@@ -96,7 +96,7 @@ pub use provider::{
   CommitOutcome, CommitReceipt, CreatedKey, DurabilityLevel, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, ReconcileOutcome, StoreCapabilities, StoreEntry,
   StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision,
-  StoreTransaction, StoreValue,
+  StoreTransaction, StoreValue, store_scan_stream,
 };
 pub use resource::{ResourceLabels, ResourceName, ResourceUri, ResourceVersion};
 pub use routing::{

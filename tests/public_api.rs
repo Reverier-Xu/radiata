@@ -459,6 +459,28 @@ fn storage_spi_values_are_externally_constructible() {
     .transactional_migration(true);
 }
 
+/// The `StoreScan` to `BoxStream` converter (R2) is externally drivable:
+/// an external scan composes with the standard stream combinators.
+#[tokio::test]
+async fn store_scan_stream_is_externally_drivable() {
+  use futures_util::StreamExt;
+
+  let namespace = StoreNamespace::new(QualifiedTag::parse("example.org/pubs/scan").unwrap());
+  let entries = vec![StoreEntry::new(
+    namespace.clone(),
+    StoreKey::new(Arc::from(b"scan-key".to_vec())),
+    StoreValue::new(Arc::from(b"scan-value".to_vec())),
+  )];
+  let scan: Box<dyn StoreScan> = Box::new(PubScan {
+    entries: entries.clone(),
+  });
+  let collected: Vec<StoreEntry> = radiata::store_scan_stream(scan)
+    .map(|item| item.unwrap())
+    .collect()
+    .await;
+  assert_eq!(collected, entries);
+}
+
 // ------------------------------------------------------- streams/policies
 
 /// An external stream body: any standard `Stream` of ordered chunks is a
@@ -669,6 +691,7 @@ fn config_and_registry_are_externally_constructible() {
 #[cfg(all(feature = "json", unix))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_typed_facade_signature_drives_a_real_cluster() {
+  use futures_core::Stream as _;
   init_tracing();
   let directory = tempfile::tempdir().unwrap();
   let factory = json_store(directory.path().to_path_buf());
@@ -1000,6 +1023,18 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let _closed = matches!(route_events.try_recv(), Ok(EventReceive::Empty));
   let _closed = matches!(revoked_events.try_recv(), Ok(EventReceive::Empty));
   let _closed = matches!(recovery_events.try_recv(), Ok(EventReceive::Empty));
+
+  // The additive standard-stream view (R2): a subscription is a Stream of
+  // the same EventReceive items; pending polls yield no Empty item.
+  futures_util::future::poll_fn(|cx| {
+    assert!(
+      std::pin::Pin::new(&mut session_events)
+        .poll_next(cx)
+        .is_pending()
+    );
+    std::task::Poll::Ready(())
+  })
+  .await;
 
   // Listener stop command.
   let _stopped: () = issuer

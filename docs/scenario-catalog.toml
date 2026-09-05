@@ -1793,6 +1793,22 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-02"
+gate = "G11"
+priority = "P1"
+first = 4
+verification_id = "VERIFY-G11-02"
+kind = "contract"
+cases = [
+  { title = "Expose event subscriptions as standard streams", acceptance = "EventSubscription implements futures-core Stream yielding exactly the EventReceive items recv reports, in the same order; lag stays explicit as Lagged, Empty never appears as an item, and the terminal Closed item is yielded exactly once before the stream ends.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+  ] },
+  { title = "Convert store scans to standard streams", acceptance = "store_scan_stream converts any provider StoreScan into a BoxStream that preserves scan order, items, end-of-scan, and typed errors exactly as an explicit next() loop, so consumers compose with ecosystem stream combinators while providers keep the cursor contract.", rebaseline = "ADR-0009", threats = [
+    "THR-029",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"

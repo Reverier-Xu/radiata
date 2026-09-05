@@ -280,6 +280,9 @@ pub struct radiata::EventSubscription<E: radiata::Event>
 impl<E: radiata::Event> radiata::EventSubscription<E>
 pub async fn radiata::EventSubscription<E>::recv(&mut self) -> radiata::Result<radiata::EventReceive<E>>
 pub fn radiata::EventSubscription<E>::try_recv(&mut self) -> radiata::Result<radiata::EventReceive<E>>
+impl<E: radiata::Event> futures_core::stream::Stream for radiata::EventSubscription<E>
+pub type radiata::EventSubscription<E>::Item = radiata::EventReceive<E>
+pub fn radiata::EventSubscription<E>::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
 pub struct radiata::ExtensionRegistry
 impl radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::new() -> Self
@@ -1040,5 +1043,6 @@ impl radiata::Query for radiata::WaitForShutdown
 pub type radiata::WaitForShutdown::Output = radiata::ShutdownReason
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+pub fn radiata::store_scan_stream(alloc::boxed::Box<(dyn radiata::extension::StoreScan + '_)>) -> futures_core::stream::BoxStream<'_, radiata::Result<radiata::StoreEntry>>
 pub type radiata::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>
 pub type radiata::Result<T, E> = core::result::Result<T, E>

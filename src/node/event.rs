@@ -1,3 +1,8 @@
+use std::{
+  pin::Pin,
+  task::{Context, Poll},
+};
+
 use tokio::sync::broadcast;
 
 use crate::{Error, Event, Result};
@@ -30,27 +35,94 @@ impl Default for EventOptions {
 }
 
 pub struct EventSubscription<E: Event> {
-  receiver: broadcast::Receiver<E>,
+  state: SubscriptionState<E>,
+}
+
+/// The subscription's receive state: the channel receiver either sits
+/// idle, or is checked out into one in-flight receive future while a
+/// `Stream` poll is pending. Checking the receiver out keeps the
+/// `Stream` impl free of any additional dependency while `recv`,
+/// `try_recv`, and `poll_next` share one channel position.
+enum SubscriptionState<E: Event> {
+  Idle(broadcast::Receiver<E>),
+  InFlight(crate::BoxFuture<'static, (RawReceive<E>, broadcast::Receiver<E>)>),
+  Terminated,
+}
+
+type RawReceive<E> = std::result::Result<E, broadcast::error::RecvError>;
+
+/// Maps one raw broadcast receive to the contract item plus the terminal
+/// flag: `Closed` is terminal (yielded once, then the stream ends).
+fn map_receive<E: Event>(raw: RawReceive<E>) -> (EventReceive<E>, bool) {
+  match raw {
+    Ok(event) => (EventReceive::Item(event), false),
+    Err(broadcast::error::RecvError::Lagged(missed)) => (EventReceive::Lagged { missed }, false),
+    Err(broadcast::error::RecvError::Closed) => (EventReceive::Closed, true),
+  }
 }
 
 impl<E: Event> EventSubscription<E> {
   pub async fn recv(&mut self) -> Result<EventReceive<E>> {
-    let receive = match self.receiver.recv().await {
-      Ok(event) => EventReceive::Item(event),
-      Err(broadcast::error::RecvError::Lagged(missed)) => EventReceive::Lagged { missed },
-      Err(broadcast::error::RecvError::Closed) => EventReceive::Closed,
+    let state = std::mem::replace(&mut self.state, SubscriptionState::Terminated);
+    let (raw, receiver) = match state {
+      SubscriptionState::Terminated => return Ok(EventReceive::Closed),
+      SubscriptionState::Idle(mut receiver) => {
+        let raw = receiver.recv().await;
+        (raw, receiver)
+      }
+      SubscriptionState::InFlight(pending) => pending.await,
     };
-    Ok(receive)
+    let (item, terminated) = map_receive(raw);
+    self.state = if terminated {
+      SubscriptionState::Terminated
+    } else {
+      SubscriptionState::Idle(receiver)
+    };
+    Ok(item)
   }
 
   pub fn try_recv(&mut self) -> Result<EventReceive<E>> {
-    let receive = match self.receiver.try_recv() {
-      Ok(event) => EventReceive::Item(event),
-      Err(broadcast::error::TryRecvError::Empty) => EventReceive::Empty,
-      Err(broadcast::error::TryRecvError::Lagged(missed)) => EventReceive::Lagged { missed },
-      Err(broadcast::error::TryRecvError::Closed) => EventReceive::Closed,
-    };
-    Ok(receive)
+    let state = std::mem::replace(&mut self.state, SubscriptionState::Terminated);
+    match state {
+      SubscriptionState::Terminated => Ok(EventReceive::Closed),
+      SubscriptionState::Idle(mut receiver) => {
+        let (item, terminated) = match receiver.try_recv() {
+          Ok(event) => (EventReceive::Item(event), false),
+          Err(broadcast::error::TryRecvError::Empty) => (EventReceive::Empty, false),
+          Err(broadcast::error::TryRecvError::Lagged(missed)) => {
+            (EventReceive::Lagged { missed }, false)
+          }
+          Err(broadcast::error::TryRecvError::Closed) => (EventReceive::Closed, true),
+        };
+        self.state = if terminated {
+          SubscriptionState::Terminated
+        } else {
+          SubscriptionState::Idle(receiver)
+        };
+        Ok(item)
+      }
+      SubscriptionState::InFlight(mut pending) => {
+        // A pending stream poll owns the channel position: observe its
+        // current readiness without consuming the caller's waker.
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        match pending.as_mut().poll(&mut context) {
+          Poll::Pending => {
+            self.state = SubscriptionState::InFlight(pending);
+            Ok(EventReceive::Empty)
+          }
+          Poll::Ready((raw, receiver)) => {
+            let (item, terminated) = map_receive(raw);
+            self.state = if terminated {
+              SubscriptionState::Terminated
+            } else {
+              SubscriptionState::Idle(receiver)
+            };
+            Ok(item)
+          }
+        }
+      }
+    }
   }
 }
 
@@ -60,6 +132,44 @@ pub enum EventReceive<E> {
   Empty,
   Lagged { missed: u64 },
   Closed,
+}
+
+/// The additive standard-stream view (R2): the same items `recv` yields,
+/// in the same order. Lag stays explicit as `EventReceive::Lagged`; the
+/// terminal `EventReceive::Closed` item is yielded once, then the stream
+/// ends. `try_recv`'s `Empty` is poll-level pending and never appears as
+/// an item.
+impl<E: Event> futures_core::Stream for EventSubscription<E> {
+  type Item = EventReceive<E>;
+
+  fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    loop {
+      match &mut self.state {
+        SubscriptionState::Terminated => return Poll::Ready(None),
+        SubscriptionState::Idle(_) => {
+          let SubscriptionState::Idle(mut receiver) =
+            std::mem::replace(&mut self.state, SubscriptionState::Terminated)
+          else {
+            unreachable!("matched idle state")
+          };
+          self.state =
+            SubscriptionState::InFlight(Box::pin(async move { (receiver.recv().await, receiver) }));
+        }
+        SubscriptionState::InFlight(pending) => match pending.as_mut().poll(cx) {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready((raw, receiver)) => {
+            let (item, terminated) = map_receive(raw);
+            self.state = if terminated {
+              SubscriptionState::Terminated
+            } else {
+              SubscriptionState::Idle(receiver)
+            };
+            return Poll::Ready(Some(item));
+          }
+        },
+      }
+    }
+  }
 }
 
 /// The runtime event hub (T-G09-03): one typed subscriber set per event
@@ -107,7 +217,9 @@ impl EventHub {
     let entries = subscribers.entry(std::any::TypeId::of::<E>()).or_default();
     Self::prune::<E>(entries);
     entries.push(Box::new(std::sync::Arc::new(sender)));
-    EventSubscription { receiver }
+    EventSubscription {
+      state: SubscriptionState::Idle(receiver),
+    }
   }
 
   /// Emits one event to every live subscriber of its type; a subscriber
@@ -154,7 +266,12 @@ fn validate_capacity(value: usize) -> Result<()> {
 #[cfg(test)]
 fn event_channel<E: Event>(options: EventOptions) -> (broadcast::Sender<E>, EventSubscription<E>) {
   let (sender, receiver) = broadcast::channel(options.capacity);
-  (sender, EventSubscription { receiver })
+  (
+    sender,
+    EventSubscription {
+      state: SubscriptionState::Idle(receiver),
+    },
+  )
 }
 
 #[cfg(test)]
@@ -220,5 +337,49 @@ mod tests {
       subscription.recv().await.unwrap(),
       EventReceive::Closed
     ));
+  }
+
+  /// SC-G11-P1-04: the additive `Stream` view yields exactly the items
+  /// `recv`/`try_recv` report, keeps lag explicit, and terminates after
+  /// one `Closed` item.
+  #[tokio::test]
+  async fn g11_event_subscription_stream_matches_recv_parity() {
+    use futures_util::StreamExt;
+
+    let options = EventOptions::new().capacity(2).unwrap();
+    let (sender, subscription) = event_channel::<TestEvent>(options);
+    tokio::pin!(subscription);
+
+    // Pending is poll-level, never an Empty item.
+    futures_util::future::poll_fn(|cx| {
+      assert!(futures_core::Stream::poll_next(subscription.as_mut(), cx).is_pending());
+      std::task::Poll::Ready(())
+    })
+    .await;
+
+    sender.send(TestEvent(1)).unwrap();
+    sender.send(TestEvent(2)).unwrap();
+    sender.send(TestEvent(3)).unwrap();
+
+    assert!(matches!(
+      subscription.as_mut().next().await,
+      Some(EventReceive::Lagged { missed: 1 })
+    ));
+    assert!(matches!(
+      subscription.as_mut().next().await,
+      Some(EventReceive::Item(TestEvent(2)))
+    ));
+    assert!(matches!(
+      subscription.as_mut().next().await,
+      Some(EventReceive::Item(TestEvent(3)))
+    ));
+
+    drop(sender);
+    assert!(matches!(
+      subscription.as_mut().next().await,
+      Some(EventReceive::Closed)
+    ));
+    assert!(subscription.as_mut().next().await.is_none());
+    assert!(subscription.as_mut().next().await.is_none());
   }
 }

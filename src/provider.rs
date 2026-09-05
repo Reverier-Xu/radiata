@@ -636,6 +636,25 @@ pub trait StoreScan: fmt::Debug + Send {
   fn next<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<StoreEntry>>>;
 }
 
+/// Converts one provider [`StoreScan`] into the standard stream view (R2):
+/// consumers compose scans with the ecosystem stream combinators while
+/// providers keep implementing the explicit cursor [`StoreScan::next`].
+/// Items preserve scan order and the crate's typed error.
+pub fn store_scan_stream(
+  scan: Box<dyn StoreScan + '_>,
+) -> futures_core::stream::BoxStream<'_, Result<StoreEntry>> {
+  use futures_util::TryStreamExt;
+  Box::pin(
+    futures_util::stream::try_unfold(scan, |mut scan| async move {
+      scan
+        .next()
+        .await
+        .map(|entry| entry.map(|entry| (entry, scan)))
+    })
+    .into_stream(),
+  )
+}
+
 pub trait StoreSnapshot: fmt::Debug + Send + Sync + 'static {
   fn revision(&self) -> &StoreRevision;
 
@@ -800,10 +819,70 @@ mod tests {
   use std::sync::Arc;
 
   use super::{
-    DurabilityLevel, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRequirements,
-    StoreRevision, StoreTransaction, StoreValue,
+    DurabilityLevel, StoreEntry, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
+    StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
   };
   use crate::{Digest, QualifiedTag, TransactionId};
+
+  /// SC-G11-P1-05: the `StoreScan` to `BoxStream` converter preserves
+  /// order, items, end-of-scan, and the typed error, matching an explicit
+  /// `next()` loop exactly.
+  #[tokio::test]
+  async fn g11_store_scan_stream_matches_next_loop_parity() {
+    use futures_util::StreamExt;
+
+    #[derive(Debug)]
+    struct ScriptedScan {
+      items: std::vec::IntoIter<crate::Result<Option<StoreEntry>>>,
+    }
+
+    impl crate::provider::StoreScan for ScriptedScan {
+      fn next<'a>(&'a mut self) -> crate::BoxFuture<'a, crate::Result<Option<StoreEntry>>> {
+        Box::pin(async move { self.items.next().unwrap_or(Ok(None)) })
+      }
+    }
+
+    let namespace =
+      StoreNamespace::new(QualifiedTag::parse("radiata.woooo.tech/metadata/scan-parity").unwrap());
+    let entry = |index: u8| {
+      StoreEntry::new(
+        namespace.clone(),
+        StoreKey::new(Arc::from(&[index][..])),
+        StoreValue::new(Arc::from(&[index][..])),
+      )
+    };
+    let expected = [entry(1), entry(2), entry(3)];
+
+    let scan = Box::new(ScriptedScan {
+      items: vec![
+        Ok(Some(expected[0].clone())),
+        Ok(Some(expected[1].clone())),
+        Ok(Some(expected[2].clone())),
+        Ok(None),
+      ]
+      .into_iter(),
+    });
+    let collected: Vec<StoreEntry> = super::store_scan_stream(scan)
+      .collect::<Vec<crate::Result<StoreEntry>>>()
+      .await
+      .into_iter()
+      .collect::<crate::Result<Vec<_>>>()
+      .unwrap();
+    assert_eq!(collected, expected);
+
+    // A typed error surfaces as an item in place and ends nothing early.
+    let scan = Box::new(ScriptedScan {
+      items: vec![
+        Ok(Some(entry(9))),
+        Err(crate::Error::internal("scan parity")),
+      ]
+      .into_iter(),
+    });
+    let mut stream = super::store_scan_stream(scan);
+    assert_eq!(stream.next().await.unwrap().unwrap(), entry(9));
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::Internal);
+  }
 
   #[test]
   fn g1_core_store_requirements_expose_every_required_capability() {
