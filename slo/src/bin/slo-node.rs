@@ -15,7 +15,7 @@
 use std::{
   io::{BufRead, Write},
   process::ExitCode,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use radiata::{
@@ -51,6 +51,7 @@ fn main() -> ExitCode {
   if std::env::var("RADIATA_SLO_LOG").is_ok() {
     tracing_subscriber::fmt()
       .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=debug"))
+      .with_writer(std::io::stderr)
       .init();
   }
   let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -262,10 +263,16 @@ async fn member(
   let issuer_text = std::env::var(common::ENV_ISSUER).map_err(|_| "issuer unset".to_owned())?;
   let issuer = Endpoint::parse(&issuer_text).map_err(|error| error.to_string())?;
   let credential = radiata::JoinCredential::parse(secret).map_err(|error| error.to_string())?;
-  handle
-    .command(JoinCluster::new(issuer, credential))
-    .await
-    .map_err(|error| error.to_string())?;
+  let joined = tokio::time::timeout(
+    Duration::from_secs(30),
+    handle.command(JoinCluster::new(issuer, credential)),
+  )
+  .await;
+  match joined {
+    Ok(Ok(_)) => {}
+    Ok(Err(error)) => return Err(format!("join failed: {error}")),
+    Err(_) => return Err("join timed out after 30s".to_owned()),
+  }
   let local = handle
     .query(GetLocalNode::new())
     .await
@@ -391,34 +398,46 @@ async fn has_resource(handle: &radiata::NodeHandle, name_text: &str) -> String {
 async fn set_own_zone(
   handle: &radiata::NodeHandle, node_id: &radiata::NodeId, value: &str,
 ) -> String {
-  let revision = match handle
-    .query(PageMembers::new(PageSpec::first(64).unwrap()))
-    .await
-  {
-    Ok(page) => page
-      .items()
-      .iter()
-      .find(|view| view.node_id() == node_id)
-      .map(|view| view.owner_revision())
-      .unwrap_or(1),
-    Err(_) => return "error member page".to_owned(),
-  };
-  let patch = (|| {
-    let key = radiata::LabelKey::parse("example.org/labels/zone")?;
-    let value = radiata::LabelValue::parse(value)?;
-    radiata::NodeMetadataPatch::new().set_capability(key, value)
-  })()
-  .map_err(|error| format!("error {error}"));
-  let patch = match patch {
-    Ok(patch) => patch,
-    Err(error) => return error,
-  };
-  match handle
-    .command(radiata::UpdateNodeMetadata::new(revision, patch))
-    .await
-  {
-    Ok(_) => "zone ok".to_owned(),
-    Err(error) => format!("error {error}"),
+  let deadline = Instant::now() + Duration::from_secs(30);
+  let mut attempts = 0_u32;
+  loop {
+    attempts += 1;
+    let revision = match handle
+      .query(PageMembers::new(PageSpec::first(64).unwrap()))
+      .await
+    {
+      Ok(page) => page
+        .items()
+        .iter()
+        .find(|view| view.node_id() == node_id)
+        .map(|view| view.owner_revision())
+        .unwrap_or(1),
+      Err(_) => return "error member page".to_owned(),
+    };
+    let patch = (|| {
+      let key = radiata::LabelKey::parse("example.org/labels/zone")?;
+      let value = radiata::LabelValue::parse(value)?;
+      radiata::NodeMetadataPatch::new().set_capability(key, value)
+    })();
+    let patch = match patch {
+      Ok(patch) => patch,
+      Err(error) => return format!("error {error}"),
+    };
+    match handle
+      .command(radiata::UpdateNodeMetadata::new(revision, patch))
+      .await
+    {
+      Ok(_) => return "zone ok".to_owned(),
+      Err(error) if error.kind() == radiata::ErrorKind::Conflict => {
+        // A concurrent descriptor ensure may have bumped the revision;
+        // re-observe and retry within the bound.
+        if Instant::now() > deadline || attempts > 20 {
+          return format!("error {error}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+      }
+      Err(error) => return format!("error {error}"),
+    }
   }
 }
 

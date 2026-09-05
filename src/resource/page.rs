@@ -140,9 +140,12 @@ pub(crate) mod sync {
           continue;
         }
       };
-      if record.verify(&writer_key).is_err() {
-        tracing::debug!(writer = %record.writer(), "resource page record skipped: bad signature");
-        continue;
+      match record.verify(&writer_key) {
+        Ok(()) => {}
+        Err(error) => {
+          tracing::debug!(writer = %record.writer(), kind = ?error.kind(), "resource page record skipped: bad signature");
+          continue;
+        }
       }
       if matches!(
         super::super::store::commit_record_ctx(store, entropy, record).await?,

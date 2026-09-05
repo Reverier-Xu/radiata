@@ -492,8 +492,14 @@ async fn measure_async(runs: u32, expected_commit: String) -> Result<(), String>
       loop {
         creator.send("zones")?;
         let reply = creator.read_line()?;
-        eprintln!("slo-controller: zones reply = {reply:?}");
-        if reply.trim() == format!("zones {workload_nodes}") {
+        // The creator's own node-metadata samples also carry the zone
+        // label, so the converged count is at least the workload members.
+        let count = reply
+          .trim()
+          .strip_prefix("zones ")
+          .and_then(|value| value.parse::<usize>().ok())
+          .unwrap_or(0);
+        if count >= workload_nodes {
           break;
         }
         if Instant::now() > deadline {
@@ -613,6 +619,8 @@ async fn measure_async(runs: u32, expected_commit: String) -> Result<(), String>
       sample_seed += 1;
       let name = format!("radiata.woooo.tech/resources/workload-{sample_seed:03}");
       let started = now_ms();
+      creator.send(&format!("workload resource {sample_seed}"))?;
+      let line = creator.read_line()?;
       let mut observed = false;
       let convergence = Instant::now() + Duration::from_secs(30);
       loop {

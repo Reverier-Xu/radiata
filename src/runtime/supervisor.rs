@@ -728,6 +728,7 @@ impl Supervisor {
     let insert_listener = std::sync::Arc::clone(&listener);
     let attachment = bound.clone();
     let abort = tasks.spawn(async move {
+      tracing::debug!("accept loop started");
       loop {
         // The join hint is computed per accepted connection so the accept
         // path stays fast and never stalls on the credential issuer lock;

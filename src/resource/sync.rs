@@ -105,7 +105,10 @@ impl PacketConsumer for ResourceSyncConsumer {
         .upgrade()
         .ok_or_else(|| Error::shutting_down("resource sync"))?;
       let page = payload.page()?;
-      page_sync::apply_page_ctx(context.store(), self.entropy.as_ref(), &page).await?;
+      tracing::debug!(count = page.records().len(), "resource sync page received");
+      let installed =
+        page_sync::apply_page_ctx(context.store(), self.entropy.as_ref(), &page).await?;
+      tracing::debug!(installed, "resource sync page applied");
       Ok(())
     })
   }
@@ -170,6 +173,11 @@ pub(crate) async fn resource_sync_tick(
   )
   .await?;
   let page_fp = page.fingerprint();
+  tracing::debug!(
+    count = page.records().len(),
+    fp = page_fp,
+    "resource sync page emitted"
+  );
   // A round starts when the first page's content or the alive-peer set
   // changed, and is retried on a slow cadence otherwise; mid-round pages
   // always send as the continuation of an already-started round.
