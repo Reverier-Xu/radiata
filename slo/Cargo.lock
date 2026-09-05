@@ -644,6 +644,7 @@ dependencies = [
  "domain",
  "ed25519-dalek",
  "fs4",
+ "futures-core",
  "futures-util",
  "getrandom 0.4.3",
  "hkdf",
@@ -669,6 +670,8 @@ name = "radiata-slo"
 version = "0.0.0"
 dependencies = [
  "ed25519-dalek",
+ "futures-core",
+ "futures-util",
  "getrandom 0.4.3",
  "radiata",
  "tempfile",

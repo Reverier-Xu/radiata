@@ -25,22 +25,22 @@ use radiata::{
   ConnectMember, ConnectivityStatus, CreateCluster, CreatedKey, DeliveryAck, Digest,
   DisconnectPeer, Discovery, DiscoveryPage, Endpoint, EndpointCandidate, EventOptions,
   EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag, GetLocalNode,
-  GetMember, GetNodeStatus, GetObservability, GetResource, GetRoute, IncomingPacket,
+  GetMember, GetNodeStatus, GetObservability, GetResource, GetRoute, IncomingStream,
   IssuedJoinCredential, JoinCluster, JoinCredential, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster,
   LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView, NodeBuilder,
   NodeConfig, NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus,
-  ObservabilitySnapshot, OutboundPacket, PacketBody, PacketConsumer, PacketMetadata, PacketPolicy,
-  PacketTarget, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
-  PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
-  RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
+  ObservabilitySnapshot, OutboundStream, PacketConsumer, PageCursor, PageListeners, PageMembers,
+  PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition, ProtocolTag,
+  PutResource, QualifiedTag, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
   ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result,
   RotateJoinCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy,
   SelectResources, Selector, SessionChanged, SessionView, Shutdown, ShutdownOutcome,
   ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities, StoreEntry, StoreKey,
   StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
-  TraceId, TraceMetadataLimits, TransactionId, TransportTag, UpdateNodeMetadata, WaitForShutdown,
+  StreamMetadata, StreamPolicy, StreamTarget, TraceId, TraceMetadataLimits, TransactionId,
+  TransportTag, UpdateNodeMetadata, WaitForShutdown,
   extension::{Entropy, KeyProvider, Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -459,21 +459,14 @@ fn storage_spi_values_are_externally_constructible() {
     .transactional_migration(true);
 }
 
-// ------------------------------------------------------- packets/policies
+// ------------------------------------------------------- streams/policies
 
-/// An external packet body, consumer, load balancer, neighbor policy, and
-/// discovery source — the complete open extension contracts.
-#[derive(Debug)]
-struct PubBody {
-  chunks: u8,
-}
-
-impl PacketBody for PubBody {
-  fn next_chunk<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Arc<[u8]>>>> {
-    let sent = self.chunks;
-    self.chunks += 1;
-    Box::pin(async move { Ok((sent == 0).then(|| Arc::from(b"pub-body".to_vec()) as Arc<[u8]>)) })
-  }
+/// An external stream body: any standard `Stream` of ordered chunks is a
+/// body (R1); the trivial one-shot case needs no trait ceremony.
+fn pub_body(
+  chunk: &'static [u8],
+) -> impl futures_core::Stream<Item = Result<Arc<[u8]>>> + Send + 'static {
+  futures_util::stream::once(async move { Ok(Arc::from(chunk) as Arc<[u8]>) })
 }
 
 #[derive(Debug, Default)]
@@ -482,14 +475,19 @@ struct PubConsumer {
 }
 
 impl PacketConsumer for PubConsumer {
-  fn accept<'a>(&'a self, mut packet: IncomingPacket) -> BoxFuture<'a, Result<()>> {
+  fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
       let _ = packet.source();
       let _ = packet.destination();
       let _ = packet.trace_id();
       let _ = packet.protocol();
       let _ = packet.metadata();
-      while packet.body().next_chunk().await?.is_some() {}
+      let mut body = packet.body();
+      while std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+        .is_some()
+      {}
       *self.received.lock().unwrap() += 1;
       Ok(())
     })
@@ -569,10 +567,10 @@ async fn discovery_contract_is_externally_implementable() {
   assert!(empty.items().is_empty());
 }
 
-/// Packet policies, metadata, and targets are externally constructible.
+/// Stream policies, metadata, and targets are externally constructible.
 #[test]
-fn packet_surface_is_externally_constructible() {
-  let policy = PacketPolicy::new(RoutingPolicy::Direct, 3)
+fn stream_surface_is_externally_constructible() {
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 3)
     .unwrap()
     .load_balancer(QualifiedTag::parse("example.org/balancers/first").unwrap());
   assert_eq!(policy.max_hops(), 3);
@@ -583,16 +581,16 @@ fn packet_surface_is_externally_constructible() {
   assert_eq!(policy.routing_policy(), &RoutingPolicy::Direct);
 
   let key = QualifiedTag::parse("example.org/pubs/hint").unwrap();
-  let metadata = PacketMetadata::new()
+  let metadata = StreamMetadata::new()
     .insert(key.clone(), Arc::from(b"hint-value".to_vec()))
     .unwrap();
   assert_eq!(metadata.get(&key), Some(b"hint-value".as_slice()));
   assert_eq!(metadata.entries().count(), 1);
 
   let node = NodeId::parse("node_0000000000000000000A1").unwrap();
-  let _exact = PacketTarget::Exact(node.clone());
+  let _exact = StreamTarget::Exact(node.clone());
   let _matching =
-    PacketTarget::MatchingNodes(Selector::parse("example.org/labels/lane=one").unwrap());
+    StreamTarget::MatchingNodes(Selector::parse("example.org/labels/lane=one").unwrap());
   let selector = Selector::parse("example.org/labels/lane=one").unwrap();
   assert_eq!(selector.as_str(), "example.org/labels/lane=one");
 }
@@ -872,20 +870,17 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap();
   assert!(one_resource.is_some());
 
-  // Packet stream with an exact-node target and a delivery ack.
-  let packet: OutboundPacket = issuer
+  // Stream with an exact-node target and a delivery ack.
+  let packet: OutboundStream = issuer
     .handle
-    .create_packet(
-      PacketTarget::Exact(member_id.clone()),
+    .open_stream(
+      StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      PacketPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
-      PacketMetadata::new(),
+      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let ack: DeliveryAck = packet
-    .send_sync(Box::new(PubBody { chunks: 0 }))
-    .await
-    .unwrap();
+  let ack: DeliveryAck = packet.send_sync(pub_body(b"pub-body")).await.unwrap();
   let _ = ack.trace_id();
   let _ = ack.destination();
   let _ = ack.admitted_at();
@@ -942,14 +937,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // Async route handle and route status.
   let routed = issuer
     .handle
-    .create_packet(
-      PacketTarget::Exact(member_id.clone()),
+    .open_stream(
+      StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      PacketPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
-      PacketMetadata::new(),
+      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let handle: RouteHandle = routed.send_async(Box::new(PubBody { chunks: 0 })).unwrap();
+  let handle: RouteHandle = routed.send_async(pub_body(b"pub-body")).unwrap();
   let _ = handle.trace_id();
   // An async route retires its record after the terminal state, so the
   // status query races completion: a live route exposes every accessor,

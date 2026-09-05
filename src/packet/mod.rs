@@ -1,23 +1,32 @@
 //! Opaque directed packet streams (ADR-0007).
 //!
 //! The data-plane unit is an opaque packet stream, not an application
-//! request or response. [`NodeHandle::create_packet`] allocates the
+//! request or response. [`NodeHandle::open_stream`] allocates the
 //! core-generated [`TraceId`] synchronously and performs no body delivery;
-//! [`OutboundPacket::send_sync`] waits only for the destination's
+//! [`OutboundStream::send_sync`] waits only for the destination's
 //! current-process admission acknowledgement, while
-//! [`OutboundPacket::send_async`] returns a [`RouteHandle`] immediately and
+//! [`OutboundStream::send_async`] returns a [`RouteHandle`] immediately and
 //! exposes in-memory route status through the `GetRoute` query.
 //!
-//! Core frames and forwards body chunks with constant memory and
-//! backpressure over one authenticated session, preserves byte order, never
-//! persists payload bytes, and never replays or resumes an interrupted
-//! stream: route or session interruption ends the stream with
-//! `StreamInterrupted`.
+//! Bodies are standard [`Stream`]s of ordered chunks (R1: futures-core
+//! enters the public ABI). Core frames and forwards body chunks with
+//! constant memory and backpressure over one authenticated session,
+//! preserves byte order, never persists payload bytes, and never replays
+//! or resumes an interrupted stream: route or session interruption ends
+//! the stream with `StreamInterrupted`.
 
 pub(crate) mod wire;
 
-use std::{collections::BTreeMap, fmt, sync::Arc, time::SystemTime};
+use std::{
+  collections::BTreeMap,
+  fmt,
+  pin::Pin,
+  sync::Arc,
+  task::{Context, Poll},
+  time::SystemTime,
+};
 
+use futures_core::{Stream, stream::BoxStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -25,7 +34,7 @@ use crate::{
   extension_registry::ExtensionRegistry, runtime::RuntimeClient,
 };
 
-/// The caller-selected routing policy for one packet.
+/// The caller-selected routing policy for one stream.
 ///
 /// Typed so the compiler rejects unknown or misspelled policies at build
 /// time; only direct exact-node delivery exists at this gate, and selector
@@ -38,23 +47,23 @@ pub enum RoutingPolicy {
   Direct,
 }
 
-/// The maximum number of metadata entries in one packet (ADR-0002 bounded
+/// The maximum number of metadata entries in one stream (ADR-0002 bounded
 /// collection).
 pub(crate) const METADATA_MAX_ENTRIES: usize = 256;
 
-/// The maximum summed metadata key and value bytes in one packet.
+/// The maximum summed metadata key and value bytes in one stream.
 pub(crate) const METADATA_MAX_BYTES: usize = 32 * 1_024;
 
 /// The per-chunk streaming quantum in bytes. Total stream length is not a
 /// public limit; core chunks large caller writes stay constant-memory.
 pub(crate) const MAX_CHUNK_BYTES: usize = 32 * 1_024;
 
-/// A packet destination: an exact authenticated node, or one node selected
+/// A stream destination: an exact authenticated node, or one node selected
 /// by the registered load balancer from the members whose owned labels
 /// match the selector (T-G06-01).
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PacketTarget {
+pub enum StreamTarget {
   /// Delivers to exactly this authenticated node.
   Exact(NodeId),
   /// Delivers to the single node a registered load-balancing policy
@@ -62,19 +71,19 @@ pub enum PacketTarget {
   MatchingNodes(crate::Selector),
 }
 
-/// The caller-selected routing policy for one packet.
+/// The caller-selected routing policy for one stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PacketPolicy {
+pub struct StreamPolicy {
   routing_policy: RoutingPolicy,
   load_balancing: Option<QualifiedTag>,
   max_hops: u32,
 }
 
-impl PacketPolicy {
+impl StreamPolicy {
   /// Selects a routing policy and a nonzero hop budget.
   pub fn new(routing_policy: RoutingPolicy, max_hops: u32) -> Result<Self> {
     if max_hops == 0 {
-      return Err(Error::invalid_input("packet hop budget"));
+      return Err(Error::invalid_input("stream hop budget"));
     }
     Ok(Self {
       routing_policy,
@@ -84,7 +93,7 @@ impl PacketPolicy {
   }
 
   /// Selects a load-balancing policy for matching-node targets. Exact-node
-  /// targets reject a load balancer at `create_packet`.
+  /// targets reject a load balancer at `open_stream`.
   pub fn load_balancer(mut self, value: QualifiedTag) -> Self {
     self.load_balancing = Some(value);
     self
@@ -103,19 +112,19 @@ impl PacketPolicy {
   }
 }
 
-/// A bounded canonical metadata label map carried by one packet.
+/// A bounded canonical metadata label map carried by one stream.
 ///
-/// Bounds are enforced at [`PacketMetadata::insert`]: at most
+/// Bounds are enforced at [`StreamMetadata::insert`]: at most
 /// [`METADATA_MAX_ENTRIES`] entries and [`METADATA_MAX_BYTES`] summed key
 /// and value bytes. Keys are unique and ordered by canonical tag text, so
 /// the wire encoding is deterministic.
 #[derive(Clone, Default, Eq, PartialEq)]
-pub struct PacketMetadata {
+pub struct StreamMetadata {
   entries: BTreeMap<QualifiedTag, Arc<[u8]>>,
   total_bytes: usize,
 }
 
-impl PacketMetadata {
+impl StreamMetadata {
   pub fn new() -> Self {
     Self::default()
   }
@@ -123,11 +132,11 @@ impl PacketMetadata {
   /// Inserts one label, enforcing uniqueness and the bounded-map limits.
   pub fn insert(mut self, key: QualifiedTag, value: Arc<[u8]>) -> Result<Self> {
     if self.entries.contains_key(&key) {
-      return Err(Error::conflict("packet metadata"));
+      return Err(Error::conflict("stream metadata"));
     }
     let added = key.as_str().len() + value.len();
     if self.entries.len() >= METADATA_MAX_ENTRIES || self.total_bytes + added > METADATA_MAX_BYTES {
-      return Err(Error::resource_exhausted("packet metadata"));
+      return Err(Error::resource_exhausted("stream metadata"));
     }
     self.total_bytes += added;
     self.entries.insert(key, value);
@@ -146,21 +155,22 @@ impl PacketMetadata {
   }
 }
 
-impl fmt::Debug for PacketMetadata {
+impl fmt::Debug for StreamMetadata {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
-      .debug_struct("PacketMetadata")
+      .debug_struct("StreamMetadata")
       .field("entries", &self.entries.len())
       .field("total_bytes", &self.total_bytes)
       .finish()
   }
 }
 
-/// A caller-owned packet body stream. Core pulls chunks with backpressure;
-/// returning `Ok(None)` ends the stream.
-pub trait PacketBody: fmt::Debug + Send + 'static {
-  fn next_chunk<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Arc<[u8]>>>>;
-}
+/// A caller-owned stream body (R1): the standard [`Stream`] of ordered
+/// chunks with the crate's typed error. Core pulls chunks with
+/// backpressure; a `None` item ends the stream.
+///
+/// The erased form core carries across the runtime boundary.
+pub(crate) type BodyStream = BoxStream<'static, Result<Arc<[u8]>>>;
 
 /// A one-shot body that yields exactly one bounded chunk (core sync and
 /// control streams).
@@ -175,28 +185,30 @@ impl StaticBody {
   }
 }
 
-impl PacketBody for StaticBody {
-  fn next_chunk<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move { Ok(self.bytes.take()) })
+impl Stream for StaticBody {
+  type Item = Result<Arc<[u8]>>;
+
+  fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    Poll::Ready(self.bytes.take().map(Ok))
   }
 }
 
-/// An outbound packet with its core-allocated [`TraceId`], created by
-/// [`NodeHandle::create_packet`] before any delivery work starts.
-pub struct OutboundPacket {
+/// An outbound stream with its core-allocated [`TraceId`], created by
+/// [`NodeHandle::open_stream`] before any delivery work starts.
+pub struct OutboundStream {
   trace_id: TraceId,
-  target: PacketTarget,
+  target: StreamTarget,
   load_balancer: Option<QualifiedTag>,
   max_hops: u32,
   protocol: ProtocolTag,
-  metadata: PacketMetadata,
+  metadata: StreamMetadata,
   runtime: RuntimeClient,
 }
 
-impl OutboundPacket {
+impl OutboundStream {
   pub(crate) fn new(
-    trace_id: TraceId, target: PacketTarget, load_balancer: Option<QualifiedTag>, max_hops: u32,
-    protocol: ProtocolTag, metadata: PacketMetadata, runtime: RuntimeClient,
+    trace_id: TraceId, target: StreamTarget, load_balancer: Option<QualifiedTag>, max_hops: u32,
+    protocol: ProtocolTag, metadata: StreamMetadata, runtime: RuntimeClient,
   ) -> Self {
     Self {
       trace_id,
@@ -219,9 +231,11 @@ impl OutboundPacket {
   /// admission acknowledgement (ADR-0007): the returned [`DeliveryAck`]
   /// proves authenticated admission to the destination's bounded incoming
   /// stream, never durable retention, processing, or success.
-  pub fn send_sync(self, body: Box<dyn PacketBody>) -> BoxFuture<'static, Result<DeliveryAck>> {
+  pub fn send_sync<S>(self, body: S) -> BoxFuture<'static, Result<DeliveryAck>>
+  where
+    S: Stream<Item = Result<Arc<[u8]>>> + Send + 'static, {
     let trace_id = self.trace_id.clone();
-    let (request, outcome) = self.into_request(body);
+    let (request, outcome) = self.into_request(Box::pin(body));
     Box::pin(async move {
       request.runtime.send_packet(request.inner).await?;
       match outcome.await {
@@ -239,18 +253,18 @@ impl OutboundPacket {
   /// Starts streaming in the background and returns the route handle
   /// immediately. Delivery progress and terminal state are observable
   /// through the `GetRoute` query.
-  pub fn send_async(self, body: Box<dyn PacketBody>) -> Result<RouteHandle> {
+  pub fn send_async<S>(self, body: S) -> Result<RouteHandle>
+  where
+    S: Stream<Item = Result<Arc<[u8]>>> + Send + 'static, {
     let handle = RouteHandle {
       trace_id: self.trace_id.clone(),
     };
-    let (request, _) = self.into_request(body);
+    let (request, _) = self.into_request(Box::pin(body));
     request.runtime.try_send_packet(request.inner)?;
     Ok(handle)
   }
 
-  fn into_request(
-    self, body: Box<dyn PacketBody>,
-  ) -> (SendRequest, oneshot::Receiver<RoutedAckOutcome>) {
+  fn into_request(self, body: BodyStream) -> (SendRequest, oneshot::Receiver<RoutedAckOutcome>) {
     let (notify, outcome) = oneshot::channel();
     let inner = OutboundRequest {
       trace_id: self.trace_id,
@@ -273,10 +287,10 @@ impl OutboundPacket {
   }
 }
 
-impl fmt::Debug for OutboundPacket {
+impl fmt::Debug for OutboundStream {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
-      .debug_struct("OutboundPacket")
+      .debug_struct("OutboundStream")
       .field("trace_id", &self.trace_id)
       .field("target", &self.target)
       .field("protocol", &self.protocol)
@@ -294,9 +308,9 @@ struct SendRequest {
 /// An admitted incoming packet stream handed to the registered
 /// [`crate::PacketConsumer`]. Endpoints are the session-authenticated node
 /// IDs; the body preserves wire order.
-/// The reply context an admitted incoming packet needs to derive a
-/// caller-owned return packet: the registry that gates protocol labels and
-/// the runtime client that routes outbound packets.
+/// The reply context an admitted incoming stream needs to derive a
+/// caller-owned return stream: the registry that gates protocol labels and
+/// the runtime client that routes outbound streams.
 #[derive(Clone)]
 pub(crate) struct PacketReplyContext {
   registry: Arc<ExtensionRegistry>,
@@ -309,20 +323,20 @@ impl PacketReplyContext {
   }
 }
 
-pub struct IncomingPacket {
+pub struct IncomingStream {
   source: NodeId,
   destination: NodeId,
   trace_id: TraceId,
   protocol: ProtocolTag,
-  metadata: PacketMetadata,
-  body: ChannelBody,
+  metadata: StreamMetadata,
+  body: BodyStream,
   reply: PacketReplyContext,
 }
 
-impl IncomingPacket {
+impl IncomingStream {
   pub(crate) fn new(
     source: NodeId, destination: NodeId, trace_id: TraceId, protocol: ProtocolTag,
-    metadata: PacketMetadata, body: ChannelBody, reply: PacketReplyContext,
+    metadata: StreamMetadata, body: BodyStream, reply: PacketReplyContext,
   ) -> Self {
     Self {
       source,
@@ -351,29 +365,32 @@ impl IncomingPacket {
     &self.protocol
   }
 
-  pub fn metadata(&self) -> &PacketMetadata {
+  pub fn metadata(&self) -> &StreamMetadata {
     &self.metadata
   }
 
-  pub fn body(&mut self) -> &mut dyn PacketBody {
-    &mut self.body
+  /// The admitted body stream in wire order. A channel that closes
+  /// without an end item yields one `StreamInterrupted` error (ADR-0007:
+  /// no replay, no continuation).
+  pub fn body(&mut self) -> Pin<&mut (dyn Stream<Item = Result<Arc<[u8]>>> + Send)> {
+    self.body.as_mut()
   }
 
-  /// Derives a caller-owned return packet to the authenticated source:
+  /// Derives a caller-owned return stream to the authenticated source:
   /// the endpoints are swapped and the incoming `TraceId` is reused. Core
   /// assigns no return meaning, never completes another stream by
-  /// correlation, and the derived packet follows the exact-node direct
+  /// correlation, and the derived stream follows the exact-node direct
   /// policy with the caller-supplied protocol and metadata (ADR-0007,
   /// SC-G03-P0-16).
-  pub fn derive_return_packet(
-    &self, protocol: ProtocolTag, metadata: PacketMetadata,
-  ) -> Result<OutboundPacket> {
+  pub fn derive_return_stream(
+    &self, protocol: ProtocolTag, metadata: StreamMetadata,
+  ) -> Result<OutboundStream> {
     if !self.reply.registry.has_protocol(&protocol) {
       return Err(Error::unsupported("packet protocol"));
     }
-    Ok(OutboundPacket::new(
+    Ok(OutboundStream::new(
       self.trace_id.clone(),
-      PacketTarget::Exact(self.source.clone()),
+      StreamTarget::Exact(self.source.clone()),
       None,
       1,
       protocol,
@@ -383,10 +400,10 @@ impl IncomingPacket {
   }
 }
 
-impl fmt::Debug for IncomingPacket {
+impl fmt::Debug for IncomingStream {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
-      .debug_struct("IncomingPacket")
+      .debug_struct("IncomingStream")
       .field("source", &self.source)
       .field("destination", &self.destination)
       .field("trace_id", &self.trace_id)
@@ -428,7 +445,7 @@ impl DeliveryAck {
 }
 
 /// A handle to one in-flight or completed route, returned by
-/// [`OutboundPacket::send_async`] and accepted by the `GetRoute` query.
+/// [`OutboundStream::send_async`] and accepted by the `GetRoute` query.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RouteHandle {
   trace_id: TraceId,
@@ -512,12 +529,12 @@ pub(crate) type RoutedAckOutcome = Result<RoutedAck, ErrorKind>;
 /// One outbound send request flowing from the facade to the supervisor.
 pub(crate) struct OutboundRequest {
   pub(crate) trace_id: TraceId,
-  pub(crate) target: PacketTarget,
+  pub(crate) target: StreamTarget,
   pub(crate) load_balancer: Option<QualifiedTag>,
   pub(crate) max_hops: u32,
   pub(crate) protocol: ProtocolTag,
-  pub(crate) metadata: PacketMetadata,
-  pub(crate) body: Box<dyn PacketBody>,
+  pub(crate) metadata: StreamMetadata,
+  pub(crate) body: BodyStream,
   /// Core-internal control traffic (membership sync): routed like any
   /// packet but excluded from durable trace persistence.
   pub(crate) internal: bool,
@@ -537,7 +554,7 @@ pub(crate) enum StreamItem {
   End,
 }
 
-/// The [`PacketBody`] backed by one admitted incoming stream's bounded
+/// The body [`Stream`] backed by one admitted incoming stream's bounded
 /// channel. A channel that closes without an `End` item is an interrupted
 /// stream (ADR-0007: no replay, no continuation).
 #[derive(Debug)]
@@ -555,21 +572,22 @@ impl ChannelBody {
   }
 }
 
-impl PacketBody for ChannelBody {
-  fn next_chunk<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move {
-      if self.done {
-        return Ok(None);
+impl Stream for ChannelBody {
+  type Item = Result<Arc<[u8]>>;
+
+  fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    if self.done {
+      return Poll::Ready(None);
+    }
+    match self.receiver.poll_recv(cx) {
+      Poll::Ready(Some(StreamItem::Chunk(bytes))) => Poll::Ready(Some(Ok(bytes))),
+      Poll::Ready(Some(StreamItem::End)) => {
+        self.done = true;
+        Poll::Ready(None)
       }
-      match self.receiver.recv().await {
-        Some(StreamItem::Chunk(bytes)) => Ok(Some(bytes)),
-        Some(StreamItem::End) => {
-          self.done = true;
-          Ok(None)
-        }
-        None => Err(Error::stream_interrupted("packet stream")),
-      }
-    })
+      Poll::Ready(None) => Poll::Ready(Some(Err(Error::stream_interrupted("packet stream")))),
+      Poll::Pending => Poll::Pending,
+    }
   }
 }
 
@@ -648,7 +666,7 @@ pub(crate) fn ack_error(kind: ErrorKind) -> Error {
 mod tests {
   use std::sync::Arc;
 
-  use super::{METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, PacketMetadata};
+  use super::{METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, StreamMetadata};
   use crate::{ErrorKind, QualifiedTag};
 
   fn key(name: &str) -> QualifiedTag {
@@ -656,21 +674,21 @@ mod tests {
   }
 
   #[test]
-  fn tls_transport_packet_metadata_insert_enforces_byte_bound() {
-    let metadata = PacketMetadata::new();
+  fn stream_metadata_insert_enforces_byte_bound() {
+    let metadata = StreamMetadata::new();
     let value: Arc<[u8]> = Arc::from(vec![0_u8; METADATA_MAX_BYTES]);
     let error = metadata.insert(key("oversize"), value).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
 
-    let metadata = PacketMetadata::new()
+    let metadata = StreamMetadata::new()
       .insert(key("small"), Arc::from(&b"value"[..]))
       .unwrap();
     assert_eq!(metadata.get(&key("small")), Some(&b"value"[..]));
   }
 
   #[test]
-  fn tls_transport_packet_metadata_insert_enforces_entry_bound_and_uniqueness() {
-    let mut metadata = PacketMetadata::new();
+  fn stream_metadata_insert_enforces_entry_bound_and_uniqueness() {
+    let mut metadata = StreamMetadata::new();
     for index in 0..METADATA_MAX_ENTRIES {
       let name = format!("entry-{index:04}");
       metadata = metadata.insert(key(&name), Arc::from(&b""[..])).unwrap();
@@ -687,8 +705,8 @@ mod tests {
   }
 
   #[test]
-  fn tls_transport_packet_metadata_entries_are_canonical_ordered() {
-    let metadata = PacketMetadata::new()
+  fn stream_metadata_entries_are_canonical_ordered() {
+    let metadata = StreamMetadata::new()
       .insert(key("zeta"), Arc::from(&b"1"[..]))
       .unwrap()
       .insert(key("alpha"), Arc::from(&b"2"[..]))

@@ -15,7 +15,7 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::page::{ResourcePage, sync as page_sync};
 use crate::{
-  Error, IncomingPacket, ProtocolTag, Result,
+  Error, IncomingStream, ProtocolTag, Result,
   api::BoxFuture,
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::lifecycle::LocalIdentityContext,
@@ -96,7 +96,7 @@ impl ResourceSyncConsumer {
 }
 
 impl PacketConsumer for ResourceSyncConsumer {
-  fn accept<'a>(&'a self, mut packet: IncomingPacket) -> BoxFuture<'a, Result<()>> {
+  fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
       let bytes = crate::sync_common::drain_body(packet.body(), "resource sync body").await?;
       let payload = ResourceSyncPayload::decode(&bytes)?;

@@ -11,11 +11,11 @@ use std::{sync::Arc, time::Duration};
 
 use radiata::{
   BoxFuture, CreateCluster, Endpoint, ErrorKind, EventOptions, EventReceive, GetResource, Listen,
-  LoadBalancingPolicy, NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketMetadata, PacketPolicy,
-  PacketTarget, PageListeners, PageMembers, PageResources, PageSessions, PageSpec, PageTopology,
-  PageTrust, ProtocolDefinition, ProtocolTag, PutResource, RemoveResource, ResourceChanged,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, RevokeNode, RoutingPolicy,
-  SelectResources, Selector, SessionChanged, Shutdown, ShutdownReason, UpdateNodeMetadata,
+  LoadBalancingPolicy, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageListeners, PageMembers,
+  PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition, ProtocolTag,
+  PutResource, RemoveResource, ResourceChanged, ResourceLabels, ResourceName, ResourceUri,
+  ResourceWrite, Result, RevokeNode, RoutingPolicy, SelectResources, Selector, SessionChanged,
+  Shutdown, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, UpdateNodeMetadata,
   extension::KeyProvider,
 };
 
@@ -40,10 +40,15 @@ struct EchoCollector {
 
 impl radiata::PacketConsumer for EchoCollector {
   fn accept<'a>(
-    &'a self, mut packet: radiata::IncomingPacket,
+    &'a self, mut packet: radiata::IncomingStream,
   ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-      while packet.body().next_chunk().await?.is_some() {}
+      let mut body = packet.body();
+      while std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+        .is_some()
+      {}
       *self.packets.lock().unwrap() += 1;
       Ok(())
     })
@@ -75,15 +80,10 @@ impl LoadBalancingPolicy for FirstMatch {
 }
 
 /// A small opaque body for the echo packet.
-#[derive(Debug)]
-struct EchoBody {
-  chunk: Option<Arc<[u8]>>,
-}
-
-impl radiata::PacketBody for EchoBody {
-  fn next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move { Ok(self.chunk.take()) })
-  }
+fn echo_body(
+  chunk: &'static [u8],
+) -> impl futures_core::Stream<Item = Result<Arc<[u8]>>> + Send + 'static {
+  futures_util::stream::once(async move { Ok(Arc::from(chunk) as Arc<[u8]>) })
 }
 
 async fn start_node(seed: u64, echo: bool) -> Node {
@@ -603,21 +603,16 @@ async fn g9_facade_core_only_operations() {
   let selector = Selector::parse("example.org/labels/zone=edge").unwrap();
   let packet = issuer
     .handle
-    .create_packet(
-      PacketTarget::MatchingNodes(selector),
+    .open_stream(
+      StreamTarget::MatchingNodes(selector),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      PacketPolicy::new(RoutingPolicy::Direct, 1)
+      StreamPolicy::new(RoutingPolicy::Direct, 1)
         .unwrap()
         .load_balancer(radiata::QualifiedTag::parse(LOAD_BALANCER).unwrap()),
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let ack = packet
-    .send_sync(Box::new(EchoBody {
-      chunk: Some(Arc::from(&b"hello"[..])),
-    }))
-    .await
-    .unwrap();
+  let ack = packet.send_sync(echo_body(b"hello")).await.unwrap();
   assert_eq!(ack.destination(), &member_id);
 
   // Paged population views: members, trust, topology.
@@ -782,8 +777,8 @@ async fn g9_resource_labels_never_enable_protocols() {
   // regardless of the resource label.
   let error = issuer
     .handle
-    .create_packet(
-      PacketTarget::Exact(
+    .open_stream(
+      StreamTarget::Exact(
         member
           .handle
           .query(radiata::GetLocalNode::new())
@@ -793,8 +788,8 @@ async fn g9_resource_labels_never_enable_protocols() {
           .clone(),
       ),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      PacketPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
-      PacketMetadata::new(),
+      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamMetadata::new(),
     )
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Unsupported);

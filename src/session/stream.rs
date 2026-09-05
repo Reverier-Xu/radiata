@@ -31,12 +31,12 @@ use tracing::{debug, instrument, trace, warn};
 
 use super::{driver::EstablishedSession, forward};
 use crate::{
-  Error, ErrorKind, NodeId, PacketMetadata, ProtocolTag, QualifiedTag, Result, TraceId,
+  Error, ErrorKind, NodeId, ProtocolTag, QualifiedTag, Result, StreamMetadata, TraceId,
   api::BoxFuture,
   extension_registry::ExtensionRegistry,
   packet::{
-    AckOutcome, ChannelBody, IncomingPacket, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext,
-    PacketTarget, RouteRecord, RouteState, StreamItem,
+    AckOutcome, ChannelBody, IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext,
+    RouteRecord, RouteState, StreamItem, StreamTarget,
     wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, OpenFrame},
   },
   protocol::wire::PacketKind,
@@ -1126,13 +1126,13 @@ async fn admit_open(
             admitted_at_millis: admitted_at,
           },
         );
-        let packet = IncomingPacket::new(
+        let packet = IncomingStream::new(
           open.source,
           open.destination,
           open.trace_id,
           open.protocol,
           open.metadata,
-          ChannelBody::new(body),
+          Box::pin(ChannelBody::new(body)),
           PacketReplyContext::new(context.registry.clone(), context.runtime.clone()),
         );
         let consumer = Arc::clone(&registration.consumer);
@@ -1262,8 +1262,8 @@ pub(crate) async fn run_outbound(
   // The supervisor resolves selector targets before spawning the pump; a
   // matching-node request that reaches this point is an internal error.
   let destination = match request.target.clone() {
-    PacketTarget::Exact(destination) => destination,
-    PacketTarget::MatchingNodes(_) => {
+    StreamTarget::Exact(destination) => destination,
+    StreamTarget::MatchingNodes(_) => {
       request.reject(ErrorKind::Internal);
       return;
     }
@@ -1333,7 +1333,7 @@ pub(crate) async fn run_outbound(
   // Selector-selected and multi-hop-routed deliveries carry the route
   // envelope (the current wire fixture): every hop re-validates the chain
   // before admission. Direct exact-node sends keep the previous shape.
-  let route = if force_routed || matches!(request.target, PacketTarget::MatchingNodes(_)) {
+  let route = if force_routed || matches!(request.target, StreamTarget::MatchingNodes(_)) {
     Some(
       crate::routing::RouteContext::new(
         trace_id.clone(),
@@ -1407,8 +1407,8 @@ pub(crate) async fn run_outbound(
   let mut sequence = 0_u64;
   let mut body = request.body;
   loop {
-    match body.next_chunk().await {
-      Ok(Some(bytes)) => {
+    match std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+      Some(Ok(bytes)) => {
         if bytes.len() > MAX_CHUNK_BYTES {
           terminal!(ErrorKind::InvalidInput);
           return;
@@ -1444,8 +1444,8 @@ pub(crate) async fn run_outbound(
           record.forward(forwarded);
         });
       }
-      Ok(None) => break,
-      Err(error) => {
+      None => break,
+      Some(Err(error)) => {
         terminal!(error.kind());
         return;
       }
@@ -1573,7 +1573,7 @@ fn withdraw_pending(entry: &SessionEntry, trace_id: &TraceId) {
 /// protocol, canonical metadata): identical retransmissions produce the
 /// same digest; any mutation produces a different one.
 pub(crate) fn opening_context_digest(
-  source: &NodeId, destination: &NodeId, protocol: &ProtocolTag, metadata: &PacketMetadata,
+  source: &NodeId, destination: &NodeId, protocol: &ProtocolTag, metadata: &StreamMetadata,
 ) -> crate::Digest {
   let mut bytes = Vec::with_capacity(128);
   bytes.extend_from_slice(source.as_str().as_bytes());
@@ -1937,7 +1937,7 @@ mod pending_admission_tests {
     SessionMeta, run_outbound,
   };
   use crate::{
-    ErrorKind, NodeId, PacketMetadata, PacketTarget, ProtocolTag, TraceId, packet::StaticBody,
+    ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId, packet::StaticBody,
     storage::contract::helpers::ManualClock,
   };
 
@@ -1992,12 +1992,12 @@ mod pending_admission_tests {
     let (ack_tx, ack_rx) = oneshot::channel();
     let request = crate::packet::OutboundRequest {
       trace_id: TraceId::parse("trace_000000000000000000099").unwrap(),
-      target: PacketTarget::Exact(node(2)),
+      target: StreamTarget::Exact(node(2)),
       load_balancer: None,
       max_hops: 1,
       protocol: ProtocolTag::parse("radiata.woooo.tech/protocols/test").unwrap(),
-      metadata: PacketMetadata::new(),
-      body: Box::new(StaticBody::new(Arc::from(&b"x"[..]))),
+      metadata: StreamMetadata::new(),
+      body: Box::pin(StaticBody::new(Arc::from(&b"x"[..]))),
       internal: true,
       ack_notify: ack_tx,
     };
@@ -2027,7 +2027,7 @@ mod admission_tests {
 
   use super::opening_context_digest;
   use crate::{
-    NodeId, PacketMetadata, ProtocolTag, QualifiedTag, TraceId, identity::signature::body_digest,
+    NodeId, ProtocolTag, QualifiedTag, StreamMetadata, TraceId, identity::signature::body_digest,
   };
 
   fn node(value: u8) -> NodeId {
@@ -2042,8 +2042,8 @@ mod admission_tests {
     ProtocolTag::parse(&format!("radiata.woooo.tech/protocols/{name}")).unwrap()
   }
 
-  fn metadata(entries: &[(&str, &[u8])]) -> PacketMetadata {
-    let mut md = PacketMetadata::new();
+  fn metadata(entries: &[(&str, &[u8])]) -> StreamMetadata {
+    let mut md = StreamMetadata::new();
     for (name, value) in entries {
       let key: QualifiedTag = format!("radiata.woooo.tech/labels/{name}").parse().unwrap();
       md = md.insert(key, Arc::from(*value)).unwrap();
@@ -2112,7 +2112,7 @@ mod admission_tests {
   /// entry-value change is visible.
   #[test]
   fn metadata_ordering_is_canonical_in_the_digest() {
-    let a = PacketMetadata::new()
+    let a = StreamMetadata::new()
       .insert(
         "radiata.woooo.tech/labels/alpha".parse().unwrap(),
         Arc::from(&b"1"[..]),
@@ -2123,7 +2123,7 @@ mod admission_tests {
         Arc::from(&b"2"[..]),
       )
       .unwrap();
-    let b = PacketMetadata::new()
+    let b = StreamMetadata::new()
       .insert(
         "radiata.woooo.tech/labels/zeta".parse().unwrap(),
         Arc::from(&b"2"[..]),

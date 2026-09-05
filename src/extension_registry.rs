@@ -10,7 +10,7 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{
-  DiscoveryTag, Error, FeatureTag, IncomingPacket, ProtocolTag, Result, TransportTag,
+  DiscoveryTag, Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag,
   api::BoxFuture,
   transport::registry::{Discovery, Transport},
 };
@@ -42,7 +42,7 @@ impl ProtocolDefinition {
 /// `accept` is invoked once per admitted stream, after authentication and
 /// admission; it owns all application meaning of the packet.
 pub trait PacketConsumer: fmt::Debug + Send + Sync + 'static {
-  fn accept<'a>(&'a self, packet: IncomingPacket) -> BoxFuture<'a, Result<()>>;
+  fn accept<'a>(&'a self, packet: IncomingStream) -> BoxFuture<'a, Result<()>>;
 }
 
 /// One registered protocol: its definition plus the receiving consumer.
@@ -151,8 +151,8 @@ impl ExtensionRegistry {
 
   /// Registers one load-balancing policy under a canonical tag
   /// (T-G06-01). A duplicate tag is a conflict; registration never
-  /// replaces an existing entry. Matching-node packet targets resolve
-  /// their `PacketPolicy` load-balancer tag here at send time.
+  /// replaces an existing entry. Matching-node stream targets resolve
+  /// their `StreamPolicy` load-balancer tag here at send time.
   pub fn register_load_balancer(
     &mut self, tag: crate::QualifiedTag, value: Arc<dyn crate::LoadBalancingPolicy>,
   ) -> Result<&mut Self> {
@@ -317,13 +317,13 @@ mod tests {
   use std::sync::Arc;
 
   use super::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
-  use crate::{ErrorKind, FeatureTag, IncomingPacket, ProtocolTag, Result, api::BoxFuture};
+  use crate::{ErrorKind, FeatureTag, IncomingStream, ProtocolTag, Result, api::BoxFuture};
 
   #[derive(Debug)]
   struct NoopConsumer;
 
   impl PacketConsumer for NoopConsumer {
-    fn accept<'a>(&'a self, _packet: IncomingPacket) -> BoxFuture<'a, Result<()>> {
+    fn accept<'a>(&'a self, _packet: IncomingStream) -> BoxFuture<'a, Result<()>> {
       Box::pin(async { Ok(()) })
     }
   }

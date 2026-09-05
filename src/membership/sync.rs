@@ -15,7 +15,7 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{
-  ClusterId, Error, IncomingPacket, NodeId, ProtocolTag, Result,
+  ClusterId, Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::{BoxFuture, Entropy},
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::{
@@ -124,7 +124,7 @@ impl MembershipSyncConsumer {
 }
 
 impl PacketConsumer for MembershipSyncConsumer {
-  fn accept<'a>(&'a self, mut packet: IncomingPacket) -> BoxFuture<'a, Result<()>> {
+  fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
       let bytes = crate::sync_common::drain_body(packet.body(), "membership sync body").await?;
       let payload = SyncPayload::decode(&bytes)?;

@@ -1,32 +1,32 @@
 pub mod radiata
 pub mod radiata::adapters
-pub fn radiata::adapters::json_store(path: std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
-pub fn radiata::adapters::redb_store(path: std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
+pub fn radiata::adapters::json_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
+pub fn radiata::adapters::redb_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
 pub mod radiata::extension
 pub trait radiata::extension::Entropy: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::extension::Entropy::fill(&self, output: &mut [u8]) -> radiata::Result<()>
+pub fn radiata::extension::Entropy::fill(&self, &mut [u8]) -> radiata::Result<()>
 pub trait radiata::extension::KeyProvider: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::extension::KeyProvider::capabilities(&self) -> radiata::KeyCapabilities
-pub fn radiata::extension::KeyProvider::create_ed25519<'a>(&'a self, operation: &'a radiata::KeyOperationId) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyCreateState>>
-pub fn radiata::extension::KeyProvider::delete<'a>(&'a self, operation: &'a radiata::KeyOperationId, handle: &'a radiata::KeyHandle) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyDeleteState>>
-pub fn radiata::extension::KeyProvider::public_key<'a>(&'a self, handle: &'a radiata::KeyHandle) -> radiata::BoxFuture<'a, radiata::Result<radiata::PublicKey>>
-pub fn radiata::extension::KeyProvider::reconcile_create<'a>(&'a self, operation: &'a radiata::KeyOperationId) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyCreateState>>
-pub fn radiata::extension::KeyProvider::reconcile_delete<'a>(&'a self, operation: &'a radiata::KeyOperationId, handle: &'a radiata::KeyHandle) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyDeleteState>>
-pub fn radiata::extension::KeyProvider::sign<'a>(&'a self, handle: &'a radiata::KeyHandle, message: &'a [u8]) -> radiata::BoxFuture<'a, radiata::Result<radiata::Signature>>
+pub fn radiata::extension::KeyProvider::create_ed25519<'a>(&'a self, &'a radiata::KeyOperationId) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyCreateState>>
+pub fn radiata::extension::KeyProvider::delete<'a>(&'a self, &'a radiata::KeyOperationId, &'a radiata::KeyHandle) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyDeleteState>>
+pub fn radiata::extension::KeyProvider::public_key<'a>(&'a self, &'a radiata::KeyHandle) -> radiata::BoxFuture<'a, radiata::Result<radiata::PublicKey>>
+pub fn radiata::extension::KeyProvider::reconcile_create<'a>(&'a self, &'a radiata::KeyOperationId) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyCreateState>>
+pub fn radiata::extension::KeyProvider::reconcile_delete<'a>(&'a self, &'a radiata::KeyOperationId, &'a radiata::KeyHandle) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyDeleteState>>
+pub fn radiata::extension::KeyProvider::sign<'a>(&'a self, &'a radiata::KeyHandle, &'a [u8]) -> radiata::BoxFuture<'a, radiata::Result<radiata::Signature>>
 pub trait radiata::extension::Storage: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::extension::Storage::capabilities(&self) -> radiata::StoreCapabilities
-pub fn radiata::extension::Storage::commit<'a>(&'a self, transaction: radiata::StoreTransaction) -> radiata::BoxFuture<'a, radiata::Result<radiata::CommitOutcome>>
+pub fn radiata::extension::Storage::commit<'a>(&'a self, radiata::StoreTransaction) -> radiata::BoxFuture<'a, radiata::Result<radiata::CommitOutcome>>
 pub fn radiata::extension::Storage::flush<'a>(&'a self) -> radiata::BoxFuture<'a, radiata::Result<()>>
-pub fn radiata::extension::Storage::reconcile<'a>(&'a self, transaction: &'a radiata::TransactionId, digest: &'a radiata::Digest) -> radiata::BoxFuture<'a, radiata::Result<radiata::ReconcileOutcome>>
+pub fn radiata::extension::Storage::reconcile<'a>(&'a self, &'a radiata::TransactionId, &'a radiata::Digest) -> radiata::BoxFuture<'a, radiata::Result<radiata::ReconcileOutcome>>
 pub fn radiata::extension::Storage::snapshot<'a>(&'a self) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<dyn radiata::extension::StoreSnapshot>>>
 pub trait radiata::extension::StorageFactory: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::extension::StorageFactory::open<'a>(&'a self, requirements: radiata::StoreRequirements) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<dyn radiata::extension::Storage>>>
+pub fn radiata::extension::StorageFactory::open<'a>(&'a self, radiata::StoreRequirements) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<dyn radiata::extension::Storage>>>
 pub trait radiata::extension::StoreScan: core::fmt::Debug + core::marker::Send
 pub fn radiata::extension::StoreScan::next<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<core::option::Option<radiata::StoreEntry>>>
 pub trait radiata::extension::StoreSnapshot: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::extension::StoreSnapshot::get<'a>(&'a self, namespace: &'a radiata::StoreNamespace, key: &'a radiata::StoreKey) -> radiata::BoxFuture<'a, radiata::Result<core::option::Option<radiata::StoreValue>>>
+pub fn radiata::extension::StoreSnapshot::get<'a>(&'a self, &'a radiata::StoreNamespace, &'a radiata::StoreKey) -> radiata::BoxFuture<'a, radiata::Result<core::option::Option<radiata::StoreValue>>>
 pub fn radiata::extension::StoreSnapshot::revision(&self) -> &radiata::StoreRevision
-pub fn radiata::extension::StoreSnapshot::scan<'a>(&'a self, namespace: &'a radiata::StoreNamespace, prefix: &'a [u8]) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<(dyn radiata::extension::StoreScan + 'a)>>>
+pub fn radiata::extension::StoreSnapshot::scan<'a>(&'a self, &'a radiata::StoreNamespace, &'a [u8]) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<(dyn radiata::extension::StoreScan + 'a)>>>
 #[non_exhaustive] pub enum radiata::CommitOutcome
 pub radiata::CommitOutcome::Aborted
 pub radiata::CommitOutcome::Committed(radiata::CommitReceipt)
@@ -85,9 +85,6 @@ pub radiata::NodeStatus::Running
 pub radiata::NodeStatus::ShuttingDown
 pub radiata::NodeStatus::Starting
 pub radiata::NodeStatus::Stopped
-#[non_exhaustive] pub enum radiata::PacketTarget
-pub radiata::PacketTarget::Exact(radiata::NodeId)
-pub radiata::PacketTarget::MatchingNodes(radiata::Selector)
 #[non_exhaustive] pub enum radiata::ProviderErrorContext
 pub radiata::ProviderErrorContext::Discovery
 pub radiata::ProviderErrorContext::Entropy
@@ -162,6 +159,9 @@ pub radiata::StoreOperation::Put::expected: radiata::StoreExpectation
 pub radiata::StoreOperation::Put::key: radiata::StoreKey
 pub radiata::StoreOperation::Put::namespace: radiata::StoreNamespace
 pub radiata::StoreOperation::Put::value: radiata::StoreValue
+#[non_exhaustive] pub enum radiata::StreamTarget
+pub radiata::StreamTarget::Exact(radiata::NodeId)
+pub radiata::StreamTarget::MatchingNodes(radiata::Selector)
 #[non_exhaustive] pub enum radiata::TrustStatus
 pub radiata::TrustStatus::Revoked
 pub radiata::TrustStatus::Trusted
@@ -173,18 +173,18 @@ pub fn radiata::AdmissionView::issuer(&self) -> &radiata::NodeId
 pub struct radiata::ChannelBinding(_)
 impl radiata::ChannelBinding
 pub const fn radiata::ChannelBinding::as_bytes(&self) -> &[u8; 32]
-pub const fn radiata::ChannelBinding::from_tls_exporter(value: [u8; 32]) -> Self
+pub const fn radiata::ChannelBinding::from_tls_exporter([u8; 32]) -> Self
 pub struct radiata::ClusterId(_)
 impl radiata::ClusterId
 pub fn radiata::ClusterId::as_str(&self) -> &str
-pub fn radiata::ClusterId::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::ClusterId::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::ClusterId
-pub fn radiata::ClusterId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ClusterId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::ClusterId
-pub fn radiata::ClusterId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ClusterId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::ClusterId
 pub type radiata::ClusterId::Err = radiata::Error
-pub fn radiata::ClusterId::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::ClusterId::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ClusterView
 impl radiata::ClusterView
 pub fn radiata::ClusterView::cluster_id(&self) -> &radiata::ClusterId
@@ -192,12 +192,12 @@ pub fn radiata::ClusterView::creator(&self) -> &radiata::NodeId
 pub struct radiata::CommitReceipt
 impl radiata::CommitReceipt
 pub fn radiata::CommitReceipt::committed_revision(&self) -> &radiata::StoreRevision
-pub fn radiata::CommitReceipt::new(transaction: radiata::TransactionId, operation_digest: radiata::Digest, committed_revision: radiata::StoreRevision) -> Self
+pub fn radiata::CommitReceipt::new(radiata::TransactionId, radiata::Digest, radiata::StoreRevision) -> Self
 pub fn radiata::CommitReceipt::operation_digest(&self) -> &radiata::Digest
 pub fn radiata::CommitReceipt::transaction(&self) -> &radiata::TransactionId
 pub struct radiata::ConnectMember
 impl radiata::ConnectMember
-pub fn radiata::ConnectMember::new(receiver: radiata::Endpoint, peer: radiata::NodeId) -> Self
+pub fn radiata::ConnectMember::new(radiata::Endpoint, radiata::NodeId) -> Self
 impl radiata::Command for radiata::ConnectMember
 pub type radiata::ConnectMember::Output = radiata::NodeId
 pub struct radiata::CreateCluster
@@ -208,7 +208,7 @@ pub type radiata::CreateCluster::Output = radiata::ClusterView
 pub struct radiata::CreatedKey
 impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
-pub fn radiata::CreatedKey::new(handle: radiata::KeyHandle, public_key: radiata::PublicKey) -> Self
+pub fn radiata::CreatedKey::new(radiata::KeyHandle, radiata::PublicKey) -> Self
 pub fn radiata::CreatedKey::public_key(&self) -> &radiata::PublicKey
 pub struct radiata::DeliveryAck
 impl radiata::DeliveryAck
@@ -218,61 +218,61 @@ pub fn radiata::DeliveryAck::trace_id(&self) -> &radiata::TraceId
 pub struct radiata::Digest(_)
 impl radiata::Digest
 pub const fn radiata::Digest::as_bytes(&self) -> &[u8; 32]
-pub const fn radiata::Digest::from_bytes(value: [u8; 32]) -> Self
+pub const fn radiata::Digest::from_bytes([u8; 32]) -> Self
 impl core::fmt::Debug for radiata::Digest
-pub fn radiata::Digest::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::Digest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::DisconnectPeer
 impl radiata::DisconnectPeer
-pub fn radiata::DisconnectPeer::new(peer: radiata::NodeId) -> Self
+pub fn radiata::DisconnectPeer::new(radiata::NodeId) -> Self
 impl radiata::Command for radiata::DisconnectPeer
 pub type radiata::DisconnectPeer::Output = ()
 pub struct radiata::DiscoveryPage
 impl radiata::DiscoveryPage
 pub fn radiata::DiscoveryPage::items(&self) -> &[radiata::EndpointCandidate]
-pub fn radiata::DiscoveryPage::new(items: alloc::vec::Vec<radiata::EndpointCandidate>, next: core::option::Option<radiata::PageCursor>) -> radiata::Result<Self>
+pub fn radiata::DiscoveryPage::new(alloc::vec::Vec<radiata::EndpointCandidate>, core::option::Option<radiata::PageCursor>) -> radiata::Result<Self>
 pub const fn radiata::DiscoveryPage::next(&self) -> core::option::Option<&radiata::PageCursor>
 pub struct radiata::DiscoveryTag(_)
 impl radiata::DiscoveryTag
 pub fn radiata::DiscoveryTag::as_str(&self) -> &str
 pub fn radiata::DiscoveryTag::domain(&self) -> &str
-pub fn radiata::DiscoveryTag::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::DiscoveryTag::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::DiscoveryTag
-pub fn radiata::DiscoveryTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::DiscoveryTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::DiscoveryTag
-pub fn radiata::DiscoveryTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::DiscoveryTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::DiscoveryTag
 pub type radiata::DiscoveryTag::Err = radiata::Error
-pub fn radiata::DiscoveryTag::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::DiscoveryTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::Endpoint
 impl radiata::Endpoint
 pub fn radiata::Endpoint::as_str(&self) -> &str
-pub fn radiata::Endpoint::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::Endpoint::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::Endpoint
-pub fn radiata::Endpoint::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::Endpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::Endpoint
-pub fn radiata::Endpoint::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::Endpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::Endpoint
 pub type radiata::Endpoint::Err = radiata::Error
-pub fn radiata::Endpoint::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::Endpoint::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::EndpointCandidate
 impl radiata::EndpointCandidate
 pub const fn radiata::EndpointCandidate::endpoint(&self) -> &radiata::Endpoint
-pub fn radiata::EndpointCandidate::new(endpoint: radiata::Endpoint) -> Self
+pub fn radiata::EndpointCandidate::new(radiata::Endpoint) -> Self
 pub const fn radiata::EndpointCandidate::priority(&self) -> i32
-pub fn radiata::EndpointCandidate::with_priority(self, value: i32) -> Self
+pub fn radiata::EndpointCandidate::with_priority(self, i32) -> Self
 pub struct radiata::Error
 impl radiata::Error
 pub fn radiata::Error::context(&self) -> &'static str
 pub fn radiata::Error::kind(&self) -> radiata::ErrorKind
-pub fn radiata::Error::provider(kind: radiata::ProviderErrorKind, context: radiata::ProviderErrorContext) -> Self
+pub fn radiata::Error::provider(radiata::ProviderErrorKind, radiata::ProviderErrorContext) -> Self
 impl core::error::Error for radiata::Error
 impl core::fmt::Debug for radiata::Error
-pub fn radiata::Error::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::Error
-pub fn radiata::Error::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::EventOptions
 impl radiata::EventOptions
-pub fn radiata::EventOptions::capacity(self, value: usize) -> radiata::Result<Self>
+pub fn radiata::EventOptions::capacity(self, usize) -> radiata::Result<Self>
 pub fn radiata::EventOptions::new() -> Self
 impl core::default::Default for radiata::EventOptions
 pub fn radiata::EventOptions::default() -> Self
@@ -283,30 +283,30 @@ pub fn radiata::EventSubscription<E>::try_recv(&mut self) -> radiata::Result<rad
 pub struct radiata::ExtensionRegistry
 impl radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::new() -> Self
-pub fn radiata::ExtensionRegistry::register_feature(&mut self, value: radiata::FeatureDefinition) -> radiata::Result<&mut Self>
-pub fn radiata::ExtensionRegistry::register_load_balancer(&mut self, tag: radiata::QualifiedTag, value: alloc::sync::Arc<dyn radiata::LoadBalancingPolicy>) -> radiata::Result<&mut Self>
-pub fn radiata::ExtensionRegistry::register_next_hop(&mut self, tag: radiata::QualifiedTag, value: alloc::sync::Arc<dyn radiata::RouteNextHop>) -> radiata::Result<&mut Self>
-pub fn radiata::ExtensionRegistry::register_protocol(&mut self, value: radiata::ProtocolDefinition, consumer: alloc::sync::Arc<dyn radiata::PacketConsumer>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_feature(&mut self, radiata::FeatureDefinition) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_load_balancer(&mut self, radiata::QualifiedTag, alloc::sync::Arc<dyn radiata::LoadBalancingPolicy>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_next_hop(&mut self, radiata::QualifiedTag, alloc::sync::Arc<dyn radiata::RouteNextHop>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_protocol(&mut self, radiata::ProtocolDefinition, alloc::sync::Arc<dyn radiata::PacketConsumer>) -> radiata::Result<&mut Self>
 impl core::fmt::Debug for radiata::ExtensionRegistry
-pub fn radiata::ExtensionRegistry::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ExtensionRegistry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::FeatureDefinition
 impl radiata::FeatureDefinition
-pub fn radiata::FeatureDefinition::conflict(self, tag: radiata::FeatureTag) -> radiata::Result<Self>
-pub fn radiata::FeatureDefinition::dependency(self, tag: radiata::FeatureTag) -> radiata::Result<Self>
-pub fn radiata::FeatureDefinition::new(tag: radiata::FeatureTag, fingerprint: radiata::Digest) -> radiata::Result<Self>
-pub fn radiata::FeatureDefinition::protocol(self, tag: radiata::ProtocolTag) -> radiata::Result<Self>
+pub fn radiata::FeatureDefinition::conflict(self, radiata::FeatureTag) -> radiata::Result<Self>
+pub fn radiata::FeatureDefinition::dependency(self, radiata::FeatureTag) -> radiata::Result<Self>
+pub fn radiata::FeatureDefinition::new(radiata::FeatureTag, radiata::Digest) -> radiata::Result<Self>
+pub fn radiata::FeatureDefinition::protocol(self, radiata::ProtocolTag) -> radiata::Result<Self>
 pub struct radiata::FeatureTag(_)
 impl radiata::FeatureTag
 pub fn radiata::FeatureTag::as_str(&self) -> &str
 pub fn radiata::FeatureTag::domain(&self) -> &str
-pub fn radiata::FeatureTag::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::FeatureTag::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::FeatureTag
-pub fn radiata::FeatureTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::FeatureTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::FeatureTag
-pub fn radiata::FeatureTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::FeatureTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::FeatureTag
 pub type radiata::FeatureTag::Err = radiata::Error
-pub fn radiata::FeatureTag::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::FeatureTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::GetLocalNode
 impl radiata::GetLocalNode
 pub fn radiata::GetLocalNode::new() -> Self
@@ -314,7 +314,7 @@ impl radiata::Query for radiata::GetLocalNode
 pub type radiata::GetLocalNode::Output = radiata::LocalNodeView
 pub struct radiata::GetMember
 impl radiata::GetMember
-pub fn radiata::GetMember::new(node: radiata::NodeId) -> Self
+pub fn radiata::GetMember::new(radiata::NodeId) -> Self
 impl radiata::Query for radiata::GetMember
 pub type radiata::GetMember::Output = core::option::Option<radiata::MemberView>
 pub struct radiata::GetNodeStatus
@@ -329,12 +329,12 @@ impl radiata::Query for radiata::GetObservability
 pub type radiata::GetObservability::Output = radiata::ObservabilitySnapshot
 pub struct radiata::GetResource
 impl radiata::GetResource
-pub fn radiata::GetResource::new(name: radiata::ResourceName) -> Self
+pub fn radiata::GetResource::new(radiata::ResourceName) -> Self
 impl radiata::Query for radiata::GetResource
 pub type radiata::GetResource::Output = core::option::Option<radiata::ResourceView>
 pub struct radiata::GetRoute
 impl radiata::GetRoute
-pub fn radiata::GetRoute::new(handle: radiata::RouteHandle) -> Self
+pub fn radiata::GetRoute::new(radiata::RouteHandle) -> Self
 impl radiata::Query for radiata::GetRoute
 pub type radiata::GetRoute::Output = radiata::RouteStatusView
 pub struct radiata::IdentityReplaced
@@ -342,91 +342,91 @@ impl radiata::IdentityReplaced
 pub fn radiata::IdentityReplaced::former_identity(&self) -> &radiata::NodeId
 pub fn radiata::IdentityReplaced::replacement_identity(&self) -> &radiata::NodeId
 impl radiata::Event for radiata::IdentityReplaced
-pub struct radiata::IncomingPacket
-impl radiata::IncomingPacket
-pub fn radiata::IncomingPacket::body(&mut self) -> &mut dyn radiata::PacketBody
-pub fn radiata::IncomingPacket::derive_return_packet(&self, protocol: radiata::ProtocolTag, metadata: radiata::PacketMetadata) -> radiata::Result<radiata::OutboundPacket>
-pub fn radiata::IncomingPacket::destination(&self) -> &radiata::NodeId
-pub fn radiata::IncomingPacket::metadata(&self) -> &radiata::PacketMetadata
-pub fn radiata::IncomingPacket::protocol(&self) -> &radiata::ProtocolTag
-pub fn radiata::IncomingPacket::source(&self) -> &radiata::NodeId
-pub fn radiata::IncomingPacket::trace_id(&self) -> &radiata::TraceId
-impl core::fmt::Debug for radiata::IncomingPacket
-pub fn radiata::IncomingPacket::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::IncomingStream
+impl radiata::IncomingStream
+pub fn radiata::IncomingStream::body(&mut self) -> core::pin::Pin<&mut (dyn futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send)>
+pub fn radiata::IncomingStream::derive_return_stream(&self, radiata::ProtocolTag, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
+pub fn radiata::IncomingStream::destination(&self) -> &radiata::NodeId
+pub fn radiata::IncomingStream::metadata(&self) -> &radiata::StreamMetadata
+pub fn radiata::IncomingStream::protocol(&self) -> &radiata::ProtocolTag
+pub fn radiata::IncomingStream::source(&self) -> &radiata::NodeId
+pub fn radiata::IncomingStream::trace_id(&self) -> &radiata::TraceId
+impl core::fmt::Debug for radiata::IncomingStream
+pub fn radiata::IncomingStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::IssuedJoinCredential
 impl radiata::IssuedJoinCredential
 pub fn radiata::IssuedJoinCredential::credential(&self) -> &radiata::JoinCredential
 pub fn radiata::IssuedJoinCredential::expires_at(&self) -> std::time::SystemTime
 pub fn radiata::IssuedJoinCredential::into_credential(self) -> radiata::JoinCredential
 impl core::fmt::Debug for radiata::IssuedJoinCredential
-pub fn radiata::IssuedJoinCredential::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::IssuedJoinCredential::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::JoinCluster
 impl radiata::JoinCluster
-pub fn radiata::JoinCluster::new(receiver: radiata::Endpoint, credential: radiata::JoinCredential) -> Self
+pub fn radiata::JoinCluster::new(radiata::Endpoint, radiata::JoinCredential) -> Self
 impl radiata::Command for radiata::JoinCluster
 pub type radiata::JoinCluster::Output = radiata::AdmissionView
 pub struct radiata::JoinCredential
 impl radiata::JoinCredential
 pub fn radiata::JoinCredential::expose_secret(&self) -> &str
-pub fn radiata::JoinCredential::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::JoinCredential::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::JoinCredential
-pub fn radiata::JoinCredential::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::JoinCredential::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::KeyCapabilities
 impl radiata::KeyCapabilities
-pub fn radiata::KeyCapabilities::deletion(self, supported: bool) -> Self
-pub fn radiata::KeyCapabilities::ed25519(self, supported: bool) -> Self
+pub fn radiata::KeyCapabilities::deletion(self, bool) -> Self
+pub fn radiata::KeyCapabilities::ed25519(self, bool) -> Self
 pub fn radiata::KeyCapabilities::has_deletion(&self) -> bool
 pub fn radiata::KeyCapabilities::has_ed25519(&self) -> bool
 pub fn radiata::KeyCapabilities::has_reconciliation(&self) -> bool
 pub fn radiata::KeyCapabilities::new() -> Self
-pub fn radiata::KeyCapabilities::reconciliation(self, supported: bool) -> Self
+pub fn radiata::KeyCapabilities::reconciliation(self, bool) -> Self
 pub struct radiata::KeyHandle(_)
 impl radiata::KeyHandle
 pub fn radiata::KeyHandle::expose_provider_handle(&self) -> &[u8]
-pub fn radiata::KeyHandle::from_provider_bytes(value: alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::KeyHandle::from_provider_bytes(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::KeyHandle
-pub fn radiata::KeyHandle::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::KeyHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::KeyOperationId(_)
 impl radiata::KeyOperationId
 pub fn radiata::KeyOperationId::as_str(&self) -> &str
-pub fn radiata::KeyOperationId::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::KeyOperationId::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::KeyOperationId
-pub fn radiata::KeyOperationId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::KeyOperationId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::KeyOperationId
-pub fn radiata::KeyOperationId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::KeyOperationId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::KeyOperationId
 pub type radiata::KeyOperationId::Err = radiata::Error
-pub fn radiata::KeyOperationId::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::KeyOperationId::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::LabelKey(_)
 impl radiata::LabelKey
 pub fn radiata::LabelKey::as_str(&self) -> &str
-pub fn radiata::LabelKey::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::LabelKey::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::LabelKey
-pub fn radiata::LabelKey::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::LabelKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::LabelKey
-pub fn radiata::LabelKey::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::LabelKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::LabelKey
 pub type radiata::LabelKey::Err = radiata::Error
-pub fn radiata::LabelKey::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::LabelKey::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::LabelSet
 impl radiata::LabelSet
 pub fn radiata::LabelSet::entries(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = (&radiata::LabelKey, &radiata::LabelValue)>
-pub fn radiata::LabelSet::get(&self, key: &radiata::LabelKey) -> core::option::Option<&radiata::LabelValue>
-pub fn radiata::LabelSet::insert(self, key: radiata::LabelKey, value: radiata::LabelValue) -> radiata::Result<Self>
+pub fn radiata::LabelSet::get(&self, &radiata::LabelKey) -> core::option::Option<&radiata::LabelValue>
+pub fn radiata::LabelSet::insert(self, radiata::LabelKey, radiata::LabelValue) -> radiata::Result<Self>
 pub fn radiata::LabelSet::new() -> Self
 impl core::fmt::Debug for radiata::LabelSet
-pub fn radiata::LabelSet::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::LabelSet::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::LabelValue(_)
 impl radiata::LabelValue
 pub fn radiata::LabelValue::as_str(&self) -> &str
-pub fn radiata::LabelValue::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::LabelValue::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::LabelValue
-pub fn radiata::LabelValue::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::LabelValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::LabelValue
-pub fn radiata::LabelValue::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::LabelValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::LeaveCluster
 impl radiata::LeaveCluster
-pub fn radiata::LeaveCluster::new(acknowledgement: radiata::ReplaceIdentityAndDeleteOldCoreMetadata) -> Self
+pub fn radiata::LeaveCluster::new(radiata::ReplaceIdentityAndDeleteOldCoreMetadata) -> Self
 impl radiata::Command for radiata::LeaveCluster
 pub type radiata::LeaveCluster::Output = radiata::LeaveOutcome
 pub struct radiata::LeaveOutcome
@@ -435,20 +435,20 @@ pub fn radiata::LeaveOutcome::former_identity(&self) -> &radiata::NodeId
 pub fn radiata::LeaveOutcome::replacement_identity(&self) -> &radiata::NodeId
 pub struct radiata::Listen
 impl radiata::Listen
-pub fn radiata::Listen::new(endpoint: radiata::Endpoint) -> Self
+pub fn radiata::Listen::new(radiata::Endpoint) -> Self
 impl radiata::Command for radiata::Listen
 pub type radiata::Listen::Output = radiata::ListenerView
 pub struct radiata::ListenerId(_)
 impl radiata::ListenerId
 pub fn radiata::ListenerId::as_str(&self) -> &str
-pub fn radiata::ListenerId::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::ListenerId::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::ListenerId
-pub fn radiata::ListenerId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ListenerId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::ListenerId
-pub fn radiata::ListenerId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ListenerId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::ListenerId
 pub type radiata::ListenerId::Err = radiata::Error
-pub fn radiata::ListenerId::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::ListenerId::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ListenerPage
 impl radiata::ListenerPage
 pub fn radiata::ListenerPage::items(&self) -> &[radiata::ListenerView]
@@ -486,48 +486,48 @@ pub fn radiata::NextHopView<'_>::local(&self) -> &radiata::NodeId
 pub fn radiata::NextHopView<'_>::peers(&self) -> &[radiata::NodeId]
 pub struct radiata::NodeBuilder
 impl radiata::NodeBuilder
-pub fn radiata::NodeBuilder::config(self, value: radiata::NodeConfig) -> Self
-pub fn radiata::NodeBuilder::entropy(self, value: alloc::sync::Arc<dyn radiata::extension::Entropy>) -> Self
-pub fn radiata::NodeBuilder::extensions(self, value: radiata::ExtensionRegistry) -> Self
-pub fn radiata::NodeBuilder::new(storage: alloc::sync::Arc<dyn radiata::extension::StorageFactory>, keys: alloc::sync::Arc<dyn radiata::extension::KeyProvider>) -> Self
+pub fn radiata::NodeBuilder::config(self, radiata::NodeConfig) -> Self
+pub fn radiata::NodeBuilder::entropy(self, alloc::sync::Arc<dyn radiata::extension::Entropy>) -> Self
+pub fn radiata::NodeBuilder::extensions(self, radiata::ExtensionRegistry) -> Self
+pub fn radiata::NodeBuilder::new(alloc::sync::Arc<dyn radiata::extension::StorageFactory>, alloc::sync::Arc<dyn radiata::extension::KeyProvider>) -> Self
 pub async fn radiata::NodeBuilder::start(self) -> radiata::Result<radiata::NodeHandle>
 pub struct radiata::NodeConfig
 impl radiata::NodeConfig
 pub fn radiata::NodeConfig::new() -> Self
-pub fn radiata::NodeConfig::require_feature(self, value: radiata::FeatureTag) -> radiata::Result<Self>
-pub fn radiata::NodeConfig::with_anti_entropy_interval(self, value: core::time::Duration) -> radiata::Result<Self>
-pub fn radiata::NodeConfig::with_parser_limits(self, value: radiata::ParserLimits) -> radiata::Result<Self>
-pub fn radiata::NodeConfig::with_receipt_retention(self, value: core::time::Duration) -> radiata::Result<Self>
-pub fn radiata::NodeConfig::with_recovery_policy(self, value: radiata::RecoveryConfig) -> radiata::Result<Self>
-pub fn radiata::NodeConfig::with_route_policy(self, tag: radiata::QualifiedTag) -> Self
-pub fn radiata::NodeConfig::with_session_queue_limits(self, messages: usize, bytes: usize) -> radiata::Result<Self>
-pub fn radiata::NodeConfig::with_trace_metadata_limits(self, value: radiata::TraceMetadataLimits) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::require_feature(self, radiata::FeatureTag) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_anti_entropy_interval(self, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_parser_limits(self, radiata::ParserLimits) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_receipt_retention(self, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_recovery_policy(self, radiata::RecoveryConfig) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_route_policy(self, radiata::QualifiedTag) -> Self
+pub fn radiata::NodeConfig::with_session_queue_limits(self, usize, usize) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_trace_metadata_limits(self, radiata::TraceMetadataLimits) -> radiata::Result<Self>
 impl core::default::Default for radiata::NodeConfig
 pub fn radiata::NodeConfig::default() -> Self
 pub struct radiata::NodeHandle
 impl radiata::NodeHandle
-pub async fn radiata::NodeHandle::command<C: radiata::Command + DispatchCommand>(&self, command: C) -> radiata::Result<<C as radiata::Command>::Output>
-pub fn radiata::NodeHandle::create_packet(&self, target: radiata::PacketTarget, protocol: radiata::ProtocolTag, policy: radiata::PacketPolicy, metadata: radiata::PacketMetadata) -> radiata::Result<radiata::OutboundPacket>
-pub fn radiata::NodeHandle::events<E: radiata::Event>(&self, options: radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
-pub async fn radiata::NodeHandle::query<Q: radiata::Query + DispatchQuery>(&self, query: Q) -> radiata::Result<<Q as radiata::Query>::Output>
+pub async fn radiata::NodeHandle::command<C: radiata::Command + DispatchCommand>(&self, C) -> radiata::Result<<C as radiata::Command>::Output>
+pub fn radiata::NodeHandle::events<E: radiata::Event>(&self, radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
+pub fn radiata::NodeHandle::open_stream(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
+pub async fn radiata::NodeHandle::query<Q: radiata::Query + DispatchQuery>(&self, Q) -> radiata::Result<<Q as radiata::Query>::Output>
 pub struct radiata::NodeId(_)
 impl radiata::NodeId
 pub fn radiata::NodeId::as_str(&self) -> &str
-pub fn radiata::NodeId::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::NodeId::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::NodeId
-pub fn radiata::NodeId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::NodeId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::NodeId
-pub fn radiata::NodeId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::NodeId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::NodeId
 pub type radiata::NodeId::Err = radiata::Error
-pub fn radiata::NodeId::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::NodeId::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::NodeMetadataPatch
 impl radiata::NodeMetadataPatch
-pub fn radiata::NodeMetadataPatch::add_endpoint(self, endpoint: radiata::Endpoint) -> radiata::Result<Self>
+pub fn radiata::NodeMetadataPatch::add_endpoint(self, radiata::Endpoint) -> radiata::Result<Self>
 pub fn radiata::NodeMetadataPatch::new() -> Self
-pub fn radiata::NodeMetadataPatch::remove_capability(self, key: radiata::LabelKey) -> radiata::Result<Self>
-pub fn radiata::NodeMetadataPatch::remove_endpoint(self, endpoint: radiata::Endpoint) -> radiata::Result<Self>
-pub fn radiata::NodeMetadataPatch::set_capability(self, key: radiata::LabelKey, value: radiata::LabelValue) -> radiata::Result<Self>
+pub fn radiata::NodeMetadataPatch::remove_capability(self, radiata::LabelKey) -> radiata::Result<Self>
+pub fn radiata::NodeMetadataPatch::remove_endpoint(self, radiata::Endpoint) -> radiata::Result<Self>
+pub fn radiata::NodeMetadataPatch::set_capability(self, radiata::LabelKey, radiata::LabelValue) -> radiata::Result<Self>
 pub struct radiata::NodeRevoked
 impl radiata::NodeRevoked
 pub fn radiata::NodeRevoked::subject(&self) -> &radiata::NodeId
@@ -544,100 +544,85 @@ pub const radiata::ObservabilitySnapshot::QUEUED_SESSION_MESSAGES: &str
 pub const radiata::ObservabilitySnapshot::SESSIONS: &str
 pub const radiata::ObservabilitySnapshot::TRACE_RECORDS: &str
 pub fn radiata::ObservabilitySnapshot::captured_at(&self) -> std::time::SystemTime
-pub fn radiata::ObservabilitySnapshot::counter(&self, tag: &radiata::QualifiedTag) -> core::option::Option<u64>
+pub fn radiata::ObservabilitySnapshot::counter(&self, &radiata::QualifiedTag) -> core::option::Option<u64>
 pub struct radiata::OperationId(_)
 impl core::fmt::Debug for radiata::OperationId
-pub fn radiata::OperationId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::OutboundPacket
-impl radiata::OutboundPacket
-pub fn radiata::OutboundPacket::send_async(self, body: alloc::boxed::Box<dyn radiata::PacketBody>) -> radiata::Result<radiata::RouteHandle>
-pub fn radiata::OutboundPacket::send_sync(self, body: alloc::boxed::Box<dyn radiata::PacketBody>) -> radiata::BoxFuture<'static, radiata::Result<radiata::DeliveryAck>>
-pub fn radiata::OutboundPacket::trace_id(&self) -> &radiata::TraceId
-impl core::fmt::Debug for radiata::OutboundPacket
-pub fn radiata::OutboundPacket::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::PacketMetadata
-impl radiata::PacketMetadata
-pub fn radiata::PacketMetadata::entries(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = (&radiata::QualifiedTag, &[u8])>
-pub fn radiata::PacketMetadata::get(&self, key: &radiata::QualifiedTag) -> core::option::Option<&[u8]>
-pub fn radiata::PacketMetadata::insert(self, key: radiata::QualifiedTag, value: alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
-pub fn radiata::PacketMetadata::new() -> Self
-impl core::fmt::Debug for radiata::PacketMetadata
-pub fn radiata::PacketMetadata::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::PacketPolicy
-impl radiata::PacketPolicy
-pub fn radiata::PacketPolicy::load_balancer(self, value: radiata::QualifiedTag) -> Self
-pub fn radiata::PacketPolicy::load_balancing_policy(&self) -> core::option::Option<&radiata::QualifiedTag>
-pub fn radiata::PacketPolicy::max_hops(&self) -> u32
-pub fn radiata::PacketPolicy::new(routing_policy: radiata::RoutingPolicy, max_hops: u32) -> radiata::Result<Self>
-pub fn radiata::PacketPolicy::routing_policy(&self) -> &radiata::RoutingPolicy
+pub fn radiata::OperationId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::OutboundStream
+impl radiata::OutboundStream
+pub fn radiata::OutboundStream::send_async<S>(self, S) -> radiata::Result<radiata::RouteHandle> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send + 'static
+pub fn radiata::OutboundStream::send_sync<S>(self, S) -> radiata::BoxFuture<'static, radiata::Result<radiata::DeliveryAck>> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send + 'static
+pub fn radiata::OutboundStream::trace_id(&self) -> &radiata::TraceId
+impl core::fmt::Debug for radiata::OutboundStream
+pub fn radiata::OutboundStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::PageCursor(_)
 impl radiata::PageCursor
 pub fn radiata::PageCursor::as_bytes(&self) -> &[u8]
-pub fn radiata::PageCursor::from_provider_bytes(value: alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
-pub fn radiata::PageCursor::new(value: alloc::sync::Arc<[u8]>) -> Self
+pub fn radiata::PageCursor::from_provider_bytes(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::PageCursor::new(alloc::sync::Arc<[u8]>) -> Self
 pub struct radiata::PageListeners
 impl radiata::PageListeners
-pub fn radiata::PageListeners::new(page: radiata::PageSpec) -> Self
+pub fn radiata::PageListeners::new(radiata::PageSpec) -> Self
 impl radiata::Query for radiata::PageListeners
 pub type radiata::PageListeners::Output = radiata::ListenerPage
 pub struct radiata::PageMembers
 impl radiata::PageMembers
-pub fn radiata::PageMembers::new(page: radiata::PageSpec) -> Self
+pub fn radiata::PageMembers::new(radiata::PageSpec) -> Self
 impl radiata::Query for radiata::PageMembers
 pub type radiata::PageMembers::Output = radiata::MemberPage
 pub struct radiata::PageResources
 impl radiata::PageResources
-pub fn radiata::PageResources::new(page: radiata::PageSpec) -> Self
+pub fn radiata::PageResources::new(radiata::PageSpec) -> Self
 impl radiata::Query for radiata::PageResources
 pub type radiata::PageResources::Output = radiata::ResourcePage
 pub struct radiata::PageSessions
 impl radiata::PageSessions
-pub fn radiata::PageSessions::new(page: radiata::PageSpec) -> Self
+pub fn radiata::PageSessions::new(radiata::PageSpec) -> Self
 impl radiata::Query for radiata::PageSessions
 pub type radiata::PageSessions::Output = radiata::SessionPage
 pub struct radiata::PageSpec
 impl radiata::PageSpec
-pub fn radiata::PageSpec::after(cursor: radiata::PageCursor, limit: usize) -> radiata::Result<Self>
-pub fn radiata::PageSpec::first(limit: usize) -> radiata::Result<Self>
+pub fn radiata::PageSpec::after(radiata::PageCursor, usize) -> radiata::Result<Self>
+pub fn radiata::PageSpec::first(usize) -> radiata::Result<Self>
 pub struct radiata::PageTopology
 impl radiata::PageTopology
-pub fn radiata::PageTopology::new(page: radiata::PageSpec) -> Self
+pub fn radiata::PageTopology::new(radiata::PageSpec) -> Self
 impl radiata::Query for radiata::PageTopology
 pub type radiata::PageTopology::Output = radiata::TopologyPage
 pub struct radiata::PageTrust
 impl radiata::PageTrust
-pub fn radiata::PageTrust::new(page: radiata::PageSpec) -> Self
+pub fn radiata::PageTrust::new(radiata::PageSpec) -> Self
 impl radiata::Query for radiata::PageTrust
 pub type radiata::PageTrust::Output = radiata::TrustPage
 pub struct radiata::ParserLimits
 impl radiata::ParserLimits
-pub fn radiata::ParserLimits::new(frame_bytes: usize, depth: usize, collection_items: usize) -> radiata::Result<Self>
+pub fn radiata::ParserLimits::new(usize, usize, usize) -> radiata::Result<Self>
 impl core::default::Default for radiata::ParserLimits
 pub fn radiata::ParserLimits::default() -> Self
 pub struct radiata::ProtocolDefinition
 impl radiata::ProtocolDefinition
-pub fn radiata::ProtocolDefinition::new(tag: radiata::ProtocolTag, owning_feature: radiata::FeatureTag) -> Self
+pub fn radiata::ProtocolDefinition::new(radiata::ProtocolTag, radiata::FeatureTag) -> Self
 pub struct radiata::ProtocolTag(_)
 impl radiata::ProtocolTag
 pub fn radiata::ProtocolTag::as_str(&self) -> &str
 pub fn radiata::ProtocolTag::domain(&self) -> &str
-pub fn radiata::ProtocolTag::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::ProtocolTag::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::ProtocolTag
-pub fn radiata::ProtocolTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ProtocolTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::ProtocolTag
-pub fn radiata::ProtocolTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ProtocolTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::ProtocolTag
 pub type radiata::ProtocolTag::Err = radiata::Error
-pub fn radiata::ProtocolTag::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::ProtocolTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::PublicKey(_)
 impl radiata::PublicKey
 pub const fn radiata::PublicKey::as_bytes(&self) -> &[u8; 32]
-pub const fn radiata::PublicKey::from_bytes(value: [u8; 32]) -> Self
+pub const fn radiata::PublicKey::from_bytes([u8; 32]) -> Self
 impl core::fmt::Debug for radiata::PublicKey
-pub fn radiata::PublicKey::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::PublicKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::PutResource
 impl radiata::PutResource
-pub fn radiata::PutResource::new(record: radiata::ResourceWrite) -> radiata::Result<Self>
+pub fn radiata::PutResource::new(radiata::ResourceWrite) -> radiata::Result<Self>
 impl radiata::Command for radiata::PutResource
 pub type radiata::PutResource::Output = radiata::ResourceMutationView
 pub struct radiata::QualifiedTag
@@ -646,21 +631,21 @@ pub fn radiata::QualifiedTag::as_str(&self) -> &str
 pub fn radiata::QualifiedTag::category(&self) -> &str
 pub fn radiata::QualifiedTag::domain(&self) -> &str
 pub fn radiata::QualifiedTag::name(&self) -> &str
-pub fn radiata::QualifiedTag::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::QualifiedTag::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::QualifiedTag
-pub fn radiata::QualifiedTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::QualifiedTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::QualifiedTag
-pub fn radiata::QualifiedTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::QualifiedTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::QualifiedTag
 pub type radiata::QualifiedTag::Err = radiata::Error
-pub fn radiata::QualifiedTag::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::QualifiedTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::RecoveryChanged
 impl radiata::RecoveryChanged
 pub fn radiata::RecoveryChanged::recovery(&self) -> &radiata::RecoveryView
 impl radiata::Event for radiata::RecoveryChanged
 pub struct radiata::RecoveryConfig
 impl radiata::RecoveryConfig
-pub fn radiata::RecoveryConfig::new(neighbors: usize, fan_out: usize, initial_backoff: core::time::Duration, maximum_backoff: core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::RecoveryConfig::new(usize, usize, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
 impl core::default::Default for radiata::RecoveryConfig
 pub fn radiata::RecoveryConfig::default() -> Self
 pub struct radiata::RecoveryView
@@ -670,7 +655,7 @@ pub const fn radiata::RecoveryView::next_attempt_at(&self) -> core::option::Opti
 pub const fn radiata::RecoveryView::unreachable_components(&self) -> usize
 pub struct radiata::RemoveResource
 impl radiata::RemoveResource
-pub fn radiata::RemoveResource::new(name: radiata::ResourceName, expected: radiata::ResourceVersion) -> Self
+pub fn radiata::RemoveResource::new(radiata::ResourceName, radiata::ResourceVersion) -> Self
 impl radiata::Command for radiata::RemoveResource
 pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
 pub struct radiata::ReplaceIdentityAndDeleteOldCoreMetadata
@@ -682,13 +667,13 @@ pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
 impl radiata::Event for radiata::ResourceChanged
 pub struct radiata::ResourceLabels
 impl radiata::ResourceLabels
-pub fn radiata::ResourceLabels::custom(self, key: radiata::LabelKey, value: radiata::LabelValue) -> radiata::Result<Self>
+pub fn radiata::ResourceLabels::custom(self, radiata::LabelKey, radiata::LabelValue) -> radiata::Result<Self>
 pub fn radiata::ResourceLabels::custom_labels(&self) -> &radiata::LabelSet
-pub fn radiata::ResourceLabels::new(resource_type: radiata::LabelValue, uri: radiata::ResourceUri) -> Self
+pub fn radiata::ResourceLabels::new(radiata::LabelValue, radiata::ResourceUri) -> Self
 pub fn radiata::ResourceLabels::resource_type(&self) -> &radiata::LabelValue
 pub fn radiata::ResourceLabels::uri(&self) -> &radiata::ResourceUri
 impl core::fmt::Debug for radiata::ResourceLabels
-pub fn radiata::ResourceLabels::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ResourceLabels::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::ResourceMutationView
 impl radiata::ResourceMutationView
 pub fn radiata::ResourceMutationView::accepted(&self) -> &radiata::ResourceView
@@ -696,14 +681,14 @@ pub fn radiata::ResourceMutationView::is_current_winner(&self) -> bool
 pub struct radiata::ResourceName(_)
 impl radiata::ResourceName
 pub fn radiata::ResourceName::as_str(&self) -> &str
-pub fn radiata::ResourceName::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::ResourceName::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::ResourceName
-pub fn radiata::ResourceName::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ResourceName::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::ResourceName
-pub fn radiata::ResourceName::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ResourceName::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::ResourceName
 pub type radiata::ResourceName::Err = radiata::Error
-pub fn radiata::ResourceName::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::ResourceName::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ResourcePage
 impl radiata::ResourcePage
 pub fn radiata::ResourcePage::items(&self) -> &[radiata::ResourceView]
@@ -711,14 +696,14 @@ pub fn radiata::ResourcePage::next(&self) -> core::option::Option<&radiata::Page
 pub struct radiata::ResourceUri(_)
 impl radiata::ResourceUri
 pub fn radiata::ResourceUri::as_str(&self) -> &str
-pub fn radiata::ResourceUri::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::ResourceUri::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::ResourceUri
-pub fn radiata::ResourceUri::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ResourceUri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::ResourceUri
-pub fn radiata::ResourceUri::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ResourceUri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::ResourceUri
 pub type radiata::ResourceUri::Err = radiata::Error
-pub fn radiata::ResourceUri::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::ResourceUri::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ResourceVersion
 impl radiata::ResourceVersion
 pub fn radiata::ResourceVersion::digest(&self) -> &radiata::Digest
@@ -726,7 +711,7 @@ pub fn radiata::ResourceVersion::is_removal(&self) -> bool
 pub fn radiata::ResourceVersion::timestamp(&self) -> std::time::SystemTime
 pub fn radiata::ResourceVersion::writer(&self) -> &radiata::NodeId
 impl core::fmt::Debug for radiata::ResourceVersion
-pub fn radiata::ResourceVersion::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::ResourceVersion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::ResourceView
 impl radiata::ResourceView
 pub fn radiata::ResourceView::labels(&self) -> &radiata::ResourceLabels
@@ -734,10 +719,10 @@ pub fn radiata::ResourceView::name(&self) -> &radiata::ResourceName
 pub fn radiata::ResourceView::version(&self) -> &radiata::ResourceVersion
 pub struct radiata::ResourceWrite
 impl radiata::ResourceWrite
-pub fn radiata::ResourceWrite::new(name: radiata::ResourceName, labels: radiata::ResourceLabels) -> Self
+pub fn radiata::ResourceWrite::new(radiata::ResourceName, radiata::ResourceLabels) -> Self
 pub struct radiata::RevokeNode
 impl radiata::RevokeNode
-pub fn radiata::RevokeNode::new(subject: radiata::NodeId, expected_key: radiata::PublicKey) -> Self
+pub fn radiata::RevokeNode::new(radiata::NodeId, radiata::PublicKey) -> Self
 impl radiata::Command for radiata::RevokeNode
 pub type radiata::RevokeNode::Output = radiata::RevokeOutcome
 pub struct radiata::RevokeOutcome
@@ -773,15 +758,15 @@ pub fn radiata::RouteStatusView::trace_id(&self) -> &radiata::TraceId
 pub fn radiata::RouteStatusView::updated_at(&self) -> std::time::SystemTime
 pub struct radiata::SelectResources
 impl radiata::SelectResources
-pub fn radiata::SelectResources::new(selector: radiata::Selector, page: radiata::PageSpec) -> Self
+pub fn radiata::SelectResources::new(radiata::Selector, radiata::PageSpec) -> Self
 impl radiata::Query for radiata::SelectResources
 pub type radiata::SelectResources::Output = radiata::ResourcePage
 pub struct radiata::Selector
 impl radiata::Selector
 pub fn radiata::Selector::as_str(&self) -> &str
-pub fn radiata::Selector::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::Selector::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::Selector
-pub fn radiata::Selector::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::Selector::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::SessionChanged
 impl radiata::SessionChanged
 pub fn radiata::SessionChanged::peer(&self) -> &radiata::NodeId
@@ -793,14 +778,14 @@ pub fn radiata::SessionFeatureView::feature(&self) -> &radiata::FeatureTag
 pub struct radiata::SessionId(_)
 impl radiata::SessionId
 pub fn radiata::SessionId::as_str(&self) -> &str
-pub fn radiata::SessionId::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::SessionId::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::SessionId
-pub fn radiata::SessionId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::SessionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::SessionId
-pub fn radiata::SessionId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::SessionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::SessionId
 pub type radiata::SessionId::Err = radiata::Error
-pub fn radiata::SessionId::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::SessionId::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::SessionPage
 impl radiata::SessionPage
 pub fn radiata::SessionPage::items(&self) -> &[radiata::SessionView]
@@ -823,9 +808,9 @@ pub fn radiata::ShutdownOutcome::reason(&self) -> &radiata::ShutdownReason
 pub struct radiata::Signature(_)
 impl radiata::Signature
 pub const fn radiata::Signature::as_bytes(&self) -> &[u8; 64]
-pub const fn radiata::Signature::from_bytes(value: [u8; 64]) -> Self
+pub const fn radiata::Signature::from_bytes([u8; 64]) -> Self
 impl core::fmt::Debug for radiata::Signature
-pub fn radiata::Signature::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::Signature::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::StartRecovery
 impl radiata::StartRecovery
 pub fn radiata::StartRecovery::new() -> Self
@@ -833,39 +818,39 @@ impl radiata::Command for radiata::StartRecovery
 pub type radiata::StartRecovery::Output = radiata::RecoveryView
 pub struct radiata::StopListener
 impl radiata::StopListener
-pub fn radiata::StopListener::new(listener: radiata::ListenerId) -> Self
+pub fn radiata::StopListener::new(radiata::ListenerId) -> Self
 impl radiata::Command for radiata::StopListener
 pub type radiata::StopListener::Output = ()
 pub struct radiata::StoreCapabilities
 impl radiata::StoreCapabilities
-pub fn radiata::StoreCapabilities::conditional_batch(self, supported: bool) -> Self
+pub fn radiata::StoreCapabilities::conditional_batch(self, bool) -> Self
 pub fn radiata::StoreCapabilities::durability(&self) -> radiata::DurabilityLevel
-pub fn radiata::StoreCapabilities::exclusive_lifetime_lock(self, supported: bool) -> Self
+pub fn radiata::StoreCapabilities::exclusive_lifetime_lock(self, bool) -> Self
 pub fn radiata::StoreCapabilities::has_conditional_batch(&self) -> bool
 pub fn radiata::StoreCapabilities::has_exclusive_lifetime_lock(&self) -> bool
 pub fn radiata::StoreCapabilities::has_ordered_scan(&self) -> bool
 pub fn radiata::StoreCapabilities::has_reconciliation(&self) -> bool
 pub fn radiata::StoreCapabilities::has_transactional_migration(&self) -> bool
-pub fn radiata::StoreCapabilities::new(durability: radiata::DurabilityLevel) -> Self
-pub fn radiata::StoreCapabilities::ordered_scan(self, supported: bool) -> Self
-pub fn radiata::StoreCapabilities::reconciliation(self, supported: bool) -> Self
-pub fn radiata::StoreCapabilities::transactional_migration(self, supported: bool) -> Self
+pub fn radiata::StoreCapabilities::new(radiata::DurabilityLevel) -> Self
+pub fn radiata::StoreCapabilities::ordered_scan(self, bool) -> Self
+pub fn radiata::StoreCapabilities::reconciliation(self, bool) -> Self
+pub fn radiata::StoreCapabilities::transactional_migration(self, bool) -> Self
 pub struct radiata::StoreEntry
 impl radiata::StoreEntry
 pub fn radiata::StoreEntry::key(&self) -> &radiata::StoreKey
 pub fn radiata::StoreEntry::namespace(&self) -> &radiata::StoreNamespace
-pub fn radiata::StoreEntry::new(namespace: radiata::StoreNamespace, key: radiata::StoreKey, value: radiata::StoreValue) -> Self
+pub fn radiata::StoreEntry::new(radiata::StoreNamespace, radiata::StoreKey, radiata::StoreValue) -> Self
 pub fn radiata::StoreEntry::value(&self) -> &radiata::StoreValue
 pub struct radiata::StoreKey(_)
 impl radiata::StoreKey
 pub fn radiata::StoreKey::as_bytes(&self) -> &[u8]
-pub fn radiata::StoreKey::new(value: alloc::sync::Arc<[u8]>) -> Self
+pub fn radiata::StoreKey::new(alloc::sync::Arc<[u8]>) -> Self
 impl core::fmt::Debug for radiata::StoreKey
-pub fn radiata::StoreKey::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::StoreKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::StoreNamespace(_)
 impl radiata::StoreNamespace
 pub fn radiata::StoreNamespace::as_str(&self) -> &str
-pub const fn radiata::StoreNamespace::new(value: radiata::QualifiedTag) -> Self
+pub const fn radiata::StoreNamespace::new(radiata::QualifiedTag) -> Self
 pub struct radiata::StoreRequirements
 impl radiata::StoreRequirements
 pub fn radiata::StoreRequirements::required_durability(&self) -> radiata::DurabilityLevel
@@ -877,9 +862,9 @@ pub fn radiata::StoreRequirements::requires_transactional_migration(&self) -> bo
 pub struct radiata::StoreRevision(_)
 impl radiata::StoreRevision
 pub fn radiata::StoreRevision::as_bytes(&self) -> &[u8]
-pub fn radiata::StoreRevision::new(value: alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::StoreRevision::new(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::StoreRevision
-pub fn radiata::StoreRevision::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::StoreRevision::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::StoreTransaction
 impl radiata::StoreTransaction
 pub fn radiata::StoreTransaction::base_revision(&self) -> &radiata::StoreRevision
@@ -891,9 +876,24 @@ pub struct radiata::StoreValue
 impl radiata::StoreValue
 pub fn radiata::StoreValue::as_bytes(&self) -> &[u8]
 pub fn radiata::StoreValue::digest(&self) -> &radiata::Digest
-pub fn radiata::StoreValue::new(value: alloc::sync::Arc<[u8]>) -> Self
+pub fn radiata::StoreValue::new(alloc::sync::Arc<[u8]>) -> Self
 impl core::fmt::Debug for radiata::StoreValue
-pub fn radiata::StoreValue::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::StoreValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::StreamMetadata
+impl radiata::StreamMetadata
+pub fn radiata::StreamMetadata::entries(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = (&radiata::QualifiedTag, &[u8])>
+pub fn radiata::StreamMetadata::get(&self, &radiata::QualifiedTag) -> core::option::Option<&[u8]>
+pub fn radiata::StreamMetadata::insert(self, radiata::QualifiedTag, alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::StreamMetadata::new() -> Self
+impl core::fmt::Debug for radiata::StreamMetadata
+pub fn radiata::StreamMetadata::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::StreamPolicy
+impl radiata::StreamPolicy
+pub fn radiata::StreamPolicy::load_balancer(self, radiata::QualifiedTag) -> Self
+pub fn radiata::StreamPolicy::load_balancing_policy(&self) -> core::option::Option<&radiata::QualifiedTag>
+pub fn radiata::StreamPolicy::max_hops(&self) -> u32
+pub fn radiata::StreamPolicy::new(radiata::RoutingPolicy, u32) -> radiata::Result<Self>
+pub fn radiata::StreamPolicy::routing_policy(&self) -> &radiata::RoutingPolicy
 pub struct radiata::TopologyEdgeView
 impl radiata::TopologyEdgeView
 pub fn radiata::TopologyEdgeView::connected(&self) -> bool
@@ -907,42 +907,42 @@ pub fn radiata::TopologyPage::next(&self) -> core::option::Option<&radiata::Page
 pub struct radiata::TraceId(_)
 impl radiata::TraceId
 pub fn radiata::TraceId::as_str(&self) -> &str
-pub fn radiata::TraceId::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::TraceId::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::TraceId
-pub fn radiata::TraceId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::TraceId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::TraceId
-pub fn radiata::TraceId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::TraceId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::TraceId
 pub type radiata::TraceId::Err = radiata::Error
-pub fn radiata::TraceId::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::TraceId::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::TraceMetadataLimits
 impl radiata::TraceMetadataLimits
-pub fn radiata::TraceMetadataLimits::new(active: usize, terminal: usize, retention: core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::TraceMetadataLimits::new(usize, usize, core::time::Duration) -> radiata::Result<Self>
 impl core::default::Default for radiata::TraceMetadataLimits
 pub fn radiata::TraceMetadataLimits::default() -> Self
 pub struct radiata::TransactionId(_)
 impl radiata::TransactionId
 pub fn radiata::TransactionId::as_str(&self) -> &str
-pub fn radiata::TransactionId::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::TransactionId::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::TransactionId
-pub fn radiata::TransactionId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::TransactionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::TransactionId
-pub fn radiata::TransactionId::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::TransactionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::TransactionId
 pub type radiata::TransactionId::Err = radiata::Error
-pub fn radiata::TransactionId::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::TransactionId::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::TransportTag(_)
 impl radiata::TransportTag
 pub fn radiata::TransportTag::as_str(&self) -> &str
 pub fn radiata::TransportTag::domain(&self) -> &str
-pub fn radiata::TransportTag::parse(value: &str) -> radiata::Result<Self>
+pub fn radiata::TransportTag::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::TransportTag
-pub fn radiata::TransportTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::TransportTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::TransportTag
-pub fn radiata::TransportTag::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn radiata::TransportTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for radiata::TransportTag
 pub type radiata::TransportTag::Err = radiata::Error
-pub fn radiata::TransportTag::from_str(value: &str) -> radiata::Result<Self>
+pub fn radiata::TransportTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::TrustPage
 impl radiata::TrustPage
 pub fn radiata::TrustPage::items(&self) -> &[radiata::TrustedIdentityView]
@@ -954,7 +954,7 @@ pub fn radiata::TrustedIdentityView::public_key(&self) -> &radiata::PublicKey
 pub const fn radiata::TrustedIdentityView::status(&self) -> radiata::TrustStatus
 pub struct radiata::UpdateNodeMetadata
 impl radiata::UpdateNodeMetadata
-pub fn radiata::UpdateNodeMetadata::new(expected_revision: u64, patch: radiata::NodeMetadataPatch) -> Self
+pub fn radiata::UpdateNodeMetadata::new(u64, radiata::NodeMetadataPatch) -> Self
 impl radiata::Command for radiata::UpdateNodeMetadata
 pub type radiata::UpdateNodeMetadata::Output = radiata::MemberView
 pub struct radiata::WaitForShutdown
@@ -963,7 +963,7 @@ pub fn radiata::WaitForShutdown::new() -> Self
 impl radiata::Query for radiata::WaitForShutdown
 pub type radiata::WaitForShutdown::Output = radiata::ShutdownReason
 pub trait radiata::CandidateNodeReader: radiata::routing::private::Sealed + core::fmt::Debug + core::marker::Send + core::marker::Sync
-pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, selector: &'a radiata::Selector, cursor: core::option::Option<radiata::PageCursor>, limit: usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
+pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, &'a radiata::Selector, core::option::Option<radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
 pub trait radiata::Command: radiata::operation::private::Sealed + core::marker::Send + 'static
 pub type radiata::Command::Output: core::marker::Send + 'static
 impl radiata::Command for radiata::ConnectMember
@@ -995,7 +995,7 @@ pub type radiata::StopListener::Output = ()
 impl radiata::Command for radiata::UpdateNodeMetadata
 pub type radiata::UpdateNodeMetadata::Output = radiata::MemberView
 pub trait radiata::Discovery: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::Discovery::discover<'a>(&'a self, cursor: core::option::Option<&'a radiata::PageCursor>, limit: usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::DiscoveryPage>>
+pub fn radiata::Discovery::discover<'a>(&'a self, core::option::Option<&'a radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::DiscoveryPage>>
 pub trait radiata::Event: radiata::operation::private::Sealed + core::clone::Clone + core::marker::Send + core::marker::Sync + 'static
 impl radiata::Event for radiata::IdentityReplaced
 impl radiata::Event for radiata::MemberChanged
@@ -1005,11 +1005,9 @@ impl radiata::Event for radiata::ResourceChanged
 impl radiata::Event for radiata::RouteChanged
 impl radiata::Event for radiata::SessionChanged
 pub trait radiata::LoadBalancingPolicy: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::LoadBalancingPolicy::select<'a>(&'a self, selector: &'a radiata::Selector, candidates: &'a dyn radiata::CandidateNodeReader) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
-pub trait radiata::PacketBody: core::fmt::Debug + core::marker::Send + 'static
-pub fn radiata::PacketBody::next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<core::option::Option<alloc::sync::Arc<[u8]>>>>
+pub fn radiata::LoadBalancingPolicy::select<'a>(&'a self, &'a radiata::Selector, &'a dyn radiata::CandidateNodeReader) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub trait radiata::PacketConsumer: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::PacketConsumer::accept<'a>(&'a self, packet: radiata::IncomingPacket) -> radiata::BoxFuture<'a, radiata::Result<()>>
+pub fn radiata::PacketConsumer::accept<'a>(&'a self, radiata::IncomingStream) -> radiata::BoxFuture<'a, radiata::Result<()>>
 pub trait radiata::Query: radiata::operation::private::Sealed + core::marker::Send + 'static
 pub type radiata::Query::Output: core::marker::Send + 'static
 impl radiata::Query for radiata::GetLocalNode
@@ -1041,6 +1039,6 @@ pub type radiata::SelectResources::Output = radiata::ResourcePage
 impl radiata::Query for radiata::WaitForShutdown
 pub type radiata::WaitForShutdown::Output = radiata::ShutdownReason
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, view: radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub type radiata::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>
 pub type radiata::Result<T, E> = core::result::Result<T, E>

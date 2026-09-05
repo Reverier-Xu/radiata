@@ -14,8 +14,8 @@ use std::{sync::Arc, time::Duration};
 
 use radiata::{
   CreateCluster, Endpoint, ErrorKind, GetObservability, Listen, NodeBuilder, NodeConfig,
-  PacketMetadata, PacketPolicy, PacketTarget, PageSessions, PageSpec, ProtocolTag, QualifiedTag,
-  Shutdown, extension::KeyProvider,
+  PageSessions, PageSpec, ProtocolTag, QualifiedTag, Shutdown, StreamMetadata, StreamPolicy,
+  StreamTarget, extension::KeyProvider,
 };
 #[cfg(all(test, feature = "json", unix))]
 use radiata::{
@@ -186,15 +186,18 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
 
   // A failing route leaves no queue residue after the typed interruption.
   let unknown = issuer.handle.query(GetObservability::new()).await.unwrap();
-  let result = issuer.handle.create_packet(
-    PacketTarget::Exact(member.id.clone().unwrap()),
+  let result = issuer.handle.open_stream(
+    StreamTarget::Exact(member.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered").unwrap(),
-    PacketPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
-    PacketMetadata::new(),
+    StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
+    StreamMetadata::new(),
   );
   match result {
     Ok(packet) => {
-      let error = packet.send_sync(Box::new(EmptyBody)).await.unwrap_err();
+      let error = packet
+        .send_sync(futures_util::stream::empty())
+        .await
+        .unwrap_err();
       let _ = error.kind();
     }
     Err(error) => assert_eq!(error.kind(), ErrorKind::Unsupported),
@@ -226,20 +229,6 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
 
   issuer.handle.command(Shutdown::new()).await.unwrap();
   member.handle.command(Shutdown::new()).await.unwrap();
-}
-
-struct EmptyBody;
-
-impl radiata::PacketBody for EmptyBody {
-  fn next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move { Ok(None) })
-  }
-}
-
-impl std::fmt::Debug for EmptyBody {
-  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    formatter.write_str("EmptyBody")
-  }
 }
 
 /// SC-G10-P0-16: injected credential, key, packet-body, path, address,
@@ -329,19 +318,15 @@ async fn redaction_lane_rejects_every_forbidden_class() {
   }
 
   // Packet bodies stay inside the stream; never loggable.
-  let packet = member.handle.create_packet(
-    PacketTarget::Exact(issuer.id.clone().unwrap()),
+  let packet = member.handle.open_stream(
+    StreamTarget::Exact(issuer.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered-marker").unwrap(),
-    PacketPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
-    PacketMetadata::new(),
+    StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
+    StreamMetadata::new(),
   );
   match packet {
     Ok(packet) => {
-      let _ = packet
-        .send_sync(Box::new(MarkerBody {
-          marker: body_marker.clone(),
-        }))
-        .await;
+      let _ = packet.send_sync(marker_body(body_marker.clone())).await;
     }
     Err(error) => assert_eq!(error.kind(), ErrorKind::Unsupported),
   }
@@ -416,20 +401,8 @@ async fn redaction_lane_rejects_every_forbidden_class() {
 }
 
 #[cfg(all(test, feature = "json", unix))]
-struct MarkerBody {
+fn marker_body(
   marker: Arc<[u8]>,
-}
-
-#[cfg(all(test, feature = "json", unix))]
-impl radiata::PacketBody for MarkerBody {
-  fn next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move { Ok(Some(self.marker.clone())) })
-  }
-}
-
-#[cfg(all(test, feature = "json", unix))]
-impl std::fmt::Debug for MarkerBody {
-  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    formatter.write_str("MarkerBody")
-  }
+) -> impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send {
+  futures_util::stream::once(async move { Ok(marker) })
 }

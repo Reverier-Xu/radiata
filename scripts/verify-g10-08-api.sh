@@ -33,7 +33,7 @@ require_lane "values" 'boundary_values_construct_parse_and_round_trip' "$TMP/pub
 require_lane "pages" 'page_specs_and_cursors' "$TMP/pub.list"
 require_lane "storage spi" 'storage_spi_values_are_externally_constructible' "$TMP/pub.list"
 require_lane "discovery" 'discovery_contract_is_externally_implementable' "$TMP/pub.list"
-require_lane "packets" 'packet_surface_is_externally_constructible' "$TMP/pub.list"
+require_lane "streams" 'stream_surface_is_externally_constructible' "$TMP/pub.list"
 require_lane "registry" 'config_and_registry_are_externally_constructible' "$TMP/pub.list"
 require_lane "facade" 'every_typed_facade_signature_drives_a_real_cluster' "$TMP/pub.list"
 cargo test --locked --all-features --test public_api
@@ -41,10 +41,17 @@ cargo test --locked --all-features --test public_api
 # Public-api freeze guard (SC-G10-P0-25): the simplified public API must
 # match the approved 0.1 baseline exactly. Any addition, removal, or
 # signature change is a compatibility amendment, never an accident.
+# The baseline rendering is pinned to cargo-public-api 0.52.0 (T-G11-01
+# regeneration): a different tool version re-renders signatures without
+# parameter names and must not be mistaken for API drift.
 command -v cargo-public-api >/dev/null || {
   printf 'cargo-public-api is required for the freeze guard\n' >&2
   exit 1
 }
+if ! cargo public-api --version | grep -qx 'cargo-public-api 0.52.0'; then
+  printf 'cargo-public-api 0.52.0 is required to reproduce the baseline rendering\n' >&2
+  exit 1
+fi
 cargo public-api --all-features -sss > "$TMP/current-public-api.txt"
 if ! diff -u tests/fixtures/public-api/baseline-0.1.txt "$TMP/current-public-api.txt" > "$TMP/api.diff"; then
   printf 'public API drifted from the approved 0.1 baseline:\n' >&2

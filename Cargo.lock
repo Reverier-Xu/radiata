@@ -717,6 +717,7 @@ dependencies = [
  "domain",
  "ed25519-dalek",
  "fs4",
+ "futures-core",
  "futures-util",
  "getrandom 0.4.3",
  "hkdf",

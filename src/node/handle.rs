@@ -3,9 +3,9 @@ use std::sync::Arc;
 use crate::{
   Command, ConnectMember, CreateCluster, DisconnectPeer, Error, Event, EventOptions,
   EventSubscription, GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRoute,
-  JoinCluster, Listen, NodeStatus, OutboundPacket, PacketMetadata, PacketPolicy, PacketTarget,
-  PageMembers, PageTopology, PageTrust, ProtocolTag, Query, Result, RotateJoinCredential,
-  SelectResources, Shutdown, StartRecovery, StopListener, TraceId, UpdateNodeMetadata,
+  JoinCluster, Listen, NodeStatus, OutboundStream, PageMembers, PageTopology, PageTrust,
+  ProtocolTag, Query, Result, RotateJoinCredential, SelectResources, Shutdown, StartRecovery,
+  StopListener, StreamMetadata, StreamPolicy, StreamTarget, TraceId, UpdateNodeMetadata,
   WaitForShutdown,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
@@ -278,28 +278,28 @@ impl NodeHandle {
     }
   }
 
-  /// Creates an outbound packet, allocating its core-generated [`TraceId`]
+  /// Opens an outbound stream, allocating its core-generated [`TraceId`]
   /// synchronously from the injected entropy. No body delivery starts
-  /// until [`OutboundPacket::send_sync`] or [`OutboundPacket::send_async`]
+  /// until [`OutboundStream::send_sync`] or [`OutboundStream::send_async`]
   /// consumes the body.
   ///
   /// An exact-node target rejects a load-balancer selection; a
   /// matching-node target requires one whose tag resolves in the node's
   /// [`ExtensionRegistry`] (T-G06-01). The routing policy must resolve to
   /// the built-in direct policy, and the protocol tag must be registered.
-  pub fn create_packet(
-    &self, target: PacketTarget, protocol: ProtocolTag, policy: PacketPolicy,
-    metadata: PacketMetadata,
-  ) -> Result<OutboundPacket> {
+  pub fn open_stream(
+    &self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy,
+    metadata: StreamMetadata,
+  ) -> Result<OutboundStream> {
     let load_balancer = match (&target, policy.load_balancing_policy()) {
-      (PacketTarget::Exact(_), Some(_)) => {
+      (StreamTarget::Exact(_), Some(_)) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
-      (PacketTarget::Exact(_), None) => None,
-      (PacketTarget::MatchingNodes(_), None) => {
+      (StreamTarget::Exact(_), None) => None,
+      (StreamTarget::MatchingNodes(_), None) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
-      (PacketTarget::MatchingNodes(_), Some(tag)) => {
+      (StreamTarget::MatchingNodes(_), Some(tag)) => {
         // Every referenced policy tag must resolve in the registry.
         if !self.extensions.has_load_balancer(tag) {
           return Err(Error::invalid_input("packet load balancer"));
@@ -311,7 +311,7 @@ impl NodeHandle {
       return Err(Error::unsupported("packet protocol"));
     }
     let trace_id = TraceId::generate(self.entropy.as_ref())?;
-    Ok(OutboundPacket::new(
+    Ok(OutboundStream::new(
       trace_id,
       target,
       load_balancer,

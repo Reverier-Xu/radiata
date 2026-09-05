@@ -16,10 +16,10 @@ use std::{
 };
 
 use radiata::{
-  ConnectMember, CreateCluster, DisconnectPeer, ErrorKind, GetRoute, IncomingPacket, JoinCluster,
-  Listen, NodeBuilder, NodeConfig, NodeHandle, PacketBody, PacketConsumer, PacketMetadata,
-  PacketPolicy, PacketTarget, PageTopology, ProtocolTag, QualifiedTag, RotateJoinCredential,
-  RouteNextHop, RouteState, RoutingPolicy, Shutdown,
+  ConnectMember, CreateCluster, DisconnectPeer, ErrorKind, GetRoute, IncomingStream, JoinCluster,
+  Listen, NodeBuilder, NodeConfig, NodeHandle, PacketConsumer, PageTopology, ProtocolTag,
+  QualifiedTag, RotateJoinCredential, RouteNextHop, RouteState, RoutingPolicy, Shutdown,
+  StreamMetadata, StreamPolicy, StreamTarget,
 };
 
 mod common;
@@ -69,13 +69,17 @@ struct Collector {
 
 impl PacketConsumer for Collector {
   fn accept<'a>(
-    &'a self, mut packet: IncomingPacket,
+    &'a self, mut packet: IncomingStream,
   ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), radiata::Error>> + Send + 'a>>
   {
     Box::pin(async move {
       let trace = packet.trace_id().to_string();
       let mut body = Vec::new();
-      while let Some(chunk) = packet.body().next_chunk().await? {
+      let mut chunks = packet.body();
+      while let Some(chunk) = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+      {
         body.extend_from_slice(&chunk);
       }
       self.packets.lock().unwrap().push((trace, body));
@@ -84,71 +88,34 @@ impl PacketConsumer for Collector {
   }
 }
 
-/// A body that stalls after the first chunk until released.
-#[derive(Debug)]
-struct GatedBody {
-  open: Arc<std::sync::atomic::AtomicBool>,
-  notify: Arc<tokio::sync::Notify>,
-  first: bool,
-}
-
-impl GatedBody {
-  fn new() -> (
-    Self,
-    Arc<std::sync::atomic::AtomicBool>,
-    Arc<tokio::sync::Notify>,
-  ) {
-    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let notify = Arc::new(tokio::sync::Notify::new());
-    (
-      Self {
-        open: Arc::clone(&open),
-        notify: Arc::clone(&notify),
-        first: true,
-      },
-      open,
-      notify,
-    )
-  }
-}
-
-impl PacketBody for GatedBody {
-  fn next_chunk<'a>(
-    &'a mut self,
-  ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = radiata::Result<Option<Arc<[u8]>>>> + Send + 'a>,
-  > {
-    if !self.first {
-      return Box::pin(async { Ok(None) });
+/// A body stream that stalls after creation until released.
+fn gated_body() -> (
+  impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static,
+  Arc<std::sync::atomic::AtomicBool>,
+  Arc<tokio::sync::Notify>,
+) {
+  let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let notify = Arc::new(tokio::sync::Notify::new());
+  let released = Arc::clone(&open);
+  let waiter = Arc::clone(&notify);
+  let body = futures_util::stream::once(async move {
+    while !released.load(std::sync::atomic::Ordering::SeqCst) {
+      waiter.notified().await;
     }
-    self.first = false;
-    let open = Arc::clone(&self.open);
-    let notify = Arc::clone(&self.notify);
-    Box::pin(async move {
-      while !open.load(std::sync::atomic::Ordering::SeqCst) {
-        notify.notified().await;
-      }
-      Ok(Some(Arc::from(&b"held"[..])))
-    })
-  }
+    Ok(Arc::from(&b"held"[..]) as Arc<[u8]>)
+  });
+  (body, open, notify)
 }
 
-#[derive(Debug)]
-struct VecBody(Vec<&'static [u8]>);
-
-impl PacketBody for VecBody {
-  fn next_chunk<'a>(
-    &'a mut self,
-  ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = radiata::Result<Option<Arc<[u8]>>>> + Send + 'a>,
-  > {
-    let next = if self.0.is_empty() {
-      None
-    } else {
-      Some(self.0.remove(0))
-    };
-    Box::pin(async move { Ok(next.map(Arc::from)) })
-  }
+/// A body stream that yields each chunk in order.
+fn vec_body(
+  chunks: &[&'static [u8]],
+) -> impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static {
+  let items: Vec<radiata::Result<Arc<[u8]>>> = chunks
+    .iter()
+    .map(|chunk| Ok(Arc::from(*chunk) as Arc<[u8]>))
+    .collect();
+  futures_util::stream::iter(items)
 }
 
 struct Node {
@@ -403,7 +370,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     .unwrap();
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = PacketPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
 
   // Quiesce: the live undirected topology must settle to exactly
   // {A—B, A—C, B—C, C—D} and stay stable before any packet moves, so the
@@ -457,17 +424,14 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   // ---- Successful three-hop delivery ----
   let packet = nodes[0]
     .handle
-    .create_packet(
-      PacketTarget::Exact(nodes[3].id().clone()),
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
       protocol.clone(),
       policy.clone(),
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let ack = packet
-    .send_sync(Box::new(VecBody(vec![b"one", b"two"])))
-    .await
-    .unwrap();
+  let ack = packet.send_sync(vec_body(&[b"one", b"two"])).await.unwrap();
   assert_eq!(ack.destination(), nodes[3].id());
 
   wait_for(
@@ -491,17 +455,17 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   }
 
   // ---- Explicit interruption of the last leg mid-stream ----
-  let (body, open_flag, notify) = GatedBody::new();
+  let (body, open_flag, notify) = gated_body();
   let packet = nodes[0]
     .handle
-    .create_packet(
-      PacketTarget::Exact(nodes[3].id().clone()),
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
       protocol,
       policy,
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let route_handle = packet.send_async(Box::new(body)).unwrap();
+  let route_handle = packet.send_async(body).unwrap();
 
   // Let the stream reach its in-flight phase.
   tokio::time::sleep(Duration::from_millis(300)).await;
@@ -536,17 +500,14 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   // failure directly.
   let packet = nodes[0]
     .handle
-    .create_packet(
-      PacketTarget::Exact(nodes[3].id().clone()),
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
       ProtocolTag::parse(PROTOCOL_TAG).unwrap(),
-      PacketPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
-      PacketMetadata::new(),
+      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let error = packet
-    .send_sync(Box::new(VecBody(vec![b"never"])))
-    .await
-    .unwrap_err();
+  let error = packet.send_sync(vec_body(&[b"never"])).await.unwrap_err();
   assert!(
     matches!(
       error.kind(),

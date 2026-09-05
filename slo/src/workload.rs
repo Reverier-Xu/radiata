@@ -15,9 +15,9 @@ use std::{
 
 use radiata::{
   BoxFuture, Endpoint, LabelKey, LabelValue, LoadBalancingPolicy, NodeHandle, NodeId,
-  NodeMetadataPatch, PacketBody, PacketMetadata, PacketPolicy, PacketTarget, PageMembers, PageSpec,
-  ProtocolTag, PutResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
-  RoutingPolicy, Selector, UpdateNodeMetadata,
+  NodeMetadataPatch, PageMembers, PageSpec, ProtocolTag, PutResource, ResourceLabels,
+  ResourceName, ResourceUri, ResourceWrite, RoutingPolicy, Selector, StreamMetadata, StreamPolicy,
+  StreamTarget, UpdateNodeMetadata,
 };
 
 /// The protocol tag the workload packets ride (registered on every node).
@@ -77,23 +77,11 @@ fn finish(mut sample: RawSample, result: Result<(), radiata::Error>) -> RawSampl
   sample
 }
 
-/// A minimal opaque packet body: the bounded 4,096-byte benchmark payload
+/// A minimal opaque stream body: the bounded 4,096-byte benchmark payload
 /// (a benchmark value, not an API maximum).
-#[derive(Debug)]
-pub struct WorkloadBody {
-  sent: bool,
-}
-
-impl PacketBody for WorkloadBody {
-  fn next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move {
-      if self.sent {
-        return Ok(None);
-      }
-      self.sent = true;
-      Ok(Some(Arc::from(vec![0_u8; 4096].into_boxed_slice())))
-    })
-  }
+fn workload_body() -> impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static
+{
+  futures_util::stream::once(async move { Ok(Arc::from(vec![0_u8; 4096]) as Arc<[u8]>) })
 }
 
 /// Selects the first matching candidate in canonical order.
@@ -132,15 +120,13 @@ pub async fn sample_direct_packet(handle: &NodeHandle, target: &NodeId) -> RawSa
     outcome: "ok".to_owned(),
   };
   let result = async {
-    let packet = handle.create_packet(
-      PacketTarget::Exact(target.clone()),
+    let packet = handle.open_stream(
+      StreamTarget::Exact(target.clone()),
       ProtocolTag::parse(WORKLOAD_PROTOCOL)?,
-      PacketPolicy::new(RoutingPolicy::Direct, 1)?,
-      PacketMetadata::new(),
+      StreamPolicy::new(RoutingPolicy::Direct, 1)?,
+      StreamMetadata::new(),
     )?;
-    packet
-      .send_sync(Box::new(WorkloadBody { sent: false }))
-      .await?;
+    packet.send_sync(workload_body()).await?;
     Ok(())
   }
   .await;
@@ -160,16 +146,14 @@ pub async fn sample_routed_packet(handle: &NodeHandle) -> RawSample {
   };
   let result = async {
     let selector = Selector::parse(WORKLOAD_SELECTOR)?;
-    let packet = handle.create_packet(
-      PacketTarget::MatchingNodes(selector),
+    let packet = handle.open_stream(
+      StreamTarget::MatchingNodes(selector),
       ProtocolTag::parse(WORKLOAD_PROTOCOL)?,
-      PacketPolicy::new(RoutingPolicy::Direct, 3)?
+      StreamPolicy::new(RoutingPolicy::Direct, 3)?
         .load_balancer(radiata::QualifiedTag::parse(WORKLOAD_BALANCER)?),
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )?;
-    packet
-      .send_sync(Box::new(WorkloadBody { sent: false }))
-      .await?;
+    packet.send_sync(workload_body()).await?;
     Ok(())
   }
   .await;

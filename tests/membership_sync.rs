@@ -67,11 +67,16 @@ struct EchoCollector {
 
 impl radiata::PacketConsumer for EchoCollector {
   fn accept<'a>(
-    &'a self, mut packet: radiata::IncomingPacket,
+    &'a self, mut packet: radiata::IncomingStream,
   ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), radiata::Error>> + Send + 'a>>
   {
     Box::pin(async move {
-      while packet.body().next_chunk().await?.is_some() {}
+      let mut body = packet.body();
+      while std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+        .is_some()
+      {}
       *self.packets.lock().unwrap() += 1;
       Ok(())
     })
@@ -79,15 +84,10 @@ impl radiata::PacketConsumer for EchoCollector {
 }
 
 /// A one-chunk body for the workload sample packet.
-#[derive(Debug)]
-struct WorkloadBody {
-  chunk: Option<Arc<[u8]>>,
-}
-
-impl radiata::PacketBody for WorkloadBody {
-  fn next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move { Ok(self.chunk.take()) })
-  }
+fn workload_body(
+  chunk: &'static [u8],
+) -> impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static {
+  futures_util::stream::once(async move { Ok(Arc::from(chunk) as Arc<[u8]>) })
 }
 
 async fn start_node(seed: u64, storage: Arc<MemoryStorageFactory>) -> Node {
@@ -954,19 +954,14 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
   // Packet delivery: issuer to node15 over the authenticated session.
   let packet = nodes[0]
     .handle
-    .create_packet(
-      radiata::PacketTarget::Exact(nodes[15].id.clone()),
+    .open_stream(
+      radiata::StreamTarget::Exact(nodes[15].id.clone()),
       radiata::ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      radiata::PacketPolicy::new(radiata::RoutingPolicy::Direct, 1).unwrap(),
-      radiata::PacketMetadata::new(),
+      radiata::StreamPolicy::new(radiata::RoutingPolicy::Direct, 1).unwrap(),
+      radiata::StreamMetadata::new(),
     )
     .unwrap();
-  let ack = packet
-    .send_sync(Box::new(WorkloadBody {
-      chunk: Some(Arc::from(&b"sample"[..])),
-    }))
-    .await
-    .unwrap();
+  let ack = packet.send_sync(workload_body(b"sample")).await.unwrap();
   assert_eq!(ack.destination(), &nodes[15].id);
 
   // Wait for node15's own descriptor at revision 1, then bump it: the

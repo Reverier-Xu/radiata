@@ -3,10 +3,12 @@
 //! alive-peer set, fingerprint it, and push fire-and-forget payloads
 //! through identical code so a fix in one lane cannot miss the other.
 
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
+
+use futures_core::Stream;
 
 use crate::{
-  Error, NodeId, PacketBody, ProtocolTag, Result, TraceId, api::Entropy, runtime::RuntimeClient,
+  Error, NodeId, ProtocolTag, Result, TraceId, api::Entropy, runtime::RuntimeClient,
   session::stream::SessionTable,
 };
 
@@ -19,11 +21,14 @@ pub(crate) const MAX_SYNC_CHUNKS: usize = 4_096;
 
 /// Reads one complete bounded body from an admitted sync stream.
 pub(crate) async fn drain_body(
-  body: &mut dyn PacketBody, context: &'static str,
+  mut body: Pin<&mut (dyn Stream<Item = Result<Arc<[u8]>>> + Send)>, context: &'static str,
 ) -> Result<Vec<u8>> {
   let mut bytes = Vec::new();
   let mut chunks: usize = 0;
-  while let Some(chunk) = body.next_chunk().await? {
+  while let Some(chunk) = std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+    .await
+    .transpose()?
+  {
     chunks = chunks.saturating_add(1);
     if chunks > MAX_SYNC_CHUNKS || bytes.len().saturating_add(chunk.len()) > MAX_SYNC_BYTES {
       return Err(Error::resource_exhausted(context));
@@ -64,15 +69,15 @@ pub(crate) async fn send_payload(
   encoded: &[u8],
 ) -> Result<()> {
   let trace_id = TraceId::generate(entropy.as_ref())?;
-  let body = Box::new(crate::packet::StaticBody::new(Arc::from(encoded.to_vec())));
+  let body = Box::pin(crate::packet::StaticBody::new(Arc::from(encoded.to_vec())));
   let (ack_notify, _ack) = tokio::sync::oneshot::channel();
   let request = crate::packet::OutboundRequest {
     trace_id,
-    target: crate::PacketTarget::Exact(peer.clone()),
+    target: crate::StreamTarget::Exact(peer.clone()),
     load_balancer: None,
     max_hops: 1,
     protocol: protocol.clone(),
-    metadata: crate::packet::PacketMetadata::new(),
+    metadata: crate::packet::StreamMetadata::new(),
     body,
     internal: true,
     ack_notify,

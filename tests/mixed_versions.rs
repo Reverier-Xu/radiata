@@ -14,9 +14,9 @@ use std::{sync::Arc, time::Duration};
 use radiata::{
   ConnectMember, CreateCluster, DisconnectPeer, Endpoint, ErrorKind, FeatureDefinition, FeatureTag,
   GetMember, GetResource, JoinCluster, Listen, LoadBalancingPolicy, NodeBuilder, NodeConfig,
-  NodeHandle, PacketMetadata, PacketPolicy, PacketTarget, PageMembers, PageSessions, PageSpec,
-  PageTrust, ProtocolDefinition, ProtocolTag, QualifiedTag, ResourceLabels, ResourceName,
-  ResourceUri, ResourceWrite, Result, RotateJoinCredential, extension::KeyProvider,
+  NodeHandle, PageMembers, PageSessions, PageSpec, PageTrust, ProtocolDefinition, ProtocolTag,
+  QualifiedTag, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result,
+  RotateJoinCredential, StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
 };
 
 mod common;
@@ -45,11 +45,15 @@ struct Collector {
 
 impl radiata::PacketConsumer for Collector {
   fn accept<'a>(
-    &'a self, mut packet: radiata::IncomingPacket,
+    &'a self, mut packet: radiata::IncomingStream,
   ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
       let mut body = Vec::new();
-      while let Some(chunk) = packet.body().next_chunk().await? {
+      let mut chunks = packet.body();
+      while let Some(chunk) = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+      {
         body.extend_from_slice(&chunk);
       }
       self
@@ -87,21 +91,14 @@ impl LoadBalancingPolicy for FirstMatch {
 }
 
 /// A small opaque body for the echo packet.
-#[derive(Debug)]
-struct EchoBody {
-  chunks: Vec<Arc<[u8]>>,
-}
-
-impl radiata::PacketBody for EchoBody {
-  fn next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move {
-      Ok(if self.chunks.is_empty() {
-        None
-      } else {
-        Some(self.chunks.remove(0))
-      })
-    })
-  }
+fn echo_body(
+  chunks: &[&'static [u8]],
+) -> impl futures_core::Stream<Item = Result<Arc<[u8]>>> + Send + 'static {
+  let items: Vec<Result<Arc<[u8]>>> = chunks
+    .iter()
+    .map(|chunk| Ok(Arc::from(*chunk) as Arc<[u8]>))
+    .collect();
+  futures_util::stream::iter(items)
 }
 
 /// `current` nodes register the current-only feature; `prior` nodes offer
@@ -345,24 +342,19 @@ async fn assert_metadata_interop(issuer: &Node, member: &Node) {
 /// Ordered packet delivery in both directions across the mixed pair.
 async fn assert_packet_interop(issuer: &Node, member: &Node) {
   let protocol = ProtocolTag::parse(ECHO_PROTOCOL).unwrap();
-  let policy = PacketPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
 
   // Prior initiator direction: member sends, issuer consumes.
   let packet = member
     .handle
-    .create_packet(
-      PacketTarget::Exact(issuer.id().clone()),
+    .open_stream(
+      StreamTarget::Exact(issuer.id().clone()),
       protocol.clone(),
       policy.clone(),
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let ack = packet
-    .send_sync(Box::new(EchoBody {
-      chunks: vec![Arc::from(b"or".as_slice()), Arc::from(b"der".as_slice())],
-    }))
-    .await
-    .unwrap();
+  let ack = packet.send_sync(echo_body(&[b"or", b"der"])).await.unwrap();
   assert_eq!(ack.destination(), issuer.id());
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
@@ -386,19 +378,14 @@ async fn assert_packet_interop(issuer: &Node, member: &Node) {
   // Current responder direction: issuer sends, member consumes.
   let packet = issuer
     .handle
-    .create_packet(
-      PacketTarget::Exact(member.id().clone()),
+    .open_stream(
+      StreamTarget::Exact(member.id().clone()),
       protocol,
       policy,
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  packet
-    .send_sync(Box::new(EchoBody {
-      chunks: vec![Arc::from(b"pa".as_slice()), Arc::from(b"ck".as_slice())],
-    }))
-    .await
-    .unwrap();
+  packet.send_sync(echo_body(&[b"pa", b"ck"])).await.unwrap();
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
     if member
@@ -542,20 +529,17 @@ async fn e2e09_prior_initiator_interops_with_current_responder() {
     tokio::time::sleep(POLL).await;
   }
   let protocol = ProtocolTag::parse(ECHO_PROTOCOL).unwrap();
-  let policy = PacketPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
   let packet = issuer
     .handle
-    .create_packet(
-      PacketTarget::Exact(member_id.clone()),
+    .open_stream(
+      StreamTarget::Exact(member_id.clone()),
       protocol,
       policy,
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap();
-  let error = packet
-    .send_sync(Box::new(EchoBody { chunks: Vec::new() }))
-    .await
-    .unwrap_err();
+  let error = packet.send_sync(echo_body(&[])).await.unwrap_err();
   assert!(
     matches!(
       error.kind(),

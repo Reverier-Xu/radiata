@@ -24,6 +24,7 @@ ed25519-dalek = { version = "3.0", default-features = false, features = [
   "zeroize",
 ] }
 fs4 = { version = "1.1", optional = true }
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = [
   "std",
   "async-await",

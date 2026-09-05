@@ -1771,6 +1771,28 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-01"
+gate = "G11"
+priority = "P0"
+first = 1
+verification_id = "VERIFY-G11-01"
+kind = "public-api"
+cases = [
+  { title = "Rename the packet family to stream terminology", acceptance = "The facade exposes open_stream, OutboundStream, IncomingStream, StreamTarget, StreamPolicy, and StreamMetadata; the public-api baseline contains no superseded Packet-target/policy/metadata or create-packet export; wire vocabulary (PacketConsumer, wire kinds, schema tags, internal modules) keeps its names unchanged.", rebaseline = "ADR-0009", threats = [
+    "THR-014",
+    "THR-029",
+  ] },
+  { title = "Adopt standard futures-core stream bodies", acceptance = "Stream bodies are the standard futures-core Stream of Result<Arc<[u8]>>; send_sync and send_async consume any Stream + Send + 'static without trait ceremony; IncomingStream::body exposes the admitted body as a Stream preserving wire order, bounded admission, and typed errors; futures-core appears in the public ABI while channel and task handles stay excluded.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-029",
+  ] },
+  { title = "Preserve the two-phase TraceId-before-body contract", acceptance = "open_stream allocates the core TraceId synchronously before any body delivery; interruption ends the stream with a typed StreamInterrupted; derive_return_stream swaps authenticated endpoints and reuses the incoming TraceId; wire formats and golden vectors are byte-identical to the pre-rename formats.", rebaseline = "ADR-0009", threats = [
+    "THR-009",
+    "THR-012",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"

@@ -17,9 +17,10 @@ use std::{
 
 use radiata::{
   ConnectMember, CreateCluster, DisconnectPeer, Endpoint, GetObservability, GetResource, Listen,
-  NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketMetadata, PacketPolicy, PacketTarget,
-  ProtocolTag, PutResource, QualifiedTag, RemoveResource, ResourceLabels, ResourceName,
-  ResourceUri, ResourceWrite, Result, RotateJoinCredential, Shutdown, extension::KeyProvider,
+  NodeBuilder, NodeConfig, NodeHandle, NodeId, ProtocolTag, PutResource, QualifiedTag,
+  RemoveResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result,
+  RotateJoinCredential, Shutdown, StreamMetadata, StreamPolicy, StreamTarget,
+  extension::KeyProvider,
 };
 
 mod common;
@@ -71,30 +72,23 @@ struct Collector {
 
 impl radiata::PacketConsumer for Collector {
   fn accept<'a>(
-    &'a self, mut packet: radiata::IncomingPacket,
+    &'a self, mut packet: radiata::IncomingStream,
   ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-      while packet.body().next_chunk().await?.is_some() {}
+      let mut body = packet.body();
+      while std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+        .is_some()
+      {}
       *self.packets.lock().unwrap() += 1;
       Ok(())
     })
   }
 }
 
-struct SoakBody {
-  chunk: Option<Arc<[u8]>>,
-}
-
-impl std::fmt::Debug for SoakBody {
-  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    formatter.write_str("SoakBody")
-  }
-}
-
-impl radiata::PacketBody for SoakBody {
-  fn next_chunk<'a>(&'a mut self) -> radiata::BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move { Ok(self.chunk.take()) })
-  }
+fn soak_body(chunk: Arc<[u8]>) -> impl futures_core::Stream<Item = Result<Arc<[u8]>>> + Send {
+  futures_util::stream::once(async move { Ok(chunk) })
 }
 
 async fn start_node(seed: u64) -> Node {
@@ -319,7 +313,7 @@ async fn soak_churn_then_baseline_return() {
 
   let mut stats = WorkloadStats::default();
   let protocol = ProtocolTag::parse(SOAK_PROTOCOL).unwrap();
-  let policy = PacketPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
   let started = Instant::now();
   let mut tick = 0_u64;
   let mut last_resource: Option<(ResourceName, radiata::ResourceVersion)> = None;
@@ -328,19 +322,16 @@ async fn soak_churn_then_baseline_return() {
     let member = &members[(tick as usize) % members.len()];
 
     // Packet streaming issuer -> member.
-    let packet = issuer.handle.create_packet(
-      PacketTarget::Exact(member.id().clone()),
+    let packet = issuer.handle.open_stream(
+      StreamTarget::Exact(member.id().clone()),
       protocol.clone(),
       policy.clone(),
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     );
     match packet {
       Ok(packet) => {
         let body = Arc::from(format!("tick-{tick}").as_bytes());
-        match packet
-          .send_sync(Box::new(SoakBody { chunk: Some(body) }))
-          .await
-        {
+        match packet.send_sync(soak_body(body)).await {
           Ok(_) => stats.packets_sent += 1,
           Err(error) => stats.failures.push(WorkloadFailure {
             operation: "packet",

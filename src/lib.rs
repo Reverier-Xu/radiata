@@ -86,8 +86,8 @@ pub use operation::{
   SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
 };
 pub use packet::{
-  DeliveryAck, IncomingPacket, OutboundPacket, PacketBody, PacketMetadata, PacketPolicy,
-  PacketTarget, RouteHandle, RouteState, RouteStatusView, RoutingPolicy,
+  DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
+  RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
 };
 pub use protocol::{
   DiscoveryTag, FeatureDefinition, FeatureTag, ProtocolTag, QualifiedTag, TransportTag,

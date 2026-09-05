@@ -34,10 +34,15 @@ struct EchoConsumer;
 
 impl radiata::PacketConsumer for EchoConsumer {
   fn accept<'a>(
-    &'a self, mut packet: radiata::IncomingPacket,
+    &'a self, mut packet: radiata::IncomingStream,
   ) -> radiata::BoxFuture<'a, radiata::Result<()>> {
     Box::pin(async move {
-      while packet.body().next_chunk().await?.is_some() {}
+      let mut body = packet.body();
+      while std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+        .is_some()
+      {}
       Ok(())
     })
   }

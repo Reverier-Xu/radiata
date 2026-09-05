@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::{
   AdmissionView, ClusterView, Endpoint, Error, ErrorKind, IssuedJoinCredential, ListenerView,
-  LocalNodeView, NodeConfig, NodeId, PacketTarget, Result, ShutdownOutcome, ShutdownReason,
+  LocalNodeView, NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason, StreamTarget,
   TraceId,
   api::Entropy,
   extension_registry::ExtensionRegistry,
@@ -924,8 +924,8 @@ impl Supervisor {
     // before any frame moves: candidates stream from the descriptor store,
     // the caller's policy picks one, and core re-validates the pick.
     let resolved = match &request.target {
-      PacketTarget::Exact(destination) => Ok(destination.clone()),
-      PacketTarget::MatchingNodes(selector) => {
+      StreamTarget::Exact(destination) => Ok(destination.clone()),
+      StreamTarget::MatchingNodes(selector) => {
         self
           .select_matching_destination(selector, request.load_balancer.as_ref())
           .await
@@ -934,7 +934,7 @@ impl Supervisor {
     let destination = match resolved {
       Ok(destination) => {
         // The resolved target drives the rest of the pump.
-        request.target = PacketTarget::Exact(destination.clone());
+        request.target = StreamTarget::Exact(destination.clone());
         destination
       }
       Err(error) => {

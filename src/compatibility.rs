@@ -428,8 +428,8 @@ mod tests {
 
   use super::{FROZEN_FAMILY_COUNTS, VECTOR_MANIFEST, VectorShape, protocol_wire, wire};
   use crate::{
-    ClusterId, Endpoint, LabelKey, LabelSet, LabelValue, NodeId, PacketMetadata, ProtocolTag,
-    PublicKey, ResourceName, ResourceUri, StoreValue, TraceId,
+    ClusterId, Endpoint, LabelKey, LabelSet, LabelValue, NodeId, ProtocolTag, PublicKey,
+    ResourceName, ResourceUri, StoreValue, StreamMetadata, TraceId,
     hex::decode as hex_decode,
     membership::page::decode_descriptor,
     protocol::{CONTROL_CBOR_LIMITS, wire::PacketKind},
@@ -695,7 +695,7 @@ mod tests {
   #[test]
   fn constructed_vectors_match_the_frozen_bytes() {
     // Packet frames.
-    let metadata = PacketMetadata::new()
+    let metadata = StreamMetadata::new()
       .insert(
         "radiata.woooo.tech/labels/example".parse().unwrap(),
         Arc::from(b"frozen".as_slice()),

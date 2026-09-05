@@ -18,6 +18,8 @@ path = "src/bin/slo-controller.rs"
 
 [dependencies]
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "rand_core"] }
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 getrandom = "0.4"
 radiata = { path = "..", features = ["redb"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }

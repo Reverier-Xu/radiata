@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
-use super::{MAX_CHUNK_BYTES, PacketMetadata};
+use super::{MAX_CHUNK_BYTES, StreamMetadata};
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, Result, TraceId,
   protocol::{
@@ -92,7 +92,7 @@ pub(crate) struct OpenFrame {
   pub(crate) source: NodeId,
   pub(crate) destination: NodeId,
   pub(crate) protocol: ProtocolTag,
-  pub(crate) metadata: PacketMetadata,
+  pub(crate) metadata: StreamMetadata,
   /// The per-hop route envelope. `None` is the previous fixture shape: a
   /// direct delivery where the authenticated source sent the frame
   /// straight to this node (T-G06-01).
@@ -257,7 +257,7 @@ fn open_from_wire(wire: OpenWire) -> Result<OpenFrame> {
   if !wire.metadata.windows(2).all(|pair| pair[0].0 < pair[1].0) {
     return Err(Error::invalid_input("packet metadata order"));
   }
-  let mut metadata = PacketMetadata::new();
+  let mut metadata = StreamMetadata::new();
   for (key, value) in wire.metadata {
     metadata = metadata.insert(key.parse()?, Arc::from(value.as_slice()))?;
   }
@@ -376,7 +376,7 @@ mod tests {
     encode_open,
   };
   use crate::{
-    ErrorKind, NodeId, PacketMetadata, ProtocolTag, TraceId,
+    ErrorKind, NodeId, ProtocolTag, StreamMetadata, TraceId,
     protocol::{CONTROL_CBOR_LIMITS, encode_canonical},
   };
 
@@ -390,7 +390,7 @@ mod tests {
 
   fn open_frame() -> OpenFrame {
     let (trace_id, source, destination) = ids();
-    let metadata = PacketMetadata::new()
+    let metadata = StreamMetadata::new()
       .insert(
         "radiata.woooo.tech/labels/alpha".parse().unwrap(),
         Arc::from(&b"one"[..]),
@@ -575,7 +575,7 @@ mod route_tests {
 
   use super::{OpenFrame, OpenWireV1, PACKET_CBOR_LIMITS, RouteWire, decode_open, encode_open};
   use crate::{
-    NodeId, PacketMetadata, ProtocolTag, TraceId,
+    NodeId, ProtocolTag, StreamMetadata, TraceId,
     protocol::{CONTROL_CBOR_LIMITS, encode_canonical},
     routing::HopState,
   };
@@ -599,7 +599,7 @@ mod route_tests {
       source: source.clone(),
       destination: destination.clone(),
       protocol: ProtocolTag::parse("radiata.woooo.tech/protocols/test-packets").unwrap(),
-      metadata: PacketMetadata::new(),
+      metadata: StreamMetadata::new(),
       route: Some(HopState {
         current: holder.clone(),
         visited: vec![source],
@@ -668,7 +668,7 @@ mod route_tests {
       source,
       destination,
       protocol: ProtocolTag::parse("radiata.woooo.tech/protocols/test-packets").unwrap(),
-      metadata: PacketMetadata::new()
+      metadata: StreamMetadata::new()
         .insert(
           "radiata.woooo.tech/labels/alpha".parse().unwrap(),
           Arc::from(&b"v"[..]),

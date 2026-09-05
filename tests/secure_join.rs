@@ -285,8 +285,8 @@ async fn secure_join_wrong_credential_fails_without_admission() {
 use std::sync::Mutex as StdMutex;
 
 use radiata::{
-  BoxFuture, ExtensionRegistry, GetRoute, IncomingPacket, PacketBody, PacketMetadata, PacketPolicy,
-  PacketTarget, ProtocolDefinition, ProtocolTag, QualifiedTag, RouteState,
+  BoxFuture, ExtensionRegistry, GetRoute, IncomingStream, ProtocolDefinition, ProtocolTag,
+  QualifiedTag, RouteState, StreamMetadata, StreamPolicy, StreamTarget,
 };
 
 #[derive(Debug)]
@@ -306,9 +306,13 @@ impl VecBody {
   }
 }
 
-impl PacketBody for VecBody {
-  fn next_chunk<'a>(&'a mut self) -> BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    Box::pin(async move { Ok(self.chunks.next()) })
+impl futures_core::Stream for VecBody {
+  type Item = radiata::Result<Arc<[u8]>>;
+
+  fn poll_next(
+    mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Option<Self::Item>> {
+    std::task::Poll::Ready(self.chunks.next().map(Ok))
   }
 }
 
@@ -318,10 +322,14 @@ struct Collector {
 }
 
 impl radiata::PacketConsumer for Collector {
-  fn accept<'a>(&'a self, mut packet: IncomingPacket) -> BoxFuture<'a, radiata::Result<()>> {
+  fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, radiata::Result<()>> {
     Box::pin(async move {
       let mut body = Vec::new();
-      while let Some(chunk) = packet.body().next_chunk().await? {
+      let mut chunks = packet.body();
+      while let Some(chunk) = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+      {
         body.extend_from_slice(&chunk);
       }
       self
@@ -401,8 +409,8 @@ fn protocol(tag: &str) -> ProtocolDefinition {
   )
 }
 
-fn metadata() -> PacketMetadata {
-  PacketMetadata::new()
+fn metadata() -> StreamMetadata {
+  StreamMetadata::new()
     .insert(
       QualifiedTag::parse("radiata.woooo.tech/resources/test-label").unwrap(),
       Arc::from(b"value".as_slice()),
@@ -410,8 +418,8 @@ fn metadata() -> PacketMetadata {
     .unwrap()
 }
 
-fn policy() -> PacketPolicy {
-  PacketPolicy::new(radiata::RoutingPolicy::Direct, 1).unwrap()
+fn policy() -> StreamPolicy {
+  StreamPolicy::new(radiata::RoutingPolicy::Direct, 1).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -456,8 +464,8 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
   // session; the TraceId is visible before any body delivery.
   let packet = receiver
     .handle
-    .create_packet(
-      PacketTarget::Exact(admission.admitted_node().clone()),
+    .open_stream(
+      StreamTarget::Exact(admission.admitted_node().clone()),
       ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
       policy(),
       metadata(),
@@ -465,9 +473,7 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
     .unwrap();
   let trace_before = packet.trace_id().clone();
   let ack = packet
-    .send_sync(Box::new(VecBody::new(vec![
-      b"chunk-1", b"chunk-2", b"chunk-3",
-    ])))
+    .send_sync(VecBody::new(vec![b"chunk-1", b"chunk-2", b"chunk-3"]))
     .await
     .unwrap();
   assert_eq!(ack.trace_id(), &trace_before);
@@ -509,15 +515,15 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
   let unknown = radiata::NodeId::parse("node_999999999999999999999").unwrap();
   let packet = receiver
     .handle
-    .create_packet(
-      PacketTarget::Exact(unknown),
+    .open_stream(
+      StreamTarget::Exact(unknown),
       ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
       policy(),
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap();
   let error = packet
-    .send_sync(Box::new(VecBody::new(vec![b"never-delivered"])))
+    .send_sync(VecBody::new(vec![b"never-delivered"]))
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
@@ -550,11 +556,11 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
   // registered fails before any session work.
   let error = receiver
     .handle
-    .create_packet(
-      PacketTarget::Exact(admission.admitted_node().clone()),
+    .open_stream(
+      StreamTarget::Exact(admission.admitted_node().clone()),
       ProtocolTag::parse("radiata.woooo.tech/protocols/not-registered").unwrap(),
       policy(),
-      PacketMetadata::new(),
+      StreamMetadata::new(),
     )
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -579,17 +585,14 @@ async fn packet_round_trip(
   let deadline = std::time::Instant::now() + Duration::from_secs(10);
   let ack = loop {
     let packet = sender
-      .create_packet(
-        PacketTarget::Exact(target.clone()),
+      .open_stream(
+        StreamTarget::Exact(target.clone()),
         ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
         policy(),
         metadata(),
       )
       .unwrap();
-    match packet
-      .send_sync(Box::new(VecBody::new(vec![b"a", b"b"])))
-      .await
-    {
+    match packet.send_sync(VecBody::new(vec![b"a", b"b"])).await {
       Ok(ack) => break ack,
       Err(error)
         if matches!(
@@ -729,24 +732,15 @@ impl ReleaseGate {
   }
 }
 
-/// A packet body that stalls on the first chunk until released, then ends.
-#[derive(Debug)]
-struct BlockingBody {
+/// A packet body stream that stalls on the first chunk until released,
+/// then ends.
+fn blocking_body(
   release: Arc<ReleaseGate>,
-  released: bool,
-}
-
-impl PacketBody for BlockingBody {
-  fn next_chunk<'a>(&'a mut self) -> BoxFuture<'a, radiata::Result<Option<Arc<[u8]>>>> {
-    if self.released {
-      return Box::pin(async move { Ok(None) });
-    }
-    self.released = true;
-    Box::pin(async move {
-      self.release.wait().await;
-      Ok(Some(Arc::from(&b"held"[..])))
-    })
-  }
+) -> impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static {
+  futures_util::stream::once(async move {
+    release.wait().await;
+    Ok(Arc::from(&b"held"[..]) as Arc<[u8]>)
+  })
 }
 
 /// A consumer that records packet traces, bodies, and terminal errors.
@@ -756,10 +750,14 @@ struct RecordingConsumer {
 }
 
 impl radiata::PacketConsumer for RecordingConsumer {
-  fn accept<'a>(&'a self, mut packet: IncomingPacket) -> BoxFuture<'a, radiata::Result<()>> {
+  fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, radiata::Result<()>> {
     Box::pin(async move {
       let mut body = Vec::new();
-      while let Some(chunk) = packet.body().next_chunk().await? {
+      let mut chunks = packet.body();
+      while let Some(chunk) = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+      {
         body.extend_from_slice(&chunk);
       }
       self
@@ -780,18 +778,22 @@ struct ReplyConsumer {
 }
 
 impl radiata::PacketConsumer for ReplyConsumer {
-  fn accept<'a>(&'a self, mut packet: IncomingPacket) -> BoxFuture<'a, radiata::Result<()>> {
+  fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, radiata::Result<()>> {
     Box::pin(async move {
       let mut body = Vec::new();
-      while let Some(chunk) = packet.body().next_chunk().await? {
+      let mut chunks = packet.body();
+      while let Some(chunk) = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+      {
         body.extend_from_slice(&chunk);
       }
       let trace = packet.trace_id().clone();
       self.pings.lock().unwrap().push((trace.to_string(), body));
       let reply = packet
-        .derive_return_packet(
+        .derive_return_stream(
           ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
-          PacketMetadata::new(),
+          StreamMetadata::new(),
         )
         .unwrap();
       assert_eq!(
@@ -799,9 +801,7 @@ impl radiata::PacketConsumer for ReplyConsumer {
         &trace,
         "derived reply reuses the trace id"
       );
-      reply
-        .send_sync(Box::new(VecBody::new(vec![b"reply"])))
-        .await?;
+      reply.send_sync(VecBody::new(vec![b"reply"])).await?;
       Ok(())
     })
   }
@@ -840,18 +840,15 @@ async fn round_trip_to(
   sender: &NodeHandle, target: &radiata::NodeId, body: &[&'static [u8]], collector: &Arc<Collector>,
 ) -> radiata::TraceId {
   let packet = sender
-    .create_packet(
-      PacketTarget::Exact(target.clone()),
+    .open_stream(
+      StreamTarget::Exact(target.clone()),
       ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
       policy(),
       metadata(),
     )
     .unwrap();
   let trace = packet.trace_id().clone();
-  packet
-    .send_sync(Box::new(VecBody::new(body.to_vec())))
-    .await
-    .unwrap();
+  packet.send_sync(VecBody::new(body.to_vec())).await.unwrap();
   wait_for(
     || !collector.packets.lock().unwrap().is_empty(),
     Duration::from_secs(10),
@@ -940,7 +937,7 @@ async fn secure_join_packets_flow_concurrently_in_both_directions() {
 /// SC-G03-P0-16: a caller derives a return packet by swapping endpoints
 /// and reusing the incoming trace id; core assigns no return meaning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_derived_return_packet_reuses_trace_id() {
+async fn secure_join_derived_return_stream_reuses_trace_id() {
   let reply_consumer = Arc::new(ReplyConsumer::default());
   let reply_collector = Arc::new(Collector::default());
   let receiver = Node {
@@ -1050,32 +1047,29 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
   let protocol_tag = ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap();
   for _ in 0..4 {
     let packet = joiner_handle
-      .create_packet(
-        PacketTarget::Exact(receiver_id.clone()),
+      .open_stream(
+        StreamTarget::Exact(receiver_id.clone()),
         protocol_tag.clone(),
         policy(),
         metadata(),
       )
       .unwrap();
     packet
-      .send_sync(Box::new(BlockingBody {
-        release: release.clone(),
-        released: false,
-      }))
+      .send_sync(blocking_body(release.clone()))
       .await
       .unwrap();
   }
 
   let packet = joiner_handle
-    .create_packet(
-      PacketTarget::Exact(receiver_id.clone()),
+    .open_stream(
+      StreamTarget::Exact(receiver_id.clone()),
       protocol_tag.clone(),
       policy(),
       metadata(),
     )
     .unwrap();
   let error = packet
-    .send_sync(Box::new(VecBody::new(vec![b"overflow"])))
+    .send_sync(VecBody::new(vec![b"overflow"]))
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Overloaded);
@@ -1089,15 +1083,15 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
   .await;
   assert_eq!(recorder.packets.lock().unwrap().len(), 4);
   let packet = joiner_handle
-    .create_packet(
-      PacketTarget::Exact(receiver_id.clone()),
+    .open_stream(
+      StreamTarget::Exact(receiver_id.clone()),
       protocol_tag,
       policy(),
       metadata(),
     )
     .unwrap();
   packet
-    .send_sync(Box::new(VecBody::new(vec![b"after"])))
+    .send_sync(VecBody::new(vec![b"after"]))
     .await
     .unwrap();
   wait_for(
@@ -1294,19 +1288,17 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   // before the body finishes, so the explicit interruption is visible in
   // the route state, not the send future.
   let packet = joiner_handle
-    .create_packet(
-      PacketTarget::Exact(receiver_id),
+    .open_stream(
+      StreamTarget::Exact(receiver_id),
       ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
       policy(),
       metadata(),
     )
     .unwrap();
   let release = Arc::new(ReleaseGate::default());
-  let body = BlockingBody {
-    release: Arc::clone(&release),
-    released: false,
-  };
-  let route = packet.send_async(Box::new(body)).unwrap();
+  let route = packet
+    .send_async(blocking_body(Arc::clone(&release)))
+    .unwrap();
 
   // Wait until the stream is admitted and streaming (the ack resolves
   // before the body finishes), so the peer shutdown below is guaranteed to
