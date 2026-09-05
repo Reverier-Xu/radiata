@@ -1809,6 +1809,20 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-03"
+gate = "G11"
+priority = "P0"
+first = 6
+verification_id = "VERIFY-G11-03"
+kind = "validation"
+cases = [
+  { title = "Amend the public ABI rule for the Tokio ecosystem", acceptance = "The manifest admits futures-core and Tokio traits/interfaces in public signatures while Tokio channel/task handles, TLS/CBOR/redb/JSON implementation types, wire envelopes, and private-key bytes stay excluded; ADR-0004 records the rationale; the api-inventory digest matches the amended manifest and the public-api listing contains no Tokio channel or task handle type.", rebaseline = "ADR-0009", threats = [
+    "THR-014",
+    "THR-029",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"

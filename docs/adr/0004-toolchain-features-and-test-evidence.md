@@ -30,6 +30,19 @@ amended:
       The workspace builds, clippy -D warnings, and tests all pass on 1.98.0, and the
       stable CI job already runs the same compiler, so the floor and the forward
       detection lane coincide until the next stable release.
+  - date: 2026-09-05
+    summary: >-
+      Admit futures-core 0.3 as a production dependency entering the public ABI and
+      amend the manifest ABI rule (T-G11-03, stream abstraction audit R3): Tokio is the
+      crate's sole supported async ecosystem, so futures-core and Tokio
+      traits/interfaces (Stream, BoxStream, tokio-stream adapters, tokio::io traits
+      where they fit) may appear in public signatures. Tokio channel and task handles
+      (mpsc/broadcast senders and receivers, JoinHandle) stay excluded as runtime
+      internals. Rationale: the hand-rolled PacketBody trait was isomorphic to the
+      textbook Stream shape with real ergonomics cost, chunk boundaries carry no wire
+      semantics, and the previous std-only ABI rule was the only blocker; futures-util
+      was already a pinned production dependency, so futures-core adds no new supply
+      chain.
 deciders: radiata maintainers
 ---
 

@@ -15,8 +15,15 @@ conversation pattern, body persistence, deployment behavior, peer-clock coordina
 limit.
 
 The local facade uses sealed commands, queries, and events. Provider and policy traits are open. No
-public signature contains Tokio channels/tasks, TLS implementation types, CBOR implementation types,
-redb types, JSON values, wire envelopes, private-key bytes, or an upper-layer object model.
+public signature contains Tokio channel or task handles, TLS implementation types, CBOR
+implementation types, redb types, JSON values, wire envelopes, private-key bytes, or an upper-layer
+object model.
+
+Amendment (T-G11-03, ADR-0009 rebaseline): Tokio is the crate's sole supported async ecosystem.
+`futures-core` and Tokio traits/interfaces (`futures_core::Stream`, `BoxStream`, tokio-stream
+adapters, `tokio::io` traits where they fit) may appear in public signatures. Tokio channel and
+task handles (mpsc/broadcast senders and receivers, `JoinHandle`, and friends) remain excluded —
+they are runtime internals, not interfaces.
 
 Population-sized member, trust, resource, topology, and policy inputs are paged or incremental. Local
 session/listener lists also use pages for a uniform bounded contract.

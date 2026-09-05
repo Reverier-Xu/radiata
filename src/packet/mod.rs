@@ -1,7 +1,7 @@
 //! Opaque directed packet streams (ADR-0007).
 //!
 //! The data-plane unit is an opaque packet stream, not an application
-//! request or response. [`NodeHandle::open_stream`] allocates the
+//! request or response. [`crate::NodeHandle::open_stream`] allocates the
 //! core-generated [`TraceId`] synchronously and performs no body delivery;
 //! [`OutboundStream::send_sync`] waits only for the destination's
 //! current-process admission acknowledgement, while
@@ -194,7 +194,7 @@ impl Stream for StaticBody {
 }
 
 /// An outbound stream with its core-allocated [`TraceId`], created by
-/// [`NodeHandle::open_stream`] before any delivery work starts.
+/// [`crate::NodeHandle::open_stream`] before any delivery work starts.
 pub struct OutboundStream {
   trace_id: TraceId,
   target: StreamTarget,
