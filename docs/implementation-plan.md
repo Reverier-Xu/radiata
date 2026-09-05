@@ -9,6 +9,12 @@ A task changes no public/wire/persisted contract beyond this plan and the API ma
 Population-sized outputs are always streamed, paged, or incremental. Packet bodies and application
 objects never enter core storage.
 
+Rebaseline (2026-09-05): ADR-0009 replaces the create/join admission lifecycle with the peer-trust
+merge model and deletes `ClusterId`, genesis records, and creator privilege; rows and scenarios
+referencing them are re-scoped at execution per
+`docs/reviews/2026-09-05-plan-rebaseline-audit.md`. The rebaseline work and the incomplete G10
+tasks (T-G10-07, T-G10-10, T-G10-11, T-G10-12) are orchestrated as gate G11.
+
 Rollback codes: `R0` independent before compatibility; `R1` before dependents; `R2` retain shipped
 readers/tags/migrations; `R3` irreversible security action requiring forward recovery.
 
@@ -42,7 +48,7 @@ never replace assertions. T-G10-05 still owns the bounded public observability A
 
 ## Critical Path
 
-`G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G6 -> G7 -> G8 -> G9 -> G10`
+`G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G6 -> G7 -> G8 -> G9 -> G10 -> G11`
 
 ## G0: Responsibility and Contract Rebaseline
 
@@ -161,23 +167,47 @@ never replace assertions. T-G10-05 still owns the bounded public observability A
 | T-G10-04 State-machine fuzzing | P0/H | 10-01 | Admission, feature, packet routing/stream, and resource tuple state targets | fuzz state machines | SC-G10-P0-12..14; invariant/corpus tests | R0 |
 | T-G10-05 Secret-safe observability | P0/H | 10-02,G9 PASS | Bounded route/resource/reachability/queue/task/storage status; no body/secret/path/address leakage | observability | SC-G10-P0-15..16; baseline/redaction | R1 |
 | T-G10-06 Churn/resource soak | P0/H | 10-05,G7 PASS | 8h/24h packet, metadata, session, wall-clock and provider churn with baseline return | soak | SC-G10-P0-17..19; duration/baseline evidence | R0 |
-| T-G10-07 Native CI/evidence matrix | P0/H | 10-03,04,06,G8 PASS | MSRV/stable/native/features/fuzz/soak attestations for revised targets | workflows/evidence | SC-G10-P0-20..24; native/powerset/attestation | R0 |
 | T-G10-08 API/semver review | P0/H | 10-01,02,G9 PASS | Approve exact connectivity/packet/metadata facade and absence of superseded exports | API manifest/public tests | SC-G10-P0-25..26; public-api/semver/external test | R2 |
 | T-G10-09 Evidence validator preflight | P0/H | 10-03..08 | Validate current threat/budget/attempt/profile semantics and reject stale/superseded evidence | evidence docs/validator | SC-G10-P0-27..29; negative ledgers | R0 |
-| T-G10-10 OCI SLO harness qualification | P0/H | 10-02,05,07,08,09,G5 PASS,G7 PASS | External publish-false 16-node harness using admission, packets, owner revisions, and resources only | SLO harness | SC-G10-P0-30..33; isolation/readiness/workload/cleanup | R0 |
-| T-G10-11 Candidate and complete SLO ledger | P0/H | 10-10 and prior G10 | Immutable candidate, release matrices, 125 revised-workload samples, complete lineage | release/SLO evidence | SC-G10-P0-34..37, E2E-10; exact SHA/profile/results | R0 |
-| T-G10-12 Token, tag, and publish | P0/H | 10-11 | Validate provider ledger, issue external token, guard tag/publish exact candidate | release evidence | SC-G10-P0-38..40; transition negatives/registry | R0 |
+
+## G11: Rebaseline Fix and Cleanup
+
+G11 executes the ADR-0009 cluster-composition rebaseline and the stream-terminology rename recorded
+in `docs/reviews/2026-09-05-plan-rebaseline-audit.md`, then completes the G10 work moved below.
+Moved tasks keep their stable IDs; the gate closes on the publish task.
+
+| Task | Risk | Depends | Deliverable / exact API impact | Owned paths | Evidence | RB |
+| --- | --- | --- | --- | --- | --- | --- |
+| T-G11-01 Stream rename/standard bodies | P0/H | G10 PASS | Rename the packet family to stream terminology and replace `PacketBody` with the standard `futures::Stream` (futures-core enters the public ABI); `open_stream` keeps the two-phase TraceId-before-body flow | packet/api/facade | SC-G11-P0-01..03; rename/public-api/stream-body suites | R2 |
+| T-G11-02 Event/scan stream adapters | P1/M | 11-01 | `Stream` impl for `EventSubscription` and a `StoreScan` to `BoxStream` converter | node/provider | SC-G11-P1-04..05; adapter parity tests | R1 |
+| T-G11-03 Public ABI rule amendment | P0/M | 11-01 | Manifest admits futures-core and Tokio traits/interfaces, keeps channel/task handles excluded; ADR rationale note | api-manifest/adr | SC-G11-P0-06; digest/freeze guard | R2 |
+| T-G11-04 ChannelBody receiver cleanup | P2/L | 11-01 | Replace the hand-rolled incoming-body receiver loop with `ReceiverStream` plus an explicit end sentinel | packet internals | SC-G11-P1-07; interruption suites | R1 |
+| T-G11-05 Born-with-cluster | P0/H | 11-01 | `start()` get-or-create local identity; delete `CreateCluster`, `JoinCluster`, `existing_cluster`, and the genesis/pointer storage families | identity/node/runtime | SC-G11-P0-08..10; reopen/idempotence/crash suites | R2 |
+| T-G11-06 cluster_merge | P0/H | 11-05 | Credential-authorized pairwise merge; binding-set union over authenticated sessions and ordinary sync | identity/session/membership | SC-G11-P0-11..14; credential/expiry/single-use/union matrix | R2 |
+| T-G11-07 cluster_leave | P0/H | 11-05 | Owner-signed leave record, bounded first-ACK wait, rotation pipeline with crash-safe journal | identity/leave/session | SC-G11-P0-15..18; ack/timeout/crash/replay suites | R3 |
+| T-G11-08 Cleanup command family | P0/H | 11-06,07 | `cleanup_node` convergent tombstone, `purge_revocation` local explicit clear, detection views | membership/identity/facade | SC-G11-P0-19..22; terminality/convergence/view suites | R3 |
+| T-G11-09 Checkpoint tombstone GC | P0/H | 11-08 | Unsigned max-wins checkpoint record, removal-only sync filtering, GC pass on the retention engine | membership/sync/storage | SC-G11-P0-23..26; checkpoint/filter/merge-after-checkpoint suites | R2 |
+| T-G11-10 Convergent permanent revocation | P0/H | 11-08 | Revocation as a convergent permanent tombstone excluded from checkpoints; cluster-wide expulsion | identity/trust | SC-G11-P0-27..30; expulsion/permanence/backup-restore suites | R3 |
+| T-G11-11 ClusterId excision/vector regen | P0/H | 11-05..10 | Handshake, hint, grant, and snapshot formats lose cluster fields; golden vectors and compatibility fixtures regenerated | protocol/identity/compatibility | SC-G11-P0-31..33; golden/migration re-run | R2 |
+| T-G11-12 Threat/scenario/README rebaseline | P0/M | 11-05..11 | Threat model narrows to transport-path adversaries, scenario catalog re-keyed, README deployment-trust note | docs | SC-G11-P0-34..35; validator negative fixtures | R1 |
+| T-G11-13 SLO merge-stratum workload | P0/H | 11-06,07 | The five admission samples become five merge samples with unchanged credential evidence rules | slo harness | SC-G11-P0-36..37; harness qualification | R0 |
+| T-G11-14 API manifest/inventory amendment | P0/H | 11-01..13 | Merged ADR-0009 plus stream surface frozen into the manifest and api-inventory digests | api manifest/inventory | SC-G11-P0-38..39; digest/public-api proof re-run | R2 |
+| T-G10-07 Native CI/evidence matrix (moved) | P0/H | 11-01..14 | MSRV/stable/native/features/fuzz/soak attestations for the rebaselined targets | workflows/evidence | SC-G10-P0-20..24; native/powerset/attestation | R0 |
+| T-G10-10 OCI SLO harness qualification (moved) | P0/H | 11-13 and prior G11 | External publish-false 16-node harness using merges, packets, owner revisions, and resources only | SLO harness | SC-G10-P0-30..33; isolation/readiness/workload/cleanup | R0 |
+| T-G10-11 Candidate and complete SLO ledger (moved) | P0/H | 11-13 and prior G11 | Immutable candidate, release matrices, 125 merge-workload samples, complete lineage | release/SLO evidence | SC-G10-P0-34..37, E2E-10; exact SHA/profile/results | R0 |
+| T-G10-12 Token, tag, and publish (moved) | P0/H | 10-11 | Validate provider ledger, issue external token, guard tag/publish exact candidate | release evidence | SC-G10-P0-38..40; transition negatives/registry | R0 |
 
 ## Gate Closure
 
 Each gate closes on its final stable task (`00-06`, `01-05`, `02-05`, `03-06`, `04-06`, `05-06`,
-`06-05`, `07-06`, `08-05`, `09-07`, `10-12`). Handoffs copy the current row, scenarios, threats, API
+`06-05`, `07-06`, `08-05`, `09-07`, `10-09`, `10-12`). T-G10-07, T-G10-10, T-G10-11, and T-G10-12
+keep their stable IDs but execute inside G11. Handoffs copy the current row, scenarios, threats, API
 signatures, focused argv, `Q`, and rollback code. One writer owns the worktree; reviewers assess current
 semantics and cannot cite evidence whose acceptance text predates this rebaseline.
 
 ```bash
 test -f docs/implementation-plan.md
 test "$(wc -l < docs/implementation-plan.md)" -le 300
-test "$(rg -c '^\| T-G[0-9]{2}-[0-9]{2} ' docs/implementation-plan.md)" -eq 69
-test "$(rg -c '^## G[0-9]+:' docs/implementation-plan.md)" -eq 11
+test "$(rg -c '^\| T-G[0-9]{2}-[0-9]{2} ' docs/implementation-plan.md)" -eq 83
+test "$(rg -c '^## G[0-9]+:' docs/implementation-plan.md)" -eq 12
 ```

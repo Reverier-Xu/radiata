@@ -3,8 +3,8 @@
 ## Reason for Existence
 
 This document turns the accepted product boundary into an ordered, verifiable development program.
-ADRs govern design choices; [ADR-0007](adr/0007-core-responsibility-and-metadata.md) is authoritative
-where earlier decisions conflict.
+ADRs govern design choices: [ADR-0007](adr/0007-core-responsibility-and-metadata.md) governs the core
+boundary, [ADR-0009](adr/0009-peer-trust-cluster-composition.md) governs cluster composition semantics.
 
 `radiata` is a Rust library for authenticated cluster connectivity, opaque packet streams, and
 convergent core metadata. It does not model, persist, schedule, or deploy an application.
@@ -13,11 +13,14 @@ convergent core metadata. It does not model, persist, schedule, or deploy an app
 
 The library provides:
 
-- Stable cluster, node, trace, transaction, and operation identities. A `NodeId` is immutably bound to
-  one Ed25519 public key; addresses and certificates are mutable attributes.
-- The complete fixed admission policy: 32-byte single-use credentials, ten-minute lifetime, one
-  committed subject per generation, 4/64 pending attempts, 16/256 attempts per minute, 1,024 bounded
-  source buckets retained for ten idle minutes, and a ten-second authentication deadline.
+- Stable node, trace, transaction, and operation identities. A `NodeId` is immutably bound to one
+  Ed25519 public key; addresses and certificates are mutable attributes.
+- Cluster composition under a peer-trust deployment model: every node is born holding a singleton
+  cluster, `cluster_merge` unions binding sets, `cluster_leave` rotates identity behind an
+  owner-signed leave record, and user-invoked cleanup with checkpoint GC collects dead-node
+  tombstones. One credential authorizes one pairwise merge under the complete fixed policy: 32-byte
+  single-use, ten-minute lifetime, one committed merge per generation, 4/64 pending attempts, 16/256
+  attempts per minute, 1,024 bounded source buckets retained for ten idle minutes, ten-second deadline.
 - Authenticated full-duplex transports, endpoint discovery, trust propagation, sparse topology,
   multi-hop routing, and continuous recovery while known members remain mutually unreachable.
 - Opaque directed packet streams. Core assigns a `TraceId` before body delivery, targets an exact node
@@ -33,11 +36,11 @@ The library provides:
 - Portable behavior across Windows, macOS, and Linux.
 
 There is no hard node-count ceiling. The 1,024-node profile is mandatory functional and trend evidence,
-not admission policy or a larger-scale latency promise. Population-sized membership, trust, resource,
+not merge policy or a larger-scale latency promise. Population-sized membership, trust, resource,
 topology, and policy-input views are streamed, paged, or incrementally observed.
 
 The exact 16-node latency profile remains a release evidence workload after being rewritten around
-admission, packet delivery, owner-revision node metadata, and generic resource metadata.
+merges, packet delivery, owner-revision node metadata, and generic resource metadata.
 
 ## Packet Boundary
 
@@ -83,8 +86,8 @@ wake work to re-read wall time but are not protocol ordering authorities.
 
 1. Treat identity, endpoint reachability, active sessions, topology, routing, and resources as distinct
    domains. Never infer identity from an address or graph.
-2. Keep identity, admission, wire canonicalization, authenticated negotiation, route safety, metadata
-   convergence, and transaction semantics closed and auditable.
+2. Keep identity, merge authorization, wire canonicalization, authenticated negotiation, route
+   safety, metadata convergence, and transaction semantics closed and auditable.
 3. Keep transports, discovery, protocol definitions, packet consumers, load balancing, routing,
    neighbors, key custody, and storage implementations open behind tagged traits.
 4. Bound frames, queues, parser allocation, subscriptions, fan-out, concurrent work, and tasks with
@@ -102,7 +105,7 @@ wake work to re-read wall time but are not protocol ordering authorities.
 
 | Area | Responsibility | Primary extension boundary |
 | --- | --- | --- |
-| `identity` | IDs, immutable key binding, admission, trust, revoke, rotation | Key provider |
+| `identity` | IDs, immutable key binding, merge authorization, trust, revoke, rotation | Key provider |
 | `protocol` | Prelude, deterministic CBOR, feature and protocol definition intersection | Protocol registry |
 | `transport` | Discovery, candidates, authenticated full-duplex sessions | Transport and discovery |
 | `membership` | Owner-revision-marked entries and streamed membership observations | None |
@@ -119,7 +122,8 @@ because they share the crate.
 
 ### M0: Responsibility and Contract Rebaseline
 
-Reopen G0 using the existing IDs. Reconcile every active planning artifact with ADR-0007, freeze the
+Reopen G0 using the existing IDs. Reconcile every active planning artifact with ADR-0007 and ADR-0009,
+freeze the
 packet, metadata, time, storage, and population-query contracts, update threat/evidence ownership, and
 make the validator reject reintroduced superseded active semantics. Earlier evidence cannot close the
 new predicates.
@@ -158,12 +162,13 @@ Exit gate:
 
 ### M3: Secure Two-Node Packet Slice
 
-Implement cluster genesis, fixed admission, authenticated TLS 1.3 WebSocket sessions, exporter binding,
-feature intersection, incoming packet streams, and direct exact-node packet delivery in both directions.
+Implement the credential-authorized merge handshake, authenticated TLS 1.3 WebSocket sessions,
+exporter binding, feature intersection, incoming packet streams, and direct exact-node packet delivery
+in both directions.
 
 Exit gate:
 
-- Real loopback join and authenticated packet streaming pass through the public facade.
+- Real loopback merge and authenticated packet streaming pass through the public facade.
 - The `TraceId` exists before body delivery, bytes remain ordered, and disconnect is explicit.
 - Delivery acknowledgement proves only current-process incoming-stream admission.
 
@@ -175,7 +180,7 @@ bounded queues, trust snapshots, paged trust observations, readdressing, and cle
 Exit gate:
 
 - Reciprocal exact public-key trust propagates and catches up through ordinary metadata sync.
-- Alternate-peer reconnect is credential-free after admission.
+- Alternate-peer reconnect is credential-free after merge.
 - Slow peers and replacement races release all bounded resources.
 
 Reserved config: `NodeConfig::session_queue_bytes` is the session byte budget that M4 wires
@@ -243,8 +248,9 @@ Exit gate:
 
 ### M9: Resource Operations and Facade Closure
 
-Complete named resource mutation/removal, labels and selectors, revoke, leave/identity rotation,
-immediate recovery, streamed observations, route status/events, and the sealed public facade.
+Complete named resource mutation/removal, labels and selectors, convergent revocation,
+leave-via-rotation, dead-node cleanup, immediate recovery, streamed observations, route status/events,
+and the sealed public facade.
 
 Exit gate:
 
@@ -255,7 +261,7 @@ Exit gate:
 ### M10: Compatibility and Release Evidence
 
 Add golden vectors, mixed binaries, fuzzing, soak, native CI, public OCI evidence, and release guards.
-Rewrite the fixed 16-node workload around admission, packets, node-owner revisions, and resources; retain
+Rewrite the fixed 16-node workload around merges, packets, node-owner revisions, and resources; retain
 the 1,024-node functional/trend profile.
 
 Exit gate:
@@ -265,11 +271,25 @@ Exit gate:
 - All 125 exact-candidate samples use the revised workload and retain complete attempt lineage.
 - Functional `0.1.0` API, wire, and metadata compatibility receive explicit review.
 
+### M11: Rebaseline Fix and Cleanup
+
+Execute the ADR-0009 cluster-composition rebaseline and the stream-terminology rename, regenerate
+the affected wire/metadata evidence, rewrite the threat model and SLO workload, and complete the
+deferred native-CI, SLO-harness, SLO-ledger, and publish work.
+
+Exit gate:
+
+- The public facade exposes only the merge/leave/cleanup and stream surface; no genesis or cluster
+  identity remains in API, wire, or storage.
+- Golden vectors, mixed binaries, fuzz, soak, and the 125-sample merge-workload ledger pass on the
+  rebaselined formats.
+- The README documents the peer-trust deployment model and its operational contract.
+
 ## Requirement Traceability
 
 | Requirement | Owning milestones |
 | --- | --- |
-| Identity, fixed admission, key custody | M1, M2, M3 |
+| Identity, merge authorization, key custody | M1, M2, M3 |
 | Full-duplex authenticated transports and recovery | M3, M4, M5 |
 | Exact-node and node-label-selected packet streaming | M3, M6, M9 |
 | Revision-marked node and resource metadata convergence | M5, M7, M9 |
@@ -293,7 +313,7 @@ Verify this roadmap with:
 
 ```bash
 test -f docs/roadmap.md
-test "$(wc -l < docs/roadmap.md)" -le 300
+test "$(wc -l < docs/roadmap.md)" -le 320
 grep -q '^## Requirement Traceability$' docs/roadmap.md
 grep -q '^### M10: Compatibility and Release Evidence$' docs/roadmap.md
 ```
