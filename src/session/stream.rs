@@ -35,8 +35,8 @@ use crate::{
   api::BoxFuture,
   extension_registry::ExtensionRegistry,
   packet::{
-    AckOutcome, ChannelBody, IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext,
-    RouteRecord, RouteState, StreamItem, StreamTarget,
+    AckOutcome, IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext, RouteRecord,
+    RouteState, StreamItem, StreamTarget, channel_body,
     wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, OpenFrame},
   },
   protocol::wire::PacketKind,
@@ -1132,7 +1132,7 @@ async fn admit_open(
           open.trace_id,
           open.protocol,
           open.metadata,
-          Box::pin(ChannelBody::new(body)),
+          channel_body(body),
           PacketReplyContext::new(context.registry.clone(), context.runtime.clone()),
         );
         let consumer = Arc::clone(&registration.consumer);

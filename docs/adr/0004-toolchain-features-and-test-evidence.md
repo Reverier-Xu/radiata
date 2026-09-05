@@ -43,6 +43,13 @@ amended:
       semantics, and the previous std-only ABI rule was the only blocker; futures-util
       was already a pinned production dependency, so futures-core adds no new supply
       chain.
+  - date: 2026-09-05
+    summary: >-
+      Admit tokio-stream 0.1 (sync feature only) as an internal production dependency
+      (T-G11-04, stream abstraction audit R4): the incoming-body receiver adopts the
+      standard ReceiverStream adapter with an explicit end sentinel instead of a
+      hand-rolled poll loop. tokio-stream types stay out of public signatures; only
+      futures-core interfaces cross the ABI.
 deciders: radiata maintainers
 ---
 

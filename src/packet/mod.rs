@@ -27,7 +27,9 @@ use std::{
 };
 
 use futures_core::{Stream, stream::BoxStream};
-use tokio::sync::{mpsc, oneshot};
+use futures_util::StreamExt as _;
+use tokio::sync::oneshot;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, QualifiedTag, Result, TraceId, api::BoxFuture,
@@ -554,41 +556,30 @@ pub(crate) enum StreamItem {
   End,
 }
 
-/// The body [`Stream`] backed by one admitted incoming stream's bounded
-/// channel. A channel that closes without an `End` item is an interrupted
-/// stream (ADR-0007: no replay, no continuation).
-#[derive(Debug)]
-pub(crate) struct ChannelBody {
-  receiver: mpsc::Receiver<StreamItem>,
-  done: bool,
-}
-
-impl ChannelBody {
-  pub(crate) const fn new(receiver: mpsc::Receiver<StreamItem>) -> Self {
-    Self {
-      receiver,
-      done: false,
-    }
-  }
-}
-
-impl Stream for ChannelBody {
-  type Item = Result<Arc<[u8]>>;
-
-  fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-    if self.done {
-      return Poll::Ready(None);
-    }
-    match self.receiver.poll_recv(cx) {
-      Poll::Ready(Some(StreamItem::Chunk(bytes))) => Poll::Ready(Some(Ok(bytes))),
-      Poll::Ready(Some(StreamItem::End)) => {
-        self.done = true;
-        Poll::Ready(None)
+/// The body [`Stream`] over one admitted incoming stream's bounded
+/// channel: the standard [`ReceiverStream`] adapter plus the explicit
+/// `End` sentinel. A channel that closes without an `End` item is an
+/// interrupted stream (ADR-0007: no replay, no continuation) and yields
+/// exactly one `StreamInterrupted` error.
+pub(crate) fn channel_body(receiver: tokio::sync::mpsc::Receiver<StreamItem>) -> BodyStream {
+  let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let observed = Arc::clone(&ended);
+  let body = ReceiverStream::new(receiver)
+    .map(move |item| match item {
+      StreamItem::Chunk(bytes) => Some(Ok(bytes)),
+      StreamItem::End => {
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        None
       }
-      Poll::Ready(None) => Poll::Ready(Some(Err(Error::stream_interrupted("packet stream")))),
-      Poll::Pending => Poll::Pending,
-    }
-  }
+    })
+    .take_while(|item| std::future::ready(item.is_some()))
+    .filter_map(std::future::ready);
+  let tail = futures_util::stream::once(async move {
+    (!ended.load(std::sync::atomic::Ordering::SeqCst))
+      .then(|| Err(Error::stream_interrupted("packet stream")))
+  })
+  .filter_map(std::future::ready);
+  Box::pin(body.chain(tail))
 }
 
 /// One in-memory route record (bounded trace metadata, never payload).
@@ -666,7 +657,9 @@ pub(crate) fn ack_error(kind: ErrorKind) -> Error {
 mod tests {
   use std::sync::Arc;
 
-  use super::{METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, StreamMetadata};
+  use futures_util::StreamExt as _;
+
+  use super::{METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, StreamItem, StreamMetadata, channel_body};
   use crate::{ErrorKind, QualifiedTag};
 
   fn key(name: &str) -> QualifiedTag {
@@ -714,5 +707,63 @@ mod tests {
     let names: Vec<&str> = metadata.entries().map(|(key, _)| key.name()).collect();
     assert_eq!(names, ["alpha", "zeta"]);
     assert_eq!(metadata.entries().len(), 2);
+  }
+
+  /// SC-G11-P1-07: the receiver-stream body yields chunks in order and
+  /// ends cleanly at the explicit end sentinel.
+  #[tokio::test]
+  async fn channel_body_yields_chunks_in_order_and_ends_at_the_sentinel() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    sender
+      .send(StreamItem::Chunk(Arc::from(&b"one"[..])))
+      .await
+      .unwrap();
+    sender
+      .send(StreamItem::Chunk(Arc::from(&b"two"[..])))
+      .await
+      .unwrap();
+    sender.send(StreamItem::End).await.unwrap();
+    drop(sender);
+
+    let collected: Vec<Arc<[u8]>> = channel_body(receiver)
+      .map(|item| item.unwrap())
+      .collect()
+      .await;
+    assert_eq!(
+      collected,
+      vec![Arc::from(&b"one"[..]) as Arc<[u8]>, Arc::from(&b"two"[..])]
+    );
+  }
+
+  /// SC-G11-P1-07: a channel that closes without the end sentinel is an
+  /// interrupted stream: exactly one typed error, then the stream ends.
+  #[tokio::test]
+  async fn channel_body_close_without_end_is_one_typed_interruption() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    sender
+      .send(StreamItem::Chunk(Arc::from(&b"held"[..])))
+      .await
+      .unwrap();
+    drop(sender);
+
+    let items: Vec<crate::Result<Arc<[u8]>>> = channel_body(receiver).collect().await;
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].as_ref().unwrap(), &Arc::from(&b"held"[..]));
+    let error = items[1].as_ref().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::StreamInterrupted);
+  }
+
+  /// SC-G11-P1-07: items after the end sentinel are never yielded.
+  #[tokio::test]
+  async fn channel_body_never_yields_after_the_end_sentinel() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    sender.send(StreamItem::End).await.unwrap();
+    sender
+      .send(StreamItem::Chunk(Arc::from(&b"late"[..])))
+      .await
+      .unwrap();
+    drop(sender);
+
+    assert!(channel_body(receiver).next().await.is_none());
   }
 }

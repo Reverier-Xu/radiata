@@ -1823,6 +1823,19 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-04"
+gate = "G11"
+priority = "P1"
+first = 7
+verification_id = "VERIFY-G11-04"
+kind = "contract"
+cases = [
+  { title = "Adopt the receiver-stream adapter with an explicit end sentinel", acceptance = "The incoming-body receiver is the standard ReceiverStream adapter over the bounded channel plus the explicit End sentinel: chunks preserve wire order, the sentinel ends the stream and nothing after it is yielded, and a channel closed without the sentinel yields exactly one typed StreamInterrupted error; end-to-end interruption suites stay green.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"
