@@ -429,6 +429,10 @@ async fn supervise(
         let result = supervisor.purge_revocation(subject).await;
         let _ = reply.send(result);
       }
+      Control::IssueCleanupCheckpoint { reply } => {
+        let result = supervisor.issue_cleanup_checkpoint().await;
+        let _ = reply.send(result);
+      }
       Control::RemoveResource {
         name,
         expected,
@@ -1873,6 +1877,16 @@ impl Supervisor {
       &subject,
     )
     .await
+  }
+
+  /// Starts a new checkpoint GC epoch at the current wall clock
+  /// (T-G11-09, ADR-0009 decision 5). The watermark converges through the
+  /// sync plane; collected tombstones are swept after sync rounds.
+  async fn issue_cleanup_checkpoint(&mut self) -> Result<u64> {
+    self.require_unblocked()?;
+    let context = self.context()?;
+    crate::identity::cleanup::issue_checkpoint_ctx(&context, self.dependencies.entropy.as_ref())
+      .await
   }
 
   async fn revoke_node(

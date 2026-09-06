@@ -250,3 +250,78 @@ async fn g11_purge_revocation_clears_the_local_boundary() {
   issuer.handle.command(Shutdown::new()).await.unwrap();
   member.handle.command(Shutdown::new()).await.unwrap();
 }
+
+/// SC-G11-P0-23/26: the issuer cleans a member and starts the GC epoch;
+/// the checkpoint command is idempotent under max-wins, and the cluster
+/// stays fully compositional afterwards (a later merge still converges).
+/// The sweep and filter mechanics themselves are unit-covered; through
+/// the facade the observable contract is that checkpointing never breaks
+/// convergence and never gates live entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn g11_checkpoint_converges_and_keeps_the_cluster_compositional() {
+  let issuer = start_node(21).await;
+  let issuer_endpoint = listen(&issuer).await;
+
+  let subject = start_node(22).await;
+  common::merge_with_retry(&subject.handle, &issuer.handle, issuer_endpoint.clone()).await;
+  let subject_id = local_id(&subject.handle).await;
+  let subject_key = trusted_key(&issuer.handle, &subject_id).await;
+
+  let observer = start_node(23).await;
+  let _observer_endpoint = listen(&observer).await;
+  common::merge_with_retry(&observer.handle, &issuer.handle, issuer_endpoint.clone()).await;
+  let _observer_id = local_id(&observer.handle).await;
+
+  // Clean the subject, then start the epoch. Max-wins: the second issue
+  // never rolls the watermark back.
+  issuer
+    .handle
+    .command(CleanupNode::new(subject_id.clone()))
+    .await
+    .unwrap();
+  let first = issuer
+    .handle
+    .command(radiata::IssueCleanupCheckpoint::new())
+    .await
+    .unwrap();
+  let second = issuer
+    .handle
+    .command(radiata::IssueCleanupCheckpoint::new())
+    .await
+    .unwrap();
+  assert!(second >= first, "the watermark is monotonic");
+
+  // The observer also issues: the epoch converges through sync and stays
+  // monotonic across issuers (any member may checkpoint).
+  let on_observer = observer
+    .handle
+    .command(radiata::IssueCleanupCheckpoint::new())
+    .await
+    .unwrap();
+  assert!(on_observer >= first);
+
+  // The cluster stays compositional after checkpointing: a fresh node
+  // still merges in and converges.
+  let late = start_node(24).await;
+  common::merge_with_retry(&late.handle, &issuer.handle, issuer_endpoint.clone()).await;
+  let late_id = local_id(&late.handle).await;
+  let _ = trusted_key(&observer.handle, &late_id).await;
+
+  // The cleaned subject's binding stays as permanent evidence everywhere.
+  let page = observer
+    .handle
+    .query(PageTrust::new(PageSpec::first(64).unwrap()))
+    .await
+    .unwrap();
+  assert!(
+    page
+      .items()
+      .iter()
+      .any(|view| view.node_id() == &subject_id && view.public_key() == &subject_key),
+    "the cleaned subject's binding stays as permanent evidence"
+  );
+
+  for node in [&issuer, &subject, &observer, &late] {
+    node.handle.command(Shutdown::new()).await.unwrap();
+  }
+}

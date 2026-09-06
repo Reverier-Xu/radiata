@@ -241,6 +241,13 @@ impl DispatchCommand for crate::CleanupNode {
   }
 }
 
+impl DispatchCommand for crate::IssueCleanupCheckpoint {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+    let runtime = runtime.clone();
+    Box::pin(async move { runtime.issue_cleanup_checkpoint().await })
+  }
+}
+
 impl DispatchCommand for crate::PurgeRevocation {
   fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
     let subject = self.into_subject();

@@ -42,6 +42,7 @@ pub(crate) const SYNC_KIND_SNAPSHOT: u8 = 2;
 pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
 pub(crate) const SYNC_KIND_CLEANUP: u8 = 4;
 pub(crate) const SYNC_KIND_REVOCATION: u8 = 5;
+pub(crate) const SYNC_KIND_CHECKPOINT: u8 = 6;
 
 /// One sync payload: an encoded membership page, an encoded issuer trust
 /// snapshot, or an encoded signed removal tombstone.
@@ -57,6 +58,8 @@ pub(crate) enum SyncPayload {
   Cleanup(ByteVec),
   /// An encoded [`crate::identity::revocation::RevocationRecordV1`].
   Revocation(ByteVec),
+  /// An encoded [`crate::identity::cleanup::CleanupCheckpointV1`].
+  Checkpoint(ByteVec),
 }
 
 #[derive(Encode, Decode)]
@@ -78,6 +81,7 @@ impl SyncPayload {
       Self::Leave(encoded) => (SYNC_KIND_LEAVE, encoded.clone()),
       Self::Cleanup(encoded) => (SYNC_KIND_CLEANUP, encoded.clone()),
       Self::Revocation(encoded) => (SYNC_KIND_REVOCATION, encoded.clone()),
+      Self::Checkpoint(encoded) => (SYNC_KIND_CHECKPOINT, encoded.clone()),
     };
     encode_canonical(
       &SyncPayloadWire {
@@ -106,6 +110,7 @@ impl SyncPayload {
       SYNC_KIND_LEAVE => Ok(Self::Leave(wire.payload)),
       SYNC_KIND_CLEANUP => Ok(Self::Cleanup(wire.payload)),
       SYNC_KIND_REVOCATION => Ok(Self::Revocation(wire.payload)),
+      SYNC_KIND_CHECKPOINT => Ok(Self::Checkpoint(wire.payload)),
       _ => Err(Error::invalid_input("membership sync payload kind")),
     }
   }
@@ -241,6 +246,7 @@ async fn accept_payload(
         tracing::debug!(subject = %record.subject(), "cleanup record skipped: bindings unknown");
         return Ok(());
       }
+      tracing::debug!(subject = %record.subject(), "cleanup record accepted for persistence");
       // Terminal evidence must not be dropped on a raced commit: bounded
       // backoff retries cover transient store contention.
       let mut backoff = Duration::from_millis(25);
@@ -255,7 +261,10 @@ async fn accept_payload(
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_millis(400));
           }
-          Err(error) => return Err(error),
+          Err(error) => {
+            tracing::debug!(kind = ?error.kind(), "cleanup record persist failed");
+            return Err(error);
+          }
         }
       }
       events.emit(crate::MemberChanged::new(record.subject().clone()));
@@ -290,6 +299,14 @@ async fn accept_payload(
         }
       }
       events.emit(crate::NodeRevoked::new(record.subject().clone()));
+    }
+    SyncPayload::Checkpoint(encoded) => {
+      // A cleanup checkpoint is unsigned hygiene knowledge (ADR-0009
+      // decision 5): max-wins by watermark, never gating live entries or
+      // revocations.
+      let checkpoint = crate::identity::cleanup::CleanupCheckpointV1::decode(encoded.as_ref())?;
+      crate::identity::cleanup::persist_checkpoint_ctx(store, entropy.as_ref(), &checkpoint)
+        .await?;
     }
   }
   Ok(())
@@ -485,6 +502,14 @@ pub(crate) async fn sync_tick(
     crate::identity::cleanup::known_cleanup_records_ctx(store, LEAVE_RESEND_CAP).await?;
   let revocation_records =
     crate::identity::revocation::known_revocation_records_ctx(store, LEAVE_RESEND_CAP).await?;
+  let local_checkpoint = crate::identity::cleanup::latest_checkpoint_millis_ctx(store)
+    .await?
+    .map(|watermark| {
+      crate::identity::cleanup::CleanupCheckpointV1::new(
+        watermark,
+        context.identity().node().clone(),
+      )
+    });
   let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
   let peers = crate::sync_common::alive_peers(sessions)?;
   let peers_fp = crate::sync_common::peers_fingerprint(&peers);
@@ -545,7 +570,9 @@ pub(crate) async fn sync_tick(
     None => None,
   };
   let leave_bytes: Vec<Vec<u8>> = if snapshot_bytes.is_some() {
-    let mut out = Vec::with_capacity(leave_records.len() + cleanup_records.len());
+    let mut out = Vec::with_capacity(
+      leave_records.len() + cleanup_records.len() + revocation_records.len() + 1,
+    );
     for record in &leave_records {
       out.push(SyncPayload::Leave(ByteVec::from(record.encode()?)).encode()?);
     }
@@ -554,6 +581,9 @@ pub(crate) async fn sync_tick(
     }
     for record in &revocation_records {
       out.push(SyncPayload::Revocation(ByteVec::from(record.encode()?)).encode()?);
+    }
+    if let Some(checkpoint) = &local_checkpoint {
+      out.push(SyncPayload::Checkpoint(ByteVec::from(checkpoint.encode()?)).encode()?);
     }
     out
   } else {
@@ -579,6 +609,7 @@ pub(crate) async fn sync_tick(
       let _ =
         crate::sync_common::send_payload(runtime, entropy, peer, &protocol, &page_bytes).await;
     }
+    gc_collected_tombstones(store, entropy).await;
     return Ok(());
   }
   cursor.ticks_since_page_send = cursor.ticks_since_page_send.saturating_add(1);
@@ -590,5 +621,19 @@ pub(crate) async fn sync_tick(
       }
     }
   }
+  gc_collected_tombstones(store, entropy).await;
   Ok(())
+}
+
+/// The post-round checkpoint GC (ADR-0009 decision 5): collect the
+/// leave/cleanup tombstones at or before the local checkpoint watermark.
+/// Hygiene only — a failure is logged and retried next round.
+async fn gc_collected_tombstones(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+) {
+  if let Err(error) =
+    crate::identity::cleanup::collect_collected_tombstones_ctx(store, entropy.as_ref()).await
+  {
+    tracing::debug!(kind = ?error.kind(), "checkpoint gc pass failed");
+  }
 }

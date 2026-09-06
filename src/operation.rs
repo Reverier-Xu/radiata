@@ -492,6 +492,27 @@ impl Command for PurgeRevocation {
   type Output = ();
 }
 
+/// Starts a new cleanup checkpoint GC epoch at the current wall clock
+/// (ADR-0009 decision 5). Max-wins: a stored checkpoint with a higher
+/// watermark survives. Deployments issue checkpoints only against a fully
+/// converged cluster. Returns the persisted watermark.
+pub struct IssueCleanupCheckpoint {
+  _private: (),
+}
+
+#[allow(clippy::new_without_default)]
+impl IssueCleanupCheckpoint {
+  pub fn new() -> Self {
+    Self { _private: () }
+  }
+}
+
+impl private::Sealed for IssueCleanupCheckpoint {}
+
+impl Command for IssueCleanupCheckpoint {
+  type Output = u64;
+}
+
 /// Creates signed removal evidence for one resource (T-G09-05): the
 /// removal commits only when the locally stored winner still equals
 /// `expected` exactly and the removal strictly wins the tuple, so a stale

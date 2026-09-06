@@ -30,6 +30,8 @@ pub(crate) const TRUST_SNAPSHOT_NAMESPACE: &str = "radiata.woooo.tech/metadata/t
 pub(crate) const TRUST_BINDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/trust-binding-v1";
 /// Local authorization revocation per exact subject binding (G9-04).
 pub(crate) const REVOCATION_NAMESPACE: &str = "radiata.woooo.tech/metadata/revocation-v1";
+/// Cleanup checkpoint GC epoch marker (T-G11-09), max-wins by watermark.
+pub(crate) const CHECKPOINT_NAMESPACE: &str = "radiata.woooo.tech/metadata/cleanup-checkpoint-v1";
 /// In-progress active-leave intent (G9-06).
 pub(crate) const LEAVE_NAMESPACE: &str = "radiata.woooo.tech/metadata/leave-v1";
 /// One issuer-signed dead-node cleanup tombstone per subject (T-G11-08).
@@ -109,11 +111,12 @@ mod catalog {
   }
 
   use super::{
-    CLEANUP_NAMESPACE, CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, INTERNAL_NAMESPACE,
-    KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE, KEY_DELETION_INTENT_NAMESPACE,
-    LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE, MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE,
-    PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE, REVOCATION_NAMESPACE, SCHEMA_NAMESPACE,
-    TRACE_NAMESPACE, TRUST_BINDING_NAMESPACE, TRUST_SNAPSHOT_NAMESPACE,
+    CHECKPOINT_NAMESPACE, CLEANUP_NAMESPACE, CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE,
+    INTERNAL_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE,
+    KEY_DELETION_INTENT_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
+    MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE,
+    REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE, TRUST_BINDING_NAMESPACE,
+    TRUST_SNAPSHOT_NAMESPACE,
   };
 
   /// Every core metadata family, in domain order and then declaration order.
@@ -126,6 +129,7 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::Identity, REVOCATION_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, LEAVE_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, CLEANUP_NAMESPACE),
+      MetadataFamily::new(MetadataDomain::Identity, CHECKPOINT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_CREATION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETED_NAMESPACE),

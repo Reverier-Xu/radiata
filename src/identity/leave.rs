@@ -163,6 +163,10 @@ struct LeaveRecordBodyWire {
   #[n(3)]
   #[cbor(with = "minicbor::bytes")]
   public_key: Vec<u8>,
+  /// Signed host wall-clock UNIX milliseconds: the removal timestamp the
+  /// checkpoint GC compares against its watermark (T-G11-09).
+  #[n(4)]
+  timestamp_millis: u64,
 }
 
 #[derive(Encode, Decode)]
@@ -178,6 +182,8 @@ struct LeaveRecordWire {
   #[cbor(with = "minicbor::bytes")]
   public_key: Vec<u8>,
   #[n(4)]
+  timestamp_millis: u64,
+  #[n(5)]
   #[cbor(with = "minicbor::bytes")]
   signature: Vec<u8>,
 }
@@ -187,21 +193,24 @@ struct LeaveRecordWire {
 /// key before rotating; peers verify it against the permanently retained
 /// identity binding, never against the leaver staying online. Because the
 /// rotation destroys the old key, the record carries no replay or time-lag
-/// attack surface.
+/// attack surface. The signed removal timestamp is what the checkpoint GC
+/// (decision 5) compares against its watermark.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LeaveRecordV1 {
   node: NodeId,
   public_key: PublicKey,
+  timestamp_millis: u64,
   signature: crate::Signature,
 }
 
 impl LeaveRecordV1 {
   pub(crate) const fn new(
-    node: NodeId, public_key: PublicKey, signature: crate::Signature,
+    node: NodeId, public_key: PublicKey, timestamp_millis: u64, signature: crate::Signature,
   ) -> Self {
     Self {
       node,
       public_key,
+      timestamp_millis,
       signature,
     }
   }
@@ -214,14 +223,21 @@ impl LeaveRecordV1 {
     &self.public_key
   }
 
+  pub(crate) const fn timestamp_millis(&self) -> u64 {
+    self.timestamp_millis
+  }
+
   /// Encodes the canonical body the owner signs.
-  pub(crate) fn encode_signed_body(node: &NodeId, public_key: &PublicKey) -> Result<Vec<u8>> {
+  pub(crate) fn encode_signed_body(
+    node: &NodeId, public_key: &PublicKey, timestamp_millis: u64,
+  ) -> Result<Vec<u8>> {
     encode_canonical(
       &LeaveRecordBodyWire {
         schema: LEAVE_RECORD_SCHEMA.to_owned(),
         record_version: 1,
         node: node.as_str().to_owned(),
         public_key: public_key.as_bytes().to_vec(),
+        timestamp_millis,
       },
       LEAVE_RECORD_LIMITS,
     )
@@ -231,7 +247,7 @@ impl LeaveRecordV1 {
   pub(crate) fn verify(&self) -> Result<()> {
     crate::identity::signature::verify_strict(
       LEAVE_RECORD_V1_DOMAIN,
-      &Self::encode_signed_body(&self.node, &self.public_key)?,
+      &Self::encode_signed_body(&self.node, &self.public_key, self.timestamp_millis)?,
       &self.public_key,
       &self.signature,
       "leave record signature",
@@ -245,6 +261,7 @@ impl LeaveRecordV1 {
         record_version: 1,
         node: self.node.as_str().to_owned(),
         public_key: self.public_key.as_bytes().to_vec(),
+        timestamp_millis: self.timestamp_millis,
         signature: self.signature.as_bytes().to_vec(),
       },
       LEAVE_RECORD_LIMITS,
@@ -267,6 +284,7 @@ impl LeaveRecordV1 {
         <[u8; 32]>::try_from(wire.public_key.as_slice())
           .map_err(|_| Error::invalid_input("leave record key"))?,
       ),
+      timestamp_millis: wire.timestamp_millis,
       signature: crate::Signature::from_bytes(
         <[u8; 64]>::try_from(wire.signature.as_slice())
           .map_err(|_| Error::invalid_input("leave record signature"))?,
@@ -275,12 +293,15 @@ impl LeaveRecordV1 {
   }
 }
 
-/// Signs the leave record for the current local identity.
+/// Signs the leave record for the current local identity, stamping the
+/// host wall-clock removal timestamp the checkpoint GC compares against.
 pub(crate) async fn sign_leave_record(
   context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>,
 ) -> Result<LeaveRecordV1> {
   let identity = context.identity();
-  let body = LeaveRecordV1::encode_signed_body(identity.node(), identity.public_key())?;
+  let timestamp_millis = crate::time::now_millis();
+  let body =
+    LeaveRecordV1::encode_signed_body(identity.node(), identity.public_key(), timestamp_millis)?;
   let signature = keys
     .sign(
       identity.handle(),
@@ -290,6 +311,7 @@ pub(crate) async fn sign_leave_record(
   let record = LeaveRecordV1::new(
     identity.node().clone(),
     identity.public_key().clone(),
+    timestamp_millis,
     signature,
   );
   record.verify()?;
@@ -375,6 +397,46 @@ pub(crate) async fn known_leave_records_ctx(
     }
   }
   Ok(records)
+}
+
+/// The bounded per-pass GC batch on the leave family: one sweep deletes
+/// at most this many collected tombstones; the next sync round continues.
+const GC_BATCH: usize = 64;
+
+/// The leave-side checkpoint sweep (ADR-0009 decision 5): conditional
+/// exact-digest deletes of collected leave records stamped at or before
+/// `watermark`. The leave intent singleton is never touched.
+pub(crate) async fn collect_before_ctx(
+  store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
+) -> Result<usize> {
+  let namespace = leave_namespace()?;
+  let mut collected = 0_usize;
+  for record in known_leave_records_ctx(store, GC_BATCH).await? {
+    if record.timestamp_millis() > watermark {
+      continue;
+    }
+    let snapshot = store.snapshot().await?;
+    let key = leave_record_key(record.node());
+    let Some(existing) = snapshot.get(&namespace, &key).await? else {
+      continue;
+    };
+    let transaction = store.prepare_transaction(
+      TransactionId::generate(entropy)?,
+      snapshot.revision().clone(),
+      vec![StoreOperation::Delete {
+        namespace: namespace.clone(),
+        key,
+        expected: existing.digest().clone(),
+      }],
+    )?;
+    drop(snapshot);
+    // A raced write on this tombstone conflicts: it stays for the next
+    // pass (hygiene, never security).
+    if let crate::CommitOutcome::Committed(_) = store.commit(transaction).await? {
+      collected += 1;
+    }
+  }
+  Ok(collected)
 }
 
 /// Discovers the pending leave-intent, if any.
@@ -789,6 +851,7 @@ mod tests {
     let other = LeaveRecordV1::new(
       crate::NodeId::parse("node_000000000000000000099").unwrap(),
       record.public_key().clone(),
+      record.timestamp_millis(),
       crate::Signature::from_bytes([0x5A; 64]),
     );
     assert!(other.verify().is_err());
@@ -832,6 +895,7 @@ mod tests {
     let divergent = LeaveRecordV1::new(
       node.clone(),
       record.public_key().clone(),
+      record.timestamp_millis(),
       crate::Signature::from_bytes([0x5A; 64]),
     );
     let error = persist_leave_record_ctx(context.store(), entropy.as_ref(), &divergent)
