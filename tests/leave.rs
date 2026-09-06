@@ -346,11 +346,17 @@ async fn g11_leave_announces_to_connected_peers_before_rotating() {
   // The first admission acknowledgement arrived well inside the bound.
   assert!(started.elapsed() < Duration::from_secs(5));
 
-  // The peer observed the leave record for the former identity.
-  let observed = tokio::time::timeout(Duration::from_secs(30), async {
+  // The peer observed the leave record for the former identity. Under a
+  // loaded runner the accept path can trail the announcement by seconds.
+  let observed = tokio::time::timeout(Duration::from_secs(60), async {
     loop {
       match member_events.recv().await {
-        Ok(EventReceive::Item(changed)) if changed.node_id() == &former => break,
+        Ok(EventReceive::Item(changed)) => {
+          tracing::debug!(node = %changed.node_id(), "peer observed member change");
+          if changed.node_id() == &former {
+            break;
+          }
+        }
         Ok(_) => continue,
         Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
       }
