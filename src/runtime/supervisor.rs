@@ -1882,15 +1882,25 @@ impl Supervisor {
     let context = self.context()?;
     let local = context.identity().node();
     if &subject == local {
-      // Self-removal is the explicit leave path (T-G09-06), never a
-      // self-revoke.
+      // Self-removal is the explicit leave path (ADR-0009 decision 3),
+      // never a self-revoke.
       return Err(Error::invalid_input("revoke subject"));
     }
+    // The tombstone is issuer-signed and converges through the sync plane
+    // (ADR-0009 decision 6): any member may expel a compromised binding
+    // cluster-wide, and the record is permanent until an explicit local
+    // purge.
+    let record = crate::identity::revocation::sign_revocation_record(
+      &context,
+      &self.dependencies.keys,
+      &subject,
+      &expected_key,
+    )
+    .await?;
     let outcome = crate::identity::revocation::revoke_binding_ctx(
       context.store(),
       self.dependencies.entropy.as_ref(),
-      &subject,
-      &expected_key,
+      &record,
     )
     .await?;
     let was_already_revoked = matches!(

@@ -406,10 +406,11 @@ async fn g9_delayed_content_converges_after_revoke() {
     tokio::time::sleep(Duration::from_millis(100)).await;
   }
 
-  // The revoked writer's binding also converges to the third member as
-  // an independently trusted binding through a current member's snapshot
-  // (SC-G09-P0-14): content and binding both converge, while only the
-  // revoking node treats the identity as unauthorized.
+  // The revoked writer's binding also converges to the third member —
+  // and so does the revocation tombstone (ADR-0009 decision 6:
+  // revocation is a convergent permanent removal tombstone, so the
+  // expulsion is cluster-wide): content converges, the binding converges,
+  // and every member treats the identity as unauthorized.
   let member_key_on_third = tokio::time::timeout(Duration::from_secs(30), async {
     loop {
       let page = third
@@ -433,7 +434,7 @@ async fn g9_delayed_content_converges_after_revoke() {
   })
   .await
   .unwrap();
-  assert_eq!(member_key_on_third, radiata::TrustStatus::Trusted);
+  assert_eq!(member_key_on_third, radiata::TrustStatus::Revoked);
 
   for node in [issuer, member, third] {
     node.handle.command(Shutdown::new()).await.unwrap();

@@ -41,9 +41,10 @@ pub(crate) const SYNC_KIND_PAGE: u8 = 1;
 pub(crate) const SYNC_KIND_SNAPSHOT: u8 = 2;
 pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
 pub(crate) const SYNC_KIND_CLEANUP: u8 = 4;
+pub(crate) const SYNC_KIND_REVOCATION: u8 = 5;
 
-/// One sync payload: an encoded membership page, an encoded issuer
-/// trust snapshot, or an encoded owner/issuer-signed removal tombstone.
+/// One sync payload: an encoded membership page, an encoded issuer trust
+/// snapshot, or an encoded signed removal tombstone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SyncPayload {
   /// An encoded [`MembershipPage`].
@@ -54,6 +55,8 @@ pub(crate) enum SyncPayload {
   Leave(ByteVec),
   /// An encoded [`crate::identity::cleanup::CleanupRecordV1`].
   Cleanup(ByteVec),
+  /// An encoded [`crate::identity::revocation::RevocationRecordV1`].
+  Revocation(ByteVec),
 }
 
 #[derive(Encode, Decode)]
@@ -74,6 +77,7 @@ impl SyncPayload {
       Self::Snapshot(encoded) => (SYNC_KIND_SNAPSHOT, encoded.clone()),
       Self::Leave(encoded) => (SYNC_KIND_LEAVE, encoded.clone()),
       Self::Cleanup(encoded) => (SYNC_KIND_CLEANUP, encoded.clone()),
+      Self::Revocation(encoded) => (SYNC_KIND_REVOCATION, encoded.clone()),
     };
     encode_canonical(
       &SyncPayloadWire {
@@ -101,6 +105,7 @@ impl SyncPayload {
       SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(wire.payload)),
       SYNC_KIND_LEAVE => Ok(Self::Leave(wire.payload)),
       SYNC_KIND_CLEANUP => Ok(Self::Cleanup(wire.payload)),
+      SYNC_KIND_REVOCATION => Ok(Self::Revocation(wire.payload)),
       _ => Err(Error::invalid_input("membership sync payload kind")),
     }
   }
@@ -254,6 +259,37 @@ async fn accept_payload(
         }
       }
       events.emit(crate::MemberChanged::new(record.subject().clone()));
+    }
+    SyncPayload::Revocation(encoded) => {
+      // A revocation tombstone is convergent permanent evidence (ADR-0009
+      // decision 6): verified against the retained issuer and subject
+      // bindings before any persistence, never covered by checkpoints, and
+      // never re-adoptable away. A tombstone whose bindings have not
+      // converged yet is skipped; the resend cadence heals ordering.
+      let record = crate::identity::revocation::RevocationRecordV1::decode(encoded.as_ref())?;
+      let bindings = trust_store::trusted_bindings(store).await?;
+      if !bindings.contains_key(record.issuer()) || !bindings.contains_key(record.subject()) {
+        tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
+        return Ok(());
+      }
+      // Terminal evidence must not be dropped on a raced commit: bounded
+      // backoff retries cover transient store contention.
+      let mut backoff = Duration::from_millis(25);
+      let mut attempts = 0_u32;
+      loop {
+        match crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record)
+          .await
+        {
+          Ok(()) => break,
+          Err(error) if error.kind() == crate::ErrorKind::NotReady && attempts < 8 => {
+            attempts += 1;
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(400));
+          }
+          Err(error) => return Err(error),
+        }
+      }
+      events.emit(crate::NodeRevoked::new(record.subject().clone()));
     }
   }
   Ok(())
@@ -447,6 +483,8 @@ pub(crate) async fn sync_tick(
     crate::identity::leave::known_leave_records_ctx(store, LEAVE_RESEND_CAP).await?;
   let cleanup_records =
     crate::identity::cleanup::known_cleanup_records_ctx(store, LEAVE_RESEND_CAP).await?;
+  let revocation_records =
+    crate::identity::revocation::known_revocation_records_ctx(store, LEAVE_RESEND_CAP).await?;
   let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
   let peers = crate::sync_common::alive_peers(sessions)?;
   let peers_fp = crate::sync_common::peers_fingerprint(&peers);
@@ -513,6 +551,9 @@ pub(crate) async fn sync_tick(
     }
     for record in &cleanup_records {
       out.push(SyncPayload::Cleanup(ByteVec::from(record.encode()?)).encode()?);
+    }
+    for record in &revocation_records {
+      out.push(SyncPayload::Revocation(ByteVec::from(record.encode()?)).encode()?);
     }
     out
   } else {

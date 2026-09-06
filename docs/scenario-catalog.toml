@@ -1928,6 +1928,30 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-10"
+gate = "G11"
+priority = "P0"
+first = 27
+verification_id = "VERIFY-G11-10"
+kind = "contract"
+cases = [
+  { title = "Revocation is an issuer-signed convergent tombstone", acceptance = "RevocationRecordV1 pins the exact subject key and is signed by the revoking member; the store-level commit is conditional on the live trusted binding's exact digest, is idempotent for the exact record, and fails closed on substituted keys.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-014",
+  ] },
+  { title = "Expulsion is cluster-wide through ordinary sync", acceptance = "The tombstone rides the sync plane with bounded-backoff persistence, so every member — not only the revoking node — converges the revoked status; sessions to the revoked identity are refused everywhere.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-012",
+  ] },
+  { title = "Permanence: revocation is never garbage-collected", acceptance = "The record set is never pruned by any GC pass (unlike leave/cleanup tombstones under T-G11-09) and re-forwards on the snapshot resend cadence, so the gate lives as long as the binding it constrains.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+  ] },
+  { title = "Purge is a deliberate local escape", acceptance = "purge_revocation removes the local record only; a purge is transient by nature while peers still hold the permanent tombstone and sync re-delivers it.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"

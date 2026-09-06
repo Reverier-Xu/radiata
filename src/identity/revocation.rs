@@ -1,32 +1,209 @@
-//! Local authorization revocation (T-G09-04, ADR-0006).
+//! Convergent permanent revocation (T-G11-10, ADR-0009 decision 6).
 //!
-//! Revocation is a durable, local, typed boundary over one exact
-//! node-to-key binding — never a cluster-wide consensus and never content
-//! erasure. Once the revocation transaction is known committed, the node
+//! Revocation is a convergent, permanent, issuer-signed removal tombstone
+//! over one exact node-to-key binding: any member may expel a compromised
+//! binding cluster-wide, the record rides the sync plane, is never covered
+//! by checkpoints, and is cleared only by an explicit local
+//! `purge_revocation`. Once the revocation is known committed, the node
 //! closes the revoked identity's sessions, rejects its new sessions and
-//! online operations, refuses a new admission for it, and never adopts a
-//! new binding for it from issuer snapshots. Everything the identity
-//! signed before the revoke — resources, descriptors, trust history, and
-//! bindings already adopted anywhere — stays eligible for ordinary
-//! anti-entropy; members admitted through a revoked issuer remain
-//! independently trusted.
+//! online operations, refuses a new merge for it, and never adopts a new
+//! binding for it from snapshots. Everything the identity signed before
+//! the revoke — resources, descriptors, trust history, and bindings
+//! already adopted anywhere — stays eligible for ordinary anti-entropy.
 //!
-//! The record is one conditional store write: version byte plus the exact
-//! revoked public key under the subject's canonical key. It carries no
-//! signature because revocation is a local authority decision and never
-//! replicates.
+//! The permanence asymmetry is deliberate: revocation subjects have live,
+//! hostile keys, and bindings resurface by design (sync, stragglers,
+//! storage backup restore), so the gate must live as long as the binding
+//! it constrains.
 
 use std::sync::Arc;
 
-/// The durable namespace of local revocation records.
+use minicbor::{Decode, Encode};
+
+/// The durable namespace of revocation records.
 pub(crate) use crate::storage::families::REVOCATION_NAMESPACE;
 use crate::{
   Error, NodeId, PublicKey, Result, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
   StoreValue, TransactionId, api::Entropy, storage::MetadataStore,
 };
 
-/// The current revocation record version byte.
-const REVOCATION_VERSION: u8 = 1;
+/// The durable schema of the issuer-signed revocation record.
+pub(crate) const REVOCATION_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/revocation-record-v1";
+/// The signature domain of the issuer-signed revocation record.
+pub(crate) const REVOCATION_RECORD_V1_DOMAIN: &[u8] =
+  b"radiata.woooo.tech/crypto/revocation-record-v1";
+
+/// Canonical-decoder bounds for the flat revocation record.
+const REVOCATION_LIMITS: crate::protocol::CborLimits =
+  crate::protocol::CborLimits::new(1, 8, 1_024);
+
+#[derive(Encode, Decode)]
+#[cbor(array)]
+struct RevocationRecordBodyWire {
+  #[n(0)]
+  schema: String,
+  #[n(1)]
+  record_version: u16,
+  #[n(2)]
+  subject: String,
+  #[n(3)]
+  #[cbor(with = "minicbor::bytes")]
+  subject_key: Vec<u8>,
+  #[n(4)]
+  issuer: String,
+}
+
+#[derive(Encode, Decode)]
+#[cbor(array)]
+struct RevocationRecordWire {
+  #[n(0)]
+  schema: String,
+  #[n(1)]
+  record_version: u16,
+  #[n(2)]
+  subject: String,
+  #[n(3)]
+  #[cbor(with = "minicbor::bytes")]
+  subject_key: Vec<u8>,
+  #[n(4)]
+  issuer: String,
+  #[n(5)]
+  #[cbor(with = "minicbor::bytes")]
+  signature: Vec<u8>,
+}
+
+/// One issuer-signed convergent revocation tombstone (ADR-0009 decision 6).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RevocationRecordV1 {
+  subject: NodeId,
+  subject_key: PublicKey,
+  issuer: NodeId,
+  signature: crate::Signature,
+}
+
+impl RevocationRecordV1 {
+  pub(crate) const fn new(
+    subject: NodeId, subject_key: PublicKey, issuer: NodeId, signature: crate::Signature,
+  ) -> Self {
+    Self {
+      subject,
+      subject_key,
+      issuer,
+      signature,
+    }
+  }
+
+  pub(crate) const fn subject(&self) -> &NodeId {
+    &self.subject
+  }
+
+  pub(crate) const fn subject_key(&self) -> &PublicKey {
+    &self.subject_key
+  }
+
+  pub(crate) const fn issuer(&self) -> &NodeId {
+    &self.issuer
+  }
+
+  /// Encodes the canonical body the issuer signs.
+  pub(crate) fn encode_signed_body(
+    subject: &NodeId, subject_key: &PublicKey, issuer: &NodeId,
+  ) -> Result<Vec<u8>> {
+    crate::protocol::encode_canonical(
+      &RevocationRecordBodyWire {
+        schema: REVOCATION_RECORD_SCHEMA.to_owned(),
+        record_version: 1,
+        subject: subject.as_str().to_owned(),
+        subject_key: subject_key.as_bytes().to_vec(),
+        issuer: issuer.as_str().to_owned(),
+      },
+      REVOCATION_LIMITS,
+    )
+  }
+
+  /// Verifies the issuer signature against `issuer_key` (the issuer's
+  /// permanently retained binding).
+  pub(crate) fn verify(&self, issuer_key: &PublicKey) -> Result<()> {
+    crate::identity::signature::verify_strict(
+      REVOCATION_RECORD_V1_DOMAIN,
+      &Self::encode_signed_body(&self.subject, &self.subject_key, &self.issuer)?,
+      issuer_key,
+      &self.signature,
+      "revocation record signature",
+    )
+  }
+
+  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+    crate::protocol::encode_canonical(
+      &RevocationRecordWire {
+        schema: REVOCATION_RECORD_SCHEMA.to_owned(),
+        record_version: 1,
+        subject: self.subject.as_str().to_owned(),
+        subject_key: self.subject_key.as_bytes().to_vec(),
+        issuer: self.issuer.as_str().to_owned(),
+        signature: self.signature.as_bytes().to_vec(),
+      },
+      REVOCATION_LIMITS,
+    )
+  }
+
+  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+    let wire: RevocationRecordWire = crate::protocol::decode_canonical_strict(
+      bytes,
+      REVOCATION_LIMITS,
+      "revocation record canonical form",
+    )
+    .map_err(|_| Error::invalid_input("revocation record"))?;
+    if wire.schema != REVOCATION_RECORD_SCHEMA || wire.record_version != 1 {
+      return Err(Error::invalid_input("revocation record schema"));
+    }
+    Ok(Self {
+      subject: NodeId::parse(&wire.subject)?,
+      subject_key: PublicKey::from_bytes(
+        <[u8; 32]>::try_from(wire.subject_key.as_slice())
+          .map_err(|_| Error::invalid_input("revocation record key"))?,
+      ),
+      issuer: NodeId::parse(&wire.issuer)?,
+      signature: crate::Signature::from_bytes(
+        <[u8; 64]>::try_from(wire.signature.as_slice())
+          .map_err(|_| Error::invalid_input("revocation record signature"))?,
+      ),
+    })
+  }
+}
+
+/// Signs one revocation tombstone for `subject` under the local identity.
+/// The subject must hold a locally trusted binding equal to
+/// `expected_key`: an unknown subject fails `NotFound` and a different
+/// trusted key fails `Conflict`, so a stale or substituted revocation
+/// never signs.
+pub(crate) async fn sign_revocation_record(
+  context: &super::lifecycle::LocalIdentityContext, keys: &Arc<dyn crate::provider::KeyProvider>,
+  subject: &NodeId, expected_key: &PublicKey,
+) -> Result<RevocationRecordV1> {
+  let bindings = crate::identity::trust::store::trusted_bindings(context.store()).await?;
+  match bindings.get(subject) {
+    Some(bound) if bound == expected_key => {}
+    Some(_) => return Err(Error::conflict("revocation key")),
+    None => return Err(Error::not_found("revocation subject")),
+  }
+  let identity = context.identity();
+  let body = RevocationRecordV1::encode_signed_body(subject, expected_key, identity.node())?;
+  let signature = keys
+    .sign(
+      identity.handle(),
+      &super::signature::signature_message(REVOCATION_RECORD_V1_DOMAIN, &body),
+    )
+    .await?;
+  let record = RevocationRecordV1::new(
+    subject.clone(),
+    expected_key.clone(),
+    identity.node().clone(),
+    signature,
+  );
+  record.verify(identity.public_key())?;
+  Ok(record)
+}
 
 fn namespace() -> Result<StoreNamespace> {
   crate::identity::records::metadata_namespace(REVOCATION_NAMESPACE)
@@ -36,22 +213,8 @@ fn revocation_key(subject: &NodeId) -> StoreKey {
   StoreKey::new(Arc::from(subject.as_str().as_bytes().to_vec()))
 }
 
-fn encode_value(key: &PublicKey) -> Vec<u8> {
-  let mut bytes = Vec::with_capacity(33);
-  bytes.push(REVOCATION_VERSION);
-  bytes.extend_from_slice(key.as_bytes());
-  bytes
-}
-
-fn decode_value(bytes: &[u8]) -> Result<PublicKey> {
-  if bytes.len() != 33 || bytes[0] != REVOCATION_VERSION {
-    return Err(Error::invalid_input("revocation record"));
-  }
-  Ok(PublicKey::from_bytes(
-    bytes[1..]
-      .try_into()
-      .map_err(|_| Error::invalid_input("revocation record"))?,
-  ))
+fn decode_value(bytes: &[u8]) -> Result<RevocationRecordV1> {
+  RevocationRecordV1::decode(bytes)
 }
 
 /// The outcome of one conditional revocation commit.
@@ -65,24 +228,26 @@ pub(crate) enum RevokeStoreOutcome {
   AlreadyRevoked,
 }
 
-/// Conditionally revokes one exact subject/key binding (SC-G09-P0-13).
+/// Conditionally revokes one exact subject/key binding with the given
+/// issuer-signed tombstone (SC-G09-P0-13, convergent per ADR-0009
+/// decision 6).
 ///
-/// The subject must hold a locally trusted binding equal to
-/// `expected_key`: an unknown subject fails `NotFound` and a different
-/// trusted key fails `Conflict`, so a stale or substituted revocation
-/// never lands. A stored revocation for a different key also fails
-/// `Conflict`; the exact same one is idempotent. The commit is one
-/// conditional transaction that pins both the revocation key's absence
-/// and the trusted binding record's exact digest, so a concurrent binding
-/// change between the snapshot and the commit fails closed instead of
-/// letting the revoke land against a stale key (the custody-lane
-/// precedent in `deletion.rs`).
+/// The record's subject key must equal the locally trusted binding: an
+/// unknown subject fails `NotFound` and a different trusted key fails
+/// `Conflict`, so a stale or substituted revocation never lands. A stored
+/// revocation for a different key also fails `Conflict`; the exact same
+/// one is idempotent. The commit is one conditional transaction that pins
+/// both the revocation key's absence and the trusted binding record's
+/// exact digest, so a concurrent binding change between the snapshot and
+/// the commit fails closed instead of letting the revoke land against a
+/// stale key (the custody-lane precedent in `deletion.rs`).
 pub(crate) async fn revoke_binding_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, subject: &NodeId, expected_key: &PublicKey,
+  store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
 ) -> Result<RevokeStoreOutcome> {
-  let (binding_namespace, binding_key) = crate::identity::records::identity_binding_key(subject)?;
+  let (binding_namespace, binding_key) =
+    crate::identity::records::identity_binding_key(record.subject())?;
   let namespace = namespace()?;
-  let store_key = revocation_key(subject);
+  let store_key = revocation_key(record.subject());
   let snapshot = store.snapshot().await?;
   let binding_value = snapshot
     .get(&binding_namespace, &binding_key)
@@ -91,12 +256,12 @@ pub(crate) async fn revoke_binding_ctx(
   let binding_digest = binding_value.digest().clone();
   let binding = crate::identity::records::IdentityBindingV1::decode(binding_value.as_bytes())
     .map_err(|_| Error::invalid_input("identity binding"))?;
-  if binding.public_key() != expected_key {
+  if binding.public_key() != record.subject_key() {
     return Err(Error::conflict("revocation key"));
   }
   if let Some(existing) = snapshot.get(&namespace, &store_key).await? {
-    let existing_key = decode_value(existing.as_bytes())?;
-    if &existing_key == expected_key {
+    let existing_record = decode_value(existing.as_bytes())?;
+    if existing_record == *record {
       return Ok(RevokeStoreOutcome::AlreadyRevoked);
     }
     return Err(Error::conflict("revocation key"));
@@ -119,7 +284,7 @@ pub(crate) async fn revoke_binding_ctx(
         namespace,
         key: store_key,
         expected,
-        value: StoreValue::new(Arc::from(encode_value(expected_key))),
+        value: StoreValue::new(Arc::from(record.encode()?)),
       },
     ],
   )?;
@@ -128,8 +293,8 @@ pub(crate) async fn revoke_binding_ctx(
     // A raced exact revocation committed first: idempotent. Any other
     // interleaving fails closed and the caller retries the operation.
     crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-      match revoked_key_ctx(store, subject).await? {
-        Some(key) if &key == expected_key => Ok(RevokeStoreOutcome::AlreadyRevoked),
+      match revoked_key_ctx(store, record.subject()).await? {
+        Some(key) if key == *record.subject_key() => Ok(RevokeStoreOutcome::AlreadyRevoked),
         _ => Err(Error::conflict("revocation commit")),
       }
     }
@@ -140,8 +305,71 @@ pub(crate) async fn revoke_binding_ctx(
   }
 }
 
-/// The revoked key of `subject`, when the local node revoked that exact
-/// binding. Snapshot reads only; the result never fabricates a revocation.
+/// Persists one issuer-signed revocation tombstone received over sync
+/// (ADR-0009 decision 6): verified against the retained issuer binding
+/// and the subject binding, idempotent for the exact record, and failing
+/// closed on any divergence.
+pub(crate) async fn persist_revocation_ctx(
+  store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
+) -> Result<()> {
+  let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
+  let issuer_key = bindings
+    .get(record.issuer())
+    .cloned()
+    .ok_or_else(|| Error::not_trusted("revocation issuer"))?;
+  record.verify(&issuer_key)?;
+  if let Some(bound) = bindings.get(record.subject())
+    && bound != record.subject_key()
+  {
+    return Err(Error::not_trusted("revocation subject binding"));
+  }
+  let namespace = namespace()?;
+  let store_key = revocation_key(record.subject());
+  let snapshot = store.snapshot().await?;
+  if let Some(existing) = snapshot.get(&namespace, &store_key).await? {
+    if existing.as_bytes() == record.encode()?.as_slice() {
+      return Ok(());
+    }
+    return Err(Error::conflict("revocation record"));
+  }
+  let transaction = store.prepare_transaction(
+    TransactionId::generate(entropy)?,
+    snapshot.revision().clone(),
+    vec![StoreOperation::Put {
+      namespace,
+      key: store_key,
+      expected: StoreExpectation::Absent,
+      value: StoreValue::new(Arc::from(record.encode()?)),
+    }],
+  )?;
+  drop(snapshot);
+  let _ = store.commit(transaction).await?;
+  Ok(())
+}
+
+/// Every known revocation tombstone, bounded by `cap`, for sync
+/// forwarding. Permanent records: never pruned by any GC pass.
+pub(crate) async fn known_revocation_records_ctx(
+  store: &MetadataStore, cap: usize,
+) -> Result<Vec<RevocationRecordV1>> {
+  let namespace = namespace()?;
+  let snapshot = store.snapshot().await?;
+  let mut scan = snapshot.scan(&namespace, &[]).await?;
+  let mut records = Vec::new();
+  while let Some(entry) = scan.next().await? {
+    let record = RevocationRecordV1::decode(entry.value().as_bytes())
+      .map_err(|_| Error::invalid_input("revocation record decode"))?;
+    records.push(record);
+    if records.len() >= cap {
+      break;
+    }
+  }
+  Ok(records)
+}
+
+/// The revoked tombstone of `subject`, when this node holds one for that
+/// exact subject key. Snapshot reads only; the result never fabricates a
+/// revocation.
 pub(crate) async fn revoked_key_ctx(
   store: &MetadataStore, subject: &NodeId,
 ) -> Result<Option<PublicKey>> {
@@ -151,7 +379,7 @@ pub(crate) async fn revoked_key_ctx(
   let Some(value) = snapshot.get(&namespace, &key).await? else {
     return Ok(None);
   };
-  Ok(Some(decode_value(value.as_bytes())?))
+  Ok(Some(decode_value(value.as_bytes())?.subject_key().clone()))
 }
 
 /// Whether `subject` is locally revoked under exactly `key` (the session
@@ -164,7 +392,9 @@ pub(crate) async fn is_revoked_ctx(
 
 /// Explicitly clears the local revocation record for `subject` (T-G11-08):
 /// the purge is local-only and idempotent — an absent record is a no-op.
-/// It is the operator's deliberate escape from a fat-fingered revoke.
+/// It is the operator's deliberate escape from a fat-fingered revoke; a
+/// purge is transient by nature (peers still hold the permanent tombstone
+/// and sync re-delivers it).
 pub(crate) async fn purge_revocation_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, subject: &NodeId,
 ) -> Result<()> {
@@ -205,11 +435,19 @@ pub(crate) async fn purge_revocation_ctx(
 mod tests {
   use std::{sync::Arc, time::Duration};
 
-  use super::{RevokeStoreOutcome, is_revoked_ctx, revoke_binding_ctx, revoked_key_ctx};
+  use ed25519_dalek::Signer as _;
+
+  use super::{
+    REVOCATION_RECORD_V1_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, is_revoked_ctx,
+    known_revocation_records_ctx, revoke_binding_ctx, revoked_key_ctx,
+  };
   use crate::{
-    ErrorKind, NodeId, PublicKey, StoreExpectation,
+    ErrorKind, NodeId, PublicKey, Signature, StoreExpectation,
     api::SystemEntropy,
-    identity::records::{self, IdentityBindingV1},
+    identity::{
+      records::{self, IdentityBindingV1},
+      signature::signature_message,
+    },
     provider::StorageFactory,
     storage::MetadataStore,
   };
@@ -220,6 +458,30 @@ mod tests {
 
   fn key(seed: u8) -> PublicKey {
     PublicKey::from_bytes([seed; 32])
+  }
+
+  /// The fixed test issuer: a distinct node whose deterministic signing
+  /// key produces byte-identical records across crash-matrix runs.
+  fn issuer() -> NodeId {
+    NodeId::parse("node_000000000000000000091").unwrap()
+  }
+
+  fn issuer_signing() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x2A; 32])
+  }
+
+  /// Builds the exact issuer-signed tombstone the store-level revoke
+  /// commits (the signature is deterministic, so crash-matrix dry runs
+  /// and child processes construct byte-identical records).
+  fn signed_record(subject: &NodeId, subject_key: &PublicKey) -> RevocationRecordV1 {
+    let body = RevocationRecordV1::encode_signed_body(subject, subject_key, &issuer()).unwrap();
+    let signature = issuer_signing().sign(&signature_message(REVOCATION_RECORD_V1_DOMAIN, &body));
+    RevocationRecordV1::new(
+      subject.clone(),
+      subject_key.clone(),
+      issuer(),
+      Signature::from_bytes(signature.to_bytes()),
+    )
   }
 
   async fn open_store() -> MetadataStore {
@@ -266,7 +528,7 @@ mod tests {
     trust(&store, &subject(), &key(7)).await;
 
     assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &subject(), &key(7))
+      revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
         .await
         .unwrap(),
       RevokeStoreOutcome::Revoked(_)
@@ -277,17 +539,21 @@ mod tests {
     );
     assert!(is_revoked_ctx(&store, &subject(), &key(7)).await.unwrap());
     assert!(!is_revoked_ctx(&store, &subject(), &key(8)).await.unwrap());
+    // The permanent record set feeds the sync forwarder.
+    let known = known_revocation_records_ctx(&store, 64).await.unwrap();
+    assert_eq!(known.len(), 1);
+    assert_eq!(known[0].subject(), &subject());
 
     // Idempotent: the same exact revocation reports no new transition.
     assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &subject(), &key(7))
+      revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
         .await
         .unwrap(),
       RevokeStoreOutcome::AlreadyRevoked
     ));
     // A revocation recorded under one key never silently rekeys.
     assert_eq!(
-      revoke_binding_ctx(&store, &SystemEntropy, &subject(), &key(8))
+      revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(8)))
         .await
         .unwrap_err()
         .kind(),
@@ -297,7 +563,7 @@ mod tests {
     // An unknown subject and a substituted trusted key both fail closed.
     let unknown = NodeId::parse("node_000000000000000000052").unwrap();
     assert_eq!(
-      revoke_binding_ctx(&store, &SystemEntropy, &unknown, &key(7))
+      revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&unknown, &key(7)))
         .await
         .unwrap_err()
         .kind(),
@@ -306,10 +572,14 @@ mod tests {
     let substituted = NodeId::parse("node_000000000000000000053").unwrap();
     trust(&store, &substituted, &key(9)).await;
     assert_eq!(
-      revoke_binding_ctx(&store, &SystemEntropy, &substituted, &key(10))
-        .await
-        .unwrap_err()
-        .kind(),
+      revoke_binding_ctx(
+        &store,
+        &SystemEntropy,
+        &signed_record(&substituted, &key(10))
+      )
+      .await
+      .unwrap_err()
+      .kind(),
       ErrorKind::Conflict
     );
     assert!(!is_revoked_ctx(&store, &substituted, &key(9)).await.unwrap());
@@ -329,7 +599,7 @@ mod tests {
       .unwrap();
     trust(&store, &subject(), &key(7)).await;
     assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &subject(), &key(7))
+      revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
         .await
         .unwrap(),
       RevokeStoreOutcome::Revoked(_)
@@ -360,15 +630,43 @@ mod crash {
 
   use tempfile::TempDir;
 
-  use super::{RevokeStoreOutcome, revoke_binding_ctx, revoked_key_ctx};
+  use super::{
+    REVOCATION_RECORD_V1_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, revoke_binding_ctx,
+    revoked_key_ctx,
+  };
   use crate::{
-    CommitReceipt, NodeId, PublicKey, ReconcileOutcome, StoreExpectation,
+    CommitReceipt, NodeId, PublicKey, ReconcileOutcome, Signature, StoreExpectation,
     api::SystemEntropy,
-    identity::records::{self, IdentityBindingV1},
+    identity::{
+      records::{self, IdentityBindingV1},
+      signature::signature_message,
+    },
     provider::StorageFactory,
     storage::{MetadataStore, test_util},
     transport::testing::SeedEntropy,
   };
+
+  /// The fixed test issuer: byte-identical records across dry runs and
+  /// child processes keep the crash-matrix receipt comparison exact.
+  fn issuer() -> NodeId {
+    NodeId::parse("node_000000000000000000091").unwrap()
+  }
+
+  fn issuer_signing() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x2A; 32])
+  }
+
+  fn signed_record(subject: &NodeId, subject_key: &PublicKey) -> RevocationRecordV1 {
+    use ed25519_dalek::Signer as _;
+    let body = RevocationRecordV1::encode_signed_body(subject, subject_key, &issuer()).unwrap();
+    let signature = issuer_signing().sign(&signature_message(REVOCATION_RECORD_V1_DOMAIN, &body));
+    RevocationRecordV1::new(
+      subject.clone(),
+      subject_key.clone(),
+      issuer(),
+      Signature::from_bytes(signature.to_bytes()),
+    )
+  }
 
   const CRASH_DIR_ENV: &str = "RADIATA_REVOKE_CRASH_DIR";
   const CRASH_POINT_ENV: &str = "RADIATA_REVOKE_CRASH_POINT";
@@ -466,9 +764,13 @@ mod crash {
     let factory = factory(backend, dir.path());
     seed(&factory).await;
     let store = open_store(&factory).await;
-    match revoke_binding_ctx(&store, &SeedEntropy(CHILD_ENTROPY_SEED), &subject(), &key())
-      .await
-      .unwrap()
+    match revoke_binding_ctx(
+      &store,
+      &SeedEntropy(CHILD_ENTROPY_SEED),
+      &signed_record(&subject(), &key()),
+    )
+    .await
+    .unwrap()
     {
       RevokeStoreOutcome::Revoked(receipt) => receipt,
       RevokeStoreOutcome::AlreadyRevoked => panic!("dry-run revoke must commit"),
@@ -501,9 +803,13 @@ mod crash {
     let store = MetadataStore::open(&factory, Duration::from_secs(10))
       .await
       .unwrap();
-    match revoke_binding_ctx(&store, &SeedEntropy(CHILD_ENTROPY_SEED), &subject(), &key())
-      .await
-      .unwrap()
+    match revoke_binding_ctx(
+      &store,
+      &SeedEntropy(CHILD_ENTROPY_SEED),
+      &signed_record(&subject(), &key()),
+    )
+    .await
+    .unwrap()
     {
       RevokeStoreOutcome::Revoked(_) | RevokeStoreOutcome::AlreadyRevoked => {}
     }
