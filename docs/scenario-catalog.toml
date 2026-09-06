@@ -1904,6 +1904,30 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-08"
+gate = "G11"
+priority = "P0"
+first = 19
+verification_id = "VERIFY-G11-08"
+kind = "contract"
+cases = [
+  { title = "cleanup_node issues a convergent issuer-signed tombstone", acceptance = "CleanupRecordV1 pins the exact subject binding and is signed by the issuing member; receivers verify it against the retained issuer and subject bindings, persist it idempotently, and converge it through the sync resend cadence; cleaning an unknown subject or the own node fails with a typed error.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-014",
+  ] },
+  { title = "Cleanup is terminal and excludes the subject", acceptance = "A cleaned node is refused new member sessions and re-merges everywhere the tombstone converged, is excluded from recovery dialing, and keeps its binding as permanent verification evidence; there is no resurrection path.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-012",
+  ] },
+  { title = "Terminal removal evidence survives store contention", acceptance = "A raced commit while persisting a received leave or cleanup record retries with a bounded backoff instead of dropping the record; the sender may be gone for good.", rebaseline = "ADR-0009", threats = [
+    "THR-015",
+  ] },
+  { title = "purge_revocation clears one local record explicitly", acceptance = "PurgeRevocation deletes the local revocation record for one subject, is idempotent, and restores the local session boundary (fat-finger recovery).", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"

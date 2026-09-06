@@ -421,6 +421,14 @@ async fn supervise(
         let result = supervisor.revoke_node(subject, expected_key).await;
         let _ = reply.send(result);
       }
+      Control::CleanupNode { subject, reply } => {
+        let result = supervisor.cleanup_node(subject).await;
+        let _ = reply.send(result);
+      }
+      Control::PurgeRevocation { subject, reply } => {
+        let result = supervisor.purge_revocation(subject).await;
+        let _ = reply.send(result);
+      }
       Control::RemoveResource {
         name,
         expected,
@@ -1828,6 +1836,45 @@ impl Supervisor {
   /// conditionally first, then the revoked identity's sessions close and
   /// its new sessions, admissions, and operations are rejected. Stored
   /// metadata is never erased or reinterpreted.
+  /// Issues one convergent issuer-signed cleanup tombstone (T-G11-08):
+  /// the record persists locally and converges through the sync plane.
+  async fn cleanup_node(&mut self, subject: NodeId) -> Result<()> {
+    self.require_unblocked()?;
+    let context = self.context()?;
+    if &subject == context.identity().node() {
+      // Self-removal is the explicit leave path (ADR-0009 decision 3),
+      // never a self-cleanup.
+      return Err(Error::invalid_input("cleanup subject"));
+    }
+    let record =
+      crate::identity::cleanup::sign_cleanup_record(&context, &self.dependencies.keys, &subject)
+        .await?;
+    crate::identity::cleanup::persist_cleanup_record_ctx(
+      context.store(),
+      self.dependencies.entropy.as_ref(),
+      &record,
+    )
+    .await?;
+    self
+      .dependencies
+      .events
+      .emit(crate::MemberChanged::new(subject));
+    Ok(())
+  }
+
+  /// Clears the local revocation record for one subject (T-G11-08):
+  /// local-only, idempotent, deliberate.
+  async fn purge_revocation(&mut self, subject: NodeId) -> Result<()> {
+    self.require_unblocked()?;
+    let context = self.context()?;
+    crate::identity::revocation::purge_revocation_ctx(
+      context.store(),
+      self.dependencies.entropy.as_ref(),
+      &subject,
+    )
+    .await
+  }
+
   async fn revoke_node(
     &mut self, subject: NodeId, expected_key: crate::PublicKey,
   ) -> Result<crate::RevokeOutcome> {
@@ -1992,15 +2039,17 @@ impl Supervisor {
     // from their signed descriptor; reachability stays distinct from the
     // active topology and recovery never dials strangers (SC-G05-P0-11/18).
     let bindings = crate::identity::trust::store::trusted_bindings(self.context()?.store()).await?;
-    // Left nodes are excluded from recovery dialing (ADR-0009 decision 3).
-    let left = crate::identity::leave::left_nodes_ctx(self.context()?.store()).await?;
+    // Left and cleaned nodes are excluded from recovery dialing
+    // (ADR-0009 decisions 3-4).
+    let mut excluded = crate::identity::cleanup::cleaned_nodes_ctx(self.context()?.store()).await?;
+    excluded.append(&mut crate::identity::leave::left_nodes_ctx(self.context()?.store()).await?);
     // One snapshot for the whole cycle: per-member descriptor reads must
     // not pay one snapshot acquisition each (a 1,024-member recovery tick
     // would otherwise acquire 1,024 snapshots).
     let snapshot = self.context()?.store().snapshot().await?;
     let mut candidates = std::collections::BTreeSet::new();
     for member in online.difference(&direct) {
-      if self.recovery_excluded.contains(member) || left.contains(member) {
+      if self.recovery_excluded.contains(member) || excluded.contains(member) {
         continue;
       }
       // Only known members (a durable binding exists) are dialled.

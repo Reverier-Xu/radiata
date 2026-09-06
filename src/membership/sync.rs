@@ -11,7 +11,7 @@
 //! topology converge over the same authenticated sessions the facade
 //! observes.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
@@ -40,9 +40,10 @@ const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-sync-pa
 pub(crate) const SYNC_KIND_PAGE: u8 = 1;
 pub(crate) const SYNC_KIND_SNAPSHOT: u8 = 2;
 pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
+pub(crate) const SYNC_KIND_CLEANUP: u8 = 4;
 
 /// One sync payload: an encoded membership page, an encoded issuer
-/// trust snapshot, or an encoded owner-signed leave record.
+/// trust snapshot, or an encoded owner/issuer-signed removal tombstone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SyncPayload {
   /// An encoded [`MembershipPage`].
@@ -51,6 +52,8 @@ pub(crate) enum SyncPayload {
   Snapshot(ByteVec),
   /// An encoded [`crate::identity::leave::LeaveRecordV1`].
   Leave(ByteVec),
+  /// An encoded [`crate::identity::cleanup::CleanupRecordV1`].
+  Cleanup(ByteVec),
 }
 
 #[derive(Encode, Decode)]
@@ -70,6 +73,7 @@ impl SyncPayload {
       Self::Page(encoded) => (SYNC_KIND_PAGE, encoded.clone()),
       Self::Snapshot(encoded) => (SYNC_KIND_SNAPSHOT, encoded.clone()),
       Self::Leave(encoded) => (SYNC_KIND_LEAVE, encoded.clone()),
+      Self::Cleanup(encoded) => (SYNC_KIND_CLEANUP, encoded.clone()),
     };
     encode_canonical(
       &SyncPayloadWire {
@@ -96,6 +100,7 @@ impl SyncPayload {
       SYNC_KIND_PAGE => Ok(Self::Page(wire.payload)),
       SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(wire.payload)),
       SYNC_KIND_LEAVE => Ok(Self::Leave(wire.payload)),
+      SYNC_KIND_CLEANUP => Ok(Self::Cleanup(wire.payload)),
       _ => Err(Error::invalid_input("membership sync payload kind")),
     }
   }
@@ -200,8 +205,55 @@ async fn accept_payload(
       if bound_key != record.public_key() {
         return Err(Error::not_trusted("leave record binding"));
       }
-      crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
+      // The leaver is gone after this delivery: transient store contention
+      // must not drop terminal evidence, so the persist retries with a
+      // bounded backoff.
+      let mut backoff = Duration::from_millis(25);
+      let mut attempts = 0_u32;
+      loop {
+        match crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record)
+          .await
+        {
+          Ok(()) => break,
+          Err(error) if error.kind() == crate::ErrorKind::NotReady && attempts < 8 => {
+            attempts += 1;
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(400));
+          }
+          Err(error) => return Err(error),
+        }
+      }
       events.emit(crate::MemberChanged::new(record.node().clone()));
+    }
+    SyncPayload::Cleanup(encoded) => {
+      // An issuer-signed cleanup tombstone is terminal evidence (ADR-0009
+      // decision 4): verified against the retained issuer and subject
+      // bindings before any persistence. A tombstone whose bindings have
+      // not converged yet is skipped; the resend cadence heals ordering.
+      let record = crate::identity::cleanup::CleanupRecordV1::decode(encoded.as_ref())?;
+      let bindings = trust_store::trusted_bindings(store).await?;
+      if !bindings.contains_key(record.issuer()) || !bindings.contains_key(record.subject()) {
+        tracing::debug!(subject = %record.subject(), "cleanup record skipped: bindings unknown");
+        return Ok(());
+      }
+      // Terminal evidence must not be dropped on a raced commit: bounded
+      // backoff retries cover transient store contention.
+      let mut backoff = Duration::from_millis(25);
+      let mut attempts = 0_u32;
+      loop {
+        match crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), &record)
+          .await
+        {
+          Ok(()) => break,
+          Err(error) if error.kind() == crate::ErrorKind::NotReady && attempts < 8 => {
+            attempts += 1;
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(400));
+          }
+          Err(error) => return Err(error),
+        }
+      }
+      events.emit(crate::MemberChanged::new(record.subject().clone()));
     }
   }
   Ok(())
@@ -388,11 +440,13 @@ pub(crate) async fn sync_tick(
     return Ok(());
   }
   let snapshot = refresh_issuer_snapshot(context, entropy).await?;
-  // Owner-signed leave records ride the same anti-entropy plane: forward
-  // the known (bounded) set whenever a snapshot round sends, so a lost
-  // delivery heals on the resend cadence (ADR-0009 decision 3).
+  // Removal tombstones (leave, cleanup) ride the same anti-entropy plane:
+  // forward the known (bounded) sets whenever a snapshot round sends, so a
+  // lost delivery heals on the resend cadence (ADR-0009 decisions 3-4).
   let leave_records =
     crate::identity::leave::known_leave_records_ctx(store, LEAVE_RESEND_CAP).await?;
+  let cleanup_records =
+    crate::identity::cleanup::known_cleanup_records_ctx(store, LEAVE_RESEND_CAP).await?;
   let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
   let peers = crate::sync_common::alive_peers(sessions)?;
   let peers_fp = crate::sync_common::peers_fingerprint(&peers);
@@ -453,14 +507,25 @@ pub(crate) async fn sync_tick(
     None => None,
   };
   let leave_bytes: Vec<Vec<u8>> = if snapshot_bytes.is_some() {
-    let mut out = Vec::with_capacity(leave_records.len());
+    let mut out = Vec::with_capacity(leave_records.len() + cleanup_records.len());
     for record in &leave_records {
       out.push(SyncPayload::Leave(ByteVec::from(record.encode()?)).encode()?);
+    }
+    for record in &cleanup_records {
+      out.push(SyncPayload::Cleanup(ByteVec::from(record.encode()?)).encode()?);
     }
     out
   } else {
     Vec::new()
   };
+  if !leave_records.is_empty() || !cleanup_records.is_empty() {
+    tracing::debug!(
+      leave = leave_records.len(),
+      cleanup = cleanup_records.len(),
+      send = !leave_bytes.is_empty(),
+      "removal tombstones considered for forwarding"
+    );
+  }
   if page_due || !starting_round {
     cursor.ticks_since_page_send = 0;
     for peer in &peers {

@@ -169,6 +169,11 @@ pub struct radiata::ChannelBinding(_)
 impl radiata::ChannelBinding
 pub const fn radiata::ChannelBinding::as_bytes(&self) -> &[u8; 32]
 pub const fn radiata::ChannelBinding::from_tls_exporter([u8; 32]) -> Self
+pub struct radiata::CleanupNode
+impl radiata::CleanupNode
+pub fn radiata::CleanupNode::new(radiata::NodeId) -> Self
+impl radiata::Command for radiata::CleanupNode
+pub type radiata::CleanupNode::Output = ()
 pub struct radiata::CommitReceipt
 impl radiata::CommitReceipt
 pub fn radiata::CommitReceipt::committed_revision(&self) -> &radiata::StoreRevision
@@ -601,6 +606,11 @@ pub const fn radiata::PublicKey::as_bytes(&self) -> &[u8; 32]
 pub const fn radiata::PublicKey::from_bytes([u8; 32]) -> Self
 impl core::fmt::Debug for radiata::PublicKey
 pub fn radiata::PublicKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::PurgeRevocation
+impl radiata::PurgeRevocation
+pub fn radiata::PurgeRevocation::new(radiata::NodeId) -> Self
+impl radiata::Command for radiata::PurgeRevocation
+pub type radiata::PurgeRevocation::Output = ()
 pub struct radiata::PutResource
 impl radiata::PutResource
 pub fn radiata::PutResource::new(radiata::ResourceWrite) -> radiata::Result<Self>
@@ -947,6 +957,8 @@ pub trait radiata::CandidateNodeReader: radiata::routing::private::Sealed + core
 pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, &'a radiata::Selector, core::option::Option<radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
 pub trait radiata::Command: radiata::operation::private::Sealed + core::marker::Send + 'static
 pub type radiata::Command::Output: core::marker::Send + 'static
+impl radiata::Command for radiata::CleanupNode
+pub type radiata::CleanupNode::Output = ()
 impl radiata::Command for radiata::ConnectMember
 pub type radiata::ConnectMember::Output = radiata::NodeId
 impl radiata::Command for radiata::DisconnectPeer
@@ -957,6 +969,8 @@ impl radiata::Command for radiata::Listen
 pub type radiata::Listen::Output = radiata::ListenerView
 impl radiata::Command for radiata::MergeCluster
 pub type radiata::MergeCluster::Output = radiata::MergeView
+impl radiata::Command for radiata::PurgeRevocation
+pub type radiata::PurgeRevocation::Output = ()
 impl radiata::Command for radiata::PutResource
 pub type radiata::PutResource::Output = radiata::ResourceMutationView
 impl radiata::Command for radiata::RemoveResource

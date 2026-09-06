@@ -78,12 +78,13 @@ pub use identity::{
 pub use label::{LabelKey, LabelSet, LabelValue};
 pub use node::{EventOptions, EventReceive, EventSubscription, NodeBuilder, NodeHandle};
 pub use operation::{
-  Command, ConnectMember, DisconnectPeer, Event, GetLocalNode, GetMember, GetNodeStatus,
-  GetObservability, GetResource, GetRoute, IdentityReplaced, LeaveCluster, Listen, MemberChanged,
-  MergeCluster, NodeRevoked, PageListeners, PageMembers, PageResources, PageSessions, PageTopology,
-  PageTrust, PutResource, Query, RecoveryChanged, RemoveResource, ResourceChanged, ResourceWrite,
-  RevokeNode, RotateMergeCredential, RouteChanged, SelectResources, SessionChanged, Shutdown,
-  StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
+  CleanupNode, Command, ConnectMember, DisconnectPeer, Event, GetLocalNode, GetMember,
+  GetNodeStatus, GetObservability, GetResource, GetRoute, IdentityReplaced, LeaveCluster, Listen,
+  MemberChanged, MergeCluster, NodeRevoked, PageListeners, PageMembers, PageResources,
+  PageSessions, PageTopology, PageTrust, PurgeRevocation, PutResource, Query, RecoveryChanged,
+  RemoveResource, ResourceChanged, ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged,
+  SelectResources, SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata,
+  WaitForShutdown,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,

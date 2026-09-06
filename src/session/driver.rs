@@ -225,7 +225,9 @@ impl SessionDriver {
     // merge through this node: the exact revoked or left binding fails
     // closed before any credential or signing work (T-G09-04, ADR-0006,
     // ADR-0009 decision 3).
-    if crate::identity::leave::is_left_ctx(self.context.store(), &peek.node_id).await? {
+    if crate::identity::leave::is_left_ctx(self.context.store(), &peek.node_id).await?
+      || crate::identity::cleanup::is_cleaned_ctx(self.context.store(), &peek.node_id).await?
+    {
       return Err(Error::not_trusted("peer left"));
     }
     if crate::identity::revocation::is_revoked_ctx(
@@ -550,9 +552,12 @@ impl SessionDriver {
 /// before any signing work (T-G09-04: revocation removes connection
 /// authority).
 async fn trusted_binding(context: &LocalIdentityContext, peer: &NodeId) -> Result<PublicKey> {
-  // A node with an owner-signed leave record is terminal evidence: it is
-  // excluded from session establishment (ADR-0009 decision 3).
-  if crate::identity::leave::is_left_ctx(context.store(), peer).await? {
+  // A node with an owner-signed leave record or an issuer-signed cleanup
+  // tombstone is terminal evidence: it is excluded from session
+  // establishment (ADR-0009 decisions 3-4).
+  if crate::identity::leave::is_left_ctx(context.store(), peer).await?
+    || crate::identity::cleanup::is_cleaned_ctx(context.store(), peer).await?
+  {
     return Err(Error::not_trusted("peer left"));
   }
   let snapshot = context.store().snapshot().await?;

@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub(crate) mod cleanup;
+#[allow(dead_code)]
 pub(crate) mod credential;
 #[allow(dead_code)]
 pub(crate) mod deletion;

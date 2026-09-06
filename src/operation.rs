@@ -446,6 +446,52 @@ impl Command for RevokeNode {
   type Output = crate::RevokeOutcome;
 }
 
+/// Issues a convergent issuer-signed cleanup tombstone for one
+/// decommissioned node (ADR-0009 decision 4). Terminal: there is no
+/// resurrection path. The caller is responsible for never cleaning a node
+/// that is merely offline.
+pub struct CleanupNode {
+  subject: NodeId,
+}
+
+impl CleanupNode {
+  pub fn new(subject: NodeId) -> Self {
+    Self { subject }
+  }
+
+  pub(crate) fn into_subject(self) -> NodeId {
+    self.subject
+  }
+}
+
+impl private::Sealed for CleanupNode {}
+
+impl Command for CleanupNode {
+  type Output = ();
+}
+
+/// Explicitly clears the local revocation record for one subject
+/// (ADR-0009 decision 6). Local-only and idempotent.
+pub struct PurgeRevocation {
+  subject: NodeId,
+}
+
+impl PurgeRevocation {
+  pub fn new(subject: NodeId) -> Self {
+    Self { subject }
+  }
+
+  pub(crate) fn into_subject(self) -> NodeId {
+    self.subject
+  }
+}
+
+impl private::Sealed for PurgeRevocation {}
+
+impl Command for PurgeRevocation {
+  type Output = ();
+}
+
 /// Creates signed removal evidence for one resource (T-G09-05): the
 /// removal commits only when the locally stored winner still equals
 /// `expected` exactly and the removal strictly wins the tuple, so a stale

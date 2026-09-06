@@ -32,6 +32,8 @@ pub(crate) const TRUST_BINDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/tr
 pub(crate) const REVOCATION_NAMESPACE: &str = "radiata.woooo.tech/metadata/revocation-v1";
 /// In-progress active-leave intent (G9-06).
 pub(crate) const LEAVE_NAMESPACE: &str = "radiata.woooo.tech/metadata/leave-v1";
+/// One issuer-signed dead-node cleanup tombstone per subject (T-G11-08).
+pub(crate) const CLEANUP_NAMESPACE: &str = "radiata.woooo.tech/metadata/cleanup-v1";
 /// Owner-revision-marked node descriptor per node.
 pub(crate) const NODE_DESCRIPTOR_NAMESPACE: &str = "radiata.woooo.tech/metadata/node-descriptor-v1";
 /// One multiwriter generic resource register per resource name.
@@ -107,7 +109,7 @@ mod catalog {
   }
 
   use super::{
-    CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, INTERNAL_NAMESPACE,
+    CLEANUP_NAMESPACE, CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, INTERNAL_NAMESPACE,
     KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE, KEY_DELETION_INTENT_NAMESPACE,
     LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE, MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE,
     PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE, REVOCATION_NAMESPACE, SCHEMA_NAMESPACE,
@@ -123,6 +125,7 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::Identity, MERGE_GRANT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, REVOCATION_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, LEAVE_NAMESPACE),
+      MetadataFamily::new(MetadataDomain::Identity, CLEANUP_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_CREATION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETED_NAMESPACE),

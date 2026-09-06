@@ -152,6 +152,14 @@ pub(crate) enum Control {
     expected_key: crate::PublicKey,
     reply: oneshot::Sender<Result<crate::RevokeOutcome>>,
   },
+  PurgeRevocation {
+    subject: NodeId,
+    reply: oneshot::Sender<Result<()>>,
+  },
+  CleanupNode {
+    subject: NodeId,
+    reply: oneshot::Sender<Result<()>>,
+  },
   RemoveResource {
     name: crate::ResourceName,
     expected: crate::ResourceVersion,
@@ -450,6 +458,18 @@ impl RuntimeClient {
         expected_key,
         reply,
       })
+      .await
+  }
+
+  pub(crate) async fn cleanup_node(&self, subject: NodeId) -> Result<()> {
+    self
+      .send_command(|reply| Control::CleanupNode { subject, reply })
+      .await
+  }
+
+  pub(crate) async fn purge_revocation(&self, subject: NodeId) -> Result<()> {
+    self
+      .send_command(|reply| Control::PurgeRevocation { subject, reply })
       .await
   }
 

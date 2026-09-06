@@ -162,6 +162,45 @@ pub(crate) async fn is_revoked_ctx(
   Ok(revoked_key_ctx(store, subject).await?.as_ref() == Some(key))
 }
 
+/// Explicitly clears the local revocation record for `subject` (T-G11-08):
+/// the purge is local-only and idempotent — an absent record is a no-op.
+/// It is the operator's deliberate escape from a fat-fingered revoke.
+pub(crate) async fn purge_revocation_ctx(
+  store: &MetadataStore, entropy: &dyn Entropy, subject: &NodeId,
+) -> Result<()> {
+  let namespace = namespace()?;
+  let store_key = revocation_key(subject);
+  let snapshot = store.snapshot().await?;
+  let Some(existing) = snapshot.get(&namespace, &store_key).await? else {
+    return Ok(());
+  };
+  let transaction = store.prepare_transaction(
+    TransactionId::generate(entropy)?,
+    snapshot.revision().clone(),
+    vec![StoreOperation::Delete {
+      namespace,
+      key: store_key,
+      expected: existing.digest().clone(),
+    }],
+  )?;
+  drop(snapshot);
+  match store.commit(transaction).await? {
+    crate::CommitOutcome::Committed(_) => Ok(()),
+    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
+      // A raced purge committed first: idempotent.
+      if revoked_key_ctx(store, subject).await?.is_none() {
+        Ok(())
+      } else {
+        Err(Error::conflict("revocation purge"))
+      }
+    }
+    crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
+      crate::ProviderErrorKind::CommitUnknown,
+      crate::ProviderErrorContext::StorageCommit,
+    )),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::{sync::Arc, time::Duration};

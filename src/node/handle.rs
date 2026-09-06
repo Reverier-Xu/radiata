@@ -233,6 +233,22 @@ impl DispatchCommand for crate::RevokeNode {
   }
 }
 
+impl DispatchCommand for crate::CleanupNode {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+    let subject = self.into_subject();
+    let runtime = runtime.clone();
+    Box::pin(async move { runtime.cleanup_node(subject).await })
+  }
+}
+
+impl DispatchCommand for crate::PurgeRevocation {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+    let subject = self.into_subject();
+    let runtime = runtime.clone();
+    Box::pin(async move { runtime.purge_revocation(subject).await })
+  }
+}
+
 impl DispatchCommand for crate::RemoveResource {
   fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
     let (name, expected) = self.into_parts();
