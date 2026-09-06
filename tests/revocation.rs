@@ -412,29 +412,24 @@ async fn g9_delayed_content_converges_after_revoke() {
   // expulsion is cluster-wide): content converges, the binding converges,
   // and every member treats the identity as unauthorized.
   let member_key_on_third = tokio::time::timeout(Duration::from_secs(30), async {
+    // The tombstone trails its binding (the revocation forwards on the
+    // snapshot resend cadence), so poll until the revoked status lands.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-      let page = third
-        .handle
-        .query(PageTrust::new(PageSpec::first(8).unwrap()))
-        .await
-        .unwrap();
-      if let Some(view) = page
-        .items()
-        .iter()
-        .find(|view| view.node_id() == &member_id)
-      {
-        break view.status();
-      }
-      assert!(
-        deadline.elapsed() < Duration::from_secs(30),
-        "binding never converged"
-      );
-      tokio::time::sleep(Duration::from_millis(100)).await;
+      let Some(status) = trust_status(&third.handle, &member_id).await else {
+        assert!(
+          deadline.elapsed() < Duration::from_secs(30),
+          "binding never converged"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        continue;
+      };
+      assert_eq!(status, radiata::TrustStatus::Revoked, "wrong status");
+      break;
     }
   })
   .await
   .unwrap();
-  assert_eq!(member_key_on_third, radiata::TrustStatus::Revoked);
 
   for node in [issuer, member, third] {
     node.handle.command(Shutdown::new()).await.unwrap();
