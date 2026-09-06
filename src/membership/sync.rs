@@ -218,6 +218,7 @@ async fn accept_payload(
       // The writer exclusion serializes the persist against every other
       // store writer, so terminal evidence cannot be dropped on contention.
       crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
+      tracing::debug!(node = %record.node(), "leave record persisted on peer");
       events.emit(crate::MemberChanged::new(record.node().clone()));
     }
     SyncPayload::Cleanup(encoded) => {
