@@ -142,6 +142,241 @@ fn leave_key() -> StoreKey {
   StoreKey::new(Arc::from(INTENT_KEY.to_vec()))
 }
 
+/// The durable schema of the owner-signed leave record.
+pub(crate) const LEAVE_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/leave-record-v1";
+/// The signature domain of the owner-signed leave record.
+pub(crate) const LEAVE_RECORD_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/leave-record-v1";
+
+/// Canonical-decoder bounds for the flat leave record.
+const LEAVE_RECORD_LIMITS: crate::protocol::CborLimits =
+  crate::protocol::CborLimits::new(1, 8, 1_024);
+
+#[derive(Encode, Decode)]
+#[cbor(array)]
+struct LeaveRecordBodyWire {
+  #[n(0)]
+  schema: String,
+  #[n(1)]
+  record_version: u16,
+  #[n(2)]
+  node: String,
+  #[n(3)]
+  #[cbor(with = "minicbor::bytes")]
+  public_key: Vec<u8>,
+}
+
+#[derive(Encode, Decode)]
+#[cbor(array)]
+struct LeaveRecordWire {
+  #[n(0)]
+  schema: String,
+  #[n(1)]
+  record_version: u16,
+  #[n(2)]
+  node: String,
+  #[n(3)]
+  #[cbor(with = "minicbor::bytes")]
+  public_key: Vec<u8>,
+  #[n(4)]
+  #[cbor(with = "minicbor::bytes")]
+  signature: Vec<u8>,
+}
+
+/// One owner-signed leave record (ADR-0009 decision 3): a terminal removal
+/// tombstone for the named binding. The leaver signs it with its current
+/// key before rotating; peers verify it against the permanently retained
+/// identity binding, never against the leaver staying online. Because the
+/// rotation destroys the old key, the record carries no replay or time-lag
+/// attack surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LeaveRecordV1 {
+  node: NodeId,
+  public_key: PublicKey,
+  signature: crate::Signature,
+}
+
+impl LeaveRecordV1 {
+  pub(crate) const fn new(
+    node: NodeId, public_key: PublicKey, signature: crate::Signature,
+  ) -> Self {
+    Self {
+      node,
+      public_key,
+      signature,
+    }
+  }
+
+  pub(crate) const fn node(&self) -> &NodeId {
+    &self.node
+  }
+
+  pub(crate) const fn public_key(&self) -> &PublicKey {
+    &self.public_key
+  }
+
+  /// Encodes the canonical body the owner signs.
+  pub(crate) fn encode_signed_body(node: &NodeId, public_key: &PublicKey) -> Result<Vec<u8>> {
+    encode_canonical(
+      &LeaveRecordBodyWire {
+        schema: LEAVE_RECORD_SCHEMA.to_owned(),
+        record_version: 1,
+        node: node.as_str().to_owned(),
+        public_key: public_key.as_bytes().to_vec(),
+      },
+      LEAVE_RECORD_LIMITS,
+    )
+  }
+
+  /// Verifies the owner signature against the permanently retained binding.
+  pub(crate) fn verify(&self) -> Result<()> {
+    crate::identity::signature::verify_strict(
+      LEAVE_RECORD_V1_DOMAIN,
+      &Self::encode_signed_body(&self.node, &self.public_key)?,
+      &self.public_key,
+      &self.signature,
+      "leave record signature",
+    )
+  }
+
+  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+    encode_canonical(
+      &LeaveRecordWire {
+        schema: LEAVE_RECORD_SCHEMA.to_owned(),
+        record_version: 1,
+        node: self.node.as_str().to_owned(),
+        public_key: self.public_key.as_bytes().to_vec(),
+        signature: self.signature.as_bytes().to_vec(),
+      },
+      LEAVE_RECORD_LIMITS,
+    )
+  }
+
+  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+    let wire: LeaveRecordWire = crate::protocol::decode_canonical_strict(
+      bytes,
+      LEAVE_RECORD_LIMITS,
+      "leave record canonical form",
+    )
+    .map_err(|_| Error::invalid_input("leave record"))?;
+    if wire.schema != LEAVE_RECORD_SCHEMA || wire.record_version != 1 {
+      return Err(Error::invalid_input("leave record schema"));
+    }
+    Ok(Self {
+      node: NodeId::parse(&wire.node)?,
+      public_key: PublicKey::from_bytes(
+        <[u8; 32]>::try_from(wire.public_key.as_slice())
+          .map_err(|_| Error::invalid_input("leave record key"))?,
+      ),
+      signature: crate::Signature::from_bytes(
+        <[u8; 64]>::try_from(wire.signature.as_slice())
+          .map_err(|_| Error::invalid_input("leave record signature"))?,
+      ),
+    })
+  }
+}
+
+/// Signs the leave record for the current local identity.
+pub(crate) async fn sign_leave_record(
+  context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>,
+) -> Result<LeaveRecordV1> {
+  let identity = context.identity();
+  let body = LeaveRecordV1::encode_signed_body(identity.node(), identity.public_key())?;
+  let signature = keys
+    .sign(
+      identity.handle(),
+      &crate::identity::signature::signature_message(LEAVE_RECORD_V1_DOMAIN, &body),
+    )
+    .await?;
+  let record = LeaveRecordV1::new(
+    identity.node().clone(),
+    identity.public_key().clone(),
+    signature,
+  );
+  record.verify()?;
+  Ok(record)
+}
+
+fn leave_record_key(node: &NodeId) -> StoreKey {
+  StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()))
+}
+
+/// Persists one verified leave record (idempotent; a re-delivery of the
+/// exact record is a no-op, a different record for the same node conflicts
+/// without mutation).
+pub(crate) async fn persist_leave_record_ctx(
+  store: &MetadataStore, entropy: &dyn Entropy, record: &LeaveRecordV1,
+) -> Result<()> {
+  record.verify()?;
+  let namespace = leave_namespace()?;
+  let key = leave_record_key(record.node());
+  let snapshot = store.snapshot().await?;
+  if let Some(existing) = snapshot.get(&namespace, &key).await? {
+    if existing.as_bytes() == record.encode()?.as_slice() {
+      return Ok(());
+    }
+    return Err(Error::conflict("leave record"));
+  }
+  let transaction = store.prepare_transaction(
+    TransactionId::generate(entropy)?,
+    snapshot.revision().clone(),
+    vec![StoreOperation::Put {
+      namespace,
+      key,
+      expected: StoreExpectation::Absent,
+      value: StoreValue::new(Arc::from(record.encode()?)),
+    }],
+  )?;
+  drop(snapshot);
+  let _ = store.commit(transaction).await?;
+  Ok(())
+}
+
+/// Whether `node` has a leave record in the local store.
+pub(crate) async fn is_left_ctx(store: &MetadataStore, node: &NodeId) -> Result<bool> {
+  let namespace = leave_namespace()?;
+  let snapshot = store.snapshot().await?;
+  Ok(
+    snapshot
+      .get(&namespace, &leave_record_key(node))
+      .await?
+      .is_some(),
+  )
+}
+
+/// Every known leave record's node, for exclusion sweeps.
+pub(crate) async fn left_nodes_ctx(
+  store: &MetadataStore,
+) -> Result<std::collections::BTreeSet<NodeId>> {
+  let mut left = std::collections::BTreeSet::new();
+  for record in known_leave_records_ctx(store, usize::MAX).await? {
+    left.insert(record.node().clone());
+  }
+  Ok(left)
+}
+
+/// The known leave records, oldest first, bounded by `cap`. The intent
+/// singleton key never decodes as a record and is skipped.
+pub(crate) async fn known_leave_records_ctx(
+  store: &MetadataStore, cap: usize,
+) -> Result<Vec<LeaveRecordV1>> {
+  let namespace = leave_namespace()?;
+  let snapshot = store.snapshot().await?;
+  let mut scan = snapshot.scan(&namespace, &[]).await?;
+  let mut records = Vec::new();
+  while let Some(entry) = scan.next().await? {
+    if entry.key().as_bytes() == INTENT_KEY {
+      continue;
+    }
+    let record = LeaveRecordV1::decode(entry.value().as_bytes())
+      .map_err(|_| Error::invalid_input("leave record decode"))?;
+    records.push(record);
+    if records.len() >= cap {
+      break;
+    }
+  }
+  Ok(records)
+}
+
 /// Discovers the pending leave-intent, if any.
 pub(crate) async fn discover_leave_intent(
   store: &MetadataStore,
@@ -453,7 +688,11 @@ pub(crate) async fn resume_if_pending(
 mod tests {
   use std::{sync::Arc, time::Duration};
 
-  use super::{LeaveIntentV1, WIPE_NAMESPACES, discover_leave_intent, execute, resume_if_pending};
+  use super::{
+    LeaveIntentV1, LeaveRecordV1, WIPE_NAMESPACES, discover_leave_intent, execute, is_left_ctx,
+    known_leave_records_ctx, left_nodes_ctx, persist_leave_record_ctx, resume_if_pending,
+    sign_leave_record,
+  };
   use crate::{
     ErrorKind, Result, StoreExpectation, StoreOperation, StoreValue, TransactionId,
     api::Entropy,
@@ -526,6 +765,86 @@ mod tests {
         "family {tag} must be wiped"
       );
     }
+  }
+
+  /// SC-G11-P0-15: the owner-signed leave record round-trips canonically,
+  /// verifies against the owner key, and rejects any body or signature
+  /// mutation.
+  #[tokio::test]
+  async fn leave_record_signs_round_trips_and_rejects_mutation() {
+    let factory = reference_factory();
+    let (keys, _entropy, context) = open_store(&factory).await.unwrap();
+    let record = sign_leave_record(&context, &keys.as_provider())
+      .await
+      .unwrap();
+    assert_eq!(record.node(), context.identity().node());
+    record.verify().unwrap();
+
+    let bytes = record.encode().unwrap();
+    let decoded = LeaveRecordV1::decode(&bytes).unwrap();
+    assert_eq!(decoded, record);
+    decoded.verify().unwrap();
+
+    // A record for another node with this signature never verifies.
+    let other = LeaveRecordV1::new(
+      crate::NodeId::parse("node_000000000000000000099").unwrap(),
+      record.public_key().clone(),
+      crate::Signature::from_bytes([0x5A; 64]),
+    );
+    assert!(other.verify().is_err());
+  }
+
+  /// SC-G11-P0-15/16: persistence is idempotent for the exact record,
+  /// conflicts on a divergent record for the same node, and the left set
+  /// is queryable for session and recovery exclusion.
+  #[tokio::test]
+  async fn leave_record_persists_idempotently_and_marks_left() {
+    let factory = reference_factory();
+    let (keys, entropy, context) = open_store(&factory).await.unwrap();
+    let record = sign_leave_record(&context, &keys.as_provider())
+      .await
+      .unwrap();
+    let node = record.node().clone();
+
+    assert!(!is_left_ctx(context.store(), &node).await.unwrap());
+    persist_leave_record_ctx(context.store(), entropy.as_ref(), &record)
+      .await
+      .unwrap();
+    persist_leave_record_ctx(context.store(), entropy.as_ref(), &record)
+      .await
+      .unwrap();
+    assert!(is_left_ctx(context.store(), &node).await.unwrap());
+    assert!(
+      left_nodes_ctx(context.store())
+        .await
+        .unwrap()
+        .contains(&node)
+    );
+    assert_eq!(
+      known_leave_records_ctx(context.store(), 64)
+        .await
+        .unwrap()
+        .len(),
+      1
+    );
+
+    // A divergent record for the same node conflicts without mutation.
+    let divergent = LeaveRecordV1::new(
+      node.clone(),
+      record.public_key().clone(),
+      crate::Signature::from_bytes([0x5A; 64]),
+    );
+    let error = persist_leave_record_ctx(context.store(), entropy.as_ref(), &divergent)
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
+    assert_eq!(
+      known_leave_records_ctx(context.store(), 64)
+        .await
+        .unwrap()
+        .len(),
+      1
+    );
   }
 
   /// The leave-intent record round-trips canonically and rejects schema,

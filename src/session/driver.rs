@@ -221,9 +221,13 @@ impl SessionDriver {
     // the typed rejection on some platforms).
     self.require_unblocked()?;
 
-    // A locally revoked identity never completes a new merge through
-    // this node: the exact revoked binding fails closed before any
-    // credential or signing work (T-G09-04, ADR-0006).
+    // A locally revoked or already-left identity never completes a new
+    // merge through this node: the exact revoked or left binding fails
+    // closed before any credential or signing work (T-G09-04, ADR-0006,
+    // ADR-0009 decision 3).
+    if crate::identity::leave::is_left_ctx(self.context.store(), &peek.node_id).await? {
+      return Err(Error::not_trusted("peer left"));
+    }
     if crate::identity::revocation::is_revoked_ctx(
       self.context.store(),
       &peek.node_id,
@@ -546,6 +550,11 @@ impl SessionDriver {
 /// before any signing work (T-G09-04: revocation removes connection
 /// authority).
 async fn trusted_binding(context: &LocalIdentityContext, peer: &NodeId) -> Result<PublicKey> {
+  // A node with an owner-signed leave record is terminal evidence: it is
+  // excluded from session establishment (ADR-0009 decision 3).
+  if crate::identity::leave::is_left_ctx(context.store(), peer).await? {
+    return Err(Error::not_trusted("peer left"));
+  }
   let snapshot = context.store().snapshot().await?;
   let (namespace, key) = identity_binding_key(peer)?;
   let value = snapshot

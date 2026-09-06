@@ -39,6 +39,14 @@ struct LeaveKeys {
 }
 
 impl LeaveKeys {
+  /// A provider whose generated keys start from `base`, so two providers
+  /// in one test never collide on an identity.
+  fn with_base(base: u64) -> Self {
+    let provider = Self::default();
+    *provider.next.lock().unwrap() = base;
+    provider
+  }
+
   fn seed_for(base: u64) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&base.to_le_bytes().repeat(4)[..32].try_into().unwrap())
   }
@@ -272,6 +280,108 @@ async fn g9_leave_replaces_identity_and_shuts_down_with_active_leave() {
     handle.query(radiata::GetNodeStatus::new()).await.unwrap(),
     radiata::NodeStatus::Stopped
   );
+}
+
+/// SC-G11-P0-16/17: the leaver announces its owner-signed leave record to
+/// connected sessions before rotating; the peer persists the terminal
+/// evidence (one `MemberChanged` for the former identity) and the leaver's
+/// bounded first-ack wait completes well before its bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn g11_leave_announces_to_connected_peers_before_rotating() {
+  {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+      tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=trace"))
+        .with_test_writer()
+        .init();
+    });
+  }
+  let listener_storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let leaver_storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let listener = NodeBuilder::new(
+    listener_storage,
+    Arc::new(LeaveKeys::with_base(100)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let leaver = NodeBuilder::new(
+    leaver_storage,
+    Arc::new(LeaveKeys::with_base(200)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let endpoint = listener
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap()
+    .endpoint()
+    .clone();
+  common::merge_with_retry(&leaver, &listener, endpoint).await;
+  let former = leaver
+    .query(radiata::GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  let mut member_events = listener
+    .events::<radiata::MemberChanged>(EventOptions::new())
+    .unwrap();
+
+  let started = std::time::Instant::now();
+  let outcome = leaver
+    .command(LeaveCluster::new(
+      ReplaceIdentityAndDeleteOldCoreMetadata::new(),
+    ))
+    .await
+    .unwrap();
+  assert_eq!(outcome.former_identity(), &former);
+  // The first admission acknowledgement arrived well inside the bound.
+  assert!(started.elapsed() < Duration::from_secs(5));
+
+  // The peer observed the leave record for the former identity.
+  let observed = tokio::time::timeout(Duration::from_secs(30), async {
+    loop {
+      match member_events.recv().await {
+        Ok(EventReceive::Item(changed)) if changed.node_id() == &former => break,
+        Ok(_) => continue,
+        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+      }
+    }
+  })
+  .await;
+  assert!(observed.is_ok(), "the peer never observed the leave");
+  listener.command(Shutdown::new()).await.unwrap();
+}
+
+/// SC-G11-P0-17: with no connected session the announcement has nobody to
+/// acknowledge it, so no wait engages and the leave completes immediately
+/// (silent leave degrades to the cleanup path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g11_leave_without_peers_completes_without_waiting() {
+  let storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let handle = NodeBuilder::new(storage, Arc::new(LeaveKeys::default()))
+    .start()
+    .await
+    .unwrap();
+  let outcome = handle
+    .command(LeaveCluster::new(
+      ReplaceIdentityAndDeleteOldCoreMetadata::new(),
+    ))
+    .await
+    .unwrap();
+  assert_ne!(outcome.former_identity(), outcome.replacement_identity());
+  let reason = handle.query(WaitForShutdown::new()).await.unwrap();
+  assert_eq!(reason, ShutdownReason::ActiveLeave);
 }
 
 /// SC-G09-P0-20/21: after the leave and a restart, the store shows no old

@@ -39,15 +39,18 @@ const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-sync-pa
 /// snapshot (grant set).
 pub(crate) const SYNC_KIND_PAGE: u8 = 1;
 pub(crate) const SYNC_KIND_SNAPSHOT: u8 = 2;
+pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
 
-/// One sync payload: an encoded membership page or an encoded issuer
-/// trust snapshot.
+/// One sync payload: an encoded membership page, an encoded issuer
+/// trust snapshot, or an encoded owner-signed leave record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SyncPayload {
   /// An encoded [`MembershipPage`].
   Page(ByteVec),
   /// An encoded [`TrustSnapshotV1`].
   Snapshot(ByteVec),
+  /// An encoded [`crate::identity::leave::LeaveRecordV1`].
+  Leave(ByteVec),
 }
 
 #[derive(Encode, Decode)]
@@ -66,6 +69,7 @@ impl SyncPayload {
     let (kind, payload) = match self {
       Self::Page(encoded) => (SYNC_KIND_PAGE, encoded.clone()),
       Self::Snapshot(encoded) => (SYNC_KIND_SNAPSHOT, encoded.clone()),
+      Self::Leave(encoded) => (SYNC_KIND_LEAVE, encoded.clone()),
     };
     encode_canonical(
       &SyncPayloadWire {
@@ -91,6 +95,7 @@ impl SyncPayload {
     match wire.kind {
       SYNC_KIND_PAGE => Ok(Self::Page(wire.payload)),
       SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(wire.payload)),
+      SYNC_KIND_LEAVE => Ok(Self::Leave(wire.payload)),
       _ => Err(Error::invalid_input("membership sync payload kind")),
     }
   }
@@ -180,6 +185,23 @@ async fn accept_payload(
           trust_store::adopt_binding_ctx(store, entropy.as_ref(), binding.node(), binding.key())
             .await;
       }
+    }
+    SyncPayload::Leave(encoded) => {
+      // An owner-signed leave record is terminal evidence (ADR-0009
+      // decision 3): verified against the permanently retained binding
+      // before any persistence. A record whose binding has not converged
+      // yet is skipped; the resend cadence heals the ordering.
+      let record = crate::identity::leave::LeaveRecordV1::decode(encoded.as_ref())?;
+      let bindings = trust_store::trusted_bindings(store).await?;
+      let Some(bound_key) = bindings.get(record.node()) else {
+        tracing::debug!(node = %record.node(), "leave record skipped: binding unknown");
+        return Ok(());
+      };
+      if bound_key != record.public_key() {
+        return Err(Error::not_trusted("leave record binding"));
+      }
+      crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
+      events.emit(crate::MemberChanged::new(record.node().clone()));
     }
   }
   Ok(())
@@ -331,6 +353,10 @@ pub(crate) struct SyncCursor {
   pub(crate) page: Option<Vec<u8>>,
 }
 
+/// The bounded number of known leave records forwarded per snapshot
+/// round (anti-entropy healing without unbounded per-tick work).
+const LEAVE_RESEND_CAP: usize = 64;
+
 /// Snapshot deliveries are retried on this slow cadence even when the
 /// grant set is unchanged, so a dropped payload heals instead of stalling
 /// a peer forever (anti-entropy, SC-G05-P0-07).
@@ -362,6 +388,11 @@ pub(crate) async fn sync_tick(
     return Ok(());
   }
   let snapshot = refresh_issuer_snapshot(context, entropy).await?;
+  // Owner-signed leave records ride the same anti-entropy plane: forward
+  // the known (bounded) set whenever a snapshot round sends, so a lost
+  // delivery heals on the resend cadence (ADR-0009 decision 3).
+  let leave_records =
+    crate::identity::leave::known_leave_records_ctx(store, LEAVE_RESEND_CAP).await?;
   let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
   let peers = crate::sync_common::alive_peers(sessions)?;
   let peers_fp = crate::sync_common::peers_fingerprint(&peers);
@@ -421,10 +452,22 @@ pub(crate) async fn sync_tick(
     Some(payload) => Some(payload.encode()?),
     None => None,
   };
+  let leave_bytes: Vec<Vec<u8>> = if snapshot_bytes.is_some() {
+    let mut out = Vec::with_capacity(leave_records.len());
+    for record in &leave_records {
+      out.push(SyncPayload::Leave(ByteVec::from(record.encode()?)).encode()?);
+    }
+    out
+  } else {
+    Vec::new()
+  };
   if page_due || !starting_round {
     cursor.ticks_since_page_send = 0;
     for peer in &peers {
       if let Some(bytes) = &snapshot_bytes {
+        let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
+      }
+      for bytes in &leave_bytes {
         let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
       }
       let _ =
@@ -436,6 +479,9 @@ pub(crate) async fn sync_tick(
   if let Some(bytes) = &snapshot_bytes {
     for peer in &peers {
       let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
+      for bytes in &leave_bytes {
+        let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
+      }
     }
   }
   Ok(())

@@ -64,6 +64,8 @@ pub(crate) fn peers_fingerprint(peers: &[NodeId]) -> u64 {
 /// Sends one pre-encoded sync payload to `peer` over its authenticated
 /// session with a fire-and-forget admission: routing failures are dropped
 /// (the next tick retries) and never stall the anti-entropy loop.
+/// Sends one sync payload to one peer over the packet data plane as an
+/// exact-target, max-hops-1 internal stream; fire-and-forget delivery.
 pub(crate) async fn send_payload(
   runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, peer: &NodeId, protocol: &ProtocolTag,
   encoded: &[u8],

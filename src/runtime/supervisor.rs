@@ -627,7 +627,7 @@ impl Supervisor {
       &sync_context,
       dependencies.entropy.clone(),
       dependencies.sessions.clone(),
-      crate::runtime::RuntimeClient::routing_only(packet_tx, dependencies.routes.clone()),
+      crate::runtime::RuntimeClient::routing_only(packet_tx.clone(), dependencies.routes.clone()),
       Arc::clone(&published_endpoints),
       dependencies.config.anti_entropy_interval(),
       shutdown_tx.subscribe(),
@@ -847,6 +847,97 @@ impl Supervisor {
     )
     .await?;
     Ok(view)
+  }
+
+  /// The bounded wait for the first leave-record admission
+  /// acknowledgement (ADR-0009 decision 3): five seconds, well inside the
+  /// fixed authentication deadline's order of magnitude.
+  const LEAVE_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+  /// Signs the owner leave record and injects it into every connected
+  /// session, waiting at most [`Self::LEAVE_ACK_WAIT`] for the first
+  /// current-process admission acknowledgement plus the local flush of the
+  /// record bodies (the acknowledgement proves admission; the awaited pump
+  /// proves the record left this process before teardown retires the
+  /// session).
+  async fn announce_leave(&mut self) -> Result<()> {
+    let context = self.context()?;
+    let record =
+      crate::identity::leave::sign_leave_record(&context, &self.dependencies.keys).await?;
+    let peers = crate::sync_common::alive_peers(&self.dependencies.sessions)?;
+    if peers.is_empty() {
+      return Ok(());
+    }
+    tracing::debug!(peers = peers.len(), "leave announcement starting");
+    let protocol = crate::ProtocolTag::parse(crate::membership::sync::MEMBERSHIP_SYNC_PROTOCOL)?;
+    let encoded =
+      crate::membership::sync::SyncPayload::Leave(minicbor::bytes::ByteVec::from(record.encode()?))
+        .encode()?;
+    let acked = std::sync::Arc::new(tokio::sync::Notify::new());
+    let local = context.identity().node().clone();
+    let mut pumps = Vec::new();
+    for peer in peers {
+      let entry = self
+        .dependencies
+        .sessions
+        .lock()
+        .map_err(Error::session_table)?
+        .get(&peer)
+        .cloned()
+        .filter(|entry| entry.alive());
+      // A peer without a live session is skipped: the bounded wait covers
+      // the rest, and a lost announcement degrades to a silent leave.
+      let Some(entry) = entry else {
+        continue;
+      };
+      let (ack_notify, ack) = tokio::sync::oneshot::channel();
+      let trace_id = TraceId::generate(self.dependencies.entropy.as_ref())?;
+      let request = crate::packet::OutboundRequest {
+        trace_id,
+        target: crate::StreamTarget::Exact(peer.clone()),
+        load_balancer: None,
+        max_hops: 1,
+        protocol: protocol.clone(),
+        metadata: crate::packet::StreamMetadata::new(),
+        body: Box::pin(crate::packet::StaticBody::new(Arc::from(encoded.clone()))),
+        internal: true,
+        ack_notify,
+      };
+      // The pump runs as its own task: the acknowledgement channel
+      // resolves at admission and the task itself completes after the
+      // record body flushed to the session.
+      let pump = tokio::spawn(crate::session::stream::run_outbound(
+        entry,
+        local.clone(),
+        request,
+        self.dependencies.routes.clone(),
+        false,
+        None,
+        self.dependencies.events.clone(),
+      ));
+      let acked = std::sync::Arc::clone(&acked);
+      tokio::spawn(async move {
+        if matches!(ack.await, Ok(Ok(_))) {
+          acked.notify_one();
+        }
+      });
+      pumps.push(pump);
+    }
+    if pumps.is_empty() {
+      return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + Self::LEAVE_ACK_WAIT;
+    let waited = tokio::time::timeout_at(deadline, acked.notified()).await;
+    tracing::debug!(
+      acknowledged = waited.is_ok(),
+      "leave announcement wait completed"
+    );
+    // Drain the pumps with the remaining budget so the record bodies are
+    // flushed before the leave's network teardown retires the sessions.
+    for pump in pumps {
+      let _ = tokio::time::timeout_at(deadline, pump).await;
+    }
+    Ok(())
   }
 
   /// Reconnects to an already-admitted peer with key trust only (G3-04,
@@ -1794,6 +1885,14 @@ impl Supervisor {
     }
     let context = self.context()?;
 
+    // ADR-0009 decision 3: announce the owner-signed leave record to the
+    // connected sessions and wait a bounded time for the first
+    // current-process admission acknowledgement; a timeout degrades to a
+    // silent leave, which the cleanup path covers. The announcement drives
+    // the packet pump directly (spawned stream tasks carry it), so the
+    // bounded wait never stalls the control loop.
+    self.announce_leave().await?;
+
     // Network teardown first: no new sessions or inbound metadata while
     // the identity is replaced and the old metadata is wiped.
     let listener_ids: Vec<crate::identity::ListenerId> = self.listeners.keys().cloned().collect();
@@ -1893,13 +1992,15 @@ impl Supervisor {
     // from their signed descriptor; reachability stays distinct from the
     // active topology and recovery never dials strangers (SC-G05-P0-11/18).
     let bindings = crate::identity::trust::store::trusted_bindings(self.context()?.store()).await?;
+    // Left nodes are excluded from recovery dialing (ADR-0009 decision 3).
+    let left = crate::identity::leave::left_nodes_ctx(self.context()?.store()).await?;
     // One snapshot for the whole cycle: per-member descriptor reads must
     // not pay one snapshot acquisition each (a 1,024-member recovery tick
     // would otherwise acquire 1,024 snapshots).
     let snapshot = self.context()?.store().snapshot().await?;
     let mut candidates = std::collections::BTreeSet::new();
     for member in online.difference(&direct) {
-      if self.recovery_excluded.contains(member) {
+      if self.recovery_excluded.contains(member) || left.contains(member) {
         continue;
       }
       // Only known members (a durable binding exists) are dialled.

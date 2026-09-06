@@ -1881,6 +1881,29 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-07"
+gate = "G11"
+priority = "P0"
+first = 15
+verification_id = "VERIFY-G11-07"
+kind = "contract"
+cases = [
+  { title = "Leave is an owner-signed terminal record", acceptance = "LeaveRecordV1 is signed with the current key before rotation, round-trips canonically, verifies against the permanently retained binding, and rejects body/signature mutation; the rotation destroys the old key so the record carries no replay or time-lag surface.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+  ] },
+  { title = "Bounded first-ack announcement before rotation", acceptance = "LeaveCluster signs the record, injects it into every connected session, waits at most five seconds for the first current-process admission acknowledgement, then runs the crash-safe rotation pipeline regardless of the outcome; no connected session means no wait engages.", rebaseline = "ADR-0009", threats = [
+    "THR-015",
+  ] },
+  { title = "Leave records converge through sync and exclude the leaver", acceptance = "Peers verify the record against the retained binding, persist it idempotently (re-delivery is a no-op, a divergent record for the same node fails closed), emit one MemberChanged, and re-forward it on the snapshot resend cadence; left nodes are refused session establishment and excluded from recovery dialing.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-012",
+  ] },
+  { title = "Crash during leave resumes to a reconciled phase", acceptance = "The journaled leave-intent pipeline is unchanged: a crash before, during, or after the announcement reopens to the exact phase and resumes; the record is re-derivable deterministically from the same key.", rebaseline = "ADR-0009", threats = [
+    "THR-015",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"
