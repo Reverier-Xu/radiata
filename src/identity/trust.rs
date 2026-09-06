@@ -446,6 +446,7 @@ pub(crate) mod store {
   pub(crate) async fn persist_snapshot_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, snapshot: &TrustSnapshotV1,
   ) -> Result<()> {
+    let _permit = store.write_permit().await;
     let namespace = snapshot_namespace()?;
     let key = snapshot_key(snapshot.issuer(), snapshot.revision());
     let current = store.snapshot().await?;
@@ -553,6 +554,7 @@ pub(crate) mod store {
   pub(crate) async fn persist_binding_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, node: &NodeId, key: &PublicKey,
   ) -> Result<()> {
+    let _permit = store.write_permit().await;
     let namespace = binding_namespace()?;
     let store_key = StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()));
     let snapshot = store.snapshot().await?;
@@ -670,6 +672,7 @@ pub(crate) mod store {
   pub(crate) async fn adopt_binding_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, node: &NodeId, key: &PublicKey,
   ) -> Result<()> {
+    let _permit = store.write_permit().await;
     let (namespace, store_key) = crate::identity::records::identity_binding_key(node)?;
     let snapshot = store.snapshot().await?;
     if let Some(existing) = snapshot.get(&namespace, &store_key).await? {

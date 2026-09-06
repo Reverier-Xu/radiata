@@ -108,6 +108,7 @@ pub(crate) async fn sweep_removed_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, clock: &dyn WallClock, retention: Duration,
   cap: usize,
 ) -> Result<usize> {
+  let _permit = store.write_permit().await;
   let namespace = super::store::namespace()?;
   let now = clock.now();
   let snapshot = store.snapshot().await?;

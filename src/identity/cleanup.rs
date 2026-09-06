@@ -234,6 +234,7 @@ pub(crate) async fn sign_cleanup_record(
 pub(crate) async fn persist_cleanup_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &CleanupRecordV1,
 ) -> Result<()> {
+  let _permit = store.write_permit().await;
   let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
   let issuer_key = bindings
     .get(record.issuer())
@@ -403,6 +404,11 @@ fn checkpoint_namespace() -> Result<StoreNamespace> {
 pub(crate) async fn issue_checkpoint_ctx(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
 ) -> Result<u64> {
+  let store = context.store();
+  let _permit = store.write_permit().await;
+  // Inside the writer exclusion no other committer can interleave, so
+  // the snapshot read, the max-wins decision, and the conditional put
+  // are one linear section: no retry is needed.
   let identity = context.identity();
   let requested = crate::time::now_millis();
   let checkpoint = CleanupCheckpointV1::new(requested, identity.node().clone());
@@ -420,8 +426,8 @@ pub(crate) async fn issue_checkpoint_ctx(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Put {
-      namespace,
-      key,
+      namespace: namespace.clone(),
+      key: key.clone(),
       expected,
       value: StoreValue::new(Arc::from(checkpoint.encode()?)),
     }],
@@ -429,15 +435,13 @@ pub(crate) async fn issue_checkpoint_ctx(
   drop(snapshot);
   match context.store().commit(transaction).await? {
     crate::CommitOutcome::Committed(_) => Ok(requested),
-    // A raced higher checkpoint won: report its watermark.
+    // The only semantic failure left: an equal-or-higher checkpoint
+    // landed between the read and the commit through a path that did not
+    // hold the permit (impossible in-process; defensive).
     crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-      let snapshot = context.store().snapshot().await?;
-      match snapshot
-        .get(&checkpoint_namespace()?, &checkpoint_key())
-        .await?
-      {
-        Some(existing) => Ok(CleanupCheckpointV1::decode(existing.as_bytes())?.watermark_millis),
-        None => Err(Error::conflict("cleanup checkpoint")),
+      match latest_checkpoint_millis_ctx(context.store()).await? {
+        Some(stored) if stored >= requested => Ok(stored),
+        _ => Err(Error::conflict("cleanup checkpoint")),
       }
     }
     crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
@@ -466,6 +470,7 @@ pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Resul
 pub(crate) async fn persist_checkpoint_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, checkpoint: &CleanupCheckpointV1,
 ) -> Result<()> {
+  let _permit = store.write_permit().await;
   let namespace = checkpoint_namespace()?;
   let key = checkpoint_key();
   let snapshot = store.snapshot().await?;
@@ -530,6 +535,7 @@ async fn collect_before_in(
   store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: u64,
   known: &[CleanupRecordV1],
 ) -> Result<usize> {
+  let _permit = store.write_permit().await;
   let mut collected = 0_usize;
   for record in known {
     if record.timestamp_millis() > watermark {

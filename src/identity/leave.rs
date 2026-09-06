@@ -328,6 +328,7 @@ fn leave_record_key(node: &NodeId) -> StoreKey {
 pub(crate) async fn persist_leave_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &LeaveRecordV1,
 ) -> Result<()> {
+  let _permit = store.write_permit().await;
   record.verify()?;
   let namespace = leave_namespace()?;
   let key = leave_record_key(record.node());
@@ -409,6 +410,7 @@ const GC_BATCH: usize = 64;
 pub(crate) async fn collect_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
+  let _permit = store.write_permit().await;
   let namespace = leave_namespace()?;
   let mut collected = 0_usize;
   for record in known_leave_records_ctx(store, GC_BATCH).await? {
@@ -657,6 +659,7 @@ async fn run_leave(
   store: &MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, stored: &StoreValue,
   intent: &LeaveIntentV1,
 ) -> Result<()> {
+  let _permit = store.write_permit().await;
   let identity =
     crate::identity::lifecycle::discover_local_identity(store.snapshot().await?.as_ref())
       .await?

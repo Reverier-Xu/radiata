@@ -88,6 +88,7 @@ pub(crate) async fn ensure_self_binding(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
 ) -> Result<()> {
   let store = context.store();
+  let _permit = store.write_permit().await;
   let identity = context.identity();
   let (namespace, key) = identity_binding_key(identity.node())?;
   let expected = IdentityBindingV1::new(identity.node().clone(), identity.public_key().clone());
@@ -210,6 +211,7 @@ pub(crate) async fn recover_journal_prologue(
 pub(crate) async fn cleanup_pending_exact(
   store: &MetadataStore, entropy: &dyn Entropy, purpose: &str, context: &'static str,
 ) -> Result<()> {
+  let _permit = store.write_permit().await;
   let mut attempts = 0_u8;
   loop {
     attempts += 1;
@@ -542,6 +544,7 @@ pub(crate) enum CommitWithReconcile {
 pub(crate) async fn commit_with_reconcile(
   store: &MetadataStore, prepared: PreparedTransaction,
 ) -> Result<CommitWithReconcile> {
+  let _permit = store.write_permit().await;
   match store.commit(prepared).await? {
     CommitOutcome::Committed(_) => Ok(CommitWithReconcile::Committed),
     CommitOutcome::Aborted | CommitOutcome::Conflict => Ok(CommitWithReconcile::Aborted),

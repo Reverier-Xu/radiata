@@ -307,6 +307,7 @@ pub(crate) mod store {
   pub(crate) async fn store_descriptor_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, descriptor: &NodeDescriptorV1,
   ) -> Result<()> {
+    let _permit = store.write_permit().await;
     let namespace = namespace()?;
     let key = descriptor_key(descriptor.node());
     let snapshot = store.snapshot().await?;

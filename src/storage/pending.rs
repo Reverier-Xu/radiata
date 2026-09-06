@@ -21,7 +21,7 @@ use minicbor::{
 };
 
 use super::{
-  CommitState, MetadataStore, PendingCommit,
+  CommitState, MetadataStore, PendingCommit, WriterLock,
   receipt::{
     HostWallClock, PreparedTransaction, ReceiptIdentity, ReceiptReferenceChange,
     ReceiptReferenceToken, WallClock, build_receipt_change_operations, group_receipt_changes,
@@ -566,6 +566,10 @@ impl MetadataStore {
     let store = Self {
       provider,
       state: std::sync::Mutex::new(CommitState::Ready),
+      writer_lock: WriterLock {
+        holder: std::sync::Mutex::new(None),
+        released: tokio::sync::Notify::new(),
+      },
       clock,
       receipt_retention,
     };

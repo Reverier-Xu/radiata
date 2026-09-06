@@ -11,7 +11,7 @@
 //! topology converge over the same authenticated sessions the facade
 //! observes.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
@@ -215,24 +215,9 @@ async fn accept_payload(
       if bound_key != record.public_key() {
         return Err(Error::not_trusted("leave record binding"));
       }
-      // The leaver is gone after this delivery: transient store contention
-      // must not drop terminal evidence, so the persist retries with a
-      // bounded backoff.
-      let mut backoff = Duration::from_millis(25);
-      let mut attempts = 0_u32;
-      loop {
-        match crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record)
-          .await
-        {
-          Ok(()) => break,
-          Err(error) if error.kind() == crate::ErrorKind::NotReady && attempts < 8 => {
-            attempts += 1;
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_millis(400));
-          }
-          Err(error) => return Err(error),
-        }
-      }
+      // The writer exclusion serializes the persist against every other
+      // store writer, so terminal evidence cannot be dropped on contention.
+      crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
       events.emit(crate::MemberChanged::new(record.node().clone()));
     }
     SyncPayload::Cleanup(encoded) => {
@@ -246,27 +231,8 @@ async fn accept_payload(
         tracing::debug!(subject = %record.subject(), "cleanup record skipped: bindings unknown");
         return Ok(());
       }
-      tracing::debug!(subject = %record.subject(), "cleanup record accepted for persistence");
-      // Terminal evidence must not be dropped on a raced commit: bounded
-      // backoff retries cover transient store contention.
-      let mut backoff = Duration::from_millis(25);
-      let mut attempts = 0_u32;
-      loop {
-        match crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), &record)
-          .await
-        {
-          Ok(()) => break,
-          Err(error) if error.kind() == crate::ErrorKind::NotReady && attempts < 8 => {
-            attempts += 1;
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_millis(400));
-          }
-          Err(error) => {
-            tracing::debug!(kind = ?error.kind(), "cleanup record persist failed");
-            return Err(error);
-          }
-        }
-      }
+      crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), &record)
+        .await?;
       events.emit(crate::MemberChanged::new(record.subject().clone()));
     }
     SyncPayload::Revocation(encoded) => {
@@ -281,23 +247,7 @@ async fn accept_payload(
         tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
         return Ok(());
       }
-      // Terminal evidence must not be dropped on a raced commit: bounded
-      // backoff retries cover transient store contention.
-      let mut backoff = Duration::from_millis(25);
-      let mut attempts = 0_u32;
-      loop {
-        match crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record)
-          .await
-        {
-          Ok(()) => break,
-          Err(error) if error.kind() == crate::ErrorKind::NotReady && attempts < 8 => {
-            attempts += 1;
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_millis(400));
-          }
-          Err(error) => return Err(error),
-        }
-      }
+      crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record).await?;
       events.emit(crate::NodeRevoked::new(record.subject().clone()));
     }
     SyncPayload::Checkpoint(encoded) => {

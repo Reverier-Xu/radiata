@@ -152,6 +152,7 @@ pub(crate) mod sync {
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &MembershipPage,
   ) -> Result<Vec<NodeId>> {
+    let _permit = store.write_permit().await;
     let mut applied = Vec::new();
     for descriptor in page.descriptors() {
       // Skip descriptors we already have at an equal or higher revision.

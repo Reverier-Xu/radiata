@@ -244,6 +244,7 @@ pub(crate) enum RevokeStoreOutcome {
 pub(crate) async fn revoke_binding_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
 ) -> Result<RevokeStoreOutcome> {
+  let _permit = store.write_permit().await;
   let (binding_namespace, binding_key) =
     crate::identity::records::identity_binding_key(record.subject())?;
   let namespace = namespace()?;
@@ -312,6 +313,7 @@ pub(crate) async fn revoke_binding_ctx(
 pub(crate) async fn persist_revocation_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
 ) -> Result<()> {
+  let _permit = store.write_permit().await;
   let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
   let issuer_key = bindings
     .get(record.issuer())
@@ -398,6 +400,9 @@ pub(crate) async fn is_revoked_ctx(
 pub(crate) async fn purge_revocation_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, subject: &NodeId,
 ) -> Result<()> {
+  let _permit = store.write_permit().await;
+  // Inside the writer exclusion the read, the explicit-clear decision,
+  // and the exact-digest delete are one linear section: no retry needed.
   let namespace = namespace()?;
   let store_key = revocation_key(subject);
   let snapshot = store.snapshot().await?;
@@ -416,18 +421,8 @@ pub(crate) async fn purge_revocation_ctx(
   drop(snapshot);
   match store.commit(transaction).await? {
     crate::CommitOutcome::Committed(_) => Ok(()),
-    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-      // A raced purge committed first: idempotent.
-      if revoked_key_ctx(store, subject).await?.is_none() {
-        Ok(())
-      } else {
-        Err(Error::conflict("revocation purge"))
-      }
-    }
-    crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
-      crate::ProviderErrorKind::CommitUnknown,
-      crate::ProviderErrorContext::StorageCommit,
-    )),
+    // Defensive: under the exclusion this is unreachable in-process.
+    _ => Err(Error::conflict("revocation purge")),
   }
 }
 

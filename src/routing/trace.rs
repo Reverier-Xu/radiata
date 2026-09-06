@@ -344,6 +344,7 @@ pub(crate) async fn put_trace(
 pub(crate) async fn terminate_stale(
   store: &MetadataStore, entropy: &dyn Entropy, clock: &dyn WallClock,
 ) -> Result<usize> {
+  let _permit = store.write_permit().await;
   let space = namespace()?;
   let snapshot = store.snapshot().await?;
   let mut scan = snapshot.scan(&space, &[]).await?;
@@ -385,6 +386,7 @@ pub(crate) async fn sweep(
   store: &MetadataStore, entropy: &dyn Entropy, clock: &dyn WallClock, terminal_cap: usize,
   retention: Duration,
 ) -> Result<usize> {
+  let _permit = store.write_permit().await;
   let space = namespace()?;
   let now = clock.now();
   let snapshot = store.snapshot().await?;

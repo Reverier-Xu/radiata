@@ -77,6 +77,7 @@ pub(crate) async fn read_record_ctx(
 pub(crate) async fn commit_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
 ) -> Result<ResourceCommitOutcome> {
+  let _permit = store.write_permit().await;
   let namespace = namespace()?;
   let key = record_key(record.name());
   // One snapshot view for both the tuple decision and the per-key CAS
@@ -148,6 +149,7 @@ pub(crate) async fn commit_removal_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
   expected: &ResourceRecordV1,
 ) -> Result<ResourceCommitOutcome> {
+  let _permit = store.write_permit().await;
   debug_assert!(record.removed(), "removal commits carry removal records");
   let namespace = namespace()?;
   let key = record_key(record.name());

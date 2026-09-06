@@ -163,10 +163,10 @@ jobs:
       - name: fixed simulator gate
         run: cargo +1.98.0 test --locked --lib simulation::network::tests::simulation_network_fault_matrix_gate -- --ignored --exact
 
-  features:
-    name: features
+  features-check:
+    name: features / check (powerset)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 12
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -191,8 +191,35 @@ jobs:
       - name: feature powerset check
         run: cargo +1.98.0 hack check --feature-powerset --depth 1 --locked
 
-      - name: feature powerset test
-        run: cargo +1.98.0 hack test --feature-powerset --depth 1 --locked
+  features-test:
+    name: features / test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default
+            flags: --no-default-features
+          - name: json
+            flags: --no-default-features --features json
+          - name: redb
+            flags: --no-default-features --features redb
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install MSRV toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.98.0
+
+      - name: cargo test
+        run: cargo +1.98.0 test --locked ${{ matrix.flags }}
 
   container:
     name: container

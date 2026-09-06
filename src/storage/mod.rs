@@ -17,6 +17,86 @@ const ENTRY_WAIT_BOUND: Duration = Duration::from_secs(5);
 /// The commit-slot wait poll interval.
 const ENTRY_WAIT_BACKOFF: Duration = Duration::from_millis(10);
 
+/// The process-wide writer exclusion for one [`MetadataStore`]: at most
+/// one task may hold a read-decide-commit section at a time, so base
+/// revisions observed inside the section cannot move before the commit
+/// lands. Task-reentrant: a task that already holds the section acquires
+/// a no-op permit, so journaled flows can span nested helper calls
+/// without threading the permit through signatures.
+#[derive(Debug)]
+struct WriterLock {
+  /// The holder's task id, if the holder runs inside a spawned task;
+  /// [`None`] when the holder runs in a root future outside any task
+  /// (e.g. a unit test body). Root-context holders are inherently
+  /// sequential, so a shared pseudo-identity is sound there.
+  holder: Mutex<Option<Option<tokio::task::Id>>>,
+  /// Wakes parked acquirers when the section is released.
+  released: tokio::sync::Notify,
+}
+
+impl WriterLock {
+  fn holder(&self) -> Option<Option<tokio::task::Id>> {
+    *self.holder.lock().expect("writer lock holder")
+  }
+
+  async fn acquire(&self) -> WriterPermit<'_> {
+    let me = tokio::task::try_id();
+    if self.holder() == Some(me) {
+      return WriterPermit {
+        lock: self,
+        holder: me,
+        nested: true,
+      };
+    }
+    loop {
+      // Register interest before re-checking the holder: the enable-
+      // check ordering closes the lost-wakeup window between seeing a
+      // held section and parking.
+      let notified = self.released.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+      if self.holder().is_none() {
+        if let Ok(mut holder) = self.holder.lock() {
+          if holder.is_none() {
+            *holder = Some(me);
+            return WriterPermit {
+              lock: self,
+              holder: me,
+              nested: false,
+            };
+          }
+        }
+      }
+      notified.await;
+    }
+  }
+
+  fn release(&self, holder: Option<tokio::task::Id>) {
+    if let Ok(mut slot) = self.holder.lock() {
+      if *slot == Some(holder) {
+        *slot = None;
+      }
+    }
+    self.released.notify_waiters();
+  }
+}
+
+/// The held writer section; releases on drop.
+#[derive(Debug)]
+pub(crate) struct WriterPermit<'a> {
+  lock: &'a WriterLock,
+  holder: Option<tokio::task::Id>,
+  nested: bool,
+}
+
+impl Drop for WriterPermit<'_> {
+  fn drop(&mut self) {
+    if !self.nested {
+      self.lock.release(self.holder);
+    }
+  }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingCommit {
   transaction: TransactionId,
@@ -38,6 +118,9 @@ enum CommitState {
 pub(crate) struct MetadataStore {
   provider: Box<dyn Storage>,
   state: Mutex<CommitState>,
+  /// The writer exclusion: serializes every read-decide-commit section
+  /// (see [`WriterLock`]).
+  writer_lock: WriterLock,
   clock: Arc<dyn WallClock>,
   receipt_retention: Duration,
 }
@@ -134,9 +217,21 @@ impl MetadataStore {
     Ok(Self {
       provider,
       state: Mutex::new(state),
+      writer_lock: WriterLock {
+        holder: Mutex::new(None),
+        released: tokio::sync::Notify::new(),
+      },
       clock,
       receipt_retention,
     })
+  }
+
+  /// Acquires the writer exclusion: while held, no other task can enter
+  /// a read-decide-commit section on this store, so a snapshot taken
+  /// under the permit stays authoritative until the caller's commit
+  /// lands. Task-reentrant; see [`WriterLock`].
+  pub(crate) async fn write_permit(&self) -> WriterPermit<'_> {
+    self.writer_lock.acquire().await
   }
 
   pub(crate) async fn snapshot(&self) -> Result<Box<dyn StoreSnapshot>> {
