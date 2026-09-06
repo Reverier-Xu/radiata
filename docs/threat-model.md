@@ -9,6 +9,14 @@ Each threat row lists its minimum mandatory oracle scenarios, not every scenario
 Validation requires every listed oracle to cite that threat; additional scenario-to-threat links are
 allowed for shared mitigations.
 
+Rebaseline note (2026-09-05, ADR-0009): the peer-trust deployment model narrows the adversary model
+to transport-path adversaries plus operational misuse. The authorized-malicious-member family
+(`THR-012`, mandatory key `malicious-members`) moves out of architectural scope: under the merge
+composition model, a hostile properly-admitted member is indistinguishable from a path adversary,
+and its containment is a deployment responsibility documented in the repository README. The threat
+row and its stable ID remain for evidence continuity; its predicates own no architectural
+enforcement beyond the existing revoke/leave/cleanup boundaries.
+
 ## Protected Assets
 
 - Canonical identity bindings, admission credentials, key-provider authority, and session-trusted
@@ -29,12 +37,16 @@ core diagnostics and evidence artifacts.
 
 - An unauthenticated client with malformed input and many transport source addresses.
 - A peer holding a stolen unexpired credential but no admitted identity key.
-- A malicious or colluding admitted member with valid signing authority.
 - A peer replaying, delaying, duplicating, reordering, dropping, or reflecting protocol traffic.
 - A corrupt, unavailable, capacity-limited, or dishonest storage/key/network provider.
 - A hostile host wall clock that rolls back, freezes, or jumps forward.
 - An evidence producer attempting injection, secret/body retention, budget reduction, stale-predicate
   reuse, sample replacement, rerun masking, or release substitution.
+
+A malicious or colluding admitted member with valid signing authority is out of architectural scope
+under the peer-trust deployment model (ADR-0009): containing such a member is a deployment
+responsibility (see the repository README). The revoke/leave/cleanup boundaries below remain as the
+mechanisms a deployment uses to expel one.
 
 ## Trust Boundaries
 

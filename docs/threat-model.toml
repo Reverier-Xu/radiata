@@ -160,8 +160,8 @@ scenario_ids = [
   "SC-G09-P0-14",
   "E2E-08",
 ]
-mitigation = "Authenticate every source, validate owners route context and revisions, enforce caller-selected finite capacities, emit bounded equivocation evidence, and durably revoke before closing sessions."
-residual = "Revoke removes future connectivity and admission authority but does not invalidate otherwise valid stored metadata; colluders can create Sybils over time."
+mitigation = "Out of architectural scope under the peer-trust deployment model (ADR-0009, 2026-09-05): a hostile properly-admitted member is indistinguishable from a path adversary, and containment is a deployment responsibility documented in the repository README. The revoke/leave/cleanup boundaries remain the expulsion mechanisms; authenticate every source, validate owner route context and revisions, and enforce caller-selected finite capacities."
+residual = "The crate assumes only trusted nodes are merged; it does not defend against authorized hostile members. Revoke removes future connectivity and admission authority but does not invalidate otherwise valid stored metadata; colluders can create Sybils over time subject only to deployment controls."
 status = "accepted"
 
 [[threat]]
