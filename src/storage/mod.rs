@@ -35,8 +35,18 @@ struct WriterLock {
 }
 
 impl WriterLock {
+  /// Poisoning cannot lose the holder record in a recoverable way, so a
+  /// poisoned lock resolves to its inner value: the writer exclusion must
+  /// stay observable after a panicking holder unwinds.
+  fn slot(&self) -> std::sync::MutexGuard<'_, Option<Option<tokio::task::Id>>> {
+    match self.holder.lock() {
+      Ok(slot) => slot,
+      Err(poisoned) => poisoned.into_inner(),
+    }
+  }
+
   fn holder(&self) -> Option<Option<tokio::task::Id>> {
-    *self.holder.lock().expect("writer lock holder")
+    *self.slot()
   }
 
   async fn acquire(&self) -> WriterPermit<'_> {
@@ -56,15 +66,14 @@ impl WriterLock {
       tokio::pin!(notified);
       notified.as_mut().enable();
       if self.holder().is_none() {
-        if let Ok(mut holder) = self.holder.lock() {
-          if holder.is_none() {
-            *holder = Some(me);
-            return WriterPermit {
-              lock: self,
-              holder: me,
-              nested: false,
-            };
-          }
+        let mut slot = self.slot();
+        if slot.is_none() {
+          *slot = Some(me);
+          return WriterPermit {
+            lock: self,
+            holder: me,
+            nested: false,
+          };
         }
       }
       notified.await;
@@ -72,10 +81,9 @@ impl WriterLock {
   }
 
   fn release(&self, holder: Option<tokio::task::Id>) {
-    if let Ok(mut slot) = self.holder.lock() {
-      if *slot == Some(holder) {
-        *slot = None;
-      }
+    let mut slot = self.slot();
+    if *slot == Some(holder) {
+      *slot = None;
     }
     self.released.notify_waiters();
   }
