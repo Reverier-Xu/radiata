@@ -2,8 +2,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::{Digest, Error, PublicKey, Result, Signature};
 
-pub(crate) const CLUSTER_GENESIS_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/cluster-genesis-v1";
-pub(crate) const ADMISSION_GRANT_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/admission-grant-v1";
+pub(crate) const MERGE_GRANT_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/merge-grant-v1";
 
 pub(crate) fn body_digest(canonical_body: &[u8]) -> Digest {
   Digest::from_bytes(Sha256::digest(canonical_body).into())
@@ -34,10 +33,7 @@ pub(crate) fn verify_strict(
 mod tests {
   use ed25519_dalek::{Signer, SigningKey};
 
-  use super::{
-    ADMISSION_GRANT_V1_DOMAIN, CLUSTER_GENESIS_V1_DOMAIN, body_digest, signature_message,
-    verify_strict,
-  };
+  use super::{MERGE_GRANT_V1_DOMAIN, body_digest, signature_message, verify_strict};
   use crate::{ErrorKind, PublicKey, Signature};
 
   const BODY: &[u8] = b"\x85\x01\x02\x03\x04\x05";
@@ -55,71 +51,66 @@ mod tests {
   #[test]
   fn identity_records_signature_domains_are_exact_ascii_labels() {
     assert_eq!(
-      CLUSTER_GENESIS_V1_DOMAIN,
-      b"radiata.woooo.tech/crypto/cluster-genesis-v1"
+      MERGE_GRANT_V1_DOMAIN,
+      b"radiata.woooo.tech/crypto/merge-grant-v1"
     );
-    assert_eq!(
-      ADMISSION_GRANT_V1_DOMAIN,
-      b"radiata.woooo.tech/crypto/admission-grant-v1"
-    );
-    assert!(CLUSTER_GENESIS_V1_DOMAIN.is_ascii());
-    assert!(ADMISSION_GRANT_V1_DOMAIN.is_ascii());
+    assert!(MERGE_GRANT_V1_DOMAIN.is_ascii());
   }
 
   #[test]
   fn identity_records_signature_message_is_domain_then_body_digest() {
-    let message = signature_message(CLUSTER_GENESIS_V1_DOMAIN, BODY);
+    let message = signature_message(MERGE_GRANT_V1_DOMAIN, BODY);
 
     assert_eq!(
-      &message[..CLUSTER_GENESIS_V1_DOMAIN.len()],
-      CLUSTER_GENESIS_V1_DOMAIN
+      &message[..MERGE_GRANT_V1_DOMAIN.len()],
+      MERGE_GRANT_V1_DOMAIN
     );
     assert_eq!(
-      &message[CLUSTER_GENESIS_V1_DOMAIN.len()..],
+      &message[MERGE_GRANT_V1_DOMAIN.len()..],
       body_digest(BODY).as_bytes()
     );
-    assert_eq!(message.len(), CLUSTER_GENESIS_V1_DOMAIN.len() + 32);
+    assert_eq!(message.len(), MERGE_GRANT_V1_DOMAIN.len() + 32);
   }
 
   #[test]
   fn identity_records_strict_verification_accepts_valid_signature() {
-    let (public_key, signature) = signed(BODY, CLUSTER_GENESIS_V1_DOMAIN);
+    let (public_key, signature) = signed(BODY, MERGE_GRANT_V1_DOMAIN);
 
     verify_strict(
-      CLUSTER_GENESIS_V1_DOMAIN,
+      MERGE_GRANT_V1_DOMAIN,
       BODY,
       &public_key,
       &signature,
-      "cluster genesis signature",
+      "merge grant signature",
     )
     .unwrap();
   }
 
   #[test]
   fn identity_records_strict_verification_rejects_wrong_domain_body_and_key() {
-    let (public_key, signature) = signed(BODY, CLUSTER_GENESIS_V1_DOMAIN);
+    let (public_key, signature) = signed(BODY, MERGE_GRANT_V1_DOMAIN);
 
     let wrong_domain = verify_strict(
-      ADMISSION_GRANT_V1_DOMAIN,
+      b"radiata.woooo.tech/crypto/leave-record-v1",
       BODY,
       &public_key,
       &signature,
-      "admission grant signature",
+      "merge grant signature",
     );
     let wrong_body = verify_strict(
-      CLUSTER_GENESIS_V1_DOMAIN,
+      MERGE_GRANT_V1_DOMAIN,
       b"\x85\x01\x02\x03\x04\x06",
       &public_key,
       &signature,
-      "cluster genesis signature",
+      "merge grant signature",
     );
     let other_key = SigningKey::from_bytes(&[9; 32]).verifying_key();
     let wrong_key = verify_strict(
-      CLUSTER_GENESIS_V1_DOMAIN,
+      MERGE_GRANT_V1_DOMAIN,
       BODY,
       &PublicKey::from_bytes(other_key.to_bytes()),
       &signature,
-      "cluster genesis signature",
+      "merge grant signature",
     );
 
     for result in [wrong_domain, wrong_body, wrong_key] {
@@ -130,18 +121,18 @@ mod tests {
 
   #[test]
   fn identity_records_strict_verification_rejects_noncanonical_signature_scalar() {
-    let (public_key, signature) = signed(BODY, CLUSTER_GENESIS_V1_DOMAIN);
+    let (public_key, signature) = signed(BODY, MERGE_GRANT_V1_DOMAIN);
     let mut malleated = *signature.as_bytes();
     for byte in &mut malleated[32..] {
       *byte = 0xFF;
     }
 
     let error = verify_strict(
-      CLUSTER_GENESIS_V1_DOMAIN,
+      MERGE_GRANT_V1_DOMAIN,
       BODY,
       &public_key,
       &Signature::from_bytes(malleated),
-      "cluster genesis signature",
+      "merge grant signature",
     )
     .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -149,36 +140,36 @@ mod tests {
 
   #[test]
   fn identity_records_strict_verification_rejects_undecompressible_public_key() {
-    let (_, signature) = signed(BODY, CLUSTER_GENESIS_V1_DOMAIN);
+    let (_, signature) = signed(BODY, MERGE_GRANT_V1_DOMAIN);
 
     let error = verify_strict(
-      CLUSTER_GENESIS_V1_DOMAIN,
+      MERGE_GRANT_V1_DOMAIN,
       BODY,
       &PublicKey::from_bytes([0xFF; 32]),
       &signature,
-      "cluster genesis signature",
+      "merge grant signature",
     )
     .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-    assert_eq!(error.context(), "cluster genesis signature");
+    assert_eq!(error.context(), "merge grant signature");
   }
 
   #[test]
   fn identity_records_authentication_errors_are_redacted() {
-    let (public_key, signature) = signed(BODY, CLUSTER_GENESIS_V1_DOMAIN);
+    let (public_key, signature) = signed(BODY, MERGE_GRANT_V1_DOMAIN);
 
     let error = verify_strict(
-      ADMISSION_GRANT_V1_DOMAIN,
+      b"radiata.woooo.tech/crypto/leave-record-v1",
       BODY,
       &public_key,
       &signature,
-      "admission grant signature",
+      "merge grant signature",
     )
     .unwrap_err();
     let rendered = format!("{error:?}");
     assert_eq!(
       rendered,
-      "Error { kind: AuthenticationFailed, context: \"admission grant signature\" }"
+      "Error { kind: AuthenticationFailed, context: \"merge grant signature\" }"
     );
     let key_hex: String = public_key
       .as_bytes()

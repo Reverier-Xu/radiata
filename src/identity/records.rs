@@ -2,13 +2,11 @@ use std::sync::Arc;
 
 use minicbor::{Decode, Encode};
 
-use super::signature::{
-  ADMISSION_GRANT_V1_DOMAIN, CLUSTER_GENESIS_V1_DOMAIN, body_digest, verify_strict,
-};
+use super::signature::{MERGE_GRANT_V1_DOMAIN, verify_strict};
 use crate::{
-  ClusterId, Digest, Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey,
-  QualifiedTag, Result, Signature, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
-  StoreRevision, StoreValue, TransactionId,
+  Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey, QualifiedTag, Result,
+  Signature, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision, StoreValue,
+  TransactionId,
   api::Entropy,
   error::fixed_bytes,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
@@ -24,18 +22,15 @@ const RECORD_VERSION: u64 = 1;
 /// The durable purpose text of the fixed variants, single-sourced so
 /// producers, wire code, and tests all reference one literal.
 pub(crate) const LOCAL_IDENTITY_PURPOSE_TEXT: &str = "local-identity";
-pub(crate) const CLUSTER_GENESIS_PURPOSE_TEXT: &str = "cluster-genesis";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalPurpose {
   /// The local identity bootstrap intent.
   LocalIdentity,
-  /// The cluster genesis intent.
-  ClusterGenesis,
-  /// One credential admission attempt, keyed by issuer generation.
-  Admission(GenerationId),
-  /// One member adoption attempt, keyed by admission id.
-  Adoption(AdmissionId),
+  /// One credential merge attempt, keyed by issuer generation.
+  Merge(GenerationId),
+  /// One merge adoption attempt, keyed by merge id.
+  MergeAdoption(MergeId),
   /// One key deletion intent, keyed by provider handle digest.
   KeyDeletion(KeyHandle),
 }
@@ -46,12 +41,11 @@ impl JournalPurpose {
   pub(crate) fn text(&self) -> String {
     match self {
       Self::LocalIdentity => LOCAL_IDENTITY_PURPOSE_TEXT.to_owned(),
-      Self::ClusterGenesis => CLUSTER_GENESIS_PURPOSE_TEXT.to_owned(),
-      Self::Admission(generation) => {
-        format!("admission-{}", crate::hex::encode(generation.as_bytes()))
+      Self::Merge(generation) => {
+        format!("merge-{}", crate::hex::encode(generation.as_bytes()))
       }
-      Self::Adoption(admission) => {
-        format!("adoption-{}", crate::hex::encode(admission.as_bytes()))
+      Self::MergeAdoption(merge) => {
+        format!("merge-adoption-{}", crate::hex::encode(merge.as_bytes()))
       }
       Self::KeyDeletion(handle) => {
         format!(
@@ -81,17 +75,15 @@ fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
 const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/local-identity-v1";
 const KEY_CREATION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/key-creation-intent-v1";
 const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/identity-binding-v1";
-const CLUSTER_GENESIS_SCHEMA: &str = "radiata.woooo.tech/schemas/cluster-genesis-v1";
-const LOCAL_CLUSTER_POINTER_SCHEMA: &str = "radiata.woooo.tech/schemas/local-cluster-pointer-v1";
 const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/credential-use-v1";
-const ADMISSION_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/admission-grant-v1";
+const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/merge-grant-v1";
 const KEY_DELETION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/key-deletion-intent-v1";
 const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/key-deleted-v1";
 
 pub(crate) use crate::storage::families::{
-  ADMISSION_GRANT_NAMESPACE, CLUSTER_GENESIS_NAMESPACE, CREDENTIAL_USE_NAMESPACE,
-  IDENTITY_BINDING_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE,
-  KEY_DELETION_INTENT_NAMESPACE, LOCAL_CLUSTER_POINTER_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
+  CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE,
+  KEY_DELETED_NAMESPACE, KEY_DELETION_INTENT_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
+  MERGE_GRANT_NAMESPACE,
 };
 
 const SINGLETON_KEY: &[u8] = b"self";
@@ -151,16 +143,12 @@ pub(crate) fn identity_binding_namespace() -> Result<StoreNamespace> {
   metadata_namespace(IDENTITY_BINDING_NAMESPACE)
 }
 
-pub(crate) fn cluster_genesis_namespace() -> Result<StoreNamespace> {
-  metadata_namespace(CLUSTER_GENESIS_NAMESPACE)
-}
-
 pub(crate) fn credential_use_namespace() -> Result<StoreNamespace> {
   metadata_namespace(CREDENTIAL_USE_NAMESPACE)
 }
 
-pub(crate) fn admission_grant_namespace() -> Result<StoreNamespace> {
-  metadata_namespace(ADMISSION_GRANT_NAMESPACE)
+pub(crate) fn merge_grant_namespace() -> Result<StoreNamespace> {
+  metadata_namespace(MERGE_GRANT_NAMESPACE)
 }
 
 pub(crate) fn key_creation_intent_key(
@@ -179,20 +167,6 @@ pub(crate) fn identity_binding_key(node: &NodeId) -> Result<(StoreNamespace, Sto
   ))
 }
 
-pub(crate) fn cluster_genesis_key(cluster: &ClusterId) -> Result<(StoreNamespace, StoreKey)> {
-  Ok((
-    metadata_namespace(CLUSTER_GENESIS_NAMESPACE)?,
-    store_key(cluster.as_str().as_bytes()),
-  ))
-}
-
-pub(crate) fn local_cluster_pointer_key() -> Result<(StoreNamespace, StoreKey)> {
-  Ok((
-    metadata_namespace(LOCAL_CLUSTER_POINTER_NAMESPACE)?,
-    store_key(SINGLETON_KEY),
-  ))
-}
-
 pub(crate) fn credential_use_key(
   issuer: &NodeId, generation: &GenerationId,
 ) -> Result<(StoreNamespace, StoreKey)> {
@@ -208,9 +182,9 @@ pub(crate) fn credential_use_key(
   ))
 }
 
-pub(crate) fn admission_grant_key(admission: &AdmissionId) -> Result<(StoreNamespace, StoreKey)> {
+pub(crate) fn merge_grant_key(admission: &MergeId) -> Result<(StoreNamespace, StoreKey)> {
   Ok((
-    metadata_namespace(ADMISSION_GRANT_NAMESPACE)?,
+    metadata_namespace(MERGE_GRANT_NAMESPACE)?,
     store_key(admission.as_bytes()),
   ))
 }
@@ -268,9 +242,9 @@ impl std::fmt::Debug for GenerationId {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct AdmissionId(OperationId);
+pub(crate) struct MergeId(OperationId);
 
-impl AdmissionId {
+impl MergeId {
   pub(crate) fn generate(entropy: &dyn Entropy) -> Result<Self> {
     OperationId::generate(entropy).map(Self)
   }
@@ -284,9 +258,9 @@ impl AdmissionId {
   }
 }
 
-impl std::fmt::Debug for AdmissionId {
+impl std::fmt::Debug for MergeId {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    formatter.write_str("AdmissionId(..)")
+    formatter.write_str("MergeId(..)")
   }
 }
 
@@ -742,242 +716,47 @@ impl IdentityBindingV1 {
 
 #[derive(Encode, Decode)]
 #[cbor(array)]
-struct ClusterGenesisBodyWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  cluster_id: String,
-  #[n(3)]
-  creator_id: String,
-  #[n(4)]
-  #[cbor(with = "minicbor::bytes")]
-  creator_key: Vec<u8>,
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct ClusterGenesisWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  cluster_id: String,
-  #[n(3)]
-  creator_id: String,
-  #[n(4)]
-  #[cbor(with = "minicbor::bytes")]
-  creator_key: Vec<u8>,
-  #[n(5)]
-  #[cbor(with = "minicbor::bytes")]
-  signature: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClusterGenesisV1 {
-  cluster: ClusterId,
-  creator: NodeId,
-  creator_key: PublicKey,
-  signature: Signature,
-}
-
-impl ClusterGenesisV1 {
-  pub(crate) const fn new(
-    cluster: ClusterId, creator: NodeId, creator_key: PublicKey, signature: Signature,
-  ) -> Self {
-    Self {
-      cluster,
-      creator,
-      creator_key,
-      signature,
-    }
-  }
-
-  pub(crate) fn cluster(&self) -> &ClusterId {
-    &self.cluster
-  }
-
-  pub(crate) fn creator(&self) -> &NodeId {
-    &self.creator
-  }
-
-  pub(crate) fn creator_key(&self) -> &PublicKey {
-    &self.creator_key
-  }
-
-  /// Encodes the canonical body that the creator signs.
-  pub(crate) fn encode_signed_body(
-    cluster: &ClusterId, creator: &NodeId, creator_key: &PublicKey,
-  ) -> Result<Vec<u8>> {
-    encode_canonical(
-      &ClusterGenesisBodyWire {
-        schema: CLUSTER_GENESIS_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        cluster_id: cluster.as_str().to_owned(),
-        creator_id: creator.as_str().to_owned(),
-        creator_key: creator_key.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn signed_body(&self) -> Result<Vec<u8>> {
-    Self::encode_signed_body(&self.cluster, &self.creator, &self.creator_key)
-  }
-
-  pub(crate) fn verify(&self) -> Result<()> {
-    verify_strict(
-      CLUSTER_GENESIS_V1_DOMAIN,
-      &self.signed_body()?,
-      &self.creator_key,
-      &self.signature,
-      "cluster genesis signature",
-    )
-  }
-
-  pub(crate) fn digest(&self) -> Result<Digest> {
-    Ok(body_digest(&self.encode()?))
-  }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &ClusterGenesisWire {
-        schema: CLUSTER_GENESIS_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        cluster_id: self.cluster.as_str().to_owned(),
-        creator_id: self.creator.as_str().to_owned(),
-        creator_key: self.creator_key.as_bytes().to_vec(),
-        signature: self.signature.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: ClusterGenesisWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, CLUSTER_GENESIS_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    Ok(Self {
-      cluster: ClusterId::parse(&wire.cluster_id)?,
-      creator: NodeId::parse(&wire.creator_id)?,
-      creator_key: PublicKey::from_bytes(fixed_bytes(&wire.creator_key, "identity public key")?),
-      signature: Signature::from_bytes(fixed_bytes(&wire.signature, "identity signature")?),
-    })
-  }
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct LocalClusterPointerWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  cluster_id: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  genesis_digest: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LocalClusterPointerV1 {
-  cluster: ClusterId,
-  genesis_digest: Digest,
-}
-
-impl LocalClusterPointerV1 {
-  pub(crate) const fn new(cluster: ClusterId, genesis_digest: Digest) -> Self {
-    Self {
-      cluster,
-      genesis_digest,
-    }
-  }
-
-  pub(crate) fn cluster(&self) -> &ClusterId {
-    &self.cluster
-  }
-
-  pub(crate) fn genesis_digest(&self) -> &Digest {
-    &self.genesis_digest
-  }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &LocalClusterPointerWire {
-        schema: LOCAL_CLUSTER_POINTER_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        cluster_id: self.cluster.as_str().to_owned(),
-        genesis_digest: self.genesis_digest.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: LocalClusterPointerWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, LOCAL_CLUSTER_POINTER_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    Ok(Self {
-      cluster: ClusterId::parse(&wire.cluster_id)?,
-      genesis_digest: Digest::from_bytes(fixed_bytes(&wire.genesis_digest, "genesis digest")?),
-    })
-  }
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
 struct CredentialUseWire {
   #[n(0)]
   schema: String,
   #[n(1)]
   record_version: u64,
   #[n(2)]
-  cluster_id: String,
-  #[n(3)]
   issuer_id: String,
-  #[n(4)]
+  #[n(3)]
   #[cbor(with = "minicbor::bytes")]
   generation_id: Vec<u8>,
-  #[n(5)]
+  #[n(4)]
   #[cbor(with = "minicbor::bytes")]
-  admission_id: Vec<u8>,
-  #[n(6)]
+  merge_id: Vec<u8>,
+  #[n(5)]
   subject_id: String,
-  #[n(7)]
+  #[n(6)]
   #[cbor(with = "minicbor::bytes")]
   subject_key: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CredentialUseV1 {
-  cluster: ClusterId,
   issuer: NodeId,
   generation: GenerationId,
-  admission: AdmissionId,
+  merge: MergeId,
   subject: NodeId,
   subject_key: PublicKey,
 }
 
 impl CredentialUseV1 {
   pub(crate) const fn new(
-    cluster: ClusterId, issuer: NodeId, generation: GenerationId, admission: AdmissionId,
-    subject: NodeId, subject_key: PublicKey,
+    issuer: NodeId, generation: GenerationId, merge: MergeId, subject: NodeId,
+    subject_key: PublicKey,
   ) -> Self {
     Self {
-      cluster,
       issuer,
       generation,
-      admission,
+      merge,
       subject,
       subject_key,
     }
-  }
-
-  pub(crate) fn cluster(&self) -> &ClusterId {
-    &self.cluster
   }
 
   pub(crate) fn issuer(&self) -> &NodeId {
@@ -988,8 +767,8 @@ impl CredentialUseV1 {
     &self.generation
   }
 
-  pub(crate) fn admission(&self) -> &AdmissionId {
-    &self.admission
+  pub(crate) fn merge(&self) -> &MergeId {
+    &self.merge
   }
 
   pub(crate) fn subject(&self) -> &NodeId {
@@ -1005,10 +784,9 @@ impl CredentialUseV1 {
       &CredentialUseWire {
         schema: CREDENTIAL_USE_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
-        cluster_id: self.cluster.as_str().to_owned(),
         issuer_id: self.issuer.as_str().to_owned(),
         generation_id: self.generation.as_bytes().to_vec(),
-        admission_id: self.admission.as_bytes().to_vec(),
+        merge_id: self.merge.as_bytes().to_vec(),
         subject_id: self.subject.as_str().to_owned(),
         subject_key: self.subject_key.as_bytes().to_vec(),
       },
@@ -1021,15 +799,14 @@ impl CredentialUseV1 {
     expect_schema(&wire.schema, CREDENTIAL_USE_SCHEMA)?;
     expect_version(wire.record_version)?;
     Ok(Self {
-      cluster: ClusterId::parse(&wire.cluster_id)?,
       issuer: NodeId::parse(&wire.issuer_id)?,
       generation: GenerationId::from_operation(OperationId::from_bytes(fixed_bytes(
         &wire.generation_id,
         "credential generation id",
       )?)),
-      admission: AdmissionId::from_operation(OperationId::from_bytes(fixed_bytes(
-        &wire.admission_id,
-        "admission id",
+      merge: MergeId::from_operation(OperationId::from_bytes(fixed_bytes(
+        &wire.merge_id,
+        "merge id",
       )?)),
       subject: NodeId::parse(&wire.subject_id)?,
       subject_key: PublicKey::from_bytes(fixed_bytes(&wire.subject_key, "identity public key")?),
@@ -1039,59 +816,54 @@ impl CredentialUseV1 {
 
 #[derive(Encode, Decode)]
 #[cbor(array)]
-struct AdmissionGrantBodyWire {
+struct MergeGrantBodyWire {
   #[n(0)]
   schema: String,
   #[n(1)]
   record_version: u64,
   #[n(2)]
-  cluster_id: String,
-  #[n(3)]
   #[cbor(with = "minicbor::bytes")]
-  admission_id: Vec<u8>,
-  #[n(4)]
+  merge_id: Vec<u8>,
+  #[n(3)]
   subject_id: String,
-  #[n(5)]
+  #[n(4)]
   #[cbor(with = "minicbor::bytes")]
   subject_key: Vec<u8>,
-  #[n(6)]
+  #[n(5)]
   issuer_id: String,
-  #[n(7)]
+  #[n(6)]
   #[cbor(with = "minicbor::bytes")]
   generation_id: Vec<u8>,
 }
 
 #[derive(Encode, Decode)]
 #[cbor(array)]
-struct AdmissionGrantWire {
+struct MergeGrantWire {
   #[n(0)]
   schema: String,
   #[n(1)]
   record_version: u64,
   #[n(2)]
-  cluster_id: String,
-  #[n(3)]
   #[cbor(with = "minicbor::bytes")]
-  admission_id: Vec<u8>,
-  #[n(4)]
+  merge_id: Vec<u8>,
+  #[n(3)]
   subject_id: String,
-  #[n(5)]
+  #[n(4)]
   #[cbor(with = "minicbor::bytes")]
   subject_key: Vec<u8>,
-  #[n(6)]
+  #[n(5)]
   issuer_id: String,
-  #[n(7)]
+  #[n(6)]
   #[cbor(with = "minicbor::bytes")]
   generation_id: Vec<u8>,
-  #[n(8)]
+  #[n(7)]
   #[cbor(with = "minicbor::bytes")]
   signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AdmissionGrantV1 {
-  cluster: ClusterId,
-  admission: AdmissionId,
+pub(crate) struct MergeGrantV1 {
+  merge: MergeId,
   subject: NodeId,
   subject_key: PublicKey,
   issuer: NodeId,
@@ -1099,14 +871,13 @@ pub(crate) struct AdmissionGrantV1 {
   signature: Signature,
 }
 
-impl AdmissionGrantV1 {
+impl MergeGrantV1 {
   pub(crate) const fn new(
-    cluster: ClusterId, admission: AdmissionId, subject: NodeId, subject_key: PublicKey,
-    issuer: NodeId, generation: GenerationId, signature: Signature,
+    merge: MergeId, subject: NodeId, subject_key: PublicKey, issuer: NodeId,
+    generation: GenerationId, signature: Signature,
   ) -> Self {
     Self {
-      cluster,
-      admission,
+      merge,
       subject,
       subject_key,
       issuer,
@@ -1115,12 +886,8 @@ impl AdmissionGrantV1 {
     }
   }
 
-  pub(crate) fn cluster(&self) -> &ClusterId {
-    &self.cluster
-  }
-
-  pub(crate) fn admission(&self) -> &AdmissionId {
-    &self.admission
+  pub(crate) fn merge(&self) -> &MergeId {
+    &self.merge
   }
 
   pub(crate) fn subject(&self) -> &NodeId {
@@ -1141,15 +908,14 @@ impl AdmissionGrantV1 {
 
   /// Encodes the canonical body that the issuer signs.
   pub(crate) fn encode_signed_body(
-    cluster: &ClusterId, admission: &AdmissionId, subject: &NodeId, subject_key: &PublicKey,
-    issuer: &NodeId, generation: &GenerationId,
+    merge: &MergeId, subject: &NodeId, subject_key: &PublicKey, issuer: &NodeId,
+    generation: &GenerationId,
   ) -> Result<Vec<u8>> {
     encode_canonical(
-      &AdmissionGrantBodyWire {
-        schema: ADMISSION_GRANT_SCHEMA.to_owned(),
+      &MergeGrantBodyWire {
+        schema: MERGE_GRANT_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
-        cluster_id: cluster.as_str().to_owned(),
-        admission_id: admission.as_bytes().to_vec(),
+        merge_id: merge.as_bytes().to_vec(),
         subject_id: subject.as_str().to_owned(),
         subject_key: subject_key.as_bytes().to_vec(),
         issuer_id: issuer.as_str().to_owned(),
@@ -1161,8 +927,7 @@ impl AdmissionGrantV1 {
 
   pub(crate) fn signed_body(&self) -> Result<Vec<u8>> {
     Self::encode_signed_body(
-      &self.cluster,
-      &self.admission,
+      &self.merge,
       &self.subject,
       &self.subject_key,
       &self.issuer,
@@ -1172,21 +937,20 @@ impl AdmissionGrantV1 {
 
   pub(crate) fn verify(&self, issuer_key: &PublicKey) -> Result<()> {
     verify_strict(
-      ADMISSION_GRANT_V1_DOMAIN,
+      MERGE_GRANT_V1_DOMAIN,
       &self.signed_body()?,
       issuer_key,
       &self.signature,
-      "admission grant signature",
+      "merge grant signature",
     )
   }
 
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical(
-      &AdmissionGrantWire {
-        schema: ADMISSION_GRANT_SCHEMA.to_owned(),
+      &MergeGrantWire {
+        schema: MERGE_GRANT_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
-        cluster_id: self.cluster.as_str().to_owned(),
-        admission_id: self.admission.as_bytes().to_vec(),
+        merge_id: self.merge.as_bytes().to_vec(),
         subject_id: self.subject.as_str().to_owned(),
         subject_key: self.subject_key.as_bytes().to_vec(),
         issuer_id: self.issuer.as_str().to_owned(),
@@ -1198,14 +962,13 @@ impl AdmissionGrantV1 {
   }
 
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: AdmissionGrantWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, ADMISSION_GRANT_SCHEMA)?;
+    let wire: MergeGrantWire = decode_wire(bytes)?;
+    expect_schema(&wire.schema, MERGE_GRANT_SCHEMA)?;
     expect_version(wire.record_version)?;
     Ok(Self {
-      cluster: ClusterId::parse(&wire.cluster_id)?,
-      admission: AdmissionId::from_operation(OperationId::from_bytes(fixed_bytes(
-        &wire.admission_id,
-        "admission id",
+      merge: MergeId::from_operation(OperationId::from_bytes(fixed_bytes(
+        &wire.merge_id,
+        "merge id",
       )?)),
       subject: NodeId::parse(&wire.subject_id)?,
       subject_key: PublicKey::from_bytes(fixed_bytes(&wire.subject_key, "identity public key")?),
@@ -1230,8 +993,6 @@ mod tests {
 
   const SUBJECT_NODE: &str = "node_100000000000000000000";
   const ISSUER_NODE: &str = "node_200000000000000000000";
-  const CREATOR_NODE: &str = "node_300000000000000000000";
-  const CLUSTER: &str = "cluster_400000000000000000000";
   const OPERATION: &str = "keyop_500000000000000000000";
   const TRANSACTION: &str = "txn_600000000000000000000";
   const BASE_REVISION: &[u8] = &[0x07];
@@ -1244,10 +1005,6 @@ mod tests {
 
   fn node(value: &str) -> NodeId {
     NodeId::parse(value).unwrap()
-  }
-
-  fn cluster() -> ClusterId {
-    ClusterId::parse(CLUSTER).unwrap()
   }
 
   fn operation() -> KeyOperationId {
@@ -1270,8 +1027,8 @@ mod tests {
     GenerationId::from_operation(OperationId::from_bytes(GENERATION_BYTES))
   }
 
-  fn admission() -> AdmissionId {
-    AdmissionId::from_operation(OperationId::from_bytes(ADMISSION_BYTES))
+  fn merge() -> MergeId {
+    MergeId::from_operation(OperationId::from_bytes(ADMISSION_BYTES))
   }
 
   fn issuer_signing_key() -> SigningKey {
@@ -1306,62 +1063,31 @@ mod tests {
     IdentityBindingV1::new(node(SUBJECT_NODE), PublicKey::from_bytes(SUBJECT_KEY))
   }
 
-  fn cluster_genesis() -> ClusterGenesisV1 {
-    let creator_key = issuer_key();
-    let body = ClusterGenesisBodyWire {
-      schema: CLUSTER_GENESIS_SCHEMA.to_owned(),
-      record_version: RECORD_VERSION,
-      cluster_id: CLUSTER.to_owned(),
-      creator_id: CREATOR_NODE.to_owned(),
-      creator_key: creator_key.as_bytes().to_vec(),
-    };
-    let body_bytes = encode_canonical(&body, RECORD_LIMITS).unwrap();
-    let signature = issuer_signing_key().sign(&super::super::signature::signature_message(
-      CLUSTER_GENESIS_V1_DOMAIN,
-      &body_bytes,
-    ));
-    ClusterGenesisV1::new(
-      cluster(),
-      node(CREATOR_NODE),
-      creator_key,
-      Signature::from_bytes(signature.to_bytes()),
-    )
-  }
-
-  fn local_cluster_pointer() -> LocalClusterPointerV1 {
-    LocalClusterPointerV1::new(cluster(), cluster_genesis().digest().unwrap())
-  }
-
   fn credential_use() -> CredentialUseV1 {
     CredentialUseV1::new(
-      cluster(),
       node(ISSUER_NODE),
       generation(),
-      admission(),
+      merge(),
       node(SUBJECT_NODE),
       PublicKey::from_bytes(SUBJECT_KEY),
     )
   }
 
-  fn admission_grant() -> AdmissionGrantV1 {
-    let body = AdmissionGrantBodyWire {
-      schema: ADMISSION_GRANT_SCHEMA.to_owned(),
-      record_version: RECORD_VERSION,
-      cluster_id: CLUSTER.to_owned(),
-      admission_id: ADMISSION_BYTES.to_vec(),
-      subject_id: SUBJECT_NODE.to_owned(),
-      subject_key: SUBJECT_KEY.to_vec(),
-      issuer_id: ISSUER_NODE.to_owned(),
-      generation_id: GENERATION_BYTES.to_vec(),
-    };
-    let body_bytes = encode_canonical(&body, RECORD_LIMITS).unwrap();
+  fn merge_grant() -> MergeGrantV1 {
+    let body_bytes = MergeGrantV1::encode_signed_body(
+      &merge(),
+      &node(SUBJECT_NODE),
+      &PublicKey::from_bytes(SUBJECT_KEY),
+      &node(ISSUER_NODE),
+      &generation(),
+    )
+    .unwrap();
     let signature = issuer_signing_key().sign(&super::super::signature::signature_message(
-      ADMISSION_GRANT_V1_DOMAIN,
+      MERGE_GRANT_V1_DOMAIN,
       &body_bytes,
     ));
-    AdmissionGrantV1::new(
-      cluster(),
-      admission(),
+    MergeGrantV1::new(
+      merge(),
       node(SUBJECT_NODE),
       PublicKey::from_bytes(SUBJECT_KEY),
       node(ISSUER_NODE),
@@ -1377,12 +1103,9 @@ mod tests {
   const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f6c6f63616c2d6964656e746974792d763101781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f705f353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
   const KEY_CREATION_INTENT_GOLDEN: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f6b65792d6372656174696f6e2d696e74656e742d763101781b6b65796f705f353030303030303030303030303030303030303030781a6e6f64655f3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e5f3630303030303030303030303030303030303030304107";
   const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f6f2e746563682f736368656d61732f6964656e746974792d62696e64696e672d763101781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139";
-  const CLUSTER_GENESIS_GOLDEN: &str = "86782d726164696174612e776f6f6f6f2e746563682f736368656d61732f636c75737465722d67656e657369732d763101781d636c75737465725f343030303030303030303030303030303030303030781a6e6f64655f33303030303030303030303030303030303030303058202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12584028398d820b25e3618992ba08ad0fe261128ee5c8f7ca655765c2303fdc0b8a65ce241540838f0a88aeba4302e93b70828a09c27a7491b3961717339fac8f5d0f";
-  const CLUSTER_GENESIS_BODY_GOLDEN: &str = "85782d726164696174612e776f6f6f6f2e746563682f736368656d61732f636c75737465722d67656e657369732d763101781d636c75737465725f343030303030303030303030303030303030303030781a6e6f64655f33303030303030303030303030303030303030303058202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12";
-  const LOCAL_CLUSTER_POINTER_GOLDEN: &str = "847833726164696174612e776f6f6f6f2e746563682f736368656d61732f6c6f63616c2d636c75737465722d706f696e7465722d763101781d636c75737465725f3430303030303030303030303030303030303030305820ba82d09d872d1bf8ffa4f198ab8257de03802da2b6d054516ef31524c7f210b6";
-  const CREDENTIAL_USE_GOLDEN: &str = "88782c726164696174612e776f6f6f6f2e746563682f736368656d61732f63726564656e7469616c2d7573652d763101781d636c75737465725f343030303030303030303030303030303030303030781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
-  const ADMISSION_GRANT_GOLDEN: &str = "89782d726164696174612e776f6f6f6f2e746563682f736368656d61732f61646d697373696f6e2d6772616e742d763101781d636c75737465725f34303030303030303030303030303030303030303050d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840d27a9075764357e316585a08cf08d5f1a2bb27e13a3e873129b5291a57bbc0d0a80dcf2e0a51479d3961ef06ad52e33c052c4a3e9eaeb23aafc9d7818de56a01";
-  const ADMISSION_GRANT_BODY_GOLDEN: &str = "88782d726164696174612e776f6f6f6f2e746563682f736368656d61732f61646d697373696f6e2d6772616e742d763101781d636c75737465725f34303030303030303030303030303030303030303050d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+  const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f63726564656e7469616c2d7573652d763101781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+  const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3584009dc3281151230e95e83bdbf2cd9980b355e5c18acb600c5114fbf51a082961249d4c580f6a99cb16a10277db527b001de91d55c5be064322a31559377959d0d";
+  const MERGE_GRANT_BODY_GOLDEN: &str = "877829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 
   #[test]
   fn identity_records_golden_vectors_match_exact_bytes() {
@@ -1399,28 +1122,13 @@ mod tests {
       golden(IDENTITY_BINDING_GOLDEN)
     );
     assert_eq!(
-      cluster_genesis().encode().unwrap(),
-      golden(CLUSTER_GENESIS_GOLDEN)
-    );
-    assert_eq!(
-      cluster_genesis().signed_body().unwrap(),
-      golden(CLUSTER_GENESIS_BODY_GOLDEN)
-    );
-    assert_eq!(
-      local_cluster_pointer().encode().unwrap(),
-      golden(LOCAL_CLUSTER_POINTER_GOLDEN)
-    );
-    assert_eq!(
       credential_use().encode().unwrap(),
       golden(CREDENTIAL_USE_GOLDEN)
     );
+    assert_eq!(merge_grant().encode().unwrap(), golden(MERGE_GRANT_GOLDEN));
     assert_eq!(
-      admission_grant().encode().unwrap(),
-      golden(ADMISSION_GRANT_GOLDEN)
-    );
-    assert_eq!(
-      admission_grant().signed_body().unwrap(),
-      golden(ADMISSION_GRANT_BODY_GOLDEN)
+      merge_grant().signed_body().unwrap(),
+      golden(MERGE_GRANT_BODY_GOLDEN)
     );
   }
 
@@ -1439,44 +1147,21 @@ mod tests {
       identity_binding()
     );
     assert_eq!(
-      ClusterGenesisV1::decode(&golden(CLUSTER_GENESIS_GOLDEN)).unwrap(),
-      cluster_genesis()
-    );
-    assert_eq!(
-      LocalClusterPointerV1::decode(&golden(LOCAL_CLUSTER_POINTER_GOLDEN)).unwrap(),
-      local_cluster_pointer()
-    );
-    assert_eq!(
       CredentialUseV1::decode(&golden(CREDENTIAL_USE_GOLDEN)).unwrap(),
       credential_use()
     );
     assert_eq!(
-      AdmissionGrantV1::decode(&golden(ADMISSION_GRANT_GOLDEN)).unwrap(),
-      admission_grant()
+      MergeGrantV1::decode(&golden(MERGE_GRANT_GOLDEN)).unwrap(),
+      merge_grant()
     );
   }
 
   #[test]
   fn identity_records_signed_records_verify_against_golden_bytes() {
-    ClusterGenesisV1::decode(&golden(CLUSTER_GENESIS_GOLDEN))
-      .unwrap()
-      .verify()
-      .unwrap();
-    AdmissionGrantV1::decode(&golden(ADMISSION_GRANT_GOLDEN))
+    MergeGrantV1::decode(&golden(MERGE_GRANT_GOLDEN))
       .unwrap()
       .verify(&issuer_key())
       .unwrap();
-  }
-
-  #[test]
-  fn identity_records_local_cluster_pointer_tracks_genesis_digest() {
-    let pointer = local_cluster_pointer();
-    let genesis = cluster_genesis();
-
-    assert_eq!(pointer.cluster(), genesis.cluster());
-    assert_eq!(pointer.genesis_digest(), &genesis.digest().unwrap());
-    let expected = body_digest(&genesis.encode().unwrap());
-    assert_eq!(pointer.genesis_digest(), &expected);
   }
 
   fn wrong_schema(schema: &str) -> String {
@@ -1510,22 +1195,6 @@ mod tests {
     );
     assert!(IdentityBindingV1::decode(&binding).is_err());
 
-    let mut genesis = cluster_genesis().encode().unwrap();
-    replace_text(
-      &mut genesis,
-      CLUSTER_GENESIS_SCHEMA,
-      &wrong_schema(CLUSTER_GENESIS_SCHEMA),
-    );
-    assert!(ClusterGenesisV1::decode(&genesis).is_err());
-
-    let mut pointer = local_cluster_pointer().encode().unwrap();
-    replace_text(
-      &mut pointer,
-      LOCAL_CLUSTER_POINTER_SCHEMA,
-      &wrong_schema(LOCAL_CLUSTER_POINTER_SCHEMA),
-    );
-    assert!(LocalClusterPointerV1::decode(&pointer).is_err());
-
     let mut credential = credential_use().encode().unwrap();
     replace_text(
       &mut credential,
@@ -1534,13 +1203,13 @@ mod tests {
     );
     assert!(CredentialUseV1::decode(&credential).is_err());
 
-    let mut grant = admission_grant().encode().unwrap();
+    let mut grant = merge_grant().encode().unwrap();
     replace_text(
       &mut grant,
-      ADMISSION_GRANT_SCHEMA,
-      &wrong_schema(ADMISSION_GRANT_SCHEMA),
+      MERGE_GRANT_SCHEMA,
+      &wrong_schema(MERGE_GRANT_SCHEMA),
     );
-    assert!(AdmissionGrantV1::decode(&grant).is_err());
+    assert!(MergeGrantV1::decode(&grant).is_err());
   }
 
   #[test]
@@ -1549,10 +1218,8 @@ mod tests {
       local_identity().encode().unwrap(),
       key_creation_intent().encode().unwrap(),
       identity_binding().encode().unwrap(),
-      cluster_genesis().encode().unwrap(),
-      local_cluster_pointer().encode().unwrap(),
       credential_use().encode().unwrap(),
-      admission_grant().encode().unwrap(),
+      merge_grant().encode().unwrap(),
     ] {
       let mut mutated = bytes.clone();
       let version = version_position(&bytes);
@@ -1565,10 +1232,8 @@ mod tests {
     LocalIdentityV1::decode(bytes).is_err()
       && KeyCreationIntentV1::decode(bytes).is_err()
       && IdentityBindingV1::decode(bytes).is_err()
-      && ClusterGenesisV1::decode(bytes).is_err()
-      && LocalClusterPointerV1::decode(bytes).is_err()
       && CredentialUseV1::decode(bytes).is_err()
-      && AdmissionGrantV1::decode(bytes).is_err()
+      && MergeGrantV1::decode(bytes).is_err()
   }
 
   fn replace_text(bytes: &mut [u8], from: &str, to: &str) {
@@ -1593,10 +1258,8 @@ mod tests {
       local_identity().encode().unwrap(),
       key_creation_intent().encode().unwrap(),
       identity_binding().encode().unwrap(),
-      cluster_genesis().encode().unwrap(),
-      local_cluster_pointer().encode().unwrap(),
       credential_use().encode().unwrap(),
-      admission_grant().encode().unwrap(),
+      merge_grant().encode().unwrap(),
     ] {
       let mut trailed = bytes;
       trailed.push(0x00);
@@ -1610,10 +1273,8 @@ mod tests {
       local_identity().encode().unwrap(),
       key_creation_intent().encode().unwrap(),
       identity_binding().encode().unwrap(),
-      cluster_genesis().encode().unwrap(),
-      local_cluster_pointer().encode().unwrap(),
       credential_use().encode().unwrap(),
-      admission_grant().encode().unwrap(),
+      merge_grant().encode().unwrap(),
     ] {
       let version = version_position(&bytes);
       let mut widened = bytes[..version].to_vec();
@@ -1629,10 +1290,8 @@ mod tests {
       local_identity().encode().unwrap(),
       key_creation_intent().encode().unwrap(),
       identity_binding().encode().unwrap(),
-      cluster_genesis().encode().unwrap(),
-      local_cluster_pointer().encode().unwrap(),
       credential_use().encode().unwrap(),
-      admission_grant().encode().unwrap(),
+      merge_grant().encode().unwrap(),
     ] {
       let mut extra = bytes.clone();
       extra[0] += 1;
@@ -1713,10 +1372,9 @@ mod tests {
       &CredentialUseWire {
         schema: CREDENTIAL_USE_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
-        cluster_id: CLUSTER.to_owned(),
         issuer_id: ISSUER_NODE.to_owned(),
         generation_id: vec![0xC3; 15],
-        admission_id: ADMISSION_BYTES.to_vec(),
+        merge_id: ADMISSION_BYTES.to_vec(),
         subject_id: SUBJECT_NODE.to_owned(),
         subject_key: SUBJECT_KEY.to_vec(),
       },
@@ -1727,103 +1385,51 @@ mod tests {
   }
 
   #[test]
-  fn identity_records_genesis_signature_covers_every_body_field() {
-    let genesis = cluster_genesis();
-    genesis.verify().unwrap();
-
-    let other_cluster = ClusterId::parse("cluster_900000000000000000000").unwrap();
-    let other_node = node("node_900000000000000000000");
-    let other_key = PublicKey::from_bytes([0xB2; 32]);
-    let signature = genesis_signature(&genesis).clone();
-
-    for mutated in [
-      ClusterGenesisV1::new(
-        other_cluster,
-        node(CREATOR_NODE),
-        issuer_key(),
-        signature.clone(),
-      ),
-      ClusterGenesisV1::new(cluster(), other_node, issuer_key(), signature.clone()),
-      ClusterGenesisV1::new(cluster(), node(CREATOR_NODE), other_key, signature),
-    ] {
-      let error = mutated.verify().unwrap_err();
-      assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-    }
-
-    let other_signature = Signature::from_bytes([0x5A; 64]);
-    let mutated =
-      ClusterGenesisV1::new(cluster(), node(CREATOR_NODE), issuer_key(), other_signature);
-    assert_eq!(
-      mutated.verify().unwrap_err().kind(),
-      ErrorKind::AuthenticationFailed
-    );
-  }
-
-  fn genesis_signature(genesis: &ClusterGenesisV1) -> &Signature {
-    &genesis.signature
-  }
-
-  #[test]
-  fn identity_records_admission_signature_covers_every_body_field() {
-    let grant = admission_grant();
+  fn identity_records_merge_signature_covers_every_body_field() {
+    let grant = merge_grant();
     grant.verify(&issuer_key()).unwrap();
 
     let signature = grant_signature(&grant);
-    let other_cluster = ClusterId::parse("cluster_900000000000000000000").unwrap();
-    let other_admission = AdmissionId::from_operation(OperationId::from_bytes([0xE5; 16]));
+    let other_merge = MergeId::from_operation(OperationId::from_bytes([0xE5; 16]));
     let other_generation = GenerationId::from_operation(OperationId::from_bytes([0xE5; 16]));
     let other_node = node("node_900000000000000000000");
     let other_key = PublicKey::from_bytes([0xB2; 32]);
 
     for mutated in [
-      AdmissionGrantV1::new(
-        other_cluster,
-        admission(),
+      MergeGrantV1::new(
+        other_merge,
         node(SUBJECT_NODE),
         PublicKey::from_bytes(SUBJECT_KEY),
         node(ISSUER_NODE),
         generation(),
         signature.clone(),
       ),
-      AdmissionGrantV1::new(
-        cluster(),
-        other_admission,
-        node(SUBJECT_NODE),
-        PublicKey::from_bytes(SUBJECT_KEY),
-        node(ISSUER_NODE),
-        generation(),
-        signature.clone(),
-      ),
-      AdmissionGrantV1::new(
-        cluster(),
-        admission(),
+      MergeGrantV1::new(
+        merge(),
         other_node.clone(),
         PublicKey::from_bytes(SUBJECT_KEY),
         node(ISSUER_NODE),
         generation(),
         signature.clone(),
       ),
-      AdmissionGrantV1::new(
-        cluster(),
-        admission(),
+      MergeGrantV1::new(
+        merge(),
         node(SUBJECT_NODE),
         other_key,
         node(ISSUER_NODE),
         generation(),
         signature.clone(),
       ),
-      AdmissionGrantV1::new(
-        cluster(),
-        admission(),
+      MergeGrantV1::new(
+        merge(),
         node(SUBJECT_NODE),
         PublicKey::from_bytes(SUBJECT_KEY),
         other_node,
         generation(),
         signature.clone(),
       ),
-      AdmissionGrantV1::new(
-        cluster(),
-        admission(),
+      MergeGrantV1::new(
+        merge(),
         node(SUBJECT_NODE),
         PublicKey::from_bytes(SUBJECT_KEY),
         node(ISSUER_NODE),
@@ -1846,7 +1452,7 @@ mod tests {
     );
   }
 
-  fn grant_signature(grant: &AdmissionGrantV1) -> Signature {
+  fn grant_signature(grant: &MergeGrantV1) -> Signature {
     grant.signature.clone()
   }
 
@@ -1860,16 +1466,15 @@ mod tests {
       .collect();
     assert!(!identity_debug.contains(&handle_hex));
 
-    let genesis = cluster_genesis();
-    let genesis_debug = format!("{genesis:?}");
-    let signature = genesis_signature(&genesis);
+    let grant_debug = format!("{:?}", merge_grant());
+    let signature = grant_signature(&merge_grant());
     let signature_hex: String = signature
       .as_bytes()
       .iter()
       .map(|byte| format!("{byte:02x}"))
       .collect();
-    assert!(!genesis_debug.contains(&signature_hex));
-    assert!(genesis_debug.contains("Signature(..)"));
+    assert!(!grant_debug.contains(&signature_hex));
+    assert!(grant_debug.contains("Signature(..)"));
 
     let use_debug = format!("{:?}", credential_use());
     let generation_hex: String = GENERATION_BYTES
@@ -1883,15 +1488,15 @@ mod tests {
     assert!(!use_debug.contains(&generation_hex));
     assert!(!use_debug.contains(&admission_hex));
     assert!(use_debug.contains("GenerationId(..)"));
-    assert!(use_debug.contains("AdmissionId(..)"));
+    assert!(use_debug.contains("MergeId(..)"));
 
-    let grant_debug = format!("{:?}", admission_grant());
+    let grant_debug = format!("{:?}", merge_grant());
     assert!(!grant_debug.contains(&generation_hex));
     assert!(!grant_debug.contains(&admission_hex));
     assert!(!grant_debug.contains(&signature_hex));
 
     assert_eq!(format!("{:?}", generation()), "GenerationId(..)");
-    assert_eq!(format!("{:?}", admission()), "AdmissionId(..)");
+    assert_eq!(format!("{:?}", merge()), "MergeId(..)");
   }
 
   #[test]
@@ -1900,10 +1505,8 @@ mod tests {
       local_identity_key().unwrap(),
       key_creation_intent_key(&operation()).unwrap(),
       identity_binding_key(&node(SUBJECT_NODE)).unwrap(),
-      cluster_genesis_key(&cluster()).unwrap(),
-      local_cluster_pointer_key().unwrap(),
       credential_use_key(&node(ISSUER_NODE), &generation()).unwrap(),
-      admission_grant_key(&admission()).unwrap(),
+      merge_grant_key(&merge()).unwrap(),
     ];
 
     let mut namespaces = Vec::new();
@@ -1940,20 +1543,6 @@ mod tests {
     );
     assert_eq!(binding_key.as_bytes(), SUBJECT_NODE.as_bytes());
 
-    let (genesis_namespace, genesis_key) = cluster_genesis_key(&cluster()).unwrap();
-    assert_eq!(
-      genesis_namespace.as_str(),
-      "radiata.woooo.tech/metadata/cluster-genesis-v1"
-    );
-    assert_eq!(genesis_key.as_bytes(), CLUSTER.as_bytes());
-
-    let (pointer_namespace, pointer_key) = local_cluster_pointer_key().unwrap();
-    assert_eq!(
-      pointer_namespace.as_str(),
-      "radiata.woooo.tech/metadata/local-cluster-pointer-v1"
-    );
-    assert_eq!(pointer_key.as_bytes(), b"self");
-
     let (use_namespace, use_key) = credential_use_key(&node(ISSUER_NODE), &generation()).unwrap();
     assert_eq!(
       use_namespace.as_str(),
@@ -1963,10 +1552,10 @@ mod tests {
     expected_use_key.extend_from_slice(&GENERATION_BYTES);
     assert_eq!(use_key.as_bytes(), expected_use_key.as_slice());
 
-    let (grant_namespace, grant_key) = admission_grant_key(&admission()).unwrap();
+    let (grant_namespace, grant_key) = merge_grant_key(&merge()).unwrap();
     assert_eq!(
       grant_namespace.as_str(),
-      "radiata.woooo.tech/metadata/admission-grant-v1"
+      "radiata.woooo.tech/metadata/merge-grant-v1"
     );
     assert_eq!(grant_key.as_bytes(), &ADMISSION_BYTES);
   }
@@ -2174,9 +1763,9 @@ mod tests {
     assert_eq!(NodeId::parse(id.as_str()).unwrap(), id);
 
     let max = ScriptedEntropy::new(vec![entropy_word(suffix_space() - 1)]);
-    let id = ClusterId::generate(&max).unwrap();
-    assert_eq!(id.as_str(), "cluster_ZZZZZZZZZZZZZZZZZZZZZ");
-    assert_eq!(ClusterId::parse(id.as_str()).unwrap(), id);
+    let id = NodeId::generate(&max).unwrap();
+    assert_eq!(id.as_str(), "node_ZZZZZZZZZZZZZZZZZZZZZ");
+    assert_eq!(NodeId::parse(id.as_str()).unwrap(), id);
 
     let one = ScriptedEntropy::new(vec![entropy_word(1)]);
     let id = TransactionId::generate(&one).unwrap();
@@ -2199,8 +1788,8 @@ mod tests {
       entropy_word(suffix_space()),
       entropy_word(61),
     ]);
-    let id = ClusterId::generate(&entropy).unwrap();
-    assert_eq!(id.as_str(), "cluster_00000000000000000000Z");
+    let id = NodeId::generate(&entropy).unwrap();
+    assert_eq!(id.as_str(), "node_00000000000000000000Z");
   }
 
   #[test]
@@ -2209,12 +1798,12 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::Internal);
     assert_eq!(error.context(), "injected entropy failure");
 
-    assert!(ClusterId::generate(&FailingEntropy).is_err());
+    assert!(NodeId::generate(&FailingEntropy).is_err());
     assert!(TransactionId::generate(&FailingEntropy).is_err());
     assert!(KeyOperationId::generate(&FailingEntropy).is_err());
     assert!(OperationId::generate(&FailingEntropy).is_err());
     assert!(GenerationId::generate(&FailingEntropy).is_err());
-    assert!(AdmissionId::generate(&FailingEntropy).is_err());
+    assert!(MergeId::generate(&FailingEntropy).is_err());
   }
 
   #[test]
@@ -2225,7 +1814,7 @@ mod tests {
     assert_eq!(format!("{operation:?}"), "OperationId(..)");
 
     let entropy = ScriptedEntropy::new(vec![ADMISSION_BYTES.to_vec()]);
-    let wrapper = AdmissionId::generate(&entropy).unwrap();
-    assert_eq!(wrapper, admission());
+    let wrapper = MergeId::generate(&entropy).unwrap();
+    assert_eq!(wrapper, merge());
   }
 }

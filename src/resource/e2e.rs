@@ -16,7 +16,7 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use crate::{
-  ClusterId, LabelKey, LabelSet, LabelValue, NodeId,
+  LabelKey, LabelSet, LabelValue, NodeId,
   api::SystemEntropy,
   membership::{NodeDescriptorV1, page as member_page, store as descriptor_store},
   provider::StorageFactory,
@@ -55,7 +55,6 @@ fn resource(
   name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str, seed: [u8; 32],
 ) -> ResourceRecordV1 {
   ResourceRecordV1::sign(
-    ClusterId::parse("cluster_000000000000000000001").unwrap(),
     name.clone(),
     LabelValue::parse("document").unwrap(),
     crate::ResourceUri::parse(uri).unwrap(),

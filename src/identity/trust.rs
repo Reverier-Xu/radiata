@@ -1,20 +1,20 @@
 //! Issuer trust snapshots (G4-05, consumed by the membership sync lane
-//! in G5).
+//! in G5; rebaselined by ADR-0009: every node is its own snapshot issuer).
 // Unit-verified store surfaces exercised by the unit suite.
 #![allow(dead_code)]
 //!
 //! A [`TrustSnapshotV1`] is one ordered set of `NodeId`-to-`PublicKey`
-//! bindings (cluster, strictly increasing revision, version, ordered
-//! bindings), carried over authenticated sessions and trusted through
-//! them (ADR-0008); it carries no per-entry signatures. Conflicting
-//! evidence fails closed: wrong clusters or issuers in a decoded record's
-//! own marking, stale revisions, and `NodeId` key substitutions against
-//! locally admitted bindings are rejected without selecting a winner.
+//! bindings (strictly increasing revision, version, ordered bindings),
+//! carried over authenticated sessions and trusted through them (ADR-0008);
+//! it carries no per-entry signatures. Conflicting evidence fails closed:
+//! wrong issuers in a decoded record's own marking, stale revisions, and
+//! `NodeId` key substitutions against locally admitted bindings are rejected
+//! without selecting a winner.
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{
-  ClusterId, Digest, NodeId, PublicKey, Result,
+  Digest, NodeId, PublicKey, Result,
   protocol::{decode_canonical, encode_canonical},
 };
 
@@ -46,7 +46,6 @@ impl TrustBinding {
 /// One issuer-marked trust snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrustSnapshotV1 {
-  cluster: ClusterId,
   revision: u64,
   version: u16,
   issuer: NodeId,
@@ -71,26 +70,22 @@ struct SnapshotWire {
   #[n(1)]
   record_version: u16,
   #[n(2)]
-  cluster: String,
-  #[n(3)]
   revision: u64,
-  #[n(4)]
+  #[n(3)]
   version: u16,
-  #[n(5)]
+  #[n(4)]
   issuer: String,
-  #[n(6)]
+  #[n(5)]
   issuer_key: ByteVec,
-  #[n(7)]
+  #[n(6)]
   bindings: Vec<BindingWire>,
 }
 
 impl TrustSnapshotV1 {
   pub(crate) fn new(
-    cluster: ClusterId, revision: u64, version: u16, issuer: NodeId, issuer_key: PublicKey,
-    bindings: Vec<TrustBinding>,
+    revision: u64, version: u16, issuer: NodeId, issuer_key: PublicKey, bindings: Vec<TrustBinding>,
   ) -> Self {
     Self {
-      cluster,
       revision,
       version,
       issuer,
@@ -99,16 +94,16 @@ impl TrustSnapshotV1 {
     }
   }
 
-  pub(crate) const fn cluster(&self) -> &ClusterId {
-    &self.cluster
-  }
-
   pub(crate) const fn revision(&self) -> u64 {
     self.revision
   }
 
   pub(crate) const fn issuer(&self) -> &NodeId {
     &self.issuer
+  }
+
+  pub(crate) const fn issuer_key(&self) -> &PublicKey {
+    &self.issuer_key
   }
 
   pub(crate) fn bindings(&self) -> &[TrustBinding] {
@@ -124,7 +119,6 @@ impl TrustSnapshotV1 {
     SnapshotWire {
       schema: TRUST_SNAPSHOT_SCHEMA.to_owned(),
       record_version: 1,
-      cluster: self.cluster.as_str().to_owned(),
       revision: self.revision,
       version: self.version,
       issuer: self.issuer.as_str().to_owned(),
@@ -142,8 +136,8 @@ impl TrustSnapshotV1 {
 
   /// Decodes one snapshot, checking only its own marking and canonical
   /// wire rules. Entries are trusted through the authenticated session
-  /// that delivered them (ADR-0008); the caller compares the cluster and
-  /// issuer markings against its local view where that matters.
+  /// that delivered them (ADR-0008); the caller compares the issuer
+  /// marking against its local view where that matters.
   pub(crate) fn decode(bytes: &[u8]) -> Result<TrustSnapshotV1> {
     let wire: SnapshotWire = decode_canonical(bytes, crate::protocol::CONTROL_CBOR_LIMITS)
       .map_err(|_| crate::Error::invalid_input("trust snapshot decode"))?;
@@ -155,8 +149,6 @@ impl TrustSnapshotV1 {
     if wire.version != 1 {
       return Err(crate::Error::invalid_input("trust snapshot version"));
     }
-    let cluster = ClusterId::parse(&wire.cluster)
-      .map_err(|_| crate::Error::invalid_input("trust snapshot cluster"))?;
     let issuer = NodeId::parse(&wire.issuer)
       .map_err(|_| crate::Error::invalid_input("trust snapshot issuer"))?;
     let issuer_key = PublicKey::from_bytes(
@@ -179,7 +171,6 @@ impl TrustSnapshotV1 {
       return Err(crate::Error::invalid_input("trust snapshot ordering"));
     }
     Ok(Self::new(
-      cluster,
       wire.revision,
       wire.version,
       issuer,
@@ -255,11 +246,7 @@ mod tests {
   use std::time::Duration;
 
   use super::{TrustBinding, TrustSnapshotV1, page_bindings};
-  use crate::{ClusterId, NodeId};
-
-  fn cluster() -> ClusterId {
-    ClusterId::parse("cluster_100000000000000000000").unwrap()
-  }
+  use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node_{value:021}")).unwrap()
@@ -277,7 +264,6 @@ mod tests {
   fn snapshot(revision: u64, issuer_index: u8, bindings: Vec<(u8, u8)>) -> TrustSnapshotV1 {
     let (issuer, issuer_key) = issuer_pair(issuer_index);
     TrustSnapshotV1::new(
-      cluster(),
       revision,
       1,
       issuer,
@@ -300,7 +286,6 @@ mod tests {
     assert_eq!(decoded.bindings().len(), 3);
     // Ordered by canonical node text.
     assert_eq!(decoded.bindings()[0].node(), &node(2));
-    assert_eq!(decoded.cluster(), &cluster());
     assert_eq!(decoded.issuer(), &node(1));
   }
 
@@ -674,34 +659,7 @@ pub(crate) mod store {
     Ok(false)
   }
 
-  /// The trusted issuer anchor for snapshot verification: on the cluster
-  /// creator this is the creator's own binding; on a member it is the
-  /// issuer of this node's admission grant, resolved to its durable
-  /// binding. The grant is committed at adoption, so the scan is bounded
-  /// by the admission-grant population.
-  pub(crate) async fn trusted_issuer(
-    store: &MetadataStore, local: &NodeId,
-  ) -> Result<Option<(NodeId, PublicKey)>> {
-    let namespace = crate::identity::records::admission_grant_namespace()?;
-    let snapshot = store.snapshot().await?;
-    let mut scan = snapshot.scan(&namespace, &[]).await?;
-    let mut issuer = None;
-    while let Some(entry) = scan.next().await? {
-      let grant = crate::identity::records::AdmissionGrantV1::decode(entry.value().as_bytes())
-        .map_err(|_| crate::Error::invalid_input("admission grant decode"))?;
-      if grant.subject() == local {
-        issuer = Some(grant.issuer().clone());
-        break;
-      }
-    }
-    let Some(issuer) = issuer else {
-      return Ok(None);
-    };
-    let bindings = trusted_bindings(store).await?;
-    Ok(bindings.get(&issuer).cloned().map(|key| (issuer, key)))
-  }
-
-  /// Commits one verified issuer-snapshot binding into the authoritative
+  /// Commits one verified snapshot-adjacent binding into the authoritative
   /// identity store so member-mode dialing and page verification can use
   /// it (the grant-carrying reconnect path). A node already bound to a
   /// different key is a key-substitution conflict and fails closed. A

@@ -183,7 +183,7 @@ async fn json_runtime_node_start_restart_preserves_identity_and_generations() {
   let creates_after_first = calls.create.lock().unwrap().len();
   assert_eq!(creates_after_first, 1);
   let files_after_first = generation_files(dir.path());
-  assert_eq!(files_after_first.len(), 3);
+  assert_eq!(files_after_first.len(), 4);
   assert!(temp_files(dir.path()).is_empty());
   assert!(dir.path().join("radiata.lock").exists());
 
@@ -257,7 +257,7 @@ async fn json_runtime_repeated_restarts_keep_every_final_generation() {
   assert!(temp_files(dir.path()).is_empty());
   // Every final generation remains; the full parent/checksum chain is
   // validated by the successful reopens themselves.
-  assert_eq!(expected_files.len(), 3);
+  assert_eq!(expected_files.len(), 4);
 }
 
 #[cfg(not(unix))]

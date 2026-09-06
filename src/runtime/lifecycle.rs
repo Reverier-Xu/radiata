@@ -1,9 +1,9 @@
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-  AdmissionView, ClusterView, Endpoint, Error, IssuedJoinCredential, ListenerView, LocalNodeView,
-  NodeId, NodeStatus, Result, RouteStatusView, ShutdownOutcome, ShutdownReason,
-  identity::{ListenerId, credential::JoinCredential},
+  Endpoint, Error, IssuedMergeCredential, ListenerView, LocalNodeView, MergeView, NodeId,
+  NodeStatus, Result, RouteStatusView, ShutdownOutcome, ShutdownReason,
+  identity::{ListenerId, credential::MergeCredential},
   packet::{OutboundRequest, RouteHandle},
   session::stream::RouteTable,
 };
@@ -63,11 +63,8 @@ pub(crate) enum Control {
   Shutdown {
     reply: oneshot::Sender<ShutdownOutcome>,
   },
-  CreateCluster {
-    reply: oneshot::Sender<Result<ClusterView>>,
-  },
-  RotateJoinCredential {
-    reply: oneshot::Sender<Result<IssuedJoinCredential>>,
+  RotateMergeCredential {
+    reply: oneshot::Sender<Result<IssuedMergeCredential>>,
   },
   Listen {
     endpoint: Endpoint,
@@ -77,10 +74,10 @@ pub(crate) enum Control {
     listener: ListenerId,
     reply: oneshot::Sender<Result<()>>,
   },
-  JoinCluster {
+  MergeCluster {
     receiver: Endpoint,
-    credential: JoinCredential,
-    reply: oneshot::Sender<Result<AdmissionView>>,
+    credential: MergeCredential,
+    reply: oneshot::Sender<Result<MergeView>>,
   },
   ConnectMember {
     receiver: Endpoint,
@@ -251,15 +248,9 @@ impl RuntimeClient {
       .map_err(|_| Error::internal("node control reply"))?
   }
 
-  pub(crate) async fn create_cluster(&self) -> Result<ClusterView> {
+  pub(crate) async fn rotate_merge_credential(&self) -> Result<IssuedMergeCredential> {
     self
-      .send_command(|reply| Control::CreateCluster { reply })
-      .await
-  }
-
-  pub(crate) async fn rotate_join_credential(&self) -> Result<IssuedJoinCredential> {
-    self
-      .send_command(|reply| Control::RotateJoinCredential { reply })
+      .send_command(|reply| Control::RotateMergeCredential { reply })
       .await
   }
 
@@ -275,11 +266,11 @@ impl RuntimeClient {
       .await
   }
 
-  pub(crate) async fn join_cluster(
-    &self, receiver: Endpoint, credential: JoinCredential,
-  ) -> Result<AdmissionView> {
+  pub(crate) async fn merge_cluster(
+    &self, receiver: Endpoint, credential: MergeCredential,
+  ) -> Result<MergeView> {
     self
-      .send_command(|reply| Control::JoinCluster {
+      .send_command(|reply| Control::MergeCluster {
         receiver,
         credential,
         reply,

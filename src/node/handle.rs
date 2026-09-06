@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use crate::{
-  Command, ConnectMember, CreateCluster, DisconnectPeer, Error, Event, EventOptions,
-  EventSubscription, GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRoute,
-  JoinCluster, Listen, NodeStatus, OutboundStream, PageMembers, PageTopology, PageTrust,
-  ProtocolTag, Query, Result, RotateJoinCredential, SelectResources, Shutdown, StartRecovery,
-  StopListener, StreamMetadata, StreamPolicy, StreamTarget, TraceId, UpdateNodeMetadata,
-  WaitForShutdown,
+  Command, ConnectMember, DisconnectPeer, Error, Event, EventOptions, EventSubscription,
+  GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRoute, Listen, MergeCluster,
+  NodeStatus, OutboundStream, PageMembers, PageTopology, PageTrust, ProtocolTag, Query, Result,
+  RotateMergeCredential, SelectResources, Shutdown, StartRecovery, StopListener, StreamMetadata,
+  StreamPolicy, StreamTarget, TraceId, UpdateNodeMetadata, WaitForShutdown,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
   runtime::RuntimeClient,
@@ -41,17 +40,10 @@ impl DispatchCommand for Shutdown {
   }
 }
 
-impl DispatchCommand for CreateCluster {
+impl DispatchCommand for RotateMergeCredential {
   fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
     let runtime = runtime.clone();
-    Box::pin(async move { runtime.create_cluster().await })
-  }
-}
-
-impl DispatchCommand for RotateJoinCredential {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.rotate_join_credential().await })
+    Box::pin(async move { runtime.rotate_merge_credential().await })
   }
 }
 
@@ -71,11 +63,11 @@ impl DispatchCommand for StopListener {
   }
 }
 
-impl DispatchCommand for JoinCluster {
+impl DispatchCommand for MergeCluster {
   fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
     let (receiver, credential) = self.into_parts();
     let runtime = runtime.clone();
-    Box::pin(async move { runtime.join_cluster(receiver, credential).await })
+    Box::pin(async move { runtime.merge_cluster(receiver, credential).await })
   }
 }
 

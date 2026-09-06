@@ -290,12 +290,12 @@ pub async fn sample_admission(
     outcome: "ok".to_owned(),
   };
   let result = async {
-    let issued = issuer.command(radiata::RotateJoinCredential::new()).await?;
+    let issued = issuer.command(radiata::RotateMergeCredential::new()).await?;
     let secret = issued.credential().expose_secret().to_owned();
     member
-      .command(radiata::JoinCluster::new(
+      .command(radiata::MergeCluster::new(
         endpoint.clone(),
-        radiata::JoinCredential::parse(&secret)?,
+        radiata::MergeCredential::parse(&secret)?,
       ))
       .await?;
     let expected = member.query(radiata::GetLocalNode::new()).await?;

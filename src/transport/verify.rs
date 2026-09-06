@@ -8,7 +8,7 @@
 //! unsupported signature schemes must be rejected. This module is the single
 //! implementation of that rule; it has no accept-anything path.
 //!
-//! - [`TrustMode::Join`]: chain, hostname, and validity-window trust are
+//! - [`TrustMode::Merge`]: chain, hostname, and validity-window trust are
 //!   relaxed exactly as ADR-0001 specifies. The certificate is not a node
 //!   identity or trust record; receiver authentication happens at the
 //!   application proof layer over the RFC 9266 channel binding.
@@ -41,11 +41,11 @@ use rustls::{
 /// The trust relaxation permitted for one authentication mode (ADR-0001).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustMode {
-  /// Join mode: the receiver's self-signed ephemeral certificate is unknown
+  /// Merge mode: the receiver's self-signed ephemeral certificate is unknown
   /// up front, so chain and hostname trust are relaxed. Credential and
   /// identity proofs over the channel binding authenticate the receiver.
-  Join,
-  /// Member mode: the join-mode relaxation plus an exact expected leaf
+  Merge,
+  /// Member mode: the merge-mode relaxation plus an exact expected leaf
   /// SubjectPublicKeyInfo binding. The durable Ed25519 identity binding is
   /// still established by the application proof layer, not by this
   /// verifier.
@@ -166,7 +166,7 @@ mod tests {
   #[test]
   fn tls_transport_verifier_join_mode_accepts_unknown_self_signed_leaf() {
     let certificate = certificate(7);
-    let verifier = verifier(TrustMode::Join);
+    let verifier = verifier(TrustMode::Merge);
 
     verifier
       .verify_server_cert(
@@ -181,7 +181,7 @@ mod tests {
 
   #[test]
   fn tls_transport_verifier_rejects_empty_and_malformed_leaves() {
-    let verifier = verifier(TrustMode::Join);
+    let verifier = verifier(TrustMode::Merge);
 
     let empty = CertificateDer::from(Vec::new());
     assert!(
@@ -242,7 +242,7 @@ mod tests {
 
   #[test]
   fn tls_transport_verifier_signature_schemes_are_tls13_capable() {
-    let verifier = verifier(TrustMode::Join);
+    let verifier = verifier(TrustMode::Merge);
 
     for scheme in verifier.supported_verify_schemes() {
       assert!(!matches!(
@@ -266,6 +266,6 @@ mod tests {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<BootstrapCertVerifier>();
     assert_send_sync::<TrustMode>();
-    let _ = Arc::new(verifier(TrustMode::Join));
+    let _ = Arc::new(verifier(TrustMode::Merge));
   }
 }

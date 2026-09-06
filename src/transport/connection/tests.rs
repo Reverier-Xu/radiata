@@ -17,12 +17,12 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message as WsMessage};
 
 use super::{CHANNEL_BINDING_LEN, Connection, EXPORTER_LABEL, FrameRules};
 use crate::{
-  ClusterId, ErrorKind, Result,
+  ErrorKind, Result,
   transport::{
     cert::EphemeralCertificate,
     testing::{SeedEntropy, server_name},
-    tls::{crypto_provider, join_client_config, member_client_config, server_config},
-    ws::{self, JoinHint, MAX_MESSAGE_BYTES},
+    tls::{crypto_provider, member_client_config, merge_client_config, server_config},
+    ws::{self, MAX_MESSAGE_BYTES, MergeHint},
   },
 };
 
@@ -48,15 +48,12 @@ fn leaf_spki(
 }
 
 async fn loopback_pair() -> (Connection, Connection) {
-  loopback_pair_with(join_client_config().unwrap(), certificate(11)).await
+  loopback_pair_with(merge_client_config().unwrap(), certificate(11)).await
 }
 
 #[tokio::test]
-async fn tls_transport_join_hint_round_trips_inside_the_tls_channel() {
-  let hint = JoinHint::new(
-    ClusterId::parse("cluster_100000000000000000000").unwrap(),
-    [0x5A; 16],
-  );
+async fn tls_transport_merge_hint_round_trips_inside_the_tls_channel() {
+  let hint = MergeHint::new([0x5A; 16]);
   let config = server_config(&certificate(23)).unwrap();
   let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let address = listener.local_addr().unwrap();
@@ -69,16 +66,16 @@ async fn tls_transport_join_hint_round_trips_inside_the_tls_channel() {
   });
 
   let tcp = TcpStream::connect(address).await.unwrap();
-  let client = Connection::connect(tcp, join_client_config().unwrap(), server_name(), rules())
+  let client = Connection::connect(tcp, merge_client_config().unwrap(), server_name(), rules())
     .await
     .unwrap();
-  assert_eq!(client.join_hint(), Some(&hint));
+  assert_eq!(client.merge_hint(), Some(&hint));
   let server = server.await.unwrap().unwrap();
-  assert_eq!(server.join_hint(), None);
+  assert_eq!(server.merge_hint(), None);
 
   // A listener without join capability publishes no hint headers.
   let (client, _server) = loopback_pair().await;
-  assert_eq!(client.join_hint(), None);
+  assert_eq!(client.merge_hint(), None);
 }
 
 async fn loopback_pair_with(
@@ -117,7 +114,7 @@ async fn raw_loopback() -> (
 
   let tcp = TcpStream::connect(address).await.unwrap();
   let authority = tcp.peer_addr().unwrap().to_string();
-  let tls = TlsConnector::from(join_client_config().unwrap())
+  let tls = TlsConnector::from(merge_client_config().unwrap())
     .connect(server_name(), tcp)
     .await
     .unwrap();
@@ -131,7 +128,7 @@ fn framed(stream: WebSocketStream<TlsStream<TcpStream>>) -> Connection {
     stream,
     rules: rules(),
     channel_binding: [0; CHANNEL_BINDING_LEN],
-    join_hint: None,
+    merge_hint: None,
     source: None,
     pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
   }
@@ -247,7 +244,7 @@ async fn connect_to_hostile_server(
 
   let tcp = TcpStream::connect(address).await.unwrap();
   let client =
-    Connection::connect(tcp, join_client_config().unwrap(), server_name(), rules()).await;
+    Connection::connect(tcp, merge_client_config().unwrap(), server_name(), rules()).await;
   let outcome = server.await.unwrap();
   (
     client,
@@ -268,7 +265,7 @@ async fn tls_transport_loopback_derives_identical_exporter_channel_binding() {
   });
 
   let tcp = TcpStream::connect(address).await.unwrap();
-  let client_tls = TlsConnector::from(join_client_config().unwrap())
+  let client_tls = TlsConnector::from(merge_client_config().unwrap())
     .connect(server_name(), tcp)
     .await
     .unwrap();
@@ -530,7 +527,7 @@ async fn tls_transport_rejects_malformed_presented_chain() {
 
 #[tokio::test]
 async fn tls_transport_split_halves_deliver_many_messages_in_order() {
-  let (client, server) = loopback_pair_with(join_client_config().unwrap(), certificate(17)).await;
+  let (client, server) = loopback_pair_with(merge_client_config().unwrap(), certificate(17)).await;
   // The fixed session rule declares packet kind 0x10 only.
   let mut declared_rules = rules();
   declared_rules.is_declared = |schema, kind| schema == 1 && kind == 0x10;
@@ -569,7 +566,7 @@ async fn tls_transport_split_halves_deliver_many_messages_in_order() {
 
 #[tokio::test]
 async fn tls_transport_split_burst_after_round_trip_delivers_all_messages() {
-  let (client, server) = loopback_pair_with(join_client_config().unwrap(), certificate(19)).await;
+  let (client, server) = loopback_pair_with(merge_client_config().unwrap(), certificate(19)).await;
   let mut both_rules = rules();
   both_rules.is_declared = |schema, kind| schema == 1 && kind == 0x10;
   let client = Connection {

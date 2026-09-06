@@ -9,10 +9,10 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  CreateCluster, Endpoint, ErrorKind, EventOptions, EventReceive, JoinCluster, JoinCredential,
-  Listen, NodeBuilder, NodeConfig, NodeHandle, NodeId, NodeRevoked, PageSpec, PageTrust,
-  PutResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RevokeNode,
-  RotateJoinCredential, SelectResources, Selector, Shutdown, TrustStatus, extension::KeyProvider,
+  Endpoint, ErrorKind, EventOptions, EventReceive, Listen, MergeCluster, MergeCredential,
+  NodeBuilder, NodeConfig, NodeHandle, NodeId, NodeRevoked, PageSpec, PageTrust, PutResource,
+  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RevokeNode, RotateMergeCredential,
+  SelectResources, Selector, Shutdown, TrustStatus, extension::KeyProvider,
 };
 
 mod common;
@@ -131,13 +131,12 @@ async fn selected_names(node: &NodeHandle) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g9_revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   let issuer = start_node(0).await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
   let issuer_id = local_id(&issuer.handle).await;
 
   let mut member = start_node(1).await;
   member.endpoint = listen(&member).await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
   member.id = local_id(&member.handle).await;
 
   // The member commits a resource the issuer converges on before the
@@ -214,13 +213,13 @@ async fn g9_revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   let rejoin = async {
     let issued = issuer
       .handle
-      .command(RotateJoinCredential::new())
+      .command(RotateMergeCredential::new())
       .await
       .unwrap();
-    let credential = JoinCredential::parse(issued.credential().expose_secret()).unwrap();
+    let credential = MergeCredential::parse(issued.credential().expose_secret()).unwrap();
     member
       .handle
-      .command(JoinCluster::new(listen(&issuer).await, credential))
+      .command(MergeCluster::new(listen(&issuer).await, credential))
       .await
   };
   let error = rejoin.await.unwrap_err();
@@ -276,12 +275,11 @@ async fn g9_revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g9_revoke_is_exact_and_idempotent() {
   let issuer = start_node(0).await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
 
   let mut member = start_node(1).await;
   member.endpoint = listen(&member).await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
   member.id = local_id(&member.handle).await;
   let member_key = trusted_key(&issuer.handle, &member.id).await;
 
@@ -364,11 +362,10 @@ async fn g9_revoke_is_exact_and_idempotent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g9_delayed_content_converges_after_revoke() {
   let issuer = start_node(0).await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
 
   let member = start_node(1).await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
   let member_id = local_id(&member.handle).await;
 
   member.handle.command(write(2)).await.unwrap();
@@ -396,7 +393,7 @@ async fn g9_delayed_content_converges_after_revoke() {
     .unwrap();
 
   let third = start_node(2).await;
-  common::join_with_retry(&third.handle, &issuer.handle, issuer_endpoint).await;
+  common::merge_with_retry(&third.handle, &issuer.handle, issuer_endpoint).await;
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   while !selected_names(&third.handle)
     .await

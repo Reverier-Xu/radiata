@@ -31,14 +31,14 @@ pub(crate) const GENERATION_ID_LEN: usize = 16;
 ///
 /// The value implements neither `Clone`, `Copy`, serialization, `Display`,
 /// nor revealing `Debug`; the secret text is reachable only through
-/// [`JoinCredential::expose_secret`] and the secret bytes only through the
+/// [`MergeCredential::expose_secret`] and the secret bytes only through the
 /// crate-private proof-derivation boundary.
-pub struct JoinCredential {
+pub struct MergeCredential {
   text: SecretString,
   body: SecretBox<[u8; BODY_LEN]>,
 }
 
-impl JoinCredential {
+impl MergeCredential {
   /// Parses the exact canonical form: the `join_` prefix followed by the
   /// unpadded base64url rendering of a 32-byte body. Any other prefix,
   /// length, alphabet, padding, or non-canonical trailing bits are
@@ -86,9 +86,9 @@ impl JoinCredential {
   }
 }
 
-impl fmt::Debug for JoinCredential {
+impl fmt::Debug for MergeCredential {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str("JoinCredential(..)")
+    formatter.write_str("MergeCredential(..)")
   }
 }
 
@@ -96,14 +96,14 @@ impl fmt::Debug for JoinCredential {
 ///
 /// This is the only value a receiver may hand to an operator; it carries no
 /// generation ID and implements neither `Clone` nor revealing `Debug`.
-pub struct IssuedJoinCredential {
-  credential: JoinCredential,
+pub struct IssuedMergeCredential {
+  credential: MergeCredential,
   expires_at: SystemTime,
 }
 
-impl IssuedJoinCredential {
+impl IssuedMergeCredential {
   /// The issued credential secret.
-  pub fn credential(&self) -> &JoinCredential {
+  pub fn credential(&self) -> &MergeCredential {
     &self.credential
   }
 
@@ -113,14 +113,14 @@ impl IssuedJoinCredential {
   }
 
   /// Consumes the wrapper and returns the credential secret.
-  pub fn into_credential(self) -> JoinCredential {
+  pub fn into_credential(self) -> MergeCredential {
     self.credential
   }
 }
 
-impl fmt::Debug for IssuedJoinCredential {
+impl fmt::Debug for IssuedMergeCredential {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str("IssuedJoinCredential(..)")
+    formatter.write_str("IssuedMergeCredential(..)")
   }
 }
 
@@ -132,7 +132,7 @@ enum GenerationState {
 }
 
 struct ActiveGeneration {
-  credential: Option<JoinCredential>,
+  credential: Option<MergeCredential>,
   generation_id: [u8; GENERATION_ID_LEN],
   expires_at: SystemTime,
   state: GenerationState,
@@ -156,11 +156,11 @@ impl ActiveGeneration {
 /// rotation invalidates the previous value by dropping and zeroizing its
 /// secret. The durable single-use commit semantics arrive with the G3
 /// admission layer; this type owns only the in-memory lifecycle.
-pub(crate) struct JoinCredentialIssuer {
+pub(crate) struct MergeCredentialIssuer {
   generation: Option<ActiveGeneration>,
 }
 
-impl JoinCredentialIssuer {
+impl MergeCredentialIssuer {
   pub(crate) const fn new() -> Self {
     Self { generation: None }
   }
@@ -169,7 +169,7 @@ impl JoinCredentialIssuer {
   /// (unexpired, unconsumed) generation already exists.
   pub(crate) fn issue(
     &mut self, entropy: &dyn Entropy, now: SystemTime,
-  ) -> Result<IssuedJoinCredential> {
+  ) -> Result<IssuedMergeCredential> {
     if let Some(generation) = &self.generation
       && generation.live(now).is_ok()
     {
@@ -183,7 +183,7 @@ impl JoinCredentialIssuer {
   /// generation.
   pub(crate) fn rotate(
     &mut self, entropy: &dyn Entropy, now: SystemTime,
-  ) -> Result<IssuedJoinCredential> {
+  ) -> Result<IssuedMergeCredential> {
     self.replace(entropy, now)
   }
 
@@ -198,7 +198,7 @@ impl JoinCredentialIssuer {
 
   /// The live credential secret, reserved or active, for proof derivation
   /// and verification. Expired or consumed generations fail closed.
-  pub(crate) fn active_credential(&self, now: SystemTime) -> Result<&JoinCredential> {
+  pub(crate) fn active_credential(&self, now: SystemTime) -> Result<&MergeCredential> {
     let generation = self
       .generation
       .as_ref()
@@ -263,7 +263,7 @@ impl JoinCredentialIssuer {
     }
   }
 
-  fn replace(&mut self, entropy: &dyn Entropy, now: SystemTime) -> Result<IssuedJoinCredential> {
+  fn replace(&mut self, entropy: &dyn Entropy, now: SystemTime) -> Result<IssuedMergeCredential> {
     let mut body = Zeroizing::new([0_u8; BODY_LEN]);
     entropy.fill(body.as_mut())?;
     let mut generation_id = [0_u8; GENERATION_ID_LEN];
@@ -273,27 +273,27 @@ impl JoinCredentialIssuer {
       .ok_or_else(|| Error::internal("join credential expiry"))?;
     // Replacing the generation drops and zeroizes the previous secret.
     self.generation = Some(ActiveGeneration {
-      credential: Some(JoinCredential::from_body(*body)),
+      credential: Some(MergeCredential::from_body(*body)),
       generation_id,
       expires_at,
       state: GenerationState::Active,
     });
-    Ok(IssuedJoinCredential {
-      credential: JoinCredential::from_body(*body),
+    Ok(IssuedMergeCredential {
+      credential: MergeCredential::from_body(*body),
       expires_at,
     })
   }
 }
 
-impl Default for JoinCredentialIssuer {
+impl Default for MergeCredentialIssuer {
   fn default() -> Self {
     Self::new()
   }
 }
 
-impl fmt::Debug for JoinCredentialIssuer {
+impl fmt::Debug for MergeCredentialIssuer {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str("JoinCredentialIssuer(..)")
+    formatter.write_str("MergeCredentialIssuer(..)")
   }
 }
 
@@ -305,7 +305,7 @@ mod tests {
   };
 
   use super::{
-    BODY_LEN, CREDENTIAL_LEN, GENERATION_ID_LEN, JoinCredential, JoinCredentialIssuer, LIFETIME,
+    BODY_LEN, CREDENTIAL_LEN, GENERATION_ID_LEN, LIFETIME, MergeCredential, MergeCredentialIssuer,
   };
   use crate::{Error, ErrorKind, Result, api::Entropy};
 
@@ -351,7 +351,7 @@ mod tests {
   #[test]
   fn tls_transport_credential_parse_accepts_exact_canonical_form() {
     assert_eq!(GOLDEN_TEXT.len(), CREDENTIAL_LEN);
-    let credential = JoinCredential::parse(GOLDEN_TEXT).unwrap();
+    let credential = MergeCredential::parse(GOLDEN_TEXT).unwrap();
     assert_eq!(credential.expose_secret(), GOLDEN_TEXT);
     assert_eq!(credential.expose_secret_bytes(), &GOLDEN_BODY);
   }
@@ -376,22 +376,22 @@ mod tests {
     for value in &rejected {
       assert_ne!(value, GOLDEN_TEXT);
       assert_eq!(
-        JoinCredential::parse(value).unwrap_err().kind(),
+        MergeCredential::parse(value).unwrap_err().kind(),
         ErrorKind::InvalidInput,
         "value: {value:?}"
       );
     }
-    assert!(JoinCredential::parse(GOLDEN_TEXT).is_ok());
+    assert!(MergeCredential::parse(GOLDEN_TEXT).is_ok());
   }
 
   #[test]
   fn tls_transport_credential_debug_and_errors_redact_the_secret() {
-    let credential = JoinCredential::parse(GOLDEN_TEXT).unwrap();
+    let credential = MergeCredential::parse(GOLDEN_TEXT).unwrap();
     let debug = format!("{credential:?}");
-    assert_eq!(debug, "JoinCredential(..)");
+    assert_eq!(debug, "MergeCredential(..)");
     assert!(!debug.contains(GOLDEN_TEXT));
 
-    let error = JoinCredential::parse("join_").unwrap_err();
+    let error = MergeCredential::parse("join_").unwrap_err();
     assert_eq!(
       format!("{error:?}"),
       "Error { kind: InvalidInput, context: \"join credential\" }"
@@ -402,7 +402,7 @@ mod tests {
   #[test]
   fn tls_transport_credential_issue_uses_entropy_and_expires_after_ten_minutes() {
     let entropy = SequenceEntropy::default();
-    let mut issuer = JoinCredentialIssuer::new();
+    let mut issuer = MergeCredentialIssuer::new();
     let issued = issuer.issue(&entropy, ISSUED_AT).unwrap();
 
     assert_eq!(issued.credential().expose_secret(), GOLDEN_TEXT);
@@ -428,7 +428,7 @@ mod tests {
     );
 
     // Entropy failure propagates without mutating any existing state.
-    let mut fresh = JoinCredentialIssuer::new();
+    let mut fresh = MergeCredentialIssuer::new();
     assert_eq!(
       fresh.issue(&FailingEntropy, ISSUED_AT).unwrap_err().kind(),
       ErrorKind::Io
@@ -446,7 +446,7 @@ mod tests {
   #[test]
   fn tls_transport_credential_expiry_and_rotation_invalidate_generations() {
     let entropy = SequenceEntropy::default();
-    let mut issuer = JoinCredentialIssuer::new();
+    let mut issuer = MergeCredentialIssuer::new();
     let first = issuer.issue(&entropy, ISSUED_AT).unwrap();
     let first_generation = issuer.generation_id().unwrap();
 
@@ -482,7 +482,7 @@ mod tests {
   #[test]
   fn tls_transport_credential_reservation_is_single_use() {
     let entropy = SequenceEntropy::default();
-    let mut issuer = JoinCredentialIssuer::new();
+    let mut issuer = MergeCredentialIssuer::new();
     issuer.issue(&entropy, ISSUED_AT).unwrap();
 
     // One outstanding reservation only.
@@ -529,10 +529,10 @@ mod tests {
   #[test]
   fn tls_transport_credential_issuer_state_is_redacted() {
     let entropy = SequenceEntropy::default();
-    let mut issuer = JoinCredentialIssuer::new();
+    let mut issuer = MergeCredentialIssuer::new();
     let issued = issuer.issue(&entropy, ISSUED_AT).unwrap();
-    assert_eq!(format!("{issuer:?}"), "JoinCredentialIssuer(..)");
-    assert_eq!(format!("{issued:?}"), "IssuedJoinCredential(..)");
+    assert_eq!(format!("{issuer:?}"), "MergeCredentialIssuer(..)");
+    assert_eq!(format!("{issued:?}"), "IssuedMergeCredential(..)");
     let debug = format!("{issuer:?}{issued:?}");
     assert!(!debug.contains(issued.credential().expose_secret()));
   }

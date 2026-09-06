@@ -1836,6 +1836,51 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-05"
+gate = "G11"
+priority = "P0"
+first = 8
+verification_id = "VERIFY-G11-05"
+kind = "contract"
+cases = [
+  { title = "Every started node is born holding a singleton cluster", acceptance = "start() get-or-creates the local identity through the journaled pipeline and ensures the immutable self IdentityBinding in the same boot; a reopened node reuses the exact binding; no CreateCluster command, ClusterView, ClusterGenesisV1, LocalClusterPointerV1, or existing_cluster exists anywhere in API, wire, or record schemas.", rebaseline = "ADR-0009", threats = [
+    "THR-014",
+  ] },
+  { title = "Self-binding bootstrap is crash-safe and idempotent", acceptance = "ensure_self_binding commits one conditional put; a crash, conflict, or unknown outcome resolves by authoritative re-read accepting only the exact local binding; reopen suites prove no duplicate or divergent binding.", rebaseline = "ADR-0009", threats = [
+    "THR-015",
+  ] },
+  { title = "Genesis privilege is fully excised", acceptance = "No node holds creator privileges: the genesis/pointer storage families, the genesis signature domain, and every create/join asymmetry are deleted from code, fixtures, and golden vectors.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-014",
+  ] },
+]
+
+[[scenario_set]]
+owner_task = "T-G11-06"
+gate = "G11"
+priority = "P0"
+first = 11
+verification_id = "VERIFY-G11-06"
+kind = "contract"
+cases = [
+  { title = "One merge credential authorizes one authenticated session", acceptance = "MergeCluster dials with a MergeCredential; the fixed credential mechanism is unchanged (32-byte bearer secret, ten-minute lifetime, single successful use per generation, one active generation per issuer, fixed rate and pending guardrails); failed attempts never consume.", rebaseline = "ADR-0009", threats = [
+    "THR-001",
+    "THR-002",
+  ] },
+  { title = "Both sides adopt the union of their binding sets", acceptance = "The issuer commits binding + credential use + merge grant in one journaled transaction; the merger adopts the issuer binding and grant; a re-merge of the same pair with the same keys is idempotent; a conflicting key fails closed without mutation.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-014",
+  ] },
+  { title = "Merge converges K clusters with K-1 credentials through ordinary sync", acceptance = "After merge, every node refreshes its own trust snapshot (no creator-only privilege) and the anti-entropy plane converges the union of bindings and descriptors across the session graph; a node merged into a multi-node cluster learns every binding without further credentials.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+  ] },
+  { title = "Merge wire formats carry no cluster fields", acceptance = "Handshake hellos, the merge hint, the grant payload, and trust snapshots contain no ClusterId; golden vectors and compatibility fixtures are regenerated to the new formats.", rebaseline = "ADR-0009", threats = [
+    "THR-009",
+    "THR-012",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"

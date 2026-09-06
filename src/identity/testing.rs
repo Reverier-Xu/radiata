@@ -19,7 +19,7 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use super::lifecycle::{LocalIdentityContext, open_local_identity};
 use crate::{
-  BoxFuture, ClusterId, CommitOutcome, CreatedKey, Digest, Error, KeyCapabilities, KeyCreateState,
+  BoxFuture, CommitOutcome, CreatedKey, Digest, Error, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, NodeId, ProviderErrorContext, ProviderErrorKind,
   PublicKey, QualifiedTag, ReconcileOutcome, Result, Signature, StoreCapabilities, StoreKey,
   StoreNamespace, StoreOperation, StoreRequirements, StoreTransaction, StoreValue, TransactionId,
@@ -84,7 +84,6 @@ pub(crate) enum KeyCall {
 pub(crate) enum SignScript {
   Apply,
   InvalidBytes,
-  WrongMessage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -404,9 +403,6 @@ impl KeyProvider for ScriptedKeys {
       .map(|signing| match script {
         SignScript::Apply => Signature::from_bytes(signing.sign(message).to_bytes()),
         SignScript::InvalidBytes => Signature::from_bytes([0x5A; 64]),
-        SignScript::WrongMessage => {
-          Signature::from_bytes(signing.sign(b"tampered-message").to_bytes())
-        }
       })
       .ok_or_else(|| Error::provider(ProviderErrorKind::Internal, ProviderErrorContext::KeySign));
     Box::pin(async move { result })
@@ -666,11 +662,6 @@ pub(crate) async fn open_context(
 
 pub(crate) fn node(value: u128) -> NodeId {
   NodeId::parse(&format!("node_{value:021}")).unwrap()
-}
-
-#[allow(dead_code)]
-pub(crate) fn cluster(value: u128) -> ClusterId {
-  ClusterId::parse(&format!("cluster_{value:021}")).unwrap()
 }
 
 #[allow(dead_code)]

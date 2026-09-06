@@ -163,10 +163,8 @@ pub(crate) async fn discover_leave_intent(
 /// are storage infrastructure and stay.
 const WIPE_NAMESPACES: &[&str] = &[
   crate::storage::families::IDENTITY_BINDING_NAMESPACE,
-  crate::storage::families::CLUSTER_GENESIS_NAMESPACE,
-  crate::storage::families::LOCAL_CLUSTER_POINTER_NAMESPACE,
   crate::storage::families::CREDENTIAL_USE_NAMESPACE,
-  crate::storage::families::ADMISSION_GRANT_NAMESPACE,
+  crate::storage::families::MERGE_GRANT_NAMESPACE,
   crate::storage::families::TRUST_SNAPSHOT_NAMESPACE,
   crate::storage::families::TRUST_BINDING_NAMESPACE,
   crate::storage::families::REVOCATION_NAMESPACE,

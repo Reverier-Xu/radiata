@@ -12,15 +12,10 @@ pub(crate) const LOCAL_IDENTITY_NAMESPACE: &str = "radiata.woooo.tech/metadata/l
 /// One immutable node-to-key identity binding per node.
 pub(crate) const IDENTITY_BINDING_NAMESPACE: &str =
   "radiata.woooo.tech/metadata/identity-binding-v1";
-/// Cluster genesis admission record.
-pub(crate) const CLUSTER_GENESIS_NAMESPACE: &str = "radiata.woooo.tech/metadata/cluster-genesis-v1";
-/// Local cluster membership pointer.
-pub(crate) const LOCAL_CLUSTER_POINTER_NAMESPACE: &str =
-  "radiata.woooo.tech/metadata/local-cluster-pointer-v1";
 /// Single-use credential use evidence per issuer generation.
 pub(crate) const CREDENTIAL_USE_NAMESPACE: &str = "radiata.woooo.tech/metadata/credential-use-v1";
-/// Committed admission grant per credential.
-pub(crate) const ADMISSION_GRANT_NAMESPACE: &str = "radiata.woooo.tech/metadata/admission-grant-v1";
+/// Committed merge grant per credential.
+pub(crate) const MERGE_GRANT_NAMESPACE: &str = "radiata.woooo.tech/metadata/merge-grant-v1";
 /// Pending Ed25519 key creation intent per operation.
 pub(crate) const KEY_CREATION_INTENT_NAMESPACE: &str =
   "radiata.woooo.tech/metadata/key-creation-intent-v1";
@@ -112,10 +107,9 @@ mod catalog {
   }
 
   use super::{
-    ADMISSION_GRANT_NAMESPACE, CLUSTER_GENESIS_NAMESPACE, CREDENTIAL_USE_NAMESPACE,
-    IDENTITY_BINDING_NAMESPACE, INTERNAL_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE,
-    KEY_DELETED_NAMESPACE, KEY_DELETION_INTENT_NAMESPACE, LEAVE_NAMESPACE,
-    LOCAL_CLUSTER_POINTER_NAMESPACE, LOCAL_IDENTITY_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE,
+    CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, INTERNAL_NAMESPACE,
+    KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE, KEY_DELETION_INTENT_NAMESPACE,
+    LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE, MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE,
     PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE, REVOCATION_NAMESPACE, SCHEMA_NAMESPACE,
     TRACE_NAMESPACE, TRUST_BINDING_NAMESPACE, TRUST_SNAPSHOT_NAMESPACE,
   };
@@ -125,10 +119,8 @@ mod catalog {
     vec![
       MetadataFamily::new(MetadataDomain::Identity, LOCAL_IDENTITY_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, IDENTITY_BINDING_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, CLUSTER_GENESIS_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, LOCAL_CLUSTER_POINTER_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, CREDENTIAL_USE_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, ADMISSION_GRANT_NAMESPACE),
+      MetadataFamily::new(MetadataDomain::Identity, MERGE_GRANT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, REVOCATION_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Identity, LEAVE_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_CREATION_INTENT_NAMESPACE),

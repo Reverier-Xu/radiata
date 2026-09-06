@@ -165,30 +165,10 @@ pub radiata::StreamTarget::MatchingNodes(radiata::Selector)
 #[non_exhaustive] pub enum radiata::TrustStatus
 pub radiata::TrustStatus::Revoked
 pub radiata::TrustStatus::Trusted
-pub struct radiata::AdmissionView
-impl radiata::AdmissionView
-pub fn radiata::AdmissionView::admitted_node(&self) -> &radiata::NodeId
-pub fn radiata::AdmissionView::cluster_id(&self) -> &radiata::ClusterId
-pub fn radiata::AdmissionView::issuer(&self) -> &radiata::NodeId
 pub struct radiata::ChannelBinding(_)
 impl radiata::ChannelBinding
 pub const fn radiata::ChannelBinding::as_bytes(&self) -> &[u8; 32]
 pub const fn radiata::ChannelBinding::from_tls_exporter([u8; 32]) -> Self
-pub struct radiata::ClusterId(_)
-impl radiata::ClusterId
-pub fn radiata::ClusterId::as_str(&self) -> &str
-pub fn radiata::ClusterId::parse(&str) -> radiata::Result<Self>
-impl core::fmt::Debug for radiata::ClusterId
-pub fn radiata::ClusterId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::fmt::Display for radiata::ClusterId
-pub fn radiata::ClusterId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::str::traits::FromStr for radiata::ClusterId
-pub type radiata::ClusterId::Err = radiata::Error
-pub fn radiata::ClusterId::from_str(&str) -> radiata::Result<Self>
-pub struct radiata::ClusterView
-impl radiata::ClusterView
-pub fn radiata::ClusterView::cluster_id(&self) -> &radiata::ClusterId
-pub fn radiata::ClusterView::creator(&self) -> &radiata::NodeId
 pub struct radiata::CommitReceipt
 impl radiata::CommitReceipt
 pub fn radiata::CommitReceipt::committed_revision(&self) -> &radiata::StoreRevision
@@ -200,11 +180,6 @@ impl radiata::ConnectMember
 pub fn radiata::ConnectMember::new(radiata::Endpoint, radiata::NodeId) -> Self
 impl radiata::Command for radiata::ConnectMember
 pub type radiata::ConnectMember::Output = radiata::NodeId
-pub struct radiata::CreateCluster
-impl radiata::CreateCluster
-pub fn radiata::CreateCluster::new() -> Self
-impl radiata::Command for radiata::CreateCluster
-pub type radiata::CreateCluster::Output = radiata::ClusterView
 pub struct radiata::CreatedKey
 impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
@@ -356,24 +331,13 @@ pub fn radiata::IncomingStream::source(&self) -> &radiata::NodeId
 pub fn radiata::IncomingStream::trace_id(&self) -> &radiata::TraceId
 impl core::fmt::Debug for radiata::IncomingStream
 pub fn radiata::IncomingStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::IssuedJoinCredential
-impl radiata::IssuedJoinCredential
-pub fn radiata::IssuedJoinCredential::credential(&self) -> &radiata::JoinCredential
-pub fn radiata::IssuedJoinCredential::expires_at(&self) -> std::time::SystemTime
-pub fn radiata::IssuedJoinCredential::into_credential(self) -> radiata::JoinCredential
-impl core::fmt::Debug for radiata::IssuedJoinCredential
-pub fn radiata::IssuedJoinCredential::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::JoinCluster
-impl radiata::JoinCluster
-pub fn radiata::JoinCluster::new(radiata::Endpoint, radiata::JoinCredential) -> Self
-impl radiata::Command for radiata::JoinCluster
-pub type radiata::JoinCluster::Output = radiata::AdmissionView
-pub struct radiata::JoinCredential
-impl radiata::JoinCredential
-pub fn radiata::JoinCredential::expose_secret(&self) -> &str
-pub fn radiata::JoinCredential::parse(&str) -> radiata::Result<Self>
-impl core::fmt::Debug for radiata::JoinCredential
-pub fn radiata::JoinCredential::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::IssuedMergeCredential
+impl radiata::IssuedMergeCredential
+pub fn radiata::IssuedMergeCredential::credential(&self) -> &radiata::MergeCredential
+pub fn radiata::IssuedMergeCredential::expires_at(&self) -> std::time::SystemTime
+pub fn radiata::IssuedMergeCredential::into_credential(self) -> radiata::MergeCredential
+impl core::fmt::Debug for radiata::IssuedMergeCredential
+pub fn radiata::IssuedMergeCredential::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::KeyCapabilities
 impl radiata::KeyCapabilities
 pub fn radiata::KeyCapabilities::deletion(self, bool) -> Self
@@ -462,7 +426,6 @@ pub fn radiata::ListenerView::endpoint(&self) -> &radiata::Endpoint
 pub fn radiata::ListenerView::id(&self) -> &radiata::ListenerId
 pub struct radiata::LocalNodeView
 impl radiata::LocalNodeView
-pub fn radiata::LocalNodeView::cluster_id(&self) -> &radiata::ClusterId
 pub fn radiata::LocalNodeView::node_id(&self) -> &radiata::NodeId
 pub fn radiata::LocalNodeView::public_key(&self) -> &radiata::PublicKey
 pub struct radiata::MemberChanged
@@ -482,6 +445,21 @@ pub fn radiata::MemberView::labels(&self) -> &radiata::LabelSet
 pub fn radiata::MemberView::node_id(&self) -> &radiata::NodeId
 pub fn radiata::MemberView::owner_revision(&self) -> u64
 pub fn radiata::MemberView::public_key(&self) -> &radiata::PublicKey
+pub struct radiata::MergeCluster
+impl radiata::MergeCluster
+pub fn radiata::MergeCluster::new(radiata::Endpoint, radiata::MergeCredential) -> Self
+impl radiata::Command for radiata::MergeCluster
+pub type radiata::MergeCluster::Output = radiata::MergeView
+pub struct radiata::MergeCredential
+impl radiata::MergeCredential
+pub fn radiata::MergeCredential::expose_secret(&self) -> &str
+pub fn radiata::MergeCredential::parse(&str) -> radiata::Result<Self>
+impl core::fmt::Debug for radiata::MergeCredential
+pub fn radiata::MergeCredential::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::MergeView
+impl radiata::MergeView
+pub fn radiata::MergeView::node(&self) -> &radiata::NodeId
+pub fn radiata::MergeView::peer(&self) -> &radiata::NodeId
 pub struct radiata::NextHopView<'a>
 impl radiata::NextHopView<'_>
 pub fn radiata::NextHopView<'_>::destination(&self) -> &radiata::NodeId
@@ -732,11 +710,11 @@ pub struct radiata::RevokeOutcome
 impl radiata::RevokeOutcome
 pub fn radiata::RevokeOutcome::subject(&self) -> &radiata::NodeId
 pub fn radiata::RevokeOutcome::was_already_revoked(&self) -> bool
-pub struct radiata::RotateJoinCredential
-impl radiata::RotateJoinCredential
-pub fn radiata::RotateJoinCredential::new() -> Self
-impl radiata::Command for radiata::RotateJoinCredential
-pub type radiata::RotateJoinCredential::Output = radiata::IssuedJoinCredential
+pub struct radiata::RotateMergeCredential
+impl radiata::RotateMergeCredential
+pub fn radiata::RotateMergeCredential::new() -> Self
+impl radiata::Command for radiata::RotateMergeCredential
+pub type radiata::RotateMergeCredential::Output = radiata::IssuedMergeCredential
 pub struct radiata::RouteChanged
 impl radiata::RouteChanged
 pub fn radiata::RouteChanged::handle(&self) -> &radiata::RouteHandle
@@ -971,24 +949,22 @@ pub trait radiata::Command: radiata::operation::private::Sealed + core::marker::
 pub type radiata::Command::Output: core::marker::Send + 'static
 impl radiata::Command for radiata::ConnectMember
 pub type radiata::ConnectMember::Output = radiata::NodeId
-impl radiata::Command for radiata::CreateCluster
-pub type radiata::CreateCluster::Output = radiata::ClusterView
 impl radiata::Command for radiata::DisconnectPeer
 pub type radiata::DisconnectPeer::Output = ()
-impl radiata::Command for radiata::JoinCluster
-pub type radiata::JoinCluster::Output = radiata::AdmissionView
 impl radiata::Command for radiata::LeaveCluster
 pub type radiata::LeaveCluster::Output = radiata::LeaveOutcome
 impl radiata::Command for radiata::Listen
 pub type radiata::Listen::Output = radiata::ListenerView
+impl radiata::Command for radiata::MergeCluster
+pub type radiata::MergeCluster::Output = radiata::MergeView
 impl radiata::Command for radiata::PutResource
 pub type radiata::PutResource::Output = radiata::ResourceMutationView
 impl radiata::Command for radiata::RemoveResource
 pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
 impl radiata::Command for radiata::RevokeNode
 pub type radiata::RevokeNode::Output = radiata::RevokeOutcome
-impl radiata::Command for radiata::RotateJoinCredential
-pub type radiata::RotateJoinCredential::Output = radiata::IssuedJoinCredential
+impl radiata::Command for radiata::RotateMergeCredential
+pub type radiata::RotateMergeCredential::Output = radiata::IssuedMergeCredential
 impl radiata::Command for radiata::Shutdown
 pub type radiata::Shutdown::Output = radiata::ShutdownOutcome
 impl radiata::Command for radiata::StartRecovery

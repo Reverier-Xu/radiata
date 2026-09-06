@@ -11,8 +11,8 @@
 use crate::{
   FeatureTag,
   identity::records::{
-    AdmissionGrantV1, ClusterGenesisV1, CredentialUseV1, IdentityBindingV1, KeyCreationIntentV1,
-    KeyDeletedV1, KeyDeletionIntentV1, LocalClusterPointerV1, LocalIdentityV1,
+    CredentialUseV1, IdentityBindingV1, KeyCreationIntentV1, KeyDeletedV1, KeyDeletionIntentV1,
+    LocalIdentityV1, MergeGrantV1,
   },
   membership::page::decode_descriptor,
   packet::wire,
@@ -78,10 +78,8 @@ pub fn persisted_decode(input: &[u8]) {
   let _ = KeyDeletionIntentV1::decode(input);
   let _ = KeyDeletedV1::decode(input);
   let _ = IdentityBindingV1::decode(input);
-  let _ = ClusterGenesisV1::decode(input);
-  let _ = LocalClusterPointerV1::decode(input);
   let _ = CredentialUseV1::decode(input);
-  let _ = AdmissionGrantV1::decode(input);
+  let _ = MergeGrantV1::decode(input);
   let _ = decode_descriptor(input);
   let _ = ResourceRecordV1::decode(input);
   let _ = decode_trace_record(input);
@@ -122,8 +120,8 @@ use std::{collections::BTreeSet, sync::Arc as SharedArc};
 use crate::{
   ErrorKind, NodeId, PublicKey, TraceId,
   identity::{
-    admission::{AdmissionProposal, AdmissionState, admission_state, commit_admission},
-    records::{AdmissionId, GenerationId},
+    merge::{MergeProposal, MergeState, commit_merge, merge_state},
+    records::{GenerationId, MergeId},
     testing::{
       ScriptedKeys, SequenceEntropy, fresh_reference, node, open_context, scripted_signing,
     },
@@ -299,38 +297,37 @@ pub fn admission(input: &[u8]) {
         // finding: skip the run.
         Err(_) => return Ok::<(), crate::Error>(()),
       });
-      if crate::identity::genesis::create_cluster(&context, &keys.as_provider(), entropy.as_ref())
+      if crate::identity::lifecycle::ensure_self_binding(&context, entropy.as_ref())
         .await
         .is_err()
       {
         return Ok(());
       }
-      let mut last: Option<(AdmissionProposal, AdmissionGrantV1)> = None;
+      let mut last: Option<(MergeProposal, MergeGrantV1)> = None;
       for pair in input.chunks(2) {
         let op = admission_op(pair[0]);
         let subject_index = u64::from(pair.get(1).copied().unwrap_or(0)) % 4;
         match op {
           AdmissionOp::Propose => {
-            let (Some(generation), Some(admission_id)) = (
+            let (Some(generation), Some(merge_id)) = (
               GenerationId::generate(entropy.as_ref()).ok(),
-              AdmissionId::generate(entropy.as_ref()).ok(),
+              MergeId::generate(entropy.as_ref()).ok(),
             ) else {
               return Ok(());
             };
-            let proposal = AdmissionProposal::new(
+            let proposal = MergeProposal::new(
               node(u128::from(subject_index) + 1_000),
               PublicKey::from_bytes(scripted_signing(subject_index).verifying_key().to_bytes()),
               generation,
-              admission_id,
+              merge_id,
             );
-            match commit_admission(&context, &keys.as_provider(), entropy.as_ref(), &proposal).await
-            {
+            match commit_merge(&context, &keys.as_provider(), entropy.as_ref(), &proposal).await {
               Ok(grant) => {
                 // The grant verifies against the issuer key and the state
                 // machine reports the exact triple consumed.
                 grant.verify(context.identity().public_key())?;
-                match admission_state(&context, &proposal).await {
-                  Ok(AdmissionState::Consumed(_, existing)) if *existing == grant => {}
+                match merge_state(&context, &proposal).await {
+                  Ok(MergeState::Consumed(_, existing)) if *existing == grant => {}
                   other => panic!("admission state diverged after commit: {other:?}"),
                 }
                 last = Some((proposal, grant));
@@ -344,7 +341,7 @@ pub fn admission(input: &[u8]) {
           AdmissionOp::Replay => {
             if let Some((proposal, grant)) = &last {
               let replayed =
-                commit_admission(&context, &keys.as_provider(), entropy.as_ref(), proposal).await;
+                commit_merge(&context, &keys.as_provider(), entropy.as_ref(), proposal).await;
               match replayed {
                 Ok(existing) if existing == *grant => {}
                 _ => panic!("replay of a consumed admission diverged"),
@@ -353,10 +350,10 @@ pub fn admission(input: &[u8]) {
           }
           AdmissionOp::DoubleBook => {
             if let Some((proposal, _)) = &last {
-              let Some(admission_id) = AdmissionId::generate(entropy.as_ref()).ok() else {
+              let Some(merge_id) = MergeId::generate(entropy.as_ref()).ok() else {
                 return Ok(());
               };
-              let double = AdmissionProposal::new(
+              let double = MergeProposal::new(
                 node(u128::from(subject_index) + 2_000),
                 PublicKey::from_bytes(
                   scripted_signing(subject_index + 4)
@@ -364,10 +361,9 @@ pub fn admission(input: &[u8]) {
                     .to_bytes(),
                 ),
                 proposal.generation().clone(),
-                admission_id,
+                merge_id,
               );
-              match commit_admission(&context, &keys.as_provider(), entropy.as_ref(), &double).await
-              {
+              match commit_merge(&context, &keys.as_provider(), entropy.as_ref(), &double).await {
                 Err(error) => {
                   if error.kind() != ErrorKind::Conflict {
                     panic!("double-booking must fail closed as Conflict: {error:?}");
@@ -376,15 +372,15 @@ pub fn admission(input: &[u8]) {
                 Ok(_) => panic!("a second subject admitted on a consumed generation"),
               }
               // The original admission survives the rejected attempt.
-              match admission_state(&context, proposal).await {
-                Ok(AdmissionState::Consumed(..)) => {}
+              match merge_state(&context, proposal).await {
+                Ok(MergeState::Consumed(..)) => {}
                 _ => panic!("the rejected attempt must not disturb the committed triple"),
               }
             }
           }
           AdmissionOp::WrongKey => {
             if let Some((proposal, _)) = &last {
-              let wrong = AdmissionProposal::new(
+              let wrong = MergeProposal::new(
                 proposal.subject().clone(),
                 PublicKey::from_bytes(
                   scripted_signing(subject_index + 8)
@@ -392,10 +388,9 @@ pub fn admission(input: &[u8]) {
                     .to_bytes(),
                 ),
                 proposal.generation().clone(),
-                proposal.admission().clone(),
+                proposal.merge().clone(),
               );
-              match commit_admission(&context, &keys.as_provider(), entropy.as_ref(), &wrong).await
-              {
+              match commit_merge(&context, &keys.as_provider(), entropy.as_ref(), &wrong).await {
                 Err(error) => {
                   if error.kind() != ErrorKind::Conflict {
                     panic!("a wrong-key replay must fail closed as Conflict: {error:?}");

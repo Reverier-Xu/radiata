@@ -27,7 +27,6 @@ async fn resource_converges_to_the_member_view() {
   .start()
   .await
   .unwrap();
-  creator.command(radiata::CreateCluster::new()).await.unwrap();
   let listener = creator
     .command(radiata::Listen::new(
       radiata::Endpoint::parse("wss://127.0.0.1:0").unwrap(),
@@ -54,15 +53,15 @@ async fn resource_converges_to_the_member_view() {
   .unwrap();
 
   let issued = creator
-    .command(radiata::RotateJoinCredential::new())
+    .command(radiata::RotateMergeCredential::new())
     .await
     .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    let credential = radiata::JoinCredential::parse(&secret).unwrap();
+    let credential = radiata::MergeCredential::parse(&secret).unwrap();
     match member
-      .command(radiata::JoinCluster::new(endpoint.clone(), credential))
+      .command(radiata::MergeCluster::new(endpoint.clone(), credential))
       .await
     {
       Ok(_) => break,

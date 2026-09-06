@@ -16,11 +16,10 @@ use std::{
 };
 
 use radiata::{
-  ConnectMember, CreateCluster, DisconnectPeer, Endpoint, GetObservability, GetResource, Listen,
-  NodeBuilder, NodeConfig, NodeHandle, NodeId, ProtocolTag, PutResource, QualifiedTag,
-  RemoveResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result,
-  RotateJoinCredential, Shutdown, StreamMetadata, StreamPolicy, StreamTarget,
-  extension::KeyProvider,
+  ConnectMember, DisconnectPeer, Endpoint, GetObservability, GetResource, Listen, NodeBuilder,
+  NodeConfig, NodeHandle, NodeId, ProtocolTag, PutResource, QualifiedTag, RemoveResource,
+  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, RotateMergeCredential,
+  Shutdown, StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
 };
 
 mod common;
@@ -288,15 +287,15 @@ async fn soak_churn_then_baseline_return() {
   issuer.id = Some(
     issuer
       .handle
-      .command(CreateCluster::new())
+      .query(radiata::GetLocalNode::new())
       .await
       .unwrap()
-      .creator()
+      .node_id()
       .clone(),
   );
   issuer.listen().await;
   for member in &mut members {
-    common::join_with_retry(&member.handle, &issuer.handle, issuer.endpoint().clone()).await;
+    common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint().clone()).await;
     member.id = Some(
       member
         .handle
@@ -416,7 +415,7 @@ async fn soak_churn_then_baseline_return() {
       }
     }
     if tick.is_multiple_of(64) {
-      match issuer.handle.command(RotateJoinCredential::new()).await {
+      match issuer.handle.command(RotateMergeCredential::new()).await {
         Ok(_) => stats.credential_rotations += 1,
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "rotate",

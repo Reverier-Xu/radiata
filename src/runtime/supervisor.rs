@@ -8,15 +8,13 @@ use tokio::{
 use tracing::debug;
 
 use crate::{
-  AdmissionView, ClusterView, Endpoint, Error, ErrorKind, IssuedJoinCredential, ListenerView,
-  LocalNodeView, NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason, StreamTarget,
-  TraceId,
+  Endpoint, Error, ErrorKind, IssuedMergeCredential, ListenerView, LocalNodeView, MergeView,
+  NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason, StreamTarget, TraceId,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{
-    credential::JoinCredentialIssuer,
-    genesis::create_cluster,
-    lifecycle::{LocalIdentityContext, open_local_identity},
+    credential::MergeCredentialIssuer,
+    lifecycle::{LocalIdentityContext, ensure_self_binding, open_local_identity},
   },
   packet::{OutboundRequest, RouteRecord, RouteState},
   protocol::offer::node_offer,
@@ -186,7 +184,14 @@ pub(crate) async fn spawn_runtime(
     receipt_retention,
   )
   .await?;
-  dependencies.context = Some(Arc::new(context));
+  let context = {
+    // Born-with-cluster (ADR-0009 decision 1): every started node holds
+    // its own immutable identity binding, so it is a singleton cluster of
+    // one and merge union needs no genesis ceremony.
+    ensure_self_binding(&context, dependencies.entropy.as_ref()).await?;
+    Arc::new(context)
+  };
+  dependencies.context = Some(context);
   // The core membership sync protocol is registered before the runtime is
   // marked ready: a caller that registered the same tag fails `start`
   // with a typed conflict instead of a spawned-task panic.
@@ -313,12 +318,8 @@ async fn supervise(
         .await;
         return;
       }
-      Control::CreateCluster { reply } => {
-        let result = supervisor.create_cluster().await;
-        let _ = reply.send(result);
-      }
-      Control::RotateJoinCredential { reply } => {
-        let result = supervisor.rotate_join_credential();
+      Control::RotateMergeCredential { reply } => {
+        let result = supervisor.rotate_merge_credential();
         let _ = reply.send(result);
       }
       Control::Listen { endpoint, reply } => {
@@ -329,13 +330,13 @@ async fn supervise(
         let result = supervisor.stop_listener(&listener).await;
         let _ = reply.send(result);
       }
-      Control::JoinCluster {
+      Control::MergeCluster {
         receiver,
         credential,
         reply,
       } => {
         let result = supervisor
-          .join_cluster(receiver, credential, &mut tasks)
+          .merge_cluster(receiver, credential, &mut tasks)
           .await;
         let _ = reply.send(result);
       }
@@ -615,7 +616,7 @@ impl Supervisor {
       driver_context,
       dependencies.keys.clone(),
       dependencies.entropy.clone(),
-      Arc::new(std::sync::Mutex::new(JoinCredentialIssuer::new())),
+      Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
       offer,
     );
     // The membership sync protocol was registered by `spawn_runtime`
@@ -689,22 +690,7 @@ impl Supervisor {
     (self.dependencies, aborted)
   }
 
-  async fn create_cluster(&mut self) -> Result<ClusterView> {
-    self.require_unblocked()?;
-    let context = self.context()?;
-    let genesis = create_cluster(
-      &context,
-      &self.dependencies.keys,
-      self.dependencies.entropy.as_ref(),
-    )
-    .await?;
-    Ok(ClusterView::new(
-      genesis.cluster().clone(),
-      genesis.creator().clone(),
-    ))
-  }
-
-  fn rotate_join_credential(&mut self) -> Result<IssuedJoinCredential> {
+  fn rotate_merge_credential(&mut self) -> Result<IssuedMergeCredential> {
     self.require_unblocked()?;
     self
       .driver
@@ -733,7 +719,7 @@ impl Supervisor {
         // The join hint is computed per accepted connection so the accept
         // path stays fast and never stalls on the credential issuer lock;
         // a hint failure skips this connection only.
-        let mut hint = match driver.join_hint().await {
+        let mut hint = match driver.merge_hint().await {
           Ok(Some(hint)) => Some(hint),
           _ => None,
         };
@@ -818,23 +804,23 @@ impl Supervisor {
     Ok(())
   }
 
-  async fn join_cluster(
-    &mut self, receiver: Endpoint, credential: crate::identity::credential::JoinCredential,
+  async fn merge_cluster(
+    &mut self, receiver: Endpoint, credential: crate::identity::credential::MergeCredential,
     tasks: &mut JoinSet<()>,
-  ) -> Result<AdmissionView> {
+  ) -> Result<MergeView> {
     self.require_unblocked()?;
     let mut connection = self
       .dependencies
       .transport
-      .connect(receiver.clone(), tls::join_client_config()?)
+      .connect(receiver.clone(), tls::merge_client_config()?)
       .await?;
     let hint = connection
-      .join_hint()
+      .merge_hint()
       .cloned()
       .ok_or_else(|| Error::authentication_failed("join hint"))?;
     let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
-    let (session, view) = self.driver.join(&mut connection, &hint, secret).await?;
-    // Remember the peer's leaf SPKI from the join as the member-mode
+    let (session, view) = self.driver.merge(&mut connection, &hint, secret).await?;
+    // Remember the peer's leaf SPKI from the merge as the member-mode
     // reconnect pinning anchor (THR-002 hardening).
     let peer = session.peer().clone();
     if !hint.leaf_spki().is_empty() {
@@ -842,8 +828,8 @@ impl Supervisor {
         .driver
         .record_peer_spki(&peer, hint.leaf_spki().to_vec());
     }
-    // Keep the join session open so both sides can stream packets over it.
-    // The admission view returns only after the session table registers
+    // Keep the merge session open so both sides can stream packets over
+    // it. The merge view returns only after the session table registers
     // the entry, so the caller's first packet cannot race registration.
     let sessions = self.dependencies.sessions.clone();
     let packet = self.packet.clone();
@@ -1564,11 +1550,6 @@ impl Supervisor {
     // before the commit so peers can verify this candidate as soon as it
     // arrives (a writing member that never listens must still propagate).
     self.ensure_self_descriptor().await?;
-    let cluster = crate::identity::genesis::local_cluster(&context)
-      .await?
-      .ok_or_else(|| Error::not_ready("local cluster"))?
-      .cluster()
-      .clone();
     let writer = context.identity().node().clone();
     let labels = write.labels().clone();
     // A snapshot-exact CAS can lose a race against a concurrent internal
@@ -1583,7 +1564,6 @@ impl Supervisor {
       attempts += 1;
       let timestamp_millis = crate::time::now_millis();
       let record = crate::resource::ResourceRecordV1::sign_with_provider(
-        cluster.clone(),
         write.name().clone(),
         labels.resource_type().clone(),
         labels.uri().clone(),
@@ -1647,11 +1627,6 @@ impl Supervisor {
     // The writer's descriptor anchors the removal's signature for the
     // same propagation reason as a put.
     self.ensure_self_descriptor().await?;
-    let cluster = crate::identity::genesis::local_cluster(&context)
-      .await?
-      .ok_or_else(|| Error::not_ready("local cluster"))?
-      .cluster()
-      .clone();
     let writer = context.identity().node().clone();
     // The snapshot-exact CAS can lose a race against a concurrent internal
     // committer, so the observation, signature, and commit re-run within
@@ -1684,7 +1659,6 @@ impl Supervisor {
         .checked_add(1)
         .ok_or_else(|| Error::conflict("resource removal rank"))?;
       let body = crate::resource::ResourceRecordV1::encode_signed_body(
-        &cluster,
         &name,
         stored.resource_type(),
         stored.resource_uri(),
@@ -1706,7 +1680,6 @@ impl Supervisor {
         )
         .await?;
       let removal = crate::resource::ResourceRecordV1::seal(
-        cluster.clone(),
         name.clone(),
         stored.resource_type().clone(),
         stored.resource_uri().clone(),
@@ -1820,9 +1793,6 @@ impl Supervisor {
       return Err(Error::invalid_input("leave acknowledgement"));
     }
     let context = self.context()?;
-    crate::identity::genesis::local_cluster(&context)
-      .await?
-      .ok_or_else(|| Error::not_ready("local cluster"))?;
 
     // Network teardown first: no new sessions or inbound metadata while
     // the identity is replaced and the old metadata is wiped.
@@ -1985,11 +1955,7 @@ impl Supervisor {
 
   async fn local_node(&mut self) -> Result<LocalNodeView> {
     let context = self.context()?;
-    let pointer = crate::identity::genesis::local_cluster(&context)
-      .await?
-      .ok_or_else(|| Error::not_ready("local cluster"))?;
     Ok(LocalNodeView::new(
-      pointer.cluster().clone(),
       context.identity().node().clone(),
       context.identity().public_key().clone(),
     ))
@@ -2035,7 +2001,7 @@ async fn dial_member(
     Some(spki) => {
       tls::member_client_config(rustls::pki_types::SubjectPublicKeyInfoDer::from(spki))?
     }
-    None => tls::join_client_config()?,
+    None => tls::merge_client_config()?,
   };
   let mut connection = transport.connect(receiver.clone(), config).await?;
   let session = driver.initiate_member(&mut connection, peer).await?;

@@ -20,7 +20,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::{Digest, Error, JoinCredential, Result};
+use crate::{Digest, Error, MergeCredential, Result};
 
 /// The exact ADR-0001 responder bootstrap key info label.
 pub(crate) const RESPONDER_KEY_INFO: &[u8] = b"radiata.woooo.tech/crypto/bootstrap-v1-responder";
@@ -60,7 +60,7 @@ impl CredentialSecret {
   }
 
   /// Copies the secret body out of a parsed join credential.
-  pub(crate) fn from_credential(credential: &JoinCredential) -> Self {
+  pub(crate) fn from_credential(credential: &MergeCredential) -> Self {
     Self::from_bytes(*credential.expose_secret_bytes())
   }
 
@@ -141,7 +141,7 @@ mod tests {
     CredentialProof, CredentialSecret, INITIATOR_KEY_INFO, ProofRole, RESPONDER_KEY_INFO,
     derive_proof, proof_mac, role_key, verify_proof,
   };
-  use crate::{Digest, JoinCredential};
+  use crate::{Digest, MergeCredential};
 
   const CHANNEL_BINDING: [u8; 32] = [0xCB; 32];
   const CREDENTIAL: [u8; 32] = [0x42; 32];
@@ -227,7 +227,7 @@ mod tests {
   #[test]
   fn tls_transport_proof_derivation_accepts_parsed_credentials() {
     let credential =
-      JoinCredential::parse("join_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").unwrap();
+      MergeCredential::parse("join_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").unwrap();
     let from_credential = CredentialSecret::from_credential(&credential);
     let from_bytes = CredentialSecret::from_bytes([
       0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,

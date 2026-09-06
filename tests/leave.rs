@@ -14,12 +14,11 @@ use std::{
 };
 
 use radiata::{
-  BoxFuture, CreateCluster, Endpoint, Error, ErrorKind, EventOptions, EventReceive,
-  IdentityReplaced, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId,
-  LeaveCluster, Listen, NodeBuilder, NodeHandle, PublicKey, PutResource,
-  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
-  ResourceWrite, Result, Shutdown, ShutdownReason, Signature, WaitForShutdown,
-  extension::KeyProvider,
+  BoxFuture, Endpoint, Error, ErrorKind, EventOptions, EventReceive, IdentityReplaced,
+  KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, LeaveCluster, Listen,
+  NodeBuilder, NodeHandle, PublicKey, PutResource, ReplaceIdentityAndDeleteOldCoreMetadata,
+  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, Shutdown, ShutdownReason,
+  Signature, WaitForShutdown, extension::KeyProvider,
 };
 #[cfg(any(feature = "json", feature = "redb"))]
 use radiata::{
@@ -222,7 +221,6 @@ async fn g9_leave_replaces_identity_and_shuts_down_with_active_leave() {
   ));
   let keys: Arc<dyn KeyProvider> = Arc::new(LeaveKeys::default());
   let handle = NodeBuilder::new(storage, keys).start().await.unwrap();
-  handle.command(CreateCluster::new()).await.unwrap();
   handle
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
@@ -310,7 +308,6 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
       .start()
       .await
       .unwrap();
-    handle.command(CreateCluster::new()).await.unwrap();
     handle
       .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
       .await
@@ -337,18 +334,13 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
     assert_eq!(keys.deleted_count(), 1);
   }
 
-  // Restart on the same store: no cluster, no members, no trust, no
-  // resources — only the replacement identity remains.
+  // Restart on the same store: members, trust, and resources are wiped —
+  // the replacement identity is born with its own singleton cluster
+  // (ADR-0009), so the local view resolves to exactly the replacement.
   let handle = NodeBuilder::new(storage, provider).start().await.unwrap();
-  assert_eq!(
-    handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap_err()
-      .kind(),
-    ErrorKind::NotReady,
-    "the old cluster pointer is gone"
-  );
+  let local = handle.query(radiata::GetLocalNode::new()).await.unwrap();
+  assert_eq!(local.node_id(), &replacement);
+  assert_ne!(local.node_id(), &former_handle_bytes);
   assert!(
     handle
       .query(SelectResources::new(
@@ -383,34 +375,8 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
       .is_empty()
   );
 
-  // A fresh cluster over the restarted store binds the replacement
-  // identity — the old identity never returns.
-  handle.command(CreateCluster::new()).await.unwrap();
-  let local = handle.query(radiata::GetLocalNode::new()).await.unwrap();
-  assert_eq!(local.node_id(), &replacement);
-  assert_ne!(local.node_id(), &former_handle_bytes);
+  // The old identity never returns: the restarted node is exactly the
+  // replacement identity's singleton cluster (asserted above).
 
-  handle.command(Shutdown::new()).await.unwrap();
-}
-
-/// SC-G09-P0-18: leave requires an acknowledged intent and a cluster; a
-/// standalone node fails NotReady without touching anything.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_leave_without_cluster_is_not_ready() {
-  let storage = Arc::new(common::MemoryStorageFactory::new(
-    common::required_capabilities(),
-  ));
-  let keys: Arc<dyn KeyProvider> = Arc::new(LeaveKeys::default());
-  let handle = NodeBuilder::new(storage, keys).start().await.unwrap();
-  assert_eq!(
-    handle
-      .command(LeaveCluster::new(
-        ReplaceIdentityAndDeleteOldCoreMetadata::new()
-      ))
-      .await
-      .unwrap_err()
-      .kind(),
-    ErrorKind::NotReady
-  );
   handle.command(Shutdown::new()).await.unwrap();
 }

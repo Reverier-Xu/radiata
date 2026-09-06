@@ -1,7 +1,7 @@
-//! Runtime-level atomic admission and reconciliation lane (T-G03-03).
+//! Runtime-level atomic merge and reconciliation lane (T-G03-03).
 //!
 //! Drives the full node stack through `NodeBuilder` with a fault-injecting
-//! storage factory: an indeterminate admission commit freezes the node and
+//! storage factory: an indeterminate merge commit freezes the node and
 //! blocks credential rotation, reuse, and new listening until an
 //! authoritative reopen reconciles the exact transaction; a definite
 //! pre-commit abort releases the generation for one later attempt. Test
@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use radiata::{
-  CreateCluster, Endpoint, ErrorKind, GetLocalNode, JoinCluster, JoinCredential, Listen,
-  NodeBuilder, NodeHandle, RotateJoinCredential, Shutdown, extension::StorageFactory,
+  Endpoint, ErrorKind, GetLocalNode, Listen, MergeCluster, MergeCredential, NodeBuilder,
+  NodeHandle, RotateMergeCredential, Shutdown, extension::StorageFactory,
 };
 
 mod common;
@@ -40,33 +40,27 @@ fn keys_at(seed: u64) -> Arc<ScriptedKeys> {
   Arc::new(ScriptedKeys::full_at(seed))
 }
 
-async fn clustered(factory: Arc<dyn StorageFactory>, seed: u64) -> (Node, radiata::ClusterView) {
-  let node = start(factory, keys_at(seed)).await;
-  let cluster = node.handle.command(CreateCluster::new()).await.unwrap();
-  (node, cluster)
-}
-
-async fn join(
-  node: &Node, endpoint: &Endpoint, credential: JoinCredential,
-) -> radiata::Result<radiata::AdmissionView> {
+async fn merge(
+  node: &Node, endpoint: &Endpoint, credential: MergeCredential,
+) -> radiata::Result<radiata::MergeView> {
   node
     .handle
-    .command(JoinCluster::new(endpoint.clone(), credential))
+    .command(MergeCluster::new(endpoint.clone(), credential))
     .await
 }
 
-/// Issues one join credential with bounded retries: admission-sensitive
+/// Issues one merge credential with bounded retries: merge-sensitive
 /// operations refuse while a concurrent metadata commit or reconciliation
 /// holds the store, so a rotation is retried instead of failing the lane.
-async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedJoinCredential {
+async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
   loop {
-    match issuer.handle.command(RotateJoinCredential::new()).await {
+    match issuer.handle.command(RotateMergeCredential::new()).await {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
       }
-      Err(error) => panic!("join credential rotation failed persistently: {error:?}"),
+      Err(error) => panic!("merge credential rotation failed persistently: {error:?}"),
     }
   }
 }
@@ -78,31 +72,18 @@ async fn fresh_node(seed: u64) -> (Node, Arc<MemoryStorageFactory>) {
   (node, memory)
 }
 
-/// SC-G03-P0-08: an indeterminate admission commit freezes the node; every
-/// admission-sensitive operation (rotation, reuse, new listening) is
+/// SC-G03-P0-08: an indeterminate merge commit freezes the node; every
+/// merge-sensitive operation (rotation, reuse, new listening) is
 /// blocked with `NotReady`, no new signing work happens, and an
 /// authoritative reopen reconciles the exact committed transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   let memory = Arc::new(MemoryStorageFactory::new(required_capabilities()));
-  // Identity creation (3) and genesis (2) pass; the admission triple
-  // commit at position six applies but reports unknown, and the
-  // in-process reconcile also stays unknown.
-  let fault = Arc::new(FaultingFactory::new(
-    Arc::clone(&memory),
-    vec![
-      CommitFault::Pass,
-      CommitFault::Pass,
-      CommitFault::Pass,
-      CommitFault::Pass,
-      CommitFault::Pass,
-      CommitFault::UnknownApplied,
-    ],
-  ));
+  let fault = Arc::new(FaultingFactory::new(Arc::clone(&memory), Vec::new()));
   fault.add_reconcile_unknowns(1);
 
   let provider: Arc<dyn StorageFactory> = fault.clone();
-  let (receiver, _) = clustered(provider.clone(), 1_000).await;
+  let receiver = start(provider.clone(), keys_at(1_000)).await;
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle
@@ -110,20 +91,25 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
     .await
     .unwrap();
 
+  // Pin an indeterminate outcome to the merge commit: the number of setup
+  // commits (identity, rotation, listen) is not stable, so the script is
+  // armed only after the listener is ready; the in-process reconcile also
+  // stays unknown.
+  fault.reset_script(vec![CommitFault::UnknownApplied]);
   let (joiner, _) = fresh_node(2_000).await;
-  let error = join(&joiner, listener.endpoint(), issued.into_credential())
+  let error = merge(&joiner, listener.endpoint(), issued.into_credential())
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
   joiner.handle.command(Shutdown::new()).await.unwrap();
 
   // The indeterminate outcome froze the receiver: credential rotation
-  // and new listening are blocked with NotReady, and a join attempt is
+  // and new listening are blocked with NotReady, and a merge attempt is
   // refused before any credential validation or signing work.
   let _signing_calls_after_freeze = receiver.keys.take_calls();
   let rotation = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap_err();
   assert_eq!(rotation.kind(), ErrorKind::NotReady);
@@ -137,17 +123,17 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   // A syntactically valid credential proves the responder gate fires
   // before the credential is verified or any identity signature is made.
   let gate_credential =
-    JoinCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-  let join_result = fresh_joiner
+    MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+  let merge_result = fresh_joiner
     .handle
-    .command(JoinCluster::new(
+    .command(MergeCluster::new(
       listener.endpoint().clone(),
       gate_credential,
     ))
     .await;
   assert!(
-    join_result.is_err(),
-    "frozen receiver must refuse the join at the responder gate"
+    merge_result.is_err(),
+    "frozen receiver must refuse the merge at the responder gate"
   );
   assert!(
     receiver.keys.take_calls().is_empty(),
@@ -157,8 +143,8 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 
   // Authoritative reopen with the same identity reconciles the journal to
-  // committed: the receiver starts unblocked and the durable admission
-  // admits a later member.
+  // committed: the receiver starts unblocked and the durable merge
+  // admits a later peer.
   let receiver_keys = receiver.keys.clone();
   drop(receiver);
   let receiver = start(provider.clone(), receiver_keys).await;
@@ -169,26 +155,26 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
     .await
     .unwrap();
   let (later, _) = fresh_node(4_000).await;
-  let admission = join(&later, listener.endpoint(), issued.into_credential())
+  let merge = merge(&later, listener.endpoint(), issued.into_credential())
     .await
     .unwrap();
   let local = later.handle.query(GetLocalNode::new()).await.unwrap();
-  assert_eq!(local.node_id(), admission.admitted_node());
+  assert_eq!(local.node_id(), merge.node());
   later.handle.command(Shutdown::new()).await.unwrap();
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
 /// SC-G03-P0-07: a definite pre-commit abort leaves the node unblocked and
-/// releases the credential generation for one later join attempt.
+/// releases the credential generation for one later merge attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admission_runtime_definite_abort_unblocks_and_allows_later_join() {
+async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
   let memory = Arc::new(MemoryStorageFactory::new(required_capabilities()));
   let fault = Arc::new(FaultingFactory::new(
     Arc::clone(&memory),
     vec![CommitFault::Pass; 8],
   ));
   let provider: Arc<dyn StorageFactory> = fault.clone();
-  let (receiver, _) = clustered(provider.clone(), 1_100).await;
+  let receiver = start(provider.clone(), keys_at(1_100)).await;
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle
@@ -196,12 +182,12 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_join() {
     .await
     .unwrap();
 
-  // Pin a definite pre-commit abort to the join admission commit: the
-  // number of setup commits (cluster, rotation, listen) is not stable, so
-  // the script is armed only after the listener is ready.
+  // Pin a definite pre-commit abort to the merge commit: the number of
+  // setup commits (identity, rotation, listen) is not stable, so the
+  // script is armed only after the listener is ready.
   fault.reset_script(vec![CommitFault::Aborted; 8]);
   let (joiner, _) = fresh_node(2_100).await;
-  let error = join(&joiner, listener.endpoint(), issued.into_credential())
+  let error = merge(&joiner, listener.endpoint(), issued.into_credential())
     .await
     .unwrap_err();
   assert!(
@@ -209,17 +195,17 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_join() {
       error.kind(),
       ErrorKind::AuthenticationFailed | ErrorKind::Conflict
     ),
-    "a definitely aborted admission surfaces as a typed rejection, got {:?}",
+    "a definitely aborted merge surfaces as a typed rejection, got {:?}",
     error.kind()
   );
   // Prove the abort was final before the later attempt: no evidence of
-  // the abandoned admission survives.
+  // the abandoned merge survives.
   fault.reset_script(Vec::new());
   joiner.handle.command(Shutdown::new()).await.unwrap();
 
-  // The abort is final: binding, credential use, and grant are all
-  // absent, the store is not frozen, and one later attempt with a fresh
-  // credential succeeds (SC-G03-P0-07).
+  // The abort is final: the binding, the credential use, and the grant
+  // are all absent, the store is not frozen, and one later attempt with
+  // a fresh credential succeeds (SC-G03-P0-07).
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle
@@ -227,10 +213,11 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_join() {
     .await
     .unwrap();
   let (later, _) = fresh_node(3_100).await;
-  let admission = join(&later, listener.endpoint(), issued.into_credential())
+  let merge = merge(&later, listener.endpoint(), issued.into_credential())
     .await
     .unwrap();
-  assert_eq!(admission.cluster_id(), admission.cluster_id());
+  let local = later.handle.query(GetLocalNode::new()).await.unwrap();
+  assert_eq!(local.node_id(), merge.node());
   later.handle.command(Shutdown::new()).await.unwrap();
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }

@@ -87,8 +87,8 @@ async fn g1_lifecycle_start_and_shutdown_provisions_identity_once() {
   );
   assert_eq!(
     providers.entropy.fills(),
-    &[32, 16, 16, 16, 16, 16],
-    "startup fills the runtime seed, then generates node, operation, and transaction IDs",
+    &[32, 16, 16, 16, 16, 16, 16],
+    "startup fills the runtime seed, then generates node, operation, and transaction IDs (including the self-binding transaction)",
   );
   let calls = providers.keys.take_calls();
   assert!(
@@ -98,12 +98,12 @@ async fn g1_lifecycle_start_and_shutdown_provisions_identity_once() {
     ),
     "startup provisions and verifies the local identity: {calls:?}",
   );
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
 
   let outcome = handle.command(Shutdown::new()).await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
-  assert_eq!(providers.entropy.fills().len(), 6);
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.entropy.fills().len(), 7);
+  assert_eq!(providers.factory.commit_calls(), 4);
   assert_eq!(providers.keys.take_calls(), vec![]);
 }
 

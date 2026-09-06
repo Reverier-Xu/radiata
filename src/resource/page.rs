@@ -178,7 +178,7 @@ mod tests {
 
   use super::{ResourcePage, ResourceRecordV1, sync};
   use crate::{
-    ClusterId, Endpoint, LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy,
+    Endpoint, LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy,
     membership::store as descriptor_store, provider::StorageFactory, resource::ResourceName,
     storage::MetadataStore,
   };
@@ -211,7 +211,6 @@ mod tests {
     name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str, seed: [u8; 32],
   ) -> ResourceRecordV1 {
     ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       name.clone(),
       LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse(uri).unwrap(),
@@ -421,7 +420,6 @@ mod tests {
     // Re-sign the same body with a different key so the record shape is
     // valid but the signature does not verify under the trusted key.
     let forged_body = ResourceRecordV1::encode_signed_body(
-      good.cluster(),
       good.name(),
       good.resource_type(),
       good.resource_uri(),
@@ -443,7 +441,6 @@ mod tests {
         .to_bytes(),
     );
     let forged = ResourceRecordV1::seal(
-      good.cluster().clone(),
       good.name().clone(),
       good.resource_type().clone(),
       good.resource_uri().clone(),

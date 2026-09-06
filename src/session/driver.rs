@@ -9,12 +9,11 @@
 //! - signing order: the initiator calls `KeyProvider::sign` for its identity
 //!   signature only after the responder credential proof and identity signature
 //!   verified, exactly as ADR-0001 requires;
-//! - admission wiring: a join-mode responder commits the admission triple
-//!   through [`commit_admission`] before delivering the signed grant at
-//!   protocol position six; the joiner verifies the delivered grant against the
-//!   authenticated session (signed issuer key, exact subject, and the cluster
-//!   ID from the untrusted upgrade hint) and persists it through
-//!   [`adopt_admission`].
+//! - merge wiring: a merge-mode responder commits the merge triple through
+//!   [`commit_merge`] before delivering the signed grant at protocol position
+//!   six; the merger verifies the delivered grant against the authenticated
+//!   session (signed issuer key and exact subject) and persists it through
+//!   [`adopt_merge`].
 //!
 //! Every peer-visible failure maps to a generic `AuthenticationFailed`
 //! error; no handshake detail, credential, proof, or exporter bytes cross
@@ -25,23 +24,18 @@ use std::{
   time::{Duration, SystemTime},
 };
 
-use minicbor::{Decode, Encode, bytes::ByteVec};
 use tokio::time::timeout;
 
 use crate::{
-  ClusterId, Digest, Error, NodeId, PublicKey, Result,
+  Error, NodeId, PublicKey, Result,
   api::Entropy,
   identity::{
-    admission::{AdmissionProposal, adopt_admission, commit_admission},
-    credential::{GENERATION_ID_LEN, JoinCredentialIssuer},
-    genesis::existing_cluster,
+    credential::{GENERATION_ID_LEN, MergeCredentialIssuer},
     lifecycle::LocalIdentityContext,
-    records::{
-      AdmissionGrantV1, AdmissionId, GenerationId, IdentityBindingV1, identity_binding_key,
-    },
+    merge::{MergeProposal, adopt_merge, commit_merge},
+    records::{GenerationId, IdentityBindingV1, MergeGrantV1, MergeId, identity_binding_key},
   },
   protocol::{
-    CONTROL_CBOR_LIMITS,
     credential::CredentialSecret,
     feature::FeatureRegistry,
     handshake::{
@@ -54,9 +48,9 @@ use crate::{
   provider::KeyProvider,
   transport::{
     connection::{Connection, Message},
-    ws::JoinHint,
+    ws::MergeHint,
   },
-  view::AdmissionView,
+  view::MergeView,
 };
 
 /// The fixed ADR-0006 authentication deadline for the full session
@@ -117,16 +111,16 @@ pub(crate) struct SessionDriver {
   context: Arc<LocalIdentityContext>,
   keys: Arc<dyn KeyProvider>,
   entropy: Arc<dyn Entropy>,
-  issuer: Arc<Mutex<JoinCredentialIssuer>>,
+  issuer: Arc<Mutex<MergeCredentialIssuer>>,
   offer: FeatureOffer,
-  limiter: crate::identity::admission_rate::AdmissionLimiter,
+  limiter: crate::identity::merge_rate::MergeLimiter,
   member_spkis: Arc<MemberSpkiTable>,
 }
 
 impl SessionDriver {
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, keys: Arc<dyn KeyProvider>, entropy: Arc<dyn Entropy>,
-    issuer: Arc<Mutex<JoinCredentialIssuer>>, offer: FeatureOffer,
+    issuer: Arc<Mutex<MergeCredentialIssuer>>, offer: FeatureOffer,
   ) -> Self {
     Self {
       context,
@@ -134,12 +128,12 @@ impl SessionDriver {
       entropy,
       issuer,
       offer,
-      limiter: crate::identity::admission_rate::AdmissionLimiter::new(),
+      limiter: crate::identity::merge_rate::MergeLimiter::new(),
       member_spkis: Arc::new(MemberSpkiTable::default()),
     }
   }
 
-  pub(crate) fn issuer(&self) -> &Arc<Mutex<JoinCredentialIssuer>> {
+  pub(crate) fn issuer(&self) -> &Arc<Mutex<MergeCredentialIssuer>> {
     &self.issuer
   }
 
@@ -161,19 +155,15 @@ impl SessionDriver {
       .and_then(|anchors| anchors.get(peer).cloned())
   }
 
-  /// The current non-secret join hint for accepted connections: the local
-  /// cluster ID plus the active credential generation ID. `None` (no
-  /// cluster, no active generation, or an indeterminate metadata store
-  /// awaiting authoritative reopen) means the listener publishes no hint
-  /// and cannot admit joiners.
-  pub(crate) async fn join_hint(&self) -> Result<Option<JoinHint>> {
+  /// The current non-secret merge hint for accepted connections: the
+  /// active credential generation ID. `None` (no active generation, or an
+  /// indeterminate metadata store awaiting authoritative reopen) means the
+  /// listener publishes no hint and cannot admit mergers.
+  pub(crate) async fn merge_hint(&self) -> Result<Option<MergeHint>> {
     if self.context.store().is_blocked()? {
-      tracing::debug!("join hint withheld: metadata store awaiting reconciliation");
+      tracing::debug!("merge hint withheld: metadata store awaiting reconciliation");
       return Ok(None);
     }
-    let Some(pointer) = crate::identity::genesis::local_cluster(&self.context).await? else {
-      return Ok(None);
-    };
     let generation = match self.issuer.lock() {
       Ok(issuer) => match issuer.generation_id() {
         Some(generation) => generation,
@@ -185,11 +175,11 @@ impl SessionDriver {
       // surface it so it stays observable instead of masquerading as
       // "no active generation".
       Err(_) => {
-        tracing::warn!("join credential issuer lock poisoned");
-        return Err(Error::internal("join credential issuer"));
+        tracing::warn!("merge credential issuer lock poisoned");
+        return Err(Error::internal("merge credential issuer"));
       }
     };
-    Ok(Some(JoinHint::new(pointer.cluster().clone(), generation)))
+    Ok(Some(MergeHint::new(generation)))
   }
 
   /// Runs the responder (listener) side of one accepted connection.
@@ -202,7 +192,7 @@ impl SessionDriver {
     if result.is_err() {
       // A clean close lets the initiator observe a typed authentication
       // failure instead of an undifferentiated transport error. Early
-      // rejections (rate window, frozen store, cluster mismatch) can race
+      // rejections (rate window, frozen store) can race
       // the initiator's in-flight hello; draining one pending message
       // under a bounded grace keeps the close free of unread inbound bytes
       // (whose reset would mask the typed rejection on some platforms).
@@ -231,15 +221,7 @@ impl SessionDriver {
     // the typed rejection on some platforms).
     self.require_unblocked()?;
 
-    let pointer = crate::identity::genesis::local_cluster(&self.context)
-      .await?
-      .ok_or_else(|| Error::authentication_failed("session cluster"))?;
-    // Early rejection before any signing work: the advertised cluster must
-    // match this receiver's cluster exactly.
-    if peek.cluster != *pointer.cluster() {
-      return Err(Error::authentication_failed("session cluster"));
-    }
-    // A locally revoked identity never completes a new admission through
+    // A locally revoked identity never completes a new merge through
     // this node: the exact revoked binding fails closed before any
     // credential or signing work (T-G09-04, ADR-0006).
     if crate::identity::revocation::is_revoked_ctx(
@@ -259,7 +241,7 @@ impl SessionDriver {
     // mode the peer must already hold a trusted binding.
     let mut reservation = None;
     let (expected_peer, generation, credential) = match peek.mode {
-      HandshakeMode::Join => {
+      HandshakeMode::Merge => {
         let active = {
           let mut issuer = self
             .issuer
@@ -301,7 +283,6 @@ impl SessionDriver {
       HandshakeConfig {
         mode: peek.mode,
         role: Role::Responder,
-        cluster: pointer.cluster().clone(),
         local_id: identity.node().clone(),
         local_key: identity.public_key().clone(),
         expected_peer,
@@ -348,7 +329,7 @@ impl SessionDriver {
       .ok_or_else(|| Error::internal("handshake peer"))?;
     let peer_id = peer_id.clone();
 
-    if peek.mode == HandshakeMode::Join {
+    if peek.mode == HandshakeMode::Merge {
       let result = self
         .commit_and_deliver(&mut handshake, connection, generation)
         .await;
@@ -375,58 +356,47 @@ impl SessionDriver {
     let (peer_id, peer_key) = handshake
       .peer_identity()
       .ok_or_else(|| Error::internal("handshake peer"))?;
-    let generation = generation.ok_or_else(|| Error::internal("join credential generation"))?;
-    let proposal = AdmissionProposal::new(
+    let generation = generation.ok_or_else(|| Error::internal("merge credential generation"))?;
+    let proposal = MergeProposal::new(
       peer_id.clone(),
       peer_key.clone(),
       GenerationId::from_bytes(generation),
-      AdmissionId::generate(self.entropy.as_ref())?,
+      MergeId::generate(self.entropy.as_ref())?,
     );
-    let grant =
-      commit_admission(&self.context, &self.keys, self.entropy.as_ref(), &proposal).await?;
-    let genesis = existing_cluster(&self.context)
-      .await?
-      .ok_or_else(|| Error::internal("session cluster"))?;
-    let payload = encode_grant_payload(&grant, &genesis.digest()?)?;
-    let message = handshake.admission_grant_delivery(&payload)?;
-    send(connection, HandshakeKind::AdmissionGrantDelivery, &message).await
+    let grant = commit_merge(&self.context, &self.keys, self.entropy.as_ref(), &proposal).await?;
+    let payload = grant.encode()?;
+    let message = handshake.merge_grant_delivery(&payload)?;
+    send(connection, HandshakeKind::MergeGrantDelivery, &message).await
   }
 
-  /// Runs the initiator side of a join-mode connection. Returns the
-  /// authenticated session with the issuer and the adopted admission view.
+  /// Runs the initiator side of a merge-mode connection. Returns the
+  /// authenticated session with the adopted merge view.
   ///
   /// The credential is consumed from the caller; the ADR-0001 signing order
   /// is enforced here: the local identity signature is produced only after
   /// the responder proof verifies.
-  pub(crate) async fn join(
-    &self, connection: &mut Connection, hint: &JoinHint, credential: CredentialSecret,
-  ) -> Result<(EstablishedSession, AdmissionView)> {
+  pub(crate) async fn merge(
+    &self, connection: &mut Connection, hint: &MergeHint, credential: CredentialSecret,
+  ) -> Result<(EstablishedSession, MergeView)> {
     timeout(
       AUTHENTICATION_DEADLINE,
-      self.join_inner(connection, hint, credential),
+      self.merge_inner(connection, hint, credential),
     )
     .await
     .map_err(|_| Error::authentication_failed("authentication deadline"))?
   }
 
-  async fn join_inner(
-    &self, connection: &mut Connection, hint: &JoinHint, credential: CredentialSecret,
-  ) -> Result<(EstablishedSession, AdmissionView)> {
+  async fn merge_inner(
+    &self, connection: &mut Connection, hint: &MergeHint, credential: CredentialSecret,
+  ) -> Result<(EstablishedSession, MergeView)> {
     self.require_unblocked()?;
-    if crate::identity::genesis::local_cluster(&self.context)
-      .await?
-      .is_some()
-    {
-      return Err(Error::conflict("local cluster"));
-    }
     let identity = self.context.identity();
     let mut nonce = [0_u8; 32];
     self.entropy.fill(&mut nonce)?;
     let mut handshake = Handshake::new(
       HandshakeConfig {
-        mode: HandshakeMode::Join,
+        mode: HandshakeMode::Merge,
         role: Role::Initiator,
-        cluster: hint.cluster().clone(),
         local_id: identity.node().clone(),
         local_key: identity.public_key().clone(),
         expected_peer: None,
@@ -466,7 +436,7 @@ impl SessionDriver {
     let confirmation = receive_kind(connection, HandshakeKind::SelectionConfirmation).await?;
     handshake.receive(&confirmation.body)?;
 
-    let delivery = receive_kind(connection, HandshakeKind::AdmissionGrantDelivery).await?;
+    let delivery = receive_kind(connection, HandshakeKind::MergeGrantDelivery).await?;
     handshake.receive(&delivery.body)?;
     let payload = handshake
       .grant_delivery()
@@ -474,9 +444,8 @@ impl SessionDriver {
     let (issuer, issuer_key) = handshake
       .peer_identity()
       .ok_or_else(|| Error::internal("handshake peer"))?;
-    let (grant, genesis_digest) = decode_grant_payload(
+    let grant = decode_grant_payload(
       payload,
-      hint.cluster(),
       identity.node(),
       identity.public_key(),
       issuer,
@@ -489,21 +458,10 @@ impl SessionDriver {
     if crate::identity::revocation::is_revoked_ctx(self.context.store(), grant.issuer(), issuer_key)
       .await?
     {
-      return Err(Error::revoked("admission grant issuer"));
+      return Err(Error::revoked("merge grant issuer"));
     }
-    adopt_admission(
-      &self.context,
-      self.entropy.as_ref(),
-      &grant,
-      issuer_key,
-      &genesis_digest,
-    )
-    .await?;
-    let view = AdmissionView::new(
-      grant.cluster().clone(),
-      identity.node().clone(),
-      issuer.clone(),
-    );
+    adopt_merge(&self.context, self.entropy.as_ref(), &grant, issuer_key).await?;
+    let view = MergeView::new(identity.node().clone(), issuer.clone());
     Ok((established(&handshake)?, view))
   }
 
@@ -523,9 +481,6 @@ impl SessionDriver {
     &self, connection: &mut Connection, peer: &NodeId,
   ) -> Result<EstablishedSession> {
     self.require_unblocked()?;
-    let pointer = crate::identity::genesis::local_cluster(&self.context)
-      .await?
-      .ok_or_else(|| Error::not_ready("local cluster"))?;
     let binding = trusted_binding(&self.context, peer).await?;
     let identity = self.context.identity();
     let mut nonce = [0_u8; 32];
@@ -534,7 +489,6 @@ impl SessionDriver {
       HandshakeConfig {
         mode: HandshakeMode::Member,
         role: Role::Initiator,
-        cluster: pointer.cluster().clone(),
         local_id: identity.node().clone(),
         local_key: identity.public_key().clone(),
         expected_peer: Some((peer.clone(), binding)),
@@ -611,12 +565,12 @@ async fn trusted_binding(context: &LocalIdentityContext, peer: &NodeId) -> Resul
 /// generation. Dropping an armed reservation releases it; a failed attempt
 /// never consumes the credential.
 struct CredentialReservation {
-  issuer: Arc<Mutex<JoinCredentialIssuer>>,
+  issuer: Arc<Mutex<MergeCredentialIssuer>>,
   armed: bool,
 }
 
 impl CredentialReservation {
-  fn armed(issuer: Arc<Mutex<JoinCredentialIssuer>>) -> Self {
+  fn armed(issuer: Arc<Mutex<MergeCredentialIssuer>>) -> Self {
     Self {
       issuer,
       armed: true,
@@ -674,57 +628,23 @@ async fn receive_kind(connection: &mut Connection, expected: HandshakeKind) -> R
   }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct GrantPayloadWire {
-  #[n(0)]
-  grant: ByteVec,
-  #[n(1)]
-  genesis_digest: ByteVec,
-}
-
-/// Encodes the position-six grant delivery payload: the canonical signed
-/// grant plus the receiver's cluster genesis digest.
-fn encode_grant_payload(grant: &AdmissionGrantV1, genesis_digest: &Digest) -> Result<Vec<u8>> {
-  crate::protocol::encode_canonical(
-    &GrantPayloadWire {
-      grant: ByteVec::from(grant.encode()?),
-      genesis_digest: ByteVec::from(genesis_digest.as_bytes().to_vec()),
-    },
-    CONTROL_CBOR_LIMITS,
-  )
-}
-
 /// Decodes and strictly validates a position-six grant delivery payload
-/// against the authenticated session: the grant's cluster must equal the
-/// (untrusted) upgrade hint cluster, the subject must be exactly the local
+/// against the authenticated session: the subject must be exactly the local
 /// identity, the issuer must be the authenticated peer, and the issuer
 /// signature must verify against the peer's session key.
 fn decode_grant_payload(
-  payload: &[u8], expected_cluster: &ClusterId, subject: &NodeId, subject_key: &PublicKey,
-  issuer: &NodeId, issuer_key: &PublicKey,
-) -> Result<(AdmissionGrantV1, Digest)> {
-  let wire: GrantPayloadWire = crate::protocol::decode_canonical_strict(
-    payload,
-    CONTROL_CBOR_LIMITS,
-    "admission grant payload canonical",
-  )
-  .map_err(|_| Error::authentication_failed("admission grant payload"))?;
-  let digest: [u8; 32] = wire
-    .genesis_digest
-    .as_slice()
-    .try_into()
-    .map_err(|_| Error::authentication_failed("admission grant payload"))?;
-  let grant = AdmissionGrantV1::decode(wire.grant.as_slice())
-    .map_err(|_| Error::authentication_failed("admission grant"))?;
-  if grant.cluster() != expected_cluster
-    || grant.subject() != subject
+  payload: &[u8], subject: &NodeId, subject_key: &PublicKey, issuer: &NodeId,
+  issuer_key: &PublicKey,
+) -> Result<MergeGrantV1> {
+  let grant =
+    MergeGrantV1::decode(payload).map_err(|_| Error::authentication_failed("merge grant"))?;
+  if grant.subject() != subject
     || grant.subject_key() != subject_key
     || grant.issuer() != issuer
     || grant.issuer() == subject
   {
-    return Err(Error::authentication_failed("admission grant"));
+    return Err(Error::authentication_failed("merge grant"));
   }
   grant.verify(issuer_key)?;
-  Ok((grant, Digest::from_bytes(digest)))
+  Ok(grant)
 }

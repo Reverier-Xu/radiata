@@ -25,7 +25,6 @@ async fn zone_label_converges_to_the_creator_page() {
     .start()
     .await
     .unwrap();
-  creator.command(radiata::CreateCluster::new()).await.unwrap();
   let listener = creator
     .command(radiata::Listen::new(
       radiata::Endpoint::parse("wss://127.0.0.1:0").unwrap(),
@@ -49,15 +48,15 @@ async fn zone_label_converges_to_the_creator_page() {
     .await
     .unwrap();
 
-  let issued = creator.command(radiata::RotateJoinCredential::new()).await.unwrap();
+  let issued = creator.command(radiata::RotateMergeCredential::new()).await.unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   // The first dial can race the accept loop's pre-rotation hint; the
   // accept loop recomputes per connection, so the retry matches.
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
   loop {
-    let credential = radiata::JoinCredential::parse(&secret).unwrap();
+    let credential = radiata::MergeCredential::parse(&secret).unwrap();
     match member
-      .command(radiata::JoinCluster::new(endpoint.clone(), credential))
+      .command(radiata::MergeCluster::new(endpoint.clone(), credential))
       .await
     {
       Ok(_) => break,

@@ -1,5 +1,5 @@
 use crate::{
-  ClusterId, Endpoint, Error, ErrorKind, NodeId, PublicKey, QualifiedTag, Result,
+  Endpoint, Error, ErrorKind, NodeId, PublicKey, QualifiedTag, Result,
   identity::{ListenerId, SessionId},
 };
 
@@ -21,57 +21,26 @@ pub enum ShutdownReason {
   Fatal(ErrorKind),
 }
 
-/// The created or existing local cluster returned by `CreateCluster`.
+/// The completed merge returned by `MergeCluster` (ADR-0009 decision 2).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterView {
-  cluster_id: ClusterId,
-  creator: NodeId,
+pub struct MergeView {
+  node: NodeId,
+  peer: NodeId,
 }
 
-impl ClusterView {
-  pub fn cluster_id(&self) -> &ClusterId {
-    &self.cluster_id
+impl MergeView {
+  /// The local node that adopted the issuer's binding.
+  pub fn node(&self) -> &NodeId {
+    &self.node
   }
 
-  pub fn creator(&self) -> &NodeId {
-    &self.creator
+  /// The authenticated merge peer whose binding was adopted.
+  pub fn peer(&self) -> &NodeId {
+    &self.peer
   }
 
-  pub(crate) const fn new(cluster_id: ClusterId, creator: NodeId) -> Self {
-    Self {
-      cluster_id,
-      creator,
-    }
-  }
-}
-
-/// The completed admission returned by `JoinCluster`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdmissionView {
-  cluster_id: ClusterId,
-  admitted_node: NodeId,
-  issuer: NodeId,
-}
-
-impl AdmissionView {
-  pub fn cluster_id(&self) -> &ClusterId {
-    &self.cluster_id
-  }
-
-  pub fn admitted_node(&self) -> &NodeId {
-    &self.admitted_node
-  }
-
-  pub fn issuer(&self) -> &NodeId {
-    &self.issuer
-  }
-
-  pub(crate) const fn new(cluster_id: ClusterId, admitted_node: NodeId, issuer: NodeId) -> Self {
-    Self {
-      cluster_id,
-      admitted_node,
-      issuer,
-    }
+  pub(crate) const fn new(node: NodeId, peer: NodeId) -> Self {
+    Self { node, peer }
   }
 }
 
@@ -313,19 +282,14 @@ impl ObservabilitySnapshot {
   }
 }
 
-/// The local node's identity and cluster membership.
+/// The local node's identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalNodeView {
-  cluster_id: ClusterId,
   node_id: NodeId,
   public_key: PublicKey,
 }
 
 impl LocalNodeView {
-  pub fn cluster_id(&self) -> &ClusterId {
-    &self.cluster_id
-  }
-
   pub fn node_id(&self) -> &NodeId {
     &self.node_id
   }
@@ -334,9 +298,8 @@ impl LocalNodeView {
     &self.public_key
   }
 
-  pub(crate) const fn new(cluster_id: ClusterId, node_id: NodeId, public_key: PublicKey) -> Self {
+  pub(crate) const fn new(node_id: NodeId, public_key: PublicKey) -> Self {
     Self {
-      cluster_id,
       node_id,
       public_key,
     }

@@ -10,7 +10,7 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  BoxFuture, CreateCluster, Endpoint, ErrorKind, EventOptions, EventReceive, GetResource, Listen,
+  BoxFuture, Endpoint, ErrorKind, EventOptions, EventReceive, GetResource, Listen,
   LoadBalancingPolicy, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageListeners, PageMembers,
   PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition, ProtocolTag,
   PutResource, RemoveResource, ResourceChanged, ResourceLabels, ResourceName, ResourceUri,
@@ -343,12 +343,11 @@ async fn e2e08_resources_revoke_and_leave() {
     handle: issuer_handle,
     endpoint: Endpoint::parse("wss://127.0.0.1:0").unwrap(),
   };
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
 
   let mut member = start_node(1, false).await;
   member.endpoint = listen(&member).await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
   let member_id = member
     .handle
     .query(radiata::GetLocalNode::new())
@@ -481,12 +480,11 @@ async fn g9_facade_core_only_operations() {
     });
   }
   let issuer = start_node(0, true).await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
 
   let mut member = start_node(1, true).await;
   member.endpoint = listen(&member).await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
   let member_id = member
     .handle
     .query(radiata::GetLocalNode::new())
@@ -740,12 +738,11 @@ async fn g9_facade_core_only_operations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g9_resource_labels_never_enable_protocols() {
   let issuer = start_node(0, false).await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
 
   let mut member = start_node(1, false).await;
   member.endpoint = listen(&member).await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
 
   // A resource claiming to be the echo protocol.
   member

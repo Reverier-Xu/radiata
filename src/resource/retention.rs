@@ -180,7 +180,7 @@ mod tests {
 
   use super::sweep_removed_ctx;
   use crate::{
-    ClusterId, LabelKey, LabelSet, LabelValue, NodeId,
+    LabelKey, LabelSet, LabelValue, NodeId,
     api::SystemEntropy,
     provider::StorageFactory,
     resource::{ResourceName, ResourceRecordV1},
@@ -206,7 +206,6 @@ mod tests {
     name: &ResourceName, timestamp_millis: u64, removed: bool, uri: &str,
   ) -> ResourceRecordV1 {
     ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       name.clone(),
       LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse(uri).unwrap(),

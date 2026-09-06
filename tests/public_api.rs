@@ -21,21 +21,21 @@ use std::{
 #[cfg(all(feature = "json", unix))]
 use radiata::adapters::json_store;
 use radiata::{
-  AdmissionView, BoxFuture, ChannelBinding, ClusterId, ClusterView, CommitOutcome, CommitReceipt,
-  ConnectMember, ConnectivityStatus, CreateCluster, CreatedKey, DeliveryAck, Digest,
-  DisconnectPeer, Discovery, DiscoveryPage, Endpoint, EndpointCandidate, EventOptions,
-  EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag, GetLocalNode,
-  GetMember, GetNodeStatus, GetObservability, GetResource, GetRoute, IncomingStream,
-  IssuedJoinCredential, JoinCluster, JoinCredential, KeyCapabilities, KeyCreateState,
+  BoxFuture, ChannelBinding, CommitOutcome, CommitReceipt, ConnectMember, ConnectivityStatus,
+  CreatedKey, DeliveryAck, Digest, DisconnectPeer, Discovery, DiscoveryPage, Endpoint,
+  EndpointCandidate, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
+  FeatureDefinition, FeatureTag, GetLocalNode, GetMember, GetNodeStatus, GetObservability,
+  GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster,
-  LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView, NodeBuilder,
-  NodeConfig, NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus,
-  ObservabilitySnapshot, OutboundStream, PacketConsumer, PageCursor, PageListeners, PageMembers,
-  PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition, ProtocolTag,
-  PutResource, QualifiedTag, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
+  LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView,
+  MergeCluster, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId,
+  NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
+  PacketConsumer, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
+  PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
+  RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
   ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result,
-  RotateJoinCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy,
+  RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy,
   SelectResources, Selector, SessionChanged, SessionView, Shutdown, ShutdownOutcome,
   ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities, StoreEntry, StoreKey,
   StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
@@ -55,9 +55,6 @@ fn boundary_values_construct_parse_and_round_trip() {
   let node = NodeId::parse("node_0000000000000000000A1").unwrap();
   assert_eq!(node.as_str(), "node_0000000000000000000A1");
   assert_eq!(node.to_string().parse::<NodeId>().unwrap(), node);
-
-  let cluster = ClusterId::parse("cluster_0000000000000000000B2").unwrap();
-  assert_eq!(cluster.as_str(), "cluster_0000000000000000000B2");
 
   let txn = TransactionId::parse("txn_0000000000000000000C3").unwrap();
   assert_eq!(txn.as_str(), "txn_0000000000000000000C3");
@@ -102,7 +99,7 @@ fn boundary_values_construct_parse_and_round_trip() {
   assert_eq!(labels.get(&key), Some(&value));
 
   let credential =
-    JoinCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+    MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
   assert_eq!(
     credential.expose_secret(),
     "join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -145,7 +142,7 @@ fn page_specs_and_cursors() {
 
 /// An external key provider implementing the complete open SPI with real
 /// Ed25519 custody: deterministic keys from fixed seeds, exact handle
-/// records, and genuine signatures (the join protocol verifies them).
+/// records, and genuine signatures (the merge protocol verifies them).
 #[derive(Debug, Default)]
 struct PubKeys {
   records: Mutex<std::collections::BTreeMap<Vec<u8>, ed25519_dalek::SigningKey>>,
@@ -698,10 +695,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let keys: Arc<dyn KeyProvider> = PubKeys::new();
 
   let issuer = start(factory.clone(), keys.clone()).await;
-  let cluster: ClusterView = issuer.handle.command(CreateCluster::new()).await.unwrap();
   let endpoint = listen(&issuer).await;
   let local: LocalNodeView = issuer.handle.query(GetLocalNode::new()).await.unwrap();
-  assert_eq!(local.cluster_id(), cluster.cluster_id());
   let issuer_id: NodeId = local.node_id().clone();
   assert_eq!(local.public_key().as_bytes().len(), 32);
 
@@ -711,21 +706,20 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // External provider SPI is honored through a second node.
   let member_factory: Arc<dyn StorageFactory> = Arc::new(PubStoreFactory);
   let member = start(member_factory, keys).await;
-  let issued: IssuedJoinCredential = issuer
+  let issued: IssuedMergeCredential = issuer
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let expires = issued.expires_at();
   let _ = expires;
-  let admission: AdmissionView = join_with_retry(
+  let merge: MergeView = merge_with_retry(
     &member.handle,
     &endpoint,
     issued.into_credential().expose_secret(),
   )
   .await;
-  assert_eq!(admission.cluster_id(), cluster.cluster_id());
-  let member_id: NodeId = admission.admitted_node().clone();
+  let member_id: NodeId = merge.node().clone();
 
   // Sessions, members, trust, topology pages, and views.
   wait_for_session(&member).await;
@@ -1160,23 +1154,23 @@ async fn listen(node: &Node) -> Endpoint {
   listener.endpoint().clone()
 }
 
-async fn join_with_retry(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> AdmissionView {
+async fn merge_with_retry(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> MergeView {
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   loop {
     match node
-      .command(JoinCluster::new(
+      .command(MergeCluster::new(
         endpoint.clone(),
-        JoinCredential::parse(secret).unwrap(),
+        MergeCredential::parse(secret).unwrap(),
       ))
       .await
     {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
-        // Pace the retries outside the fixed per-source admission window
+        // Pace the retries outside the fixed per-source merge window
         // (sixteen attempts per minute).
         tokio::time::sleep(Duration::from_secs(5)).await;
       }
-      Err(error) => panic!("join never succeeded: {error:?}"),
+      Err(error) => panic!("merge never succeeded: {error:?}"),
     }
   }
 }

@@ -16,10 +16,10 @@ use std::{
 };
 
 use radiata::{
-  ConnectMember, CreateCluster, DisconnectPeer, ErrorKind, GetRoute, IncomingStream, JoinCluster,
-  Listen, NodeBuilder, NodeConfig, NodeHandle, PacketConsumer, PageTopology, ProtocolTag,
-  QualifiedTag, RotateJoinCredential, RouteNextHop, RouteState, RoutingPolicy, Shutdown,
-  StreamMetadata, StreamPolicy, StreamTarget,
+  ConnectMember, DisconnectPeer, ErrorKind, GetRoute, IncomingStream, Listen, MergeCluster,
+  NodeBuilder, NodeConfig, NodeHandle, PacketConsumer, PageTopology, ProtocolTag, QualifiedTag,
+  RotateMergeCredential, RouteNextHop, RouteState, RoutingPolicy, Shutdown, StreamMetadata,
+  StreamPolicy, StreamTarget,
 };
 
 mod common;
@@ -260,17 +260,23 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     nodes.push(start_node(seed as u64, Arc::clone(collector), Arc::clone(&table)).await);
   }
 
-  // Cluster genesis on A names its identity; members can only listen once
-  // their own node knows the cluster, so joins happen before the member
-  // listeners come up and each admission reports the member's identity.
-  let cluster = nodes[0].handle.command(CreateCluster::new()).await.unwrap();
-  nodes[0].set_id(cluster.creator().clone());
+  // Merge anchor: A's own identity comes from its local view; members
+  // learn theirs from the merge view. Merges happen before the member
+  // listeners come up and each merge reports the member's identity.
+  let anchor_id = nodes[0]
+    .handle
+    .query(radiata::GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  nodes[0].set_id(anchor_id);
   nodes[0].listen().await;
 
   for member_index in 1..=3usize {
     let issued = nodes[0]
       .handle
-      .command(RotateJoinCredential::new())
+      .command(RotateMergeCredential::new())
       .await
       .unwrap();
     let secret = issued.credential().expose_secret().to_owned();
@@ -280,14 +286,14 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
       attempts += 1;
       let result = nodes[member_index]
         .handle
-        .command(JoinCluster::new(
+        .command(MergeCluster::new(
           nodes[0].endpoint().clone(),
-          radiata::JoinCredential::parse(&secret).unwrap(),
+          radiata::MergeCredential::parse(&secret).unwrap(),
         ))
         .await;
       match result {
         Ok(view) => {
-          nodes[member_index].set_id(view.admitted_node().clone());
+          nodes[member_index].set_id(view.node().clone());
           break;
         }
         // Exponential pacing keeps the retries outside the fixed

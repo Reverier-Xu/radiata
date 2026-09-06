@@ -58,6 +58,12 @@ const FRESH_START_EVENTS: &[&str] = &[
   // leave resumes before the node serves.
   "snapshot",
   "get",
+  // Born-with-cluster (ADR-0009): the self-binding check and its
+  // conditional commit close startup.
+  "snapshot",
+  "get",
+  "entropy",
+  "commit",
 ];
 
 struct Providers {
@@ -120,7 +126,7 @@ async fn storage_runtime_success_orders_storage_probe_before_identity_and_releas
     "startup must open and probe storage, then probe key capabilities, then run identity calls",
   );
   assert_eq!(providers.factory.open_calls(), 1);
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
   let calls = providers.keys.take_calls();
   assert!(
     matches!(
@@ -135,7 +141,7 @@ async fn storage_runtime_success_orders_storage_probe_before_identity_and_releas
 
   handle.command(Shutdown::new()).await.unwrap();
   assert_eq!(providers.storage_drops.count(), 1);
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
   assert_eq!(providers.keys.take_calls(), vec![]);
   drop(providers.factory);
   drop(providers.keys);

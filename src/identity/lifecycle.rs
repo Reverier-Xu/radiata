@@ -29,8 +29,9 @@
 use std::{sync::Arc, time::Duration};
 
 use super::records::{
-  KeyCreationIntentV1, LocalIdentityV1, key_creation_intent_key, key_creation_intent_namespace,
-  key_deleted_key, key_deletion_intent_key, local_identity_key,
+  IdentityBindingV1, KeyCreationIntentV1, LocalIdentityV1, identity_binding_key,
+  key_creation_intent_key, key_creation_intent_namespace, key_deleted_key, key_deletion_intent_key,
+  local_identity_key,
 };
 use crate::{
   CommitOutcome, CreatedKey, Error, KeyCreateState, KeyOperationId, NodeId, ProviderErrorContext,
@@ -73,6 +74,59 @@ impl LocalIdentityContext {
   pub(crate) fn replace_identity(&mut self, identity: LocalIdentityV1) {
     self.identity = identity;
   }
+}
+
+/// Ensures the born-with-cluster self binding exists (ADR-0009 decision 1):
+/// every started node holds its own immutable `IdentityBindingV1`, so a fresh
+/// node is a singleton cluster of one and merge needs no genesis ceremony.
+///
+/// Idempotent get-or-create through one conditional transaction: an existing
+/// binding for the local node must match the identity exactly, anything else
+/// is storage corruption. A conflict or unknown outcome resolves by
+/// authoritative re-read, accepting only the exact same binding.
+pub(crate) async fn ensure_self_binding(
+  context: &LocalIdentityContext, entropy: &dyn Entropy,
+) -> Result<()> {
+  let store = context.store();
+  let identity = context.identity();
+  let (namespace, key) = identity_binding_key(identity.node())?;
+  let expected = IdentityBindingV1::new(identity.node().clone(), identity.public_key().clone());
+  let snapshot = store.snapshot().await?;
+  if let Some(existing) = snapshot.get(&namespace, &key).await? {
+    return expect_exact_self_binding(existing.as_bytes(), identity);
+  }
+  let transaction = store.prepare_transaction(
+    TransactionId::generate(entropy)?,
+    snapshot.revision().clone(),
+    vec![StoreOperation::Put {
+      namespace: namespace.clone(),
+      key: key.clone(),
+      expected: StoreExpectation::Absent,
+      value: StoreValue::new(Arc::from(expected.encode()?)),
+    }],
+  )?;
+  drop(snapshot);
+  match store.commit(transaction).await? {
+    CommitOutcome::Committed(_) => Ok(()),
+    CommitOutcome::Aborted | CommitOutcome::Conflict | CommitOutcome::Unknown { .. } => {
+      // A concurrent or equivocated outcome resolves only to the exact
+      // same self binding; anything else fails closed.
+      let snapshot = store.snapshot().await?;
+      let existing = snapshot
+        .get(&namespace, &key)
+        .await?
+        .ok_or_else(|| Error::conflict("self binding"))?;
+      expect_exact_self_binding(existing.as_bytes(), identity)
+    }
+  }
+}
+
+fn expect_exact_self_binding(bytes: &[u8], identity: &LocalIdentityV1) -> Result<()> {
+  let binding = IdentityBindingV1::decode(bytes).map_err(|_| discovery_corrupt())?;
+  if binding.node() != identity.node() || binding.public_key() != identity.public_key() {
+    return Err(discovery_corrupt());
+  }
+  Ok(())
 }
 
 /// Opens or creates the local node identity with exact crash recovery.

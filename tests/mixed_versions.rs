@@ -12,11 +12,11 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  ConnectMember, CreateCluster, DisconnectPeer, Endpoint, ErrorKind, FeatureDefinition, FeatureTag,
-  GetMember, GetResource, JoinCluster, Listen, LoadBalancingPolicy, NodeBuilder, NodeConfig,
-  NodeHandle, PageMembers, PageSessions, PageSpec, PageTrust, ProtocolDefinition, ProtocolTag,
-  QualifiedTag, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result,
-  RotateJoinCredential, StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
+  ConnectMember, DisconnectPeer, Endpoint, ErrorKind, FeatureDefinition, FeatureTag, GetMember,
+  GetResource, Listen, LoadBalancingPolicy, MergeCluster, NodeBuilder, NodeConfig, NodeHandle,
+  PageMembers, PageSessions, PageSpec, PageTrust, ProtocolDefinition, ProtocolTag, QualifiedTag,
+  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, RotateMergeCredential,
+  StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
 };
 
 mod common;
@@ -211,12 +211,19 @@ impl Node {
 /// credential issuer; `member` joins as the initiator. Returns the
 /// member's node id.
 async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeId {
-  let cluster = issuer.handle.command(CreateCluster::new()).await.unwrap();
-  issuer.id = Some(cluster.creator().clone());
+  issuer.id = Some(
+    issuer
+      .handle
+      .query(radiata::GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id()
+      .clone(),
+  );
   issuer.listen().await;
   let issued = issuer
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
@@ -226,14 +233,14 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
     attempts += 1;
     match member
       .handle
-      .command(JoinCluster::new(
+      .command(MergeCluster::new(
         issuer.endpoint().clone(),
-        radiata::JoinCredential::parse(&secret).unwrap(),
+        radiata::MergeCredential::parse(&secret).unwrap(),
       ))
       .await
     {
       Ok(view) => {
-        member.id = Some(view.admitted_node().clone());
+        member.id = Some(view.node().clone());
         break;
       }
       Err(_) if std::time::Instant::now() < deadline => {
@@ -615,20 +622,27 @@ async fn e2e09_incompatible_required_features_are_refused_in_both_roles() {
   // Current initiator requires the current-only feature; the prior
   // responder never published it.
   let mut issuer = start_node(5, false).await;
-  let cluster = issuer.handle.command(CreateCluster::new()).await.unwrap();
-  issuer.id = Some(cluster.creator().clone());
+  issuer.id = Some(
+    issuer
+      .handle
+      .query(radiata::GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id()
+      .clone(),
+  );
   issuer.listen().await;
   let joiner = start_node_requiring(6, CURRENT_FEATURE, true).await;
   let issued = issuer
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let error = joiner
     .handle
-    .command(JoinCluster::new(
+    .command(MergeCluster::new(
       issuer.endpoint().clone(),
-      radiata::JoinCredential::parse(issued.credential().expose_secret()).unwrap(),
+      radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
     ))
     .await
     .unwrap_err();
@@ -660,24 +674,27 @@ async fn e2e09_incompatible_required_features_are_refused_in_both_roles() {
   // Prior initiator requires a prior-only feature; the current responder
   // has never published it.
   let mut prior_issuer = start_node(7, false).await;
-  let cluster = prior_issuer
-    .handle
-    .command(CreateCluster::new())
-    .await
-    .unwrap();
-  prior_issuer.id = Some(cluster.creator().clone());
+  prior_issuer.id = Some(
+    prior_issuer
+      .handle
+      .query(radiata::GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id()
+      .clone(),
+  );
   prior_issuer.listen().await;
   let prior_joiner = start_node_requiring(8, PRIOR_FEATURE, true).await;
   let issued = prior_issuer
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let error = prior_joiner
     .handle
-    .command(JoinCluster::new(
+    .command(MergeCluster::new(
       prior_issuer.endpoint().clone(),
-      radiata::JoinCredential::parse(issued.credential().expose_secret()).unwrap(),
+      radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
     ))
     .await
     .unwrap_err();

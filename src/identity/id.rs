@@ -85,7 +85,6 @@ macro_rules! canonical_id {
 }
 
 canonical_id!(NodeId, "node_", "node id");
-canonical_id!(ClusterId, "cluster_", "cluster id");
 canonical_id!(TraceId, "trace_", "trace id");
 canonical_id!(TransactionId, "txn_", "transaction id");
 canonical_id!(ListenerId, "listener_", "listener id");
@@ -112,7 +111,6 @@ macro_rules! generated_id {
 }
 
 generated_id!(NodeId, "node_");
-generated_id!(ClusterId, "cluster_");
 generated_id!(TraceId, "trace_");
 generated_id!(TransactionId, "txn_");
 generated_id!(ListenerId, "listener_");

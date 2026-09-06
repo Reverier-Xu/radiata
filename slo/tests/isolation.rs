@@ -60,8 +60,8 @@ fn controller_never_binds_its_own_listener() {
   let text = fs::read_to_string("src/bin/slo-controller.rs").expect("controller source is present");
   for token in [
     "Listen::new",
-    "CreateCluster::new",
-    "RotateJoinCredential::new",
+    "MergeCluster::new",
+    "RotateMergeCredential::new",
   ] {
     assert!(
       !text.contains(token),

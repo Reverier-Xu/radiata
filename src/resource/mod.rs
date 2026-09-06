@@ -14,7 +14,7 @@
 //! future-dated writer can dominate until wall time catches up.
 //!
 //! Every record is signed by its writer over the canonical unsigned body,
-//! and every field mutation (cluster, name, labels, timestamp, writer,
+//! and every field mutation (name, labels, timestamp, writer,
 //! removal rank, digest, or signature) fails verification before any
 //! comparison or persistence.
 
@@ -25,8 +25,7 @@ use std::{fmt, sync::Arc};
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{
-  ClusterId, Digest, Error, LabelSet, LabelValue, NodeId, PublicKey, QualifiedTag, Result,
-  Signature,
+  Digest, Error, LabelSet, LabelValue, NodeId, PublicKey, QualifiedTag, Result, Signature,
   identity::signature::{body_digest, signature_message, verify_strict},
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
   time,
@@ -289,31 +288,29 @@ struct ResourceRecordBodyWire {
   #[n(1)]
   record_version: u16,
   #[n(2)]
-  cluster_id: String,
-  #[n(3)]
   name: String,
   /// Reserved type label value (opaque bounded UTF-8).
-  #[n(4)]
+  #[n(3)]
   resource_type: String,
   /// Reserved URI label value; core never follows it.
-  #[n(5)]
+  #[n(4)]
   resource_uri: String,
   /// Canonical custom labels: key/value pairs sorted by key text, unique
   /// keys (the `LabelSet` invariant).
-  #[n(6)]
+  #[n(5)]
   labels: Vec<(String, String)>,
   /// Signed host wall-clock UNIX milliseconds (the tuple's first element).
-  #[n(7)]
+  #[n(6)]
   timestamp_millis: u64,
-  #[n(8)]
+  #[n(7)]
   writer: String,
   /// Removal rank: orders removal evidence against same-writer writes at
   /// the same timestamp (the tuple's third element).
-  #[n(9)]
+  #[n(8)]
   removal_rank: u64,
   /// Whether this record removes the named resource rather than asserting
   /// live metadata.
-  #[n(10)]
+  #[n(9)]
   removed: bool,
 }
 
@@ -327,33 +324,30 @@ struct ResourceRecordWire {
   #[n(1)]
   record_version: u16,
   #[n(2)]
-  cluster_id: String,
-  #[n(3)]
   name: String,
-  #[n(4)]
+  #[n(3)]
   resource_type: String,
-  #[n(5)]
+  #[n(4)]
   resource_uri: String,
-  #[n(6)]
+  #[n(5)]
   labels: Vec<(String, String)>,
-  #[n(7)]
+  #[n(6)]
   timestamp_millis: u64,
-  #[n(8)]
+  #[n(7)]
   writer: String,
-  #[n(9)]
+  #[n(8)]
   removal_rank: u64,
-  #[n(10)]
+  #[n(9)]
   removed: bool,
-  #[n(11)]
+  #[n(10)]
   digest: ByteVec,
-  #[n(12)]
+  #[n(11)]
   signature: ByteVec,
 }
 
 /// One signed multiwriter resource-metadata record (ADR-0007).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceRecordV1 {
-  cluster: ClusterId,
   name: ResourceName,
   resource_type: LabelValue,
   resource_uri: ResourceUri,
@@ -370,15 +364,13 @@ impl ResourceRecordV1 {
   /// Encodes the canonical unsigned body that `writer` signs.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn encode_signed_body(
-    cluster: &ClusterId, name: &ResourceName, resource_type: &LabelValue,
-    resource_uri: &ResourceUri, labels: &LabelSet, timestamp_millis: u64, writer: &NodeId,
-    removal_rank: u64, removed: bool,
+    name: &ResourceName, resource_type: &LabelValue, resource_uri: &ResourceUri, labels: &LabelSet,
+    timestamp_millis: u64, writer: &NodeId, removal_rank: u64, removed: bool,
   ) -> Result<Vec<u8>> {
     encode_canonical(
       &ResourceRecordBodyWire {
         schema: RESOURCE_RECORD_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
-        cluster_id: cluster.as_str().to_owned(),
         name: name.as_str().to_owned(),
         resource_type: resource_type.as_str().to_owned(),
         resource_uri: resource_uri.as_str().to_owned(),
@@ -400,12 +392,10 @@ impl ResourceRecordV1 {
   /// caller's key provider).
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn seal(
-    cluster: ClusterId, name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri,
-    labels: LabelSet, timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
-    signature: Signature,
+    name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
+    timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool, signature: Signature,
   ) -> Result<Self> {
     let body = Self::encode_signed_body(
-      &cluster,
       &name,
       &resource_type,
       &resource_uri,
@@ -417,7 +407,6 @@ impl ResourceRecordV1 {
     )?;
     Self::seal_prepared(
       body,
-      cluster,
       name,
       resource_type,
       resource_uri,
@@ -434,12 +423,11 @@ impl ResourceRecordV1 {
   /// (shared by `sign`, `sign_with_provider`, and the write-shape probe).
   #[allow(clippy::too_many_arguments)]
   fn seal_prepared(
-    body: Vec<u8>, cluster: ClusterId, name: ResourceName, resource_type: LabelValue,
-    resource_uri: ResourceUri, labels: LabelSet, timestamp_millis: u64, writer: NodeId,
-    removal_rank: u64, removed: bool, signature: Signature,
+    body: Vec<u8>, name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri,
+    labels: LabelSet, timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
+    signature: Signature,
   ) -> Result<Self> {
     Ok(Self {
-      cluster,
       name,
       resource_type,
       resource_uri,
@@ -458,12 +446,11 @@ impl ResourceRecordV1 {
   /// [`ResourceRecordV1::sign_with_provider`]).
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn sign(
-    cluster: ClusterId, name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri,
-    labels: LabelSet, timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
+    name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
+    timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
     signing_key: &ed25519_dalek::SigningKey,
   ) -> Result<Self> {
     let body = Self::encode_signed_body(
-      &cluster,
       &name,
       &resource_type,
       &resource_uri,
@@ -481,7 +468,6 @@ impl ResourceRecordV1 {
     );
     Self::seal_prepared(
       body,
-      cluster,
       name,
       resource_type,
       resource_uri,
@@ -500,12 +486,11 @@ impl ResourceRecordV1 {
   /// remove, no double encode, no transposable argument lists).
   #[allow(clippy::too_many_arguments)]
   pub(crate) async fn sign_with_provider(
-    cluster: ClusterId, name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri,
-    labels: LabelSet, timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
+    name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
+    timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
     keys: &Arc<dyn crate::provider::KeyProvider>, handle: &crate::KeyHandle,
   ) -> Result<Self> {
     let body = Self::encode_signed_body(
-      &cluster,
       &name,
       &resource_type,
       &resource_uri,
@@ -520,7 +505,6 @@ impl ResourceRecordV1 {
       .await?;
     Self::seal_prepared(
       body,
-      cluster,
       name,
       resource_type,
       resource_uri,
@@ -535,11 +519,6 @@ impl ResourceRecordV1 {
 
   /// Accessors awaiting their store/sync consumers (T-G07-03/04) follow;
   /// the record shape is frozen here so those gates cannot drift it.
-  #[allow(dead_code)]
-  pub(crate) const fn cluster(&self) -> &ClusterId {
-    &self.cluster
-  }
-
   pub(crate) const fn name(&self) -> &ResourceName {
     &self.name
   }
@@ -589,7 +568,6 @@ impl ResourceRecordV1 {
       &ResourceRecordWire {
         schema: RESOURCE_RECORD_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
-        cluster_id: self.cluster.as_str().to_owned(),
         name: self.name.as_str().to_owned(),
         resource_type: self.resource_type.as_str().to_owned(),
         resource_uri: self.resource_uri.as_str().to_owned(),
@@ -618,7 +596,6 @@ impl ResourceRecordV1 {
     if wire.schema != RESOURCE_RECORD_SCHEMA || wire.record_version != RECORD_VERSION {
       return Err(Error::invalid_input("resource record schema"));
     }
-    let cluster = ClusterId::parse(&wire.cluster_id)?;
     let name = ResourceName::parse(&wire.name)?;
     let resource_type = LabelValue::parse(&wire.resource_type)?;
     let resource_uri = ResourceUri::parse(&wire.resource_uri)?;
@@ -628,7 +605,6 @@ impl ResourceRecordV1 {
     }
     let writer = NodeId::parse(&wire.writer)?;
     let record = Self {
-      cluster,
       name,
       resource_type,
       resource_uri,
@@ -661,7 +637,6 @@ impl ResourceRecordV1 {
   /// Encodes the canonical unsigned body of this record's fields.
   fn signed_body(&self) -> Result<Vec<u8>> {
     Self::encode_signed_body(
-      &self.cluster,
       &self.name,
       &self.resource_type,
       &self.resource_uri,
@@ -714,10 +689,8 @@ impl ResourceRecordV1 {
 /// placeholder signature, so an accepted write can never exceed the record
 /// budget when the runtime stamps and signs it.
 pub(crate) fn check_write_shape(name: &ResourceName, labels: &ResourceLabels) -> Result<()> {
-  let cluster = ClusterId::parse("cluster_000000000000000000001")?;
   let writer = NodeId::parse("node_000000000000000000001")?;
   let probe = ResourceRecordV1::seal(
-    cluster,
     name.clone(),
     labels.resource_type().clone(),
     labels.uri().clone(),
@@ -756,7 +729,7 @@ mod tests {
   use super::{
     RESERVED_TYPE_LABEL_KEY, RESERVED_URI_LABEL_KEY, ResourceName, ResourceRecordV1, ResourceUri,
   };
-  use crate::{ClusterId, LabelKey, LabelSet, LabelValue, NodeId};
+  use crate::{LabelKey, LabelSet, LabelValue, NodeId};
 
   const SEED: [u8; 32] = [11; 32];
   const OTHER_SEED: [u8; 32] = [13; 32];
@@ -789,7 +762,6 @@ mod tests {
     labels: &LabelSet, resource_type: &str, uri: &str, seed: [u8; 32],
   ) -> ResourceRecordV1 {
     ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       name.clone(),
       LabelValue::parse(resource_type).unwrap(),
       ResourceUri::parse(uri).unwrap(),
@@ -820,22 +792,20 @@ mod tests {
   /// vector; deterministic CBOR plus the ed25519 signature over the
   /// domain-separated digest of seed `[11; 32]`).
   const GOLDEN_RESOURCE_RECORD_V1: &[u8] = &[
-    141, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
+    140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 114, 101, 115, 111, 117, 114, 99, 101, 45, 114,
-    101, 99, 111, 114, 100, 45, 118, 49, 1, 120, 29, 99, 108, 117, 115, 116, 101, 114, 95, 48, 48,
-    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 120, 40, 114, 97,
-    100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115,
-    111, 117, 114, 99, 101, 115, 47, 100, 101, 109, 111, 45, 111, 98, 106, 101, 99, 116, 104, 100,
-    111, 99, 117, 109, 101, 110, 116, 109, 102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47,
-    97, 129, 130, 120, 24, 101, 120, 97, 109, 112, 108, 101, 46, 111, 114, 103, 47, 108, 97, 98,
-    101, 108, 115, 47, 111, 119, 110, 101, 114, 102, 116, 101, 97, 109, 45, 97, 25, 3, 232, 120,
-    26, 110, 111, 100, 101, 95, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-    48, 48, 48, 49, 0, 244, 88, 32, 220, 27, 50, 253, 238, 218, 104, 188, 224, 82, 105, 103, 200,
-    184, 26, 194, 74, 39, 188, 133, 163, 237, 252, 0, 134, 157, 82, 36, 16, 83, 255, 250, 88, 64,
-    195, 184, 165, 166, 71, 146, 160, 167, 150, 172, 165, 15, 149, 143, 112, 15, 147, 242, 169,
-    121, 236, 152, 216, 79, 254, 48, 235, 21, 124, 140, 139, 149, 221, 125, 71, 137, 125, 205, 132,
-    119, 138, 156, 182, 192, 205, 36, 153, 90, 50, 225, 236, 136, 73, 46, 215, 197, 159, 160, 63,
-    81, 90, 11, 204, 13,
+    101, 99, 111, 114, 100, 45, 118, 49, 1, 120, 40, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111,
+    111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115, 111, 117, 114, 99, 101, 115, 47, 100,
+    101, 109, 111, 45, 111, 98, 106, 101, 99, 116, 104, 100, 111, 99, 117, 109, 101, 110, 116, 109,
+    102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 97, 129, 130, 120, 24, 101, 120, 97,
+    109, 112, 108, 101, 46, 111, 114, 103, 47, 108, 97, 98, 101, 108, 115, 47, 111, 119, 110, 101,
+    114, 102, 116, 101, 97, 109, 45, 97, 25, 3, 232, 120, 26, 110, 111, 100, 101, 95, 48, 48, 48,
+    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 0, 244, 88, 32, 55,
+    144, 174, 137, 225, 205, 1, 83, 220, 226, 186, 236, 153, 35, 165, 47, 158, 35, 248, 226, 230,
+    0, 124, 197, 132, 141, 31, 232, 177, 178, 138, 6, 88, 64, 182, 72, 247, 81, 196, 123, 191, 104,
+    27, 55, 95, 49, 80, 60, 153, 241, 195, 104, 93, 241, 101, 70, 164, 246, 119, 62, 9, 116, 221,
+    229, 144, 215, 176, 246, 26, 166, 236, 211, 225, 81, 205, 232, 215, 64, 146, 133, 44, 255, 214,
+    128, 48, 195, 186, 168, 42, 111, 34, 109, 168, 163, 193, 24, 123, 1,
   ];
 
   fn writer_key_of(seed: [u8; 32]) -> crate::PublicKey {
@@ -1054,7 +1024,6 @@ mod tests {
       SEED,
     );
     let equivocate_b = ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       name(),
       LabelValue::parse("a").unwrap(),
       ResourceUri::parse("u://two").unwrap(),
@@ -1074,13 +1043,6 @@ mod tests {
     // Byte-identical replay is idempotent.
     let decoded = ResourceRecordV1::decode(&equivocate_a.encode().unwrap()).unwrap();
     assert_eq!(&decoded, &equivocate_a);
-  }
-
-  #[test]
-  fn tmp_dump_resource_goldens() {
-    println!("BASE: {:02x?}", base_record().encode().unwrap());
-    println!("LIVE: {:02x?}", g9_live_record().encode().unwrap());
-    println!("REMOVAL: {:02x?}", g9_removal_record().encode().unwrap());
   }
 
   /// Golden vector: the exact canonical bytes of one fixed record are
@@ -1224,42 +1186,39 @@ mod tests {
   /// the ed25519 signature over the domain-separated digest of seed
   /// `[11; 32]`).
   const GOLDEN_RESOURCE_LIVE_G9: &[u8] = &[
-    141, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
+    140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 114, 101, 115, 111, 117, 114, 99, 101, 45, 114,
-    101, 99, 111, 114, 100, 45, 118, 49, 1, 120, 29, 99, 108, 117, 115, 116, 101, 114, 95, 48, 48,
-    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 120, 36, 114, 97,
-    100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115,
-    111, 117, 114, 99, 101, 115, 47, 103, 57, 45, 108, 105, 118, 101, 104, 100, 111, 99, 117, 109,
-    101, 110, 116, 110, 102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 103, 57, 130, 130,
-    120, 24, 101, 120, 97, 109, 112, 108, 101, 46, 111, 114, 103, 47, 108, 97, 98, 101, 108, 115,
-    47, 111, 119, 110, 101, 114, 102, 116, 101, 97, 109, 45, 97, 130, 119, 111, 116, 104, 101, 114,
-    46, 110, 101, 116, 47, 108, 97, 98, 101, 108, 115, 47, 114, 101, 103, 105, 111, 110, 98, 101,
-    117, 25, 15, 160, 120, 26, 110, 111, 100, 101, 95, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
-    48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 0, 244, 88, 32, 156, 128, 55, 52, 211, 136, 123, 225,
-    248, 33, 91, 156, 155, 4, 195, 99, 239, 163, 61, 187, 128, 244, 222, 115, 220, 105, 248, 68,
-    87, 1, 222, 101, 88, 64, 69, 89, 5, 41, 35, 39, 110, 131, 163, 22, 71, 9, 152, 45, 228, 87, 29,
-    39, 21, 22, 145, 86, 249, 173, 212, 107, 137, 192, 73, 169, 197, 82, 132, 25, 202, 11, 143,
-    195, 191, 7, 133, 108, 22, 65, 100, 253, 179, 249, 73, 229, 0, 126, 222, 143, 219, 47, 209,
-    181, 90, 95, 143, 121, 65, 0,
+    101, 99, 111, 114, 100, 45, 118, 49, 1, 120, 36, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111,
+    111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115, 111, 117, 114, 99, 101, 115, 47, 103,
+    57, 45, 108, 105, 118, 101, 104, 100, 111, 99, 117, 109, 101, 110, 116, 110, 102, 105, 108,
+    101, 58, 47, 47, 47, 116, 109, 112, 47, 103, 57, 130, 130, 120, 24, 101, 120, 97, 109, 112,
+    108, 101, 46, 111, 114, 103, 47, 108, 97, 98, 101, 108, 115, 47, 111, 119, 110, 101, 114, 102,
+    116, 101, 97, 109, 45, 97, 130, 119, 111, 116, 104, 101, 114, 46, 110, 101, 116, 47, 108, 97,
+    98, 101, 108, 115, 47, 114, 101, 103, 105, 111, 110, 98, 101, 117, 25, 15, 160, 120, 26, 110,
+    111, 100, 101, 95, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
+    48, 49, 0, 244, 88, 32, 104, 39, 16, 240, 152, 76, 253, 248, 207, 223, 194, 142, 202, 87, 93,
+    50, 89, 60, 68, 201, 230, 14, 154, 177, 83, 171, 217, 44, 20, 21, 159, 91, 88, 64, 81, 95, 12,
+    59, 9, 174, 11, 137, 193, 237, 29, 103, 112, 4, 33, 4, 73, 117, 54, 144, 214, 123, 14, 229, 52,
+    210, 151, 200, 67, 67, 25, 99, 75, 106, 209, 37, 34, 33, 86, 142, 239, 53, 18, 160, 226, 37,
+    14, 88, 234, 76, 87, 213, 96, 81, 101, 161, 15, 229, 185, 80, 230, 231, 132, 8,
   ];
 
   /// The pinned current fixture of one signed removal record (T-G09-01
   /// vector; same construction as `GOLDEN_RESOURCE_LIVE_G9`).
   const GOLDEN_RESOURCE_REMOVAL_G9: &[u8] = &[
-    141, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
+    140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 114, 101, 115, 111, 117, 114, 99, 101, 45, 114,
-    101, 99, 111, 114, 100, 45, 118, 49, 1, 120, 29, 99, 108, 117, 115, 116, 101, 114, 95, 48, 48,
-    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 120, 39, 114, 97,
-    100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115,
-    111, 117, 114, 99, 101, 115, 47, 103, 57, 45, 114, 101, 109, 111, 118, 101, 100, 104, 100, 111,
-    99, 117, 109, 101, 110, 116, 118, 102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 103,
-    57, 45, 114, 101, 109, 111, 118, 101, 100, 128, 25, 19, 136, 120, 26, 110, 111, 100, 101, 95,
-    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 1, 245, 88,
-    32, 171, 129, 179, 122, 211, 56, 226, 33, 118, 150, 20, 130, 22, 199, 193, 205, 109, 150, 14,
-    4, 26, 149, 77, 82, 215, 129, 86, 208, 31, 69, 127, 193, 88, 64, 201, 226, 97, 155, 229, 63,
-    109, 1, 122, 10, 196, 19, 68, 229, 31, 20, 246, 134, 27, 218, 96, 232, 25, 171, 170, 140, 34,
-    179, 44, 103, 155, 197, 180, 181, 49, 253, 88, 199, 152, 237, 8, 31, 118, 108, 110, 43, 245,
-    22, 233, 215, 100, 197, 79, 37, 240, 4, 16, 56, 146, 73, 0, 155, 78, 13,
+    101, 99, 111, 114, 100, 45, 118, 49, 1, 120, 39, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111,
+    111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115, 111, 117, 114, 99, 101, 115, 47, 103,
+    57, 45, 114, 101, 109, 111, 118, 101, 100, 104, 100, 111, 99, 117, 109, 101, 110, 116, 118,
+    102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 103, 57, 45, 114, 101, 109, 111, 118,
+    101, 100, 128, 25, 19, 136, 120, 26, 110, 111, 100, 101, 95, 48, 48, 48, 48, 48, 48, 48, 48,
+    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 1, 245, 88, 32, 220, 177, 233, 239, 67,
+    250, 221, 150, 118, 197, 162, 54, 69, 239, 46, 133, 20, 151, 111, 179, 203, 36, 104, 53, 77,
+    61, 38, 249, 66, 238, 182, 243, 88, 64, 137, 218, 118, 22, 237, 55, 15, 126, 33, 247, 175, 112,
+    203, 97, 255, 245, 213, 12, 109, 167, 189, 77, 233, 213, 236, 198, 171, 144, 184, 162, 175,
+    204, 51, 66, 62, 197, 157, 177, 53, 178, 43, 123, 131, 31, 243, 157, 4, 49, 149, 85, 62, 47,
+    36, 212, 12, 248, 114, 195, 54, 216, 202, 209, 215, 10,
   ];
 
   /// The fixture writer and timestamp shared by the G9 current vectors.
@@ -1276,7 +1235,6 @@ mod tests {
       )
       .unwrap();
     ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       ResourceName::parse("radiata.woooo.tech/resources/g9-live").unwrap(),
       LabelValue::parse("document").unwrap(),
       ResourceUri::parse("file:///tmp/g9").unwrap(),
@@ -1292,7 +1250,6 @@ mod tests {
 
   fn g9_removal_record() -> ResourceRecordV1 {
     ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       ResourceName::parse("radiata.woooo.tech/resources/g9-removed").unwrap(),
       LabelValue::parse("document").unwrap(),
       ResourceUri::parse("file:///tmp/g9-removed").unwrap(),

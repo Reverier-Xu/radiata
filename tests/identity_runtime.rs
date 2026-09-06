@@ -121,8 +121,8 @@ async fn identity_runtime_fresh_start_provisions_once_and_restart_reloads_same_i
   let stored = local_identity_bytes(&providers.factory).expect("local identity stored");
   assert!(intent_keys(&providers.factory).is_empty());
   assert_eq!(pending_count(&providers.factory), 0);
-  assert_eq!(providers.factory.commit_calls(), 3);
-  assert_eq!(providers.factory.receipt_count(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
+  assert_eq!(providers.factory.receipt_count(), 4);
   handle.command(Shutdown::new()).await.unwrap();
   assert_eq!(providers.storage_drops.count(), 1);
   assert_eq!(providers.factory_drops.count(), 0);
@@ -141,7 +141,7 @@ async fn identity_runtime_fresh_start_provisions_once_and_restart_reloads_same_i
       .iter()
       .any(|call| matches!(call, KeyCall::Create(_)))
   );
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
   assert_eq!(
     local_identity_bytes(&providers.factory).as_deref(),
     Some(stored.as_slice()),
@@ -192,7 +192,7 @@ async fn identity_runtime_missing_handle_stops_before_running_without_replacemen
     vec![KeyCall::PublicKey(handle_bytes)],
     "no replacement create, sign, or delete may run",
   );
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
   assert_eq!(
     local_identity_bytes(&providers.factory).as_deref(),
     Some(stored.as_slice()),
@@ -234,7 +234,7 @@ async fn identity_runtime_mismatched_public_key_stops_before_running_without_rep
     mismatched.take_calls(),
     vec![KeyCall::PublicKey(handle_bytes)],
   );
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -316,7 +316,7 @@ async fn identity_runtime_create_unknown_restart_reconciles_the_same_operation()
   );
   assert!(local_identity_bytes(&providers.factory).is_some());
   assert!(intent_keys(&providers.factory).is_empty());
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
   handle.command(Shutdown::new()).await.unwrap();
 }
 
@@ -371,7 +371,7 @@ async fn identity_runtime_finalize_unknown_applied_recovers_journal_on_restart()
     "recovery reconciles the journal, cleans pending, and verifies the key",
   );
   assert_eq!(pending_count(&providers.factory), 0);
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
   handle.command(Shutdown::new()).await.unwrap();
 }
 
@@ -426,7 +426,7 @@ async fn identity_runtime_finalize_unknown_not_applied_resumes_intent_on_restart
   );
   assert!(local_identity_bytes(&providers.factory).is_some());
   assert!(intent_keys(&providers.factory).is_empty());
-  assert_eq!(providers.factory.commit_calls(), 3);
+  assert_eq!(providers.factory.commit_calls(), 4);
   handle.command(Shutdown::new()).await.unwrap();
 }
 

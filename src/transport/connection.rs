@@ -32,7 +32,7 @@ use tokio_tungstenite::{
   tungstenite::{Bytes as WsBytes, Message as WsMessage},
 };
 
-use super::{ws, ws::JoinHint};
+use super::{ws, ws::MergeHint};
 /// The local policy applied to every sent and received wire message
 /// (defined in the protocol domain; re-exported for connection callers).
 pub(crate) use crate::protocol::wire::FrameRules;
@@ -65,8 +65,8 @@ pub(crate) struct Connection {
   stream: WebSocketStream<TlsStream<TcpStream>>,
   rules: FrameRules,
   channel_binding: [u8; CHANNEL_BINDING_LEN],
-  join_hint: Option<JoinHint>,
-  source: Option<crate::identity::admission_rate::AdmissionSource>,
+  merge_hint: Option<MergeHint>,
+  source: Option<crate::identity::merge_rate::MergeSource>,
   /// UNIX-seconds of the last peer pong (keepalive liveness).
   pong_last_seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -78,7 +78,7 @@ impl Connection {
   /// publishes the non-secret cluster and credential generation IDs as
   /// upgrade response headers inside the TLS channel.
   pub(crate) async fn accept(
-    tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, hint: Option<&JoinHint>,
+    tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, hint: Option<&MergeHint>,
   ) -> Result<Self> {
     // The packet data plane is ack-driven with small messages; the kernel
     // Nagle + delayed-ACK interaction would stall every burst by the
@@ -88,7 +88,7 @@ impl Connection {
     let source = tcp
       .peer_addr()
       .ok()
-      .map(crate::identity::admission_rate::AdmissionSource::normalize);
+      .map(crate::identity::merge_rate::MergeSource::normalize);
     tracing::debug!("tls connection accepted");
     let tls = TlsAcceptor::from(config)
       .accept(tcp)
@@ -100,7 +100,7 @@ impl Connection {
       stream,
       rules,
       channel_binding,
-      join_hint: None,
+      merge_hint: None,
       source,
       pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
@@ -130,12 +130,12 @@ impl Connection {
       .await
       .map_err(|_| Error::authentication_failed("tls connect"))?;
     let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
-    let (stream, join_hint) = ws::connect(TlsStream::from(tls), &authority).await?;
+    let (stream, merge_hint) = ws::connect(TlsStream::from(tls), &authority).await?;
     Ok(Self {
       stream,
       rules,
       channel_binding,
-      join_hint,
+      merge_hint,
       source: None,
       pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
@@ -143,8 +143,8 @@ impl Connection {
 
   /// The listener's non-secret join hints captured during the WebSocket
   /// upgrade (client side only).
-  pub(crate) const fn join_hint(&self) -> Option<&JoinHint> {
-    self.join_hint.as_ref()
+  pub(crate) const fn merge_hint(&self) -> Option<&MergeHint> {
+    self.merge_hint.as_ref()
   }
 
   /// The locally derived RFC 9266 channel binding.
@@ -177,9 +177,7 @@ impl Connection {
   /// The canonical admission source of the accepted connection; the
   /// initiator side carries none (its own node rate-limits inbound
   /// attempts).
-  pub(crate) const fn peer_source(
-    &self,
-  ) -> Option<crate::identity::admission_rate::AdmissionSource> {
+  pub(crate) const fn peer_source(&self) -> Option<crate::identity::merge_rate::MergeSource> {
     self.source
   }
 

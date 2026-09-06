@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use crate::{
-  ClusterId, LabelKey, LabelSet, LabelValue, NodeId,
+  LabelKey, LabelSet, LabelValue, NodeId,
   api::SystemEntropy,
   membership::{NodeDescriptorV1, page as member_page, store as descriptor_store},
   provider::StorageFactory,
@@ -75,7 +75,6 @@ fn resource_record(
   seed_index: u8, writer: &NodeId, uri: &str, timestamp_millis: u64, seed: [u8; 32],
 ) -> ResourceRecordV1 {
   ResourceRecordV1::sign(
-    ClusterId::parse("cluster_000000000000000000001").unwrap(),
     ResourceName::parse(&format!("radiata.woooo.tech/resources/mixed-{seed_index}")).unwrap(),
     LabelValue::parse("document").unwrap(),
     crate::ResourceUri::parse(uri).unwrap(),

@@ -11,7 +11,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::{Endpoint, Error, Result, TransportTag, api::BoxFuture, transport::ws::JoinHint};
+use crate::{Endpoint, Error, Result, TransportTag, api::BoxFuture, transport::ws::MergeHint};
 
 /// One TLS exporter channel binding (RFC 9266). Both session sides derive
 /// the same value from the authenticated TLS connection and bind it into
@@ -48,7 +48,7 @@ pub(crate) trait TransportListener: fmt::Debug + Send + Sync + 'static {
   /// prelude upgrade. `hint` is the listener-side credential-generation
   /// evidence served to joining peers.
   fn accept<'a>(
-    &'a self, hint: Option<&'a JoinHint>,
+    &'a self, hint: Option<&'a MergeHint>,
   ) -> BoxFuture<'a, Result<super::connection::Connection>>;
 
   /// Closes the listener and releases its bound address.
@@ -277,7 +277,7 @@ impl TransportListener for WssListener {
   }
 
   fn accept<'a>(
-    &'a self, hint: Option<&'a JoinHint>,
+    &'a self, hint: Option<&'a MergeHint>,
   ) -> BoxFuture<'a, Result<super::connection::Connection>> {
     let config = std::sync::Arc::clone(&self.config);
     let rules = self.rules;
@@ -434,7 +434,7 @@ mod tests {
     // and accept together. The listener serves the join hint the dialer
     // does not need (the client config carries no pinning here).
     let (client, accepted) = tokio::join!(
-      transport.connect(bound, super::super::tls::join_client_config().unwrap()),
+      transport.connect(bound, super::super::tls::merge_client_config().unwrap()),
       listener.accept(None),
     );
     let client = client.unwrap();
@@ -528,7 +528,7 @@ mod counting_tests {
     let (client, accepted) = tokio::join!(
       dial_side.connect(
         bound.clone(),
-        super::super::tls::join_client_config().unwrap()
+        super::super::tls::merge_client_config().unwrap()
       ),
       listener.accept(None),
     );

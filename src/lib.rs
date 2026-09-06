@@ -72,18 +72,18 @@ pub use config::{NodeConfig, ParserLimits, RecoveryConfig, TraceMetadataLimits};
 pub use error::{Error, ErrorKind, ProviderErrorContext, ProviderErrorKind, Result};
 pub use extension_registry::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
 pub use identity::{
-  ClusterId, Digest, IssuedJoinCredential, JoinCredential, ListenerId, NodeId, OperationId,
-  PublicKey, SessionId, Signature, TraceId, TransactionId,
+  Digest, IssuedMergeCredential, ListenerId, MergeCredential, NodeId, OperationId, PublicKey,
+  SessionId, Signature, TraceId, TransactionId,
 };
 pub use label::{LabelKey, LabelSet, LabelValue};
 pub use node::{EventOptions, EventReceive, EventSubscription, NodeBuilder, NodeHandle};
 pub use operation::{
-  Command, ConnectMember, CreateCluster, DisconnectPeer, Event, GetLocalNode, GetMember,
-  GetNodeStatus, GetObservability, GetResource, GetRoute, IdentityReplaced, JoinCluster,
-  LeaveCluster, Listen, MemberChanged, NodeRevoked, PageListeners, PageMembers, PageResources,
-  PageSessions, PageTopology, PageTrust, PutResource, Query, RecoveryChanged, RemoveResource,
-  ResourceChanged, ResourceWrite, RevokeNode, RotateJoinCredential, RouteChanged, SelectResources,
-  SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
+  Command, ConnectMember, DisconnectPeer, Event, GetLocalNode, GetMember, GetNodeStatus,
+  GetObservability, GetResource, GetRoute, IdentityReplaced, LeaveCluster, Listen, MemberChanged,
+  MergeCluster, NodeRevoked, PageListeners, PageMembers, PageResources, PageSessions, PageTopology,
+  PageTrust, PutResource, Query, RecoveryChanged, RemoveResource, ResourceChanged, ResourceWrite,
+  RevokeNode, RotateMergeCredential, RouteChanged, SelectResources, SessionChanged, Shutdown,
+  StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
@@ -106,12 +106,11 @@ pub use transport::{
   ChannelBinding, Discovery, DiscoveryPage, Endpoint, EndpointCandidate, PageCursor,
 };
 pub use view::{
-  AdmissionView, ClusterView, ConnectivityStatus, LeaveOutcome, ListenerPage, ListenerView,
-  LocalNodeView, MemberPage, MemberView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot,
-  PageSpec, RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView,
-  ResourcePage, ResourceView, RevokeOutcome, SessionFeatureView, SessionPage, SessionView,
-  ShutdownOutcome, ShutdownReason, TopologyEdgeView, TopologyPage, TrustPage, TrustStatus,
-  TrustedIdentityView,
+  ConnectivityStatus, LeaveOutcome, ListenerPage, ListenerView, LocalNodeView, MemberPage,
+  MemberView, MergeView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot, PageSpec,
+  RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView, ResourcePage,
+  ResourceView, RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome,
+  ShutdownReason, TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
 };
 
 pub mod extension {

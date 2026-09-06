@@ -25,15 +25,12 @@ use tokio_tungstenite::{
   },
 };
 
-use crate::{ClusterId, Error, Result, protocol::PRELUDE_LEN};
+use crate::{Error, Result, protocol::PRELUDE_LEN};
 
 /// The fixed WebSocket upgrade path.
 pub(crate) const WS_PATH: &str = "/mrly";
 
-/// The response header carrying the listener's non-secret cluster ID hint.
-pub(crate) const CLUSTER_HINT_HEADER: &str = "mrly-cluster";
-
-/// The response header carrying the listener's non-secret join credential
+/// The response header carrying the listener's non-secret merge credential
 /// generation ID hint (32 lowercase hexadecimal characters).
 pub(crate) const GENERATION_HINT_HEADER: &str = "mrly-generation";
 
@@ -43,25 +40,22 @@ pub(crate) const GENERATION_HINT_HEADER: &str = "mrly-generation";
 /// listener cannot be replayed against a different certificate.
 pub(crate) const SPKI_HINT_HEADER: &str = "mrly-leaf-spki";
 
-/// The non-secret join routing hints a listener publishes inside the TLS
-/// channel during the WebSocket upgrade.
+/// The non-secret merge hint a listener publishes inside the TLS channel
+/// during the WebSocket upgrade.
 ///
-/// Both values are ADR-0001 transcript inputs (cluster ID, non-secret
-/// credential generation ID) and are never trusted on receipt: the joiner
-/// uses them only to construct its hello, the state machine equality-checks
-/// them against the responder's own configuration, and the final signed
-/// admission grant is verified before any cluster adoption.
+/// The generation ID is an ADR-0001 transcript input and is never trusted
+/// on receipt: the merger uses it only to construct its hello, the state
+/// machine equality-checks it against the responder's own configuration,
+/// and the final signed merge grant is verified before any adoption.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct JoinHint {
-  cluster: ClusterId,
+pub(crate) struct MergeHint {
   generation: [u8; 16],
   leaf_spki: Vec<u8>,
 }
 
-impl JoinHint {
-  pub(crate) const fn new(cluster: ClusterId, generation: [u8; 16]) -> Self {
+impl MergeHint {
+  pub(crate) const fn new(generation: [u8; 16]) -> Self {
     Self {
-      cluster,
       generation,
       leaf_spki: Vec::new(),
     }
@@ -76,10 +70,6 @@ impl JoinHint {
 
   pub(crate) fn leaf_spki(&self) -> &[u8] {
     &self.leaf_spki
-  }
-
-  pub(crate) const fn cluster(&self) -> &ClusterId {
-    &self.cluster
   }
 
   pub(crate) const fn generation(&self) -> &[u8; 16] {
@@ -111,10 +101,10 @@ fn config() -> WebSocketConfig {
 
 /// Accepts the server half of a WebSocket upgrade over an established TLS
 /// stream. Only `GET /mrly` upgrades are accepted. When the listener can
-/// admit joiners, `hint` publishes the non-secret cluster and credential
-/// generation IDs as response headers inside the TLS channel.
+/// admit mergers, `hint` publishes the non-secret credential generation ID
+/// as a response header inside the TLS channel.
 pub(crate) async fn accept<Stream>(
-  stream: Stream, hint: Option<&JoinHint>,
+  stream: Stream, hint: Option<&MergeHint>,
 ) -> Result<WebSocketStream<Stream>>
 where
   Stream: AsyncRead + AsyncWrite + Unpin, {
@@ -127,10 +117,10 @@ where
 
 /// Runs the client half of a WebSocket upgrade over an established TLS
 /// stream, requesting the fixed `/mrly` path. Returns the stream and the
-/// listener's non-secret join hints, when it published any.
+/// listener's non-secret merge hint, when it published any.
 pub(crate) async fn connect<Stream>(
   stream: Stream, authority: &str,
-) -> Result<(WebSocketStream<Stream>, Option<JoinHint>)>
+) -> Result<(WebSocketStream<Stream>, Option<MergeHint>)>
 where
   Stream: AsyncRead + AsyncWrite + Unpin, {
   let request = format!("wss://{authority}{WS_PATH}");
@@ -142,21 +132,18 @@ where
 
 fn parse_hint(
   headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
-) -> Result<Option<JoinHint>> {
+) -> Result<Option<MergeHint>> {
   let error = || Error::invalid_input("websocket hint");
-  let clusters: Vec<_> = headers.get_all(CLUSTER_HINT_HEADER).iter().collect();
   let generations: Vec<_> = headers.get_all(GENERATION_HINT_HEADER).iter().collect();
   let spkis: Vec<_> = headers.get_all(SPKI_HINT_HEADER).iter().collect();
-  if clusters.is_empty() && generations.is_empty() && spkis.is_empty() {
+  if generations.is_empty() && spkis.is_empty() {
     return Ok(None);
   }
-  if clusters.len() != 1 || generations.len() != 1 || spkis.len() > 1 {
+  if generations.len() != 1 || spkis.len() > 1 {
     return Err(error());
   }
-  let cluster =
-    ClusterId::parse(clusters[0].to_str().map_err(|_| error())?).map_err(|_| error())?;
   let generation = parse_generation_hex(generations[0].to_str().map_err(|_| error())?)?;
-  let hint = JoinHint::new(cluster, generation);
+  let hint = MergeHint::new(generation);
   let hint = match spkis.first() {
     Some(spki) => hint.with_leaf_spki(crate::hex::decode(
       spki.to_str().map_err(|_| error())?,
@@ -172,7 +159,7 @@ fn parse_hint(
 // contract and not a result channel for secrets.
 #[allow(clippy::result_large_err)]
 fn check_path(
-  request: &Request, mut response: Response, hint: Option<&JoinHint>,
+  request: &Request, mut response: Response, hint: Option<&MergeHint>,
 ) -> std::result::Result<Response, ErrorResponse> {
   if request.uri().path() == WS_PATH {
     if let Some(hint) = hint {
@@ -184,16 +171,12 @@ fn check_path(
       } else {
         HeaderValue::from_str(&crate::hex::encode(hint.leaf_spki())).ok()
       };
-      let (Ok(cluster), Ok(generation)) = (
-        HeaderValue::from_str(hint.cluster().as_str()),
-        HeaderValue::from_str(&generation_hex(hint.generation())),
-      ) else {
-        let mut rejection = ErrorResponse::new(Some("invalid join hint".to_owned()));
+      let Ok(generation) = HeaderValue::from_str(&generation_hex(hint.generation())) else {
+        let mut rejection = ErrorResponse::new(Some("invalid merge hint".to_owned()));
         *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         return Err(rejection);
       };
       let headers = response.headers_mut();
-      headers.insert(CLUSTER_HINT_HEADER, cluster);
       headers.insert(GENERATION_HINT_HEADER, generation);
       if let Some(spki) = spki {
         headers.insert(SPKI_HINT_HEADER, spki);

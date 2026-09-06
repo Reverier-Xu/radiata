@@ -32,7 +32,7 @@ pub(crate) enum HandshakeKind {
   SelectionConfirmation,
   /// Position 6 (responder, join mode only): post-authentication admission
   /// grant delivery. Never part of the authentication transcript.
-  AdmissionGrantDelivery,
+  MergeGrantDelivery,
 }
 
 impl HandshakeKind {
@@ -43,7 +43,7 @@ impl HandshakeKind {
     Self::ResponderProof,
     Self::InitiatorProof,
     Self::SelectionConfirmation,
-    Self::AdmissionGrantDelivery,
+    Self::MergeGrantDelivery,
   ];
 
   /// The immutable kind ID under base schema `0x0001`.
@@ -54,12 +54,12 @@ impl HandshakeKind {
       Self::ResponderProof => 0x0003,
       Self::InitiatorProof => 0x0004,
       Self::SelectionConfirmation => 0x0005,
-      Self::AdmissionGrantDelivery => 0x0006,
+      Self::MergeGrantDelivery => 0x0006,
     }
   }
 
-  /// The lockstep exchange position (1..=6); position six is the join-only
-  /// post-authentication grant delivery.
+  /// The lockstep exchange position (1..=6); position six is the
+  /// merge-only post-authentication grant delivery.
   pub(crate) const fn position(self) -> u8 {
     match self {
       Self::InitiatorHello => 1,
@@ -67,17 +67,17 @@ impl HandshakeKind {
       Self::ResponderProof => 3,
       Self::InitiatorProof => 4,
       Self::SelectionConfirmation => 5,
-      Self::AdmissionGrantDelivery => 6,
+      Self::MergeGrantDelivery => 6,
     }
   }
 
   /// The deterministic-CBOR array arity of the message at this position.
   pub(crate) const fn arity(self) -> u8 {
     match self {
-      Self::InitiatorHello => 8,
-      Self::ResponderHello => 6,
+      Self::InitiatorHello => 7,
+      Self::ResponderHello => 5,
       Self::ResponderProof | Self::InitiatorProof => 3,
-      Self::SelectionConfirmation | Self::AdmissionGrantDelivery => 2,
+      Self::SelectionConfirmation | Self::MergeGrantDelivery => 2,
     }
   }
 }
@@ -198,7 +198,7 @@ mod tests {
     (0x0003, HandshakeKind::ResponderProof),
     (0x0004, HandshakeKind::InitiatorProof),
     (0x0005, HandshakeKind::SelectionConfirmation),
-    (0x0006, HandshakeKind::AdmissionGrantDelivery),
+    (0x0006, HandshakeKind::MergeGrantDelivery),
   ];
 
   #[test]

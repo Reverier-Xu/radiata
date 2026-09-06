@@ -1,15 +1,15 @@
-//! Secure-join integration lane (T-G03-02).
+//! Secure-merge integration lane (T-G03-02).
 //!
-//! Two real nodes over loopback TLS 1.3 WebSocket: the receiver creates a
-//! cluster, issues a join credential, and listens; the joiner completes the
-//! exporter-bound join and persists the admission. Negative lanes prove
-//! generic failure without admission or credential consumption.
+//! Two real nodes over loopback TLS 1.3 WebSocket: the receiver rotates a
+//! merge credential and listens; the peer completes the exporter-bound
+//! merge and persists the adopted binding. Negative lanes prove generic
+//! failure without a merge or credential consumption.
 
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  CreateCluster, Endpoint, ErrorKind, GetLocalNode, JoinCluster, JoinCredential, Listen,
-  NodeBuilder, NodeHandle, RotateJoinCredential, Shutdown,
+  Endpoint, ErrorKind, GetLocalNode, Listen, MergeCluster, MergeCredential, NodeBuilder,
+  NodeHandle, RotateMergeCredential, Shutdown,
 };
 #[cfg(all(unix, feature = "json"))]
 use tempfile::TempDir;
@@ -52,11 +52,11 @@ fn init_tracing() {
   });
 }
 
-/// Issues one join credential with bounded retries: admission-sensitive
+/// Issues one merge credential with bounded retries: merge-sensitive
 /// operations transiently refuse while concurrent metadata commits hold
 /// the store (the same precedent as the membership-sync harness).
 /// Retry backoff that doubles from 250 ms and caps at four seconds: the
-/// fixed admission policy caps one source at sixteen attempts per minute,
+/// fixed merge policy caps one source at sixteen attempts per minute,
 /// so a tight retry storm would trip it and fail fast forever after.
 fn retry_backoff(attempts: u32) -> Duration {
   let shift = attempts.min(5);
@@ -64,10 +64,10 @@ fn retry_backoff(attempts: u32) -> Duration {
   Duration::from_millis(millis.max(250)).min(Duration::from_secs(4))
 }
 
-async fn rotate_with_retry(issuer: &NodeHandle) -> radiata::IssuedJoinCredential {
+async fn rotate_with_retry(issuer: &NodeHandle) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer.command(RotateJoinCredential::new()).await {
+    match issuer.command(RotateMergeCredential::new()).await {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -77,11 +77,11 @@ async fn rotate_with_retry(issuer: &NodeHandle) -> radiata::IssuedJoinCredential
   }
 }
 
-/// One join with bounded retries: a transient admission-conflict refusal
-/// consumes no credential, so each attempt reissues a fresh one.
-async fn join_with_retry(
+/// One merge with bounded retries: a transient refusal consumes no
+/// credential, so each attempt reuses the same secret.
+async fn merge_with_retry(
   node: &NodeHandle, endpoint: &Endpoint, secret: &str,
-) -> radiata::AdmissionView {
+) -> radiata::MergeView {
   // The fixed authentication deadline expires on starved runners; the
   // bound covers a fully loaded CI machine (the sixteen-node lane runs
   // alongside every other test binary in the workspace suite).
@@ -90,9 +90,9 @@ async fn join_with_retry(
   loop {
     attempts = attempts.wrapping_add(1);
     match node
-      .command(JoinCluster::new(
+      .command(MergeCluster::new(
         endpoint.clone(),
-        JoinCredential::parse(secret).unwrap(),
+        MergeCredential::parse(secret).unwrap(),
       ))
       .await
     {
@@ -100,22 +100,22 @@ async fn join_with_retry(
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
       }
-      Err(error) => panic!("join failed persistently (attempt {attempts}): {error:?}"),
+      Err(error) => panic!("merge failed persistently (attempt {attempts}): {error:?}"),
     }
   }
 }
 
-/// One success-expecting join with bounded retries: the typed rejection
+/// One success-expecting merge with bounded retries: the typed rejection
 /// lanes stay single-shot, but a success path must not fail the lane when
 /// a loaded runner expires the fixed authentication deadline. The same
-/// credential is reused (a failed join consumes no credential).
-async fn join_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radiata::AdmissionView {
+/// credential is reused (a failed merge consumes no credential).
+async fn merge_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radiata::MergeView {
   let deadline = std::time::Instant::now() + Duration::from_secs(120);
   loop {
     match node
-      .command(JoinCluster::new(
+      .command(MergeCluster::new(
         endpoint.clone(),
-        JoinCredential::parse(secret).unwrap(),
+        MergeCredential::parse(secret).unwrap(),
       ))
       .await
     {
@@ -123,7 +123,7 @@ async fn join_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radiat
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(500)).await;
       }
-      Err(error) => panic!("join never succeeded: {error:?}"),
+      Err(error) => panic!("merge never succeeded: {error:?}"),
     }
   }
 }
@@ -154,7 +154,7 @@ async fn start_json(dir: &TempDir, keys: Arc<ScriptedKeys>) -> Node {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_completes_exporter_bound_join_and_persists_admission() {
+async fn secure_join_completes_exporter_bound_merge_and_persists_binding() {
   let receiver = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(10_000)),
@@ -166,10 +166,9 @@ async fn secure_join_completes_exporter_bound_join_and_persists_admission() {
   )
   .await;
 
-  let cluster = receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -179,21 +178,75 @@ async fn secure_join_completes_exporter_bound_join_and_persists_admission() {
     .unwrap();
 
   let secret = issued.credential().expose_secret().to_owned();
-  let admission = join_ok(&joiner.handle, listener.endpoint(), &secret).await;
-  assert_eq!(admission.cluster_id(), cluster.cluster_id());
-  assert_eq!(admission.issuer(), cluster.creator());
+  let merge = merge_ok(&joiner.handle, listener.endpoint(), &secret).await;
 
   let local = joiner.handle.query(GetLocalNode::new()).await.unwrap();
-  assert_eq!(local.cluster_id(), cluster.cluster_id());
-  assert_eq!(local.node_id(), admission.admitted_node());
+  assert_eq!(local.node_id(), merge.node());
 
-  // The receiver observes the admitted subject in its own identity state:
-  // its local node view shows the issuer, not the subject.
+  // The receiver observes the merged peer in its own identity state: its
+  // local node view shows the merge peer, not the merging node.
   let receiver_local = receiver.handle.query(GetLocalNode::new()).await.unwrap();
-  assert_eq!(receiver_local.node_id(), cluster.creator());
+  assert_eq!(receiver_local.node_id(), merge.peer());
 
   receiver.handle.command(Shutdown::new()).await.unwrap();
   joiner.handle.command(Shutdown::new()).await.unwrap();
+}
+
+/// SC-G11-P0-08: born-with-cluster. A freshly started node — no creation
+/// ceremony at all — immediately resolves its local view, pages itself as
+/// the singleton cluster member, issues a merge credential, and admits a
+/// merger over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn g11_born_with_cluster_serves_immediately_without_ceremony() {
+  let node = start(
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+    Arc::new(ScriptedKeys::full_at(30_000)),
+  )
+  .await;
+  let merger = start(
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+    Arc::new(ScriptedKeys::full_at(40_000)),
+  )
+  .await;
+
+  // No creation ceremony exists: the local view resolves from the first
+  // instant, and the singleton membership page is exactly the self node.
+  let local = node.handle.query(GetLocalNode::new()).await.unwrap();
+  assert!(local.node_id().as_str().starts_with("node_"));
+  let members = node
+    .handle
+    .query(radiata::PageMembers::new(
+      radiata::PageSpec::first(8).unwrap(),
+    ))
+    .await
+    .unwrap();
+  assert!(
+    members
+      .items()
+      .iter()
+      .all(|member| member.node_id() == local.node_id())
+  );
+
+  // The fresh node issues a merge credential and admits a merger with no
+  // prior state beyond its own birth binding.
+  let issued = node
+    .handle
+    .command(RotateMergeCredential::new())
+    .await
+    .unwrap();
+  let listener = node
+    .handle
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap();
+  let secret = issued.credential().expose_secret().to_owned();
+  let merge = merge_ok(&merger.handle, listener.endpoint(), &secret).await;
+  let merger_local = merger.handle.query(GetLocalNode::new()).await.unwrap();
+  assert_eq!(merger_local.node_id(), merge.node());
+  assert_eq!(local.node_id(), merge.peer());
+
+  node.handle.command(Shutdown::new()).await.unwrap();
+  merger.handle.command(Shutdown::new()).await.unwrap();
 }
 
 // The json backend provides OsCrashDurable only where the directory
@@ -201,7 +254,7 @@ async fn secure_join_completes_exporter_bound_join_and_persists_admission() {
 // refused with a typed error, matching json_runtime's non-unix lane.
 #[cfg(all(unix, feature = "json"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_json_backend_round_trips_the_same_join() {
+async fn secure_join_json_backend_round_trips_the_same_merge() {
   let receiver_dir = tempfile::tempdir().unwrap();
   let joiner_dir = tempfile::tempdir().unwrap();
   let receiver_keys = Arc::new(ScriptedKeys::full_at(30_000));
@@ -209,10 +262,9 @@ async fn secure_join_json_backend_round_trips_the_same_join() {
   let receiver = start_json(&receiver_dir, receiver_keys.clone()).await;
   let joiner = start_json(&joiner_dir, joiner_keys.clone()).await;
 
-  let cluster = receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -222,25 +274,23 @@ async fn secure_join_json_backend_round_trips_the_same_join() {
     .unwrap();
 
   // The json restart lane contends with the parallel powerset suite, so
-  // the join uses the same bounded-retry helper as the memory lanes.
+  // the merge uses the same bounded-retry helper as the memory lanes.
   let secret = issued.credential().expose_secret().to_owned();
-  let admission = join_with_retry(&joiner.handle, listener.endpoint(), &secret).await;
-  assert_eq!(admission.cluster_id(), cluster.cluster_id());
+  let merge = merge_with_retry(&joiner.handle, listener.endpoint(), &secret).await;
 
-  // Both sides persist through reopen: shutdown and restart the joiner on
-  // the same directory proves the adopted pointer/binding/grant survived.
+  // Both sides persist through reopen: shutdown and restart the merging
+  // node on the same directory proves the adopted binding survived.
   joiner.handle.command(Shutdown::new()).await.unwrap();
   let restarted = start_json(&joiner_dir, joiner_keys.clone()).await;
   let local = restarted.handle.query(GetLocalNode::new()).await.unwrap();
-  assert_eq!(local.cluster_id(), cluster.cluster_id());
-  assert_eq!(local.node_id(), admission.admitted_node());
+  assert_eq!(local.node_id(), merge.node());
 
   receiver.handle.command(Shutdown::new()).await.unwrap();
   restarted.handle.command(Shutdown::new()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_wrong_credential_fails_without_admission() {
+async fn secure_join_wrong_credential_fails_without_merge() {
   let receiver = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(50_000)),
@@ -252,10 +302,9 @@ async fn secure_join_wrong_credential_fails_without_admission() {
   )
   .await;
 
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -264,17 +313,13 @@ async fn secure_join_wrong_credential_fails_without_admission() {
     .await
     .unwrap();
 
-  let wrong = JoinCredential::parse("join_BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").unwrap();
+  let wrong = MergeCredential::parse("join_BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").unwrap();
   let error = joiner
     .handle
-    .command(JoinCluster::new(listener.endpoint().clone(), wrong))
+    .command(MergeCluster::new(listener.endpoint().clone(), wrong))
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-  assert!(
-    joiner.handle.query(GetLocalNode::new()).await.is_err(),
-    "a failed join leaves the joiner standalone"
-  );
 
   receiver.handle.command(Shutdown::new()).await.unwrap();
   joiner.handle.command(Shutdown::new()).await.unwrap();
@@ -360,7 +405,7 @@ async fn start_with_protocol(
 /// Restarts a node over a just-shut-down storage directory: under CI load
 /// the previous handle's exclusive lock can linger briefly past the
 /// shutdown reply, so the reopen retries with a bound instead of failing
-/// the sample (same pattern as the join retries).
+/// the sample (same pattern as the merge retries).
 async fn restart_with_protocol(
   storage: Arc<MemoryStorageFactory>, keys: Arc<ScriptedKeys>, tag: &str, consumer: Arc<Collector>,
 ) -> NodeHandle {
@@ -444,10 +489,9 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
   )
   .await;
 
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -455,9 +499,9 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
     .unwrap();
-  let admission = {
+  let merge = {
     let secret = issued.credential().expose_secret().to_owned();
-    join_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
+    merge_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
   };
 
   // The receiver sends to the joiner over the established authenticated
@@ -465,7 +509,7 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
   let packet = receiver
     .handle
     .open_stream(
-      StreamTarget::Exact(admission.admitted_node().clone()),
+      StreamTarget::Exact(merge.node().clone()),
       ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
       policy(),
       metadata(),
@@ -477,7 +521,7 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
     .await
     .unwrap();
   assert_eq!(ack.trace_id(), &trace_before);
-  assert_eq!(ack.destination(), admission.admitted_node());
+  assert_eq!(ack.destination(), merge.node());
 
   // Admission is acked before the consumer finishes; wait for the bounded
   // consumer task to record the packet on wall time.
@@ -508,7 +552,6 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
     .await,
     _keys: Arc::new(ScriptedKeys::full()),
   };
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
 
   // No session to any node: routing to an unknown exact node fails before
   // any delivery work.
@@ -528,7 +571,8 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
 
-  // Unregistered protocol: rejected before admission even with a session.
+  // Unregistered protocol: rejected before the session even with a live
+  // peer.
   let collector = Arc::new(Collector::default());
   let joiner_handle = start_with_protocol(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
@@ -539,7 +583,7 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
   .await;
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -547,9 +591,9 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
     .unwrap();
-  let admission = {
+  let merge = {
     let secret = issued.credential().expose_secret().to_owned();
-    join_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
+    merge_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
   };
 
   // Sender-side: creating a packet for a protocol the local registry never
@@ -557,7 +601,7 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
   let error = receiver
     .handle
     .open_stream(
-      StreamTarget::Exact(admission.admitted_node().clone()),
+      StreamTarget::Exact(merge.node().clone()),
       ProtocolTag::parse("radiata.woooo.tech/protocols/not-registered").unwrap(),
       policy(),
       StreamMetadata::new(),
@@ -632,10 +676,9 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
     .await,
     _keys: receiver_keys.clone(),
   };
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -658,17 +701,17 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
     _keys: joiner_keys.clone(),
   };
   let secret = issued.credential().expose_secret().to_owned();
-  let admission = join_ok(&joiner.handle, listener.endpoint(), &secret).await;
-  let _admitted = admission.admitted_node().clone();
+  let merge = merge_ok(&joiner.handle, listener.endpoint(), &secret).await;
+  let _admitted = merge.node().clone();
 
-  // E2E-01: the joined member streams packets; credential rotation does
+  // E2E-01: the merged member streams packets; credential rotation does
   // not disconnect it.
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
   packet_round_trip(&joiner.handle, &receiver_id, &receiver_collector).await;
   receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   receiver_collector.packets.lock().unwrap().clear();
@@ -884,10 +927,9 @@ async fn secure_join_packets_flow_concurrently_in_both_directions() {
     collector.clone(),
   )
   .await;
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -895,13 +937,13 @@ async fn secure_join_packets_flow_concurrently_in_both_directions() {
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
     .unwrap();
-  let admission = {
+  let merge = {
     let secret = issued.credential().expose_secret().to_owned();
-    join_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
+    merge_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
   };
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
-  let joiner_id = admission.admitted_node().clone();
+  let joiner_id = merge.node().clone();
 
   let (east_trace, west_trace) = tokio::join!(
     async {
@@ -957,10 +999,9 @@ async fn secure_join_derived_return_stream_reuses_trace_id() {
     reply_collector.clone(),
   )
   .await;
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -968,13 +1009,13 @@ async fn secure_join_derived_return_stream_reuses_trace_id() {
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
     .unwrap();
-  let admission = {
+  let merge = {
     let secret = issued.credential().expose_secret().to_owned();
-    join_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
+    merge_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
   };
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
-  let _joiner_id = admission.admitted_node().clone();
+  let _joiner_id = merge.node().clone();
 
   let trace = round_trip_to(&joiner_handle, &receiver_id, &[b"ping"], &reply_collector).await;
   let pings = reply_consumer.pings.lock().unwrap().clone();
@@ -1024,10 +1065,9 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
     Arc::new(Collector::default()),
   )
   .await;
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -1035,13 +1075,13 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
     .unwrap();
-  let admission = {
+  let merge = {
     let secret = issued.credential().expose_secret().to_owned();
-    join_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
+    merge_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
   };
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
-  let _joiner_id = admission.admitted_node().clone();
+  let _joiner_id = merge.node().clone();
 
   let release = Arc::new(ReleaseGate::default());
   let protocol_tag = ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap();
@@ -1106,13 +1146,13 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- T-G03-06 hostile / admission-input closure evidence (SC-G03-P0-22) ----
+// ---- T-G03-06 hostile / merge-input closure evidence (SC-G03-P0-22) ----
 
-/// SC-G03-P0-22: a source exhausting its fixed admission rate window is
+/// SC-G03-P0-22: a source exhausting its fixed merge rate window is
 /// refused before any handshake or signing work; the refusal consumes no
 /// credential and performs no signature.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_admission_rate_window_refuses_before_signing() {
+async fn secure_join_merge_rate_window_refuses_before_signing() {
   let receiver_keys = Arc::new(ScriptedKeys::full_at(130_000));
   let receiver = Node {
     handle: start_with_protocol(
@@ -1124,10 +1164,9 @@ async fn secure_join_admission_rate_window_refuses_before_signing() {
     .await,
     _keys: receiver_keys.clone(),
   };
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -1138,8 +1177,8 @@ async fn secure_join_admission_rate_window_refuses_before_signing() {
 
   // A syntactically valid but cryptographically wrong credential fails at
   // proof verification; every attempt still counts against the fixed
-  // per-source admission rate window (16 per 60 seconds).
-  let hostile = JoinCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+  // per-source merge rate window (16 per 60 seconds).
+  let hostile = MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
   let attacker = start_with_protocol(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(131_000)),
@@ -1149,9 +1188,9 @@ async fn secure_join_admission_rate_window_refuses_before_signing() {
   .await;
   for _ in 0..16 {
     let error = attacker
-      .command(JoinCluster::new(
+      .command(MergeCluster::new(
         listener.endpoint().clone(),
-        JoinCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
+        MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
       ))
       .await
       .unwrap_err();
@@ -1165,7 +1204,7 @@ async fn secure_join_admission_rate_window_refuses_before_signing() {
   // The seventeenth attempt from the same source (all loopback reconnects
   // normalize to one source) is refused before any signing work.
   let error = attacker
-    .command(JoinCluster::new(listener.endpoint().clone(), hostile))
+    .command(MergeCluster::new(listener.endpoint().clone(), hostile))
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -1183,23 +1222,22 @@ async fn secure_join_admission_rate_window_refuses_before_signing() {
 // Three end-to-end lanes that the secure-join suite did not previously
 // exercise as a whole process: single-use credential enforcement against a
 // copied credential, explicit interruption of an in-flight outbound stream
-// when the peer shuts down, and fail-closed join after the listener stops.
+// when the peer shuts down, and fail-closed merge after the listener stops.
 
-/// THR-001 real-world lane: a join credential is single-use. Even when the
+/// THR-001 real-world lane: a merge credential is single-use. Even when the
 /// credential bytes are copied (as they would be after a leak), the second
-/// join attempt on the same generation is refused without admission and
+/// merge attempt on the same generation is refused without a merge and
 /// without consuming another generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_copied_credential_cannot_join_twice() {
+async fn secure_join_copied_credential_cannot_merge_twice() {
   let receiver = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(120_000)),
   )
   .await;
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -1217,7 +1255,7 @@ async fn secure_join_copied_credential_cannot_join_twice() {
   )
   .await;
   let secret = issued.credential().expose_secret().to_owned();
-  let _admission = join_ok(&joiner.handle, listener.endpoint(), &secret).await;
+  let _merge = merge_ok(&joiner.handle, listener.endpoint(), &secret).await;
 
   // A second node replays the copied credential bytes; the issuer must
   // refuse without admitting a second subject for the same generation.
@@ -1226,10 +1264,10 @@ async fn secure_join_copied_credential_cannot_join_twice() {
     Arc::new(ScriptedKeys::full_at(140_000)),
   )
   .await;
-  let copied = JoinCredential::parse(&credential_text).unwrap();
+  let copied = MergeCredential::parse(&credential_text).unwrap();
   let error = second
     .handle
-    .command(JoinCluster::new(listener.endpoint().clone(), copied))
+    .command(MergeCluster::new(listener.endpoint().clone(), copied))
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -1265,10 +1303,9 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   )
   .await;
 
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -1276,9 +1313,9 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
     .unwrap();
-  let _admission = {
+  let _merge = {
     let secret = issued.credential().expose_secret().to_owned();
-    join_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
+    merge_ok(&joiner_handle, &(listener.endpoint().clone()), &secret).await
   };
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
@@ -1365,19 +1402,18 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   joiner_handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// Real-world lane: after the receiver stops listening, a late join attempt
-/// fails closed with a typed error instead of hanging or admitting.
+/// Real-world lane: after the receiver stops listening, a late merge attempt
+/// fails closed with a typed error instead of hanging or merging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_join_after_listener_stop_fails_closed() {
+async fn secure_join_merge_after_listener_stop_fails_closed() {
   let receiver = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(170_000)),
   )
   .await;
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -1391,7 +1427,7 @@ async fn secure_join_join_after_listener_stop_fails_closed() {
     .await
     .unwrap();
   // One in-flight accept can still complete after the stop returns; wait
-  // until the public listener page is empty before the late join.
+  // until the public listener page is empty before the late merge.
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
   loop {
     let listeners = receiver
@@ -1418,7 +1454,7 @@ async fn secure_join_join_after_listener_stop_fails_closed() {
   .await;
   let error = late
     .handle
-    .command(JoinCluster::new(
+    .command(MergeCluster::new(
       listener.endpoint().clone(),
       issued.into_credential(),
     ))
@@ -1429,7 +1465,7 @@ async fn secure_join_join_after_listener_stop_fails_closed() {
       error.kind(),
       ErrorKind::Io | ErrorKind::AuthenticationFailed | ErrorKind::StreamInterrupted
     ),
-    "late join must fail closed with a typed error, got {:?}",
+    "late merge must fail closed with a typed error, got {:?}",
     error.kind()
   );
 
@@ -1457,10 +1493,9 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
     .await,
     _keys: Arc::new(ScriptedKeys::full()),
   };
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let receiver_listener = receiver
@@ -1481,7 +1516,7 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
     _keys: Arc::new(ScriptedKeys::full()),
   };
   let secret = issued.credential().expose_secret().to_owned();
-  let admission = join_ok(&joiner.handle, receiver_listener.endpoint(), &secret).await;
+  let merge = merge_ok(&joiner.handle, receiver_listener.endpoint(), &secret).await;
 
   // The joiner now listens so the receiver can dial it back.
   let joiner_listener = joiner
@@ -1491,10 +1526,10 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
     .unwrap();
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
-  let joiner_id = admission.admitted_node().clone();
+  let joiner_id = merge.node().clone();
 
   // Crossed dial: the receiver dials the already-connected joiner while the
-  // incoming session from the join is still live.
+  // incoming session from the merge is still live.
   let authenticated = receiver
     .handle
     .command(ConnectMember::new(
@@ -1527,10 +1562,9 @@ async fn secure_join_shutdown_rejects_new_work_after_drain() {
     Arc::new(ScriptedKeys::full_at(220_000)),
   )
   .await;
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -1544,14 +1578,14 @@ async fn secure_join_shutdown_rejects_new_work_after_drain() {
   )
   .await;
   let secret = issued.credential().expose_secret().to_owned();
-  join_ok(&joiner.handle, listener.endpoint(), &secret).await;
+  merge_ok(&joiner.handle, listener.endpoint(), &secret).await;
 
   receiver.handle.command(Shutdown::new()).await.unwrap();
   // New work after shutdown is rejected with a typed shutdown error, not
   // accepted or hung.
   let error = receiver
     .handle
-    .command(CreateCluster::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::ShuttingDown);
@@ -1564,7 +1598,7 @@ async fn secure_join_shutdown_rejects_new_work_after_drain() {
 use radiata::{GetMember, PageMembers, PageSpec, PageTopology};
 
 /// The public membership/topology views expose the local owner-marked
-/// descriptor and the authenticated session edge after a join.
+/// descriptor and the authenticated session edge after a merge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_public_membership_and_topology_views() {
   let receiver = start(
@@ -1572,10 +1606,9 @@ async fn secure_join_public_membership_and_topology_views() {
     Arc::new(ScriptedKeys::full_at(400_000)),
   )
   .await;
-  receiver.handle.command(CreateCluster::new()).await.unwrap();
   let issued = receiver
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let listener = receiver
@@ -1589,7 +1622,7 @@ async fn secure_join_public_membership_and_topology_views() {
   )
   .await;
   let secret = issued.credential().expose_secret().to_owned();
-  let admission = join_ok(&joiner.handle, listener.endpoint(), &secret).await;
+  let merge = merge_ok(&joiner.handle, listener.endpoint(), &secret).await;
 
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
@@ -1627,7 +1660,7 @@ async fn secure_join_public_membership_and_topology_views() {
     topology
       .items()
       .iter()
-      .any(|edge| edge.destination() == admission.admitted_node() && edge.connected()),
+      .any(|edge| edge.destination() == merge.node() && edge.connected()),
     "authenticated session edge must be visible"
   );
 
@@ -1635,16 +1668,15 @@ async fn secure_join_public_membership_and_topology_views() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// G5-06 core: a sixteen-node cluster joins the issuer and the public
+/// G5-06 core: a sixteen-node cluster merges with the issuer and the public
 /// topology view exposes the authenticated edges (SC-G05-P0-24).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_sixteen_node_membership_joins_and_views() {
+async fn secure_join_sixteen_node_membership_merges_and_views() {
   let issuer = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(500_000)),
   )
   .await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let listener = issuer
     .handle
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
@@ -1660,7 +1692,7 @@ async fn secure_join_sixteen_node_membership_joins_and_views() {
     )
     .await;
     let secret = issued.credential().expose_secret().to_owned();
-    join_with_retry(&member.handle, listener.endpoint(), &secret).await;
+    merge_with_retry(&member.handle, listener.endpoint(), &secret).await;
     members.push(member);
   }
 

@@ -1,4 +1,4 @@
-//! Fixed credential-admission rate limiting (ADR-0007, THR-001).
+//! Fixed credential-merge rate limiting (ADR-0007, THR-001).
 //!
 //! Before any handshake or signing work, each connection attempt is
 //! admitted against the fixed policy: per-source and global pending
@@ -6,7 +6,7 @@
 //! source-bucket table with idle eviction, and the ten-second
 //! authentication deadline owned by the session driver. A rejected
 //! attempt consumes no credential and performs no signing; an
-//! [`AdmissionSlot`] holds the pending count for exactly one in-flight
+//! [`MergeSlot`] holds the pending count for exactly one in-flight
 //! attempt and releases it on every outcome, including cancellation.
 //!
 //! Rate windows use the monotonic clock, so host wall-clock rollback can
@@ -31,17 +31,17 @@ pub(crate) const WINDOW_SECONDS: Duration = Duration::from_secs(60);
 pub(crate) const SOURCE_BUCKET_LIMIT: usize = 1024;
 pub(crate) const SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(600);
 
-/// The canonical admission source. The peer port is dropped (ephemeral
+/// The canonical merge source. The peer port is dropped (ephemeral
 /// reconnects are aliases of one source), IPv4-mapped IPv6 collapses to its
 /// IPv4 form, so every alias of one source shares one bucket (ADR-0007
 /// normalized-source aliases).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum AdmissionSource {
+pub(crate) enum MergeSource {
   V4([u8; 4]),
   V6([u8; 16]),
 }
 
-impl AdmissionSource {
+impl MergeSource {
   pub(crate) fn normalize(address: SocketAddr) -> Self {
     match address.ip() {
       IpAddr::V4(v4) => Self::V4(v4.octets()),
@@ -82,7 +82,7 @@ impl RateWindow {
       self.count = 0;
     }
     if self.count >= self.limit {
-      return Err(Error::overloaded("admission rate window"));
+      return Err(Error::overloaded("merge rate window"));
     }
     self.count += 1;
     Ok(())
@@ -96,18 +96,18 @@ struct SourceBucket {
 }
 
 struct Inner {
-  sources: BTreeMap<AdmissionSource, SourceBucket>,
+  sources: BTreeMap<MergeSource, SourceBucket>,
   global_pending: usize,
   global_window: RateWindow,
 }
 
-/// The fixed admission limiter shared by every accepted connection.
+/// The fixed merge limiter shared by every accepted connection.
 #[derive(Clone)]
-pub(crate) struct AdmissionLimiter {
+pub(crate) struct MergeLimiter {
   inner: Arc<Mutex<Inner>>,
 }
 
-impl AdmissionLimiter {
+impl MergeLimiter {
   pub(crate) fn new() -> Self {
     let now = Instant::now();
     Self {
@@ -120,23 +120,23 @@ impl AdmissionLimiter {
   }
 
   /// Admits one connection attempt from `source`, holding its pending slot
-  /// until the [`AdmissionSlot`] drops. Rejection is a typed overload and
+  /// until the [`MergeSlot`] drops. Rejection is a typed overload and
   /// never consumes a credential.
-  pub(crate) fn begin(&self, source: AdmissionSource) -> Result<AdmissionSlot> {
+  pub(crate) fn begin(&self, source: MergeSource) -> Result<MergeSlot> {
     let now = Instant::now();
     let mut inner = self
       .inner
       .lock()
-      .map_err(|_| Error::internal("admission limiter"))?;
+      .map_err(|_| Error::internal("merge limiter"))?;
     if !inner.sources.contains_key(&source) && inner.sources.len() >= SOURCE_BUCKET_LIMIT {
       inner.evict_idle(now);
       if !inner.sources.contains_key(&source) && inner.sources.len() >= SOURCE_BUCKET_LIMIT {
-        return Err(Error::overloaded("admission source buckets"));
+        return Err(Error::overloaded("merge source buckets"));
       }
     }
     inner.global_window.record(now)?;
     if inner.global_pending >= PENDING_GLOBAL {
-      return Err(Error::overloaded("admission global pending"));
+      return Err(Error::overloaded("merge global pending"));
     }
     {
       let bucket = inner.sources.entry(source).or_insert_with(|| SourceBucket {
@@ -147,12 +147,12 @@ impl AdmissionLimiter {
       bucket.last_seen = now;
       bucket.window.record(now)?;
       if bucket.pending >= PENDING_PER_SOURCE {
-        return Err(Error::overloaded("admission source pending"));
+        return Err(Error::overloaded("merge source pending"));
       }
       bucket.pending += 1;
     }
     inner.global_pending += 1;
-    Ok(AdmissionSlot {
+    Ok(MergeSlot {
       limiter: self.clone(),
       source,
     })
@@ -163,7 +163,7 @@ impl Inner {
   /// Evicts buckets idle for the configured lifetime when the table is
   /// full, so one source can never pin the table against all others.
   fn evict_idle(&mut self, now: Instant) {
-    let expired: Vec<AdmissionSource> = self
+    let expired: Vec<MergeSource> = self
       .sources
       .iter()
       .filter(|(_, bucket)| {
@@ -179,18 +179,18 @@ impl Inner {
 
 /// One in-flight admission attempt. Holds the per-source and global
 /// pending counts until dropped, whatever the handshake outcome.
-pub(crate) struct AdmissionSlot {
-  limiter: AdmissionLimiter,
-  source: AdmissionSource,
+pub(crate) struct MergeSlot {
+  limiter: MergeLimiter,
+  source: MergeSource,
 }
 
-impl core::fmt::Debug for AdmissionSlot {
+impl core::fmt::Debug for MergeSlot {
   fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    formatter.write_str("AdmissionSlot(..)")
+    formatter.write_str("MergeSlot(..)")
   }
 }
 
-impl Drop for AdmissionSlot {
+impl Drop for MergeSlot {
   fn drop(&mut self) {
     if let Ok(mut inner) = self.limiter.inner.lock() {
       inner.global_pending = inner.global_pending.saturating_sub(1);
@@ -209,17 +209,17 @@ mod tests {
   };
 
   use super::{
-    AdmissionLimiter, AdmissionSource, PENDING_GLOBAL, PENDING_PER_SOURCE, RATE_GLOBAL,
-    RATE_PER_SOURCE, SOURCE_BUCKET_LIMIT,
+    MergeLimiter, MergeSource, PENDING_GLOBAL, PENDING_PER_SOURCE, RATE_GLOBAL, RATE_PER_SOURCE,
+    SOURCE_BUCKET_LIMIT,
   };
   use crate::ErrorKind;
 
-  fn source(octet: u8) -> AdmissionSource {
-    AdmissionSource::V4([10, 0, 0, octet])
+  fn source(octet: u8) -> MergeSource {
+    MergeSource::V4([10, 0, 0, octet])
   }
 
-  fn source16(index: u16) -> AdmissionSource {
-    AdmissionSource::V4([10, 0, (index >> 8) as u8, index as u8])
+  fn source16(index: u16) -> MergeSource {
+    MergeSource::V4([10, 0, (index >> 8) as u8, index as u8])
   }
 
   fn addr(ip: IpAddr) -> SocketAddr {
@@ -227,21 +227,21 @@ mod tests {
   }
 
   #[test]
-  fn admission_rate_normalizes_ipv4_mapped_aliases() {
-    let v4 = AdmissionSource::normalize(addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7))));
-    let mapped = AdmissionSource::normalize(addr(IpAddr::V6(Ipv6Addr::new(
+  fn merge_rate_normalizes_ipv4_mapped_aliases() {
+    let v4 = MergeSource::normalize(addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7))));
+    let mapped = MergeSource::normalize(addr(IpAddr::V6(Ipv6Addr::new(
       0, 0, 0, 0, 0, 0xFFFF, 0xC0A8, 0x0107,
     ))));
     assert_eq!(v4, mapped, "v4-mapped v6 must share the v4 bucket");
-    let native = AdmissionSource::normalize(addr(IpAddr::V6(Ipv6Addr::new(
+    let native = MergeSource::normalize(addr(IpAddr::V6(Ipv6Addr::new(
       0x2001, 0xDB8, 0, 0, 0, 0, 0, 1,
     ))));
     assert_ne!(v4, native);
   }
 
   #[test]
-  fn admission_rate_per_source_window_and_pending_are_bounded() {
-    let limiter = AdmissionLimiter::new();
+  fn merge_rate_per_source_window_and_pending_are_bounded() {
+    let limiter = MergeLimiter::new();
     let origin = source(1);
     // The per-source fixed window saturates at the configured rate.
     for _ in 0..RATE_PER_SOURCE {
@@ -256,7 +256,7 @@ mod tests {
     drop(limiter.begin(source(2)).unwrap());
 
     // Pending: hold the per-source limit, then one more is refused.
-    let limiter = AdmissionLimiter::new();
+    let limiter = MergeLimiter::new();
     let held: Vec<_> = (0..PENDING_PER_SOURCE)
       .map(|_| limiter.begin(origin).unwrap())
       .collect();
@@ -270,8 +270,8 @@ mod tests {
   }
 
   #[test]
-  fn admission_rate_global_window_and_pending_are_bounded() {
-    let limiter = AdmissionLimiter::new();
+  fn merge_rate_global_window_and_pending_are_bounded() {
+    let limiter = MergeLimiter::new();
     let mut held = Vec::new();
     // Hold the global pending limit from distinct sources.
     let mut octet = 1;
@@ -287,7 +287,7 @@ mod tests {
     drop(held);
 
     // Global rate window saturates across sources.
-    let limiter = AdmissionLimiter::new();
+    let limiter = MergeLimiter::new();
     let mut octet = 1;
     for _ in 0..RATE_GLOBAL {
       drop(limiter.begin(source(octet)).unwrap());
@@ -301,8 +301,8 @@ mod tests {
   }
 
   #[test]
-  fn admission_rate_bucket_table_is_bounded_and_evicts_idle_sources() {
-    let limiter = AdmissionLimiter::new();
+  fn merge_rate_bucket_table_is_bounded_and_evicts_idle_sources() {
+    let limiter = MergeLimiter::new();
     // Fill the table up to the limit with distinct sources. The global
     // rate window is reset per iteration so the test isolates the bucket
     // bound from the 256/60s global rate (which would legitimately cap a

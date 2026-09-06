@@ -19,8 +19,8 @@ use std::{
 };
 
 use radiata::{
-  CreateCluster, Endpoint, GetLocalNode, JoinCluster, Listen, NodeBuilder, NodeConfig, PageMembers,
-  PageSpec, RotateJoinCredential, adapters::redb_store,
+  Endpoint, GetLocalNode, Listen, MergeCluster, NodeBuilder, NodeConfig, PageMembers,
+  PageSpec, RotateMergeCredential, adapters::redb_store,
 };
 
 #[path = "../common_impl.rs"]
@@ -133,16 +133,12 @@ async fn creator(
   handle: radiata::NodeHandle, endpoint: Endpoint, stdin: &mut std::io::StdinLock<'static>,
   stdout: &mut std::io::StdoutLock<'static>,
 ) -> Result<(), String> {
-  // Genesis runs on the unlistening store; the initial credential rotates
-  // BEFORE the listener starts, so the accept loop's first computed hint
-  // already carries an active generation (a hint computed before any
-  // credential exists refuses every early joiner).
-  handle
-    .command(CreateCluster::new())
-    .await
-    .map_err(|error| error.to_string())?;
+  // Born-with-cluster (ADR-0009): no genesis step. The initial credential
+  // rotates BEFORE the listener starts, so the accept loop's first computed
+  // hint already carries an active generation (a hint computed before any
+  // credential exists refuses every early merger).
   let issued = handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .map_err(|error| error.to_string())?;
   let listener = handle
@@ -176,7 +172,7 @@ async fn creator(
           }
           "rotate" => {
             let issued = handle
-              .command(RotateJoinCredential::new())
+              .command(RotateMergeCredential::new())
               .await
               .map_err(|error| error.to_string())?;
             println!("credential {}", issued.credential().expose_secret());
@@ -267,10 +263,10 @@ async fn member(
   let secret = parts.next().ok_or("expected credential".to_owned())?;
   let issuer_text = std::env::var(common::ENV_ISSUER).map_err(|_| "issuer unset".to_owned())?;
   let issuer = Endpoint::parse(&issuer_text).map_err(|error| error.to_string())?;
-  let credential = radiata::JoinCredential::parse(secret).map_err(|error| error.to_string())?;
+  let credential = radiata::MergeCredential::parse(secret).map_err(|error| error.to_string())?;
   let joined = tokio::time::timeout(
     Duration::from_secs(30),
-    handle.command(JoinCluster::new(issuer, credential)),
+    handle.command(MergeCluster::new(issuer, credential)),
   )
   .await;
   match joined {

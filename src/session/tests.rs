@@ -1,8 +1,9 @@
 //! Session-driver tests over real loopback TLS WebSocket connections.
 //!
-//! The join lane proves the full ADR-0001 bootstrap ordering with real
-//! proofs, exporter channel bindings, and journaled admission; the member
-//! lane proves the credential-free reconnect mechanism both directions.
+//! The merge lane proves the full ADR-0001 bootstrap ordering with real
+//! proofs, exporter channel bindings, and journaled merge adoption; the
+//! member lane proves the credential-free reconnect mechanism both
+//! directions.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,9 +13,9 @@ use super::{SessionDriver, handshake_frame_rules};
 use crate::{
   Digest, ErrorKind, FeatureTag,
   identity::{
-    credential::JoinCredentialIssuer,
-    genesis::create_cluster,
-    lifecycle::LocalIdentityContext,
+    credential::MergeCredentialIssuer,
+    lifecycle::{LocalIdentityContext, ensure_self_binding},
+    records::identity_binding_key,
     testing::{
       CommitFault, FaultingFactory, ScriptedKeys, SequenceEntropy, fresh_reference, open_context,
     },
@@ -31,14 +32,14 @@ use crate::{
   transport::{
     cert::EphemeralCertificate,
     connection::Connection,
-    tls::{join_client_config, server_config},
+    tls::{merge_client_config, server_config},
   },
 };
 
 struct Node {
   context: Arc<LocalIdentityContext>,
   driver: SessionDriver,
-  issuer: Arc<Mutex<JoinCredentialIssuer>>,
+  issuer: Arc<Mutex<MergeCredentialIssuer>>,
   keys: Arc<ScriptedKeys>,
   entropy: Arc<SequenceEntropy>,
 }
@@ -55,7 +56,12 @@ async fn node_from(
   factory: Arc<dyn crate::provider::StorageFactory>, offer: FeatureOffer,
 ) -> Node {
   let context = Arc::new(open_context(&factory, &keys, &entropy).await.unwrap());
-  let issuer = Arc::new(Mutex::new(JoinCredentialIssuer::new()));
+  // Born-with-cluster (ADR-0009): every started node holds its own
+  // singleton identity binding, exactly as `spawn_runtime` establishes.
+  ensure_self_binding(&context, entropy.as_ref())
+    .await
+    .unwrap();
+  let issuer = Arc::new(Mutex::new(MergeCredentialIssuer::new()));
   let driver = SessionDriver::new(
     context.clone(),
     keys.as_provider(),
@@ -91,16 +97,12 @@ async fn reopen_node(
   node_from(keys, entropy, factory, offer).await
 }
 
-async fn clustered_node() -> Node {
-  let node = node().await;
-  create_cluster(
-    &node.context,
-    &node.keys.as_provider(),
-    node.entropy.as_ref(),
-  )
-  .await
-  .unwrap();
-  node
+/// Whether the node's own identity binding record is present in its
+/// metadata store.
+async fn has_self_binding(node: &Node) -> bool {
+  let (namespace, key) = identity_binding_key(node.context.identity().node()).unwrap();
+  let snapshot = node.context.store().snapshot().await.unwrap();
+  snapshot.get(&namespace, &key).await.unwrap().is_some()
 }
 
 /// Spawns a responder task for one incoming connection. The returned
@@ -119,7 +121,7 @@ async fn listen(
   let task = tokio::spawn(async move {
     let (tcp, _) = listener.accept().await.unwrap();
     let hint = if with_hint {
-      driver.join_hint().await.unwrap()
+      driver.merge_hint().await.unwrap()
     } else {
       None
     };
@@ -136,7 +138,7 @@ async fn connect(address: std::net::SocketAddr) -> Connection {
   let tcp = TcpStream::connect(address).await.unwrap();
   Connection::connect(
     tcp,
-    join_client_config().unwrap(),
+    merge_client_config().unwrap(),
     "127.0.0.1".try_into().unwrap(),
     handshake_frame_rules().unwrap(),
   )
@@ -144,7 +146,7 @@ async fn connect(address: std::net::SocketAddr) -> Connection {
   .unwrap()
 }
 
-fn credential_secret(issuer: &Arc<Mutex<JoinCredentialIssuer>>) -> CredentialSecret {
+fn credential_secret(issuer: &Arc<Mutex<MergeCredentialIssuer>>) -> CredentialSecret {
   let guard = issuer.lock().unwrap();
   let credential = guard
     .active_credential(std::time::SystemTime::now())
@@ -153,9 +155,9 @@ fn credential_secret(issuer: &Arc<Mutex<JoinCredentialIssuer>>) -> CredentialSec
 }
 
 #[tokio::test]
-async fn session_join_then_member_reconnect_round_trips() {
-  let receiver = clustered_node().await;
-  let joiner = node().await;
+async fn session_merge_then_member_reconnect_round_trips() {
+  let receiver = node().await;
+  let merger = node().await;
   let issued = receiver
     .issuer
     .lock()
@@ -165,10 +167,10 @@ async fn session_join_then_member_reconnect_round_trips() {
 
   let (address, first_responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
-  let (session, view) = joiner
+  let hint = connection.merge_hint().unwrap().clone();
+  let (session, view) = merger
     .driver
-    .join(
+    .merge(
       &mut connection,
       &hint,
       CredentialSecret::from_credential(issued.credential()),
@@ -177,18 +179,18 @@ async fn session_join_then_member_reconnect_round_trips() {
     .unwrap();
   let issuer_id = session.peer().clone();
   assert!(!session.selected_features().is_empty());
-  assert_eq!(view.issuer(), &issuer_id);
-  assert_ne!(view.admitted_node(), &issuer_id);
+  assert_eq!(view.peer(), &issuer_id);
+  assert_ne!(view.node(), &issuer_id);
 
-  // A fresh joiner replaying the consumed credential is rejected; the
-  // first join already consumed the generation.
+  // A fresh merger replaying the consumed credential is rejected; the
+  // first merge already consumed the generation.
   let second = node().await;
   let (address, second_responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
+  let hint = connection.merge_hint().unwrap().clone();
   let error = second
     .driver
-    .join(
+    .merge(
       &mut connection,
       &hint,
       CredentialSecret::from_credential(issued.credential()),
@@ -202,7 +204,7 @@ async fn session_join_then_member_reconnect_round_trips() {
   // Member-mode reconnect: no credential, trusted bindings on both sides.
   let (address, member_responder) = listen(&receiver, false).await;
   let mut connection = connect(address).await;
-  let session = joiner
+  let session = merger
     .driver
     .initiate_member(&mut connection, &issuer_id)
     .await
@@ -210,14 +212,14 @@ async fn session_join_then_member_reconnect_round_trips() {
   assert_eq!(session.peer(), &issuer_id);
   assert_eq!(
     member_responder.await.unwrap().unwrap().peer(),
-    &peer_return_marker(&joiner)
+    &peer_return_marker(&merger)
   );
 }
 
 #[tokio::test]
-async fn session_join_rejects_wrong_credential_without_consuming() {
-  let receiver = clustered_node().await;
-  let joiner = node().await;
+async fn session_merge_rejects_wrong_credential_without_consuming() {
+  let receiver = node().await;
+  let merger = node().await;
   receiver
     .issuer
     .lock()
@@ -226,17 +228,17 @@ async fn session_join_rejects_wrong_credential_without_consuming() {
     .unwrap();
 
   // A wrong-but-canonical credential from an independent issuer.
-  let mut other = JoinCredentialIssuer::new();
+  let mut other = MergeCredentialIssuer::new();
   let wrong = other
     .rotate(receiver.entropy.as_ref(), std::time::SystemTime::now())
     .unwrap();
 
   let (address, responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
-  let error = joiner
+  let hint = connection.merge_hint().unwrap().clone();
+  let error = merger
     .driver
-    .join(
+    .merge(
       &mut connection,
       &hint,
       CredentialSecret::from_credential(wrong.credential()),
@@ -256,54 +258,23 @@ async fn session_join_rejects_wrong_credential_without_consuming() {
   receiver.issuer.lock().unwrap().release().unwrap();
 }
 
-#[tokio::test]
-async fn session_join_rejects_hint_cluster_mismatch_fail_closed() {
-  let receiver = clustered_node().await;
-  let joiner = node().await;
-  receiver
-    .issuer
-    .lock()
-    .unwrap()
-    .rotate(receiver.entropy.as_ref(), std::time::SystemTime::now())
-    .unwrap();
-  let secret = credential_secret(&receiver.issuer);
-
-  // A hint from a different cluster must fail the state machine's equality
-  // check before any signing or admission.
-  let (address, responder) = listen(&receiver, true).await;
-  let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
-  let foreign = crate::transport::ws::JoinHint::new(
-    crate::ClusterId::parse("cluster_999999999999999999999").unwrap(),
-    *hint.generation(),
-  );
-  let error = joiner
-    .driver
-    .join(&mut connection, &foreign, secret)
-    .await
-    .unwrap_err();
-  assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-  assert!(responder.await.unwrap().is_err());
-}
-
 fn peer_return_marker(node: &Node) -> crate::NodeId {
   node.context.identity().node().clone()
 }
 
-// ---- T-G03-03 atomic admission/reconciliation evidence ----
+// ---- T-G03-03 atomic merge/reconciliation evidence ----
 
-/// SC-G03-P0-07: a genuine pre-commit rejection of the admission commit
+/// SC-G03-P0-07: a genuine pre-commit rejection of the merge commit
 /// leaves the issuer credential generation released, so one later attempt
 /// with the same still-valid credential succeeds.
 #[tokio::test]
-async fn session_admission_precommit_abort_releases_generation_for_same_credential_retry() {
+async fn session_merge_precommit_abort_releases_generation_for_same_credential_retry() {
   let (reference, _factory) = fresh_reference();
-  // Identity creation (3) and genesis (2) pass; the admission triple
-  // commit at position six is rejected before applying.
+  // Identity creation (3) and the self-binding (1) pass; the merge triple
+  // commit at position five is rejected before applying.
   let faulting = FaultingFactory::new(
     &reference,
     vec![
-      CommitFault::Pass,
       CommitFault::Pass,
       CommitFault::Pass,
       CommitFault::Pass,
@@ -312,14 +283,7 @@ async fn session_admission_precommit_abort_releases_generation_for_same_credenti
     ],
   );
   let receiver = node_with_factory(faulting.as_factory()).await;
-  create_cluster(
-    &receiver.context,
-    &receiver.keys.as_provider(),
-    receiver.entropy.as_ref(),
-  )
-  .await
-  .unwrap();
-  let joiner = node().await;
+  let merger = node().await;
   receiver
     .issuer
     .lock()
@@ -329,11 +293,11 @@ async fn session_admission_precommit_abort_releases_generation_for_same_credenti
 
   let (address, first_responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
+  let hint = connection.merge_hint().unwrap().clone();
   let secret = credential_secret(&receiver.issuer);
-  let error = joiner
+  let error = merger
     .driver
-    .join(&mut connection, &hint, secret.clone())
+    .merge(&mut connection, &hint, secret.clone())
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -343,13 +307,13 @@ async fn session_admission_precommit_abort_releases_generation_for_same_credenti
   // still valid for exactly one later attempt.
   let (address, second_responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
-  let (session, view) = joiner
+  let hint = connection.merge_hint().unwrap().clone();
+  let (session, view) = merger
     .driver
-    .join(&mut connection, &hint, secret)
+    .merge(&mut connection, &hint, secret)
     .await
     .unwrap();
-  assert_eq!(view.issuer(), session.peer());
+  assert_eq!(view.peer(), session.peer());
   second_responder.await.unwrap().unwrap();
 }
 
@@ -358,7 +322,7 @@ async fn session_admission_precommit_abort_releases_generation_for_same_credenti
 /// authentication after an authoritative reopen.
 #[tokio::test]
 async fn session_adoption_result_loss_recovers_via_member_reconnect() {
-  let receiver = clustered_node().await;
+  let receiver = node().await;
   receiver
     .issuer
     .lock()
@@ -366,8 +330,8 @@ async fn session_adoption_result_loss_recovers_via_member_reconnect() {
     .rotate(receiver.entropy.as_ref(), std::time::SystemTime::now())
     .unwrap();
 
-  // The joiner's adoption commit applies but reports unknown, and the
-  // in-process reconcile also stays unknown: the join result is lost.
+  // The merger's adoption commit applies but reports unknown, and the
+  // in-process reconcile also stays unknown: the merge result is lost.
   let (reference, _factory) = fresh_reference();
   let faulting = FaultingFactory::new(
     &reference,
@@ -375,62 +339,58 @@ async fn session_adoption_result_loss_recovers_via_member_reconnect() {
       CommitFault::Pass,
       CommitFault::Pass,
       CommitFault::Pass,
+      CommitFault::Pass,
       CommitFault::UnknownApplied,
     ],
   );
   faulting.push_reconcile_fault(ReconcileOutcome::Unknown);
-  let joiner = node_with_factory(faulting.as_factory()).await;
-  let joiner_id = peer_return_marker(&joiner);
+  let merger = node_with_factory(faulting.as_factory()).await;
+  let merger_id = peer_return_marker(&merger);
 
   let (address, responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
+  let hint = connection.merge_hint().unwrap().clone();
   let secret = credential_secret(&receiver.issuer);
-  let error = joiner
+  let error = merger
     .driver
-    .join(&mut connection, &hint, secret)
+    .merge(&mut connection, &hint, secret)
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::CommitUnknown);
-  // The receiver committed and delivered the grant; only the joiner lost
+  // The receiver committed and delivered the grant; only the merger lost
   // the final adoption result.
   assert!(responder.await.unwrap().is_ok());
 
   // Authoritative reopen on the same provider with the same identity
-  // reconciles the pending adoption journal to committed: the joiner now
+  // reconciles the pending adoption journal to committed: the merger now
   // owns its stored grant.
-  let keys = joiner.keys.clone();
-  let entropy = joiner.entropy.clone();
-  drop(joiner);
-  let joiner = reopen_node(keys, entropy, faulting.as_factory()).await;
-  assert!(
-    crate::identity::genesis::local_cluster(&joiner.context)
-      .await
-      .unwrap()
-      .is_some()
-  );
+  let keys = merger.keys.clone();
+  let entropy = merger.entropy.clone();
+  drop(merger);
+  let merger = reopen_node(keys, entropy, faulting.as_factory()).await;
+  assert!(has_self_binding(&merger).await);
 
   // The recovered identity authenticates in member mode without any
   // credential, proving its stored grant is usable.
   let (address, member_responder) = listen(&receiver, false).await;
   let mut connection = connect(address).await;
-  let session = joiner
+  let session = merger
     .driver
     .initiate_member(&mut connection, &peer_return_marker(&receiver))
     .await
     .unwrap();
   assert_eq!(session.peer(), &peer_return_marker(&receiver));
-  assert_eq!(member_responder.await.unwrap().unwrap().peer(), &joiner_id);
+  assert_eq!(member_responder.await.unwrap().unwrap().peer(), &merger_id);
 }
 
 /// SC-G03-P0-14: a credential-free member reconnect negotiates the exact
-/// same feature policy as the original join — byte-identical feature
-/// selection, never a weakened offer — and never consults a join
+/// same feature policy as the original merge — byte-identical feature
+/// selection, never a weakened offer — and never consults a merge
 /// credential.
 #[tokio::test]
 async fn session_member_reconnect_preserves_exact_feature_selection() {
-  let receiver = clustered_node().await;
-  let joiner = node().await;
+  let receiver = node().await;
+  let merger = node().await;
   let issued = receiver
     .issuer
     .lock()
@@ -440,24 +400,24 @@ async fn session_member_reconnect_preserves_exact_feature_selection() {
 
   let (address, first_responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
-  let (join_session, _) = joiner
+  let hint = connection.merge_hint().unwrap().clone();
+  let (merge_session, _) = merger
     .driver
-    .join(
+    .merge(
       &mut connection,
       &hint,
       CredentialSecret::from_credential(issued.credential()),
     )
     .await
     .unwrap();
-  let issuer_id = join_session.peer().clone();
-  let join_features = join_session.selected_features().to_vec();
+  let issuer_id = merge_session.peer().clone();
+  let merge_features = merge_session.selected_features().to_vec();
   first_responder.await.unwrap().unwrap();
 
   // Member reconnect: key trust only, no credential, same feature policy.
   let (address, member_responder) = listen(&receiver, false).await;
   let mut connection = connect(address).await;
-  let reconnect = joiner
+  let reconnect = merger
     .driver
     .initiate_member(&mut connection, &issuer_id)
     .await
@@ -465,24 +425,24 @@ async fn session_member_reconnect_preserves_exact_feature_selection() {
   assert_eq!(reconnect.peer(), &issuer_id);
   assert_eq!(
     reconnect.selected_features(),
-    &join_features[..],
+    &merge_features[..],
     "reconnect must reproduce the prior exact feature selection"
   );
   assert!(!reconnect.selected_features().is_empty());
   assert_eq!(
     member_responder.await.unwrap().unwrap().peer(),
-    &peer_return_marker(&joiner)
+    &peer_return_marker(&merger)
   );
 
   // The responder side of the reconnect observed the identical selection.
   let (address, _) = listen(&receiver, false).await;
   let mut connection = connect(address).await;
-  let responder_side = joiner
+  let responder_side = merger
     .driver
     .initiate_member(&mut connection, &issuer_id)
     .await
     .unwrap();
-  assert_eq!(responder_side.selected_features(), &join_features[..]);
+  assert_eq!(responder_side.selected_features(), &merge_features[..]);
 }
 
 // ---- T-G10-02 mixed-binary feature intersection evidence ----
@@ -562,11 +522,9 @@ fn expected_mixed_selection() -> Vec<FeatureTag> {
   tags
 }
 
-/// Joins `initiator` (prior) against `responder` (current) and asserts the
+/// Merges `initiator` (prior) into `responder` (current) and asserts the
 /// exact intersection on both sides.
-async fn join_and_assert_mixed_selection(
-  responder: &Node, initiator: &Node,
-) -> crate::AdmissionView {
+async fn merge_and_assert_mixed_selection(responder: &Node, initiator: &Node) -> crate::MergeView {
   let issued = responder
     .issuer
     .lock()
@@ -575,10 +533,10 @@ async fn join_and_assert_mixed_selection(
     .unwrap();
   let (address, responder_task) = listen(responder, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
+  let hint = connection.merge_hint().unwrap().clone();
   let (session, view) = initiator
     .driver
-    .join(
+    .merge(
       &mut connection,
       &hint,
       CredentialSecret::from_credential(issued.credential()),
@@ -604,9 +562,9 @@ async fn join_and_assert_mixed_selection(
 /// and the never-supported routed-delivery label stays unselected.
 #[tokio::test]
 async fn mixed_prior_initiator_negotiates_current_responder() {
-  let current = clustered_node().await;
+  let current = node().await;
   let prior = node_with_offer(prior_offer()).await;
-  join_and_assert_mixed_selection(&current, &prior).await;
+  merge_and_assert_mixed_selection(&current, &prior).await;
 }
 
 /// SC-G10-P0-07: a current initiator negotiates a prior responder with
@@ -614,23 +572,11 @@ async fn mixed_prior_initiator_negotiates_current_responder() {
 /// opposite initiator role.
 #[tokio::test]
 async fn mixed_current_initiator_negotiates_prior_responder() {
-  let prior = clustered_node_with_offer(prior_offer()).await;
+  let prior = node_with_offer(prior_offer()).await;
   let current =
     node_with_offer(node_offer(&FeatureRegistry::builtin().unwrap(), &Default::default()).unwrap())
       .await;
-  join_and_assert_mixed_selection(&prior, &current).await;
-}
-
-async fn clustered_node_with_offer(offer: FeatureOffer) -> Node {
-  let node = node_with_offer(offer).await;
-  create_cluster(
-    &node.context,
-    &node.keys.as_provider(),
-    node.entropy.as_ref(),
-  )
-  .await
-  .unwrap();
-  node
+  merge_and_assert_mixed_selection(&prior, &current).await;
 }
 
 /// SC-G10-P0-08 (current initiator): a required label the prior binary
@@ -638,7 +584,7 @@ async fn clustered_node_with_offer(offer: FeatureOffer) -> Node {
 /// roles fail closed and no session exists.
 #[tokio::test]
 async fn mixed_current_required_routed_delivery_is_refused() {
-  let prior = clustered_node_with_offer(prior_offer()).await;
+  let prior = node_with_offer(prior_offer()).await;
   let current = node_with_offer(current_routed_required_offer()).await;
   let issued = prior
     .issuer
@@ -648,17 +594,17 @@ async fn mixed_current_required_routed_delivery_is_refused() {
     .unwrap();
   let (address, responder_task) = listen(&prior, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
-  let join_error = current
+  let hint = connection.merge_hint().unwrap().clone();
+  let merge_error = current
     .driver
-    .join(
+    .merge(
       &mut connection,
       &hint,
       CredentialSecret::from_credential(issued.credential()),
     )
     .await
     .unwrap_err();
-  assert_eq!(join_error.kind(), ErrorKind::AuthenticationFailed);
+  assert_eq!(merge_error.kind(), ErrorKind::AuthenticationFailed);
   let responder_error = responder_task.await.unwrap().unwrap_err();
   assert_eq!(responder_error.kind(), ErrorKind::AuthenticationFailed);
   assert!(
@@ -671,7 +617,7 @@ async fn mixed_current_required_routed_delivery_is_refused() {
 /// has never published is rejected identically in the opposite role.
 #[tokio::test]
 async fn mixed_prior_required_unknown_feature_is_refused() {
-  let current = clustered_node().await;
+  let current = node().await;
   let prior = node_with_offer(prior_only_offer()).await;
   let issued = current
     .issuer
@@ -681,17 +627,17 @@ async fn mixed_prior_required_unknown_feature_is_refused() {
     .unwrap();
   let (address, responder_task) = listen(&current, true).await;
   let mut connection = connect(address).await;
-  let hint = connection.join_hint().unwrap().clone();
-  let join_error = prior
+  let hint = connection.merge_hint().unwrap().clone();
+  let merge_error = prior
     .driver
-    .join(
+    .merge(
       &mut connection,
       &hint,
       CredentialSecret::from_credential(issued.credential()),
     )
     .await
     .unwrap_err();
-  assert_eq!(join_error.kind(), ErrorKind::AuthenticationFailed);
+  assert_eq!(merge_error.kind(), ErrorKind::AuthenticationFailed);
   let responder_error = responder_task.await.unwrap().unwrap_err();
   assert_eq!(responder_error.kind(), ErrorKind::AuthenticationFailed);
   assert!(
@@ -705,10 +651,10 @@ async fn mixed_prior_required_unknown_feature_is_refused() {
 /// is gone — the selection never outlives its session.
 #[tokio::test]
 async fn mixed_member_reconnect_preserves_selection_and_replaces_state() {
-  let current = clustered_node().await;
+  let current = node().await;
   let prior = node_with_offer(prior_offer()).await;
-  let view = join_and_assert_mixed_selection(&current, &prior).await;
-  let issuer_id = view.issuer().clone();
+  let view = merge_and_assert_mixed_selection(&current, &prior).await;
+  let issuer_id = view.peer().clone();
 
   // The reconnect must negotiate the identical intersection.
   let (address, member_responder) = listen(&current, false).await;

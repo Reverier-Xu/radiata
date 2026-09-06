@@ -20,8 +20,8 @@ use super::{
   store::{ResourceCommitOutcome, commit_record_ctx, read_record_ctx},
 };
 use crate::{
-  ClusterId, CommitReceipt, LabelKey, LabelSet, LabelValue, NodeId, ReconcileOutcome,
-  StoreRequirements, TransactionId,
+  CommitReceipt, LabelKey, LabelSet, LabelValue, NodeId, ReconcileOutcome, StoreRequirements,
+  TransactionId,
   api::SystemEntropy,
   provider::StorageFactory,
   storage::{MetadataStore, json::JsonStoreFactory},
@@ -64,7 +64,6 @@ fn labels() -> LabelSet {
 #[allow(clippy::too_many_arguments)]
 fn record(timestamp_millis: u64, removed: bool, uri: &str) -> ResourceRecordV1 {
   ResourceRecordV1::sign(
-    ClusterId::parse("cluster_000000000000000000001").unwrap(),
     name(),
     LabelValue::parse("document").unwrap(),
     crate::ResourceUri::parse(uri).unwrap(),

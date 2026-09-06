@@ -12,15 +12,15 @@
 use std::sync::Mutex;
 use std::{sync::Arc, time::Duration};
 
-use radiata::{
-  CreateCluster, Endpoint, ErrorKind, GetObservability, Listen, NodeBuilder, NodeConfig,
-  PageSessions, PageSpec, ProtocolTag, QualifiedTag, Shutdown, StreamMetadata, StreamPolicy,
-  StreamTarget, extension::KeyProvider,
-};
 #[cfg(all(test, feature = "json", unix))]
 use radiata::{
   DisconnectPeer, PageResources, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
-  RotateJoinCredential,
+  RotateMergeCredential,
+};
+use radiata::{
+  Endpoint, ErrorKind, GetObservability, Listen, NodeBuilder, NodeConfig, PageSessions, PageSpec,
+  ProtocolTag, QualifiedTag, Shutdown, StreamMetadata, StreamPolicy, StreamTarget,
+  extension::KeyProvider,
 };
 
 mod common;
@@ -95,10 +95,17 @@ async fn listen(node: &mut Node) {
 async fn observability_snapshot_covers_bounded_responsibilities() {
   let mut issuer = start_node(1).await;
   let mut member = start_node(2).await;
-  let cluster = issuer.handle.command(CreateCluster::new()).await.unwrap();
-  issuer.id = Some(cluster.creator().clone());
+  issuer.id = Some(
+    issuer
+      .handle
+      .query(radiata::GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id()
+      .clone(),
+  );
   listen(&mut issuer).await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
   member.id = Some(
     member
       .handle
@@ -273,15 +280,22 @@ async fn redaction_lane_rejects_every_forbidden_class() {
   };
   let mut member = start_node(3).await;
 
-  let cluster = issuer.handle.command(CreateCluster::new()).await.unwrap();
-  issuer.id = Some(cluster.creator().clone());
+  issuer.id = Some(
+    issuer
+      .handle
+      .query(radiata::GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id()
+      .clone(),
+  );
   listen(&mut issuer).await;
 
   // Markers: the credential secret, the packet body, a hostile label
   // value, a selector text, and the storage path.
   let issued = issuer
     .handle
-    .command(RotateJoinCredential::new())
+    .command(RotateMergeCredential::new())
     .await
     .unwrap();
   let credential_marker = issued.credential().expose_secret().to_owned();
@@ -289,7 +303,7 @@ async fn redaction_lane_rejects_every_forbidden_class() {
   let label_marker = "hostile\nlabel\x00value-MARKER";
   let selector_marker = "radiata.woooo.tech/labels/marker-selector-x1q9";
 
-  common::join_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
   member.id = Some(
     member
       .handle

@@ -81,7 +81,7 @@ mod tests {
 
   use super::{super::store, select_page_ctx};
   use crate::{
-    ClusterId, LabelKey, LabelSet, LabelValue, NodeId, ResourceName, ResourceUri, Selector,
+    LabelKey, LabelSet, LabelValue, NodeId, ResourceName, ResourceUri, Selector,
     api::SystemEntropy, provider::StorageFactory, storage::MetadataStore,
   };
 
@@ -119,7 +119,6 @@ mod tests {
       )
       .unwrap();
     super::ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       name(seed),
       LabelValue::parse(if seed.is_multiple_of(2) {
         "document"

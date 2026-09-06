@@ -12,7 +12,6 @@ async fn creator_starts_on_redb_with_harness_keys() {
     .start()
     .await
     .unwrap();
-  handle.command(radiata::CreateCluster::new()).await.unwrap();
   let local = handle.query(radiata::GetLocalNode::new()).await.unwrap();
-  assert!(local.cluster_id().as_str().starts_with("cluster_"));
+  assert!(local.node_id().as_str().starts_with("node_"));
 }

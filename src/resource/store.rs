@@ -187,8 +187,8 @@ mod tests {
     ResourceCommitOutcome, ResourceName, ResourceRecordV1, commit_record_ctx, read_record_ctx,
   };
   use crate::{
-    ClusterId, LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy,
-    provider::StorageFactory, storage::MetadataStore,
+    LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy, provider::StorageFactory,
+    storage::MetadataStore,
   };
 
   const SEED: [u8; 32] = [21; 32];
@@ -211,7 +211,6 @@ mod tests {
     timestamp_millis: u64, removal_rank: u64, removed: bool, uri: &str,
   ) -> ResourceRecordV1 {
     ResourceRecordV1::sign(
-      ClusterId::parse("cluster_000000000000000000001").unwrap(),
       name(),
       LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse(uri).unwrap(),

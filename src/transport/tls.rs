@@ -15,7 +15,7 @@
 //!   server sends one.
 //! - ALPN is not required: `alpn_protocols` stays empty on both sides; the
 //!   WebSocket upgrade runs directly over the TLS stream.
-//! - The join-mode client verifier is the custom ADR-0001
+//! - The merge-mode client verifier is the custom ADR-0001
 //!   [`BootstrapCertVerifier`], never the WebPKI chain verifier.
 
 use std::sync::Arc;
@@ -59,15 +59,15 @@ pub(crate) fn server_config(certificate: &EphemeralCertificate) -> Result<Arc<Se
   Ok(Arc::new(config))
 }
 
-/// Builds the join-mode client configuration: chain and hostname trust are
+/// Builds the merge-mode client configuration: chain and hostname trust are
 /// relaxed exactly as ADR-0001 permits, while the TLS 1.3
 /// `CertificateVerify` signature remains fully validated. The WebPKI chain
 /// verifier is never used in join mode.
-pub(crate) fn join_client_config() -> Result<Arc<ClientConfig>> {
-  client_config(TrustMode::Join)
+pub(crate) fn merge_client_config() -> Result<Arc<ClientConfig>> {
+  client_config(TrustMode::Merge)
 }
 
-/// Builds the member-mode client configuration: the join-mode relaxation
+/// Builds the member-mode client configuration: the merge-mode relaxation
 /// plus an exact expected leaf SubjectPublicKeyInfo binding. The durable
 /// Ed25519 identity check happens at the application proof layer; the SPKI
 /// pin is the TLS-layer anchor learned during a join.
@@ -98,7 +98,7 @@ fn client_config(mode: TrustMode) -> Result<Arc<ClientConfig>> {
 mod tests {
   use rustls::SupportedCipherSuite;
 
-  use super::{crypto_provider, join_client_config, server_config};
+  use super::{crypto_provider, merge_client_config, server_config};
   use crate::transport::{cert::EphemeralCertificate, testing::SeedEntropy};
 
   #[test]
@@ -118,7 +118,7 @@ mod tests {
   fn tls_transport_configs_forbid_early_data_resumption_and_alpn() {
     let certificate = EphemeralCertificate::generate(&SeedEntropy(3)).unwrap();
     let server = server_config(&certificate).unwrap();
-    let client = join_client_config().unwrap();
+    let client = merge_client_config().unwrap();
 
     // Server: no early data, no TLS 1.3 tickets, no session storage, no
     // ALPN offer.

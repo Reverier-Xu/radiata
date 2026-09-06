@@ -34,31 +34,31 @@ pub const KEY_CREATION_INTENT_NAMESPACE: &str =
   "radiata.woooo.tech/metadata/key-creation-intent-v1";
 pub const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/pending-transaction-v1";
 
-/// One join with bounded retries against one stable credential: the
-/// accept loop precomputes its join hint, so rotating on every retry
+/// One merge with bounded retries against one stable credential: the
+/// accept loop precomputes its merge hint, so rotating on every retry
 /// would invalidate the in-flight accept's hint forever (rotate once,
-/// retry with the same secret). Admission-sensitive operations
+/// retry with the same secret). Merge-sensitive operations
 /// transiently refuse while concurrent metadata commits hold the store.
-pub async fn join_with_retry(
+pub async fn merge_with_retry(
   node: &radiata::NodeHandle, issuer: &radiata::NodeHandle, endpoint: radiata::Endpoint,
 ) {
-  use radiata::{JoinCluster, JoinCredential, RotateJoinCredential};
-  let issued = issuer.command(RotateJoinCredential::new()).await.unwrap();
+  use radiata::{MergeCluster, MergeCredential, RotateMergeCredential};
+  let issued = issuer.command(RotateMergeCredential::new()).await.unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut attempts = 0_u32;
   loop {
     attempts += 1;
-    let credential = JoinCredential::parse(&secret).unwrap();
+    let credential = MergeCredential::parse(&secret).unwrap();
     match node
-      .command(JoinCluster::new(endpoint.clone(), credential))
+      .command(MergeCluster::new(endpoint.clone(), credential))
       .await
     {
       Ok(_) => return,
       Err(error) => {
         assert!(
           deadline.elapsed() < Duration::from_secs(60),
-          "join never succeeded: {error:?}"
+          "merge never succeeded: {error:?}"
         );
         let backoff = Duration::from_millis(100 * (1_u64 << attempts.min(4)));
         tokio::time::sleep(backoff).await;
@@ -70,7 +70,7 @@ pub async fn join_with_retry(
 /// One resource write with bounded retries: a commit racing the
 /// anti-entropy driver's writes transiently refuses with NotReady (the
 /// single-store in-flight-commit rule). Retries with a bound, matching
-/// the admission harness precedent. `write` rebuilds the command for
+/// the merge harness precedent. `write` rebuilds the command for
 /// each attempt (commands are single-use values).
 pub async fn put_resource_with_retry(
   node: &radiata::NodeHandle, mut write: impl FnMut() -> radiata::PutResource,
@@ -663,8 +663,8 @@ impl FaultingFactory {
   }
 
   /// Replaces the commit-fault script; the runtime lane uses this to pin
-  /// an abort to the join admission commit regardless of how many earlier
-  /// setup commits (cluster, rotation, listen) were consumed.
+  /// an abort to the merge commit regardless of how many earlier
+  /// setup commits (identity, rotation, listen) were consumed.
   pub fn reset_script(&self, script: Vec<CommitFault>) {
     *self.script.lock().unwrap() = script.into();
   }

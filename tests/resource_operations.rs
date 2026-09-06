@@ -11,9 +11,9 @@ use std::{sync::Arc, time::Duration};
 #[cfg(any(feature = "json", feature = "redb"))]
 use radiata::extension::StorageFactory;
 use radiata::{
-  CreateCluster, Endpoint, EventOptions, EventReceive, NodeBuilder, NodeConfig, NodeHandle,
-  PageSpec, PutResource, ResourceChanged, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
-  SelectResources, Selector, Shutdown, ShutdownReason, extension::KeyProvider,
+  Endpoint, EventOptions, EventReceive, NodeBuilder, NodeConfig, NodeHandle, PageSpec, PutResource,
+  ResourceChanged, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, SelectResources,
+  Selector, Shutdown, ShutdownReason, extension::KeyProvider,
 };
 
 mod common;
@@ -93,7 +93,6 @@ async fn g9_put_resource_commits_atomically_and_emits_one_event() {
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
   )
   .await;
-  node.handle.command(CreateCluster::new()).await.unwrap();
   let mut events = node
     .handle
     .events::<ResourceChanged>(EventOptions::new())
@@ -162,46 +161,6 @@ async fn g9_put_resource_commits_atomically_and_emits_one_event() {
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
-/// Aborts emit nothing: a write rejected before commit (no cluster yet)
-/// produces no event and stores no candidate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_put_resource_without_cluster_aborts_without_event() {
-  let node = start_node(
-    0,
-    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
-  )
-  .await;
-  let mut events = node
-    .handle
-    .events::<ResourceChanged>(EventOptions::new())
-    .unwrap();
-
-  let error = node
-    .handle
-    .command(
-      PutResource::new(ResourceWrite::new(
-        resource_name(2),
-        resource_labels("document", 2),
-      ))
-      .unwrap(),
-    )
-    .await
-    .unwrap_err();
-  assert_eq!(error.kind(), radiata::ErrorKind::NotReady);
-  assert!(matches!(
-    events.try_recv().unwrap(),
-    EventReceive::Empty | EventReceive::Closed
-  ));
-  assert!(
-    select_names(&node.handle, "radiata.woooo.tech/resources/type")
-      .await
-      .is_empty()
-  );
-
-  let outcome = node.handle.command(Shutdown::new()).await.unwrap();
-  assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
-}
-
 /// SC-G09-P0-10: concurrent writers on different members each commit a
 /// signed candidate; ordinary sync converges every member to the same
 /// tuple winner, and the losing candidate is not a conflict.
@@ -212,7 +171,6 @@ async fn g9_concurrent_resource_writes_converge_to_one_winner() {
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
   )
   .await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
 
   let member = start_node(
@@ -220,7 +178,7 @@ async fn g9_concurrent_resource_writes_converge_to_one_winner() {
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
   )
   .await;
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
 
   // Both members write the same name concurrently with competing labels.
   let shared = resource_name(3);
@@ -321,7 +279,6 @@ async fn g9_maintenance_preserves_labels_and_emits_nothing() {
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
   )
   .await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   let issuer_endpoint = listen(&issuer).await;
   common::put_resource_with_retry(&issuer.handle, || {
     PutResource::new(ResourceWrite::new(
@@ -341,7 +298,7 @@ async fn g9_maintenance_preserves_labels_and_emits_nothing() {
     .handle
     .events::<ResourceChanged>(EventOptions::new())
     .unwrap();
-  common::join_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
 
   // The resource converges to the member through ordinary sync...
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -410,7 +367,6 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
       .start()
       .await
       .unwrap();
-    handle.command(CreateCluster::new()).await.unwrap();
     handle
       .command(
         PutResource::new(ResourceWrite::new(
@@ -463,7 +419,6 @@ async fn g9_remove_resource_requires_the_exact_version() {
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
   )
   .await;
-  node.handle.command(CreateCluster::new()).await.unwrap();
   let mut events = node
     .handle
     .events::<ResourceChanged>(EventOptions::new())
@@ -622,7 +577,6 @@ async fn g9_remove_preserves_unrelated_metadata() {
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
   )
   .await;
-  node.handle.command(CreateCluster::new()).await.unwrap();
 
   for seed in [30_u8, 31] {
     node

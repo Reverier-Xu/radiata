@@ -1,10 +1,10 @@
 //! G5 membership sync over authenticated sessions (T-G05-05/06).
 //!
-//! Sixteen real nodes over loopback TLS: node 0 creates the cluster and
-//! admits every member; the anti-entropy driver pages descriptors
-//! and the issuer-trust snapshot over each authenticated session;
-//! reciprocal trust, exact descriptors, and the exact crossed-cube
-//! CQ4 topology (32 undirected sessions, degree four, diameter three)
+//! Sixteen real nodes over loopback TLS: node 0 merges with every member;
+//! the anti-entropy driver pages descriptors and the trust snapshot over
+//! each authenticated session; reciprocal trust, exact descriptors, and
+//! the exact crossed-cube CQ4 topology (32 undirected sessions, degree
+//! four, diameter three)
 //! converge through public facade observations only. The failure matrix
 //! exercises duplicate delivery and partition healing (reorder, endpoint
 //! change, and full process restart are covered by the descriptor store's
@@ -14,9 +14,9 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use radiata::{
-  ConnectMember, CreateCluster, DisconnectPeer, Endpoint, GetLocalNode, JoinCluster, Listen,
-  NodeBuilder, NodeConfig, NodeHandle, PageMembers, PageSpec, PageTopology, PageTrust,
-  RecoveryConfig, RotateJoinCredential, Shutdown, StartRecovery,
+  ConnectMember, DisconnectPeer, Endpoint, GetLocalNode, Listen, MergeCluster, NodeBuilder,
+  NodeConfig, NodeHandle, PageMembers, PageSpec, PageTopology, PageTrust, RecoveryConfig,
+  RotateMergeCredential, Shutdown, StartRecovery,
 };
 
 mod common;
@@ -269,10 +269,11 @@ async fn wait_descriptors(nodes: &[Node], expected: usize, revision: u64, timeou
   }
 }
 
-/// Closes the redundant join-star session between each member and the
+/// Closes the redundant merge-star session between each member and the
 /// issuer when they are not CQ4 neighbors, so each pair ends with exactly
-/// the one CQ4 session (the dial replaces the join for CQ4-neighbor pairs
-/// through the crossed-dial rule). Convergent: after the closes, the
+/// the one CQ4 session (the dial replaces the merge session for
+/// CQ4-neighbor pairs through the crossed-dial rule). Convergent: after
+/// the closes, the
 /// recovery controller may perceive an intentional disconnect as an edge
 /// loss in a narrow window and re-dial it, so the harness re-checks and
 /// re-closes until no redundant star edge remains (bounded iterations).
@@ -403,7 +404,7 @@ async fn wait_connected(nodes: &[Node], from: usize, to: usize, timeout: Duratio
   }
 }
 
-/// Starts the issuer and joins `count - 1` members. Every node listens.
+/// Starts the issuer and merges `count - 1` members. Every node listens.
 async fn build_cluster(count: usize) -> Vec<Node> {
   let mut nodes = Vec::with_capacity(count);
   let mut issuer = start_node(
@@ -411,7 +412,6 @@ async fn build_cluster(count: usize) -> Vec<Node> {
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
   )
   .await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   issuer.id = node_id(&issuer).await;
   let issuer_endpoint = listen(&issuer).await;
   issuer.endpoint = issuer_endpoint.clone();
@@ -423,7 +423,7 @@ async fn build_cluster(count: usize) -> Vec<Node> {
     member.endpoint = listen(&member).await;
     let issued = rotate_with_retry(&nodes[0]).await;
     let secret = issued.credential().expose_secret().to_owned();
-    join_with_retry(&member, issuer_endpoint.clone(), &secret).await;
+    merge_with_retry(&member, issuer_endpoint.clone(), &secret).await;
     member.id = node_id(&member).await;
     nodes.push(member);
   }
@@ -569,18 +569,18 @@ async fn connect_cq4(nodes: &[Node]) {
   }
 }
 
-/// Issues one join credential with bounded retries: admission-sensitive
+/// Issues one merge credential with bounded retries: merge-sensitive
 /// operations refuse while a concurrent metadata commit holds the store
 /// frozen for microseconds, so a rotation is retried.
-async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedJoinCredential {
+async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer.handle.command(RotateJoinCredential::new()).await {
+    match issuer.handle.command(RotateMergeCredential::new()).await {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(50)).await;
       }
-      Err(error) => panic!("join credential rotation failed persistently: {error:?}"),
+      Err(error) => panic!("merge credential rotation failed persistently: {error:?}"),
     }
   }
 }
@@ -588,9 +588,9 @@ async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedJoinCredential {
 /// Retry backoff that doubles from 250 ms and caps at four seconds: the
 /// first retries stay fast enough for the convergence SLO samples while a
 /// persistent storm still paces itself outside the fixed per-source
-/// admission window (sixteen attempts per minute).
+/// merge window (sixteen attempts per minute).
 fn retry_backoff(attempts: u32) -> Duration {
-  // The fixed per-source admission window accepts sixteen attempts per
+  // The fixed per-source merge window accepts sixteen attempts per
   // minute; retries at four-second spacing (fifteen per minute) sit just
   // under it so a refusal storm cannot saturate the window forever.
   let shift = attempts.min(5);
@@ -598,20 +598,20 @@ fn retry_backoff(attempts: u32) -> Duration {
   Duration::from_millis(millis.max(4_000)).min(Duration::from_secs(8))
 }
 
-/// One join with bounded retries: the transport drops handshakes under
-/// sixteen-node load, so a join is retried before failing the harness.
-/// A credential is not `Clone` (secret hygiene), and a failed join
-/// consumes no credential, so each attempt reissues a fresh credential;
+/// One merge with bounded retries: the transport drops handshakes under
+/// sixteen-node load, so a merge is retried before failing the harness.
+/// A credential is not `Clone` (secret hygiene), and a failed merge
+/// consumes no credential, so each attempt reuses the same secret;
 /// the member identity is unchanged.
-async fn join_with_retry(node: &Node, endpoint: Endpoint, secret: &str) {
+async fn merge_with_retry(node: &Node, endpoint: Endpoint, secret: &str) {
   let deadline = std::time::Instant::now() + Duration::from_secs(300);
   let mut attempts: u32 = 0;
   loop {
     attempts = attempts.wrapping_add(1);
-    let credential = radiata::JoinCredential::parse(secret).unwrap();
+    let credential = radiata::MergeCredential::parse(secret).unwrap();
     match node
       .handle
-      .command(JoinCluster::new(endpoint.clone(), credential))
+      .command(MergeCluster::new(endpoint.clone(), credential))
       .await
     {
       Ok(_) => return,
@@ -619,7 +619,7 @@ async fn join_with_retry(node: &Node, endpoint: Endpoint, secret: &str) {
         tokio::time::sleep(retry_backoff(attempts)).await;
         let _ = error;
       }
-      Err(error) => panic!("join failed persistently (attempt {attempts}): {error:?}"),
+      Err(error) => panic!("merge failed persistently (attempt {attempts}): {error:?}"),
     }
   }
 }
@@ -693,7 +693,7 @@ async fn collected_topology(nodes: &[Node]) -> Vec<(u8, u8)> {
 async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   let _cluster_gate = cluster_gate().lock().await;
 
-  // Nodes 0..14 join first; before node 15 joins, the induced graph must
+  // Nodes 0..14 merge first; before node 15 merges, the induced graph must
   // already be the 28-edge CQ4-minus-node-15 (SC-G05-P0-23).
   let mut nodes = build_cluster(15).await;
 
@@ -703,9 +703,9 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   // these are bounded functional waits, not SLO samples.
   wait_trust(&nodes, 15, Duration::from_secs(180)).await;
 
-  // Induced 28-edge graph among nodes 0..14, before node 15 joins
+  // Induced 28-edge graph among nodes 0..14, before node 15 merges
   // (SC-G05-P0-23): connect the CQ4 edges among the present members and
-  // close the redundant join-star sessions, then settle to the exact edge
+  // close the redundant merge-star sessions, then settle to the exact edge
   // set.
   connect_cq4(&nodes).await;
   close_star_sessions(&nodes, 0).await;
@@ -721,14 +721,14 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
     "the induced topology is exactly CQ4 restricted to nodes 0..14"
   );
 
-  // Node 15 joins last and must see all fifteen prior bindings through
+  // Node 15 merges last and must see all fifteen prior bindings through
   // public queries (SC-G05-P0-25).
   let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let mut node15 = start_node(15, storage).await;
   node15.endpoint = listen(&node15).await;
   let issued = rotate_with_retry(&nodes[0]).await;
   let secret = issued.credential().expose_secret().to_owned();
-  join_with_retry(&node15, nodes[0].endpoint.clone(), &secret).await;
+  merge_with_retry(&node15, nodes[0].endpoint.clone(), &secret).await;
   node15.id = node_id(&node15).await;
   let node15_handle = node15.handle.clone();
   wait_until(
@@ -775,7 +775,7 @@ async fn membership_sync_failure_matrix_partition_healing() {
   wait_trust(&nodes, 4, Duration::from_secs(20)).await;
   // The induced CQ4 graph on {0,1,2,3} is the 4-cycle (0,1),(0,2),(1,3),
   // (2,3); dial those exact edges through the public facade and close the
-  // redundant (0,3) join star.
+  // redundant (0,3) merge star.
   for (left, right) in [(0_u8, 1_u8), (0, 2), (1, 3), (2, 3)] {
     connect_with_retry(
       &nodes[left as usize],
@@ -854,12 +854,12 @@ async fn membership_sync_failure_matrix_partition_healing() {
 async fn membership_sync_slo_trend_stays_below_bound() {
   let _cluster_gate = cluster_gate().lock().await;
 
-  // The trend lane records admission and descriptor completion from public
+  // The trend lane records merge and descriptor completion from public
   // observations; every sample must stay below 10,000 ms
   // (eight-node sample; SC-G05-P0-29 calls for a sixteen-node trend run -
   // recorded as a known catalog deviation).
-  // The trend records the full admission-to-descriptor-completion window:
-  // the timer starts before the first join so admission time is included
+  // The trend records the full merge-to-descriptor-completion window:
+  // the timer starts before the first merge so merge time is included
   // (SC-G05-P0-29). The strict <10 s bound is asserted on this 8-node
   // sample; the sixteen-node lane (slower under load) is the convergence
   // E2E rather than the SLO sample.
@@ -873,12 +873,12 @@ async fn membership_sync_slo_trend_stays_below_bound() {
   if std::env::var_os("RADIATA_SLO_PROFILE_STRICT").is_some_and(|value| value == "1") {
     assert!(
       elapsed < Duration::from_secs(10),
-      "admission-to-descriptor-completion sample {elapsed:?} exceeds the 10,000 ms SLO"
+      "merge-to-descriptor-completion sample {elapsed:?} exceeds the 10,000 ms SLO"
     );
   } else {
     tracing::info!(
       sample_ms = elapsed.as_millis() as u64,
-      "admission-to-descriptor-completion sample"
+      "merge-to-descriptor-completion sample"
     );
   }
   for node in nodes {
@@ -887,7 +887,7 @@ async fn membership_sync_slo_trend_stays_below_bound() {
 }
 
 /// SC-G07-P0-18: the revised sixteen-node SLO workload. One timed sample
-/// covers fixed admission (the sixteenth join), exact-node packet
+/// covers the fixed-rate merge (the sixteenth node), exact-node packet
 /// delivery, an owner-revision node-metadata bump, and descriptor
 /// convergence — all inside the 10,000 ms bound; only the exact 16-node
 /// profile is latency-qualified. Resource tuple convergence has no pre-G9
@@ -900,7 +900,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
   let _cluster_gate = cluster_gate().lock().await;
 
   init_tracing();
-  // Profile setup (untimed): fifteen members join and converge.
+  // Profile setup (untimed): fifteen members merge and converge.
   let collector = Arc::new(EchoCollector::default());
   let mut nodes = Vec::with_capacity(16);
   let mut issuer = start_node_inner(
@@ -909,7 +909,6 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
     Some(Arc::clone(&collector)),
   )
   .await;
-  issuer.handle.command(CreateCluster::new()).await.unwrap();
   issuer.id = node_id(&issuer).await;
   issuer.endpoint = listen(&issuer).await;
   nodes.push(issuer);
@@ -923,18 +922,18 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
     member.endpoint = listen(&member).await;
     let issued = rotate_with_retry(&nodes[0]).await;
     let secret = issued.credential().expose_secret().to_owned();
-    join_with_retry(&member, nodes[0].endpoint.clone(), &secret).await;
+    merge_with_retry(&member, nodes[0].endpoint.clone(), &secret).await;
     member.id = node_id(&member).await;
     nodes.push(member);
   }
   // Untimed setup phases use generous bounds: the SLO claim starts at the
-  // sixteenth admission, and loaded runners converge slower than the
+  // sixteenth merge, and loaded runners converge slower than the
   // sample window.
   wait_trust(&nodes, 15, Duration::from_secs(180)).await;
 
   let started = std::time::Instant::now();
 
-  // Admission: the sixteenth node joins through fixed admission.
+  // Merge: the sixteenth node merges through fixed admission.
   let mut node15 = start_node_inner(
     15,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
@@ -944,7 +943,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
   node15.endpoint = listen(&node15).await;
   let issued = rotate_with_retry(&nodes[0]).await;
   let secret = issued.credential().expose_secret().to_owned();
-  join_with_retry(&node15, nodes[0].endpoint.clone(), &secret).await;
+  merge_with_retry(&node15, nodes[0].endpoint.clone(), &secret).await;
   node15.id = node_id(&node15).await;
   nodes.push(node15);
 

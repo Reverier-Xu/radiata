@@ -6,45 +6,46 @@
 //!
 //! - The real TLS 1.3 transport and the RFC 9266 exporter channel binding
 //!   belong to the G3-02 transport; here the channel binding is a locally
-//!   supplied fixed 32-byte value and never a wire field. Join-mode credential
-//!   proofs are real ADR-0001 values derived through [`super::credential`]
-//!   (HKDF-SHA256 over the channel binding and credential body, role-separated
-//!   HMAC-SHA256 over the transcript digest) and verified in constant time. No
-//!   proof, exporter, or credential bytes are ever logged by this module.
+//!   supplied fixed 32-byte value and never a wire field.
+//! - Merge-mode credential proofs are real ADR-0001 values derived through
+//!   [`super::credential`] (HKDF-SHA256 over the channel binding and credential
+//!   body, role-separated HMAC-SHA256 over the transcript digest) and verified
+//!   in constant time. No proof, exporter, or credential bytes are ever logged
+//!   by this module.
 //! - The message kind IDs are the immutable published schema `0x0001` kind IDs
 //!   of the closed [`super::wire`] registry.
-//! - Admission commits, grants, and cluster adoption follow in G3-03; this
+//! - Merge commits, grants, and adoption follow in the session driver; this
 //!   state machine only authenticates and delivers the opaque grant bytes.
-//!   Join-mode endpoints are configured with the expected cluster ID and
-//!   credential generation ID up front.
+//!   Merge-mode endpoints are configured with the credential generation ID up
+//!   front.
 //!
 //! Protocol positions (strict global lockstep, no retry fallback paths):
 //!
-//! 1. `InitiatorHello` (initiator): mode, join-mode credential generation ID,
-//!    cluster ID, node ID, Ed25519 public key, 32-byte nonce, full offer.
-//! 2. `ResponderHello` (responder): cluster ID, node ID, public key, nonce,
-//!    full offer. Both sides can now assemble the transcript and compute the
-//!    deterministic feature selection.
-//! 3. `ResponderProof` (responder): join-mode credential proof plus the
+//! 1. `InitiatorHello` (initiator): mode, merge-mode credential generation ID,
+//!    node ID, Ed25519 public key, 32-byte nonce, full offer.
+//! 2. `ResponderHello` (responder): node ID, public key, nonce, full offer.
+//!    Both sides can now assemble the transcript and compute the deterministic
+//!    feature selection.
+//! 3. `ResponderProof` (responder): merge-mode credential proof plus the
 //!    responder identity signature over the transcript.
-//! 4. `InitiatorProof` (initiator): join-mode credential proof plus the
+//! 4. `InitiatorProof` (initiator): merge-mode credential proof plus the
 //!    initiator identity signature. The initiator signs only after the
 //!    responder proof verified.
 //! 5. `SelectionConfirmation` (responder): the selection bytes, which must
 //!    equal the initiator's locally computed bytes exactly. Position five
 //!    completes authentication; the state machine is then terminal.
-//! 6. `AdmissionGrantDelivery` (responder, join mode only): opaque grant bytes
+//! 6. `MergeGrantDelivery` (responder, merge mode only): opaque grant bytes
 //!    sent only after authentication completed. Position six is
 //!    post-authentication and never part of the transcript.
 //!
-//! The canonical, length-delimited transcript covers ADR-0001 items 1..=9:
-//! protocol magic and base schema ID `0x0001`, mode and join-mode generation
-//! ID, fixed initiator/responder roles, cluster ID, both node IDs and Ed25519
+//! The canonical, length-delimited transcript covers ADR-0001 items 1..=8:
+//! protocol magic and base schema ID `0x0001`, mode and merge-mode
+//! generation ID, fixed initiator/responder roles, both node IDs and Ed25519
 //! public keys, both independent 32-byte nonces, both complete canonical
 //! offer byte strings, the deterministic selection bytes, and the locally
 //! supplied 32-byte channel binding. The transcript digest is SHA-256 over
 //! the canonical bytes and every validation rejection happens before the
-//! caller is asked to sign or admit anything.
+//! caller is asked to sign or merge anything.
 
 use minicbor::{Decode, Decoder, Encode, bytes::ByteVec};
 
@@ -61,7 +62,7 @@ use super::{
   wire::HandshakeKind,
 };
 use crate::{
-  ClusterId, Digest, Error, NodeId, PublicKey, Signature,
+  Digest, Error, NodeId, PublicKey, Signature,
   identity::signature::{body_digest, signature_message, verify_strict},
 };
 
@@ -78,7 +79,7 @@ const KIND_RESPONDER_HELLO: u64 = HandshakeKind::ResponderHello.kind_id() as u64
 const KIND_RESPONDER_PROOF: u64 = HandshakeKind::ResponderProof.kind_id() as u64;
 const KIND_INITIATOR_PROOF: u64 = HandshakeKind::InitiatorProof.kind_id() as u64;
 const KIND_SELECTION_CONFIRMATION: u64 = HandshakeKind::SelectionConfirmation.kind_id() as u64;
-const KIND_ADMISSION_GRANT_DELIVERY: u64 = HandshakeKind::AdmissionGrantDelivery.kind_id() as u64;
+const KIND_MERGE_GRANT_DELIVERY: u64 = HandshakeKind::MergeGrantDelivery.kind_id() as u64;
 
 /// The exact ADR-0001 responder session-signature domain.
 pub(crate) const SESSION_V1_RESPONDER_DOMAIN: &[u8] =
@@ -90,21 +91,21 @@ pub(crate) const SESSION_V1_INITIATOR_DOMAIN: &[u8] =
 /// The ADR-0001 authentication mode of one handshake.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HandshakeMode {
-  Join,
+  Merge,
   Member,
 }
 
 impl HandshakeMode {
   const fn as_str(self) -> &'static str {
     match self {
-      Self::Join => "join",
+      Self::Merge => "merge",
       Self::Member => "member",
     }
   }
 
   fn parse(value: &str) -> Result<Self, HandshakeError> {
     match value {
-      "join" => Ok(Self::Join),
+      "merge" => Ok(Self::Merge),
       "member" => Ok(Self::Member),
       _ => Err(HandshakeError::Malformed {
         context: "handshake mode",
@@ -135,8 +136,6 @@ pub(crate) enum HandshakeError {
   OutOfOrder,
   /// Both roles presented the same node ID or public key.
   IdentityEqual,
-  /// The peer hello names a cluster other than the configured one.
-  UnexpectedCluster,
   /// The peer binding conflicts with the configured expected key.
   ExpectedKeyConflict,
   /// The received credential proof fails constant-time verification
@@ -165,9 +164,6 @@ impl From<HandshakeError> for Error {
       HandshakeError::Duplicate => Error::authentication_failed("handshake duplicate"),
       HandshakeError::OutOfOrder => Error::authentication_failed("handshake out of order"),
       HandshakeError::IdentityEqual => Error::authentication_failed("handshake identity equal"),
-      HandshakeError::UnexpectedCluster => {
-        Error::authentication_failed("handshake unexpected cluster")
-      }
       HandshakeError::ExpectedKeyConflict => {
         Error::authentication_failed("handshake expected key conflict")
       }
@@ -190,12 +186,11 @@ impl From<HandshakeError> for Error {
 pub(crate) struct HandshakeConfig {
   pub(crate) mode: HandshakeMode,
   pub(crate) role: Role,
-  pub(crate) cluster: ClusterId,
   pub(crate) local_id: NodeId,
   pub(crate) local_key: PublicKey,
-  /// The trusted peer binding; required in member mode, absent for join.
+  /// The trusted peer binding; required in member mode, absent for merge.
   pub(crate) expected_peer: Option<(NodeId, PublicKey)>,
-  /// The non-secret join credential generation ID (join mode only).
+  /// The non-secret merge credential generation ID (merge mode only).
   pub(crate) generation: Option<[u8; GENERATION_LEN]>,
   /// The join credential body both endpoints derive and verify
   /// role-separated proofs from (join mode only). Never logged, persisted,
@@ -239,7 +234,7 @@ impl Handshake {
     config: HandshakeConfig, registry: FeatureRegistry,
   ) -> Result<Self, HandshakeError> {
     match config.mode {
-      HandshakeMode::Join => {
+      HandshakeMode::Merge => {
         if config.generation.is_none() || config.credential.is_none() {
           return Err(HandshakeError::Malformed {
             context: "handshake join inputs",
@@ -319,7 +314,7 @@ impl Handshake {
       .map(|selection| selection.features().to_vec())
   }
 
-  /// Position 1 (initiator): the mode/generation/cluster/identity hello.
+  /// Position 1 (initiator): the mode/generation/identity hello.
   pub(crate) fn initiator_hello(&mut self) -> Result<Vec<u8>, HandshakeError> {
     self.begin_send(HandshakeKind::InitiatorHello, Role::Initiator)?;
     let wire = InitiatorHelloWire {
@@ -329,7 +324,6 @@ impl Handshake {
         .config
         .generation
         .map(|generation| ByteVec::from(generation.to_vec())),
-      cluster: self.config.cluster.as_str().to_owned(),
       node_id: self.config.local_id.as_str().to_owned(),
       public_key: ByteVec::from(self.config.local_key.as_bytes().to_vec()),
       nonce: ByteVec::from(self.config.local_nonce.to_vec()),
@@ -343,7 +337,6 @@ impl Handshake {
     self.begin_send(HandshakeKind::ResponderHello, Role::Responder)?;
     let wire = ResponderHelloWire {
       kind: KIND_RESPONDER_HELLO,
-      cluster: self.config.cluster.as_str().to_owned(),
       node_id: self.config.local_id.as_str().to_owned(),
       public_key: ByteVec::from(self.config.local_key.as_bytes().to_vec()),
       nonce: ByteVec::from(self.config.local_nonce.to_vec()),
@@ -387,7 +380,7 @@ impl Handshake {
   fn derive_local_proof(&self, role: ProofRole) -> Result<Option<CredentialProof>, HandshakeError> {
     match self.config.mode {
       HandshakeMode::Member => Ok(None),
-      HandshakeMode::Join => {
+      HandshakeMode::Merge => {
         let secret = self
           .config
           .credential
@@ -427,15 +420,13 @@ impl Handshake {
   /// bytes, sent only after authentication completed. The grant is
   /// post-authentication and never part of the transcript; grant
   /// construction and validation belong to the G3-03 admission layer.
-  pub(crate) fn admission_grant_delivery(
-    &mut self, grant: &[u8],
-  ) -> Result<Vec<u8>, HandshakeError> {
+  pub(crate) fn merge_grant_delivery(&mut self, grant: &[u8]) -> Result<Vec<u8>, HandshakeError> {
     if self.config.role != Role::Responder {
       return Err(HandshakeError::State {
         context: "handshake send role",
       });
     }
-    if self.config.mode != HandshakeMode::Join {
+    if self.config.mode != HandshakeMode::Merge {
       return Err(HandshakeError::State {
         context: "handshake grant mode",
       });
@@ -456,7 +447,7 @@ impl Handshake {
       });
     }
     let wire = GrantDeliveryWire {
-      kind: KIND_ADMISSION_GRANT_DELIVERY,
+      kind: KIND_MERGE_GRANT_DELIVERY,
       grant: ByteVec::from(grant.to_vec()),
     };
     let bytes =
@@ -482,7 +473,7 @@ impl Handshake {
 
   /// Validates and consumes one inbound canonical message, rejecting
   /// duplicates, unknown fields, ordering violations, reflections, identity
-  /// collisions, cluster or key conflicts, proof or signature mismatches, and
+  /// collisions, key conflicts, proof or signature mismatches, and
   /// selection divergence before the machine advances.
   pub(crate) fn receive(&mut self, bytes: &[u8]) -> Result<(), HandshakeError> {
     validate_canonical(bytes, CONTROL_CBOR_LIMITS).map_err(|_| HandshakeError::NonCanonical)?;
@@ -493,7 +484,7 @@ impl Handshake {
     if position_sender(kind) == self.config.role {
       return Err(HandshakeError::RoleSwapped);
     }
-    if kind == HandshakeKind::AdmissionGrantDelivery {
+    if kind == HandshakeKind::MergeGrantDelivery {
       return self.receive_grant_delivery(bytes);
     }
     if self.completed >= PROTOCOL_POSITIONS {
@@ -516,7 +507,7 @@ impl Handshake {
         self.receive_proof(bytes, SESSION_V1_INITIATOR_DOMAIN, ProofRole::Initiator)?
       }
       HandshakeKind::SelectionConfirmation => self.receive_confirmation(bytes)?,
-      HandshakeKind::AdmissionGrantDelivery => unreachable!(),
+      HandshakeKind::MergeGrantDelivery => unreachable!(),
     }
     self.completed += 1;
     Ok(())
@@ -559,7 +550,7 @@ impl Handshake {
     }
     let generation = optional_bytes::<GENERATION_LEN>(wire.generation, "handshake generation")?;
     match (self.config.mode, &generation, &self.config.generation) {
-      (HandshakeMode::Join, Some(actual), Some(expected)) if actual == expected => {}
+      (HandshakeMode::Merge, Some(actual), Some(expected)) if actual == expected => {}
       (HandshakeMode::Member, None, None) => {}
       _ => {
         return Err(HandshakeError::Malformed {
@@ -567,41 +558,22 @@ impl Handshake {
         });
       }
     }
-    self.accept_peer_hello(
-      wire.cluster,
-      wire.node_id,
-      wire.public_key,
-      wire.nonce,
-      wire.offer,
-    )
+    self.accept_peer_hello(wire.node_id, wire.public_key, wire.nonce, wire.offer)
   }
 
   fn receive_responder_hello(&mut self, bytes: &[u8]) -> Result<(), HandshakeError> {
     let wire: ResponderHelloWire = decode_wire(bytes)?;
-    self.accept_peer_hello(
-      wire.cluster,
-      wire.node_id,
-      wire.public_key,
-      wire.nonce,
-      wire.offer,
-    )
+    self.accept_peer_hello(wire.node_id, wire.public_key, wire.nonce, wire.offer)
   }
 
   fn accept_peer_hello(
-    &mut self, cluster: String, node_id: String, public_key: ByteVec, nonce: ByteVec,
-    offer_bytes: ByteVec,
+    &mut self, node_id: String, public_key: ByteVec, nonce: ByteVec, offer_bytes: ByteVec,
   ) -> Result<(), HandshakeError> {
-    let cluster = ClusterId::parse(&cluster).map_err(|_| HandshakeError::Malformed {
-      context: "handshake cluster",
-    })?;
     let node_id = NodeId::parse(&node_id).map_err(|_| HandshakeError::Malformed {
       context: "handshake node id",
     })?;
     let public_key = fixed_bytes::<PUBLIC_KEY_LEN>(&public_key, "handshake public key")?;
     let nonce = fixed_bytes::<NONCE_LEN>(&nonce, "handshake nonce")?;
-    if cluster != self.config.cluster {
-      return Err(HandshakeError::UnexpectedCluster);
-    }
     if node_id == self.config.local_id || public_key == *self.config.local_key.as_bytes() {
       return Err(HandshakeError::IdentityEqual);
     }
@@ -644,7 +616,6 @@ impl Handshake {
     let transcript = assemble_transcript(
       self.config.mode,
       self.config.generation,
-      &self.config.cluster,
       initiator,
       responder,
       selection.bytes(),
@@ -662,7 +633,7 @@ impl Handshake {
     let proof =
       optional_bytes::<PROOF_LEN>(wire.proof, "handshake proof")?.map(CredentialProof::from_bytes);
     match (self.config.mode, &proof) {
-      (HandshakeMode::Join, Some(actual)) => {
+      (HandshakeMode::Merge, Some(actual)) => {
         let secret = self
           .config
           .credential
@@ -679,7 +650,7 @@ impl Handshake {
           return Err(HandshakeError::ProofMismatch);
         }
       }
-      (HandshakeMode::Join, None) => {
+      (HandshakeMode::Merge, None) => {
         return Err(HandshakeError::Malformed {
           context: "handshake proof",
         });
@@ -720,7 +691,7 @@ impl Handshake {
   }
 
   fn receive_grant_delivery(&mut self, bytes: &[u8]) -> Result<(), HandshakeError> {
-    if self.config.mode != HandshakeMode::Join {
+    if self.config.mode != HandshakeMode::Merge {
       return Err(HandshakeError::Malformed {
         context: "handshake grant mode",
       });
@@ -753,7 +724,6 @@ impl Handshake {
 pub(crate) struct InitiatorHelloPeek {
   pub(crate) mode: HandshakeMode,
   pub(crate) generation: Option<[u8; GENERATION_LEN]>,
-  pub(crate) cluster: ClusterId,
   pub(crate) node_id: NodeId,
   pub(crate) public_key: PublicKey,
 }
@@ -769,9 +739,6 @@ pub(crate) fn peek_initiator_hello(bytes: &[u8]) -> Result<InitiatorHelloPeek, H
   }
   let mode = HandshakeMode::parse(&wire.mode)?;
   let generation = optional_bytes::<GENERATION_LEN>(wire.generation, "handshake generation")?;
-  let cluster = ClusterId::parse(&wire.cluster).map_err(|_| HandshakeError::Malformed {
-    context: "handshake cluster",
-  })?;
   let node_id = NodeId::parse(&wire.node_id).map_err(|_| HandshakeError::Malformed {
     context: "handshake node id",
   })?;
@@ -779,7 +746,6 @@ pub(crate) fn peek_initiator_hello(bytes: &[u8]) -> Result<InitiatorHelloPeek, H
   Ok(InitiatorHelloPeek {
     mode,
     generation,
-    cluster,
     node_id,
     public_key: PublicKey::from_bytes(public_key),
   })
@@ -853,8 +819,8 @@ fn optional_bytes<const LENGTH: usize>(
 }
 
 fn assemble_transcript(
-  mode: HandshakeMode, generation: Option<[u8; GENERATION_LEN]>, cluster: &ClusterId,
-  initiator: &HelloView, responder: &HelloView, selection: &[u8], channel_binding: &[u8; 32],
+  mode: HandshakeMode, generation: Option<[u8; GENERATION_LEN]>, initiator: &HelloView,
+  responder: &HelloView, selection: &[u8], channel_binding: &[u8; 32],
 ) -> Result<Vec<u8>, HandshakeError> {
   let identity = |view: &HelloView| IdentityWire {
     node_id: view.node_id.as_str().to_owned(),
@@ -869,7 +835,6 @@ fn assemble_transcript(
       Role::Initiator.as_str().to_owned(),
       Role::Responder.as_str().to_owned(),
     ],
-    cluster: cluster.as_str().to_owned(),
     identities: vec![identity(initiator), identity(responder)],
     nonces: vec![
       ByteVec::from(initiator.nonce.to_vec()),
@@ -897,14 +862,12 @@ struct InitiatorHelloWire {
   #[n(2)]
   generation: Option<ByteVec>,
   #[n(3)]
-  cluster: String,
-  #[n(4)]
   node_id: String,
-  #[n(5)]
+  #[n(4)]
   public_key: ByteVec,
-  #[n(6)]
+  #[n(5)]
   nonce: ByteVec,
-  #[n(7)]
+  #[n(6)]
   offer: ByteVec,
 }
 
@@ -914,14 +877,12 @@ struct ResponderHelloWire {
   #[n(0)]
   kind: u64,
   #[n(1)]
-  cluster: String,
-  #[n(2)]
   node_id: String,
-  #[n(3)]
+  #[n(2)]
   public_key: ByteVec,
-  #[n(4)]
+  #[n(3)]
   nonce: ByteVec,
-  #[n(5)]
+  #[n(4)]
   offer: ByteVec,
 }
 
@@ -963,7 +924,7 @@ struct IdentityWire {
   public_key: ByteVec,
 }
 
-/// The canonical ADR-0001 transcript, items 1..=9 in order.
+/// The canonical ADR-0001 transcript, items 1..=8 in order.
 #[derive(Encode)]
 #[cbor(array)]
 struct TranscriptWire {
@@ -978,16 +939,14 @@ struct TranscriptWire {
   #[n(4)]
   roles: Vec<String>,
   #[n(5)]
-  cluster: String,
-  #[n(6)]
   identities: Vec<IdentityWire>,
-  #[n(7)]
+  #[n(6)]
   nonces: Vec<ByteVec>,
-  #[n(8)]
+  #[n(7)]
   offers: Vec<ByteVec>,
-  #[n(9)]
+  #[n(8)]
   selection: ByteVec,
-  #[n(10)]
+  #[n(9)]
   channel_binding: ByteVec,
 }
 
@@ -1029,10 +988,6 @@ mod tests {
     NodeId::parse(&format!("node_{sequence:021}")).unwrap()
   }
 
-  fn cluster_id(sequence: u8) -> ClusterId {
-    ClusterId::parse(&format!("cluster_{sequence:021}")).unwrap()
-  }
-
   fn public_key(seed: &[u8; 32]) -> PublicKey {
     PublicKey::from_bytes(SigningKey::from_bytes(seed).verifying_key().to_bytes())
   }
@@ -1057,9 +1012,8 @@ mod tests {
     TestPair {
       initiator: TestEndpoint {
         config: HandshakeConfig {
-          mode: HandshakeMode::Join,
+          mode: HandshakeMode::Merge,
           role: Role::Initiator,
-          cluster: cluster_id(1),
           local_id: node_id(1),
           local_key: public_key(&INITIATOR_SEED),
           expected_peer: None,
@@ -1073,9 +1027,8 @@ mod tests {
       },
       responder: TestEndpoint {
         config: HandshakeConfig {
-          mode: HandshakeMode::Join,
+          mode: HandshakeMode::Merge,
           role: Role::Responder,
-          cluster: cluster_id(1),
           local_id: node_id(2),
           local_key: public_key(&RESPONDER_SEED),
           expected_peer: None,
@@ -1099,7 +1052,6 @@ mod tests {
         config: HandshakeConfig {
           mode: HandshakeMode::Member,
           role: Role::Initiator,
-          cluster: cluster_id(1),
           local_id: node_id(1),
           local_key: initiator_key.clone(),
           expected_peer: Some((node_id(2), responder_key.clone())),
@@ -1115,7 +1067,6 @@ mod tests {
         config: HandshakeConfig {
           mode: HandshakeMode::Member,
           role: Role::Responder,
-          cluster: cluster_id(1),
           local_id: node_id(2),
           local_key: responder_key.clone(),
           expected_peer: Some((node_id(1), initiator_key.clone())),
@@ -1206,11 +1157,11 @@ mod tests {
     Handshake::new(endpoint.config.clone(), registry()).unwrap()
   }
 
-  const JOIN_TRANSCRIPT_HEX: &str = "8b644d524c5901646a6f696e50777777777777777777777777777777778269696e69746961746f7269726573706f6e646572781d636c75737465725f3030303030303030303030303030303030303030318282781a6e6f64655f3030303030303030303030303030303030303030315820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873782781a6e6f64655f3030303030303030303030303030303030303030325820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0825820101010101010101010101010101010101010101010101010101010101010101058202020202020202020202020202020202020202020202020202020202020202020825902a98385827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58207e1cd8b5da6a7073ecf8bcc214f3bc23fd0e8aa5d039df81d051aebc6261dbb2827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820594268233e6759361cfe2a5ddb5fe318375670bd6d3c74a9dfd7970378328ba882782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458209b6e0d583656d859650b5b2f983772d13f37f0ddcb800cb5ae73b92d521d1f0882782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572795820348d89297781958b76a3b261ef9a9a1c47d5231102afad3f1a30fbce07a37537827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f72655820c7d97780c1919caa52efbf957e11a6ed3e894724558bf0e80497996536e2fa6e847830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573747828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0010000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d72657175657374731901005902d68385827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58207e1cd8b5da6a7073ecf8bcc214f3bc23fd0e8aa5d039df81d051aebc6261dbb2827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820594268233e6759361cfe2a5ddb5fe318375670bd6d3c74a9dfd7970378328ba882782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458209b6e0d583656d859650b5b2f983772d13f37f0ddcb800cb5ae73b92d521d1f0882782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572795820348d89297781958b76a3b261ef9a9a1c47d5231102afad3f1a30fbce07a37537827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f72655820c7d97780c1919caa52efbf957e11a6ed3e894724558bf0e80497996536e2fa6e857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0080000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d726571756573747319020059014682857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0010000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d72657175657374731901005820cbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcb";
+  const JOIN_TRANSCRIPT_HEX: &str = "8a644d524c5901656d6572676550777777777777777777777777777777778269696e69746961746f7269726573706f6e6465728282781a6e6f64655f3030303030303030303030303030303030303030315820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873782781a6e6f64655f3030303030303030303030303030303030303030325820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0825820101010101010101010101010101010101010101010101010101010101010101058202020202020202020202020202020202020202020202020202020202020202020825902a98385827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58207e1cd8b5da6a7073ecf8bcc214f3bc23fd0e8aa5d039df81d051aebc6261dbb2827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820594268233e6759361cfe2a5ddb5fe318375670bd6d3c74a9dfd7970378328ba882782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458209b6e0d583656d859650b5b2f983772d13f37f0ddcb800cb5ae73b92d521d1f0882782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572795820348d89297781958b76a3b261ef9a9a1c47d5231102afad3f1a30fbce07a37537827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f72655820c7d97780c1919caa52efbf957e11a6ed3e894724558bf0e80497996536e2fa6e847830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573747828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0010000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d72657175657374731901005902d68385827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58207e1cd8b5da6a7073ecf8bcc214f3bc23fd0e8aa5d039df81d051aebc6261dbb2827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820594268233e6759361cfe2a5ddb5fe318375670bd6d3c74a9dfd7970378328ba882782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458209b6e0d583656d859650b5b2f983772d13f37f0ddcb800cb5ae73b92d521d1f0882782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572795820348d89297781958b76a3b261ef9a9a1c47d5231102afad3f1a30fbce07a37537827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f72655820c7d97780c1919caa52efbf957e11a6ed3e894724558bf0e80497996536e2fa6e857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0080000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d726571756573747319020059014682857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0010000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d72657175657374731901005820cbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcb";
   const JOIN_TRANSCRIPT_DIGEST_HEX: &str =
-    "00a596c8ef985c10fc58f8f513b4126a4a21178fcfe509bed3348fb62870b463";
+    "cdecaa46eeba78d47a85ec62ae8d8b7584d3bebdfc47dcd68d9a6f5093ec5567";
   const MEMBER_TRANSCRIPT_DIGEST_HEX: &str =
-    "df19f115c68ec363da181e2e014e2aa0abd047f26a23e663ef33bdb8b79b91b1";
+    "1f127414da4b46c19cdd768d686f7db049a1ce95c94d7f6921b5d3e301e0df5e";
   const SELECTION_HEX: &str = "82857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0010000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d7265717565737473190100";
 
   #[test]
@@ -1360,14 +1311,14 @@ mod tests {
 
     // After authentication the responder delivers the grant exactly once.
     let mut exchange = drive(&pair, &[], false, false).unwrap();
-    let message = exchange.responder.admission_grant_delivery(&grant).unwrap();
+    let message = exchange.responder.merge_grant_delivery(&grant).unwrap();
     exchange.initiator.receive(&message).unwrap();
     assert_eq!(exchange.initiator.grant_delivery(), Some(grant.as_slice()));
     assert_eq!(
       exchange.initiator.receive(&message),
       Err(HandshakeError::Duplicate)
     );
-    assert!(exchange.responder.admission_grant_delivery(&grant).is_err());
+    assert!(exchange.responder.merge_grant_delivery(&grant).is_err());
 
     // The transcript and digest are untouched by the delivery.
     assert_eq!(
@@ -1380,11 +1331,7 @@ mod tests {
     );
 
     // Pre-authentication delivery is out of order on both directions.
-    assert!(
-      fresh(&pair.responder)
-        .admission_grant_delivery(&grant)
-        .is_err()
-    );
+    assert!(fresh(&pair.responder).merge_grant_delivery(&grant).is_err());
     assert_eq!(
       fresh(&pair.initiator).receive(&message),
       Err(HandshakeError::OutOfOrder)
@@ -1396,7 +1343,7 @@ mod tests {
     assert!(
       member_exchange
         .responder
-        .admission_grant_delivery(&grant)
+        .merge_grant_delivery(&grant)
         .is_err()
     );
     assert_eq!(
@@ -1408,11 +1355,11 @@ mod tests {
 
     // The initiator never sends a grant, and empty grants are malformed.
     let mut exchange = drive(&pair, &[], false, false).unwrap();
-    assert!(exchange.initiator.admission_grant_delivery(&grant).is_err());
-    assert!(exchange.responder.admission_grant_delivery(&[]).is_err());
+    assert!(exchange.initiator.merge_grant_delivery(&grant).is_err());
+    assert!(exchange.responder.merge_grant_delivery(&[]).is_err());
     let empty = encode_canonical(
       &GrantDeliveryWire {
-        kind: KIND_ADMISSION_GRANT_DELIVERY,
+        kind: KIND_MERGE_GRANT_DELIVERY,
         grant: ByteVec::from(Vec::new()),
       },
       CONTROL_CBOR_LIMITS,
@@ -1445,7 +1392,6 @@ mod tests {
       kind: wire.kind,
       mode: wire.mode.clone(),
       generation: None,
-      cluster: wire.cluster.clone(),
       node_id: wire.node_id.clone(),
       public_key: ByteVec::from(wire.public_key.to_vec()),
       nonce: ByteVec::from(wire.nonce.to_vec()),
@@ -1461,7 +1407,6 @@ mod tests {
       kind: wire.kind,
       mode: wire.mode,
       generation: None,
-      cluster: wire.cluster,
       node_id: wire.node_id,
       public_key: ByteVec::from(wire.public_key.to_vec()),
       nonce: ByteVec::from(wire.nonce.to_vec()),
@@ -1523,16 +1468,6 @@ mod tests {
     assert_eq!(
       fresh(&pair.responder).receive(&trailing),
       Err(HandshakeError::NonCanonical)
-    );
-
-    // Unexpected cluster.
-    let mut config = pair.initiator.config.clone();
-    config.cluster = cluster_id(9);
-    let mut initiator = Handshake::new(config, registry()).unwrap();
-    let hello = initiator.initiator_hello().unwrap();
-    assert_eq!(
-      fresh(&pair.responder).receive(&hello),
-      Err(HandshakeError::UnexpectedCluster)
     );
 
     // Conflicting expected key (member mode trusted binding).
@@ -1601,13 +1536,12 @@ mod tests {
       Some(HandshakeError::SelectionBytesMismatch)
     );
 
-    // Join mode requires the generation ID field.
+    // Merge mode requires the generation ID field.
     let wire: InitiatorHelloWire = decode_wire(&honest.messages[0]).unwrap();
     let missing_generation = InitiatorHelloWire {
       kind: wire.kind,
       mode: wire.mode,
       generation: None,
-      cluster: wire.cluster,
       node_id: wire.node_id,
       public_key: wire.public_key,
       nonce: wire.nonce,
@@ -1682,16 +1616,14 @@ mod tests {
     #[n(2)]
     generation: Option<ByteVec>,
     #[n(3)]
-    cluster: String,
-    #[n(4)]
     node_id: String,
-    #[n(5)]
+    #[n(4)]
     public_key: ByteVec,
-    #[n(6)]
+    #[n(5)]
     nonce: ByteVec,
-    #[n(7)]
+    #[n(6)]
     offer: ByteVec,
-    #[n(8)]
+    #[n(7)]
     extra: u64,
   }
 
@@ -1705,12 +1637,10 @@ mod tests {
     #[n(2)]
     generation: Option<ByteVec>,
     #[n(3)]
-    cluster: String,
-    #[n(4)]
     node_id: String,
-    #[n(5)]
+    #[n(4)]
     public_key: ByteVec,
-    #[n(6)]
+    #[n(5)]
     nonce: ByteVec,
   }
 

@@ -2,7 +2,7 @@ pub(crate) mod private {
   pub trait Sealed {}
 }
 
-use crate::{Endpoint, JoinCredential, NodeId, identity::ListenerId, packet::RouteHandle};
+use crate::{Endpoint, MergeCredential, NodeId, identity::ListenerId, packet::RouteHandle};
 
 #[allow(private_bounds)]
 pub trait Command: private::Sealed + Send + 'static {
@@ -34,38 +34,21 @@ impl Command for Shutdown {
   type Output = crate::ShutdownOutcome;
 }
 
-pub struct CreateCluster {
+pub struct RotateMergeCredential {
   _private: (),
 }
 
 #[allow(clippy::new_without_default)]
-impl CreateCluster {
+impl RotateMergeCredential {
   pub fn new() -> Self {
     Self { _private: () }
   }
 }
 
-impl private::Sealed for CreateCluster {}
+impl private::Sealed for RotateMergeCredential {}
 
-impl Command for CreateCluster {
-  type Output = crate::ClusterView;
-}
-
-pub struct RotateJoinCredential {
-  _private: (),
-}
-
-#[allow(clippy::new_without_default)]
-impl RotateJoinCredential {
-  pub fn new() -> Self {
-    Self { _private: () }
-  }
-}
-
-impl private::Sealed for RotateJoinCredential {}
-
-impl Command for RotateJoinCredential {
-  type Output = crate::IssuedJoinCredential;
+impl Command for RotateMergeCredential {
+  type Output = crate::IssuedMergeCredential;
 }
 
 pub struct Listen {
@@ -108,28 +91,28 @@ impl Command for StopListener {
   type Output = ();
 }
 
-pub struct JoinCluster {
+pub struct MergeCluster {
   receiver: Endpoint,
-  credential: JoinCredential,
+  credential: MergeCredential,
 }
 
-impl JoinCluster {
-  pub fn new(receiver: Endpoint, credential: JoinCredential) -> Self {
+impl MergeCluster {
+  pub fn new(receiver: Endpoint, credential: MergeCredential) -> Self {
     Self {
       receiver,
       credential,
     }
   }
 
-  pub(crate) fn into_parts(self) -> (Endpoint, JoinCredential) {
+  pub(crate) fn into_parts(self) -> (Endpoint, MergeCredential) {
     (self.receiver, self.credential)
   }
 }
 
-impl private::Sealed for JoinCluster {}
+impl private::Sealed for MergeCluster {}
 
-impl Command for JoinCluster {
-  type Output = crate::AdmissionView;
+impl Command for MergeCluster {
+  type Output = crate::MergeView;
 }
 
 /// Connects to an already-admitted peer using key trust only (G3-04): no
