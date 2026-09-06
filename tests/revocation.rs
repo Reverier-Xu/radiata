@@ -411,7 +411,7 @@ async fn g9_delayed_content_converges_after_revoke() {
   // revocation is a convergent permanent removal tombstone, so the
   // expulsion is cluster-wide): content converges, the binding converges,
   // and every member treats the identity as unauthorized.
-  let member_key_on_third = tokio::time::timeout(Duration::from_secs(30), async {
+  tokio::time::timeout(Duration::from_secs(30), async {
     // The tombstone trails its binding (the revocation forwards on the
     // snapshot resend cadence), so poll until the revoked status lands.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
