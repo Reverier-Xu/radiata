@@ -9,10 +9,12 @@ source: ADR-0007
 
 ## Contract
 
-This manifest freezes the connectivity-and-metadata facade. The crate owns authenticated cluster
-connectivity, opaque packet streams, and core metadata. It exposes no business record model, built-in
-conversation pattern, body persistence, deployment behavior, peer-clock coordination, or product node
-limit.
+This manifest freezes the connectivity-and-metadata facade. The crate owns authenticated
+peer-to-peer connectivity, opaque streams, and core metadata. Under the peer-trust deployment model
+(ADR-0009) every started node is born holding a singleton cluster: clusters compose exclusively by
+credential-authorized merge, and cluster identity is the convergent binding set — the crate exposes no
+machine cluster identity. It exposes no business record model, built-in conversation pattern, body
+persistence, deployment behavior, peer-clock coordination, or product node limit.
 
 The local facade uses sealed commands, queries, and events. Provider and policy traits are open. No
 public signature contains Tokio channel or task handles, TLS implementation types, CBOR
@@ -34,6 +36,7 @@ session/listener lists also use pages for a uniform bounded contract.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type BoxFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+use std::pin::Pin;
 
 pub struct Error { /* private */ }
 
@@ -122,7 +125,6 @@ addresses.
 
 ```rust
 pub struct NodeId { /* private */ }
-pub struct ClusterId { /* private */ }
 pub struct TraceId { /* private */ }
 pub struct TransactionId { /* private canonical text */ }
 pub struct OperationId { /* private */ }
@@ -134,10 +136,6 @@ pub struct PublicKey { /* private [u8; 32] */ }
 pub struct Signature { /* private [u8; 64] */ }
 
 impl NodeId {
-    pub fn parse(value: &str) -> Result<Self>;
-    pub fn as_str(&self) -> &str;
-}
-impl ClusterId {
     pub fn parse(value: &str) -> Result<Self>;
     pub fn as_str(&self) -> &str;
 }
@@ -206,14 +204,14 @@ Every tag and label type has `parse`, `as_str`, and canonical value traits. Rese
 Core never dereferences a `ResourceUri`.
 
 ```rust
-pub struct JoinCredential { /* private secret */ }
-impl JoinCredential {
+pub struct MergeCredential { /* private secret */ }
+impl MergeCredential {
     pub fn parse(value: &str) -> Result<Self>;
     pub fn expose_secret(&self) -> &str;
 }
 ```
 
-`JoinCredential` implements neither `Clone`, `Copy`, serialization, `Display`, nor revealing `Debug`.
+`MergeCredential` implements neither `Clone`, `Copy`, serialization, `Display`, nor revealing `Debug`.
 
 ## Configuration and Builder
 
@@ -292,11 +290,11 @@ impl NodeHandle {
     pub async fn command<C: Command>(&self, command: C) -> Result<C::Output>;
     pub async fn query<Q: Query>(&self, query: Q) -> Result<Q::Output>;
     pub fn events<E: Event>(&self, options: EventOptions) -> Result<EventSubscription<E>>;
-    pub fn create_packet(&self, target: PacketTarget, protocol: ProtocolTag, policy: PacketPolicy, metadata: PacketMetadata) -> Result<OutboundPacket>;
+    pub fn open_stream(&self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy, metadata: StreamMetadata) -> Result<OutboundStream>;
 }
 ```
 
-`create_packet` allocates a core-generated `TraceId` synchronously and performs no body delivery. The
+`open_stream` allocates a core-generated `TraceId` synchronously and performs no body delivery. The
 returned packet exposes that ID before `send_sync` or `send_async` starts consuming the body. An exact
 node target rejects a load-balancer selection; a matching-node target requires one. Every referenced
 policy tag must resolve in the registry, and the caller-selected nonzero hop budget bounds route work
@@ -309,13 +307,9 @@ pub struct Shutdown { /* private */ }
 impl Shutdown { pub fn new() -> Self; }
 impl Command for Shutdown { type Output = ShutdownOutcome; }
 
-pub struct CreateCluster { /* private */ }
-impl CreateCluster { pub fn new() -> Self; }
-impl Command for CreateCluster { type Output = ClusterView; }
-
-pub struct RotateJoinCredential { /* private */ }
-impl RotateJoinCredential { pub fn new() -> Self; }
-impl Command for RotateJoinCredential { type Output = IssuedJoinCredential; }
+pub struct RotateMergeCredential { /* private */ }
+impl RotateMergeCredential { pub fn new() -> Self; }
+impl Command for RotateMergeCredential { type Output = IssuedMergeCredential; }
 
 pub struct Listen { /* private */ }
 impl Listen { pub fn new(endpoint: Endpoint) -> Self; }
@@ -325,9 +319,21 @@ pub struct StopListener { /* private */ }
 impl StopListener { pub fn new(listener: ListenerId) -> Self; }
 impl Command for StopListener { type Output = (); }
 
-pub struct JoinCluster { /* private */ }
-impl JoinCluster { pub fn new(receiver: Endpoint, credential: JoinCredential) -> Self; }
-impl Command for JoinCluster { type Output = AdmissionView; }
+pub struct MergeCluster { /* private */ }
+impl MergeCluster { pub fn new(receiver: Endpoint, credential: MergeCredential) -> Self; }
+impl Command for MergeCluster { type Output = MergeView; }
+
+pub struct CleanupNode { /* private */ }
+impl CleanupNode { pub fn new(subject: NodeId) -> Self; }
+impl Command for CleanupNode { type Output = (); }
+
+pub struct PurgeRevocation { /* private */ }
+impl PurgeRevocation { pub fn new(subject: NodeId) -> Self; }
+impl Command for PurgeRevocation { type Output = (); }
+
+pub struct IssueCleanupCheckpoint { /* private */ }
+impl IssueCleanupCheckpoint { pub fn new() -> Self; }
+impl Command for IssueCleanupCheckpoint { type Output = u64; }
 
 pub struct ConnectMember { /* private */ }
 impl ConnectMember { pub fn new(receiver: Endpoint, peer: NodeId) -> Self; }
@@ -364,8 +370,13 @@ impl LeaveCluster { pub fn new(acknowledgement: ReplaceIdentityAndDeleteOldCoreM
 impl Command for LeaveCluster { type Output = LeaveOutcome; }
 ```
 
-Leave and cleanup affect only core metadata and key intents. They never follow a resource URI or delete
-an upper-layer object.
+Leave signs an owner-signed terminal leave record, announces it to the connected sessions with a
+bounded first-admission-acknowledgement wait, then rotates the identity through the crash-safe
+journaled pipeline. Leave and cleanup affect only core metadata and key intents. They never follow a
+resource URI or delete an upper-layer object. The cleanup family (`CleanupNode`,
+`PurgeRevocation`, `IssueCleanupCheckpoint`) issues convergent signed removal tombstones, clears one
+local revocation record explicitly, and starts checkpoint GC epochs; revocation records are permanent
+and never collected.
 
 ## Queries and Pages
 
@@ -441,17 +452,17 @@ impl Query for GetObservability { type Output = ObservabilitySnapshot; }
 Every page has `items(&self) -> &[T]` and `next(&self) -> Option<&PageCursor>`. A page is only one bounded
 observation and does not claim a stable whole-population snapshot while metadata changes.
 
-## Packet Streams
+## Streams
 
 ```rust
 #[non_exhaustive]
-pub enum PacketTarget {
+pub enum StreamTarget {
     Exact(NodeId),
     MatchingNodes(Selector),
 }
 
-pub struct PacketPolicy { /* private explicit policy selection */ }
-impl PacketPolicy {
+pub struct StreamPolicy { /* private explicit policy selection */ }
+impl StreamPolicy {
     pub fn new(routing_policy: RoutingPolicy, max_hops: u32) -> Result<Self>;
     pub fn load_balancer(self, value: QualifiedTag) -> Self;
     pub fn routing_policy(&self) -> &RoutingPolicy;
@@ -464,38 +475,42 @@ pub enum RoutingPolicy {
     Direct,
 }
 
-pub struct PacketMetadata { /* private bounded canonical map */ }
-impl PacketMetadata {
+pub struct StreamMetadata { /* private bounded canonical map */ }
+impl StreamMetadata {
     pub fn new() -> Self;
     pub fn insert(self, key: QualifiedTag, value: std::sync::Arc<[u8]>) -> Result<Self>;
     pub fn get(&self, key: &QualifiedTag) -> Option<&[u8]>;
     pub fn entries(&self) -> impl ExactSizeIterator<Item = (&QualifiedTag, &[u8])>;
 }
 
-pub trait PacketBody: std::fmt::Debug + Send + 'static {
-    fn next_chunk<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<std::sync::Arc<[u8]>>>>;
-}
+/// The body of one stream: a standard [] of opaque
+/// chunk results. Core never inspects chunk content or boundaries.
+pub type BodyStream = dyn futures_core::Stream<Item = Result<std::sync::Arc<[u8]>>> + Send;
 
-pub struct OutboundPacket { /* private, owns trace and route context */ }
-impl OutboundPacket {
+pub struct OutboundStream { /* private, owns trace and route context */ }
+impl OutboundStream {
     pub fn trace_id(&self) -> &TraceId;
-    pub fn send_sync(self, body: Box<dyn PacketBody>) -> BoxFuture<'static, Result<DeliveryAck>>;
-    pub fn send_async(self, body: Box<dyn PacketBody>) -> Result<RouteHandle>;
+    pub fn send_sync<S>(self, body: S) -> BoxFuture<'static, Result<DeliveryAck>>
+    where
+        S: futures_core::Stream<Item = Result<std::sync::Arc<[u8]>>> + Send + 'static;
+    pub fn send_async<S>(self, body: S) -> Result<RouteHandle>
+    where
+        S: futures_core::Stream<Item = Result<std::sync::Arc<[u8]>>> + Send + 'static;
 }
 
 impl RouteHandle {
     pub fn trace_id(&self) -> &TraceId;
 }
 
-pub struct IncomingPacket { /* private */ }
-impl IncomingPacket {
+pub struct IncomingStream { /* private */ }
+impl IncomingStream {
     pub fn source(&self) -> &NodeId;
     pub fn destination(&self) -> &NodeId;
     pub fn trace_id(&self) -> &TraceId;
     pub fn protocol(&self) -> &ProtocolTag;
-    pub fn metadata(&self) -> &PacketMetadata;
-    pub fn body(&mut self) -> &mut dyn PacketBody;
-    pub fn derive_return_packet(&self, protocol: ProtocolTag, metadata: PacketMetadata) -> Result<OutboundPacket>;
+    pub fn metadata(&self) -> &StreamMetadata;
+    pub fn body(&mut self) -> Pin<&mut (dyn futures_core::Stream<Item = Result<std::sync::Arc<[u8]>>> + Send)>;
+    pub fn derive_return_stream(&self, protocol: ProtocolTag, metadata: StreamMetadata) -> Result<OutboundStream>;
 }
 
 pub struct DeliveryAck { /* private */ }
@@ -523,7 +538,7 @@ backpressure. Route/session interruption ends the stream with `StreamInterrupted
 body bytes and never automatically continues an interrupted stream after disconnect or restart.
 
 `DeliveryAck` proves authenticated admission to the destination process's bounded incoming stream only.
-A caller may use `derive_return_packet` to swap endpoints and reuse the same `TraceId`; core assigns no
+A caller may use `derive_return_stream` to swap endpoints and reuse the same `TraceId`; core assigns no
 meaning to that packet and owns no correlation policy.
 
 ## Node and Resource Metadata Views
@@ -531,7 +546,6 @@ meaning to that packet and owns no correlation policy.
 ```rust
 pub struct LocalNodeView { /* private */ }
 impl LocalNodeView {
-    pub fn cluster_id(&self) -> &ClusterId;
     pub fn node_id(&self) -> &NodeId;
     pub fn public_key(&self) -> &PublicKey;
 }
@@ -698,22 +712,16 @@ pub struct ReplaceIdentityAndDeleteOldCoreMetadata { /* no Default */ }
 impl ReplaceIdentityAndDeleteOldCoreMetadata { pub fn new() -> Self; }
 pub struct ShutdownOutcome { /* private */ }
 impl ShutdownOutcome { pub fn reason(&self) -> &ShutdownReason; }
-pub struct ClusterView { /* private */ }
-impl ClusterView {
-    pub fn cluster_id(&self) -> &ClusterId;
-    pub fn creator(&self) -> &NodeId;
-}
-pub struct IssuedJoinCredential { /* private secret */ }
-impl IssuedJoinCredential {
-    pub fn credential(&self) -> &JoinCredential;
+pub struct IssuedMergeCredential { /* private secret */ }
+impl IssuedMergeCredential {
+    pub fn credential(&self) -> &MergeCredential;
     pub fn expires_at(&self) -> std::time::SystemTime;
-    pub fn into_credential(self) -> JoinCredential;
+    pub fn into_credential(self) -> MergeCredential;
 }
-pub struct AdmissionView { /* private */ }
-impl AdmissionView {
-    pub fn cluster_id(&self) -> &ClusterId;
-    pub fn admitted_node(&self) -> &NodeId;
-    pub fn issuer(&self) -> &NodeId;
+pub struct MergeView { /* private */ }
+impl MergeView {
+    pub fn node(&self) -> &NodeId;
+    pub fn peer(&self) -> &NodeId;
 }
 pub struct RevokeOutcome { /* private */ }
 impl RevokeOutcome {
@@ -1019,7 +1027,7 @@ impl FeatureDefinition {
     pub fn protocol(self, tag: ProtocolTag) -> Result<Self>;
 }
 pub trait PacketConsumer: std::fmt::Debug + Send + Sync + 'static {
-    fn accept<'a>(&'a self, packet: IncomingPacket) -> BoxFuture<'a, Result<()>>;
+    fn accept<'a>(&'a self, packet: IncomingStream) -> BoxFuture<'a, Result<()>>;
 }
 
 pub struct RouteContext { /* private current route observation */ }
@@ -1082,10 +1090,10 @@ JSON is test-only. redb is the feature-gated production backend. Concrete adapte
 | Values, errors, finite configuration | T-G01-01 |
 | Builder, lifecycle, wall clock, typed facade | T-G01-02 |
 | Storage/key SPI semantics and JSON | T-G02-01..T-G02-05 |
-| Admission, TLS, exact-node packet streams | T-G03-02..T-G03-06 |
+| Admission, TLS, exact-node streams | T-G03-02..T-G03-06 |
 | Session, endpoint, trust pages | T-G04-02..T-G04-06 |
 | Node revisions, population pages, recovery | T-G05-01..T-G05-06 |
-| Multi-hop packet routes and trace metadata | T-G06-01..T-G06-05 |
+| Multi-hop stream routes and trace metadata | T-G06-01..T-G06-05 |
 | Resource tuple convergence and wall time | T-G07-01..T-G07-06 |
 | redb and migrations | T-G08-01..T-G08-05 |
 | Resource operations and facade closure | T-G09-01..T-G09-07 |

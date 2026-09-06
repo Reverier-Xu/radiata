@@ -462,7 +462,7 @@ async fn measure_async(runs: u32, expected_commit: String) -> Result<(), String>
         &mut ledger,
         run,
         index as u32 + 1,
-        "admission",
+        "merge",
         started.unwrap_or(0),
         ended,
         outcome,

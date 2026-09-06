@@ -4,6 +4,13 @@ title: Measure the sixteen-node connectivity and metadata profile
 status: accepted
 date: 2026-08-02
 amended: 2026-08-04
+amended-notes:
+  - date: 2026-09-05
+    summary: >-
+      The admission stratum becomes the merge stratum (T-G11-13, ADR-0009
+      rebaseline): the five fixed-admission samples execute credential-
+      authorized cluster merges with unchanged credential evidence rules;
+      the method, pass rule, lineage, and sample totals are unchanged.
 deciders: radiata maintainers
 ---
 

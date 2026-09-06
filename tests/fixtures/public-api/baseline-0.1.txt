@@ -336,6 +336,11 @@ pub fn radiata::IncomingStream::source(&self) -> &radiata::NodeId
 pub fn radiata::IncomingStream::trace_id(&self) -> &radiata::TraceId
 impl core::fmt::Debug for radiata::IncomingStream
 pub fn radiata::IncomingStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::IssueCleanupCheckpoint
+impl radiata::IssueCleanupCheckpoint
+pub fn radiata::IssueCleanupCheckpoint::new() -> Self
+impl radiata::Command for radiata::IssueCleanupCheckpoint
+pub type radiata::IssueCleanupCheckpoint::Output = u64
 pub struct radiata::IssuedMergeCredential
 impl radiata::IssuedMergeCredential
 pub fn radiata::IssuedMergeCredential::credential(&self) -> &radiata::MergeCredential
@@ -963,6 +968,8 @@ impl radiata::Command for radiata::ConnectMember
 pub type radiata::ConnectMember::Output = radiata::NodeId
 impl radiata::Command for radiata::DisconnectPeer
 pub type radiata::DisconnectPeer::Output = ()
+impl radiata::Command for radiata::IssueCleanupCheckpoint
+pub type radiata::IssueCleanupCheckpoint::Output = u64
 impl radiata::Command for radiata::LeaveCluster
 pub type radiata::LeaveCluster::Output = radiata::LeaveOutcome
 impl radiata::Command for radiata::Listen

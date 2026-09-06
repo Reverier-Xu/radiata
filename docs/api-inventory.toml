@@ -1,22 +1,21 @@
 schema = "radiata.woooo.tech/schemas/api-inventory-v1"
 status = "accepted"
 document = "docs/api-manifest.md"
-sha256 = "ba727eabcbbd5f2fb332a74ba301bbdb7c48b9044aa66932e8c3c880ec699c6b"
+sha256 = "83a4dff1736b46168c04754e8f4b2907d2a42258275167f9a2b803780830f2bd"
 
 node_handle_signatures = [
   "pub async fn command<C: Command>(&self, command: C) -> Result<C::Output>;",
   "pub async fn query<Q: Query>(&self, query: Q) -> Result<Q::Output>;",
   "pub fn events<E: Event>(&self, options: EventOptions) -> Result<EventSubscription<E>>;",
-  "pub fn create_packet(&self, target: PacketTarget, protocol: ProtocolTag, policy: PacketPolicy, metadata: PacketMetadata) -> Result<OutboundPacket>;",
+  "pub fn open_stream(&self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy, metadata: StreamMetadata) -> Result<OutboundStream>;",
 ]
 
 commands = [
   "Shutdown",
-  "CreateCluster",
-  "RotateJoinCredential",
+  "RotateMergeCredential",
   "Listen",
   "StopListener",
-  "JoinCluster",
+  "MergeCluster",
   "ConnectMember",
   "DisconnectPeer",
   "UpdateNodeMetadata",
@@ -24,6 +23,9 @@ commands = [
   "PutResource",
   "RemoveResource",
   "RevokeNode",
+  "CleanupNode",
+  "PurgeRevocation",
+  "IssueCleanupCheckpoint",
   "LeaveCluster",
 ]
 
@@ -62,7 +64,7 @@ extension_traits = [
   "StoreSnapshot",
   "StoreScan",
         "Discovery",
-  "PacketBody",
+  "futures_core::Stream",
   "PacketConsumer",
   "LoadBalancingPolicy",
   "RouteNextHop",
@@ -87,13 +89,12 @@ required_reexports = [
   "Result",
   "BoxFuture",
   "NodeId",
-  "ClusterId",
   "TraceId",
   "TransactionId",
   "OperationId",
   "ListenerId",
   "SessionId",
-  "JoinCredential",
+  "MergeCredential",
   "Digest",
   "PublicKey",
   "Signature",
@@ -113,7 +114,7 @@ required_reexports = [
   "PacketTarget",
   "PacketPolicy",
   "PacketMetadata",
-  "PacketBody",
+  "futures_core::Stream",
   "OutboundPacket",
   "IncomingPacket",
   "DeliveryAck",
@@ -150,9 +151,8 @@ required_reexports = [
   "NodeStatus",
   "ShutdownReason",
   "ShutdownOutcome",
-  "ClusterView",
-  "IssuedJoinCredential",
-  "AdmissionView",
+  "IssuedMergeCredential",
+  "MergeView",
   "RevokeOutcome",
   "LeaveOutcome",
   "ResourceMutationView",
@@ -207,7 +207,7 @@ forbidden_public_tokens = [
   "pub trait WallClock",
   "pub fn wall_clock",
   "pub fn timestamp(self",
-  "PacketTarget::Resource",
+  "StreamTarget::Resource",
   "Vec<MemberView>",
   "Vec<TrustedIdentityView>",
   "Vec<ResourceView>",

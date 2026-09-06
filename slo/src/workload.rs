@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 //! The exact ADR-0005 workload (T-G10-11, SC-G10-P0-34..37): five runs of
-//! five samples per stratum — fixed admission, direct packets, routed
+//! five samples per stratum — fixed merge, direct packets, routed
 //! label-selected packets, owner-revision node metadata, and resource
 //! metadata writes — observed only through the public facade.
 //!
@@ -284,7 +284,7 @@ pub async fn sample_admission(
   let sample = RawSample {
     run: 0,
     index: 0,
-    stratum: "admission",
+    stratum: "merge",
     started_at_ms: now_ms(),
     ended_at_ms: 0,
     outcome: "ok".to_owned(),

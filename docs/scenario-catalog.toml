@@ -1952,6 +1952,42 @@ cases = [
   ] },
 ]
 
+[[scenario_set]]
+owner_task = "T-G11-11"
+gate = "G11"
+priority = "P0"
+first = 31
+verification_id = "VERIFY-G11-11"
+kind = "validation"
+cases = [
+  { title = "No cluster field survives anywhere", acceptance = "API, wire frames, handshake hello/transcript, merge hint, grant payload, trust snapshots, resource records, and storage families contain no ClusterId; the public-api baseline matches the excised surface exactly.", rebaseline = "ADR-0009", threats = [
+    "THR-014",
+  ] },
+  { title = "Golden vectors and compatibility fixtures are regenerated", acceptance = "Identity records, pending records, handshake transcripts, resource records, and compatibility fixtures pin the rebaselined byte formats and round-trip exactly.", rebaseline = "ADR-0009", threats = [
+    "THR-009",
+    "THR-012",
+  ] },
+  { title = "Mixed-version evidence is regenerated post-rebaseline", acceptance = "The mixed-binary compatibility lane passes with the rebaselined formats on every compiled backend; nothing is published, so no migration path is owed.", rebaseline = "ADR-0009", threats = [
+    "THR-009",
+  ] },
+]
+
+[[scenario_set]]
+owner_task = "T-G11-13"
+gate = "G11"
+priority = "P0"
+first = 36
+verification_id = "VERIFY-G11-13"
+kind = "validation"
+cases = [
+  { title = "The admission stratum becomes the merge stratum", acceptance = "The SLO workload's five fixed samples execute credential-authorized merges with unchanged credential evidence rules; the stratum is reported as merge; the controller ledger records the same schema, pass rule, five-run lineage, and 125-sample total (ADR-0005 amendment).", rebaseline = "ADR-0009", threats = [
+    "THR-002",
+  ] },
+  { title = "The controller never drives the facade directly", acceptance = "The isolation lane proves the controller binary issues no listen, merge, or query commands; nodes are external processes driven only through the stdin/stdout helper pipes.", rebaseline = "ADR-0009", threats = [
+    "THR-002",
+  ] },
+]
+
 [[e2e]]
 id = "E2E-01"
 title = "Secure join and credential rotation"
