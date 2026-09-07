@@ -33,7 +33,9 @@ grep -q 'Admit futures-core 0.3 as a production dependency entering the public A
   exit 1
 }
 
-# Digest lane: the api-inventory digest matches the amended manifest.
+# Digest lane: the api-inventory digest matches the amended manifest
+# (with the ABI rule lane above this carries SC-G11-P0-38..39: the
+# T-G11-14 manifest and inventory amendment freeze).
 manifest_sha=$(sha256sum docs/api-manifest.md | awk '{ print $1 }')
 inventory_sha=$(awk -F'"' '/^sha256 = / { print $2 }' docs/api-inventory.toml)
 if [[ "$manifest_sha" != "$inventory_sha" ]]; then
