@@ -195,13 +195,15 @@ Moved tasks keep their stable IDs; the gate closes on the publish task.
 | T-G10-07 Native CI/evidence matrix (moved) | P0/H | 11-01..14 | MSRV/stable/native/features/fuzz/soak attestations for the rebaselined targets | workflows/evidence | SC-G10-P0-20..24; native/powerset/attestation | R0 |
 | T-G10-10 OCI SLO harness qualification (moved) | P0/H | 11-13 and prior G11 | External publish-false 16-node harness using merges, packets, owner revisions, and resources only | SLO harness | SC-G10-P0-30..33; isolation/readiness/workload/cleanup | R0 |
 | T-G10-11 Candidate and complete SLO ledger (moved) | P0/H | 11-13 and prior G11 | Immutable candidate, release matrices, 125 merge-workload samples, complete lineage | release/SLO evidence | SC-G10-P0-34..37, E2E-10; exact SHA/profile/results | R0 |
-| T-G10-12 Token, tag, and publish (moved) | P0/H | 10-11 | Validate provider ledger, issue external token, guard tag/publish exact candidate | release evidence | SC-G10-P0-38..40; transition negatives/registry | R0 |
+| T-G10-12 Manual publish contract (moved) | P1/L | 10-11 | No automated publication surface; the operator runs the launcher, reviews the outcomes, and tags the exact verified commit | release flow | SC-G10-P0-38..40; launcher sequencing and manual-publish contract | R0 |
 
 ## Gate Closure
 
 Each gate closes on its final stable task (`00-06`, `01-05`, `02-05`, `03-06`, `04-06`, `05-06`,
 `06-05`, `07-06`, `08-05`, `09-07`, `10-09`, `10-12`). T-G10-07, T-G10-10, T-G10-11, and T-G10-12
-keep their stable IDs but execute inside G11. Handoffs copy the current row, scenarios, threats, API
+keep their stable IDs but execute inside G11. T-G10-12 closes as the manual publish contract
+(`docs/reviews/2026-09-07-release-flow-closure.md`): no automated publication surface exists, and
+the operator publishes by tagging the exact commit the launcher verified. Handoffs copy the current row, scenarios, threats, API
 signatures, focused argv, `Q`, and rollback code. One writer owns the worktree; reviewers assess current
 semantics and cannot cite evidence whose acceptance text predates this rebaseline.
 

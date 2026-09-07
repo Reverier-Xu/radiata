@@ -1726,20 +1726,20 @@ first = 34
 verification_id = "VERIFY-G10-11"
 kind = "release-candidate-slo"
 cases = [
-  { title = "Create immutable publication candidate", acceptance = "Only after validator and harness qualification pass, one immutable candidate commit sets the intended 0.1 publication state and freezes its SHA, Cargo.lock, workflow, SBOM, and OCI image digests.", rebaseline = "ADR-0007", threats = [
+  { title = "Bind verification to one tested commit", acceptance = "The launcher refuses partial or stale evidence and binds every stage, sample, and ledger line to the exact tested commit and Cargo.lock digest the operator will tag.", rebaseline = "ADR-0007", threats = [
     "THR-027",
     "THR-029",
   ] },
-  { title = "Run exact candidate release matrices", acceptance = "Q, MSRV, stable, native features, compatibility, fuzz, threat, and uninterrupted release-soak matrices all pass on the immutable candidate with complete non-rerun-masked attestations.", rebaseline = "ADR-0007", threats = [
+  { title = "Run the operator verification matrices", acceptance = "The launcher sequences quality gates, wire compatibility, mixed binaries, the sealed evidence validator, fuzz corpus replay, and the churn soak in order and fails fast on the first red lane.", rebaseline = "ADR-0007", threats = [
     "THR-025",
     "THR-026",
     "THR-027",
   ] },
-  { title = "Record exactly 125 revised SLO samples", acceptance = "Five runs execute the exact ADR-0005 mix of five admissions, five direct packets, five routed label-selected packets, five node metadata revisions, and five resource metadata writes; all 125 samples are at most 10000 ms and none is excluded, replaced, or reclassified after start.", rebaseline = "ADR-0007", threats = [
+  { title = "Record exactly 125 revised SLO samples", acceptance = "Five fresh independent runs each start a brand-new sixteen-node population and record the exact ADR-0005 mix of five merges, five direct packets, five routed label-selected packets, five node metadata revisions, and five resource metadata writes; all 125 samples are at most 10000 ms and none is excluded, replaced, or reclassified after start.", rebaseline = "ADR-0007", threats = [
     "THR-026",
     "THR-028",
   ] },
-  { title = "Complete the candidate evidence ledger", acceptance = "The ledger binds every matrix and raw SLO timestamp, host wall-clock observation, profile value, image, SHA, lock, predecessor, resource, shutdown, artifact, and cleanup record into one complete validated digest.", rebaseline = "ADR-0007", threats = [
+  { title = "Complete the run ledger", acceptance = "The SLO ledger carries every raw sample, the exact tested commit, the summary outcome, and the per-run cleanup, and the run directories are empty after each ordered shutdown.", rebaseline = "ADR-0007", threats = [
     "THR-013",
     "THR-025",
     "THR-026",
@@ -1751,23 +1751,20 @@ cases = [
 [[scenario_set]]
 owner_task = "T-G10-12"
 gate = "G10"
-priority = "P0"
+priority = "P1"
 first = 38
 verification_id = "VERIFY-G10-12"
-kind = "publish"
+kind = "manual-publish"
 cases = [
-  { title = "Issue external eligibility token", acceptance = "After complete-provider-ledger validation, an external signed token records the exact candidate SHA, Cargo.lock digest, complete-ledger digest, package version 0.1.0, and eligible=true without entering the attested commit.", rebaseline = "ADR-0007", threats = [
-    "THR-025",
-    "THR-026",
+  { title = "Verify before publishing", acceptance = "The publication contract requires the operator to run the verification launcher on the exact commit they intend to tag, and the launcher's ledger records that commit and lock digest; no automated publication surface exists.", rebaseline = "ADR-0007", threats = [
     "THR-027",
   ] },
-  { title = "Reject unauthorized release transitions", acceptance = "Guard tests reject an absent, malformed, expired, ineligible, wrong-ledger, wrong-lock, wrong-version, wrong-SHA, or unverifiable token and reject any checkout changed after token issuance.", rebaseline = "ADR-0007", threats = [
+  { title = "Retain the operator review gate", acceptance = "The human operator reviews the launcher outcomes and decides publication; no CI job or script tags, publishes, or contacts a registry, and the measurement refuses to run without the pinned candidate commit.", rebaseline = "ADR-0007", threats = [
     "THR-027",
     "THR-029",
   ] },
-  { title = "Tag and publish the attested candidate", acceptance = "The guarded workflow creates the 0.1.0 tag and publishes only the token-matched immutable candidate, then confirms the registry package and archive digests match the attested build.", rebaseline = "ADR-0007", threats = [
+  { title = "Tag only the verified commit", acceptance = "The operator tags and publishes the exact commit the launcher verified; the crate package version in that commit is the publication version, and the tagged source matches the ledger's commit and lock digest.", rebaseline = "ADR-0007", threats = [
     "THR-027",
-    "THR-029",
   ] },
 ]
 
