@@ -337,8 +337,8 @@ title = "Candidate lock evidence token tag or artifact substitution"
 priority = "P0"
 owner_task = "T-G10-12"
 scenario_ids = ["SC-G10-P0-34", "SC-G10-P0-38", "SC-G10-P0-39", "SC-G10-P0-40"]
-mitigation = "Create the immutable candidate first, bind evidence images and SBOM to SHA and lock, issue an external signed token over the complete ledger, and guard publication by exact match."
-residual = "Compromise of protected CI signing and registry identities requires platform controls outside the crate."
+mitigation = "Bind every evidence stage, sample, and ledger line to the exact tested commit and lock digest through the fail-fast verification launcher, and publish manually by tagging the commit the launcher verified."
+residual = "Publication correctness rests on the operator running the launcher on the exact commit they tag; no platform control defends against the operator bypassing their own review."
 status = "accepted"
 
 [[threat]]
