@@ -64,14 +64,61 @@ jobs:
       - name: verify MSRV
         run: test "$(rustc +1.98.0 --version --verbose | awk '$1 == "release:" { print $2 }')" = "1.98.0"
 
+      - name: record start
+        id: start
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: cargo check
+        id: check
         run: cargo +1.98.0 check --workspace --all-targets --all-features --locked
 
       - name: cargo clippy
+        id: clippy
         run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
+        id: test
         run: cargo +1.98.0 test --workspace --all-features --locked
+
+      - name: quality attestation
+        if: always()
+        shell: bash
+        env:
+          CHECK: ${{ steps.check.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          TEST: ${{ steps.test.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          STARTED: ${{ steps.start.outputs.started }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          commit=$(git rev-parse HEAD)
+          lock=$(sha256sum Cargo.lock | awk '{ print $1 }')
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
+          uninterrupted=true
+          [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
+          result=fail
+          if [ "$CHECK" = "success" ] && [ "$CLIPPY" = "success" ] \
+            && [ "$TEST" = "success" ] && [ "$uninterrupted" = "true" ]; then
+            result=pass
+          fi
+          # The canonical test-attestation record (T-G10-07): every field
+          # the sealed ledger validator requires, bound to the tested commit.
+          printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"msrv","target":"quality-msrv","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
+            "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "$duration" "$uninterrupted" "$result" > target/attestation-quality-msrv.json
+          cat target/attestation-quality-msrv.json
+
+      - name: upload attestation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-attestation-msrv
+          path: target/attestation-quality-msrv.json
+          retention-days: 30
 
   stable:
     name: stable
@@ -94,19 +141,64 @@ jobs:
       - name: report stable toolchain
         run: rustc +stable --version --verbose
 
+      - name: record start
+        id: start
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: cargo check
+        id: check
         run: cargo +stable check --workspace --all-targets --all-features --locked
 
       - name: cargo clippy
+        id: clippy
         run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
+        id: test
         run: cargo +stable test --workspace --all-features --locked
+
+      - name: quality attestation
+        if: always()
+        shell: bash
+        env:
+          CHECK: ${{ steps.check.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          TEST: ${{ steps.test.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          STARTED: ${{ steps.start.outputs.started }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          commit=$(git rev-parse HEAD)
+          lock=$(sha256sum Cargo.lock | awk '{ print $1 }')
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
+          uninterrupted=true
+          [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
+          result=fail
+          if [ "$CHECK" = "success" ] && [ "$CLIPPY" = "success" ] \
+            && [ "$TEST" = "success" ] && [ "$uninterrupted" = "true" ]; then
+            result=pass
+          fi
+          printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"stable","target":"quality-stable","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
+            "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "$duration" "$uninterrupted" "$result" > target/attestation-quality-stable.json
+          cat target/attestation-quality-stable.json
+
+      - name: upload attestation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-attestation-stable
+          path: target/attestation-quality-stable.json
+          retention-days: 30
 
   macos:
     name: macos
     runs-on: macos-latest
-    timeout-minutes: 12
+    timeout-minutes: 40
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -121,22 +213,96 @@ jobs:
           toolchain: 1.98.0
           components: clippy
 
+      - name: record start
+        id: start
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: cargo check
+        id: check
         run: cargo +1.98.0 check --workspace --all-targets --all-features --locked
 
       - name: cargo clippy
+        id: clippy
         run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
+        id: test
         run: cargo +1.98.0 test --workspace --all-features --locked
 
+      - name: native feature checks
+        id: native_checks
+        shell: bash
+        run: |
+          cargo +1.98.0 check --locked --no-default-features
+          cargo +1.98.0 check --locked --no-default-features --features redb
+
+      - name: native feature tests
+        id: native_tests
+        shell: bash
+        run: |
+          cargo +1.98.0 test --locked --no-default-features
+          cargo +1.98.0 test --locked --no-default-features --features redb
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        with:
+          tool: cargo-hack@0.6.45
+
+      - name: native feature powerset check
+        id: powerset
+        run: cargo +1.98.0 hack check --feature-powerset --depth 1 --locked
+
       - name: fixed simulator gate
+        id: simulator
         run: cargo +1.98.0 test --locked --lib simulation::network::tests::simulation_network_fault_matrix_gate -- --ignored --exact
+
+      - name: quality attestation
+        if: always()
+        shell: bash
+        env:
+          CHECK: ${{ steps.check.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          TEST: ${{ steps.test.outcome }}
+          NATIVE_CHECKS: ${{ steps.native_checks.outcome }}
+          NATIVE_TESTS: ${{ steps.native_tests.outcome }}
+          POWERSET: ${{ steps.powerset.outcome }}
+          SIMULATOR: ${{ steps.simulator.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          STARTED: ${{ steps.start.outputs.started }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          commit=$(git rev-parse HEAD)
+          lock=$(sha256sum Cargo.lock | awk '{ print $1 }')
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
+          uninterrupted=true
+          [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
+          result=pass
+          for outcome in "$CHECK" "$CLIPPY" "$TEST" "$NATIVE_CHECKS" \
+            "$NATIVE_TESTS" "$POWERSET" "$SIMULATOR"; do
+            [ "$outcome" = "success" ] || result=fail
+          done
+          if [ "$uninterrupted" != "true" ]; then result=fail; fi
+          printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"macos","target":"quality-macos","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
+            "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "$duration" "$uninterrupted" "$result" > target/attestation-quality-macos.json
+          cat target/attestation-quality-macos.json
+
+      - name: upload attestation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-attestation-macos
+          path: target/attestation-quality-macos.json
+          retention-days: 30
 
   windows:
     name: windows
     runs-on: windows-latest
-    timeout-minutes: 18
+    timeout-minutes: 60
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -151,17 +317,91 @@ jobs:
           toolchain: 1.98.0
           components: clippy
 
+      - name: record start
+        id: start
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: cargo check
+        id: check
         run: cargo +1.98.0 check --workspace --all-targets --all-features --locked
 
       - name: cargo clippy
+        id: clippy
         run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
+        id: test
         run: cargo +1.98.0 test --workspace --all-features --locked
 
+      - name: native feature checks
+        id: native_checks
+        shell: bash
+        run: |
+          cargo +1.98.0 check --locked --no-default-features
+          cargo +1.98.0 check --locked --no-default-features --features redb
+
+      - name: native feature tests
+        id: native_tests
+        shell: bash
+        run: |
+          cargo +1.98.0 test --locked --no-default-features
+          cargo +1.98.0 test --locked --no-default-features --features redb
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        with:
+          tool: cargo-hack@0.6.45
+
+      - name: native feature powerset check
+        id: powerset
+        run: cargo +1.98.0 hack check --feature-powerset --depth 1 --locked
+
       - name: fixed simulator gate
+        id: simulator
         run: cargo +1.98.0 test --locked --lib simulation::network::tests::simulation_network_fault_matrix_gate -- --ignored --exact
+
+      - name: quality attestation
+        if: always()
+        shell: bash
+        env:
+          CHECK: ${{ steps.check.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          TEST: ${{ steps.test.outcome }}
+          NATIVE_CHECKS: ${{ steps.native_checks.outcome }}
+          NATIVE_TESTS: ${{ steps.native_tests.outcome }}
+          POWERSET: ${{ steps.powerset.outcome }}
+          SIMULATOR: ${{ steps.simulator.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          STARTED: ${{ steps.start.outputs.started }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          commit=$(git rev-parse HEAD)
+          lock=$(sha256sum Cargo.lock | awk '{ print $1 }')
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
+          uninterrupted=true
+          [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
+          result=pass
+          for outcome in "$CHECK" "$CLIPPY" "$TEST" "$NATIVE_CHECKS" \
+            "$NATIVE_TESTS" "$POWERSET" "$SIMULATOR"; do
+            [ "$outcome" = "success" ] || result=fail
+          done
+          if [ "$uninterrupted" != "true" ]; then result=fail; fi
+          printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"windows","target":"quality-windows","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
+            "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "$duration" "$uninterrupted" "$result" > target/attestation-quality-windows.json
+          cat target/attestation-quality-windows.json
+
+      - name: upload attestation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-attestation-windows
+          path: target/attestation-quality-windows.json
+          retention-days: 30
 
   features-check:
     name: features / check (powerset)

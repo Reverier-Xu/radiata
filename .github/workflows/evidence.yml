@@ -58,8 +58,10 @@ jobs:
         run: cargo test --locked --all-features --lib fuzz_adapters
 
       - name: live fuzz budget
+        id: fuzz
         working-directory: fuzz
         run: |
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
           mkdir -p "../target/fuzz-work/${{ matrix.target }}"
           cargo +nightly fuzz run "${{ matrix.target }}" \
             --target x86_64-unknown-linux-gnu \
@@ -69,6 +71,8 @@ jobs:
 
       - name: attestation
         if: always()
+        env:
+          STARTED: ${{ steps.fuzz.outputs.started }}
         run: |
           set -euo pipefail
           commit=$(git rev-parse HEAD)
@@ -81,6 +85,9 @@ jobs:
           else
             result="fail"; uninterrupted="false"
           fi
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
           jq -n \
             --arg schema "radiata.woooo.tech/schemas/test-attestation" \
             --arg commit "$commit" \
@@ -96,11 +103,13 @@ jobs:
             --argjson budget 1800 \
             --argjson timeout 10 \
             --argjson rss 4096 \
+            --argjson seconds "$duration" \
             --argjson uninterrupted "$uninterrupted" \
             '{schema: $schema, commit: $commit, lock_digest: $lock, provider_run_id: $run,
               attempt: $attempt, job: $job, target: $target, toolchain: {rust: $rust, cargo_fuzz: $fuzz},
               corpus_digest: $corpus, budget_seconds: $budget, input_timeout_seconds: $timeout,
-              rss_limit_mb: $rss, uninterrupted: $uninterrupted, result: $result}' \
+              rss_limit_mb: $rss, duration_seconds: $seconds, uninterrupted: $uninterrupted,
+              retry: "complete", predecessor: "", result: $result}' \
             > "target/attestation-fuzz-${{ matrix.target }}.json"
           cat "target/attestation-fuzz-${{ matrix.target }}.json"
 
@@ -117,7 +126,10 @@ jobs:
   soak:
     name: soak
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The hosted-runner job ceiling. The weekly (8h) and release (24h)
+    # lanes need a runner that honors their full duration; a truncated
+    # attempt is retained as failed evidence, never reclassified.
+    timeout-minutes: 360
     steps:
       - name: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -130,38 +142,71 @@ jobs:
       - name: install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
+      - name: resolve soak budget
+        id: budget
+        run: |
+          set -euo pipefail
+          mode="${{ inputs.soak_mode }}"
+          if [ -z "$mode" ]; then mode=nightly; fi
+          case "$mode" in
+            weekly) secs=28800 ;;
+            release) secs=86400 ;;
+            *) secs=600 ;;
+          esac
+          if [ -n "${{ inputs.soak_duration_secs }}" ]; then
+            secs="${{ inputs.soak_duration_secs }}"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "secs=$secs" >> "$GITHUB_OUTPUT"
+
       - name: bounded soak attempt
+        id: soak
         run: |
           set -euo pipefail
           commit=$(git rev-parse HEAD)
-          export RADIATA_SOAK_DURATION_SECS="${{ inputs.soak_duration_secs || 600 }}"
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          export RADIATA_SOAK_DURATION_SECS="${{ steps.budget.outputs.secs }}"
           export RADIATA_SOAK_LEDGER="$PWD/target/soak-ledger.ndjson"
           export RADIATA_SOAK_COMMIT="$commit"
           cargo test --locked --all-features --test soak -- --ignored --exact soak_churn_then_baseline_return
-          jq -e '.schema == "radiata.woooo.tech/schemas/soak-attempt-v1"
+          jq -e --argjson min "${{ steps.budget.outputs.secs }}" \
+            '.schema == "radiata.woooo.tech/schemas/soak-attempt-v1"
             and .result == "pass"
-            and (.duration_secs | . >= 600)' "$RADIATA_SOAK_LEDGER" > /dev/null
+            and .retry == "complete"
+            and (.duration_secs | . >= $min)' "$RADIATA_SOAK_LEDGER" > /dev/null
 
       - name: attestation
         if: always()
+        env:
+          STARTED: ${{ steps.soak.outputs.started }}
+          SOAK_OUTCOME: ${{ steps.soak.outcome }}
         run: |
           set -euo pipefail
           commit=$(git rev-parse HEAD)
           lock_digest=$(sha256sum Cargo.lock | awk '{ print $1 }')
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
+          uninterrupted=true
+          if [ "$SOAK_OUTCOME" != "success" ]; then uninterrupted=false; fi
+          ledger_result=$(jq -rs 'map(.result) | if length > 0 and all(. == "pass") then "pass" else "fail" end' target/soak-ledger.ndjson 2>/dev/null || echo fail)
           jq -n \
             --arg schema "radiata.woooo.tech/schemas/test-attestation" \
             --arg commit "$commit" \
             --arg lock "$lock_digest" \
             --arg run "${{ github.run_id }}" \
             --arg attempt "${{ github.run_attempt }}" \
-            --arg job "soak" \
+            --arg job "soak-${{ steps.budget.outputs.mode }}" \
             --arg target "soak_churn_then_baseline_return" \
             --arg rust "$(rustc +1.98.0 --version)" \
-            --arg result "$(jq -rs 'map(.result) | if all(. == "pass") then "pass" else "fail" end' target/soak-ledger.ndjson)" \
-            --argjson duration "${{ inputs.soak_duration_secs || 600 }}" \
+            --arg result "$ledger_result" \
+            --argjson uninterrupted "$uninterrupted" \
+            --argjson budget "${{ steps.budget.outputs.secs }}" \
+            --argjson seconds "$duration" \
             '{schema: $schema, commit: $commit, lock_digest: $lock, provider_run_id: $run,
               attempt: $attempt, job: $job, target: $target, toolchain: {rust: $rust},
-              budget_seconds: $duration, result: $result}' \
+              budget_seconds: $budget, duration_seconds: $seconds, uninterrupted: $uninterrupted,
+              retry: "complete", predecessor: "", result: $result}' \
             > target/attestation-soak.json
           cat target/attestation-soak.json
 

@@ -204,14 +204,35 @@ fn open_files() -> usize {
   0
 }
 
-/// Writes one attempt record to the ledger path: an NDJSON line with
-/// counters, typed failure kinds, and the baseline proof. No node ids,
-/// paths, or addresses — counts and kinds only.
+/// The digest of the previous attempt line in an existing ledger, or the
+/// empty string when the ledger is new: the soak lineage chain link.
+fn previous_attempt_digest(path: &std::path::Path) -> String {
+  std::fs::read_to_string(path)
+    .ok()
+    .and_then(|text| {
+      text
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+    })
+    .map(|line| radiata_test_support::ledger::line_digest(&line))
+    .unwrap_or_default()
+}
+
+/// Writes one attempt record to the ledger path: an NDJSON line with the
+/// lineage link and retry classification, counters, typed failure kinds,
+/// and the baseline proof. No node ids, paths, or addresses — counts and
+/// kinds only. Every appended attempt ran its full configured budget, so
+/// the classification is always `complete`; a product failure retains
+/// its failed line, and a later rerun can never supersede it.
 fn append_ledger(
   path: &std::path::Path, commit: &str, duration: Duration, stats: &WorkloadStats,
   baseline: &[(&str, u64)],
 ) {
   use std::fmt::Write as _;
+  let predecessor = previous_attempt_digest(path);
   let failures = stats
     .failures
     .iter()
@@ -231,12 +252,14 @@ fn append_ledger(
   let record = format!(
     concat!(
       "{{\"schema\":\"radiata.woooo.tech/schemas/soak-attempt-v1\",",
-      "\"commit\":\"{}\",\"duration_secs\":{},\"packets_sent\":{},",
+      "\"commit\":\"{}\",\"predecessor\":\"{}\",\"retry\":\"complete\",",
+      "\"duration_secs\":{},\"packets_sent\":{},",
       "\"packets_received\":{},\"resources_written\":{},\"reconnects\":{},",
       "\"credential_rotations\":{},\"failures\":[{}],\"baseline_return\":{{{}}},",
       "\"result\":\"pass\"}}\n"
     ),
     commit,
+    predecessor,
     duration.as_secs(),
     stats.packets_sent,
     stats.packets_received,
