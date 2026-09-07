@@ -2034,6 +2034,14 @@ impl Supervisor {
   }
 
   async fn recovery_tick_inner(&mut self) -> Result<()> {
+    // Finished connection tasks keep their JoinHandles until reaped, so a
+    // long-lived listener would otherwise grow one dead handle per ever
+    // accepted connection and inflate the observability counts. Reaping
+    // each tick keeps the vec and the counts live-work only; abort() on a
+    // finished handle is a no-op, so shutdown semantics are unchanged.
+    if let Ok(mut handles) = self.connection_tasks.lock() {
+      handles.retain(|handle| !handle.is_finished());
+    }
     let direct: std::collections::BTreeSet<NodeId> = self
       .dependencies
       .sessions
