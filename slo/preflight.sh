@@ -108,6 +108,17 @@ CONTROLLER_IMAGE_ID=$(
 [ -n "$NODE_IMAGE_ID" ] || fail "the slo-node image id was not recorded"
 [ -n "$CONTROLLER_IMAGE_ID" ] || fail "the slo-controller image id was not recorded"
 
+# The image build itself loads the host; wait for the page-out aftermath
+# to settle so the pressure window starts quiet.
+quiet_deadline=$((SECONDS + 180))
+prev_swap=""
+while [ "$SECONDS" -lt "$quiet_deadline" ]; do
+  cur_swap=$(awk '/^pswpin/ { i = $2 } /^pswpout/ { o = $2 } END { print i + 0, o + 0 }' /proc/vmstat)
+  [ "$cur_swap" = "$prev_swap" ] && break
+  prev_swap="$cur_swap"
+  sleep 5
+done
+
 # --- redb data volumes: a dedicated writable root, cleaned after ---
 VOLUMES=${RADIATA_SLO_VOLUMES:-target/slo-volumes}
 mkdir -p "$VOLUMES/probe"

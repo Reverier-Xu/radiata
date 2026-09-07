@@ -26,6 +26,8 @@ pub const WORKLOAD_PROTOCOL: &str = "radiata.woooo.tech/protocols/workload-echo"
 pub const WORKLOAD_FEATURE: &str = "radiata.woooo.tech/features/session-core";
 /// The load-balancer tag used by the routed stratum.
 pub const WORKLOAD_BALANCER: &str = "example.org/balancers/first-match";
+/// The next-hop routing policy tag every helper registers.
+pub const NEXT_HOP_POLICY: &str = "example.org/policies/slo-next-hop";
 /// The member label the routed stratum selects on.
 pub const WORKLOAD_SELECTOR: &str = "example.org/labels/zone=edge";
 /// The SLO sample deadline (the decision-register constant).
@@ -123,7 +125,9 @@ pub async fn sample_direct_packet(handle: &NodeHandle, target: &NodeId) -> RawSa
     let packet = handle.open_stream(
       StreamTarget::Exact(target.clone()),
       ProtocolTag::parse(WORKLOAD_PROTOCOL)?,
-      StreamPolicy::new(RoutingPolicy::Direct, 1)?,
+      // The sparse topology routes exact-target packets over up to three
+      // hops; one hop of slack keeps the budget non-binding.
+      StreamPolicy::new(RoutingPolicy::Direct, 4)?,
       StreamMetadata::new(),
     )?;
     packet.send_sync(workload_body()).await?;

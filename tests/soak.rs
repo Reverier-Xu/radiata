@@ -527,17 +527,34 @@ async fn soak_churn_then_baseline_return() {
   for member in &members {
     member_snapshots.push(snapshot_of(&member.handle).await);
   }
-  let issuer_snapshot = snapshot_of(&issuer.handle).await;
-  let issuer_queued = (
-    counter(
-      &issuer_snapshot,
-      radiata::ObservabilitySnapshot::QUEUED_SESSION_MESSAGES,
-    ),
-    counter(
-      &issuer_snapshot,
-      radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES,
-    ),
-  );
+  // The steady-state residual re-reads until the periodic anti-entropy
+  // page flight drains: a fresh snapshot can land mid-flight with one
+  // page and its acknowledgement still queued, so the baseline polls
+  // until the queue sits inside the bounded residual instead of
+  // asserting one instantaneous sample.
+  let queued_deadline = Instant::now() + BASELINE_TIMEOUT;
+  let mut issuer_snapshot;
+  let issuer_queued = loop {
+    issuer_snapshot = snapshot_of(&issuer.handle).await;
+    let queued = (
+      counter(
+        &issuer_snapshot,
+        radiata::ObservabilitySnapshot::QUEUED_SESSION_MESSAGES,
+      ),
+      counter(
+        &issuer_snapshot,
+        radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES,
+      ),
+    );
+    if queued.0 <= STEADY_STATE_QUEUE_MAX && queued.1 <= 4_096 {
+      break queued;
+    }
+    assert!(
+      Instant::now() < queued_deadline,
+      "the issuer queue never settled inside the steady-state residual: {queued:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+  };
 
   // Queues, streams, routes, and transactions return to their baselines.
   baseline.push((

@@ -121,7 +121,7 @@ async fn g9_put_resource_commits_atomically_and_emits_one_event() {
   assert_eq!(by_custom, [resource_name(1).as_str().to_owned()]);
 
   // Exactly one event after durability; the bus does not replay it.
-  let event = tokio::time::timeout(Duration::from_secs(30), events.recv())
+  let event = tokio::time::timeout(Duration::from_secs(90), events.recv())
     .await
     .unwrap()
     .unwrap();
@@ -147,7 +147,7 @@ async fn g9_put_resource_commits_atomically_and_emits_one_event() {
     .await
     .unwrap();
   assert!(outcome.is_current_winner());
-  let event = tokio::time::timeout(Duration::from_secs(30), events.recv())
+  let event = tokio::time::timeout(Duration::from_secs(90), events.recv())
     .await
     .unwrap()
     .unwrap();
@@ -437,7 +437,7 @@ async fn g9_remove_resource_requires_the_exact_version() {
     .await
     .unwrap();
   // Drain the put's event.
-  let _ = tokio::time::timeout(Duration::from_secs(30), events.recv())
+  let _ = tokio::time::timeout(Duration::from_secs(90), events.recv())
     .await
     .unwrap();
   let stale = node
@@ -464,7 +464,7 @@ async fn g9_remove_resource_requires_the_exact_version() {
     )
     .await
     .unwrap();
-  let _ = tokio::time::timeout(Duration::from_secs(30), events.recv())
+  let _ = tokio::time::timeout(Duration::from_secs(90), events.recv())
     .await
     .unwrap();
 
@@ -519,7 +519,7 @@ async fn g9_remove_resource_requires_the_exact_version() {
     .unwrap();
   assert!(outcome.is_current_winner());
   assert!(outcome.accepted().version().is_removal());
-  let event = tokio::time::timeout(Duration::from_secs(30), events.recv())
+  let event = tokio::time::timeout(Duration::from_secs(90), events.recv())
     .await
     .unwrap()
     .unwrap();

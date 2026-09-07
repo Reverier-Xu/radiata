@@ -41,6 +41,16 @@ fi
 # The dry-run verifies host, engine, images, bridge routes and MTU,
 # qdisc neutrality, the 60-second pressure window, the frozen 64-direction
 # topology table, and rejects every mismatch before any measurement.
+# Any harness build that ran just before this lane leaves page-out
+# aftermath behind, so wait for the swap counters to settle first.
+quiet_deadline=$((SECONDS + 120))
+prev_swap=""
+while [ "$SECONDS" -lt "$quiet_deadline" ]; do
+  cur_swap=$(awk '/^pswpin/ { i = $2 } /^pswpout/ { o = $2 } END { print i + 0, o + 0 }' /proc/vmstat)
+  [ "$cur_swap" = "$prev_swap" ] && break
+  prev_swap="$cur_swap"
+  sleep 5
+done
 bash slo/preflight.sh
 OBS=${RADIATA_SLO_OBSERVATIONS:-target/slo-preflight-observations.json}
 jq -e '
@@ -105,9 +115,10 @@ COMMIT=$(git rev-parse HEAD)
   exit 1
 }
 
-# The measure mode is refused without the external T-G10-12 token.
-if slo/target/debug/slo-controller measure >/dev/null 2>&1; then
-  printf 'measure mode must be refused without the release token\n' >&2
+# The measure mode pins the exact candidate commit: without the pinned
+# RADIATA_SLO_COMMIT it refuses to run.
+if RADIATA_SLO_COMMIT= slo/target/debug/slo-controller measure >/dev/null 2>&1; then
+  printf 'measure mode must refuse an unpinned candidate commit\n' >&2
   exit 1
 fi
 

@@ -93,6 +93,9 @@ async fn run() -> Result<(), String> {
   let config = NodeConfig::new()
     .with_anti_entropy_interval(Duration::from_millis(250))
     .map_err(|error| error.to_string())?;
+  let config = config.with_route_policy(
+    radiata::QualifiedTag::parse(workload::NEXT_HOP_POLICY).map_err(|error| error.to_string())?,
+  );
   // The workload protocol rides the core session feature with an echo
   // consumer owned by the helper; every node registers the same surface
   // so packets deliver at any member.
@@ -112,6 +115,15 @@ async fn run() -> Result<(), String> {
   extensions
     .register_load_balancer(balancer_tag, std::sync::Arc::new(workload::FirstMatch))
     .map_err(|error| error.to_string())?;
+  let route_table: RouteTable = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+  extensions
+    .register_next_hop(
+      radiata::QualifiedTag::parse(workload::NEXT_HOP_POLICY).map_err(|error| error.to_string())?,
+      std::sync::Arc::new(SloNextHopPolicy {
+        table: std::sync::Arc::clone(&route_table),
+      }),
+    )
+    .map_err(|error| error.to_string())?;
   let handle = NodeBuilder::new(factory, keys)
     .config(config)
     .extensions(extensions)
@@ -123,15 +135,74 @@ async fn run() -> Result<(), String> {
   let mut stdout = std::io::stdout().lock();
 
   match role.as_str() {
-    "creator" => creator(handle, endpoint, &mut stdin, &mut stdout).await,
-    "member" => member(handle, endpoint, &mut stdin, &mut stdout).await,
+    "creator" => {
+      creator(handle, endpoint, &mut stdin, &mut stdout, route_table)
+        .await
+    }
+    "member" => {
+      member(handle, endpoint, &mut stdin, &mut stdout, route_table)
+        .await
+    }
     other => Err(format!("unknown role {other}")),
   }
 }
 
+/// The harness-distributed routing table: destination node id text to
+/// next-hop node id text over the frozen sparse topology.
+type RouteTable = std::sync::Arc<
+  std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+>;
+
+/// The topology-aware next-hop policy: one frozen first-hop row per node,
+/// distributed by the controller over the helpers' stdin protocol.
+/// Unknown destinations fail closed with the provider-visible
+/// unsupported error.
+#[derive(Debug)]
+struct SloNextHopPolicy {
+  table: RouteTable,
+}
+
+impl radiata::RouteNextHop for SloNextHopPolicy {
+  fn next_hop<'a>(
+    &'a self, view: radiata::NextHopView<'a>,
+  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>> {
+    Box::pin(async move {
+      let next = self
+        .table
+        .lock()
+        .unwrap()
+        .get(view.destination().as_str())
+        .cloned()
+        .ok_or_else(|| {
+          radiata::Error::provider(
+            radiata::ProviderErrorKind::Unsupported,
+            radiata::ProviderErrorContext::RoutingPolicy,
+          )
+        })?;
+      radiata::NodeId::parse(&next)
+    })
+  }
+}
+
+/// Handles one `route <destination> <next-hop>` table row.
+fn handle_route(table: &RouteTable, parts: impl Iterator<Item = String>) -> &'static str {
+  let mut fields = parts;
+  let (Some(destination), Some(next_hop)) = (fields.next(), fields.next()) else {
+    return "error route row needs destination and next hop";
+  };
+  if radiata::NodeId::parse(&destination).is_err() || radiata::NodeId::parse(&next_hop).is_err() {
+    return "error route row ids are invalid";
+  }
+  table
+    .lock()
+    .unwrap()
+    .insert(destination, next_hop);
+  "route ok"
+}
+
 async fn creator(
   handle: radiata::NodeHandle, endpoint: Endpoint, stdin: &mut std::io::StdinLock<'static>,
-  stdout: &mut std::io::StdoutLock<'static>,
+  stdout: &mut std::io::StdoutLock<'static>, table: RouteTable,
 ) -> Result<(), String> {
   // Born-with-cluster (ADR-0009): no genesis step. The initial credential
   // rotates BEFORE the listener starts, so the accept loop's first computed
@@ -223,6 +294,31 @@ async fn creator(
               .count();
             println!("zones {count}");
           }
+          "disconnect" => {
+            // Drop one member session: the harness prunes the star merge
+            // sessions down to the sparse final topology (ADR-0005).
+            // Intentionally disconnected peers are never re-dialled by
+            // recovery until a deliberate reconnect.
+            let Some(id_text) = parts.next() else {
+              println!("error missing node id");
+              continue;
+            };
+            let target = match radiata::NodeId::parse(id_text) {
+              Ok(node_id) => radiata::DisconnectPeer::new(node_id),
+              Err(_) => {
+                println!("error invalid node id");
+                continue;
+              }
+            };
+            match handle.command(target).await {
+              Ok(_) => println!("disconnect ok"),
+              Err(error) => println!("disconnect error {error}"),
+            }
+          }
+          "route" => {
+            let fields = parts.map(str::to_owned);
+            println!("{}", handle_route(&table, fields));
+          }
           "workload" => {
             let reply = run_workload_command(&handle, parts).await;
             println!("{reply}");
@@ -243,7 +339,7 @@ async fn creator(
 
 async fn member(
   handle: radiata::NodeHandle, endpoint: Endpoint, stdin: &mut std::io::StdinLock<'static>,
-  stdout: &mut std::io::StdoutLock<'static>,
+  stdout: &mut std::io::StdoutLock<'static>, table: RouteTable,
 ) -> Result<(), String> {
   // The first line carries the single-use credential; the member listens
   // before it joins so the accept loop holds its precomputed join hint.
@@ -320,6 +416,34 @@ async fn member(
             let value = parts.next().unwrap_or("edge").to_owned();
             let reply = set_own_zone(&handle, &node_id, &value).await;
             println!("{reply}");
+          }
+          "connect" => {
+            // Dial a fellow cluster member: credential-free after the
+            // pairwise merge, used by the harness to build the sparse
+            // final topology (ADR-0005).
+            let Some(endpoint_text) = parts.next() else {
+              println!("error missing endpoint");
+              continue;
+            };
+            let Some(id_text) = parts.next() else {
+              println!("error missing node id");
+              continue;
+            };
+            let target = match (radiata::Endpoint::parse(endpoint_text), radiata::NodeId::parse(id_text)) {
+              (Ok(endpoint), Ok(node_id)) => radiata::ConnectMember::new(endpoint, node_id),
+              _ => {
+                println!("error invalid connect target");
+                continue;
+              }
+            };
+            match handle.command(target).await {
+              Ok(_) => println!("connect ok"),
+              Err(error) => println!("connect error {error}"),
+            }
+          }
+          "route" => {
+            let fields = parts.map(str::to_owned);
+            println!("{}", handle_route(&table, fields));
           }
           _ => println!("error unknown command"),
         }
