@@ -126,8 +126,8 @@ pub(crate) fn resource_sync_protocol_definition() -> Result<ProtocolDefinition> 
 /// The resource-sync driver's per-node continuation state.
 #[derive(Default)]
 pub(crate) struct ResourceSyncCursor {
-  /// Fingerprint of the last page sent, so an unchanged catalog costs no
-  /// encode or per-peer delivery at all.
+  /// Raw-bytes fingerprint of the next page range, so an unchanged
+  /// catalog costs no decode, encode, or per-peer delivery at all.
   pub(crate) page_fingerprint: u64,
   /// Fingerprint of the alive-peer set: a newly connected peer must
   /// receive the current page immediately, changed set or not.
@@ -166,18 +166,17 @@ pub(crate) async fn resource_sync_tick(
   // quiet state costs no sends at all (T-G10-06 soak finding: an
   // unconditional cursor turn re-sent every page every tick).
   let starting_round = cursor.page.is_none();
-  let page = page_sync::emit_page_ctx(
+  // The raw-bytes fingerprint of the next page range: the quiet state
+  // pays one scan and one hash and skips the emit entirely, so nothing
+  // decodes a record (no re-encode, no digest) until the page actually
+  // sends (review finding F1: the emit's decode ran every tick even
+  // when the fingerprint gate suppressed every send).
+  let page_fp = page_sync::page_fingerprint_ctx(
     store,
     cursor.page.as_deref(),
     super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
   )
   .await?;
-  let page_fp = page.fingerprint();
-  tracing::debug!(
-    count = page.records().len(),
-    fp = page_fp,
-    "resource sync page emitted"
-  );
   // A round starts when the first page's content or the alive-peer set
   // changed, and is retried on a slow cadence otherwise; mid-round pages
   // always send as the continuation of an already-started round.
@@ -190,15 +189,22 @@ pub(crate) async fn resource_sync_tick(
   } else {
     true
   };
-  if due || !starting_round {
-    cursor.page = page.cursor().map(|value| value.to_vec());
-  }
   cursor.peers_fingerprint = peers_fp;
   if !due && starting_round {
     cursor.ticks_since_page_send = cursor.ticks_since_page_send.saturating_add(1);
     return Ok(());
   }
   cursor.ticks_since_page_send = 0;
+  let page = page_sync::emit_page_ctx(
+    store,
+    cursor.page.as_deref(),
+    super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
+  )
+  .await?;
+  tracing::debug!(count = page.records().len(), "resource sync page emitted");
+  if due || !starting_round {
+    cursor.page = page.cursor().map(|value| value.to_vec());
+  }
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
   for peer in &peers {
     let _ =
