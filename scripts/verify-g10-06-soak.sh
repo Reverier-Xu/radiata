@@ -33,6 +33,8 @@ LINES=$(wc -l < "$RADIATA_SOAK_LEDGER")
 jq -e '
   .schema == "radiata.woooo.tech/schemas/soak-attempt-v1"
   and (.commit | length) > 0
+  and (.predecessor | length) == 0
+  and .retry == "complete"
   and (.duration_secs | . >= 90)
   and (.packets_sent | . >= 100)
   and (.baseline_return.sessions == 3)
@@ -43,6 +45,28 @@ jq -e '
 ' < "$RADIATA_SOAK_LEDGER" > /dev/null || { printf 'soak ledger failed validation\n' >&2; exit 1; }
 [[ $(jq -r '.commit' < "$RADIATA_SOAK_LEDGER") == "$COMMIT" ]] || {
   printf 'soak ledger commit does not match the tested commit\n' >&2
+  exit 1
+}
+
+# The lineage chain: a second attempt in the same ledger names the digest
+# of the first line exactly as the sealed validator computes it.
+RADIATA_SOAK_DURATION_SECS=20 \
+RADIATA_SOAK_LEDGER="$RADIATA_SOAK_LEDGER" \
+RADIATA_SOAK_NO_CHURN=1 \
+RADIATA_SOAK_COMMIT="$COMMIT" \
+  cargo test --locked --all-features --test soak -- --ignored --exact soak_churn_then_baseline_return
+[[ $(wc -l < "$RADIATA_SOAK_LEDGER") -eq 2 ]] || {
+  printf 'soak lineage did not chain a second attempt\n' >&2
+  exit 1
+}
+PREDECESSOR=$(sed -n '1p' "$RADIATA_SOAK_LEDGER" | tr -d '\n' | sha256sum | awk '{ print $1 }')
+sed -n '2p' "$RADIATA_SOAK_LEDGER" > "$TMP/second-line.json"
+[[ $(jq -r '.predecessor' "$TMP/second-line.json") == "$PREDECESSOR" ]] || {
+  printf 'soak lineage predecessor digest mismatch\n' >&2
+  exit 1
+}
+[[ $(jq -r '.retry' "$TMP/second-line.json") == "complete" ]] || {
+  printf 'soak lineage retry classification missing\n' >&2
   exit 1
 }
 

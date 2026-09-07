@@ -321,6 +321,19 @@ pub fn validate_lineage(attestations: &[Attestation]) -> Result<(), ValidationEr
   Ok(())
 }
 
+/// The canonical digest of one raw ledger line (the soak attempt chain
+/// link). Trailing line breaks are not part of the digest, so producers
+/// chain append-mode NDJSON records without retaining newline bytes.
+///
+/// # Panics
+/// Never: the SHA-256 digest of a fixed input cannot fail.
+#[must_use]
+pub fn line_digest(line: &str) -> String {
+  let mut hasher = Sha256::new();
+  hasher.update(line.trim_end().as_bytes());
+  hex(&hasher.finalize())
+}
+
 /// The canonical digest of one attempt record (the lineage chain link).
 ///
 /// # Panics
@@ -543,6 +556,16 @@ mod tests {
 
   fn passing_attestation() -> Attestation {
     parse_attestation(&attestation_line(&[])).unwrap()
+  }
+
+  // The soak lineage chain links raw attempt lines by exact-content
+  // digest; trailing line breaks never enter the digest.
+  #[test]
+  fn line_digest_links_raw_ledger_lines_without_line_breaks() {
+    let line = "{\"schema\":\"x\",\"result\":\"pass\"}";
+    assert_eq!(line_digest(line), line_digest(&format!("{line}\n")));
+    assert_ne!(line_digest(line), line_digest("{\"schema\":\"x\"}"));
+    assert_eq!(line_digest("").len(), 64);
   }
 
   // SC-G10-P0-27: the complete current-semantic record passes preflight.
