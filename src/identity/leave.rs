@@ -712,22 +712,31 @@ async fn begin_intent(
     replacement_operation: KeyOperationId::generate(entropy)?,
   };
   let value = StoreValue::new(Arc::from(intent.encode()?));
-  let snapshot = store.snapshot().await?;
-  let prepared = store.prepare_transaction(
-    TransactionId::generate(entropy)?,
-    snapshot.revision().clone(),
-    vec![StoreOperation::Put {
-      namespace: leave_namespace()?,
-      key: leave_key(),
-      expected: StoreExpectation::Absent,
-      value: value.clone(),
-    }],
-  )?;
-  drop(snapshot);
-  match commit_with_reconcile(store, prepared).await? {
-    CommitWithReconcile::Committed => Ok((value, intent)),
-    CommitWithReconcile::Aborted => Err(Error::conflict("leave intent")),
+  // The intent's absent expectation races concurrent background commits
+  // (anti-entropy, neighbouring families). Losing that race is transient:
+  // the bounded retries re-snapshot and re-prepare the same intent instead
+  // of surfacing the conflict to the caller (the wipe batches use the
+  // same bounded-retry precedent).
+  const INTENT_RACE_BUDGET: usize = 8;
+  for _ in 0..INTENT_RACE_BUDGET {
+    let snapshot = store.snapshot().await?;
+    let prepared = store.prepare_transaction(
+      TransactionId::generate(entropy)?,
+      snapshot.revision().clone(),
+      vec![StoreOperation::Put {
+        namespace: leave_namespace()?,
+        key: leave_key(),
+        expected: StoreExpectation::Absent,
+        value: value.clone(),
+      }],
+    )?;
+    drop(snapshot);
+    match commit_with_reconcile(store, prepared).await? {
+      CommitWithReconcile::Committed => return Ok((value, intent)),
+      CommitWithReconcile::Aborted => continue,
+    }
   }
+  Err(Error::conflict("leave intent"))
 }
 
 /// Resumes a pending leave at startup (T-G09-06 restart path): the leave
