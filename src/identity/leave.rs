@@ -703,6 +703,14 @@ async fn begin_intent(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
 ) -> Result<(StoreValue, LeaveIntentV1)> {
   let store = context.store();
+  // The intent install joins the store's writer exclusion like every
+  // other identity phase: read-decide-commit on the Absent expectation is
+  // then atomic against internal writers (anti-entropy, neighbouring
+  // families), and only an external writer can still win the race. The
+  // bounded retries remain as the fail-closed second line for that
+  // residual window (the lock is task-reentrant, so run_leave's own
+  // permit below nests).
+  let _permit = store.write_permit().await;
   let former = context.identity().clone();
   let intent = LeaveIntentV1 {
     former_node: former.node().clone(),
@@ -712,11 +720,10 @@ async fn begin_intent(
     replacement_operation: KeyOperationId::generate(entropy)?,
   };
   let value = StoreValue::new(Arc::from(intent.encode()?));
-  // The intent's absent expectation races concurrent background commits
-  // (anti-entropy, neighbouring families). Losing that race is transient:
-  // the bounded retries re-snapshot and re-prepare the same intent instead
-  // of surfacing the conflict to the caller (the wipe batches use the
-  // same bounded-retry precedent).
+  // Losing the Absent expectation to an external writer is transient:
+  // the bounded retries re-snapshot and re-prepare the same intent
+  // instead of surfacing the conflict to the caller (the wipe batches
+  // use the same bounded-retry precedent).
   const INTENT_RACE_BUDGET: usize = 8;
   for _ in 0..INTENT_RACE_BUDGET {
     let snapshot = store.snapshot().await?;
