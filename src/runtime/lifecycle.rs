@@ -5,7 +5,7 @@ use crate::{
   NodeStatus, Result, RouteStatusView, ShutdownOutcome, ShutdownReason,
   identity::{ListenerId, credential::MergeCredential},
   packet::{OutboundRequest, RouteHandle},
-  session::stream::RouteTable,
+  routing::RouteTable,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

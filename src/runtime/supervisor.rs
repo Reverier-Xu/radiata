@@ -19,13 +19,11 @@ use crate::{
   packet::{OutboundRequest, RouteRecord, RouteState},
   protocol::offer::node_offer,
   provider::{KeyProvider, StorageFactory},
+  routing::{RouteTable, insert_route},
   runtime::{Control, LifecycleSnapshot, RuntimeClient},
   session::{
     SessionDriver,
-    stream::{
-      RouteTable, SessionEntry, SessionPacketContext, SessionTable, insert_route, run_outbound,
-      run_session,
-    },
+    stream::{SessionEntry, SessionPacketContext, SessionTable, run_outbound, run_session},
   },
   transport::{
     registry::{Transport, TransportListener},
@@ -588,7 +586,7 @@ fn session_packet_context(
     dependencies.config.route_policy().cloned(),
     dependencies.sessions.clone(),
     dependencies.routes.clone(),
-    crate::session::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
+    crate::routing::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
     dependencies.config.trace_metadata_limits().active(),
     Arc::clone(&dependencies.connection_tasks),
     dependencies.config.parser_cbor_limits(),

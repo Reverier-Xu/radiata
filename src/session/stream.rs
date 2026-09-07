@@ -29,17 +29,21 @@ use tokio::{
 };
 use tracing::{debug, instrument, trace, warn};
 
-use super::{driver::EstablishedSession, forward};
+use super::driver::EstablishedSession;
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, QualifiedTag, Result, StreamMetadata, TraceId,
   api::BoxFuture,
   extension_registry::ExtensionRegistry,
   packet::{
-    AckOutcome, IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext, RouteRecord,
-    RouteState, StreamItem, StreamTarget, channel_body,
+    AckOutcome, IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext, RouteState,
+    StreamItem, StreamTarget, channel_body,
     wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, OpenFrame},
   },
   protocol::wire::PacketKind,
+  routing::{
+    forward,
+    table::{RouteTable, record_rejection, update_route},
+  },
   transport::connection::{Connection, ConnectionReader, ConnectionWriter},
 };
 
@@ -71,16 +75,6 @@ pub(crate) enum PendingAck {
 }
 
 pub(crate) type PendingAcks = Arc<Mutex<HashMap<TraceId, PendingAck>>>;
-
-/// The shared node-local route table: bounded in-memory trace metadata
-/// (ADR-0007: identity, selected node, progress, terminal state — never
-/// payload bytes, no durability claim).
-// TODO(M6): these route records and the forwarding paths below are
-// routing-domain code (roadmap: "Packet targets, load balancing, routes,
-// stream forwarding, trace status"). They move to a dedicated `routing`
-// module when M6 lands; keep session framing and route state separate
-// until then.
-pub(crate) type RouteTable = Arc<Mutex<BTreeMap<TraceId, RouteRecord>>>;
 
 /// The packet-handling context shared by every session of one node.
 /// The caller-selected session bounds (G4-04): outbound queue count and
@@ -145,7 +139,7 @@ pub(crate) struct SessionPacketContext {
   /// The typed event hub: session and route transitions emit through it
   /// (G9-07).
   events: Arc<crate::node::EventHub>,
-  forwarding: super::forward::ForwardingTable,
+  forwarding: crate::routing::forward::ForwardingTable,
   route_policy: Option<QualifiedTag>,
   sessions: SessionTable,
   routes: RouteTable,
@@ -180,7 +174,7 @@ impl SessionPacketContext {
       clock,
       entropy,
       events,
-      forwarding: super::forward::new_table(),
+      forwarding: crate::routing::forward::new_table(),
       route_policy,
       sessions,
       routes: routes_clone,
@@ -229,12 +223,12 @@ pub(crate) struct AdmittedStream {
 
 /// One framed outbound session message.
 pub(crate) struct SessionFrame {
-  pub(super) kind: PacketKind,
-  pub(super) body: Vec<u8>,
+  pub(crate) kind: PacketKind,
+  pub(crate) body: Vec<u8>,
 }
 
 impl SessionFrame {
-  pub(super) const fn new(kind: PacketKind, body: Vec<u8>) -> Self {
+  pub(crate) const fn new(kind: PacketKind, body: Vec<u8>) -> Self {
     Self { kind, body }
   }
 }
@@ -474,8 +468,8 @@ pub(crate) struct SessionMeta {
 /// One established session's send-side handle in the session table.
 #[derive(Clone)]
 pub(crate) struct SessionEntry {
-  pub(super) frames: BoundedSender,
-  pub(super) pending_acks: PendingAcks,
+  pub(crate) frames: BoundedSender,
+  pub(crate) pending_acks: PendingAcks,
   /// Per-session concurrent admission bound from the session policy,
   /// carried here so the outbound pump (which runs without the session
   /// context) can enforce typed backpressure.
@@ -1557,44 +1551,6 @@ pub(crate) fn test_queue(max_count: usize, max_bytes: usize) -> (BoundedSender, 
   )
 }
 
-/// Inserts one route record under the configured capacity, evicting the
-/// oldest terminal record when full. Active records are never evicted.
-pub(crate) fn insert_route(
-  routes: &RouteTable, capacity: usize, record: RouteRecord,
-) -> Result<()> {
-  let mut table = routes
-    .lock()
-    .map_err(|_| Error::internal("route records"))?;
-  if !table.contains_key(&record.trace_id) && table.len() >= capacity {
-    let oldest = table
-      .iter()
-      .filter(|(_, entry)| matches!(entry.state, RouteState::Delivered | RouteState::Failed(_)))
-      .min_by_key(|(_, entry)| entry.updated_at)
-      .map(|(trace_id, _)| trace_id.clone());
-    match oldest {
-      Some(trace_id) => {
-        table.remove(&trace_id);
-      }
-      None => return Err(Error::resource_exhausted("route records")),
-    }
-  }
-  table.insert(record.trace_id.clone(), record);
-  Ok(())
-}
-
-/// Applies one update to a route record, when present.
-fn update_route(routes: &RouteTable, trace_id: &TraceId, update: impl FnOnce(&mut RouteRecord)) {
-  // A failed route is final: an interruption discovered after the local
-  // enqueue completed still terminates the observation as failed, while no
-  // later success can overwrite a recorded failure.
-  if let Ok(mut table) = routes.lock()
-    && let Some(record) = table.get_mut(trace_id)
-    && !matches!(record.state, RouteState::Failed(_))
-  {
-    update(record);
-  }
-}
-
 /// Removes a pending admission that never reached the wire.
 fn withdraw_pending(entry: &SessionEntry, trace_id: &TraceId) {
   if let Ok(mut pending) = entry.pending_acks.lock() {
@@ -1621,23 +1577,6 @@ pub(crate) fn opening_context_digest(
     bytes.push(2);
   }
   crate::identity::signature::body_digest(&bytes)
-}
-
-/// Records one bounded terminal route fact for an admission rejection:
-/// identity and typed failure only, never payload bytes, always within
-/// the node's configured route-record capacity.
-fn record_rejection(routes: &RouteTable, capacity: usize, trace_id: &TraceId, kind: ErrorKind) {
-  // A trace already carrying a terminal fact never grows the table.
-  if routes
-    .lock()
-    .map(|table| table.contains_key(trace_id))
-    .unwrap_or(true)
-  {
-    return;
-  }
-  let mut record = RouteRecord::failing(trace_id.clone());
-  record.update(RouteState::Failed(kind));
-  let _ = insert_route(routes, capacity, record);
 }
 
 #[cfg(test)]
