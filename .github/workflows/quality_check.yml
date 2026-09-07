@@ -198,7 +198,7 @@ jobs:
   macos:
     name: macos
     runs-on: macos-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -237,13 +237,6 @@ jobs:
           cargo +1.98.0 check --locked --no-default-features
           cargo +1.98.0 check --locked --no-default-features --features redb
 
-      - name: native feature tests
-        id: native_tests
-        shell: bash
-        run: |
-          cargo +1.98.0 test --locked --no-default-features
-          cargo +1.98.0 test --locked --no-default-features --features redb
-
       - name: install cargo-hack
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
         with:
@@ -265,7 +258,6 @@ jobs:
           CLIPPY: ${{ steps.clippy.outcome }}
           TEST: ${{ steps.test.outcome }}
           NATIVE_CHECKS: ${{ steps.native_checks.outcome }}
-          NATIVE_TESTS: ${{ steps.native_tests.outcome }}
           POWERSET: ${{ steps.powerset.outcome }}
           SIMULATOR: ${{ steps.simulator.outcome }}
           JOB_STATUS: ${{ job.status }}
@@ -282,7 +274,7 @@ jobs:
           [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
           result=pass
           for outcome in "$CHECK" "$CLIPPY" "$TEST" "$NATIVE_CHECKS" \
-            "$NATIVE_TESTS" "$POWERSET" "$SIMULATOR"; do
+            "$POWERSET" "$SIMULATOR"; do
             [ "$outcome" = "success" ] || result=fail
           done
           if [ "$uninterrupted" != "true" ]; then result=fail; fi
@@ -302,7 +294,7 @@ jobs:
   windows:
     name: windows
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -341,13 +333,6 @@ jobs:
           cargo +1.98.0 check --locked --no-default-features
           cargo +1.98.0 check --locked --no-default-features --features redb
 
-      - name: native feature tests
-        id: native_tests
-        shell: bash
-        run: |
-          cargo +1.98.0 test --locked --no-default-features
-          cargo +1.98.0 test --locked --no-default-features --features redb
-
       - name: install cargo-hack
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
         with:
@@ -369,7 +354,6 @@ jobs:
           CLIPPY: ${{ steps.clippy.outcome }}
           TEST: ${{ steps.test.outcome }}
           NATIVE_CHECKS: ${{ steps.native_checks.outcome }}
-          NATIVE_TESTS: ${{ steps.native_tests.outcome }}
           POWERSET: ${{ steps.powerset.outcome }}
           SIMULATOR: ${{ steps.simulator.outcome }}
           JOB_STATUS: ${{ job.status }}
@@ -386,7 +370,7 @@ jobs:
           [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
           result=pass
           for outcome in "$CHECK" "$CLIPPY" "$TEST" "$NATIVE_CHECKS" \
-            "$NATIVE_TESTS" "$POWERSET" "$SIMULATOR"; do
+            "$POWERSET" "$SIMULATOR"; do
             [ "$outcome" = "success" ] || result=fail
           done
           if [ "$uninterrupted" != "true" ]; then result=fail; fi
@@ -401,6 +385,82 @@ jobs:
         with:
           name: quality-attestation-windows
           path: target/attestation-quality-windows.json
+          retention-days: 30
+
+  native-features-test:
+    name: native features / test (${{ matrix.os }}, ${{ matrix.config }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            config: no-default
+            flags: --no-default-features
+          - os: macos-latest
+            config: redb-only
+            flags: --no-default-features --features redb
+          - os: windows-latest
+            config: no-default
+            flags: --no-default-features
+          - os: windows-latest
+            config: redb-only
+            flags: --no-default-features --features redb
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install MSRV toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.98.0
+
+      - name: record start
+        id: start
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: cargo test
+        id: test
+        shell: bash
+        run: cargo +1.98.0 test --locked ${{ matrix.flags }}
+
+      - name: quality attestation
+        if: always()
+        shell: bash
+        env:
+          TEST: ${{ steps.test.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          STARTED: ${{ steps.start.outputs.started }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          commit=$(git rev-parse HEAD)
+          lock=$(sha256sum Cargo.lock | awk '{ print $1 }')
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
+          uninterrupted=true
+          [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
+          result=fail
+          if [ "$TEST" = "success" ] && [ "$uninterrupted" = "true" ]; then result=pass; fi
+          printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"native-features-%s-%s","target":"quality-native-features","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
+            "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "${{ matrix.os }}" "${{ matrix.config }}" "$duration" "$uninterrupted" "$result" \
+            > "target/attestation-native-${{ matrix.os }}-${{ matrix.config }}.json"
+          cat "target/attestation-native-${{ matrix.os }}-${{ matrix.config }}.json"
+
+      - name: upload attestation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-attestation-native-${{ matrix.os }}-${{ matrix.config }}
+          path: target/attestation-native-${{ matrix.os }}-${{ matrix.config }}.json
           retention-days: 30
 
   features-check:
