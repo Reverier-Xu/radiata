@@ -1,0 +1,7 @@
+# Every checked-out text file uses LF endings on every platform so that
+# content digests (Cargo.lock attestation), shell scripts, and fixtures
+# are byte-identical across Windows, macOS, and Linux runners.
+* text=auto eol=lf
+
+# Fuzz corpus entries are raw binary inputs.
+*.bin -text

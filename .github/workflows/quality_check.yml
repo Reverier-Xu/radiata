@@ -280,12 +280,12 @@ jobs:
           if [ "$duration" -lt 0 ]; then duration=0; fi
           uninterrupted=true
           [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
-          result=fail
+          result=pass
           for outcome in "$CHECK" "$CLIPPY" "$TEST" "$NATIVE_CHECKS" \
             "$NATIVE_TESTS" "$POWERSET" "$SIMULATOR"; do
             [ "$outcome" = "success" ] || result=fail
           done
-          if [ "$result" = "pass" ] && [ "$uninterrupted" != "true" ]; then result=fail; fi
+          if [ "$uninterrupted" != "true" ]; then result=fail; fi
           printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"macos","target":"quality-macos","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
             "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
             "$duration" "$uninterrupted" "$result" > target/attestation-quality-macos.json
@@ -384,12 +384,12 @@ jobs:
           if [ "$duration" -lt 0 ]; then duration=0; fi
           uninterrupted=true
           [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
-          result=fail
+          result=pass
           for outcome in "$CHECK" "$CLIPPY" "$TEST" "$NATIVE_CHECKS" \
             "$NATIVE_TESTS" "$POWERSET" "$SIMULATOR"; do
             [ "$outcome" = "success" ] || result=fail
           done
-          if [ "$result" = "pass" ] && [ "$uninterrupted" != "true" ]; then result=fail; fi
+          if [ "$uninterrupted" != "true" ]; then result=fail; fi
           printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"windows","target":"quality-windows","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
             "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
             "$duration" "$uninterrupted" "$result" > target/attestation-quality-windows.json
