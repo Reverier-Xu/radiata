@@ -499,7 +499,6 @@ impl Command for PurgeRevocation {
 pub struct IssueCleanupCheckpoint {
   _private: (),
 }
-
 #[allow(clippy::new_without_default)]
 impl IssueCleanupCheckpoint {
   pub fn new() -> Self {
@@ -511,6 +510,28 @@ impl private::Sealed for IssueCleanupCheckpoint {}
 
 impl Command for IssueCleanupCheckpoint {
   type Output = u64;
+}
+
+/// Runs one full anti-entropy round now: pages the local membership and
+/// resource registers and pushes them over every authenticated session,
+/// exactly like a wall-clock tick, and completes when the round finishes.
+/// Convergence checks become deterministic: drive a round, await it, then
+/// read the pages — no tick-cadence sleeps.
+pub struct RunSyncRound {
+  _private: (),
+}
+
+#[allow(clippy::new_without_default)]
+impl RunSyncRound {
+  pub fn new() -> Self {
+    Self { _private: () }
+  }
+}
+
+impl private::Sealed for RunSyncRound {}
+
+impl Command for RunSyncRound {
+  type Output = ();
 }
 
 /// Creates signed removal evidence for one resource (T-G09-05): the

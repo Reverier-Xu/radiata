@@ -16,7 +16,7 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{
-  Error, IncomingStream, ProtocolTag, Result,
+  Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::{BoxFuture, Entropy},
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::{
@@ -128,17 +128,19 @@ pub(crate) struct MembershipSyncConsumer {
   context: std::sync::Weak<LocalIdentityContext>,
   entropy: Arc<dyn Entropy>,
   events: Arc<crate::node::EventHub>,
+  revision: crate::node::MemberRevisionSignal,
 }
 
 impl MembershipSyncConsumer {
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
-    events: Arc<crate::node::EventHub>,
+    events: Arc<crate::node::EventHub>, revision: crate::node::MemberRevisionSignal,
   ) -> Self {
     Self {
       context: Arc::downgrade(&context),
       entropy,
       events,
+      revision,
     }
   }
 }
@@ -152,14 +154,33 @@ impl PacketConsumer for MembershipSyncConsumer {
         .context
         .upgrade()
         .ok_or_else(|| Error::shutting_down("membership sync"))?;
-      accept_payload(&context, self.entropy.clone(), &self.events, &payload).await
+      accept_payload(
+        &context,
+        self.entropy.clone(),
+        &self.events,
+        &self.revision,
+        &payload,
+      )
+      .await
     })
   }
 }
 
+/// Emits the paired member-set change notification: the transient event
+/// for live subscribers plus the persistent revision bump for watch-based
+/// observers. The bump trails the persist, so a released watcher is
+/// guaranteed the change is durable and query-visible.
+fn member_changed(
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal, node: NodeId,
+) {
+  events.emit(crate::MemberChanged::new(node));
+  revision.bump();
+}
+
 async fn accept_payload(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
-  events: &Arc<crate::node::EventHub>, payload: &SyncPayload,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+  payload: &SyncPayload,
 ) -> Result<()> {
   let store = context.store();
   match payload {
@@ -168,7 +189,7 @@ async fn accept_payload(
       // Every newly installed descriptor is one member change (T-G09-07).
       let installed = page_sync::apply_page_ctx(store, entropy.as_ref(), &page).await?;
       for node in installed {
-        events.emit(crate::MemberChanged::new(node));
+        member_changed(events, revision, node);
       }
     }
     SyncPayload::Snapshot(encoded) => {
@@ -219,7 +240,7 @@ async fn accept_payload(
       // store writer, so terminal evidence cannot be dropped on contention.
       crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
       tracing::debug!(node = %record.node(), "leave record persisted on peer");
-      events.emit(crate::MemberChanged::new(record.node().clone()));
+      member_changed(events, revision, record.node().clone());
     }
     SyncPayload::Cleanup(encoded) => {
       // An issuer-signed cleanup tombstone is terminal evidence (ADR-0009
@@ -234,7 +255,7 @@ async fn accept_payload(
       }
       crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), &record)
         .await?;
-      events.emit(crate::MemberChanged::new(record.subject().clone()));
+      member_changed(events, revision, record.subject().clone());
     }
     SyncPayload::Revocation(encoded) => {
       // A revocation tombstone is convergent permanent evidence (ADR-0009

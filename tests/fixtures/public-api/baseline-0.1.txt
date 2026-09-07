@@ -446,6 +446,10 @@ pub struct radiata::MemberPage
 impl radiata::MemberPage
 pub fn radiata::MemberPage::items(&self) -> &[radiata::MemberView]
 pub fn radiata::MemberPage::next(&self) -> core::option::Option<&radiata::PageCursor>
+pub struct radiata::MemberRevision
+impl radiata::MemberRevision
+pub async fn radiata::MemberRevision::changed(&mut self) -> radiata::Result<u64>
+pub fn radiata::MemberRevision::current(&self) -> u64
 pub struct radiata::MemberView
 impl radiata::MemberView
 pub fn radiata::MemberView::connectivity(&self) -> radiata::ConnectivityStatus
@@ -499,8 +503,10 @@ pub struct radiata::NodeHandle
 impl radiata::NodeHandle
 pub async fn radiata::NodeHandle::command<C: radiata::Command + DispatchCommand>(&self, C) -> radiata::Result<<C as radiata::Command>::Output>
 pub fn radiata::NodeHandle::events<E: radiata::Event>(&self, radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
+pub fn radiata::NodeHandle::member_revision(&self) -> radiata::MemberRevision
 pub fn radiata::NodeHandle::open_stream(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
 pub async fn radiata::NodeHandle::query<Q: radiata::Query + DispatchQuery>(&self, Q) -> radiata::Result<<Q as radiata::Query>::Output>
+pub fn radiata::NodeHandle::run_sync_round(&self) -> impl core::future::future::Future<Output = radiata::Result<()>> + core::marker::Send
 pub struct radiata::NodeId(_)
 impl radiata::NodeId
 pub fn radiata::NodeId::as_str(&self) -> &str
@@ -752,6 +758,11 @@ pub fn radiata::RouteStatusView::selected_node(&self) -> core::option::Option<&r
 pub fn radiata::RouteStatusView::state(&self) -> &radiata::RouteState
 pub fn radiata::RouteStatusView::trace_id(&self) -> &radiata::TraceId
 pub fn radiata::RouteStatusView::updated_at(&self) -> std::time::SystemTime
+pub struct radiata::RunSyncRound
+impl radiata::RunSyncRound
+pub fn radiata::RunSyncRound::new() -> Self
+impl radiata::Command for radiata::RunSyncRound
+pub type radiata::RunSyncRound::Output = ()
 pub struct radiata::SelectResources
 impl radiata::SelectResources
 pub fn radiata::SelectResources::new(radiata::Selector, radiata::PageSpec) -> Self
@@ -986,6 +997,8 @@ impl radiata::Command for radiata::RevokeNode
 pub type radiata::RevokeNode::Output = radiata::RevokeOutcome
 impl radiata::Command for radiata::RotateMergeCredential
 pub type radiata::RotateMergeCredential::Output = radiata::IssuedMergeCredential
+impl radiata::Command for radiata::RunSyncRound
+pub type radiata::RunSyncRound::Output = ()
 impl radiata::Command for radiata::Shutdown
 pub type radiata::Shutdown::Output = radiata::ShutdownOutcome
 impl radiata::Command for radiata::StartRecovery

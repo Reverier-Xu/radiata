@@ -163,6 +163,9 @@ pub(crate) enum Control {
   IssueCleanupCheckpoint {
     reply: oneshot::Sender<Result<u64>>,
   },
+  RunSyncRound {
+    reply: oneshot::Sender<Result<()>>,
+  },
   RemoveResource {
     name: crate::ResourceName,
     expected: crate::ResourceVersion,
@@ -473,6 +476,12 @@ impl RuntimeClient {
   pub(crate) async fn issue_cleanup_checkpoint(&self) -> Result<u64> {
     self
       .send_command(|reply| Control::IssueCleanupCheckpoint { reply })
+      .await
+  }
+
+  pub(crate) async fn run_sync_round(&self) -> Result<()> {
+    self
+      .send_command(|reply| Control::RunSyncRound { reply })
       .await
   }
 

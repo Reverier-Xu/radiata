@@ -174,6 +174,16 @@ where
 async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
   let deadline = std::time::Instant::now() + timeout;
   loop {
+    // Drive one deterministic anti-entropy round per node so convergence
+    // is scheduled by the test, not by the wall-clock tick cadence; the
+    // bounded check below stays the convergence verdict.
+    for node in nodes {
+      node
+        .handle
+        .command(radiata::RunSyncRound::new())
+        .await
+        .unwrap();
+    }
     let mut complete = true;
     let mut views: Vec<Vec<radiata::TrustedIdentityView>> = Vec::new();
     for node in nodes {

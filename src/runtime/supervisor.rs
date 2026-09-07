@@ -39,6 +39,11 @@ const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs
 
 /// Capacity of the node's outbound packet command channel, shared with
 /// the builder so both channel ends are created at one construction site.
+/// The bounded request channel for RunSyncRound commands: rounds are
+/// self-limiting (one page per session per round), so a small queue with
+/// typed backpressure matches the work.
+pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
+
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
 
 struct LifecyclePublisher {
@@ -86,6 +91,13 @@ pub(crate) struct RuntimeDependencies {
   pub(crate) routes: RouteTable,
   /// The typed event hub shared with every node handle (G9-03).
   pub(crate) events: Arc<crate::node::EventHub>,
+  /// The node's member-set revision signal: bumped one-to-one with the
+  /// MemberChanged emissions so observers await changes instead of
+  /// polling pages.
+  pub(crate) member_revision: crate::node::MemberRevisionSignal,
+  /// Requests for one immediate anti-entropy round, forwarded to the
+  /// sync driver (the cursor owner) by the RunSyncRound command.
+  pub(crate) sync_round_requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
   /// Node-scoped task handles: connection tasks plus the graceful
   /// consumer-drain tasks. Shutdown awaits them and the recovery tick
   /// reaps finished ones (bounded task accounting, roadmap rule 4).
@@ -101,11 +113,13 @@ pub(crate) struct RuntimeDependencies {
 /// and the issuer trust snapshot over every authenticated session on the
 /// configured interval and stops on the shutdown signal (SC-G05-P0-22:
 /// streams metadata pages; bounded work per tick).
+#[allow(clippy::too_many_arguments)]
 fn spawn_sync_driver(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn crate::api::Entropy>,
   sessions: crate::session::stream::SessionTable, runtime: crate::runtime::RuntimeClient,
   published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>, interval: std::time::Duration,
   shutdown: tokio::sync::watch::Receiver<()>,
+  mut round_requests: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
 ) -> tokio::task::JoinHandle<()> {
   let driver_context = Arc::clone(context);
   let driver_entropy = entropy;
@@ -118,6 +132,38 @@ fn spawn_sync_driver(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sync_cursor = crate::membership::sync::SyncCursor::default();
     let mut resource_cursor = crate::resource::sync::ResourceSyncCursor::default();
+    async fn run_round(
+      context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn crate::api::Entropy>,
+      sessions: &crate::session::stream::SessionTable, runtime: &crate::runtime::RuntimeClient,
+      endpoints: &[Endpoint], sync_cursor: &mut crate::membership::sync::SyncCursor,
+      resource_cursor: &mut crate::resource::sync::ResourceSyncCursor,
+    ) {
+      if let Err(error) = crate::membership::sync::sync_tick(
+        context,
+        entropy,
+        sessions,
+        runtime,
+        endpoints,
+        sync_cursor,
+      )
+      .await
+      {
+        // Persistent anti-entropy failure must stay visible in
+        // diagnostics; the next tick retries regardless.
+        tracing::warn!(kind = ?error.kind(), "membership sync tick failed");
+      }
+      if let Err(error) = crate::resource::sync::resource_sync_tick(
+        context,
+        entropy,
+        sessions,
+        runtime,
+        resource_cursor,
+      )
+      .await
+      {
+        tracing::warn!(kind = ?error.kind(), "resource sync tick failed");
+      }
+    }
     loop {
       tokio::select! {
         changed = driver_shutdown.changed() => {
@@ -129,30 +175,38 @@ fn spawn_sync_driver(
             .lock()
             .map(|endpoints| endpoints.clone())
             .unwrap_or_default();
-          if let Err(error) = crate::membership::sync::sync_tick(
+          run_round(
             &driver_context,
             &driver_entropy,
             &driver_sessions,
             &driver_runtime,
             &endpoints,
             &mut sync_cursor,
+            &mut resource_cursor,
           )
-          .await
-          {
-            // Persistent anti-entropy failure must stay visible in
-            // diagnostics; the next tick retries regardless.
-            tracing::warn!(kind = ?error.kind(), "membership sync tick failed");
-          }
-          if let Err(error) = crate::resource::sync::resource_sync_tick(
+          .await;
+        }
+        // The RunSyncRound command's deterministic round: identical work
+        // to a wall-clock tick, but the caller awaits its completion, so
+        // convergence checks need no interval-cadence sleeps.
+        round = round_requests.recv() => {
+          let reply = round;
+          let endpoints: Vec<Endpoint> = driver_endpoints
+            .lock()
+            .map(|endpoints| endpoints.clone())
+            .unwrap_or_default();
+          run_round(
             &driver_context,
             &driver_entropy,
             &driver_sessions,
             &driver_runtime,
+            &endpoints,
+            &mut sync_cursor,
             &mut resource_cursor,
           )
-          .await
-          {
-            tracing::warn!(kind = ?error.kind(), "resource sync tick failed");
+          .await;
+          if let Some(reply) = reply {
+            let _ = reply.send(());
           }
         }
       }
@@ -166,6 +220,7 @@ pub(crate) async fn spawn_runtime(
     mpsc::Sender<crate::packet::OutboundRequest>,
     mpsc::Receiver<crate::packet::OutboundRequest>,
   ),
+  sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<RuntimeClient> {
   let runtime = Handle::try_current().map_err(|_| Error::not_ready("Tokio runtime"))?;
   // The runtime seed is drawn before anything else so the startup entropy
@@ -208,6 +263,7 @@ pub(crate) async fn spawn_runtime(
     Arc::clone(&runtime_context),
     dependencies.entropy.clone(),
     dependencies.events.clone(),
+    dependencies.member_revision.clone(),
   ));
   dependencies
     .extensions
@@ -234,6 +290,7 @@ pub(crate) async fn spawn_runtime(
     control_rx,
     packet_tx,
     packet_rx,
+    sync_rounds,
     state_tx,
     ready_tx,
   ));
@@ -248,6 +305,7 @@ async fn supervise(
   dependencies: RuntimeDependencies, mut control: mpsc::Receiver<Control>,
   packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
   mut packets: mpsc::Receiver<crate::packet::OutboundRequest>,
+  sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
   state: watch::Sender<LifecycleSnapshot>, ready: oneshot::Sender<()>,
 ) {
   let mut tasks = JoinSet::<()>::new();
@@ -267,7 +325,7 @@ async fn supervise(
     return;
   }
 
-  let mut supervisor = match Supervisor::new(dependencies, packet_tx) {
+  let mut supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds) {
     Ok(supervisor) => supervisor,
     Err(failure) => {
       let (error, dependencies) = *failure;
@@ -435,7 +493,10 @@ async fn supervise(
         let result = supervisor.issue_cleanup_checkpoint().await;
         let _ = reply.send(result);
       }
-      Control::RemoveResource {
+      Control::RunSyncRound { reply } => {
+        let result = supervisor.run_sync_round().await;
+        let _ = reply.send(result);
+      }      Control::RemoveResource {
         name,
         expected,
         reply,
@@ -598,6 +659,7 @@ impl Supervisor {
   /// so the caller can still run a clean shutdown instead of panicking.
   fn new(
     dependencies: RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
+    sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
   ) -> std::result::Result<Self, Box<(Error, RuntimeDependencies)>> {
     let Some(context) = dependencies.context.clone() else {
       return Err(Box::new((Error::internal("runtime context"), dependencies)));
@@ -646,6 +708,7 @@ impl Supervisor {
       Arc::clone(&published_endpoints),
       dependencies.config.anti_entropy_interval(),
       shutdown_tx.subscribe(),
+      sync_rounds,
     ));
     // The durable trace-metadata sink shares the runtime identity context
     // and injected entropy; persistence failures never touch the data plane.
@@ -1647,6 +1710,7 @@ impl Supervisor {
       .dependencies
       .events
       .emit(crate::MemberChanged::new(local.clone()));
+    self.dependencies.member_revision.bump();
     crate::membership::member_view(&updated, crate::ConnectivityStatus::Connected)
   }
 
@@ -1876,6 +1940,7 @@ impl Supervisor {
       .dependencies
       .events
       .emit(crate::MemberChanged::new(subject));
+    self.dependencies.member_revision.bump();
     Ok(())
   }
 
@@ -1900,6 +1965,24 @@ impl Supervisor {
     let context = self.context()?;
     crate::identity::cleanup::issue_checkpoint_ctx(&context, self.dependencies.entropy.as_ref())
       .await
+  }
+
+  /// Forwards the RunSyncRound request to the sync driver (the cursor
+  /// owner) and awaits the round's completion. A dropped reply means the
+  /// node is shutting down.
+  async fn run_sync_round(&self) -> Result<()> {
+    let (reply, reply_rx) = tokio::sync::oneshot::channel();
+    self
+      .dependencies
+      .sync_round_requests
+      .clone()
+      .send(reply)
+      .await
+      .map_err(|_| Error::shutting_down("sync round"))?;
+    reply_rx
+      .await
+      .map_err(|_| Error::shutting_down("sync round"))?;
+    Ok(())
   }
 
   async fn revoke_node(

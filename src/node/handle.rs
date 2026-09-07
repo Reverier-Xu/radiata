@@ -17,6 +17,7 @@ pub struct NodeHandle {
   entropy: Arc<dyn Entropy>,
   extensions: Arc<ExtensionRegistry>,
   events: Arc<crate::node::EventHub>,
+  member_revision: crate::node::MemberRevision,
 }
 
 /// Executes one typed command against the runtime. Each command implements
@@ -248,6 +249,13 @@ impl DispatchCommand for crate::IssueCleanupCheckpoint {
   }
 }
 
+impl DispatchCommand for crate::RunSyncRound {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+    let runtime = runtime.clone();
+    Box::pin(async move { runtime.run_sync_round().await })
+  }
+}
+
 impl DispatchCommand for crate::PurgeRevocation {
   fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
     let subject = self.into_subject();
@@ -283,13 +291,14 @@ impl DispatchQuery for GetRoute {
 impl NodeHandle {
   pub(crate) fn new(
     runtime: RuntimeClient, entropy: Arc<dyn Entropy>, extensions: Arc<ExtensionRegistry>,
-    events: Arc<crate::node::EventHub>,
+    events: Arc<crate::node::EventHub>, member_revision: crate::node::MemberRevision,
   ) -> Self {
     Self {
       runtime,
       entropy,
       extensions,
       events,
+      member_revision,
     }
   }
 
@@ -358,5 +367,24 @@ impl NodeHandle {
       return Err(Error::shutting_down("node events"));
     }
     Ok(self.events.subscribe::<E>(options))
+  }
+
+  /// Subscribes to this node's member-set revision. Unlike the transient
+  /// event stream, the revision is value-based state: a watcher created
+  /// before an action observes every later change, and a watcher created
+  /// after it reads the current revision immediately. Await
+  /// [`MemberRevision::changed`] after driving an operation instead of
+  /// polling the member pages with wall-clock sleeps.
+  pub fn member_revision(&self) -> crate::node::MemberRevision {
+    self.member_revision.clone()
+  }
+
+  /// Runs one full anti-entropy round now (membership pages, the issuer
+  /// trust snapshot, and resource pages over every authenticated session)
+  /// and completes when the round finishes. The convergence check
+  /// becomes deterministic: drive a round, await it, then read the
+  /// pages — no interval-cadence sleeps.
+  pub fn run_sync_round(&self) -> impl Future<Output = Result<()>> + Send {
+    crate::RunSyncRound::new().dispatch(&self.runtime)
   }
 }

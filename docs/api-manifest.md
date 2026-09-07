@@ -290,9 +290,19 @@ impl NodeHandle {
     pub async fn command<C: Command>(&self, command: C) -> Result<C::Output>;
     pub async fn query<Q: Query>(&self, query: Q) -> Result<Q::Output>;
     pub fn events<E: Event>(&self, options: EventOptions) -> Result<EventSubscription<E>>;
+    pub fn member_revision(&self) -> MemberRevision;
+    pub fn run_sync_round(&self) -> impl Future<Output = Result<()>> + Send;
     pub fn open_stream(&self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy, metadata: StreamMetadata) -> Result<OutboundStream>;
 }
 ```
+
+`member_revision` hands out a value-based watcher over the member-set
+revision: bumps pair one-to-one with `MemberChanged` emissions after the
+underlying persist lands, so awaiting `changed` is deterministic where the
+transient event stream can lag or drop. `run_sync_round` drives one full
+anti-entropy round now and completes when it finishes; convergence checks
+await the round and then read the pages instead of sleeping on the tick
+cadence.
 
 `open_stream` allocates a core-generated `TraceId` synchronously and performs no body delivery. The
 returned packet exposes that ID before `send_sync` or `send_async` starts consuming the body. An exact
@@ -334,6 +344,10 @@ impl Command for PurgeRevocation { type Output = (); }
 pub struct IssueCleanupCheckpoint { /* private */ }
 impl IssueCleanupCheckpoint { pub fn new() -> Self; }
 impl Command for IssueCleanupCheckpoint { type Output = u64; }
+
+pub struct RunSyncRound { /* private */ }
+impl RunSyncRound { pub fn new() -> Self; }
+impl Command for RunSyncRound { type Output = (); }
 
 pub struct ConnectMember { /* private */ }
 impl ConnectMember { pub fn new(receiver: Endpoint, peer: NodeId) -> Self; }
@@ -741,6 +755,12 @@ pub struct EventOptions { /* private finite capacity */ }
 impl EventOptions {
     pub fn new() -> Self;
     pub fn capacity(self, value: usize) -> Result<Self>;
+}
+
+pub struct MemberRevision { /* private */ }
+impl MemberRevision {
+    pub fn current(&self) -> u64;
+    pub async fn changed(&mut self) -> Result<u64>;
 }
 
 pub struct EventSubscription<E: Event> { /* private */ }

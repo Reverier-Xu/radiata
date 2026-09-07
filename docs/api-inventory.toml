@@ -1,12 +1,14 @@
 schema = "radiata.woooo.tech/schemas/api-inventory-v1"
 status = "accepted"
 document = "docs/api-manifest.md"
-sha256 = "83a4dff1736b46168c04754e8f4b2907d2a42258275167f9a2b803780830f2bd"
+sha256 = "ade2476cf7db4415c58fe1dbfdc18c18664291555141e18b27ef0681d080e5de"
 
 node_handle_signatures = [
   "pub async fn command<C: Command>(&self, command: C) -> Result<C::Output>;",
   "pub async fn query<Q: Query>(&self, query: Q) -> Result<Q::Output>;",
   "pub fn events<E: Event>(&self, options: EventOptions) -> Result<EventSubscription<E>>;",
+  "pub fn member_revision(&self) -> MemberRevision;",
+  "pub fn run_sync_round(&self) -> impl Future<Output = Result<()>> + Send;",
   "pub fn open_stream(&self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy, metadata: StreamMetadata) -> Result<OutboundStream>;",
 ]
 
@@ -27,6 +29,7 @@ commands = [
   "PurgeRevocation",
   "IssueCleanupCheckpoint",
   "LeaveCluster",
+  "RunSyncRound",
 ]
 
 queries = [
