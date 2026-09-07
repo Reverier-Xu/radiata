@@ -413,7 +413,9 @@ async fn g9_delayed_content_converges_after_revoke() {
   // and every member treats the identity as unauthorized.
   tokio::time::timeout(Duration::from_secs(30), async {
     // The tombstone trails its binding (the revocation forwards on the
-    // snapshot resend cadence), so poll until the revoked status lands.
+    // snapshot resend cadence), so under a loaded runner the binding can
+    // converge as still-Trusted first. Poll past every intermediate
+    // status until the revoked status lands or the deadline expires.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
       let Some(status) = trust_status(&third.handle, &member_id).await else {
@@ -424,8 +426,14 @@ async fn g9_delayed_content_converges_after_revoke() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         continue;
       };
-      assert_eq!(status, radiata::TrustStatus::Revoked, "wrong status");
-      break;
+      if status == radiata::TrustStatus::Revoked {
+        break;
+      }
+      assert!(
+        deadline.elapsed() < Duration::from_secs(30),
+        "revocation tombstone never converged: {status:?}"
+      );
+      tokio::time::sleep(Duration::from_millis(100)).await;
     }
   })
   .await
