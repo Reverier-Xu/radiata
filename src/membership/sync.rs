@@ -25,6 +25,7 @@ use crate::{
   },
   membership::page::{MembershipPage, sync as page_sync},
   protocol::{decode_canonical_strict, encode_canonical},
+  provider::KeyProvider,
   runtime::RuntimeClient,
   session::stream::SessionTable,
 };
@@ -175,6 +176,108 @@ fn member_changed(
 ) {
   events.emit(crate::MemberChanged::new(node));
   revision.bump();
+}
+
+/// The bounded wait for the first leave-record admission acknowledgement
+/// (ADR-0009 decision 3): five seconds, well inside the fixed
+/// authentication deadline's order of magnitude.
+const LEAVE_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The bounded wait for flushing the record bodies after the first
+/// acknowledgement. Deliberately a fresh budget, not the ack wait's
+/// remainder: a slow acknowledgement must not shrink the flush window
+/// toward zero, or the record body dies in the outbound queue when the
+/// teardown retires the sessions (at-most-once loss of terminal
+/// evidence).
+const LEAVE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The leave-plane announcement (ADR-0009 decision 3): injects the
+/// owner-signed leave record into every connected session, waiting at
+/// most [`LEAVE_ACK_WAIT`] for the first current-process admission
+/// acknowledgement plus [`LEAVE_FLUSH_WAIT`] for the local flush of the
+/// record bodies (the acknowledgement proves admission; the awaited pump
+/// proves the record left this process before teardown retires the
+/// session). The node signs nothing here: the caller owns the record
+/// through the identity domain; this is the sync plane's delivery
+/// contract, mirroring the receive arm and the resend cadence below.
+pub(crate) async fn announce_leave(
+  context: &LocalIdentityContext, entropy: &Arc<dyn Entropy>, keys: &Arc<dyn KeyProvider>,
+  sessions: &crate::session::stream::SessionTable, routes: &crate::routing::RouteTable,
+  events: &Arc<crate::node::EventHub>,
+) -> Result<()> {
+  let record = crate::identity::leave::sign_leave_record(context, keys).await?;
+  let peers = crate::sync_common::alive_peers(sessions)?;
+  if peers.is_empty() {
+    return Ok(());
+  }
+  tracing::debug!(peers = peers.len(), "leave announcement starting");
+  let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
+  let encoded = SyncPayload::Leave(minicbor::bytes::ByteVec::from(record.encode()?)).encode()?;
+  let acked = std::sync::Arc::new(tokio::sync::Notify::new());
+  let local = context.identity().node().clone();
+  let mut pumps = Vec::new();
+  for peer in peers {
+    let entry = sessions
+      .lock()
+      .map_err(crate::Error::session_table)?
+      .get(&peer)
+      .cloned()
+      .filter(|entry| entry.alive());
+    // A peer without a live session is skipped: the bounded wait covers
+    // the rest, and a lost announcement degrades to a silent leave.
+    let Some(entry) = entry else {
+      continue;
+    };
+    let (ack_notify, ack) = tokio::sync::oneshot::channel();
+    let trace_id = crate::TraceId::generate(entropy.as_ref())?;
+    let request = crate::packet::OutboundRequest {
+      trace_id,
+      target: crate::StreamTarget::Exact(peer.clone()),
+      load_balancer: None,
+      max_hops: 1,
+      protocol: protocol.clone(),
+      metadata: crate::packet::StreamMetadata::new(),
+      body: Box::pin(crate::packet::StaticBody::new(Arc::from(encoded.clone()))),
+      internal: true,
+      ack_notify,
+    };
+    // The pump runs as its own task: the acknowledgement channel
+    // resolves at admission and the task itself completes after the
+    // record body flushed to the session.
+    let pump = tokio::spawn(crate::session::stream::run_outbound(
+      entry,
+      local.clone(),
+      request,
+      routes.clone(),
+      false,
+      None,
+      events.clone(),
+    ));
+    let acked = std::sync::Arc::clone(&acked);
+    tokio::spawn(async move {
+      if matches!(ack.await, Ok(Ok(_))) {
+        acked.notify_one();
+      }
+    });
+    pumps.push(pump);
+  }
+  if pumps.is_empty() {
+    return Ok(());
+  }
+  let deadline = tokio::time::Instant::now() + LEAVE_ACK_WAIT;
+  let waited = tokio::time::timeout_at(deadline, acked.notified()).await;
+  tracing::debug!(
+    acknowledged = waited.is_ok(),
+    "leave announcement wait completed"
+  );
+  // Drain the pumps with their own fresh budget so the record bodies
+  // are flushed before the leave's network teardown retires the
+  // sessions, regardless of how long the acknowledgement took.
+  let flush_deadline = tokio::time::Instant::now() + LEAVE_FLUSH_WAIT;
+  for pump in pumps {
+    let _ = tokio::time::timeout_at(flush_deadline, pump).await;
+  }
+  Ok(())
 }
 
 async fn accept_payload(
