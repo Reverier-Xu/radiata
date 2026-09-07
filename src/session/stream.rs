@@ -153,6 +153,9 @@ pub(crate) struct SessionPacketContext {
   /// The node's configured bound on in-memory terminal route records;
   /// admission rejections must respect it like every other writer (G6-02).
   route_capacity: usize,
+  /// The node-scoped tracked task vec: session-exit consumer drains join
+  /// it so a teardown cannot abort an in-flight apply unnoticed.
+  task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
   parser_limits: crate::protocol::CborLimits,
 }
 
@@ -166,6 +169,7 @@ impl SessionPacketContext {
     entropy: Arc<dyn crate::api::Entropy>, events: Arc<crate::node::EventHub>,
     route_policy: Option<QualifiedTag>, sessions: SessionTable, routes_clone: RouteTable,
     forwarding_capacity: usize, route_capacity: usize,
+    task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     parser_limits: crate::protocol::CborLimits,
   ) -> Self {
     Self {
@@ -182,6 +186,7 @@ impl SessionPacketContext {
       routes: routes_clone,
       forwarding_capacity,
       route_capacity,
+      task_drains,
       parser_limits,
     }
   }
@@ -1037,6 +1042,18 @@ async fn read_loop(
       },
     }
   }
+  // Graceful consumer drain: handing the session's consumer tasks to a
+  // node-scoped drain task means a teardown (Io error, deterministic
+  // replacement, shutdown) can no longer abort an in-flight apply. A
+  // fully received control payload therefore always completes its
+  // persist-and-emit (terminal evidence must not strand on a session
+  // end), and a partial body fails closed at decode instead. The drain
+  // handle joins the node's tracked task vec, so shutdown still awaits
+  // it and the recovery tick reaps it (bounded task accounting).
+  let drain = tokio::spawn(async move { while consumers.join_next().await.is_some() {} });
+  if let Ok(mut tasks) = context.task_drains.lock() {
+    tasks.push(drain);
+  }
 }
 
 /// Validates one open frame against the authenticated session and the
@@ -1609,9 +1626,7 @@ pub(crate) fn opening_context_digest(
 /// Records one bounded terminal route fact for an admission rejection:
 /// identity and typed failure only, never payload bytes, always within
 /// the node's configured route-record capacity.
-fn record_rejection(
-  routes: &RouteTable, capacity: usize, trace_id: &TraceId, kind: ErrorKind,
-) {
+fn record_rejection(routes: &RouteTable, capacity: usize, trace_id: &TraceId, kind: ErrorKind) {
   // A trace already carrying a terminal fact never grows the table.
   if routes
     .lock()

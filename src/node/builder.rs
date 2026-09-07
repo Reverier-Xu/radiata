@@ -76,6 +76,7 @@ impl NodeBuilder {
           sessions: Default::default(),
           routes: Default::default(),
           events: Arc::clone(&events),
+          connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
           runtime_seed: None,
         },
         (packet_tx, packet_rx),

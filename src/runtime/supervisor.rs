@@ -88,6 +88,10 @@ pub(crate) struct RuntimeDependencies {
   pub(crate) routes: RouteTable,
   /// The typed event hub shared with every node handle (G9-03).
   pub(crate) events: Arc<crate::node::EventHub>,
+  /// Node-scoped task handles: connection tasks plus the graceful
+  /// consumer-drain tasks. Shutdown awaits them and the recovery tick
+  /// reaps finished ones (bounded task accounting, roadmap rule 4).
+  pub(crate) connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
   /// The 32-byte runtime seed drawn once at startup, before identity
   /// provisioning. Deliberately reserved and pinned by the G1 lifecycle
   /// entropy-sequence test; future runtime lanes consume it from here
@@ -534,7 +538,6 @@ async fn finish_shutdown(
 struct Supervisor {
   dependencies: RuntimeDependencies,
   shutdown_tx: watch::Sender<()>,
-  connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
   driver: SessionDriver,
   packet: Arc<SessionPacketContext>,
   route_capacity: usize,
@@ -587,6 +590,7 @@ fn session_packet_context(
     dependencies.routes.clone(),
     crate::session::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
     dependencies.config.trace_metadata_limits().active(),
+    Arc::clone(&dependencies.connection_tasks),
     dependencies.config.parser_cbor_limits(),
   )
 }
@@ -665,7 +669,6 @@ impl Supervisor {
     Ok(Self {
       dependencies,
       shutdown_tx,
-      connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
       driver,
       packet,
       route_capacity,
@@ -694,7 +697,7 @@ impl Supervisor {
       driver.abort();
       aborted.push(driver);
     }
-    if let Ok(mut handles) = self.connection_tasks.lock() {
+    if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
       for handle in handles.drain(..) {
         handle.abort();
         aborted.push(handle);
@@ -722,7 +725,7 @@ impl Supervisor {
     let sessions = self.dependencies.sessions.clone();
     let packet = self.packet.clone();
     let shutdown = self.shutdown_tx.subscribe();
-    let connection_tasks = self.connection_tasks.clone();
+    let connection_tasks = self.dependencies.connection_tasks.clone();
     let accept_listener = std::sync::Arc::clone(&listener);
     let insert_listener = std::sync::Arc::clone(&listener);
     let attachment = bound.clone();
@@ -867,6 +870,14 @@ impl Supervisor {
   /// fixed authentication deadline's order of magnitude.
   const LEAVE_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+  /// The bounded wait for flushing the record bodies after the first
+  /// acknowledgement. Deliberately a fresh budget, not the ack wait's
+  /// remainder: a slow acknowledgement must not shrink the flush window
+  /// toward zero, or the record body dies in the outbound queue when the
+  /// teardown retires the sessions (at-most-once loss of terminal
+  /// evidence).
+  const LEAVE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
   /// Signs the owner leave record and injects it into every connected
   /// session, waiting at most [`Self::LEAVE_ACK_WAIT`] for the first
   /// current-process admission acknowledgement plus the local flush of the
@@ -945,10 +956,12 @@ impl Supervisor {
       acknowledged = waited.is_ok(),
       "leave announcement wait completed"
     );
-    // Drain the pumps with the remaining budget so the record bodies are
-    // flushed before the leave's network teardown retires the sessions.
+    // Drain the pumps with their own fresh budget so the record bodies
+    // are flushed before the leave's network teardown retires the
+    // sessions, regardless of how long the acknowledgement took.
+    let flush_deadline = tokio::time::Instant::now() + Self::LEAVE_FLUSH_WAIT;
     for pump in pumps {
-      let _ = tokio::time::timeout_at(deadline, pump).await;
+      let _ = tokio::time::timeout_at(flush_deadline, pump).await;
     }
     Ok(())
   }
@@ -1458,6 +1471,7 @@ impl Supervisor {
       routes.len()
     };
     let connection_tasks = self
+      .dependencies
       .connection_tasks
       .lock()
       .map_err(Error::session_table)?
@@ -2039,7 +2053,7 @@ impl Supervisor {
     // accepted connection and inflate the observability counts. Reaping
     // each tick keeps the vec and the counts live-work only; abort() on a
     // finished handle is a no-op, so shutdown semantics are unchanged.
-    if let Ok(mut handles) = self.connection_tasks.lock() {
+    if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
       handles.retain(|handle| !handle.is_finished());
     }
     let direct: std::collections::BTreeSet<NodeId> = self
