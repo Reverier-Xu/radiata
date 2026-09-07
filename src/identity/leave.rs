@@ -29,6 +29,7 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 use super::{
   deletion::delete_unreferenced_key,
   lifecycle::{CommitWithReconcile, LocalIdentityContext, commit_with_reconcile},
+  records,
   records::{LocalIdentityV1, local_identity_key},
 };
 use crate::{
@@ -330,28 +331,15 @@ pub(crate) async fn persist_leave_record_ctx(
 ) -> Result<()> {
   let _permit = store.write_permit().await;
   record.verify()?;
-  let namespace = leave_namespace()?;
-  let key = leave_record_key(record.node());
-  let snapshot = store.snapshot().await?;
-  if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    if existing.as_bytes() == record.encode()?.as_slice() {
-      return Ok(());
-    }
-    return Err(Error::conflict("leave record"));
-  }
-  let transaction = store.prepare_transaction(
-    TransactionId::generate(entropy)?,
-    snapshot.revision().clone(),
-    vec![StoreOperation::Put {
-      namespace,
-      key,
-      expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(record.encode()?)),
-    }],
-  )?;
-  drop(snapshot);
-  let _ = store.commit(transaction).await?;
-  Ok(())
+  records::persist_terminal_record(
+    store,
+    entropy,
+    leave_namespace()?,
+    leave_record_key(record.node()),
+    Arc::from(record.encode()?),
+    "leave record",
+  )
+  .await
 }
 
 /// Whether `node` has a leave record in the local store.
@@ -382,27 +370,21 @@ pub(crate) async fn left_nodes_ctx(
 pub(crate) async fn known_leave_records_ctx(
   store: &MetadataStore, cap: usize,
 ) -> Result<Vec<LeaveRecordV1>> {
-  let namespace = leave_namespace()?;
-  let snapshot = store.snapshot().await?;
-  let mut scan = snapshot.scan(&namespace, &[]).await?;
-  let mut records = Vec::new();
-  while let Some(entry) = scan.next().await? {
-    if entry.key().as_bytes() == INTENT_KEY {
-      continue;
-    }
-    let record = LeaveRecordV1::decode(entry.value().as_bytes())
-      .map_err(|_| Error::invalid_input("leave record decode"))?;
-    records.push(record);
-    if records.len() >= cap {
-      break;
-    }
-  }
-  Ok(records)
+  records::scan_decoded_records(
+    store,
+    leave_namespace()?,
+    cap,
+    intent_key_skip,
+    LeaveRecordV1::decode,
+  )
+  .await
 }
 
-/// The bounded per-pass GC batch on the leave family: one sweep deletes
-/// at most this many collected tombstones; the next sync round continues.
-const GC_BATCH: usize = 64;
+/// The leave family's namespace carries the leave-intent singleton under
+/// [`INTENT_KEY`]; the known-records scan must not decode it as a record.
+fn intent_key_skip(key: &StoreKey) -> bool {
+  key.as_bytes() == INTENT_KEY
+}
 
 /// The leave-side checkpoint sweep (ADR-0009 decision 5): conditional
 /// exact-digest deletes of collected leave records stamped at or before
@@ -410,35 +392,13 @@ const GC_BATCH: usize = 64;
 pub(crate) async fn collect_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
-  let _permit = store.write_permit().await;
   let namespace = leave_namespace()?;
-  let mut collected = 0_usize;
-  for record in known_leave_records_ctx(store, GC_BATCH).await? {
-    if record.timestamp_millis() > watermark {
-      continue;
-    }
-    let snapshot = store.snapshot().await?;
-    let key = leave_record_key(record.node());
-    let Some(existing) = snapshot.get(&namespace, &key).await? else {
-      continue;
-    };
-    let transaction = store.prepare_transaction(
-      TransactionId::generate(entropy)?,
-      snapshot.revision().clone(),
-      vec![StoreOperation::Delete {
-        namespace: namespace.clone(),
-        key,
-        expected: existing.digest().clone(),
-      }],
-    )?;
-    drop(snapshot);
-    // A raced write on this tombstone conflicts: it stays for the next
-    // pass (hygiene, never security).
-    if let crate::CommitOutcome::Committed(_) = store.commit(transaction).await? {
-      collected += 1;
-    }
-  }
-  Ok(collected)
+  let known = known_leave_records_ctx(store, records::TOMBSTONE_GC_BATCH).await?;
+  let entries: Vec<_> = known
+    .iter()
+    .map(|record| (leave_record_key(record.node()), record.timestamp_millis()))
+    .collect();
+  records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
 }
 
 /// Discovers the pending leave-intent, if any.
@@ -586,22 +546,10 @@ async fn swap_identity(
     return Err(Error::conflict("leave identity swap"));
   }
   // The replacement handle must be provably fresh: a deletion intent or
-  // tombstone for it fails closed (the finalize_identity precedent).
-  let (deletion_namespace, deletion_key) =
-    crate::identity::records::key_deletion_intent_key(created.handle())?;
-  let (deleted_namespace, deleted_key) =
-    crate::identity::records::key_deleted_key(created.handle())?;
-  if snapshot
-    .get(&deletion_namespace, &deletion_key)
-    .await?
-    .is_some()
-    || snapshot
-      .get(&deleted_namespace, &deleted_key)
-      .await?
-      .is_some()
-  {
-    return Err(Error::conflict("key handle reuse"));
-  }
+  // tombstone for it fails closed (the finalize_identity precedent); the
+  // same guard keys are re-checked transactionally below.
+  records::assert_key_handle_fresh(snapshot.as_ref(), created.handle()).await?;
+  let [deletion_check, deleted_check] = records::key_handle_fresh_checks(created.handle())?;
   let prepared = store.prepare_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
@@ -612,16 +560,8 @@ async fn swap_identity(
         expected: StoreExpectation::Exact(former_value.digest().clone()),
         value: StoreValue::new(Arc::from(replacement.encode()?)),
       },
-      StoreOperation::Check {
-        namespace: deletion_namespace,
-        key: deletion_key,
-        expected: StoreExpectation::Absent,
-      },
-      StoreOperation::Check {
-        namespace: deleted_namespace,
-        key: deleted_key,
-        expected: StoreExpectation::Absent,
-      },
+      deletion_check,
+      deleted_check,
     ],
   )?;
   drop(snapshot);

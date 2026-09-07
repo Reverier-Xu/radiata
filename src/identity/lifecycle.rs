@@ -28,10 +28,12 @@
 
 use std::{sync::Arc, time::Duration};
 
-use super::records::{
-  IdentityBindingV1, KeyCreationIntentV1, LocalIdentityV1, identity_binding_key,
-  key_creation_intent_key, key_creation_intent_namespace, key_deleted_key, key_deletion_intent_key,
-  local_identity_key,
+use super::{
+  records,
+  records::{
+    IdentityBindingV1, KeyCreationIntentV1, LocalIdentityV1, identity_binding_key,
+    key_creation_intent_key, key_creation_intent_namespace, local_identity_key,
+  },
 };
 use crate::{
   CommitOutcome, CreatedKey, Error, KeyCreateState, KeyOperationId, NodeId, ProviderErrorContext,
@@ -431,36 +433,15 @@ async fn finalize_identity(
   let target = intent.recovery_identity(&stored_intent)?;
   let snapshot = store.snapshot().await?;
   // A handle with a deletion intent or tombstone must never be referenced by
-  // a new record again.
-  let (deletion_namespace, deletion_key) = key_deletion_intent_key(created.handle())?;
-  let (deleted_namespace, deleted_key) = key_deleted_key(created.handle())?;
-  if snapshot
-    .get(&deletion_namespace, &deletion_key)
-    .await?
-    .is_some()
-    || snapshot
-      .get(&deleted_namespace, &deleted_key)
-      .await?
-      .is_some()
-  {
-    return Err(Error::conflict("key handle reuse"));
-  }
+  // a new record again; the same guard keys are re-checked transactionally
+  // below.
+  records::assert_key_handle_fresh(snapshot.as_ref(), created.handle()).await?;
+  let [deletion_check, deleted_check] = records::key_handle_fresh_checks(created.handle())?;
   let (local_namespace, local_key) = local_identity_key()?;
   let (intent_namespace, intent_key) = key_creation_intent_key(intent.operation())?;
   // Transactional guard: the journaled commit must also prove no deletion
   // intent or tombstone appeared for this handle after the snapshot.
-  let reuse_guards = [
-    StoreOperation::Check {
-      namespace: deletion_namespace,
-      key: deletion_key,
-      expected: StoreExpectation::Absent,
-    },
-    StoreOperation::Check {
-      namespace: deleted_namespace,
-      key: deleted_key,
-      expected: StoreExpectation::Absent,
-    },
-  ];
+  let reuse_guards = [deletion_check, deleted_check];
   let local_token = ReceiptReferenceToken::for_record(&local_namespace, &local_key);
   let intent_token = ReceiptReferenceToken::for_record(&intent_namespace, &intent_key);
   let prepared = store
