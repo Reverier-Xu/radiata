@@ -25,7 +25,6 @@ use crate::{
   },
   membership::page::{MembershipPage, sync as page_sync},
   protocol::{decode_canonical_strict, encode_canonical},
-  provider::KeyProvider,
   runtime::RuntimeClient,
   session::stream::SessionTable,
 };
@@ -44,6 +43,10 @@ pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
 pub(crate) const SYNC_KIND_CLEANUP: u8 = 4;
 pub(crate) const SYNC_KIND_REVOCATION: u8 = 5;
 pub(crate) const SYNC_KIND_CHECKPOINT: u8 = 6;
+/// A leave-applied receipt: the applying peer confirms one leave record
+/// persisted. Additive (post-0.1 peers only): peers that never send it
+/// leave the announcement on its documented bounded-degradation path.
+pub(crate) const SYNC_KIND_LEAVE_APPLIED: u8 = 7;
 
 /// One sync payload: an encoded membership page, an encoded issuer trust
 /// snapshot, or an encoded signed removal tombstone.
@@ -61,6 +64,10 @@ pub(crate) enum SyncPayload {
   Revocation(ByteVec),
   /// An encoded [`crate::identity::cleanup::CleanupCheckpointV1`].
   Checkpoint(ByteVec),
+  /// The applying peer's receipt for one leave record, addressed to the
+  /// leaver. A hint only: never re-forwarded, never stored, and absent
+  /// from pre-receipt peers by design.
+  LeaveApplied { node: NodeId },
 }
 
 #[derive(Encode, Decode)]
@@ -83,6 +90,10 @@ impl SyncPayload {
       Self::Cleanup(encoded) => (SYNC_KIND_CLEANUP, encoded.clone()),
       Self::Revocation(encoded) => (SYNC_KIND_REVOCATION, encoded.clone()),
       Self::Checkpoint(encoded) => (SYNC_KIND_CHECKPOINT, encoded.clone()),
+      Self::LeaveApplied { node } => (
+        SYNC_KIND_LEAVE_APPLIED,
+        ByteVec::from(node.as_str().as_bytes().to_vec()),
+      ),
     };
     encode_canonical(
       &SyncPayloadWire {
@@ -112,6 +123,12 @@ impl SyncPayload {
       SYNC_KIND_CLEANUP => Ok(Self::Cleanup(wire.payload)),
       SYNC_KIND_REVOCATION => Ok(Self::Revocation(wire.payload)),
       SYNC_KIND_CHECKPOINT => Ok(Self::Checkpoint(wire.payload)),
+      SYNC_KIND_LEAVE_APPLIED => Ok(Self::LeaveApplied {
+        node: NodeId::parse(
+          std::str::from_utf8(wire.payload.as_ref())
+            .map_err(|_| Error::invalid_input("membership sync payload kind"))?,
+        )?,
+      }),
       _ => Err(Error::invalid_input("membership sync payload kind")),
     }
   }
@@ -130,18 +147,21 @@ pub(crate) struct MembershipSyncConsumer {
   entropy: Arc<dyn Entropy>,
   events: Arc<crate::node::EventHub>,
   revision: crate::node::MemberRevisionSignal,
+  leave_applied: LeaveAppliedSignal,
 }
 
 impl MembershipSyncConsumer {
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
     events: Arc<crate::node::EventHub>, revision: crate::node::MemberRevisionSignal,
+    leave_applied: LeaveAppliedSignal,
   ) -> Self {
     Self {
       context: Arc::downgrade(&context),
       entropy,
       events,
       revision,
+      leave_applied,
     }
   }
 }
@@ -149,6 +169,8 @@ impl MembershipSyncConsumer {
 impl PacketConsumer for MembershipSyncConsumer {
   fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
+      let source = packet.source().clone();
+      let runtime = packet.reply_runtime();
       let bytes = crate::sync_common::drain_body(packet.body(), "membership sync body").await?;
       let payload = SyncPayload::decode(&bytes)?;
       let context = self
@@ -160,6 +182,9 @@ impl PacketConsumer for MembershipSyncConsumer {
         self.entropy.clone(),
         &self.events,
         &self.revision,
+        &self.leave_applied,
+        &runtime,
+        &source,
         &payload,
       )
       .await
@@ -178,6 +203,36 @@ fn member_changed(
   revision.bump();
 }
 
+/// The leave-plane's applied-receipt signal: bumped once per durable
+/// leave-record install on this node (the node itself being the record's
+/// subject). [`announce_leave`] parks on it so the announcement resolves
+/// on durable application instead of mere admission.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LeaveAppliedSignal {
+  notify: Arc<tokio::sync::Notify>,
+}
+
+impl LeaveAppliedSignal {
+  pub(crate) fn new() -> Self {
+    Self {
+      notify: Arc::new(tokio::sync::Notify::new()),
+    }
+  }
+
+  pub(crate) fn bump(&self) {
+    self.notify.notify_one();
+  }
+
+  /// Arms and awaits one notification. The enable-before-await ordering
+  /// inside keeps a bump that races the arming captured (Notify permits).
+  pub(crate) async fn wait(&self) {
+    let notified = self.notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    notified.await;
+  }
+}
+
 /// The bounded wait for the first leave-record admission acknowledgement
 /// (ADR-0009 decision 3): five seconds, well inside the fixed
 /// authentication deadline's order of magnitude.
@@ -192,20 +247,20 @@ const LEAVE_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const LEAVE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The leave-plane announcement (ADR-0009 decision 3): injects the
-/// owner-signed leave record into every connected session, waiting at
-/// most [`LEAVE_ACK_WAIT`] for the first current-process admission
-/// acknowledgement plus [`LEAVE_FLUSH_WAIT`] for the local flush of the
-/// record bodies (the acknowledgement proves admission; the awaited pump
-/// proves the record left this process before teardown retires the
-/// session). The node signs nothing here: the caller owns the record
-/// through the identity domain; this is the sync plane's delivery
-/// contract, mirroring the receive arm and the resend cadence below.
+/// owner-signed leave record into every connected session and waits at
+/// most [`LEAVE_ACK_WAIT`] for the first durable-install receipt
+/// (post-receipt peers) or the first admission acknowledgement
+/// (pre-receipt peers), then [`LEAVE_FLUSH_WAIT`] for the local flush of
+/// the record bodies. The caller owns the record — signed exactly once
+/// and journaled before this call, so re-drives cannot diverge from what
+/// peers already hold. A timeout degrades to the documented silent
+/// leave, which the cleanup path covers.
 pub(crate) async fn announce_leave(
-  context: &LocalIdentityContext, entropy: &Arc<dyn Entropy>, keys: &Arc<dyn KeyProvider>,
-  sessions: &crate::session::stream::SessionTable, routes: &crate::routing::RouteTable,
-  events: &Arc<crate::node::EventHub>,
+  context: &LocalIdentityContext, entropy: &Arc<dyn Entropy>,
+  record: &crate::identity::leave::LeaveRecordV1, sessions: &crate::session::stream::SessionTable,
+  routes: &crate::routing::RouteTable, events: &Arc<crate::node::EventHub>,
+  leave_applied: &LeaveAppliedSignal,
 ) -> Result<()> {
-  let record = crate::identity::leave::sign_leave_record(context, keys).await?;
   let peers = crate::sync_common::alive_peers(sessions)?;
   if peers.is_empty() {
     return Ok(());
@@ -214,6 +269,22 @@ pub(crate) async fn announce_leave(
   let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
   let encoded = SyncPayload::Leave(minicbor::bytes::ByteVec::from(record.encode()?)).encode()?;
   let acked = std::sync::Arc::new(tokio::sync::Notify::new());
+  // Register the applied-receipt interest before any pump runs: the
+  // enable-before-check ordering closes the lost-wakeup window against
+  // an apply that completes while the wait is being armed.
+  let (resolved_tx, resolved_rx) = tokio::sync::oneshot::channel();
+  let applied_signal = leave_applied.clone();
+  let acked_waiter = acked.clone();
+  tokio::spawn(async move {
+    // The receipt is the durable outcome; an admission acknowledgement is
+    // the pre-receipt-peer outcome. Notify permits make the arming race
+    // against a fast receipt harmless.
+    let applied = tokio::select! {
+      _ = applied_signal.wait() => true,
+      _ = acked_waiter.notified() => false,
+    };
+    let _ = resolved_tx.send(applied);
+  });
   let local = context.identity().node().clone();
   let mut pumps = Vec::new();
   for peer in peers {
@@ -265,9 +336,17 @@ pub(crate) async fn announce_leave(
     return Ok(());
   }
   let deadline = tokio::time::Instant::now() + LEAVE_ACK_WAIT;
-  let waited = tokio::time::timeout_at(deadline, acked.notified()).await;
+  // The wait resolves on whichever lands first: the applied receipt (the
+  // durable outcome) or an admission acknowledgement (pre-receipt peers).
+  // Neither lands inside the budget: the documented silent-leave
+  // degradation. The journaled record keeps the leave retryable.
+  let applied_in_time = tokio::time::timeout_at(deadline, resolved_rx)
+    .await
+    .ok()
+    .and_then(|resolved| resolved.ok())
+    .unwrap_or(false);
   tracing::debug!(
-    acknowledged = waited.is_ok(),
+    applied = applied_in_time,
     "leave announcement wait completed"
   );
   // Drain the pumps with their own fresh budget so the record bodies
@@ -280,9 +359,11 @@ pub(crate) async fn announce_leave(
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_payload(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+  leave_applied: &LeaveAppliedSignal, runtime: &RuntimeClient, source: &NodeId,
   payload: &SyncPayload,
 ) -> Result<()> {
   let store = context.store();
@@ -344,6 +425,27 @@ async fn accept_payload(
       crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
       tracing::debug!(node = %record.node(), "leave record persisted on peer");
       member_changed(events, revision, record.node().clone());
+      // The applied receipt (ADR-0009 decision 3): one durable-install
+      // confirmation back to the leaver, best-effort and retried by the
+      // announcement budget. Pre-receipt peers simply never send it.
+      let receipt = SyncPayload::LeaveApplied {
+        node: record.node().clone(),
+      }
+      .encode()?;
+      let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
+      if let Err(error) =
+        crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt).await
+      {
+        tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
+      }
+    }
+    SyncPayload::LeaveApplied { node } => {
+      // A receipt is a hint addressed to the record's subject only:
+      // fail-open for every other receiver, and never a trust decision.
+      if *node != *context.identity().node() {
+        return Ok(());
+      }
+      leave_applied.bump();
     }
     SyncPayload::Cleanup(encoded) => {
       // An issuer-signed cleanup tombstone is terminal evidence (ADR-0009

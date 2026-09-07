@@ -95,6 +95,10 @@ pub(crate) struct RuntimeDependencies {
   /// MemberChanged emissions so observers await changes instead of
   /// polling pages.
   pub(crate) member_revision: crate::node::MemberRevisionSignal,
+  /// The leave-plane applied-receipt signal: the membership sync
+  /// consumer bumps it when this node durably installs a peer's leave
+  /// applied receipt addressed to this node.
+  pub(crate) leave_applied: crate::membership::sync::LeaveAppliedSignal,
   /// Requests for one immediate anti-entropy round, forwarded to the
   /// sync driver (the cursor owner) by the RunSyncRound command.
   pub(crate) sync_round_requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
@@ -264,6 +268,7 @@ pub(crate) async fn spawn_runtime(
     dependencies.entropy.clone(),
     dependencies.events.clone(),
     dependencies.member_revision.clone(),
+    dependencies.leave_applied.clone(),
   ));
   dependencies
     .extensions
@@ -1951,19 +1956,27 @@ impl Supervisor {
     }
     let context = self.context()?;
 
-    // ADR-0009 decision 3: announce the owner-signed leave record to the
-    // connected sessions and wait a bounded time for the first
-    // current-process admission acknowledgement; a timeout degrades to a
-    // silent leave, which the cleanup path covers. The announcement drives
-    // the packet pump directly (spawned stream tasks carry it), so the
-    // bounded wait never stalls the control loop.
+    // ADR-0009 decision 3, crash-retryable ordering: journal the intent
+    // and the signed record before any network effect, announce with the
+    // journaled record, then rotate. A crash anywhere before rotation
+    // resumes at startup with the same journaled record, so the leave is
+    // never forgotten and never diverges from what peers may already
+    // hold. A receipt-less budget expires into the documented silent
+    // leave, which the cleanup path covers.
+    let journaled = crate::identity::leave::journal_leave(
+      &context,
+      &self.dependencies.keys,
+      self.dependencies.entropy.as_ref(),
+    )
+    .await?;
     crate::membership::sync::announce_leave(
       &context,
       &self.dependencies.entropy,
-      &self.dependencies.keys,
+      &journaled.record,
       &self.dependencies.sessions,
       &self.dependencies.routes,
       &self.dependencies.events,
+      &self.dependencies.leave_applied,
     )
     .await?;
 
@@ -1986,12 +1999,18 @@ impl Supervisor {
       self.recovery_history.remove(&peer);
     }
 
-    let (former, replacement) = crate::identity::leave::execute(
-      &context,
+    crate::identity::leave::run_leave(
+      context.store(),
       &self.dependencies.keys,
       self.dependencies.entropy.as_ref(),
+      &journaled.stored,
+      &journaled.intent,
     )
     .await?;
+    let (former, replacement) = (
+      journaled.intent.former_node().clone(),
+      journaled.intent.replacement_node().clone(),
+    );
     self.dependencies.events.emit(crate::IdentityReplaced::new(
       former.clone(),
       replacement.clone(),

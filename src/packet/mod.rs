@@ -351,6 +351,12 @@ impl IncomingStream {
     }
   }
 
+  /// The reply half of the admitting node: consumers derive addressed
+  /// internal-plane signals (e.g. the leave-applied receipt) through it.
+  pub(crate) fn reply_runtime(&self) -> RuntimeClient {
+    self.reply.runtime.clone()
+  }
+
   pub fn source(&self) -> &NodeId {
     &self.source
   }

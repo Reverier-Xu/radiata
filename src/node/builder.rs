@@ -80,6 +80,7 @@ impl NodeBuilder {
           routes: Default::default(),
           events: Arc::clone(&events),
           member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
+          leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
           sync_round_requests: round_tx,
           connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
           runtime_seed: None,

@@ -401,6 +401,69 @@ pub(crate) async fn collect_before_ctx(
   records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
 }
 
+/// One journaled leave drive: the signed terminal record plus the intent
+/// coordinates. The record is signed exactly once and reused verbatim by
+/// re-drives and startup resume, so a re-announcement can never diverge
+/// from a record a peer already holds (divergent records fail closed).
+pub(crate) struct JournaledLeave {
+  pub(crate) record: LeaveRecordV1,
+  pub(crate) stored: StoreValue,
+  pub(crate) intent: LeaveIntentV1,
+}
+
+/// Phase J of the leave pipeline, before any network effect: journal the
+/// intent, then sign and persist the terminal record into the leave
+/// family (which the wipe deliberately spares). The intent leads so a
+/// crash in between resumes as "intent without record" — the record is
+/// signed fresh because nothing was announced yet. A crash after this
+/// phase resumes at startup with the same journaled record.
+pub(crate) async fn journal_leave(
+  context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+) -> Result<JournaledLeave> {
+  let store = context.store();
+  // A pending intent from a crashed earlier drive owns its journaled
+  // record: reuse it verbatim.
+  if let Some((stored, intent)) = discover_leave_intent(store).await? {
+    let record = self_leave_record(store, &intent.former_node)
+      .await?
+      .ok_or_else(|| Error::internal("journaled leave record"))?;
+    return Ok(JournaledLeave {
+      record,
+      stored,
+      intent,
+    });
+  }
+  let (stored, intent) = begin_intent(context, entropy).await?;
+  let record = sign_leave_record(context, keys).await?;
+  persist_leave_record_ctx(store, entropy, &record).await?;
+  Ok(JournaledLeave {
+    record,
+    stored,
+    intent,
+  })
+}
+
+/// The leaver's own journaled terminal record, when present (phase J or
+/// later). Snapshot reads only.
+async fn self_leave_record(store: &MetadataStore, node: &NodeId) -> Result<Option<LeaveRecordV1>> {
+  let namespace = leave_namespace()?;
+  let snapshot = store.snapshot().await?;
+  let Some(value) = snapshot.get(&namespace, &leave_record_key(node)).await? else {
+    return Ok(None);
+  };
+  Ok(Some(LeaveRecordV1::decode(value.as_bytes())?))
+}
+
+impl LeaveIntentV1 {
+  pub(crate) fn former_node(&self) -> &NodeId {
+    &self.former_node
+  }
+
+  pub(crate) fn replacement_node(&self) -> &NodeId {
+    &self.replacement_node
+  }
+}
+
 /// Discovers the pending leave-intent, if any.
 pub(crate) async fn discover_leave_intent(
   store: &MetadataStore,
@@ -595,7 +658,7 @@ async fn complete_leave(
 /// Runs the leave phases from the intent forward: replacement key, identity
 /// swap, metadata wipe, former-key deletion, completion. Idempotent and
 /// shared by the command path and the startup resume.
-async fn run_leave(
+pub(crate) async fn run_leave(
   store: &MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, stored: &StoreValue,
   intent: &LeaveIntentV1,
 ) -> Result<()> {
@@ -619,21 +682,26 @@ async fn run_leave(
   complete_leave(store, entropy, stored).await
 }
 
-/// Executes one active leave: journals the intent, then runs the phases.
-/// Returns the exact former and replacement identities for the outcome.
-/// A pending intent (left by a mid-phase failure) is resumed to
-/// completion instead of refusing: the operator can always re-drive a
-/// leave, and the resume is the same crash-recovery path startup uses.
+/// Test composition of the full drive without any announcement (the
+/// announcement is the sync plane's responsibility): journal the intent
+/// and record, then run the phases to completion.
+#[cfg(test)]
 pub(crate) async fn execute(
   context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
 ) -> Result<(NodeId, NodeId)> {
-  let store = context.store();
-  let (stored, intent) = match discover_leave_intent(store).await? {
-    Some((stored, intent)) => (stored, intent),
-    None => begin_intent(context, entropy).await?,
-  };
-  run_leave(store, keys, entropy, &stored, &intent).await?;
-  Ok((intent.former_node.clone(), intent.replacement_node.clone()))
+  let journaled = journal_leave(context, keys, entropy).await?;
+  run_leave(
+    context.store(),
+    keys,
+    entropy,
+    &journaled.stored,
+    &journaled.intent,
+  )
+  .await?;
+  Ok((
+    journaled.intent.former_node().clone(),
+    journaled.intent.replacement_node().clone(),
+  ))
 }
 
 /// Phase A: journals the leave-intent before any provider or identity
@@ -996,6 +1064,45 @@ mod tests {
   /// SC-G09-P0-21 (resume arm): a leave interrupted after the identity
   /// swap resumes to completion — never a mixed identity, a duplicate
   /// key, or restored old metadata.
+  /// The crash-retryable ordering (phase J leads): a journaled drive
+  /// reuses its signed record verbatim on re-drive, and a crash after
+  /// the journal resumes at startup to a fully replaced identity.
+  #[tokio::test]
+  async fn journaled_leave_is_idempotent_and_resumes() {
+    let factory = reference_factory();
+    let (keys, entropy, context) = open_store(&factory).await.unwrap();
+    seed_old_metadata(context.store(), entropy.as_ref())
+      .await
+      .unwrap();
+
+    let first = super::journal_leave(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap();
+    let again = super::journal_leave(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap();
+    assert_eq!(
+      first.record.encode().unwrap(),
+      again.record.encode().unwrap(),
+      "a re-drive reuses the journaled record verbatim"
+    );
+
+    // Simulate the crash: the drive never announces or rotates. The
+    // startup resume completes the phases with the same record.
+    let identity = resume_if_pending(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap()
+      .expect("the journaled leave resumes to a replacement identity");
+    assert_eq!(identity.node(), &first.intent.replacement_node);
+    // The leave is recorded, never forgotten: the former identity stays
+    // terminal evidence even after the wipe spares the leave family.
+    assert!(
+      is_left_ctx(context.store(), first.intent.former_node())
+        .await
+        .unwrap()
+    );
+  }
+
   #[tokio::test]
   async fn interrupted_leave_resumes_to_completion() {
     let factory = reference_factory();
