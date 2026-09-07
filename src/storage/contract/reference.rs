@@ -301,12 +301,28 @@ fn reference_commit(
   if transaction.base_revision() != &reference_revision(state.generation) {
     return Ok(CommitOutcome::Conflict);
   }
-  if !transaction
-    .operations()
-    .iter()
-    .all(|operation| crate::provider::condition_matches(&state.entries, &state.receipts, operation))
-  {
-    return Ok(CommitOutcome::Conflict);
+  for operation in transaction.operations() {
+    if !crate::provider::condition_matches(
+      |namespace: &StoreNamespace, key: &StoreKey| {
+        Ok(
+          state
+            .entries
+            .get(&(namespace.clone(), key.clone()))
+            .map(|value| value.digest().clone()),
+        )
+      },
+      |transaction: &TransactionId| {
+        Ok(
+          state
+            .receipts
+            .get(transaction)
+            .map(|receipt| receipt.operation_digest().clone()),
+        )
+      },
+      operation,
+    )? {
+      return Ok(CommitOutcome::Conflict);
+    }
   }
 
   let next_generation = state.generation.checked_add(1).ok_or_else(|| {

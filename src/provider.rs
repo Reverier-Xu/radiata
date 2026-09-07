@@ -693,18 +693,18 @@ fn digest_store_value(value: &[u8]) -> Digest {
   Digest::from_bytes(hasher.finalize().into())
 }
 
-/// Evaluates one conditional operation against the current entries and
-/// receipts. This is the single definition shared by every storage adapter
-/// AND the reference provider in the storage contract suite, so a condition
-/// bug cannot hide by being copied into both the oracle and the adapter
-/// under test. Without the `json` feature the only callers live in test
-/// builds (the contract suite), which is intentionally allowed.
-#[cfg_attr(not(feature = "json"), allow(dead_code))]
+/// Evaluates one conditional operation against closure lookups over the
+/// committing state: `entry` resolves one record to its content digest
+/// (None when absent) and `receipt` resolves one transaction id to its
+/// operation digest. This is the single definition shared by every
+/// storage adapter AND the reference provider in the storage contract
+/// suite, so a condition bug cannot hide by being copied into both the
+/// oracle and the adapter under test.
 pub(crate) fn condition_matches(
-  entries: &std::collections::BTreeMap<(StoreNamespace, StoreKey), StoreValue>,
-  receipts: &std::collections::BTreeMap<TransactionId, CommitReceipt>, operation: &StoreOperation,
-) -> bool {
-  match operation {
+  mut entry: impl FnMut(&StoreNamespace, &StoreKey) -> Result<Option<Digest>>,
+  mut receipt: impl FnMut(&TransactionId) -> Result<Option<Digest>>, operation: &StoreOperation,
+) -> Result<bool> {
+  Ok(match operation {
     StoreOperation::Check {
       namespace,
       key,
@@ -715,28 +715,23 @@ pub(crate) fn condition_matches(
       key,
       expected,
       ..
-    } => expectation_matches(entries.get(&(namespace.clone(), key.clone())), expected),
+    } => expectation_matches(entry(namespace, key)?, expected),
     StoreOperation::Delete {
       namespace,
       key,
       expected,
-    } => entries
-      .get(&(namespace.clone(), key.clone()))
-      .is_some_and(|value| value.digest() == expected),
+    } => entry(namespace, key)?.is_some_and(|digest| &digest == expected),
     StoreOperation::ForgetReceipt {
       transaction,
       expected_operation_digest,
-    } => receipts
-      .get(transaction)
-      .is_some_and(|receipt| receipt.operation_digest() == expected_operation_digest),
-  }
+    } => receipt(transaction)?.is_some_and(|digest| &digest == expected_operation_digest),
+  })
 }
 
-#[cfg_attr(not(feature = "json"), allow(dead_code))]
-fn expectation_matches(value: Option<&StoreValue>, expected: &StoreExpectation) -> bool {
-  match (value, expected) {
+fn expectation_matches(digest: Option<Digest>, expected: &StoreExpectation) -> bool {
+  match (digest, expected) {
     (None, StoreExpectation::Absent) => true,
-    (Some(value), StoreExpectation::Exact(digest)) => value.digest() == digest,
+    (Some(digest), StoreExpectation::Exact(expected)) => &digest == expected,
     _ => false,
   }
 }

@@ -328,11 +328,31 @@ impl JsonStorage {
     }
     if transaction.operation_digest() != &transaction.computed_operation_digest()
       || transaction.base_revision().as_bytes() != state.generation.to_be_bytes()
-      || !transaction.operations().iter().all(|operation| {
-        crate::provider::condition_matches(&state.entries, &state.receipts, operation)
-      })
     {
       return Ok(CommitOutcome::Conflict);
+    }
+    for operation in transaction.operations() {
+      if !crate::provider::condition_matches(
+        |namespace: &StoreNamespace, key: &StoreKey| {
+          Ok(
+            state
+              .entries
+              .get(&(namespace.clone(), key.clone()))
+              .map(|value| value.digest().clone()),
+          )
+        },
+        |transaction: &TransactionId| {
+          Ok(
+            state
+              .receipts
+              .get(transaction)
+              .map(|receipt| receipt.operation_digest().clone()),
+          )
+        },
+        operation,
+      )? {
+        return Ok(CommitOutcome::Conflict);
+      }
     }
     let next_generation = state
       .generation

@@ -15,9 +15,9 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 
 use crate::{
   BoxFuture, CommitOutcome, CommitReceipt, Digest, DurabilityLevel, Error, ProviderErrorContext,
-  ProviderErrorKind, ReconcileOutcome, Result, StoreCapabilities, StoreEntry, StoreExpectation,
-  StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction,
-  StoreValue, TransactionId,
+  ProviderErrorKind, ReconcileOutcome, Result, StoreCapabilities, StoreEntry, StoreKey,
+  StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
+  TransactionId,
   provider::{Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -363,20 +363,6 @@ fn snapshot_revision(transaction: &redb::ReadTransaction) -> Result<StoreRevisio
   StoreRevision::new(Arc::from(generation.to_be_bytes()))
 }
 
-fn expectation_matches_table(
-  entries: &impl ReadableTable<&'static [u8], &'static [u8]>, namespace: &StoreNamespace,
-  key: &StoreKey, expected: &StoreExpectation,
-) -> Result<bool> {
-  let stored = entries
-    .get(&*composite_key(namespace, key))
-    .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
-  Ok(match (stored, expected) {
-    (None, StoreExpectation::Absent) => true,
-    (Some(guard), StoreExpectation::Exact(digest)) => owned_value(guard.value()).digest() == digest,
-    _ => false,
-  })
-}
-
 fn initialize(database: &Database) -> Result<()> {
   let mut write = database
     .begin_write()
@@ -449,35 +435,18 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
       return Ok(CommitOutcome::Conflict);
     }
     for operation in transaction.operations() {
-      let matches = match operation {
-        StoreOperation::Check {
-          namespace,
-          key,
-          expected,
-        }
-        | StoreOperation::Put {
-          namespace,
-          key,
-          expected,
-          ..
-        } => expectation_matches_table(&entries, namespace, key, expected)?,
-        StoreOperation::Delete {
-          namespace,
-          key,
-          expected,
-        } => {
+      if !crate::provider::condition_matches(
+        |namespace: &StoreNamespace, key: &StoreKey| {
           let stored = entries
             .get(&*composite_key(namespace, key))
             .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
-          stored.is_some_and(|guard| owned_value(guard.value()).digest() == expected)
-        }
-        StoreOperation::ForgetReceipt {
-          transaction: forgotten,
-          expected_operation_digest,
-        } => read_receipt(&receipts, forgotten)?
-          .is_some_and(|receipt| receipt.operation_digest() == expected_operation_digest),
-      };
-      if !matches {
+          Ok(stored.map(|guard| owned_value(guard.value()).digest().clone()))
+        },
+        |forgotten: &TransactionId| {
+          Ok(read_receipt(&receipts, forgotten)?.map(|receipt| receipt.operation_digest().clone()))
+        },
+        operation,
+      )? {
         return Ok(CommitOutcome::Conflict);
       }
     }
