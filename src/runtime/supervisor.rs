@@ -586,6 +586,7 @@ fn session_packet_context(
     dependencies.sessions.clone(),
     dependencies.routes.clone(),
     crate::session::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
+    dependencies.config.trace_metadata_limits().active(),
     dependencies.config.parser_cbor_limits(),
   )
 }

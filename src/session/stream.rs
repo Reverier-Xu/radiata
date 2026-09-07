@@ -150,6 +150,9 @@ pub(crate) struct SessionPacketContext {
   sessions: SessionTable,
   routes: RouteTable,
   forwarding_capacity: usize,
+  /// The node's configured bound on in-memory terminal route records;
+  /// admission rejections must respect it like every other writer (G6-02).
+  route_capacity: usize,
   parser_limits: crate::protocol::CborLimits,
 }
 
@@ -162,7 +165,8 @@ impl SessionPacketContext {
     runtime: crate::runtime::RuntimeClient, clock: Arc<dyn crate::storage::receipt::WallClock>,
     entropy: Arc<dyn crate::api::Entropy>, events: Arc<crate::node::EventHub>,
     route_policy: Option<QualifiedTag>, sessions: SessionTable, routes_clone: RouteTable,
-    forwarding_capacity: usize, parser_limits: crate::protocol::CborLimits,
+    forwarding_capacity: usize, route_capacity: usize,
+    parser_limits: crate::protocol::CborLimits,
   ) -> Self {
     Self {
       local,
@@ -177,6 +181,7 @@ impl SessionPacketContext {
       sessions,
       routes: routes_clone,
       forwarding_capacity,
+      route_capacity,
       parser_limits,
     }
   }
@@ -193,6 +198,11 @@ impl SessionPacketContext {
   /// The caller-selected bound on concurrently forwarded routes.
   pub(crate) const fn forwarding_capacity(&self) -> usize {
     self.forwarding_capacity
+  }
+
+  /// The caller-selected bound on in-memory terminal route records.
+  pub(crate) const fn route_capacity(&self) -> usize {
+    self.route_capacity
   }
 
   /// The caller-selected packet parser limits (G3's checked finite limits).
@@ -1150,9 +1160,15 @@ async fn admit_open(
       }
       // Unknown protocol tag or owning feature not selected on this
       // session: rejected before admission, never reaching a consumer.
-      // The rejection is recorded as bounded terminal route metadata.
+      // The rejection is recorded as bounded terminal route metadata
+      // within the node's configured route-record capacity.
       _ => {
-        record_rejection(&context.routes, &trace_id, ErrorKind::Unsupported);
+        record_rejection(
+          &context.routes,
+          context.route_capacity(),
+          &trace_id,
+          ErrorKind::Unsupported,
+        );
         AckStatus::Unsupported
       }
     }
@@ -1591,8 +1607,11 @@ pub(crate) fn opening_context_digest(
 }
 
 /// Records one bounded terminal route fact for an admission rejection:
-/// identity and typed failure only, never payload bytes.
-fn record_rejection(routes: &RouteTable, trace_id: &TraceId, kind: ErrorKind) {
+/// identity and typed failure only, never payload bytes, always within
+/// the node's configured route-record capacity.
+fn record_rejection(
+  routes: &RouteTable, capacity: usize, trace_id: &TraceId, kind: ErrorKind,
+) {
   // A trace already carrying a terminal fact never grows the table.
   if routes
     .lock()
@@ -1603,7 +1622,7 @@ fn record_rejection(routes: &RouteTable, trace_id: &TraceId, kind: ErrorKind) {
   }
   let mut record = RouteRecord::failing(trace_id.clone());
   record.update(RouteState::Failed(kind));
-  let _ = insert_route(routes, usize::MAX, record);
+  let _ = insert_route(routes, capacity, record);
 }
 
 #[cfg(test)]
@@ -2183,8 +2202,8 @@ mod admission_tests {
   #[tokio::test]
   async fn rejections_record_one_terminal_fact() {
     let routes: super::RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-    super::record_rejection(&routes, &trace(9), crate::ErrorKind::Unsupported);
-    super::record_rejection(&routes, &trace(9), crate::ErrorKind::Unsupported);
+    super::record_rejection(&routes, 8, &trace(9), crate::ErrorKind::Unsupported);
+    super::record_rejection(&routes, 8, &trace(9), crate::ErrorKind::Unsupported);
 
     let table = routes.lock().unwrap();
     assert_eq!(table.len(), 1);
@@ -2194,5 +2213,23 @@ mod admission_tests {
       crate::RouteState::Failed(crate::ErrorKind::Unsupported)
     ));
     assert!(record.selected_node.is_none());
+  }
+
+  /// A rejection never grows the table past the node's configured route
+  /// capacity: the oldest terminal record is evicted to make room.
+  #[tokio::test]
+  async fn rejections_stay_within_the_route_capacity() {
+    let routes: super::RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    for seed in 1..=4 {
+      super::record_rejection(&routes, 3, &trace(seed), crate::ErrorKind::Unsupported);
+    }
+
+    let table = routes.lock().unwrap();
+    assert_eq!(table.len(), 3);
+    assert!(
+      !table.contains_key(&trace(1)),
+      "the oldest rejection is evicted once the table is full"
+    );
+    assert!(table.contains_key(&trace(4)));
   }
 }
