@@ -7,4 +7,6 @@
 #[path = "common_impl.rs"]
 pub mod common;
 
+pub mod topology;
+
 pub use common::FileKeyProvider;

@@ -1,0 +1,10 @@
+target
+slo/target
+fuzz
+docs
+scripts
+tests
+test-support/tests
+.github
+.git
+tmp

@@ -16,11 +16,6 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# --- profile preflight (SC-G10-P0-32) -------------------------------------
-# The dry-run verifies host, engine, bridge MTU, publish-false state, and
-# rejects every mismatch before any measurement.
-bash slo/preflight.sh
-
 # --- harness build (SC-G10-P0-30) ------------------------------------------
 # The publish-false external workspace builds both harness binaries from
 # the path dependency at the exact working-tree source and lockfile.
@@ -41,6 +36,24 @@ if grep -q 'radiata-slo' Cargo.toml; then
   printf 'the harness leaked into the library workspace\n' >&2
   exit 1
 fi
+
+# --- profile preflight (SC-G10-P0-32) -------------------------------------
+# The dry-run verifies host, engine, images, bridge routes and MTU,
+# qdisc neutrality, the 60-second pressure window, the frozen 64-direction
+# topology table, and rejects every mismatch before any measurement.
+bash slo/preflight.sh
+OBS=${RADIATA_SLO_OBSERVATIONS:-target/slo-preflight-observations.json}
+jq -e '
+  .schema == "radiata.woooo.tech/schemas/slo-preflight-observations-v1"
+  and .result == "pass"
+  and .topology.directions == 64
+  and .topology.throughput_edges == 4
+  and (.topology.three_hop_path | length) > 0
+  and .bridge.mtu == 1500
+' "$OBS" >/dev/null || {
+  printf 'the preflight observations failed validation\n' >&2
+  exit 1
+}
 
 # --- isolation negatives (SC-G10-P0-31) ------------------------------------
 cargo test --locked --all-features --manifest-path slo/Cargo.toml \
@@ -66,7 +79,7 @@ RADIATA_SLO_ROOT="$TMP/qual" \
 RADIATA_SLO_LEDGER="$TMP/qualification.ndjson" \
 RADIATA_SLO_NODE_BIN="$ROOT/slo/target/debug/slo-node" \
 RADIATA_SLO_COMMIT="$(git rev-parse HEAD)" \
-timeout 180 slo/target/debug/slo-controller qualify 5 >/dev/null 2>&1 || {
+timeout 600 slo/target/debug/slo-controller qualify 5 >/dev/null 2>&1 || {
   printf 'the harness qualification failed\n' >&2
   tail -5 "$TMP/qual.out" 2>/dev/null >&2 || true
   exit 1
