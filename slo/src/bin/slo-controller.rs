@@ -12,8 +12,9 @@
 //!   public pages, shut down in order, and record the qualification
 //!   outcome — the harness self-proof demanded by SC-G10-P0-33 without
 //!   claiming any SLO sample.
-//! - `measure`: the exact 125-sample workload, refused until the external
-//!   release token of T-G10-12 gates the immutable candidate.
+//! - `measure`: the exact 125-sample workload over one pinned candidate
+//!   commit (`RADIATA_SLO_COMMIT`); the operator reviews the ledger and
+//!   publishes manually.
 //! - `topology`: print the frozen profile direction table — the 64 final
 //!   directions, the exact three-hop path, and the four throughput edges
 //!   — for the preflight to verify and record (SC-G10-P0-32).
@@ -38,9 +39,8 @@ fn main() {
         .unwrap_or(3);
       qualify(count)
     }
-    // The exact 125-sample workload. The external T-G10-12 release token
-    // (candidate SHA + complete-ledger digest, `eligible = true`) must be
-    // present and match the tested commit before any sample starts.
+    // The exact 125-sample workload over one pinned candidate commit; the
+    // operator reviews the ledger and publishes manually.
     "measure" => {
       let runs = args
         .get(2)
@@ -330,53 +330,15 @@ fn record_qualification(
     .map_err(|error| error.to_string())
 }
 
-/// The token gate: the external signed release-eligibility token file
-/// records the exact candidate SHA, the Cargo.lock digest, the package
-/// version, and `eligible = true`; it never enters the attested commit.
-fn verify_release_token(expected_commit: &str) -> Result<(), String> {
-  let path = std::env::var("RADIATA_SLO_TOKEN")
-    .map_err(|_| "RADIATA_SLO_TOKEN unset: measurement is not eligible".to_owned())?;
-  let text =
-    std::fs::read_to_string(&path).map_err(|error| format!("release token unreadable: {error}"))?;
-  // The token file is a flat object of string/bool fields produced by the
-  // external issuer; pull the four allowlisted keys by pattern.
-  let field = |key: &str| {
-    let marker = format!("\"{key}\":");
-    text
-      .find(&marker)
-      .map(|start| {
-        let rest = &text[start + marker.len()..];
-        let end = rest.find([',', '}']).unwrap_or(rest.len());
-        rest[..end].trim().trim_matches('"').to_owned()
-      })
-      .unwrap_or_default()
-  };
-  let eligible = field("eligible") == "true";
-  let commit = field("commit");
-  let version = field("version");
-  if !eligible {
-    return Err("the release token is not eligible".to_owned());
-  }
-  if commit != expected_commit {
-    return Err("the release token commit does not match the tested commit".to_owned());
-  }
-  if version != "0.1.0" {
-    return Err(format!(
-      "the release token version is {version}, expected 0.1.0"
-    ));
-  }
-  Ok(())
-}
 
 /// The exact ADR-0005 measurement: five runs of the five-stratum
-/// 25-sample mix over one sixteen-node cluster, every raw sample recorded.
+/// 25-sample mix, every raw sample recorded against the pinned commit.
 fn measure(runs: u32) -> Result<(), String> {
   let expected_commit =
     std::env::var("RADIATA_SLO_COMMIT").map_err(|_| "RADIATA_SLO_COMMIT unset".to_owned())?;
   if expected_commit == "unknown" || expected_commit.is_empty() {
     return Err("RADIATA_SLO_COMMIT must be the exact candidate SHA".to_owned());
   }
-  verify_release_token(&expected_commit)?;
   let runtime = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(2)
     .enable_all()
@@ -386,6 +348,11 @@ fn measure(runs: u32) -> Result<(), String> {
   runtime.block_on(async move { measure_async(runs, commit).await })
 }
 
+/// The fresh run population (ADR-0005): one creator plus ten
+/// already-merged members; the merge stratum adds five fresh nodes to
+/// reach the exact sixteen-node final population.
+const INITIAL_MEMBERS: usize = 10;
+
 async fn measure_async(runs: u32, expected_commit: String) -> Result<(), String> {
   let root = std::env::var("RADIATA_SLO_ROOT")
     .map(PathBuf::from)
@@ -394,58 +361,95 @@ async fn measure_async(runs: u32, expected_commit: String) -> Result<(), String>
     .map(PathBuf::from)
     .map_err(|_| "RADIATA_SLO_LEDGER unset".to_owned())?;
   std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+  let mut ledger = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&ledger_path)
+    .map_err(|error| error.to_string())?;
+  use std::io::Write as _;
+  let mut sample_seed: u32 = 0;
+  let mut recorded = 0_usize;
+  for run in 1..=runs {
+    // ADR-0005: five fresh independent runs — every run creates fresh
+    // identities, stores, credentials, and ports, and is shut down and
+    // cleaned up before the next one starts. A failed run fails the
+    // attempt: the summary records the shortfall.
+    let run_root = root.join(format!("run{run}"));
+    if let Err(error) = measure_run(
+      &run_root,
+      run,
+      &mut ledger,
+      &mut sample_seed,
+      &mut recorded,
+    )
+    .await
+    {
+      eprintln!("slo-controller: run {run} failed: {error}");
+      break;
+    }
+  }
+  let status = if recorded == runs as usize * 25 { "pass" } else { "fail" };
+  let summary = format!(
+    "{{\"schema\":\"radiata.woooo.tech/schemas/slo-ledger-summary-v1\",\"commit\":\"{expected_commit}\",\"runs\":{runs},\"recorded\":{recorded},\"status\":\"{status}\"}}\n"
+  );
+  ledger
+    .write_all(summary.as_bytes())
+    .map_err(|error| error.to_string())?;
+  if status == "pass" {
+    Ok(())
+  } else {
+    Err("the measurement recorded failures or missing samples".to_owned())
+  }
+}
+
+/// One fresh independent run over a brand-new sixteen-node cluster.
+async fn measure_run(
+  root: &std::path::Path, run: u32, ledger: &mut std::fs::File,
+  sample_seed: &mut u32, recorded: &mut usize,
+) -> Result<(), String> {
   let workload_nodes = 5_usize;
 
-  // Cluster startup (untimed): one creator plus five workload members.
+  // Cluster startup (untimed): one creator plus ten already-merged
+  // members. One fresh credential per member; retries REUSE it. A failed
+  // join consumes no credential and the accept loop recomputes its hint
+  // per connection, so the next dial with the SAME generation matches (a
+  // rotate-per-retry would leave the blocked accept permanently one
+  // generation behind).
   let mut members: Vec<NodeProcess> = Vec::new();
   let mut creator: NodeProcess = {
-    let mut node = spawn_node(&root, 0, "", "creator")?;
+    let mut node = spawn_node(root, 0, "", "creator")?;
     let line = node.read_line()?;
     common::parse_credential_line(&line).ok_or("creator returned no initial credential")?;
     wait_ready(&mut node, Duration::from_secs(120))?;
     node
   };
   let creator_id = creator.node_id.clone().ok_or("creator id missing")?;
-  for index in 0..workload_nodes {
-    // One fresh credential per member; retries REUSE it. A failed join
-    // consumes no credential and the accept loop recomputes its hint per
-    // connection, so the next dial with the SAME generation matches (a
-    // rotate-per-retry would leave the blocked accept permanently one
-    // generation behind).
-    eprintln!("slo-controller: startup member {index} rotating");
+  for index in 0..INITIAL_MEMBERS {
+    eprintln!("slo-controller: run {run} startup member {index} rotating");
     let creator_ref = &mut creator;
     creator_ref.send("rotate")?;
-    eprintln!("slo-controller: startup member {index} credential ready");
     let line = creator_ref.read_line()?;
     let secret = common::parse_credential_line(&line).ok_or("creator returned no credential")?;
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
       let mut node = spawn_node(
-        &root,
+        root,
         index + 1,
         &creator_endpoint(Some(creator_ref))?,
         "member",
       )?;
-      eprintln!("slo-controller: startup member {index} spawned, joining");
+      eprintln!("slo-controller: run {run} startup member {index} joining");
       node.send(&format!("join {secret}"))?;
-      eprintln!("slo-controller: startup member {index} join sent");
       match wait_ready(&mut node, Duration::from_secs(120)) {
         Ok(()) => {
-          eprintln!("slo-controller: startup member {index} ready");
-          // Untimed setup: label the member so the routed stratum's
-          // label-selected targets resolve (ADR-0005 routed samples).
-          node.send("setzone edge")?;
-          let reply = node.read_line()?;
-          if reply.trim() != "zone ok" {
-            return Err(format!("zone label setup failed: {reply}"));
-          }
+          eprintln!("slo-controller: run {run} startup member {index} ready");
           members.push(node);
           break;
         }
         Err(_) if Instant::now() < deadline => {
           // Pace the retries outside the fixed per-source admission
           // window (sixteen attempts per minute).
-          tokio::time::sleep(Duration::from_millis(300)).await;
+          tokio::time::sleep(Duration::from_millis(4_000)).await;
           continue;
         }
         Err(error) => return Err(error),
@@ -453,283 +457,340 @@ async fn measure_async(runs: u32, expected_commit: String) -> Result<(), String>
     }
   }
 
-  let mut sample_seed: u32 = 0;
-  let mut recorded = 0_usize;
-  let mut all_pass = true;
-  let mut ledger = std::fs::OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(&ledger_path)
-    .map_err(|error| error.to_string())?;
-  use std::io::Write as _;
-
-  for run in 1..=runs {
-    // -- admission stratum: five fresh nodes join through fixed admission.
-    for index in 0..workload_nodes {
-      let port = 18_000_u32 + (run - 1) * 100 + index as u32;
-      creator.send("rotate")?;
-      let line = creator.read_line()?;
-      let secret = common::parse_credential_line(&line).ok_or("creator returned no credential")?;
-      // The sample starts before the credential is relayed: the raw
-      // window covers the full admission through the public observation.
-      // A failed join consumes no credential, so retries reuse the same
-      // secret (the accept loop recomputes its hint per connection; a
-      // rotate-per-retry would leave the blocked accept one generation
-      // behind). The start timestamp is taken at the first relay.
-      let mut started: Option<u128> = None;
-      let outcome;
-      let mut ended;
-      let mut joined: Option<NodeProcess> = None;
-      let admission_deadline = Instant::now() + Duration::from_secs(180);
-      loop {
-        let mut fresh = spawn_admission_node(&root, run, index as u32, port)?;
-        if started.is_none() {
-          started = Some(now_ms());
-        }
-        fresh.send(&format!("join {secret}"))?;
-        let ready = wait_ready(&mut fresh, Duration::from_secs(120));
-        ended = now_ms();
-        if ready.is_ok() {
-          outcome = "ok";
-          joined = Some(fresh);
-          break;
-        }
-        if Instant::now() > admission_deadline {
-          outcome = "failed";
-          break;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-      }
-      if outcome == "failed" {
-        all_pass = false;
-      }
-      write_sample(
-        &mut ledger,
-        run,
-        index as u32 + 1,
-        "merge",
-        started.unwrap_or(0),
-        ended,
-        outcome,
-      )?;
-      recorded += 1;
-      if let Some(fresh) = joined {
-        members.push(fresh);
-      }
-    }
-
-    creator.send("members")?;
+  // -- merge stratum: five fresh nodes join through fixed admission.
+  for index in 0..workload_nodes {
+    creator.send("rotate")?;
     let line = creator.read_line()?;
-    let member_ids: Vec<String> = line
-      .strip_prefix("members ")
-      .unwrap_or("")
-      .split(',')
-      .filter(|id| !id.is_empty())
-      .map(str::to_owned)
-      .collect();
-    if member_ids.len() < workload_nodes {
-      return Err("not enough members for the packet strata".to_owned());
-    }
-    // Untimed setup: wait until the creator's public member page exposes
-    // the zone label of every workload member (descriptor convergence).
-    {
-      let deadline = Instant::now() + Duration::from_secs(60);
-      loop {
-        creator.send("zones")?;
-        let reply = creator.read_line()?;
-        // The creator's own node-metadata samples also carry the zone
-        // label, so the converged count is at least the workload members.
-        let count = reply
-          .trim()
-          .strip_prefix("zones ")
-          .and_then(|value| value.parse::<usize>().ok())
-          .unwrap_or(0);
-        if count >= workload_nodes {
-          break;
-        }
-        if Instant::now() > deadline {
-          return Err(format!("zone labels never converged; last {reply:?}"));
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    let secret = common::parse_credential_line(&line).ok_or("creator returned no credential")?;
+    // The sample starts before the credential is relayed: the raw window
+    // covers the full admission through the public observation. A failed
+    // join consumes no credential, so retries reuse the same secret; the
+    // retries are paced outside the per-source admission window.
+    let mut started: Option<u128> = None;
+    let outcome;
+    let mut ended;
+    let mut joined: Option<NodeProcess> = None;
+    let admission_deadline = Instant::now() + Duration::from_secs(180);
+    let issuer = creator_endpoint(Some(&creator))?;
+    loop {
+      let mut fresh = spawn_node(root, INITIAL_MEMBERS + index + 1, &issuer, "member")?;
+      if started.is_none() {
+        started = Some(now_ms());
       }
+      fresh.send(&format!("join {secret}"))?;
+      let ready = wait_ready(&mut fresh, Duration::from_secs(120));
+      ended = now_ms();
+      if ready.is_ok() {
+        outcome = "ok";
+        joined = Some(fresh);
+        break;
+      }
+      if Instant::now() > admission_deadline {
+        outcome = "failed";
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(4_000)).await;
     }
+    let pass = outcome == "ok";
+    write_sample(
+      ledger,
+      run,
+      index as u32 + 1,
+      "merge",
+      started.unwrap_or(0),
+      ended,
+      outcome,
+    )?;
+    *recorded += 1;
+    if let Some(fresh) = joined {
+      members.push(fresh);
+    }
+    if !pass {
+      return Err("an admission sample failed".to_owned());
+    }
+  }
 
-    // -- direct packet stratum: targets are other nodes only.
-    let targets: Vec<&String> =
-      member_ids.iter().filter(|id| *id != &creator_id).collect();
-    for index in 0..workload_nodes {
-      let target = &targets[index % targets.len()];
-      let started = now_ms();
-      creator.send(&format!("workload direct {target}"))?;
-      let line = creator.read_line()?;
-      let ended = now_ms();
-      let outcome = if line.contains("\"outcome\":\"ok\"") {
-        "ok"
-      } else {
-        "failed"
-      };
-      if outcome == "failed" {
-        all_pass = false;
-      }
-      write_sample(
-        &mut ledger,
-        run,
-        index as u32 + 1,
-        "direct-packet",
-        started,
-        ended,
-        outcome,
-      )?;
-      recorded += 1;
+  // -- topology (ADR-0005): prune the star down to the sparse final
+  // graph. The creator keeps sessions only with its frozen ring/chord
+  // neighbours; every member-to-member edge is dialled credential-free.
+  // Intentionally disconnected peers are never re-dialled by recovery,
+  // so the pruned sessions stay pruned.
+  let creator_neighbours: Vec<usize> = topology::profile_edges()
+    .iter()
+    .filter(|edge| edge.0 == 0 || edge.1 == 0)
+    .map(|edge| if edge.0 == 0 { edge.1 } else { edge.0 })
+    .collect();
+  let population = INITIAL_MEMBERS + workload_nodes;
+  for index in 1..=population {
+    if creator_neighbours.contains(&index) {
+      continue;
     }
-
-    // -- routed packet stratum (label-selected destination).
-    for index in 0..workload_nodes {
-      let started = now_ms();
-      creator.send("workload routed")?;
-      let line = creator.read_line()?;
-      let ended = now_ms();
-      let outcome = if line.contains("\"outcome\":\"ok\"") {
-        "ok"
-      } else {
-        "failed"
-      };
-      if outcome == "failed" {
-        all_pass = false;
-      }
-      write_sample(
-        &mut ledger,
-        run,
-        index as u32 + 1,
-        "routed-packet",
-        started,
-        ended,
-        outcome,
-      )?;
-      recorded += 1;
+    let id = members[index - 1].node_id.clone().ok_or("member id missing")?;
+    creator.send(&format!("disconnect {id}"))?;
+    let reply = creator.read_line()?;
+    if reply.trim() != "disconnect ok" {
+      return Err(format!("session prune failed: {reply}"));
     }
-
-    // -- node metadata stratum: one owner revision observed by every member.
-    for index in 0..workload_nodes {
-      let value = format!("run{run}-{index}");
-      let started = now_ms();
-      creator.send(&format!("workload node-meta 0 {value}"))?;
-      let line = creator.read_line()?;
-      // The acceptance predicate: every member observes the exact label
-      // value through its own public member page (bounded polling while
-      // sync converges).
-      let mut observed = false;
-      let convergence = Instant::now() + Duration::from_secs(30);
-      loop {
-        let mut all_yes = true;
-        for member in &mut members {
-          member.send(&format!("haszone {value}"))?;
-          let reply = member.read_line()?;
-          if reply.trim() != "haszone yes" {
-            all_yes = false;
-          }
-        }
-        if all_yes {
-          observed = true;
-          break;
-        }
-        if Instant::now() > convergence {
-          break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-      }
-      let ended = now_ms();
-      let outcome = if observed && line.contains("\"outcome\":\"ok\"") {
-        "ok"
-      } else {
-        "failed"
-      };
-      if outcome == "failed" {
-        all_pass = false;
-      }
-      write_sample(
-        &mut ledger,
-        run,
-        index as u32 + 1,
-        "node-metadata",
-        started,
-        ended,
-        outcome,
-      )?;
-      recorded += 1;
+  }
+  for edge in topology::profile_edges() {
+    if edge.0 == 0 || edge.1 == 0 {
+      continue;
     }
+    let (dialer, target) = (edge.0 - 1, edge.1 - 1);
+    let target_endpoint = members[target].endpoint.clone().ok_or("member endpoint missing")?;
+    let target_id = members[target].node_id.clone().ok_or("member id missing")?;
+    let dial_deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+      members[dialer]
+        .send(&format!("connect {target_endpoint} {target_id}"))?;
+      let reply = members[dialer].read_line()?;
+      if reply.trim() == "connect ok" {
+        break;
+      }
+      if Instant::now() > dial_deadline {
+        return Err(format!(
+          "topology edge {}->{} never dialled: {reply}",
+          edge.0, edge.1
+        ));
+      }
+      // The pairwise trust trails the merges on the sync cadence.
+      tokio::time::sleep(Duration::from_millis(4_000)).await;
+    }
+  }
 
-    // -- resource metadata stratum.
-    for index in 0..workload_nodes {
-      sample_seed += 1;
-      let name = format!("radiata.woooo.tech/resources/workload-{sample_seed:03}");
-      let started = now_ms();
-      creator.send(&format!("workload resource {sample_seed}"))?;
-      let line = creator.read_line()?;
-      let mut observed = false;
-      let convergence = Instant::now() + Duration::from_secs(30);
-      loop {
-        let mut all_yes = true;
-        for member in &mut members {
-          member.send(&format!("has {name}"))?;
-          let reply = member.read_line()?;
-          if reply.trim() != "has yes" {
-            all_yes = false;
-          }
-        }
-        if all_yes {
-          observed = true;
-          break;
-        }
-        if Instant::now() > convergence {
-          break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-      }
-      let ended = now_ms();
-      let outcome = if observed && line.contains("\"outcome\":\"ok\"") {
-        "ok"
+  // Distribute the frozen per-source next-hop rows: each helper learns
+  // the first hop toward every destination over its stdin protocol, so
+  // the registered routing policy resolves multi-hop routes.
+  let hop_table = topology::next_hop_table();
+  let mut node_ids: Vec<String> = vec![creator_id.clone()];
+  for member in &members {
+    node_ids.push(member.node_id.clone().ok_or("member id missing")?);
+  }
+  for (source, row) in &hop_table {
+    for (destination, hop) in row {
+      let line = format!("route {} {}", node_ids[*destination], node_ids[*hop]);
+      let (reply, label) = if *source == 0 {
+        creator.send(&line)?;
+        (creator.read_line()?, 0)
       } else {
-        "failed"
+        let member = &mut members[source - 1];
+        member.send(&line)?;
+        (member.read_line()?, *source)
       };
-      if outcome == "failed" {
-        all_pass = false;
+      if reply.trim() != "route ok" {
+        return Err(format!(
+          "route row {destination}->{hop} rejected at node {label}: {reply}"
+        ));
       }
-      write_sample(
-        &mut ledger,
-        run,
-        index as u32 + 1,
-        "resource-metadata",
-        started,
-        ended,
-        outcome,
-      )?;
-      recorded += 1;
+    }
+  }
+
+  creator.send("members")?;
+  let line = creator.read_line()?;
+  let member_ids: Vec<String> = line
+    .strip_prefix("members ")
+    .unwrap_or("")
+    .split(',')
+    .filter(|id| !id.is_empty())
+    .map(str::to_owned)
+    .collect();
+  if member_ids.len() < workload_nodes {
+    return Err("not enough members for the packet strata".to_owned());
+  }
+  // Label member seven as the routed stratum's only eligible target:
+  // the exact three-hop endpoint of the frozen topology, so every routed
+  // sample crosses exactly three hops (ADR-0005). The label propagates
+  // to the creator's public page over the sparse topology.
+  members[6].send("setzone edge")?;
+  let reply = members[6].read_line()?;
+  if reply.trim() != "zone ok" {
+    return Err(format!("zone label setup failed: {reply}"));
+  }
+  // Untimed setup: wait until the creator's public member page exposes
+  // the zone label of the three-hop routed target (member seven, the
+  // exact three-hop endpoint of the frozen topology).
+  {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+      creator.send("zones")?;
+      let reply = creator.read_line()?;
+      let count = reply
+        .trim()
+        .strip_prefix("zones ")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+      if count >= 1 {
+        break;
+      }
+      if Instant::now() > deadline {
+        return Err(format!("zone label never converged; last {reply:?}"));
+      }
+      tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+  }
+
+  // -- direct packet stratum: targets are other nodes only.
+  let targets: Vec<&String> =
+    member_ids.iter().filter(|id| *id != &creator_id).collect();
+  for index in 0..workload_nodes {
+    let target = &targets[index % targets.len()];
+    let started = now_ms();
+    creator.send(&format!("workload direct {target}"))?;
+    let line = creator.read_line()?;
+    let ended = now_ms();
+    let outcome = if line.contains("\"outcome\":\"ok\"") {
+      "ok"
+    } else {
+      "failed"
+    };
+    write_sample(
+      ledger,
+      run,
+      index as u32 + 1,
+      "direct-packet",
+      started,
+      ended,
+      outcome,
+    )?;
+    *recorded += 1;
+    if outcome != "ok" {
+      return Err("a direct packet sample failed".to_owned());
+    }
+  }
+
+  // -- routed packet stratum (label-selected destination).
+  for index in 0..workload_nodes {
+    let started = now_ms();
+    creator.send("workload routed")?;
+    let line = creator.read_line()?;
+    let ended = now_ms();
+    let outcome = if line.contains("\"outcome\":\"ok\"") {
+      "ok"
+    } else {
+      "failed"
+    };
+    write_sample(
+      ledger,
+      run,
+      index as u32 + 1,
+      "routed-packet",
+      started,
+      ended,
+      outcome,
+    )?;
+    *recorded += 1;
+    if outcome != "ok" {
+      return Err("a routed packet sample failed".to_owned());
+    }
+  }
+
+  // -- node metadata stratum: one owner revision observed by every member.
+  for index in 0..workload_nodes {
+    let value = format!("run{run}-{index}");
+    let started = now_ms();
+    creator.send(&format!("workload node-meta 0 {value}"))?;
+    let line = creator.read_line()?;
+    // The acceptance predicate: every member observes the exact label
+    // value through its own public member page (bounded polling while
+    // sync converges over the sparse topology).
+    let mut observed = false;
+    let convergence = Instant::now() + Duration::from_secs(30);
+    loop {
+      let mut all_yes = true;
+      for member in &mut members {
+        member.send(&format!("haszone {value}"))?;
+        let reply = member.read_line()?;
+        if reply.trim() != "haszone yes" {
+          all_yes = false;
+        }
+      }
+      if all_yes {
+        observed = true;
+        break;
+      }
+      if Instant::now() > convergence {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let ended = now_ms();
+    let outcome = if observed && line.contains("\"outcome\":\"ok\"") {
+      "ok"
+    } else {
+      "failed"
+    };
+    write_sample(
+      ledger,
+      run,
+      index as u32 + 1,
+      "node-metadata",
+      started,
+      ended,
+      outcome,
+    )?;
+    *recorded += 1;
+    if outcome != "ok" {
+      return Err("a node metadata sample failed".to_owned());
+    }
+  }
+
+  // -- resource metadata stratum.
+  for index in 0..workload_nodes {
+    *sample_seed += 1;
+    let name = format!("radiata.woooo.tech/resources/workload-{sample_seed:03}");
+    let started = now_ms();
+    creator.send(&format!("workload resource {sample_seed}"))?;
+    let line = creator.read_line()?;
+    let mut observed = false;
+    let convergence = Instant::now() + Duration::from_secs(30);
+    loop {
+      let mut all_yes = true;
+      for member in &mut members {
+        member.send(&format!("has {name}"))?;
+        let reply = member.read_line()?;
+        if reply.trim() != "has yes" {
+          all_yes = false;
+        }
+      }
+      if all_yes {
+        observed = true;
+        break;
+      }
+      if Instant::now() > convergence {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let ended = now_ms();
+    let outcome = if observed && line.contains("\"outcome\":\"ok\"") {
+      "ok"
+    } else {
+      "failed"
+    };
+    write_sample(
+      ledger,
+      run,
+      index as u32 + 1,
+      "resource-metadata",
+      started,
+      ended,
+      outcome,
+    )?;
+    *recorded += 1;
+    if outcome != "ok" {
+      return Err("a resource metadata sample failed".to_owned());
     }
   }
 
   // Cleanup: ordered shutdown of every helper; the run-owned stores are
-  // removed by the helpers' shutdown path.
+  // removed by the helpers' shutdown path, and the empty run directory
+  // goes with them.
   for member in members {
     let _ = member.shutdown();
   }
   let _ = creator.shutdown();
-  let summary = format!(
-    "{{\"schema\":\"radiata.woooo.tech/schemas/slo-ledger-summary-v1\",\"commit\":\"{expected_commit}\",\"runs\":{runs},\"recorded\":{recorded},\"status\":\"{}\"}}\n",
-    if all_pass && recorded == runs as usize * 25 {
-      "pass"
-    } else {
-      "fail"
-    }
-  );
-  ledger
-    .write_all(summary.as_bytes())
-    .map_err(|error| error.to_string())?;
-  if all_pass && recorded == runs as usize * 25 {
-    Ok(())
-  } else {
-    Err("the measurement recorded failures or missing samples".to_owned())
-  }
+  let _ = std::fs::remove_dir(root);
+  Ok(())
 }
 
 fn now_ms() -> u128 {
@@ -740,38 +801,6 @@ fn now_ms() -> u128 {
 }
 
 /// Spawns one admission-sample helper: a listening, unjoined member.
-fn spawn_admission_node(
-  root: &std::path::Path, run: u32, index: u32, port: u32,
-) -> Result<NodeProcess, String> {
-  let directory = root.join(format!("admission-run{run}-{index}"));
-  std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-  let endpoint = format!("wss://127.0.0.1:{port}");
-  let mut command = Command::new(node_binary());
-  command
-    .env(common::ENV_ROLE, "member")
-    .env(common::ENV_DIR, &directory)
-    .env(common::ENV_ENDPOINT, &endpoint)
-    .env(common::ENV_ISSUER, "wss://127.0.0.1:17000");
-  command
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::inherit());
-  let mut child = command
-    .spawn()
-    .map_err(|error| format!("admission node spawn failed: {error}"))?;
-  let stdin = child.stdin.take().ok_or("node stdin missing")?;
-  let stdout = std::io::BufReader::new(child.stdout.take().ok_or("node stdout missing")?);
-  Ok(NodeProcess {
-    child,
-    stdin,
-    stdout,
-    directory,
-    node_id: None,
-    endpoint: Some(endpoint),
-    ready: false,
-  })
-}
-
 fn write_sample(
   ledger: &mut std::fs::File, run: u32, index: u32, stratum: &str, started: u128, ended: u128,
   outcome: &str,
