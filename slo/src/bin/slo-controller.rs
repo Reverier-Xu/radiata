@@ -14,6 +14,9 @@
 //!   claiming any SLO sample.
 //! - `measure`: the exact 125-sample workload, refused until the external
 //!   release token of T-G10-12 gates the immutable candidate.
+//! - `topology`: print the frozen profile direction table — the 64 final
+//!   directions, the exact three-hop path, and the four throughput edges
+//!   — for the preflight to verify and record (SC-G10-P0-32).
 
 use std::{
   io::{BufRead, Write},
@@ -22,7 +25,7 @@ use std::{
   time::{Duration, Instant},
 };
 
-use radiata_slo::common;
+use radiata_slo::{common, topology};
 
 fn main() {
   let args: Vec<String> = std::env::args().collect();
@@ -45,12 +48,54 @@ fn main() {
         .unwrap_or(5);
       measure(runs)
     }
+    "topology" => print_topology(),
     other => Err(format!("unknown mode {other}")),
   };
   if let Err(error) = result {
     eprintln!("slo-controller failed: {error}");
     std::process::exit(1);
   }
+}
+
+/// Prints the frozen profile direction table (SC-G10-P0-32): one line per
+/// final direction, then the three-hop path and the four throughput
+/// edges. The preflight verifies the counts and records the table verbatim
+/// into the observations.
+fn print_topology() -> Result<(), String> {
+  let directions = topology::directed_directions();
+  if directions.len() != 64 {
+    return Err(format!(
+      "the profile direction table holds {} directions, expected 64",
+      directions.len()
+    ));
+  }
+  for (from, to) in &directions {
+    println!("direction {from}->{to}");
+  }
+  let (from, to) = topology::exact_three_hop();
+  if topology::distance(from, to) != Some(3) {
+    return Err("the three-hop path is not exactly three hops".to_owned());
+  }
+  println!("three-hop {from}->{to}");
+  let throughput = topology::throughput_edges();
+  let final_edges: Vec<(usize, usize)> = topology::profile_edges()
+    .iter()
+    .map(|edge| (edge.0.min(edge.1), edge.0.max(edge.1)))
+    .collect();
+  if throughput.len() != 4 {
+    return Err(format!(
+      "the profile holds {} throughput edges, expected 4",
+      throughput.len()
+    ));
+  }
+  for edge in throughput {
+    let canonical = (edge.0.min(edge.1), edge.0.max(edge.1));
+    if !final_edges.contains(&canonical) {
+      return Err("a throughput edge is not a final edge".to_owned());
+    }
+    println!("throughput {}->{}", edge.0.min(edge.1), edge.0.max(edge.1));
+  }
+  Ok(())
 }
 
 struct NodeProcess {

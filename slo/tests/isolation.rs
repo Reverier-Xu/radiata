@@ -10,6 +10,7 @@ use std::fs;
 
 const HARNESS_SOURCES: &[&str] = &[
   "src/common_impl.rs",
+  "src/topology.rs",
   "src/bin/slo-node.rs",
   "src/bin/slo-controller.rs",
 ];
