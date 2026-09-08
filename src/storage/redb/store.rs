@@ -22,7 +22,9 @@ use crate::{
 };
 
 const ENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-entries-v1");
+const DIGESTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-digests-v1");
 const RECEIPTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-receipts-v1");
+const VALUE_DIGEST_BYTES: usize = 32;
 const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-meta-v1");
 const REVISION_META_KEY: &[u8] = b"revision";
 const RECEIPT_VALUE_BYTES: usize = 40;
@@ -99,9 +101,12 @@ impl StorageFactory for RedbStoreFactory {
       .map_err(|_| internal(ProviderErrorContext::StorageOpen))??;
       let database = Arc::new(database);
       let init_database = Arc::clone(&database);
-      tokio::task::spawn_blocking(move || initialize(&init_database))
-        .await
-        .map_err(|_| internal(ProviderErrorContext::StorageOpen))??;
+      tokio::task::spawn_blocking(move || {
+        initialize(&init_database)?;
+        backfill_value_digests(&init_database)
+      })
+      .await
+      .map_err(|_| internal(ProviderErrorContext::StorageOpen))??;
       Ok(Box::new(RedbStorage { database }) as Box<dyn Storage>)
     })
   }
@@ -202,10 +207,30 @@ impl StoreSnapshot for RedbSnapshot {
         .transaction
         .open_table(ENTRIES_TABLE)
         .map_err(|error| map_table_error(error, ProviderErrorContext::StorageSnapshot))?;
+      let composite = composite_key(namespace, key);
       let stored = entries
-        .get(&*composite_key(namespace, key))
+        .get(&*composite)
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageSnapshot))?;
-      Ok(stored.map(|guard| owned_value(guard.value())))
+      let Some(guard) = stored else {
+        return Ok(None);
+      };
+      // Reads trust the persisted digest: the commit path wrote both
+      // sides in one atomic transaction, so a missing row is corruption.
+      let persisted = self
+        .transaction
+        .open_table(DIGESTS_TABLE)
+        .map_err(|error| map_table_error(error, ProviderErrorContext::StorageSnapshot))?
+        .get(&*composite)
+        .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageSnapshot))?
+        .ok_or_else(|| digest_corrupt(ProviderErrorContext::StorageSnapshot))?;
+      let digest_bytes: [u8; VALUE_DIGEST_BYTES] = persisted
+        .value()
+        .try_into()
+        .map_err(|_| digest_corrupt(ProviderErrorContext::StorageSnapshot))?;
+      Ok(Some(StoreValue::from_parts(
+        Arc::from(guard.value()),
+        Digest::from_bytes(digest_bytes),
+      )))
     })
   }
 
@@ -217,12 +242,20 @@ impl StoreSnapshot for RedbSnapshot {
         .transaction
         .open_table(ENTRIES_TABLE)
         .map_err(|error| map_table_error(error, ProviderErrorContext::StorageScan))?;
+      let digests = self
+        .transaction
+        .open_table(DIGESTS_TABLE)
+        .map_err(|error| map_table_error(error, ProviderErrorContext::StorageScan))?;
       let bound = composite_prefix(namespace, prefix);
       let range = entries
         .range::<&[u8]>(&*bound..)
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageScan))?;
+      let digest_range = digests
+        .range::<&[u8]>(&*bound..)
+        .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageScan))?;
       Ok(Box::new(RedbScan {
         range,
+        digest_range,
         namespace: namespace.clone(),
         prefix: bound,
         base_len: namespace.as_str().len() + 1,
@@ -233,6 +266,9 @@ impl StoreSnapshot for RedbSnapshot {
 
 struct RedbScan {
   range: redb::Range<'static, &'static [u8], &'static [u8]>,
+  // The digest sidecar iterates in lockstep: both tables carry the same
+  // composite keys, written and removed in the same transactions.
+  digest_range: redb::Range<'static, &'static [u8], &'static [u8]>,
   namespace: StoreNamespace,
   prefix: Vec<u8>,
   base_len: usize,
@@ -250,22 +286,32 @@ impl StoreScan for RedbScan {
       // The range starts at the composite prefix bound, so the first
       // non-matching key ends the ordered scan without materializing the
       // namespace.
-      match self.range.next() {
-        Some(Ok((key, value))) => {
+      match (self.range.next(), self.digest_range.next()) {
+        (Some(Ok((key, value))), Some(Ok((digest_key, digest)))) => {
           let bytes = key.value();
+          if bytes != digest_key.value() {
+            return Err(digest_corrupt(ProviderErrorContext::StorageScan));
+          }
           if !bytes.starts_with(&self.prefix) {
             return Ok(None);
           }
           let user_key = &bytes[self.base_len..];
+          let digest_bytes: [u8; VALUE_DIGEST_BYTES] = digest
+            .value()
+            .try_into()
+            .map_err(|_| digest_corrupt(ProviderErrorContext::StorageScan))?;
           let entry = StoreEntry::new(
             self.namespace.clone(),
             StoreKey::new(Arc::from(user_key)),
-            owned_value(value.value()),
+            StoreValue::from_parts(Arc::from(value.value()), Digest::from_bytes(digest_bytes)),
           );
           Ok(Some(entry))
         }
-        Some(Err(error)) => Err(map_storage_error(error, ProviderErrorContext::StorageScan)),
-        None => Ok(None),
+        (Some(Err(error)), _) | (_, Some(Err(error))) => {
+          Err(map_storage_error(error, ProviderErrorContext::StorageScan))
+        }
+        (None, None) => Ok(None),
+        _ => Err(digest_corrupt(ProviderErrorContext::StorageScan)),
       }
     })
   }
@@ -273,6 +319,12 @@ impl StoreScan for RedbScan {
 
 fn internal(context: ProviderErrorContext) -> Error {
   Error::provider(ProviderErrorKind::Internal, context)
+}
+
+/// A persisted digest sidecar row is missing or malformed: the commit
+/// path maintains both sides atomically, so this is storage corruption.
+fn digest_corrupt(context: ProviderErrorContext) -> Error {
+  Error::provider(ProviderErrorKind::StorageCorrupt, context)
 }
 
 fn composite_key(namespace: &StoreNamespace, key: &StoreKey) -> Vec<u8> {
@@ -387,8 +439,58 @@ fn initialize(database: &Database) -> Result<()> {
       .open_table(ENTRIES_TABLE)
       .map_err(|error| map_table_error(error, ProviderErrorContext::StorageOpen))?;
     write
+      .open_table(DIGESTS_TABLE)
+      .map_err(|error| map_table_error(error, ProviderErrorContext::StorageOpen))?;
+    write
       .open_table(RECEIPTS_TABLE)
       .map_err(|error| map_table_error(error, ProviderErrorContext::StorageOpen))?;
+  }
+  write
+    .commit()
+    .map_err(|error| map_commit_error(error, ProviderErrorContext::StorageOpen))?;
+  Ok(())
+}
+
+/// Backfills persisted value digests for entries written before the
+/// digest table existed. One write transaction over the whole table: a
+/// legacy file upgrades transparently on its first open, and a crash
+/// leaves the file at the complete old or new state. Fresh files find
+/// nothing to backfill.
+fn backfill_value_digests(database: &Database) -> Result<()> {
+  let mut write = database
+    .begin_write()
+    .map_err(|error| map_transaction_error(error, ProviderErrorContext::StorageOpen))?;
+  write
+    .set_durability(Durability::Immediate)
+    .map_err(|error| map_durability_error(error, ProviderErrorContext::StorageOpen))?;
+  {
+    let entries = write
+      .open_table(ENTRIES_TABLE)
+      .map_err(|error| map_table_error(error, ProviderErrorContext::StorageOpen))?;
+    let mut digests = write
+      .open_table(DIGESTS_TABLE)
+      .map_err(|error| map_table_error(error, ProviderErrorContext::StorageOpen))?;
+    let mut pending: Vec<(Vec<u8>, Digest)> = Vec::new();
+    let mut cursor = entries
+      .iter()
+      .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?;
+    while let Some(Ok((key, value))) = cursor.next() {
+      if digests
+        .get(key.value())
+        .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?
+        .is_none()
+      {
+        pending.push((
+          key.value().to_vec(),
+          owned_value(value.value()).digest().clone(),
+        ));
+      }
+    }
+    for (key, digest) in pending {
+      digests
+        .insert(key.as_slice(), digest.as_bytes().as_slice())
+        .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
+    }
   }
   write
     .commit()
@@ -408,6 +510,9 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
   let receipt = {
     let mut entries = write
       .open_table(ENTRIES_TABLE)
+      .map_err(|error| map_table_error(error, ProviderErrorContext::StorageCommit))?;
+    let mut digests = write
+      .open_table(DIGESTS_TABLE)
       .map_err(|error| map_table_error(error, ProviderErrorContext::StorageCommit))?;
     let mut receipts = write
       .open_table(RECEIPTS_TABLE)
@@ -440,10 +545,24 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
     for operation in transaction.operations() {
       if !crate::provider::condition_matches(
         |namespace: &StoreNamespace, key: &StoreKey| {
+          let composite = composite_key(namespace, key);
           let stored = entries
-            .get(&*composite_key(namespace, key))
+            .get(&*composite)
             .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
-          Ok(stored.map(|guard| owned_value(guard.value()).digest().clone()))
+          if stored.is_none() {
+            return Ok(None);
+          }
+          // The commit path keeps every entry's digest row current in the
+          // same transaction, so a missing row is storage corruption.
+          let persisted = digests
+            .get(&*composite)
+            .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?
+            .ok_or_else(|| digest_corrupt(ProviderErrorContext::StorageCommit))?;
+          let bytes: [u8; VALUE_DIGEST_BYTES] = persisted
+            .value()
+            .try_into()
+            .map_err(|_| digest_corrupt(ProviderErrorContext::StorageCommit))?;
+          Ok(Some(Digest::from_bytes(bytes)))
         },
         |forgotten: &TransactionId| {
           Ok(read_receipt(&receipts, forgotten)?.map(|receipt| receipt.operation_digest().clone()))
@@ -473,10 +592,16 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
           entries
             .insert(&*composite, value.as_bytes())
             .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
+          digests
+            .insert(&*composite, value.digest().as_bytes().as_slice())
+            .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
         }
         StoreOperation::Delete { namespace, key, .. } => {
           let composite = composite_key(namespace, key);
           entries
+            .remove(&*composite)
+            .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
+          digests
             .remove(&*composite)
             .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
         }

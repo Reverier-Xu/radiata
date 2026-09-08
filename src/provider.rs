@@ -406,6 +406,15 @@ impl StoreValue {
     Self { value, digest }
   }
 
+  /// Reassembles a value from bytes and a digest that a backend persisted
+  /// alongside them, so reads do not recompute the digest. The caller
+  /// guarantees the pair is consistent; a backend that persists digests
+  /// writes both sides in one atomic transaction and fails closed when a
+  /// digest row is missing.
+  pub(crate) fn from_parts(value: Arc<[u8]>, digest: Digest) -> Self {
+    Self { value, digest }
+  }
+
   pub fn as_bytes(&self) -> &[u8] {
     &self.value
   }
