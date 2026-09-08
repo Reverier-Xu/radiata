@@ -2,7 +2,7 @@
 //!
 //! A registered [`Transport`] owns the listener/connection lifecycle for
 //! one canonical [`TransportTag`]; a registered [`Discovery`] resolves
-//! [`EndpointCandidate`] pages for one canonical [`DiscoveryTag`]. Core
+//! [`EndpointCandidate`] pages for one canonical `DiscoveryTag`. Core
 //! retains authentication and stream safety: a transport only carries the
 //! prelude frames, the session handshake always authenticates, and
 //! registration never bypasses either. The built-in WSS transport is
@@ -151,7 +151,7 @@ impl PageCursor {
 }
 
 /// An open discovery implementation registered under a canonical
-/// [`DiscoveryTag`].
+/// `DiscoveryTag`.
 pub trait Discovery: fmt::Debug + Send + Sync + 'static {
   /// Returns the next bounded page of candidate endpoints. `None` cursor
   /// starts the stream.

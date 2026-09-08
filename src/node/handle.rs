@@ -360,7 +360,7 @@ impl NodeHandle {
   }
 
   /// Subscribes to node events (T-G09-03). Subscriptions are bounded and
-  /// transient: a lagging subscriber observes [`EventReceive::Lagged`] and
+  /// transient: a lagging subscriber observes `EventReceive::Lagged` and
   /// must re-read through the paged queries.
   pub fn events<E: Event>(&self, options: EventOptions) -> Result<EventSubscription<E>> {
     if self.runtime.status() != NodeStatus::Running {
@@ -373,7 +373,7 @@ impl NodeHandle {
   /// event stream, the revision is value-based state: a watcher created
   /// before an action observes every later change, and a watcher created
   /// after it reads the current revision immediately. Await
-  /// [`MemberRevision::changed`] after driving an operation instead of
+  /// `MemberRevision::changed` after driving an operation instead of
   /// polling the member pages with wall-clock sleeps.
   pub fn member_revision(&self) -> crate::node::MemberRevision {
     self.member_revision.clone()
