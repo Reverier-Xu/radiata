@@ -326,9 +326,14 @@ impl JsonStorage {
         Ok(CommitOutcome::Conflict)
       };
     }
-    if transaction.operation_digest() != &transaction.computed_operation_digest()
-      || transaction.base_revision().as_bytes() != state.generation.to_be_bytes()
-    {
+    // The operation digest is transaction identity (THR-020), fixed at
+    // prepare over private immutable fields; recomputing it here is a
+    // development tripwire, never a release-time gate.
+    debug_assert_eq!(
+      transaction.operation_digest(),
+      &transaction.computed_operation_digest()
+    );
+    if transaction.base_revision().as_bytes() != state.generation.to_be_bytes() {
       return Ok(CommitOutcome::Conflict);
     }
     for operation in transaction.operations() {

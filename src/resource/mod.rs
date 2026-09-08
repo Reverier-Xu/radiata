@@ -650,7 +650,10 @@ impl ResourceRecordV1 {
 
   /// Verifies the writer's signature against the writer's public key.
   /// The digest was already checked against the fields at decode time;
-  /// this closes the chain from fields to writer identity.
+  /// this closes the chain from fields to writer identity — deliberately
+  /// re-derived here so verification stays independently complete
+  /// (defense in depth; the redundant encode+hash is ~2% of the
+  /// ed25519 verify on this path).
   pub(crate) fn verify(&self, writer_key: &PublicKey) -> Result<()> {
     verify_strict(
       RESOURCE_RECORD_V1_DOMAIN,

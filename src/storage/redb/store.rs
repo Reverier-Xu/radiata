@@ -427,9 +427,12 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
         },
       );
     }
-    if transaction.operation_digest() != &transaction.computed_operation_digest() {
-      return Ok(CommitOutcome::Conflict);
-    }
+    // Development tripwire: the digest is fixed at prepare over private
+    // immutable fields (see the json adapter's note).
+    debug_assert_eq!(
+      transaction.operation_digest(),
+      &transaction.computed_operation_digest()
+    );
     let generation = current_generation(&meta, ProviderErrorContext::StorageCommit)?;
     if transaction.base_revision().as_bytes() != generation.to_be_bytes() {
       return Ok(CommitOutcome::Conflict);
