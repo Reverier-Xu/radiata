@@ -325,28 +325,15 @@ pub(crate) async fn persist_revocation_ctx(
   {
     return Err(Error::not_trusted("revocation subject binding"));
   }
-  let namespace = namespace()?;
-  let store_key = revocation_key(record.subject());
-  let snapshot = store.snapshot().await?;
-  if let Some(existing) = snapshot.get(&namespace, &store_key).await? {
-    if existing.as_bytes() == record.encode()?.as_slice() {
-      return Ok(());
-    }
-    return Err(Error::conflict("revocation record"));
-  }
-  let transaction = store.prepare_transaction(
-    TransactionId::generate(entropy)?,
-    snapshot.revision().clone(),
-    vec![StoreOperation::Put {
-      namespace,
-      key: store_key,
-      expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(record.encode()?)),
-    }],
-  )?;
-  drop(snapshot);
-  let _ = store.commit(transaction).await?;
-  Ok(())
+  crate::identity::records::persist_terminal_record(
+    store,
+    entropy,
+    namespace()?,
+    revocation_key(record.subject()),
+    Arc::from(record.encode()?),
+    "revocation record",
+  )
+  .await
 }
 
 /// Every known revocation tombstone, bounded by `cap`, for sync
@@ -354,19 +341,14 @@ pub(crate) async fn persist_revocation_ctx(
 pub(crate) async fn known_revocation_records_ctx(
   store: &MetadataStore, cap: usize,
 ) -> Result<Vec<RevocationRecordV1>> {
-  let namespace = namespace()?;
-  let snapshot = store.snapshot().await?;
-  let mut scan = snapshot.scan(&namespace, &[]).await?;
-  let mut records = Vec::new();
-  while let Some(entry) = scan.next().await? {
-    let record = RevocationRecordV1::decode(entry.value().as_bytes())
-      .map_err(|_| Error::invalid_input("revocation record decode"))?;
-    records.push(record);
-    if records.len() >= cap {
-      break;
-    }
-  }
-  Ok(records)
+  crate::identity::records::scan_decoded_records(
+    store,
+    namespace()?,
+    cap,
+    crate::identity::records::skip_none,
+    RevocationRecordV1::decode,
+  )
+  .await
 }
 
 /// The revoked tombstone of `subject`, when this node holds one for that

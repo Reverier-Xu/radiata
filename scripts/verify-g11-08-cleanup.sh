@@ -33,11 +33,17 @@ cargo test --locked --all-features --lib identity::cleanup
 
 # Convergence lane (SC-G11-P0-19..21): the tombstone converges through
 # ordinary sync, excludes the subject from sessions and re-merges, and the
-# binding stays as permanent evidence.
+# binding stays as permanent evidence. The purge lane below also carries
+# SC-G11-P0-22 (purge_revocation clears one local record explicitly and
+# restores the local session boundary).
 cargo test --locked --all-features --test cleanup -- --list > "$TMP/cleanup-it.list"
 require_lane "convergent cleanup" 'g11_cleanup_converges_and_excludes_the_subject' "$TMP/cleanup-it.list"
 require_lane "purge" 'g11_purge_revocation_clears_the_local_boundary' "$TMP/cleanup-it.list"
 cargo test --locked --all-features --test cleanup
+# These cleanup lanes also carry the checkpoint-GC scenarios
+# (SC-G11-P0-23..26): the max-wins watermark convergence runs through the
+# facade in tests/cleanup.rs and the sweep/filter boundary in the unit
+# module of identity::cleanup above.
 
 # Family lane: the sync payload kinds and the revocation suites stay green.
 cargo test --locked --all-features --lib membership::sync

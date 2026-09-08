@@ -72,23 +72,6 @@ impl ResourcePage {
     }
     Self::new(records, cursor)
   }
-
-  /// A stable order-independent fingerprint of the page content.
-  pub(crate) fn fingerprint(&self) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    self.records.len().hash(&mut hasher);
-    self
-      .cursor
-      .as_ref()
-      .map_or(0_usize, Vec::len)
-      .hash(&mut hasher);
-    for record in &self.records {
-      record.name().as_str().hash(&mut hasher);
-      record.digest().as_bytes().hash(&mut hasher);
-    }
-    hasher.finish()
-  }
 }
 
 /// The anti-entropy driver for resource pages: pages the local register
@@ -112,6 +95,37 @@ pub(crate) mod sync {
     })
     .await?;
     ResourcePage::new(paged.items, paged.next)
+  }
+
+  /// A cheap change fingerprint over the raw stored bytes of the page
+  /// range [`Self::emit_page_ctx`] would produce. Records are stored
+  /// canonically, so the raw bytes carry every content change without
+  /// decoding any record: the quiet-state tick pays one scan and one
+  /// hash instead of a decode, re-encode, and digest per record. The
+  /// slow resend cadence heals the (non-cryptographic) collision case,
+  /// exactly like the decoded fingerprint it replaces.
+  pub(crate) async fn page_fingerprint_ctx(
+    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
+  ) -> Result<u64> {
+    use std::hash::{Hash, Hasher};
+    let limit = limit.clamp(1, MAX_PAGE_RECORDS);
+    let namespace = super::super::store::namespace()?;
+    let snapshot = store.snapshot().await?;
+    let mut scan = snapshot.scan(&namespace, &[]).await?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let paged = crate::paging::scan_paged(scan.as_mut(), cursor, limit, |_key, bytes| {
+      bytes.len().hash(&mut hasher);
+      bytes.hash(&mut hasher);
+      Ok(Some(()))
+    })
+    .await?;
+    paged.items.len().hash(&mut hasher);
+    paged
+      .next
+      .as_ref()
+      .map_or(0_usize, Vec::len)
+      .hash(&mut hasher);
+    Ok(hasher.finish())
   }
 
   /// Applies one received page over the running node's metadata store.

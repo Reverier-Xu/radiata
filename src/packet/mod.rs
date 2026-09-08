@@ -117,7 +117,7 @@ impl StreamPolicy {
 /// A bounded canonical metadata label map carried by one stream.
 ///
 /// Bounds are enforced at [`StreamMetadata::insert`]: at most
-/// [`METADATA_MAX_ENTRIES`] entries and [`METADATA_MAX_BYTES`] summed key
+/// `METADATA_MAX_ENTRIES` entries and `METADATA_MAX_BYTES` summed key
 /// and value bytes. Keys are unique and ordered by canonical tag text, so
 /// the wire encoding is deterministic.
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -349,6 +349,12 @@ impl IncomingStream {
       body,
       reply,
     }
+  }
+
+  /// The reply half of the admitting node: consumers derive addressed
+  /// internal-plane signals (e.g. the leave-applied receipt) through it.
+  pub(crate) fn reply_runtime(&self) -> RuntimeClient {
+    self.reply.runtime.clone()
   }
 
   pub fn source(&self) -> &NodeId {

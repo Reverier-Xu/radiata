@@ -131,7 +131,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
       std::time::Instant::now() < deadline,
       "no session registered"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 
   let counter = |snapshot: &radiata::ObservabilitySnapshot, tag: &str| {
@@ -188,7 +188,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
       break;
     }
     assert!(std::time::Instant::now() < drain, "queues never drained");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 
   // A failing route leaves no queue residue after the typed interruption.
@@ -231,7 +231,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
       std::time::Instant::now() < residue,
       "queue residue never drained"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 
   issuer.handle.command(Shutdown::new()).await.unwrap();
@@ -328,7 +328,7 @@ async fn redaction_lane_rejects_every_forbidden_class() {
       std::time::Instant::now() < deadline,
       "no session registered"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 
   // Packet bodies stay inside the stream; never loggable.

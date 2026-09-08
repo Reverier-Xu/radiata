@@ -186,7 +186,7 @@ async fn wait_sessions(nodes: &[&Node], expected: usize) {
       return;
     }
     assert!(Instant::now() < deadline, "sessions never reached baseline");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 }
 
@@ -518,7 +518,7 @@ async fn soak_churn_then_baseline_return() {
       Instant::now() < deadline,
       "queues never returned to the steady-state baseline"
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
   }
 
   // The workload produced typed outcomes only.
@@ -553,7 +553,7 @@ async fn soak_churn_then_baseline_return() {
       Instant::now() < queued_deadline,
       "the issuer queue never settled inside the steady-state residual: {queued:?}"
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
   };
 
   // Queues, streams, routes, and transactions return to their baselines.

@@ -23,7 +23,11 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use crate::{Error, NodeId, QualifiedTag, Result, api::BoxFuture};
 
+pub(crate) mod forward;
+pub(crate) mod table;
 pub(crate) mod trace;
+
+pub(crate) use table::{RouteTable, insert_route};
 
 /// The maximum byte length of one selector input. The bound keeps parsing
 /// work finite and independent of caller payloads; longer inputs are

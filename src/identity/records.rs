@@ -4,13 +4,16 @@ use minicbor::{Decode, Encode};
 
 use super::signature::{MERGE_GRANT_V1_DOMAIN, verify_strict};
 use crate::{
-  Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey, QualifiedTag, Result,
-  Signature, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision, StoreValue,
-  TransactionId,
+  BoxFuture, Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey, QualifiedTag,
+  Result, Signature, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision,
+  StoreValue, TransactionId,
   api::Entropy,
   error::fixed_bytes,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
-  storage::receipt::{ReceiptIdentity, ReceiptReferenceToken, recover_self_referenced_transaction},
+  storage::{
+    MetadataStore,
+    receipt::{ReceiptIdentity, ReceiptReferenceToken, recover_self_referenced_transaction},
+  },
 };
 
 const RECORD_VERSION: u64 = 1;
@@ -209,6 +212,153 @@ pub(crate) fn key_deleted_key(handle: &KeyHandle) -> Result<(StoreNamespace, Sto
     metadata_namespace(KEY_DELETED_NAMESPACE)?,
     store_key(handle.expose_provider_handle()),
   ))
+}
+
+/// The two keys whose presence marks a key handle as spent: one carries
+/// the deletion intent, the other the deletion tombstone.
+pub(crate) fn key_handle_guard_keys(handle: &KeyHandle) -> Result<[(StoreNamespace, StoreKey); 2]> {
+  Ok([key_deletion_intent_key(handle)?, key_deleted_key(handle)?])
+}
+
+/// The handle-freshness snapshot check shared by the leave swap and the
+/// identity finalize: a handle carrying a deletion intent or tombstone
+/// must never be referenced by a new record again. Pair with
+/// [`key_handle_fresh_checks`], the transactional twin covering the
+/// window between this snapshot and the commit.
+pub(crate) async fn assert_key_handle_fresh(
+  snapshot: &dyn crate::provider::StoreSnapshot, handle: &KeyHandle,
+) -> Result<()> {
+  for (namespace, key) in key_handle_guard_keys(handle)? {
+    if snapshot.get(&namespace, &key).await?.is_some() {
+      return Err(Error::conflict("key handle reuse"));
+    }
+  }
+  Ok(())
+}
+
+/// The transactional twin of [`assert_key_handle_fresh`]: the two Absent
+/// checks a journaled commit installs for the handle's guard keys.
+pub(crate) fn key_handle_fresh_checks(handle: &KeyHandle) -> Result<[StoreOperation; 2]> {
+  let keys = key_handle_guard_keys(handle)?;
+  Ok(keys.map(|(namespace, key)| StoreOperation::Check {
+    namespace,
+    key,
+    expected: StoreExpectation::Absent,
+  }))
+}
+
+/// The shared idempotent install for one terminal tombstone record
+/// (`LeaveRecordV1`, `CleanupRecordV1`, `RevocationRecordV1`): a
+/// snapshot-identical record is a no-op, any divergence conflicts, and a
+/// fresh record installs through one conditional Absent put. The caller
+/// holds the store's writer permit and has already verified the record
+/// against the retained bindings; `label` names the family in the
+/// conflict error.
+pub(crate) async fn persist_terminal_record(
+  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, key: StoreKey,
+  encoded: Arc<[u8]>, label: &'static str,
+) -> Result<()> {
+  let snapshot = store.snapshot().await?;
+  if let Some(existing) = snapshot.get(&namespace, &key).await? {
+    if existing.as_bytes() == encoded.as_ref() {
+      return Ok(());
+    }
+    return Err(Error::conflict(label));
+  }
+  let transaction = store.prepare_transaction(
+    TransactionId::generate(entropy)?,
+    snapshot.revision().clone(),
+    vec![StoreOperation::Put {
+      namespace,
+      key,
+      expected: StoreExpectation::Absent,
+      value: StoreValue::new(encoded),
+    }],
+  )?;
+  drop(snapshot);
+  let _ = store.commit(transaction).await?;
+  Ok(())
+}
+
+/// The scan skip predicate for families whose namespace carries no extra
+/// singleton keys.
+pub(crate) fn skip_none(_: &StoreKey) -> bool {
+  false
+}
+
+/// The shared bounded known-records scan for the terminal tombstone
+/// families: one ordered namespace scan decoded through `decode`, capped
+/// at `cap` records, skipping keys the family excludes (the leave intent
+/// singleton shares its family's namespace).
+/// The shared bounded known-records scan for the terminal tombstone
+/// families: one ordered namespace scan decoded through `decode`, capped
+/// at `cap` records, skipping keys `skip` excludes (the leave intent
+/// singleton shares its family's namespace). Function pointers keep the
+/// returned future's Send proof simple; the decoders are associated
+/// functions already returning crate results.
+pub(crate) fn scan_decoded_records<'a, T>(
+  store: &'a MetadataStore, namespace: StoreNamespace, cap: usize, skip: fn(&StoreKey) -> bool,
+  decode: fn(&[u8]) -> Result<T>,
+) -> BoxFuture<'a, Result<Vec<T>>>
+where
+  T: Send + 'a, {
+  Box::pin(async move {
+    let snapshot = store.snapshot().await?;
+    let mut scan = snapshot.scan(&namespace, &[]).await?;
+    let mut records = Vec::new();
+    while let Some(entry) = scan.next().await? {
+      if skip(entry.key()) {
+        continue;
+      }
+      records.push(decode(entry.value().as_bytes())?);
+      if records.len() >= cap {
+        break;
+      }
+    }
+    Ok(records)
+  })
+}
+
+/// The bounded per-pass tombstone GC batch shared by the leave and
+/// cleanup sweeps: one pass deletes at most this many collected
+/// tombstones; the next sync round continues.
+pub(crate) const TOMBSTONE_GC_BATCH: usize = 64;
+
+/// The shared checkpoint sweep body: conditional exact-digest deletes of
+/// `entries` (record key plus collection timestamp) stamped at or before
+/// `watermark`. A raced write on a tombstone conflicts and stays for the
+/// next pass (hygiene, never security). Holds the writer permit across
+/// the sweep like every identity phase.
+pub(crate) async fn collect_tombstones_before(
+  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: u64,
+  entries: &[(StoreKey, u64)],
+) -> Result<usize> {
+  let _permit = store.write_permit().await;
+  let mut collected = 0_usize;
+  for (key, stamp_millis) in entries {
+    let (key, stamp_millis) = (key.clone(), *stamp_millis);
+    if stamp_millis > watermark {
+      continue;
+    }
+    let snapshot = store.snapshot().await?;
+    let Some(existing) = snapshot.get(&namespace, &key).await? else {
+      continue;
+    };
+    let transaction = store.prepare_transaction(
+      TransactionId::generate(entropy)?,
+      snapshot.revision().clone(),
+      vec![StoreOperation::Delete {
+        namespace: namespace.clone(),
+        key,
+        expected: existing.digest().clone(),
+      }],
+    )?;
+    drop(snapshot);
+    if let crate::CommitOutcome::Committed(_) = store.commit(transaction).await? {
+      collected += 1;
+    }
+  }
+  Ok(collected)
 }
 
 #[derive(Clone, Eq, PartialEq)]

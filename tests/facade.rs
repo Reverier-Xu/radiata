@@ -319,6 +319,7 @@ fn resource_write(name_seed: u8, resource_type: &str) -> PutResource {
 /// facade, every member converges on them, revocation preserves their
 /// content and never follows the URI, and leave replaces identities —
 /// explicit operations touch only core metadata.
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e08_resources_revoke_and_leave() {
   // The caller's object the resource URI points at: core must never
@@ -368,6 +369,13 @@ async fn e2e08_resources_revoke_and_leave() {
   // with reserved type/URI plus namespaced custom labels exist in core).
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round on the observer instead of the wall-clock tick.
+    issuer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
     let page = issuer
       .handle
       .query(SelectResources::new(
@@ -383,7 +391,7 @@ async fn e2e08_resources_revoke_and_leave() {
       deadline.elapsed() < Duration::from_secs(30),
       "no resource convergence"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // Revoke the publishing member: its committed resource stays eligible,
@@ -498,6 +506,13 @@ async fn g9_facade_core_only_operations() {
   // next revision; the SLO harness pins the same ordering).
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round on the observer instead of the wall-clock tick.
+    issuer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
     let members = issuer
       .handle
       .query(PageMembers::new(PageSpec::first(8).unwrap()))
@@ -514,7 +529,7 @@ async fn g9_facade_core_only_operations() {
       deadline.elapsed() < Duration::from_secs(30),
       "member descriptor never converged"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // The member labels itself as an echo-capable zone member.
@@ -593,7 +608,14 @@ async fn g9_facade_core_only_operations() {
       deadline.elapsed() < Duration::from_secs(30),
       "label never converged"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round on the observer instead of the wall-clock tick.
+    issuer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // Label-selected packet delivery: the issuer targets the matching-node
@@ -710,7 +732,7 @@ async fn g9_facade_core_only_operations() {
       deadline.elapsed() < Duration::from_secs(30),
       "no session view"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 
   // Session events: the member's shutdown retires its session.
@@ -767,7 +789,14 @@ async fn g9_resource_labels_never_enable_protocols() {
       break;
     }
     assert!(deadline.elapsed() < Duration::from_secs(30));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round on the observer instead of the wall-clock tick.
+    issuer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // The protocol is not registered on the issuer: the packet fails

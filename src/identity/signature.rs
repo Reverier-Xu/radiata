@@ -9,23 +9,44 @@ pub(crate) fn body_digest(canonical_body: &[u8]) -> Digest {
 }
 
 pub(crate) fn signature_message(domain: &[u8], canonical_body: &[u8]) -> Vec<u8> {
-  let digest = body_digest(canonical_body);
+  signature_message_from_digest(domain, &body_digest(canonical_body))
+}
+
+/// The signature message for an already-digested body: domain‖digest.
+/// Callers that hold the body use [`signature_message`]; callers that
+/// hold a digest already proven to bind the body verify through this and
+/// skip a redundant re-encode and hash.
+pub(crate) fn signature_message_from_digest(domain: &[u8], digest: &Digest) -> Vec<u8> {
   let mut message = Vec::with_capacity(domain.len() + digest.as_bytes().len());
   message.extend_from_slice(domain);
   message.extend_from_slice(digest.as_bytes());
   message
 }
 
-#[allow(dead_code)]
 pub(crate) fn verify_strict(
   domain: &[u8], canonical_body: &[u8], public_key: &PublicKey, signature: &Signature,
+  context: &'static str,
+) -> Result<()> {
+  verify_strict_message(
+    domain,
+    &signature_message(domain, canonical_body),
+    public_key,
+    signature,
+    context,
+  )
+}
+
+/// Verifies one signature over a prebuilt signature message (domain‖digest
+/// for callers that hold a digest already proven to bind the body).
+pub(crate) fn verify_strict_message(
+  _domain: &[u8], message: &[u8], public_key: &PublicKey, signature: &Signature,
   context: &'static str,
 ) -> Result<()> {
   let key = ed25519_dalek::VerifyingKey::from_bytes(public_key.as_bytes())
     .map_err(|_| Error::authentication_failed(context))?;
   let signature = ed25519_dalek::Signature::from_bytes(signature.as_bytes());
   key
-    .verify_strict(&signature_message(domain, canonical_body), &signature)
+    .verify_strict(message, &signature)
     .map_err(|_| Error::authentication_failed(context))
 }
 

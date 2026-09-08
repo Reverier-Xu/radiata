@@ -37,7 +37,7 @@ pub enum ErrorKind {
 
 /// The closed set of error categories a provider implementation may
 /// produce. It is the provider-side projection of [`ErrorKind`]: every
-/// variant maps 1:1 through [`ProviderErrorKind::into_error_kind`], and no
+/// variant maps 1:1 through `ProviderErrorKind::into_error_kind`, and no
 /// core-only category (authentication, routing, stream, conflict) is
 /// expressible by a provider. Extend [`ErrorKind`] freely; extend this
 /// enum only when a new category must also originate inside a provider.

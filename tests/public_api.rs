@@ -21,9 +21,9 @@ use std::{
 #[cfg(all(feature = "json", unix))]
 use radiata::adapters::json_store;
 use radiata::{
-  BoxFuture, ChannelBinding, CommitOutcome, CommitReceipt, ConnectMember, ConnectivityStatus,
-  CreatedKey, DeliveryAck, Digest, DisconnectPeer, Discovery, DiscoveryPage, Endpoint,
-  EndpointCandidate, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
+  ApplyReceiptRetention, BoxFuture, ChannelBinding, CommitOutcome, CommitReceipt, ConnectMember,
+  ConnectivityStatus, CreatedKey, DeliveryAck, Digest, DisconnectPeer, Discovery, DiscoveryPage,
+  Endpoint, EndpointCandidate, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
   FeatureDefinition, FeatureTag, GetLocalNode, GetMember, GetNodeStatus, GetObservability,
   GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster,
@@ -32,7 +32,7 @@ use radiata::{
   NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
   PacketConsumer, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
   PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
-  RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
+  ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
   ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result,
   RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy,
@@ -1084,6 +1084,17 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   };
   assert_ne!(outcome.former_identity(), outcome.replacement_identity());
 
+  // The explicit receipt-retention pass drives over the member's real
+  // store: the node's own receipts are not anchored, so the pass
+  // forgets nothing. (The issuer has left and is already shut down.)
+  let retention: ReceiptRetentionReport = member
+    .handle
+    .command(ApplyReceiptRetention::new())
+    .await
+    .unwrap();
+  assert_eq!(retention.forgotten, 0);
+  assert!(!retention.remaining);
+
   let shutdown: ShutdownOutcome = issuer.handle.command(Shutdown::new()).await.unwrap();
   assert!(matches!(
     shutdown.reason(),
@@ -1190,6 +1201,6 @@ async fn wait_for_session(node: &Node) {
       std::time::Instant::now() < deadline,
       "no session registered"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 }

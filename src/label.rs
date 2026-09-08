@@ -79,7 +79,7 @@ pub struct LabelValue(Arc<str>);
 
 impl LabelValue {
   /// Validates and stores one label value: non-empty, at most
-  /// [`LABEL_VALUE_MAX_BYTES`] UTF-8 bytes.
+  /// `LABEL_VALUE_MAX_BYTES` UTF-8 bytes.
   pub fn parse(value: &str) -> Result<Self> {
     if value.is_empty() || value.len() > LABEL_VALUE_MAX_BYTES {
       return Err(Error::invalid_input("label value"));
@@ -105,7 +105,7 @@ impl fmt::Debug for LabelValue {
 }
 
 /// A canonical label map: unique [`LabelKey`]s ordered by canonical key
-/// text, at most [`LABEL_SET_MAX_ENTRIES`] entries.
+/// text, at most `LABEL_SET_MAX_ENTRIES` entries.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct LabelSet {
   entries: BTreeMap<LabelKey, LabelValue>,

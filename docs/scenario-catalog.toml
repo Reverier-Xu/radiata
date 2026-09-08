@@ -1926,6 +1926,33 @@ cases = [
 ]
 
 [[scenario_set]]
+owner_task = "T-G11-09"
+gate = "G11"
+priority = "P0"
+first = 23
+verification_id = "VERIFY-G11-08"
+kind = "contract"
+cases = [
+  { title = "Checkpoint issues idempotently under max-wins", acceptance = "The cleanup checkpoint is an unsigned record ordered by a strictly monotonic watermark: re-issuing never rolls the watermark back, any member may issue, and the epoch converges through ordinary sync so checkpointing never gates live entries.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-012",
+  ] },
+  { title = "The GC pass collects only up to the watermark", acceptance = "The retention sweep collects leave and cleanup tombstones timestamped at or before the checkpoint watermark through exact-digest conditional deletes; newer tombstones and a raced write stay for the next pass.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-012",
+  ] },
+  { title = "Revocation is excluded from the checkpoint sweep", acceptance = "The sweep never touches the revocation family: a revoked binding stays revoked after every GC pass, and a collected subject's trusted binding remains the permanent anchor.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-012",
+    "THR-015",
+  ] },
+  { title = "The cluster stays compositional after checkpointing", acceptance = "After a checkpoint epoch a later cluster_merge still converges and the cluster stays fully compositional through the public facade; checkpointing never breaks convergence and never excludes a live member.", rebaseline = "ADR-0009", threats = [
+    "THR-010",
+    "THR-014",
+  ] },
+]
+
+[[scenario_set]]
 owner_task = "T-G11-10"
 gate = "G11"
 priority = "P0"
@@ -1970,6 +1997,24 @@ cases = [
 ]
 
 [[scenario_set]]
+owner_task = "T-G11-12"
+gate = "G11"
+priority = "P0"
+first = 34
+verification_id = "VERIFY-G11-12"
+kind = "documentation"
+cases = [
+  { title = "The threat model owns only transport-path adversaries", acceptance = "The rebaselined threat model limits adversaries to the transport path: the ADR-0009 rebaseline note owns the executable predicates, containing a malicious member is documented as a deployment guarantee rather than a core control, and the sealed validator's negative fixtures reject stale threat-ledger evidence.", rebaseline = "ADR-0009", threats = [
+    "THR-012",
+    "THR-014",
+  ] },
+  { title = "The catalog and README state the deployment trust contract", acceptance = "The README documents the peer-trust deployment model and the three guarantees the deployment owes, and every catalog scenario cites rebaselined acceptance text; superseded semantics cannot close a gate.", rebaseline = "ADR-0009", threats = [
+    "THR-012",
+    "THR-014",
+  ] },
+]
+
+[[scenario_set]]
 owner_task = "T-G11-13"
 gate = "G11"
 priority = "P0"
@@ -1982,6 +2027,24 @@ cases = [
   ] },
   { title = "The controller never drives the facade directly", acceptance = "The isolation lane proves the controller binary issues no listen, merge, or query commands; nodes are external processes driven only through the stdin/stdout helper pipes.", rebaseline = "ADR-0009", threats = [
     "THR-002",
+  ] },
+]
+
+[[scenario_set]]
+owner_task = "T-G11-14"
+gate = "G11"
+priority = "P0"
+first = 38
+verification_id = "VERIFY-G11-03"
+kind = "validation"
+cases = [
+  { title = "The merged surface is frozen in the manifest", acceptance = "The API manifest freezes the ADR-0009 merge, leave, cleanup, and stream surface with futures-core and the Tokio traits and interfaces admitted and channel and task handles excluded; the digest freeze guard rejects any unamended drift.", rebaseline = "ADR-0009", threats = [
+    "THR-014",
+    "THR-029",
+  ] },
+  { title = "The inventory digests match the shipped surface", acceptance = "The api-inventory digests match the rebaselined public surface, and the public-api and semver proofs re-run green against the merged facade (VERIFY-G10-08).", rebaseline = "ADR-0009", threats = [
+    "THR-014",
+    "THR-029",
   ] },
 ]
 

@@ -356,7 +356,16 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
       std::time::Instant::now() < deadline,
       "every member must hold all four trust bindings"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round per node instead of the wall-clock tick.
+    for node in &nodes {
+      node
+        .handle
+        .command(radiata::RunSyncRound::new())
+        .await
+        .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // Linear chain sessions B—C and C—D; the A—D leg is intentionally cut
@@ -473,8 +482,42 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     .unwrap();
   let route_handle = packet.send_async(body).unwrap();
 
-  // Let the stream reach its in-flight phase.
-  tokio::time::sleep(Duration::from_millis(300)).await;
+  // Wait until the stream is observably in flight before breaking the
+  // last leg: a fixed sleep races the scheduler, the route state is the
+  // contract.
+  let inflight_deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    // The supervisor inserts the route record asynchronously after
+    // `send_async` queues the request; keep waiting until it exists.
+    let view = match nodes[0]
+      .handle
+      .query(radiata::GetRoute::new(route_handle.clone()))
+      .await
+    {
+      Ok(view) => view,
+      Err(error) if error.kind() == radiata::ErrorKind::NotFound => {
+        assert!(
+          std::time::Instant::now() < inflight_deadline,
+          "the stream never reached its in-flight phase"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        continue;
+      }
+      Err(error) => panic!("route query failed: {error:?}"),
+    };
+    if matches!(view.state(), radiata::RouteState::Streaming) {
+      break;
+    }
+    assert!(
+      !matches!(view.state(), radiata::RouteState::Failed(_)),
+      "the stream failed before reaching its in-flight phase"
+    );
+    assert!(
+      std::time::Instant::now() < inflight_deadline,
+      "the stream never reached its in-flight phase"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
 
   // Break the last leg while the body is still gated.
   nodes[2]

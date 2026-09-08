@@ -233,6 +233,18 @@ async fn g9_concurrent_resource_writes_converge_to_one_winner() {
     {
       break;
     }
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round per node instead of the wall-clock tick.
+    issuer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    member
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
     if deadline.elapsed() >= Duration::from_secs(30) {
       let members_a = issuer
         .handle
@@ -260,7 +272,7 @@ async fn g9_concurrent_resource_writes_converge_to_one_winner() {
         members_b.items().len(),
       );
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   for node in [issuer, member] {
@@ -312,7 +324,13 @@ async fn g9_maintenance_preserves_labels_and_emits_nothing() {
       deadline.elapsed() < Duration::from_secs(30),
       "no convergence"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Schedule the next convergence observation on the observer.
+    member
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // ...and continued maintenance ticks preserve the labels and emit no

@@ -174,6 +174,16 @@ where
 async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
   let deadline = std::time::Instant::now() + timeout;
   loop {
+    // Drive one deterministic anti-entropy round per node so convergence
+    // is scheduled by the test, not by the wall-clock tick cadence; the
+    // bounded check below stays the convergence verdict.
+    for node in nodes {
+      node
+        .handle
+        .command(radiata::RunSyncRound::new())
+        .await
+        .unwrap();
+    }
     let mut complete = true;
     let mut views: Vec<Vec<radiata::TrustedIdentityView>> = Vec::new();
     for node in nodes {
@@ -220,7 +230,7 @@ async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
       }
       panic!("trust convergence timeout after {timeout:?}");
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
   }
 }
 
@@ -230,6 +240,15 @@ async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
 async fn wait_descriptors(nodes: &[Node], expected: usize, revision: u64, timeout: Duration) {
   let deadline = std::time::Instant::now() + timeout;
   loop {
+    // Drive one deterministic anti-entropy round per node so convergence
+    // is scheduled by the test, not by the wall-clock tick cadence.
+    for node in nodes {
+      node
+        .handle
+        .command(radiata::RunSyncRound::new())
+        .await
+        .unwrap();
+    }
     let mut pages = Vec::new();
     let mut complete = true;
     for node in nodes {
@@ -265,7 +284,7 @@ async fn wait_descriptors(nodes: &[Node], expected: usize, revision: u64, timeou
       std::time::Instant::now() < deadline,
       "descriptor convergence timeout after {timeout:?}"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
   }
 }
 
@@ -735,6 +754,7 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
     move || {
       let handle = node15_handle.clone();
       Box::pin(async move {
+        let _ = handle.command(radiata::RunSyncRound::new()).await;
         let page = handle
           .query(PageTrust::new(PageSpec::first(64).unwrap()))
           .await
@@ -785,8 +805,6 @@ async fn membership_sync_failure_matrix_partition_healing() {
     .await;
   }
   close_star_sessions(&nodes, 0).await;
-  tokio::time::sleep(Duration::from_millis(300)).await;
-  tokio::time::sleep(Duration::from_millis(800)).await;
   let expected_4: std::collections::BTreeSet<(u8, u8)> =
     [(0, 1), (0, 2), (1, 3), (2, 3)].into_iter().collect();
   wait_settled(&nodes, &expected_4, Duration::from_secs(15)).await;
@@ -801,16 +819,26 @@ async fn membership_sync_failure_matrix_partition_healing() {
       nodes[edge.1 as usize].id.clone(),
     ))
     .await;
-  tokio::time::sleep(Duration::from_millis(500)).await;
-  let edges = collected_topology(&nodes).await;
-  assert_eq!(
-    edges
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let edges = collected_topology(&nodes).await;
+    let duplicates = edges
       .iter()
       .filter(|(left, right)| *left == edge.0 && *right == edge.1)
-      .count(),
-    1,
-    "duplicate delivery converges to one session"
-  );
+      .count();
+    if duplicates == 1 {
+      break;
+    }
+    assert!(
+      duplicates == 0,
+      "duplicate delivery produced {duplicates} parallel sessions"
+    );
+    assert!(
+      std::time::Instant::now() < deadline,
+      "duplicate delivery never converged to one session"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
 
   // Partition healing: the receiving side drops the (0,1) edge (a real
   // edge loss, not an intentional disconnect), and the dialing side's
@@ -820,7 +848,6 @@ async fn membership_sync_failure_matrix_partition_healing() {
     .handle
     .command(DisconnectPeer::new(nodes[0].id.clone()))
     .await;
-  tokio::time::sleep(Duration::from_millis(300)).await;
   // The immediate-recovery command forces a bounded cycle; recovery
   // converges back to connected-path connectivity (SC-G05-P0-19/22).
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -1003,7 +1030,16 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
       std::time::Instant::now() < deadline,
       "revision-2 convergence timeout; observed revisions of {target}: {observed:?}"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Schedule the next convergence sample: one deterministic round per
+    // node instead of waiting on the wall-clock tick cadence.
+    for node in &nodes {
+      node
+        .handle
+        .command(radiata::RunSyncRound::new())
+        .await
+        .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(5)).await;
   }
 
   let elapsed = started.elapsed();

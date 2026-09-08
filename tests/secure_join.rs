@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use radiata::{
   Endpoint, ErrorKind, GetLocalNode, Listen, MergeCluster, MergeCredential, NodeBuilder,
-  NodeHandle, RotateMergeCredential, Shutdown,
+  NodeHandle, PageSpec, PageTopology, RotateMergeCredential, Shutdown,
 };
 #[cfg(all(unix, feature = "json"))]
 use tempfile::TempDir;
@@ -1319,6 +1319,7 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   };
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
+  let receiver_peer = receiver_id.clone();
 
   // Start an outbound stream whose body stalls on its first chunk, then
   // observe it through the async route handle: the admission ack resolves
@@ -1367,17 +1368,36 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   // then release the stalled body so the route attempts to continue and
   // observes the close.
   receiver.handle.command(Shutdown::new()).await.unwrap();
-  // Give the peer's session close time to propagate over the loopback
-  // before releasing the stalled body; under CI load a fixed 100ms has
-  // proven too short, so wait in bounded steps.
-  for _ in 0..10 {
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+  // Wait until the joiner observes the session close before releasing the
+  // stalled body: releasing early would let the body finish normally and
+  // turn the interruption assertion into a false failure.
+  let close_deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let topology = joiner_handle
+      .query(PageTopology::new(PageSpec::first(8).unwrap()))
+      .await
+      .unwrap();
+    let connected = topology
+      .items()
+      .iter()
+      .any(|edge| edge.destination() == &receiver_peer && edge.connected());
+    if !connected {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < close_deadline,
+      "the joiner never observed the peer's session close"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
   release.open();
 
   // The in-flight route must end with the explicit interruption state.
+  // The bound covers loaded CI runners where the sixteen-node lane runs
+  // in parallel inside the same binary and starves this task for tens
+  // of seconds.
   let mut terminal: Option<RouteState> = None;
-  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let deadline = std::time::Instant::now() + Duration::from_secs(60);
   while terminal.is_none() {
     let view = joiner_handle
       .query(GetRoute::new(route.clone()))
@@ -1595,7 +1615,7 @@ async fn secure_join_shutdown_rejects_new_work_after_drain() {
 
 // ---- G5 public membership and topology views (SC-G05-P0-23..26 core) ----
 
-use radiata::{GetMember, PageMembers, PageSpec, PageTopology};
+use radiata::{GetMember, PageMembers};
 
 /// The public membership/topology views expose the local owner-marked
 /// descriptor and the authenticated session edge after a merge.

@@ -22,6 +22,16 @@ const REFERENCE_EDGE_TAG: &[u8] = b"\x03reference-edge\0";
 const ELIGIBILITY_ANCHOR_TAG: &[u8] = b"\x04eligibility-anchor\0";
 const EDGE_DELIMITER: u8 = 0;
 const RECORD_REFERENCE_DOMAIN: &[u8] = b"radiata.woooo.tech/receipt-reference/metadata-record/v1\0";
+const RETENTION_SWEEP_DOMAIN: &[u8] = b"radiata.woooo.tech/receipt-retention/sweep-operation/v1\0";
+/// The upper bound on receipts one retention sweep drives through the
+/// cleanup state machine, so one host call stays latency-bounded no
+/// matter how large the anchored population grows; the report says
+/// whether the scan stopped at the bound.
+pub(crate) const RETENTION_SWEEP_BOUND: usize = 4096;
+
+/// The outcome of one retention sweep; the public report lives in the
+/// view module.
+pub(crate) use crate::view::ReceiptRetentionReport;
 const REFERENCE_TOKEN_WIDTH: usize = 32;
 const WALL_TIME_WIDTH: usize = 13;
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
@@ -252,7 +262,7 @@ impl MetadataStore {
       value: StoreValue::new(Arc::from([])),
     });
     if let Some(anchor) = state.anchor {
-      decode_wall_time(anchor.as_bytes())?;
+      decode_anchor_value(anchor.as_bytes())?;
       operations.push(StoreOperation::Delete {
         namespace,
         key: state.anchor_key,
@@ -356,12 +366,15 @@ impl MetadataStore {
             namespace,
             key: state.anchor_key,
             expected: StoreExpectation::Absent,
-            value: StoreValue::new(Arc::from(encode_wall_time(now))),
+            value: StoreValue::new(Arc::from(encode_anchor_value(
+              now,
+              target.operation_digest(),
+            ))),
           },
         ],
       ),
       Some(anchor) => {
-        let anchored_at = decode_wall_time(anchor.as_bytes())?;
+        let (anchored_at, _) = decode_anchor_value(anchor.as_bytes())?;
         let Some(deadline) = anchored_at.checked_add(self.receipt_retention) else {
           return Ok(ReceiptCleanupOutcome::Retained);
         };
@@ -413,6 +426,79 @@ impl MetadataStore {
       })),
     }
   }
+
+  /// Applies receipt retention over every anchored receipt: the cleanup
+  /// state machine forgets the ones past their deadline and retains the
+  /// rest, so one explicit host-triggered pass advances the whole
+  /// anchored population one idempotent step. Unanchored receipts stay
+  /// untouched: anchoring is the owning state machine's decision, and a
+  /// receipt that still carries owner references must never grow an
+  /// anchor.
+  pub(crate) async fn apply_receipt_retention(&self) -> crate::Result<ReceiptRetentionReport> {
+    let namespace = internal_namespace()?;
+    let snapshot = self.snapshot().await?;
+    let mut targets = Vec::new();
+    let mut scan = snapshot.scan(&namespace, ELIGIBILITY_ANCHOR_TAG).await?;
+    while let Some(entry) = scan.next().await? {
+      if targets.len() >= RETENTION_SWEEP_BOUND {
+        return Ok(ReceiptRetentionReport {
+          forgotten: 0,
+          remaining: true,
+        });
+      }
+      let key = entry.key().as_bytes();
+      let transaction = key
+        .strip_prefix(ELIGIBILITY_ANCHOR_TAG)
+        .ok_or_else(storage_corrupt)?;
+      let (anchored_at, operation_digest) = decode_anchor_value(entry.value().as_bytes())?;
+      let deadline = anchored_at
+        .checked_add(self.receipt_retention)
+        .ok_or_else(storage_corrupt)?;
+      // Only receipts whose deadline has passed leave the scan; the
+      // state machine re-verifies everything for the ones that remain.
+      if self.clock.now() < deadline {
+        continue;
+      }
+      let transaction =
+        TransactionId::parse(std::str::from_utf8(transaction).map_err(|_| storage_corrupt())?)?;
+      targets.push(ReceiptIdentity::from_parts(transaction, operation_digest));
+    }
+    drop(scan);
+    drop(snapshot);
+
+    let mut forgotten = 0_u64;
+    for target in &targets {
+      let operation_id = retention_sweep_operation_id(&target.transaction)?;
+      if let ReceiptCleanupOutcome::Forgotten(_) =
+        self.cleanup_receipt(target, operation_id).await?
+      {
+        forgotten = forgotten
+          .checked_add(1)
+          .ok_or_else(|| Error::resource_exhausted("retention sweep count"))?;
+      }
+    }
+    Ok(ReceiptRetentionReport {
+      forgotten,
+      remaining: targets.len() >= RETENTION_SWEEP_BOUND,
+    })
+  }
+}
+
+/// The deterministic cleanup-transaction identity for one swept receipt:
+/// derived from the target transaction under a dedicated domain, so a
+/// retried sweep replays the same cleanup as an idempotent no-op while
+/// no other transaction can collide with it.
+fn retention_sweep_operation_id(target: &TransactionId) -> crate::Result<TransactionId> {
+  let mut hasher = Sha256::new();
+  hasher.update(RETENTION_SWEEP_DOMAIN);
+  hasher.update(target.as_str().as_bytes());
+  let hashed = hasher.finalize();
+  TransactionId::parse(&format!(
+    "txn_{}",
+    crate::identity::id::encode_base62_suffix(u128::from_be_bytes(
+      hashed[..16].try_into().map_err(|_| storage_corrupt())?
+    ))?
+  ))
 }
 
 /// Deterministically rebuilds the identity of a transaction that paired the
@@ -666,7 +752,7 @@ pub(super) async fn build_receipt_change_operations(
     });
   }
   if let Some(anchor) = anchor {
-    decode_wall_time(anchor.as_bytes())?;
+    decode_anchor_value(anchor.as_bytes())?;
     operations.push(StoreOperation::Delete {
       namespace: namespace.clone(),
       key: anchor_key,
@@ -911,6 +997,29 @@ fn decode_reference_count(value: &StoreValue) -> crate::Result<u64> {
     return Err(storage_corrupt());
   }
   Ok(count)
+}
+
+/// Encodes one eligibility-anchor value: the anchoring wall time that
+/// starts the retention clock alongside the operation digest the forget
+/// must condition on, so a retention sweep can rebuild the exact receipt
+/// identity from durable state alone.
+pub(super) fn encode_anchor_value(anchored_at: SystemTime, operation_digest: &Digest) -> Vec<u8> {
+  let mut encoded = Vec::with_capacity(WALL_TIME_WIDTH + 32);
+  encoded.extend_from_slice(&encode_wall_time(anchored_at));
+  encoded.extend_from_slice(operation_digest.as_bytes());
+  encoded
+}
+
+/// Decodes one eligibility-anchor value; any other length is corruption.
+pub(super) fn decode_anchor_value(value: &[u8]) -> crate::Result<(SystemTime, Digest)> {
+  if value.len() != WALL_TIME_WIDTH + 32 {
+    return Err(storage_corrupt());
+  }
+  let anchored_at = decode_wall_time(&value[..WALL_TIME_WIDTH])?;
+  let digest_bytes: [u8; 32] = value[WALL_TIME_WIDTH..]
+    .try_into()
+    .map_err(|_| storage_corrupt())?;
+  Ok((anchored_at, Digest::from_bytes(digest_bytes)))
 }
 
 pub(super) fn encode_wall_time(value: SystemTime) -> [u8; WALL_TIME_WIDTH] {

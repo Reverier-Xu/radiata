@@ -570,6 +570,7 @@ impl MetadataStore {
         holder: std::sync::Mutex::new(None),
         released: tokio::sync::Notify::new(),
       },
+      ready_notify: tokio::sync::Notify::new(),
       clock,
       receipt_retention,
     };

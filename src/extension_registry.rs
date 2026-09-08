@@ -55,7 +55,7 @@ pub(crate) struct ProtocolRegistration {
 /// for the node's lifetime and are installed through
 /// [`crate::NodeBuilder::extensions`]; core protocols are registered by
 /// the runtime at startup through
-/// [`ExtensionRegistry::register_core_protocol`].
+/// `ExtensionRegistry::register_core_protocol`.
 #[derive(Default)]
 pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,

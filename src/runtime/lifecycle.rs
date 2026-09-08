@@ -5,7 +5,7 @@ use crate::{
   NodeStatus, Result, RouteStatusView, ShutdownOutcome, ShutdownReason,
   identity::{ListenerId, credential::MergeCredential},
   packet::{OutboundRequest, RouteHandle},
-  session::stream::RouteTable,
+  routing::RouteTable,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +163,12 @@ pub(crate) enum Control {
   IssueCleanupCheckpoint {
     reply: oneshot::Sender<Result<u64>>,
   },
+  ApplyReceiptRetention {
+    reply: oneshot::Sender<Result<crate::view::ReceiptRetentionReport>>,
+  },
+  RunSyncRound {
+    reply: oneshot::Sender<Result<()>>,
+  },
   RemoveResource {
     name: crate::ResourceName,
     expected: crate::ResourceVersion,
@@ -215,13 +221,6 @@ impl RuntimeClient {
     self.state.borrow().status()
   }
 
-  /// The bounded observability snapshot (T-G10-05).
-  pub(crate) async fn observability_snapshot(&self) -> Result<crate::ObservabilitySnapshot> {
-    self
-      .send_command(|reply| Control::Observability { reply })
-      .await
-  }
-
   pub(crate) async fn shutdown(&self) -> Result<ShutdownOutcome> {
     if let Some(reason) = self.state.borrow().reason() {
       return Ok(ShutdownOutcome::new(reason));
@@ -241,7 +240,7 @@ impl RuntimeClient {
     }
   }
 
-  async fn send_command<Output, Build>(&self, build: Build) -> Result<Output>
+  pub(crate) async fn send_command<Output, Build>(&self, build: Build) -> Result<Output>
   where
     Build: FnOnce(oneshot::Sender<Result<Output>>) -> Control,
     Output: Send + 'static, {
@@ -257,256 +256,6 @@ impl RuntimeClient {
     response
       .await
       .map_err(|_| Error::internal("node control reply"))?
-  }
-
-  pub(crate) async fn rotate_merge_credential(&self) -> Result<IssuedMergeCredential> {
-    self
-      .send_command(|reply| Control::RotateMergeCredential { reply })
-      .await
-  }
-
-  pub(crate) async fn listen(&self, endpoint: Endpoint) -> Result<ListenerView> {
-    self
-      .send_command(|reply| Control::Listen { endpoint, reply })
-      .await
-  }
-
-  pub(crate) async fn stop_listener(&self, listener: ListenerId) -> Result<()> {
-    self
-      .send_command(|reply| Control::StopListener { listener, reply })
-      .await
-  }
-
-  pub(crate) async fn merge_cluster(
-    &self, receiver: Endpoint, credential: MergeCredential,
-  ) -> Result<MergeView> {
-    self
-      .send_command(|reply| Control::MergeCluster {
-        receiver,
-        credential,
-        reply,
-      })
-      .await
-  }
-
-  /// Connects to an already-admitted peer with key trust only (G3-04).
-  pub(crate) async fn connect_member(&self, receiver: Endpoint, peer: NodeId) -> Result<NodeId> {
-    self
-      .send_command(|reply| Control::ConnectMember {
-        receiver,
-        peer,
-        reply,
-      })
-      .await
-  }
-
-  pub(crate) async fn local_node(&self) -> Result<LocalNodeView> {
-    self
-      .send_command(|reply| Control::GetLocalNode { reply })
-      .await
-  }
-
-  /// One member's public observation (G5-06).
-  pub(crate) async fn member(&self, node: NodeId) -> Result<Option<crate::MemberView>> {
-    self
-      .send_command(|reply| Control::GetMember { node, reply })
-      .await
-  }
-
-  /// Pages the public membership observations (G5-06).
-  pub(crate) async fn page_members(
-    &self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::MemberPage> {
-    self
-      .send_command(|reply| Control::PageMembers {
-        cursor,
-        limit,
-        reply,
-      })
-      .await
-  }
-
-  /// Pages the live resource winners matching one selector (G9-02).
-  pub(crate) async fn select_resources(
-    &self, selector: crate::Selector, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::ResourcePage> {
-    self
-      .send_command(|reply| Control::SelectResources {
-        selector,
-        cursor,
-        limit,
-        reply,
-      })
-      .await
-  }
-
-  /// Pages every live resource winner in canonical name order (G9-07).
-  pub(crate) async fn page_resources(
-    &self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::ResourcePage> {
-    self
-      .send_command(|reply| Control::PageResources {
-        cursor,
-        limit,
-        reply,
-      })
-      .await
-  }
-
-  /// Reads the live winner of one named resource (G9-07).
-  pub(crate) async fn get_resource(
-    &self, name: crate::ResourceName,
-  ) -> Result<Option<crate::ResourceView>> {
-    self
-      .send_command(|reply| Control::GetResource { name, reply })
-      .await
-  }
-
-  /// Pages the node's bound listeners (G9-07).
-  pub(crate) async fn page_listeners(
-    &self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::ListenerPage> {
-    self
-      .send_command(|reply| Control::PageListeners {
-        cursor,
-        limit,
-        reply,
-      })
-      .await
-  }
-
-  /// Pages the live authenticated sessions (G9-07).
-  pub(crate) async fn page_sessions(
-    &self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::SessionPage> {
-    self
-      .send_command(|reply| Control::PageSessions {
-        cursor,
-        limit,
-        reply,
-      })
-      .await
-  }
-
-  /// Pages the public topology edges (G5-06).
-  pub(crate) async fn page_topology(
-    &self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::TopologyPage> {
-    self
-      .send_command(|reply| Control::PageTopology {
-        cursor,
-        limit,
-        reply,
-      })
-      .await
-  }
-
-  /// Pages the public trust observations (G5-06).
-  pub(crate) async fn page_trust(
-    &self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::TrustPage> {
-    self
-      .send_command(|reply| Control::PageTrust {
-        cursor,
-        limit,
-        reply,
-      })
-      .await
-  }
-
-  /// Forces one bounded immediate recovery cycle and returns its view
-  /// (G5-06).
-  pub(crate) async fn start_recovery(&self) -> Result<crate::RecoveryView> {
-    self
-      .send_command(|reply| Control::StartRecovery { reply })
-      .await
-  }
-
-  /// Closes the authenticated session to one peer (G5-06).
-  pub(crate) async fn disconnect_peer(&self, peer: NodeId) -> Result<()> {
-    self
-      .send_command(|reply| Control::DisconnectPeer { peer, reply })
-      .await
-  }
-
-  /// Updates the local node's own descriptor (owner-only node metadata).
-  pub(crate) async fn update_node_metadata(
-    &self, expected_revision: u64, patch: crate::NodeMetadataPatch,
-  ) -> Result<crate::MemberView> {
-    self
-      .send_command(|reply| Control::UpdateNodeMetadata {
-        expected_revision,
-        patch,
-        reply,
-      })
-      .await
-  }
-
-  /// Commits one resource write intent as a signed candidate (G9-03).
-  pub(crate) async fn put_resource(
-    &self, write: crate::ResourceWrite,
-  ) -> Result<crate::ResourceMutationView> {
-    self
-      .send_command(|reply| Control::PutResource { write, reply })
-      .await
-  }
-
-  /// Revokes one exact subject binding's authority (G9-04).
-  pub(crate) async fn revoke_node(
-    &self, subject: NodeId, expected_key: crate::PublicKey,
-  ) -> Result<crate::RevokeOutcome> {
-    self
-      .send_command(|reply| Control::RevokeNode {
-        subject,
-        expected_key,
-        reply,
-      })
-      .await
-  }
-
-  pub(crate) async fn cleanup_node(&self, subject: NodeId) -> Result<()> {
-    self
-      .send_command(|reply| Control::CleanupNode { subject, reply })
-      .await
-  }
-
-  pub(crate) async fn issue_cleanup_checkpoint(&self) -> Result<u64> {
-    self
-      .send_command(|reply| Control::IssueCleanupCheckpoint { reply })
-      .await
-  }
-
-  pub(crate) async fn purge_revocation(&self, subject: NodeId) -> Result<()> {
-    self
-      .send_command(|reply| Control::PurgeRevocation { subject, reply })
-      .await
-  }
-
-  /// Creates signed removal evidence for one resource (G9-05).
-  pub(crate) async fn remove_resource(
-    &self, name: crate::ResourceName, expected: crate::ResourceVersion,
-  ) -> Result<crate::ResourceMutationView> {
-    self
-      .send_command(|reply| Control::RemoveResource {
-        name,
-        expected,
-        reply,
-      })
-      .await
-  }
-
-  /// Actively leaves the cluster, replacing the node's identity (G9-06).
-  /// The node shuts down with `ShutdownReason::ActiveLeave` after the
-  /// outcome is reported.
-  pub(crate) async fn leave_cluster(
-    &self, acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
-  ) -> Result<crate::LeaveOutcome> {
-    self
-      .send_command(|reply| Control::LeaveCluster {
-        acknowledgement,
-        reply,
-      })
-      .await
   }
 
   /// Hands one outbound packet to the supervisor over the dedicated packet

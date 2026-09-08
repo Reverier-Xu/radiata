@@ -27,14 +27,14 @@ use crate::{
   storage::families::SCHEMA_NAMESPACE,
 };
 
-const BASE_RECORD_KIND: u8 = 1;
+pub(crate) const BASE_RECORD_KIND: u8 = 1;
 const EDGE_RECORD_KIND: u8 = 2;
 
-fn schema_key() -> StoreKey {
+pub(crate) fn schema_key() -> StoreKey {
   StoreKey::new(Arc::from(b"store".as_slice()))
 }
 
-fn schema_namespace() -> Result<StoreNamespace> {
+pub(crate) fn schema_namespace() -> Result<StoreNamespace> {
   Ok(StoreNamespace::new(crate::QualifiedTag::parse(
     SCHEMA_NAMESPACE,
   )?))
@@ -85,6 +85,58 @@ pub(crate) fn decode_schema_record(value: &StoreValue) -> Result<(u8, String, Op
 
 fn corrupt() -> Error {
   Error::unsupported_schema("metadata schema record")
+}
+
+/// The production metadata schema baseline: the record format every
+/// store carries before any migration edge exists. Stores created before
+/// versioning stamp this baseline on their first versioned open.
+pub(crate) const METADATA_SCHEMA_V1: &str = "radiata.woooo.tech/schemas/metadata-v1";
+
+/// The production migration chain. Every metadata format change lands
+/// here as one explicit edge, so an opened store always ends at the
+/// chain target before any consumer reads or recovers it. The chain is
+/// a compile-time constant, so the validation error is unreachable.
+pub(crate) fn production_registry() -> Result<MigrationRegistry> {
+  MigrationRegistry::new(METADATA_SCHEMA_V1, Vec::new())
+}
+
+/// The open-time schema gate: fail closed on a store whose schema
+/// version this build does not know, and upgrade — stamping and walking
+/// the explicit edge chain — only when the chain actually has edges to
+/// apply. While the production chain is the unedgeed baseline, an absent
+/// record is the baseline by definition, so opening a store writes
+/// nothing; a format change turns the same gate into the upgrade path.
+pub(crate) async fn ensure_open_schema(storage: &dyn Storage) -> Result<()> {
+  let registry = production_registry()?;
+  let snapshot = storage.snapshot().await?;
+  let existing = snapshot
+    .get(&schema_namespace()?, &schema_key())
+    .await?
+    .map(|value| decode_schema_record(&value))
+    .transpose()?;
+  drop(snapshot);
+  match existing {
+    // No record and nothing to migrate: the implicit baseline is current.
+    None if registry.target() == registry.base => Ok(()),
+    // A fresh store in a chain with edges, or a store behind the target:
+    // stamp and walk the explicit chain inside one conditional
+    // transaction per edge.
+    record => {
+      if let Some((kind, tag, digest)) = record {
+        let known = tag == registry.base || registry.edges.iter().any(|edge| edge.to == tag);
+        if !known {
+          return Err(Error::unsupported_schema("metadata schema version"));
+        }
+        if tag == registry.target() {
+          // Replay idempotence of the applied edge stays verified by
+          // ensure_schema; being at the target needs no writes.
+          return Ok(());
+        }
+        let _ = (kind, digest);
+      }
+      registry.ensure_schema(storage).await.map(|_| ())
+    }
+  }
 }
 
 /// The transform plan of one migration edge.
@@ -484,6 +536,71 @@ mod tests {
       Some(dir),
       Arc::new(crate::storage::redb::RedbStoreFactory::new(path)),
     )
+  }
+
+  /// The open-time gate: while the production chain has no edges, a
+  /// fresh store opens without any schema write (the absent record is
+  /// the implicit baseline) and a reopen is equally quiet.
+  #[cfg(all(feature = "json", unix))]
+  #[tokio::test]
+  async fn metadata_open_gate_accepts_fresh_and_reopened_stores_without_writes() {
+    let (_dir, factory) = json_factory();
+    crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(30))
+      .await
+      .unwrap();
+    // The first open released the store lock; the gate wrote nothing.
+    let raw = factory
+      .open(crate::StoreRequirements::metadata())
+      .await
+      .unwrap();
+    ensure_open_schema(raw.as_ref()).await.unwrap();
+    assert_eq!(read_schema(raw.as_ref()).await, None);
+    drop(raw);
+    crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(30))
+      .await
+      .unwrap();
+  }
+
+  /// A store whose schema record names a version outside the production
+  /// chain fails closed on open without mutating anything.
+  #[cfg(all(feature = "json", unix))]
+  #[tokio::test]
+  async fn metadata_open_rejects_a_schema_version_outside_the_chain() {
+    use crate::{StoreOperation, storage::families};
+    let (_dir, factory) = json_factory();
+    // Commit a foreign schema record through the raw storage before the
+    // metadata store ever opens.
+    let raw = factory
+      .open(crate::StoreRequirements::metadata())
+      .await
+      .unwrap();
+    let snapshot = raw.snapshot().await.unwrap();
+    let foreign = encode_schema_record(
+      BASE_RECORD_KIND,
+      "radiata.woooo.tech/schemas/metadata-foreign-v9",
+      None,
+    );
+    let transaction = StoreTransaction::new(
+      util::transaction_id(910),
+      snapshot.revision().clone(),
+      vec![StoreOperation::Put {
+        namespace: schema_namespace().unwrap(),
+        key: schema_key(),
+        expected: crate::StoreExpectation::Absent,
+        value: foreign,
+      }],
+    )
+    .unwrap();
+    assert!(matches!(
+      raw.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+    drop(raw);
+    let error = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(30))
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::UnsupportedSchema);
+    let _ = families::INTERNAL_NAMESPACE;
   }
 
   #[tokio::test]

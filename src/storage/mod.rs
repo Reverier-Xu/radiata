@@ -14,7 +14,8 @@ use crate::{
 /// short, so an entry wait queues a concurrent caller instead of surfacing
 /// the transient refusal. Keep it well under any caller-facing deadline.
 const ENTRY_WAIT_BOUND: Duration = Duration::from_secs(5);
-/// The commit-slot wait poll interval.
+/// The commit-slot wait backstop: finish paths notify parked waiters
+/// directly, so the backoff only bounds a lost-wakeup path.
 const ENTRY_WAIT_BACKOFF: Duration = Duration::from_millis(10);
 
 /// The process-wide writer exclusion for one [`MetadataStore`]: at most
@@ -129,6 +130,10 @@ pub(crate) struct MetadataStore {
   /// The writer exclusion: serializes every read-decide-commit section
   /// (see [`WriterLock`]).
   writer_lock: WriterLock,
+  /// Wakes commit-slot waiters when the state returns to Ready (or an
+  /// awaitable frozen outcome lands), so entry waits park instead of
+  /// polling. The backoff sleep stays as a lost-wakeup backstop.
+  ready_notify: tokio::sync::Notify,
   clock: Arc<dyn WallClock>,
   receipt_retention: Duration,
 }
@@ -222,6 +227,12 @@ impl MetadataStore {
         ProviderErrorContext::StorageOpen,
       ));
     }
+    // The opened store must sit inside the production schema chain
+    // before anything reads or recovers it: a version outside the chain
+    // fails closed without mutating anything, and a store behind the
+    // target walks the explicit edge chain (which, while the chain has
+    // no edges, writes nothing at all).
+    migration::ensure_open_schema(provider.as_ref()).await?;
     Ok(Self {
       provider,
       state: Mutex::new(state),
@@ -229,6 +240,7 @@ impl MetadataStore {
         holder: Mutex::new(None),
         released: tokio::sync::Notify::new(),
       },
+      ready_notify: tokio::sync::Notify::new(),
       clock,
       receipt_retention,
     })
@@ -269,7 +281,16 @@ impl MetadataStore {
           if std::time::Instant::now() >= deadline {
             return Err(error);
           }
-          tokio::time::sleep(ENTRY_WAIT_BACKOFF).await;
+          // Park until a finish path notifies, with the short backoff as
+          // a lost-wakeup backstop; either way the loop re-checks the
+          // state before waiting again.
+          let notified = self.ready_notify.notified();
+          tokio::pin!(notified);
+          notified.as_mut().enable();
+          tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(ENTRY_WAIT_BACKOFF) => {}
+          }
         }
         Err(error) => return Err(error),
       }
@@ -329,7 +350,14 @@ impl MetadataStore {
           if std::time::Instant::now() >= deadline {
             return Err(error);
           }
-          tokio::time::sleep(ENTRY_WAIT_BACKOFF).await;
+          // Same parked entry wait as commit (see there).
+          let notified = self.ready_notify.notified();
+          tokio::pin!(notified);
+          notified.as_mut().enable();
+          tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(ENTRY_WAIT_BACKOFF) => {}
+          }
         }
         Err(error) => return Err(error),
       }
@@ -417,6 +445,7 @@ impl MetadataStore {
   fn finish_ready(&self, call: ProviderCall<'_>) -> Result<()> {
     *self.lock_state()? = CommitState::Ready;
     call.complete();
+    self.ready_notify.notify_waiters();
     Ok(())
   }
 
@@ -432,6 +461,7 @@ impl MetadataStore {
     *provider_call_active = false;
     drop(state);
     call.complete();
+    self.ready_notify.notify_waiters();
     Ok(())
   }
 

@@ -12,12 +12,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use tracing::{debug, warn};
 
-use super::stream::{BoundedSender, PendingAck, PendingAcks, SessionFrame, SessionTable};
 use crate::{
   ErrorKind, NodeId, Result, TraceId,
   extension_registry::ExtensionRegistry,
   packet::wire::{self, AckStatus, ChunkFrame, EndFrame, OpenFrame},
   protocol::wire::PacketKind,
+  session::stream::{BoundedSender, PendingAck, PendingAcks, SessionFrame, SessionTable},
 };
 
 #[derive(Clone)]

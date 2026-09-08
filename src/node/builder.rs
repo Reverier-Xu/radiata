@@ -58,6 +58,9 @@ impl NodeBuilder {
     }
     let extensions = Arc::new(extensions);
     let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);
+    let (round_tx, round_rx) =
+      tokio::sync::mpsc::channel(crate::runtime::SYNC_ROUND_CHANNEL_CAPACITY);
     let client = {
       let (packet_tx, packet_rx) =
         tokio::sync::mpsc::channel(crate::runtime::PACKET_CHANNEL_CAPACITY);
@@ -76,12 +79,23 @@ impl NodeBuilder {
           sessions: Default::default(),
           routes: Default::default(),
           events: Arc::clone(&events),
+          member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
+          leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
+          sync_round_requests: round_tx,
+          connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
           runtime_seed: None,
         },
         (packet_tx, packet_rx),
+        round_rx,
       )
       .await?
     };
-    Ok(NodeHandle::new(client, self.entropy, extensions, events))
+    Ok(NodeHandle::new(
+      client,
+      self.entropy,
+      extensions,
+      events,
+      crate::node::MemberRevision::new(revision_rx),
+    ))
   }
 }

@@ -29,6 +29,7 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 use super::{
   deletion::delete_unreferenced_key,
   lifecycle::{CommitWithReconcile, LocalIdentityContext, commit_with_reconcile},
+  records,
   records::{LocalIdentityV1, local_identity_key},
 };
 use crate::{
@@ -330,28 +331,15 @@ pub(crate) async fn persist_leave_record_ctx(
 ) -> Result<()> {
   let _permit = store.write_permit().await;
   record.verify()?;
-  let namespace = leave_namespace()?;
-  let key = leave_record_key(record.node());
-  let snapshot = store.snapshot().await?;
-  if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    if existing.as_bytes() == record.encode()?.as_slice() {
-      return Ok(());
-    }
-    return Err(Error::conflict("leave record"));
-  }
-  let transaction = store.prepare_transaction(
-    TransactionId::generate(entropy)?,
-    snapshot.revision().clone(),
-    vec![StoreOperation::Put {
-      namespace,
-      key,
-      expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(record.encode()?)),
-    }],
-  )?;
-  drop(snapshot);
-  let _ = store.commit(transaction).await?;
-  Ok(())
+  records::persist_terminal_record(
+    store,
+    entropy,
+    leave_namespace()?,
+    leave_record_key(record.node()),
+    Arc::from(record.encode()?),
+    "leave record",
+  )
+  .await
 }
 
 /// Whether `node` has a leave record in the local store.
@@ -382,27 +370,21 @@ pub(crate) async fn left_nodes_ctx(
 pub(crate) async fn known_leave_records_ctx(
   store: &MetadataStore, cap: usize,
 ) -> Result<Vec<LeaveRecordV1>> {
-  let namespace = leave_namespace()?;
-  let snapshot = store.snapshot().await?;
-  let mut scan = snapshot.scan(&namespace, &[]).await?;
-  let mut records = Vec::new();
-  while let Some(entry) = scan.next().await? {
-    if entry.key().as_bytes() == INTENT_KEY {
-      continue;
-    }
-    let record = LeaveRecordV1::decode(entry.value().as_bytes())
-      .map_err(|_| Error::invalid_input("leave record decode"))?;
-    records.push(record);
-    if records.len() >= cap {
-      break;
-    }
-  }
-  Ok(records)
+  records::scan_decoded_records(
+    store,
+    leave_namespace()?,
+    cap,
+    intent_key_skip,
+    LeaveRecordV1::decode,
+  )
+  .await
 }
 
-/// The bounded per-pass GC batch on the leave family: one sweep deletes
-/// at most this many collected tombstones; the next sync round continues.
-const GC_BATCH: usize = 64;
+/// The leave family's namespace carries the leave-intent singleton under
+/// [`INTENT_KEY`]; the known-records scan must not decode it as a record.
+fn intent_key_skip(key: &StoreKey) -> bool {
+  key.as_bytes() == INTENT_KEY
+}
 
 /// The leave-side checkpoint sweep (ADR-0009 decision 5): conditional
 /// exact-digest deletes of collected leave records stamped at or before
@@ -410,35 +392,76 @@ const GC_BATCH: usize = 64;
 pub(crate) async fn collect_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
-  let _permit = store.write_permit().await;
   let namespace = leave_namespace()?;
-  let mut collected = 0_usize;
-  for record in known_leave_records_ctx(store, GC_BATCH).await? {
-    if record.timestamp_millis() > watermark {
-      continue;
-    }
-    let snapshot = store.snapshot().await?;
-    let key = leave_record_key(record.node());
-    let Some(existing) = snapshot.get(&namespace, &key).await? else {
-      continue;
-    };
-    let transaction = store.prepare_transaction(
-      TransactionId::generate(entropy)?,
-      snapshot.revision().clone(),
-      vec![StoreOperation::Delete {
-        namespace: namespace.clone(),
-        key,
-        expected: existing.digest().clone(),
-      }],
-    )?;
-    drop(snapshot);
-    // A raced write on this tombstone conflicts: it stays for the next
-    // pass (hygiene, never security).
-    if let crate::CommitOutcome::Committed(_) = store.commit(transaction).await? {
-      collected += 1;
-    }
+  let known = known_leave_records_ctx(store, records::TOMBSTONE_GC_BATCH).await?;
+  let entries: Vec<_> = known
+    .iter()
+    .map(|record| (leave_record_key(record.node()), record.timestamp_millis()))
+    .collect();
+  records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
+}
+
+/// One journaled leave drive: the signed terminal record plus the intent
+/// coordinates. The record is signed exactly once and reused verbatim by
+/// re-drives and startup resume, so a re-announcement can never diverge
+/// from a record a peer already holds (divergent records fail closed).
+pub(crate) struct JournaledLeave {
+  pub(crate) record: LeaveRecordV1,
+  pub(crate) stored: StoreValue,
+  pub(crate) intent: LeaveIntentV1,
+}
+
+/// Phase J of the leave pipeline, before any network effect: journal the
+/// intent, then sign and persist the terminal record into the leave
+/// family (which the wipe deliberately spares). The intent leads so a
+/// crash in between resumes as "intent without record" — the record is
+/// signed fresh because nothing was announced yet. A crash after this
+/// phase resumes at startup with the same journaled record.
+pub(crate) async fn journal_leave(
+  context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+) -> Result<JournaledLeave> {
+  let store = context.store();
+  // A pending intent from a crashed earlier drive owns its journaled
+  // record: reuse it verbatim.
+  if let Some((stored, intent)) = discover_leave_intent(store).await? {
+    let record = self_leave_record(store, &intent.former_node)
+      .await?
+      .ok_or_else(|| Error::internal("journaled leave record"))?;
+    return Ok(JournaledLeave {
+      record,
+      stored,
+      intent,
+    });
   }
-  Ok(collected)
+  let (stored, intent) = begin_intent(context, entropy).await?;
+  let record = sign_leave_record(context, keys).await?;
+  persist_leave_record_ctx(store, entropy, &record).await?;
+  Ok(JournaledLeave {
+    record,
+    stored,
+    intent,
+  })
+}
+
+/// The leaver's own journaled terminal record, when present (phase J or
+/// later). Snapshot reads only.
+async fn self_leave_record(store: &MetadataStore, node: &NodeId) -> Result<Option<LeaveRecordV1>> {
+  let namespace = leave_namespace()?;
+  let snapshot = store.snapshot().await?;
+  let Some(value) = snapshot.get(&namespace, &leave_record_key(node)).await? else {
+    return Ok(None);
+  };
+  Ok(Some(LeaveRecordV1::decode(value.as_bytes())?))
+}
+
+impl LeaveIntentV1 {
+  pub(crate) fn former_node(&self) -> &NodeId {
+    &self.former_node
+  }
+
+  pub(crate) fn replacement_node(&self) -> &NodeId {
+    &self.replacement_node
+  }
 }
 
 /// Discovers the pending leave-intent, if any.
@@ -586,22 +609,10 @@ async fn swap_identity(
     return Err(Error::conflict("leave identity swap"));
   }
   // The replacement handle must be provably fresh: a deletion intent or
-  // tombstone for it fails closed (the finalize_identity precedent).
-  let (deletion_namespace, deletion_key) =
-    crate::identity::records::key_deletion_intent_key(created.handle())?;
-  let (deleted_namespace, deleted_key) =
-    crate::identity::records::key_deleted_key(created.handle())?;
-  if snapshot
-    .get(&deletion_namespace, &deletion_key)
-    .await?
-    .is_some()
-    || snapshot
-      .get(&deleted_namespace, &deleted_key)
-      .await?
-      .is_some()
-  {
-    return Err(Error::conflict("key handle reuse"));
-  }
+  // tombstone for it fails closed (the finalize_identity precedent); the
+  // same guard keys are re-checked transactionally below.
+  records::assert_key_handle_fresh(snapshot.as_ref(), created.handle()).await?;
+  let [deletion_check, deleted_check] = records::key_handle_fresh_checks(created.handle())?;
   let prepared = store.prepare_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
@@ -612,16 +623,8 @@ async fn swap_identity(
         expected: StoreExpectation::Exact(former_value.digest().clone()),
         value: StoreValue::new(Arc::from(replacement.encode()?)),
       },
-      StoreOperation::Check {
-        namespace: deletion_namespace,
-        key: deletion_key,
-        expected: StoreExpectation::Absent,
-      },
-      StoreOperation::Check {
-        namespace: deleted_namespace,
-        key: deleted_key,
-        expected: StoreExpectation::Absent,
-      },
+      deletion_check,
+      deleted_check,
     ],
   )?;
   drop(snapshot);
@@ -655,7 +658,7 @@ async fn complete_leave(
 /// Runs the leave phases from the intent forward: replacement key, identity
 /// swap, metadata wipe, former-key deletion, completion. Idempotent and
 /// shared by the command path and the startup resume.
-async fn run_leave(
+pub(crate) async fn run_leave(
   store: &MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, stored: &StoreValue,
   intent: &LeaveIntentV1,
 ) -> Result<()> {
@@ -679,21 +682,26 @@ async fn run_leave(
   complete_leave(store, entropy, stored).await
 }
 
-/// Executes one active leave: journals the intent, then runs the phases.
-/// Returns the exact former and replacement identities for the outcome.
-/// A pending intent (left by a mid-phase failure) is resumed to
-/// completion instead of refusing: the operator can always re-drive a
-/// leave, and the resume is the same crash-recovery path startup uses.
+/// Test composition of the full drive without any announcement (the
+/// announcement is the sync plane's responsibility): journal the intent
+/// and record, then run the phases to completion.
+#[cfg(test)]
 pub(crate) async fn execute(
   context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
 ) -> Result<(NodeId, NodeId)> {
-  let store = context.store();
-  let (stored, intent) = match discover_leave_intent(store).await? {
-    Some((stored, intent)) => (stored, intent),
-    None => begin_intent(context, entropy).await?,
-  };
-  run_leave(store, keys, entropy, &stored, &intent).await?;
-  Ok((intent.former_node.clone(), intent.replacement_node.clone()))
+  let journaled = journal_leave(context, keys, entropy).await?;
+  run_leave(
+    context.store(),
+    keys,
+    entropy,
+    &journaled.stored,
+    &journaled.intent,
+  )
+  .await?;
+  Ok((
+    journaled.intent.former_node().clone(),
+    journaled.intent.replacement_node().clone(),
+  ))
 }
 
 /// Phase A: journals the leave-intent before any provider or identity
@@ -703,6 +711,14 @@ async fn begin_intent(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
 ) -> Result<(StoreValue, LeaveIntentV1)> {
   let store = context.store();
+  // The intent install joins the store's writer exclusion like every
+  // other identity phase: read-decide-commit on the Absent expectation is
+  // then atomic against internal writers (anti-entropy, neighbouring
+  // families), and only an external writer can still win the race. The
+  // bounded retries remain as the fail-closed second line for that
+  // residual window (the lock is task-reentrant, so run_leave's own
+  // permit below nests).
+  let _permit = store.write_permit().await;
   let former = context.identity().clone();
   let intent = LeaveIntentV1 {
     former_node: former.node().clone(),
@@ -712,11 +728,10 @@ async fn begin_intent(
     replacement_operation: KeyOperationId::generate(entropy)?,
   };
   let value = StoreValue::new(Arc::from(intent.encode()?));
-  // The intent's absent expectation races concurrent background commits
-  // (anti-entropy, neighbouring families). Losing that race is transient:
-  // the bounded retries re-snapshot and re-prepare the same intent instead
-  // of surfacing the conflict to the caller (the wipe batches use the
-  // same bounded-retry precedent).
+  // Losing the Absent expectation to an external writer is transient:
+  // the bounded retries re-snapshot and re-prepare the same intent
+  // instead of surfacing the conflict to the caller (the wipe batches
+  // use the same bounded-retry precedent).
   const INTENT_RACE_BUDGET: usize = 8;
   for _ in 0..INTENT_RACE_BUDGET {
     let snapshot = store.snapshot().await?;
@@ -1049,6 +1064,45 @@ mod tests {
   /// SC-G09-P0-21 (resume arm): a leave interrupted after the identity
   /// swap resumes to completion — never a mixed identity, a duplicate
   /// key, or restored old metadata.
+  /// The crash-retryable ordering (phase J leads): a journaled drive
+  /// reuses its signed record verbatim on re-drive, and a crash after
+  /// the journal resumes at startup to a fully replaced identity.
+  #[tokio::test]
+  async fn journaled_leave_is_idempotent_and_resumes() {
+    let factory = reference_factory();
+    let (keys, entropy, context) = open_store(&factory).await.unwrap();
+    seed_old_metadata(context.store(), entropy.as_ref())
+      .await
+      .unwrap();
+
+    let first = super::journal_leave(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap();
+    let again = super::journal_leave(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap();
+    assert_eq!(
+      first.record.encode().unwrap(),
+      again.record.encode().unwrap(),
+      "a re-drive reuses the journaled record verbatim"
+    );
+
+    // Simulate the crash: the drive never announces or rotates. The
+    // startup resume completes the phases with the same record.
+    let identity = resume_if_pending(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap()
+      .expect("the journaled leave resumes to a replacement identity");
+    assert_eq!(identity.node(), &first.intent.replacement_node);
+    // The leave is recorded, never forgotten: the former identity stays
+    // terminal evidence even after the wipe spares the leave family.
+    assert!(
+      is_left_ctx(context.store(), first.intent.former_node())
+        .await
+        .unwrap()
+    );
+  }
+
   #[tokio::test]
   async fn interrupted_leave_resumes_to_completion() {
     let factory = reference_factory();

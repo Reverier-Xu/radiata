@@ -25,9 +25,8 @@ use super::{
 /// The durable namespace of cleanup tombstone records.
 pub(crate) use crate::storage::families::CLEANUP_NAMESPACE;
 use crate::{
-  Error, NodeId, PublicKey, Result, Signature, StoreExpectation, StoreKey, StoreNamespace,
-  StoreOperation, StoreValue, TransactionId, api::Entropy, provider::KeyProvider,
-  storage::MetadataStore,
+  Error, NodeId, PublicKey, Result, Signature, StoreKey, StoreNamespace, StoreOperation,
+  StoreValue, TransactionId, api::Entropy, provider::KeyProvider, storage::MetadataStore,
 };
 
 /// The durable schema of the issuer-signed cleanup tombstone.
@@ -246,28 +245,15 @@ pub(crate) async fn persist_cleanup_record_ctx(
   {
     return Err(Error::not_trusted("cleanup subject binding"));
   }
-  let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
-  let key = cleanup_key(record.subject());
-  let snapshot = store.snapshot().await?;
-  if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    if existing.as_bytes() == record.encode()?.as_slice() {
-      return Ok(());
-    }
-    return Err(Error::conflict("cleanup record"));
-  }
-  let transaction = store.prepare_transaction(
-    TransactionId::generate(entropy)?,
-    snapshot.revision().clone(),
-    vec![StoreOperation::Put {
-      namespace: namespace.clone(),
-      key,
-      expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(record.encode()?)),
-    }],
-  )?;
-  drop(snapshot);
-  let _ = store.commit(transaction).await?;
-  Ok(())
+  crate::identity::records::persist_terminal_record(
+    store,
+    entropy,
+    metadata_namespace(CLEANUP_NAMESPACE)?,
+    cleanup_key(record.subject()),
+    Arc::from(record.encode()?),
+    "cleanup record",
+  )
+  .await
 }
 
 /// Whether `node` has a cleanup tombstone in the local store.
@@ -286,19 +272,14 @@ pub(crate) async fn is_cleaned_ctx(store: &MetadataStore, node: &NodeId) -> Resu
 pub(crate) async fn known_cleanup_records_ctx(
   store: &MetadataStore, cap: usize,
 ) -> Result<Vec<CleanupRecordV1>> {
-  let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
-  let snapshot = store.snapshot().await?;
-  let mut scan = snapshot.scan(&namespace, &[]).await?;
-  let mut records = Vec::new();
-  while let Some(entry) = scan.next().await? {
-    let record = CleanupRecordV1::decode(entry.value().as_bytes())
-      .map_err(|_| Error::invalid_input("cleanup record decode"))?;
-    records.push(record);
-    if records.len() >= cap {
-      break;
-    }
-  }
-  Ok(records)
+  crate::identity::records::scan_decoded_records(
+    store,
+    metadata_namespace(CLEANUP_NAMESPACE)?,
+    cap,
+    crate::identity::records::skip_none,
+    CleanupRecordV1::decode,
+  )
+  .await
 }
 
 /// Every cleaned node, for exclusion sweeps.
@@ -518,51 +499,20 @@ pub(crate) async fn collect_collected_tombstones_ctx(
 async fn collect_cleanup_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
-  let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
-  let known = known_cleanup_records_ctx(store, GC_BATCH).await?;
-  collect_before_in(store, entropy, namespace, watermark, &known).await
-}
-
-/// The bounded per-pass GC batch: one sweep deletes at most this many
-/// collected tombstones; the next sync round continues.
-const GC_BATCH: usize = 64;
-
-/// Conditional exact-digest deletes for the collected records in one
-/// namespace. `known` is the already-decoded record list for that
-/// namespace (the caller bounds it); each delete pins the stored value's
-/// digest, so a raced write conflicts instead of deleting blind.
-async fn collect_before_in(
-  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: u64,
-  known: &[CleanupRecordV1],
-) -> Result<usize> {
-  let _permit = store.write_permit().await;
-  let mut collected = 0_usize;
-  for record in known {
-    if record.timestamp_millis() > watermark {
-      continue;
-    }
-    let snapshot = store.snapshot().await?;
-    let key = cleanup_key(record.subject());
-    let Some(existing) = snapshot.get(&namespace, &key).await? else {
-      continue;
-    };
-    let transaction = store.prepare_transaction(
-      TransactionId::generate(entropy)?,
-      snapshot.revision().clone(),
-      vec![StoreOperation::Delete {
-        namespace: namespace.clone(),
-        key,
-        expected: existing.digest().clone(),
-      }],
-    )?;
-    drop(snapshot);
-    // A raced write on this tombstone conflicts: it stays for the next
-    // pass (hygiene, never security).
-    if let crate::CommitOutcome::Committed(_) = store.commit(transaction).await? {
-      collected += 1;
-    }
-  }
-  Ok(collected)
+  let known =
+    known_cleanup_records_ctx(store, crate::identity::records::TOMBSTONE_GC_BATCH).await?;
+  let entries: Vec<_> = known
+    .iter()
+    .map(|record| (cleanup_key(record.subject()), record.timestamp_millis()))
+    .collect();
+  crate::identity::records::collect_tombstones_before(
+    store,
+    entropy,
+    metadata_namespace(CLEANUP_NAMESPACE)?,
+    watermark,
+    &entries,
+  )
+  .await
 }
 
 #[cfg(test)]

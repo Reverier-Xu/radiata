@@ -16,14 +16,13 @@ use std::{
 use radiata::{
   BoxFuture, Endpoint, Error, ErrorKind, EventOptions, EventReceive, IdentityReplaced,
   KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, LeaveCluster, Listen,
-  NodeBuilder, NodeHandle, PublicKey, PutResource, ReplaceIdentityAndDeleteOldCoreMetadata,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, Shutdown, ShutdownReason,
-  Signature, WaitForShutdown, extension::KeyProvider,
+  NodeBuilder, NodeHandle, PageMembers, PageSpec, PublicKey, PutResource,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
+  ResourceWrite, Result, Shutdown, ShutdownReason, Signature, WaitForShutdown,
+  extension::KeyProvider,
 };
 #[cfg(any(feature = "json", feature = "redb"))]
-use radiata::{
-  PageMembers, PageSpec, PageTrust, SelectResources, Selector, extension::StorageFactory,
-};
+use radiata::{PageTrust, SelectResources, Selector, extension::StorageFactory};
 
 mod common;
 
@@ -346,19 +345,27 @@ async fn g11_leave_announces_to_connected_peers_before_rotating() {
   // The first admission acknowledgement arrived well inside the bound.
   assert!(started.elapsed() < Duration::from_secs(5));
 
-  // The peer observed the leave record for the former identity. Under a
-  // loaded runner the accept path can trail the announcement by seconds.
+  // The peer observed the leave record for the former identity. The
+  // authoritative observation is the member page (the applied leave
+  // removes the former descriptor); the event stream is only a fast
+  // path, because a loaded runner may lag the subscription and lag
+  // drops notifications without replaying them.
   let observed = tokio::time::timeout(Duration::from_secs(60), async {
     loop {
-      match member_events.recv().await {
-        Ok(EventReceive::Item(changed)) => {
-          tracing::debug!(node = %changed.node_id(), "peer observed member change");
-          if changed.node_id() == &former {
-            break;
-          }
-        }
-        Ok(_) => continue,
-        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+      let present = listener
+        .query(PageMembers::new(PageSpec::first(8).unwrap()))
+        .await
+        .unwrap()
+        .items()
+        .iter()
+        .any(|member| member.node_id() == &former);
+      if !present {
+        break;
+      }
+      match tokio::time::timeout(Duration::from_millis(200), member_events.recv()).await {
+        Ok(Ok(EventReceive::Item(changed))) if changed.node_id() == &former => break,
+        Ok(Ok(_)) => continue,
+        Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
       }
     }
   })
