@@ -410,7 +410,10 @@ impl StoreValue {
   /// alongside them, so reads do not recompute the digest. The caller
   /// guarantees the pair is consistent; a backend that persists digests
   /// writes both sides in one atomic transaction and fails closed when a
-  /// digest row is missing.
+  /// digest row is missing. Without a digest-persisting backend the only
+  /// callers live in that backend's feature build, which is intentionally
+  /// allowed.
+  #[cfg_attr(not(feature = "redb"), allow(dead_code))]
   pub(crate) fn from_parts(value: Arc<[u8]>, digest: Digest) -> Self {
     Self { value, digest }
   }
@@ -708,7 +711,9 @@ fn digest_store_value(value: &[u8]) -> Digest {
 /// operation digest. This is the single definition shared by every
 /// storage adapter AND the reference provider in the storage contract
 /// suite, so a condition bug cannot hide by being copied into both the
-/// oracle and the adapter under test.
+/// oracle and the adapter under test. Without a storage-backend feature
+/// the only callers live in test builds, which is intentionally allowed.
+#[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
 pub(crate) fn condition_matches(
   mut entry: impl FnMut(&StoreNamespace, &StoreKey) -> Result<Option<Digest>>,
   mut receipt: impl FnMut(&TransactionId) -> Result<Option<Digest>>, operation: &StoreOperation,
