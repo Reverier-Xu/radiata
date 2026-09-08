@@ -16,14 +16,13 @@ use std::{
 use radiata::{
   BoxFuture, Endpoint, Error, ErrorKind, EventOptions, EventReceive, IdentityReplaced,
   KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, LeaveCluster, Listen,
-  NodeBuilder, NodeHandle, PublicKey, PutResource, ReplaceIdentityAndDeleteOldCoreMetadata,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, Shutdown, ShutdownReason,
-  Signature, WaitForShutdown, extension::KeyProvider,
+  NodeBuilder, NodeHandle, PageMembers, PageSpec, PublicKey, PutResource,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
+  ResourceWrite, Result, Shutdown, ShutdownReason, Signature, WaitForShutdown,
+  extension::KeyProvider,
 };
 #[cfg(any(feature = "json", feature = "redb"))]
-use radiata::{
-  PageMembers, PageSpec, PageTrust, SelectResources, Selector, extension::StorageFactory,
-};
+use radiata::{PageTrust, SelectResources, Selector, extension::StorageFactory};
 
 mod common;
 
