@@ -76,6 +76,9 @@ async fn local_id(node: &NodeHandle) -> NodeId {
 async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round on the observer instead of the wall-clock tick.
+    issuer.command(radiata::RunSyncRound::new()).await.unwrap();
     let page = issuer
       .query(PageTrust::new(PageSpec::first(64).unwrap()))
       .await
@@ -87,7 +90,7 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
       deadline.elapsed() < Duration::from_secs(30),
       "member {member} must be trusted"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
   }
 }
 
@@ -160,7 +163,14 @@ async fn g11_cleanup_converges_and_excludes_the_subject() {
       deadline.elapsed() < Duration::from_secs(30),
       "observer never refused the cleaned subject"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The tombstone converges through ordinary sync: schedule the next
+    // observation round on the observer.
+    observer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
   }
 
   // The issuer refuses the cleaned subject's re-merge even with a fresh

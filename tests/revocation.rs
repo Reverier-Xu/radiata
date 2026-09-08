@@ -69,6 +69,9 @@ async fn local_id(node: &NodeHandle) -> NodeId {
 async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round on the observer instead of the wall-clock tick.
+    issuer.command(radiata::RunSyncRound::new()).await.unwrap();
     let page = issuer
       .query(PageTrust::new(PageSpec::first(64).unwrap()))
       .await
@@ -80,7 +83,7 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
       deadline.elapsed() < Duration::from_secs(30),
       "member {member} must be trusted"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
   }
 }
 
@@ -152,7 +155,13 @@ async fn g9_revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
       deadline.elapsed() < Duration::from_secs(30),
       "no resource sync"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Schedule the next convergence observation on the observer.
+    issuer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   let member_key = trusted_key(&issuer.handle, &member.id).await;
@@ -379,7 +388,13 @@ async fn g9_delayed_content_converges_after_revoke() {
       deadline.elapsed() < Duration::from_secs(30),
       "no resource sync"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Schedule the next convergence observation on the observer.
+    issuer
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // Revoke the member on the issuer, then join a third node: the revoked
@@ -403,7 +418,13 @@ async fn g9_delayed_content_converges_after_revoke() {
       deadline.elapsed() < Duration::from_secs(30),
       "delayed content must converge to the new member"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Schedule the next convergence observation on the observer.
+    third
+      .handle
+      .command(radiata::RunSyncRound::new())
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   // The revoked writer's binding also converges to the third member —
@@ -423,7 +444,13 @@ async fn g9_delayed_content_converges_after_revoke() {
           deadline.elapsed() < Duration::from_secs(30),
           "binding never converged"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Schedule the next convergence observation on the observer.
+        third
+          .handle
+          .command(radiata::RunSyncRound::new())
+          .await
+          .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
         continue;
       };
       if status == radiata::TrustStatus::Revoked {
@@ -433,7 +460,13 @@ async fn g9_delayed_content_converges_after_revoke() {
         deadline.elapsed() < Duration::from_secs(30),
         "revocation tombstone never converged: {status:?}"
       );
-      tokio::time::sleep(Duration::from_millis(100)).await;
+      // Schedule the next convergence observation on the observer.
+      third
+        .handle
+        .command(radiata::RunSyncRound::new())
+        .await
+        .unwrap();
+      tokio::time::sleep(Duration::from_millis(10)).await;
     }
   })
   .await

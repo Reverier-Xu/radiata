@@ -1190,6 +1190,6 @@ async fn wait_for_session(node: &Node) {
       std::time::Instant::now() < deadline,
       "no session registered"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
 }
