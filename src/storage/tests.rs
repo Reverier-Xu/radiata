@@ -75,9 +75,23 @@ impl StoreSnapshot for EmptySnapshot {
   }
 
   fn get<'a>(
-    &'a self, _namespace: &'a StoreNamespace, _key: &'a StoreKey,
+    &'a self, namespace: &'a StoreNamespace, key: &'a StoreKey,
   ) -> BoxFuture<'a, Result<Option<StoreValue>>> {
-    Box::pin(async { Ok(None) })
+    Box::pin(async move {
+      // The scripted store presents the production schema baseline, so
+      // the open-time migration pass takes its idempotent Current path
+      // and the scripted commits stay reserved for the test's own
+      // transactions.
+      let schema = crate::storage::migration::schema_namespace()?;
+      if namespace == &schema && key == &crate::storage::migration::schema_key() {
+        return Ok(Some(crate::storage::migration::encode_schema_record(
+          crate::storage::migration::BASE_RECORD_KIND,
+          crate::storage::migration::METADATA_SCHEMA_V1,
+          None,
+        )));
+      }
+      Ok(None)
+    })
   }
 
   fn scan<'a>(
@@ -270,7 +284,8 @@ async fn storage_contract_engine_unknown_and_commit_unknown_freeze_writes_but_al
     CommitOutcome::Unknown { .. }
   ));
   assert!(store.snapshot().await.is_ok());
-  assert_eq!(state.snapshot_calls.load(Ordering::SeqCst), 1);
+  // One snapshot from the test, one from the open-time schema pass.
+  assert_eq!(state.snapshot_calls.load(Ordering::SeqCst), 2);
   assert_eq!(
     store.commit(transaction(1)).await.unwrap_err().kind(),
     ErrorKind::NotReady,

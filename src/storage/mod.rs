@@ -227,6 +227,12 @@ impl MetadataStore {
         ProviderErrorContext::StorageOpen,
       ));
     }
+    // The opened store must sit inside the production schema chain
+    // before anything reads or recovers it: a version outside the chain
+    // fails closed without mutating anything, and a store behind the
+    // target walks the explicit edge chain (which, while the chain has
+    // no edges, writes nothing at all).
+    migration::ensure_open_schema(provider.as_ref()).await?;
     Ok(Self {
       provider,
       state: Mutex::new(state),
