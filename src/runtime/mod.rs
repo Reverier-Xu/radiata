@@ -1,5 +1,7 @@
 mod lifecycle;
+mod recovery;
 mod supervisor;
+mod views;
 
 pub(crate) use lifecycle::{Control, LifecycleSnapshot, RuntimeClient};
 pub(crate) use supervisor::{

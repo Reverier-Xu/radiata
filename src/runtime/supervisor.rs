@@ -8,8 +8,8 @@ use tokio::{
 use tracing::debug;
 
 use crate::{
-  Endpoint, Error, ErrorKind, IssuedMergeCredential, ListenerView, LocalNodeView, MergeView,
-  NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason, StreamTarget, TraceId,
+  Endpoint, Error, ErrorKind, IssuedMergeCredential, ListenerView, MergeView, NodeConfig, NodeId,
+  Result, ShutdownOutcome, ShutdownReason, StreamTarget, TraceId,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{
@@ -23,7 +23,7 @@ use crate::{
   runtime::{Control, LifecycleSnapshot, RuntimeClient},
   session::{
     SessionDriver,
-    stream::{SessionEntry, SessionPacketContext, SessionTable, run_outbound, run_session},
+    stream::{SessionPacketContext, SessionTable, run_outbound, run_session},
   },
   transport::{
     registry::{Transport, TransportListener},
@@ -599,37 +599,37 @@ async fn finish_shutdown(
   }
 }
 
-struct Supervisor {
-  dependencies: RuntimeDependencies,
-  shutdown_tx: watch::Sender<()>,
-  driver: SessionDriver,
-  packet: Arc<SessionPacketContext>,
-  route_capacity: usize,
-  listeners: BTreeMap<
+pub(super) struct Supervisor {
+  pub(super) dependencies: RuntimeDependencies,
+  pub(super) shutdown_tx: watch::Sender<()>,
+  pub(super) driver: SessionDriver,
+  pub(super) packet: Arc<SessionPacketContext>,
+  pub(super) route_capacity: usize,
+  pub(super) listeners: BTreeMap<
     crate::identity::ListenerId,
     (Endpoint, std::sync::Arc<dyn TransportListener>, AbortHandle),
   >,
-  recovery: crate::membership::recovery::RecoveryController,
-  recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-  published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
+  pub(super) recovery: crate::membership::recovery::RecoveryController,
+  pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
   // Members this node has ever authenticated a session with: the recovery
   // "known online" set. Recovery restores authenticated paths to exactly
   // these members (edge-loss healing) and never dials strangers, so it
   // cannot add edges beyond the caller-configured topology (SC-G05-P0-26).
-  recovery_history: std::collections::BTreeSet<NodeId>,
+  pub(super) recovery_history: std::collections::BTreeSet<NodeId>,
   // Intentionally disconnected peers: recovery never heals them until an
   // explicit reconnect (a new session to the peer) restores the
   // relationship (SC-G05-P0-26 no-extra-edge).
-  recovery_excluded: std::collections::BTreeSet<NodeId>,
+  pub(super) recovery_excluded: std::collections::BTreeSet<NodeId>,
   // The anti-entropy driver task: aborted on shutdown so the node's
   // storage handle is released promptly (a restarted node reopening the
   // same factory must not race a lingering driver).
-  sync_driver: Option<tokio::task::JoinHandle<()>>,
-  trace_sink: crate::routing::trace::TraceSink,
+  pub(super) sync_driver: Option<tokio::task::JoinHandle<()>>,
+  pub(super) trace_sink: crate::routing::trace::TraceSink,
   // Approximate live durable trace-record population, shared with the
   // sink (incremented per successful persistence) and decremented by the
   // retention sweep's removals; zero means sweeps can stay skipped.
-  trace_records: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  pub(super) trace_records: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Builds the node-shared packet context (single construction site):
@@ -1137,73 +1137,10 @@ impl Supervisor {
     }
   }
 
-  /// Resolves one live downstream session for a routed first hop through
-  /// the node's configured next-hop policy. `Ok(None)` means no policy or
-  /// no eligible hop exists and the caller fails the route explicitly.
-  async fn select_forward_entry(&self, destination: &NodeId) -> Result<Option<SessionEntry>> {
-    let Some(tag) = self.dependencies.config.route_policy() else {
-      debug!(destination = %destination, "no route policy configured; forward unavailable");
-      return Ok(None);
-    };
-    let Some(policy) = self.dependencies.extensions.next_hop_policy(tag) else {
-      tracing::warn!(tag = %tag, "configured route policy is not registered");
-      return Ok(None);
-    };
-    let local = self.packet.local().clone();
-    let peers = crate::sync_common::alive_peers(&self.dependencies.sessions)?;
-    let view = crate::routing::NextHopView {
-      destination,
-      local: &local,
-      peers: &peers,
-    };
-    let hop = policy.next_hop(view).await?;
-    let entry = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .get(&hop)
-      .filter(|entry| entry.alive())
-      .cloned();
-    debug!(hop = %hop, selected = entry.is_some(), "forward candidate resolved");
-    Ok(entry)
-  }
-
-  /// Resolves one matching-node target to exactly one eligible destination
-  /// (SC-G06-P0-02): the registered load-balancing policy selects among the
-  /// incrementally streamed candidates, and core independently validates
-  /// the pick against the authoritative descriptors — an unknown, removed,
-  /// or nonmatching node fails closed before any frame moves.
-  async fn select_matching_destination(
-    &self, selector: &crate::Selector, load_balancer: Option<&crate::QualifiedTag>,
-  ) -> Result<NodeId> {
-    let Some(load_balancer) = load_balancer else {
-      return Err(Error::invalid_input("packet load balancer"));
-    };
-    let policy = self
-      .dependencies
-      .extensions
-      .load_balancer(load_balancer)
-      .ok_or_else(|| Error::invalid_input("packet load balancer"))?;
-    let snapshot = self.context()?.store().snapshot().await?;
-    let reader = crate::routing::StoreCandidateReader::new(snapshot);
-    let selected = policy.select(selector, &reader).await?;
-    // Authoritative re-validation of the selected destination.
-    let descriptor =
-      crate::membership::store::read_descriptor_ctx(self.context()?.store(), &selected).await?;
-    let Some(descriptor) = descriptor else {
-      return Err(Error::not_found("packet destination"));
-    };
-    if descriptor.removed() || !selector.matches(descriptor.labels()) {
-      return Err(Error::not_trusted("packet destination"));
-    }
-    Ok(selected)
-  }
-
   /// Lazily publishes this node's own signed descriptor (revision 1) so
   /// the public views always expose the local identity, with the
   /// published listener endpoints.
-  async fn ensure_self_descriptor(&mut self) -> Result<()> {
+  pub(super) async fn ensure_self_descriptor(&mut self) -> Result<()> {
     let context = self.context()?;
     let endpoints = self
       .published_endpoints
@@ -1216,342 +1153,6 @@ impl Supervisor {
       endpoints,
     )
     .await
-  }
-
-  /// One member's public observation from the signed descriptor store and
-  /// the session table (SC-G05-P0-23..26).
-  async fn member(&mut self, node: NodeId) -> Result<Option<crate::MemberView>> {
-    self.ensure_self_descriptor().await?;
-    let connected = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .contains_key(&node);
-    let Some(descriptor) =
-      crate::membership::store::read_descriptor_ctx(self.context()?.store(), &node).await?
-    else {
-      return Ok(None);
-    };
-    Ok(Some(crate::membership::member_view(
-      &descriptor,
-      if connected {
-        crate::ConnectivityStatus::Connected
-      } else {
-        crate::ConnectivityStatus::Reachable
-      },
-    )?))
-  }
-
-  /// Pages the signed descriptors, annotating connectivity from the
-  /// session table (SC-G05-P0-23..25).
-  async fn page_members(
-    &mut self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::MemberPage> {
-    self.ensure_self_descriptor().await?;
-    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    // Snapshot the connected set under the lock, then release it before
-    // any await so the supervisor future stays `Send`.
-    let connected: std::collections::BTreeSet<NodeId> = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .keys()
-      .cloned()
-      .collect();
-    let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
-      crate::membership::NODE_DESCRIPTOR_NAMESPACE,
-    )?);
-    let snapshot = self.context()?.store().snapshot().await?;
-    let mut scan = snapshot.scan(&namespace, &[]).await?;
-    let paged = crate::paging::scan_paged(
-      scan.as_mut(),
-      cursor.as_ref().map(|cursor| cursor.as_bytes()),
-      limit,
-      |_key, bytes| {
-        let descriptor = crate::membership::page::decode_descriptor(bytes)?;
-        crate::membership::member_view(
-          &descriptor,
-          if connected.contains(descriptor.node()) {
-            crate::ConnectivityStatus::Connected
-          } else {
-            crate::ConnectivityStatus::Reachable
-          },
-        )
-        .map(Some)
-      },
-    )
-    .await?;
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::MemberPage::new(paged.items, next))
-  }
-
-  /// Pages the live resource winners matching one selector (SC-G09-P1-08).
-  async fn select_resources(
-    &mut self, selector: &crate::Selector, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::ResourcePage> {
-    crate::resource::select::select_page_ctx(
-      self.context()?.store(),
-      selector,
-      cursor.as_ref(),
-      limit,
-    )
-    .await
-  }
-
-  /// Pages every live resource winner in canonical name order (G9-07):
-  /// the reserved type label is always present, so its existence selector
-  /// is exactly the unfiltered catalog.
-  async fn page_resources(
-    &mut self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::ResourcePage> {
-    let all = crate::Selector::parse(crate::resource::RESERVED_TYPE_LABEL_KEY)?;
-    self.select_resources(&all, cursor, limit).await
-  }
-
-  /// Reads the live winner of one named resource (G9-07); a removed or
-  /// unknown name reads as absent.
-  async fn get_resource(
-    &mut self, name: &crate::ResourceName,
-  ) -> Result<Option<crate::ResourceView>> {
-    let record = crate::resource::store::read_record_ctx(self.context()?.store(), name).await?;
-    Ok(match record {
-      Some(record) if !record.removed() => Some(crate::resource::select::resource_view(&record)),
-      _ => None,
-    })
-  }
-
-  /// Pages the node's bound listeners in canonical id order (G9-07).
-  async fn page_listeners(
-    &mut self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::ListenerPage> {
-    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    let entries = self
-      .listeners
-      .iter()
-      .map(|(id, (endpoint, ..))| {
-        (
-          id.as_str().as_bytes().to_vec(),
-          crate::ListenerView::new(id.clone(), endpoint.clone()),
-        )
-      })
-      .collect::<Vec<_>>();
-    let paged = crate::paging::page_keys(
-      entries.into_iter(),
-      cursor.as_ref().map(|cursor| cursor.as_bytes()),
-      limit,
-    );
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::ListenerPage::new(paged.items, next))
-  }
-
-  /// Pages the live authenticated sessions in canonical peer order
-  /// (G9-07); selected features resolve their exact definition digests at
-  /// query time (SC-G09-P0-23).
-  async fn page_sessions(
-    &mut self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::SessionPage> {
-    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    let entries: Vec<(Vec<u8>, crate::SessionView)> = {
-      let sessions = self
-        .dependencies
-        .sessions
-        .lock()
-        .map_err(Error::session_table)?;
-      sessions
-        .iter()
-        .filter(|(_, entry)| entry.alive())
-        .map(|(peer, entry)| {
-          let features = entry
-            .meta
-            .features
-            .iter()
-            .filter_map(|tag| {
-              self
-                .dependencies
-                .extensions
-                .feature_digest(tag)
-                .map(|digest| crate::SessionFeatureView::new(tag.clone(), digest))
-            })
-            .collect();
-          (
-            peer.as_str().as_bytes().to_vec(),
-            crate::SessionView::new(
-              entry.meta.id.clone(),
-              entry.meta.generation,
-              peer.clone(),
-              entry.meta.endpoint.clone(),
-              features,
-            ),
-          )
-        })
-        .collect()
-    };
-    let paged = crate::paging::page_keys(
-      entries.into_iter(),
-      cursor.as_ref().map(|cursor| cursor.as_bytes()),
-      limit,
-    );
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::SessionPage::new(paged.items, next))
-  }
-
-  /// The bounded observability snapshot (T-G10-05, SC-G10-P0-15):
-  /// session/listener/task counters, queue totals, route and trace
-  /// counters, the pending-transaction count, and metadata-store
-  /// availability, captured at the local host wall clock. Counters and
-  /// flags only; the snapshot never enumerates a whole population and
-  /// carries no identity, address, path, selector, body, or credential
-  /// material.
-  async fn observability_snapshot(
-    &mut self, tasks: &JoinSet<()>,
-  ) -> Result<crate::ObservabilitySnapshot> {
-    let Some(context) = self.dependencies.context.clone() else {
-      return Err(Error::not_ready("observability snapshot"));
-    };
-    let (sessions, queued_messages, queued_bytes, audit_delta) = {
-      let table = self
-        .dependencies
-        .sessions
-        .lock()
-        .map_err(Error::session_table)?;
-      let messages = table.values().map(|entry| entry.queued_messages()).sum();
-      let bytes = table.values().map(|entry| entry.queued_bytes()).sum();
-      let audit: usize = table.values().map(|entry| entry.queue_audit_delta()).sum();
-      (table.len(), messages, bytes, audit)
-    };
-    let open_routes = {
-      let routes = self
-        .dependencies
-        .routes
-        .lock()
-        .map_err(Error::session_table)?;
-      routes.len()
-    };
-    let connection_tasks = self
-      .dependencies
-      .connection_tasks
-      .lock()
-      .map_err(Error::session_table)?
-      .len();
-    let background_tasks = tasks.len() + connection_tasks + usize::from(self.sync_driver.is_some());
-    let trace_records = self
-      .trace_records
-      .load(std::sync::atomic::Ordering::Relaxed);
-    let pending_transactions =
-      crate::storage::pending::pending_transaction_count(context.store()).await?;
-    let storage_available = !context.store().is_blocked()?;
-    if queued_messages > 0 || audit_delta != queued_messages {
-      tracing::warn!(
-        queued_messages,
-        queued_bytes,
-        audit_reserved_minus_removed = audit_delta,
-        "runtime status: queued session frames"
-      );
-    }
-    crate::ObservabilitySnapshot::new(
-      std::time::SystemTime::now(),
-      sessions,
-      self.listeners.len(),
-      background_tasks,
-      queued_messages,
-      queued_bytes,
-      open_routes,
-      trace_records,
-      pending_transactions,
-      storage_available,
-    )
-  }
-
-  /// Pages the authenticated sessions as directed topology edges
-  /// (SC-G05-P0-26).
-  async fn page_topology(
-    &mut self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::TopologyPage> {
-    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    // Build the edge list entirely under the lock (no await inside), so the
-    // guard drops before the future completes.
-    let context_node = self.context()?.identity().node().clone();
-    let paged = crate::paging::page_keys(
-      self
-        .dependencies
-        .sessions
-        .lock()
-        .map_err(Error::session_table)?
-        .iter()
-        .map(|(peer, entry)| {
-          (
-            peer.as_str().as_bytes().to_vec(),
-            crate::TopologyEdgeView::new(
-              context_node.clone(),
-              peer.clone(),
-              entry.alive(),
-              std::time::SystemTime::now(),
-            ),
-          )
-        }),
-      cursor.as_ref().map(|cursor| cursor.as_bytes()),
-      limit,
-    );
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::TopologyPage::new(paged.items, next))
-  }
-
-  /// Pages the public trust observations (SC-G05-P0-25): the exact
-  /// NodeId-to-key bindings verified locally, deterministically ordered
-  /// and bounded.
-  async fn page_trust(
-    &mut self, cursor: Option<crate::PageCursor>, limit: usize,
-  ) -> Result<crate::TrustPage> {
-    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    // Trust paging is offset-based (the trust store scans an ordered
-    // namespace in slices) while the other views keyset-paginate. The
-    // encoding still lives behind the opaque `PageCursor`, and a cursor
-    // that does not decode exactly fails closed instead of restarting
-    // the page at offset zero.
-    let offset = match cursor.as_ref() {
-      None => 0,
-      Some(cursor) => std::str::from_utf8(cursor.as_bytes())
-        .map_err(|_| Error::invalid_input("trust page cursor"))?
-        .parse::<usize>()
-        .map_err(|_| Error::invalid_input("trust page cursor"))?,
-    };
-    let context = self.context()?;
-    let observations =
-      crate::identity::trust::store::paged_trust_ctx(context.store(), offset, limit).await?;
-    let mut items = Vec::with_capacity(observations.bindings().len());
-    for binding in observations.bindings() {
-      // A locally revoked binding reports its exact status; the binding
-      // itself is never erased (ADR-0006: revoke is an authorization
-      // boundary, not content erasure).
-      let status = match crate::identity::revocation::revoked_key_ctx(
-        context.store(),
-        binding.node(),
-      )
-      .await?
-      {
-        Some(revoked) if &revoked == binding.key() => crate::TrustStatus::Revoked,
-        _ => crate::TrustStatus::Trusted,
-      };
-      items.push(crate::TrustedIdentityView::new(
-        binding.node().clone(),
-        binding.key().clone(),
-        status,
-      ));
-    }
-    let next = observations
-      .next()
-      .map(|next| crate::PageCursor::new(std::sync::Arc::from(next.to_string().into_bytes())));
-    Ok(crate::TrustPage::new(items, next))
   }
 
   /// Forces one bounded immediate recovery cycle (SC-G05-P0-19) and
@@ -2018,154 +1619,7 @@ impl Supervisor {
     Ok(crate::LeaveOutcome::new(former, replacement))
   }
 
-  /// The public recovery observation: whether every known online member
-  /// has an authenticated path, how many members remain unreachable, and
-  /// the next scheduled attempt.
-  fn recovery_view(&self) -> crate::RecoveryView {
-    let now = crate::time::now_seconds();
-    crate::RecoveryView::new(
-      self.recovery.state() == crate::membership::recovery::RecoveryState::Connected,
-      self.recovery.pending_count(),
-      self
-        .recovery
-        .next_attempt_seconds(now)
-        .map(crate::time::from_seconds),
-    )
-  }
-
-  /// One recovery observation tick: feed the controller the known-online
-  /// set (members this node ever authenticated a session with) and the
-  /// current direct sessions, then dial unreachable members whose
-  /// endpoints are published, through the configured bounded fan-out
-  /// (SC-G05-P0-14/17/22: recovery restores authenticated path
-  /// connectivity to known members and quiesces; it never dials strangers
-  /// or the local node, so it cannot add edges beyond the configured
-  /// topology).
-  async fn recovery_tick(&mut self) -> Result<()> {
-    let before = self.recovery_view();
-    let result = self.recovery_tick_inner().await;
-    let after = self.recovery_view();
-    if after != before {
-      self
-        .dependencies
-        .events
-        .emit(crate::RecoveryChanged::new(after));
-    }
-    result
-  }
-
-  async fn recovery_tick_inner(&mut self) -> Result<()> {
-    // Finished connection tasks keep their JoinHandles until reaped, so a
-    // long-lived listener would otherwise grow one dead handle per ever
-    // accepted connection and inflate the observability counts. Reaping
-    // each tick keeps the vec and the counts live-work only; abort() on a
-    // finished handle is a no-op, so shutdown semantics are unchanged.
-    if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
-      handles.retain(|handle| !handle.is_finished());
-    }
-    let direct: std::collections::BTreeSet<NodeId> = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .iter()
-      .filter(|(_, entry)| entry.alive())
-      .map(|(peer, _)| peer.clone())
-      .collect();
-    for peer in &direct {
-      self.recovery_history.insert(peer.clone());
-    }
-    let online = self.recovery_history.clone();
-    let now = crate::time::now_seconds();
-    self.recovery.observe(&online, &direct);
-    if self.recovery.state() != crate::membership::recovery::RecoveryState::Recovering
-      || !self.recovery.due(now)
-      || {
-        self
-          .recovery_pending
-          .load(std::sync::atomic::Ordering::Relaxed)
-          >= self.dependencies.config.recovery().fan_out().max(1)
-      }
-    {
-      return Ok(());
-    }
-    // Candidates are unreachable known members with a published endpoint
-    // from their signed descriptor; reachability stays distinct from the
-    // active topology and recovery never dials strangers (SC-G05-P0-11/18).
-    let bindings = crate::identity::trust::store::trusted_bindings(self.context()?.store()).await?;
-    // Left and cleaned nodes are excluded from recovery dialing
-    // (ADR-0009 decisions 3-4).
-    let mut excluded = crate::identity::cleanup::cleaned_nodes_ctx(self.context()?.store()).await?;
-    excluded.append(&mut crate::identity::leave::left_nodes_ctx(self.context()?.store()).await?);
-    // One snapshot for the whole cycle: per-member descriptor reads must
-    // not pay one snapshot acquisition each (a 1,024-member recovery tick
-    // would otherwise acquire 1,024 snapshots).
-    let snapshot = self.context()?.store().snapshot().await?;
-    let mut candidates = std::collections::BTreeSet::new();
-    for member in online.difference(&direct) {
-      if self.recovery_excluded.contains(member) || excluded.contains(member) {
-        continue;
-      }
-      // Only known members (a durable binding exists) are dialled.
-      if !bindings.contains_key(member) {
-        continue;
-      }
-      let descriptor =
-        crate::membership::store::read_descriptor_snapshot(snapshot.as_ref(), member).await;
-      if let Ok(Some(descriptor)) = descriptor
-        && let Some(endpoint) = descriptor.endpoints().first()
-      {
-        candidates.insert((member.clone(), endpoint.clone()));
-      }
-    }
-    let step = self.recovery.next_step(
-      now,
-      &candidates
-        .iter()
-        .map(|(member, _)| member.clone())
-        .collect(),
-    );
-    for (member, endpoint) in candidates {
-      if step.targets.contains(&member) {
-        // Recovery dials run in a detached task so the supervisor select
-        // loop never blocks on a handshake (each can take the full
-        // authentication deadline); the result is reconciled by the next
-        // observation tick.
-        self
-          .recovery_pending
-          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let receiver = endpoint.clone();
-        let peer = member.clone();
-        let driver = self.driver.clone();
-        let sessions = self.dependencies.sessions.clone();
-        let packet = self.packet.clone();
-        let shutdown = self.shutdown_tx.subscribe();
-        let pending = std::sync::Arc::clone(&self.recovery_pending);
-        let transport = Arc::clone(&self.dependencies.transport);
-        tokio::spawn(async move {
-          let _ = dial_member(
-            transport, driver, sessions, packet, shutdown, receiver, &peer,
-          )
-          .await;
-          // Release the in-flight slot when the dial resolves, so recovery
-          // stays alive across repeated partition waves (the counter bounds
-          // in-flight dials, not lifetime volume).
-          pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        });
-      }
-    }
-    Ok(())
-  }
-
-  async fn local_node(&mut self) -> Result<LocalNodeView> {
-    let context = self.context()?;
-    Ok(LocalNodeView::new(
-      context.identity().node().clone(),
-      context.identity().public_key().clone(),
-    ))
-  }
-
-  fn context(&self) -> Result<Arc<LocalIdentityContext>> {
+  pub(super) fn context(&self) -> Result<Arc<LocalIdentityContext>> {
     self
       .dependencies
       .context
@@ -2178,7 +1632,7 @@ impl Supervisor {
   /// reuse, rotation, signing, and new networking stay unavailable until
   /// an authoritative reopen reconciles the exact transaction or proves
   /// absence. Established authenticated sessions are unaffected.
-  fn require_unblocked(&self) -> Result<()> {
+  pub(super) fn require_unblocked(&self) -> Result<()> {
     let context = self.context()?;
     if context.store().is_blocked()? {
       return Err(Error::not_ready("metadata storage reconciliation"));
@@ -2192,7 +1646,7 @@ impl Supervisor {
 /// and exporter binding, then the session is kept open for packet streams.
 /// Called by `connect_member` and by the recovery controller's detached
 /// dial tasks.
-async fn dial_member(
+pub(super) async fn dial_member(
   transport: Arc<dyn Transport>, driver: SessionDriver,
   sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
   shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId,
