@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
+use tokio::sync::oneshot;
+
 use crate::{
   Command, ConnectMember, DisconnectPeer, Error, Event, EventOptions, EventSubscription,
-  GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRoute, Listen, MergeCluster,
-  NodeStatus, OutboundStream, PageMembers, PageTopology, PageTrust, ProtocolTag, Query, Result,
-  RotateMergeCredential, SelectResources, Shutdown, StartRecovery, StopListener, StreamMetadata,
-  StreamPolicy, StreamTarget, TraceId, UpdateNodeMetadata, WaitForShutdown,
+  GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRoute, IssuedMergeCredential,
+  Listen, MergeCluster, NodeId, NodeStatus, OutboundStream, PageMembers, PageTopology, PageTrust,
+  ProtocolTag, Query, Result, RotateMergeCredential, RouteStatusView, SelectResources, Shutdown,
+  ShutdownOutcome, ShutdownReason, StartRecovery, StopListener, StreamMetadata, StreamPolicy,
+  StreamTarget, TraceId, UpdateNodeMetadata, WaitForShutdown,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
-  runtime::RuntimeClient,
+  runtime::{Control, RuntimeClient},
+  view::{ListenerView, LocalNodeView, MergeView},
 };
 
 #[derive(Clone)]
@@ -20,271 +24,329 @@ pub struct NodeHandle {
   member_revision: crate::node::MemberRevision,
 }
 
-/// Executes one typed command against the runtime. Each command implements
-/// this itself, so the handle no longer hardcodes a per-kind TypeId dispatch
-/// table: adding a command requires exactly the struct in `operation.rs`
-/// plus its `DispatchCommand` impl, and the compiler rejects a command that
-/// forgets the impl.
+/// Arms one command into its control-bus message. Implementing this is
+/// what wires a command into the runtime: the generic dispatcher owns the
+/// send-and-await, and the compiler rejects a command that forgets the
+/// arm.
+pub(crate) trait CommandControl: Command {
+  fn control(self, reply: oneshot::Sender<Result<Self::Output>>) -> Control;
+}
+
+/// Executes one typed command against the runtime. Every command arms
+/// itself into one [`Control`] message via [`CommandControl`]; the
+/// generic dispatcher owns the send-and-await.
 pub(crate) trait DispatchCommand: Command {
   fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>>;
 }
 
-/// Executes one typed query against the runtime; see [`DispatchCommand`].
+impl<C: CommandControl> DispatchCommand for C {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<C::Output>> {
+    let runtime = runtime.clone();
+    Box::pin(async move { runtime.send_command(|reply| C::control(self, reply)).await })
+  }
+}
+
+/// Arms one query into its control-bus message; see [`CommandControl`].
+pub(crate) trait QueryControl: Query {
+  fn control(self, reply: oneshot::Sender<Result<Self::Output>>) -> Control;
+}
+
+/// Executes one typed query against the runtime; see [`CommandControl`].
 pub(crate) trait DispatchQuery: Query {
   fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>>;
 }
 
+impl<Q: QueryControl> DispatchQuery for Q {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Q::Output>> {
+    let runtime = runtime.clone();
+    Box::pin(async move { runtime.send_command(|reply| Q::control(self, reply)).await })
+  }
+}
+
+// Lifecycle specials that do not ride the Result-wrapped control bus: an
+// outcome-typed shutdown, a local status read, a shutdown wait, and a
+// route-table read. Each keeps its dedicated dispatch.
+
 impl DispatchCommand for Shutdown {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<ShutdownOutcome>> {
     let runtime = runtime.clone();
     Box::pin(async move { runtime.shutdown().await })
   }
 }
 
-impl DispatchCommand for RotateMergeCredential {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.rotate_merge_credential().await })
-  }
-}
-
-impl DispatchCommand for Listen {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let endpoint = self.into_endpoint();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.listen(endpoint).await })
-  }
-}
-
-impl DispatchCommand for StopListener {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let listener = self.into_listener();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.stop_listener(listener).await })
-  }
-}
-
-impl DispatchCommand for MergeCluster {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let (receiver, credential) = self.into_parts();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.merge_cluster(receiver, credential).await })
-  }
-}
-
-impl DispatchCommand for ConnectMember {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let (receiver, peer) = self.into_parts();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.connect_member(receiver, peer).await })
-  }
-}
-
 impl DispatchQuery for GetNodeStatus {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<NodeStatus>> {
     let runtime = runtime.clone();
     Box::pin(async move { Ok(runtime.status()) })
   }
 }
 
-impl DispatchQuery for GetObservability {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.observability_snapshot().await })
-  }
-}
-
 impl DispatchQuery for WaitForShutdown {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<ShutdownReason>> {
     let runtime = runtime.clone();
     Box::pin(async move { runtime.wait_for_shutdown().await })
   }
 }
 
-impl DispatchQuery for GetLocalNode {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl DispatchQuery for GetRoute {
+  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<RouteStatusView>> {
+    let handle = self.handle().clone();
     let runtime = runtime.clone();
-    Box::pin(async move { runtime.local_node().await })
+    Box::pin(async move { runtime.route_status(&handle) })
   }
 }
 
-impl DispatchQuery for GetMember {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+// Commands.
+
+impl CommandControl for RotateMergeCredential {
+  fn control(self, reply: oneshot::Sender<Result<IssuedMergeCredential>>) -> Control {
+    Control::RotateMergeCredential { reply }
+  }
+}
+
+impl CommandControl for Listen {
+  fn control(self, reply: oneshot::Sender<Result<ListenerView>>) -> Control {
+    let endpoint = self.into_endpoint();
+    Control::Listen { endpoint, reply }
+  }
+}
+
+impl CommandControl for StopListener {
+  fn control(self, reply: oneshot::Sender<Result<()>>) -> Control {
+    let listener = self.into_listener();
+    Control::StopListener { listener, reply }
+  }
+}
+
+impl CommandControl for MergeCluster {
+  fn control(self, reply: oneshot::Sender<Result<MergeView>>) -> Control {
+    let (receiver, credential) = self.into_parts();
+    Control::MergeCluster {
+      receiver,
+      credential,
+      reply,
+    }
+  }
+}
+
+impl CommandControl for ConnectMember {
+  fn control(self, reply: oneshot::Sender<Result<NodeId>>) -> Control {
+    let (receiver, peer) = self.into_parts();
+    Control::ConnectMember {
+      receiver,
+      peer,
+      reply,
+    }
+  }
+}
+
+impl CommandControl for StartRecovery {
+  fn control(self, reply: oneshot::Sender<Result<crate::RecoveryView>>) -> Control {
+    Control::StartRecovery { reply }
+  }
+}
+
+impl CommandControl for DisconnectPeer {
+  fn control(self, reply: oneshot::Sender<Result<()>>) -> Control {
+    let peer = self.peer().clone();
+    Control::DisconnectPeer { peer, reply }
+  }
+}
+
+impl CommandControl for UpdateNodeMetadata {
+  fn control(self, reply: oneshot::Sender<Result<crate::MemberView>>) -> Control {
+    let (expected_revision, patch) = self.into_parts();
+    Control::UpdateNodeMetadata {
+      expected_revision,
+      patch,
+      reply,
+    }
+  }
+}
+
+impl CommandControl for crate::PutResource {
+  fn control(self, reply: oneshot::Sender<Result<crate::ResourceMutationView>>) -> Control {
+    let write = crate::PutResource::into_write(self);
+    Control::PutResource { write, reply }
+  }
+}
+
+impl CommandControl for crate::RevokeNode {
+  fn control(self, reply: oneshot::Sender<Result<crate::RevokeOutcome>>) -> Control {
+    let (subject, expected_key) = self.into_parts();
+    Control::RevokeNode {
+      subject,
+      expected_key,
+      reply,
+    }
+  }
+}
+
+impl CommandControl for crate::CleanupNode {
+  fn control(self, reply: oneshot::Sender<Result<()>>) -> Control {
+    let subject = self.into_subject();
+    Control::CleanupNode { subject, reply }
+  }
+}
+
+impl CommandControl for crate::IssueCleanupCheckpoint {
+  fn control(self, reply: oneshot::Sender<Result<u64>>) -> Control {
+    Control::IssueCleanupCheckpoint { reply }
+  }
+}
+
+impl CommandControl for crate::RunSyncRound {
+  fn control(self, reply: oneshot::Sender<Result<()>>) -> Control {
+    Control::RunSyncRound { reply }
+  }
+}
+
+impl CommandControl for crate::PurgeRevocation {
+  fn control(self, reply: oneshot::Sender<Result<()>>) -> Control {
+    let subject = self.into_subject();
+    Control::PurgeRevocation { subject, reply }
+  }
+}
+
+impl CommandControl for crate::RemoveResource {
+  fn control(self, reply: oneshot::Sender<Result<crate::ResourceMutationView>>) -> Control {
+    let (name, expected) = self.into_parts();
+    Control::RemoveResource {
+      name,
+      expected,
+      reply,
+    }
+  }
+}
+
+impl CommandControl for crate::LeaveCluster {
+  fn control(self, reply: oneshot::Sender<Result<crate::LeaveOutcome>>) -> Control {
+    let acknowledgement = *self.acknowledgement();
+    Control::LeaveCluster {
+      acknowledgement,
+      reply,
+    }
+  }
+}
+
+// Queries.
+
+impl QueryControl for GetObservability {
+  fn control(self, reply: oneshot::Sender<Result<crate::ObservabilitySnapshot>>) -> Control {
+    Control::Observability { reply }
+  }
+}
+
+impl QueryControl for GetLocalNode {
+  fn control(self, reply: oneshot::Sender<Result<LocalNodeView>>) -> Control {
+    Control::GetLocalNode { reply }
+  }
+}
+
+impl QueryControl for GetMember {
+  fn control(self, reply: oneshot::Sender<Result<Option<crate::MemberView>>>) -> Control {
     let node = self.node().clone();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.member(node).await })
+    Control::GetMember { node, reply }
   }
 }
 
-impl DispatchQuery for PageMembers {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for PageMembers {
+  fn control(self, reply: oneshot::Sender<Result<crate::MemberPage>>) -> Control {
     let page = self.page();
     let cursor = page.cursor().cloned();
     let limit = page.limit();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.page_members(cursor, limit).await })
+    Control::PageMembers {
+      cursor,
+      limit,
+      reply,
+    }
   }
 }
 
-impl DispatchQuery for SelectResources {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for SelectResources {
+  fn control(self, reply: oneshot::Sender<Result<crate::ResourcePage>>) -> Control {
     let selector = self.selector().clone();
     let page = self.page();
     let cursor = page.cursor().cloned();
     let limit = page.limit();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.select_resources(selector, cursor, limit).await })
+    Control::SelectResources {
+      selector,
+      cursor,
+      limit,
+      reply,
+    }
   }
 }
 
-impl DispatchQuery for crate::GetResource {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for crate::GetResource {
+  fn control(self, reply: oneshot::Sender<Result<Option<crate::ResourceView>>>) -> Control {
     let name = self.name().clone();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.get_resource(name).await })
+    Control::GetResource { name, reply }
   }
 }
 
-impl DispatchQuery for crate::PageResources {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for crate::PageResources {
+  fn control(self, reply: oneshot::Sender<Result<crate::ResourcePage>>) -> Control {
     let page = self.page();
     let cursor = page.cursor().cloned();
     let limit = page.limit();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.page_resources(cursor, limit).await })
+    Control::PageResources {
+      cursor,
+      limit,
+      reply,
+    }
   }
 }
 
-impl DispatchQuery for crate::PageListeners {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for crate::PageListeners {
+  fn control(self, reply: oneshot::Sender<Result<crate::ListenerPage>>) -> Control {
     let page = self.page();
     let cursor = page.cursor().cloned();
     let limit = page.limit();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.page_listeners(cursor, limit).await })
+    Control::PageListeners {
+      cursor,
+      limit,
+      reply,
+    }
   }
 }
 
-impl DispatchQuery for crate::PageSessions {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for crate::PageSessions {
+  fn control(self, reply: oneshot::Sender<Result<crate::SessionPage>>) -> Control {
     let page = self.page();
     let cursor = page.cursor().cloned();
     let limit = page.limit();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.page_sessions(cursor, limit).await })
+    Control::PageSessions {
+      cursor,
+      limit,
+      reply,
+    }
   }
 }
 
-impl DispatchQuery for PageTopology {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for PageTopology {
+  fn control(self, reply: oneshot::Sender<Result<crate::TopologyPage>>) -> Control {
     let page = self.page();
     let cursor = page.cursor().cloned();
     let limit = page.limit();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.page_topology(cursor, limit).await })
+    Control::PageTopology {
+      cursor,
+      limit,
+      reply,
+    }
   }
 }
 
-impl DispatchQuery for PageTrust {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
+impl QueryControl for PageTrust {
+  fn control(self, reply: oneshot::Sender<Result<crate::TrustPage>>) -> Control {
     let page = self.page();
     let cursor = page.cursor().cloned();
     let limit = page.limit();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.page_trust(cursor, limit).await })
-  }
-}
-
-impl DispatchCommand for StartRecovery {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.start_recovery().await })
-  }
-}
-
-impl DispatchCommand for DisconnectPeer {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let peer = self.peer().clone();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.disconnect_peer(peer).await })
-  }
-}
-
-impl DispatchCommand for UpdateNodeMetadata {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let (expected_revision, patch) = self.into_parts();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.update_node_metadata(expected_revision, patch).await })
-  }
-}
-
-impl DispatchCommand for crate::PutResource {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let write = crate::PutResource::into_write(self);
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.put_resource(write).await })
-  }
-}
-
-impl DispatchCommand for crate::RevokeNode {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let (subject, expected_key) = self.into_parts();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.revoke_node(subject, expected_key).await })
-  }
-}
-
-impl DispatchCommand for crate::CleanupNode {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let subject = self.into_subject();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.cleanup_node(subject).await })
-  }
-}
-
-impl DispatchCommand for crate::IssueCleanupCheckpoint {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.issue_cleanup_checkpoint().await })
-  }
-}
-
-impl DispatchCommand for crate::RunSyncRound {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.run_sync_round().await })
-  }
-}
-
-impl DispatchCommand for crate::PurgeRevocation {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let subject = self.into_subject();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.purge_revocation(subject).await })
-  }
-}
-
-impl DispatchCommand for crate::RemoveResource {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let (name, expected) = self.into_parts();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.remove_resource(name, expected).await })
-  }
-}
-
-impl DispatchCommand for crate::LeaveCluster {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let acknowledgement = *self.acknowledgement();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.leave_cluster(acknowledgement).await })
-  }
-}
-
-impl DispatchQuery for GetRoute {
-  fn dispatch(self, runtime: &RuntimeClient) -> BoxFuture<'static, Result<Self::Output>> {
-    let handle = self.handle().clone();
-    let runtime = runtime.clone();
-    Box::pin(async move { runtime.route_status(&handle) })
+    Control::PageTrust {
+      cursor,
+      limit,
+      reply,
+    }
   }
 }
 
