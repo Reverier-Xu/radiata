@@ -498,6 +498,10 @@ async fn supervise(
         let result = supervisor.issue_cleanup_checkpoint().await;
         let _ = reply.send(result);
       }
+      Control::ApplyReceiptRetention { reply } => {
+        let result = supervisor.apply_receipt_retention().await;
+        let _ = reply.send(result);
+      }
       Control::RunSyncRound { reply } => {
         let result = supervisor.run_sync_round().await;
         let _ = reply.send(result);
@@ -1470,6 +1474,15 @@ impl Supervisor {
     let context = self.context()?;
     crate::identity::cleanup::issue_checkpoint_ctx(&context, self.dependencies.entropy.as_ref())
       .await
+  }
+
+  /// Forgets every anchored receipt past its retention deadline. The
+  /// unknown-outcome freeze blocks the pass: a pending unknown may still
+  /// reference its receipt, and cleanup conflicts rather than guesses.
+  async fn apply_receipt_retention(&mut self) -> Result<crate::view::ReceiptRetentionReport> {
+    self.require_unblocked()?;
+    let context = self.context()?;
+    context.store().apply_receipt_retention().await
   }
 
   /// Forwards the RunSyncRound request to the sync driver (the cursor

@@ -349,6 +349,15 @@ pub struct RunSyncRound { /* private */ }
 impl RunSyncRound { pub fn new() -> Self; }
 impl Command for RunSyncRound { type Output = (); }
 
+pub struct ApplyReceiptRetention { /* private */ }
+impl ApplyReceiptRetention { pub fn new() -> Self; }
+impl Command for ApplyReceiptRetention { type Output = ReceiptRetentionReport; }
+
+pub struct ReceiptRetentionReport {
+    pub forgotten: u64,
+    pub remaining: bool,
+}
+
 pub struct ConnectMember { /* private */ }
 impl ConnectMember { pub fn new(receiver: Endpoint, peer: NodeId) -> Self; }
 impl Command for ConnectMember { type Output = NodeId; }

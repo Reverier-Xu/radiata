@@ -1,7 +1,7 @@
 schema = "radiata.woooo.tech/schemas/api-inventory-v1"
 status = "accepted"
 document = "docs/api-manifest.md"
-sha256 = "ade2476cf7db4415c58fe1dbfdc18c18664291555141e18b27ef0681d080e5de"
+sha256 = "2f0dc39c64592189937c23e9dadee36ebeb74b10f53ced1f52bd073f8a8dcc9b"
 
 node_handle_signatures = [
   "pub async fn command<C: Command>(&self, command: C) -> Result<C::Output>;",

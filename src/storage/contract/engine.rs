@@ -15,9 +15,10 @@ use crate::{
     MetadataStore,
     receipt::{
       ACTIVE_MARKER_VALUE, FORGOTTEN_MARKER_VALUE, ReceiptCleanupOutcome, ReceiptIdentity,
-      ReceiptReferenceOutcome, ReceiptReferenceToken, WallClock, decode_wall_time,
-      eligibility_anchor_key, encode_wall_time, increment_reference_count, internal_namespace,
-      reference_edge_key, reference_head_key, used_id_key,
+      ReceiptReferenceOutcome, ReceiptReferenceToken, WallClock, decode_anchor_value,
+      decode_wall_time, eligibility_anchor_key, encode_anchor_value, encode_wall_time,
+      increment_reference_count, internal_namespace, reference_edge_key, reference_head_key,
+      used_id_key,
     },
   },
 };
@@ -225,6 +226,70 @@ async fn storage_contract_prepared_transactions_are_atomic_idempotent_and_perman
 }
 
 #[tokio::test]
+async fn storage_contract_retention_sweep_forgets_only_past_deadline_anchored_receipts() {
+  let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+  let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+  let snapshot = store.snapshot().await.unwrap();
+  let prepared = store
+    .prepare_transaction(
+      contract_transaction_id(20),
+      snapshot.revision().clone(),
+      vec![StoreOperation::Put {
+        namespace: namespace("retention-sweep"),
+        key: store_key(b"record"),
+        expected: StoreExpectation::Absent,
+        value: value(b"payload"),
+      }],
+    )
+    .unwrap();
+  let receipt = committed(store.commit(prepared).await.unwrap());
+  let identity = ReceiptIdentity::from_receipt(&receipt);
+
+  // Nothing is anchored, so the sweep forgets nothing.
+  let report = store.apply_receipt_retention().await.unwrap();
+  assert_eq!(report.forgotten, 0);
+  assert!(!report.remaining);
+
+  // Anchoring starts the retention clock; inside the window the sweep
+  // retains.
+  assert!(matches!(
+    store
+      .cleanup_receipt(&identity, contract_transaction_id(21))
+      .await
+      .unwrap(),
+    ReceiptCleanupOutcome::Anchored(_)
+  ));
+  let report = store.apply_receipt_retention().await.unwrap();
+  assert_eq!(report.forgotten, 0);
+  assert!(!report.remaining);
+
+  // Past the deadline the same explicit pass forgets, and a repeat pass
+  // is an idempotent no-op.
+  clock.set(UNIX_EPOCH + Duration::from_secs(200));
+  let report = store.apply_receipt_retention().await.unwrap();
+  assert_eq!(report.forgotten, 1);
+  assert!(!report.remaining);
+  assert_eq!(
+    store
+      .snapshot()
+      .await
+      .unwrap()
+      .get(
+        &internal_namespace().unwrap(),
+        &used_id_key(&contract_transaction_id(20)).unwrap()
+      )
+      .await
+      .unwrap()
+      .unwrap()
+      .as_bytes(),
+    FORGOTTEN_MARKER_VALUE
+  );
+  let report = store.apply_receipt_retention().await.unwrap();
+  assert_eq!(report.forgotten, 0);
+}
+
+#[tokio::test]
 async fn storage_contract_opaque_reference_categories_block_cleanup_until_final_removal() {
   let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
   let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(200)));
@@ -397,9 +462,13 @@ async fn storage_contract_reference_addition_and_final_disappearance_reset_reten
     .await
     .unwrap()
     .unwrap();
+  // The anchor carries the anchoring time plus the conditioned digest.
   assert_eq!(
-    decode_wall_time(anchor.as_bytes()).unwrap(),
-    UNIX_EPOCH + Duration::from_secs(320)
+    decode_anchor_value(anchor.as_bytes()).unwrap(),
+    (
+      UNIX_EPOCH + Duration::from_secs(320),
+      target.operation_digest().clone()
+    )
   );
   clock.set(UNIX_EPOCH + Duration::from_secs(329));
   assert!(matches!(
@@ -879,7 +948,10 @@ async fn storage_contract_deadline_overflow_retains_without_provider_commit() {
         internal_namespace().unwrap(),
         eligibility_anchor_key(target.transaction()).unwrap(),
       ),
-      StoreValue::new(Arc::from(encode_wall_time(anchor_time))),
+      StoreValue::new(Arc::from(encode_anchor_value(
+        anchor_time,
+        &Digest::from_bytes([7; 32]),
+      ))),
     );
   }
   let before = factory.commit_calls.load(Ordering::SeqCst);

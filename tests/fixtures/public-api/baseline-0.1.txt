@@ -165,6 +165,11 @@ pub radiata::StreamTarget::MatchingNodes(radiata::Selector)
 #[non_exhaustive] pub enum radiata::TrustStatus
 pub radiata::TrustStatus::Revoked
 pub radiata::TrustStatus::Trusted
+pub struct radiata::ApplyReceiptRetention
+impl radiata::ApplyReceiptRetention
+pub fn radiata::ApplyReceiptRetention::new() -> Self
+impl radiata::Command for radiata::ApplyReceiptRetention
+pub type radiata::ApplyReceiptRetention::Output = radiata::ReceiptRetentionReport
 pub struct radiata::ChannelBinding(_)
 impl radiata::ChannelBinding
 pub const fn radiata::ChannelBinding::as_bytes(&self) -> &[u8; 32]
@@ -641,6 +646,9 @@ pub fn radiata::QualifiedTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core:
 impl core::str::traits::FromStr for radiata::QualifiedTag
 pub type radiata::QualifiedTag::Err = radiata::Error
 pub fn radiata::QualifiedTag::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::ReceiptRetentionReport
+pub radiata::ReceiptRetentionReport::forgotten: u64
+pub radiata::ReceiptRetentionReport::remaining: bool
 pub struct radiata::RecoveryChanged
 impl radiata::RecoveryChanged
 pub fn radiata::RecoveryChanged::recovery(&self) -> &radiata::RecoveryView
@@ -973,6 +981,8 @@ pub trait radiata::CandidateNodeReader: radiata::routing::private::Sealed + core
 pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, &'a radiata::Selector, core::option::Option<radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
 pub trait radiata::Command: radiata::operation::private::Sealed + core::marker::Send + 'static
 pub type radiata::Command::Output: core::marker::Send + 'static
+impl radiata::Command for radiata::ApplyReceiptRetention
+pub type radiata::ApplyReceiptRetention::Output = radiata::ReceiptRetentionReport
 impl radiata::Command for radiata::CleanupNode
 pub type radiata::CleanupNode::Output = ()
 impl radiata::Command for radiata::ConnectMember

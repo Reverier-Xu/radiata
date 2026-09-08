@@ -512,6 +512,30 @@ impl Command for IssueCleanupCheckpoint {
   type Output = u64;
 }
 
+/// Applies receipt retention across the node's metadata store: every
+/// anchored receipt whose retention deadline has elapsed is forgotten
+/// through the cleanup state machine, and every other receipt is left
+/// exactly as it is. The pass is explicit, idempotent, and latency
+/// bounded; issue it again while [`crate::ReceiptRetentionReport::
+/// remaining`] reports true. Anchoring itself is the owning state
+/// machine's decision and is not performed by this command.
+pub struct ApplyReceiptRetention {
+  _private: (),
+}
+
+#[allow(clippy::new_without_default)]
+impl ApplyReceiptRetention {
+  pub fn new() -> Self {
+    Self { _private: () }
+  }
+}
+
+impl private::Sealed for ApplyReceiptRetention {}
+
+impl Command for ApplyReceiptRetention {
+  type Output = crate::view::ReceiptRetentionReport;
+}
+
 /// Runs one full anti-entropy round now: pages the local membership and
 /// resource registers and pushes them over every authenticated session,
 /// exactly like a wall-clock tick, and completes when the round finishes.

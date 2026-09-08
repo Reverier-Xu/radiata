@@ -163,6 +163,9 @@ pub(crate) enum Control {
   IssueCleanupCheckpoint {
     reply: oneshot::Sender<Result<u64>>,
   },
+  ApplyReceiptRetention {
+    reply: oneshot::Sender<Result<crate::view::ReceiptRetentionReport>>,
+  },
   RunSyncRound {
     reply: oneshot::Sender<Result<()>>,
   },

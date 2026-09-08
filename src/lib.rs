@@ -80,13 +80,13 @@ pub use node::{
   EventOptions, EventReceive, EventSubscription, MemberRevision, NodeBuilder, NodeHandle,
 };
 pub use operation::{
-  CleanupNode, Command, ConnectMember, DisconnectPeer, Event, GetLocalNode, GetMember,
-  GetNodeStatus, GetObservability, GetResource, GetRoute, IdentityReplaced, IssueCleanupCheckpoint,
-  LeaveCluster, Listen, MemberChanged, MergeCluster, NodeRevoked, PageListeners, PageMembers,
-  PageResources, PageSessions, PageTopology, PageTrust, PurgeRevocation, PutResource, Query,
-  RecoveryChanged, RemoveResource, ResourceChanged, ResourceWrite, RevokeNode,
-  RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources, SessionChanged, Shutdown,
-  StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
+  ApplyReceiptRetention, CleanupNode, Command, ConnectMember, DisconnectPeer, Event, GetLocalNode,
+  GetMember, GetNodeStatus, GetObservability, GetResource, GetRoute, IdentityReplaced,
+  IssueCleanupCheckpoint, LeaveCluster, Listen, MemberChanged, MergeCluster, NodeRevoked,
+  PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
+  PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResourceChanged,
+  ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources,
+  SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
@@ -111,9 +111,10 @@ pub use transport::{
 pub use view::{
   ConnectivityStatus, LeaveOutcome, ListenerPage, ListenerView, LocalNodeView, MemberPage,
   MemberView, MergeView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot, PageSpec,
-  RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView, ResourcePage,
-  ResourceView, RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome,
-  ShutdownReason, TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
+  ReceiptRetentionReport, RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata,
+  ResourceMutationView, ResourcePage, ResourceView, RevokeOutcome, SessionFeatureView, SessionPage,
+  SessionView, ShutdownOutcome, ShutdownReason, TopologyEdgeView, TopologyPage, TrustPage,
+  TrustStatus, TrustedIdentityView,
 };
 
 pub mod extension {

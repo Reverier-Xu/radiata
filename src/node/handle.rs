@@ -195,6 +195,12 @@ impl CommandControl for crate::IssueCleanupCheckpoint {
   }
 }
 
+impl CommandControl for crate::ApplyReceiptRetention {
+  fn control(self, reply: oneshot::Sender<Result<crate::view::ReceiptRetentionReport>>) -> Control {
+    Control::ApplyReceiptRetention { reply }
+  }
+}
+
 impl CommandControl for crate::RunSyncRound {
   fn control(self, reply: oneshot::Sender<Result<()>>) -> Control {
     Control::RunSyncRound { reply }
