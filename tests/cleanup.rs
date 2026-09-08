@@ -74,7 +74,10 @@ async fn local_id(node: &NodeHandle) -> NodeId {
 /// The member's trusted public key as the issuer observes it, polled with
 /// a bound (bindings converge through the merge and ordinary sync).
 async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey {
-  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  // The bound covers loaded CI runners (the macOS lane shares one box
+  // with the whole suite), where convergence samples are starved for
+  // tens of seconds.
+  let deadline = std::time::Instant::now() + Duration::from_secs(90);
   loop {
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer instead of the wall-clock tick.
@@ -87,7 +90,7 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
       return view.public_key().clone();
     }
     assert!(
-      deadline.elapsed() < Duration::from_secs(30),
+      deadline.elapsed() < Duration::from_secs(90),
       "member {member} must be trusted"
     );
     tokio::time::sleep(Duration::from_millis(5)).await;

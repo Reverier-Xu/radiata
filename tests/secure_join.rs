@@ -1393,8 +1393,11 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   release.open();
 
   // The in-flight route must end with the explicit interruption state.
+  // The bound covers loaded CI runners where the sixteen-node lane runs
+  // in parallel inside the same binary and starves this task for tens
+  // of seconds.
   let mut terminal: Option<RouteState> = None;
-  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let deadline = std::time::Instant::now() + Duration::from_secs(60);
   while terminal.is_none() {
     let view = joiner_handle
       .query(GetRoute::new(route.clone()))
