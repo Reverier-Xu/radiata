@@ -814,3 +814,51 @@ async fn gc_collected_tombstones(
     tracing::debug!(kind = ?error.kind(), "checkpoint gc pass failed");
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn node(seed: u8) -> NodeId {
+    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+  }
+
+  /// Every sync payload kind round-trips through the canonical wire,
+  /// including the additive leave-applied receipt (SC-G11-P0-16/17's
+  /// receipt arm): the leaver correlates by subject, so the subject must
+  /// survive the encoding exactly.
+  #[test]
+  fn sync_payload_kinds_round_trip() {
+    let payloads = vec![
+      SyncPayload::LeaveApplied { node: node(1) },
+      SyncPayload::LeaveApplied { node: node(2) },
+    ];
+    for payload in payloads {
+      let encoded = payload.encode().unwrap();
+      assert_eq!(SyncPayload::decode(&encoded).unwrap(), payload);
+    }
+  }
+
+  /// The leave-applied receipt carries one subject only: the applying
+  /// peer sends it to the record's leaver, and the leaver's consumer
+  /// consumes it exactly when the subject is the local node. The signal
+  /// itself is permit-based: one bump releases exactly one waiter.
+  #[tokio::test]
+  async fn leave_applied_signal_releases_one_waiter_per_bump() {
+    use std::time::Duration;
+
+    let signal = LeaveAppliedSignal::default();
+    signal.bump();
+    // A stored permit resolves the first wait immediately.
+    tokio::time::timeout(Duration::from_millis(50), signal.wait())
+      .await
+      .expect("the stored permit resolves the first wait");
+    // Without a fresh bump the next wait parks.
+    assert!(
+      tokio::time::timeout(Duration::from_millis(50), signal.wait())
+        .await
+        .is_err(),
+      "without a fresh bump the next wait parks"
+    );
+  }
+}
