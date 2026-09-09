@@ -38,7 +38,7 @@ use super::{ws, ws::MergeHint};
 pub(crate) use crate::protocol::wire::FrameRules;
 use crate::{
   Error, ProviderErrorContext, ProviderErrorKind, Result,
-  protocol::{PRELUDE_LEN, Prelude, split_message, wire::BASE_SCHEMA_ID},
+  protocol::{PRELUDE_LEN, Prelude, check_frame, split_message, wire::BASE_SCHEMA_ID},
 };
 
 /// The exact RFC 9266 exporter label.
@@ -346,14 +346,19 @@ fn encode_frame(
   rules: FrameRules, schema_id: u16, kind_id: u16, flags: u16, body: &[u8],
 ) -> Result<Vec<u8>> {
   let body_len = u32::try_from(body.len()).map_err(|_| Error::invalid_input("wire body length"))?;
-  if !(rules.is_declared)(schema_id, kind_id)
-    || flags & !rules.allowed_flags != 0
-    || body_len > rules.message_limit
-  {
-    return Err(Error::invalid_input("wire limits"));
-  }
+  let prelude = Prelude::new(schema_id, kind_id, flags, body_len);
+  // The send side shares the declared/flags/message-limit trio with the
+  // decode direction and deliberately skips `receive_limit`: that bound
+  // protects the receiving peer's allocation, so only `split_message`
+  // applies it on arrival.
+  check_frame(
+    prelude,
+    rules.allowed_flags,
+    rules.message_limit,
+    rules.is_declared,
+  )?;
   let mut frame = Vec::with_capacity(PRELUDE_LEN + body.len());
-  frame.extend_from_slice(&Prelude::new(schema_id, kind_id, flags, body_len).encode());
+  frame.extend_from_slice(&prelude.encode());
   frame.extend_from_slice(body);
   Ok(frame)
 }
