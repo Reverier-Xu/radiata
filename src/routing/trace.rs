@@ -293,9 +293,7 @@ pub(crate) fn decode_trace_record(bytes: &[u8]) -> Result<TraceRecord> {
 }
 
 fn namespace() -> Result<crate::StoreNamespace> {
-  Ok(crate::StoreNamespace::new(crate::QualifiedTag::parse(
-    TRACE_NAMESPACE,
-  )?))
+  crate::storage::families::namespace(TRACE_NAMESPACE)
 }
 
 fn key(trace_id: &TraceId) -> crate::StoreKey {

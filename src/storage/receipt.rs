@@ -922,9 +922,7 @@ pub(super) fn operation_uses_reserved_namespace(operation: &StoreOperation) -> b
 }
 
 pub(crate) fn internal_namespace() -> crate::Result<StoreNamespace> {
-  Ok(StoreNamespace::new(crate::QualifiedTag::parse(
-    INTERNAL_NAMESPACE,
-  )?))
+  super::families::namespace(INTERNAL_NAMESPACE)
 }
 
 pub(crate) fn used_id_key(transaction: &TransactionId) -> crate::Result<StoreKey> {

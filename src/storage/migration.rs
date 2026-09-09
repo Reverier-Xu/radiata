@@ -35,9 +35,7 @@ pub(crate) fn schema_key() -> StoreKey {
 }
 
 pub(crate) fn schema_namespace() -> Result<StoreNamespace> {
-  Ok(StoreNamespace::new(crate::QualifiedTag::parse(
-    SCHEMA_NAMESPACE,
-  )?))
+  super::families::namespace(SCHEMA_NAMESPACE)
 }
 
 /// Encodes one canonical migration schema-record variant; the migration
