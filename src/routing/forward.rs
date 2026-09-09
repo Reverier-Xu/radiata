@@ -338,15 +338,9 @@ async fn select_next_hop(
     return Ok(destination.clone());
   }
   let tag = route_policy.ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
-  let policy = registry
-    .next_hop_policy(tag)
+  let hop = crate::routing::resolve_next_hop(registry, tag, destination, local, peers)
+    .await?
     .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
-  let view = crate::routing::NextHopView {
-    destination,
-    local,
-    peers,
-  };
-  let hop = policy.next_hop(view).await?;
   if peers.contains(&hop) {
     Ok(hop)
   } else {

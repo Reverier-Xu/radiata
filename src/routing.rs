@@ -768,6 +768,27 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
   fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>>;
 }
 
+/// The shared next-hop resolution for the routing plane: resolves the
+/// registered [`RouteNextHop`] policy named by `tag` against the route
+/// view built from `destination`, `local`, and the alive `peers`.
+/// `Ok(None)` means `tag` names no registered policy — the callers apply
+/// their own observability and fallback; the policy's own rejection
+/// propagates as `Err`.
+pub(crate) async fn resolve_next_hop(
+  registry: &crate::extension_registry::ExtensionRegistry, tag: &QualifiedTag,
+  destination: &NodeId, local: &NodeId, peers: &[NodeId],
+) -> Result<Option<NodeId>> {
+  let Some(policy) = registry.next_hop_policy(tag) else {
+    return Ok(None);
+  };
+  let view = NextHopView {
+    destination,
+    local,
+    peers,
+  };
+  policy.next_hop(view).await.map(Some)
+}
+
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;

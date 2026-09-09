@@ -20,18 +20,24 @@ impl Supervisor {
       debug!(destination = %destination, "no route policy configured; forward unavailable");
       return Ok(None);
     };
-    let Some(policy) = self.dependencies.extensions.next_hop_policy(tag) else {
-      tracing::warn!(tag = %tag, "configured route policy is not registered");
-      return Ok(None);
-    };
     let local = self.packet.local().clone();
     let peers = crate::sync_common::alive_peers(&self.dependencies.sessions)?;
-    let view = crate::routing::NextHopView {
+    let hop = match crate::routing::resolve_next_hop(
+      &self.dependencies.extensions,
+      tag,
       destination,
-      local: &local,
-      peers: &peers,
+      &local,
+      &peers,
+    )
+    .await
+    {
+      Ok(Some(hop)) => hop,
+      Ok(None) => {
+        tracing::warn!(tag = %tag, "configured route policy is not registered");
+        return Ok(None);
+      }
+      Err(error) => return Err(error),
     };
-    let hop = policy.next_hop(view).await?;
     let entry = self
       .dependencies
       .sessions
