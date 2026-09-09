@@ -16,10 +16,10 @@ use crate::{
     credential::MergeCredentialIssuer,
     lifecycle::{LocalIdentityContext, ensure_self_binding, open_local_identity},
   },
-  packet::{OutboundRequest, RouteRecord, RouteState},
+  packet::{OutboundRequest, RouteRecord},
   protocol::offer::node_offer,
   provider::{KeyProvider, StorageFactory},
-  routing::{RouteTable, insert_route},
+  routing::{RouteTable, insert_route, record_terminal_failure},
   runtime::{Control, LifecycleSnapshot, RuntimeClient},
   session::{
     SessionDriver,
@@ -961,18 +961,16 @@ impl Supervisor {
 
   /// Records one bounded terminal route failure for an outbound trace so
   /// asynchronous senders can observe it through `GetRoute`: identity and
-  /// typed failure only, never a body or a fabricated selected node.
+  /// typed failure only, never a body or a fabricated selected node. An
+  /// already-tracked route keeps its real selected node — only the state
+  /// moves to the typed failure.
   fn record_route_failure(&self, trace_id: &TraceId, kind: ErrorKind) {
-    let _ = insert_route(
+    record_terminal_failure(
       &self.dependencies.routes,
       self.route_capacity,
-      RouteRecord::failing(trace_id.clone()),
+      trace_id,
+      kind,
     );
-    if let Ok(mut routes) = self.dependencies.routes.lock()
-      && let Some(record) = routes.get_mut(trace_id)
-    {
-      record.update(RouteState::Failed(kind));
-    }
     self
       .dependencies
       .events

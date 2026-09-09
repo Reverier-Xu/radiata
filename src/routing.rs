@@ -26,7 +26,7 @@ pub(crate) mod forward;
 pub(crate) mod table;
 pub(crate) mod trace;
 
-pub(crate) use table::{RouteTable, insert_route};
+pub(crate) use table::{RouteTable, insert_route, record_terminal_failure};
 
 /// The maximum byte length of one selector input. The bound keeps parsing
 /// work finite and independent of caller payloads; longer inputs are
