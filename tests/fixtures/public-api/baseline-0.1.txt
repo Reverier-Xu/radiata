@@ -27,6 +27,7 @@ pub trait radiata::extension::StoreSnapshot: core::fmt::Debug + core::marker::Se
 pub fn radiata::extension::StoreSnapshot::get<'a>(&'a self, &'a radiata::StoreNamespace, &'a radiata::StoreKey) -> radiata::BoxFuture<'a, radiata::Result<core::option::Option<radiata::StoreValue>>>
 pub fn radiata::extension::StoreSnapshot::revision(&self) -> &radiata::StoreRevision
 pub fn radiata::extension::StoreSnapshot::scan<'a>(&'a self, &'a radiata::StoreNamespace, &'a [u8]) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<(dyn radiata::extension::StoreScan + 'a)>>>
+pub fn radiata::extension::StoreSnapshot::scan_from<'a>(&'a self, &'a radiata::StoreNamespace, &'a [u8], core::option::Option<&'a [u8]>) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<(dyn radiata::extension::StoreScan + 'a)>>>
 #[non_exhaustive] pub enum radiata::CommitOutcome
 pub radiata::CommitOutcome::Aborted
 pub radiata::CommitOutcome::Committed(radiata::CommitReceipt)

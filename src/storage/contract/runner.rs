@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use super::helpers::*;
 use crate::{
-  CommitOutcome, Digest, ReconcileOutcome, StoreExpectation, StoreOperation, StoreRequirements,
-  provider::StorageFactory,
+  CommitOutcome, Digest, ReconcileOutcome, StoreEntry, StoreExpectation, StoreOperation,
+  StoreRequirements, provider::StorageFactory,
 };
+
 pub(crate) async fn storage_contract_snapshot_lookup_and_ordering(
   factory: Arc<dyn StorageFactory>,
 ) {
@@ -483,4 +484,172 @@ pub(crate) async fn storage_contract_conflicts_atomicity_and_idempotence(
     },
   ];
   assert!(transaction(17, receipt.committed_revision().clone(), duplicate_receipt).is_err());
+}
+
+/// The positioned-scan (seek) contract, shared by every storage backend:
+/// `scan_from` positions strictly past the keyset cursor with the exact
+/// plain-scan order and filters, `None` equals a plain scan, and
+/// out-of-bounds positions are empty scans, never errors.
+pub(crate) async fn storage_contract_positioned_scans(factory: Arc<dyn StorageFactory>) {
+  let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
+  let initial = storage.snapshot().await.unwrap();
+  let target_namespace = namespace("one");
+  let other_namespace = namespace("two");
+  let keys = [
+    vec![],
+    vec![0x00],
+    vec![0x7F],
+    vec![0x80],
+    vec![0xFF],
+    vec![0xFF, 0x00],
+    vec![0xFF, 0xFF],
+  ];
+  let operations = keys
+    .iter()
+    .enumerate()
+    .map(|(index, key)| StoreOperation::Put {
+      namespace: target_namespace.clone(),
+      key: store_key(key),
+      expected: StoreExpectation::Absent,
+      value: value(&[index as u8]),
+    })
+    .chain([StoreOperation::Put {
+      namespace: other_namespace.clone(),
+      key: store_key(&[0x00]),
+      expected: StoreExpectation::Absent,
+      value: value(b"other"),
+    }])
+    .collect();
+  assert!(matches!(
+    storage
+      .commit(transaction(0, initial.revision().clone(), operations).unwrap())
+      .await
+      .unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+
+  let current = storage.snapshot().await.unwrap();
+  let key_list = |entries: &[StoreEntry]| {
+    entries
+      .iter()
+      .map(|entry| entry.key().as_bytes().to_vec())
+      .collect::<Vec<Vec<u8>>>()
+  };
+
+  // `None` observes exactly the plain scan.
+  let plain = collect_scan(current.scan(&target_namespace, &[]).await.unwrap()).await;
+  let unpositioned = collect_scan(
+    current
+      .scan_from(&target_namespace, &[], None)
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert_eq!(key_list(&plain), keys);
+  assert_eq!(key_list(&plain), key_list(&unpositioned));
+  assert!(
+    plain
+      .iter()
+      .all(|entry| entry.namespace() == &target_namespace)
+  );
+
+  // The first key's cursor returns the remainder; the last key's cursor
+  // is an empty scan, and exhaustion stays exhausted.
+  let head = collect_scan(
+    current
+      .scan_from(&target_namespace, &[], Some(&[]))
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert_eq!(key_list(&head), keys[1..].to_vec());
+  let mut tail = current
+    .scan_from(&target_namespace, &[], Some(&[0xFF, 0xFF]))
+    .await
+    .unwrap();
+  assert!(tail.next().await.unwrap().is_none());
+  assert!(tail.next().await.unwrap().is_none());
+  drop(tail);
+
+  // Positioning is by key order: an absent `from` between two stored
+  // keys starts at the next stored key.
+  let between = collect_scan(
+    current
+      .scan_from(&target_namespace, &[], Some(&[0xC0]))
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert_eq!(
+    key_list(&between),
+    vec![vec![0xFF], vec![0xFF, 0x00], vec![0xFF, 0xFF]]
+  );
+
+  // Prefix and position compose: `from` before the prefix range returns
+  // the whole prefixed scan, inside it the strictly-later remainder,
+  // past its last key an empty scan.
+  let prefixed = keys
+    .iter()
+    .filter(|key| key.starts_with(&[0xFF]))
+    .cloned()
+    .collect::<Vec<_>>();
+  let before = collect_scan(
+    current
+      .scan_from(&target_namespace, &[0xFF], Some(&[0x00]))
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert_eq!(key_list(&before), prefixed);
+  let inside = collect_scan(
+    current
+      .scan_from(&target_namespace, &[0xFF], Some(&[0xFF, 0x00]))
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert_eq!(key_list(&inside), vec![vec![0xFF, 0xFF]]);
+  let inside_gap = collect_scan(
+    current
+      .scan_from(&target_namespace, &[0xFF], Some(&[0xFF, 0x00, 0x00]))
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert_eq!(key_list(&inside_gap), vec![vec![0xFF, 0xFF]]);
+  let mut past = current
+    .scan_from(&target_namespace, &[0xFF], Some(&[0xFF, 0xFF]))
+    .await
+    .unwrap();
+  assert!(past.next().await.unwrap().is_none());
+  drop(past);
+
+  // Namespaces bound positioned scans exactly like plain scans: the
+  // positioned plain scan of the second namespace yields only its own
+  // entries, its own last key's cursor is empty, and a cursor past the
+  // first namespace's end never leaks the second namespace's entries.
+  let other_plain = collect_scan(
+    current
+      .scan_from(&other_namespace, &[], None)
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert_eq!(key_list(&other_plain), vec![vec![0x00]]);
+  let other_positioned = collect_scan(
+    current
+      .scan_from(&other_namespace, &[], Some(&[0x00]))
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert!(other_positioned.is_empty());
+  let beyond = collect_scan(
+    current
+      .scan_from(&target_namespace, &[], Some(&[0xFF, 0xFF, 0xFF]))
+      .await
+      .unwrap(),
+  )
+  .await;
+  assert!(beyond.is_empty());
 }
