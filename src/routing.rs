@@ -1,5 +1,4 @@
-//! Packet route targets, selection, and the checked route envelope
-//! (T-G06-01, ADR-0007).
+//! Packet route targets, selection, and the checked route envelope.
 //!
 //! A packet target is either an exact [`NodeId`] or a selector evaluated
 //! against node-owned labels. Label targets expose matching members
@@ -15,7 +14,7 @@
 //! forwarding work, so mutation of the trace, endpoints, protocol,
 //! metadata, or any route field fails closed before a body byte moves.
 //! Authenticity comes from the mutually authenticated session transcript
-//! (ADR-0002 exporter binding): each hop proves the context was produced
+//! (exporter binding): each hop proves the context was produced
 //! by the peer it claims, and the canonical wire encoding rejects every
 //! mutation.
 
@@ -41,8 +40,7 @@ pub(crate) const SELECTOR_MAX_PREDICATES: usize = 16;
 pub(crate) const SELECTOR_MAX_SET_VALUES: usize = 16;
 
 /// One bounded label selector: a conjunction of predicates over the
-/// closed selector key space (the T-G06-01 equality subset, completed to
-/// the full operator set in T-G09-02).
+/// closed selector key space.
 ///
 /// Grammar (whitespace separates predicates):
 ///
@@ -423,9 +421,9 @@ impl Selector {
     &self.canonical
   }
 
-  /// Whether every predicate is satisfied under `lookup` (T-G09-02: the
-  /// single evaluator shared by node-label selection and reserved-aware
-  /// resource selection).
+  /// Whether every predicate is satisfied under `lookup` (the single
+  /// evaluator shared by node-label selection and reserved-aware resource
+  /// selection).
   pub(crate) fn matches_with<'a>(&self, lookup: impl Fn(&QualifiedTag) -> Option<&'a str>) -> bool {
     self
       .predicates
@@ -508,8 +506,8 @@ pub(crate) enum RouteProgress {
   },
 }
 
-/// The routing envelope of one packet (ADR-0007 trace metadata: identity,
-/// selected destination, progress — never payload bytes).
+/// The routing envelope of one packet (trace metadata: identity, selected
+/// destination, progress — never payload bytes).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteContext {
   trace_id: crate::TraceId,
@@ -571,8 +569,8 @@ impl RouteContext {
   }
 
   /// Rebuilds the envelope from one decoded open frame. A frame without a
-  /// route state is a legacy direct delivery (the previous fixture shape):
-  /// the authenticated source held the packet and sent it directly.
+  /// route state is a legacy direct delivery: the authenticated source
+  /// held the packet and sent it directly.
   pub(crate) fn from_frame(
     trace_id: crate::TraceId, source: NodeId, destination: NodeId, route: Option<HopState>,
   ) -> Self {
@@ -595,8 +593,7 @@ impl RouteContext {
 
   /// Validates this envelope at the receiving node `local` against its
   /// session-authenticated `peer`, then produces the checked progress
-  /// decision. Every rejection happens before any forwarding work
-  /// (SC-G06-P0-01/03):
+  /// decision. Every rejection happens before any forwarding work:
   ///
   /// - the authenticated session peer must be the claimed current holder, so
   ///   endpoint substitutions fail closed (`NotTrusted`);
@@ -674,7 +671,7 @@ impl RouteContext {
 
 /// The descriptor-store-backed candidate reader: streams bounded pages of
 /// live members whose owned labels satisfy the selector, in canonical node
-/// order (SC-G06-P0-02: candidates are exposed incrementally, never as a
+/// order (candidates are exposed incrementally, never as a
 /// whole-population allocation).
 #[derive(Debug)]
 pub(crate) struct StoreCandidateReader {
@@ -785,7 +782,7 @@ mod tests {
     set
   }
 
-  // ---- SC-G06-P0-01: route-context mutation fails before forwarding ----
+  // ---- route-context mutation fails before forwarding ----
 
   /// A frame whose claimed current holder differs from the
   /// session-authenticated peer is rejected before any progress decision.
@@ -859,7 +856,7 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::Conflict);
   }
 
-  // ---- SC-G06-P0-02: label-target selection without unauthorized routing ----
+  // ---- label-target selection without unauthorized routing ----
 
   /// The selector grammar parses within bounds, canonicalizes equivalent
   /// forms to one representation, and evaluates existence and equality.
@@ -1042,7 +1039,7 @@ mod tests {
     Ok(())
   }
 
-  // ---- SC-G06-P0-03: checked route progress ----
+  // ---- checked route progress ----
 
   /// Every hop advances exactly once along one chosen next edge; loop
   /// attempts through chain members fail closed.
@@ -1134,7 +1131,7 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
   }
 
-  // ---- SC-G06-P0-04: bounded work independent of stream length ----
+  // ---- bounded work independent of stream length ----
 
   /// The envelope's work bound is a pure function of the caller-selected
   /// budget: generated chains of arbitrary attempted length always stop
@@ -1178,7 +1175,7 @@ mod tests {
     assert_eq!(context.visited().len(), usize::try_from(max_hops).unwrap());
   }
 
-  // ---- SC-G09-P1-05..07: the completed selector grammar ----
+  // ---- the full selector grammar ----
 
   /// Every grammar operator parses and evaluates with the documented set
   /// semantics: equality and `in` require the key present; inequality and
@@ -1313,7 +1310,7 @@ mod tests {
 
   /// Grammar bounds hold: over-limit input, predicates, set members, and
   /// values are rejected with typed errors, and malformed shapes fail
-  /// closed without panic (THR-012).
+  /// closed without panic.
   #[test]
   fn grammar_bounds_reject_overlimit_and_malformed_input() {
     // Input byte limit.
@@ -1329,7 +1326,7 @@ mod tests {
       Selector::parse(&oversized).unwrap_err().kind(),
       ErrorKind::InvalidInput
     );
-    // Canonical-form limit (selector fuzz finding, T-G10-03): a set's
+    // Canonical-form limit (selector fuzz finding): a set's
     // closing parenthesis may directly abut the next predicate with no
     // whitespace, and the canonical form inserts the separator space, so
     // an input within the raw byte bound can canonicalize past the same
@@ -1413,7 +1410,7 @@ mod tests {
     }
   }
 
-  // ---- SC-G09-P1-07: evaluator semantics against a reference ----
+  // ---- evaluator semantics against a reference ----
 
   /// One generated predicate with its independently computed reference
   /// semantics.
@@ -1536,7 +1533,7 @@ mod tests {
     /// The implementation matches the reference evaluator over absent,
     /// present, and overwritten (duplicate-assignment) labels for every
     /// grammar operator, and the canonical text reparses to an equal
-    /// selector (SC-G09-P1-07, round-trip of SC-G09-P1-06).
+    /// selector.
     #[test]
     fn evaluator_matches_reference_over_generated_label_spaces(
       predicates in proptest::collection::vec(arb_predicate(), 1..=8),
@@ -1555,7 +1552,7 @@ mod tests {
     }
 
     /// Hostile and malformed inputs never panic and never exceed the
-    /// documented bounds (SC-G09-P1-05).
+    /// documented bounds.
     #[test]
     fn hostile_selector_input_never_panics(input in ".{0,1100}") {
       let result = std::panic::catch_unwind(|| Selector::parse(&input));

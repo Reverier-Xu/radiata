@@ -1,5 +1,4 @@
-//! Public-API integration tests for active leave and identity rotation
-//! (T-G09-06, SC-G09-P0-18..21).
+//! Public-API integration tests for active leave and identity rotation.
 //!
 //! Every test drives the facade only: an acknowledged `LeaveCluster`
 //! replaces the identity, deletes the old key and the old identity's core
@@ -218,11 +217,11 @@ async fn put_with_retry(handle: &NodeHandle, name_seed: u8) {
   }
 }
 
-/// SC-G09-P0-18: an acknowledged active leave binds the exact former and
+/// An acknowledged active leave binds the exact former and
 /// replacement identities, emits one IdentityReplaced, and shuts the node
 /// down with the ActiveLeave reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_leave_replaces_identity_and_shuts_down_with_active_leave() {
+async fn leave_replaces_identity_and_shuts_down_with_active_leave() {
   let storage = Arc::new(common::MemoryStorageFactory::new(
     common::required_capabilities(),
   ));
@@ -281,12 +280,12 @@ async fn g9_leave_replaces_identity_and_shuts_down_with_active_leave() {
   );
 }
 
-/// SC-G11-P0-16/17: the leaver announces its owner-signed leave record to
+/// The leaver announces its owner-signed leave record to
 /// connected sessions before rotating; the peer persists the terminal
 /// evidence (one `MemberChanged` for the former identity) and the leaver's
 /// bounded first-ack wait completes well before its bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g11_leave_announces_to_connected_peers_before_rotating() {
+async fn leave_announces_to_connected_peers_before_rotating() {
   {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -374,11 +373,11 @@ async fn g11_leave_announces_to_connected_peers_before_rotating() {
   listener.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G11-P0-17: with no connected session the announcement has nobody to
+/// With no connected session the announcement has nobody to
 /// acknowledge it, so no wait engages and the leave completes immediately
 /// (silent leave degrades to the cleanup path).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g11_leave_without_peers_completes_without_waiting() {
+async fn leave_without_peers_completes_without_waiting() {
   let storage = Arc::new(common::MemoryStorageFactory::new(
     common::required_capabilities(),
   ));
@@ -397,12 +396,12 @@ async fn g11_leave_without_peers_completes_without_waiting() {
   assert_eq!(reason, ShutdownReason::ActiveLeave);
 }
 
-/// SC-G09-P0-20/21: after the leave and a restart, the store shows no old
+/// After the leave and a restart, the store shows no old
 /// identity metadata — no cluster, members, trust, or resources — while
 /// the replacement identity runs and the old key is provider-deleted.
 #[cfg(all(feature = "json", unix))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_json_leave_restart_shows_only_the_replacement() {
+async fn json_leave_restart_shows_only_the_replacement() {
   let directory = tempfile::tempdir().unwrap();
   leave_restart_shows_only_the_replacement(radiata::adapters::json_store(
     directory.path().to_path_buf(),
@@ -412,7 +411,7 @@ async fn g9_json_leave_restart_shows_only_the_replacement() {
 
 #[cfg(feature = "redb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_redb_leave_restart_shows_only_the_replacement() {
+async fn redb_leave_restart_shows_only_the_replacement() {
   let directory = tempfile::tempdir().unwrap();
   leave_restart_shows_only_the_replacement(radiata::adapters::redb_store(
     directory.path().join("store.redb"),
@@ -458,8 +457,8 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   }
 
   // Restart on the same store: members, trust, and resources are wiped —
-  // the replacement identity is born with its own singleton cluster
-  // (ADR-0009), so the local view resolves to exactly the replacement.
+  // the replacement identity is born with its own singleton cluster, so
+  // the local view resolves to exactly the replacement.
   let handle = NodeBuilder::new(storage, provider).start().await.unwrap();
   let local = handle.query(radiata::GetLocalNode::new()).await.unwrap();
   assert_eq!(local.node_id(), &replacement);

@@ -1,9 +1,9 @@
-//! Bounded membership anti-entropy pages (G5-02).
+//! Bounded membership anti-entropy pages.
 //!
 //! A normal anti-entropy tick emits [`MembershipPage`]s: a bounded list of
 //! [`NodeDescriptorV1`] records plus an opaque cursor, never a
 //! whole-population allocation. Entries are trusted through the
-//! authenticated session that delivered them (ADR-0008); the receiver
+//! authenticated session that delivered them; the receiver
 //! repairs missing owner revisions, converges stale peers to the highest
 //! revision, and rejects over-capacity pages and looping cursors.
 
@@ -62,7 +62,7 @@ impl MembershipPage {
   }
 
   /// Decodes one page. Entries are trusted through the authenticated
-  /// session that delivered them (ADR-0008): decoding checks only the
+  /// session that delivered them: decoding checks only the
   /// canonical wire rules and page capacity.
   pub(crate) fn decode(bytes: &[u8]) -> Result<MembershipPage> {
     let (items, cursor) = crate::paging::decode_page(
@@ -126,7 +126,7 @@ pub(crate) mod sync {
 
   /// Emits one bounded page over the running node's metadata store. The
   /// cursor is the last emitted node's text, so pages continue without
-  /// allocating the whole population (SC-G05-P0-06).
+  /// allocating the whole population.
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<MembershipPage> {
@@ -138,7 +138,7 @@ pub(crate) mod sync {
     let mut scan = snapshot.scan(&namespace, &[]).await?;
     let paged = crate::paging::scan_paged(scan.as_mut(), cursor, limit, |_key, bytes| {
       // The sender only pages its own stored records; entries are trusted
-      // through the session that delivers them (ADR-0008).
+      // through the session that delivers them.
       super::decode_descriptor(bytes).map(Some)
     })
     .await?;
@@ -147,8 +147,7 @@ pub(crate) mod sync {
 
   /// Applies one received page over the running node's metadata store:
   /// the store accepts only the exact next revision, so stale, repeated,
-  /// downgraded, and replayed descriptors cannot replace a newer record
-  /// (SC-G05-P0-07/08).
+  /// downgraded, and replayed descriptors cannot replace a newer record.
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &MembershipPage,
   ) -> Result<Vec<NodeId>> {
@@ -197,7 +196,7 @@ pub(crate) mod sync {
 /// The single canonical descriptor decoder: wire rules and error strings
 /// live in exactly one place. Entries are trusted through the session
 /// that delivered them, so decoding checks only schema, version, and
-/// canonical wire rules (ADR-0008). Both record shapes are accepted: the
+/// canonical wire rules. Both record shapes are accepted: the
 /// current version 2 (capability labels) and the previous version 1
 /// fixture shape (no labels, empty label set).
 pub(crate) fn decode_descriptor(bytes: &[u8]) -> Result<NodeDescriptorV1> {
@@ -264,8 +263,7 @@ fn decode_wire(
     return Err(Error::invalid_input("node descriptor schema"));
   }
   // Version 1 records carry no labels element; version 2 records must
-  // carry it. Unknown wire or record versions fail closed (SC-G05-P0-05,
-  // extended by T-G06-01 with the labels element).
+  // carry it. Unknown wire or record versions fail closed.
   if version != 1 {
     return Err(Error::invalid_input("node descriptor version"));
   }
@@ -288,8 +286,7 @@ fn decode_wire(
   let mut previous_key: Option<&str> = None;
   for (key_text, value_text) in fields.labels.unwrap_or(&[]) {
     // Strictly ascending canonical keys fail closed on reordered or
-    // duplicate entries; values are validated bounded opaque text
-    // (SC-G06-P0-02 node-owned labels).
+    // duplicate entries; values are validated bounded opaque text.
     if previous_key.is_some_and(|previous| previous >= key_text.as_str()) {
       return Err(Error::invalid_input("node descriptor label order"));
     }
@@ -346,8 +343,7 @@ mod tests {
     ))
   }
 
-  /// SC-G05-P0-06: a tick emits bounded pages without a whole-population
-  /// allocation.
+  /// A tick emits bounded pages without a whole-population allocation.
   #[tokio::test]
   async fn emit_pages_bounded_without_whole_members() {
     let factory = factory();
@@ -369,8 +365,8 @@ mod tests {
     assert!(page.cursor().is_none());
   }
 
-  /// SC-G05-P0-07/08: repeated pages repair missing revisions and stale
-  /// peers converge to the highest revision.
+  /// Repeated pages repair missing revisions and stale peers converge to
+  /// the highest revision.
   #[tokio::test]
   async fn apply_pages_repairs_and_converges() {
     let factory = factory();
@@ -403,8 +399,8 @@ mod tests {
     let _ = applied;
   }
 
-  /// SC-G05-P0-09: a dishonest page cannot loop a cursor or exceed
-  /// capacities; unknown versions fail closed at decode.
+  /// A dishonest page cannot loop a cursor or exceed capacities; unknown
+  /// versions fail closed at decode.
   #[test]
   fn reject_dishonest_pages() {
     // Over-capacity page.

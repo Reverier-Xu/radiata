@@ -54,11 +54,11 @@ const FRESH_START_EVENTS: &[&str] = &[
   "get",
   "scan",
   "commit",
-  // The leave-intent discovery read closes startup (T-G09-06): a pending
+  // The leave-intent discovery read closes startup: a pending
   // leave resumes before the node serves.
   "snapshot",
   "get",
-  // Born-with-cluster (ADR-0009): the self-binding check and its
+  // Born-with-cluster: the self-binding check and its
   // conditional commit close startup.
   "snapshot",
   "get",

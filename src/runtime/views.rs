@@ -10,7 +10,7 @@ use crate::{Error, LocalNodeView, NodeId, Result};
 
 impl Supervisor {
   /// One member's public observation from the signed descriptor store and
-  /// the session table (SC-G05-P0-23..26).
+  /// the session table.
   pub(super) async fn member(&mut self, node: NodeId) -> Result<Option<crate::MemberView>> {
     self.ensure_self_descriptor().await?;
     let connected = self
@@ -34,7 +34,7 @@ impl Supervisor {
     )?))
   }
   /// Pages the signed descriptors, annotating connectivity from the
-  /// session table (SC-G05-P0-23..25).
+  /// session table.
   pub(super) async fn page_members(
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::MemberPage> {
@@ -78,7 +78,7 @@ impl Supervisor {
       .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
     Ok(crate::MemberPage::new(paged.items, next))
   }
-  /// Pages the live resource winners matching one selector (SC-G09-P1-08).
+  /// Pages the live resource winners matching one selector.
   pub(super) async fn select_resources(
     &mut self, selector: &crate::Selector, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::ResourcePage> {
@@ -90,7 +90,7 @@ impl Supervisor {
     )
     .await
   }
-  /// Pages every live resource winner in canonical name order (G9-07):
+  /// Pages every live resource winner in canonical name order:
   /// the reserved type label is always present, so its existence selector
   /// is exactly the unfiltered catalog.
   pub(super) async fn page_resources(
@@ -99,7 +99,7 @@ impl Supervisor {
     let all = crate::Selector::parse(crate::resource::RESERVED_TYPE_LABEL_KEY)?;
     self.select_resources(&all, cursor, limit).await
   }
-  /// Reads the live winner of one named resource (G9-07); a removed or
+  /// Reads the live winner of one named resource; a removed or
   /// unknown name reads as absent.
   pub(super) async fn get_resource(
     &mut self, name: &crate::ResourceName,
@@ -110,7 +110,7 @@ impl Supervisor {
       _ => None,
     })
   }
-  /// Pages the node's bound listeners in canonical id order (G9-07).
+  /// Pages the node's bound listeners in canonical id order.
   pub(super) async fn page_listeners(
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::ListenerPage> {
@@ -135,9 +135,9 @@ impl Supervisor {
       .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
     Ok(crate::ListenerPage::new(paged.items, next))
   }
-  /// Pages the live authenticated sessions in canonical peer order
-  /// (G9-07); selected features resolve their exact definition digests at
-  /// query time (SC-G09-P0-23).
+  /// Pages the live authenticated sessions in canonical peer order;
+  /// selected features resolve their exact definition digests at query
+  /// time.
   pub(super) async fn page_sessions(
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::SessionPage> {
@@ -187,7 +187,7 @@ impl Supervisor {
       .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
     Ok(crate::SessionPage::new(paged.items, next))
   }
-  /// The bounded observability snapshot (T-G10-05, SC-G10-P0-15):
+  /// The bounded observability snapshot:
   /// session/listener/task counters, queue totals, route and trace
   /// counters, the pending-transaction count, and metadata-store
   /// availability, captured at the local host wall clock. Counters and
@@ -253,8 +253,7 @@ impl Supervisor {
       storage_available,
     )
   }
-  /// Pages the authenticated sessions as directed topology edges
-  /// (SC-G05-P0-26).
+  /// Pages the authenticated sessions as directed topology edges.
   pub(super) async fn page_topology(
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::TopologyPage> {
@@ -288,7 +287,7 @@ impl Supervisor {
       .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
     Ok(crate::TopologyPage::new(paged.items, next))
   }
-  /// Pages the public trust observations (SC-G05-P0-25): the exact
+  /// Pages the public trust observations: the exact
   /// NodeId-to-key bindings verified locally, deterministically ordered
   /// and bounded.
   pub(super) async fn page_trust(
@@ -313,8 +312,8 @@ impl Supervisor {
     let mut items = Vec::with_capacity(observations.bindings().len());
     for binding in observations.bindings() {
       // A locally revoked binding reports its exact status; the binding
-      // itself is never erased (ADR-0006: revoke is an authorization
-      // boundary, not content erasure).
+      // itself is never erased (revoke is an authorization boundary, not
+      // content erasure).
       let status = match crate::identity::revocation::revoked_key_ctx(
         context.store(),
         binding.node(),

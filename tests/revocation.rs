@@ -1,5 +1,4 @@
-//! Public-API integration tests for authorization revocation (T-G09-04,
-//! SC-G09-P0-13/14).
+//! Public-API integration tests for authorization revocation.
 //!
 //! Every test drives the facade only: `RevokeNode` durably revokes one
 //! exact binding, closes its sessions, and denies its new sessions,
@@ -128,11 +127,11 @@ async fn selected_names(node: &NodeHandle) -> Vec<String> {
     .collect()
 }
 
-/// SC-G09-P0-13/14: the durable revoke commits the exact binding, closes
-/// the identity's session, emits one event, denies redial and rejoin, and
-/// preserves the revoked member's committed metadata.
+/// The durable revoke commits the exact binding, closes the identity's
+/// session, emits one event, denies redial and rejoin, and preserves the
+/// revoked member's committed metadata.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
+async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   let issuer = start_node(0).await;
   let issuer_endpoint = listen(&issuer).await;
   let issuer_id = local_id(&issuer.handle).await;
@@ -217,8 +216,7 @@ async fn g9_revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   // The revoked identity's new join admission is rejected. The member's
   // own facade refuses first (one node joins one cluster), and the
   // responder-side revocation check rejects a revoked subject's join
-  // after a leave (T-G09-06 exercises that path): every lane fails
-  // closed, never with admission.
+  // after a leave: every lane fails closed, never with admission.
   let rejoin = async {
     let issued = issuer
       .handle
@@ -278,11 +276,11 @@ async fn g9_revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   }
 }
 
-/// SC-G09-P0-13: revocation is exact and idempotent — an unknown subject
-/// is not found, a substituted key conflicts, and a repeated exact revoke
-/// reports no new transition and emits no second event.
+/// Revocation is exact and idempotent — an unknown subject is not found,
+/// a substituted key conflicts, and a repeated exact revoke reports no
+/// new transition and emits no second event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_revoke_is_exact_and_idempotent() {
+async fn revoke_is_exact_and_idempotent() {
   let issuer = start_node(0).await;
   let issuer_endpoint = listen(&issuer).await;
 
@@ -365,11 +363,11 @@ async fn g9_revoke_is_exact_and_idempotent() {
   }
 }
 
-/// SC-G09-P0-14: metadata signed before the revoke stays eligible — a
-/// member that joins after the revoke still converges on the revoked
-/// writer's historical resource through ordinary sync.
+/// Metadata signed before the revoke stays eligible — a member that
+/// joins after the revoke still converges on the revoked writer's
+/// historical resource through ordinary sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_delayed_content_converges_after_revoke() {
+async fn delayed_content_converges_after_revoke() {
   let issuer = start_node(0).await;
   let issuer_endpoint = listen(&issuer).await;
 
@@ -428,10 +426,10 @@ async fn g9_delayed_content_converges_after_revoke() {
   }
 
   // The revoked writer's binding also converges to the third member —
-  // and so does the revocation tombstone (ADR-0009 decision 6:
-  // revocation is a convergent permanent removal tombstone, so the
-  // expulsion is cluster-wide): content converges, the binding converges,
-  // and every member treats the identity as unauthorized.
+  // and so does the revocation tombstone (revocation is a convergent
+  // permanent removal tombstone, so the expulsion is cluster-wide):
+  // content converges, the binding converges, and every member treats
+  // the identity as unauthorized.
   tokio::time::timeout(Duration::from_secs(30), async {
     // The tombstone trails its binding (the revocation forwards on the
     // snapshot resend cadence), so under a loaded runner the binding can

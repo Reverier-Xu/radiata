@@ -326,8 +326,8 @@ impl JsonStorage {
         Ok(CommitOutcome::Conflict)
       };
     }
-    // The operation digest is transaction identity (THR-020), fixed at
-    // prepare over private immutable fields; recomputing it here is a
+    // The operation digest is transaction identity, fixed at prepare
+    // over private immutable fields; recomputing it here is a
     // development tripwire, never a release-time gate.
     debug_assert_eq!(
       transaction.operation_digest(),

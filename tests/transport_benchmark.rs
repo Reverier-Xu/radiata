@@ -1,4 +1,4 @@
-//! Transport performance benchmark (T-G11 wrap-up, user-directed).
+//! Transport performance benchmark.
 //!
 //! Measures the CPU-tick cost per delivered chunk of the full radiata
 //! stream pipeline (CBOR packet frames + session multiplexing + WS

@@ -1,4 +1,4 @@
-//! E2E-09 mixed binaries (T-G10-02, SC-G10-P0-06..09).
+//! Mixed binaries.
 //!
 //! An external consumer models a prior-version binary and the current
 //! binary purely through the public facade: the prior node offers a
@@ -413,12 +413,11 @@ async fn assert_packet_interop(issuer: &Node, member: &Node) {
   }
 }
 
-/// E2E-09, SC-G10-P0-06 (prior initiator), SC-G10-P0-09 (cleanup): a
-/// prior-version initiator and the current responder negotiate the
+/// A prior-version initiator and the current responder negotiate the
 /// identical intersection, exchange packets and metadata, and the
 /// session-scoped selection is replaced and retired with the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e09_prior_initiator_interops_with_current_responder() {
+async fn prior_initiator_interops_with_current_responder() {
   let mut issuer = start_node(1, true).await;
   let mut member = start_node(2, false).await;
   let member_id = join_mixed_pair(&mut issuer, &mut member).await;
@@ -578,11 +577,11 @@ async fn e2e09_prior_initiator_interops_with_current_responder() {
     .unwrap();
 }
 
-/// E2E-09, SC-G10-P0-07 (current initiator): a current initiator and a
-/// prior responder reach the identical intersection in the opposite role
+/// A current initiator and a prior responder reach the identical
+/// intersection in the opposite role
 /// with packet and trust interoperability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e09_current_initiator_interops_with_prior_responder() {
+async fn current_initiator_interops_with_prior_responder() {
   let mut issuer = start_node(3, false).await;
   let mut member = start_node(4, true).await;
   let member_id = join_mixed_pair(&mut issuer, &mut member).await;
@@ -614,11 +613,11 @@ async fn e2e09_current_initiator_interops_with_prior_responder() {
     .unwrap();
 }
 
-/// SC-G10-P0-08: incompatible required features are refused in both
+/// Incompatible required features are refused in both
 /// initiator roles without retrying a weaker offer, and no session
 /// survives the refusal on either side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e09_incompatible_required_features_are_refused_in_both_roles() {
+async fn incompatible_required_features_are_refused_in_both_roles() {
   // Current initiator requires the current-only feature; the prior
   // responder never published it.
   let mut issuer = start_node(5, false).await;

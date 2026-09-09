@@ -1,5 +1,5 @@
-//! Generic named resource metadata (T-G07-02 records, T-G09-01 public
-//! names/labels/vectors, ADR-0007).
+//! Generic named resource metadata: signed records with public names,
+//! labels, and ordering versions.
 //!
 //! A resource is a stable name plus labels: reserved labels carry the
 //! resource type and resource URI (callers provide the values; core never
@@ -211,7 +211,7 @@ impl fmt::Debug for ResourceLabels {
   }
 }
 
-/// The ordering version of one resource record (ADR-0007).
+/// The ordering version of one resource record.
 ///
 /// The version is exactly the signed multiwriter tuple: the host
 /// wall-clock timestamp, the canonical writer [`NodeId`], the removal
@@ -246,8 +246,8 @@ impl ResourceVersion {
     &self.digest
   }
 
-  /// Whether this observed version names exactly `record`'s tuple
-  /// (T-G09-05): timestamp, writer, removal flag, and digest all equal.
+  /// Whether this observed version names exactly `record`'s tuple:
+  /// timestamp, writer, removal flag, and digest all equal.
   pub(crate) fn matches_record(&self, record: &ResourceRecordV1) -> bool {
     self.timestamp == record.timestamp()
       && self.writer == *record.writer()
@@ -345,7 +345,7 @@ struct ResourceRecordWire {
   signature: ByteVec,
 }
 
-/// One signed multiwriter resource-metadata record (ADR-0007).
+/// One signed multiwriter resource-metadata record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceRecordV1 {
   name: ResourceName,
@@ -482,8 +482,8 @@ impl ResourceRecordV1 {
 
   /// Assembles the record from a signature produced by the caller's key
   /// provider over the canonical signed body — the single production
-  /// construction path (G9 review: one sign-and-seal pipeline for put and
-  /// remove, no double encode, no transposable argument lists).
+  /// construction path: one sign-and-seal pipeline for put and remove,
+  /// no double encode, no transposable argument lists.
   #[allow(clippy::too_many_arguments)]
   pub(crate) async fn sign_with_provider(
     name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
@@ -517,8 +517,7 @@ impl ResourceRecordV1 {
     )
   }
 
-  /// Accessors awaiting their store/sync consumers (T-G07-03/04) follow;
-  /// the record shape is frozen here so those gates cannot drift it.
+  /// The canonical resource name this record describes.
   pub(crate) const fn name(&self) -> &ResourceName {
     &self.name
   }
@@ -626,7 +625,7 @@ impl ResourceRecordV1 {
     };
     // The stored digest must match the decoded fields exactly: any field
     // mutation (or digest tampering) fails here, before comparison or
-    // persistence (SC-G07-P0-04).
+    // persistence.
     let body = record.signed_body()?;
     if body_digest(&body) != record.digest {
       return Err(Error::invalid_input("resource record digest"));
@@ -664,7 +663,7 @@ impl ResourceRecordV1 {
     )
   }
 
-  /// The deterministic timestamp-maximum tuple order (SC-G07-P0-05):
+  /// The deterministic timestamp-maximum tuple order:
   /// lexicographic maximum of signed wall-clock timestamp, canonical
   /// writer id, removal rank, and canonical digest. Total, transitive,
   /// commutative, associative, and idempotent under max-reduction; equal
@@ -687,7 +686,7 @@ impl ResourceRecordV1 {
 }
 
 /// Validates that a candidate with this name and labels fits the
-/// canonical record envelope under any stamp (T-G09-03): the probe encodes
+/// canonical record envelope under any stamp: the probe encodes
 /// the full wire shape with maximal-width timestamp/rank fields and a
 /// placeholder signature, so an accepted write can never exceed the record
 /// budget when the runtime stamps and signs it.
@@ -791,9 +790,9 @@ mod tests {
     )
   }
 
-  /// The pinned canonical encoding of `base_record()` (T-G07-02 wire
-  /// vector; deterministic CBOR plus the ed25519 signature over the
-  /// domain-separated digest of seed `[11; 32]`).
+  /// The pinned canonical encoding of `base_record()`: deterministic
+  /// CBOR plus the ed25519 signature over the domain-separated digest of
+  /// seed `[11; 32]`.
   const GOLDEN_RESOURCE_RECORD_V1: &[u8] = &[
     140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 114, 101, 115, 111, 117, 114, 99, 101, 45, 114,
@@ -816,7 +815,7 @@ mod tests {
     crate::PublicKey::from_bytes(key.verifying_key().to_bytes())
   }
 
-  // ---- SC-G07-P0-04: signed records validate before anything else ----
+  // ---- Signed records validate before anything else ----
 
   /// A well-formed record verifies under its writer's key and round-trips
   /// through the canonical encoding byte-exactly.
@@ -895,7 +894,7 @@ mod tests {
     assert!(record.verify(&writer_key_of(OTHER_SEED)).is_err());
   }
 
-  // ---- SC-G07-P0-05: timestamp-maximum tuple algebra ----
+  // ---- Timestamp-maximum tuple algebra ----
 
   /// The tuple order is total, antisymmetric, transitive; max-reduction is
   /// commutative, associative, and idempotent — exhaustively over a small
@@ -960,8 +959,7 @@ mod tests {
 
   /// Equal timestamps use deterministic writer, then removal-rank,
   /// then digest tie-breaks; rollback can make a later local write lose
-  /// and a future-dated write dominates until wall time catches up
-  /// (SC-G07-P0-01 semantics expressed in the tuple).
+  /// and a future-dated write dominates until wall time catches up.
   #[test]
   fn equal_timestamp_tie_breaks_are_deterministic_and_rollback_loses() {
     let early = record(&name(), 1_000, &writer(), 0, &labels(), "a", "u://1", SEED);
@@ -1013,7 +1011,7 @@ mod tests {
 
   /// Signed equivocation at one tuple position converges to one
   /// deterministic winner by digest, and byte-identical replay is
-  /// idempotent (SC-G07-P0-06).
+  /// idempotent.
   #[test]
   fn equivocation_converges_and_replay_is_idempotent() {
     let equivocate_a = record(
@@ -1049,7 +1047,7 @@ mod tests {
   }
 
   /// Golden vector: the exact canonical bytes of one fixed record are
-  /// pinned so any encoder drift across gates fails loudly. The signature
+  /// pinned so any encoder drift fails loudly. The signature
   /// is deterministic (ed25519 over the domain-separated digest), so the
   /// full encoding is reproducible from the fixed seed.
   #[test]
@@ -1059,12 +1057,12 @@ mod tests {
     assert_eq!(bytes.as_slice(), GOLDEN_RESOURCE_RECORD_V1);
   }
 
-  // ---- SC-G09-P0-01/02: namespace ownership and reserved labels ----
+  // ---- Namespace ownership and reserved labels ----
 
   /// The reserved URI label is bounded opaque caller text: exotic schemes
   /// and delimiter-heavy values store verbatim, core never parses or
   /// follows them, and empty or over-limit text is rejected without
-  /// truncation (THR-012, THR-029).
+  /// truncation.
   #[test]
   fn resource_uri_is_bounded_opaque_text() {
     for value in [
@@ -1096,7 +1094,7 @@ mod tests {
 
   /// Every resource supplies both reserved labels; custom labels stay in
   /// the closed `labels` category, so the reserved `resources/*` keys can
-  /// never be smuggled in as custom labels (THR-012).
+  /// never be smuggled in as custom labels.
   #[test]
   fn resource_labels_require_reserved_and_bound_custom() {
     let labels = super::ResourceLabels::new(
@@ -1152,11 +1150,10 @@ mod tests {
     );
   }
 
-  // ---- SC-G09-P0-04: current and previous vector compatibility ----
+  // ---- Current and previous vector compatibility ----
 
   /// Unknown schemas and record versions fail closed at decode; there is
-  /// no fallback decoding of an incompatible resource record (THR-021,
-  /// THR-022).
+  /// no fallback decoding of an incompatible resource record.
   #[test]
   fn unknown_schema_or_record_version_fails_closed() {
     let bytes = base_record().encode().unwrap();
@@ -1185,9 +1182,8 @@ mod tests {
   }
 
   /// The pinned current fixture of one live record whose custom labels
-  /// span two caller domains (T-G09-01 vector; deterministic CBOR plus
-  /// the ed25519 signature over the domain-separated digest of seed
-  /// `[11; 32]`).
+  /// span two caller domains: deterministic CBOR plus the ed25519
+  /// signature over the domain-separated digest of seed `[11; 32]`.
   const GOLDEN_RESOURCE_LIVE_G9: &[u8] = &[
     140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 114, 101, 115, 111, 117, 114, 99, 101, 45, 114,
@@ -1206,8 +1202,8 @@ mod tests {
     14, 88, 234, 76, 87, 213, 96, 81, 101, 161, 15, 229, 185, 80, 230, 231, 132, 8,
   ];
 
-  /// The pinned current fixture of one signed removal record (T-G09-01
-  /// vector; same construction as `GOLDEN_RESOURCE_LIVE_G9`).
+  /// The pinned current fixture of one signed removal record: same
+  /// construction as `GOLDEN_RESOURCE_LIVE_G9`.
   const GOLDEN_RESOURCE_REMOVAL_G9: &[u8] = &[
     140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 114, 101, 115, 111, 117, 114, 99, 101, 45, 114,
@@ -1224,8 +1220,9 @@ mod tests {
     36, 212, 12, 248, 114, 195, 54, 216, 202, 209, 215, 10,
   ];
 
-  /// The fixture writer and timestamp shared by the G9 current vectors.
-  fn g9_live_record() -> ResourceRecordV1 {
+  /// Builds the signed live fixture record pinned by
+  /// `GOLDEN_RESOURCE_LIVE_G9`.
+  fn live_record() -> ResourceRecordV1 {
     let labels = LabelSet::new()
       .insert(
         LabelKey::parse("example.org/labels/owner").unwrap(),
@@ -1251,7 +1248,7 @@ mod tests {
     .unwrap()
   }
 
-  fn g9_removal_record() -> ResourceRecordV1 {
+  fn removal_record() -> ResourceRecordV1 {
     ResourceRecordV1::sign(
       ResourceName::parse("radiata.woooo.tech/resources/g9-removed").unwrap(),
       LabelValue::parse("document").unwrap(),
@@ -1267,14 +1264,13 @@ mod tests {
   }
 
   /// Current and previous fixtures round-trip canonically and preserve
-  /// their exact logical tuple versions (SC-G09-P0-04): the G7 golden
-  /// vector stays byte-stable as the previous fixture, and the G9 current
-  /// fixtures pin the same record shape for a live multi-domain record
-  /// and a removal.
+  /// their exact logical tuple versions: the older golden vector stays
+  /// byte-stable as the previous fixture, and the current fixtures pin
+  /// the same record shape for a live multi-domain record and a removal.
   #[test]
   fn current_and_previous_fixtures_round_trip_with_exact_versions() {
-    // Previous fixture (G7): the bytes pinned before G9 reopened the
-    // surface still decode to the identical logical record.
+    // Previous fixture: the older pinned bytes still decode to the
+    // identical logical record.
     let previous = ResourceRecordV1::decode(GOLDEN_RESOURCE_RECORD_V1).unwrap();
     assert_eq!(previous.encode().unwrap(), GOLDEN_RESOURCE_RECORD_V1);
     let previous_version = super::ResourceVersion::from_record(&previous);
@@ -1291,7 +1287,7 @@ mod tests {
 
     // Current fixtures: byte-stable encoding, canonical round-trip, and
     // exact logical versions.
-    let live = g9_live_record();
+    let live = live_record();
     assert_eq!(live.encode().unwrap(), GOLDEN_RESOURCE_LIVE_G9);
     let live_decoded = ResourceRecordV1::decode(GOLDEN_RESOURCE_LIVE_G9).unwrap();
     assert_eq!(live_decoded, live);
@@ -1300,7 +1296,7 @@ mod tests {
     assert!(!live_version.is_removal());
     assert_eq!(live_version.digest(), live.digest());
 
-    let removal = g9_removal_record();
+    let removal = removal_record();
     assert_eq!(removal.encode().unwrap(), GOLDEN_RESOURCE_REMOVAL_G9);
     let removal_decoded = ResourceRecordV1::decode(GOLDEN_RESOURCE_REMOVAL_G9).unwrap();
     assert_eq!(removal_decoded, removal);

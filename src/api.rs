@@ -27,13 +27,13 @@ mod tests {
   use crate::ErrorKind;
 
   #[test]
-  fn g1_lifecycle_system_entropy_fills_requested_output() {
+  fn lifecycle_system_entropy_fills_requested_output() {
     let mut output = [0; 32];
     SystemEntropy.fill(&mut output).unwrap();
   }
 
   #[test]
-  fn g1_lifecycle_system_entropy_failure_is_typed_and_redacted() {
+  fn lifecycle_system_entropy_failure_is_typed_and_redacted() {
     let error = system_entropy_error();
     assert_eq!(error.kind(), ErrorKind::Io);
     assert_eq!(error.context(), "entropy");

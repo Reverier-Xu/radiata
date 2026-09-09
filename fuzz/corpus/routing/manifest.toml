@@ -1,8 +1,6 @@
 schema = "radiata.woooo.tech/schemas/fuzz-corpus-v1"
 status = "accepted"
 target = "routing"
-owner_task = "T-G10-04"
-reviewer_task = "T-G10-04"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
 minimizer = { tool = "none", version = "0" }
 aggregate = { entry_count = 8, total_bytes = 152 }

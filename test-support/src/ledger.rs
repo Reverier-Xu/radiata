@@ -1,4 +1,4 @@
-//! The release-evidence ledger validator (T-G10-09, VERIFY-G10-09).
+//! The release-evidence ledger validator.
 //!
 //! One sealed, typed validator for the canonical evidence ledgers: the
 //! test-attestation records produced by every test, fuzz, soak, and SLO
@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest as ShaDigest, Sha256};
 
-/// The canonical test-attestation schema tag (ADR-0004).
+/// The canonical test-attestation schema tag.
 pub const ATTESTATION_SCHEMA: &str = "radiata.woooo.tech/schemas/test-attestation";
 /// The canonical soak attempt schema tag.
 pub const SOAK_ATTEMPT_SCHEMA: &str = "radiata.woooo.tech/schemas/soak-attempt-v1";
@@ -279,7 +279,7 @@ pub fn validate_attestation(
 
 /// Validates one complete attempt lineage in ledger order.
 ///
-/// Rules (THR-026): every non-first attempt must name its predecessor's
+/// Rules: every non-first attempt must name its predecessor's
 /// digest; only an `Infrastructure` classification may follow a failed
 /// attempt; a failed product attempt can never be superseded — the
 /// lineage fails if any failure is followed by a successful attempt
@@ -381,7 +381,7 @@ pub struct SloSample {
   pub ended_at_ms: u128,
 }
 
-/// The five exact workload strata of the revised profile (ADR-0005).
+/// The five exact workload strata of the SLO profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SloStratum {
   Admission,
@@ -415,7 +415,7 @@ pub struct SloValidation {
 
 /// Validates the complete candidate SLO ledger.
 ///
-/// Rules (ADR-0005, THR-025..028): exactly 125 samples across five runs
+/// Rules: exactly 125 samples across five runs
 /// and five strata (five samples per stratum per run); every sample
 /// carries its predeclared identifier and raw start/end observations; no
 /// sample is excluded, replaced, or reclassified after start; every
@@ -568,7 +568,7 @@ mod tests {
     assert_eq!(line_digest("").len(), 64);
   }
 
-  // SC-G10-P0-27: the complete current-semantic record passes preflight.
+  // The complete current-semantic record passes preflight.
   #[test]
   fn complete_attestation_passes_preflight() {
     let attestation = passing_attestation();
@@ -577,7 +577,7 @@ mod tests {
     validate_lineage(&[attestation]).unwrap();
   }
 
-  // SC-G10-P0-27: interrupted runs, missing attestations, short
+  // Interrupted runs, missing attestations, short
   // durations, and identity mismatches all fail closed.
   #[test]
   fn incomplete_or_under_budget_evidence_is_rejected() {
@@ -635,7 +635,7 @@ mod tests {
     assert!(parse_attestation("not-json").is_err());
   }
 
-  // SC-G10-P0-28: a product failure, a missing predecessor, an invalid
+  // A product failure, a missing predecessor, an invalid
   // retry classification, a replacement run, and a later successful rerun
   // can never supersede retained failed evidence.
   #[test]
@@ -691,7 +691,7 @@ mod tests {
     validate_lineage(&[failed, retried]).unwrap();
   }
 
-  // SC-G10-P0-29: the complete synthetic SLO ledger passes and every
+  // The complete synthetic SLO ledger passes and every
   // incomplete or post-start-excluded variant fails.
   #[test]
   fn slo_ledger_validation() {
@@ -720,8 +720,8 @@ mod tests {
     assert_eq!(outcome.samples, 125);
     assert_eq!(outcome.maximum_latency_ms, 1_000);
 
-    // Missing threats/profile constants: the profile member count is
-    // validated against the decision-register constant.
+    // A profile member count that differs from the validator's constant
+    // fails.
     assert_eq!(
       validate_slo_ledger(&samples, 10_000, 32, 125, true),
       Err(ValidationError::IncompleteLedger("profile member count"))

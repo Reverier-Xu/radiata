@@ -47,7 +47,7 @@ Record the target gate (e.g. G3) and its tasks (e.g. T-G03-01..06), scenarios
 
 Do not trust commit messages. Prove closure from evidence:
 
-1. Run every `scripts/verify-g<n>-*.sh` for the gate. Each must exit 0.
+1. Run every `scripts/verify-*.sh` verification script. Each must exit 0.
    Capture the exact `cargo test` lanes each script runs (they encode which
    scenarios the gate considers covered).
 2. Map every SC-* acceptance item to a concrete test:

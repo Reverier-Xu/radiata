@@ -1,13 +1,11 @@
-//! External-crate proof of the frozen functional `0.1.0` public API
-//! (T-G10-08, SC-G10-P0-25/26).
+//! External-crate proof of the public API.
 //!
 //! This integration test is an ordinary external consumer of the published
-//! facade: every supported manifest signature is constructed, dispatched,
+//! facade: every supported public signature is constructed, dispatched,
 //! or implemented from outside the crate, solely through `radiata::*`. A
-//! signature that disappears, renames, or changes shape breaks this build;
-//! a superseded export would appear here as an unsatisfied lane.
+//! signature that disappears, renames, or changes shape breaks this build.
 //!
-//! The cluster-driving lane mounts the test-only JSON adapter, so the
+//! The cluster-driving test mounts the test-only JSON adapter, so the
 //! file requires the `json` feature and the unix directory barrier (the
 //! json_runtime precedent).
 
@@ -48,8 +46,7 @@ const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------- values
 
-/// Every manifest value constructor and canonical accessor, exactly as the
-/// API manifest freezes them.
+/// Every public value constructor and canonical accessor.
 #[test]
 fn boundary_values_construct_parse_and_round_trip() {
   let node = NodeId::parse("node_0000000000000000000A1").unwrap();
@@ -119,9 +116,9 @@ fn boundary_values_construct_parse_and_round_trip() {
 
 // ------------------------------------------------------------ pages/views
 
-/// Page specs, cursors, and the page accessor contract frozen by the
-/// manifest. View types are core-constructed: external crates read them
-/// through accessors, never struct literals.
+/// Page specs, cursors, and the page accessor contract. View types are
+/// core-constructed: external crates read them through accessors, never
+/// struct literals.
 #[test]
 fn page_specs_and_cursors() {
   let spec = PageSpec::first(8).unwrap();
@@ -456,7 +453,7 @@ fn storage_spi_values_are_externally_constructible() {
     .transactional_migration(true);
 }
 
-/// The `StoreScan` to `BoxStream` converter (R2) is externally drivable:
+/// The `StoreScan` to `BoxStream` converter is externally drivable:
 /// an external scan composes with the standard stream combinators.
 #[tokio::test]
 async fn store_scan_stream_is_externally_drivable() {
@@ -481,7 +478,7 @@ async fn store_scan_stream_is_externally_drivable() {
 // ------------------------------------------------------- streams/policies
 
 /// An external stream body: any standard `Stream` of ordered chunks is a
-/// body (R1); the trivial one-shot case needs no trait ceremony.
+/// body; the trivial one-shot case needs no trait ceremony.
 fn pub_body(
   chunk: &'static [u8],
 ) -> impl futures_core::Stream<Item = Result<Arc<[u8]>>> + Send + 'static {
@@ -682,7 +679,7 @@ fn config_and_registry_are_externally_constructible() {
 }
 
 /// The full typed command/query/event surface drives one real two-node
-/// cluster from outside the crate: every manifest command and query is
+/// cluster from outside the crate: every public command and query is
 /// dispatched and every event kind is subscribed.
 #[cfg(all(feature = "json", unix))]
 #[cfg(all(feature = "json", unix))]
@@ -1018,8 +1015,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let _closed = matches!(revoked_events.try_recv(), Ok(EventReceive::Empty));
   let _closed = matches!(recovery_events.try_recv(), Ok(EventReceive::Empty));
 
-  // The additive standard-stream view (R2): a subscription is a Stream of
-  // the same EventReceive items; pending polls yield no Empty item.
+  // The standard-stream view: a subscription is a Stream of the same
+  // EventReceive items; pending polls yield no Empty item.
   futures_util::future::poll_fn(|cx| {
     assert!(
       std::pin::Pin::new(&mut session_events)

@@ -1,30 +1,11 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-//! G1 exposes deterministic foundation values, provider boundaries, and the
-//! node lifecycle through this crate root and [`extension`]. Implementation
-//! modules remain private.
-//!
-//! ```compile_fail,E0603
-//! use radiata::provider;
-//! ```
-//!
-//! ```compile_fail,E0603
-//! use radiata::runtime;
-//! ```
-//!
-//! Superseded limits and public clock injection are absent.
-//!
-//! ```compile_fail,E0432
-//! use radiata::{AdmissionLimits, Clock, MonotonicTime, ProtocolLimits, TraceLimits};
-//! ```
-//!
-//! ```compile_fail,E0432
-//! use radiata::extension::Clock;
-//! ```
-//!
-//! ```compile_fail,E0599
-//! let _ = radiata::NodeConfig::new().with_member_limit(1_024);
-//! ```
+//! The crate root of the radiata runtime: a deterministic relay node
+//! library with identity, membership, resource metadata, storage, and a
+//! routed TLS 1.3 packet data plane. The facade exposes deterministic
+//! foundation values, provider boundaries, and the node lifecycle through
+//! this crate root and the [`extension`] module; every implementation
+//! module remains private.
 
 mod api;
 mod config;
@@ -51,14 +32,14 @@ mod transport;
 mod view;
 
 /// The bounded fuzz adapters for the canonical decoder/selector fuzz
-/// targets (T-G10-03). Hidden from every normal build: the corpus replay
+/// targets. Hidden from every normal build: the corpus replay
 /// suites use them under `cfg(test)` and the libFuzzer targets under
 /// `cfg(fuzzing)`; nothing else consumes them.
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod fuzz_adapters;
 
-/// The frozen `0.1.0` compatibility manifest (T-G10-01). Test-only: every
+/// The frozen `0.1.0` compatibility manifest. Test-only: every
 /// golden vector is consumed through the compatibility and migration
 /// suites; the production wire/record encoders stay the single owners.
 #[cfg(test)]

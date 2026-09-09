@@ -1,5 +1,5 @@
 #![cfg(all(test, unix, feature = "json", feature = "redb"))]
-//! Mixed-backend metadata E2E (T-G08-05, E2E-07).
+//! Mixed-backend metadata end-to-end tests.
 //!
 //! One metadata side runs on the JSON adapter and the other on the redb
 //! adapter. The lanes prove that the same ordinary sync pages converge the
@@ -237,8 +237,8 @@ async fn converge(sides: [&MetadataStore; 2]) {
 mod cross_backend {
   use super::*;
 
-  /// E2E-07 / SC-G08-P0-13: a JSON side and a redb side converge through
-  /// the ordinary sync pages to byte-identical logical metadata views.
+  /// A JSON side and a redb side converge through the ordinary sync
+  /// pages to byte-identical logical metadata views.
   #[tokio::test]
   async fn mixed_storage_backends_converge_to_byte_identical_views() {
     let json_dir = TempDir::new().unwrap();
@@ -284,7 +284,7 @@ mod cross_backend {
     );
   }
 
-  /// SC-G08-P0-14: repeated graceful restarts preserve the converged
+  /// Repeated graceful restarts preserve the converged
   /// logical view exactly on both backends.
   #[tokio::test]
   async fn mixed_storage_graceful_restarts_preserve_identical_views() {

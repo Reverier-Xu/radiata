@@ -1,8 +1,7 @@
-//! Deterministic sparse neighbor planning (G5-03).
+//! Deterministic sparse neighbor planning.
 //!
-//! The planner and maintenance limiter are unit-verified against
-//! SC-G05-P0-10..13; the runtime consumer lands when topology maintenance
-//! is wired, so the surface is intentionally dead in non-test builds.
+//! The planner and maintenance limiter are unit-verified; the surface is
+//! intentionally dead in non-test builds.
 #![cfg_attr(not(test), allow(dead_code))]
 //!
 //! Equal membership inputs produce the same bounded neighbor plan
@@ -38,7 +37,7 @@ impl NeighborPlan {
 
 /// Plans the sparse neighbor set for `local` over the membership.
 /// The plan is a pure function of the inputs: the same membership always
-/// yields the same bounded plan (SC-G05-P0-10). The neighbors are the
+/// yields the same bounded plan. The neighbors are the
 /// `degree` next members in canonical order (wrapping), skipping self and
 /// deduplicating, so the result is a sparse cycle with no self-edge.
 pub(crate) fn plan_neighbors(
@@ -54,8 +53,8 @@ pub(crate) fn plan_neighbors(
   // The number of possible neighbors excludes the local node itself. The
   // plan size is bounded by this availability, so a requested degree larger
   // than the membership cannot spin the cycle forever: the walk stops once
-  // every possible neighbor is collected (SC-G05-P0-10 keeps the plan a
-  // bounded, deterministic function of the owner-marked inputs).
+  // every possible neighbor is collected, keeping the plan a bounded,
+  // deterministic function of the owner-marked inputs.
   let available = members.len().saturating_sub(1);
   let target = degree.min(available);
   let mut neighbors = Vec::with_capacity(target);
@@ -108,7 +107,7 @@ impl MaintenanceBounds {
 /// One slot tracked by the neighbor maintenance limiter: pending (in
 /// flight) or queued. The limiter refuses work beyond the configured
 /// bounds so slow or nonresponsive candidates cannot exceed the
-/// pending-connect or queue limits (SC-G05-P0-13).
+/// pending-connect or queue limits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MaintenanceLoad {
   pending: usize,
@@ -163,8 +162,8 @@ mod tests {
     values.iter().map(|value| node(*value)).collect()
   }
 
-  /// SC-G05-P0-10: equal inputs produce the same bounded plan with no
-  /// self-edge or duplicate peer.
+  /// Equal inputs produce the same bounded plan with no self-edge or
+  /// duplicate peer.
   #[test]
   fn neighbor_plan_is_deterministic_and_clean() {
     let membership = members(&[1, 2, 3, 4, 5]);
@@ -182,8 +181,8 @@ mod tests {
     assert_eq!(neighbors[2], node(5));
   }
 
-  /// SC-G05-P0-12: churn (join/leave) restores the configured sparse cycle
-  /// without exceeding the peer bound.
+  /// Churn (join/leave) restores the configured sparse cycle without
+  /// exceeding the peer bound.
   #[test]
   fn neighbor_plan_recovers_under_churn_within_bound() {
     let mut membership = members(&[1, 2, 3, 4]);
@@ -203,7 +202,7 @@ mod tests {
     assert_eq!(recovered.neighbors().len(), 2);
   }
 
-  /// SC-G05-P0-13: slow candidates cannot exceed pending/queue limits.
+  /// Slow candidates cannot exceed pending/queue limits.
   #[test]
   fn maintenance_limiter_bounds_pending_and_queue() {
     let bounds = MaintenanceBounds::new(2, 2);
@@ -231,8 +230,8 @@ mod tests {
     load.start_connect(bounds).unwrap();
   }
 
-  /// SC-G05-P0-11: reachability is distinct from active topology — a local
-  /// node outside the membership plans no neighbors (candidates only).
+  /// Reachability is distinct from active topology — a local node outside
+  /// the membership plans no neighbors (candidates only).
   #[test]
   fn neighbor_plan_keeps_reachability_distinct() {
     let membership = members(&[1, 2, 3]);
@@ -289,7 +288,7 @@ mod scale_tests {
 
   /// The 1,024-node functional trend: the sparse planner and the
   /// maintenance limiter operate at cluster scale without a
-  /// whole-population allocation or a rejection boundary (M5 verify).
+  /// whole-population allocation or a rejection boundary.
   #[test]
   fn neighbor_plan_and_limiter_scale_to_1024_nodes() {
     let membership: BTreeSet<NodeId> = (0..1_024).map(node_at).collect();

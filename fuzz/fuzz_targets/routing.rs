@@ -1,5 +1,4 @@
-//! The canonical `routing` state-machine fuzz target (T-G10-04,
-//! ADR-0004).
+//! The canonical `routing` state-machine fuzz target.
 //!
 //! Derived transition sequences drive the route envelope state machine:
 //! authenticated holder selection, one checked next hop, monotone budget

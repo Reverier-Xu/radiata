@@ -56,7 +56,7 @@ pub(crate) enum FailureCaptureError {
 /// Evidence identifiers and file prefix for the network fault-matrix
 /// scenario, single-sourced here so the manifest, file naming, replay
 /// filter, and redaction lanes cannot desynchronize on a rename.
-pub(crate) const MATRIX_SCENARIO_ID: &str = "SC-G01-P0-04";
+pub(crate) const MATRIX_SCENARIO_ID: &str = "fault-matrix-baseline";
 pub(crate) const MATRIX_TEST_ID: &str = "simulation-network-fault-matrix";
 pub(crate) const MATRIX_FILE_PREFIX: &str = "simulation-network-fault-matrix";
 pub(crate) const MATRIX_REPLAY_TEST_FILTER: &str =

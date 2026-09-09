@@ -1,4 +1,4 @@
-//! Harness isolation negatives (T-G10-10, SC-G10-P0-30/31).
+//! Harness isolation negatives.
 //!
 //! The harness is an external publish-false workspace. These lanes prove
 //! the isolation contract structurally: no private crate path, no storage

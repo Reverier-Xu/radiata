@@ -1,5 +1,4 @@
-//! Authenticated session driver and keep-alive (ADR-0001, ADR-0006,
-//! ADR-0007).
+//! Authenticated session driver and keep-alive.
 //!
 //! Crate-private: the supervisor owns listener/session tasks and drives the
 //! handshake state machine over the framed transport through this module.

@@ -1,11 +1,11 @@
-//! Issuer trust snapshots (G4-05, consumed by the membership sync lane
-//! in G5; rebaselined by ADR-0009: every node is its own snapshot issuer).
+//! Issuer trust snapshots consumed by the membership sync lane: every
+//! node is its own snapshot issuer.
 // Unit-verified store surfaces exercised by the unit suite.
 #![allow(dead_code)]
 //!
 //! A [`TrustSnapshotV1`] is one ordered set of `NodeId`-to-`PublicKey`
 //! bindings (strictly increasing revision, version, ordered bindings),
-//! carried over authenticated sessions and trusted through them (ADR-0008);
+//! carried over authenticated sessions and trusted through them;
 //! it carries no per-entry signatures. Conflicting evidence fails closed:
 //! wrong issuers in a decoded record's own marking, stale revisions, and
 //! `NodeId` key substitutions against locally admitted bindings are rejected
@@ -136,7 +136,7 @@ impl TrustSnapshotV1 {
 
   /// Decodes one snapshot, checking only its own marking and canonical
   /// wire rules. Entries are trusted through the authenticated session
-  /// that delivered them (ADR-0008); the caller compares the issuer
+  /// that delivered them; the caller compares the issuer
   /// marking against its local view where that matters.
   pub(crate) fn decode(bytes: &[u8]) -> Result<TrustSnapshotV1> {
     let wire: SnapshotWire = decode_canonical(bytes, crate::protocol::CONTROL_CBOR_LIMITS)
@@ -144,8 +144,7 @@ impl TrustSnapshotV1 {
     if wire.schema != TRUST_SNAPSHOT_SCHEMA || wire.record_version != 1 {
       return Err(crate::Error::invalid_input("trust snapshot schema"));
     }
-    // Only version 1 is known; an unknown version fails closed (the
-    // descriptor decoder's SC-G05-P0-05 precedent).
+    // Only version 1 is known; an unknown version fails closed.
     if wire.version != 1 {
       return Err(crate::Error::invalid_input("trust snapshot version"));
     }
@@ -186,7 +185,7 @@ impl TrustSnapshotV1 {
 
   /// Rejects a `NodeId` key substitution against the known local bindings:
   /// every binding whose node is already known must carry the exact same
-  /// key (SC-G04-P0-19).
+  /// key.
   pub(crate) fn assert_no_key_substitution(&self, known: &[(NodeId, PublicKey)]) -> Result<()> {
     let known: std::collections::BTreeMap<&NodeId, &PublicKey> =
       known.iter().map(|(node, key)| (node, key)).collect();
@@ -275,8 +274,8 @@ mod tests {
     )
   }
 
-  /// SC-G04-P0-16: the snapshot round-trips its marking, revision, and
-  /// ordered bindings durably.
+  /// The snapshot round-trips its marking, revision, and ordered
+  /// bindings durably.
   #[test]
   fn trust_snapshot_round_trips() {
     let snapshot = snapshot(7, 1, vec![(2, 2), (3, 3), (4, 4)]);
@@ -289,7 +288,7 @@ mod tests {
     assert_eq!(decoded.issuer(), &node(1));
   }
 
-  /// SC-G04-P0-19: conflicting evidence fails closed.
+  /// Conflicting evidence fails closed.
   #[test]
   fn trust_snapshot_rejects_conflicting_evidence() {
     let first = snapshot(7, 1, vec![(2, 2)]);
@@ -307,8 +306,8 @@ mod tests {
     assert!(!first.is_newer_than(&newer));
   }
 
-  /// SC-G04-P0-17: all trust views return the same pairs; paging is
-  /// deterministic and bounded.
+  /// All trust views return the same pairs; paging is deterministic and
+  /// bounded.
   #[test]
   fn trust_bindings_page_deterministically() {
     let snapshot = snapshot(7, 1, vec![(2, 2), (3, 3), (4, 4), (5, 5)]);
@@ -340,7 +339,7 @@ mod tests {
     Duration::ZERO
   }
 
-  // ---- SC-G04-P0-17/18: durable persistence and paged observations ----
+  // ---- Durable persistence and paged observations ----
 
   fn factory() -> std::sync::Arc<dyn crate::provider::StorageFactory> {
     std::sync::Arc::new(crate::storage::contract::ReferenceFactory::new(
@@ -401,7 +400,7 @@ mod tests {
 }
 
 /// The trust observation store: persists issuer-signed snapshots and
-/// serves bounded paged views over every binding (SC-G04-P0-17).
+/// serves bounded paged views over every binding.
 pub(crate) mod store {
   use std::{collections::BTreeMap, sync::Arc};
 
@@ -667,8 +666,8 @@ pub(crate) mod store {
   /// different key is a key-substitution conflict and fails closed. A
   /// locally revoked identity never gains a new binding through this
   /// path: re-delivery of its existing binding stays idempotent, but a
-  /// fresh adoption is refused (T-G09-04: revoke removes the authority
-  /// to gain trust through this node).
+  /// fresh adoption is refused (revocation removes the authority to gain
+  /// trust through this node).
   pub(crate) async fn adopt_binding_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, node: &NodeId, key: &PublicKey,
   ) -> Result<()> {

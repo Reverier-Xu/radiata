@@ -1,14 +1,13 @@
-//! Authenticated session driver over the framed TLS WebSocket transport
-//! (ADR-0001, ADR-0002, ADR-0006).
+//! Authenticated session driver over the framed TLS WebSocket transport.
 //!
 //! The driver sequences the private [`Handshake`] state machine over a
 //! [`Connection`] under the fixed ten-second authentication deadline
-//! (`tokio::time::timeout`, ADR-0006 fixed default). It owns the two things
+//! (`tokio::time::timeout`). It owns the two things
 //! the pure state machine deliberately does not:
 //!
 //! - signing order: the initiator calls `KeyProvider::sign` for its identity
 //!   signature only after the responder credential proof and identity signature
-//!   verified, exactly as ADR-0001 requires;
+//!   verified;
 //! - merge wiring: a merge-mode responder commits the merge triple through
 //!   [`commit_merge`] before delivering the signed grant at protocol position
 //!   six; the merger verifies the delivered grant against the authenticated
@@ -53,7 +52,7 @@ use crate::{
   view::MergeView,
 };
 
-/// The fixed ADR-0006 authentication deadline for the full session
+/// The fixed authentication deadline for the full session
 /// bootstrap exchange (positions one through six, including the join-mode
 /// admission commit and grant adoption).
 pub(crate) const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(10);
@@ -66,7 +65,7 @@ pub(crate) const CLOSE_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// One authenticated session at the end of the bootstrap exchange: the
 /// peer's session-authenticated node ID and the exact negotiated feature
-/// intersection (ADR-0002), which gates packet-protocol admission.
+/// intersection, which gates packet-protocol admission.
 #[derive(Clone, Debug)]
 pub(crate) struct EstablishedSession {
   peer: NodeId,
@@ -208,7 +207,7 @@ impl SessionDriver {
 
   async fn respond_inner(&self, connection: &mut Connection) -> Result<EstablishedSession> {
     // Fixed admission rate limiting precedes every handshake and signing
-    // step; a rejected attempt consumes no credential (THR-001).
+    // step; a rejected attempt consumes no credential.
     let source = connection
       .peer_source()
       .ok_or_else(|| Error::authentication_failed("admission source"))?;
@@ -223,8 +222,7 @@ impl SessionDriver {
 
     // A locally revoked or already-left identity never completes a new
     // merge through this node: the exact revoked or left binding fails
-    // closed before any credential or signing work (T-G09-04, ADR-0006,
-    // ADR-0009 decision 3).
+    // closed before any credential or signing work.
     if crate::identity::leave::is_left_ctx(self.context.store(), &peek.node_id).await?
       || crate::identity::cleanup::is_cleaned_ctx(self.context.store(), &peek.node_id).await?
     {
@@ -378,8 +376,8 @@ impl SessionDriver {
   /// Runs the initiator side of a merge-mode connection. Returns the
   /// authenticated session with the adopted merge view.
   ///
-  /// The credential is consumed from the caller; the ADR-0001 signing order
-  /// is enforced here: the local identity signature is produced only after
+  /// The credential is consumed from the caller; the signing order is
+  /// enforced here: the local identity signature is produced only after
   /// the responder proof verifies.
   pub(crate) async fn merge(
     &self, connection: &mut Connection, hint: &MergeHint, credential: CredentialSecret,
@@ -425,7 +423,7 @@ impl SessionDriver {
     handshake.receive(&hello.body)?;
     let proof = receive_kind(connection, HandshakeKind::ResponderProof).await?;
     handshake.receive(&proof.body)?;
-    // ADR-0001: the initiator signs only after the responder proof verified.
+    // The initiator signs only after the responder proof verified.
     let transcript = handshake
       .transcript_bytes()
       .ok_or_else(|| Error::internal("handshake transcript"))?;
@@ -459,8 +457,7 @@ impl SessionDriver {
     )?;
     // A newly presented raw grant whose issuer is already locally revoked
     // is rejected even when its signature verifies; bindings accepted
-    // anywhere before the revoke still converge through snapshots
-    // (T-G09-04, ADR-0006).
+    // anywhere before the revoke still converge through snapshots.
     if crate::identity::revocation::is_revoked_ctx(self.context.store(), grant.issuer(), issuer_key)
       .await?
     {
@@ -517,7 +514,7 @@ impl SessionDriver {
     handshake.receive(&hello.body)?;
     let proof = receive_kind(connection, HandshakeKind::ResponderProof).await?;
     handshake.receive(&proof.body)?;
-    // ADR-0001: the initiator signs only after the responder proof verified.
+    // The initiator signs only after the responder proof verified.
     let transcript = handshake
       .transcript_bytes()
       .ok_or_else(|| Error::internal("handshake transcript"))?;
@@ -536,7 +533,7 @@ impl SessionDriver {
     established(&handshake)
   }
   /// Blocks new session establishment while the local metadata store is
-  /// frozen on an indeterminate outcome (THR-015): the node refuses to
+  /// frozen on an indeterminate outcome: the node refuses to
   /// sign or admit until an authoritative reopen reconciles the exact
   /// transaction or proves absence.
   fn require_unblocked(&self) -> Result<()> {
@@ -549,12 +546,11 @@ impl SessionDriver {
 
 /// Reads the trusted member-mode binding for `peer` from durable storage.
 /// A locally revoked binding fails closed with the typed revocation error
-/// before any signing work (T-G09-04: revocation removes connection
-/// authority).
+/// before any signing work (revocation removes connection authority).
 async fn trusted_binding(context: &LocalIdentityContext, peer: &NodeId) -> Result<PublicKey> {
   // A node with an owner-signed leave record or an issuer-signed cleanup
   // tombstone is terminal evidence: it is excluded from session
-  // establishment (ADR-0009 decisions 3-4).
+  // establishment.
   if crate::identity::leave::is_left_ctx(context.store(), peer).await?
     || crate::identity::cleanup::is_cleaned_ctx(context.store(), peer).await?
   {

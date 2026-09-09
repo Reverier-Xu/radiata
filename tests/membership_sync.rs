@@ -1,15 +1,15 @@
-//! G5 membership sync over authenticated sessions (T-G05-05/06).
+//! Membership sync over authenticated sessions.
 //!
 //! Sixteen real nodes over loopback TLS: node 0 merges with every member;
 //! the anti-entropy driver pages descriptors and the trust snapshot over
 //! each authenticated session; reciprocal trust, exact descriptors, and
 //! the exact crossed-cube CQ4 topology (32 undirected sessions, degree
-//! four, diameter three)
-//! converge through public facade observations only. The failure matrix
-//! exercises duplicate delivery and partition healing (reorder, endpoint
-//! change, and full process restart are covered by the descriptor store's
-//! revision/replay unit tests and the secure-join restart lane); the trend
-//! lane records the metadata descriptor-completion SLO.
+//! four, diameter three) converge through public facade observations
+//! only. The failure-matrix test exercises duplicate delivery and
+//! partition healing (reorder, endpoint change, and full process restart
+//! are covered by the descriptor store's revision/replay unit tests and
+//! the secure-join restart coverage); the SLO tests record
+//! merge-to-descriptor-completion samples.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -58,8 +58,7 @@ struct Node {
 /// The echo protocol tag of the revised SLO workload sample.
 const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/workload-echo";
 
-/// Counts fully drained workload packets (SC-G07-P0-18 sample delivery
-/// observation).
+/// Counts fully drained workload packets (sample delivery observation).
 #[derive(Debug, Default)]
 struct EchoCollector {
   packets: std::sync::Mutex<usize>,
@@ -195,7 +194,7 @@ async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
       views.push(page);
     }
     if complete {
-      // Exact NodeId-to-key agreement (SC-G05-P0-24): every peer's view of
+      // Exact NodeId-to-key agreement: every peer's view of
       // a member carries the same public key as that member's self-view.
       let mut keys: std::collections::BTreeMap<radiata::NodeId, Vec<radiata::PublicKey>> =
         std::collections::BTreeMap::new();
@@ -236,7 +235,7 @@ async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
 
 /// Every node's membership page converges to `expected` descriptors, all
 /// at the expected owner revision, and every node's view of the same
-/// member carries the same descriptor digest (SC-G05-P0-25).
+/// member carries the same descriptor digest.
 async fn wait_descriptors(nodes: &[Node], expected: usize, revision: u64, timeout: Duration) {
   let deadline = std::time::Instant::now() + timeout;
   loop {
@@ -365,7 +364,7 @@ async fn wait_settled(
     if set == *expected {
       // The exact expected topology must hold continuously across a
       // bounded wall-clock window: settled, with no extra or recovery
-      // edge (SC-G05-P0-26).
+      // edge.
       match matched_since {
         None => matched_since = Some(std::time::Instant::now()),
         Some(first) if first.elapsed() >= Duration::from_secs(5) => return edges,
@@ -713,19 +712,18 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   let _cluster_gate = cluster_gate().lock().await;
 
   // Nodes 0..14 merge first; before node 15 merges, the induced graph must
-  // already be the 28-edge CQ4-minus-node-15 (SC-G05-P0-23).
+  // already be the 28-edge CQ4-minus-node-15.
   let mut nodes = build_cluster(15).await;
 
   // Reciprocal trust converges over the authenticated sessions: every
-  // member's trust page exposes all fifteen bindings (SC-G05-P0-24/25).
+  // member's trust page exposes all fifteen bindings.
   // Loaded runners converge slower than the functional bound claims;
   // these are bounded functional waits, not SLO samples.
   wait_trust(&nodes, 15, Duration::from_secs(180)).await;
 
-  // Induced 28-edge graph among nodes 0..14, before node 15 merges
-  // (SC-G05-P0-23): connect the CQ4 edges among the present members and
-  // close the redundant merge-star sessions, then settle to the exact edge
-  // set.
+  // Induced 28-edge graph among nodes 0..14, before node 15 merges:
+  // connect the CQ4 edges among the present members and close the
+  // redundant merge-star sessions, then settle to the exact edge set.
   connect_cq4(&nodes).await;
   close_star_sessions(&nodes, 0).await;
   let expected_induced: std::collections::BTreeSet<(u8, u8)> = cq4_edges()
@@ -741,7 +739,7 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   );
 
   // Node 15 merges last and must see all fifteen prior bindings through
-  // public queries (SC-G05-P0-25).
+  // public queries.
   let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let mut node15 = start_node(15, storage).await;
   node15.endpoint = listen(&node15).await;
@@ -771,11 +769,11 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   wait_trust(&nodes, 16, Duration::from_secs(180)).await;
 
   // Descriptor readiness: every member view exposes the exact revision 1
-  // for every node (SC-G05-P0-25).
+  // for every node.
   wait_descriptors(&nodes, 16, 1, Duration::from_secs(180)).await;
 
-  // The exact final topology: 32 sessions, degree four, diameter three
-  // (SC-G05-P0-26). Node 15's four edges make 32 in total.
+  // The exact final topology: 32 sessions, degree four, diameter three.
+  // Node 15's four edges make 32 in total.
   connect_cq4(&nodes).await;
   close_star_sessions(&nodes, 0).await;
   let expected_full: std::collections::BTreeSet<(u8, u8)> = cq4_edges().into_iter().collect();
@@ -843,13 +841,13 @@ async fn membership_sync_failure_matrix_partition_healing() {
   // Partition healing: the receiving side drops the (0,1) edge (a real
   // edge loss, not an intentional disconnect), and the dialing side's
   // recovery controller re-dials through the published endpoint until the
-  // views converge again (SC-G05-P0-22/28).
+  // views converge again.
   let _ = nodes[1]
     .handle
     .command(DisconnectPeer::new(nodes[0].id.clone()))
     .await;
   // The immediate-recovery command forces a bounded cycle; recovery
-  // converges back to connected-path connectivity (SC-G05-P0-19/22).
+  // converges back to connected-path connectivity.
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut recovered = false;
   while std::time::Instant::now() < deadline {
@@ -881,20 +879,15 @@ async fn membership_sync_failure_matrix_partition_healing() {
 async fn membership_sync_slo_trend_stays_below_bound() {
   let _cluster_gate = cluster_gate().lock().await;
 
-  // The trend lane records merge and descriptor completion from public
-  // observations; every sample must stay below 10,000 ms
-  // (eight-node sample; SC-G05-P0-29 calls for a sixteen-node trend run -
-  // recorded as a known catalog deviation).
-  // The trend records the full merge-to-descriptor-completion window:
-  // the timer starts before the first merge so merge time is included
-  // (SC-G05-P0-29). The strict <10 s bound is asserted on this 8-node
-  // sample; the sixteen-node lane (slower under load) is the convergence
-  // E2E rather than the SLO sample.
+  // The trend records the full merge-to-descriptor-completion window
+  // from public observations: the timer starts before the first merge so
+  // merge time is included. The strict 10,000 ms bound is asserted on
+  // this eight-node sample under the harness strict profile flag.
   let started = std::time::Instant::now();
   let nodes = build_cluster(8).await;
   wait_descriptors(&nodes, 8, 1, Duration::from_secs(30)).await;
   let elapsed = started.elapsed();
-  // ADR-0005 quantifies the 10,000 ms bound only on the exact 16-node OCI
+  // The 10,000 ms bound is quantified only on the exact 16-node OCI
   // profile; shared-runtime trend lanes record the raw sample and enforce
   // the strict bound only under the harness profile flag.
   if std::env::var_os("RADIATA_SLO_PROFILE_STRICT").is_some_and(|value| value == "1") {
@@ -913,15 +906,13 @@ async fn membership_sync_slo_trend_stays_below_bound() {
   }
 }
 
-/// SC-G07-P0-18: the revised sixteen-node SLO workload. One timed sample
-/// covers the fixed-rate merge (the sixteenth node), exact-node packet
-/// delivery, an owner-revision node-metadata bump, and descriptor
-/// convergence — all inside the 10,000 ms bound; only the exact 16-node
-/// profile is latency-qualified. Resource tuple convergence has no pre-G9
-/// facade write path; its convergence evidence is the resource e2e lane
-/// (SC-G07-P0-16/17) over the same bounded-page machinery, and the
-/// resource sync protocol rides the same authenticated sessions this
-/// sample exercises.
+/// The revised sixteen-node SLO workload. One timed sample covers the
+/// fixed-rate merge (the sixteenth node), exact-node packet delivery, an
+/// owner-revision node-metadata bump, and descriptor convergence — all
+/// inside the 10,000 ms bound; only the exact 16-node profile is
+/// latency-qualified. The resource sync protocol rides the same
+/// authenticated sessions this sample exercises (shared anti-entropy
+/// plumbing over bounded bodies).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_sync_sixteen_node_revised_workload_slo() {
   let _cluster_gate = cluster_gate().lock().await;
@@ -1043,11 +1034,11 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
   }
 
   let elapsed = started.elapsed();
-  // ADR-0005 quantifies the 10,000 ms bound only on the exact 16-node OCI
-  // profile (dedicated 0.5-CPU node containers on a 12+-CPU host, run by
-  // the T-G10-10/11 harness). Shared-runtime lanes are functional/trend
-  // evidence: they assert bounded convergence and record the raw sample;
-  // the strict bound applies when the harness flags the real profile.
+  // The 10,000 ms bound is quantified only on the exact 16-node OCI
+  // profile (dedicated 0.5-CPU node containers on a 12+-CPU host).
+  // Shared-runtime lanes are functional/trend evidence: they assert
+  // bounded convergence and record the raw sample; the strict bound
+  // applies when the harness flags the real profile.
   if std::env::var_os("RADIATA_SLO_PROFILE_STRICT").is_some_and(|value| value == "1") {
     assert!(
       elapsed < Duration::from_secs(10),

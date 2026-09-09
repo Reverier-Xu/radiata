@@ -1,4 +1,4 @@
-//! Convergent permanent revocation (T-G11-10, ADR-0009 decision 6).
+//! Convergent permanent revocation.
 //!
 //! Revocation is a convergent, permanent, issuer-signed removal tombstone
 //! over one exact node-to-key binding: any member may expel a compromised
@@ -13,8 +13,8 @@
 //!
 //! The permanence asymmetry is deliberate: revocation subjects have live,
 //! hostile keys, and bindings resurface by design (sync, stragglers,
-//! storage backup restore), so the gate must live as long as the binding
-//! it constrains.
+//! storage backup restore), so the revocation record must live as long as
+//! the binding it constrains.
 
 use std::sync::Arc;
 
@@ -72,7 +72,7 @@ struct RevocationRecordWire {
   signature: Vec<u8>,
 }
 
-/// One issuer-signed convergent revocation tombstone (ADR-0009 decision 6).
+/// One issuer-signed convergent revocation tombstone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RevocationRecordV1 {
   subject: NodeId,
@@ -229,8 +229,7 @@ pub(crate) enum RevokeStoreOutcome {
 }
 
 /// Conditionally revokes one exact subject/key binding with the given
-/// issuer-signed tombstone (SC-G09-P0-13, convergent per ADR-0009
-/// decision 6).
+/// issuer-signed tombstone.
 ///
 /// The record's subject key must equal the locally trusted binding: an
 /// unknown subject fails `NotFound` and a different trusted key fails
@@ -306,8 +305,8 @@ pub(crate) async fn revoke_binding_ctx(
   }
 }
 
-/// Persists one issuer-signed revocation tombstone received over sync
-/// (ADR-0009 decision 6): verified against the retained issuer binding
+/// Persists one issuer-signed revocation tombstone received over sync:
+/// verified against the retained issuer binding
 /// and the subject binding, idempotent for the exact record, and failing
 /// closed on any divergence.
 pub(crate) async fn persist_revocation_ctx(
@@ -374,7 +373,7 @@ pub(crate) async fn is_revoked_ctx(
   Ok(revoked_key_ctx(store, subject).await?.as_ref() == Some(key))
 }
 
-/// Explicitly clears the local revocation record for `subject` (T-G11-08):
+/// Explicitly clears the local revocation record for `subject`:
 /// the purge is local-only and idempotent — an absent record is a no-op.
 /// It is the operator's deliberate escape from a fat-fingered revoke; a
 /// purge is transient by nature (peers still hold the permanent tombstone
@@ -593,7 +592,7 @@ mod tests {
   }
 }
 
-/// Subprocess durability matrix for revocations (SC-G09-P0-14).
+/// Subprocess durability matrix for revocations.
 ///
 /// Mirrors the resource crash lane: the parent seeds the trusted binding,
 /// the child revokes it under deterministic entropy while aborting inside
@@ -795,8 +794,7 @@ mod crash {
   /// Every crash boundary reopens to exactly the old or the new state:
   /// the trusted binding is always intact, and the revocation is either
   /// absent or the exact committed key — never partial or substituted.
-  /// The matrix runs against every compiled backend (SC-G09-P0-14: JSON
-  /// and redb).
+  /// The matrix runs against every compiled backend (JSON and redb).
   #[tokio::test]
   async fn revoke_crash_boundaries_recover_exact_old_or_new_state() {
     for (backend, last_point) in backends() {

@@ -5,8 +5,8 @@
 //! transcripts, or private material. One journaled transaction commits the
 //! immutable subject `IdentityBinding`, the unique `CredentialUse`, and the
 //! issuer-signed `MergeGrant`, so one issuer credential generation can ever
-//! commit at most one subject (ADR-0009 decision 2: one merge credential
-//! authorizes one authenticated session between two nodes).
+//! commit at most one subject (one merge credential authorizes one
+//! authenticated session between two nodes).
 //!
 //! Merge is a binding-set union: a subject binding that already exists with
 //! the exact same key is left in place (re-merging an already-merged pair is
@@ -87,7 +87,7 @@ pub(crate) enum MergeState {
 /// reuse of the subject, credential generation, or merge ID fails closed
 /// without mutation. A subject binding that already exists with the exact
 /// same key (the pair merged before) is reused: the transaction then commits
-/// only the credential use and the grant (ADR-0009 union semantics).
+/// only the credential use and the grant (union semantics).
 pub(crate) async fn commit_merge(
   context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
   proposal: &MergeProposal,
@@ -559,7 +559,7 @@ mod tests {
   }
 
   /// A started node: identity opened and the born-with-cluster self
-  /// binding ensured (ADR-0009 decision 1).
+  /// binding ensured.
   async fn bound() -> Fixture {
     let (reference, factory) = fresh_reference();
     let keys = ScriptedKeys::full();
@@ -672,9 +672,9 @@ mod tests {
     assert_never_deleted(&fixture.keys);
   }
 
-  /// SC-G11-P0-13: re-merging an already-merged subject with a fresh
-  /// credential generation reuses the exact existing binding (union
-  /// semantics) and commits only the use and grant records.
+  /// Re-merging an already-merged subject with a fresh credential
+  /// generation reuses the exact existing binding (union semantics) and
+  /// commits only the use and grant records.
   #[tokio::test]
   async fn identity_records_remerge_reuses_the_existing_binding() {
     let fixture = bound().await;
@@ -983,12 +983,12 @@ mod tests {
     assert_never_deleted(&fixture.keys);
   }
 
-  // ---- T-G03-03 atomic merge/reconciliation evidence ----
+  // ---- atomic merge/reconciliation evidence ----
 
-  /// SC-G03-P0-07: faulting every pre-commit boundary of the merge commit
-  /// (genuine abort, genuine conflict, or crash before apply) leaves
-  /// binding, use, and grant all absent and releases the still-valid
-  /// credential generation for exactly one later attempt.
+  /// Faulting every pre-commit boundary of the merge commit (genuine
+  /// abort, genuine conflict, or crash before apply) leaves binding, use,
+  /// and grant all absent and releases the still-valid credential
+  /// generation for exactly one later attempt.
   #[tokio::test]
   async fn identity_records_merge_precommit_rejections_leave_all_absent_and_release_generation() {
     for fault in [
@@ -1059,9 +1059,9 @@ mod tests {
     }
   }
 
-  /// SC-G03-P0-09: a crash after apply at every pre-merge commit boundary
-  /// never yields a partial triple, and reopen resolves to exactly the
-  /// applied merge (at most one subject per generation).
+  /// A crash after apply at every pre-merge commit boundary never yields
+  /// a partial triple, and reopen resolves to exactly the applied merge
+  /// (at most one subject per generation).
   #[tokio::test]
   async fn identity_records_merge_unknown_applied_schedule_reconciles_after_reopen() {
     for position in 1..=5_u32 {
@@ -1106,9 +1106,9 @@ mod tests {
 
   // ---- Adoption (the merging node's persistence boundary) ----
 
-  /// SC-G11-P0-12: adoption commits the issuer binding and the grant
-  /// atomically, replays idempotently, and rejects foreign subjects,
-  /// self-issuance, and key substitution.
+  /// Adoption commits the issuer binding and the grant atomically,
+  /// replays idempotently, and rejects foreign subjects, self-issuance,
+  /// and key substitution.
   #[tokio::test]
   async fn identity_records_merge_adoption_commits_and_replays() {
     let fixture = bound().await;

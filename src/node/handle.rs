@@ -377,8 +377,8 @@ impl NodeHandle {
   ///
   /// An exact-node target rejects a load-balancer selection; a
   /// matching-node target requires one whose tag resolves in the node's
-  /// [`ExtensionRegistry`] (T-G06-01). The routing policy must resolve to
-  /// the built-in direct policy, and the protocol tag must be registered.
+  /// [`ExtensionRegistry`]. The routing policy must resolve to the
+  /// built-in direct policy, and the protocol tag must be registered.
   pub fn open_stream(
     &self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy,
     metadata: StreamMetadata,
@@ -427,7 +427,7 @@ impl NodeHandle {
     query.dispatch(&self.runtime).await
   }
 
-  /// Subscribes to node events (T-G09-03). Subscriptions are bounded and
+  /// Subscribes to node events. Subscriptions are bounded and
   /// transient: a lagging subscriber observes `EventReceive::Lagged` and
   /// must re-read through the paged queries.
   pub fn events<E: Event>(&self, options: EventOptions) -> Result<EventSubscription<E>> {

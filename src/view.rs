@@ -21,7 +21,7 @@ pub enum ShutdownReason {
   Fatal(ErrorKind),
 }
 
-/// The completed merge returned by `MergeCluster` (ADR-0009 decision 2).
+/// The completed merge returned by `MergeCluster`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergeView {
   node: NodeId,
@@ -65,7 +65,7 @@ impl ListenerView {
   }
 }
 
-/// One bounded page of listener observations (G9-07).
+/// One bounded page of listener observations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenerPage {
   items: Vec<ListenerView>,
@@ -87,7 +87,7 @@ impl ListenerPage {
 }
 
 /// One session-scoped selected feature: the negotiated tag and its exact
-/// definition digest from the authenticated intersection (SC-G09-P0-23).
+/// definition digest from the authenticated intersection.
 /// The pair is session metadata: it disappears with the session and never
 /// becomes a node-wide authorization claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,7 +113,7 @@ impl SessionFeatureView {
   }
 }
 
-/// One live authenticated session's public observation (G9-07): its
+/// One live authenticated session's public observation: its
 /// server-allocated id, the per-peer replacement generation, the peer, the
 /// attachment endpoint (the dial target for outbound sessions, the
 /// accepting listener for inbound ones), and the session-scoped feature
@@ -162,7 +162,7 @@ impl SessionView {
   }
 }
 
-/// One bounded page of session observations (G9-07).
+/// One bounded page of session observations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionPage {
   items: Vec<SessionView>,
@@ -183,8 +183,8 @@ impl SessionPage {
   }
 }
 
-/// The bounded observability snapshot of one node (T-G10-05,
-/// SC-G10-P0-15): counters keyed by well-known tags covering sessions,
+/// The bounded observability snapshot of one node: counters keyed by
+/// well-known tags covering sessions,
 /// listeners, background tasks, queue totals, open routes, retained trace
 /// metadata, pending transactions, and metadata-store availability,
 /// captured at the local host wall clock. Counters and flags only; the
@@ -321,7 +321,7 @@ impl ShutdownOutcome {
   }
 }
 
-// ---- G5 public membership and topology views (SC-G05-P0-23..26) ----
+// ---- Public membership and topology views ----
 
 /// The connectivity of one member as observed locally.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,7 +375,7 @@ impl MemberView {
     &self.endpoints
   }
 
-  /// The member's node-owned capability labels (SC-G06-P0-02).
+  /// The member's node-owned capability labels.
   pub fn labels(&self) -> &crate::LabelSet {
     &self.labels
   }
@@ -398,7 +398,7 @@ impl MemberView {
 
 /// The caller-built patch behind the `UpdateNodeMetadata` command: the
 /// owning node's bounded edits to its own descriptor, applied at a strictly
-/// higher revision (ADR-0007 owner-only records).
+/// higher revision.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeMetadataPatch {
   add_endpoints: Vec<Endpoint>,
@@ -544,7 +544,7 @@ impl ResourcePage {
   }
 }
 
-/// The outcome of one local resource mutation (T-G09-03/05): the accepted
+/// The outcome of one local resource mutation: the accepted
 /// signed candidate plus whether that candidate is the register's current
 /// tuple winner. Acceptance is not a promise of winning or staying
 /// current; a losing candidate stays harmless.
@@ -573,8 +573,8 @@ impl ResourceMutationView {
   }
 }
 
-/// The explicit acknowledgement required by [`crate::LeaveCluster`]
-/// (T-G09-06): constructing it is the caller's deliberate confirmation
+/// The explicit acknowledgement required by [`crate::LeaveCluster`]:
+/// constructing it is the caller's deliberate confirmation
 /// that the leave replaces the node's identity and deletes the old
 /// identity's local core metadata. It has no `Default`, so the
 /// acknowledgement cannot be produced accidentally.
@@ -596,7 +596,7 @@ impl ReplaceIdentityAndDeleteOldCoreMetadata {
   }
 }
 
-/// The outcome of one active leave (T-G09-06): the exact former and
+/// The outcome of one active leave: the exact former and
 /// replacement identities, bound together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaveOutcome {
@@ -621,7 +621,7 @@ impl LeaveOutcome {
   }
 }
 
-/// The outcome of one authorization revoke (T-G09-04): the exact subject
+/// The outcome of one authorization revoke: the exact subject
 /// and whether this call performed the revocation transition (an
 /// idempotent repeated revoke reports `true` for `was_already_revoked`).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -707,7 +707,7 @@ impl TopologyPage {
 }
 
 /// One paged query spec: a bounded first page or a continuation after a
-/// cursor (api-manifest shape).
+/// cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageSpec {
   cursor: Option<crate::PageCursor>,
@@ -741,7 +741,7 @@ impl PageSpec {
   }
 }
 
-// ---- G5 trust and recovery views (SC-G05-P0-24..30) ----
+// ---- Trust and recovery views ----
 
 /// The trust status of one observed identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -750,7 +750,7 @@ pub enum TrustStatus {
   /// The binding is trusted (verified from an admission grant or an
   /// issuer snapshot).
   Trusted,
-  /// The binding was revoked (G9 wires revocation).
+  /// The binding was revoked.
   Revoked,
 }
 

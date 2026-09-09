@@ -1,4 +1,4 @@
-//! The canonical `wire_decode` fuzz target (T-G10-03, ADR-0004).
+//! The canonical `wire_decode` fuzz target.
 //!
 //! Feeds every input through the prelude splitter, the closed kind
 //! registries, and each packet frame decoder with the frozen control-plane

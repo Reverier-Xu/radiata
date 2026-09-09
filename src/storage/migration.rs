@@ -1,4 +1,4 @@
-//! Transactional metadata schema migrations (T-G08-04).
+//! Transactional metadata schema migrations.
 //!
 //! A store carries one schema metadata family record naming its current
 //! logical schema version. [`MigrationRegistry`] owns an explicit, immutable
@@ -41,7 +41,7 @@ pub(crate) fn schema_namespace() -> Result<StoreNamespace> {
 }
 
 /// Encodes one canonical migration schema-record variant; the migration
-/// engine and the G10 compatibility freeze reader share this encoder.
+/// engine and the compatibility freeze reader share this encoder.
 pub(crate) fn encode_schema_record(kind: u8, tag: &str, digest: Option<&Digest>) -> StoreValue {
   let mut bytes = Vec::with_capacity(2 + tag.len() + 32);
   bytes.push(kind);
@@ -53,7 +53,7 @@ pub(crate) fn encode_schema_record(kind: u8, tag: &str, digest: Option<&Digest>)
   StoreValue::new(Arc::from(bytes))
 }
 
-/// The canonical migration schema-record decoder; the G10 compatibility
+/// The canonical migration schema-record decoder; the compatibility
 /// freeze reader consumes the same fail-closed path as the engine.
 pub(crate) fn decode_schema_record(value: &StoreValue) -> Result<(u8, String, Option<Digest>)> {
   let bytes = value.as_bytes();
@@ -355,7 +355,7 @@ const MIGRATION_TRANSACTION_DOMAIN: &[u8] = b"radiata.woooo.tech/migration-trans
 const MIGRATION_IMPLEMENTATION_DOMAIN: &[u8] = b"radiata.woooo.tech/migration-implementation-v1";
 
 /// Derives the domain-separated implementation digest of one migration
-/// tag. Production edge registration and the G10 compatibility freeze
+/// tag. Production edge registration and the compatibility freeze
 /// reader share this single derivation.
 pub(crate) fn implementation_digest(tag: &str) -> Digest {
   let mut hasher = Sha256::new();
@@ -383,7 +383,7 @@ fn migration_transaction_value(parts: &[&[u8]]) -> Result<u128> {
 }
 
 // The declared metadata schema chain frozen for the `0.1.0` wire/metadata
-// compatibility contract (T-G10-01): the base version, the intermediate
+// compatibility contract: the base version, the intermediate
 // version, the current target, and each declared edge tag. These
 // literals are frozen; every migration fixture and the compatibility
 // manifest must agree with them byte-for-byte.

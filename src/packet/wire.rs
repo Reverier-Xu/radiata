@@ -1,5 +1,4 @@
-//! Packet-stream wire frames under base schema `0x0001` (ADR-0002,
-//! ADR-0007).
+//! Packet-stream wire frames under base schema `0x0001`.
 //!
 //! Four deterministic-CBOR bodies ride the closed kind registry's packet
 //! kinds (`0x0010..=0x0013`): open carries the trace ID, both
@@ -37,14 +36,14 @@ pub(crate) enum AckStatus {
   Overloaded,
   /// A hop along the route failed after the open was relayed (session
   /// interruption); no admission claim is made either way. Additive code;
-  /// older peers fail closed on it (mixed-binary compat is T-G10-02).
+  /// older peers fail closed on it.
   Failed,
 }
 
 impl AckStatus {
   /// The single source of truth for `ErrorKind` → wire status: a relayed
   /// rejection keeps its precise kind while any other failure collapses to
-  /// the additive generic-failure code (mixed-binary compat is T-G10-02).
+  /// the additive generic-failure code.
   pub(crate) fn from_kind(kind: ErrorKind) -> Self {
     match kind {
       ErrorKind::Unsupported => Self::Unsupported,
@@ -93,9 +92,8 @@ pub(crate) struct OpenFrame {
   pub(crate) destination: NodeId,
   pub(crate) protocol: ProtocolTag,
   pub(crate) metadata: StreamMetadata,
-  /// The per-hop route envelope. `None` is the previous fixture shape: a
-  /// direct delivery where the authenticated source sent the frame
-  /// straight to this node (T-G06-01).
+  /// The per-hop route envelope. `None` is a direct delivery: the
+  /// authenticated source sent the frame straight to this node.
   pub(crate) route: Option<HopState>,
 }
 
@@ -151,8 +149,8 @@ struct OpenWire {
   /// Canonical metadata: key/value pairs sorted by key text, unique keys.
   #[n(4)]
   metadata: Vec<(String, ByteVec)>,
-  /// Present only on routed frames; direct frames end at `metadata`
-  /// (the previous fixture shape decodes without it).
+  /// Present only on routed frames; direct-delivery frames end at
+  /// `metadata`.
   #[n(5)]
   route: Option<RouteWire>,
 }
@@ -229,15 +227,15 @@ pub(crate) fn encode_open(frame: &OpenFrame) -> Result<Vec<u8>> {
 /// Decodes one packet-open frame body, enforcing canonical encoding,
 /// canonical metadata ordering, the bounded metadata map, and — for routed
 /// frames — a duplicate-free visited chain. The caller-selected parser
-/// limits bound every decode allocation (G3's checked finite limits).
+/// limits bound every decode allocation.
 pub(crate) fn decode_open(body: &[u8], limits: CborLimits) -> Result<OpenFrame> {
-  // The current frame shape carries the optional route element.
+  // The routed frame shape carries the optional route element.
   if let Ok(wire) = decode_canonical::<OpenWire>(body, limits)
     && encode_canonical(&wire, PACKET_CBOR_LIMITS).is_ok_and(|encoded| encoded == body)
   {
     return open_from_wire(wire);
   }
-  // The previous fixture shape ends at the metadata element.
+  // Direct-delivery frames end at the metadata element.
   let wire: OpenWireV1 =
     decode_canonical(body, limits).map_err(|_| Error::invalid_input("packet open decode"))?;
   if !encode_canonical(&wire, PACKET_CBOR_LIMITS).is_ok_and(|encoded| encoded == body) {
@@ -449,8 +447,7 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }
 
-  /// A routed frame whose route chain contains a duplicate node fails
-
+  /// Padded or truncated frame bodies fail closed at the wire boundary.
   #[test]
   fn tls_transport_packet_open_frame_rejects_noncanonical_padding() {
     let body = encode_open(&open_frame()).unwrap();
@@ -620,8 +617,8 @@ mod route_tests {
     assert_eq!(route.remaining_hops, 3);
   }
 
-  /// The previous fixture shape (no route element) decodes with `None`
-  /// route state — direct delivery stays wire-compatible.
+  /// A frame without the route element decodes with `None` route state —
+  /// direct delivery stays wire-compatible.
   #[test]
   fn direct_open_frame_decodes_without_route_state() {
     let (trace_id, source, destination, _) = ids();

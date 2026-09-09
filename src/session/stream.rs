@@ -1,5 +1,4 @@
-//! Established-session keep-alive and packet-stream multiplexing
-//! (ADR-0002, ADR-0007).
+//! Established-session keep-alive and packet-stream multiplexing.
 //!
 //! After the authentication exchange completes, the connection splits into
 //! a writer half driven by a bounded frame channel (the session queue) and
@@ -56,7 +55,7 @@ const INCOMING_STREAM_CHUNKS: usize = 8;
 pub(crate) type SessionTable = Arc<Mutex<BTreeMap<NodeId, SessionEntry>>>;
 
 /// One pending outbound admission: a synchronous waiter, or a forwarding
-/// hop whose acknowledgement must be relayed upstream (T-G06-03). The
+/// hop whose acknowledgement must be relayed upstream. The
 /// map holding these is bounded per session by
 /// [`SessionPolicy::pending_admissions`]: a peer that accepts opens
 /// without acknowledging them cannot grow origin memory without limit.
@@ -77,7 +76,7 @@ pub(crate) enum PendingAck {
 pub(crate) type PendingAcks = Arc<Mutex<HashMap<TraceId, PendingAck>>>;
 
 /// The packet-handling context shared by every session of one node.
-/// The caller-selected session bounds (G4-04): outbound queue count and
+/// The caller-selected session bounds: outbound queue count and
 /// encoded-byte budgets, plus the wall-clock liveness deadlines.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionPolicy {
@@ -96,7 +95,7 @@ pub(crate) struct SessionPolicy {
 }
 
 /// The fixed per-session bound on concurrent admissions awaiting their
-/// peer (T-G06 review): beyond it, new opens fail closed with typed
+/// peer: beyond it, new opens fail closed with typed
 /// `Overloaded` backpressure instead of growing memory.
 pub(crate) const MAX_PENDING_ADMISSIONS: usize = 256;
 
@@ -134,10 +133,9 @@ pub(crate) struct SessionPacketContext {
   policy: SessionPolicy,
   runtime: crate::runtime::RuntimeClient,
   clock: Arc<dyn crate::storage::receipt::WallClock>,
-  /// Injected entropy for per-session identifiers (G9-07).
+  /// Injected entropy for per-session identifiers.
   entropy: Arc<dyn crate::api::Entropy>,
-  /// The typed event hub: session and route transitions emit through it
-  /// (G9-07).
+  /// The typed event hub: session and route transitions emit through it.
   events: Arc<crate::node::EventHub>,
   forwarding: crate::routing::forward::ForwardingTable,
   route_policy: Option<QualifiedTag>,
@@ -145,7 +143,7 @@ pub(crate) struct SessionPacketContext {
   routes: RouteTable,
   forwarding_capacity: usize,
   /// The node's configured bound on in-memory terminal route records;
-  /// admission rejections must respect it like every other writer (G6-02).
+  /// admission rejections must respect it like every other writer.
   route_capacity: usize,
   /// The node-scoped tracked task vec: session-exit consumer drains join
   /// it so a teardown cannot abort an in-flight apply unnoticed.
@@ -204,7 +202,7 @@ impl SessionPacketContext {
     self.route_capacity
   }
 
-  /// The caller-selected packet parser limits (G3's checked finite limits).
+  /// The caller-selected packet parser limits.
   pub(crate) const fn parser_limits(&self) -> crate::protocol::CborLimits {
     self.parser_limits
   }
@@ -242,7 +240,7 @@ pub(crate) enum DialDirection {
   Incoming,
 }
 
-/// The deterministic crossed-dial ownership rule (SC-G04-P0-09): the
+/// The deterministic crossed-dial ownership rule: the
 /// connection initiated by the smaller node id wins, so both sides of a
 /// simultaneous dial converge to the same authenticated session. Each side
 /// keeps the entry whose direction matches the rule and drops the other.
@@ -256,7 +254,7 @@ pub(crate) fn keep_connection(local: &NodeId, peer: &NodeId, direction: DialDire
 /// The shared admission state of one outbound session queue: the count of
 /// queued frames and their summed encoded bytes. Both bounds are checked
 /// atomically (under `admit`) before enqueue, and a rejected frame is never
-/// partially enqueued (SC-G04-P0-12).
+/// partially enqueued.
 #[derive(Debug, Default)]
 struct QueueState {
   count: AtomicUsize,
@@ -265,7 +263,7 @@ struct QueueState {
   /// Signalled by [`BoundedReceiver::recv`] after every reservation
   /// release, so waiting relays wake on progress instead of spinning.
   released: tokio::sync::Notify,
-  /// Soak diagnostic (T-G10-06): admissions granted and removals (drains
+  /// Soak diagnostic: admissions granted and removals (drains
   /// plus error-path releases). reserved - removed = frames sitting in
   /// the channel.
   audit_reserved: AtomicUsize,
@@ -292,12 +290,12 @@ pub(crate) struct BoundedSender {
 }
 
 impl BoundedSender {
-  /// The current queued frame count (runtime status view, T-G10-05).
+  /// The current queued frame count (runtime status view).
   pub(crate) fn queued_messages(&self) -> usize {
     self.state.count.load(Ordering::Relaxed)
   }
 
-  /// The current queued frame bytes (runtime status view, T-G10-05).
+  /// The current queued frame bytes (runtime status view).
   pub(crate) fn queued_bytes(&self) -> u64 {
     u64::try_from(self.state.bytes.load(Ordering::Relaxed)).unwrap_or(u64::MAX)
   }
@@ -389,7 +387,7 @@ impl BoundedSender {
 
   /// The forwarding variant: waits for downstream capacity instead of
   /// rejecting, so a slow destination stops the relay's reads until it
-  /// progresses (SC-G06-P0-10). Order is preserved by the FIFO queue.
+  /// progresses. Order is preserved by the FIFO queue.
   /// Wakeups come from [`BoundedReceiver::recv`] releases; the bounded
   /// backstop covers a closed queue that will never release again.
   pub(crate) async fn send_waiting(&self, frame: SessionFrame) -> Result<()> {
@@ -453,7 +451,7 @@ impl BoundedReceiver {
   }
 }
 
-/// The public session metadata allocated at registration (G9-07): the
+/// The public session metadata allocated at registration: the
 /// server-allocated id, the per-peer replacement generation, the
 /// attachment endpoint (dial target for outbound, accepting listener for
 /// inbound), and the session-scoped selected features.
@@ -475,7 +473,7 @@ pub(crate) struct SessionEntry {
   /// context) can enforce typed backpressure.
   pub(super) pending_admissions: usize,
   pub(super) clock: Arc<dyn crate::storage::receipt::WallClock>,
-  /// The public session metadata (G9-07).
+  /// The public session metadata.
   pub(crate) meta: Arc<SessionMeta>,
   alive: Arc<AtomicBool>,
   direction: DialDirection,
@@ -488,12 +486,12 @@ impl SessionEntry {
     self.alive.load(Ordering::SeqCst)
   }
 
-  /// The queued outbound frame count (runtime status view, T-G10-05).
+  /// The queued outbound frame count (runtime status view).
   pub(crate) fn queued_messages(&self) -> usize {
     self.frames.queued_messages()
   }
 
-  /// The queued outbound frame bytes (runtime status view, T-G10-05).
+  /// The queued outbound frame bytes (runtime status view).
   pub(crate) fn queued_bytes(&self) -> u64 {
     self.frames.queued_bytes()
   }
@@ -743,7 +741,7 @@ fn clock_millis(clock: &dyn crate::storage::receipt::WallClock) -> u64 {
   crate::time::to_millis(clock.now())
 }
 
-/// Enforces the session liveness policy on host wall time (SC-G04-P0-13/14):
+/// Enforces the session liveness policy on host wall time:
 /// a session with no authenticated traffic or owned in-flight work for the
 /// idle deadline closes; a peer missing a keepalive result for the
 /// keepalive deadline closes. Wall-clock rollback or freeze delays both
@@ -830,7 +828,7 @@ async fn liveness_observer(
 
 /// Closes the authenticated session to `peer` from the node side: removes
 /// the entry so no further routing occurs and retires it so its reader and
-/// writer loops end (DisconnectPeer, SC-G05-P0-22 partition simulation).
+/// writer loops end (DisconnectPeer, partition simulation).
 /// A missing or already-dead entry is a no-op.
 pub(crate) fn retire_session(table: &SessionTable, peer: &NodeId) -> Result<()> {
   let entry = table
@@ -1054,12 +1052,12 @@ async fn read_loop(
 /// local registry, admits it into the bounded incoming stream table, and
 /// acknowledges current-process admission (or the typed rejection).
 ///
-/// Routed frames (T-G06-01) carry a route envelope that is re-validated
-/// against the session-authenticated peer before admission; any mutation,
-/// loop, or exhausted budget fails closed before a consumer runs. Until
-/// the T-G06-03 forwarder consumes the forwarding arm, frames addressed to
-/// another node are rejected as unsupported — fail-closed, with no
-/// consumer invocation and only bounded metadata recorded.
+/// Routed frames carry a route envelope that is re-validated against the
+/// session-authenticated peer before admission; any mutation, loop, or
+/// exhausted budget fails closed before a consumer runs. Frames addressed
+/// to another node belong to the route forwarder; an open that reaches
+/// this admission boundary addressed elsewhere is rejected as unsupported
+/// — fail-closed, with no consumer invocation.
 async fn admit_open(
   open: OpenFrame, session: &EstablishedSession, context: &SessionPacketContext,
   frames: &BoundedSender, incoming: &mut HashMap<TraceId, AdmittedStream>,
@@ -1071,7 +1069,7 @@ async fn admit_open(
   let mut reack_admitted_at: Option<u64> = None;
   let status = 'status: {
     // A routed frame re-validates its envelope against the
-    // session-authenticated holder before anything else (SC-G06-P0-01);
+    // session-authenticated holder before anything else;
     // the chain itself then authenticates the original source.
     if let Some(route) = open.route.clone() {
       let envelope = crate::routing::RouteContext::from_frame(
@@ -1080,7 +1078,7 @@ async fn admit_open(
         open.destination.clone(),
         Some(route),
       );
-      // Forwarding work belongs to the route forwarder (T-G06-03); this
+      // Forwarding work belongs to the route forwarder; this
       // admission boundary never branches a body, so any frame that does
       // not arrive exactly here fails closed without a consumer.
       if !matches!(
@@ -1099,8 +1097,8 @@ async fn admit_open(
     if open.destination != local {
       break 'status AckStatus::Unsupported;
     }
-    // The immutable opening context decides duplicate handling (SC-G06-P0-
-    // 15): an identical retransmission reports the current admission status
+    // The immutable opening context decides duplicate handling: an
+    // identical retransmission reports the current admission status
     // without invoking the consumer twice; a conflicting one fails closed.
     let context_digest = crate::session::stream::opening_context_digest(
       &open.source,
@@ -1111,7 +1109,7 @@ async fn admit_open(
     match incoming.get(&trace_id) {
       // An identical retransmission reports the current admission status
       // with the original admission time; the consumer is not invoked
-      // twice (SC-G06-P0-15).
+      // twice.
       Some(admitted) if admitted.context == context_digest => {
         reack_admitted_at = Some(admitted.admitted_at_millis);
         break 'status AckStatus::Admitted;
@@ -1127,12 +1125,11 @@ async fn admit_open(
       {
         // Saturation prioritises conflicts over genuinely new streams:
         // identical duplicates were already answered above, conflicting
-        // ones failed closed above, and only a new stream now receives
-        // the typed backpressure (SC-G06-P0-15). The inbound admitted
-        // stream table deliberately shares the caller-selected session
-        // queue message budget: every admitted stream occupies queue
-        // capacity, so one knob bounds both (T-G06 review: documented,
-        // no longer silent).
+        // ones failed closed above, and only a new stream receives the
+        // typed backpressure. The inbound admitted stream table
+        // deliberately shares the caller-selected session queue message
+        // budget: every admitted stream occupies queue capacity, so one
+        // knob bounds both.
         if incoming.len() >= context.policy.queue_messages {
           break 'status AckStatus::Overloaded;
         }
@@ -1274,7 +1271,7 @@ fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) {
 
 /// Pumps one outbound packet over its session: open, admission wait,
 /// ordered chunks, end. Updates the in-memory route record and notifies
-/// the synchronous waiter of the admission outcome (ADR-0007: the ack
+/// the synchronous waiter of the admission outcome (the ack
 /// proves current-process admission only).
 #[instrument(name = "packet", skip_all, fields(
   trace_id = %request.trace_id,
@@ -1329,7 +1326,7 @@ pub(crate) async fn run_outbound(
     let queued_at = clock_seconds(entry.clock.as_ref());
     let registered = entry.pending_acks.lock().map(|mut pending| {
       // Typed backpressure instead of unbounded growth: beyond the
-      // per-session admission bound the open fails closed (T-G06 review).
+      // per-session admission bound the open fails closed.
       if pending.len() >= entry.pending_admissions {
         return Err(());
       }
@@ -1358,8 +1355,8 @@ pub(crate) async fn run_outbound(
   }
 
   // Selector-selected and multi-hop-routed deliveries carry the route
-  // envelope (the current wire fixture): every hop re-validates the chain
-  // before admission. Direct exact-node sends keep the previous shape.
+  // envelope: every hop re-validates the chain before admission. Direct
+  // exact-node sends carry no envelope.
   let route = if force_routed || matches!(request.target, StreamTarget::MatchingNodes(_)) {
     Some(
       crate::routing::RouteContext::new(
@@ -1588,8 +1585,8 @@ mod replacement_tests {
     NodeId::parse(&format!("node_{value:021}")).unwrap()
   }
 
-  /// SC-G04-P0-09: every completion ordering picks the same single session
-  /// owner from durable identities.
+  /// Every completion ordering picks the same single session owner from
+  /// durable identities.
   #[test]
   fn crossed_dial_converges_to_the_smaller_initiator_connection() {
     let smaller = node(1);
@@ -1646,8 +1643,8 @@ mod queue_tests {
     )
   }
 
-  /// SC-G04-P0-12: count and byte bounds are checked atomically and a
-  /// rejected frame is never partially enqueued.
+  /// Count and byte bounds are checked atomically and a rejected frame is
+  /// never partially enqueued.
   #[tokio::test]
   async fn bounded_queue_rejects_at_either_boundary_without_partial_enqueue() {
     let (sender, mut receiver) = queue(2, 1_000);
@@ -1703,8 +1700,8 @@ mod liveness_tests {
     Arc::new(Mutex::new(HashMap::new()))
   }
 
-  /// SC-G04-P0-14: while host wall time advances normally, only sessions
-  /// without authenticated traffic or owned in-flight work close after the
+  /// While host wall time advances normally, only sessions without
+  /// authenticated traffic or owned in-flight work close after the
   /// configured idle deadline.
   #[tokio::test(start_paused = true)]
   async fn idle_closes_at_the_deadline_only_without_owned_work() {
@@ -1766,8 +1763,8 @@ mod liveness_tests {
     handle.await.unwrap();
   }
 
-  /// SC-G04-P0-14 continuation: rollback or freeze delays closure and a
-  /// forward jump makes it immediately due.
+  /// Clock rollback or freeze delays closure and a forward jump makes it
+  /// immediately due.
   #[tokio::test(start_paused = true)]
   async fn idle_respects_clock_rollback_and_forward_jumps() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
@@ -1804,8 +1801,8 @@ mod liveness_tests {
     handle.await.unwrap();
   }
 
-  /// SC-G04-P0-13: a peer missing the keepalive result is closed after the
-  /// keepalive deadline.
+  /// A peer missing the keepalive result is closed after the keepalive
+  /// deadline.
   #[tokio::test(start_paused = true)]
   async fn keepalive_closes_a_peer_missing_the_result() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
@@ -1843,10 +1840,10 @@ mod liveness_tests {
     handle.await.unwrap();
   }
 
-  /// T-G06 review follow-up: the owned-work hold-off is itself
-  /// deadline-bounded — a waiting admission older than the idle deadline
-  /// no longer exempts the session, so a peer that never acknowledges
-  /// cannot hold it open forever.
+  /// The owned-work hold-off is itself deadline-bounded — a waiting
+  /// admission older than the idle deadline no longer exempts the
+  /// session, so a peer that never acknowledges cannot hold it open
+  /// forever.
   #[tokio::test(start_paused = true)]
   async fn stale_owned_work_no_longer_blocks_the_idle_close() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
@@ -1956,9 +1953,9 @@ mod pending_admission_tests {
     }
   }
 
-  /// T-G06 review: a session at its concurrent-admission bound rejects a
-  /// new outbound open with typed `Overloaded` backpressure instead of
-  /// growing the pending map without limit.
+  /// A session at its concurrent-admission bound rejects a new outbound
+  /// open with typed `Overloaded` backpressure instead of growing the
+  /// pending map without limit.
   #[tokio::test]
   async fn admission_bound_rejects_new_opens_with_overloaded() {
     let entry = saturated_entry(4);
@@ -2024,7 +2021,7 @@ mod admission_tests {
     md
   }
 
-  // ---- SC-G06-P0-15: identical duplicates report status; conflicts fail ----
+  // ---- Identical duplicates report status; conflicts fail ----
 
   /// The immutable context digest is stable across identical retransmissions
   /// and changes with any mutation of source, destination, protocol, or
@@ -2149,7 +2146,7 @@ mod admission_tests {
     let _ = BTreeMap::<String, ByteVec>::new();
   }
 
-  // ---- SC-G06-P0-12/13: rejection records stay bounded terminal facts ----
+  // ---- Rejection records stay bounded terminal facts ----
 
   /// A rejected open records exactly one bounded terminal route fact; a
   /// second rejection for the same trace never grows the table.

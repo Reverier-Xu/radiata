@@ -1,12 +1,12 @@
-//! Bounded canonical node and resource labels (ADR-0007).
+//! Bounded canonical node and resource labels.
 //!
 //! Labels are the core metadata that selectors evaluate against: a
 //! [`LabelKey`] is a domain-qualified tag in the `labels` category, a
 //! [`LabelValue`] is bounded opaque UTF-8 text, and a [`LabelSet`] is the
 //! canonical key-sorted map carried by owner-marked node descriptors.
 //! Core treats values as opaque bytes and never assigns them meaning;
-//! reserved categories stay closed (resource type and URI labels arrive
-//! with the G7/G9 resource catalog).
+//! reserved categories stay closed, and the resource type and URI labels
+//! live in the reserved `resources` category.
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 

@@ -1,4 +1,4 @@
-//! TLS 1.3-only rustls configuration (ADR-0001 "TLS Bootstrap").
+//! TLS 1.3-only rustls configuration.
 //!
 //! Every bootstrap and member session uses TLS 1.3:
 //!
@@ -8,15 +8,15 @@
 //!   ClientHello therefore cannot negotiate.
 //! - Early data is off: the server keeps `max_early_data_size = 0` and the
 //!   client keeps `enable_early_data = false`.
-//! - Session resumption is off before 0.1.0: the server sends zero TLS 1.3
-//!   tickets (`send_tls13_tickets = 0`) and stores no sessions. rustls has no
+//! - Session resumption is off: the server sends zero TLS 1.3 tickets
+//!   (`send_tls13_tickets = 0`) and stores no sessions. rustls has no
 //!   client-side `enable_tls13_tickets` switch; the client equivalent is
 //!   `Resumption::disabled()`, which never retains or offers a ticket even if a
 //!   server sends one.
 //! - ALPN is not required: `alpn_protocols` stays empty on both sides; the
 //!   WebSocket upgrade runs directly over the TLS stream.
-//! - The merge-mode client verifier is the custom ADR-0001
-//!   [`BootstrapCertVerifier`], never the WebPKI chain verifier.
+//! - The merge-mode client verifier is the custom [`BootstrapCertVerifier`],
+//!   never the WebPKI chain verifier.
 
 use std::sync::Arc;
 
@@ -42,7 +42,7 @@ pub(crate) fn crypto_provider() -> Arc<CryptoProvider> {
 
 /// Builds the listener-side TLS configuration for one ephemeral
 /// certificate. Client authentication is not requested: peer authentication
-/// happens at the application proof layer (ADR-0001).
+/// happens at the application proof layer.
 pub(crate) fn server_config(certificate: &EphemeralCertificate) -> Result<Arc<ServerConfig>> {
   let mut config = ServerConfig::builder_with_provider(crypto_provider())
     .with_protocol_versions(&[&TLS13])
@@ -60,8 +60,8 @@ pub(crate) fn server_config(certificate: &EphemeralCertificate) -> Result<Arc<Se
 }
 
 /// Builds the merge-mode client configuration: chain and hostname trust are
-/// relaxed exactly as ADR-0001 permits, while the TLS 1.3
-/// `CertificateVerify` signature remains fully validated. The WebPKI chain
+/// relaxed, while the TLS 1.3 `CertificateVerify` signature remains fully
+/// validated. The WebPKI chain
 /// verifier is never used in join mode.
 pub(crate) fn merge_client_config() -> Result<Arc<ClientConfig>> {
   client_config(TrustMode::Merge)

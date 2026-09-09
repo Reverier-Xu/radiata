@@ -1,7 +1,7 @@
-//! Framed connection over the TLS WebSocket stream (ADR-0001, ADR-0002).
+//! Framed connection over the TLS WebSocket stream.
 //!
 //! A [`Connection`] carries exactly one binary WebSocket message per
-//! ADR-0002 wire message: one 16-byte prelude followed by one body. Encode
+//! wire message: one 16-byte prelude followed by one body. Encode
 //! and decode reuse the `protocol::envelope` prelude and [`split_message`]
 //! semantics, so kind declaration, flag, class-limit, receive-limit, and
 //! trailing-byte checks are identical to the in-memory handshake harness.
@@ -9,8 +9,8 @@
 //! limit while reassembling frames, and `split_message` re-checks every
 //! configured limit before exposing the body.
 //!
-//! The channel binding is the RFC 9266 `tls-exporter` channel binding
-//! (ADR-0001): exactly
+//! The channel binding is the RFC 9266 `tls-exporter` channel binding:
+//! exactly
 //! `TLS-Exporter("EXPORTER-Channel-Binding", "", 32)`. It is read from the
 //! local TLS connection immediately after the handshake completes, never
 //! received as a wire field, never logged, and never treated as a secret.
@@ -41,10 +41,10 @@ use crate::{
   protocol::{PRELUDE_LEN, Prelude, split_message, wire::BASE_SCHEMA_ID},
 };
 
-/// The exact RFC 9266 exporter label (ADR-0001).
+/// The exact RFC 9266 exporter label.
 pub(crate) const EXPORTER_LABEL: &[u8] = b"EXPORTER-Channel-Binding";
 
-/// The channel binding length in bytes (ADR-0001).
+/// The channel binding length in bytes.
 pub(crate) const CHANNEL_BINDING_LEN: usize = 32;
 
 /// One decoded wire message.
@@ -82,8 +82,7 @@ impl Connection {
   ) -> Result<Self> {
     // The packet data plane is ack-driven with small messages; the kernel
     // Nagle + delayed-ACK interaction would stall every burst by the
-    // delayed-ACK window, so the transport owns low-latency sockets
-    // (ADR-0007 stream semantics require prompt delivery).
+    // delayed-ACK window, so the transport owns low-latency sockets.
     let tcp = low_latency(tcp, ProviderErrorContext::TransportAccept)?;
     let source = tcp
       .peer_addr()
@@ -191,7 +190,7 @@ impl Connection {
   }
 
   /// Splits the connection into independent writer and reader halves for
-  /// the post-authentication session phase (ADR-0007 packet streams).
+  /// the post-authentication session phase.
   pub(crate) fn into_split(self) -> (ConnectionWriter, ConnectionReader) {
     let (sink, stream) = self.stream.split();
     let pong_last_seen = self.pong_last_seen;
@@ -356,8 +355,7 @@ fn encode_frame(
 }
 
 /// Disables the kernel Nagle algorithm so ack-driven small-message bursts
-/// are not stalled by the delayed-ACK window (ADR-0007 packet streams are
-/// latency-sensitive and carry no bulk transfer that Nagle would help).
+/// are not stalled by the delayed-ACK window.
 fn low_latency(tcp: TcpStream, context: ProviderErrorContext) -> Result<TcpStream> {
   tcp
     .set_nodelay(true)

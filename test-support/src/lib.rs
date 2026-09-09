@@ -1462,7 +1462,7 @@ mod tests {
   fn manifest(producer: ProducerKind) -> EvidenceManifest {
     EvidenceManifest::new(
       producer,
-      EvidenceId::new("SC-G01-P0-04").unwrap(),
+      EvidenceId::new("scenario-baseline").unwrap(),
       EvidenceId::new("shared-artifact-contract").unwrap(),
       Some(7),
       FailureClass::Invariant,
@@ -1595,7 +1595,7 @@ mod tests {
     assert_eq!(
       EvidenceManifest::new(
         ProducerKind::Fuzz,
-        EvidenceId::new("SC-G01-P0-04").unwrap(),
+        EvidenceId::new("scenario-baseline").unwrap(),
         EvidenceId::new("wrong-replay").unwrap(),
         None,
         FailureClass::Invariant,

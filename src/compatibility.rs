@@ -1,4 +1,4 @@
-//! The frozen `0.1.0` wire/metadata compatibility manifest (T-G10-01).
+//! The frozen `0.1.0` wire/metadata compatibility manifest.
 //!
 //! [`VECTOR_MANIFEST`] lists every golden vector the `0.1.0` release
 //! freezes across the seven format families: packet wire frames, identity
@@ -212,7 +212,7 @@ pub(crate) const VECTOR_MANIFEST: &[CompatibilityVector] = &[
     read: read_packet_ack,
   },
   // Identity records: the whole closed record surface of the identity
-  // journal, pinned in the G2/G3 golden suites and frozen here.
+  // journal, pinned byte-for-byte here.
   CompatibilityVector {
     family: CompatibilityFamily::Identity,
     name: "local-identity-v1",
@@ -279,8 +279,8 @@ pub(crate) const VECTOR_MANIFEST: &[CompatibilityVector] = &[
     shape: VectorShape::ByteStable,
     read: read_node_descriptor,
   },
-  // Resource records: the G7 previous fixture and the G9 current live
-  // and removal fixtures.
+  // Resource records: the previous fixture and the current live and
+  // removal fixtures.
   CompatibilityVector {
     family: CompatibilityFamily::Resource,
     name: "record-g7-previous",
@@ -427,7 +427,7 @@ mod tests {
     golden(entry(name).hex)
   }
 
-  // ---- SC-G10-P0-01: golden vectors reproduce byte-for-byte ----
+  // ---- golden vectors reproduce byte-for-byte ----
 
   /// Every manifest-listed current vector decodes through its family
   /// reader and re-encodes byte-for-byte, and every vector carries its
@@ -512,7 +512,7 @@ mod tests {
     );
   }
 
-  // ---- SC-G10-P0-02: previous readers accept compatible vectors ----
+  // ---- previous readers accept compatible vectors ----
 
   /// The manifest inventory is closed: every family ships exactly its
   /// frozen vector count and every family has a reader, so an omitted
@@ -542,7 +542,8 @@ mod tests {
   /// The previous fixture shapes stay accepted by the current readers:
   /// the direct packet open decodes without a route envelope, the record
   /// version 1 node descriptor decodes to an empty capability label set,
-  /// and the G7 resource fixture keeps its exact logical tuple version.
+  /// and the previous resource fixture keeps its exact logical tuple
+  /// version.
   #[test]
   fn previous_reader_shapes_stay_accepted() {
     // Packet open, previous shape: no route envelope.
@@ -560,7 +561,7 @@ mod tests {
     let current_descriptor = decode_descriptor(&bytes("descriptor-v2")).unwrap();
     assert_eq!(current_descriptor.encode().unwrap(), bytes("descriptor-v2"));
 
-    // Resource record, G7 previous fixture: exact logical version.
+    // Resource record, previous fixture: exact logical version.
     let previous_resource = ResourceRecordV1::decode(&bytes("record-g7-previous")).unwrap();
     assert_eq!(previous_resource.timestamp_millis(), 1_000);
     assert!(
@@ -575,7 +576,7 @@ mod tests {
     );
   }
 
-  // ---- SC-G10-P0-05: unsupported format versions fail closed ----
+  // ---- unsupported format versions fail closed ----
 
   /// Unknown, downgraded, and newer unsupported format versions return
   /// typed errors from every family reader without fallback decoding.
@@ -713,7 +714,7 @@ mod tests {
     assert_eq!(ack, bytes("ack-v1"));
 
     // Identity key-deleted record (the other five identity vectors are
-    // the pinned G2/G3 bytes, already round-tripped above).
+    // pinned golden bytes already round-tripped byte-for-byte above).
     let deleted = crate::identity::records::KeyDeletedV1::new(
       crate::provider::KeyOperationId::parse("keyop_AAAAAAAAAAAAAAAAAAAAA").unwrap(),
       crate::provider::KeyHandle::from_provider_bytes(Arc::from(b"provider-handle-01".as_slice()))
@@ -744,7 +745,7 @@ mod tests {
     .unwrap();
     assert_eq!(descriptor, bytes("descriptor-v2"));
 
-    // Resource records, G9 fixtures.
+    // Resource records, live and removal fixtures.
     let writer = node(1);
     let seed = [11_u8; 32];
     let live = ResourceRecordV1::sign(
@@ -814,8 +815,8 @@ mod tests {
     .to_vec();
     assert_eq!(edge, bytes("edge-record-v1"));
 
-    // The copied G2/G3/transaction golden bytes stay byte-identical to
-    // their owner-module pins (the owner-module golden suites pin the
+    // The copied identity and transaction golden bytes stay byte-identical
+    // to their owner-module pins (the owner-module golden suites pin the
     // same literals; this freezes them against owner-module edits).
     for name in [
       "local-identity-v1",

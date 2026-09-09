@@ -66,7 +66,7 @@ impl Providers {
 }
 
 #[test]
-fn g1_lifecycle_sealed_operations_preserve_outputs() {
+fn lifecycle_sealed_operations_preserve_outputs() {
   fn assert_command<Operation: Command<Output = ShutdownOutcome>>() {}
   fn assert_status_query<Operation: Query<Output = NodeStatus>>() {}
   fn assert_wait_query<Operation: Query<Output = ShutdownReason>>() {}
@@ -77,7 +77,7 @@ fn g1_lifecycle_sealed_operations_preserve_outputs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g1_lifecycle_start_and_shutdown_provisions_identity_once() {
+async fn lifecycle_start_and_shutdown_provisions_identity_once() {
   let providers = Providers::new();
   let handle = providers.start().await;
 
@@ -108,7 +108,7 @@ async fn g1_lifecycle_start_and_shutdown_provisions_identity_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g1_lifecycle_cloned_handles_share_runtime_status() {
+async fn lifecycle_cloned_handles_share_runtime_status() {
   let providers = Providers::new();
   let first = providers.start().await;
   let second = first.clone();
@@ -125,7 +125,7 @@ async fn g1_lifecycle_cloned_handles_share_runtime_status() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g1_lifecycle_shutdown_and_wait_are_idempotent() {
+async fn lifecycle_shutdown_and_wait_are_idempotent() {
   let providers = Providers::new();
   let handle = providers.start().await;
   let waiter = handle.clone();
@@ -150,7 +150,7 @@ async fn g1_lifecycle_shutdown_and_wait_are_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g1_lifecycle_concurrent_shutdown_runs_one_drain() {
+async fn lifecycle_concurrent_shutdown_runs_one_drain() {
   let providers = Providers::new();
   let handle = providers.start().await;
   let barrier = Arc::new(tokio::sync::Barrier::new(16));
@@ -185,7 +185,7 @@ async fn g1_lifecycle_concurrent_shutdown_runs_one_drain() {
 }
 
 #[test]
-fn g1_lifecycle_start_without_tokio_returns_not_ready_without_provider_calls() {
+fn lifecycle_start_without_tokio_returns_not_ready_without_provider_calls() {
   let providers = Providers::new();
   let mut start = Box::pin(providers.builder().start());
   let waker = Waker::noop();
@@ -201,7 +201,7 @@ fn g1_lifecycle_start_without_tokio_returns_not_ready_without_provider_calls() {
 }
 
 #[test]
-fn g1_lifecycle_runtime_loss_publishes_failed_terminal_state() {
+fn lifecycle_runtime_loss_publishes_failed_terminal_state() {
   let runtime = tokio::runtime::Builder::new_current_thread()
     .enable_all()
     .build()
@@ -235,7 +235,7 @@ fn g1_lifecycle_runtime_loss_publishes_failed_terminal_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g1_lifecycle_shutdown_releases_retained_providers() {
+async fn lifecycle_shutdown_releases_retained_providers() {
   let providers = Providers::new();
   let handle = providers.start().await;
 
@@ -251,7 +251,7 @@ async fn g1_lifecycle_shutdown_releases_retained_providers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g1_lifecycle_last_handle_drop_stops_supervisor() {
+async fn lifecycle_last_handle_drop_stops_supervisor() {
   let providers = Providers::new();
   let handle = providers.start().await;
 
@@ -278,11 +278,11 @@ async fn g1_lifecycle_last_handle_drop_stops_supervisor() {
   assert_eq!(providers.key_drops.count(), 1);
 }
 
-/// G9-02 facade wiring: the sealed `SelectResources` query pages the local
-/// resource catalog through the public handle; an empty catalog returns an
-/// empty bounded page with no continuation.
+/// The sealed `SelectResources` query pages the local resource catalog
+/// through the public handle; an empty catalog returns an empty bounded
+/// page with no continuation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_select_resources_pages_the_empty_catalog() {
+async fn select_resources_pages_the_empty_catalog() {
   let providers = Providers::new();
   let handle = providers.start().await;
 

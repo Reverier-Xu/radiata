@@ -1,5 +1,4 @@
-//! The canonical `admission` state-machine fuzz target (T-G10-04,
-//! ADR-0004).
+//! The canonical `admission` state-machine fuzz target.
 //!
 //! Derived operation sequences drive the admission commit/reconcile state
 //! machine: propose, replay, double-book a generation, and replay with a

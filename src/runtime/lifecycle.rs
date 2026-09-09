@@ -279,8 +279,8 @@ impl RuntimeClient {
     })
   }
 
-  /// Reads one in-memory route record (ADR-0007: bounded trace metadata
-  /// only, no durability claim).
+  /// Reads one in-memory route record (bounded trace metadata only, no
+  /// durability claim).
   pub(crate) fn route_status(&self, handle: &RouteHandle) -> Result<RouteStatusView> {
     let routes = self
       .routes

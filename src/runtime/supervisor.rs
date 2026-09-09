@@ -85,11 +85,11 @@ pub(crate) struct RuntimeDependencies {
   pub(crate) entropy: Arc<dyn Entropy>,
   pub(crate) extensions: Arc<ExtensionRegistry>,
   /// The registered transport every dial and listen flows through, so
-  /// configured attempts are observable at one boundary (SC-G05-P0-22).
+  /// configured attempts are observable at one boundary.
   pub(crate) transport: Arc<dyn Transport>,
   pub(crate) sessions: SessionTable,
   pub(crate) routes: RouteTable,
-  /// The typed event hub shared with every node handle (G9-03).
+  /// The typed event hub shared with every node handle.
   pub(crate) events: Arc<crate::node::EventHub>,
   /// The node's member-set revision signal: bumped one-to-one with the
   /// MemberChanged emissions so observers await changes instead of
@@ -104,19 +104,18 @@ pub(crate) struct RuntimeDependencies {
   pub(crate) sync_round_requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
   /// Node-scoped task handles: connection tasks plus the graceful
   /// consumer-drain tasks. Shutdown awaits them and the recovery tick
-  /// reaps finished ones (bounded task accounting, roadmap rule 4).
+  /// reaps finished ones (bounded task accounting).
   pub(crate) connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
   /// The 32-byte runtime seed drawn once at startup, before identity
-  /// provisioning. Deliberately reserved and pinned by the G1 lifecycle
-  /// entropy-sequence test; future runtime lanes consume it from here
-  /// instead of re-drawing.
+  /// provisioning. Deliberately reserved and pinned by the lifecycle
+  /// entropy-sequence test.
   pub(crate) runtime_seed: Option<[u8; 32]>,
 }
 
 /// Spawns the anti-entropy membership-sync driver: it pages descriptors
 /// and the issuer trust snapshot over every authenticated session on the
-/// configured interval and stops on the shutdown signal (SC-G05-P0-22:
-/// streams metadata pages; bounded work per tick).
+/// configured interval and stops on the shutdown signal (streams metadata
+/// pages; bounded work per tick).
 #[allow(clippy::too_many_arguments)]
 fn spawn_sync_driver(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn crate::api::Entropy>,
@@ -235,7 +234,7 @@ pub(crate) async fn spawn_runtime(
   // `dependencies.transport` is resolved once in the builder from the
   // extension registry, so every dial and listen flows through the
   // registered transport (a counting wrapper registered under the WSS tag
-  // observes configured attempts, SC-G05-P0-22). It is not re-resolved or
+  // observes configured attempts). It is not re-resolved or
   // overridden here.
   let receipt_retention = dependencies.config.receipt_retention();
   let context = open_local_identity(
@@ -246,7 +245,7 @@ pub(crate) async fn spawn_runtime(
   )
   .await?;
   let context = {
-    // Born-with-cluster (ADR-0009 decision 1): every started node holds
+    // Born-with-cluster: every started node holds
     // its own immutable identity binding, so it is a singleton cluster of
     // one and merge union needs no genesis ceremony.
     ensure_self_binding(&context, dependencies.entropy.as_ref()).await?;
@@ -274,7 +273,7 @@ pub(crate) async fn spawn_runtime(
     .extensions
     .register_core_protocol(sync_definition, sync_consumer)?;
   // The core resource sync protocol rides the same authenticated sessions
-  // and anti-entropy driver as membership sync (T-G07-04).
+  // and anti-entropy driver as membership sync.
   let resource_definition = crate::resource::sync::resource_sync_protocol_definition()?;
   let resource_consumer = Arc::new(crate::resource::sync::ResourceSyncConsumer::new(
     runtime_context,
@@ -619,11 +618,11 @@ pub(super) struct Supervisor {
   // Members this node has ever authenticated a session with: the recovery
   // "known online" set. Recovery restores authenticated paths to exactly
   // these members (edge-loss healing) and never dials strangers, so it
-  // cannot add edges beyond the caller-configured topology (SC-G05-P0-26).
+  // cannot add edges beyond the caller-configured topology.
   pub(super) recovery_history: std::collections::BTreeSet<NodeId>,
   // Intentionally disconnected peers: recovery never heals them until an
   // explicit reconnect (a new session to the peer) restores the
-  // relationship (SC-G05-P0-26 no-extra-edge).
+  // relationship (no-extra-edge).
   pub(super) recovery_excluded: std::collections::BTreeSet<NodeId>,
   // The anti-entropy driver task: aborted on shutdown so the node's
   // storage handle is released promptly (a restarted node reopening the
@@ -674,7 +673,7 @@ impl Supervisor {
       return Err(Box::new((Error::internal("runtime context"), dependencies)));
     };
     // The negotiation registry is the frozen built-in set plus every
-    // caller-registered feature definition (T-G09-07).
+    // caller-registered feature definition.
     let mut definitions = match crate::protocol::feature::builtin_definitions() {
       Ok(definitions) => definitions,
       Err(error) => return Err(Box::new((error, dependencies))),
@@ -829,7 +828,7 @@ impl Supervisor {
           match driver.respond(&mut connection).await {
             Ok(session) => {
               // Keep the authenticated session open: it serves packet
-              // streams until the connection closes (ADR-0007).
+              // streams until the connection closes.
               run_session(
                 connection,
                 session,
@@ -845,7 +844,7 @@ impl Supervisor {
             Err(error) => {
               // A typed rejection must reach the dialer before the socket
               // disappears: close gracefully so the failure frame drains
-              // instead of being lost to a reset (THR-002 hardening).
+              // instead of being lost to a reset (hardening).
               let _ = connection.close().await;
               tracing::warn!(kind = ?error.kind(), context = %error, "session establishment failed");
             }
@@ -907,7 +906,7 @@ impl Supervisor {
     let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
     let (session, view) = self.driver.merge(&mut connection, &hint, secret).await?;
     // Remember the peer's leaf SPKI from the merge as the member-mode
-    // reconnect pinning anchor (THR-002 hardening).
+    // reconnect pinning anchor (hardening).
     let peer = session.peer().clone();
     if !hint.leaf_spki().is_empty() {
       self
@@ -935,10 +934,10 @@ impl Supervisor {
     Ok(view)
   }
 
-  /// Reconnects to an already-admitted peer with key trust only (G3-04,
-  /// THR-002): the member-mode handshake proves both identities over a
-  /// fresh transcript and exporter binding without consulting any join
-  /// credential, then keeps the session open for packet streams.
+  /// Reconnects to an already-admitted peer with key trust only: the
+  /// member-mode handshake proves both identities over a fresh transcript
+  /// and exporter binding without consulting any join credential, then
+  /// keeps the session open for packet streams.
   async fn connect_member(&mut self, receiver: Endpoint, peer: NodeId) -> Result<NodeId> {
     self.require_unblocked()?;
     // A deliberate caller connect restores an intentionally disconnected
@@ -985,7 +984,7 @@ impl Supervisor {
   /// Routes one outbound packet. Matching-node targets resolve through the
   /// registered load-balancing policy over the descriptor store before the
   /// pump starts; the selected node is validated against the authoritative
-  /// descriptors (SC-G06-P0-02). Failure paths still record the terminal
+  /// descriptors. Failure paths still record the terminal
   /// route state so asynchronous senders can observe them through
   /// `GetRoute`.
   async fn send_packet(
@@ -1044,7 +1043,7 @@ impl Supervisor {
       .get(&destination)
       .cloned();
     // A direct path is preferred; without one, the node's registered
-    // next-hop policy may route through a connected peer (T-G06-03). The
+    // next-hop policy may route through a connected peer. The
     // pump then emits the route envelope so every intermediate hop
     // re-validates the chain.
     let direct = entry.filter(|entry| entry.alive());
@@ -1121,7 +1120,7 @@ impl Supervisor {
   }
 
   /// One host-wall-clock retention pass over the resource removal
-  /// evidence (T-G07-05): expired and excess signed removal records leave
+  /// evidence: expired and excess signed removal records leave
   /// by exact conditional deletes that never dereference a resource URI
   /// or touch caller data; live resource metadata is never evicted.
   async fn resource_removal_sweep(&mut self) {
@@ -1159,7 +1158,7 @@ impl Supervisor {
     .await
   }
 
-  /// Forces one bounded immediate recovery cycle (SC-G05-P0-19) and
+  /// Forces one bounded immediate recovery cycle and
   /// returns the public recovery view.
   fn start_recovery(&mut self) -> Result<crate::RecoveryView> {
     let before = self.recovery_view();
@@ -1174,8 +1173,8 @@ impl Supervisor {
     Ok(after)
   }
 
-  /// Closes the authenticated session to one peer (SC-G05-P0-22 partition
-  /// simulation) and removes it from the recovery known-online set: an
+  /// Closes the authenticated session to one peer (partition simulation)
+  /// and removes it from the recovery known-online set: an
   /// intentional disconnect is respected by recovery (a real edge loss, by
   /// contrast, leaves the member online and gets healed on the next cycle).
   fn disconnect_peer(&mut self, peer: &NodeId) -> Result<()> {
@@ -1194,7 +1193,7 @@ impl Supervisor {
   /// Applies one owner-only metadata patch to this node's own descriptor
   /// (`UpdateNodeMetadata`): endpoint candidates and capability labels are
   /// replaced at a strictly higher revision than `expected_revision`, and
-  /// the updated member view is returned (ADR-0007 owner records).
+  /// the updated member view is returned (owner records).
   async fn update_node_metadata(
     &mut self, expected_revision: u64, patch: crate::NodeMetadataPatch,
   ) -> Result<crate::MemberView> {
@@ -1224,7 +1223,7 @@ impl Supervisor {
   }
 
   /// Commits one resource write intent as a signed candidate record
-  /// (`PutResource`, T-G09-03): the supervisor stamps the host wall-clock
+  /// (`PutResource`): the supervisor stamps the host wall-clock
   /// tuple, signs through the node's key provider, and commits the whole
   /// record in one conditional transaction. A committed winner emits
   /// exactly one [`crate::ResourceChanged`] after durability; an accepted
@@ -1301,13 +1300,12 @@ impl Supervisor {
     }
   }
 
-  /// Creates signed removal evidence for one resource (`RemoveResource`,
-  /// T-G09-05): only when the stored winner still equals the caller's
+  /// Creates signed removal evidence for one resource (`RemoveResource`):
+  /// only when the stored winner still equals the caller's
   /// observed version exactly and the removal strictly wins the tuple.
   /// The removal record carries the winner's labels (removal evidence
   /// stays comparable), and the operation touches core metadata only —
-  /// the resource URI is never followed and no caller object is deleted
-  /// (SC-G09-P0-15..17).
+  /// the resource URI is never followed and no caller object is deleted.
   async fn remove_resource(
     &mut self, name: crate::ResourceName, expected: crate::ResourceVersion,
   ) -> Result<crate::ResourceMutationView> {
@@ -1422,18 +1420,17 @@ impl Supervisor {
   }
 
   /// Revokes one exact subject binding's connection and admission
-  /// authority (`RevokeNode`, T-G09-04): the revocation commits
+  /// authority (`RevokeNode`): the revocation commits
   /// conditionally first, then the revoked identity's sessions close and
   /// its new sessions, admissions, and operations are rejected. Stored
   /// metadata is never erased or reinterpreted.
-  /// Issues one convergent issuer-signed cleanup tombstone (T-G11-08):
+  /// Issues one convergent issuer-signed cleanup tombstone:
   /// the record persists locally and converges through the sync plane.
   async fn cleanup_node(&mut self, subject: NodeId) -> Result<()> {
     self.require_unblocked()?;
     let context = self.context()?;
     if &subject == context.identity().node() {
-      // Self-removal is the explicit leave path (ADR-0009 decision 3),
-      // never a self-cleanup.
+      // Self-removal is the explicit leave path, never a self-cleanup.
       return Err(Error::invalid_input("cleanup subject"));
     }
     let record =
@@ -1453,7 +1450,7 @@ impl Supervisor {
     Ok(())
   }
 
-  /// Clears the local revocation record for one subject (T-G11-08):
+  /// Clears the local revocation record for one subject:
   /// local-only, idempotent, deliberate.
   async fn purge_revocation(&mut self, subject: NodeId) -> Result<()> {
     self.require_unblocked()?;
@@ -1466,9 +1463,9 @@ impl Supervisor {
     .await
   }
 
-  /// Starts a new checkpoint GC epoch at the current wall clock
-  /// (T-G11-09, ADR-0009 decision 5). The watermark converges through the
-  /// sync plane; collected tombstones are swept after sync rounds.
+  /// Starts a new checkpoint GC epoch at the current wall clock. The
+  /// watermark converges through the sync plane; collected tombstones are
+  /// swept after sync rounds.
   async fn issue_cleanup_checkpoint(&mut self) -> Result<u64> {
     self.require_unblocked()?;
     let context = self.context()?;
@@ -1510,12 +1507,11 @@ impl Supervisor {
     let context = self.context()?;
     let local = context.identity().node();
     if &subject == local {
-      // Self-removal is the explicit leave path (ADR-0009 decision 3),
-      // never a self-revoke.
+      // Self-removal is the explicit leave path, never a self-revoke.
       return Err(Error::invalid_input("revoke subject"));
     }
-    // The tombstone is issuer-signed and converges through the sync plane
-    // (ADR-0009 decision 6): any member may expel a compromised binding
+    // The tombstone is issuer-signed and converges through the sync plane:
+    // any member may expel a compromised binding
     // cluster-wide, and the record is permanent until an explicit local
     // purge.
     let record = crate::identity::revocation::sign_revocation_record(
@@ -1553,7 +1549,7 @@ impl Supervisor {
     Ok(crate::RevokeOutcome::new(subject, was_already_revoked))
   }
 
-  /// Executes one acknowledged active leave (`LeaveCluster`, T-G09-06):
+  /// Executes one acknowledged active leave (`LeaveCluster`):
   /// tears down listeners and sessions, replaces the identity, wipes the
   /// old identity's local core metadata, and deletes the old key — all
   /// through the journaled, crash-recoverable leave phases. The caller's
@@ -1570,7 +1566,7 @@ impl Supervisor {
     }
     let context = self.context()?;
 
-    // ADR-0009 decision 3, crash-retryable ordering: journal the intent
+    // Crash-retryable ordering: journal the intent
     // and the signed record before any network effect, announce with the
     // journaled record, then rotate. A crash anywhere before rotation
     // resumes at startup with the same journaled record, so the leave is
@@ -1641,7 +1637,7 @@ impl Supervisor {
   }
 
   /// Blocks admission-sensitive operations while the metadata store is
-  /// frozen on an indeterminate outcome (ADR-0007, THR-015): credential
+  /// frozen on an indeterminate outcome: credential
   /// reuse, rotation, signing, and new networking stay unavailable until
   /// an authoritative reopen reconciles the exact transaction or proves
   /// absence. Established authenticated sessions are unaffected.

@@ -1,4 +1,4 @@
-//! The canonical `selector` fuzz target (T-G10-03, ADR-0004).
+//! The canonical `selector` fuzz target.
 //!
 //! Feeds every input through the bounded selector parser and asserts the
 //! canonical round-trip invariant: parsed canonical text reparses to

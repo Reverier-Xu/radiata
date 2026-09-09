@@ -1,11 +1,11 @@
-//! The caller-supplied extension registry (ADR-0007).
+//! The node-local extension registry.
 //!
-//! This gate implements exactly one registration point:
 //! [`ExtensionRegistry::register_protocol`] binds a [`ProtocolDefinition`]
 //! to the [`PacketConsumer`] that receives admitted incoming streams for
-//! that protocol tag. The remaining manifest registration points arrive
-//! with their owning gates (transports and discovery G4-01, policies
-//! G5/G6).
+//! that protocol tag, alongside caller registration of feature
+//! definitions, load-balancing policies, and next-hop routing policies.
+//! The runtime installs the built-in WSS transport and core protocols at
+//! startup through the same registry.
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -72,7 +72,7 @@ impl ExtensionRegistry {
     Self::default()
   }
 
-  /// Registers one caller-defined feature (T-G09-07): the definition's
+  /// Registers one caller-defined feature: the definition's
   /// contract fingerprint joins the node's negotiation registry, so its
   /// exact digest is offered and intersected at handshake time. A
   /// duplicate tag is a conflict; the built-in domain is reserved (the
@@ -101,7 +101,7 @@ impl ExtensionRegistry {
 
   /// The exact negotiation digest of one feature tag (the digest offered
   /// and intersected at handshake time): the caller-registered definition
-  /// wins, then the built-in registry (T-G09-07).
+  /// wins, then the built-in registry.
   pub(crate) fn feature_digest(&self, tag: &crate::FeatureTag) -> Option<crate::Digest> {
     let definition = self
       .features
@@ -149,8 +149,8 @@ impl ExtensionRegistry {
     self.discoveries.get(tag)
   }
 
-  /// Registers one load-balancing policy under a canonical tag
-  /// (T-G06-01). A duplicate tag is a conflict; registration never
+  /// Registers one load-balancing policy under a canonical tag. A
+  /// duplicate tag is a conflict; registration never
   /// replaces an existing entry. Matching-node stream targets resolve
   /// their `StreamPolicy` load-balancer tag here at send time.
   pub fn register_load_balancer(
@@ -186,8 +186,8 @@ impl ExtensionRegistry {
       .unwrap_or(false)
   }
 
-  /// Registers one next-hop routing policy under a canonical tag
-  /// (T-G06-03). A duplicate tag is a conflict; registration never
+  /// Registers one next-hop routing policy under a canonical tag. A
+  /// duplicate tag is a conflict; registration never
   /// replaces an existing entry. A node's configured route-policy tag
   /// resolves here when a routed packet must hop through this node.
   pub fn register_next_hop(

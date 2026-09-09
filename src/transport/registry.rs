@@ -1,4 +1,4 @@
-//! Open transport and discovery registries (G4-01, ADR-0007).
+//! Open transport and discovery registries.
 //!
 //! A registered [`Transport`] owns the listener/connection lifecycle for
 //! one canonical [`TransportTag`]; a registered [`Discovery`] resolves
@@ -6,8 +6,7 @@
 //! retains authentication and stream safety: a transport only carries the
 //! prelude frames, the session handshake always authenticates, and
 //! registration never bypasses either. The built-in WSS transport is
-//! registered by default and must satisfy the G3 secure-join regression
-//! unchanged.
+//! registered by default.
 
 use std::{fmt, sync::Arc};
 
@@ -136,7 +135,7 @@ impl PageCursor {
     Self(value)
   }
 
-  /// Builds a cursor from provider bytes (api-manifest shape).
+  /// Builds a cursor from provider bytes.
   pub fn from_provider_bytes(value: Arc<[u8]>) -> Result<Self> {
     if value.is_empty() {
       return Err(Error::invalid_input("page cursor"));
@@ -161,8 +160,8 @@ pub trait Discovery: fmt::Debug + Send + Sync + 'static {
 }
 /// The built-in WSS transport: TLS 1.3 WebSocket over TCP, carrying the
 /// crate's prelude frames. Registered by default under
-/// [`BUILTIN_TRANSPORT_WSS`]; the session driver and the G4
-/// regressions use it through the registry.
+/// [`BUILTIN_TRANSPORT_WSS`]; the session driver uses it through the
+/// registry.
 pub(crate) struct WssTransport;
 
 impl fmt::Debug for WssTransport {
@@ -173,8 +172,8 @@ impl fmt::Debug for WssTransport {
   }
 }
 
-/// The built-in WebSocket transport tag: the only dial/listen transport
-/// until the G4-06 candidate wiring consumes more registry entries.
+/// The canonical tag of the built-in WebSocket transport, the only
+/// built-in dial/listen transport.
 pub(crate) const BUILTIN_TRANSPORT_WSS: &str = "radiata.woooo.tech/transports/wss";
 
 impl WssTransport {
@@ -336,7 +335,7 @@ mod tests {
     EndpointCandidate::new(Endpoint::parse(&format!("wss://{host}:9000")).unwrap())
   }
 
-  // ---- SC-G04-P0-01: transport registration by canonical tag ----
+  // ---- Transport registration by canonical tag ----
 
   #[test]
   fn transport_registry_accepts_one_owner_domain_and_rejects_duplicates() {
@@ -364,7 +363,7 @@ mod tests {
     assert!(TransportTag::parse("radiata.woooo.tech/crypto/ed25519").is_err());
   }
 
-  // ---- SC-G04-P0-02: discovery registration without central switching ----
+  // ---- Discovery registration without central switching ----
 
   #[derive(Debug)]
   struct StaticDiscovery(Vec<EndpointCandidate>);
@@ -419,7 +418,7 @@ mod tests {
     assert_eq!(page.items()[0].endpoint().host(), "two.example");
   }
 
-  // ---- SC-G04-P0-03: authenticated transport results ----
+  // ---- Authenticated transport results ----
 
   #[tokio::test]
   async fn wss_transport_connection_carries_a_real_tls_exporter_binding() {
@@ -448,8 +447,8 @@ mod tests {
     assert_eq!(client_binding, server_binding);
   }
 
-  // ---- SC-G04-P0-04: the built-in WSS transport is registered and the
-  // secure join/packet/disconnect/reconnect regression runs on the same
+  // ---- The built-in WSS transport is registered and the secure
+  // join/packet/disconnect/reconnect regression runs on the same
   // authenticated connection path (secure_join integration lane). ----
 
   #[test]
@@ -463,8 +462,8 @@ mod tests {
 }
 
 /// A transport wrapper that counts dial attempts at the registry boundary:
-/// the observation seam SC-G05-P0-22 requires (bounded configured attempts
-/// are visible to a caller without touching the session layer).
+/// bounded configured attempts are visible to a caller without touching
+/// the session layer.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct CountingTransport {

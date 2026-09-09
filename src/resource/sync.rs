@@ -1,4 +1,4 @@
-//! Session-carried resource sync (T-G07-04 wiring).
+//! Session-carried resource sync.
 //!
 //! An authenticated session carries one bounded [`ResourcePage`] per
 //! anti-entropy tick over the dedicated resource-sync protocol. Records
@@ -163,14 +163,12 @@ pub(crate) async fn resource_sync_tick(
   // A paged anti-entropy round advances the cursor only while it is
   // sending; a steady state with an unchanged first page never turns the
   // cursor, so the page content cannot change between ticks and the
-  // quiet state costs no sends at all (T-G10-06 soak finding: an
-  // unconditional cursor turn re-sent every page every tick).
+  // quiet state costs no sends at all.
   let starting_round = cursor.page.is_none();
   // The raw-bytes fingerprint of the next page range: the quiet state
   // pays one scan and one hash and skips the emit entirely, so nothing
   // decodes a record (no re-encode, no digest) until the page actually
-  // sends (review finding F1: the emit's decode ran every tick even
-  // when the fingerprint gate suppressed every send).
+  // sends.
   let page_fp = page_sync::page_fingerprint_ctx(
     store,
     cursor.page.as_deref(),

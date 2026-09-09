@@ -1,5 +1,5 @@
 //! Join credential secrets and the receiver's in-memory credential
-//! generation lifecycle (ADR-0001).
+//! generation lifecycle.
 //!
 //! A join credential is exactly 32 uniformly random bytes rendered as
 //! unpadded base64url with the sensitive `join_` prefix. Credential text,
@@ -150,12 +150,12 @@ impl ActiveGeneration {
   }
 }
 
-/// The receiver's memory-only join credential generation state (ADR-0001).
+/// The receiver's memory-only join credential generation state.
 ///
 /// At most one generation exists at a time. Process restart erases it;
 /// rotation invalidates the previous value by dropping and zeroizing its
-/// secret. The durable single-use commit semantics arrive with the G3
-/// admission layer; this type owns only the in-memory lifecycle.
+/// secret. The session driver's admission commit owns the durable
+/// single-use semantics; this type owns only the in-memory lifecycle.
 pub(crate) struct MergeCredentialIssuer {
   generation: Option<ActiveGeneration>,
 }

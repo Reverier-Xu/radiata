@@ -4,20 +4,18 @@
 //! drives readiness and the workload through public facade observations
 //! only, records raw wall-clock samples into the release ledger, and
 //! performs the ordered shutdown and cleanup. It never inspects private
-//! node state (SC-G10-P0-31): its only node-facing channels are the
+//! node state: its only node-facing channels are the
 //! helpers' stdin protocols and the public facade itself.
 //!
 //! Modes:
 //! - `qualify <nodes>`: start a bounded cluster, prove readiness through
 //!   public pages, shut down in order, and record the qualification
-//!   outcome — the harness self-proof demanded by SC-G10-P0-33 without
-//!   claiming any SLO sample.
+//!   outcome — the harness self-proof, without claiming any SLO sample.
 //! - `measure`: the exact 125-sample workload over one pinned candidate
 //!   commit (`RADIATA_SLO_COMMIT`); the operator reviews the ledger and
 //!   publishes manually.
 //! - `topology`: print the frozen profile direction table — the 64 final
-//!   directions, the exact three-hop path, and the four throughput edges
-//!   — for the preflight to verify and record (SC-G10-P0-32).
+//!   directions, the exact three-hop path, and the four throughput edges.
 
 use std::{
   io::{BufRead, Write},
@@ -57,10 +55,9 @@ fn main() {
   }
 }
 
-/// Prints the frozen profile direction table (SC-G10-P0-32): one line per
-/// final direction, then the three-hop path and the four throughput
-/// edges. The preflight verifies the counts and records the table verbatim
-/// into the observations.
+/// Prints the frozen profile direction table: one line per final
+/// direction, then the three-hop path and the four throughput edges. Each
+/// count is verified against the frozen profile before printing.
 fn print_topology() -> Result<(), String> {
   let directions = topology::directed_directions();
   if directions.len() != 64 {
@@ -137,8 +134,7 @@ impl NodeProcess {
       Err(error) => Err(error.to_string()),
     };
     // The run-owned store directory is removed only after the ordered
-    // shutdown proves the helper exited cleanly (ADR-0005 cleanup rules:
-    // run-owned containers, networks, stores, credentials, artifacts).
+    // shutdown proves the helper exited cleanly.
     let _ = std::fs::remove_dir_all(&self.directory);
     outcome
   }
@@ -247,10 +243,6 @@ fn run_cluster(
       wait_ready(&mut node, Duration::from_secs(120))?;
       creator = Some(node);
     } else {
-      // A fresh single-use credential per member; a transient handshake
-      // refusal (a loaded accept loop expiring the fixed authentication
-      // deadline) retries with a newly rotated credential — the harness
-      // precedent for admission-sensitive operations.
       // One fresh credential per member; the first member consumes the
       // creator's initial rotation. A failed join consumes no credential,
       // so a retry reuses the same secret: the accept loop recomputes its
@@ -331,7 +323,7 @@ fn record_qualification(
 }
 
 
-/// The exact ADR-0005 measurement: five runs of the five-stratum
+/// The exact measurement: five runs of the five-stratum
 /// 25-sample mix, every raw sample recorded against the pinned commit.
 fn measure(runs: u32) -> Result<(), String> {
   let expected_commit =
@@ -348,7 +340,7 @@ fn measure(runs: u32) -> Result<(), String> {
   runtime.block_on(async move { measure_async(runs, commit).await })
 }
 
-/// The fresh run population (ADR-0005): one creator plus ten
+/// The fresh run population: one creator plus ten
 /// already-merged members; the merge stratum adds five fresh nodes to
 /// reach the exact sixteen-node final population.
 const INITIAL_MEMBERS: usize = 10;
@@ -370,7 +362,7 @@ async fn measure_async(runs: u32, expected_commit: String) -> Result<(), String>
   let mut sample_seed: u32 = 0;
   let mut recorded = 0_usize;
   for run in 1..=runs {
-    // ADR-0005: five fresh independent runs — every run creates fresh
+    // Five fresh independent runs — every run creates fresh
     // identities, stores, credentials, and ports, and is shut down and
     // cleaned up before the next one starts. A failed run fails the
     // attempt: the summary records the shortfall.
@@ -510,7 +502,7 @@ async fn measure_run(
     }
   }
 
-  // -- topology (ADR-0005): prune the star down to the sparse final
+  // -- topology: prune the star down to the sparse final
   // graph. The creator keeps sessions only with its frozen ring/chord
   // neighbours; every member-to-member edge is dialled credential-free.
   // Intentionally disconnected peers are never re-dialled by recovery,
@@ -599,7 +591,7 @@ async fn measure_run(
   }
   // Label member seven as the routed stratum's only eligible target:
   // the exact three-hop endpoint of the frozen topology, so every routed
-  // sample crosses exactly three hops (ADR-0005). The label propagates
+  // sample crosses exactly three hops. The label propagates
   // to the creator's public page over the sparse topology.
   members[6].send("setzone edge")?;
   let reply = members[6].read_line()?;
@@ -800,7 +792,7 @@ fn now_ms() -> u128 {
     .unwrap_or(0)
 }
 
-/// Spawns one admission-sample helper: a listening, unjoined member.
+/// Writes one raw sample record into the release ledger.
 fn write_sample(
   ledger: &mut std::fs::File, run: u32, index: u32, stratum: &str, started: u128, ended: u128,
   outcome: &str,

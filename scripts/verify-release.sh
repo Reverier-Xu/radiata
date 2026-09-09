@@ -1,5 +1,5 @@
 #!/usr/bin/bash -p
-# The release verification launcher (T-G10-11): one command that runs the
+# The release verification launcher: one command that runs the
 # full pre-publication verification suite in order and fails fast on the
 # first red lane. The operator executes the script, reviews the outcomes,
 # and publishes manually.
@@ -12,11 +12,11 @@
 # Stages:
 #   1. quality gates        taplo, nightly rustfmt, check/clippy/test
 #                           across all targets and features, locked
-#   2. wire compatibility   golden and migration fixtures (VERIFY-G10-01)
-#   3. mixed binaries       prior/current interop (VERIFY-G10-02)
-#   4. evidence validator   sealed ledger negatives (VERIFY-G10-09)
+#   2. wire compatibility   golden and migration fixtures
+#   3. mixed binaries       prior/current interop
+#   4. evidence validator   sealed ledger negatives
 #   5. fuzz corpus replay   every reviewed corpus through the adapters
-#   6. churn soak           bounded churn plus baseline return (VERIFY-G10-06)
+#   6. churn soak           bounded churn plus baseline return
 #   7. slo harness          profile preflight, cluster qualification, and
 #                           the 125-sample measure pinned to this commit
 #
@@ -60,15 +60,15 @@ RUSTFLAGS="-Dwarnings" RUSTDOCFLAGS="-Dwarnings" \
 printf 'stage %s PASS\n' "$STAGE"
 
 stage "wire compatibility"
-bash scripts/verify-g10-01-compat-fixtures.sh
+bash scripts/verify-compat-fixtures.sh
 printf 'stage %s PASS\n' "$STAGE"
 
 stage "mixed binaries"
-bash scripts/verify-g10-02-mixed-binary.sh
+bash scripts/verify-mixed-binary.sh
 printf 'stage %s PASS\n' "$STAGE"
 
 stage "evidence validator"
-bash scripts/verify-g10-09-evidence-validator.sh
+bash scripts/verify-evidence-validator.sh
 printf 'stage %s PASS\n' "$STAGE"
 
 stage "fuzz corpus replay"
@@ -76,7 +76,7 @@ cargo test --locked --all-features --lib fuzz_adapters
 printf 'stage %s PASS\n' "$STAGE"
 
 stage "churn soak"
-bash scripts/verify-g10-06-soak.sh
+bash scripts/verify-soak.sh
 printf 'stage %s PASS\n' "$STAGE"
 
 if [ "$SKIP_SLO" -eq 1 ]; then

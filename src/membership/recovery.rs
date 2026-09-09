@@ -1,4 +1,4 @@
-//! Continuous recovery state machine (G5-04).
+//! Continuous recovery state machine.
 //!
 //! Recovery activates whenever known online members remain in mutually
 //! unreachable authenticated components, retries according to caller-
@@ -102,8 +102,8 @@ impl RecoveryController {
 
   /// Feeds one observation of which members are reachable and which are
   /// known online. Recovery activates when known online members remain
-  /// unreachable (SC-G05-P0-14); it quiesces when all are connected
-  /// through some authenticated path (SC-G05-P0-18).
+  /// unreachable; it quiesces when all are connected through some
+  /// authenticated path.
   pub(crate) fn observe(&mut self, online: &BTreeSet<NodeId>, reachable: &BTreeSet<NodeId>) {
     let unreachable: BTreeSet<NodeId> = online.difference(reachable).cloned().collect();
     if unreachable.is_empty() {
@@ -125,7 +125,7 @@ impl RecoveryController {
   /// Computes the next recovery step: a bounded set of targets expanded
   /// only through the configured fan-out from the neighbors, plus the
   /// wall-clock backoff (re-read every wake; rollback/freeze delays,
-  /// forward jump makes it due — SC-G05-P0-15).
+  /// forward jump makes it due).
   pub(crate) fn next_step(&mut self, now: u64, candidates: &BTreeSet<NodeId>) -> RecoveryStep {
     let backoff = self.backoff_seconds(now);
     let targets: Vec<NodeId> = candidates
@@ -171,7 +171,7 @@ impl RecoveryController {
   }
 
   /// Records one candidate as connected; when nothing remains pending the
-  /// controller transitions to `Connected` (SC-G05-P0-18). Assertion
+  /// controller transitions to `Connected`. Assertion
   /// surface for the unit suite; production observes through `state`.
   #[cfg(test)]
   pub(crate) fn connected(&mut self, member: &NodeId) {
@@ -181,8 +181,7 @@ impl RecoveryController {
     }
   }
 
-  /// Forces one immediate recovery cycle (immediate-recovery command,
-  /// SC-G05-P0-19).
+  /// Forces one immediate recovery cycle (immediate-recovery command).
   pub(crate) fn immediate(&mut self, now: u64) {
     if self.pending.is_empty() && self.state != RecoveryState::Recovering {
       return;
@@ -211,7 +210,7 @@ mod tests {
     RecoveryPolicy::new(4, 64, 1, 5 * 60)
   }
 
-  /// SC-G05-P0-14: recovery activates whenever known online members remain
+  /// Recovery activates whenever known online members remain
   /// unreachable, including after a later connectivity change.
   #[test]
   fn recovery_activates_on_unreachable_members() {
@@ -229,7 +228,7 @@ mod tests {
     assert_eq!(controller.state(), RecoveryState::Recovering);
   }
 
-  /// SC-G05-P0-18: recovery quiesces once all online members are connected
+  /// Recovery quiesces once all online members are connected
   /// through some authenticated path; never a full mesh.
   #[test]
   fn recovery_quiesces_at_connected_path() {
@@ -248,9 +247,9 @@ mod tests {
     assert_eq!(controller.state(), RecoveryState::Recovering);
   }
 
-  /// SC-G05-P0-15: backoff doubles from the initial value up to the
-  /// maximum and re-reads wall time; a forward jump makes it immediately
-  /// due, rollback/freeze delays it.
+  /// Backoff doubles from the initial value up to the maximum and
+  /// re-reads wall time; a forward jump makes it immediately due,
+  /// rollback/freeze delays it.
   #[test]
   fn recovery_backoff_follows_wall_clock() {
     let mut controller = RecoveryController::new(policy());
@@ -272,8 +271,7 @@ mod tests {
     assert!(controller.due(10_004));
   }
 
-  /// SC-G05-P0-17: each cycle expands only through the configured bounded
-  /// fan-out.
+  /// Each cycle expands only through the configured bounded fan-out.
   #[test]
   fn recovery_expands_through_bounded_fan_out() {
     let mut controller = RecoveryController::new(RecoveryPolicy::new(4, 2, 1, 60));
@@ -283,8 +281,7 @@ mod tests {
     assert_eq!(step.targets.len(), 2, "fan-out bounds each cycle");
   }
 
-  /// SC-G05-P0-19: an immediate-recovery command forces one cycle without
-  /// storms.
+  /// An immediate-recovery command forces one cycle without storms.
   #[test]
   fn recovery_immediate_forces_one_cycle() {
     let mut controller = RecoveryController::new(policy());
@@ -298,10 +295,10 @@ mod tests {
   }
 }
 
-/// Seeded recovery simulation (G5-05): drives the recovery controller over
+/// Seeded recovery simulation: drives the recovery controller over
 /// a deterministic membership/connectivity scenario and replays the exact
 /// decisions for a seed, matching the configured neighbor/fan-out and
-/// wall-clock backoff (SC-G05-P0-20).
+/// wall-clock backoff.
 #[cfg(test)]
 pub(crate) mod simulation {
   use std::collections::BTreeSet;
@@ -325,7 +322,7 @@ pub(crate) mod simulation {
 
   /// Runs one seeded scenario and returns the exact decision trace. The
   /// seed selects the deterministic order of the *unreachable* members
-  /// only; reachable members are never dialed (SC-G05-P0-20).
+  /// only; reachable members are never dialed.
   pub(crate) fn run_seed(seed: u64, scenario: &RecoveryScenario) -> Vec<RecoveryDecision> {
     let mut controller = RecoveryController::new(RecoveryPolicy::new(4, 64, 1, 60));
     let mut trace = Vec::new();
@@ -372,8 +369,8 @@ pub(crate) mod simulation {
       [1_u8, 2, 3, 4].into_iter().map(node).collect()
     }
 
-    /// SC-G05-P0-20: a seeded simulation replays the same decisions for the
-    /// same seed and reaches connected-path connectivity; recovery stops at
+    /// A seeded simulation replays the same decisions for the same seed and
+    /// reaches connected-path connectivity; recovery stops at
     /// reachability, not a full mesh.
     #[test]
     fn seeded_recovery_replays_and_quiesces() {
@@ -426,7 +423,7 @@ mod scale_tests {
 
   /// The 1,024-node recovery trend: the controller makes bounded
   /// decisions over a cluster-scale membership without a whole-population
-  /// graph or a rejection boundary (M5 verify).
+  /// graph or a rejection boundary.
   #[test]
   fn recovery_controller_scales_to_1024_nodes() {
     let online: BTreeSet<NodeId> = (0..1_024).map(node_at).collect();

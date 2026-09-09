@@ -1,4 +1,4 @@
-//! Routed-frame forwarding at intermediate nodes (T-G06-03).
+//! Routed-frame forwarding at intermediate nodes.
 //!
 //! A forwarding node holds one [`ForwardingHop`] per in-flight routed
 //! trace: the frame senders toward the upstream holder (for acknowledgement
@@ -57,8 +57,7 @@ pub(crate) fn contains(table: &ForwardingTable, trace_id: &TraceId) -> bool {
 }
 
 /// The default bound on concurrently forwarded routes. A session-layer
-/// routing bound, deliberately independent of the trace metadata budget
-/// it transiently shared (G9 review remediation).
+/// routing bound, deliberately independent of the trace metadata budget.
 pub(crate) const FORWARDING_ROUTE_CAPACITY_DEFAULT: usize = 8_192;
 
 /// Validates and relays one routed open whose destination is another node:
@@ -409,7 +408,7 @@ mod tests {
     }
   }
 
-  // ---- SC-G06-P0-09: frames pass once, in strict prefix order ----
+  // ---- Frames pass once, in strict prefix order ----
 
   /// Chunks relay in their wire sequence and the end frame terminates the
   /// hop; nothing is duplicated, reordered, or echoed upstream.
@@ -471,7 +470,7 @@ mod tests {
 
   use futures_util::FutureExt;
 
-  // ---- SC-G06-P0-10: backpressure crosses hops ----
+  // ---- Backpressure crosses hops ----
 
   /// A saturated downstream queue stalls the relay instead of buffering
   /// without bound; draining resumes it exactly where it stopped.
@@ -514,7 +513,7 @@ mod tests {
     assert!(upstream_rx.recv().now_or_never().is_none());
   }
 
-  // ---- SC-G06-P0-11: explicit typed interruption, never a replay ----
+  // ---- Explicit typed interruption, never a replay ----
 
   /// A dead downstream session reports one failed acknowledgement upstream
   /// and removes the hop; later frames for that trace are dropped silently.
@@ -602,7 +601,7 @@ mod tests {
   /// A closing session's end never passes a still-in-flight chunk: the
   /// relay lock spans the backpressure await, so the downstream leg keeps
   /// the strict chunk-then-end prefix even when a session close races a
-  /// stalled relay (SC-G06-P0-09).
+  /// stalled relay.
   #[tokio::test]
   async fn closing_session_end_queues_after_the_last_in_flight_chunk() {
     let table = new_table();

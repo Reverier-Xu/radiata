@@ -1,6 +1,6 @@
 //! Session-driver tests over real loopback TLS WebSocket connections.
 //!
-//! The merge lane proves the full ADR-0001 bootstrap ordering with real
+//! The merge lane proves the full bootstrap ordering with real
 //! proofs, exporter channel bindings, and journaled merge adoption; the
 //! member lane proves the credential-free reconnect mechanism both
 //! directions.
@@ -56,7 +56,7 @@ async fn node_from(
   factory: Arc<dyn crate::provider::StorageFactory>, offer: FeatureOffer,
 ) -> Node {
   let context = Arc::new(open_context(&factory, &keys, &entropy).await.unwrap());
-  // Born-with-cluster (ADR-0009): every started node holds its own
+  // Born-with-cluster: every started node holds its own
   // singleton identity binding, exactly as `spawn_runtime` establishes.
   ensure_self_binding(&context, entropy.as_ref())
     .await
@@ -262,9 +262,9 @@ fn peer_return_marker(node: &Node) -> crate::NodeId {
   node.context.identity().node().clone()
 }
 
-// ---- T-G03-03 atomic merge/reconciliation evidence ----
+// ---- atomic merge/reconciliation evidence ----
 
-/// SC-G03-P0-07: a genuine pre-commit rejection of the merge commit
+/// A genuine pre-commit rejection of the merge commit
 /// leaves the issuer credential generation released, so one later attempt
 /// with the same still-valid credential succeeds.
 #[tokio::test]
@@ -317,7 +317,7 @@ async fn session_merge_precommit_abort_releases_generation_for_same_credential_r
   second_responder.await.unwrap().unwrap();
 }
 
-/// SC-G03-P0-09: dropping the final adoption result still permits the
+/// Dropping the final adoption result still permits the
 /// same identity to recover its stored grant through member
 /// authentication after an authoritative reopen.
 #[tokio::test]
@@ -383,7 +383,7 @@ async fn session_adoption_result_loss_recovers_via_member_reconnect() {
   assert_eq!(member_responder.await.unwrap().unwrap().peer(), &merger_id);
 }
 
-/// SC-G03-P0-14: a credential-free member reconnect negotiates the exact
+/// A credential-free member reconnect negotiates the exact
 /// same feature policy as the original merge — byte-identical feature
 /// selection, never a weakened offer — and never consults a merge
 /// credential.
@@ -445,17 +445,17 @@ async fn session_member_reconnect_preserves_exact_feature_selection() {
   assert_eq!(responder_side.selected_features(), &merge_features[..]);
 }
 
-// ---- T-G10-02 mixed-binary feature intersection evidence ----
+// ---- mixed-binary feature intersection evidence ----
 
-/// The prior binary's offer (SC-G10-P0-06/07): the G3-era built-ins only —
-/// routed delivery did not exist — with the mandatory limits at their
-/// defaults and the mandatory session features required.
+/// The prior binary's offer: the four built-ins other than routed
+/// delivery, with the mandatory limits at their defaults and the
+/// mandatory session features required.
 fn prior_offer() -> FeatureOffer {
   prior_family_offer(None)
 }
 
 /// The prior binary's offer requiring one prior-only feature that the
-/// current registry has never published (SC-G10-P0-08, prior initiator).
+/// current registry has never published (prior initiator).
 fn prior_only_offer() -> FeatureOffer {
   prior_family_offer(Some(("testing.example/features/prior-only", [0x5A; 32])))
 }
@@ -488,8 +488,8 @@ fn prior_family_offer(prior_only: Option<(&str, [u8; 32])>) -> FeatureOffer {
   FeatureOffer::new(supported, required, limits).unwrap()
 }
 
-/// The current offer requiring routed delivery (SC-G10-P0-08, current
-/// initiator): a known label the prior binary never supported.
+/// The current offer requiring routed delivery (current initiator): a
+/// known label the prior binary never supported.
 fn current_routed_required_offer() -> FeatureOffer {
   let registry = FeatureRegistry::builtin().unwrap();
   let mut required = std::collections::BTreeSet::new();
@@ -557,7 +557,7 @@ async fn merge_and_assert_mixed_selection(responder: &Node, initiator: &Node) ->
   view
 }
 
-/// SC-G10-P0-06: a prior-version initiator negotiates a current responder;
+/// A prior-version initiator negotiates a current responder;
 /// both sides expose the identical signed optional-feature intersection
 /// and the never-supported routed-delivery label stays unselected.
 #[tokio::test]
@@ -567,7 +567,7 @@ async fn mixed_prior_initiator_negotiates_current_responder() {
   merge_and_assert_mixed_selection(&current, &prior).await;
 }
 
-/// SC-G10-P0-07: a current initiator negotiates a prior responder with
+/// A current initiator negotiates a prior responder with
 /// platform and feature parity — the identical intersection in the
 /// opposite initiator role.
 #[tokio::test]
@@ -579,7 +579,7 @@ async fn mixed_current_initiator_negotiates_prior_responder() {
   merge_and_assert_mixed_selection(&prior, &current).await;
 }
 
-/// SC-G10-P0-08 (current initiator): a required label the prior binary
+/// With the current initiator, a required label the prior binary
 /// never supported is rejected without retrying a weaker offer — both
 /// roles fail closed and no session exists.
 #[tokio::test]
@@ -613,7 +613,7 @@ async fn mixed_current_required_routed_delivery_is_refused() {
   );
 }
 
-/// SC-G10-P0-08 (prior initiator): a required label the current registry
+/// With the prior initiator, a required label the current registry
 /// has never published is rejected identically in the opposite role.
 #[tokio::test]
 async fn mixed_prior_required_unknown_feature_is_refused() {
@@ -646,7 +646,7 @@ async fn mixed_prior_required_unknown_feature_is_refused() {
   );
 }
 
-/// SC-G10-P0-09: a mixed pair's member-mode reconnect reproduces the exact
+/// A mixed pair's member-mode reconnect reproduces the exact
 /// mixed selection, and the replaced session's pair-scoped feature state
 /// is gone — the selection never outlives its session.
 #[tokio::test]

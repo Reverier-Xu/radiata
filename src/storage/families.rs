@@ -5,7 +5,7 @@
 //! all-family storage contract lane iterates this catalog, so a family
 //! added anywhere in the crate is pulled into the shared snapshot, scan,
 //! transaction, reconcile, and capability contract as soon as its
-//! namespace appears here (T-G08-01).
+//! namespace appears here.
 
 /// Local identity singleton record.
 pub(crate) const LOCAL_IDENTITY_NAMESPACE: &str = "radiata.woooo.tech/metadata/local-identity-v1";
@@ -28,13 +28,13 @@ pub(crate) const KEY_DELETED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-
 pub(crate) const TRUST_SNAPSHOT_NAMESPACE: &str = "radiata.woooo.tech/metadata/trust-snapshot-v1";
 /// Trust snapshot binding observation per issuer and subject.
 pub(crate) const TRUST_BINDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/trust-binding-v1";
-/// Local authorization revocation per exact subject binding (G9-04).
+/// Local authorization revocation per exact subject binding.
 pub(crate) const REVOCATION_NAMESPACE: &str = "radiata.woooo.tech/metadata/revocation-v1";
-/// Cleanup checkpoint GC epoch marker (T-G11-09), max-wins by watermark.
+/// Cleanup checkpoint GC epoch marker, max-wins by watermark.
 pub(crate) const CHECKPOINT_NAMESPACE: &str = "radiata.woooo.tech/metadata/cleanup-checkpoint-v1";
-/// In-progress active-leave intent (G9-06).
+/// In-progress active-leave intent.
 pub(crate) const LEAVE_NAMESPACE: &str = "radiata.woooo.tech/metadata/leave-v1";
-/// One issuer-signed dead-node cleanup tombstone per subject (T-G11-08).
+/// One issuer-signed dead-node cleanup tombstone per subject.
 pub(crate) const CLEANUP_NAMESPACE: &str = "radiata.woooo.tech/metadata/cleanup-v1";
 /// Owner-revision-marked node descriptor per node.
 pub(crate) const NODE_DESCRIPTOR_NAMESPACE: &str = "radiata.woooo.tech/metadata/node-descriptor-v1";

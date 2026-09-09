@@ -1,4 +1,4 @@
-//! ADR-0001 join-mode credential proof derivation.
+//! Join-mode credential proof derivation.
 //!
 //! The derivation is exact:
 //!
@@ -22,9 +22,9 @@ use zeroize::Zeroizing;
 
 use crate::{Digest, Error, MergeCredential, Result};
 
-/// The exact ADR-0001 responder bootstrap key info label.
+/// The exact responder bootstrap key info label.
 pub(crate) const RESPONDER_KEY_INFO: &[u8] = b"radiata.woooo.tech/crypto/bootstrap-v1-responder";
-/// The exact ADR-0001 initiator bootstrap key info label.
+/// The exact initiator bootstrap key info label.
 pub(crate) const INITIATOR_KEY_INFO: &[u8] = b"radiata.woooo.tech/crypto/bootstrap-v1-initiator";
 
 const ROLE_KEY_LEN: usize = 32;

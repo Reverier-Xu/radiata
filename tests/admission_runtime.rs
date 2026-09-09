@@ -1,12 +1,11 @@
-//! Runtime-level atomic merge and reconciliation lane (T-G03-03).
+//! Runtime-level atomic merge and reconciliation lane.
 //!
 //! Drives the full node stack through `NodeBuilder` with a fault-injecting
 //! storage factory: an indeterminate merge commit freezes the node and
 //! blocks credential rotation, reuse, and new listening until an
 //! authoritative reopen reconciles the exact transaction; a definite
 //! pre-commit abort releases the generation for one later attempt. Test
-//! names are prefixed `admission_runtime_` for the task verifier's
-//! nonempty lane proof.
+//! names are prefixed `admission_runtime_`.
 
 use std::sync::Arc;
 
@@ -72,7 +71,7 @@ async fn fresh_node(seed: u64) -> (Node, Arc<MemoryStorageFactory>) {
   (node, memory)
 }
 
-/// SC-G03-P0-08: an indeterminate merge commit freezes the node; every
+/// An indeterminate merge commit freezes the node; every
 /// merge-sensitive operation (rotation, reuse, new listening) is
 /// blocked with `NotReady`, no new signing work happens, and an
 /// authoritative reopen reconciles the exact committed transaction.
@@ -164,7 +163,7 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G03-P0-07: a definite pre-commit abort leaves the node unblocked and
+/// A definite pre-commit abort leaves the node unblocked and
 /// releases the credential generation for one later merge attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
@@ -205,7 +204,7 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
 
   // The abort is final: the binding, the credential use, and the grant
   // are all absent, the store is not frozen, and one later attempt with
-  // a fresh credential succeeds (SC-G03-P0-07).
+  // a fresh credential succeeds.
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle

@@ -3,7 +3,7 @@
 //! binaries: a private-custody key provider and the readiness framing,
 //! all through the public facade only.
 //!
-//! Isolation contract (SC-G10-P0-31): this module never imports a private
+//! Isolation contract: this module never imports a private
 //! crate path, never touches storage internals or replication shortcuts,
 //! and never enables a test-only feature. Private key bytes stay in the
 //! provider-owned directory and never enter metadata, logs, or artifacts.

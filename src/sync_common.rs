@@ -14,7 +14,7 @@ use crate::{
 
 /// The receiver-side body cap for one sync stream: one page is at most a
 /// bounded record list, so a generous but finite byte budget bounds a
-/// malicious stream (SC-G05-P0-09).
+/// malicious stream.
 pub(crate) const MAX_SYNC_BYTES: usize = 256 * 1_024;
 /// The receiver-side chunk-count cap paired with [`MAX_SYNC_BYTES`].
 pub(crate) const MAX_SYNC_CHUNKS: usize = 4_096;

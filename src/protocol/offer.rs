@@ -1,4 +1,4 @@
-//! Canonical authenticated feature offer encoding and validation (ADR-0002).
+//! Canonical authenticated feature offer encoding and validation.
 //!
 //! An offer carries sorted, unique collections: `(feature label,
 //! definition digest)` supported pairs, required labels, and the mandatory
@@ -135,7 +135,7 @@ impl FeatureOffer {
     &self.required
   }
 
-  /// The offered numeric limit map (used by selection and G3-04 evidence).
+  /// The offered numeric limit map.
   #[allow(dead_code)]
   pub(crate) fn limits(&self) -> &[(QualifiedTag, u64)] {
     &self.limits

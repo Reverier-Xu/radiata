@@ -14,8 +14,8 @@ pub enum ErrorKind {
   NotFound,
   NotReady,
   NotTrusted,
-  /// Reserved for the G9 authorization-revoke gate (api-manifest
-  /// `NodeRevoked`/`TrustStatus::Revoked`); no current gate produces it.
+  /// A node identity was revoked: the revocation checks in session
+  /// admission, session binding, and trust adoption produce it.
   Revoked,
   Unsupported,
   UnsupportedSchema,
