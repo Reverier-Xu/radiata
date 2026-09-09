@@ -56,51 +56,22 @@ impl Ord for RemovalCandidate {
   }
 }
 
-/// Deletes one removal record by exact conditional expectation: a stale
-/// expectation (the register moved since the scan) conflicts without
-/// mutating anything, and an indeterminate outcome leaves the record for
-/// the next pass. Returns whether the record was removed.
-async fn delete_exact(
-  store: &MetadataStore, entropy: &dyn Entropy, snapshot: &crate::StoreRevision,
-  namespace: &crate::StoreNamespace, key: StoreKey, digest: crate::Digest,
-) -> Result<bool> {
-  let transaction = store.prepare_transaction(
-    crate::TransactionId::generate(entropy)?,
-    snapshot.clone(),
-    vec![StoreOperation::Delete {
-      namespace: namespace.clone(),
-      key,
-      expected: digest,
-    }],
-  )?;
-  match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) => Ok(true),
-    // A stale expectation conflicts without mutation: the newer winner
-    // stays untouched.
-    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => Ok(false),
-    crate::CommitOutcome::Unknown { .. } => {
-      // The pending identity is discoverable through the store's
-      // recovery surface; leave the record in place rather than
-      // guessing, and let the next pass finish the job.
-      tracing::debug!("resource removal sweep ended indeterminate; retried next pass");
-      Ok(false)
-    }
-  }
-}
-
 /// Runs one bounded retention pass over the resource namespace:
 /// `removed()` records expire at their retention deadline and the removal
-/// population stays within the cap, oldest-first. Every removal is one
-/// conditional delete against the exact stored digest; a record whose
+/// population stays within the cap, oldest-first. Every removal leaves by
+/// one conditional delete against the exact stored digest; a record whose
 /// expectation no longer matches is left untouched (a conflicting stale
 /// expectation is never mutated away).
 ///
-/// The pass is bounded by construction: expired removals are deleted
-/// inline while streaming (nothing is materialized), and a max-heap
-/// bounded by `cap` tracks the oldest fresh removals so the cap applies
-/// during the scan instead of after collecting everything. One pass
-/// evicts at most `cap` overflow records; a bulk overflow converges over
-/// repeated passes.
+/// The pass is bounded by construction: the scan streams records and a
+/// max-heap bounded by `cap` tracks the oldest fresh removals so the cap
+/// applies during the scan instead of after collecting everything. The
+/// expired removals and the cap overflow leave together in one
+/// conditional multi-delete transaction built on the scan's revision, so
+/// a single pass lands every due deletion; any conflict leaves the whole
+/// batch untouched for the next bounded pass. The cap itself applies only
+/// when `cap > 0`: with `cap == 0` the candidate heap stays empty and the
+/// population bound never evicts.
 ///
 /// Live records are never evicted, matching the trace lane's active-record
 /// rule. Returns the number of removal records actually cleaned.
@@ -113,7 +84,9 @@ pub(crate) async fn sweep_removed_ctx(
   let now = clock.now();
   let snapshot = store.snapshot().await?;
   let mut scan = snapshot.scan(&namespace, &[]).await?;
-  let mut removed = 0_usize;
+  // The due deletes collect during the scan and leave in one batch; the
+  // batch size is bounded by the removal population the cap maintains.
+  let mut due: Vec<StoreOperation> = Vec::new();
   let mut fresh_total = 0_usize;
   let mut oldest: std::collections::BinaryHeap<RemovalCandidate> =
     std::collections::BinaryHeap::new();
@@ -129,9 +102,11 @@ pub(crate) async fn sweep_removed_ctx(
       .duration_since(record.timestamp())
       .is_ok_and(|age| age >= retention);
     if expired {
-      if delete_exact(store, entropy, snapshot.revision(), &namespace, key, digest).await? {
-        removed = removed.saturating_add(1);
-      }
+      due.push(StoreOperation::Delete {
+        namespace: namespace.clone(),
+        key,
+        expected: digest,
+      });
       continue;
     }
     fresh_total = fresh_total.saturating_add(1);
@@ -153,22 +128,46 @@ pub(crate) async fn sweep_removed_ctx(
   if overflow > 0 {
     let mut candidates = oldest.into_vec();
     candidates.sort_by_key(|candidate| candidate.stamped);
-    for candidate in candidates.into_iter().take(overflow) {
-      if delete_exact(
-        store,
-        entropy,
-        snapshot.revision(),
-        &namespace,
-        candidate.key,
-        candidate.digest,
-      )
-      .await?
-      {
-        removed = removed.saturating_add(1);
-      }
+    due.extend(
+      candidates
+        .into_iter()
+        .take(overflow)
+        .map(|candidate| StoreOperation::Delete {
+          namespace: namespace.clone(),
+          key: candidate.key,
+          expected: candidate.digest,
+        }),
+    );
+  }
+  if due.is_empty() {
+    return Ok(0);
+  }
+
+  // One conditional multi-delete transaction on the scan's revision: the
+  // whole pass is old-or-new at every crash boundary, and every delete
+  // carries the exact digest it was scanned with. Landing the deletes in
+  // one commit keeps the pass from stranding its second-and-later
+  // deletions behind a revision the pass itself advanced.
+  let removed = due.len();
+  let transaction = store.prepare_transaction(
+    crate::TransactionId::generate(entropy)?,
+    snapshot.revision().clone(),
+    due,
+  )?;
+  match store.commit(transaction).await? {
+    crate::CommitOutcome::Committed(_) => Ok(removed),
+    // A conflict or abort mutates nothing: the newer winner (or the
+    // moved base revision) stays untouched, and the next bounded pass
+    // retries the whole batch.
+    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => Ok(0),
+    crate::CommitOutcome::Unknown { .. } => {
+      // The pending identity is discoverable through the store's
+      // recovery surface; leave the records in place rather than
+      // guessing, and let the next pass finish the job.
+      tracing::debug!("resource removal sweep ended indeterminate; retried next pass");
+      Ok(0)
     }
   }
-  Ok(removed)
 }
 #[cfg(test)]
 mod tests {
@@ -248,9 +247,12 @@ mod tests {
   #[tokio::test]
   async fn sweep_expires_aged_removals_and_never_touches_live_records() {
     let (_factory, store, clock) = open_store().await;
+    // Timestamps are epoch millis: 8_000 ms is 8 s, while the sweep clock
+    // reads 9_500 s, so the first removal is far past the 1_000 s window
+    // and the second is genuinely fresh (9_600 s is after the clock).
     let stale_removal = record(&name(1), 8_000, true, "file:///gone");
-    let fresh_removal = record(&name(2), 10_000, true, "file:///recent");
-    let live = record(&name(3), 10_000, false, "file:///live");
+    let fresh_removal = record(&name(2), 9_600_000, true, "file:///recent");
+    let live = record(&name(3), 9_600_000, false, "file:///live");
     for value in [&stale_removal, &fresh_removal, &live] {
       install(&store, value).await;
     }
@@ -282,6 +284,43 @@ mod tests {
         .await
         .unwrap()
         .is_some()
+    );
+  }
+
+  /// One pass lands every expired removal, not only the first: two aged
+  /// removal records leave together in the same sweep through the single
+  /// conditional multi-delete transaction.
+  #[tokio::test]
+  async fn one_pass_expires_multiple_aged_removals() {
+    let (_factory, store, clock) = open_store().await;
+    // Timestamps are epoch millis: both records are hours past the
+    // 1_000 s retention window when the sweep clock reads 10_000 s.
+    let first = record(&name(7), 7_000, true, "file:///first");
+    let second = record(&name(8), 7_500, true, "file:///second");
+    install(&store, &first).await;
+    install(&store, &second).await;
+    clock.set(UNIX_EPOCH + Duration::from_secs(10_000));
+    let removed = sweep_removed_ctx(
+      &store,
+      &SystemEntropy,
+      clock.as_ref(),
+      Duration::from_secs(1_000),
+      128,
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 2);
+    assert!(
+      crate::resource::store::read_record_ctx(&store, &name(7))
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      crate::resource::store::read_record_ctx(&store, &name(8))
+        .await
+        .unwrap()
+        .is_none()
     );
   }
 
