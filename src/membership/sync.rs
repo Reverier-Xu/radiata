@@ -378,7 +378,8 @@ async fn accept_payload(
     SyncPayload::Snapshot(encoded) => {
       let snapshot = TrustSnapshotV1::decode(encoded.as_ref())?;
       // The trust adoption policy lives in the trust module: issuer key
-      // verification, snapshot persistence, and per-binding adoption.
+      // verification and per-binding adoption (a delivered snapshot is
+      // never persisted; only the issuer's own refresh persists one).
       accept_snapshot(store, entropy.as_ref(), &snapshot).await?;
     }
     SyncPayload::Leave(encoded) => {
