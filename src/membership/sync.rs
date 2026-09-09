@@ -20,7 +20,7 @@ use crate::{
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::{
     lifecycle::LocalIdentityContext,
-    trust::{TrustBinding, TrustSnapshotV1, store as trust_store},
+    trust::{TrustSnapshotV1, accept_snapshot, refresh_issuer_snapshot, store as trust_store},
   },
   membership::page::{MembershipPage, sync as page_sync},
   protocol::{decode_canonical_strict, encode_canonical},
@@ -377,33 +377,9 @@ async fn accept_payload(
     }
     SyncPayload::Snapshot(encoded) => {
       let snapshot = TrustSnapshotV1::decode(encoded.as_ref())?;
-      // The issuer's declared key must match its locally trusted binding
-      // when one exists: a substitution is conflicting evidence and fails
-      // closed (snapshots are per-issuer, trusted through the
-      // authenticated session and the binding set they extend).
-      let bindings = trust_store::trusted_bindings(store).await?;
-      if let Some(known) = bindings.get(snapshot.issuer())
-        && known != snapshot.issuer_key()
-      {
-        return Err(Error::not_trusted("trust snapshot issuer key"));
-      }
-      trust_store::persist_snapshot_ctx(store, entropy.as_ref(), &snapshot).await?;
-      // Binding adoption is best effort per record: a transient store
-      // contention on one binding must not abort the remaining bindings of
-      // the snapshot; the next delivery retries what was skipped
-      // (anti-entropy repair).
-      for binding in snapshot.bindings() {
-        if let Err(error) =
-          trust_store::persist_binding_ctx(store, entropy.as_ref(), binding.node(), binding.key())
-            .await
-        {
-          tracing::debug!(node = %binding.node(), kind = ?error.kind(), "trust binding persist skipped");
-          continue;
-        }
-        let _ =
-          trust_store::adopt_binding_ctx(store, entropy.as_ref(), binding.node(), binding.key())
-            .await;
-      }
+      // The trust adoption policy lives in the trust module: issuer key
+      // verification, snapshot persistence, and per-binding adoption.
+      accept_snapshot(store, entropy.as_ref(), &snapshot).await?;
     }
     SyncPayload::Leave(encoded) => {
       // An owner-signed leave record is terminal evidence: verified
@@ -550,58 +526,6 @@ pub(crate) async fn ensure_local_descriptor(
     if !installed {
       return Err(error);
     }
-  }
-  Ok(())
-}
-
-/// Every node refreshes its own trust snapshot when its binding set
-/// changed: enumerate the durable bindings at revision `latest + 1` and
-/// persist. Returns the latest snapshot.
-pub(crate) async fn refresh_issuer_snapshot(
-  context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
-) -> Result<Option<TrustSnapshotV1>> {
-  let store = context.store();
-  let issuer = context.identity().node().clone();
-  // Cheap short-circuit: bindings are append-only between merges, so an
-  // unchanged count means an unchanged binding set; the full enumeration
-  // runs only when a merge may have added one.
-  let latest = trust_store::latest_snapshot_ctx(store, &issuer).await?;
-  if let Some(latest) = &latest
-    && !trust_store::has_more_than_bindings(store, latest.bindings().len()).await?
-  {
-    return Ok(Some(latest.clone()));
-  }
-  let bindings = trust_store::trusted_bindings(store).await?;
-  let current: Vec<TrustBinding> = bindings
-    .into_iter()
-    .map(|(node, key)| TrustBinding::new(node, key))
-    .collect();
-  let revision = match &latest {
-    Some(latest) if latest.bindings() != current.as_slice() => latest.revision().saturating_add(1),
-    Some(latest) => return Ok(Some(latest.clone())),
-    None => 1,
-  };
-  let snapshot = TrustSnapshotV1::new(
-    revision,
-    1,
-    issuer,
-    context.identity().public_key().clone(),
-    current,
-  );
-  persist_snapshot_with_bindings(store, entropy, &snapshot).await?;
-  Ok(Some(snapshot))
-}
-
-/// Persists one verified snapshot plus its binding observations, so the
-/// issuer's own trust page and every receiver's page expose the exact
-/// binding set.
-async fn persist_snapshot_with_bindings(
-  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>, snapshot: &TrustSnapshotV1,
-) -> Result<()> {
-  trust_store::persist_snapshot_ctx(store, entropy.as_ref(), snapshot).await?;
-  for binding in snapshot.bindings() {
-    trust_store::persist_binding_ctx(store, entropy.as_ref(), binding.node(), binding.key())
-      .await?;
   }
   Ok(())
 }
