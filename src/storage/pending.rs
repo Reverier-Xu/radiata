@@ -21,7 +21,7 @@ use minicbor::{
 };
 
 use super::{
-  CommitState, MetadataStore, PendingCommit, WriterLock,
+  CommitState, MetadataStore, PendingCommit,
   receipt::{
     HostWallClock, PreparedTransaction, ReceiptIdentity, ReceiptReferenceChange,
     ReceiptReferenceToken, WallClock, build_receipt_change_operations, group_receipt_changes,
@@ -31,9 +31,8 @@ use super::{
 };
 pub(crate) use crate::storage::families::PENDING_NAMESPACE;
 use crate::{
-  CommitOutcome, CommitReceipt, Digest, Error, ProviderErrorContext, ProviderErrorKind,
-  QualifiedTag, Result, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
-  StoreRequirements, StoreRevision, StoreValue, TransactionId,
+  CommitOutcome, CommitReceipt, Digest, Error, QualifiedTag, Result, StoreExpectation, StoreKey,
+  StoreNamespace, StoreOperation, StoreRevision, StoreValue, TransactionId,
   error::fixed_bytes,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
   provider::{StorageFactory, StoreSnapshot},
@@ -534,10 +533,11 @@ impl MetadataStore {
 
   /// Opens a store classified by the pending journal for `purpose`.
   ///
-  /// Without a pending record the store starts ready on the old state. With
-  /// a pending record the store starts frozen on the exact identity
-  /// reconstructed from the record, and reconciliation must prove the
-  /// journaled transaction committed.
+  /// The open itself walks the production open path, so the schema gate
+  /// applies before any journal discovery. Without a pending record the
+  /// store starts ready on the old state. With a pending record the store
+  /// starts frozen on the exact identity reconstructed from the record,
+  /// and reconciliation must prove the journaled transaction committed.
   pub(crate) async fn open_pending_recovered(
     factory: &Arc<dyn StorageFactory>, receipt_retention: Duration, purpose: &str,
   ) -> Result<(Self, Option<ReceiptIdentity>)> {
@@ -555,25 +555,13 @@ impl MetadataStore {
     clock: Arc<dyn WallClock>,
   ) -> Result<(Self, Option<ReceiptIdentity>)> {
     validate_purpose(purpose)?;
-    let requirements = StoreRequirements::metadata();
-    let provider = factory.open(requirements).await?;
-    if !provider.capabilities().satisfies(&requirements) {
-      return Err(Error::provider(
-        ProviderErrorKind::UnsupportedCapability,
-        ProviderErrorContext::StorageOpen,
-      ));
-    }
-    let store = Self {
-      provider,
-      state: std::sync::Mutex::new(CommitState::Ready),
-      writer_lock: WriterLock {
-        holder: std::sync::Mutex::new(None),
-        released: tokio::sync::Notify::new(),
-      },
-      ready_notify: tokio::sync::Notify::new(),
-      clock,
-      receipt_retention,
-    };
+    // The recovered open walks the production open path: the capability
+    // check, the schema gate, and the store construction stay single-
+    // sourced in `open_with_state`, so a store whose schema version this
+    // build does not know fails closed before any pending record is
+    // discovered or replayed.
+    let store =
+      Self::open_with_state(factory, receipt_retention, clock, CommitState::Ready).await?;
     let discovered = {
       let snapshot = store.snapshot().await?;
       discover_pending(snapshot.as_ref(), purpose).await?
