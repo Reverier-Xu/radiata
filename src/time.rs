@@ -2,9 +2,14 @@
 //!
 //! One home for the UNIX-epoch second/millisecond conversions that every
 //! subsystem needs, so saturation and epoch handling cannot drift between
-//! modules. Production semantics always read the host clock through an
-//! injected [`WallClock`](crate::storage::receipt::WallClock); these helpers
-//! are pure conversions over a [`SystemTime`] value.
+//! modules. The `to_*`/`from_*` functions are pure conversions over a
+//! [`SystemTime`] value. The `now_seconds`/`now_millis` functions are the
+//! protocol-visible liveness readings taken directly from the host clock
+//! (`SystemTime::now`) — deliberately not pure, because production code
+//! calls them exactly where the host wall clock is the required
+//! authority (storage receipt internals instead take the injected
+//! [`WallClock`](crate::storage::receipt::WallClock), which wraps these
+//! conversions for tests).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

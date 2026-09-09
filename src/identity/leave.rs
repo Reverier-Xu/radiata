@@ -3,13 +3,14 @@
 //! An explicit active leave replaces the node's identity and erases the
 //! old identity's local core metadata, crash-safely:
 //!
-//! 1. A journaled leave-intent records the exact former identity and the
+//! 1. A resumable leave-intent record (a durable record in its own family, not
+//!    a pending-journal entry) records the exact former identity and the
 //!    replacement coordinates (node id and key-creation operation).
 //! 2. The replacement key is created through the provider under that operation
 //!    id; an indeterminate create reconciles, never duplicates.
-//! 3. One journaled transaction swaps the local-identity singleton to the
-//!    replacement — after this commit the node is never the former identity
-//!    again.
+//! 3. One resumable idempotent transaction swaps the local-identity singleton
+//!    to the replacement — after this commit the node is never the former
+//!    identity again.
 //! 4. The old identity's domain metadata (trust, membership, resources, traces,
 //!    credentials, admissions, revocations) is wiped in bounded idempotent
 //!    batches; the store's schema, receipt internals, and key custody records

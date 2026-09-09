@@ -25,7 +25,10 @@ const ENTRY_WAIT_BACKOFF: Duration = Duration::from_millis(10);
 /// revisions observed inside the section cannot move before the commit
 /// lands. Task-reentrant: a task that already holds the section acquires
 /// a no-op permit, so journaled flows can span nested helper calls
-/// without threading the permit through signatures.
+/// without threading the permit through signatures. Root-context holders
+/// (no task id) share one pseudo-identity, so they must not
+/// `tokio::join!` concurrent store operations: both legs would observe
+/// "already holding" and run inside one exclusion at the same time.
 #[derive(Debug)]
 struct WriterLock {
   /// The holder's task id, if the holder runs inside a spawned task;
