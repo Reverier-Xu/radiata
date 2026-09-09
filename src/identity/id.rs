@@ -90,18 +90,9 @@ canonical_id!(TransactionId, "txn_", "transaction id");
 canonical_id!(ListenerId, "listener_", "listener id");
 canonical_id!(SessionId, "session_", "session id");
 
-// The canonical text form is exercised by the facade tests in later gates;
-// keep the accessor referenced so dead-code analysis does not flag the
-// generated impls before that wiring lands.
-#[allow(dead_code)]
-const _: fn(&ListenerId) -> &str = ListenerId::as_str;
-#[allow(dead_code)]
-const _: fn(&SessionId) -> &str = SessionId::as_str;
-
 macro_rules! generated_id {
   ($name:ident, $prefix:literal) => {
     impl $name {
-      #[allow(dead_code)]
       pub(crate) fn generate(entropy: &dyn Entropy) -> Result<Self> {
         let suffix = random_base62_suffix(entropy)?;
         Ok(Self(format!(concat!($prefix, "{}"), suffix)))
@@ -120,17 +111,14 @@ generated_id!(SessionId, "session_");
 pub struct OperationId([u8; 16]);
 
 impl OperationId {
-  #[allow(dead_code)]
   pub(crate) const fn from_bytes(value: [u8; 16]) -> Self {
     Self(value)
   }
 
-  #[allow(dead_code)]
   pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
     &self.0
   }
 
-  #[allow(dead_code)]
   pub(crate) fn generate(entropy: &dyn Entropy) -> Result<Self> {
     let mut value = [0_u8; 16];
     entropy.fill(&mut value)?;

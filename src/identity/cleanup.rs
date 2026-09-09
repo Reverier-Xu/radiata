@@ -337,14 +337,6 @@ impl CleanupCheckpointV1 {
     }
   }
 
-  pub(crate) const fn watermark_millis(&self) -> u64 {
-    self.watermark_millis
-  }
-
-  pub(crate) const fn issuer(&self) -> &NodeId {
-    &self.issuer
-  }
-
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_wire(&CheckpointWire {
       schema: CHECKPOINT_SCHEMA.to_owned(),

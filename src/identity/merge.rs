@@ -55,16 +55,19 @@ impl MergeProposal {
 
   /// The node being merged in; the fuzz target's conflict derivations
   /// rebuild proposals from these exact fields.
+  #[cfg(any(test, fuzzing))]
   pub(crate) const fn subject(&self) -> &NodeId {
     &self.subject
   }
 
   /// The credential generation this proposal binds (single-subject).
+  #[cfg(any(test, fuzzing))]
   pub(crate) const fn generation(&self) -> &GenerationId {
     &self.generation
   }
 
   /// The merge attempt identifier.
+  #[cfg(any(test, fuzzing))]
   pub(crate) const fn merge(&self) -> &MergeId {
     &self.merge
   }
