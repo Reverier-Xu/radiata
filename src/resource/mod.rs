@@ -60,9 +60,12 @@ const RECORD_VERSION: u16 = 1;
 pub struct ResourceName(QualifiedTag);
 
 impl ResourceName {
-  /// Parses and validates one resource name.
+  /// Parses and validates one resource name. The domain folds to
+  /// lowercase before the tag grammar runs, so a case variant resolves
+  /// onto the canonical name and lookups cannot be split across case
+  /// forgeries.
   pub fn parse(value: &str) -> Result<Self> {
-    let tag = QualifiedTag::parse(value)?;
+    let tag = QualifiedTag::parse(&crate::protocol::tag::fold_tag_domain(value))?;
     if tag.category() != "resources" {
       return Err(Error::invalid_input("resource name"));
     }
@@ -1141,6 +1144,9 @@ mod tests {
     assert!(LabelKey::parse("RADIATA.WOOOO.TECH/resources/type").is_err());
     assert!(LabelKey::parse("radiata.woooo.tech/resources/uri").is_err());
     assert!(LabelKey::parse("example.org/labels/").is_err());
+    // A trailing dot is a non-canonical spelling the fold does not
+    // normalize: it fails closed.
+    assert!(LabelKey::parse("example.org./labels/owner").is_err());
     assert!(ResourceName::parse("RADIATA.WOOOO.TECH/labels/not-a-resource").is_err());
     // A case-variant resource name normalizes to the canonical name, so
     // lookups cannot be split across case forgeries.

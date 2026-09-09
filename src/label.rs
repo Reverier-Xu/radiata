@@ -33,8 +33,14 @@ pub struct LabelKey(QualifiedTag);
 
 impl LabelKey {
   /// Parses and validates one label key (`<domain>/labels/<name>`).
+  ///
+  /// The domain folds to lowercase before the tag grammar runs, so a
+  /// case variant of a reserved or custom key parses onto the canonical
+  /// identity instead of a distinct spelling; the grammar itself
+  /// validates the folded text and rejects every non-canonical spelling
+  /// it does not normalize.
   pub fn parse(value: &str) -> Result<Self> {
-    let tag = QualifiedTag::parse(value)?;
+    let tag = QualifiedTag::parse(&crate::protocol::tag::fold_tag_domain(value))?;
     if tag.category() != "labels" {
       return Err(Error::invalid_input("label key"));
     }

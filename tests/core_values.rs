@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 use radiata::{
-  Digest, DiscoveryTag, ErrorKind, FeatureTag, NodeConfig, NodeId, ParserLimits, ProtocolTag,
-  ProviderErrorContext, ProviderErrorKind, PublicKey, QualifiedTag, RecoveryConfig, Signature,
-  TraceId, TraceMetadataLimits, TransactionId, TransportTag,
+  Digest, DiscoveryTag, Endpoint, ErrorKind, FeatureTag, NodeConfig, NodeId, ParserLimits,
+  ProtocolTag, ProviderErrorContext, ProviderErrorKind, PublicKey, QualifiedTag, RecoveryConfig,
+  Signature, TraceId, TraceMetadataLimits, TransactionId, TransportTag,
 };
 
 #[test]
@@ -75,9 +75,39 @@ fn core_tags_reject_noncanonical_namespaces() {
     "example.com/features/work/extra",
     "example.com/features/wörk",
     "radiata.woooo.tech/crypto/admission-grant-v1",
+    // Canonical domains only: the trailing dot, uppercase spellings, and
+    // underscores all parse as DNS grammar but must not become tag
+    // identities.
+    "example.com./features/work",
+    "EXAMPLE.com/features/work",
+    "under_score.example.com/features/work",
     too_long_tag.as_str(),
   ] {
     assert!(QualifiedTag::parse(value).is_err(), "accepted {value:?}");
+  }
+
+  // The reserved builtin-domain crypto category cannot be bypassed by a
+  // non-canonical spelling: every case or dot variant is rejected before
+  // any reserved comparison sees it.
+  for value in [
+    "RADIATA.WOOOO.TECH/crypto/session-v1",
+    "radiata.woooo.tech./crypto/session-v1",
+  ] {
+    assert!(QualifiedTag::parse(value).is_err(), "accepted {value:?}");
+  }
+}
+
+#[test]
+fn core_endpoints_reject_noncanonical_dns_hosts() {
+  for value in [
+    // Trailing dot, uppercase spelling, and underscore all parse as DNS
+    // grammar; canonical endpoints reject them so text equality stays
+    // identity.
+    "wss://relay.example.com.:443",
+    "wss://Relay.Example.COM:443",
+    "wss://under_score.example.com:443",
+  ] {
+    assert!(Endpoint::parse(value).is_err(), "accepted {value:?}");
   }
 }
 

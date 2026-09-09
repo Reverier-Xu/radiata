@@ -48,11 +48,13 @@ impl Endpoint {
     }
 
     let (host, bracketed, port) = split_authority(authority)?;
-    // DNS names are case-insensitive: normalize the host to lowercase for
-    // storage and comparison instead of rejecting uppercase input. The
-    // fold never changes byte length, so the split offsets stay valid.
+    // DNS hosts are validated on the original text: `validate_host`
+    // rejects every non-lowercase spelling as non-canonical. The fold
+    // below only canonicalizes IP literals, whose hex digits are
+    // case-insensitive; it never changes byte length, so the split
+    // offsets stay valid.
+    validate_host(host)?;
     let host = host.to_ascii_lowercase();
-    validate_host(&host)?;
     let port = match port {
       Some(text) => parse_port(text)?,
       None => DEFAULT_PORT,
@@ -231,10 +233,9 @@ mod tests {
       ("wss://127.0.0.1:9000", "127.0.0.1", 9000),
       ("wss://[::1]:9000", "::1", 9000),
       ("wss://[2001:db8::1]", "2001:db8::1", 443),
-      // DNS names are case-insensitive: uppercase input is accepted and
-      // normalized to lowercase for storage and comparison.
-      ("wss://Relay.Example.COM", "relay.example.com", 443),
-      ("wss://RELAY.example.com:8443", "relay.example.com", 8443),
+      // IP literals are case-insensitive: uppercase hex digits fold to
+      // the canonical lowercase form for storage and comparison.
+      ("wss://[2001:DB8::1]:8443", "2001:db8::1", 8443),
       ("wss://a-b.c-d.example", "a-b.c-d.example", 443),
     ] {
       let endpoint = Endpoint::parse(text).unwrap();
@@ -269,6 +270,17 @@ mod tests {
       "wss://relay.example.com:443x",
       "wss:// relay.example.com",
       "wss://relay..example.com",
+      // DNS hosts are canonical: uppercase spellings would alias their
+      // lowercase form under a different text identity, and trailing dots
+      // and underscores are non-canonical spellings the DNS grammar alone
+      // would accept.
+      "wss://Relay.Example.COM",
+      "wss://RELAY.example.com:8443",
+      "wss://relay.example.com.:443",
+      "wss://relay.example.com.",
+      "wss://under_score.example.com:443",
+      "wss://-lead.example.com",
+      "wss://trail-.example.com",
       "wss://127.0.0.1.1",
       "wss://127.0.0.256",
       "wss://017.0.0.1",
