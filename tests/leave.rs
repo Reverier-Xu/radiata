@@ -488,13 +488,23 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
       .all(|member| member.node_id() == &replacement),
     "only the replacement identity may appear"
   );
+  // The trust view reads the single identity-binding family: the wipe
+  // removed the old cluster's bindings, leaving at most the restarted
+  // node's own born-with-cluster binding.
+  let trust = handle
+    .query(PageTrust::new(PageSpec::first(8).unwrap()))
+    .await
+    .unwrap();
   assert!(
-    handle
-      .query(PageTrust::new(PageSpec::first(8).unwrap()))
-      .await
-      .unwrap()
+    trust.items().len() <= 1,
+    "old cluster trust metadata must be wiped"
+  );
+  assert!(
+    trust
       .items()
-      .is_empty()
+      .iter()
+      .all(|view| view.node_id() == &replacement),
+    "only the replacement's own binding may remain"
   );
 
   // The old identity never returns: the restarted node is exactly the
