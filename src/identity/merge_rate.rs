@@ -5,9 +5,11 @@
 //! attempts, per-source and global 60-second fixed windows, a bounded
 //! source-bucket table with idle eviction, and the ten-second
 //! authentication deadline owned by the session driver. A rejected
-//! attempt consumes no credential and performs no signing; an
-//! [`MergeSlot`] holds the pending count for exactly one in-flight
-//! attempt and releases it on every outcome, including cancellation.
+//! attempt consumes no credential, performs no signing, and consumes no
+//! rate-window budget: both windows record an attempt only after every
+//! admission check has passed. An [`MergeSlot`] holds the pending count
+//! for exactly one in-flight attempt and releases it on every outcome,
+//! including cancellation.
 //!
 //! Rate windows use the monotonic clock, so host wall-clock rollback can
 //! delay the authentication deadline and a forward jump can make it
@@ -74,18 +76,21 @@ impl RateWindow {
     }
   }
 
-  /// Records one attempt in the fixed 60-second window; saturation is a
-  /// typed overload.
-  fn record(&mut self, now: Instant) -> Result<()> {
+  /// Reports whether one attempt is admitted by the fixed 60-second
+  /// window, rotating to a fresh window first. Rotation is deterministic
+  /// on `now` and consumes nothing; only [`RateWindow::record`] does.
+  fn admits(&mut self, now: Instant) -> bool {
     if now.duration_since(self.start) >= WINDOW_SECONDS {
       self.start = now;
       self.count = 0;
     }
-    if self.count >= self.limit {
-      return Err(Error::overloaded("merge rate window"));
-    }
+    self.count < self.limit
+  }
+
+  /// Records one admitted attempt. Saturation was already refused by
+  /// [`RateWindow::admits`]; callers must check before recording.
+  fn record(&mut self) {
     self.count += 1;
-    Ok(())
   }
 }
 
@@ -121,7 +126,10 @@ impl MergeLimiter {
 
   /// Admits one connection attempt from `source`, holding its pending slot
   /// until the [`MergeSlot`] drops. Rejection is a typed overload and
-  /// never consumes a credential.
+  /// never consumes a credential; the per-source and global windows
+  /// record the attempt only after every admission check has passed,
+  /// immediately before the grant, so rejected attempts never consume
+  /// the rate budget of any source.
   pub(crate) fn begin(&self, source: MergeSource) -> Result<MergeSlot> {
     let now = Instant::now();
     let mut inner = self
@@ -134,23 +142,31 @@ impl MergeLimiter {
         return Err(Error::overloaded("merge source buckets"));
       }
     }
-    inner.global_window.record(now)?;
     if inner.global_pending >= PENDING_GLOBAL {
       return Err(Error::overloaded("merge global pending"));
     }
-    {
-      let bucket = inner.sources.entry(source).or_insert_with(|| SourceBucket {
-        pending: 0,
-        window: RateWindow::new(now, RATE_PER_SOURCE),
-        last_seen: now,
-      });
-      bucket.last_seen = now;
-      bucket.window.record(now)?;
-      if bucket.pending >= PENDING_PER_SOURCE {
-        return Err(Error::overloaded("merge source pending"));
-      }
-      bucket.pending += 1;
+    if !inner.global_window.admits(now) {
+      return Err(Error::overloaded("merge rate window"));
     }
+    let bucket = inner.sources.entry(source).or_insert_with(|| SourceBucket {
+      pending: 0,
+      window: RateWindow::new(now, RATE_PER_SOURCE),
+      last_seen: now,
+    });
+    bucket.last_seen = now;
+    if bucket.pending >= PENDING_PER_SOURCE {
+      return Err(Error::overloaded("merge source pending"));
+    }
+    if !bucket.window.admits(now) {
+      return Err(Error::overloaded("merge rate window"));
+    }
+    // Every admission check passed: record both windows as the final
+    // grant step. Recording is infallible and the per-source bucket is
+    // last used before the global window is touched, so a rejected
+    // attempt can never consume either window's budget.
+    bucket.window.record();
+    bucket.pending += 1;
+    inner.global_window.record();
     inner.global_pending += 1;
     Ok(MergeSlot {
       limiter: self.clone(),
@@ -267,6 +283,34 @@ mod tests {
     );
     drop(held);
     drop(limiter.begin(origin).unwrap());
+  }
+
+  /// Rejected attempts must not consume the global rate budget: one
+  /// source hammering past its per-source window cannot exhaust the
+  /// global 60-second window for every other source.
+  #[test]
+  fn merge_rate_rejected_attempts_do_not_consume_the_global_window() {
+    let limiter = MergeLimiter::new();
+    let hammer = source(1);
+    let other = source(2);
+    // The hammer saturates its per-source window with granted attempts.
+    for _ in 0..RATE_PER_SOURCE {
+      drop(limiter.begin(hammer).unwrap());
+    }
+    // Rapid-fire past the saturated window: every further attempt is
+    // rejected (and, before the fix, each of these consumed a global
+    // slot because the global window recorded before the per-source
+    // check).
+    for _ in 0..RATE_GLOBAL {
+      assert_eq!(
+        limiter.begin(hammer).unwrap_err().kind(),
+        ErrorKind::Overloaded,
+        "saturated source must be rejected"
+      );
+    }
+    // A different source still passes global admission inside the same
+    // window: none of the hammer's rejections consumed the global budget.
+    drop(limiter.begin(other).unwrap());
   }
 
   #[test]
