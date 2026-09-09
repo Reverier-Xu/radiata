@@ -7,18 +7,49 @@
 //! stays bounded by the two session queues, and every interruption is
 //! reported upstream with an explicit typed acknowledgement instead of a
 //! replay or continuation.
+//!
+//! Module boundary: the forwarding domain owns its own types (forwarding
+//! hops, pending acknowledgement entries) and may depend on session
+//! infrastructure — bounded frame senders and the session table — but
+//! forwarding-domain concepts are never defined in the session module.
 
 use std::{collections::HashMap, sync::Arc};
 
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::{
   ErrorKind, NodeId, Result, TraceId,
   extension_registry::ExtensionRegistry,
-  packet::wire::{self, AckStatus, ChunkFrame, EndFrame, OpenFrame},
+  packet::{
+    AckOutcome,
+    wire::{self, AckStatus, ChunkFrame, EndFrame, OpenFrame},
+  },
   protocol::wire::PacketKind,
-  session::stream::{BoundedSender, PendingAck, PendingAcks, SessionFrame, SessionTable},
+  session::stream::{BoundedSender, SessionFrame, SessionTable},
 };
+
+/// One pending outbound admission on a session: a synchronous waiter at
+/// the origin, or a forwarding hop whose acknowledgement must be relayed
+/// upstream. The map holding these is bounded per session by
+/// `SessionPolicy::pending_admissions`: a peer that accepts opens
+/// without acknowledging them cannot grow origin memory without limit.
+pub(crate) enum PendingAck {
+  Wait {
+    notify: oneshot::Sender<AckOutcome>,
+    /// Host wall-clock seconds at insertion; the liveness policy lets the
+    /// idle deadline close a session whose oldest waiting admission has
+    /// been outstanding for a full idle deadline, so a silent peer cannot
+    /// hold a session open forever through the owned-work exemption.
+    queued_at: u64,
+  },
+  Relay {
+    upstream: BoundedSender,
+  },
+}
+
+/// The per-session pending-admission map keyed by trace id.
+pub(crate) type PendingAcks = Arc<std::sync::Mutex<HashMap<TraceId, PendingAck>>>;
 
 #[derive(Clone)]
 pub(crate) struct ForwardingHop {

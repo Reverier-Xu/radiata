@@ -669,6 +669,22 @@ impl RouteContext {
   }
 }
 
+/// Validates one decoded open frame's routing envelope at the local
+/// admission boundary (stream admission, not forwarding). The envelope is
+/// re-checked against the session-authenticated `peer` before anything
+/// else, the visited chain then authenticates the original source, and a
+/// legacy direct frame (no route state) authenticates only through the
+/// exact source-peer match. Forwarding is never a valid outcome at this
+/// boundary — the frame either arrives exactly at `local` or fails
+/// closed — so the next-hop choice is hardcoded to a typed refusal.
+pub(crate) fn receive_open_envelope(
+  trace_id: crate::TraceId, source: NodeId, destination: NodeId, route: Option<HopState>,
+  local: &NodeId, peer: &NodeId,
+) -> Result<RouteProgress> {
+  RouteContext::from_frame(trace_id, source, destination, route)
+    .receive(local, peer, |_| Err(Error::unsupported("route forwarding")))
+}
+
 /// The descriptor-store-backed candidate reader: streams bounded pages of
 /// live members whose owned labels satisfy the selector, in canonical node
 /// order (candidates are exposed incrementally, never as a
