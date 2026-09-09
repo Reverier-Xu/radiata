@@ -9,10 +9,13 @@
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
+// The discovery extension surface is test-only until a discovery wiring
+// exists (see `transport::registry`).
+#[cfg(test)]
+use crate::{DiscoveryTag, transport::registry::Discovery};
 use crate::{
-  DiscoveryTag, Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag,
-  api::BoxFuture,
-  transport::registry::{Discovery, Transport},
+  Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag, api::BoxFuture,
+  transport::registry::Transport,
 };
 
 /// The immutable definition of one domain-qualified packet protocol: its
@@ -61,6 +64,7 @@ pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,
   protocols: std::sync::Mutex<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
   transports: BTreeMap<TransportTag, Arc<dyn Transport>>,
+  #[cfg(test)]
   discoveries: BTreeMap<DiscoveryTag, Arc<dyn Discovery>>,
   load_balancers:
     std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
@@ -265,18 +269,19 @@ impl ExtensionRegistry {
 
 impl fmt::Debug for ExtensionRegistry {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter
-      .debug_struct("ExtensionRegistry")
-      .field(
-        "protocols",
-        &self
-          .protocols
-          .lock()
-          .map(|protocols| protocols.len())
-          .unwrap_or(0),
-      )
-      .field("transports", &self.transports.len())
-      .field("discoveries", &self.discoveries.len())
+    let mut builder = formatter.debug_struct("ExtensionRegistry");
+    builder.field(
+      "protocols",
+      &self
+        .protocols
+        .lock()
+        .map(|protocols| protocols.len())
+        .unwrap_or(0),
+    );
+    builder.field("transports", &self.transports.len());
+    #[cfg(test)]
+    builder.field("discoveries", &self.discoveries.len());
+    builder
       .field(
         "load_balancers",
         &self

@@ -86,9 +86,7 @@ pub use resource::{ResourceLabels, ResourceName, ResourceUri, ResourceVersion};
 pub use routing::{
   CandidateNodeReader, LoadBalancingPolicy, NextHopView, RouteContext, RouteNextHop, Selector,
 };
-pub use transport::{
-  ChannelBinding, Discovery, DiscoveryPage, Endpoint, EndpointCandidate, PageCursor,
-};
+pub use transport::{Endpoint, PageCursor};
 pub use view::{
   ConnectivityStatus, LeaveOutcome, ListenerPage, ListenerView, LocalNodeView, MemberPage,
   MemberView, MergeView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot, PageSpec,

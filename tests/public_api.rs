@@ -19,26 +19,25 @@ use std::{
 #[cfg(all(feature = "json", unix))]
 use radiata::adapters::json_store;
 use radiata::{
-  ApplyReceiptRetention, BoxFuture, ChannelBinding, CommitOutcome, CommitReceipt, ConnectMember,
-  ConnectivityStatus, CreatedKey, DeliveryAck, Digest, DisconnectPeer, Discovery, DiscoveryPage,
-  Endpoint, EndpointCandidate, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
-  FeatureDefinition, FeatureTag, GetLocalNode, GetMember, GetNodeStatus, GetObservability,
-  GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState,
-  KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster,
-  LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView,
-  MergeCluster, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId,
-  NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
-  PacketConsumer, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
-  PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
-  ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
-  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
-  ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result,
-  RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy,
-  SelectResources, Selector, SessionChanged, SessionView, Shutdown, ShutdownOutcome,
-  ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities, StoreEntry, StoreKey,
-  StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
-  StreamMetadata, StreamPolicy, StreamTarget, TraceId, TraceMetadataLimits, TransactionId,
-  TransportTag, UpdateNodeMetadata, WaitForShutdown,
+  ApplyReceiptRetention, BoxFuture, CommitOutcome, CommitReceipt, ConnectMember,
+  ConnectivityStatus, CreatedKey, DeliveryAck, Digest, DisconnectPeer, Endpoint, EventOptions,
+  EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag, GetLocalNode,
+  GetMember, GetNodeStatus, GetObservability, GetResource, GetRoute, IncomingStream,
+  IssuedMergeCredential, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
+  KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster, LeaveOutcome, Listen,
+  LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView, MergeCluster, MergeCredential,
+  MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked,
+  NodeStatus, ObservabilitySnapshot, OutboundStream, PacketConsumer, PageCursor, PageListeners,
+  PageMembers, PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition,
+  ProtocolTag, PutResource, QualifiedTag, ReceiptRetentionReport, RecoveryChanged, RecoveryConfig,
+  RecoveryView, RemoveResource, ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged,
+  ResourceLabels, ResourceMutationView, ResourceName, ResourcePage, ResourceUri, ResourceVersion,
+  ResourceWrite, Result, RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop,
+  RouteState, RoutingPolicy, SelectResources, Selector, SessionChanged, SessionView, Shutdown,
+  ShutdownOutcome, ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities,
+  StoreEntry, StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision,
+  StoreTransaction, StoreValue, StreamMetadata, StreamPolicy, StreamTarget, TraceId,
+  TraceMetadataLimits, TransactionId, TransportTag, UpdateNodeMetadata, WaitForShutdown,
   extension::{Entropy, KeyProvider, Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -64,9 +63,6 @@ fn boundary_values_construct_parse_and_round_trip() {
 
   let signature = Signature::from_bytes([11; 64]);
   assert_eq!(signature.as_bytes(), &[11; 64]);
-
-  let binding = ChannelBinding::from_tls_exporter([13; 32]);
-  assert_eq!(binding.as_bytes(), &[13; 32]);
 
   let endpoint = Endpoint::parse("wss://127.0.0.1:0").unwrap();
   assert_eq!(endpoint.as_str(), "wss://127.0.0.1:0");
@@ -548,39 +544,6 @@ impl RouteNextHop for PubNextHop {
       })
     })
   }
-}
-
-#[derive(Debug)]
-struct PubDiscovery;
-
-impl Discovery for PubDiscovery {
-  fn discover<'a>(
-    &'a self, cursor: Option<&PageCursor>, limit: usize,
-  ) -> BoxFuture<'a, Result<DiscoveryPage>> {
-    Box::pin(async move {
-      let _ = cursor;
-      let candidate =
-        EndpointCandidate::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()).with_priority(3);
-      assert_eq!(candidate.priority(), 3);
-      let _endpoint = candidate.endpoint();
-      let items = if limit > 0 {
-        vec![candidate]
-      } else {
-        Vec::new()
-      };
-      DiscoveryPage::new(items, None)
-    })
-  }
-}
-
-/// The open Discovery contract is implementable and callable externally.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn discovery_contract_is_externally_implementable() {
-  let page = PubDiscovery.discover(None, 4).await.unwrap();
-  assert_eq!(page.items().len(), 1);
-  assert!(page.next().is_none());
-  let empty = PubDiscovery.discover(None, 0).await.unwrap();
-  assert!(empty.items().is_empty());
 }
 
 /// Stream policies, metadata, and targets are externally constructible.
