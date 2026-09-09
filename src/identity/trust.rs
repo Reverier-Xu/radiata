@@ -9,11 +9,16 @@
 //! `NodeId` key substitutions against locally admitted bindings are rejected
 //! without selecting a winner.
 
+use std::sync::Arc;
+
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
+use super::lifecycle::LocalIdentityContext;
 use crate::{
   NodeId, PublicKey, Result,
+  api::Entropy,
   protocol::{decode_canonical, encode_canonical},
+  storage::MetadataStore,
 };
 
 /// The durable schema and namespace of one trust snapshot record.
@@ -234,6 +239,89 @@ pub(crate) fn page_bindings(
     .checked_add(page.len())
     .filter(|end| *end < bindings.len());
   Ok(TrustPage::new(page, next))
+}
+
+/// Accepts one issuer-marked trust snapshot delivered over an
+/// authenticated session: the trust adoption policy for the sync lane.
+/// The issuer's declared key must match its locally trusted binding
+/// when one exists: a substitution is conflicting evidence and fails
+/// closed (snapshots are per-issuer, trusted through the
+/// authenticated session and the binding set they extend). The verified
+/// snapshot persists, then binding adoption runs per record: a transient
+/// store contention on one binding must not abort the remaining bindings
+/// of the snapshot; the next delivery retries what was skipped
+/// (anti-entropy repair).
+pub(crate) async fn accept_snapshot(
+  store: &MetadataStore, entropy: &dyn Entropy, snapshot: &TrustSnapshotV1,
+) -> Result<()> {
+  let bindings = store::trusted_bindings(store).await?;
+  if let Some(known) = bindings.get(snapshot.issuer())
+    && known != snapshot.issuer_key()
+  {
+    return Err(crate::Error::not_trusted("trust snapshot issuer key"));
+  }
+  store::persist_snapshot_ctx(store, entropy, snapshot).await?;
+  for binding in snapshot.bindings() {
+    if let Err(error) =
+      store::persist_binding_ctx(store, entropy, binding.node(), binding.key()).await
+    {
+      tracing::debug!(node = %binding.node(), kind = ?error.kind(), "trust binding persist skipped");
+      continue;
+    }
+    let _ = store::adopt_binding_ctx(store, entropy, binding.node(), binding.key()).await;
+  }
+  Ok(())
+}
+
+/// Every node refreshes its own trust snapshot when its binding set
+/// changed: enumerate the durable bindings at revision `latest + 1` and
+/// persist. Returns the latest snapshot.
+pub(crate) async fn refresh_issuer_snapshot(
+  context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
+) -> Result<Option<TrustSnapshotV1>> {
+  let store = context.store();
+  let issuer = context.identity().node().clone();
+  // Cheap short-circuit: bindings are append-only between merges, so an
+  // unchanged count means an unchanged binding set; the full enumeration
+  // runs only when a merge may have added one.
+  let latest = store::latest_snapshot_ctx(store, &issuer).await?;
+  if let Some(latest) = &latest
+    && !store::has_more_than_bindings(store, latest.bindings().len()).await?
+  {
+    return Ok(Some(latest.clone()));
+  }
+  let bindings = store::trusted_bindings(store).await?;
+  let current: Vec<TrustBinding> = bindings
+    .into_iter()
+    .map(|(node, key)| TrustBinding::new(node, key))
+    .collect();
+  let revision = match &latest {
+    Some(latest) if latest.bindings() != current.as_slice() => latest.revision().saturating_add(1),
+    Some(latest) => return Ok(Some(latest.clone())),
+    None => 1,
+  };
+  let snapshot = TrustSnapshotV1::new(
+    revision,
+    1,
+    issuer,
+    context.identity().public_key().clone(),
+    current,
+  );
+  persist_snapshot_with_bindings(store, entropy, &snapshot).await?;
+  Ok(Some(snapshot))
+}
+
+/// Persists one verified snapshot plus its binding observations, so the
+/// issuer's own trust page and every receiver's page expose the exact
+/// binding set.
+async fn persist_snapshot_with_bindings(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>, snapshot: &TrustSnapshotV1,
+) -> Result<()> {
+  store::persist_snapshot_ctx(store, entropy.as_ref(), snapshot).await?;
+  for binding in snapshot.bindings() {
+    store::persist_binding_ctx(store, entropy.as_ref(), binding.node(), binding.key()).await?;
+  }
+  Ok(())
 }
 
 #[cfg(test)]
