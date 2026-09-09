@@ -377,8 +377,9 @@ impl NodeHandle {
   ///
   /// An exact-node target rejects a load-balancer selection; a
   /// matching-node target requires one whose tag resolves in the node's
-  /// [`ExtensionRegistry`]. The routing policy must resolve to the
-  /// built-in direct policy, and the protocol tag must be registered.
+  /// [`ExtensionRegistry`]. The routing policy must be the built-in
+  /// direct policy — enforced up front when the [`StreamPolicy`] is
+  /// constructed — and the protocol tag must be registered.
   pub fn open_stream(
     &self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy,
     metadata: StreamMetadata,
