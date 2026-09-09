@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{SessionDriver, handshake_frame_rules};
+use super::{SessionDriver, connection_frame_rules};
 use crate::{
   Digest, ErrorKind, FeatureTag,
   identity::{
@@ -125,10 +125,14 @@ async fn listen(
     } else {
       None
     };
-    let mut connection =
-      Connection::accept(tcp, config, handshake_frame_rules().unwrap(), hint.as_ref())
-        .await
-        .unwrap();
+    let mut connection = Connection::accept(
+      tcp,
+      config,
+      connection_frame_rules().unwrap(),
+      hint.as_ref(),
+    )
+    .await
+    .unwrap();
     driver.respond(&mut connection).await
   });
   (address, task)
@@ -140,7 +144,7 @@ async fn connect(address: std::net::SocketAddr) -> Connection {
     tcp,
     merge_client_config().unwrap(),
     "127.0.0.1".try_into().unwrap(),
-    handshake_frame_rules().unwrap(),
+    connection_frame_rules().unwrap(),
   )
   .await
   .unwrap()

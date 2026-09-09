@@ -115,9 +115,12 @@ pub(crate) struct FrameRules {
   pub(crate) is_declared: fn(u16, u16) -> bool,
 }
 
-/// The frame rules of the handshake phase: declared handshake kinds only,
-/// no flags, bounded by the offer decode limits.
-pub(crate) fn handshake_frame_rules() -> crate::Result<FrameRules> {
+/// The frame rules of an authenticated connection's whole lifetime: every
+/// published kind of the base schema (handshake and packet stream alike),
+/// no flags, bounded by the control decode limits. The scope is the
+/// connection, not the handshake phase alone: the same rules gate the
+/// pre-authentication exchange and the post-authentication packet kinds.
+pub(crate) fn connection_frame_rules() -> crate::Result<FrameRules> {
   let limit = u32::try_from(crate::protocol::CONTROL_CBOR_LIMITS.max_body_len())
     .map_err(|_| crate::Error::invalid_input("handshake frame limit"))?;
   Ok(FrameRules {
