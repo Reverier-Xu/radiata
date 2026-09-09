@@ -354,11 +354,14 @@ pub(crate) mod store {
       }],
     )?;
     // A discarded commit outcome would silently drop the descriptor: a
-    // Conflict (the register moved under the CAS) must surface so the
-    // anti-entropy page applies on a later tick instead of vanishing.
+    // Conflict (the register moved under the CAS) or an Aborted commit
+    // (definitively not applied) must surface so the anti-entropy page
+    // applies on a later tick instead of vanishing.
     match store.commit(transaction).await? {
-      crate::CommitOutcome::Committed(_) | crate::CommitOutcome::Aborted => Ok(()),
-      crate::CommitOutcome::Conflict => Err(Error::conflict("node descriptor revision")),
+      crate::CommitOutcome::Committed(_) => Ok(()),
+      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
+        Err(Error::conflict("node descriptor revision"))
+      }
       crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
         crate::ProviderErrorKind::CommitUnknown,
         crate::ProviderErrorContext::StorageCommit,
@@ -388,10 +391,17 @@ pub(crate) mod store {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::Arc;
+  use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+  };
 
   use super::{NodeDescriptorV1, store};
-  use crate::{Endpoint, NodeId, provider::StorageFactory};
+  use crate::{
+    BoxFuture, CommitOutcome, Endpoint, ErrorKind, NodeId, ReconcileOutcome, StoreCapabilities,
+    StoreRequirements, StoreTransaction,
+    provider::{Storage, StorageFactory, StoreSnapshot},
+  };
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node_{value:021}")).unwrap()
@@ -423,6 +433,67 @@ mod tests {
     Arc::new(crate::storage::contract::ReferenceFactory::new(
       crate::storage::contract::required_capabilities(),
     ))
+  }
+
+  /// Test-only storage wrapper that aborts the first scripted commit:
+  /// the reference factory is otherwise always-committed, so this is the
+  /// only way to drive an `Aborted` outcome into the descriptor store.
+  #[derive(Debug)]
+  struct AbortingOnceFactory {
+    reference: Arc<dyn StorageFactory>,
+  }
+
+  #[derive(Debug)]
+  struct AbortingOnceStorage {
+    reference: Box<dyn Storage>,
+    pending: Mutex<VecDeque<()>>,
+  }
+
+  impl StorageFactory for AbortingOnceFactory {
+    fn open<'a>(
+      &'a self, requirements: StoreRequirements,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Storage>>> {
+      Box::pin(async move {
+        let reference = self.reference.open(requirements).await?;
+        Ok(Box::new(AbortingOnceStorage {
+          reference,
+          pending: Mutex::new(VecDeque::from([()])),
+        }) as Box<dyn Storage>)
+      })
+    }
+  }
+
+  impl Storage for AbortingOnceStorage {
+    fn capabilities(&self) -> StoreCapabilities {
+      self.reference.capabilities()
+    }
+
+    fn snapshot<'a>(&'a self) -> BoxFuture<'a, crate::Result<Box<dyn StoreSnapshot>>> {
+      self.reference.snapshot()
+    }
+
+    fn commit<'a>(
+      &'a self, transaction: StoreTransaction,
+    ) -> BoxFuture<'a, crate::Result<CommitOutcome>> {
+      let abort = self.pending.lock().unwrap().pop_front().is_some();
+      Box::pin(async move {
+        if abort {
+          Ok(CommitOutcome::Aborted)
+        } else {
+          self.reference.commit(transaction).await
+        }
+      })
+    }
+
+    fn reconcile<'a>(
+      &'a self, transaction: &'a crate::TransactionId, digest: &'a crate::Digest,
+    ) -> BoxFuture<'a, crate::Result<ReconcileOutcome>> {
+      self.reference.reconcile(transaction, digest)
+    }
+
+    fn flush<'a>(&'a self) -> BoxFuture<'a, crate::Result<()>> {
+      self.reference.flush()
+    }
   }
 
   /// Membership entries are keyed under their marked owner and round-trip
@@ -500,6 +571,35 @@ mod tests {
       store::store_descriptor(&factory, &descriptor(3, 1, vec![], true))
         .await
         .is_ok()
+    );
+  }
+
+  /// An aborted commit is definitively not applied: the descriptor store
+  /// must fail closed instead of reporting success while the write is
+  /// silently dropped (the anti-entropy page then applies on a later
+  /// tick through the normal error path).
+  #[tokio::test]
+  async fn descriptor_store_fails_closed_on_aborted_commit() {
+    let factory: Arc<dyn StorageFactory> = Arc::new(AbortingOnceFactory {
+      reference: factory(),
+    });
+    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    let error = store::store_descriptor_ctx(
+      &store,
+      &crate::api::SystemEntropy,
+      &descriptor(1, 1, vec!["one.example"], false),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    // The aborted write never landed.
+    assert!(
+      store::read_descriptor_ctx(&store, &node(1))
+        .await
+        .unwrap()
+        .is_none()
     );
   }
 
