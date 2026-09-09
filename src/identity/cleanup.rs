@@ -18,9 +18,7 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{
-  lifecycle::LocalIdentityContext,
-  records::metadata_namespace,
-  signature::{signature_message, verify_strict},
+  lifecycle::LocalIdentityContext, records, records::metadata_namespace, signature::verify_strict,
 };
 /// The durable namespace of cleanup tombstone records.
 pub(crate) use crate::storage::families::CLEANUP_NAMESPACE;
@@ -208,23 +206,23 @@ pub(crate) async fn sign_cleanup_record(
     .ok_or_else(|| Error::not_found("cleanup subject"))?;
   let identity = context.identity();
   let timestamp_millis = crate::time::now_millis();
-  let body =
-    CleanupRecordV1::encode_signed_body(subject, &subject_key, identity.node(), timestamp_millis)?;
-  let signature = keys
-    .sign(
-      identity.handle(),
-      &signature_message(CLEANUP_RECORD_V1_DOMAIN, &body),
-    )
-    .await?;
-  let record = CleanupRecordV1::new(
+  let signature = records::sign_tombstone(
+    context,
+    keys,
+    CLEANUP_RECORD_V1_DOMAIN,
+    "cleanup record signature",
+    |identity| {
+      CleanupRecordV1::encode_signed_body(subject, &subject_key, identity.node(), timestamp_millis)
+    },
+  )
+  .await?;
+  Ok(CleanupRecordV1::new(
     subject.clone(),
     subject_key,
     identity.node().clone(),
     timestamp_millis,
     signature,
-  );
-  record.verify(identity.public_key())?;
-  Ok(record)
+  ))
 }
 
 /// Persists one verified cleanup tombstone (idempotent; a re-delivery of
@@ -258,14 +256,12 @@ pub(crate) async fn persist_cleanup_record_ctx(
 
 /// Whether `node` has a cleanup tombstone in the local store.
 pub(crate) async fn is_cleaned_ctx(store: &MetadataStore, node: &NodeId) -> Result<bool> {
-  let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
-  let snapshot = store.snapshot().await?;
-  Ok(
-    snapshot
-      .get(&namespace, &cleanup_key(node))
-      .await?
-      .is_some(),
+  records::key_present(
+    store,
+    &metadata_namespace(CLEANUP_NAMESPACE)?,
+    &cleanup_key(node),
   )
+  .await
 }
 
 /// Every known cleanup tombstone, bounded by `cap`, for sync forwarding.
@@ -286,13 +282,10 @@ pub(crate) async fn known_cleanup_records_ctx(
 pub(crate) async fn cleaned_nodes_ctx(
   store: &MetadataStore,
 ) -> Result<std::collections::BTreeSet<NodeId>> {
-  Ok(
-    known_cleanup_records_ctx(store, usize::MAX)
-      .await?
-      .iter()
-      .map(|record| record.subject().clone())
-      .collect(),
-  )
+  Ok(records::collect_subjects(
+    &known_cleanup_records_ctx(store, usize::MAX).await?,
+    CleanupRecordV1::subject,
+  ))
 }
 
 /// The durable schema of the cleanup checkpoint (GC epoch) record.

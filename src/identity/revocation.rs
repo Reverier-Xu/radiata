@@ -188,21 +188,20 @@ pub(crate) async fn sign_revocation_record(
     None => return Err(Error::not_found("revocation subject")),
   }
   let identity = context.identity();
-  let body = RevocationRecordV1::encode_signed_body(subject, expected_key, identity.node())?;
-  let signature = keys
-    .sign(
-      identity.handle(),
-      &super::signature::signature_message(REVOCATION_RECORD_V1_DOMAIN, &body),
-    )
-    .await?;
-  let record = RevocationRecordV1::new(
+  let signature = crate::identity::records::sign_tombstone(
+    context,
+    keys,
+    REVOCATION_RECORD_V1_DOMAIN,
+    "revocation record signature",
+    |identity| RevocationRecordV1::encode_signed_body(subject, expected_key, identity.node()),
+  )
+  .await?;
+  Ok(RevocationRecordV1::new(
     subject.clone(),
     expected_key.clone(),
     identity.node().clone(),
     signature,
-  );
-  record.verify(identity.public_key())?;
-  Ok(record)
+  ))
 }
 
 fn namespace() -> Result<StoreNamespace> {

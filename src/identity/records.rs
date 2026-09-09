@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use minicbor::{Decode, Encode};
 
-use super::signature::{MERGE_GRANT_V1_DOMAIN, verify_strict};
+use super::{
+  lifecycle::LocalIdentityContext,
+  signature::{MERGE_GRANT_V1_DOMAIN, signature_message, verify_strict},
+};
 use crate::{
   BoxFuture, Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey, Result, Signature,
   StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision, StoreValue,
@@ -10,6 +13,7 @@ use crate::{
   api::Entropy,
   error::fixed_bytes,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
+  provider::KeyProvider,
   storage::{
     MetadataStore,
     receipt::{ReceiptIdentity, ReceiptReferenceToken, recover_self_referenced_transaction},
@@ -304,6 +308,45 @@ where
     }
     Ok(records)
   })
+}
+
+/// The shared signed-tombstone driver behind the leave, cleanup, and
+/// revocation signers: encodes the canonical body through `body` against
+/// the local identity, signs it under `domain`, and fails closed through
+/// a strict self-verification under `label` before returning the
+/// signature. A driver assembles its record from the verified pair, so
+/// a signing or assembly bug can never emit an unverifiable tombstone.
+pub(crate) async fn sign_tombstone(
+  context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, domain: &'static [u8],
+  label: &'static str, body: impl FnOnce(&LocalIdentityV1) -> Result<Vec<u8>>,
+) -> Result<Signature> {
+  let identity = context.identity();
+  let body = body(identity)?;
+  let signature = keys
+    .sign(identity.handle(), &signature_message(domain, &body))
+    .await?;
+  verify_strict(domain, &body, identity.public_key(), &signature, label)?;
+  Ok(signature)
+}
+
+/// Whether one exact key is present in a metadata namespace (snapshot
+/// read only).
+pub(crate) async fn key_present(
+  store: &MetadataStore, namespace: &StoreNamespace, key: &StoreKey,
+) -> Result<bool> {
+  let snapshot = store.snapshot().await?;
+  Ok(snapshot.get(namespace, key).await?.is_some())
+}
+
+/// The subjects of decoded tombstone records, collected into the ordered
+/// set the exclusion sweeps consume.
+pub(crate) fn collect_subjects<T>(
+  records: &[T], subject: fn(&T) -> &NodeId,
+) -> std::collections::BTreeSet<NodeId> {
+  records
+    .iter()
+    .map(|record| subject(record).clone())
+    .collect()
 }
 
 /// The bounded per-pass tombstone GC batch shared by the leave and
