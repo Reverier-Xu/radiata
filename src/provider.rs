@@ -519,7 +519,6 @@ pub struct StoreTransaction {
 }
 
 impl StoreTransaction {
-  #[allow(dead_code)]
   pub(crate) fn new(
     id: TransactionId, base_revision: StoreRevision, operations: Vec<StoreOperation>,
   ) -> Result<Self> {
@@ -559,14 +558,12 @@ impl StoreTransaction {
   }
 }
 
-#[allow(dead_code)]
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 enum StoreOperationIdentity<'a> {
   Key(&'a StoreNamespace, &'a StoreKey),
   Receipt(&'a TransactionId),
 }
 
-#[allow(dead_code)]
 fn validate_distinct_operations(operations: &[StoreOperation]) -> Result<()> {
   let mut identities = Vec::new();
   identities
