@@ -74,6 +74,26 @@ impl Prelude {
   }
 }
 
+/// The declared/flags/message-limit validation shared by the encode
+/// (transport `encode_frame`) and decode (`split_message`) directions, so
+/// a local bug fails fast instead of emitting bytes the peer must reject.
+/// The send side deliberately skips `receive_limit`: that bound protects
+/// the receiving peer's body allocation, so only `split_message` applies
+/// it on arrival — never the sender.
+pub(crate) fn check_frame<IsDeclared>(
+  prelude: Prelude, allowed_flags: u16, message_limit: u32, is_declared: IsDeclared,
+) -> Result<()>
+where
+  IsDeclared: FnOnce(u16, u16) -> bool, {
+  if !is_declared(prelude.schema_id(), prelude.kind_id())
+    || prelude.flags() & !allowed_flags != 0
+    || prelude.body_len > message_limit
+  {
+    return Err(Error::invalid_input("wire limits"));
+  }
+  Ok(())
+}
+
 pub(crate) fn split_message<IsDeclared>(
   message: &[u8], allowed_flags: u16, message_limit: u32, receive_limit: u32,
   is_declared: IsDeclared,
@@ -81,11 +101,10 @@ pub(crate) fn split_message<IsDeclared>(
 where
   IsDeclared: FnOnce(u16, u16) -> bool, {
   let prelude = Prelude::decode(message)?;
-  if !is_declared(prelude.schema_id, prelude.kind_id)
-    || prelude.flags & !allowed_flags != 0
-    || prelude.body_len > message_limit
-    || prelude.body_len > receive_limit
-  {
+  check_frame(prelude, allowed_flags, message_limit, is_declared)?;
+  // The receive limit guards this side's body allocation; the send
+  // direction never applies it.
+  if prelude.body_len > receive_limit {
     return Err(Error::invalid_input("wire limits"));
   }
 

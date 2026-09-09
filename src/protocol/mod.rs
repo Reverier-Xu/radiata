@@ -25,6 +25,6 @@ pub(crate) use cbor::{
   CborLimits, StrictDecodeFailure, decode_canonical, decode_canonical_strict,
   decode_canonical_strict_or, encode_canonical, validate_canonical,
 };
-pub(crate) use envelope::{PRELUDE_LEN, Prelude, split_message};
+pub(crate) use envelope::{PRELUDE_LEN, Prelude, check_frame, split_message};
 pub use feature::FeatureDefinition;
 pub use tag::{DiscoveryTag, FeatureTag, ProtocolTag, QualifiedTag, TransportTag};
