@@ -185,7 +185,7 @@ impl Transport for WssTransport {
         .map_err(|_| Error::internal("listener address"))?;
       let certificate = super::cert::EphemeralCertificate::generate(&crate::api::SystemEntropy)?;
       let config = super::tls::server_config(&certificate)?;
-      let rules = crate::protocol::wire::handshake_frame_rules()?;
+      let rules = crate::protocol::wire::connection_frame_rules()?;
       let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
       Ok(Box::new(WssListener {
         listener: tcp,
@@ -215,7 +215,7 @@ impl Transport for WssTransport {
           )
         })?;
       let server_name = endpoint.server_name()?;
-      let rules = crate::protocol::wire::handshake_frame_rules()?;
+      let rules = crate::protocol::wire::connection_frame_rules()?;
       super::connection::Connection::connect(tcp, client, server_name, rules).await
     })
   }
