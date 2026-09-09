@@ -4,7 +4,9 @@
 //! over one exact node-to-key binding: any member may expel a compromised
 //! binding cluster-wide, the record rides the sync plane, is never covered
 //! by checkpoints, and is cleared only by an explicit local
-//! `purge_revocation`. Once the revocation is known committed, the node
+//! `purge_revocation` (the one deliberate exception: a local leave rotation
+//! wipes the revocation family together with the old identity). Once the
+//! revocation is known committed, the node
 //! closes the revoked identity's sessions, rejects its new sessions and
 //! online operations, refuses a new merge for it, and never adopts a new
 //! binding for it from snapshots. Everything the identity signed before

@@ -21,6 +21,9 @@ use crate::{
   provider::{Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
+// The `relay-*` table names are historical frozen names: they predate the
+// metadata-family namespace split but are persisted inside existing redb
+// files, so they must never change.
 const ENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-entries-v1");
 const DIGESTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-digests-v1");
 const RECEIPTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-receipts-v1");

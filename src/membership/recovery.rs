@@ -50,6 +50,10 @@ pub(crate) enum RecoveryState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryStep {
   pub(crate) targets: Vec<NodeId>,
+  /// The wall-clock backoff as computed BEFORE the attempt counter
+  /// advanced (the pre-increment value), and `0` when the deadline is
+  /// already due (the caller wakes immediately). It is the delay the
+  /// just-taken attempt scheduled, not a remaining wait.
   pub(crate) backoff_seconds: u64,
 }
 
