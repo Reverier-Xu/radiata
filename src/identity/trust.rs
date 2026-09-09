@@ -271,18 +271,6 @@ pub(crate) async fn accept_snapshot(
     // evidence and fails closed, failing the tick so the sync caller
     // surfaces the typed error.
     if let Err(error) =
-      store::persist_binding_ctx(store, entropy, binding.node(), binding.key()).await
-    {
-      if matches!(
-        error.kind(),
-        crate::ErrorKind::Conflict | crate::ErrorKind::NotReady
-      ) {
-        tracing::debug!(node = %binding.node(), kind = ?error.kind(), "trust binding persist skipped");
-        continue;
-      }
-      return Err(error);
-    }
-    if let Err(error) =
       store::adopt_binding_ctx(store, entropy, binding.node(), binding.key()).await
     {
       if matches!(
@@ -332,21 +320,8 @@ pub(crate) async fn refresh_issuer_snapshot(
     context.identity().public_key().clone(),
     current,
   );
-  persist_snapshot_with_bindings(store, entropy, &snapshot).await?;
+  store::persist_snapshot_ctx(store, entropy.as_ref(), &snapshot).await?;
   Ok(Some(snapshot))
-}
-
-/// Persists one verified snapshot plus its binding observations, so the
-/// issuer's own trust page and every receiver's page expose the exact
-/// binding set.
-async fn persist_snapshot_with_bindings(
-  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>, snapshot: &TrustSnapshotV1,
-) -> Result<()> {
-  store::persist_snapshot_ctx(store, entropy.as_ref(), snapshot).await?;
-  for binding in snapshot.bindings() {
-    store::persist_binding_ctx(store, entropy.as_ref(), binding.node(), binding.key()).await?;
-  }
-  Ok(())
 }
 
 #[cfg(test)]
@@ -477,6 +452,45 @@ mod tests {
     );
   }
 
+  /// A delivered snapshot's bindings surface through the single
+  /// identity-binding representation: the authoritative trusted-keys map
+  /// and the paged trust view expose the exact same pairs (the raw
+  /// trust-binding family is gone).
+  #[tokio::test]
+  async fn accept_snapshot_bindings_surface_through_the_identity_family() {
+    use super::store;
+    let factory = factory();
+    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    // The issuer must be locally bound before its snapshot is accepted.
+    store::adopt_binding_ctx(&store, &crate::api::SystemEntropy, &node(1), &key(1))
+      .await
+      .unwrap();
+    let snapshot = snapshot(3, 1, vec![(1, 1), (2, 2), (3, 3)]);
+    super::accept_snapshot(&store, &crate::api::SystemEntropy, &snapshot)
+      .await
+      .unwrap();
+
+    // The authoritative map equals the snapshot's binding set.
+    let bindings = store::trusted_bindings(&store).await.unwrap();
+    let expected: std::collections::BTreeMap<_, _> = snapshot
+      .bindings()
+      .iter()
+      .map(|binding| (binding.node().clone(), binding.key().clone()))
+      .collect();
+    assert_eq!(bindings, expected);
+
+    // The paged view (the public trust observation stream) exposes the
+    // same pairs with exact cursors, straight from the identity family.
+    let page = store::paged_trust_ctx(&store, 0, 2).await.unwrap();
+    assert_eq!(page.bindings(), &snapshot.bindings()[..2]);
+    assert_eq!(page.next(), Some(2));
+    let rest = store::paged_trust_ctx(&store, 2, 2).await.unwrap();
+    assert_eq!(rest.bindings(), &snapshot.bindings()[2..]);
+    assert_eq!(rest.next(), None);
+  }
+
   #[tokio::test]
   async fn trust_snapshot_persists_and_reloads_after_restart() {
     use super::store;
@@ -486,10 +500,10 @@ mod tests {
     // a later open on the same provider is an offline restart.
     let factory = factory();
     store::persist_snapshot(&factory, &snapshot).await.unwrap();
-    store::persist_binding(&factory, &node(2), &key(2))
+    store::adopt_binding(&factory, &node(2), &key(2))
       .await
       .unwrap();
-    store::persist_binding(&factory, &node(3), &key(3))
+    store::adopt_binding(&factory, &node(3), &key(3))
       .await
       .unwrap();
 
@@ -534,9 +548,7 @@ mod tests {
 pub(crate) mod store {
   use std::{collections::BTreeMap, sync::Arc};
 
-  use super::{
-    TRUST_BINDING_NAMESPACE, TRUST_SNAPSHOT_NAMESPACE, TrustBinding, TrustPage, TrustSnapshotV1,
-  };
+  use super::{TRUST_SNAPSHOT_NAMESPACE, TrustBinding, TrustPage, TrustSnapshotV1};
   #[cfg(test)]
   use crate::provider::StorageFactory;
   use crate::{
@@ -552,12 +564,6 @@ pub(crate) mod store {
   fn snapshot_namespace() -> Result<StoreNamespace> {
     Ok(StoreNamespace::new(crate::QualifiedTag::parse(
       TRUST_SNAPSHOT_NAMESPACE,
-    )?))
-  }
-
-  fn binding_namespace() -> Result<StoreNamespace> {
-    Ok(StoreNamespace::new(crate::QualifiedTag::parse(
-      TRUST_BINDING_NAMESPACE,
     )?))
   }
 
@@ -644,21 +650,6 @@ pub(crate) mod store {
     Ok(Some(TrustSnapshotV1::decode(&bytes)?))
   }
 
-  /// The stored trust-binding format: one version byte followed by the
-  /// 32-byte public key. Version and length are checked strictly so a
-  /// corrupted or future-format value fails closed instead of being skipped.
-  const TRUST_BINDING_VERSION: u8 = 1;
-
-  fn decode_binding_value(bytes: &[u8]) -> Result<PublicKey> {
-    if bytes.len() != 33 || bytes[0] != TRUST_BINDING_VERSION {
-      return Err(crate::Error::invalid_input("trust binding format"));
-    }
-    let key: [u8; 32] = bytes[1..33]
-      .try_into()
-      .map_err(|_| crate::Error::invalid_input("trust binding key"))?;
-    Ok(PublicKey::from_bytes(key))
-  }
-
   /// The revision parsed out of a snapshot key (`{issuer}/{revision:020}`).
   /// A malformed suffix is schema corruption, never revision zero.
   fn revision_from_key(key: &StoreKey) -> Result<u64> {
@@ -676,59 +667,24 @@ pub(crate) mod store {
       .map_err(|_| crate::Error::invalid_input("trust snapshot revision"))
   }
 
-  /// Persists one verified nonconflicting binding over the running node's
-  /// metadata store. Idempotent: an already-present binding is left in
-  /// place, so concurrent snapshot deliveries and re-deliveries cannot
-  /// conflict and abort the remaining bindings of the snapshot.
-  pub(crate) async fn persist_binding_ctx(
-    store: &MetadataStore, entropy: &dyn Entropy, node: &NodeId, key: &PublicKey,
-  ) -> Result<()> {
-    let _permit = store.write_permit().await;
-    let namespace = binding_namespace()?;
-    let store_key = StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()));
-    let snapshot = store.snapshot().await?;
-    if let Some(existing) = snapshot.get(&namespace, &store_key).await? {
-      // A re-keyed binding must not silently diverge: a known node with a
-      // different key is conflicting evidence and fails closed.
-      if decode_binding_value(existing.as_bytes())?.as_bytes() != key.as_bytes() {
-        return Err(crate::Error::not_trusted("trust binding key substitution"));
-      }
-      return Ok(());
-    }
-    let mut bytes = Vec::with_capacity(33);
-    bytes.push(TRUST_BINDING_VERSION);
-    bytes.extend_from_slice(key.as_bytes());
-    let transaction = store.prepare_transaction(
-      TransactionId::generate(entropy)?,
-      snapshot.revision().clone(),
-      vec![StoreOperation::Put {
-        namespace: namespace.clone(),
-        key: store_key,
-        expected: StoreExpectation::Absent,
-        value: StoreValue::new(Arc::from(bytes)),
-      }],
-    )?;
-    let _ = store.commit(transaction).await?;
-    Ok(())
-  }
-
   /// Paged trust observations over the running node's metadata store:
-  /// distinct bindings from verified snapshots, deterministically ordered
+  /// distinct bindings from the authoritative identity-binding family —
+  /// the one durable binding representation — deterministically ordered
   /// and bounded. The scan order is the canonical node-text order, so the
   /// page is taken by skipping `offset` entries during one streamed pass -
   /// no whole-population allocation.
   pub(crate) async fn paged_trust_ctx(
     store: &MetadataStore, offset: usize, limit: usize,
   ) -> Result<TrustPage> {
-    let namespace = binding_namespace()?;
+    let namespace = crate::identity::records::identity_binding_namespace()?;
     let snapshot = store.snapshot().await?;
     let mut scan = snapshot.scan(&namespace, &[]).await?;
     let mut skipped = 0_usize;
     let mut page: Vec<TrustBinding> = Vec::with_capacity(limit);
     let mut more_after_page = false;
     while let Some(entry) = scan.next().await? {
-      let node = NodeId::parse(&String::from_utf8_lossy(entry.key().as_bytes()))?;
-      let key = decode_binding_value(entry.value().as_bytes())?;
+      let binding = crate::identity::records::IdentityBindingV1::decode(entry.value().as_bytes())
+        .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
       if skipped < offset {
         skipped += 1;
         continue;
@@ -739,7 +695,10 @@ pub(crate) mod store {
         more_after_page = true;
         break;
       }
-      page.push(TrustBinding::new(node, key));
+      page.push(TrustBinding::new(
+        binding.node().clone(),
+        binding.public_key().clone(),
+      ));
     }
     // The next cursor is exact only when the page filled and a further
     // entry was already fetched past it.
@@ -751,11 +710,12 @@ pub(crate) mod store {
     Ok(TrustPage::new(page, next))
   }
 
-  /// The durable trusted bindings as observed from the local identity
-  /// store (`identity_binding_namespace`): every binding this node has
+  /// The durable trusted bindings from the authoritative identity-binding
+  /// family (`identity_binding_namespace`): every binding this node has
   /// committed from a verified grant or snapshot adoption. This is the
-  /// authoritative trusted-keys map for membership page verification and
-  /// the recovery online set.
+  /// single trusted-keys representation — it feeds membership page
+  /// verification, the recovery online set, and the paged trust view
+  /// alike.
   pub(crate) async fn trusted_bindings(
     store: &MetadataStore,
   ) -> Result<BTreeMap<NodeId, PublicKey>> {
@@ -790,14 +750,15 @@ pub(crate) mod store {
     Ok(false)
   }
 
-  /// Commits one verified snapshot-adjacent binding into the authoritative
-  /// identity store so member-mode dialing and page verification can use
-  /// it (the grant-carrying reconnect path). A node already bound to a
-  /// different key is a key-substitution conflict and fails closed. A
-  /// locally revoked identity never gains a new binding through this
-  /// path: re-delivery of its existing binding stays idempotent, but a
-  /// fresh adoption is refused (revocation removes the authority to gain
-  /// trust through this node).
+  /// Commits one verified binding into the authoritative identity-binding
+  /// family — the single durable binding representation — so member-mode
+  /// dialing, page verification, and the trust view can all use it (the
+  /// grant-carrying reconnect path). A node already bound to a different
+  /// key is a key-substitution conflict and fails closed. A locally
+  /// revoked identity never gains a new binding through this path:
+  /// re-delivery of its existing binding stays idempotent, but a fresh
+  /// adoption is refused (revocation removes the authority to gain trust
+  /// through this node).
   pub(crate) async fn adopt_binding_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, node: &NodeId, key: &PublicKey,
   ) -> Result<()> {
@@ -854,14 +815,14 @@ pub(crate) mod store {
     latest_snapshot_ctx(&store, trusted_issuer).await
   }
 
-  /// Persists one verified nonconflicting binding over a standalone
+  /// Adopts one verified nonconflicting binding over a standalone
   /// factory handle (test-only restart harness).
   #[cfg(test)]
-  pub(crate) async fn persist_binding(
+  pub(crate) async fn adopt_binding(
     factory: &Arc<dyn StorageFactory>, node: &NodeId, key: &PublicKey,
   ) -> Result<()> {
     let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
-    persist_binding_ctx(&store, &crate::api::SystemEntropy, node, key).await
+    adopt_binding_ctx(&store, &crate::api::SystemEntropy, node, key).await
   }
 
   /// Paged trust observations over a standalone factory handle (test-only
@@ -874,6 +835,3 @@ pub(crate) mod store {
     paged_trust_ctx(&store, offset, limit).await
   }
 }
-
-/// The durable namespace of one snapshot binding observation.
-pub(crate) use crate::storage::families::TRUST_BINDING_NAMESPACE;
