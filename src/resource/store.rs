@@ -37,8 +37,9 @@ pub(crate) enum ResourceCommitOutcome {
   Installed(#[allow(dead_code)] CommitReceipt),
   /// A greater tuple already occupies the register: the write is accepted
   /// but stores nothing and wins nothing (accepted writes may lose tuple
-  /// order; losers stay harmless).
-  Superseded(ResourceRecordV1),
+  /// order; losers stay harmless). The payload names the stored winner;
+  /// production callers deliberately ignore it, tests read it.
+  Superseded(#[allow(dead_code)] ResourceRecordV1),
   /// The commit ended indeterminate: the caller must reconcile the
   /// pending transaction identity before knowing whether old or new
   /// metadata won. The register reopens to exactly one of them.

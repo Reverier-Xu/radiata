@@ -74,6 +74,9 @@ pub(crate) struct ReceiptIdentity {
 }
 
 impl ReceiptIdentity {
+  /// Rebuilds the identity of a committed transaction (contract-suite
+  /// fixtures; production paths carry identities explicitly).
+  #[cfg(any(test, fuzzing))]
   pub(super) fn from_receipt(receipt: &CommitReceipt) -> Self {
     Self {
       transaction: receipt.transaction().clone(),
@@ -133,7 +136,10 @@ impl ReceiptReferenceToken {
 pub(crate) enum ReceiptReferenceChange {
   /// Adds tokens to the fresh transaction's own receipt.
   AddSelf(Vec<ReceiptReferenceToken>),
-  /// Adds tokens to a prior active receipt target.
+  /// Adds tokens to a prior active receipt target (test-only direct
+  /// reference paths; production references flow through `AddSelf` and
+  /// `Remove`).
+  #[cfg(test)]
   Add {
     target: ReceiptIdentity,
     tokens: Vec<ReceiptReferenceToken>,
@@ -151,6 +157,9 @@ pub(super) struct GroupedReceiptChange {
   tokens: Vec<ReceiptReferenceToken>,
 }
 
+/// The direct reference-commit classification (test-only: production
+/// committers read the `CommitOutcome` directly).
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ReceiptReferenceOutcome {
   Applied(CommitReceipt),
@@ -214,6 +223,11 @@ impl MetadataStore {
     prepare_internal_transaction(id, snapshot.revision().clone(), operations)
   }
 
+  /// Adds one edge token to a prior active receipt in one conditional
+  /// transaction. Test-only: production reference changes are journaled
+  /// through `prepare_transaction_with_receipt_changes`, while the
+  /// contract suite exercises the direct state machine here.
+  #[cfg(test)]
   pub(super) async fn add_receipt_reference(
     &self, target: &ReceiptIdentity, token: &ReceiptReferenceToken, operation_id: TransactionId,
   ) -> crate::Result<ReceiptReferenceOutcome> {
@@ -275,6 +289,11 @@ impl MetadataStore {
     map_reference_outcome(self.commit(prepared).await?)
   }
 
+  /// Removes one edge token from a prior active receipt in one
+  /// conditional transaction. Test-only: production removals flow
+  /// through the journaled prepare path (pending cleanup) or the
+  /// retention sweep.
+  #[cfg(test)]
   pub(super) async fn remove_receipt_reference(
     &self, target: &ReceiptIdentity, token: &ReceiptReferenceToken, operation_id: TransactionId,
   ) -> crate::Result<ReceiptReferenceOutcome> {
@@ -564,6 +583,8 @@ pub(super) fn prepare_internal_transaction(
   StoreTransaction::new(id, base_revision, operations).map(PreparedTransaction)
 }
 
+/// Maps one direct reference commit onto its classified outcome.
+#[cfg(test)]
 fn map_reference_outcome(outcome: CommitOutcome) -> crate::Result<ReceiptReferenceOutcome> {
   Ok(match outcome {
     CommitOutcome::Committed(receipt) => ReceiptReferenceOutcome::Applied(receipt),
@@ -595,6 +616,7 @@ pub(super) fn group_receipt_changes(
   for change in changes {
     let (target, remove, tokens) = match change {
       ReceiptReferenceChange::AddSelf(tokens) => (None, false, tokens),
+      #[cfg(test)]
       ReceiptReferenceChange::Add { target, tokens } => (Some(target), false, tokens),
       ReceiptReferenceChange::Remove { target, tokens } => (Some(target), true, tokens),
     };
@@ -809,29 +831,39 @@ async fn build_self_reference_operations(
 /// order, and index audit cannot drift between sites. The optional
 /// single-token edge (add/remove paths) is read between the head and
 /// anchor reads, exactly as the pre-dedup sites did: the read order is
-/// observable to fault-injecting providers and pinned by tests.
+/// observable to fault-injecting providers and pinned by tests. Only
+/// the test-only direct reference paths consume the head and edge
+/// values themselves, so those fields exist in test builds only.
 struct ReceiptReferenceState {
   head_key: StoreKey,
   anchor_key: StoreKey,
+  #[cfg(test)]
   edge_key: Option<StoreKey>,
+  #[cfg(test)]
   head: Option<StoreValue>,
   /// The edge value when a token was given: `Some` when the edge exists,
   /// `None` when absent (or no token was requested).
+  #[cfg(test)]
   edge: Option<StoreValue>,
   anchor: Option<StoreValue>,
   audited_count: u64,
 }
 
+#[cfg_attr(not(test), allow(unused_variables))]
 async fn load_reference_state(
   snapshot: &dyn StoreSnapshot, namespace: &StoreNamespace, transaction: &TransactionId,
   edge_token: Option<&ReceiptReferenceToken>,
 ) -> crate::Result<ReceiptReferenceState> {
   let head_key = reference_head_key(transaction)?;
+  // The head read stays in every build: the read order between the head,
+  // edge, and anchor reads is observable to fault-injecting providers.
   let head = snapshot.get(namespace, &head_key).await?;
+  #[cfg(test)]
   let edge_key = match edge_token {
     Some(token) => Some(reference_edge_key(transaction, token)?),
     None => None,
   };
+  #[cfg(test)]
   let edge = match &edge_key {
     Some(key) => snapshot.get(namespace, key).await?,
     None => None,
@@ -849,11 +881,14 @@ async fn load_reference_state(
   Ok(ReceiptReferenceState {
     head_key,
     anchor_key,
+    #[cfg(test)]
+    edge_key,
+    #[cfg(test)]
     head,
+    #[cfg(test)]
+    edge,
     anchor,
     audited_count,
-    edge_key,
-    edge,
   })
 }
 

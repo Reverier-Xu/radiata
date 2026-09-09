@@ -158,6 +158,10 @@ pub(crate) struct MigrationEdge {
 }
 
 impl MigrationEdge {
+  /// Builds one edge. Test-only today: the production chain is the
+  /// unedged baseline, so only fixtures and contract lanes register
+  /// edges.
+  #[cfg(test)]
   pub(crate) fn new(
     from: &'static str, to: &'static str, tag: &'static str, digest: Digest,
     transform: Option<MigrationTransform>,
@@ -350,11 +354,13 @@ const MIGRATION_TRANSACTION_DOMAIN: &[u8] = b"radiata.woooo.tech/migration-trans
 
 /// The domain-separation string for the migration implementation digest.
 /// Must stay byte-identical forever (it anchors edge identity).
+#[cfg(test)]
 const MIGRATION_IMPLEMENTATION_DOMAIN: &[u8] = b"radiata.woooo.tech/migration-implementation-v1";
 
 /// Derives the domain-separated implementation digest of one migration
 /// tag. Production edge registration and the compatibility freeze
 /// reader share this single derivation.
+#[cfg(test)]
 pub(crate) fn implementation_digest(tag: &str) -> Digest {
   let mut hasher = Sha256::new();
   hasher.update(MIGRATION_IMPLEMENTATION_DOMAIN);
@@ -385,10 +391,18 @@ fn migration_transaction_value(parts: &[&[u8]]) -> Result<u128> {
 // version, the current target, and each declared edge tag. These
 // literals are frozen; every migration fixture and the compatibility
 // manifest must agree with them byte-for-byte.
+/// The frozen fixture chain used by the migration tests and the
+/// compatibility manifest tests. These literals are frozen; every
+/// fixture must agree with them byte-for-byte.
+#[cfg(test)]
 pub(crate) const BASE_VERSION: &str = "radiata.woooo.tech/schemas/metadata-test-v1";
+#[cfg(test)]
 pub(crate) const V2: &str = "radiata.woooo.tech/schemas/metadata-test-v2";
+#[cfg(test)]
 pub(crate) const V3: &str = "radiata.woooo.tech/schemas/metadata-test-v3";
+#[cfg(test)]
 pub(crate) const EDGE_ONE_TAG: &str = "radiata.woooo.tech/schemas/migration-edge-one-v1";
+#[cfg(test)]
 pub(crate) const EDGE_TWO_TAG: &str = "radiata.woooo.tech/schemas/migration-edge-two-v1";
 
 #[cfg(test)]

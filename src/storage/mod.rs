@@ -3,7 +3,9 @@ use std::{
   time::Duration,
 };
 
-use self::receipt::{HostWallClock, PreparedTransaction, WallClock};
+#[cfg(test)]
+use self::receipt::HostWallClock;
+use self::receipt::{PreparedTransaction, WallClock};
 use crate::{
   CommitOutcome, CommitReceipt, Digest, Error, ErrorKind, ProviderErrorContext, ProviderErrorKind,
   ReconcileOutcome, Result, StoreRequirements, TransactionId,
@@ -122,7 +124,6 @@ enum CommitState {
   },
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct MetadataStore {
   provider: Box<dyn Storage>,
@@ -138,13 +139,11 @@ pub(crate) struct MetadataStore {
   receipt_retention: Duration,
 }
 
-#[allow(dead_code)]
 struct ProviderCall<'a> {
   state: &'a Mutex<CommitState>,
   active: bool,
 }
 
-#[allow(dead_code)]
 impl ProviderCall<'_> {
   fn complete(mut self) {
     self.active = false;
@@ -167,14 +166,18 @@ impl Drop for ProviderCall<'_> {
   }
 }
 
-#[allow(dead_code)]
 impl MetadataStore {
+  /// Opens a fresh (or existing, plain-ready) metadata store. Test-only
+  /// today: production opens go through the journal-backed recovered and
+  /// pending-recovery paths instead.
+  #[cfg(test)]
   pub(crate) async fn open(
     factory: &Arc<dyn StorageFactory>, receipt_retention: Duration,
   ) -> Result<Self> {
     Self::open_with_clock(factory, receipt_retention, Arc::new(HostWallClock)).await
   }
 
+  #[cfg(test)]
   pub(crate) async fn open_recovered(
     factory: &Arc<dyn StorageFactory>, receipt_retention: Duration, transaction: TransactionId,
     digest: Digest,
@@ -189,12 +192,16 @@ impl MetadataStore {
     .await
   }
 
+  /// The clock-injected open used by the storage contract suite and the
+  /// unit tests, so deterministic clocks drive commit-timestamp behavior.
+  #[cfg(any(test, fuzzing))]
   async fn open_with_clock(
     factory: &Arc<dyn StorageFactory>, receipt_retention: Duration, clock: Arc<dyn WallClock>,
   ) -> Result<Self> {
     Self::open_with_state(factory, receipt_retention, clock, CommitState::Ready).await
   }
 
+  #[cfg(test)]
   async fn open_recovered_with_clock(
     factory: &Arc<dyn StorageFactory>, receipt_retention: Duration, transaction: TransactionId,
     digest: Digest, clock: Arc<dyn WallClock>,
@@ -565,14 +572,11 @@ pub(crate) mod test_util;
 pub(crate) mod families;
 #[cfg(feature = "json")]
 pub(crate) mod json;
-#[allow(dead_code)]
 pub(crate) mod migration;
 
 #[cfg(all(test, unix, feature = "json", feature = "redb"))]
 pub(crate) mod mixed_e2e;
-#[allow(dead_code)]
 pub(crate) mod pending;
-#[allow(dead_code)]
 pub(crate) mod receipt;
 #[cfg(feature = "redb")]
 pub(crate) mod redb;

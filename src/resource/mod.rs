@@ -18,8 +18,6 @@
 //! removal rank, digest, or signature) fails verification before any
 //! comparison or persistence.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{fmt, sync::Arc};
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
@@ -447,6 +445,7 @@ impl ResourceRecordV1 {
   /// Signs the canonical body with the given signing key and assembles the
   /// record (test and vector construction; production callers go through
   /// [`ResourceRecordV1::sign_with_provider`]).
+  #[cfg(test)]
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn sign(
     name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
@@ -542,6 +541,9 @@ impl ResourceRecordV1 {
     time::from_millis(self.timestamp_millis)
   }
 
+  /// The host wall-clock timestamp in milliseconds (test-only: readers
+  /// consume the normalized time view instead).
+  #[cfg(test)]
   pub(crate) const fn timestamp_millis(&self) -> u64 {
     self.timestamp_millis
   }

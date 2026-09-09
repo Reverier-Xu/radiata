@@ -339,18 +339,24 @@ impl PendingTransactionV1 {
     })
   }
 
+  /// Test-only accessors over the decoded record; production reads the
+  /// fields through `recover_identity` and `encode` instead.
+  #[cfg(test)]
   pub(super) fn purpose(&self) -> &str {
     &self.purpose
   }
 
+  #[cfg(test)]
   pub(super) const fn transaction(&self) -> &TransactionId {
     &self.transaction
   }
 
+  #[cfg(test)]
   pub(super) const fn base_revision(&self) -> &StoreRevision {
     &self.base_revision
   }
 
+  #[cfg(test)]
   pub(super) fn planned_operations(&self) -> &[StoreOperation] {
     &self.planned_operations
   }
