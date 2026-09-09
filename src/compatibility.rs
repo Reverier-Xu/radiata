@@ -86,9 +86,9 @@ const CREDENTIAL_USE_TAG: &str = "radiata.woooo.tech/schemas/credential-use-v1";
 const MERGE_GRANT_TAG: &str = "radiata.woooo.tech/schemas/merge-grant-v1";
 const KEY_DELETED_TAG: &str = "radiata.woooo.tech/schemas/key-deleted-v1";
 
-/// The frozen packet frame readers. The `open` body appears in both the
-/// current routed shape and the previous direct shape; the shared reader
-/// accepts both, so the previous fixture shape stays decodable.
+/// The frozen packet frame readers. The `open` reader accepts the one
+/// canonical open shape: direct frames omit the route element, routed
+/// frames carry it.
 fn read_packet_open(bytes: &[u8]) -> Result<Vec<u8>> {
   let frame = wire::decode_open(bytes, FREEZE_CBOR_LIMITS)?;
   wire::encode_open(&frame)
@@ -169,8 +169,8 @@ fn read_migration_schema_record(bytes: &[u8]) -> Result<Vec<u8>> {
 /// compatibility suite asserts the exact per-family counts, so removing,
 /// renaming, or adding a vector without a plan amendment fails.
 pub(crate) const VECTOR_MANIFEST: &[CompatibilityVector] = &[
-  // Packet frame bodies. The direct open is the previous fixture shape
-  // (no route envelope); the routed open is the current shape.
+  // Packet frame bodies: the direct open omits the route element, the
+  // routed open carries it — one canonical wire shape, two frame variants.
   CompatibilityVector {
     family: CompatibilityFamily::Packet,
     name: "open-direct-v1",
@@ -539,17 +539,17 @@ mod tests {
     assert_eq!(VECTOR_MANIFEST.len(), 21);
   }
 
-  /// The previous fixture shapes stay accepted by the current readers:
-  /// the direct packet open decodes without a route envelope, the record
+  /// The frozen vector shapes stay accepted by the current readers: the
+  /// direct packet open decodes without a route envelope, the record
   /// version 1 node descriptor decodes to an empty capability label set,
   /// and the previous resource fixture keeps its exact logical tuple
   /// version.
   #[test]
   fn previous_reader_shapes_stay_accepted() {
-    // Packet open, previous shape: no route envelope.
+    // Packet open, direct variant: canonical, no route element.
     let direct = wire::decode_open(&bytes("open-direct-v1"), CONTROL_CBOR_LIMITS).unwrap();
     assert!(direct.route.is_none());
-    // Packet open, current shape: routed envelope present.
+    // Packet open, routed variant: routed envelope present.
     let routed = wire::decode_open(&bytes("open-routed-v1"), CONTROL_CBOR_LIMITS).unwrap();
     assert!(routed.route.is_some());
 

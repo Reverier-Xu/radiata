@@ -3,11 +3,11 @@ status = "accepted"
 target = "wire_decode"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
 minimizer = { tool = "none", version = "0" }
-aggregate = { entry_count = 10, total_bytes = 863 }
+aggregate = { entry_count = 10, total_bytes = 871 }
 
 [[entry]]
-digest = "3015c3df6c7ad84650d01266c263738389b0a45951bd42f61db6f97bb610eedc"
-byte_count = 167
+digest = "a128e9f015c02cc6392fcc59bcfb965072298c54be938d91f9d5516e638c29ac"
+byte_count = 171
 origin = "golden-fixture"
 lineage = "compatibility manifest open-direct-v1"
 schema_tags = ["packet kind 0x0010..0x0013"]
@@ -55,8 +55,8 @@ lineage = "truncated open frame"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
-digest = "4c06e5be613fe23ee392105bc7ac7ac5a64c5010b09f75c74c6879520f494688"
-byte_count = 167
+digest = "e5d62cd6fe9bd98c29540e7503965e7a84eac893ef339aa24d43f3d63c811682"
+byte_count = 171
 origin = "synthetic-generator"
 lineage = "bit-inverted open frame"
 schema_tags = ["packet kind 0x0010..0x0013"]
@@ -69,8 +69,8 @@ lineage = "oversized prelude body length"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
-digest = "5035f34690ec4fc3486a51e2028703b7fac5238d21cf4b0b0c13d73396aacb56"
-byte_count = 166
+digest = "937cae60ed3316bb8bb5f24c6a051954c3e6bb55bafba419d14629d49e5f6a4f"
+byte_count = 170
 origin = "synthetic-generator"
 lineage = "open frame missing final byte"
 schema_tags = ["packet kind 0x0010..0x0013"]
