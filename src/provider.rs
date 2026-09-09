@@ -683,11 +683,50 @@ pub trait StorageFactory: fmt::Debug + Send + Sync + 'static {
   -> BoxFuture<'a, Result<Box<dyn Storage>>>;
 }
 
+/// The durable, conditionally-transactional key-value storage contract.
+///
+/// One store owns a single key space of ([`StoreNamespace`],
+/// [`StoreKey`]) records plus the receipts of the transactions that
+/// changed them. Every adapter must provide the same observable
+/// behavior at the four contract points:
+///
+/// - **Commit ordering.** [`Storage::commit`] evaluates one prepared
+///   transaction against the committing state in a fixed order, and the first
+///   failing check wins without applying anything: the receipt replay first (a
+///   transaction id that already carries a receipt returns
+///   [`CommitOutcome::Committed`] when the prepared operation digest matches —
+///   the idempotent replay — and [`CommitOutcome::Conflict`] otherwise), then
+///   the base-revision check ([`CommitOutcome::Conflict`] for a transaction
+///   prepared on any revision but the current one), then every operation's
+///   conditional expectation including `ForgetReceipt`'s digest expectation
+///   ([`CommitOutcome::Conflict`] on the first miss). Only then do the changes
+///   apply atomically, the revision advances by exactly one, and the receipt
+///   persists under the transaction's own identity, so a retry of the same id
+///   and digest replays to the same receipt.
+/// - **Unknown outcomes.** An adapter that cannot decide whether a commit
+///   applied (a crash or an indeterminate backend answer) must return
+///   [`CommitOutcome::Unknown`] carrying the exact transaction identity it was
+///   handed — the original id and operation digest, never a guess — and leave
+///   classification to [`Storage::reconcile`].
+/// - **Snapshot immutability.** [`Storage::snapshot`] observes exactly one
+///   revision; later commits never mutate an outstanding snapshot, so a
+///   decision made on it stays authoritative until the caller's own commit
+///   lands.
+/// - **Reconciliation.** [`Storage::reconcile`] classifies a past transaction
+///   exactly three ways: [`ReconcileOutcome::Committed`] when a receipt exists
+///   for the id with the exact digest, [`ReconcileOutcome::DigestConflict`]
+///   when the id exists with a different digest, and
+///   [`ReconcileOutcome::Aborted`] when no receipt exists (the transaction
+///   never applied; a fresh prepare may retry it).
 pub trait Storage: fmt::Debug + Send + Sync + 'static {
   fn capabilities(&self) -> StoreCapabilities;
 
   fn snapshot<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn StoreSnapshot>>>;
 
+  /// Atomically applies one prepared conditional transaction in the
+  /// contract order documented on [`Storage`]: receipt replay, base
+  /// revision, conditional expectations, then the atomic change
+  /// application with the single revision bump and receipt persistence.
   fn commit<'a>(&'a self, transaction: StoreTransaction) -> BoxFuture<'a, Result<CommitOutcome>>;
 
   fn reconcile<'a>(
