@@ -8,6 +8,11 @@
 //! wrong issuers in a decoded record's own marking, stale revisions, and
 //! `NodeId` key substitutions against locally admitted bindings are rejected
 //! without selecting a winner.
+//!
+//! Lifecycle: delivered remote snapshots are never persisted —
+//! `accept_snapshot` adopts their bindings immediately. Only the
+//! issuer's own refresh persists its snapshot, and that record is the
+//! revision basis the next refresh reads back.
 
 use std::sync::Arc;
 
@@ -113,9 +118,13 @@ impl TrustSnapshotV1 {
     &self.bindings
   }
 
-  /// Encodes the full wire record (one 64 KiB control-bound record: at
-  /// roughly 870 bindings that bound saturates, so larger memberships
-  /// heal through the bounded snapshot resend cadence, never paging).
+  /// Encodes the full wire record. One record is bounded by the 64 KiB
+  /// control-body limit (roughly 870 bindings saturate it) and never
+  /// pages: once a membership outgrows the bound, encoding fails, the
+  /// sync tick skips that round's snapshot send, and descriptor-page
+  /// anti-entropy continues unaffected. Reaching that scale needs the
+  /// protocol-level pagination redesign (docs/snapshot-analysis.md,
+  /// suggestion 3), not a wider bound here.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical(&self.wire(), crate::protocol::CONTROL_CBOR_LIMITS)
   }
