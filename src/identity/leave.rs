@@ -28,6 +28,7 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{
+  canonical::canonical_record,
   deletion::delete_unreferenced_key,
   lifecycle::{CommitWithReconcile, LocalIdentityContext, commit_with_reconcile},
   records,
@@ -35,10 +36,7 @@ use super::{
 };
 use crate::{
   Error, KeyHandle, KeyOperationId, NodeId, PublicKey, Result, StoreExpectation, StoreKey,
-  StoreNamespace, StoreOperation, StoreValue, TransactionId,
-  api::Entropy,
-  protocol::{decode_canonical, encode_canonical},
-  provider::KeyProvider,
+  StoreNamespace, StoreOperation, StoreValue, TransactionId, api::Entropy, provider::KeyProvider,
   storage::MetadataStore,
 };
 
@@ -64,63 +62,25 @@ pub(crate) struct LeaveIntentV1 {
   replacement_operation: KeyOperationId,
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct LeaveIntentWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  former_node: String,
-  #[n(3)]
-  former_key: ByteVec,
-  #[n(4)]
-  former_handle: ByteVec,
-  #[n(5)]
-  replacement_node: String,
-  #[n(6)]
-  replacement_operation: String,
+canonical_record! {
+  wire LeaveIntentWire for LeaveIntentV1 {
+    schema LEAVE_INTENT_SCHEMA,
+    version u16 INTENT_VERSION,
+    limits INTENT_LIMITS,
+    decode [lenient remap "leave intent", header_err "leave intent schema"]
+    fields {
+      #[n(2)] former_node = former_node: String => node()
+      #[n(3)] former_key = former_key: ByteVec => key32("leave intent key")
+      #[n(4)] former_handle = former_handle: ByteVec => handle()
+      #[n(5)] replacement_node = replacement_node: String => node()
+      #[n(6)] replacement_operation = replacement_operation: String => text(KeyOperationId)
+    }
+  }
 }
 
 impl LeaveIntentV1 {
   fn former_handle(&self) -> &KeyHandle {
     &self.former_handle
-  }
-
-  fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &LeaveIntentWire {
-        schema: LEAVE_INTENT_SCHEMA.to_owned(),
-        record_version: INTENT_VERSION,
-        former_node: self.former_node.as_str().to_owned(),
-        former_key: ByteVec::from(self.former_key.as_bytes().to_vec()),
-        former_handle: ByteVec::from(self.former_handle.expose_provider_handle().to_vec()),
-        replacement_node: self.replacement_node.as_str().to_owned(),
-        replacement_operation: self.replacement_operation.as_str().to_owned(),
-      },
-      INTENT_LIMITS,
-    )
-  }
-
-  fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: LeaveIntentWire =
-      decode_canonical(bytes, INTENT_LIMITS).map_err(|_| Error::invalid_input("leave intent"))?;
-    if wire.schema != LEAVE_INTENT_SCHEMA || wire.record_version != INTENT_VERSION {
-      return Err(Error::invalid_input("leave intent schema"));
-    }
-    Ok(Self {
-      former_node: NodeId::parse(&wire.former_node)?,
-      former_key: PublicKey::from_bytes(
-        <[u8; 32]>::try_from(wire.former_key.as_slice())
-          .map_err(|_| Error::invalid_input("leave intent key"))?,
-      ),
-      former_handle: KeyHandle::from_provider_bytes(Arc::from(
-        wire.former_handle.as_slice().to_vec(),
-      ))?,
-      replacement_node: NodeId::parse(&wire.replacement_node)?,
-      replacement_operation: KeyOperationId::parse(&wire.replacement_operation)?,
-    })
   }
 
   /// The deterministic fixture intent for round-trip tests.
@@ -153,41 +113,24 @@ pub(crate) const LEAVE_RECORD_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/lea
 const LEAVE_RECORD_LIMITS: crate::protocol::CborLimits =
   crate::protocol::CborLimits::new(1, 8, 1_024);
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct LeaveRecordBodyWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  node: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  public_key: Vec<u8>,
-  /// Signed host wall-clock UNIX milliseconds: the removal timestamp the
-  /// checkpoint GC compares against its watermark.
-  #[n(4)]
-  timestamp_millis: u64,
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct LeaveRecordWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  node: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  public_key: Vec<u8>,
-  #[n(4)]
-  timestamp_millis: u64,
-  #[n(5)]
-  #[cbor(with = "minicbor::bytes")]
-  signature: Vec<u8>,
+canonical_record! {
+  wire LeaveRecordWire for LeaveRecordV1 vis [pub(crate)] {
+    schema LEAVE_RECORD_SCHEMA,
+    version u16 1,
+    limits LEAVE_RECORD_LIMITS,
+    decode [strict remap "leave record", canonical "leave record canonical form", header_err "leave record schema"]
+    fields {
+      #[n(2)] node = node: String => node()
+      #[n(3)] public_key = public_key: ByteVec => key32("leave record key")
+      #[n(4)] timestamp_millis = timestamp_millis: u64 => stamp()
+      #[n(5)] signature = signature: ByteVec => sig("leave record signature")
+    }
+    signed_body wire LeaveRecordBodyWire fn encode_signed_body {
+      #[n(2)] node: &NodeId as node: String => node()
+      #[n(3)] public_key: &PublicKey as public_key: ByteVec => key32()
+      #[n(4)] timestamp_millis: u64 as timestamp_millis: u64 => stamp()
+    }
+  }
 }
 
 /// One owner-signed leave record: a terminal removal
@@ -229,22 +172,6 @@ impl LeaveRecordV1 {
     self.timestamp_millis
   }
 
-  /// Encodes the canonical body the owner signs.
-  pub(crate) fn encode_signed_body(
-    node: &NodeId, public_key: &PublicKey, timestamp_millis: u64,
-  ) -> Result<Vec<u8>> {
-    encode_canonical(
-      &LeaveRecordBodyWire {
-        schema: LEAVE_RECORD_SCHEMA.to_owned(),
-        record_version: 1,
-        node: node.as_str().to_owned(),
-        public_key: public_key.as_bytes().to_vec(),
-        timestamp_millis,
-      },
-      LEAVE_RECORD_LIMITS,
-    )
-  }
-
   /// Verifies the owner signature against the permanently retained binding.
   pub(crate) fn verify(&self) -> Result<()> {
     crate::identity::signature::verify_strict(
@@ -254,44 +181,6 @@ impl LeaveRecordV1 {
       &self.signature,
       "leave record signature",
     )
-  }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &LeaveRecordWire {
-        schema: LEAVE_RECORD_SCHEMA.to_owned(),
-        record_version: 1,
-        node: self.node.as_str().to_owned(),
-        public_key: self.public_key.as_bytes().to_vec(),
-        timestamp_millis: self.timestamp_millis,
-        signature: self.signature.as_bytes().to_vec(),
-      },
-      LEAVE_RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: LeaveRecordWire = crate::protocol::decode_canonical_strict(
-      bytes,
-      LEAVE_RECORD_LIMITS,
-      "leave record canonical form",
-    )
-    .map_err(|_| Error::invalid_input("leave record"))?;
-    if wire.schema != LEAVE_RECORD_SCHEMA || wire.record_version != 1 {
-      return Err(Error::invalid_input("leave record schema"));
-    }
-    Ok(Self {
-      node: NodeId::parse(&wire.node)?,
-      public_key: PublicKey::from_bytes(
-        <[u8; 32]>::try_from(wire.public_key.as_slice())
-          .map_err(|_| Error::invalid_input("leave record key"))?,
-      ),
-      timestamp_millis: wire.timestamp_millis,
-      signature: crate::Signature::from_bytes(
-        <[u8; 64]>::try_from(wire.signature.as_slice())
-          .map_err(|_| Error::invalid_input("leave record signature"))?,
-      ),
-    })
   }
 }
 
