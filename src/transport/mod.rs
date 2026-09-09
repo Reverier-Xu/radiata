@@ -32,7 +32,7 @@ pub(crate) mod verify;
 pub(crate) mod ws;
 
 pub use endpoint::Endpoint;
-pub use registry::{ChannelBinding, Discovery, DiscoveryPage, EndpointCandidate, PageCursor};
+pub use registry::PageCursor;
 
 /// Shared test harness for the transport module lanes.
 #[cfg(test)]

@@ -170,10 +170,6 @@ impl radiata::ApplyReceiptRetention
 pub fn radiata::ApplyReceiptRetention::new() -> Self
 impl radiata::Command for radiata::ApplyReceiptRetention
 pub type radiata::ApplyReceiptRetention::Output = radiata::ReceiptRetentionReport
-pub struct radiata::ChannelBinding(_)
-impl radiata::ChannelBinding
-pub const fn radiata::ChannelBinding::as_bytes(&self) -> &[u8; 32]
-pub const fn radiata::ChannelBinding::from_tls_exporter([u8; 32]) -> Self
 pub struct radiata::CleanupNode
 impl radiata::CleanupNode
 pub fn radiata::CleanupNode::new(radiata::NodeId) -> Self
@@ -211,11 +207,6 @@ impl radiata::DisconnectPeer
 pub fn radiata::DisconnectPeer::new(radiata::NodeId) -> Self
 impl radiata::Command for radiata::DisconnectPeer
 pub type radiata::DisconnectPeer::Output = ()
-pub struct radiata::DiscoveryPage
-impl radiata::DiscoveryPage
-pub fn radiata::DiscoveryPage::items(&self) -> &[radiata::EndpointCandidate]
-pub fn radiata::DiscoveryPage::new(alloc::vec::Vec<radiata::EndpointCandidate>, core::option::Option<radiata::PageCursor>) -> radiata::Result<Self>
-pub const fn radiata::DiscoveryPage::next(&self) -> core::option::Option<&radiata::PageCursor>
 pub struct radiata::DiscoveryTag(_)
 impl radiata::DiscoveryTag
 pub fn radiata::DiscoveryTag::as_str(&self) -> &str
@@ -239,12 +230,6 @@ pub fn radiata::Endpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt
 impl core::str::traits::FromStr for radiata::Endpoint
 pub type radiata::Endpoint::Err = radiata::Error
 pub fn radiata::Endpoint::from_str(&str) -> radiata::Result<Self>
-pub struct radiata::EndpointCandidate
-impl radiata::EndpointCandidate
-pub const fn radiata::EndpointCandidate::endpoint(&self) -> &radiata::Endpoint
-pub fn radiata::EndpointCandidate::new(radiata::Endpoint) -> Self
-pub const fn radiata::EndpointCandidate::priority(&self) -> i32
-pub fn radiata::EndpointCandidate::with_priority(self, i32) -> Self
 pub struct radiata::Error
 impl radiata::Error
 pub fn radiata::Error::context(&self) -> &'static str
@@ -1018,8 +1003,6 @@ impl radiata::Command for radiata::StopListener
 pub type radiata::StopListener::Output = ()
 impl radiata::Command for radiata::UpdateNodeMetadata
 pub type radiata::UpdateNodeMetadata::Output = radiata::MemberView
-pub trait radiata::Discovery: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::Discovery::discover<'a>(&'a self, core::option::Option<&'a radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::DiscoveryPage>>
 pub trait radiata::Event: radiata::operation::private::Sealed + core::clone::Clone + core::marker::Send + core::marker::Sync + 'static
 impl radiata::Event for radiata::IdentityReplaced
 impl radiata::Event for radiata::MemberChanged

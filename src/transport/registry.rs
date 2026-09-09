@@ -12,23 +12,6 @@ use std::{fmt, sync::Arc};
 
 use crate::{Endpoint, Error, Result, TransportTag, api::BoxFuture, transport::ws::MergeHint};
 
-/// One TLS exporter channel binding (RFC 9266). Both session sides derive
-/// the same value from the authenticated TLS connection and bind it into
-/// the handshake transcript, so a transport that skips TLS cannot forge a
-/// valid handshake.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ChannelBinding(pub(crate) [u8; 32]);
-
-impl ChannelBinding {
-  pub const fn from_tls_exporter(value: [u8; 32]) -> Self {
-    Self(value)
-  }
-
-  pub const fn as_bytes(&self) -> &[u8; 32] {
-    &self.0
-  }
-}
-
 /// A framed session stream produced by a registered [`Transport`]. The
 /// boundary is intentionally concrete: exactly one built-in wire format
 /// exists today and the session handshake drives this type directly; a
@@ -70,59 +53,49 @@ pub(crate) trait Transport: fmt::Debug + Send + Sync + 'static {
 }
 
 /// One candidate endpoint observation for a node, with a caller-selected
-/// priority for discovery ordering.
+/// priority for discovery ordering. Test-only until a discovery wiring
+/// exists; no production caller constructs candidates.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EndpointCandidate {
+pub(crate) struct EndpointCandidate {
   endpoint: Endpoint,
   priority: i32,
 }
 
+#[cfg(test)]
 impl EndpointCandidate {
-  pub fn new(endpoint: Endpoint) -> Self {
+  pub(crate) fn new(endpoint: Endpoint) -> Self {
     Self {
       endpoint,
       priority: 0,
     }
   }
 
-  pub fn with_priority(self, value: i32) -> Self {
-    Self {
-      priority: value,
-      endpoint: self.endpoint,
-    }
-  }
-
-  pub const fn endpoint(&self) -> &Endpoint {
+  pub(crate) const fn endpoint(&self) -> &Endpoint {
     &self.endpoint
-  }
-
-  pub const fn priority(&self) -> i32 {
-    self.priority
   }
 }
 
 /// One bounded page of discovery results plus an optional continuation
-/// cursor.
+/// cursor. Test-only until a discovery wiring exists.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiscoveryPage {
+pub(crate) struct DiscoveryPage {
   items: Vec<EndpointCandidate>,
   next: Option<PageCursor>,
 }
 
+#[cfg(test)]
 impl DiscoveryPage {
-  pub fn new(items: Vec<EndpointCandidate>, next: Option<PageCursor>) -> Result<Self> {
+  pub(crate) fn new(items: Vec<EndpointCandidate>, next: Option<PageCursor>) -> Result<Self> {
     if items.is_empty() && next.is_some() {
       return Err(Error::invalid_input("discovery page"));
     }
     Ok(Self { items, next })
   }
 
-  pub fn items(&self) -> &[EndpointCandidate] {
+  pub(crate) fn items(&self) -> &[EndpointCandidate] {
     &self.items
-  }
-
-  pub const fn next(&self) -> Option<&PageCursor> {
-    self.next.as_ref()
   }
 }
 
@@ -150,8 +123,10 @@ impl PageCursor {
 }
 
 /// An open discovery implementation registered under a canonical
-/// `DiscoveryTag`.
-pub trait Discovery: fmt::Debug + Send + Sync + 'static {
+/// `DiscoveryTag`. Test-only until a discovery wiring exists: no
+/// production caller registers or resolves discoveries today.
+#[cfg(test)]
+pub(crate) trait Discovery: fmt::Debug + Send + Sync + 'static {
   /// Returns the next bounded page of candidate endpoints. `None` cursor
   /// starts the stream.
   fn discover<'a>(
@@ -318,9 +293,13 @@ mod tests {
 
   use super::{Discovery, Transport, WssTransport};
   use crate::{
-    DiscoveryTag, ErrorKind, ExtensionRegistry, Result, TransportTag,
+    ErrorKind, ExtensionRegistry, Result, TransportTag,
     api::BoxFuture,
-    transport::{DiscoveryPage, Endpoint, EndpointCandidate, PageCursor},
+    protocol::DiscoveryTag,
+    transport::{
+      Endpoint,
+      registry::{DiscoveryPage, EndpointCandidate, PageCursor},
+    },
   };
 
   fn transport_tag(value: &str) -> TransportTag {
