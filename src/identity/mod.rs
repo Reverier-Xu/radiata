@@ -1,16 +1,11 @@
-#[allow(dead_code)]
 pub(crate) mod cleanup;
-#[allow(dead_code)]
 pub(crate) mod credential;
-#[allow(dead_code)]
 pub(crate) mod deletion;
 pub(crate) mod id;
 pub(crate) mod leave;
 pub(crate) mod lifecycle;
-#[allow(dead_code)]
 pub(crate) mod merge;
 pub(crate) mod merge_rate;
-#[allow(dead_code)]
 pub(crate) mod records;
 pub(crate) mod revocation;
 pub(crate) mod signature;

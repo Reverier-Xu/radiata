@@ -28,8 +28,6 @@ pub(crate) const LOCAL_IDENTITY_PURPOSE_TEXT: &str = "local-identity";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalPurpose {
-  /// The local identity bootstrap intent.
-  LocalIdentity,
   /// One credential merge attempt, keyed by issuer generation.
   Merge(GenerationId),
   /// One merge adoption attempt, keyed by merge id.
@@ -43,7 +41,6 @@ impl JournalPurpose {
   /// codec so wire and persisted values cannot drift in formatting.
   pub(crate) fn text(&self) -> String {
     match self {
-      Self::LocalIdentity => LOCAL_IDENTITY_PURPOSE_TEXT.to_owned(),
       Self::Merge(generation) => {
         format!("merge-{}", crate::hex::encode(generation.as_bytes()))
       }
@@ -146,14 +143,6 @@ pub(crate) fn identity_binding_namespace() -> Result<StoreNamespace> {
   metadata_namespace(IDENTITY_BINDING_NAMESPACE)
 }
 
-pub(crate) fn credential_use_namespace() -> Result<StoreNamespace> {
-  metadata_namespace(CREDENTIAL_USE_NAMESPACE)
-}
-
-pub(crate) fn merge_grant_namespace() -> Result<StoreNamespace> {
-  metadata_namespace(MERGE_GRANT_NAMESPACE)
-}
-
 pub(crate) fn key_creation_intent_key(
   operation: &KeyOperationId,
 ) -> Result<(StoreNamespace, StoreKey)> {
@@ -192,10 +181,12 @@ pub(crate) fn merge_grant_key(admission: &MergeId) -> Result<(StoreNamespace, St
   ))
 }
 
+#[cfg(test)]
 pub(crate) fn key_deletion_intent_namespace() -> Result<StoreNamespace> {
   metadata_namespace(KEY_DELETION_INTENT_NAMESPACE)
 }
 
+#[cfg(test)]
 pub(crate) fn key_deleted_namespace() -> Result<StoreNamespace> {
   metadata_namespace(KEY_DELETED_NAMESPACE)
 }
@@ -365,6 +356,7 @@ pub(crate) async fn collect_tombstones_before(
 pub(crate) struct GenerationId(OperationId);
 
 impl GenerationId {
+  #[cfg(any(test, fuzzing))]
   pub(crate) fn generate(entropy: &dyn Entropy) -> Result<Self> {
     OperationId::generate(entropy).map(Self)
   }
@@ -463,6 +455,9 @@ impl LocalIdentityV1 {
     &self.public_key
   }
 
+  /// The operation id of the bootstrap intent that created this record
+  /// (test-verified against the admission state machine).
+  #[cfg(test)]
   pub(crate) fn operation(&self) -> &KeyOperationId {
     &self.operation
   }
@@ -562,6 +557,9 @@ impl KeyCreationIntentV1 {
     &self.transaction
   }
 
+  /// The store revision the intent was prepared against (test-verified;
+  /// recovery reads the field directly).
+  #[cfg(test)]
   pub(crate) const fn base_revision(&self) -> &StoreRevision {
     &self.base_revision
   }
@@ -762,10 +760,6 @@ pub(crate) struct KeyDeletedV1 {
 impl KeyDeletedV1 {
   pub(crate) const fn new(operation: KeyOperationId, handle: KeyHandle) -> Self {
     Self { operation, handle }
-  }
-
-  pub(crate) fn operation(&self) -> &KeyOperationId {
-    &self.operation
   }
 
   pub(crate) fn handle(&self) -> &KeyHandle {

@@ -1,7 +1,5 @@
 //! Issuer trust snapshots consumed by the membership sync lane: every
 //! node is its own snapshot issuer.
-// Unit-verified store surfaces exercised by the unit suite.
-#![allow(dead_code)]
 //!
 //! A [`TrustSnapshotV1`] is one ordered set of `NodeId`-to-`PublicKey`
 //! bindings (strictly increasing revision, version, ordered bindings),
@@ -14,7 +12,7 @@
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{
-  Digest, NodeId, PublicKey, Result,
+  NodeId, PublicKey, Result,
   protocol::{decode_canonical, encode_canonical},
 };
 
@@ -179,6 +177,7 @@ impl TrustSnapshotV1 {
   }
 
   /// True when this snapshot is strictly newer than `other` by revision.
+  #[cfg(test)]
   pub(crate) fn is_newer_than(&self, other: &TrustSnapshotV1) -> bool {
     self.revision > other.revision
   }
@@ -186,6 +185,7 @@ impl TrustSnapshotV1 {
   /// Rejects a `NodeId` key substitution against the known local bindings:
   /// every binding whose node is already known must carry the exact same
   /// key.
+  #[cfg(test)]
   pub(crate) fn assert_no_key_substitution(&self, known: &[(NodeId, PublicKey)]) -> Result<()> {
     let known: std::collections::BTreeMap<&NodeId, &PublicKey> =
       known.iter().map(|(node, key)| (node, key)).collect();
@@ -222,6 +222,7 @@ impl TrustPage {
 }
 
 /// Paged trust observations over one ordered snapshot's bindings.
+#[cfg(test)]
 pub(crate) fn page_bindings(
   bindings: &[TrustBinding], offset: usize, limit: usize,
 ) -> Result<TrustPage> {
@@ -235,15 +236,8 @@ pub(crate) fn page_bindings(
   Ok(TrustPage::new(page, next))
 }
 
-/// The digest of one snapshot's canonical encoding, for receipts.
-pub(crate) fn snapshot_digest(snapshot: &TrustSnapshotV1) -> Result<Digest> {
-  Ok(crate::identity::signature::body_digest(&snapshot.encode()?))
-}
-
 #[cfg(test)]
 mod tests {
-  use std::time::Duration;
-
   use super::{TrustBinding, TrustSnapshotV1, page_bindings};
   use crate::NodeId;
 
@@ -332,11 +326,6 @@ mod tests {
     ];
     let error = TrustSnapshotV1::decode(&unordered.encode().unwrap());
     assert!(error.is_err());
-  }
-
-  #[allow(dead_code)]
-  fn _duration_hint() -> Duration {
-    Duration::ZERO
   }
 
   // ---- Durable persistence and paged observations ----

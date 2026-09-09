@@ -166,7 +166,10 @@ impl MergeCredentialIssuer {
   }
 
   /// Issues the first generation, rejecting the call while a live
-  /// (unexpired, unconsumed) generation already exists.
+  /// (unexpired, unconsumed) generation already exists. Production only
+  /// ever rotates (the first generation is issued by `rotate` on the
+  /// fresh issuer), so this entry point is exercised by tests only.
+  #[cfg(test)]
   pub(crate) fn issue(
     &mut self, entropy: &dyn Entropy, now: SystemTime,
   ) -> Result<IssuedMergeCredential> {
