@@ -37,6 +37,14 @@ const CONTROL_CAPACITY: usize = 32;
 /// every other period out of `NodeConfig`).
 const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The accept-loop backoff: every consecutive failed upgrade delays the
+/// next accept by one step, capped at `ACCEPT_BACKOFF_MAX_STEPS` steps,
+/// so a persistently broken accept cannot spin hot; one success clears
+/// the backoff. A single failed upgrade still costs nothing (the delay
+/// applies only from the second consecutive failure on).
+const ACCEPT_BACKOFF_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+const ACCEPT_BACKOFF_MAX_STEPS: u32 = 5;
+
 /// Capacity of the node's outbound packet command channel, shared with
 /// the builder so both channel ends are created at one construction site.
 /// The bounded request channel for RunSyncRound commands: rounds are
@@ -800,6 +808,10 @@ impl Supervisor {
     let attachment = bound.clone();
     let abort = tasks.spawn(async move {
       tracing::debug!("accept loop started");
+      // Consecutive failed upgrades: drives the bounded accept backoff,
+      // so a persistently failing accept sleeps longer instead of
+      // spinning; a success clears it.
+      let mut accept_failures: u32 = 0;
       loop {
         // The join hint is computed per accepted connection so the accept
         // path stays fast and never stalls on the credential issuer lock;
@@ -815,9 +827,25 @@ impl Supervisor {
         }
         let accepted = accept_listener.accept(hint.as_ref()).await;
         let mut connection = match accepted {
-          Ok(connection) => connection,
-          // A failed TLS/prelude upgrade must not kill the listener.
-          Err(_) => continue,
+          Ok(connection) => {
+            accept_failures = 0;
+            connection
+          }
+          Err(error) => {
+            // A failed TLS/prelude upgrade must not kill the listener;
+            // consecutive failures back off on a bounded growing delay.
+            accept_failures = accept_failures.saturating_add(1);
+            let delay = ACCEPT_BACKOFF_STEP
+              .saturating_mul(accept_failures.min(ACCEPT_BACKOFF_MAX_STEPS));
+            tracing::debug!(
+              kind = ?error.kind(),
+              consecutive = accept_failures,
+              delay_ms = delay.as_millis(),
+              "accept failed; backing off"
+            );
+            tokio::time::sleep(delay).await;
+            continue;
+          }
         };
         let driver = driver.clone();
         let packet = packet.clone();
