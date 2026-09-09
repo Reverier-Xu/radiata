@@ -983,7 +983,6 @@ mod tests {
       crate::storage::families::CREDENTIAL_USE_NAMESPACE,
       crate::storage::families::MERGE_GRANT_NAMESPACE,
       crate::storage::families::TRUST_SNAPSHOT_NAMESPACE,
-      crate::storage::families::TRUST_BINDING_NAMESPACE,
       crate::storage::families::REVOCATION_NAMESPACE,
       crate::storage::families::NODE_DESCRIPTOR_NAMESPACE,
       crate::storage::families::RESOURCE_RECORD_NAMESPACE,
