@@ -479,21 +479,44 @@ pub(crate) async fn discover_leave_intent(
   )))
 }
 
-/// The domain metadata namespaces of the old identity, wiped by a leave.
-/// The local identity singleton is swapped, never wiped; the store's
-/// schema, receipt internals, pending journal, and key-custody records
-/// are storage infrastructure and stay.
-const WIPE_NAMESPACES: &[&str] = &[
+/// The member-visible metadata domains wiped whole by a leave: the old
+/// identity's trust view plus every node-descriptor, resource, and trace
+/// family. A family added to any of these domains joins the wipe scope
+/// automatically through the registry derivation.
+const WIPE_DOMAINS: &[crate::storage::families::MetadataDomain] = &[
+  crate::storage::families::MetadataDomain::Trust,
+  crate::storage::families::MetadataDomain::Node,
+  crate::storage::families::MetadataDomain::Resource,
+  crate::storage::families::MetadataDomain::Route,
+];
+
+/// The Identity-domain families that carry the old identity itself and
+/// are wiped with it. The rest of the Identity domain stays: the local
+/// identity singleton is swapped, never wiped, and the leave intent,
+/// cleanup tombstones, and checkpoint are hygiene records of the store,
+/// not credentials of the old identity. Key-custody families (the
+/// KeyIntent domain) and the storage infrastructure domains (pending
+/// journal, receipts, schema) stay for the same reason.
+const WIPE_IDENTITY_FAMILIES: &[&str] = &[
   crate::storage::families::IDENTITY_BINDING_NAMESPACE,
   crate::storage::families::CREDENTIAL_USE_NAMESPACE,
   crate::storage::families::MERGE_GRANT_NAMESPACE,
-  crate::storage::families::TRUST_SNAPSHOT_NAMESPACE,
-  crate::storage::families::TRUST_BINDING_NAMESPACE,
   crate::storage::families::REVOCATION_NAMESPACE,
-  crate::storage::families::NODE_DESCRIPTOR_NAMESPACE,
-  crate::storage::families::RESOURCE_RECORD_NAMESPACE,
-  crate::storage::families::TRACE_NAMESPACE,
 ];
+
+/// The domain metadata namespaces of the old identity, wiped by a leave:
+/// derived from the storage family registry so the wipe scope cannot
+/// silently miss a newly added member-visible family.
+pub(crate) fn wipe_namespaces() -> Vec<&'static str> {
+  crate::storage::families::metadata_families()
+    .into_iter()
+    .filter(|family| {
+      WIPE_DOMAINS.contains(&family.domain())
+        || WIPE_IDENTITY_FAMILIES.contains(&family.namespace_tag())
+    })
+    .map(|family| family.namespace_tag())
+    .collect()
+}
 
 /// The bounded batch size of one wipe transaction.
 const WIPE_BATCH: usize = 64;
@@ -547,7 +570,7 @@ async fn wipe_family(
 
 /// Wipes every domain family of the old identity.
 async fn wipe_old_metadata(store: &MetadataStore, entropy: &dyn Entropy) -> Result<()> {
-  for namespace in WIPE_NAMESPACES {
+  for namespace in wipe_namespaces() {
     wipe_family(store, entropy, namespace).await?;
   }
   Ok(())
@@ -778,9 +801,9 @@ mod tests {
   use std::{sync::Arc, time::Duration};
 
   use super::{
-    LeaveIntentV1, LeaveRecordV1, WIPE_NAMESPACES, discover_leave_intent, execute, is_left_ctx,
+    LeaveIntentV1, LeaveRecordV1, discover_leave_intent, execute, is_left_ctx,
     known_leave_records_ctx, left_nodes_ctx, persist_leave_record_ctx, resume_if_pending,
-    sign_leave_record,
+    sign_leave_record, wipe_namespaces,
   };
   use crate::{
     ErrorKind, Result, StoreExpectation, StoreOperation, StoreValue, TransactionId,
@@ -821,7 +844,7 @@ mod tests {
   /// Seeds one opaque record into each wiped family, so the leave has
   /// metadata to erase in every namespace.
   async fn seed_old_metadata(store: &MetadataStore, entropy: &dyn Entropy) -> Result<()> {
-    for tag in WIPE_NAMESPACES {
+    for tag in wipe_namespaces() {
       let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(tag)?);
       let snapshot = store.snapshot().await?;
       let prepared = store.prepare_transaction(
@@ -845,7 +868,7 @@ mod tests {
 
   /// Every wiped family must be empty after the leave.
   async fn assert_wiped(store: &MetadataStore) {
-    for tag in WIPE_NAMESPACES {
+    for tag in wipe_namespaces() {
       let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(tag).unwrap());
       let snapshot = store.snapshot().await.unwrap();
       let mut scan = snapshot.scan(&namespace, &[]).await.unwrap();
@@ -952,6 +975,29 @@ mod tests {
     let last = forged.len() - 1;
     forged[last] ^= 0xFF;
     assert!(LeaveIntentV1::decode(&forged).is_err());
+  }
+
+  /// The registry-derived wipe scope stays set-equal to the pre-registry
+  /// list: any catalog or domain change that alters what a leave wipes
+  /// must update this expectation deliberately instead of silently
+  /// widening or shrinking the wipe.
+  #[test]
+  fn wipe_scope_matches_the_pre_registry_list() {
+    let mut derived = wipe_namespaces();
+    derived.sort_unstable();
+    let mut expected = vec![
+      crate::storage::families::IDENTITY_BINDING_NAMESPACE,
+      crate::storage::families::CREDENTIAL_USE_NAMESPACE,
+      crate::storage::families::MERGE_GRANT_NAMESPACE,
+      crate::storage::families::TRUST_SNAPSHOT_NAMESPACE,
+      crate::storage::families::TRUST_BINDING_NAMESPACE,
+      crate::storage::families::REVOCATION_NAMESPACE,
+      crate::storage::families::NODE_DESCRIPTOR_NAMESPACE,
+      crate::storage::families::RESOURCE_RECORD_NAMESPACE,
+      crate::storage::families::TRACE_NAMESPACE,
+    ];
+    expected.sort_unstable();
+    assert_eq!(derived, expected);
   }
 
   /// One leave swaps the identity, wipes every old
@@ -1159,7 +1205,7 @@ mod crash {
   use tempfile::TempDir;
 
   use super::{
-    LeaveIntentV1, WIPE_NAMESPACES, begin_intent, discover_leave_intent, execute, run_leave,
+    LeaveIntentV1, begin_intent, discover_leave_intent, execute, run_leave, wipe_namespaces,
   };
   use crate::{
     NodeId, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreValue, TransactionId,
@@ -1279,7 +1325,7 @@ mod crash {
 
   /// Seeds one opaque old-identity record per wiped family.
   pub(super) async fn seed(store: &MetadataStore, entropy: &dyn Entropy) {
-    for tag in WIPE_NAMESPACES {
+    for tag in wipe_namespaces() {
       let namespace = StoreNamespace::new(crate::QualifiedTag::parse(tag).unwrap());
       let snapshot = store.snapshot().await.unwrap();
       let prepared = store
@@ -1313,8 +1359,8 @@ mod crash {
   async fn observe(factory: &Arc<dyn StorageFactory>) -> Phase {
     let (_keys, _entropy, context) = open_with_entropy_offset(factory, 1_000_000).await;
     let store = context.store();
-    let mut noise = Vec::with_capacity(WIPE_NAMESPACES.len());
-    for tag in WIPE_NAMESPACES {
+    let mut noise = Vec::with_capacity(wipe_namespaces().len());
+    for tag in wipe_namespaces() {
       let namespace = StoreNamespace::new(crate::QualifiedTag::parse(tag).unwrap());
       let snapshot = store.snapshot().await.unwrap();
       let mut scan = snapshot.scan(&namespace, &[]).await.unwrap();

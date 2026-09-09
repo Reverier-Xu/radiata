@@ -49,14 +49,13 @@ pub(crate) const INTERNAL_NAMESPACE: &str = "radiata.woooo.tech/metadata/receipt
 /// The store's current logical schema version record.
 pub(crate) const SCHEMA_NAMESPACE: &str = "radiata.woooo.tech/metadata/store-schema-v1";
 
-#[cfg(test)]
-#[cfg_attr(
-  not(all(test, unix, feature = "json", feature = "redb")),
-  allow(unused_imports)
-)]
-pub(crate) use catalog::{MetadataDomain, MetadataFamily, metadata_families};
+#[cfg(all(test, unix, feature = "json", feature = "redb"))]
+pub(crate) use catalog::MetadataFamily;
+/// The owning domain of every catalog family; consumers classify families
+/// through the catalog itself (iterate [`metadata_families`]) instead of
+/// by copying namespace lists.
+pub(crate) use catalog::{MetadataDomain, metadata_families};
 
-#[cfg(test)]
 mod catalog {
   /// The domain that owns one metadata family's record encodings.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +102,9 @@ mod catalog {
       self.namespace_tag
     }
 
+    /// The namespace parsed for provider use (test-only: the storage
+    /// contract lane drives every family through it).
+    #[cfg(test)]
     pub(crate) fn namespace(&self) -> crate::Result<crate::StoreNamespace> {
       Ok(crate::StoreNamespace::new(crate::QualifiedTag::parse(
         self.namespace_tag,
@@ -183,6 +185,48 @@ mod catalog {
           "metadata family catalog lacks domain {domain:?}"
         );
       }
+    }
+
+    /// Every catalog family is classified: each family resolves to its
+    /// declared domain through a registry lookup, and unknown tags stay
+    /// unclassified. A family added to the catalog is domain-classified
+    /// by construction, and every derived consumer (the leave wipe
+    /// scope) sees it automatically.
+    #[test]
+    fn family_registry_resolves_a_domain_for_every_family() {
+      for family in metadata_families() {
+        assert_eq!(
+          domain_lookup(family.namespace_tag()),
+          Some(family.domain()),
+          "family {} must resolve to its declared domain",
+          family.namespace_tag()
+        );
+      }
+      assert_eq!(
+        domain_lookup("radiata.woooo.tech/metadata/not-a-family-v1"),
+        None
+      );
+    }
+
+    /// The leave wipe scope consumes only registered families: every
+    /// namespace leave wipes resolves through the registry, so a wiped
+    /// family is always a classified member of the catalog.
+    #[test]
+    fn leave_wipe_scope_consumes_only_registry_families() {
+      for tag in crate::identity::leave::wipe_namespaces() {
+        assert!(
+          domain_lookup(tag).is_some(),
+          "leave wipes unregistered family {tag}"
+        );
+      }
+    }
+
+    /// The registry lookup behind the classification guards.
+    fn domain_lookup(namespace_tag: &str) -> Option<MetadataDomain> {
+      metadata_families()
+        .into_iter()
+        .find(|family| family.namespace_tag() == namespace_tag)
+        .map(|family| family.domain())
     }
   }
 }
