@@ -526,18 +526,13 @@ async fn supervise(
       } => {
         match supervisor.leave_cluster(acknowledgement).await {
           Ok(outcome) => {
-            // The outcome reaches the caller before teardown begins; the
-            // node then shuts down with the active-leave reason.
-            let _ = reply.send(Ok(outcome));
-            let (dependencies, drained) = supervisor.into_dependencies();
-            finish_shutdown(
+            handle_leave(
+              outcome,
+              reply,
+              supervisor.into_dependencies(),
               control,
               tasks,
-              dependencies,
-              drained,
               &mut lifecycle,
-              None,
-              ShutdownReason::ActiveLeave,
             )
             .await;
             return;
@@ -575,6 +570,31 @@ async fn supervise(
     &mut lifecycle,
     None,
     ShutdownReason::Explicit,
+  )
+  .await;
+}
+
+/// The `LeaveCluster` shutdown sequence, hoisted out of the select arm so
+/// the arm stays symmetric with the observation arms: the leave outcome
+/// reaches the caller before teardown begins, then the runtime drains and
+/// shuts down with the active-leave reason. Consumes the control loop and
+/// task set, so `supervise` returns right after.
+async fn handle_leave(
+  outcome: crate::LeaveOutcome, reply: oneshot::Sender<Result<crate::LeaveOutcome>>,
+  (dependencies, drained): (RuntimeDependencies, Vec<tokio::task::JoinHandle<()>>),
+  control: mpsc::Receiver<Control>, tasks: JoinSet<()>, lifecycle: &mut LifecyclePublisher,
+) {
+  // The outcome reaches the caller before teardown begins; the node then
+  // shuts down with the active-leave reason.
+  let _ = reply.send(Ok(outcome));
+  finish_shutdown(
+    control,
+    tasks,
+    dependencies,
+    drained,
+    lifecycle,
+    None,
+    ShutdownReason::ActiveLeave,
   )
   .await;
 }
