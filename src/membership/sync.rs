@@ -534,7 +534,11 @@ pub(crate) async fn ensure_local_descriptor(
 /// snapshot when this node is the creator, and push a bounded page plus the
 /// latest snapshot over every authenticated session. The work per tick is
 /// bounded: one page and one snapshot per session, nothing paged to
-/// exhaustion.
+/// exhaustion. A snapshot refresh failure (an issuer binding set that
+/// overflows the single-record control bound) skips only that round's
+/// snapshot send: the descriptor-page and tombstone anti-entropy below
+/// keeps running, so a large membership degrades the snapshot leg instead
+/// of stalling every sync lane.
 /// The driver's per-node anti-entropy continuation state.
 #[derive(Default)]
 pub(crate) struct SyncCursor {
@@ -592,7 +596,23 @@ pub(crate) async fn sync_tick(
     // No membership yet: no descriptors exist to anti-entropize.
     return Ok(());
   }
-  let snapshot = refresh_issuer_snapshot(context, entropy).await?;
+  // A snapshot refresh or encode failure (a binding set that overflows
+  // the single-record control bound) must not fail the whole tick: every
+  // round would fail identically and descriptor-page, resource, and
+  // tombstone anti-entropy would stall permanently. Log and skip this
+  // round's snapshot send; the page plane below runs unchanged and the
+  // cursor keeps its existing semantics (no revision recorded, the
+  // resend cadence untouched while refresh fails).
+  let snapshot = match refresh_issuer_snapshot(context, entropy).await {
+    Ok(snapshot) => snapshot,
+    Err(error) => {
+      tracing::warn!(
+        kind = ?error.kind(),
+        "issuer snapshot refresh failed; skipping this round's snapshot send"
+      );
+      None
+    }
+  };
   // Removal tombstones (leave, cleanup) ride the same anti-entropy plane:
   // forward the known (bounded) sets whenever a snapshot round sends, so a
   // lost delivery heals on the resend cadence.
@@ -749,10 +769,6 @@ async fn gc_collected_tombstones(
 mod tests {
   use super::*;
 
-  fn node(seed: u8) -> NodeId {
-    NodeId::parse(&format!("node_{seed:021}")).unwrap()
-  }
-
   /// Every sync payload kind round-trips through the canonical wire,
   /// including the additive leave-applied receipt: the leaver correlates
   /// by subject, so the subject must survive the encoding exactly.
@@ -766,6 +782,115 @@ mod tests {
       let encoded = payload.encode().unwrap();
       assert_eq!(SyncPayload::decode(&encoded).unwrap(), payload);
     }
+  }
+
+  fn node(seed: u8) -> NodeId {
+    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+  }
+
+  fn node_at(seed: u64) -> NodeId {
+    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+  }
+
+  fn key_at(value: u64) -> crate::PublicKey {
+    let signing = crate::identity::testing::scripted_signing(value);
+    crate::PublicKey::from_bytes(signing.verifying_key().to_bytes())
+  }
+
+  /// Regression: a snapshot refresh failure used to fail the whole sync
+  /// tick every round — an issuer binding set over the single-record
+  /// control bound cannot encode (~870+ bindings), so descriptor and
+  /// tombstone anti-entropy stalled permanently. The oversized issuer
+  /// refresh fails in isolation, the tick still returns success, and the
+  /// page plane keeps advancing (round dispatched, resend cadence armed)
+  /// while no snapshot revision is ever recorded.
+  #[tokio::test]
+  async fn sync_tick_survives_snapshot_refresh_overflow() {
+    use crate::{
+      identity::{
+        lifecycle,
+        testing::{ScriptedKeys, SequenceEntropy},
+      },
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let factory: Arc<dyn crate::provider::StorageFactory> =
+      Arc::new(ReferenceFactory::new(required_capabilities()));
+    let keys = ScriptedKeys::full();
+    let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        &keys.as_provider(),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    // Oversize the issuer's binding set past the snapshot wire bounds
+    // (1_024 collection entries inside the 64 KiB control body): the
+    // issuer's own snapshot can no longer encode.
+    for index in 0..1_200_u64 {
+      trust_store::adopt_binding_ctx(
+        context.store(),
+        entropy.as_ref(),
+        &node_at(index),
+        &key_at(index),
+      )
+      .await
+      .unwrap();
+    }
+    // The injection is real: the issuer refresh fails on its own.
+    let error = refresh_issuer_snapshot(&context, &entropy)
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let (packet, _received) = tokio::sync::mpsc::channel(16);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = RuntimeClient::routing_only(packet, routes);
+    let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
+    let mut cursor = SyncCursor::default();
+
+    // The tick succeeds despite the failed snapshot leg, and the page
+    // round dispatches (to zero live sessions here).
+    sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      cursor.snapshot_rev, 0,
+      "no snapshot revision recorded while refresh fails"
+    );
+    // A quiet second tick: the stored page fingerprint arms the resend
+    // cadence instead of the tick failing again.
+    sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      cursor.snapshot_rev, 0,
+      "still no snapshot revision recorded"
+    );
+    assert_eq!(
+      cursor.ticks_since_page_send, 1,
+      "the page plane keeps advancing across ticks"
+    );
   }
 
   /// The leave-applied receipt carries one subject only: the applying
