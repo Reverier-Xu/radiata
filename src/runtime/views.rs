@@ -8,6 +8,18 @@ use tokio::task::JoinSet;
 use super::supervisor::Supervisor;
 use crate::{Error, LocalNodeView, NodeId, Result};
 
+/// The shared tail of the keyset-paged views: wraps the scan's next key
+/// into the opaque page cursor and assembles the page through the
+/// caller's page constructor.
+fn finish_page<T, P>(
+  paged: crate::paging::Paged<T>, page: impl FnOnce(Vec<T>, Option<crate::PageCursor>) -> P,
+) -> P {
+  let next = paged
+    .next
+    .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
+  page(paged.items, next)
+}
+
 impl Supervisor {
   /// One member's public observation from the signed descriptor store and
   /// the session table.
@@ -73,10 +85,7 @@ impl Supervisor {
       },
     )
     .await?;
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::MemberPage::new(paged.items, next))
+    Ok(finish_page(paged, crate::MemberPage::new))
   }
   /// Pages the live resource winners matching one selector.
   pub(super) async fn select_resources(
@@ -130,10 +139,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::ListenerPage::new(paged.items, next))
+    Ok(finish_page(paged, crate::ListenerPage::new))
   }
   /// Pages the live authenticated sessions in canonical peer order;
   /// selected features resolve their exact definition digests at query
@@ -182,10 +188,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::SessionPage::new(paged.items, next))
+    Ok(finish_page(paged, crate::SessionPage::new))
   }
   /// The bounded observability snapshot:
   /// session/listener/task counters, queue totals, route and trace
@@ -282,10 +285,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    let next = paged
-      .next
-      .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-    Ok(crate::TopologyPage::new(paged.items, next))
+    Ok(finish_page(paged, crate::TopologyPage::new))
   }
   /// Pages the public trust observations: the exact
   /// NodeId-to-key bindings verified locally, deterministically ordered
