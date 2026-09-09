@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use minicbor::{Decode, Encode};
+use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{
+  canonical::canonical_record,
   lifecycle::LocalIdentityContext,
   signature::{MERGE_GRANT_V1_DOMAIN, signature_message, verify_strict},
 };
@@ -11,8 +12,7 @@ use crate::{
   StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision, StoreValue,
   TransactionId,
   api::Entropy,
-  error::fixed_bytes,
-  protocol::{CborLimits, decode_canonical_strict, encode_canonical},
+  protocol::CborLimits,
   provider::KeyProvider,
   storage::{
     MetadataStore,
@@ -92,33 +92,6 @@ pub(crate) use crate::storage::families::{
 
 const SINGLETON_KEY: &[u8] = b"self";
 const RECORD_LIMITS: CborLimits = CborLimits::new(1, 16, 1_024);
-
-fn decode_wire<'bytes, T>(bytes: &'bytes [u8]) -> Result<T>
-where
-  T: Decode<'bytes, ()> + Encode<()>, {
-  decode_canonical_strict(bytes, RECORD_LIMITS, "identity record canonical form")
-}
-
-fn expect_schema(actual: &str, expected: &str) -> Result<()> {
-  if actual != expected {
-    return Err(Error::invalid_input("identity record schema"));
-  }
-  Ok(())
-}
-
-fn expect_version(actual: u64) -> Result<()> {
-  if actual != RECORD_VERSION {
-    return Err(Error::invalid_input("identity record version"));
-  }
-  Ok(())
-}
-
-fn expect_algorithm(actual: &str) -> Result<()> {
-  if actual != ED25519_ALGORITHM {
-    return Err(Error::invalid_input("identity record algorithm"));
-  }
-  Ok(())
-}
 
 pub(crate) fn metadata_namespace(tag: &str) -> Result<StoreNamespace> {
   crate::storage::families::namespace(tag)
@@ -445,25 +418,20 @@ impl std::fmt::Debug for MergeId {
   }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct LocalIdentityWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  node_id: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  public_key: Vec<u8>,
-  #[n(4)]
-  algorithm: String,
-  #[n(5)]
-  key_operation_id: String,
-  #[n(6)]
-  #[cbor(with = "minicbor::bytes")]
-  key_handle: Vec<u8>,
+canonical_record! {
+  wire LocalIdentityWire for LocalIdentityV1 vis [pub(crate)] {
+    schema LOCAL_IDENTITY_SCHEMA,
+    version u64 RECORD_VERSION,
+    algorithm #[n(4)] (String) ED25519_ALGORITHM, algorithm_err "identity record algorithm",
+    limits RECORD_LIMITS,
+    decode [canonical "identity record canonical form", schema_err "identity record schema", version_err "identity record version"]
+    fields {
+      #[n(2)] node = node_id: String => node()
+      #[n(3)] public_key = public_key: ByteVec => key32("identity public key")
+      #[n(5)] operation = key_operation_id: String => text(KeyOperationId)
+      #[n(6)] handle = key_handle: ByteVec => handle()
+    }
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -504,56 +472,24 @@ impl LocalIdentityV1 {
   pub(crate) fn handle(&self) -> &KeyHandle {
     &self.handle
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &LocalIdentityWire {
-        schema: LOCAL_IDENTITY_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        node_id: self.node.as_str().to_owned(),
-        public_key: self.public_key.as_bytes().to_vec(),
-        algorithm: ED25519_ALGORITHM.to_owned(),
-        key_operation_id: self.operation.as_str().to_owned(),
-        key_handle: self.handle.expose_provider_handle().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: LocalIdentityWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, LOCAL_IDENTITY_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    expect_algorithm(&wire.algorithm)?;
-    Ok(Self {
-      node: NodeId::parse(&wire.node_id)?,
-      public_key: PublicKey::from_bytes(fixed_bytes(&wire.public_key, "identity public key")?),
-      operation: KeyOperationId::parse(&wire.key_operation_id)?,
-      handle: KeyHandle::from_provider_bytes(Arc::from(wire.key_handle))?,
-    })
-  }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct KeyCreationIntentWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  operation: String,
-  #[n(3)]
-  intended_node: String,
-  #[n(4)]
-  purpose: String,
-  #[n(5)]
-  algorithm: String,
-  #[n(6)]
-  transaction: String,
-  #[n(7)]
-  #[cbor(with = "minicbor::bytes")]
-  base_revision: Vec<u8>,
+canonical_record! {
+  wire KeyCreationIntentWire for KeyCreationIntentV1 vis [pub(crate)] {
+    schema KEY_CREATION_INTENT_SCHEMA,
+    version u64 RECORD_VERSION,
+    algorithm #[n(5)] (String) ED25519_ALGORITHM, algorithm_err "identity record algorithm",
+    limits RECORD_LIMITS,
+    decode [canonical "identity record canonical form", schema_err "identity record schema", version_err "identity record version"]
+    construct new,
+    fields {
+      #[n(2)] operation = operation: String => text(KeyOperationId)
+      #[n(3)] intended_node = intended_node: String => node()
+      #[n(4)] purpose = purpose: String => str()
+      #[n(6)] transaction = transaction: String => text(TransactionId)
+      #[n(7)] base_revision = base_revision: ByteVec => revision()
+    }
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -624,57 +560,23 @@ impl KeyCreationIntentV1 {
       &[token],
     )
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &KeyCreationIntentWire {
-        schema: KEY_CREATION_INTENT_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        operation: self.operation.as_str().to_owned(),
-        intended_node: self.intended_node.as_str().to_owned(),
-        purpose: self.purpose.clone(),
-        algorithm: ED25519_ALGORITHM.to_owned(),
-        transaction: self.transaction.as_str().to_owned(),
-        base_revision: self.base_revision.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: KeyCreationIntentWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, KEY_CREATION_INTENT_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    expect_algorithm(&wire.algorithm)?;
-    Self::new(
-      KeyOperationId::parse(&wire.operation)?,
-      NodeId::parse(&wire.intended_node)?,
-      wire.purpose,
-      TransactionId::parse(&wire.transaction)?,
-      StoreRevision::new(Arc::from(wire.base_revision))?,
-    )
-  }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct KeyDeletionIntentWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  operation: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  handle: Vec<u8>,
-  #[n(4)]
-  purpose: String,
-  #[n(5)]
-  transaction: String,
-  #[n(6)]
-  #[cbor(with = "minicbor::bytes")]
-  base_revision: Vec<u8>,
+canonical_record! {
+  wire KeyDeletionIntentWire for KeyDeletionIntentV1 vis [pub(crate)] {
+    schema KEY_DELETION_INTENT_SCHEMA,
+    version u64 RECORD_VERSION,
+    limits RECORD_LIMITS,
+    decode [canonical "identity record canonical form", schema_err "identity record schema", version_err "identity record version"]
+    construct new,
+    fields {
+      #[n(2)] operation = operation: String => text(KeyOperationId)
+      #[n(3)] handle = handle: ByteVec => handle()
+      #[n(4)] purpose = purpose: String => str()
+      #[n(5)] transaction = transaction: String => text(TransactionId)
+      #[n(6)] base_revision = base_revision: ByteVec => revision()
+    }
+  }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -735,34 +637,6 @@ impl KeyDeletionIntentV1 {
       &[token],
     )
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &KeyDeletionIntentWire {
-        schema: KEY_DELETION_INTENT_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        operation: self.operation.as_str().to_owned(),
-        handle: self.handle.expose_provider_handle().to_vec(),
-        purpose: self.purpose.clone(),
-        transaction: self.transaction.as_str().to_owned(),
-        base_revision: self.base_revision.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: KeyDeletionIntentWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, KEY_DELETION_INTENT_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    Self::new(
-      KeyOperationId::parse(&wire.operation)?,
-      KeyHandle::from_provider_bytes(Arc::from(wire.handle))?,
-      wire.purpose,
-      TransactionId::parse(&wire.transaction)?,
-      StoreRevision::new(Arc::from(wire.base_revision))?,
-    )
-  }
 }
 
 impl std::fmt::Debug for KeyDeletionIntentV1 {
@@ -776,18 +650,17 @@ impl std::fmt::Debug for KeyDeletionIntentV1 {
   }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct KeyDeletedWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  operation: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  handle: Vec<u8>,
+canonical_record! {
+  wire KeyDeletedWire for KeyDeletedV1 vis [pub(crate)] {
+    schema KEY_DELETED_SCHEMA,
+    version u64 RECORD_VERSION,
+    limits RECORD_LIMITS,
+    decode [canonical "identity record canonical form", schema_err "identity record schema", version_err "identity record version"]
+    fields {
+      #[n(2)] operation = operation: String => text(KeyOperationId)
+      #[n(3)] handle = handle: ByteVec => handle()
+    }
+  }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -804,28 +677,6 @@ impl KeyDeletedV1 {
   pub(crate) fn handle(&self) -> &KeyHandle {
     &self.handle
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &KeyDeletedWire {
-        schema: KEY_DELETED_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        operation: self.operation.as_str().to_owned(),
-        handle: self.handle.expose_provider_handle().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: KeyDeletedWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, KEY_DELETED_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    Ok(Self {
-      operation: KeyOperationId::parse(&wire.operation)?,
-      handle: KeyHandle::from_provider_bytes(Arc::from(wire.handle))?,
-    })
-  }
 }
 
 impl std::fmt::Debug for KeyDeletedV1 {
@@ -837,20 +688,18 @@ impl std::fmt::Debug for KeyDeletedV1 {
   }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct IdentityBindingWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  node_id: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  public_key: Vec<u8>,
-  #[n(4)]
-  algorithm: String,
+canonical_record! {
+  wire IdentityBindingWire for IdentityBindingV1 vis [pub(crate)] {
+    schema IDENTITY_BINDING_SCHEMA,
+    version u64 RECORD_VERSION,
+    algorithm #[n(4)] (String) ED25519_ALGORITHM, algorithm_err "identity record algorithm",
+    limits RECORD_LIMITS,
+    decode [canonical "identity record canonical form", schema_err "identity record schema", version_err "identity record version"]
+    fields {
+      #[n(2)] node = node_id: String => node()
+      #[n(3)] public_key = public_key: ByteVec => key32("identity public key")
+    }
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -871,52 +720,22 @@ impl IdentityBindingV1 {
   pub(crate) fn public_key(&self) -> &PublicKey {
     &self.public_key
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &IdentityBindingWire {
-        schema: IDENTITY_BINDING_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        node_id: self.node.as_str().to_owned(),
-        public_key: self.public_key.as_bytes().to_vec(),
-        algorithm: ED25519_ALGORITHM.to_owned(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: IdentityBindingWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, IDENTITY_BINDING_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    expect_algorithm(&wire.algorithm)?;
-    Ok(Self {
-      node: NodeId::parse(&wire.node_id)?,
-      public_key: PublicKey::from_bytes(fixed_bytes(&wire.public_key, "identity public key")?),
-    })
-  }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct CredentialUseWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  issuer_id: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  generation_id: Vec<u8>,
-  #[n(4)]
-  #[cbor(with = "minicbor::bytes")]
-  merge_id: Vec<u8>,
-  #[n(5)]
-  subject_id: String,
-  #[n(6)]
-  #[cbor(with = "minicbor::bytes")]
-  subject_key: Vec<u8>,
+canonical_record! {
+  wire CredentialUseWire for CredentialUseV1 vis [pub(crate)] {
+    schema CREDENTIAL_USE_SCHEMA,
+    version u64 RECORD_VERSION,
+    limits RECORD_LIMITS,
+    decode [canonical "identity record canonical form", schema_err "identity record schema", version_err "identity record version"]
+    fields {
+      #[n(2)] issuer = issuer_id: String => node()
+      #[n(3)] generation = generation_id: ByteVec => oid16(GenerationId, "credential generation id")
+      #[n(4)] merge = merge_id: ByteVec => oid16(MergeId, "merge id")
+      #[n(5)] subject = subject_id: String => node()
+      #[n(6)] subject_key = subject_key: ByteVec => key32("identity public key")
+    }
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -961,87 +780,30 @@ impl CredentialUseV1 {
   pub(crate) fn subject_key(&self) -> &PublicKey {
     &self.subject_key
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &CredentialUseWire {
-        schema: CREDENTIAL_USE_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        issuer_id: self.issuer.as_str().to_owned(),
-        generation_id: self.generation.as_bytes().to_vec(),
-        merge_id: self.merge.as_bytes().to_vec(),
-        subject_id: self.subject.as_str().to_owned(),
-        subject_key: self.subject_key.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: CredentialUseWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, CREDENTIAL_USE_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    Ok(Self {
-      issuer: NodeId::parse(&wire.issuer_id)?,
-      generation: GenerationId::from_operation(OperationId::from_bytes(fixed_bytes(
-        &wire.generation_id,
-        "credential generation id",
-      )?)),
-      merge: MergeId::from_operation(OperationId::from_bytes(fixed_bytes(
-        &wire.merge_id,
-        "merge id",
-      )?)),
-      subject: NodeId::parse(&wire.subject_id)?,
-      subject_key: PublicKey::from_bytes(fixed_bytes(&wire.subject_key, "identity public key")?),
-    })
-  }
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct MergeGrantBodyWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  #[cbor(with = "minicbor::bytes")]
-  merge_id: Vec<u8>,
-  #[n(3)]
-  subject_id: String,
-  #[n(4)]
-  #[cbor(with = "minicbor::bytes")]
-  subject_key: Vec<u8>,
-  #[n(5)]
-  issuer_id: String,
-  #[n(6)]
-  #[cbor(with = "minicbor::bytes")]
-  generation_id: Vec<u8>,
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct MergeGrantWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u64,
-  #[n(2)]
-  #[cbor(with = "minicbor::bytes")]
-  merge_id: Vec<u8>,
-  #[n(3)]
-  subject_id: String,
-  #[n(4)]
-  #[cbor(with = "minicbor::bytes")]
-  subject_key: Vec<u8>,
-  #[n(5)]
-  issuer_id: String,
-  #[n(6)]
-  #[cbor(with = "minicbor::bytes")]
-  generation_id: Vec<u8>,
-  #[n(7)]
-  #[cbor(with = "minicbor::bytes")]
-  signature: Vec<u8>,
+canonical_record! {
+  wire MergeGrantWire for MergeGrantV1 vis [pub(crate)] {
+    schema MERGE_GRANT_SCHEMA,
+    version u64 RECORD_VERSION,
+    limits RECORD_LIMITS,
+    decode [canonical "identity record canonical form", schema_err "identity record schema", version_err "identity record version"]
+    fields {
+      #[n(2)] merge = merge_id: ByteVec => oid16(MergeId, "merge id")
+      #[n(3)] subject = subject_id: String => node()
+      #[n(4)] subject_key = subject_key: ByteVec => key32("identity public key")
+      #[n(5)] issuer = issuer_id: String => node()
+      #[n(6)] generation = generation_id: ByteVec => oid16(GenerationId, "credential generation id")
+      #[n(7)] signature = signature: ByteVec => sig("identity signature")
+    }
+    signed_body wire MergeGrantBodyWire fn encode_signed_body {
+      #[n(2)] merge: &MergeId as merge_id: ByteVec => oid16(MergeId, "merge id")
+      #[n(3)] subject: &NodeId as subject_id: String => node()
+      #[n(4)] subject_key: &PublicKey as subject_key: ByteVec => key32("identity public key")
+      #[n(5)] issuer: &NodeId as issuer_id: String => node()
+      #[n(6)] generation: &GenerationId as generation_id: ByteVec => oid16(GenerationId, "credential generation id")
+    }
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1089,25 +851,7 @@ impl MergeGrantV1 {
     &self.generation
   }
 
-  /// Encodes the canonical body that the issuer signs.
-  pub(crate) fn encode_signed_body(
-    merge: &MergeId, subject: &NodeId, subject_key: &PublicKey, issuer: &NodeId,
-    generation: &GenerationId,
-  ) -> Result<Vec<u8>> {
-    encode_canonical(
-      &MergeGrantBodyWire {
-        schema: MERGE_GRANT_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        merge_id: merge.as_bytes().to_vec(),
-        subject_id: subject.as_str().to_owned(),
-        subject_key: subject_key.as_bytes().to_vec(),
-        issuer_id: issuer.as_str().to_owned(),
-        generation_id: generation.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
+  /// Encodes the canonical signed body of this grant.
   pub(crate) fn signed_body(&self) -> Result<Vec<u8>> {
     Self::encode_signed_body(
       &self.merge,
@@ -1127,42 +871,6 @@ impl MergeGrantV1 {
       "merge grant signature",
     )
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &MergeGrantWire {
-        schema: MERGE_GRANT_SCHEMA.to_owned(),
-        record_version: RECORD_VERSION,
-        merge_id: self.merge.as_bytes().to_vec(),
-        subject_id: self.subject.as_str().to_owned(),
-        subject_key: self.subject_key.as_bytes().to_vec(),
-        issuer_id: self.issuer.as_str().to_owned(),
-        generation_id: self.generation.as_bytes().to_vec(),
-        signature: self.signature.as_bytes().to_vec(),
-      },
-      RECORD_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: MergeGrantWire = decode_wire(bytes)?;
-    expect_schema(&wire.schema, MERGE_GRANT_SCHEMA)?;
-    expect_version(wire.record_version)?;
-    Ok(Self {
-      merge: MergeId::from_operation(OperationId::from_bytes(fixed_bytes(
-        &wire.merge_id,
-        "merge id",
-      )?)),
-      subject: NodeId::parse(&wire.subject_id)?,
-      subject_key: PublicKey::from_bytes(fixed_bytes(&wire.subject_key, "identity public key")?),
-      issuer: NodeId::parse(&wire.issuer_id)?,
-      generation: GenerationId::from_operation(OperationId::from_bytes(fixed_bytes(
-        &wire.generation_id,
-        "credential generation id",
-      )?)),
-      signature: Signature::from_bytes(fixed_bytes(&wire.signature, "identity signature")?),
-    })
-  }
 }
 
 #[cfg(test)]
@@ -1172,7 +880,7 @@ mod tests {
   use ed25519_dalek::{Signer, SigningKey};
 
   use super::*;
-  use crate::{ErrorKind, QualifiedTag, TransactionId};
+  use crate::{ErrorKind, QualifiedTag, TransactionId, protocol::encode_canonical};
 
   const SUBJECT_NODE: &str = "node_100000000000000000000";
   const ISSUER_NODE: &str = "node_200000000000000000000";
@@ -1515,7 +1223,7 @@ mod tests {
         schema: IDENTITY_BINDING_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
         node_id: SUBJECT_NODE.to_owned(),
-        public_key: vec![0xA1; 31],
+        public_key: ByteVec::from(vec![0xA1; 31]),
         algorithm: ED25519_ALGORITHM.to_owned(),
       },
       RECORD_LIMITS,
@@ -1528,10 +1236,10 @@ mod tests {
         schema: LOCAL_IDENTITY_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
         node_id: SUBJECT_NODE.to_owned(),
-        public_key: SUBJECT_KEY.to_vec(),
+        public_key: ByteVec::from(SUBJECT_KEY.to_vec()),
         algorithm: ED25519_ALGORITHM.to_owned(),
         key_operation_id: OPERATION.to_owned(),
-        key_handle: Vec::new(),
+        key_handle: ByteVec::from(Vec::new()),
       },
       RECORD_LIMITS,
     )
@@ -1543,7 +1251,7 @@ mod tests {
         schema: IDENTITY_BINDING_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
         node_id: SUBJECT_NODE.to_owned(),
-        public_key: SUBJECT_KEY.to_vec(),
+        public_key: ByteVec::from(SUBJECT_KEY.to_vec()),
         algorithm: "radiata.woooo.tech/crypto/ed25519ph".to_owned(),
       },
       RECORD_LIMITS,
@@ -1556,10 +1264,10 @@ mod tests {
         schema: CREDENTIAL_USE_SCHEMA.to_owned(),
         record_version: RECORD_VERSION,
         issuer_id: ISSUER_NODE.to_owned(),
-        generation_id: vec![0xC3; 15],
-        merge_id: ADMISSION_BYTES.to_vec(),
+        generation_id: ByteVec::from(vec![0xC3; 15]),
+        merge_id: ByteVec::from(ADMISSION_BYTES.to_vec()),
         subject_id: SUBJECT_NODE.to_owned(),
-        subject_key: SUBJECT_KEY.to_vec(),
+        subject_key: ByteVec::from(SUBJECT_KEY.to_vec()),
       },
       RECORD_LIMITS,
     )
