@@ -1,4 +1,4 @@
-//! Three-hop routed packet streams over real TLS (E2E-05, T-G06-05).
+//! Three-hop routed packet streams over real TLS.
 //!
 //! Four nodes form a linear topology A — B — C — D with sessions only
 //! between adjacent members. Every node registers the same shared next-hop

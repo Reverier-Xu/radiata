@@ -1,4 +1,4 @@
-//! The node-local route table (ADR-0007): bounded in-memory trace
+//! The node-local route table: bounded in-memory trace
 //! metadata only — identity, selected node, progress, terminal state.
 //! Never payload bytes, no durability claim; the durable twin lives in
 //! [`crate::routing::trace`].
@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// The shared node-local route table: bounded in-memory trace metadata
-/// (ADR-0007: identity, selected node, progress, terminal state — never
+/// (identity, selected node, progress, terminal state — never
 /// payload bytes, no durability claim). Routing-domain state: session
 /// framing only borrows it while demultiplexing frames.
 pub(crate) type RouteTable = Arc<Mutex<BTreeMap<TraceId, RouteRecord>>>;

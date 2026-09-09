@@ -1,10 +1,9 @@
-//! Session-carried membership sync (G5-05/06 wiring, rebaselined by
-//! ADR-0009).
+//! Session-carried membership sync.
 //!
 //! An authenticated session carries two bounded sync payloads in one
 //! direction: a [`MembershipPage`] of node descriptors and the issuer
 //! [`TrustSnapshotV1`] binding set. Entries are trusted through the
-//! authenticated session that delivered them (ADR-0008); decoding checks
+//! authenticated session that delivered them; decoding checks
 //! only canonical wire rules and bounded capacities. Every node refreshes
 //! its own snapshot when its binding set changes, and every member pages
 //! its local descriptors, so reciprocal trust, exact descriptors, and
@@ -135,9 +134,9 @@ impl SyncPayload {
 }
 
 /// The core receiver of membership sync streams over authenticated
-/// sessions. Entries are trusted through the session that delivered them
-/// (ADR-0008); decoding enforces canonical wire rules and bounded
-/// capacities before install.
+/// sessions. Entries are trusted through the session that delivered them;
+/// decoding enforces canonical wire rules and bounded capacities before
+/// install.
 #[derive(Debug)]
 pub(crate) struct MembershipSyncConsumer {
   // Held weakly so the registry shared with a live node handle never pins
@@ -233,9 +232,9 @@ impl LeaveAppliedSignal {
   }
 }
 
-/// The bounded wait for the first leave-record admission acknowledgement
-/// (ADR-0009 decision 3): five seconds, well inside the fixed
-/// authentication deadline's order of magnitude.
+/// The bounded wait for the first leave-record admission acknowledgement:
+/// five seconds, well inside the fixed authentication deadline's order of
+/// magnitude.
 const LEAVE_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The bounded wait for flushing the record bodies after the first
@@ -246,7 +245,7 @@ const LEAVE_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// evidence).
 const LEAVE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The leave-plane announcement (ADR-0009 decision 3): injects the
+/// The leave-plane announcement: injects the
 /// owner-signed leave record into every connected session and waits at
 /// most [`LEAVE_ACK_WAIT`] for the first durable-install receipt
 /// (post-receipt peers) or the first admission acknowledgement
@@ -370,7 +369,7 @@ async fn accept_payload(
   match payload {
     SyncPayload::Page(encoded) => {
       let page = MembershipPage::decode(encoded.as_ref())?;
-      // Every newly installed descriptor is one member change (T-G09-07).
+      // Every newly installed descriptor is one member change.
       let installed = page_sync::apply_page_ctx(store, entropy.as_ref(), &page).await?;
       for node in installed {
         member_changed(events, revision, node);
@@ -380,7 +379,7 @@ async fn accept_payload(
       let snapshot = TrustSnapshotV1::decode(encoded.as_ref())?;
       // The issuer's declared key must match its locally trusted binding
       // when one exists: a substitution is conflicting evidence and fails
-      // closed (ADR-0009: snapshots are per-issuer, trusted through the
+      // closed (snapshots are per-issuer, trusted through the
       // authenticated session and the binding set they extend).
       let bindings = trust_store::trusted_bindings(store).await?;
       if let Some(known) = bindings.get(snapshot.issuer())
@@ -392,7 +391,7 @@ async fn accept_payload(
       // Binding adoption is best effort per record: a transient store
       // contention on one binding must not abort the remaining bindings of
       // the snapshot; the next delivery retries what was skipped
-      // (anti-entropy repair, SC-G05-P0-07).
+      // (anti-entropy repair).
       for binding in snapshot.bindings() {
         if let Err(error) =
           trust_store::persist_binding_ctx(store, entropy.as_ref(), binding.node(), binding.key())
@@ -407,8 +406,8 @@ async fn accept_payload(
       }
     }
     SyncPayload::Leave(encoded) => {
-      // An owner-signed leave record is terminal evidence (ADR-0009
-      // decision 3): verified against the permanently retained binding
+      // An owner-signed leave record is terminal evidence: verified
+      // against the permanently retained binding
       // before any persistence. A record whose binding has not converged
       // yet is skipped; the resend cadence heals the ordering.
       let record = crate::identity::leave::LeaveRecordV1::decode(encoded.as_ref())?;
@@ -425,7 +424,7 @@ async fn accept_payload(
       crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
       tracing::debug!(node = %record.node(), "leave record persisted on peer");
       member_changed(events, revision, record.node().clone());
-      // The applied receipt (ADR-0009 decision 3): one durable-install
+      // The applied receipt: one durable-install
       // confirmation back to the leaver, best-effort and retried by the
       // announcement budget. Pre-receipt peers simply never send it.
       let receipt = SyncPayload::LeaveApplied {
@@ -448,8 +447,8 @@ async fn accept_payload(
       leave_applied.bump();
     }
     SyncPayload::Cleanup(encoded) => {
-      // An issuer-signed cleanup tombstone is terminal evidence (ADR-0009
-      // decision 4): verified against the retained issuer and subject
+      // An issuer-signed cleanup tombstone is terminal evidence: verified
+      // against the retained issuer and subject
       // bindings before any persistence. A tombstone whose bindings have
       // not converged yet is skipped; the resend cadence heals ordering.
       let record = crate::identity::cleanup::CleanupRecordV1::decode(encoded.as_ref())?;
@@ -463,8 +462,8 @@ async fn accept_payload(
       member_changed(events, revision, record.subject().clone());
     }
     SyncPayload::Revocation(encoded) => {
-      // A revocation tombstone is convergent permanent evidence (ADR-0009
-      // decision 6): verified against the retained issuer and subject
+      // A revocation tombstone is convergent permanent evidence: verified
+      // against the retained issuer and subject
       // bindings before any persistence, never covered by checkpoints, and
       // never re-adoptable away. A tombstone whose bindings have not
       // converged yet is skipped; the resend cadence heals ordering.
@@ -478,8 +477,8 @@ async fn accept_payload(
       events.emit(crate::NodeRevoked::new(record.subject().clone()));
     }
     SyncPayload::Checkpoint(encoded) => {
-      // A cleanup checkpoint is unsigned hygiene knowledge (ADR-0009
-      // decision 5): max-wins by watermark, never gating live entries or
+      // A cleanup checkpoint is unsigned hygiene knowledge: max-wins by
+      // watermark, never gating live entries or
       // revocations.
       let checkpoint = crate::identity::cleanup::CleanupCheckpointV1::decode(encoded.as_ref())?;
       crate::identity::cleanup::persist_checkpoint_ctx(store, entropy.as_ref(), &checkpoint)
@@ -520,7 +519,7 @@ pub(crate) async fn ensure_local_descriptor(
     }
     // An empty candidate set never downgrades published endpoints: the
     // startup tick fires before any listener exists and must not bump the
-    // revision (descriptor endpoint stability, SC-G05-P0-25).
+    // revision (descriptor endpoint stability).
     if endpoints.is_empty() {
       return Ok(());
     }
@@ -595,7 +594,7 @@ pub(crate) async fn refresh_issuer_snapshot(
 
 /// Persists one verified snapshot plus its binding observations, so the
 /// issuer's own trust page and every receiver's page expose the exact
-/// binding set (SC-G05-P0-25).
+/// binding set.
 async fn persist_snapshot_with_bindings(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>, snapshot: &TrustSnapshotV1,
 ) -> Result<()> {
@@ -611,7 +610,7 @@ async fn persist_snapshot_with_bindings(
 /// snapshot when this node is the creator, and push a bounded page plus the
 /// latest snapshot over every authenticated session. The work per tick is
 /// bounded: one page and one snapshot per session, nothing paged to
-/// exhaustion (SC-G05-P0-06).
+/// exhaustion.
 /// The driver's per-node anti-entropy continuation state.
 #[derive(Default)]
 pub(crate) struct SyncCursor {
@@ -641,7 +640,7 @@ const LEAVE_RESEND_CAP: usize = 64;
 
 /// Snapshot deliveries are retried on this slow cadence even when the
 /// grant set is unchanged, so a dropped payload heals instead of stalling
-/// a peer forever (anti-entropy, SC-G05-P0-07).
+/// a peer forever (anti-entropy).
 const SNAPSHOT_RESEND_TICKS: u32 = 8;
 /// Page deliveries are retried on this slower cadence for the same reason.
 const PAGE_RESEND_TICKS: u32 = 32;
@@ -672,7 +671,7 @@ pub(crate) async fn sync_tick(
   let snapshot = refresh_issuer_snapshot(context, entropy).await?;
   // Removal tombstones (leave, cleanup) ride the same anti-entropy plane:
   // forward the known (bounded) sets whenever a snapshot round sends, so a
-  // lost delivery heals on the resend cadence (ADR-0009 decisions 3-4).
+  // lost delivery heals on the resend cadence.
   let leave_records =
     crate::identity::leave::known_leave_records_ctx(store, LEAVE_RESEND_CAP).await?;
   let cleanup_records =
@@ -693,9 +692,7 @@ pub(crate) async fn sync_tick(
   // A paged anti-entropy round advances the cursor only while it is
   // sending; a steady state with an unchanged first page never turns the
   // cursor, so the page content (and its fingerprint) cannot change
-  // between ticks and the quiet state costs no sends at all (T-G10-06
-  // soak finding: an unconditional cursor turn re-sent every page every
-  // tick, keeping one frame in flight permanently).
+  // between ticks and the quiet state costs no sends at all.
   let starting_round = cursor.page.is_none();
   let page = page_sync::emit_page_ctx(
     store,
@@ -707,7 +704,7 @@ pub(crate) async fn sync_tick(
   let page_bytes = page_payload.encode()?;
   // A round starts when the first page's content or the alive-peer set
   // changed, and is retried on a slow cadence otherwise (lost-delivery
-  // healing, SC-G05-P0-07). Mid-round pages always send: they are the
+  // healing). Mid-round pages always send: they are the
   // continuation of an already-started round.
   let page_fp = page.fingerprint();
   let page_due = if starting_round {
@@ -726,7 +723,7 @@ pub(crate) async fn sync_tick(
   // A snapshot is sent when its revision advanced, and retried on a slow
   // cadence even when unchanged: re-sending the same revision to every
   // session every tick floods the store with idempotent commits, but a
-  // lost delivery must still heal (SC-G05-P0-07).
+  // lost delivery must still heal.
   let snapshot_payload = match &snapshot {
     Some(snapshot)
       if snapshot.revision() != cursor.snapshot_rev
@@ -802,7 +799,7 @@ pub(crate) async fn sync_tick(
   Ok(())
 }
 
-/// The post-round checkpoint GC (ADR-0009 decision 5): collect the
+/// The post-round checkpoint GC: collect the
 /// leave/cleanup tombstones at or before the local checkpoint watermark.
 /// Hygiene only — a failure is logged and retried next round.
 async fn gc_collected_tombstones(
@@ -824,9 +821,8 @@ mod tests {
   }
 
   /// Every sync payload kind round-trips through the canonical wire,
-  /// including the additive leave-applied receipt (SC-G11-P0-16/17's
-  /// receipt arm): the leaver correlates by subject, so the subject must
-  /// survive the encoding exactly.
+  /// including the additive leave-applied receipt: the leaver correlates
+  /// by subject, so the subject must survive the encoding exactly.
   #[test]
   fn sync_payload_kinds_round_trip() {
     let payloads = vec![

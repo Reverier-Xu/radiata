@@ -1073,7 +1073,7 @@ mod tests {
   }
 
   #[test]
-  fn simulation_frame_sequence_has_no_total_byte_ceiling() {
+  fn simulation_frame_sequence_enforces_per_frame_byte_limits_only() {
     let link = LinkKey::new(NodeKey::new(1), NodeKey::new(2));
     let mut topology = topology(SimulationLimits::new(4, 1, 1, 8, 64, 8).unwrap());
     topology.add_link(link, policy(1, 0, 0, 0, 0)).unwrap();
@@ -1362,7 +1362,7 @@ mod tests {
   }
 
   #[test]
-  #[ignore = "run by VERIFY-G01-03 as the fixed 1000-seed gate"]
+  #[ignore = "fixed 1000-seed gate, run by the CI simulator step"]
   fn simulation_network_fault_matrix_gate() {
     assert_fault_matrix(0..1_000);
   }

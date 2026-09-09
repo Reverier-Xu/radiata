@@ -1,15 +1,14 @@
-//! Two-component metadata merge E2E (T-G07-06, E2E-06).
+//! Two-component metadata merge exercised end-to-end.
 //!
 //! The real anti-entropy driver pages local metadata over authenticated
-//! sessions (proven end-to-end for sessions and routing lanes in
-//! G5/G6); this lane proves the G7 claim on top of that transport: two
+//! sessions; this module drives the same ordinary bounded pages: two
 //! eight-node components that changed owner-revision node records and
-//! generic resources converge, after healing, through the same ordinary
-//! bounded pages — node records by strictly-increasing owner revision and
-//! resources by the signed timestamp-maximum tuple. No whole-catalog
-//! materialization, no causal or freshness ordering, no population
-//! ceiling: the 1,024-record profile converges identically through paged
-//! scans, and a changeless second pass transfers nothing (SC-G07-P0-16..18).
+//! generic resources converge, after healing, through those pages — node
+//! records by strictly-increasing owner revision and resources by the
+//! signed timestamp-maximum tuple. No whole-catalog materialization, no
+//! causal or freshness ordering, no population ceiling: the 1,024-record
+//! profile converges identically through paged scans, and a changeless
+//! second pass transfers nothing.
 
 use std::sync::Arc;
 
@@ -161,9 +160,9 @@ async fn converge(sides: [&MetadataStore; 2]) -> usize {
   total_applied
 }
 
-/// E2E-06 / SC-G07-P0-16: two eight-node components change owner-revision
-/// node records and generic resources; after healing, ordinary bounded
-/// pages converge node records by revision and resources by signed tuple.
+/// Two eight-node components change owner-revision node records and
+/// generic resources; after healing, ordinary bounded pages converge node
+/// records by revision and resources by signed tuple.
 #[tokio::test]
 async fn eight_plus_eight_components_merge_by_revision_and_tuple() {
   let (_, side_a) = open_store().await;
@@ -283,12 +282,12 @@ async fn eight_plus_eight_components_merge_by_revision_and_tuple() {
     );
   }
 
-  // A changeless second pass transfers nothing (SC-G07-P1-12).
+  // A changeless second pass transfers nothing.
   assert_eq!(converge([&side_a, &side_b]).await, 0);
 }
 
-/// SC-G07-P0-17: the 1,024-profile participates with no over-population
-/// rejection, no whole-catalog materialization, and paged convergence.
+/// The 1,024-profile participates with no over-population rejection, no
+/// whole-catalog materialization, and paged convergence.
 #[tokio::test]
 async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
   let (_, side_a) = open_store().await;
@@ -388,16 +387,14 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
       "name {seed} must converge identically on both components"
     );
   }
-  // Hygiene guard only: this layer makes no latency qualification claim —
-  // the qualified 16-node SLO workload sample lives in the public-facade
-  // membership_sync lane (SC-G07-P0-18). The bound tolerates
-  // parallel-test contention on slow CI runners.
+  // Hygiene guard only: this layer makes no latency qualification claim.
+  // The bound tolerates parallel-test contention on slow CI runners.
   assert!(started.elapsed() < std::time::Duration::from_secs(120));
 }
 
-/// SC-G07-P0-11: restart and readdress repair through the ordinary tick —
-/// never reconnect-only logic or false convergence acknowledgement. Side
-/// B loses and reopens its store handle (a process restart over durable
+/// Restart and readdress repair through the ordinary tick — never
+/// reconnect-only logic or false convergence acknowledgement. Side B
+/// loses and reopens its store handle (a process restart over durable
 /// storage) mid-convergence, and writer B's endpoint candidate changes at
 /// a strictly higher owner revision (readdress); the ordinary bounded
 /// pages converge both sides to the highest revision and the winning

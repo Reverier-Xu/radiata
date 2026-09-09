@@ -1,4 +1,4 @@
-//! Exact authenticated feature selection (ADR-0002).
+//! Exact authenticated feature selection.
 //!
 //! Both peers independently compute the same effective feature set:
 //!
@@ -69,14 +69,13 @@ pub(crate) struct Selection {
 }
 
 impl Selection {
-  /// The selected feature set; surfaced to callers by G3-04's selection
-  /// evidence.
+  /// The selected feature set.
   #[allow(dead_code)]
   pub(crate) fn features(&self) -> &[FeatureTag] {
     &self.features
   }
 
-  /// The effective negotiated limits; surfaced by G3-04.
+  /// The effective negotiated limits.
   #[allow(dead_code)]
   pub(crate) fn limits(&self) -> &[(QualifiedTag, u64)] {
     &self.limits
@@ -87,7 +86,7 @@ impl Selection {
     &self.bytes
   }
 
-  /// One effective limit by tag (G3-04 selection evidence).
+  /// One effective limit by tag.
   #[allow(dead_code)]
   pub(crate) fn limit(&self, tag: &QualifiedTag) -> Option<u64> {
     self
@@ -565,8 +564,6 @@ mod tests {
     )
     .unwrap()
   }
-
-  // ---- T-G03-04 feature selection evidence ----
 
   #[test]
   fn handshake_selection_required_order_permutations_are_identical() {

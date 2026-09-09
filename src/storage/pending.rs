@@ -357,7 +357,7 @@ impl PendingTransactionV1 {
   }
 
   /// Canonical wire encoding of the pending-transaction record; shared
-  /// by the receipt engine and the G10 compatibility freeze reader.
+  /// by the receipt engine and the compatibility freeze reader.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical(
       &PendingTransactionWire {
@@ -376,7 +376,7 @@ impl PendingTransactionV1 {
     )
   }
 
-  /// The canonical pending-transaction decoder; the G10 compatibility
+  /// The canonical pending-transaction decoder; the compatibility
   /// freeze reader consumes the same fail-closed path as the engine.
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
     let wire: PendingTransactionWire =
@@ -774,9 +774,9 @@ pub(super) fn pending_namespace() -> Result<StoreNamespace> {
   Ok(StoreNamespace::new(tag))
 }
 
-/// Counts pending journal records for the bounded runtime status view
-/// (T-G10-05). The journal is bounded by construction (one record per
-/// in-flight transaction); the count never exposes record contents.
+/// Counts pending journal records for the bounded runtime status view.
+/// The journal is bounded by construction (one record per in-flight
+/// transaction); the count never exposes record contents.
 pub(crate) async fn pending_transaction_count(
   store: &crate::storage::MetadataStore,
 ) -> Result<usize> {

@@ -363,9 +363,8 @@ pub struct StoreNamespace(QualifiedTag);
 
 impl StoreNamespace {
   /// The namespace is a plain wrapper over an already-validated
-  /// [`QualifiedTag`]; unlike the parse-side constructors it cannot fail,
-  /// so the old vestigial `Result` (which forced a `?` on every caller
-  /// for validation that never happened) is gone.
+  /// [`QualifiedTag`]; construction cannot fail and performs no further
+  /// validation.
   pub const fn new(value: QualifiedTag) -> Self {
     Self(value)
   }
@@ -648,7 +647,7 @@ pub trait StoreScan: fmt::Debug + Send {
   fn next<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<StoreEntry>>>;
 }
 
-/// Converts one provider [`StoreScan`] into the standard stream view (R2):
+/// Converts one provider [`StoreScan`] into the standard stream view:
 /// consumers compose scans with the ecosystem stream combinators while
 /// providers keep implementing the explicit cursor [`StoreScan::next`].
 /// Items preserve scan order and the crate's typed error.
@@ -833,11 +832,11 @@ mod tests {
   };
   use crate::{Digest, QualifiedTag, TransactionId};
 
-  /// SC-G11-P1-05: the `StoreScan` to `BoxStream` converter preserves
+  /// The `StoreScan` to `BoxStream` converter preserves
   /// order, items, end-of-scan, and the typed error, matching an explicit
   /// `next()` loop exactly.
   #[tokio::test]
-  async fn g11_store_scan_stream_matches_next_loop_parity() {
+  async fn store_scan_stream_matches_next_loop_parity() {
     use futures_util::StreamExt;
 
     #[derive(Debug)]
@@ -894,7 +893,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_store_requirements_expose_every_required_capability() {
+  fn core_store_requirements_expose_every_required_capability() {
     let requirements = StoreRequirements {
       required_durability: DurabilityLevel::OsCrashDurable,
       conditional_batch: true,
@@ -916,7 +915,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_store_transaction_digest_is_canonical_and_redacted() {
+  fn core_store_transaction_digest_is_canonical_and_redacted() {
     let mut transaction = transaction_fixture(1, b"secret-value");
     let computed = transaction.computed_operation_digest();
     transaction.operation_digest = computed.clone();
@@ -952,7 +951,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_store_transaction_rejects_duplicate_identities_across_variants() {
+  fn core_store_transaction_rejects_duplicate_identities_across_variants() {
     let namespace =
       StoreNamespace::new(QualifiedTag::parse("radiata.woooo.tech/metadata/duplicates").unwrap());
     let key = StoreKey::new(Arc::from(b"same-key".as_slice()));
@@ -1009,7 +1008,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_store_transaction_accepts_large_unique_operation_set() {
+  fn core_store_transaction_accepts_large_unique_operation_set() {
     const OPERATION_COUNT: usize = 16_384;
     let namespace =
       StoreNamespace::new(QualifiedTag::parse("radiata.woooo.tech/metadata/large").unwrap());

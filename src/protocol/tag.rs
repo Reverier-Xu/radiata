@@ -7,7 +7,7 @@ pub(crate) const MAX_TAG_LEN: usize = 128;
 const MAX_COMPONENT_LEN: usize = 63;
 
 /// The builtin domain: its `crypto` category is reserved for signature
-/// domains and never available as a qualified tag (ADR-0001), and the
+/// domains and never available as a qualified tag, and the
 /// feature registry independently rejects caller definitions under the
 /// whole domain. One constant so tag grammar and the registry cannot
 /// drift apart.

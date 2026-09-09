@@ -1,4 +1,4 @@
-//! Selector-driven paged resource selection (T-G09-02, ADR-0007).
+//! Selector-driven paged resource selection.
 //!
 //! Selection evaluates a bounded [`Selector`] against each winner's full
 //! label space — the reserved type and URI labels plus the custom labels —
@@ -17,7 +17,7 @@ use crate::{
 
 /// Whether `record`'s full label space satisfies `selector`: the reserved
 /// type/URI labels resolve to the record's reserved fields and every other
-/// key resolves against the custom labels (SC-G09-P1-07).
+/// key resolves against the custom labels.
 pub(crate) fn record_matches(record: &ResourceRecordV1, selector: &Selector) -> bool {
   fn lookup<'a>(record: &'a ResourceRecordV1) -> impl Fn(&QualifiedTag) -> Option<&'a str> {
     move |tag| {
@@ -45,7 +45,7 @@ pub(crate) fn resource_view(record: &ResourceRecordV1) -> crate::ResourceView {
 }
 
 /// Pages the live resource winners matching `selector` in canonical name
-/// order (SC-G09-P1-08): deterministic unsigned-byte key order, bounded
+/// order: deterministic unsigned-byte key order, bounded
 /// pages, cursor continuation, and no whole-population output.
 pub(crate) async fn select_page_ctx(
   store: &MetadataStore, selector: &Selector, cursor: Option<&crate::PageCursor>, limit: usize,
@@ -198,7 +198,7 @@ mod tests {
   }
 
   /// Selection evaluates the reserved type/URI labels and the custom
-  /// labels through every grammar operator (SC-G09-P1-07 over records).
+  /// labels through every grammar operator against stored records.
   #[tokio::test]
   async fn selection_matches_reserved_and_custom_labels() {
     let store = open_store().await;
@@ -238,7 +238,7 @@ mod tests {
   /// Pages are bounded and cursor-complete: no page exceeds the limit,
   /// the limit clamps to the public view bound, and the walk covers the
   /// catalog exactly once in canonical name order without a
-  /// whole-population output (SC-G09-P1-08, THR-024-adjacent bounds).
+  /// whole-population output.
   #[tokio::test]
   async fn selection_pages_are_bounded_and_cursor_complete() {
     let store = open_store().await;
@@ -268,7 +268,7 @@ mod tests {
   }
 
   /// A winner that is a signed removal reads as absent; a losing removal
-  /// never hides the live winner (SC-G09-P1-08 with SC-G07 retention).
+  /// never hides the live winner.
   #[tokio::test]
   async fn removed_winners_read_as_absent() {
     let store = open_store().await;
@@ -284,10 +284,9 @@ mod tests {
     assert_eq!(walked, [name(2).as_str().to_owned()]);
   }
 
-  /// SC-G09-P1-08: after concurrent label writes converge through
-  /// ordinary pages, both members return the same deterministically
-  /// ordered names for every selector; neither side's stale local
-  /// observation is authoritative.
+  /// After concurrent label writes converge through ordinary pages, both
+  /// members return the same deterministically ordered names for every
+  /// selector; neither side's stale local observation is authoritative.
   #[tokio::test]
   async fn converged_members_return_identical_ordered_selections() {
     let store_a = open_store().await;

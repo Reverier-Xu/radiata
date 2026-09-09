@@ -1,8 +1,6 @@
 schema = "radiata.woooo.tech/schemas/fuzz-corpus-v1"
 status = "accepted"
 target = "wire_decode"
-owner_task = "T-G10-03"
-reviewer_task = "T-G10-03"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
 minimizer = { tool = "none", version = "0" }
 aggregate = { entry_count = 10, total_bytes = 863 }

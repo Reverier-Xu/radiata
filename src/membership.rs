@@ -1,9 +1,9 @@
-//! Owner-marked node descriptors (G5-01, ADR-0008 session-trust boundary).
+//! Owner-marked node descriptors (session-trust boundary).
 //!
 //! A [`NodeDescriptorV1`] is the node-owned revision record: it carries the
 //! owning node's `NodeId` marking, its endpoint candidates, a strictly
 //! increasing revision, and the removal flag. Entries are trusted through
-//! the authenticated session that delivered them (ADR-0008), so they carry
+//! the authenticated session that delivered them, so they carry
 //! no per-entry signatures. Core accepts an update only at a strictly
 //! higher revision; stale and repeated revisions cannot replace the
 //! current record, and a retained removal marker defeats reordered or
@@ -19,8 +19,8 @@ pub(crate) use crate::storage::families::NODE_DESCRIPTOR_NAMESPACE;
 
 /// One owner-marked node descriptor.
 ///
-/// The record carries the owning node's capability labels from G6 onward
-/// (record version 2); version 1 records without labels remain decodable
+/// The record carries the owning node's capability labels (record
+/// version 2); version 1 records without labels remain decodable
 /// as the previous fixture shape and always decode to an empty label set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NodeDescriptorV1 {
@@ -171,7 +171,7 @@ pub(crate) fn node_descriptor_digest(descriptor: &NodeDescriptorV1) -> Result<cr
 /// routed candidate reads) flows through here so the view shape cannot
 /// drift between them.
 /// Applies one owner-only metadata patch to a descriptor and returns the
-/// descriptor at the next revision (ADR-0007 owner records): endpoint adds
+/// descriptor at the next revision (owner records): endpoint adds
 /// must be new, endpoint removals must exist, label set/insert flows
 /// through the label namespace rules, and label removals must exist.
 /// Single-sourced here — next to the descriptor type it mutates — so any
@@ -302,8 +302,7 @@ pub(crate) mod store {
   /// diverging forever — including a first install at a higher revision
   /// for a node whose trusted binding already exists (the member updated
   /// its labels before its first descriptor page ever arrived here);
-  /// a removal marker is never replaced by an older
-  /// live descriptor (SC-G05-P0-03, ADR-0008).
+  /// a removal marker is never replaced by an older live descriptor.
   pub(crate) async fn store_descriptor_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, descriptor: &NodeDescriptorV1,
   ) -> Result<()> {
@@ -426,8 +425,8 @@ mod tests {
     ))
   }
 
-  /// SC-G05-P0-02: membership entries are keyed under their marked owner
-  /// and round-trip their identity marking through the canonical wire.
+  /// Membership entries are keyed under their marked owner and round-trip
+  /// their identity marking through the canonical wire.
   #[test]
   fn descriptor_carries_owner_marking() {
     let descriptor = descriptor(1, 1, vec!["one.example"], false);
@@ -437,8 +436,8 @@ mod tests {
     assert_eq!(decoded.public_key(), &key(1));
   }
 
-  /// SC-G05-P0-03: a record is replaced only by a strictly higher
-  /// revision, and a skipped intermediate revision still heals the gap.
+  /// A record is replaced only by a strictly higher revision, and a
+  /// skipped intermediate revision still heals the gap.
   #[tokio::test]
   async fn descriptor_store_enforces_monotonic_revisions() {
     let factory = factory();
@@ -476,7 +475,7 @@ mod tests {
     );
   }
 
-  /// SC-G05-P0-04: a removal marker defeats replayed older descriptors.
+  /// A removal marker defeats replayed older descriptors.
   #[tokio::test]
   async fn descriptor_removal_marker_defeats_replay() {
     let factory = factory();
@@ -504,8 +503,8 @@ mod tests {
     );
   }
 
-  /// SC-G05-P0-05: golden compatibility vectors — current fixtures decode
-  /// to expected values; unknown versions fail closed.
+  /// Golden compatibility vectors — current fixtures decode to expected
+  /// values; unknown versions fail closed.
   #[test]
   fn descriptor_compatibility_vectors() {
     // Round-trip produces the expected canonical values.

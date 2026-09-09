@@ -18,8 +18,8 @@ pub(crate) fn to_seconds(time: SystemTime) -> u64 {
 }
 
 /// Current host wall-clock seconds, used for protocol-visible liveness and
-/// expiry boundaries (roadmap: host `SystemTime` is the only time
-/// authority; injected clocks wrap these conversions for tests).
+/// expiry boundaries. Host `SystemTime` is the only time authority;
+/// injected clocks wrap these conversions for tests.
 pub(crate) fn now_seconds() -> u64 {
   to_seconds(SystemTime::now())
 }
@@ -33,8 +33,7 @@ pub(crate) fn to_millis(time: SystemTime) -> u64 {
 }
 
 /// Current host wall-clock milliseconds; resource writes stamp their
-/// signed tuple with this host reading (roadmap: host `SystemTime` is the
-/// only time authority).
+/// signed tuple with this host reading.
 pub(crate) fn now_millis() -> u64 {
   to_millis(SystemTime::now())
 }
@@ -55,9 +54,9 @@ mod tests {
 
   use super::{from_millis, to_millis, to_seconds};
 
-  // SC-G07-P0-01: host `SystemTime` is the only ordering authority and
-  // conversions are total — a wall-clock rollback below the epoch
-  // saturates at zero instead of failing bounded work.
+  // Host `SystemTime` is the only ordering authority and conversions are
+  // total — a wall-clock rollback below the epoch saturates at zero
+  // instead of failing bounded work.
   #[test]
   fn conversions_are_total_and_saturate_at_the_epoch() {
     assert_eq!(to_seconds(UNIX_EPOCH), 0);
@@ -69,7 +68,7 @@ mod tests {
     assert_eq!(to_millis(later), 1_500);
   }
 
-  // SC-G07-P0-01: stored millisecond timestamps round-trip exactly, so a
+  // Stored millisecond timestamps round-trip exactly, so a
   // clock freeze re-reads the same instant and a rollback restores an
   // earlier recorded value without drift.
   #[test]

@@ -534,15 +534,13 @@ impl MetadataStore {
     }
   }
 
-  /// Whether the store is frozen on an indeterminate outcome and the
-  /// runtime must block new admission-sensitive operations (credential
-  /// rotation, reuse, signing, and networking) until an authoritative
-  /// reopen reconciles the exact transaction or proves absence.
   /// Whether the store is blocked on an indeterminate outcome: frozen and
   /// no provider call in flight. A frozen state with an active provider
   /// call is an ordinary in-flight commit that will complete momentarily;
-  /// it is not a block (THR-015 applies to indeterminate outcomes awaiting
-  /// authoritative reopen, not to completing commits).
+  /// it is not a block. While blocked, the runtime refuses new
+  /// admission-sensitive operations (credential rotation, reuse, signing,
+  /// and networking) until an authoritative reopen reconciles the exact
+  /// transaction or proves absence.
   pub(crate) fn is_blocked(&self) -> Result<bool> {
     Ok(matches!(
       *self.lock_state()?,

@@ -8,7 +8,7 @@ use radiata::{
 };
 
 #[test]
-fn g1_core_ids_round_trip_canonical_forms() {
+fn core_ids_round_trip_canonical_forms() {
   let node = NodeId::parse("node_0123456789abcdefghijk").unwrap();
   let trace = TraceId::parse("trace_0123456789ABCDEFGHIJK").unwrap();
   let transaction = TransactionId::parse("txn_abcdefghijklmnopqrstu").unwrap();
@@ -23,7 +23,7 @@ fn g1_core_ids_round_trip_canonical_forms() {
 }
 
 #[test]
-fn g1_core_ids_reject_noncanonical_forms() {
+fn core_ids_reject_noncanonical_forms() {
   for value in [
     "node_0123456789abcdefghij",
     "node_0123456789abcdefghijkl",
@@ -51,7 +51,7 @@ fn g1_core_ids_reject_noncanonical_forms() {
 }
 
 #[test]
-fn g1_core_tags_parse_current_namespaces_and_categories() {
+fn core_tags_parse_current_namespaces_and_categories() {
   let tag = QualifiedTag::parse("radiata.woooo.tech/features/session-core").unwrap();
   assert_eq!(tag.domain(), "radiata.woooo.tech");
   assert_eq!(tag.category(), "features");
@@ -65,7 +65,7 @@ fn g1_core_tags_parse_current_namespaces_and_categories() {
 }
 
 #[test]
-fn g1_core_tags_reject_noncanonical_namespaces() {
+fn core_tags_reject_noncanonical_namespaces() {
   let too_long_name = "a".repeat(64);
   let too_long_tag = format!("example.com/features/{too_long_name}");
   for value in [
@@ -82,7 +82,7 @@ fn g1_core_tags_reject_noncanonical_namespaces() {
 }
 
 #[test]
-fn g1_core_config_accepts_nonzero_values_above_superseded_maxima() {
+fn core_config_accepts_nonzero_values_above_the_default_maxima() {
   let parser = ParserLimits::new(16 * 1024 * 1024, 2_048, 2_048).unwrap();
   let trace =
     TraceMetadataLimits::new(65_537, 1_048_577, Duration::from_secs(31 * 24 * 60 * 60)).unwrap();
@@ -113,7 +113,7 @@ fn g1_core_config_accepts_nonzero_values_above_superseded_maxima() {
 }
 
 #[test]
-fn g1_core_config_rejects_only_invalid_foundation_relationships() {
+fn core_config_rejects_only_invalid_foundation_relationships() {
   assert!(ParserLimits::new(0, 1, 1).is_err());
   assert!(ParserLimits::new(1, 0, 1).is_err());
   assert!(ParserLimits::new(1, 1, 0).is_err());
@@ -144,7 +144,7 @@ fn g1_core_config_rejects_only_invalid_foundation_relationships() {
 }
 
 #[test]
-fn g1_core_provider_errors_match_manifest_and_remain_redacted() {
+fn core_provider_errors_match_manifest_and_remain_redacted() {
   let cases = [
     (
       ProviderErrorKind::UnsupportedSchema,
@@ -165,7 +165,7 @@ fn g1_core_provider_errors_match_manifest_and_remain_redacted() {
 }
 
 #[test]
-fn g1_core_byte_wrappers_require_explicit_access() {
+fn core_byte_wrappers_require_explicit_access() {
   let digest = Digest::from_bytes([7; 32]);
   let public_key = PublicKey::from_bytes([8; 32]);
   let signature = Signature::from_bytes([9; 64]);
@@ -180,7 +180,7 @@ fn g1_core_byte_wrappers_require_explicit_access() {
 
 proptest! {
   #[test]
-  fn g1_core_generated_ids_round_trip(suffix in "[0-9a-zA-Z]{21}") {
+  fn core_generated_ids_round_trip(suffix in "[0-9a-zA-Z]{21}") {
     let node = format!("node_{suffix}");
     let trace = format!("trace_{suffix}");
     let transaction = format!("txn_{suffix}");
@@ -191,7 +191,7 @@ proptest! {
   }
 
   #[test]
-  fn g1_core_generated_tags_round_trip(
+  fn core_generated_tags_round_trip(
     owner in "[a-z][a-z0-9]{0,7}",
     label in "[a-z][a-z0-9]{0,7}",
     name in "[a-z][a-z0-9-]{0,15}[a-z0-9]",

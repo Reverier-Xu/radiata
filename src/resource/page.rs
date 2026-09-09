@@ -1,5 +1,4 @@
-//! Bounded resource-metadata pages for ordinary anti-entropy repair
-//! (T-G07-04, ADR-0007).
+//! Bounded resource-metadata pages for ordinary anti-entropy repair.
 //!
 //! One page carries a bounded list of whole signed records plus a
 //! continuation cursor, so population-sized catalogs stream without ever
@@ -102,8 +101,7 @@ pub(crate) mod sync {
   /// canonically, so the raw bytes carry every content change without
   /// decoding any record: the quiet-state tick pays one scan and one
   /// hash instead of a decode, re-encode, and digest per record. The
-  /// slow resend cadence heals the (non-cryptographic) collision case,
-  /// exactly like the decoded fingerprint it replaces.
+  /// slow resend cadence heals the (non-cryptographic) collision case.
   pub(crate) async fn page_fingerprint_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<u64> {
@@ -267,7 +265,7 @@ mod tests {
       .unwrap();
   }
 
-  /// SC-G07-P0-10: pages enforce record, byte, and schema capacities — an
+  /// Pages enforce record, byte, and schema capacities — an
   /// oversized page, a wrong schema, and a truncated record all fail
   /// closed at decode.
   #[test]
@@ -301,7 +299,7 @@ mod tests {
     assert!(ResourcePage::decode(&bytes[..bytes.len() - 4]).is_err());
   }
 
-  /// SC-G07-P0-10 + SC-G07-P1-12: duplicate, reordered, and changing
+  /// Duplicate, reordered, and changing
   /// pages converge to one stable winner set; a second completed pass
   /// transfers no authoritative changes.
   #[tokio::test]
@@ -404,7 +402,7 @@ mod tests {
       .unwrap()
   }
 
-  /// SC-G07-P0-10: signature validation happens before comparison — a
+  /// Signature validation happens before comparison — a
   /// record from an unknown writer or with a broken signature is skipped
   /// fail-closed and never stored.
   #[tokio::test]

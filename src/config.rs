@@ -7,17 +7,17 @@ pub struct NodeConfig {
   anti_entropy_interval: Duration,
   recovery: RecoveryConfig,
   session_queue_messages: usize,
-  // Wired by G4-04 as the summed encoded-byte budget of one session's
-  // outbound frame queue.
+  // The summed encoded-byte budget of one session's outbound frame
+  // queue.
   session_queue_bytes: usize,
-  // Wired by G4-04: a session with no authenticated traffic or owned
-  // in-flight work for this long closes on host wall time. Zero disables.
+  // A session with no authenticated traffic or owned in-flight work for
+  // this long closes on host wall time. Zero disables.
   session_idle_timeout: Duration,
-  // Wired by G4-04: the keepalive interval and the deadline after which a
-  // peer missing a keepalive result is closed. Zero disables keepalive.
+  // The keepalive interval and the deadline after which a peer missing a
+  // keepalive result is closed. Zero disables keepalive.
   keepalive_interval: Duration,
   keepalive_timeout: Duration,
-  // Caller-selected packet parser limits (G3): depth, collection items,
+  // Caller-selected packet parser limits: depth, collection items,
   // and frame bytes bound every packet-body decode allocation.
   parser_limits: ParserLimits,
   trace_metadata_limits: TraceMetadataLimits,
@@ -50,8 +50,7 @@ impl NodeConfig {
     Ok(self)
   }
 
-  /// Sets the parser limits (G1/G3's "checked caller-selected finite
-  /// limits"): every packet-frame decode enforces them.
+  /// Sets the parser limits: every packet-frame decode enforces them.
   pub fn with_parser_limits(mut self, value: ParserLimits) -> Result<Self> {
     self.parser_limits = value;
     Ok(self)
@@ -62,7 +61,7 @@ impl NodeConfig {
     Ok(self)
   }
 
-  /// Selects the node's next-hop routing policy tag (T-G06-03): when a
+  /// Selects the node's next-hop routing policy tag: when a
   /// routed packet's destination is not directly connected, the tag
   /// resolves in the extension registry and the registered policy picks
   /// the single next hop. Without a tag the node forwards only to a
@@ -221,13 +220,13 @@ impl TraceMetadataLimits {
   }
 
   /// The caller-selected terminal-record population cap, enforced by the
-  /// trace retention sweep (T-G06-05).
+  /// trace retention sweep.
   pub(crate) const fn terminal(&self) -> usize {
     self.terminal
   }
 
   /// The caller-selected host-wall-clock retention window for terminal
-  /// records (T-G06-05).
+  /// records.
   pub(crate) const fn retention(&self) -> Duration {
     self.retention
   }

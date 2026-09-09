@@ -1,4 +1,4 @@
-//! Fixed credential-merge rate limiting (ADR-0007, THR-001).
+//! Fixed credential-merge rate limiting.
 //!
 //! Before any handshake or signing work, each connection attempt is
 //! admitted against the fixed policy: per-source and global pending
@@ -12,7 +12,7 @@
 //! Rate windows use the monotonic clock, so host wall-clock rollback can
 //! delay the authentication deadline and a forward jump can make it
 //! immediately due, but neither ever widens or narrows the fixed rate
-//! counts (ADR-0007 host-wall-clock semantics).
+//! counts (host-wall-clock semantics).
 
 use std::{
   collections::BTreeMap,
@@ -33,8 +33,8 @@ pub(crate) const SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(600);
 
 /// The canonical merge source. The peer port is dropped (ephemeral
 /// reconnects are aliases of one source), IPv4-mapped IPv6 collapses to its
-/// IPv4 form, so every alias of one source shares one bucket (ADR-0007
-/// normalized-source aliases).
+/// IPv4 form, so every alias of one source shares one bucket
+/// (normalized-source aliases).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MergeSource {
   V4([u8; 4]),

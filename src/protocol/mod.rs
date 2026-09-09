@@ -8,7 +8,7 @@ pub(crate) mod selection;
 pub(crate) mod tag;
 pub(crate) mod wire;
 
-/// ADR-0002's handshake/control body ceiling: one wire body never exceeds
+/// The handshake/control body ceiling: one wire body never exceeds
 /// it, and every derived limit (parser defaults, aggregate WebSocket
 /// messages) derives from this constant instead of restating the number.
 pub(crate) const ADR0002_BODY_BYTES: usize = 65_536;

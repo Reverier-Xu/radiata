@@ -1,17 +1,17 @@
-//! Security-critical ADR-0001 server certificate verifier.
+//! Security-critical server certificate verifier.
 //!
-//! ADR-0001 permits a joining client to relax certificate-chain and hostname
-//! trust only, because the receiver presents an unknown self-signed
-//! ephemeral certificate. The same ADR forbids unconditional certificate or
-//! handshake-signature acceptance: the TLS 1.3 `CertificateVerify` signature
-//! must always be fully validated against the presented leaf key, and
-//! unsupported signature schemes must be rejected. This module is the single
-//! implementation of that rule; it has no accept-anything path.
+//! Join mode relaxes certificate-chain and hostname trust only, because the
+//! receiver presents an unknown self-signed ephemeral certificate.
+//! Unconditional certificate or handshake-signature acceptance is forbidden:
+//! the TLS 1.3 `CertificateVerify` signature must always be fully validated
+//! against the presented leaf key, and unsupported signature schemes must be
+//! rejected. This module is the single implementation of that rule; it has
+//! no accept-anything path.
 //!
 //! - [`TrustMode::Merge`]: chain, hostname, and validity-window trust are
-//!   relaxed exactly as ADR-0001 specifies. The certificate is not a node
-//!   identity or trust record; receiver authentication happens at the
-//!   application proof layer over the RFC 9266 channel binding.
+//!   relaxed. The certificate is not a node identity or trust record; receiver
+//!   authentication happens at the application proof layer over the RFC 9266
+//!   channel binding.
 //! - [`TrustMode::Member`]: the same relaxed chain/hostname policy plus an
 //!   exact binding of the presented leaf SubjectPublicKeyInfo to an expected
 //!   key. The exact Ed25519 identity check (proof of possession over the
@@ -38,7 +38,7 @@ use rustls::{
   server::ParsedCertificate,
 };
 
-/// The trust relaxation permitted for one authentication mode (ADR-0001).
+/// The trust relaxation applied for one authentication mode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustMode {
   /// Merge mode: the receiver's self-signed ephemeral certificate is unknown
@@ -49,14 +49,14 @@ pub(crate) enum TrustMode {
   /// SubjectPublicKeyInfo binding. The durable Ed25519 identity binding is
   /// still established by the application proof layer, not by this
   /// verifier.
-  #[allow(dead_code)] // G3-04 production wiring; loopback tests construct it.
+  #[allow(dead_code)] // wired through member-mode dialing; loopback tests construct it directly.
   Member {
     /// The exact expected leaf SubjectPublicKeyInfo.
     expected_spki: SubjectPublicKeyInfoDer<'static>,
   },
 }
 
-/// The ADR-0001 bootstrap server certificate verifier.
+/// The bootstrap server certificate verifier.
 #[derive(Debug)]
 pub(crate) struct BootstrapCertVerifier {
   supported: WebPkiSupportedAlgorithms,
@@ -74,7 +74,7 @@ impl ServerCertVerifier for BootstrapCertVerifier {
     &self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
     _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
   ) -> Result<ServerCertVerified, RustlsError> {
-    // ADR-0001 relaxes chain, hostname, and validity-window trust. The leaf
+    // The mode relaxes chain, hostname, and validity-window trust. The leaf
     // must still carry bytes and decode as a well-formed X.509 certificate;
     // anything less fails closed.
     if end_entity.as_ref().is_empty() {

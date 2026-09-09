@@ -1,19 +1,18 @@
-//! WebSocket layer over the TLS stream (ADR-0002 "Fixed Wire Prelude").
+//! WebSocket layer over the TLS stream.
 //!
-//! - Every connection upgrades on the fixed `/mrly` path. The path is a
-//!   protocol constant documented here; a decision-register entry is not
-//!   required this phase.
+//! - Every connection upgrades on the fixed `/mrly` path, a protocol constant
+//!   defined by [`WS_PATH`] in this module.
 //! - Messages are binary only; text messages are rejected by
 //!   [`super::connection`].
-//! - Per-message compression is disabled before 0.1.0: no permessage-deflate
-//!   feature of tungstenite is compiled in, so no compression extension is
-//!   offered or accepted.
-//! - The aggregate message limit is 65,552 bytes: the ADR-0002
-//!   handshake/control CBOR body ceiling (65,536) plus one 16-byte prelude.
-//!   tungstenite enforces it while reassembling fragments, so a fragmented
-//!   hostile message is bounded before the body is exposed. Single-frame
-//!   parsing keeps the tungstenite default guard (16 MiB); the aggregate limit
-//!   above is the authoritative bound.
+//! - Per-message compression is disabled: no permessage-deflate feature of
+//!   tungstenite is compiled in, so no compression extension is offered or
+//!   accepted.
+//! - The aggregate message limit is 65,552 bytes: the handshake/control CBOR
+//!   body ceiling (65,536) plus one 16-byte prelude. tungstenite enforces it
+//!   while reassembling fragments, so a fragmented hostile message is bounded
+//!   before the body is exposed. Single-frame parsing keeps the tungstenite
+//!   default guard (16 MiB); the aggregate limit above is the authoritative
+//!   bound.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{
@@ -43,7 +42,7 @@ pub(crate) const SPKI_HINT_HEADER: &str = "mrly-leaf-spki";
 /// The non-secret merge hint a listener publishes inside the TLS channel
 /// during the WebSocket upgrade.
 ///
-/// The generation ID is an ADR-0001 transcript input and is never trusted
+/// The generation ID is a handshake transcript input and is never trusted
 /// on receipt: the merger uses it only to construct its hello, the state
 /// machine equality-checks it against the responder's own configuration,
 /// and the final signed merge grant is verified before any adoption.
@@ -85,8 +84,8 @@ fn parse_generation_hex(text: &str) -> Result<[u8; 16]> {
   crate::hex::decode_array(text, "websocket hint")
 }
 
-/// The aggregate WebSocket message limit: ADR-0002's body ceiling plus one
-/// 16-byte prelude.
+/// The aggregate WebSocket message limit: the protocol handshake/control
+/// body ceiling plus one 16-byte prelude.
 pub(crate) const MAX_MESSAGE_BYTES: usize = crate::protocol::ADR0002_BODY_BYTES + PRELUDE_LEN;
 
 fn config() -> WebSocketConfig {

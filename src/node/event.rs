@@ -134,7 +134,7 @@ pub enum EventReceive<E> {
   Closed,
 }
 
-/// The additive standard-stream view (R2): the same items `recv` yields,
+/// The additive standard-stream view: the same items `recv` yields,
 /// in the same order. Lag stays explicit as `EventReceive::Lagged`; the
 /// terminal `EventReceive::Closed` item is yielded once, then the stream
 /// ends. `try_recv`'s `Empty` is poll-level pending and never appears as
@@ -172,7 +172,7 @@ impl<E: Event> futures_core::Stream for EventSubscription<E> {
   }
 }
 
-/// The runtime event hub (T-G09-03): one typed subscriber set per event
+/// The runtime event hub: one typed subscriber set per event
 /// type. Events are transient — an emission with no live subscriber is
 /// dropped, a lagging subscriber observes `Lagged` and must re-read
 /// through the paged queries, and nothing is retained for replay after
@@ -286,7 +286,7 @@ mod tests {
   impl Event for TestEvent {}
 
   #[test]
-  fn g1_lifecycle_event_capacity_accepts_values_above_old_maximum() {
+  fn lifecycle_event_capacity_accepts_values_without_a_fixed_maximum() {
     EventOptions::new().capacity(1_025).unwrap();
     EventOptions::new().capacity(4_097).unwrap();
     assert_eq!(
@@ -307,7 +307,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn g1_lifecycle_event_subscription_reports_empty_lagged_and_closed() {
+  async fn lifecycle_event_subscription_reports_empty_lagged_and_closed() {
     let options = EventOptions::new().capacity(2).unwrap();
     let (sender, mut subscription) = event_channel::<TestEvent>(options);
 
@@ -339,11 +339,11 @@ mod tests {
     ));
   }
 
-  /// SC-G11-P1-04: the additive `Stream` view yields exactly the items
+  /// The additive `Stream` view yields exactly the items
   /// `recv`/`try_recv` report, keeps lag explicit, and terminates after
   /// one `Closed` item.
   #[tokio::test]
-  async fn g11_event_subscription_stream_matches_recv_parity() {
+  async fn event_subscription_stream_matches_recv_parity() {
     use futures_util::StreamExt;
 
     let options = EventOptions::new().capacity(2).unwrap();

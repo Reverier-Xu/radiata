@@ -4,9 +4,9 @@ unset BASH_ENV ENV CDPATH GLOBIGNORE GREP_OPTIONS
 export LC_ALL=C
 
 # Builds the release slo-node and slo-controller OCI images from the
-# external path dependency at the exact working-tree source checkout
-# (SC-G10-P0-30) and records the source SHA, Cargo.lock digest, and both
-# image identifiers into one observations file for the candidate ledger.
+# external path dependency at the exact working-tree source checkout and
+# records the source SHA, Cargo.lock digest, and both image identifiers
+# into one observations file for the candidate ledger.
 #
 # usage: scripts/build-slo-images.sh [output-json]
 

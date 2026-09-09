@@ -1,5 +1,4 @@
-//! Ephemeral self-signed listener certificates (ADR-0001 "TLS Bootstrap",
-//! ADR-0004 rcgen amendment).
+//! Ephemeral self-signed listener certificates.
 //!
 //! Every listener generates a fresh ephemeral certificate key pair from the
 //! injected entropy boundary. The certificate is memory-only, never
@@ -10,7 +9,7 @@
 //! Algorithm choice: Ed25519. rcgen's `ring` crypto backend supports Ed25519
 //! signing and PKCS#8 import, so the certificate key shares no code path
 //! with the durable identity key even though both use Ed25519. (ECDSA P-256
-//! would be the documented fallback if ring Ed25519 support were
+//! would be the fallback if ring Ed25519 support were
 //! unavailable.) The 32-byte seed comes entirely from the injected
 //! [`Entropy`]; rcgen's own randomness is only used internally for ECDSA
 //! key import, which Ed25519 never touches.

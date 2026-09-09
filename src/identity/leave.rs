@@ -1,4 +1,4 @@
-//! Active leave and identity replacement (T-G09-06, ADR-0001/0006).
+//! Active leave and identity replacement.
 //!
 //! An explicit active leave replaces the node's identity and erases the
 //! old identity's local core metadata, crash-safely:
@@ -165,7 +165,7 @@ struct LeaveRecordBodyWire {
   #[cbor(with = "minicbor::bytes")]
   public_key: Vec<u8>,
   /// Signed host wall-clock UNIX milliseconds: the removal timestamp the
-  /// checkpoint GC compares against its watermark (T-G11-09).
+  /// checkpoint GC compares against its watermark.
   #[n(4)]
   timestamp_millis: u64,
 }
@@ -189,13 +189,13 @@ struct LeaveRecordWire {
   signature: Vec<u8>,
 }
 
-/// One owner-signed leave record (ADR-0009 decision 3): a terminal removal
+/// One owner-signed leave record: a terminal removal
 /// tombstone for the named binding. The leaver signs it with its current
 /// key before rotating; peers verify it against the permanently retained
 /// identity binding, never against the leaver staying online. Because the
 /// rotation destroys the old key, the record carries no replay or time-lag
 /// attack surface. The signed removal timestamp is what the checkpoint GC
-/// (decision 5) compares against its watermark.
+/// compares against its watermark.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LeaveRecordV1 {
   node: NodeId,
@@ -386,7 +386,7 @@ fn intent_key_skip(key: &StoreKey) -> bool {
   key.as_bytes() == INTENT_KEY
 }
 
-/// The leave-side checkpoint sweep (ADR-0009 decision 5): conditional
+/// The leave-side checkpoint sweep: conditional
 /// exact-digest deletes of collected leave records stamped at or before
 /// `watermark`. The leave intent singleton is never touched.
 pub(crate) async fn collect_before_ctx(
@@ -555,7 +555,7 @@ async fn wipe_old_metadata(store: &MetadataStore, entropy: &dyn Entropy) -> Resu
 
 /// Creates or reconciles the replacement key under the intent's operation
 /// id; an indeterminate provider outcome blocks pending reconciliation and
-/// never duplicates the key (SC-G09-P0-19).
+/// never duplicates the key.
 async fn replacement_key(
   keys: &Arc<dyn KeyProvider>, intent: &LeaveIntentV1,
 ) -> Result<crate::CreatedKey> {
@@ -754,7 +754,7 @@ async fn begin_intent(
   Err(Error::conflict("leave intent"))
 }
 
-/// Resumes a pending leave at startup (T-G09-06 restart path): the leave
+/// Resumes a pending leave at startup (restart path): the leave
 /// phases run to completion before the node serves. Returns the context's
 /// replacement identity when the swap happened during this resume.
 pub(crate) async fn resume_if_pending(
@@ -856,7 +856,7 @@ mod tests {
     }
   }
 
-  /// SC-G11-P0-15: the owner-signed leave record round-trips canonically,
+  /// The owner-signed leave record round-trips canonically,
   /// verifies against the owner key, and rejects any body or signature
   /// mutation.
   #[tokio::test]
@@ -884,7 +884,7 @@ mod tests {
     assert!(other.verify().is_err());
   }
 
-  /// SC-G11-P0-15/16: persistence is idempotent for the exact record,
+  /// Persistence is idempotent for the exact record,
   /// conflicts on a divergent record for the same node, and the left set
   /// is queryable for session and recovery exclusion.
   #[tokio::test]
@@ -954,7 +954,7 @@ mod tests {
     assert!(LeaveIntentV1::decode(&forged).is_err());
   }
 
-  /// SC-G09-P0-18/20: one leave swaps the identity, wipes every old
+  /// One leave swaps the identity, wipes every old
   /// domain family, deletes the former key through the custody protocol,
   /// and clears its intent — the store holds only the replacement
   /// identity afterwards.
@@ -1006,7 +1006,7 @@ mod tests {
     assert!(keys.has_handle(identity.handle()));
   }
 
-  /// SC-G09-P0-19: an indeterminate provider create blocks the leave with
+  /// An indeterminate provider create blocks the leave with
   /// the typed reconciliation error and mutates nothing beyond the
   /// journaled intent; the startup resume then reconciles and completes.
   #[tokio::test]
@@ -1061,7 +1061,7 @@ mod tests {
     );
   }
 
-  /// SC-G09-P0-21 (resume arm): a leave interrupted after the identity
+  /// A leave interrupted after the identity
   /// swap resumes to completion — never a mixed identity, a duplicate
   /// key, or restored old metadata.
   /// The crash-retryable ordering (phase J leads): a journaled drive
@@ -1143,7 +1143,7 @@ mod tests {
 
 #[cfg(all(test, unix, any(feature = "json", feature = "redb")))]
 mod crash {
-  //! Subprocess durability matrix for the leave transition (SC-G09-P0-21).
+  //! Subprocess durability matrix for the leave transition.
   //!
   //! The child drives a leave against the selected backend store and
   //! aborts at one selected commit-path boundary of the intent commit or

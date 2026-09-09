@@ -4,12 +4,10 @@ A Rust library crate providing authenticated peer-to-peer connectivity, opaque s
 metadata for group applications: identity bindings, credential-authorized cluster composition,
 membership and resource convergence, and a routed stream data plane — all over TLS 1.3.
 
-Status: pre-release (`0.0.x`); the public surface is being finalized for `0.1.0` under the gate plan
-in [docs/implementation-plan.md](docs/implementation-plan.md). Architecture authority lives in
-[docs/adr/](docs/adr/) and [docs/roadmap.md](docs/roadmap.md); the frozen facade contract is
-[docs/api-manifest.md](docs/api-manifest.md).
+Status: pre-release (`0.0.x`); the public surface is being finalized for `0.1.0`. The authoritative
+API reference is the crate's rustdoc (`cargo doc`).
 
-## Deployment trust model (ADR-0009)
+## Deployment trust model
 
 radiata's architecture defends the **wire**, not the members. Transport-path security — TLS 1.3 with
 exporter binding, handshake transcripts, merge credentials, and signature verification against
@@ -28,5 +26,3 @@ Under the peer-trust deployment model, the deployment owes three guarantees:
 3. **Cleaned subjects stay decommissioned.** A `cleanup_node` tombstone is terminal; there is no
    resurrection path. A mistakenly cleaned node recovers only by rotating its identity and
    re-merging as a new `NodeId`.
-
-Threat authority: [docs/threat-model.md](docs/threat-model.md).

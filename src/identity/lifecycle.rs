@@ -1,8 +1,8 @@
 //! Local-identity open and creation lifecycle over journaled metadata
 //! storage.
 //!
-//! Opening the local identity follows the ADR-0001 key lifecycle and the
-//! ADR-0003 key-provider operation protocol with exact, bounded recovery:
+//! Opening the local identity follows a journaled key lifecycle and a
+//! key-provider operation protocol with exact, bounded recovery:
 //!
 //! 1. open the metadata store classified by the `local-identity` pending
 //!    journal; a recovered journal must reconcile to `Committed` and is then
@@ -71,14 +71,13 @@ impl LocalIdentityContext {
   }
 
   /// Replaces the in-memory identity after a startup leave resume swapped
-  /// the durable singleton (T-G09-06): the context never observes a mixed
-  /// identity.
+  /// the durable singleton: the context never observes a mixed identity.
   pub(crate) fn replace_identity(&mut self, identity: LocalIdentityV1) {
     self.identity = identity;
   }
 }
 
-/// Ensures the born-with-cluster self binding exists (ADR-0009 decision 1):
+/// Ensures the born-with-cluster self binding exists:
 /// every started node holds its own immutable `IdentityBindingV1`, so a fresh
 /// node is a singleton cluster of one and merge needs no genesis ceremony.
 ///
@@ -168,9 +167,9 @@ pub(crate) async fn open_local_identity(
       resume_identity_creation(store, keys, entropy, stored, intent).await
     }
   }?;
-  // A pending leave-intent resumes and completes before the node serves
-  // (T-G09-06): the returned context always reflects the post-leave
-  // identity, never a mixed one.
+  // A pending leave-intent resumes and completes before the node serves:
+  // the returned context always reflects the post-leave identity, never a
+  // mixed one.
   let mut context = context;
   if let Some(replacement) = super::leave::resume_if_pending(&context, keys, entropy).await? {
     context.replace_identity(replacement);
@@ -193,9 +192,7 @@ pub(crate) async fn reconcile_recovered_journal(store: &MetadataStore) -> Result
 /// The shared journal-recovery prologue of every journaled identity
 /// mutation: a recovered pending journal for `purpose` reconciles and
 /// cleans up before classification (returns `true`); otherwise a frozen
-/// store reconciles before any new work (returns `false`). Single source
-/// for the prologue previously copy-pasted across genesis, admission,
-/// adoption, and key deletion.
+/// store reconciles before any new work (returns `false`).
 pub(crate) async fn recover_journal_prologue(
   store: &MetadataStore, entropy: &dyn Entropy, purpose: &str, context: &'static str,
 ) -> Result<bool> {

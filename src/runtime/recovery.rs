@@ -43,8 +43,8 @@ impl Supervisor {
     debug!(hop = %hop, selected = entry.is_some(), "forward candidate resolved");
     Ok(entry)
   }
-  /// Resolves one matching-node target to exactly one eligible destination
-  /// (SC-G06-P0-02): the registered load-balancing policy selects among the
+  /// Resolves one matching-node target to exactly one eligible
+  /// destination: the registered load-balancing policy selects among the
   /// incrementally streamed candidates, and core independently validates
   /// the pick against the authoritative descriptors — an unknown, removed,
   /// or nonmatching node fails closed before any frame moves.
@@ -91,10 +91,9 @@ impl Supervisor {
   /// set (members this node ever authenticated a session with) and the
   /// current direct sessions, then dial unreachable members whose
   /// endpoints are published, through the configured bounded fan-out
-  /// (SC-G05-P0-14/17/22: recovery restores authenticated path
-  /// connectivity to known members and quiesces; it never dials strangers
-  /// or the local node, so it cannot add edges beyond the configured
-  /// topology).
+  /// (recovery restores authenticated path connectivity to known members
+  /// and quiesces; it never dials strangers or the local node, so it
+  /// cannot add edges beyond the configured topology).
   pub(super) async fn recovery_tick(&mut self) -> Result<()> {
     let before = self.recovery_view();
     let result = self.recovery_tick_inner().await;
@@ -144,10 +143,9 @@ impl Supervisor {
     }
     // Candidates are unreachable known members with a published endpoint
     // from their signed descriptor; reachability stays distinct from the
-    // active topology and recovery never dials strangers (SC-G05-P0-11/18).
+    // active topology and recovery never dials strangers.
     let bindings = crate::identity::trust::store::trusted_bindings(self.context()?.store()).await?;
-    // Left and cleaned nodes are excluded from recovery dialing
-    // (ADR-0009 decisions 3-4).
+    // Left and cleaned nodes are excluded from recovery dialing.
     let mut excluded = crate::identity::cleanup::cleaned_nodes_ctx(self.context()?.store()).await?;
     excluded.append(&mut crate::identity::leave::left_nodes_ctx(self.context()?.store()).await?);
     // One snapshot for the whole cycle: per-member descriptor reads must

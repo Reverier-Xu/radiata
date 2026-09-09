@@ -1,9 +1,9 @@
-//! Durable route-trace metadata (T-G06-02, ADR-0007).
+//! Durable route-trace metadata.
 //!
-//! The trace store persists exactly what ADR-0007 bounds: identity
+//! The trace store persists a bounded record: identity
 //! ([`crate::TraceId`] plus both authenticated endpoints), the selected
 //! destination, the attempt count, stream progress, and the terminal
-//! state — never payload bytes. Records ride the G2 conditional
+//! state — never payload bytes. Records ride the conditional
 //! transaction machinery, so every write reconciles by canonical
 //! `TransactionId` and digest, and every stored byte is inspectable.
 //!
@@ -16,8 +16,8 @@
 //! - a process restart terminates previously active records explicitly
 //!   (`Failed(StreamInterrupted)`); no reopen path continues a body.
 //!
-//! Record accessors are unit-verified against SC-G06-P0-05..08; some stay
-//! intentionally dead in non-test builds until the G6-03/05 consumers land.
+//! Record accessors are unit-verified in this module's tests; some stay
+//! intentionally dead in non-test builds, where only tests consume them.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::time::{Duration, SystemTime};
@@ -205,8 +205,8 @@ impl TraceRecord {
     self
   }
 
-  /// Canonical wire encoding of the trace record; the G10 compatibility
-  /// freeze reader shares this exact encoder.
+  /// Canonical wire encoding of the trace record; the compatibility
+  /// suite's golden-vector reader shares this exact encoder.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical_record(self)
   }
@@ -528,7 +528,7 @@ mod tests {
     records
   }
 
-  // ---- SC-G06-P0-05: trace metadata without body bytes ----
+  // ---- Trace metadata without body bytes ----
 
   /// Every `ErrorKind` survives the closed failure-code mapping, and an
   /// unknown stored byte fails closed instead of decoding as a valid kind.
@@ -623,7 +623,7 @@ mod tests {
     }
   }
 
-  // ---- SC-G06-P0-06: atomic reconcile by TransactionId and digest ----
+  // ---- Atomic reconcile by TransactionId and digest ----
 
   /// A lost compare-and-swap surfaces as a typed conflict instead of a
   /// silent overwrite, and re-writing the identical record is idempotent.
@@ -670,8 +670,7 @@ mod tests {
     assert_eq!(all_records(&store).await.len(), 1);
   }
 
-  // ---- SC-G06-P0-07: active streams survive retention; restart terminates
-  // ----
+  // ---- Active streams survive retention; restart terminates ----
 
   /// Retention never removes active records; a restart terminates them
   /// explicitly with `StreamInterrupted`, and no reopen path continues.
@@ -739,7 +738,7 @@ mod tests {
     assert!(reopened.iter().all(|record| record.phase().is_terminal()));
   }
 
-  // ---- SC-G06-P0-08: caller-selected capacity and wall-clock retention ----
+  // ---- Caller-selected capacity and wall-clock retention ----
 
   /// Terminal records expire on host wall time, the terminal population
   /// never exceeds the caller-selected cap, and active records are never
@@ -805,9 +804,9 @@ mod tests {
     assert_eq!(records[0].phase(), &TracePhase::Routing);
   }
 
-  // SC-G07-P0-01/02 (and the SC-G06-P0-18 gap): retention sweeps re-read
-  // the wall clock on every pass, so rollback or freeze delays expiry and
-  // a forward jump expires immediately — no monotonic-clock assumption.
+  // Retention sweeps re-read the wall clock on every pass, so rollback or
+  // freeze delays expiry and a forward jump expires immediately — no
+  // monotonic-clock assumption.
   #[tokio::test]
   async fn sweep_rereads_wall_time_across_discontinuities() {
     let (_factory, store, clock) = open_store().await;

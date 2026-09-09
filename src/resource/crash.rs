@@ -1,4 +1,4 @@
-//! Subprocess durability matrix for resource registers (SC-G07-P0-07).
+//! Subprocess durability matrix for resource registers.
 //!
 //! Mirrors the JSON adapter's crash lane: a parent test seeds one register
 //! value, spawns the library test binary itself with an environment-
@@ -358,7 +358,7 @@ async fn resource_delete_child_entry() {
   }
 }
 
-/// SC-G07-P0-14: every cleanup/delete boundary reopens to old-or-new —
+/// Every cleanup/delete boundary reopens to old-or-new —
 /// the removal record is fully present or fully gone, never partial, and
 /// the delete transaction's identity reconciles consistently.
 #[tokio::test]

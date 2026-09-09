@@ -1,8 +1,6 @@
 schema = "radiata.woooo.tech/schemas/fuzz-corpus-v1"
 status = "accepted"
 target = "selector"
-owner_task = "T-G10-03"
-reviewer_task = "T-G10-03"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
 minimizer = { tool = "none", version = "0" }
 aggregate = { entry_count = 13, total_bytes = 2477 }
@@ -95,6 +93,6 @@ schema_tags = ["selector"]
 digest = "e6991990a71c27ec343638c40de45a1d7884ce1f3b19183e5a5435daad592289"
 byte_count = 1023
 origin = "synthetic-generator"
-lineage = "regression: canonical selector form exceeded the input bound (selector fuzz target finding, minimized, T-G10-03)"
+lineage = "regression: canonical selector form exceeded the input bound (selector fuzz target finding, minimized)"
 schema_tags = ["selector"]
 

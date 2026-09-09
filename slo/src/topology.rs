@@ -1,4 +1,4 @@
-//! The deterministic sixteen-node sparse topology (ADR-0005, SC-G10-P0-32).
+//! The deterministic sixteen-node sparse topology.
 //!
 //! The final authenticated graph is a ring plus quarter-span chords: every
 //! member keeps its two ring neighbours and two chord neighbours, giving a
@@ -163,7 +163,7 @@ mod tests {
   use super::*;
   use std::collections::BTreeSet;
 
-  // SC-G10-P0-32: the frozen direction table is exactly 64 directions —
+  // The frozen direction table is exactly 64 directions —
   // 32 unique undirected edges, no self-loops, both orientations present.
   #[test]
   fn direction_table_is_exactly_sixty_four_directions() {
@@ -203,7 +203,7 @@ mod tests {
     }
   }
 
-  // SC-G10-P0-32: one exact three-hop path exists — the endpoints are
+  // One exact three-hop path exists — the endpoints are
   // three hops apart with no two-hop or one-hop shortcut.
   #[test]
   fn exact_three_hop_pair_has_breadth_first_distance_three() {

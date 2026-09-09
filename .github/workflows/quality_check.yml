@@ -105,8 +105,8 @@ jobs:
             && [ "$TEST" = "success" ] && [ "$uninterrupted" = "true" ]; then
             result=pass
           fi
-          # The canonical test-attestation record (T-G10-07): every field
-          # the sealed ledger validator requires, bound to the tested commit.
+          # The canonical test-attestation record: every field the sealed
+          # ledger validator requires, bound to the tested commit.
           printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"msrv","target":"quality-msrv","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
             "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
             "$duration" "$uninterrupted" "$result" > target/attestation-quality-msrv.json
@@ -569,9 +569,9 @@ jobs:
           mkdir -p target
           cargo tree --locked --workspace -d > target/dependency-duplicates.txt
           cat target/dependency-duplicates.txt
-          # Duplicate crate families in one protocol role are release blockers
-          # (ADR-0004). The reviewed baseline names exactly these benign
-          # duplicates across distinct roles; any new family fails the lane.
+          # Duplicate crate families in one protocol role are release blockers.
+          # The reviewed baseline names exactly these benign duplicates across
+          # distinct roles; any new family fails the lane.
           # getrandom 0.2/0.3/0.4 + rand 0.9/0.10 + syn 2/3: independent
           # third-party minimum versions in distinct dependency roles
           # (ring's CSPRNG draw, proptest's generators, proc-macro

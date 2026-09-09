@@ -1,7 +1,7 @@
-//! The manifest `Endpoint` value type: a canonical `wss://host[:port]`
+//! The public `Endpoint` value type: a canonical `wss://host[:port]`
 //! address.
 //!
-//! Addresses are endpoint candidates and never identities (ADR-0001). The
+//! Addresses are endpoint candidates and never identities. The
 //! canonical text form is exactly `wss://<host>:<port>` with an explicit
 //! port (default 443), a lowercase DNS name or an IP literal host, and no
 //! userinfo, path, query, or fragment: the transport upgrades on the fixed
@@ -11,9 +11,8 @@
 //! whitespace) instead of normalizing it, matching the crate's other
 //! canonical value types.
 //!
-//! The type is re-exported at the crate root; the shape matches
-//! `docs/api-manifest.md` (`parse`/`as_str` plus the canonical value
-//! traits).
+//! The type is re-exported at the crate root and exposes `parse`/`as_str`
+//! plus the canonical value traits.
 
 use std::{fmt, str::FromStr};
 

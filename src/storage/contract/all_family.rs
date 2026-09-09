@@ -1,9 +1,9 @@
-//! All-family metadata contract lane (T-G08-01).
+//! All-family metadata contract lane.
 //!
 //! Drives the backend-neutral storage contract over every entry of the
 //! metadata family catalog: provider-owned immutable snapshots, exact
 //! lookup, unsigned-byte ordered scan streams, base/per-key conditions,
-//! cross-family atomicity, receipts, and reconciliation (SC-G08-P0-01..02).
+//! cross-family atomicity, receipts, and reconciliation.
 
 use std::sync::Arc;
 

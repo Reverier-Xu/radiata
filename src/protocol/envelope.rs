@@ -153,7 +153,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_prelude_uses_exact_network_order_bytes() {
+  fn core_prelude_uses_exact_network_order_bytes() {
     let encoded = Prelude::new(0x0001, 0x0203, 0x0004, 5).encode();
 
     assert_eq!(
@@ -167,7 +167,7 @@ mod tests {
 
   proptest! {
     #[test]
-    fn g1_core_prelude_round_trips_without_copying_body(
+    fn core_prelude_round_trips_without_copying_body(
       schema in any::<u16>(),
       kind in any::<u16>(),
       flags in 0_u16..=0x000f,
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn g1_core_hostile_wire_and_cbor_bytes_never_panic(
+    fn core_hostile_wire_and_cbor_bytes_never_panic(
       input in proptest::collection::vec(any::<u8>(), 0..512),
     ) {
       let wire_result = std::panic::catch_unwind(|| {
@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn g1_core_equivalent_cbor_values_encode_identically(
+    fn core_equivalent_cbor_values_encode_identically(
       sequence in any::<u64>(),
       payload in proptest::collection::vec(any::<u8>(), 0..128),
     ) {
@@ -216,7 +216,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_prelude_rejects_malformed_and_over_limit_messages() {
+  fn core_prelude_rejects_malformed_and_over_limit_messages() {
     let canonical = message(0, &[0x01]);
     assert!(split_message(&canonical[..15], 0, 8, 8, declared).is_err());
 
@@ -242,7 +242,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_cbor_encodes_and_decodes_exact_canonical_bytes() {
+  fn core_cbor_encodes_and_decodes_exact_canonical_bytes() {
     let body = TestBody {
       sequence: 1,
       payload: b"ok".to_vec(),
@@ -257,7 +257,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_cbor_rejects_noncanonical_or_unsupported_forms() {
+  fn core_cbor_rejects_noncanonical_or_unsupported_forms() {
     for bytes in [
       &[0x18, 0x01][..],
       &[0x9F, 0xFF],
@@ -272,7 +272,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_cbor_enforces_caller_selected_limits() {
+  fn core_cbor_enforces_caller_selected_limits() {
     assert!(decode_canonical::<Ignored>(&[0x81, 0x81, 0x00], CborLimits::new(1, 8, 8)).is_err());
     assert!(
       decode_canonical::<Ignored>(&[0x83, 0x00, 0x01, 0x02], CborLimits::new(4, 2, 8)).is_err()
@@ -283,7 +283,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_cbor_accepts_limits_above_superseded_maxima() {
+  fn core_cbor_accepts_generous_caller_selected_limits() {
     let mut deep = vec![0x81; 40];
     deep.push(0x00);
     decode_canonical::<Ignored>(&deep, CborLimits::new(40, 1, deep.len())).unwrap();
@@ -302,7 +302,7 @@ mod tests {
   }
 
   #[test]
-  fn g1_core_cbor_bounds_output_before_encoding_growth() {
+  fn core_cbor_bounds_output_before_encoding_growth() {
     let body = RepeatedBody {
       accepted_items: Cell::new(0),
     };

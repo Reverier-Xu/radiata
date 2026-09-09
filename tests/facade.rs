@@ -1,5 +1,4 @@
-//! External core-only facade proof and E2E-08 (T-G09-07,
-//! SC-G09-P0-22..26).
+//! External core-only facade proof.
 //!
 //! This test crate is an external consumer: it exercises the entire
 //! core-only public surface — packet streams over label-selected
@@ -315,13 +314,13 @@ fn resource_write(name_seed: u8, resource_type: &str) -> PutResource {
   .unwrap()
 }
 
-/// E2E-08 / SC-G09-P0-22: generic capability resources flow through the
-/// facade, every member converges on them, revocation preserves their
-/// content and never follows the URI, and leave replaces identities —
-/// explicit operations touch only core metadata.
+/// Generic capability resources flow through the facade, every member
+/// converges on them, revocation preserves their content and never
+/// follows the URI, and leave replaces identities — explicit operations
+/// touch only core metadata.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e08_resources_revoke_and_leave() {
+async fn resources_revoke_and_leave() {
   // The caller's object the resource URI points at: core must never
   // touch it.
   let caller_object = tempfile::tempdir().unwrap();
@@ -365,8 +364,8 @@ async fn e2e08_resources_revoke_and_leave() {
     .await
     .unwrap();
 
-  // Both members observe it (SC-G09-P0-22: only generic named resources
-  // with reserved type/URI plus namespaced custom labels exist in core).
+  // Both members observe it (only generic named resources with reserved
+  // type/URI plus namespaced custom labels exist in core).
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     // Schedule the next convergence observation: one deterministic
@@ -461,7 +460,7 @@ async fn e2e08_resources_revoke_and_leave() {
     .unwrap();
   assert_eq!(reason, ShutdownReason::ActiveLeave);
   // The leave deleted exactly the former identity's key through the
-  // custody protocol (the key-intents clause of E2E-08).
+  // custody protocol.
   assert_eq!(issuer_keys.deleted_count(), 1);
 
   assert_eq!(
@@ -473,10 +472,10 @@ async fn e2e08_resources_revoke_and_leave() {
   member.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G09-P0-25: label-selected packet delivery, every paged view, the
-/// resource lifecycle, and events — all through the public facade.
+/// Label-selected packet delivery, every paged view, the resource
+/// lifecycle, and events — all through the public facade.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_facade_core_only_operations() {
+async fn facade_core_only_operations() {
   {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -724,7 +723,7 @@ async fn g9_facade_core_only_operations() {
       .iter()
       .any(|session| session.peer() == &member_id)
     {
-      // The negotiated features ride the session only (SC-G09-P0-23).
+      // The negotiated features ride the session only.
       assert!(!sessions.items()[0].selected_features().is_empty());
       break;
     }
@@ -753,12 +752,12 @@ async fn g9_facade_core_only_operations() {
   issuer.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G09-P0-24: resource labels never enable protocol behavior — a
-/// resource whose type names a protocol does not make an unregistered
-/// protocol deliverable; only the transcript-bound feature intersection
+/// Resource labels never enable protocol behavior — a resource whose
+/// type names a protocol does not make an unregistered protocol
+/// deliverable; only the transcript-bound feature intersection
 /// authorizes dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_resource_labels_never_enable_protocols() {
+async fn resource_labels_never_enable_protocols() {
   let issuer = start_node(0, false).await;
   let issuer_endpoint = listen(&issuer).await;
 

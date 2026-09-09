@@ -115,7 +115,7 @@ impl Command for MergeCluster {
   type Output = crate::MergeView;
 }
 
-/// Connects to an already-admitted peer using key trust only (G3-04): no
+/// Connects to an already-admitted peer using key trust only: no
 /// join credential is consulted or required, the expected peer's trusted
 /// identity binding gates the handshake, and the negotiated feature policy
 /// is the same exact offer/selection machinery as a join.
@@ -160,7 +160,7 @@ impl Query for GetNodeStatus {
   type Output = crate::NodeStatus;
 }
 
-/// The bounded observability snapshot query (T-G10-05): one snapshot of
+/// The bounded observability snapshot query: one snapshot of
 /// counters and flags, never an enumeration.
 pub struct GetObservability {
   _private: (),
@@ -213,7 +213,7 @@ impl Query for WaitForShutdown {
   type Output = crate::ShutdownReason;
 }
 
-/// Queries one member's public observation (G5-06).
+/// Queries one member's public observation.
 pub struct GetMember {
   node: NodeId,
 }
@@ -234,7 +234,7 @@ impl Query for GetMember {
   type Output = Option<crate::MemberView>;
 }
 
-/// Pages the public membership observations (G5-06).
+/// Pages the public membership observations.
 pub struct PageMembers {
   page: crate::PageSpec,
 }
@@ -255,7 +255,7 @@ impl Query for PageMembers {
   type Output = crate::MemberPage;
 }
 
-/// Pages the live resource winners matching one selector (T-G09-02).
+/// Pages the live resource winners matching one selector.
 pub struct SelectResources {
   selector: crate::Selector,
   page: crate::PageSpec,
@@ -281,7 +281,7 @@ impl Query for SelectResources {
   type Output = crate::ResourcePage;
 }
 
-/// Pages the node's bound listeners (G9-07).
+/// Pages the node's bound listeners.
 pub struct PageListeners {
   page: crate::PageSpec,
 }
@@ -302,7 +302,7 @@ impl Query for PageListeners {
   type Output = crate::ListenerPage;
 }
 
-/// Pages the live authenticated sessions (G9-07).
+/// Pages the live authenticated sessions.
 pub struct PageSessions {
   page: crate::PageSpec,
 }
@@ -323,7 +323,7 @@ impl Query for PageSessions {
   type Output = crate::SessionPage;
 }
 
-/// Reads the live winner of one named resource, when present (G9-07).
+/// Reads the live winner of one named resource, when present.
 pub struct GetResource {
   name: crate::ResourceName,
 }
@@ -344,7 +344,7 @@ impl Query for GetResource {
   type Output = Option<crate::ResourceView>;
 }
 
-/// Pages the live resource winners in canonical name order (G9-07).
+/// Pages the live resource winners in canonical name order.
 pub struct PageResources {
   page: crate::PageSpec,
 }
@@ -365,7 +365,7 @@ impl Query for PageResources {
   type Output = crate::ResourcePage;
 }
 
-/// One caller-authored resource write intent (T-G09-03): the stable name
+/// One caller-authored resource write intent: the stable name
 /// plus its reserved and custom labels. Core stamps the wall-clock tuple
 /// and signs the candidate record when the command executes; the caller
 /// never supplies a timestamp, writer, or signature.
@@ -388,8 +388,8 @@ impl ResourceWrite {
   }
 }
 
-/// Commits one resource write intent as a signed candidate record
-/// (T-G09-03). Acceptance never promises the candidate becomes or stays
+/// Commits one resource write intent as a signed candidate record.
+/// Acceptance never promises the candidate becomes or stays
 /// the tuple winner; the outcome view reports the accepted record and
 /// whether it is the current winner.
 pub struct PutResource {
@@ -416,8 +416,8 @@ impl Command for PutResource {
   type Output = crate::ResourceMutationView;
 }
 
-/// Revokes one exact subject binding's connection and admission authority
-/// (T-G09-04, ADR-0006): a durable local authorization boundary that
+/// Revokes one exact subject binding's connection and admission
+/// authority: a durable local authorization boundary that
 /// closes the identity's sessions and rejects its new sessions, raw
 /// grants, and admissions — without deleting or reinterpreting any stored
 /// metadata. `expected_key` pins the exact trusted binding so a stale or
@@ -447,7 +447,7 @@ impl Command for RevokeNode {
 }
 
 /// Issues a convergent issuer-signed cleanup tombstone for one
-/// decommissioned node (ADR-0009 decision 4). Terminal: there is no
+/// decommissioned node. Terminal: there is no
 /// resurrection path. The caller is responsible for never cleaning a node
 /// that is merely offline.
 pub struct CleanupNode {
@@ -470,8 +470,8 @@ impl Command for CleanupNode {
   type Output = ();
 }
 
-/// Explicitly clears the local revocation record for one subject
-/// (ADR-0009 decision 6). Local-only and idempotent.
+/// Explicitly clears the local revocation record for one subject.
+/// Local-only and idempotent.
 pub struct PurgeRevocation {
   subject: NodeId,
 }
@@ -492,8 +492,8 @@ impl Command for PurgeRevocation {
   type Output = ();
 }
 
-/// Starts a new cleanup checkpoint GC epoch at the current wall clock
-/// (ADR-0009 decision 5). Max-wins: a stored checkpoint with a higher
+/// Starts a new cleanup checkpoint GC epoch at the current wall clock.
+/// Max-wins: a stored checkpoint with a higher
 /// watermark survives. Deployments issue checkpoints only against a fully
 /// converged cluster. Returns the persisted watermark.
 pub struct IssueCleanupCheckpoint {
@@ -558,7 +558,7 @@ impl Command for RunSyncRound {
   type Output = ();
 }
 
-/// Creates signed removal evidence for one resource (T-G09-05): the
+/// Creates signed removal evidence for one resource: the
 /// removal commits only when the locally stored winner still equals
 /// `expected` exactly and the removal strictly wins the tuple, so a stale
 /// request never removes newer metadata and never poses as a newer
@@ -585,7 +585,7 @@ impl Command for RemoveResource {
   type Output = crate::ResourceMutationView;
 }
 
-/// Actively leaves the cluster (T-G09-06): replaces the node's identity
+/// Actively leaves the cluster: replaces the node's identity
 /// with a fresh node id and key, deletes the old identity's local core
 /// metadata and key through the journaled custody protocols, and shuts the
 /// node down with [`crate::ShutdownReason::ActiveLeave`]. The explicit
@@ -611,7 +611,7 @@ impl Command for LeaveCluster {
   type Output = crate::LeaveOutcome;
 }
 
-/// The node's identity was replaced by an active leave (T-G09-06).
+/// The node's identity was replaced by an active leave.
 /// Emitted once, after the identity swap is durable and before the node
 /// shuts down with [`crate::ShutdownReason::ActiveLeave`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -642,7 +642,7 @@ impl private::Sealed for IdentityReplaced {}
 impl Event for IdentityReplaced {}
 
 /// One authenticated session to the peer was established, replaced, or
-/// retired (T-G09-07). Transient: subscribers re-read the session page
+/// retired. Transient: subscribers re-read the session page
 /// for the current set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionChanged {
@@ -663,7 +663,7 @@ impl private::Sealed for SessionChanged {}
 
 impl Event for SessionChanged {}
 
-/// A member's owner-revision descriptor changed (T-G09-07): a local
+/// A member's owner-revision descriptor changed: a local
 /// update or a converged sync install. Transient: subscribers re-read the
 /// member views for the current state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -685,7 +685,7 @@ impl private::Sealed for MemberChanged {}
 
 impl Event for MemberChanged {}
 
-/// One route's state changed (T-G09-07). Transient: subscribers re-read
+/// One route's state changed. Transient: subscribers re-read
 /// `GetRoute` for the current status.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteChanged {
@@ -706,7 +706,7 @@ impl private::Sealed for RouteChanged {}
 
 impl Event for RouteChanged {}
 
-/// The recovery state changed (T-G09-07): connectivity restored, a
+/// The recovery state changed: connectivity restored, a
 /// component became unreachable, or an immediate recovery started.
 /// Transient: subscribers re-read the recovery view.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -728,8 +728,8 @@ impl private::Sealed for RecoveryChanged {}
 
 impl Event for RecoveryChanged {}
 
-/// A locally revoked identity lost connection and admission authority
-/// (T-G09-04). Emitted once per revocation transition, after the durable
+/// A locally revoked identity lost connection and admission authority.
+/// Emitted once per revocation transition, after the durable
 /// commit; an idempotent repeated revoke emits nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeRevoked {
@@ -750,8 +750,8 @@ impl private::Sealed for NodeRevoked {}
 
 impl Event for NodeRevoked {}
 
-/// One committed local resource candidate became visible in the catalog
-/// (T-G09-03). Emitted exactly once after the candidate's durable commit;
+/// One committed local resource candidate became visible in the catalog.
+/// Emitted exactly once after the candidate's durable commit;
 /// the command's [`crate::ResourceMutationView`] reports whether that
 /// candidate is the current winner. Aborted and indeterminate candidates
 /// emit nothing, and restart or maintenance never replays the event.
@@ -774,7 +774,7 @@ impl private::Sealed for ResourceChanged {}
 
 impl Event for ResourceChanged {}
 
-/// Pages the public topology edges (G5-06).
+/// Pages the public topology edges.
 pub struct PageTopology {
   page: crate::PageSpec,
 }
@@ -795,7 +795,7 @@ impl Query for PageTopology {
   type Output = crate::TopologyPage;
 }
 
-/// Pages the public trust observations (G5-06).
+/// Pages the public trust observations.
 pub struct PageTrust {
   page: crate::PageSpec,
 }
@@ -816,8 +816,7 @@ impl Query for PageTrust {
   type Output = crate::TrustPage;
 }
 
-/// Forces one bounded immediate recovery cycle and returns its view
-/// (G5-06).
+/// Forces one bounded immediate recovery cycle and returns its view.
 pub struct StartRecovery {
   _private: (),
 }
@@ -835,8 +834,7 @@ impl Command for StartRecovery {
   type Output = crate::RecoveryView;
 }
 
-/// Closes the authenticated session to one peer (G5-06, partition
-/// simulation and failure matrix).
+/// Closes the authenticated session to one peer.
 pub struct DisconnectPeer {
   peer: NodeId,
 }
@@ -857,8 +855,8 @@ impl Command for DisconnectPeer {
   type Output = ();
 }
 
-/// Updates the local node's own descriptor (owner-only node metadata,
-/// ADR-0007): endpoint candidates and capability labels are applied at a
+/// Updates the local node's own descriptor (owner-only node metadata):
+/// endpoint candidates and capability labels are applied at a
 /// strictly higher revision than `expected_revision`, and the updated
 /// member view is returned. Same-revision or stale expectations conflict.
 pub struct UpdateNodeMetadata {
@@ -886,7 +884,7 @@ impl Command for UpdateNodeMetadata {
 }
 
 /// Queries the in-memory route status of one packet route handle
-/// (ADR-0007: bounded trace metadata only, no durability claim).
+/// (bounded trace metadata only, no durability claim).
 pub struct GetRoute {
   handle: RouteHandle,
 }

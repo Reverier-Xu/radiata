@@ -1,5 +1,4 @@
-//! The canonical `feature_selection` state-machine fuzz target (T-G10-04,
-//! ADR-0004).
+//! The canonical `feature_selection` state-machine fuzz target.
 //!
 //! Derived offer pairs exercise digest equality, dependency closure,
 //! conflict pairs, limit minima, and required-label rejection. An accepted

@@ -1,5 +1,4 @@
-//! Public-API integration tests for the dead-node cleanup family
-//! (T-G11-08, ADR-0009 decision 4, SC-G11-P0-19..22).
+//! Public-API integration tests for the dead-node cleanup family.
 //!
 //! Every test drives the facade only: `CleanupNode` issues a convergent
 //! issuer-signed removal tombstone that syncs to every member, excludes
@@ -97,12 +96,12 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
   }
 }
 
-/// SC-G11-P0-19..21: one cleanup tombstone converges to an observer through
+/// One cleanup tombstone converges to an observer through
 /// ordinary sync, the subject's binding stays as permanent evidence, the
 /// subject is refused new member sessions and re-merges everywhere, and
 /// cleaning an unknown or the own node fails with a typed error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn g11_cleanup_converges_and_excludes_the_subject() {
+async fn cleanup_converges_and_excludes_the_subject() {
   let issuer = start_node(1).await;
   let issuer_endpoint = listen(&issuer).await;
   let issuer_id = local_id(&issuer.handle).await;
@@ -214,11 +213,11 @@ async fn g11_cleanup_converges_and_excludes_the_subject() {
   }
 }
 
-/// SC-G11-P0-22: `PurgeRevocation` clears the local revocation record
+/// `PurgeRevocation` clears the local revocation record
 /// explicitly and idempotently; the revoked member's sessions work again
 /// afterwards (fat-finger recovery).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g11_purge_revocation_clears_the_local_boundary() {
+async fn purge_revocation_clears_the_local_boundary() {
   let issuer = start_node(11).await;
   let issuer_endpoint = listen(&issuer).await;
 
@@ -264,14 +263,14 @@ async fn g11_purge_revocation_clears_the_local_boundary() {
   member.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G11-P0-23/26: the issuer cleans a member and starts the GC epoch;
+/// The issuer cleans a member and starts the GC epoch;
 /// the checkpoint command is idempotent under max-wins, and the cluster
 /// stays fully compositional afterwards (a later merge still converges).
 /// The sweep and filter mechanics themselves are unit-covered; through
 /// the facade the observable contract is that checkpointing never breaks
 /// convergence and never gates live entries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn g11_checkpoint_converges_and_keeps_the_cluster_compositional() {
+async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   let issuer = start_node(21).await;
   let issuer_endpoint = listen(&issuer).await;
 

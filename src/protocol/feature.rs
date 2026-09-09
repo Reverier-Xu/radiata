@@ -1,5 +1,5 @@
 //! Domain-qualified feature label definitions and the closed validation
-//! registry from ADR-0002.
+//! registry.
 //!
 //! A [`FeatureDefinition`] is the immutable contract behind one feature
 //! label. Its definition digest is SHA-256 over the deterministic-CBOR
@@ -163,8 +163,8 @@ impl FeatureDefinition {
     &self.tag
   }
 
-  /// The immutable contract fingerprint (definition content input; G3-04
-  /// exposes it through negotiated evidence).
+  /// The immutable contract fingerprint included in the definition digest
+  /// input.
   #[allow(dead_code)]
   pub(crate) const fn fingerprint(&self) -> &Digest {
     &self.fingerprint
@@ -430,7 +430,7 @@ impl FeatureRegistry {
     Ok(Self { definitions: map })
   }
 
-  /// Builds the frozen built-in registry from ADR-0002.
+  /// Builds the frozen built-in registry.
   pub(crate) fn builtin() -> Result<Self> {
     Self::build(builtin_definitions()?)
   }
@@ -445,8 +445,8 @@ impl FeatureRegistry {
   }
 }
 
-/// The built-in features every session requires: the ADR-0001 Ed25519
-/// session authentication and the session core it anchors.
+/// The built-in features every session requires: the Ed25519 session
+/// authentication and the session core it anchors.
 pub(crate) fn required_session_features() -> Result<[FeatureTag; 2]> {
   Ok([
     FeatureTag::parse(AUTH_ED25519_SESSION)?,

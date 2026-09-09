@@ -1,4 +1,4 @@
-//! Dead-node cleanup tombstones (T-G11-08, ADR-0009 decision 4).
+//! Dead-node cleanup tombstones.
 //!
 //! `cleanup_node` issues a convergent, issuer-signed removal tombstone for
 //! a node the operator has decommissioned. The record carries the exact
@@ -52,7 +52,7 @@ struct CleanupRecordBodyWire {
   #[n(4)]
   issuer: String,
   /// Signed host wall-clock UNIX milliseconds: the removal timestamp the
-  /// checkpoint GC compares against its watermark (T-G11-09).
+  /// checkpoint GC compares against its watermark.
   #[n(5)]
   timestamp_millis: u64,
 }
@@ -78,7 +78,7 @@ struct CleanupRecordWire {
   signature: Vec<u8>,
 }
 
-/// One issuer-signed cleanup tombstone (ADR-0009 decision 4).
+/// One issuer-signed cleanup tombstone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CleanupRecordV1 {
   subject: NodeId,
@@ -313,14 +313,14 @@ struct CheckpointWire {
   #[n(2)]
   watermark_millis: u64,
   /// The member that issued the epoch (hygiene provenance only; the
-  /// record is unsigned by design — ADR-0009 decision 5: violations
-  /// degrade to metadata hygiene issues, never security failures).
+  /// record is unsigned by design — violations degrade to metadata
+  /// hygiene issues, never security failures).
   #[n(3)]
   issuer: String,
 }
 
-/// One cleanup checkpoint (ADR-0009 decision 5): an unsigned, max-wins
-/// record that rides the sync plane and declares one wall-clock watermark.
+/// One cleanup checkpoint: an unsigned, max-wins record that rides the
+/// sync plane and declares one wall-clock watermark.
 /// It is hygiene knowledge, not authorization: it never gates live
 /// entries, revocation records, or bindings.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -477,7 +477,7 @@ pub(crate) async fn persist_checkpoint_ctx(
   Ok(())
 }
 
-/// The checkpoint GC pass (ADR-0009 decision 5): after sync rounds, delete
+/// The checkpoint GC pass: after sync rounds, delete
 /// the collected leave and cleanup tombstones stamped at or before the
 /// latest local checkpoint watermark, reusing the conditional exact-digest
 /// delete. Bounded per pass; a raced delete conflicts and stays for the
@@ -568,8 +568,8 @@ mod tests {
     )
   }
 
-  /// SC-G11-P0-19: the cleanup tombstone signs, round-trips, and verifies;
-  /// any body or signature mutation fails verification.
+  /// The cleanup tombstone signs, round-trips, and verifies; any body or
+  /// signature mutation fails verification.
   #[tokio::test]
   async fn cleanup_record_signs_round_trips_and_rejects_mutation() {
     let factory = reference_factory();
@@ -612,9 +612,9 @@ mod tests {
     assert!(forged.verify(context.identity().public_key()).is_err());
   }
 
-  /// SC-G11-P0-20: persistence verifies the issuer binding, is idempotent
-  /// for the exact record, and fails closed on divergent subject keys and
-  /// unknown issuers; the cleaned set is queryable for exclusion.
+  /// Persistence verifies the issuer binding, is idempotent for the exact
+  /// record, and fails closed on divergent subject keys and unknown
+  /// issuers; the cleaned set is queryable for exclusion.
   #[tokio::test]
   async fn cleanup_record_persists_idempotently_and_marks_cleaned() {
     let factory = reference_factory();
@@ -676,10 +676,10 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
   }
 
-  /// SC-G11-P0-24/25: the GC pass collects only the tombstones at or
-  /// before the checkpoint watermark — newer tombstones and revocation
-  /// records stay, and the subject's binding stays as the permanent
-  /// anchor. The checkpoint is max-wins by watermark.
+  /// The GC pass collects only the tombstones at or before the checkpoint
+  /// watermark — newer tombstones and revocation records stay, and the
+  /// subject's binding stays as the permanent anchor. The checkpoint is
+  /// max-wins by watermark.
   #[tokio::test]
   async fn checkpoint_gc_collects_only_up_to_the_watermark() {
     use crate::{

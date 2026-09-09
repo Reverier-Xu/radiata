@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-//! The exact ADR-0005 workload (T-G10-11, SC-G10-P0-34..37): five runs of
+//! The exact sixteen-node profile workload: five runs of
 //! five samples per stratum — fixed merge, direct packets, routed
 //! label-selected packets, owner-revision node metadata, and resource
 //! metadata writes — observed only through the public facade.

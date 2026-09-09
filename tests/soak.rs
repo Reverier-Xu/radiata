@@ -1,4 +1,4 @@
-//! The churn/resource soak harness (T-G10-06, SC-G10-P0-17..19).
+//! The churn/resource soak harness.
 //!
 //! One four-node cluster runs a duration-bounded mixed workload —
 //! admission rotation, session churn (disconnect/reconnect), packet
@@ -284,7 +284,7 @@ fn append_ledger(
 /// admission rotation, packet streaming, resource writes, and session
 /// churn, then returns to the finite baselines.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "soak; run via scripts/verify-g10-06-soak.sh or the CI schedule"]
+#[ignore = "soak; run via scripts/verify-soak.sh or the CI schedule"]
 async fn soak_churn_then_baseline_return() {
   let duration_secs: u64 = std::env::var("RADIATA_SOAK_DURATION_SECS")
     .ok()

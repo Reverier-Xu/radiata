@@ -1,5 +1,4 @@
-//! Public-API integration tests for resource operations (T-G09-03,
-//! SC-G09-P0-09..12).
+//! Public-API integration tests for resource operations.
 //!
 //! Every test drives the facade only: `PutResource` commits one signed
 //! candidate atomically, emits exactly one post-commit event, converges
@@ -84,10 +83,10 @@ async fn select_names(node: &NodeHandle, selector: &str) -> Vec<String> {
     .collect()
 }
 
-/// SC-G09-P0-09/11: one valid write commits its complete signed candidate
-/// atomically and emits exactly one post-commit event naming the resource.
+/// One valid write commits its complete signed candidate atomically and
+/// emits exactly one post-commit event naming the resource.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_put_resource_commits_atomically_and_emits_one_event() {
+async fn put_resource_commits_atomically_and_emits_one_event() {
   let node = start_node(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
@@ -161,11 +160,11 @@ async fn g9_put_resource_commits_atomically_and_emits_one_event() {
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
-/// SC-G09-P0-10: concurrent writers on different members each commit a
-/// signed candidate; ordinary sync converges every member to the same
-/// tuple winner, and the losing candidate is not a conflict.
+/// Concurrent writers on different members each commit a signed
+/// candidate; ordinary sync converges every member to the same tuple
+/// winner, and the losing candidate is not a conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_concurrent_resource_writes_converge_to_one_winner() {
+async fn concurrent_resource_writes_converge_to_one_winner() {
   let issuer = start_node(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
@@ -281,11 +280,11 @@ async fn g9_concurrent_resource_writes_converge_to_one_winner() {
   }
 }
 
-/// SC-G09-P0-12: ordinary maintenance — anti-entropy ticks and topology
-/// chatter between two connected members — never erases labels and never
-/// emits a resource event without an explicit committed mutation.
+/// Ordinary maintenance — anti-entropy ticks and topology chatter
+/// between two connected members — never erases labels and never emits
+/// a resource event without an explicit committed mutation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g9_maintenance_preserves_labels_and_emits_nothing() {
+async fn maintenance_preserves_labels_and_emits_nothing() {
   let issuer = start_node(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
@@ -351,12 +350,12 @@ async fn g9_maintenance_preserves_labels_and_emits_nothing() {
   }
 }
 
-/// SC-G09-P0-09/12 restart lanes: a committed candidate survives a clean
-/// restart byte-exact on the real backends, and the restart emits no
-/// replayed event.
+/// Restart lanes: a committed candidate survives a clean restart
+/// byte-exact on the real backends, and the restart emits no replayed
+/// event.
 #[cfg(all(feature = "json", unix))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_json_restart_preserves_labels_without_event_replay() {
+async fn json_restart_preserves_labels_without_event_replay() {
   let directory = tempfile::tempdir().unwrap();
   restart_preserves_labels_without_event_replay(radiata::adapters::json_store(
     directory.path().to_path_buf(),
@@ -366,7 +365,7 @@ async fn g9_json_restart_preserves_labels_without_event_replay() {
 
 #[cfg(feature = "redb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_redb_restart_preserves_labels_without_event_replay() {
+async fn redb_restart_preserves_labels_without_event_replay() {
   let directory = tempfile::tempdir().unwrap();
   restart_preserves_labels_without_event_replay(radiata::adapters::redb_store(
     directory.path().join("store.redb"),
@@ -427,11 +426,11 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
   handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G09-P0-15: removal requires the exact observed version — a stale
-/// version fails closed and never becomes a newer winner; the exact
-/// removal wins once, emits one event, and is idempotent.
+/// Removal requires the exact observed version — a stale version fails
+/// closed and never becomes a newer winner; the exact removal wins once,
+/// emits one event, and is idempotent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_remove_resource_requires_the_exact_version() {
+async fn remove_resource_requires_the_exact_version() {
   let node = start_node(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
@@ -585,11 +584,11 @@ async fn g9_remove_resource_requires_the_exact_version() {
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
-/// SC-G09-P0-16/17: removal touches only the named resource's core
-/// metadata — unrelated resources stay selected, and neither the URI nor
-/// any caller object is consulted.
+/// Removal touches only the named resource's core metadata — unrelated
+/// resources stay selected, and neither the URI nor any caller object is
+/// consulted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g9_remove_preserves_unrelated_metadata() {
+async fn remove_preserves_unrelated_metadata() {
   let node = start_node(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),

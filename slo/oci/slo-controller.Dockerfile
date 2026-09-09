@@ -1,4 +1,4 @@
-# The release slo-controller image (SC-G10-P0-30): built from the external
+# The release slo-controller image: built from the external
 # path dependency at one exact source checkout and Cargo.lock digest.
 # The build context is the repository root.
 FROM rust:1.98-bookworm AS build

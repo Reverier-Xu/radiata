@@ -1,13 +1,13 @@
-//! Private in-memory authentication handshake state machine (ADR-0001,
-//! ADR-0002) over abstract canonical messages.
+//! Private in-memory authentication handshake state machine over abstract
+//! canonical messages.
 //!
-//! This module models the ADR-0001 message ordering and transcript assembly
+//! This module models the handshake message ordering and transcript assembly
 //! without any socket or TLS code. Ownership boundaries:
 //!
 //! - The real TLS 1.3 transport and the RFC 9266 exporter channel binding
-//!   belong to the G3-02 transport; here the channel binding is a locally
-//!   supplied fixed 32-byte value and never a wire field.
-//! - Merge-mode credential proofs are real ADR-0001 values derived through
+//!   belong to the `crate::transport` connection layer; here the channel
+//!   binding is a locally supplied fixed 32-byte value and never a wire field.
+//! - Merge-mode credential proofs are real values derived through
 //!   [`super::credential`] (HKDF-SHA256 over the channel binding and credential
 //!   body, role-separated HMAC-SHA256 over the transcript digest) and verified
 //!   in constant time. No proof, exporter, or credential bytes are ever logged
@@ -38,7 +38,8 @@
 //!    sent only after authentication completed. Position six is
 //!    post-authentication and never part of the transcript.
 //!
-//! The canonical, length-delimited transcript covers ADR-0001 items 1..=8:
+//! The canonical, length-delimited transcript covers the fixed protocol
+//! items in order:
 //! protocol magic and base schema ID `0x0001`, mode and merge-mode
 //! generation ID, fixed initiator/responder roles, both node IDs and Ed25519
 //! public keys, both independent 32-byte nonces, both complete canonical
@@ -81,14 +82,14 @@ const KIND_INITIATOR_PROOF: u64 = HandshakeKind::InitiatorProof.kind_id() as u64
 const KIND_SELECTION_CONFIRMATION: u64 = HandshakeKind::SelectionConfirmation.kind_id() as u64;
 const KIND_MERGE_GRANT_DELIVERY: u64 = HandshakeKind::MergeGrantDelivery.kind_id() as u64;
 
-/// The exact ADR-0001 responder session-signature domain.
+/// The exact responder session-signature domain.
 pub(crate) const SESSION_V1_RESPONDER_DOMAIN: &[u8] =
   b"radiata.woooo.tech/crypto/session-v1-responder";
-/// The exact ADR-0001 initiator session-signature domain.
+/// The exact initiator session-signature domain.
 pub(crate) const SESSION_V1_INITIATOR_DOMAIN: &[u8] =
   b"radiata.woooo.tech/crypto/session-v1-initiator";
 
-/// The ADR-0001 authentication mode of one handshake.
+/// The authentication mode of one handshake.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HandshakeMode {
   Merge,
@@ -199,7 +200,8 @@ pub(crate) struct HandshakeConfig {
   pub(crate) local_nonce: [u8; NONCE_LEN],
   pub(crate) local_offer: FeatureOffer,
   /// Locally derived channel binding placeholder; the real RFC 9266 exporter
-  /// value is supplied by the G3-02 transport and is never a wire field.
+  /// value is supplied by the transport connection layer and is never a wire
+  /// field.
   pub(crate) channel_binding: [u8; 32],
 }
 
@@ -299,8 +301,8 @@ impl Handshake {
     self.transcript.as_deref().map(body_digest)
   }
 
-  /// The locally computed deterministic selection bytes (G3-04 exposes
-  /// them through session evidence).
+  /// The locally computed deterministic selection bytes retained from the
+  /// negotiated selection.
   #[allow(dead_code)]
   pub(crate) fn selection_bytes(&self) -> Option<&[u8]> {
     self.selection.as_ref().map(Selection::bytes)
@@ -419,7 +421,8 @@ impl Handshake {
   /// Position 6 (responder, join mode only): opaque signed admission grant
   /// bytes, sent only after authentication completed. The grant is
   /// post-authentication and never part of the transcript; grant
-  /// construction and validation belong to the G3-03 admission layer.
+  /// construction and validation belong to the session driver and the
+  /// identity merge module.
   pub(crate) fn merge_grant_delivery(&mut self, grant: &[u8]) -> Result<Vec<u8>, HandshakeError> {
     if self.config.role != Role::Responder {
       return Err(HandshakeError::State {
@@ -751,13 +754,13 @@ pub(crate) fn peek_initiator_hello(bytes: &[u8]) -> Result<InitiatorHelloPeek, H
   })
 }
 
-/// The exact ADR-0001 responder session-signature payload:
+/// The exact responder session-signature payload:
 /// `radiata.woooo.tech/crypto/session-v1-responder || SHA-256(transcript)`.
 pub(crate) fn responder_session_message(transcript: &[u8]) -> Vec<u8> {
   signature_message(SESSION_V1_RESPONDER_DOMAIN, transcript)
 }
 
-/// The exact ADR-0001 initiator session-signature payload:
+/// The exact initiator session-signature payload:
 /// `radiata.woooo.tech/crypto/session-v1-initiator || SHA-256(transcript)`.
 pub(crate) fn initiator_session_message(transcript: &[u8]) -> Vec<u8> {
   signature_message(SESSION_V1_INITIATOR_DOMAIN, transcript)
@@ -924,7 +927,7 @@ struct IdentityWire {
   public_key: ByteVec,
 }
 
-/// The canonical ADR-0001 transcript, items 1..=8 in order.
+/// The canonical handshake transcript, fixed items in order.
 #[derive(Encode)]
 #[cbor(array)]
 struct TranscriptWire {
@@ -1228,8 +1231,8 @@ mod tests {
     assert!(member.initiator.is_authenticated());
     assert!(member.responder.is_authenticated());
 
-    // Join carries mode "join" plus a generation ID; member carries mode
-    // "member" and a null generation slot.
+    // Merge mode carries mode "merge" plus a generation ID; member mode
+    // carries mode "member" and a null generation slot.
     assert_ne!(join.messages[0], member.messages[0]);
     // Join proofs carry 32-byte opaque values; member proofs are null.
     assert_ne!(join.messages[2], member.messages[2]);
@@ -1280,7 +1283,7 @@ mod tests {
     let digest = exchange.initiator.transcript_digest().unwrap();
     let secret = credential();
 
-    // The wire proofs equal the exact ADR-0001 HKDF/HMAC derivation over
+    // The wire proofs equal the exact HKDF/HMAC derivation over
     // the transcript digest; the transcript bytes stay free of proofs.
     let responder_wire: ProofWire = decode_wire(&exchange.messages[2]).unwrap();
     let expected = derive_proof(ProofRole::Responder, &CHANNEL_BINDING, &secret, &digest).unwrap();
@@ -1644,9 +1647,9 @@ mod tests {
     nonce: ByteVec,
   }
 
-  /// THR-002 / SC-G03-P0-18: a complete prior handshake replayed on a
-  /// fresh connection fails — the fresh exporter channel binding produces a
-  /// different transcript, so the replayed proof signatures never verify.
+  /// A complete prior handshake replayed on a fresh connection fails — the
+  /// fresh exporter channel binding produces a different transcript, so the
+  /// replayed proof signatures never verify.
   #[test]
   fn handshake_state_machine_rejects_cross_connection_replay() {
     // Session A completes honestly; its messages are the replay material.
@@ -1664,7 +1667,7 @@ mod tests {
     // positions, so session A's initiator proof (position four) is
     // rejected by strict position ordering before any signature work, and
     // the fresh nonce/exporter transcript binding never becomes a replay
-    // vector (THR-002).
+    // vector.
     replay_responder.receive(&exchange_a.messages[0]).unwrap();
     let responder_hello = replay_responder.responder_hello().unwrap();
     assert_eq!(

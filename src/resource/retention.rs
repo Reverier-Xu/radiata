@@ -1,4 +1,4 @@
-//! Signed removal retention and exact core-metadata cleanup (T-G07-05).
+//! Signed removal retention and exact core-metadata cleanup.
 //!
 //! A removal is a signed resource record like any other: it stays the
 //! register's convergence-eligible winner until this exact-metadata policy
@@ -242,7 +242,7 @@ mod tests {
     }
   }
 
-  /// SC-G07-P0-14: expired removal records leave by exact conditional
+  /// Expired removal records leave by exact conditional
   /// deletes; live records and fresh removals stay; the sweep returns the
   /// exact count cleaned.
   #[tokio::test]
@@ -285,7 +285,7 @@ mod tests {
     );
   }
 
-  /// SC-G07-P0-13: removal evidence stays convergence-eligible until
+  /// Removal evidence stays convergence-eligible until
   /// policy removes it, and a cap evicts the oldest removals first while
   /// live winners stay put.
   #[tokio::test]
@@ -325,7 +325,7 @@ mod tests {
     }
   }
 
-  /// SC-G07-P0-13: a stale delete expectation fails closed as a typed
+  /// A stale delete expectation fails closed as a typed
   /// conflict without mutating the stored winner, exactly as the sweep's
   /// conditional delete does when a concurrent writer moved the register.
   #[tokio::test]
@@ -364,7 +364,7 @@ mod tests {
     }
   }
 
-  /// SC-G07-P0-15: cleanup never dereferences or follows the resource
+  /// Cleanup never dereferences or follows the resource
   /// URI — the referenced file survives untouched while the core record
   /// is removed.
   #[tokio::test]

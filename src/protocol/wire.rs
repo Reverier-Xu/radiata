@@ -1,4 +1,4 @@
-//! Closed wire kind registry for base schema `0x0001` (ADR-0002).
+//! Closed wire kind registry for base schema `0x0001`.
 //!
 //! A `kind_id` identifies one exact message schema in the deterministic-CBOR
 //! base decoder. IDs are immutable and never reused once published. The
@@ -6,15 +6,15 @@
 //! IDs are rejected before body dispatch, and golden fixtures pin every
 //! published schema/kind pair.
 //!
-//! This phase publishes the six authentication handshake kinds. Positions
-//! one through five are the strict lockstep authentication exchange;
+//! The registry publishes six authentication handshake kinds: positions
+//! one through five are the strict lockstep authentication exchange, and
 //! position six is the join-only post-authentication admission grant
-//! delivery. The four packet-stream kinds carry the ADR-0007 opaque packet
-//! data plane over an established authenticated session: open (trace,
+//! delivery. The four packet-stream kinds carry the opaque packet data
+//! plane over an established authenticated session: open (trace,
 //! endpoints, protocol tag, metadata), ordered chunks, end, and the
 //! current-process admission acknowledgement.
 
-/// The deterministic-CBOR base schema ID (ADR-0002).
+/// The deterministic-CBOR base schema ID.
 pub(crate) const BASE_SCHEMA_ID: u16 = 0x0001;
 
 /// One published handshake message kind of base schema `0x0001`.
@@ -128,8 +128,7 @@ pub(crate) fn handshake_frame_rules() -> crate::Result<FrameRules> {
   })
 }
 
-/// One published packet-stream message kind of base schema `0x0001`
-/// (ADR-0007).
+/// One published packet-stream message kind of base schema `0x0001`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PacketKind {
   /// Opens one directed packet stream: trace ID, authenticated endpoints,

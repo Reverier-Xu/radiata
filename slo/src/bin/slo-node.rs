@@ -204,7 +204,7 @@ async fn creator(
   handle: radiata::NodeHandle, endpoint: Endpoint, stdin: &mut std::io::StdinLock<'static>,
   stdout: &mut std::io::StdoutLock<'static>, table: RouteTable,
 ) -> Result<(), String> {
-  // Born-with-cluster (ADR-0009): no genesis step. The initial credential
+  // Born-with-cluster: no genesis step. The initial credential
   // rotates BEFORE the listener starts, so the accept loop's first computed
   // hint already carries an active generation (a hint computed before any
   // credential exists refuses every early merger).
@@ -296,7 +296,7 @@ async fn creator(
           }
           "disconnect" => {
             // Drop one member session: the harness prunes the star merge
-            // sessions down to the sparse final topology (ADR-0005).
+            // sessions down to the sparse final topology.
             // Intentionally disconnected peers are never re-dialled by
             // recovery until a deliberate reconnect.
             let Some(id_text) = parts.next() else {
@@ -420,7 +420,7 @@ async fn member(
           "connect" => {
             // Dial a fellow cluster member: credential-free after the
             // pairwise merge, used by the harness to build the sparse
-            // final topology (ADR-0005).
+            // final topology.
             let Some(endpoint_text) = parts.next() else {
               println!("error missing endpoint");
               continue;

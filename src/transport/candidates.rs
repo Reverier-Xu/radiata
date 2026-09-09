@@ -1,4 +1,4 @@
-//! Node-owned endpoint candidate sets (G4-02, ADR-0001).
+//! Node-owned endpoint candidate sets.
 //!
 //! An observed address becomes a candidate **for one authenticated
 //! `NodeId`** and can never create, replace, or rebind an identity record:
@@ -9,9 +9,7 @@
 //! addresses cannot authorize a session (authentication always happens at
 //! the handshake).
 
-// TODO(G4-06): the table is consumed when the supervisor routes dials and
-// readdresses through candidates; until then it is exercised by its unit
-// suite.
+// The table is currently exercised only by its unit suite.
 #![allow(dead_code)]
 
 use std::{
@@ -205,7 +203,7 @@ mod tests {
     UNIX_EPOCH + Duration::from_secs(seconds)
   }
 
-  // ---- SC-G04-P0-05: candidates bind to the authenticated identity ----
+  // ---- Candidates bind to the authenticated identity ----
 
   #[test]
   fn endpoint_table_scopes_candidates_by_node_and_never_touches_identity() {
@@ -233,7 +231,7 @@ mod tests {
     assert_eq!(table.node_count(), 2);
   }
 
-  // ---- SC-G04-P0-06: deterministic candidate merging ----
+  // ---- Deterministic candidate merging ----
 
   #[test]
   fn candidate_set_merges_duplicates_and_reorders_deterministically() {
@@ -254,7 +252,7 @@ mod tests {
     assert_eq!(set.len(), 3);
   }
 
-  // ---- SC-G04-P0-07: host wall-clock expiry ----
+  // ---- Host wall-clock expiry ----
 
   #[test]
   fn candidates_expire_at_the_host_wall_clock_boundary() {
@@ -288,7 +286,7 @@ mod tests {
     assert_eq!(candidates.candidates(&node(7), at(1101)).unwrap().len(), 0);
   }
 
-  // ---- SC-G04-P0-08: readdress keeps the exact trusted key ----
+  // ---- Readdress keeps the exact trusted key ----
 
   #[test]
   fn readdress_replaces_the_candidate_while_identity_stays_bound() {

@@ -1,5 +1,5 @@
 //! The bounded fuzz adapters for the canonical decoder and selector fuzz
-//! targets (T-G10-03).
+//! targets.
 //!
 //! The module exists only under `cfg(any(test, fuzzing))`: the corpus
 //! replay suites reuse it for the out-of-libFuzzer ordered replay, the
@@ -31,7 +31,7 @@ pub enum WireFrame {
   Ack,
 }
 
-/// The wire target (ADR-0004 `wire_decode`): prelude splitting, closed
+/// The wire target (`wire_decode`): prelude splitting, closed
 /// kind lookups, and every packet frame body decoder. The prelude half
 /// exercises the exact `split_message` boundary the transport uses; the
 /// body half decodes the input as each packet frame shape directly.
@@ -67,7 +67,7 @@ pub fn wire_decode(input: &[u8]) -> Vec<WireFrame> {
   decoded
 }
 
-/// The persisted target (ADR-0004 `persisted_decode`): every frozen
+/// The persisted target (`persisted_decode`): every frozen
 /// metadata record decoder across the identity, node, resource, trace,
 /// transaction, and migration families. Each decoder is the exact
 /// fail-closed production path; any outcome other than a clean
@@ -89,7 +89,7 @@ pub fn persisted_decode(input: &[u8]) {
   let _ = decode_schema_record(&crate::StoreValue::new(std::sync::Arc::from(input)));
 }
 
-/// The selector target (ADR-0004 `selector`): the bounded parser plus the
+/// The selector target (`selector`): the bounded parser plus the
 /// canonical round-trip invariant. Two parses of one input converge, the
 /// canonical text reparses to itself, and every outcome is a value.
 pub fn selector_parse(input: &[u8]) -> Option<String> {
@@ -113,7 +113,7 @@ pub fn selector_parse(input: &[u8]) -> Option<String> {
   Some(canonical)
 }
 
-// ---- state-machine targets (T-G10-04) ----
+// ---- state-machine targets ----
 
 use std::{collections::BTreeSet, sync::Arc as SharedArc};
 
@@ -176,7 +176,7 @@ fn derive_offer(
   FeatureOffer::new(supported, required, limits)
 }
 
-/// The feature_selection target (T-G10-04, SC-G10-P0-13): derived offer
+/// The feature_selection target: derived offer
 /// pairs exercise digest equality, dependency closure, conflict pairs,
 /// limit minima, and required-label rejection with no downgrade or
 /// fallback. Any panic is a finding; an accepted selection must satisfy
@@ -273,7 +273,7 @@ fn admission_op(byte: u8) -> AdmissionOp {
   }
 }
 
-/// The admission target (T-G10-04, SC-G10-P0-12): derived operation
+/// The admission target: derived operation
 /// sequences preserve the single-subject generation binding, replay
 /// rejection/idempotence, and commit reconciliation against the reference
 /// storage, with every error a typed value. The target allocates a fresh
@@ -407,7 +407,7 @@ pub fn admission(input: &[u8]) {
     .ok();
 }
 
-/// The routing target (T-G10-04, SC-G10-P0-14): derived transition
+/// The routing target: derived transition
 /// sequences over the route envelope preserve authenticated holder
 /// selection, one checked next hop, monotone budget drain, duplicate-free
 /// visited chains, and explicit termination; every rejection is a typed
@@ -490,7 +490,7 @@ fn bytes_at(input: &[u8], offset: usize) -> u8 {
 
 #[cfg(test)]
 mod replay_tests {
-  //! Ordered corpus replay (T-G10-03, SC-G10-P0-10): every approved
+  //! Ordered corpus replay: every approved
   //! retained corpus input replays exactly once in filename order,
   //! outside libFuzzer scheduling. Malformed or over-bound inputs must
   //! fail closed with typed errors and never panic.
@@ -598,7 +598,7 @@ mod replay_tests {
   }
 
   /// Replays one input exactly once through the admission state-machine
-  /// target (T-G10-04, SC-G10-P0-12).
+  /// target.
   #[test]
   fn admission_corpus_replays_in_filename_order() {
     for (name, path, bytes) in corpus_files("admission") {
@@ -608,7 +608,7 @@ mod replay_tests {
   }
 
   /// Replays one input exactly once through the feature-selection
-  /// state-machine target (T-G10-04, SC-G10-P0-13).
+  /// state-machine target.
   #[test]
   fn feature_selection_corpus_replays_in_filename_order() {
     for (name, path, bytes) in corpus_files("feature_selection") {
@@ -618,7 +618,7 @@ mod replay_tests {
   }
 
   /// Replays one input exactly once through the routing state-machine
-  /// target (T-G10-04, SC-G10-P0-14).
+  /// target.
   #[test]
   fn routing_corpus_replays_in_filename_order() {
     for (name, path, bytes) in corpus_files("routing") {

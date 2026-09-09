@@ -1,5 +1,5 @@
 #!/usr/bin/bash -p
-# The OCI profile preflight (ADR-0005, SC-G10-P0-32): the bounded dry-run
+# The OCI profile preflight: the bounded dry-run
 # that verifies every host, engine, image, network, limit, and topology
 # property the sixteen-node profile demands, and rejects every mismatch
 # before any measurement. A failed preflight aborts before measurement
@@ -98,7 +98,7 @@ grep -q '^publish[[:space:]]*=[[:space:]]*false' slo/Cargo.toml || {
   fail "the harness workspace is not publish = false"
 }
 
-# --- release images (SC-G10-P0-30): build or reuse, then record ---
+# --- release images: build or reuse, then record ---
 IMAGES_JSON=${RADIATA_SLO_IMAGES_JSON:-target/slo-images.json}
 bash scripts/build-slo-images.sh "$IMAGES_JSON" >/dev/null
 NODE_IMAGE_ID=$(jq -r '.images[] | select(.name == "radiata/slo-node") | .image_id' "$IMAGES_JSON")
@@ -126,7 +126,7 @@ printf 'redb' > "$VOLUMES/probe/.writable"
 [ "$(cat "$VOLUMES/probe/.writable")" = "redb" ] || fail "the redb volume root is not writable"
 rm -rf "$VOLUMES/probe"
 
-# --- frozen topology table (SC-G10-P0-32): 64 directions, 3-hop, 4 edges ---
+# --- frozen topology table: 64 directions, 3-hop, 4 edges ---
 if [ ! -x slo/target/debug/slo-controller ]; then
   ( cd slo && cargo build --locked --bin slo-controller >/dev/null 2>&1 )
 fi

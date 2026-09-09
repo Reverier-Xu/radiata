@@ -1,4 +1,4 @@
-//! Opaque directed packet streams (ADR-0007).
+//! Opaque directed packet streams.
 //!
 //! The data-plane unit is an opaque packet stream, not an application
 //! request or response. [`crate::NodeHandle::open_stream`] allocates the
@@ -8,12 +8,11 @@
 //! [`OutboundStream::send_async`] returns a [`RouteHandle`] immediately and
 //! exposes in-memory route status through the `GetRoute` query.
 //!
-//! Bodies are standard [`Stream`]s of ordered chunks (R1: futures-core
-//! enters the public ABI). Core frames and forwards body chunks with
-//! constant memory and backpressure over one authenticated session,
-//! preserves byte order, never persists payload bytes, and never replays
-//! or resumes an interrupted stream: route or session interruption ends
-//! the stream with `StreamInterrupted`.
+//! Bodies are standard [`Stream`]s of ordered chunks. Core frames and
+//! forwards body chunks with constant memory and backpressure over one
+//! authenticated session, preserves byte order, never persists payload
+//! bytes, and never replays or resumes an interrupted stream: route or
+//! session interruption ends the stream with `StreamInterrupted`.
 
 pub(crate) mod wire;
 
@@ -39,8 +38,9 @@ use crate::{
 /// The caller-selected routing policy for one stream.
 ///
 /// Typed so the compiler rejects unknown or misspelled policies at build
-/// time; only direct exact-node delivery exists at this gate, and selector
-/// policies arrive with label routing (G6/G9).
+/// time; the direct exact-node policy is the only routing policy, and
+/// selection among label-matching members goes through
+/// [`StreamTarget::MatchingNodes`] with the registered load balancer.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoutingPolicy {
@@ -49,8 +49,7 @@ pub enum RoutingPolicy {
   Direct,
 }
 
-/// The maximum number of metadata entries in one stream (ADR-0002 bounded
-/// collection).
+/// The maximum number of metadata entries in one stream.
 pub(crate) const METADATA_MAX_ENTRIES: usize = 256;
 
 /// The maximum summed metadata key and value bytes in one stream.
@@ -62,7 +61,7 @@ pub(crate) const MAX_CHUNK_BYTES: usize = 32 * 1_024;
 
 /// A stream destination: an exact authenticated node, or one node selected
 /// by the registered load balancer from the members whose owned labels
-/// match the selector (T-G06-01).
+/// match the selector.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamTarget {
@@ -167,7 +166,7 @@ impl fmt::Debug for StreamMetadata {
   }
 }
 
-/// A caller-owned stream body (R1): the standard [`Stream`] of ordered
+/// A caller-owned stream body: the standard [`Stream`] of ordered
 /// chunks with the crate's typed error. Core pulls chunks with
 /// backpressure; a `None` item ends the stream.
 ///
@@ -230,7 +229,7 @@ impl OutboundStream {
   }
 
   /// Streams the body and waits only for the destination's current-process
-  /// admission acknowledgement (ADR-0007): the returned [`DeliveryAck`]
+  /// admission acknowledgement: the returned [`DeliveryAck`]
   /// proves authenticated admission to the destination's bounded incoming
   /// stream, never durable retention, processing, or success.
   pub fn send_sync<S>(self, body: S) -> BoxFuture<'static, Result<DeliveryAck>>
@@ -307,9 +306,6 @@ struct SendRequest {
   runtime: RuntimeClient,
 }
 
-/// An admitted incoming packet stream handed to the registered
-/// [`crate::PacketConsumer`]. Endpoints are the session-authenticated node
-/// IDs; the body preserves wire order.
 /// The reply context an admitted incoming stream needs to derive a
 /// caller-owned return stream: the registry that gates protocol labels and
 /// the runtime client that routes outbound streams.
@@ -325,6 +321,9 @@ impl PacketReplyContext {
   }
 }
 
+/// An admitted incoming packet stream handed to the registered
+/// [`crate::PacketConsumer`]. Endpoints are the session-authenticated node
+/// IDs; the body preserves wire order.
 pub struct IncomingStream {
   source: NodeId,
   destination: NodeId,
@@ -378,8 +377,8 @@ impl IncomingStream {
   }
 
   /// The admitted body stream in wire order. A channel that closes
-  /// without an end item yields one `StreamInterrupted` error (ADR-0007:
-  /// no replay, no continuation).
+  /// without an end item yields one `StreamInterrupted` error; there is
+  /// no replay and no continuation.
   pub fn body(&mut self) -> Pin<&mut (dyn Stream<Item = Result<Arc<[u8]>>> + Send)> {
     self.body.as_mut()
   }
@@ -388,8 +387,7 @@ impl IncomingStream {
   /// the endpoints are swapped and the incoming `TraceId` is reused. Core
   /// assigns no return meaning, never completes another stream by
   /// correlation, and the derived stream follows the exact-node direct
-  /// policy with the caller-supplied protocol and metadata (ADR-0007,
-  /// SC-G03-P0-16).
+  /// policy with the caller-supplied protocol and metadata.
   pub fn derive_return_stream(
     &self, protocol: ProtocolTag, metadata: StreamMetadata,
   ) -> Result<OutboundStream> {
@@ -421,7 +419,7 @@ impl fmt::Debug for IncomingStream {
   }
 }
 
-/// The destination's current-process admission acknowledgement (ADR-0007).
+/// The destination's current-process admission acknowledgement.
 /// It carries no durable-retention, processing, or success claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeliveryAck {
@@ -481,8 +479,8 @@ pub enum RouteState {
   Failed(ErrorKind),
 }
 
-/// One bounded in-memory observation of a route (ADR-0007: trace metadata
-/// only, never payload bytes, and no durability claim).
+/// One bounded in-memory observation of a route: trace metadata only,
+/// never payload bytes, and no durability claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteStatusView {
   handle: RouteHandle,
@@ -565,8 +563,7 @@ pub(crate) enum StreamItem {
 /// The body [`Stream`] over one admitted incoming stream's bounded
 /// channel: the standard [`ReceiverStream`] adapter plus the explicit
 /// `End` sentinel. A channel that closes without an `End` item is an
-/// interrupted stream (ADR-0007: no replay, no continuation) and yields
-/// exactly one `StreamInterrupted` error.
+/// interrupted stream and yields exactly one `StreamInterrupted` error.
 pub(crate) fn channel_body(receiver: tokio::sync::mpsc::Receiver<StreamItem>) -> BodyStream {
   let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
   let observed = Arc::clone(&ended);
@@ -715,7 +712,7 @@ mod tests {
     assert_eq!(metadata.entries().len(), 2);
   }
 
-  /// SC-G11-P1-07: the receiver-stream body yields chunks in order and
+  /// The receiver-stream body yields chunks in order and
   /// ends cleanly at the explicit end sentinel.
   #[tokio::test]
   async fn channel_body_yields_chunks_in_order_and_ends_at_the_sentinel() {
@@ -741,7 +738,7 @@ mod tests {
     );
   }
 
-  /// SC-G11-P1-07: a channel that closes without the end sentinel is an
+  /// A channel that closes without the end sentinel is an
   /// interrupted stream: exactly one typed error, then the stream ends.
   #[tokio::test]
   async fn channel_body_close_without_end_is_one_typed_interruption() {
@@ -759,7 +756,7 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::StreamInterrupted);
   }
 
-  /// SC-G11-P1-07: items after the end sentinel are never yielded.
+  /// Items after the end sentinel are never yielded.
   #[tokio::test]
   async fn channel_body_never_yields_after_the_end_sentinel() {
     let (sender, receiver) = tokio::sync::mpsc::channel(4);

@@ -1,15 +1,15 @@
-//! Conditional local transactions for resource metadata (T-G07-03).
+//! Conditional local transactions for resource metadata.
 //!
 //! One named resource is one register: a put or removal conditionally
 //! commits exactly one whole signed record under the register key, and the
 //! commit installs only when the incoming tuple strictly wins over the
-//! stored record (SC-G07-P0-08). Losing records are accepted and store
-//! nothing — acceptance never promises a current or future win. A losing,
+//! stored record. Losing records are accepted and store nothing —
+//! acceptance never promises a current or future win. A losing,
 //! conflicting, or indeterminate outcome never leaves partial labels or a
 //! hidden causal ordering behind: the storage contract's conditional
-//! transactions reopen to exactly the old or the new whole record
-//! (SC-G07-P0-07), and concurrent exact-version writes resolve to typed
-//! conflicts or one commit (SC-G07-P0-09).
+//! transactions reopen to exactly the old or the new whole record, and
+//! concurrent exact-version writes resolve to typed conflicts or one
+//! commit.
 
 use std::sync::Arc;
 
@@ -33,8 +33,7 @@ fn record_key(name: &ResourceName) -> StoreKey {
 #[derive(Debug)]
 pub(crate) enum ResourceCommitOutcome {
   /// The record is now the register's stored winner; the receipt proves
-  /// the durable commit. The receipt becomes caller-visible once the
-  /// runtime wires this outcome into its recovery surface.
+  /// the durable commit.
   Installed(#[allow(dead_code)] CommitReceipt),
   /// A greater tuple already occupies the register: the write is accepted
   /// but stores nothing and wins nothing (accepted writes may lose tuple
@@ -42,9 +41,7 @@ pub(crate) enum ResourceCommitOutcome {
   Superseded(ResourceRecordV1),
   /// The commit ended indeterminate: the caller must reconcile the
   /// pending transaction identity before knowing whether old or new
-  /// metadata won. The register reopens to exactly one of them. The
-  /// identity fields become caller-visible once the runtime wires this
-  /// outcome into its recovery surface.
+  /// metadata won. The register reopens to exactly one of them.
   Indeterminate {
     #[allow(dead_code)]
     transaction: TransactionId,
@@ -102,8 +99,8 @@ pub(crate) async fn commit_record_ctx(
   .await
 }
 
-/// The shared conditional-put tail of both register commits (G9 review):
-/// one snapshot-exact CAS, one typed outcome mapping. The caller's
+/// The shared conditional-put tail of both register commits: one
+/// snapshot-exact CAS, one typed outcome mapping. The caller's
 /// snapshot view stays the single authority for both the per-key
 /// expectation and the CAS revision.
 async fn commit_put_ctx(
@@ -139,12 +136,12 @@ async fn commit_put_ctx(
 }
 
 /// Conditionally commits one signed removal record under an exact-version
-/// precondition (T-G09-05, SC-G09-P0-15): the stored winner must still be
+/// precondition: the stored winner must still be
 /// exactly `expected`, and the removal must strictly win the tuple, so a
 /// raced or stale removal can never overwrite a newer record or pose as a
 /// newer wall-clock winner. The commit is one conditional transaction, so
 /// every fault boundary reopens to exactly the old or the new record
-/// without touching unrelated metadata (SC-G09-P0-16).
+/// without touching unrelated metadata.
 pub(crate) async fn commit_removal_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
   expected: &ResourceRecordV1,
@@ -245,9 +242,8 @@ mod tests {
     (factory, store)
   }
 
-  /// SC-G07-P0-07: a local put conditionally commits one whole signed
-  /// record; a fresh handle reopens exactly that metadata with every label
-  /// intact.
+  /// A local put conditionally commits one whole signed record; a fresh
+  /// handle reopens exactly that metadata with every label intact.
   #[tokio::test]
   async fn local_put_installs_whole_and_reopens_intact() {
     let (_factory, store) = open_store().await;
@@ -272,9 +268,9 @@ mod tests {
     assert!(!stored.removed());
   }
 
-  /// SC-G07-P0-08: a losing write is accepted but stores nothing and wins
-  /// nothing — the stored winner is untouched and the loser never becomes
-  /// visible through any read path.
+  /// A losing write is accepted but stores nothing and wins nothing —
+  /// the stored winner is untouched and the loser never becomes visible
+  /// through any read path.
   #[tokio::test]
   async fn losing_writes_are_accepted_and_stay_harmless() {
     let (_factory, store) = open_store().await;
@@ -314,7 +310,7 @@ mod tests {
   /// A removal is just a signed record: a greater-tuple removal replaces a
   /// live record, and an even-greater live put replaces the removal — the
   /// register has no hidden causal or tombstone permanence at this layer
-  /// (removal evidence retention is T-G07-05).
+  /// (removal evidence retention lives in the retention module).
   #[tokio::test]
   async fn removals_and_puts_converge_by_tuple_order_alone() {
     let (_factory, store) = open_store().await;
@@ -348,9 +344,9 @@ mod tests {
     assert_eq!(stored.resource_uri(), revive.resource_uri());
   }
 
-  /// SC-G07-P0-09: two exact-version writes prepared from one snapshot can
-  /// produce only typed conflicts or one commit — never partial labels or
-  /// hidden ordering.
+  /// Two exact-version writes prepared from one snapshot can produce only
+  /// typed conflicts or one commit — never partial labels or hidden
+  /// ordering.
   #[tokio::test]
   async fn raced_exact_version_writes_fail_with_typed_conflicts() {
     let (_factory, store) = open_store().await;
@@ -403,9 +399,9 @@ mod tests {
     assert!(stored.digest() == first.digest() || stored.digest() == second.digest());
   }
 
-  /// SC-G09-P0-04: both real backends preserve the exact logical tuple
-  /// version of a stored record across a reopen — JSON and redb return
-  /// the identical signed record, never a normalized or truncated form.
+  /// Both real backends preserve the exact logical tuple version of a
+  /// stored record across a reopen — JSON and redb return the identical
+  /// signed record, never a normalized or truncated form.
   #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   async fn backend_preserves_the_exact_logical_version(factory: Arc<dyn StorageFactory>) {
     let record = put(7_000, "file:///versioned");
@@ -436,7 +432,7 @@ mod tests {
   }
 
   // Windows JSON cannot satisfy the metadata open requirements (no durable
-  // directory barrier); the JSON arm is unix-only per ADR-0004.
+  // directory barrier); the JSON arm is therefore unix-only.
   #[cfg(all(feature = "json", unix))]
   #[tokio::test]
   async fn json_backend_preserves_the_exact_logical_version() {

@@ -137,7 +137,7 @@ impl StorageFactory for DummyFactory {
 }
 
 #[test]
-fn g1_core_key_boundary_is_constructible_inspectable_and_redacted() {
+fn core_key_boundary_is_constructible_inspectable_and_redacted() {
   let capabilities = KeyCapabilities::new()
     .ed25519(true)
     .reconciliation(true)
@@ -171,7 +171,7 @@ fn g1_core_key_boundary_is_constructible_inspectable_and_redacted() {
 }
 
 #[test]
-fn g1_core_storage_boundary_values_round_trip() {
+fn core_storage_boundary_values_round_trip() {
   let capabilities = complete_store_capabilities();
   assert_eq!(capabilities.durability(), DurabilityLevel::OsCrashDurable);
   assert!(capabilities.has_conditional_batch());
@@ -259,7 +259,7 @@ fn g1_core_storage_boundary_values_round_trip() {
 }
 
 #[test]
-fn g1_core_provider_traits_are_object_safe_and_external() {
+fn core_provider_traits_are_object_safe_and_external() {
   fn accept_traits(
     _keys: Arc<dyn KeyProvider>, _factory: Arc<dyn StorageFactory>, _storage: Box<dyn Storage>,
     _snapshot: Box<dyn StoreSnapshot>, _scan: Box<dyn StoreScan>,

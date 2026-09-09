@@ -1,4 +1,4 @@
-//! The canonical `persisted_decode` fuzz target (T-G10-03, ADR-0004).
+//! The canonical `persisted_decode` fuzz target.
 //!
 //! Feeds every input through each frozen persisted-metadata record
 //! decoder: identity, node, resource, trace, transaction, and migration

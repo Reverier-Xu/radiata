@@ -1,5 +1,5 @@
 //! The redb production storage adapter implementing the backend-neutral
-//! storage SPI (T-G08-02).
+//! storage SPI.
 //!
 //! Logical layout: one `&[u8] -> &[u8]` entries table keyed by
 //! `namespace-tag ++ 0x00 ++ key`, one receipts table keyed by transaction

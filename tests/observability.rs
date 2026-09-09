@@ -1,5 +1,4 @@
-//! Bounded runtime status and secret-safe observability (T-G10-05,
-//! SC-G10-P0-15/16).
+//! Bounded runtime status and secret-safe observability.
 //!
 //! The status lane proves the public observation of the bounded runtime
 //! responsibilities — lifecycle, sessions, listeners, tasks, queues,
@@ -89,7 +88,7 @@ async fn listen(node: &mut Node) {
   node.endpoint = listener.endpoint().clone();
 }
 
-/// SC-G10-P0-15: the observability snapshot covers the bounded
+/// The observability snapshot covers the bounded
 /// responsibilities with counters and flags only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observability_snapshot_covers_bounded_responsibilities() {
@@ -172,7 +171,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   }
 
   // Session queues return to the empty baseline after the sync traffic
-  // drains (SC-G10-P0-15's queue responsibility).
+  // drains.
   let drain = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     let issuer_status = issuer.handle.query(GetObservability::new()).await.unwrap();
@@ -238,7 +237,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   member.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G10-P0-16: injected credential, key, packet-body, path, address,
+/// Injected credential, key, packet-body, path, address,
 /// selector, and hostile-string markers never enter the emitted log
 /// stream of a full node workflow.
 ///

@@ -3,7 +3,8 @@
 > **G9 review 2026-09-02 (main @ 8135662, four fresh reviewer lanes):
 > resources/selector, identity custody, runtime facade, cross-cutting +
 > tests.** G9 verdict **PASS-WITH-GAPS** → remediated to **PASS** (same
-> day; all seven lanes re-run PASS, Q 550/0 clean tree ×5). All seven verify-g09-* lanes PASS;
+> day; all seven lanes re-run PASS, Q 550/0 clean tree ×5). All seven
+> resource/authorization/leave/facade verify lanes PASS;
 > full Q green on a clean tree (550 passed, 0 failed). Every SC-G09
 > acceptance phrase mapped to a proving test except the gaps below; no P0.
 >
@@ -64,7 +65,7 @@
 > usize::MAX capacity; leave_cluster retires sessions without
 > SessionChanged (document the asymmetry); tests/leave.rs
 > `former_handle_bytes` holds a NodeId; fixed-sleep absence windows;
-> verify-g09-02 label naming; retention tombstone-GC resurrection window
+> verify-resource-selectors label naming; retention tombstone-GC resurrection window
 > deserves one doc sentence; ResourceVersion::from_record/CommitReceipt
 > dead_code payloads are a declared G10 wiring obligation.
 >
@@ -99,12 +100,12 @@
 > precondition/tuple-win layering is correct under one snapshot; the
 > selector parser bounds and escape round-trips were hand-traced and are
 > property-pinned; the revocation/leave crash matrices reconcile
-> decisively at every point; the verify-g09-04 namespace-catalog diff
+> decisively at every point; the verify-authorization-revocation namespace-catalog diff
 > guard is a strong single-source check; no unsafe, no unwrap/expect in
 > production, no stringly-typed registries found in any lane.
 >
 > **G8 review 2026-08-30 (main @ a6f9b3e, four fresh reviewer lanes +
-> orchestrator):** G8 verdict **PASS**. All five verify-g08-\* lanes PASS;
+> orchestrator):** G8 verdict **PASS**. All five storage verify lanes PASS;
 > every SC-G08 acceptance phrase mapped to a concrete test (no unmapped
 > phrases). Zero P0, zero P1 across all four lanes. All cited P2s
 > spot-checked.
@@ -149,7 +150,7 @@
 > metadata storage contract driven unchanged across JSON/redb/reference
 > providers (`contract/reference.rs::run_storage_contract`); namespace
 > literals single-sourced in `families.rs` and statically enforced by
-> verify-g08-01's rg+diff guard; redb adapter feature-gated with static
+> verify-storage-contract's rg+diff guard; redb adapter feature-gated with static
 > isolation checks (cfg gate, api-manifest redb-type grep, powerset via
 > pinned cargo-hack 0.6.45); redb crash matrix at 6 commit-path points
 > (begin→conditions→mutations→revision→receipt→durable-commit) with
@@ -206,7 +207,8 @@
 >   merge rules inline instead of membership.rs.
 >
 > ### G8 gate record
-> - verify-g08-01..05: PASS (ran locally 2026-08-30).
+> - verify-storage-contract, verify-redb-adapter, verify-redb-integrity,
+>   verify-storage-migration, verify-mixed-storage: PASS (ran locally 2026-08-30).
 > - SC mapping: P0-01/02 contract+unknown.rs tests; P1-03 capability
 >   refusal (contract unknown.rs:80 + redb tests.rs:43); P0-04 redb
 >   contract parity; P0-05 static isolation checks in script; P1-06
@@ -215,11 +217,11 @@
 >   P0-09 receipt_refs.rs owner/intent/cleanup lanes; P0-10..12
 >   migration registry/interruption/replay/reader lanes; P0-13/14
 >   mixed_e2e convergence + graceful/killed restarts; P1-15 powerset
->   + CI lanes in verify-g08-05; E2E-07 = mixed_e2e lanes.
+>   + CI lanes in verify-mixed-storage; E2E-07 = mixed_e2e lanes.
 >
 
 > **G7 re-review 2026-08-25 (main, four fresh reviewer lanes +
-> orchestrator):** G7 verdict **PASS-WITH-GAPS**; all six verify-g07-\*
+> orchestrator):** G7 verdict **PASS-WITH-GAPS**; all six wall-clock/resource verify
 > lanes PASS; Q suite green on rerun (first run had one parallel-load
 > flake: routed_packets handshake `AuthenticationFailed: handshake
 > closed`, 3/3 green in isolation — harness lacks connect retry).
@@ -227,7 +229,7 @@
 >
 > **Remediated 2026-08-28 (branch fix-g7-review-findings, 10 commits):**
 > both P1s, all P2 hotspots below, and the evidence gaps (P0-18 sample
-> + P0-11 restart/readdress lane, wired into verify-g07-04/06).
+> + P0-11 restart/readdress lane, wired into verify-resource-sync/verify-merge-scale-slo).
 > Residual decisions: E2E-06 real-session resource writes need the G9
 > facade (no pre-G9 write path exists); stream.rs clock_second/millis
 > aliases kept (single-file readability, no longer duplicated); member
@@ -287,7 +289,9 @@
 
 > **G6 re-review 2026-08-25 (main @ b9cd349, five fresh reviewer lanes +
 > orchestrator):** G6 verdict **PASS-WITH-GAPS**; Q suite and all five
-> verify-g06-\* lanes green; planning validator green (69/226/10/29).
+> routing verify lanes (verify-route-authorization, verify-routing-trace,
+> verify-packet-forwarding, verify-stream-admission, verify-route-completion)
+> green; planning validator green (69/226/10/29).
 > All P0/P1 findings below spot-checked against source. Hotspots:
 >
 > ### P0 — leftover debug output in the G6 hot path
@@ -339,7 +343,9 @@
 
 > **Post-closure spot review 2026-08-25 (main @ cc984d8, two fresh
 > reviewer agents + supervisor-run verify lanes):** evidence chain
-> COMPLETE — all five verify-g06-* scripts PASS locally; task/scenario/
+> COMPLETE — all five routing verify scripts (verify-route-authorization,
+> verify-routing-trace, verify-packet-forwarding, verify-stream-admission,
+> verify-route-completion) PASS locally; task/scenario/
 > impact registration consistent; all nine development-gates G6 Verify
 > bullets covered. Code verdict NEEDS-WORK → remediated same day:
 >
@@ -441,7 +447,8 @@ P2 = nice-to-have. All line numbers are from that revision and drift.
 
 ## G4 status (2026-08, gate in progress)
 
-- T-G04-01..06 all registered with verify lanes (`verify-g04-01..06`), all
+- T-G04-01..06 all registered with verify lanes (`verify-transport-*`,
+  `verify-session-*`, `verify-identity-trust`, `verify-reconnect`), all
   lanes PASS on the working tree; full suite 392 tests, zero warnings.
 - Delivered: transport/discovery registries with the built-in WSS registered
   by default; identity-scoped endpoint candidates with wall-clock expiry;
@@ -497,7 +504,7 @@ total order verified by unit and integration tests.
 ## G5 status (2026-08, gate in progress)
 
 - T-G05-01..05 (descriptors, pages, neighbors, recovery, seeded sim) all
-  registered with verify lanes (`verify-g05-01..05`), all lanes PASS; full
+  registered with verify lanes (`verify-membership-*`), all lanes PASS; full
   suite 399 tests, zero warnings.
 - Delivered: owner-signed node descriptors with strict-next revisions and
   signed removal markers; bounded anti-entropy pages (emit/apply with

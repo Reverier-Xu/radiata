@@ -1,4 +1,4 @@
-//! Secure-merge integration lane (T-G03-02).
+//! Secure-merge integration lane.
 //!
 //! Two real nodes over loopback TLS 1.3 WebSocket: the receiver rotates a
 //! merge credential and listens; the peer completes the exporter-bound
@@ -192,12 +192,12 @@ async fn secure_join_completes_exporter_bound_merge_and_persists_binding() {
   joiner.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G11-P0-08: born-with-cluster. A freshly started node — no creation
-/// ceremony at all — immediately resolves its local view, pages itself as
-/// the singleton cluster member, issues a merge credential, and admits a
+/// Born-with-cluster: a freshly started node — no creation ceremony at
+/// all — immediately resolves its local view, pages itself as the
+/// singleton cluster member, issues a merge credential, and admits a
 /// merger over it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn g11_born_with_cluster_serves_immediately_without_ceremony() {
+async fn born_with_cluster_serves_immediately_without_ceremony() {
   let node = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(30_000)),
@@ -325,7 +325,7 @@ async fn secure_join_wrong_credential_fails_without_merge() {
   joiner.handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- T-G03-02 packet data plane evidence (SC-G03-P0-06) ----
+// ---- packet data plane evidence ----
 
 use std::sync::Mutex as StdMutex;
 
@@ -613,8 +613,7 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
   joiner_handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- T-G03-04 feature selection / credential-free reconnect evidence (E2E-01)
-// ----
+// ---- credential-free reconnect evidence ----
 
 use radiata::ConnectMember;
 
@@ -704,8 +703,8 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
   let merge = merge_ok(&joiner.handle, listener.endpoint(), &secret).await;
   let _admitted = merge.node().clone();
 
-  // E2E-01: the merged member streams packets; credential rotation does
-  // not disconnect it.
+  // The merged member streams packets; credential rotation does not
+  // disconnect it.
   let receiver_view = receiver.handle.query(GetLocalNode::new()).await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
   packet_round_trip(&joiner.handle, &receiver_id, &receiver_collector).await;
@@ -747,7 +746,7 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- T-G03-05 bidirectional packet streams evidence (SC-G03-P0-15..17) ----
+// ---- bidirectional packet streams evidence ----
 
 use tokio::sync::Notify;
 
@@ -903,9 +902,8 @@ async fn round_trip_to(
   trace
 }
 
-/// SC-G03-P0-15: both peers stream concurrent packets over one session;
-/// each incoming stream preserves its endpoints, trace id, metadata, and
-/// byte order.
+/// Both peers stream concurrent packets over one session; each incoming
+/// stream preserves its endpoints, trace id, metadata, and byte order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_packets_flow_concurrently_in_both_directions() {
   let receiver_collector = Arc::new(Collector::default());
@@ -976,8 +974,8 @@ async fn secure_join_packets_flow_concurrently_in_both_directions() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G03-P0-16: a caller derives a return packet by swapping endpoints
-/// and reusing the incoming trace id; core assigns no return meaning.
+/// A caller derives a return packet by swapping endpoints and reusing the
+/// incoming trace id; core assigns no return meaning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_derived_return_stream_reuses_trace_id() {
   let reply_consumer = Arc::new(ReplyConsumer::default());
@@ -1039,8 +1037,8 @@ async fn secure_join_derived_return_stream_reuses_trace_id() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G03-P0-17: bounded incoming-stream admission returns typed
-/// backpressure at the configured capacity, and release frees every slot.
+/// Bounded incoming-stream admission returns typed backpressure at the
+/// configured capacity, and release frees every slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers() {
   let config = radiata::NodeConfig::new()
@@ -1146,11 +1144,11 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- T-G03-06 hostile / merge-input closure evidence (SC-G03-P0-22) ----
+// ---- hostile / merge-input closure evidence ----
 
-/// SC-G03-P0-22: a source exhausting its fixed merge rate window is
-/// refused before any handshake or signing work; the refusal consumes no
-/// credential and performs no signature.
+/// A source exhausting its fixed merge rate window is refused before any
+/// handshake or signing work; the refusal consumes no credential and
+/// performs no signature.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_merge_rate_window_refuses_before_signing() {
   let receiver_keys = Arc::new(ScriptedKeys::full_at(130_000));
@@ -1217,14 +1215,14 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- Real-world business scenarios (post-G3 review, 2026-08) ----
+// ---- Real-world business scenarios ----
 //
-// Three end-to-end lanes that the secure-join suite did not previously
-// exercise as a whole process: single-use credential enforcement against a
-// copied credential, explicit interruption of an in-flight outbound stream
-// when the peer shuts down, and fail-closed merge after the listener stops.
+// Three end-to-end lanes run against real nodes: single-use credential
+// enforcement against a copied credential, explicit interruption of an
+// in-flight outbound stream when the peer shuts down, and fail-closed
+// merge after the listener stops.
 
-/// THR-001 real-world lane: a merge credential is single-use. Even when the
+/// Real-world lane: a merge credential is single-use. Even when the
 /// credential bytes are copied (as they would be after a leak), the second
 /// merge attempt on the same generation is refused without a merge and
 /// without consuming another generation.
@@ -1277,7 +1275,7 @@ async fn secure_join_copied_credential_cannot_merge_twice() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// ADR-0007 / SC-G03-P0-06 real-world lane: when the receiving peer shuts
+/// Real-world lane: when the receiving peer shuts
 /// down, an in-flight outbound stream ends with an explicit typed
 /// `StreamInterrupted` on the sender's route — core never reports the
 /// stream as delivered after the peer closes, and never hangs the sender.
@@ -1493,9 +1491,9 @@ async fn secure_join_merge_after_listener_stop_fails_closed() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- T-G04-03 crossed-dial evidence (SC-G04-P0-09..11, E2E-03) ----
+// ---- crossed-dial evidence ----
 
-/// E2E-03 / SC-G04-P0-09: simultaneous dials converge to one authenticated
+/// Simultaneous dials converge to one authenticated
 /// session. The receiver accepts the joiner (incoming) and then dials the
 /// joiner back (outgoing); the deterministic ownership rule keeps exactly
 /// one connection and the drained one tears down without breaking the
@@ -1573,8 +1571,8 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// SC-G04-P0-15: shutdown rejects new work and releases session resources
-/// independently of wall-clock progress.
+/// Shutdown rejects new work and releases session resources independently
+/// of wall-clock progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_shutdown_rejects_new_work_after_drain() {
   let receiver = start(
@@ -1613,7 +1611,7 @@ async fn secure_join_shutdown_rejects_new_work_after_drain() {
   joiner.handle.command(Shutdown::new()).await.unwrap();
 }
 
-// ---- G5 public membership and topology views (SC-G05-P0-23..26 core) ----
+// ---- public membership and topology views ----
 
 use radiata::{GetMember, PageMembers};
 
@@ -1688,8 +1686,8 @@ async fn secure_join_public_membership_and_topology_views() {
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 
-/// G5-06 core: a sixteen-node cluster merges with the issuer and the public
-/// topology view exposes the authenticated edges (SC-G05-P0-24).
+/// A sixteen-node cluster merges with the issuer and the public topology
+/// view exposes the authenticated edges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_sixteen_node_membership_merges_and_views() {
   let issuer = start(
