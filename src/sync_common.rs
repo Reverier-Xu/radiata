@@ -38,6 +38,18 @@ pub(crate) async fn drain_body(
   Ok(bytes)
 }
 
+/// Splits one encoded payload into pump-legal chunks: each chunk stays
+/// within the packet chunk bound, so the pump forwards a payload between
+/// the 32 KiB chunk bound and the 64 KiB control-page bound instead of
+/// terminating the stream as oversize (the size-ladder note in
+/// `crate::paging`). The receiver's [`drain_body`] reassembles the chunk
+/// stream into one body.
+pub(crate) fn chunk_payload(encoded: &[u8]) -> impl Iterator<Item = Arc<[u8]>> + '_ {
+  encoded
+    .chunks(crate::packet::MAX_CHUNK_BYTES)
+    .map(Arc::from)
+}
+
 /// The alive-peer set of one node, in stable order.
 pub(crate) fn alive_peers(sessions: &SessionTable) -> Result<Vec<NodeId>> {
   let guard = sessions.lock().map_err(Error::session_table)?;
@@ -66,12 +78,18 @@ pub(crate) fn peers_fingerprint(peers: &[NodeId]) -> u64 {
 /// (the next tick retries) and never stall the anti-entropy loop.
 /// Sends one sync payload to one peer over the packet data plane as an
 /// exact-target, max-hops-1 internal stream; fire-and-forget delivery.
+/// The payload streams as bounded chunks ([`chunk_payload`]), so an
+/// encoded page above the single-chunk bound still delivers.
 pub(crate) async fn send_payload(
   runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, peer: &NodeId, protocol: &ProtocolTag,
   encoded: &[u8],
 ) -> Result<()> {
   let trace_id = TraceId::generate(entropy.as_ref())?;
-  let body = Box::pin(crate::packet::StaticBody::new(Arc::from(encoded.to_vec())));
+  // The chunk vec owns its bytes, so the body stream is 'static and the
+  // fire-and-forget request never borrows this call's slice.
+  let chunks: Vec<Arc<[u8]>> = chunk_payload(encoded).collect();
+  let body: crate::packet::BodyStream =
+    Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)));
   let (ack_notify, _ack) = tokio::sync::oneshot::channel();
   let request = crate::packet::OutboundRequest {
     trace_id,
@@ -87,4 +105,38 @@ pub(crate) async fn send_payload(
   // Fire-and-forget: the admission ack (or its absence) is retried by the
   // next tick; a full routing queue drops the payload without blocking.
   runtime.try_send_packet(request)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::chunk_payload;
+  use crate::packet::MAX_CHUNK_BYTES;
+
+  /// A payload above the 32 KiB chunk bound splits into pump-legal
+  /// chunks whose concatenation is exactly the payload: a fat page
+  /// delivers instead of terminating the pump as oversize.
+  #[test]
+  fn oversized_payloads_split_into_pump_legal_chunks() {
+    let payload: Vec<u8> = (0..(MAX_CHUNK_BYTES * 2 + 123))
+      .map(|index| (index % 251) as u8)
+      .collect();
+    let chunks: Vec<std::sync::Arc<[u8]>> = chunk_payload(&payload).collect();
+    assert_eq!(chunks.len(), 3);
+    assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_CHUNK_BYTES));
+    let joined: Vec<u8> = chunks
+      .iter()
+      .flat_map(|chunk| chunk.iter().copied())
+      .collect();
+    assert_eq!(joined, payload);
+  }
+
+  /// A payload exactly at the chunk bound stays one chunk, and the split
+  /// never produces an empty trailing chunk.
+  #[test]
+  fn payload_at_the_chunk_bound_stays_one_chunk() {
+    let payload = vec![7_u8; MAX_CHUNK_BYTES];
+    let chunks: Vec<std::sync::Arc<[u8]>> = chunk_payload(&payload).collect();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].len(), MAX_CHUNK_BYTES);
+  }
 }

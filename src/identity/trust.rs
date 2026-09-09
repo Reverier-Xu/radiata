@@ -113,7 +113,9 @@ impl TrustSnapshotV1 {
     &self.bindings
   }
 
-  /// Encodes the full wire record.
+  /// Encodes the full wire record (one 64 KiB control-bound record: at
+  /// roughly 870 bindings that bound saturates, so larger memberships
+  /// heal through the bounded snapshot resend cadence, never paging).
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical(&self.wire(), crate::protocol::CONTROL_CBOR_LIMITS)
   }

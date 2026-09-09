@@ -82,10 +82,54 @@ pub(crate) mod sync {
   /// Emits one bounded page of resource records starting after `cursor`.
   /// The cursor is the last emitted name's text, so paging continues
   /// across ticks without allocating the whole catalog.
+  ///
+  /// A page of fat records can overflow the 64 KiB control-body bound,
+  /// which failed the whole sync tick every tick and stalled the cursor
+  /// forever. The bounded halving ladder below retries at half the page
+  /// capacity until the full wire payload (page envelope plus sync
+  /// wrapper) fits: one record is bounded far below the control bound,
+  /// so the ladder always terminates, and a halved page still carries
+  /// its continuation cursor (the size-ladder note in
+  /// `crate::paging::encode_page`).
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<ResourcePage> {
-    let limit = limit.clamp(1, MAX_PAGE_RECORDS);
+    let mut limit = limit.clamp(1, MAX_PAGE_RECORDS);
+    loop {
+      let page = emit_at_capacity(store, cursor, limit).await?;
+      if wire_payload_fits(&page)? {
+        return Ok(page);
+      }
+      if limit == 1 {
+        // One record is bounded far below the control bound, so the
+        // ladder terminates here with a deliverable page; reaching this
+        // arm means a bound regressed elsewhere — fail loudly instead of
+        // looping.
+        return Err(Error::resource_exhausted("resource page"));
+      }
+      limit /= 2;
+    }
+  }
+
+  /// True when the page's full wire payload (page envelope plus sync
+  /// wrapper) encodes inside the control-body bound.
+  fn wire_payload_fits(page: &ResourcePage) -> Result<bool> {
+    // A page envelope that fails to encode is simply "does not fit" —
+    // the ladder's whole reason to halve.
+    let Ok(encoded) = page.encode() else {
+      return Ok(false);
+    };
+    Ok(
+      super::super::sync::ResourceSyncPayload(minicbor::bytes::ByteVec::from(encoded))
+        .encode()
+        .is_ok(),
+    )
+  }
+
+  /// Emits one page at an exact candidate capacity (one ladder step).
+  async fn emit_at_capacity(
+    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
+  ) -> Result<ResourcePage> {
     let namespace = super::super::store::namespace()?;
     let snapshot = store.snapshot().await?;
     let mut scan = snapshot.scan(&namespace, &[]).await?;

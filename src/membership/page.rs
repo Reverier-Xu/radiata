@@ -122,15 +122,59 @@ impl MembershipPage {
 /// and applies received pages under strict validation.
 pub(crate) mod sync {
   use super::{MAX_PAGE_DESCRIPTORS, MembershipPage};
-  use crate::{NodeId, Result, api::Entropy, storage::MetadataStore};
+  use crate::{Error, NodeId, Result, api::Entropy, storage::MetadataStore};
 
   /// Emits one bounded page over the running node's metadata store. The
   /// cursor is the last emitted node's text, so pages continue without
   /// allocating the whole population.
+  ///
+  /// A page of fat descriptors can overflow the 64 KiB control-body
+  /// bound, which failed the whole sync tick every tick and stalled the
+  /// cursor forever. The bounded halving ladder below retries at half
+  /// the page capacity until the full wire payload (page envelope plus
+  /// sync wrapper) fits: one descriptor is bounded far below the control
+  /// bound, so the ladder always terminates, and a halved page still
+  /// carries its continuation cursor (the size-ladder note in
+  /// `crate::paging::encode_page`).
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<MembershipPage> {
-    let limit = limit.clamp(1, MAX_PAGE_DESCRIPTORS);
+    let mut limit = limit.clamp(1, MAX_PAGE_DESCRIPTORS);
+    loop {
+      let page = emit_at_capacity(store, cursor, limit).await?;
+      if wire_payload_fits(&page)? {
+        return Ok(page);
+      }
+      if limit == 1 {
+        // One descriptor is bounded far below the control bound, so the
+        // ladder terminates here with a deliverable page; reaching this
+        // arm means a bound regressed elsewhere — fail loudly instead of
+        // looping.
+        return Err(Error::resource_exhausted("membership page"));
+      }
+      limit /= 2;
+    }
+  }
+
+  /// True when the page's full wire payload (page envelope plus sync
+  /// wrapper) encodes inside the control-body bound.
+  fn wire_payload_fits(page: &MembershipPage) -> Result<bool> {
+    // A page envelope that fails to encode is simply "does not fit" —
+    // the ladder's whole reason to halve.
+    let Ok(encoded) = page.encode() else {
+      return Ok(false);
+    };
+    Ok(
+      super::super::sync::SyncPayload::Page(minicbor::bytes::ByteVec::from(encoded))
+        .encode()
+        .is_ok(),
+    )
+  }
+
+  /// Emits one page at an exact candidate capacity (one ladder step).
+  async fn emit_at_capacity(
+    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
+  ) -> Result<MembershipPage> {
     let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
       super::super::NODE_DESCRIPTOR_NAMESPACE,
     )?);
@@ -363,6 +407,65 @@ mod tests {
     let page = sync::emit_page(&factory, page.cursor(), 2).await.unwrap();
     assert_eq!(page.descriptors().len(), 1);
     assert!(page.cursor().is_none());
+  }
+
+  /// A page of fat descriptors (label sets at their maximum) splits
+  /// through the bounded halving ladder instead of overflowing the 64 KiB
+  /// control-body bound: every emitted page's full wire payload (page
+  /// envelope plus sync wrapper) encodes, paging continues past halved
+  /// pages, and every descriptor is delivered. Under the pre-ladder code
+  /// this page overflowed the bound and failed the sync tick forever.
+  #[tokio::test]
+  async fn fat_descriptor_pages_halve_instead_of_overflowing() {
+    fn fat_labels() -> crate::LabelSet {
+      let mut labels = crate::LabelSet::new();
+      for index in 0..crate::label::LABEL_SET_MAX_ENTRIES {
+        labels = labels
+          .insert(
+            crate::LabelKey::parse(&format!("example.org/labels/fat-{index:02}")).unwrap(),
+            crate::LabelValue::parse(&"v".repeat(crate::label::LABEL_VALUE_MAX_BYTES)).unwrap(),
+          )
+          .unwrap();
+      }
+      labels
+    }
+    let factory = factory();
+    for seed in 1..=6_u8 {
+      let fat = descriptor(seed, 1, "fat").with_labels(fat_labels());
+      crate::membership::store::store_descriptor(&factory, &fat)
+        .await
+        .unwrap();
+    }
+
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut delivered: Vec<NodeId> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+      let page = sync::emit_page(&factory, cursor.as_deref(), super::DEFAULT_PAGE_LIMIT)
+        .await
+        .unwrap();
+      // The full wire payload (page envelope plus sync wrapper) fits the
+      // control-body bound: the ladder halved the capacity to get here.
+      let wrapped = crate::membership::sync::SyncPayload::Page(minicbor::bytes::ByteVec::from(
+        page.encode().unwrap(),
+      ));
+      assert!(wrapped.encode().is_ok());
+      pages += 1;
+      assert!(
+        page.descriptors().len() < 6,
+        "an over-bound page never reaches the wire whole"
+      );
+      delivered.extend(page.descriptors().iter().map(|entry| entry.node().clone()));
+      let done = page.cursor().is_none();
+      cursor = page.cursor().map(|value| value.to_vec());
+      if done {
+        break;
+      }
+    }
+    assert!(pages >= 3, "six fat descriptors split over several pages");
+    delivered.sort();
+    delivered.dedup();
+    assert_eq!(delivered.len(), 6);
   }
 
   /// Repeated pages repair missing revisions and stale peers converge to
