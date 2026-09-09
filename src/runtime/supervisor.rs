@@ -1345,28 +1345,10 @@ impl Supervisor {
         .removal_rank()
         .checked_add(1)
         .ok_or_else(|| Error::conflict("resource removal rank"))?;
-      let body = crate::resource::ResourceRecordV1::encode_signed_body(
-        &name,
-        stored.resource_type(),
-        stored.resource_uri(),
-        stored.labels(),
-        timestamp_millis,
-        &writer,
-        removal_rank,
-        true,
-      )?;
-      let signature = self
-        .dependencies
-        .keys
-        .sign(
-          context.identity().handle(),
-          &crate::identity::signature::signature_message(
-            crate::resource::RESOURCE_RECORD_V1_DOMAIN,
-            &body,
-          ),
-        )
-        .await?;
-      let removal = crate::resource::ResourceRecordV1::seal(
+      // The removal signs through the same single sign-and-seal path as a
+      // put (`removed = true`): one canonical encode, one digest, and no
+      // second body construction inside `seal`.
+      let removal = crate::resource::ResourceRecordV1::sign_with_provider(
         name.clone(),
         stored.resource_type().clone(),
         stored.resource_uri().clone(),
@@ -1375,8 +1357,10 @@ impl Supervisor {
         writer.clone(),
         removal_rank,
         true,
-        signature,
-      )?;
+        &self.dependencies.keys,
+        context.identity().handle(),
+      )
+      .await?;
       if !removal.wins_over(&stored) {
         // A rolled-back host clock cannot pose as a newer winner: the
         // removal is refused and the live record stays.
