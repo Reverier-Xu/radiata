@@ -1,7 +1,7 @@
 # radiata 全量代码审计报告
 
 > 审计基线：main @ `faf7833`（2026-09-09）。
-> **修复记录**：全部 P1×3、P2×21（除 P2-12 待决策）、P3×13 已在分支 `fix-audit-fixes`（worktree `../radiata-audit-fixes`）逐项修复落盘，每项独立 commit、全部门禁绿（taplo/fmt/clippy -D warnings/全量测试 550→607/0、cargo-hack each-feature 矩阵、fuzzing 构建零警告）。详见 §9 修复台账。P2-12（持久化格式统一）与 canonical_record! 宏、OpenWireV1 双形态两个后续项待 owner 决策。
+> **修复记录**：全部 P1×3、P2×22（含 owner 决策后的 P2-12）、P3×14 已在分支 `fix-audit-fixes`（worktree `../radiata-audit-fixes`）逐项修复落盘，每项独立 commit、全部门禁绿（taplo/fmt/clippy -D warnings/全量测试 550→608/0、受影响 verify 脚本全 PASS、cargo-hack each-feature 矩阵、fuzzing 构建零警告）。详见 §9 修复台账。P2-12、OpenWireV1、canonical_record! 宏均已 owner 决策并落地（见 §9 台账与 §4 勘误）；性能与规模项与 store_scan_stream 公开面保留待后续。
 > 方法：4 个并行 reviewer 分区深读全部生产代码（L1 协议+L2 传输 / L5 身份+成员 / L3 会话+L4 路由+L7 运行时 / L6 存储+资源+跨模块扫描），统一 7+4 维度评分表；全部 P0/P1 与关键 P2 已由主审逐条对照源码复核（子代理行号可能有 ±10 行漂移，但事实均成立）。
 > 质量门禁基线：taplo ✓ / nightly fmt ✓ / check ✓ / clippy `-D warnings` ✓ / **cargo test 550 通过 0 失败**。
 > 架构与模块职责见 [architecture.md](architecture.md)。
@@ -125,7 +125,9 @@
 
 **算法/边界**：`LimitedWriter::new` 每次 encode 预零化整个 64 KiB 预算（chunk 高频路径成本翻倍）；`revision+1` 非饱和 vs `saturating_add` 同语义两写（membership.rs:199）；首装特例允许 revision 0 落库（违反自述 revision≥1）；`RecoveryStep::backoff_seconds` 返回自增前值、语义误导；WriterLock root 伪身份在 `tokio::join!` 场景绕过互斥（生产单提交槽兜底，注释需排除该场景）；分页每页全 namespace 重扫 O(N²/L)（StoreScan 无 seek 接口的固有成本，规模上万再议）；终态 trace 记录无界 spawn（并发有界、排队无界）；accept 错误无退避热循环风险。
 
-**死代码**：`store_scan_stream` 公开导出但 crate 内零生产调用（仅外部测试驱动）；`signature_message_from_digest` 零调用；`MergeCredentialIssuer::issue` 的活跃代冲突分支永不触发；id.rs 的 const fn shim 与宏内 allow 已过时；`OpenWireV1` 双形态解码为不存在的旧 peer 保留兼容（pre-1.0 应明确决策）。
+**死代码**：`store_scan_stream` 公开导出但 crate 内零生产调用（仅外部测试驱动）；`signature_message_from_digest` 零调用；`MergeCredentialIssuer::issue` 的活跃代冲突分支永不触发；id.rs 的 const fn shim 与宏内 allow 已过时；`OpenWireV1` 双形态——见下方勘误。
+
+> **勘误（批 7 修复时发现）**：原认定"crate 从不发出 legacy 5 元素形态"不成立——minicbor derive 的 array 编码跳过 nil 字段并收缩数组长度，direct open 帧（`route: None`）的 canonical 编码**就是 5 元素体**，6 字段解码器本就通过 Option 缺省接受它（改动前兼容测试已逐字节钉住该形态）。实际缺陷仅为：(1) `OpenWireV1` 回退分支是永不为解码成功贡献的死代码；(2) routed 解码失败时误报 "packet open decode" 上下文。修复 = 删除死分支、单一 `decode_canonical_strict` 路径、统一错误上下文；线上格式零变化（direct=5 元素、routed=6 元素），冻结向量 `open-direct-v1` 保持 byte-stable。
 
 ## 5. 分层评价（自底向上）
 
@@ -315,5 +317,10 @@
 | P2-14 session⇄routing 循环 | `1386718` | PendingAck/PendingAcks 迁入 routing；receive_open_envelope 纯函数 |
 | P3×12（帧校验/墓碑收敛/分发收敛/尾样板/revision 边界/SPKI/accept 退避/next-hop 单源/LeaveCluster 提取/改名/注释漂移/死助手） | `ac041a6`…`b94b0b5` | 逐项见 git log，全部行为等价或收紧 |
 | feature 矩阵门控 | `3ecf0f6` | 迁移测试 helper 补 any(json+unix,redb) 门，each-feature 矩阵零警告 |
+| P2-12 绑定单一表示（owner 决策：淘汰族） | `1134df0`+`681c34e`+`bf8a0e8` | 删 TRUST_BINDING 族：读侧流式解码 IDENTITY_BINDING、写侧只走 adopt、目录/清退联动；单例节点可见自身绑定（有意新语义）；撤销防护统一变强；顺带修 verify-storage-contract 的 relay→radiata 陈旧正则 |
+| OpenWireV1 死分支（见 §4 勘误） | `00d227c` | 删回退分支与误导上下文，单路径 decode_canonical_strict，冻结向量 byte-stable，3 条陈旧语料刷新 |
+| canonical_record! 宏（12/13） | `6aa28ea`+`3b5dfea` | 宏 + records.rs 7 类型 + cleanup/leave/revocation 5 类型收敛，净 −277 行，trust 快照豁免有文档背书 |
 
-**未修（待决策）**：P2-12（TRUST_BINDING 持久化 raw 字节 → IdentityBindingV1，需迁移链路设计）；canonical_record! 宏（13 组 Wire/encode/decode triple 收敛，golden 向量保重构安全）；OpenWireV1 双形态（pre-1.0 兼容窗口决策）；store_scan_stream 公开面（保留供扩展作者或降级）；LimitedWriter 预零化 / 分页 O(N²) 重扫 / 终态 trace 无界 spawn（性能与规模项）。
+**未修（有意保留）**：store_scan_stream 公开面（保留供扩展作者，有外部驱动测试）；LimitedWriter 预零化 / 分页 O(N²) 重扫 / 终态 trace 无界 spawn（性能与规模项，规模触达前不动）；trust.rs `TrustSnapshotV1` 脚手架保持手写（canonical_record! 豁免，canonical.rs 模块文档已记录）。
+
+**已决策落地**：P2-12（owner 决策：淘汰 TRUST_BINDING 族——IDENTITY_BINDING 成为绑定唯一表示，读侧流式解码、写侧只走 adopt、撤销防护统一变强、单例节点可见自身绑定为有意新语义）；OpenWireV1（owner 决策：删死分支保线上格式，见 §4 勘误）；canonical_record! 宏（12/13 组收敛，净 −277 行，金样本逐字节不变）。
