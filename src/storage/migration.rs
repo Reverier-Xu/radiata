@@ -410,6 +410,9 @@ mod tests {
   use std::sync::Arc;
 
   use super::*;
+  #[cfg(not(any(all(feature = "json", unix), feature = "redb")))]
+  use crate::storage::test_util as util;
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   use crate::{
     StoreRequirements, StoreRevision, provider::StorageFactory, storage::test_util as util,
   };
@@ -496,6 +499,7 @@ mod tests {
     )
   }
 
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   async fn seed_legacy(storage: &dyn Storage) -> StoreRevision {
     let snapshot = storage.snapshot().await.unwrap();
     let legacy = util::namespace("migration-legacy");
@@ -516,6 +520,7 @@ mod tests {
     }
   }
 
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   async fn read_schema(storage: &dyn Storage) -> Option<String> {
     let snapshot = storage.snapshot().await.unwrap();
     let namespace = schema_namespace().unwrap();
@@ -618,6 +623,7 @@ mod tests {
   /// The pending recovery path opens through the same gate: a store whose
   /// schema record names a version outside the production chain fails
   /// closed there too, before any pending record is discovered.
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   async fn pending_recovery_rejects_a_schema_version_outside_the_chain(
     factory: Arc<dyn StorageFactory>,
   ) {
@@ -755,6 +761,7 @@ mod tests {
     assert_eq!(registry_one_edge().target(), V2);
   }
 
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   async fn edges_apply_atomically_and_replay_idempotently(factory: Arc<dyn StorageFactory>) {
     let storage: Arc<dyn Storage> =
       Arc::from(factory.open(StoreRequirements::metadata()).await.unwrap());
@@ -800,6 +807,7 @@ mod tests {
     );
   }
 
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   async fn older_reader_and_digest_mismatch_fail_closed(factory: Arc<dyn StorageFactory>) {
     let storage: Arc<dyn Storage> =
       Arc::from(factory.open(StoreRequirements::metadata()).await.unwrap());
