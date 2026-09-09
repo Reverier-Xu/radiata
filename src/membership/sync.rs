@@ -697,30 +697,39 @@ pub(crate) async fn sync_tick(
   }
   if page_due || !starting_round {
     cursor.ticks_since_page_send = 0;
-    for peer in &peers {
-      if let Some(bytes) = &snapshot_bytes {
-        let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
-      }
-      for bytes in &leave_bytes {
-        let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
-      }
-      let _ =
-        crate::sync_common::send_payload(runtime, entropy, peer, &protocol, &page_bytes).await;
+    let mut payloads: Vec<&[u8]> = Vec::with_capacity(leave_bytes.len() + 2);
+    if let Some(bytes) = &snapshot_bytes {
+      payloads.push(bytes);
     }
+    payloads.extend(leave_bytes.iter().map(Vec::as_slice));
+    payloads.push(&page_bytes);
+    dispatch_to_peers(&peers, &payloads, runtime, entropy, &protocol).await;
     gc_collected_tombstones(store, entropy).await;
     return Ok(());
   }
   cursor.ticks_since_page_send = cursor.ticks_since_page_send.saturating_add(1);
+  let mut payloads: Vec<&[u8]> = Vec::with_capacity(leave_bytes.len() + 1);
   if let Some(bytes) = &snapshot_bytes {
-    for peer in &peers {
-      let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
-      for bytes in &leave_bytes {
-        let _ = crate::sync_common::send_payload(runtime, entropy, peer, &protocol, bytes).await;
-      }
-    }
+    payloads.push(bytes);
+    payloads.extend(leave_bytes.iter().map(Vec::as_slice));
   }
+  dispatch_to_peers(&peers, &payloads, runtime, entropy, &protocol).await;
   gc_collected_tombstones(store, entropy).await;
   Ok(())
+}
+
+/// The per-tick peer fan-out shared by both sync regimes: sends every
+/// payload to every alive peer in order, swallowing individual delivery
+/// failures (the snapshot and page resend cadences heal lost payloads).
+async fn dispatch_to_peers(
+  peers: &[NodeId], payloads: &[&[u8]], runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>,
+  protocol: &ProtocolTag,
+) {
+  for peer in peers {
+    for payload in payloads {
+      let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await;
+    }
+  }
 }
 
 /// The post-round checkpoint GC: collect the
