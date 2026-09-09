@@ -478,17 +478,24 @@ async fn commit_batch(
 #[cfg(test)]
 mod tests {
   use std::{
-    sync::Arc,
+    sync::{
+      Arc,
+      atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, UNIX_EPOCH},
   };
 
   use super::{
-    TRACE_NAMESPACE, TracePhase, TraceRecord, decode_trace_record, put_trace, sweep,
-    terminate_stale,
+    MAX_QUEUED_TRACE_PERSISTENCE, TRACE_NAMESPACE, TracePhase, TraceRecord, TraceSink,
+    decode_trace_record, put_trace, sweep, terminate_stale,
   };
   use crate::{
     ErrorKind, NodeId, TraceId,
     api::SystemEntropy,
+    identity::{
+      lifecycle,
+      testing::{ScriptedKeys, SequenceEntropy},
+    },
     provider::StorageFactory,
     storage::{MetadataStore, contract::helpers::ManualClock, receipt::WallClock},
   };
@@ -863,15 +870,181 @@ mod tests {
     assert_eq!(removed, 1);
     assert!(all_records(&store).await.is_empty());
   }
+
+  // ---- Bounded terminal-record queue: overflow drops and its counter ----
+
+  /// Opens a sink over a real identity context and store, sharing the
+  /// live-record counter with the caller.
+  async fn open_sink() -> (
+    TraceSink,
+    Arc<lifecycle::LocalIdentityContext>,
+    Arc<AtomicUsize>,
+  ) {
+    let factory: Arc<dyn StorageFactory> =
+      Arc::new(crate::storage::contract::ReferenceFactory::new(
+        crate::storage::contract::required_capabilities(),
+      ));
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        &keys.as_provider(),
+        entropy.as_ref(),
+        Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    let live_records = Arc::new(AtomicUsize::new(0));
+    let sink = TraceSink::new(
+      Arc::clone(&context),
+      entropy,
+      Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000))),
+      Arc::clone(&live_records),
+    );
+    (sink, context, live_records)
+  }
+
+  fn terminal_record(seed: u32, sink: &TraceSink) -> TraceRecord {
+    TraceRecord::new(trace(seed), node(1), node(9), sink.clock_now())
+      .with_transition(super::TraceTransition::Delivered, sink.clock_now())
+  }
+
+  /// The terminal-persistence queue admits at most the bound: overflow
+  /// records drop and are counted instead of queueing without limit,
+  /// every admitted record still persists, and the drop aggregate reads
+  /// back through the observability snapshot's well-known tag.
+  #[tokio::test]
+  async fn queue_bound_drops_overflow_records_and_counts_them() {
+    let (sink, context, live_records) = open_sink().await;
+
+    // Feed past the bound synchronously: on this single-threaded test
+    // runtime the spawned persistence tasks cannot run until the test
+    // awaits, so exactly the bound admits and every further feed drops.
+    const FED: usize = 200;
+    for seed in 0..u32::try_from(FED).unwrap() {
+      sink.record_terminal(terminal_record(seed, &sink));
+    }
+    assert_eq!(sink.queued(), MAX_QUEUED_TRACE_PERSISTENCE);
+    assert_eq!(sink.dropped(), FED - MAX_QUEUED_TRACE_PERSISTENCE);
+
+    // Every admitted record persists; the drops stay drops. Drain on a
+    // wall-clock deadline: persistence tasks contend on the store's
+    // single-commit state machine, so spins alone cannot bound the wait.
+    let drained_at = std::time::Instant::now() + Duration::from_secs(30);
+    while sink.queued() != 0 {
+      assert!(
+        std::time::Instant::now() < drained_at,
+        "the admitted queue never drained"
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sink.queued(), 0);
+    let persisted = all_records(context.store()).await.len();
+    assert_eq!(persisted, MAX_QUEUED_TRACE_PERSISTENCE);
+    assert_eq!(live_records.load(Ordering::Relaxed), persisted);
+    // Conservation: dropped plus persisted equals everything fed.
+    assert_eq!(sink.dropped(), FED - persisted);
+
+    // The observability snapshot carries the drop counter under its
+    // well-known tag.
+    let snapshot = crate::ObservabilitySnapshot::new(
+      sink.clock_now(),
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      persisted,
+      sink.dropped(),
+      0,
+      true,
+    )
+    .unwrap();
+    let dropped_tag =
+      crate::QualifiedTag::parse(crate::ObservabilitySnapshot::TRACE_RECORDS_DROPPED).unwrap();
+    assert_eq!(
+      snapshot.counter(&dropped_tag),
+      Some(u64::try_from(sink.dropped()).unwrap())
+    );
+  }
+
+  /// Under a concurrent terminal-record burst the queue depth stays
+  /// within the bound at every observed instant, everything drains, and
+  /// the drop aggregate conserves the fed population against the
+  /// persisted one.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn concurrent_terminal_burst_stays_within_the_queue_bound() {
+    let (sink, context, live_records) = open_sink().await;
+
+    // Feeder tasks: every fed record either queues (within the bound) or
+    // drops; record_terminal never blocks the data-plane caller.
+    const FEEDERS: u32 = 3;
+    const PER_FEEDER: u32 = 40;
+    let mut feeders = tokio::task::JoinSet::new();
+    for feeder in 0..FEEDERS {
+      let sink = sink.clone();
+      feeders.spawn(async move {
+        for seed in 0..PER_FEEDER {
+          sink.record_terminal(terminal_record(seed + feeder * PER_FEEDER, &sink));
+        }
+      });
+    }
+
+    // A concurrent sampler observes the queue depth live; the bound must
+    // hold at every instant it can see.
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler_sink = sink.clone();
+    let sampler_stop = Arc::clone(&stop);
+    let sampler = tokio::spawn(async move {
+      let mut deepest = 0_usize;
+      let mut samples = 0_u64;
+      while !sampler_stop.load(Ordering::Relaxed) {
+        deepest = deepest.max(sampler_sink.queued());
+        samples += 1;
+        tokio::task::yield_now().await;
+      }
+      (deepest, samples)
+    });
+
+    while feeders.join_next().await.is_some() {}
+    let drained_at = std::time::Instant::now() + Duration::from_secs(30);
+    while sink.queued() != 0 {
+      assert!(
+        std::time::Instant::now() < drained_at,
+        "the admitted queue never drained"
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sink.queued(), 0);
+    stop.store(true, Ordering::Relaxed);
+    let (deepest, samples) = sampler.await.unwrap();
+    assert!(samples > 0, "the sampler never observed the queue");
+    assert!(deepest <= MAX_QUEUED_TRACE_PERSISTENCE);
+
+    // Conservation under contention: every fed record is exactly one of
+    // dropped or persisted (an admitted write can still lose the store's
+    // optimistic-concurrency race, so the persisted side may sit lower).
+    let fed = usize::try_from(FEEDERS * PER_FEEDER).unwrap();
+    let persisted = live_records.load(Ordering::Relaxed);
+    assert!(sink.dropped() + persisted <= fed);
+    // Distinct trace ids make the durable population equal the
+    // successful-persistence counter.
+    assert_eq!(all_records(context.store()).await.len(), persisted);
+  }
 }
 
 /// The persistence handle shared with the packet pump: clones cheaply and
 /// records terminal transitions best-effort — a persistence failure is
 /// surfaced as a diagnostic and never corrupts the data plane's explicit
-/// semantics. Concurrent persistence tasks are bounded so a burst of
-/// completions cannot spawn unbounded work, and the shared live-record
-/// counter lets the retention sweep stay skipped while no durable record
-/// exists.
+/// semantics. Concurrent persistence tasks are bounded and the admitted
+/// queue is bounded too, so a burst of completions cannot spawn unbounded
+/// work: once the queue bound is reached, further terminal records are
+/// dropped and counted in the observability snapshot instead of queueing
+/// without limit. The shared live-record counter lets the retention sweep
+/// stay skipped while no durable record exists.
 #[derive(Clone)]
 pub(crate) struct TraceSink {
   context: std::sync::Arc<crate::identity::lifecycle::LocalIdentityContext>,
@@ -879,6 +1052,13 @@ pub(crate) struct TraceSink {
   clock: std::sync::Arc<dyn WallClock>,
   /// Bounds concurrently running persistence tasks.
   permits: std::sync::Arc<tokio::sync::Semaphore>,
+  /// Admitted-but-unfinished persistence tasks: incremented under the
+  /// queue-bound compare-and-swap before each spawn, decremented when the
+  /// spawned task finishes. The bound makes the queue depth structural.
+  pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  /// Terminal records dropped because the queue bound was full; surfaced
+  /// through the observability snapshot's drop counter.
+  dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// Approximate durable record population: incremented per successful
   /// persistence, decremented by the retention sweep's removals. Transition
   /// rewrites may over-approximate; that only costs extra cheap sweeps,
@@ -888,6 +1068,13 @@ pub(crate) struct TraceSink {
 
 /// The maximum number of concurrent terminal-record persistence tasks.
 const MAX_CONCURRENT_TRACE_PERSISTENCE: usize = 16;
+
+/// The maximum number of admitted-but-unfinished terminal-record
+/// persistence tasks: at most [`MAX_CONCURRENT_TRACE_PERSISTENCE`] run at
+/// once and the rest queue. The durable trace is a best-effort observation
+/// surface, so once this bound is reached the next terminal record is
+/// dropped and counted rather than queueing without limit.
+const MAX_QUEUED_TRACE_PERSISTENCE: usize = 64;
 
 impl TraceSink {
   pub(crate) fn new(
@@ -902,8 +1089,54 @@ impl TraceSink {
       permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
         MAX_CONCURRENT_TRACE_PERSISTENCE,
       )),
+      pending: std::sync::Arc::default(),
+      dropped: std::sync::Arc::default(),
       live_records,
     }
+  }
+
+  /// Admits one terminal-record persistence task when the queue bound has
+  /// room, spawning the bounded best-effort write; a full bound drops the
+  /// record, counts the drop, and returns immediately. The counter
+  /// compare-and-swap keeps the queue depth structurally at or below
+  /// [`MAX_QUEUED_TRACE_PERSISTENCE`] under any admission race.
+  pub(crate) fn record_terminal(&self, record: TraceRecord) {
+    let admitted = self.pending.fetch_update(
+      std::sync::atomic::Ordering::Relaxed,
+      std::sync::atomic::Ordering::Relaxed,
+      |pending| (pending < MAX_QUEUED_TRACE_PERSISTENCE).then_some(pending + 1),
+    );
+    if admitted.is_err() {
+      let dropped = self
+        .dropped
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+      tracing::debug!(
+        dropped,
+        "route trace record dropped: persistence queue full"
+      );
+      return;
+    }
+    let sink = self.clone();
+    tokio::spawn(async move {
+      sink.record(record).await;
+      sink
+        .pending
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    });
+  }
+
+  /// The terminal records dropped so far because the persistence queue
+  /// was full; the observability snapshot surfaces this aggregate.
+  pub(crate) fn dropped(&self) -> usize {
+    self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  /// The current admitted-but-unfinished persistence-task population.
+  /// Test-only: production reads the drop aggregate, not the queue depth.
+  #[cfg(test)]
+  pub(crate) fn queued(&self) -> usize {
+    self.pending.load(std::sync::atomic::Ordering::Relaxed)
   }
 
   /// Records one transition; failures are logged, never propagated into

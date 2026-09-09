@@ -232,6 +232,7 @@ impl Supervisor {
     let trace_records = self
       .trace_records
       .load(std::sync::atomic::Ordering::Relaxed);
+    let trace_records_dropped = self.trace_sink.dropped();
     let pending_transactions =
       crate::storage::pending::pending_transaction_count(context.store()).await?;
     let storage_available = !context.store().is_blocked()?;
@@ -252,6 +253,7 @@ impl Supervisor {
       queued_bytes,
       open_routes,
       trace_records,
+      trace_records_dropped,
       pending_transactions,
       storage_available,
     )

@@ -186,7 +186,8 @@ impl SessionPage {
 /// The bounded observability snapshot of one node: counters keyed by
 /// well-known tags covering sessions,
 /// listeners, background tasks, queue totals, open routes, retained trace
-/// metadata, pending transactions, and metadata-store availability,
+/// metadata plus its dropped-record counter, pending transactions, and
+/// metadata-store availability,
 /// captured at the local host wall clock. Counters and flags only; the
 /// snapshot carries no identity, address, path, selector, body, or
 /// credential material and never enumerates a whole population.
@@ -212,6 +213,9 @@ impl ObservabilitySnapshot {
   pub const OPEN_ROUTES: &str = "radiata.woooo.tech/status/open-routes";
   /// Well-known counter tag: retained trace metadata records.
   pub const TRACE_RECORDS: &str = "radiata.woooo.tech/status/trace-records";
+  /// Well-known counter tag: terminal trace records dropped because the
+  /// persistence queue was full (best-effort lane, never a data loss).
+  pub const TRACE_RECORDS_DROPPED: &str = "radiata.woooo.tech/status/trace-records-dropped";
   /// Well-known counter tag: pending metadata transactions.
   pub const PENDING_TRANSACTIONS: &str = "radiata.woooo.tech/status/pending-transactions";
   /// Well-known counter tag: metadata store availability (1 = available).
@@ -233,10 +237,11 @@ impl ObservabilitySnapshot {
   pub(crate) fn new(
     captured_at: std::time::SystemTime, sessions: usize, listeners: usize, background_tasks: usize,
     queued_session_messages: usize, queued_session_bytes: u64, open_routes: usize,
-    trace_records: usize, pending_transactions: usize, storage_available: bool,
+    trace_records: usize, trace_records_dropped: usize, pending_transactions: usize,
+    storage_available: bool,
   ) -> Result<Self> {
     let internal = || Error::internal("observability counter");
-    let counters: [(&str, u64); 9] = [
+    let counters: [(&str, u64); 10] = [
       (
         Self::SESSIONS,
         u64::try_from(sessions).map_err(|_| internal())?,
@@ -261,6 +266,10 @@ impl ObservabilitySnapshot {
       (
         Self::TRACE_RECORDS,
         u64::try_from(trace_records).map_err(|_| internal())?,
+      ),
+      (
+        Self::TRACE_RECORDS_DROPPED,
+        u64::try_from(trace_records_dropped).map_err(|_| internal())?,
       ),
       (
         Self::PENDING_TRANSACTIONS,
