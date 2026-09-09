@@ -53,9 +53,10 @@ pub(crate) async fn select_page_ctx(
   let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
   let namespace = super::store::namespace()?;
   let snapshot = store.snapshot().await?;
-  let mut scan = snapshot.scan(&namespace, &[]).await?;
   let paged = crate::paging::scan_paged(
-    scan.as_mut(),
+    snapshot.as_ref(),
+    &namespace,
+    &[],
     cursor.map(|cursor| cursor.as_bytes()),
     limit,
     |_key, bytes| {

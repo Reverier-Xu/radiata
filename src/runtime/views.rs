@@ -66,9 +66,10 @@ impl Supervisor {
       crate::membership::NODE_DESCRIPTOR_NAMESPACE,
     )?);
     let snapshot = self.context()?.store().snapshot().await?;
-    let mut scan = snapshot.scan(&namespace, &[]).await?;
     let paged = crate::paging::scan_paged(
-      scan.as_mut(),
+      snapshot.as_ref(),
+      &namespace,
+      &[],
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
       |_key, bytes| {
@@ -135,7 +136,7 @@ impl Supervisor {
       })
       .collect::<Vec<_>>();
     let paged = crate::paging::page_keys(
-      entries.into_iter(),
+      entries,
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
@@ -184,7 +185,7 @@ impl Supervisor {
         .collect()
     };
     let paged = crate::paging::page_keys(
-      entries.into_iter(),
+      entries,
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
@@ -283,7 +284,8 @@ impl Supervisor {
               std::time::SystemTime::now(),
             ),
           )
-        }),
+        })
+        .collect::<Vec<_>>(),
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );

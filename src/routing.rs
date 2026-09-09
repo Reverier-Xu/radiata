@@ -711,9 +711,11 @@ impl CandidateNodeReader for StoreCandidateReader {
       let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
         crate::membership::NODE_DESCRIPTOR_NAMESPACE,
       )?);
-      let mut scan = self.snapshot.scan(&namespace, &[]).await?;
+      let snapshot = self.snapshot.as_ref();
       let paged = crate::paging::scan_paged(
-        scan.as_mut(),
+        snapshot,
+        &namespace,
+        &[],
         cursor.as_ref().map(|cursor| cursor.as_bytes()),
         limit,
         |_key, bytes| {

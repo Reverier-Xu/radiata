@@ -132,10 +132,14 @@ pub(crate) mod sync {
   ) -> Result<ResourcePage> {
     let namespace = super::super::store::namespace()?;
     let snapshot = store.snapshot().await?;
-    let mut scan = snapshot.scan(&namespace, &[]).await?;
-    let paged = crate::paging::scan_paged(scan.as_mut(), cursor, limit, |_key, bytes| {
-      ResourceRecordV1::decode(bytes).map(Some)
-    })
+    let paged = crate::paging::scan_paged(
+      snapshot.as_ref(),
+      &namespace,
+      &[],
+      cursor,
+      limit,
+      |_key, bytes| ResourceRecordV1::decode(bytes).map(Some),
+    )
     .await?;
     ResourcePage::new(paged.items, paged.next)
   }
@@ -153,13 +157,19 @@ pub(crate) mod sync {
     let limit = limit.clamp(1, MAX_PAGE_RECORDS);
     let namespace = super::super::store::namespace()?;
     let snapshot = store.snapshot().await?;
-    let mut scan = snapshot.scan(&namespace, &[]).await?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let paged = crate::paging::scan_paged(scan.as_mut(), cursor, limit, |_key, bytes| {
-      bytes.len().hash(&mut hasher);
-      bytes.hash(&mut hasher);
-      Ok(Some(()))
-    })
+    let paged = crate::paging::scan_paged(
+      snapshot.as_ref(),
+      &namespace,
+      &[],
+      cursor,
+      limit,
+      |_key, bytes| {
+        bytes.len().hash(&mut hasher);
+        bytes.hash(&mut hasher);
+        Ok(Some(()))
+      },
+    )
     .await?;
     paged.items.len().hash(&mut hasher);
     paged
