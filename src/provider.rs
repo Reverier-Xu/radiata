@@ -673,6 +673,67 @@ pub trait StoreSnapshot: fmt::Debug + Send + Sync + 'static {
   fn scan<'a>(
     &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8],
   ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>>;
+
+  /// Positioned ordered scan (the seek primitive behind keyset-cursor
+  /// paging). The full contract, at the same level as the commit-ordering
+  /// contract on [`Storage`]:
+  ///
+  /// - **Ordering identity.** Entries stream in the exact unsigned-byte key
+  ///   order and namespace/prefix filter of [`StoreSnapshot::scan`];
+  ///   positioning never reorders or refilters.
+  /// - **Strict positioning.** `Some(from)` yields the first key *strictly
+  ///   greater than* `from` first — the keyset-cursor semantics, where a
+  ///   continuation cursor is the last key already seen and the next page
+  ///   resumes after it. Positioning is by key order, so `from` need not exist
+  ///   in the store.
+  /// - **`None` equivalence.** `None` observes exactly [`StoreSnapshot::scan`].
+  /// - **Out of bounds is empty.** A `from` at or past the namespace or prefix
+  ///   end is an empty scan, never an error.
+  /// - **One revision.** The positioned scan observes the same single snapshot
+  ///   revision as `get`/`scan` (the snapshot-immutability contract on
+  ///   [`Storage`]).
+  ///
+  /// The default implementation delegates to [`StoreSnapshot::scan`] and
+  /// skips the ordered head at or before `from`, which is correct but
+  /// linear in the skip distance; backends with native range starts
+  /// override it.
+  fn scan_from<'a>(
+    &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8], from: Option<&'a [u8]>,
+  ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>> {
+    let Some(from) = from else {
+      return self.scan(namespace, prefix);
+    };
+    let from = from.to_vec();
+    Box::pin(async move {
+      let inner = self.scan(namespace, prefix).await?;
+      Ok(Box::new(SkippingScan { inner, from }) as Box<dyn StoreScan>)
+    })
+  }
+}
+
+/// The default [`StoreSnapshot::scan_from`] path: the backend scan
+/// already streams the namespace's prefix range in key order, so the
+/// wrapper drops the ordered head at or before `from` and then passes
+/// every strictly-greater entry through untouched.
+#[derive(Debug)]
+struct SkippingScan<'a> {
+  inner: Box<dyn StoreScan + 'a>,
+  from: Vec<u8>,
+}
+
+impl StoreScan for SkippingScan<'_> {
+  fn next<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<StoreEntry>>> {
+    Box::pin(async move {
+      loop {
+        match self.inner.next().await? {
+          // The scan is ordered, so this drops exactly the cursor head
+          // and stops skipping at the first strictly-greater key.
+          Some(entry) if entry.key().as_bytes() <= self.from.as_slice() => {}
+          other => return Ok(other),
+        }
+      }
+    })
+  }
 }
 
 pub trait StorageFactory: fmt::Debug + Send + Sync + 'static {
@@ -685,7 +746,7 @@ pub trait StorageFactory: fmt::Debug + Send + Sync + 'static {
 /// One store owns a single key space of ([`StoreNamespace`],
 /// [`StoreKey`]) records plus the receipts of the transactions that
 /// changed them. Every adapter must provide the same observable
-/// behavior at the four contract points:
+/// behavior at the five contract points:
 ///
 /// - **Commit ordering.** [`Storage::commit`] evaluates one prepared
 ///   transaction against the committing state in a fixed order, and the first
@@ -709,6 +770,11 @@ pub trait StorageFactory: fmt::Debug + Send + Sync + 'static {
 ///   revision; later commits never mutate an outstanding snapshot, so a
 ///   decision made on it stays authoritative until the caller's own commit
 ///   lands.
+/// - **Positioned scans.** [`StoreSnapshot::scan_from`] is the read-side seek
+///   primitive: `Some(from)` starts at the first key strictly greater than
+///   `from` in the exact [`StoreSnapshot::scan`] order (a keyset continuation
+///   cursor is the last key already seen), `None` equals a plain scan, and a
+///   `from` past the namespace or prefix end is an empty scan, never an error.
 /// - **Reconciliation.** [`Storage::reconcile`] classifies a past transaction
 ///   exactly three ways: [`ReconcileOutcome::Committed`] when a receipt exists
 ///   for the id with the exact digest, [`ReconcileOutcome::DigestConflict`]

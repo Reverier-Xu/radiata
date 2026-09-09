@@ -10,7 +10,7 @@ use std::{
 use super::helpers::reference_revision;
 #[cfg(test)]
 use super::runner::{
-  storage_contract_conflicts_atomicity_and_idempotence,
+  storage_contract_conflicts_atomicity_and_idempotence, storage_contract_positioned_scans,
   storage_contract_snapshot_lookup_and_ordering,
 };
 use crate::{
@@ -88,7 +88,7 @@ struct ReferenceSnapshot {
 
 #[derive(Debug)]
 struct ReferenceScan<'a> {
-  entries: std::collections::btree_map::Iter<'a, (StoreNamespace, StoreKey), StoreValue>,
+  entries: std::collections::btree_map::Range<'a, (StoreNamespace, StoreKey), StoreValue>,
   namespace: &'a StoreNamespace,
   prefix: &'a [u8],
 }
@@ -265,8 +265,22 @@ impl StoreSnapshot for ReferenceSnapshot {
   fn scan<'a>(
     &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8],
   ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>> {
+    self.scan_from(namespace, prefix, None)
+  }
+
+  fn scan_from<'a>(
+    &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8], from: Option<&'a [u8]>,
+  ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>> {
+    // The map is keyed by (namespace, key) in the exact scan order, so
+    // one range lower bound carries both the plain prefix start and the
+    // strictly-greater positioned start; `next` filters namespace and
+    // prefix, keeping out-of-bounds starts empty.
+    let lower = match from {
+      None => std::ops::Bound::Included((namespace.clone(), StoreKey::new(Arc::from(prefix)))),
+      Some(from) => std::ops::Bound::Excluded((namespace.clone(), StoreKey::new(Arc::from(from)))),
+    };
     let scan = ReferenceScan {
-      entries: self.entries.iter(),
+      entries: self.entries.range((lower, std::ops::Bound::Unbounded)),
       namespace,
       prefix,
     };
@@ -384,6 +398,7 @@ where
   F: Fn() -> Arc<dyn StorageFactory>, {
   storage_contract_snapshot_lookup_and_ordering(fresh()).await;
   storage_contract_conflicts_atomicity_and_idempotence(fresh()).await;
+  storage_contract_positioned_scans(fresh()).await;
   super::all_family::storage_contract_all_family_roundtrip(fresh()).await;
   super::all_family::storage_contract_cross_family_atomicity(fresh()).await;
 }

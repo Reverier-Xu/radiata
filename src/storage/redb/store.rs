@@ -240,6 +240,12 @@ impl StoreSnapshot for RedbSnapshot {
   fn scan<'a>(
     &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8],
   ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>> {
+    self.scan_from(namespace, prefix, None)
+  }
+
+  fn scan_from<'a>(
+    &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8], from: Option<&'a [u8]>,
+  ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>> {
     Box::pin(async move {
       let entries = self
         .transaction
@@ -249,18 +255,37 @@ impl StoreSnapshot for RedbSnapshot {
         .transaction
         .open_table(DIGESTS_TABLE)
         .map_err(|error| map_table_error(error, ProviderErrorContext::StorageScan))?;
-      let bound = composite_prefix(namespace, prefix);
+      // The composite key is `namespace-tag ++ 0x00 ++ user key` in the
+      // exact scan order: one lower bound starts the range at the prefix
+      // (or, positioned, strictly past `from`), and `next` ends the scan
+      // at the first key outside the composite prefix, keeping
+      // out-of-bounds starts empty.
+      let prefix_bound = composite_prefix(namespace, prefix);
+      let positioned_start = from.map(|from| composite_prefix(namespace, from));
+      let lower = match positioned_start.as_deref() {
+        None => std::ops::Bound::Included(prefix_bound.as_slice()),
+        // A `from` exactly on the prefix start excludes that exact key.
+        Some(start) if start == prefix_bound.as_slice() => {
+          std::ops::Bound::Excluded(prefix_bound.as_slice())
+        }
+        // Positioning only ever moves the bound forward: a `from` beyond
+        // the prefix start positions strictly past it, a `from` before
+        // it keeps the inclusive prefix start (the range must not begin
+        // inside keys the prefix filter would end the scan on).
+        Some(start) if start > prefix_bound.as_slice() => std::ops::Bound::Excluded(start),
+        Some(_) => std::ops::Bound::Included(prefix_bound.as_slice()),
+      };
       let range = entries
-        .range::<&[u8]>(&*bound..)
+        .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageScan))?;
       let digest_range = digests
-        .range::<&[u8]>(&*bound..)
+        .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageScan))?;
       Ok(Box::new(RedbScan {
         range,
         digest_range,
         namespace: namespace.clone(),
-        prefix: bound,
+        prefix: prefix_bound,
         base_len: namespace.as_str().len() + 1,
       }) as Box<dyn StoreScan + 'a>)
     })

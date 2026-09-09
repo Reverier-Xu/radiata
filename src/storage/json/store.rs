@@ -831,10 +831,22 @@ impl StoreSnapshot for JsonSnapshot {
   fn scan<'a>(
     &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8],
   ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>> {
-    let range = self.entries.range((
-      std::ops::Bound::Included((namespace.clone(), StoreKey::new(Arc::from(prefix)))),
-      std::ops::Bound::Unbounded,
-    ));
+    self.scan_from(namespace, prefix, None)
+  }
+
+  fn scan_from<'a>(
+    &'a self, namespace: &'a StoreNamespace, prefix: &'a [u8], from: Option<&'a [u8]>,
+  ) -> BoxFuture<'a, Result<Box<dyn StoreScan + 'a>>> {
+    // The map is keyed by (namespace, key) in the exact scan order, so
+    // one range lower bound carries both the plain prefix start and the
+    // strictly-greater positioned start; `next` filters namespace and
+    // prefix and ends the scan at the first non-matching entry, keeping
+    // out-of-bounds starts empty.
+    let lower = match from {
+      None => std::ops::Bound::Included((namespace.clone(), StoreKey::new(Arc::from(prefix)))),
+      Some(from) => std::ops::Bound::Excluded((namespace.clone(), StoreKey::new(Arc::from(from)))),
+    };
+    let range = self.entries.range((lower, std::ops::Bound::Unbounded));
     let scan = JsonScan {
       namespace: namespace.clone(),
       prefix: prefix.to_vec(),
