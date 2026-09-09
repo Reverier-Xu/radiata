@@ -216,14 +216,14 @@ impl Supervisor {
         .dependencies
         .routes
         .lock()
-        .map_err(Error::session_table)?;
+        .map_err(|_| Error::internal("route records"))?;
       routes.len()
     };
     let connection_tasks = self
       .dependencies
       .connection_tasks
       .lock()
-      .map_err(Error::session_table)?
+      .map_err(|_| Error::internal("connection tasks"))?
       .len();
     let background_tasks = tasks.len() + connection_tasks + usize::from(self.sync_driver.is_some());
     let trace_records = self
