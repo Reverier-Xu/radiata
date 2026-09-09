@@ -248,11 +248,12 @@ pub(crate) fn page_bindings(
 /// The issuer's declared key must match its locally trusted binding
 /// when one exists: a substitution is conflicting evidence and fails
 /// closed (snapshots are per-issuer, trusted through the
-/// authenticated session and the binding set they extend). The verified
-/// snapshot persists, then binding adoption runs per record: a transient
-/// store contention on one binding must not abort the remaining bindings
-/// of the snapshot; the next delivery retries what was skipped
-/// (anti-entropy repair).
+/// authenticated session and the binding set they extend). The delivered
+/// snapshot is never persisted: binding adoption runs per record, and a
+/// transient store contention on one binding must not abort the
+/// remaining bindings of the snapshot; the next delivery retries what
+/// was skipped (anti-entropy repair). Only the issuer's own refresh
+/// persists a snapshot (see `refresh_issuer_snapshot`).
 pub(crate) async fn accept_snapshot(
   store: &MetadataStore, entropy: &dyn Entropy, snapshot: &TrustSnapshotV1,
 ) -> Result<()> {
@@ -262,7 +263,6 @@ pub(crate) async fn accept_snapshot(
   {
     return Err(crate::Error::not_trusted("trust snapshot issuer key"));
   }
-  store::persist_snapshot_ctx(store, entropy, snapshot).await?;
   for binding in snapshot.bindings() {
     // Only transient contention (Conflict) or a not-yet-ready store
     // (NotReady) skips one binding: the next snapshot delivery retries it
@@ -491,6 +491,106 @@ mod tests {
     assert_eq!(rest.next(), None);
   }
 
+  /// A delivered remote snapshot is adopted without persistence: the
+  /// bindings land in the identity-binding family, but no TRUST_SNAPSHOT
+  /// record is written for the remote issuer. Only the issuer's own
+  /// refresh persists a snapshot.
+  #[tokio::test]
+  async fn accept_snapshot_adopts_without_persisting_the_remote_snapshot() {
+    use super::store;
+    let factory = factory();
+    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    // The issuer must be locally bound before its snapshot is accepted.
+    store::adopt_binding_ctx(&store, &crate::api::SystemEntropy, &node(1), &key(1))
+      .await
+      .unwrap();
+    let snapshot = snapshot(3, 1, vec![(1, 1), (2, 2), (3, 3)]);
+    super::accept_snapshot(&store, &crate::api::SystemEntropy, &snapshot)
+      .await
+      .unwrap();
+
+    // The bindings were adopted...
+    let bindings = store::trusted_bindings(&store).await.unwrap();
+    assert_eq!(bindings.get(&node(2)), Some(&key(2)));
+    assert_eq!(bindings.get(&node(3)), Some(&key(3)));
+    // ...but the remote snapshot itself was never persisted.
+    assert_eq!(
+      store::latest_snapshot_ctx(&store, &node(1)).await.unwrap(),
+      None,
+      "a delivered remote snapshot must not be persisted"
+    );
+  }
+
+  /// The issuer's own refresh persists its snapshot: the durable record
+  /// is the sole revision basis the next refresh reads back, and an
+  /// unchanged binding set re-reads it without a revision bump.
+  #[tokio::test]
+  async fn refresh_issuer_snapshot_persists_the_issuer_own_snapshot() {
+    use super::store;
+    use crate::identity::{
+      lifecycle,
+      testing::{ScriptedKeys, SequenceEntropy},
+    };
+    let factory = factory();
+    let keys = ScriptedKeys::full();
+    let entropy: std::sync::Arc<dyn crate::api::Entropy> =
+      std::sync::Arc::new(SequenceEntropy::default());
+    let context = std::sync::Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        &keys.as_provider(),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    let store = context.store();
+    store::adopt_binding_ctx(store, entropy.as_ref(), &node(2), &key(2))
+      .await
+      .unwrap();
+    store::adopt_binding_ctx(store, entropy.as_ref(), &node(3), &key(3))
+      .await
+      .unwrap();
+
+    let first = super::refresh_issuer_snapshot(&context, &entropy)
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(first.revision(), 1);
+    let persisted = store::latest_snapshot_ctx(store, context.identity().node())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(persisted, first, "the issuer's own snapshot is persisted");
+
+    // An unchanged binding set re-reads the persisted snapshot without a
+    // revision bump.
+    let again = super::refresh_issuer_snapshot(&context, &entropy)
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(again.revision(), 1);
+    assert_eq!(again, first);
+
+    // A new binding bumps the persisted revision exactly once.
+    store::adopt_binding_ctx(store, entropy.as_ref(), &node(4), &key(4))
+      .await
+      .unwrap();
+    let third = super::refresh_issuer_snapshot(&context, &entropy)
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(third.revision(), 2);
+    let persisted = store::latest_snapshot_ctx(store, context.identity().node())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(persisted, third);
+  }
+
   #[tokio::test]
   async fn trust_snapshot_persists_and_reloads_after_restart() {
     use super::store;
@@ -575,9 +675,12 @@ pub(crate) mod store {
     StoreKey::new(Arc::from(bytes))
   }
 
-  /// Persists one verified snapshot over the running node's metadata
-  /// store (runtime path; never re-opens storage). Re-delivery of the
-  /// same revision is a no-op (idempotent).
+  /// Persists one snapshot over the running node's metadata store
+  /// (runtime path; never re-opens storage). The sole writer is the
+  /// issuer's own refresh — delivered remote snapshots are adopted
+  /// without persistence — and the record is the revision basis the
+  /// next refresh reads back. Re-refresh of the same revision is a
+  /// no-op (idempotent).
   pub(crate) async fn persist_snapshot_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, snapshot: &TrustSnapshotV1,
   ) -> Result<()> {
