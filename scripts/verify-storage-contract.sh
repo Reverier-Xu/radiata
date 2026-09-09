@@ -27,9 +27,9 @@ require_nonempty_tests() {
 # Catalog lane: the backend-neutral family catalog
 # single-sources every metadata namespace literal in the crate and covers
 # every implemented domain exactly once per namespace.
-rg -o 'relay\.woooo\.tech/metadata/[a-z0-9-]+-v[0-9]+' src --no-filename | sort -u \
+rg -o 'radiata\.woooo\.tech/metadata/[a-z0-9-]+-v[0-9]+' src --no-filename | sort -u \
   > "$TMP/namespace-actual.txt"
-rg -o 'relay\.woooo\.tech/metadata/[a-z0-9-]+-v[0-9]+' src/storage/families.rs --no-filename \
+rg -o 'radiata\.woooo\.tech/metadata/[a-z0-9-]+-v[0-9]+' src/storage/families.rs --no-filename \
   | sort -u > "$TMP/namespace-catalog.txt"
 if [[ ! -s "$TMP/namespace-actual.txt" ]]; then
   printf 'catalog guard matched no namespace literals in src\n' >&2

@@ -26,8 +26,6 @@ pub(crate) const KEY_DELETION_INTENT_NAMESPACE: &str =
 pub(crate) const KEY_DELETED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-deleted-v1";
 /// One issuer trust snapshot per issuer and revision.
 pub(crate) const TRUST_SNAPSHOT_NAMESPACE: &str = "radiata.woooo.tech/metadata/trust-snapshot-v1";
-/// Trust snapshot binding observation per issuer and subject.
-pub(crate) const TRUST_BINDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/trust-binding-v1";
 /// Local authorization revocation per exact subject binding.
 pub(crate) const REVOCATION_NAMESPACE: &str = "radiata.woooo.tech/metadata/revocation-v1";
 /// Cleanup checkpoint GC epoch marker, max-wins by watermark.
@@ -78,7 +76,7 @@ mod catalog {
     Identity,
     /// Key custody intents and their committed outcomes.
     KeyIntent,
-    /// Issuer trust snapshots and snapshot binding observations.
+    /// Issuer trust snapshots.
     Trust,
     /// Owner-revision-marked node descriptors.
     Node,
@@ -130,8 +128,7 @@ mod catalog {
     INTERNAL_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE,
     KEY_DELETION_INTENT_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
     MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE,
-    REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE, TRUST_BINDING_NAMESPACE,
-    TRUST_SNAPSHOT_NAMESPACE,
+    REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE, TRUST_SNAPSHOT_NAMESPACE,
   };
 
   /// Every core metadata family, in domain order and then declaration order.
@@ -149,7 +146,6 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Trust, TRUST_SNAPSHOT_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Trust, TRUST_BINDING_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Node, NODE_DESCRIPTOR_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Resource, RESOURCE_RECORD_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Route, TRACE_NAMESPACE),
