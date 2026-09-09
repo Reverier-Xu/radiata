@@ -15,9 +15,7 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 use super::{MAX_CHUNK_BYTES, StreamMetadata};
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, Result, TraceId,
-  protocol::{
-    CONTROL_CBOR_LIMITS, CborLimits, decode_canonical, decode_canonical_strict, encode_canonical,
-  },
+  protocol::{CONTROL_CBOR_LIMITS, CborLimits, decode_canonical_strict, encode_canonical},
   routing::HopState,
 };
 
@@ -149,25 +147,9 @@ struct OpenWire {
   /// Canonical metadata: key/value pairs sorted by key text, unique keys.
   #[n(4)]
   metadata: Vec<(String, ByteVec)>,
-  /// Present only on routed frames; direct-delivery frames end at
-  /// `metadata`.
+  /// `None` on direct-delivery frames; present only on routed frames.
   #[n(5)]
   route: Option<RouteWire>,
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct OpenWireV1 {
-  #[n(0)]
-  trace_id: String,
-  #[n(1)]
-  source: String,
-  #[n(2)]
-  destination: String,
-  #[n(3)]
-  protocol: String,
-  #[n(4)]
-  metadata: Vec<(String, ByteVec)>,
 }
 
 #[derive(Encode, Decode)]
@@ -224,31 +206,14 @@ pub(crate) fn encode_open(frame: &OpenFrame) -> Result<Vec<u8>> {
   )
 }
 
-/// Decodes one packet-open frame body, enforcing canonical encoding,
-/// canonical metadata ordering, the bounded metadata map, and — for routed
-/// frames — a duplicate-free visited chain. The caller-selected parser
-/// limits bound every decode allocation.
+/// Decodes one packet-open frame body, enforcing the single six-element
+/// shape (direct delivery carries a `None` route element), canonical
+/// encoding, canonical metadata ordering, the bounded metadata map, and —
+/// for routed frames — a duplicate-free visited chain. The caller-selected
+/// parser limits bound every decode allocation.
 pub(crate) fn decode_open(body: &[u8], limits: CborLimits) -> Result<OpenFrame> {
-  // The routed frame shape carries the optional route element.
-  if let Ok(wire) = decode_canonical::<OpenWire>(body, limits)
-    && encode_canonical(&wire, PACKET_CBOR_LIMITS).is_ok_and(|encoded| encoded == body)
-  {
-    return open_from_wire(wire);
-  }
-  // Direct-delivery frames end at the metadata element.
-  let wire: OpenWireV1 =
-    decode_canonical(body, limits).map_err(|_| Error::invalid_input("packet open decode"))?;
-  if !encode_canonical(&wire, PACKET_CBOR_LIMITS).is_ok_and(|encoded| encoded == body) {
-    return Err(Error::invalid_input("packet open canonical"));
-  }
-  open_from_wire(OpenWire {
-    trace_id: wire.trace_id,
-    source: wire.source,
-    destination: wire.destination,
-    protocol: wire.protocol,
-    metadata: wire.metadata,
-    route: None,
-  })
+  let wire: OpenWire = decode_canonical_strict(body, limits, "packet open canonical")?;
+  open_from_wire(wire)
 }
 
 fn open_from_wire(wire: OpenWire) -> Result<OpenFrame> {
@@ -570,9 +535,9 @@ mod route_tests {
 
   use minicbor::bytes::ByteVec;
 
-  use super::{OpenFrame, OpenWireV1, PACKET_CBOR_LIMITS, RouteWire, decode_open, encode_open};
+  use super::{OpenFrame, PACKET_CBOR_LIMITS, RouteWire, decode_open, encode_open};
   use crate::{
-    NodeId, ProtocolTag, StreamMetadata, TraceId,
+    ErrorKind, NodeId, ProtocolTag, StreamMetadata, TraceId,
     protocol::{CONTROL_CBOR_LIMITS, encode_canonical},
     routing::HopState,
   };
@@ -617,23 +582,43 @@ mod route_tests {
     assert_eq!(route.remaining_hops, 3);
   }
 
-  /// A frame without the route element decodes with `None` route state —
-  /// direct delivery stays wire-compatible.
+  /// A frame without a route decodes with `None` route state — direct
+  /// delivery — through the single six-field wire shape, and structurally
+  /// invalid bodies fail closed through that one path with the unified
+  /// decode context (the retired five-element branch used to report such
+  /// bodies as "packet open decode" instead).
   #[test]
   fn direct_open_frame_decodes_without_route_state() {
     let (trace_id, source, destination, _) = ids();
-    let wire = OpenWireV1 {
-      trace_id: trace_id.to_string(),
-      source: source.to_string(),
-      destination: destination.to_string(),
-      protocol: "radiata.woooo.tech/protocols/test-packets".to_owned(),
-      metadata: Vec::new(),
+    let frame = OpenFrame {
+      trace_id,
+      source: source.clone(),
+      destination: destination.clone(),
+      protocol: ProtocolTag::parse("radiata.woooo.tech/protocols/test-packets").unwrap(),
+      metadata: StreamMetadata::new(),
+      route: None,
     };
-    let body = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();
+    let body = encode_open(&frame).unwrap();
     let decoded = decode_open(&body, PACKET_CBOR_LIMITS).unwrap();
     assert!(decoded.route.is_none());
     assert_eq!(decoded.source, source);
     assert_eq!(decoded.destination, destination);
+    assert_eq!(encode_open(&decoded).unwrap(), body);
+
+    // Padded bodies fail closed through the same single path.
+    let mut padded = body;
+    padded.push(0x00);
+    assert!(decode_open(&padded, PACKET_CBOR_LIMITS).is_err());
+
+    // A structurally invalid open body fails closed through the single
+    // remaining path — the retired branch's "packet open decode"
+    // context no longer exists anywhere.
+    let mut oversized = encode_open(&frame).unwrap();
+    oversized[0] = 0x87;
+    oversized.extend_from_slice(&[0x00]);
+    let error = decode_open(&oversized, PACKET_CBOR_LIMITS).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_ne!(error.context(), "packet open decode");
   }
 
   /// A duplicate-free chain is enforced at the wire boundary; reordered
