@@ -16,7 +16,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use radiata::{
   ConnectMember, DisconnectPeer, Endpoint, GetLocalNode, Listen, MergeCluster, NodeBuilder,
   NodeConfig, NodeHandle, PageMembers, PageSpec, PageTopology, PageTrust, RecoveryConfig,
-  RotateMergeCredential, Shutdown, StartRecovery,
+  RotateMergeCredential, Shutdown, StartRecovery, UpdateNodeMetadata,
 };
 
 mod common;
@@ -1052,5 +1052,111 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
   }
   for node in nodes {
     node.handle.command(Shutdown::new()).await.unwrap();
+  }
+}
+
+/// Fat descriptor pages deliver and converge over real sessions.
+///
+/// Four members label themselves at the label-set maximum (64 entries of
+/// 256-byte values), so one descriptor page overflows both wire bounds
+/// at once: the emission ladder halves the page capacity instead of
+/// failing the sync tick every tick, and the encoded payload ships as
+/// multiple packet chunks instead of terminating the pump as oversize.
+/// Under the pre-fix code this scenario stalled permanently — the page
+/// never left the sender, the cursor never advanced, and the members'
+/// fat label sets never converged anywhere.
+#[tokio::test]
+async fn membership_sync_delivers_fat_descriptor_pages() {
+  let _cluster_gate = cluster_gate().lock().await;
+  init_tracing();
+
+  const FAT_ENTRIES: usize = 64;
+  const FAT_VALUE_BYTES: usize = 256;
+  fn fat_patch() -> radiata::NodeMetadataPatch {
+    let mut patch = radiata::NodeMetadataPatch::new();
+    for index in 0..FAT_ENTRIES {
+      patch = patch
+        .set_capability(
+          radiata::LabelKey::parse(&format!("example.org/labels/fat-{index:02}")).unwrap(),
+          radiata::LabelValue::parse(&"v".repeat(FAT_VALUE_BYTES)).unwrap(),
+        )
+        .unwrap();
+    }
+    patch
+  }
+
+  let nodes = build_cluster(5).await;
+  let issuer = &nodes[0];
+
+  // Every member labels itself at the maximum; the owner-revision CAS
+  // re-observes the current revision on a lost race.
+  for member in &nodes[1..] {
+    let member_id = member
+      .handle
+      .query(GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id()
+      .clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+      let members = member
+        .handle
+        .query(PageMembers::new(PageSpec::first(8).unwrap()))
+        .await
+        .unwrap();
+      let revision = members
+        .items()
+        .iter()
+        .find(|view| view.node_id() == &member_id)
+        .map(|view| view.owner_revision())
+        .unwrap_or(1);
+      match member
+        .handle
+        .command(UpdateNodeMetadata::new(revision, fat_patch()))
+        .await
+      {
+        Ok(_) => break,
+        Err(error) if error.kind() == radiata::ErrorKind::Conflict => {
+          assert!(
+            std::time::Instant::now() < deadline,
+            "fat metadata update never succeeded"
+          );
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(error) => panic!("fat metadata update failed persistently: {error:?}"),
+      }
+    }
+  }
+
+  // The issuer's descriptor store converges to every member's full fat
+  // label set through ordinary anti-entropy rounds: pages halve,
+  // payloads chunk, and the cursor advances every round.
+  let member_ids: std::collections::BTreeSet<radiata::NodeId> =
+    nodes[1..].iter().map(|node| node.id.clone()).collect();
+  let expected = member_ids.len();
+  let deadline = std::time::Instant::now() + Duration::from_secs(120);
+  loop {
+    issuer.handle.run_sync_round().await.unwrap();
+    let members = issuer
+      .handle
+      .query(PageMembers::new(PageSpec::first(64).unwrap()))
+      .await
+      .unwrap();
+    let converged = members
+      .items()
+      .iter()
+      .filter(|view| {
+        member_ids.contains(view.node_id()) && view.labels().entries().count() >= FAT_ENTRIES
+      })
+      .count();
+    if converged == expected {
+      break;
+    }
+    assert!(
+      deadline.elapsed() < Duration::from_secs(120),
+      "fat descriptor pages never converged: {converged}/{expected}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
   }
 }

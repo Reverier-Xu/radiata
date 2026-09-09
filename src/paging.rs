@@ -38,6 +38,21 @@ pub(crate) fn check_page_shape(
 }
 
 /// Encodes one bounded page envelope over pre-encoded items.
+///
+/// The sync size ladder (three bounds, each layer its own job):
+///
+/// 1. **64 KiB encode bound** ([`crate::protocol::CONTROL_CBOR_LIMITS`]): a
+///    page envelope (and every other control body) must encode inside it. The
+///    lane `emit_page_ctx` functions enforce this at emission with a bounded
+///    halving ladder over the page capacity, so a page of fat records splits
+///    instead of failing the tick.
+/// 2. **32 KiB chunk bound** ([`crate::packet::MAX_CHUNK_BYTES`]): the pump
+///    forwards each body chunk as one frame. The sender splits an encoded
+///    payload at this bound (`crate::sync_common::chunk_payload`); the receiver
+///    reassembles the chunk stream.
+/// 3. **256 KiB receive bound** ([`crate::sync_common::MAX_SYNC_BYTES`] with
+///    [`crate::sync_common::MAX_SYNC_CHUNKS`]): the receiver-side defense for
+///    one drained sync body.
 pub(crate) fn encode_page(
   schema: &str, items: &[Vec<u8>], cursor: Option<&[u8]>,
 ) -> Result<Vec<u8>> {

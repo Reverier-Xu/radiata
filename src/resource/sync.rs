@@ -32,7 +32,7 @@ const RESOURCE_SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/resource-
 
 /// One resource sync payload: an encoded [`ResourcePage`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResourceSyncPayload(ByteVec);
+pub(crate) struct ResourceSyncPayload(pub(crate) ByteVec);
 
 #[derive(Encode, Decode)]
 #[cbor(array)]
