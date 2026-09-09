@@ -215,7 +215,7 @@ pub(crate) fn apply_metadata_patch(
       descriptor.node().clone(),
       descriptor.public_key().clone(),
       endpoints,
-      descriptor.revision() + 1,
+      descriptor.revision().saturating_add(1),
       false,
       1,
     )
@@ -320,7 +320,12 @@ pub(crate) mod store {
       if existing.removed() && !descriptor.removed() {
         return Err(Error::conflict("node descriptor removal"));
       }
-    } else if descriptor.revision() != 1 {
+    } else if descriptor.revision() == 0 {
+      // The descriptor register starts at revision 1: a zero-revision
+      // descriptor is never a legal first install, not even for a node
+      // whose binding is already adopted.
+      return Err(Error::conflict("node descriptor revision"));
+    } else if descriptor.revision() > 1 {
       // A first install at a revision above 1 is only healable when the
       // node is already trusted (its adopted binding exists): the page
       // arrived over an authenticated session from a trusted member, so
@@ -541,6 +546,41 @@ mod tests {
       store::store_descriptor(&factory, &descriptor(2, 1, vec!["two.example"], false))
         .await
         .is_err()
+    );
+  }
+
+  /// A first install at revision 0 is rejected even when the node's
+  /// binding is already adopted: the register starts at revision 1, so
+  /// the first-install escape hatch for skipped revisions never extends
+  /// to the illegal zero revision.
+  #[tokio::test]
+  async fn descriptor_store_rejects_revision_zero_first_install() {
+    let store = crate::storage::MetadataStore::open(&factory(), std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    crate::identity::trust::store::adopt_binding_ctx(
+      &store,
+      &crate::api::SystemEntropy,
+      &node(3),
+      &key(3),
+    )
+    .await
+    .unwrap();
+
+    let error = store::store_descriptor_ctx(
+      &store,
+      &crate::api::SystemEntropy,
+      &descriptor(0, 3, vec!["zero.example"], false),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    assert!(
+      store::read_descriptor_ctx(&store, &node(3))
+        .await
+        .unwrap()
+        .is_none(),
+      "the rejected install must not land"
     );
   }
 
