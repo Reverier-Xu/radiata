@@ -18,7 +18,8 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{
-  lifecycle::LocalIdentityContext, records, records::metadata_namespace, signature::verify_strict,
+  canonical::canonical_record, lifecycle::LocalIdentityContext, records,
+  records::metadata_namespace, signature::verify_strict,
 };
 /// The durable namespace of cleanup tombstone records.
 pub(crate) use crate::storage::families::CLEANUP_NAMESPACE;
@@ -35,45 +36,26 @@ pub(crate) const CLEANUP_RECORD_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/c
 /// Canonical-decoder bounds for the flat cleanup record.
 const CLEANUP_LIMITS: crate::protocol::CborLimits = crate::protocol::CborLimits::new(1, 8, 1_024);
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct CleanupRecordBodyWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  subject: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  subject_key: Vec<u8>,
-  #[n(4)]
-  issuer: String,
-  /// Signed host wall-clock UNIX milliseconds: the removal timestamp the
-  /// checkpoint GC compares against its watermark.
-  #[n(5)]
-  timestamp_millis: u64,
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct CleanupRecordWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  subject: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  subject_key: Vec<u8>,
-  #[n(4)]
-  issuer: String,
-  #[n(5)]
-  timestamp_millis: u64,
-  #[n(6)]
-  #[cbor(with = "minicbor::bytes")]
-  signature: Vec<u8>,
+canonical_record! {
+  wire CleanupRecordWire for CleanupRecordV1 vis [pub(crate)] {
+    schema CLEANUP_RECORD_SCHEMA,
+    version u16 1,
+    limits CLEANUP_LIMITS,
+    decode [strict remap "cleanup record", canonical "cleanup record canonical form", header_err "cleanup record schema"]
+    fields {
+      #[n(2)] subject = subject: String => node()
+      #[n(3)] subject_key = subject_key: ByteVec => key32("cleanup record key")
+      #[n(4)] issuer = issuer: String => node()
+      #[n(5)] timestamp_millis = timestamp_millis: u64 => stamp()
+      #[n(6)] signature = signature: ByteVec => sig("cleanup record signature")
+    }
+    signed_body wire CleanupRecordBodyWire fn encode_signed_body {
+      #[n(2)] subject: &NodeId as subject: String => node()
+      #[n(3)] subject_key: &PublicKey as subject_key: ByteVec => key32()
+      #[n(4)] issuer: &NodeId as issuer: String => node()
+      #[n(5)] timestamp_millis: u64 as timestamp_millis: u64 => stamp()
+    }
+  }
 }
 
 /// One issuer-signed cleanup tombstone.
@@ -116,20 +98,6 @@ impl CleanupRecordV1 {
     &self.issuer
   }
 
-  /// Encodes the canonical body the issuer signs.
-  pub(crate) fn encode_signed_body(
-    subject: &NodeId, subject_key: &PublicKey, issuer: &NodeId, timestamp_millis: u64,
-  ) -> Result<Vec<u8>> {
-    encode_wire(&CleanupRecordBodyWire {
-      schema: CLEANUP_RECORD_SCHEMA.to_owned(),
-      record_version: 1,
-      subject: subject.as_str().to_owned(),
-      subject_key: subject_key.as_bytes().to_vec(),
-      issuer: issuer.as_str().to_owned(),
-      timestamp_millis,
-    })
-  }
-
   /// Verifies the issuer signature against `issuer_key` (the issuer's
   /// permanently retained binding).
   pub(crate) fn verify(&self, issuer_key: &PublicKey) -> Result<()> {
@@ -146,47 +114,6 @@ impl CleanupRecordV1 {
       "cleanup record signature",
     )
   }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_wire(&CleanupRecordWire {
-      schema: CLEANUP_RECORD_SCHEMA.to_owned(),
-      record_version: 1,
-      subject: self.subject.as_str().to_owned(),
-      subject_key: self.subject_key.as_bytes().to_vec(),
-      issuer: self.issuer.as_str().to_owned(),
-      timestamp_millis: self.timestamp_millis,
-      signature: ByteVec::from(self.signature.as_bytes().to_vec()).to_vec(),
-    })
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: CleanupRecordWire = crate::protocol::decode_canonical_strict(
-      bytes,
-      CLEANUP_LIMITS,
-      "cleanup record canonical form",
-    )
-    .map_err(|_| Error::invalid_input("cleanup record"))?;
-    if wire.schema != CLEANUP_RECORD_SCHEMA || wire.record_version != 1 {
-      return Err(Error::invalid_input("cleanup record schema"));
-    }
-    Ok(Self {
-      subject: NodeId::parse(&wire.subject)?,
-      subject_key: PublicKey::from_bytes(
-        <[u8; 32]>::try_from(wire.subject_key.as_slice())
-          .map_err(|_| Error::invalid_input("cleanup record key"))?,
-      ),
-      issuer: NodeId::parse(&wire.issuer)?,
-      timestamp_millis: wire.timestamp_millis,
-      signature: Signature::from_bytes(
-        <[u8; 64]>::try_from(wire.signature.as_slice())
-          .map_err(|_| Error::invalid_input("cleanup record signature"))?,
-      ),
-    })
-  }
-}
-
-fn encode_wire<T: Encode<()>>(wire: &T) -> Result<Vec<u8>> {
-  crate::protocol::encode_canonical(wire, CLEANUP_LIMITS)
 }
 
 fn cleanup_key(subject: &NodeId) -> StoreKey {
@@ -294,22 +221,22 @@ pub(crate) const CHECKPOINT_SCHEMA: &str = "radiata.woooo.tech/schemas/cleanup-c
 /// The durable namespace of cleanup checkpoint (GC epoch) records.
 pub(crate) use crate::storage::families::CHECKPOINT_NAMESPACE;
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct CheckpointWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  /// The GC epoch watermark: host wall-clock UNIX milliseconds. Removal
-  /// tombstones stamped at or before this watermark are collected.
-  #[n(2)]
-  watermark_millis: u64,
-  /// The member that issued the epoch (hygiene provenance only; the
-  /// record is unsigned by design — violations degrade to metadata
-  /// hygiene issues, never security failures).
-  #[n(3)]
-  issuer: String,
+canonical_record! {
+  wire CheckpointWire for CleanupCheckpointV1 vis [pub(crate)] {
+    schema CHECKPOINT_SCHEMA,
+    version u16 1,
+    limits CLEANUP_LIMITS,
+    decode [strict remap "cleanup checkpoint", canonical "cleanup checkpoint canonical form", header_err "cleanup checkpoint schema"]
+    fields {
+      /// The GC epoch watermark: host wall-clock UNIX milliseconds. Removal
+      /// tombstones stamped at or before this watermark are collected.
+      #[n(2)] watermark_millis = watermark_millis: u64 => stamp()
+      /// The member that issued the epoch (hygiene provenance only; the
+      /// record is unsigned by design — violations degrade to metadata
+      /// hygiene issues, never security failures).
+      #[n(3)] issuer = issuer: String => node()
+    }
+  }
 }
 
 /// One cleanup checkpoint: an unsigned, max-wins record that rides the
@@ -328,31 +255,6 @@ impl CleanupCheckpointV1 {
       watermark_millis,
       issuer,
     }
-  }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_wire(&CheckpointWire {
-      schema: CHECKPOINT_SCHEMA.to_owned(),
-      record_version: 1,
-      watermark_millis: self.watermark_millis,
-      issuer: self.issuer.as_str().to_owned(),
-    })
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: CheckpointWire = crate::protocol::decode_canonical_strict(
-      bytes,
-      CLEANUP_LIMITS,
-      "cleanup checkpoint canonical form",
-    )
-    .map_err(|_| Error::invalid_input("cleanup checkpoint"))?;
-    if wire.schema != CHECKPOINT_SCHEMA || wire.record_version != 1 {
-      return Err(Error::invalid_input("cleanup checkpoint schema"));
-    }
-    Ok(Self {
-      watermark_millis: wire.watermark_millis,
-      issuer: NodeId::parse(&wire.issuer)?,
-    })
   }
 }
 

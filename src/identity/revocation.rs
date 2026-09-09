@@ -20,8 +20,9 @@
 
 use std::sync::Arc;
 
-use minicbor::{Decode, Encode};
+use minicbor::{Decode, Encode, bytes::ByteVec};
 
+use super::canonical::canonical_record;
 /// The durable namespace of revocation records.
 pub(crate) use crate::storage::families::REVOCATION_NAMESPACE;
 use crate::{
@@ -39,39 +40,24 @@ pub(crate) const REVOCATION_RECORD_V1_DOMAIN: &[u8] =
 const REVOCATION_LIMITS: crate::protocol::CborLimits =
   crate::protocol::CborLimits::new(1, 8, 1_024);
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct RevocationRecordBodyWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  subject: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  subject_key: Vec<u8>,
-  #[n(4)]
-  issuer: String,
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct RevocationRecordWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  subject: String,
-  #[n(3)]
-  #[cbor(with = "minicbor::bytes")]
-  subject_key: Vec<u8>,
-  #[n(4)]
-  issuer: String,
-  #[n(5)]
-  #[cbor(with = "minicbor::bytes")]
-  signature: Vec<u8>,
+canonical_record! {
+  wire RevocationRecordWire for RevocationRecordV1 vis [pub(crate)] {
+    schema REVOCATION_RECORD_SCHEMA,
+    version u16 1,
+    limits REVOCATION_LIMITS,
+    decode [strict remap "revocation record", canonical "revocation record canonical form", header_err "revocation record schema"]
+    fields {
+      #[n(2)] subject = subject: String => node()
+      #[n(3)] subject_key = subject_key: ByteVec => key32("revocation record key")
+      #[n(4)] issuer = issuer: String => node()
+      #[n(5)] signature = signature: ByteVec => sig("revocation record signature")
+    }
+    signed_body wire RevocationRecordBodyWire fn encode_signed_body {
+      #[n(2)] subject: &NodeId as subject: String => node()
+      #[n(3)] subject_key: &PublicKey as subject_key: ByteVec => key32()
+      #[n(4)] issuer: &NodeId as issuer: String => node()
+    }
+  }
 }
 
 /// One issuer-signed convergent revocation tombstone.
@@ -107,22 +93,6 @@ impl RevocationRecordV1 {
     &self.issuer
   }
 
-  /// Encodes the canonical body the issuer signs.
-  pub(crate) fn encode_signed_body(
-    subject: &NodeId, subject_key: &PublicKey, issuer: &NodeId,
-  ) -> Result<Vec<u8>> {
-    crate::protocol::encode_canonical(
-      &RevocationRecordBodyWire {
-        schema: REVOCATION_RECORD_SCHEMA.to_owned(),
-        record_version: 1,
-        subject: subject.as_str().to_owned(),
-        subject_key: subject_key.as_bytes().to_vec(),
-        issuer: issuer.as_str().to_owned(),
-      },
-      REVOCATION_LIMITS,
-    )
-  }
-
   /// Verifies the issuer signature against `issuer_key` (the issuer's
   /// permanently retained binding).
   pub(crate) fn verify(&self, issuer_key: &PublicKey) -> Result<()> {
@@ -133,44 +103,6 @@ impl RevocationRecordV1 {
       &self.signature,
       "revocation record signature",
     )
-  }
-
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    crate::protocol::encode_canonical(
-      &RevocationRecordWire {
-        schema: REVOCATION_RECORD_SCHEMA.to_owned(),
-        record_version: 1,
-        subject: self.subject.as_str().to_owned(),
-        subject_key: self.subject_key.as_bytes().to_vec(),
-        issuer: self.issuer.as_str().to_owned(),
-        signature: self.signature.as_bytes().to_vec(),
-      },
-      REVOCATION_LIMITS,
-    )
-  }
-
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: RevocationRecordWire = crate::protocol::decode_canonical_strict(
-      bytes,
-      REVOCATION_LIMITS,
-      "revocation record canonical form",
-    )
-    .map_err(|_| Error::invalid_input("revocation record"))?;
-    if wire.schema != REVOCATION_RECORD_SCHEMA || wire.record_version != 1 {
-      return Err(Error::invalid_input("revocation record schema"));
-    }
-    Ok(Self {
-      subject: NodeId::parse(&wire.subject)?,
-      subject_key: PublicKey::from_bytes(
-        <[u8; 32]>::try_from(wire.subject_key.as_slice())
-          .map_err(|_| Error::invalid_input("revocation record key"))?,
-      ),
-      issuer: NodeId::parse(&wire.issuer)?,
-      signature: crate::Signature::from_bytes(
-        <[u8; 64]>::try_from(wire.signature.as_slice())
-          .map_err(|_| Error::invalid_input("revocation record signature"))?,
-      ),
-    })
   }
 }
 
