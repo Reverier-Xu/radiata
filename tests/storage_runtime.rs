@@ -17,6 +17,10 @@ const FRESH_START_EVENTS: &[&str] = &[
   "entropy",
   "open",
   "capabilities",
+  // The open-time schema gate reads (and fails closed on) the store's
+  // schema record before anything discovers or recovers a journal.
+  "snapshot",
+  "get",
   "snapshot",
   "scan",
   "key-capabilities",

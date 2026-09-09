@@ -603,6 +603,64 @@ mod tests {
     let _ = families::INTERNAL_NAMESPACE;
   }
 
+  /// The pending recovery path opens through the same gate: a store whose
+  /// schema record names a version outside the production chain fails
+  /// closed there too, before any pending record is discovered.
+  async fn pending_recovery_rejects_a_schema_version_outside_the_chain(
+    factory: Arc<dyn StorageFactory>,
+  ) {
+    // Commit a foreign schema record through the raw storage before the
+    // metadata store ever opens.
+    let raw = factory
+      .open(crate::StoreRequirements::metadata())
+      .await
+      .unwrap();
+    let snapshot = raw.snapshot().await.unwrap();
+    let foreign = encode_schema_record(
+      BASE_RECORD_KIND,
+      "radiata.woooo.tech/schemas/metadata-foreign-v9",
+      None,
+    );
+    let transaction = StoreTransaction::new(
+      util::transaction_id(911),
+      snapshot.revision().clone(),
+      vec![StoreOperation::Put {
+        namespace: schema_namespace().unwrap(),
+        key: schema_key(),
+        expected: crate::StoreExpectation::Absent,
+        value: foreign,
+      }],
+    )
+    .unwrap();
+    assert!(matches!(
+      raw.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+    drop(raw);
+    let error = crate::storage::MetadataStore::open_pending_recovered(
+      &factory,
+      std::time::Duration::from_secs(30),
+      "local-identity",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::UnsupportedSchema);
+  }
+
+  #[cfg(all(feature = "json", unix))]
+  #[tokio::test]
+  async fn pending_recovery_rejects_a_schema_version_outside_the_chain_json() {
+    let (_dir, factory) = json_factory();
+    pending_recovery_rejects_a_schema_version_outside_the_chain(factory).await;
+  }
+
+  #[cfg(feature = "redb")]
+  #[tokio::test]
+  async fn pending_recovery_rejects_a_schema_version_outside_the_chain_redb() {
+    let (_dir, factory) = redb_factory();
+    pending_recovery_rejects_a_schema_version_outside_the_chain(factory).await;
+  }
+
   #[tokio::test]
   async fn migration_registry_rejects_invalid_edge_graphs() {
     let missing_decoder = MigrationEdge::new(
