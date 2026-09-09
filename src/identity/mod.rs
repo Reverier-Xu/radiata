@@ -1,3 +1,4 @@
+pub(crate) mod canonical;
 pub(crate) mod cleanup;
 pub(crate) mod credential;
 pub(crate) mod deletion;
