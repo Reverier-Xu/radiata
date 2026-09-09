@@ -320,6 +320,10 @@
 | P2-12 绑定单一表示（owner 决策：淘汰族） | `1134df0`+`681c34e`+`bf8a0e8` | 删 TRUST_BINDING 族：读侧流式解码 IDENTITY_BINDING、写侧只走 adopt、目录/清退联动；单例节点可见自身绑定（有意新语义）；撤销防护统一变强；顺带修 verify-storage-contract 的 relay→radiata 陈旧正则 |
 | OpenWireV1 死分支（见 §4 勘误） | `00d227c` | 删回退分支与误导上下文，单路径 decode_canonical_strict，冻结向量 byte-stable，3 条陈旧语料刷新 |
 | canonical_record! 宏（12/13） | `6aa28ea`+`3b5dfea` | 宏 + records.rs 7 类型 + cleanup/leave/revocation 5 类型收敛，净 −277 行，trust 快照豁免有文档背书 |
+| snapshot 专项分析 | `e8b5e20` | docs/snapshot-analysis.md：7 种快照判定（owner 命题 1-2 成成立）；计数短路与 stale-base 残留均验证 |
+| 留档排队上限 | `fbfaa14` | 终态 trace sink 排队 64 上限，溢出丢弃 + `trace-records-dropped` 观测计数器；基线 +1 行 |
+| 快照三连修（owner 决策） | `466b1f2`+`6585be4`+`5d0f7aa` | 快照溢出不再拖死描述符反熵；远端快照停止持久化（issuer 自写自读保留）；注释如实化 |
+| 分页 seek 扩展（owner 决策） | `c33fcf8`+`73ec5fd` | StoreSnapshot::scan_from 定位扫描（default 方法保兼容）+ 三后端 + 合约；分页 O(N²/L)→O(page)（实测 1100 vs 50600 步）；基线 +1 行 |
 
 **未修（有意保留）**：store_scan_stream 公开面（保留供扩展作者，有外部驱动测试）；LimitedWriter 预零化 / 分页 O(N²) 重扫 / 终态 trace 无界 spawn（性能与规模项，规模触达前不动）；trust.rs `TrustSnapshotV1` 脚手架保持手写（canonical_record! 豁免，canonical.rs 模块文档已记录）。
 
