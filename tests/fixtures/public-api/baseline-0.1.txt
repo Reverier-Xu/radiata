@@ -531,6 +531,7 @@ pub const radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES: &str
 pub const radiata::ObservabilitySnapshot::QUEUED_SESSION_MESSAGES: &str
 pub const radiata::ObservabilitySnapshot::SESSIONS: &str
 pub const radiata::ObservabilitySnapshot::TRACE_RECORDS: &str
+pub const radiata::ObservabilitySnapshot::TRACE_RECORDS_DROPPED: &str
 pub fn radiata::ObservabilitySnapshot::captured_at(&self) -> std::time::SystemTime
 pub fn radiata::ObservabilitySnapshot::counter(&self, &radiata::QualifiedTag) -> core::option::Option<u64>
 pub struct radiata::OperationId(_)

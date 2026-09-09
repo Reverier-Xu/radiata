@@ -1489,7 +1489,9 @@ pub(crate) async fn run_outbound(
 
 /// Fire-and-forget persistence of one durable terminal fact per packet:
 /// the data plane never waits on metadata storage and intermediate
-/// progress stays an in-memory observation.
+/// progress stays an in-memory observation. The sink admits the
+/// persistence task only while its queue bound has room; a full queue
+/// drops the record and counts the drop.
 fn record_terminal_trace(
   trace: &Option<crate::routing::trace::TraceSink>, trace_id: &TraceId, source: &NodeId,
   destination: &NodeId, transition: crate::routing::trace::TraceTransition,
@@ -1502,8 +1504,7 @@ fn record_terminal_trace(
       trace.clock_now(),
     )
     .with_transition(transition, trace.clock_now());
-    let trace = trace.clone();
-    tokio::spawn(async move { trace.record(updated).await });
+    trace.record_terminal(updated);
   }
 }
 
