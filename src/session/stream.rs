@@ -11,6 +11,11 @@
 //! Interruption is explicit everywhere: a closed session fails pending
 //! admissions and in-flight bodies with `StreamInterrupted`, and core
 //! never persists or replays payload bytes.
+//!
+//! Module boundary: routing-domain concepts (the forwarding table,
+//! relayed acknowledgements, envelope validation) live in
+//! `crate::routing`; this module owns only the session infrastructure
+//! they attach to.
 
 use std::{
   collections::{BTreeMap, HashMap},
@@ -40,7 +45,7 @@ use crate::{
   },
   protocol::wire::PacketKind,
   routing::{
-    forward,
+    forward::{self, PendingAck, PendingAcks},
     table::{RouteTable, record_rejection, update_route},
   },
   transport::connection::{Connection, ConnectionReader, ConnectionWriter},
@@ -53,27 +58,6 @@ const INCOMING_STREAM_CHUNKS: usize = 8;
 /// The shared node-local session table: authenticated peer to live (or
 /// dead, pending replacement) session entry.
 pub(crate) type SessionTable = Arc<Mutex<BTreeMap<NodeId, SessionEntry>>>;
-
-/// One pending outbound admission: a synchronous waiter, or a forwarding
-/// hop whose acknowledgement must be relayed upstream. The
-/// map holding these is bounded per session by
-/// [`SessionPolicy::pending_admissions`]: a peer that accepts opens
-/// without acknowledging them cannot grow origin memory without limit.
-pub(crate) enum PendingAck {
-  Wait {
-    notify: oneshot::Sender<AckOutcome>,
-    /// Host wall-clock seconds at insertion; the liveness policy lets the
-    /// idle deadline close a session whose oldest waiting admission has
-    /// been outstanding for a full idle deadline, so a silent peer cannot
-    /// hold a session open forever through the owned-work exemption.
-    queued_at: u64,
-  },
-  Relay {
-    upstream: BoundedSender,
-  },
-}
-
-pub(crate) type PendingAcks = Arc<Mutex<HashMap<TraceId, PendingAck>>>;
 
 /// The packet-handling context shared by every session of one node.
 /// The caller-selected session bounds: outbound queue count and
@@ -1068,33 +1052,23 @@ async fn admit_open(
   let local = context.local().clone();
   let mut reack_admitted_at: Option<u64> = None;
   let status = 'status: {
-    // A routed frame re-validates its envelope against the
-    // session-authenticated holder before anything else;
-    // the chain itself then authenticates the original source.
-    if let Some(route) = open.route.clone() {
-      let envelope = crate::routing::RouteContext::from_frame(
+    // The routing envelope re-validates against the session-authenticated
+    // holder before anything else (the chain itself then authenticates the
+    // original source; a direct frame authenticates only through the exact
+    // source-peer match). Forwarding work belongs to the route forwarder;
+    // this admission boundary never branches a body, so any frame that
+    // does not arrive exactly here fails closed without a consumer.
+    if !matches!(
+      crate::routing::receive_open_envelope(
         trace_id.clone(),
         open.source.clone(),
         open.destination.clone(),
-        Some(route),
-      );
-      // Forwarding work belongs to the route forwarder; this
-      // admission boundary never branches a body, so any frame that does
-      // not arrive exactly here fails closed without a consumer.
-      if !matches!(
-        envelope.receive(&local, session.peer(), |_| {
-          Err(Error::unsupported("route forwarding"))
-        }),
-        Ok(crate::routing::RouteProgress::Arrive)
-      ) {
-        break 'status AckStatus::Unsupported;
-      }
-    } else if open.source != *session.peer() {
-      // Direct frames: endpoints must match the session-authenticated
-      // identities exactly.
-      break 'status AckStatus::Unsupported;
-    }
-    if open.destination != local {
+        open.route.clone(),
+        &local,
+        session.peer(),
+      ),
+      Ok(crate::routing::RouteProgress::Arrive)
+    ) {
       break 'status AckStatus::Unsupported;
     }
     // The immutable opening context decides duplicate handling: an
