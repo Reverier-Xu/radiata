@@ -50,6 +50,34 @@ impl NodeConfig {
     Ok(self)
   }
 
+  /// Sets the session liveness policy. A session with no authenticated
+  /// traffic or owned in-flight work for `idle_timeout` closes, and a peer
+  /// missing a keepalive result for `keepalive_timeout` closes. All three
+  /// values zero disable the policy; otherwise `idle_timeout` or
+  /// `keepalive_interval` must be nonzero, and a configured keepalive
+  /// requires `keepalive_interval > 0` with
+  /// `keepalive_timeout > keepalive_interval`.
+  pub fn with_session_liveness(
+    mut self, idle_timeout: Duration, keepalive_interval: Duration, keepalive_timeout: Duration,
+  ) -> Result<Self> {
+    // A configured keepalive is always the ordered pair interval <
+    // timeout: an interval without a deadline, a deadline without an
+    // interval, or a deadline inside the interval would silently disable
+    // or immediately fire the peer-missed close.
+    let keepalive_configured = !keepalive_interval.is_zero() || !keepalive_timeout.is_zero();
+    if keepalive_configured
+      && (keepalive_interval.is_zero()
+        || keepalive_timeout.is_zero()
+        || keepalive_timeout <= keepalive_interval)
+    {
+      return Err(Error::invalid_input("session liveness policy"));
+    }
+    self.session_idle_timeout = idle_timeout;
+    self.keepalive_interval = keepalive_interval;
+    self.keepalive_timeout = keepalive_timeout;
+    Ok(self)
+  }
+
   /// Sets the parser limits: every packet-frame decode enforces them.
   pub fn with_parser_limits(mut self, value: ParserLimits) -> Result<Self> {
     self.parser_limits = value;
@@ -309,4 +337,90 @@ fn ensure_nonzero_duration(value: Duration, context: &'static str) -> Result<()>
     return Err(Error::invalid_input(context));
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration;
+
+  use super::NodeConfig;
+  use crate::ErrorKind;
+
+  /// The liveness setter stores every accepted policy shape: fully
+  /// disabled, idle-only, keepalive-only, and the idle plus ordered
+  /// keepalive pair.
+  #[test]
+  fn session_liveness_accepts_disabled_and_valid_policies() {
+    // All-zero disables the policy and matches the default.
+    let disabled = NodeConfig::new()
+      .with_session_liveness(Duration::ZERO, Duration::ZERO, Duration::ZERO)
+      .unwrap();
+    assert!(disabled.session_idle_timeout().is_zero());
+    assert!(disabled.keepalive_interval().is_zero());
+    assert!(disabled.keepalive_timeout().is_zero());
+    assert_eq!(
+      disabled.session_idle_timeout(),
+      NodeConfig::new().session_idle_timeout()
+    );
+
+    let idle_only = NodeConfig::new()
+      .with_session_liveness(Duration::from_secs(30), Duration::ZERO, Duration::ZERO)
+      .unwrap();
+    assert_eq!(idle_only.session_idle_timeout(), Duration::from_secs(30));
+    assert!(idle_only.keepalive_interval().is_zero());
+    assert!(idle_only.keepalive_timeout().is_zero());
+
+    let keepalive_only = NodeConfig::new()
+      .with_session_liveness(
+        Duration::ZERO,
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+      )
+      .unwrap();
+    assert!(keepalive_only.session_idle_timeout().is_zero());
+    assert_eq!(keepalive_only.keepalive_interval(), Duration::from_secs(5));
+    assert_eq!(keepalive_only.keepalive_timeout(), Duration::from_secs(15));
+
+    let both = NodeConfig::new()
+      .with_session_liveness(
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+      )
+      .unwrap();
+    assert_eq!(both.session_idle_timeout(), Duration::from_secs(30));
+    assert_eq!(both.keepalive_interval(), Duration::from_secs(5));
+    assert_eq!(both.keepalive_timeout(), Duration::from_secs(15));
+  }
+
+  /// A deadline without either driver, a keepalive without a deadline,
+  /// and a deadline inside the interval are all invalid input.
+  #[test]
+  fn session_liveness_rejects_broken_policies() {
+    let broken = [
+      (Duration::ZERO, Duration::ZERO, Duration::from_secs(15)),
+      (
+        Duration::from_secs(30),
+        Duration::ZERO,
+        Duration::from_secs(15),
+      ),
+      (Duration::ZERO, Duration::from_secs(5), Duration::ZERO),
+      (
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+      ),
+      (
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(4),
+      ),
+    ];
+    for (idle_timeout, keepalive_interval, keepalive_timeout) in broken {
+      let error = NodeConfig::new()
+        .with_session_liveness(idle_timeout, keepalive_interval, keepalive_timeout)
+        .unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+  }
 }

@@ -500,6 +500,7 @@ pub fn radiata::NodeConfig::with_parser_limits(self, radiata::ParserLimits) -> r
 pub fn radiata::NodeConfig::with_receipt_retention(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_recovery_policy(self, radiata::RecoveryConfig) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_route_policy(self, radiata::QualifiedTag) -> Self
+pub fn radiata::NodeConfig::with_session_liveness(self, core::time::Duration, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_session_queue_limits(self, usize, usize) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_trace_metadata_limits(self, radiata::TraceMetadataLimits) -> radiata::Result<Self>
 impl core::default::Default for radiata::NodeConfig
