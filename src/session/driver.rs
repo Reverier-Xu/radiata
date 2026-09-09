@@ -32,6 +32,7 @@ use crate::{
     credential::{GENERATION_ID_LEN, MergeCredentialIssuer},
     lifecycle::LocalIdentityContext,
     merge::{MergeProposal, adopt_merge, commit_merge},
+    merge_rate::MergeSource,
     records::{GenerationId, IdentityBindingV1, MergeGrantV1, MergeId, identity_binding_key},
   },
   protocol::{
@@ -207,10 +208,19 @@ impl SessionDriver {
 
   async fn respond_inner(&self, connection: &mut Connection) -> Result<EstablishedSession> {
     // Fixed admission rate limiting precedes every handshake and signing
-    // step; a rejected attempt consumes no credential.
-    let source = connection
-      .peer_source()
-      .ok_or_else(|| Error::authentication_failed("admission source"))?;
+    // step; a rejected attempt consumes no credential. The admission
+    // source is the accepted peer socket address, normalized here because
+    // the identity domain owns merge-admission semantics — transport only
+    // carries the raw address. A missing address never means "admit an
+    // unattributed attempt": with no source there is no bucket to charge,
+    // so admitting it would let an unattributable connection bypass the
+    // fixed policy; it fails closed as a typed authentication failure
+    // instead.
+    let source = MergeSource::normalize(
+      connection
+        .peer_addr()
+        .ok_or_else(|| Error::authentication_failed("admission source"))?,
+    );
     let _slot = self.limiter.begin(source)?;
     let first = receive_kind(connection, HandshakeKind::InitiatorHello).await?;
     let peek = peek_initiator_hello(&first.body)?;

@@ -18,7 +18,7 @@
 //! RFC 5705/8446 define an absent context as zero-length and rustls maps
 //! both to the same exporter input, so there is no `None` ambiguity.
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use futures_util::{
   SinkExt, StreamExt,
@@ -66,7 +66,12 @@ pub(crate) struct Connection {
   rules: FrameRules,
   channel_binding: [u8; CHANNEL_BINDING_LEN],
   merge_hint: Option<MergeHint>,
-  source: Option<crate::identity::merge_rate::MergeSource>,
+  /// The accepted peer's socket address, carried raw for the upper
+  /// layer: this transport knows nothing about admission semantics and
+  /// never normalizes or interprets the address. It is `None` only when
+  /// the kernel could not report the peer address on an accepted
+  /// connection; dialer-side connections carry none.
+  peer_addr: Option<SocketAddr>,
   /// UNIX-seconds of the last peer pong (keepalive liveness).
   pong_last_seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -84,10 +89,7 @@ impl Connection {
     // Nagle + delayed-ACK interaction would stall every burst by the
     // delayed-ACK window, so the transport owns low-latency sockets.
     let tcp = low_latency(tcp, ProviderErrorContext::TransportAccept)?;
-    let source = tcp
-      .peer_addr()
-      .ok()
-      .map(crate::identity::merge_rate::MergeSource::normalize);
+    let peer_addr = tcp.peer_addr().ok();
     tracing::debug!("tls connection accepted");
     let tls = TlsAcceptor::from(config)
       .accept(tcp)
@@ -100,7 +102,7 @@ impl Connection {
       rules,
       channel_binding,
       merge_hint: None,
-      source,
+      peer_addr,
       pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
@@ -135,7 +137,7 @@ impl Connection {
       rules,
       channel_binding,
       merge_hint,
-      source: None,
+      peer_addr: None,
       pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
@@ -173,11 +175,13 @@ impl Connection {
     next_message(&mut self.stream, self.rules, &self.pong_last_seen).await
   }
 
-  /// The canonical admission source of the accepted connection; the
-  /// initiator side carries none (its own node rate-limits inbound
-  /// attempts).
-  pub(crate) const fn peer_source(&self) -> Option<crate::identity::merge_rate::MergeSource> {
-    self.source
+  /// The accepted peer's raw socket address; dialer-side connections
+  /// carry none (the initiator rate-limits nothing here). `None` on an
+  /// accepted connection means the kernel could not report the peer
+  /// address; interpreting that case is the admission layer's explicit
+  /// decision, never this transport's.
+  pub(crate) const fn peer_addr(&self) -> Option<SocketAddr> {
+    self.peer_addr
   }
 
   /// Sends a WebSocket close frame and flushes the stream.
