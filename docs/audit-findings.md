@@ -1,6 +1,7 @@
 # radiata 全量代码审计报告
 
 > 审计基线：main @ `faf7833`（2026-09-09）。
+> **修复记录**：全部 P1×3、P2×21（除 P2-12 待决策）、P3×13 已在分支 `fix-audit-fixes`（worktree `../radiata-audit-fixes`）逐项修复落盘，每项独立 commit、全部门禁绿（taplo/fmt/clippy -D warnings/全量测试 550→607/0、cargo-hack each-feature 矩阵、fuzzing 构建零警告）。详见 §9 修复台账。P2-12（持久化格式统一）与 canonical_record! 宏、OpenWireV1 双形态两个后续项待 owner 决策。
 > 方法：4 个并行 reviewer 分区深读全部生产代码（L1 协议+L2 传输 / L5 身份+成员 / L3 会话+L4 路由+L7 运行时 / L6 存储+资源+跨模块扫描），统一 7+4 维度评分表；全部 P0/P1 与关键 P2 已由主审逐条对照源码复核（子代理行号可能有 ±10 行漂移，但事实均成立）。
 > 质量门禁基线：taplo ✓ / nightly fmt ✓ / check ✓ / clippy `-D warnings` ✓ / **cargo test 550 通过 0 失败**。
 > 架构与模块职责见 [architecture.md](architecture.md)。
@@ -277,9 +278,42 @@
 
 这套限制体系整体质量高：**单源化是主旋律**——`ADR0002_BODY_BYTES` 根上限、`CborLimits` 按 schema 精确分层、`MAX_VIEW_PAGE_ITEMS`/`LABEL_VALUE_MAX_BYTES` 等关键界均有唯一常量并被多处引用；几乎所有常量带论证注释；`ensure_nonzero`/值域校验在构造点统一拦截"零=无限制"；fail-closed 贯彻到位（未知 kind/schema/status、超页、超界一律类型化拒绝而非截断）。"零=禁用"语义（keepalive/idle）有文档但受 P1-2 影响。最值得收口的三件事：(a) 统一 sync 载荷尺寸链（P2-23）；(b) 页参数/purpose 长度并入单源（L2/L6）；(c) 修正 `_DEFAULT` 命名与两处注释错位，让"可配默认"与"固定内部界"一眼可辨。
 
-## 8. 修复优先级建议
+## 8. 修复优先级建议（已被 §9 台账取代，保留作原始评估）
 
 1. **立即**（0.1.0 发布前）：P1-1 canonical 域名、P1-2 liveness 不可达、P1-3 retention stale-base；P2-15（一行级修复）、P2-16、P2-9。
 2. **短期**（一次批量清理 PR）：P2-8/P2-10/P2-11/P2-22（allow(dead_code) 三处收敛 + sync.rs 错误分级 + 限速顺序）、P2-19、P2-20、P2-21、P2-23（sync 尺寸链：发送多 chunk 化或发射侧按 chunk 界推导页条数）。
 3. **中期**（结构性，各自独立 ticket）：P2-14 session/routing 分离、P2-7 trust 策略归位、P2-12 绑定表示统一、P2-13 leave 清单派生、P2-4/P2-5/P2-17 装饰面接线或收缩。
 4. **择机**：P3 清单，其中 canonical_record! 宏（13 组 triple）与 P3 文档-代码矛盾修正收益最高。
+
+## 9. 修复台账（分支 fix-audit-fixings）
+
+| 发现 | commit | 修复摘要 |
+| --- | --- | --- |
+| 文档基线 | `86c25b2` | 本审计文档入库 |
+| P1-1 canonical 域名 | `61dbf27` | 显式拒绝尾点/大写/下划线/非 LDH；保留比较移到折叠后；LabelKey/ResourceName 域段折叠保留归一化契约 |
+| P1-2 liveness 不可达 | `0633930` | `with_session_liveness` setter + 校验 + public-api 基线更新 |
+| P1-3 retention 陈旧 base | `c39f9f3` | 过期+溢出合并为单事务多 Delete；回归测试（旧代码下失败） |
+| P2-4 candidates 死模块 | `4047828`+`1c7d1b2` | 删除模块与孤儿 verify 脚本，文档同步 |
+| P2-5 Discovery 面装饰 | `b35ab89` | 公开面收缩（基线 -15 项），Discovery 面 cfg(test) |
+| P2-6 传输层身份依赖 | `98eb5c0` | 归一化/准入上移 session driver，`grep identity:: src/transport/` 清零 |
+| P3-L7 字面量 | `000834d` | DEFINITION_LIMITS 引用 ADR0002_BODY_BYTES |
+| P2-9 Aborted 当成功 | `8e429fa` | Conflict|Aborted→Err + AbortingOnceFactory 测试 |
+| P2-10 限速配额 | `0792a65` | 检查全部通过后再 record 两窗口；回归测试 |
+| P2-11 identity dead_code | `10b6bdd` | 删 6 处压制；死 item 删/cfg 化（清单见 commit） |
+| P2-13 WIPE 清单 | `1a49f67` | families 域归属注册表派生 + 守卫/集合相等测试 |
+| P2-7 trust 策略归位 | `eac5cb3` | accept_snapshot/refresh_issuer_snapshot 移入 trust.rs（纯移动） |
+| P2-8 绑定错误分级 | `9db6c64` | 仅 Conflict/NotReady 跳过，NotTrusted 上抛；回归测试 |
+| P2-15 remove 双重编码 | `a83eacb` | remove 走 sign_with_provider 单源管线 |
+| P2-16 终态路由抹 destination | `2e69f52` | 统一 record_terminal_failure，保留 selected_node；3 新单测 |
+| P2-17 RoutingPolicy 装饰 | `6425630` | 穷尽 match 强制 Direct 不变量（类型+运行时双保证） |
+| P2-18 锁上下文串名 | `11ae067` | routes/connection_tasks 锁中毒准确命名 |
+| P2-23 sync 尺寸链 | `c2b2b59` | 多 chunk 发送 + 发射侧减半阶梯；集成回归测试（stash 验证旧代码 257s 卡死） |
+| P2-19 pending 绕 schema 门 | `c9723c7` | 复用 open_with_state；json/redb 双后端 fail-closed 测试 |
+| P2-20 Storage 零文档 | `4ae4dbb` | 提交顺序契约/Unknown 语义/snapshot 不可变/reconcile 三态入 trait 文档 |
+| P2-21 namespace 六处重写 | `8cf7569` | families::namespace 单源，六处委托 |
+| P2-22 storage/resource dead_code | `3afca42` | 删全部过时压制；死 item 按政策 cfg 化（清单见 commit） |
+| P2-14 session⇄routing 循环 | `1386718` | PendingAck/PendingAcks 迁入 routing；receive_open_envelope 纯函数 |
+| P3×12（帧校验/墓碑收敛/分发收敛/尾样板/revision 边界/SPKI/accept 退避/next-hop 单源/LeaveCluster 提取/改名/注释漂移/死助手） | `ac041a6`…`b94b0b5` | 逐项见 git log，全部行为等价或收紧 |
+| feature 矩阵门控 | `3ecf0f6` | 迁移测试 helper 补 any(json+unix,redb) 门，each-feature 矩阵零警告 |
+
+**未修（待决策）**：P2-12（TRUST_BINDING 持久化 raw 字节 → IdentityBindingV1，需迁移链路设计）；canonical_record! 宏（13 组 Wire/encode/decode triple 收敛，golden 向量保重构安全）；OpenWireV1 双形态（pre-1.0 兼容窗口决策）；store_scan_stream 公开面（保留供扩展作者或降级）；LimitedWriter 预零化 / 分页 O(N²) 重扫 / 终态 trace 无界 spawn（性能与规模项）。
