@@ -9,14 +9,7 @@ pub(crate) fn body_digest(canonical_body: &[u8]) -> Digest {
 }
 
 pub(crate) fn signature_message(domain: &[u8], canonical_body: &[u8]) -> Vec<u8> {
-  signature_message_from_digest(domain, &body_digest(canonical_body))
-}
-
-/// The signature message for an already-digested body: domain‖digest.
-/// Callers that hold the body use [`signature_message`]; callers that
-/// hold a digest already proven to bind the body verify through this and
-/// skip a redundant re-encode and hash.
-pub(crate) fn signature_message_from_digest(domain: &[u8], digest: &Digest) -> Vec<u8> {
+  let digest = body_digest(canonical_body);
   let mut message = Vec::with_capacity(domain.len() + digest.as_bytes().len());
   message.extend_from_slice(domain);
   message.extend_from_slice(digest.as_bytes());
