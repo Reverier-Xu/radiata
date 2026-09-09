@@ -168,7 +168,17 @@ fn check_path(
       let spki = if hint.leaf_spki().is_empty() {
         None
       } else {
-        HeaderValue::from_str(&crate::hex::encode(hint.leaf_spki())).ok()
+        match HeaderValue::from_str(&crate::hex::encode(hint.leaf_spki())) {
+          Ok(spki) => Some(spki),
+          // The hint values are canonical ASCII by construction; a
+          // render failure is an internal bug and rejects the upgrade
+          // outright instead of emitting a partial hint.
+          Err(_) => {
+            let mut rejection = ErrorResponse::new(Some("invalid merge hint".to_owned()));
+            *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return Err(rejection);
+          }
+        }
       };
       let Ok(generation) = HeaderValue::from_str(&generation_hex(hint.generation())) else {
         let mut rejection = ErrorResponse::new(Some("invalid merge hint".to_owned()));
