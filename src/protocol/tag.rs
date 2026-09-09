@@ -29,12 +29,7 @@ pub struct QualifiedTag {
 
 impl QualifiedTag {
   pub fn parse(value: &str) -> Result<Self> {
-    let (domain_end, category_end) = validate_tag(value)?;
-    // DNS names are case-insensitive; normalize the domain to lowercase for
-    // storage and comparison instead of rejecting uppercase input. The
-    // case fold never changes byte length, so the split offsets stay valid.
-    let domain = value[..domain_end].to_ascii_lowercase();
-    let value = format!("{domain}{}", &value[domain_end..]);
+    let (value, domain_end, category_end) = validate_tag(value)?;
     Ok(Self {
       value,
       domain_end,
@@ -137,7 +132,14 @@ category_tag!(ProtocolTag, "protocols", "protocol tag");
 category_tag!(TransportTag, "transports", "transport tag");
 category_tag!(DiscoveryTag, "discovery", "discovery tag");
 
-fn validate_tag(value: &str) -> Result<(usize, usize)> {
+/// Validates one tag and returns its canonical text with the domain and
+/// category split offsets. Every reserved-domain and reserved-category
+/// comparison runs on the canonical text: the domain is lowercased before
+/// the builtin check, so no uppercase, trailing-dot, or other non-canonical
+/// spelling variant can bypass a reservation. The ASCII case fold never
+/// changes byte length, so the split offsets stay valid for the folded
+/// text.
+fn validate_tag(value: &str) -> Result<(String, usize, usize)> {
   if !(MIN_TAG_LEN..=MAX_TAG_LEN).contains(&value.len()) || !value.is_ascii() {
     return Err(Error::invalid_input("qualified tag"));
   }
@@ -156,23 +158,74 @@ fn validate_tag(value: &str) -> Result<(usize, usize)> {
     || !valid_dns_hostname(domain)
     || !valid_name_component(category)
     || !valid_name_component(name)
-    || (domain == BUILTIN_DOMAIN && category == CATEGORY_CRYPTO)
   {
+    return Err(Error::invalid_input("qualified tag"));
+  }
+
+  let domain = domain.to_ascii_lowercase();
+  if domain == BUILTIN_DOMAIN && category == CATEGORY_CRYPTO {
     return Err(Error::invalid_input("qualified tag"));
   }
 
   let domain_end = domain.len();
   let category_end = domain_end + 1 + category.len();
-  Ok((domain_end, category_end))
+  let value = format!("{domain}{}", &value[domain_end..]);
+  Ok((value, domain_end, category_end))
 }
 
-/// Validates one canonical DNS hostname. The `domain` crate owns the DNS
-/// grammar and label-length rules; the canonical checks (lowercase, no
-/// trailing dot, no underscore, alphanumeric label edges) stay explicit
-/// because the crate accepts non-canonical spellings. Shared by tag
-/// domains and transport endpoints so the two cannot diverge.
+/// Lowercases the domain segment of one `<domain>/<category>/<name>`
+/// text before tag parsing, for callers whose contract is normalization
+/// rather than rejection: a case variant of a reserved domain must land
+/// on the canonical reserved spelling, so lookups and reservations
+/// cannot be split across case forgeries. Only the domain folds — the
+/// tag grammar accepts lowercase alone in the category and name
+/// segments.
+pub(crate) fn fold_tag_domain(value: &str) -> String {
+  match value.split_once('/') {
+    Some((domain, rest)) => format!("{}/{}", domain.to_ascii_lowercase(), rest),
+    None => value.to_ascii_lowercase(),
+  }
+}
+
+/// Validates one canonical DNS hostname: lowercase LDH labels without a
+/// trailing dot. The `domain` crate owns the DNS grammar and label-length
+/// rules, but it also accepts non-canonical spellings (uppercase,
+/// underscore, trailing dot, non-LDH label edges), so the canonical checks
+/// stay explicit: text equality must stay identity for tag domains and
+/// transport endpoints alike, and the two cannot diverge.
 pub(crate) fn valid_dns_hostname(host: &str) -> bool {
-  !host.is_empty() && host.parse::<domain::base::name::Name<Vec<u8>>>().is_ok()
+  // The trailing-dot root form and the empty host are non-canonical.
+  if host.is_empty() || host.ends_with('.') {
+    return false;
+  }
+  // DNS names are case-insensitive, so uppercase spellings parse as valid
+  // DNS grammar but would alias their lowercase form under a different
+  // text identity.
+  if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+    return false;
+  }
+  if !host.split('.').all(valid_ldh_label) {
+    return false;
+  }
+  host.parse::<domain::base::name::Name<Vec<u8>>>().is_ok()
+}
+
+/// One LDH label: alphanumeric bytes with interior hyphens, never a
+/// leading or trailing hyphen. This excludes the underscore (the DNS
+/// grammar accepts it as the wildcard spelling, canonical hosts do not)
+/// and every non-ASCII byte.
+fn valid_ldh_label(label: &str) -> bool {
+  let bytes = label.as_bytes();
+  bytes
+    .first()
+    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    && bytes
+      .last()
+      .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    && bytes
+      .iter()
+      .copied()
+      .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn valid_name_component(component: &str) -> bool {
