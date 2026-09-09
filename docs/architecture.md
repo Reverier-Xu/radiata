@@ -31,7 +31,7 @@ radiata 是一个确定性中继节点运行时库：为群组应用提供认证
 │ L3 会话域         session/ {driver,stream}                       │
 ├─────────────────────────────────────────────────────────────────┤
 │ L2 传输域         transport/ {tls,verify,cert,ws,connection,     │
-│                  endpoint,candidates,registry}                  │
+│                  endpoint,registry}                              │
 ├─────────────────────────────────────────────────────────────────┤
 │ L1 协议域         protocol/ {cbor,envelope,tag,wire,handshake,   │
 │                  offer,selection,feature,credential}            │
@@ -83,10 +83,9 @@ radiata 是一个确定性中继节点运行时库：为群组应用提供认证
 | `transport/verify.rs` | **安全关键**服务端证书验证器：join 模式仅放宽链/主机名信任，`CertificateVerify` 签名无条件全验证。 |
 | `transport/cert.rs` | 接收方临时自签监听证书（注入熵生成、仅内存、每监听器一份，非节点身份）。 |
 | `transport/ws.rs` | 固定 `/mrly` 路径的 WebSocket 升级（仅二进制、无压缩）；升级响应携带非秘密 join 提示（cluster ID、凭据 generation ID）。 |
-| `transport/connection.rs` | TLS-WS 流上的分帧连接（一条二进制 WS 消息 = 16B prelude + body），双重有界接收；RFC 9266 `tls-exporter` 通道绑定推导。 |
-| `transport/endpoint.rs` | 公开 `Endpoint` 值类型（规范 `wss://host[:port]` 文本）。 |
-| `transport/candidates.rs` | 身份限定的 endpoint 候选（挂钟过期）。 |
-| `transport/registry.rs` | 开放 transport/discovery 注册表；内置 WSS 注册为默认。注册永不绕过认证与流安全。 |
+| `transport/connection.rs` | TLS-WS 流上的分帧连接（一条二进制 WS 消息 = 16B prelude + body），双重有界接收；RFC 9266 `tls-exporter` 通道绑定推导；向会话层暴露原始 `Option<SocketAddr>`（准入归一化在身份域）。 |
+| `transport/endpoint.rs` | 公开 `Endpoint` 值类型（规范 `wss://host[:port]` 文本；严格 canonical 域名校验）。 |
+| `transport/registry.rs` | 开放 transport 注册表（内置 WSS 注册为默认；Discovery 扩展面现为 test-only）。注册永不绕过认证与流安全。 |
 
 ### L3 会话域
 

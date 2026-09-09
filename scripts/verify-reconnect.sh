@@ -31,6 +31,6 @@ cargo test --locked --test secure_join secure_join_rotation_keeps_members_and_re
 # Outbound-only bidirectional packet sessions.
 cargo test --locked --test secure_join secure_join_packets_flow_concurrently_in_both_directions
 
-# Crossed dial and readdress converge to one session; the
-# readdress candidate table is covered by the candidates lane.
+# Crossed dial and readdress converge to one session; readdressed
+# endpoints are covered by the endpoint lane.
 cargo test --locked --test secure_join secure_join_crossed_dial_converges_to_one_session
