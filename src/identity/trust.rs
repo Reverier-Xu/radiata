@@ -262,13 +262,36 @@ pub(crate) async fn accept_snapshot(
   }
   store::persist_snapshot_ctx(store, entropy, snapshot).await?;
   for binding in snapshot.bindings() {
+    // Only transient contention (Conflict) or a not-yet-ready store
+    // (NotReady) skips one binding: the next snapshot delivery retries it
+    // (anti-entropy repair). Everything else — key substitution,
+    // revocation, decode failures, provider faults — is conflicting
+    // evidence and fails closed, failing the tick so the sync caller
+    // surfaces the typed error.
     if let Err(error) =
       store::persist_binding_ctx(store, entropy, binding.node(), binding.key()).await
     {
-      tracing::debug!(node = %binding.node(), kind = ?error.kind(), "trust binding persist skipped");
-      continue;
+      if matches!(
+        error.kind(),
+        crate::ErrorKind::Conflict | crate::ErrorKind::NotReady
+      ) {
+        tracing::debug!(node = %binding.node(), kind = ?error.kind(), "trust binding persist skipped");
+        continue;
+      }
+      return Err(error);
     }
-    let _ = store::adopt_binding_ctx(store, entropy, binding.node(), binding.key()).await;
+    if let Err(error) =
+      store::adopt_binding_ctx(store, entropy, binding.node(), binding.key()).await
+    {
+      if matches!(
+        error.kind(),
+        crate::ErrorKind::Conflict | crate::ErrorKind::NotReady
+      ) {
+        tracing::debug!(node = %binding.node(), kind = ?error.kind(), "trust binding adoption skipped");
+        continue;
+      }
+      return Err(error);
+    }
   }
   Ok(())
 }
@@ -422,6 +445,34 @@ mod tests {
     std::sync::Arc::new(crate::storage::contract::ReferenceFactory::new(
       crate::storage::contract::required_capabilities(),
     ))
+  }
+
+  #[tokio::test]
+  async fn accept_snapshot_fails_closed_on_untrusted_binding_evidence() {
+    use super::store;
+    use crate::ErrorKind;
+    let factory = factory();
+    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    // Node 2 is already locally admitted with its own key.
+    store::adopt_binding_ctx(&store, &crate::api::SystemEntropy, &node(2), &key(2))
+      .await
+      .unwrap();
+    // A snapshot from an unbound issuer carrying a re-keyed binding for
+    // node 2 is forged evidence: acceptance must fail closed with a typed
+    // error, not silently skip the conflicting binding.
+    let forged = snapshot(1, 1, vec![(2, 9), (3, 3)]);
+    let error = super::accept_snapshot(&store, &crate::api::SystemEntropy, &forged)
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotTrusted);
+    // The conflicting binding was never adopted.
+    assert_eq!(
+      store::trusted_bindings(&store).await.unwrap().get(&node(2)),
+      Some(&key(2)),
+      "node 2 must keep its locally admitted key"
+    );
   }
 
   #[tokio::test]
