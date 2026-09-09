@@ -82,7 +82,15 @@ pub struct StreamPolicy {
 
 impl StreamPolicy {
   /// Selects a routing policy and a nonzero hop budget.
+  ///
+  /// The built-in direct policy is the only routing policy: the
+  /// exhaustive match below makes any future `RoutingPolicy` variant a
+  /// compile error here until its routing semantics are defined, so an
+  /// unroutable policy can never be constructed silently.
   pub fn new(routing_policy: RoutingPolicy, max_hops: u32) -> Result<Self> {
+    match routing_policy {
+      RoutingPolicy::Direct => {}
+    }
     if max_hops == 0 {
       return Err(Error::invalid_input("stream hop budget"));
     }
@@ -662,8 +670,26 @@ mod tests {
 
   use futures_util::StreamExt as _;
 
-  use super::{METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, StreamItem, StreamMetadata, channel_body};
+  use super::{
+    METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, RoutingPolicy, StreamItem, StreamMetadata,
+    StreamPolicy, channel_body,
+  };
   use crate::{ErrorKind, QualifiedTag};
+
+  /// The direct policy is the only routable policy: `RoutingPolicy` is
+  /// `#[non_exhaustive]` with exactly one variant today, so no non-direct
+  /// value can even be constructed. The invariant is enforced twice — by
+  /// the type system (no other variant exists to build) and by the
+  /// exhaustive `match` in `StreamPolicy::new`, which turns any future
+  /// variant into a compile error at the construction gate until its
+  /// routing semantics are defined. This test pins the direct path: the
+  /// policy is accepted and carried unchanged.
+  #[test]
+  fn stream_policy_accepts_the_direct_routing_policy() {
+    let policy = StreamPolicy::new(RoutingPolicy::Direct, 4).unwrap();
+    assert_eq!(policy.routing_policy(), &RoutingPolicy::Direct);
+    assert_eq!(policy.max_hops(), 4);
+  }
 
   fn key(name: &str) -> QualifiedTag {
     QualifiedTag::parse(&format!("radiata.woooo.tech/labels/{name}")).unwrap()
