@@ -179,12 +179,18 @@ pub(crate) mod sync {
       super::super::NODE_DESCRIPTOR_NAMESPACE,
     )?);
     let snapshot = store.snapshot().await?;
-    let mut scan = snapshot.scan(&namespace, &[]).await?;
-    let paged = crate::paging::scan_paged(scan.as_mut(), cursor, limit, |_key, bytes| {
-      // The sender only pages its own stored records; entries are trusted
-      // through the session that delivers them.
-      super::decode_descriptor(bytes).map(Some)
-    })
+    let paged = crate::paging::scan_paged(
+      snapshot.as_ref(),
+      &namespace,
+      &[],
+      cursor,
+      limit,
+      |_key, bytes| {
+        // The sender only pages its own stored records; entries are trusted
+        // through the session that delivers them.
+        super::decode_descriptor(bytes).map(Some)
+      },
+    )
     .await?;
     MembershipPage::new(paged.items, paged.next)
   }
