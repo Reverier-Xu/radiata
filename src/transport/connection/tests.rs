@@ -78,6 +78,17 @@ async fn tls_transport_merge_hint_round_trips_inside_the_tls_channel() {
   assert_eq!(client.merge_hint(), None);
 }
 
+/// The accepted side carries the dialer's raw socket address for the
+/// admission layer; the dialer side carries none, and the transport
+/// never normalizes or interprets the address.
+#[tokio::test]
+async fn accepted_connections_carry_the_raw_peer_address_and_dialers_carry_none() {
+  let (client, server) = loopback_pair().await;
+  assert!(client.peer_addr().is_none());
+  let address = server.peer_addr().unwrap();
+  assert!(address.ip().is_loopback());
+}
+
 async fn loopback_pair_with(
   client_config: Arc<rustls::ClientConfig>, certificate: EphemeralCertificate,
 ) -> (Connection, Connection) {
@@ -129,7 +140,7 @@ fn framed(stream: WebSocketStream<TlsStream<TcpStream>>) -> Connection {
     rules: rules(),
     channel_binding: [0; CHANNEL_BINDING_LEN],
     merge_hint: None,
-    source: None,
+    peer_addr: None,
     pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
   }
 }
