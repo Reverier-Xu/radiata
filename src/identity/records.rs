@@ -4,9 +4,9 @@ use minicbor::{Decode, Encode};
 
 use super::signature::{MERGE_GRANT_V1_DOMAIN, verify_strict};
 use crate::{
-  BoxFuture, Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey, QualifiedTag,
-  Result, Signature, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision,
-  StoreValue, TransactionId,
+  BoxFuture, Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey, Result, Signature,
+  StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision, StoreValue,
+  TransactionId,
   api::Entropy,
   error::fixed_bytes,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
@@ -117,11 +117,7 @@ fn expect_algorithm(actual: &str) -> Result<()> {
 }
 
 pub(crate) fn metadata_namespace(tag: &str) -> Result<StoreNamespace> {
-  let tag = QualifiedTag::parse(tag)?;
-  if tag.category() != crate::protocol::tag::CATEGORY_METADATA {
-    return Err(Error::invalid_input("identity record namespace"));
-  }
-  Ok(StoreNamespace::new(tag))
+  crate::storage::families::namespace(tag)
 }
 
 fn store_key(bytes: &[u8]) -> StoreKey {
@@ -1133,7 +1129,7 @@ mod tests {
   use ed25519_dalek::{Signer, SigningKey};
 
   use super::*;
-  use crate::{ErrorKind, TransactionId};
+  use crate::{ErrorKind, QualifiedTag, TransactionId};
 
   const SUBJECT_NODE: &str = "node_100000000000000000000";
   const ISSUER_NODE: &str = "node_200000000000000000000";

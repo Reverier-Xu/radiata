@@ -49,6 +49,19 @@ pub(crate) const INTERNAL_NAMESPACE: &str = "radiata.woooo.tech/metadata/receipt
 /// The store's current logical schema version record.
 pub(crate) const SCHEMA_NAMESPACE: &str = "radiata.woooo.tech/metadata/store-schema-v1";
 
+/// Parses one catalog family tag into its provider namespace: the single
+/// constant-to-namespace conversion for the catalog. The tag grammar
+/// validates the text and the metadata-category check keeps foreign
+/// namespaces out of the store, so every family resolves through this one
+/// place and domain-local helpers only delegate here.
+pub(crate) fn namespace(tag: &str) -> crate::Result<crate::StoreNamespace> {
+  let tag = crate::QualifiedTag::parse(tag)?;
+  if tag.category() != crate::protocol::tag::CATEGORY_METADATA {
+    return Err(crate::Error::invalid_input("metadata family namespace"));
+  }
+  Ok(crate::StoreNamespace::new(tag))
+}
+
 #[cfg(all(test, unix, feature = "json", feature = "redb"))]
 pub(crate) use catalog::MetadataFamily;
 /// The owning domain of every catalog family; consumers classify families

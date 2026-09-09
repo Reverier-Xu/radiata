@@ -755,11 +755,7 @@ fn validate_purpose(purpose: &str) -> Result<()> {
 }
 
 pub(super) fn pending_namespace() -> Result<StoreNamespace> {
-  let tag = QualifiedTag::parse(PENDING_NAMESPACE)?;
-  if tag.category() != crate::protocol::tag::CATEGORY_METADATA {
-    return Err(Error::invalid_input("pending transaction namespace"));
-  }
-  Ok(StoreNamespace::new(tag))
+  super::families::namespace(PENDING_NAMESPACE)
 }
 
 /// Counts pending journal records for the bounded runtime status view.

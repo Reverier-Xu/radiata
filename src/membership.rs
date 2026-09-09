@@ -253,9 +253,7 @@ pub(crate) mod store {
   };
 
   fn namespace() -> Result<StoreNamespace> {
-    Ok(StoreNamespace::new(crate::QualifiedTag::parse(
-      NODE_DESCRIPTOR_NAMESPACE,
-    )?))
+    crate::storage::families::namespace(NODE_DESCRIPTOR_NAMESPACE)
   }
 
   fn descriptor_key(node: &NodeId) -> StoreKey {
