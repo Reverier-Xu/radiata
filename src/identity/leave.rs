@@ -301,22 +301,22 @@ pub(crate) async fn sign_leave_record(
 ) -> Result<LeaveRecordV1> {
   let identity = context.identity();
   let timestamp_millis = crate::time::now_millis();
-  let body =
-    LeaveRecordV1::encode_signed_body(identity.node(), identity.public_key(), timestamp_millis)?;
-  let signature = keys
-    .sign(
-      identity.handle(),
-      &crate::identity::signature::signature_message(LEAVE_RECORD_V1_DOMAIN, &body),
-    )
-    .await?;
-  let record = LeaveRecordV1::new(
+  let signature = records::sign_tombstone(
+    context,
+    keys,
+    LEAVE_RECORD_V1_DOMAIN,
+    "leave record signature",
+    |identity| {
+      LeaveRecordV1::encode_signed_body(identity.node(), identity.public_key(), timestamp_millis)
+    },
+  )
+  .await?;
+  Ok(LeaveRecordV1::new(
     identity.node().clone(),
     identity.public_key().clone(),
     timestamp_millis,
     signature,
-  );
-  record.verify()?;
-  Ok(record)
+  ))
 }
 
 fn leave_record_key(node: &NodeId) -> StoreKey {
@@ -344,25 +344,17 @@ pub(crate) async fn persist_leave_record_ctx(
 
 /// Whether `node` has a leave record in the local store.
 pub(crate) async fn is_left_ctx(store: &MetadataStore, node: &NodeId) -> Result<bool> {
-  let namespace = leave_namespace()?;
-  let snapshot = store.snapshot().await?;
-  Ok(
-    snapshot
-      .get(&namespace, &leave_record_key(node))
-      .await?
-      .is_some(),
-  )
+  records::key_present(store, &leave_namespace()?, &leave_record_key(node)).await
 }
 
 /// Every known leave record's node, for exclusion sweeps.
 pub(crate) async fn left_nodes_ctx(
   store: &MetadataStore,
 ) -> Result<std::collections::BTreeSet<NodeId>> {
-  let mut left = std::collections::BTreeSet::new();
-  for record in known_leave_records_ctx(store, usize::MAX).await? {
-    left.insert(record.node().clone());
-  }
-  Ok(left)
+  Ok(records::collect_subjects(
+    &known_leave_records_ctx(store, usize::MAX).await?,
+    LeaveRecordV1::node,
+  ))
 }
 
 /// The known leave records, oldest first, bounded by `cap`. The intent
