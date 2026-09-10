@@ -591,15 +591,26 @@ async fn current_initiator_interops_with_prior_responder() {
   assert_packet_interop(&issuer, &member).await;
 
   // The issuer (prior surface) still resolves the member's paged view.
-  let page = issuer
-    .handle
-    .query(PageMembers::new(PageSpec::first(8).unwrap()))
-    .await
-    .unwrap();
-  assert!(
-    page.items().iter().any(|m| m.node_id() == &member_id),
-    "the prior responder pages the current member"
-  );
+  // The member's post-listen descriptor (now carrying its endpoint)
+  // converges to the issuer through the anti-entropy ticks, so the
+  // observation is poll-bounded like every other probe: a loaded runner
+  // can lag the push by a few ticks.
+  let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+  loop {
+    let page = issuer
+      .handle
+      .query(PageMembers::new(PageSpec::first(8).unwrap()))
+      .await
+      .unwrap();
+    if page.items().iter().any(|m| m.node_id() == &member_id) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the prior responder pages the current member"
+    );
+    tokio::time::sleep(POLL).await;
+  }
 
   member
     .handle
