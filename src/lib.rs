@@ -89,8 +89,8 @@ pub use routing::{
 pub use transport::{Endpoint, PageCursor};
 pub use view::{
   ConnectivityStatus, LeaveOutcome, ListenerPage, ListenerView, LocalNodeView, MemberPage,
-  MemberView, MergeView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot, PageSpec,
-  ReceiptRetentionReport, RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata,
+  MemberStatus, MemberView, MergeView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot,
+  PageSpec, ReceiptRetentionReport, RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata,
   ResourceMutationView, ResourcePage, ResourceView, RevokeOutcome, SessionFeatureView, SessionPage,
   SessionView, ShutdownOutcome, ShutdownReason, TopologyEdgeView, TopologyPage, TrustPage,
   TrustStatus, TrustedIdentityView,

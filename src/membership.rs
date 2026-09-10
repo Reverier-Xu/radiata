@@ -510,6 +510,30 @@ mod tests {
     assert_eq!(decoded.public_key(), &key(1));
   }
 
+  /// The member view defaults to the active removal state and the
+  /// observation layer's annotation overrides it: the status — not page
+  /// membership — is the authoritative liveness signal.
+  #[test]
+  fn member_view_defaults_active_and_carries_the_annotated_status() {
+    let descriptor = descriptor(1, 1, vec!["one.example"], false);
+    let view = super::member_view(&descriptor, crate::ConnectivityStatus::Reachable).unwrap();
+    assert_eq!(view.status(), crate::MemberStatus::Active);
+    assert_eq!(
+      super::member_view(&descriptor, crate::ConnectivityStatus::Reachable)
+        .unwrap()
+        .with_status(crate::MemberStatus::Left)
+        .status(),
+      crate::MemberStatus::Left
+    );
+    assert_eq!(
+      super::member_view(&descriptor, crate::ConnectivityStatus::Reachable)
+        .unwrap()
+        .with_status(crate::MemberStatus::Cleaned)
+        .status(),
+      crate::MemberStatus::Cleaned
+    );
+  }
+
   /// A record is replaced only by a strictly higher revision, and a
   /// skipped intermediate revision still heals the gap.
   #[tokio::test]

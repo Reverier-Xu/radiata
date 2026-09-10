@@ -370,6 +370,21 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   })
   .await;
   assert!(observed.is_ok(), "the peer never observed the leave");
+
+  // A still-visible left member is annotated as Left, never Active: the
+  // descriptor stays as verification evidence, so the status is the
+  // liveness signal (finding #9).
+  let page = listener
+    .query(PageMembers::new(PageSpec::first(8).unwrap()))
+    .await
+    .unwrap();
+  assert!(
+    page
+      .items()
+      .iter()
+      .all(|member| member.node_id() != &former || member.status() == radiata::MemberStatus::Left)
+  );
+
   listener.command(Shutdown::new()).await.unwrap();
 }
 
