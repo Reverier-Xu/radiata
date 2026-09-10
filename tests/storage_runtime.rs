@@ -124,10 +124,14 @@ async fn storage_runtime_success_orders_storage_probe_before_identity_and_releas
     handle.query(GetNodeStatus::new()).await.unwrap(),
     NodeStatus::Running,
   );
-  assert_eq!(
+  // The startup order is a prefix property: after the identity init the
+  // recovery plane's first tick appends its own reads (the departed prune
+  // and the finding-#4 known-online seeding), so the observation is
+  // asserted as a prefix, not an exact sequence.
+  assert!(
+    providers.events.events().starts_with(FRESH_START_EVENTS),
+    "startup must open and probe storage, then probe key capabilities, then run identity calls: {:?}",
     providers.events.events(),
-    FRESH_START_EVENTS,
-    "startup must open and probe storage, then probe key capabilities, then run identity calls",
   );
   assert_eq!(providers.factory.open_calls(), 1);
   assert_eq!(providers.factory.commit_calls(), 4);
