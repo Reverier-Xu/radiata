@@ -1523,6 +1523,29 @@ pub(crate) fn test_queue(max_count: usize, max_bytes: usize) -> (BoundedSender, 
   )
 }
 
+/// Test-only: a live session entry around a test queue, so sync-layer
+/// tests can drive per-peer dispatch without a real connection.
+#[cfg(test)]
+pub(crate) fn test_entry(entropy: &dyn crate::api::Entropy) -> (SessionEntry, BoundedReceiver) {
+  let (frames, receiver) = test_queue(256, 8 * 1_024 * 1_024);
+  let entry = SessionEntry {
+    frames,
+    pending_acks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    pending_admissions: MAX_PENDING_ADMISSIONS,
+    clock: Arc::new(crate::storage::receipt::HostWallClock),
+    meta: Arc::new(SessionMeta {
+      id: crate::SessionId::generate(entropy).unwrap(),
+      generation: 0,
+      endpoint: crate::Endpoint::parse("wss://127.0.0.1:9").unwrap(),
+      features: Vec::new(),
+    }),
+    alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    direction: DialDirection::Outgoing,
+    retire: watch::channel(()).0,
+  };
+  (entry, receiver)
+}
+
 /// Removes a pending admission that never reached the wire.
 fn withdraw_pending(entry: &SessionEntry, trace_id: &TraceId) {
   if let Ok(mut pending) = entry.pending_acks.lock() {
