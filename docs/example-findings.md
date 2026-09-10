@@ -11,7 +11,7 @@
 | 1 | **没有生产级 KeyProvider**：客户必须自行实现带崩溃恢复语义的密钥生命周期（`create_ed25519`/`reconcile_create`/`delete`/`reconcile_delete`，`KeyCreateState::{Present,Absent,Unknown}` 三态）。库内只有测试用的 ScriptedKeys。实现一个幂等的文件版 provider 是接入中最难的一步，且做错恢复语义的后果（身份丢失/重复）不易察觉。 | 高 | 已在 example 中提供 FileKeyProvider 参考实现；建议库内提供生产参考实现或深入文档 |
 | 2 | **凭据轮换使已发凭据立即失效，且无只读查询当前凭据的 API**：`RotateMergeCredential` 是唯一的凭据签发口。多个节点并发自举时互相轮换、互相作废，join 永远失败；客户必须串行化 join 或带外分发同一个 token。 | 高 | example 采用编排器串行 join；建议提供"签发不轮换"的查询或多次有效的凭据选项 |
 | 3 | **监听器服务过期 join hint（库缺陷，本战役已修）**：accept 循环在阻塞等待连接前计算 hint 快照，期间凭据轮换不被反映；joiner 校验 hint 与凭据世代不一致即拒。症状：轮换后第一次 join 必败，且"每次重试重新取 token"会让失败永久化。修复：hint 改为每连接在 TCP accept 后、写升级响应前评估（`TransportListener::accept` 收 hint 回调，crate 内部 trait，不涉公开 API）。 | 高（已修） | commit 本次 |
-| 4 | **重启实例不自动回连**：持久化存储里有全部成员描述符与信任绑定，但恢复控制器只处理"有会话节点间的分区"——零会话的孤立重启节点不会拨号已知成员，必须操作员再次 `POST /join`。 | 中 | 已记录；改进方向：恢复控制器考虑拨号持久化描述符中的已知成员 |
+| 4 | **重启实例不自动回连**：持久化存储里有全部成员描述符与信任绑定，但恢复控制器只处理“有会话节点间的分区”——零会话的孤立重启节点不会拨号已知成员，必须操作员再次 `POST /join`。 | 中（已修） | 已修：recovery 首个 tick 从持久化证据（信任绑定后的已发布描述符，排除自身/removed/left/cleaned/主动断开）一次性补水 known-online 集，重启节点无操作员干预被动回连；json/redb 重启集成测试钉住 |
 | 5 | **json 存储适配器为 test-only**：默认 feature 是 json，但生产路径必须启用 redb feature 并用 `adapters::redb_store`。默认 feature 与生产推荐的错位容易踩坑。 | 低 | 文档已明确；建议反转默认 feature 或在文档头部加粗提示 |
 | 6 | **资源名是域限定标签语法**：`ResourceName` 形如 `demo.org/resources/kv1`（域/类别/名），简单键值用户会尝试 `kv1` 被拒。 | 低 | 设计使然（全局命名空间防冲突）；可在文档给常见名字模板 |
 | 7 | **无环境/配置辅助**：端点构建、数据目录、peer 列表全靠客户代码。 | 低 | 库的合理边界；列出仅为完整 |
