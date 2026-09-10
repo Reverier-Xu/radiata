@@ -121,7 +121,7 @@ async fn listen(
   let task = tokio::spawn(async move {
     let (tcp, _) = listener.accept().await.unwrap();
     let hint = if with_hint {
-      driver.merge_hint().await.unwrap()
+      driver.merge_hint().unwrap()
     } else {
       None
     };

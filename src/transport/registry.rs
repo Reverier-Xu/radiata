@@ -20,17 +20,14 @@ pub(crate) trait TransportListener: fmt::Debug + Send + Sync + 'static {
   /// The real bound endpoint (port zero resolves to the OS-assigned port).
   fn local_endpoint(&self) -> Endpoint;
 
-  /// The listener certificate's leaf SPKI, served in the join hint so
-  /// member reconnects can pin the peer's TLS leaf.
-  fn leaf_spki(&self) -> Option<Vec<u8>> {
-    None
-  }
-
   /// Accepts the next inbound session stream, completing the TLS and
-  /// prelude upgrade. `hint` is the listener-side credential-generation
-  /// evidence served to joining peers.
+  /// prelude upgrade. `hint` is evaluated per accepted connection, right
+  /// before the upgrade response is written, so the served credential
+  /// generation is always the issuer's current one: a rotation that lands
+  /// while the listener waits for a connection must never serve a stale
+  /// generation to the next joiner.
   fn accept<'a>(
-    &'a self, hint: Option<&'a MergeHint>,
+    &'a self, hint: &'a (dyn Fn() -> Option<MergeHint> + Send + Sync),
   ) -> BoxFuture<'a, Result<super::connection::Connection>>;
 
   /// Closes the listener and releases its bound address.
@@ -246,12 +243,8 @@ impl TransportListener for WssListener {
     self.bound.clone()
   }
 
-  fn leaf_spki(&self) -> Option<Vec<u8>> {
-    self.leaf.clone()
-  }
-
   fn accept<'a>(
-    &'a self, hint: Option<&'a MergeHint>,
+    &'a self, hint: &'a (dyn Fn() -> Option<MergeHint> + Send + Sync),
   ) -> BoxFuture<'a, Result<super::connection::Connection>> {
     let config = std::sync::Arc::clone(&self.config);
     let rules = self.rules;
@@ -272,7 +265,17 @@ impl TransportListener for WssListener {
           return Err(Error::shutting_down("transport listener"));
         }
       };
-      super::connection::Connection::accept(tcp, config, rules, hint).await
+      // The hint is evaluated after the kernel accept: the served
+      // generation is the issuer's current one, not a snapshot from when
+      // the listener started blocking. The listener's leaf SPKI is
+      // attached here so reconnect pinning travels with the hint.
+      let mut hint = hint();
+      if let Some(hint) = hint.as_mut()
+        && let Some(spki) = self.leaf.clone()
+      {
+        *hint = hint.clone().with_leaf_spki(spki);
+      }
+      super::connection::Connection::accept(tcp, config, rules, hint.as_ref()).await
     })
   }
 
@@ -413,7 +416,7 @@ mod tests {
     // does not need (the client config carries no pinning here).
     let (client, accepted) = tokio::join!(
       transport.connect(bound, super::super::tls::merge_client_config().unwrap()),
-      listener.accept(None),
+      listener.accept(&|| None),
     );
     let client = client.unwrap();
     let accepted = accepted.unwrap();
@@ -508,7 +511,7 @@ mod counting_tests {
         bound.clone(),
         super::super::tls::merge_client_config().unwrap()
       ),
-      listener.accept(None),
+      listener.accept(&|| None),
     );
     assert!(client.is_ok());
     assert!(accepted.is_ok());

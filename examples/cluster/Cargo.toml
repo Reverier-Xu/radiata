@@ -1,0 +1,36 @@
+[package]
+name = "radiata-cluster-node"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Lives outside the radiata workspace on purpose: a customer project.
+[workspace]
+
+# A customer-style service built on the radiata library: an HTTP
+# resource getter/setter over a 9-instance sparse cluster. This crate is
+# intentionally OUTSIDE the radiata workspace — a customer project
+# depends on the published/path library and brings its own web stack.
+
+[dependencies]
+radiata = { path = "../..", features = ["redb"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+] }
+axum = { version = "0.8", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = "3"
+futures-util = "0.3"
+getrandom = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true

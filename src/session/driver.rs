@@ -159,7 +159,7 @@ impl SessionDriver {
   /// active credential generation ID. `None` (no active generation, or an
   /// indeterminate metadata store awaiting authoritative reopen) means the
   /// listener publishes no hint and cannot admit mergers.
-  pub(crate) async fn merge_hint(&self) -> Result<Option<MergeHint>> {
+  pub(crate) fn merge_hint(&self) -> Result<Option<MergeHint>> {
     if self.context.store().is_blocked()? {
       tracing::debug!("merge hint withheld: metadata store awaiting reconciliation");
       return Ok(None);
@@ -266,6 +266,7 @@ impl SessionDriver {
             .generation_id()
             .ok_or_else(|| Error::authentication_failed("join credential"))?;
           if peek.generation != Some(active_generation) {
+            tracing::warn!(peek_gen = ?peek.generation, active_gen = ?active_generation, "TEMP-DEBUG generation mismatch");
             return Err(Error::authentication_failed("join credential generation"));
           }
           issuer
