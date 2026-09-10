@@ -9,9 +9,9 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  CleanupNode, ConnectMember, Endpoint, ErrorKind, Listen, MergeCluster, MergeCredential,
-  NodeBuilder, NodeConfig, NodeHandle, NodeId, PageSpec, PageTrust, PurgeRevocation, RevokeNode,
-  RotateMergeCredential, Shutdown, extension::KeyProvider,
+  CleanupNode, ConnectMember, Endpoint, ErrorKind, Listen, MemberStatus, MergeCluster,
+  MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageMembers, PageSpec, PageTrust,
+  PurgeRevocation, RevokeNode, RotateMergeCredential, Shutdown, extension::KeyProvider,
 };
 
 mod common;
@@ -174,6 +174,36 @@ async fn cleanup_converges_and_excludes_the_subject() {
       .unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
   }
+
+  // The member page annotates the cleaned subject instead of leaving it
+  // indistinguishable from a live member: the record is on the observer,
+  // so the page must report Cleaned, never Active.
+  let annotated = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      let status = observer
+        .handle
+        .query(PageMembers::new(PageSpec::first(64).unwrap()))
+        .await
+        .unwrap()
+        .items()
+        .iter()
+        .find(|member| member.node_id() == &subject_id)
+        .map(|member| member.status());
+      if status == Some(MemberStatus::Cleaned) {
+        break;
+      }
+      assert!(
+        status != Some(MemberStatus::Active),
+        "the cleaned subject is still reported as an active member"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  })
+  .await;
+  assert!(
+    annotated.is_ok(),
+    "the cleaned subject never surfaced as Cleaned on the member page"
+  );
 
   // The issuer refuses the cleaned subject's re-merge even with a fresh
   // credential.

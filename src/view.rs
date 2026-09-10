@@ -355,8 +355,24 @@ pub struct MemberView {
   owner_revision: u64,
   digest: crate::Digest,
   connectivity: ConnectivityStatus,
+  status: MemberStatus,
   endpoints: Vec<Endpoint>,
   labels: crate::LabelSet,
+}
+
+/// The node's membership-removal state as observed from the local
+/// terminal records. A signed leave or cleanup record marks a member as no
+/// longer part of the cluster even though its descriptor remains stored as
+/// verification evidence, so the status — not the page membership — is the
+/// authoritative liveness signal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberStatus {
+  /// No terminal removal record exists for the node.
+  Active,
+  /// The node owns a signed leave record.
+  Left,
+  /// An issuer-signed cleanup record removes the node.
+  Cleaned,
 }
 
 impl MemberView {
@@ -389,6 +405,14 @@ impl MemberView {
     &self.labels
   }
 
+  /// The node's membership-removal state. Left and cleaned members keep
+  /// their descriptor as verification evidence but are no longer cluster
+  /// members; count only [`MemberStatus::Active`] entries when computing
+  /// live membership from a member page.
+  pub fn status(&self) -> MemberStatus {
+    self.status
+  }
+
   pub(crate) fn new(
     node_id: NodeId, public_key: PublicKey, owner_revision: u64, digest: crate::Digest,
     connectivity: ConnectivityStatus, endpoints: Vec<Endpoint>, labels: crate::LabelSet,
@@ -399,9 +423,17 @@ impl MemberView {
       owner_revision,
       digest,
       connectivity,
+      status: MemberStatus::Active,
       endpoints,
       labels,
     }
+  }
+
+  /// Annotates the view with the node's removal state; the observation
+  /// layer derives it from the terminal-record stores.
+  pub(crate) fn with_status(mut self, status: MemberStatus) -> Self {
+    self.status = status;
+    self
   }
 }
 

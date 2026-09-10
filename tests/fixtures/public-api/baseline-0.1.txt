@@ -80,6 +80,10 @@ pub radiata::KeyCreateState::Unknown
 pub radiata::KeyDeleteState::Absent
 pub radiata::KeyDeleteState::Present
 pub radiata::KeyDeleteState::Unknown
+pub enum radiata::MemberStatus
+pub radiata::MemberStatus::Active
+pub radiata::MemberStatus::Cleaned
+pub radiata::MemberStatus::Left
 #[non_exhaustive] pub enum radiata::NodeStatus
 pub radiata::NodeStatus::Failed
 pub radiata::NodeStatus::Running
@@ -450,6 +454,7 @@ pub fn radiata::MemberView::labels(&self) -> &radiata::LabelSet
 pub fn radiata::MemberView::node_id(&self) -> &radiata::NodeId
 pub fn radiata::MemberView::owner_revision(&self) -> u64
 pub fn radiata::MemberView::public_key(&self) -> &radiata::PublicKey
+pub fn radiata::MemberView::status(&self) -> radiata::MemberStatus
 pub struct radiata::MergeCluster
 impl radiata::MergeCluster
 pub fn radiata::MergeCluster::new(radiata::Endpoint, radiata::MergeCredential) -> Self

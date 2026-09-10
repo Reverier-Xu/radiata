@@ -36,14 +36,23 @@ impl Supervisor {
     else {
       return Ok(None);
     };
-    Ok(Some(crate::membership::member_view(
-      &descriptor,
-      if connected {
-        crate::ConnectivityStatus::Connected
-      } else {
-        crate::ConnectivityStatus::Reachable
-      },
-    )?))
+    let context = self.context()?;
+    let store = context.store();
+    let status = if crate::identity::cleanup::is_cleaned_ctx(store, &node).await? {
+      crate::MemberStatus::Cleaned
+    } else if crate::identity::leave::is_left_ctx(store, &node).await? {
+      crate::MemberStatus::Left
+    } else {
+      crate::MemberStatus::Active
+    };
+    let connectivity = if connected {
+      crate::ConnectivityStatus::Connected
+    } else {
+      crate::ConnectivityStatus::Reachable
+    };
+    Ok(Some(
+      crate::membership::member_view(&descriptor, connectivity)?.with_status(status),
+    ))
   }
   /// Pages the signed descriptors, annotating connectivity from the
   /// session table.
@@ -65,7 +74,15 @@ impl Supervisor {
     let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
       crate::membership::NODE_DESCRIPTOR_NAMESPACE,
     )?);
-    let snapshot = self.context()?.store().snapshot().await?;
+    // The removal state comes from the terminal-record stores, collected
+    // once per page: the descriptor store deliberately retains left and
+    // cleaned members as verification evidence, so the page annotates
+    // their status instead of filtering them.
+    let context = self.context()?;
+    let store = context.store();
+    let cleaned = crate::identity::cleanup::cleaned_nodes_ctx(store).await?;
+    let left = crate::identity::leave::left_nodes_ctx(store).await?;
+    let snapshot = store.snapshot().await?;
     let paged = crate::paging::scan_paged(
       snapshot.as_ref(),
       &namespace,
@@ -74,15 +91,20 @@ impl Supervisor {
       limit,
       |_key, bytes| {
         let descriptor = crate::membership::page::decode_descriptor(bytes)?;
-        crate::membership::member_view(
-          &descriptor,
-          if connected.contains(descriptor.node()) {
-            crate::ConnectivityStatus::Connected
-          } else {
-            crate::ConnectivityStatus::Reachable
-          },
-        )
-        .map(Some)
+        let status = if cleaned.contains(descriptor.node()) {
+          crate::MemberStatus::Cleaned
+        } else if left.contains(descriptor.node()) {
+          crate::MemberStatus::Left
+        } else {
+          crate::MemberStatus::Active
+        };
+        let connectivity = if connected.contains(descriptor.node()) {
+          crate::ConnectivityStatus::Connected
+        } else {
+          crate::ConnectivityStatus::Reachable
+        };
+        crate::membership::member_view(&descriptor, connectivity)
+          .map(|view| Some(view.with_status(status)))
       },
     )
     .await?;
