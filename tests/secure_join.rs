@@ -1715,18 +1715,28 @@ async fn secure_join_sixteen_node_membership_merges_and_views() {
   }
 
   // The issuer's topology view exposes all fifteen authenticated edges.
-  let topology = issuer
-    .handle
-    .query(PageTopology::new(PageSpec::first(64).unwrap()))
-    .await
-    .unwrap();
-  assert_eq!(
-    topology
+  // The fifteenth member's descriptor reaches the issuer through the
+  // sync plane, so under load the edge count can lag the last merge by
+  // a tick; poll instead of asserting a single snapshot.
+  let topology_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+  let connected_edges = loop {
+    let topology = issuer
+      .handle
+      .query(PageTopology::new(PageSpec::first(64).unwrap()))
+      .await
+      .unwrap();
+    let connected = topology
       .items()
       .iter()
       .filter(|edge| edge.connected())
-      .count(),
-    15,
+      .count();
+    if connected == 15 || std::time::Instant::now() > topology_deadline {
+      break connected;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+  };
+  assert_eq!(
+    connected_edges, 15,
     "all fifteen members hold an authenticated session"
   );
 
