@@ -545,7 +545,11 @@ async fn redb_leave_restart_shows_only_the_replacement() {
 /// the node dials its known members without operator action (finding
 /// #4). No listener is opened on the restarted node — the healing is
 /// entirely its own outbound dial.
-#[cfg(feature = "json")]
+/// The json adapter refuses os-crash-durable requirements on non-unix
+/// platforms by design (no directory-barrier evidence), so the json
+/// variant of the restart probe is unix-only; windows is covered by the
+/// redb variant below.
+#[cfg(all(feature = "json", unix))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn json_restarted_node_passively_reconnects() {
   {
