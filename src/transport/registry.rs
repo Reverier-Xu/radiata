@@ -425,30 +425,37 @@ mod tests {
 
   // ---- Authenticated transport results ----
 
-  /// A named listen endpoint binds the wildcard socket of the resolved
-  /// family (the name re-resolves as the machine moves networks) while
-  /// staying dialable on the loopback interface; a literal-IP endpoint
-  /// keeps binding exactly that address.
+  /// A named listen endpoint binds the wildcard socket (the name
+  /// re-resolves as the machine moves networks) while staying dialable;
+  /// a literal-IP endpoint keeps binding exactly that address. An
+  /// unresolvable name exercises the name branch deterministically: no
+  /// platform-specific resolution order, no address-family surprise —
+  /// and the dial targets the loopback literal, never the wildcard
+  /// address itself (connecting to the unspecified address is a Linux
+  /// quirk; Windows refuses it outright, which would hang a join! on
+  /// the never-completing accept).
   #[tokio::test]
   async fn named_endpoints_bind_the_wildcard_and_stay_dialable() {
     let transport = WssTransport::new();
     let listener = transport
-      .bind(Endpoint::parse("wss://localhost:0").unwrap())
+      .bind(Endpoint::parse("wss://ghost.invalid:0").unwrap())
       .await
       .unwrap();
     let bound = listener.local_endpoint();
-    assert!(
-      bound.host() == "0.0.0.0" || bound.host() == "::",
-      "named endpoints bind the family wildcard, got {}",
-      bound.host()
-    );
+    assert_eq!(bound.host(), "0.0.0.0");
     assert_ne!(bound.port(), 0);
 
-    // The wildcard listener still accepts a loopback dial.
-    let (client, accepted) = tokio::join!(
-      transport.connect(bound, super::super::tls::merge_client_config().unwrap()),
-      listener.accept(&|| None),
-    );
+    // Dial the loopback literal of the bound port, wrapped in a timeout:
+    // any regression here must fail fast, never hang the ci lane.
+    let dial = Endpoint::parse(&format!("wss://127.0.0.1:{}", bound.port())).unwrap();
+    let (client, accepted) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+      tokio::join!(
+        transport.connect(dial, super::super::tls::merge_client_config().unwrap()),
+        listener.accept(&|| None),
+      )
+    })
+    .await
+    .expect("the wildcard listener dial timed out");
     assert!(client.is_ok());
     assert!(accepted.is_ok());
 
