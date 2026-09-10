@@ -15,7 +15,7 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::page::{ResourcePage, sync as page_sync};
 use crate::{
-  Error, IncomingStream, ProtocolTag, Result,
+  Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::BoxFuture,
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::lifecycle::LocalIdentityContext,
@@ -123,90 +123,315 @@ pub(crate) fn resource_sync_protocol_definition() -> Result<ProtocolDefinition> 
   ))
 }
 
-/// The resource-sync driver's per-node continuation state.
-#[derive(Default)]
-pub(crate) struct ResourceSyncCursor {
-  /// Raw-bytes fingerprint of the next page range, so an unchanged
-  /// catalog costs no decode, encode, or per-peer delivery at all.
-  pub(crate) page_fingerprint: u64,
-  /// Fingerprint of the alive-peer set: a newly connected peer must
-  /// receive the current page immediately, changed set or not.
-  pub(crate) peers_fingerprint: u64,
-  /// Ticks since the last page send: a lost delivery must be retried on a
-  /// slow cadence even when nothing changed.
-  pub(crate) ticks_since_page_send: u32,
-  /// The last resource page cursor, so record sync continues across ticks
-  /// and converges beyond a single page.
-  pub(crate) page: Option<Vec<u8>>,
+/// The resource-sync driver's per-peer continuation state, tracked
+/// separately for every alive peer: a peer that was unreachable during a
+/// round keeps its own cursor behind, so the very next round after its
+/// session returns re-delivers everything it missed. Per-peer cursors
+/// also mean a newly connected peer receives the full catalog on its
+/// first tick without any global state churn.
+#[derive(Debug, Default)]
+pub(crate) struct ResourceSyncCursors {
+  peers: std::collections::BTreeMap<NodeId, PeerCursorState>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PeerCursorState {
+  /// Raw-bytes fingerprint of this peer's next page range, so an
+  /// unchanged catalog costs no decode, encode, or delivery at all.
+  page_fingerprint: u64,
+  /// Ticks since this peer's last page send: a lost delivery must be
+  /// retried on a slow cadence even when nothing changed.
+  ticks_since_page_send: u32,
+  /// Page rounds sent since this peer's last full from-scratch pass:
+  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
+  /// into a dying session) can stay missing.
+  rounds_since_full: u32,
+  /// This peer's page continuation cursor.
+  page: Option<Vec<u8>>,
 }
 
 /// Page deliveries are retried on this slower cadence for lost-delivery
 /// healing even when nothing changed.
+/// Page deliveries are retried on this slower cadence for lost-delivery
+/// healing even when nothing changed.
 const RESOURCE_PAGE_RESEND_TICKS: u32 = 32;
 
-/// One resource anti-entropy step: page the local register from the
-/// cursor and push the bounded page over every authenticated session.
-/// The work per tick is bounded to one page per session, nothing paged to
-/// exhaustion. A second completed pass transfers no authoritative changes:
-/// unchanged fingerprints cost no sends at all.
+/// Page rounds between full from-scratch catch-up passes per peer: bounds
+/// how long a payload lost mid-flight (fire-and-forget delivery into a
+/// dying session) can stay missing for a peer whose cursor already moved
+/// past the lost records. Rounds, not ticks: quiet peers do not count.
+const RESOURCE_FULL_SYNC_ROUNDS: u32 = 128;
+
+/// One resource anti-entropy step: for every alive peer, page the local
+/// register from that peer's own cursor and push the bounded page over
+/// the peer's session. Per-peer cursors mean a peer that was unreachable
+/// during a round is caught up in full when its session returns, and a
+/// periodic from-scratch pass bounds how long a payload lost mid-flight
+/// can stay missing. Steady state with an unchanged catalog sends nothing
+/// (the per-peer fingerprint matches), and everything is idempotent on
+/// the receiver (digest-checked application).
 pub(crate) async fn resource_sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn crate::api::Entropy>,
-  sessions: &SessionTable, runtime: &RuntimeClient, cursor: &mut ResourceSyncCursor,
+  sessions: &SessionTable, runtime: &RuntimeClient, cursors: &mut ResourceSyncCursors,
 ) -> Result<()> {
   let store = context.store();
   let peers = crate::sync_common::alive_peers(sessions)?;
   if peers.is_empty() {
+    // Nothing can be delivered with no live sessions. Dropping the
+    // per-peer state means a returning peer is caught up in full —
+    // including everything written while it was unreachable — on its
+    // first tick back.
+    cursors.peers.clear();
     return Ok(());
   }
+  cursors.peers.retain(|peer, _| peers.contains(peer));
   let protocol = ProtocolTag::parse(RESOURCE_SYNC_PROTOCOL)?;
-  let peers_fp = crate::sync_common::peers_fingerprint(&peers);
-  // A paged anti-entropy round advances the cursor only while it is
-  // sending; a steady state with an unchanged first page never turns the
-  // cursor, so the page content cannot change between ticks and the
-  // quiet state costs no sends at all.
-  let starting_round = cursor.page.is_none();
-  // The raw-bytes fingerprint of the next page range: the quiet state
-  // pays one scan and one hash and skips the emit entirely, so nothing
-  // decodes a record (no re-encode, no digest) until the page actually
-  // sends.
-  let page_fp = page_sync::page_fingerprint_ctx(
-    store,
-    cursor.page.as_deref(),
-    super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
-  )
-  .await?;
-  // A round starts when the first page's content or the alive-peer set
-  // changed, and is retried on a slow cadence otherwise; mid-round pages
-  // always send as the continuation of an already-started round.
-  let due = if starting_round {
-    let due = page_fp != cursor.page_fingerprint
-      || peers_fp != cursor.peers_fingerprint
-      || cursor.ticks_since_page_send >= RESOURCE_PAGE_RESEND_TICKS;
-    cursor.page_fingerprint = page_fp;
-    due
-  } else {
-    true
-  };
-  cursor.peers_fingerprint = peers_fp;
-  if !due && starting_round {
-    cursor.ticks_since_page_send = cursor.ticks_since_page_send.saturating_add(1);
-    return Ok(());
-  }
-  cursor.ticks_since_page_send = 0;
-  let page = page_sync::emit_page_ctx(
-    store,
-    cursor.page.as_deref(),
-    super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
-  )
-  .await?;
-  tracing::debug!(count = page.records().len(), "resource sync page emitted");
-  if due || !starting_round {
-    cursor.page = page.cursor().map(|value| value.to_vec());
-  }
-  let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
   for peer in &peers {
-    let _ =
-      crate::sync_common::send_payload(runtime, entropy, peer, &protocol, &payload_bytes).await;
+    let state = cursors.peers.entry(peer.clone()).or_default();
+    resource_sync_tick_peer(store, entropy, runtime, peer, state, &protocol).await?;
   }
   Ok(())
+}
+
+/// One resource anti-entropy round toward a single peer, from that
+/// peer's own cursor: the quiet state sends nothing, a changed catalog
+/// sends the next bounded page, and a periodic from-scratch pass
+/// re-delivers the whole catalog so a payload lost mid-flight is bounded
+/// to one full-sync window.
+async fn resource_sync_tick_peer(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn crate::api::Entropy>,
+  runtime: &RuntimeClient, peer: &NodeId, state: &mut PeerCursorState, protocol: &ProtocolTag,
+) -> Result<()> {
+  let starting_round = state.page.is_none();
+  // This peer's next page range fingerprint: the quiet state pays one
+  // scan and one hash and skips the emit entirely.
+  let page_fp = page_sync::page_fingerprint_ctx(
+    store,
+    state.page.as_deref(),
+    super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
+  )
+  .await?;
+  let quiet = starting_round
+    && page_fp == state.page_fingerprint
+    && state.ticks_since_page_send < RESOURCE_PAGE_RESEND_TICKS
+    && state.rounds_since_full < RESOURCE_FULL_SYNC_ROUNDS;
+  if quiet {
+    state.ticks_since_page_send = state.ticks_since_page_send.saturating_add(1);
+    state.rounds_since_full = state.rounds_since_full.saturating_add(1);
+    return Ok(());
+  }
+  // A periodic from-scratch pass re-delivers the whole catalog to this
+  // peer, bounding mid-flight payload loss to one full-sync window.
+  if state.rounds_since_full >= RESOURCE_FULL_SYNC_ROUNDS {
+    state.page = None;
+    state.rounds_since_full = 0;
+  }
+  state.page_fingerprint = page_fp;
+  state.ticks_since_page_send = 0;
+  state.rounds_since_full = state.rounds_since_full.saturating_add(1);
+  let page = page_sync::emit_page_ctx(
+    store,
+    state.page.as_deref(),
+    super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
+  )
+  .await?;
+  tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
+  state.page = page.cursor().map(|value| value.to_vec());
+  let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
+  let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes).await;
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use ed25519_dalek::SigningKey;
+  use futures_util::StreamExt as _;
+
+  use super::{ResourceSyncCursors, ResourceSyncPayload, resource_sync_tick_peer};
+  use crate::{
+    LabelValue, NodeId,
+    api::SystemEntropy,
+    resource::page::ResourcePage,
+    runtime::RuntimeClient,
+    session::stream::{self, SessionTable},
+  };
+
+  fn node(seed: u64) -> NodeId {
+    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+  }
+
+  fn record(name: &str, timestamp: u64) -> crate::resource::ResourceRecordV1 {
+    crate::resource::ResourceRecordV1::sign(
+      crate::ResourceName::parse(name).unwrap(),
+      LabelValue::parse("document").unwrap(),
+      crate::ResourceUri::parse(&format!("u://{name}")).unwrap(),
+      crate::LabelSet::new(),
+      timestamp,
+      node(1),
+      0,
+      false,
+      &SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap()
+  }
+
+  async fn open_store() -> Arc<crate::storage::MetadataStore> {
+    let factory: Arc<dyn crate::provider::StorageFactory> =
+      Arc::new(crate::storage::contract::ReferenceFactory::new(
+        crate::storage::contract::required_capabilities(),
+      ));
+    Arc::new(
+      crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
+        .await
+        .unwrap(),
+    )
+  }
+
+  /// Stores one trusted writer descriptor, so the sync lane can verify
+  /// the seeded records' signatures.
+  async fn trust(store: &crate::storage::MetadataStore, node: &NodeId, seed: [u8; 32]) {
+    let key =
+      crate::PublicKey::from_bytes(SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      node.clone(),
+      key,
+      vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()],
+      1,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(store, &SystemEntropy, &descriptor)
+      .await
+      .unwrap();
+  }
+
+  fn harness() -> (
+    RuntimeClient,
+    ResourceSyncCursors,
+    SessionTable,
+    tokio::sync::mpsc::Receiver<crate::packet::OutboundRequest>,
+  ) {
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(64);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = RuntimeClient::routing_only(packet_tx, routes);
+    (runtime, ResourceSyncCursors::default(), sessions, packet_rx)
+  }
+
+  fn seed_peer_session(sessions: &SessionTable, entropy: &Arc<dyn crate::api::Entropy>) {
+    let (entry, _rx) = stream::test_entry(entropy.as_ref());
+    sessions.lock().unwrap().insert(node(2), entry);
+  }
+
+  async fn payload_names(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::packet::OutboundRequest>,
+  ) -> Vec<String> {
+    let mut request = rx.recv().await.expect("dispatched payload");
+    let mut bytes = Vec::new();
+    while let Some(chunk) = request.body.as_mut().next().await {
+      bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let payload = ResourceSyncPayload::decode(&bytes).unwrap();
+    payload
+      .page()
+      .unwrap()
+      .records()
+      .iter()
+      .map(|record| record.name().as_str().to_owned())
+      .collect()
+  }
+
+  /// The gap-write convergence contract: a peer whose session drops and
+  /// returns must receive every record written while it was gone on its
+  /// first post-return round, and a steady unchanged catalog dispatches
+  /// nothing at all.
+  #[tokio::test]
+  async fn a_peer_that_missed_a_round_receives_gap_writes_on_the_next_full_pass() {
+    let store = open_store().await;
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
+    let peer = node(2);
+    trust(&store, &node(1), [9; 32]).await;
+    let (runtime, mut cursors, sessions, mut rx) = harness();
+
+    // Converge one late-key record to the peer first.
+    crate::resource::page::sync::apply_page_ctx(
+      &store,
+      entropy.as_ref(),
+      &ResourcePage::new(vec![record("demo.org/resources/z-late", 1_000)], None).unwrap(),
+    )
+    .await
+    .unwrap();
+    seed_peer_session(&sessions, &entropy);
+    {
+      let state = cursors.peers.entry(peer.clone()).or_default();
+      resource_sync_tick_peer(
+        store.as_ref(),
+        &entropy,
+        &runtime,
+        &peer,
+        state,
+        &crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap(),
+      )
+      .await
+      .unwrap();
+    }
+    let names = payload_names(&mut rx).await;
+    assert_eq!(names, vec!["demo.org/resources/z-late".to_owned()]);
+
+    // The peer's session drops; an early-key record is written while it
+    // is gone; the session returns. The per-peer state was dropped with
+    // the session, so the returning round re-delivers from scratch and
+    // the gap write reaches the peer (finding #10 fixed).
+    sessions.lock().unwrap().remove(&peer);
+    crate::resource::page::sync::apply_page_ctx(
+      &store,
+      entropy.as_ref(),
+      &ResourcePage::new(vec![record("demo.org/resources/a-gap", 2_000)], None).unwrap(),
+    )
+    .await
+    .unwrap();
+    seed_peer_session(&sessions, &entropy);
+    {
+      let state = cursors.peers.entry(peer.clone()).or_default();
+      resource_sync_tick_peer(
+        store.as_ref(),
+        &entropy,
+        &runtime,
+        &peer,
+        state,
+        &crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap(),
+      )
+      .await
+      .unwrap();
+    }
+    let names = payload_names(&mut rx).await;
+    assert!(
+      names.contains(&"demo.org/resources/a-gap".to_owned()),
+      "the gap write must reach the returning peer: {names:?}"
+    );
+
+    // A steady unchanged catalog dispatches nothing at all.
+    let quiet_before = rx.len();
+    {
+      let state = cursors.peers.entry(peer.clone()).or_default();
+      resource_sync_tick_peer(
+        store.as_ref(),
+        &entropy,
+        &runtime,
+        &peer,
+        state,
+        &crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap(),
+      )
+      .await
+      .unwrap();
+    }
+    assert!(
+      rx.try_recv().is_err(),
+      "a steady catalog must not dispatch anything"
+    );
+    let _ = quiet_before;
+  }
 }
