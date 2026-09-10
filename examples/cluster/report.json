@@ -1,17 +1,17 @@
 {
   "writes": 30,
-  "converge_p50_ms": 1.6539940169896,
-  "converge_p90_ms": 16.928616849996615,
-  "converge_p99_ms": 17.072814302984625,
-  "converge_max_ms": 17.072814302984625,
-  "local_get_p50_ms": 0.48298397450707853,
-  "stream_probe_p50_ms": 0.201,
+  "converge_p50_ms": 1302.1608449926134,
+  "converge_p90_ms": 16915.738528012298,
+  "converge_p99_ms": 17227.5586570031,
+  "converge_max_ms": 17227.5586570031,
+  "local_get_p50_ms": 0.4664110019803047,
+  "stream_probe_p50_ms": 0.181,
   "stream_probe_ok": 30,
-  "crash_recovery_s": 1.9145059580041561,
+  "crash_recovery_s": 1.3194603849842679,
   "observability": {
     "1": {
       "members": 9,
-      "sessions": 5,
+      "sessions": 8,
       "store_available": 1,
       "trace_records_dropped": 0
     },
@@ -23,7 +23,7 @@
     },
     "3": {
       "members": 9,
-      "sessions": 3,
+      "sessions": 4,
       "store_available": 1,
       "trace_records_dropped": 0
     },
@@ -35,13 +35,13 @@
     },
     "5": {
       "members": 9,
-      "sessions": 1,
+      "sessions": 2,
       "store_available": 1,
       "trace_records_dropped": 0
     },
     "6": {
       "members": 9,
-      "sessions": 3,
+      "sessions": 4,
       "store_available": 1,
       "trace_records_dropped": 0
     },
@@ -53,7 +53,7 @@
     },
     "8": {
       "members": 9,
-      "sessions": 2,
+      "sessions": 4,
       "store_available": 1,
       "trace_records_dropped": 0
     },
