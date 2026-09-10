@@ -1,0 +1,30 @@
+# 客户集成摩擦点记录（9 实例集群 example）
+
+> 以"不了解 radiata 内部实现的客户"视角，用纯公共 API 搭建 9 实例集群 +
+> HTTP resource getter/setter 的全过程记录。凡必须绕过/深入内部才能完成
+> 的事项均入档评估。
+
+## 发现清单
+
+| # | 摩擦点 | 严重度 | 状态 |
+| --- | --- | --- | --- |
+| 1 | **没有生产级 KeyProvider**：客户必须自行实现带崩溃恢复语义的密钥生命周期（`create_ed25519`/`reconcile_create`/`delete`/`reconcile_delete`，`KeyCreateState::{Present,Absent,Unknown}` 三态）。库内只有测试用的 ScriptedKeys。实现一个幂等的文件版 provider 是接入中最难的一步，且做错恢复语义的后果（身份丢失/重复）不易察觉。 | 高 | 已在 example 中提供 FileKeyProvider 参考实现；建议库内提供生产参考实现或深入文档 |
+| 2 | **凭据轮换使已发凭据立即失效，且无只读查询当前凭据的 API**：`RotateMergeCredential` 是唯一的凭据签发口。多个节点并发自举时互相轮换、互相作废，join 永远失败；客户必须串行化 join 或带外分发同一个 token。 | 高 | example 采用编排器串行 join；建议提供"签发不轮换"的查询或多次有效的凭据选项 |
+| 3 | **监听器服务过期 join hint（库缺陷，本战役已修）**：accept 循环在阻塞等待连接前计算 hint 快照，期间凭据轮换不被反映；joiner 校验 hint 与凭据世代不一致即拒。症状：轮换后第一次 join 必败，且"每次重试重新取 token"会让失败永久化。修复：hint 改为每连接在 TCP accept 后、写升级响应前评估（`TransportListener::accept` 收 hint 回调，crate 内部 trait，不涉公开 API）。 | 高（已修） | commit 本次 |
+| 4 | **重启实例不自动回连**：持久化存储里有全部成员描述符与信任绑定，但恢复控制器只处理"有会话节点间的分区"——零会话的孤立重启节点不会拨号已知成员，必须操作员再次 `POST /join`。 | 中 | 已记录；改进方向：恢复控制器考虑拨号持久化描述符中的已知成员 |
+| 5 | **json 存储适配器为 test-only**：默认 feature 是 json，但生产路径必须启用 redb feature 并用 `adapters::redb_store`。默认 feature 与生产推荐的错位容易踩坑。 | 低 | 文档已明确；建议反转默认 feature 或在文档头部加粗提示 |
+| 6 | **资源名是域限定标签语法**：`ResourceName` 形如 `demo.org/resources/kv1`（域/类别/名），简单键值用户会尝试 `kv1` 被拒。 | 低 | 设计使然（全局命名空间防冲突）；可在文档给常见名字模板 |
+| 7 | **无环境/配置辅助**：端点构建、数据目录、peer 列表全靠客户代码。 | 低 | 库的合理边界；列出仅为完整 |
+| 8 | **`DisconnectPeer` 拆会话不分"谁拨的"**：交叉拨号收敛为单一会话后，任一侧 disconnect 都会拆除整条会话——编排器拆自举星腿时必须小心不要拆掉成型图的边。 | 低 | 行为合理；编排脚本已按成型图保留边 |
+
+## 正面结论
+
+- **全程未 hack 任何 radiata 内部**：join、组网、资源读写、观测全部通过公共门面（NodeHandle 命令/查询 + PacketConsumer + KeyProvider + StorageFactory 扩展点）完成。唯一的库缺陷（#3）以库修复落地，而非 example 绕过。
+- 公共观测面（`GetObservability`/`PageMembers`/`PageSessions`/`GetNodeStatus`）足以支撑外部绞手完成正确性、可用性、拓扑形状验证，无需内部插桩。
+- 扩展点（PacketConsumer + 自定义 protocol tag）让数据面健康探针成为一行注册。
+
+## 遗留改进建议（按价值）
+
+1. 生产参考 KeyProvider（文件/密钥环）入库或作为独立 crate。
+2. join 凭据的"只读查询 + 多次有效"选项，消除串行 join 约束。
+3. 恢复控制器对"零会话但持久化描述符非空"的孤立实例触发重连。

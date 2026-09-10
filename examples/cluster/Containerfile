@@ -1,0 +1,20 @@
+# Multi-stage build for the radiata cluster demo node.
+# Build from the repository root:
+#   podman build -t radiata-cluster-node -f examples/cluster/Containerfile .
+FROM rust:1.98-bookworm AS build
+WORKDIR /build
+COPY . /build
+WORKDIR /build/examples/cluster
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=build /build/examples/cluster/target/release/radiata-cluster-node /usr/local/bin/node
+ENV LISTEN=wss://0.0.0.0:9443
+ENV HTTP_LISTEN=0.0.0.0:8080
+ENV DATA=/data
+VOLUME /data
+EXPOSE 9443 8080
+ENTRYPOINT ["/usr/local/bin/node"]

@@ -828,24 +828,17 @@ impl Supervisor {
     let attachment = bound.clone();
     let abort = tasks.spawn(async move {
       tracing::debug!("accept loop started");
+      // The hint provider is evaluated per accepted connection (after the
+      // kernel accept, before the upgrade response): a credential rotation
+      // during the blocking wait is reflected in the very next join.
+      let hint_provider_driver = driver.clone();
+      let hint_provider = move || hint_provider_driver.merge_hint().ok().flatten();
       // Consecutive failed upgrades: drives the bounded accept backoff,
       // so a persistently failing accept sleeps longer instead of
       // spinning; a success clears it.
       let mut accept_failures: u32 = 0;
       loop {
-        // The join hint is computed per accepted connection so the accept
-        // path stays fast and never stalls on the credential issuer lock;
-        // a hint failure skips this connection only.
-        let mut hint = match driver.merge_hint().await {
-          Ok(Some(hint)) => Some(hint),
-          _ => None,
-        };
-        if let Some(hint) = hint.as_mut()
-          && let Some(spki) = listener.leaf_spki()
-        {
-          *hint = hint.clone().with_leaf_spki(spki);
-        }
-        let accepted = accept_listener.accept(hint.as_ref()).await;
+        let accepted = accept_listener.accept(&hint_provider).await;
         let mut connection = match accepted {
           Ok(connection) => {
             accept_failures = 0;
