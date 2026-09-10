@@ -94,6 +94,22 @@ impl Endpoint {
     &self.canonical[SCHEME.len()..]
   }
 
+  /// The same endpoint advertising a different port. Used to keep the
+  /// caller's advertised host when a named bind resolved a wildcard
+  /// socket: the host re-resolves across network moves, the bound port
+  /// is the only part the caller learns from the OS.
+  pub(crate) fn with_port(&self, port: u16) -> Self {
+    let canonical = match self.canonical.rsplit_once(':') {
+      Some((head, _)) => format!("{head}:{port}"),
+      None => format!("{}:{}", self.canonical, port),
+    };
+    Self {
+      canonical,
+      host: self.host.clone(),
+      port,
+    }
+  }
+
   /// Builds the endpoint for an already-bound socket address, preserving
   /// the exact canonical text form (bracketed IPv6, explicit port). Used
   /// after binding a wildcard/port-zero listener, where the caller only
@@ -224,6 +240,24 @@ fn validate_dns_hostname(host: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::Endpoint;
+
+  /// Swapping the port keeps the advertised host and the canonical text
+  /// form (including IPv6 brackets): the published endpoint of a
+  /// wildcard-bound named listener stays the caller's dialable name.
+  #[test]
+  fn with_port_preserves_host_and_canonical_form() {
+    let endpoint = Endpoint::parse("wss://n5.example:9443").unwrap();
+    let rebound = endpoint.with_port(40123);
+    assert_eq!(rebound.host(), "n5.example");
+    assert_eq!(rebound.port(), 40123);
+    assert_eq!(rebound.as_str(), "wss://n5.example:40123");
+
+    let bracketed = Endpoint::parse("wss://[2001:db8::1]:9443").unwrap();
+    let rebound = bracketed.with_port(5);
+    assert_eq!(rebound.host(), "2001:db8::1");
+    assert_eq!(rebound.port(), 5);
+    assert_eq!(rebound.as_str(), "wss://[2001:db8::1]:5");
+  }
 
   #[test]
   fn tls_transport_endpoint_accepts_canonical_forms() {

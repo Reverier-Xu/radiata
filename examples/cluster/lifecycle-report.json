@@ -22,42 +22,42 @@
       "beta": true
     },
     "n6": {
-      "alpha": true,
+      "alpha": false,
       "beta": true
     },
     "n7": {
-      "alpha": true,
+      "alpha": false,
       "beta": true
     },
     "n8": {
-      "alpha": true,
+      "alpha": false,
       "beta": true
     },
     "n9": {
-      "alpha": true,
+      "alpha": false,
       "beta": true
     }
   },
-  "merged_converge_p50_s": 0.4568646150000859,
-  "merged_converge_p90_s": 0.5433286629850045,
+  "merged_converge_p50_s": 0.34773522400064394,
+  "merged_converge_p90_s": 0.4903423099895008,
   "leave": {
-    "former_identity": "node_Fwgh8LQp91Xq6gL25B3vh",
+    "former_identity": "node_8X4gVkUOhA6wDjIWzI5AE",
     "left": true,
-    "replacement_identity": "node_zWjMSmuZYPDZ0v9Ek7c5j"
+    "replacement_identity": "node_OgKBi8tzlyCyhbiGChEDc"
   },
   "conflict": {
-    "side_a_digest": "181bceafb978286088004f71e7c558d702b221a6123b3d68d236619fb9eb5bbf",
-    "side_b_digest": "b945d13287037992f9ba2810793d1a408eb5b9a0fc02c22e95999710968920df",
+    "side_a_digest": "84381386f1369d300d7d2c24482db21fdc2fa31a55fc37dc2732cd4bf51775e7",
+    "side_b_digest": "2925b763245597c1d007e35ccfe05a0884b3d6a8dd34af7222623efbea99fccc",
     "deterministic_winner": true
   },
-  "heal_seconds": 182.26707331300713,
-  "heal_conflict_winner": "A",
-  "heal_unanimous": false,
+  "heal_seconds": 11.680772574996809,
+  "heal_conflict_winner": "B",
+  "heal_unanimous": true,
   "heal_conflict_distribution": {
-    "side_a": 6,
-    "side_b": 1,
-    "none": 2
+    "side_a": 0,
+    "side_b": 9,
+    "none": 0
   },
   "a_visible_on": 6,
-  "b_visible_on": 1
+  "b_visible_on": 9
 }
