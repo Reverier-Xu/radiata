@@ -900,23 +900,35 @@ impl Supervisor {
       }
     });
     let id = crate::identity::ListenerId::generate(self.dependencies.entropy.as_ref())?;
+    // Publish the caller's advertised endpoint, not the bound socket
+    // address: peers dial the advertised name, which re-resolves across
+    // network moves. A named endpoint binds the wildcard socket (see
+    // WssTransport::bind), whose local address (0.0.0.0) is local
+    // plumbing and undialable from other nodes. Literal-IP endpoints
+    // publish the bound form directly: the requested host is the bound
+    // host, and a wildcard port resolves to the real one.
+    let published = if endpoint.host() == bound.host() {
+      bound
+    } else {
+      endpoint.with_port(bound.port())
+    };
     self.listeners.insert(
       id.clone(),
       (
-        bound.clone(),
+        published.clone(),
         std::sync::Arc::clone(&insert_listener),
         abort,
       ),
     );
-    // Publish the bound endpoint so the next anti-entropy tick pages it in
-    // the local descriptor (recovery dials peers through published
+    // Publish the advertised endpoint so the next anti-entropy tick pages
+    // it in the local descriptor (recovery dials peers through published
     // endpoints).
     if let Ok(mut endpoints) = self.published_endpoints.lock()
-      && !endpoints.contains(&bound)
+      && !endpoints.contains(&published)
     {
-      endpoints.push(bound.clone());
+      endpoints.push(published.clone());
     }
-    Ok(ListenerView::new(id, bound))
+    Ok(ListenerView::new(id, published))
   }
 
   async fn stop_listener(&mut self, listener: &crate::identity::ListenerId) -> Result<()> {

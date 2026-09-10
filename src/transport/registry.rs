@@ -169,7 +169,30 @@ impl WssTransport {
 impl Transport for WssTransport {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
     Box::pin(async move {
-      let tcp = tokio::net::TcpListener::bind((endpoint.host(), endpoint.port()))
+      // A literal-IP endpoint binds exactly that address. A named host is
+      // the advertised attachment point, not a bind constraint: the name
+      // re-resolves as the machine moves networks, so the listener binds
+      // the wildcard of the resolved family and keeps accepting on
+      // whatever address the name points at later. Binding the name's
+      // startup address instead orphans the listener on every address
+      // change and silently cuts the node off from all inbound dials.
+      let port = endpoint.port();
+      let bind_addr: std::net::SocketAddr = match endpoint.host().parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port),
+        Err(_) => {
+          let resolved_ipv6 = tokio::net::lookup_host((endpoint.host(), port))
+            .await
+            .ok()
+            .and_then(|mut addresses| addresses.next())
+            .is_some_and(|address| address.is_ipv6());
+          if resolved_ipv6 {
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port)
+          } else {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+          }
+        }
+      };
+      let tcp = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|_| {
           Error::provider(
@@ -401,6 +424,41 @@ mod tests {
   }
 
   // ---- Authenticated transport results ----
+
+  /// A named listen endpoint binds the wildcard socket of the resolved
+  /// family (the name re-resolves as the machine moves networks) while
+  /// staying dialable on the loopback interface; a literal-IP endpoint
+  /// keeps binding exactly that address.
+  #[tokio::test]
+  async fn named_endpoints_bind_the_wildcard_and_stay_dialable() {
+    let transport = WssTransport::new();
+    let listener = transport
+      .bind(Endpoint::parse("wss://localhost:0").unwrap())
+      .await
+      .unwrap();
+    let bound = listener.local_endpoint();
+    assert!(
+      bound.host() == "0.0.0.0" || bound.host() == "::",
+      "named endpoints bind the family wildcard, got {}",
+      bound.host()
+    );
+    assert_ne!(bound.port(), 0);
+
+    // The wildcard listener still accepts a loopback dial.
+    let (client, accepted) = tokio::join!(
+      transport.connect(bound, super::super::tls::merge_client_config().unwrap()),
+      listener.accept(&|| None),
+    );
+    assert!(client.is_ok());
+    assert!(accepted.is_ok());
+
+    let literal = WssTransport::new();
+    let listener = literal
+      .bind(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+      .await
+      .unwrap();
+    assert_eq!(listener.local_endpoint().host(), "127.0.0.1");
+  }
 
   #[tokio::test]
   async fn wss_transport_connection_carries_a_real_tls_exporter_binding() {
