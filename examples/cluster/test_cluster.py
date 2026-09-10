@@ -223,9 +223,9 @@ def phase_correctness_and_latency() -> dict:
         "stream_probe_ok": len(probe_times),
     }
     print(
-        f"[latency] converge p50 {report['converge_p50_ms'] * 1000:.0f} ms | "
-        f"p90 {report['converge_p90_ms'] * 1000:.0f} ms | p99 {report['converge_p99_ms'] * 1000:.0f} ms | "
-        f"max {report['converge_max_ms'] * 1000:.0f} ms (n={len(convergence)})"
+        f"[latency] converge p50 {report['converge_p50_ms']:.0f} ms | "
+        f"p90 {report['converge_p90_ms']:.0f} ms | p99 {report['converge_p99_ms']:.0f} ms | "
+        f"max {report['converge_max_ms']:.0f} ms (n={len(convergence)})"
     )
     print(f"[latency] local get p50 {report['local_get_p50_ms']:.1f} ms | "
           f"stream probe p50 {report['stream_probe_p50_ms']:.1f} ms ({report['stream_probe_ok']}/30 ok)")

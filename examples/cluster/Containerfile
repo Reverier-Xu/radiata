@@ -9,10 +9,10 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/examples/cluster/target/release/radiata-cluster-node /usr/local/bin/node
-ENV LISTEN=wss://0.0.0.0:9443
+ENV LISTEN=wss://127.0.0.1:9443
 ENV HTTP_LISTEN=0.0.0.0:8080
 ENV DATA=/data
 VOLUME /data

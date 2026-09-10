@@ -9,7 +9,7 @@ mod http;
 mod http_client;
 mod keys;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use radiata::{GetLocalNode, Listen, NodeBuilder, ProtocolDefinition, ProtocolTag};
 use serde_json::json;
@@ -51,7 +51,7 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn load_config() -> Config {
   Config {
-    listen: env_or("LISTEN", "wss://0.0.0.0:9443"),
+    listen: env_or("LISTEN", "wss://127.0.0.1:9443"),
     http_listen: env_or("HTTP_LISTEN", "0.0.0.0:8080"),
     data: PathBuf::from(env_or("DATA", "/data")),
   }
@@ -88,7 +88,15 @@ async fn main() {
     .expect("register probe protocol");
 
   let node = NodeBuilder::new(storage, Arc::new(keys))
-    .config(radiata::NodeConfig::new())
+    .config(
+      radiata::NodeConfig::new()
+        .with_session_liveness(
+          Duration::from_secs(30),
+          Duration::from_secs(5),
+          Duration::from_secs(15),
+        )
+        .expect("liveness policy"),
+    )
     .extensions(extensions)
     .start()
     .await

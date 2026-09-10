@@ -1,0 +1,63 @@
+{
+  "direct_cross_genesis_merge": true,
+  "federation": {
+    "n1": {
+      "alpha": true,
+      "beta": true
+    },
+    "n2": {
+      "alpha": true,
+      "beta": true
+    },
+    "n3": {
+      "alpha": true,
+      "beta": true
+    },
+    "n4": {
+      "alpha": true,
+      "beta": true
+    },
+    "n5": {
+      "alpha": true,
+      "beta": true
+    },
+    "n6": {
+      "alpha": true,
+      "beta": true
+    },
+    "n7": {
+      "alpha": true,
+      "beta": true
+    },
+    "n8": {
+      "alpha": true,
+      "beta": true
+    },
+    "n9": {
+      "alpha": true,
+      "beta": true
+    }
+  },
+  "merged_converge_p50_s": 0.2970472589950077,
+  "merged_converge_p90_s": 0.40661241600173526,
+  "leave": {
+    "former_identity": "node_0gPevuGeIdktp2QR8aGj7",
+    "left": true,
+    "replacement_identity": "node_wzmnBD14ic7bz6IzlnpTX"
+  },
+  "conflict": {
+    "side_a_digest": "6be1f6832b95383f7c58f860c316f20e66f48557934967dd3fed10d6c544e183",
+    "side_b_digest": "1126498826f49c520b7baea8f9c99c7ca3238adeecd54c291f6fe5da2bebf8c5",
+    "deterministic_winner": true
+  },
+  "heal_seconds": 182.41267846300616,
+  "heal_conflict_winner": "A",
+  "heal_unanimous": false,
+  "heal_conflict_distribution": {
+    "side_a": 6,
+    "side_b": 1,
+    "none": 2
+  },
+  "a_visible_on": 6,
+  "b_visible_on": 1
+}

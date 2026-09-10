@@ -10,11 +10,11 @@ use axum::{
   routing::{get, post},
 };
 use radiata::{
-  ConnectMember, GetObservability, GetResource, LabelKey, LabelValue, MemberPage, MergeCluster,
-  MergeCredential, NodeHandle, NodeId, PageMembers, PageResources, PageSessions, PageSpec,
-  ProtocolTag,
-  PutResource, QualifiedTag, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
-  RotateMergeCredential, RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
+  ConnectMember, GetObservability, GetResource, LabelKey, LabelValue, LeaveCluster, MemberPage,
+  MergeCluster, MergeCredential, NodeHandle, NodeId, PageMembers, PageResources, PageSessions,
+  PageSpec, ProtocolTag, PutResource, QualifiedTag, ReplaceIdentityAndDeleteOldCoreMetadata,
+  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RotateMergeCredential, RoutingPolicy,
+  StreamMetadata, StreamPolicy, StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -146,7 +146,6 @@ async fn connect(
 pub struct DisconnectRequest {
   pub node_id: String,
 }
-
 /// Tears down the session to one peer: the topology shaper uses it to
 /// drop the join-phase legs through the bootstrap once the sparse graph
 /// is dialed.
@@ -161,6 +160,25 @@ async fn disconnect(
     .await
     .map_err(|error| (StatusCode::BAD_GATEWAY, Json(json!({"error": error.to_string()}))))?;
   Ok(Json(json!({"disconnected": true})))
+}
+
+/// Leaves the cluster: the node's identity is replaced and the old
+/// identity's local core metadata is wiped (the operator acknowledges
+/// this deliberately). The runtime shuts down after the outcome is
+/// returned; the process stays up only long enough to serve it.
+async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let outcome = state
+    .node
+    .command(LeaveCluster::new(
+      ReplaceIdentityAndDeleteOldCoreMetadata::new(),
+    ))
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error.to_string()}))))?;
+  Ok(Json(json!({
+    "left": true,
+    "former_identity": outcome.former_identity().as_str(),
+    "replacement_identity": outcome.replacement_identity().as_str(),
+  })))
 }
 
 fn version_json(view: &radiata::ResourceView) -> Value {
@@ -321,6 +339,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/join", post(join))
     .route("/connect", post(connect))
     .route("/disconnect", post(disconnect))
+    .route("/leave", post(leave))
     .route("/resources/{*name}", get(get_resource).put(put_resource))
     .route("/resources", get(list_resources))
     .route("/stream-probe", post(stream_probe))

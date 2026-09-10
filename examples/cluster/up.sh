@@ -22,6 +22,7 @@ podman build -t "$IMAGE" -f Containerfile ../..
 echo "starting n1 (bootstrap)..."
 podman run -d --name n1 --hostname n1 --network "$NETWORK" \
   -v "radiata-data-1:/data" \
+  -e "LISTEN=wss://n1:9443" \
   -p "$((BASE_HTTP_PORT + 1)):8080" \
   "$IMAGE"
 
@@ -33,10 +34,14 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
+# Every instance listens on its own DNS name: the listen endpoint is
+# published verbatim in the node descriptor, so peers and the recovery
+# controller can dial it.
 for i in $(seq 2 "$N"); do
-  echo "starting n$i (joins are driven by test_cluster.py, one at a time)..."
+  echo "starting n$i (joins are driven by the test harness, one at a time)..."
   podman run -d --name "n$i" --hostname "n$i" --network "$NETWORK" \
     -v "radiata-data-$i:/data" \
+    -e "LISTEN=wss://n$i:9443" \
     -p "$((BASE_HTTP_PORT + i)):8080" \
     "$IMAGE"
 done
