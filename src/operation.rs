@@ -160,6 +160,27 @@ impl Query for GetNodeStatus {
   type Output = crate::NodeStatus;
 }
 
+/// The recovery plane's current observation: whether every known online
+/// member has an authenticated path, how many members remain
+/// unreachable, and when the next dial round is scheduled. The pull
+/// complement of the transient [`RecoveryChanged`] event.
+pub struct GetRecovery {
+  _private: (),
+}
+
+#[allow(clippy::new_without_default)]
+impl GetRecovery {
+  pub fn new() -> Self {
+    Self { _private: () }
+  }
+}
+
+impl private::Sealed for GetRecovery {}
+
+impl Query for GetRecovery {
+  type Output = crate::RecoveryView;
+}
+
 /// The bounded observability snapshot query: one snapshot of
 /// counters and flags, never an enumeration.
 pub struct GetObservability {

@@ -133,6 +133,18 @@ impl Supervisor {
     for peer in &direct {
       self.recovery_history.insert(peer.clone());
     }
+    // Departed identities (left or cleaned) are no longer cluster
+    // members and are forgotten by the recovery plane: counting one as
+    // pending would keep the controller in Recovering forever — never
+    // quiescent, attempts unbounded — and peg the dial backoff at its
+    // maximum for every future partition, stalling all re-dialing.
+    let context = self.context()?;
+    let store = context.store();
+    let mut excluded = crate::identity::cleanup::cleaned_nodes_ctx(store).await?;
+    excluded.append(&mut crate::identity::leave::left_nodes_ctx(store).await?);
+    for member in &excluded {
+      self.recovery_history.remove(member);
+    }
     let online = self.recovery_history.clone();
     let now = crate::time::now_seconds();
     self.recovery.observe(&online, &direct);
@@ -150,14 +162,10 @@ impl Supervisor {
     // Candidates are unreachable known members with a published endpoint
     // from their signed descriptor; reachability stays distinct from the
     // active topology and recovery never dials strangers.
-    let bindings = crate::identity::trust::store::trusted_bindings(self.context()?.store()).await?;
-    // Left and cleaned nodes are excluded from recovery dialing.
-    let mut excluded = crate::identity::cleanup::cleaned_nodes_ctx(self.context()?.store()).await?;
-    excluded.append(&mut crate::identity::leave::left_nodes_ctx(self.context()?.store()).await?);
-    // One snapshot for the whole cycle: per-member descriptor reads must
-    // not pay one snapshot acquisition each (a 1,024-member recovery tick
-    // would otherwise acquire 1,024 snapshots).
-    let snapshot = self.context()?.store().snapshot().await?;
+    let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
+    // Left and cleaned nodes are excluded from recovery dialing (their
+    // history entries were already forgotten above).
+    let snapshot = store.snapshot().await?;
     let mut candidates = std::collections::BTreeSet::new();
     for member in online.difference(&direct) {
       if self.recovery_excluded.contains(member) || excluded.contains(member) {

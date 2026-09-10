@@ -290,10 +290,12 @@ async fn leave_announces_to_connected_peers_before_rotating() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-      tracing_subscriber::fmt()
+      // Tolerant of another test in this binary initializing the global
+      // subscriber first: only the first initialization wins.
+      let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=trace"))
         .with_test_writer()
-        .init();
+        .try_init();
     });
   }
   let listener_storage = Arc::new(common::MemoryStorageFactory::new(
@@ -386,6 +388,110 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   );
 
   listener.command(Shutdown::new()).await.unwrap();
+}
+
+/// Recovery must treat a departed member as forgotten rather than
+/// permanently unreachable: the surviving peers observe one Recovering
+/// transition when the departed member's session drops, then quiesce
+/// (connected) once the departed identity is pruned from the recovery
+/// plane. A controller stuck in Recovering would grow its attempts
+/// without bound and peg the dial backoff at its maximum for every
+/// future partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_quiesces_after_a_member_departs() {
+  {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+      // Tolerant of the file's other test initializing the global
+      // subscriber first: only the first initialization wins.
+      let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=debug"))
+        .with_test_writer()
+        .try_init();
+    });
+  }
+  let a_storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let b_storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let c_storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let a = NodeBuilder::new(
+    a_storage,
+    Arc::new(LeaveKeys::with_base(300)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let b = NodeBuilder::new(
+    b_storage,
+    Arc::new(LeaveKeys::with_base(400)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let c = NodeBuilder::new(
+    c_storage,
+    Arc::new(LeaveKeys::with_base(500)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let a_endpoint = a
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap()
+    .endpoint()
+    .clone();
+  common::merge_with_retry(&b, &a, a_endpoint.clone()).await;
+  common::merge_with_retry(&c, &a, a_endpoint).await;
+  // Let at least one recovery tick observe the connected c, so the
+  // controller's history genuinely contains the identity that departs
+  // next (otherwise the assertion below races the tick and passes
+  // vacuously).
+  tokio::time::sleep(Duration::from_secs(5)).await;
+
+  c.command(LeaveCluster::new(
+    ReplaceIdentityAndDeleteOldCoreMetadata::new(),
+  ))
+  .await
+  .unwrap();
+
+  // The decisive invariant is the pull view: the departed member must
+  // never appear as unreachable. Across several recovery ticks after
+  // the departure (long enough for the tick that observes the dead
+  // session), the controller must report zero unreachable members —
+  // without the pruning it would hold the departed identity pending
+  // forever, stay Recovering, grow attempts without bound, and peg the
+  // dial backoff at its maximum for every future partition.
+  let quiesced = tokio::time::timeout(Duration::from_secs(30), async {
+    let mut settled = 0_u32;
+    loop {
+      let view = a.query(radiata::GetRecovery::new()).await.unwrap();
+      assert_eq!(
+        view.unreachable_components(),
+        0,
+        "the departed member is pending as unreachable"
+      );
+      settled += 1;
+      if settled >= 6 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+  })
+  .await;
+  assert!(
+    quiesced.is_ok(),
+    "the recovery view was not observable after the departure"
+  );
+
+  a.command(Shutdown::new()).await.unwrap();
+  b.command(Shutdown::new()).await.unwrap();
 }
 
 /// With no connected session the announcement has nobody to
