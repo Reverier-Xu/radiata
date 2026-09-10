@@ -62,17 +62,6 @@ pub(crate) fn alive_peers(sessions: &SessionTable) -> Result<Vec<NodeId>> {
   )
 }
 
-/// A stable order-independent fingerprint of the alive-peer set.
-pub(crate) fn peers_fingerprint(peers: &[NodeId]) -> u64 {
-  use std::hash::{Hash, Hasher};
-  let mut hasher = std::collections::hash_map::DefaultHasher::new();
-  peers.len().hash(&mut hasher);
-  for peer in peers {
-    peer.hash(&mut hasher);
-  }
-  hasher.finish()
-}
-
 /// Sends one pre-encoded sync payload to `peer` over its authenticated
 /// session with a fire-and-forget admission: routing failures are dropped
 /// (the next tick retries) and never stall the anti-entropy loop.

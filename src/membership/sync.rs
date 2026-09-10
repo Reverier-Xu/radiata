@@ -540,27 +540,37 @@ pub(crate) async fn ensure_local_descriptor(
 /// snapshot send: the descriptor-page and tombstone anti-entropy below
 /// keeps running, so a large membership degrades the snapshot leg instead
 /// of stalling every sync lane.
-/// The driver's per-node anti-entropy continuation state.
-#[derive(Default)]
-pub(crate) struct SyncCursor {
-  /// The last snapshot revision sent, so unchanged grant sets are not
-  /// re-sent every tick.
-  pub(crate) snapshot_rev: u64,
-  /// Ticks since the last snapshot send: a lost delivery must be retried
-  /// without waiting for the next grant-set change.
-  pub(crate) ticks_since_snapshot_send: u32,
-  /// Fingerprint of the last page sent, so an unchanged membership set
-  /// costs no encode or per-peer delivery at all.
-  pub(crate) page_fingerprint: u64,
-  /// Fingerprint of the alive-peer set: a newly connected peer must
-  /// receive the current pages immediately, changed set or not.
-  pub(crate) peers_fingerprint: u64,
-  /// Ticks since the last page send: a lost delivery must be retried on
-  /// a slow cadence even when nothing changed.
-  pub(crate) ticks_since_page_send: u32,
-  /// The last membership page cursor, so descriptor sync continues across
-  /// ticks and converges beyond a single page.
-  pub(crate) page: Option<Vec<u8>>,
+/// The driver's per-peer anti-entropy continuation state, tracked
+/// separately for every alive peer: a peer that was unreachable during a
+/// round keeps its own cursors behind, so the very next round after its
+/// session returns re-delivers everything it missed — including writes
+/// made while it was partitioned away.
+#[derive(Debug, Default)]
+pub(crate) struct MembershipSyncCursors {
+  peers: std::collections::BTreeMap<NodeId, PeerSyncState>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PeerSyncState {
+  /// The last snapshot revision sent to this peer, so unchanged grant
+  /// sets are not re-sent every tick.
+  snapshot_rev: u64,
+  /// Ticks since this peer's last snapshot send: a lost delivery must be
+  /// retried without waiting for the next grant-set change.
+  ticks_since_snapshot_send: u32,
+  /// Fingerprint of the last page sent to this peer, so an unchanged
+  /// membership set costs no encode or delivery at all.
+  page_fingerprint: u64,
+  /// Ticks since this peer's last page send: a lost delivery must be
+  /// retried on a slow cadence even when nothing changed.
+  ticks_since_page_send: u32,
+  /// This peer's page continuation cursor, so descriptor sync converges
+  /// beyond a single page.
+  page: Option<Vec<u8>>,
+  /// Page rounds sent since this peer's last full from-scratch pass:
+  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
+  /// into a dying session) can stay missing.
+  rounds_since_full: u32,
 }
 
 /// The bounded number of known leave records forwarded per snapshot
@@ -574,9 +584,16 @@ const SNAPSHOT_RESEND_TICKS: u32 = 8;
 /// Page deliveries are retried on this slower cadence for the same reason.
 const PAGE_RESEND_TICKS: u32 = 32;
 
+/// Page rounds between full from-scratch catch-up passes per peer: bounds
+/// how long a payload lost mid-flight (fire-and-forget delivery into a
+/// dying session) can stay missing. Rounds, not ticks: quiet peers do not
+/// count.
+const MEMBERSHIP_FULL_SYNC_ROUNDS: u32 = 128;
+
 pub(crate) async fn sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>, sessions: &SessionTable,
-  runtime: &RuntimeClient, local_endpoints: &[crate::Endpoint], cursor: &mut SyncCursor,
+  runtime: &RuntimeClient, local_endpoints: &[crate::Endpoint],
+  cursors: &mut MembershipSyncCursors,
 ) -> Result<()> {
   let store = context.store();
   // Nothing to advertise at startup: the supervisor publishes the local
@@ -633,62 +650,22 @@ pub(crate) async fn sync_tick(
     });
   let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
   let peers = crate::sync_common::alive_peers(sessions)?;
-  let peers_fp = crate::sync_common::peers_fingerprint(&peers);
-  // A paged anti-entropy round advances the cursor only while it is
-  // sending; a steady state with an unchanged first page never turns the
-  // cursor, so the page content (and its fingerprint) cannot change
-  // between ticks and the quiet state costs no sends at all.
-  let starting_round = cursor.page.is_none();
-  let page = page_sync::emit_page_ctx(
-    store,
-    cursor.page.as_deref(),
-    crate::membership::page::DEFAULT_PAGE_LIMIT,
-  )
-  .await?;
-  let page_payload = SyncPayload::Page(ByteVec::from(page.encode()?));
-  let page_bytes = page_payload.encode()?;
-  // A round starts when the first page's content or the alive-peer set
-  // changed, and is retried on a slow cadence otherwise (lost-delivery
-  // healing). Mid-round pages always send: they are the
-  // continuation of an already-started round.
-  let page_fp = page.fingerprint();
-  let page_due = if starting_round {
-    let due = page_fp != cursor.page_fingerprint
-      || peers_fp != cursor.peers_fingerprint
-      || cursor.ticks_since_page_send >= PAGE_RESEND_TICKS;
-    cursor.page_fingerprint = page_fp;
-    due
-  } else {
-    true
-  };
-  if page_due || !starting_round {
-    cursor.page = page.cursor().map(|value| value.to_vec());
+  if peers.is_empty() {
+    // Nothing can be delivered with no live sessions. Dropping the
+    // per-peer state means a returning peer is caught up in full —
+    // including everything written while it was unreachable — on its
+    // first tick back.
+    cursors.peers.clear();
+    gc_collected_tombstones(store, entropy).await;
+    return Ok(());
   }
-  cursor.peers_fingerprint = peers_fp;
-  // A snapshot is sent when its revision advanced, and retried on a slow
-  // cadence even when unchanged: re-sending the same revision to every
-  // session every tick floods the store with idempotent commits, but a
-  // lost delivery must still heal.
-  let snapshot_payload = match &snapshot {
-    Some(snapshot)
-      if snapshot.revision() != cursor.snapshot_rev
-        || cursor.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS =>
-    {
-      cursor.snapshot_rev = snapshot.revision();
-      cursor.ticks_since_snapshot_send = 0;
-      Some(SyncPayload::Snapshot(ByteVec::from(snapshot.encode()?)))
-    }
-    Some(_) => {
-      cursor.ticks_since_snapshot_send = cursor.ticks_since_snapshot_send.saturating_add(1);
-      None
-    }
-    None => None,
-  };
-  let snapshot_bytes = match &snapshot_payload {
-    Some(payload) => Some(payload.encode()?),
-    None => None,
-  };
-  let leave_bytes: Vec<Vec<u8>> = if snapshot_bytes.is_some() {
+  cursors.peers.retain(|peer, _| peers.contains(peer));
+  // Snapshot and tombstone wire bytes are peer-independent: encode once.
+  let snapshot_bytes = snapshot
+    .as_ref()
+    .map(|snapshot| SyncPayload::Snapshot(ByteVec::from(snapshot.encode()?)).encode())
+    .transpose()?;
+  let tombstone_bytes: Vec<Vec<u8>> = if snapshot.is_some() {
     let mut out = Vec::with_capacity(
       leave_records.len() + cleanup_records.len() + revocation_records.len() + 1,
     );
@@ -712,44 +689,90 @@ pub(crate) async fn sync_tick(
     tracing::debug!(
       leave = leave_records.len(),
       cleanup = cleanup_records.len(),
-      send = !leave_bytes.is_empty(),
+      send = !tombstone_bytes.is_empty(),
       "removal tombstones considered for forwarding"
     );
   }
-  if page_due || !starting_round {
-    cursor.ticks_since_page_send = 0;
-    let mut payloads: Vec<&[u8]> = Vec::with_capacity(leave_bytes.len() + 2);
-    if let Some(bytes) = &snapshot_bytes {
-      payloads.push(bytes);
+  for peer in &peers {
+    let state = cursors.peers.entry(peer.clone()).or_default();
+    // A periodic from-scratch pass re-delivers the whole descriptor
+    // catalog to this peer, bounding mid-flight payload loss to one
+    // full-sync window.
+    if state.rounds_since_full >= MEMBERSHIP_FULL_SYNC_ROUNDS {
+      state.page = None;
+      state.rounds_since_full = 0;
     }
-    payloads.extend(leave_bytes.iter().map(Vec::as_slice));
+    let starting_round = state.page.is_none();
+    let page = page_sync::emit_page_ctx(
+      store,
+      state.page.as_deref(),
+      crate::membership::page::DEFAULT_PAGE_LIMIT,
+    )
+    .await?;
+    let page_bytes = SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?;
+    let page_fp = page.fingerprint();
+    // The fingerprint is recorded against the emitted page every starting
+    // round (mirroring the global-cursor semantics): a stale recorded
+    // fingerprint would mark every round as changed, keep the page due
+    // forever, and starve the snapshot/tombstone resend cadence — the
+    // quiet rounds between unchanged pages are what let
+    // ticks_since_snapshot_send advance to its resend threshold.
+    let page_due = if starting_round {
+      let due =
+        page_fp != state.page_fingerprint || state.ticks_since_page_send >= PAGE_RESEND_TICKS;
+      state.page_fingerprint = page_fp;
+      due
+    } else {
+      true
+    };
+    // A snapshot is due for this peer when its revision advanced past
+    // what this peer last received, or on the slow resend cadence.
+    let snapshot_due = match &snapshot {
+      Some(snapshot) => {
+        snapshot.revision() != state.snapshot_rev
+          || state.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS
+      }
+      None => false,
+    };
+    if !page_due && !snapshot_due && starting_round {
+      state.ticks_since_page_send = state.ticks_since_page_send.saturating_add(1);
+      state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
+      continue;
+    }
+    if page_due {
+      state.page = page.cursor().map(|value| value.to_vec());
+      state.ticks_since_page_send = 0;
+    }
+    if snapshot_due {
+      if let Some(snapshot) = &snapshot {
+        state.snapshot_rev = snapshot.revision();
+      }
+      state.ticks_since_snapshot_send = 0;
+    }
+    let mut payloads: Vec<&[u8]> = Vec::new();
+    if snapshot_due {
+      if let Some(bytes) = &snapshot_bytes {
+        payloads.push(bytes);
+      }
+      payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
+    }
     payloads.push(&page_bytes);
-    dispatch_to_peers(&peers, &payloads, runtime, entropy, &protocol).await;
-    gc_collected_tombstones(store, entropy).await;
-    return Ok(());
+    dispatch_to_peer(peer, &payloads, runtime, entropy, &protocol).await;
+    state.rounds_since_full = state.rounds_since_full.saturating_add(1);
   }
-  cursor.ticks_since_page_send = cursor.ticks_since_page_send.saturating_add(1);
-  let mut payloads: Vec<&[u8]> = Vec::with_capacity(leave_bytes.len() + 1);
-  if let Some(bytes) = &snapshot_bytes {
-    payloads.push(bytes);
-    payloads.extend(leave_bytes.iter().map(Vec::as_slice));
-  }
-  dispatch_to_peers(&peers, &payloads, runtime, entropy, &protocol).await;
   gc_collected_tombstones(store, entropy).await;
   Ok(())
 }
 
-/// The per-tick peer fan-out shared by both sync regimes: sends every
-/// payload to every alive peer in order, swallowing individual delivery
-/// failures (the snapshot and page resend cadences heal lost payloads).
-async fn dispatch_to_peers(
-  peers: &[NodeId], payloads: &[&[u8]], runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>,
+/// The per-tick fan-out to one peer: sends every payload in order,
+/// swallowing individual delivery failures (the snapshot and page resend
+/// cadences heal lost payloads).
+async fn dispatch_to_peer(
+  peer: &NodeId, payloads: &[&[u8]], runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>,
   protocol: &ProtocolTag,
 ) {
-  for peer in peers {
-    for payload in payloads {
-      let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await;
-    }
+  for payload in payloads {
+    let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await;
   }
 }
 
@@ -854,7 +877,7 @@ mod tests {
       Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let runtime = RuntimeClient::routing_only(packet, routes);
     let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
-    let mut cursor = SyncCursor::default();
+    let mut cursors = MembershipSyncCursors::default();
 
     // The tick succeeds despite the failed snapshot leg, and the page
     // round dispatches (to zero live sessions here).
@@ -864,13 +887,13 @@ mod tests {
       &sessions,
       &runtime,
       &endpoints,
-      &mut cursor,
+      &mut cursors,
     )
     .await
     .unwrap();
-    assert_eq!(
-      cursor.snapshot_rev, 0,
-      "no snapshot revision recorded while refresh fails"
+    assert!(
+      cursors.peers.is_empty(),
+      "no snapshot revision recorded while refresh fails (no live sessions)"
     );
     // A quiet second tick: the stored page fingerprint arms the resend
     // cadence instead of the tick failing again.
@@ -880,17 +903,13 @@ mod tests {
       &sessions,
       &runtime,
       &endpoints,
-      &mut cursor,
+      &mut cursors,
     )
     .await
     .unwrap();
-    assert_eq!(
-      cursor.snapshot_rev, 0,
+    assert!(
+      cursors.peers.is_empty(),
       "still no snapshot revision recorded"
-    );
-    assert_eq!(
-      cursor.ticks_since_page_send, 1,
-      "the page plane keeps advancing across ticks"
     );
   }
 
