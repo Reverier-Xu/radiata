@@ -112,6 +112,37 @@ impl Supervisor {
     }
     result
   }
+  /// Seeds the known-online set from the durable member evidence once
+  /// per process: published descriptors behind a trusted binding are
+  /// members this identity has authenticated with before — the restarted
+  /// process's past-life sessions. Removed-flagged descriptors, departed
+  /// members, and intentionally disconnected members are not seeded.
+  async fn seed_known_online(
+    store: &crate::storage::MetadataStore, local: &NodeId,
+    history: &mut std::collections::BTreeSet<NodeId>,
+    excluded: &std::collections::BTreeSet<NodeId>,
+  ) -> Result<()> {
+    let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
+    let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
+      crate::membership::NODE_DESCRIPTOR_NAMESPACE,
+    )?);
+    let snapshot = store.snapshot().await?;
+    let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
+    while let Some(entry) = scan.next().await? {
+      if let Ok(descriptor) = crate::membership::page::decode_descriptor(entry.value().as_bytes()) {
+        let node = descriptor.node();
+        if !descriptor.removed()
+          && node != local
+          && bindings.contains_key(node)
+          && !excluded.contains(node)
+        {
+          history.insert(node.clone());
+        }
+      }
+    }
+    Ok(())
+  }
+
   pub(super) async fn recovery_tick_inner(&mut self) -> Result<()> {
     // Finished connection tasks keep their JoinHandles until reaped, so a
     // long-lived listener would otherwise grow one dead handle per ever
@@ -144,6 +175,24 @@ impl Supervisor {
     excluded.append(&mut crate::identity::leave::left_nodes_ctx(store).await?);
     for member in &excluded {
       self.recovery_history.remove(member);
+    }
+    // A restarted process carries no session history: the durable member
+    // evidence (published descriptors behind a trusted binding) seeds the
+    // known-online set once, so a restarted node heals its connectivity
+    // without operator action. Departed members keep their exclusion; a
+    // transient store error simply retries the seeding next tick.
+    if !self.recovery_seeded {
+      match Self::seed_known_online(
+        store,
+        context.identity().node(),
+        &mut self.recovery_history,
+        &excluded,
+      )
+      .await
+      {
+        Ok(()) => self.recovery_seeded = true,
+        Err(error) => tracing::debug!(kind = ?error.kind(), "recovery history seeding deferred"),
+      }
     }
     let online = self.recovery_history.clone();
     let now = crate::time::now_seconds();

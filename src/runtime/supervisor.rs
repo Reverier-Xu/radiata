@@ -651,6 +651,10 @@ pub(super) struct Supervisor {
   // these members (edge-loss healing) and never dials strangers, so it
   // cannot add edges beyond the caller-configured topology.
   pub(super) recovery_history: std::collections::BTreeSet<NodeId>,
+  /// Set once the known-online set has been seeded from the durable
+  /// member evidence (a restarted process's past-life sessions); later
+  /// ticks never re-seed, so pruned departed members stay forgotten.
+  pub(super) recovery_seeded: bool,
   // Intentionally disconnected peers: recovery never heals them until an
   // explicit reconnect (a new session to the peer) restores the
   // relationship (no-extra-edge).
@@ -777,6 +781,7 @@ impl Supervisor {
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       published_endpoints,
       recovery_history: std::collections::BTreeSet::new(),
+      recovery_seeded: false,
       recovery_excluded: std::collections::BTreeSet::new(),
       sync_driver,
       trace_sink,

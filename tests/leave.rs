@@ -540,6 +540,148 @@ async fn redb_leave_restart_shows_only_the_replacement() {
   .await;
 }
 
+/// A restarted node must passively rejoin connectivity: its persisted
+/// descriptors behind trusted bindings seed the recovery plane once, so
+/// the node dials its known members without operator action (finding
+/// #4). No listener is opened on the restarted node — the healing is
+/// entirely its own outbound dial.
+#[cfg(feature = "json")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn json_restarted_node_passively_reconnects() {
+  {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+      let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=debug"))
+        .with_test_writer()
+        .try_init();
+    });
+  }
+  let peer_directory = tempfile::tempdir().unwrap();
+  let directory = tempfile::tempdir().unwrap();
+  restarted_node_passively_reconnects(
+    radiata::adapters::json_store(peer_directory.path().to_path_buf()),
+    radiata::adapters::json_store(directory.path().to_path_buf()),
+  )
+  .await;
+}
+
+#[cfg(feature = "redb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redb_restarted_node_passively_reconnects() {
+  let peer_directory = tempfile::tempdir().unwrap();
+  let directory = tempfile::tempdir().unwrap();
+  restarted_node_passively_reconnects(
+    radiata::adapters::redb_store(peer_directory.path().join("store.redb")),
+    radiata::adapters::redb_store(directory.path().join("store.redb")),
+  )
+  .await;
+}
+
+#[cfg(any(feature = "json", feature = "redb"))]
+async fn restarted_node_passively_reconnects(
+  peer_storage: Arc<dyn StorageFactory>, storage: Arc<dyn StorageFactory>,
+) {
+  let peer = NodeBuilder::new(
+    peer_storage,
+    Arc::new(LeaveKeys::with_base(600)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let peer_endpoint = peer
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap()
+    .endpoint()
+    .clone();
+
+  // The restarting node: durable storage, merges into the peer, then
+  // shuts down. Its store keeps the peer's descriptor and binding. The
+  // key provider instance is shared across the restart so the scripted
+  // keys reproduce the persisted identity.
+  let keys: Arc<dyn KeyProvider> = Arc::new(LeaveKeys::with_base(700));
+  let node = NodeBuilder::new(Arc::clone(&storage), keys.clone())
+    .start()
+    .await
+    .unwrap();
+  common::merge_with_retry(&node, &peer, peer_endpoint.clone()).await;
+  let node_id = node
+    .query(radiata::GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  let peer_id = peer
+    .query(radiata::GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+
+  // The passive reconnect seeds from persisted descriptors, so wait for
+  // the peer's descriptor (with its dialable endpoint) to converge into
+  // the node's store before shutting down.
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let converged = node
+      .query(radiata::GetMember::new(peer_id.clone()))
+      .await
+      .unwrap()
+      .is_some_and(|view| !view.endpoints().is_empty());
+    if converged {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the peer descriptor never converged into the node's store"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+  node.command(Shutdown::new()).await.unwrap();
+
+  // Restart on the SAME durable store: no Listen, no join, no connect —
+  // the only path back is recovery seeding from the persisted evidence.
+  let restarted = NodeBuilder::new(storage, keys.clone())
+    .start()
+    .await
+    .unwrap();
+  assert_eq!(
+    restarted
+      .query(radiata::GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id(),
+    &node_id,
+    "the restart must resume the persisted identity"
+  );
+
+  // The recovery plane seeds the peer from the persisted evidence and
+  // dials it; the session forms without any operator action.
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let reconnected = restarted
+      .query(radiata::PageSessions::new(PageSpec::first(8).unwrap()))
+      .await
+      .unwrap()
+      .items()
+      .iter()
+      .any(|session| session.peer() == &peer_id);
+    if reconnected {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the restarted node never passively reconnected to its known peer"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+  }
+
+  restarted.command(Shutdown::new()).await.unwrap();
+  peer.command(Shutdown::new()).await.unwrap();
+}
+
 #[cfg(any(feature = "json", feature = "redb"))]
 async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactory>) {
   let keys = Arc::new(LeaveKeys::default());
