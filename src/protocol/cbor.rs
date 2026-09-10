@@ -32,21 +32,22 @@ enum LimitedWriteError {
 
 struct LimitedWriter {
   bytes: Vec<u8>,
-  position: usize,
+  limit: usize,
 }
 
 impl LimitedWriter {
   fn new(limit: usize) -> Result<Self> {
     let mut bytes = Vec::new();
+    // Capacity without initialization: the encode hot path pays one
+    // allocation, never a full-budget memset. The payload grows by
+    // appended writes and the limit is enforced per write.
     bytes
       .try_reserve_exact(limit)
       .map_err(|_| Error::invalid_input("CBOR output allocation"))?;
-    bytes.resize(limit, 0);
-    Ok(Self { bytes, position: 0 })
+    Ok(Self { bytes, limit })
   }
 
-  fn into_bytes(mut self) -> Vec<u8> {
-    self.bytes.truncate(self.position);
+  fn into_bytes(self) -> Vec<u8> {
     self.bytes
   }
 }
@@ -56,15 +57,16 @@ impl Write for LimitedWriter {
 
   fn write_all(&mut self, buffer: &[u8]) -> core::result::Result<(), Self::Error> {
     let end = self
-      .position
+      .bytes
+      .len()
       .checked_add(buffer.len())
       .ok_or(LimitedWriteError::LimitExceeded)?;
-    let output = self
-      .bytes
-      .get_mut(self.position..end)
-      .ok_or(LimitedWriteError::LimitExceeded)?;
-    output.copy_from_slice(buffer);
-    self.position = end;
+    if end > self.limit {
+      return Err(LimitedWriteError::LimitExceeded);
+    }
+    // A rejected write is atomic: the check precedes the append, so a
+    // failed write leaves the output exactly as the successful prefix.
+    self.bytes.extend_from_slice(buffer);
     Ok(())
   }
 }
@@ -406,4 +408,31 @@ fn read_array<const LENGTH: usize>(bytes: &[u8], start: usize) -> Result<[u8; LE
     .get(first..last)
     .ok_or_else(|| Error::invalid_input("CBOR header"))?;
   <[u8; LENGTH]>::try_from(slice).map_err(|_| Error::invalid_input("CBOR header"))
+}
+
+#[cfg(test)]
+mod tests {
+  use minicbor::encode::Write as _;
+
+  use super::{LimitedWriteError, LimitedWriter};
+
+  /// The writer enforces the limit across multiple writes, returns
+  /// exactly the written bytes, and rejects an over-budget write
+  /// atomically (nothing appended) — the encode hot path pays one
+  /// allocation, never a full-budget memset.
+  #[test]
+  fn limited_writer_enforces_the_limit_and_keeps_written_bytes() {
+    let mut writer = LimitedWriter::new(8).unwrap();
+    writer.write_all(&[1, 2, 3]).unwrap();
+    writer.write_all(&[4, 5]).unwrap();
+    assert_eq!(writer.into_bytes(), vec![1, 2, 3, 4, 5]);
+
+    let mut writer = LimitedWriter::new(4).unwrap();
+    writer.write_all(&[1, 2]).unwrap();
+    assert!(matches!(
+      writer.write_all(&[3, 4, 5]),
+      Err(LimitedWriteError::LimitExceeded)
+    ));
+    assert_eq!(writer.into_bytes(), vec![1, 2]);
+  }
 }

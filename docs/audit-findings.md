@@ -325,6 +325,6 @@
 | 快照三连修（owner 决策） | `466b1f2`+`6585be4`+`5d0f7aa` | 快照溢出不再拖死描述符反熵；远端快照停止持久化（issuer 自写自读保留）；注释如实化 |
 | 分页 seek 扩展（owner 决策） | `c33fcf8`+`73ec5fd` | StoreSnapshot::scan_from 定位扫描（default 方法保兼容）+ 三后端 + 合约；分页 O(N²/L)→O(page)（实测 1100 vs 50600 步）；基线 +1 行 |
 
-**未修（有意保留）**：store_scan_stream 公开面（保留供扩展作者，有外部驱动测试）；LimitedWriter 预零化 / 分页 O(N²) 重扫 / 终态 trace 无界 spawn（性能与规模项，规模触达前不动）；trust.rs `TrustSnapshotV1` 脚手架保持手写（canonical_record! 豁免，canonical.rs 模块文档已记录）。
+**未修（有意保留）**：store_scan_stream 公开面（保留供扩展作者，有外部驱动测试）；trust.rs `TrustSnapshotV1` 脚手架保持手写（canonical_record! 豁免，canonical.rs 模块文档已记录）。~~LimitedWriter 预零化~~（已修：容量预留不初始化、追加式写入、限流原子）；~~分页 O(N²) 重扫~~（已修：scan_from 定位扫描全路径接管，见上行）；~~终态 trace 无界 spawn~~（已修：fbfaa14 排队上限 + 丢弃计数，本行系过时记载）。
 
 **已决策落地**：P2-12（owner 决策：淘汰 TRUST_BINDING 族——IDENTITY_BINDING 成为绑定唯一表示，读侧流式解码、写侧只走 adopt、撤销防护统一变强、单例节点可见自身绑定为有意新语义）；OpenWireV1（owner 决策：删死分支保线上格式，见 §4 勘误）；canonical_record! 宏（12/13 组收敛，净 −277 行，金样本逐字节不变）。
