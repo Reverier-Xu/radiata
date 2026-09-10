@@ -91,6 +91,9 @@ pub(crate) enum Control {
     node: NodeId,
     reply: oneshot::Sender<Result<Option<crate::MemberView>>>,
   },
+  GetRecovery {
+    reply: oneshot::Sender<Result<crate::RecoveryView>>,
+  },
   PageMembers {
     cursor: Option<crate::PageCursor>,
     limit: usize,

@@ -305,6 +305,11 @@ impl radiata::GetObservability
 pub fn radiata::GetObservability::new() -> Self
 impl radiata::Query for radiata::GetObservability
 pub type radiata::GetObservability::Output = radiata::ObservabilitySnapshot
+pub struct radiata::GetRecovery
+impl radiata::GetRecovery
+pub fn radiata::GetRecovery::new() -> Self
+impl radiata::Query for radiata::GetRecovery
+pub type radiata::GetRecovery::Output = radiata::RecoveryView
 pub struct radiata::GetResource
 impl radiata::GetResource
 pub fn radiata::GetResource::new(radiata::ResourceName) -> Self
@@ -1032,6 +1037,8 @@ impl radiata::Query for radiata::GetNodeStatus
 pub type radiata::GetNodeStatus::Output = radiata::NodeStatus
 impl radiata::Query for radiata::GetObservability
 pub type radiata::GetObservability::Output = radiata::ObservabilitySnapshot
+impl radiata::Query for radiata::GetRecovery
+pub type radiata::GetRecovery::Output = radiata::RecoveryView
 impl radiata::Query for radiata::GetResource
 pub type radiata::GetResource::Output = core::option::Option<radiata::ResourceView>
 impl radiata::Query for radiata::GetRoute

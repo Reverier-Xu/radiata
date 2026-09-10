@@ -428,6 +428,9 @@ async fn supervise(
         let result = supervisor.member(node).await;
         let _ = reply.send(result);
       }
+      Control::GetRecovery { reply } => {
+        let _ = reply.send(Ok(supervisor.recovery_view()));
+      }
       Control::PageMembers { cursor, limit, reply } => {
         let result = supervisor.page_members(cursor, limit).await;
         let _ = reply.send(result);

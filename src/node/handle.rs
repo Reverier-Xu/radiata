@@ -4,11 +4,11 @@ use tokio::sync::oneshot;
 
 use crate::{
   Command, ConnectMember, DisconnectPeer, Error, Event, EventOptions, EventSubscription,
-  GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRoute, IssuedMergeCredential,
-  Listen, MergeCluster, NodeId, NodeStatus, OutboundStream, PageMembers, PageTopology, PageTrust,
-  ProtocolTag, Query, Result, RotateMergeCredential, RouteStatusView, SelectResources, Shutdown,
-  ShutdownOutcome, ShutdownReason, StartRecovery, StopListener, StreamMetadata, StreamPolicy,
-  StreamTarget, TraceId, UpdateNodeMetadata, WaitForShutdown,
+  GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRecovery, GetRoute,
+  IssuedMergeCredential, Listen, MergeCluster, NodeId, NodeStatus, OutboundStream, PageMembers,
+  PageTopology, PageTrust, ProtocolTag, Query, Result, RotateMergeCredential, RouteStatusView,
+  SelectResources, Shutdown, ShutdownOutcome, ShutdownReason, StartRecovery, StopListener,
+  StreamMetadata, StreamPolicy, StreamTarget, TraceId, UpdateNodeMetadata, WaitForShutdown,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
   runtime::{Control, RuntimeClient},
@@ -253,6 +253,12 @@ impl QueryControl for GetMember {
   fn control(self, reply: oneshot::Sender<Result<Option<crate::MemberView>>>) -> Control {
     let node = self.node().clone();
     Control::GetMember { node, reply }
+  }
+}
+
+impl QueryControl for GetRecovery {
+  fn control(self, reply: oneshot::Sender<Result<crate::RecoveryView>>) -> Control {
+    Control::GetRecovery { reply }
   }
 }
 
