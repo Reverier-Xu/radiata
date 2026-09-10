@@ -27,12 +27,29 @@ struct Node {
 
 async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Node {
   // The runtime default entropy (system randomness) keeps every node's id
-  // unique; deterministic entropy would collide across nodes.
-  let handle = NodeBuilder::new(factory, keys.clone())
-    .start()
-    .await
-    .unwrap();
-  Node { handle, keys }
+  // unique; deterministic entropy would collide across nodes. A prior
+  // runtime instance's detached teardown can briefly hold the factory's
+  // exclusive-open flag under load, so the open is retried to a deadline.
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+  loop {
+    match NodeBuilder::new(factory.clone(), keys.clone())
+      .start()
+      .await
+    {
+      Ok(handle) => {
+        return Node {
+          handle,
+          keys: keys.clone(),
+        };
+      }
+      Err(error)
+        if error.kind() == ErrorKind::StorageLocked && std::time::Instant::now() < deadline =>
+      {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+      }
+      Err(error) => panic!("node start failed persistently: {error:?}"),
+    }
+  }
 }
 
 fn keys_at(seed: u64) -> Arc<ScriptedKeys> {
