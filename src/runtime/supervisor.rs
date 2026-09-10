@@ -141,12 +141,12 @@ fn spawn_sync_driver(
   tokio::spawn(async move {
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut sync_cursor = crate::membership::sync::SyncCursor::default();
+    let mut sync_cursor = crate::membership::sync::MembershipSyncCursors::default();
     let mut resource_cursor = crate::resource::sync::ResourceSyncCursors::default();
     async fn run_round(
       context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn crate::api::Entropy>,
       sessions: &crate::session::stream::SessionTable, runtime: &crate::runtime::RuntimeClient,
-      endpoints: &[Endpoint], sync_cursor: &mut crate::membership::sync::SyncCursor,
+      endpoints: &[Endpoint], sync_cursor: &mut crate::membership::sync::MembershipSyncCursors,
       resource_cursor: &mut crate::resource::sync::ResourceSyncCursors,
     ) {
       if let Err(error) = crate::membership::sync::sync_tick(

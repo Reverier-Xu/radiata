@@ -266,7 +266,6 @@ impl SessionDriver {
             .generation_id()
             .ok_or_else(|| Error::authentication_failed("join credential"))?;
           if peek.generation != Some(active_generation) {
-            tracing::warn!(peek_gen = ?peek.generation, active_gen = ?active_generation, "TEMP-DEBUG generation mismatch");
             return Err(Error::authentication_failed("join credential generation"));
           }
           issuer
