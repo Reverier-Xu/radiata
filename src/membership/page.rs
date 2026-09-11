@@ -10,13 +10,12 @@
 /// The schema of one membership sync page.
 pub(crate) const MEMBERSHIP_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-page-v1";
 
-/// The default page limit when the caller supplies none.
-pub(crate) const DEFAULT_PAGE_LIMIT: usize = 16;
-
-/// The maximum page size a receiver accepts, bounding one page's bytes.
-pub(crate) const MAX_PAGE_DESCRIPTORS: usize = 64;
-
 use super::{NodeDescriptorV1, store};
+/// The default page limit when the caller supplies none (single-sourced
+/// in the paging module; lane-local name for readable call sites).
+pub(crate) use crate::paging::PAGE_DEFAULT_LIMIT as DEFAULT_PAGE_LIMIT;
+/// The maximum page size a receiver accepts, bounding one page's bytes.
+pub(crate) use crate::paging::PAGE_MAX_ITEMS as MAX_PAGE_DESCRIPTORS;
 use crate::{
   Error, LabelKey, LabelSet, LabelValue, NodeId, Result,
   protocol::{decode_canonical, encode_canonical},
