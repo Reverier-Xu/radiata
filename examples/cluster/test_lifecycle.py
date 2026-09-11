@@ -430,9 +430,17 @@ def main() -> None:
     ids = {node: node_id_of(node) for node in range(1, N + 1)}
     before = (sessions_of(1), sessions_of(2))
     http("POST", 1, "/disconnect", {"node_id": ids[2]})
-    time.sleep(2)
-    dropped = (sessions_of(1), sessions_of(2))
-    assert dropped[0] < before[0], f"n1 sessions did not drop on disconnect: {before} -> {dropped}"
+    # The teardown lands before /disconnect returns, but the recovery
+    # plane re-heals the edge within seconds (1s initial backoff), so the
+    # drop is observed with a fast poll instead of a fixed sleep.
+    observed_drop = False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if sessions_of(1) < before[0] or sessions_of(2) < before[1]:
+            observed_drop = True
+            break
+        time.sleep(0.1)
+    assert observed_drop, f"the disconnect never dropped the edge: before={before}"
     healed = time.monotonic()
     deadline = healed + 150
     while time.monotonic() < deadline:
@@ -443,7 +451,7 @@ def main() -> None:
         raise SystemExit("the disconnected edge was never healed back by recovery")
     report["disconnect_self_heal_seconds"] = time.monotonic() - healed
     print(f"[heal] n1-n2 edge healed by recovery in "
-          f"{report['disconnect_self_heal_seconds']:.0f}s ({dropped} -> back to {before})")
+          f"{report['disconnect_self_heal_seconds']:.0f}s (drop observed, back to {before})")
     # And the whole cluster still converges after the edge dance.
     digest = write_resource(2, "demo.org/resources/post-heal-check", "converged")
     converge(list(range(1, N + 1)), "demo.org/resources/post-heal-check", digest)
