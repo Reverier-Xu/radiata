@@ -907,7 +907,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let recovery: RecoveryView = issuer.handle.command(StartRecovery::new()).await.unwrap();
   let _ = (
     recovery.is_connected(),
-    recovery.unreachable_components(),
+    recovery.unreachable_members(),
     recovery.next_attempt_at(),
   );
 
@@ -952,7 +952,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let recovery: RecoveryView = issuer.handle.command(StartRecovery::new()).await.unwrap();
   let _ = (
     recovery.is_connected(),
-    recovery.unreachable_components(),
+    recovery.unreachable_members(),
     recovery.next_attempt_at(),
   );
   let observability: ObservabilitySnapshot =
