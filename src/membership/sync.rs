@@ -475,40 +475,51 @@ pub(crate) fn sync_protocol_definition() -> Result<ProtocolDefinition> {
 }
 
 /// Ensures the local descriptor exists (revision 1) with the given
-/// endpoint candidates, so the anti-entropy tick can page it. Publishes a
-/// revision bump when the endpoint set changes and the caller requests it.
+/// endpoint candidates, so the anti-entropy tick can page it. An install
+/// or an endpoint change advances the store's descriptor revision — a
+/// member-set change — so the paired member-set notification fires here:
+/// the transient [`crate::MemberChanged`] event plus the persistent
+/// revision bump, keeping the revision counter's one-to-one promise.
 pub(crate) async fn ensure_local_descriptor(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>, endpoints: Vec<crate::Endpoint>,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
 ) -> Result<()> {
   let store = context.store();
   let node = context.identity().node().clone();
   let public_key = context.identity().public_key().clone();
   let existing = crate::membership::store::read_descriptor_ctx(store, &node).await?;
-  if let Some(current) = &existing {
-    let same_endpoints = current.endpoints().len() == endpoints.len()
-      && current
-        .endpoints()
-        .iter()
-        .zip(&endpoints)
-        .all(|(left, right)| left == right);
-    if same_endpoints {
-      return Ok(());
+  let changed = match &existing {
+    Some(current) => {
+      let same_endpoints = current.endpoints().len() == endpoints.len()
+        && current
+          .endpoints()
+          .iter()
+          .zip(&endpoints)
+          .all(|(left, right)| left == right);
+      if same_endpoints {
+        false
+      } else if endpoints.is_empty() {
+        // An empty candidate set never downgrades published endpoints:
+        // the startup tick fires before any listener exists and must not
+        // bump the revision (descriptor endpoint stability).
+        return Ok(());
+      } else {
+        true
+      }
     }
-    // An empty candidate set never downgrades published endpoints: the
-    // startup tick fires before any listener exists and must not bump the
-    // revision (descriptor endpoint stability).
-    if endpoints.is_empty() {
-      return Ok(());
-    }
+    None => true,
+  };
+  if !changed {
+    return Ok(());
   }
-  let revision = existing
+  let descriptor_revision = existing
     .as_ref()
     .map_or(1, |current| current.revision().saturating_add(1));
   let descriptor = crate::membership::NodeDescriptorV1::new(
     node.clone(),
     public_key,
     endpoints,
-    revision,
+    descriptor_revision,
     false,
     1,
   );
@@ -522,12 +533,16 @@ pub(crate) async fn ensure_local_descriptor(
     // for this exact node and key.
     let installed = crate::membership::store::read_descriptor_ctx(store, &node)
       .await?
-      .map(|current| current.revision() >= revision)
+      .map(|current| current.revision() >= descriptor_revision)
       .unwrap_or(false);
     if !installed {
       return Err(error);
     }
   }
+  // The member set genuinely changed (the local descriptor was installed
+  // or its endpoint set moved): fire the paired notification so a watcher
+  // that subscribes before acting never misses the bump.
+  member_changed(events, revision, node);
   Ok(())
 }
 
@@ -590,10 +605,12 @@ const PAGE_RESEND_TICKS: u32 = 32;
 /// count.
 const MEMBERSHIP_FULL_SYNC_ROUNDS: u32 = 128;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>, sessions: &SessionTable,
   runtime: &RuntimeClient, local_endpoints: &[crate::Endpoint],
-  cursors: &mut MembershipSyncCursors,
+  cursors: &mut MembershipSyncCursors, events: &Arc<crate::node::EventHub>,
+  revision: &crate::node::MemberRevisionSignal,
 ) -> Result<()> {
   let store = context.store();
   // Nothing to advertise at startup: the supervisor publishes the local
@@ -601,7 +618,7 @@ pub(crate) async fn sync_tick(
   // so the anti-entropy loop never races a transient empty endpoint set
   // into a revision bump.
   if !local_endpoints.is_empty() {
-    ensure_local_descriptor(context, entropy, local_endpoints.to_vec()).await?;
+    ensure_local_descriptor(context, entropy, local_endpoints.to_vec(), events, revision).await?;
   }
   // Before any member is admitted the node's store writes are quiescent
   // (the supervisor's lazy paths publish the local descriptor on the first
@@ -881,6 +898,9 @@ mod tests {
 
     // The tick succeeds despite the failed snapshot leg, and the page
     // round dispatches (to zero live sessions here).
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
     sync_tick(
       &context,
       &entropy,
@@ -888,6 +908,8 @@ mod tests {
       &runtime,
       &endpoints,
       &mut cursors,
+      &events,
+      &revision,
     )
     .await
     .unwrap();
@@ -904,6 +926,8 @@ mod tests {
       &runtime,
       &endpoints,
       &mut cursors,
+      &events,
+      &revision,
     )
     .await
     .unwrap();

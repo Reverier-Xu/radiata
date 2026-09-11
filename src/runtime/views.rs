@@ -1,7 +1,9 @@
 //! Paged reads and point views on the node's observed state: members,
 //! resources, listeners, sessions, topology, trust, and observability.
 //! Pure observation over the signed descriptor stores and the session
-//! table; no state transition lives here.
+//! table. One deliberate exception: a member query lazily ensures the
+//! local descriptor exists (an install fires the paired member-set
+//! notification inside the ensure, keeping the revision contract).
 
 use tokio::task::JoinSet;
 

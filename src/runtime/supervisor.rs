@@ -131,6 +131,7 @@ fn spawn_sync_driver(
   published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>, interval: std::time::Duration,
   shutdown: tokio::sync::watch::Receiver<()>,
   mut round_requests: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+  events: Arc<crate::node::EventHub>, revision: crate::node::MemberRevisionSignal,
 ) -> tokio::task::JoinHandle<()> {
   let driver_context = Arc::clone(context);
   let driver_entropy = entropy;
@@ -138,6 +139,8 @@ fn spawn_sync_driver(
   let driver_runtime = runtime;
   let driver_endpoints = published_endpoints;
   let mut driver_shutdown = shutdown;
+  let driver_events = events;
+  let driver_revision = revision;
   tokio::spawn(async move {
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -148,6 +151,7 @@ fn spawn_sync_driver(
       sessions: &crate::session::stream::SessionTable, runtime: &crate::runtime::RuntimeClient,
       endpoints: &[Endpoint], sync_cursor: &mut crate::membership::sync::MembershipSyncCursors,
       resource_cursor: &mut crate::resource::sync::ResourceSyncCursors,
+      events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
     ) {
       if let Err(error) = crate::membership::sync::sync_tick(
         context,
@@ -156,6 +160,8 @@ fn spawn_sync_driver(
         runtime,
         endpoints,
         sync_cursor,
+        events,
+        revision,
       )
       .await
       {
@@ -194,6 +200,8 @@ fn spawn_sync_driver(
             &endpoints,
             &mut sync_cursor,
             &mut resource_cursor,
+            &driver_events,
+            &driver_revision,
           )
           .await;
         }
@@ -214,6 +222,8 @@ fn spawn_sync_driver(
             &endpoints,
             &mut sync_cursor,
             &mut resource_cursor,
+            &driver_events,
+            &driver_revision,
           )
           .await;
           if let Some(reply) = reply {
@@ -770,6 +780,8 @@ impl Supervisor {
       dependencies.config.anti_entropy_interval(),
       shutdown_tx.subscribe(),
       sync_rounds,
+      dependencies.events.clone(),
+      dependencies.member_revision.clone(),
     ));
     // The durable trace-metadata sink shares the runtime identity context
     // and injected entropy; persistence failures never touch the data plane.
@@ -1233,6 +1245,8 @@ impl Supervisor {
       &context,
       &self.dependencies.entropy,
       endpoints,
+      &self.dependencies.events,
+      &self.dependencies.member_revision,
     )
     .await
   }
