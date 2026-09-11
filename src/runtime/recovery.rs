@@ -248,20 +248,28 @@ impl Supervisor {
     }
     // A restarted process carries no session history: the durable member
     // evidence (published descriptors behind a trusted binding) seeds the
-    // known-online set once, so a restarted node heals its connectivity
-    // without operator action. Departed members keep their exclusion; a
-    // transient store error simply retries the seeding next tick.
-    if !self.recovery_seeded {
-      match Self::seed_known_online(
-        store,
-        context.identity().node(),
-        &mut self.recovery_history,
-        &excluded,
-      )
-      .await
-      {
-        Ok(()) => self.recovery_seeded = true,
-        Err(error) => tracing::debug!(kind = ?error.kind(), "recovery history seeding deferred"),
+    // known-online set, so a restarted node heals its connectivity
+    // without operator action. The seed retried while the history stays
+    // empty and the store revision advanced: evidence can arrive after
+    // the first tick (a leave-wiped node rejoins and re-syncs member
+    // descriptors over its merge session), and a one-shot seed would
+    // strand it dialing only its join peer. Departed members keep their
+    // exclusion on every attempt; a transient store error defers to the
+    // next tick; an unchanged revision skips the rescan entirely.
+    if self.recovery_history.is_empty() {
+      let revision = store.snapshot().await?.revision().clone();
+      if self.recovery_seeded_at_revision.as_ref() != Some(&revision) {
+        match Self::seed_known_online(
+          store,
+          context.identity().node(),
+          &mut self.recovery_history,
+          &excluded,
+        )
+        .await
+        {
+          Ok(()) => self.recovery_seeded_at_revision = Some(revision),
+          Err(error) => tracing::debug!(kind = ?error.kind(), "recovery history seeding deferred"),
+        }
       }
     }
     let online = self.recovery_history.clone();
