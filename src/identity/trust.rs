@@ -216,42 +216,6 @@ impl TrustSnapshotV1 {
   }
 }
 
-/// The bounded, deterministic page of one trust observation stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TrustPage {
-  bindings: Vec<TrustBinding>,
-  next: Option<usize>,
-}
-
-impl TrustPage {
-  pub(crate) fn new(bindings: Vec<TrustBinding>, next: Option<usize>) -> Self {
-    Self { bindings, next }
-  }
-
-  pub(crate) fn bindings(&self) -> &[TrustBinding] {
-    &self.bindings
-  }
-
-  pub(crate) const fn next(&self) -> Option<usize> {
-    self.next
-  }
-}
-
-/// Paged trust observations over one ordered snapshot's bindings.
-#[cfg(test)]
-pub(crate) fn page_bindings(
-  bindings: &[TrustBinding], offset: usize, limit: usize,
-) -> Result<TrustPage> {
-  let Some(slice) = bindings.get(offset..) else {
-    return Err(crate::Error::invalid_input("trust page offset"));
-  };
-  let page: Vec<TrustBinding> = slice.iter().take(limit).cloned().collect();
-  let next = offset
-    .checked_add(page.len())
-    .filter(|end| *end < bindings.len());
-  Ok(TrustPage::new(page, next))
-}
-
 /// Accepts one issuer-marked trust snapshot delivered over an
 /// authenticated session: the trust adoption policy for the sync lane.
 /// The issuer's declared key must match its locally trusted binding
@@ -335,7 +299,7 @@ pub(crate) async fn refresh_issuer_snapshot(
 
 #[cfg(test)]
 mod tests {
-  use super::{TrustBinding, TrustSnapshotV1, page_bindings};
+  use super::{TrustBinding, TrustSnapshotV1};
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
@@ -395,22 +359,6 @@ mod tests {
     let newer = snapshot(8, 1, vec![(2, 2)]);
     assert!(newer.is_newer_than(&first));
     assert!(!first.is_newer_than(&newer));
-  }
-
-  /// All trust views return the same pairs; paging is deterministic and
-  /// bounded.
-  #[test]
-  fn trust_bindings_page_deterministically() {
-    let snapshot = snapshot(7, 1, vec![(2, 2), (3, 3), (4, 4), (5, 5)]);
-    let page = page_bindings(snapshot.bindings(), 0, 2).unwrap();
-    assert_eq!(page.bindings().len(), 2);
-    assert_eq!(page.next(), Some(2));
-    let page = page_bindings(snapshot.bindings(), 2, 2).unwrap();
-    assert_eq!(page.bindings().len(), 2);
-    assert_eq!(page.next(), None);
-    // Views agree on the exact pairs.
-    let all = page_bindings(snapshot.bindings(), 0, 8).unwrap();
-    assert_eq!(all.bindings(), snapshot.bindings());
   }
 
   #[test]
@@ -491,13 +439,18 @@ mod tests {
     assert_eq!(bindings, expected);
 
     // The paged view (the public trust observation stream) exposes the
-    // same pairs with exact cursors, straight from the identity family.
-    let page = store::paged_trust_ctx(&store, 0, 2).await.unwrap();
-    assert_eq!(page.bindings(), &snapshot.bindings()[..2]);
-    assert_eq!(page.next(), Some(2));
-    let rest = store::paged_trust_ctx(&store, 2, 2).await.unwrap();
-    assert_eq!(rest.bindings(), &snapshot.bindings()[2..]);
-    assert_eq!(rest.next(), None);
+    // same pairs with keyset cursors, straight from the identity family.
+    let page = store::paged_trust_ctx(&store, None, 2).await.unwrap();
+    assert_eq!(page.items, snapshot.bindings()[..2]);
+    assert!(
+      page.next.is_some(),
+      "a full page with more entries continues"
+    );
+    let rest = store::paged_trust_ctx(&store, page.next.as_deref(), 2)
+      .await
+      .unwrap();
+    assert_eq!(rest.items, snapshot.bindings()[2..]);
+    assert!(rest.next.is_none());
   }
 
   /// A delivered remote snapshot is adopted without persistence: the
@@ -625,12 +578,14 @@ mod tests {
     assert_eq!(loaded.revision(), 9);
     assert_eq!(loaded.bindings(), snapshot.bindings());
 
-    let page = store::paged_trust(&factory, 0, 1).await.unwrap();
-    assert_eq!(page.bindings().len(), 1);
-    assert_eq!(page.next(), Some(1));
-    let page = store::paged_trust(&factory, 1, 8).await.unwrap();
-    assert_eq!(page.bindings().len(), 1);
-    assert_eq!(page.next(), None);
+    let page = store::paged_trust(&factory, None, 1).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(page.next.is_some());
+    let page = store::paged_trust(&factory, page.next.as_deref(), 8)
+      .await
+      .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(page.next.is_none());
   }
 
   #[tokio::test]
@@ -657,7 +612,7 @@ mod tests {
 pub(crate) mod store {
   use std::{collections::BTreeMap, sync::Arc};
 
-  use super::{TRUST_SNAPSHOT_NAMESPACE, TrustBinding, TrustPage, TrustSnapshotV1};
+  use super::{TRUST_SNAPSHOT_NAMESPACE, TrustBinding, TrustSnapshotV1};
   #[cfg(test)]
   use crate::provider::StorageFactory;
   use crate::{
@@ -791,45 +746,32 @@ pub(crate) mod store {
 
   /// Paged trust observations over the running node's metadata store:
   /// distinct bindings from the authoritative identity-binding family —
-  /// the one durable binding representation — deterministically ordered
-  /// and bounded. The scan order is the canonical node-text order, so the
-  /// page is taken by skipping `offset` entries during one streamed pass -
-  /// no whole-population allocation.
+  /// the one durable binding representation — keyset-paginated in the
+  /// canonical node-text key order through the shared
+  /// [`crate::paging::scan_paged`] loop: the continuation cursor is the
+  /// page's last raw key, resumed strictly past it (one end-of-stream
+  /// rule for every paged read).
   pub(crate) async fn paged_trust_ctx(
-    store: &MetadataStore, offset: usize, limit: usize,
-  ) -> Result<TrustPage> {
+    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
+  ) -> Result<crate::paging::Paged<TrustBinding>> {
     let namespace = crate::identity::records::identity_binding_namespace()?;
     let snapshot = store.snapshot().await?;
-    let mut scan = snapshot.scan(&namespace, &[]).await?;
-    let mut skipped = 0_usize;
-    let mut page: Vec<TrustBinding> = Vec::with_capacity(limit);
-    let mut more_after_page = false;
-    while let Some(entry) = scan.next().await? {
-      let binding = crate::identity::records::IdentityBindingV1::decode(entry.value().as_bytes())
-        .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
-      if skipped < offset {
-        skipped += 1;
-        continue;
-      }
-      if page.len() >= limit {
-        // This entry was fetched and deferred: at least one further
-        // binding exists beyond the page.
-        more_after_page = true;
-        break;
-      }
-      page.push(TrustBinding::new(
-        binding.node().clone(),
-        binding.public_key().clone(),
-      ));
-    }
-    // The next cursor is exact only when the page filled and a further
-    // entry was already fetched past it.
-    let next = if page.len() == limit && more_after_page {
-      Some(offset + limit)
-    } else {
-      None
-    };
-    Ok(TrustPage::new(page, next))
+    crate::paging::scan_paged(
+      snapshot.as_ref(),
+      &namespace,
+      &[],
+      cursor,
+      limit,
+      |_key, bytes| {
+        let binding = crate::identity::records::IdentityBindingV1::decode(bytes)
+          .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
+        Ok(Some(TrustBinding::new(
+          binding.node().clone(),
+          binding.public_key().clone(),
+        )))
+      },
+    )
+    .await
   }
 
   /// The durable trusted bindings from the authoritative identity-binding
@@ -964,9 +906,9 @@ pub(crate) mod store {
   /// restart harness).
   #[cfg(test)]
   pub(crate) async fn paged_trust(
-    factory: &Arc<dyn StorageFactory>, offset: usize, limit: usize,
-  ) -> Result<TrustPage> {
+    factory: &Arc<dyn StorageFactory>, cursor: Option<&[u8]>, limit: usize,
+  ) -> Result<crate::paging::Paged<TrustBinding>> {
     let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
-    paged_trust_ctx(&store, offset, limit).await
+    paged_trust_ctx(&store, cursor, limit).await
   }
 }
