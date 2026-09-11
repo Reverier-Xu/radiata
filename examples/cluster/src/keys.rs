@@ -2,13 +2,18 @@
 //! of radiata's `KeyProvider` extension point.
 //!
 //! Keys live under `DATA/keys/<operation-id>` (raw 32-byte secret, mode
-//! 0600). The key handle IS the operation id's bytes, giving a 1:1
-//! mapping that survives crashes: `create` is idempotent (an existing
-//! secret file means the operation already committed), and
-//! `reconcile_create` reports exactly what is on disk.
+//! 0600 at creation). The key handle IS the operation id's bytes, giving
+//! a 1:1 mapping that survives crashes: `create` is idempotent (the
+//! create-exclusive write means a repeated or concurrent operation keeps
+//! the first secret that landed on disk), and `reconcile_create` reports
+//! exactly what is on disk. A torn write of the 32-byte secret fails
+//! closed on every later read (the file exists but does not parse);
+//! delete the corrupt file to re-issue. Files written by older versions
+//! of this provider with a wider mode are tightened to 0600 on load.
 
 use std::{
   fs,
+  io::Write as _,
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -69,6 +74,52 @@ impl FileKeyProvider {
       PublicKey::from_bytes(signing.verifying_key().to_bytes()),
     )))
   }
+
+  /// Creates the secret file with its final permissions from the first
+  /// byte: a umask-based default (0644) tightened afterwards leaves a
+  /// crash window with a world-readable key, and a swallowed chmod error
+  /// would leave it that way. The create-exclusive open doubles as the
+  /// idempotency primitive: a concurrent creator of the same operation
+  /// loses the name and keeps the winner's bytes.
+  fn store_secret(&self, path: &Path, secret: &[u8; 32]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut file = {
+      use std::os::unix::fs::OpenOptionsExt as _;
+      std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(path)?;
+    file.write_all(secret)?;
+    // The key is the node's identity: the bytes must survive the power
+    // loss the provider's recovery semantics are written against.
+    file.sync_all()
+  }
+
+  /// Reads one stored secret, tightening a pre-existing file's
+  /// permissions to 0600 when an older writer (or an out-of-band copy)
+  /// left them wider; a chmod failure surfaces instead of being
+  /// swallowed (unix).
+  fn load_secret(&self, path: &Path) -> std::io::Result<[u8; 32]> {
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+      let metadata = fs::metadata(path)?;
+      if metadata.mode() & 0o777 != 0o600 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+      }
+    }
+    let bytes = fs::read(path)?;
+    bytes
+      .try_into()
+      .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad key length"))
+  }
 }
 
 impl KeyProvider for FileKeyProvider {
@@ -85,22 +136,22 @@ impl KeyProvider for FileKeyProvider {
     Box::pin(async move {
       let handle = Self::handle_for(operation)?;
       let path = self.secret_path(&handle);
-      let secret: [u8; 32] = match fs::read(&path) {
-        Ok(bytes) => bytes
-          .try_into()
-          .map_err(|_| corrupt())?,
+      let secret: [u8; 32] = match self.load_secret(&path) {
+        Ok(secret) => secret,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
           let mut fresh = [0u8; 32];
           getrandom::fill(&mut fresh).map_err(|_| {
             radiata::Error::provider(ProviderErrorKind::Io, ProviderErrorContext::Entropy)
           })?;
-          fs::write(&path, fresh).map_err(|error| io_error(&error))?;
-          #[cfg(unix)]
-          {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+          match self.store_secret(&path, &fresh) {
+            Ok(()) => fresh,
+            // Lost a concurrent creation of the same operation: the
+            // winner's secret is the committed one.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+              self.load_secret(&path).map_err(|error| io_error(&error))?
+            }
+            Err(error) => return Err(io_error(&error)),
           }
-          fresh
         }
         Err(error) => return Err(io_error(&error)),
       };
@@ -172,10 +223,6 @@ impl KeyProvider for FileKeyProvider {
 
 impl FileKeyProvider {
   fn load_signing(&self, handle: &KeyHandle) -> std::io::Result<SigningKey> {
-    let bytes = fs::read(self.secret_path(handle))?;
-    let secret: [u8; 32] = bytes
-      .try_into()
-      .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad key length"))?;
-    Ok(SigningKey::from_bytes(&secret))
+    Ok(SigningKey::from_bytes(&self.load_secret(&self.secret_path(handle))?))
   }
 }
