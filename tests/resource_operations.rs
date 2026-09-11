@@ -431,6 +431,16 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
 /// emits one event, and is idempotent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remove_resource_requires_the_exact_version() {
+  {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+      let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=debug"))
+        .with_test_writer()
+        .try_init();
+    });
+  }
   let node = start_node(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),

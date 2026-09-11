@@ -655,6 +655,13 @@ pub(super) struct Supervisor {
   /// member evidence (a restarted process's past-life sessions); later
   /// ticks never re-seed, so pruned departed members stay forgotten.
   pub(super) recovery_seeded: bool,
+  /// The highest resource-write stamp this writer has issued: a
+  /// writer's own successive writes must strictly outrank their
+  /// predecessor, so the issue clock advances at least one millisecond
+  /// per write and rides through wall-clock regressions (a
+  /// same-millisecond stamp would fall to the digest tie-break, and the
+  /// writer's own second write could lose to its first).
+  pub(super) resource_write_clock: std::sync::atomic::AtomicU64,
   // Intentionally disconnected peers: recovery never heals them until an
   // explicit reconnect (a new session to the peer) restores the
   // relationship (no-extra-edge).
@@ -782,6 +789,7 @@ impl Supervisor {
       published_endpoints,
       recovery_history: std::collections::BTreeSet::new(),
       recovery_seeded: false,
+      resource_write_clock: std::sync::atomic::AtomicU64::new(0),
       recovery_excluded: std::collections::BTreeSet::new(),
       sync_driver,
       trace_sink,
@@ -1309,7 +1317,11 @@ impl Supervisor {
     let mut attempts = 0_u32;
     loop {
       attempts += 1;
-      let timestamp_millis = crate::time::now_millis();
+      let observed = crate::time::now_millis();
+      let previous = self
+        .resource_write_clock
+        .fetch_max(observed, std::sync::atomic::Ordering::Relaxed);
+      let timestamp_millis = previous.saturating_add(1).max(observed);
       let record = crate::resource::ResourceRecordV1::sign_with_provider(
         write.name().clone(),
         labels.resource_type().clone(),
