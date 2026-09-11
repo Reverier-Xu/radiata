@@ -94,21 +94,13 @@ pub(crate) mod sync {
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<ResourcePage> {
-    let mut limit = limit.clamp(1, MAX_PAGE_RECORDS);
-    loop {
-      let page = emit_at_capacity(store, cursor, limit).await?;
-      if wire_payload_fits(&page)? {
-        return Ok(page);
-      }
-      if limit == 1 {
-        // One record is bounded far below the control bound, so the
-        // ladder terminates here with a deliverable page; reaching this
-        // arm means a bound regressed elsewhere — fail loudly instead of
-        // looping.
-        return Err(Error::resource_exhausted("resource page"));
-      }
-      limit /= 2;
-    }
+    crate::paging::emit_with_size_ladder(
+      limit.clamp(1, MAX_PAGE_RECORDS),
+      "resource page",
+      |limit| emit_at_capacity(store, cursor, limit),
+      wire_payload_fits,
+    )
+    .await
   }
 
   /// True when the page's full wire payload (page envelope plus sync
