@@ -694,3 +694,110 @@ total order verified by unit and integration tests.
 4. Export namespace/feature constants; de-duplicate lifecycle test harness.
 5. Wire or gate the speculative public surface (events, member_client_config,
    config defaults) before 0.1.0.
+
+---
+
+# Round 3 — Delta audit of the post-fix segment (2026-09-11, main @ 8bee21f)
+
+> Scope: full regression of the 2026-09-09 audit fixes (all STILL-FIXED,
+> see docs/audit-findings.md §9) + deep review of the never-audited segment
+> `9b23ce3..HEAD` (per-peer sync cursors, recovery seeding/forgetting,
+> MemberStatus, wildcard bind, resource stamp monotonic clock, loopback
+> benchmark). 4 reviewer lanes; supervisor re-verified every P1/P2 against
+> HEAD source. Q suite green (614/0). Verdict for the new segment: **BLOCK**
+> (3×P1, all one-line-class fixes + regression tests).
+
+### P1 (verified against HEAD source)
+
+1. **resource/sync.rs:229 — page fingerprint recorded on continuation
+   rounds.** `state.page_fingerprint = page_fp;` runs every round; catalogs
+   >1 page (16 records) record a tail-range fingerprint, so the next
+   from-scratch round never matches → quiet never true → full catalog
+   resend per peer per 250ms tick, forever. membership/sync.rs:720-724 does
+   it correctly (record only in the `starting_round` arm) — the divergence
+   is the proof. Fix: mirror membership; add a >16-record steady-state
+   zero-send regression test (the existing quiet test uses 1 record).
+2. **runtime/supervisor.rs:1320-1324 — issued stamp never folded back into
+   `resource_write_clock`.** `fetch_max(observed)` returns `previous` but
+   only stores `observed`: write#2 in one millisecond issues
+   `previous+1` while the clock stays at `observed`, so write#3+ repeat the
+   same stamp → digest tie-break → the writer's own later put can lose to
+   its earlier one (exactly what 8bee21f promised to prevent; only covers
+   the first pair per millisecond). Fix: after computing `timestamp_millis`,
+   `fetch_max(timestamp_millis, Relaxed)`; add a 3-writes-same-ms strictly
+   increasing test.
+3. **runtime/recovery.rs:164-165 + :220 — recovery_excluded peers counted
+   pending forever.** The direct-peer backfill inserts every alive-session
+   peer into `recovery_history` without checking `recovery_excluded`; an
+   intentionally-disconnected peer that reconnects *inbound* then loses its
+   session is pending (counted) but never dialable (:220 skips it) →
+   controller never quiesces, backoff pegged at max — same trap shape as
+   example-findings #11. Exclusion is only lifted on outbound
+   `connect_member` (supervisor.rs:1014). Fix: skip excluded peers in the
+   backfill, or clear exclusion on inbound session registration.
+
+### P2 hotspots (verified)
+
+- supervisor.rs:1410 — remove_resource uses raw `now_millis()`, bypassing
+  the monotonic issue clock (put-only invariant; rollback → removals
+  fail-conflict / later puts silently Superseded).
+- identity trust.rs:730,905 + records.rs:243 + cleanup.rs:363 —
+  `let _ = store.commit(..)` discards CommitOutcome (Conflict/Aborted/
+  Unknown treated as success) at four identity-side persist points.
+- recovery.rs:174-175 + views.rs:83-84 — every 2s tick / PageMembers runs
+  `usize::MAX`-cap full scans of all cleanup+leave tombstones (unbounded,
+  permanent).
+- views.rs:27,62 → membership/sync.rs ensure_local_descriptor — query path
+  mutates the member set without MemberChanged/revision bump (revision
+  contract breach + "no state transition here" doc breach + ghost doc
+  param at :477-479).
+- transport/registry.rs:33-34/305-310 + supervisor.rs:951-953 — close()
+  contract claims it releases the bound address; the real release is the
+  supervisor's abort dropping the task; both comments state the causality
+  backwards. No close→rebind regression test exists.
+- transport/registry.rs:183-196 — wildcard bind family chosen by *first
+  resolved address*; on Windows (IPV6_V6ONLY=1) an AAAA-first resolution
+  yields [::] that refuses all IPv4 dials.
+- examples/cluster/src/keys.rs:95-99 — reference FileKeyProvider writes
+  the secret (umask 0644) *then* chmods 0600; crash between = permanently
+  wide-open key file, chmod errors swallowed. Use OpenOptions mode(0o600).
+- Duplication cluster from the per-peer cursor landing (parallel state
+  machines membership/sync.rs:556-601 vs resource/sync.rs:142-169, same
+  32/128 cadence constants; halving ladders membership/page.rs:151-186 vs
+  resource/page.rs:87-125) — extract shared PeerPageCursor into
+  sync_common.rs / ladder into paging.rs.
+- purpose validation remains dual (pending.rs:753-761 vs records.rs:69-78)
+  and deterministic txn-id derivation is hand-rolled twice in storage
+  (receipt.rs:510-523, migration.rs:230-238).
+
+### False positive to remember
+
+- "fmt gate red at supervisor.rs:518 (`}      Control::RemoveResource {`)"
+  — rustfmt +nightly *preserves* that arm as-is (known complex-arm
+  behavior); `cargo +nightly fmt --all -- --check` exits 0. Cosmetic P3,
+  not a gate violation. Don't report fmt-red without running the gate.
+
+### Healthy (new segment)
+
+- 2026-09-09 audit fixes: all 3×P1 + sampled P2s verified STILL-FIXED with
+  HEAD line evidence (retention single-transaction multi-delete; trust
+  policy in identity::trust; NotTrusted propagation; Aborted→Err; rate
+  limiter check-before-record; TRUST_BINDING family gone; WIPE derived
+  from families; snapshot overflow isolation; liveness setter).
+- LimitedWriter rewrite (cbor.rs) correct: try_reserve_exact, atomic
+  reject-or-append, prefix-preserving, fully pinned by tests.
+- Wildcard bind + with_port publishing shape correct (advertised host +
+  bound port); teardown retry bounded; recovery seeding exclusions correct
+  at seed time; MemberStatus derived from terminal records at the view
+  layer only.
+- Fail-closed, bounded-queue, secret-redaction and tracing disciplines all
+  held across the new segment; no unsafe / prod unwrap / println anywhere.
+
+### Lesson for the next review
+
+- The two worst P1s (fingerprint overwrite, stamp fold-back) are *same-mechanism-two-lanes*
+  drift: one lane landed the correct shape, the other a near-miss. When a
+  mechanism exists in two lanes, diff the two implementations — the
+  divergence is the finding.
+- give each reviewer explicit "answer this question" items (lane B was
+  asked to compare against the membership-side shape and found it).
