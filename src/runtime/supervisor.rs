@@ -660,7 +660,8 @@ pub(super) struct Supervisor {
   /// predecessor, so the issue clock advances at least one millisecond
   /// per write and rides through wall-clock regressions (a
   /// same-millisecond stamp would fall to the digest tie-break, and the
-  /// writer's own second write could lose to its first).
+  /// writer's own second write could lose to its first). Both the put
+  /// and the remove paths issue through [`Self::issue_resource_stamp`].
   pub(super) resource_write_clock: std::sync::atomic::AtomicU64,
   // Intentionally disconnected peers: recovery never heals them until an
   // explicit reconnect (a new session to the peer) restores the
@@ -1289,6 +1290,15 @@ impl Supervisor {
     crate::membership::member_view(&updated, crate::ConnectivityStatus::Connected)
   }
 
+  /// Issues the next resource-write stamp for this node: strictly
+  /// greater than every stamp this writer has issued before, riding
+  /// through host wall-clock regressions. The issued stamp is folded
+  /// back into the issue clock so a third write inside the millisecond
+  /// that produced the second cannot reuse the same candidate stamp.
+  fn issue_resource_stamp(&self) -> u64 {
+    issue_write_stamp(&self.resource_write_clock)
+  }
+
   /// Commits one resource write intent as a signed candidate record
   /// (`PutResource`): the supervisor stamps the host wall-clock
   /// tuple, signs through the node's key provider, and commits the whole
@@ -1317,11 +1327,7 @@ impl Supervisor {
     let mut attempts = 0_u32;
     loop {
       attempts += 1;
-      let observed = crate::time::now_millis();
-      let previous = self
-        .resource_write_clock
-        .fetch_max(observed, std::sync::atomic::Ordering::Relaxed);
-      let timestamp_millis = previous.saturating_add(1).max(observed);
+      let timestamp_millis = self.issue_resource_stamp();
       let record = crate::resource::ResourceRecordV1::sign_with_provider(
         write.name().clone(),
         labels.resource_type().clone(),
@@ -1408,7 +1414,10 @@ impl Supervisor {
           true,
         ));
       }
-      let timestamp_millis = crate::time::now_millis();
+      // The removal rides the same monotonic issue clock as a put, so a
+      // writer removing its own fresh record always outranks it, and a
+      // rolled-back host clock cannot issue a stale-looking stamp.
+      let timestamp_millis = self.issue_resource_stamp();
       // A synced record may legally carry the maximum rank; a saturated
       // register cannot host a further removal and fails closed instead of
       // wrapping the rank order.
@@ -1771,4 +1780,53 @@ async fn keep_outbound_session(
     return Err(Error::internal("session registration"));
   }
   Ok(())
+}
+
+/// Issues the next resource-write stamp from the writer's issue clock:
+/// strictly greater than every stamp previously issued through this
+/// clock, and never below the observed wall clock. The issued stamp is
+/// folded back into the clock, so successive issues inside one
+/// millisecond keep advancing by one instead of colliding on
+/// `previous + 1` and falling to the register's digest tie-break.
+fn issue_write_stamp(clock: &std::sync::atomic::AtomicU64) -> u64 {
+  issue_write_stamp_since(clock, crate::time::now_millis())
+}
+
+/// [`issue_write_stamp`] against an injected observation, so the
+/// same-millisecond collision the fold prevents stays deterministic to
+/// test.
+fn issue_write_stamp_since(clock: &std::sync::atomic::AtomicU64, observed: u64) -> u64 {
+  let previous = clock.fetch_max(observed, std::sync::atomic::Ordering::Relaxed);
+  let stamp = previous.saturating_add(1).max(observed);
+  clock.fetch_max(stamp, std::sync::atomic::Ordering::Relaxed);
+  stamp
+}
+
+#[cfg(test)]
+mod resource_stamp_tests {
+  use super::issue_write_stamp_since;
+
+  #[test]
+  fn stamps_advance_inside_one_millisecond() {
+    let clock = std::sync::atomic::AtomicU64::new(0);
+    // Three issues inside the same observed millisecond: the second
+    // issue advances past the first without moving the clock, so the
+    // fold-back is what keeps the third from reusing the second's stamp.
+    let first = issue_write_stamp_since(&clock, 1_000);
+    let second = issue_write_stamp_since(&clock, 1_000);
+    let third = issue_write_stamp_since(&clock, 1_000);
+    assert_eq!(first, 1_000);
+    assert_eq!(second, 1_001);
+    assert_eq!(third, 1_002);
+  }
+
+  #[test]
+  fn stamps_ride_through_wall_clock_regressions() {
+    let clock = std::sync::atomic::AtomicU64::new(0);
+    let _ = issue_write_stamp_since(&clock, 5_000);
+    // A rolled-back observation issues above the last stamp, never below.
+    let next = issue_write_stamp_since(&clock, 4_000);
+    assert_eq!(next, 5_001);
+    assert!(clock.load(std::sync::atomic::Ordering::Relaxed) >= next);
+  }
 }
