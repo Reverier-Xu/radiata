@@ -494,6 +494,103 @@ async fn recovery_quiesces_after_a_member_departs() {
   b.command(Shutdown::new()).await.unwrap();
 }
 
+/// An intentionally disconnected member must never re-enter the
+/// recovery plane through a passive inbound session: exclusion is lifted
+/// only by a deliberate caller connect. If the inbound session re-seeded
+/// the known-online set, the excluded peer would be counted pending (but
+/// never dialable) once that session dropped — the controller would stay
+/// Recovering forever and peg the dial backoff at its maximum, the same
+/// trap a departed identity's pruning avoids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_stays_quiet_when_an_excluded_peer_reconnects_inbound() {
+  let a_storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let b_storage = Arc::new(common::MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ));
+  let a = NodeBuilder::new(
+    a_storage,
+    Arc::new(LeaveKeys::with_base(600)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let b = NodeBuilder::new(
+    b_storage,
+    Arc::new(LeaveKeys::with_base(700)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let a_endpoint = a
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap()
+    .endpoint()
+    .clone();
+  common::merge_with_retry(&b, &a, a_endpoint.clone()).await;
+  let a_id = a
+    .query(radiata::GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  let b_id = b
+    .query(radiata::GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  // Let one recovery tick observe the connected b, so the history
+  // genuinely contains it before the disconnect.
+  tokio::time::sleep(Duration::from_secs(5)).await;
+
+  // a disconnects b: b leaves a's recovery plane (history pruned,
+  // exclusion recorded).
+  a.command(radiata::DisconnectPeer::new(b_id.clone()))
+    .await
+    .unwrap();
+  // b dials back on its own: a accepts the inbound member session, but
+  // that passive session must not restore b to a's recovery plane.
+  b.command(radiata::ConnectMember::new(a_endpoint, a_id.clone()))
+    .await
+    .unwrap();
+  // Let a recovery tick observe the alive inbound session (the buggy
+  // behavior would re-seed the excluded peer into the history here).
+  tokio::time::sleep(Duration::from_secs(5)).await;
+  // b drops the session from its side: the excluded peer must not
+  // surface as permanently unreachable on a.
+  b.command(radiata::DisconnectPeer::new(a_id.clone()))
+    .await
+    .unwrap();
+
+  let quiesced = tokio::time::timeout(Duration::from_secs(30), async {
+    let mut settled = 0_u32;
+    loop {
+      let view = a.query(radiata::GetRecovery::new()).await.unwrap();
+      assert_eq!(
+        view.unreachable_components(),
+        0,
+        "the excluded peer is pending as unreachable after its session dropped"
+      );
+      settled += 1;
+      if settled >= 6 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+  })
+  .await;
+  assert!(
+    quiesced.is_ok(),
+    "the recovery view never settled after the excluded peer's session dropped"
+  );
+
+  a.command(Shutdown::new()).await.unwrap();
+  b.command(Shutdown::new()).await.unwrap();
+}
+
 /// With no connected session the announcement has nobody to
 /// acknowledge it, so no wait engages and the leave completes immediately
 /// (silent leave degrades to the cleanup path).
