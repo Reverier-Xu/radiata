@@ -972,8 +972,10 @@ impl Supervisor {
     let Some((endpoint, listener_handle, abort)) = self.listeners.remove(listener) else {
       return Err(Error::not_found("listener"));
     };
-    // Close releases the bound address immediately (a later rebind on the
-    // same port works); aborting the accept task alone would not.
+    // Close only wakes the pending accept so it observes the shutdown;
+    // the address is released by dropping the listener — the removal
+    // above and the aborted accept task drop the last owners, so a
+    // later rebind on the same port works.
     let _ = listener_handle.close().await;
     abort.abort();
     if let Ok(mut endpoints) = self.published_endpoints.lock() {
