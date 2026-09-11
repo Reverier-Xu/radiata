@@ -9,10 +9,9 @@
 //!   accepted.
 //! - The aggregate message limit is 65,552 bytes: the handshake/control CBOR
 //!   body ceiling (65,536) plus one 16-byte prelude. tungstenite enforces it
-//!   while reassembling fragments, so a fragmented hostile message is bounded
-//!   before the body is exposed. Single-frame parsing keeps the tungstenite
-//!   default guard (16 MiB); the aggregate limit above is the authoritative
-//!   bound.
+//!   while reassembling fragments, and the frame guard is bound to the same
+//!   ceiling, so a fragmented hostile message is bounded before the body is
+//!   exposed.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{
@@ -170,9 +169,6 @@ fn check_path(
       } else {
         match HeaderValue::from_str(&crate::hex::encode(hint.leaf_spki())) {
           Ok(spki) => Some(spki),
-          // The hint values are canonical ASCII by construction; a
-          // render failure is an internal bug and rejects the upgrade
-          // outright instead of emitting a partial hint.
           Err(_) => {
             let mut rejection = ErrorResponse::new(Some("invalid merge hint".to_owned()));
             *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;

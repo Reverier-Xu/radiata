@@ -19,6 +19,8 @@ pub(crate) const BUILTIN_DOMAIN: &str = "radiata.woooo.tech";
 pub(crate) const CATEGORY_CRYPTO: &str = "crypto";
 pub(crate) const CATEGORY_LIMITS: &str = "limits";
 pub(crate) const CATEGORY_METADATA: &str = "metadata";
+pub(crate) const CATEGORY_RESOURCES: &str = "resources";
+pub(crate) const CATEGORY_LABELS: &str = "labels";
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QualifiedTag {

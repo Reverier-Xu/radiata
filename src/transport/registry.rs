@@ -191,7 +191,8 @@ impl Transport for WssTransport {
       let tcp = match endpoint.host().parse::<std::net::IpAddr>() {
         Ok(ip) => tokio::net::TcpListener::bind(std::net::SocketAddr::new(ip, port))
           .await
-          .map_err(|_| {
+          .map_err(|error| {
+            tracing::debug!(address = %ip, error = %error, "transport bind failed");
             Error::provider(
               crate::ProviderErrorKind::Io,
               crate::ProviderErrorContext::TransportBind,
@@ -199,14 +200,24 @@ impl Transport for WssTransport {
           })?,
         Err(_) => match bind_dual_stack(port).await {
           Ok(tcp) => tcp,
-          Err(_) => tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
-            .await
-            .map_err(|_| {
-              Error::provider(
-                crate::ProviderErrorKind::Io,
-                crate::ProviderErrorContext::TransportBind,
-              )
-            })?,
+          Err(error) => {
+            // The host has no IPv6: fall back to the ipv4 wildcard, but
+            // say so — an operator debugging inbound reachability needs
+            // to know which family the listener actually took.
+            tracing::debug!(
+              error = %error,
+              "dual-stack wildcard bind unavailable; falling back to ipv4"
+            );
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+              .await
+              .map_err(|error| {
+                tracing::debug!(error = %error, "ipv4 wildcard bind failed");
+                Error::provider(
+                  crate::ProviderErrorKind::Io,
+                  crate::ProviderErrorContext::TransportBind,
+                )
+              })?
+          }
         },
       };
       let bound = tcp
@@ -222,10 +233,16 @@ impl Transport for WssTransport {
         shutdown: shutdown_rx,
         config,
         rules,
-        leaf: certificate
-          .leaf_spki()
-          .ok()
-          .map(|spki| spki.as_ref().to_vec()),
+        leaf: match certificate.leaf_spki() {
+          Ok(spki) => Some(spki.as_ref().to_vec()),
+          // Without the SPKI the join hint loses its reconnect anchor
+          // (member-mode dialing cannot pin). This is a soft degradation,
+          // but it must never happen silently.
+          Err(error) => {
+            tracing::warn!(kind = ?error.kind(), "leaf spki unavailable; serving hint without pin");
+            None
+          }
+        },
         bound: Endpoint::from_socket_addr(bound),
       }) as Box<dyn TransportListener>)
     })
@@ -237,7 +254,10 @@ impl Transport for WssTransport {
     Box::pin(async move {
       let tcp = tokio::net::TcpStream::connect(endpoint.authority())
         .await
-        .map_err(|_| {
+        .map_err(|error| {
+          // The typed failure stays coarse, but the OS reason (refused,
+          // dns, timeout) reaches diagnostics instead of vanishing.
+          tracing::debug!(endpoint = %endpoint.as_str(), error = %error, "transport dial failed");
           Error::provider(
             crate::ProviderErrorKind::Io,
             crate::ProviderErrorContext::TransportConnect,

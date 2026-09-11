@@ -87,15 +87,6 @@ pub(crate) fn record_terminal_failure(
   let _ = insert_route(routes, capacity, record);
 }
 
-/// Records one bounded terminal route fact for an admission rejection:
-/// identity and typed failure only, never payload bytes, always within
-/// the node's configured route-record capacity.
-pub(crate) fn record_rejection(
-  routes: &RouteTable, capacity: usize, trace_id: &TraceId, kind: ErrorKind,
-) {
-  record_terminal_failure(routes, capacity, trace_id, kind);
-}
-
 #[cfg(test)]
 mod terminal_failure_tests {
   use std::{

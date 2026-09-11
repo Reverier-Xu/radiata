@@ -46,7 +46,7 @@ use crate::{
   protocol::wire::PacketKind,
   routing::{
     forward::{self, PendingAck, PendingAcks},
-    table::{RouteTable, record_rejection, update_route},
+    table::{RouteTable, record_terminal_failure, update_route},
   },
   transport::connection::{Connection, ConnectionReader, ConnectionWriter},
 };
@@ -1145,7 +1145,7 @@ async fn admit_open(
       // The rejection is recorded as bounded terminal route metadata
       // within the node's configured route-record capacity.
       _ => {
-        record_rejection(
+        record_terminal_failure(
           &context.routes,
           context.route_capacity(),
           &trace_id,
@@ -1330,8 +1330,10 @@ pub(crate) async fn run_outbound(
 
   // Selector-selected and multi-hop-routed deliveries carry the route
   // envelope: every hop re-validates the chain before admission. Direct
-  // exact-node sends carry no envelope.
-  let route = if force_routed || matches!(request.target, StreamTarget::MatchingNodes(_)) {
+  // exact-node sends carry no envelope. (Matching-node targets were
+  // rejected above; `force_routed` is the only remaining envelope
+  // trigger.)
+  let route = if force_routed {
     Some(
       crate::routing::RouteContext::new(
         trace_id.clone(),
@@ -2151,8 +2153,8 @@ mod admission_tests {
   #[tokio::test]
   async fn rejections_record_one_terminal_fact() {
     let routes: super::RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-    super::record_rejection(&routes, 8, &trace(9), crate::ErrorKind::Unsupported);
-    super::record_rejection(&routes, 8, &trace(9), crate::ErrorKind::Unsupported);
+    super::record_terminal_failure(&routes, 8, &trace(9), crate::ErrorKind::Unsupported);
+    super::record_terminal_failure(&routes, 8, &trace(9), crate::ErrorKind::Unsupported);
 
     let table = routes.lock().unwrap();
     assert_eq!(table.len(), 1);
@@ -2170,7 +2172,7 @@ mod admission_tests {
   async fn rejections_stay_within_the_route_capacity() {
     let routes: super::RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     for seed in 1..=4 {
-      super::record_rejection(&routes, 3, &trace(seed), crate::ErrorKind::Unsupported);
+      super::record_terminal_failure(&routes, 3, &trace(seed), crate::ErrorKind::Unsupported);
     }
 
     let table = routes.lock().unwrap();

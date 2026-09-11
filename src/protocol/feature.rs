@@ -167,7 +167,7 @@ impl FeatureDefinition {
 
   /// The immutable contract fingerprint included in the definition digest
   /// input.
-  #[allow(dead_code)]
+  #[cfg(test)]
   pub(crate) const fn fingerprint(&self) -> &Digest {
     &self.fingerprint
   }

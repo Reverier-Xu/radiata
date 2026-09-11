@@ -136,7 +136,7 @@ impl FeatureOffer {
   }
 
   /// The offered numeric limit map.
-  #[allow(dead_code)]
+  #[cfg(test)]
   pub(crate) fn limits(&self) -> &[(QualifiedTag, u64)] {
     &self.limits
   }

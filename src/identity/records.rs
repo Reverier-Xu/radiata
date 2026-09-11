@@ -249,10 +249,6 @@ pub(crate) fn skip_none(_: &StoreKey) -> bool {
 
 /// The shared bounded known-records scan for the terminal tombstone
 /// families: one ordered namespace scan decoded through `decode`, capped
-/// at `cap` records, skipping keys the family excludes (the leave intent
-/// singleton shares its family's namespace).
-/// The shared bounded known-records scan for the terminal tombstone
-/// families: one ordered namespace scan decoded through `decode`, capped
 /// at `cap` records, skipping keys `skip` excludes (the leave intent
 /// singleton shares its family's namespace). Function pointers keep the
 /// returned future's Send proof simple; the decoders are associated

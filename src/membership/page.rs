@@ -167,9 +167,7 @@ pub(crate) mod sync {
   async fn emit_at_capacity(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<MembershipPage> {
-    let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
-      super::super::NODE_DESCRIPTOR_NAMESPACE,
-    )?);
+    let namespace = crate::storage::families::namespace(super::super::NODE_DESCRIPTOR_NAMESPACE)?;
     let snapshot = store.snapshot().await?;
     let paged = crate::paging::scan_paged(
       snapshot.as_ref(),

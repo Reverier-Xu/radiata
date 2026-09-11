@@ -303,7 +303,7 @@ impl Handshake {
 
   /// The locally computed deterministic selection bytes retained from the
   /// negotiated selection.
-  #[allow(dead_code)]
+  #[cfg(test)]
   pub(crate) fn selection_bytes(&self) -> Option<&[u8]> {
     self.selection.as_ref().map(Selection::bytes)
   }

@@ -36,7 +36,10 @@ fn status_tag(name: &str) -> QualifiedTag {
 async fn status(state: State<SharedState>) -> Json<Value> {
   let node = &state.node;
   let observability = node.query(GetObservability::new()).await;
-  let members: Option<MemberPage> = node.query(PageMembers::new(PageSpec::first(64).unwrap())).await.ok();
+  let members: Option<MemberPage> = node
+    .query(PageMembers::new(PageSpec::first(64).unwrap()))
+    .await
+    .ok();
   let member_count = members.as_ref().map_or(0, |page| page.items().len());
   let counter = |name: &str| {
     observability
@@ -86,17 +89,33 @@ async fn join(
     attempt += 1;
     let token = http_client::get_json(&request.bootstrap_http, "/join-token")
       .await
-      .map_err(|error| (StatusCode::BAD_GATEWAY, Json(json!({"error": error.to_string()}))))?;
-    let secret = token["credential"]
-      .as_str()
-      .ok_or_else(|| (StatusCode::BAD_GATEWAY, Json(json!({"error": "no credential"}))))?;
-    let credential = MergeCredential::parse(secret)
-      .map_err(|error| (StatusCode::BAD_GATEWAY, Json(json!({"error": error.to_string()}))))?;
+      .map_err(|error| {
+        (
+          StatusCode::BAD_GATEWAY,
+          Json(json!({"error": error.to_string()})),
+        )
+      })?;
+    let secret = token["credential"].as_str().ok_or_else(|| {
+      (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": "no credential"})),
+      )
+    })?;
+    let credential = MergeCredential::parse(secret).map_err(|error| {
+      (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
     match state
       .node
       .command(MergeCluster::new(
-        radiata::Endpoint::parse(&request.bootstrap_wss)
-          .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?,
+        radiata::Endpoint::parse(&request.bootstrap_wss).map_err(|error| {
+          (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+          )
+        })?,
         credential,
       ))
       .await
@@ -130,15 +149,28 @@ pub struct ConnectRequest {
 async fn connect(
   state: State<SharedState>, Json(request): Json<ConnectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let endpoint = radiata::Endpoint::parse(&request.endpoint)
-    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
-  let node_id = NodeId::parse(&request.node_id)
-    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
+  let endpoint = radiata::Endpoint::parse(&request.endpoint).map_err(|error| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
+  let node_id = NodeId::parse(&request.node_id).map_err(|error| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
   let connected = state
     .node
     .command(ConnectMember::new(endpoint, node_id))
     .await
-    .map_err(|error| (StatusCode::BAD_GATEWAY, Json(json!({"error": error.to_string()}))))?;
+    .map_err(|error| {
+      (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
   Ok(Json(json!({"connected": connected.as_str()})))
 }
 
@@ -152,13 +184,22 @@ pub struct DisconnectRequest {
 async fn disconnect(
   state: State<SharedState>, Json(request): Json<DisconnectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let node_id = NodeId::parse(&request.node_id)
-    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
+  let node_id = NodeId::parse(&request.node_id).map_err(|error| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
   state
     .node
     .command(radiata::DisconnectPeer::new(node_id))
     .await
-    .map_err(|error| (StatusCode::BAD_GATEWAY, Json(json!({"error": error.to_string()}))))?;
+    .map_err(|error| {
+      (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
   Ok(Json(json!({"disconnected": true})))
 }
 
@@ -173,7 +214,12 @@ async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Js
       ReplaceIdentityAndDeleteOldCoreMetadata::new(),
     ))
     .await
-    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error.to_string()}))))?;
+    .map_err(|error| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
   Ok(Json(json!({
     "left": true,
     "former_identity": outcome.former_identity().as_str(),
@@ -183,7 +229,12 @@ async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Js
 
 fn version_json(view: &radiata::ResourceView) -> Value {
   let version = view.version();
-  let digest: String = version.digest().as_bytes().iter().map(|byte| format!("{byte:02x}")).collect();
+  let digest: String = version
+    .digest()
+    .as_bytes()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
   json!({
     "timestamp_millis": version
       .timestamp()
@@ -235,32 +286,59 @@ pub struct ResourcePut {
 }
 
 async fn put_resource(
-  state: State<SharedState>, AxumPath(name): AxumPath<String>,
-  Json(request): Json<ResourcePut>,
+  state: State<SharedState>, AxumPath(name): AxumPath<String>, Json(request): Json<ResourcePut>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let name = ResourceName::parse(&name)
-    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
-  let resource_type = LabelValue::parse(&request.resource_type)
-    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
-  let uri = ResourceUri::parse(&request.uri)
-    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
+  let name = ResourceName::parse(&name).map_err(|error| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
+  let resource_type = LabelValue::parse(&request.resource_type).map_err(|error| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
+  let uri = ResourceUri::parse(&request.uri).map_err(|error| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
   let mut labels = ResourceLabels::new(resource_type, uri);
   for (key, value) in request.labels {
-    let key = LabelKey::parse(&key)
-      .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
-    let value = LabelValue::parse(&value)
-      .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
-    labels = labels
-      .custom(key, value)
-      .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
+    let key = LabelKey::parse(&key).map_err(|error| {
+      (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
+    let value = LabelValue::parse(&value).map_err(|error| {
+      (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
+    labels = labels.custom(key, value).map_err(|error| {
+      (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
   }
-  let put = PutResource::new(ResourceWrite::new(name, labels))
-    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
-  let outcome = state
-    .node
-    .command(put)
-    .await
-    .map_err(|error| (StatusCode::CONFLICT, Json(json!({"error": error.to_string()}))))?;
+  let put = PutResource::new(ResourceWrite::new(name, labels)).map_err(|error| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
+  let outcome = state.node.command(put).await.map_err(|error| {
+    (
+      StatusCode::CONFLICT,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
   Ok(Json(json!({
     "accepted": true,
     "is_winner": outcome.is_current_winner(),
@@ -271,7 +349,9 @@ async fn put_resource(
 async fn list_resources(state: State<SharedState>) -> Result<Json<Value>, StatusCode> {
   let page = state
     .node
-    .query(PageResources::new(PageSpec::first(64).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?))
+    .query(PageResources::new(
+      PageSpec::first(64).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
   let items: Vec<Value> = page
@@ -296,7 +376,9 @@ async fn stream_probe(state: State<SharedState>) -> Result<Json<Value>, (StatusC
   // its target from the live session table.
   let sessions = state
     .node
-    .query(PageSessions::new(PageSpec::first(64).map_err(internal_error)?))
+    .query(PageSessions::new(
+      PageSpec::first(64).map_err(internal_error)?,
+    ))
     .await
     .map_err(internal_error)?;
   let peer = sessions
@@ -318,18 +400,28 @@ async fn stream_probe(state: State<SharedState>) -> Result<Json<Value>, (StatusC
       StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
       StreamMetadata::new(),
     )
-    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error.to_string()}))))?;
+    .map_err(|error| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
   let body = futures_util::stream::iter([Ok(Arc::from(vec![0xA5u8; 1024].into_boxed_slice()))]);
-  stream
-    .send_sync(body)
-    .await
-    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error.to_string()}))))?;
+  stream.send_sync(body).await.map_err(|error| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
   let acked = started.elapsed();
   Ok(Json(json!({"ack_us": acked.as_micros() as u64})))
 }
 
 pub fn internal_error(error: radiata::Error) -> (StatusCode, Json<Value>) {
-  (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error.to_string()})))
+  (
+    StatusCode::INTERNAL_SERVER_ERROR,
+    Json(json!({"error": error.to_string()})),
+  )
 }
 
 pub fn router(state: SharedState) -> Router {

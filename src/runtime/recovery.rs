@@ -168,7 +168,13 @@ impl Supervisor {
     let snapshot = store.snapshot().await?;
     let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
     while let Some(entry) = scan.next().await? {
-      if let Ok(descriptor) = crate::membership::page::decode_descriptor(entry.value().as_bytes()) {
+      let decoded = crate::membership::page::decode_descriptor(entry.value().as_bytes());
+      if let Err(error) = &decoded {
+        // Seeding is best-effort over durable evidence; a corrupt entry
+        // skips this round, but never silently.
+        tracing::debug!(kind = ?error.kind(), "recovery seed skipped an undecodable descriptor");
+      }
+      if let Ok(descriptor) = decoded {
         let node = descriptor.node();
         if !descriptor.removed()
           && node != local
@@ -293,12 +299,21 @@ impl Supervisor {
       if !bindings.contains_key(member) {
         continue;
       }
-      let descriptor =
+      let descriptor_read =
         crate::membership::store::read_descriptor_snapshot(snapshot.as_ref(), member).await;
-      if let Ok(Some(descriptor)) = descriptor
-        && let Some(endpoint) = descriptor.endpoints().first()
-      {
-        candidates.insert((member.clone(), endpoint.clone()));
+      match descriptor_read {
+        Ok(Some(descriptor)) => match descriptor.endpoints().first() {
+          Some(endpoint) => {
+            candidates.insert((member.clone(), endpoint.clone()));
+          }
+          // No published endpoint: recovery stays best-effort, but the
+          // skip is visible in diagnostics instead of silent.
+          None => tracing::debug!(member = %member.as_str(), "no published endpoint; skipped"),
+        },
+        Ok(None) => tracing::debug!(member = %member.as_str(), "no descriptor; skipped"),
+        Err(error) => {
+          tracing::debug!(member = %member.as_str(), kind = ?error.kind(), "descriptor read failed; skipped")
+        }
       }
     }
     let step = self.recovery.next_step(

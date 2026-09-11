@@ -35,7 +35,10 @@ fn body_of(raw: &str) -> std::io::Result<Value> {
     .split_once("\r\n\r\n")
     .map(|(_, body)| body)
     .ok_or_else(|| std::io::Error::other("malformed http response"))?;
-  if raw.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+  if raw
+    .to_ascii_lowercase()
+    .contains("transfer-encoding: chunked")
+  {
     let mut decoded = String::new();
     let mut rest = body;
     loop {

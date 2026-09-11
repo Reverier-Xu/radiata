@@ -22,8 +22,8 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use radiata::{
   BoxFuture, CreatedKey, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
   KeyOperationId, ProviderErrorContext, ProviderErrorKind, PublicKey, Result, Signature,
+  extension::KeyProvider,
 };
-use radiata::extension::KeyProvider;
 
 fn io_error(error: &std::io::Error) -> radiata::Error {
   let kind = match error.kind() {
@@ -35,7 +35,10 @@ fn io_error(error: &std::io::Error) -> radiata::Error {
 }
 
 fn corrupt() -> radiata::Error {
-  radiata::Error::provider(ProviderErrorKind::StorageCorrupt, ProviderErrorContext::KeySign)
+  radiata::Error::provider(
+    ProviderErrorKind::StorageCorrupt,
+    ProviderErrorContext::KeySign,
+  )
 }
 
 #[derive(Debug)]
@@ -66,9 +69,7 @@ impl FileKeyProvider {
   }
 
   fn present(&self, handle: KeyHandle) -> Result<KeyCreateState> {
-    let signing = self
-      .load_signing(&handle)
-      .map_err(|_| corrupt())?;
+    let signing = self.load_signing(&handle).map_err(|_| corrupt())?;
     Ok(KeyCreateState::Present(CreatedKey::new(
       handle,
       PublicKey::from_bytes(signing.verifying_key().to_bytes()),
@@ -178,8 +179,7 @@ impl KeyProvider for FileKeyProvider {
 
   fn public_key<'a>(&'a self, handle: &'a KeyHandle) -> BoxFuture<'a, Result<PublicKey>> {
     Box::pin(async move {
-      let signing =
-        self.load_signing(handle).map_err(|_| corrupt())?;
+      let signing = self.load_signing(handle).map_err(|_| corrupt())?;
       Ok(PublicKey::from_bytes(signing.verifying_key().to_bytes()))
     })
   }
@@ -188,9 +188,7 @@ impl KeyProvider for FileKeyProvider {
     &'a self, handle: &'a KeyHandle, message: &'a [u8],
   ) -> BoxFuture<'a, Result<Signature>> {
     Box::pin(async move {
-      let signing = self
-        .load_signing(handle)
-        .map_err(|_| corrupt())?;
+      let signing = self.load_signing(handle).map_err(|_| corrupt())?;
       Ok(Signature::from_bytes(signing.sign(message).to_bytes()))
     })
   }
@@ -223,6 +221,8 @@ impl KeyProvider for FileKeyProvider {
 
 impl FileKeyProvider {
   fn load_signing(&self, handle: &KeyHandle) -> std::io::Result<SigningKey> {
-    Ok(SigningKey::from_bytes(&self.load_secret(&self.secret_path(handle))?))
+    Ok(SigningKey::from_bytes(
+      &self.load_secret(&self.secret_path(handle))?,
+    ))
   }
 }

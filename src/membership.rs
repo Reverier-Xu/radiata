@@ -165,11 +165,6 @@ pub(crate) fn node_descriptor_digest(descriptor: &NodeDescriptorV1) -> Result<cr
   ))
 }
 
-/// The single descriptor → public member view mapper: annotates the
-/// owner-revision descriptor with the session-table connectivity decision.
-/// Every public member view (exact lookup, paged population read, and
-/// routed candidate reads) flows through here so the view shape cannot
-/// drift between them.
 /// Applies one owner-only metadata patch to a descriptor and returns the
 /// descriptor at the next revision (owner records): endpoint adds
 /// must be new, endpoint removals must exist, label set/insert flows
@@ -223,6 +218,11 @@ pub(crate) fn apply_metadata_patch(
   )
 }
 
+/// The single descriptor → public member view mapper: annotates the
+/// owner-revision descriptor with the session-table connectivity decision.
+/// Every public member view (exact lookup, paged population read, and
+/// routed candidate reads) flows through here so the view shape cannot
+/// drift between them.
 pub(crate) fn member_view(
   descriptor: &NodeDescriptorV1, status: crate::ConnectivityStatus,
 ) -> Result<crate::MemberView> {

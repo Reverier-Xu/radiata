@@ -671,9 +671,7 @@ pub(crate) mod store {
   const REVISION_KEY_DIGITS: usize = 20;
 
   fn snapshot_namespace() -> Result<StoreNamespace> {
-    Ok(StoreNamespace::new(crate::QualifiedTag::parse(
-      TRUST_SNAPSHOT_NAMESPACE,
-    )?))
+    crate::storage::families::namespace(TRUST_SNAPSHOT_NAMESPACE)
   }
 
   fn snapshot_key(issuer: &NodeId, revision: u64) -> StoreKey {

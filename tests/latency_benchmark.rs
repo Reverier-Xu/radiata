@@ -294,7 +294,7 @@ async fn lane_radiata() {
 }
 
 /// The radiata throughput lane: 32 sequential streams of 1 MiB each.
-/// The session queue is a bounded flow-control window (16 MiB): one
+/// The session queue is a bounded flow-control window (8 MiB): one
 /// single stream bursting past it ends with `StreamInterrupted` by
 /// design, so sustainable throughput is measured stream by stream.
 async fn lane_radiata_throughput() {
