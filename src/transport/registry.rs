@@ -30,7 +30,11 @@ pub(crate) trait TransportListener: fmt::Debug + Send + Sync + 'static {
     &'a self, hint: &'a (dyn Fn() -> Option<MergeHint> + Send + Sync),
   ) -> BoxFuture<'a, Result<super::connection::Connection>>;
 
-  /// Closes the listener and releases its bound address.
+  /// Signals shutdown: a pending [`Self::accept`] returns the transport's
+  /// shutdown error promptly instead of waiting for a connection. The
+  /// bound address itself is released when the listener is dropped
+  /// (callers own that lifetime): signal, drop, then rebind on the same
+  /// port works.
   fn close<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
 }
 
@@ -304,9 +308,9 @@ impl TransportListener for WssListener {
 
   fn close<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
-      // Signalling wakes the pending accept, which drops the listener and
-      // releases the bound address: close-then-rebind works (the previous
-      // no-op did not).
+      // Signalling only wakes a pending accept (it returns the shutdown
+      // error); the socket stays bound until the owner drops the
+      // listener, which is what releases the address for a rebind.
       let _ = self.shutdown_tx.send(());
       Ok(())
     })
@@ -465,6 +469,43 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(listener.local_endpoint().host(), "127.0.0.1");
+  }
+
+  /// The close contract: the signal wakes a pending accept with the
+  /// shutdown error, and dropping the listener releases the bound
+  /// address, so signal-drop-rebind on the same port works. This pins
+  /// the supervisor's stop sequence (close, abort, rebind) at the
+  /// registry level, where a second transport implementation would have
+  /// to reproduce it.
+  #[tokio::test]
+  async fn close_then_drop_releases_the_bound_port_for_rebind() {
+    let transport = WssTransport::new();
+    let listener = transport
+      .bind(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+      .await
+      .unwrap();
+    let port = listener.local_endpoint().port();
+
+    // The signal arrives before the accept call: the watch receiver has
+    // an unseen change, so the accept must resolve immediately with the
+    // shutdown error instead of waiting for a connection.
+    listener.close().await.unwrap();
+    let outcome =
+      tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept(&|| None))
+        .await
+        .expect("the signalled accept must wake, never hang");
+    assert_eq!(outcome.unwrap_err().kind(), ErrorKind::ShuttingDown);
+
+    // Dropping the listener releases the bound address; the same port
+    // rebinds successfully.
+    drop(listener);
+    let rebound = tokio::time::timeout(
+      std::time::Duration::from_secs(5),
+      transport.bind(Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap()),
+    )
+    .await
+    .expect("the same-port rebind timed out");
+    assert_eq!(rebound.unwrap().local_endpoint().port(), port);
   }
 
   #[tokio::test]
