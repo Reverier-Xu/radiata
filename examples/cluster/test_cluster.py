@@ -195,6 +195,40 @@ def put_and_converge(writer: int, name: str, value: str) -> tuple[float, str, li
     return time.monotonic() - started, digest, lagging
 
 
+def phase_same_writer_rapid_writes() -> None:
+    """One writer fires three puts at the same key back to back — inside
+    one wall-clock millisecond, usually. The LWW register's stamp issue
+    must be strictly monotonic per writer (folded-back issue clock), so
+    the LAST write wins on every node and the first two never resurface
+    (findings 8bee21f / 83eac04)."""
+    print("[correctness] rapid same-writer triple write must land the last value")
+    name = "demo.org/resources/rapid-triple"
+    digests = [
+        http("PUT", 2, f"/resources/{name}", {
+            "type": "demo",
+            "uri": f"radiata://demo/{name}",
+            "labels": {"demo.org/labels/value": f"rapid-{index}"},
+        })["version"]["digest"]
+        for index in range(3)
+    ]
+    assert len(set(digests)) == 3, "three distinct writes must yield three distinct digests"
+    deadline = time.monotonic() + 30
+    while True:
+        lagging = [
+            node for node in range(1, N + 1)
+            if podman_state(node) == "running"
+            and (try_http("GET", node, f"/resources/{name}", timeout=2) or {}).get(
+                "version", {}
+            ).get("digest") != digests[-1]
+        ]
+        if not lagging:
+            break
+        if time.monotonic() > deadline:
+            raise SystemExit(f"rapid triple write never settled on the last value; lagging: {lagging}")
+        time.sleep(0.05)
+    print(f"[correctness] rapid triple write landed the last value on all nodes")
+
+
 def phase_correctness_and_latency() -> dict:
     print("[correctness] 30 writes from random writers; every node must match")
     convergence: list[float] = []
@@ -325,6 +359,7 @@ def main() -> None:
 
     print("[correctness] verifying the shaped graph stays converged")
     put_and_converge(3, "demo.org/resources/bootstrap-check", "post-topology")
+    phase_same_writer_rapid_writes()
 
     report = phase_correctness_and_latency()
     phase_fault_recovery(report)

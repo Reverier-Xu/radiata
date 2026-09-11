@@ -41,7 +41,7 @@ for i in $(seq 2 "$N"); do
   echo "starting n$i (joins are driven by the test harness, one at a time)..."
   podman run -d --name "n$i" --hostname "n$i" --network "$NETWORK" \
     -v "radiata-data-$i:/data" \
-    -e "LISTEN=wss://n$i:9443" \
+    -e "LISTEN=wss://n$i:9443" -e "RUST_LOG=${RUST_LOG:-info}" \
     -p "$((BASE_HTTP_PORT + i)):8080" \
     "$IMAGE"
 done

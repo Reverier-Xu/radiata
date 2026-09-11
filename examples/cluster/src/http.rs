@@ -41,6 +41,24 @@ async fn status(state: State<SharedState>) -> Json<Value> {
     .await
     .ok();
   let member_count = members.as_ref().map_or(0, |page| page.items().len());
+  // The library annotates every member page entry with its lifecycle
+  // status (active / left / cleaned), so an operator — and the scenario
+  // tests — can tell live members from departed evidence (finding #9).
+  let member_statuses: std::collections::BTreeMap<String, String> = members
+    .as_ref()
+    .map(|page| {
+      page
+        .items()
+        .iter()
+        .map(|view| {
+          (
+            view.node_id().as_str().to_owned(),
+            format!("{:?}", view.status()).to_lowercase(),
+          )
+        })
+        .collect()
+    })
+    .unwrap_or_default();
   let counter = |name: &str| {
     observability
       .as_ref()
@@ -51,6 +69,7 @@ async fn status(state: State<SharedState>) -> Json<Value> {
     "node_id": state.node_id.as_str(),
     "uptime_secs": state.started.elapsed().as_secs(),
     "members": member_count,
+    "member_statuses": member_statuses,
     "sessions": counter("sessions"),
     "listeners": counter("listeners"),
     "store_available": counter("metadata-store-available"),
@@ -424,6 +443,22 @@ pub fn internal_error(error: radiata::Error) -> (StatusCode, Json<Value>) {
   )
 }
 
+/// The public recovery-plane view: whether every known online member has
+/// an authenticated path, how many members remain unreachable, and the
+/// next scheduled attempt (operator debugging for partition healing).
+async fn recovery(state: State<SharedState>) -> Json<Value> {
+  match state.node.query(radiata::GetRecovery::new()).await {
+    Ok(view) => Json(json!({
+      "connected": view.is_connected(),
+      "unreachable_members": view.unreachable_members(),
+      "next_attempt_at": view.next_attempt_at()
+        .and_then(|at| at.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs()),
+    })),
+    Err(error) => Json(json!({"error": error.to_string()})),
+  }
+}
+
 pub fn router(state: SharedState) -> Router {
   Router::new()
     .route("/status", get(status))
@@ -434,6 +469,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/leave", post(leave))
     .route("/resources/{*name}", get(get_resource).put(put_resource))
     .route("/resources", get(list_resources))
+    .route("/recovery", get(recovery))
     .route("/stream-probe", post(stream_probe))
     .with_state(state)
 }

@@ -798,6 +798,102 @@ async fn restarted_node_passively_reconnects(
   peer.command(Shutdown::new()).await.unwrap();
 }
 
+/// Evidence can arrive after the first recovery tick: a node whose
+/// store was wiped by its own leave (or simply joined late) re-seeds
+/// the known-online plane once its member descriptors sync in over the
+/// merge session. Without the re-seed such a node dials only its join
+/// peer; when that session drops it is stranded on an otherwise
+/// reachable cluster (the lifecycle partition stall).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_reseeds_evidence_that_arrived_after_the_first_tick() {
+  let peer = NodeBuilder::new(
+    Arc::new(common::MemoryStorageFactory::new(
+      common::required_capabilities(),
+    )),
+    Arc::new(LeaveKeys::with_base(800)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+  let peer_endpoint = peer
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap()
+    .endpoint()
+    .clone();
+  let peer_id = peer
+    .query(radiata::GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  let node = NodeBuilder::new(
+    Arc::new(common::MemoryStorageFactory::new(
+      common::required_capabilities(),
+    )),
+    Arc::new(LeaveKeys::with_base(900)) as Arc<dyn KeyProvider>,
+  )
+  .start()
+  .await
+  .unwrap();
+
+  // The first recovery tick seeds on an empty evidence pool (nothing
+  // merged yet), so give it time to run before the merge lands.
+  tokio::time::sleep(Duration::from_secs(3)).await;
+
+  // The merge session brings the binding and descriptor (with the
+  // peer's dialable endpoint) after the first seed attempt already ran.
+  common::merge_with_retry(&node, &peer, peer_endpoint.clone()).await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let converged = node
+      .query(radiata::GetMember::new(peer_id.clone()))
+      .await
+      .unwrap()
+      .is_some_and(|view| !view.endpoints().is_empty());
+    if converged {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the peer descriptor never converged into the node's store"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+
+  // Drain the history: the only session dies and the peer leaves the
+  // node's known-online set for now.
+  node
+    .command(radiata::DisconnectPeer::new(peer_id.clone()))
+    .await
+    .unwrap();
+
+  // The history is empty but the evidence landed after the initial
+  // empty seed: the next revision-advanced seed must pick the peer up
+  // again, and recovery dials it back without operator action.
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let reconnected = node
+      .query(radiata::PageSessions::new(PageSpec::first(8).unwrap()))
+      .await
+      .unwrap()
+      .items()
+      .iter()
+      .any(|session| session.peer() == &peer_id);
+    if reconnected {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the node never re-dialed its known peer after the evidence arrived late"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+  }
+
+  node.command(Shutdown::new()).await.unwrap();
+  peer.command(Shutdown::new()).await.unwrap();
+}
+
 #[cfg(any(feature = "json", feature = "redb"))]
 async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactory>) {
   let keys = Arc::new(LeaveKeys::default());

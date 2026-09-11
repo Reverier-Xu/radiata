@@ -15,14 +15,19 @@ E3 two-cluster - n5 bootstraps an independent cluster B (n6..n9 join it);
                  what the public api allows and what it breaks.
 E4 work        - both populations write and converge inside their own set
 E5 leave       - a node leaves (identity replaced); membership drops and
-                 the left identity must not be readable as a member
+                 the left identity must stay distinguishable from live
+                 members (annotated status in every member page)
 E6 rejoin      - the replacement identity re-joins with a fresh token
 E7 partition   - the network is split into two components; both sides
                  keep working (including a same-name double write whose
                  register must converge deterministically after heal)
 E8 heal        - network restored; the cluster must self-heal without
                  operator action (recovery dials), then all writes,
-                 including the partition-time conflict, converge
+                 including the partition-time conflict, converge, and
+                 every partition-time write is visible everywhere
+E8.5 disconnect - tearing a session is not a membership operation: the
+                 other side's recovery plane dials the edge back
+                 without operator action
 
 Run: python3 test_lifecycle.py   (after ./down.sh && ./up.sh)
 """
@@ -110,6 +115,37 @@ def wait(predicate, description: str, nodes: list[int] | None = None, deadline_s
 def members_of(node: int) -> int:
     try:
         return http_any("GET", node, "/status", timeout=3).get("members", -1)
+    except Exception:
+        return -1
+
+
+def member_statuses(node: int) -> dict:
+    """node_id -> "active" | "left" | "cleaned" from /status."""
+    try:
+        return http_any("GET", node, "/status", timeout=3).get("member_statuses", {})
+    except Exception:
+        return {}
+
+
+def wait_member_status(node_id: str, expected: str, nodes: list[int], deadline_s: float = 60):
+    """Every node must annotate the node_id with the expected lifecycle
+    status (finding #9 fixed: member pages distinguish live members from
+    departed evidence)."""
+    started = time.monotonic()
+    while True:
+        states = {n: member_statuses(n).get(node_id) for n in nodes}
+        if all(state == expected for state in states.values()):
+            print(f"[status] {node_id[:16]}.. annotated {expected} on {len(nodes)} nodes "
+                  f"({time.monotonic() - started:.1f}s)")
+            return
+        if time.monotonic() - started > deadline_s:
+            raise SystemExit(f"{node_id} never annotated {expected}: {states}")
+        time.sleep(0.5)
+
+
+def sessions_of(node: int) -> int:
+    try:
+        return http_any("GET", node, "/status", timeout=3).get("sessions", -1)
     except Exception:
         return -1
 
@@ -270,10 +306,10 @@ def main() -> None:
     replacement_id = left["replacement_identity"]
     print(f"[leave] n9: {left['former_identity']} -> {replacement_id}")
     report["leave"] = left
-    # FINDING #9: the left identity's descriptor stays in member pages,
-    # so the count remains 9 (8 live + 1 left) and there is no public way
-    # to tell which member is left. Recorded in docs/example-findings.md.
+    # Finding #9 is fixed: member pages annotate lifecycle status, so the
+    # left identity is distinguishable from live members. Assert it.
     wait(lambda node: members_of(node) == 9, "leave record propagated (left identity still counted)", [1, 2, 3, 4, 5, 6, 7, 8])
+    wait_member_status(former_id, "left", [1, 2, 3, 4, 5, 6, 7, 8])
 
     print("=== E6 rejoin: the replacement identity re-joins ===")
     # The left node's runtime shut down; restart the container (same
@@ -286,6 +322,10 @@ def main() -> None:
     new_id = node_id_of(9)
     assert new_id != former_id, "rejoin reused the left identity"
     print(f"[rejoin] n9 now runs {new_id} (former {former_id} stays left)")
+    # The replacement identity is live everywhere; the former identity is
+    # still only departed evidence.
+    wait_member_status(new_id, "active", list(range(1, N + 1)))
+    wait_member_status(former_id, "left", list(range(1, N + 1)))
 
     print("=== E7 partition: split into {1,2,3,4} and {5,6,7,8,9} ===")
     podman("network", "create", SPLIT_NETWORK, check=False)  # idempotent
@@ -298,15 +338,12 @@ def main() -> None:
     split_digest_a = write_resource(1, "demo.org/resources/split-a", "side-a")
     split_digest_b = write_resource(6, "demo.org/resources/split-b", "side-b")
     converge([1, 2, 3, 4], "demo.org/resources/split-a", split_digest_a)
-    # FINDING #10 (library): writes made during a connectivity gap are not
-    # re-propagated to peers whose sync cursor is already past the key, so
-    # side-B convergence of split-b is NOT guaranteed. Measure and record
-    # instead of asserting.
-    try:
-        converge([5, 6, 7, 8, 9], "demo.org/resources/split-b", split_digest_b, deadline_s=45)
-        print("[partition] side B internal convergence: ok (unexpected per finding #10)")
-    except SystemExit:
-        print("[partition] side B internal convergence: STALLED (finding #10 confirmed)")
+    # Finding #10 is fixed: per-peer sync cursors are dropped when a
+    # session dies, so a re-formed session re-delivers the full catalog —
+    # intra-side convergence of split-b is guaranteed, not merely hoped
+    # for.
+    converge([5, 6, 7, 8, 9], "demo.org/resources/split-b", split_digest_b, deadline_s=45)
+    print("[partition] side B internal convergence: ok")
     across = digest_of(5, "demo.org/resources/split-a")
     print(f"[partition] side A converged split-a; side B converged split-b; "
           f"split-a visible on B: {across is not None}")
@@ -334,15 +371,25 @@ def main() -> None:
     for node in (5, 6, 7, 8, 9):
         podman("network", "disconnect", SPLIT_NETWORK, f"n{node}")
         podman("network", "connect", MAIN_NETWORK, f"n{node}")
-    # Self-heal observation: recovery re-dials the other component, but
-    # per finding #10 the partition-time writes are expected to stay
-    # partitioned. Measure what actually converges, no operator action.
+    # Self-heal observation: recovery re-dials the other component, and
+    # per-peer cursors re-deliver the full catalog on re-formed sessions,
+    # so after the heal BOTH partition-time writes must be visible on
+    # every node — no operator action, no record left behind.
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         states = {node: digest_of(node, "demo.org/resources/conflict") for node in range(1, N + 1)}
         a_side = sum(1 for v in states.values() if v == side_a_digest)
         b_side = sum(1 for v in states.values() if v == side_b_digest)
-        if a_side + b_side == N and (a_side == N or b_side == N):
+        split_a_seen = sum(
+            1 for node in range(1, N + 1)
+            if digest_of(node, "demo.org/resources/split-a") == split_digest_a
+        )
+        split_b_seen = sum(
+            1 for node in range(1, N + 1)
+            if digest_of(node, "demo.org/resources/split-b") == split_digest_b
+        )
+        if a_side + b_side == N and (a_side == N or b_side == N) \
+                and split_a_seen == N and split_b_seen == N:
             break
         time.sleep(1)
     winner = "A" if a_side >= b_side else "B"
@@ -352,13 +399,43 @@ def main() -> None:
     report["heal_conflict_distribution"] = {"side_a": a_side, "side_b": b_side, "none": N - a_side - b_side}
     print(f"[heal] after {report['heal_seconds']:.0f}s: side-A winner on {a_side} nodes, "
           f"side-B winner on {b_side} nodes, unreachable/none {N - a_side - b_side}")
+    assert report["heal_unanimous"], "conflict register never reached a unanimous winner"
     for name, digest in (("demo.org/resources/split-a", split_digest_a),
                          ("demo.org/resources/split-b", split_digest_b)):
         visible = sum(1 for node in range(1, N + 1) if digest_of(node, name) == digest)
         report[f"{name.split('-')[-1]}_visible_on"] = visible
+        assert visible == N, f"{name} visible on only {visible}/{N} after heal"
         print(f"[heal] {name}: visible on {visible}/{N}")
     wait(lambda node: members_of(node) == 10, "membership records restored", list(range(1, N + 1)),
          deadline_s=120)
+
+    print("=== E8.5 disconnect is not a departure: the edge heals itself ===")
+    # Owner decision: DisconnectPeer only tears the session down — it is
+    # not a removal from the cluster. A one-sided teardown leaves the
+    # other side counting the peer as unreachable, so its recovery plane
+    # dials the edge back without operator action. The n1-n2 edge
+    # provably exists (n2 joined through n1 in E2).
+    ids = {node: node_id_of(node) for node in range(1, N + 1)}
+    before = (sessions_of(1), sessions_of(2))
+    http("POST", 1, "/disconnect", {"node_id": ids[2]})
+    time.sleep(2)
+    dropped = (sessions_of(1), sessions_of(2))
+    assert dropped[0] < before[0], f"n1 sessions did not drop on disconnect: {before} -> {dropped}"
+    healed = time.monotonic()
+    deadline = healed + 150
+    while time.monotonic() < deadline:
+        if sessions_of(1) >= before[0] and sessions_of(2) >= before[1]:
+            break
+        time.sleep(1)
+    else:
+        raise SystemExit("the disconnected edge was never healed back by recovery")
+    report["disconnect_self_heal_seconds"] = time.monotonic() - healed
+    print(f"[heal] n1-n2 edge healed by recovery in "
+          f"{report['disconnect_self_heal_seconds']:.0f}s ({dropped} -> back to {before})")
+    # And the whole cluster still converges after the edge dance.
+    digest = write_resource(2, "demo.org/resources/post-heal-check", "converged")
+    converge(list(range(1, N + 1)), "demo.org/resources/post-heal-check", digest)
+    print("[heal] post-disconnect write converged on all 9 nodes")
 
     print("\n=== lifecycle report ===")
     print(json.dumps(report, indent=2))
