@@ -80,8 +80,7 @@ impl Supervisor {
     // their status instead of filtering them.
     let context = self.context()?;
     let store = context.store();
-    let cleaned = crate::identity::cleanup::cleaned_nodes_ctx(store).await?;
-    let left = crate::identity::leave::left_nodes_ctx(store).await?;
+    let departed = self.departed_exclusions(store).await?;
     let snapshot = store.snapshot().await?;
     let paged = crate::paging::scan_paged(
       snapshot.as_ref(),
@@ -91,13 +90,7 @@ impl Supervisor {
       limit,
       |_key, bytes| {
         let descriptor = crate::membership::page::decode_descriptor(bytes)?;
-        let status = if cleaned.contains(descriptor.node()) {
-          crate::MemberStatus::Cleaned
-        } else if left.contains(descriptor.node()) {
-          crate::MemberStatus::Left
-        } else {
-          crate::MemberStatus::Active
-        };
+        let status = departed.status(descriptor.node());
         let connectivity = if connected.contains(descriptor.node()) {
           crate::ConnectivityStatus::Connected
         } else {
