@@ -310,28 +310,20 @@ impl Supervisor {
   }
   /// Pages the public trust observations: the exact
   /// NodeId-to-key bindings verified locally, deterministically ordered
-  /// and bounded.
+  /// and bounded (keyset-paginated like every other view).
   pub(super) async fn page_trust(
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::TrustPage> {
     let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    // Trust paging is offset-based (the trust store scans an ordered
-    // namespace in slices) while the other views keyset-paginate. The
-    // encoding still lives behind the opaque `PageCursor`, and a cursor
-    // that does not decode exactly fails closed instead of restarting
-    // the page at offset zero.
-    let offset = match cursor.as_ref() {
-      None => 0,
-      Some(cursor) => std::str::from_utf8(cursor.as_bytes())
-        .map_err(|_| Error::invalid_input("trust page cursor"))?
-        .parse::<usize>()
-        .map_err(|_| Error::invalid_input("trust page cursor"))?,
-    };
     let context = self.context()?;
-    let observations =
-      crate::identity::trust::store::paged_trust_ctx(context.store(), offset, limit).await?;
-    let mut items = Vec::with_capacity(observations.bindings().len());
-    for binding in observations.bindings() {
+    let paged = crate::identity::trust::store::paged_trust_ctx(
+      context.store(),
+      cursor.as_ref().map(|cursor| cursor.as_bytes()),
+      limit,
+    )
+    .await?;
+    let mut items = Vec::with_capacity(paged.items.len());
+    for binding in &paged.items {
       // A locally revoked binding reports its exact status; the binding
       // itself is never erased (revoke is an authorization boundary, not
       // content erasure).
@@ -350,10 +342,13 @@ impl Supervisor {
         status,
       ));
     }
-    let next = observations
-      .next()
-      .map(|next| crate::PageCursor::new(std::sync::Arc::from(next.to_string().into_bytes())));
-    Ok(crate::TrustPage::new(items, next))
+    Ok(finish_page(
+      crate::paging::Paged {
+        items,
+        next: paged.next,
+      },
+      crate::TrustPage::new,
+    ))
   }
   pub(super) async fn local_node(&mut self) -> Result<LocalNodeView> {
     let context = self.context()?;
