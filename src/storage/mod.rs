@@ -268,32 +268,23 @@ impl MetadataStore {
     self.provider.snapshot().await
   }
 
-  pub(crate) async fn commit(&self, transaction: PreparedTransaction) -> Result<CommitOutcome> {
-    // The single-commit state machine refuses a second in-flight commit
-    // with NotReady. Every internal committer (anti-entropy ticks,
-    // descriptor ensures, key intents) is short and always restores the
-    // Ready state, so a bounded entry wait turns the transient refusal
-    // into queueing instead of pushing retry policy onto every caller.
-    // A caller that truly cannot wait still observes NotReady after the
-    // bound, and a user-visible Conflict/Aborted outcome is never masked:
-    // only the entry refusal is retried, never the commit itself.
-    let deadline = std::time::Instant::now() + ENTRY_WAIT_BOUND;
-    let transaction = transaction.0;
-    let pending = PendingCommit {
-      transaction: transaction.id().clone(),
-      digest: transaction.operation_digest().clone(),
-      journal_proven: false,
-    };
-    let call = loop {
-      match self.begin_commit(pending.clone()) {
-        Ok(call) => break call,
+  /// The bounded entry wait shared by commit and reconcile: a transient
+  /// `NotReady` refusal (a second in-flight state-machine entry) parks
+  /// until a finish path notifies, with the short backoff as a
+  /// lost-wakeup backstop; either way the entry is re-checked before
+  /// waiting again. Past the bound the refusal surfaces instead of
+  /// queueing forever, and any non-NotReady error is never retried.
+  async fn wait_for_entry<R>(
+    &self, deadline: std::time::Instant,
+    mut begin: impl FnMut() -> std::result::Result<R, crate::Error>,
+  ) -> std::result::Result<R, crate::Error> {
+    loop {
+      match begin() {
+        Ok(value) => return Ok(value),
         Err(error) if error.kind() == crate::ErrorKind::NotReady => {
           if std::time::Instant::now() >= deadline {
             return Err(error);
           }
-          // Park until a finish path notifies, with the short backoff as
-          // a lost-wakeup backstop; either way the loop re-checks the
-          // state before waiting again.
           let notified = self.ready_notify.notified();
           tokio::pin!(notified);
           notified.as_mut().enable();
@@ -304,7 +295,28 @@ impl MetadataStore {
         }
         Err(error) => return Err(error),
       }
+    }
+  }
+
+  pub(crate) async fn commit(&self, transaction: PreparedTransaction) -> Result<CommitOutcome> {
+    // The single-commit state machine refuses a second in-flight commit
+    // with NotReady. Every internal committer (anti-entropy ticks,
+    // descriptor ensures, key intents) is short and always restores the
+    // Ready state, so a bounded entry wait turns the transient refusal
+    // into queueing instead of pushing retry policy onto every caller.
+    // A caller that truly cannot wait still observes NotReady after the
+    // bound, and a user-visible Conflict/Aborted outcome is never masked:
+    // only the entry refusal is retried, never the commit itself.
+    let transaction = transaction.0;
+    let pending = PendingCommit {
+      transaction: transaction.id().clone(),
+      digest: transaction.operation_digest().clone(),
+      journal_proven: false,
     };
+    let deadline = std::time::Instant::now() + ENTRY_WAIT_BOUND;
+    let call = self
+      .wait_for_entry(deadline, || self.begin_commit(pending.clone()))
+      .await?;
     let result = self.provider.commit(transaction).await;
 
     match result {
@@ -353,25 +365,9 @@ impl MetadataStore {
     // in-flight commit waits for the Ready state instead of surfacing the
     // transient refusal to callers.
     let deadline = std::time::Instant::now() + ENTRY_WAIT_BOUND;
-    let (pending, call) = loop {
-      match self.begin_reconcile() {
-        Ok(pair) => break pair,
-        Err(error) if error.kind() == crate::ErrorKind::NotReady => {
-          if std::time::Instant::now() >= deadline {
-            return Err(error);
-          }
-          // Same parked entry wait as commit (see there).
-          let notified = self.ready_notify.notified();
-          tokio::pin!(notified);
-          notified.as_mut().enable();
-          tokio::select! {
-            _ = notified => {}
-            _ = tokio::time::sleep(ENTRY_WAIT_BACKOFF) => {}
-          }
-        }
-        Err(error) => return Err(error),
-      }
-    };
+    let (pending, call) = self
+      .wait_for_entry(deadline, || self.begin_reconcile())
+      .await?;
     let outcome = self
       .provider
       .reconcile(&pending.transaction, &pending.digest)
