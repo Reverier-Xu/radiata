@@ -508,15 +508,12 @@ impl MetadataStore {
 /// retried sweep replays the same cleanup as an idempotent no-op while
 /// no other transaction can collide with it.
 fn retention_sweep_operation_id(target: &TransactionId) -> crate::Result<TransactionId> {
-  let mut hasher = Sha256::new();
-  hasher.update(RETENTION_SWEEP_DOMAIN);
-  hasher.update(target.as_str().as_bytes());
-  let hashed = hasher.finalize();
   TransactionId::parse(&format!(
     "txn_{}",
-    crate::identity::id::encode_base62_suffix(u128::from_be_bytes(
-      hashed[..16].try_into().map_err(|_| storage_corrupt())?
-    ))?
+    crate::identity::id::encode_base62_suffix(super::deterministic_transaction_value(
+      RETENTION_SWEEP_DOMAIN,
+      &[target.as_str().as_bytes()],
+    )?)?
   ))
 }
 

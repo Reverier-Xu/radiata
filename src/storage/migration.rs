@@ -17,8 +17,6 @@
 
 use std::sync::Arc;
 
-use sha2::{Digest as ShaDigest, Sha256};
-
 use crate::{
   BoxFuture, CommitOutcome, Digest, Error, Result, StoreExpectation, StoreKey, StoreNamespace,
   StoreOperation, StoreTransaction, StoreValue, TransactionId,
@@ -362,28 +360,19 @@ const MIGRATION_IMPLEMENTATION_DOMAIN: &[u8] = b"radiata.woooo.tech/migration-im
 /// reader share this single derivation.
 #[cfg(test)]
 pub(crate) fn implementation_digest(tag: &str) -> Digest {
+  use sha2::{Digest as ShaDigest, Sha256};
   let mut hasher = Sha256::new();
   hasher.update(MIGRATION_IMPLEMENTATION_DOMAIN);
   hasher.update(tag.as_bytes());
   Digest::from_bytes(hasher.finalize().into())
 }
 
-/// Derives a deterministic migration transaction-id value: the
-/// domain-separated SHA-256 over the ordered parts, truncated to the
-/// first 16 bytes and read big-endian. The base stamp passes its schema
-/// id bytes; every edge passes its tag and implementation digest, so all
-/// sites share one derivation and cannot drift.
+/// Derives a deterministic migration transaction-id value: the shared
+/// storage derivation under the migration domain. The base stamp passes
+/// its schema id bytes; every edge passes its tag and implementation
+/// digest, so all sites share one derivation and cannot drift.
 fn migration_transaction_value(parts: &[&[u8]]) -> Result<u128> {
-  let mut hasher = Sha256::new();
-  hasher.update(MIGRATION_TRANSACTION_DOMAIN);
-  for part in parts {
-    hasher.update(part);
-  }
-  let hashed = hasher.finalize();
-  let bytes: [u8; 16] = hashed[..16]
-    .try_into()
-    .map_err(|_| Error::internal("migration transaction value"))?;
-  Ok(u128::from_be_bytes(bytes))
+  super::deterministic_transaction_value(MIGRATION_TRANSACTION_DOMAIN, parts)
 }
 
 // The declared metadata schema chain frozen for the `0.1.0` wire/metadata

@@ -589,3 +589,23 @@ pub(crate) mod contract;
 
 #[cfg(test)]
 mod tests;
+
+/// Derives a deterministic transaction-id value (single source for the
+/// storage domain): the domain-separated SHA-256 over the ordered parts,
+/// truncated to the first 16 bytes and read big-endian. Callers freeze
+/// their own domain constants (the migration chain, the receipt
+/// retention sweep), so a retried operation replays the same idempotent
+/// identity while no other transaction can collide with it.
+pub(crate) fn deterministic_transaction_value(domain: &[u8], parts: &[&[u8]]) -> Result<u128> {
+  use sha2::{Digest as ShaDigest, Sha256};
+  let mut hasher = Sha256::new();
+  hasher.update(domain);
+  for part in parts {
+    hasher.update(part);
+  }
+  let hashed = hasher.finalize();
+  let bytes: [u8; 16] = hashed[..16]
+    .try_into()
+    .map_err(|_| crate::Error::internal("deterministic transaction value"))?;
+  Ok(u128::from_be_bytes(bytes))
+}
