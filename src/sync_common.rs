@@ -129,3 +129,102 @@ mod tests {
     assert_eq!(chunks[0].len(), MAX_CHUNK_BYTES);
   }
 }
+
+/// The per-peer page anti-entropy continuation state shared by the
+/// membership and resource sync lanes: the continuation cursor, the
+/// steady-state page fingerprint, and the resend cadences. The cadence
+/// constants live here so the two lanes cannot drift — a one-lane
+/// cadence change would silently fork the anti-entropy behavior.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PeerPageCursor {
+  /// Fingerprint of the last page sent to this peer, so an unchanged
+  /// catalog costs no delivery at all.
+  page_fingerprint: u64,
+  /// Ticks since this peer's last page send: a lost delivery must be
+  /// retried on a slow cadence even when nothing changed.
+  ticks_since_page_send: u32,
+  /// Page rounds sent since this peer's last full from-scratch pass:
+  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
+  /// into a dying session) can stay missing.
+  rounds_since_full: u32,
+  /// This peer's page continuation cursor, so sync converges beyond a
+  /// single page.
+  page: Option<Vec<u8>>,
+}
+
+/// One page-plane round outcome for a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageRound {
+  /// Starting round with an unchanged fingerprint and the resend
+  /// cadence not reached: the peer stays silent this round.
+  Quiet,
+  /// The page must be sent this round: a changed fingerprint, a resend
+  /// cadence reached, or a continuation of a multi-page pass.
+  Send,
+}
+
+impl PeerPageCursor {
+  /// Page deliveries are retried on this slower cadence for lost-delivery
+  /// healing even when nothing changed.
+  pub(crate) const PAGE_RESEND_TICKS: u32 = 32;
+
+  /// Page rounds between full from-scratch catch-up passes per peer:
+  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
+  /// into a dying session) can stay missing. Rounds, not ticks: quiet
+  /// peers do not count.
+  pub(crate) const FULL_SYNC_ROUNDS: u32 = 128;
+
+  /// After [`Self::FULL_SYNC_ROUNDS`] dispatched rounds the next round
+  /// re-delivers from scratch: reset the continuation cursor and the
+  /// round counter.
+  pub(crate) fn arm_full_pass(&mut self) {
+    if self.rounds_since_full >= Self::FULL_SYNC_ROUNDS {
+      self.page = None;
+      self.rounds_since_full = 0;
+    }
+  }
+
+  /// The round's page-plane decision against the next page range's
+  /// fingerprint. The fingerprint is recorded on starting rounds only: a
+  /// continuation round hashes a tail range of the catalog, and
+  /// recording that range would make the next from-scratch range never
+  /// match — a catalog larger than one page would then resend in full
+  /// every tick and never go quiet.
+  pub(crate) fn page_round(&mut self, fingerprint: u64) -> PageRound {
+    if self.page.is_some() {
+      return PageRound::Send;
+    }
+    let due =
+      fingerprint != self.page_fingerprint || self.ticks_since_page_send >= Self::PAGE_RESEND_TICKS;
+    self.page_fingerprint = fingerprint;
+    if due {
+      PageRound::Send
+    } else {
+      PageRound::Quiet
+    }
+  }
+
+  /// A quiet round: no page is due, so both cadence counters advance.
+  pub(crate) fn quiet_tick(&mut self) {
+    self.ticks_since_page_send = self.ticks_since_page_send.saturating_add(1);
+    self.rounds_since_full = self.rounds_since_full.saturating_add(1);
+  }
+
+  /// Records one dispatched page: advances the continuation cursor and
+  /// resets the page resend cadence.
+  pub(crate) fn record_send(&mut self, next_cursor: Option<&[u8]>) {
+    self.page = next_cursor.map(|value| value.to_vec());
+    self.ticks_since_page_send = 0;
+  }
+
+  /// Advances the full-pass counter after one dispatched round (a round
+  /// that dispatched without a page due still counts).
+  pub(crate) fn count_round(&mut self) {
+    self.rounds_since_full = self.rounds_since_full.saturating_add(1);
+  }
+
+  /// The continuation cursor the next emit resumes from.
+  pub(crate) fn continuation(&self) -> Option<&[u8]> {
+    self.page.as_deref()
+  }
+}

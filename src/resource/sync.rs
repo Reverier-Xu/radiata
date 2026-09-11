@@ -131,40 +131,14 @@ pub(crate) fn resource_sync_protocol_definition() -> Result<ProtocolDefinition> 
 /// first tick without any global state churn.
 #[derive(Debug, Default)]
 pub(crate) struct ResourceSyncCursors {
-  peers: std::collections::BTreeMap<NodeId, PeerCursorState>,
+  peers: std::collections::BTreeMap<NodeId, crate::sync_common::PeerPageCursor>,
 }
-
-#[derive(Debug, Default)]
-pub(crate) struct PeerCursorState {
-  /// Raw-bytes fingerprint of this peer's next page range, so an
-  /// unchanged catalog costs no decode, encode, or delivery at all.
-  page_fingerprint: u64,
-  /// Ticks since this peer's last page send: a lost delivery must be
-  /// retried on a slow cadence even when nothing changed.
-  ticks_since_page_send: u32,
-  /// Page rounds sent since this peer's last full from-scratch pass:
-  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
-  /// into a dying session) can stay missing.
-  rounds_since_full: u32,
-  /// This peer's page continuation cursor.
-  page: Option<Vec<u8>>,
-}
-
-/// Page deliveries are retried on this slower cadence for lost-delivery
-/// healing even when nothing changed.
-/// Page deliveries are retried on this slower cadence for lost-delivery
-/// healing even when nothing changed.
-const RESOURCE_PAGE_RESEND_TICKS: u32 = 32;
-
-/// Page rounds between full from-scratch catch-up passes per peer: bounds
-/// how long a payload lost mid-flight (fire-and-forget delivery into a
-/// dying session) can stay missing for a peer whose cursor already moved
-/// past the lost records. Rounds, not ticks: quiet peers do not count.
-const RESOURCE_FULL_SYNC_ROUNDS: u32 = 128;
 
 /// One resource anti-entropy step: for every alive peer, page the local
 /// register from that peer's own cursor and push the bounded page over
-/// the peer's session. Per-peer cursors mean a peer that was unreachable
+/// the peer's session. The per-peer continuation state (fingerprint,
+/// resend cadences, cursor) is the shared [`crate::sync_common::
+/// PeerPageCursor`]. Per-peer cursors mean a peer that was unreachable
 /// during a round is caught up in full when its session returns, and a
 /// periodic from-scratch pass bounds how long a payload lost mid-flight
 /// can stay missing. Steady state with an unchanged catalog sends nothing
@@ -200,52 +174,31 @@ pub(crate) async fn resource_sync_tick(
 /// to one full-sync window.
 async fn resource_sync_tick_peer(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn crate::api::Entropy>,
-  runtime: &RuntimeClient, peer: &NodeId, state: &mut PeerCursorState, protocol: &ProtocolTag,
+  runtime: &RuntimeClient, peer: &NodeId, state: &mut crate::sync_common::PeerPageCursor,
+  protocol: &ProtocolTag,
 ) -> Result<()> {
-  let starting_round = state.page.is_none();
+  state.arm_full_pass();
   // This peer's next page range fingerprint: the quiet state pays one
-  // scan and one hash and skips the emit entirely. Only a from-scratch
-  // round may record the fingerprint: a continuation round hashes a
-  // tail range of the catalog, and recording that range would make the
-  // next from-scratch range never match — a catalog larger than one
-  // page would then resend in full every tick and never go quiet.
+  // scan and one hash and skips the emit entirely. The page-round
+  // decision records the fingerprint on from-scratch rounds only.
   let page_fp = page_sync::page_fingerprint_ctx(
     store,
-    state.page.as_deref(),
+    state.continuation(),
     super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
   )
   .await?;
-  let page_due = if starting_round {
-    let due = page_fp != state.page_fingerprint
-      || state.ticks_since_page_send >= RESOURCE_PAGE_RESEND_TICKS;
-    state.page_fingerprint = page_fp;
-    due
-  } else {
-    // A continuation round always continues: the remaining pages of
-    // the current pass are still owed to this peer.
-    true
-  };
-  if !page_due && state.rounds_since_full < RESOURCE_FULL_SYNC_ROUNDS {
-    state.ticks_since_page_send = state.ticks_since_page_send.saturating_add(1);
-    state.rounds_since_full = state.rounds_since_full.saturating_add(1);
+  if state.page_round(page_fp) == crate::sync_common::PageRound::Quiet {
+    state.quiet_tick();
     return Ok(());
   }
-  // A periodic from-scratch pass re-delivers the whole catalog to this
-  // peer, bounding mid-flight payload loss to one full-sync window.
-  if state.rounds_since_full >= RESOURCE_FULL_SYNC_ROUNDS {
-    state.page = None;
-    state.rounds_since_full = 0;
-  }
-  state.ticks_since_page_send = 0;
-  state.rounds_since_full = state.rounds_since_full.saturating_add(1);
   let page = page_sync::emit_page_ctx(
     store,
-    state.page.as_deref(),
+    state.continuation(),
     super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
   )
   .await?;
   tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
-  state.page = page.cursor().map(|value| value.to_vec());
+  state.record_send(page.cursor());
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
   let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes).await;
   Ok(())

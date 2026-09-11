@@ -573,19 +573,9 @@ pub(crate) struct PeerSyncState {
   /// Ticks since this peer's last snapshot send: a lost delivery must be
   /// retried without waiting for the next grant-set change.
   ticks_since_snapshot_send: u32,
-  /// Fingerprint of the last page sent to this peer, so an unchanged
-  /// membership set costs no encode or delivery at all.
-  page_fingerprint: u64,
-  /// Ticks since this peer's last page send: a lost delivery must be
-  /// retried on a slow cadence even when nothing changed.
-  ticks_since_page_send: u32,
-  /// This peer's page continuation cursor, so descriptor sync converges
-  /// beyond a single page.
-  page: Option<Vec<u8>>,
-  /// Page rounds sent since this peer's last full from-scratch pass:
-  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
-  /// into a dying session) can stay missing.
-  rounds_since_full: u32,
+  /// The shared page-plane continuation state (fingerprint, resend
+  /// cadences, continuation cursor).
+  page: crate::sync_common::PeerPageCursor,
 }
 
 /// The bounded number of known leave records forwarded per snapshot
@@ -594,16 +584,9 @@ const LEAVE_RESEND_CAP: usize = 64;
 
 /// Snapshot deliveries are retried on this slow cadence even when the
 /// grant set is unchanged, so a dropped payload heals instead of stalling
-/// a peer forever (anti-entropy).
+/// a peer forever (anti-entropy). The page cadences are single-sourced in
+/// [`crate::sync_common::PeerPageCursor`].
 const SNAPSHOT_RESEND_TICKS: u32 = 8;
-/// Page deliveries are retried on this slower cadence for the same reason.
-const PAGE_RESEND_TICKS: u32 = 32;
-
-/// Page rounds between full from-scratch catch-up passes per peer: bounds
-/// how long a payload lost mid-flight (fire-and-forget delivery into a
-/// dying session) can stay missing. Rounds, not ticks: quiet peers do not
-/// count.
-const MEMBERSHIP_FULL_SYNC_ROUNDS: u32 = 128;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_tick(
@@ -712,36 +695,21 @@ pub(crate) async fn sync_tick(
   }
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
-    // A periodic from-scratch pass re-delivers the whole descriptor
-    // catalog to this peer, bounding mid-flight payload loss to one
-    // full-sync window.
-    if state.rounds_since_full >= MEMBERSHIP_FULL_SYNC_ROUNDS {
-      state.page = None;
-      state.rounds_since_full = 0;
-    }
-    let starting_round = state.page.is_none();
+    state.page.arm_full_pass();
     let page = page_sync::emit_page_ctx(
       store,
-      state.page.as_deref(),
+      state.page.continuation(),
       crate::membership::page::DEFAULT_PAGE_LIMIT,
     )
     .await?;
     let page_bytes = SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?;
-    let page_fp = page.fingerprint();
-    // The fingerprint is recorded against the emitted page every starting
-    // round (mirroring the global-cursor semantics): a stale recorded
+    // The page-round decision records the fingerprint against the
+    // emitted page on starting rounds only: a stale recorded
     // fingerprint would mark every round as changed, keep the page due
     // forever, and starve the snapshot/tombstone resend cadence — the
     // quiet rounds between unchanged pages are what let
     // ticks_since_snapshot_send advance to its resend threshold.
-    let page_due = if starting_round {
-      let due =
-        page_fp != state.page_fingerprint || state.ticks_since_page_send >= PAGE_RESEND_TICKS;
-      state.page_fingerprint = page_fp;
-      due
-    } else {
-      true
-    };
+    let page_round = state.page.page_round(page.fingerprint());
     // A snapshot is due for this peer when its revision advanced past
     // what this peer last received, or on the slow resend cadence.
     let snapshot_due = match &snapshot {
@@ -751,14 +719,19 @@ pub(crate) async fn sync_tick(
       }
       None => false,
     };
-    if !page_due && !snapshot_due && starting_round {
-      state.ticks_since_page_send = state.ticks_since_page_send.saturating_add(1);
-      state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
-      continue;
-    }
-    if page_due {
-      state.page = page.cursor().map(|value| value.to_vec());
-      state.ticks_since_page_send = 0;
+    match page_round {
+      crate::sync_common::PageRound::Quiet if !snapshot_due => {
+        state.page.quiet_tick();
+        state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
+        continue;
+      }
+      crate::sync_common::PageRound::Quiet => {
+        // The page is not due, but the snapshot leg is: dispatch the
+        // snapshot round without advancing the page cursor.
+      }
+      crate::sync_common::PageRound::Send => {
+        state.page.record_send(page.cursor());
+      }
     }
     if snapshot_due {
       if let Some(snapshot) = &snapshot {
@@ -775,7 +748,7 @@ pub(crate) async fn sync_tick(
     }
     payloads.push(&page_bytes);
     dispatch_to_peer(peer, &payloads, runtime, entropy, &protocol).await;
-    state.rounds_since_full = state.rounds_since_full.saturating_add(1);
+    state.page.count_round();
   }
   gc_collected_tombstones(store, entropy).await;
   Ok(())
