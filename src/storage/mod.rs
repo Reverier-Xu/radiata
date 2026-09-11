@@ -586,6 +586,14 @@ pub(crate) mod contract;
 #[cfg(test)]
 mod tests;
 
+/// The one `StorageCorrupt` constructor for the storage domain: every
+/// "on-disk state violates an invariant" failure carries the kind plus
+/// the caller's error context, so the corruption surface cannot fork per
+/// backend (receipt bookkeeping, json generations, redb tables).
+pub(crate) fn storage_corrupt(context: ProviderErrorContext) -> Error {
+  Error::provider(ProviderErrorKind::StorageCorrupt, context)
+}
+
 /// Derives a deterministic transaction-id value (single source for the
 /// storage domain): the domain-separated SHA-256 over the ordered parts,
 /// truncated to the first 16 bytes and read big-endian. Callers freeze
