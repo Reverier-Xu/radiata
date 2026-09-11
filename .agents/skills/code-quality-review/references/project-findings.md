@@ -727,14 +727,18 @@ total order verified by unit and integration tests.
    `fetch_max(timestamp_millis, Relaxed)`; add a 3-writes-same-ms strictly
    increasing test.
 3. **runtime/recovery.rs:164-165 + :220 — recovery_excluded peers counted
-   pending forever.** The direct-peer backfill inserts every alive-session
-   peer into `recovery_history` without checking `recovery_excluded`; an
-   intentionally-disconnected peer that reconnects *inbound* then loses its
-   session is pending (counted) but never dialable (:220 skips it) →
-   controller never quiesces, backoff pegged at max — same trap shape as
-   example-findings #11. Exclusion is only lifted on outbound
-   `connect_member` (supervisor.rs:1014). Fix: skip excluded peers in the
-   backfill, or clear exclusion on inbound session registration.
+   pending forever.** The direct-peer backfill inserted every
+   alive-session peer into `recovery_history` without checking
+   `recovery_excluded`; an intentionally-disconnected peer that
+   reconnected *inbound* then lost its session was pending (counted) but
+   never dialable → controller never quiesced. **Owner decision
+   (2026-09-11): the exclusion semantics was removed entirely** — a
+   session disconnect is not a membership operation; ending a membership
+   is the leave flow. DisconnectPeer only tears the session and forgets
+   the history entry; revocation is blocked by construction (deleted
+   binding). Lesson: when a fix choice hinges on product semantics
+   (here, "what does disconnect mean"), surface the fork to the owner
+   instead of picking the minimal patch.
 
 ### P2 hotspots (verified)
 
