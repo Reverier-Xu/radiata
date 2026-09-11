@@ -668,17 +668,15 @@ pub(super) struct Supervisor {
   // these members (edge-loss healing) and never dials strangers, so it
   // cannot add edges beyond the caller-configured topology.
   pub(super) recovery_history: std::collections::BTreeSet<NodeId>,
-  /// The store revision the last seeding attempt ran at: the known-online
-  /// set is seeded from the durable member evidence (a restarted
-  /// process's past-life sessions), and the attempt retried whenever the
-  /// history is empty AND the revision advanced — evidence can arrive
-  /// after the first tick (a leave-wiped node rejoins and re-syncs its
-  /// member descriptors over the merge session), so a one-shot seed
-  /// would strand such a node with only its join peer in the plane.
-  /// Departed members keep their exclusion on every attempt, and an
-  /// unchanged revision skips the rescan entirely (commit-writes are
-  /// rare metadata events).
-  pub(super) recovery_seeded_at_revision: Option<crate::StoreRevision>,
+  /// Set once the known-online set has been seeded from the durable
+  /// member evidence (a restarted process's past-life sessions); later
+  /// ticks never re-seed. Evidence that arrived after the first tick is
+  /// deliberately NOT re-seeded: it describes members this identity has
+  /// never sessioned, and dialing them would fabricate edges beyond the
+  /// established topology (the sixteen-node topology suite pins the
+  /// exact shaped graph; recovery heals existing edges, it never
+  /// invents new ones).
+  pub(super) recovery_seeded: bool,
   /// Memoized departed-members exclusion set, keyed by the store
   /// revision it was computed at: the set only changes when a leave or
   /// cleanup tombstone lands or gets GC'd, and every such change commits
@@ -869,7 +867,7 @@ impl Supervisor {
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       published_endpoints,
       recovery_history: std::collections::BTreeSet::new(),
-      recovery_seeded_at_revision: None,
+      recovery_seeded: false,
       exclusion_cache: std::sync::Mutex::new(None),
       resource_write_clock: std::sync::atomic::AtomicU64::new(0),
       sync_driver,
