@@ -176,34 +176,39 @@ impl Transport for WssTransport {
       // A literal-IP endpoint binds exactly that address. A named host is
       // the advertised attachment point, not a bind constraint: the name
       // re-resolves as the machine moves networks, so the listener binds
-      // the wildcard of the resolved family and keeps accepting on
-      // whatever address the name points at later. Binding the name's
-      // startup address instead orphans the listener on every address
-      // change and silently cuts the node off from all inbound dials.
+      // a wildcard socket and keeps accepting on whatever address the
+      // name points at later. Binding the name's startup address instead
+      // orphans the listener on every address change and silently cuts
+      // the node off from all inbound dials.
+      //
+      // The named wildcard prefers the dual-stack IPv6 socket with
+      // IPV6_V6ONLY explicitly cleared: picking one family from the first
+      // resolved address would fork platform behavior (Windows defaults
+      // V6ONLY=1, so an AAAA-first resolution would cut off every IPv4
+      // dialer), while the dual-stack socket accepts both families
+      // everywhere. A host without IPv6 falls back to the IPv4 wildcard.
       let port = endpoint.port();
-      let bind_addr: std::net::SocketAddr = match endpoint.host().parse::<std::net::IpAddr>() {
-        Ok(ip) => std::net::SocketAddr::new(ip, port),
-        Err(_) => {
-          let resolved_ipv6 = tokio::net::lookup_host((endpoint.host(), port))
+      let tcp = match endpoint.host().parse::<std::net::IpAddr>() {
+        Ok(ip) => tokio::net::TcpListener::bind(std::net::SocketAddr::new(ip, port))
+          .await
+          .map_err(|_| {
+            Error::provider(
+              crate::ProviderErrorKind::Io,
+              crate::ProviderErrorContext::TransportBind,
+            )
+          })?,
+        Err(_) => match bind_dual_stack(port).await {
+          Ok(tcp) => tcp,
+          Err(_) => tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
             .await
-            .ok()
-            .and_then(|mut addresses| addresses.next())
-            .is_some_and(|address| address.is_ipv6());
-          if resolved_ipv6 {
-            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port)
-          } else {
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
-          }
-        }
+            .map_err(|_| {
+              Error::provider(
+                crate::ProviderErrorKind::Io,
+                crate::ProviderErrorContext::TransportBind,
+              )
+            })?,
+        },
       };
-      let tcp = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .map_err(|_| {
-          Error::provider(
-            crate::ProviderErrorKind::Io,
-            crate::ProviderErrorContext::TransportBind,
-          )
-        })?;
       let bound = tcp
         .local_addr()
         .map_err(|_| Error::internal("listener address"))?;
@@ -243,6 +248,25 @@ impl Transport for WssTransport {
       super::connection::Connection::connect(tcp, client, server_name, rules).await
     })
   }
+}
+
+/// Binds the dual-stack IPv6 wildcard for a named host: `IPV6_V6ONLY`
+/// is cleared explicitly (Linux defaults it off, Windows and FreeBSD on),
+/// so one socket accepts both IPv4-mapped and native IPv6 connections on
+/// every platform. Fails on hosts without IPv6 at all; the caller falls
+/// back to the IPv4 wildcard.
+async fn bind_dual_stack(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+  let socket = socket2::Socket::new(
+    socket2::Domain::IPV6,
+    socket2::Type::STREAM,
+    Some(socket2::Protocol::TCP),
+  )?;
+  socket.set_only_v6(false)?;
+  socket.set_nonblocking(true)?;
+  let address: std::net::SocketAddr = ([0u16; 8], port).into();
+  socket.bind(&address.into())?;
+  socket.listen(128)?;
+  tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))
 }
 
 /// A [`TransportListener`] for the built-in WSS transport.
@@ -446,7 +470,15 @@ mod tests {
       .await
       .unwrap();
     let bound = listener.local_endpoint();
-    assert_eq!(bound.host(), "0.0.0.0");
+    // A wildcard of either family: dual-stack [::] where IPv6 exists,
+    // the IPv4 fallback where it does not. The dial below is the real
+    // assertion — it fails the moment a platform binds [::] with
+    // IPV6_V6ONLY left enabled and drops every IPv4 dialer.
+    assert!(
+      bound.host() == "::" || bound.host() == "0.0.0.0",
+      "the named wildcard bound an unexpected address: {}",
+      bound.host()
+    );
     assert_ne!(bound.port(), 0);
 
     // Dial the loopback literal of the bound port, wrapped in a timeout:
