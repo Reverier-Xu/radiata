@@ -655,6 +655,16 @@ pub(super) struct Supervisor {
   /// member evidence (a restarted process's past-life sessions); later
   /// ticks never re-seed, so pruned departed members stay forgotten.
   pub(super) recovery_seeded: bool,
+  /// Memoized departed-members exclusion set, keyed by the store
+  /// revision it was computed at: the set only changes when a leave or
+  /// cleanup tombstone lands or gets GC'd, and every such change commits
+  /// (advancing the revision). A tick or member view over an unchanged
+  /// revision reuses the cached set instead of rescanning and decoding
+  /// every accumulated tombstone; any other commit also invalidates,
+  /// which merely recomputes once (commit-writes are rare metadata
+  /// events).
+  pub(super) exclusion_cache:
+    std::sync::Mutex<Option<(crate::StoreRevision, super::recovery::Departed)>>,
   /// The highest resource-write stamp this writer has issued: a
   /// writer's own successive writes must strictly outrank their
   /// predecessor, so the issue clock advances at least one millisecond
@@ -790,6 +800,7 @@ impl Supervisor {
       published_endpoints,
       recovery_history: std::collections::BTreeSet::new(),
       recovery_seeded: false,
+      exclusion_cache: std::sync::Mutex::new(None),
       resource_write_clock: std::sync::atomic::AtomicU64::new(0),
       recovery_excluded: std::collections::BTreeSet::new(),
       sync_driver,

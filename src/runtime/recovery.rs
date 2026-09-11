@@ -9,6 +9,45 @@ use tracing::debug;
 use super::supervisor::{Supervisor, dial_member};
 use crate::{Error, NodeId, Result, session::stream::SessionEntry};
 
+/// The cleaned and left node sets behind the recovery exclusions and the
+/// member status annotations, kept distinct so a cleaned member still
+/// annotates as [`crate::MemberStatus::Cleaned`] rather than left.
+#[derive(Clone, Default)]
+pub(super) struct Departed {
+  cleaned: std::collections::BTreeSet<NodeId>,
+  left: std::collections::BTreeSet<NodeId>,
+}
+
+impl Departed {
+  async fn compute(store: &crate::storage::MetadataStore) -> Result<Self> {
+    Ok(Self {
+      cleaned: crate::identity::cleanup::cleaned_nodes_ctx(store).await?,
+      left: crate::identity::leave::left_nodes_ctx(store).await?,
+    })
+  }
+
+  /// The union exclusion set for the recovery plane.
+  pub(super) fn union(&self) -> std::collections::BTreeSet<NodeId> {
+    self
+      .cleaned
+      .iter()
+      .chain(self.left.iter())
+      .cloned()
+      .collect()
+  }
+
+  /// The member status annotation for one node.
+  pub(super) fn status(&self, node: &NodeId) -> crate::MemberStatus {
+    if self.cleaned.contains(node) {
+      crate::MemberStatus::Cleaned
+    } else if self.left.contains(node) {
+      crate::MemberStatus::Left
+    } else {
+      crate::MemberStatus::Active
+    }
+  }
+}
+
 impl Supervisor {
   /// Resolves one live downstream session for a routed first hop through
   /// the node's configured next-hop policy. `Ok(None)` means no policy or
@@ -143,6 +182,28 @@ impl Supervisor {
     Ok(())
   }
 
+  /// The departed-members exclusion state (cleaned + left), memoized per
+  /// store revision: rescanning and decoding every accumulated tombstone
+  /// on every two-second tick (and every member page) is unbounded work
+  /// for an answer that only changes when a tombstone commit moves the
+  /// revision. A poisoned cache only costs a recompute.
+  pub(super) async fn departed_exclusions(
+    &self, store: &crate::storage::MetadataStore,
+  ) -> Result<Departed> {
+    let revision = store.snapshot().await?.revision().clone();
+    if let Ok(guard) = self.exclusion_cache.lock()
+      && let Some((cached_revision, cached)) = guard.as_ref()
+      && cached_revision == &revision
+    {
+      return Ok(cached.clone());
+    }
+    let departed = Departed::compute(store).await?;
+    if let Ok(mut guard) = self.exclusion_cache.lock() {
+      *guard = Some((revision, departed.clone()));
+    }
+    Ok(departed)
+  }
+
   pub(super) async fn recovery_tick_inner(&mut self) -> Result<()> {
     // Finished connection tasks keep their JoinHandles until reaped, so a
     // long-lived listener would otherwise grow one dead handle per ever
@@ -180,8 +241,7 @@ impl Supervisor {
     // maximum for every future partition, stalling all re-dialing.
     let context = self.context()?;
     let store = context.store();
-    let mut excluded = crate::identity::cleanup::cleaned_nodes_ctx(store).await?;
-    excluded.append(&mut crate::identity::leave::left_nodes_ctx(store).await?);
+    let excluded = self.departed_exclusions(store).await?.union();
     for member in &excluded {
       self.recovery_history.remove(member);
     }
