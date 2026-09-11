@@ -494,15 +494,13 @@ async fn recovery_quiesces_after_a_member_departs() {
   b.command(Shutdown::new()).await.unwrap();
 }
 
-/// An intentionally disconnected member must never re-enter the
-/// recovery plane through a passive inbound session: exclusion is lifted
-/// only by a deliberate caller connect. If the inbound session re-seeded
-/// the known-online set, the excluded peer would be counted pending (but
-/// never dialable) once that session dropped — the controller would stay
-/// Recovering forever and peg the dial backoff at its maximum, the same
-/// trap a departed identity's pruning avoids.
+/// A disconnected session is not a departure: the peer keeps its
+/// binding and descriptor, so once a later session carries it back into
+/// the known-online set, its next drop is ordinary unreachability and
+/// the recovery controller heals it (dials the published endpoint)
+/// without operator action. Ending a membership is the leave flow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovery_stays_quiet_when_an_excluded_peer_reconnects_inbound() {
+async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
   let a_storage = Arc::new(common::MemoryStorageFactory::new(
     common::required_capabilities(),
   ));
@@ -529,6 +527,11 @@ async fn recovery_stays_quiet_when_an_excluded_peer_reconnects_inbound() {
     .unwrap()
     .endpoint()
     .clone();
+  // b listens too: its descriptor must publish an endpoint for the
+  // recovery plane to dial after the later drop.
+  b.command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap();
   common::merge_with_retry(&b, &a, a_endpoint.clone()).await;
   let a_id = a
     .query(radiata::GetLocalNode::new())
@@ -542,49 +545,48 @@ async fn recovery_stays_quiet_when_an_excluded_peer_reconnects_inbound() {
     .unwrap()
     .node_id()
     .clone();
-  // Let one recovery tick observe the connected b, so the history
-  // genuinely contains it before the disconnect.
+  // Let anti-entropy publish b's descriptor (with its endpoint) on a,
+  // and one recovery tick observe the connected pair.
   tokio::time::sleep(Duration::from_secs(5)).await;
 
-  // a disconnects b: b leaves a's recovery plane (history pruned,
-  // exclusion recorded).
+  // a disconnects b: the session is torn down and b leaves a's recovery
+  // history for now.
   a.command(radiata::DisconnectPeer::new(b_id.clone()))
     .await
     .unwrap();
-  // b dials back on its own: a accepts the inbound member session, but
-  // that passive session must not restore b to a's recovery plane.
+  // b dials back on its own: a accepts the inbound member session, and
+  // b is known-online again through it.
   b.command(radiata::ConnectMember::new(a_endpoint, a_id.clone()))
     .await
     .unwrap();
-  // Let a recovery tick observe the alive inbound session (the buggy
-  // behavior would re-seed the excluded peer into the history here).
+  // Let a recovery tick observe the alive session.
   tokio::time::sleep(Duration::from_secs(5)).await;
-  // b drops the session from its side: the excluded peer must not
-  // surface as permanently unreachable on a.
+  // b drops the session from its side: b is now an unreachable known
+  // member with a published endpoint — the recovery plane must count it
+  // pending and dial it back.
   b.command(radiata::DisconnectPeer::new(a_id.clone()))
     .await
     .unwrap();
 
-  let quiesced = tokio::time::timeout(Duration::from_secs(30), async {
-    let mut settled = 0_u32;
+  // First the drop must surface as unreachability (a genuinely counts
+  // the member again), then recovery must heal the session without
+  // operator action: unreachable returns to zero and stays there.
+  let healed = tokio::time::timeout(Duration::from_secs(60), async {
+    let mut observed_unreachable = false;
     loop {
       let view = a.query(radiata::GetRecovery::new()).await.unwrap();
-      assert_eq!(
-        view.unreachable_components(),
-        0,
-        "the excluded peer is pending as unreachable after its session dropped"
-      );
-      settled += 1;
-      if settled >= 6 {
+      if view.unreachable_components() > 0 {
+        observed_unreachable = true;
+      } else if observed_unreachable {
         break;
       }
-      tokio::time::sleep(Duration::from_secs(1)).await;
+      tokio::time::sleep(Duration::from_millis(500)).await;
     }
   })
   .await;
   assert!(
-    quiesced.is_ok(),
-    "the recovery view never settled after the excluded peer's session dropped"
+    healed.is_ok(),
+    "the disconnected peer's session was not healed back by recovery"
   );
 
   a.command(Shutdown::new()).await.unwrap();

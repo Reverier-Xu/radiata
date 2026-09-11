@@ -855,7 +855,10 @@ impl Command for StartRecovery {
   type Output = crate::RecoveryView;
 }
 
-/// Closes the authenticated session to one peer.
+/// Closes the authenticated session to one peer: the session is torn
+/// down now and the peer leaves the recovery plane until a later session
+/// restores it. The peer's membership (binding and descriptor) is
+/// untouched — to end a membership, use the leave flow instead.
 pub struct DisconnectPeer {
   peer: NodeId,
 }

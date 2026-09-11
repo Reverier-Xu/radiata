@@ -154,8 +154,8 @@ impl Supervisor {
   /// Seeds the known-online set from the durable member evidence once
   /// per process: published descriptors behind a trusted binding are
   /// members this identity has authenticated with before — the restarted
-  /// process's past-life sessions. Removed-flagged descriptors, departed
-  /// members, and intentionally disconnected members are not seeded.
+  /// process's past-life sessions. Removed-flagged descriptors and
+  /// departed members (left or cleaned, computed below) are not seeded.
   async fn seed_known_online(
     store: &crate::storage::MetadataStore, local: &NodeId,
     history: &mut std::collections::BTreeSet<NodeId>,
@@ -229,15 +229,10 @@ impl Supervisor {
       .map(|(peer, _)| peer.clone())
       .collect();
     for peer in &direct {
-      // An intentionally disconnected peer never re-enters the
-      // known-online set through a passive session: exclusion is lifted
-      // only by a deliberate caller connect. Counting one as known would
-      // make it permanently pending (never dialable, never quiescent)
-      // once that session drops — the same trap a departed identity's
-      // pruning below avoids.
-      if self.recovery_excluded.contains(peer) {
-        continue;
-      }
+      // Any authenticated session — inbound or outbound — makes the peer
+      // known-online again: membership is a whole, and there is no
+      // per-session exclusion state. A departed identity is handled by
+      // the pruning below, not by session bookkeeping.
       self.recovery_history.insert(peer.clone());
     }
     // Departed identities (left or cleaned) are no longer cluster
@@ -292,7 +287,7 @@ impl Supervisor {
     let snapshot = store.snapshot().await?;
     let mut candidates = std::collections::BTreeSet::new();
     for member in online.difference(&direct) {
-      if self.recovery_excluded.contains(member) || excluded.contains(member) {
+      if excluded.contains(member) {
         continue;
       }
       // Only known members (a durable binding exists) are dialled.

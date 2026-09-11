@@ -690,10 +690,6 @@ pub(super) struct Supervisor {
   /// writer's own second write could lose to its first). Both the put
   /// and the remove paths issue through [`Self::issue_resource_stamp`].
   pub(super) resource_write_clock: std::sync::atomic::AtomicU64,
-  // Intentionally disconnected peers: recovery never heals them until an
-  // explicit reconnect (a new session to the peer) restores the
-  // relationship (no-extra-edge).
-  pub(super) recovery_excluded: std::collections::BTreeSet<NodeId>,
   // The anti-entropy driver task: aborted on shutdown so the node's
   // storage handle is released promptly (a restarted node reopening the
   // same factory must not race a lingering driver).
@@ -821,7 +817,6 @@ impl Supervisor {
       recovery_seeded: false,
       exclusion_cache: std::sync::Mutex::new(None),
       resource_write_clock: std::sync::atomic::AtomicU64::new(0),
-      recovery_excluded: std::collections::BTreeSet::new(),
       sync_driver,
       trace_sink,
       trace_records,
@@ -1042,9 +1037,6 @@ impl Supervisor {
   /// keeps the session open for packet streams.
   async fn connect_member(&mut self, receiver: Endpoint, peer: NodeId) -> Result<NodeId> {
     self.require_unblocked()?;
-    // A deliberate caller connect restores an intentionally disconnected
-    // relationship: recovery may heal it again.
-    self.recovery_excluded.remove(&peer);
     let driver = self.driver.clone();
     let sessions = self.dependencies.sessions.clone();
     let packet = self.packet.clone();
@@ -1275,10 +1267,11 @@ impl Supervisor {
     Ok(after)
   }
 
-  /// Closes the authenticated session to one peer (partition simulation)
-  /// and removes it from the recovery known-online set: an
-  /// intentional disconnect is respected by recovery (a real edge loss, by
-  /// contrast, leaves the member online and gets healed on the next cycle).
+  /// Closes the authenticated session to one peer and forgets it in the
+  /// recovery plane for now: the member keeps its binding and descriptor,
+  /// so any later session (inbound, healed, or a deliberate connect)
+  /// restores it to the recovery plane like any other member. Ending a
+  /// membership is the leave flow, not disconnecting a session.
   fn disconnect_peer(&mut self, peer: &NodeId) -> Result<()> {
     crate::session::stream::retire_session(&self.dependencies.sessions, peer)?;
     self
@@ -1286,9 +1279,11 @@ impl Supervisor {
       .events
       .emit(crate::SessionChanged::new(peer.clone()));
     self.recovery_history.remove(peer);
-    // An intentional disconnect is never re-healed until the relationship
-    // is deliberately re-established (a new session to the peer).
-    self.recovery_excluded.insert(peer.clone());
+    // A disconnect only tears the session down: the peer stays a known
+    // member (its binding and descriptor are untouched), so a later
+    // session — inbound or healed — restores it to the recovery plane
+    // like any other member. Leaving the cluster is the way to end a
+    // membership, not disconnecting a session.
     Ok(())
   }
 
@@ -1631,14 +1626,15 @@ impl Supervisor {
     );
     if !was_already_revoked {
       // After the known-committed transition: close the exact identity's
-      // active sessions and exclude it from recovery redial.
+      // active sessions. Redial is impossible by construction — the
+      // revoked binding is gone, so neither recovery candidates nor an
+      // inbound handshake can admit this identity again.
       crate::session::stream::retire_session(&self.dependencies.sessions, &subject)?;
       self
         .dependencies
         .events
         .emit(crate::SessionChanged::new(subject.clone()));
       self.recovery_history.remove(&subject);
-      self.recovery_excluded.insert(subject.clone());
       self
         .dependencies
         .events
