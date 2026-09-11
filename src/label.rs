@@ -41,7 +41,7 @@ impl LabelKey {
   /// it does not normalize.
   pub fn parse(value: &str) -> Result<Self> {
     let tag = QualifiedTag::parse(&crate::protocol::tag::fold_tag_domain(value))?;
-    if tag.category() != "labels" {
+    if tag.category() != crate::protocol::tag::CATEGORY_LABELS {
       return Err(Error::invalid_input("label key"));
     }
     Ok(Self(tag))
@@ -55,7 +55,7 @@ impl LabelKey {
   /// evaluation re-checks the category, so reserved keys can never enter
   /// the custom label namespace this way).
   pub(crate) fn from_label_tag(tag: &QualifiedTag) -> Option<Self> {
-    (tag.category() == "labels").then(|| Self(tag.clone()))
+    (tag.category() == crate::protocol::tag::CATEGORY_LABELS).then(|| Self(tag.clone()))
   }
 }
 

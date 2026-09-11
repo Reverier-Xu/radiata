@@ -62,13 +62,12 @@ pub(crate) fn alive_peers(sessions: &SessionTable) -> Result<Vec<NodeId>> {
   )
 }
 
-/// Sends one pre-encoded sync payload to `peer` over its authenticated
-/// session with a fire-and-forget admission: routing failures are dropped
-/// (the next tick retries) and never stall the anti-entropy loop.
 /// Sends one sync payload to one peer over the packet data plane as an
-/// exact-target, max-hops-1 internal stream; fire-and-forget delivery.
-/// The payload streams as bounded chunks ([`chunk_payload`]), so an
-/// encoded page above the single-chunk bound still delivers.
+/// exact-target, max-hops-1 internal stream; fire-and-forget delivery
+/// (routing failures are dropped, the next tick retries, and the
+/// anti-entropy loop never stalls). The payload streams as bounded
+/// chunks ([`chunk_payload`]), so an encoded page above the single-chunk
+/// bound still delivers.
 pub(crate) async fn send_payload(
   runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, peer: &NodeId, protocol: &ProtocolTag,
   encoded: &[u8],

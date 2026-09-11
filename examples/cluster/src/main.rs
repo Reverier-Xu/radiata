@@ -115,7 +115,6 @@ async fn main() {
     .clone();
   tracing::info!(node = %node_id.as_str(), "radiata node up");
 
-
   let state = Arc::new(http::AppState {
     node,
     node_id,
@@ -125,7 +124,9 @@ async fn main() {
 
   let app = http::router(Arc::clone(&state));
   let addr: SocketAddr = config.http_listen.parse().expect("HTTP_LISTEN");
-  let listener = tokio::net::TcpListener::bind(addr).await.expect("http bind");
+  let listener = tokio::net::TcpListener::bind(addr)
+    .await
+    .expect("http bind");
   tracing::info!(%addr, "http api up");
   axum::serve(listener, app)
     .with_graceful_shutdown(async {

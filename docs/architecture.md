@@ -62,7 +62,7 @@ radiata 是一个确定性中继节点运行时库：为群组应用提供认证
 | `hex.rs` | 全 crate 唯一小写 hex 编解码，所有线转录/持久化文档/摘要渲染共用。 |
 | `time.rs` | 挂钟时间获取（供注入）。 |
 | `label.rs` | 有界规范标签（`LabelKey`/`LabelValue`/`LabelSet`），选择器求值依据。 |
-| `paging.rs` | keyset-cursor 分页单一实现（membership/resource/candidate/公共视图共用），容量处仅在可证明还有下一条时才给续游标。 |
+| `paging.rs` | keyset-cursor 分页单一实现（membership/resource/公共视图/信任快照共用；依赖存储 SPI 的 `scan_from` 定位扫描，复杂度 O(page)）。容量处仅在可证明还有下一条时才给续游标。 |
 
 ### L1 协议域（控制面语义）
 

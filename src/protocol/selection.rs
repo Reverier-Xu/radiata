@@ -70,15 +70,8 @@ pub(crate) struct Selection {
 
 impl Selection {
   /// The selected feature set.
-  #[allow(dead_code)]
   pub(crate) fn features(&self) -> &[FeatureTag] {
     &self.features
-  }
-
-  /// The effective negotiated limits.
-  #[allow(dead_code)]
-  pub(crate) fn limits(&self) -> &[(QualifiedTag, u64)] {
-    &self.limits
   }
 
   /// The deterministic-CBOR selection bytes exchanged for exact match.
@@ -87,7 +80,7 @@ impl Selection {
   }
 
   /// One effective limit by tag.
-  #[allow(dead_code)]
+  #[cfg(test)]
   pub(crate) fn limit(&self, tag: &QualifiedTag) -> Option<u64> {
     self
       .limits

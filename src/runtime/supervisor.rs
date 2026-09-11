@@ -45,9 +45,11 @@ const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs
 const ACCEPT_BACKOFF_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 const ACCEPT_BACKOFF_MAX_STEPS: u32 = 5;
 
-/// Capacity of the node's outbound packet command channel, shared with
-/// the builder so both channel ends are created at one construction site.
-/// The bounded request channel for RunSyncRound commands: rounds are
+/// Capacity of the node's outbound packet command channel:
+/// `PACKET_CHANNEL_CAPACITY` derives from it so one bound governs both
+/// control ends.
+///
+/// The bounded request channel for `RunSyncRound` commands: rounds are
 /// self-limiting (one page per session per round), so a small queue with
 /// typed backpressure matches the work.
 pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
@@ -525,7 +527,8 @@ async fn supervise(
       Control::RunSyncRound { reply } => {
         let result = supervisor.run_sync_round().await;
         let _ = reply.send(result);
-      }      Control::RemoveResource {
+      }
+      Control::RemoveResource {
         name,
         expected,
         reply,
@@ -568,7 +571,11 @@ async fn supervise(
         let _ = supervisor.send_packet(request, &mut tasks).await;
       }
       _ = recovery_timer.tick() => {
-        let _ = supervisor.recovery_tick().await;
+        // A failed tick (store outage, tombstone scan failure) must stay
+        // visible: silent drops would starve recovery diagnostics.
+        if let Err(error) = supervisor.recovery_tick().await {
+          tracing::warn!(kind = ?error.kind(), "recovery tick failed");
+        }
         supervisor.trace_retention_sweep().await;
         supervisor.resource_removal_sweep().await;
       }

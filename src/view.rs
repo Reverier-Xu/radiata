@@ -873,6 +873,9 @@ impl RecoveryView {
     self.is_connected
   }
 
+  /// How many members the controller still counts as unreachable.
+  /// (The accessor name predates the member-set framing; it counts
+  /// members, not network components.)
   pub const fn unreachable_components(&self) -> usize {
     self.unreachable_components
   }

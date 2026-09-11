@@ -194,7 +194,9 @@ impl Connection {
   }
 
   /// Splits the connection into independent writer and reader halves for
-  /// the post-authentication session phase.
+  /// the post-authentication session phase. Only the reader carries the
+  /// pong clock: pongs arrive on the read half, and a writer-side
+  /// timestamp no one reads is dead weight.
   pub(crate) fn into_split(self) -> (ConnectionWriter, ConnectionReader) {
     let (sink, stream) = self.stream.split();
     let pong_last_seen = self.pong_last_seen;
@@ -202,7 +204,6 @@ impl Connection {
       ConnectionWriter {
         sink,
         rules: self.rules,
-        pong_last_seen: Arc::clone(&pong_last_seen),
       },
       ConnectionReader {
         stream,
@@ -224,7 +225,6 @@ impl core::fmt::Debug for Connection {
 pub(crate) struct ConnectionWriter {
   sink: SplitSink<WebSocketStream<TlsStream<TcpStream>>, WsMessage>,
   rules: FrameRules,
-  pong_last_seen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ConnectionWriter {
@@ -235,14 +235,6 @@ impl ConnectionWriter {
       .send(WsMessage::Ping(WsBytes::new()))
       .await
       .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::TransportSend))
-  }
-
-  /// UNIX-seconds of the last peer pong.
-  #[allow(dead_code)]
-  pub(crate) fn pong_last_seen(&self) -> u64 {
-    self
-      .pong_last_seen
-      .load(std::sync::atomic::Ordering::Relaxed)
   }
 
   /// Sends one base-schema wire message of `kind_id` with no flags.

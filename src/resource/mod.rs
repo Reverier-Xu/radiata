@@ -64,7 +64,7 @@ impl ResourceName {
   /// forgeries.
   pub fn parse(value: &str) -> Result<Self> {
     let tag = QualifiedTag::parse(&crate::protocol::tag::fold_tag_domain(value))?;
-    if tag.category() != "resources" {
+    if tag.category() != crate::protocol::tag::CATEGORY_RESOURCES {
       return Err(Error::invalid_input("resource name"));
     }
     Ok(Self(tag))

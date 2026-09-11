@@ -124,9 +124,9 @@ pub(crate) fn resource_sync_protocol_definition() -> Result<ProtocolDefinition> 
 }
 
 /// The resource-sync driver's per-peer continuation state, tracked
-/// separately for every alive peer: a peer that was unreachable during a
-/// round keeps its own cursor behind, so the very next round after its
-/// session returns re-delivers everything it missed. Per-peer cursors
+/// separately for every alive peer: the state is dropped when a peer's
+/// session is gone, so the returning peer's first round re-delivers
+/// everything it missed. Per-peer cursors
 /// also mean a newly connected peer receives the full catalog on its
 /// first tick without any global state churn.
 #[derive(Debug, Default)]

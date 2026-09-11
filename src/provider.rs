@@ -136,19 +136,48 @@ impl CreatedKey {
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyCreateState {
+  /// The key exists and its public part is returned.
   Present(CreatedKey),
+  /// The key provably does not exist: the caller may create it.
   Absent,
+  /// Existence cannot be decided (for example a crashed or torn create
+  /// left an unparseable artifact): fail closed, never overwrite.
   Unknown,
 }
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyDeleteState {
+  /// The key existed and was deleted by this call.
   Present,
+  /// The key provably does not exist: deletion is a no-op.
   Absent,
+  /// Deletion cannot be decided: fail closed, never assume absence.
   Unknown,
 }
 
+/// The customer-side key custody contract.
+///
+/// Every method takes an explicit [`KeyOperationId`] and must be
+/// idempotent with respect to it: a retried operation resolves to the
+/// same durable outcome as the first attempt, whatever crashed in
+/// between. The tri-state returns are the contract's core — a state you
+/// cannot prove (`Present`/`Absent`) must be reported as `Unknown`
+/// rather than guessed, because the node's identity survives crashes
+/// only if custody is exact:
+///
+/// - `create_ed25519` keyed by one operation id must never mint two different
+///   secrets across retries: the first secret that reaches durable storage
+///   wins, and every later call with the same id returns that same key.
+/// - `reconcile_create` reports what is on disk without creating: it is how a
+///   restarted node resolves an intent whose outcome it never observed.
+/// - `delete` removes the key named by the handle; `reconcile_delete` reports
+///   whether the removal landed. A returned secret must be destroyed, not
+///   archived.
+///
+/// Errors mean "this provider cannot answer right now" (io, permission,
+/// entropy): the runtime fails the operation closed and the caller
+/// retries. They never mean "the key is gone".
 pub trait KeyProvider: fmt::Debug + Send + Sync + 'static {
   fn capabilities(&self) -> KeyCapabilities;
 

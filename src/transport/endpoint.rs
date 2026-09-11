@@ -88,8 +88,7 @@ impl Endpoint {
     self.port
   }
 
-  /// The canonical `host:port` authority used for dialing and the
-  /// WebSocket `Host` header.
+  /// The canonical `host:port` authority used for dialing.
   pub(crate) fn authority(&self) -> &str {
     &self.canonical[SCHEME.len()..]
   }
@@ -99,6 +98,10 @@ impl Endpoint {
   /// socket: the host re-resolves across network moves, the bound port
   /// is the only part the caller learns from the OS.
   pub(crate) fn with_port(&self, port: u16) -> Self {
+    // The canonical form always carries the scheme and a host:port
+    // authority, so the port separator exists; the fallback arm is
+    // unreachable by construction and kept only to avoid panicking on a
+    // malformed canonical string.
     let canonical = match self.canonical.rsplit_once(':') {
       Some((head, _)) => format!("{head}:{port}"),
       None => format!("{}:{}", self.canonical, port),

@@ -556,10 +556,10 @@ pub(crate) async fn ensure_local_descriptor(
 /// keeps running, so a large membership degrades the snapshot leg instead
 /// of stalling every sync lane.
 /// The driver's per-peer anti-entropy continuation state, tracked
-/// separately for every alive peer: a peer that was unreachable during a
-/// round keeps its own cursors behind, so the very next round after its
-/// session returns re-delivers everything it missed — including writes
-/// made while it was partitioned away.
+/// separately for every alive peer: the state is dropped when a peer's
+/// session is gone, so the returning peer's first round re-delivers
+/// everything it missed — including writes made while it was
+/// partitioned away.
 #[derive(Debug, Default)]
 pub(crate) struct MembershipSyncCursors {
   peers: std::collections::BTreeMap<NodeId, PeerSyncState>,
