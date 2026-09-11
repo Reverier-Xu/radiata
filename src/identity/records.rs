@@ -62,19 +62,6 @@ impl JournalPurpose {
 }
 
 const ED25519_ALGORITHM: &str = "radiata.woooo.tech/crypto/ed25519";
-const MAX_PURPOSE_LEN: usize = 128;
-
-/// The intent-purpose grammar (single source): nonempty, bounded, and
-/// printable ASCII, with the caller's context in the typed error.
-fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
-  if purpose.is_empty()
-    || purpose.len() > MAX_PURPOSE_LEN
-    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
-  {
-    return Err(Error::invalid_input(context));
-  }
-  Ok(())
-}
 
 const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/local-identity-v1";
 const KEY_CREATION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/key-creation-intent-v1";
@@ -516,7 +503,7 @@ impl KeyCreationIntentV1 {
     operation: KeyOperationId, intended_node: NodeId, purpose: String, transaction: TransactionId,
     base_revision: StoreRevision,
   ) -> Result<Self> {
-    validate_purpose(&purpose, "key creation intent purpose")?;
+    crate::provider::validate_purpose(&purpose, "key creation intent purpose")?;
     Ok(Self {
       operation,
       intended_node,
@@ -603,7 +590,7 @@ impl KeyDeletionIntentV1 {
     operation: KeyOperationId, handle: KeyHandle, purpose: String, transaction: TransactionId,
     base_revision: StoreRevision,
   ) -> Result<Self> {
-    validate_purpose(&purpose, "key deletion intent purpose")?;
+    crate::provider::validate_purpose(&purpose, "key deletion intent purpose")?;
     Ok(Self {
       operation,
       handle,

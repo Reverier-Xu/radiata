@@ -924,6 +924,26 @@ fn update_length(hasher: &mut Sha256, value: usize) {
   hasher.update((value as u128).to_be_bytes());
 }
 
+/// The shared intent-purpose bound: nonempty, bounded, printable ASCII
+/// purposes live in both the identity intent records and the pending
+/// transaction journal, so the grammar and its limit are defined once
+/// here and both sides validate through [`validate_purpose`].
+pub(crate) const MAX_PURPOSE_LEN: usize = 128;
+
+/// The intent-purpose grammar (single source): nonempty, bounded, and
+/// printable ASCII, with the caller's context in the typed error. Both
+/// the identity intent records and the storage pending journal validate
+/// purposes through this one gate so the two bounds cannot drift.
+pub(crate) fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
+  if purpose.is_empty()
+    || purpose.len() > MAX_PURPOSE_LEN
+    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+  {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
