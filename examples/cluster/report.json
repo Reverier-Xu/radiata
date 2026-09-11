@@ -1,13 +1,13 @@
 {
   "writes": 30,
-  "converge_p50_ms": 7987.683857005322,
-  "converge_p90_ms": 16801.269579998916,
-  "converge_p99_ms": 17424.456639011623,
-  "converge_max_ms": 17424.456639011623,
-  "local_get_p50_ms": 0.5137110128998756,
-  "stream_probe_p50_ms": 0.173,
+  "converge_p50_ms": 8024.5412299991585,
+  "converge_p90_ms": 16900.668461981695,
+  "converge_p99_ms": 17018.366432981566,
+  "converge_max_ms": 17018.366432981566,
+  "local_get_p50_ms": 0.47695700777694583,
+  "stream_probe_p50_ms": 0.178,
   "stream_probe_ok": 30,
-  "crash_recovery_s": 1.962409944011597,
+  "crash_recovery_s": 1.9952932710002642,
   "observability": {
     "1": {
       "members": 9,
