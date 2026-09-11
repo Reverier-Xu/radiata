@@ -136,7 +136,7 @@ impl FeatureOffer {
   }
 
   /// The offered numeric limit map.
-  #[cfg(test)]
+  #[cfg(any(test, fuzzing))]
   pub(crate) fn limits(&self) -> &[(QualifiedTag, u64)] {
     &self.limits
   }
