@@ -266,14 +266,23 @@ def main() -> None:
 
     # Federation correctness: BOTH pre-merge resources must now be
     # visible everywhere (alpha rode n4's local store into B; beta rode
-    # the merge sessions into what was A).
+    # the merge sessions into what was A). Wait, not sample: propagation
+    # across the fresh merge edges takes a couple of sync rounds.
     report["federation"] = {}
-    for node in range(1, N + 1):
-        alpha = digest_of(node, "demo.org/resources/alpha")
-        beta = digest_of(node, "demo.org/resources/beta")
-        report["federation"][f"n{node}"] = {"alpha": alpha is not None, "beta": beta is not None}
-    alpha_all = all(entry["alpha"] for entry in report["federation"].values())
-    beta_all = all(entry["beta"] for entry in report["federation"].values())
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        report["federation"] = {
+            f"n{node}": {
+                "alpha": digest_of(node, "demo.org/resources/alpha") is not None,
+                "beta": digest_of(node, "demo.org/resources/beta") is not None,
+            }
+            for node in range(1, N + 1)
+        }
+        alpha_all = all(entry["alpha"] for entry in report["federation"].values())
+        beta_all = all(entry["beta"] for entry in report["federation"].values())
+        if alpha_all and beta_all:
+            break
+        time.sleep(1)
     print(f"[federation] alpha visible on 9/9: {alpha_all}; beta visible on 9/9: {beta_all}")
 
     print("=== E4 work in the merged cluster ===")
@@ -340,10 +349,13 @@ def main() -> None:
     converge([1, 2, 3, 4], "demo.org/resources/split-a", split_digest_a)
     # Finding #10 is fixed: per-peer sync cursors are dropped when a
     # session dies, so a re-formed session re-delivers the full catalog —
-    # intra-side convergence of split-b is guaranteed, not merely hoped
-    # for.
-    converge([5, 6, 7, 8, 9], "demo.org/resources/split-b", split_digest_b, deadline_s=45)
-    print("[partition] side B internal convergence: ok")
+    # intra-side convergence is guaranteed between sessioned members
+    # ({5,6,7,8} all sessioned n5 during the joins). n9 is excluded: its
+    # replacement identity has only ever sessioned n1 (side A), and the
+    # recovery contract never fabricates edges toward never-sessioned
+    # members — n9 catches up after the heal instead.
+    converge([5, 6, 7, 8], "demo.org/resources/split-b", split_digest_b, deadline_s=45)
+    print("[partition] side B internal convergence: ok (n9 excluded by the topology contract)")
     across = digest_of(5, "demo.org/resources/split-a")
     print(f"[partition] side A converged split-a; side B converged split-b; "
           f"split-a visible on B: {across is not None}")
