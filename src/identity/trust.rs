@@ -727,8 +727,20 @@ pub(crate) mod store {
       current.revision().clone(),
       operations,
     )?;
-    let _ = store.commit(transaction).await?;
-    Ok(())
+    // A discarded commit outcome would report a snapshot revision as
+    // persisted without a committed outcome behind it: Conflict/Aborted
+    // definitively did not land, and Unknown leaves durability
+    // indeterminate — both must surface (the sync lane isolates them).
+    match store.commit(transaction).await? {
+      crate::CommitOutcome::Committed(_) => Ok(()),
+      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
+        Err(crate::Error::conflict("trust snapshot"))
+      }
+      crate::CommitOutcome::Unknown { .. } => Err(crate::Error::provider(
+        crate::ProviderErrorKind::CommitUnknown,
+        crate::ProviderErrorContext::StorageCommit,
+      )),
+    }
   }
 
   /// The highest-revision snapshot for one issuer over the running node's
@@ -902,8 +914,21 @@ pub(crate) mod store {
         value: StoreValue::new(Arc::from(binding.encode()?)),
       }],
     )?;
-    let _ = store.commit(transaction).await?;
-    Ok(())
+    // A discarded commit outcome would report the binding as adopted
+    // without a committed outcome behind it: Conflict/Aborted
+    // definitively did not land, and Unknown leaves durability
+    // indeterminate — the snapshot-accept lane treats a surfaced
+    // conflict as skippable and everything else as evidence failure.
+    match store.commit(transaction).await? {
+      crate::CommitOutcome::Committed(_) => Ok(()),
+      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
+        Err(crate::Error::conflict("trust binding adoption"))
+      }
+      crate::CommitOutcome::Unknown { .. } => Err(crate::Error::provider(
+        crate::ProviderErrorKind::CommitUnknown,
+        crate::ProviderErrorContext::StorageCommit,
+      )),
+    }
   }
 
   /// Persists one verified snapshot as a plain store value over a
