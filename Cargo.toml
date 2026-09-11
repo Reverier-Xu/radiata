@@ -47,6 +47,9 @@ secrecy = { version = "0.10", default-features = false }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 sha2 = "0.11"
+# Already in the dependency graph through tokio; used to clear
+# IPV6_V6ONLY explicitly on the named-host wildcard listener.
+socket2 = "0.6"
 tokio = { version = "1.53", features = [
   "rt",
   "sync",
