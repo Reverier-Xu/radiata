@@ -240,8 +240,18 @@ pub(crate) async fn persist_terminal_record(
     }],
   )?;
   drop(snapshot);
-  let _ = store.commit(transaction).await?;
-  Ok(())
+  // A discarded commit outcome would silently drop the tombstone: a
+  // Conflict or Aborted commit definitively did not land, and an Unknown
+  // leaves durability indeterminate — the caller must never report a
+  // terminal record as persisted without a committed outcome.
+  match store.commit(transaction).await? {
+    crate::CommitOutcome::Committed(_) => Ok(()),
+    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => Err(Error::conflict(label)),
+    crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
+      crate::ProviderErrorKind::CommitUnknown,
+      crate::ProviderErrorContext::StorageCommit,
+    )),
+  }
 }
 
 /// The scan skip predicate for families whose namespace carries no extra
