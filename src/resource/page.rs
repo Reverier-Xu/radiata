@@ -15,12 +15,12 @@ use crate::{Error, Result};
 
 pub(crate) const RESOURCE_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/resource-page-v1";
 
-/// The default records-per-page emission limit.
-pub(crate) const DEFAULT_RESOURCE_PAGE_LIMIT: usize = 16;
-
+/// The default records-per-page emission limit (single-sourced in the
+/// paging module; lane-local name for readable call sites).
+pub(crate) use crate::paging::PAGE_DEFAULT_LIMIT as DEFAULT_RESOURCE_PAGE_LIMIT;
 /// The receiver-side per-page capacity: a page above this bound fails
 /// closed instead of being truncated.
-pub(crate) const MAX_PAGE_RECORDS: usize = 64;
+pub(crate) use crate::paging::PAGE_MAX_ITEMS as MAX_PAGE_RECORDS;
 
 /// One bounded page of signed resource records plus a continuation cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]

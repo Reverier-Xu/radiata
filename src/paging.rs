@@ -12,6 +12,15 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{Error, Result};
 
+/// The default page limit when the caller supplies none: one constant
+/// for every paging lane (membership descriptors, resource records), so
+/// per-lane copies cannot drift apart.
+pub(crate) const PAGE_DEFAULT_LIMIT: usize = 16;
+
+/// The maximum page size a receiver accepts, bounding one page's bytes:
+/// a page above this bound fails closed instead of being truncated.
+pub(crate) const PAGE_MAX_ITEMS: usize = 64;
+
 /// The one bounded-page wire envelope every anti-entropy lane encodes:
 /// positional array layout, so membership pages and resource pages share
 /// the exact byte shape (golden vectors pin both).
