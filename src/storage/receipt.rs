@@ -10,9 +10,9 @@ use sha2::{Digest as ShaDigest, Sha256};
 use super::MetadataStore;
 pub(crate) use crate::storage::families::INTERNAL_NAMESPACE;
 use crate::{
-  CommitOutcome, CommitReceipt, Digest, Error, ProviderErrorContext, ProviderErrorKind,
-  StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision, StoreTransaction,
-  StoreValue, TransactionId, provider::StoreSnapshot,
+  CommitOutcome, CommitReceipt, Digest, Error, ProviderErrorContext, StoreExpectation, StoreKey,
+  StoreNamespace, StoreOperation, StoreRevision, StoreTransaction, StoreValue, TransactionId,
+  provider::StoreSnapshot,
 };
 const USED_ID_TAG: &[u8] = b"\x01used-id\0";
 pub(crate) const ACTIVE_MARKER_VALUE: &[u8] = b"";
@@ -244,7 +244,9 @@ impl MetadataStore {
       Some(token),
     )
     .await?;
-    let edge_key = state.edge_key.ok_or_else(storage_corrupt)?;
+    let edge_key = state
+      .edge_key
+      .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
 
     if state.edge.is_some() {
       return Ok(ReceiptReferenceOutcome::Conflict);
@@ -310,13 +312,17 @@ impl MetadataStore {
       Some(token),
     )
     .await?;
-    let edge_key = state.edge_key.ok_or_else(storage_corrupt)?;
+    let edge_key = state
+      .edge_key
+      .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
     let edge = state.edge;
 
     let Some(edge) = edge else {
       return Ok(ReceiptReferenceOutcome::Conflict);
     };
-    let head = state.head.ok_or_else(storage_corrupt)?;
+    let head = state
+      .head
+      .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
     let count = decode_reference_count(&head)?;
 
     let mut operations = Vec::new();
@@ -468,18 +474,20 @@ impl MetadataStore {
       let key = entry.key().as_bytes();
       let transaction = key
         .strip_prefix(ELIGIBILITY_ANCHOR_TAG)
-        .ok_or_else(storage_corrupt)?;
+        .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
       let (anchored_at, operation_digest) = decode_anchor_value(entry.value().as_bytes())?;
       let deadline = anchored_at
         .checked_add(self.receipt_retention)
-        .ok_or_else(storage_corrupt)?;
+        .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
       // Only receipts whose deadline has passed leave the scan; the
       // state machine re-verifies everything for the ones that remain.
       if self.clock.now() < deadline {
         continue;
       }
-      let transaction =
-        TransactionId::parse(std::str::from_utf8(transaction).map_err(|_| storage_corrupt())?)?;
+      let transaction = TransactionId::parse(
+        std::str::from_utf8(transaction)
+          .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?,
+      )?;
       targets.push(ReceiptIdentity::from_parts(transaction, operation_digest));
     }
     drop(scan);
@@ -711,8 +719,10 @@ pub(super) async fn build_receipt_change_operations(
         return Err(Error::conflict("receipt reference token"));
       }
     }
-    let head = head.ok_or_else(storage_corrupt)?;
-    let remaining = count.checked_sub(additional).ok_or_else(storage_corrupt)?;
+    let head = head.ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
+    let remaining = count
+      .checked_sub(additional)
+      .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
     operations
       .try_reserve_exact(group.tokens.len() + 1)
       .map_err(|_| Error::resource_exhausted("receipt reference change"))?;
@@ -896,7 +906,9 @@ async fn verify_live_marker(
   match marker {
     Some(value) if value.as_bytes() == ACTIVE_MARKER_VALUE => Ok(LiveMarker::Active(value)),
     Some(value) if value.as_bytes() == FORGOTTEN_MARKER_VALUE => Ok(LiveMarker::Forgotten),
-    _ => Err(storage_corrupt()),
+    _ => Err(super::storage_corrupt(
+      ProviderErrorContext::StorageSnapshot,
+    )),
   }
 }
 
@@ -918,7 +930,9 @@ async fn audit_reference_index(
           .ok_or_else(|| Error::resource_exhausted("receipt reference key"))?
       || !entry.value().as_bytes().is_empty()
     {
-      return Err(storage_corrupt());
+      return Err(super::storage_corrupt(
+        ProviderErrorContext::StorageSnapshot,
+      ));
     }
     count = increment_reference_count(count)?;
   }
@@ -926,10 +940,16 @@ async fn audit_reference_index(
   match head {
     None if count == 0 => {}
     Some(value) if decode_reference_count(value)? == count => {}
-    _ => return Err(storage_corrupt()),
+    _ => {
+      return Err(super::storage_corrupt(
+        ProviderErrorContext::StorageSnapshot,
+      ));
+    }
   }
   if count > 0 && anchor.is_some() {
-    return Err(storage_corrupt());
+    return Err(super::storage_corrupt(
+      ProviderErrorContext::StorageSnapshot,
+    ));
   }
   Ok(count)
 }
@@ -1021,10 +1041,15 @@ pub(crate) fn encode_reference_count(count: u64) -> StoreValue {
 }
 
 fn decode_reference_count(value: &StoreValue) -> crate::Result<u64> {
-  let bytes: [u8; 8] = value.as_bytes().try_into().map_err(|_| storage_corrupt())?;
+  let bytes: [u8; 8] = value
+    .as_bytes()
+    .try_into()
+    .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
   let count = u64::from_be_bytes(bytes);
   if count == 0 {
-    return Err(storage_corrupt());
+    return Err(super::storage_corrupt(
+      ProviderErrorContext::StorageSnapshot,
+    ));
   }
   Ok(count)
 }
@@ -1043,12 +1068,14 @@ pub(super) fn encode_anchor_value(anchored_at: SystemTime, operation_digest: &Di
 /// Decodes one eligibility-anchor value; any other length is corruption.
 pub(super) fn decode_anchor_value(value: &[u8]) -> crate::Result<(SystemTime, Digest)> {
   if value.len() != WALL_TIME_WIDTH + 32 {
-    return Err(storage_corrupt());
+    return Err(super::storage_corrupt(
+      ProviderErrorContext::StorageSnapshot,
+    ));
   }
   let anchored_at = decode_wall_time(&value[..WALL_TIME_WIDTH])?;
   let digest_bytes: [u8; 32] = value[WALL_TIME_WIDTH..]
     .try_into()
-    .map_err(|_| storage_corrupt())?;
+    .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
   Ok((anchored_at, Digest::from_bytes(digest_bytes)))
 }
 
@@ -1066,25 +1093,36 @@ pub(super) fn encode_wall_time(value: SystemTime) -> [u8; WALL_TIME_WIDTH] {
 
 pub(super) fn decode_wall_time(encoded: &[u8]) -> crate::Result<SystemTime> {
   if encoded.len() != WALL_TIME_WIDTH {
-    return Err(storage_corrupt());
+    return Err(super::storage_corrupt(
+      ProviderErrorContext::StorageSnapshot,
+    ));
   }
   let sign = encoded[0];
-  let seconds = u64::from_be_bytes(encoded[1..9].try_into().map_err(|_| storage_corrupt())?);
-  let nanos = u32::from_be_bytes(encoded[9..13].try_into().map_err(|_| storage_corrupt())?);
+  let seconds = u64::from_be_bytes(
+    encoded[1..9]
+      .try_into()
+      .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?,
+  );
+  let nanos = u32::from_be_bytes(
+    encoded[9..13]
+      .try_into()
+      .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?,
+  );
   if nanos >= NANOS_PER_SECOND || (sign == 1 && seconds == 0 && nanos == 0) {
-    return Err(storage_corrupt());
+    return Err(super::storage_corrupt(
+      ProviderErrorContext::StorageSnapshot,
+    ));
   }
   let duration = Duration::new(seconds, nanos);
   match sign {
-    0 => UNIX_EPOCH.checked_add(duration).ok_or_else(storage_corrupt),
-    1 => UNIX_EPOCH.checked_sub(duration).ok_or_else(storage_corrupt),
-    _ => Err(storage_corrupt()),
+    0 => UNIX_EPOCH
+      .checked_add(duration)
+      .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot)),
+    1 => UNIX_EPOCH
+      .checked_sub(duration)
+      .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot)),
+    _ => Err(super::storage_corrupt(
+      ProviderErrorContext::StorageSnapshot,
+    )),
   }
-}
-
-pub(super) fn storage_corrupt() -> Error {
-  Error::provider(
-    ProviderErrorKind::StorageCorrupt,
-    ProviderErrorContext::StorageSnapshot,
-  )
 }

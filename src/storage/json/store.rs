@@ -627,7 +627,9 @@ fn load_chain(directory: &Path, store_uuid: &[u8; 16]) -> Result<Head> {
         .insert(generation, (entry.path(), transaction))
         .is_some()
     {
-      return Err(corrupt_open());
+      return Err(super::super::storage_corrupt(
+        ProviderErrorContext::StorageOpen,
+      ));
     }
   }
   let mut entries = BTreeMap::new();
@@ -635,13 +637,18 @@ fn load_chain(directory: &Path, store_uuid: &[u8; 16]) -> Result<Head> {
   let mut total_bytes = 0_u64;
   let mut parent: Option<(u64, Digest)> = None;
   for (position, (generation, (path, transaction))) in generations.iter().enumerate() {
-    let expected = u64::try_from(position + 1).map_err(|_| corrupt_open())?;
+    let expected = u64::try_from(position + 1)
+      .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?;
     if *generation != expected {
-      return Err(corrupt_open());
+      return Err(super::super::storage_corrupt(
+        ProviderErrorContext::StorageOpen,
+      ));
     }
     let metadata = entry_metadata(path)?;
     if metadata.len() > MAX_TOTAL_BYTES {
-      return Err(corrupt_open());
+      return Err(super::super::storage_corrupt(
+        ProviderErrorContext::StorageOpen,
+      ));
     }
     let bytes =
       fs::read(path).map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))?;
@@ -652,7 +659,7 @@ fn load_chain(directory: &Path, store_uuid: &[u8; 16]) -> Result<Head> {
           ProviderErrorContext::StorageOpen,
         )
       } else {
-        corrupt_open()
+        super::super::storage_corrupt(ProviderErrorContext::StorageOpen)
       }
     })?;
     if document.store_uuid != hex_encode(store_uuid)
@@ -665,25 +672,30 @@ fn load_chain(directory: &Path, store_uuid: &[u8; 16]) -> Result<Head> {
           .map(|(_, digest)| hex_encode(digest.as_bytes()))
           .as_deref()
     {
-      return Err(corrupt_open());
+      return Err(super::super::storage_corrupt(
+        ProviderErrorContext::StorageOpen,
+      ));
     }
     for forgotten in &document.forgotten {
-      let target = TransactionId::parse(forgotten).map_err(|_| corrupt_open())?;
+      let target = TransactionId::parse(forgotten)
+        .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?;
       if receipts.remove(&target).is_none() {
-        return Err(corrupt_open());
+        return Err(super::super::storage_corrupt(
+          ProviderErrorContext::StorageOpen,
+        ));
       }
     }
-    let revision =
-      StoreRevision::new(Arc::from(generation.to_be_bytes())).map_err(|_| corrupt_open())?;
+    let revision = StoreRevision::new(Arc::from(generation.to_be_bytes()))
+      .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?;
     let receipt = CommitReceipt::new(
       transaction.clone(),
       Digest::from_bytes(
         <[u8; 32]>::try_from(
           hex_decode_bytes(&document.operation_digest, "json operation digest")
-            .map_err(|_| corrupt_open())?
+            .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?
             .as_slice(),
         )
-        .map_err(|_| corrupt_open())?,
+        .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?,
       ),
       revision,
     );
@@ -710,7 +722,9 @@ fn load_chain(directory: &Path, store_uuid: &[u8; 16]) -> Result<Head> {
       })
       .collect();
     if actual_receipts != expected_receipts {
-      return Err(corrupt_open());
+      return Err(super::super::storage_corrupt(
+        ProviderErrorContext::StorageOpen,
+      ));
     }
     // Every generation stores a complete logical snapshot, so the chain
     // state is exactly the newest generation's map, never a union.
@@ -718,22 +732,33 @@ fn load_chain(directory: &Path, store_uuid: &[u8; 16]) -> Result<Head> {
     for (namespace, key, value) in &document.entries {
       let namespace = match crate::QualifiedTag::parse(namespace) {
         Ok(tag) => StoreNamespace::new(tag),
-        Err(_) => return Err(corrupt_open()),
+        Err(_) => {
+          return Err(super::super::storage_corrupt(
+            ProviderErrorContext::StorageOpen,
+          ));
+        }
       };
       let key = StoreKey::new(Arc::from(
-        hex_decode_bytes(key, "json entry key").map_err(|_| corrupt_open())?,
+        hex_decode_bytes(key, "json entry key")
+          .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?,
       ));
       let value = StoreValue::new(Arc::from(
-        hex_decode_bytes(value, "json entry value").map_err(|_| corrupt_open())?,
+        hex_decode_bytes(value, "json entry value")
+          .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?,
       ));
       if generation_entries.insert((namespace, key), value).is_some() {
-        return Err(corrupt_open());
+        return Err(super::super::storage_corrupt(
+          ProviderErrorContext::StorageOpen,
+        ));
       }
     }
     entries = generation_entries;
     total_bytes = total_bytes
-      .checked_add(u64::try_from(bytes.len()).map_err(|_| corrupt_open())?)
-      .ok_or_else(corrupt_open)?;
+      .checked_add(
+        u64::try_from(bytes.len())
+          .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?,
+      )
+      .ok_or_else(|| super::super::storage_corrupt(crate::ProviderErrorContext::StorageOpen))?;
     parent = Some((*generation, GenerationDocument::digest(&bytes)));
   }
   let (generation, digest) = parent.unwrap_or((0, Digest::from_bytes([0; 32])));
@@ -794,13 +819,6 @@ fn cleanup_temp_files(directory: &Path) -> Result<()> {
 
 fn entry_metadata(path: &Path) -> Result<fs::Metadata> {
   fs::metadata(path).map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))
-}
-
-fn corrupt_open() -> Error {
-  Error::provider(
-    ProviderErrorKind::StorageCorrupt,
-    ProviderErrorContext::StorageOpen,
-  )
 }
 
 struct JsonSnapshot {

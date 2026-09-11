@@ -225,11 +225,11 @@ impl StoreSnapshot for RedbSnapshot {
         .map_err(|error| map_table_error(error, ProviderErrorContext::StorageSnapshot))?
         .get(&*composite)
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageSnapshot))?
-        .ok_or_else(|| digest_corrupt(ProviderErrorContext::StorageSnapshot))?;
+        .ok_or_else(|| super::super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
       let digest_bytes: [u8; VALUE_DIGEST_BYTES] = persisted
         .value()
         .try_into()
-        .map_err(|_| digest_corrupt(ProviderErrorContext::StorageSnapshot))?;
+        .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
       Ok(Some(StoreValue::from_parts(
         Arc::from(guard.value()),
         Digest::from_bytes(digest_bytes),
@@ -318,7 +318,9 @@ impl StoreScan for RedbScan {
         (Some(Ok((key, value))), Some(Ok((digest_key, digest)))) => {
           let bytes = key.value();
           if bytes != digest_key.value() {
-            return Err(digest_corrupt(ProviderErrorContext::StorageScan));
+            return Err(super::super::storage_corrupt(
+              ProviderErrorContext::StorageScan,
+            ));
           }
           if !bytes.starts_with(&self.prefix) {
             return Ok(None);
@@ -327,7 +329,7 @@ impl StoreScan for RedbScan {
           let digest_bytes: [u8; VALUE_DIGEST_BYTES] = digest
             .value()
             .try_into()
-            .map_err(|_| digest_corrupt(ProviderErrorContext::StorageScan))?;
+            .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageScan))?;
           let entry = StoreEntry::new(
             self.namespace.clone(),
             StoreKey::new(Arc::from(user_key)),
@@ -339,7 +341,9 @@ impl StoreScan for RedbScan {
           Err(map_storage_error(error, ProviderErrorContext::StorageScan))
         }
         (None, None) => Ok(None),
-        _ => Err(digest_corrupt(ProviderErrorContext::StorageScan)),
+        _ => Err(super::super::storage_corrupt(
+          ProviderErrorContext::StorageScan,
+        )),
       }
     })
   }
@@ -351,10 +355,6 @@ fn internal(context: ProviderErrorContext) -> Error {
 
 /// A persisted digest sidecar row is missing or malformed: the commit
 /// path maintains both sides atomically, so this is storage corruption.
-fn digest_corrupt(context: ProviderErrorContext) -> Error {
-  Error::provider(ProviderErrorKind::StorageCorrupt, context)
-}
-
 fn composite_key(namespace: &StoreNamespace, key: &StoreKey) -> Vec<u8> {
   let mut bytes = Vec::with_capacity(namespace.as_str().len() + 1 + key.as_bytes().len());
   bytes.extend_from_slice(namespace.as_str().as_bytes());
@@ -419,7 +419,7 @@ fn read_receipt(
       let (digest_bytes, revision_bytes) = bytes.split_at(32);
       let digest_digest: [u8; 32] = digest_bytes
         .try_into()
-        .map_err(|_| corrupt(ProviderErrorContext::StorageReconcile))?;
+        .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageReconcile))?;
       let generation = decode_revision(revision_bytes)?;
       Some(CommitReceipt::new(
         transaction.clone(),
@@ -429,10 +429,6 @@ fn read_receipt(
     }
     None => None,
   })
-}
-
-fn corrupt(context: ProviderErrorContext) -> Error {
-  Error::provider(ProviderErrorKind::StorageCorrupt, context)
 }
 
 fn snapshot_revision(transaction: &redb::ReadTransaction) -> Result<StoreRevision> {
@@ -585,11 +581,11 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
           let persisted = digests
             .get(&*composite)
             .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?
-            .ok_or_else(|| digest_corrupt(ProviderErrorContext::StorageCommit))?;
+            .ok_or_else(|| super::super::storage_corrupt(ProviderErrorContext::StorageCommit))?;
           let bytes: [u8; VALUE_DIGEST_BYTES] = persisted
             .value()
             .try_into()
-            .map_err(|_| digest_corrupt(ProviderErrorContext::StorageCommit))?;
+            .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageCommit))?;
           Ok(Some(Digest::from_bytes(bytes)))
         },
         |forgotten: &TransactionId| {
@@ -726,7 +722,7 @@ fn map_table_error(error: redb::TableError, context: ProviderErrorContext) -> Er
   match error {
     redb::TableError::TableDoesNotExist(_)
     | redb::TableError::TableTypeMismatch { .. }
-    | redb::TableError::TypeDefinitionChanged { .. } => corrupt(context),
+    | redb::TableError::TypeDefinitionChanged { .. } => super::super::storage_corrupt(context),
     redb::TableError::Storage(storage) => map_storage_error(storage, context),
     redb::TableError::TableIsMultimap(_)
     | redb::TableError::TableIsNotMultimap(_)

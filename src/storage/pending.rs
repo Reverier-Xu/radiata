@@ -26,7 +26,6 @@ use super::{
     HostWallClock, PreparedTransaction, ReceiptIdentity, ReceiptReferenceChange,
     ReceiptReferenceToken, WallClock, build_receipt_change_operations, group_receipt_changes,
     internal_namespace, operation_uses_reserved_namespace, prepare_internal_transaction,
-    storage_corrupt,
   },
 };
 pub(crate) use crate::storage::families::PENDING_NAMESPACE;
@@ -429,7 +428,7 @@ impl PendingTransactionV1 {
       self.base_revision.clone(),
       operations,
     )
-    .map_err(|_| storage_corrupt())?;
+    .map_err(|_| super::storage_corrupt(crate::ProviderErrorContext::StorageSnapshot))?;
     Ok(ReceiptIdentity::from_parts(
       prepared.id().clone(),
       prepared.operation_digest().clone(),
@@ -680,15 +679,21 @@ pub(crate) async fn discover_pending(
   let mut found = None;
   while let Some(entry) = scan.next().await? {
     if entry.namespace() != &namespace || entry.key().as_bytes() != key.as_bytes() {
-      return Err(storage_corrupt());
+      return Err(super::storage_corrupt(
+        crate::ProviderErrorContext::StorageSnapshot,
+      ));
     }
     if found.is_some() {
-      return Err(storage_corrupt());
+      return Err(super::storage_corrupt(
+        crate::ProviderErrorContext::StorageSnapshot,
+      ));
     }
-    let record =
-      PendingTransactionV1::decode(entry.value().as_bytes()).map_err(|_| storage_corrupt())?;
+    let record = PendingTransactionV1::decode(entry.value().as_bytes())
+      .map_err(|_| super::storage_corrupt(crate::ProviderErrorContext::StorageSnapshot))?;
     if record.purpose != purpose {
-      return Err(storage_corrupt());
+      return Err(super::storage_corrupt(
+        crate::ProviderErrorContext::StorageSnapshot,
+      ));
     }
     found = Some((entry.value().clone(), record));
   }
@@ -765,7 +770,9 @@ pub(crate) async fn pending_transaction_count(
   let mut count = 0_usize;
   while let Some(entry) = scan.next().await? {
     if entry.namespace() != &namespace {
-      return Err(storage_corrupt());
+      return Err(super::storage_corrupt(
+        crate::ProviderErrorContext::StorageSnapshot,
+      ));
     }
     count += 1;
   }
