@@ -122,7 +122,7 @@ impl MembershipPage {
 /// and applies received pages under strict validation.
 pub(crate) mod sync {
   use super::{MAX_PAGE_DESCRIPTORS, MembershipPage};
-  use crate::{Error, NodeId, Result, api::Entropy, storage::MetadataStore};
+  use crate::{NodeId, Result, api::Entropy, storage::MetadataStore};
 
   /// Emits one bounded page over the running node's metadata store. The
   /// cursor is the last emitted node's text, so pages continue without
@@ -139,21 +139,13 @@ pub(crate) mod sync {
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<MembershipPage> {
-    let mut limit = limit.clamp(1, MAX_PAGE_DESCRIPTORS);
-    loop {
-      let page = emit_at_capacity(store, cursor, limit).await?;
-      if wire_payload_fits(&page)? {
-        return Ok(page);
-      }
-      if limit == 1 {
-        // One descriptor is bounded far below the control bound, so the
-        // ladder terminates here with a deliverable page; reaching this
-        // arm means a bound regressed elsewhere — fail loudly instead of
-        // looping.
-        return Err(Error::resource_exhausted("membership page"));
-      }
-      limit /= 2;
-    }
+    crate::paging::emit_with_size_ladder(
+      limit.clamp(1, MAX_PAGE_DESCRIPTORS),
+      "membership page",
+      |limit| emit_at_capacity(store, cursor, limit),
+      wire_payload_fits,
+    )
+    .await
   }
 
   /// True when the page's full wire payload (page envelope plus sync

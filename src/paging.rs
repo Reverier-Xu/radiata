@@ -172,6 +172,31 @@ pub(crate) fn page_keys<T>(
 /// named constant so the facade's page clamps cannot drift apart.
 pub(crate) const MAX_VIEW_PAGE_ITEMS: usize = 64;
 
+/// Emits one wire-deliverable page through the size ladder (single
+/// source for the membership and resource lanes): emit at the candidate
+/// capacity, halve until the lane's `fits` predicate accepts the page
+/// (a fat record set can overflow the control-body bound), and fail
+/// closed when even a single-record page does not fit — a record is
+/// bounded far below the control bound, so reaching that arm means a
+/// bound regressed elsewhere.
+pub(crate) async fn emit_with_size_ladder<T, F, Fut>(
+  mut limit: usize, context: &'static str, mut emit: F, fits: impl Fn(&T) -> Result<bool>,
+) -> Result<T>
+where
+  F: FnMut(usize) -> Fut,
+  Fut: std::future::Future<Output = Result<T>>, {
+  loop {
+    let page = emit(limit).await?;
+    if fits(&page)? {
+      return Ok(page);
+    }
+    if limit == 1 {
+      return Err(Error::resource_exhausted(context));
+    }
+    limit /= 2;
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::{
