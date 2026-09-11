@@ -660,7 +660,7 @@ pub struct radiata::RecoveryView
 impl radiata::RecoveryView
 pub const fn radiata::RecoveryView::is_connected(&self) -> bool
 pub const fn radiata::RecoveryView::next_attempt_at(&self) -> core::option::Option<std::time::SystemTime>
-pub const fn radiata::RecoveryView::unreachable_components(&self) -> usize
+pub const fn radiata::RecoveryView::unreachable_members(&self) -> usize
 pub struct radiata::RemoveResource
 impl radiata::RemoveResource
 pub fn radiata::RemoveResource::new(radiata::ResourceName, radiata::ResourceVersion) -> Self

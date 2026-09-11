@@ -864,7 +864,7 @@ pub struct ReceiptRetentionReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryView {
   is_connected: bool,
-  unreachable_components: usize,
+  unreachable_members: usize,
   next_attempt_at: Option<std::time::SystemTime>,
 }
 
@@ -873,11 +873,9 @@ impl RecoveryView {
     self.is_connected
   }
 
-  /// How many members the controller still counts as unreachable.
-  /// (The accessor name predates the member-set framing; it counts
-  /// members, not network components.)
-  pub const fn unreachable_components(&self) -> usize {
-    self.unreachable_components
+  /// How many known members the controller still counts as unreachable.
+  pub const fn unreachable_members(&self) -> usize {
+    self.unreachable_members
   }
 
   pub const fn next_attempt_at(&self) -> Option<std::time::SystemTime> {
@@ -885,12 +883,11 @@ impl RecoveryView {
   }
 
   pub(crate) const fn new(
-    is_connected: bool, unreachable_components: usize,
-    next_attempt_at: Option<std::time::SystemTime>,
+    is_connected: bool, unreachable_members: usize, next_attempt_at: Option<std::time::SystemTime>,
   ) -> Self {
     Self {
       is_connected,
-      unreachable_components,
+      unreachable_members,
       next_attempt_at,
     }
   }

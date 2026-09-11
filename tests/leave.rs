@@ -473,7 +473,7 @@ async fn recovery_quiesces_after_a_member_departs() {
     loop {
       let view = a.query(radiata::GetRecovery::new()).await.unwrap();
       assert_eq!(
-        view.unreachable_components(),
+        view.unreachable_members(),
         0,
         "the departed member is pending as unreachable"
       );
@@ -575,7 +575,7 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
     let mut observed_unreachable = false;
     loop {
       let view = a.query(radiata::GetRecovery::new()).await.unwrap();
-      if view.unreachable_components() > 0 {
+      if view.unreachable_members() > 0 {
         observed_unreachable = true;
       } else if observed_unreachable {
         break;
