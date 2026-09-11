@@ -300,3 +300,51 @@ async fn select_resources_pages_the_empty_catalog() {
   let outcome = handle.command(Shutdown::new()).await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
+
+/// The lazy local-descriptor install is a member-set change: the first
+/// public operation that ensures the descriptor (here a paged member
+/// query on a node with no listener yet) must fire the paired
+/// `MemberChanged` event and revision bump, so a watcher that subscribes
+/// before acting never misses the local node joining its own member set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
+  let providers = Providers::new();
+  let node = providers.start().await;
+  let local = node.query(radiata::GetLocalNode::new()).await.unwrap();
+  let mut events = node
+    .events::<radiata::MemberChanged>(radiata::EventOptions::new())
+    .unwrap();
+
+  // No listener has ever published endpoints, so the anti-entropy loop
+  // skips the ensure; this query performs the install itself.
+  node
+    .query(radiata::PageMembers::new(
+      radiata::PageSpec::first(8).unwrap(),
+    ))
+    .await
+    .unwrap();
+  let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+    .await
+    .unwrap()
+    .unwrap();
+  match event {
+    radiata::EventReceive::Item(changed) => {
+      assert_eq!(changed.node_id(), local.node_id());
+    }
+    _other => panic!("expected a member-changed event"),
+  }
+
+  // A steady second query changes nothing and fires nothing.
+  node
+    .query(radiata::PageMembers::new(
+      radiata::PageSpec::first(8).unwrap(),
+    ))
+    .await
+    .unwrap();
+  assert!(
+    matches!(events.try_recv(), Ok(radiata::EventReceive::Empty)),
+    "an unchanged ensure must not announce"
+  );
+
+  node.command(Shutdown::new()).await.unwrap();
+}
