@@ -204,18 +204,28 @@ async fn resource_sync_tick_peer(
 ) -> Result<()> {
   let starting_round = state.page.is_none();
   // This peer's next page range fingerprint: the quiet state pays one
-  // scan and one hash and skips the emit entirely.
+  // scan and one hash and skips the emit entirely. Only a from-scratch
+  // round may record the fingerprint: a continuation round hashes a
+  // tail range of the catalog, and recording that range would make the
+  // next from-scratch range never match — a catalog larger than one
+  // page would then resend in full every tick and never go quiet.
   let page_fp = page_sync::page_fingerprint_ctx(
     store,
     state.page.as_deref(),
     super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
   )
   .await?;
-  let quiet = starting_round
-    && page_fp == state.page_fingerprint
-    && state.ticks_since_page_send < RESOURCE_PAGE_RESEND_TICKS
-    && state.rounds_since_full < RESOURCE_FULL_SYNC_ROUNDS;
-  if quiet {
+  let page_due = if starting_round {
+    let due = page_fp != state.page_fingerprint
+      || state.ticks_since_page_send >= RESOURCE_PAGE_RESEND_TICKS;
+    state.page_fingerprint = page_fp;
+    due
+  } else {
+    // A continuation round always continues: the remaining pages of
+    // the current pass are still owed to this peer.
+    true
+  };
+  if !page_due && state.rounds_since_full < RESOURCE_FULL_SYNC_ROUNDS {
     state.ticks_since_page_send = state.ticks_since_page_send.saturating_add(1);
     state.rounds_since_full = state.rounds_since_full.saturating_add(1);
     return Ok(());
@@ -226,7 +236,6 @@ async fn resource_sync_tick_peer(
     state.page = None;
     state.rounds_since_full = 0;
   }
-  state.page_fingerprint = page_fp;
   state.ticks_since_page_send = 0;
   state.rounds_since_full = state.rounds_since_full.saturating_add(1);
   let page = page_sync::emit_page_ctx(
@@ -433,5 +442,82 @@ mod tests {
       "a steady catalog must not dispatch anything"
     );
     let _ = quiet_before;
+  }
+
+  /// A catalog larger than one page must still reach the steady quiet
+  /// state: the recorded per-peer fingerprint is the from-scratch range,
+  /// so after the pass completes the next from-scratch round matches and
+  /// dispatches nothing (a tail-range fingerprint recorded on a
+  /// continuation round would make a multi-page catalog resend in full
+  /// every tick, never going quiet).
+  #[tokio::test]
+  async fn a_multi_page_catalog_goes_quiet_once_the_pass_completes() {
+    let store = open_store().await;
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
+    let peer = node(2);
+    trust(&store, &node(1), [9; 32]).await;
+    let (runtime, mut cursors, sessions, mut rx) = harness();
+    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap();
+
+    // Seed more than one page of records (the default page carries 16).
+    let total = super::super::page::DEFAULT_RESOURCE_PAGE_LIMIT + 1;
+    let mut seeded = Vec::new();
+    for index in 0..total {
+      let name = format!("demo.org/resources/r-{index:02}");
+      crate::resource::page::sync::apply_page_ctx(
+        &store,
+        entropy.as_ref(),
+        &ResourcePage::new(
+          vec![record(&name, 1_000 + u64::try_from(index).unwrap())],
+          None,
+        )
+        .unwrap(),
+      )
+      .await
+      .unwrap();
+      seeded.push(name);
+    }
+    seed_peer_session(&sessions, &entropy);
+
+    // Drive the pass to completion: one dispatch per tick until the
+    // cursor drains (ceil(total / limit) dispatches), then silence.
+    let mut requests = Vec::new();
+    for _ in 0..(total + 2) {
+      {
+        let state = cursors.peers.entry(peer.clone()).or_default();
+        resource_sync_tick_peer(store.as_ref(), &entropy, &runtime, &peer, state, &protocol)
+          .await
+          .unwrap();
+      }
+      if let Ok(request) = rx.try_recv() {
+        requests.push(request);
+      }
+    }
+    let expected_passes = total.div_ceil(super::super::page::DEFAULT_RESOURCE_PAGE_LIMIT);
+    assert_eq!(
+      requests.len(),
+      expected_passes,
+      "the pass must deliver each page exactly once, then go quiet"
+    );
+    // The final dispatches carried the whole seeded catalog.
+    let mut delivered = Vec::new();
+    for mut request in requests {
+      let mut bytes = Vec::new();
+      while let Some(chunk) = request.body.as_mut().next().await {
+        bytes.extend_from_slice(&chunk.unwrap());
+      }
+      let payload = ResourceSyncPayload::decode(&bytes).unwrap();
+      delivered.extend(
+        payload
+          .page()
+          .unwrap()
+          .records()
+          .iter()
+          .map(|record| record.name().as_str().to_owned()),
+      );
+    }
+    delivered.sort();
+    seeded.sort();
+    assert_eq!(delivered, seeded, "every record must reach the peer");
   }
 }
