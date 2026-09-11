@@ -162,6 +162,15 @@ impl Supervisor {
       .map(|(peer, _)| peer.clone())
       .collect();
     for peer in &direct {
+      // An intentionally disconnected peer never re-enters the
+      // known-online set through a passive session: exclusion is lifted
+      // only by a deliberate caller connect. Counting one as known would
+      // make it permanently pending (never dialable, never quiescent)
+      // once that session drops — the same trap a departed identity's
+      // pruning below avoids.
+      if self.recovery_excluded.contains(peer) {
+        continue;
+      }
       self.recovery_history.insert(peer.clone());
     }
     // Departed identities (left or cleaned) are no longer cluster
