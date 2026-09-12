@@ -95,6 +95,20 @@ fn boundary_values_construct_parse_and_round_trip() {
   assert!(!version.is_removal());
   assert_eq!(version.digest().as_bytes(), &[7; 32]);
 
+  // The typed caller-error construction: extension callbacks build it
+  // directly instead of misusing the provider constructor, and its
+  // Display/Error behavior is pinned semantically (the derive-generated
+  // trait impls no longer appear in the public-api rendering).
+  let caller_error = radiata::Error::caller("extension callback failed");
+  assert_eq!(caller_error.kind(), radiata::ErrorKind::CallerError);
+  assert_eq!(caller_error.context(), "extension callback failed");
+  assert_eq!(
+    caller_error.to_string(),
+    "extension callback failed: CallerError"
+  );
+  fn assert_std_error<T: std::error::Error>(_: &T) {}
+  assert_std_error(&caller_error);
+
   let key = LabelKey::parse("example.org/labels/lane").unwrap();
   let value = LabelValue::parse("one").unwrap();
   let labels = LabelSet::new().insert(key.clone(), value.clone()).unwrap();

@@ -45,6 +45,7 @@ pub radiata::DurabilityLevel::OsCrashDurable
 pub radiata::DurabilityLevel::ProcessCrashAtomic
 #[non_exhaustive] pub enum radiata::ErrorKind
 pub radiata::ErrorKind::AuthenticationFailed
+pub radiata::ErrorKind::CallerError
 pub radiata::ErrorKind::Cancelled
 pub radiata::ErrorKind::CommitUnknown
 pub radiata::ErrorKind::Conflict
@@ -237,14 +238,10 @@ pub type radiata::Endpoint::Err = radiata::Error
 pub fn radiata::Endpoint::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::Error
 impl radiata::Error
+pub fn radiata::Error::caller(&'static str) -> Self
 pub fn radiata::Error::context(&self) -> &'static str
 pub fn radiata::Error::kind(&self) -> radiata::ErrorKind
 pub fn radiata::Error::provider(radiata::ProviderErrorKind, radiata::ProviderErrorContext) -> Self
-impl core::error::Error for radiata::Error
-impl core::fmt::Debug for radiata::Error
-pub fn radiata::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::fmt::Display for radiata::Error
-pub fn radiata::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::EventOptions
 impl radiata::EventOptions
 pub fn radiata::EventOptions::capacity(self, usize) -> radiata::Result<Self>

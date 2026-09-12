@@ -108,6 +108,7 @@ const fn kind_code(kind: ErrorKind) -> Option<u8> {
     ErrorKind::CommitUnknown => 19,
     ErrorKind::Cancelled => 20,
     ErrorKind::ShuttingDown => 21,
+    ErrorKind::CallerError => 23,
     ErrorKind::Internal => 22,
   };
   Some(code)
@@ -139,6 +140,7 @@ const fn kind_from_code(code: u8) -> Result<ErrorKind> {
     19 => ErrorKind::CommitUnknown,
     20 => ErrorKind::Cancelled,
     21 => ErrorKind::ShuttingDown,
+    23 => ErrorKind::CallerError,
     22 => ErrorKind::Internal,
     _ => return Err(Error::invalid_input("route trace failure code")),
   };
@@ -561,13 +563,14 @@ mod tests {
       ErrorKind::CommitUnknown,
       ErrorKind::Cancelled,
       ErrorKind::ShuttingDown,
+      ErrorKind::CallerError,
       ErrorKind::Internal,
     ];
     for kind in kinds {
       let code = super::kind_code(kind).unwrap();
       assert_eq!(super::kind_from_code(code).unwrap(), kind);
     }
-    for code in [0_u8, 23, u8::MAX] {
+    for code in [0_u8, 24, u8::MAX] {
       assert!(super::kind_from_code(code).is_err());
     }
   }

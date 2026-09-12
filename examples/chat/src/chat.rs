@@ -110,10 +110,7 @@ impl radiata::PacketConsumer for ChatConsumer {
 /// instead of silently losing a message.
 fn store_error(error: String) -> radiata::Error {
   tracing::error!(%error, "chat store write failed");
-  radiata::Error::provider(
-    radiata::ProviderErrorKind::Io,
-    radiata::ProviderErrorContext::StorageCommit,
-  )
+  radiata::Error::caller("chat store write failed")
 }
 
 /// The chat room's next-hop policy: when a destination has no direct
@@ -131,12 +128,8 @@ impl radiata::RouteNextHop for DefaultNextHop {
     Box::pin(async move {
       view.peers().iter().min().cloned().ok_or_else(|| {
         // No live peer to relay through: the send fails closed and the
-        // business layer queues. (The public Error surface currently
-        // offers only the provider constructor; see the README.)
-        radiata::Error::provider(
-          radiata::ProviderErrorKind::Io,
-          radiata::ProviderErrorContext::TransportConnect,
-        )
+        // business layer queues.
+        radiata::Error::caller("no live peer to relay through")
       })
     })
   }

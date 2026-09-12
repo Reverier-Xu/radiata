@@ -50,6 +50,7 @@ sha2 = "0.11"
 # Already in the dependency graph through tokio; used to clear
 # IPV6_V6ONLY explicitly on the named-host wildcard listener.
 socket2 = "0.6"
+thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.53", features = [
   "rt",
   "sync",
