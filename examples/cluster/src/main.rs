@@ -2,8 +2,8 @@
 //! library. Each instance exposes an HTTP resource getter/setter, joins
 //! a sparse cluster through a bootstrap peer, and reports observation
 //! counters — without touching any radiata internals. Joining is
-//! operator-driven (POST /join): credential rotation invalidates
-//! previously issued tokens, so concurrent self-joins would race.
+//! operator-driven (POST /join): issuing a credential never rotates
+//! the generation, so concurrent self-joins share it.
 
 mod http;
 mod http_client;

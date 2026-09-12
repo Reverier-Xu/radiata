@@ -11,12 +11,12 @@ use axum::{
 };
 use radiata::{
   CleanupNode, ConnectMember, Digest, GetObservability, GetResource, IssueCleanupCheckpoint,
-  LabelKey, LabelValue, LeaveCluster, MemberPage, MergeCluster, MergeCredential, NodeHandle,
-  NodeId, PageCursor, PageMembers, PageResources, PageSessions, PageSpec, PageTrust, ProtocolTag,
-  PutResource, QualifiedTag, RemoveResource, ReplaceIdentityAndDeleteOldCoreMetadata,
-  ResourceLabels, ResourceName, ResourceUri, ResourceVersion, ResourceWrite, RevokeNode,
-  RotateMergeCredential, RoutingPolicy, SelectResources, Selector, StreamMetadata, StreamPolicy,
-  StreamTarget,
+  IssueMergeCredential, LabelKey, LabelValue, LeaveCluster, MemberPage, MergeCluster,
+  MergeCredential, NodeHandle, NodeId, PageCursor, PageMembers, PageResources, PageSessions,
+  PageSpec, PageTrust, ProtocolTag, PutResource, QualifiedTag, RemoveResource,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
+  ResourceVersion, ResourceWrite, RevokeNode, RoutingPolicy,
+  SelectResources, Selector, StreamMetadata, StreamPolicy, StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -136,7 +136,7 @@ async fn status(state: State<SharedState>) -> Json<Value> {
 async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let issued = state
     .node
-    .command(RotateMergeCredential::new())
+    .command(IssueMergeCredential::new())
     .await
     .map_err(internal_error)?;
   Ok(Json(json!({

@@ -38,6 +38,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 N = 5
 BASE_PORT = 19080
@@ -123,7 +124,10 @@ def wait_outbox_state(node: int, msg_id: str, expected: str, deadline_s: float =
 
 def phase_join_and_mesh() -> None:
     print("=== C0 join & mesh ===")
-    for node in range(2, N + 1):
+    # All four leaves join concurrently: issuing a credential is
+    # non-rotating and one live generation admits every subject, so the
+    # joins race through the same bootstrap without serializing.
+    def join(node: int) -> None:
         deadline = time.monotonic() + 60
         while True:
             status, payload = http_status("POST", node, "/join-chat",
@@ -131,13 +135,15 @@ def phase_join_and_mesh() -> None:
                                            "bootstrap_wss": "wss://c1:9443"},
                                           timeout=30)
             if status == 200 and payload and payload.get("joined"):
-                break
+                return
             if status is not None and status != 502:
                 raise SystemExit(f"c{node} join failed permanently: {status} {payload}")
             if time.monotonic() > deadline:
                 raise SystemExit(f"c{node} never joined")
             time.sleep(1)
-        print(f"[join] c{node} merged")
+    with ThreadPoolExecutor(max_workers=N - 1) as pool:
+        list(pool.map(join, range(2, N + 1)))
+    print(f"[join] c2..c{N} merged concurrently")
     # The join star is the whole topology: the hub holds N-1 sessions,
     # every leaf exactly one - routing and recovery are the library's
     # job, the business never meshes.

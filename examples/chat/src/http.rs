@@ -745,13 +745,13 @@ async fn send_group_message(
   Ok(Json(json!({"group": name, "recipients": results})))
 }
 
-/// Issues (and rotates) one merge credential. The joining node fetches
-/// this live: rotation invalidates previously issued tokens, so a token
-/// must be used immediately.
+/// Issues one merge credential. Issuing is non-rotating: the same live
+/// generation admits any number of concurrent joins until it is rotated
+/// (explicit revocation) or expires.
 async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let issued = state
     .node
-    .command(radiata::RotateMergeCredential::new())
+    .command(radiata::IssueMergeCredential::new())
     .await
     .map_err(internal)?;
   Ok(Json(json!({
@@ -769,8 +769,9 @@ pub struct JoinRequest {
 }
 
 /// Merges this node into the chat cluster through the bootstrap peer:
-/// the token is fetched live (credential rotation invalidates issued
-/// tokens), then the merge command runs with bounded retries.
+/// the token is fetched live (issuing is non-rotating, so concurrent
+/// joins share the generation), then the merge command runs with
+/// bounded retries.
 async fn join_chat(
   state: State<SharedState>, Json(request): Json<JoinRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {

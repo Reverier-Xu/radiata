@@ -28,6 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 N = 9
 BASE_PORT = 18080  # instance i serves http://127.0.0.1:{BASE_PORT + i}
@@ -88,12 +89,12 @@ def node_id(node: int) -> str:
 
 
 def join_phase() -> None:
-    """Joins n2..n9 SEQUENTIALLY: rotating the bootstrap credential
-    invalidates previously issued tokens, so concurrent joins race.
-    The public API offers no read-only issuer, which is why joins are
-    serialized here (see docs/example-findings.md)."""
-    print("[join] merging n2..n9 through n1, one at a time")
-    for node in range(2, N + 1):
+    """Joins n2..n9 CONCURRENTLY: issuing a credential is non-rotating
+    and one live generation admits every subject, so the joins race
+    through the same bootstrap without serializing."""
+    print("[join] merging n2..n9 through n1, concurrently")
+
+    def join(node: int) -> None:
         deadline = time.monotonic() + 120
         while True:
             result = try_http("POST", node, "/join", {
@@ -102,10 +103,13 @@ def join_phase() -> None:
             }, timeout=45)
             if result is not None and result.get("merged"):
                 print(f"[join] n{node} merged")
-                break
+                return
             if time.monotonic() > deadline:
                 raise SystemExit(f"n{node} never merged")
             time.sleep(1)
+
+    with ThreadPoolExecutor(max_workers=N - 1) as pool:
+        list(pool.map(join, range(2, N + 1)))
 
 
 def wait_members(expected: int, deadline_s: float = 120) -> None:

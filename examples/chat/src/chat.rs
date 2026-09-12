@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use radiata::NodeId;
 use serde::{Deserialize, Serialize};
 
 use crate::store::ChatStore;
