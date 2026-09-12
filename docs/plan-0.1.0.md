@@ -175,7 +175,9 @@
 
 ### P1-5 恢复退避参数复审 + RecoveryView 语义文档
 
-- **状态**：待办
+- **状态**：文档部分已完成（b98bdc3；`is_connected`/`unreachable_members`/`next_attempt_at`
+  与 `RecoveryConfig` 的 rustdoc 已按 any-one-route 语义补齐）；默认值校准随批次 C
+  的 P0-2 soak 数据一并收口
 - **问题**（核实修正）：D1/D5 落地后，`RecoveryConfig` 默认值（neighbors 4 / fan-out 64 /
   initial 1s / max 5min，`config.rs:320-323`）的合理性未复审。公开视图字段为
   `unreachable_members`（`view.rs:867`，映射内部 `pending_count` 诊断计数，**不等于**失联）
