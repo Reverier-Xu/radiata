@@ -128,7 +128,9 @@
 
 ### P1-2 内置默认 next-hop 策略
 
-- **状态**：待办
+- **状态**：已完成（8d26f7f；`DefaultNextHop` + `TAG` 常量 + 确定性单元测试；
+  chat 换用内置。范围修正：tests/routed_packets、tests/public_api、slo-node 的
+  手写策略是拓扑表驱动/外部可实现性证据，语义不同，不换用）
 - **问题**：任何要用多跳中继的业务都要手写约 25 行 `DefaultNextHop`（取一个存活 peer）。核实：
   `src/` 下零个 `RouteNextHop` 实现；examples/chat（chat.rs:119-143）、
   `slo/src/bin/slo-node.rs:165`、`tests/routed_packets.rs:43`、`tests/public_api.rs:544`
@@ -155,7 +157,11 @@
 
 ### P1-4 join 凭据：非轮换签发 + 多次准入
 
-- **状态**：待办（D8 定案）
+- **状态**：已完成（27a13d3 + bb05b7d；`IssueMergeCredential` 非轮换签发、世代多次准入、
+  凭据使用记录按 subject 粒度、re-admission 幂等返回既有 grant、预留机制移除；
+  两 example join 去串行化，chat/cluster e2e 均并发 join 断言通过）
+- **顺带修复**：重入网暴露的会话拆除竞态（`retire_all_sessions` 宕底）与
+  撤销同步不关闭远端会话的缺口，见 2f247bd
 - **来源**：archive/example-findings.md #2（未了项）
 - **问题**（核实补充）：并发 join 有**两层**卡点——`RotateMergeCredential` 签发即轮换作废
   旧 token；且接收端世代单次准入（`reserve` 至多一个在途、提交成功即 `consume` 作废，
