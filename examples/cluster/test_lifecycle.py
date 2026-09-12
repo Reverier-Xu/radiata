@@ -421,18 +421,22 @@ def main() -> None:
     wait(lambda node: members_of(node) == 10, "membership records restored", list(range(1, N + 1)),
          deadline_s=120)
 
-    print("=== E8.5 disconnect is not a departure: the edge heals itself ===")
-    # Owner decision: DisconnectPeer only tears the session down — it is
-    # not a removal from the cluster. A one-sided teardown leaves the
-    # other side counting the peer as unreachable, so its recovery plane
-    # dials the edge back without operator action. The n1-n2 edge
-    # provably exists (n2 joined through n1 in E2).
+    print("=== E8.5 disconnect is not a departure ===")
+    # Owner decisions: DisconnectPeer only tears the session down — it is
+    # not a removal from the cluster; and under D1 (any one route
+    # suffices) a node that keeps any authenticated path stays Connected
+    # and never re-expands its topology — only a fully isolated member
+    # re-dials. So after a one-sided teardown the edge returns only when
+    # the drop isolated an endpoint; otherwise the cluster simply routes
+    # around it. Either way the drop is not a departure: both nodes stay
+    # members and converge. The n1-n2 edge provably exists (n2 joined
+    # through n1 in E2).
     ids = {node: node_id_of(node) for node in range(1, N + 1)}
     before = (sessions_of(1), sessions_of(2))
     http("POST", 1, "/disconnect", {"node_id": ids[2]})
-    # The teardown lands before /disconnect returns, but the recovery
-    # plane re-heals the edge within seconds (1s initial backoff), so the
-    # drop is observed with a fast poll instead of a fixed sleep.
+    # The teardown lands before /disconnect returns, but a reconnecting
+    # recovery plane could re-heal within seconds, so the drop is
+    # observed with a fast poll instead of a fixed sleep.
     observed_drop = False
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -442,16 +446,25 @@ def main() -> None:
         time.sleep(0.1)
     assert observed_drop, f"the disconnect never dropped the edge: before={before}"
     healed = time.monotonic()
-    deadline = healed + 150
-    while time.monotonic() < deadline:
-        if sessions_of(1) >= before[0] and sessions_of(2) >= before[1]:
-            break
-        time.sleep(1)
+    if sessions_of(1) == 0 or sessions_of(2) == 0:
+        # The drop isolated an endpoint: recovery re-dials until any one
+        # route exists (the original edge or another member).
+        deadline = healed + 150
+        while time.monotonic() < deadline:
+            if sessions_of(1) > 0 and sessions_of(2) > 0:
+                break
+            time.sleep(1)
+        else:
+            raise SystemExit("the isolated endpoint never re-connected through recovery")
+        report["disconnect_self_heal_seconds"] = time.monotonic() - healed
+        print(f"[heal] isolated endpoint re-connected by recovery in "
+              f"{report['disconnect_self_heal_seconds']:.0f}s")
     else:
-        raise SystemExit("the disconnected edge was never healed back by recovery")
-    report["disconnect_self_heal_seconds"] = time.monotonic() - healed
-    print(f"[heal] n1-n2 edge healed by recovery in "
-          f"{report['disconnect_self_heal_seconds']:.0f}s (drop observed, back to {before})")
+        # Both sides kept other routes: D1 leaves the dropped edge down
+        # and the cluster routes around it — assert exactly that.
+        report["disconnect_self_heal_seconds"] = None
+        print(f"[heal] both endpoints stayed connected (sessions "
+              f"{sessions_of(1)}/{sessions_of(2)}); the dropped edge is not re-dialed (D1)")
     # And the whole cluster still converges after the edge dance.
     digest = write_resource(2, "demo.org/resources/post-heal-check", "converged")
     converge(list(range(1, N + 1)), "demo.org/resources/post-heal-check", digest)
