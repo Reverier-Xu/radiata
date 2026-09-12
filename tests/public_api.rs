@@ -86,6 +86,15 @@ fn boundary_values_construct_parse_and_round_trip() {
   let uri = ResourceUri::parse("file:///pub-api").unwrap();
   assert_eq!(uri.as_str(), "file:///pub-api");
 
+  // The observed-version tuple round-trips through the public
+  // constructor, so a caller can forward an observation across a
+  // process boundary and issue a conditional removal with it.
+  let version = ResourceVersion::from_parts(std::time::UNIX_EPOCH, node.clone(), false, digest);
+  assert_eq!(version.timestamp(), std::time::UNIX_EPOCH);
+  assert_eq!(version.writer(), &node);
+  assert!(!version.is_removal());
+  assert_eq!(version.digest().as_bytes(), &[7; 32]);
+
   let key = LabelKey::parse("example.org/labels/lane").unwrap();
   let value = LabelValue::parse("one").unwrap();
   let labels = LabelSet::new().insert(key.clone(), value.clone()).unwrap();

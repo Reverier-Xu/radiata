@@ -715,6 +715,7 @@ pub fn radiata::ResourceUri::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ResourceVersion
 impl radiata::ResourceVersion
 pub fn radiata::ResourceVersion::digest(&self) -> &radiata::Digest
+pub fn radiata::ResourceVersion::from_parts(std::time::SystemTime, radiata::NodeId, bool, radiata::Digest) -> Self
 pub fn radiata::ResourceVersion::is_removal(&self) -> bool
 pub fn radiata::ResourceVersion::timestamp(&self) -> std::time::SystemTime
 pub fn radiata::ResourceVersion::writer(&self) -> &radiata::NodeId

@@ -227,6 +227,23 @@ pub struct ResourceVersion {
 }
 
 impl ResourceVersion {
+  /// Rebuilds an exact version tuple an observer previously read out of
+  /// a public view. Conditional removal compares the whole tuple, so a
+  /// caller that stores or forwards observations across a process
+  /// boundary (an HTTP service, a job queue) must be able to put the
+  /// tuple back together; every field is already public through the
+  /// accessors, so the constructor adds no new disclosure.
+  pub fn from_parts(
+    timestamp: std::time::SystemTime, writer: NodeId, removal: bool, digest: Digest,
+  ) -> Self {
+    Self {
+      timestamp,
+      writer,
+      removal,
+      digest,
+    }
+  }
+
   /// The signed host wall-clock instant of the winning write.
   pub fn timestamp(&self) -> std::time::SystemTime {
     self.timestamp
