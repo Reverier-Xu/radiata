@@ -411,10 +411,20 @@ async fn accept_payload(
       let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
       // The applied receipt: one durable-install confirmation back to
       // the leaver, best-effort and retried by the announcement budget.
-      // Pre-receipt peers simply never send it. The ack receiver is
-      // dropped: the receipt is a hint, never a trust decision.
+      // Pre-receipt peers simply never send it. The admission ack is
+      // still observed (delivery truth, D2): the wait runs detached so
+      // the pump never serializes behind it, and a failed admission is
+      // diagnostics only — the receipt is a hint, never a trust
+      // decision, and is never retried here.
       match crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt) {
-        Ok(_ack) => {}
+        Ok(ack) => {
+          let peer = source.clone();
+          tokio::spawn(async move {
+            if !crate::sync_common::delivered_within_bound(ack).await {
+              tracing::debug!(peer = %peer.as_str(), "leave applied receipt not admitted");
+            }
+          });
+        }
         Err(error) => {
           tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
         }

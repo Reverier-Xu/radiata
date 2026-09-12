@@ -46,7 +46,8 @@
 
 ### P0-1 公共错误构造入口
 
-- **状态**：待办
+- **状态**：已完成（0ba771a；thiserror 采纳 + `ErrorKind::CallerError` + `Error::caller`，
+  chat 两处冒用已替换，语义钉在 public_api 测试）
 - **问题**：公共回调（`PacketConsumer`、`RouteNextHop`）需要返回 `radiata::Result`，
   但公开面只有 `Error::provider(ProviderErrorKind, ProviderErrorContext)`——语义错位。
   chat example 被迫用 `provider(Io, TransportConnect)` 冒充"无中继可用"，
@@ -81,7 +82,9 @@
 
 ### P0-3 examples 纳入 CI 门禁
 
-- **状态**：待办
+- **状态**：已完成（1365b69 + 同批 lock 刷新；examples lane 含 clippy -D warnings、
+  nightly fmt --check、py_compile；act 演练与本地逐命令验证通过；
+  cluster 既有 warning 与 fmt 漂移已清零）
 - **问题**：workspace 门禁不覆盖 `examples/*`（cluster 的 `http_client.rs` 曾有 clippy
   warning 漏网；chat 修复时才暴露同款问题）。examples 是交付证据链的一部分，必须受门禁约束。
 - **方案草案**：`.github/workflows/quality_check.yml` 增加 examples 编译 lane：
@@ -136,7 +139,9 @@
 
 ### P1-3 LeaveApplied 回执统一 ack 处理
 
-- **状态**：待办
+- **状态**：已完成（实现：发送侧回执的 admission ack 改为可观测——detach 任务有界等待、
+  失败仅 tracing::debug 诊断，不重投不阻塞泵；`delivered_within_bound` 单元测试钉住
+  成败两态）
 - **问题**（核实修正）：membership lane 的 leave 回执发送侧是最后一个 fire-and-forget
   调用点（ack receiver 直接丢弃，sync.rs:416-421），与 D2 的投递真相语义不一致。
   注意：leaver 侧 `announce_leave` 已有 `LEAVE_ACK_WAIT` 回执等待（sync.rs:271-344，

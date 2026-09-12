@@ -116,8 +116,27 @@ pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_
 
 #[cfg(test)]
 mod tests {
-  use super::{PageRound, PeerPageCursor, chunk_payload};
+  use super::{PageRound, PeerPageCursor, chunk_payload, delivered_within_bound};
   use crate::packet::MAX_CHUNK_BYTES;
+
+  /// The bounded delivery verdict: a resolved admission is true, and a
+  /// dropped admission channel (dead session) resolves false without
+  /// waiting out the bound.
+  #[tokio::test]
+  async fn delivered_within_bound_observes_the_admission_outcome() {
+    let (notify, ack) = tokio::sync::oneshot::channel();
+    let node = crate::NodeId::generate(&crate::api::SystemEntropy).expect("node id");
+    let sent = notify.send(Ok(crate::packet::RoutedAck {
+      by: node,
+      admitted_at: std::time::SystemTime::now(),
+    }));
+    assert!(sent.is_ok(), "ack channel open");
+    assert!(delivered_within_bound(ack).await);
+
+    let (notify, ack) = tokio::sync::oneshot::channel::<crate::packet::RoutedAckOutcome>();
+    drop(notify);
+    assert!(!delivered_within_bound(ack).await);
+  }
 
   /// A delivery failure must heal within one tick: the discarded peer
   /// state makes the next round re-deliver from scratch unconditionally,
