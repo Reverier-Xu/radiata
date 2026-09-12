@@ -2,6 +2,12 @@
 
 > 本文档由 2026-09-09 全量代码审计生成，对应 main @ `faf7833`。
 > 权威 API 参考仍是 rustdoc（`cargo doc`）；本文描述实现层架构与职责边界。
+>
+> **⚠️ 时点性声明（2026-09-12）**：本文未反映此后落地的变更——恢复语义
+> （any one route 契约，`runtime/recovery.rs`）、sync 投递真相（admission ack +
+> 续传丢弃，`sync_common.rs`）、`ResourceVersion::from_parts` 等。
+> 0.1.0 代码定稿后按 [plan-0.1.0.md](plan-0.1.0.md) P2-8 全量重审刷新；
+> 当前任务清单见 [plan-0.1.0.md](plan-0.1.0.md)。
 
 ## 1. 项目定位
 
