@@ -199,6 +199,38 @@
 - **验收**：注释/文档与行为一致；若移除持久化，附带迁移说明与回归。
 - **涉及面**：`identity/trust.rs`、`membership/sync.rs`。**规模：S**
 
+### P1-8 反轮子清账（2026-09-12 五分区全量审计）
+
+- **状态**：待办
+- **来源**：五分区并行代码审计（protocol / identity / transport-session /
+  storage-runtime / facade-crosscut），全部 P2 已逐条抽查行号属实。审计同时确认
+  hex/canonical CBOR/WriterLock/base62/宏族/EventHub/三处语义各异退避等为**合理自造**，
+  本项不含它们的变更。
+- **问题与修法**（全部 crate 内收敛，零新依赖，行为不变）：
+  1. `CommitOutcome`→typed-error 四臂映射在 ~10 处内联重复（identity 7 处、
+     membership.rs:345、routing/trace.rs ×2、migration.rs 变体），且已漂移：
+     trace.rs 对 Unknown 用 `StorageReconcile`、其余用 `StorageCommit`。
+     修：provider.rs 增 `commit_verdict(outcome, conflict_ctx, unknown_ctx) -> Result<()>`，
+     各处改调；resource/store.rs 的自有 outcome enum 变体不并入。
+  2. `session/driver.rs:424-453 ↔ 515-543` 发起方握手 24 行逐字重复。
+     修：提取 `async fn initiate(&self, connection, config) -> Result<Handshake>`。
+  3. `session/stream.rs:681-698 ↔ 830-847` pending-ack 清算两处重复。
+     修：提取 `fn fail_pending(&PendingAcks) -> Vec<(TraceId, BoundedSender)>`。
+  4. `protocol/offer.rs` `FeatureOffer::new` 与 `from_wire` 容量/类别/required
+     三项校验逐行镜像（offer.rs:87-118 ↔ 203-246）。修：提取共享 `finalize`。
+  5. `identity/signature.rs:34` `verify_strict_message` 零调用者 + 死 `_domain`
+     参数。修：删除，`verify_strict` 内联其两行。
+  6. `routing.rs:214` category 用裸字面量匹配，`CATEGORY_LABELS`/`CATEGORY_RESOURCES`
+     常量已在 tag.rs:22-23。修：换常量。
+  7. P3 随手项（可选）：`trust.rs:168,176` 绕过 `error::fixed_bytes`；
+     `merge_rate.rs:52` 手写 IPv4-mapped 检测改 `to_ipv4_mapped()`；
+     `routing/trace.rs:76-119` ErrorKind 编码表单源化去 Option。
+- **验收**：全门禁绿（纯重构，无行为变更）；审计引用的重复点逐条消失
+  （以 grep 复核）。
+- **涉及面**：`provider.rs`、`session/driver.rs`、`session/stream.rs`、
+  `protocol/offer.rs`、`identity/signature.rs`、`routing.rs`、`identity/trust.rs`、
+  `identity/merge_rate.rs`、`routing/trace.rs`。**规模：M**
+
 ---
 
 ## 3. P2（0.1.0 前完成；规模较大或需设计先行）
@@ -324,7 +356,8 @@
 | C | P0-2（soak 基准）、P2-2（有界剪枝实施，D10）、P2-6（默认 feature 反转实施） | A、B | 基准数据入档 + 剪枝收敛 + 矩阵全绿 |
 | D | P2-1（绑定传播分页化，D9 不留 v2）、P2-3（per-key 水位） | C | 规模测试 + e2e 回归 |
 | E | P2-5（KeyProvider crate）、P2-7（rustdoc 定位 + 审计清账） | 无硬依赖 | 新 crate 门禁 + 清账记录 |
-| F | P1-6（rustdoc 指南，含 D10 契约表述）、P2-8（架构文档刷新） | A–E 全部定稿 | `cargo doc` 评审 + 发布说明 |
+| G | P1-8（反轮子清账：commit verdict 单源、握手/清算/校验镜像收敛、死抽象删除、常量替换） | A | 全门禁（纯重构，无 e2e 依赖） |
+| F | P1-6（rustdoc 指南，含 D10 契约表述）、P2-8（架构文档刷新） | A–E、G 全部定稿 | `cargo doc` 评审 + 发布说明 |
 
 - P2-2/P2-4 已以决策关闭（D10/D11）；P2-6 决策已定、实施在批次 C；P2-7 决策已定、rustdoc 在批次 E。
 - 每批次合入前：`git status` 干净、无临时产物、逐 commit gitmoji 规范。
