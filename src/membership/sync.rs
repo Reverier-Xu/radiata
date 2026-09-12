@@ -137,7 +137,6 @@ impl SyncPayload {
 /// sessions. Entries are trusted through the session that delivered them;
 /// decoding enforces canonical wire rules and bounded capacities before
 /// install.
-#[derive(Debug)]
 pub(crate) struct MembershipSyncConsumer {
   // Held weakly so the registry shared with a live node handle never pins
   // the node's metadata store after shutdown; a packet arriving after the
@@ -147,13 +146,22 @@ pub(crate) struct MembershipSyncConsumer {
   events: Arc<crate::node::EventHub>,
   revision: crate::node::MemberRevisionSignal,
   leave_applied: LeaveAppliedSignal,
+  // The live session table: persisting a revocation tombstone retires the
+  // revoked identity's session on this node immediately.
+  sessions: crate::session::stream::SessionTable,
+}
+
+impl std::fmt::Debug for MembershipSyncConsumer {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("MembershipSyncConsumer(..)")
+  }
 }
 
 impl MembershipSyncConsumer {
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
     events: Arc<crate::node::EventHub>, revision: crate::node::MemberRevisionSignal,
-    leave_applied: LeaveAppliedSignal,
+    leave_applied: LeaveAppliedSignal, sessions: crate::session::stream::SessionTable,
   ) -> Self {
     Self {
       context: Arc::downgrade(&context),
@@ -161,6 +169,7 @@ impl MembershipSyncConsumer {
       events,
       revision,
       leave_applied,
+      sessions,
     }
   }
 }
@@ -182,6 +191,7 @@ impl PacketConsumer for MembershipSyncConsumer {
         &self.events,
         &self.revision,
         &self.leave_applied,
+        &self.sessions,
         &runtime,
         &source,
         &payload,
@@ -362,8 +372,8 @@ pub(crate) async fn announce_leave(
 async fn accept_payload(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
-  leave_applied: &LeaveAppliedSignal, runtime: &RuntimeClient, source: &NodeId,
-  payload: &SyncPayload,
+  leave_applied: &LeaveAppliedSignal, sessions: &crate::session::stream::SessionTable,
+  runtime: &RuntimeClient, source: &NodeId, payload: &SyncPayload,
 ) -> Result<()> {
   let store = context.store();
   match payload {
@@ -467,6 +477,11 @@ async fn accept_payload(
       }
       crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record).await?;
       events.emit(crate::NodeRevoked::new(record.subject().clone()));
+      // A persisted revocation closes the authorization boundary
+      // immediately on this node too: retire any live session with the
+      // revoked identity (its recovery dials race the propagation, so a
+      // session admitted before this tombstone landed must not linger).
+      crate::session::stream::retire_session(sessions, record.subject())?;
     }
     SyncPayload::Checkpoint(encoded) => {
       // A cleanup checkpoint is unsigned hygiene knowledge: max-wins by

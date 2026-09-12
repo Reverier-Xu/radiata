@@ -825,6 +825,22 @@ pub(crate) fn retire_session(table: &SessionTable, peer: &NodeId) -> Result<()> 
   Ok(())
 }
 
+/// Tears down every registered session at node shutdown: each entry's
+/// pending admissions fail exactly once and its frame sender drops, so
+/// even a session task whose abort landed before the graceful shutdown
+/// signal (skipping its exit cleanup) still closes its writer and
+/// connection — a peer observes the teardown either way.
+pub(crate) fn retire_all_sessions(table: &SessionTable) -> Result<()> {
+  let entries: Vec<SessionEntry> = {
+    let mut guard = table.lock().map_err(crate::Error::session_table)?;
+    std::mem::take(&mut *guard).into_values().collect()
+  };
+  for entry in &entries {
+    retire(entry);
+  }
+  Ok(())
+}
+
 /// Drains one replaced session: it stops accepting new work, its pending
 /// admissions fail exactly once with `StreamInterrupted`, and the retire
 /// signal closes its reader so the connection tears down after the winner

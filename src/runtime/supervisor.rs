@@ -288,6 +288,7 @@ pub(crate) async fn spawn_runtime(
     dependencies.events.clone(),
     dependencies.member_revision.clone(),
     dependencies.leave_applied.clone(),
+    dependencies.sessions.clone(),
   ));
   dependencies
     .extensions
@@ -882,6 +883,13 @@ impl Supervisor {
         handle.abort();
         aborted.push(handle);
       }
+    }
+    // Definitive session teardown: the graceful shutdown signal lets live
+    // session tasks run their exit cleanup, but an abort landing first
+    // skips it — draining the table here drops each entry's frame sender
+    // so the detached writer task still exits and the connection closes.
+    if let Err(error) = crate::session::stream::retire_all_sessions(&self.dependencies.sessions) {
+      tracing::warn!(kind = ?error.kind(), "session table teardown failed");
     }
     (self.dependencies, aborted)
   }
