@@ -35,7 +35,7 @@
     ],
     "demo.org/labels/value=absent": []
   },
-  "removal_propagation_s": 0.4164754150006047,
+  "removal_propagation_s": 0.4201367939967895,
   "page_walk_n1": {
     "pages": 2,
     "items": 77
@@ -48,7 +48,7 @@
     "pages": 2,
     "items": 77
   },
-  "revoked_subject": "node_fAa339hfmAAlyUYUz8u5a",
-  "cleanup_propagation_s": 2.01548327799901,
-  "checkpoint_watermark": 1789175035843
+  "revoked_subject": "node_FAtiIWot8pqRCQfOPBMMH",
+  "cleanup_propagation_s": 2.518672348000109,
+  "checkpoint_watermark": 1789255259660
 }
