@@ -15,7 +15,7 @@ use radiata::{
   NodeId, PageCursor, PageMembers, PageResources, PageSessions, PageSpec, PageTrust, ProtocolTag,
   PutResource, QualifiedTag, RemoveResource, ReplaceIdentityAndDeleteOldCoreMetadata,
   ResourceLabels, ResourceName, ResourceUri, ResourceVersion, ResourceWrite, RevokeNode,
-  RotateMergeCredential, RoutingPolicy, Selector, SelectResources, StreamMetadata, StreamPolicy,
+  RotateMergeCredential, RoutingPolicy, SelectResources, Selector, StreamMetadata, StreamPolicy,
   StreamTarget,
 };
 use serde_json::{Value, json};
@@ -45,7 +45,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(value: &str) -> Option<Vec<u8>> {
-  if value.len() % 2 != 0 {
+  if !value.len().is_multiple_of(2) {
     return None;
   }
   (0..value.len())
@@ -55,7 +55,10 @@ fn from_hex(value: &str) -> Option<Vec<u8>> {
 }
 
 fn bad_request(error: radiata::Error) -> (StatusCode, Json<Value>) {
-  (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()})))
+  (
+    StatusCode::BAD_REQUEST,
+    Json(json!({"error": error.to_string()})),
+  )
 }
 
 /// Builds one page spec from the demo's query parameters: the cursor is
@@ -75,8 +78,8 @@ fn page_spec(
             Json(json!({"error": "malformed cursor"})),
           )
         })?;
-      let cursor = PageCursor::from_provider_bytes(bytes.into_boxed_slice().into())
-        .map_err(bad_request)?;
+      let cursor =
+        PageCursor::from_provider_bytes(bytes.into_boxed_slice().into()).map_err(bad_request)?;
       PageSpec::after(cursor, limit).map_err(bad_request)
     }
     _ => PageSpec::first(limit).map_err(bad_request),
@@ -503,8 +506,7 @@ pub struct ExpectedVersion {
 }
 
 async fn remove_resource(
-  state: State<SharedState>, AxumPath(name): AxumPath<String>,
-  Json(request): Json<RemoveRequest>,
+  state: State<SharedState>, AxumPath(name): AxumPath<String>, Json(request): Json<RemoveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let name = ResourceName::parse(&name).map_err(bad_request)?;
   let writer = NodeId::parse(&request.expected.writer).map_err(bad_request)?;
@@ -721,7 +723,10 @@ pub fn router(state: SharedState) -> Router {
     .route("/disconnect", post(disconnect))
     .route("/leave", post(leave))
     .route("/resources", get(list_resources))
-    .route("/resources/{*name}", get(get_resource).put(put_resource).delete(remove_resource))
+    .route(
+      "/resources/{*name}",
+      get(get_resource).put(put_resource).delete(remove_resource),
+    )
     .route("/resources/select", post(select_resources))
     .route("/trust", get(trust))
     .route("/revoke", post(revoke))
