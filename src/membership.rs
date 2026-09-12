@@ -260,22 +260,6 @@ pub(crate) mod store {
     StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()))
   }
 
-  /// Reads the current descriptor for one node, if any, from an
-  /// already-acquired snapshot, so callers iterating many members pay one
-  /// snapshot acquisition per cycle instead of one per member.
-  pub(crate) async fn read_descriptor_snapshot(
-    snapshot: &dyn crate::provider::StoreSnapshot, node: &NodeId,
-  ) -> Result<Option<NodeDescriptorV1>> {
-    let namespace = namespace()?;
-    let key = descriptor_key(node);
-    let Some(value) = snapshot.get(&namespace, &key).await? else {
-      return Ok(None);
-    };
-    Ok(Some(crate::membership::page::decode_descriptor(
-      value.as_bytes(),
-    )?))
-  }
-
   /// Reads the current descriptor for one node, if any, over the running
   /// node's metadata store (the runtime path; never re-opens storage).
   pub(crate) async fn read_descriptor_ctx(

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::supervisor::{Supervisor, dial_member};
-use crate::{Error, NodeId, Result, session::stream::SessionEntry};
+use crate::{Endpoint, Error, NodeId, Result, session::stream::SessionEntry};
 
 /// The cleaned and left node sets behind the recovery exclusions and the
 /// member status annotations, kept distinct so a cleaned member still
@@ -151,46 +151,6 @@ impl Supervisor {
     }
     result
   }
-  /// Seeds the known-online set from the durable member evidence once
-  /// per process: published descriptors behind a trusted binding are
-  /// members this identity has authenticated with before — the restarted
-  /// process's past-life sessions. Removed-flagged descriptors and
-  /// departed members (left or cleaned, computed below) are not seeded.
-  /// Later ticks never re-seed: evidence that arrived after the first
-  /// tick describes members this identity never sessioned, and dialing
-  /// them would fabricate edges beyond the established topology.
-  async fn seed_known_online(
-    store: &crate::storage::MetadataStore, local: &NodeId,
-    history: &mut std::collections::BTreeSet<NodeId>,
-    excluded: &std::collections::BTreeSet<NodeId>,
-  ) -> Result<()> {
-    let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
-    let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
-      crate::membership::NODE_DESCRIPTOR_NAMESPACE,
-    )?);
-    let snapshot = store.snapshot().await?;
-    let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
-    while let Some(entry) = scan.next().await? {
-      let decoded = crate::membership::page::decode_descriptor(entry.value().as_bytes());
-      if let Err(error) = &decoded {
-        // Seeding is best-effort over durable evidence; a corrupt entry
-        // skips this round, but never silently.
-        tracing::debug!(kind = ?error.kind(), "recovery seed skipped an undecodable descriptor");
-      }
-      if let Ok(descriptor) = decoded {
-        let node = descriptor.node();
-        if !descriptor.removed()
-          && node != local
-          && bindings.contains_key(node)
-          && !excluded.contains(node)
-        {
-          history.insert(node.clone());
-        }
-      }
-    }
-    Ok(())
-  }
-
   /// The departed-members exclusion state (cleaned + left), memoized per
   /// store revision: rescanning and decoding every accumulated tombstone
   /// on every two-second tick (and every member page) is unbounded work
@@ -231,48 +191,58 @@ impl Supervisor {
       .filter(|(_, entry)| entry.alive())
       .map(|(peer, _)| peer.clone())
       .collect();
-    for peer in &direct {
-      // Any authenticated session — inbound or outbound — makes the peer
-      // known-online again: membership is a whole, and there is no
-      // per-session exclusion state. A departed identity is handled by
-      // the pruning below, not by session bookkeeping.
-      self.recovery_history.insert(peer.clone());
-    }
     // Departed identities (left or cleaned) are no longer cluster
-    // members and are forgotten by the recovery plane: counting one as
-    // pending would keep the controller in Recovering forever — never
-    // quiescent, attempts unbounded — and peg the dial backoff at its
-    // maximum for every future partition, stalling all re-dialing.
+    // members: they never enter the member table, so the recovery plane
+    // cannot count one as pending — that would keep the controller
+    // Recovering forever, never quiescent, attempts unbounded, and peg
+    // the dial backoff at its maximum for every future partition.
     let context = self.context()?;
     let store = context.store();
     let excluded = self.departed_exclusions(store).await?.union();
-    for member in &excluded {
-      self.recovery_history.remove(member);
-    }
-    // A restarted process carries no session history: the durable member
-    // evidence (published descriptors behind a trusted binding) seeds the
-    // known-online set once, so a restarted node heals its connectivity
-    // without operator action. Departed members keep their exclusion; a
-    // transient store error simply retries the seeding next tick. Later
-    // ticks never re-seed: later evidence describes members this
-    // identity never sessioned, and dialing them would fabricate edges
-    // beyond the established topology (recovery heals existing edges).
-    if !self.recovery_seeded {
-      match Self::seed_known_online(
-        store,
-        context.identity().node(),
-        &mut self.recovery_history,
-        &excluded,
-      )
-      .await
+    // The member table IS the recovery universe: every member with a
+    // trusted binding, a live descriptor, and a published endpoint is a
+    // retry candidate while the node is isolated. Scanning it every tick
+    // (not once at startup) is what lets a first-join leaf — whose
+    // descriptor table filled only after its first recovery tick —
+    // still dial a different member after its bootstrap dies.
+    let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
+    let snapshot = store.snapshot().await?;
+    let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
+      crate::membership::NODE_DESCRIPTOR_NAMESPACE,
+    )?);
+    let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
+    let mut known_members: std::collections::BTreeMap<NodeId, Endpoint> =
+      std::collections::BTreeMap::new();
+    while let Some(entry) = scan.next().await? {
+      let decoded = crate::membership::page::decode_descriptor(entry.value().as_bytes());
+      let descriptor = match decoded {
+        Ok(descriptor) => descriptor,
+        // The table scan is best-effort over durable evidence; a corrupt
+        // entry skips this round, but never silently.
+        Err(error) => {
+          tracing::debug!(kind = ?error.kind(), "recovery skipped an undecodable descriptor");
+          continue;
+        }
+      };
+      let node = descriptor.node().clone();
+      if descriptor.removed()
+        || &node == context.identity().node()
+        || excluded.contains(&node)
+        || !bindings.contains_key(&node)
       {
-        Ok(()) => self.recovery_seeded = true,
-        Err(error) => tracing::debug!(kind = ?error.kind(), "recovery history seeding deferred"),
+        continue;
+      }
+      if let Some(endpoint) = descriptor.endpoints().first() {
+        known_members.insert(node, endpoint.clone());
+      } else {
+        // No published endpoint: recovery stays best-effort, but the
+        // skip is visible in diagnostics instead of silent.
+        tracing::debug!(member = %node.as_str(), "no published endpoint; skipped");
       }
     }
-    let online = self.recovery_history.clone();
+    let known: std::collections::BTreeSet<NodeId> = known_members.keys().cloned().collect();
     let now = crate::time::now_seconds();
-    self.recovery.observe(&online, &direct);
+    self.recovery.observe(&known, &direct);
     if self.recovery.state() != crate::membership::recovery::RecoveryState::Recovering
       || !self.recovery.due(now)
       || {
@@ -284,37 +254,13 @@ impl Supervisor {
     {
       return Ok(());
     }
-    // Candidates are unreachable known members with a published endpoint
-    // from their signed descriptor; reachability stays distinct from the
-    // active topology and recovery never dials strangers.
-    let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
-    // Left and cleaned nodes are excluded from recovery dialing (their
-    // history entries were already forgotten above).
-    let snapshot = store.snapshot().await?;
+    // The node is fully isolated: retry every table member it is not
+    // directly connected to, one bounded fan-out step at a time, until
+    // any one connects (the "any one route" deployment contract).
     let mut candidates = std::collections::BTreeSet::new();
-    for member in online.difference(&direct) {
-      if excluded.contains(member) {
-        continue;
-      }
-      // Only known members (a durable binding exists) are dialled.
-      if !bindings.contains_key(member) {
-        continue;
-      }
-      let descriptor_read =
-        crate::membership::store::read_descriptor_snapshot(snapshot.as_ref(), member).await;
-      match descriptor_read {
-        Ok(Some(descriptor)) => match descriptor.endpoints().first() {
-          Some(endpoint) => {
-            candidates.insert((member.clone(), endpoint.clone()));
-          }
-          // No published endpoint: recovery stays best-effort, but the
-          // skip is visible in diagnostics instead of silent.
-          None => tracing::debug!(member = %member.as_str(), "no published endpoint; skipped"),
-        },
-        Ok(None) => tracing::debug!(member = %member.as_str(), "no descriptor; skipped"),
-        Err(error) => {
-          tracing::debug!(member = %member.as_str(), kind = ?error.kind(), "descriptor read failed; skipped")
-        }
+    for member in known.difference(&direct) {
+      if let Some(endpoint) = known_members.get(member) {
+        candidates.insert((member.clone(), endpoint.clone()));
       }
     }
     let step = self.recovery.next_step(

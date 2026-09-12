@@ -663,20 +663,6 @@ pub(super) struct Supervisor {
   pub(super) recovery: crate::membership::recovery::RecoveryController,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
-  // Members this node has ever authenticated a session with: the recovery
-  // "known online" set. Recovery restores authenticated paths to exactly
-  // these members (edge-loss healing) and never dials strangers, so it
-  // cannot add edges beyond the caller-configured topology.
-  pub(super) recovery_history: std::collections::BTreeSet<NodeId>,
-  /// Set once the known-online set has been seeded from the durable
-  /// member evidence (a restarted process's past-life sessions); later
-  /// ticks never re-seed. Evidence that arrived after the first tick is
-  /// deliberately NOT re-seeded: it describes members this identity has
-  /// never sessioned, and dialing them would fabricate edges beyond the
-  /// established topology (the sixteen-node topology suite pins the
-  /// exact shaped graph; recovery heals existing edges, it never
-  /// invents new ones).
-  pub(super) recovery_seeded: bool,
   /// Memoized departed-members exclusion set, keyed by the store
   /// revision it was computed at: the set only changes when a leave or
   /// cleanup tombstone lands or gets GC'd, and every such change commits
@@ -866,8 +852,6 @@ impl Supervisor {
       recovery,
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       published_endpoints,
-      recovery_history: std::collections::BTreeSet::new(),
-      recovery_seeded: false,
       exclusion_cache: std::sync::Mutex::new(None),
       resource_write_clock: std::sync::atomic::AtomicU64::new(0),
       sync_driver,
@@ -1331,7 +1315,6 @@ impl Supervisor {
       .dependencies
       .events
       .emit(crate::SessionChanged::new(peer.clone()));
-    self.recovery_history.remove(peer);
     // A disconnect only tears the session down: the peer stays a known
     // member (its binding and descriptor are untouched), so a later
     // session — inbound or healed — restores it to the recovery plane
@@ -1723,7 +1706,6 @@ impl Supervisor {
         .dependencies
         .events
         .emit(crate::SessionChanged::new(subject.clone()));
-      self.recovery_history.remove(&subject);
       self
         .dependencies
         .events
@@ -1789,7 +1771,6 @@ impl Supervisor {
       .collect();
     for peer in peers {
       crate::session::stream::retire_session(&self.dependencies.sessions, &peer)?;
-      self.recovery_history.remove(&peer);
     }
 
     crate::identity::leave::run_leave(
