@@ -1,6 +1,7 @@
 # radiata 0.1.0 工程计划（改进清单）
 
-> 状态基线：main @ `3b47887` 之后的工作树（2026-09-12）。
+> 状态基线：`plan-0.1.0-baseline` 分支 @ `765d663`（2026-09-12；原 main @ `3b47887` 工作树已按
+> 修复口径分 9 个 commit 落账）。
 > 全量测试 628 通过 0 失败；clippy `-D warnings`、nightly fmt、verify-api 全绿。
 > 本文档是 **0.1.0 前唯一的任务清单**：所有改进项在此登记、追踪状态、记录验收。
 > 完成一项就地更新状态行（`状态：待办 / 进行中 / 已完成（commit）`）；新发现的问题先入档再开工。
@@ -28,6 +29,16 @@
 | D3 | **版本元组公开往返**：`ResourceVersion::from_parts` 使条件删除可跨进程使用 | `resource/mod.rs`、ABI 基线、`tests/public_api.rs` |
 | D4 | **examples 独立于 workspace**（customer-style）：example 是"外部消费者视角"的交付证据，其 e2e（容器级）是库缺陷的充分暴露面 | `examples/cluster`、`examples/chat` |
 | D5 | **恢复宇宙 = 成员表**：每 tick 从描述符表全量扫描恢复候选（非一次性 seed 的会话历史），首次 join 的叶子在 bootstrap 死后可拨向从未直连的成员 | `runtime/recovery.rs` |
+| D6 | **错误构造走 thiserror 风格**：库内错误全部类型化内部定义；公开面提供类型化的调用方错误构造入口（替代 `provider` 冒用），消费者声明自己的业务错误类型、经 `#[from]` 集成 `radiata::Error`；不开放 `Error::new(kind, context)` 全量构造 | P0-1 |
+| D7 | **CAS Put 冲突映射 = `Error::conflict`**：expected 不匹配与 `RemoveResource` 现行为一致，与普通 Put 的 `Superseded` 落败路径区分 | P1-1 |
+| D8 | **join 凭据并发化 = `IssueMergeCredential` 非轮换签发 + 接收端世代多次准入**：世代 10 分钟寿命内可准入任意多节点，`reserve` 允许多在途；`Rotate` 保留为撤销/升级手段 | P1-4 |
+| D9 | **wire 不引入 v2**：0.1.0 未发布，直接删除旧快照传播实现，分页反熵新设计继承 v1 名义作为唯一 wire 形态，不留双栈兼容窗 | P2-1 |
+| D10 | **拓扑剪枝 = 记录决策不实现**："恢复偏好连通性而非最优拓扑"写入契约文档；soak 数据证明边数是实际瓶颈再立项 | P2-2 |
+| D11 | **群成员多赢家记录 = 决策记录 + 观望**：P1-1 CAS 把静默丢失变显式冲突，多赢家子记录等真实需求 | P2-4 |
+| D12 | **默认 feature 反转为 `redb`**：`json` 需显式；0.1.0 发布说明标 breaking | P2-6 |
+| D13 | **`store_scan_stream` 保留**：补"扩展作者面"定位 rustdoc，保留外部驱动测试 | P2-7 |
+
+> 以上 D6–D13 为 2026-09-12 owner 决策（源码逐条核实后拍板），对应条目的方案草案已按决策更新。
 
 ---
 
@@ -41,10 +52,10 @@
   chat example 被迫用 `provider(Io, TransportConnect)` 冒充"无中继可用"，
   用 `provider(Io, StorageCommit)` 冒充"消息存储失败"。
 - **根因**：`Error` 字段私有，per-kind 构造器全部 `pub(crate)`，`ErrorKind` 未实现 `From` 到 `Error` 的公开路径。
-- **方案草案**：`impl Error { pub fn new(kind: ErrorKind, context: &'static str) -> Self }`
-  （或按需的最小集合：`invalid_input`/`unavailable`）。保留 `provider` 不动。
-- **验收**：chat example 的两处冒用替换为正确构造；`public_api` 基线重生成并钉住；
-  全门禁绿。
+- **方案草案**（按 D6）：不开放 `Error::new(kind, context)` 全量构造；为调用方起源的
+  失败提供类型化构造入口（单一 caller-error 变体 + 构造器），保留 `provider` 不动。
+- **验收**：chat example 的两处冒用替换为正确构造（含 `chat.rs:134-135` 注释与 README
+  同步清理）；`public_api` 基线重生成并钉住；全门禁绿。
 - **涉及面**：`error.rs`、ABI 基线、examples/chat。**规模：S**
 
 ### P0-2 ack 投递语义的规模化验证（soak）
@@ -76,7 +87,8 @@
 
 ### P0-4 issuer 快照刷新失败与描述符反熵解耦
 
-- **状态**：待办
+- **状态**：已完成（f19b0f1；核实：降级路径 + 回归测试 `sync_tick_survives_snapshot_refresh_overflow`
+  均已落地，trust.rs:121-127 注释已如实化）
 - **来源**：archive/snapshot-analysis.md §4.1（未了事项）
 - **问题**：membership `sync_tick` 中 `refresh_issuer_snapshot(...)?` 一旦失败
   （编码超限、存储抖动），**整个 tick 失败**——描述符页反熵随之停摆，且每轮同样失败，
@@ -96,9 +108,10 @@
 - **状态**：待办
 - **问题**：`RemoveResource` 有 expected 版本前置，`PutResource` 没有——业务读改写
   （chat 群成员变更即实例）存在丢更新竞态，目前只能靠编排串行规避。
-- **方案草案**：`PutResource::with_expected(version)`（或 `PutResource::new` 保持不变 +
-  新构造器），提交路径复用 `commit_put_ctx` 的 snapshot-exact CAS，把"本地 winner ≠ expected"
-  从 LWW 降为显式 `Conflict`。
+- **方案草案**（按 D7 定案）：`PutResource::with_expected(version)`（或 `PutResource::new` 保持不变 +
+  新构造器），提交路径复用 `commit_put_ctx` 的 snapshot-exact CAS；"本地 winner ≠ expected"
+  映射为显式 `Error::conflict`（与 `RemoveResource` 一致），普通 Put 的 `Superseded`
+  落败路径保持不变。
 - **验收**：公共 API 测试钉住；chat example 群 join 改用 CAS 并去除"并发 join 丢更新"
   的文档警告；e2e 回归。
 - **涉及面**：`operation.rs`、`runtime/supervisor.rs`、`resource/store.rs`、ABI 基线。**规模：M**
@@ -106,43 +119,51 @@
 ### P1-2 内置默认 next-hop 策略
 
 - **状态**：待办
-- **问题**：任何要用多跳中继的业务都要手写十行 `DefaultNextHop`（取一个存活 peer）。
-  库内已有扩展点与完整的转发/信封机制，只差一个确定性默认实现。
+- **问题**：任何要用多跳中继的业务都要手写约 25 行 `DefaultNextHop`（取一个存活 peer）。核实：
+  `src/` 下零个 `RouteNextHop` 实现；examples/chat（chat.rs:119-143）、
+  `slo/src/bin/slo-node.rs:165`、`tests/routed_packets.rs:43`、`tests/public_api.rs:544`
+  共四份同款手写。库内已有扩展点与完整的转发/信封机制，只差一个确定性默认实现。
 - **方案草案**：`routing.rs` 内置 `DefaultNextHop`（destination ∈ peers 直发由调用方保证；
   策略取 NodeId 排序最小的存活 peer），公共构造器/常量 tag；文档写明可替换。
-- **验收**：chat example 换用内置策略后 e2e 回归；单元测试钉住确定性。
-- **涉及面**：`routing.rs`、`lib.rs` 导出、examples/chat。**规模：S**
+- **验收**：chat、slo-node、两个测试全部换用内置策略后 e2e 回归；单元测试钉住确定性。
+- **涉及面**：`routing.rs`、`lib.rs` 导出、examples/chat、`slo`、tests。**规模：S**
 
 ### P1-3 LeaveApplied 回执统一 ack 处理
 
 - **状态**：待办
-- **问题**：membership lane 的 leave 回执是最后一个 fire-and-forget 调用点（best-effort 提示），
-  与 D2 的投递真相语义不一致。
-- **方案草案**：与页投递同样收集 ack、轮末判定；失败仅计入诊断（回执是提示，不重投——
-  leave 公告本身有重发预算覆盖）。
+- **问题**（核实修正）：membership lane 的 leave 回执发送侧是最后一个 fire-and-forget
+  调用点（ack receiver 直接丢弃，sync.rs:416-421），与 D2 的投递真相语义不一致。
+  注意：leaver 侧 `announce_leave` 已有 `LEAVE_ACK_WAIT` 回执等待（sync.rs:271-344，
+  优先 applied receipt、次 admission ack），落地时不得与其重复/冲突——缺口仅在
+  发送侧回执的 ack 采集与轮末判定。
+- **方案草案**：发送侧与页投递同样收集 ack、轮末判定；失败仅计入诊断（回执是提示，
+  不重投——leave 公告本身有重发预算覆盖）。
 - **验收**：与 D2 一致的单元测试；leave 集成测试回归。
 - **涉及面**：`membership/sync.rs`。**规模：S**
 
-### P1-4 join 凭据：只读查询或多发凭据选项
+### P1-4 join 凭据：非轮换签发 + 多次准入
 
-- **状态**：待办
+- **状态**：待办（D8 定案）
 - **来源**：archive/example-findings.md #2（未了项）
-- **问题**：`RotateMergeCredential` 是唯一凭据签发口且签发即轮换——并发 join 互相作废，
-  业务必须串行化 join（chat/cluster 两个 example 都被迫如此编排）。
-- **方案草案**（二选一，实现前 owner 决策）：
-  a) `IssueMergeCredential`（不轮换的只读签发，凭据世代不变，多次有效）；
-  b) `GetMergeCredential`（只读查询当前世代，配合现有轮换语义）。
-  倾向 a)：彻底消除"签发即作废"的摩擦，同时保留 `Rotate` 作为升级手段。
+- **问题**（核实补充）：并发 join 有**两层**卡点——`RotateMergeCredential` 签发即轮换作废
+  旧 token；且接收端世代单次准入（`reserve` 至多一个在途、提交成功即 `consume` 作废，
+  `credential.rs`），不轮换的 token 也会撞 `join credential reserved` 冲突。业务必须串行化
+  join（chat/cluster 两 example 都被迫如此编排）。
+- **方案**（按 D8 定案）：新增 `IssueMergeCredential` 命令（非轮换签发）；接收端世代改为
+  10 分钟寿命内多次准入（`reserve` 允许多在途，准入成功不 `consume` 整个世代）；
+  `Rotate` 保留为撤销/升级手段。
 - **验收**：两 example 的 join 编排去掉串行化（并发 join e2e 断言）；ABI 基线更新。
-- **涉及面**：`operation.rs`、`identity/credential.rs`、runtime、两 example。**规模：M**
+- **涉及面**：`operation.rs`、`identity/credential.rs`、merge 准入状态机、runtime、两 example。**规模：M**
 
 ### P1-5 恢复退避参数复审 + RecoveryView 语义文档
 
 - **状态**：待办
-- **问题**：D1/D5 落地后，`RecoveryConfig` 默认值（initial 1s / max 5min / fan-out 64）的
-  合理性未复审；`RecoveryView::pending_count` 语义已变为诊断计数
-  （未直连的活跃成员数，**不等于**失联），`is_connected` 语义变为"至少一条通路"——
-  rustdoc 未同步。
+- **问题**（核实修正）：D1/D5 落地后，`RecoveryConfig` 默认值（neighbors 4 / fan-out 64 /
+  initial 1s / max 5min，`config.rs:320-323`）的合理性未复审。公开视图字段为
+  `unreachable_members`（`view.rs:867`，映射内部 `pending_count` 诊断计数，**不等于**失联）
+  与 `is_connected`（"至少一条通路"）；缺口是 `is_connected`/`next_attempt_at` 完全无 rustdoc、
+  `unreachable_members` 未显式声明"仅诊断计数"，`RecoveryConfig::new` 对 neighbors/fan-out
+  语义亦无文档——并非"描述旧语义"。
 - **方案草案**：用 P0-2 的 soak 数据校准默认值；rustdoc 重写两个视图字段的语义，
   显式给出"星型叶子失联 → 恢复 → 收敛"的时间预期公式（tick 周期 × backoff）。
 - **验收**：rustdoc 评审；`GetRecovery` 相关测试注释与新语义一致。
@@ -161,7 +182,9 @@
 
 ### P1-7 trust.rs 注释与远程快照持久化语义修正
 
-- **状态**：待办
+- **状态**：已完成（ddd24e9、bae764d；核实：注释如实化、远程快照不再持久化并有
+  `accept_snapshot_adopts_without_persisting_the_remote_snapshot` 钉住、模块文档已声明
+  无对象签名限制）
 - **来源**：archive/snapshot-analysis.md §4.2（未了事项）
 - **问题**：trust.rs 注释与快照发射失败模式不符（见 P0-4）；远程 issuer 快照的
   持久副本无读者（纯写放大），且"无对象签名、真实性由投递会话背书"的限制未在模块文档声明。
@@ -176,36 +199,39 @@
 
 ### P2-1 绑定传播协议改造（per-binding 事件 + revision 游标）
 
-- **状态**：待办
+- **状态**：待办（D9 定案：不留 v2）
 - **来源**：archive/snapshot-analysis.md §2.2 债务 1、§4.3
-- **问题**：`TrustSnapshotV1` 是"整集快照"传播单元：无 64 KiB 发射阶梯
-  （≈870 绑定饱和，超限令整个 sync_tick 失败，见 P0-4）；>16 节点规模的绑定传播
-  没有分页反熵。v1 wire 面已冻结，改造有兼容成本。
-- **方案草案**：快照降级为引导/审计用途；绑定传播改为 per-binding 记录 +
+- **问题**（核实修正）：`TrustSnapshotV1` 是"整集快照"传播单元：无 64 KiB 发射阶梯
+  （≈870 绑定饱和；超限不再令 tick 失败——P0-4 已修复，但快照发送会持续跳过，
+  绑定传播实质停摆）；>16 节点规模的绑定传播没有分页反熵（核实：绑定只在 revision
+  变化或 8 tick 慢节奏整份重发，`paged_trust_ctx` 仅本地读视图、不在 wire 路径上；
+  记录 schema 无版本协商，但握手层有 feature/limit 协商可承载）。
+- **方案**（按 D9 定案）：快照降级为引导/审计用途；绑定传播改为 per-binding 记录 +
   per-issuer revision 游标的分页反熵（复用 resource/membership 页面的
-  scan_paged + 指纹 quiet 语义）；wire schema 走 v2 版本协商。
-- **验收**：节点数 >16 的规模测试（绑定数量超一页）；旧节点兼容策略
-  （owner 决策：0.1.0 前 wire 可破坏性变更，无需兼容窗）。
+  scan_paged + 指纹 quiet 语义）。**不引入 v2**：直接删除旧快照传播实现，
+  新设计继承 v1 名义作为唯一 wire 形态，不留双栈兼容窗。
+- **验收**：节点数 >16 的规模测试（绑定数量超一页）。
 - **涉及面**：`identity/trust.rs`、`membership/sync.rs`、`protocol/`、规模测试。**规模：L**
 
 ### P2-2 拓扑自优化（恢复累积冗余边剪枝）
 
-- **状态**：待办
+- **状态**：已决策关闭（D10，2026-09-12）：记录决策不实现
 - **问题**：D1 语义下恢复只在隔离时拨号、连通后不剪枝——故障恢复事件会永久累积
-  冗余边（chat e2e 实测：hub 死后叶子互拨的边在 hub 回归后留存）。
+  冗余边（chat e2e 实测：hub 死后叶子互拨的边在 hub 回归后留存；核实：
+  `retire_session` 仅命令/leave/revocation/模拟调用，无自动剪枝路径）。
   功能无损（多跳中继兜底），但长期运行的拓扑会漂移向稠密。
-- **方案草案**：评估两向：a) 修剪——Connected 状态下周期性评估"边冗余度"
-  （两端度数 + 替代路径存在性），低价值边有界主动退役；
-  b) 不修——记录"恢复偏好连通性而非最优拓扑"为最终契约。
-  实现前 owner 决策；倾向 b) 记录决策 + 文档，除非 soak 显示边数是实际瓶颈。
-- **验收**：决策记录 + （若实现）剪枝的收敛测试与 e2e 回归。
-- **涉及面**：`runtime/recovery.rs`。**规模：M（决策）/ L（实现）**
+- **决策**：把"恢复偏好连通性而非最优拓扑"写入契约文档（随 P1-6 rustdoc 指南落）；
+  soak 数据证明边数是实际瓶颈时再立新战役实现有界剪枝。交付物为决策记录（本文档）。
+- **涉及面**：`runtime/recovery.rs` 文档。**规模：S（决策）**
 
 ### P2-3 sync per-key 水位
 
 - **状态**：待办
-- **问题**：资源/成员反熵按名字序分页 + 整目录指纹（quiet 判定）+ 全量重投兜底。
-  大目录下单条记录变更触发整目录重扫与分页重发（16 条/页/轮）。
+- **问题**（核实修正）：资源/成员反熵按名字序分页（`PAGE_DEFAULT_LIMIT = 16`，
+  `paging.rs:18`）+ 下一页区间指纹 quiet 判定（非整目录指纹）+ 全量重投兜底
+  （`arm_full_pass` 每 128 轮）。核实新事实：**中段记录变更在本 pass 内不触发重发，
+  需等 `PAGE_RESEND_TICKS = 32` tick 或 128 轮全量 pass 才被覆盖**——变更可能滞留
+  多达 ~128 轮才收敛，比原陈述更强地支撑 per-key 水位的必要性。
 - **方案草案**：per-key 水位（记录级 last-sent revision/digest 表，bounded），
   增量页只装"水位之后变化的记录"；全量重投保留为兜底。
   需先有 P0-2 的基准数据支撑必要性判断。
@@ -214,14 +240,14 @@
 
 ### P2-4 群成员多赢家记录支持（决策项）
 
-- **状态**：待办
+- **状态**：已决策关闭（D11，2026-09-12）：决策记录 + 观望
 - **问题**：LWW 整记录寄存器上，群花名册的并发读改写存在丢更新；
   P1-1 的 CAS 变体把"静默丢失"变为"显式冲突"，但并发 join 仍需重试。
-- **方案草案**：先以 P1-1 落地并观察真实需求；若业务仍需要"并发 join 全部生效"，
-  评估 member-set 的多赢家子记录（成员作为独立子键 resource 或 add/remove 操作日志）。
-  本项的 0.1.0 交付物是**决策记录**（含被否方案的理由），实现视需求另立战役。
-- **验收**：ADR 入档；chat README 的限制说明更新为指向决策。
-- **涉及面**：文档为主。**规模：S（决策）**
+- **决策**：先以 P1-1 落地并观察真实需求；"并发 join 全部生效"的多赢家子记录
+  （成员作为独立子键 resource 或 add/remove 操作日志）暂不实现，被否理由：
+  CAS 冲突已可满足正确性，多赢家寄存器与 LWW 单记录契约冲突，需真实需求支撑
+  再立战役。本项交付物为本决策记录。
+- **验收**：chat README 的限制说明更新为指向决策（随 P1-4 去串行化一并修订）。
 
 ### P2-5 生产级 KeyProvider 参考实现
 
@@ -236,28 +262,28 @@
 - **验收**：crate 独立门禁；崩溃矩阵测试；两个 example 消费同一实现。
 - **涉及面**：新 crate、两 example。**规模：M**
 
-### P2-6 默认 feature 反转评估
+### P2-6 默认 feature 反转
 
-- **状态**：待办
+- **状态**：已决策（D12，2026-09-12）：反转默认；实施待办
 - **来源**：archive/example-findings.md #5（未了项）
 - **问题**：默认 feature 是 `json`（test-only 适配器），生产推荐 `redb`——
-  新用户 `cargo add radiata` 即得到非生产存储。
-- **方案草案**：owner 决策三选一：a) 反转默认（redb 为默认，json 需显式）；
-  b) 无默认 feature（按需显式）；c) 保持现状 + 文档加粗。
-  若 a/b：发布说明标注 breaking，检查 `--no-default-features` 矩阵。
-- **验收**：决策记录；feature 矩阵（cargo-hack）全绿；文档更新。
-- **涉及面**：`Cargo.toml`、CI。**规模：S（决策）/ M（反转）**
+  新用户 `cargo add radiata` 即得到非生产存储，且默认拉 serde 全家给所有消费者。
+- **方案**（D12 定案）：反转默认——`redb` 为默认，`json` 需显式；
+  0.1.0 发布说明标 breaking。
+- **验收**：feature 矩阵（cargo-hack）全绿；文档更新；发布说明标注 breaking。
+- **涉及面**：`Cargo.toml`、CI、两 example 的依赖声明。**规模：S（反转 + 矩阵核对）**
 
-### P2-7 store_scan_stream 公开面决策 + 审计性能/规模项清账
+### P2-7 store_scan_stream 定位声明 + 审计性能/规模项清账
 
-- **状态**：待办
+- **状态**：已决策（D13，2026-09-12）：保留导出；rustdoc 待补
 - **来源**：archive/audit-findings.md（"性能与规模项与 store_scan_stream 公开面保留待后续"）
-- **问题**：`store_scan_stream` 公开导出但 crate 内零生产调用（仅外部测试驱动），
-  留作扩展作者面；审计中缓缴的性能与规模项无台账归属。
-- **方案草案**：owner 决策：保留（写入 rustdoc 定位说明 + 保留外部驱动测试）
-  或移除（紧缩公开面）；逐条核对审计"未修（有意保留）"清单，关闭或转本计划条目。
-- **验收**：决策记录；公开面与基线一致；无未归属的遗留项。
-- **涉及面**：`provider.rs`/存储域、ABI 基线。**规模：S（决策）**
+- **问题**：`store_scan_stream` 公开导出（自定义存储适配器作者的 Stream 桥接缝隙，
+  10 行 try_unfold，库内零调用是有意设计）但 rustdoc 无定位声明；
+  审计中缓缴的性能与规模项无台账归属。
+- **方案**（D13 定案）：保留导出；rustdoc 补"扩展作者面"定位说明；
+  保留外部驱动测试；逐条核对审计"未修（有意保留）"清单，关闭或转本计划条目。
+- **验收**：rustdoc 更新；公开面与基线一致；无未归属的遗留项。
+- **涉及面**：`provider.rs`。**规模：S**
 
 ### P2-8 architecture.md 全量重审刷新
 
@@ -275,14 +301,15 @@
 
 | 批次 | 内容 | 依赖 | 收口 |
 | --- | --- | --- | --- |
-| A | P0-1、P0-3、P0-4、P1-7（小改集中清障） | 无 | 全门禁 + 两 e2e 回归 |
-| B | P1-1（CAS Put）、P1-2（默认 next-hop）、P1-3（leave 回执） | 无（相互独立） | 全门禁 + chat e2e（join 去串行化断言） |
-| C | P0-2（soak 基准与参数化）、P1-4（凭据签发）、P1-5（参数复审） | A（门禁完备）、B（CAS 影响基准口径） | 基准数据入档 + e2e 回归 |
-| D | P2-1（绑定传播协议）、P2-3（per-key 水位） | C（基准数据支撑必要性） | 规模测试 + e2e 回归 |
-| E | P2-4/P2-6/P2-7（三项决策记录）、P2-5（KeyProvider crate） | 无硬依赖 | 决策入档 + 新 crate 门禁 |
-| F | P1-6（rustdoc 指南）、P2-8（架构文档刷新） | A–E 全部定稿 | `cargo doc` 评审 + 发布说明 |
+| 0 | 计划对账（状态行刷新、决策台账 D6–D13 入档、表述修正） | 无 | 本 commit |
+| A | P0-1（D6 错误构造）、P0-3（CI examples lane）、P1-3（leave 回执 ack） | 0 | 全门禁 |
+| B | P1-1（CAS Put，D7）、P1-2（默认 next-hop，含 slo/tests 同步）、P1-4（凭据并发化，D8）、P1-5（rustdoc 补齐） | 0 | 全门禁 + chat/cluster e2e（并发 join 断言） |
+| C | P0-2（soak 基准）、P2-6（默认 feature 反转实施） | A、B | 基准数据入档 + 矩阵全绿 |
+| D | P2-1（绑定传播分页化，D9 不留 v2）、P2-3（per-key 水位） | C | 规模测试 + e2e 回归 |
+| E | P2-5（KeyProvider crate）、P2-7（rustdoc 定位 + 审计清账） | 无硬依赖 | 新 crate 门禁 + 清账记录 |
+| F | P1-6（rustdoc 指南，含 D10 契约表述）、P2-8（架构文档刷新） | A–E 全部定稿 | `cargo doc` 评审 + 发布说明 |
 
-- P2-2（拓扑剪枝）倾向"记录决策、不实现"，若 soak 显示边数是实际瓶颈则升级为 L 级条目插入批次 D。
+- P2-2/P2-4 已以决策关闭（D10/D11）；P2-6 决策已定、实施在批次 C；P2-7 决策已定、rustdoc 在批次 E。
 - 每批次合入前：`git status` 干净、无临时产物、逐 commit gitmoji 规范。
 
 ## 5. 0.1.0 冻结判据
