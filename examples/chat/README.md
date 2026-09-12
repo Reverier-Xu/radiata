@@ -22,8 +22,8 @@ the routed data channel (DMs, group fan-out, read receipts).
 The business surface is exactly three operations: **join** (one HTTP
 call that merges through any single cluster member), **send** (target a
 user; the library delivers over a direct session when one exists and
-relays through a live peer when it does not — the next-hop policy is a
-ten-line `RouteNextHop` implementation), and **leave**. There is no
+relays through a live peer when it does not — the next-hop policy is
+the library's built-in `DefaultNextHop`), and **leave**. There is no
 business-side meshing: the library's recovery plane retries every member
 in the table while the node is fully isolated, reconnects through any
 member that answers, and quiesces the moment any one route exists (the

@@ -64,7 +64,7 @@ async fn main() {
   extensions
     .register_next_hop(
       radiata::QualifiedTag::parse(chat::ROUTE_POLICY).expect("static route policy tag"),
-      Arc::new(chat::DefaultNextHop),
+      Arc::new(radiata::DefaultNextHop),
     )
     .expect("register route policy");
   extensions

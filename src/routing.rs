@@ -770,6 +770,36 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
   fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>>;
 }
 
+/// The built-in next-hop policy: relays through the lowest live peer id.
+/// Direct delivery to a connected destination is resolved by the routing
+/// plane before any policy is consulted, so the policy only ever sees
+/// unconnected destinations and always relays. The choice is
+/// deterministic (canonical peer order, minimum wins), which keeps
+/// loop-freedom reasoning and replay tests simple. Register it under
+/// [`DefaultNextHop::TAG`] (or your own tag) and select that tag in
+/// [`crate::NodeConfig::with_route_policy`]; registering a different
+/// [`RouteNextHop`] implementation replaces it.
+#[derive(Debug)]
+pub struct DefaultNextHop;
+
+impl DefaultNextHop {
+  /// The well-known tag the built-in policy is registered under.
+  pub const TAG: &'static str = "radiata.woooo.tech/route-policies/default";
+}
+
+impl RouteNextHop for DefaultNextHop {
+  fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+    Box::pin(async move {
+      view
+        .peers()
+        .iter()
+        .min()
+        .cloned()
+        .ok_or_else(|| Error::caller("no live peer to relay through"))
+    })
+  }
+}
+
 /// The shared next-hop resolution for the routing plane: resolves the
 /// registered [`RouteNextHop`] policy named by `tag` against the route
 /// view built from `destination`, `local`, and the alive `peers`.
@@ -805,6 +835,34 @@ mod tests {
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node_{value:021}")).unwrap()
+  }
+
+  /// The built-in default policy always relays through the lowest live
+  /// peer id regardless of input order, and fails closed with a typed
+  /// caller error when no live peer exists.
+  #[tokio::test]
+  async fn default_next_hop_is_deterministic_and_fails_closed() {
+    use super::{DefaultNextHop, NextHopView, RouteNextHop};
+
+    let destination = node(9);
+    let local = node(0);
+    let policy = DefaultNextHop;
+    for ordering in [[4, 2, 7], [7, 4, 2], [2, 7, 4]] {
+      let peers: Vec<NodeId> = ordering.iter().map(|value| node(*value)).collect();
+      let view = NextHopView {
+        destination: &destination,
+        local: &local,
+        peers: &peers,
+      };
+      assert_eq!(policy.next_hop(view).await.unwrap(), node(2));
+    }
+    let view = NextHopView {
+      destination: &destination,
+      local: &local,
+      peers: &[],
+    };
+    let error = policy.next_hop(view).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::CallerError);
   }
 
   fn key(name: &str) -> LabelKey {

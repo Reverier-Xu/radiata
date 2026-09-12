@@ -84,7 +84,8 @@ pub use provider::{
 };
 pub use resource::{ResourceLabels, ResourceName, ResourceUri, ResourceVersion};
 pub use routing::{
-  CandidateNodeReader, LoadBalancingPolicy, NextHopView, RouteContext, RouteNextHop, Selector,
+  CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteContext,
+  RouteNextHop, Selector,
 };
 pub use transport::{Endpoint, PageCursor};
 pub use view::{

@@ -114,7 +114,8 @@
 
 ### P1-1 条件写（CAS Put）
 
-- **状态**：待办
+- **状态**：已完成（c6e6fe0；`PutResource::with_expected` + D7 conflict 映射 +
+  chat 群 join 改 CAS 有界重试、文档警告去除；集成测试三态钉住）
 - **问题**：`RemoveResource` 有 expected 版本前置，`PutResource` 没有——业务读改写
   （chat 群成员变更即实例）存在丢更新竞态，目前只能靠编排串行规避。
 - **方案草案**（按 D7 定案）：`PutResource::with_expected(version)`（或 `PutResource::new` 保持不变 +

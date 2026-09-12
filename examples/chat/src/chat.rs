@@ -113,24 +113,4 @@ fn store_error(error: String) -> radiata::Error {
   radiata::Error::caller("chat store write failed")
 }
 
-/// The chat room's next-hop policy: when a destination has no direct
-/// session, relay through the lowest-id live peer. The library asks only
-/// when the destination is not a neighbor, so the whole policy is "direct
-/// when possible, relay when not" — the deployment contract is any one
-/// route, and the library's recovery plane keeps at least one alive.
-#[derive(Debug)]
-pub struct DefaultNextHop;
 
-impl radiata::RouteNextHop for DefaultNextHop {
-  fn next_hop<'a>(
-    &'a self, view: radiata::NextHopView<'a>,
-  ) -> radiata::BoxFuture<'a, radiata::Result<NodeId>> {
-    Box::pin(async move {
-      view.peers().iter().min().cloned().ok_or_else(|| {
-        // No live peer to relay through: the send fails closed and the
-        // business layer queues.
-        radiata::Error::caller("no live peer to relay through")
-      })
-    })
-  }
-}

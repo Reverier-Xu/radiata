@@ -197,6 +197,11 @@ impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
 pub fn radiata::CreatedKey::new(radiata::KeyHandle, radiata::PublicKey) -> Self
 pub fn radiata::CreatedKey::public_key(&self) -> &radiata::PublicKey
+pub struct radiata::DefaultNextHop
+impl radiata::DefaultNextHop
+pub const radiata::DefaultNextHop::TAG: &'static str
+impl radiata::RouteNextHop for radiata::DefaultNextHop
+pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub struct radiata::DeliveryAck
 impl radiata::DeliveryAck
 pub fn radiata::DeliveryAck::admitted_at(&self) -> std::time::SystemTime
@@ -1060,6 +1065,8 @@ impl radiata::Query for radiata::WaitForShutdown
 pub type radiata::WaitForShutdown::Output = radiata::ShutdownReason
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+impl radiata::RouteNextHop for radiata::DefaultNextHop
+pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub fn radiata::store_scan_stream(alloc::boxed::Box<(dyn radiata::extension::StoreScan + '_)>) -> futures_core::stream::BoxStream<'_, radiata::Result<radiata::StoreEntry>>
 pub type radiata::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>
 pub type radiata::Result<T, E> = core::result::Result<T, E>
