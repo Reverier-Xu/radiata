@@ -29,11 +29,11 @@
 | D3 | **版本元组公开往返**：`ResourceVersion::from_parts` 使条件删除可跨进程使用 | `resource/mod.rs`、ABI 基线、`tests/public_api.rs` |
 | D4 | **examples 独立于 workspace**（customer-style）：example 是"外部消费者视角"的交付证据，其 e2e（容器级）是库缺陷的充分暴露面 | `examples/cluster`、`examples/chat` |
 | D5 | **恢复宇宙 = 成员表**：每 tick 从描述符表全量扫描恢复候选（非一次性 seed 的会话历史），首次 join 的叶子在 bootstrap 死后可拨向从未直连的成员 | `runtime/recovery.rs` |
-| D6 | **错误构造走 thiserror 风格**：库内错误全部类型化内部定义；公开面提供类型化的调用方错误构造入口（替代 `provider` 冒用），消费者声明自己的业务错误类型、经 `#[from]` 集成 `radiata::Error`；不开放 `Error::new(kind, context)` 全量构造 | P0-1 |
+| D6 | **错误面采用 thiserror crate**（非仅风格）：`Error` 与内部错误枚举（`HandshakeError`、`SelectionError`、`LimitedWriteError`、`FailureCaptureError`、`SimulationError`）的 `Display`/`Error`/`Debug` 样板 impl 全部改 derive；kind/context 的 `From` 映射表是域逻辑保留，`Error` 的 const 构造器保留；公开面提供类型化的调用方错误构造入口（替代 `provider` 冒用），消费者经 `#[from]` 集成 `radiata::Error`；不开放 `Error::new(kind, context)` 全量构造 | P0-1 |
 | D7 | **CAS Put 冲突映射 = `Error::conflict`**：expected 不匹配与 `RemoveResource` 现行为一致，与普通 Put 的 `Superseded` 落败路径区分 | P1-1 |
 | D8 | **join 凭据并发化 = `IssueMergeCredential` 非轮换签发 + 接收端世代多次准入**：世代 10 分钟寿命内可准入任意多节点，`reserve` 允许多在途；`Rotate` 保留为撤销/升级手段 | P1-4 |
 | D9 | **wire 不引入 v2**：0.1.0 未发布，直接删除旧快照传播实现，分页反熵新设计继承 v1 名义作为唯一 wire 形态，不留双栈兼容窗 | P2-1 |
-| D10 | **拓扑剪枝 = 记录决策不实现**："恢复偏好连通性而非最优拓扑"写入契约文档；soak 数据证明边数是实际瓶颈再立项 | P2-2 |
+| D10 | **拓扑剪枝改为实施**：冗余边的成本经源码量化为真实（反熵 tick 每 250ms 全 peer 扇出，流量/CPU/fd 随边数线性增长，恢复累积的 O(N²) 边永不回收）；实现有界剪枝：仅回收恢复面拨出的冗余边，保有 any-one-route 保底与迟滞防振荡；soak 基准验证边数回归基线 | P2-2 |
 | D11 | **群成员多赢家记录 = 决策记录 + 观望**：P1-1 CAS 把静默丢失变显式冲突，多赢家子记录等真实需求 | P2-4 |
 | D12 | **默认 feature 反转为 `redb`**：`json` 需显式；0.1.0 发布说明标 breaking | P2-6 |
 | D13 | **`store_scan_stream` 保留**：补"扩展作者面"定位 rustdoc，保留外部驱动测试 | P2-7 |
@@ -52,8 +52,14 @@
   chat example 被迫用 `provider(Io, TransportConnect)` 冒充"无中继可用"，
   用 `provider(Io, StorageCommit)` 冒充"消息存储失败"。
 - **根因**：`Error` 字段私有，per-kind 构造器全部 `pub(crate)`，`ErrorKind` 未实现 `From` 到 `Error` 的公开路径。
-- **方案草案**（按 D6）：不开放 `Error::new(kind, context)` 全量构造；为调用方起源的
-  失败提供类型化构造入口（单一 caller-error 变体 + 构造器），保留 `provider` 不动。
+- **方案**（按 D6 定案，含 thiserror 采纳）：
+  1. 引入 thiserror 依赖；`Error` 的手写 `Debug`/`Display`/`Error` 三个 impl 改为
+     `#[derive(Debug, Error)]` + `#[error("{context}: {kind:?}")]`；内部错误枚举
+     （`HandshakeError`、`SelectionError`、`LimitedWriteError`、`FailureCaptureError`、
+     `SimulationError`）的手写 `Display` 样板同样 derive 化；kind/context 的 `From`
+     映射表是域逻辑，保留不动；const 构造器保留。
+  2. 为调用方起源的失败提供类型化构造入口（单一 caller-error 变体 + 构造器），
+     保留 `provider` 不动；不开放 `Error::new(kind, context)` 全量构造。
 - **验收**：chat example 的两处冒用替换为正确构造（含 `chat.rs:134-135` 注释与 README
   同步清理）；`public_api` 基线重生成并钉住；全门禁绿。
 - **涉及面**：`error.rs`、ABI 基线、examples/chat。**规模：S**
@@ -213,16 +219,27 @@
 - **验收**：节点数 >16 的规模测试（绑定数量超一页）。
 - **涉及面**：`identity/trust.rs`、`membership/sync.rs`、`protocol/`、规模测试。**规模：L**
 
-### P2-2 拓扑自优化（恢复累积冗余边剪枝）
+### P2-2 拓扑自优化（恢复累积冗余边有界剪枝）
 
-- **状态**：已决策关闭（D10，2026-09-12）：记录决策不实现
-- **问题**：D1 语义下恢复只在隔离时拨号、连通后不剪枝——故障恢复事件会永久累积
-  冗余边（chat e2e 实测：hub 死后叶子互拨的边在 hub 回归后留存；核实：
-  `retire_session` 仅命令/leave/revocation/模拟调用，无自动剪枝路径）。
+- **状态**：待办（D10 重新定案：实施，2026-09-12）
+- **问题**（成本已源码量化）：D1 语义下恢复只在隔离时拨号、连通后不剪枝——故障恢复
+  事件会永久累积冗余边（chat e2e 实测：hub 死后叶子互拨的边在 hub 回归后留存；核实：
+  `retire_session` 仅命令/leave/revocation/模拟调用，无自动剪枝路径）。代价不是审美的：
+  - 反熵 tick 每 250ms 全 peer 扇出（`anti_entropy_interval`，supervisor.rs:158/174，
+    两 plane 各一次 `alive_peers()` 遍历）；
+  - 每 peer 每 tick 每 plane 固定成本：quiet 也要一次存储 scan + 指纹 hash，不 quiet
+    则一页 16 条分发 + 2s ack 等待（D2）；
+  - 每条会话稳态持有：TLS + WebSocket + 有界队列 + 读写任务 + ping watch。
+  流量/CPU/内存/fd 全部随边数线性增长：O(N²) 累积使 16 节点下每节点从 ~4 度
+  漂移到 ~15 度，反熵负载约 ×4。
   功能无损（多跳中继兜底），但长期运行的拓扑会漂移向稠密。
-- **决策**：把"恢复偏好连通性而非最优拓扑"写入契约文档（随 P1-6 rustdoc 指南落）；
-  soak 数据证明边数是实际瓶颈时再立新战役实现有界剪枝。交付物为决策记录（本文档）。
-- **涉及面**：`runtime/recovery.rs` 文档。**规模：S（决策）**
+- **方案**：有界剪枝——标记恢复面拨出的会话；Connected 且度数高于目标拓扑时，
+  周期性、确定性（NodeId 序）、小批量地退役恢复面冗余边；永不剪到断开
+  any-one-route（度数 >1 才动），带迟滞防振荡（两次评估间隔 + 最小存活期）。
+  caller 显式建立的边（直连配置）不回收。
+- **验收**：剪枝收敛测试（故障恢复事件后边数回归基线拓扑）；chat e2e 断言
+  hub 回归后边数下降；soak 基准记录边数与流量变化。
+- **涉及面**：`runtime/recovery.rs`、`runtime/supervisor.rs`、会话来源标记、e2e。**规模：M**
 
 ### P2-3 sync per-key 水位
 
@@ -302,9 +319,9 @@
 | 批次 | 内容 | 依赖 | 收口 |
 | --- | --- | --- | --- |
 | 0 | 计划对账（状态行刷新、决策台账 D6–D13 入档、表述修正） | 无 | 本 commit |
-| A | P0-1（D6 错误构造）、P0-3（CI examples lane）、P1-3（leave 回执 ack） | 0 | 全门禁 |
+| A | P0-1（D6：thiserror 采纳 + 错误构造入口）、P0-3（CI examples lane）、P1-3（leave 回执 ack） | 0 | 全门禁 |
 | B | P1-1（CAS Put，D7）、P1-2（默认 next-hop，含 slo/tests 同步）、P1-4（凭据并发化，D8）、P1-5（rustdoc 补齐） | 0 | 全门禁 + chat/cluster e2e（并发 join 断言） |
-| C | P0-2（soak 基准）、P2-6（默认 feature 反转实施） | A、B | 基准数据入档 + 矩阵全绿 |
+| C | P0-2（soak 基准）、P2-2（有界剪枝实施，D10）、P2-6（默认 feature 反转实施） | A、B | 基准数据入档 + 剪枝收敛 + 矩阵全绿 |
 | D | P2-1（绑定传播分页化，D9 不留 v2）、P2-3（per-key 水位） | C | 规模测试 + e2e 回归 |
 | E | P2-5（KeyProvider crate）、P2-7（rustdoc 定位 + 审计清账） | 无硬依赖 | 新 crate 门禁 + 清账记录 |
 | F | P1-6（rustdoc 指南，含 D10 契约表述）、P2-8（架构文档刷新） | A–E 全部定稿 | `cargo doc` 评审 + 发布说明 |
