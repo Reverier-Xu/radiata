@@ -625,6 +625,7 @@ pub type radiata::PurgeRevocation::Output = ()
 pub struct radiata::PutResource
 impl radiata::PutResource
 pub fn radiata::PutResource::new(radiata::ResourceWrite) -> radiata::Result<Self>
+pub fn radiata::PutResource::with_expected(radiata::ResourceWrite, radiata::ResourceVersion) -> radiata::Result<Self>
 impl radiata::Command for radiata::PutResource
 pub type radiata::PutResource::Output = radiata::ResourceMutationView
 pub struct radiata::QualifiedTag

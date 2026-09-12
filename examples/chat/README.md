@@ -45,9 +45,10 @@ The node binary speaks the same command set over HTTP: `/whoami`,
 
 ## Deliberate example limitations
 
-- Concurrent joins to one group can lose updates (LWW register on the
-  whole record). A real deployment serializes roster changes or builds
-  a multi-winner group record.
+- Concurrent joins to one group retry on explicit conflicts (the join
+  rides a `PutResource::with_expected` precondition, so a raced
+  read-modify-write is visible and retried — never silently lost).
+  A hotly-contended roster can still exhaust the bounded retry budget.
 - Message delivery is at-most-once per attempt with a customer-owned
   retry queue; the library's sync plane is deliberately not used for
   chat traffic.

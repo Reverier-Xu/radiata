@@ -148,6 +148,7 @@ pub(crate) enum Control {
   },
   PutResource {
     write: crate::ResourceWrite,
+    expected: Option<crate::ResourceVersion>,
     reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
   },
   RevokeNode {

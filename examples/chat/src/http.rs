@@ -31,6 +31,11 @@ const TYPE_ANNOUNCE: &str = "chat-announce";
 /// the example caps group rosters instead of inventing a second record kind.
 const MAX_MEMBERS: usize = 16;
 
+/// The bounded retry for a raced group-join read-modify-write: one
+/// attempt per observed concurrent joiner is more than enough headroom
+/// for the 5-node matrix, and a hot roster still fails closed.
+const JOIN_RETRIES: usize = 16;
+
 pub struct AppState {
   pub node: NodeHandle,
   pub node_id: NodeId,
@@ -586,9 +591,11 @@ async fn create_group(
   ))
 }
 
-/// Joins one group: a read-modify-write over the member label. The
-/// register is last-writer-wins, so concurrent joins can lose updates —
-/// the example documents this instead of hiding it.
+/// Joins one group: a read-modify-write over the member label under an
+/// exact-version precondition. A raced join conflicts explicitly and
+/// retries with a fresh read, so concurrent joins no longer lose
+/// updates; the retry bound keeps a hotly-contended roster from
+/// spinning forever.
 async fn join_group(
   state: State<SharedState>, AxumPath(name): AxumPath<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -596,33 +603,40 @@ async fn join_group(
     return Err(bad_request("invalid group name"));
   }
   let full = domain_tag("resources", &format!("group-{name}"));
-  let Some((view, _version)) = get_resource_json(&state, &full).await? else {
-    return Err(not_found("unknown group"));
-  };
-  let mut members = members_of(&view["labels"]);
-  if members.contains(&state.user) {
-    return Ok(Json(
-      json!({"joined": true, "members": members, "already": true}),
-    ));
+  for _attempt in 0..JOIN_RETRIES {
+    let Some((view, version)) = get_resource_json(&state, &full).await? else {
+      return Err(not_found("unknown group"));
+    };
+    let mut members = members_of(&view["labels"]);
+    if members.contains(&state.user) {
+      return Ok(Json(
+        json!({"joined": true, "members": members, "already": true}),
+      ));
+    }
+    if members.len() >= MAX_MEMBERS {
+      return Err(not_found("group is full"));
+    }
+    members.push(state.user.clone());
+    let roster = members.join(",");
+    let owner = view["labels"]
+      .get(format!("{DOMAIN}/labels/owner"))
+      .and_then(Value::as_str)
+      .unwrap_or(&state.user)
+      .to_owned();
+    let labels = group_labels(&roster, &owner, &name).map_err(name_error)?;
+    let put = PutResource::with_expected(
+      ResourceWrite::new(ResourceName::parse(&full).map_err(name_error)?, labels),
+      version,
+    )
+    .map_err(name_error)?;
+    match state.node.command(put).await {
+      Ok(_) => return Ok(Json(json!({"joined": true, "members": members}))),
+      // The precondition lost a race: re-read and rebuild.
+      Err(error) if error.kind() == radiata::ErrorKind::Conflict => continue,
+      Err(error) => return Err(conflict_error(error)),
+    }
   }
-  if members.len() >= MAX_MEMBERS {
-    return Err(not_found("group is full"));
-  }
-  members.push(state.user.clone());
-  let roster = members.join(",");
-  let owner = view["labels"]
-    .get(format!("{DOMAIN}/labels/owner"))
-    .and_then(Value::as_str)
-    .unwrap_or(&state.user)
-    .to_owned();
-  let labels = group_labels(&roster, &owner, &name).map_err(name_error)?;
-  let put = PutResource::new(ResourceWrite::new(
-    ResourceName::parse(&full).map_err(name_error)?,
-    labels,
-  ))
-  .map_err(name_error)?;
-  state.node.command(put).await.map_err(conflict_error)?;
-  Ok(Json(json!({"joined": true, "members": members})))
+  Err(conflict_msg("group join raced past the retry bound"))
 }
 
 async fn list_groups(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {

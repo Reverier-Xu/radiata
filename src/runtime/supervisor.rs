@@ -496,8 +496,12 @@ async fn supervise(
         let result = supervisor.update_node_metadata(expected_revision, patch).await;
         let _ = reply.send(result);
       }
-      Control::PutResource { write, reply } => {
-        let result = supervisor.put_resource(write).await;
+      Control::PutResource {
+        write,
+        expected,
+        reply,
+      } => {
+        let result = supervisor.put_resource(write, expected).await;
         let _ = reply.send(result);
       }
       Control::RevokeNode {
@@ -1367,12 +1371,14 @@ impl Supervisor {
   /// Commits one resource write intent as a signed candidate record
   /// (`PutResource`): the supervisor stamps the host wall-clock
   /// tuple, signs through the node's key provider, and commits the whole
-  /// record in one conditional transaction. A committed winner emits
-  /// exactly one [`crate::ResourceChanged`] after durability; an accepted
-  /// but superseded candidate emits nothing, and an indeterminate commit
-  /// reports `CommitUnknown` without an event.
+  /// record in one conditional transaction. With an `expected` version
+  /// the commit installs only while the stored winner equals it exactly
+  /// — a raced read-modify-write is an explicit conflict (D7). A
+  /// committed winner emits exactly one [`crate::ResourceChanged`] after
+  /// durability; an accepted but superseded candidate emits nothing, and
+  /// an indeterminate commit reports `CommitUnknown` without an event.
   async fn put_resource(
-    &mut self, write: crate::ResourceWrite,
+    &mut self, write: crate::ResourceWrite, expected: Option<crate::ResourceVersion>,
   ) -> Result<crate::ResourceMutationView> {
     self.require_unblocked()?;
     let context = self.context()?;
@@ -1387,10 +1393,23 @@ impl Supervisor {
     let write = &write;
     let labels = &labels;
     let writer = &writer;
+    let expected = &expected;
     let this = &*self;
     let context = &context;
     let (accepted, name, outcome) = with_commit_race_retry("resource put", || {
       Box::pin(async move {
+        // The caller's expected version is the only authority on which
+        // register state the write may replace: a mismatch is final and
+        // never retried (the CAS race guard below covers only the
+        // snapshot-commit window, re-running this check per attempt).
+        if let Some(expected) = expected {
+          let stored = crate::resource::store::read_record_ctx(context.store(), write.name())
+            .await?
+            .ok_or_else(|| Error::not_found("resource"))?;
+          if !expected.matches_record(&stored) {
+            return Ok(CommitRace::Final(Err(Error::conflict("resource version"))));
+          }
+        }
         let timestamp_millis = this.issue_resource_stamp();
         let record = crate::resource::ResourceRecordV1::sign_with_provider(
           write.name().clone(),
@@ -1426,6 +1445,18 @@ impl Supervisor {
       })
     })
     .await?;
+    // A preconditioned write that lost the tuple can no longer be
+    // replacing the expected version: the register moved past it, so the
+    // precondition surfaces as an explicit conflict (D7) instead of a
+    // silently accepted loser.
+    if expected.is_some()
+      && matches!(
+        outcome,
+        crate::resource::store::ResourceCommitOutcome::Superseded(_)
+      )
+    {
+      return Err(Error::conflict("resource version"));
+    }
     Ok(match outcome {
       crate::resource::store::ResourceCommitOutcome::Installed(_) => {
         self

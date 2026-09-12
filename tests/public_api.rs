@@ -846,6 +846,31 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   );
   let _ = (accepted.name(), accepted.labels());
 
+  // The conditional write constructor drives a real cluster: the exact
+  // observed version conditions the write, and the write wins.
+  let conditional = PutResource::with_expected(
+    ResourceWrite::new(
+      ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
+      ResourceLabels::new(
+        LabelValue::parse("document").unwrap(),
+        ResourceUri::parse("file:///pub-api-conditional").unwrap(),
+      )
+      .custom(
+        LabelKey::parse("example.org/labels/lane").unwrap(),
+        LabelValue::parse("two").unwrap(),
+      )
+      .unwrap(),
+    ),
+    version.clone(),
+  )
+  .unwrap();
+  let mutation: ResourceMutationView = issuer.handle.command(conditional).await.unwrap();
+  assert!(mutation.is_current_winner());
+  assert_eq!(
+    mutation.accepted().labels().uri().as_str(),
+    "file:///pub-api-conditional"
+  );
+
   let page: ResourcePage = issuer
     .handle
     .query(PageResources::new(PageSpec::first(8).unwrap()))
