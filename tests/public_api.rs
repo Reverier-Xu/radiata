@@ -696,6 +696,18 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap();
   let expires = issued.expires_at();
   let _ = expires;
+
+  // Non-rotating issue hands out the same live generation: concurrent
+  // joins share it, and only Rotate replaces the credential.
+  let reissued: IssuedMergeCredential = issuer
+    .handle
+    .command(radiata::IssueMergeCredential::new())
+    .await
+    .unwrap();
+  assert_eq!(
+    reissued.credential().expose_secret(),
+    issued.credential().expose_secret()
+  );
   let merge: MergeView = merge_with_retry(
     &member.handle,
     &endpoint,

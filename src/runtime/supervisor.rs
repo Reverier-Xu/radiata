@@ -407,6 +407,10 @@ async fn supervise(
         let result = supervisor.rotate_merge_credential();
         let _ = reply.send(result);
       }
+      Control::IssueMergeCredential { reply } => {
+        let result = supervisor.issue_merge_credential();
+        let _ = reply.send(result);
+      }
       Control::Listen { endpoint, reply } => {
         let result = supervisor.listen(endpoint, &mut tasks).await;
         let _ = reply.send(result);
@@ -902,6 +906,16 @@ impl Supervisor {
       .lock()
       .map_err(|_| Error::internal("join credential issuer"))?
       .rotate(self.dependencies.entropy.as_ref(), SystemTime::now())
+  }
+
+  fn issue_merge_credential(&mut self) -> Result<IssuedMergeCredential> {
+    self.require_unblocked()?;
+    self
+      .driver
+      .issuer()
+      .lock()
+      .map_err(|_| Error::internal("join credential issuer"))?
+      .issue(self.dependencies.entropy.as_ref(), SystemTime::now())
   }
 
   async fn listen(&mut self, endpoint: Endpoint, tasks: &mut JoinSet<()>) -> Result<ListenerView> {

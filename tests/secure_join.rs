@@ -1226,8 +1226,12 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
 /// credential bytes are copied (as they would be after a leak), the second
 /// merge attempt on the same generation is refused without a merge and
 /// without consuming another generation.
+/// Credential copies share one live generation: a second node replaying
+/// the copied credential bytes also merges (D8 — admission is
+/// per-subject, not per-generation), and only rotation retires the
+/// copied text, after which a further copy fails closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn secure_join_copied_credential_cannot_merge_twice() {
+async fn secure_join_copied_credential_shares_generation_until_rotated() {
   let receiver = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(120_000)),
@@ -1255,21 +1259,48 @@ async fn secure_join_copied_credential_cannot_merge_twice() {
   let secret = issued.credential().expose_secret().to_owned();
   let _merge = merge_ok(&joiner.handle, listener.endpoint(), &secret).await;
 
-  // A second node replays the copied credential bytes; the issuer must
-  // refuse without admitting a second subject for the same generation.
+  // A second node replays the copied credential bytes: one live
+  // generation admits any number of distinct subjects.
   let second = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(140_000)),
   )
   .await;
   let copied = MergeCredential::parse(&credential_text).unwrap();
-  let error = second
+  let merge = second
+    .handle
+    .command(MergeCluster::new(listener.endpoint().clone(), copied))
+    .await
+    .unwrap();
+  let receiver_id = receiver
+    .handle
+    .query(GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  assert_eq!(merge.peer(), &receiver_id);
+
+  // Rotation retires the copied generation: a further copy fails closed.
+  receiver
+    .handle
+    .command(RotateMergeCredential::new())
+    .await
+    .unwrap();
+  let third = start(
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+    Arc::new(ScriptedKeys::full_at(150_000)),
+  )
+  .await;
+  let copied = MergeCredential::parse(&credential_text).unwrap();
+  let error = third
     .handle
     .command(MergeCluster::new(listener.endpoint().clone(), copied))
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
 
+  third.handle.command(Shutdown::new()).await.unwrap();
   second.handle.command(Shutdown::new()).await.unwrap();
   joiner.handle.command(Shutdown::new()).await.unwrap();
   receiver.handle.command(Shutdown::new()).await.unwrap();

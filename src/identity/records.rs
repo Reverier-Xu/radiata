@@ -120,14 +120,20 @@ pub(crate) fn identity_binding_key(node: &NodeId) -> Result<(StoreNamespace, Sto
 }
 
 pub(crate) fn credential_use_key(
-  issuer: &NodeId, generation: &GenerationId,
+  issuer: &NodeId, generation: &GenerationId, subject: &NodeId,
 ) -> Result<(StoreNamespace, StoreKey)> {
   // No separator: `NodeId` is fixed-width (base62, exactly
   // `NodeId::TEXT_LEN` characters) and `GenerationId` is a fixed 16
-  // bytes, so the issuer/generation split is unambiguous by position.
-  let mut key = Vec::with_capacity(issuer.as_str().len() + generation.as_bytes().len());
+  // bytes, so the issuer/generation/subject split is unambiguous by
+  // position. The subject scopes the record: one credential generation
+  // may admit many subjects, but each (generation, subject) pair commits
+  // at most one merge (replay is idempotent, conflicting reuse fails).
+  let mut key = Vec::with_capacity(
+    issuer.as_str().len() + generation.as_bytes().len() + subject.as_str().len(),
+  );
   key.extend_from_slice(issuer.as_str().as_bytes());
   key.extend_from_slice(generation.as_bytes());
+  key.extend_from_slice(subject.as_str().as_bytes());
   Ok((
     metadata_namespace(CREDENTIAL_USE_NAMESPACE)?,
     store_key(&key),
@@ -1389,7 +1395,7 @@ mod tests {
       local_identity_key().unwrap(),
       key_creation_intent_key(&operation()).unwrap(),
       identity_binding_key(&node(SUBJECT_NODE)).unwrap(),
-      credential_use_key(&node(ISSUER_NODE), &generation()).unwrap(),
+      credential_use_key(&node(ISSUER_NODE), &generation(), &node(SUBJECT_NODE)).unwrap(),
       merge_grant_key(&merge()).unwrap(),
     ];
 
@@ -1427,13 +1433,15 @@ mod tests {
     );
     assert_eq!(binding_key.as_bytes(), SUBJECT_NODE.as_bytes());
 
-    let (use_namespace, use_key) = credential_use_key(&node(ISSUER_NODE), &generation()).unwrap();
+    let (use_namespace, use_key) =
+      credential_use_key(&node(ISSUER_NODE), &generation(), &node(SUBJECT_NODE)).unwrap();
     assert_eq!(
       use_namespace.as_str(),
       "radiata.woooo.tech/metadata/credential-use-v1"
     );
     let mut expected_use_key = ISSUER_NODE.as_bytes().to_vec();
     expected_use_key.extend_from_slice(&GENERATION_BYTES);
+    expected_use_key.extend_from_slice(SUBJECT_NODE.as_bytes());
     assert_eq!(use_key.as_bytes(), expected_use_key.as_slice());
 
     let (grant_namespace, grant_key) = merge_grant_key(&merge()).unwrap();

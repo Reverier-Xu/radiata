@@ -349,12 +349,29 @@ pub fn admission(input: &[u8]) {
             }
           }
           AdmissionOp::DoubleBook => {
-            if let Some((proposal, _)) = &last {
+            if let Some((proposal, grant)) = &last {
+              // Re-admission: same (generation, subject) pair, fresh
+              // merge id — the committed grant returns idempotently.
+              let Some(merge_id) = MergeId::generate(entropy.as_ref()).ok() else {
+                return Ok(());
+              };
+              let rejoin = MergeProposal::new(
+                proposal.subject().clone(),
+                proposal.subject_key().clone(),
+                proposal.generation().clone(),
+                merge_id,
+              );
+              match commit_merge(&context, &keys.as_provider(), entropy.as_ref(), &rejoin).await {
+                Ok(existing) if existing == *grant => {}
+                other => panic!("re-admission of a committed pair diverged: {other:?}"),
+              }
+              // Conflicting reuse: the same subject with another key
+              // fails closed and never disturbs the committed triple.
               let Some(merge_id) = MergeId::generate(entropy.as_ref()).ok() else {
                 return Ok(());
               };
               let double = MergeProposal::new(
-                node(u128::from(subject_index) + 2_000),
+                proposal.subject().clone(),
                 PublicKey::from_bytes(
                   scripted_signing(subject_index + 4)
                     .verifying_key()
@@ -366,10 +383,10 @@ pub fn admission(input: &[u8]) {
               match commit_merge(&context, &keys.as_provider(), entropy.as_ref(), &double).await {
                 Err(error) => {
                   if error.kind() != ErrorKind::Conflict {
-                    panic!("double-booking must fail closed as Conflict: {error:?}");
+                    panic!("conflicting key reuse must fail closed as Conflict: {error:?}");
                   }
                 }
-                Ok(_) => panic!("a second subject admitted on a consumed generation"),
+                Ok(_) => panic!("a conflicting key reuse of an admitted subject succeeded"),
               }
               // The original admission survives the rejected attempt.
               match merge_state(&context, proposal).await {

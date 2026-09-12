@@ -186,13 +186,14 @@ async fn session_merge_then_member_reconnect_round_trips() {
   assert_eq!(view.peer(), &issuer_id);
   assert_ne!(view.node(), &issuer_id);
 
-  // A fresh merger replaying the consumed credential is rejected; the
-  // first merge already consumed the generation.
+  // A fresh merger replaying the same credential generation succeeds:
+  // one live generation admits any number of subjects (D8); the durable
+  // commit layer owns per-subject replay refusal.
   let second = node().await;
   let (address, second_responder) = listen(&receiver, true).await;
   let mut connection = connect(address).await;
   let hint = connection.merge_hint().unwrap().clone();
-  let error = second
+  let (second_session, second_view) = second
     .driver
     .merge(
       &mut connection,
@@ -200,10 +201,12 @@ async fn session_merge_then_member_reconnect_round_trips() {
       CredentialSecret::from_credential(issued.credential()),
     )
     .await
-    .unwrap_err();
-  assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
+    .unwrap();
+  assert_eq!(second_session.peer(), &issuer_id);
+  assert_ne!(second_view.node(), &issuer_id);
+  assert_ne!(second_view.node(), view.node());
   first_responder.await.unwrap().unwrap();
-  assert!(second_responder.await.unwrap().is_err());
+  assert!(second_responder.await.unwrap().is_ok());
 
   // Member-mode reconnect: no credential, trusted bindings on both sides.
   let (address, member_responder) = listen(&receiver, false).await;
@@ -251,15 +254,17 @@ async fn session_merge_rejects_wrong_credential_without_consuming() {
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
 
-  // Wait for the responder's reservation release before reserving again.
+  // The generation is untouched by the failed proof: the same live
+  // credential remains derivable for the next attempt (no consumption,
+  // no reservation — D8).
   assert!(responder.await.unwrap().is_err());
-  let retry = receiver
-    .issuer
-    .lock()
-    .unwrap()
-    .reserve(std::time::SystemTime::now());
-  assert!(retry.is_ok());
-  receiver.issuer.lock().unwrap().release().unwrap();
+  let guard = receiver.issuer.lock().unwrap();
+  assert!(
+    guard
+      .active_credential(std::time::SystemTime::now())
+      .is_ok()
+  );
+  drop(guard);
 }
 
 fn peer_return_marker(node: &Node) -> crate::NodeId {

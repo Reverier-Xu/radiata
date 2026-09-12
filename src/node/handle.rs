@@ -104,6 +104,12 @@ impl CommandControl for RotateMergeCredential {
   }
 }
 
+impl CommandControl for crate::IssueMergeCredential {
+  fn control(self, reply: oneshot::Sender<Result<IssuedMergeCredential>>) -> Control {
+    Control::IssueMergeCredential { reply }
+  }
+}
+
 impl CommandControl for Listen {
   fn control(self, reply: oneshot::Sender<Result<ListenerView>>) -> Control {
     let endpoint = self.into_endpoint();

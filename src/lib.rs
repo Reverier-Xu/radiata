@@ -63,8 +63,8 @@ pub use node::{
 pub use operation::{
   ApplyReceiptRetention, CleanupNode, Command, ConnectMember, DisconnectPeer, Event, GetLocalNode,
   GetMember, GetNodeStatus, GetObservability, GetRecovery, GetResource, GetRoute, IdentityReplaced,
-  IssueCleanupCheckpoint, LeaveCluster, Listen, MemberChanged, MergeCluster, NodeRevoked,
-  PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
+  IssueCleanupCheckpoint, IssueMergeCredential, LeaveCluster, Listen, MemberChanged, MergeCluster,
+  NodeRevoked, PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
   PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResourceChanged,
   ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources,
   SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,

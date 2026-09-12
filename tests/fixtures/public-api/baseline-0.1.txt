@@ -343,6 +343,11 @@ impl radiata::IssueCleanupCheckpoint
 pub fn radiata::IssueCleanupCheckpoint::new() -> Self
 impl radiata::Command for radiata::IssueCleanupCheckpoint
 pub type radiata::IssueCleanupCheckpoint::Output = u64
+pub struct radiata::IssueMergeCredential
+impl radiata::IssueMergeCredential
+pub fn radiata::IssueMergeCredential::new() -> Self
+impl radiata::Command for radiata::IssueMergeCredential
+pub type radiata::IssueMergeCredential::Output = radiata::IssuedMergeCredential
 pub struct radiata::IssuedMergeCredential
 impl radiata::IssuedMergeCredential
 pub fn radiata::IssuedMergeCredential::credential(&self) -> &radiata::MergeCredential
@@ -993,6 +998,8 @@ impl radiata::Command for radiata::DisconnectPeer
 pub type radiata::DisconnectPeer::Output = ()
 impl radiata::Command for radiata::IssueCleanupCheckpoint
 pub type radiata::IssueCleanupCheckpoint::Output = u64
+impl radiata::Command for radiata::IssueMergeCredential
+pub type radiata::IssueMergeCredential::Output = radiata::IssuedMergeCredential
 impl radiata::Command for radiata::LeaveCluster
 pub type radiata::LeaveCluster::Output = radiata::LeaveOutcome
 impl radiata::Command for radiata::Listen

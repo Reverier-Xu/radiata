@@ -51,6 +51,28 @@ impl Command for RotateMergeCredential {
   type Output = crate::IssuedMergeCredential;
 }
 
+/// Issues the current live join credential generation without rotating
+/// it: the returned credential admits any number of joins until the
+/// generation is rotated or expires (ten minutes), so concurrent joins
+/// share one generation. With no live generation, one is created.
+/// [`RotateMergeCredential`] remains the revocation/upgrade step.
+pub struct IssueMergeCredential {
+  _private: (),
+}
+
+#[allow(clippy::new_without_default)]
+impl IssueMergeCredential {
+  pub fn new() -> Self {
+    Self { _private: () }
+  }
+}
+
+impl private::Sealed for IssueMergeCredential {}
+
+impl Command for IssueMergeCredential {
+  type Output = crate::IssuedMergeCredential;
+}
+
 pub struct Listen {
   endpoint: Endpoint,
 }
