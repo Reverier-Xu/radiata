@@ -5,16 +5,18 @@ use std::sync::Arc;
 
 use axum::{
   Json, Router,
-  extract::{Path as AxumPath, State},
+  extract::{Path as AxumPath, Query, State},
   http::StatusCode,
   routing::{get, post},
 };
 use radiata::{
-  ConnectMember, GetObservability, GetResource, LabelKey, LabelValue, LeaveCluster, MemberPage,
-  MergeCluster, MergeCredential, NodeHandle, NodeId, PageMembers, PageResources, PageSessions,
-  PageSpec, ProtocolTag, PutResource, QualifiedTag, ReplaceIdentityAndDeleteOldCoreMetadata,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RotateMergeCredential, RoutingPolicy,
-  StreamMetadata, StreamPolicy, StreamTarget,
+  CleanupNode, ConnectMember, Digest, GetObservability, GetResource, IssueCleanupCheckpoint,
+  LabelKey, LabelValue, LeaveCluster, MemberPage, MergeCluster, MergeCredential, NodeHandle,
+  NodeId, PageCursor, PageMembers, PageResources, PageSessions, PageSpec, PageTrust, ProtocolTag,
+  PutResource, QualifiedTag, RemoveResource, ReplaceIdentityAndDeleteOldCoreMetadata,
+  ResourceLabels, ResourceName, ResourceUri, ResourceVersion, ResourceWrite, RevokeNode,
+  RotateMergeCredential, RoutingPolicy, Selector, SelectResources, StreamMetadata, StreamPolicy,
+  StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -31,6 +33,54 @@ pub type SharedState = Arc<AppState>;
 
 fn status_tag(name: &str) -> QualifiedTag {
   QualifiedTag::parse(&format!("radiata.woooo.tech/status/{name}")).unwrap()
+}
+
+/// The page bound every demo list lane shares: one caller-visible page
+/// never exceeds the store's own page capacity, so a cursor walk
+/// exercises the exact continuation contract the sync lanes use.
+const PAGE_LIMIT: usize = 64;
+
+fn to_hex(bytes: &[u8]) -> String {
+  bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn from_hex(value: &str) -> Option<Vec<u8>> {
+  if value.len() % 2 != 0 {
+    return None;
+  }
+  (0..value.len())
+    .step_by(2)
+    .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).ok())
+    .collect()
+}
+
+fn bad_request(error: radiata::Error) -> (StatusCode, Json<Value>) {
+  (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()})))
+}
+
+/// Builds one page spec from the demo's query parameters: the cursor is
+/// the hex encoding of the opaque continuation bytes the previous page
+/// returned, and the limit stays inside the shared page bound.
+fn page_spec(
+  limit: Option<usize>, cursor: Option<String>,
+) -> Result<PageSpec, (StatusCode, Json<Value>)> {
+  let limit = limit.unwrap_or(PAGE_LIMIT).clamp(1, PAGE_LIMIT);
+  match cursor {
+    Some(text) if !text.is_empty() => {
+      let bytes = from_hex(&text)
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or_else(|| {
+          (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "malformed cursor"})),
+          )
+        })?;
+      let cursor = PageCursor::from_provider_bytes(bytes.into_boxed_slice().into())
+        .map_err(bad_request)?;
+      PageSpec::after(cursor, limit).map_err(bad_request)
+    }
+    _ => PageSpec::first(limit).map_err(bad_request),
+  }
 }
 
 async fn status(state: State<SharedState>) -> Json<Value> {
@@ -365,14 +415,22 @@ async fn put_resource(
   })))
 }
 
-async fn list_resources(state: State<SharedState>) -> Result<Json<Value>, StatusCode> {
+#[derive(serde::Deserialize)]
+pub struct ListQuery {
+  pub limit: Option<usize>,
+  /// Hex-encoded continuation cursor from the previous page.
+  pub cursor: Option<String>,
+}
+
+async fn list_resources(
+  state: State<SharedState>, Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let spec = page_spec(query.limit, query.cursor)?;
   let page = state
     .node
-    .query(PageResources::new(
-      PageSpec::first(64).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-    ))
+    .query(PageResources::new(spec))
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(internal_error)?;
   let items: Vec<Value> = page
     .items()
     .iter()
@@ -383,7 +441,202 @@ async fn list_resources(state: State<SharedState>) -> Result<Json<Value>, Status
       })
     })
     .collect();
+  Ok(Json(json!({
+    "items": items,
+    "count": items.len(),
+    "next": page.next().map(|cursor| to_hex(cursor.as_bytes())),
+  })))
+}
+
+/// The selector surface: one canonical label-selector expression over
+/// the live resource winners, paged exactly like the full listing.
+#[derive(serde::Deserialize)]
+pub struct SelectRequest {
+  pub selector: String,
+  pub limit: Option<usize>,
+  pub cursor: Option<String>,
+}
+
+async fn select_resources(
+  state: State<SharedState>, Json(request): Json<SelectRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let selector = Selector::parse(&request.selector).map_err(bad_request)?;
+  let spec = page_spec(request.limit, request.cursor)?;
+  let page = state
+    .node
+    .query(SelectResources::new(selector, spec))
+    .await
+    .map_err(internal_error)?;
+  let items: Vec<Value> = page
+    .items()
+    .iter()
+    .map(|view| {
+      json!({
+        "name": view.name().as_str(),
+        "labels": labels_json(view),
+        "version": version_json(view),
+      })
+    })
+    .collect();
+  Ok(Json(json!({
+    "items": items,
+    "count": items.len(),
+    "next": page.next().map(|cursor| to_hex(cursor.as_bytes())),
+  })))
+}
+
+/// Conditional removal: the caller echoes the exact version tuple it
+/// observed, and the removal commits only while that tuple is still the
+/// local winner — a stale request never removes newer metadata.
+#[derive(serde::Deserialize)]
+pub struct RemoveRequest {
+  pub expected: ExpectedVersion,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ExpectedVersion {
+  pub timestamp_millis: u64,
+  pub writer: String,
+  pub digest: String,
+  #[serde(default)]
+  pub removal: bool,
+}
+
+async fn remove_resource(
+  state: State<SharedState>, AxumPath(name): AxumPath<String>,
+  Json(request): Json<RemoveRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let name = ResourceName::parse(&name).map_err(bad_request)?;
+  let writer = NodeId::parse(&request.expected.writer).map_err(bad_request)?;
+  let bytes = from_hex(&request.expected.digest).ok_or_else(|| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": "malformed digest"})),
+    )
+  })?;
+  let digest: [u8; 32] = bytes.try_into().map_err(|_| {
+    (
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": "digest must be 32 bytes"})),
+    )
+  })?;
+  let expected = ResourceVersion::from_parts(
+    std::time::SystemTime::UNIX_EPOCH
+      + std::time::Duration::from_millis(request.expected.timestamp_millis),
+    writer,
+    request.expected.removal,
+    Digest::from_bytes(digest),
+  );
+  let outcome = state
+    .node
+    .command(RemoveResource::new(name, expected))
+    .await
+    .map_err(|error| {
+      // A stale expectation is a conflict, not a server fault: the
+      // caller must re-observe and retry.
+      (
+        StatusCode::CONFLICT,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
+  Ok(Json(json!({
+    "removed": true,
+    "is_winner": outcome.is_current_winner(),
+    "version": version_json(outcome.accepted()),
+  })))
+}
+
+/// The trust plane view: the exact node-to-key bindings this node
+/// verifies signatures against, with each binding's status.
+async fn trust(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let page = state
+    .node
+    .query(PageTrust::new(
+      PageSpec::first(PAGE_LIMIT).map_err(bad_request)?,
+    ))
+    .await
+    .map_err(internal_error)?;
+  let items: Vec<Value> = page
+    .items()
+    .iter()
+    .map(|view| {
+      json!({
+        "node_id": view.node_id().as_str(),
+        "status": format!("{:?}", view.status()).to_lowercase(),
+      })
+    })
+    .collect();
   Ok(Json(json!({"items": items, "count": items.len()})))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SubjectRequest {
+  pub node_id: String,
+}
+
+/// Revokes one identity's exact binding: its sessions close and its
+/// new sessions, admissions, and dials fail closed. Stored metadata
+/// stays eligible for ordinary sync (an authorization boundary, not
+/// content erasure).
+async fn revoke(
+  state: State<SharedState>, Json(request): Json<SubjectRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let subject = NodeId::parse(&request.node_id).map_err(bad_request)?;
+  let page = state
+    .node
+    .query(PageTrust::new(
+      PageSpec::first(PAGE_LIMIT).map_err(bad_request)?,
+    ))
+    .await
+    .map_err(internal_error)?;
+  let binding = page
+    .items()
+    .iter()
+    .find(|view| view.node_id() == &subject)
+    .ok_or_else(|| {
+      (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "no trust binding observed for subject"})),
+      )
+    })?;
+  let outcome = state
+    .node
+    .command(RevokeNode::new(subject, binding.public_key().clone()))
+    .await
+    .map_err(internal_error)?;
+  Ok(Json(json!({
+    "revoked": true,
+    "already": outcome.was_already_revoked(),
+    "subject": outcome.subject().as_str(),
+  })))
+}
+
+/// Issues the convergent issuer-signed cleanup tombstone for one
+/// decommissioned node. Terminal — the deployment owns the decision to
+/// never clean a merely offline node.
+async fn cleanup(
+  state: State<SharedState>, Json(request): Json<SubjectRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let subject = NodeId::parse(&request.node_id).map_err(bad_request)?;
+  state
+    .node
+    .command(CleanupNode::new(subject))
+    .await
+    .map_err(internal_error)?;
+  Ok(Json(json!({"cleaned": true})))
+}
+
+/// Starts a cleanup checkpoint GC epoch at the current wall clock
+/// (max-wins across nodes). Issued only against a converged cluster.
+async fn cleanup_checkpoint(
+  state: State<SharedState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let watermark = state
+    .node
+    .command(IssueCleanupCheckpoint::new())
+    .await
+    .map_err(internal_error)?;
+  Ok(Json(json!({"watermark": watermark})))
 }
 
 /// Opens a one-chunk stream to the first other cluster member and waits
@@ -467,8 +720,13 @@ pub fn router(state: SharedState) -> Router {
     .route("/connect", post(connect))
     .route("/disconnect", post(disconnect))
     .route("/leave", post(leave))
-    .route("/resources/{*name}", get(get_resource).put(put_resource))
     .route("/resources", get(list_resources))
+    .route("/resources/{*name}", get(get_resource).put(put_resource).delete(remove_resource))
+    .route("/resources/select", post(select_resources))
+    .route("/trust", get(trust))
+    .route("/revoke", post(revoke))
+    .route("/cleanup", post(cleanup))
+    .route("/cleanup-checkpoint", post(cleanup_checkpoint))
     .route("/recovery", get(recovery))
     .route("/stream-probe", post(stream_probe))
     .with_state(state)

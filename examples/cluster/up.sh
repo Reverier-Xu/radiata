@@ -22,7 +22,7 @@ podman build -t "$IMAGE" -f Containerfile ../..
 echo "starting n1 (bootstrap)..."
 podman run -d --name n1 --hostname n1 --network "$NETWORK" \
   -v "radiata-data-1:/data" \
-  -e "LISTEN=wss://n1:9443" \
+  -e "LISTEN=wss://n1:9443" -e "RUST_LOG=${RUST_LOG:-info}" \
   -p "$((BASE_HTTP_PORT + 1)):8080" \
   "$IMAGE"
 

@@ -1,0 +1,54 @@
+{
+  "selectors": {
+    "demo.org/labels/value=alpha": [
+      "demo.org/resources/sel-01",
+      "demo.org/resources/sel-02"
+    ],
+    "demo.org/labels/value!=alpha": [
+      "demo.org/resources/sel-03",
+      "demo.org/resources/sel-04",
+      "demo.org/resources/sel-05",
+      "demo.org/resources/sel-06"
+    ],
+    "demo.org/labels/tier in (gold,silver)": [
+      "demo.org/resources/sel-01",
+      "demo.org/resources/sel-02",
+      "demo.org/resources/sel-03"
+    ],
+    "demo.org/labels/tier notin (gold,silver)": [
+      "demo.org/resources/sel-04",
+      "demo.org/resources/sel-05",
+      "demo.org/resources/sel-06"
+    ],
+    "demo.org/labels/tier": [
+      "demo.org/resources/sel-01",
+      "demo.org/resources/sel-02",
+      "demo.org/resources/sel-03",
+      "demo.org/resources/sel-05"
+    ],
+    "!demo.org/labels/tier": [
+      "demo.org/resources/sel-04",
+      "demo.org/resources/sel-06"
+    ],
+    "demo.org/labels/value=alpha demo.org/labels/tier=gold": [
+      "demo.org/resources/sel-01"
+    ],
+    "demo.org/labels/value=absent": []
+  },
+  "removal_propagation_s": 0.4164754150006047,
+  "page_walk_n1": {
+    "pages": 2,
+    "items": 77
+  },
+  "page_walk_n5": {
+    "pages": 2,
+    "items": 77
+  },
+  "page_walk_n9": {
+    "pages": 2,
+    "items": 77
+  },
+  "revoked_subject": "node_fAa339hfmAAlyUYUz8u5a",
+  "cleanup_propagation_s": 2.01548327799901,
+  "checkpoint_watermark": 1789175035843
+}
