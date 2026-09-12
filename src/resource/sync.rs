@@ -160,9 +160,30 @@ pub(crate) async fn resource_sync_tick(
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
   let protocol = ProtocolTag::parse(RESOURCE_SYNC_PROTOCOL)?;
+  let mut acks = Vec::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
-    resource_sync_tick_peer(store, entropy, runtime, peer, state, &protocol).await?;
+    if let Some(ack) =
+      resource_sync_tick_peer(store, entropy, runtime, peer, state, &protocol).await?
+    {
+      acks.push((peer.clone(), ack));
+    }
+  }
+  // Delivery verdicts resolve concurrently: one unreachable peer must
+  // not serialize the round behind its ack wait (that would make the
+  // convergence bound liveness teardown, not the anti-entropy cadence).
+  let verdicts = futures_util::future::join_all(acks.into_iter().map(|(peer, ack)| async move {
+    (peer, crate::sync_common::delivered_within_bound(ack).await)
+  }))
+  .await;
+  for (peer, delivered) in verdicts {
+    if !delivered && let Some(state) = cursors.peers.get_mut(&peer) {
+      // The page never reached the peer's admission (dead session,
+      // timed-out ack): drop the continuation so the next tick
+      // re-delivers from scratch instead of trusting a cursor the peer
+      // may never have seen.
+      state.discard_progress();
+    }
   }
   Ok(())
 }
@@ -176,7 +197,7 @@ async fn resource_sync_tick_peer(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn crate::api::Entropy>,
   runtime: &RuntimeClient, peer: &NodeId, state: &mut crate::sync_common::PeerPageCursor,
   protocol: &ProtocolTag,
-) -> Result<()> {
+) -> Result<Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>> {
   state.arm_full_pass();
   // This peer's next page range fingerprint: the quiet state pays one
   // scan and one hash and skips the emit entirely. The page-round
@@ -189,7 +210,7 @@ async fn resource_sync_tick_peer(
   .await?;
   if state.page_round(page_fp) == crate::sync_common::PageRound::Quiet {
     state.quiet_tick();
-    return Ok(());
+    return Ok(None);
   }
   let page = page_sync::emit_page_ctx(
     store,
@@ -200,8 +221,8 @@ async fn resource_sync_tick_peer(
   tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
   state.record_send(page.cursor());
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
-  let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes).await;
-  Ok(())
+  let ack = crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes)?;
+  Ok(Some(ack))
 }
 
 #[cfg(test)]
@@ -288,35 +309,62 @@ mod tests {
     sessions.lock().unwrap().insert(node(2), entry);
   }
 
-  async fn payload_names(
-    rx: &mut tokio::sync::mpsc::Receiver<crate::packet::OutboundRequest>,
-  ) -> Vec<String> {
-    let mut request = rx.recv().await.expect("dispatched payload");
-    let mut bytes = Vec::new();
-    while let Some(chunk) = request.body.as_mut().next().await {
-      bytes.extend_from_slice(&chunk.unwrap());
+  /// Drains dispatched payloads like a live destination: resolves each
+  /// admission ack (the bounded delivery wait in `send_payload` must
+  /// observe success) and records one entry per delivered page.
+  fn ack_drainer(
+    mut rx: tokio::sync::mpsc::Receiver<crate::packet::OutboundRequest>,
+    delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+  ) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+      while let Some(mut request) = rx.recv().await {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = request.body.as_mut().next().await {
+          bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
+          by: node(2),
+          admitted_at: std::time::SystemTime::now(),
+        }));
+        if let Ok(payload) = ResourceSyncPayload::decode(&bytes)
+          && let Ok(page) = payload.page()
+        {
+          delivered.lock().unwrap().push(
+            page
+              .records()
+              .iter()
+              .map(|record| record.name().as_str().to_owned())
+              .collect(),
+          );
+        }
+      }
+    })
+  }
+
+  async fn wait_for_pages(delivered: &Arc<std::sync::Mutex<Vec<Vec<String>>>>, count: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while delivered.lock().unwrap().len() < count {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "dispatch never arrived"
+      );
+      tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let payload = ResourceSyncPayload::decode(&bytes).unwrap();
-    payload
-      .page()
-      .unwrap()
-      .records()
-      .iter()
-      .map(|record| record.name().as_str().to_owned())
-      .collect()
   }
 
   /// The gap-write convergence contract: a peer whose session drops and
   /// returns must receive every record written while it was gone on its
   /// first post-return round, and a steady unchanged catalog dispatches
   /// nothing at all.
-  #[tokio::test]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_peer_that_missed_a_round_receives_gap_writes_on_the_next_full_pass() {
     let store = open_store().await;
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
     let peer = node(2);
     trust(&store, &node(1), [9; 32]).await;
-    let (runtime, mut cursors, sessions, mut rx) = harness();
+    let (runtime, mut cursors, sessions, rx) = harness();
+    let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    ack_drainer(rx, Arc::clone(&delivered));
 
     // Converge one late-key record to the peer first.
     crate::resource::page::sync::apply_page_ctx(
@@ -340,8 +388,11 @@ mod tests {
       .await
       .unwrap();
     }
-    let names = payload_names(&mut rx).await;
-    assert_eq!(names, vec!["demo.org/resources/z-late".to_owned()]);
+    wait_for_pages(&delivered, 1).await;
+    assert_eq!(
+      delivered.lock().unwrap()[0],
+      vec!["demo.org/resources/z-late".to_owned()]
+    );
 
     // The peer's session drops; an early-key record is written while it
     // is gone; the session returns. The per-peer state was dropped with
@@ -369,14 +420,15 @@ mod tests {
       .await
       .unwrap();
     }
-    let names = payload_names(&mut rx).await;
+    wait_for_pages(&delivered, 2).await;
+    let names = delivered.lock().unwrap()[1].clone();
     assert!(
       names.contains(&"demo.org/resources/a-gap".to_owned()),
       "the gap write must reach the returning peer: {names:?}"
     );
 
     // A steady unchanged catalog dispatches nothing at all.
-    let quiet_before = rx.len();
+    let quiet_before = delivered.lock().unwrap().len();
     {
       let state = cursors.peers.entry(peer.clone()).or_default();
       resource_sync_tick_peer(
@@ -390,11 +442,12 @@ mod tests {
       .await
       .unwrap();
     }
-    assert!(
-      rx.try_recv().is_err(),
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+      delivered.lock().unwrap().len(),
+      quiet_before,
       "a steady catalog must not dispatch anything"
     );
-    let _ = quiet_before;
   }
 
   /// A catalog larger than one page must still reach the steady quiet
@@ -403,13 +456,15 @@ mod tests {
   /// dispatches nothing (a tail-range fingerprint recorded on a
   /// continuation round would make a multi-page catalog resend in full
   /// every tick, never going quiet).
-  #[tokio::test]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_multi_page_catalog_goes_quiet_once_the_pass_completes() {
     let store = open_store().await;
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
     let peer = node(2);
     trust(&store, &node(1), [9; 32]).await;
-    let (runtime, mut cursors, sessions, mut rx) = harness();
+    let (runtime, mut cursors, sessions, rx) = harness();
+    let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    ack_drainer(rx, Arc::clone(&delivered));
     let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap();
 
     // Seed more than one page of records (the default page carries 16).
@@ -434,7 +489,6 @@ mod tests {
 
     // Drive the pass to completion: one dispatch per tick until the
     // cursor drains (ceil(total / limit) dispatches), then silence.
-    let mut requests = Vec::new();
     for _ in 0..(total + 2) {
       {
         let state = cursors.peers.entry(peer.clone()).or_default();
@@ -442,35 +496,24 @@ mod tests {
           .await
           .unwrap();
       }
-      if let Ok(request) = rx.try_recv() {
-        requests.push(request);
-      }
     }
     let expected_passes = total.div_ceil(super::super::page::DEFAULT_RESOURCE_PAGE_LIMIT);
+    // The drainer task consumes the channel concurrently: wait for the
+    // pass to land before asserting, then confirm the pass went quiet.
+    wait_for_pages(&delivered, expected_passes).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
-      requests.len(),
+      delivered.lock().unwrap().len(),
       expected_passes,
       "the pass must deliver each page exactly once, then go quiet"
     );
     // The final dispatches carried the whole seeded catalog.
-    let mut delivered = Vec::new();
-    for mut request in requests {
-      let mut bytes = Vec::new();
-      while let Some(chunk) = request.body.as_mut().next().await {
-        bytes.extend_from_slice(&chunk.unwrap());
-      }
-      let payload = ResourceSyncPayload::decode(&bytes).unwrap();
-      delivered.extend(
-        payload
-          .page()
-          .unwrap()
-          .records()
-          .iter()
-          .map(|record| record.name().as_str().to_owned()),
-      );
+    let mut delivered_names = Vec::new();
+    for page in delivered.lock().unwrap().drain(..) {
+      delivered_names.extend(page);
     }
-    delivered.sort();
+    delivered_names.sort();
     seeded.sort();
-    assert_eq!(delivered, seeded, "every record must reach the peer");
+    assert_eq!(delivered_names, seeded, "every record must reach the peer");
   }
 }

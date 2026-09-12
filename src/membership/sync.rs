@@ -409,10 +409,15 @@ async fn accept_payload(
       }
       .encode()?;
       let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
-      if let Err(error) =
-        crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt).await
-      {
-        tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
+      // The applied receipt: one durable-install confirmation back to
+      // the leaver, best-effort and retried by the announcement budget.
+      // Pre-receipt peers simply never send it. The ack receiver is
+      // dropped: the receipt is a hint, never a trust decision.
+      match crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt) {
+        Ok(_ack) => {}
+        Err(error) => {
+          tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
+        }
       }
     }
     SyncPayload::LeaveApplied { node } => {
@@ -693,8 +698,17 @@ pub(crate) async fn sync_tick(
       "removal tombstones considered for forwarding"
     );
   }
+  let mut pending_acks: Vec<(
+    NodeId,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )> = Vec::new();
+  let mut pending_snapshot_revs: Vec<(NodeId, u64)> = Vec::new();
+  let mut failed_peers: Vec<NodeId> = Vec::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
+    // The snapshot revision this round would mark as delivered; recorded
+    // only after the dispatch is acknowledged (see the verdicts below).
+    let mut pending_snapshot_rev = None;
     state.page.arm_full_pass();
     let page = page_sync::emit_page_ctx(
       store,
@@ -733,11 +747,12 @@ pub(crate) async fn sync_tick(
         state.page.record_send(page.cursor());
       }
     }
-    if snapshot_due {
-      if let Some(snapshot) = &snapshot {
-        state.snapshot_rev = snapshot.revision();
-      }
+    if snapshot_due && let Some(snapshot) = &snapshot {
       state.ticks_since_snapshot_send = 0;
+      // The revision is only recorded after the dispatch below is
+      // acknowledged: an undelivered round must leave the snapshot due
+      // on the next tick, not marked as already delivered.
+      pending_snapshot_rev = Some(snapshot.revision());
     }
     let mut payloads: Vec<&[u8]> = Vec::new();
     if snapshot_due {
@@ -747,23 +762,74 @@ pub(crate) async fn sync_tick(
       payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
     }
     payloads.push(&page_bytes);
-    dispatch_to_peer(peer, &payloads, runtime, entropy, &protocol).await;
-    state.page.count_round();
+    let acks = dispatch_to_peer(peer, &payloads, runtime, entropy, &protocol).await;
+    if acks.is_empty() {
+      // Nothing was queued (the routing queue rejected outright): the
+      // round never left this node.
+      failed_peers.push(peer.clone());
+    } else {
+      state.page.count_round();
+      pending_acks.extend(acks.into_iter().map(|ack| (peer.clone(), ack)));
+      if let Some(revision) = pending_snapshot_rev {
+        pending_snapshot_revs.push((peer.clone(), revision));
+      }
+    }
+  }
+  // Delivery verdicts resolve concurrently: one unreachable peer must
+  // not serialize the round behind its ack wait (that would make the
+  // convergence bound liveness teardown, not the anti-entropy cadence).
+  let verdicts =
+    futures_util::future::join_all(pending_acks.into_iter().map(|(peer, ack)| async move {
+      (peer, crate::sync_common::delivered_within_bound(ack).await)
+    }))
+    .await;
+  let delivered_peers: std::collections::HashSet<NodeId> = verdicts
+    .iter()
+    .filter(|(_, delivered)| *delivered)
+    .map(|(peer, _)| peer.clone())
+    .collect();
+  for (peer, delivered) in verdicts {
+    if !delivered {
+      failed_peers.push(peer);
+    }
+  }
+  for peer in failed_peers {
+    // An unadmitted payload means the peer may hold none of this round:
+    // drop the continuation so the next tick re-delivers the page from
+    // scratch (the snapshot stays due through its unrecorded revision).
+    if let Some(state) = cursors.peers.get_mut(&peer) {
+      state.page.discard_progress();
+    }
+  }
+  for (peer, revision) in pending_snapshot_revs {
+    if delivered_peers.contains(&peer)
+      && let Some(state) = cursors.peers.get_mut(&peer)
+    {
+      state.snapshot_rev = revision;
+    }
   }
   gc_collected_tombstones(store, entropy).await;
   Ok(())
 }
 
-/// The per-tick fan-out to one peer: sends every payload in order,
-/// swallowing individual delivery failures (the snapshot and page resend
-/// cadences heal lost payloads).
+/// The per-tick fan-out to one peer: sends every payload in order and
+/// returns their admission receivers. A payload swallowed by a session
+/// that still looks alive never resolves its receiver, which is exactly
+/// the signal the caller needs to re-deliver from scratch.
 async fn dispatch_to_peer(
   peer: &NodeId, payloads: &[&[u8]], runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>,
   protocol: &ProtocolTag,
-) {
+) -> Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>> {
+  let mut acks = Vec::new();
   for payload in payloads {
-    let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await;
+    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload) {
+      Ok(ack) => acks.push(ack),
+      Err(error) => {
+        tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
+      }
+    }
   }
+  acks
 }
 
 /// The post-round checkpoint GC: collect the
