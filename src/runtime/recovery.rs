@@ -48,6 +48,12 @@ impl Departed {
   }
 }
 
+/// Recovery-tick cooldown between pruning two recovery-dialed redundant
+/// edges: one cut per four 2s ticks (8s) drains a post-partition mesh
+/// gradually enough to observe stability between cuts while still
+/// converging in seconds-to-a-minute on small clusters.
+const RECOVERY_PRUNE_COOLDOWN_TICKS: u32 = 4;
+
 impl Supervisor {
   /// Resolves one live downstream session for a routed first hop through
   /// the node's configured next-hop policy. `Ok(None)` means no policy or
@@ -118,6 +124,63 @@ impl Supervisor {
     }
     Ok(selected)
   }
+  /// Bounded pruning of recovery-accumulated redundant edges (D10).
+  /// While connected, retires at most one recovery-dialed session per
+  /// cooldown, choosing the highest peer id deterministically. An edge is
+  /// pruned only while at least one caller-configured or inbound session
+  /// remains: a node holding only recovery-dialed sessions never prunes
+  /// (those edges are its lifeline), so pruning can never re-isolate the
+  /// node, and a restored primary edge (inbound on this side) gradually
+  /// displaces the recovery mesh. Caller-configured and inbound sessions
+  /// are never reclaimed here.
+  pub(super) fn maybe_prune_recovery_edges(
+    &mut self, direct: &std::collections::BTreeSet<NodeId>,
+  ) -> Result<()> {
+    if self.recovery.state() != crate::membership::recovery::RecoveryState::Connected {
+      return Ok(());
+    }
+    self.prune_cooldown = self.prune_cooldown.saturating_sub(1);
+    if self.prune_cooldown > 0 {
+      return Ok(());
+    }
+    let (marked, unmarked): (Vec<NodeId>, Vec<NodeId>) = {
+      let sessions = self
+        .dependencies
+        .sessions
+        .lock()
+        .map_err(Error::session_table)?;
+      let mut marked = Vec::new();
+      let mut unmarked = Vec::new();
+      for (peer, entry) in sessions.iter() {
+        if !direct.contains(peer) || !entry.alive() {
+          continue;
+        }
+        if entry.recovery_dialed() {
+          marked.push(peer.clone());
+        } else {
+          unmarked.push(peer.clone());
+        }
+      }
+      (marked, unmarked)
+    };
+    // The star-preservation rule: pruning requires a non-recovery edge to
+    // keep this node connected, so the fallback route survives the cut.
+    let Some(victim) = marked.iter().max().cloned() else {
+      return Ok(());
+    };
+    if unmarked.is_empty() {
+      return Ok(());
+    }
+    crate::session::stream::retire_session(&self.dependencies.sessions, &victim)?;
+    self
+      .dependencies
+      .events
+      .emit(crate::SessionChanged::new(victim.clone()));
+    self.prune_cooldown = RECOVERY_PRUNE_COOLDOWN_TICKS;
+    tracing::debug!(peer = %victim.as_str(), "pruned a redundant recovery-dialed edge");
+    Ok(())
+  }
+
   /// The public recovery observation: whether every known online member
   /// has an authenticated path, how many members remain unreachable, and
   /// the next scheduled attempt.
@@ -132,9 +195,10 @@ impl Supervisor {
         .map(crate::time::from_seconds),
     )
   }
-  /// One recovery observation tick: feed the controller the known-online
-  /// set (members this node ever authenticated a session with) and the
-  /// current direct sessions, then dial unreachable members whose
+  /// One recovery observation tick: feed the controller the member-table
+  /// set (the recovery universe) and the current direct sessions, prune
+  /// one redundant recovery-dialed edge per cooldown while connected,
+  /// then — while fully isolated — dial unreachable members whose
   /// endpoints are published, through the configured bounded fan-out
   /// (recovery restores authenticated path connectivity to known members
   /// and quiesces; it never dials strangers or the local node, so it
@@ -243,6 +307,7 @@ impl Supervisor {
     let known: std::collections::BTreeSet<NodeId> = known_members.keys().cloned().collect();
     let now = crate::time::now_seconds();
     self.recovery.observe(&known, &direct);
+    self.maybe_prune_recovery_edges(&direct)?;
     if self.recovery.state() != crate::membership::recovery::RecoveryState::Recovering
       || !self.recovery.due(now)
       || {
@@ -289,7 +354,7 @@ impl Supervisor {
         let transport = Arc::clone(&self.dependencies.transport);
         tokio::spawn(async move {
           let _ = dial_member(
-            transport, driver, sessions, packet, shutdown, receiver, &peer,
+            transport, driver, sessions, packet, shutdown, receiver, &peer, true,
           )
           .await;
           // Release the in-flight slot when the dial resolves, so recovery

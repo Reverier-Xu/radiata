@@ -97,6 +97,16 @@ async fn start_node_inner(
   seed: u64, storage: Arc<MemoryStorageFactory>, echo: Option<Arc<EchoCollector>>,
 ) -> Node {
   let keys = Arc::new(ScriptedKeys::full_at(600_000 + seed * 1_000));
+  start_node_with_keys(seed, storage, keys, echo).await
+}
+
+/// Starts a node over an explicit key provider: restartable identities
+/// share one provider instance across both lifetimes (the persisted key
+/// handle must resolve after the reopen).
+async fn start_node_with_keys(
+  seed: u64, storage: Arc<MemoryStorageFactory>, keys: Arc<ScriptedKeys>,
+  echo: Option<Arc<EchoCollector>>,
+) -> Node {
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage.clone();
   let config = NodeConfig::new()
     .with_anti_entropy_interval(SYNC_INTERVAL)
@@ -783,6 +793,106 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   for node in nodes {
     node.handle.command(Shutdown::new()).await.unwrap();
   }
+}
+
+/// Recovery pruning (D10): losing the hub meshes the leaves through
+/// recovery-dialed edges; the restarted hub re-dials the leaves (marked
+/// on the hub, inbound on the leaves), and each leaf then prunes its
+/// recovery-dialed leaf-leaf edge because an inbound anchor edge keeps
+/// it connected. The hub never prunes its recovery dials while they are
+/// its only sessions. The settled topology returns to the caller-shaped
+/// star with no operator action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
+  init_tracing();
+  let _cluster_gate = cluster_gate().lock().await;
+
+  let hub_storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+  // The hub's identity must survive its restart: one key provider
+  // instance serves both lifetimes (the persisted key handle resolves
+  // after the reopen).
+  let hub_keys = Arc::new(ScriptedKeys::full_at(600_000));
+  let mut nodes = vec![
+    start_node_with_keys(0, hub_storage.clone(), hub_keys.clone(), None).await,
+    start_node(
+      1,
+      Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+    )
+    .await,
+    start_node(
+      2,
+      Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+    )
+    .await,
+  ];
+  for node in &mut nodes {
+    node.id = node_id(node).await;
+    node.endpoint = listen(node).await;
+  }
+  let secret = nodes[0]
+    .handle
+    .command(RotateMergeCredential::new())
+    .await
+    .unwrap()
+    .into_credential()
+    .expose_secret()
+    .to_owned();
+  merge_with_retry(&nodes[1], nodes[0].endpoint.clone(), &secret).await;
+  merge_with_retry(&nodes[2], nodes[0].endpoint.clone(), &secret).await;
+  wait_trust(&nodes, 3, Duration::from_secs(30)).await;
+
+  // Hub loss: both leaves are isolated and mesh through a recovery-dialed
+  // edge.
+  let left_handle = nodes[1].handle.clone();
+  let left_id = nodes[1].id.clone();
+  let right_handle = nodes[2].handle.clone();
+  let right_id = nodes[2].id.clone();
+  nodes[0].handle.command(Shutdown::new()).await.unwrap();
+  wait_until(
+    move || {
+      let left_handle = left_handle.clone();
+      let right_handle = right_handle.clone();
+      let left_id = left_id.clone();
+      let right_id = right_id.clone();
+      Box::pin(async move {
+        let meshed = topology_edges_by(&left_handle, &right_id).await
+          || topology_edges_by(&right_handle, &left_id).await;
+        meshed.then_some(())
+      })
+    },
+    Duration::from_secs(120),
+  )
+  .await;
+
+  // The hub restarts with the same identity and re-dials the leaves
+  // through recovery; its dials are marked on the hub and inbound on the
+  // leaves.
+  let mut hub = start_node_with_keys(0, hub_storage, hub_keys, None).await;
+  hub.id = node_id(&hub).await;
+  hub.endpoint = listen(&hub).await;
+  let _ = hub.handle.command(StartRecovery::new()).await;
+  nodes[0] = hub;
+
+  // The leaves prune the redundant recovery edge once the hub edge
+  // anchors them; the settled topology is the caller-shaped star with
+  // exactly two edges and no leaf-leaf link.
+  let expected: std::collections::BTreeSet<(u8, u8)> = [(0, 1), (0, 2)].into_iter().collect();
+  wait_settled(&nodes, &expected, Duration::from_secs(120)).await;
+
+  for node in nodes {
+    node.handle.command(Shutdown::new()).await.unwrap();
+  }
+}
+
+/// Whether the node currently reports a connected session to `peer`.
+async fn topology_edges_by(handle: &NodeHandle, peer: &radiata::NodeId) -> bool {
+  handle
+    .query(PageTopology::new(PageSpec::first(64).unwrap()))
+    .await
+    .unwrap()
+    .items()
+    .iter()
+    .any(|edge| edge.connected() && edge.destination() == peer)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

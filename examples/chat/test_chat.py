@@ -299,6 +299,12 @@ def phase_hub_death_recovery(report: dict) -> None:
     assert back["state"] == "sent", "the hub edge is direct again"
     http("GET", 1, "/messages?unread=true")
     wait_outbox_state(2, back["msg_id"], "read")
+    # Recovery pruning (D10): the leaf-leaf edges the outage accumulated
+    # are retired once the hub edge anchors each leaf again; every leaf
+    # settles back to exactly one session (the hub).
+    wait(lambda: all(sessions_via_status(node) == 1 for node in range(2, N + 1)),
+         "recovery-pruned edges settle back to the star (one session per leaf)",
+         deadline_s=180)
     report["hub_death_recovery"] = "isolated-queued-reconnected-through-another-member-flushed"
     print("[hub loss] isolate queued both ways, recovered via another member, flushed, receipted")
 

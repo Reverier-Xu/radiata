@@ -671,6 +671,8 @@ pub(super) struct Supervisor {
   >,
   pub(super) recovery: crate::membership::recovery::RecoveryController,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  /// Recovery-tick cooldown before the next redundant-edge cut (D10).
+  pub(super) prune_cooldown: u32,
   pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
   /// Memoized departed-members exclusion set, keyed by the store
   /// revision it was computed at: the set only changes when a leave or
@@ -860,6 +862,7 @@ impl Supervisor {
       listeners: BTreeMap::new(),
       recovery,
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+      prune_cooldown: 0,
       published_endpoints,
       exclusion_cache: std::sync::Mutex::new(None),
       resource_write_clock: std::sync::atomic::AtomicU64::new(0),
@@ -984,6 +987,7 @@ impl Supervisor {
                 crate::session::stream::DialDirection::Incoming,
                 attachment.clone(),
                 None,
+                false,
               )
               .await;
             }
@@ -1086,6 +1090,7 @@ impl Supervisor {
       sessions,
       shutdown,
       receiver,
+      false,
       |session_task| {
         tasks.spawn(session_task);
       },
@@ -1112,6 +1117,7 @@ impl Supervisor {
       shutdown,
       receiver,
       &peer,
+      false,
     )
     .await
   }
@@ -1872,10 +1878,11 @@ impl Supervisor {
 /// and exporter binding, then the session is kept open for packet streams.
 /// Called by `connect_member` and by the recovery controller's detached
 /// dial tasks.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dial_member(
   transport: Arc<dyn Transport>, driver: SessionDriver,
   sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
-  shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId,
+  shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId, recovery_dialed: bool,
 ) -> Result<NodeId> {
   // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
   // at join (same-listener reconnects); without an anchor this process
@@ -1900,6 +1907,7 @@ pub(super) async fn dial_member(
     sessions,
     shutdown,
     receiver,
+    recovery_dialed,
     |session_task| {
       tokio::spawn(session_task);
     },
@@ -1912,10 +1920,12 @@ pub(super) async fn dial_member(
 /// outbound session pump through the caller's spawner and returns only
 /// after the session table registers the entry, so the caller's first
 /// packet cannot race registration.
+#[allow(clippy::too_many_arguments)]
 async fn keep_outbound_session(
   connection: crate::transport::connection::Connection,
   session: crate::session::EstablishedSession, packet: Arc<SessionPacketContext>,
   sessions: SessionTable, shutdown: watch::Receiver<()>, attachment: Endpoint,
+  recovery_dialed: bool,
   spawn: impl FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
 ) -> Result<()> {
   let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
@@ -1928,6 +1938,7 @@ async fn keep_outbound_session(
     crate::session::stream::DialDirection::Outgoing,
     attachment,
     Some(registered_tx),
+    recovery_dialed,
   )));
   if registered_rx.await.is_err() {
     return Err(Error::internal("session registration"));

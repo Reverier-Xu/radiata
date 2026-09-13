@@ -461,6 +461,10 @@ pub(crate) struct SessionEntry {
   pub(crate) meta: Arc<SessionMeta>,
   alive: Arc<AtomicBool>,
   direction: DialDirection,
+  /// Whether the recovery plane (not the caller) dialed this session:
+  /// pruning only ever retires recovery-dialed edges — caller-configured
+  /// and inbound sessions are never reclaimed by the pruning pass.
+  recovery_dialed: bool,
   retire: watch::Sender<()>,
 }
 
@@ -468,6 +472,12 @@ impl SessionEntry {
   /// Whether the session's reader loop is still serving the connection.
   pub(crate) fn alive(&self) -> bool {
     self.alive.load(Ordering::SeqCst)
+  }
+
+  /// Whether the recovery plane dialed this session (prunable on
+  /// redundancy; see the bounded pruning pass in the recovery tick).
+  pub(crate) fn recovery_dialed(&self) -> bool {
+    self.recovery_dialed
   }
 
   /// The queued outbound frame count (runtime status view).
@@ -498,7 +508,7 @@ impl SessionEntry {
 pub(crate) async fn run_session(
   connection: Connection, session: EstablishedSession, context: Arc<SessionPacketContext>,
   table: SessionTable, shutdown: watch::Receiver<()>, direction: DialDirection,
-  attachment: crate::Endpoint, registered: Option<oneshot::Sender<()>>,
+  attachment: crate::Endpoint, registered: Option<oneshot::Sender<()>>, recovery_dialed: bool,
 ) {
   let peer = session.peer().clone();
   let (writer, mut reader) = connection.into_split();
@@ -544,6 +554,7 @@ pub(crate) async fn run_session(
     }),
     alive: Arc::clone(&alive),
     direction,
+    recovery_dialed,
     retire: retire_tx,
   };
   {
@@ -1559,6 +1570,7 @@ pub(crate) fn test_entry(entropy: &dyn crate::api::Entropy) -> (SessionEntry, Bo
     }),
     alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     direction: DialDirection::Outgoing,
+    recovery_dialed: false,
     retire: watch::channel(()).0,
   };
   (entry, receiver)
@@ -1965,6 +1977,7 @@ mod pending_admission_tests {
       }),
       alive: Arc::new(AtomicBool::new(true)),
       direction: DialDirection::Outgoing,
+      recovery_dialed: false,
       retire,
     }
   }
