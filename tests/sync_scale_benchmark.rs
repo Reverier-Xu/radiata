@@ -279,3 +279,120 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
     node.handle.command(Shutdown::new()).await.unwrap();
   }
 }
+
+/// The trust-binding page limit exercised at scale: 70 members mean the
+/// issuer's snapshot holds 70 bindings (one over the 64-binding page
+/// limit), so full trust convergence requires two trust pages per peer.
+#[ignore = "explicit benchmark: cargo test --release --test sync_scale_benchmark -- --ignored --nocapture"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn sync_bindings_over_page_limit_converge_through_two_pages() {
+  init_tracing();
+  let peers = 70_usize;
+  let mut nodes = vec![start(0).await];
+  let secret = nodes[0]
+    .handle
+    .command(RotateMergeCredential::new())
+    .await
+    .unwrap()
+    .into_credential()
+    .expose_secret()
+    .to_owned();
+  for index in 1..peers as u64 {
+    let member = start(index).await;
+    // NotReady (a prior merge's reconcile still in flight) is the
+    // documented typed-transient merge failure: bounded retry is the
+    // caller contract here, and correctness is asserted after
+    // convergence below, not by any single attempt passing.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+      let credential = radiata::MergeCredential::parse(&secret).unwrap();
+      match member
+        .handle
+        .command(MergeCluster::new(nodes[0].endpoint.clone(), credential))
+        .await
+      {
+        Ok(_) => break,
+        Err(error) => {
+          assert!(
+            Instant::now() < deadline,
+            "merge never succeeded for member {index}: {error:?}"
+          );
+          tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+      }
+    }
+    nodes.push(member);
+  }
+
+  // Trust convergence: every member's PageTrust shows all `peers`
+  // bindings (its own + every other member) — the issuer's snapshot
+  // (70 bindings) pages through two wire pages per peer. One poll
+  // round over all members, then a single wait between rounds.
+  let expected = peers;
+  let started = Instant::now();
+  let deadline = started + Duration::from_secs(30 * 60);
+  loop {
+    let mut pending = 0_usize;
+    for node in &nodes {
+      let trust = node
+        .handle
+        .query(radiata::PageTrust::new(PageSpec::first(64).unwrap()))
+        .await
+        .unwrap();
+      let mut seen = trust.items().len();
+      if let Some(cursor) = trust.next() {
+        let second_page = node
+          .handle
+          .query(radiata::PageTrust::new(
+            PageSpec::after(cursor.clone(), 64).unwrap(),
+          ))
+          .await
+          .unwrap();
+        seen += second_page.items().len();
+      }
+      if seen != expected {
+        pending += 1;
+      }
+    }
+    if pending == 0 {
+      break;
+    }
+    if started.elapsed().as_secs() % 30 < 1 {
+      let mut counts = Vec::new();
+      for node in &nodes {
+        let trust = node
+          .handle
+          .query(radiata::PageTrust::new(PageSpec::first(64).unwrap()))
+          .await
+          .unwrap();
+        let mut seen = trust.items().len();
+        if let Some(cursor) = trust.next() {
+          let second_page = node
+            .handle
+            .query(radiata::PageTrust::new(
+              PageSpec::after(cursor.clone(), 64).unwrap(),
+            ))
+            .await
+            .unwrap();
+          seen += second_page.items().len();
+        }
+        counts.push(seen);
+      }
+      counts.sort();
+      eprintln!("PROBE pending={pending} counts={counts:?}");
+    }
+    assert!(
+      Instant::now() < deadline,
+      "trust never converged to {expected} ({pending} members short)"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+  }
+  println!(
+    "cell peers={peers} bindings={expected} (two pages) converge={:.1}s",
+    started.elapsed().as_secs_f64(),
+  );
+
+  for node in nodes {
+    node.handle.command(Shutdown::new()).await.unwrap();
+  }
+}
