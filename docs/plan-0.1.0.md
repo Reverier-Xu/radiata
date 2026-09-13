@@ -252,7 +252,11 @@
 
 ### P2-1 绑定传播协议改造（per-binding 事件 + revision 游标）
 
-- **状态**：待办（D9 定案：不留 v2）
+- **状态**：已完成（10d306d + 7df5d74；按 D9 直接删除整集 wire 形态，新分页设计继承 v1；
+  接收端逐页采纳 + issuer key 校验；发送端 per-peer keyset 游标一 tick 一页，
+  空页关 pass 才记 revision；tombstone 拆独立重发节奏；会话消费者失败补
+  warn 日志；规模验收：70 成员星型 70 绑定双页传播 3.6s 全收敛，
+  cleanup/lifecycle e2e 回归绿）
 - **来源**：archive/snapshot-analysis.md §2.2 债务 1、§4.3
 - **问题**（核实修正）：`TrustSnapshotV1` 是"整集快照"传播单元：无 64 KiB 发射阶梯
   （≈870 绑定饱和；超限不再令 tick 失败——P0-4 已修复，但快照发送会持续跳过，
