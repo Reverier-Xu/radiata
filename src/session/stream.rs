@@ -1159,6 +1159,16 @@ async fn admit_open(
         debug!(trace_id = %consumer_trace, "incoming consumer spawned");
         consumers.spawn(async move {
           let result = consumer.accept(packet).await;
+          if let Err(error) = &result {
+            // An admitted stream whose consumer failed is an operational
+            // anomaly (decode failure, store fault): surfaced at warn so
+            // it is visible above the protocol's trace/debug traffic.
+            warn!(
+              trace_id = %consumer_trace,
+              kind = ?error.kind(),
+              "packet consumer failed"
+            );
+          }
           debug!(
             trace_id = %consumer_trace,
             ok = result.is_ok(),
