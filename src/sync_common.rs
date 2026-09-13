@@ -98,8 +98,8 @@ pub(crate) fn send_payload(
 /// Resolves one dispatched payload's admission within [`SEND_ACK_WAIT`].
 /// A dead session resolves immediately; a rejecting one returns the
 /// typed failure; a half-dead one (the session still queues but nothing
-/// crosses) surfaces as the timeout. Every outcome except the ack means
-/// the caller must re-deliver from scratch on the next tick.
+/// crosses) surfaces as the timeout. Every outcome except the ack makes
+/// the caller re-send the failed page on the next tick.
 pub(crate) async fn delivered_within_bound(
   ack: tokio::sync::oneshot::Receiver<RoutedAckOutcome>,
 ) -> bool {
@@ -138,23 +138,43 @@ mod tests {
     assert!(!delivered_within_bound(ack).await);
   }
 
-  /// A delivery failure must heal within one tick: the discarded peer
-  /// state makes the next round re-deliver from scratch unconditionally,
-  /// regardless of the recorded fingerprint.
+  /// A delivery failure heals within one tick by re-sending exactly the
+  /// failed page: the continuation rewinds to the page's start (acked
+  /// predecessors stay delivered), and the forced resend-due state makes
+  /// the retry fire immediately regardless of the recorded fingerprint.
   #[test]
-  fn discarded_progress_re_delivers_from_scratch_on_the_next_round() {
+  fn discarded_progress_re_sends_the_failed_page_on_the_next_round() {
     let mut state = PeerPageCursor::default();
+    // First page (from scratch): its start is the empty continuation.
     assert_eq!(state.page_round(7), PageRound::Send);
     state.record_send(Some(&[9, 9]));
-    // A steady catalog with the old state stays quiet until the resend
-    // cadence; the discard forces the send immediately.
-    assert_eq!(state.page_round(7), PageRound::Send);
+    // Second page dispatched from cursor [9, 9]: its failure rewinds to
+    // [9, 9], not to scratch.
+    state.discard_progress();
+    assert_eq!(
+      state.continuation(),
+      None,
+      "first-page failure rewinds to scratch"
+    );
+
+    // Mid-pass failure: page two's start is cursor [9, 9].
+    state.record_send(Some(&[9, 9]));
+    state.record_send(Some(&[4, 4]));
+    state.discard_progress();
+    assert_eq!(
+      state.continuation(),
+      Some(&[9, 9][..]),
+      "mid-pass failure rewinds to the failed page's start"
+    );
+    assert_eq!(
+      state.page_round(7),
+      PageRound::Send,
+      "continuation round always sends"
+    );
+
+    // A settled catalog goes quiet after a complete pass.
     state.record_send(None);
     assert_eq!(state.page_round(7), PageRound::Quiet);
-
-    state.discard_progress();
-    assert_eq!(state.continuation(), None);
-    assert_eq!(state.page_round(7), PageRound::Send);
   }
 
   /// A payload above the 32 KiB chunk bound splits into pump-legal
@@ -206,6 +226,12 @@ pub(crate) struct PeerPageCursor {
   /// This peer's page continuation cursor, so sync converges beyond a
   /// single page.
   page: Option<Vec<u8>>,
+  /// The continuation the last dispatched page was emitted from: an
+  /// undelivered page rewinds to exactly this point — the failed page
+  /// is re-sent, not the whole prefix (acked pages are already durable
+  /// on the peer and re-sending them under load turns convergence into
+  /// a random walk that stalls deep catalogs).
+  page_start: Option<Vec<u8>>,
 }
 
 /// One page-plane round outcome for a peer.
@@ -266,20 +292,22 @@ impl PeerPageCursor {
     self.rounds_since_full = self.rounds_since_full.saturating_add(1);
   }
 
-  /// Records one dispatched page: advances the continuation cursor and
-  /// resets the page resend cadence.
+  /// Records one dispatched page: advances the continuation cursor,
+  /// remembers where the page started (for a single-page re-send on
+  /// delivery failure), and resets the page resend cadence.
   pub(crate) fn record_send(&mut self, next_cursor: Option<&[u8]>) {
+    self.page_start = self.page.take();
     self.page = next_cursor.map(|value| value.to_vec());
     self.ticks_since_page_send = 0;
   }
 
-  /// Drops all continuation progress after an undelivered page: the
-  /// next round re-delivers from scratch unconditionally, exactly like
-  /// a returning session's first tick. Forcing the resend-due state
-  /// (instead of relying on the fingerprint) is what makes a delivery
-  /// failure heal within one tick on an otherwise quiet peer.
+  /// Rewinds the continuation to the start of the undelivered page: the
+  /// next round re-sends exactly that page — acked predecessors stay
+  /// delivered — and the forced resend-due state makes the retry fire on
+  /// the next tick even on an otherwise quiet peer. A failure on the
+  /// first page of a pass rewinds to scratch.
   pub(crate) fn discard_progress(&mut self) {
-    self.page = None;
+    self.page = self.page_start.take();
     self.ticks_since_page_send = Self::PAGE_RESEND_TICKS;
   }
 

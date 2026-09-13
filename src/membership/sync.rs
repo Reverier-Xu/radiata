@@ -820,8 +820,8 @@ pub(crate) async fn sync_tick(
   }
   for peer in failed_peers {
     // An unadmitted payload means the peer may hold none of this round:
-    // drop the continuation so the next tick re-delivers the page from
-    // scratch (the snapshot stays due through its unrecorded revision).
+    // rewind to the failed page's start so the next tick re-sends exactly
+    // that page (the snapshot stays due through its unrecorded revision).
     if let Some(state) = cursors.peers.get_mut(&peer) {
       state.page.discard_progress();
     }

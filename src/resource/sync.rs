@@ -179,9 +179,9 @@ pub(crate) async fn resource_sync_tick(
   for (peer, delivered) in verdicts {
     if !delivered && let Some(state) = cursors.peers.get_mut(&peer) {
       // The page never reached the peer's admission (dead session,
-      // timed-out ack): drop the continuation so the next tick
-      // re-delivers from scratch instead of trusting a cursor the peer
-      // may never have seen.
+      // timed-out ack): rewind to the failed page's start so the next
+      // tick re-sends exactly that page — acked predecessors stay
+      // delivered and convergence never re-walks the prefix.
       state.discard_progress();
     }
   }
