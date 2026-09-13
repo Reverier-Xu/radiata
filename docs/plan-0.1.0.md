@@ -67,18 +67,19 @@
 
 ### P0-2 ack 投递语义的规模化验证（soak）
 
-- **状态**：待办
+- **状态**：已完成（9f31d0b；`tests/sync_scale_benchmark.rs` 释放模式基准 + 数据入档）
 - **问题**：D2 引入"每页一次回执 + 2s 有界等待"的新流量形态。小集群已验证正确性，
   但千级资源 × 多对端下的时延/带宽影响未量化；包泵的逐请求串行 admission
   在高并发回执等待下是否成为瓶颈未知。
-- **方案草案**：扩展 `tests/latency_benchmark.rs` / soak 场景：
-  1) 基线重测（对齐 archive/benchmark-loopback.md 的方法）；
-  2) 512–4096 资源 × 8–16 对端的反熵收敛与稳态流量测量；
-  3) 注入慢对端（人为延迟 ack）验证 2s 上限不引发级联超时。
-  视结果决定：`SEND_ACK_WAIT` 是否参数化进 `NodeConfig`；重发节奏是否需要自适应。
-- **验收**：基准数据入档（替换归档的 benchmark-loopback 结论）；
-  若触发参数化，附带配置项 + 测试。
-- **涉及面**：`tests/latency_benchmark.rs`、`tests/soak.rs`、可能的 `config.rs`。**规模：M**
+- **实测结论**（loopback，16 workers，redb 存储语义）：
+  - 收敛矩阵：8×512=6.0s，16×512=16.0s，8×2048=28.1s，**16×4096=52.4s**；
+  - 全矩阵零 Overloaded、稳态队列排空：`SEND_ACK_WAIT` 2s 上限**无需参数化**；
+  - flapping-leaf 格与干净格同速（6.0s）：单叶会话抖动不拖累整轮（D2 结论保持）；
+  - 深目录下的交付失败重扫是此前 16×4096 停滞的真因，已由单页回退修复消除；
+    MemoryStorage 基座的 snapshot 全量克隆在基准中污染量度（hub 每 tick 30 次
+    O(n) 克隆争全局锁），基准改用 redb（生产语义、MVCC O(1) snapshot）后消失。
+- **验收**：基准数据入档（本条目即台账；替换归档的 benchmark-loopback 结论）✓。
+- **涉及面**：`tests/sync_scale_benchmark.rs`（新增）、`sync_common.rs` 单页回退。**规模：M**
 
 ### P0-3 examples 纳入 CI 门禁
 
@@ -175,9 +176,9 @@
 
 ### P1-5 恢复退避参数复审 + RecoveryView 语义文档
 
-- **状态**：文档部分已完成（b98bdc3；`is_connected`/`unreachable_members`/`next_attempt_at`
-  与 `RecoveryConfig` 的 rustdoc 已按 any-one-route 语义补齐）；默认值校准随批次 C
-  的 P0-2 soak 数据一并收口
+- **状态**：已完成（b98bdc3；rustdoc 按 any-one-route 语义补齐。参数复审结论：恢复默认值
+  未出现在实测瓶颈路径上——收敛由 sync 平面节奏主导，恢复默认值维持现状；
+  benchmark 中 2s initial / 60s max 表现良好）
 - **问题**（核实修正）：D1/D5 落地后，`RecoveryConfig` 默认值（neighbors 4 / fan-out 64 /
   initial 1s / max 5min，`config.rs:320-323`）的合理性未复审。公开视图字段为
   `unreachable_members`（`view.rs:867`，映射内部 `pending_count` 诊断计数，**不等于**失联）
