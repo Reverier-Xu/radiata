@@ -33,17 +33,17 @@ require_lane "adoption boundary" 'identity_records_merge_adoption_commits_and_re
 require_lane "journal recovery" 'identity_records_merge_pending_journal_recovers_after_reopen' "$TMP/merge.list"
 cargo test --locked --all-features --lib identity::merge
 
-# Credential lane: wrong credential, single-use, rate window,
+# Credential lane: wrong credential, generation reuse, rate window,
 # and stopped-listener guardrails over the real loopback handshake.
 cargo test --locked --all-features --test secure_join -- --list > "$TMP/secure.list"
 require_lane "wrong credential" 'secure_join_wrong_credential_fails_without_merge' "$TMP/secure.list"
-require_lane "single use" 'secure_join_copied_credential_cannot_merge_twice' "$TMP/secure.list"
+require_lane "generation reuse" 'secure_join_copied_credential_shares_generation_until_rotated' "$TMP/secure.list"
 require_lane "rate window" 'secure_join_merge_rate_window_refuses_before_signing' "$TMP/secure.list"
 require_lane "listener stop" 'secure_join_merge_after_listener_stop_fails_closed' "$TMP/secure.list"
 for lane in \
   secure_join_completes_exporter_bound_merge_and_persists_binding \
   secure_join_wrong_credential_fails_without_merge \
-  secure_join_copied_credential_cannot_merge_twice \
+  secure_join_copied_credential_shares_generation_until_rotated \
   secure_join_merge_rate_window_refuses_before_signing \
   secure_join_merge_after_listener_stop_fails_closed; do
   cargo test --locked --all-features --test secure_join "$lane" -- --exact
