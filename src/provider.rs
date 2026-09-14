@@ -694,10 +694,18 @@ pub trait StoreScan: fmt::Debug + Send {
   fn next<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<StoreEntry>>>;
 }
 
-/// Converts one provider [`StoreScan`] into the standard stream view:
-/// consumers compose scans with the ecosystem stream combinators while
-/// providers keep implementing the explicit cursor [`StoreScan::next`].
-/// Items preserve scan order and the crate's typed error.
+/// Converts one provider [`StoreScan`] into the standard stream view.
+///
+/// **This is the extension-author surface.** Custom storage providers
+/// implement the explicit cursor [`StoreScan::next`]; this bridge adapts
+/// it to `Stream<Item = Result<StoreEntry>>` so ecosystem stream
+/// combinators compose over provider scans without the crate itself
+/// taking a stream-runtime dependency. The crate has zero internal
+/// callers by design — the boundary exists for code outside the crate —
+/// and an external-driver integration test
+/// (`store_scan_stream_is_externally_drivable`) pins the contract:
+/// items, order, end-of-scan, and the typed error match an explicit
+/// `next()` loop exactly.
 pub fn store_scan_stream(
   scan: Box<dyn StoreScan + '_>,
 ) -> futures_core::stream::BoxStream<'_, Result<StoreEntry>> {

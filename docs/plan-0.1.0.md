@@ -221,7 +221,9 @@
 
 ### P1-8 反轮子清账（2026-09-12 五分区全量审计）
 
-- **状态**：待办
+- **状态**：已完成（commit_verdict 单源、SessionDriver::initiate 提取、
+  fail_pending_waits 提取、FeatureOffer::finalize 提取、verify_strict_message
+  删除、selector 类别常量、trust 解码 fixed_bytes、to_ipv4_mapped）
 - **来源**：五分区并行代码审计（protocol / identity / transport-session /
   storage-runtime / facade-crosscut），全部 P2 已逐条抽查行号属实。审计同时确认
   hex/canonical CBOR/WriterLock/base62/宏族/EventHub/三处语义各异退避等为**合理自造**，
@@ -401,7 +403,10 @@
 
 ### P2-7 store_scan_stream 定位声明 + 审计性能/规模项清账
 
-- **状态**：已决策（D13，2026-09-12）：保留导出；rustdoc 待补
+- **状态**：已完成（rustdoc 定位声明：扩展作者面、零内部调用者为设计、
+  外部驱动测试钉住契约；审计“未修（有意保留）”清单逐条核对——
+  store_scan_stream 已清账、TrustSnapshotV1 手写豁免已有记录、其余三项早前已修，
+  无未归属遗留项；D13 保留导出的决策不变）
 - **来源**：archive/audit-findings.md（"性能与规模项与 store_scan_stream 公开面保留待后续"）
 - **问题**：`store_scan_stream` 公开导出（自定义存储适配器作者的 Stream 桥接缝隙，
   10 行 try_unfold，库内零调用是有意设计）但 rustdoc 无定位声明；
