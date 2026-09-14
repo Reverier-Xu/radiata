@@ -1,13 +1,13 @@
 {
   "writes": 30,
-  "converge_p50_ms": 8486.349171998882,
-  "converge_p90_ms": 16064.782147001097,
-  "converge_p99_ms": 16782.2871319986,
-  "converge_max_ms": 16782.2871319986,
-  "local_get_p50_ms": 0.47164700663415715,
-  "stream_probe_p50_ms": 0.177,
+  "converge_p50_ms": 15737.663813000836,
+  "converge_p90_ms": 16643.788526002027,
+  "converge_p99_ms": 17175.418612001522,
+  "converge_max_ms": 17175.418612001522,
+  "local_get_p50_ms": 0.47503099631285295,
+  "stream_probe_p50_ms": 0.173,
   "stream_probe_ok": 30,
-  "crash_recovery_s": 9.652909472999454,
+  "crash_recovery_s": 9.70118862399977,
   "observability": {
     "1": {
       "members": 9,
@@ -29,7 +29,7 @@
     },
     "4": {
       "members": 9,
-      "sessions": 5,
+      "sessions": 4,
       "store_available": 1,
       "trace_records_dropped": 0
     },
@@ -41,7 +41,7 @@
     },
     "6": {
       "members": 9,
-      "sessions": 4,
+      "sessions": 5,
       "store_available": 1,
       "trace_records_dropped": 0
     },
@@ -53,13 +53,13 @@
     },
     "8": {
       "members": 9,
-      "sessions": 3,
+      "sessions": 4,
       "store_available": 1,
       "trace_records_dropped": 0
     },
     "9": {
       "members": 9,
-      "sessions": 6,
+      "sessions": 5,
       "store_available": 1,
       "trace_records_dropped": 0
     }
