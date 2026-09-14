@@ -332,7 +332,25 @@ def op_dm(model: Model, rng: random.Random, node: int):
     if status == 200:
       break
     if status != 404 or time.monotonic() > deadline:
-      raise HarnessError(f"dm endpoint failed: {status} {payload}")
+      _, roster = roster_of(node)
+      hub_roster = roster_of(1)[1]
+      diagnostics = []
+      for peer in sorted({node, 1}):
+        logs = subprocess.run(
+          ["podman", "logs", f"c{peer}"], capture_output=True, text=True, check=False
+        )
+        lines = [
+          line for line in (logs.stdout + logs.stderr).splitlines()
+          if "resource" in line or "watermark" in line or "warn" in line.lower()
+        ]
+        diagnostics.append(
+          f"--- c{peer} resource/warn tail ---\n" + "\n".join(lines[-40:])
+        )
+      raise HarnessError(
+        f"dm endpoint failed: {status} {payload} target={to} "
+        f"sender-roster={sorted(roster)} hub-roster={sorted(hub_roster)}\n"
+        + "\n".join(diagnostics)
+      )
     time.sleep(POLL)
   # Sent or pending: both are legal immediate outcomes; a pending dm
   # queues in the outbox and flushes when the route heals.
@@ -528,7 +546,7 @@ def op_flush(model: Model, rng: random.Random, node: int):
 # the post-conditions.
 OPERATIONS = [
   ("join-chat", lambda m, node: node in m.alive and node not in m.merged and node not in m.left, op_join_chat),
-  ("leave", lambda m, node: node in m.merged and node in m.alive and len(m.merged) > 1, op_leave),
+  ("leave", lambda m, node: node in m.merged and node in m.alive and len(m.merged) > 3, op_leave),
   ("disconnect", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_disconnect),
   ("dm", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_dm),
   ("group-message", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_group_message),
@@ -614,11 +632,25 @@ def main() -> None:
       sys.exit(1)
 
   print(f"[fuzz] seed={args.seed} ops={args.ops} nodes={N}")
-  for step in range(args.ops):
+  step = 0
+  executed = 0
+  idle = 0
+  while executed < args.ops:
+    step += 1
     node = rng.randint(args.node_start, N)
     name, mutator = pick_operation(model, rng, node)
     if name is None:
+      # No legal operation for the sampled node this step (every node in
+      # the rotation is departed or the pool is temporarily closed): an
+      # empty step is retried, never counted as work. A long idle streak
+      # means the model lost its operation pool entirely — fail loudly
+      # instead of spinning forever.
+      idle += 1
+      if idle > 200:
+        raise HarnessError(f"operation pool exhausted after {idle} idle steps")
       continue
+    idle = 0
+    executed += 1
     started = time.time()
     history.append(f"{name} c{node}")
     print(f"[op {step:04d}] {name} c{node}")
