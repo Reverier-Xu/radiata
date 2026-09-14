@@ -372,6 +372,27 @@
 - **验收**：rustdoc 更新；公开面与基线一致；无未归属的遗留项。
 - **涉及面**：`provider.rs`。**规模：S**
 
+### P2-9 场景 fuzz 套件（模型驱动集群测试）
+
+- **状态**：待办
+- **来源**：P2-3 验证复盘——预算窗口静默关闭与写入者信任竞速两个永久发散缺陷，
+  均是靠规模基准的偶然组合才暴露；固定场景 e2e 无法系统性覆盖任意操作序列下的
+  收敛正确性。
+- **方案草案**：模型驱动状态化 fuzz——
+  1. **期望状态 map**：操作 → 集群状态迁移的显式模型（merge → 成员/描述符收敛 +
+     会话建立；leave → 成员移除 + 会话拆除；disconnect → 会话消失；恢复 → 会话
+     重建 + 队列排空；消息/资源写入 → 收敛复制；打标 → 元数据收敛；revoke/cleanup
+     → 信任移除……）；
+  2. **原子操作生成器**（带前置条件）：merge、leave、chat dm/group 消息、节点
+     打标（chat example 补 admin 端点 `UpdateNodeMetadata`）、disconnect、恢复
+     （re-merge/recovery）、重启、资源 put/remove、revoke/cleanup；
+  3. **随机序列驱动**：种子可复现，失败时输出 seed 与完整操作日志；
+  4. **检查点断言**：每个操作后按状态 map 有界等待收敛，断言集群可观测状态
+     == 模型期望（成员集、会话图、消息投递、资源视图、队列排空）。
+- **验收**：冒烟种子集入 CI lane；至少一次长跑（≥1000 操作序列）零发散；
+  fuzz 发现的缺陷逐条入档并回修。
+- **涉及面**：examples/chat（admin 端点）、新增 fuzz 编排、CI lane。**规模：L**
+
 ### P2-8 architecture.md 全量重审刷新
 
 - **状态**：待办
@@ -393,9 +414,11 @@
 | B | P1-1（CAS Put，D7）、P1-2（默认 next-hop，含 slo/tests 同步）、P1-4（凭据并发化，D8）、P1-5（rustdoc 补齐） | 0 | 全门禁 + chat/cluster e2e（并发 join 断言） |
 | C | P0-2（soak 基准）、P2-2（有界剪枝实施，D10）、P2-6（默认 feature 反转实施） | A、B | 基准数据入档 + 剪枝收敛 + 矩阵全绿 |
 | D | P2-1（绑定传播分页化，D9 不留 v2）、P2-3（per-key 水位） | C | 规模测试 + e2e 回归 |
+| D+ | P1-9 存储提交状态机审计与修复（merge NotReady 根因，L） | D | 审计入档 + 回归测试 + 全门禁 + e2e |
+| H | P2-9 场景 fuzz 套件（模型驱动，L） | D+ | 冒烟种子 CI lane + ≥1000 操作长跑零发散 |
 | E | P2-5（KeyProvider crate）、P2-7（rustdoc 定位 + 审计清账） | 无硬依赖 | 新 crate 门禁 + 清账记录 |
 | G | P1-8（反轮子清账：commit verdict 单源、握手/清算/校验镜像收敛、死抽象删除、常量替换） | A | 全门禁（纯重构，无 e2e 依赖） |
-| F | P1-6（rustdoc 指南，含 D10 契约表述）、P2-8（架构文档刷新） | A–E、G 全部定稿 | `cargo doc` 评审 + 发布说明 |
+| F | P1-6（rustdoc 指南，含 D10 契约表述）、P2-8（架构文档刷新） | A–E、G、H 全部定稿 | `cargo doc` 评审 + 发布说明 |
 
 - P2-2/P2-4 已以决策关闭（D10/D11）；P2-6 决策已定、实施在批次 C；P2-7 决策已定、rustdoc 在批次 E。
 - 每批次合入前：`git status` 干净、无临时产物、逐 commit gitmoji 规范。
