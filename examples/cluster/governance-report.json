@@ -35,20 +35,20 @@
     ],
     "demo.org/labels/value=absent": []
   },
-  "removal_propagation_s": 0.4201367939967895,
+  "removal_propagation_s": 13.259665860001405,
   "page_walk_n1": {
     "pages": 2,
-    "items": 77
+    "items": 111
   },
   "page_walk_n5": {
     "pages": 2,
-    "items": 77
+    "items": 111
   },
   "page_walk_n9": {
     "pages": 2,
-    "items": 77
+    "items": 111
   },
-  "revoked_subject": "node_FAtiIWot8pqRCQfOPBMMH",
-  "cleanup_propagation_s": 2.518672348000109,
-  "checkpoint_watermark": 1789255259660
+  "revoked_subject": "node-2cgljy5yaswrfo040s13b",
+  "cleanup_propagation_s": 2.020208415007801,
+  "checkpoint_watermark": 1789409480722
 }

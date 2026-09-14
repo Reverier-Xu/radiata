@@ -38,19 +38,19 @@
       "beta": true
     }
   },
-  "merged_converge_p50_s": 0.3149100150039885,
-  "merged_converge_p90_s": 0.5926811009994708,
+  "merged_converge_p50_s": 8.317576430010376,
+  "merged_converge_p90_s": 16.212180768998223,
   "leave": {
-    "former_identity": "node_cUhZPCFSHXQnsjgAsc9mS",
+    "former_identity": "node-eerv6y4jk7ylg7wolu41l",
     "left": true,
-    "replacement_identity": "node_DgiHZ9AZYAWhxJdRmq6GX"
+    "replacement_identity": "node-4kfyyka3ii548pwfwbcba"
   },
   "conflict": {
-    "side_a_digest": "3cf57482b6b4754de8a2905f5e63e3a2612ed0099294ef18f42c659bef7a60f7",
-    "side_b_digest": "eaa75f33d429feb0bc45debd399977691971a0e39feabe450327bb6997325dc2",
+    "side_a_digest": "fd9bf65a358765b6cec3330cc82c75b60ad2cb85af99556b4417693212c68a4e",
+    "side_b_digest": "e5bfd0fdd0dade9f08f574ca752bb15e3f91343048406e5f46aa7f562f3919e5",
     "deterministic_winner": true
   },
-  "heal_seconds": 32.592555128998356,
+  "heal_seconds": 31.862486573998467,
   "heal_conflict_winner": "B",
   "heal_unanimous": true,
   "heal_conflict_distribution": {
