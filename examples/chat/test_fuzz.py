@@ -128,24 +128,34 @@ class Checker:
     raise self.fail(f"state not converged within {deadline_s}s: {description} (last: {last})")
 
   def wait_path(
-    self, node: int, since: float, needle: str, description: str,
+    self, node, since: float, needle: str, description: str,
     deadline_s: float = 30, also: str | None = None,
   ):
-    """The node's log must contain `needle` (and `also` on the same
-    line when given) within the deadline."""
+    """One of `node`'s logs (a single node id or a tuple of candidates)
+    must contain `needle` (and `also` on the same line when given)
+    within the deadline. Multi-node targets cover heals that may be
+    performed by either endpoint of the broken edge."""
+    targets = tuple(node) if isinstance(node, (tuple, list)) else (node,)
     deadline = time.monotonic() + deadline_s
 
     def hit(text: str) -> bool:
       return any(needle in line and (also is None or also in line)
                  for line in path_lines(text, needle))
 
+    def hit_any() -> bool:
+      return any(hit(podman_logs(target, since)) for target in targets)
+
     while time.monotonic() < deadline:
-      if hit(podman_logs(node, since)):
+      if hit_any():
         return
       time.sleep(POLL)
-    excerpt = "\n".join(path_lines(podman_logs(node, since), needle)[-10:])
+    excerpt = "\n".join(
+      line
+      for target in targets
+      for line in path_lines(podman_logs(target, since), needle)[-5:]
+    )
     raise self.fail(
-      f"path event missing on c{node}: {description}"
+      f"path event missing on {targets}: {description}"
       + (f" (line must also contain {also!r})" if also else "")
       + f"\nlog tail:\n{excerpt}"
     )
@@ -295,9 +305,12 @@ def op_disconnect(model: Model, rng: random.Random, node: int):
   else:
     return None, []
   if after == 0:
-    # Fully isolated: the recovery plane dials the member table and the
-    # settled event is the heal's path proof.
-    return None, [(node, "member dial settled", None, "recovery re-established after isolation")]
+    # Fully isolated: the recovery plane heals the cut, but EITHER side
+    # may win the race — the isolated node dials out, or the (also
+    # isolated) peer dials back in and the node quiesces over the
+    # inbound route. Assert the heal dial on either endpoint.
+    return None, [((node, peer), "member dial settled", None,
+                   "recovery re-established after isolation")]
   # Partial break: the node holds other routes and must stay connected
   # without redialing; the shared checkpoint asserts liveness.
   return None, []
@@ -309,9 +322,18 @@ def op_dm(model: Model, rng: random.Random, node: int):
   if not peers:
     return None, []
   to = f"u{rng.choice(peers)}"
-  status, payload = http(node, "POST", "/dm", {"to": to, "body": f"fuzz-{rng.randrange(1 << 30)}"})
-  if status != 200 or payload is None:
-    raise HarnessError(f"dm endpoint failed: {status}")
+  body = f"fuzz-{rng.randrange(1 << 30)}"
+  # The sender resolves the target through its LOCAL identity view; the
+  # user resource may still be converging there right after a join.
+  # A 404 is a convergence gap, not a model violation: wait it out.
+  deadline = time.monotonic() + 30
+  while True:
+    status, payload = http(node, "POST", "/dm", {"to": to, "body": body})
+    if status == 200:
+      break
+    if status != 404 or time.monotonic() > deadline:
+      raise HarnessError(f"dm endpoint failed: {status} {payload}")
+    time.sleep(POLL)
   # Sent or pending: both are legal immediate outcomes; a pending dm
   # queues in the outbox and flushes when the route heals.
   if payload.get("state") not in ("sent", "pending"):
