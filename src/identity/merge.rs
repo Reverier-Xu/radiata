@@ -106,6 +106,13 @@ pub(crate) async fn commit_merge(
   proposal: &MergeProposal,
 ) -> Result<MergeGrantV1> {
   let store = context.store();
+  // The whole journaled section — recovery prologue, commit, cleanup —
+  // holds the writer exclusion: concurrent same-generation merges share
+  // one purpose-scoped pending slot, and an interleaved prologue that
+  // observes another flow's live residue would misclassify it as a crash
+  // journal (inner acquisitions in the committed helpers re-enter this
+  // permit as no-ops).
+  let _permit = store.write_permit().await;
   let purpose = merge_purpose(&proposal.generation);
   if crate::identity::lifecycle::recover_journal_prologue(
     store,
@@ -302,6 +309,8 @@ pub(crate) async fn adopt_merge(
   issuer_key: &PublicKey,
 ) -> Result<()> {
   let store = context.store();
+  // Same-purpose serialization: see the note on `commit_merge`.
+  let _permit = store.write_permit().await;
   let purpose = merge_adoption_purpose(grant.merge());
   if crate::identity::lifecycle::recover_journal_prologue(
     store,

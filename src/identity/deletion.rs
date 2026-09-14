@@ -38,6 +38,9 @@ pub(crate) async fn delete_unreferenced_key(
   store: &crate::storage::MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
   handle: &KeyHandle,
 ) -> Result<()> {
+  // The whole journaled section holds the writer exclusion: see the
+  // same-purpose serialization note on the merge flow.
+  let _permit = store.write_permit().await;
   let purpose = deletion_purpose(handle);
   // The deletion path reconciles a frozen store after journal recovery
   // too (a cheap no-op on a non-frozen store), matching its historical

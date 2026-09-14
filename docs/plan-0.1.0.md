@@ -255,7 +255,9 @@
 
 ### P1-9 存储提交状态机：并发同世代 journal 的 reconcile 误分类（merge NotReady）
 
-- **状态**：进行中（审计完成，修复中）
+- **状态**：已完成（证据直读恢复 `resolve_pending_journal`、Ready 态 reconcile
+  立即拒绝、日志化流程全程 writer permit 串行化、`ensure_self_binding` 补解冻；
+  回归测试三则）
 - **来源**：P2-3 验收期间捕获（16 节点合并爆发负载下偶发握手被拒）；完整审计定位。
 - **根因链**（三个设计缺陷叠加）：
   1. **purpose 槽位碰撞**：`JournalPurpose::Merge(GenerationId)` 按凭据世代取键——
@@ -373,7 +375,8 @@
 
 ### P2-5 生产级 KeyProvider 参考实现
 
-- **状态**：待办
+- **状态**：暂缓（2026-09-14：owner 提出必要性商讨中，是否实施待定；
+  暂缓期间 FileKeyProvider 仍随 example 分发，不计入 0.1.0 冻结判据）
 - **来源**：archive/example-findings.md #1（未了项）
 - **问题**：库内只有测试用 ScriptedKeys；生产接入最难的一步是带崩溃恢复语义的
   密钥生命周期（三态 create/delete + reconcile）。cluster/chat example 的
