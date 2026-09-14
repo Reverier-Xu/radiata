@@ -266,7 +266,9 @@ def op_leave(model: Model, rng: random.Random, node: int):
 
 
 def op_disconnect(model: Model, rng: random.Random, node: int):
-  """The node tears one session down; recovery heals it back."""
+  """Tears one session down; recovery heals it only when the teardown
+  actually isolates the node (any-one-route: a node with other live
+  sessions stays connected and must NOT re-dial)."""
   if not model.merged or node not in model.alive:
     return None, []
   peer_pool = sorted(other for other in model.merged if other != node and other in model.alive)
@@ -276,16 +278,28 @@ def op_disconnect(model: Model, rng: random.Random, node: int):
   peer_node_id = node_id_of(node, f"u{peer}")
   if not peer_node_id:
     return None, []
-  # The teardown only surfaces on a peer when the node actually held a
-  # session (the count is the only mesh view the chat surface exposes):
-  # with one, recovery re-dials the peer and the settled event is the
-  # heal's path proof; with none, the disconnect is a no-op.
   before_ok, before_sessions = sessions_of(node)
   status, _ = http(node, "POST", "/disconnect", {"node_id": peer_node_id})
-  if status != 200:
+  if status != 200 or not before_ok or before_sessions < 1:
     return None, []
-  if before_ok and before_sessions >= 1:
-    return None, [(node, "member dial settled", None, "the session re-established after the teardown")]
+  # Wait for the teardown to surface in the mesh count. Tearing an edge
+  # the node does not hold (e.g. a non-hub peer in a star) is a no-op:
+  # nothing to assert, and no redial may be expected.
+  deadline = time.monotonic() + 10
+  after = before_sessions
+  while time.monotonic() < deadline:
+    ok, after = sessions_of(node)
+    if ok and after < before_sessions:
+      break
+    time.sleep(POLL)
+  else:
+    return None, []
+  if after == 0:
+    # Fully isolated: the recovery plane dials the member table and the
+    # settled event is the heal's path proof.
+    return None, [(node, "member dial settled", None, "recovery re-established after isolation")]
+  # Partial break: the node holds other routes and must stay connected
+  # without redialing; the shared checkpoint asserts liveness.
   return None, []
 
 
