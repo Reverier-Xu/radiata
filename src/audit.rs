@@ -66,6 +66,19 @@ pub(crate) fn dial_settled(peer: &str, recovery: bool, connected: bool) {
   let _ = (peer, recovery, connected);
 }
 
+/// One member descriptor was installed from an anti-entropy page:
+/// the receiving peer adopted a new or higher-revision record. This is
+/// the delivery-truth proof for member metadata propagation — labels,
+/// revisions, and membership knowledge reach a peer only through this
+/// path, so the harness asserts it after every descriptor-carrying
+/// operation instead of trusting the sender's tick.
+pub(crate) fn descriptor_installed(node: &str, revision: u64) {
+  #[cfg(feature = "audit")]
+  debug!(target: "audit", node, revision, "member descriptor installed");
+  #[cfg(not(feature = "audit"))]
+  let _ = (node, revision);
+}
+
 /// One purpose-scoped pending journal resolved against durable
 /// evidence: `committed` records the classification.
 pub(crate) fn journal_resolved(purpose: &str, committed: bool) {

@@ -13,10 +13,9 @@ use axum::{
   routing::{get, post},
 };
 use radiata::{
-  GetMember, GetResource, LabelKey, LabelValue, NodeHandle, NodeId, PageSessions, PageSpec,
-  PutResource, RemoveResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
-  RoutingPolicy, SelectResources, Selector, StreamMetadata, StreamPolicy, StreamTarget,
-  UpdateNodeMetadata,
+  GetResource, LabelKey, LabelValue, NodeHandle, NodeId, PageSessions, PageSpec, PutResource,
+  RemoveResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RoutingPolicy,
+  SelectResources, Selector, StreamMetadata, StreamPolicy, StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -843,9 +842,7 @@ fn label_map_json(view: &radiata::MemberView) -> serde_json::Map<String, Value> 
 /// Reads the node's own owner metadata: the capability label map plus
 /// the revision a conditional update must expect. The scenario fuzz
 /// harness drives node labeling through this surface.
-async fn get_metadata(
-  state: State<SharedState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn get_metadata(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let view = state
     .node
     .query(radiata::GetMember::new(state.node_id.clone()))
@@ -855,8 +852,34 @@ async fn get_metadata(
   Ok(Json(json!({
     "labels": label_map_json(&view),
     "revision": view.owner_revision(),
-  }))
-  )
+  })))
+}
+
+/// Reads any member's converged capability labels plus the owner
+/// revision: the descriptor page plane carries owner metadata to every
+/// peer, so the same read on different nodes converges to the same
+/// value. The scenario fuzz harness asserts label convergence through
+/// this surface.
+async fn member_labels(
+  state: State<SharedState>, AxumPath(user): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  if !valid_component(&user) {
+    return Err(bad_request("invalid user"));
+  }
+  let Some(node_id) = resolve_user(&state, &user).await else {
+    return Err(not_found("unknown user"));
+  };
+  let view = state
+    .node
+    .query(radiata::GetMember::new(node_id))
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| not_found("member view not converged"))?;
+  Ok(Json(json!({
+    "user": user,
+    "revision": view.owner_revision(),
+    "labels": label_map_json(&view),
+  })))
 }
 
 #[derive(serde::Deserialize)]
@@ -899,8 +922,7 @@ async fn update_metadata(
   Ok(Json(json!({
     "labels": label_map_json(&view),
     "revision": view.owner_revision(),
-  }))
-  )
+  })))
 }
 
 #[derive(serde::Deserialize)]
@@ -959,6 +981,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/join-token", get(join_token))
     .route("/join-chat", post(join_chat))
     .route("/metadata", get(get_metadata).post(update_metadata))
+    .route("/labels/{user}", get(member_labels))
     .route("/mesh-sessions", get(mesh_sessions))
     .route("/disconnect", post(disconnect))
     .route("/leave", post(leave))

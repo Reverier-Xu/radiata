@@ -384,8 +384,14 @@ async fn accept_payload(
       let page = MembershipPage::decode(encoded.as_ref())?;
       // Every newly installed descriptor is one member change.
       let installed = page_sync::apply_page_ctx(store, entropy.as_ref(), &page).await?;
-      for node in installed {
-        member_changed(events, revision, node);
+      for descriptor in page.descriptors() {
+        if installed.contains(descriptor.node()) {
+          // The audit event is the propagation path proof: a
+          // descriptor exists on this peer only because this page
+          // carried it.
+          crate::audit::descriptor_installed(descriptor.node().as_str(), descriptor.revision());
+          member_changed(events, revision, descriptor.node().clone());
+        }
       }
     }
     SyncPayload::Snapshot(encoded) => {

@@ -93,6 +93,8 @@ class Model:
     self.merged: set[int] = {1}                  # members of the cluster
     self.left: set[int] = set()                  # nodes that left: gone for the run
     self.labels: dict[int, dict[str, str]] = {i: {} for i in self.alive}
+    self.group_exists = False                    # g-fuzz created somewhere
+    self.group_members: set[int] = set()         # users in the g-fuzz roster
 
   def roster(self) -> set[int]:
     """Users whose profiles every live merged node must expose."""
@@ -125,15 +127,28 @@ class Checker:
       time.sleep(POLL)
     raise self.fail(f"state not converged within {deadline_s}s: {description} (last: {last})")
 
-  def wait_path(self, node: int, since: float, needle: str, description: str, deadline_s: float = 30):
-    """The node's log must contain `needle` within the deadline."""
+  def wait_path(
+    self, node: int, since: float, needle: str, description: str,
+    deadline_s: float = 30, also: str | None = None,
+  ):
+    """The node's log must contain `needle` (and `also` on the same
+    line when given) within the deadline."""
     deadline = time.monotonic() + deadline_s
+
+    def hit(text: str) -> bool:
+      return any(needle in line and (also is None or also in line)
+                 for line in path_lines(text, needle))
+
     while time.monotonic() < deadline:
-      if any(needle in line for line in path_lines(podman_logs(node, since), needle)):
+      if hit(podman_logs(node, since)):
         return
       time.sleep(POLL)
     excerpt = "\n".join(path_lines(podman_logs(node, since), needle)[-10:])
-    raise self.fail(f"path event missing on c{node}: {description}\nlog tail:\n{excerpt}")
+    raise self.fail(
+      f"path event missing on c{node}: {description}"
+      + (f" (line must also contain {also!r})" if also else "")
+      + f"\nlog tail:\n{excerpt}"
+    )
 
 
 def roster_of(node: int) -> tuple[bool, set[str]]:
@@ -158,6 +173,38 @@ def metadata_of(node: int) -> tuple[bool, dict]:
   return True, payload
 
 
+def groups_of(node: int) -> tuple[bool, dict[str, set[str]]]:
+  """The node's converged group view: name -> member set."""
+  status, payload = http(node, "GET", "/groups")
+  if status != 200 or payload is None:
+    return False, {}
+  groups = {
+    entry["name"]: set(entry.get("members") or [])
+    for entry in payload.get("groups", [])
+    if entry.get("name")
+  }
+  return True, groups
+
+
+def labels_of(node: int, user: str) -> tuple[bool, dict]:
+  """The node's converged view of one member's capability labels."""
+  status, payload = http(node, "GET", f"/labels/{user}")
+  if status != 200 or payload is None:
+    return False, {}
+  return True, payload
+
+
+def node_id_of(node: int, user: str) -> str | None:
+  """Resolves a user's node id through the node's identity view."""
+  status, payload = http(node, "GET", "/identities")
+  if status != 200 or payload is None:
+    return None
+  for entry in payload.get("identities", []):
+    if entry.get("user") == user:
+      return entry.get("node_id")
+  return None
+
+
 # --------------------------------------------------------------------------
 # Atomic operations. Each op mutates the model, executes, and returns the
 # (since, needle, node) PATH expectations the checker asserts alongside
@@ -177,10 +224,23 @@ def op_join_chat(model: Model, rng: random.Random, node: int):
   if status != 200 or not (payload or {}).get("joined"):
     raise HarnessError(f"join endpoint failed: {status} {payload}")
   model.merged.add(node)
-  return [
-    (node, "member dial started", "the join dial started"),
-    (node, "member dial settled", "the join dial connected"),
+  peers = sorted(u for u in model.merged if u != node and u in model.alive)
+  path = [
+    (node, "member dial started", None, "the join dial started"),
+    (node, "member dial settled", None, "the join dial connected"),
   ]
+  # Every established member learns the newcomer through the descriptor
+  # page plane: each peer must install the newcomer's descriptor, not
+  # merely display its roster (the roster state check reads only one
+  # node's view).
+  newcomer = node_id_of(node, f"u{node}")
+  if newcomer:
+    path.extend(
+      (peer, "member descriptor installed", f"node={newcomer}",
+       f"c{peer} installed the newcomer descriptor")
+      for peer in peers
+    )
+  return None, path
 
 
 def op_leave(model: Model, rng: random.Random, node: int):
@@ -194,27 +254,26 @@ def op_leave(model: Model, rng: random.Random, node: int):
   model.merged.discard(node)
   model.left.add(node)
   model.labels.pop(node, None)
-  return [
-    (node, "leave announcement starting", "the leave announcement started"),
-    (peer, "leave record persisted on peer", "the leave record propagated to a peer"),
+  # The group roster is untouched by leave: the departed user's name
+  # lingers in the resource label as evidence, exactly like their chat
+  # identity resource.
+  return None, [
+    (node, "leave announcement starting", None, "the leave announcement started"),
+    (peer, "leave record persisted on peer", None, "the leave record propagated to a peer"),
   ]
 
 
 def op_disconnect(model: Model, rng: random.Random, node: int):
   """The node tears one session down; recovery heals it back."""
   if not model.merged or node not in model.alive:
-    return []
+    return None, []
   peer_pool = sorted(other for other in model.merged if other != node and other in model.alive)
   if not peer_pool:
-    return []
+    return None, []
   peer = rng.choice(peer_pool)
-  _, payload = http(node, "GET", "/identities")
-  peer_node_id = next(
-    (entry["node_id"] for entry in payload.get("identities", []) if entry["user"] == f"u{peer}"),
-    None,
-  ) if payload else None
+  peer_node_id = node_id_of(node, f"u{peer}")
   if not peer_node_id:
-    return []
+    return None, []
   # The teardown only surfaces on a peer when the node actually held a
   # session (the count is the only mesh view the chat surface exposes):
   # with one, recovery re-dials the peer and the settled event is the
@@ -222,17 +281,17 @@ def op_disconnect(model: Model, rng: random.Random, node: int):
   before_ok, before_sessions = sessions_of(node)
   status, _ = http(node, "POST", "/disconnect", {"node_id": peer_node_id})
   if status != 200:
-    return []
+    return None, []
   if before_ok and before_sessions >= 1:
-    return [(node, "member dial settled", "the session re-established after the teardown")]
-  return []
+    return None, [(node, "member dial settled", None, "the session re-established after the teardown")]
+  return None, []
 
 
 def op_dm(model: Model, rng: random.Random, node: int):
   """One direct message between two live merged users."""
   peers = sorted(u for u in model.merged if u != node and u in model.alive)
   if not peers:
-    return []
+    return None, []
   to = f"u{rng.choice(peers)}"
   status, payload = http(node, "POST", "/dm", {"to": to, "body": f"fuzz-{rng.randrange(1 << 30)}"})
   if status != 200 or payload is None:
@@ -241,34 +300,121 @@ def op_dm(model: Model, rng: random.Random, node: int):
   # queues in the outbox and flushes when the route heals.
   if payload.get("state") not in ("sent", "pending"):
     raise HarnessError(f"dm outcome must be sent or pending: {payload}")
-  return []
+  return None, []
+
+
+def group_roster_matches(model: Model):
+  """State predicate factory: every live merged node's group view must
+  show g-fuzz with exactly the model's roster (resource replication is
+  cluster-wide, so non-member nodes still list the group)."""
+  expected = {f"u{i}" for i in model.group_members}
+
+  def check():
+    for node in sorted(model.alive & model.merged):
+      ok, groups = groups_of(node)
+      if not ok:
+        return False, f"c{node} group view unreachable"
+      got = groups.get("g-fuzz")
+      if got != expected:
+        return False, f"c{node} g-fuzz={sorted(got or set())} want {sorted(expected)}"
+    return True, f"g-fuzz roster={sorted(expected)} everywhere"
+
+  return "g-fuzz roster converged on every live merged node", check
+
+
+def op_join_group(model: Model, rng: random.Random, node: int):
+  """One live merged user joins g-fuzz: a CAS read-modify-write over
+  the member roster that must converge to every live merged node."""
+  del rng
+  status, payload = http(node, "POST", "/groups/g-fuzz/join")
+  if status == 404:
+    # Known group, not yet converged locally (fresh restart): wait for
+    # the local view, then retry once.
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+      ok, groups = groups_of(node)
+      if ok and "g-fuzz" in groups:
+        break
+      time.sleep(POLL)
+    status, payload = http(node, "POST", "/groups/g-fuzz/join")
+  if status != 200 or not (payload or {}).get("joined"):
+    raise HarnessError(f"group join failed: {status} {payload}")
+  # `already` (a committed join whose ack the harness missed) still
+  # means the roster carries this user: the model must match.
+  model.group_members.add(node)
+  return group_roster_matches(model), []
 
 
 def op_group_message(model: Model, rng: random.Random, node: int):
   """One group message from a live merged user; the group is created on
   first use so the group plane always carries real traffic."""
   if node not in model.alive or node not in model.merged:
-    return []
+    return None, []
   body = f"fuzz-{rng.randrange(1 << 30)}"
   status, payload = http(node, "POST", "/groups/g-fuzz/send", {"body": body})
+  created_now = False
   if status == 404:
-    created, _ = http(node, "POST", "/groups", {"name": "g-fuzz"})
-    if created != 200:
-      return []
-    status, payload = http(node, "POST", "/groups/g-fuzz/send", {"body": body})
+    if model.group_exists:
+      # The model says the group exists cluster-wide; a local 404 is a
+      # convergence gap. Re-creating here would overwrite the roster
+      # through an unconditional put — wait for convergence instead.
+      deadline = time.monotonic() + 30
+      while time.monotonic() < deadline:
+        ok, groups = groups_of(node)
+        if ok and "g-fuzz" in groups:
+          break
+        time.sleep(POLL)
+      else:
+        raise HarnessError("g-fuzz missing on a live merged node though the model has it")
+      status, payload = http(node, "POST", "/groups/g-fuzz/send", {"body": body})
+    else:
+      created, _ = http(node, "POST", "/groups", {"name": "g-fuzz"})
+      if created != 200:
+        return None, []
+      created_now = True
+      status, payload = http(node, "POST", "/groups/g-fuzz/send", {"body": body})
   if status != 200 or payload is None:
     raise HarnessError(f"group send endpoint failed: {status}")
-  return []
+  if created_now:
+    model.group_exists = True
+    model.group_members.add(node)
+    return group_roster_matches(model), []
+  return None, []
+
+
+def label_converged(model: Model, node: int, key_name: str, value: str, revision: int):
+  """State predicate factory: the label written on `node` must read back
+  with the same value on every live merged peer (descriptor page
+  convergence), each at least the written revision."""
+  user = f"u{node}"
+  readers = sorted(u for u in model.alive & model.merged if u != node)
+
+  def check():
+    for peer in readers:
+      ok, payload = labels_of(peer, user)
+      if not ok:
+        return False, f"c{peer} label view for {user} unreachable"
+      got = None
+      for full_key, full_value in payload.get("labels", {}).items():
+        if full_key.endswith(f"/{key_name}"):
+          got = full_value
+      if got != value:
+        return False, f"c{peer} {key_name}={got!r} want {value!r}"
+      if payload.get("revision", 0) < revision:
+        return False, f"c{peer} revision {payload.get('revision')} < {revision}"
+    return True, f"{key_name}={value} converged on {readers}"
+
+  return f"label {key_name}={value} converged on every live merged peer", check
 
 
 def op_label(model: Model, rng: random.Random, node: int):
   """The node labels itself: conditional owner-metadata update, then
   descriptor convergence carries the label to the cluster."""
   if node not in model.alive:
-    return []
+    return None, []
   status, payload = metadata_of(node)
   if status != 200:
-    return []
+    return None, []
   key = f"fuzz-{rng.randrange(1 << 16)}"
   value = f"v{rng.randrange(1 << 30)}"
   revision = payload.get("revision", 0)
@@ -288,11 +434,24 @@ def op_label(model: Model, rng: random.Random, node: int):
     _, fresh = metadata_of(node)
     body["expected_revision"] = fresh.get("revision", revision)
     time.sleep(POLL)
+  landed_revision = (payload or {}).get("revision", revision)
   model.labels.setdefault(node, {})[key] = value
-  # Path note: descriptor-label propagation audit events land with the
-  # membership-lane instrumentation; v1 asserts the local conditional
-  # update through the state surface only.
-  return []
+  if node not in model.merged:
+    # A standalone node's descriptor is outside the membership plane:
+    # the update is local-only by design.
+    return None, []
+  state_check = label_converged(model, node, key, value, landed_revision)
+  # Path: every live merged peer must install the higher-revision
+  # descriptor — labels travel only through the page plane.
+  updater = node_id_of(node, f"u{node}")
+  path = []
+  if updater:
+    path = [
+      (peer, "member descriptor installed", f"node={updater}",
+       f"c{peer} installed the relabeled descriptor of c{node}")
+      for peer in sorted(u for u in model.alive & model.merged if u != node)
+    ]
+  return state_check, path
 
 
 def op_restart(model: Model, rng: random.Random, node: int):
@@ -301,7 +460,7 @@ def op_restart(model: Model, rng: random.Random, node: int):
   del rng
   subprocess.run(["podman", "kill", f"c{node}"], capture_output=True, check=False)
   model.alive.discard(node)
-  return []
+  return None, []
 
 
 def op_start(model: Model, rng: random.Random, node: int):
@@ -311,7 +470,7 @@ def op_start(model: Model, rng: random.Random, node: int):
   subprocess.run(["podman", "start", f"c{node}"], capture_output=True, check=False)
   model.alive.add(node)
   model.labels.setdefault(node, {})
-  return []
+  return None, []
 
 
 def op_flush(model: Model, rng: random.Random, node: int):
@@ -321,18 +480,21 @@ def op_flush(model: Model, rng: random.Random, node: int):
   status, _ = http(node, "POST", "/flush")
   if status not in (200, 0):
     raise HarnessError(f"flush endpoint failed: {status}")
-  return []
+  return None, []
 
 
-# Every generator: (name, precondition(model), mutator(model, rng, node) -> path
-# expectations). Preconditions keep operations legal (no messaging from a
-# dead node); the state map covers the post-conditions.
+# Every generator: (name, precondition(model, node), mutator(model, rng,
+# node) -> (state_check | None, path expectations)). Preconditions keep
+# operations legal (no messaging from a dead node); the state map covers
+# the post-conditions.
 OPERATIONS = [
   ("join-chat", lambda m, node: node in m.alive and node not in m.merged and node not in m.left, op_join_chat),
   ("leave", lambda m, node: node in m.merged and node in m.alive and len(m.merged) > 1, op_leave),
   ("disconnect", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_disconnect),
   ("dm", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_dm),
   ("group-message", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_group_message),
+  ("join-group", lambda m, node: node in m.merged and node in m.alive and node not in m.left
+   and m.group_exists and node not in m.group_members and len(m.group_members) < 16, op_join_group),
   ("label", lambda m, node: node in m.alive and node not in m.left, op_label),
   ("restart", lambda m, node: node in m.alive and node not in m.left, op_restart),
   ("start", lambda m, node: node not in m.alive and node not in m.left, op_start),
@@ -340,9 +502,10 @@ OPERATIONS = [
 ]
 
 
-def checkpoint(checker: Checker, model: Model, path_expectations: list):
-  """The dual assertion: state convergence against the model, then the
-  operation's audit path on the responsible node."""
+def checkpoint(checker: Checker, model: Model, state_check, path_expectations: list):
+  """The dual assertion: state convergence against the model (the shared
+  cluster checkpoint plus the operation's own predicate), then the
+  operation's audit path on the responsible nodes."""
   live = sorted(model.alive & model.merged)
 
   def state_ok():
@@ -367,8 +530,11 @@ def checkpoint(checker: Checker, model: Model, path_expectations: list):
     return True, f"roster={sorted(users)}"
 
   checker.wait_state("cluster state matches the model", state_ok, deadline_s=60)
-  for node, needle, description in path_expectations:
-    checker.wait_path(node, time.time() - 5, needle, description, deadline_s=30)
+  if state_check is not None:
+    description, predicate = state_check
+    checker.wait_state(description, predicate, deadline_s=60)
+  for node, needle, also, description in path_expectations:
+    checker.wait_path(node, time.time() - 5, needle, description, deadline_s=30, also=also)
 
 
 def pick_operation(model: Model, rng: random.Random, node: int):
@@ -417,9 +583,9 @@ def main() -> None:
     started = time.time()
     history.append(f"{name} c{node}")
     print(f"[op {step:04d}] {name} c{node}")
-    path_expectations = mutator(model, rng, node)
+    state_check, path_expectations = mutator(model, rng, node)
     try:
-      checkpoint(checker, model, path_expectations)
+      checkpoint(checker, model, state_check, path_expectations)
     except HarnessError as violation:
       print(violation)
       sys.exit(1)

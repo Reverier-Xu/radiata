@@ -111,5 +111,3 @@ fn store_error(error: String) -> radiata::Error {
   tracing::error!(%error, "chat store write failed");
   radiata::Error::caller("chat store write failed")
 }
-
-
