@@ -11,8 +11,8 @@ rust-version = "1.98.0"
 version      = "0.0.2"
 
 [features]
-default = ["redb"]
 audit   = []
+default = ["redb"]
 json    = ["dep:fs4", "dep:rustix", "dep:serde", "dep:serde_json"]
 redb    = ["dep:redb"]
 

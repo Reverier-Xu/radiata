@@ -24,13 +24,13 @@ require_nonempty_tests() {
   fi
 }
 
-cargo test --locked --lib json_adapter -- --list > "$TMP/json-adapter.list"
+cargo test --locked --all-features --lib json_adapter -- --list > "$TMP/json-adapter.list"
 require_nonempty_tests json_adapter "$TMP/json-adapter.list"
-cargo test --locked --lib json_adapter
+cargo test --locked --all-features --lib json_adapter
 
-cargo test --locked --test json_runtime json_runtime -- --list > "$TMP/json-runtime.list"
+cargo test --locked --all-features --test json_runtime json_runtime -- --list > "$TMP/json-runtime.list"
 require_nonempty_tests json_runtime "$TMP/json-runtime.list"
-cargo test --locked --test json_runtime json_runtime
+cargo test --locked --all-features --test json_runtime json_runtime
 
 cargo check --locked --workspace --no-default-features
 

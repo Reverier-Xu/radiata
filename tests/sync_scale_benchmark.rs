@@ -1,3 +1,5 @@
+#![cfg(feature = "redb")]
+
 //! Scale benchmark for the ack-gated anti-entropy planes (P0-2) and
 //! the per-key resource watermark (P2-3).
 //!
