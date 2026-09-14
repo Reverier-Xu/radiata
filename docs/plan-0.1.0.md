@@ -253,6 +253,42 @@
 
 ---
 
+### P1-9 存储提交状态机：并发同世代 journal 的 reconcile 误分类（merge NotReady）
+
+- **状态**：进行中（审计完成，修复中）
+- **来源**：P2-3 验收期间捕获（16 节点合并爆发负载下偶发握手被拒）；完整审计定位。
+- **根因链**（三个设计缺陷叠加）：
+  1. **purpose 槽位碰撞**：`JournalPurpose::Merge(GenerationId)` 按凭据世代取键——
+     同一凭据的并发 merge 共享一个 pending 槽位，但流程的
+     prologue→commit→cleanup 三段并未按槽位串行化（writer permit 只盖住
+     commit 段）；
+  2. **残留误分类**：flow A 提交完成、cleanup 未跑的亚毫秒窗口内，flow B 的
+     prologue `recover_pending` 读到 A 的合法残留 → `freeze_journaled` 冻结
+     整个 store → `reconcile_recovered_journal` 调 `store.reconcile()`；
+  3. **Ready 状态 reconcile 必然 5s 空等**：A 的 cleanup 完成后状态回到 Ready，
+     B 的 `begin_reconcile` 对 Ready 的语义性拒绝被 `wait_for_entry` 重试——
+     而合并后写入洪峰让槽位在 Ready/Frozen(active) 间持续翻转，每次重检都失败，
+     5s 到期 → `NotReady("metadata storage reconcile")` → 握手以
+     `AuthenticationFailed` 失败。
+  附带缺陷：`reconcile_if_frozen` 预检与 `begin_reconcile` 之间的竞速下，两个
+  并发同身份恢复者的第二个必然走 Ready 拒绝路径；`ensure_self_binding` 在
+  Unknown 后只做快照检查不解除冻结（对支持 Unknown 的 provider 是搁置槽位隐患，
+  redb 上为死路径）。
+- **修复设计**（L）：
+  1. journal 恢复改走**持久证据**：新增 `resolve_pending_journal(purpose)`——
+     journal 与业务操作同一 commit 原子写入，故 provider 收据即权威；
+     证据直读（绕过槽位状态机）→ Committed 即解冻继续；证据缺席且残留仍在 →
+     fail closed（冻结 + corrupt）；残留已被竞速清理 → 视为已解决继续；
+  2. `reconcile()` 对 Ready 立即类型化拒绝，不再进入 5s 等待（语义性拒绝无
+     等待价值）；
+  3. 日志化流程（merge 准入/采纳、key 删除等）全程持有 writer permit，
+     同 purpose 流程串行化（permit 任务内可重入，内层获取无开销）；
+  4. `ensure_self_binding` Unknown 臂补 `reconcile_if_frozen`。
+- **验收**：并发同 purpose journal 竞速回归测试（修复前必现 NotReady/corrupt）；
+  Ready 态 reconcile 快速失败断言；崩溃恢复分类测试；全门禁 + chat/cluster e2e。
+- **涉及面**：`storage/mod.rs`、`storage/pending.rs`、`identity/lifecycle.rs`、
+  `identity/merge.rs` 等日志化流程入口。**规模：L**
+
 ## 3. P2（0.1.0 前完成；规模较大或需设计先行）
 
 ### P2-1 绑定传播协议改造（per-binding 事件 + revision 游标）
