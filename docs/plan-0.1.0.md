@@ -79,6 +79,11 @@
     MemoryStorage 基座的 snapshot 全量克隆在基准中污染量度（hub 每 tick 30 次
     O(n) 克隆争全局锁），基准改用 redb（生产语义、MVCC O(1) snapshot）后消失。
 - **验收**：基准数据入档（本条目即台账；替换归档的 benchmark-loopback 结论）✓。
+- **后续观察**（P2-3 验证期间捕获，先在问题）：16 节点合并爆发负载下，一次
+  merge 握手因存储提交状态机入口等待超时被拒（`metadata storage reconcile:
+  NotReady` → `AuthenticationFailed: handshake closed`）。生产语义为运维重试；
+  基准已加同款退避重试（`merge_with_retry`）。入口等待上界与 provider 调用时延
+  的匹配关系值得独立排查（候选后续项，非 P2-3 范围）。
 - **涉及面**：`tests/sync_scale_benchmark.rs`（新增）、`sync_common.rs` 单页回退。**规模：M**
 
 ### P0-3 examples 纳入 CI 门禁
@@ -294,17 +299,30 @@
 
 ### P2-3 sync per-key 水位
 
-- **状态**：待办
+- **状态**：已实施（资源通道）
 - **问题**（核实修正）：资源/成员反熵按名字序分页（`PAGE_DEFAULT_LIMIT = 16`，
   `paging.rs:18`）+ 下一页区间指纹 quiet 判定（非整目录指纹）+ 全量重投兜底
   （`arm_full_pass` 每 128 轮）。核实新事实：**中段记录变更在本 pass 内不触发重发，
   需等 `PAGE_RESEND_TICKS = 32` tick 或 128 轮全量 pass 才被覆盖**——变更可能滞留
   多达 ~128 轮才收敛，比原陈述更强地支撑 per-key 水位的必要性。
-- **方案草案**：per-key 水位（记录级 last-sent revision/digest 表，bounded），
-  增量页只装"水位之后变化的记录"；全量重投保留为兜底。
-  需先有 P0-2 的基准数据支撑必要性判断。
-- **验收**：大目录下单写收敛轮数显著下降的基准对比；正确性测试（乱序/丢失窗口）。
-- **涉及面**：`sync_common.rs`、`resource/sync.rs`、`membership/sync.rs`、存储。**规模：L**
+- **实施**（资源通道；成员通道保留指纹游标——节点数即目录上界，无收益）：
+  - `ResourcePeerState`：每对端 walk 游标 + 有界水位表（`WATERMARK_TABLE_CAP =
+    8192`，溢出清空回退全量）+ 检测节奏 `DETECTION_CADENCE_TICKS = 32`；
+  - 发射按水位过滤（`emit_page_filtered_ctx`），预算 `SCAN_BUDGET_PER_TICK = 256`
+    摊销扫描；**预算窗口静默时 pass 从窗口边界继续而非关闭**（否则首个静默窗口
+    之后的记录永久搁浅——规模基准抓到的真实缺陷，带回归测试）；
+  - 水位提交 verdict-gated（admission ack 裁决，失败 rewind 到页起点）；
+  - 写入者信任等待：页可先于其写入者描述符到达（两通道同 tick 双向竞速），
+    应用侧有界等待描述符收敛（2s），超时跳过并 warn；
+  - 水位定期刷新（`WATERMARK_REFRESH_PASSES = 64`）：整表清空重投一次，为
+    admission≠apply 类偏差（任何未知 skip）保留有界修复上界。
+- **验收结果**（`sync_scale_benchmark`，release，loopback）：
+  - 矩阵全绿：8×512 = 16.0s、16×512 = 16.0s、8×2048 = 36.1s、16×4096 = 60.4s
+    （旧指纹基线 52.4s，+15% 为水位记账代价），稳态 queued_bytes 全零；
+  - **中段单写验收样本：4096 目录收敛后单写收敛 10.1s**（= 32 tick 检测节奏
+    8s + 摊销扫描 2s + 单页），旧设计需全量重发 ~64s+；
+  - 回归测试：静默预算窗口继续 pass（`a_quiet_budget_window_continues_the_pass_instead_of_closing_it`）。
+- **涉及面**：`resource/sync.rs`、`resource/page.rs`。**规模：L**
 
 ### P2-4 群成员多赢家记录支持（决策项）
 

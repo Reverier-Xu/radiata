@@ -1,9 +1,14 @@
-//! Scale benchmark for the ack-gated anti-entropy planes (P0-2).
+//! Scale benchmark for the ack-gated anti-entropy planes (P0-2) and
+//! the per-key resource watermark (P2-3).
 //!
 //! Measures convergence time of the resource sync plane at
-//! 512–4096 resources × 8–16 members on loopback, plus the failure
+//! 512–4096 resources × 8–16 members on loopback, the failure
 //! shape of a flapping peer (session churn resolving ack verdicts as
-//! undelivered) — the matrix quantifies whether the per-page admission
+//! undelivered), and the P2-3 watermark acceptance sample: exactly one
+//! write into a converged mid-size catalog must converge within one
+//! detection cadence window plus an amortized scan walk — not the full
+//! catalog re-send cycle the previous fingerprint design paid on every
+//! quiet window. The matrix quantifies whether the per-page admission
 //! ack wait (2s bound) changes convergence or steady-state behavior at
 //! scale, replacing the archived loopback baseline.
 //!
@@ -155,12 +160,7 @@ async fn convergence_cell(peers: usize, resources: u32) {
     .to_owned();
   for index in 1..peers as u64 {
     let member = start(index).await;
-    let credential = radiata::MergeCredential::parse(&secret).unwrap();
-    member
-      .handle
-      .command(MergeCluster::new(nodes[0].endpoint.clone(), credential))
-      .await
-      .unwrap();
+    merge_with_retry(&mut nodes[0], &member, &secret).await;
     nodes.push(member);
   }
 
@@ -197,6 +197,109 @@ async fn convergence_cell(peers: usize, resources: u32) {
   }
 }
 
+/// Joins one member to the hub with bounded retries: a merge racing a
+/// loaded store's metadata-commit state machine can be refused with the
+/// typed transient `NotReady` (the operator re-issues the join); the
+/// sample must measure convergence, not join luck.
+async fn merge_with_retry(hub: &mut Node, member: &Node, secret: &str) {
+  let deadline = Instant::now() + Duration::from_secs(60);
+  let mut attempts = 0_u32;
+  loop {
+    attempts += 1;
+    let credential = radiata::MergeCredential::parse(secret).unwrap();
+    match member
+      .handle
+      .command(MergeCluster::new(hub.endpoint.clone(), credential))
+      .await
+    {
+      Ok(_) => return,
+      Err(_) if Instant::now() < deadline => {
+        tokio::time::sleep(Duration::from_millis(
+          200u64.saturating_mul(u64::from(attempts.min(5))),
+        ))
+        .await;
+      }
+      Err(error) => panic!("the merge never succeeded: {error:?}"),
+    }
+  }
+}
+
+/// One watermark acceptance cell: a full `resources` catalog converges
+/// first (untimed), then exactly one new record is written mid-catalog
+/// (its key sorts at the midpoint, so the detection pass must walk past
+/// unchanged watermarked entries) and the single-write convergence time
+/// is sampled on every leaf. Under the per-key watermark design the
+/// sample is one detection cadence window plus the amortized scan walk
+/// and one page round — not a full catalog re-send.
+async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
+  let mut nodes = vec![start(0).await];
+  let secret = nodes[0]
+    .handle
+    .command(RotateMergeCredential::new())
+    .await
+    .unwrap()
+    .into_credential()
+    .expose_secret()
+    .to_owned();
+  for index in 1..peers as u64 {
+    let member = start(index).await;
+    merge_with_retry(&mut nodes[0], &member, &secret).await;
+    nodes.push(member);
+  }
+
+  // Untimed setup: converge the full catalog first.
+  for seed in 0..resources {
+    let (name, labels) = resource(seed);
+    nodes[0]
+      .handle
+      .command(PutResource::new(ResourceWrite::new(name, labels)).unwrap())
+      .await
+      .unwrap();
+  }
+  let leaves: Vec<NodeHandle> = nodes[1..].iter().map(|node| node.handle.clone()).collect();
+  convergence_time(&leaves, resources as usize).await;
+
+  // The measured write: one new record at the catalog's key midpoint.
+  let mid = resources / 2;
+  let name =
+    ResourceName::parse(&format!("radiata.woooo.tech/resources/scale-{mid:05}-1")).unwrap();
+  let started = Instant::now();
+  nodes[0]
+    .handle
+    .command(
+      PutResource::new(ResourceWrite::new(
+        name,
+        ResourceLabels::new(
+          radiata::LabelValue::parse("benchmark").unwrap(),
+          ResourceUri::parse("file:///scale/mid-write").unwrap(),
+        ),
+      ))
+      .unwrap(),
+    )
+    .await
+    .unwrap();
+  convergence_time(&leaves, resources as usize + 1).await;
+  let elapsed = started.elapsed();
+
+  // Steady-state observations after the single-write round: queued
+  // bytes must be drained on every node.
+  let mut queued_bytes = Vec::new();
+  for node in &nodes {
+    let snapshot = node.handle.query(GetObservability::new()).await.unwrap();
+    queued_bytes.push(snapshot.counter(
+      &radiata::QualifiedTag::parse(radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES).unwrap(),
+    ));
+  }
+  println!(
+    "cell peers={peers} resources={resources} single_write_converge={:.1}s steady_queued_bytes={queued_bytes:?}",
+    elapsed.as_secs_f64(),
+  );
+
+  for node in nodes {
+    node.handle.command(Shutdown::new()).await.unwrap();
+  }
+}
+
 /// The convergence matrix: 512–4096 resources × 8–16 members.
 /// `RADIATA_BENCH_CELL=peers,resources` runs one cell only (debugging).
 #[ignore = "explicit benchmark: cargo test --release --test sync_scale_benchmark -- --ignored --nocapture"]
@@ -213,6 +316,18 @@ async fn sync_ack_convergence_matrix() {
   for (peers, resources) in [(8, 512), (16, 512), (8, 2048), (16, 4096)] {
     convergence_cell(peers, resources).await;
   }
+}
+
+/// The P2-3 watermark acceptance sample: a converged 4096-record
+/// catalog receives exactly one mid-catalog write. The sample must be
+/// one detection cadence window plus an amortized scan walk (a single
+/// changed page) — orders of magnitude below the full-catalog re-send
+/// cycle the previous fingerprint design paid on every quiet window.
+#[ignore = "explicit benchmark: cargo test --release --test sync_scale_benchmark sync_watermark_single_write_converges_within_one_cadence_window -- --ignored --nocapture"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn sync_watermark_single_write_converges_within_one_cadence_window() {
+  init_tracing();
+  mid_catalog_single_write_cell(8, 4096).await;
 }
 
 /// A flapping peer (session torn down every two seconds mid-convergence)
