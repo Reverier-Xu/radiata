@@ -12,6 +12,7 @@ version      = "0.0.2"
 
 [features]
 default = ["redb"]
+audit   = []
 json    = ["dep:fs4", "dep:rustix", "dep:serde", "dep:serde_json"]
 redb    = ["dep:redb"]
 

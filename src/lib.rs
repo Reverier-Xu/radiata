@@ -8,6 +8,7 @@
 //! module remains private.
 
 mod api;
+mod audit;
 mod config;
 mod error;
 mod extension_registry;

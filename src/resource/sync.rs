@@ -286,6 +286,7 @@ pub(crate) async fn resource_sync_tick(
       if delivered {
         round.commit_delivered(state);
       } else {
+        crate::audit::resource_page_rewound(peer.as_str());
         round.rewind(state);
       }
     }
@@ -334,8 +335,10 @@ async fn resource_sync_tick_peer(
       if state.passes_since_refresh >= WATERMARK_REFRESH_PASSES {
         state.passes_since_refresh = 0;
         state.watermarks.clear();
+        crate::audit::resource_watermarks_refreshed(peer.as_str());
       }
     }
+    crate::audit::resource_pass_settled(peer.as_str(), emission.walk_cursor.is_some());
     state.cursor = emission.walk_cursor.clone();
     state.scan_start = None;
     return Ok(ResourcePeerRound {

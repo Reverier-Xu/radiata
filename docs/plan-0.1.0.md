@@ -431,10 +431,18 @@
      打标（chat example 补 admin 端点 `UpdateNodeMetadata`）、disconnect、恢复
      （re-merge/recovery）、重启、资源 put/remove、revoke/cleanup；
   3. **随机序列驱动**：种子可复现，失败时输出 seed 与完整操作日志；
-  4. **检查点断言**：每个操作后按状态 map 有界等待收敛，断言集群可观测状态
-     == 模型期望（成员集、会话图、消息投递、资源视图、队列排空）。
-- **验收**：冒烟种子集入 CI lane；至少一次长跑（≥1000 操作序列）零发散；
-  fuzz 发现的缺陷逐条入档并回修。
+  4. **双重断言（状态 + 执行路径）**：每个操作后不仅有界等待 redb/HTTP 状态
+     收敛并断言等于模型期望，还解析节点日志断言**具体执行路径**符合状态 map 的
+     期望路径（如：中段写入 → 恰好一次 count=1 的水位过滤发射而非全量重发；
+     断开 → 恢复拨号来自预期发起方；leave → 墓碑传播路径而非集合重算）。杜绝
+     侥幸成功——路径错误即使终态正确也判失败。库内在语义决策点补结构化
+     tracing 事件（字段一致：peer、计数、原因/状态），chat 容器日志按节点落盘
+     供 harness 解析；
+  5. **运行基座**：Python 驱动 + chat 容器（复用 test_chat.py 基建），种子可复现。
+- **验收**：冒烟种子集入 CI lane；至少一次长跑（≥1000 操作序列）零发散（状态与
+  路径双重零违例）；fuzz 发现的缺陷逐条入档并回修。
+- **涉及面**：库内 tracing 打点、examples/chat（admin 端点 + 日志落盘）、
+  新增 fuzz 编排、CI lane。**规模：L**
 - **涉及面**：examples/chat（admin 端点）、新增 fuzz 编排、CI lane。**规模：L**
 
 ### P2-8 architecture.md 全量重审刷新

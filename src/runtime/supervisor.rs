@@ -1884,36 +1884,42 @@ pub(super) async fn dial_member(
   sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
   shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId, recovery_dialed: bool,
 ) -> Result<NodeId> {
-  // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
-  // at join (same-listener reconnects); without an anchor this process
-  // falls back to the join-mode relaxation and the application proof
-  // layer remains the authenticator.
-  let config = match driver.peer_spki(peer) {
-    Some(spki) => {
-      tls::member_client_config(rustls::pki_types::SubjectPublicKeyInfoDer::from(spki))?
-    }
-    None => tls::merge_client_config()?,
-  };
-  let mut connection = transport.connect(receiver.clone(), config).await?;
-  let session = driver.initiate_member(&mut connection, peer).await?;
-  let authenticated = session.peer().clone();
-  // The member-mode dial returns only after the session table settles, so
-  // the caller's first packet cannot race registration (including the
-  // crossed-dial loser outcome, which reports no usable session).
-  keep_outbound_session(
-    connection,
-    session,
-    packet,
-    sessions,
-    shutdown,
-    receiver,
-    recovery_dialed,
-    |session_task| {
-      tokio::spawn(session_task);
-    },
-  )
-  .await?;
-  Ok(authenticated)
+  crate::audit::dial_started(peer.as_str(), recovery_dialed);
+  let result = async {
+    // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
+    // at join (same-listener reconnects); without an anchor this process
+    // falls back to the join-mode relaxation and the application proof
+    // layer remains the authenticator.
+    let config = match driver.peer_spki(peer) {
+      Some(spki) => {
+        tls::member_client_config(rustls::pki_types::SubjectPublicKeyInfoDer::from(spki))?
+      }
+      None => tls::merge_client_config()?,
+    };
+    let mut connection = transport.connect(receiver.clone(), config).await?;
+    let session = driver.initiate_member(&mut connection, peer).await?;
+    let authenticated = session.peer().clone();
+    // The member-mode dial returns only after the session table settles, so
+    // the caller's first packet cannot race registration (including the
+    // crossed-dial loser outcome, which reports no usable session).
+    keep_outbound_session(
+      connection,
+      session,
+      packet,
+      sessions,
+      shutdown,
+      receiver,
+      recovery_dialed,
+      |session_task| {
+        tokio::spawn(session_task);
+      },
+    )
+    .await?;
+    Ok(authenticated)
+  }
+  .await;
+  crate::audit::dial_settled(peer.as_str(), recovery_dialed, result.is_ok());
+  result
 }
 
 /// The keep-open tail shared by join and member dials: spawns the

@@ -556,6 +556,7 @@ impl MetadataStore {
       Ok(ReconcileOutcome::Committed(receipt)) => {
         self.validate_receipt(&pending, &receipt, ProviderErrorContext::StorageReconcile)?;
         self.finish_journal_recovery()?;
+        crate::audit::journal_resolved(purpose, true);
         Ok(true)
       }
       Ok(_) => {
@@ -567,6 +568,7 @@ impl MetadataStore {
         // the store stays frozen and fails closed.
         if self.recover_pending(purpose).await?.is_none() {
           self.finish_journal_recovery()?;
+          crate::audit::journal_resolved(purpose, false);
           return Ok(false);
         }
         Err(Error::provider(

@@ -353,10 +353,20 @@ impl Supervisor {
         let pending = std::sync::Arc::clone(&self.recovery_pending);
         let transport = Arc::clone(&self.dependencies.transport);
         tokio::spawn(async move {
-          let _ = dial_member(
+          if let Err(error) = dial_member(
             transport, driver, sessions, packet, shutdown, receiver, &peer, true,
           )
-          .await;
+          .await
+          {
+            // A refused dial is expected while a peer restarts; the
+            // failure surfaces for the recovery controller's next
+            // observation tick instead of vanishing here.
+            tracing::warn!(
+              peer = %peer.as_str(),
+              kind = ?error.kind(),
+              "recovery dial failed"
+            );
+          }
           // Release the in-flight slot when the dial resolves, so recovery
           // stays alive across repeated partition waves (the counter bounds
           // in-flight dials, not lifetime volume).
