@@ -1,13 +1,13 @@
 {
   "writes": 30,
-  "converge_p50_ms": 7819.680581000284,
-  "converge_p90_ms": 17088.516414005426,
-  "converge_p99_ms": 17993.48660800024,
-  "converge_max_ms": 17993.48660800024,
-  "local_get_p50_ms": 0.47881501086521894,
-  "stream_probe_p50_ms": 0.142,
+  "converge_p50_ms": 8486.349171998882,
+  "converge_p90_ms": 16064.782147001097,
+  "converge_p99_ms": 16782.2871319986,
+  "converge_max_ms": 16782.2871319986,
+  "local_get_p50_ms": 0.47164700663415715,
+  "stream_probe_p50_ms": 0.177,
   "stream_probe_ok": 30,
-  "crash_recovery_s": 1.5422380279924255,
+  "crash_recovery_s": 9.652909472999454,
   "observability": {
     "1": {
       "members": 9,
@@ -35,13 +35,13 @@
     },
     "5": {
       "members": 9,
-      "sessions": 8,
+      "sessions": 6,
       "store_available": 1,
       "trace_records_dropped": 0
     },
     "6": {
       "members": 9,
-      "sessions": 5,
+      "sessions": 4,
       "store_available": 1,
       "trace_records_dropped": 0
     },
@@ -53,7 +53,7 @@
     },
     "8": {
       "members": 9,
-      "sessions": 4,
+      "sessions": 3,
       "store_available": 1,
       "trace_records_dropped": 0
     },
