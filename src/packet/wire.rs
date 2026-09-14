@@ -345,9 +345,9 @@ mod tests {
 
   fn ids() -> (TraceId, NodeId, NodeId) {
     (
-      TraceId::parse("trace_000000000000000000001").unwrap(),
-      NodeId::parse("node_000000000000000000001").unwrap(),
-      NodeId::parse("node_000000000000000000002").unwrap(),
+      TraceId::parse("trace-000000000000000000001").unwrap(),
+      NodeId::parse("node-000000000000000000001").unwrap(),
+      NodeId::parse("node-000000000000000000002").unwrap(),
     )
   }
 
@@ -503,9 +503,9 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
 
     let wire = super::OpenWire {
-      trace_id: "trace_000000000000000000001".to_owned(),
-      source: "node_000000000000000000001".to_owned(),
-      destination: "node_000000000000000000002".to_owned(),
+      trace_id: "trace-000000000000000000001".to_owned(),
+      source: "node-000000000000000000001".to_owned(),
+      destination: "node-000000000000000000002".to_owned(),
       protocol: "radiata.woooo.tech/features/not-a-protocol".to_owned(),
       metadata: Vec::new(),
       route: None,
@@ -544,10 +544,10 @@ mod route_tests {
 
   fn ids() -> (TraceId, NodeId, NodeId, NodeId) {
     (
-      TraceId::parse("trace_000000000000000000001").unwrap(),
-      NodeId::parse("node_000000000000000000001").unwrap(),
-      NodeId::parse("node_000000000000000000002").unwrap(),
-      NodeId::parse("node_000000000000000000003").unwrap(),
+      TraceId::parse("trace-000000000000000000001").unwrap(),
+      NodeId::parse("node-000000000000000000001").unwrap(),
+      NodeId::parse("node-000000000000000000002").unwrap(),
+      NodeId::parse("node-000000000000000000003").unwrap(),
     )
   }
 
@@ -577,7 +577,7 @@ mod route_tests {
     assert_eq!(route.current, holder);
     assert_eq!(
       route.visited,
-      vec![NodeId::parse("node_000000000000000000001").unwrap()]
+      vec![NodeId::parse("node-000000000000000000001").unwrap()]
     );
     assert_eq!(route.remaining_hops, 3);
   }
@@ -633,10 +633,10 @@ mod route_tests {
       protocol: "radiata.woooo.tech/protocols/test-packets".to_owned(),
       metadata: Vec::new(),
       route: Some(RouteWire {
-        current: "node_000000000000000000009".to_owned(),
+        current: "node-000000000000000000009".to_owned(),
         visited: vec![
-          "node_000000000000000000005".to_owned(),
-          "node_000000000000000000005".to_owned(),
+          "node-000000000000000000005".to_owned(),
+          "node-000000000000000000005".to_owned(),
         ],
         remaining_hops: 2,
       }),
@@ -657,7 +657,7 @@ mod route_tests {
         )
         .unwrap(),
       route: Some(HopState {
-        current: NodeId::parse("node_000000000000000000009").unwrap(),
+        current: NodeId::parse("node-000000000000000000009").unwrap(),
         visited: Vec::new(),
         remaining_hops: 1,
       }),

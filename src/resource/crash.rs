@@ -69,7 +69,7 @@ fn record(timestamp_millis: u64, removed: bool, uri: &str) -> ResourceRecordV1 {
     crate::ResourceUri::parse(uri).unwrap(),
     labels(),
     timestamp_millis,
-    NodeId::parse("node_000000000000000000001").unwrap(),
+    NodeId::parse("node-000000000000000000001").unwrap(),
     if removed { 1 } else { 0 },
     removed,
     &SigningKey::from_bytes(&[21; 32]),

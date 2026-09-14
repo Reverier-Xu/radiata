@@ -21,7 +21,7 @@ pub(crate) fn value(bytes: &[u8]) -> StoreValue {
 }
 
 pub(crate) fn transaction_id(index: u64) -> TransactionId {
-  TransactionId::parse(&format!("txn_{index:021}")).unwrap()
+  TransactionId::parse(&format!("txn-{index:021}")).unwrap()
 }
 
 /// The store requirements of the subprocess durability lanes (single

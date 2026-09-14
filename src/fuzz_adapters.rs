@@ -431,11 +431,11 @@ pub fn admission(input: &[u8]) {
 /// error, never a panic.
 pub fn routing(input: &[u8]) -> Option<()> {
   let pool: Vec<NodeId> = (1_u8..=8)
-    .map(|index| NodeId::parse(&format!("node_{index:021}")))
+    .map(|index| NodeId::parse(&format!("node-{index:021}")))
     .collect::<crate::Result<Vec<_>>>()
     .ok()?;
   let node = |byte: u8| pool[usize::from(byte) % pool.len()].clone();
-  let trace = TraceId::parse("trace_000000000000000000001").ok()?;
+  let trace = TraceId::parse("trace-000000000000000000001").ok()?;
   let max_hops = u32::from(bytes_at(input, 0) % 8) + 1;
   let mut context = RouteContext::new(
     trace,

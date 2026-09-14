@@ -379,7 +379,7 @@ mod tests {
   };
 
   fn node(seed: u64) -> NodeId {
-    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+    NodeId::parse(&format!("node-{seed:021}")).unwrap()
   }
 
   fn record(name: &str, timestamp: u64) -> crate::resource::ResourceRecordV1 {

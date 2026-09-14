@@ -90,11 +90,11 @@ mod tests {
   const OTHER_SEED: [u8; 32] = [42; 32];
 
   fn writer() -> NodeId {
-    NodeId::parse("node_000000000000000000041").unwrap()
+    NodeId::parse("node-000000000000000000041").unwrap()
   }
 
   fn other_writer() -> NodeId {
-    NodeId::parse("node_000000000000000000042").unwrap()
+    NodeId::parse("node-000000000000000000042").unwrap()
   }
 
   fn name(seed: u8) -> ResourceName {

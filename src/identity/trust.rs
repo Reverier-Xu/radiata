@@ -489,7 +489,7 @@ mod tests {
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn key(value: u8) -> crate::PublicKey {

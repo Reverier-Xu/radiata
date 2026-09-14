@@ -235,8 +235,10 @@ def op_join_chat(model: Model, rng: random.Random, node: int):
   # node's view).
   newcomer = node_id_of(node, f"u{node}")
   if newcomer:
+    # The id is matched bare: tracing wraps field values in quotes and
+    # ANSI formatting, so a `node=<id>` compound needle never matches.
     path.extend(
-      (peer, "member descriptor installed", f"node={newcomer}",
+      (peer, "member descriptor installed", newcomer,
        f"c{peer} installed the newcomer descriptor")
       for peer in peers
     )
@@ -446,8 +448,9 @@ def op_label(model: Model, rng: random.Random, node: int):
   updater = node_id_of(node, f"u{node}")
   path = []
   if updater:
+    # Bare-id match: see the join-chat note on tracing field formatting.
     path = [
-      (peer, "member descriptor installed", f"node={updater}",
+      (peer, "member descriptor installed", updater,
        f"c{peer} installed the relabeled descriptor of c{node}")
       for peer in sorted(u for u in model.alive & model.merged if u != node)
     ]

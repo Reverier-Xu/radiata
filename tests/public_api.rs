@@ -48,12 +48,12 @@ const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 /// Every public value constructor and canonical accessor.
 #[test]
 fn boundary_values_construct_parse_and_round_trip() {
-  let node = NodeId::parse("node_0000000000000000000A1").unwrap();
-  assert_eq!(node.as_str(), "node_0000000000000000000A1");
+  let node = NodeId::parse("node-0000000000000000000a1").unwrap();
+  assert_eq!(node.as_str(), "node-0000000000000000000a1");
   assert_eq!(node.to_string().parse::<NodeId>().unwrap(), node);
 
-  let txn = TransactionId::parse("txn_0000000000000000000C3").unwrap();
-  assert_eq!(txn.as_str(), "txn_0000000000000000000C3");
+  let txn = TransactionId::parse("txn-0000000000000000000c3").unwrap();
+  assert_eq!(txn.as_str(), "txn-0000000000000000000c3");
 
   let digest = Digest::from_bytes([7; 32]);
   assert_eq!(digest.as_bytes(), &[7; 32]);
@@ -121,11 +121,11 @@ fn boundary_values_construct_parse_and_round_trip() {
     "join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
   );
 
-  let trace = TraceId::parse("trace_0000000000000000000E5").unwrap();
-  assert_eq!(trace.as_str(), "trace_0000000000000000000E5");
+  let trace = TraceId::parse("trace-0000000000000000000e5").unwrap();
+  assert_eq!(trace.as_str(), "trace-0000000000000000000e5");
 
-  let key_operation = KeyOperationId::parse("keyop_0000000000000000000D4").unwrap();
-  assert_eq!(key_operation.as_str(), "keyop_0000000000000000000D4");
+  let key_operation = KeyOperationId::parse("keyop-0000000000000000000d4").unwrap();
+  assert_eq!(key_operation.as_str(), "keyop-0000000000000000000d4");
 
   // Key-handle material is constructed from provider bytes exactly as an
   // external provider passes custody through the facade.
@@ -589,7 +589,7 @@ fn stream_surface_is_externally_constructible() {
   assert_eq!(metadata.get(&key), Some(b"hint-value".as_slice()));
   assert_eq!(metadata.entries().count(), 1);
 
-  let node = NodeId::parse("node_0000000000000000000A1").unwrap();
+  let node = NodeId::parse("node-0000000000000000000a1").unwrap();
   let _exact = StreamTarget::Exact(node.clone());
   let _matching =
     StreamTarget::MatchingNodes(Selector::parse("example.org/labels/lane=one").unwrap());

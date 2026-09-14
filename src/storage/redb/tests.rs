@@ -54,7 +54,7 @@ async fn redb_adapter_refuses_unsupported_capability_requirements() {
 async fn redb_adapter_reopen_preserves_entries_receipts_and_revision() {
   let directory = TempDir::new().unwrap();
   let path = directory.path().join("store.redb");
-  let transaction_id = TransactionId::parse("txn_000000000000000000042").unwrap();
+  let transaction_id = TransactionId::parse("txn-000000000000000000042").unwrap();
   {
     let factory = Arc::new(RedbStoreFactory::new(path.clone()));
     let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
@@ -156,7 +156,7 @@ async fn redb_adapter_transaction_digest_conflicts_fail_closed() {
   let namespace = crate::storage::test_util::namespace("redb-digest");
 
   let original = StoreTransaction::new(
-    TransactionId::parse("txn_000000000000000000041").unwrap(),
+    TransactionId::parse("txn-000000000000000000041").unwrap(),
     base,
     vec![StoreOperation::Put {
       namespace: namespace.clone(),
@@ -174,7 +174,7 @@ async fn redb_adapter_transaction_digest_conflicts_fail_closed() {
   // The same transaction identity with a different operation digest must
   // fail closed instead of recommitting.
   let forged = StoreTransaction::new(
-    TransactionId::parse("txn_000000000000000000041").unwrap(),
+    TransactionId::parse("txn-000000000000000000041").unwrap(),
     receipt.committed_revision().clone(),
     vec![StoreOperation::Put {
       namespace: namespace.clone(),
@@ -210,7 +210,7 @@ async fn redb_adapter_transaction_digest_conflicts_fail_closed() {
   // every other receipt intact.
   let other_base = storage.snapshot().await.unwrap().revision().clone();
   let other = StoreTransaction::new(
-    TransactionId::parse("txn_000000000000000000042").unwrap(),
+    TransactionId::parse("txn-000000000000000000042").unwrap(),
     other_base,
     vec![StoreOperation::Put {
       namespace: namespace.clone(),
@@ -226,7 +226,7 @@ async fn redb_adapter_transaction_digest_conflicts_fail_closed() {
   };
   let forget_base = storage.snapshot().await.unwrap().revision().clone();
   let wrong_forget = StoreTransaction::new(
-    TransactionId::parse("txn_000000000000000000043").unwrap(),
+    TransactionId::parse("txn-000000000000000000043").unwrap(),
     forget_base,
     vec![
       StoreOperation::ForgetReceipt {
@@ -255,7 +255,7 @@ async fn redb_adapter_transaction_digest_conflicts_fail_closed() {
   ));
 
   let exact_forget = StoreTransaction::new(
-    TransactionId::parse("txn_000000000000000000044").unwrap(),
+    TransactionId::parse("txn-000000000000000000044").unwrap(),
     storage.snapshot().await.unwrap().revision().clone(),
     vec![StoreOperation::ForgetReceipt {
       transaction: receipt.transaction().clone(),

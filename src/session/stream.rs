@@ -1618,7 +1618,7 @@ mod replacement_tests {
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   /// Every completion ordering picks the same single session owner from
@@ -1888,7 +1888,7 @@ mod liveness_tests {
     {
       let (notify, _wait) = oneshot::channel();
       pending.lock().unwrap().insert(
-        crate::TraceId::parse("trace_000000000000000000001").unwrap(),
+        crate::TraceId::parse("trace-000000000000000000001").unwrap(),
         super::PendingAck::Wait {
           notify,
           queued_at: 100,
@@ -1948,7 +1948,7 @@ mod pending_admission_tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   /// A session entry whose pending map is pre-filled with relayed
@@ -1963,7 +1963,7 @@ mod pending_admission_tests {
     };
     let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
     for seed in 0..pending_admissions {
-      let trace_id = TraceId::parse(&format!("trace_{seed:021}")).unwrap();
+      let trace_id = TraceId::parse(&format!("trace-{seed:021}")).unwrap();
       pending_acks.lock().unwrap().insert(
         trace_id,
         PendingAck::Relay {
@@ -1978,7 +1978,7 @@ mod pending_admission_tests {
       pending_admissions,
       clock: Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1))),
       meta: Arc::new(SessionMeta {
-        id: crate::SessionId::parse("session_000000000000000000001").unwrap(),
+        id: crate::SessionId::parse("session-000000000000000000001").unwrap(),
         generation: 1,
         endpoint: crate::Endpoint::parse("wss://saturated:9000").unwrap(),
         features: Vec::new(),
@@ -1998,7 +1998,7 @@ mod pending_admission_tests {
     let entry = saturated_entry(4);
     let (ack_tx, ack_rx) = oneshot::channel();
     let request = crate::packet::OutboundRequest {
-      trace_id: TraceId::parse("trace_000000000000000000099").unwrap(),
+      trace_id: TraceId::parse("trace-000000000000000000099").unwrap(),
       target: StreamTarget::Exact(node(2)),
       load_balancer: None,
       max_hops: 1,
@@ -2038,11 +2038,11 @@ mod admission_tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn trace(seed: u32) -> TraceId {
-    TraceId::parse(&format!("trace_{seed:021}")).unwrap()
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
   }
 
   fn protocol(name: &str) -> ProtocolTag {

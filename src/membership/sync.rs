@@ -931,11 +931,11 @@ mod tests {
   }
 
   fn node(seed: u8) -> NodeId {
-    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+    NodeId::parse(&format!("node-{seed:021}")).unwrap()
   }
 
   fn node_at(seed: u64) -> NodeId {
-    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+    NodeId::parse(&format!("node-{seed:021}")).unwrap()
   }
 
   fn key_at(value: u64) -> crate::PublicKey {

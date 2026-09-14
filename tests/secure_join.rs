@@ -212,7 +212,7 @@ async fn born_with_cluster_serves_immediately_without_ceremony() {
   // No creation ceremony exists: the local view resolves from the first
   // instant, and the singleton membership page is exactly the self node.
   let local = node.handle.query(GetLocalNode::new()).await.unwrap();
-  assert!(local.node_id().as_str().starts_with("node_"));
+  assert!(local.node_id().as_str().starts_with("node-"));
   let members = node
     .handle
     .query(radiata::PageMembers::new(
@@ -555,7 +555,7 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
 
   // No session to any node: routing to an unknown exact node fails before
   // any delivery work.
-  let unknown = radiata::NodeId::parse("node_999999999999999999999").unwrap();
+  let unknown = radiata::NodeId::parse("node-999999999999999999999").unwrap();
   let packet = receiver
     .handle
     .open_stream(

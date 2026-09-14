@@ -834,7 +834,7 @@ mod tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   /// The built-in default policy always relays through the lowest live

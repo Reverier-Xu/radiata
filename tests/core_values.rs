@@ -9,13 +9,13 @@ use radiata::{
 
 #[test]
 fn core_ids_round_trip_canonical_forms() {
-  let node = NodeId::parse("node_0123456789abcdefghijk").unwrap();
-  let trace = TraceId::parse("trace_0123456789ABCDEFGHIJK").unwrap();
-  let transaction = TransactionId::parse("txn_abcdefghijklmnopqrstu").unwrap();
+  let node = NodeId::parse("node-0123456789abcdefghijk").unwrap();
+  let trace = TraceId::parse("trace-0123456789abcdefghijk").unwrap();
+  let transaction = TransactionId::parse("txn-abcdefghijklmnopqrstu").unwrap();
 
-  assert_eq!(node.as_str(), "node_0123456789abcdefghijk");
-  assert_eq!(trace.as_str(), "trace_0123456789ABCDEFGHIJK");
-  assert_eq!(transaction.as_str(), "txn_abcdefghijklmnopqrstu");
+  assert_eq!(node.as_str(), "node-0123456789abcdefghijk");
+  assert_eq!(trace.as_str(), "trace-0123456789abcdefghijk");
+  assert_eq!(transaction.as_str(), "txn-abcdefghijklmnopqrstu");
   assert_eq!(
     transaction.to_string().parse::<TransactionId>().unwrap(),
     transaction
@@ -25,11 +25,13 @@ fn core_ids_round_trip_canonical_forms() {
 #[test]
 fn core_ids_reject_noncanonical_forms() {
   for value in [
-    "node_0123456789abcdefghij",
-    "node_0123456789abcdefghijkl",
-    "node_0123456789abcdefghij-",
-    " node_0123456789abcdefghijk",
-    "Node_0123456789abcdefghijk",
+    "node-0123456789abcdefghij",
+    "node-0123456789abcdefghijkl",
+    "node-0123456789abcdefghij-",
+    " node-0123456789abcdefghijk",
+    "Node-0123456789abcdefghijk",
+    "node_0123456789abcdefghijk",
+    "node-0123456789ABCDEFGHIJK",
   ] {
     assert_eq!(
       NodeId::parse(value).unwrap_err().kind(),
@@ -38,10 +40,10 @@ fn core_ids_reject_noncanonical_forms() {
   }
 
   for value in [
-    "txn_abcdefghijklmnopqrst",
-    "txn_abcdefghijklmnopqrstuv",
-    "txn_abcdefghijklmnopqrst-",
-    "Txn_abcdefghijklmnopqrstu",
+    "txn-abcdefghijklmnopqrst",
+    "txn-abcdefghijklmnopqrstuv",
+    "txn-abcdefghijklmnopqrst-",
+    "Txn-abcdefghijklmnopqrstu",
   ] {
     assert_eq!(
       TransactionId::parse(value).unwrap_err().kind(),
@@ -210,10 +212,10 @@ fn core_byte_wrappers_require_explicit_access() {
 
 proptest! {
   #[test]
-  fn core_generated_ids_round_trip(suffix in "[0-9a-zA-Z]{21}") {
-    let node = format!("node_{suffix}");
-    let trace = format!("trace_{suffix}");
-    let transaction = format!("txn_{suffix}");
+  fn core_generated_ids_round_trip(suffix in "[0-9a-z]{21}") {
+    let node = format!("node-{suffix}");
+    let trace = format!("trace-{suffix}");
+    let transaction = format!("txn-{suffix}");
 
     prop_assert_eq!(NodeId::parse(&node).unwrap().to_string(), node);
     prop_assert_eq!(TraceId::parse(&trace).unwrap().to_string(), trace);

@@ -208,7 +208,7 @@ mod tests {
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn set(values: &[u8]) -> BTreeSet<NodeId> {
@@ -351,7 +351,7 @@ pub(crate) mod simulation {
       let reachable: BTreeSet<NodeId> = reachable
         .iter()
         .map(|value| {
-          NodeId::parse(&format!("node_{value:021}"))
+          NodeId::parse(&format!("node-{value:021}"))
             .unwrap_or_else(|_| unreachable!("scenario node text"))
         })
         .collect();
@@ -383,7 +383,7 @@ pub(crate) mod simulation {
     use crate::NodeId;
 
     fn node(value: u8) -> NodeId {
-      NodeId::parse(&format!("node_{value:021}")).unwrap()
+      NodeId::parse(&format!("node-{value:021}")).unwrap()
     }
 
     fn online() -> BTreeSet<NodeId> {
@@ -442,7 +442,7 @@ mod scale_tests {
   use crate::NodeId;
 
   fn node_at(index: usize) -> NodeId {
-    NodeId::parse(&format!("node_{index:021}")).unwrap()
+    NodeId::parse(&format!("node-{index:021}")).unwrap()
   }
 
   fn set(values: &[usize]) -> BTreeSet<NodeId> {

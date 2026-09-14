@@ -146,13 +146,14 @@ fn core_key_boundary_is_constructible_inspectable_and_redacted() {
   assert!(capabilities.has_reconciliation());
   assert!(capabilities.has_deletion());
 
-  let operation = KeyOperationId::parse("keyop_0123456789abcdefghijk").unwrap();
-  assert_eq!(operation.as_str(), "keyop_0123456789abcdefghijk");
+  let operation = KeyOperationId::parse("keyop-0123456789abcdefghijk").unwrap();
+  assert_eq!(operation.as_str(), "keyop-0123456789abcdefghijk");
   assert_eq!(
     operation.to_string().parse::<KeyOperationId>().unwrap(),
     operation
   );
-  assert!(KeyOperationId::parse("keyop_0123456789abcdefghij-").is_err());
+  assert!(KeyOperationId::parse("keyop-0123456789abcdefghij-").is_err());
+  assert!(KeyOperationId::parse("keyop-0123456789ABCDEFGHIJK").is_err());
 
   let handle = KeyHandle::from_provider_bytes(Arc::from(b"sensitive-handle".as_slice())).unwrap();
   assert_eq!(handle.expose_provider_handle(), b"sensitive-handle");
@@ -206,7 +207,7 @@ fn core_storage_boundary_values_round_trip() {
   assert_eq!(entry.value(), &value);
 
   let digest = value.digest().clone();
-  let transaction = TransactionId::parse("txn_0123456789abcdefghijk").unwrap();
+  let transaction = TransactionId::parse("txn-0123456789abcdefghijk").unwrap();
   let operations = [
     StoreOperation::Check {
       namespace: namespace.clone(),

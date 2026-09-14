@@ -98,11 +98,11 @@ mod terminal_failure_tests {
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn trace(seed: u32) -> TraceId {
-    TraceId::parse(&format!("trace_{seed:021}")).unwrap()
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
   }
 
   /// A terminal failure on an already-tracked route moves only the state

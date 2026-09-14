@@ -155,7 +155,7 @@ mod tests {
   use crate::{ErrorKind, NodeId};
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn members(values: &[u8]) -> BTreeSet<NodeId> {
@@ -283,7 +283,7 @@ mod scale_tests {
   use crate::NodeId;
 
   fn node_at(index: usize) -> NodeId {
-    NodeId::parse(&format!("node_{index:021}")).unwrap()
+    NodeId::parse(&format!("node-{index:021}")).unwrap()
   }
 
   /// The 1,024-node functional trend: the sparse planner and the

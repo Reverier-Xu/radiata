@@ -516,13 +516,10 @@ impl MetadataStore {
 /// retried sweep replays the same cleanup as an idempotent no-op while
 /// no other transaction can collide with it.
 fn retention_sweep_operation_id(target: &TransactionId) -> crate::Result<TransactionId> {
-  TransactionId::parse(&format!(
-    "txn_{}",
-    crate::identity::id::encode_base62_suffix(super::deterministic_transaction_value(
-      RETENTION_SWEEP_DOMAIN,
-      &[target.as_str().as_bytes()],
-    )?)?
-  ))
+  TransactionId::parse(&crate::identity::id::prefixed_id(
+    "txn",
+    super::deterministic_transaction_value(RETENTION_SWEEP_DOMAIN, &[target.as_str().as_bytes()])?,
+  )?)
 }
 
 /// Deterministically rebuilds the identity of a transaction that paired the

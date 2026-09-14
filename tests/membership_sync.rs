@@ -135,7 +135,7 @@ async fn start_node_with_keys(
     handle,
     // Port zero resolves to the OS-assigned port when listening.
     endpoint: Endpoint::parse("wss://127.0.0.1:0").unwrap(),
-    id: radiata::NodeId::parse(&format!("node_{seed:021}")).unwrap(),
+    id: radiata::NodeId::parse(&format!("node-{seed:021}")).unwrap(),
   }
 }
 

@@ -1267,7 +1267,7 @@ mod tests {
     let foreign_identity = crate::identity::records::LocalIdentityV1::new(
       node(78_000),
       PublicKey::from_bytes(foreign_signing.verifying_key().to_bytes()),
-      crate::KeyOperationId::parse("keyop_500000000000000000000").unwrap(),
+      crate::KeyOperationId::parse("keyop-500000000000000000000").unwrap(),
       crate::KeyHandle::from_provider_bytes(Arc::from(&b"foreign-handle"[..])).unwrap(),
     );
     let foreign = signed_grant(

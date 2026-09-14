@@ -122,8 +122,8 @@ pub(crate) fn identity_binding_key(node: &NodeId) -> Result<(StoreNamespace, Sto
 pub(crate) fn credential_use_key(
   issuer: &NodeId, generation: &GenerationId, subject: &NodeId,
 ) -> Result<(StoreNamespace, StoreKey)> {
-  // No separator: `NodeId` is fixed-width (base62, exactly
-  // `NodeId::TEXT_LEN` characters) and `GenerationId` is a fixed 16
+  // No separator: `NodeId` is fixed-width (lowercase base-36, exactly
+  // `NodeId` text length characters) and `GenerationId` is a fixed 16
   // bytes, so the issuer/generation/subject split is unambiguous by
   // position. The subject scopes the record: one credential generation
   // may admit many subjects, but each (generation, subject) pair commits
@@ -879,10 +879,10 @@ mod tests {
   use super::*;
   use crate::{ErrorKind, QualifiedTag, TransactionId, protocol::encode_canonical};
 
-  const SUBJECT_NODE: &str = "node_100000000000000000000";
-  const ISSUER_NODE: &str = "node_200000000000000000000";
-  const OPERATION: &str = "keyop_500000000000000000000";
-  const TRANSACTION: &str = "txn_600000000000000000000";
+  const SUBJECT_NODE: &str = "node-100000000000000000000";
+  const ISSUER_NODE: &str = "node-200000000000000000000";
+  const OPERATION: &str = "keyop-500000000000000000000";
+  const TRANSACTION: &str = "txn-600000000000000000000";
   const BASE_REVISION: &[u8] = &[0x07];
   const PURPOSE: &str = "node-identity";
   const SIGNING_SEED: [u8; 32] = [0x42; 32];
@@ -988,12 +988,12 @@ mod tests {
     crate::hex::decode(hex, "golden").unwrap()
   }
 
-  const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f6c6f63616c2d6964656e746974792d763101781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f705f353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
-  const KEY_CREATION_INTENT_GOLDEN: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f6b65792d6372656174696f6e2d696e74656e742d763101781b6b65796f705f353030303030303030303030303030303030303030781a6e6f64655f3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e5f3630303030303030303030303030303030303030304107";
-  const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f6f2e746563682f736368656d61732f6964656e746974792d62696e64696e672d763101781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139";
-  const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f63726564656e7469616c2d7573652d763101781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
-  const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3584009dc3281151230e95e83bdbf2cd9980b355e5c18acb600c5114fbf51a082961249d4c580f6a99cb16a10277db527b001de91d55c5be064322a31559377959d0d";
-  const MERGE_GRANT_BODY_GOLDEN: &str = "877829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64655f3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64655f32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+  const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f6c6f63616c2d6964656e746974792d763101781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
+  const KEY_CREATION_INTENT_GOLDEN: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f6b65792d6372656174696f6e2d696e74656e742d763101781b6b65796f702d353030303030303030303030303030303030303030781a6e6f64652d3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e2d3630303030303030303030303030303030303030304107";
+  const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f6f2e746563682f736368656d61732f6964656e746974792d62696e64696e672d763101781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139";
+  const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f63726564656e7469616c2d7573652d763101781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+  const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840621e250937af13187933854eee29d10f832f52cc1139193f8ecd538f8abcc3db21c04d4bcc1bd9c7edbffc84b897576a7a29547c856c46d3fdfd1619b40b5c06";
+  const MERGE_GRANT_BODY_GOLDEN: &str = "877829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 
   #[test]
   fn identity_records_golden_vectors_match_exact_bytes() {
@@ -1197,7 +1197,7 @@ mod tests {
   fn identity_records_reject_field_value_mutations() {
     let malformed_node = {
       let mut bytes = identity_binding().encode().unwrap();
-      replace_text(&mut bytes, SUBJECT_NODE, "node_!00000000000000000000");
+      replace_text(&mut bytes, SUBJECT_NODE, "node-!00000000000000000000");
       bytes
     };
     assert!(IdentityBindingV1::decode(&malformed_node).is_err());
@@ -1280,7 +1280,7 @@ mod tests {
     let signature = grant_signature(&grant);
     let other_merge = MergeId::from_operation(OperationId::from_bytes([0xE5; 16]));
     let other_generation = GenerationId::from_operation(OperationId::from_bytes([0xE5; 16]));
-    let other_node = node("node_900000000000000000000");
+    let other_node = node("node-900000000000000000000");
     let other_key = PublicKey::from_bytes([0xB2; 32]);
 
     for mutated in [
@@ -1540,7 +1540,7 @@ mod tests {
     // Mutating any single intent field changes the recovered identity.
     for mutated in [
       KeyCreationIntentV1::new(
-        KeyOperationId::parse("keyop_600000000000000000000").unwrap(),
+        KeyOperationId::parse("keyop-600000000000000000000").unwrap(),
         node(SUBJECT_NODE),
         PURPOSE.to_owned(),
         transaction(),
@@ -1567,7 +1567,7 @@ mod tests {
         operation(),
         node(SUBJECT_NODE),
         PURPOSE.to_owned(),
-        TransactionId::parse("txn_700000000000000000000").unwrap(),
+        TransactionId::parse("txn-700000000000000000000").unwrap(),
         base_revision(),
       )
       .unwrap(),
@@ -1636,34 +1636,36 @@ mod tests {
   fn suffix_space() -> u128 {
     let mut space = 1_u128;
     for _ in 0..21 {
-      space *= 62;
+      space *= 36;
     }
     space
   }
 
+  /// The 14-byte entropy draw the generator consumes: the value's low
+  /// 112 bits, big-endian.
   fn entropy_word(value: u128) -> Vec<u8> {
-    value.to_be_bytes().to_vec()
+    value.to_be_bytes()[2..].to_vec()
   }
 
   #[test]
   fn identity_records_generated_ids_use_canonical_unbiased_suffixes() {
     let zero = ScriptedEntropy::new(vec![entropy_word(0)]);
     let id = NodeId::generate(&zero).unwrap();
-    assert_eq!(id.as_str(), "node_000000000000000000000");
+    assert_eq!(id.as_str(), "node-000000000000000000000");
     assert_eq!(NodeId::parse(id.as_str()).unwrap(), id);
 
     let max = ScriptedEntropy::new(vec![entropy_word(suffix_space() - 1)]);
     let id = NodeId::generate(&max).unwrap();
-    assert_eq!(id.as_str(), "node_ZZZZZZZZZZZZZZZZZZZZZ");
+    assert_eq!(id.as_str(), "node-zzzzzzzzzzzzzzzzzzzzz");
     assert_eq!(NodeId::parse(id.as_str()).unwrap(), id);
 
     let one = ScriptedEntropy::new(vec![entropy_word(1)]);
     let id = TransactionId::generate(&one).unwrap();
-    assert_eq!(id.as_str(), "txn_000000000000000000001");
+    assert_eq!(id.as_str(), "txn-000000000000000000001");
 
-    let digit_run = ScriptedEntropy::new(vec![entropy_word(61)]);
+    let digit_run = ScriptedEntropy::new(vec![entropy_word(36 + 25)]);
     let id = KeyOperationId::generate(&digit_run).unwrap();
-    assert_eq!(id.as_str(), "keyop_00000000000000000000Z");
+    assert_eq!(id.as_str(), "keyop-00000000000000000001p");
     assert_eq!(KeyOperationId::parse(id.as_str()).unwrap(), id);
   }
 
@@ -1671,15 +1673,15 @@ mod tests {
   fn identity_records_generator_rejects_out_of_range_candidates() {
     let entropy = ScriptedEntropy::new(vec![entropy_word(suffix_space()), entropy_word(5)]);
     let id = NodeId::generate(&entropy).unwrap();
-    assert_eq!(id.as_str(), "node_000000000000000000005");
+    assert_eq!(id.as_str(), "node-000000000000000000005");
 
     let entropy = ScriptedEntropy::new(vec![
       entropy_word(u128::MAX),
       entropy_word(suffix_space()),
-      entropy_word(61),
+      entropy_word(36 + 25),
     ]);
     let id = NodeId::generate(&entropy).unwrap();
-    assert_eq!(id.as_str(), "node_00000000000000000000Z");
+    assert_eq!(id.as_str(), "node-00000000000000000001p");
   }
 
   #[test]

@@ -4,7 +4,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::{BoxFuture, Digest, Error, PublicKey, QualifiedTag, Result, Signature, TransactionId};
 
-const KEY_OPERATION_PREFIX: &str = "keyop_";
+const KEY_OPERATION_PREFIX: &str = "keyop";
 const STORE_VALUE_DOMAIN: &[u8] = b"radiata/store-value/v1\0";
 const STORE_TRANSACTION_DOMAIN: &[u8] = b"radiata/store-transaction/v1\0";
 
@@ -59,8 +59,8 @@ impl KeyOperationId {
 
   #[allow(dead_code)]
   pub(crate) fn generate(entropy: &dyn crate::api::Entropy) -> Result<Self> {
-    let suffix = crate::identity::random_base62_suffix(entropy)?;
-    Ok(Self(format!("{KEY_OPERATION_PREFIX}{suffix}")))
+    let value = crate::identity::id::random_prefixed_id(KEY_OPERATION_PREFIX, entropy)?;
+    Ok(Self(value))
   }
 
   pub fn as_str(&self) -> &str {
@@ -1100,7 +1100,7 @@ mod tests {
     let computed = transaction.computed_operation_digest();
     transaction.operation_digest = computed.clone();
 
-    assert_eq!(transaction.id().as_str(), "txn_0123456789abcdefghijk");
+    assert_eq!(transaction.id().as_str(), "txn-0123456789abcdefghijk");
     assert_eq!(transaction.operation_digest(), &computed);
     assert_eq!(transaction.computed_operation_digest(), computed);
     assert_eq!(transaction.base_revision().as_bytes(), &[1]);
@@ -1158,7 +1158,7 @@ mod tests {
       for second in first + 1..operations.len() {
         assert!(
           StoreTransaction::new(
-            TransactionId::parse(&format!("txn_{first:010}{second:011}")).unwrap(),
+            TransactionId::parse(&format!("txn-{first:010}{second:011}")).unwrap(),
             revision.clone(),
             vec![operations[first].clone(), operations[second].clone()],
           )
@@ -1167,10 +1167,10 @@ mod tests {
       }
     }
 
-    let receipt = TransactionId::parse("txn_111111111111111111111").unwrap();
+    let receipt = TransactionId::parse("txn-111111111111111111111").unwrap();
     assert!(
       StoreTransaction::new(
-        TransactionId::parse("txn_222222222222222222222").unwrap(),
+        TransactionId::parse("txn-222222222222222222222").unwrap(),
         revision,
         vec![
           StoreOperation::ForgetReceipt {
@@ -1200,7 +1200,7 @@ mod tests {
       })
       .collect();
     let transaction = StoreTransaction::new(
-      TransactionId::parse("txn_333333333333333333333").unwrap(),
+      TransactionId::parse("txn-333333333333333333333").unwrap(),
       StoreRevision::new(Arc::from([1])).unwrap(),
       operations,
     )
@@ -1219,7 +1219,7 @@ mod tests {
       value: StoreValue::new(Arc::from(value)),
     }]);
     StoreTransaction {
-      id: TransactionId::parse("txn_0123456789abcdefghijk").unwrap(),
+      id: TransactionId::parse("txn-0123456789abcdefghijk").unwrap(),
       operation_digest: Digest::from_bytes([0; 32]),
       base_revision: StoreRevision::new(Arc::from([revision])).unwrap(),
       operations,

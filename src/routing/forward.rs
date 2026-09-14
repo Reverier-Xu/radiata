@@ -418,11 +418,11 @@ mod tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn trace(seed: u32) -> TraceId {
-    TraceId::parse(&format!("trace_{seed:021}")).unwrap()
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
   }
 
   fn chunk(seed: u32, sequence: u64, payload: u8) -> ChunkFrame {

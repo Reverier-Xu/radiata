@@ -149,7 +149,8 @@ impl DropTracker {
 
 /// Deterministic entropy: every fill yields the next counter in big-endian
 /// bytes right-aligned into the output. Sixteen-byte fills stay far below
-/// the base62 suffix space, so generated IDs are `...1`, `...2`, and so on.
+/// the lowercase base-36 suffix space, so generated IDs are `...1`,
+/// `...2`, and so on.
 #[derive(Debug, Default)]
 pub struct SequenceEntropy {
   next: Mutex<u128>,

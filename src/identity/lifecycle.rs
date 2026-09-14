@@ -680,15 +680,15 @@ mod tests {
   }
 
   fn node(value: u128) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn operation(value: u128) -> KeyOperationId {
-    KeyOperationId::parse(&format!("keyop_{value:021}")).unwrap()
+    KeyOperationId::parse(&format!("keyop-{value:021}")).unwrap()
   }
 
   fn transaction(value: u128) -> TransactionId {
-    TransactionId::parse(&format!("txn_{value:021}")).unwrap()
+    TransactionId::parse(&format!("txn-{value:021}")).unwrap()
   }
 
   fn namespace(tag: &str) -> StoreNamespace {

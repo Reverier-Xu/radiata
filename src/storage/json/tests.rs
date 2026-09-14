@@ -46,7 +46,7 @@ async fn json_adapter_generation_file_is_deterministic_and_header_complete() {
   assert_eq!(document.generation, 1);
   assert_eq!(document.parent_generation, None);
   assert_eq!(document.parent_digest, None);
-  assert_eq!(document.transaction_id, "txn_000000000000000000001");
+  assert_eq!(document.transaction_id, "txn-000000000000000000001");
   assert_eq!(
     document.operation_digest,
     hex_encode(receipt.operation_digest().as_bytes())
@@ -92,8 +92,8 @@ async fn json_adapter_names_are_unique_zero_padded_and_never_reused() {
   assert_eq!(files.len(), 2);
   let first = files[0].file_name().unwrap().to_str().unwrap();
   let second = files[1].file_name().unwrap().to_str().unwrap();
-  assert!(first.starts_with("gen-00000000000000000001-txn_"));
-  assert!(second.starts_with("gen-00000000000000000002-txn_"));
+  assert!(first.starts_with("gen-00000000000000000001-txn-"));
+  assert!(second.starts_with("gen-00000000000000000002-txn-"));
   assert_ne!(first, second);
 
   drop(storage);
@@ -108,7 +108,7 @@ async fn json_adapter_names_are_unique_zero_padded_and_never_reused() {
       .unwrap()
       .to_str()
       .unwrap()
-      .starts_with("gen-00000000000000000003-txn_")
+      .starts_with("gen-00000000000000000003-txn-")
   );
 }
 
@@ -159,7 +159,7 @@ async fn json_adapter_commit_never_overwrites_final_generation() {
 
   let collision = dir
     .path()
-    .join("gen-00000000000000000002-txn_000000000000000000002.json");
+    .join("gen-00000000000000000002-txn-000000000000000000002.json");
   fs::write(&collision, b"pre-existing final").unwrap();
   let before = fs::read(&collision).unwrap();
   let revision = head_revision(&*storage).await;
@@ -183,7 +183,7 @@ async fn json_adapter_stale_temporary_cleanup_preserves_finals_and_unrelated_fil
 
   let stale_temp = dir
     .path()
-    .join("tmp-00000000000000000002-txn_000000000000000000099-0.tmp");
+    .join("tmp-00000000000000000002-txn-000000000000000000099-0.tmp");
   fs::write(&stale_temp, b"partial").unwrap();
   let lookalike = dir.path().join("tmp-not-a-counter.tmp");
   fs::write(&lookalike, b"keep").unwrap();
@@ -378,7 +378,7 @@ async fn json_adapter_reopen_rejects_corruption_and_never_selects_older() {
     &files[0],
     dir
       .path()
-      .join("gen-00000000000000000001-txn_000000000000000000099.json"),
+      .join("gen-00000000000000000001-txn-000000000000000000099.json"),
   )
   .unwrap();
   expect_reopen_error(&dir, ErrorKind::StorageCorrupt).await;
@@ -438,7 +438,7 @@ async fn json_adapter_reopen_rejects_corruption_and_never_selects_older() {
   let files = generation_files(dir.path());
   let bytes = fs::read(&files[1]).unwrap();
   let text = String::from_utf8(bytes).unwrap();
-  let edited = text.replace("txn_000000000000000000001", "txn_000000000000000000099");
+  let edited = text.replace("txn-000000000000000000001", "txn-000000000000000000099");
   fs::write(&files[1], edited).unwrap();
   expect_reopen_error(&dir, ErrorKind::StorageCorrupt).await;
 }
