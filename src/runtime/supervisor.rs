@@ -1058,6 +1058,7 @@ impl Supervisor {
     tasks: &mut JoinSet<()>,
   ) -> Result<MergeView> {
     self.require_unblocked()?;
+    crate::audit::dial_started(&receiver.to_string(), false);
     let mut connection = self
       .dependencies
       .transport
@@ -1072,6 +1073,7 @@ impl Supervisor {
     // Remember the peer's leaf SPKI from the merge as the member-mode
     // reconnect pinning anchor (hardening).
     let peer = session.peer().clone();
+    crate::audit::dial_settled(peer.as_str(), false, true);
     if !hint.leaf_spki().is_empty() {
       self
         .driver

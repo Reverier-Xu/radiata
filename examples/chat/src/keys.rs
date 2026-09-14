@@ -201,8 +201,12 @@ impl KeyProvider for FileKeyProvider {
       if !path.exists() {
         return Ok(KeyDeleteState::Absent);
       }
+      // The removal is synchronous, so success proves absence: the
+      // three-state contract classifies Present as "still exists after
+      // the attempt", which would strand the caller's deletion flow on
+      // a NotReady retry loop for a handle that is provably gone.
       fs::remove_file(path).map_err(|error| io_error(&error))?;
-      Ok(KeyDeleteState::Present)
+      Ok(KeyDeleteState::Absent)
     })
   }
 

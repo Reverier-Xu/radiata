@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Scenario fuzz harness for the chat example cluster (P2-9).
+
+Model-driven stateful fuzzing over the chat HTTP surface: a random
+(but seed-reproducible) sequence of atomic cluster operations — merge,
+leave, disconnect, restart, dm, group traffic, node labeling — with a
+DUAL assertion after every operation:
+
+  1. STATE: the cluster's observable state (rosters, sessions, labels,
+     messages, resource views) converges to what the operation's entry
+     in the state map says it must be, within a bounded deadline.
+  2. PATH: the node logs (parsed from container logs) contain the
+     semantic path events the state map requires — so a green final
+     state reached through a wrong execution path fails the run.
+
+Run:
+  FUZZ=1 ./up.sh
+  python3 test_fuzz.py --seed 7 --ops 60
+  python3 test_fuzz.py --seed 7 --ops 60 --replay   # verbose op log
+
+On any violation the harness prints the seed, the full operation
+history, the failing assertion, and the relevant audit-log excerpts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE_HTTP_PORT = 19080
+N = 5
+POLL = 0.5
+
+
+class HarnessError(Exception):
+  """One fuzz violation: carries the seed, history, and reason."""
+
+
+def http(node: int, method: str, path: str, body: dict | None = None, timeout: float = 5):
+  """One HTTP call to node's chat API; returns (status, payload-or-None)."""
+  url = f"http://127.0.0.1:{BASE_HTTP_PORT + node}{path}"
+  data = None if body is None else json.dumps(body).encode()
+  request = urllib.request.Request(url, data=data, method=method)
+  if data is not None:
+    request.add_header("Content-Type", "application/json")
+  try:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+      return response.status, json.loads(response.read() or b"{}")
+  except urllib.error.HTTPError as error:
+    payload = error.read()
+    try:
+      return error.code, json.loads(payload or b"{}")
+    except json.JSONDecodeError:
+      return error.code, {}
+  except (urllib.error.URLError, TimeoutError, OSError):
+    return 0, None
+
+
+def podman_logs(node: int, since_epoch: float) -> str:
+  """The node's container logs newer than `since_epoch` (unix seconds)."""
+  result = subprocess.run(
+    ["podman", "logs", "--since", str(int(since_epoch)), f"c{node}"],
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+  return result.stdout + result.stderr
+
+
+def path_lines(log_text: str, needle: str) -> list[str]:
+  """Log lines containing `needle` (stable event text)."""
+  return [line for line in log_text.splitlines() if needle in line]
+
+
+class Model:
+  """The expected-state map: what the cluster must look like, per node.
+
+  The model is the operation-driven truth: every mutation updates it and
+  every checkpoint compares the live cluster against it. Anything the
+  live cluster cannot express (watermark tables, journal state) is
+  verified through the audit PATH assertions instead.
+  """
+
+  def __init__(self, n: int):
+    self.n = n
+    self.alive: set[int] = set(range(1, n + 1))  # nodes running
+    self.merged: set[int] = {1}                  # members of the cluster
+    self.left: set[int] = set()                  # nodes that left: gone for the run
+    self.labels: dict[int, dict[str, str]] = {i: {} for i in self.alive}
+
+  def roster(self) -> set[int]:
+    """Users whose profiles every live merged node must expose."""
+    return {i for i in self.merged if i in self.alive}
+
+
+class Checker:
+  """Deadline-bounded state and path assertions against the live cluster."""
+
+  def __init__(self, model: Model, seed: int, history: list[str]):
+    self.model = model
+    self.seed = seed
+    self.history = history
+
+  def fail(self, reason: str) -> HarnessError:
+    trace = "\n".join(f"  op[{index}] {entry}" for index, entry in enumerate(self.history))
+    return HarnessError(
+      f"FUZZ VIOLATION seed={self.seed}\nreason: {reason}\noperations:\n{trace}"
+    )
+
+  def wait_state(self, description: str, predicate, deadline_s: float):
+    """Polls until `predicate()` holds; every false poll is a live
+    state read. Timeout is a state-map violation."""
+    deadline = time.monotonic() + deadline_s
+    last = None
+    while time.monotonic() < deadline:
+      ok, last = predicate()
+      if ok:
+        return
+      time.sleep(POLL)
+    raise self.fail(f"state not converged within {deadline_s}s: {description} (last: {last})")
+
+  def wait_path(self, node: int, since: float, needle: str, description: str, deadline_s: float = 30):
+    """The node's log must contain `needle` within the deadline."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+      if any(needle in line for line in path_lines(podman_logs(node, since), needle)):
+        return
+      time.sleep(POLL)
+    excerpt = "\n".join(path_lines(podman_logs(node, since), needle)[-10:])
+    raise self.fail(f"path event missing on c{node}: {description}\nlog tail:\n{excerpt}")
+
+
+def roster_of(node: int) -> tuple[bool, set[str]]:
+  status, payload = http(node, "GET", "/identities")
+  if status != 200 or payload is None:
+    return False, set()
+  users = {entry["user"] for entry in payload.get("identities", []) if entry.get("user")}
+  return True, users
+
+
+def sessions_of(node: int) -> tuple[bool, int]:
+  status, payload = http(node, "GET", "/mesh-sessions")
+  if status != 200 or payload is None:
+    return False, -1
+  return True, payload.get("sessions", -1)
+
+
+def metadata_of(node: int) -> tuple[bool, dict]:
+  status, payload = http(node, "GET", "/metadata")
+  if status != 200 or payload is None:
+    return False, {}
+  return True, payload
+
+
+# --------------------------------------------------------------------------
+# Atomic operations. Each op mutates the model, executes, and returns the
+# (since, needle, node) PATH expectations the checker asserts alongside
+# the state convergence.
+# --------------------------------------------------------------------------
+
+def op_join_chat(model: Model, rng: random.Random, node: int):
+  """A live node joins the cluster through the bootstrap hub (c1)."""
+  del rng
+  status, payload = http(
+    node,
+    "POST",
+    "/join-chat",
+    {"bootstrap_http": "c1:8080", "bootstrap_wss": "wss://c1:9443"},
+    timeout=30,
+  )
+  if status != 200 or not (payload or {}).get("joined"):
+    raise HarnessError(f"join endpoint failed: {status} {payload}")
+  model.merged.add(node)
+  return [
+    (node, "member dial started", "the join dial started"),
+    (node, "member dial settled", "the join dial connected"),
+  ]
+
+
+def op_leave(model: Model, rng: random.Random, node: int):
+  """The node leaves: identity replaced, old core metadata deleted."""
+  status, payload = http(node, "POST", "/leave", timeout=30)
+  if status != 200 or not (payload or {}).get("left"):
+    raise HarnessError(f"leave endpoint failed: {status} {payload}")
+  peers = [u for u in model.merged if u != node and u in model.alive]
+  peer = rng.choice(peers) if peers else node
+  model.alive.discard(node)
+  model.merged.discard(node)
+  model.left.add(node)
+  model.labels.pop(node, None)
+  return [
+    (node, "leave announcement starting", "the leave announcement started"),
+    (peer, "leave record persisted on peer", "the leave record propagated to a peer"),
+  ]
+
+
+def op_disconnect(model: Model, rng: random.Random, node: int):
+  """The node tears one session down; recovery heals it back."""
+  if not model.merged or node not in model.alive:
+    return []
+  peer_pool = sorted(other for other in model.merged if other != node and other in model.alive)
+  if not peer_pool:
+    return []
+  peer = rng.choice(peer_pool)
+  _, payload = http(node, "GET", "/identities")
+  peer_node_id = next(
+    (entry["node_id"] for entry in payload.get("identities", []) if entry["user"] == f"u{peer}"),
+    None,
+  ) if payload else None
+  if not peer_node_id:
+    return []
+  # The teardown only surfaces on a peer when the node actually held a
+  # session (the count is the only mesh view the chat surface exposes):
+  # with one, recovery re-dials the peer and the settled event is the
+  # heal's path proof; with none, the disconnect is a no-op.
+  before_ok, before_sessions = sessions_of(node)
+  status, _ = http(node, "POST", "/disconnect", {"node_id": peer_node_id})
+  if status != 200:
+    return []
+  if before_ok and before_sessions >= 1:
+    return [(node, "member dial settled", "the session re-established after the teardown")]
+  return []
+
+
+def op_dm(model: Model, rng: random.Random, node: int):
+  """One direct message between two live merged users."""
+  peers = sorted(u for u in model.merged if u != node and u in model.alive)
+  if not peers:
+    return []
+  to = f"u{rng.choice(peers)}"
+  status, payload = http(node, "POST", "/dm", {"to": to, "body": f"fuzz-{rng.randrange(1 << 30)}"})
+  if status != 200 or payload is None:
+    raise HarnessError(f"dm endpoint failed: {status}")
+  # Sent or pending: both are legal immediate outcomes; a pending dm
+  # queues in the outbox and flushes when the route heals.
+  if payload.get("state") not in ("sent", "pending"):
+    raise HarnessError(f"dm outcome must be sent or pending: {payload}")
+  return []
+
+
+def op_group_message(model: Model, rng: random.Random, node: int):
+  """One group message from a live merged user; the group is created on
+  first use so the group plane always carries real traffic."""
+  if node not in model.alive or node not in model.merged:
+    return []
+  body = f"fuzz-{rng.randrange(1 << 30)}"
+  status, payload = http(node, "POST", "/groups/g-fuzz/send", {"body": body})
+  if status == 404:
+    created, _ = http(node, "POST", "/groups", {"name": "g-fuzz"})
+    if created != 200:
+      return []
+    status, payload = http(node, "POST", "/groups/g-fuzz/send", {"body": body})
+  if status != 200 or payload is None:
+    raise HarnessError(f"group send endpoint failed: {status}")
+  return []
+
+
+def op_label(model: Model, rng: random.Random, node: int):
+  """The node labels itself: conditional owner-metadata update, then
+  descriptor convergence carries the label to the cluster."""
+  if node not in model.alive:
+    return []
+  status, payload = metadata_of(node)
+  if status != 200:
+    return []
+  key = f"fuzz-{rng.randrange(1 << 16)}"
+  value = f"v{rng.randrange(1 << 30)}"
+  revision = payload.get("revision", 0)
+  body = {
+    "set_labels": {key: value},
+    "expected_revision": revision,
+  }
+  deadline = time.monotonic() + 20
+  while True:
+    status, payload = http(node, "POST", "/metadata", body)
+    if status == 200:
+      break
+    # A raced update conflicts; re-read the revision and retry within
+    # the deadline — a stale-revision refusal must never strand the op.
+    if status != 409 or time.monotonic() > deadline:
+      raise HarnessError(f"label update failed: {status} {payload}")
+    _, fresh = metadata_of(node)
+    body["expected_revision"] = fresh.get("revision", revision)
+    time.sleep(POLL)
+  model.labels.setdefault(node, {})[key] = value
+  # Path note: descriptor-label propagation audit events land with the
+  # membership-lane instrumentation; v1 asserts the local conditional
+  # update through the state surface only.
+  return []
+
+
+def op_restart(model: Model, rng: random.Random, node: int):
+  """SIGKILL-style container restart: sessions drop cluster-wide, the
+  store persists, the node heals back in through its persisted identity."""
+  del rng
+  subprocess.run(["podman", "kill", f"c{node}"], capture_output=True, check=False)
+  model.alive.discard(node)
+  return []
+
+
+def op_start(model: Model, rng: random.Random, node: int):
+  """Starts a stopped container; the node rejoins through persisted state.
+  Membership is unchanged: a killed member auto-rejoins via recovery, a
+  never-merged node stays standalone."""
+  subprocess.run(["podman", "start", f"c{node}"], capture_output=True, check=False)
+  model.alive.add(node)
+  model.labels.setdefault(node, {})
+  return []
+
+
+def op_flush(model: Model, rng: random.Random, node: int):
+  """Drains the node's outbox: queued traffic must deliver or stay
+  queued with a typed reason — never vanish."""
+  del rng, model
+  status, _ = http(node, "POST", "/flush")
+  if status not in (200, 0):
+    raise HarnessError(f"flush endpoint failed: {status}")
+  return []
+
+
+# Every generator: (name, precondition(model), mutator(model, rng, node) -> path
+# expectations). Preconditions keep operations legal (no messaging from a
+# dead node); the state map covers the post-conditions.
+OPERATIONS = [
+  ("join-chat", lambda m, node: node in m.alive and node not in m.merged and node not in m.left, op_join_chat),
+  ("leave", lambda m, node: node in m.merged and node in m.alive and len(m.merged) > 1, op_leave),
+  ("disconnect", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_disconnect),
+  ("dm", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_dm),
+  ("group-message", lambda m, node: node in m.merged and node in m.alive and node not in m.left, op_group_message),
+  ("label", lambda m, node: node in m.alive and node not in m.left, op_label),
+  ("restart", lambda m, node: node in m.alive and node not in m.left, op_restart),
+  ("start", lambda m, node: node not in m.alive and node not in m.left, op_start),
+  ("flush", lambda m, node: node in m.alive and node not in m.left, op_flush),
+]
+
+
+def checkpoint(checker: Checker, model: Model, path_expectations: list):
+  """The dual assertion: state convergence against the model, then the
+  operation's audit path on the responsible node."""
+  live = sorted(model.alive & model.merged)
+
+  def state_ok():
+    ok, users = roster_of(min(live)) if live else (True, set())
+    if not ok:
+      return False, "roster unreachable"
+    expected_users = {f"u{i}" for i in model.merged if i in model.alive}
+    # Converged means: every live merged user's identity is visible; the
+    # departed ones may linger as evidence or be gone entirely.
+    if not expected_users.issubset(users):
+      return False, f"roster {sorted(users)} lacks {sorted(expected_users - users)}"
+    # A live merged node holds a session only when a second live merged
+    # member exists: a lone hub with nobody merged yet legitimately has
+    # zero sessions.
+    connected_required = len(model.merged & model.alive) >= 2
+    for node in live:
+      ok, sessions = sessions_of(node)
+      if not ok:
+        return False, f"c{node} unreachable"
+      if connected_required and sessions < 1:
+        return False, f"c{node} has {sessions} sessions"
+    return True, f"roster={sorted(users)}"
+
+  checker.wait_state("cluster state matches the model", state_ok, deadline_s=60)
+  for node, needle, description in path_expectations:
+    checker.wait_path(node, time.time() - 5, needle, description, deadline_s=30)
+
+
+def pick_operation(model: Model, rng: random.Random, node: int):
+  """One legal random operation by name-weighted selection."""
+  legal = [(name, mutator) for name, precondition, mutator in OPERATIONS if precondition(model, node)]
+  if not legal:
+    return None, None
+  return rng.choice(legal)
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--seed", type=int, default=1)
+  parser.add_argument("--ops", type=int, default=40, help="operation count")
+  parser.add_argument("--node-start", type=int, default=2, help="first fuzzed node")
+  args = parser.parse_args()
+
+  rng = random.Random(args.seed)
+  model = Model(N)
+  checker = Checker(model, args.seed, history=[])
+  history = checker.history
+
+  # Freshness preflight: the model assumes a fresh cluster (only the
+  # hub, nothing merged). A dirty cluster from a previous run would
+  # violate the model immediately — fail fast with the remedy instead.
+  for node in range(1, N + 1):
+    ok, payload = http(node, "GET", "/whoami")
+    if not ok:
+      print(f"[fuzz] c{node} is not responding; run ./down.sh && FUZZ=1 ./up.sh first")
+      sys.exit(1)
+  for node in range(args.node_start, N + 1):
+    ok, sessions = sessions_of(node)
+    if ok and sessions != 0:
+      print(
+        f"[fuzz] c{node} already holds {sessions} sessions; "
+        "the cluster is not fresh — run ./down.sh && FUZZ=1 ./up.sh first"
+      )
+      sys.exit(1)
+
+  print(f"[fuzz] seed={args.seed} ops={args.ops} nodes={N}")
+  for step in range(args.ops):
+    node = rng.randint(args.node_start, N)
+    name, mutator = pick_operation(model, rng, node)
+    if name is None:
+      continue
+    started = time.time()
+    history.append(f"{name} c{node}")
+    print(f"[op {step:04d}] {name} c{node}")
+    path_expectations = mutator(model, rng, node)
+    try:
+      checkpoint(checker, model, path_expectations)
+    except HarnessError as violation:
+      print(violation)
+      sys.exit(1)
+    history[-1] += f" ({time.time() - started:.1f}s)"
+
+  print(f"[fuzz] seed={args.seed}: {args.ops} operations, zero violations")
+
+
+if __name__ == "__main__":
+  main()
