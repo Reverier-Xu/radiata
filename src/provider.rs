@@ -660,6 +660,27 @@ pub enum CommitOutcome {
   },
 }
 
+/// Classifies one conditional [`CommitOutcome`] into the shared verdict:
+/// a commit passes its receipt through, a lost exact-version race or a
+/// proven abort surfaces as the caller's typed conflict, and an unknown
+/// outcome fails closed with the commit-unknown error (the store stays
+/// frozen until reconciliation). One source for every plain
+/// commit-site mapping so the error contexts cannot drift per lane;
+/// sites with post-conflict classification (idempotent replays,
+/// already-revoked checks) keep their own match arms.
+pub(crate) fn commit_verdict(
+  outcome: CommitOutcome, conflict: &'static str,
+) -> crate::Result<CommitReceipt> {
+  match outcome {
+    CommitOutcome::Committed(receipt) => Ok(receipt),
+    CommitOutcome::Conflict | CommitOutcome::Aborted => Err(Error::conflict(conflict)),
+    CommitOutcome::Unknown { .. } => Err(Error::provider(
+      crate::ProviderErrorKind::CommitUnknown,
+      crate::ProviderErrorContext::StorageCommit,
+    )),
+  }
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReconcileOutcome {

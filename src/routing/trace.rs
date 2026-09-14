@@ -325,16 +325,8 @@ pub(crate) async fn put_trace(
       value: crate::StoreValue::new(std::sync::Arc::from(encoded)),
     }],
   )?;
-  match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) => Ok(()),
-    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-      Err(Error::conflict("route trace"))
-    }
-    crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
-      ProviderErrorKind::CommitUnknown,
-      ProviderErrorContext::StorageReconcile,
-    )),
-  }
+  crate::provider::commit_verdict(store.commit(transaction).await?, "route trace")?;
+  Ok(())
 }
 
 /// Terminates every non-terminal record left by a previous incarnation:
@@ -472,7 +464,10 @@ async fn commit_batch(
     crate::CommitOutcome::Conflict => Ok(0),
     crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
       ProviderErrorKind::CommitUnknown,
-      ProviderErrorContext::StorageReconcile,
+      // The trace register commits through the same conditional slot as
+      // every other lane; only the context label historically said
+      // otherwise.
+      ProviderErrorContext::StorageCommit,
     )),
   }
 }

@@ -344,16 +344,8 @@ pub(crate) mod store {
     // Conflict (the register moved under the CAS) or an Aborted commit
     // (definitively not applied) must surface so the anti-entropy page
     // applies on a later tick instead of vanishing.
-    match store.commit(transaction).await? {
-      crate::CommitOutcome::Committed(_) => Ok(()),
-      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-        Err(Error::conflict("node descriptor revision"))
-      }
-      crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
-        crate::ProviderErrorKind::CommitUnknown,
-        crate::ProviderErrorContext::StorageCommit,
-      )),
-    }
+    crate::provider::commit_verdict(store.commit(transaction).await?, "node descriptor revision")?;
+    Ok(())
   }
 
   /// Reads the current descriptor for one node over a standalone factory
