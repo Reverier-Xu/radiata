@@ -5,7 +5,11 @@ FROM rust:1.98-bookworm AS build
 WORKDIR /build
 COPY . /build
 WORKDIR /build/examples/chat
-RUN cargo build --release
+# CARGO_FEATURES is passed through to cargo's --features (e.g. the
+# fuzz harness builds with CARGO_FEATURES=audit so the container logs
+# carry the semantic path events).
+ARG CARGO_FEATURES=""
+RUN cargo build --release --features "$CARGO_FEATURES"
 
 FROM debian:bookworm-slim
 RUN apt-get update \

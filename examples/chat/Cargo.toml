@@ -16,6 +16,7 @@ publish = false
 
 [dependencies]
 radiata = { path = "../..", features = ["redb"] }
+
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",
@@ -34,6 +35,12 @@ futures-util = "0.3"
 getrandom = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Forwards the library's audit instrumentation (semantic path events the
+# scenario fuzz harness parses from container logs). Off by default: the
+# deterministic e2e does not need it.
+audit = ["radiata/audit"]
 
 [profile.release]
 strip = true

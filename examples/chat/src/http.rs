@@ -13,9 +13,10 @@ use axum::{
   routing::{get, post},
 };
 use radiata::{
-  GetResource, LabelKey, LabelValue, NodeHandle, NodeId, PageSessions, PageSpec, PutResource,
-  RemoveResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RoutingPolicy,
-  SelectResources, Selector, StreamMetadata, StreamPolicy, StreamTarget,
+  GetMember, GetResource, LabelKey, LabelValue, NodeHandle, NodeId, PageSessions, PageSpec,
+  PutResource, RemoveResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
+  RoutingPolicy, SelectResources, Selector, StreamMetadata, StreamPolicy, StreamTarget,
+  UpdateNodeMetadata,
 };
 use serde_json::{Value, json};
 
@@ -831,6 +832,77 @@ async fn mesh_sessions(
   Ok(Json(json!({"sessions": sessions.items().len()})))
 }
 
+fn label_map_json(view: &radiata::MemberView) -> serde_json::Map<String, Value> {
+  view
+    .labels()
+    .entries()
+    .map(|(key, value)| (key.as_str().to_owned(), json!(value.as_str())))
+    .collect()
+}
+
+/// Reads the node's own owner metadata: the capability label map plus
+/// the revision a conditional update must expect. The scenario fuzz
+/// harness drives node labeling through this surface.
+async fn get_metadata(
+  state: State<SharedState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let view = state
+    .node
+    .query(radiata::GetMember::new(state.node_id.clone()))
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| not_found("local member view"))?;
+  Ok(Json(json!({
+    "labels": label_map_json(&view),
+    "revision": view.owner_revision(),
+  }))
+  )
+}
+
+#[derive(serde::Deserialize)]
+pub struct MetadataUpdateRequest {
+  /// Capability labels to set (domain-qualified keys are derived from
+  /// these bare names, matching every other chat-surface label).
+  pub set_labels: std::collections::HashMap<String, String>,
+  /// Capability labels to remove.
+  #[serde(default)]
+  pub remove_labels: Vec<String>,
+  /// The owner revision the update applies on top of; a stale value
+  /// conflicts (409) and the caller retries from a fresh read.
+  pub expected_revision: u64,
+}
+
+/// Conditionally updates the node's own owner metadata: strictly higher
+/// revision, capability labels set and removed as one transaction, the
+/// updated view returned. A raced update conflicts (409).
+async fn update_metadata(
+  state: State<SharedState>, Json(request): Json<MetadataUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let mut patch = radiata::NodeMetadataPatch::new();
+  for (name, value) in &request.set_labels {
+    let key = LabelKey::parse(&domain_tag("labels", name)).map_err(name_error)?;
+    let value = LabelValue::parse(value).map_err(name_error)?;
+    patch = patch.set_capability(key, value).map_err(conflict_error)?;
+  }
+  for name in &request.remove_labels {
+    let key = LabelKey::parse(&domain_tag("labels", name)).map_err(name_error)?;
+    patch = patch.remove_capability(key).map_err(conflict_error)?;
+  }
+  let view = state
+    .node
+    .command(radiata::UpdateNodeMetadata::new(
+      request.expected_revision,
+      patch,
+    ))
+    .await
+    .map_err(conflict_error)?;
+  Ok(Json(json!({
+    "labels": label_map_json(&view),
+    "revision": view.owner_revision(),
+  }))
+  )
+}
+
 #[derive(serde::Deserialize)]
 pub struct DisconnectRequest {
   pub node_id: String,
@@ -886,6 +958,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/groups/{name}/dissolve", post(dissolve_group))
     .route("/join-token", get(join_token))
     .route("/join-chat", post(join_chat))
+    .route("/metadata", get(get_metadata).post(update_metadata))
     .route("/mesh-sessions", get(mesh_sessions))
     .route("/disconnect", post(disconnect))
     .route("/leave", post(leave))
