@@ -80,8 +80,8 @@ impl FeatureOffer {
   /// duplicates, capacity overflow, non-`limits` limit tags, and required
   /// labels outside the supported set.
   pub(crate) fn new(
-    mut supported: Vec<(FeatureTag, Digest)>, mut required: Vec<FeatureTag>,
-    mut limits: Vec<(QualifiedTag, u64)>,
+    supported: Vec<(FeatureTag, Digest)>, required: Vec<FeatureTag>,
+    limits: Vec<(QualifiedTag, u64)>,
   ) -> Result<Self> {
     if supported.len() > MAX_SUPPORTED_LABELS {
       return Err(Error::invalid_input("feature offer supported capacity"));
@@ -92,6 +92,18 @@ impl FeatureOffer {
     if limits.len() > MAX_NEGOTIATED_LIMITS {
       return Err(Error::invalid_input("feature offer limits capacity"));
     }
+    Self::finalize(supported, required, limits)
+  }
+
+  /// The shared canonicalization and validation tail of both offer
+  /// paths: sorts every collection, rejects duplicates, non-`limits`
+  /// limit tags, and required labels outside the supported set. The
+  /// capacity checks stay at the entry points because the wire path
+  /// must reject capacity overflow before any per-entry parse.
+  fn finalize(
+    mut supported: Vec<(FeatureTag, Digest)>, mut required: Vec<FeatureTag>,
+    mut limits: Vec<(QualifiedTag, u64)>,
+  ) -> Result<Self> {
     supported.sort_by(|first, second| first.0.as_str().cmp(second.0.as_str()));
     required.sort_by(|first, second| first.as_str().cmp(second.as_str()));
     limits.sort_by(|first, second| first.0.as_str().cmp(second.0.as_str()));
@@ -240,16 +252,7 @@ impl FeatureOffer {
       },
     )?;
 
-    for tag in &required {
-      if !supported.iter().any(|(candidate, _)| candidate == tag) {
-        return Err(Error::invalid_input("feature offer required unsupported"));
-      }
-    }
-    Ok(Self {
-      supported,
-      required,
-      limits,
-    })
+    Self::finalize(supported, required, limits)
   }
 
   fn wire(&self) -> FeatureOfferWire {

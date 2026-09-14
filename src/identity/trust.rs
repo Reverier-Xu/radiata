@@ -237,18 +237,18 @@ impl TrustSnapshotV1 {
     }
     let issuer = NodeId::parse(&wire.issuer)
       .map_err(|_| crate::Error::invalid_input("trust snapshot issuer"))?;
-    let issuer_key = PublicKey::from_bytes(
-      <[u8; 32]>::try_from(wire.issuer_key.as_ref())
-        .map_err(|_| crate::Error::invalid_input("trust snapshot issuer key"))?,
-    );
+    let issuer_key = PublicKey::from_bytes(crate::error::fixed_bytes(
+      wire.issuer_key.as_ref(),
+      "trust snapshot issuer key",
+    )?);
     let mut bindings = Vec::with_capacity(wire.bindings.len());
     for binding in &wire.bindings {
       let node = NodeId::parse(&binding.node)
         .map_err(|_| crate::Error::invalid_input("trust snapshot node"))?;
-      let key = PublicKey::from_bytes(
-        <[u8; 32]>::try_from(binding.key.as_ref())
-          .map_err(|_| crate::Error::invalid_input("trust snapshot key"))?,
-      );
+      let key = PublicKey::from_bytes(crate::error::fixed_bytes(
+        binding.key.as_ref(),
+        "trust snapshot key",
+      )?);
       bindings.push(TrustBinding::new(node, key));
     }
     // Ordered deterministically: canonical node text ascending; a
@@ -347,18 +347,18 @@ impl TrustSnapshotPage {
     }
     let issuer = NodeId::parse(&wire.issuer)
       .map_err(|_| crate::Error::invalid_input("trust snapshot issuer"))?;
-    let issuer_key = PublicKey::from_bytes(
-      <[u8; 32]>::try_from(wire.issuer_key.as_ref())
-        .map_err(|_| crate::Error::invalid_input("trust snapshot issuer key"))?,
-    );
+    let issuer_key = PublicKey::from_bytes(crate::error::fixed_bytes(
+      wire.issuer_key.as_ref(),
+      "trust snapshot issuer key",
+    )?);
     let mut bindings = Vec::with_capacity(wire.bindings.len());
     for binding in &wire.bindings {
       let node = NodeId::parse(&binding.node)
         .map_err(|_| crate::Error::invalid_input("trust snapshot node"))?;
-      let key = PublicKey::from_bytes(
-        <[u8; 32]>::try_from(binding.key.as_ref())
-          .map_err(|_| crate::Error::invalid_input("trust snapshot key"))?,
-      );
+      let key = PublicKey::from_bytes(crate::error::fixed_bytes(
+        binding.key.as_ref(),
+        "trust snapshot key",
+      )?);
       bindings.push(TrustBinding::new(node, key));
     }
     // Ordered deterministically: canonical node text ascending; a

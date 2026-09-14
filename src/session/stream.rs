@@ -688,24 +688,10 @@ pub(crate) async fn run_session(
   // forwarded hops relay a failed acknowledgement upstream, and dropped
   // body channels close without an end marker. Every hop fed by this
   // session's peer terminates downstream explicitly.
-  let relays: Vec<(TraceId, BoundedSender)> = if let Ok(mut pending) = pending_acks.lock() {
-    let interrupted = pending.len();
-    let mut relays = Vec::new();
-    for (trace_id, entry) in pending.drain() {
-      match entry {
-        PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(Err(ErrorKind::StreamInterrupted));
-        }
-        PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
-      }
-    }
-    if interrupted > 0 {
-      debug!(interrupted, "session closed pending admissions");
-    }
-    relays
-  } else {
-    Vec::new()
-  };
+  let (interrupted, relays) = fail_pending_waits(&pending_acks);
+  if interrupted > 0 {
+    debug!(interrupted, "session closed pending admissions");
+  }
   for (trace_id, upstream) in relays {
     upstream
       .send_status(&trace_id, crate::packet::wire::AckStatus::Failed)
@@ -858,22 +844,34 @@ pub(crate) fn retire_all_sessions(table: &SessionTable) -> Result<()> {
 /// is registered.
 fn retire(entry: &SessionEntry) {
   entry.alive.store(false, Ordering::SeqCst);
-  if let Ok(mut pending) = entry.pending_acks.lock() {
+  let (_, relays) = fail_pending_waits(&entry.pending_acks);
+  for (trace_id, upstream) in relays {
+    // Best-effort relay of the interruption; a saturated queue
+    // cannot be repaired here and the upstream liveness policy
+    // bounds the wait regardless.
+    upstream.try_send_status(&trace_id, crate::packet::wire::AckStatus::Failed);
+  }
+  let _ = entry.retire.send(());
+}
+
+/// Drains one session's pending admission acks, failing every local
+/// waiter with the typed interruption, and returns the count plus the
+/// forwarded hops' upstream senders for the caller's relay handling.
+fn fail_pending_waits(pending_acks: &PendingAcks) -> (usize, Vec<(TraceId, BoundedSender)>) {
+  let mut relays = Vec::new();
+  let mut interrupted = 0_usize;
+  if let Ok(mut pending) = pending_acks.lock() {
+    interrupted = pending.len();
     for (trace_id, ack) in pending.drain() {
       match ack {
         PendingAck::Wait { notify, .. } => {
           let _ = notify.send(Err(ErrorKind::StreamInterrupted));
         }
-        PendingAck::Relay { upstream } => {
-          // Best-effort relay of the interruption; a saturated queue
-          // cannot be repaired here and the upstream liveness policy
-          // bounds the wait regardless.
-          upstream.try_send_status(&trace_id, crate::packet::wire::AckStatus::Failed);
-        }
+        PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
       }
     }
   }
-  let _ = entry.retire.send(());
+  (interrupted, relays)
 }
 
 /// Writes queued session frames in order until the queue closes or the

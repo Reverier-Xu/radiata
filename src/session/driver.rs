@@ -33,7 +33,9 @@ use crate::{
     lifecycle::LocalIdentityContext,
     merge::{MergeProposal, adopt_merge, commit_merge},
     merge_rate::MergeSource,
-    records::{GenerationId, IdentityBindingV1, MergeGrantV1, MergeId, identity_binding_key},
+    records::{
+      GenerationId, IdentityBindingV1, LocalIdentityV1, MergeGrantV1, MergeId, identity_binding_key,
+    },
   },
   protocol::{
     credential::CredentialSecret,
@@ -414,33 +416,7 @@ impl SessionDriver {
       },
       FeatureRegistry::builtin()?,
     )?;
-
-    send(
-      connection,
-      HandshakeKind::InitiatorHello,
-      &handshake.initiator_hello()?,
-    )
-    .await?;
-    let hello = receive_kind(connection, HandshakeKind::ResponderHello).await?;
-    handshake.receive(&hello.body)?;
-    let proof = receive_kind(connection, HandshakeKind::ResponderProof).await?;
-    handshake.receive(&proof.body)?;
-    // The initiator signs only after the responder proof verified.
-    let transcript = handshake
-      .transcript_bytes()
-      .ok_or_else(|| Error::internal("handshake transcript"))?;
-    let signature = self
-      .keys
-      .sign(identity.handle(), &initiator_session_message(transcript))
-      .await?;
-    send(
-      connection,
-      HandshakeKind::InitiatorProof,
-      &handshake.initiator_proof(signature)?,
-    )
-    .await?;
-    let confirmation = receive_kind(connection, HandshakeKind::SelectionConfirmation).await?;
-    handshake.receive(&confirmation.body)?;
+    self.initiate(connection, &mut handshake, identity).await?;
 
     let delivery = receive_kind(connection, HandshakeKind::MergeGrantDelivery).await?;
     handshake.receive(&delivery.body)?;
@@ -505,7 +481,18 @@ impl SessionDriver {
       },
       FeatureRegistry::builtin()?,
     )?;
+    self.initiate(connection, &mut handshake, identity).await?;
+    established(&handshake)
+  }
 
+  /// Drives the initiator's half of a built handshake: the hello, the
+  /// responder hello and proof, the local signature — produced only
+  /// after the responder proof verifies — and the feature-selection
+  /// confirmation. The merge flow continues with grant delivery
+  /// afterwards; the member flow ends here.
+  async fn initiate(
+    &self, connection: &mut Connection, handshake: &mut Handshake, identity: &LocalIdentityV1,
+  ) -> Result<()> {
     send(
       connection,
       HandshakeKind::InitiatorHello,
@@ -532,7 +519,7 @@ impl SessionDriver {
     .await?;
     let confirmation = receive_kind(connection, HandshakeKind::SelectionConfirmation).await?;
     handshake.receive(&confirmation.body)?;
-    established(&handshake)
+    Ok(())
   }
   /// Blocks new session establishment while the local metadata store is
   /// frozen on an indeterminate outcome: the node refuses to

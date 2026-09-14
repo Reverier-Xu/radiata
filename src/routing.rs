@@ -211,8 +211,8 @@ impl<'a> SelectorParser<'a> {
     // The closed selector key space: custom labels live in the `labels`
     // category; the only `resources` keys are the two reserved labels.
     match tag.category() {
-      "labels" => Ok(tag),
-      "resources"
+      crate::protocol::tag::CATEGORY_LABELS => Ok(tag),
+      crate::protocol::tag::CATEGORY_RESOURCES
         if tag.as_str() == crate::resource::RESERVED_TYPE_LABEL_KEY
           || tag.as_str() == crate::resource::RESERVED_URI_LABEL_KEY =>
       {
