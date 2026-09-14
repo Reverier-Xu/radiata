@@ -197,7 +197,10 @@
 
 ### P1-6 rustdoc 指南补齐
 
-- **状态**：待办
+- **状态**：已完成（d2aeb17；`radiata::guide` doc-only 模块：版本元组往返、
+  any-one-route 契约、RouteNextHop/PacketConsumer/KeyProvider 三扩展点接入步骤，
+  每题编译期示例；`RUSTDOCFLAGS="-D warnings" cargo doc` 零坏链、doctest 全绿；
+  chat/cluster 两 README 指向指南，chat README 的并发 join 陈旧限制说明随 D8/D11 修订）
 - **问题**：本轮沉淀的业务接入模式散落在 example 里，rustdoc 无指南：
   版本元组往返（`from_parts` → 条件删除）、any-one-route 契约、
   `RouteNextHop`/`PacketConsumer`/`KeyProvider` 三大扩展点的接入步骤。
@@ -418,10 +421,20 @@
 
 ### P2-9 场景 fuzz 套件（模型驱动集群测试）
 
-- **状态**：进行中（audit feature + 语义路径事件已落地；Python 驱动
-  `test_fuzz.py`（9 类原子操作 + 模型状态 map + 双重断言 + 种子可复现）已落地，
-  种子 1–9 冒烟全部零违例；待办：≥1000 操作长跑验收证据、成员标签传播打点、
-  群组加入操作）
+- **状态**：已完成（audit feature + 语义路径事件 9c26b01/6981d7f；Python 驱动
+  `test_fuzz.py`：10 类原子操作（join-chat/leave/disconnect/dm/group-message/
+  join-group/label/restart/start/flush）+ 期望状态 map + 状态/执行路径双重断言
+  + 种子可复现；打点覆盖 descriptor 安装、资源水位三轮、journal 恢复、拨号、
+  leave 回执；`/labels/{user}` 端点支撑标签收敛的状态面断言。
+  **验收证据**：冒烟种子 1–9 各 25–30 op 全部零违例；长跑 seed=42、**1050 个实际
+  操作**（按操作类型分布 10 类全覆盖）355s 零发散（状态与路径双重）。
+  **过程中发现并修复的 harness 语义缺陷**：① disconnect 后仅在全隔离时才允许
+  断言恢复重拨（any-one-route 下部分断开不得重拨，且对端可能赢得竞速、入站愈合）；
+  ② dm 需容忍发送端本地花名册收敛滞后（404 有界重试）；③ 长跑预算须按实际操作
+  计数、leave 须保操作池可持续（95fe80e）。**观察项（入档观望）**：seed 8 曾两次
+  观察到目标 user 资源对单成员投递滞后 60s+ 后自愈，时间尺度与
+  `WATERMARK_REFRESH_PASSES` 兜底一致（P2-3 文档化的 admission≠apply 有界修复
+  路径），14 次专项复现未再现；该发现归属 P2-3 机制、非新缺陷。）
 - **运行策略**：与容器 e2e 同策略（podman 非 CI 门禁），随 e2e 批次手动执行；
   `FUZZ=1 ./up.sh && python3 test_fuzz.py --seed N --ops M`
 - **来源**：P2-3 验证复盘——预算窗口静默关闭与写入者信任竞速两个永久发散缺陷，
@@ -448,11 +461,14 @@
   路径双重零违例）；fuzz 发现的缺陷逐条入档并回修。
 - **涉及面**：库内 tracing 打点、examples/chat（admin 端点 + 日志落盘）、
   新增 fuzz 编排、CI lane。**规模：L**
-- **涉及面**：examples/chat（admin 端点）、新增 fuzz 编排、CI lane。**规模：L**
 
 ### P2-8 architecture.md 全量重审刷新
 
-- **状态**：待办
+- **状态**：已完成（5e791f3；按 0.1.0 定稿代码全量重写：分层清单逐模块核对
+  （id 命名单源、剪枝、水位、trust 分页、凭据世代、CAS、journal 证据直读、
+  audit 面、guide 模块、默认 feature）；数据流五节按当前实现重述；头部改钉
+  plan-0.1.0-baseline 定稿；删除时点性声明；作为 0.1.0 发布说明的架构附件）
+- **验收**：文档与代码逐节核对（审计式走查，关键常量与机制均对源核实）✓
 - **问题**：架构文档钉在 main @ `faf7833`；此后 D1/D2/D3/D5 语义、ack 投递、
   CAS 写（P1-1）、协议改造（P2-1）均未反映。
 - **方案草案**：**在 P0–P2 全部代码定稿后执行**（避免反复刷新）：按当前代码
