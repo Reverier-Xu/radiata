@@ -12,6 +12,7 @@ mod audit;
 mod config;
 mod error;
 mod extension_registry;
+mod guide;
 mod hex;
 mod identity;
 mod label;
