@@ -556,8 +556,13 @@ impl Command for PurgeRevocation {
 
 /// Starts a new cleanup checkpoint GC epoch at the current wall clock.
 /// Max-wins: a stored checkpoint with a higher
-/// watermark survives. Deployments issue checkpoints only against a fully
-/// converged cluster. Returns the persisted watermark.
+/// watermark survives. The library enforces the convergence precondition
+/// itself: the issue is refused with [`crate::ErrorKind::NotReady`] while
+/// any known member other than self whose removal record is not terminal
+/// (left or cleaned) lacks a live authenticated session, because
+/// tombstones that member has not received yet could be collected by the
+/// new epoch. Re-issue once the member is connected. Returns the
+/// persisted watermark.
 pub struct IssueCleanupCheckpoint {
   _private: (),
 }

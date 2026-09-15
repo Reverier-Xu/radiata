@@ -1719,13 +1719,75 @@ impl Supervisor {
   }
 
   /// Starts a new checkpoint GC epoch at the current wall clock. The
-  /// watermark converges through the sync plane; collected tombstones are
-  /// swept after sync rounds.
+  /// convergence precondition is enforced here, not by the caller: the
+  /// watermark converges through the sync plane, collected tombstones are
+  /// swept after sync rounds, and a member still owed tombstones must be
+  /// connected before any epoch may start.
   async fn issue_cleanup_checkpoint(&mut self) -> Result<u64> {
     self.require_unblocked()?;
     let context = self.context()?;
+    self.require_members_connected(&context).await?;
     crate::identity::cleanup::issue_checkpoint_ctx(&context, self.dependencies.entropy.as_ref())
       .await
+  }
+
+  /// The checkpoint issue precondition: every known member other than
+  /// self whose removal record is not terminal (left or cleaned) must
+  /// hold at least one live authenticated session — the crate's own
+  /// any-one-route connectivity contract. A non-terminal member is still
+  /// owed tombstone deliveries, so an epoch issued while it is unreachable
+  /// could collect records it has not received yet; a member with a
+  /// terminal removal record is exactly what the epoch may collect and
+  /// never blocks. A singleton cluster passes trivially (no other
+  /// member).
+  async fn require_members_connected(&self, context: &LocalIdentityContext) -> Result<()> {
+    // Snapshot the live-session peers under the lock, then release it
+    // before any await so the supervisor future stays `Send`.
+    let live: std::collections::BTreeSet<NodeId> = self
+      .dependencies
+      .sessions
+      .lock()
+      .map_err(Error::session_table)?
+      .iter()
+      .filter(|(_, entry)| entry.alive())
+      .map(|(peer, _)| peer.clone())
+      .collect();
+    let store = context.store();
+    let departed = self.departed_exclusions(store).await?;
+    let snapshot = store.snapshot().await?;
+    let namespace = crate::membership::descriptor_namespace()?;
+    let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
+    let mut unreachable = 0_usize;
+    while let Some(entry) = scan.next().await? {
+      let descriptor = match crate::membership::page::decode_descriptor(entry.value().as_bytes()) {
+        Ok(descriptor) => descriptor,
+        // The scan is best-effort over durable evidence, matching the
+        // recovery tick's enumeration; an undecodable entry stays visible
+        // in diagnostics.
+        Err(error) => {
+          debug!(kind = ?error.kind(), "checkpoint guard skipped an undecodable descriptor");
+          continue;
+        }
+      };
+      let node = descriptor.node();
+      if descriptor.removed()
+        || node == context.identity().node()
+        || departed.status(node) != crate::MemberStatus::Active
+      {
+        continue;
+      }
+      if !live.contains(node) {
+        unreachable += 1;
+      }
+    }
+    if unreachable > 0 {
+      debug!(
+        unreachable,
+        "cleanup checkpoint refused: non-terminal members without a live session"
+      );
+      return Err(Error::not_ready("cleanup checkpoint"));
+    }
+    Ok(())
   }
 
   /// Forgets every anchored receipt past its retention deadline. The
