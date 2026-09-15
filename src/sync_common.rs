@@ -8,8 +8,13 @@ use std::{pin::Pin, sync::Arc};
 use futures_core::Stream;
 
 use crate::{
-  Error, NodeId, ProtocolTag, Result, TraceId, api::Entropy, packet::RoutedAckOutcome,
-  runtime::RuntimeClient, session::stream::SessionTable,
+  Error, NodeId, ProtocolTag, Result, TraceId,
+  api::Entropy,
+  node::EventHub,
+  packet::RoutedAckOutcome,
+  routing::RouteTable,
+  runtime::RuntimeClient,
+  session::stream::{SessionEntry, SessionTable},
 };
 
 /// The receiver-side body cap for one sync stream: one page is at most a
@@ -79,6 +84,20 @@ pub(crate) fn send_payload(
   let chunks: Vec<Arc<[u8]>> = chunk_payload(encoded).collect();
   let body: crate::packet::BodyStream =
     Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)));
+  let (request, ack_rx) = outbound_request(peer, protocol, trace_id, body);
+  runtime.try_send_packet(request)?;
+  Ok(ack_rx)
+}
+
+/// The one constructor for a sync lane's internal outbound request:
+/// exact-peer target, single hop, no metadata, admission ack channel —
+/// the shape every session-carried payload shares.
+fn outbound_request(
+  peer: &NodeId, protocol: &ProtocolTag, trace_id: TraceId, body: crate::packet::BodyStream,
+) -> (
+  crate::packet::OutboundRequest,
+  tokio::sync::oneshot::Receiver<RoutedAckOutcome>,
+) {
   let (ack_notify, ack_rx) = tokio::sync::oneshot::channel();
   let request = crate::packet::OutboundRequest {
     trace_id,
@@ -91,8 +110,47 @@ pub(crate) fn send_payload(
     internal: true,
     ack_notify,
   };
-  runtime.try_send_packet(request)?;
-  Ok(ack_rx)
+  (request, ack_rx)
+}
+
+/// The session-pump context one pumped payload needs: the live session
+/// entry plus the node-scoped collaborators the pump runs against.
+pub(crate) struct PumpContext<'a> {
+  pub(crate) entry: SessionEntry,
+  pub(crate) local: &'a NodeId,
+  pub(crate) routes: &'a RouteTable,
+  pub(crate) events: &'a Arc<EventHub>,
+}
+
+/// The leave lane's dispatch: the same bounded request as
+/// [`send_payload`], but the session pump is spawned here and its
+/// handle returned — the leaver must hold the pump's lifetime so the
+/// record body flushes before the session teardown the lane drives.
+pub(crate) fn send_pumped_payload(
+  context: PumpContext<'_>, entropy: &Arc<dyn Entropy>, peer: &NodeId, protocol: &ProtocolTag,
+  encoded: &[u8],
+) -> Result<(
+  tokio::sync::oneshot::Receiver<RoutedAckOutcome>,
+  tokio::task::JoinHandle<()>,
+)> {
+  let trace_id = TraceId::generate(entropy.as_ref())?;
+  let body: crate::packet::BodyStream = Box::pin(crate::packet::StaticBody::new(Arc::from(
+    encoded.to_vec().into_boxed_slice(),
+  )));
+  let (request, ack_rx) = outbound_request(peer, protocol, trace_id, body);
+  // The pump runs as its own task: the acknowledgement channel resolves
+  // at admission and the task itself completes after the record body
+  // flushed to the session.
+  let pump = tokio::spawn(crate::session::stream::run_outbound(
+    context.entry,
+    context.local.clone(),
+    request,
+    context.routes.clone(),
+    false,
+    None,
+    context.events.clone(),
+  ));
+  Ok((ack_rx, pump))
 }
 
 /// Resolves one dispatched payload's admission within [`SEND_ACK_WAIT`].

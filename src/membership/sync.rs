@@ -311,31 +311,18 @@ pub(crate) async fn announce_leave(
     let Some(entry) = entry else {
       continue;
     };
-    let (ack_notify, ack) = tokio::sync::oneshot::channel();
-    let trace_id = crate::TraceId::generate(entropy.as_ref())?;
-    let request = crate::packet::OutboundRequest {
-      trace_id,
-      target: crate::StreamTarget::Exact(peer.clone()),
-      load_balancer: None,
-      max_hops: 1,
-      protocol: protocol.clone(),
-      metadata: crate::packet::StreamMetadata::new(),
-      body: Box::pin(crate::packet::StaticBody::new(Arc::from(encoded.clone()))),
-      internal: true,
-      ack_notify,
-    };
-    // The pump runs as its own task: the acknowledgement channel
-    // resolves at admission and the task itself completes after the
-    // record body flushed to the session.
-    let pump = tokio::spawn(crate::session::stream::run_outbound(
-      entry,
-      local.clone(),
-      request,
-      routes.clone(),
-      false,
-      None,
-      events.clone(),
-    ));
+    let (ack, pump) = crate::sync_common::send_pumped_payload(
+      crate::sync_common::PumpContext {
+        entry,
+        local: &local,
+        routes,
+        events,
+      },
+      entropy,
+      &peer,
+      &protocol,
+      &encoded,
+    )?;
     let acked = std::sync::Arc::clone(&acked);
     tokio::spawn(async move {
       if matches!(ack.await, Ok(Ok(_))) {

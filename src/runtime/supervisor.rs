@@ -322,8 +322,7 @@ pub(crate) async fn spawn_runtime(
   runtime.spawn(supervise(
     dependencies,
     control_rx,
-    packet_tx,
-    packet_rx,
+    (packet_tx, packet_rx),
     sync_rounds,
     state_tx,
     ready_tx,
@@ -338,12 +337,15 @@ pub(crate) async fn spawn_runtime(
 
 async fn supervise(
   dependencies: RuntimeDependencies, mut control: mpsc::Receiver<Control>,
-  packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
-  mut packets: mpsc::Receiver<crate::packet::OutboundRequest>,
+  packets: (
+    mpsc::Sender<crate::packet::OutboundRequest>,
+    mpsc::Receiver<crate::packet::OutboundRequest>,
+  ),
   sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
   state: watch::Sender<LifecycleSnapshot>, ready: oneshot::Sender<()>,
   offer: crate::protocol::offer::FeatureOffer,
 ) {
+  let (packet_tx, mut packet_rx) = packets;
   let mut tasks = JoinSet::<()>::new();
   let mut lifecycle = LifecyclePublisher::new(state);
   lifecycle.publish(LifecycleSnapshot::running());
@@ -589,7 +591,7 @@ async fn supervise(
       }
         }
       }
-      request = packets.recv() => {
+      request = packet_rx.recv() => {
         let Some(request) = request else {
           continue;
         };
@@ -1589,7 +1591,7 @@ impl Supervisor {
             "resource removal clock",
           ))));
         }
-        let outcome = match crate::resource::store::commit_removal_ctx(
+        match crate::resource::store::commit_removal_ctx(
           store,
           this.dependencies.entropy.as_ref(),
           &removal,
@@ -1628,8 +1630,7 @@ impl Supervisor {
             };
             Ok(CommitRace::Final(Ok((name.clone(), installed, result))))
           }
-        };
-        outcome
+        }
       })
     })
     .await?;
