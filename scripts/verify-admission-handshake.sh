@@ -30,14 +30,14 @@ require_nonempty_tests admission_runtime "$TMP/admission-runtime.list"
 cargo test --locked --test admission_runtime admission_runtime
 
 # Record lane: pre-commit rejection matrix and unknown-applied schedule.
-cargo test --locked --lib identity_records_admission -- --list > "$TMP/admission-records.list"
-require_nonempty_tests identity_records_admission "$TMP/admission-records.list"
-cargo test --locked --lib identity_records_admission
+cargo test --locked --lib identity_records_merge -- --list > "$TMP/admission-records.list"
+require_nonempty_tests identity_records_merge "$TMP/admission-records.list"
+cargo test --locked --lib identity_records_merge
 
 # Session lane: same-generation retry after abort, member-mode recovery.
-cargo test --locked --lib session_admission -- --list > "$TMP/admission-session.list"
-require_nonempty_tests session_admission "$TMP/admission-session.list"
-cargo test --locked --lib session_admission
+cargo test --locked --lib session_merge -- --list > "$TMP/admission-session.list"
+require_nonempty_tests session_merge "$TMP/admission-session.list"
+cargo test --locked --lib session_merge
 cargo test --locked --lib session_adoption_result_loss -- --list > "$TMP/adoption-session.list"
 require_nonempty_tests session_adoption_result_loss "$TMP/adoption-session.list"
 cargo test --locked --lib session_adoption_result_loss

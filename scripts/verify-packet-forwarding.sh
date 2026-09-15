@@ -26,7 +26,7 @@ require_nonempty_tests() {
 
 # Forwarding lane: ordered constant-memory frame relay,
 # cross-hop backpressure, and explicit typed interruption.
-cargo test --locked --lib session::forward -- --list > "$TMP/forward.list"
+cargo test --locked --lib routing::forward -- --list > "$TMP/forward.list"
 require_nonempty_tests session_forward "$TMP/forward.list"
-cargo test --locked --lib session::forward
+cargo test --locked --lib routing::forward
 cargo test --locked --lib packet::wire

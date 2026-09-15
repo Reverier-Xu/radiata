@@ -24,9 +24,9 @@ require_nonempty_tests() {
   fi
 }
 
-cargo test --locked --lib json_crash -- --list > "$TMP/json-crash.list"
+cargo test --locked --all-features --lib json_crash -- --list > "$TMP/json-crash.list"
 require_nonempty_tests json_crash "$TMP/json-crash.list"
-cargo test --locked --lib json_crash
+cargo test --locked --all-features --lib json_crash
 
 cargo test --locked --lib key_intent -- --list > "$TMP/key-intent.list"
 require_nonempty_tests key_intent "$TMP/key-intent.list"

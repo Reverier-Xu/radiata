@@ -12,7 +12,7 @@ if (($# != 0)); then
 fi
 # The public membership/topology view lane.
 cargo test --locked --test secure_join secure_join_public_membership_and_topology_views
-cargo test --locked --test secure_join secure_join_sixteen_node_membership_joins_and_views
+cargo test --locked --test secure_join secure_join_sixteen_node_membership_merges_and_views
 # The membership failure matrix: duplicate delivery, partition healing, and
 # immediate recovery observability.
 cargo test --locked --test membership_sync membership_sync_failure_matrix_partition_healing

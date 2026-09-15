@@ -43,9 +43,9 @@ cargo test --locked --lib handshake_limit_negotiation
 cargo test --locked --lib session_member_reconnect -- --list > "$TMP/member.list"
 require_nonempty_tests session_member_reconnect "$TMP/member.list"
 cargo test --locked --lib session_member_reconnect
-cargo test --locked --lib session_join_then_member_reconnect -- --list > "$TMP/reconnect.list"
-require_nonempty_tests session_join_then_member_reconnect "$TMP/reconnect.list"
-cargo test --locked --lib session_join_then_member_reconnect
+cargo test --locked --lib session_merge_then_member_reconnect -- --list > "$TMP/reconnect.list"
+require_nonempty_tests session_merge_then_member_reconnect "$TMP/reconnect.list"
+cargo test --locked --lib session_merge_then_member_reconnect
 
 # End-to-end lane: join once, rotation keeps members, reconnect uses key trust.
 cargo test --locked --test secure_join secure_join_rotation_keeps_members -- --list > "$TMP/e2e.list"

@@ -24,6 +24,6 @@ require_nonempty_tests() {
   fi
 }
 
-cargo test --locked --lib json_native -- --list > "$TMP/json-native.list"
+cargo test --locked --all-features --lib json_native -- --list > "$TMP/json-native.list"
 require_nonempty_tests json_native "$TMP/json-native.list"
-cargo test --locked --lib json_native
+cargo test --locked --all-features --lib json_native

@@ -24,10 +24,10 @@ require_nonempty_tests() {
   fi
 }
 
-# Fixed admission rate limiting lane.
-cargo test --locked --lib admission_rate -- --list > "$TMP/rate.list"
-require_nonempty_tests admission_rate "$TMP/rate.list"
-cargo test --locked --lib admission_rate
+# Fixed merge rate limiting lane (the admission-era limiter, renamed).
+cargo test --locked --lib merge_rate -- --list > "$TMP/rate.list"
+require_nonempty_tests merge_rate "$TMP/rate.list"
+cargo test --locked --lib merge_rate
 
 # Hostile handshake lane: replay, misbinding, malformed transitions.
 cargo test --locked --lib handshake_state_machine -- --list > "$TMP/handshake.list"
@@ -49,6 +49,6 @@ require_nonempty_tests tls_transport_member_mode "$TMP/member.list"
 cargo test --locked --lib tls_transport_member_mode
 
 # Runtime lane: source rate window refusal performs no signing.
-cargo test --locked --test secure_join secure_join_admission_rate_window -- --list > "$TMP/runtime.list"
-require_nonempty_tests secure_join_admission_rate_window "$TMP/runtime.list"
-cargo test --locked --test secure_join secure_join_admission_rate_window
+cargo test --locked --test secure_join secure_join_merge_rate_window -- --list > "$TMP/runtime.list"
+require_nonempty_tests secure_join_merge_rate_window "$TMP/runtime.list"
+cargo test --locked --test secure_join secure_join_merge_rate_window
