@@ -605,7 +605,7 @@ fn config_and_registry_are_externally_constructible() {
     .with_anti_entropy_interval(Duration::from_millis(250))
     .unwrap()
     .with_recovery_policy(
-      RecoveryConfig::new(4, 8, Duration::from_secs(1), Duration::from_secs(300)).unwrap(),
+      RecoveryConfig::new(8, Duration::from_secs(1), Duration::from_secs(300)).unwrap(),
     )
     .unwrap()
     .with_session_queue_limits(64, 1024)

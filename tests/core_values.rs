@@ -118,13 +118,8 @@ fn core_config_accepts_nonzero_values_above_the_default_maxima() {
   let parser = ParserLimits::new(16 * 1024 * 1024, 2_048, 2_048).unwrap();
   let trace =
     TraceMetadataLimits::new(65_537, 1_048_577, Duration::from_secs(31 * 24 * 60 * 60)).unwrap();
-  let recovery = RecoveryConfig::new(
-    2_048,
-    4_096,
-    Duration::from_secs(31),
-    Duration::from_secs(601),
-  )
-  .unwrap();
+  let recovery =
+    RecoveryConfig::new(4_096, Duration::from_secs(31), Duration::from_secs(601)).unwrap();
   let feature = FeatureTag::parse("example.com/features/work").unwrap();
 
   NodeConfig::new()
@@ -152,8 +147,9 @@ fn core_config_rejects_only_invalid_foundation_relationships() {
   assert!(TraceMetadataLimits::new(0, 1, Duration::from_secs(1)).is_err());
   assert!(TraceMetadataLimits::new(1, 0, Duration::from_secs(1)).is_err());
   assert!(TraceMetadataLimits::new(1, 1, Duration::ZERO).is_err());
-  assert!(RecoveryConfig::new(2, 1, Duration::from_secs(1), Duration::from_secs(2)).is_err());
-  assert!(RecoveryConfig::new(1, 2, Duration::from_secs(2), Duration::from_secs(1)).is_err());
+  assert!(RecoveryConfig::new(0, Duration::from_secs(1), Duration::from_secs(2)).is_err());
+  assert!(RecoveryConfig::new(1, Duration::ZERO, Duration::from_secs(2)).is_err());
+  assert!(RecoveryConfig::new(1, Duration::from_secs(2), Duration::from_secs(1)).is_err());
   assert!(
     NodeConfig::new()
       .with_anti_entropy_interval(Duration::ZERO)

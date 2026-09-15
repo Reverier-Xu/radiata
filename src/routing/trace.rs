@@ -16,9 +16,9 @@
 //! - a process restart terminates previously active records explicitly
 //!   (`Failed(StreamInterrupted)`); no reopen path continues a body.
 //!
-//! Record accessors are unit-verified in this module's tests; some stay
-//! intentionally dead in non-test builds, where only tests consume them.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Record accessors that only the unit tests and the compatibility
+//! golden-vector reader consume are `#[cfg(test)]`; the production
+//! surface stays exactly the record writer, decoder, and sweeps.
 
 use std::time::{Duration, SystemTime};
 
@@ -180,18 +180,25 @@ impl TraceRecord {
     self
   }
 
+  /// Test-only identity probes: production code reads these fields
+  /// through the canonical encoder and the retention scans, never through
+  /// accessors.
+  #[cfg(test)]
   pub(crate) fn trace_id(&self) -> &TraceId {
     &self.trace_id
   }
 
+  #[cfg(test)]
   pub(crate) fn source(&self) -> &NodeId {
     &self.source
   }
 
+  #[cfg(test)]
   pub(crate) fn destination(&self) -> &NodeId {
     &self.destination
   }
 
+  #[cfg(test)]
   pub(crate) fn phase(&self) -> &TracePhase {
     &self.phase
   }
@@ -200,9 +207,13 @@ impl TraceRecord {
   pub(crate) fn with_transition(mut self, transition: TraceTransition, at: SystemTime) -> Self {
     self.updated_at = at;
     self.phase = match transition {
-      TraceTransition::Streaming => TracePhase::Streaming,
       TraceTransition::Delivered => TracePhase::Delivered,
       TraceTransition::Failed(kind) => TracePhase::Failed(kind),
+      // The in-flight transition is a persisted phase only: production
+      // records route progress in memory and terminals durably, so the
+      // constructor value exists for the frozen golden-vector fixtures.
+      #[cfg(test)]
+      TraceTransition::Streaming => TracePhase::Streaming,
     };
     self
   }
@@ -217,6 +228,9 @@ impl TraceRecord {
 /// One persisted route transition beyond the initial routing record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TraceTransition {
+  /// Test-only constructor value: the in-flight phase is a persisted
+  /// wire shape (the golden vectors pin it), never a production write.
+  #[cfg(test)]
   Streaming,
   Delivered,
   Failed(ErrorKind),

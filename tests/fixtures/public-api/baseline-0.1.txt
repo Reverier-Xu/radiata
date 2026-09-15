@@ -662,7 +662,7 @@ pub fn radiata::RecoveryChanged::recovery(&self) -> &radiata::RecoveryView
 impl radiata::Event for radiata::RecoveryChanged
 pub struct radiata::RecoveryConfig
 impl radiata::RecoveryConfig
-pub fn radiata::RecoveryConfig::new(usize, usize, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::RecoveryConfig::new(usize, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
 impl core::default::Default for radiata::RecoveryConfig
 pub fn radiata::RecoveryConfig::default() -> Self
 pub struct radiata::RecoveryView

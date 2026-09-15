@@ -76,7 +76,7 @@ async fn start(seed: u64) -> Node {
     .with_anti_entropy_interval(sync_interval())
     .unwrap()
     .with_recovery_policy(
-      RecoveryConfig::new(4, 64, Duration::from_secs(2), Duration::from_secs(60)).unwrap(),
+      RecoveryConfig::new(64, Duration::from_secs(2), Duration::from_secs(60)).unwrap(),
     )
     .unwrap();
   let handle = NodeBuilder::new(storage, keys)

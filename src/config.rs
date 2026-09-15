@@ -295,39 +295,29 @@ impl Default for TraceMetadataLimits {
 /// The recovery policy: bounds and cadence for the any-one-route
 /// recovery plane. While fully isolated, a node retries members from its
 /// table with wall-clock backoff (initial → maximum, doubling); a
-/// connected node never dials. `neighbors` names the intended direct
-/// neighborhood size (used by topology bootstrap hints),
-/// `fan_out` caps how many members one recovery round dials in parallel,
-/// and the backoff pair bounds the retry cadence.
+/// connected node never dials. `fan_out` caps how many members one
+/// recovery round dials in parallel, and the backoff pair bounds the
+/// retry cadence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryConfig {
-  neighbors: usize,
   fan_out: usize,
   initial_backoff: Duration,
   maximum_backoff: Duration,
 }
 
 impl RecoveryConfig {
-  pub fn new(
-    neighbors: usize, fan_out: usize, initial_backoff: Duration, maximum_backoff: Duration,
-  ) -> Result<Self> {
-    ensure_nonzero(neighbors, "recovery neighbors")?;
+  pub fn new(fan_out: usize, initial_backoff: Duration, maximum_backoff: Duration) -> Result<Self> {
     ensure_nonzero(fan_out, "recovery fan-out")?;
     ensure_nonzero_duration(initial_backoff, "initial recovery backoff")?;
     ensure_nonzero_duration(maximum_backoff, "maximum recovery backoff")?;
-    if neighbors > fan_out || initial_backoff > maximum_backoff {
+    if initial_backoff > maximum_backoff {
       return Err(Error::invalid_input("recovery policy"));
     }
     Ok(Self {
-      neighbors,
       fan_out,
       initial_backoff,
       maximum_backoff,
     })
-  }
-
-  pub(crate) const fn neighbors(&self) -> usize {
-    self.neighbors
   }
 
   pub(crate) const fn fan_out(&self) -> usize {
@@ -346,7 +336,6 @@ impl RecoveryConfig {
 impl Default for RecoveryConfig {
   fn default() -> Self {
     Self {
-      neighbors: 4,
       fan_out: 64,
       initial_backoff: Duration::from_secs(1),
       maximum_backoff: Duration::from_secs(5 * 60),

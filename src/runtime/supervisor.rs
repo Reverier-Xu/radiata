@@ -851,7 +851,6 @@ impl Supervisor {
     );
     let recovery = crate::membership::recovery::RecoveryController::new(
       crate::membership::recovery::RecoveryPolicy::new(
-        dependencies.config.recovery().neighbors(),
         dependencies.config.recovery().fan_out(),
         dependencies.config.recovery().initial_backoff_seconds(),
         dependencies.config.recovery().maximum_backoff_seconds(),
