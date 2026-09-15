@@ -88,7 +88,7 @@ fn new_record() -> ResourceRecordV1 {
 async fn open_store(factory: &Arc<dyn StorageFactory>) -> MetadataStore {
   // The crash child dies holding the store lock: tolerate the lock-
   // release window on loaded runners.
-  crate::storage::test_util::open_store_with_lock_retry(factory).await
+  crate::storage::test_util::crash_reopen::open_store_with_lock_retry(factory).await
 }
 
 fn factory(dir: &TempDir) -> Arc<dyn StorageFactory> {

@@ -106,8 +106,11 @@ async fn redb_crash_boundaries_recover_exact_old_or_new_state() {
 
     run_child(&dir, point);
 
-    let reopened =
-      crate::storage::test_util::open_provider_with_lock_retry(&factory, requirements()).await;
+    let reopened = crate::storage::test_util::crash_reopen::open_provider_with_lock_retry(
+      &factory,
+      requirements(),
+    )
+    .await;
     let snapshot = reopened.snapshot().await.unwrap();
     let namespace = namespace();
     let seed_value = snapshot
