@@ -1,5 +1,24 @@
 # radiata Verified Findings (G3-era review, 2026-08)
 
+> **0.1.0 remediation 2026-09-15 (branch fix-audit-p1-p2, 12 commits).**
+> All five P1s fixed with regression tests (leave record re-sign +
+> crash-matrix record phase; tombstone lane unconditional +
+> tombstone_round_due unit pin; resource scratch-rewind forces pass due;
+> pong wakes surfaced as Received::Pong + FrameSource read_loop test;
+> node offer built pre-ready with typed start() failure). All
+> production P2s fixed (trust decode limits + parse extraction +
+> capacity comment; lifecycle twin harness deleted; PeerPageCursor doc
+> + shared cadence constant; paging &None invariant; sync_common
+> reclassified cross-cutting; run_outbound phases named; sync_tick
+> decomposed per peer; tombstone bindings single-load; retention batch
+> bound + deterministic txn id; writer wait per page; ReceiptRetention
+> Report homed in L6; journal-recovery precondition documented; views
+> status dedup; resource mutation tail shared; descriptor namespace
+> accessor; json body_digest reuse; e2e converge walk shared). Deferred
+> (pre-existing tickets, assessed and kept): stream.rs five-way file
+> split (M6) — outbound phases named as the seam; full test NodeHarness
+> consolidation (needs a parameter-object design).
+
 > **0.1.0 merge audit 2026-09-15 (main @ 28cbfc7, seven fresh reviewer lanes over
 > L0-L7 + cross-cut; supervisor verified every P1 against source).** Q suite green
 > (642/0 + doctests), CI green on the merge commit. Verdict for the tree:
