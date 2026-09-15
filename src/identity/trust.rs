@@ -125,6 +125,45 @@ struct SnapshotPageWire {
 const TRUST_SNAPSHOT_STORE_LIMITS: crate::protocol::CborLimits =
   crate::protocol::CborLimits::new(16, 16_384, 1 << 20);
 
+/// The shared parse core of both snapshot shapes: the header checks
+/// (schema marking, record version, logical version), the issuer parse,
+/// and the canonically ordered binding set. Both wire forms carry these
+/// fields; the store form builds the full snapshot, the page form adds
+/// its continuation cursor.
+fn parse_snapshot_wire(
+  wire: SnapshotWire,
+) -> Result<(u64, u16, NodeId, PublicKey, Vec<TrustBinding>)> {
+  if wire.schema != TRUST_SNAPSHOT_SCHEMA || wire.record_version != 1 {
+    return Err(crate::Error::invalid_input("trust snapshot schema"));
+  }
+  // Only version 1 is known; an unknown version fails closed.
+  if wire.version != 1 {
+    return Err(crate::Error::invalid_input("trust snapshot version"));
+  }
+  let issuer = NodeId::parse(&wire.issuer)
+    .map_err(|_| crate::Error::invalid_input("trust snapshot issuer"))?;
+  let issuer_key = PublicKey::from_bytes(crate::error::fixed_bytes(
+    wire.issuer_key.as_ref(),
+    "trust snapshot issuer key",
+  )?);
+  let mut bindings = Vec::with_capacity(wire.bindings.len());
+  for binding in &wire.bindings {
+    let node = NodeId::parse(&binding.node)
+      .map_err(|_| crate::Error::invalid_input("trust snapshot node"))?;
+    let key = PublicKey::from_bytes(crate::error::fixed_bytes(
+      binding.key.as_ref(),
+      "trust snapshot key",
+    )?);
+    bindings.push(TrustBinding::new(node, key));
+  }
+  // Ordered deterministically: canonical node text ascending; a
+  // non-canonical order is rejected.
+  if !bindings.windows(2).all(|pair| pair[0].node < pair[1].node) {
+    return Err(crate::Error::invalid_input("trust snapshot ordering"));
+  }
+  Ok((wire.revision, wire.version, issuer, issuer_key, bindings))
+}
+
 impl TrustSnapshotV1 {
   pub(crate) fn new(
     revision: u64, version: u16, issuer: NodeId, issuer_key: PublicKey, bindings: Vec<TrustBinding>,
@@ -233,41 +272,8 @@ impl TrustSnapshotV1 {
     // would fail its own revision read-back forever.
     let wire: SnapshotWire = decode_canonical(bytes, TRUST_SNAPSHOT_STORE_LIMITS)
       .map_err(|_| crate::Error::invalid_input("trust snapshot decode"))?;
-    if wire.schema != TRUST_SNAPSHOT_SCHEMA || wire.record_version != 1 {
-      return Err(crate::Error::invalid_input("trust snapshot schema"));
-    }
-    // Only version 1 is known; an unknown version fails closed.
-    if wire.version != 1 {
-      return Err(crate::Error::invalid_input("trust snapshot version"));
-    }
-    let issuer = NodeId::parse(&wire.issuer)
-      .map_err(|_| crate::Error::invalid_input("trust snapshot issuer"))?;
-    let issuer_key = PublicKey::from_bytes(crate::error::fixed_bytes(
-      wire.issuer_key.as_ref(),
-      "trust snapshot issuer key",
-    )?);
-    let mut bindings = Vec::with_capacity(wire.bindings.len());
-    for binding in &wire.bindings {
-      let node = NodeId::parse(&binding.node)
-        .map_err(|_| crate::Error::invalid_input("trust snapshot node"))?;
-      let key = PublicKey::from_bytes(crate::error::fixed_bytes(
-        binding.key.as_ref(),
-        "trust snapshot key",
-      )?);
-      bindings.push(TrustBinding::new(node, key));
-    }
-    // Ordered deterministically: canonical node text ascending; a
-    // non-canonical order is rejected.
-    if !bindings.windows(2).all(|pair| pair[0].node < pair[1].node) {
-      return Err(crate::Error::invalid_input("trust snapshot ordering"));
-    }
-    Ok(Self::new(
-      wire.revision,
-      wire.version,
-      issuer,
-      issuer_key,
-      bindings,
-    ))
+    let (revision, version, issuer, issuer_key, bindings) = parse_snapshot_wire(wire)?;
+    Ok(Self::new(revision, version, issuer, issuer_key, bindings))
   }
 
   /// True when this snapshot is strictly newer than `other` by revision.
@@ -344,33 +350,18 @@ impl TrustSnapshotPage {
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
     let wire: SnapshotPageWire = decode_canonical(bytes, crate::protocol::CONTROL_CBOR_LIMITS)
       .map_err(|_| crate::Error::invalid_input("trust snapshot decode"))?;
-    if wire.schema != TRUST_SNAPSHOT_SCHEMA || wire.record_version != 1 {
-      return Err(crate::Error::invalid_input("trust snapshot schema"));
-    }
-    if wire.version != 1 {
-      return Err(crate::Error::invalid_input("trust snapshot version"));
-    }
-    let issuer = NodeId::parse(&wire.issuer)
-      .map_err(|_| crate::Error::invalid_input("trust snapshot issuer"))?;
-    let issuer_key = PublicKey::from_bytes(crate::error::fixed_bytes(
-      wire.issuer_key.as_ref(),
-      "trust snapshot issuer key",
-    )?);
-    let mut bindings = Vec::with_capacity(wire.bindings.len());
-    for binding in &wire.bindings {
-      let node = NodeId::parse(&binding.node)
-        .map_err(|_| crate::Error::invalid_input("trust snapshot node"))?;
-      let key = PublicKey::from_bytes(crate::error::fixed_bytes(
-        binding.key.as_ref(),
-        "trust snapshot key",
-      )?);
-      bindings.push(TrustBinding::new(node, key));
-    }
-    // Ordered deterministically: canonical node text ascending; a
-    // non-canonical order is rejected.
-    if !bindings.windows(2).all(|pair| pair[0].node < pair[1].node) {
-      return Err(crate::Error::invalid_input("trust snapshot ordering"));
-    }
+    // The page repeats the full-set header fields and binding entries,
+    // so both shapes share one parse core; the continuation cursor is
+    // the page form's only extra field.
+    let (revision, version, issuer, issuer_key, bindings) = parse_snapshot_wire(SnapshotWire {
+      schema: wire.schema,
+      record_version: wire.record_version,
+      revision: wire.revision,
+      version: wire.version,
+      issuer: wire.issuer,
+      issuer_key: wire.issuer_key,
+      bindings: wire.bindings,
+    })?;
     let continuation = match &wire.continuation {
       Some(cursor) => Some(
         NodeId::parse(cursor)
@@ -379,8 +370,8 @@ impl TrustSnapshotPage {
       None => None,
     };
     Ok(Self {
-      revision: wire.revision,
-      version: wire.version,
+      revision,
+      version,
       issuer,
       issuer_key,
       continuation,
