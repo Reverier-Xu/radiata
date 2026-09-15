@@ -1482,32 +1482,43 @@ impl Supervisor {
     // replacing the expected version: the register moved past it, so the
     // precondition surfaces as an explicit conflict (D7) instead of a
     // silently accepted loser.
-    if expected.is_some()
-      && matches!(
-        outcome,
-        crate::resource::store::ResourceCommitOutcome::Superseded(_)
-      )
-    {
-      return Err(Error::conflict("resource version"));
-    }
-    Ok(match outcome {
+    let superseded = if expected.is_some() {
+      None
+    } else {
+      Some(crate::ResourceMutationView::new(accepted.clone(), false))
+    };
+    Self::resource_mutation_outcome(
+      &self.dependencies.events,
+      &name,
+      outcome,
+      crate::ResourceMutationView::new(accepted, true),
+      superseded,
+    )
+  }
+
+  /// The shared post-commit mapping for one resource mutation: a
+  /// committed install emits exactly one change event and wins; a
+  /// superseded mutation reports the accepted loser (plain put) or
+  /// conflicts (a preconditioned write or a removal whose register
+  /// moved); an indeterminate commit is never guessed into an outcome.
+  fn resource_mutation_outcome(
+    events: &crate::node::EventHub, name: &crate::ResourceName,
+    outcome: crate::resource::store::ResourceCommitOutcome, winner: crate::ResourceMutationView,
+    superseded: Option<crate::ResourceMutationView>,
+  ) -> Result<crate::ResourceMutationView> {
+    match outcome {
       crate::resource::store::ResourceCommitOutcome::Installed(_) => {
-        self
-          .dependencies
-          .events
-          .emit(crate::ResourceChanged::new(name.clone()));
-        crate::ResourceMutationView::new(accepted, true)
+        events.emit(crate::ResourceChanged::new(name.clone()));
+        Ok(winner)
       }
-      crate::resource::store::ResourceCommitOutcome::Superseded(_) => {
-        crate::ResourceMutationView::new(accepted, false)
-      }
-      crate::resource::store::ResourceCommitOutcome::Indeterminate { .. } => {
-        return Err(Error::provider(
-          crate::ProviderErrorKind::CommitUnknown,
-          crate::ProviderErrorContext::StorageCommit,
-        ));
-      }
-    })
+      crate::resource::store::ResourceCommitOutcome::Superseded(_) => superseded
+        .map(Ok)
+        .unwrap_or_else(|| Err(Error::conflict("resource version"))),
+      crate::resource::store::ResourceCommitOutcome::Indeterminate { .. } => Err(Error::provider(
+        crate::ProviderErrorKind::CommitUnknown,
+        crate::ProviderErrorContext::StorageCommit,
+      )),
+    }
   }
 
   /// Creates signed removal evidence for one resource (`RemoveResource`):
@@ -1537,7 +1548,7 @@ impl Supervisor {
     let this = &*self;
     let context = &context;
     let name = &name;
-    let (name, installed, view) = with_commit_race_retry("resource removal", || {
+    with_commit_race_retry("resource removal", || {
       Box::pin(async move {
         let store = context.store();
         let stored = crate::resource::store::read_record_ctx(store, name)
@@ -1551,10 +1562,9 @@ impl Supervisor {
         if stored.removed() {
           // The exact removal already won: idempotent, no new transition
           // (and no event — only a fresh install emits).
-          return Ok(CommitRace::Final(Ok((
-            name.clone(),
-            false,
-            crate::ResourceMutationView::new(crate::resource::select::resource_view(&stored), true),
+          return Ok(CommitRace::Final(Ok(crate::ResourceMutationView::new(
+            crate::resource::select::resource_view(&stored),
+            true,
           ))));
         }
         // The removal rides the same monotonic issue clock as a put, so a
@@ -1605,42 +1615,23 @@ impl Supervisor {
           Ok(outcome) => {
             // A committed removal emits exactly one event after
             // durability; the raced/moved/indeterminate arms below never
-            // reach the emit as successes.
-            let installed = matches!(
+            // reach the emit as successes. A removal has no accepted-
+            // loser report: a register move conflicts (D7).
+            Ok(CommitRace::Final(Self::resource_mutation_outcome(
+              &this.dependencies.events,
+              name,
               outcome,
-              crate::resource::store::ResourceCommitOutcome::Installed(_)
-            );
-            let result = match outcome {
-              crate::resource::store::ResourceCommitOutcome::Installed(_) => {
-                crate::ResourceMutationView::new(
-                  crate::resource::select::resource_view(&removal),
-                  true,
-                )
-              }
-              // The register moved between the observation and the commit.
-              crate::resource::store::ResourceCommitOutcome::Superseded(_) => {
-                return Err(Error::conflict("resource version"));
-              }
-              crate::resource::store::ResourceCommitOutcome::Indeterminate { .. } => {
-                return Err(Error::provider(
-                  crate::ProviderErrorKind::CommitUnknown,
-                  crate::ProviderErrorContext::StorageCommit,
-                ));
-              }
-            };
-            Ok(CommitRace::Final(Ok((name.clone(), installed, result))))
+              crate::ResourceMutationView::new(
+                crate::resource::select::resource_view(&removal),
+                true,
+              ),
+              None,
+            )))
           }
         }
       })
     })
-    .await?;
-    if installed {
-      self
-        .dependencies
-        .events
-        .emit(crate::ResourceChanged::new(name.clone()));
-    }
-    Ok(view)
+    .await
   }
 
   /// Revokes one exact subject binding's connection and admission
