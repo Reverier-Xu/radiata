@@ -14,7 +14,7 @@ use crate::{
   StoreValue, TransactionId,
   provider::{Storage, StorageFactory, StoreScan, StoreSnapshot},
   storage::{
-    MetadataStore,
+    CommitState, MetadataStore, PendingCommit,
     contract::helpers,
     receipt::{PreparedTransaction, prepare_internal_transaction},
     test_util::transaction_id,
@@ -502,6 +502,60 @@ async fn storage_contract_engine_malformed_reconcile_receipt_retains_freeze() {
     ErrorKind::NotReady,
   );
   assert_eq!(state.commit_calls.load(Ordering::SeqCst), 1);
+}
+
+/// The journal-recovery unfreeze only fires while the slot still holds
+/// the exact resolved identity: a permit-holding resolver always meets
+/// that condition, while the declared-uncommitted command must not
+/// clobber a slot that another resolver unfroze or a new in-flight
+/// commit re-purposed during its delete await.
+#[tokio::test]
+async fn journal_recovery_unfreeze_skips_a_slot_that_moved_on() {
+  let (store, _state) = scripted(vec![], vec![]).await;
+  let resolved = PendingCommit {
+    transaction: transaction_id(1),
+    digest: Digest::from_bytes([1; 32]),
+    journal_proven: true,
+  };
+  {
+    let mut state = store.lock_state().unwrap();
+    *state = CommitState::Frozen {
+      pending: resolved.clone(),
+      provider_call_active: false,
+    };
+  }
+  store.finish_journal_recovery(&resolved).unwrap();
+  assert!(matches!(*store.lock_state().unwrap(), CommitState::Ready));
+
+  let replaced = PendingCommit {
+    transaction: transaction_id(2),
+    digest: Digest::from_bytes([2; 32]),
+    journal_proven: false,
+  };
+  {
+    let mut state = store.lock_state().unwrap();
+    *state = CommitState::Frozen {
+      pending: replaced,
+      provider_call_active: true,
+    };
+  }
+  store.finish_journal_recovery(&resolved).unwrap();
+  assert!(matches!(
+    *store.lock_state().unwrap(),
+    CommitState::Frozen {
+      provider_call_active: true,
+      ..
+    }
+  ));
+
+  // A slot another resolver already unfroze stays ready: the skipped
+  // unfreeze changes nothing and reports no error.
+  {
+    let mut state = store.lock_state().unwrap();
+    *state = CommitState::Ready;
+  }
+  store.finish_journal_recovery(&resolved).unwrap();
+  assert!(matches!(*store.lock_state().unwrap(), CommitState::Ready));
 }
 
 async fn scripted(

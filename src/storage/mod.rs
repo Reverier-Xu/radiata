@@ -5,10 +5,13 @@ use std::{
 
 #[cfg(test)]
 use self::receipt::HostWallClock;
-use self::receipt::{PreparedTransaction, WallClock, prepare_internal_transaction};
+use self::receipt::{
+  PreparedTransaction, ReceiptReferenceToken, WallClock, build_pending_record_delete_operations,
+  prepare_internal_transaction,
+};
 use crate::{
   CommitOutcome, CommitReceipt, Digest, Error, ErrorKind, ProviderErrorContext, ProviderErrorKind,
-  ReconcileOutcome, Result, StoreOperation, StoreRequirements, TransactionId,
+  ReconcileOutcome, Result, StoreRequirements, TransactionId,
   provider::{Storage, StorageFactory, StoreSnapshot},
 };
 
@@ -561,7 +564,7 @@ impl MetadataStore {
     {
       Ok(ReconcileOutcome::Committed(receipt)) => {
         self.validate_receipt(&pending, &receipt, ProviderErrorContext::StorageReconcile)?;
-        self.finish_journal_recovery()?;
+        self.finish_journal_recovery(&pending)?;
         crate::audit::journal_resolved(purpose, true);
         Ok(true)
       }
@@ -573,7 +576,7 @@ impl MetadataStore {
         // present means the durable state contradicts the journal, and
         // the store stays frozen and fails closed.
         if self.recover_pending(purpose).await?.is_none() {
-          self.finish_journal_recovery()?;
+          self.finish_journal_recovery(&pending)?;
           crate::audit::journal_resolved(purpose, false);
           return Ok(false);
         }
@@ -594,12 +597,27 @@ impl MetadataStore {
 
   /// Returns a frozen store recovered on journal evidence back to ready.
   ///
-  /// Precondition: the caller runs inside the journaled flow's writer
-  /// permit (see [`Self::resolve_pending_journal`]): the unfreeze and
-  /// the notify are state mutations that must not interleave with
-  /// another resolver's evidence read.
-  fn finish_journal_recovery(&self) -> Result<()> {
-    *self.lock_state()? = CommitState::Ready;
+  /// Permit-holding resolvers (see [`Self::resolve_pending_journal`])
+  /// still own the frozen slot when they unfreeze, so the identity
+  /// condition below always holds for them. The declared-uncommitted
+  /// command runs outside the writer permit by design, so its unfreeze
+  /// is conditioned on the slot still holding the exact resolved
+  /// identity: a slot that moved on during the delete await (unfrozen by
+  /// another resolver, or re-purposed by a new in-flight commit) keeps
+  /// its state, because clobbering it would break the
+  /// single-in-flight-commit invariant.
+  fn finish_journal_recovery(&self, resolved: &PendingCommit) -> Result<()> {
+    let mut state = self.lock_state()?;
+    match &*state {
+      CommitState::Frozen { pending, .. }
+        if pending.transaction == resolved.transaction && pending.digest == resolved.digest => {}
+      // The slot moved on while this resolver was reading durable
+      // evidence: the resolution outcome is classified from durable
+      // evidence either way, so only the state write is skipped.
+      _ => return Ok(()),
+    }
+    *state = CommitState::Ready;
+    drop(state);
     self.ready_notify.notify_waiters();
     Ok(())
   }
@@ -614,11 +632,16 @@ impl MetadataStore {
   /// resolves.
   ///
   /// The resolution deletes the pending journal record for the frozen
-  /// purpose in one atomic, never-journaled transaction and only then
-  /// unfreezes the store, so a crash at any point leaves the store either
-  /// still frozen with its journal or cleanly unfrozen without one —
-  /// never half-cleared. A restart after the delete reopens ready with no
-  /// pending journal.
+  /// purpose — paired, exactly as the normal pending cleanup pairs them,
+  /// with removing the journal's receipt-reference token from the live
+  /// target receipt — in one atomic, never-journaled transaction and
+  /// only then unfreezes the store, so a crash at any point leaves the
+  /// store either still frozen with its journal or cleanly unfrozen
+  /// without one — never half-cleared. A restart after the delete
+  /// reopens ready with no pending journal. The unfreeze is conditioned
+  /// on the slot still holding the exact frozen identity (see
+  /// [`Self::finish_journal_recovery`]): a slot that moved on during the
+  /// delete await keeps its state, and the landed delete still stands.
   ///
   /// Writer gate: the frozen slot replaces the writer exclusion here.
   /// While frozen, every normal commit path refuses at the slot, so this
@@ -669,22 +692,42 @@ impl MetadataStore {
       }
       Err(error) => return Err(error),
     }
-    let (base_revision, expected) = {
-      let snapshot = self.snapshot().await?;
-      let Some((stored, record)) = pending::discover_pending(snapshot.as_ref(), &purpose).await?
-      else {
-        // The journal vanished between reads: there is nothing left to
-        // abort, and the frozen premise no longer holds.
-        return Err(Error::conflict("frozen journal resolution"));
-      };
-      let identity = record.recover_identity(&stored)?;
-      if identity.transaction() != &pending.transaction
-        || identity.operation_digest() != &pending.digest
-      {
-        return Err(storage_corrupt(ProviderErrorContext::StorageSnapshot));
-      }
-      (snapshot.revision().clone(), stored.digest().clone())
+    let snapshot = self.snapshot().await?;
+    let Some((stored, record)) = pending::discover_pending(snapshot.as_ref(), &purpose).await?
+    else {
+      // The journal vanished between reads: there is nothing left to
+      // abort, and the frozen premise no longer holds.
+      return Err(Error::conflict("frozen journal resolution"));
     };
+    let identity = record.recover_identity(&stored)?;
+    if identity.transaction() != &pending.transaction
+      || identity.operation_digest() != &pending.digest
+    {
+      return Err(storage_corrupt(ProviderErrorContext::StorageSnapshot));
+    }
+    let base_revision = snapshot.revision().clone();
+    // The delete is paired — in the same shape as the normal pending
+    // cleanup — with removing the journal's receipt-reference token from
+    // the live target receipt, so a receipt touched by a
+    // declared-uncommitted transaction can anchor and be forgotten again
+    // instead of staying permanently referenced. A forgotten target
+    // receipt carries no reachable reference set, so the record delete
+    // alone applies.
+    let record_token = ReceiptReferenceToken::for_record(
+      &pending::pending_namespace()?,
+      &pending::pending_key(&purpose),
+    );
+    let delete_operations = build_pending_record_delete_operations(
+      snapshot.as_ref(),
+      &operation,
+      &identity,
+      &record_token,
+      pending::pending_namespace()?,
+      pending::pending_key(&purpose),
+      stored.digest().clone(),
+    )
+    .await?;
+    drop(snapshot);
     // The slot must still be the exact frozen journal: nothing else may
     // unfreeze between the evidence read and the delete, and a flipped
     // slot means the premise broke while this resolution was reading.
@@ -694,15 +737,7 @@ impl MetadataStore {
     }
     drop(frozen_now);
     let delete_id = operation.clone();
-    let prepared = prepare_internal_transaction(
-      operation,
-      base_revision,
-      vec![StoreOperation::Delete {
-        namespace: pending::pending_namespace()?,
-        key: pending::pending_key(&purpose),
-        expected,
-      }],
-    )?;
+    let prepared = prepare_internal_transaction(operation, base_revision, delete_operations)?;
     let delete_digest = prepared.operation_digest().clone();
     // The delete bypasses the commit slot's state machine on purpose:
     // the machine refuses any commit while frozen, and this delete is
@@ -742,7 +777,7 @@ impl MetadataStore {
       }
       Err(error) => return Err(error),
     }
-    self.finish_journal_recovery()?;
+    self.finish_journal_recovery(&pending)?;
     crate::audit::journal_declared_uncommitted(&purpose);
     tracing::info!(
       purpose = %purpose,
