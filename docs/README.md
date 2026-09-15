@@ -7,7 +7,7 @@
 
 | 文档 | 内容 | 维护约定 |
 | --- | --- | --- |
-| [architecture.md](architecture.md) | 分层架构与模块职责（2026-09-09 审计时点生成，main @ `faf7833`） | ⚠️ 已过时：此后落地的恢复语义（any one route）、ack 投递语义、`ResourceVersion::from_parts` 等未反映。**0.1.0 代码定稿后全量重审刷新**（见 plan-0.1.0.md P2-8） |
+| [architecture.md](architecture.md) | 分层架构与模块职责（对应 `plan-0.1.0-baseline` 0.1.0 代码定稿，2026-09-15 全量重审刷新） | 代码变更触及架构语义时同步更新 |
 | [plan-0.1.0.md](plan-0.1.0.md) | **0.1.0 前改进计划（唯一任务清单）**：P0/P1/P2 全部条目、根因、方案草案、验收标准、批次顺序 | 每完成一项就地更新状态；新发现的问题先入档再开工 |
 | [archive/README.md](archive/README.md) | 归档说明 | — |
 
