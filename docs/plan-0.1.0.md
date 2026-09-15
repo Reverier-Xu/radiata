@@ -36,7 +36,8 @@
 | D10 | **拓扑剪枝改为实施**：冗余边的成本经源码量化为真实（反熵 tick 每 250ms 全 peer 扇出，流量/CPU/fd 随边数线性增长，恢复累积的 O(N²) 边永不回收）；实现有界剪枝：仅回收恢复面拨出的冗余边，保有 any-one-route 保底与迟滞防振荡；soak 基准验证边数回归基线 | P2-2 |
 | D11 | **群成员多赢家记录 = 决策记录 + 观望**：P1-1 CAS 把静默丢失变显式冲突，多赢家子记录等真实需求 | P2-4 |
 | D12 | **默认 feature 反转为 `redb`**：`json` 需显式；0.1.0 发布说明标 breaking | P2-6 |
-| D13 | **`store_scan_stream` 保留**：补"扩展作者面"定位 rustdoc，保留外部驱动测试 | P2-7 |
+| D13 | **`store_scan_stream` 保留**：补“扩展作者面”定位 rustdoc，保留外部驱动测试 | P2-7 |
+| D14 | **SLO 测量并轨，移除独立 `radiata-slo` harness**（2026-09-15 owner 决策）：SLO 证据收敛到两处——进程内泳道（`tests/membership_sync.rs` 16 节点 SLO 与 1,024 节点 trend、`tests/sync_scale_benchmark.rs`、soak）承担规模剖面；容器级测量由 examples 承担：`examples/cluster/test_slo.py` 五层 × 5 轮 × 5 样本（admission / direct-packet / routed-packet / node-metadata / resource-metadata，逐样本 10s deadline、原始墙钟无事后剔除）+ `examples/chat/test_chat.py` 的 dm/offline 时延断言；audit 打桩（SLO=1 构建 + 逐节点日志）提供路径证据。删除 `slo/` crate、其 OCI 镜像/预检/qualification、`build-slo-images.sh`、`verify-slo-merge-stratum.sh`、`verify-oci-harness.sh`、`verify-release.sh` stage 7 与 test-support 的 SLO ledger validator（attestation/soak ledger 验证保留） | P2-10 |
 
 > 以上 D6–D13 为 2026-09-12 owner 决策（源码逐条核实后拍板），对应条目的方案草案已按决策更新。
 
@@ -461,6 +462,30 @@
   路径双重零违例）；fuzz 发现的缺陷逐条入档并回修。
 - **涉及面**：库内 tracing 打点、examples/chat（admin 端点 + 日志落盘）、
   新增 fuzz 编排、CI lane。**规模：L**
+
+### P2-10 SLO 测量并轨（移除独立 slo harness）
+
+- **状态**：已完成（D14，2026-09-15；随 0.1.0 审计执行）
+- **问题**：`radiata-slo` 是一套独立的 16 节点 OCI 测量装置（controller/node 双二进制、
+  125 样本工作负载、主机预检、qualification、发布台账 + sealed validator），与 workspace
+  内已有的进程内规模泳道、以及 examples 容器级 e2e 三套测量并行存在：同一 SLO 声明由
+  三处机制分别度量，维护面重复且 16 节点 OCI 剖面对主机（12+ CPU / 16 GiB / podman）
+  有硬性要求，长期看是第二套需要自己门禁的 harness。
+- **决策**：按 D14 并轨——进程内泳道承担规模剖面（CI 可跑、无主机要求），容器级由
+  examples + audit 打桩承担（customer-style 部署证据链的一部分）。
+- **实施**：删除 `slo/` 与 `scripts/{build-slo-images,verify-slo-merge-stratum,
+  verify-oci-harness}.sh`、`verify-release.sh` stage 7；test-support 移除 SLO ledger
+  validator（`slo_ledger_validation` 泳道同步移除；attestation/soak 验证保留）。
+  `examples/cluster` 新增 `/metadata`（owner-revision 元数据写）与 `/packets/routed`
+  （MatchingNodes 选择器 + first-match 负载均衡器 + 多跳中继）端点与 `audit` feature；
+  `test_slo.py` 五层×5 轮×5 样本，逐样本 10s deadline，报告 `slo-report.json`；
+  `up.sh SLO=1` 构建 audit 镜像并逐节点落盘日志供路径断言。`examples/chat` 的
+  dm/offline 相位改为数字化时延 + 10s deadline 断言。
+- **验收**：examples 泳道（clippy/fmt/py_compile）绿；SLO=1 容器级 `test_slo.py`
+  125/125 样本 ≤10s + audit 路径断言 PASS；全门禁绿。
+- **涉及面**：`slo/`（删）、scripts ×4（删/改）、`test-support/src/ledger.rs`、
+  `examples/cluster`（http/main/Cargo/Containerfile/up.sh/test_slo.py/README）、
+  `examples/chat/test_chat.py`。**规模：M**
 
 ### P2-8 architecture.md 全量重审刷新
 

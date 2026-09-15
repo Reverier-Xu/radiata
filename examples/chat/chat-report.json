@@ -1,7 +1,11 @@
 {
-  "dm_receipt_seconds": "ok",
+  "dm_receipt_seconds": 0.0,
+  "hub_death_recovery_seconds": 0.8,
   "hub_death_recovery": "isolated-queued-reconnected-through-another-member-flushed",
-  "offline_dm": "queued-delivered-read",
+  "offline_dm": {
+    "path": "queued-delivered-read",
+    "flush_to_read_seconds": 0.0
+  },
   "group_offline_member": "queued-delivered-read",
   "chaos": "kill+disconnect all healed"
 }

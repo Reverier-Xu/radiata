@@ -12,11 +12,11 @@ use axum::{
 use radiata::{
   CleanupNode, ConnectMember, Digest, GetObservability, GetResource, IssueCleanupCheckpoint,
   IssueMergeCredential, LabelKey, LabelValue, LeaveCluster, MemberPage, MergeCluster,
-  MergeCredential, NodeHandle, NodeId, PageCursor, PageMembers, PageResources, PageSessions,
-  PageSpec, PageTrust, ProtocolTag, PutResource, QualifiedTag, RemoveResource,
+  MergeCredential, NodeHandle, NodeId, NodeMetadataPatch, PageCursor, PageMembers, PageResources,
+  PageSessions, PageSpec, PageTrust, ProtocolTag, PutResource, QualifiedTag, RemoveResource,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
   ResourceVersion, ResourceWrite, RevokeNode, RoutingPolicy, SelectResources, Selector,
-  StreamMetadata, StreamPolicy, StreamTarget,
+  StreamMetadata, StreamPolicy, StreamTarget, UpdateNodeMetadata,
 };
 use serde_json::{Value, json};
 
@@ -30,6 +30,13 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// The load-balancer tag the routed-probe lane selects: the node
+/// registers a first-match policy under this tag at build time.
+pub const FIRST_MATCH_BALANCER: &str = "example.org/balancers/first-match";
+
+/// The probe protocol tag both packet lanes ride.
+const PROBE_PROTOCOL: &str = "radiata.woooo.tech/protocols/probe";
 
 fn status_tag(name: &str) -> QualifiedTag {
   QualifiedTag::parse(&format!("radiata.woooo.tech/status/{name}")).unwrap()
@@ -691,6 +698,127 @@ async fn stream_probe(state: State<SharedState>) -> Result<Json<Value>, (StatusC
   Ok(Json(json!({"ack_us": acked.as_micros() as u64})))
 }
 
+/// Owner-revision node metadata write: reads the node's current revision
+/// through the public membership page, applies the label patch, and
+/// retries bounded on the explicit conflict a concurrent descriptor
+/// ensure can produce between observation and command.
+async fn update_metadata(
+  state: State<SharedState>, Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let labels = body
+    .get("labels")
+    .and_then(Value::as_object)
+    .ok_or_else(|| {
+      (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "body must be {\"labels\": {key: value, ...}}"})),
+      )
+    })?;
+  let mut patch = NodeMetadataPatch::new();
+  for (key, value) in labels {
+    let Some(value) = value.as_str() else {
+      return Err((
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "label values must be strings"})),
+      ));
+    };
+    let key = LabelKey::parse(key).map_err(bad_request)?;
+    let value = LabelValue::parse(value).map_err(bad_request)?;
+    patch = patch.set_capability(key, value).map_err(bad_request)?;
+  }
+  let mut revision = self_owner_revision(&state).await?;
+  // The revision is re-observed after every conflict: the owner-revision
+  // register only ever accepts the exact current revision.
+  let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+  loop {
+    match state
+      .node
+      .command(UpdateNodeMetadata::new(revision, patch.clone()))
+      .await
+    {
+      Ok(view) => {
+        return Ok(Json(json!({"revision": view.owner_revision()})));
+      }
+      Err(error) if error.kind() == radiata::ErrorKind::Conflict => {
+        if tokio::time::Instant::now() >= deadline {
+          return Err(internal_error(error));
+        }
+        revision = self_owner_revision(&state).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+      Err(error) => return Err(internal_error(error)),
+    }
+  }
+}
+
+async fn self_owner_revision(state: &SharedState) -> Result<u64, (StatusCode, Json<Value>)> {
+  let page = state
+    .node
+    .query(PageMembers::new(
+      PageSpec::first(PAGE_LIMIT).map_err(internal_error)?,
+    ))
+    .await
+    .map_err(internal_error)?;
+  page
+    .items()
+    .iter()
+    .find(|view| view.node_id() == &state.node_id)
+    .map(|view| view.owner_revision())
+    .ok_or_else(|| {
+      (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "own descriptor not yet visible"})),
+      )
+    })
+}
+
+/// Label-selected packet send: the registered first-match load balancer
+/// picks one member whose owned labels match the selector, and the
+/// packet rides the authenticated data plane (multi-hop relay within
+/// the hop budget when the pair is not directly connected). The SLO
+/// harness times this round-trip as the routed-packet stratum.
+async fn routed_probe(
+  state: State<SharedState>, Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let Some(selector_text) = body.get("selector").and_then(Value::as_str) else {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      Json(json!({"error": "body must be {\"selector\": \"domain/labels/k=v\"}"})),
+    ));
+  };
+  let selector = Selector::parse(selector_text).map_err(bad_request)?;
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8)
+    .map_err(internal_error)?
+    .load_balancer(QualifiedTag::parse(FIRST_MATCH_BALANCER).map_err(bad_request)?);
+  let started = std::time::Instant::now();
+  let stream = state
+    .node
+    .open_stream(
+      StreamTarget::MatchingNodes(selector),
+      ProtocolTag::parse(PROBE_PROTOCOL).map_err(bad_request)?,
+      policy,
+      StreamMetadata::new(),
+    )
+    .map_err(|error| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
+  let body = futures_util::stream::iter([Ok(Arc::from(vec![0xA5_u8; 1024].into_boxed_slice()))]);
+  let ack = stream.send_sync(body).await.map_err(|error| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
+  let acked = started.elapsed();
+  Ok(Json(json!({
+    "ack_us": acked.as_micros() as u64,
+    "destination": ack.destination().as_str(),
+  })))
+}
+
 pub fn internal_error(error: radiata::Error) -> (StatusCode, Json<Value>) {
   (
     StatusCode::INTERNAL_SERVER_ERROR,
@@ -734,5 +862,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/cleanup-checkpoint", post(cleanup_checkpoint))
     .route("/recovery", get(recovery))
     .route("/stream-probe", post(stream_probe))
+    .route("/metadata", post(update_metadata))
+    .route("/packets/routed", post(routed_probe))
     .with_state(state)
 }

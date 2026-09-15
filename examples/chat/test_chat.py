@@ -42,6 +42,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 N = 5
 BASE_PORT = 19080
+# The per-sample decision deadline the library's SLO claims are asserted
+# against (see examples/cluster/test_slo.py for the full strata run).
+SLO_DEADLINE_SECONDS = 10
 
 
 def http(method: str, node: int, path: str, body: dict | None = None, timeout: float = 10.0):
@@ -182,6 +185,7 @@ def phase_announcements() -> None:
 def phase_dm_and_receipts(report: dict) -> None:
     print("=== C3 dm & user-driven receipts ===")
     # u1 -> u2 rides the direct hub edge.
+    dm_started = time.monotonic()
     result = http("POST", 1, "/dm", {"to": "u2", "body": "hello u2"})
     assert result["state"] == "sent", f"an online peer must deliver: {result}"
     msg_id = result["msg_id"]
@@ -197,7 +201,10 @@ def phase_dm_and_receipts(report: dict) -> None:
         "u2 must hold the delivered dm"
     assert view["receipts_sent"] == 1, f"viewing must emit exactly one receipt: {view}"
     wait_outbox_state(1, msg_id, "read")
-    report["dm_receipt_seconds"] = "ok"
+    dm_seconds = time.monotonic() - dm_started
+    assert dm_seconds <= SLO_DEADLINE_SECONDS, \
+        f"dm + receipt round trip took {dm_seconds:.1f}s, over the {SLO_DEADLINE_SECONDS}s SLO"
+    report["dm_receipt_seconds"] = round(dm_seconds, 1)
 
     # A repeated view is receipt-idempotent: nothing unseen remains.
     again = http("GET", 2, "/messages?unread=true")
@@ -231,6 +238,7 @@ def phase_dm_offline(report: dict) -> None:
          "c4 rejoined through the recovery plane without operator action", deadline_s=120)
     flushed = http("POST", 1, "/flush")
     assert flushed["delivered"] >= 1, f"the flush must deliver the queued dm: {flushed}"
+    flush_started = time.monotonic()
     wait_outbox_state(1, msg_id, "sent")
 
     # The recipient views and the receipt crosses the restart boundary.
@@ -238,11 +246,18 @@ def phase_dm_offline(report: dict) -> None:
     assert any(m["msg_id"] == msg_id for m in view["messages"]), "u4 must hold the queued dm"
     assert view["receipts_sent"] == 1
     wait_outbox_state(1, msg_id, "read")
-    report["offline_dm"] = "queued-delivered-read"
+    offline_seconds = time.monotonic() - flush_started
+    assert offline_seconds <= SLO_DEADLINE_SECONDS, \
+        f"flush-to-read took {offline_seconds:.1f}s, over the {SLO_DEADLINE_SECONDS}s SLO"
+    report["offline_dm"] = {
+        "path": "queued-delivered-read",
+        "flush_to_read_seconds": round(offline_seconds, 1),
+    }
     print("[offline] queue -> flush -> deliver -> user-driven receipt all verified")
 
 
 def phase_hub_death_recovery(report: dict) -> None:
+    recovery_started = time.monotonic()
     """The owner-contract scenario: a leaf connected to exactly one
     cluster node loses it. Messages in BOTH directions queue as pending,
     the isolated leaf's recovery plane retries every member in its table,
@@ -299,6 +314,9 @@ def phase_hub_death_recovery(report: dict) -> None:
     assert back["state"] == "sent", "the hub edge is direct again"
     http("GET", 1, "/messages?unread=true")
     wait_outbox_state(2, back["msg_id"], "read")
+    # Recovery is an observation, not a per-sample SLO: the wall clock
+    # here includes two container restarts and the recovery backoff.
+    report["hub_death_recovery_seconds"] = round(time.monotonic() - recovery_started, 1)
     # Recovery pruning (D10): the leaf-leaf edges the outage accumulated
     # are retired once the hub edge anchors each leaf again; every leaf
     # settles back to exactly one session (the hub).
