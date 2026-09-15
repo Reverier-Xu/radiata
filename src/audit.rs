@@ -87,3 +87,14 @@ pub(crate) fn journal_resolved(purpose: &str, committed: bool) {
   #[cfg(not(feature = "audit"))]
   let _ = (purpose, committed);
 }
+
+/// An operator declared the frozen pending journal's interrupted
+/// transaction not durably committed and the store resolved it as
+/// aborted: the declaration, corroborated by an uncommitted or
+/// indeterminate evidence read, anchored the journal delete.
+pub(crate) fn journal_declared_uncommitted(purpose: &str) {
+  #[cfg(feature = "audit")]
+  debug!(target: "audit", purpose, "journal declared uncommitted");
+  #[cfg(not(feature = "audit"))]
+  let _ = purpose;
+}

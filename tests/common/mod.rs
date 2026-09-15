@@ -308,6 +308,12 @@ impl MemoryStorageFactory {
       StoreValue::new(Arc::from(bytes.as_slice())),
     );
   }
+
+  /// Removes one durable receipt, bypassing the commit path, to set up
+  /// the lost-provider-evidence recovery scenarios.
+  pub fn forget_receipt(&self, transaction: &TransactionId) {
+    self.state.lock().unwrap().receipts.remove(transaction);
+  }
 }
 
 impl Drop for MemoryStorageFactory {
@@ -641,6 +647,17 @@ pub enum CommitFault {
   Aborted,
   UnknownApplied,
   UnknownNotApplied,
+  /// Answers unknown after applying, but only to a journaled
+  /// transaction (one carrying its pending-record put); every other
+  /// commit passes through. The permanent-contradiction scenarios need
+  /// the freeze pinned to the journaled commit exactly.
+  JournalUnknownApplied,
+}
+
+/// The pending-transaction journal namespace: a journaled commit is
+/// recognizable by its pending-record put into this namespace.
+fn pending_journal_namespace() -> StoreNamespace {
+  namespace("radiata.woooo.tech/metadata/pending-transaction-v1")
 }
 
 #[derive(Debug)]
@@ -648,6 +665,7 @@ pub struct FaultingFactory {
   memory: Arc<MemoryStorageFactory>,
   script: Arc<Mutex<VecDeque<CommitFault>>>,
   reconcile_unknowns: Arc<Mutex<usize>>,
+  last_unknown_applied: Arc<Mutex<Option<TransactionId>>>,
 }
 
 impl FaultingFactory {
@@ -656,11 +674,19 @@ impl FaultingFactory {
       memory,
       script: Arc::new(Mutex::new(script.into())),
       reconcile_unknowns: Arc::new(Mutex::new(0)),
+      last_unknown_applied: Arc::new(Mutex::new(None)),
     }
   }
 
   pub fn add_reconcile_unknowns(&self, count: usize) {
     *self.reconcile_unknowns.lock().unwrap() += count;
+  }
+
+  /// The transaction of the most recent unknown-after-apply fault
+  /// (`UnknownApplied` or `JournalUnknownApplied`): the
+  /// durable-evidence scenarios remove exactly that receipt.
+  pub fn last_unknown_applied(&self) -> Option<TransactionId> {
+    self.last_unknown_applied.lock().unwrap().clone()
   }
 
   /// Replaces the commit-fault script; the runtime lane uses this to pin
@@ -681,6 +707,7 @@ impl StorageFactory for FaultingFactory {
         memory,
         script: Arc::clone(&self.script),
         reconcile_unknowns: Arc::clone(&self.reconcile_unknowns),
+        last_unknown_applied: Arc::clone(&self.last_unknown_applied),
       }) as Box<dyn Storage>)
     })
   }
@@ -691,6 +718,7 @@ struct FaultingStorage {
   memory: Box<dyn Storage>,
   script: Arc<Mutex<VecDeque<CommitFault>>>,
   reconcile_unknowns: Arc<Mutex<usize>>,
+  last_unknown_applied: Arc<Mutex<Option<TransactionId>>>,
 }
 
 impl Storage for FaultingStorage {
@@ -703,7 +731,7 @@ impl Storage for FaultingStorage {
   }
 
   fn commit<'a>(&'a self, transaction: StoreTransaction) -> BoxFuture<'a, Result<CommitOutcome>> {
-    let fault = self
+    let mut fault = self
       .script
       .lock()
       .unwrap()
@@ -712,6 +740,13 @@ impl Storage for FaultingStorage {
     Box::pin(async move {
       let id = transaction.id().clone();
       let digest = transaction.operation_digest().clone();
+      if fault == CommitFault::JournalUnknownApplied
+        && !transaction.operations().iter().any(|operation| {
+          matches!(operation, StoreOperation::Put { namespace, .. } if *namespace == pending_journal_namespace())
+        })
+      {
+        fault = CommitFault::Pass;
+      }
       match fault {
         CommitFault::Pass => self.memory.commit(transaction).await,
         CommitFault::Aborted => Ok(CommitOutcome::Aborted),
@@ -719,11 +754,12 @@ impl Storage for FaultingStorage {
           transaction: id,
           operation_digest: digest,
         }),
-        CommitFault::UnknownApplied => {
+        CommitFault::UnknownApplied | CommitFault::JournalUnknownApplied => {
           assert!(matches!(
             self.memory.commit(transaction).await?,
             CommitOutcome::Committed(_)
           ));
+          *self.last_unknown_applied.lock().unwrap() = Some(id.clone());
           Ok(CommitOutcome::Unknown {
             transaction: id,
             operation_digest: digest,

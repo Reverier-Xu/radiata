@@ -67,9 +67,10 @@ pub use operation::{
   GetMember, GetNodeStatus, GetObservability, GetRecovery, GetResource, GetRoute, IdentityReplaced,
   IssueCleanupCheckpoint, IssueMergeCredential, LeaveCluster, Listen, MemberChanged, MergeCluster,
   NodeRevoked, PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
-  PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResourceChanged,
-  ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources,
-  SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
+  PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResolveFrozenJournal,
+  ResourceChanged, ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound,
+  SelectResources, SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata,
+  WaitForShutdown,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
@@ -91,12 +92,12 @@ pub use routing::{
 };
 pub use transport::{Endpoint, PageCursor};
 pub use view::{
-  ConnectivityStatus, LeaveOutcome, ListenerPage, ListenerView, LocalNodeView, MemberPage,
-  MemberStatus, MemberView, MergeView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot,
-  PageSpec, ReceiptRetentionReport, RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata,
-  ResourceMutationView, ResourcePage, ResourceView, RevokeOutcome, SessionFeatureView, SessionPage,
-  SessionView, ShutdownOutcome, ShutdownReason, TopologyEdgeView, TopologyPage, TrustPage,
-  TrustStatus, TrustedIdentityView,
+  ConnectivityStatus, DeclareInterruptedTransactionUncommitted, LeaveOutcome, ListenerPage,
+  ListenerView, LocalNodeView, MemberPage, MemberStatus, MemberView, MergeView, NodeMetadataPatch,
+  NodeStatus, ObservabilitySnapshot, PageSpec, ReceiptRetentionReport, RecoveryView,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView, ResourcePage, ResourceView,
+  RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome, ShutdownReason,
+  TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
 };
 
 pub mod extension {

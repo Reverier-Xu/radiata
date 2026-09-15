@@ -879,6 +879,229 @@ async fn reconcile_on_a_ready_store_fails_immediately() {
   assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+/// The permanent-contradiction freeze: the journaled transaction landed,
+/// but the provider's receipt is gone, so reconciliation classifies as
+/// aborted while the journal proves committed and the store fails
+/// closed. The operator-confirmed uncommitted declaration deletes the
+/// journal in one atomic transaction and unfreezes the store; the
+/// resolution is durable — a reopen on the same storage (the crash
+/// simulation) finds no pending journal and starts ready.
+#[tokio::test]
+async fn identity_records_declared_uncommitted_resolution_is_durable() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let fault_calls = Arc::new(AtomicUsize::new(0));
+  let fault_factory: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+    reference: Arc::clone(&reference),
+    mode: UnknownFaultMode::Applied,
+    commit_calls: Arc::clone(&fault_calls),
+  });
+  let clock: Arc<dyn WallClock> = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(980)));
+  let store = MetadataStore::open_with_clock(&fault_factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+  let prepared = prepare_journaled_owner_put(&store, 470).await;
+  let transaction = prepared.id().clone();
+  let digest = prepared.operation_digest().clone();
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  drop(store);
+
+  // The provider loses the receipt: the durable evidence now
+  // permanently contradicts the pending journal.
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .remove(&transaction);
+
+  let plain_factory: Arc<dyn StorageFactory> = reference.clone();
+  let (store, recovered) = open_pending(&plain_factory, 981).await;
+  let identity = recovered.unwrap();
+  assert_eq!(identity.transaction(), &transaction);
+  assert_eq!(identity.operation_digest(), &digest);
+  assert!(store.is_blocked().unwrap());
+  let unrelated = prepare_plain_put(&store, 471, 7).await;
+  assert_eq!(
+    store.commit(unrelated).await.unwrap_err().kind(),
+    crate::ErrorKind::NotReady
+  );
+
+  // Every reconcile re-derives the same contradiction: journal present,
+  // receipt absent.
+  assert_eq!(
+    store
+      .resolve_pending_journal(JOURNAL_PURPOSE)
+      .await
+      .unwrap_err()
+      .kind(),
+    crate::ErrorKind::StorageCorrupt
+  );
+  assert!(store.is_blocked().unwrap());
+
+  // The acknowledged declaration resolves the frozen journal: the
+  // pending record is deleted in one atomic transaction and the store
+  // unfreezes.
+  store
+    .resolve_frozen_journal_uncommitted(contract_transaction_id(472))
+    .await
+    .unwrap();
+  assert!(!store.is_blocked().unwrap());
+  let unrelated = prepare_plain_put(&store, 473, 8).await;
+  assert!(matches!(
+    store.commit(unrelated).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&pending_namespace().unwrap(), &pending_key(JOURNAL_PURPOSE))
+      .await
+      .unwrap()
+      .is_none()
+  );
+  drop(snapshot);
+
+  // Crash simulation: the resolution survived a restart on the same
+  // storage — no pending journal, no freeze.
+  drop(store);
+  let (store, recovered) = open_pending(&plain_factory, 982).await;
+  assert!(recovered.is_none());
+  assert!(!store.is_blocked().unwrap());
+  let unrelated = prepare_plain_put(&store, 474, 9).await;
+  assert!(matches!(
+    store.commit(unrelated).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+}
+
+/// The declaration refuses every state it does not target: a ready store
+/// and an in-flight commit freeze with no durable journal record behind
+/// it reject typed with `Conflict` and change nothing.
+#[tokio::test]
+async fn identity_records_declared_uncommitted_resolution_refuses_unfrozen_and_non_journal_freezes()
+{
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  {
+    let factory: Arc<dyn StorageFactory> = Arc::clone(&reference) as _;
+    let clock: Arc<dyn WallClock> =
+      Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(990)));
+    let store = MetadataStore::open_with_clock(&factory, Duration::from_secs(10), clock)
+      .await
+      .unwrap();
+    assert_eq!(
+      store
+        .resolve_frozen_journal_uncommitted(contract_transaction_id(475))
+        .await
+        .unwrap_err()
+        .kind(),
+      crate::ErrorKind::Conflict
+    );
+    assert!(!store.is_blocked().unwrap());
+  }
+
+  let fault_calls = Arc::new(AtomicUsize::new(0));
+  let fault_factory: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+    reference: Arc::clone(&reference),
+    mode: UnknownFaultMode::NotApplied,
+    commit_calls: Arc::clone(&fault_calls),
+  });
+  let clock: Arc<dyn WallClock> = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(991)));
+  let store = MetadataStore::open_with_clock(&fault_factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+  let prepared = prepare_plain_put(&store, 476, 10).await;
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  assert!(store.is_blocked().unwrap());
+  assert_eq!(
+    store
+      .resolve_frozen_journal_uncommitted(contract_transaction_id(477))
+      .await
+      .unwrap_err()
+      .kind(),
+    crate::ErrorKind::Conflict
+  );
+  assert!(store.is_blocked().unwrap());
+}
+
+/// The declaration refuses to delete a journal the provider proves
+/// committed: the fresh evidence read rejects typed and the store stays
+/// frozen with its journal intact (a healed provider resolves the
+/// journal through the normal reconciliation).
+#[tokio::test]
+async fn identity_records_declared_uncommitted_resolution_refuses_committed_evidence() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let fault_calls = Arc::new(AtomicUsize::new(0));
+  let fault_factory: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+    reference: Arc::clone(&reference),
+    mode: UnknownFaultMode::Applied,
+    commit_calls: Arc::clone(&fault_calls),
+  });
+  let clock: Arc<dyn WallClock> =
+    Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+  let store = MetadataStore::open_with_clock(&fault_factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+  let prepared = prepare_journaled_owner_put(&store, 479).await;
+  let transaction = prepared.id().clone();
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  drop(store);
+
+  // Lose the receipt, reopen frozen on the contradiction, then heal the
+  // provider: the evidence read inside the resolution now proves the
+  // journaled transaction committed.
+  let healed_receipt = reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .get(&transaction)
+    .unwrap()
+    .clone();
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .remove(&transaction);
+  let plain_factory: Arc<dyn StorageFactory> = reference.clone();
+  let (store, recovered) = open_pending(&plain_factory, 1001).await;
+  assert!(recovered.is_some());
+  assert!(store.is_blocked().unwrap());
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .insert(transaction, healed_receipt);
+
+  assert_eq!(
+    store
+      .resolve_frozen_journal_uncommitted(contract_transaction_id(480))
+      .await
+      .unwrap_err()
+      .kind(),
+    crate::ErrorKind::StorageCorrupt
+  );
+  assert!(store.is_blocked().unwrap());
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&pending_namespace().unwrap(), &pending_key(JOURNAL_PURPOSE))
+      .await
+      .unwrap()
+      .is_some()
+  );
+}
+
 /// Concurrent same-purpose journal flows serialize through the writer
 /// permit: exactly one business commit lands, the others classify as
 /// definitively not-applied, no flow observes a ready-state reconcile

@@ -585,6 +585,13 @@ async fn supervise(
           }
         }
       }
+      Control::ResolveFrozenJournal {
+        acknowledgement,
+        reply,
+      } => {
+        let result = supervisor.resolve_frozen_journal(acknowledgement).await;
+        let _ = reply.send(result);
+      }
       Control::Observability { reply } => {
         let result = supervisor.observability_snapshot(&tasks).await;
         let _ = reply.send(result);
@@ -1875,6 +1882,35 @@ impl Supervisor {
       replacement.clone(),
     ));
     Ok(crate::LeaveOutcome::new(former, replacement))
+  }
+
+  /// Executes one operator-acknowledged frozen-journal resolution
+  /// (`ResolveFrozenJournal`): resolves the store's frozen pending
+  /// journal as uncommitted and unfreezes the store. The store's blocked
+  /// state is this command's precondition, so the `require_unblocked`
+  /// gate that refuses admission-sensitive commands while frozen
+  /// deliberately does not apply here. The command deliberately does not
+  /// queue on the store's writer exclusion: on a frozen store the
+  /// background anti-entropy writers park inside that exclusion on the
+  /// commit-slot refusal and would starve the operator command forever.
+  /// The frozen slot itself is the writer gate — every normal commit
+  /// path refuses while frozen — and operator commands serialize on the
+  /// supervisor's control loop, so the slot's fate keeps a single
+  /// writer.
+  async fn resolve_frozen_journal(
+    &mut self, acknowledgement: crate::DeclareInterruptedTransactionUncommitted,
+  ) -> Result<()> {
+    // The acknowledgement is a proof-of-construction marker: only the
+    // deliberate constructor produces it.
+    if !acknowledgement.is_acknowledged() {
+      return Err(Error::invalid_input("frozen journal acknowledgement"));
+    }
+    let context = self.context()?;
+    let operation = crate::TransactionId::generate(self.dependencies.entropy.as_ref())?;
+    context
+      .store()
+      .resolve_frozen_journal_uncommitted(operation)
+      .await
   }
 
   pub(super) fn context(&self) -> Result<Arc<LocalIdentityContext>> {

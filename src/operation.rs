@@ -676,6 +676,49 @@ impl Command for LeaveCluster {
   type Output = crate::LeaveOutcome;
 }
 
+/// Resolves a metadata store frozen on a pending journal whose durable
+/// provider evidence permanently contradicts the journal: the journaled
+/// record is present, but the provider proves no committed receipt for
+/// the journaled transaction, so every restart-based reconciliation
+/// re-derives the same contradiction and the store refuses all
+/// admission-sensitive operations.
+///
+/// Restart-based reconciliation is the first remedy and stays
+/// authoritative whenever the evidence resolves; this command is the
+/// operator-confirmed last resort for the permanent-contradiction case.
+/// The acknowledgement asserts the interrupted journaled transaction did
+/// not durably commit; the node re-checks the durable evidence (a
+/// provider verdict that the transaction committed or digest-conflicted
+/// refuses the declaration and keeps the store frozen), then deletes the
+/// pending journal record for the frozen purpose in one atomic
+/// transaction and unfreezes the store. The resolution is durable: a
+/// restart after it reopens ready with no pending journal. There is
+/// deliberately no opposite declaration — without provider evidence
+/// there is nothing to anchor a "committed" override on.
+///
+/// On a store that is not frozen on a resolvable pending journal — a
+/// ready store, an in-flight commit, or a freeze matching no durable
+/// journal record — the command fails typed without changing anything.
+pub struct ResolveFrozenJournal {
+  acknowledgement: crate::DeclareInterruptedTransactionUncommitted,
+}
+
+impl ResolveFrozenJournal {
+  pub fn new(acknowledgement: crate::DeclareInterruptedTransactionUncommitted) -> Self {
+    Self { acknowledgement }
+  }
+
+  pub(crate) const fn acknowledgement(&self) -> &crate::DeclareInterruptedTransactionUncommitted {
+    &self.acknowledgement
+  }
+}
+
+impl private::Sealed for ResolveFrozenJournal {}
+
+impl Command for ResolveFrozenJournal {
+  type Output = ();
+}
+
 /// The node's identity was replaced by an active leave.
 /// Emitted once, after the identity swap is durable and before the node
 /// shuts down with [`crate::ShutdownReason::ActiveLeave`].

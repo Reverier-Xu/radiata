@@ -20,24 +20,25 @@ use std::{
 use radiata::adapters::json_store;
 use radiata::{
   ApplyReceiptRetention, BoxFuture, CommitOutcome, CommitReceipt, ConnectMember,
-  ConnectivityStatus, CreatedKey, DeliveryAck, Digest, DisconnectPeer, Endpoint, EventOptions,
-  EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag, GetLocalNode,
-  GetMember, GetNodeStatus, GetObservability, GetResource, GetRoute, IncomingStream,
-  IssuedMergeCredential, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster, LeaveOutcome, Listen,
-  LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView, MergeCluster, MergeCredential,
-  MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked,
-  NodeStatus, ObservabilitySnapshot, OutboundStream, PacketConsumer, PageCursor, PageListeners,
-  PageMembers, PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition,
-  ProtocolTag, PutResource, QualifiedTag, ReceiptRetentionReport, RecoveryChanged, RecoveryConfig,
-  RecoveryView, RemoveResource, ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged,
-  ResourceLabels, ResourceMutationView, ResourceName, ResourcePage, ResourceUri, ResourceVersion,
-  ResourceWrite, Result, RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop,
-  RouteState, RoutingPolicy, SelectResources, Selector, SessionChanged, SessionView, Shutdown,
-  ShutdownOutcome, ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities,
-  StoreEntry, StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision,
-  StoreTransaction, StoreValue, StreamMetadata, StreamPolicy, StreamTarget, TraceId,
-  TraceMetadataLimits, TransactionId, TransportTag, UpdateNodeMetadata, WaitForShutdown,
+  ConnectivityStatus, CreatedKey, DeclareInterruptedTransactionUncommitted, DeliveryAck, Digest,
+  DisconnectPeer, Endpoint, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
+  FeatureDefinition, FeatureTag, GetLocalNode, GetMember, GetNodeStatus, GetObservability,
+  GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState,
+  KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster,
+  LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView,
+  MergeCluster, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId,
+  NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
+  PacketConsumer, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
+  PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
+  ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResolveFrozenJournal, ResourceChanged, ResourceLabels,
+  ResourceMutationView, ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite,
+  Result, RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState,
+  RoutingPolicy, SelectResources, Selector, SessionChanged, SessionView, Shutdown, ShutdownOutcome,
+  ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities, StoreEntry, StoreKey,
+  StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
+  StreamMetadata, StreamPolicy, StreamTarget, TraceId, TraceMetadataLimits, TransactionId,
+  TransportTag, UpdateNodeMetadata, WaitForShutdown,
   extension::{Entropy, KeyProvider, Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -1114,6 +1115,19 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap();
   assert_eq!(retention.forgotten, 0);
   assert!(!retention.remaining);
+
+  // The frozen-journal recovery command on a healthy store: the typed
+  // rejection is the contract (nothing is frozen), and the acknowledged
+  // marker keeps the recovery decision a deliberate caller construction.
+  let frozen_rejection = member
+    .handle
+    .command(ResolveFrozenJournal::new(
+      DeclareInterruptedTransactionUncommitted::new(),
+    ))
+    .await
+    .unwrap_err();
+  assert_eq!(frozen_rejection.kind(), radiata::ErrorKind::Conflict);
+  let _still_serving: LocalNodeView = member.handle.query(GetLocalNode::new()).await.unwrap();
 
   let shutdown: ShutdownOutcome = issuer.handle.command(Shutdown::new()).await.unwrap();
   assert!(matches!(

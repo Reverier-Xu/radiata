@@ -665,6 +665,40 @@ impl MetadataStore {
   }
 }
 
+/// Finds the purpose of the pending journal record whose reconstructed
+/// identity equals the frozen slot's exact identity, from one snapshot.
+///
+/// The scan walks the whole pending namespace (bounded by construction:
+/// one record per in-flight transaction). Any out-of-namespace entry,
+/// malformed record, or duplicate identity match fails closed as storage
+/// corruption; no match means the frozen slot is not a recovered journal.
+pub(crate) async fn discover_frozen_journal_purpose(
+  snapshot: &dyn StoreSnapshot, transaction: &TransactionId, digest: &Digest,
+) -> Result<Option<String>> {
+  let namespace = pending_namespace()?;
+  let mut scan = snapshot.scan(&namespace, &[]).await?;
+  let mut found = None;
+  while let Some(entry) = scan.next().await? {
+    if entry.namespace() != &namespace {
+      return Err(super::storage_corrupt(
+        crate::ProviderErrorContext::StorageSnapshot,
+      ));
+    }
+    let record = PendingTransactionV1::decode(entry.value().as_bytes())
+      .map_err(|_| super::storage_corrupt(crate::ProviderErrorContext::StorageSnapshot))?;
+    let identity = record.recover_identity(entry.value())?;
+    if identity.transaction() == transaction && identity.operation_digest() == digest {
+      if found.is_some() {
+        return Err(super::storage_corrupt(
+          crate::ProviderErrorContext::StorageSnapshot,
+        ));
+      }
+      found = Some(record.purpose);
+    }
+  }
+  Ok(found)
+}
+
 /// Discovers zero or one pending record for `purpose` from a snapshot.
 ///
 /// Any prefix-extended key, duplicate entry, malformed value, or purpose

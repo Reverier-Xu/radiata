@@ -5,10 +5,10 @@ use std::{
 
 #[cfg(test)]
 use self::receipt::HostWallClock;
-use self::receipt::{PreparedTransaction, WallClock};
+use self::receipt::{PreparedTransaction, WallClock, prepare_internal_transaction};
 use crate::{
   CommitOutcome, CommitReceipt, Digest, Error, ErrorKind, ProviderErrorContext, ProviderErrorKind,
-  ReconcileOutcome, Result, StoreRequirements, TransactionId,
+  ReconcileOutcome, Result, StoreOperation, StoreRequirements, TransactionId,
   provider::{Storage, StorageFactory, StoreSnapshot},
 };
 
@@ -604,6 +604,154 @@ impl MetadataStore {
     Ok(())
   }
 
+  /// Resolves a store frozen on a pending journal whose durable provider
+  /// evidence permanently contradicts the journal (the record is present,
+  /// but the provider proves no committed receipt for the journaled
+  /// transaction), by declaring the interrupted transaction not durably
+  /// committed. This is the operator-confirmed last resort for the
+  /// permanent-contradiction freeze; restart-based reconciliation remains
+  /// the first remedy and stays authoritative whenever the evidence
+  /// resolves.
+  ///
+  /// The resolution deletes the pending journal record for the frozen
+  /// purpose in one atomic, never-journaled transaction and only then
+  /// unfreezes the store, so a crash at any point leaves the store either
+  /// still frozen with its journal or cleanly unfrozen without one —
+  /// never half-cleared. A restart after the delete reopens ready with no
+  /// pending journal.
+  ///
+  /// Writer gate: the frozen slot replaces the writer exclusion here.
+  /// While frozen, every normal commit path refuses at the slot, so this
+  /// direct provider commit is the only durable writer; operator
+  /// commands serialize on the supervisor's control loop, and the slot's
+  /// fate is mutated only under the state mutex through the same finish
+  /// path the normal resolver uses. The delete is re-anchored to the
+  /// still-frozen slot immediately before it commits.
+  ///
+  /// Typed rejections that change nothing: a ready store, an in-flight
+  /// commit freeze, and a frozen slot matching no durable journal record
+  /// reject with `Conflict`; a fresh evidence read proving the transaction
+  /// committed or digest-conflicted rejects with `StorageCorrupt` (a
+  /// committed journal resolves through restart instead); an evidence read
+  /// failure propagates and keeps the store frozen.
+  pub(crate) async fn resolve_frozen_journal_uncommitted(
+    &self, operation: TransactionId,
+  ) -> Result<()> {
+    let pending = self.lock_frozen_slot()?;
+    let purpose = {
+      let snapshot = self.snapshot().await?;
+      pending::discover_frozen_journal_purpose(
+        snapshot.as_ref(),
+        &pending.transaction,
+        &pending.digest,
+      )
+      .await?
+    };
+    let Some(purpose) = purpose else {
+      // No durable journal matches the frozen slot: the freeze is an
+      // in-flight commit slot, not a recovered journal, and aborting it
+      // has nothing to anchor on.
+      return Err(Error::conflict("frozen journal resolution"));
+    };
+    // The delete is anchored to a fresh durable verdict: evidence of a
+    // committed or digest-conflicted transaction contradicts the
+    // declaration and keeps the store frozen, while a definitively
+    // uncommitted or indeterminate verdict accepts the declaration. An
+    // evidence failure is not a classification and changes nothing.
+    match self
+      .provider
+      .reconcile(&pending.transaction, &pending.digest)
+      .await
+    {
+      Ok(ReconcileOutcome::Aborted | ReconcileOutcome::Unknown) => {}
+      Ok(ReconcileOutcome::Committed(_) | ReconcileOutcome::DigestConflict) => {
+        return Err(storage_corrupt(ProviderErrorContext::StorageReconcile));
+      }
+      Err(error) => return Err(error),
+    }
+    let (base_revision, expected) = {
+      let snapshot = self.snapshot().await?;
+      let Some((stored, record)) = pending::discover_pending(snapshot.as_ref(), &purpose).await?
+      else {
+        // The journal vanished between reads: there is nothing left to
+        // abort, and the frozen premise no longer holds.
+        return Err(Error::conflict("frozen journal resolution"));
+      };
+      let identity = record.recover_identity(&stored)?;
+      if identity.transaction() != &pending.transaction
+        || identity.operation_digest() != &pending.digest
+      {
+        return Err(storage_corrupt(ProviderErrorContext::StorageSnapshot));
+      }
+      (snapshot.revision().clone(), stored.digest().clone())
+    };
+    // The slot must still be the exact frozen journal: nothing else may
+    // unfreeze between the evidence read and the delete, and a flipped
+    // slot means the premise broke while this resolution was reading.
+    let frozen_now = self.lock_frozen_slot()?;
+    if frozen_now.transaction != pending.transaction || frozen_now.digest != pending.digest {
+      return Err(Error::conflict("frozen journal resolution"));
+    }
+    drop(frozen_now);
+    let delete_id = operation.clone();
+    let prepared = prepare_internal_transaction(
+      operation,
+      base_revision,
+      vec![StoreOperation::Delete {
+        namespace: pending::pending_namespace()?,
+        key: pending::pending_key(&purpose),
+        expected,
+      }],
+    )?;
+    let delete_digest = prepared.operation_digest().clone();
+    // The delete bypasses the commit slot's state machine on purpose:
+    // the machine refuses any commit while frozen, and this delete is
+    // the resolution that ends the freeze. The frozen slot itself gates
+    // the writers: every normal commit path refuses while frozen.
+    match self.provider.commit(prepared.0).await {
+      Ok(CommitOutcome::Committed(receipt)) => {
+        self.validate_receipt(
+          &PendingCommit {
+            transaction: delete_id,
+            digest: delete_digest,
+            journal_proven: false,
+          },
+          &receipt,
+          ProviderErrorContext::StorageCommit,
+        )?;
+      }
+      Ok(CommitOutcome::Unknown {
+        transaction,
+        operation_digest,
+      }) => {
+        if transaction != delete_id || operation_digest != delete_digest {
+          return Err(storage_corrupt(ProviderErrorContext::StorageCommit));
+        }
+        // Classify the unknown by the journal's presence, the same
+        // evidence read the resolver classifies by: gone means the delete
+        // landed; still present means it did not and the contradiction
+        // stands, so a retry re-enters the same resolution.
+        if self.recover_pending(&purpose).await?.is_some() {
+          return Err(Error::conflict("frozen journal resolution"));
+        }
+      }
+      // The conditional delete definitively did not land: the record's
+      // expected digest no longer matches, so the frozen premise broke.
+      Ok(CommitOutcome::Aborted | CommitOutcome::Conflict) => {
+        return Err(Error::conflict("frozen journal resolution"));
+      }
+      Err(error) => return Err(error),
+    }
+    self.finish_journal_recovery()?;
+    crate::audit::journal_declared_uncommitted(&purpose);
+    tracing::info!(
+      purpose = %purpose,
+      transaction = %pending.transaction.as_str(),
+      "frozen journal resolved as uncommitted"
+    );
+    Ok(())
+  }
+
   /// Reconciles a frozen store back to ready, if it is frozen.
   ///
   /// A ready store is unchanged. A frozen store reconciles its exact pending
@@ -651,6 +799,20 @@ impl MetadataStore {
       .state
       .lock()
       .map_err(|_| Error::internal("metadata storage commit state"))
+  }
+
+  /// Clones the frozen slot's pending identity while the slot is a
+  /// settled freeze (no provider call in flight); every other state is
+  /// not a resolvable frozen journal.
+  fn lock_frozen_slot(&self) -> Result<PendingCommit> {
+    let state = self.lock_state()?;
+    match &*state {
+      CommitState::Frozen {
+        pending,
+        provider_call_active: false,
+      } => Ok(pending.clone()),
+      _ => Err(Error::conflict("frozen journal resolution")),
+    }
   }
 }
 #[cfg(any(test, fuzzing))]

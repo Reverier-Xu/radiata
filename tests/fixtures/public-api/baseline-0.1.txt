@@ -197,6 +197,9 @@ impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
 pub fn radiata::CreatedKey::new(radiata::KeyHandle, radiata::PublicKey) -> Self
 pub fn radiata::CreatedKey::public_key(&self) -> &radiata::PublicKey
+pub struct radiata::DeclareInterruptedTransactionUncommitted
+impl radiata::DeclareInterruptedTransactionUncommitted
+pub fn radiata::DeclareInterruptedTransactionUncommitted::new() -> Self
 pub struct radiata::DefaultNextHop
 impl radiata::DefaultNextHop
 pub const radiata::DefaultNextHop::TAG: &'static str
@@ -678,6 +681,11 @@ pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
 pub struct radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 impl radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 pub fn radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new() -> Self
+pub struct radiata::ResolveFrozenJournal
+impl radiata::ResolveFrozenJournal
+pub fn radiata::ResolveFrozenJournal::new(radiata::DeclareInterruptedTransactionUncommitted) -> Self
+impl radiata::Command for radiata::ResolveFrozenJournal
+pub type radiata::ResolveFrozenJournal::Output = ()
 pub struct radiata::ResourceChanged
 impl radiata::ResourceChanged
 pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
@@ -1013,6 +1021,8 @@ impl radiata::Command for radiata::PutResource
 pub type radiata::PutResource::Output = radiata::ResourceMutationView
 impl radiata::Command for radiata::RemoveResource
 pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
+impl radiata::Command for radiata::ResolveFrozenJournal
+pub type radiata::ResolveFrozenJournal::Output = ()
 impl radiata::Command for radiata::RevokeNode
 pub type radiata::RevokeNode::Output = radiata::RevokeOutcome
 impl radiata::Command for radiata::RotateMergeCredential

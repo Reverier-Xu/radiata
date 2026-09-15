@@ -185,6 +185,10 @@ pub(crate) enum Control {
     acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
     reply: oneshot::Sender<Result<crate::LeaveOutcome>>,
   },
+  ResolveFrozenJournal {
+    acknowledgement: crate::DeclareInterruptedTransactionUncommitted,
+    reply: oneshot::Sender<Result<()>>,
+  },
   Observability {
     reply: oneshot::Sender<Result<crate::ObservabilitySnapshot>>,
   },
