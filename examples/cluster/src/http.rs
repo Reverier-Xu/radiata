@@ -15,8 +15,8 @@ use radiata::{
   MergeCredential, NodeHandle, NodeId, PageCursor, PageMembers, PageResources, PageSessions,
   PageSpec, PageTrust, ProtocolTag, PutResource, QualifiedTag, RemoveResource,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
-  ResourceVersion, ResourceWrite, RevokeNode, RoutingPolicy,
-  SelectResources, Selector, StreamMetadata, StreamPolicy, StreamTarget,
+  ResourceVersion, ResourceWrite, RevokeNode, RoutingPolicy, SelectResources, Selector,
+  StreamMetadata, StreamPolicy, StreamTarget,
 };
 use serde_json::{Value, json};
 
