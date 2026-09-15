@@ -227,10 +227,17 @@ impl ResourcePeerRound {
 
   /// Rewinds an undelivered page to its scan start so the next tick
   /// re-collects exactly the same changed records (watermark entries
-  /// were never committed).
+  /// were never committed). A scratch-start failure (`None` rewind
+  /// target) also forces the next pass due: otherwise the pass-start
+  /// tick reset would silence the peer for a full detection cadence —
+  /// the same next-tick retry the membership lane's
+  /// `PeerPageCursor::discard_progress` implements.
   fn rewind(&self, state: &mut ResourcePeerState) {
     state.cursor = self.rewind_cursor.clone();
     state.scan_start = None;
+    if self.rewind_cursor.is_none() {
+      state.ticks_since_pass = DETECTION_CADENCE_TICKS;
+    }
   }
 }
 
@@ -658,6 +665,52 @@ mod tests {
     assert_eq!(
       delivered_names, seeded,
       "every record must reach the peer despite the quiet delivered prefix"
+    );
+  }
+
+  /// A scratch-start page whose delivery fails rewinds to scratch AND
+  /// the next round re-dispatches: the rewind forces the pass due
+  /// instead of silencing the peer for a full detection cadence (the
+  /// membership lane's `discard_progress` contract, mirrored here).
+  #[tokio::test]
+  async fn a_failed_scratch_start_page_rewinds_and_retries_on_the_next_round() {
+    let store = open_store().await;
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
+    let peer = node(2);
+    trust(&store, &node(1), [9; 32]).await;
+    let (runtime, mut cursors, _sessions, _rx) = harness();
+    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap();
+
+    crate::resource::page::sync::apply_page_ctx(
+      &store,
+      entropy.as_ref(),
+      &ResourcePage::new(vec![record("demo.org/resources/scratch-01", 1_000)], None).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Round 1: the scratch-start page dispatches, but the delivery
+    // fails (the admission ack is dropped, like a peer that never
+    // admits).
+    let state = cursors.peers.entry(peer.clone()).or_default();
+    let mut round =
+      resource_sync_tick_peer(store.as_ref(), &entropy, &runtime, &peer, state, &protocol)
+        .await
+        .unwrap();
+    let ack = round.ack.take().expect("the scratch round dispatches a page");
+    drop(ack);
+    round.rewind(state);
+
+    // Round 2: the same page must dispatch again — the rewind forced
+    // the pass due instead of waiting out the detection cadence.
+    let state = cursors.peers.get_mut(&peer).unwrap();
+    let round =
+      resource_sync_tick_peer(store.as_ref(), &entropy, &runtime, &peer, state, &protocol)
+        .await
+        .unwrap();
+    assert!(
+      round.ack.is_some(),
+      "the rewound scratch page must retry on the next tick, not after the cadence"
     );
   }
 
