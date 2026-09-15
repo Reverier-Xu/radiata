@@ -1099,7 +1099,7 @@ impl TraceSink {
   /// compare-and-swap keeps the queue depth structurally at or below
   /// [`MAX_QUEUED_TRACE_PERSISTENCE`] under any admission race.
   pub(crate) fn record_terminal(&self, record: TraceRecord) {
-    let admitted = self.pending.fetch_update(
+    let admitted = self.pending.try_update(
       std::sync::atomic::Ordering::Relaxed,
       std::sync::atomic::Ordering::Relaxed,
       |pending| (pending < MAX_QUEUED_TRACE_PERSISTENCE).then_some(pending + 1),
