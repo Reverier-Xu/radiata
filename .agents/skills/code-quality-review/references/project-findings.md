@@ -1,5 +1,127 @@
 # radiata Verified Findings (G3-era review, 2026-08)
 
+> **Full audit 2026-09-16 (main @ 17a8c20, seven lanes: 5 module partitions +
+> user-path + dependency/ecosystem; docs/ ignored by owner instruction — code
+> and comments are the only source of truth).** Q suite green (573/0, clippy
+> `-D warnings`, both fmt gates). Zero unsafe/unwrap/println continues to hold.
+> Verdict: **PASS-WITH-GAPS** — one P0, seven P1 (all supervisor-verified),
+> product-level user-path gaps per owner's stated intent.
+>
+> ### P0 (verified line-by-line)
+> - **No dial deadline anywhere.** `WssTransport::connect`
+>   (transport/registry.rs:251-270) runs TcpStream::connect + TLS + WS
+>   upgrade with no timeout; `merge_cluster`/`connect_member` await it
+>   INSIDE the supervisor select arm (supervisor.rs:1066-1070, 1112-1128);
+>   `dial_member` (supervisor.rs:1873+) same. A peer that accepts TCP and
+>   goes silent stalls the whole node: no commands, no ticks, no keepalive;
+>   control channel (cap 32) fills and every send_command blocks forever;
+>   GetNodeStatus still says Running (local watch read). Recovery variant:
+>   fan_out hung detached dials pin all `recovery_pending` slots forever →
+>   recovery never dials again. Fix: dial deadline (config knob) applied at
+>   both call sites; the same file's own tests use timeouts (registry.rs
+>   504-556) — the production path is the outlier.
+>
+> ### P1 (all verified against source)
+> 1. trust.rs encode/decode budget asymmetry persists: encode_store uses
+>    TRUST_SNAPSHOT_STORE_LIMITS (1 MiB, :123,155), decode_store uses
+>    CONTROL_CBOR_LIMITS (64 KiB, :229) — a >64 KiB snapshot persists then
+>    fails its own read-back (:954) every refresh.
+> 2. trust.rs TrustSnapshotV1::decode_store ↔ TrustSnapshotPage::decode
+>    (~37-line twin parse pipelines, :228-266 vs :339-384) still unmerged;
+>    the twins are exactly where finding 1 lives.
+> 3. merge_rate.rs rejected attempts keep buckets resident:
+>    entry().or_insert_with + unconditional last_seen refresh (:146-150)
+>    precede per-source rejections — 1024 distinct sources at one attempt
+>    per <600s pin the table, "merge source buckets" Overloaded for every
+>    new source indefinitely (admission DoS).
+> 4. membership/sync.rs:917-949 trust cursor commits on PEER-level OR of
+>    acks while the comment claims payload-level gating; trust page ack
+>    timeout + descriptor page ack ok ⇒ cursor skips undelivered bindings
+>    until session teardown clears per-peer state.
+> 5. membership/neighbor.rs is a fully dead production module (zero
+>    callers; #![cfg_attr(not(test), allow(dead_code))]); the real dial
+>    bound lives in runtime/recovery.rs (fan_out + recovery_pending).
+>    Same pattern in routing/trace.rs:19-21 module-wide allow(dead_code).
+> 6. session/stream.rs (2382 ln) is the god-file; its outbound packet pump
+>    (run_outbound :1389-1563) is routing-domain logic living in L3 while
+>    the inbound half lives in routing/forward.rs — the data plane is
+>    split across two modules.
+> 7. runtime/supervisor.rs god-type: one ~1120-line impl block (799-1920)
+>    carrying ~7 sub-components; split seams already proven by views.rs/
+>    recovery.rs impl-sibling pattern (listeners / anti_entropy / resources
+>    / identity_ops / packets).
+> 8. guide.rs (264 ln integration guide) is a PRIVATE module (lib.rs:15)
+>    — doctests run but rustdoc never renders it; users on docs.rs never
+>    see it. Fix: `pub mod guide` (or #[doc(hidden)] pub).
+>
+> ### User-path findings (owner bar: k8s-style — rare fixed-scenario recovery
+> ops are acceptable; routine ops must be automated)
+> - UNBOUNDED-CONNECT P0 above is the primary "user deadlock": one
+>   MergeCluster against a silent receiver permanently loses the node.
+> - Journal freeze (storage/mod.rs resolve_pending_journal) has NO operator
+>   escape (no declare-aborted API); NotReady everywhere, restart cannot
+>   resolve a permanently contradicted journal. Needs a fixed-scenario,
+>   ack-gated recovery command per owner's k8s bar.
+> - receipt retention: config knob exists (30d default) but NO automatic
+>   driver — trace + resource removal sweeps are tick-driven
+>   (supervisor.rs:606-607), ApplyReceiptRetention is manual-only
+>   (:550-551,1694). Routine op leaked to user; automate like the others.
+> - DefaultNextHop exists but is NOT wired by default: without
+>   with_route_policy + register_next_hop, non-adjacent forwarding fails
+>   closed (config.rs:92-97) — a routing internal is mandatory user
+>   config. Fix: default to DefaultNextHop::TAG.
+> - KeyProvider: NO in-crate implementation; embedders must ship/copy a
+>   228-line FileKeyProvider (examples/*/src/keys.rs) with a 7-method
+>   crash-reconcile contract. Owner decision: should be built-in like
+>   storage adapters (adapters::file_key_store + memory variant),
+>   customization still allowed.
+> - Acceptable rare ops (k8s bar): StartRecovery, RunSyncRound,
+>   DisconnectPeer, PurgeRevocation; IssueCleanupCheckpoint needs a
+>   library-side guard (convergence check) since the doc puts "only
+>   against a fully converged cluster" on the user.
+> - By-design irreversibility (revoke/cleanup/leave tombstones) escape =
+>   identity rotation; surfaces consistently; CleanupNode-on-live-node is
+>   terminal (no PurgeCleanup). Ghost members after silent departure
+>   require operator CleanupNode (recovery dials them at max backoff).
+> - LeaveCluster is not abortable after journaling (error after intent ⇒
+>   leave completes at next startup); must be documented.
+>
+> ### Dependencies (lane G, verified via crates.io/RUSTSEC 2026-09-16)
+> - All pins current; rustls lock = 2-day-old RUSTSEC-2026-0285 fix
+>   (0.23.45); redb behind by one minor (4.2 → 4.3). Posture excellent
+>   (deny.toml bans aws-lc-rs; ~101 unique pkgs for 67k LOC).
+> - Hand-rolled KEEP verdicts with rationale: canonical CBOR, hex, ID gen,
+>   rate limiter, paging, LWW, anti-entropy, simulation (turmoil/madsim
+>   are runtime-invasive, not deterministic-equivalent), chitchat/libp2p
+>   rejected (would discard the auth model).
+> - One REPLACE: drop `domain` 0.12 (single call site tag.rs:212; add ~4
+>   LOC RFC-1035 length caps to valid_dns_hostname). Optional: drop
+>   tokio-stream (one ReceiverStream use).
+>
+> ### Over-architecture verdict: NOT over-architected overall
+> - Facade ≈2050 ln closed vocabulary; heavy code is test infrastructure
+>   (simulation ~4300 cfg(test), contract ~4800, compatibility 890,
+>   fuzz 646). 15 public traits all have real implementors; config knobs
+>   all consumed.
+> - Genuine speculative surface: storage/migration.rs edge machinery
+>   (production_registry() = zero edges, ~200 ln unreachable in prod,
+>   doc admits it); Discovery trait family test-gated; transactional_
+>   migration capability bit nothing advertises; ConnectivityStatus::
+>   Offline zero producers; PageCursor homed in transport/registry.
+> - Two-lane drift matrix (membership vs resource sync): 8 divergences
+>   catalogued — 3 P2 (resource tick aborts on queue rejection leaving
+>   scratch-start peers silent a full detection window; membership
+>   cadence resets pre-verdict; four corrupt-row policies across lanes).
+>   Commit-decision scaffolding triplicated across json/redb/reference;
+>   crash-point constants copied 3×/backend across 5 matrices.
+>
+> ### Lesson for the next review
+> - Ask each lane to DIFF same-mechanism twins systematically — it again
+>   produced the top correctness finding (OR-verdict cursor commit) and
+>   the drift matrix. Owner scope notes (k8s bar for ops commands,
+>   built-in providers) must be captured BEFORE dispatch; they regrade
+>   several "leak" findings into acceptable-or-defect classes.
+
 > **0.1.0 remediation 2026-09-15 (branch fix-audit-p1-p2, 12 commits).**
 > All five P1s fixed with regression tests (leave record re-sign +
 > crash-matrix record phase; tombstone lane unconditional +
