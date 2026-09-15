@@ -212,6 +212,11 @@ struct ResourcePeerRound {
   commit_cursor: Option<Vec<u8>>,
   rewind_cursor: Option<Vec<u8>>,
   marks: Vec<(Vec<u8>, Digest)>,
+  /// Whether a page was assembled and handed to dispatch: a round with
+  /// this flag set but no ack means the routing queue rejected the
+  /// dispatch, and the tick applies the same rewind an undelivered
+  /// verdict gets.
+  dispatched: bool,
 }
 
 impl ResourcePeerRound {
@@ -278,9 +283,22 @@ pub(crate) async fn resource_sync_tick(
     let state = cursors.peers.entry(peer.clone()).or_default();
     let mut round =
       resource_sync_tick_peer(store, entropy, runtime, peer, state, &protocol).await?;
+    if !round.dispatched {
+      // A quiet round: nothing was due and the state already advanced.
+      continue;
+    }
     if let Some(ack) = round.ack.take() {
       pending.push((peer.clone(), round));
       acks.push(ack);
+    } else {
+      // The routing queue rejected the dispatch: the page never left
+      // this node. Treat it like an undelivered verdict — rewind to the
+      // page's scan start so the next tick re-sends exactly that page —
+      // and move on to the remaining peers instead of aborting the
+      // whole tick (the membership lane's per-payload rejection
+      // policy).
+      crate::audit::resource_page_rewound(peer.as_str());
+      round.rewind(state);
     }
   }
   // Delivery verdicts resolve concurrently: one unreachable peer must
@@ -323,6 +341,7 @@ async fn resource_sync_tick_peer(
       commit_cursor: None,
       rewind_cursor: None,
       marks: Vec::new(),
+      dispatched: false,
     });
   }
   let emission = page_sync::emit_page_filtered_ctx(
@@ -357,16 +376,32 @@ async fn resource_sync_tick_peer(
       commit_cursor: None,
       rewind_cursor: None,
       marks: Vec::new(),
+      dispatched: false,
     });
   };
   tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
-  let ack = crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes)?;
+  let ack = match crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes)
+  {
+    Ok(ack) => Some(ack),
+    Err(error) => {
+      // A queue rejection is a per-payload outcome, never a tick
+      // failure: the round reports an undelivered page and the tick's
+      // aggregator applies the rewind.
+      tracing::debug!(
+        peer = %peer.as_str(),
+        kind = ?error.kind(),
+        "resource sync page dispatch rejected"
+      );
+      None
+    }
+  };
   Ok(ResourcePeerRound {
-    ack: Some(ack),
+    ack,
     commit_cursor: emission.walk_cursor.clone(),
     rewind_cursor: emission.scan_start.clone(),
     marks: emission.marks,
+    dispatched: true,
   })
 }
 
@@ -379,7 +414,7 @@ mod tests {
 
   use super::{
     DETECTION_CADENCE_TICKS, ResourceSyncCursors, ResourceSyncPayload, delivered_within_bound,
-    resource_sync_tick_peer,
+    resource_sync_tick, resource_sync_tick_peer,
   };
   use crate::{
     LabelValue, NodeId, ProtocolTag,
@@ -718,6 +753,100 @@ mod tests {
     assert!(
       round.ack.is_some(),
       "the rewound scratch page must retry on the next tick, not after the cadence"
+    );
+  }
+
+  /// A routing-queue rejection must not abort the tick: the rejected
+  /// peer's round rewinds (an in-flight pass rewinds to its page start,
+  /// a scratch-start failure re-forces the pass due) and the remaining
+  /// peers still run their round that tick. The old code propagated the
+  /// rejection with `?`, aborting the whole tick and stranding every
+  /// later peer — a scratch-start peer was silent for a full detection
+  /// cadence. The next tick over a healthy queue re-sends both pages
+  /// from their page starts.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_rejected_dispatch_rewinds_that_peer_and_the_tick_still_runs_the_rest() {
+    let factory: Arc<dyn crate::provider::StorageFactory> =
+      Arc::new(crate::storage::contract::ReferenceFactory::new(
+        crate::storage::contract::required_capabilities(),
+      ));
+    let keys = crate::identity::testing::ScriptedKeys::full();
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
+    let context = Arc::new(
+      crate::identity::lifecycle::open_local_identity(
+        &factory,
+        &keys.as_provider(),
+        &SystemEntropy,
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    let store = context.store();
+    trust(store, &node(1), [9; 32]).await;
+    crate::resource::page::sync::apply_page_ctx(
+      store,
+      entropy.as_ref(),
+      &ResourcePage::new(vec![record("demo.org/resources/reject-01", 1_000)], None).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    for seed in [2_u64, 3] {
+      let (entry, _rx) = stream::test_entry(entropy.as_ref());
+      sessions.lock().unwrap().insert(node(seed), entry);
+    }
+
+    // A closed routing queue rejects every dispatch outright.
+    let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(64);
+    drop(closed_rx);
+    let rejecting = RuntimeClient::routing_only(
+      closed_tx,
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+    );
+
+    let mut cursors = ResourceSyncCursors::default();
+    // The first peer starts mid-pass: its rejected page must rewind to
+    // its page start, not to scratch.
+    cursors.peers.entry(node(2)).or_default().cursor = Some(b"aaa-page-start".to_vec());
+
+    resource_sync_tick(&context, &entropy, &sessions, &rejecting, &mut cursors)
+      .await
+      .unwrap();
+
+    let mid = cursors.peers.get(&node(2)).unwrap();
+    assert_eq!(
+      mid.cursor.as_deref(),
+      Some(b"aaa-page-start".as_slice()),
+      "the in-flight page rewinds to its scan start"
+    );
+    assert_eq!(mid.scan_start, None);
+    let scratch = cursors.peers.get(&node(3)).unwrap();
+    assert_eq!(
+      scratch.cursor, None,
+      "the second peer still ran its round and rewound to scratch"
+    );
+    assert_eq!(
+      scratch.ticks_since_pass, DETECTION_CADENCE_TICKS,
+      "a scratch-start rejection re-forces the pass due instead of silencing the peer"
+    );
+
+    // The next tick over a healthy queue re-sends both peers' pages
+    // from their page starts.
+    let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(64);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let working = RuntimeClient::routing_only(packet_tx, routes);
+    let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    ack_drainer(packet_rx, Arc::clone(&delivered));
+    resource_sync_tick(&context, &entropy, &sessions, &working, &mut cursors)
+      .await
+      .unwrap();
+    assert_eq!(
+      delivered.lock().unwrap().len(),
+      2,
+      "both rewound peers re-dispatch their pages on the next tick"
     );
   }
 
