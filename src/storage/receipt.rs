@@ -1130,3 +1130,25 @@ pub(super) fn decode_wall_time(encoded: &[u8]) -> crate::Result<SystemTime> {
     )),
   }
 }
+
+/// Test-only anchoring seam for runtime-level tests: the automated
+/// retention tick test drives the real sweep against a receipt anchored
+/// through the owning cleanup state machine, never a synthetic row.
+#[cfg(test)]
+pub(crate) mod retention_testing {
+  use super::{MetadataStore, ReceiptCleanupOutcome, ReceiptIdentity};
+  use crate::{CommitReceipt, Result, api::Entropy};
+
+  /// Anchors one committed receipt through the owning cleanup state
+  /// machine. Returns `false` when the receipt did not grow an anchor —
+  /// after a retention pass forgot it, the forgotten marker wins and the
+  /// state machine conflicts instead.
+  pub(crate) async fn anchor_receipt(
+    store: &MetadataStore, entropy: &dyn Entropy, receipt: &CommitReceipt,
+  ) -> Result<bool> {
+    let identity = ReceiptIdentity::from_receipt(receipt);
+    let operation_id = crate::TransactionId::generate(entropy)?;
+    let outcome = store.cleanup_receipt(&identity, operation_id).await?;
+    Ok(matches!(outcome, ReceiptCleanupOutcome::Anchored(_)))
+  }
+}

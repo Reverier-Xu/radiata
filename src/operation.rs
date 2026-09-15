@@ -577,10 +577,13 @@ impl Command for IssueCleanupCheckpoint {
 /// Applies receipt retention across the node's metadata store: every
 /// anchored receipt whose retention deadline has elapsed is forgotten
 /// through the cleanup state machine, and every other receipt is left
-/// exactly as it is. The pass is explicit, idempotent, and latency
-/// bounded; issue it again while [`crate::ReceiptRetentionReport::
-/// remaining`] reports true. Anchoring itself is the owning state
-/// machine's decision and is not performed by this command.
+/// exactly as it is. The pass is idempotent and latency bounded; issue it
+/// again while [`crate::ReceiptRetentionReport::
+/// remaining`] reports true. The recovery tick runs the same pass
+/// automatically on its sweep cadence; this command forces one
+/// idempotent pass on demand (tests, operations, a bounded drain of a
+/// large backlog). Anchoring itself is the owning state machine's
+/// decision and is not performed by this command.
 pub struct ApplyReceiptRetention {
   _private: (),
 }

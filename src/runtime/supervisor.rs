@@ -605,6 +605,7 @@ async fn supervise(
         }
         supervisor.trace_retention_sweep().await;
         supervisor.resource_removal_sweep().await;
+        supervisor.receipt_retention_sweep().await;
       }
     }
   }
@@ -1323,6 +1324,21 @@ impl Supervisor {
     }
   }
 
+  /// One host-wall-clock retention pass over the anchored receipts: every
+  /// receipt past its configured retention deadline is forgotten through
+  /// the cleanup state machine, so the `receipt_retention` knob has an
+  /// automatic driver alongside the explicit command. A failure (store
+  /// outage, frozen reconciliation) never panics the tick: it surfaces as
+  /// a warning and the next bounded pass retries.
+  async fn receipt_retention_sweep(&mut self) {
+    let Ok(context) = self.context() else {
+      return;
+    };
+    if let Err(error) = context.store().apply_receipt_retention().await {
+      tracing::warn!(kind = ?error.kind(), "receipt retention sweep failed");
+    }
+  }
+
   /// Lazily publishes this node's own signed descriptor (revision 1) so
   /// the public views always expose the local identity, with the
   /// published listener endpoints.
@@ -1706,6 +1722,8 @@ impl Supervisor {
   }
 
   /// Forgets every anchored receipt past its retention deadline. The
+  /// recovery tick runs the same pass on every sweep cadence; the explicit
+  /// command remains the way to force an idempotent pass on demand. The
   /// unknown-outcome freeze blocks the pass: a pending unknown may still
   /// reference its receipt, and cleanup conflicts rather than guesses.
   async fn apply_receipt_retention(&mut self) -> Result<crate::view::ReceiptRetentionReport> {
@@ -2100,5 +2118,185 @@ mod resource_stamp_tests {
     let next = issue_write_stamp_since(&clock, 4_000);
     assert_eq!(next, 5_001);
     assert!(clock.load(std::sync::atomic::Ordering::Relaxed) >= next);
+  }
+}
+
+#[cfg(test)]
+mod receipt_retention_sweep_tests {
+  use std::{sync::Arc, time::Duration};
+
+  use tokio::sync::{mpsc, watch};
+
+  use super::{RuntimeDependencies, Supervisor, node_offer};
+  use crate::{
+    NodeConfig, Result, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreValue,
+    TransactionId,
+    extension_registry::ExtensionRegistry,
+    identity::{
+      lifecycle::open_local_identity,
+      testing::{ScriptedKeys, SequenceEntropy},
+    },
+    protocol::feature,
+    provider::{KeyProvider, StorageFactory},
+    storage::receipt::retention_testing::anchor_receipt,
+  };
+
+  /// Builds a running supervisor over a fresh in-memory identity with the
+  /// caller's receipt-retention window. No sessions, no listeners: the
+  /// supervisor's tick-path sweeps run against a real metadata store.
+  async fn sweep_supervisor(
+    retention: Duration,
+  ) -> (
+    Supervisor,
+    Arc<dyn crate::provider::StorageFactory>,
+    Arc<dyn crate::api::Entropy>,
+  ) {
+    let factory: Arc<dyn StorageFactory> =
+      Arc::new(crate::storage::contract::ReferenceFactory::new(
+        crate::storage::contract::required_capabilities(),
+      ));
+    let keys: Arc<dyn KeyProvider> = ScriptedKeys::full().as_provider();
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      open_local_identity(&factory, &keys, entropy.as_ref(), retention)
+        .await
+        .unwrap(),
+    );
+    let config = NodeConfig::new().with_receipt_retention(retention).unwrap();
+    let mut definitions = feature::builtin_definitions().unwrap();
+    definitions.extend(ExtensionRegistry::new().feature_definitions());
+    let registry = feature::FeatureRegistry::build(definitions).unwrap();
+    let offer = node_offer(&registry, config.required_features()).unwrap();
+    let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
+    let (revision_tx, _) = watch::channel(0_u64);
+    let (packet_tx, _packet_rx) = mpsc::channel(super::PACKET_CHANNEL_CAPACITY);
+    let dependencies = RuntimeDependencies {
+      transport: Arc::new(crate::transport::registry::WssTransport::new()),
+      storage_factory: factory.clone(),
+      context: Some(context.clone()),
+      keys,
+      config,
+      entropy: entropy.clone(),
+      extensions: Arc::new(ExtensionRegistry::new()),
+      sessions: Default::default(),
+      routes: Default::default(),
+      events: Arc::new(crate::node::EventHub::new()),
+      member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
+      leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
+      sync_round_requests: round_tx,
+      connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+      runtime_seed: None,
+    };
+    // Supervisor::new builds the shared packet context itself, so the
+    // test drives the exact production construction path.
+    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx, offer) {
+      Ok(supervisor) => supervisor,
+      Err(boxed) => panic!("supervisor construction failed: {}", boxed.0),
+    };
+    (supervisor, factory, entropy)
+  }
+
+  fn test_namespace() -> Result<StoreNamespace> {
+    Ok(StoreNamespace::new(crate::QualifiedTag::parse(
+      "radiata.woooo.tech/metadata/retention-tick-test",
+    )?))
+  }
+
+  /// Commits one ordinary caller transaction and returns its receipt: the
+  /// anchoring seam needs a real committed transaction identity.
+  async fn commit_one(
+    supervisor: &Supervisor, entropy: &dyn crate::api::Entropy, marker: &[u8],
+  ) -> crate::CommitReceipt {
+    let context = supervisor.context().unwrap();
+    let store = context.store();
+    let snapshot = store.snapshot().await.unwrap();
+    let prepared = store
+      .prepare_transaction(
+        TransactionId::generate(entropy).unwrap(),
+        snapshot.revision().clone(),
+        vec![StoreOperation::Put {
+          namespace: test_namespace().unwrap(),
+          key: StoreKey::new(Arc::from(marker.to_vec())),
+          expected: StoreExpectation::Absent,
+          value: StoreValue::new(Arc::from(marker.to_vec())),
+        }],
+      )
+      .unwrap();
+    crate::provider::commit_verdict(store.commit(prepared).await.unwrap(), "retention test")
+      .unwrap()
+  }
+
+  /// The recovery tick's receipt-retention sweep is the automatic driver
+  /// for the `receipt_retention` knob: once a receipt's deadline elapses,
+  /// the sweep alone forgets it, and the explicit command keeps working
+  /// as the idempotent on-demand pass.
+  #[tokio::test]
+  async fn tick_sweep_forgets_elapsed_anchored_receipts() {
+    let retention = Duration::from_millis(100);
+    let (mut supervisor, _factory, entropy) = sweep_supervisor(retention).await;
+
+    // The explicit command keeps working: over an empty anchor set it is
+    // an idempotent no-op.
+    let report = supervisor.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
+
+    // Anchor one committed receipt and let its deadline elapse.
+    let receipt = commit_one(&supervisor, entropy.as_ref(), b"first").await;
+    assert!(
+      anchor_receipt(
+        supervisor.context().unwrap().store(),
+        entropy.as_ref(),
+        &receipt
+      )
+      .await
+      .unwrap()
+    );
+    tokio::time::sleep(retention + Duration::from_millis(250)).await;
+
+    // The manual command forgets the elapsed receipt exactly once.
+    let report = supervisor.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 1);
+    assert!(!report.remaining);
+    // A forgotten receipt never grows a second anchor.
+    assert!(
+      !anchor_receipt(
+        supervisor.context().unwrap().store(),
+        entropy.as_ref(),
+        &receipt
+      )
+      .await
+      .unwrap()
+    );
+
+    // The automated path: a second elapsed anchor is forgotten by the
+    // tick sweep alone, with no command issued.
+    let receipt = commit_one(&supervisor, entropy.as_ref(), b"second").await;
+    assert!(
+      anchor_receipt(
+        supervisor.context().unwrap().store(),
+        entropy.as_ref(),
+        &receipt
+      )
+      .await
+      .unwrap()
+    );
+    tokio::time::sleep(retention + Duration::from_millis(250)).await;
+    supervisor.receipt_retention_sweep().await;
+    assert!(
+      !anchor_receipt(
+        supervisor.context().unwrap().store(),
+        entropy.as_ref(),
+        &receipt
+      )
+      .await
+      .unwrap(),
+      "the tick sweep must forget the elapsed anchor"
+    );
+
+    // The explicit command stays available and idempotent afterwards.
+    let report = supervisor.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
   }
 }
