@@ -150,16 +150,9 @@ pub(crate) mod sync {
   /// True when the page's full wire payload (page envelope plus sync
   /// wrapper) encodes inside the control-body bound.
   fn wire_payload_fits(page: &MembershipPage) -> Result<bool> {
-    // A page envelope that fails to encode is simply "does not fit" —
-    // the ladder's whole reason to halve.
-    let Ok(encoded) = page.encode() else {
-      return Ok(false);
-    };
-    Ok(
-      super::super::sync::SyncPayload::Page(minicbor::bytes::ByteVec::from(encoded))
-        .encode()
-        .is_ok(),
-    )
+    crate::sync_common::page_wire_fits(page.encode(), |bytes| {
+      crate::membership::sync::SyncPayload::Page(minicbor::bytes::ByteVec::from(bytes)).encode()
+    })
   }
 
   /// Emits one page at an exact candidate capacity (one ladder step).
@@ -199,11 +192,17 @@ pub(crate) mod sync {
       {
         continue;
       }
-      if super::store::store_descriptor_ctx(store, entropy, descriptor)
-        .await
-        .is_ok()
-      {
-        applied.push(descriptor.node().clone());
+      match super::store::store_descriptor_ctx(store, entropy, descriptor).await {
+        Ok(()) => applied.push(descriptor.node().clone()),
+        // A store-level refusal (a concurrent newer revision won, or a
+        // storage failure) is a skip, not a page failure: the anti-
+        // entropy cadence re-delivers, and the refusal is observable.
+        Err(error) => tracing::debug!(
+          node = %descriptor.node(),
+          revision = descriptor.revision(),
+          kind = ?error.kind(),
+          "membership page descriptor skipped: store refused",
+        ),
       }
     }
     Ok(applied)

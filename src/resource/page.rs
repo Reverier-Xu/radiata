@@ -127,16 +127,9 @@ pub(crate) mod sync {
   /// True when the page's full wire payload (page envelope plus sync
   /// wrapper) encodes inside the control-body bound.
   fn wire_payload_fits(page: &ResourcePage) -> Result<bool> {
-    // A page envelope that fails to encode is simply "does not fit" —
-    // the ladder's whole reason to halve.
-    let Ok(encoded) = page.encode() else {
-      return Ok(false);
-    };
-    Ok(
-      super::super::sync::ResourceSyncPayload(minicbor::bytes::ByteVec::from(encoded))
-        .encode()
-        .is_ok(),
-    )
+    crate::sync_common::page_wire_fits(page.encode(), |bytes| {
+      super::super::sync::ResourceSyncPayload(minicbor::bytes::ByteVec::from(bytes)).encode()
+    })
   }
 
   /// Emits one filtered detection/emission step at an exact candidate

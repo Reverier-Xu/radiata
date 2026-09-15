@@ -38,13 +38,7 @@ impl Departed {
 
   /// The member status annotation for one node.
   pub(super) fn status(&self, node: &NodeId) -> crate::MemberStatus {
-    if self.cleaned.contains(node) {
-      crate::MemberStatus::Cleaned
-    } else if self.left.contains(node) {
-      crate::MemberStatus::Left
-    } else {
-      crate::MemberStatus::Active
-    }
+    crate::membership::member_status(self.cleaned.contains(node), self.left.contains(node))
   }
 }
 
@@ -271,9 +265,7 @@ impl Supervisor {
     // still dial a different member after its bootstrap dies.
     let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
     let snapshot = store.snapshot().await?;
-    let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
-      crate::membership::NODE_DESCRIPTOR_NAMESPACE,
-    )?);
+    let namespace = crate::membership::descriptor_namespace()?;
     let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
     let mut known_members: std::collections::BTreeMap<NodeId, Endpoint> =
       std::collections::BTreeMap::new();

@@ -1294,7 +1294,6 @@ impl Supervisor {
     };
     if let Err(error) = crate::resource::retention::sweep_removed_ctx(
       context.store(),
-      self.dependencies.entropy.as_ref(),
       &crate::storage::receipt::HostWallClock,
       crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
       crate::resource::retention::RESOURCE_REGISTER_CAP,
@@ -1630,11 +1629,7 @@ impl Supervisor {
             Ok(CommitRace::Final(Ok((name.clone(), installed, result))))
           }
         };
-        match outcome {
-          // Only a non-race failure or a final success reaches the caller.
-          Err(error) => Err(error),
-          Ok(raced) => Ok(raced),
-        }
+        outcome
       })
     })
     .await?;

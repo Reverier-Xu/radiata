@@ -1,3 +1,4 @@
+pub use crate::storage::receipt::ReceiptRetentionReport;
 use crate::{
   Endpoint, Error, ErrorKind, NodeId, PublicKey, QualifiedTag, Result,
   identity::{ListenerId, SessionId},
@@ -845,19 +846,6 @@ impl TrustPage {
   pub(crate) fn new(items: Vec<TrustedIdentityView>, next: Option<crate::PageCursor>) -> Self {
     Self { items, next }
   }
-}
-
-/// The outcome of one explicit receipt-retention pass: how many anchored
-/// receipts past their deadline were forgotten, and whether anchored
-/// receipts remain beyond the pass bound (call again to continue).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReceiptRetentionReport {
-  /// Anchored receipts whose retention deadline had elapsed and whose
-  /// forget transaction committed.
-  pub forgotten: u64,
-  /// The pass stopped at its internal bound with anchored receipts left;
-  /// issue the command again to continue.
-  pub remaining: bool,
 }
 
 /// The public view of one immediate recovery observation.
