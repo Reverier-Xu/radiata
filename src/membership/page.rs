@@ -167,10 +167,23 @@ pub(crate) mod sync {
       &[],
       cursor,
       limit,
-      |_key, bytes| {
+      |key, bytes| match super::decode_descriptor(bytes) {
         // The sender only pages its own stored records; entries are trusted
         // through the session that delivers them.
-        super::decode_descriptor(bytes).map(Some)
+        Ok(descriptor) => Ok(Some(descriptor)),
+        // A stored row that no longer decodes must not fail the whole
+        // page: that would permanently kill descriptor anti-entropy
+        // egress for every member. Skip the row with evidence — the
+        // recovery plane's scan policy — and keep advertising the rest.
+        Err(error) => {
+          tracing::debug!(
+            namespace = %namespace.as_str(),
+            key = %String::from_utf8_lossy(key),
+            kind = ?error.kind(),
+            "membership page skipped an undecodable descriptor row",
+          );
+          Ok(None)
+        }
       },
     )
     .await?;
@@ -401,6 +414,64 @@ mod tests {
     let page = sync::emit_page(&factory, page.cursor(), 2).await.unwrap();
     assert_eq!(page.descriptors().len(), 1);
     assert!(page.cursor().is_none());
+  }
+
+  /// A stored descriptor row that no longer decodes is skipped with a
+  /// logged evidence trail instead of failing the page: one corrupt row
+  /// must not kill descriptor anti-entropy egress for every member (nor
+  /// strand the rows behind it in the paging order).
+  #[tokio::test]
+  async fn a_corrupt_descriptor_row_is_skipped_and_the_page_still_emits() {
+    use crate::{
+      StoreKey,
+      identity::testing::inject_entry,
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn StorageFactory> = reference.clone();
+    crate::membership::store::store_descriptor(&factory, &descriptor(1, 1, "one"))
+      .await
+      .unwrap();
+    crate::membership::store::store_descriptor(&factory, &descriptor(2, 1, "two"))
+      .await
+      .unwrap();
+    // The corrupt row sorts last: a single page delivers both good rows
+    // and ends the stream.
+    let namespace =
+      crate::storage::families::namespace(crate::membership::NODE_DESCRIPTOR_NAMESPACE).unwrap();
+    inject_entry(
+      &reference,
+      (
+        namespace,
+        StoreKey::new(Arc::from(b"node-corrupt-row".to_vec())),
+      ),
+      vec![0xFF, 0x00, 0x01],
+    );
+
+    let page = sync::emit_page(&factory, None, super::DEFAULT_PAGE_LIMIT)
+      .await
+      .unwrap();
+    assert_eq!(page.descriptors().len(), 2);
+    assert!(page.cursor().is_none());
+
+    // Paging at capacity one walks past the corrupt row: both good rows
+    // still deliver across pages and the walk terminates cleanly.
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut delivered: Vec<NodeId> = Vec::new();
+    loop {
+      let page = sync::emit_page(&factory, cursor.as_deref(), 1)
+        .await
+        .unwrap();
+      delivered.extend(page.descriptors().iter().map(|entry| entry.node().clone()));
+      match page.cursor() {
+        Some(next) => cursor = Some(next.to_vec()),
+        None => break,
+      }
+    }
+    delivered.sort();
+    delivered.dedup();
+    assert_eq!(delivered.len(), 2, "every decodable row was advertised");
   }
 
   /// A page of fat descriptors (label sets at their maximum) splits
