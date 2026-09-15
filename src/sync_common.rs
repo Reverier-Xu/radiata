@@ -264,10 +264,11 @@ mod tests {
   }
 }
 
-/// The per-peer page anti-entropy continuation state shared by the
-/// membership and resource sync lanes: the continuation cursor, the
-/// steady-state page fingerprint, and the resend cadences. The cadence
-/// constants live here so the two lanes cannot drift — a one-lane
+/// The membership lane's per-peer page anti-entropy continuation state:
+/// the continuation cursor, the steady-state page fingerprint, and the
+/// resend cadence. The resource lane runs its own watermark-walk state
+/// machine by design (per-key watermarks replace the fingerprint), but
+/// both lanes share this struct's cadence constants — a one-lane
 /// cadence change would silently fork the anti-entropy behavior.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PeerPageCursor {
@@ -304,8 +305,10 @@ pub(crate) enum PageRound {
 }
 
 impl PeerPageCursor {
-  /// Page deliveries are retried on this slower cadence for lost-delivery
-  /// healing even when nothing changed.
+  /// The sync lanes' shared resend cadence (ticks): the membership lane
+  /// re-sends a quiet page on it, and the resource lane's detection
+  /// passes run on it — one constant, so the twin state machines cannot
+  /// drift.
   pub(crate) const PAGE_RESEND_TICKS: u32 = 32;
 
   /// Page rounds between full from-scratch catch-up passes per peer:

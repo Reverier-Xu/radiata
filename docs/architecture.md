@@ -39,7 +39,7 @@ radiata 是一个确定性中继节点运行时库：为群组应用提供认证
 │                  offer,selection,feature,credential}            │
 ├─────────────────────────────────────────────────────────────────┤
 │ L0 值与工具       identity/{id,value,signature} hex time label   │
-│                  paging sync_common audit                       │
+│                  paging audit                                   │
 └─────────────────────────────────────────────────────────────────┘
 横切（test-only / feature-gated）:
   simulation/ compatibility.rs fuzz_adapters.rs
@@ -67,7 +67,6 @@ radiata 是一个确定性中继节点运行时库：为群组应用提供认证
 | `time.rs` | 挂钟时间获取（供注入）。 |
 | `label.rs` | 有界规范标签（`LabelKey`/`LabelValue`/`LabelSet`），选择器求值依据。 |
 | `paging.rs` | keyset-cursor 分页单一实现（membership/resource/公共视图共用；依赖存储 SPI 的 `scan_from` 定位扫描，复杂度 O(page)）。容量处仅在可证明还有下一条时才给续游标。 |
-| `sync_common.rs` | 同步公共机制单源：alive-peer 枚举、`delivered_within_bound`（`SEND_ACK_WAIT` 2s 有界回执等待，投递真相 D2 的裁决点）、页轮判定 `PageRound`（区间指纹 quiet / 32 tick 重发节奏 `PAGE_RESEND_TICKS`）。 |
 | `audit.rs` | `audit` feature 门控的语义路径事件（`member descriptor installed`、`resource pass settled`、`journal resolved` 等）：一行一决策、字段与消息文本稳定。fuzz harness（P2-9）以解析这些事件断言执行路径；feature 关闭时函数体为空，生产构建零开销。 |
 
 ### L1 协议域（控制面语义）
@@ -180,6 +179,7 @@ radiata 是一个确定性中继节点运行时库：为群组应用提供认证
 | `compatibility.rs` | 冻结的 `0.1.0` 兼容性 golden 向量清单（7 格式族 21 向量），`cfg(test)`。 |
 | `fuzz_adapters.rs` | 规范解码器/选择器 fuzz 目标的有界适配器，`cfg(any(test, fuzzing))`。 |
 | `audit` feature | 语义路径事件（见 L0 `audit.rs`）。 |
+| `sync_common.rs` | 同步平面横切辅助：alive-peer 枚举、`delivered_within_bound`（`SEND_ACK_WAIT` 2s 有界回执等待，投递真相 D2 的裁决点）、页轮判定 `PageRound`（区间指纹 quiet / 32 tick 重发节奏 `PAGE_RESEND_TICKS`，membership/resource 两车道共享）、同步 outbound 请求单源构造与 leave 泵分发。它协作 L3 会话表、L4 包与 L7 运行时客户端，依赖方向违背纯 L0 的自上而下——这是有意的横切定位，不是分层错误。 |
 | `examples/chat/test_fuzz.py` | P2-9 场景 fuzz harness：模型驱动状态化 fuzz（9+ 原子操作、期望状态 map、状态+执行路径双重断言、种子可复现），容器级运行、非 CI 门禁。 |
 | `test-support` crate | 集成测试公共设施。 |
 

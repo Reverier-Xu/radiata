@@ -193,8 +193,12 @@ const WATERMARK_TABLE_CAP: usize = 8_192;
 const WATERMARK_REFRESH_PASSES: u32 = 64;
 
 /// Quiet ticks between detection passes: a mid-catalog write is
-/// detected within one cadence window and delivered as one page.
-pub(crate) const DETECTION_CADENCE_TICKS: u32 = 32;
+/// detected within one cadence window and delivered as one page. The
+/// value is the sync plane's shared resend cadence (single-sourced in
+/// [`crate::sync_common`]), so the membership and resource lanes
+/// cannot drift.
+pub(crate) const DETECTION_CADENCE_TICKS: u32 =
+  crate::sync_common::PeerPageCursor::PAGE_RESEND_TICKS;
 
 /// Store entries scanned per tick while a pass is in flight: bounds the
 /// per-tick decode cost and the walk amortizes across ticks.
