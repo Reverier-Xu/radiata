@@ -98,12 +98,16 @@ pub(crate) fn run_crash_child(
 pub(crate) mod crash_reopen {
   use std::{sync::Arc, time::Duration};
 
-  use crate::{ErrorKind, provider::StorageFactory, storage::MetadataStore};
+  use crate::{ErrorKind, provider::StorageFactory};
 
-  /// Opens the store retrying the cross-process lock window.
+  /// Opens the store retrying the cross-process lock window. Its
+  /// callers (the resource and revocation crash matrices) are unix-only.
+  #[cfg(all(test, unix))]
   pub(crate) async fn open_store_with_lock_retry(
     factory: &Arc<dyn StorageFactory>,
-  ) -> MetadataStore {
+  ) -> crate::storage::MetadataStore {
+    use crate::storage::MetadataStore;
+
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
       match MetadataStore::open(factory, Duration::from_secs(10)).await {
