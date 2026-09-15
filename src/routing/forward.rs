@@ -114,8 +114,30 @@ pub(crate) async fn open(
   // handling and surfaces the empty set as a typed route rejection
   // downstream instead of propagating an error.
   let peers = crate::sync_common::alive_peers(sessions).unwrap_or_default();
+  // Loop-free candidates: a next hop already in the visited chain (or
+  // the source/current holder) can only cycle back — the checked
+  // receive would reject the pick after the policy chose it, so a
+  // deterministic minimum-id policy would fail closed on every attempt
+  // (observed live on a ring topology). Excluding the chain here makes
+  // strictly forward progress structural: the candidate set shrinks
+  // with every hop.
+  let candidates = loop_free_candidates(
+    envelope.source(),
+    envelope.current(),
+    envelope.visited(),
+    &peers,
+  );
   let mut chosen = if open.destination != *local {
-    Some(select_next_hop(registry, route_policy, &open.destination, local, &peers).await)
+    Some(
+      select_next_hop(
+        registry,
+        route_policy,
+        &open.destination,
+        local,
+        &candidates,
+      )
+      .await,
+    )
   } else {
     None
   };
@@ -380,6 +402,23 @@ fn remove_pending(acks: &PendingAcks, trace_id: &TraceId) {
   }
 }
 
+/// The loop-free next-hop candidates for one forwarded open: the alive
+/// peers minus the visited chain, the source, and the current holder —
+/// any other choice is rejected by the envelope's own loop check after
+/// the policy picks it, so deterministic policies (minimum id) would
+/// fail closed on every attempt instead of progressing. Excluding the
+/// chain here makes strictly forward progress structural: the candidate
+/// set shrinks with every hop.
+fn loop_free_candidates(
+  source: &NodeId, current: &NodeId, visited: &[NodeId], peers: &[NodeId],
+) -> Vec<NodeId> {
+  peers
+    .iter()
+    .filter(|peer| *peer != current && *peer != source && !visited.contains(peer))
+    .cloned()
+    .collect()
+}
+
 fn reject_open(upstream: &BoundedSender, trace_id: &TraceId) {
   send_status(upstream, trace_id, AckStatus::Unsupported);
 }
@@ -407,6 +446,29 @@ fn send_status(upstream: &BoundedSender, trace_id: &TraceId, status: AckStatus) 
 
 #[cfg(test)]
 mod tests {
+  use super::loop_free_candidates;
+
+  /// The loop-free candidate set excludes the visited chain, the source,
+  /// and the current holder: a minimum-id policy then walks the ring in
+  /// strictly forward progress instead of cycling between two mutual
+  /// minima until the hop budget dies.
+  #[test]
+  fn loop_free_candidates_exclude_the_whole_chain() {
+    let peers: Vec<crate::NodeId> = (1_u8..=9).map(node).collect();
+    // Mid-route state on the n2-originated ring walk: current holder n1,
+    // chain n2->n3->n4->n5 behind it.
+    let candidates = loop_free_candidates(
+      &node(2),
+      &node(1),
+      &[node(2), node(3), node(4), node(5)],
+      &peers,
+    );
+    assert_eq!(
+      candidates,
+      vec![node(6), node(7), node(8), node(9)],
+      "only unvisited forward candidates remain"
+    );
+  }
 
   use minicbor::bytes::ByteVec;
 
