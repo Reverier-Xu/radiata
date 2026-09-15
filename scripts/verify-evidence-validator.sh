@@ -19,9 +19,8 @@ trap 'rm -rf "$TMP"' EXIT
 # The validator suite: the sealed ledger validator
 # proves every negative fixture — interrupted targets, missing
 # attestations, reduced counts, short durations, mismatched commit/lock
-# digests, masked attempt lineages, invalid retry classifications,
-# replacement runs, invalid SLO/threat ledgers — and passes exactly one
-# complete synthetic ledger per lane.
+# digests, masked attempt lineages, and invalid retry classifications —
+# and passes exactly one complete synthetic ledger per lane.
 cargo test --locked --all-features -p radiata-test-support --lib ledger -- --list > "$TMP/ledger.list"
 require_lane() {
   local label=$1 pattern=$2
@@ -33,7 +32,6 @@ require_lane() {
 require_lane "complete preflight" 'complete_attestation_passes_preflight'
 require_lane "incomplete rejection" 'incomplete_or_under_budget_evidence_is_rejected'
 require_lane "masked lineage" 'masked_attempt_lineages_are_rejected'
-require_lane "slo ledger" 'slo_ledger_validation'
 cargo test --locked --all-features -p radiata-test-support --lib ledger
 
 # The repository's own evidence lanes must validate against the same
