@@ -697,7 +697,10 @@ mod tests {
       resource_sync_tick_peer(store.as_ref(), &entropy, &runtime, &peer, state, &protocol)
         .await
         .unwrap();
-    let ack = round.ack.take().expect("the scratch round dispatches a page");
+    let ack = round
+      .ack
+      .take()
+      .expect("the scratch round dispatches a page");
     drop(ack);
     round.rewind(state);
 

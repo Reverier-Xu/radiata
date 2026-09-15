@@ -83,6 +83,16 @@ impl EstablishedSession {
   pub(crate) fn selected_features(&self) -> &[crate::FeatureTag] {
     &self.selected_features
   }
+
+  /// A minimal session summary for read-loop liveness tests: the peer
+  /// identity is the only field those tests observe.
+  #[cfg(test)]
+  pub(crate) fn test_session(peer: NodeId) -> Self {
+    Self {
+      peer,
+      selected_features: Vec::new(),
+    }
+  }
 }
 
 /// Extracts the established-session summary from a completed handshake.

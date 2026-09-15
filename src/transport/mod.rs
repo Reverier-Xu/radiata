@@ -25,6 +25,7 @@
 
 pub(crate) mod cert;
 pub(crate) mod connection;
+pub(crate) use connection::Received;
 mod endpoint;
 pub(crate) mod registry;
 pub(crate) mod tls;

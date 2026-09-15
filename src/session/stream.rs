@@ -907,26 +907,53 @@ async fn run_writer(
   }
 }
 
+/// The read loop's frame source: one receive wake plus the shared pong
+/// stamp. Abstracted so liveness tests can feed synthetic wakes without
+/// a TLS connection.
+pub(crate) trait FrameSource {
+  fn receive_event(
+    &mut self,
+  ) -> futures_util::future::BoxFuture<'_, crate::Result<Option<crate::transport::Received>>>;
+  fn pong_last_seen(&self) -> u64;
+}
+
+impl FrameSource for ConnectionReader {
+  fn receive_event(
+    &mut self,
+  ) -> futures_util::future::BoxFuture<'_, crate::Result<Option<crate::transport::Received>>> {
+    Box::pin(ConnectionReader::receive_event(self))
+  }
+
+  fn pong_last_seen(&self) -> u64 {
+    ConnectionReader::pong_last_seen(self)
+  }
+}
+
 /// Serves incoming packet frames until the connection closes or a frame
 /// violates the wire contract (fail closed).
 async fn read_loop(
-  reader: &mut ConnectionReader, session: &EstablishedSession, context: &SessionPacketContext,
+  source: &mut impl FrameSource, session: &EstablishedSession, context: &SessionPacketContext,
   frames: &BoundedSender, pending_acks: &PendingAcks,
   last_activity: &Arc<std::sync::atomic::AtomicU64>,
 ) {
   let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
   let mut consumers = JoinSet::new();
-  let mut last_pong_seen = reader.pong_last_seen();
+  let mut last_pong_seen = source.pong_last_seen();
   loop {
-    // A peer pong is a keepalive response: reflect it into the injected
-    // clock's activity mark so the liveness observer sees one time source.
-    let pong = reader.pong_last_seen();
-    if pong != last_pong_seen {
-      last_pong_seen = pong;
-      last_activity.store(clock_seconds(context.clock.as_ref()), Ordering::Relaxed);
-    }
-    let message = match reader.receive().await {
-      Ok(Some(message)) => message,
+    let message = match source.receive_event().await {
+      Ok(Some(crate::transport::Received::Message(message))) => message,
+      Ok(Some(crate::transport::Received::Pong)) => {
+        // A peer pong is a keepalive response: reflect it into the
+        // injected clock's activity mark so the liveness observer sees
+        // one time source. This wake is what lets a frame-silent but
+        // responsive peer survive the idle deadline.
+        let pong = source.pong_last_seen();
+        if pong != last_pong_seen {
+          last_pong_seen = pong;
+          last_activity.store(clock_seconds(context.clock.as_ref()), Ordering::Relaxed);
+        }
+        continue;
+      }
       Ok(None) => {
         trace!("session read ended orderly");
         break;
@@ -2219,5 +2246,126 @@ mod admission_tests {
       "the oldest rejection is evicted once the table is full"
     );
     assert!(table.contains_key(&trace(4)));
+  }
+}
+
+#[cfg(test)]
+mod read_loop_liveness_tests {
+  use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{
+      Arc, Mutex,
+      atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, UNIX_EPOCH},
+  };
+
+  use futures_util::future::BoxFuture;
+  use tokio::sync::mpsc;
+
+  use super::{FrameSource, SessionPacketContext, read_loop};
+  use crate::{
+    NodeId, identity::testing::SequenceEntropy, node::EventHub,
+    storage::contract::helpers::ManualClock, transport::Received,
+  };
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  /// A frame source that answers every wake with a keepalive pong (the
+  /// wire shape of a responsive but application-silent peer) and then
+  /// ends the session orderly.
+  struct PongSource {
+    remaining: u32,
+    now: u64,
+  }
+
+  impl FrameSource for PongSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      let pong = self.remaining > 0;
+      if pong {
+        self.remaining -= 1;
+        self.now += 1;
+      }
+      Box::pin(async move {
+        if pong {
+          Ok(Some(Received::Pong))
+        } else {
+          Ok(None)
+        }
+      })
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      self.now
+    }
+  }
+
+  fn context(clock: Arc<dyn crate::storage::receipt::WallClock>) -> SessionPacketContext {
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    SessionPacketContext::new(
+      node(1),
+      Arc::new(crate::ExtensionRegistry::new()),
+      super::SessionPolicy::new(
+        8,
+        1 << 20,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+      ),
+      crate::runtime::RuntimeClient::routing_only(
+        mpsc::channel(4).0,
+        Arc::new(Mutex::new(BTreeMap::new())),
+      ),
+      clock,
+      entropy,
+      Arc::new(EventHub::new()),
+      None,
+      Arc::new(Mutex::new(BTreeMap::new())),
+      Arc::new(Mutex::new(BTreeMap::new())),
+      8,
+      16,
+      Arc::new(Mutex::new(Vec::new())),
+      crate::protocol::CONTROL_CBOR_LIMITS,
+    )
+  }
+
+  /// A frame-silent peer that answers keepalive pings must stay alive:
+  /// every pong wake reflects the injected clock into the session's
+  /// activity mark, so the liveness observer (pinned separately) never
+  /// sees the idle deadline lapse. Before the fix the pong was swallowed
+  /// inside the transport receive and the activity mark never advanced.
+  #[tokio::test]
+  async fn pong_wakes_reflect_activity_for_frame_silent_peers() {
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
+    // A stale activity mark: the peer has been silent since second 1.
+    let last_activity = Arc::new(AtomicU64::new(1));
+    let mut source = PongSource {
+      remaining: 3,
+      now: 0,
+    };
+    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let context = context(Arc::clone(&clock) as Arc<dyn crate::storage::receipt::WallClock>);
+    let (frames, _receiver) = super::test_queue(8, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+
+    read_loop(
+      &mut source,
+      &session,
+      &context,
+      &frames,
+      &pending_acks,
+      &last_activity,
+    )
+    .await;
+
+    // The pong wakes advanced the activity mark to the injected clock's
+    // current seconds (the pong stamp changes are what the loop saw).
+    assert_eq!(
+      last_activity.load(Ordering::SeqCst),
+      1_000,
+      "the pong wakes must refresh the session activity mark"
+    );
   }
 }

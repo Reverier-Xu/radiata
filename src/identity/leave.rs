@@ -689,7 +689,10 @@ async fn ensure_journaled_record(
   context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, store: &MetadataStore,
   entropy: &dyn Entropy, intent: &LeaveIntentV1,
 ) -> Result<()> {
-  if self_leave_record(store, &intent.former_node).await?.is_some() {
+  if self_leave_record(store, &intent.former_node)
+    .await?
+    .is_some()
+  {
     return Ok(());
   }
   if context.identity().node() != &intent.former_node {
@@ -1330,8 +1333,9 @@ mod crash {
       // before run_leave ever starts, then arm inside the identity swap
       // (phase C, the first commit of the remaining phases).
       "swap" => {
-        let journaled =
-          super::journal_leave(&context, &keys.as_provider(), entropy.as_ref()).await.unwrap();
+        let journaled = super::journal_leave(&context, &keys.as_provider(), entropy.as_ref())
+          .await
+          .unwrap();
         select_point(&backend, point);
         let _ = run_leave(
           context.store(),
@@ -1347,10 +1351,10 @@ mod crash {
       "record" => {
         let (stored, intent) = begin_intent(&context, entropy.as_ref()).await.unwrap();
         select_point(&backend, point);
-        let record =
-          super::sign_leave_record(&context, &keys.as_provider()).await.unwrap();
-        let _ =
-          super::persist_leave_record_ctx(context.store(), entropy.as_ref(), &record).await;
+        let record = super::sign_leave_record(&context, &keys.as_provider())
+          .await
+          .unwrap();
+        let _ = super::persist_leave_record_ctx(context.store(), entropy.as_ref(), &record).await;
         let _ = stored;
         let _ = intent;
       }

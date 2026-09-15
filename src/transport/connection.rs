@@ -60,6 +60,18 @@ pub(crate) struct Message {
   pub(crate) body: Vec<u8>,
 }
 
+#[cfg(test)]
+impl Received {
+  /// Unwraps the message variant for tests exercising the message-only
+  /// reader contract; a pong there means the wake contract regressed.
+  pub(crate) fn expect_message(self) -> Message {
+    match self {
+      Received::Message(message) => message,
+      Received::Pong => panic!("unexpected keepalive pong wake"),
+    }
+  }
+}
+
 /// One framed TLS WebSocket connection.
 pub(crate) struct Connection {
   stream: WebSocketStream<TlsStream<TcpStream>>,
@@ -172,7 +184,13 @@ impl Connection {
   /// prelude/limit violation fail closed. Ping and pong messages are
   /// answered by tungstenite and skipped.
   pub(crate) async fn receive(&mut self) -> Result<Option<Message>> {
-    next_message(&mut self.stream, self.rules, &self.pong_last_seen).await
+    loop {
+      return match next_message(&mut self.stream, self.rules, &self.pong_last_seen).await? {
+        Some(Received::Message(message)) => Ok(Some(message)),
+        Some(Received::Pong) => continue,
+        None => Ok(None),
+      };
+    }
   }
 
   /// The accepted peer's raw socket address; dialer-side connections
@@ -266,23 +284,34 @@ impl ConnectionReader {
       .load(std::sync::atomic::Ordering::Relaxed)
   }
 
-  /// Receives the next wire message. Returns `Ok(None)` on an orderly
-  /// close; every limit or framing violation fails closed. The semantics
-  /// are exactly [`Connection::receive`] over the split stream half.
-  pub(crate) async fn receive(&mut self) -> Result<Option<Message>> {
+  /// Receives the next wire message or keepalive pong. Returns `Ok(None)`
+  /// on an orderly close; every limit or framing violation fails closed.
+  /// The session read loop consumes this event form: a pong wake must
+  /// reach the loop so it can refresh the session's activity mark.
+  pub(crate) async fn receive_event(&mut self) -> Result<Option<Received>> {
     next_message(&mut self.stream, self.rules, &self.pong_last_seen).await
   }
 }
 
 type WsResult = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
 
-/// The single receive loop shared by [`Connection::receive`] and
-/// [`ConnectionReader::receive`]: binary messages are split and limit-
-/// checked, pongs refresh the shared liveness stamp, and every other
+/// What one receive wake observed: a wire message, or a keepalive pong
+/// the caller must reflect into its own liveness clock. Surfacing pongs
+/// (instead of swallowing them) lets a frame-silent session stay alive
+/// on keepalone responses alone.
+pub(crate) enum Received {
+  Message(Message),
+  Pong,
+}
+
+/// The single receive loop shared by [`Connection::receive`],
+/// [`ConnectionReader::receive`], and [`ConnectionReader::receive_event`]:
+/// binary messages are split and limit-checked, pongs refresh the shared
+/// liveness stamp and surface as [`Received::Pong`], and every other
 /// control shape fails closed or is skipped exactly as documented.
 async fn next_message<S>(
   stream: &mut S, rules: FrameRules, pong_last_seen: &std::sync::atomic::AtomicU64,
-) -> Result<Option<Message>>
+) -> Result<Option<Received>>
 where
   S: futures_util::Stream<Item = WsResult> + Unpin, {
   loop {
@@ -306,24 +335,25 @@ where
           body_len = body.len(),
           "wire message received"
         );
-        return Ok(Some(Message {
+        return Ok(Some(Received::Message(Message {
           schema_id: prelude.schema_id(),
           kind_id: prelude.kind_id(),
           flags: prelude.flags(),
           body: body.to_vec(),
-        }));
+        })));
       }
       WsMessage::Text(_) => return Err(Error::invalid_input("websocket text message")),
       WsMessage::Ping(_) => continue,
       WsMessage::Pong(_) => {
         // The peer answered a keepalive ping; record the liveness time
         // (tungstenite answers pings itself, so this observes the peer's
-        // own pong responses).
+        // own pong responses) and wake the caller so it can reflect the
+        // response into the session's activity mark.
         pong_last_seen.store(
           crate::time::now_seconds(),
           std::sync::atomic::Ordering::Relaxed,
         );
-        continue;
+        return Ok(Some(Received::Pong));
       }
       WsMessage::Close(_) => return Ok(None),
       WsMessage::Frame(_) => return Err(Error::invalid_input("websocket raw frame")),
