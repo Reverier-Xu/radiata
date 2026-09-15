@@ -669,6 +669,7 @@ pub(crate) async fn resume_if_pending(
   let Some((stored, intent)) = discover_leave_intent(store).await? else {
     return Ok(None);
   };
+  ensure_journaled_record(context, keys, store, entropy, &intent).await?;
   run_leave(store, keys, entropy, &stored, &intent).await?;
   let identity =
     crate::identity::lifecycle::discover_local_identity(store.snapshot().await?.as_ref())
@@ -676,6 +677,26 @@ pub(crate) async fn resume_if_pending(
       .ok_or_else(|| Error::internal("leave local identity"))?
       .1;
   Ok(Some(identity))
+}
+
+/// Completes the journaled record after a crash in the intent-to-record
+/// window: the intent committed but the terminal leave record never
+/// persisted, so the resume signs it fresh here — while the former key
+/// is still live, because the identity swap below deletes it. A
+/// replacement-side identity without a record is unreachable through
+/// the journaled flow and fails closed as corrupt.
+async fn ensure_journaled_record(
+  context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, store: &MetadataStore,
+  entropy: &dyn Entropy, intent: &LeaveIntentV1,
+) -> Result<()> {
+  if self_leave_record(store, &intent.former_node).await?.is_some() {
+    return Ok(());
+  }
+  if context.identity().node() != &intent.former_node {
+    return Err(super::lifecycle::discovery_corrupt());
+  }
+  let record = sign_leave_record(context, keys).await?;
+  persist_leave_record_ctx(store, entropy, &record).await
 }
 
 #[cfg(test)]
@@ -1230,11 +1251,12 @@ mod crash {
   }
 
   /// The observable post-resume state: identity, per-family noise
-  /// presence, and intent presence.
+  /// presence, intent presence, and leave-record presence.
   struct Phase {
     identity: NodeId,
     noise: Vec<bool>,
     intent: Option<LeaveIntentV1>,
+    leave_record: Option<NodeId>,
   }
 
   async fn observe(factory: &Arc<dyn StorageFactory>) -> Phase {
@@ -1251,10 +1273,22 @@ mod crash {
       .await
       .unwrap()
       .map(|(_, intent)| intent);
+    // The record belongs to the former node, which the intent no longer
+    // names after the resume: scan the spared leave family instead.
+    let namespace = super::leave_namespace().unwrap();
+    let snapshot = store.snapshot().await.unwrap();
+    let mut scan = snapshot.scan(&namespace, &[]).await.unwrap();
+    let mut leave_record = None;
+    while let Some(entry) = scan.next().await.unwrap() {
+      if let Ok(record) = super::LeaveRecordV1::decode(entry.value().as_bytes()) {
+        leave_record = Some(record.node().clone());
+      }
+    }
     Phase {
       identity: context.identity().node().clone(),
       noise,
       intent,
+      leave_record,
     }
   }
 
@@ -1292,19 +1326,33 @@ mod crash {
         select_point(&backend, point);
         let _ = execute(&context, &keys.as_provider(), entropy.as_ref()).await;
       }
-      // Commit the intent first, then arm inside the identity swap
+      // Mirror the real live flow exactly: the record is journaled
+      // before run_leave ever starts, then arm inside the identity swap
       // (phase C, the first commit of the remaining phases).
       "swap" => {
-        let (stored, intent) = begin_intent(&context, entropy.as_ref()).await.unwrap();
+        let journaled =
+          super::journal_leave(&context, &keys.as_provider(), entropy.as_ref()).await.unwrap();
         select_point(&backend, point);
         let _ = run_leave(
           context.store(),
           &keys.as_provider(),
           entropy.as_ref(),
-          &stored,
-          &intent,
+          &journaled.stored,
+          &journaled.intent,
         )
         .await;
+      }
+      // Commit the intent first, then arm inside the record commit
+      // (the intent-to-record window the resume must repair).
+      "record" => {
+        let (stored, intent) = begin_intent(&context, entropy.as_ref()).await.unwrap();
+        select_point(&backend, point);
+        let record =
+          super::sign_leave_record(&context, &keys.as_provider()).await.unwrap();
+        let _ =
+          super::persist_leave_record_ctx(context.store(), entropy.as_ref(), &record).await;
+        let _ = stored;
+        let _ = intent;
       }
       other => panic!("unknown leave crash phase: {other}"),
     }
@@ -1336,8 +1384,13 @@ mod crash {
       assert!(completed.intent.is_none());
       assert!(completed.noise.iter().all(|present| !present));
       assert_ne!(completed.identity, untouched.identity);
+      assert_eq!(
+        completed.leave_record.as_ref(),
+        Some(&untouched.identity),
+        "the completed control keeps the former node's leave record"
+      );
 
-      for phase in ["intent", "swap"] {
+      for phase in ["intent", "swap", "record"] {
         for point in 1..=last_point {
           let dir = TempDir::new().unwrap();
           let factory = factory(backend, dir.path());
@@ -1358,6 +1411,24 @@ mod crash {
             observed.identity,
             observed.noise,
           );
+          // The swap and record phases commit the intent before the
+          // crash, so the resume always finishes the leave — and a
+          // finished leave always carries the former node's record,
+          // re-signed fresh by the resume when the crash hit the
+          // intent-to-record window.
+          if phase != "intent" {
+            assert!(
+              is_completed,
+              "{backend}/{phase}/{point}: the committed intent must resume to completion"
+            );
+          }
+          if is_completed {
+            assert_eq!(
+              observed.leave_record.as_ref(),
+              Some(&untouched.identity),
+              "{backend}/{phase}/{point}: a completed leave must carry the former node's record"
+            );
+          }
         }
       }
     }
