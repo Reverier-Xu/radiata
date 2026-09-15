@@ -1142,6 +1142,53 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   member.handle.command(Shutdown::new()).await.unwrap();
 }
 
+/// The built-in file-backed key store is externally drivable: the
+/// adapter constructor hands back the open `KeyProvider` trait object,
+/// and a real directory backs create/replay/reconcile/delete plus the
+/// strict Ed25519 verification the runtime performs.
+#[cfg(all(feature = "json", unix))]
+#[tokio::test]
+async fn file_key_store_is_externally_drivable() {
+  let dir = tempfile::tempdir().unwrap();
+  let store: Arc<dyn KeyProvider> = radiata::adapters::file_key_store(dir.path().to_path_buf());
+  let operation = KeyOperationId::parse("keyop-0000000000000000000f1").unwrap();
+  let message = b"built-in key store strict message";
+
+  let created = store.create_ed25519(&operation).await.unwrap();
+  let created = match created {
+    KeyCreateState::Present(created) => created,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  let public_key = store.public_key(created.handle()).await.unwrap();
+  assert_eq!(public_key.as_bytes(), created.public_key().as_bytes());
+
+  let signature = store.sign(created.handle(), message).await.unwrap();
+  let verifying = ed25519_dalek::VerifyingKey::from_bytes(public_key.as_bytes()).unwrap();
+  verifying
+    .verify_strict(
+      message,
+      &ed25519_dalek::Signature::from_bytes(signature.as_bytes()),
+    )
+    .unwrap();
+
+  let replayed = store.create_ed25519(&operation).await.unwrap();
+  let replayed = match replayed {
+    KeyCreateState::Present(replayed) => replayed,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  assert_eq!(
+    replayed.public_key().as_bytes(),
+    created.public_key().as_bytes()
+  );
+
+  let reconciled = store.reconcile_create(&operation).await.unwrap();
+  assert!(matches!(reconciled, KeyCreateState::Present(_)));
+  let deleted = store.delete(&operation, created.handle()).await.unwrap();
+  assert!(matches!(deleted, KeyDeleteState::Present));
+  let error = store.sign(created.handle(), message).await.unwrap_err();
+  assert_eq!(error.kind(), radiata::ErrorKind::StorageCorrupt);
+}
+
 // --------------------------------------------------------------- helpers
 
 fn init_tracing() {

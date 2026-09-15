@@ -1,5 +1,6 @@
 pub mod radiata
 pub mod radiata::adapters
+pub fn radiata::adapters::file_key_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::KeyProvider>
 pub fn radiata::adapters::json_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
 pub fn radiata::adapters::redb_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
 pub mod radiata::extension

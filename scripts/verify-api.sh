@@ -35,6 +35,7 @@ require_lane "storage spi" 'storage_spi_values_are_externally_constructible' "$T
 require_lane "streams" 'stream_surface_is_externally_constructible' "$TMP/pub.list"
 require_lane "registry" 'config_and_registry_are_externally_constructible' "$TMP/pub.list"
 require_lane "facade" 'every_typed_facade_signature_drives_a_real_cluster' "$TMP/pub.list"
+require_lane "file key store" 'file_key_store_is_externally_drivable' "$TMP/pub.list"
 cargo test --locked --all-features --test public_api
 
 # Public-api freeze guard: the simplified public API must

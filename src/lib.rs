@@ -15,6 +15,7 @@ mod extension_registry;
 mod guide;
 mod hex;
 mod identity;
+mod keys;
 mod label;
 mod membership;
 mod node;
@@ -108,14 +109,14 @@ pub mod extension {
 }
 
 pub mod adapters {
-  //! Explicit storage-adapter constructors.
+  //! Explicit storage and key-custody adapter constructors.
   //!
   //! Adapter selection is always an explicit caller choice; no feature
   //! selects a backend implicitly.
 
-  #[cfg(any(feature = "json", feature = "redb"))]
   use std::{path::PathBuf, sync::Arc};
 
+  use crate::extension::KeyProvider;
   #[cfg(any(feature = "json", feature = "redb"))]
   use crate::extension::StorageFactory;
 
@@ -138,5 +139,35 @@ pub mod adapters {
   #[cfg(feature = "redb")]
   pub fn redb_store(path: PathBuf) -> Arc<dyn StorageFactory> {
     Arc::new(crate::storage::redb::RedbStoreFactory::new(path))
+  }
+
+  /// Creates a durable file-backed Ed25519 key store rooted at the
+  /// directory `path` (created lazily on the first mutating operation).
+  ///
+  /// This is the zero-effort custody default: one directory holds one
+  /// key file per operation id (the raw 32-byte seed, mode 0600 from
+  /// the first byte on unix) plus one intent marker per in-flight or
+  /// interrupted operation, and every write is fsynced with a
+  /// directory-entry barrier before the operation reports. The crash
+  /// contract is the trait's: a create is idempotent per
+  /// [`KeyOperationId`](crate::KeyOperationId) — the first secret that
+  /// reaches durable storage wins across retries and concurrent
+  /// creators — and the `reconcile_*` methods classify interrupted
+  /// operations purely from durable evidence, failing closed
+  /// (`Unknown`) on an artifact that cannot prove its key. A key file
+  /// that exists but does not parse is never overwritten; delete it
+  /// (through [`KeyProvider::delete`]) to re-issue.
+  ///
+  /// Platform notes: on unix, directory barriers use std's directory
+  /// open + fsync and key files carry mode 0600 from creation. On other
+  /// platforms the directory barrier degrades to a no-op (the last
+  /// crash window may lose a directory entry whose removal or creation
+  /// was not yet persisted — every such state resolves to the same
+  /// tri-state answers, never to a fabricated key) and key files take
+  /// the volume's default permissions; custody on those platforms
+  /// additionally depends on the operator mounting the directory under
+  /// an access-controlled path.
+  pub fn file_key_store(path: PathBuf) -> Arc<dyn KeyProvider> {
+    Arc::new(crate::keys::file::FileKeyStore::new(path))
   }
 }
