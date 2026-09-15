@@ -50,20 +50,18 @@ const RECOVERY_PRUNE_COOLDOWN_TICKS: u32 = 4;
 
 impl Supervisor {
   /// Resolves one live downstream session for a routed first hop through
-  /// the node's configured next-hop policy. `Ok(None)` means no policy or
-  /// no eligible hop exists and the caller fails the route explicitly.
+  /// the node's effective next-hop policy (the caller selection, or the
+  /// built-in default policy). `Ok(None)` means no eligible hop exists and
+  /// the caller fails the route explicitly.
   pub(super) async fn select_forward_entry(
     &self, destination: &NodeId,
   ) -> Result<Option<SessionEntry>> {
-    let Some(tag) = self.dependencies.config.route_policy() else {
-      debug!(destination = %destination, "no route policy configured; forward unavailable");
-      return Ok(None);
-    };
+    let tag = self.dependencies.config.route_policy()?;
     let local = self.packet.local().clone();
     let peers = crate::sync_common::alive_peers(&self.dependencies.sessions)?;
     let hop = match crate::routing::resolve_next_hop(
       &self.dependencies.extensions,
-      tag,
+      &tag,
       destination,
       &local,
       &peers,

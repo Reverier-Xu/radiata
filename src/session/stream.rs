@@ -122,7 +122,7 @@ pub(crate) struct SessionPacketContext {
   /// The typed event hub: session and route transitions emit through it.
   events: Arc<crate::node::EventHub>,
   forwarding: crate::routing::forward::ForwardingTable,
-  route_policy: Option<QualifiedTag>,
+  route_policy: QualifiedTag,
   sessions: SessionTable,
   routes: RouteTable,
   forwarding_capacity: usize,
@@ -143,7 +143,7 @@ impl SessionPacketContext {
     local: NodeId, registry: Arc<ExtensionRegistry>, policy: SessionPolicy,
     runtime: crate::runtime::RuntimeClient, clock: Arc<dyn crate::storage::receipt::WallClock>,
     entropy: Arc<dyn crate::api::Entropy>, events: Arc<crate::node::EventHub>,
-    route_policy: Option<QualifiedTag>, sessions: SessionTable, routes_clone: RouteTable,
+    route_policy: QualifiedTag, sessions: SessionTable, routes_clone: RouteTable,
     forwarding_capacity: usize, route_capacity: usize,
     task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     parser_limits: crate::protocol::CborLimits,
@@ -167,9 +167,10 @@ impl SessionPacketContext {
     }
   }
 
-  /// The node's configured next-hop routing policy tag, if any.
-  pub(crate) const fn route_policy(&self) -> Option<&QualifiedTag> {
-    self.route_policy.as_ref()
+  /// The node's effective next-hop routing policy tag (the caller
+  /// selection, or the built-in default policy's tag).
+  pub(crate) const fn route_policy(&self) -> &QualifiedTag {
+    &self.route_policy
   }
 
   pub(crate) const fn local(&self) -> &NodeId {
@@ -2332,7 +2333,7 @@ mod read_loop_liveness_tests {
       clock,
       entropy,
       Arc::new(EventHub::new()),
-      None,
+      crate::routing::DefaultNextHop::tag().unwrap(),
       Arc::new(Mutex::new(BTreeMap::new())),
       Arc::new(Mutex::new(BTreeMap::new())),
       8,

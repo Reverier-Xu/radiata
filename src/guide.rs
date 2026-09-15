@@ -101,8 +101,11 @@
 //!
 //! The built-in [`DefaultNextHop`](crate::DefaultNextHop)
 //! relays through the lowest live peer id — deterministic, loop-free,
-//! and a sensible first choice. Implement the trait to replace it (a
-//! hub-and-spoke relay, a latency-aware pick, a shard-affine route):
+//! and the default: the node registers it under its well-known tag and
+//! selects it unless the configuration names another policy, so
+//! multi-hop relay works out of the box. Implement the trait to replace
+//! it (a hub-and-spoke relay, a latency-aware pick, a shard-affine
+//! route):
 //!
 //! ```
 //! use radiata::{BoxFuture, NextHopView, NodeId, Result, RouteNextHop};
@@ -125,8 +128,8 @@
 //! }
 //! ```
 //!
-//! Registration is two steps: install the implementation under a
-//! qualified tag, then select that tag in the node configuration.
+//! Replacing the default is two steps: install the implementation under
+//! a qualified tag, then select that tag in the node configuration.
 //!
 //! ```no_run
 //! # use radiata::{ExtensionRegistry, QualifiedTag, RouteNextHop};
@@ -138,6 +141,7 @@
 //! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop);
 //! registry.register_next_hop(tag.clone(), policy)?;
 //! // NodeConfig::new().with_route_policy(tag) selects it at build time;
+//! // without a selection the built-in DefaultNextHop stays the default.
 //! // NodeBuilder::extensions(registry) installs the registry.
 //! # Ok(())
 //! # }

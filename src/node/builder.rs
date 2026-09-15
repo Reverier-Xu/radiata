@@ -56,6 +56,18 @@ impl NodeBuilder {
         std::sync::Arc::new(crate::transport::registry::WssTransport::new()),
       )?;
     }
+    // The built-in next-hop policy is the default route policy: a node
+    // without a caller-selected tag relays through it, so multi-hop
+    // routes work out of the box. As with the transport, a caller
+    // registration for the same tag is a conflict, so only add it when
+    // absent.
+    let next_hop_tag = crate::routing::DefaultNextHop::tag()?;
+    if extensions.next_hop_policy(&next_hop_tag).is_none() {
+      extensions.register_next_hop(
+        next_hop_tag,
+        std::sync::Arc::new(crate::routing::DefaultNextHop),
+      )?;
+    }
     let extensions = Arc::new(extensions);
     let events = Arc::new(crate::node::EventHub::new());
     let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);

@@ -729,8 +729,11 @@ fn session_packet_context(
   context: &LocalIdentityContext, dependencies: &RuntimeDependencies,
   packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
   policy: crate::session::stream::SessionPolicy,
-) -> SessionPacketContext {
-  SessionPacketContext::new(
+) -> Result<SessionPacketContext> {
+  // The effective route policy: the caller selection, or the built-in
+  // default policy tag (registered by the builder out of the box).
+  let route_policy = dependencies.config.route_policy()?;
+  Ok(SessionPacketContext::new(
     context.identity().node().clone(),
     dependencies.extensions.clone(),
     policy,
@@ -738,14 +741,14 @@ fn session_packet_context(
     std::sync::Arc::new(crate::storage::receipt::HostWallClock),
     dependencies.entropy.clone(),
     dependencies.events.clone(),
-    dependencies.config.route_policy().cloned(),
+    route_policy,
     dependencies.sessions.clone(),
     dependencies.routes.clone(),
     crate::routing::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
     dependencies.config.trace_metadata_limits().active(),
     Arc::clone(&dependencies.connection_tasks),
     dependencies.config.parser_cbor_limits(),
-  )
+  ))
 }
 
 /// The commit-race retry budget for the resource write paths.
@@ -808,12 +811,11 @@ impl Supervisor {
       return Err(Box::new((Error::internal("runtime context"), dependencies)));
     };
     let policy = crate::session::stream::SessionPolicy::from_config(&dependencies.config);
-    let packet = Arc::new(session_packet_context(
-      &context,
-      &dependencies,
-      packet_tx.clone(),
-      policy,
-    ));
+    let packet = match session_packet_context(&context, &dependencies, packet_tx.clone(), policy) {
+      Ok(packet) => packet,
+      Err(error) => return Err(Box::new((error, dependencies))),
+    };
+    let packet = Arc::new(packet);
     let route_capacity = dependencies.config.trace_metadata_limits().active();
     let sync_context = Arc::clone(&context);
     let driver_context = Arc::clone(&context);
@@ -1226,11 +1228,21 @@ impl Supervisor {
     );
     let (entry, force_routed) = match direct {
       Some(entry) => (entry, false),
-      None => match self.select_forward_entry(&destination).await? {
-        Some(entry) => (entry, true),
-        None => {
+      None => match self.select_forward_entry(&destination).await {
+        Ok(Some(entry)) => (entry, true),
+        Ok(None) => {
           fail(request, ErrorKind::RouteUnavailable);
           return Err(Error::route_unavailable("packet session"));
+        }
+        Err(error) => {
+          // A failed first-hop resolution still ends the route
+          // explicitly: bounded terminal trace metadata records the
+          // resolution failure's own kind, while the caller sees the
+          // stable route-unavailable dispatch outcome (a policy's
+          // internal rejection kind is not a caller-facing ack status).
+          self.record_route_failure(&trace_id, error.kind());
+          request.reject(ErrorKind::RouteUnavailable);
+          return Ok(());
         }
       },
     };

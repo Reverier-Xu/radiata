@@ -102,7 +102,7 @@ pub(crate) const FORWARDING_ROUTE_CAPACITY_DEFAULT: usize = 8_192;
 pub(crate) async fn open(
   local: &NodeId, peer: &NodeId, open: OpenFrame, upstream: &BoundedSender,
   sessions: &SessionTable, forwarding: &ForwardingTable, registry: &ExtensionRegistry,
-  route_policy: Option<&crate::QualifiedTag>, forwarding_capacity: usize,
+  route_policy: &crate::QualifiedTag, forwarding_capacity: usize,
 ) -> bool {
   let envelope = crate::routing::RouteContext::from_frame(
     open.trace_id.clone(),
@@ -353,14 +353,16 @@ async fn relay_open(
 }
 
 async fn select_next_hop(
-  registry: &ExtensionRegistry, route_policy: Option<&crate::QualifiedTag>, destination: &NodeId,
+  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, destination: &NodeId,
   local: &NodeId, peers: &[NodeId],
 ) -> Result<NodeId> {
   if peers.contains(destination) {
     return Ok(destination.clone());
   }
-  let tag = route_policy.ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
-  let hop = crate::routing::resolve_next_hop(registry, tag, destination, local, peers)
+  // A tag naming no registered policy fails closed: with the builder's
+  // built-in registration this only happens for a caller tag that was
+  // never registered on this node.
+  let hop = crate::routing::resolve_next_hop(registry, route_policy, destination, local, peers)
     .await?
     .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
   if peers.contains(&hop) {

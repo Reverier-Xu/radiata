@@ -1,16 +1,16 @@
-//! Three-hop routed packet streams over real TLS.
+//! Three-hop routed packet streams over real TLS, in two lanes.
 //!
 //! Four nodes form a linear topology A — B — C — D with sessions only
-//! between adjacent members. Every node registers the same shared next-hop
-//! policy and configures it as its route policy. A synchronous send from A
-//! targeting D crosses all three hops: the body arrives in order at D's
-//! consumer, the acknowledgement names the selected destination, no
-//! intermediate consumer runs, and a mid-stream interruption of the last
-//! leg ends the route with an explicit typed terminal state — nothing
-//! replays or continues.
+//! between adjacent members. The explicit lane registers a shared
+//! next-hop policy and selects it through the configuration; the default
+//! lane installs no policy anywhere and still relays through the
+//! built-in `DefaultNextHop`. A synchronous send from A targeting D
+//! crosses all three hops: the body arrives in order at D's consumer,
+//! the acknowledgement names the selected destination, and no
+//! intermediate consumer runs.
 
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet},
   sync::{Arc, Mutex},
   time::Duration,
 };
@@ -122,7 +122,6 @@ struct Node {
   handle: NodeHandle,
   endpoint: Option<radiata::Endpoint>,
   id: Option<radiata::NodeId>,
-  #[allow(dead_code)]
   collector: Arc<Collector>,
 }
 
@@ -136,7 +135,13 @@ impl Node {
   }
 }
 
-async fn start_node(seed: u64, collector: Arc<Collector>, table: SharedTable) -> Node {
+/// Starts one node. With `policy_table`, the node registers the shared
+/// linear next-hop policy and selects it through the configuration (the
+/// explicit-override lane); without one, the node runs with the default
+/// configuration and no registered policy at all (the default lane).
+async fn start_node(
+  seed: u64, collector: Arc<Collector>, policy_table: Option<SharedTable>,
+) -> Node {
   let keys = Arc::new(ScriptedKeys::full_at(800_000 + seed * 1_000));
   let factory: Arc<dyn radiata::extension::StorageFactory> =
     Arc::new(MemoryStorageFactory::new(required_capabilities()));
@@ -151,15 +156,16 @@ async fn start_node(seed: u64, collector: Arc<Collector>, table: SharedTable) ->
       consumer,
     )
     .unwrap();
-  registry
-    .register_next_hop(
-      QualifiedTag::parse(POLICY_TAG).unwrap(),
-      Arc::new(SharedPolicy {
-        table: Arc::clone(&table),
-      }),
-    )
-    .unwrap();
-  let config = NodeConfig::new().with_route_policy(QualifiedTag::parse(POLICY_TAG).unwrap());
+  let mut config = NodeConfig::new();
+  if let Some(table) = policy_table {
+    registry
+      .register_next_hop(
+        QualifiedTag::parse(POLICY_TAG).unwrap(),
+        Arc::new(SharedPolicy { table }),
+      )
+      .unwrap();
+    config = config.with_route_policy(QualifiedTag::parse(POLICY_TAG).unwrap());
+  }
   let handle = NodeBuilder::new(factory, keys)
     .config(config)
     .extensions(registry)
@@ -227,6 +233,17 @@ async fn wait_for<F: FnMut() -> bool>(mut probe: F, timeout: Duration, what: &'s
   }
 }
 
+fn init_tracing() {
+  use std::sync::Once;
+  static INIT: Once = Once::new();
+  INIT.call_once(|| {
+    tracing_subscriber::fmt()
+      .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=trace"))
+      .with_test_writer()
+      .init()
+  });
+}
+
 async fn wait_until_terminal(handle: &NodeHandle, route: &radiata::RouteHandle) -> RouteState {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
@@ -245,19 +262,19 @@ async fn wait_until_terminal(handle: &NodeHandle, route: &radiata::RouteHandle) 
   }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
-  tracing_subscriber::fmt()
-    .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=trace"))
-    .with_test_writer()
-    .init();
+/// Boots four merged members of one cluster: node 0 is the merge anchor
+/// and holds its identity from its local view, members 1..=3 join with
+/// rotated credentials and learn theirs from the merge view, every member
+/// listens, and every member converges to all four trust bindings.
+async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
   let table: SharedTable = Arc::default();
   let collectors: Vec<Arc<Collector>> = (0..4).map(|_| Arc::new(Collector::default())).collect();
 
   // Start all four nodes before identities exist to fill the policy map.
   let mut nodes = Vec::new();
   for (seed, collector) in collectors.iter().enumerate() {
-    nodes.push(start_node(seed as u64, Arc::clone(collector), Arc::clone(&table)).await);
+    let policy_table = with_policy.then(|| Arc::clone(&table));
+    nodes.push(start_node(seed as u64, Arc::clone(collector), policy_table).await);
   }
 
   // Merge anchor: A's own identity comes from its local view; members
@@ -309,25 +326,6 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
       }
     }
   }
-
-  // Per-node linear chain policy over the concrete identities: for every
-  // origin, the way toward a later member is its right-hand neighbour.
-  {
-    let mut guard = table.lock().unwrap();
-    for origin in 0..4_usize {
-      for destination in (origin + 1)..4_usize {
-        let next = origin + 1;
-        guard.insert(
-          format!(
-            "{}|{}",
-            nodes[origin].id().as_str(),
-            nodes[destination].id.as_ref().unwrap().as_str()
-          ),
-          nodes[next].id().as_str().to_owned(),
-        );
-      }
-    }
-  }
   for node in nodes.iter_mut().skip(1) {
     node.listen().await;
   }
@@ -368,9 +366,15 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
-  // Linear chain sessions B—C and C—D; the A—D leg is intentionally cut
-  // from both endpoints so D is reachable only through the chain (an
-  // intentional disconnect is never re-healed by recovery).
+  (nodes, table)
+}
+
+/// Wires the caller-session chain B—C and C—D and cuts the A—D leg from
+/// both endpoints (an intentional disconnect is never re-healed by
+/// recovery), so D is reachable only through the chain. Waits until the
+/// live undirected topology settles to exactly {A—B, A—C, B—C, C—D} and
+/// stays stable before any packet moves.
+async fn settle_linear_chain(nodes: &[Node]) {
   nodes[1].connect_to(&nodes[2]).await;
   nodes[2].connect_to(&nodes[3]).await;
   nodes[0]
@@ -384,29 +388,22 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     .await
     .unwrap();
 
-  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
-
-  // Quiesce: the live undirected topology must settle to exactly
-  // {A—B, A—C, B—C, C—D} and stay stable before any packet moves, so the
-  // routed path A→B→C→D is deterministic.
-  let expected: std::collections::BTreeSet<(String, String)> =
-    [(0usize, 1usize), (0, 2), (1, 2), (2, 3)]
-      .into_iter()
-      .map(|(i, j)| {
-        let (lo, hi) = if nodes[i].id().as_str() < nodes[j].id().as_str() {
-          (nodes[i].id().as_str(), nodes[j].id().as_str())
-        } else {
-          (nodes[j].id().as_str(), nodes[i].id().as_str())
-        };
-        (lo.to_owned(), hi.to_owned())
-      })
-      .collect();
+  let expected: BTreeSet<(String, String)> = [(0usize, 1usize), (0, 2), (1, 2), (2, 3)]
+    .into_iter()
+    .map(|(i, j)| {
+      let (lo, hi) = if nodes[i].id().as_str() < nodes[j].id().as_str() {
+        (nodes[i].id().as_str(), nodes[j].id().as_str())
+      } else {
+        (nodes[j].id().as_str(), nodes[i].id().as_str())
+      };
+      (lo.to_owned(), hi.to_owned())
+    })
+    .collect();
   let mut stable_samples = 0_u32;
   let settle_deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    let mut live = std::collections::BTreeSet::new();
-    for node in &nodes {
+    let mut live = BTreeSet::new();
+    for node in nodes {
       let page = node
         .handle
         .query(PageTopology::new(radiata::PageSpec::first(64).unwrap()))
@@ -435,6 +432,36 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
   }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
+  init_tracing();
+  let (nodes, table) = boot_linear_four(true).await;
+
+  // Per-node linear chain policy over the concrete identities: for every
+  // origin, the way toward a later member is its right-hand neighbour.
+  {
+    let mut guard = table.lock().unwrap();
+    for origin in 0..4_usize {
+      for destination in (origin + 1)..4_usize {
+        let next = origin + 1;
+        guard.insert(
+          format!(
+            "{}|{}",
+            nodes[origin].id().as_str(),
+            nodes[destination].id.as_ref().unwrap().as_str()
+          ),
+          nodes[next].id().as_str().to_owned(),
+        );
+      }
+    }
+  }
+
+  settle_linear_chain(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
 
   // ---- Successful three-hop delivery ----
   let packet = nodes[0]
@@ -451,7 +478,8 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
 
   wait_for(
     || {
-      collectors[3]
+      nodes[3]
+        .collector
         .packets
         .lock()
         .unwrap()
@@ -465,8 +493,8 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   .await;
 
   // No intermediate consumer ran anywhere along the route.
-  for collector in collectors.iter().take(3) {
-    assert!(collector.packets.lock().unwrap().is_empty());
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
   }
 
   // ---- Explicit interruption of the last leg mid-stream ----
@@ -534,7 +562,8 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   let _terminal = wait_until_terminal(&nodes[0].handle, &route_handle).await;
   // Whatever the local enqueue race produced, the interrupted stream's
   // bytes must never surface at D, and no reopen path continues it.
-  let delivered_to_d = collectors[3]
+  let delivered_to_d = nodes[3]
+    .collector
     .packets
     .lock()
     .unwrap()
@@ -564,6 +593,58 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     ),
     "expected an explicit typed route failure, got {error:?}"
   );
+
+  for node in &nodes {
+    let _ = node.handle.command(Shutdown::new()).await;
+  }
+}
+
+/// The default lane: with the default configuration — no
+/// `with_route_policy`, no registered next-hop policy anywhere — a routed
+/// packet to a non-adjacent destination still relays. The builder
+/// registers the built-in `DefaultNextHop` under its well-known tag and
+/// the node resolves that tag by default, so multi-hop relay works out
+/// of the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn default_policy_relays_routed_packets_without_configuration() {
+  init_tracing();
+  let (nodes, _table) = boot_linear_four(false).await;
+  settle_linear_chain(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol,
+      policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet.send_sync(vec_body(&[b"one", b"two"])).await.unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .first()
+        .map(|(_, body)| body == &b"onetwo".to_vec())
+        .unwrap_or(false)
+    },
+    Duration::from_secs(30),
+    "the ordered body must reach D through the default policy",
+  )
+  .await;
+
+  // No intermediate consumer ran anywhere along the route.
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
 
   for node in &nodes {
     let _ = node.handle.command(Shutdown::new()).await;

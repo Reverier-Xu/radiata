@@ -97,8 +97,9 @@ impl NodeConfig {
   /// Selects the node's next-hop routing policy tag: when a
   /// routed packet's destination is not directly connected, the tag
   /// resolves in the extension registry and the registered policy picks
-  /// the single next hop. Without a tag the node forwards only to a
-  /// directly connected destination and fails closed otherwise.
+  /// the single next hop. Without a tag the node relays through the
+  /// built-in [`crate::routing::DefaultNextHop`] policy, so multi-hop
+  /// routes work out of the box; setting a tag overrides the default.
   pub fn with_route_policy(mut self, tag: crate::QualifiedTag) -> Self {
     self.route_policy = Some(tag);
     self
@@ -179,9 +180,14 @@ impl NodeConfig {
       self.parser_limits.frame_bytes,
     )
   }
-  /// The node's configured next-hop routing policy tag, if any.
-  pub(crate) const fn route_policy(&self) -> Option<&crate::QualifiedTag> {
-    self.route_policy.as_ref()
+  /// The node's effective next-hop routing policy tag: the caller-selected
+  /// tag, or the built-in default policy's tag when unset (the builder
+  /// registers that policy out of the box).
+  pub(crate) fn route_policy(&self) -> Result<crate::QualifiedTag> {
+    match &self.route_policy {
+      Some(tag) => Ok(tag.clone()),
+      None => crate::routing::DefaultNextHop::tag(),
+    }
   }
 
   pub(crate) const fn required_features(&self) -> &BTreeSet<FeatureTag> {
