@@ -35,9 +35,9 @@ require_nonempty_tests resource_retention "$TMP/retention.list"
 cargo test --locked --lib resource::retention
 
 if [[ $(uname -s) == Linux || $(uname -s) == Darwin ]]; then
-  cargo test --locked --lib resource::crash::resource_delete_boundaries -- --list > "$TMP/delete.list"
+  cargo test --locked --all-features --lib resource::crash::resource_delete_boundaries_recover -- --list > "$TMP/delete.list"
   require_nonempty_tests resource_delete_matrix "$TMP/delete.list"
-  cargo test --locked --lib resource::crash::resource_delete_boundaries
+  cargo test --locked --all-features --lib resource::crash::resource_delete_boundaries_recover
 fi
 
 printf 'VERIFY-RESOURCE-REMOVAL-RETENTION PASS\n'

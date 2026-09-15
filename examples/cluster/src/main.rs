@@ -14,6 +14,28 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use radiata::{GetLocalNode, Listen, NodeBuilder, ProtocolDefinition, ProtocolTag};
 use serde_json::json;
 
+/// The first-match load balancer: selects the first matching candidate
+/// the bounded candidate page presents. Core independently validates the
+/// returned ID against the authoritative descriptor store, so a stale
+/// page can never route outside the trusted member set.
+#[derive(Debug)]
+struct FirstMatch;
+
+impl radiata::LoadBalancingPolicy for FirstMatch {
+  fn select<'a>(
+    &'a self, selector: &'a radiata::Selector, candidates: &'a dyn radiata::CandidateNodeReader,
+  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>> {
+    Box::pin(async move {
+      let page = candidates.next_matching_nodes(selector, None, 8).await?;
+      page
+        .items()
+        .first()
+        .map(|view| view.node_id().clone())
+        .ok_or_else(|| radiata::Error::caller("no member matches the selector"))
+    })
+  }
+}
+
 /// The self-probe protocol: one chunk looped back through the local
 /// admission path, counted by this consumer.
 #[derive(Debug)]
@@ -86,6 +108,20 @@ async fn main() {
       Arc::new(probe),
     )
     .expect("register probe protocol");
+  extensions
+    .register_load_balancer(
+      radiata::QualifiedTag::parse(http::FIRST_MATCH_BALANCER).unwrap(),
+      Arc::new(FirstMatch),
+    )
+    .expect("register load balancer");
+  // The built-in next-hop policy relays label-selected sends through a
+  // connected peer when the selected destination is not adjacent.
+  extensions
+    .register_next_hop(
+      radiata::QualifiedTag::parse(radiata::DefaultNextHop::TAG).unwrap(),
+      Arc::new(radiata::DefaultNextHop),
+    )
+    .expect("register route policy");
 
   let node = NodeBuilder::new(storage, Arc::new(keys))
     .config(
@@ -95,7 +131,8 @@ async fn main() {
           Duration::from_secs(5),
           Duration::from_secs(15),
         )
-        .expect("liveness policy"),
+        .expect("liveness policy")
+        .with_route_policy(radiata::QualifiedTag::parse(radiata::DefaultNextHop::TAG).unwrap()),
     )
     .extensions(extensions)
     .start()

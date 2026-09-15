@@ -1,5 +1,104 @@
 # radiata Verified Findings (G3-era review, 2026-08)
 
+> **0.1.0 merge audit 2026-09-15 (main @ 28cbfc7, seven fresh reviewer lanes over
+> L0-L7 + cross-cut; supervisor verified every P1 against source).** Q suite green
+> (642/0 + doctests), CI green on the merge commit. Verdict for the tree:
+> **PASS-WITH-GAPS** — zero P0, five P1s (all spot-checked line-by-line),
+> evidence-chain rot (four stale verify scripts, fixed same day), and the SLO
+> harness removed by owner decision (D14) in favor of examples + in-process lanes.
+>
+> ### P1 — verified against source (fix before release)
+> 1. `identity/leave.rs:299-317,566` — crash between `begin_intent` and
+>    `persist_leave_record_ctx`: `run_leave`'s resume path swaps identity, wipes
+>    metadata, deletes the former key, and completes the intent WITHOUT ever
+>    re-signing/persisting the leave record — contradicting the doc at :296-298
+>    ("the record is signed fresh"). Peers never learn the former identity left.
+>    Fix: in the pre-swap resume arm, sign+persist the record while the former
+>    key is still live (or commit intent+record in one transaction).
+> 2. `membership/sync.rs:713,778-780` — tombstone lane (leave/cleanup/revocation/
+>    checkpoint) is gated on `snapshot.is_some()`, so the P0-4 isolation contract
+>    ("descriptor pages AND tombstones keep flowing when snapshot refresh fails")
+>    is false for the tombstone half; a persistently overflowing issuer snapshot
+>    silently stalls revocation propagation. Fix: build `tombstone_bytes`
+>    unconditionally; drop the `snapshot.is_some()` term from `tombstones_due`.
+> 3. `resource/sync.rs:231-235,307,325` — rewind after a scratch-start page
+>    failure leaves `cursor=None && ticks=0`, so `pass_due` waits the full
+>    DETECTION_CADENCE_TICKS (32); membership's `discard_progress` fixed the same
+>    class to resend next tick (same-mechanism-two-lanes drift again). Fix: force
+>    the pass due in `rewind` when `rewind_cursor` is None.
+> 4. `transport/connection.rs:318-327` + `session/stream.rs:921-927` — pong
+>    liveness bridge cannot fire: `receive()` never returns on a pong, and the
+>    activity reflection runs only at read-loop top. A frame-silent-but-pinging
+>    peer is closed at the idle deadline, defeating the keepalive contract
+>    (defaults disable the policy today, so not an outage). Fix: make pong
+>    wakeups observable to the read loop; add a pongs-only liveness test.
+> 5. `runtime/supervisor.rs:337-364` — provisioning failure inside `Supervisor::new`
+>    (API-reachable via `require_feature` of an unregistered tag) publishes
+>    `Stopped(Explicit)` instead of `LifecycleSnapshot::failed()`; the caller's
+>    `start()` already returned Ok. Fix: build the offer/feature registry before
+>    `ready.send()`, or publish Fatal in the failure arm.
+>
+> ### Evidence-chain rot (found + fixed same day, scripts only; 10 lanes)
+> - verify-crash-matrix.sh + verify-json-native.sh: json lanes lost their
+>   feature flag in the P2-6 default-feature inversion → `--all-features`.
+> - verify-authorization-revocation.sh: catalog guard still grepped the
+>   pre-rename domain `relay.woooo.tech` → silent pipefail exit 1 →
+>   `radiata.woooo.tech`.
+> - Rename-wave filter rot (admission→merge, joins→merges,
+>   session::forward→routing::forward, resource crash-boundary renames):
+>   verify-admission-handshake.sh
+>   (`identity_records_admission`/`session_admission`),
+>   verify-handshake-selection.sh (`session_join_then_member_reconnect`),
+>   verify-hostile-inputs.sh (`admission_rate`,
+>   `secure_join_admission_rate_window`), verify-membership-views.sh
+>   (`secure_join_sixteen_node_membership_joins_and_views`),
+>   verify-packet-forwarding.sh (`session::forward` module moved),
+>   verify-resource-mutation.sh + verify-resource-removal-retention.sh
+>   (`resource_crash/delete_boundaries` renamed AND needing
+>   `--all-features` for the backend-parameterized matrix).
+> - LESSON: feature inversions and renames must re-run every
+>   scripts/verify-*.sh, and the audit must sweep ALL cargo-test filters
+>   (guarded `--list` lanes fail loudly, but unguarded filters with zero
+>   matches exit 0 — silent rot). Substring semantics of `cargo test
+>   <filter>` make a static scan against live test listings cheap.
+> - LESSON: feature/renames must grep scripts/verify-*.sh, not just src/tests.
+>
+> ### Container SLO (D14 replacement, examples/cluster/test_slo.py)
+> - 125-sample five-strata run PASS after two harness corrections: (a) routed
+>   stratum needs the node to register DefaultNextHop + `with_route_policy`
+>   (the example never had a route policy — RouteUnavailable at the sender);
+>   (b) admission stratum must pace inside the documented merge-rate budget
+>   (RATE_PER_SOURCE=16/60s; unpaced re-merges hit `merge rate window:
+>   Overloaded` at exactly the window math — the limiter working as designed).
+> - Healthy: direct/routed/metadata/resource strata all 1-19 ms; audit path
+>   events (descriptor installed / pass settled / dial started) present in
+>   per-node logs.
+>
+> ### Notable P2s (top of backlog)
+> - trust.rs decode/encode budget asymmetry (decode_store uses CONTROL_CBOR_LIMITS
+>   64KiB, encode_store uses 1MiB) + capacity comment off by ~13× (real ceiling:
+>   max_collection_items=1024 bindings).
+> - trust.rs TrustSnapshotV1::decode_store ↔ TrustSnapshotPage::decode ~45-line
+>   parse pipeline twins (already drifted once).
+> - lifecycle.rs local CommitFault/ FaultingFactory twin with OPPOSITE Aborted
+>   semantics vs identity::testing (PureAborted is the shared one).
+> - sync_common PeerPageCursor doc claims membership+resource share it; resource
+>   never does (own DETECTION_CADENCE_TICKS=32 twin constant).
+> - supervisor.rs forwarding_capacity-style miswires resolved; descriptor
+>   namespace re-derived in 3 L7/L4 sites bypassing membership::namespace's
+>   category check.
+> - stream.rs run_outbound (L4 routing work in L3) remains the biggest god-file
+>   block; move to packet/ named as the concrete seam.
+>
+> ### What is healthy (0.1.0 tree)
+> - commit_verdict single-source holds at every plain site; TOCTOU digest pinning
+>   is comprehensive across revocation/merge/deletion/swap/checkpoint; durable
+>   purpose strings single-sourced via JournalPurpose::text; ID naming single-source
+>   holds (validate_id everywhere); canonical_record! macro is the right
+>   anti-duplication device; merge_rate limiter check-before-record with
+>   dedicated regression; MergeCredential secrecy airtight; pruning provenance
+>   contract verified at every dial site; views.rs purity holds.
+
 > **G9 review 2026-09-02 (main @ 8135662, four fresh reviewer lanes):
 > resources/selector, identity custody, runtime facade, cross-cutting +
 > tests.** G9 verdict **PASS-WITH-GAPS** → remediated to **PASS** (same

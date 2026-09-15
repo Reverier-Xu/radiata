@@ -36,9 +36,9 @@ cargo test --locked --lib resource::store
 # pending identity reconciling consistently. The JSON adapter's directory
 # barriers are only sound on unix platforms, matching the module's cfg.
 if [[ $(uname -s) == Linux || $(uname -s) == Darwin ]]; then
-  cargo test --locked --lib 'resource::crash::resource_crash_boundaries' -- --list > "$TMP/crash.list"
+  cargo test --locked --all-features --lib resource::crash::resource_crash_boundaries_recover -- --list > "$TMP/crash.list"
   require_nonempty_tests resource_crash_matrix "$TMP/crash.list"
-  cargo test --locked --lib resource::crash::resource_crash_boundaries
+  cargo test --locked --all-features --lib resource::crash::resource_crash_boundaries_recover
 fi
 
 printf 'VERIFY-RESOURCE-MUTATION PASS\n'

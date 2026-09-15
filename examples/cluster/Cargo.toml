@@ -32,5 +32,10 @@ getrandom = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Forwards the library's audit instrumentation (semantic path events the
+# SLO harness parses from the container logs for path-level evidence).
+[features]
+audit = ["radiata/audit"]
+
 [profile.release]
 strip = true

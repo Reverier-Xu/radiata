@@ -1,13 +1,13 @@
 //! The release-evidence ledger validator.
 //!
 //! One sealed, typed validator for the canonical evidence ledgers: the
-//! test-attestation records produced by every test, fuzz, soak, and SLO
-//! attempt, the soak attempt lines, and the release-candidate SLO ledger.
-//! Validation is strict and fails closed: missing fields, reduced
-//! budgets, interrupted runs, mismatched commit or lock digests, masked
-//! attempt lineages, and post-start sample exclusions are all rejections,
-//! never warnings. The validator accepts only complete current-semantic
-//! evidence; any unknown schema tag or superseded field set fails.
+//! test-attestation records produced by every test, fuzz, and soak
+//! attempt, and the soak attempt lines. Validation is strict and fails
+//! closed: missing fields, reduced budgets, interrupted runs, mismatched
+//! commit or lock digests, and masked attempt lineages are all
+//! rejections, never warnings. The validator accepts only complete
+//! current-semantic evidence; any unknown schema tag or superseded field
+//! set fails.
 
 use std::collections::BTreeMap;
 
@@ -17,8 +17,6 @@ use sha2::{Digest as ShaDigest, Sha256};
 pub const ATTESTATION_SCHEMA: &str = "radiata.woooo.tech/schemas/test-attestation";
 /// The canonical soak attempt schema tag.
 pub const SOAK_ATTEMPT_SCHEMA: &str = "radiata.woooo.tech/schemas/soak-attempt-v1";
-/// The canonical SLO ledger schema tag.
-pub const SLO_LEDGER_SCHEMA: &str = "radiata.woooo.tech/schemas/slo-ledger-v1";
 
 /// The closed retry classification set. A lineage continues only through
 /// an independently classified infrastructure failure; every other value
@@ -112,10 +110,6 @@ pub enum ValidationError {
   CommitMismatch,
   /// The lineage masks retained failed evidence or breaks its chain.
   MaskedLineage(&'static str),
-  /// The SLO ledger misses required samples, values, or records.
-  IncompleteLedger(&'static str),
-  /// A sample was excluded, replaced, or reclassified after start.
-  SampleExcludedAfterStart,
 }
 
 impl core::fmt::Display for ValidationError {
@@ -128,10 +122,6 @@ impl core::fmt::Display for ValidationError {
       Self::Interrupted => write!(formatter, "interrupted run cannot attest"),
       Self::CommitMismatch => write!(formatter, "commit or lock digest mismatch"),
       Self::MaskedLineage(why) => write!(formatter, "masked attempt lineage: {why}"),
-      Self::IncompleteLedger(why) => write!(formatter, "incomplete ledger: {why}"),
-      Self::SampleExcludedAfterStart => {
-        write!(formatter, "sample excluded after start")
-      }
     }
   }
 }
@@ -368,154 +358,6 @@ fn hex(bytes: &[u8]) -> String {
   text
 }
 
-/// One raw SLO sample of the release-candidate ledger.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SloSample {
-  /// The predeclared sample identifier (run 1..=5, sample 1..=25).
-  pub sample_id: String,
-  /// The workload stratum of the sample.
-  pub stratum: SloStratum,
-  /// The raw start wall-clock observation.
-  pub started_at_ms: u128,
-  /// The raw end wall-clock observation.
-  pub ended_at_ms: u128,
-}
-
-/// The five exact workload strata of the SLO profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SloStratum {
-  Admission,
-  DirectPacket,
-  RoutedPacket,
-  NodeMetadata,
-  ResourceMetadata,
-}
-
-impl SloStratum {
-  fn parse(value: &str) -> Option<Self> {
-    match value {
-      "admission" => Some(Self::Admission),
-      "direct-packet" => Some(Self::DirectPacket),
-      "routed-packet" => Some(Self::RoutedPacket),
-      "node-metadata" => Some(Self::NodeMetadata),
-      "resource-metadata" => Some(Self::ResourceMetadata),
-      _ => None,
-    }
-  }
-}
-
-/// The validation outcome of the complete candidate SLO ledger.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SloValidation {
-  /// The number of accepted samples (must be exactly 125 to release).
-  pub samples: usize,
-  /// The maximum observed sample latency in milliseconds.
-  pub maximum_latency_ms: u128,
-}
-
-/// Validates the complete candidate SLO ledger.
-///
-/// Rules: exactly 125 samples across five runs
-/// and five strata (five samples per stratum per run); every sample
-/// carries its predeclared identifier and raw start/end observations; no
-/// sample is excluded, replaced, or reclassified after start; every
-/// sample is at most `deadline_ms`; and the ledger records the profile
-/// constants and the cleanup status.
-///
-/// # Errors
-/// Fails closed on any missing sample, malformed value, exclusion, or
-/// deadline breach.
-pub fn validate_slo_ledger(
-  samples: &[SloSample], deadline_ms: u128, profile_members: u64, release_samples: usize,
-  cleanup_complete: bool,
-) -> Result<SloValidation, ValidationError> {
-  if !cleanup_complete {
-    return Err(ValidationError::IncompleteLedger("cleanup status"));
-  }
-  if profile_members != 16 {
-    return Err(ValidationError::IncompleteLedger("profile member count"));
-  }
-  if samples.len() != release_samples {
-    return Err(ValidationError::IncompleteLedger("sample count"));
-  }
-  let mut runs: BTreeMap<String, [usize; 5]> = BTreeMap::new();
-  let mut maximum: u128 = 0;
-  for sample in samples {
-    if sample.ended_at_ms < sample.started_at_ms {
-      return Err(ValidationError::InvalidField("sample window"));
-    }
-    if sample.started_at_ms == 0 {
-      return Err(ValidationError::MissingField("raw start value"));
-    }
-    if sample.sample_id.is_empty() {
-      return Err(ValidationError::MissingField("sample id"));
-    }
-    let latency = sample.ended_at_ms - sample.started_at_ms;
-    if latency > deadline_ms {
-      return Err(ValidationError::SampleExcludedAfterStart);
-    }
-    maximum = maximum.max(latency);
-    let run = sample.sample_id.split('/').next().unwrap_or("");
-    let Some(slot) = stratum_slot(sample.stratum) else {
-      return Err(ValidationError::InvalidField("stratum"));
-    };
-    let slots = runs.entry(run.to_owned()).or_default();
-    slots[slot] += 1;
-  }
-  let runs_expected = 5_u64;
-  if runs.len() as u64 != runs_expected {
-    return Err(ValidationError::IncompleteLedger("run count"));
-  }
-  let per_run = release_samples / runs.len();
-  let per_stratum = per_run / 5;
-  for slots in runs.values() {
-    if slots.iter().sum::<usize>() != per_run {
-      return Err(ValidationError::IncompleteLedger("run sample count"));
-    }
-    for count in slots {
-      if *count != per_stratum {
-        return Err(ValidationError::IncompleteLedger("stratum sample count"));
-      }
-    }
-  }
-  Ok(SloValidation {
-    samples: samples.len(),
-    maximum_latency_ms: maximum,
-  })
-}
-
-/// Parses one canonical SLO ledger sample line:
-/// `{"schema":".../slo-ledger-v1","sample_id":"<run>/<index>",
-///   "stratum":"<closed stratum>","started_at_ms":<raw>,"ended_at_ms":<raw>}`.
-///
-/// # Errors
-/// Fails closed on unknown schema, missing fields, and malformed values.
-pub fn parse_slo_sample(line: &str) -> Result<SloSample, ValidationError> {
-  let fields = flat_object(line)?;
-  if fields.get("schema").map(String::as_str) != Some(SLO_LEDGER_SCHEMA) {
-    return Err(ValidationError::UnknownSchema(
-      fields.get("schema").cloned().unwrap_or_default(),
-    ));
-  }
-  Ok(SloSample {
-    sample_id: require(&fields, "sample_id")?,
-    stratum: SloStratum::parse(&require(&fields, "stratum")?)
-      .ok_or(ValidationError::InvalidField("stratum"))?,
-    started_at_ms: require_u64(&fields, "started_at_ms")?.into(),
-    ended_at_ms: require_u64(&fields, "ended_at_ms")?.into(),
-  })
-}
-
-fn stratum_slot(stratum: SloStratum) -> Option<usize> {
-  match stratum {
-    SloStratum::Admission => Some(0),
-    SloStratum::DirectPacket => Some(1),
-    SloStratum::RoutedPacket => Some(2),
-    SloStratum::NodeMetadata => Some(3),
-    SloStratum::ResourceMetadata => Some(4),
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -689,89 +531,5 @@ mod tests {
     retried.retry = RetryClass::Infrastructure;
     retried.predecessor = attempt_digest(&failed);
     validate_lineage(&[failed, retried]).unwrap();
-  }
-
-  // The complete synthetic SLO ledger passes and every
-  // incomplete or post-start-excluded variant fails.
-  #[test]
-  fn slo_ledger_validation() {
-    let mut samples = Vec::new();
-    for run in 1..=5_u32 {
-      for stratum in [
-        SloStratum::Admission,
-        SloStratum::DirectPacket,
-        SloStratum::RoutedPacket,
-        SloStratum::NodeMetadata,
-        SloStratum::ResourceMetadata,
-      ] {
-        for index in 1..=5_u32 {
-          let line = format!(
-            "{{\"schema\":\"{SLO_LEDGER_SCHEMA}\",\"sample_id\":\"run-{run}/sample-{index}\",\"stratum\":\"{}\",\"started_at_ms\":{},\"ended_at_ms\":{}}}",
-            stratum_name(stratum),
-            1_000 + u128::from(index),
-            2_000 + u128::from(index),
-          );
-          samples.push(parse_slo_sample(&line).unwrap());
-        }
-      }
-    }
-    assert_eq!(samples.len(), 125);
-    let outcome = validate_slo_ledger(&samples, 10_000, 16, 125, true).unwrap();
-    assert_eq!(outcome.samples, 125);
-    assert_eq!(outcome.maximum_latency_ms, 1_000);
-
-    // A profile member count that differs from the validator's constant
-    // fails.
-    assert_eq!(
-      validate_slo_ledger(&samples, 10_000, 32, 125, true),
-      Err(ValidationError::IncompleteLedger("profile member count"))
-    );
-
-    // A missing sample fails the count.
-    assert_eq!(
-      validate_slo_ledger(&samples[..124], 10_000, 16, 125, true),
-      Err(ValidationError::IncompleteLedger("sample count"))
-    );
-
-    // A sample above the deadline is a failed sample, never an exclusion.
-    let mut over = samples.clone();
-    over[0].ended_at_ms = 20_000;
-    assert_eq!(
-      validate_slo_ledger(&over, 10_000, 16, 125, true),
-      Err(ValidationError::SampleExcludedAfterStart)
-    );
-
-    // An incomplete run (24 samples in one run, 26 in another) fails.
-    let mut uneven = samples.clone();
-    uneven[0].sample_id = "run-2/sample-99".into();
-    assert!(validate_slo_ledger(&uneven, 10_000, 16, 125, true).is_err());
-
-    // Missing cleanup status fails.
-    assert_eq!(
-      validate_slo_ledger(&samples, 10_000, 16, 125, false),
-      Err(ValidationError::IncompleteLedger("cleanup status"))
-    );
-
-    // A sample without raw values fails.
-    let line = format!(
-      "{{\"schema\":\"{SLO_LEDGER_SCHEMA}\",\"sample_id\":\"run-1/sample-1\",\"stratum\":\"admission\",\"started_at_ms\":0,\"ended_at_ms\":1}}"
-    );
-    let zero = parse_slo_sample(&line).unwrap();
-    let mut with_zero = samples.clone();
-    with_zero[0] = zero;
-    assert_eq!(
-      validate_slo_ledger(&with_zero, 10_000, 16, 125, true),
-      Err(ValidationError::MissingField("raw start value"))
-    );
-  }
-
-  fn stratum_name(stratum: SloStratum) -> &'static str {
-    match stratum {
-      SloStratum::Admission => "admission",
-      SloStratum::DirectPacket => "direct-packet",
-      SloStratum::RoutedPacket => "routed-packet",
-      SloStratum::NodeMetadata => "node-metadata",
-      SloStratum::ResourceMetadata => "resource-metadata",
-    }
   }
 }
