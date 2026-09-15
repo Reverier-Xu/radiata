@@ -6,9 +6,9 @@
 //! derived proof keys, and proof values are never persisted, replicated,
 //! logged, or included in an admission grant. Each receiver holds at most
 //! one active generation: valid for ten minutes, memory-only, invalidated
-//! by rotation, reserved by at most one in-progress commit, and consumed by
-//! exactly one successfully committed new identity. Consumption erases the
-//! secret and every stored secret is zeroized on drop.
+//! by rotation, and admitting any number of distinct subjects within its
+//! lifetime (per-subject replay is refused by the durable subject-scoped
+//! credential-use record). Every stored secret is zeroized on drop.
 
 use std::{
   fmt,
@@ -124,25 +124,14 @@ impl fmt::Debug for IssuedMergeCredential {
   }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GenerationState {
-  Active,
-  Reserved,
-  Consumed,
-}
-
 struct ActiveGeneration {
-  credential: Option<MergeCredential>,
+  credential: MergeCredential,
   generation_id: [u8; GENERATION_ID_LEN],
   expires_at: SystemTime,
-  state: GenerationState,
 }
 
 impl ActiveGeneration {
   fn live(&self, now: SystemTime) -> Result<()> {
-    if self.state == GenerationState::Consumed {
-      return Err(Error::authentication_failed("join credential consumed"));
-    }
     if now >= self.expires_at {
       return Err(Error::authentication_failed("join credential expired"));
     }
@@ -154,8 +143,10 @@ impl ActiveGeneration {
 ///
 /// At most one generation exists at a time. Process restart erases it;
 /// rotation invalidates the previous value by dropping and zeroizing its
-/// secret. The session driver's admission commit owns the durable
-/// single-use semantics; this type owns only the in-memory lifecycle.
+/// secret. Within its lifetime one generation admits any number of
+/// subjects (concurrent joins included); the durable admission commit owns
+/// the per-subject replay refusal, so this type owns only the in-memory
+/// lifecycle.
 pub(crate) struct MergeCredentialIssuer {
   generation: Option<ActiveGeneration>,
 }
@@ -165,18 +156,21 @@ impl MergeCredentialIssuer {
     Self { generation: None }
   }
 
-  /// Issues the first generation, rejecting the call while a live
-  /// (unexpired, unconsumed) generation already exists. Production only
-  /// ever rotates (the first generation is issued by `rotate` on the
-  /// fresh issuer), so this entry point is exercised by tests only.
-  #[cfg(test)]
+  /// Issues the current generation's credential without rotating it:
+  /// with a live (unexpired) generation the same credential is handed out
+  /// again (multi-admission, concurrent joins); with none, a fresh
+  /// generation is created. Only [`MergeCredentialIssuer::rotate`]
+  /// invalidates a live generation.
   pub(crate) fn issue(
     &mut self, entropy: &dyn Entropy, now: SystemTime,
   ) -> Result<IssuedMergeCredential> {
     if let Some(generation) = &self.generation
       && generation.live(now).is_ok()
     {
-      return Err(Error::conflict("join credential active"));
+      return Ok(IssuedMergeCredential {
+        credential: MergeCredential::from_body(*generation.credential.expose_secret_bytes()),
+        expires_at: generation.expires_at,
+      });
     }
     self.replace(entropy, now)
   }
@@ -199,71 +193,16 @@ impl MergeCredentialIssuer {
       .map(|generation| generation.generation_id)
   }
 
-  /// The live credential secret, reserved or active, for proof derivation
-  /// and verification. Expired or consumed generations fail closed.
+  /// The live credential secret for proof derivation and verification.
+  /// Expired generations fail closed; admission liveness is checked here
+  /// and multi-admission needs no reservation.
   pub(crate) fn active_credential(&self, now: SystemTime) -> Result<&MergeCredential> {
     let generation = self
       .generation
       .as_ref()
       .ok_or_else(|| Error::authentication_failed("join credential absent"))?;
     generation.live(now)?;
-    generation
-      .credential
-      .as_ref()
-      .ok_or_else(|| Error::authentication_failed("join credential consumed"))
-  }
-
-  /// Reserves the live generation for one in-progress admission commit. At
-  /// most one reservation can be outstanding.
-  pub(crate) fn reserve(&mut self, now: SystemTime) -> Result<()> {
-    let generation = self
-      .generation
-      .as_mut()
-      .ok_or_else(|| Error::authentication_failed("join credential absent"))?;
-    generation.live(now)?;
-    match generation.state {
-      GenerationState::Active => {
-        generation.state = GenerationState::Reserved;
-        Ok(())
-      }
-      GenerationState::Reserved => Err(Error::conflict("join credential reserved")),
-      GenerationState::Consumed => Err(Error::authentication_failed("join credential consumed")),
-    }
-  }
-
-  /// Returns a reserved generation to active after a failed proof,
-  /// collision, or definitely aborted transaction.
-  pub(crate) fn release(&mut self) -> Result<()> {
-    let generation = self
-      .generation
-      .as_mut()
-      .ok_or_else(|| Error::authentication_failed("join credential absent"))?;
-    match generation.state {
-      GenerationState::Reserved => {
-        generation.state = GenerationState::Active;
-        Ok(())
-      }
-      _ => Err(Error::conflict("join credential not reserved")),
-    }
-  }
-
-  /// Consumes a reserved generation after exactly one successfully
-  /// committed new identity. The secret is erased immediately; the
-  /// generation ID remains for audit correlation.
-  pub(crate) fn consume(&mut self) -> Result<()> {
-    let generation = self
-      .generation
-      .as_mut()
-      .ok_or_else(|| Error::authentication_failed("join credential absent"))?;
-    match generation.state {
-      GenerationState::Reserved => {
-        // Dropping the credential zeroizes the secret text and body.
-        generation.credential = None;
-        generation.state = GenerationState::Consumed;
-        Ok(())
-      }
-      _ => Err(Error::conflict("join credential not reserved")),
-    }
+    Ok(&generation.credential)
   }
 
   fn replace(&mut self, entropy: &dyn Entropy, now: SystemTime) -> Result<IssuedMergeCredential> {
@@ -276,10 +215,9 @@ impl MergeCredentialIssuer {
       .ok_or_else(|| Error::internal("join credential expiry"))?;
     // Replacing the generation drops and zeroizes the previous secret.
     self.generation = Some(ActiveGeneration {
-      credential: Some(MergeCredential::from_body(*body)),
+      credential: MergeCredential::from_body(*body),
       generation_id,
       expires_at,
-      state: GenerationState::Active,
     });
     Ok(IssuedMergeCredential {
       credential: MergeCredential::from_body(*body),
@@ -423,12 +361,12 @@ mod tests {
       &GOLDEN_BODY
     );
 
-    // A second issue while the generation is live conflicts; rotation is
-    // always allowed.
-    assert_eq!(
-      issuer.issue(&entropy, ISSUED_AT).unwrap_err().kind(),
-      ErrorKind::Conflict
-    );
+    // A second issue while the generation is live hands out the same
+    // credential (multi-admission); only rotation replaces it.
+    let again = issuer.issue(&entropy, ISSUED_AT).unwrap();
+    assert_eq!(again.credential().expose_secret(), GOLDEN_TEXT);
+    assert_eq!(again.expires_at(), ISSUED_AT + LIFETIME);
+    assert_eq!(issuer.generation_id(), Some(generation));
 
     // Entropy failure propagates without mutating any existing state.
     let mut fresh = MergeCredentialIssuer::new();
@@ -459,10 +397,6 @@ mod tests {
       issuer.active_credential(at(600)).unwrap_err().kind(),
       ErrorKind::AuthenticationFailed
     );
-    assert_eq!(
-      issuer.reserve(at(600)).unwrap_err().kind(),
-      ErrorKind::AuthenticationFailed
-    );
 
     // Rotation invalidates the old value and creates an independent one.
     let second = issuer.rotate(&entropy, at(600)).unwrap();
@@ -482,51 +416,40 @@ mod tests {
     assert_eq!(credential.expose_secret_bytes().len(), BODY_LEN);
   }
 
+  /// A live generation admits any number of subjects: issuing again
+  /// returns the same credential, concurrent admissions share the
+  /// generation, and only rotation or expiry retires it. The durable
+  /// commit layer owns per-subject replay refusal.
   #[test]
-  fn tls_transport_credential_reservation_is_single_use() {
+  fn tls_transport_credential_generation_admits_many_subjects() {
     let entropy = SequenceEntropy::default();
     let mut issuer = MergeCredentialIssuer::new();
-    issuer.issue(&entropy, ISSUED_AT).unwrap();
+    let first = issuer.issue(&entropy, ISSUED_AT).unwrap();
+    let first_generation = issuer.generation_id().unwrap();
 
-    // One outstanding reservation only.
-    issuer.reserve(ISSUED_AT).unwrap();
+    // Re-issuing hands out the same credential and generation.
+    let second = issuer.issue(&entropy, ISSUED_AT).unwrap();
     assert_eq!(
-      issuer.reserve(ISSUED_AT).unwrap_err().kind(),
-      ErrorKind::Conflict
+      second.credential().expose_secret(),
+      first.credential().expose_secret()
     );
+    assert_eq!(issuer.generation_id(), Some(first_generation));
 
-    // The reserved generation still verifies proofs.
-    assert!(
-      issuer
-        .active_credential(ISSUED_AT)
-        .unwrap()
-        .expose_secret()
-        .starts_with("join_")
-    );
-
-    // A failed attempt returns the generation to active.
-    issuer.release().unwrap();
-    assert_eq!(issuer.release().unwrap_err().kind(), ErrorKind::Conflict);
-    issuer.reserve(ISSUED_AT).unwrap();
-
-    // Exactly one successful commit consumes and erases the secret.
-    issuer.consume().unwrap();
-    assert_eq!(issuer.consume().unwrap_err().kind(), ErrorKind::Conflict);
-    assert_eq!(issuer.release().unwrap_err().kind(), ErrorKind::Conflict);
+    // The credential stays derivable for the whole lifetime (no consume
+    // step retires it).
     assert_eq!(
-      issuer.active_credential(ISSUED_AT).unwrap_err().kind(),
-      ErrorKind::AuthenticationFailed
-    );
-    assert_eq!(
-      issuer.reserve(ISSUED_AT).unwrap_err().kind(),
-      ErrorKind::AuthenticationFailed
+      issuer.active_credential(at(599)).unwrap().expose_secret(),
+      first.credential().expose_secret()
     );
 
-    // The consumed generation ID remains for audit correlation, and a fresh
-    // issue replaces the consumed generation.
-    assert!(issuer.generation_id().is_some());
-    let reissued = issuer.issue(&entropy, ISSUED_AT).unwrap();
-    assert!(reissued.credential().expose_secret().starts_with("join_"));
+    // Rotation is the only in-lifetime retirement: a fresh independent
+    // generation replaces the old one.
+    let rotated = issuer.rotate(&entropy, ISSUED_AT).unwrap();
+    assert_ne!(
+      rotated.credential().expose_secret(),
+      first.credential().expose_secret()
+    );
+    assert_ne!(issuer.generation_id(), Some(first_generation));
   }
 
   #[test]

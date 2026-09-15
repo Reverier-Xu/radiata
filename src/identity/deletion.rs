@@ -38,6 +38,9 @@ pub(crate) async fn delete_unreferenced_key(
   store: &crate::storage::MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
   handle: &KeyHandle,
 ) -> Result<()> {
+  // The whole journaled section holds the writer exclusion: see the
+  // same-purpose serialization note on the merge flow.
+  let _permit = store.write_permit().await;
   let purpose = deletion_purpose(handle);
   // The deletion path reconciles a frozen store after journal recovery
   // too (a cheap no-op on a non-frozen store), matching its historical
@@ -313,7 +316,7 @@ mod tests {
   }
 
   fn detached_handle(fixture: &Fixture, index: u64) -> crate::KeyHandle {
-    let operation = KeyOperationId::parse(&format!("keyop_{:021}", 10_000 + index)).unwrap();
+    let operation = KeyOperationId::parse(&format!("keyop-{:021}", 10_000 + index)).unwrap();
     fixture.keys.create_detached(&operation).handle().clone()
   }
 
@@ -482,7 +485,7 @@ mod tests {
       let context = open_context(&faulting.as_factory(), &keys, &entropy)
         .await
         .unwrap();
-      let operation = KeyOperationId::parse("keyop_000000000000000000099").unwrap();
+      let operation = KeyOperationId::parse("keyop-000000000000000000099").unwrap();
       let handle = keys.create_detached(&operation).handle().clone();
 
       delete_unreferenced_key(
@@ -523,7 +526,7 @@ mod tests {
     let context = open_context(&faulting.as_factory(), &keys, &entropy)
       .await
       .unwrap();
-    let operation = KeyOperationId::parse("keyop_000000000000000000098").unwrap();
+    let operation = KeyOperationId::parse("keyop-000000000000000000098").unwrap();
     let handle = keys.create_detached(&operation).handle().clone();
 
     let task = tokio::spawn({
@@ -571,7 +574,7 @@ mod tests {
       if inject_tombstone {
         let (namespace, key) = key_deleted_key(&expected_handle).unwrap();
         let tombstone = KeyDeletedV1::new(
-          KeyOperationId::parse("keyop_000000000000000000002").unwrap(),
+          KeyOperationId::parse("keyop-000000000000000000002").unwrap(),
           expected_handle.clone(),
         );
         let value = StoreValue::new(Arc::from(tombstone.encode().unwrap()));
@@ -585,10 +588,10 @@ mod tests {
         let (namespace, key) = key_deletion_intent_key(&expected_handle).unwrap();
         let revision = crate::StoreRevision::new(Arc::from(0_u64.to_be_bytes())).unwrap();
         let intent = KeyDeletionIntentV1::new(
-          KeyOperationId::parse("keyop_000000000000000000002").unwrap(),
+          KeyOperationId::parse("keyop-000000000000000000002").unwrap(),
           expected_handle.clone(),
           "key-delete-test".to_owned(),
-          crate::TransactionId::parse("txn_000000000000000000002").unwrap(),
+          crate::TransactionId::parse("txn-000000000000000000002").unwrap(),
           revision,
         )
         .unwrap();
@@ -697,7 +700,7 @@ mod guard_tests {
     let context = open_context(&faulting.as_factory(), &keys, &entropy)
       .await
       .unwrap();
-    let operation = KeyOperationId::parse("keyop_000000000000000000055").unwrap();
+    let operation = KeyOperationId::parse("keyop-000000000000000000055").unwrap();
     let handle = keys.create_detached(&operation).handle().clone();
 
     delete_unreferenced_key(

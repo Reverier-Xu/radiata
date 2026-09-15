@@ -135,7 +135,7 @@ pub(crate) fn reference_revision(generation: u64) -> StoreRevision {
 }
 
 pub(crate) fn owner_record_key() -> (StoreNamespace, StoreKey) {
-  identity_binding_key(&NodeId::parse("node_100000000000000000000").unwrap()).unwrap()
+  identity_binding_key(&NodeId::parse("node-100000000000000000000").unwrap()).unwrap()
 }
 
 pub(crate) fn pointer_record_key() -> (StoreNamespace, StoreKey) {

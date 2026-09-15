@@ -288,6 +288,7 @@ pub(crate) async fn spawn_runtime(
     dependencies.events.clone(),
     dependencies.member_revision.clone(),
     dependencies.leave_applied.clone(),
+    dependencies.sessions.clone(),
   ));
   dependencies
     .extensions
@@ -406,6 +407,10 @@ async fn supervise(
         let result = supervisor.rotate_merge_credential();
         let _ = reply.send(result);
       }
+      Control::IssueMergeCredential { reply } => {
+        let result = supervisor.issue_merge_credential();
+        let _ = reply.send(result);
+      }
       Control::Listen { endpoint, reply } => {
         let result = supervisor.listen(endpoint, &mut tasks).await;
         let _ = reply.send(result);
@@ -496,8 +501,12 @@ async fn supervise(
         let result = supervisor.update_node_metadata(expected_revision, patch).await;
         let _ = reply.send(result);
       }
-      Control::PutResource { write, reply } => {
-        let result = supervisor.put_resource(write).await;
+      Control::PutResource {
+        write,
+        expected,
+        reply,
+      } => {
+        let result = supervisor.put_resource(write, expected).await;
         let _ = reply.send(result);
       }
       Control::RevokeNode {
@@ -662,21 +671,9 @@ pub(super) struct Supervisor {
   >,
   pub(super) recovery: crate::membership::recovery::RecoveryController,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  /// Recovery-tick cooldown before the next redundant-edge cut (D10).
+  pub(super) prune_cooldown: u32,
   pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
-  // Members this node has ever authenticated a session with: the recovery
-  // "known online" set. Recovery restores authenticated paths to exactly
-  // these members (edge-loss healing) and never dials strangers, so it
-  // cannot add edges beyond the caller-configured topology.
-  pub(super) recovery_history: std::collections::BTreeSet<NodeId>,
-  /// Set once the known-online set has been seeded from the durable
-  /// member evidence (a restarted process's past-life sessions); later
-  /// ticks never re-seed. Evidence that arrived after the first tick is
-  /// deliberately NOT re-seeded: it describes members this identity has
-  /// never sessioned, and dialing them would fabricate edges beyond the
-  /// established topology (the sixteen-node topology suite pins the
-  /// exact shaped graph; recovery heals existing edges, it never
-  /// invents new ones).
-  pub(super) recovery_seeded: bool,
   /// Memoized departed-members exclusion set, keyed by the store
   /// revision it was computed at: the set only changes when a leave or
   /// cleanup tombstone lands or gets GC'd, and every such change commits
@@ -865,9 +862,8 @@ impl Supervisor {
       listeners: BTreeMap::new(),
       recovery,
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+      prune_cooldown: 0,
       published_endpoints,
-      recovery_history: std::collections::BTreeSet::new(),
-      recovery_seeded: false,
       exclusion_cache: std::sync::Mutex::new(None),
       resource_write_clock: std::sync::atomic::AtomicU64::new(0),
       sync_driver,
@@ -895,6 +891,13 @@ impl Supervisor {
         aborted.push(handle);
       }
     }
+    // Definitive session teardown: the graceful shutdown signal lets live
+    // session tasks run their exit cleanup, but an abort landing first
+    // skips it — draining the table here drops each entry's frame sender
+    // so the detached writer task still exits and the connection closes.
+    if let Err(error) = crate::session::stream::retire_all_sessions(&self.dependencies.sessions) {
+      tracing::warn!(kind = ?error.kind(), "session table teardown failed");
+    }
     (self.dependencies, aborted)
   }
 
@@ -906,6 +909,16 @@ impl Supervisor {
       .lock()
       .map_err(|_| Error::internal("join credential issuer"))?
       .rotate(self.dependencies.entropy.as_ref(), SystemTime::now())
+  }
+
+  fn issue_merge_credential(&mut self) -> Result<IssuedMergeCredential> {
+    self.require_unblocked()?;
+    self
+      .driver
+      .issuer()
+      .lock()
+      .map_err(|_| Error::internal("join credential issuer"))?
+      .issue(self.dependencies.entropy.as_ref(), SystemTime::now())
   }
 
   async fn listen(&mut self, endpoint: Endpoint, tasks: &mut JoinSet<()>) -> Result<ListenerView> {
@@ -974,6 +987,7 @@ impl Supervisor {
                 crate::session::stream::DialDirection::Incoming,
                 attachment.clone(),
                 None,
+                false,
               )
               .await;
             }
@@ -1044,6 +1058,7 @@ impl Supervisor {
     tasks: &mut JoinSet<()>,
   ) -> Result<MergeView> {
     self.require_unblocked()?;
+    crate::audit::dial_started(&receiver.to_string(), false);
     let mut connection = self
       .dependencies
       .transport
@@ -1058,6 +1073,7 @@ impl Supervisor {
     // Remember the peer's leaf SPKI from the merge as the member-mode
     // reconnect pinning anchor (hardening).
     let peer = session.peer().clone();
+    crate::audit::dial_settled(peer.as_str(), false, true);
     if !hint.leaf_spki().is_empty() {
       self
         .driver
@@ -1076,6 +1092,7 @@ impl Supervisor {
       sessions,
       shutdown,
       receiver,
+      false,
       |session_task| {
         tasks.spawn(session_task);
       },
@@ -1102,6 +1119,7 @@ impl Supervisor {
       shutdown,
       receiver,
       &peer,
+      false,
     )
     .await
   }
@@ -1331,7 +1349,6 @@ impl Supervisor {
       .dependencies
       .events
       .emit(crate::SessionChanged::new(peer.clone()));
-    self.recovery_history.remove(peer);
     // A disconnect only tears the session down: the peer stays a known
     // member (its binding and descriptor are untouched), so a later
     // session — inbound or healed — restores it to the recovery plane
@@ -1384,12 +1401,14 @@ impl Supervisor {
   /// Commits one resource write intent as a signed candidate record
   /// (`PutResource`): the supervisor stamps the host wall-clock
   /// tuple, signs through the node's key provider, and commits the whole
-  /// record in one conditional transaction. A committed winner emits
-  /// exactly one [`crate::ResourceChanged`] after durability; an accepted
-  /// but superseded candidate emits nothing, and an indeterminate commit
-  /// reports `CommitUnknown` without an event.
+  /// record in one conditional transaction. With an `expected` version
+  /// the commit installs only while the stored winner equals it exactly
+  /// — a raced read-modify-write is an explicit conflict (D7). A
+  /// committed winner emits exactly one [`crate::ResourceChanged`] after
+  /// durability; an accepted but superseded candidate emits nothing, and
+  /// an indeterminate commit reports `CommitUnknown` without an event.
   async fn put_resource(
-    &mut self, write: crate::ResourceWrite,
+    &mut self, write: crate::ResourceWrite, expected: Option<crate::ResourceVersion>,
   ) -> Result<crate::ResourceMutationView> {
     self.require_unblocked()?;
     let context = self.context()?;
@@ -1404,10 +1423,23 @@ impl Supervisor {
     let write = &write;
     let labels = &labels;
     let writer = &writer;
+    let expected = &expected;
     let this = &*self;
     let context = &context;
     let (accepted, name, outcome) = with_commit_race_retry("resource put", || {
       Box::pin(async move {
+        // The caller's expected version is the only authority on which
+        // register state the write may replace: a mismatch is final and
+        // never retried (the CAS race guard below covers only the
+        // snapshot-commit window, re-running this check per attempt).
+        if let Some(expected) = expected {
+          let stored = crate::resource::store::read_record_ctx(context.store(), write.name())
+            .await?
+            .ok_or_else(|| Error::not_found("resource"))?;
+          if !expected.matches_record(&stored) {
+            return Ok(CommitRace::Final(Err(Error::conflict("resource version"))));
+          }
+        }
         let timestamp_millis = this.issue_resource_stamp();
         let record = crate::resource::ResourceRecordV1::sign_with_provider(
           write.name().clone(),
@@ -1443,6 +1475,18 @@ impl Supervisor {
       })
     })
     .await?;
+    // A preconditioned write that lost the tuple can no longer be
+    // replacing the expected version: the register moved past it, so the
+    // precondition surfaces as an explicit conflict (D7) instead of a
+    // silently accepted loser.
+    if expected.is_some()
+      && matches!(
+        outcome,
+        crate::resource::store::ResourceCommitOutcome::Superseded(_)
+      )
+    {
+      return Err(Error::conflict("resource version"));
+    }
     Ok(match outcome {
       crate::resource::store::ResourceCommitOutcome::Installed(_) => {
         self
@@ -1723,7 +1767,6 @@ impl Supervisor {
         .dependencies
         .events
         .emit(crate::SessionChanged::new(subject.clone()));
-      self.recovery_history.remove(&subject);
       self
         .dependencies
         .events
@@ -1789,7 +1832,6 @@ impl Supervisor {
       .collect();
     for peer in peers {
       crate::session::stream::retire_session(&self.dependencies.sessions, &peer)?;
-      self.recovery_history.remove(&peer);
     }
 
     crate::identity::leave::run_leave(
@@ -1838,50 +1880,60 @@ impl Supervisor {
 /// and exporter binding, then the session is kept open for packet streams.
 /// Called by `connect_member` and by the recovery controller's detached
 /// dial tasks.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dial_member(
   transport: Arc<dyn Transport>, driver: SessionDriver,
   sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
-  shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId,
+  shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId, recovery_dialed: bool,
 ) -> Result<NodeId> {
-  // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
-  // at join (same-listener reconnects); without an anchor this process
-  // falls back to the join-mode relaxation and the application proof
-  // layer remains the authenticator.
-  let config = match driver.peer_spki(peer) {
-    Some(spki) => {
-      tls::member_client_config(rustls::pki_types::SubjectPublicKeyInfoDer::from(spki))?
-    }
-    None => tls::merge_client_config()?,
-  };
-  let mut connection = transport.connect(receiver.clone(), config).await?;
-  let session = driver.initiate_member(&mut connection, peer).await?;
-  let authenticated = session.peer().clone();
-  // The member-mode dial returns only after the session table settles, so
-  // the caller's first packet cannot race registration (including the
-  // crossed-dial loser outcome, which reports no usable session).
-  keep_outbound_session(
-    connection,
-    session,
-    packet,
-    sessions,
-    shutdown,
-    receiver,
-    |session_task| {
-      tokio::spawn(session_task);
-    },
-  )
-  .await?;
-  Ok(authenticated)
+  crate::audit::dial_started(peer.as_str(), recovery_dialed);
+  let result = async {
+    // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
+    // at join (same-listener reconnects); without an anchor this process
+    // falls back to the join-mode relaxation and the application proof
+    // layer remains the authenticator.
+    let config = match driver.peer_spki(peer) {
+      Some(spki) => {
+        tls::member_client_config(rustls::pki_types::SubjectPublicKeyInfoDer::from(spki))?
+      }
+      None => tls::merge_client_config()?,
+    };
+    let mut connection = transport.connect(receiver.clone(), config).await?;
+    let session = driver.initiate_member(&mut connection, peer).await?;
+    let authenticated = session.peer().clone();
+    // The member-mode dial returns only after the session table settles, so
+    // the caller's first packet cannot race registration (including the
+    // crossed-dial loser outcome, which reports no usable session).
+    keep_outbound_session(
+      connection,
+      session,
+      packet,
+      sessions,
+      shutdown,
+      receiver,
+      recovery_dialed,
+      |session_task| {
+        tokio::spawn(session_task);
+      },
+    )
+    .await?;
+    Ok(authenticated)
+  }
+  .await;
+  crate::audit::dial_settled(peer.as_str(), recovery_dialed, result.is_ok());
+  result
 }
 
 /// The keep-open tail shared by join and member dials: spawns the
 /// outbound session pump through the caller's spawner and returns only
 /// after the session table registers the entry, so the caller's first
 /// packet cannot race registration.
+#[allow(clippy::too_many_arguments)]
 async fn keep_outbound_session(
   connection: crate::transport::connection::Connection,
   session: crate::session::EstablishedSession, packet: Arc<SessionPacketContext>,
   sessions: SessionTable, shutdown: watch::Receiver<()>, attachment: Endpoint,
+  recovery_dialed: bool,
   spawn: impl FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
 ) -> Result<()> {
   let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
@@ -1894,6 +1946,7 @@ async fn keep_outbound_session(
     crate::session::stream::DialDirection::Outgoing,
     attachment,
     Some(registered_tx),
+    recovery_dialed,
   )));
   if registered_rx.await.is_err() {
     return Err(Error::internal("session registration"));

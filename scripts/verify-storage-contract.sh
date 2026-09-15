@@ -50,9 +50,11 @@ cargo test --locked --lib storage_contract
 
 # Backend-neutral JSON parity: the all-family lane runs
 # unchanged against the JSON adapter through the same contract runner.
-cargo test --locked --test json_runtime -- --list > "$TMP/json-runtime.list"
+# The json feature is opt-in since the default-feature inversion (D12),
+# so this lane activates it explicitly.
+cargo test --locked --all-features --test json_runtime -- --list > "$TMP/json-runtime.list"
 require_nonempty_tests json_runtime "$TMP/json-runtime.list"
-cargo test --locked --test json_runtime
+cargo test --locked --all-features --test json_runtime
 
 cargo test --locked --test storage_runtime -- --list > "$TMP/storage-runtime.list"
 require_nonempty_tests storage_runtime "$TMP/storage-runtime.list"

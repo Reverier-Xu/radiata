@@ -108,6 +108,7 @@ const fn kind_code(kind: ErrorKind) -> Option<u8> {
     ErrorKind::CommitUnknown => 19,
     ErrorKind::Cancelled => 20,
     ErrorKind::ShuttingDown => 21,
+    ErrorKind::CallerError => 23,
     ErrorKind::Internal => 22,
   };
   Some(code)
@@ -139,6 +140,7 @@ const fn kind_from_code(code: u8) -> Result<ErrorKind> {
     19 => ErrorKind::CommitUnknown,
     20 => ErrorKind::Cancelled,
     21 => ErrorKind::ShuttingDown,
+    23 => ErrorKind::CallerError,
     22 => ErrorKind::Internal,
     _ => return Err(Error::invalid_input("route trace failure code")),
   };
@@ -323,16 +325,8 @@ pub(crate) async fn put_trace(
       value: crate::StoreValue::new(std::sync::Arc::from(encoded)),
     }],
   )?;
-  match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) => Ok(()),
-    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-      Err(Error::conflict("route trace"))
-    }
-    crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
-      ProviderErrorKind::CommitUnknown,
-      ProviderErrorContext::StorageReconcile,
-    )),
-  }
+  crate::provider::commit_verdict(store.commit(transaction).await?, "route trace")?;
+  Ok(())
 }
 
 /// Terminates every non-terminal record left by a previous incarnation:
@@ -470,7 +464,10 @@ async fn commit_batch(
     crate::CommitOutcome::Conflict => Ok(0),
     crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
       ProviderErrorKind::CommitUnknown,
-      ProviderErrorContext::StorageReconcile,
+      // The trace register commits through the same conditional slot as
+      // every other lane; only the context label historically said
+      // otherwise.
+      ProviderErrorContext::StorageCommit,
     )),
   }
 }
@@ -501,11 +498,11 @@ mod tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn trace(seed: u32) -> TraceId {
-    TraceId::parse(&format!("trace_{seed:021}")).unwrap()
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
   }
 
   async fn open_store() -> (Arc<dyn StorageFactory>, MetadataStore, Arc<ManualClock>) {
@@ -561,13 +558,14 @@ mod tests {
       ErrorKind::CommitUnknown,
       ErrorKind::Cancelled,
       ErrorKind::ShuttingDown,
+      ErrorKind::CallerError,
       ErrorKind::Internal,
     ];
     for kind in kinds {
       let code = super::kind_code(kind).unwrap();
       assert_eq!(super::kind_from_code(code).unwrap(), kind);
     }
-    for code in [0_u8, 23, u8::MAX] {
+    for code in [0_u8, 24, u8::MAX] {
       assert!(super::kind_from_code(code).is_err());
     }
   }
@@ -1101,7 +1099,7 @@ impl TraceSink {
   /// compare-and-swap keeps the queue depth structurally at or below
   /// [`MAX_QUEUED_TRACE_PERSISTENCE`] under any admission race.
   pub(crate) fn record_terminal(&self, record: TraceRecord) {
-    let admitted = self.pending.fetch_update(
+    let admitted = self.pending.try_update(
       std::sync::atomic::Ordering::Relaxed,
       std::sync::atomic::Ordering::Relaxed,
       |pending| (pending < MAX_QUEUED_TRACE_PERSISTENCE).then_some(pending + 1),

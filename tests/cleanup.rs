@@ -128,7 +128,7 @@ async fn cleanup_converges_and_excludes_the_subject() {
       .kind(),
     ErrorKind::InvalidInput
   );
-  let stranger = NodeId::parse("node_999999999999999999999").unwrap();
+  let stranger = NodeId::parse("node-999999999999999999999").unwrap();
   assert_eq!(
     issuer
       .handle

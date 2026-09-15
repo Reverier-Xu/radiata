@@ -40,7 +40,7 @@ async fn start_node(seed: u64) -> Node {
   Node {
     handle,
     endpoint: Endpoint::parse("wss://127.0.0.1:0").unwrap(),
-    id: NodeId::parse("node_000000000000000000000").unwrap(), // replaced by node_id()
+    id: NodeId::parse("node-000000000000000000000").unwrap(), // replaced by node_id()
   }
 }
 
@@ -296,7 +296,7 @@ async fn revoke_is_exact_and_idempotent() {
     .unwrap();
 
   // Unknown subject: nothing trusted to revoke.
-  let unknown = NodeId::parse("node_000000000000000000099").unwrap();
+  let unknown = NodeId::parse("node-000000000000000000099").unwrap();
   assert_eq!(
     issuer
       .handle

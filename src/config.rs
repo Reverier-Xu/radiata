@@ -270,6 +270,13 @@ impl Default for TraceMetadataLimits {
   }
 }
 
+/// The recovery policy: bounds and cadence for the any-one-route
+/// recovery plane. While fully isolated, a node retries members from its
+/// table with wall-clock backoff (initial → maximum, doubling); a
+/// connected node never dials. `neighbors` names the intended direct
+/// neighborhood size (used by topology bootstrap hints),
+/// `fan_out` caps how many members one recovery round dials in parallel,
+/// and the backoff pair bounds the retry cadence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryConfig {
   neighbors: usize,

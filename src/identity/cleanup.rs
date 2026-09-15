@@ -363,16 +363,10 @@ pub(crate) async fn persist_checkpoint_ctx(
   // A discarded commit outcome would advance the reported watermark
   // without a committed outcome behind it: Conflict/Aborted definitively
   // did not land, and Unknown leaves durability indeterminate.
-  match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) => Ok(()),
-    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-      Err(Error::conflict("cleanup checkpoint"))
-    }
-    crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
-      crate::ProviderErrorKind::CommitUnknown,
-      crate::ProviderErrorContext::StorageCommit,
-    )),
-  }
+  // Without a committed outcome behind it: Conflict/Aborted definitively
+  // did not land, and Unknown leaves durability indeterminate.
+  crate::provider::commit_verdict(store.commit(transaction).await?, "cleanup checkpoint")?;
+  Ok(())
 }
 
 /// The checkpoint GC pass: after sync rounds, delete

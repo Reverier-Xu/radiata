@@ -362,8 +362,14 @@ impl MetadataStore {
 
   pub(crate) async fn reconcile(&self) -> Result<ReconcileOutcome> {
     // The same bounded entry wait as commit: a reconcile racing an
-    // in-flight commit waits for the Ready state instead of surfacing the
-    // transient refusal to callers.
+    // in-flight commit waits for the frozen slot instead of surfacing
+    // the transient refusal to callers. A ready store, by contrast, has
+    // no in-doubt commit at all: the refusal is semantic and final (no
+    // state change can make this transaction reconcilable), so it
+    // surfaces immediately instead of parking for the full bound.
+    if matches!(*self.lock_state()?, CommitState::Ready) {
+      return Err(Error::not_ready("metadata storage reconcile"));
+    }
     let deadline = std::time::Instant::now() + ENTRY_WAIT_BOUND;
     let (pending, call) = self
       .wait_for_entry(deadline, || self.begin_reconcile())
@@ -513,6 +519,78 @@ impl MetadataStore {
       }
       CommitState::Frozen { .. } => Err(Error::not_ready("metadata storage journal recovery")),
     }
+  }
+
+  /// Resolves one purpose-scoped pending journal against durable provider
+  /// evidence and returns whether a journal was recovered.
+  ///
+  /// The journal record is committed atomically with its transaction, so
+  /// the provider's durable receipt — not this process's in-flight commit
+  /// slot — is the recovery authority. Reading the evidence deliberately
+  /// bypasses the slot state machine: the slot exists to order this
+  /// process's in-flight commits, while a journal residue is either a
+  /// crash leftover or another flow's live residue, and both resolve from
+  /// the same authoritative source on a ready store.
+  ///
+  /// Outcomes: `Ok(true)` — the journal committed; the caller removes the
+  /// residue with `cleanup_pending_exact`. `Ok(false)` — nothing to
+  /// recover (absent, or the owning flow cleaned it while the evidence
+  /// was being read). `Err` — the durable evidence contradicts the
+  /// atomic journal: the store stays frozen and fails closed (the
+  /// `is_blocked` gate refuses admission-sensitive operations until an
+  /// authoritative reopen reconciles it).
+  pub(crate) async fn resolve_pending_journal(&self, purpose: &str) -> Result<bool> {
+    let Some(identity) = self.recover_pending(purpose).await? else {
+      return Ok(false);
+    };
+    let pending = PendingCommit {
+      transaction: identity.transaction().clone(),
+      digest: identity.operation_digest().clone(),
+      journal_proven: true,
+    };
+    match self
+      .provider
+      .reconcile(identity.transaction(), identity.operation_digest())
+      .await
+    {
+      Ok(ReconcileOutcome::Committed(receipt)) => {
+        self.validate_receipt(&pending, &receipt, ProviderErrorContext::StorageReconcile)?;
+        self.finish_journal_recovery()?;
+        crate::audit::journal_resolved(purpose, true);
+        Ok(true)
+      }
+      Ok(_) => {
+        // The evidence shows no committed receipt for the journaled
+        // identity — a contradiction with the atomic journal, unless the
+        // owning flow cleaned the residue while the evidence was being
+        // read. Re-read the journal: gone means already resolved; still
+        // present means the durable state contradicts the journal, and
+        // the store stays frozen and fails closed.
+        if self.recover_pending(purpose).await?.is_none() {
+          self.finish_journal_recovery()?;
+          crate::audit::journal_resolved(purpose, false);
+          return Ok(false);
+        }
+        Err(Error::provider(
+          ProviderErrorKind::StorageCorrupt,
+          ProviderErrorContext::StorageReconcile,
+        ))
+      }
+      Err(error) => {
+        // An evidence read failure is not a classification: the store
+        // stays frozen (fail closed, `is_blocked` gates admission) and
+        // the error surfaces. A retry of `resolve_pending_journal`
+        // re-enters the same frozen identity.
+        Err(error)
+      }
+    }
+  }
+
+  /// Returns a frozen store recovered on journal evidence back to ready.
+  fn finish_journal_recovery(&self) -> Result<()> {
+    *self.lock_state()? = CommitState::Ready;
+    self.ready_notify.notify_waiters();
+    Ok(())
   }
 
   /// Reconciles a frozen store back to ready, if it is frozen.

@@ -216,7 +216,7 @@ mod tests {
       crate::ResourceUri::parse(uri).unwrap(),
       labels(),
       timestamp_millis,
-      NodeId::parse("node_000000000000000000001").unwrap(),
+      NodeId::parse("node-000000000000000000001").unwrap(),
       removal_rank,
       removed,
       &SigningKey::from_bytes(&SEED),

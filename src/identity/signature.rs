@@ -20,26 +20,13 @@ pub(crate) fn verify_strict(
   domain: &[u8], canonical_body: &[u8], public_key: &PublicKey, signature: &Signature,
   context: &'static str,
 ) -> Result<()> {
-  verify_strict_message(
-    domain,
-    &signature_message(domain, canonical_body),
-    public_key,
-    signature,
-    context,
-  )
-}
-
-/// Verifies one signature over a prebuilt signature message (domain‖digest
-/// for callers that hold a digest already proven to bind the body).
-pub(crate) fn verify_strict_message(
-  _domain: &[u8], message: &[u8], public_key: &PublicKey, signature: &Signature,
-  context: &'static str,
-) -> Result<()> {
+  // The signature message is domain‖digest for callers that hold a digest
+  // already proven to bind the body.
   let key = ed25519_dalek::VerifyingKey::from_bytes(public_key.as_bytes())
     .map_err(|_| Error::authentication_failed(context))?;
   let signature = ed25519_dalek::Signature::from_bytes(signature.as_bytes());
   key
-    .verify_strict(message, &signature)
+    .verify_strict(&signature_message(domain, canonical_body), &signature)
     .map_err(|_| Error::authentication_failed(context))
 }
 

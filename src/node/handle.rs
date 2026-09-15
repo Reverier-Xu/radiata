@@ -104,6 +104,12 @@ impl CommandControl for RotateMergeCredential {
   }
 }
 
+impl CommandControl for crate::IssueMergeCredential {
+  fn control(self, reply: oneshot::Sender<Result<IssuedMergeCredential>>) -> Control {
+    Control::IssueMergeCredential { reply }
+  }
+}
+
 impl CommandControl for Listen {
   fn control(self, reply: oneshot::Sender<Result<ListenerView>>) -> Control {
     let endpoint = self.into_endpoint();
@@ -166,8 +172,12 @@ impl CommandControl for UpdateNodeMetadata {
 
 impl CommandControl for crate::PutResource {
   fn control(self, reply: oneshot::Sender<Result<crate::ResourceMutationView>>) -> Control {
-    let write = crate::PutResource::into_write(self);
-    Control::PutResource { write, reply }
+    let (write, expected) = crate::PutResource::into_parts(self);
+    Control::PutResource {
+      write,
+      expected,
+      reply,
+    }
   }
 }
 

@@ -594,6 +594,116 @@ async fn remove_resource_requires_the_exact_version() {
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
+/// Conditional write (`PutResource::with_expected`): the preconditioned
+/// candidate installs only while the stored winner equals the observed
+/// version exactly — a stale observation conflicts explicitly (D7), an
+/// unknown name fails NotFound, and the plain write path stays
+/// last-writer-wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_resource_with_expected_enforces_the_version_precondition() {
+  let node = start_node(
+    0,
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+  )
+  .await;
+
+  let name = resource_name(40);
+  node
+    .handle
+    .command(
+      PutResource::new(ResourceWrite::new(
+        name.clone(),
+        resource_labels("document", 40),
+      ))
+      .unwrap(),
+    )
+    .await
+    .unwrap();
+  let page = node
+    .handle
+    .query(SelectResources::new(
+      Selector::parse("radiata.woooo.tech/resources/type=document").unwrap(),
+      PageSpec::first(8).unwrap(),
+    ))
+    .await
+    .unwrap();
+  let version = page.items()[0].version().clone();
+
+  // The exact observed version conditions the write: it installs and
+  // wins.
+  let outcome = node
+    .handle
+    .command(
+      PutResource::with_expected(
+        ResourceWrite::new(name.clone(), resource_labels("blob", 41)),
+        version.clone(),
+      )
+      .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert!(outcome.is_current_winner());
+
+  // The pre-write version is now stale: replaying the precondition
+  // conflicts explicitly instead of losing the update silently.
+  assert_eq!(
+    node
+      .handle
+      .command(
+        PutResource::with_expected(
+          ResourceWrite::new(name.clone(), resource_labels("blob", 42)),
+          version.clone(),
+        )
+        .unwrap(),
+      )
+      .await
+      .unwrap_err()
+      .kind(),
+    radiata::ErrorKind::Conflict,
+    "a stale preconditioned write never replaces a newer winner"
+  );
+
+  // A precondition against an unknown name fails NotFound (mirroring
+  // the removal precondition).
+  assert_eq!(
+    node
+      .handle
+      .command(
+        PutResource::with_expected(
+          ResourceWrite::new(resource_name(41), resource_labels("blob", 43)),
+          version,
+        )
+        .unwrap(),
+      )
+      .await
+      .unwrap_err()
+      .kind(),
+    radiata::ErrorKind::NotFound,
+  );
+
+  // The latest write is still the single winner of the register.
+  assert_eq!(
+    select_names(&node.handle, "radiata.woooo.tech/resources/type").await,
+    [name.as_str().to_owned()]
+  );
+  let current = node
+    .handle
+    .query(SelectResources::new(
+      Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
+      PageSpec::first(8).unwrap(),
+    ))
+    .await
+    .unwrap();
+  assert_eq!(
+    current.items()[0].labels().uri().as_str(),
+    "file:///g9/041",
+    "only the preconditioned write landed"
+  );
+
+  let outcome = node.handle.command(Shutdown::new()).await.unwrap();
+  assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
+}
+
 /// Removal touches only the named resource's core metadata — unrelated
 /// resources stay selected, and neither the URI nor any caller object is
 /// consulted.

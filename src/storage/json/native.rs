@@ -272,7 +272,7 @@ async fn json_native_failed_cleanup_is_typed_and_recovers_after_permission_fix()
 
   let stale = dir
     .path()
-    .join("tmp-00000000000000000002-txn_000000000000000000099-0.tmp");
+    .join("tmp-00000000000000000002-txn-000000000000000000099-0.tmp");
   fs::write(&stale, b"partial").unwrap();
   let original = fs::metadata(dir.path()).unwrap().permissions();
   fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();

@@ -48,12 +48,12 @@ const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 /// Every public value constructor and canonical accessor.
 #[test]
 fn boundary_values_construct_parse_and_round_trip() {
-  let node = NodeId::parse("node_0000000000000000000A1").unwrap();
-  assert_eq!(node.as_str(), "node_0000000000000000000A1");
+  let node = NodeId::parse("node-0000000000000000000a1").unwrap();
+  assert_eq!(node.as_str(), "node-0000000000000000000a1");
   assert_eq!(node.to_string().parse::<NodeId>().unwrap(), node);
 
-  let txn = TransactionId::parse("txn_0000000000000000000C3").unwrap();
-  assert_eq!(txn.as_str(), "txn_0000000000000000000C3");
+  let txn = TransactionId::parse("txn-0000000000000000000c3").unwrap();
+  assert_eq!(txn.as_str(), "txn-0000000000000000000c3");
 
   let digest = Digest::from_bytes([7; 32]);
   assert_eq!(digest.as_bytes(), &[7; 32]);
@@ -86,6 +86,29 @@ fn boundary_values_construct_parse_and_round_trip() {
   let uri = ResourceUri::parse("file:///pub-api").unwrap();
   assert_eq!(uri.as_str(), "file:///pub-api");
 
+  // The observed-version tuple round-trips through the public
+  // constructor, so a caller can forward an observation across a
+  // process boundary and issue a conditional removal with it.
+  let version = ResourceVersion::from_parts(std::time::UNIX_EPOCH, node.clone(), false, digest);
+  assert_eq!(version.timestamp(), std::time::UNIX_EPOCH);
+  assert_eq!(version.writer(), &node);
+  assert!(!version.is_removal());
+  assert_eq!(version.digest().as_bytes(), &[7; 32]);
+
+  // The typed caller-error construction: extension callbacks build it
+  // directly instead of misusing the provider constructor, and its
+  // Display/Error behavior is pinned semantically (the derive-generated
+  // trait impls no longer appear in the public-api rendering).
+  let caller_error = radiata::Error::caller("extension callback failed");
+  assert_eq!(caller_error.kind(), radiata::ErrorKind::CallerError);
+  assert_eq!(caller_error.context(), "extension callback failed");
+  assert_eq!(
+    caller_error.to_string(),
+    "extension callback failed: CallerError"
+  );
+  fn assert_std_error<T: std::error::Error>(_: &T) {}
+  assert_std_error(&caller_error);
+
   let key = LabelKey::parse("example.org/labels/lane").unwrap();
   let value = LabelValue::parse("one").unwrap();
   let labels = LabelSet::new().insert(key.clone(), value.clone()).unwrap();
@@ -98,11 +121,11 @@ fn boundary_values_construct_parse_and_round_trip() {
     "join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
   );
 
-  let trace = TraceId::parse("trace_0000000000000000000E5").unwrap();
-  assert_eq!(trace.as_str(), "trace_0000000000000000000E5");
+  let trace = TraceId::parse("trace-0000000000000000000e5").unwrap();
+  assert_eq!(trace.as_str(), "trace-0000000000000000000e5");
 
-  let key_operation = KeyOperationId::parse("keyop_0000000000000000000D4").unwrap();
-  assert_eq!(key_operation.as_str(), "keyop_0000000000000000000D4");
+  let key_operation = KeyOperationId::parse("keyop-0000000000000000000d4").unwrap();
+  assert_eq!(key_operation.as_str(), "keyop-0000000000000000000d4");
 
   // Key-handle material is constructed from provider bytes exactly as an
   // external provider passes custody through the facade.
@@ -566,7 +589,7 @@ fn stream_surface_is_externally_constructible() {
   assert_eq!(metadata.get(&key), Some(b"hint-value".as_slice()));
   assert_eq!(metadata.entries().count(), 1);
 
-  let node = NodeId::parse("node_0000000000000000000A1").unwrap();
+  let node = NodeId::parse("node-0000000000000000000a1").unwrap();
   let _exact = StreamTarget::Exact(node.clone());
   let _matching =
     StreamTarget::MatchingNodes(Selector::parse("example.org/labels/lane=one").unwrap());
@@ -673,6 +696,18 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap();
   let expires = issued.expires_at();
   let _ = expires;
+
+  // Non-rotating issue hands out the same live generation: concurrent
+  // joins share it, and only Rotate replaces the credential.
+  let reissued: IssuedMergeCredential = issuer
+    .handle
+    .command(radiata::IssueMergeCredential::new())
+    .await
+    .unwrap();
+  assert_eq!(
+    reissued.credential().expose_secret(),
+    issued.credential().expose_secret()
+  );
   let merge: MergeView = merge_with_retry(
     &member.handle,
     &endpoint,
@@ -822,6 +857,31 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     version.digest(),
   );
   let _ = (accepted.name(), accepted.labels());
+
+  // The conditional write constructor drives a real cluster: the exact
+  // observed version conditions the write, and the write wins.
+  let conditional = PutResource::with_expected(
+    ResourceWrite::new(
+      ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
+      ResourceLabels::new(
+        LabelValue::parse("document").unwrap(),
+        ResourceUri::parse("file:///pub-api-conditional").unwrap(),
+      )
+      .custom(
+        LabelKey::parse("example.org/labels/lane").unwrap(),
+        LabelValue::parse("two").unwrap(),
+      )
+      .unwrap(),
+    ),
+    version.clone(),
+  )
+  .unwrap();
+  let mutation: ResourceMutationView = issuer.handle.command(conditional).await.unwrap();
+  assert!(mutation.is_current_winner());
+  assert_eq!(
+    mutation.accepted().labels().uri().as_str(),
+    "file:///pub-api-conditional"
+  );
 
   let page: ResourcePage = issuer
     .handle

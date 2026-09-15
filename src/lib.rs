@@ -8,9 +8,11 @@
 //! module remains private.
 
 mod api;
+mod audit;
 mod config;
 mod error;
 mod extension_registry;
+mod guide;
 mod hex;
 mod identity;
 mod label;
@@ -63,8 +65,8 @@ pub use node::{
 pub use operation::{
   ApplyReceiptRetention, CleanupNode, Command, ConnectMember, DisconnectPeer, Event, GetLocalNode,
   GetMember, GetNodeStatus, GetObservability, GetRecovery, GetResource, GetRoute, IdentityReplaced,
-  IssueCleanupCheckpoint, LeaveCluster, Listen, MemberChanged, MergeCluster, NodeRevoked,
-  PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
+  IssueCleanupCheckpoint, IssueMergeCredential, LeaveCluster, Listen, MemberChanged, MergeCluster,
+  NodeRevoked, PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
   PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResourceChanged,
   ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources,
   SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
@@ -84,7 +86,8 @@ pub use provider::{
 };
 pub use resource::{ResourceLabels, ResourceName, ResourceUri, ResourceVersion};
 pub use routing::{
-  CandidateNodeReader, LoadBalancingPolicy, NextHopView, RouteContext, RouteNextHop, Selector,
+  CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteContext,
+  RouteNextHop, Selector,
 };
 pub use transport::{Endpoint, PageCursor};
 pub use view::{

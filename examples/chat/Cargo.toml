@@ -1,0 +1,46 @@
+[package]
+name = "radiata-chat-node"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Lives outside the radiata workspace on purpose: a customer project.
+[workspace]
+
+# A decentralized chat room built on the radiata library: identities and
+# groups are resources on the metadata plane, direct messages and group
+# messages travel over the routed data channel, and read receipts are a
+# user-driven business flow. This crate is intentionally OUTSIDE the
+# radiata workspace — a customer project depends on the published/path
+# library and brings its own web stack.
+
+[dependencies]
+radiata = { path = "../..", features = ["redb"] }
+
+tokio = { version = "1.53", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "net",
+  "fs",
+  "io-util",
+  "time",
+  "sync",
+] }
+axum = { version = "0.8", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ed25519-dalek = "3.0"
+futures-util = "0.3"
+getrandom = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Forwards the library's audit instrumentation (semantic path events the
+# scenario fuzz harness parses from container logs). Off by default: the
+# deterministic e2e does not need it.
+audit = ["radiata/audit"]
+
+[profile.release]
+strip = true

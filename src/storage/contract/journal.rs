@@ -792,3 +792,159 @@ async fn identity_records_journaled_cleanup_unknown_stays_exact_and_restart_retr
     );
   }
 }
+
+/// The concurrent same-generation merge defect found during the P2-3
+/// acceptance run, at the storage layer: a same-purpose journal residue
+/// resolved by one flow must stay resolvable for every later flow on the
+/// same ready store — the resolution reads durable evidence idempotently
+/// instead of parking on the ready-state refusal and failing with
+/// NotReady after the full entry-wait bound.
+#[tokio::test]
+async fn identity_records_same_purpose_journal_residue_resolves_twice_from_evidence() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(870)));
+  let factory: Arc<dyn StorageFactory> = Arc::clone(&reference) as _;
+  let store = MetadataStore::open_with_clock(&factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+
+  // Flow A leaves its journal residue behind: the transaction commits
+  // atomically with the pending record, and the cleanup never runs.
+  let prepared = prepare_journaled_owner_put(&store, 430).await;
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+
+  // The recovery resolutions are idempotent evidence reads: both return
+  // committed, neither parks on the ready-state refusal, and both stay
+  // well under the old code's 5-second ready-refusal timeout.
+  let started = std::time::Instant::now();
+  assert!(
+    store
+      .resolve_pending_journal(JOURNAL_PURPOSE)
+      .await
+      .unwrap()
+  );
+  assert!(
+    store
+      .resolve_pending_journal(JOURNAL_PURPOSE)
+      .await
+      .unwrap()
+  );
+  assert!(started.elapsed() < Duration::from_secs(2));
+  assert!(!store.is_blocked().unwrap());
+
+  // The residue cleanup removes the pending record; a third resolution
+  // reports nothing to recover, and the business record is live.
+  let operation = contract_transaction_id(431);
+  assert!(matches!(
+    store
+      .cleanup_pending(JOURNAL_PURPOSE, operation)
+      .await
+      .unwrap(),
+    PendingCleanupOutcome::Applied(_) | PendingCleanupOutcome::Absent
+  ));
+  assert!(
+    !store
+      .resolve_pending_journal(JOURNAL_PURPOSE)
+      .await
+      .unwrap()
+  );
+  let (owner_namespace, owner_key) = owner_record_key();
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&owner_namespace, &owner_key)
+      .await
+      .unwrap()
+      .is_some()
+  );
+}
+
+/// A ready store has no in-doubt commit: the reconcile refusal is
+/// semantic and must surface immediately instead of parking for the
+/// full entry-wait bound.
+#[tokio::test]
+async fn reconcile_on_a_ready_store_fails_immediately() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(875)));
+  let factory: Arc<dyn StorageFactory> = Arc::clone(&reference) as _;
+  let store = MetadataStore::open_with_clock(&factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+  let started = std::time::Instant::now();
+  let error = store.reconcile().await.unwrap_err();
+  assert_eq!(error.kind(), crate::ErrorKind::NotReady);
+  assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// Concurrent same-purpose journal flows serialize through the writer
+/// permit: exactly one business commit lands, the others classify as
+/// definitively not-applied, no flow observes a ready-state reconcile
+/// refusal, and the slot ends ready with the journal cleaned.
+#[tokio::test]
+async fn concurrent_same_purpose_journal_flows_serialize_without_not_ready() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(885)));
+  let factory: Arc<dyn StorageFactory> = Arc::clone(&reference) as _;
+  let store = Arc::new(
+    MetadataStore::open_with_clock(&factory, Duration::from_secs(10), clock)
+      .await
+      .unwrap(),
+  );
+
+  let flows = 8_u16;
+  let results = futures_util::future::join_all((0..flows).map(|offset| {
+    let store = Arc::clone(&store);
+    async move {
+      let _permit = store.write_permit().await;
+      store
+        .resolve_pending_journal(JOURNAL_PURPOSE)
+        .await
+        .map_err(|_| crate::Error::conflict("stage-resolve"))?;
+      let prepared = prepare_journaled_owner_put(&store, 440 + offset).await;
+      let outcome = store
+        .commit(prepared)
+        .await
+        .map_err(|_| crate::Error::conflict("stage-commit"))?;
+      match outcome {
+        CommitOutcome::Committed(_) => {}
+        CommitOutcome::Conflict | CommitOutcome::Aborted => {}
+        CommitOutcome::Unknown { .. } => {
+          return Err(crate::Error::conflict("unexpected unknown outcome"));
+        }
+      }
+      store
+        .cleanup_pending(JOURNAL_PURPOSE, contract_transaction_id(450 + offset))
+        .await
+        .map_err(|_| crate::Error::conflict("stage-cleanup"))?;
+      Ok(())
+    }
+  }))
+  .await;
+  for (offset, result) in results.into_iter().enumerate() {
+    if let Err(error) = result {
+      panic!("flow {offset} failed: {error:?}");
+    }
+  }
+
+  // Every flow either landed its business record or lost it to the
+  // exact-version conflict; the journal is cleaned and the slot ready.
+  assert!(!store.is_blocked().unwrap());
+  assert!(
+    !store
+      .resolve_pending_journal(JOURNAL_PURPOSE)
+      .await
+      .unwrap()
+  );
+  let (owner_namespace, owner_key) = owner_record_key();
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&owner_namespace, &owner_key)
+      .await
+      .unwrap()
+      .is_some()
+  );
+}

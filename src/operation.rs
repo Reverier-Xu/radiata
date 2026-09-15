@@ -51,6 +51,28 @@ impl Command for RotateMergeCredential {
   type Output = crate::IssuedMergeCredential;
 }
 
+/// Issues the current live join credential generation without rotating
+/// it: the returned credential admits any number of joins until the
+/// generation is rotated or expires (ten minutes), so concurrent joins
+/// share one generation. With no live generation, one is created.
+/// [`RotateMergeCredential`] remains the revocation/upgrade step.
+pub struct IssueMergeCredential {
+  _private: (),
+}
+
+#[allow(clippy::new_without_default)]
+impl IssueMergeCredential {
+  pub fn new() -> Self {
+    Self { _private: () }
+  }
+}
+
+impl private::Sealed for IssueMergeCredential {}
+
+impl Command for IssueMergeCredential {
+  type Output = crate::IssuedMergeCredential;
+}
+
 pub struct Listen {
   endpoint: Endpoint,
 }
@@ -415,6 +437,7 @@ impl ResourceWrite {
 /// whether it is the current winner.
 pub struct PutResource {
   write: ResourceWrite,
+  expected: Option<crate::ResourceVersion>,
 }
 
 impl PutResource {
@@ -423,11 +446,29 @@ impl PutResource {
   /// rejected here, before any signing or storage work.
   pub fn new(record: ResourceWrite) -> crate::Result<Self> {
     crate::resource::check_write_shape(record.name(), record.labels())?;
-    Ok(Self { write: record })
+    Ok(Self {
+      write: record,
+      expected: None,
+    })
   }
 
-  pub(crate) fn into_write(self) -> ResourceWrite {
-    self.write
+  /// Conditional write (CAS): the candidate commits only when the stored
+  /// winner still equals `expected` exactly, so a raced read-modify-write
+  /// surfaces as an explicit [`crate::ErrorKind::Conflict`] instead of a
+  /// silently lost update. Without the precondition the register stays
+  /// last-writer-wins (accepted candidates may lose the tuple quietly).
+  pub fn with_expected(
+    record: ResourceWrite, expected: crate::ResourceVersion,
+  ) -> crate::Result<Self> {
+    crate::resource::check_write_shape(record.name(), record.labels())?;
+    Ok(Self {
+      write: record,
+      expected: Some(expected),
+    })
+  }
+
+  pub(crate) fn into_parts(self) -> (ResourceWrite, Option<crate::ResourceVersion>) {
+    (self.write, self.expected)
   }
 }
 

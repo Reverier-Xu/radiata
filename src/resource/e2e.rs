@@ -29,11 +29,11 @@ const RECORD_SEED: [u8; 32] = [51; 32];
 const SECOND_SEED: [u8; 32] = [53; 32];
 
 fn writer_a() -> NodeId {
-  NodeId::parse("node_000000000000000000001").unwrap()
+  NodeId::parse("node-000000000000000000001").unwrap()
 }
 
 fn writer_b() -> NodeId {
-  NodeId::parse("node_000000000000000000002").unwrap()
+  NodeId::parse("node-000000000000000000002").unwrap()
 }
 
 fn name(seed: u8) -> ResourceName {
@@ -173,14 +173,14 @@ async fn eight_plus_eight_components_merge_by_revision_and_tuple() {
   // while partitioned; the shared record is bumped only on side B.
   let mut a_nodes = Vec::new();
   for index in 1..=8_u8 {
-    let node = NodeId::parse(&format!("node_a{index:020}")).unwrap();
+    let node = NodeId::parse(&format!("node-a{index:020}")).unwrap();
     put_descriptor(&side_a, &descriptor(&node, 1, [1_u8; 32])).await;
     put_descriptor(&side_b, &descriptor(&node, 1, [1_u8; 32])).await;
     a_nodes.push(node);
   }
   put_descriptor(&side_a, &descriptor(&a_nodes[1], 2, [1_u8; 32])).await;
   put_descriptor(&side_b, &descriptor(&a_nodes[2], 2, [1_u8; 32])).await;
-  let shared = NodeId::parse("node_000000000000000000009").unwrap();
+  let shared = NodeId::parse("node-000000000000000000009").unwrap();
   put_descriptor(&side_a, &descriptor(&shared, 1, [2_u8; 32])).await;
   put_descriptor(&side_b, &descriptor(&shared, 1, [2_u8; 32])).await;
   put_descriptor(&side_b, &descriptor(&shared, 2, [2_u8; 32])).await;
@@ -297,15 +297,15 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
   // cross-side signature validation passes and true convergence is
   // exercised. The two dedicated writers sit beyond the 1,024 profile
   // range so the seeding below cannot collide with them.
-  let bulk_writer_a = NodeId::parse("node_000000000000000001024").unwrap();
-  let bulk_writer_b = NodeId::parse("node_000000000000000001025").unwrap();
+  let bulk_writer_a = NodeId::parse("node-000000000000000001024").unwrap();
+  let bulk_writer_b = NodeId::parse("node-000000000000000001025").unwrap();
   put_descriptor(&side_a, &descriptor(&bulk_writer_a, 1, RECORD_SEED)).await;
   put_descriptor(&side_b, &descriptor(&bulk_writer_a, 1, RECORD_SEED)).await;
   put_descriptor(&side_a, &descriptor(&bulk_writer_b, 1, SECOND_SEED)).await;
   put_descriptor(&side_b, &descriptor(&bulk_writer_b, 1, SECOND_SEED)).await;
 
   for index in 0..1_024_u32 {
-    let node = NodeId::parse(&format!("node_{index:021}")).unwrap();
+    let node = NodeId::parse(&format!("node-{index:021}")).unwrap();
     put_descriptor(&side_a, &descriptor(&node, 1, [3_u8; 32])).await;
     put_descriptor(&side_b, &descriptor(&node, 1, [3_u8; 32])).await;
     // A few conflicting resource tuples per name shape across the two
@@ -316,7 +316,7 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
         &resource(
           &name(u8::try_from(index % 251).unwrap()),
           u64::from(index),
-          &NodeId::parse("node_000000000000000001024").unwrap(),
+          &NodeId::parse("node-000000000000000001024").unwrap(),
           "u://a",
           RECORD_SEED,
         ),
@@ -328,7 +328,7 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
         &resource(
           &name(u8::try_from(index % 251).unwrap()),
           u64::from(index),
-          &NodeId::parse("node_000000000000000001025").unwrap(),
+          &NodeId::parse("node-000000000000000001025").unwrap(),
           "u://b",
           SECOND_SEED,
         ),
@@ -341,11 +341,11 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
   // for population size. Each side bumps half the node records while
   // partitioned so healing has revision changes to merge.
   for index in (0..1_024_u32).step_by(2) {
-    let node = NodeId::parse(&format!("node_{index:021}")).unwrap();
+    let node = NodeId::parse(&format!("node-{index:021}")).unwrap();
     put_descriptor(&side_a, &descriptor(&node, 2, [3_u8; 32])).await;
   }
   for index in (1..1_024_u32).step_by(2) {
-    let node = NodeId::parse(&format!("node_{index:021}")).unwrap();
+    let node = NodeId::parse(&format!("node-{index:021}")).unwrap();
     put_descriptor(&side_b, &descriptor(&node, 2, [3_u8; 32])).await;
   }
   let started = std::time::Instant::now();

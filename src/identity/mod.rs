@@ -17,6 +17,6 @@ pub(crate) mod trust;
 mod value;
 
 pub use credential::{IssuedMergeCredential, MergeCredential};
+pub(crate) use id::validate_id;
 pub use id::{ListenerId, NodeId, OperationId, SessionId, TraceId, TransactionId};
-pub(crate) use id::{random_base62_suffix, validate_id};
 pub use value::{Digest, PublicKey, Signature};

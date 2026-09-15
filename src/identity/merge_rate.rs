@@ -47,16 +47,10 @@ impl MergeSource {
   pub(crate) fn normalize(address: SocketAddr) -> Self {
     match address.ip() {
       IpAddr::V4(v4) => Self::V4(v4.octets()),
-      IpAddr::V6(v6) => {
-        let octets = v6.octets();
-        if octets[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF] {
-          let mut v4 = [0_u8; 4];
-          v4.copy_from_slice(&octets[12..]);
-          Self::V4(v4)
-        } else {
-          Self::V6(octets)
-        }
-      }
+      IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        Some(v4) => Self::V4(v4.octets()),
+        None => Self::V6(v6.octets()),
+      },
     }
   }
 }

@@ -20,7 +20,6 @@ use std::sync::Arc;
 use crate::{
   BoxFuture, CommitOutcome, Digest, Error, Result, StoreExpectation, StoreKey, StoreNamespace,
   StoreOperation, StoreTransaction, StoreValue, TransactionId,
-  identity::id::encode_base62_suffix,
   provider::{Storage, StoreSnapshot},
   storage::families::SCHEMA_NAMESPACE,
 };
@@ -226,13 +225,10 @@ impl MigrationRegistry {
   /// same edge hits the idempotent receipt path while any other
   /// transaction cannot collide with it.
   pub(super) fn edge_transaction_id(edge: &MigrationEdge) -> Result<TransactionId> {
-    TransactionId::parse(&format!(
-      "txn_{}",
-      encode_base62_suffix(migration_transaction_value(&[
-        edge.tag.as_bytes(),
-        edge.digest.as_bytes()
-      ])?)?
-    ))
+    TransactionId::parse(&crate::identity::id::prefixed_id(
+      "txn",
+      migration_transaction_value(&[edge.tag.as_bytes(), edge.digest.as_bytes()])?,
+    )?)
   }
 
   async fn schema_record_operation(
@@ -255,7 +251,7 @@ impl MigrationRegistry {
       Self::schema_record_operation(&*snapshot, BASE_RECORD_KIND, self.base, None).await?;
     let value = migration_transaction_value(&[self.base.as_bytes()])?;
     let transaction = StoreTransaction::new(
-      TransactionId::parse(&format!("txn_{}", encode_base62_suffix(value)?))?,
+      TransactionId::parse(&crate::identity::id::prefixed_id("txn", value)?)?,
       snapshot.revision().clone(),
       vec![operation],
     )?;

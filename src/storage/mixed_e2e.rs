@@ -52,7 +52,7 @@ fn logical_families() -> Vec<crate::storage::families::MetadataFamily> {
 }
 
 fn writer(seed: u8) -> NodeId {
-  NodeId::parse(&format!("node_{seed:021}")).unwrap()
+  NodeId::parse(&format!("node-{seed:021}")).unwrap()
 }
 
 fn descriptor(node: &NodeId, revision: u64, seed: [u8; 32]) -> NodeDescriptorV1 {

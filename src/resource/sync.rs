@@ -15,13 +15,14 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::page::{ResourcePage, sync as page_sync};
 use crate::{
-  Error, IncomingStream, NodeId, ProtocolTag, Result,
+  Digest, Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::BoxFuture,
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::lifecycle::LocalIdentityContext,
   protocol::{decode_canonical_strict, encode_canonical},
   runtime::RuntimeClient,
   session::stream::SessionTable,
+  sync_common::delivered_within_bound,
 };
 
 /// The canonical protocol tag of the resource sync stream.
@@ -131,19 +132,119 @@ pub(crate) fn resource_sync_protocol_definition() -> Result<ProtocolDefinition> 
 /// first tick without any global state churn.
 #[derive(Debug, Default)]
 pub(crate) struct ResourceSyncCursors {
-  peers: std::collections::BTreeMap<NodeId, crate::sync_common::PeerPageCursor>,
+  peers: std::collections::BTreeMap<NodeId, ResourcePeerState>,
 }
 
-/// One resource anti-entropy step: for every alive peer, page the local
-/// register from that peer's own cursor and push the bounded page over
-/// the peer's session. The per-peer continuation state (fingerprint,
-/// resend cadences, cursor) is the shared [`crate::sync_common::
-/// PeerPageCursor`]. Per-peer cursors mean a peer that was unreachable
-/// during a round is caught up in full when its session returns, and a
-/// periodic from-scratch pass bounds how long a payload lost mid-flight
-/// can stay missing. Steady state with an unchanged catalog sends nothing
-/// (the per-peer fingerprint matches), and everything is idempotent on
-/// the receiver (digest-checked application).
+/// The per-peer resource sync state: the filtered-walk cursor plus the
+/// bounded delivered-version watermark table. The cursor is the walk
+/// boundary — the last scanned entry's key while a pass is in flight —
+/// so a delivered page resumes the walk exactly where its budget window
+/// ended, and an undelivered one rewinds to its scan start; `None` means
+/// the pass is complete and the next one starts from scratch.
+///
+/// The watermark table is in memory only: a process restart clears it,
+/// and the next pass re-delivers the whole catalog (idempotent on the
+/// receiver). Overflowing the table cap clears it for the same reason:
+/// bounded memory over bounded re-delivery.
+#[derive(Debug)]
+pub(crate) struct ResourcePeerState {
+  /// The walk boundary: the last scanned entry's key while a detection
+  /// pass is in flight; `None` means the pass is complete and the next
+  /// one starts from scratch.
+  cursor: Option<Vec<u8>>,
+  /// The scan position where the in-flight page started: an undelivered
+  /// page rewinds to exactly here.
+  scan_start: Option<Vec<u8>>,
+  /// Last delivered record digest per store key (bounded by
+  /// [`WATERMARK_TABLE_CAP`]).
+  watermarks: std::collections::BTreeMap<Vec<u8>, Digest>,
+  /// Ticks since this peer's last pass ran (delivery or empty
+  /// detection). Starts at the cadence threshold: a freshly discovered
+  /// peer is immediately due its first detection pass.
+  ticks_since_pass: u32,
+  /// Completed detection passes since the watermark table was last
+  /// refreshed (see [`WATERMARK_REFRESH_PASSES`]).
+  passes_since_refresh: u32,
+}
+
+impl Default for ResourcePeerState {
+  fn default() -> Self {
+    Self {
+      cursor: None,
+      scan_start: None,
+      watermarks: std::collections::BTreeMap::new(),
+      ticks_since_pass: DETECTION_CADENCE_TICKS,
+      passes_since_refresh: 0,
+    }
+  }
+}
+
+/// Entries per peer watermark table before it resets to full
+/// re-delivery: bounds the in-memory table while keeping whole-catalog
+/// watermarks for every realistic catalog size.
+const WATERMARK_TABLE_CAP: usize = 8_192;
+
+/// Completed detection passes between watermark-table refreshes: each
+/// refresh clears the table once, so the next pass re-delivers the whole
+/// catalog. This bounds how long any admission-versus-application
+/// divergence — a page the destination admitted but skipped applying —
+/// can stay unrepaired, restoring the from-scratch liveness bound the
+/// fingerprint design provided.
+const WATERMARK_REFRESH_PASSES: u32 = 64;
+
+/// Quiet ticks between detection passes: a mid-catalog write is
+/// detected within one cadence window and delivered as one page.
+pub(crate) const DETECTION_CADENCE_TICKS: u32 = 32;
+
+/// Store entries scanned per tick while a pass is in flight: bounds the
+/// per-tick decode cost and the walk amortizes across ticks.
+const SCAN_BUDGET_PER_TICK: usize = 256;
+
+/// The outcome of one per-peer resource round: the admission ack (when
+/// a page was dispatched) plus the verdict-gated state commit it
+/// carries.
+struct ResourcePeerRound {
+  ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  commit_cursor: Option<Vec<u8>>,
+  rewind_cursor: Option<Vec<u8>>,
+  marks: Vec<(Vec<u8>, Digest)>,
+}
+
+impl ResourcePeerRound {
+  /// Commits a delivered page: the walk cursor advances to the step's
+  /// boundary (past every scanned entry) and the page's records enter
+  /// the peer's watermark table (bounded; overflow resets the table so
+  /// the next pass re-delivers the full catalog).
+  fn commit_delivered(&self, state: &mut ResourcePeerState) {
+    state.cursor = self.commit_cursor.clone();
+    state.scan_start = None;
+    if state.watermarks.len() + self.marks.len() > WATERMARK_TABLE_CAP {
+      state.watermarks.clear();
+    }
+    state.watermarks.extend(self.marks.iter().cloned());
+    state.ticks_since_pass = 0;
+  }
+
+  /// Rewinds an undelivered page to its scan start so the next tick
+  /// re-collects exactly the same changed records (watermark entries
+  /// were never committed).
+  fn rewind(&self, state: &mut ResourcePeerState) {
+    state.cursor = self.rewind_cursor.clone();
+    state.scan_start = None;
+  }
+}
+
+/// One resource anti-entropy step: for every alive peer, run one
+/// watermark-filtered detection step from that peer's own walk cursor
+/// and push the bounded changed-records page over the peer's session.
+/// The per-peer continuation state is the watermark table plus the walk
+/// cursor ([`ResourcePeerState`]). A peer that was unreachable during a
+/// round is caught up in full when its session returns (its state is
+/// dropped), and a periodic detection pass bounds how long a payload
+/// lost mid-flight can stay missing. Steady state with an unchanged
+/// catalog sends nothing (every stored digest matches the peer's
+/// watermark), and everything is idempotent on the receiver
+/// (digest-checked application).
 pub(crate) async fn resource_sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn crate::api::Entropy>,
   sessions: &SessionTable, runtime: &RuntimeClient, cursors: &mut ResourceSyncCursors,
@@ -160,9 +261,35 @@ pub(crate) async fn resource_sync_tick(
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
   let protocol = ProtocolTag::parse(RESOURCE_SYNC_PROTOCOL)?;
+  let mut pending: Vec<(NodeId, ResourcePeerRound)> = Vec::new();
+  let mut acks = Vec::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
-    resource_sync_tick_peer(store, entropy, runtime, peer, state, &protocol).await?;
+    let mut round =
+      resource_sync_tick_peer(store, entropy, runtime, peer, state, &protocol).await?;
+    if let Some(ack) = round.ack.take() {
+      pending.push((peer.clone(), round));
+      acks.push(ack);
+    }
+  }
+  // Delivery verdicts resolve concurrently: one unreachable peer must
+  // not serialize the round behind its ack wait (that would make the
+  // convergence bound liveness teardown, not the anti-entropy cadence).
+  let verdicts = futures_util::future::join_all(
+    acks
+      .into_iter()
+      .map(|ack| async move { delivered_within_bound(ack).await }),
+  )
+  .await;
+  for ((peer, round), delivered) in pending.drain(..).zip(verdicts) {
+    if let Some(state) = cursors.peers.get_mut(&peer) {
+      if delivered {
+        round.commit_delivered(state);
+      } else {
+        crate::audit::resource_page_rewound(peer.as_str());
+        round.rewind(state);
+      }
+    }
   }
   Ok(())
 }
@@ -174,34 +301,62 @@ pub(crate) async fn resource_sync_tick(
 /// to one full-sync window.
 async fn resource_sync_tick_peer(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn crate::api::Entropy>,
-  runtime: &RuntimeClient, peer: &NodeId, state: &mut crate::sync_common::PeerPageCursor,
-  protocol: &ProtocolTag,
-) -> Result<()> {
-  state.arm_full_pass();
-  // This peer's next page range fingerprint: the quiet state pays one
-  // scan and one hash and skips the emit entirely. The page-round
-  // decision records the fingerprint on from-scratch rounds only.
-  let page_fp = page_sync::page_fingerprint_ctx(
-    store,
-    state.continuation(),
-    super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
-  )
-  .await?;
-  if state.page_round(page_fp) == crate::sync_common::PageRound::Quiet {
-    state.quiet_tick();
-    return Ok(());
+  runtime: &RuntimeClient, peer: &NodeId, state: &mut ResourcePeerState, protocol: &ProtocolTag,
+) -> Result<ResourcePeerRound> {
+  // Pass due: a walk in flight, or the detection cadence elapsed.
+  let pass_due = state.cursor.is_some() || state.ticks_since_pass >= DETECTION_CADENCE_TICKS;
+  if !pass_due {
+    state.ticks_since_pass = state.ticks_since_pass.saturating_add(1);
+    return Ok(ResourcePeerRound {
+      ack: None,
+      commit_cursor: None,
+      rewind_cursor: None,
+      marks: Vec::new(),
+    });
   }
-  let page = page_sync::emit_page_ctx(
+  let emission = page_sync::emit_page_filtered_ctx(
     store,
-    state.continuation(),
+    state.cursor.as_deref(),
     super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
+    SCAN_BUDGET_PER_TICK,
+    &state.watermarks,
   )
   .await?;
+  state.ticks_since_pass = 0;
+  let Some(page) = &emission.page else {
+    // Nothing to deliver in this step: either the scan reached the
+    // catalog end (the pass completes, the cadence restarts, and the
+    // refresh counter advances) or a budget window closed change-free
+    // mid-catalog (the pass continues from its boundary next tick —
+    // closing there would strand every record behind the window until
+    // the peer's state resets).
+    if emission.walk_cursor.is_none() {
+      state.passes_since_refresh = state.passes_since_refresh.saturating_add(1);
+      if state.passes_since_refresh >= WATERMARK_REFRESH_PASSES {
+        state.passes_since_refresh = 0;
+        state.watermarks.clear();
+        crate::audit::resource_watermarks_refreshed(peer.as_str());
+      }
+    }
+    crate::audit::resource_pass_settled(peer.as_str(), emission.walk_cursor.is_some());
+    state.cursor = emission.walk_cursor.clone();
+    state.scan_start = None;
+    return Ok(ResourcePeerRound {
+      ack: None,
+      commit_cursor: None,
+      rewind_cursor: None,
+      marks: Vec::new(),
+    });
+  };
   tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
-  state.record_send(page.cursor());
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
-  let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes).await;
-  Ok(())
+  let ack = crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes)?;
+  Ok(ResourcePeerRound {
+    ack: Some(ack),
+    commit_cursor: emission.walk_cursor.clone(),
+    rewind_cursor: emission.scan_start.clone(),
+    marks: emission.marks,
+  })
 }
 
 #[cfg(test)]
@@ -211,9 +366,12 @@ mod tests {
   use ed25519_dalek::SigningKey;
   use futures_util::StreamExt as _;
 
-  use super::{ResourceSyncCursors, ResourceSyncPayload, resource_sync_tick_peer};
+  use super::{
+    DETECTION_CADENCE_TICKS, ResourceSyncCursors, ResourceSyncPayload, delivered_within_bound,
+    resource_sync_tick_peer,
+  };
   use crate::{
-    LabelValue, NodeId,
+    LabelValue, NodeId, ProtocolTag,
     api::SystemEntropy,
     resource::page::ResourcePage,
     runtime::RuntimeClient,
@@ -221,7 +379,7 @@ mod tests {
   };
 
   fn node(seed: u64) -> NodeId {
-    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+    NodeId::parse(&format!("node-{seed:021}")).unwrap()
   }
 
   fn record(name: &str, timestamp: u64) -> crate::resource::ResourceRecordV1 {
@@ -288,35 +446,78 @@ mod tests {
     sessions.lock().unwrap().insert(node(2), entry);
   }
 
-  async fn payload_names(
-    rx: &mut tokio::sync::mpsc::Receiver<crate::packet::OutboundRequest>,
-  ) -> Vec<String> {
-    let mut request = rx.recv().await.expect("dispatched payload");
-    let mut bytes = Vec::new();
-    while let Some(chunk) = request.body.as_mut().next().await {
-      bytes.extend_from_slice(&chunk.unwrap());
+  /// Drains dispatched payloads like a live destination: records each
+  /// delivered page's record names BEFORE admitting it (so an observed
+  /// ack implies the page is recorded, like a durable admission), then
+  /// resolves the admission ack exactly as a live session would. A
+  /// payload that fails to decode is a harness bug and panics the
+  /// drainer task (fail loud, never silent loss).
+  fn ack_drainer(
+    mut rx: tokio::sync::mpsc::Receiver<crate::packet::OutboundRequest>,
+    delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+  ) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+      while let Some(mut request) = rx.recv().await {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = request.body.as_mut().next().await {
+          bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let page = ResourceSyncPayload::decode(&bytes)
+          .and_then(|payload| payload.page())
+          .unwrap();
+        delivered.lock().unwrap().push(
+          page
+            .records()
+            .iter()
+            .map(|record| record.name().as_str().to_owned())
+            .collect(),
+        );
+        let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
+          by: node(2),
+          admitted_at: std::time::SystemTime::now(),
+        }));
+      }
+    })
+  }
+
+  /// Drives one peer round exactly as the production aggregator does:
+  /// awaits the admission ack within the delivery bound and commits the
+  /// round's verdict-gated state (cursor + watermarks) only on
+  /// delivery. Awaiting the ack is also the real scheduling point that
+  /// lets the drainer task run.
+  async fn tick_delivered(
+    store: &crate::storage::MetadataStore, entropy: &Arc<dyn crate::api::Entropy>,
+    runtime: &RuntimeClient, peer: &NodeId, cursors: &mut ResourceSyncCursors,
+    protocol: &ProtocolTag,
+  ) {
+    let state = cursors.peers.entry(peer.clone()).or_default();
+    let mut round = resource_sync_tick_peer(store, entropy, runtime, peer, state, protocol)
+      .await
+      .unwrap();
+    if let Some(ack) = round.ack.take() {
+      if delivered_within_bound(ack).await {
+        round.commit_delivered(state);
+      } else {
+        round.rewind(state);
+      }
     }
-    let payload = ResourceSyncPayload::decode(&bytes).unwrap();
-    payload
-      .page()
-      .unwrap()
-      .records()
-      .iter()
-      .map(|record| record.name().as_str().to_owned())
-      .collect()
+    // A quiet round (no page due) carries no verdict to commit.
   }
 
   /// The gap-write convergence contract: a peer whose session drops and
-  /// returns must receive every record written while it was gone on its
-  /// first post-return round, and a steady unchanged catalog dispatches
-  /// nothing at all.
-  #[tokio::test]
+  /// returns must receive every record written while it was gone within
+  /// one detection cadence window, and the delivery lands even though
+  /// the loop's other awaits are memory-only (the production-shaped ack
+  /// wait in `tick_delivered` is the scheduling point).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_peer_that_missed_a_round_receives_gap_writes_on_the_next_full_pass() {
     let store = open_store().await;
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
     let peer = node(2);
     trust(&store, &node(1), [9; 32]).await;
-    let (runtime, mut cursors, sessions, mut rx) = harness();
+    let (runtime, mut cursors, sessions, rx) = harness();
+    let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    ack_drainer(rx, Arc::clone(&delivered));
 
     // Converge one late-key record to the peer first.
     crate::resource::page::sync::apply_page_ctx(
@@ -327,26 +528,24 @@ mod tests {
     .await
     .unwrap();
     seed_peer_session(&sessions, &entropy);
-    {
-      let state = cursors.peers.entry(peer.clone()).or_default();
-      resource_sync_tick_peer(
-        store.as_ref(),
-        &entropy,
-        &runtime,
-        &peer,
-        state,
-        &crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap(),
-      )
-      .await
-      .unwrap();
-    }
-    let names = payload_names(&mut rx).await;
-    assert_eq!(names, vec!["demo.org/resources/z-late".to_owned()]);
+    tick_delivered(
+      store.as_ref(),
+      &entropy,
+      &runtime,
+      &peer,
+      &mut cursors,
+      &crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap(),
+    )
+    .await;
+    assert_eq!(
+      delivered.lock().unwrap()[0],
+      vec!["demo.org/resources/z-late".to_owned()]
+    );
 
     // The peer's session drops; an early-key record is written while it
-    // is gone; the session returns. The per-peer state was dropped with
-    // the session, so the returning round re-delivers from scratch and
-    // the gap write reaches the peer (finding #10 fixed).
+    // is gone; the session returns. Under the watermark design the gap
+    // write is detected by the next detection pass (within the cadence
+    // window) and delivered as one page.
     sessions.lock().unwrap().remove(&peer);
     crate::resource::page::sync::apply_page_ctx(
       &store,
@@ -356,60 +555,128 @@ mod tests {
     .await
     .unwrap();
     seed_peer_session(&sessions, &entropy);
-    {
-      let state = cursors.peers.entry(peer.clone()).or_default();
-      resource_sync_tick_peer(
+    let mut gap_landed = false;
+    for _ in 0..(DETECTION_CADENCE_TICKS + 4) {
+      tick_delivered(
         store.as_ref(),
         &entropy,
         &runtime,
         &peer,
-        state,
+        &mut cursors,
         &crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap(),
       )
-      .await
-      .unwrap();
+      .await;
+      gap_landed = delivered
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|names| names.contains(&"demo.org/resources/a-gap".to_owned()));
+      if gap_landed {
+        break;
+      }
     }
-    let names = payload_names(&mut rx).await;
     assert!(
-      names.contains(&"demo.org/resources/a-gap".to_owned()),
-      "the gap write must reach the returning peer: {names:?}"
+      gap_landed,
+      "the gap write must reach the returning peer within one cadence window"
     );
+  }
 
-    // A steady unchanged catalog dispatches nothing at all.
-    let quiet_before = rx.len();
-    {
-      let state = cursors.peers.entry(peer.clone()).or_default();
-      resource_sync_tick_peer(
-        store.as_ref(),
-        &entropy,
-        &runtime,
-        &peer,
-        state,
-        &crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap(),
+  /// A quiet budget window mid-catalog must continue the pass from its
+  /// boundary on the next tick, never close it: closing would strand
+  /// every record behind the first fully-delivered window until the
+  /// peer's state resets (the convergence bug the watermark walk
+  /// regression fixes).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_quiet_budget_window_continues_the_pass_instead_of_closing_it() {
+    let store = open_store().await;
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
+    let peer = node(2);
+    trust(&store, &node(1), [9; 32]).await;
+    let (runtime, mut cursors, sessions, rx) = harness();
+    let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    ack_drainer(rx, Arc::clone(&delivered));
+    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap();
+
+    // Seed more records than one scan budget (256) covers.
+    let total = 300_usize;
+    let mut seeded = Vec::new();
+    for chunk in (0..total).collect::<Vec<_>>().chunks(16) {
+      let records = chunk
+        .iter()
+        .map(|&index| {
+          let name = format!("demo.org/resources/s-{index:03}");
+          seeded.push(name.clone());
+          record(&name, 1_000 + u64::try_from(index).unwrap())
+        })
+        .collect();
+      crate::resource::page::sync::apply_page_ctx(
+        &store,
+        entropy.as_ref(),
+        &ResourcePage::new(records, None).unwrap(),
       )
       .await
       .unwrap();
     }
-    assert!(
-      rx.try_recv().is_err(),
-      "a steady catalog must not dispatch anything"
+    seed_peer_session(&sessions, &entropy);
+
+    // Deliver the first scan budget's worth of records (16 rounds of 16
+    // records reaches entry 256), then force the walk state back to a
+    // closed pass while the watermarks stay: the exact state a premature
+    // pass close leaves behind.
+    for _ in 0..(super::SCAN_BUDGET_PER_TICK / 16) {
+      tick_delivered(
+        store.as_ref(),
+        &entropy,
+        &runtime,
+        &peer,
+        &mut cursors,
+        &protocol,
+      )
+      .await;
+    }
+    cursors.peers.get_mut(&peer).unwrap().cursor = None;
+
+    // The next pass must walk past the quiet delivered prefix and
+    // deliver the tail within the cadence window.
+    for _ in 0..(DETECTION_CADENCE_TICKS + 8) {
+      tick_delivered(
+        store.as_ref(),
+        &entropy,
+        &runtime,
+        &peer,
+        &mut cursors,
+        &protocol,
+      )
+      .await;
+    }
+    let mut delivered_names = Vec::new();
+    for page in delivered.lock().unwrap().drain(..) {
+      delivered_names.extend(page);
+    }
+    delivered_names.sort();
+    seeded.sort();
+    assert_eq!(
+      delivered_names, seeded,
+      "every record must reach the peer despite the quiet delivered prefix"
     );
-    let _ = quiet_before;
   }
 
   /// A catalog larger than one page must still reach the steady quiet
-  /// state: the recorded per-peer fingerprint is the from-scratch range,
-  /// so after the pass completes the next from-scratch round matches and
-  /// dispatches nothing (a tail-range fingerprint recorded on a
-  /// continuation round would make a multi-page catalog resend in full
-  /// every tick, never going quiet).
-  #[tokio::test]
+  /// state: each committed page advances the walk cursor past its last
+  /// changed record, so the pass drains in ceil(total / limit)
+  /// dispatches, the empty detection page closes the pass, and every
+  /// subsequent round is quiet (re-scanning unchanged records dispatches
+  /// nothing). A continuation round that forgot its own progress would
+  /// re-dispatch the tail forever and never go quiet.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_multi_page_catalog_goes_quiet_once_the_pass_completes() {
     let store = open_store().await;
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
     let peer = node(2);
     trust(&store, &node(1), [9; 32]).await;
-    let (runtime, mut cursors, sessions, mut rx) = harness();
+    let (runtime, mut cursors, sessions, rx) = harness();
+    let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    ack_drainer(rx, Arc::clone(&delivered));
     let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/resource-sync").unwrap();
 
     // Seed more than one page of records (the default page carries 16).
@@ -433,44 +700,35 @@ mod tests {
     seed_peer_session(&sessions, &entropy);
 
     // Drive the pass to completion: one dispatch per tick until the
-    // cursor drains (ceil(total / limit) dispatches), then silence.
-    let mut requests = Vec::new();
+    // cursor drains (ceil(total / limit) dispatches) and the empty
+    // detection page closes the pass, then silence. Every dispatch
+    // round awaits its ack inside `tick_delivered`, so each page is
+    // recorded before the round returns — the final count is
+    // deterministic without extra waiting.
     for _ in 0..(total + 2) {
-      {
-        let state = cursors.peers.entry(peer.clone()).or_default();
-        resource_sync_tick_peer(store.as_ref(), &entropy, &runtime, &peer, state, &protocol)
-          .await
-          .unwrap();
-      }
-      if let Ok(request) = rx.try_recv() {
-        requests.push(request);
-      }
+      tick_delivered(
+        store.as_ref(),
+        &entropy,
+        &runtime,
+        &peer,
+        &mut cursors,
+        &protocol,
+      )
+      .await;
     }
     let expected_passes = total.div_ceil(super::super::page::DEFAULT_RESOURCE_PAGE_LIMIT);
     assert_eq!(
-      requests.len(),
+      delivered.lock().unwrap().len(),
       expected_passes,
       "the pass must deliver each page exactly once, then go quiet"
     );
     // The final dispatches carried the whole seeded catalog.
-    let mut delivered = Vec::new();
-    for mut request in requests {
-      let mut bytes = Vec::new();
-      while let Some(chunk) = request.body.as_mut().next().await {
-        bytes.extend_from_slice(&chunk.unwrap());
-      }
-      let payload = ResourceSyncPayload::decode(&bytes).unwrap();
-      delivered.extend(
-        payload
-          .page()
-          .unwrap()
-          .records()
-          .iter()
-          .map(|record| record.name().as_str().to_owned()),
-      );
+    let mut delivered_names = Vec::new();
+    for page in delivered.lock().unwrap().drain(..) {
+      delivered_names.extend(page);
     }
-    delivered.sort();
+    delivered_names.sort();
     seeded.sort();
-    assert_eq!(delivered, seeded, "every record must reach the peer");
+    assert_eq!(delivered_names, seeded, "every record must reach the peer");
   }
 }

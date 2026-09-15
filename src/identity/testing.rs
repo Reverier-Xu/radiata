@@ -31,9 +31,9 @@ use crate::{
 pub(crate) const RETENTION: Duration = Duration::from_secs(3_600);
 pub(crate) use crate::storage::pending::PENDING_NAMESPACE;
 
-/// Deterministic entropy: fills produce base62 suffix values 1, 2, 3, ...;
-/// every test uses fewer than ten fills per id, so decimal zero-padding
-/// matches base62 encoding.
+/// Deterministic entropy: fills produce lowercase base-36 suffix values
+/// 1, 2, 3, ...; every test uses fewer than ten fills per id, so decimal
+/// zero-padding matches the encoding.
 #[derive(Debug, Default)]
 pub(crate) struct SequenceEntropy(Mutex<u128>);
 
@@ -53,7 +53,8 @@ impl SequenceEntropy {
 impl Entropy for SequenceEntropy {
   fn fill(&self, output: &mut [u8]) -> Result<()> {
     // Deterministic per-call sequence: each fill draws sequential 16-byte
-    // blocks, so 16- and 32-byte requests both remain deterministic.
+    // blocks right-aligned into the output, so 14-, 16-, and 32-byte
+    // requests all observe the same low-order counter values.
     let mut offset = 0;
     while offset < output.len() {
       let mut next = self.0.lock().unwrap();
@@ -63,7 +64,7 @@ impl Entropy for SequenceEntropy {
       let block = next.to_be_bytes();
       drop(next);
       let take = (output.len() - offset).min(16);
-      output[offset..offset + take].copy_from_slice(&block[..take]);
+      output[offset..offset + take].copy_from_slice(&block[16 - take..]);
       offset += take;
     }
     Ok(())
@@ -661,12 +662,12 @@ pub(crate) async fn open_context(
 }
 
 pub(crate) fn node(value: u128) -> NodeId {
-  NodeId::parse(&format!("node_{value:021}")).unwrap()
+  NodeId::parse(&format!("node-{value:021}")).unwrap()
 }
 
 #[allow(dead_code)]
 pub(crate) fn transaction(value: u128) -> TransactionId {
-  TransactionId::parse(&format!("txn_{value:021}")).unwrap()
+  TransactionId::parse(&format!("txn-{value:021}")).unwrap()
 }
 
 pub(crate) fn namespace(tag: &str) -> StoreNamespace {

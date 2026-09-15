@@ -3,10 +3,12 @@
 //! The handshake validates credential and identity proofs before calling
 //! this layer. This layer never sees credentials, proofs, exporters,
 //! transcripts, or private material. One journaled transaction commits the
-//! immutable subject `IdentityBinding`, the unique `CredentialUse`, and the
-//! issuer-signed `MergeGrant`, so one issuer credential generation can ever
-//! commit at most one subject (one merge credential authorizes one
-//! authenticated session between two nodes).
+//! immutable subject `IdentityBinding`, the subject-scoped `CredentialUse`,
+//! and the issuer-signed `MergeGrant`: replaying the identical triple is
+//! idempotent, re-admission of the same (generation, subject) pair returns
+//! the existing grant, and one generation may admit any number of distinct
+//! subjects within its lifetime. Conflicting reuse (another key for the
+//! same subject, or another subject for the same merge ID) fails closed.
 //!
 //! Merge is a binding-set union: a subject binding that already exists with
 //! the exact same key is left in place (re-merging an already-merged pair is
@@ -60,7 +62,13 @@ impl MergeProposal {
     &self.subject
   }
 
-  /// The credential generation this proposal binds (single-subject).
+  /// The admitted subject's public key.
+  #[cfg(any(test, fuzzing))]
+  pub(crate) const fn subject_key(&self) -> &PublicKey {
+    &self.subject_key
+  }
+
+  /// The credential generation this proposal binds (subject-scoped).
   #[cfg(any(test, fuzzing))]
   pub(crate) const fn generation(&self) -> &GenerationId {
     &self.generation
@@ -86,16 +94,25 @@ pub(crate) enum MergeState {
 /// outcome.
 ///
 /// The issuer grant signature is strictly verified by core before commit.
-/// Replaying the identical complete triple is idempotent; any conflicting
-/// reuse of the subject, credential generation, or merge ID fails closed
-/// without mutation. A subject binding that already exists with the exact
-/// same key (the pair merged before) is reused: the transaction then commits
-/// only the credential use and the grant (union semantics).
+/// Replaying the identical complete triple is idempotent; re-admission of
+/// the same (generation, subject) pair with a fresh merge id returns the
+/// existing grant (`re_admission`); conflicting reuse — another key for
+/// the same subject, or another subject for the same merge ID — fails
+/// closed without mutation. A subject binding that already exists with
+/// the exact same key (the pair merged before) is reused: the transaction
+/// then commits only the credential use and the grant (union semantics).
 pub(crate) async fn commit_merge(
   context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
   proposal: &MergeProposal,
 ) -> Result<MergeGrantV1> {
   let store = context.store();
+  // The whole journaled section — recovery prologue, commit, cleanup —
+  // holds the writer exclusion: concurrent same-generation merges share
+  // one purpose-scoped pending slot, and an interleaved prologue that
+  // observes another flow's live residue would misclassify it as a crash
+  // journal (inner acquisitions in the committed helpers re-enter this
+  // permit as no-ops).
+  let _permit = store.write_permit().await;
   let purpose = merge_purpose(&proposal.generation);
   if crate::identity::lifecycle::recover_journal_prologue(
     store,
@@ -133,12 +150,15 @@ pub(crate) async fn commit_merge(
     return Err(discovery_corrupt());
   }
 
-  // The credential generation is single-use: an existing use record means
-  // this attempt classifies (idempotent replay) or conflicts (reuse with a
-  // different subject or merge ID). The subject binding is union semantics:
-  // the exact same binding is reused, a conflicting key fails closed.
+  // The credential use record is subject-scoped: an existing record for
+  // this (generation, subject) means the attempt classifies (idempotent
+  // replay) or conflicts (reuse with a different merge ID); other subjects
+  // under the same generation admit independently. The subject binding is
+  // union semantics: the exact same binding is reused, a conflicting key
+  // fails closed.
   let (binding_namespace, binding_key) = identity_binding_key(&proposal.subject)?;
-  let (use_namespace, use_key) = credential_use_key(identity.node(), &proposal.generation)?;
+  let (use_namespace, use_key) =
+    credential_use_key(identity.node(), &proposal.generation, &proposal.subject)?;
   let (grant_namespace, grant_key) = merge_grant_key(&proposal.merge)?;
   let existing_binding = snapshot.get(&binding_namespace, &binding_key).await?;
   if snapshot.get(&use_namespace, &use_key).await?.is_some()
@@ -149,7 +169,11 @@ pub(crate) async fn commit_merge(
       Ok(MergeState::Consumed(_, existing)) => Ok(*existing),
       Ok(MergeState::Aborted) => Err(discovery_corrupt()),
       Err(error) if error.kind() == crate::ErrorKind::StorageCorrupt => Err(error),
-      Err(_) => Err(Error::conflict("merge record")),
+      // Same (generation, subject) with a fresh merge id: the credential
+      // still authorizes this subject, so the committed grant is
+      // returned idempotently (re-admission, e.g. a restarted member
+      // re-joining). Conflicting field reuse still fails closed.
+      Err(_) => re_admission(context, proposal).await,
     };
   }
   let binding_present = match &existing_binding {
@@ -285,6 +309,8 @@ pub(crate) async fn adopt_merge(
   issuer_key: &PublicKey,
 ) -> Result<()> {
   let store = context.store();
+  // Same-purpose serialization: see the note on `commit_merge`.
+  let _permit = store.write_permit().await;
   let purpose = merge_adoption_purpose(grant.merge());
   if crate::identity::lifecycle::recover_journal_prologue(
     store,
@@ -453,6 +479,61 @@ fn merge_adoption_purpose(merge: &MergeId) -> String {
   crate::identity::records::JournalPurpose::MergeAdoption(merge.clone()).text()
 }
 
+/// Re-admission classification: the (generation, subject) pair is already
+/// committed under a different merge id — a restarted member re-joining
+/// with a still-valid credential gets its existing grant back
+/// idempotently. Every field and the issuer signature must verify and the
+/// stored binding must still match the presented subject key; any mismatch
+/// or missing record fails closed.
+async fn re_admission(
+  context: &LocalIdentityContext, proposal: &MergeProposal,
+) -> Result<MergeGrantV1> {
+  let identity = context.identity();
+  let snapshot = context.store().snapshot().await?;
+  let (use_namespace, use_key) =
+    credential_use_key(identity.node(), &proposal.generation, &proposal.subject)?;
+  let use_value = snapshot
+    .get(&use_namespace, &use_key)
+    .await?
+    .ok_or_else(|| Error::conflict("merge record"))?;
+  let record = CredentialUseV1::decode(use_value.as_bytes()).map_err(|_| discovery_corrupt())?;
+  if record.issuer() != identity.node()
+    || record.generation() != &proposal.generation
+    || record.subject() != &proposal.subject
+    || record.subject_key() != &proposal.subject_key
+  {
+    return Err(Error::conflict("merge record"));
+  }
+  let (grant_namespace, grant_key) = merge_grant_key(record.merge())?;
+  let grant_value = snapshot
+    .get(&grant_namespace, &grant_key)
+    .await?
+    .ok_or_else(discovery_corrupt)?;
+  let grant = MergeGrantV1::decode(grant_value.as_bytes()).map_err(|_| discovery_corrupt())?;
+  if grant.merge() != record.merge()
+    || grant.subject() != &proposal.subject
+    || grant.subject_key() != &proposal.subject_key
+    || grant.issuer() != identity.node()
+    || grant.generation() != &proposal.generation
+  {
+    return Err(discovery_corrupt());
+  }
+  grant
+    .verify(identity.public_key())
+    .map_err(|_| discovery_corrupt())?;
+  let (binding_namespace, binding_key) = identity_binding_key(&proposal.subject)?;
+  let binding_value = snapshot
+    .get(&binding_namespace, &binding_key)
+    .await?
+    .ok_or_else(discovery_corrupt)?;
+  let binding =
+    IdentityBindingV1::decode(binding_value.as_bytes()).map_err(|_| discovery_corrupt())?;
+  if binding.node() != &proposal.subject || binding.public_key() != &proposal.subject_key {
+    return Err(Error::conflict("merge binding"));
+  }
+  Ok(grant)
+}
+
 /// Classifies the durable outcome of a merge attempt.
 ///
 /// The credential use, grant, and subject binding are all present with exact
@@ -463,7 +544,8 @@ pub(crate) async fn merge_state(
 ) -> Result<MergeState> {
   let identity = context.identity();
   let snapshot = context.store().snapshot().await?;
-  let (use_namespace, use_key) = credential_use_key(identity.node(), &proposal.generation)?;
+  let (use_namespace, use_key) =
+    credential_use_key(identity.node(), &proposal.generation, &proposal.subject)?;
   let (grant_namespace, grant_key) = merge_grant_key(&proposal.merge)?;
   let (binding_namespace, binding_key) = identity_binding_key(&proposal.subject)?;
   let credential_use = snapshot.get(&use_namespace, &use_key).await?;
@@ -612,6 +694,7 @@ mod tests {
     let (use_namespace, use_key) = credential_use_key(
       fixture.context.identity().node(),
       proposal_generation(&proposal),
+      proposal.subject(),
     )
     .unwrap();
     let usage = CredentialUseV1::decode(
@@ -729,14 +812,11 @@ mod tests {
     // Same subject with another public key.
     let mut conflicting = proposal(12, &fixture.entropy);
     set_subject(&mut conflicting, proposal_subject(&first).clone());
-    // Same generation with another subject.
-    let mut other_subject = proposal(13, &fixture.entropy);
-    set_generation(&mut other_subject, proposal_generation(&first).clone());
     // Same merge ID with another subject.
     let mut reused_merge = proposal(14, &fixture.entropy);
     set_merge(&mut reused_merge, proposal_merge(&first).clone());
 
-    for attempt in [conflicting, other_subject, reused_merge] {
+    for attempt in [conflicting, reused_merge] {
       let commits_before = commit_calls(&fixture.reference);
       let error = commit_merge(
         &fixture.context,
@@ -752,6 +832,45 @@ mod tests {
         MergeState::Consumed(_, existing) => assert_eq!(*existing, grant),
         MergeState::Aborted => panic!("original merge must survive"),
       }
+    }
+
+    // Same generation with another subject admits independently (D8):
+    // the use record is subject-scoped, so replay refusal applies to the
+    // (generation, subject) pair, not the generation.
+    let mut other_subject = proposal(13, &fixture.entropy);
+    set_generation(&mut other_subject, proposal_generation(&first).clone());
+    let second_grant = commit_merge(
+      &fixture.context,
+      &provider_of(&fixture.keys),
+      fixture.entropy.as_ref(),
+      &other_subject,
+    )
+    .await
+    .unwrap();
+    second_grant
+      .verify(fixture.context.identity().public_key())
+      .unwrap();
+
+    // Re-admission: the same (generation, subject) pair with a fresh
+    // merge id returns the committed grant idempotently (a restarted
+    // member re-joining with a still-valid credential).
+    let mut rejoin = proposal(15, &fixture.entropy);
+    set_subject(&mut rejoin, proposal_subject(&first).clone());
+    set_subject_key(&mut rejoin, proposal_subject_key(&first).clone());
+    set_generation(&mut rejoin, proposal_generation(&first).clone());
+    let rejoined = commit_merge(
+      &fixture.context,
+      &provider_of(&fixture.keys),
+      fixture.entropy.as_ref(),
+      &rejoin,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rejoined, grant);
+
+    match merge_state(&fixture.context, &first).await.unwrap() {
+      MergeState::Consumed(_, existing) => assert_eq!(*existing, grant),
+      MergeState::Aborted => panic!("the original merge must survive the second subject"),
     }
     assert_never_deleted(&fixture.keys);
   }
@@ -789,16 +908,13 @@ mod tests {
         let grant = result.unwrap();
         grant.verify(context.identity().public_key()).unwrap();
         assert!(pending_keys(&reference).is_empty());
-        // The same generation can never merge a second subject.
+        // The same generation admits a second subject independently
+        // (D8); the committed first merge survives.
         let mut second = proposal(18, &entropy);
         set_generation(&mut second, proposal_generation(&first).clone());
-        assert_eq!(
-          commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &second)
-            .await
-            .unwrap_err()
-            .kind(),
-          ErrorKind::Conflict,
-        );
+        commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &second)
+          .await
+          .unwrap();
         match merge_state(&context, &first).await.unwrap() {
           MergeState::Consumed(_, existing) => assert_eq!(*existing, grant),
           MergeState::Aborted => panic!("applied merge must be consumed"),
@@ -1046,25 +1162,22 @@ mod tests {
         "fault: {fault:?} later attempt must consume the generation"
       );
 
-      // A second subject for the same generation is refused: one issuer
-      // generation never commits two subjects.
+      // A second subject for the same generation now admits: one
+      // generation may commit any number of distinct subjects (D8); the
+      // use record is subject-scoped, so only same-subject replays
+      // classify against it.
       let mut another = proposal(47, &entropy);
       set_generation(&mut another, proposal_generation(&first).clone());
-      assert_eq!(
-        commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &another)
-          .await
-          .unwrap_err()
-          .kind(),
-        ErrorKind::Conflict,
-        "fault: {fault:?}"
-      );
+      commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &another)
+        .await
+        .unwrap();
       assert_never_deleted(&keys);
     }
   }
 
   /// A crash after apply at every pre-merge commit boundary never yields
   /// a partial triple, and reopen resolves to exactly the applied merge
-  /// (at most one subject per generation).
+  /// (one merge per subject-scoped credential use).
   #[tokio::test]
   async fn identity_records_merge_unknown_applied_schedule_reconciles_after_reopen() {
     for position in 1..=5_u32 {
@@ -1154,7 +1267,7 @@ mod tests {
     let foreign_identity = crate::identity::records::LocalIdentityV1::new(
       node(78_000),
       PublicKey::from_bytes(foreign_signing.verifying_key().to_bytes()),
-      crate::KeyOperationId::parse("keyop_500000000000000000000").unwrap(),
+      crate::KeyOperationId::parse("keyop-500000000000000000000").unwrap(),
       crate::KeyHandle::from_provider_bytes(Arc::from(&b"foreign-handle"[..])).unwrap(),
     );
     let foreign = signed_grant(

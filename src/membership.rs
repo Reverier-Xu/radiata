@@ -260,22 +260,6 @@ pub(crate) mod store {
     StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()))
   }
 
-  /// Reads the current descriptor for one node, if any, from an
-  /// already-acquired snapshot, so callers iterating many members pay one
-  /// snapshot acquisition per cycle instead of one per member.
-  pub(crate) async fn read_descriptor_snapshot(
-    snapshot: &dyn crate::provider::StoreSnapshot, node: &NodeId,
-  ) -> Result<Option<NodeDescriptorV1>> {
-    let namespace = namespace()?;
-    let key = descriptor_key(node);
-    let Some(value) = snapshot.get(&namespace, &key).await? else {
-      return Ok(None);
-    };
-    Ok(Some(crate::membership::page::decode_descriptor(
-      value.as_bytes(),
-    )?))
-  }
-
   /// Reads the current descriptor for one node, if any, over the running
   /// node's metadata store (the runtime path; never re-opens storage).
   pub(crate) async fn read_descriptor_ctx(
@@ -360,16 +344,8 @@ pub(crate) mod store {
     // Conflict (the register moved under the CAS) or an Aborted commit
     // (definitively not applied) must surface so the anti-entropy page
     // applies on a later tick instead of vanishing.
-    match store.commit(transaction).await? {
-      crate::CommitOutcome::Committed(_) => Ok(()),
-      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
-        Err(Error::conflict("node descriptor revision"))
-      }
-      crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
-        crate::ProviderErrorKind::CommitUnknown,
-        crate::ProviderErrorContext::StorageCommit,
-      )),
-    }
+    crate::provider::commit_verdict(store.commit(transaction).await?, "node descriptor revision")?;
+    Ok(())
   }
 
   /// Reads the current descriptor for one node over a standalone factory
@@ -407,7 +383,7 @@ mod tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn key(value: u8) -> crate::PublicKey {

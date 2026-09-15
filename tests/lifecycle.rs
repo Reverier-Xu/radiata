@@ -87,7 +87,7 @@ async fn lifecycle_start_and_shutdown_provisions_identity_once() {
   );
   assert_eq!(
     providers.entropy.fills(),
-    &[32, 16, 16, 16, 16, 16, 16],
+    &[32, 14, 14, 14, 14, 14, 14],
     "startup fills the runtime seed, then generates node, operation, and transaction IDs (including the self-binding transaction)",
   );
   let calls = providers.keys.take_calls();

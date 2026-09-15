@@ -111,6 +111,10 @@ pub(crate) async fn ensure_self_binding(
   match store.commit(transaction).await? {
     CommitOutcome::Committed(_) => Ok(()),
     CommitOutcome::Aborted | CommitOutcome::Conflict | CommitOutcome::Unknown { .. } => {
+      // An unknown outcome leaves the commit slot frozen: resolve it
+      // against the provider evidence before classifying, so the slot
+      // cannot stay blocked behind this flow.
+      store.reconcile_if_frozen().await?;
       // A concurrent or equivocated outcome resolves only to the exact
       // same self binding; anything else fails closed.
       let snapshot = store.snapshot().await?;
@@ -190,14 +194,14 @@ pub(crate) async fn reconcile_recovered_journal(store: &MetadataStore) -> Result
 }
 
 /// The shared journal-recovery prologue of every journaled identity
-/// mutation: a recovered pending journal for `purpose` reconciles and
-/// cleans up before classification (returns `true`); otherwise a frozen
-/// store reconciles before any new work (returns `false`).
+/// mutation: a recovered pending journal for `purpose` resolves against
+/// durable provider evidence and cleans up before classification (returns
+/// `true`); otherwise a frozen store reconciles before any new work
+/// (returns `false`).
 pub(crate) async fn recover_journal_prologue(
   store: &MetadataStore, entropy: &dyn Entropy, purpose: &str, context: &'static str,
 ) -> Result<bool> {
-  if store.recover_pending(purpose).await?.is_some() {
-    reconcile_recovered_journal(store).await?;
+  if store.resolve_pending_journal(purpose).await? {
     cleanup_pending_exact(store, entropy, purpose, context).await?;
     return Ok(true);
   }
@@ -676,15 +680,15 @@ mod tests {
   }
 
   fn node(value: u128) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn operation(value: u128) -> KeyOperationId {
-    KeyOperationId::parse(&format!("keyop_{value:021}")).unwrap()
+    KeyOperationId::parse(&format!("keyop-{value:021}")).unwrap()
   }
 
   fn transaction(value: u128) -> TransactionId {
-    TransactionId::parse(&format!("txn_{value:021}")).unwrap()
+    TransactionId::parse(&format!("txn-{value:021}")).unwrap()
   }
 
   fn namespace(tag: &str) -> StoreNamespace {

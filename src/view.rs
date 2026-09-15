@@ -861,6 +861,12 @@ pub struct ReceiptRetentionReport {
 }
 
 /// The public view of one immediate recovery observation.
+///
+/// The recovery contract is "any one route suffices": a node with at
+/// least one authenticated session is connected, and the recovery plane
+/// never expands such a node's topology; a fully isolated node retries
+/// every member in its table (bounded fan-out, wall-clock backoff) until
+/// any one connects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryView {
   is_connected: bool,
@@ -869,15 +875,27 @@ pub struct RecoveryView {
 }
 
 impl RecoveryView {
+  /// Whether at least one authenticated path to the cluster exists.
+  /// Under the any-one-route contract this is the deployment's
+  /// connectivity signal; it says nothing about how many members are
+  /// directly reachable.
   pub const fn is_connected(&self) -> bool {
     self.is_connected
   }
 
   /// How many known members the controller still counts as unreachable.
+  /// A diagnostic count, not an outage signal: a connected node can keep
+  /// a nonzero count indefinitely (peers it never sessioned and need not
+  /// reach), and the recovery plane does not act while
+  /// [`RecoveryView::is_connected`] holds.
   pub const fn unreachable_members(&self) -> usize {
     self.unreachable_members
   }
 
+  /// The wall-clock instant of the next scheduled recovery dial, if the
+  /// controller is recovering (isolated). `None` when connected or idle.
+  /// Expected convergence after an isolation event is bounded by the
+  /// sync tick cadence plus the current backoff step.
   pub const fn next_attempt_at(&self) -> Option<std::time::SystemTime> {
     self.next_attempt_at
   }

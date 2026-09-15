@@ -45,6 +45,7 @@ pub radiata::DurabilityLevel::OsCrashDurable
 pub radiata::DurabilityLevel::ProcessCrashAtomic
 #[non_exhaustive] pub enum radiata::ErrorKind
 pub radiata::ErrorKind::AuthenticationFailed
+pub radiata::ErrorKind::CallerError
 pub radiata::ErrorKind::Cancelled
 pub radiata::ErrorKind::CommitUnknown
 pub radiata::ErrorKind::Conflict
@@ -196,6 +197,11 @@ impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
 pub fn radiata::CreatedKey::new(radiata::KeyHandle, radiata::PublicKey) -> Self
 pub fn radiata::CreatedKey::public_key(&self) -> &radiata::PublicKey
+pub struct radiata::DefaultNextHop
+impl radiata::DefaultNextHop
+pub const radiata::DefaultNextHop::TAG: &'static str
+impl radiata::RouteNextHop for radiata::DefaultNextHop
+pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub struct radiata::DeliveryAck
 impl radiata::DeliveryAck
 pub fn radiata::DeliveryAck::admitted_at(&self) -> std::time::SystemTime
@@ -237,14 +243,10 @@ pub type radiata::Endpoint::Err = radiata::Error
 pub fn radiata::Endpoint::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::Error
 impl radiata::Error
+pub fn radiata::Error::caller(&'static str) -> Self
 pub fn radiata::Error::context(&self) -> &'static str
 pub fn radiata::Error::kind(&self) -> radiata::ErrorKind
 pub fn radiata::Error::provider(radiata::ProviderErrorKind, radiata::ProviderErrorContext) -> Self
-impl core::error::Error for radiata::Error
-impl core::fmt::Debug for radiata::Error
-pub fn radiata::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::fmt::Display for radiata::Error
-pub fn radiata::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::EventOptions
 impl radiata::EventOptions
 pub fn radiata::EventOptions::capacity(self, usize) -> radiata::Result<Self>
@@ -341,6 +343,11 @@ impl radiata::IssueCleanupCheckpoint
 pub fn radiata::IssueCleanupCheckpoint::new() -> Self
 impl radiata::Command for radiata::IssueCleanupCheckpoint
 pub type radiata::IssueCleanupCheckpoint::Output = u64
+pub struct radiata::IssueMergeCredential
+impl radiata::IssueMergeCredential
+pub fn radiata::IssueMergeCredential::new() -> Self
+impl radiata::Command for radiata::IssueMergeCredential
+pub type radiata::IssueMergeCredential::Output = radiata::IssuedMergeCredential
 pub struct radiata::IssuedMergeCredential
 impl radiata::IssuedMergeCredential
 pub fn radiata::IssuedMergeCredential::credential(&self) -> &radiata::MergeCredential
@@ -628,6 +635,7 @@ pub type radiata::PurgeRevocation::Output = ()
 pub struct radiata::PutResource
 impl radiata::PutResource
 pub fn radiata::PutResource::new(radiata::ResourceWrite) -> radiata::Result<Self>
+pub fn radiata::PutResource::with_expected(radiata::ResourceWrite, radiata::ResourceVersion) -> radiata::Result<Self>
 impl radiata::Command for radiata::PutResource
 pub type radiata::PutResource::Output = radiata::ResourceMutationView
 pub struct radiata::QualifiedTag
@@ -715,6 +723,7 @@ pub fn radiata::ResourceUri::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ResourceVersion
 impl radiata::ResourceVersion
 pub fn radiata::ResourceVersion::digest(&self) -> &radiata::Digest
+pub fn radiata::ResourceVersion::from_parts(std::time::SystemTime, radiata::NodeId, bool, radiata::Digest) -> Self
 pub fn radiata::ResourceVersion::is_removal(&self) -> bool
 pub fn radiata::ResourceVersion::timestamp(&self) -> std::time::SystemTime
 pub fn radiata::ResourceVersion::writer(&self) -> &radiata::NodeId
@@ -989,6 +998,8 @@ impl radiata::Command for radiata::DisconnectPeer
 pub type radiata::DisconnectPeer::Output = ()
 impl radiata::Command for radiata::IssueCleanupCheckpoint
 pub type radiata::IssueCleanupCheckpoint::Output = u64
+impl radiata::Command for radiata::IssueMergeCredential
+pub type radiata::IssueMergeCredential::Output = radiata::IssuedMergeCredential
 impl radiata::Command for radiata::LeaveCluster
 pub type radiata::LeaveCluster::Output = radiata::LeaveOutcome
 impl radiata::Command for radiata::Listen
@@ -1061,6 +1072,8 @@ impl radiata::Query for radiata::WaitForShutdown
 pub type radiata::WaitForShutdown::Output = radiata::ShutdownReason
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+impl radiata::RouteNextHop for radiata::DefaultNextHop
+pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub fn radiata::store_scan_stream(alloc::boxed::Box<(dyn radiata::extension::StoreScan + '_)>) -> futures_core::stream::BoxStream<'_, radiata::Result<radiata::StoreEntry>>
 pub type radiata::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>
 pub type radiata::Result<T, E> = core::result::Result<T, E>

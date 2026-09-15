@@ -87,11 +87,11 @@ impl LeaveIntentV1 {
   #[cfg(test)]
   fn new_for_test() -> Self {
     Self {
-      former_node: NodeId::parse("node_000000000000000000061").unwrap(),
+      former_node: NodeId::parse("node-000000000000000000061").unwrap(),
       former_key: PublicKey::from_bytes([61; 32]),
       former_handle: KeyHandle::from_provider_bytes(Arc::from(b"former-handle".to_vec())).unwrap(),
-      replacement_node: NodeId::parse("node_000000000000000000062").unwrap(),
-      replacement_operation: KeyOperationId::parse("keyop_000000000000000000062").unwrap(),
+      replacement_node: NodeId::parse("node-000000000000000000062").unwrap(),
+      replacement_operation: KeyOperationId::parse("keyop-000000000000000000062").unwrap(),
     }
   }
 }
@@ -781,7 +781,7 @@ mod tests {
 
     // A record for another node with this signature never verifies.
     let other = LeaveRecordV1::new(
-      crate::NodeId::parse("node_000000000000000000099").unwrap(),
+      crate::NodeId::parse("node-000000000000000000099").unwrap(),
       record.public_key().clone(),
       record.timestamp_millis(),
       crate::Signature::from_bytes([0x5A; 64]),

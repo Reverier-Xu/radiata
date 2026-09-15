@@ -33,7 +33,9 @@ use crate::{
     lifecycle::LocalIdentityContext,
     merge::{MergeProposal, adopt_merge, commit_merge},
     merge_rate::MergeSource,
-    records::{GenerationId, IdentityBindingV1, MergeGrantV1, MergeId, identity_binding_key},
+    records::{
+      GenerationId, IdentityBindingV1, LocalIdentityV1, MergeGrantV1, MergeId, identity_binding_key,
+    },
   },
   protocol::{
     credential::CredentialSecret,
@@ -251,13 +253,14 @@ impl SessionDriver {
 
     // Resolve the mode-specific inputs before the state machine exists. In
     // join mode the generation hint is checked against the single active
-    // generation and the generation is reserved for this attempt; in member
+    // generation and the credential is taken for proof verification — one
+    // live generation admits any number of subjects concurrently (the
+    // durable admission commit owns per-subject replay refusal). In member
     // mode the peer must already hold a trusted binding.
-    let mut reservation = None;
     let (expected_peer, generation, credential) = match peek.mode {
       HandshakeMode::Merge => {
         let active = {
-          let mut issuer = self
+          let issuer = self
             .issuer
             .lock()
             .map_err(|_| Error::internal("join credential issuer"))?;
@@ -268,16 +271,12 @@ impl SessionDriver {
           if peek.generation != Some(active_generation) {
             return Err(Error::authentication_failed("join credential generation"));
           }
-          issuer
-            .reserve(now)
-            .map_err(|_| Error::authentication_failed("join credential"))?;
           let credential = issuer
             .active_credential(now)
             .map(CredentialSecret::from_credential)
             .map_err(|_| Error::authentication_failed("join credential"))?;
           (active_generation, credential)
         };
-        reservation = Some(CredentialReservation::armed(Arc::clone(&self.issuer)));
         (None, Some(active.0), Some(active.1))
       }
       HandshakeMode::Member => {
@@ -344,17 +343,12 @@ impl SessionDriver {
     let peer_id = peer_id.clone();
 
     if peek.mode == HandshakeMode::Merge {
-      let result = self
+      // The durable admission commit owns per-subject replay refusal; a
+      // failed commit needs no credential-side rollback — multi-admission
+      // generations stay live until rotation or expiry.
+      self
         .commit_and_deliver(&mut handshake, connection, generation)
-        .await;
-      let reservation = reservation.ok_or_else(|| Error::internal("join credential"))?;
-      match result {
-        Ok(()) => reservation.consume()?,
-        Err(error) => {
-          reservation.release();
-          return Err(error);
-        }
-      }
+        .await?;
     }
     let session = established(&handshake)?;
     debug_assert_eq!(session.peer(), &peer_id);
@@ -422,33 +416,7 @@ impl SessionDriver {
       },
       FeatureRegistry::builtin()?,
     )?;
-
-    send(
-      connection,
-      HandshakeKind::InitiatorHello,
-      &handshake.initiator_hello()?,
-    )
-    .await?;
-    let hello = receive_kind(connection, HandshakeKind::ResponderHello).await?;
-    handshake.receive(&hello.body)?;
-    let proof = receive_kind(connection, HandshakeKind::ResponderProof).await?;
-    handshake.receive(&proof.body)?;
-    // The initiator signs only after the responder proof verified.
-    let transcript = handshake
-      .transcript_bytes()
-      .ok_or_else(|| Error::internal("handshake transcript"))?;
-    let signature = self
-      .keys
-      .sign(identity.handle(), &initiator_session_message(transcript))
-      .await?;
-    send(
-      connection,
-      HandshakeKind::InitiatorProof,
-      &handshake.initiator_proof(signature)?,
-    )
-    .await?;
-    let confirmation = receive_kind(connection, HandshakeKind::SelectionConfirmation).await?;
-    handshake.receive(&confirmation.body)?;
+    self.initiate(connection, &mut handshake, identity).await?;
 
     let delivery = receive_kind(connection, HandshakeKind::MergeGrantDelivery).await?;
     handshake.receive(&delivery.body)?;
@@ -513,7 +481,18 @@ impl SessionDriver {
       },
       FeatureRegistry::builtin()?,
     )?;
+    self.initiate(connection, &mut handshake, identity).await?;
+    established(&handshake)
+  }
 
+  /// Drives the initiator's half of a built handshake: the hello, the
+  /// responder hello and proof, the local signature — produced only
+  /// after the responder proof verifies — and the feature-selection
+  /// confirmation. The merge flow continues with grant delivery
+  /// afterwards; the member flow ends here.
+  async fn initiate(
+    &self, connection: &mut Connection, handshake: &mut Handshake, identity: &LocalIdentityV1,
+  ) -> Result<()> {
     send(
       connection,
       HandshakeKind::InitiatorHello,
@@ -540,7 +519,7 @@ impl SessionDriver {
     .await?;
     let confirmation = receive_kind(connection, HandshakeKind::SelectionConfirmation).await?;
     handshake.receive(&confirmation.body)?;
-    established(&handshake)
+    Ok(())
   }
   /// Blocks new session establishment while the local metadata store is
   /// frozen on an indeterminate outcome: the node refuses to
@@ -579,52 +558,6 @@ async fn trusted_binding(context: &LocalIdentityContext, peer: &NodeId) -> Resul
     return Err(Error::revoked("session binding"));
   }
   Ok(public_key)
-}
-
-/// A single-use reservation on the receiver's active join credential
-/// generation. Dropping an armed reservation releases it; a failed attempt
-/// never consumes the credential.
-struct CredentialReservation {
-  issuer: Arc<Mutex<MergeCredentialIssuer>>,
-  armed: bool,
-}
-
-impl CredentialReservation {
-  fn armed(issuer: Arc<Mutex<MergeCredentialIssuer>>) -> Self {
-    Self {
-      issuer,
-      armed: true,
-    }
-  }
-
-  /// Consumes the reserved generation after the admission commit succeeded.
-  fn consume(mut self) -> Result<()> {
-    self
-      .issuer
-      .lock()
-      .map_err(|_| Error::internal("join credential issuer"))?
-      .consume()?;
-    self.armed = false;
-    Ok(())
-  }
-
-  /// Returns the reserved generation to active after a failed attempt.
-  fn release(mut self) {
-    if let Ok(mut issuer) = self.issuer.lock() {
-      let _ = issuer.release();
-    }
-    self.armed = false;
-  }
-}
-
-impl Drop for CredentialReservation {
-  fn drop(&mut self) {
-    if self.armed
-      && let Ok(mut issuer) = self.issuer.lock()
-    {
-      let _ = issuer.release();
-    }
-  }
 }
 
 /// Sends one handshake state machine message under its published kind.

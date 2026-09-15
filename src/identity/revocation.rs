@@ -362,7 +362,7 @@ mod tests {
   };
 
   fn subject() -> NodeId {
-    NodeId::parse("node_000000000000000000051").unwrap()
+    NodeId::parse("node-000000000000000000051").unwrap()
   }
 
   fn key(seed: u8) -> PublicKey {
@@ -372,7 +372,7 @@ mod tests {
   /// The fixed test issuer: a distinct node whose deterministic signing
   /// key produces byte-identical records across crash-matrix runs.
   fn issuer() -> NodeId {
-    NodeId::parse("node_000000000000000000091").unwrap()
+    NodeId::parse("node-000000000000000000091").unwrap()
   }
 
   fn issuer_signing() -> ed25519_dalek::SigningKey {
@@ -470,7 +470,7 @@ mod tests {
     );
 
     // An unknown subject and a substituted trusted key both fail closed.
-    let unknown = NodeId::parse("node_000000000000000000052").unwrap();
+    let unknown = NodeId::parse("node-000000000000000000052").unwrap();
     assert_eq!(
       revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&unknown, &key(7)))
         .await
@@ -478,7 +478,7 @@ mod tests {
         .kind(),
       ErrorKind::NotFound
     );
-    let substituted = NodeId::parse("node_000000000000000000053").unwrap();
+    let substituted = NodeId::parse("node-000000000000000000053").unwrap();
     trust(&store, &substituted, &key(9)).await;
     assert_eq!(
       revoke_binding_ctx(
@@ -558,7 +558,7 @@ mod crash {
   /// The fixed test issuer: byte-identical records across dry runs and
   /// child processes keep the crash-matrix receipt comparison exact.
   fn issuer() -> NodeId {
-    NodeId::parse("node_000000000000000000091").unwrap()
+    NodeId::parse("node-000000000000000000091").unwrap()
   }
 
   fn issuer_signing() -> ed25519_dalek::SigningKey {
@@ -601,7 +601,7 @@ mod crash {
   }
 
   fn subject() -> NodeId {
-    NodeId::parse("node_000000000000000000051").unwrap()
+    NodeId::parse("node-000000000000000000051").unwrap()
   }
 
   fn key() -> PublicKey {

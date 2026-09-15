@@ -13,10 +13,10 @@ use std::{sync::Arc, time::Duration};
 
 use radiata::{
   ConnectMember, DisconnectPeer, Endpoint, ErrorKind, FeatureDefinition, FeatureTag, GetMember,
-  GetResource, Listen, LoadBalancingPolicy, MergeCluster, NodeBuilder, NodeConfig, NodeHandle,
-  PageMembers, PageSessions, PageSpec, PageTrust, ProtocolDefinition, ProtocolTag, QualifiedTag,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, RotateMergeCredential,
-  StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
+  GetResource, IssueMergeCredential, Listen, LoadBalancingPolicy, MergeCluster, NodeBuilder,
+  NodeConfig, NodeHandle, PageMembers, PageSessions, PageSpec, PageTrust, ProtocolDefinition,
+  ProtocolTag, QualifiedTag, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result,
+  RotateMergeCredential, StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
 };
 
 mod common;
@@ -256,6 +256,60 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
   member.id().clone()
 }
 
+/// Joins a third, silent member and keeps one live session to BOTH
+/// sides of the mixed pair (see the retirement phase in
+/// `prior_initiator_interops_with_current_responder` for why the torn
+/// pair must never fully isolate). Returns the bystander node with its
+/// id resolved.
+async fn join_bystander(issuer: &Node, member: &Node) -> Node {
+  let mut bystander = start_node(3, false).await;
+  bystander.listen().await;
+  let issued = issuer
+    .handle
+    .command(IssueMergeCredential::new())
+    .await
+    .unwrap();
+  bystander
+    .handle
+    .command(MergeCluster::new(
+      issuer.endpoint().clone(),
+      radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
+    ))
+    .await
+    .unwrap();
+  bystander.id = Some(
+    bystander
+      .handle
+      .query(radiata::GetLocalNode::new())
+      .await
+      .unwrap()
+      .node_id()
+      .clone(),
+  );
+
+  // The credential-free reconnect is key-trust only: both sides must
+  // have converged each other's trusted binding through the anti-entropy
+  // ticks before the member admits the bystander, so retry until then.
+  let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+  loop {
+    match bystander
+      .handle
+      .command(ConnectMember::new(
+        member.endpoint().clone(),
+        member.id().clone(),
+      ))
+      .await
+    {
+      Ok(_) => break,
+      Err(_) if std::time::Instant::now() < deadline => {
+        tokio::time::sleep(POLL).await;
+      }
+      Err(error) => panic!("the bystander reconnect was never admitted: {error:?}"),
+    }
+  }
+  bystander
+}
+
 /// Bounded retry pacing shared by every probe below.
 const POLL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -458,6 +512,17 @@ async fn prior_initiator_interops_with_current_responder() {
 
   assert_packet_interop(&issuer, &member).await;
 
+  // A third, silent member holding one live session to BOTH sides keeps
+  // the retirement phase below deterministic: tearing the pair's only
+  // session fully isolates both nodes, and the recovery plane's
+  // any-one-route contract re-dials an isolated node's whole member
+  // table within one recovery tick — the healed session would reappear
+  // before the retirement poll observes the teardown and race every
+  // assertion after it. With one authenticated path alive on each side,
+  // neither node is ever fully isolated, recovery quiesces, and the
+  // torn pair stays torn.
+  let bystander = join_bystander(&issuer, &member).await;
+
   // Replacement: the credential-free member reconnect re-establishes the
   // session with the identical selection.
   let first_selection = {
@@ -566,6 +631,11 @@ async fn prior_initiator_interops_with_current_responder() {
   );
 
   member
+    .handle
+    .command(radiata::Shutdown::new())
+    .await
+    .unwrap();
+  bystander
     .handle
     .command(radiata::Shutdown::new())
     .await

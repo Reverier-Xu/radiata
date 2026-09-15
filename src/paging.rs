@@ -462,7 +462,7 @@ mod tests {
       })
       .collect();
     let transaction = StoreTransaction::new(
-      TransactionId::parse(&format!("txn_{:021}", 1)).unwrap(),
+      TransactionId::parse(&format!("txn-{:021}", 1)).unwrap(),
       initial.revision().clone(),
       operations,
     )

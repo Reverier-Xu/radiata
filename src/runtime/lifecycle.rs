@@ -66,6 +66,9 @@ pub(crate) enum Control {
   RotateMergeCredential {
     reply: oneshot::Sender<Result<IssuedMergeCredential>>,
   },
+  IssueMergeCredential {
+    reply: oneshot::Sender<Result<IssuedMergeCredential>>,
+  },
   Listen {
     endpoint: Endpoint,
     reply: oneshot::Sender<Result<ListenerView>>,
@@ -148,6 +151,7 @@ pub(crate) enum Control {
   },
   PutResource {
     write: crate::ResourceWrite,
+    expected: Option<crate::ResourceVersion>,
     reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
   },
   RevokeNode {

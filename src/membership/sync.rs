@@ -1,8 +1,9 @@
 //! Session-carried membership sync.
 //!
-//! An authenticated session carries two bounded sync payloads in one
-//! direction: a [`MembershipPage`] of node descriptors and the issuer
-//! [`TrustSnapshotV1`] binding set. Entries are trusted through the
+//! An authenticated session carries bounded sync payloads in one
+//! direction: a [`MembershipPage`] of node descriptors and the issuer's
+//! trust bindings as keyset pages of the snapshot record. Entries are
+//! trusted through the
 //! authenticated session that delivered them; decoding checks
 //! only canonical wire rules and bounded capacities. Every node refreshes
 //! its own snapshot when its binding set changes, and every member pages
@@ -20,7 +21,9 @@ use crate::{
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::{
     lifecycle::LocalIdentityContext,
-    trust::{TrustSnapshotV1, accept_snapshot, refresh_issuer_snapshot, store as trust_store},
+    trust::{
+      TRUST_BINDINGS_PAGE_LIMIT, accept_snapshot, refresh_issuer_snapshot, store as trust_store,
+    },
   },
   membership::page::{MembershipPage, sync as page_sync},
   protocol::{decode_canonical_strict, encode_canonical},
@@ -53,7 +56,7 @@ pub(crate) const SYNC_KIND_LEAVE_APPLIED: u8 = 7;
 pub(crate) enum SyncPayload {
   /// An encoded [`MembershipPage`].
   Page(ByteVec),
-  /// An encoded [`TrustSnapshotV1`].
+  /// One encoded issuer snapshot page.
   Snapshot(ByteVec),
   /// An encoded [`crate::identity::leave::LeaveRecordV1`].
   Leave(ByteVec),
@@ -137,7 +140,6 @@ impl SyncPayload {
 /// sessions. Entries are trusted through the session that delivered them;
 /// decoding enforces canonical wire rules and bounded capacities before
 /// install.
-#[derive(Debug)]
 pub(crate) struct MembershipSyncConsumer {
   // Held weakly so the registry shared with a live node handle never pins
   // the node's metadata store after shutdown; a packet arriving after the
@@ -147,13 +149,22 @@ pub(crate) struct MembershipSyncConsumer {
   events: Arc<crate::node::EventHub>,
   revision: crate::node::MemberRevisionSignal,
   leave_applied: LeaveAppliedSignal,
+  // The live session table: persisting a revocation tombstone retires the
+  // revoked identity's session on this node immediately.
+  sessions: crate::session::stream::SessionTable,
+}
+
+impl std::fmt::Debug for MembershipSyncConsumer {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("MembershipSyncConsumer(..)")
+  }
 }
 
 impl MembershipSyncConsumer {
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
     events: Arc<crate::node::EventHub>, revision: crate::node::MemberRevisionSignal,
-    leave_applied: LeaveAppliedSignal,
+    leave_applied: LeaveAppliedSignal, sessions: crate::session::stream::SessionTable,
   ) -> Self {
     Self {
       context: Arc::downgrade(&context),
@@ -161,6 +172,7 @@ impl MembershipSyncConsumer {
       events,
       revision,
       leave_applied,
+      sessions,
     }
   }
 }
@@ -182,6 +194,7 @@ impl PacketConsumer for MembershipSyncConsumer {
         &self.events,
         &self.revision,
         &self.leave_applied,
+        &self.sessions,
         &runtime,
         &source,
         &payload,
@@ -362,8 +375,8 @@ pub(crate) async fn announce_leave(
 async fn accept_payload(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
-  leave_applied: &LeaveAppliedSignal, runtime: &RuntimeClient, source: &NodeId,
-  payload: &SyncPayload,
+  leave_applied: &LeaveAppliedSignal, sessions: &crate::session::stream::SessionTable,
+  runtime: &RuntimeClient, source: &NodeId, payload: &SyncPayload,
 ) -> Result<()> {
   let store = context.store();
   match payload {
@@ -371,16 +384,22 @@ async fn accept_payload(
       let page = MembershipPage::decode(encoded.as_ref())?;
       // Every newly installed descriptor is one member change.
       let installed = page_sync::apply_page_ctx(store, entropy.as_ref(), &page).await?;
-      for node in installed {
-        member_changed(events, revision, node);
+      for descriptor in page.descriptors() {
+        if installed.contains(descriptor.node()) {
+          // The audit event is the propagation path proof: a
+          // descriptor exists on this peer only because this page
+          // carried it.
+          crate::audit::descriptor_installed(descriptor.node().as_str(), descriptor.revision());
+          member_changed(events, revision, descriptor.node().clone());
+        }
       }
     }
     SyncPayload::Snapshot(encoded) => {
-      let snapshot = TrustSnapshotV1::decode(encoded.as_ref())?;
+      let page = crate::identity::trust::TrustSnapshotPage::decode(encoded.as_ref())?;
       // The trust adoption policy lives in the trust module: issuer key
-      // verification and per-binding adoption (a delivered snapshot is
-      // never persisted; only the issuer's own refresh persists one).
-      accept_snapshot(store, entropy.as_ref(), &snapshot).await?;
+      // verification and per-binding adoption (a delivered snapshot page
+      // is never persisted; only the issuer's own refresh persists one).
+      accept_snapshot(store, entropy.as_ref(), &page).await?;
     }
     SyncPayload::Leave(encoded) => {
       // An owner-signed leave record is terminal evidence: verified
@@ -409,10 +428,25 @@ async fn accept_payload(
       }
       .encode()?;
       let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
-      if let Err(error) =
-        crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt).await
-      {
-        tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
+      // The applied receipt: one durable-install confirmation back to
+      // the leaver, best-effort and retried by the announcement budget.
+      // Pre-receipt peers simply never send it. The admission ack is
+      // still observed (delivery truth, D2): the wait runs detached so
+      // the pump never serializes behind it, and a failed admission is
+      // diagnostics only — the receipt is a hint, never a trust
+      // decision, and is never retried here.
+      match crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt) {
+        Ok(ack) => {
+          let peer = source.clone();
+          tokio::spawn(async move {
+            if !crate::sync_common::delivered_within_bound(ack).await {
+              tracing::debug!(peer = %peer.as_str(), "leave applied receipt not admitted");
+            }
+          });
+        }
+        Err(error) => {
+          tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
+        }
       }
     }
     SyncPayload::LeaveApplied { node } => {
@@ -452,6 +486,11 @@ async fn accept_payload(
       }
       crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record).await?;
       events.emit(crate::NodeRevoked::new(record.subject().clone()));
+      // A persisted revocation closes the authorization boundary
+      // immediately on this node too: retire any live session with the
+      // revoked identity (its recovery dials race the propagation, so a
+      // session admitted before this tombstone landed must not linger).
+      crate::session::stream::retire_session(sessions, record.subject())?;
     }
     SyncPayload::Checkpoint(encoded) => {
       // A cleanup checkpoint is unsigned hygiene knowledge: max-wins by
@@ -567,12 +606,20 @@ pub(crate) struct MembershipSyncCursors {
 
 #[derive(Debug, Default)]
 pub(crate) struct PeerSyncState {
-  /// The last snapshot revision sent to this peer, so unchanged grant
-  /// sets are not re-sent every tick.
+  /// The last snapshot revision fully delivered to this peer, so
+  /// unchanged grant sets are not re-sent every tick.
   snapshot_rev: u64,
+  /// The keyset cursor into the issuer's binding set: the last delivered
+  /// trust page's final binding, so a set larger than one wire page
+  /// pages through across ticks.
+  snapshot_cursor: Option<NodeId>,
   /// Ticks since this peer's last snapshot send: a lost delivery must be
   /// retried without waiting for the next grant-set change.
   ticks_since_snapshot_send: u32,
+  /// Ticks since this peer's last tombstone send: lost removal evidence
+  /// retries on the same slow cadence, independent of the (possibly
+  /// multi-tick) trust-page pass.
+  ticks_since_tombstone_send: u32,
   /// The shared page-plane continuation state (fingerprint, resend
   /// cadences, continuation cursor).
   page: crate::sync_common::PeerPageCursor,
@@ -660,11 +707,9 @@ pub(crate) async fn sync_tick(
     return Ok(());
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
-  // Snapshot and tombstone wire bytes are peer-independent: encode once.
-  let snapshot_bytes = snapshot
-    .as_ref()
-    .map(|snapshot| SyncPayload::Snapshot(ByteVec::from(snapshot.encode()?)).encode())
-    .transpose()?;
+  // Tombstone wire bytes are peer-independent: encode once. The trust
+  // snapshot legs are paged per peer (keyset cursor), so they cannot be
+  // hoisted out of the loop.
   let tombstone_bytes: Vec<Vec<u8>> = if snapshot.is_some() {
     let mut out = Vec::with_capacity(
       leave_records.len() + cleanup_records.len() + revocation_records.len() + 1,
@@ -693,6 +738,12 @@ pub(crate) async fn sync_tick(
       "removal tombstones considered for forwarding"
     );
   }
+  let mut pending_acks: Vec<(
+    NodeId,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )> = Vec::new();
+  let mut pending_trust_cursors: Vec<(NodeId, NodeId)> = Vec::new();
+  let mut failed_peers: Vec<NodeId> = Vec::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
     state.page.arm_full_pass();
@@ -710,60 +761,141 @@ pub(crate) async fn sync_tick(
     // quiet rounds between unchanged pages are what let
     // ticks_since_snapshot_send advance to its resend threshold.
     let page_round = state.page.page_round(page.fingerprint());
-    // A snapshot is due for this peer when its revision advanced past
-    // what this peer last received, or on the slow resend cadence.
-    let snapshot_due = match &snapshot {
-      Some(snapshot) => {
-        snapshot.revision() != state.snapshot_rev
-          || state.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS
-      }
+    // A snapshot pass is due for this peer when its revision advanced
+    // past what this peer last fully received, or on the slow resend
+    // cadence. Tombstones ride their own cadence against the same
+    // revision marker: a revision change forwards the accumulated
+    // tombstones once, and the slow cadence heals lost ones.
+    let revision_advanced = match &snapshot {
+      Some(snapshot) => snapshot.revision() != state.snapshot_rev,
       None => false,
     };
+    let snapshot_due = revision_advanced
+      || match &snapshot {
+        Some(_) => state.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS,
+        None => false,
+      };
+    let tombstones_due = (revision_advanced || !tombstone_bytes.is_empty())
+      && (snapshot.is_some()
+        && (state.ticks_since_tombstone_send >= SNAPSHOT_RESEND_TICKS || snapshot_due));
     match page_round {
-      crate::sync_common::PageRound::Quiet if !snapshot_due => {
+      crate::sync_common::PageRound::Quiet if !snapshot_due && !tombstones_due => {
         state.page.quiet_tick();
         state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
+        state.ticks_since_tombstone_send = state.ticks_since_tombstone_send.saturating_add(1);
         continue;
       }
       crate::sync_common::PageRound::Quiet => {
-        // The page is not due, but the snapshot leg is: dispatch the
-        // snapshot round without advancing the page cursor.
+        // The page is not due, but the snapshot/tombstone leg is:
+        // dispatch that round without advancing the page cursor.
       }
       crate::sync_common::PageRound::Send => {
         state.page.record_send(page.cursor());
       }
     }
-    if snapshot_due {
-      if let Some(snapshot) = &snapshot {
-        state.snapshot_rev = snapshot.revision();
-      }
+    // The trust snapshot leg pages through the issuer's binding set one
+    // wire page per tick (keyset cursor per peer); the revision is only
+    // marked fully delivered on the closing empty-page tick, so an
+    // undelivered page leaves the pass due instead of truncated.
+    let mut snapshot_page: Option<Vec<u8>> = None;
+    let mut snapshot_page_cursor: Option<NodeId> = None;
+    if snapshot_due && let Some(snapshot) = &snapshot {
       state.ticks_since_snapshot_send = 0;
+      let page = snapshot.page_after(state.snapshot_cursor.as_ref(), TRUST_BINDINGS_PAGE_LIMIT);
+      if page.bindings().is_empty() {
+        // The pass is complete for this revision: reset the cursor and
+        // mark the peer fully delivered. No payload this round.
+        state.snapshot_cursor = None;
+        state.snapshot_rev = snapshot.revision();
+      } else {
+        snapshot_page_cursor = page.continuation().cloned();
+        snapshot_page = Some(SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?);
+      }
+    }
+    if tombstones_due {
+      state.ticks_since_tombstone_send = 0;
     }
     let mut payloads: Vec<&[u8]> = Vec::new();
-    if snapshot_due {
-      if let Some(bytes) = &snapshot_bytes {
-        payloads.push(bytes);
-      }
+    if let Some(bytes) = &snapshot_page {
+      payloads.push(bytes);
+    }
+    if tombstones_due {
       payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
     }
     payloads.push(&page_bytes);
-    dispatch_to_peer(peer, &payloads, runtime, entropy, &protocol).await;
-    state.page.count_round();
+    let acks = dispatch_to_peer(peer, &payloads, runtime, entropy, &protocol).await;
+    if acks.is_empty() {
+      // Nothing was queued (the routing queue rejected outright): the
+      // round never left this node.
+      failed_peers.push(peer.clone());
+    } else {
+      state.page.count_round();
+      if let Some(cursor) = snapshot_page_cursor {
+        // The page dispatched: commit the trust cursor only after the
+        // delivery verdict (see below) — an unadmitted page rewinds.
+        pending_trust_cursors.push((peer.clone(), cursor));
+      }
+      pending_acks.extend(acks.into_iter().map(|ack| (peer.clone(), ack)));
+    }
+  }
+  // Delivery verdicts resolve concurrently: one unreachable peer must
+  // not serialize the round behind its ack wait (that would make the
+  // convergence bound liveness teardown, not the anti-entropy cadence).
+  let verdicts =
+    futures_util::future::join_all(pending_acks.into_iter().map(|(peer, ack)| async move {
+      (peer, crate::sync_common::delivered_within_bound(ack).await)
+    }))
+    .await;
+  let delivered_peers: std::collections::HashSet<NodeId> = verdicts
+    .iter()
+    .filter(|(_, delivered)| *delivered)
+    .map(|(peer, _)| peer.clone())
+    .collect();
+  for (peer, delivered) in verdicts {
+    if !delivered {
+      failed_peers.push(peer);
+    }
+  }
+  for peer in failed_peers {
+    // An unadmitted payload means the peer may hold none of this round:
+    // rewind to the failed page's start so the next tick re-sends exactly
+    // that page (the snapshot stays due through its unrecorded revision).
+    if let Some(state) = cursors.peers.get_mut(&peer) {
+      state.page.discard_progress();
+    }
+  }
+  // Trust-page cursor commits are verdict-gated like the page plane: an
+  // undelivered trust page leaves the cursor untouched, so the pass
+  // retries that page instead of skipping it.
+  for (peer, cursor) in pending_trust_cursors {
+    if delivered_peers.contains(&peer)
+      && let Some(state) = cursors.peers.get_mut(&peer)
+    {
+      state.snapshot_cursor = Some(cursor);
+    }
   }
   gc_collected_tombstones(store, entropy).await;
   Ok(())
 }
 
-/// The per-tick fan-out to one peer: sends every payload in order,
-/// swallowing individual delivery failures (the snapshot and page resend
-/// cadences heal lost payloads).
+/// The per-tick fan-out to one peer: sends every payload in order and
+/// returns their admission receivers. A payload swallowed by a session
+/// that still looks alive never resolves its receiver, which is exactly
+/// the signal the caller needs to re-deliver from scratch.
 async fn dispatch_to_peer(
   peer: &NodeId, payloads: &[&[u8]], runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>,
   protocol: &ProtocolTag,
-) {
+) -> Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>> {
+  let mut acks = Vec::new();
   for payload in payloads {
-    let _ = crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await;
+    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload) {
+      Ok(ack) => acks.push(ack),
+      Err(error) => {
+        tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
+      }
+    }
   }
+  acks
 }
 
 /// The post-round checkpoint GC: collect the
@@ -799,11 +931,11 @@ mod tests {
   }
 
   fn node(seed: u8) -> NodeId {
-    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+    NodeId::parse(&format!("node-{seed:021}")).unwrap()
   }
 
   fn node_at(seed: u64) -> NodeId {
-    NodeId::parse(&format!("node_{seed:021}")).unwrap()
+    NodeId::parse(&format!("node-{seed:021}")).unwrap()
   }
 
   fn key_at(value: u64) -> crate::PublicKey {

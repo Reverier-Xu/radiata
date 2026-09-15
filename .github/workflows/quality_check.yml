@@ -43,6 +43,39 @@ jobs:
       - name: cargo fmt
         run: cargo +nightly fmt --all -- --check
 
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: -Dwarnings
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install nightly rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      # The examples live outside the workspace on purpose (customer-style
+      # consumers), so the workspace gates never see them: lint, format, and
+      # the e2e scripts' syntax are gated here instead. Container e2e stays
+      # manual/nightly (podman is not a CI gate).
+      - name: examples quality gates
+        run: |
+          set -euo pipefail
+          for example in examples/*/; do
+            if [ -f "${example}Cargo.toml" ]; then
+              echo "== ${example}"
+              cargo +nightly clippy --manifest-path "${example}Cargo.toml" --all-targets --locked -- -D warnings
+              cargo +nightly fmt --manifest-path "${example}Cargo.toml" --all -- --check
+            fi
+          done
+          python3 -m py_compile examples/*/*.py
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest

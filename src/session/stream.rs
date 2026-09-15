@@ -461,6 +461,10 @@ pub(crate) struct SessionEntry {
   pub(crate) meta: Arc<SessionMeta>,
   alive: Arc<AtomicBool>,
   direction: DialDirection,
+  /// Whether the recovery plane (not the caller) dialed this session:
+  /// pruning only ever retires recovery-dialed edges — caller-configured
+  /// and inbound sessions are never reclaimed by the pruning pass.
+  recovery_dialed: bool,
   retire: watch::Sender<()>,
 }
 
@@ -468,6 +472,12 @@ impl SessionEntry {
   /// Whether the session's reader loop is still serving the connection.
   pub(crate) fn alive(&self) -> bool {
     self.alive.load(Ordering::SeqCst)
+  }
+
+  /// Whether the recovery plane dialed this session (prunable on
+  /// redundancy; see the bounded pruning pass in the recovery tick).
+  pub(crate) fn recovery_dialed(&self) -> bool {
+    self.recovery_dialed
   }
 
   /// The queued outbound frame count (runtime status view).
@@ -498,7 +508,7 @@ impl SessionEntry {
 pub(crate) async fn run_session(
   connection: Connection, session: EstablishedSession, context: Arc<SessionPacketContext>,
   table: SessionTable, shutdown: watch::Receiver<()>, direction: DialDirection,
-  attachment: crate::Endpoint, registered: Option<oneshot::Sender<()>>,
+  attachment: crate::Endpoint, registered: Option<oneshot::Sender<()>>, recovery_dialed: bool,
 ) {
   let peer = session.peer().clone();
   let (writer, mut reader) = connection.into_split();
@@ -544,6 +554,7 @@ pub(crate) async fn run_session(
     }),
     alive: Arc::clone(&alive),
     direction,
+    recovery_dialed,
     retire: retire_tx,
   };
   {
@@ -677,24 +688,10 @@ pub(crate) async fn run_session(
   // forwarded hops relay a failed acknowledgement upstream, and dropped
   // body channels close without an end marker. Every hop fed by this
   // session's peer terminates downstream explicitly.
-  let relays: Vec<(TraceId, BoundedSender)> = if let Ok(mut pending) = pending_acks.lock() {
-    let interrupted = pending.len();
-    let mut relays = Vec::new();
-    for (trace_id, entry) in pending.drain() {
-      match entry {
-        PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(Err(ErrorKind::StreamInterrupted));
-        }
-        PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
-      }
-    }
-    if interrupted > 0 {
-      debug!(interrupted, "session closed pending admissions");
-    }
-    relays
-  } else {
-    Vec::new()
-  };
+  let (interrupted, relays) = fail_pending_waits(&pending_acks);
+  if interrupted > 0 {
+    debug!(interrupted, "session closed pending admissions");
+  }
   for (trace_id, upstream) in relays {
     upstream
       .send_status(&trace_id, crate::packet::wire::AckStatus::Failed)
@@ -825,28 +822,56 @@ pub(crate) fn retire_session(table: &SessionTable, peer: &NodeId) -> Result<()> 
   Ok(())
 }
 
+/// Tears down every registered session at node shutdown: each entry's
+/// pending admissions fail exactly once and its frame sender drops, so
+/// even a session task whose abort landed before the graceful shutdown
+/// signal (skipping its exit cleanup) still closes its writer and
+/// connection — a peer observes the teardown either way.
+pub(crate) fn retire_all_sessions(table: &SessionTable) -> Result<()> {
+  let entries: Vec<SessionEntry> = {
+    let mut guard = table.lock().map_err(crate::Error::session_table)?;
+    std::mem::take(&mut *guard).into_values().collect()
+  };
+  for entry in &entries {
+    retire(entry);
+  }
+  Ok(())
+}
+
 /// Drains one replaced session: it stops accepting new work, its pending
 /// admissions fail exactly once with `StreamInterrupted`, and the retire
 /// signal closes its reader so the connection tears down after the winner
 /// is registered.
 fn retire(entry: &SessionEntry) {
   entry.alive.store(false, Ordering::SeqCst);
-  if let Ok(mut pending) = entry.pending_acks.lock() {
+  let (_, relays) = fail_pending_waits(&entry.pending_acks);
+  for (trace_id, upstream) in relays {
+    // Best-effort relay of the interruption; a saturated queue
+    // cannot be repaired here and the upstream liveness policy
+    // bounds the wait regardless.
+    upstream.try_send_status(&trace_id, crate::packet::wire::AckStatus::Failed);
+  }
+  let _ = entry.retire.send(());
+}
+
+/// Drains one session's pending admission acks, failing every local
+/// waiter with the typed interruption, and returns the count plus the
+/// forwarded hops' upstream senders for the caller's relay handling.
+fn fail_pending_waits(pending_acks: &PendingAcks) -> (usize, Vec<(TraceId, BoundedSender)>) {
+  let mut relays = Vec::new();
+  let mut interrupted = 0_usize;
+  if let Ok(mut pending) = pending_acks.lock() {
+    interrupted = pending.len();
     for (trace_id, ack) in pending.drain() {
       match ack {
         PendingAck::Wait { notify, .. } => {
           let _ = notify.send(Err(ErrorKind::StreamInterrupted));
         }
-        PendingAck::Relay { upstream } => {
-          // Best-effort relay of the interruption; a saturated queue
-          // cannot be repaired here and the upstream liveness policy
-          // bounds the wait regardless.
-          upstream.try_send_status(&trace_id, crate::packet::wire::AckStatus::Failed);
-        }
+        PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
       }
     }
   }
-  let _ = entry.retire.send(());
+  (interrupted, relays)
 }
 
 /// Writes queued session frames in order until the queue closes or the
@@ -1132,6 +1157,16 @@ async fn admit_open(
         debug!(trace_id = %consumer_trace, "incoming consumer spawned");
         consumers.spawn(async move {
           let result = consumer.accept(packet).await;
+          if let Err(error) = &result {
+            // An admitted stream whose consumer failed is an operational
+            // anomaly (decode failure, store fault): surfaced at warn so
+            // it is visible above the protocol's trace/debug traffic.
+            warn!(
+              trace_id = %consumer_trace,
+              kind = ?error.kind(),
+              "packet consumer failed"
+            );
+          }
           debug!(
             trace_id = %consumer_trace,
             ok = result.is_ok(),
@@ -1543,6 +1578,7 @@ pub(crate) fn test_entry(entropy: &dyn crate::api::Entropy) -> (SessionEntry, Bo
     }),
     alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     direction: DialDirection::Outgoing,
+    recovery_dialed: false,
     retire: watch::channel(()).0,
   };
   (entry, receiver)
@@ -1582,7 +1618,7 @@ mod replacement_tests {
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   /// Every completion ordering picks the same single session owner from
@@ -1852,7 +1888,7 @@ mod liveness_tests {
     {
       let (notify, _wait) = oneshot::channel();
       pending.lock().unwrap().insert(
-        crate::TraceId::parse("trace_000000000000000000001").unwrap(),
+        crate::TraceId::parse("trace-000000000000000000001").unwrap(),
         super::PendingAck::Wait {
           notify,
           queued_at: 100,
@@ -1912,7 +1948,7 @@ mod pending_admission_tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   /// A session entry whose pending map is pre-filled with relayed
@@ -1927,7 +1963,7 @@ mod pending_admission_tests {
     };
     let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
     for seed in 0..pending_admissions {
-      let trace_id = TraceId::parse(&format!("trace_{seed:021}")).unwrap();
+      let trace_id = TraceId::parse(&format!("trace-{seed:021}")).unwrap();
       pending_acks.lock().unwrap().insert(
         trace_id,
         PendingAck::Relay {
@@ -1942,13 +1978,14 @@ mod pending_admission_tests {
       pending_admissions,
       clock: Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1))),
       meta: Arc::new(SessionMeta {
-        id: crate::SessionId::parse("session_000000000000000000001").unwrap(),
+        id: crate::SessionId::parse("session-000000000000000000001").unwrap(),
         generation: 1,
         endpoint: crate::Endpoint::parse("wss://saturated:9000").unwrap(),
         features: Vec::new(),
       }),
       alive: Arc::new(AtomicBool::new(true)),
       direction: DialDirection::Outgoing,
+      recovery_dialed: false,
       retire,
     }
   }
@@ -1961,7 +1998,7 @@ mod pending_admission_tests {
     let entry = saturated_entry(4);
     let (ack_tx, ack_rx) = oneshot::channel();
     let request = crate::packet::OutboundRequest {
-      trace_id: TraceId::parse("trace_000000000000000000099").unwrap(),
+      trace_id: TraceId::parse("trace-000000000000000000099").unwrap(),
       target: StreamTarget::Exact(node(2)),
       load_balancer: None,
       max_hops: 1,
@@ -2001,11 +2038,11 @@ mod admission_tests {
   };
 
   fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node_{value:021}")).unwrap()
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
   fn trace(seed: u32) -> TraceId {
-    TraceId::parse(&format!("trace_{seed:021}")).unwrap()
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
   }
 
   fn protocol(name: &str) -> ProtocolTag {

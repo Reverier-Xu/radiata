@@ -1,5 +1,3 @@
-use std::fmt;
-
 /// A stable, secret-safe error category.
 ///
 /// Adding a category only touches this enum and its constructors; the
@@ -32,6 +30,13 @@ pub enum ErrorKind {
   CommitUnknown,
   Cancelled,
   ShuttingDown,
+  /// A caller-originated failure from an extension callback
+  /// ([`PacketConsumer`](crate::PacketConsumer),
+  /// [`RouteNextHop`](crate::routing::RouteNextHop), and the other
+  /// registered policies): the callback's own machinery failed, not the
+  /// core's. Callers construct it through [`Error::caller`]; core code
+  /// never produces it.
+  CallerError,
   Internal,
 }
 
@@ -86,6 +91,8 @@ pub enum ProviderErrorContext {
   RoutingPolicy,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {kind:?}")]
 pub struct Error {
   kind: ErrorKind,
   context: &'static str,
@@ -96,6 +103,20 @@ impl Error {
     Self {
       kind: kind.into_error_kind(),
       context: provider_error_context(context),
+    }
+  }
+
+  /// An extension callback's own failure: registered policies and
+  /// consumers ([`PacketConsumer`](crate::PacketConsumer),
+  /// [`RouteNextHop`](crate::routing::RouteNextHop), …) return this when
+  /// their own machinery failed, instead of misusing [`Error::provider`]
+  /// (reserved for provider implementations). Consumer code integrating
+  /// the crate's errors declares its own business error type and folds
+  /// this type in via `#[from]` (thiserror on the consumer side).
+  pub fn caller(context: &'static str) -> Self {
+    Self {
+      kind: ErrorKind::CallerError,
+      context,
     }
   }
 
@@ -224,24 +245,6 @@ impl Error {
     }
   }
 }
-
-impl fmt::Debug for Error {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter
-      .debug_struct("Error")
-      .field("kind", &self.kind)
-      .field("context", &self.context)
-      .finish()
-  }
-}
-
-impl fmt::Display for Error {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(formatter, "{}: {:?}", self.context, self.kind)
-  }
-}
-
-impl std::error::Error for Error {}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

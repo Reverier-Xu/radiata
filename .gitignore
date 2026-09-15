@@ -1,3 +1,5 @@
 /target
 /fuzz/target
 /slo/target
+__pycache__/
+*.pyc

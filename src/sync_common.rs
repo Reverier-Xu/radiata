@@ -8,8 +8,8 @@ use std::{pin::Pin, sync::Arc};
 use futures_core::Stream;
 
 use crate::{
-  Error, NodeId, ProtocolTag, Result, TraceId, api::Entropy, runtime::RuntimeClient,
-  session::stream::SessionTable,
+  Error, NodeId, ProtocolTag, Result, TraceId, api::Entropy, packet::RoutedAckOutcome,
+  runtime::RuntimeClient, session::stream::SessionTable,
 };
 
 /// The receiver-side body cap for one sync stream: one page is at most a
@@ -63,22 +63,23 @@ pub(crate) fn alive_peers(sessions: &SessionTable) -> Result<Vec<NodeId>> {
 }
 
 /// Sends one sync payload to one peer over the packet data plane as an
-/// exact-target, max-hops-1 internal stream; fire-and-forget delivery
-/// (routing failures are dropped, the next tick retries, and the
-/// anti-entropy loop never stalls). The payload streams as bounded
-/// chunks ([`chunk_payload`]), so an encoded page above the single-chunk
-/// bound still delivers.
-pub(crate) async fn send_payload(
+/// exact-target, max-hops-1 internal stream, and returns the
+/// destination's admission acknowledgement receiver. Queuing is
+/// fire-and-forget, but the receiver is the delivery truth: a page
+/// swallowed by a session that still looks alive never resolves it. The
+/// payload streams as bounded chunks ([`chunk_payload`]), so an encoded
+/// page above the single-chunk bound still delivers.
+pub(crate) fn send_payload(
   runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, peer: &NodeId, protocol: &ProtocolTag,
   encoded: &[u8],
-) -> Result<()> {
+) -> Result<tokio::sync::oneshot::Receiver<RoutedAckOutcome>> {
   let trace_id = TraceId::generate(entropy.as_ref())?;
   // The chunk vec owns its bytes, so the body stream is 'static and the
-  // fire-and-forget request never borrows this call's slice.
+  // request never borrows this call's slice.
   let chunks: Vec<Arc<[u8]>> = chunk_payload(encoded).collect();
   let body: crate::packet::BodyStream =
     Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)));
-  let (ack_notify, _ack) = tokio::sync::oneshot::channel();
+  let (ack_notify, ack_rx) = tokio::sync::oneshot::channel();
   let request = crate::packet::OutboundRequest {
     trace_id,
     target: crate::StreamTarget::Exact(peer.clone()),
@@ -90,15 +91,91 @@ pub(crate) async fn send_payload(
     internal: true,
     ack_notify,
   };
-  // Fire-and-forget: the admission ack (or its absence) is retried by the
-  // next tick; a full routing queue drops the payload without blocking.
-  runtime.try_send_packet(request)
+  runtime.try_send_packet(request)?;
+  Ok(ack_rx)
 }
+
+/// Resolves one dispatched payload's admission within [`SEND_ACK_WAIT`].
+/// A dead session resolves immediately; a rejecting one returns the
+/// typed failure; a half-dead one (the session still queues but nothing
+/// crosses) surfaces as the timeout. Every outcome except the ack makes
+/// the caller re-send the failed page on the next tick.
+pub(crate) async fn delivered_within_bound(
+  ack: tokio::sync::oneshot::Receiver<RoutedAckOutcome>,
+) -> bool {
+  tokio::time::timeout(SEND_ACK_WAIT, ack)
+    .await
+    .is_ok_and(|outcome| outcome.is_ok())
+}
+
+/// The bounded wait for one sync payload's admission acknowledgement:
+/// long enough to cover a healthy round trip on a loaded session, short
+/// enough that one unreachable peer cannot stall the anti-entropy tick
+/// beyond a small multiple of its cadence.
+pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
-  use super::chunk_payload;
+  use super::{PageRound, PeerPageCursor, chunk_payload, delivered_within_bound};
   use crate::packet::MAX_CHUNK_BYTES;
+
+  /// The bounded delivery verdict: a resolved admission is true, and a
+  /// dropped admission channel (dead session) resolves false without
+  /// waiting out the bound.
+  #[tokio::test]
+  async fn delivered_within_bound_observes_the_admission_outcome() {
+    let (notify, ack) = tokio::sync::oneshot::channel();
+    let node = crate::NodeId::generate(&crate::api::SystemEntropy).expect("node id");
+    let sent = notify.send(Ok(crate::packet::RoutedAck {
+      by: node,
+      admitted_at: std::time::SystemTime::now(),
+    }));
+    assert!(sent.is_ok(), "ack channel open");
+    assert!(delivered_within_bound(ack).await);
+
+    let (notify, ack) = tokio::sync::oneshot::channel::<crate::packet::RoutedAckOutcome>();
+    drop(notify);
+    assert!(!delivered_within_bound(ack).await);
+  }
+
+  /// A delivery failure heals within one tick by re-sending exactly the
+  /// failed page: the continuation rewinds to the page's start (acked
+  /// predecessors stay delivered), and the forced resend-due state makes
+  /// the retry fire immediately regardless of the recorded fingerprint.
+  #[test]
+  fn discarded_progress_re_sends_the_failed_page_on_the_next_round() {
+    let mut state = PeerPageCursor::default();
+    // First page (from scratch): its start is the empty continuation.
+    assert_eq!(state.page_round(7), PageRound::Send);
+    state.record_send(Some(&[9, 9]));
+    // Second page dispatched from cursor [9, 9]: its failure rewinds to
+    // [9, 9], not to scratch.
+    state.discard_progress();
+    assert_eq!(
+      state.continuation(),
+      None,
+      "first-page failure rewinds to scratch"
+    );
+
+    // Mid-pass failure: page two's start is cursor [9, 9].
+    state.record_send(Some(&[9, 9]));
+    state.record_send(Some(&[4, 4]));
+    state.discard_progress();
+    assert_eq!(
+      state.continuation(),
+      Some(&[9, 9][..]),
+      "mid-pass failure rewinds to the failed page's start"
+    );
+    assert_eq!(
+      state.page_round(7),
+      PageRound::Send,
+      "continuation round always sends"
+    );
+
+    // A settled catalog goes quiet after a complete pass.
+    state.record_send(None);
+    assert_eq!(state.page_round(7), PageRound::Quiet);
+  }
 
   /// A payload above the 32 KiB chunk bound splits into pump-legal
   /// chunks whose concatenation is exactly the payload: a fat page
@@ -149,6 +226,12 @@ pub(crate) struct PeerPageCursor {
   /// This peer's page continuation cursor, so sync converges beyond a
   /// single page.
   page: Option<Vec<u8>>,
+  /// The continuation the last dispatched page was emitted from: an
+  /// undelivered page rewinds to exactly this point — the failed page
+  /// is re-sent, not the whole prefix (acked pages are already durable
+  /// on the peer and re-sending them under load turns convergence into
+  /// a random walk that stalls deep catalogs).
+  page_start: Option<Vec<u8>>,
 }
 
 /// One page-plane round outcome for a peer.
@@ -209,11 +292,23 @@ impl PeerPageCursor {
     self.rounds_since_full = self.rounds_since_full.saturating_add(1);
   }
 
-  /// Records one dispatched page: advances the continuation cursor and
-  /// resets the page resend cadence.
+  /// Records one dispatched page: advances the continuation cursor,
+  /// remembers where the page started (for a single-page re-send on
+  /// delivery failure), and resets the page resend cadence.
   pub(crate) fn record_send(&mut self, next_cursor: Option<&[u8]>) {
+    self.page_start = self.page.take();
     self.page = next_cursor.map(|value| value.to_vec());
     self.ticks_since_page_send = 0;
+  }
+
+  /// Rewinds the continuation to the start of the undelivered page: the
+  /// next round re-sends exactly that page — acked predecessors stay
+  /// delivered — and the forced resend-due state makes the retry fire on
+  /// the next tick even on an otherwise quiet peer. A failure on the
+  /// first page of a pass rewinds to scratch.
+  pub(crate) fn discard_progress(&mut self) {
+    self.page = self.page_start.take();
+    self.ticks_since_page_send = Self::PAGE_RESEND_TICKS;
   }
 
   /// Advances the full-pass counter after one dispatched round (a round
