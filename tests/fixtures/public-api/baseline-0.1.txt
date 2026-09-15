@@ -499,6 +499,7 @@ impl radiata::NodeConfig
 pub fn radiata::NodeConfig::new() -> Self
 pub fn radiata::NodeConfig::require_feature(self, radiata::FeatureTag) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_anti_entropy_interval(self, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_dial_deadline(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_parser_limits(self, radiata::ParserLimits) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_receipt_retention(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_recovery_policy(self, radiata::RecoveryConfig) -> radiata::Result<Self>

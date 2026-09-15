@@ -330,7 +330,8 @@ impl Supervisor {
     for (member, endpoint) in candidates {
       if step.targets.contains(&member) {
         // Recovery dials run in a detached task so the supervisor select
-        // loop never blocks on a handshake (each can take the full
+        // loop never blocks on a handshake (each holds its in-flight
+        // slot no longer than the configured dial deadline plus the
         // authentication deadline); the result is reconciled by the next
         // observation tick.
         self
@@ -344,9 +345,18 @@ impl Supervisor {
         let shutdown = self.shutdown_tx.subscribe();
         let pending = std::sync::Arc::clone(&self.recovery_pending);
         let transport = Arc::clone(&self.dependencies.transport);
+        let dial_deadline = self.dependencies.config.dial_deadline();
         tokio::spawn(async move {
           if let Err(error) = dial_member(
-            transport, driver, sessions, packet, shutdown, receiver, &peer, true,
+            transport,
+            driver,
+            sessions,
+            packet,
+            shutdown,
+            receiver,
+            &peer,
+            true,
+            dial_deadline,
           )
           .await
           {

@@ -1063,11 +1063,16 @@ impl Supervisor {
   ) -> Result<MergeView> {
     self.require_unblocked()?;
     crate::audit::dial_started(&receiver.to_string(), false);
-    let mut connection = self
-      .dependencies
-      .transport
-      .connect(receiver.clone(), tls::merge_client_config()?)
-      .await?;
+    // The configured dial deadline bounds the connect so a peer that
+    // accepts and then goes silent cannot stall the supervisor's control
+    // loop (every command, tick, and keepalive shares that loop).
+    let mut connection = connect_with_deadline(
+      &self.dependencies.transport,
+      receiver.clone(),
+      tls::merge_client_config()?,
+      self.dependencies.config.dial_deadline(),
+    )
+    .await?;
     let hint = connection
       .merge_hint()
       .cloned()
@@ -1124,6 +1129,7 @@ impl Supervisor {
       receiver,
       &peer,
       false,
+      self.dependencies.config.dial_deadline(),
     )
     .await
   }
@@ -1864,16 +1870,46 @@ impl Supervisor {
   }
 }
 
+/// Dials one transport connection under the configured dial deadline:
+/// the deadline bounds the whole connect (TCP dial, TLS handshake, and
+/// WebSocket upgrade), so a peer that accepts and then goes silent
+/// cannot stall the supervisor's control loop or hold a recovery slot
+/// forever. An elapsed deadline maps onto the same coarse typed
+/// transport-connect failure as any other dial error; the connect
+/// future is cancelled, so the deadline and endpoint are the only real
+/// cause a diagnostic can carry.
+async fn connect_with_deadline(
+  transport: &Arc<dyn Transport>, receiver: Endpoint, client: std::sync::Arc<rustls::ClientConfig>,
+  deadline: std::time::Duration,
+) -> Result<crate::transport::connection::Connection> {
+  match tokio::time::timeout(deadline, transport.connect(receiver.clone(), client)).await {
+    Ok(result) => result,
+    Err(_) => {
+      tracing::debug!(
+        endpoint = %receiver.as_str(),
+        deadline = ?deadline,
+        "transport dial deadline elapsed"
+      );
+      Err(Error::provider(
+        crate::ProviderErrorKind::Io,
+        crate::ProviderErrorContext::TransportConnect,
+      ))
+    }
+  }
+}
+
 /// Runs one member-mode dial against an already-admitted peer: the
 /// member-mode handshake proves both identities over a fresh transcript
 /// and exporter binding, then the session is kept open for packet streams.
 /// Called by `connect_member` and by the recovery controller's detached
-/// dial tasks.
+/// dial tasks. The dial deadline travels with the call so a detached
+/// recovery dial releases its in-flight slot within the bound.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn dial_member(
   transport: Arc<dyn Transport>, driver: SessionDriver,
   sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
   shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId, recovery_dialed: bool,
+  dial_deadline: std::time::Duration,
 ) -> Result<NodeId> {
   crate::audit::dial_started(peer.as_str(), recovery_dialed);
   let result = async {
@@ -1887,7 +1923,8 @@ pub(super) async fn dial_member(
       }
       None => tls::merge_client_config()?,
     };
-    let mut connection = transport.connect(receiver.clone(), config).await?;
+    let mut connection =
+      connect_with_deadline(&transport, receiver.clone(), config, dial_deadline).await?;
     let session = driver.initiate_member(&mut connection, peer).await?;
     let authenticated = session.peer().clone();
     // The member-mode dial returns only after the session table settles, so
@@ -1961,6 +1998,69 @@ fn issue_write_stamp_since(clock: &std::sync::atomic::AtomicU64, observed: u64) 
   let stamp = previous.saturating_add(1).max(observed);
   clock.fetch_max(stamp, std::sync::atomic::Ordering::Relaxed);
   stamp
+}
+
+#[cfg(test)]
+mod dial_deadline_tests {
+  use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+  };
+
+  use super::connect_with_deadline;
+  use crate::{
+    Endpoint, ErrorKind,
+    transport::{registry::WssTransport, tls},
+  };
+
+  /// A peer that accepts TCP and then goes silent must surface the typed
+  /// dial failure within the configured deadline instead of hanging the
+  /// dialer. This exercises the one helper every production dial path
+  /// shares (`merge_cluster`, `connect_member`, and the detached
+  /// recovery dials through `dial_member`); the regression it guards is
+  /// a connect with no bound at all, which stalled the supervisor's
+  /// control loop and pinned recovery slots forever.
+  #[tokio::test]
+  async fn a_silent_peer_fails_the_dial_within_the_deadline() {
+    // The listener accepts and then holds the socket without ever
+    // speaking TLS: the TCP connect succeeds, then the handshake stalls
+    // on a socket that never answers. Holding it open matters — an
+    // early drop would reset the connection, let the TLS handshake fail
+    // fast, and bypass the timeout path under test.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let holder = tokio::spawn(async move {
+      let (_held, _) = listener.accept().await.unwrap();
+      tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let transport: Arc<dyn crate::transport::registry::Transport> = Arc::new(WssTransport::new());
+    let endpoint = Endpoint::parse(&format!("wss://127.0.0.1:{}", address.port())).unwrap();
+    let deadline = Duration::from_millis(100);
+    let started = Instant::now();
+    let error = connect_with_deadline(
+      &transport,
+      endpoint,
+      tls::merge_client_config().unwrap(),
+      deadline,
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+
+    // The same coarse typed classification as any other dial failure.
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(error.context(), "transport connect");
+    // The failure lands on the deadline, not instantaneously (an early
+    // socket error) and not at the unbounded OS connect timeout.
+    assert!(elapsed >= deadline);
+    assert!(
+      elapsed < Duration::from_secs(5),
+      "the dial took {elapsed:?}"
+    );
+
+    holder.abort();
+  }
 }
 
 #[cfg(test)]
