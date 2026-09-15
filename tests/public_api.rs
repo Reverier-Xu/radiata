@@ -1189,6 +1189,49 @@ async fn file_key_store_is_externally_drivable() {
   assert_eq!(error.kind(), radiata::ErrorKind::StorageCorrupt);
 }
 
+/// The built-in ephemeral key store is externally drivable: the
+/// in-memory constructor backs the same `KeyProvider` lifecycle within
+/// one process, and deleted keys can never sign again.
+#[tokio::test]
+async fn ephemeral_key_store_is_externally_drivable() {
+  let store: Arc<dyn KeyProvider> = radiata::adapters::ephemeral_key_store();
+  let operation = KeyOperationId::parse("keyop-0000000000000000000f2").unwrap();
+  let message = b"ephemeral key store message";
+
+  assert!(matches!(
+    store.reconcile_create(&operation).await.unwrap(),
+    KeyCreateState::Absent
+  ));
+  let created = store.create_ed25519(&operation).await.unwrap();
+  let created = match created {
+    KeyCreateState::Present(created) => created,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  let signature = store.sign(created.handle(), message).await.unwrap();
+  let verifying = ed25519_dalek::VerifyingKey::from_bytes(created.public_key().as_bytes()).unwrap();
+  verifying
+    .verify_strict(
+      message,
+      &ed25519_dalek::Signature::from_bytes(signature.as_bytes()),
+    )
+    .unwrap();
+
+  let replayed = store.create_ed25519(&operation).await.unwrap();
+  let replayed = match replayed {
+    KeyCreateState::Present(replayed) => replayed,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  assert_eq!(
+    replayed.public_key().as_bytes(),
+    created.public_key().as_bytes()
+  );
+
+  let deleted = store.delete(&operation, created.handle()).await.unwrap();
+  assert!(matches!(deleted, KeyDeleteState::Present));
+  let error = store.sign(created.handle(), message).await.unwrap_err();
+  assert_eq!(error.kind(), radiata::ErrorKind::StorageCorrupt);
+}
+
 // --------------------------------------------------------------- helpers
 
 fn init_tracing() {

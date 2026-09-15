@@ -170,4 +170,18 @@ pub mod adapters {
   pub fn file_key_store(path: PathBuf) -> Arc<dyn KeyProvider> {
     Arc::new(crate::keys::file::FileKeyStore::new(path))
   }
+
+  /// Creates a fully in-memory Ed25519 key store.
+  ///
+  /// The same operation-id discipline as [`file_key_store`], held
+  /// entirely in memory: every custody artifact is lost when this value
+  /// is dropped or the process exits. **Identity bindings built on this
+  /// store do not survive a restart** — a restarted node cannot sign,
+  /// so a cluster joined with an ephemeral key must re-join from
+  /// scratch. This constructor exists for tests and for nodes whose
+  /// identity is deliberately ephemeral; nothing else. Keys are
+  /// zeroized on removal and on drop.
+  pub fn ephemeral_key_store() -> Arc<dyn KeyProvider> {
+    Arc::new(crate::keys::ephemeral::EphemeralKeyStore::new())
+  }
 }

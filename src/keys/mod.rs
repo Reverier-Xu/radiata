@@ -6,6 +6,7 @@
 //! self-describing after a restart and a retried operation resolves to
 //! the same key forever.
 
+pub(crate) mod ephemeral;
 pub(crate) mod file;
 
 use std::sync::Arc;
