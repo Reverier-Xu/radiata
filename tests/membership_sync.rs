@@ -840,6 +840,13 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   merge_with_retry(&nodes[1], nodes[0].endpoint.clone(), &secret).await;
   merge_with_retry(&nodes[2], nodes[0].endpoint.clone(), &secret).await;
   wait_trust(&nodes, 3, Duration::from_secs(30)).await;
+  // Descriptor readiness: the leaves must hold each other's descriptors
+  // BEFORE the hub dies. The recovery universe is the local member
+  // table, and the only path a leaf's descriptor takes to its peer is
+  // through the hub's pages — once the hub is gone a missing descriptor
+  // can never arrive, and the mesh step would dial nothing but the dead
+  // hub forever.
+  wait_descriptors(&nodes, 3, 1, Duration::from_secs(30)).await;
 
   // Hub loss: both leaves are isolated and mesh through a recovery-dialed
   // edge.
