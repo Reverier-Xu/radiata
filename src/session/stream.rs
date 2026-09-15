@@ -1305,6 +1305,78 @@ fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) {
   }
 }
 
+/// Registers one outbound open's admission slot in the session's pending
+/// map: typed backpressure beyond the per-session bound, internal failure
+/// if the lock is poisoned. The named seam of the outbound pump's
+/// admission phase.
+fn register_admission(
+  entry: &SessionEntry, trace_id: &TraceId, ack_tx: tokio::sync::oneshot::Sender<AckOutcome>,
+) -> Result<(), ErrorKind> {
+  let queued_at = clock_seconds(entry.clock.as_ref());
+  let registered = entry.pending_acks.lock().map(|mut pending| {
+    // Typed backpressure instead of unbounded growth: beyond the
+    // per-session admission bound the open fails closed.
+    if pending.len() >= entry.pending_admissions {
+      return Err(ErrorKind::Overloaded);
+    }
+    pending.insert(
+      trace_id.clone(),
+      PendingAck::Wait {
+        notify: ack_tx,
+        queued_at,
+      },
+    );
+    Ok(())
+  });
+  match registered {
+    Ok(Ok(())) => Ok(()),
+    Ok(Err(kind)) => Err(kind),
+    Err(_) => Err(ErrorKind::Internal),
+  }
+}
+
+/// Streams one admitted body as ordered bounded chunks over the session
+/// queue, advancing the route record's forwarded-bytes counter. Returns
+/// the wire failure if the session queue dies mid-stream or the body
+/// violates the chunk bound.
+async fn pump_chunks(
+  entry: &SessionEntry, routes: &RouteTable, trace_id: &TraceId,
+  mut body: crate::packet::BodyStream,
+) -> Result<(), ErrorKind> {
+  let mut sequence = 0_u64;
+  loop {
+    match std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+      Some(Ok(bytes)) => {
+        if bytes.len() > MAX_CHUNK_BYTES {
+          return Err(ErrorKind::InvalidInput);
+        }
+        let forwarded = bytes.len() as u64;
+        let chunk = ChunkFrame {
+          trace_id: trace_id.clone(),
+          sequence,
+          bytes: ByteVec::from(bytes.to_vec()),
+        };
+        sequence = sequence.saturating_add(1);
+        let encoded = wire::encode_chunk(&chunk).map_err(|error| error.kind())?;
+        entry
+          .frames
+          .send(SessionFrame {
+            kind: PacketKind::Chunk,
+            body: encoded,
+          })
+          .await
+          .map_err(|_| ErrorKind::StreamInterrupted)?;
+        trace!(sequence, bytes = forwarded, "packet chunk queued");
+        update_route(routes, trace_id, |record| {
+          record.forward(forwarded);
+        });
+      }
+      None => return Ok(()),
+      Some(Err(error)) => return Err(error.kind()),
+    }
+  }
+}
+
 /// Pumps one outbound packet over its session: open, admission wait,
 /// ordered chunks, end. Updates the in-memory route record and notifies
 /// the synchronous waiter of the admission outcome (the ack
@@ -1358,35 +1430,17 @@ pub(crate) async fn run_outbound(
     terminal!(ErrorKind::StreamInterrupted);
     return;
   }
-  {
-    let queued_at = clock_seconds(entry.clock.as_ref());
-    let registered = entry.pending_acks.lock().map(|mut pending| {
-      // Typed backpressure instead of unbounded growth: beyond the
-      // per-session admission bound the open fails closed.
-      if pending.len() >= entry.pending_admissions {
-        return Err(());
-      }
-      pending.insert(
-        trace_id.clone(),
-        PendingAck::Wait {
-          notify: ack_tx,
-          queued_at,
-        },
-      );
-      Ok(())
-    });
-    match registered {
-      Ok(Ok(())) => {}
-      Ok(Err(())) => {
-        request.reject(ErrorKind::Overloaded);
-        terminal!(ErrorKind::Overloaded);
-        return;
-      }
-      Err(_) => {
-        request.reject(ErrorKind::Internal);
-        terminal!(ErrorKind::Internal);
-        return;
-      }
+  match register_admission(&entry, &trace_id, ack_tx) {
+    Ok(()) => {}
+    Err(ErrorKind::Overloaded) => {
+      request.reject(ErrorKind::Overloaded);
+      terminal!(ErrorKind::Overloaded);
+      return;
+    }
+    Err(kind) => {
+      request.reject(kind);
+      terminal!(kind);
+      return;
     }
   }
 
@@ -1466,52 +1520,9 @@ pub(crate) async fn run_outbound(
     trace_id.clone(),
   )));
 
-  let mut sequence = 0_u64;
-  let mut body = request.body;
-  loop {
-    match std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-      Some(Ok(bytes)) => {
-        if bytes.len() > MAX_CHUNK_BYTES {
-          terminal!(ErrorKind::InvalidInput);
-          return;
-        }
-        let forwarded = bytes.len() as u64;
-        let chunk = ChunkFrame {
-          trace_id: trace_id.clone(),
-          sequence,
-          bytes: ByteVec::from(bytes.to_vec()),
-        };
-        sequence = sequence.saturating_add(1);
-        let encoded = match wire::encode_chunk(&chunk) {
-          Ok(encoded) => encoded,
-          Err(error) => {
-            terminal!(error.kind());
-            return;
-          }
-        };
-        if entry
-          .frames
-          .send(SessionFrame {
-            kind: PacketKind::Chunk,
-            body: encoded,
-          })
-          .await
-          .is_err()
-        {
-          terminal!(ErrorKind::StreamInterrupted);
-          return;
-        }
-        trace!(sequence, bytes = forwarded, "packet chunk queued");
-        update_route(&routes, &trace_id, |record| {
-          record.forward(forwarded);
-        });
-      }
-      None => break,
-      Some(Err(error)) => {
-        terminal!(error.kind());
-        return;
-      }
-    }
+  if let Err(kind) = pump_chunks(&entry, &routes, &trace_id, request.body).await {
+    terminal!(kind);
+    return;
   }
 
   let end = match wire::encode_end(&EndFrame {
