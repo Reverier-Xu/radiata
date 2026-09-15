@@ -89,12 +89,12 @@ pub(crate) fn run_crash_child(
 }
 
 /// The crash matrices' lock-window reopen helpers, compiled only where
-/// their caller matrices exist (unix builds with the json or redb
-/// backend): a SIGKILLed crash child releases its flock when the process
-/// dies, but a loaded runner may schedule the parent's reopen before the
-/// release lands. Crash-matrix parents reopen through these, never
+/// their caller matrices exist (test builds with the json or redb
+/// backend): a SIGKILLed crash child releases its lock when the process
+/// dies, but a loaded runner may schedule the parent's reopen before
+/// the release lands. Crash-matrix parents reopen through these, never
 /// through a bare open.
-#[cfg(all(test, unix, any(feature = "json", feature = "redb")))]
+#[cfg(all(test, any(feature = "json", feature = "redb")))]
 pub(crate) mod crash_reopen {
   use std::{sync::Arc, time::Duration};
 
