@@ -303,6 +303,15 @@ pub(crate) async fn spawn_runtime(
   dependencies
     .extensions
     .register_core_protocol(resource_definition, resource_consumer)?;
+  // The negotiation registry and the node offer are built before the
+  // runtime is marked ready (the core protocols above joined the feature
+  // set): a provisioning failure (a caller-required feature outside the
+  // registry) is a typed start() error, never a running node that
+  // silently stopped.
+  let mut definitions = crate::protocol::feature::builtin_definitions()?;
+  definitions.extend(dependencies.extensions.feature_definitions());
+  let registry = crate::protocol::feature::FeatureRegistry::build(definitions)?;
+  let offer = node_offer(&registry, dependencies.config.required_features())?;
   let routes = dependencies.routes.clone();
   let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
   let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
@@ -318,6 +327,7 @@ pub(crate) async fn spawn_runtime(
     sync_rounds,
     state_tx,
     ready_tx,
+    offer,
   ));
 
   ready_rx
@@ -332,6 +342,7 @@ async fn supervise(
   mut packets: mpsc::Receiver<crate::packet::OutboundRequest>,
   sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
   state: watch::Sender<LifecycleSnapshot>, ready: oneshot::Sender<()>,
+  offer: crate::protocol::offer::FeatureOffer,
 ) {
   let mut tasks = JoinSet::<()>::new();
   let mut lifecycle = LifecyclePublisher::new(state);
@@ -350,11 +361,16 @@ async fn supervise(
     return;
   }
 
-  let mut supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds) {
+  let mut supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds, offer) {
     Ok(supervisor) => supervisor,
     Err(failure) => {
+      // Unreachable today: the offer was built in spawn_runtime before
+      // the runtime was marked ready, so the only remaining failure is
+      // the internal context invariant. Publish Fatal anyway — a
+      // provisioning failure can never mask as an explicit shutdown.
       let (error, dependencies) = *failure;
       tracing::error!(kind = ?error.kind(), "supervisor provisioning failed");
+      lifecycle.publish(LifecycleSnapshot::failed());
       finish_shutdown(
         control,
         tasks,
@@ -362,7 +378,7 @@ async fn supervise(
         Vec::new(),
         &mut lifecycle,
         None,
-        ShutdownReason::Explicit,
+        ShutdownReason::Fatal(error.kind()),
       )
       .await;
       return;
@@ -784,24 +800,10 @@ impl Supervisor {
   fn new(
     dependencies: RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
     sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+    offer: crate::protocol::offer::FeatureOffer,
   ) -> std::result::Result<Self, Box<(Error, RuntimeDependencies)>> {
     let Some(context) = dependencies.context.clone() else {
       return Err(Box::new((Error::internal("runtime context"), dependencies)));
-    };
-    // The negotiation registry is the frozen built-in set plus every
-    // caller-registered feature definition.
-    let mut definitions = match crate::protocol::feature::builtin_definitions() {
-      Ok(definitions) => definitions,
-      Err(error) => return Err(Box::new((error, dependencies))),
-    };
-    definitions.extend(dependencies.extensions.feature_definitions());
-    let registry = match crate::protocol::feature::FeatureRegistry::build(definitions) {
-      Ok(registry) => registry,
-      Err(error) => return Err(Box::new((error, dependencies))),
-    };
-    let offer = match node_offer(&registry, dependencies.config.required_features()) {
-      Ok(offer) => offer,
-      Err(error) => return Err(Box::new((error, dependencies))),
     };
     let policy = crate::session::stream::SessionPolicy::from_config(&dependencies.config);
     let packet = Arc::new(session_packet_context(
