@@ -635,6 +635,19 @@ const LEAVE_RESEND_CAP: usize = 64;
 /// [`crate::sync_common::PeerPageCursor`].
 const SNAPSHOT_RESEND_TICKS: u32 = 8;
 
+/// The tombstone forwarding decision for one peer round: a revision
+/// change forwards the accumulated tombstones once, and the slow
+/// cadence heals lost ones. The decision is snapshot-INDEPENDENT — a
+/// degraded snapshot leg (refresh failing) must never stall tombstone
+/// propagation, because the tombstones are what retire removed
+/// identities on peers.
+fn tombstone_round_due(
+  revision_advanced: bool, has_tombstones: bool, ticks_since_send: u32, snapshot_due: bool,
+) -> bool {
+  (revision_advanced || has_tombstones)
+    && (ticks_since_send >= SNAPSHOT_RESEND_TICKS || snapshot_due)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>, sessions: &SessionTable,
@@ -709,8 +722,10 @@ pub(crate) async fn sync_tick(
   cursors.peers.retain(|peer, _| peers.contains(peer));
   // Tombstone wire bytes are peer-independent: encode once. The trust
   // snapshot legs are paged per peer (keyset cursor), so they cannot be
-  // hoisted out of the loop.
-  let tombstone_bytes: Vec<Vec<u8>> = if snapshot.is_some() {
+  // hoisted out of the loop. The bytes are snapshot-INDEPENDENT: a
+  // failed refresh must never stall this lane (the tombstones are what
+  // retire removed identities on peers).
+  let tombstone_bytes: Vec<Vec<u8>> = {
     let mut out = Vec::with_capacity(
       leave_records.len() + cleanup_records.len() + revocation_records.len() + 1,
     );
@@ -727,8 +742,6 @@ pub(crate) async fn sync_tick(
       out.push(SyncPayload::Checkpoint(ByteVec::from(checkpoint.encode()?)).encode()?);
     }
     out
-  } else {
-    Vec::new()
   };
   if !leave_records.is_empty() || !cleanup_records.is_empty() {
     tracing::debug!(
@@ -765,7 +778,9 @@ pub(crate) async fn sync_tick(
     // past what this peer last fully received, or on the slow resend
     // cadence. Tombstones ride their own cadence against the same
     // revision marker: a revision change forwards the accumulated
-    // tombstones once, and the slow cadence heals lost ones.
+    // tombstones once, and the slow cadence heals lost ones. The
+    // cadence runs even while the snapshot leg is degraded (refresh
+    // failing): tombstone forwarding is snapshot-independent by contract.
     let revision_advanced = match &snapshot {
       Some(snapshot) => snapshot.revision() != state.snapshot_rev,
       None => false,
@@ -775,9 +790,12 @@ pub(crate) async fn sync_tick(
         Some(_) => state.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS,
         None => false,
       };
-    let tombstones_due = (revision_advanced || !tombstone_bytes.is_empty())
-      && (snapshot.is_some()
-        && (state.ticks_since_tombstone_send >= SNAPSHOT_RESEND_TICKS || snapshot_due));
+    let tombstones_due = tombstone_round_due(
+      revision_advanced,
+      !tombstone_bytes.is_empty(),
+      state.ticks_since_tombstone_send,
+      snapshot_due,
+    );
     match page_round {
       crate::sync_common::PageRound::Quiet if !snapshot_due && !tombstones_due => {
         state.page.quiet_tick();
@@ -941,6 +959,39 @@ mod tests {
   fn key_at(value: u64) -> crate::PublicKey {
     let signing = crate::identity::testing::scripted_signing(value);
     crate::PublicKey::from_bytes(signing.verifying_key().to_bytes())
+  }
+
+  // The tombstone decision is snapshot-independent: with the snapshot
+  // leg degraded (refresh failing, no revision signal), the slow
+  // cadence alone keeps forwarding accumulated tombstones.
+  #[test]
+  fn tombstones_forward_on_the_slow_cadence_without_a_snapshot() {
+    // No snapshot: revision_advanced and snapshot_due are both false.
+    let revision_advanced = false;
+    let snapshot_due = false;
+    // Tombstones present and the resend cadence reached: due.
+    assert!(tombstone_round_due(
+      revision_advanced,
+      true,
+      SNAPSHOT_RESEND_TICKS,
+      snapshot_due
+    ));
+    // Before the cadence: quiet.
+    assert!(!tombstone_round_due(
+      revision_advanced,
+      true,
+      0,
+      snapshot_due
+    ));
+    // No tombstones: nothing to forward, cadence or not.
+    assert!(!tombstone_round_due(
+      revision_advanced,
+      false,
+      SNAPSHOT_RESEND_TICKS,
+      snapshot_due
+    ));
+    // With a healthy snapshot, a revision advance forwards immediately.
+    assert!(tombstone_round_due(true, true, 0, true));
   }
 
   /// Regression: a snapshot refresh failure used to fail the whole sync
