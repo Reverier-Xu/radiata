@@ -1,11 +1,15 @@
-# archive/：时点性报告归档
+# archive/: point-in-time report archive
 
-本目录存放**已完成或已被取代**的历史报告。它们记录当时的基线、方法与结论，
-对追溯决策有用，但描述的代码状态已过期，**不反映当前实现，不再维护**。
+This directory holds **completed or superseded** historical reports. They record
+the baseline, methodology, and conclusions of their time — useful for tracing
+decisions, but the code states they describe are outdated: they do **not**
+reflect the current implementation and are no longer maintained.
 
-- 当前任务清单见 [../plan-0.1.0.md](../plan-0.1.0.md)；
-- 当前架构概览见 [../architecture.md](../architecture.md)（待 0.1.0 刷新）；
-- 实现事实以代码与注释为唯一来源，API 参考以 rustdoc 为准。
+- Current task ledger: [../plan-0.1.0.md](../plan-0.1.0.md)
+- Current architecture overview: [../architecture.md](../architecture.md)
+- Implementation facts live in the code and its comments; the rustdoc is the
+  authoritative API reference.
 
-归档原则：报告的全部行动项要么已关闭、要么已折叠进 plan-0.1.0.md 的对应条目
-（各条目"来源"字段可追溯到原报告章节）。
+Archive policy: every action item in an archived report is either closed or
+folded into the corresponding entry of `plan-0.1.0.md` (each entry's "source"
+field traces back to the original report section).
