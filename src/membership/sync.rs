@@ -1051,23 +1051,25 @@ mod tests {
 
   /// Regression: a snapshot refresh failure used to fail the whole sync
   /// tick every round — an issuer binding set over the single-record
-  /// control bound cannot encode (~870+ bindings), so descriptor and
-  /// tombstone anti-entropy stalled permanently. The oversized issuer
-  /// refresh fails in isolation, the tick still returns success, and the
-  /// page plane keeps advancing (round dispatched, resend cadence armed)
-  /// while no snapshot revision is ever recorded.
+  /// store bound cannot encode (past the 16 384-entry collection cap of
+  /// the 1 MiB store body), so descriptor and tombstone anti-entropy
+  /// stalled permanently. The oversized issuer refresh fails in
+  /// isolation, the tick still returns success, and the page plane keeps
+  /// advancing (round dispatched, resend cadence armed) while no snapshot
+  /// revision is ever recorded.
   #[tokio::test]
   async fn sync_tick_survives_snapshot_refresh_overflow() {
     use crate::{
       identity::{
         lifecycle,
-        testing::{ScriptedKeys, SequenceEntropy},
+        records::{IdentityBindingV1, identity_binding_key},
+        testing::{ScriptedKeys, SequenceEntropy, inject_entry},
       },
       storage::contract::{ReferenceFactory, required_capabilities},
     };
 
-    let factory: Arc<dyn crate::provider::StorageFactory> =
-      Arc::new(ReferenceFactory::new(required_capabilities()));
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn crate::provider::StorageFactory> = reference.clone();
     let keys = ScriptedKeys::full();
     let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
     let context = Arc::new(
@@ -1081,17 +1083,19 @@ mod tests {
       .unwrap(),
     );
     // Oversize the issuer's binding set past the snapshot wire bounds
-    // (1_024 collection entries inside the 64 KiB control body): the
-    // issuer's own snapshot can no longer encode.
-    for index in 0..1_200_u64 {
-      trust_store::adopt_binding_ctx(
-        context.store(),
-        entropy.as_ref(),
-        &node_at(index),
-        &key_at(index),
-      )
-      .await
-      .unwrap();
+    // (16 384 collection entries inside the 1 MiB store body): the
+    // issuer's own snapshot can no longer encode. The entries are
+    // injected straight into the reference store — committing this many
+    // adoptions one by one is far too slow for the suite, and the
+    // refresh path only scans the identity-binding family, which is
+    // exactly what is injected. Keys repeat; only node identity is
+    // unique per binding.
+    let shared_key = key_at(0);
+    for index in 0..16_385_u64 {
+      let node = node_at(index);
+      let (namespace, key) = identity_binding_key(&node).unwrap();
+      let binding = IdentityBindingV1::new(node, shared_key.clone());
+      inject_entry(&reference, (namespace, key), binding.encode().unwrap());
     }
     // The injection is real: the issuer refresh fails on its own.
     let error = refresh_issuer_snapshot(&context, &entropy)

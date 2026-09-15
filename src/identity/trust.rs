@@ -73,7 +73,7 @@ struct BindingWire {
 /// The durable full-set wire form: one issuer snapshot record holds the
 /// complete ordered binding set under the dedicated store-body budget
 /// ([`TRUST_SNAPSHOT_STORE_LIMITS`]); durable records are not wire frames
-/// and never cross the 64 KiB control envelope.
+/// and the 64 KiB control envelope does not bound them.
 #[derive(Encode, Decode)]
 #[cbor(array)]
 struct SnapshotWire {
@@ -117,11 +117,13 @@ struct SnapshotPageWire {
   bindings: Vec<BindingWire>,
 }
 
-/// The wire-body budget for one durable snapshot record: roughly 13 000
-/// bindings fit before the issuer refresh fails closed (a membership
-/// that outgrows even this is a new scale campaign, not a widening).
+/// The wire-body budget for one durable snapshot record. The item cap
+/// stays above what the 1 MiB body can hold (63 bytes per binding), so
+/// the body budget binds first and roughly 16 000 bindings fit before
+/// the issuer refresh fails closed (a membership that outgrows even
+/// this is a new scale campaign, not a widening).
 const TRUST_SNAPSHOT_STORE_LIMITS: crate::protocol::CborLimits =
-  crate::protocol::CborLimits::new(16, 1_024, 1 << 20);
+  crate::protocol::CborLimits::new(16, 16_384, 1 << 20);
 
 impl TrustSnapshotV1 {
   pub(crate) fn new(
@@ -226,7 +228,10 @@ impl TrustSnapshotV1 {
   /// [`Self::encode_store`]). The wire page form decodes through
   /// [`TrustSnapshotPage::decode`].
   pub(crate) fn decode_store(bytes: &[u8]) -> Result<TrustSnapshotV1> {
-    let wire: SnapshotWire = decode_canonical(bytes, crate::protocol::CONTROL_CBOR_LIMITS)
+    // Encode and decode must share the exact budget: a record that fits
+    // the store budget must always read back, or a persisted snapshot
+    // would fail its own revision read-back forever.
+    let wire: SnapshotWire = decode_canonical(bytes, TRUST_SNAPSHOT_STORE_LIMITS)
       .map_err(|_| crate::Error::invalid_input("trust snapshot decode"))?;
     if wire.schema != TRUST_SNAPSHOT_SCHEMA || wire.record_version != 1 {
       return Err(crate::Error::invalid_input("trust snapshot schema"));
@@ -527,6 +532,42 @@ mod tests {
     // Ordered by canonical node text.
     assert_eq!(decoded.bindings()[0].node(), &node(2));
     assert_eq!(decoded.issuer(), &node(1));
+  }
+
+  /// A full-capacity durable record must round-trip: the encode/decode
+  /// budget pair is the dedicated store budget, not the 64 KiB control
+  /// envelope, so a snapshot larger than the control budget persists and
+  /// still reads back as its own revision basis.
+  #[test]
+  fn trust_snapshot_over_the_control_budget_round_trips_through_the_store_form() {
+    // 2,000 bindings of canonical 26-character node ids: over the 64 KiB
+    // control budget, well inside the 1 MiB store budget. Keys repeat;
+    // only the binding order is part of the record contract.
+    let bindings: Vec<TrustBinding> = (0..2_000_u64)
+      .map(|index| {
+        TrustBinding::new(
+          NodeId::parse(&format!("node-{index:021}")).unwrap(),
+          key((index % u64::from(u8::MAX)) as u8),
+        )
+      })
+      .collect();
+    let (issuer, issuer_key) = issuer_pair(1);
+    let snapshot = TrustSnapshotV1::new(7, 1, issuer, issuer_key, bindings);
+
+    let bytes = snapshot.encode_store().unwrap();
+    // Pins the regression: the record must sit over the control envelope
+    // a control-budget decode would impose.
+    assert!(
+      bytes.len() > crate::protocol::CONTROL_CBOR_LIMITS.max_body_len(),
+      "the regression requires a record over the 64 KiB control budget"
+    );
+    assert!(
+      bytes.len() <= super::TRUST_SNAPSHOT_STORE_LIMITS.max_body_len(),
+      "the record must stay inside the dedicated store budget"
+    );
+    let decoded = TrustSnapshotV1::decode_store(&bytes).unwrap();
+    assert_eq!(decoded, snapshot);
+    assert_eq!(decoded.bindings().len(), 2_000);
   }
 
   /// The wire page form: keyset paging covers the whole set exactly
