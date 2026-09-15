@@ -40,13 +40,10 @@ impl Supervisor {
     };
     let context = self.context()?;
     let store = context.store();
-    let status = if crate::identity::cleanup::is_cleaned_ctx(store, &node).await? {
-      crate::MemberStatus::Cleaned
-    } else if crate::identity::leave::is_left_ctx(store, &node).await? {
-      crate::MemberStatus::Left
-    } else {
-      crate::MemberStatus::Active
-    };
+    let status = crate::membership::member_status(
+      crate::identity::cleanup::is_cleaned_ctx(store, &node).await?,
+      crate::identity::leave::is_left_ctx(store, &node).await?,
+    );
     let connectivity = if connected {
       crate::ConnectivityStatus::Connected
     } else {
@@ -73,9 +70,7 @@ impl Supervisor {
       .keys()
       .cloned()
       .collect();
-    let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(
-      crate::membership::NODE_DESCRIPTOR_NAMESPACE,
-    )?);
+    let namespace = crate::membership::descriptor_namespace()?;
     // The removal state comes from the terminal-record stores, collected
     // once per page: the descriptor store deliberately retains left and
     // cleaned members as verification evidence, so the page annotates

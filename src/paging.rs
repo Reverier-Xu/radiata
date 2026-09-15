@@ -95,7 +95,14 @@ pub(crate) fn decode_page(
   if wire.schema != schema {
     return Err(Error::invalid_input(context));
   }
-  check_page_shape(wire.items.len(), max_items, &None, context)?;
+  let cursor = wire.cursor.map(|value| {
+    let bytes: &[u8] = value.as_ref();
+    bytes.to_vec()
+  });
+  // The shared shape policy checks the decoded cursor too: an empty page
+  // carrying a continuation cursor fails closed right here, not only in
+  // the lanes' constructor round-trips.
+  check_page_shape(wire.items.len(), max_items, &cursor, context)?;
   Ok((
     wire
       .items
@@ -105,10 +112,7 @@ pub(crate) fn decode_page(
         bytes.to_vec()
       })
       .collect(),
-    wire.cursor.map(|value| {
-      let bytes: &[u8] = value.as_ref();
-      bytes.to_vec()
-    }),
+    cursor,
   ))
 }
 

@@ -1330,3 +1330,45 @@ mod tests {
     assert_eq!(removal_version.digest(), removal.digest());
   }
 }
+
+/// Test-only shared convergence walk: the same emit/apply path the
+/// anti-entropy driver calls, driven bidirectionally between two stores
+/// until neither side applies any change. One home for the e2e, select,
+/// and page convergence tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+  use super::page;
+  use crate::{api::SystemEntropy, storage::MetadataStore};
+
+  pub(crate) async fn converge_pair(a: &MetadataStore, b: &MetadataStore) -> usize {
+    let mut total_applied = 0;
+    loop {
+      let mut applied = 0;
+      for (emitter, receiver) in [(a, b), (b, a)] {
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+          let page_out = page::sync::emit_page_ctx(
+            emitter,
+            cursor.as_deref(),
+            page::DEFAULT_RESOURCE_PAGE_LIMIT,
+          )
+          .await
+          .unwrap();
+          let done = page_out.cursor().is_none();
+          cursor = page_out.cursor().map(|value| value.to_vec());
+          applied += page::sync::apply_page_ctx(receiver, &SystemEntropy, &page_out)
+            .await
+            .unwrap();
+          if done {
+            break;
+          }
+        }
+      }
+      if applied == 0 {
+        break;
+      }
+      total_applied += applied;
+    }
+    total_applied
+  }
+}

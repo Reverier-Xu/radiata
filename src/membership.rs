@@ -17,6 +17,13 @@ use crate::{Endpoint, LabelSet, NodeId, PublicKey, Result, protocol::encode_cano
 pub(crate) const NODE_DESCRIPTOR_SCHEMA: &str = "radiata.woooo.tech/schemas/node-descriptor-v1";
 pub(crate) use crate::storage::families::NODE_DESCRIPTOR_NAMESPACE;
 
+/// The descriptor family's store namespace: the single constructor for
+/// every reader inside and outside the module (the families registry
+/// applies the metadata-category invariant here).
+pub(crate) fn descriptor_namespace() -> Result<crate::StoreNamespace> {
+  crate::storage::families::namespace(NODE_DESCRIPTOR_NAMESPACE)
+}
+
 /// One owner-marked node descriptor.
 ///
 /// The record carries the owning node's capability labels (record
@@ -216,6 +223,20 @@ pub(crate) fn apply_metadata_patch(
     )
     .with_labels(labels),
   )
+}
+
+/// The single terminal-record → member-status rule: a cleaned node's
+/// tombstone wins over a leave, and anything else is active. The view
+/// mapper and the recovery plane's departed exclusions both flow
+/// through here so the precedence cannot drift.
+pub(crate) fn member_status(cleaned: bool, left: bool) -> crate::MemberStatus {
+  if cleaned {
+    crate::MemberStatus::Cleaned
+  } else if left {
+    crate::MemberStatus::Left
+  } else {
+    crate::MemberStatus::Active
+  }
 }
 
 /// The single descriptor → public member view mapper: annotates the

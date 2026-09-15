@@ -539,6 +539,12 @@ impl MetadataStore {
   /// atomic journal: the store stays frozen and fails closed (the
   /// `is_blocked` gate refuses admission-sensitive operations until an
   /// authoritative reopen reconciles it).
+  ///
+  /// Precondition: the journaled flow calling this holds the store's
+  /// writer permit (every identity-side entry holds it for the whole
+  /// prologue→commit→cleanup flow). The unfreeze path mutates the commit
+  /// state outside the commit path, so two concurrent resolvers could
+  /// otherwise interleave their evidence reads and verdicts.
   pub(crate) async fn resolve_pending_journal(&self, purpose: &str) -> Result<bool> {
     let Some(identity) = self.recover_pending(purpose).await? else {
       return Ok(false);
@@ -587,6 +593,11 @@ impl MetadataStore {
   }
 
   /// Returns a frozen store recovered on journal evidence back to ready.
+  ///
+  /// Precondition: the caller runs inside the journaled flow's writer
+  /// permit (see [`Self::resolve_pending_journal`]): the unfreeze and
+  /// the notify are state mutations that must not interleave with
+  /// another resolver's evidence read.
   fn finish_journal_recovery(&self) -> Result<()> {
     *self.lock_state()? = CommitState::Ready;
     self.ready_notify.notify_waiters();

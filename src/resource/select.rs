@@ -308,33 +308,12 @@ mod tests {
     }
 
     // Converge through the same emit/apply path the anti-entropy driver
-    // uses, until neither side applies any change.
-    loop {
-      let mut applied = 0;
-      for (emitter, receiver) in [(&store_a, &store_b), (&store_b, &store_a)] {
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-          let page = super::super::page::sync::emit_page_ctx(
-            emitter,
-            cursor.as_deref(),
-            super::super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
-          )
-          .await
-          .unwrap();
-          let done = page.cursor().is_none();
-          cursor = page.cursor().map(|value| value.to_vec());
-          applied += super::super::page::sync::apply_page_ctx(receiver, &SystemEntropy, &page)
-            .await
-            .unwrap();
-          if done {
-            break;
-          }
-        }
-      }
-      if applied == 0 {
-        break;
-      }
-    }
+    // uses, until neither side applies any change (shared test walk).
+    let applied_total = super::super::test_support::converge_pair(&store_a, &store_b).await;
+    assert!(
+      applied_total > 0,
+      "convergence must apply at least one page"
+    );
 
     for (selector_text, expected_count) in [
       ("radiata.woooo.tech/resources/type", 6),

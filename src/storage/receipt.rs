@@ -31,7 +31,14 @@ pub(crate) const RETENTION_SWEEP_BOUND: usize = 4096;
 
 /// The outcome of one retention sweep; the public report lives in the
 /// view module.
-pub(crate) use crate::view::ReceiptRetentionReport;
+pub struct ReceiptRetentionReport {
+  /// Anchored receipts whose retention deadline had elapsed and whose
+  /// forget transaction committed.
+  pub forgotten: u64,
+  /// The pass stopped at its internal bound with anchored receipts left;
+  /// issue the command again to continue.
+  pub remaining: bool,
+}
 const REFERENCE_TOKEN_WIDTH: usize = 32;
 const WALL_TIME_WIDTH: usize = 13;
 const NANOS_PER_SECOND: u32 = 1_000_000_000;

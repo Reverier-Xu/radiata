@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use crate::{
   Result, StoreKey, StoreOperation,
-  api::Entropy,
   storage::{MetadataStore, receipt::WallClock},
 };
 
@@ -23,6 +22,12 @@ use crate::{
 /// removal record survives this long after its own timestamp before the
 /// ordinary retention pass may drop it. Mirrors the trace-metadata default.
 pub(crate) const RESOURCE_REMOVAL_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The deterministic transaction domain of one resource removal sweep:
+/// a retried pass on the same scan revision replays the same transaction
+/// id as an idempotent no-op, and no other transaction can collide with
+/// it (the receipt sweep's derivation contract).
+const REMOVAL_SWEEP_DOMAIN: &[u8] = b"radiata.woooo.tech/resource-removal/sweep/v1\0";
 
 /// The caller-selected default cap on stored removal records: once the
 /// removal population exceeds this bound, the oldest evict first.
@@ -76,8 +81,7 @@ impl Ord for RemovalCandidate {
 /// Live records are never evicted, matching the trace lane's active-record
 /// rule. Returns the number of removal records actually cleaned.
 pub(crate) async fn sweep_removed_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, clock: &dyn WallClock, retention: Duration,
-  cap: usize,
+  store: &MetadataStore, clock: &dyn WallClock, retention: Duration, cap: usize,
 ) -> Result<usize> {
   let _permit = store.write_permit().await;
   let namespace = super::store::namespace()?;
@@ -85,7 +89,9 @@ pub(crate) async fn sweep_removed_ctx(
   let snapshot = store.snapshot().await?;
   let mut scan = snapshot.scan(&namespace, &[]).await?;
   // The due deletes collect during the scan and leave in one batch; the
-  // batch size is bounded by the removal population the cap maintains.
+  // batch is capped at the receipt sweep's bound so one host call stays
+  // latency-bounded, and the next pass drains the rest (deleted records
+  // no longer scan, so the passes make progress).
   let mut due: Vec<StoreOperation> = Vec::new();
   let mut fresh_total = 0_usize;
   let mut oldest: std::collections::BinaryHeap<RemovalCandidate> =
@@ -102,11 +108,15 @@ pub(crate) async fn sweep_removed_ctx(
       .duration_since(record.timestamp())
       .is_ok_and(|age| age >= retention);
     if expired {
-      due.push(StoreOperation::Delete {
-        namespace: namespace.clone(),
-        key,
-        expected: digest,
-      });
+      // The per-pass delete batch is bounded (the receipt sweep's twin
+      // bound); the overflow stays due for the next pass.
+      if due.len() < crate::storage::receipt::RETENTION_SWEEP_BOUND {
+        due.push(StoreOperation::Delete {
+          namespace: namespace.clone(),
+          key,
+          expected: digest,
+        });
+      }
       continue;
     }
     fresh_total = fresh_total.saturating_add(1);
@@ -124,7 +134,10 @@ pub(crate) async fn sweep_removed_ctx(
 
   // Enforce the cap oldest-first: the overflow is the oldest
   // `fresh_total - cap` fresh removals, capped at one heap per pass.
-  let overflow = fresh_total.saturating_sub(cap).min(oldest.len());
+  let overflow = fresh_total
+    .saturating_sub(cap)
+    .min(oldest.len())
+    .min(crate::storage::receipt::RETENTION_SWEEP_BOUND.saturating_sub(due.len()));
   if overflow > 0 {
     let mut candidates = oldest.into_vec();
     candidates.sort_by_key(|candidate| candidate.stamped);
@@ -147,13 +160,20 @@ pub(crate) async fn sweep_removed_ctx(
   // whole pass is old-or-new at every crash boundary, and every delete
   // carries the exact digest it was scanned with. Landing the deletes in
   // one commit keeps the pass from stranding its second-and-later
-  // deletions behind a revision the pass itself advanced.
+  // deletions behind a revision the pass itself advanced. The
+  // transaction id is derived deterministically from that revision (the
+  // receipt sweep's derivation contract): a retried pass on the same
+  // revision replays the same id as an idempotent no-op, and no other
+  // transaction can collide with it.
+  let transaction = crate::TransactionId::parse(&crate::identity::id::prefixed_id(
+    "txn",
+    crate::storage::deterministic_transaction_value(
+      REMOVAL_SWEEP_DOMAIN,
+      &[snapshot.revision().as_bytes()],
+    )?,
+  )?)?;
   let removed = due.len();
-  let transaction = store.prepare_transaction(
-    crate::TransactionId::generate(entropy)?,
-    snapshot.revision().clone(),
-    due,
-  )?;
+  let transaction = store.prepare_transaction(transaction, snapshot.revision().clone(), due)?;
   match store.commit(transaction).await? {
     crate::CommitOutcome::Committed(_) => Ok(removed),
     // A conflict or abort mutates nothing: the newer winner (or the
@@ -257,15 +277,9 @@ mod tests {
       install(&store, value).await;
     }
     clock.set(UNIX_EPOCH + Duration::from_secs(9_500));
-    let removed = sweep_removed_ctx(
-      &store,
-      &SystemEntropy,
-      clock.as_ref(),
-      Duration::from_secs(1_000),
-      128,
-    )
-    .await
-    .unwrap();
+    let removed = sweep_removed_ctx(&store, clock.as_ref(), Duration::from_secs(1_000), 128)
+      .await
+      .unwrap();
     assert_eq!(removed, 1);
     assert!(
       crate::resource::store::read_record_ctx(&store, &name(1))
@@ -300,15 +314,9 @@ mod tests {
     install(&store, &first).await;
     install(&store, &second).await;
     clock.set(UNIX_EPOCH + Duration::from_secs(10_000));
-    let removed = sweep_removed_ctx(
-      &store,
-      &SystemEntropy,
-      clock.as_ref(),
-      Duration::from_secs(1_000),
-      128,
-    )
-    .await
-    .unwrap();
+    let removed = sweep_removed_ctx(&store, clock.as_ref(), Duration::from_secs(1_000), 128)
+      .await
+      .unwrap();
     assert_eq!(removed, 2);
     assert!(
       crate::resource::store::read_record_ctx(&store, &name(7))
@@ -340,7 +348,6 @@ mod tests {
     install(&store, &record(&name(4), 6_000, false, "u://live")).await;
     let removed = sweep_removed_ctx(
       &store,
-      &SystemEntropy,
       clock.as_ref(),
       Duration::from_secs(3_600 * 24 * 365),
       2,
@@ -416,7 +423,7 @@ mod tests {
     let (_factory, store, clock) = open_store().await;
     install(&store, &record(&name(6), 1_000, true, &uri)).await;
     clock.set(UNIX_EPOCH + Duration::from_secs(20_000));
-    let removed = sweep_removed_ctx(&store, &SystemEntropy, clock.as_ref(), Duration::ZERO, 0)
+    let removed = sweep_removed_ctx(&store, clock.as_ref(), Duration::ZERO, 0)
       .await
       .unwrap();
     assert_eq!(removed, 1);

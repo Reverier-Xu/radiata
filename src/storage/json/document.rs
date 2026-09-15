@@ -224,7 +224,10 @@ impl GenerationDocument {
   }
 
   pub(super) fn digest(bytes: &[u8]) -> Digest {
-    Digest::from_bytes(Sha256::digest(bytes).into())
+    // The canonical body digest is the identity signature module's
+    // single-source SHA-256 digest: generation digests and record
+    // digests must stay the exact same function.
+    crate::identity::signature::body_digest(bytes)
   }
 }
 

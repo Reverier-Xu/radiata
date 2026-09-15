@@ -561,11 +561,15 @@ async fn tls_transport_split_halves_deliver_many_messages_in_order() {
   }
 
   for index in 0..8_u16 {
-    let received = tokio::time::timeout(std::time::Duration::from_secs(2), server_reader.receive())
-      .await
-      .expect("reader must not stall")
-      .unwrap()
-      .unwrap();
+    let received = tokio::time::timeout(
+      std::time::Duration::from_secs(2),
+      server_reader.receive_event(),
+    )
+    .await
+    .expect("reader must not stall")
+    .unwrap()
+    .unwrap()
+    .expect_message();
     assert_eq!(received.schema_id, 1);
     assert_eq!(received.kind_id, 0x10);
     assert_eq!(received.body, format!("message-{index}").into_bytes());
@@ -593,10 +597,20 @@ async fn tls_transport_split_burst_after_round_trip_delivers_all_messages() {
 
   // Open round trip: client writes, server reads, server acks, client reads.
   client_writer.send(0x10, b"open").await.unwrap();
-  let open = server_reader.receive().await.unwrap().unwrap();
+  let open = server_reader
+    .receive_event()
+    .await
+    .unwrap()
+    .unwrap()
+    .expect_message();
   assert_eq!(open.body, b"open");
   server_writer.send(0x10, b"ack").await.unwrap();
-  let ack = client_reader.receive().await.unwrap().unwrap();
+  let ack = client_reader
+    .receive_event()
+    .await
+    .unwrap()
+    .unwrap()
+    .expect_message();
   assert_eq!(ack.body, b"ack");
 
   // Burst: three chunks plus end, exactly the packet data plane pattern.
@@ -609,11 +623,58 @@ async fn tls_transport_split_burst_after_round_trip_delivers_all_messages() {
   client_writer.send(0x10, b"end").await.unwrap();
 
   for expected in ["chunk-0", "chunk-1", "chunk-2", "end"] {
-    let received = tokio::time::timeout(std::time::Duration::from_secs(2), server_reader.receive())
-      .await
-      .expect("reader must not stall")
-      .unwrap()
-      .unwrap();
+    let received = tokio::time::timeout(
+      std::time::Duration::from_secs(2),
+      server_reader.receive_event(),
+    )
+    .await
+    .expect("reader must not stall")
+    .unwrap()
+    .unwrap()
+    .expect_message();
     assert_eq!(received.body, expected.as_bytes());
   }
+}
+
+/// Pongs surface as keepalive wakes (never swallowed) and refresh the
+/// shared liveness stamp: the session read loop's reflection depends on
+/// both halves of that contract.
+#[tokio::test]
+async fn pongs_surface_as_events_and_refresh_the_liveness_stamp() {
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  let stamp = Arc::new(AtomicU64::new(0));
+  let pong = || WsMessage::Pong(tokio_tungstenite::tungstenite::Bytes::from_static(b"ka"));
+  let mut stream = futures_util::stream::iter(vec![
+    Ok(pong()),
+    Ok(pong()),
+    Ok(WsMessage::Binary(
+      super::encode_frame(rules(), 1, 1, 0, b"payload")
+        .unwrap()
+        .into(),
+    )),
+  ]);
+
+  let first = super::next_message(&mut stream, rules(), &stamp)
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(matches!(first, super::Received::Pong));
+  let second = super::next_message(&mut stream, rules(), &stamp)
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(matches!(second, super::Received::Pong));
+  assert_ne!(
+    stamp.load(Ordering::Relaxed),
+    0,
+    "a pong must refresh the liveness stamp"
+  );
+
+  // The message following the pongs arrives intact.
+  let third = super::next_message(&mut stream, rules(), &stamp)
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(third.expect_message().body, b"payload");
 }

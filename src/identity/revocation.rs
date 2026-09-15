@@ -515,9 +515,8 @@ mod tests {
     ));
     drop(store);
 
-    let reopened = MetadataStore::open(&factory, Duration::from_secs(10))
-      .await
-      .unwrap();
+    let reopened =
+      crate::storage::test_util::crash_reopen::open_store_with_lock_retry(&factory).await;
     assert_eq!(
       revoked_key_ctx(&reopened, &subject()).await.unwrap(),
       Some(key(7))
@@ -636,9 +635,9 @@ mod crash {
   }
 
   async fn open_store(factory: &Arc<dyn StorageFactory>) -> MetadataStore {
-    MetadataStore::open(factory, Duration::from_secs(10))
-      .await
-      .unwrap()
+    // The crash child dies holding the store lock: tolerate the lock-
+    // release window on loaded runners.
+    crate::storage::test_util::crash_reopen::open_store_with_lock_retry(factory).await
   }
 
   /// Seeds the trusted binding the child revokes.

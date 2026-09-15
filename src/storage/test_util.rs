@@ -87,3 +87,61 @@ pub(crate) fn run_crash_child(
     "{label} crash child at point {point} must terminate abnormally"
   );
 }
+
+/// The crash matrices' lock-window reopen helpers, compiled only where
+/// their caller matrices exist (test builds with the json or redb
+/// backend): a SIGKILLed crash child releases its lock when the process
+/// dies, but a loaded runner may schedule the parent's reopen before
+/// the release lands. Crash-matrix parents reopen through these, never
+/// through a bare open.
+#[cfg(all(test, any(feature = "json", feature = "redb")))]
+pub(crate) mod crash_reopen {
+  use std::{sync::Arc, time::Duration};
+
+  use crate::{ErrorKind, provider::StorageFactory};
+
+  /// Opens the store retrying the cross-process lock window. Its
+  /// callers (the resource and revocation crash matrices) are unix-only.
+  #[cfg(all(test, unix))]
+  pub(crate) async fn open_store_with_lock_retry(
+    factory: &Arc<dyn StorageFactory>,
+  ) -> crate::storage::MetadataStore {
+    use crate::storage::MetadataStore;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      match MetadataStore::open(factory, Duration::from_secs(10)).await {
+        Ok(store) => return store,
+        Err(error) if error.kind() == ErrorKind::StorageLocked => {
+          assert!(
+            std::time::Instant::now() < deadline,
+            "store lock never released: {error:?}"
+          );
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(error) => panic!("crash-store reopen failed: {error:?}"),
+      }
+    }
+  }
+
+  /// The provider-level twin: the same lock-window retry for matrices
+  /// that assert on the raw provider.
+  pub(crate) async fn open_provider_with_lock_retry(
+    factory: &Arc<dyn StorageFactory>, requirements: crate::StoreRequirements,
+  ) -> Box<dyn crate::provider::Storage> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      match factory.open(requirements).await {
+        Ok(provider) => return provider,
+        Err(error) if error.kind() == ErrorKind::StorageLocked => {
+          assert!(
+            std::time::Instant::now() < deadline,
+            "provider lock never released: {error:?}"
+          );
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(error) => panic!("crash provider reopen failed: {error:?}"),
+      }
+    }
+  }
+}

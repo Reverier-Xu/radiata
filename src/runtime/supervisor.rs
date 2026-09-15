@@ -303,6 +303,15 @@ pub(crate) async fn spawn_runtime(
   dependencies
     .extensions
     .register_core_protocol(resource_definition, resource_consumer)?;
+  // The negotiation registry and the node offer are built before the
+  // runtime is marked ready (the core protocols above joined the feature
+  // set): a provisioning failure (a caller-required feature outside the
+  // registry) is a typed start() error, never a running node that
+  // silently stopped.
+  let mut definitions = crate::protocol::feature::builtin_definitions()?;
+  definitions.extend(dependencies.extensions.feature_definitions());
+  let registry = crate::protocol::feature::FeatureRegistry::build(definitions)?;
+  let offer = node_offer(&registry, dependencies.config.required_features())?;
   let routes = dependencies.routes.clone();
   let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
   let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
@@ -313,11 +322,11 @@ pub(crate) async fn spawn_runtime(
   runtime.spawn(supervise(
     dependencies,
     control_rx,
-    packet_tx,
-    packet_rx,
+    (packet_tx, packet_rx),
     sync_rounds,
     state_tx,
     ready_tx,
+    offer,
   ));
 
   ready_rx
@@ -328,11 +337,15 @@ pub(crate) async fn spawn_runtime(
 
 async fn supervise(
   dependencies: RuntimeDependencies, mut control: mpsc::Receiver<Control>,
-  packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
-  mut packets: mpsc::Receiver<crate::packet::OutboundRequest>,
+  packets: (
+    mpsc::Sender<crate::packet::OutboundRequest>,
+    mpsc::Receiver<crate::packet::OutboundRequest>,
+  ),
   sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
   state: watch::Sender<LifecycleSnapshot>, ready: oneshot::Sender<()>,
+  offer: crate::protocol::offer::FeatureOffer,
 ) {
+  let (packet_tx, mut packet_rx) = packets;
   let mut tasks = JoinSet::<()>::new();
   let mut lifecycle = LifecyclePublisher::new(state);
   lifecycle.publish(LifecycleSnapshot::running());
@@ -350,11 +363,16 @@ async fn supervise(
     return;
   }
 
-  let mut supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds) {
+  let mut supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds, offer) {
     Ok(supervisor) => supervisor,
     Err(failure) => {
+      // Unreachable today: the offer was built in spawn_runtime before
+      // the runtime was marked ready, so the only remaining failure is
+      // the internal context invariant. Publish Fatal anyway — a
+      // provisioning failure can never mask as an explicit shutdown.
       let (error, dependencies) = *failure;
       tracing::error!(kind = ?error.kind(), "supervisor provisioning failed");
+      lifecycle.publish(LifecycleSnapshot::failed());
       finish_shutdown(
         control,
         tasks,
@@ -362,7 +380,7 @@ async fn supervise(
         Vec::new(),
         &mut lifecycle,
         None,
-        ShutdownReason::Explicit,
+        ShutdownReason::Fatal(error.kind()),
       )
       .await;
       return;
@@ -573,7 +591,7 @@ async fn supervise(
       }
         }
       }
-      request = packets.recv() => {
+      request = packet_rx.recv() => {
         let Some(request) = request else {
           continue;
         };
@@ -784,24 +802,10 @@ impl Supervisor {
   fn new(
     dependencies: RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
     sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+    offer: crate::protocol::offer::FeatureOffer,
   ) -> std::result::Result<Self, Box<(Error, RuntimeDependencies)>> {
     let Some(context) = dependencies.context.clone() else {
       return Err(Box::new((Error::internal("runtime context"), dependencies)));
-    };
-    // The negotiation registry is the frozen built-in set plus every
-    // caller-registered feature definition.
-    let mut definitions = match crate::protocol::feature::builtin_definitions() {
-      Ok(definitions) => definitions,
-      Err(error) => return Err(Box::new((error, dependencies))),
-    };
-    definitions.extend(dependencies.extensions.feature_definitions());
-    let registry = match crate::protocol::feature::FeatureRegistry::build(definitions) {
-      Ok(registry) => registry,
-      Err(error) => return Err(Box::new((error, dependencies))),
-    };
-    let offer = match node_offer(&registry, dependencies.config.required_features()) {
-      Ok(offer) => offer,
-      Err(error) => return Err(Box::new((error, dependencies))),
     };
     let policy = crate::session::stream::SessionPolicy::from_config(&dependencies.config);
     let packet = Arc::new(session_packet_context(
@@ -1292,7 +1296,6 @@ impl Supervisor {
     };
     if let Err(error) = crate::resource::retention::sweep_removed_ctx(
       context.store(),
-      self.dependencies.entropy.as_ref(),
       &crate::storage::receipt::HostWallClock,
       crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
       crate::resource::retention::RESOURCE_REGISTER_CAP,
@@ -1479,32 +1482,43 @@ impl Supervisor {
     // replacing the expected version: the register moved past it, so the
     // precondition surfaces as an explicit conflict (D7) instead of a
     // silently accepted loser.
-    if expected.is_some()
-      && matches!(
-        outcome,
-        crate::resource::store::ResourceCommitOutcome::Superseded(_)
-      )
-    {
-      return Err(Error::conflict("resource version"));
-    }
-    Ok(match outcome {
+    let superseded = if expected.is_some() {
+      None
+    } else {
+      Some(crate::ResourceMutationView::new(accepted.clone(), false))
+    };
+    Self::resource_mutation_outcome(
+      &self.dependencies.events,
+      &name,
+      outcome,
+      crate::ResourceMutationView::new(accepted, true),
+      superseded,
+    )
+  }
+
+  /// The shared post-commit mapping for one resource mutation: a
+  /// committed install emits exactly one change event and wins; a
+  /// superseded mutation reports the accepted loser (plain put) or
+  /// conflicts (a preconditioned write or a removal whose register
+  /// moved); an indeterminate commit is never guessed into an outcome.
+  fn resource_mutation_outcome(
+    events: &crate::node::EventHub, name: &crate::ResourceName,
+    outcome: crate::resource::store::ResourceCommitOutcome, winner: crate::ResourceMutationView,
+    superseded: Option<crate::ResourceMutationView>,
+  ) -> Result<crate::ResourceMutationView> {
+    match outcome {
       crate::resource::store::ResourceCommitOutcome::Installed(_) => {
-        self
-          .dependencies
-          .events
-          .emit(crate::ResourceChanged::new(name.clone()));
-        crate::ResourceMutationView::new(accepted, true)
+        events.emit(crate::ResourceChanged::new(name.clone()));
+        Ok(winner)
       }
-      crate::resource::store::ResourceCommitOutcome::Superseded(_) => {
-        crate::ResourceMutationView::new(accepted, false)
-      }
-      crate::resource::store::ResourceCommitOutcome::Indeterminate { .. } => {
-        return Err(Error::provider(
-          crate::ProviderErrorKind::CommitUnknown,
-          crate::ProviderErrorContext::StorageCommit,
-        ));
-      }
-    })
+      crate::resource::store::ResourceCommitOutcome::Superseded(_) => superseded
+        .map(Ok)
+        .unwrap_or_else(|| Err(Error::conflict("resource version"))),
+      crate::resource::store::ResourceCommitOutcome::Indeterminate { .. } => Err(Error::provider(
+        crate::ProviderErrorKind::CommitUnknown,
+        crate::ProviderErrorContext::StorageCommit,
+      )),
+    }
   }
 
   /// Creates signed removal evidence for one resource (`RemoveResource`):
@@ -1534,7 +1548,7 @@ impl Supervisor {
     let this = &*self;
     let context = &context;
     let name = &name;
-    let (name, installed, view) = with_commit_race_retry("resource removal", || {
+    with_commit_race_retry("resource removal", || {
       Box::pin(async move {
         let store = context.store();
         let stored = crate::resource::store::read_record_ctx(store, name)
@@ -1548,10 +1562,9 @@ impl Supervisor {
         if stored.removed() {
           // The exact removal already won: idempotent, no new transition
           // (and no event — only a fresh install emits).
-          return Ok(CommitRace::Final(Ok((
-            name.clone(),
-            false,
-            crate::ResourceMutationView::new(crate::resource::select::resource_view(&stored), true),
+          return Ok(CommitRace::Final(Ok(crate::ResourceMutationView::new(
+            crate::resource::select::resource_view(&stored),
+            true,
           ))));
         }
         // The removal rides the same monotonic issue clock as a put, so a
@@ -1588,7 +1601,7 @@ impl Supervisor {
             "resource removal clock",
           ))));
         }
-        let outcome = match crate::resource::store::commit_removal_ctx(
+        match crate::resource::store::commit_removal_ctx(
           store,
           this.dependencies.entropy.as_ref(),
           &removal,
@@ -1602,47 +1615,23 @@ impl Supervisor {
           Ok(outcome) => {
             // A committed removal emits exactly one event after
             // durability; the raced/moved/indeterminate arms below never
-            // reach the emit as successes.
-            let installed = matches!(
+            // reach the emit as successes. A removal has no accepted-
+            // loser report: a register move conflicts (D7).
+            Ok(CommitRace::Final(Self::resource_mutation_outcome(
+              &this.dependencies.events,
+              name,
               outcome,
-              crate::resource::store::ResourceCommitOutcome::Installed(_)
-            );
-            let result = match outcome {
-              crate::resource::store::ResourceCommitOutcome::Installed(_) => {
-                crate::ResourceMutationView::new(
-                  crate::resource::select::resource_view(&removal),
-                  true,
-                )
-              }
-              // The register moved between the observation and the commit.
-              crate::resource::store::ResourceCommitOutcome::Superseded(_) => {
-                return Err(Error::conflict("resource version"));
-              }
-              crate::resource::store::ResourceCommitOutcome::Indeterminate { .. } => {
-                return Err(Error::provider(
-                  crate::ProviderErrorKind::CommitUnknown,
-                  crate::ProviderErrorContext::StorageCommit,
-                ));
-              }
-            };
-            Ok(CommitRace::Final(Ok((name.clone(), installed, result))))
+              crate::ResourceMutationView::new(
+                crate::resource::select::resource_view(&removal),
+                true,
+              ),
+              None,
+            )))
           }
-        };
-        match outcome {
-          // Only a non-race failure or a final success reaches the caller.
-          Err(error) => Err(error),
-          Ok(raced) => Ok(raced),
         }
       })
     })
-    .await?;
-    if installed {
-      self
-        .dependencies
-        .events
-        .emit(crate::ResourceChanged::new(name.clone()));
-    }
-    Ok(view)
+    .await
   }
 
   /// Revokes one exact subject binding's connection and admission

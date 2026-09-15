@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use minicbor::{Decode, Encode};
 
 use crate::{
-  Error, ErrorKind, NodeId, ProviderErrorContext, ProviderErrorKind, Result, TraceId,
+  Error, ErrorKind, NodeId, Result, TraceId,
   api::Entropy,
   protocol::decode_canonical_strict,
   storage::{MetadataStore, receipt::WallClock},
@@ -460,15 +460,19 @@ async fn commit_batch(
     operations,
   )?;
   match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) | crate::CommitOutcome::Aborted => Ok(count),
-    crate::CommitOutcome::Conflict => Ok(0),
-    crate::CommitOutcome::Unknown { .. } => Err(Error::provider(
-      ProviderErrorKind::CommitUnknown,
-      // The trace register commits through the same conditional slot as
-      // every other lane; only the context label historically said
-      // otherwise.
-      ProviderErrorContext::StorageCommit,
-    )),
+    // Only a committed batch mutated anything: a conflict or abort
+    // leaves every record in place, and the next bounded pass retries
+    // the whole batch (same conservative shape as the resource removal
+    // sweep).
+    crate::CommitOutcome::Committed(_) => Ok(count),
+    crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => Ok(0),
+    crate::CommitOutcome::Unknown { .. } => {
+      // Indeterminate is not a classification: leave the records in
+      // place rather than guessing, and let the next pass finish the
+      // job.
+      tracing::debug!("trace retention batch ended indeterminate; retried next pass");
+      Ok(0)
+    }
   }
 }
 

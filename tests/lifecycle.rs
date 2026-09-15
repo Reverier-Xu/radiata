@@ -348,3 +348,23 @@ async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
 
   node.command(Shutdown::new()).await.unwrap();
 }
+
+/// A caller-required feature outside the negotiation registry fails
+/// `start()` with a typed error: the offer is built before the runtime is
+/// marked ready, so a node can never come up as a handle that silently
+/// stopped with a misleading shutdown reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_start_fails_typed_when_a_required_feature_is_unregistered() {
+  let providers = Providers::new();
+  let feature = radiata::FeatureTag::parse("example.com/features/absent").unwrap();
+  let error = match providers
+    .builder()
+    .config(radiata::NodeConfig::new().require_feature(feature).unwrap())
+    .start()
+    .await
+  {
+    Err(error) => error,
+    Ok(_) => panic!("start must fail with a typed provisioning error"),
+  };
+  assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}

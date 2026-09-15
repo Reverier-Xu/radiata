@@ -77,8 +77,10 @@ impl ResourcePage {
 /// The anti-entropy driver for resource pages: pages the local register
 /// from a cursor and applies received pages under strict validation.
 pub(crate) mod sync {
+  use std::collections::HashMap;
+
   use super::{MAX_PAGE_RECORDS, ResourcePage, ResourceRecordV1};
-  use crate::{Digest, Error, Result, api::Entropy, storage::MetadataStore};
+  use crate::{Digest, Error, NodeId, Result, api::Entropy, storage::MetadataStore};
 
   /// How long one record's writer-descriptor lookup waits for the
   /// membership lane to converge before the record skips: the descriptor
@@ -127,16 +129,9 @@ pub(crate) mod sync {
   /// True when the page's full wire payload (page envelope plus sync
   /// wrapper) encodes inside the control-body bound.
   fn wire_payload_fits(page: &ResourcePage) -> Result<bool> {
-    // A page envelope that fails to encode is simply "does not fit" —
-    // the ladder's whole reason to halve.
-    let Ok(encoded) = page.encode() else {
-      return Ok(false);
-    };
-    Ok(
-      super::super::sync::ResourceSyncPayload(minicbor::bytes::ByteVec::from(encoded))
-        .encode()
-        .is_ok(),
-    )
+    crate::sync_common::page_wire_fits(page.encode(), |bytes| {
+      super::super::sync::ResourceSyncPayload(minicbor::bytes::ByteVec::from(bytes)).encode()
+    })
   }
 
   /// Emits one filtered detection/emission step at an exact candidate
@@ -297,25 +292,58 @@ pub(crate) mod sync {
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
   ) -> Result<usize> {
+    // Resolve each distinct writer once per page: the bounded
+    // descriptor-convergence wait is a per-writer cost, not a per-record
+    // cost — a page of N records from one not-yet-converged writer waits
+    // once, not N times.
+    let mut resolved: HashMap<NodeId, Option<crate::PublicKey>> = HashMap::new();
+    for writer in page
+      .records()
+      .iter()
+      .map(|record| record.writer())
+      .collect::<Vec<_>>()
+    {
+      if resolved.contains_key(writer) {
+        continue;
+      }
+      // The fast path is the same read `writer_key` starts with: a
+      // converged writer resolves without any wait.
+      let key = match crate::membership::store::read_descriptor_ctx(store, writer).await {
+        Ok(Some(descriptor)) if !descriptor.removed() => Some(descriptor.public_key().clone()),
+        _ => None,
+      };
+      resolved.insert(writer.clone(), key);
+    }
     let mut applied = 0;
     for record in page.records() {
-      let writer_key = match writer_key(store, record.writer()).await {
-        Ok(key) => key,
-        // Unknown writers fail closed: without the writer's trusted key no
-        // signature check is possible, so nothing is compared or stored.
-        // The bounded wait in `writer_key` already absorbed the normal
-        // descriptor-convergence race; past it the skip is final for this
-        // pass and the periodic watermark refresh re-delivers the record.
-        // Past-the-bound skips are an internal-consistency anomaly (the
-        // membership lane stalled) and warn.
-        Err(error) => {
-          tracing::warn!(
-            writer = %record.writer(),
-            kind = ?error.kind(),
-            "resource page record skipped: writer descriptor never converged"
-          );
-          continue;
+      let writer_key = match resolved.get(record.writer()) {
+        Some(Some(key)) => key.clone(),
+        Some(None) => {
+          // Unknown writer: the bounded wait runs once per writer (the
+          // result is cached above for the rest of the page). Without
+          // the writer's trusted key no signature check is possible, so
+          // nothing is compared or stored. The wait already absorbed the
+          // normal descriptor-convergence race; past it the skip is
+          // final for this pass and the periodic watermark refresh
+          // re-delivers the record. Past-the-bound skips are an
+          // internal-consistency anomaly (the membership lane stalled)
+          // and warn.
+          match writer_key(store, record.writer()).await {
+            Ok(key) => {
+              resolved.insert(record.writer().clone(), Some(key.clone()));
+              key
+            }
+            Err(error) => {
+              tracing::warn!(
+                writer = %record.writer(),
+                kind = ?error.kind(),
+                "resource page writer never converged; page records skipped"
+              );
+              continue;
+            }
+          }
         }
+        None => continue,
       };
       match record.verify(&writer_key) {
         Ok(()) => {}
