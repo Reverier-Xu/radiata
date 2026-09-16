@@ -8,7 +8,7 @@ edition      = "2024"
 license      = "GPL-2.0-only"
 name         = "radiata"
 rust-version = "1.98.0"
-version      = "0.1.0"
+version      = "0.0.2"
 
 [features]
 audit   = []
