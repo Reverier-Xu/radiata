@@ -19,11 +19,11 @@ use crate::{
   packet::{OutboundRequest, RouteRecord},
   protocol::offer::node_offer,
   provider::{KeyProvider, StorageFactory},
-  routing::{RouteTable, insert_route, record_terminal_failure},
+  routing::{RouteTable, insert_route, outbound::run_outbound, record_terminal_failure},
   runtime::{Control, LifecycleSnapshot, RuntimeClient},
   session::{
     SessionDriver,
-    stream::{SessionPacketContext, SessionTable, run_outbound, run_session},
+    stream::{SessionPacketContext, SessionTable, run_session},
   },
   transport::{
     registry::{Transport, TransportListener},

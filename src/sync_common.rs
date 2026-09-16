@@ -225,7 +225,7 @@ pub(crate) fn send_pumped_payload(
   // The pump runs as its own task: the acknowledgement channel resolves
   // at admission and the task itself completes after the record body
   // flushed to the session.
-  let pump = tokio::spawn(crate::session::stream::run_outbound(
+  let pump = tokio::spawn(crate::routing::outbound::run_outbound(
     context.entry,
     context.local.clone(),
     request,

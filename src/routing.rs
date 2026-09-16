@@ -23,6 +23,7 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 use crate::{Error, NodeId, QualifiedTag, Result, api::BoxFuture};
 
 pub(crate) mod forward;
+pub(crate) mod outbound;
 pub(crate) mod table;
 pub(crate) mod trace;
 
