@@ -1,5 +1,38 @@
 # radiata Verified Findings (G3-era review, 2026-08)
 
+> **Remediation record 2026-09-16 (branch audit-remediation-0.1.0, 32 commits,
+> tree released as 0.1.0 @ f3646cb; final acceptance: 693 tests / 0 failed,
+> verify-api + verify-public-abi + verify-storage-contract + verify-release
+> all PASS, examples lanes strict-PASS).** All seven audit P0/P1s fixed:
+> dial deadline (P0, with_dial_deadline knob, enforced at merge/connect/
+> recovery dial sites), trust store-budget decode + shared snapshot parse
+> pipeline (store item cap raised 1024→16384 so the 1 MiB budget binds),
+> merge limiter buckets granted-only, trust cursor per-payload verdict.
+> Four sync-lane drifts fixed (resource dispatch rejection rewinds instead
+> of aborting the tick; membership cadence verdict-gated; corrupt scan rows
+> skip-with-log everywhere; unified envelope codec in sync_common). Product
+> line: built-in `adapters::file_key_store` (0600-at-create, fsync+dir
+> barrier, restartable-create semantics) + `adapters::ephemeral_key_store`;
+> examples consume them; guide module now public; DefaultNextHop wired by
+> default; receipt retention tick-driven; `ResolveFrozenJournal` +
+> `DeclareInterruptedTransactionUncommitted` escape hatch (review-passed:
+> conditional unfreeze + paired receipt-token delete hardened in dad243a);
+> cleanup checkpoint refuses while non-terminal members are unreachable
+> (`NotReady`). Hygiene: `domain` dep dropped (local RFC-1035 caps),
+> dead neighbor module + Offline variant + transactional_migration bit
+> removed, PageCursor homed in paging, supervisor split 2400→1330 across
+> six sibling impl modules, stream.rs split 2383→743 with the outbound
+> pump reunited into routing::outbound, storage commit precheck +
+> receipt classification single-sourced behind per-site closures
+> (crash matrices pin read order), crash-point constants exported.
+> Public API changes (baseline regenerated each commit): with_dial_deadline,
+> RecoveryConfig::new 4→3 args, file/ephemeral key stores, pub mod guide,
+> ResolveFrozenJournal + token, PageCursor::new -> Result, Offline removed,
+> transactional_migration SPI removed. Not done (owner-visible leftovers):
+> ProviderErrorKind::Cancelled kept (provider SPI vocabulary), LeaveCluster
+> post-journal no-abort semantics documented in rustdoc only via the
+> audit trail — add a guide paragraph when the guide grows.
+
 > **Full audit 2026-09-16 (main @ 17a8c20, seven lanes: 5 module partitions +
 > user-path + dependency/ecosystem; docs/ ignored by owner instruction — code
 > and comments are the only source of truth).** Q suite green (573/0, clippy
