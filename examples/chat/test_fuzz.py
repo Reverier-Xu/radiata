@@ -676,6 +676,7 @@ def main() -> None:
         print(violation)
         sys.exit(1)
     history[-1] += f" ({time.time() - started:.1f}s)"
+    print(f"[done {step:04d}] {name} c{node} {time.time() - started:.1f}s")
 
   print(f"[fuzz] seed={args.seed}: {args.ops} operations, zero violations")
 
