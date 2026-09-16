@@ -218,6 +218,10 @@ pub struct StoreRequirements {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
+  /// Forward infrastructure: no production adapter advertises the
+  /// transactional-migration bit and no production requirement names it,
+  /// so the bit exists only where tests and fuzzing exercise it.
+  #[cfg(any(test, fuzzing))]
   transactional_migration: bool,
 }
 
@@ -229,6 +233,7 @@ impl StoreRequirements {
       ordered_scan: true,
       reconciliation: true,
       exclusive_lifetime_lock: true,
+      #[cfg(any(test, fuzzing))]
       transactional_migration: false,
     }
   }
@@ -253,11 +258,13 @@ impl StoreRequirements {
     self.exclusive_lifetime_lock
   }
 
+  #[cfg(any(test, fuzzing))]
   pub fn requires_transactional_migration(&self) -> bool {
     self.transactional_migration
   }
 
-  #[cfg(test)]
+  #[cfg(any(test, fuzzing))]
+  #[cfg_attr(fuzzing, allow(dead_code))]
   pub(crate) const fn transactional_migration(mut self, required: bool) -> Self {
     self.transactional_migration = required;
     self
@@ -277,6 +284,10 @@ pub struct StoreCapabilities {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
+  /// Forward infrastructure: no production adapter advertises the
+  /// transactional-migration bit, so the bit exists only where tests and
+  /// fuzzing exercise it.
+  #[cfg(any(test, fuzzing))]
   transactional_migration: bool,
 }
 
@@ -288,6 +299,7 @@ impl StoreCapabilities {
       ordered_scan: false,
       reconciliation: false,
       exclusive_lifetime_lock: false,
+      #[cfg(any(test, fuzzing))]
       transactional_migration: false,
     }
   }
@@ -312,6 +324,7 @@ impl StoreCapabilities {
     self
   }
 
+  #[cfg(any(test, fuzzing))]
   pub fn transactional_migration(mut self, supported: bool) -> Self {
     self.transactional_migration = supported;
     self
@@ -337,6 +350,7 @@ impl StoreCapabilities {
     self.exclusive_lifetime_lock
   }
 
+  #[cfg(any(test, fuzzing))]
   pub fn has_transactional_migration(&self) -> bool {
     self.transactional_migration
   }
@@ -347,8 +361,24 @@ impl StoreCapabilities {
       && (!requirements.ordered_scan || self.ordered_scan)
       && (!requirements.reconciliation || self.reconciliation)
       && (!requirements.exclusive_lifetime_lock || self.exclusive_lifetime_lock)
-      && (!requirements.transactional_migration || self.transactional_migration)
+      && transactional_migration_satisfied(self, requirements)
   }
+}
+
+/// The gated capability clause: production requirements cannot name the
+/// transactional-migration bit, so the clause exists only under the gate.
+#[cfg(any(test, fuzzing))]
+const fn transactional_migration_satisfied(
+  capabilities: &StoreCapabilities, requirements: &StoreRequirements,
+) -> bool {
+  !requirements.transactional_migration || capabilities.transactional_migration
+}
+
+/// With the gate off the bit cannot be required or advertised, so the
+/// clause is vacuously true.
+#[cfg(not(any(test, fuzzing)))]
+const fn transactional_migration_satisfied(_: &StoreCapabilities, _: &StoreRequirements) -> bool {
+  true
 }
 
 const fn durability_satisfies(actual: DurabilityLevel, required: DurabilityLevel) -> bool {

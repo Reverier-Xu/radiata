@@ -404,7 +404,6 @@ impl StorageFactory for PubStoreFactory {
       requirements.requires_ordered_scan(),
       requirements.requires_reconciliation(),
       requirements.requires_exclusive_lifetime_lock(),
-      requirements.requires_transactional_migration(),
     );
     Box::pin(async move {
       Ok(Box::new(PubStore {
@@ -469,8 +468,7 @@ fn storage_spi_values_are_externally_constructible() {
     .conditional_batch(true)
     .ordered_scan(true)
     .reconciliation(true)
-    .exclusive_lifetime_lock(true)
-    .transactional_migration(true);
+    .exclusive_lifetime_lock(true);
 }
 
 /// The `StoreScan` to `BoxStream` converter is externally drivable:

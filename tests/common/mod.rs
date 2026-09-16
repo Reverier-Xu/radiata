@@ -505,8 +505,6 @@ fn capabilities_satisfy(capabilities: StoreCapabilities, requirements: &StoreReq
     && (!requirements.requires_reconciliation() || capabilities.has_reconciliation())
     && (!requirements.requires_exclusive_lifetime_lock()
       || capabilities.has_exclusive_lifetime_lock())
-    && (!requirements.requires_transactional_migration()
-      || capabilities.has_transactional_migration())
 }
 
 const fn durability_satisfies(actual: DurabilityLevel, required: DurabilityLevel) -> bool {

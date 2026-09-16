@@ -179,7 +179,6 @@ fn core_storage_boundary_values_round_trip() {
   assert!(capabilities.has_ordered_scan());
   assert!(capabilities.has_reconciliation());
   assert!(capabilities.has_exclusive_lifetime_lock());
-  assert!(capabilities.has_transactional_migration());
 
   let revision = StoreRevision::new(Arc::from([1_u8, 2, 3])).unwrap();
   assert_eq!(revision.as_bytes(), &[1, 2, 3]);
@@ -284,7 +283,6 @@ fn complete_store_capabilities() -> StoreCapabilities {
     .ordered_scan(true)
     .reconciliation(true)
     .exclusive_lifetime_lock(true)
-    .transactional_migration(true)
 }
 
 fn inspect_requirements(requirements: &StoreRequirements) {
@@ -293,7 +291,6 @@ fn inspect_requirements(requirements: &StoreRequirements) {
   let _ = requirements.requires_ordered_scan();
   let _ = requirements.requires_reconciliation();
   let _ = requirements.requires_exclusive_lifetime_lock();
-  let _ = requirements.requires_transactional_migration();
 }
 
 fn provider_error() -> Error {

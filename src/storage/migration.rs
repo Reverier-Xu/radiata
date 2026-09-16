@@ -1,11 +1,26 @@
 //! Transactional metadata schema migrations.
 //!
-//! A store carries one schema metadata family record naming its current
-//! logical schema version. [`MigrationRegistry`] owns an explicit, immutable
-//! chain of migration edges from the base version to the current one;
-//! construction rejects duplicate edges, cycles, ambiguous paths, unknown
-//! endpoints, missing decoders, implicit ordering, and downgrade paths
-//! before any metadata transaction opens.
+//! Production behavior today is the schema gate: every open reads and
+//! decodes the store's schema record and fails closed on a version this
+//! build does not know ([`ensure_open_schema`]). The production registry
+//! ([`production_registry`]) registers zero edges, so opening a store
+//! never rewrites metadata — an absent schema record is the implicit
+//! baseline and stays absent.
+//!
+//! The edge machinery below is declared forward infrastructure, kept
+//! production-unreachable by the zero-edge registry and exercised by the
+//! fixture chains in this module's tests and the storage contract lanes:
+//! validated immutable chains, exactly one conditional transaction per
+//! edge, deterministic replay-identifiable transaction ids, and
+//! digest-pinned replay idempotence. The first real edge arrives with the
+//! first metadata format change and lands as one registry entry plus one
+//! edge, not a new engine.
+//!
+//! [`MigrationRegistry`] owns an explicit, immutable chain of migration
+//! edges from the base version to the current one; construction rejects
+//! duplicate edges, cycles, ambiguous paths, unknown endpoints, missing
+//! decoders, implicit ordering, and downgrade paths before any metadata
+//! transaction opens.
 //!
 //! Every edge is applied as exactly one conditional transaction that
 //! transforms the records and rewrites the schema record together, so an

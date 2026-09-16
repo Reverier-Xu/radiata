@@ -863,11 +863,9 @@ pub fn radiata::StoreCapabilities::has_conditional_batch(&self) -> bool
 pub fn radiata::StoreCapabilities::has_exclusive_lifetime_lock(&self) -> bool
 pub fn radiata::StoreCapabilities::has_ordered_scan(&self) -> bool
 pub fn radiata::StoreCapabilities::has_reconciliation(&self) -> bool
-pub fn radiata::StoreCapabilities::has_transactional_migration(&self) -> bool
 pub fn radiata::StoreCapabilities::new(radiata::DurabilityLevel) -> Self
 pub fn radiata::StoreCapabilities::ordered_scan(self, bool) -> Self
 pub fn radiata::StoreCapabilities::reconciliation(self, bool) -> Self
-pub fn radiata::StoreCapabilities::transactional_migration(self, bool) -> Self
 pub struct radiata::StoreEntry
 impl radiata::StoreEntry
 pub fn radiata::StoreEntry::key(&self) -> &radiata::StoreKey
@@ -891,7 +889,6 @@ pub fn radiata::StoreRequirements::requires_conditional_batch(&self) -> bool
 pub fn radiata::StoreRequirements::requires_exclusive_lifetime_lock(&self) -> bool
 pub fn radiata::StoreRequirements::requires_ordered_scan(&self) -> bool
 pub fn radiata::StoreRequirements::requires_reconciliation(&self) -> bool
-pub fn radiata::StoreRequirements::requires_transactional_migration(&self) -> bool
 pub struct radiata::StoreRevision(_)
 impl radiata::StoreRevision
 pub fn radiata::StoreRevision::as_bytes(&self) -> &[u8]
