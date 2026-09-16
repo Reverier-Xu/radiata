@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use minicbor::{Decode, Encode, bytes::ByteVec};
+use minicbor::bytes::ByteVec;
 
 use crate::{
   Error, IncomingStream, NodeId, ProtocolTag, Result,
@@ -26,7 +26,6 @@ use crate::{
     },
   },
   membership::page::{MembershipPage, sync as page_sync},
-  protocol::{decode_canonical_strict, encode_canonical},
   runtime::RuntimeClient,
   session::stream::SessionTable,
 };
@@ -72,17 +71,6 @@ pub(crate) enum SyncPayload {
   LeaveApplied { node: NodeId },
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct SyncPayloadWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  kind: u8,
-  #[n(2)]
-  payload: ByteVec,
-}
-
 impl SyncPayload {
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     let (kind, payload) = match self {
@@ -97,37 +85,28 @@ impl SyncPayload {
         ByteVec::from(node.as_str().as_bytes().to_vec()),
       ),
     };
-    encode_canonical(
-      &SyncPayloadWire {
-        schema: SYNC_PAYLOAD_SCHEMA.to_owned(),
-        kind,
-        payload,
-      },
-      crate::protocol::CONTROL_CBOR_LIMITS,
-    )
+    crate::sync_common::encode_sync_envelope(SYNC_PAYLOAD_SCHEMA, Some(kind), payload)
   }
 
   /// Decodes one payload, rejecting unknown schemas and kinds and any
   /// non-canonical encoding (fail closed).
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: SyncPayloadWire = decode_canonical_strict(
+    let (kind, payload) = crate::sync_common::decode_kinded_sync_envelope(
       bytes,
-      crate::protocol::CONTROL_CBOR_LIMITS,
+      SYNC_PAYLOAD_SCHEMA,
       "membership sync payload canonical form",
+      "membership sync payload schema",
     )?;
-    if wire.schema != SYNC_PAYLOAD_SCHEMA {
-      return Err(Error::invalid_input("membership sync payload schema"));
-    }
-    match wire.kind {
-      SYNC_KIND_PAGE => Ok(Self::Page(wire.payload)),
-      SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(wire.payload)),
-      SYNC_KIND_LEAVE => Ok(Self::Leave(wire.payload)),
-      SYNC_KIND_CLEANUP => Ok(Self::Cleanup(wire.payload)),
-      SYNC_KIND_REVOCATION => Ok(Self::Revocation(wire.payload)),
-      SYNC_KIND_CHECKPOINT => Ok(Self::Checkpoint(wire.payload)),
+    match kind {
+      SYNC_KIND_PAGE => Ok(Self::Page(payload)),
+      SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(payload)),
+      SYNC_KIND_LEAVE => Ok(Self::Leave(payload)),
+      SYNC_KIND_CLEANUP => Ok(Self::Cleanup(payload)),
+      SYNC_KIND_REVOCATION => Ok(Self::Revocation(payload)),
+      SYNC_KIND_CHECKPOINT => Ok(Self::Checkpoint(payload)),
       SYNC_KIND_LEAVE_APPLIED => Ok(Self::LeaveApplied {
         node: NodeId::parse(
-          std::str::from_utf8(wire.payload.as_ref())
+          std::str::from_utf8(payload.as_ref())
             .map_err(|_| Error::invalid_input("membership sync payload kind"))?,
         )?,
       }),

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use minicbor::{Decode, Encode, bytes::ByteVec};
+use minicbor::bytes::ByteVec;
 
 use super::page::{ResourcePage, sync as page_sync};
 use crate::{
@@ -19,7 +19,6 @@ use crate::{
   api::BoxFuture,
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::lifecycle::LocalIdentityContext,
-  protocol::{decode_canonical_strict, encode_canonical},
   runtime::RuntimeClient,
   session::stream::SessionTable,
   sync_common::delivered_within_bound,
@@ -35,39 +34,21 @@ const RESOURCE_SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/resource-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceSyncPayload(pub(crate) ByteVec);
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct SyncPayloadWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  payload: ByteVec,
-}
-
 impl ResourceSyncPayload {
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &SyncPayloadWire {
-        schema: RESOURCE_SYNC_PAYLOAD_SCHEMA.to_owned(),
-        payload: self.0.clone(),
-      },
-      crate::protocol::CONTROL_CBOR_LIMITS,
-    )
+    crate::sync_common::encode_sync_envelope(RESOURCE_SYNC_PAYLOAD_SCHEMA, None, self.0.clone())
   }
 
   /// Decodes one payload, rejecting unknown schemas and any non-canonical
   /// encoding (fail closed). Record-level validation happens at page
   /// decode and application.
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: SyncPayloadWire = decode_canonical_strict(
+    Ok(Self(crate::sync_common::decode_plain_sync_envelope(
       bytes,
-      crate::protocol::CONTROL_CBOR_LIMITS,
+      RESOURCE_SYNC_PAYLOAD_SCHEMA,
       "resource sync payload canonical form",
-    )?;
-    if wire.schema != RESOURCE_SYNC_PAYLOAD_SCHEMA {
-      return Err(Error::invalid_input("resource sync payload schema"));
-    }
-    Ok(Self(wire.payload))
+      "resource sync payload schema",
+    )?))
   }
 
   fn page(&self) -> Result<ResourcePage> {
