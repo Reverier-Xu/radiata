@@ -581,9 +581,9 @@ mod crash {
   const CRASH_BACKEND_ENV: &str = "RADIATA_REVOKE_CRASH_BACKEND";
   const CHILD_ENTROPY_SEED: u8 = 11;
   #[cfg(feature = "json")]
-  const JSON_LAST_POINT: u8 = 13;
+  use crate::storage::json::LAST_POINT as JSON_LAST_POINT;
   #[cfg(feature = "redb")]
-  const REDB_LAST_POINT: u8 = 6;
+  use crate::storage::redb::LAST_POINT as REDB_LAST_POINT;
 
   /// The crash backends compiled into this test binary, with each commit
   /// path's boundary count.

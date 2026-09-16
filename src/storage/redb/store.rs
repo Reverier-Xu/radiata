@@ -45,6 +45,21 @@ pub(crate) fn select_crash_point(point: u8) {
   CRASH_POINT.store(point, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// First crash point at which the redb commit is already durable, so a
+/// crash from here on reopens to the committed state and every earlier
+/// point (`1..6`: after begin, after conditions, after mutations, after
+/// the revision bump, after the receipt insert) to the old one. The
+/// crash matrices import this instead of restating the boundary, so
+/// renumbering a hook desyncs nothing. Must track the `crash_hook`
+/// numbering in this module.
+#[cfg(test)]
+pub(crate) const FIRST_COMMITTED_POINT: u8 = 6;
+/// Highest live `crash_hook` boundary of this commit path; the crash
+/// matrices scan points `1..=LAST_POINT`. Must track the `crash_hook`
+/// numbering in this module.
+#[cfg(test)]
+pub(crate) const LAST_POINT: u8 = 6;
+
 #[cfg(test)]
 fn crash_hook(point: u8) {
   if CRASH_POINT.load(std::sync::atomic::Ordering::SeqCst) == point {

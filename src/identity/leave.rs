@@ -1128,9 +1128,9 @@ mod crash {
   const CRASH_PHASE_ENV: &str = "RADIATA_LEAVE_CRASH_PHASE";
   const CRASH_BACKEND_ENV: &str = "RADIATA_LEAVE_CRASH_BACKEND";
   #[cfg(feature = "json")]
-  const JSON_LAST_POINT: u8 = 13;
+  use crate::storage::json::LAST_POINT as JSON_LAST_POINT;
   #[cfg(feature = "redb")]
-  const REDB_LAST_POINT: u8 = 6;
+  use crate::storage::redb::LAST_POINT as REDB_LAST_POINT;
 
   /// The crash backends compiled into this test binary, with each commit
   /// path's boundary count.

@@ -890,18 +890,18 @@ mod crash_tests {
   #[cfg(all(feature = "json", unix))]
   const JSON_CRASH_POINT_ENV: &str = "RADIATA_JSON_MIGRATION_CRASH_POINT";
   #[cfg(all(feature = "json", unix))]
-  const JSON_FIRST_COMMITTED_POINT: u8 = 8;
-  #[cfg(all(feature = "json", unix))]
-  const JSON_LAST_POINT: u8 = 13;
+  use crate::storage::json::{
+    FIRST_COMMITTED_POINT as JSON_FIRST_COMMITTED_POINT, LAST_POINT as JSON_LAST_POINT,
+  };
 
   #[cfg(feature = "redb")]
   const REDB_CRASH_DIR_ENV: &str = "RADIATA_REDB_MIGRATION_CRASH_DIR";
   #[cfg(feature = "redb")]
   const REDB_CRASH_POINT_ENV: &str = "RADIATA_REDB_MIGRATION_CRASH_POINT";
   #[cfg(feature = "redb")]
-  const REDB_FIRST_COMMITTED_POINT: u8 = 6;
-  #[cfg(feature = "redb")]
-  const REDB_LAST_POINT: u8 = 6;
+  use crate::storage::redb::{
+    FIRST_COMMITTED_POINT as REDB_FIRST_COMMITTED_POINT, LAST_POINT as REDB_LAST_POINT,
+  };
 
   async fn seed_base_and_legacy(storage: &dyn Storage) {
     let snapshot = storage.snapshot().await.unwrap();
