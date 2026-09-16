@@ -52,11 +52,15 @@ const INTENT_KEY: &[u8] = b"leave";
 
 /// The durable leave-intent: the exact former identity and the
 /// replacement coordinates. One record per store; presence means a leave
-/// is in progress and must resume before the node serves.
+/// is in progress and must resume before the node serves. The former
+/// key's create operation rides along because the key-deletion phase
+/// must drive the provider delete under that exact operation — the
+/// pairing the built-in key stores validate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LeaveIntentV1 {
   former_node: NodeId,
   former_key: PublicKey,
+  former_operation: KeyOperationId,
   former_handle: KeyHandle,
   replacement_node: NodeId,
   replacement_operation: KeyOperationId,
@@ -74,6 +78,7 @@ canonical_record! {
       #[n(4)] former_handle = former_handle: ByteVec => handle()
       #[n(5)] replacement_node = replacement_node: String => node()
       #[n(6)] replacement_operation = replacement_operation: String => text(KeyOperationId)
+      #[n(7)] former_operation = former_operation: String => text(KeyOperationId)
     }
   }
 }
@@ -83,12 +88,17 @@ impl LeaveIntentV1 {
     &self.former_handle
   }
 
+  fn former_operation(&self) -> &KeyOperationId {
+    &self.former_operation
+  }
+
   /// The deterministic fixture intent for round-trip tests.
   #[cfg(test)]
   fn new_for_test() -> Self {
     Self {
       former_node: NodeId::parse("node-000000000000000000061").unwrap(),
       former_key: PublicKey::from_bytes([61; 32]),
+      former_operation: KeyOperationId::parse("keyop-000000000000000000061").unwrap(),
       former_handle: KeyHandle::from_provider_bytes(Arc::from(b"former-handle".to_vec())).unwrap(),
       replacement_node: NodeId::parse("node-000000000000000000062").unwrap(),
       replacement_operation: KeyOperationId::parse("keyop-000000000000000000062").unwrap(),
@@ -583,7 +593,14 @@ pub(crate) async fn run_leave(
     return Err(super::lifecycle::discovery_corrupt());
   }
   wipe_old_metadata(store, entropy).await?;
-  delete_unreferenced_key(store, keys, entropy, intent.former_handle()).await?;
+  delete_unreferenced_key(
+    store,
+    keys,
+    entropy,
+    intent.former_operation(),
+    intent.former_handle(),
+  )
+  .await?;
   complete_leave(store, entropy, stored).await
 }
 
@@ -628,6 +645,7 @@ async fn begin_intent(
   let intent = LeaveIntentV1 {
     former_node: former.node().clone(),
     former_key: former.public_key().clone(),
+    former_operation: former.operation().clone(),
     former_handle: former.handle().clone(),
     replacement_node: NodeId::generate(entropy)?,
     replacement_operation: KeyOperationId::generate(entropy)?,
