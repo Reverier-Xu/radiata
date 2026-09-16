@@ -5,6 +5,10 @@ use crate::{Error, Result};
 const MIN_TAG_LEN: usize = 5;
 pub(crate) const MAX_TAG_LEN: usize = 128;
 const MAX_COMPONENT_LEN: usize = 63;
+/// RFC 1035 presentation caps for canonical hostnames: 63 bytes per
+/// label and 253 bytes for the full name.
+const MAX_HOSTNAME_LABEL_LEN: usize = 63;
+const MAX_DNS_NAME_LEN: usize = 253;
 
 /// The builtin domain: its `crypto` category is reserved for signature
 /// domains and never available as a qualified tag, and the
@@ -190,11 +194,11 @@ pub(crate) fn fold_tag_domain(value: &str) -> String {
 }
 
 /// Validates one canonical DNS hostname: lowercase LDH labels without a
-/// trailing dot. The `domain` crate owns the DNS grammar and label-length
-/// rules, but it also accepts non-canonical spellings (uppercase,
-/// underscore, trailing dot, non-LDH label edges), so the canonical checks
-/// stay explicit: text equality must stay identity for tag domains and
-/// transport endpoints alike, and the two cannot diverge.
+/// trailing dot, within the RFC 1035 length caps (63 bytes per label,
+/// 253 bytes for the full name). Non-canonical spellings the DNS grammar
+/// alone would accept (uppercase, underscore, trailing dot, non-LDH label
+/// edges) are rejected: text equality must stay identity for tag domains
+/// and transport endpoints alike, and the two cannot diverge.
 pub(crate) fn valid_dns_hostname(host: &str) -> bool {
   // The trailing-dot root form and the empty host are non-canonical.
   if host.is_empty() || host.ends_with('.') {
@@ -206,21 +210,22 @@ pub(crate) fn valid_dns_hostname(host: &str) -> bool {
   if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
     return false;
   }
-  if !host.split('.').all(valid_ldh_label) {
+  if host.len() > MAX_DNS_NAME_LEN {
     return false;
   }
-  host.parse::<domain::base::name::Name<Vec<u8>>>().is_ok()
+  host.split('.').all(valid_ldh_label)
 }
 
 /// One LDH label: alphanumeric bytes with interior hyphens, never a
-/// leading or trailing hyphen. This excludes the underscore (the DNS
-/// grammar accepts it as the wildcard spelling, canonical hosts do not)
-/// and every non-ASCII byte.
+/// leading or trailing hyphen, at most 63 bytes (RFC 1035). This excludes
+/// the underscore (the DNS grammar accepts it as the wildcard spelling,
+/// canonical hosts do not) and every non-ASCII byte.
 fn valid_ldh_label(label: &str) -> bool {
   let bytes = label.as_bytes();
-  bytes
-    .first()
-    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+  bytes.len() <= MAX_HOSTNAME_LABEL_LEN
+    && bytes
+      .first()
+      .is_some_and(|byte| byte.is_ascii_alphanumeric())
     && bytes
       .last()
       .is_some_and(|byte| byte.is_ascii_alphanumeric())
@@ -242,4 +247,51 @@ fn valid_name_component(component: &str) -> bool {
       .iter()
       .copied()
       .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, valid_dns_hostname};
+
+  #[test]
+  fn accepts_canonical_hostnames_within_rfc1035_caps() {
+    assert!(valid_dns_hostname("radiata.woooo.tech"));
+    // A full-cap label: 63 bytes is the RFC 1035 label maximum.
+    let full_label = "a".repeat(MAX_HOSTNAME_LABEL_LEN);
+    assert!(valid_dns_hostname(&full_label));
+    assert!(valid_dns_hostname(&format!("{full_label}.example")));
+  }
+
+  #[test]
+  fn rejects_labels_above_the_63_byte_cap() {
+    let over_label = "a".repeat(MAX_HOSTNAME_LABEL_LEN + 1);
+    assert!(!valid_dns_hostname(&over_label));
+    assert!(!valid_dns_hostname(&format!("a.{over_label}")));
+  }
+
+  #[test]
+  fn rejects_names_above_the_253_byte_cap() {
+    // Every label stays within the 63-byte cap, so only the total-name
+    // cap can reject these.
+    let label = "a".repeat(MAX_HOSTNAME_LABEL_LEN);
+    let within = format!("{label}.{label}.{label}.{label}");
+    assert!(within.len() > MAX_DNS_NAME_LEN);
+    assert!(!valid_dns_hostname(&within));
+    assert!(!valid_dns_hostname(&format!("{within}.{label}")));
+  }
+
+  #[test]
+  fn rejects_noncanonical_hostname_spellings() {
+    for host in [
+      "",
+      "trailing.dot.",
+      "Upper.Example",
+      "under_score.example",
+      "-leading-hyphen.example",
+      "trailing-hyphen-.example",
+      "double..dot",
+    ] {
+      assert!(!valid_dns_hostname(host), "host: {host}");
+    }
+  }
 }
