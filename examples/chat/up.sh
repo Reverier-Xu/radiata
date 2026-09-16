@@ -52,12 +52,18 @@ done
 
 echo "waiting for the chat http apis..."
 for i in $(seq 1 "$N"); do
-  for _ in $(seq 1 60); do
+  ready=0
+  for _ in $(seq 1 90); do
     if curl -sf "http://127.0.0.1:$((BASE_HTTP_PORT + i))/whoami" >/dev/null; then
+      ready=1
       break
     fi
     sleep 1
   done
+  if [ "$ready" != 1 ]; then
+    echo "node c$i never became ready on port $((BASE_HTTP_PORT + i))" >&2
+    exit 1
+  fi
 done
 
 echo "cluster up: $N chat nodes; http on 127.0.0.1:$((BASE_HTTP_PORT + 1))..$((BASE_HTTP_PORT + N))"
