@@ -35,6 +35,26 @@
 > analog of caller-only `CallerError`), pinned on both variants. The
 > 0.1.0 version bump was rolled back to 0.0.2 before the PR: the owner
 > cuts the real release after the outstanding non-code changes land.
+>
+> **Post-memo catch 2026-09-16 (PR #41 acceptance): the chat scenario
+> fuzz (seed 7, op 8 leave) broke against the built-in file key store —
+> two same-mechanism drifts in one lane.** (1) The deletion intent
+> drove the provider delete under a freshly generated operation id,
+> while the file/ephemeral stores validate the delete pairing against
+> the key's CREATE operation (`validate_delete_pair`) — LeaveIntentV1
+> now carries `former_operation` and the intent reuses it. (2) The
+> provider delete tri-state was read by a private convention instead of
+> the SPI contract (`Present` = deleted by this call), so a successful
+> removal surfaced as spurious NotReady; the reader now follows the
+> contract and `DeleteScript::StillPresent` (a non-SPI answer) is gone.
+> Regression: the deletion flow runs against the real file key store.
+> Acceptance evidence: fuzz seeds 7/13/21 × 60 ops zero violations after
+> the fix; test_chat.py matrix green; latency/scale/transport/merge-SLO/
+> soak lanes all PASS. The first PR CI run also exposed a deterministic
+> Windows break in the same adapter: `seal` fsynced a read-only handle,
+> which FlushFileBuffers refuses with Access Denied — every reconcile of
+> a landed key failed closed on Windows. The seal handle is read+write
+> now (bytes are never modified; unix behavior unchanged).
 
 > **Full audit 2026-09-16 (main @ 17a8c20, seven lanes: 5 module partitions +
 > user-path + dependency/ecosystem; docs/ ignored by owner instruction — code
