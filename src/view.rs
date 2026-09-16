@@ -339,8 +339,6 @@ impl ShutdownOutcome {
 pub enum ConnectivityStatus {
   /// No observation yet.
   Unknown,
-  /// Known but no session and not a neighbor candidate.
-  Offline,
   /// Has candidate endpoints but no authenticated session.
   Reachable,
   /// Has an authenticated session.

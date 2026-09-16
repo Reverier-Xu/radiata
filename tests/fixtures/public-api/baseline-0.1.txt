@@ -40,7 +40,6 @@ pub radiata::CommitOutcome::Unknown::operation_digest: radiata::Digest
 pub radiata::CommitOutcome::Unknown::transaction: radiata::TransactionId
 #[non_exhaustive] pub enum radiata::ConnectivityStatus
 pub radiata::ConnectivityStatus::Connected
-pub radiata::ConnectivityStatus::Offline
 pub radiata::ConnectivityStatus::Reachable
 pub radiata::ConnectivityStatus::Unknown
 #[non_exhaustive] pub enum radiata::DurabilityLevel
