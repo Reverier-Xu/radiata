@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import subprocess
 import sys
@@ -33,8 +34,12 @@ import time
 import urllib.error
 import urllib.request
 
-BASE_HTTP_PORT = 19080
-N = 5
+# Same env knobs as up.sh: the harness must address exactly the mesh the
+# launcher started, at any cluster size and port offset.
+BASE_HTTP_PORT = int(os.environ.get("BASE_HTTP_PORT", "19080"))
+N = int(os.environ.get("N", "5"))
+# Container names carry the parallel-mesh prefix (hostnames stay c$i).
+NAME_PREFIX = os.environ.get("NAME_PREFIX", "")
 POLL = 0.5
 
 
@@ -65,7 +70,7 @@ def http(node: int, method: str, path: str, body: dict | None = None, timeout: f
 def podman_logs(node: int, since_epoch: float) -> str:
   """The node's container logs newer than `since_epoch` (unix seconds)."""
   result = subprocess.run(
-    ["podman", "logs", "--since", str(int(since_epoch)), f"c{node}"],
+    [ "podman", "logs", "--since", str(int(since_epoch)), f"{NAME_PREFIX}c{node}"],
     capture_output=True,
     text=True,
     check=False,
@@ -224,11 +229,12 @@ def node_id_of(node: int, user: str) -> str | None:
 def op_join_chat(model: Model, rng: random.Random, node: int):
   """A live node joins the cluster through the bootstrap hub (c1)."""
   del rng
+  bootstrap_host = f"{NAME_PREFIX}c1" if NAME_PREFIX else "c1"
   status, payload = http(
     node,
     "POST",
     "/join-chat",
-    {"bootstrap_http": "c1:8080", "bootstrap_wss": "wss://c1:9443"},
+    {"bootstrap_http": f"{bootstrap_host}:8080", "bootstrap_wss": f"wss://{bootstrap_host}:9443"},
     timeout=30,
   )
   if status != 200 or not (payload or {}).get("joined"):
@@ -337,7 +343,7 @@ def op_dm(model: Model, rng: random.Random, node: int):
       diagnostics = []
       for peer in sorted({node, 1}):
         logs = subprocess.run(
-          ["podman", "logs", f"c{peer}"], capture_output=True, text=True, check=False
+          [ "podman", "logs", f"{NAME_PREFIX}c{peer}"], capture_output=True, text=True, check=False
         )
         lines = [
           line for line in (logs.stdout + logs.stderr).splitlines()
@@ -515,7 +521,7 @@ def op_restart(model: Model, rng: random.Random, node: int):
   """SIGKILL-style container restart: sessions drop cluster-wide, the
   store persists, the node heals back in through its persisted identity."""
   del rng
-  subprocess.run(["podman", "kill", f"c{node}"], capture_output=True, check=False)
+  subprocess.run(["podman", "kill", f"{NAME_PREFIX}c{node}"], capture_output=True, check=False)
   model.alive.discard(node)
   return None, []
 
@@ -524,7 +530,7 @@ def op_start(model: Model, rng: random.Random, node: int):
   """Starts a stopped container; the node rejoins through persisted state.
   Membership is unchanged: a killed member auto-rejoins via recovery, a
   never-merged node stays standalone."""
-  subprocess.run(["podman", "start", f"c{node}"], capture_output=True, check=False)
+  subprocess.run(["podman", "start", f"{NAME_PREFIX}c{node}"], capture_output=True, check=False)
   model.alive.add(node)
   model.labels.setdefault(node, {})
   return None, []
@@ -607,6 +613,12 @@ def main() -> None:
   parser.add_argument("--seed", type=int, default=1)
   parser.add_argument("--ops", type=int, default=40, help="operation count")
   parser.add_argument("--node-start", type=int, default=2, help="first fuzzed node")
+  parser.add_argument(
+    "--no-wait-prob", type=float, default=0.0,
+    help="probability of skipping the convergence checkpoint after an op: "
+    "the command is issued into a possibly-unconverged cluster and the "
+    "next checked op absorbs the verification",
+  )
   args = parser.parse_args()
 
   rng = random.Random(args.seed)
@@ -655,11 +667,14 @@ def main() -> None:
     history.append(f"{name} c{node}")
     print(f"[op {step:04d}] {name} c{node}")
     state_check, path_expectations = mutator(model, rng, node)
-    try:
-      checkpoint(checker, model, state_check, path_expectations)
-    except HarnessError as violation:
-      print(violation)
-      sys.exit(1)
+    if rng.random() < args.no_wait_prob:
+      history[-1] += " [no-wait]"
+    else:
+      try:
+        checkpoint(checker, model, state_check, path_expectations)
+      except HarnessError as violation:
+        print(violation)
+        sys.exit(1)
     history[-1] += f" ({time.time() - started:.1f}s)"
 
   print(f"[fuzz] seed={args.seed}: {args.ops} operations, zero violations")

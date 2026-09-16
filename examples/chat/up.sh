@@ -4,9 +4,9 @@
 #   ./up.sh            # default: 5 chat users on network "radiata-chat"
 #   FUZZ=1 ./up.sh     # audit build + debug logs for the fuzz harness
 #
-# Topology at start: a join star through c1; every node's mesh loop
-# closes the full authenticated mesh so direct-routed chat traffic
-# always has a session to its peer.
+# Topology at start: standalone nodes; the driver chooses the shape
+# (test_chat.py joins a star through c1, the fuzz harness merges
+# organically, scale_sweep builds chains/trees via bootstrap choice).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -15,6 +15,10 @@ N=${N:-5}
 IMAGE=${IMAGE:-radiata-chat-node:latest}
 BASE_HTTP_PORT=${BASE_HTTP_PORT:-19080}
 FUZZ=${FUZZ:-0}
+# Name/volume prefix for parallel meshes: every container and volume
+# gains the prefix; the in-network hostname stays c$i so wss endpoints
+# and bootstrap addresses never change.
+NAME_PREFIX=${NAME_PREFIX:-}
 
 podman network create "$NETWORK" 2>/dev/null || true
 
@@ -29,14 +33,19 @@ if [ "$FUZZ" = "1" ]; then
   echo "fuzz mode: audit build + debug logs"
 fi
 
-echo "building the chat node image (release; several minutes on first run)..."
-podman build --build-arg CARGO_FEATURES="$FEATURES" -t "$IMAGE" -f Containerfile ../..
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  echo "building the chat node image (release; several minutes on first run)..."
+  podman build --build-arg CARGO_FEATURES="$FEATURES" -t "$IMAGE" -f Containerfile ../..
+fi
 
 for i in $(seq 1 "$N"); do
   echo "starting c$i (user u$i)..."
-  podman run -d --name "c$i" --hostname "c$i" --network "$NETWORK" \
-    -v "radiata-chat-data-$i:/data" \
-    -e "LISTEN=wss://c$i:9443" -e "CHAT_USER=u$i" -e "RUST_LOG=${RUST_LOG:-$LOG_LEVEL}" \
+  # The DNS hostname carries the mesh prefix: aardvark resolves
+  # hostnames across networks on the same host, so two parallel meshes
+  # with plain c1..cN hostnames would dial into each other.
+  podman run -d --name "${NAME_PREFIX}c$i" --hostname "${NAME_PREFIX}c$i" --network "$NETWORK" \
+    -v "${NAME_PREFIX}radiata-chat-data-$i:/data" \
+    -e "LISTEN=wss://${NAME_PREFIX}c$i:9443" -e "CHAT_USER=u$i" -e "RUST_LOG=${RUST_LOG:-$LOG_LEVEL}" \
     -p "$((BASE_HTTP_PORT + i)):8080" \
     "$IMAGE"
 done

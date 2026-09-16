@@ -3,3 +3,4 @@
 /slo/target
 __pycache__/
 *.pyc
+.ignored/

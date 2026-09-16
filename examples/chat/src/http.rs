@@ -385,8 +385,9 @@ async fn send_dm(
   })))
 }
 
-/// Retries every pending outbound message. Read receipts are regenerated
-/// from the inbox's seen state instead, so they never go stale here.
+/// Retries every pending outbound message, read receipts included: the
+/// receiver's `mark_read` is idempotent, so a replayed receipt is
+/// harmless and a receipt that finally lands heals the sender's state.
 async fn flush(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let pending = state.store.pending_outbound().await.map_err(internal)?;
   let mut delivered = 0_usize;
@@ -442,7 +443,12 @@ async fn list_messages(
         .map_err(internal)?;
       let mut receipts_sent = 0_usize;
       for message in &newly_seen {
-        let peer = NodeId::parse(&message.from_node).map_err(internal)?;
+        // The receipt targets the MESSAGE AUTHOR, resolved through the
+        // roster: on a multi-hop relay the wire-level source is the last
+        // hop node, not the author, so from_node cannot address it.
+        let peer = resolve_user(&state, &message.from_user)
+          .await
+          .ok_or_else(|| not_found("author node unknown"))?;
         let receipt = WireMessage {
           kind: "read".to_owned(),
           msg_id: message.msg_id.clone(),
@@ -463,13 +469,8 @@ async fn list_messages(
           )
           .await
           .map_err(internal)?;
-        let _ = receipt_id;
         if send_wire(&state, &peer, &receipt).await.is_ok() {
-          state
-            .store
-            .mark_sent(&message.msg_id)
-            .await
-            .map_err(internal)?;
+          state.store.mark_sent(&receipt_id).await.map_err(internal)?;
           receipts_sent += 1;
         }
       }
@@ -504,7 +505,11 @@ async fn mark_read(
       json!({"receipt_sent": false, "reason": "already seen or unknown"}),
     ));
   };
-  let peer = NodeId::parse(&message.from_node).map_err(internal)?;
+  // Same author-targeting rule as the inbox listing: from_node is the
+  // last relay hop on a multi-hop route, not the author.
+  let peer = resolve_user(&state, &message.from_user)
+    .await
+    .ok_or_else(|| not_found("author node unknown"))?;
   let receipt = WireMessage {
     kind: "read".to_owned(),
     msg_id: message.msg_id.clone(),
@@ -514,7 +519,7 @@ async fn mark_read(
     body: None,
     at_millis: now_millis(),
   };
-  state
+  let receipt_id = state
     .store
     .record_outbox(
       "read",
@@ -526,6 +531,9 @@ async fn mark_read(
     .await
     .map_err(internal)?;
   let sent = send_wire(&state, &peer, &receipt).await.is_ok();
+  if sent {
+    state.store.mark_sent(&receipt_id).await.map_err(internal)?;
+  }
   Ok(Json(json!({"receipt_sent": sent})))
 }
 
@@ -819,16 +827,36 @@ async fn join_chat(
   }
 }
 
-/// The node's session count, for the harness's mesh waits.
+/// The node's full session table, for the harness's mesh waits and the
+/// redundant-edge verification: walks every page so the count and the
+/// peer edge set stay exact at any cluster size, not just the first 64
+/// sessions. `sessions` is the raw live-session count and `distinct` the
+/// deduplicated peer count — a gap between the two is a parallel
+/// duplicate edge.
 async fn mesh_sessions(
   state: State<SharedState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let sessions = state
-    .node
-    .query(PageSessions::new(PageSpec::first(64).map_err(name_error)?))
-    .await
-    .map_err(internal)?;
-  Ok(Json(json!({"sessions": sessions.items().len()})))
+  let mut raw = 0_usize;
+  let mut peers: Vec<String> = Vec::new();
+  let mut next = Some(PageSpec::first(64).map_err(name_error)?);
+  while let Some(page) = next {
+    let view = state
+      .node
+      .query(PageSessions::new(page))
+      .await
+      .map_err(internal)?;
+    raw += view.items().len();
+    peers.extend(view.items().iter().map(|session| session.peer().as_str().to_owned()));
+    next = view
+      .next()
+      .cloned()
+      .map(|cursor| PageSpec::after(cursor, 64))
+      .transpose()
+      .map_err(name_error)?;
+  }
+  peers.sort();
+  peers.dedup();
+  Ok(Json(json!({"sessions": raw, "distinct": peers.len(), "peers": peers})))
 }
 
 fn label_map_json(view: &radiata::MemberView) -> serde_json::Map<String, Value> {
