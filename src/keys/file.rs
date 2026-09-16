@@ -124,8 +124,15 @@ impl FileKeyStore {
   /// Durability proof for observed key bytes: whatever wrote them may
   /// have died before its own fsync, so the reader fsyncs the file (and
   /// then the directory entry) before reporting the key as present.
+  /// The handle is opened read+write because Windows FlushFileBuffers
+  /// refuses a read-only handle with Access Denied; the bytes are never
+  /// modified — the call proves durability only.
   fn seal(&self, key_path: &Path, context: ProviderErrorContext) -> Result<()> {
-    let file = File::open(key_path).map_err(|error| io_error(&error, context))?;
+    let file = fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(key_path)
+      .map_err(|error| io_error(&error, context))?;
     file.sync_all().map_err(|error| io_error(&error, context))?;
     self.barrier(context)
   }
