@@ -5,14 +5,14 @@
 //! routed TLS 1.3 packet data plane. The facade exposes deterministic
 //! foundation values, provider boundaries, and the node lifecycle through
 //! this crate root and the [`extension`] module; every implementation
-//! module remains private.
+//! module remains private except the task-oriented [`guide`].
 
 mod api;
 mod audit;
 mod config;
 mod error;
 mod extension_registry;
-mod guide;
+pub mod guide;
 mod hex;
 mod identity;
 mod keys;

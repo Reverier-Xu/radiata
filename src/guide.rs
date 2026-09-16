@@ -280,9 +280,9 @@
 //!
 //! # Storage
 //!
-//! Storage selection is explicit:
-//! [`adapters::json_store`](crate::adapters::json_store) (test-only) or
-//! [`adapters::redb_store`](crate::adapters::redb_store) (production), or your
-//! own [`StorageFactory`](crate::extension::StorageFactory) for other
+//! Storage selection is explicit: `adapters::json_store` (test-only,
+//! built with the `json` feature), `adapters::redb_store` (production,
+//! built with the `redb` feature), or your own
+//! [`StorageFactory`](crate::extension::StorageFactory) for other
 //! backends. Custom adapters that scan the store directly bridge
 //! through [`store_scan_stream`](crate::store_scan_stream).
