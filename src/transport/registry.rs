@@ -8,8 +8,12 @@
 //! registration never bypasses either. The built-in WSS transport is
 //! registered by default.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
+#[cfg(test)]
+use std::sync::Arc;
 
+#[cfg(test)]
+use crate::paging::PageCursor;
 use crate::{Endpoint, Error, Result, TransportTag, api::BoxFuture, transport::ws::MergeHint};
 
 /// A framed session stream produced by a registered [`Transport`]. The
@@ -97,29 +101,6 @@ impl DiscoveryPage {
 
   pub(crate) fn items(&self) -> &[EndpointCandidate] {
     &self.items
-  }
-}
-
-/// An opaque continuation cursor for one discovery stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PageCursor(Arc<[u8]>);
-
-impl PageCursor {
-  pub fn new(value: Arc<[u8]>) -> Self {
-    Self(value)
-  }
-
-  /// Builds a cursor from provider bytes.
-  pub fn from_provider_bytes(value: Arc<[u8]>) -> Result<Self> {
-    if value.is_empty() {
-      return Err(Error::invalid_input("page cursor"));
-    }
-    Ok(Self(value))
-  }
-
-  /// The opaque cursor bytes.
-  pub fn as_bytes(&self) -> &[u8] {
-    &self.0
   }
 }
 

@@ -12,23 +12,16 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use super::{JsonStoreFactory, helpers};
+use super::{
+  JsonStoreFactory, helpers,
+  store::{FIRST_COMMITTED_POINT, LAST_POINT},
+};
 use crate::{
   CommitOutcome, ReconcileOutcome, StoreRequirements, StoreRevision, provider::StorageFactory,
 };
 
 const CRASH_DIR_ENV: &str = "RADIATA_JSON_CRASH_DIR";
 const CRASH_POINT_ENV: &str = "RADIATA_JSON_CRASH_POINT";
-
-/// Crash points inside the commit path.
-///
-/// 1: before temp create; 2: before the temp open attempt; 3: after temp
-/// create; 4: after write; 5: before file flush; 6: after file flush;
-/// 7: before rename; 8: after rename; 9: before directory barrier; 10:
-/// after barrier; 11: after in-memory result update; 12: after cleanup
-/// deletion; 13: after cleanup barrier.
-const FIRST_COMMITTED_POINT: u8 = 8;
-const LAST_POINT: u8 = 13;
 
 fn requirements() -> StoreRequirements {
   crate::storage::test_util::crash_requirements()

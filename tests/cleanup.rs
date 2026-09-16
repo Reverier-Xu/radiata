@@ -10,8 +10,9 @@ use std::{sync::Arc, time::Duration};
 
 use radiata::{
   CleanupNode, ConnectMember, Endpoint, ErrorKind, Listen, MemberStatus, MergeCluster,
-  MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageMembers, PageSpec, PageTrust,
-  PurgeRevocation, RevokeNode, RotateMergeCredential, Shutdown, extension::KeyProvider,
+  MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageMembers, PageSessions,
+  PageSpec, PageTrust, PurgeRevocation, RevokeNode, RotateMergeCredential, Shutdown,
+  extension::KeyProvider,
 };
 
 mod common;
@@ -20,9 +21,14 @@ use common::{MemoryStorageFactory, ScriptedKeys};
 
 const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The cleanup-checkpoint family's durable namespace: the rejection test
+/// asserts the refused issue left no epoch record behind.
+const CHECKPOINT_NAMESPACE_TAG: &str = "radiata.woooo.tech/metadata/cleanup-checkpoint-v1";
+
 struct Node {
   handle: NodeHandle,
   endpoint: Endpoint,
+  factory: Arc<MemoryStorageFactory>,
 }
 
 async fn start_node(seed: u64) -> Node {
@@ -41,7 +47,7 @@ async fn start_node(seed: u64) -> Node {
   let config = NodeConfig::new()
     .with_anti_entropy_interval(SYNC_INTERVAL)
     .unwrap();
-  let handle = NodeBuilder::new(storage, keys)
+  let handle = NodeBuilder::new(storage.clone(), keys)
     .config(config)
     .start()
     .await
@@ -49,6 +55,7 @@ async fn start_node(seed: u64) -> Node {
   Node {
     handle,
     endpoint: Endpoint::parse("wss://127.0.0.1:0").unwrap(),
+    factory: storage,
   }
 }
 
@@ -91,6 +98,32 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
     assert!(
       deadline.elapsed() < Duration::from_secs(90),
       "member {member} must be trusted"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+}
+
+/// One member's annotated status as the node observes it, polled with a
+/// bound (descriptors and removal records converge through the merge and
+/// ordinary sync): the checkpoint guard's enumeration source is the
+/// node's own descriptor store, so the tests wait for that view.
+async fn wait_member_status(node: &NodeHandle, member: &NodeId, expected: MemberStatus) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(90);
+  loop {
+    // Schedule the next convergence observation: one deterministic
+    // anti-entropy round on the observer.
+    node.command(radiata::RunSyncRound::new()).await.unwrap();
+    let status = node
+      .query(radiata::GetMember::new(member.clone()))
+      .await
+      .unwrap()
+      .map(|view| view.status());
+    if status == Some(expected) {
+      return;
+    }
+    assert!(
+      deadline.elapsed() < Duration::from_secs(90),
+      "member {member} never reached {expected:?} on the member table"
     );
     tokio::time::sleep(Duration::from_millis(5)).await;
   }
@@ -298,13 +331,17 @@ async fn purge_revocation_clears_the_local_boundary() {
 /// stays fully compositional afterwards (a later merge still converges).
 /// The sweep and filter mechanics themselves are unit-covered; through
 /// the facade the observable contract is that checkpointing never breaks
-/// convergence and never gates live entries.
+/// convergence and never gates live entries. The issue precondition is
+/// satisfied up front: every non-terminal member holds a live session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   let issuer = start_node(21).await;
   let issuer_endpoint = listen(&issuer).await;
 
   let subject = start_node(22).await;
+  // The subject publishes a listener so its descriptor exists and pages
+  // to the issuer: the guard enumerates members from that store.
+  let _subject_endpoint = listen(&subject).await;
   common::merge_with_retry(&subject.handle, &issuer.handle, issuer_endpoint.clone()).await;
   let subject_id = local_id(&subject.handle).await;
   let subject_key = trusted_key(&issuer.handle, &subject_id).await;
@@ -312,15 +349,28 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   let observer = start_node(23).await;
   let _observer_endpoint = listen(&observer).await;
   common::merge_with_retry(&observer.handle, &issuer.handle, issuer_endpoint.clone()).await;
-  let _observer_id = local_id(&observer.handle).await;
+  let observer_id = local_id(&observer.handle).await;
 
-  // Clean the subject, then start the epoch. Max-wins: the second issue
-  // never rolls the watermark back.
+  // The issuer's guard enumerates members from its descriptor store, so
+  // both members' descriptors must be converged before the epoch starts:
+  // each holds a live merge session back to the issuer.
+  wait_member_status(&issuer.handle, &subject_id, MemberStatus::Active).await;
+  wait_member_status(&issuer.handle, &observer_id, MemberStatus::Active).await;
+
+  // Clean the subject, then converge the tombstone to the observer
+  // BEFORE starting the epoch: the checkpoint's GC sweeps the collected
+  // record off the issuer, so the epoch must not start while a member is
+  // still owed the delivery — which is exactly what the precondition
+  // enforces.
   issuer
     .handle
     .command(CleanupNode::new(subject_id.clone()))
     .await
     .unwrap();
+  wait_member_status(&observer.handle, &subject_id, MemberStatus::Cleaned).await;
+
+  // Start the epoch. Max-wins: the second issue never rolls the watermark
+  // back.
   let first = issuer
     .handle
     .command(radiata::IssueCleanupCheckpoint::new())
@@ -333,8 +383,10 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
     .unwrap();
   assert!(second >= first, "the watermark is monotonic");
 
-  // The observer also issues: the epoch converges through sync and stays
-  // monotonic across issuers (any member may checkpoint).
+  // The observer also issues: the cleaned subject is terminal locally, so
+  // the precondition is satisfied with the live issuer session alone. The
+  // epoch converges through sync and stays monotonic across issuers (any
+  // member may checkpoint).
   let on_observer = observer
     .handle
     .command(radiata::IssueCleanupCheckpoint::new())
@@ -366,4 +418,84 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   for node in [&issuer, &subject, &observer, &late] {
     node.handle.command(Shutdown::new()).await.unwrap();
   }
+}
+
+/// A singleton node holds no other member, so the issue precondition
+/// passes trivially and the epoch starts (max-wins keeps re-issues
+/// monotonic).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_issues_on_a_singleton_node() {
+  let node = start_node(31).await;
+  let first = node
+    .handle
+    .command(radiata::IssueCleanupCheckpoint::new())
+    .await
+    .unwrap();
+  let second = node
+    .handle
+    .command(radiata::IssueCleanupCheckpoint::new())
+    .await
+    .unwrap();
+  assert!(second >= first, "the watermark is monotonic");
+  node.handle.command(Shutdown::new()).await.unwrap();
+}
+
+/// A known non-terminal member without a live session blocks the issue
+/// with the typed refusal, and the refused issue writes no epoch record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_refuses_an_unreachable_member_without_writing_an_epoch() {
+  let issuer = start_node(32).await;
+  let issuer_endpoint = listen(&issuer).await;
+
+  let member = start_node(33).await;
+  let _member_endpoint = listen(&member).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
+  let member_id = local_id(&member.handle).await;
+  // The guard enumerates members from the issuer's descriptor store, so
+  // the member's descriptor must be converged before the shutdown.
+  wait_member_status(&issuer.handle, &member_id, MemberStatus::Active).await;
+
+  // The member leaves the mesh without a terminal record: its descriptor
+  // stays an active member, its session tears down.
+  member.handle.command(Shutdown::new()).await.unwrap();
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let connected = issuer
+      .handle
+      .query(PageSessions::new(PageSpec::first(64).unwrap()))
+      .await
+      .unwrap()
+      .items()
+      .iter()
+      .any(|view| view.peer() == &member_id);
+    if !connected {
+      break;
+    }
+    assert!(
+      deadline.elapsed() < Duration::from_secs(30),
+      "the departed member's session never tore down"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+
+  // The precondition rejects the issue while the member is unreachable.
+  let error = issuer
+    .handle
+    .command(radiata::IssueCleanupCheckpoint::new())
+    .await
+    .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::NotReady);
+
+  // No epoch record may exist behind the refusal.
+  let checkpoint_namespace = common::namespace(CHECKPOINT_NAMESPACE_TAG);
+  assert!(
+    issuer
+      .factory
+      .entries()
+      .keys()
+      .all(|(namespace, _)| *namespace != checkpoint_namespace),
+    "the refused issue must not write a checkpoint"
+  );
+
+  issuer.handle.command(Shutdown::new()).await.unwrap();
 }

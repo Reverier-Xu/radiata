@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use minicbor::{Decode, Encode, bytes::ByteVec};
+use minicbor::bytes::ByteVec;
 
 use crate::{
   Error, IncomingStream, NodeId, ProtocolTag, Result,
@@ -26,7 +26,6 @@ use crate::{
     },
   },
   membership::page::{MembershipPage, sync as page_sync},
-  protocol::{decode_canonical_strict, encode_canonical},
   runtime::RuntimeClient,
   session::stream::SessionTable,
 };
@@ -72,17 +71,6 @@ pub(crate) enum SyncPayload {
   LeaveApplied { node: NodeId },
 }
 
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct SyncPayloadWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  kind: u8,
-  #[n(2)]
-  payload: ByteVec,
-}
-
 impl SyncPayload {
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     let (kind, payload) = match self {
@@ -97,37 +85,28 @@ impl SyncPayload {
         ByteVec::from(node.as_str().as_bytes().to_vec()),
       ),
     };
-    encode_canonical(
-      &SyncPayloadWire {
-        schema: SYNC_PAYLOAD_SCHEMA.to_owned(),
-        kind,
-        payload,
-      },
-      crate::protocol::CONTROL_CBOR_LIMITS,
-    )
+    crate::sync_common::encode_sync_envelope(SYNC_PAYLOAD_SCHEMA, Some(kind), payload)
   }
 
   /// Decodes one payload, rejecting unknown schemas and kinds and any
   /// non-canonical encoding (fail closed).
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: SyncPayloadWire = decode_canonical_strict(
+    let (kind, payload) = crate::sync_common::decode_kinded_sync_envelope(
       bytes,
-      crate::protocol::CONTROL_CBOR_LIMITS,
+      SYNC_PAYLOAD_SCHEMA,
       "membership sync payload canonical form",
+      "membership sync payload schema",
     )?;
-    if wire.schema != SYNC_PAYLOAD_SCHEMA {
-      return Err(Error::invalid_input("membership sync payload schema"));
-    }
-    match wire.kind {
-      SYNC_KIND_PAGE => Ok(Self::Page(wire.payload)),
-      SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(wire.payload)),
-      SYNC_KIND_LEAVE => Ok(Self::Leave(wire.payload)),
-      SYNC_KIND_CLEANUP => Ok(Self::Cleanup(wire.payload)),
-      SYNC_KIND_REVOCATION => Ok(Self::Revocation(wire.payload)),
-      SYNC_KIND_CHECKPOINT => Ok(Self::Checkpoint(wire.payload)),
+    match kind {
+      SYNC_KIND_PAGE => Ok(Self::Page(payload)),
+      SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(payload)),
+      SYNC_KIND_LEAVE => Ok(Self::Leave(payload)),
+      SYNC_KIND_CLEANUP => Ok(Self::Cleanup(payload)),
+      SYNC_KIND_REVOCATION => Ok(Self::Revocation(payload)),
+      SYNC_KIND_CHECKPOINT => Ok(Self::Checkpoint(payload)),
       SYNC_KIND_LEAVE_APPLIED => Ok(Self::LeaveApplied {
         node: NodeId::parse(
-          std::str::from_utf8(wire.payload.as_ref())
+          std::str::from_utf8(payload.as_ref())
             .map_err(|_| Error::invalid_input("membership sync payload kind"))?,
         )?,
       }),
@@ -620,12 +599,19 @@ pub(crate) struct PeerSyncState {
   /// trust page's final binding, so a set larger than one wire page
   /// pages through across ticks.
   snapshot_cursor: Option<NodeId>,
-  /// Ticks since this peer's last snapshot send: a lost delivery must be
-  /// retried without waiting for the next grant-set change.
+  /// Ticks since this peer's last DELIVERED snapshot send: a lost
+  /// delivery must be retried without waiting for the next grant-set
+  /// change. The counter advances every tick — independent of the
+  /// (possibly multi-tick) descriptor-page pass — and is pulled back to
+  /// zero only by a delivered trust page's verdict (or the pass's
+  /// closing tick), so an undelivered round retries on the next tick
+  /// instead of after a full resend interval.
   ticks_since_snapshot_send: u32,
-  /// Ticks since this peer's last tombstone send: lost removal evidence
-  /// retries on the same slow cadence, independent of the (possibly
-  /// multi-tick) trust-page pass.
+  /// Ticks since this peer's last DELIVERED tombstone send: lost removal
+  /// evidence retries on the same slow cadence, independent of the
+  /// (possibly multi-tick) trust-page pass and of the descriptor-page
+  /// plane's state. The counter advances every tick and is pulled back
+  /// to zero only by a fully delivered tombstone round.
   ticks_since_tombstone_send: u32,
   /// The shared page-plane continuation state (fingerprint, resend
   /// cadences, continuation cursor).
@@ -655,14 +641,29 @@ fn tombstone_round_due(
     && (ticks_since_send >= SNAPSHOT_RESEND_TICKS || snapshot_due)
 }
 
+/// One dispatched trust snapshot page: the keyset cursor it advances
+/// paired with ITS OWN admission receiver. A round dispatches several
+/// payloads per peer (trust page, tombstones, descriptor page), so the
+/// cursor must commit on this payload's verdict alone — another
+/// payload's ack says nothing about the trust page.
+struct SnapshotPageDispatch {
+  cursor: NodeId,
+  ack: tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+}
+
 /// The outcome of one per-peer membership round: the admission receivers
-/// for every dispatched payload (verdict-gated by the tick aggregator),
-/// the trust-page continuation to commit only on a delivered round, and
-/// whether any payload dispatched at all (a rejected dispatch fails the
-/// peer for this round).
+/// for every dispatched payload (grouped so each lane's cadence commit is
+/// verdict-gated by the tick aggregator), the dispatched trust page if
+/// any, and whether any payload dispatched at all (a rejected dispatch
+/// fails the peer for this round).
 struct MembershipPeerRound {
-  acks: Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
-  snapshot_page_cursor: Option<NodeId>,
+  /// The round's tombstone payloads' admission receivers: a fully
+  /// delivered set re-arms the tombstone resend cadence.
+  tombstone_acks: Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  /// The descriptor page's admission receiver: the page rides every
+  /// dispatched round, and its verdict feeds the peer-level failure set.
+  page_ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  snapshot_page: Option<SnapshotPageDispatch>,
   dispatched: bool,
 }
 
@@ -678,6 +679,13 @@ async fn membership_sync_tick_peer(
   snapshot: Option<&crate::identity::trust::TrustSnapshotV1>, tombstone_bytes: &[Vec<u8>],
 ) -> Result<MembershipPeerRound> {
   state.page.arm_full_pass();
+  // The snapshot and tombstone resend cadences advance on every tick —
+  // they are independent of the (possibly multi-tick) descriptor-page
+  // pass — and are pulled back to zero only by delivery verdicts in the
+  // tick's aggregator, so an undelivered round retries on the next tick
+  // instead of waiting out the full resend interval.
+  state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
+  state.ticks_since_tombstone_send = state.ticks_since_tombstone_send.saturating_add(1);
   let page = page_sync::emit_page_ctx(
     store,
     state.page.continuation(),
@@ -687,10 +695,8 @@ async fn membership_sync_tick_peer(
   let page_bytes = SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?;
   // The page-round decision records the fingerprint against the emitted
   // page on starting rounds only: a stale recorded fingerprint would
-  // mark every round as changed, keep the page due forever, and starve
-  // the snapshot/tombstone resend cadence — the quiet rounds between
-  // unchanged pages are what let ticks_since_snapshot_send advance to
-  // its resend threshold.
+  // mark every round as changed, keep the page due forever, and never
+  // let the page plane go quiet between unchanged pages.
   let page_round = state.page.page_round(page.fingerprint());
   // A snapshot pass is due for this peer when its revision advanced past
   // what this peer last fully received, or on the slow resend cadence.
@@ -717,11 +723,10 @@ async fn membership_sync_tick_peer(
   match page_round {
     crate::sync_common::PageRound::Quiet if !snapshot_due && !tombstones_due => {
       state.page.quiet_tick();
-      state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
-      state.ticks_since_tombstone_send = state.ticks_since_tombstone_send.saturating_add(1);
       return Ok(MembershipPeerRound {
-        acks: Vec::new(),
-        snapshot_page_cursor: None,
+        tombstone_acks: Vec::new(),
+        page_ack: None,
+        snapshot_page: None,
         dispatched: false,
       });
     }
@@ -740,33 +745,39 @@ async fn membership_sync_tick_peer(
   let mut snapshot_page: Option<Vec<u8>> = None;
   let mut snapshot_page_cursor: Option<NodeId> = None;
   if snapshot_due && let Some(snapshot) = snapshot {
-    state.ticks_since_snapshot_send = 0;
     let page = snapshot.page_after(state.snapshot_cursor.as_ref(), TRUST_BINDINGS_PAGE_LIMIT);
     if page.bindings().is_empty() {
       // The pass is complete for this revision: reset the cursor and
-      // mark the peer fully delivered. No payload this round.
+      // mark the peer fully delivered. No payload this round, so no
+      // delivery verdict is needed to re-arm the snapshot cadence.
       state.snapshot_cursor = None;
       state.snapshot_rev = snapshot.revision();
+      state.ticks_since_snapshot_send = 0;
     } else {
       snapshot_page_cursor = page.continuation().cloned();
       snapshot_page = Some(SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?);
     }
   }
+  let mut tombstone_payloads: Vec<&[u8]> = Vec::new();
   if tombstones_due {
-    state.ticks_since_tombstone_send = 0;
+    tombstone_payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
   }
-  let mut payloads: Vec<&[u8]> = Vec::new();
-  if let Some(bytes) = &snapshot_page {
-    payloads.push(bytes);
-  }
-  if tombstones_due {
-    payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
-  }
-  payloads.push(&page_bytes);
-  let acks = dispatch_to_peer(peer, &payloads, runtime, entropy, protocol).await;
+  let (tombstone_acks, page_ack, snapshot_ack) = dispatch_to_peer(
+    peer,
+    snapshot_page.as_deref(),
+    &tombstone_payloads,
+    &page_bytes,
+    runtime,
+    entropy,
+    protocol,
+  )
+  .await;
   Ok(MembershipPeerRound {
-    acks,
-    snapshot_page_cursor,
+    tombstone_acks,
+    page_ack,
+    snapshot_page: snapshot_ack
+      .zip(snapshot_page_cursor)
+      .map(|(ack, cursor)| SnapshotPageDispatch { cursor, ack }),
     dispatched: true,
   })
 }
@@ -874,11 +885,15 @@ pub(crate) async fn sync_tick(
       "removal tombstones considered for forwarding"
     );
   }
-  let mut pending_acks: Vec<(
+  let mut pending_tombstone_acks: Vec<(
     NodeId,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
-  let mut pending_trust_cursors: Vec<(NodeId, NodeId)> = Vec::new();
+  let mut pending_page_acks: Vec<(
+    NodeId,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )> = Vec::new();
+  let mut pending_trust_pages: Vec<(NodeId, SnapshotPageDispatch)> = Vec::new();
   let mut failed_peers: Vec<NodeId> = Vec::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
@@ -897,35 +912,74 @@ pub(crate) async fn sync_tick(
       // A quiet round with nothing due: the peer state already advanced.
       continue;
     }
-    if round.acks.is_empty() {
+    let MembershipPeerRound {
+      tombstone_acks,
+      page_ack,
+      snapshot_page,
+      ..
+    } = round;
+    if tombstone_acks.is_empty() && page_ack.is_none() && snapshot_page.is_none() {
       // Nothing was queued (the routing queue rejected outright): the
       // round never left this node.
       failed_peers.push(peer.clone());
       continue;
     }
     state.page.count_round();
-    if let Some(cursor) = round.snapshot_page_cursor {
+    if let Some(page) = snapshot_page {
       // The page dispatched: commit the trust cursor only after the
-      // delivery verdict (see below) — an unadmitted page rewinds.
-      pending_trust_cursors.push((peer.clone(), cursor));
+      // page's OWN delivery verdict (see below) — an unadmitted page
+      // rewinds.
+      pending_trust_pages.push((peer.clone(), page));
     }
-    pending_acks.extend(round.acks.into_iter().map(|ack| (peer.clone(), ack)));
+    pending_tombstone_acks.extend(tombstone_acks.into_iter().map(|ack| (peer.clone(), ack)));
+    if let Some(ack) = page_ack {
+      pending_page_acks.push((peer.clone(), ack));
+    }
   }
   // Delivery verdicts resolve concurrently: one unreachable peer must
   // not serialize the round behind its ack wait (that would make the
   // convergence bound liveness teardown, not the anti-entropy cadence).
-  let verdicts =
-    futures_util::future::join_all(pending_acks.into_iter().map(|(peer, ack)| async move {
+  let (tombstone_verdicts, page_verdicts, trust_verdicts) = futures_util::future::join3(
+    futures_util::future::join_all(pending_tombstone_acks.into_iter().map(
+      |(peer, ack)| async move { (peer, crate::sync_common::delivered_within_bound(ack).await) },
+    )),
+    futures_util::future::join_all(pending_page_acks.into_iter().map(|(peer, ack)| async move {
       (peer, crate::sync_common::delivered_within_bound(ack).await)
-    }))
-    .await;
-  let delivered_peers: std::collections::HashSet<NodeId> = verdicts
-    .iter()
-    .filter(|(_, delivered)| *delivered)
-    .map(|(peer, _)| peer.clone())
-    .collect();
-  for (peer, delivered) in verdicts {
+    })),
+    futures_util::future::join_all(pending_trust_pages.into_iter().map(
+      |(peer, page)| async move {
+        let delivered = crate::sync_common::delivered_within_bound(page.ack).await;
+        (peer, page.cursor, delivered)
+      },
+    )),
+  )
+  .await;
+  // A tombstone round re-arms its resend cadence only when EVERY
+  // tombstone of the round was admitted; any lost one retries on the
+  // next tick (the cadence counters kept advancing meanwhile).
+  let mut tombstone_rounds: std::collections::BTreeMap<NodeId, bool> =
+    std::collections::BTreeMap::new();
+  for (peer, delivered) in tombstone_verdicts {
     if !delivered {
+      failed_peers.push(peer.clone());
+    }
+    let entry = tombstone_rounds.entry(peer).or_insert(true);
+    *entry &= delivered;
+  }
+  for (peer, delivered) in page_verdicts {
+    if !delivered {
+      failed_peers.push(peer);
+    }
+  }
+  // The trust page resolves to its own verdict, never the peer-level OR
+  // over the round: a round dispatches several payloads per peer (trust
+  // page, tombstones, descriptor page), and another payload's ack says
+  // nothing about the trust page.
+  let mut trust_commits: Vec<(NodeId, NodeId)> = Vec::new();
+  for (peer, cursor, delivered) in trust_verdicts {
+    if delivered {
+      trust_commits.push((peer, cursor));
+    } else {
       failed_peers.push(peer);
     }
   }
@@ -937,14 +991,19 @@ pub(crate) async fn sync_tick(
       state.page.discard_progress();
     }
   }
-  // Trust-page cursor commits are verdict-gated like the page plane: an
-  // undelivered trust page leaves the cursor untouched, so the pass
-  // retries that page instead of skipping it.
-  for (peer, cursor) in pending_trust_cursors {
-    if delivered_peers.contains(&peer)
-      && let Some(state) = cursors.peers.get_mut(&peer)
-    {
+  // Verdict-gated cadence commits: a fully delivered tombstone round
+  // re-arms the tombstone resend cadence, and a delivered trust page
+  // re-arms the snapshot cadence while advancing the keyset cursor. An
+  // undelivered round resets nothing, so the next tick retries it.
+  for (peer, tombstones_delivered) in tombstone_rounds {
+    if tombstones_delivered && let Some(state) = cursors.peers.get_mut(&peer) {
+      state.ticks_since_tombstone_send = 0;
+    }
+  }
+  for (peer, cursor) in trust_commits {
+    if let Some(state) = cursors.peers.get_mut(&peer) {
       state.snapshot_cursor = Some(cursor);
+      state.ticks_since_snapshot_send = 0;
     }
   }
   gc_collected_tombstones(store, entropy).await;
@@ -952,23 +1011,47 @@ pub(crate) async fn sync_tick(
 }
 
 /// The per-tick fan-out to one peer: sends every payload in order and
-/// returns their admission receivers. A payload swallowed by a session
-/// that still looks alive never resolves its receiver, which is exactly
-/// the signal the caller needs to re-deliver from scratch.
+/// returns their admission receivers, grouped by lane so each cadence
+/// commit can be gated on its own delivery verdict. The trust snapshot
+/// page's receiver is kept separate from the rest so its own verdict —
+/// not a peer-level OR over the round — gates the snapshot cursor
+/// commit. A payload swallowed by a session that still looks alive never
+/// resolves its receiver, which is exactly the signal the caller needs
+/// to re-deliver from scratch.
 async fn dispatch_to_peer(
-  peer: &NodeId, payloads: &[&[u8]], runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>,
-  protocol: &ProtocolTag,
-) -> Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>> {
-  let mut acks = Vec::new();
-  for payload in payloads {
+  peer: &NodeId, snapshot_page: Option<&[u8]>, tombstones: &[&[u8]], page: &[u8],
+  runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, protocol: &ProtocolTag,
+) -> (
+  Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+) {
+  let snapshot_ack = snapshot_page.and_then(|payload| {
     match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload) {
-      Ok(ack) => acks.push(ack),
+      Ok(ack) => Some(ack),
+      Err(error) => {
+        tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
+        None
+      }
+    }
+  });
+  let mut tombstone_acks = Vec::new();
+  for payload in tombstones {
+    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload) {
+      Ok(ack) => tombstone_acks.push(ack),
       Err(error) => {
         tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
       }
     }
   }
-  acks
+  let page_ack = match crate::sync_common::send_payload(runtime, entropy, peer, protocol, page) {
+    Ok(ack) => Some(ack),
+    Err(error) => {
+      tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
+      None
+    }
+  };
+  (tombstone_acks, page_ack, snapshot_ack)
 }
 
 /// The post-round checkpoint GC: collect the
@@ -1051,23 +1134,25 @@ mod tests {
 
   /// Regression: a snapshot refresh failure used to fail the whole sync
   /// tick every round — an issuer binding set over the single-record
-  /// control bound cannot encode (~870+ bindings), so descriptor and
-  /// tombstone anti-entropy stalled permanently. The oversized issuer
-  /// refresh fails in isolation, the tick still returns success, and the
-  /// page plane keeps advancing (round dispatched, resend cadence armed)
-  /// while no snapshot revision is ever recorded.
+  /// store bound cannot encode (past the 16 384-entry collection cap of
+  /// the 1 MiB store body), so descriptor and tombstone anti-entropy
+  /// stalled permanently. The oversized issuer refresh fails in
+  /// isolation, the tick still returns success, and the page plane keeps
+  /// advancing (round dispatched, resend cadence armed) while no snapshot
+  /// revision is ever recorded.
   #[tokio::test]
   async fn sync_tick_survives_snapshot_refresh_overflow() {
     use crate::{
       identity::{
         lifecycle,
-        testing::{ScriptedKeys, SequenceEntropy},
+        records::{IdentityBindingV1, identity_binding_key},
+        testing::{ScriptedKeys, SequenceEntropy, inject_entry},
       },
       storage::contract::{ReferenceFactory, required_capabilities},
     };
 
-    let factory: Arc<dyn crate::provider::StorageFactory> =
-      Arc::new(ReferenceFactory::new(required_capabilities()));
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn crate::provider::StorageFactory> = reference.clone();
     let keys = ScriptedKeys::full();
     let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
     let context = Arc::new(
@@ -1081,17 +1166,19 @@ mod tests {
       .unwrap(),
     );
     // Oversize the issuer's binding set past the snapshot wire bounds
-    // (1_024 collection entries inside the 64 KiB control body): the
-    // issuer's own snapshot can no longer encode.
-    for index in 0..1_200_u64 {
-      trust_store::adopt_binding_ctx(
-        context.store(),
-        entropy.as_ref(),
-        &node_at(index),
-        &key_at(index),
-      )
-      .await
-      .unwrap();
+    // (16 384 collection entries inside the 1 MiB store body): the
+    // issuer's own snapshot can no longer encode. The entries are
+    // injected straight into the reference store — committing this many
+    // adoptions one by one is far too slow for the suite, and the
+    // refresh path only scans the identity-binding family, which is
+    // exactly what is injected. Keys repeat; only node identity is
+    // unique per binding.
+    let shared_key = key_at(0);
+    for index in 0..16_385_u64 {
+      let node = node_at(index);
+      let (namespace, key) = identity_binding_key(&node).unwrap();
+      let binding = IdentityBindingV1::new(node, shared_key.clone());
+      inject_entry(&reference, (namespace, key), binding.encode().unwrap());
     }
     // The injection is real: the issuer refresh fails on its own.
     let error = refresh_issuer_snapshot(&context, &entropy)
@@ -1168,6 +1255,507 @@ mod tests {
         .await
         .is_err(),
       "without a fresh bump the next wait parks"
+    );
+  }
+
+  /// Regression: the trust snapshot cursor commits on the trust page's
+  /// OWN delivery verdict, never on a peer-level OR over the round. A
+  /// round dispatches several payloads per peer (trust page, tombstones,
+  /// descriptor page); when the trust page's admission fails while the
+  /// descriptor page's ack resolves, the cursor must stay put and the
+  /// page must retry on the next tick — under the peer-level commit the
+  /// cursor jumped past the undelivered page and the missing bindings
+  /// stayed missing until the peer's session dropped.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn the_trust_cursor_commits_only_on_its_own_page_verdict() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_util::StreamExt as _;
+
+    use crate::{
+      identity::{
+        lifecycle,
+        records::{IdentityBindingV1, identity_binding_key},
+        testing::{ScriptedKeys, SequenceEntropy, inject_entry},
+      },
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn crate::provider::StorageFactory> = reference.clone();
+    let keys = ScriptedKeys::full();
+    let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        &keys.as_provider(),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    // Two injected bindings so the tick's membership probe passes and
+    // the issuer snapshot carries a paged grant set.
+    let shared_key = key_at(0);
+    for index in 101..=102_u64 {
+      let bound = node_at(index);
+      let (namespace, key) = identity_binding_key(&bound).unwrap();
+      let binding = IdentityBindingV1::new(bound, shared_key.clone());
+      inject_entry(&reference, (namespace, key), binding.encode().unwrap());
+    }
+
+    let peer = node(2);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let (entry, _rx) = crate::session::stream::test_entry(entropy.as_ref());
+    sessions.lock().unwrap().insert(peer.clone(), entry);
+    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(64);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = RuntimeClient::routing_only(packet_tx, routes);
+    // The harness fails exactly the trust snapshot payloads (their
+    // admission channel is dropped: the immediate failed verdict of a
+    // peer that never admits) while the descriptor page admits normally.
+    let admit_snapshots = Arc::new(std::sync::Mutex::new(false));
+    let snapshot_dispatches = Arc::new(AtomicUsize::new(0));
+    let drainer_snapshots = Arc::clone(&snapshot_dispatches);
+    let drainer_admit = Arc::clone(&admit_snapshots);
+    let drainer_peer = peer.clone();
+    tokio::spawn(async move {
+      while let Some(mut request) = packet_rx.recv().await {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = request.body.as_mut().next().await {
+          bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let payload = SyncPayload::decode(&bytes).unwrap();
+        if matches!(payload, SyncPayload::Snapshot(_)) {
+          drainer_snapshots.fetch_add(1, Ordering::SeqCst);
+          if !*drainer_admit.lock().unwrap() {
+            continue;
+          }
+        }
+        let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
+          by: drainer_peer.clone(),
+          admitted_at: std::time::SystemTime::now(),
+        }));
+      }
+    });
+
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
+    let mut cursors = MembershipSyncCursors::default();
+
+    // Round 1: the trust page dispatches and its admission fails while
+    // the descriptor page admits; the cursor must not advance.
+    sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursors,
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      snapshot_dispatches.load(Ordering::SeqCst),
+      1,
+      "the trust page dispatched"
+    );
+    assert!(
+      cursors.peers.get(&peer).unwrap().snapshot_cursor.is_none(),
+      "a failed trust page verdict must not advance the snapshot cursor"
+    );
+
+    // Round 2: the undelivered page retries on the next tick (the pass
+    // is still due through its unrecorded revision) and still must not
+    // commit past its failure.
+    sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursors,
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      snapshot_dispatches.load(Ordering::SeqCst),
+      2,
+      "the undelivered trust page retried on the next tick"
+    );
+    assert!(cursors.peers.get(&peer).unwrap().snapshot_cursor.is_none());
+
+    // Round 3: the trust page's own verdict resolves as delivered; only
+    // now the cursor commits.
+    *admit_snapshots.lock().unwrap() = true;
+    sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursors,
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot_dispatches.load(Ordering::SeqCst), 3);
+    assert!(
+      cursors.peers.get(&peer).unwrap().snapshot_cursor.is_some(),
+      "the delivered trust page commits its cursor"
+    );
+
+    // Round 4: the closing empty page completes the pass for this
+    // revision.
+    sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursors,
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap();
+    let state = cursors.peers.get(&peer).unwrap();
+    assert_eq!(state.snapshot_rev, 1, "the pass completed for revision 1");
+    assert!(
+      state.snapshot_cursor.is_none(),
+      "the completed pass resets the cursor"
+    );
+  }
+
+  /// The shared cadence-test harness: a local identity holding two
+  /// injected bindings (the tick's membership probe passes, the issuer
+  /// snapshot is stable at revision 1), one known leave record (the
+  /// tombstone lane has evidence to forward), and one live peer whose
+  /// payloads the drainer admits or fails per payload kind. The drainer
+  /// drops a failed kind's admission channel — the immediate failed
+  /// verdict of a peer that never admits.
+  struct CadenceHarness {
+    context: Arc<crate::identity::lifecycle::LocalIdentityContext>,
+    entropy: Arc<dyn Entropy>,
+    sessions: SessionTable,
+    runtime: RuntimeClient,
+    peer: NodeId,
+    events: Arc<crate::node::EventHub>,
+    revision: crate::node::MemberRevisionSignal,
+    admit_all: Arc<std::sync::Mutex<bool>>,
+    snapshot_dispatches: Arc<std::sync::atomic::AtomicUsize>,
+    leave_dispatches: Arc<std::sync::atomic::AtomicUsize>,
+    /// The typed reference factory behind the context's store: tests
+    /// inject raw family entries straight into its shared state.
+    reference: Arc<crate::storage::contract::ReferenceFactory>,
+  }
+
+  impl CadenceHarness {
+    async fn build() -> Self {
+      use std::sync::atomic::{AtomicUsize, Ordering};
+
+      use futures_util::StreamExt as _;
+
+      use crate::{
+        StoreKey,
+        identity::{
+          lifecycle,
+          records::{IdentityBindingV1, identity_binding_key},
+          testing::{ScriptedKeys, SequenceEntropy, inject_entry},
+        },
+        storage::contract::{ReferenceFactory, required_capabilities},
+      };
+
+      let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+      let factory: Arc<dyn crate::provider::StorageFactory> = reference.clone();
+      let keys = ScriptedKeys::full();
+      let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
+      let context = Arc::new(
+        lifecycle::open_local_identity(
+          &factory,
+          &keys.as_provider(),
+          entropy.as_ref(),
+          std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap(),
+      );
+      let shared_key = key_at(0);
+      for index in 101..=102_u64 {
+        let bound = node_at(index);
+        let (namespace, key) = identity_binding_key(&bound).unwrap();
+        let binding = IdentityBindingV1::new(bound, shared_key.clone());
+        inject_entry(&reference, (namespace, key), binding.encode().unwrap());
+      }
+      // One known leave record: the tombstone lane has evidence to
+      // forward (a scan-time decode only; the dummy signature is never
+      // verified on the send path).
+      let leaver = node_at(77);
+      let record = crate::identity::leave::LeaveRecordV1::new(
+        leaver.clone(),
+        key_at(3),
+        1_000,
+        crate::Signature::from_bytes([0_u8; 64]),
+      );
+      let leave_namespace =
+        crate::storage::families::namespace(crate::storage::families::LEAVE_NAMESPACE).unwrap();
+      inject_entry(
+        &reference,
+        (
+          leave_namespace,
+          StoreKey::new(std::sync::Arc::from(leaver.as_str().as_bytes().to_vec())),
+        ),
+        record.encode().unwrap(),
+      );
+
+      let peer = node(2);
+      let sessions: SessionTable =
+        Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+      let (entry, _rx) = crate::session::stream::test_entry(entropy.as_ref());
+      sessions.lock().unwrap().insert(peer.clone(), entry);
+      let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(64);
+      let routes: crate::routing::RouteTable =
+        Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+      let runtime = RuntimeClient::routing_only(packet_tx, routes);
+      let admit_all = Arc::new(std::sync::Mutex::new(true));
+      let snapshot_dispatches = Arc::new(AtomicUsize::new(0));
+      let leave_dispatches = Arc::new(AtomicUsize::new(0));
+      let drainer_admit = Arc::clone(&admit_all);
+      let drainer_snapshots = Arc::clone(&snapshot_dispatches);
+      let drainer_leaves = Arc::clone(&leave_dispatches);
+      let drainer_peer = peer.clone();
+      tokio::spawn(async move {
+        while let Some(mut request) = packet_rx.recv().await {
+          let mut bytes = Vec::new();
+          while let Some(chunk) = request.body.as_mut().next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+          }
+          match SyncPayload::decode(&bytes).unwrap() {
+            SyncPayload::Snapshot(_) => {
+              drainer_snapshots.fetch_add(1, Ordering::SeqCst);
+            }
+            SyncPayload::Leave(_) => {
+              drainer_leaves.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+          }
+          if *drainer_admit.lock().unwrap() {
+            let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
+              by: drainer_peer.clone(),
+              admitted_at: std::time::SystemTime::now(),
+            }));
+          }
+        }
+      });
+      let events = Arc::new(crate::node::EventHub::new());
+      let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+      Self {
+        context,
+        entropy,
+        sessions,
+        runtime,
+        peer,
+        events,
+        revision: crate::node::MemberRevisionSignal::new(revision_tx),
+        admit_all,
+        snapshot_dispatches,
+        leave_dispatches,
+        reference,
+      }
+    }
+
+    async fn tick(&self, cursors: &mut MembershipSyncCursors) {
+      let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
+      sync_tick(
+        &self.context,
+        &self.entropy,
+        &self.sessions,
+        &self.runtime,
+        &endpoints,
+        cursors,
+        &self.events,
+        &self.revision,
+      )
+      .await
+      .unwrap();
+    }
+  }
+
+  /// Regression: an undelivered round must retry on the NEXT tick, not
+  /// after a full SNAPSHOT_RESEND_TICKS interval. The cadence counters
+  /// advance every tick and are reset only by delivery verdicts; under
+  /// the dispatch-time reset a single failed round consumed the cadence
+  /// and silenced both lanes for the whole resend interval.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_undelivered_round_retries_on_the_next_tick_not_after_the_full_interval() {
+    use std::sync::atomic::Ordering;
+
+    let harness = CadenceHarness::build().await;
+    let mut cursors = MembershipSyncCursors::default();
+
+    // Converge one full snapshot pass first: round 1 delivers the trust
+    // page (the tombstones ride the revision change), round 2 closes the
+    // pass at revision 1. Round 3 is fully quiet.
+    harness.tick(&mut cursors).await;
+    harness.tick(&mut cursors).await;
+    harness.tick(&mut cursors).await;
+    let state = cursors.peers.get(&harness.peer).unwrap();
+    assert_eq!(state.snapshot_rev, 1, "the snapshot pass completed");
+    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 2);
+
+    // Arm both cadences, then fail a round completely: nothing may reset
+    // the counters.
+    {
+      let state = cursors.peers.get_mut(&harness.peer).unwrap();
+      state.ticks_since_snapshot_send = SNAPSHOT_RESEND_TICKS;
+      state.ticks_since_tombstone_send = SNAPSHOT_RESEND_TICKS;
+    }
+    *harness.admit_all.lock().unwrap() = false;
+    harness.tick(&mut cursors).await;
+    let state = cursors.peers.get(&harness.peer).unwrap();
+    assert!(
+      state.snapshot_cursor.is_none(),
+      "the failed round delivered nothing"
+    );
+    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 3);
+
+    // The next tick retries BOTH lanes: the counters were not consumed
+    // by the failed round.
+    harness.tick(&mut cursors).await;
+    assert_eq!(
+      harness.snapshot_dispatches.load(Ordering::SeqCst),
+      3,
+      "the snapshot lane retried on the next tick"
+    );
+    assert_eq!(
+      harness.leave_dispatches.load(Ordering::SeqCst),
+      4,
+      "the tombstone lane retried on the next tick"
+    );
+    assert!(
+      cursors
+        .peers
+        .get(&harness.peer)
+        .unwrap()
+        .snapshot_cursor
+        .is_none()
+    );
+
+    // Delivery heals both lanes: the verdict resets the cadences and
+    // commits the cursor.
+    *harness.admit_all.lock().unwrap() = true;
+    harness.tick(&mut cursors).await;
+    let state = cursors.peers.get(&harness.peer).unwrap();
+    assert!(
+      state.snapshot_cursor.is_some(),
+      "the delivered trust page commits its cursor"
+    );
+    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 4);
+    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 5);
+  }
+
+  /// Regression: the snapshot/tombstone cadence counters must advance on
+  /// every tick — independent of the (possibly multi-tick)
+  /// descriptor-page pass. Under quiet-round-only advancement a long
+  /// descriptor pass froze the tombstone lane for the whole pass.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_long_descriptor_pass_does_not_stall_the_tombstone_lane() {
+    use std::sync::atomic::Ordering;
+
+    use crate::{StoreKey, identity::testing::inject_entry};
+
+    let harness = CadenceHarness::build().await;
+    // A catalog far larger than one descriptor page: the page plane runs
+    // a multi-tick Send pass once the first tick records its cursor.
+    let descriptor_namespace =
+      crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
+        .unwrap();
+    for index in 0..100_u64 {
+      let member = node_at(500 + index);
+      let descriptor = crate::membership::NodeDescriptorV1::new(
+        member.clone(),
+        key_at(1),
+        vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()],
+        1,
+        false,
+        1,
+      );
+      inject_entry(
+        &harness.reference,
+        (
+          descriptor_namespace.clone(),
+          StoreKey::new(std::sync::Arc::from(member.as_str().as_bytes().to_vec())),
+        ),
+        descriptor.encode().unwrap(),
+      );
+    }
+
+    let mut cursors = MembershipSyncCursors::default();
+    // Pre-arm the tick state: the snapshot pass is already converged at
+    // revision 1 (no revision signal), and the tombstone cadence is two
+    // ticks from its resend threshold.
+    cursors.peers.insert(
+      harness.peer.clone(),
+      PeerSyncState {
+        snapshot_rev: 1,
+        ticks_since_tombstone_send: SNAPSHOT_RESEND_TICKS - 2,
+        ..PeerSyncState::default()
+      },
+    );
+
+    // Tick 1: the descriptor page dispatches (the pass starts) but the
+    // tombstone cadence is not reached yet.
+    harness.tick(&mut cursors).await;
+    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 0);
+    // The page plane is mid-pass: its continuation cursor is set.
+    assert!(
+      cursors
+        .peers
+        .get(&harness.peer)
+        .unwrap()
+        .page
+        .continuation()
+        .is_some(),
+      "the descriptor pass is in flight"
+    );
+
+    // Tick 2: still mid-pass, but the tombstone cadence elapsed — the
+    // leave record must forward even though no round was quiet.
+    harness.tick(&mut cursors).await;
+    assert_eq!(
+      harness.leave_dispatches.load(Ordering::SeqCst),
+      1,
+      "the tombstone lane forwarded mid-pass"
+    );
+    assert!(
+      cursors
+        .peers
+        .get(&harness.peer)
+        .unwrap()
+        .page
+        .continuation()
+        .is_some(),
+      "the descriptor pass is still in flight"
+    );
+
+    // The delivered tombstone round re-arms the cadence: no immediate
+    // re-fire on the next tick.
+    harness.tick(&mut cursors).await;
+    assert_eq!(
+      harness.leave_dispatches.load(Ordering::SeqCst),
+      1,
+      "the delivered round reset the tombstone cadence"
     );
   }
 }

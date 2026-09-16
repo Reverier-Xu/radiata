@@ -10,6 +10,11 @@ pub struct NodeConfig {
   // The summed encoded-byte budget of one session's outbound frame
   // queue.
   session_queue_bytes: usize,
+  // The wall-clock bound for one outbound transport connect (TCP dial,
+  // TLS handshake, and WebSocket upgrade). Distinct from the
+  // authentication deadline, which starts only after the connect
+  // returns.
+  dial_deadline: Duration,
   // A session with no authenticated traffic or owned in-flight work for
   // this long closes on host wall time. Zero disables.
   session_idle_timeout: Duration,
@@ -92,8 +97,9 @@ impl NodeConfig {
   /// Selects the node's next-hop routing policy tag: when a
   /// routed packet's destination is not directly connected, the tag
   /// resolves in the extension registry and the registered policy picks
-  /// the single next hop. Without a tag the node forwards only to a
-  /// directly connected destination and fails closed otherwise.
+  /// the single next hop. Without a tag the node relays through the
+  /// built-in [`crate::routing::DefaultNextHop`] policy, so multi-hop
+  /// routes work out of the box; setting a tag overrides the default.
   pub fn with_route_policy(mut self, tag: crate::QualifiedTag) -> Self {
     self.route_policy = Some(tag);
     self
@@ -103,6 +109,22 @@ impl NodeConfig {
     ensure_nonzero_duration(value, "receipt retention")?;
     self.receipt_retention = value;
     Ok(self)
+  }
+
+  /// Sets the outbound dial deadline: the bound for one transport
+  /// connect (TCP dial, TLS handshake, and WebSocket upgrade). Distinct
+  /// from the authentication deadline, which starts only after the
+  /// connect returns.
+  pub fn with_dial_deadline(mut self, value: Duration) -> Result<Self> {
+    ensure_nonzero_duration(value, "dial deadline")?;
+    self.dial_deadline = value;
+    Ok(self)
+  }
+
+  /// The dial deadline after which one outbound transport connect fails
+  /// (consumed by the supervisor's dial paths; nonzero by construction).
+  pub(crate) const fn dial_deadline(&self) -> Duration {
+    self.dial_deadline
   }
 
   pub(crate) const fn receipt_retention(&self) -> Duration {
@@ -158,9 +180,14 @@ impl NodeConfig {
       self.parser_limits.frame_bytes,
     )
   }
-  /// The node's configured next-hop routing policy tag, if any.
-  pub(crate) const fn route_policy(&self) -> Option<&crate::QualifiedTag> {
-    self.route_policy.as_ref()
+  /// The node's effective next-hop routing policy tag: the caller-selected
+  /// tag, or the built-in default policy's tag when unset (the builder
+  /// registers that policy out of the box).
+  pub(crate) fn route_policy(&self) -> Result<crate::QualifiedTag> {
+    match &self.route_policy {
+      Some(tag) => Ok(tag.clone()),
+      None => crate::routing::DefaultNextHop::tag(),
+    }
   }
 
   pub(crate) const fn required_features(&self) -> &BTreeSet<FeatureTag> {
@@ -179,6 +206,7 @@ impl Default for NodeConfig {
   fn default() -> Self {
     Self {
       anti_entropy_interval: Duration::from_millis(250),
+      dial_deadline: Duration::from_secs(10),
       recovery: RecoveryConfig::default(),
       session_queue_messages: 256,
       session_queue_bytes: 8 * 1024 * 1024,
@@ -273,39 +301,29 @@ impl Default for TraceMetadataLimits {
 /// The recovery policy: bounds and cadence for the any-one-route
 /// recovery plane. While fully isolated, a node retries members from its
 /// table with wall-clock backoff (initial → maximum, doubling); a
-/// connected node never dials. `neighbors` names the intended direct
-/// neighborhood size (used by topology bootstrap hints),
-/// `fan_out` caps how many members one recovery round dials in parallel,
-/// and the backoff pair bounds the retry cadence.
+/// connected node never dials. `fan_out` caps how many members one
+/// recovery round dials in parallel, and the backoff pair bounds the
+/// retry cadence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryConfig {
-  neighbors: usize,
   fan_out: usize,
   initial_backoff: Duration,
   maximum_backoff: Duration,
 }
 
 impl RecoveryConfig {
-  pub fn new(
-    neighbors: usize, fan_out: usize, initial_backoff: Duration, maximum_backoff: Duration,
-  ) -> Result<Self> {
-    ensure_nonzero(neighbors, "recovery neighbors")?;
+  pub fn new(fan_out: usize, initial_backoff: Duration, maximum_backoff: Duration) -> Result<Self> {
     ensure_nonzero(fan_out, "recovery fan-out")?;
     ensure_nonzero_duration(initial_backoff, "initial recovery backoff")?;
     ensure_nonzero_duration(maximum_backoff, "maximum recovery backoff")?;
-    if neighbors > fan_out || initial_backoff > maximum_backoff {
+    if initial_backoff > maximum_backoff {
       return Err(Error::invalid_input("recovery policy"));
     }
     Ok(Self {
-      neighbors,
       fan_out,
       initial_backoff,
       maximum_backoff,
     })
-  }
-
-  pub(crate) const fn neighbors(&self) -> usize {
-    self.neighbors
   }
 
   pub(crate) const fn fan_out(&self) -> usize {
@@ -324,7 +342,6 @@ impl RecoveryConfig {
 impl Default for RecoveryConfig {
   fn default() -> Self {
     Self {
-      neighbors: 4,
       fan_out: 64,
       initial_backoff: Duration::from_secs(1),
       maximum_backoff: Duration::from_secs(5 * 60),
@@ -398,6 +415,22 @@ mod tests {
     assert_eq!(both.session_idle_timeout(), Duration::from_secs(30));
     assert_eq!(both.keepalive_interval(), Duration::from_secs(5));
     assert_eq!(both.keepalive_timeout(), Duration::from_secs(15));
+  }
+
+  /// The dial deadline accepts any nonzero duration (the default
+  /// matches the authentication deadline) and rejects zero: a zero
+  /// deadline would cancel every dial before the OS connect resolves.
+  #[test]
+  fn dial_deadline_accepts_nonzero_and_rejects_zero() {
+    let configured = NodeConfig::new()
+      .with_dial_deadline(Duration::from_millis(250))
+      .unwrap();
+    assert_eq!(configured.dial_deadline(), Duration::from_millis(250));
+    assert_eq!(NodeConfig::new().dial_deadline(), Duration::from_secs(10));
+    let error = NodeConfig::new()
+      .with_dial_deadline(Duration::ZERO)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }
 
   /// A deadline without either driver, a keepalive without a deadline,

@@ -5,7 +5,10 @@ use std::{
 
 #[cfg(test)]
 use self::receipt::HostWallClock;
-use self::receipt::{PreparedTransaction, WallClock};
+use self::receipt::{
+  PreparedTransaction, ReceiptReferenceToken, WallClock, build_pending_record_delete_operations,
+  prepare_internal_transaction,
+};
 use crate::{
   CommitOutcome, CommitReceipt, Digest, Error, ErrorKind, ProviderErrorContext, ProviderErrorKind,
   ReconcileOutcome, Result, StoreRequirements, TransactionId,
@@ -561,7 +564,7 @@ impl MetadataStore {
     {
       Ok(ReconcileOutcome::Committed(receipt)) => {
         self.validate_receipt(&pending, &receipt, ProviderErrorContext::StorageReconcile)?;
-        self.finish_journal_recovery()?;
+        self.finish_journal_recovery(&pending)?;
         crate::audit::journal_resolved(purpose, true);
         Ok(true)
       }
@@ -573,7 +576,7 @@ impl MetadataStore {
         // present means the durable state contradicts the journal, and
         // the store stays frozen and fails closed.
         if self.recover_pending(purpose).await?.is_none() {
-          self.finish_journal_recovery()?;
+          self.finish_journal_recovery(&pending)?;
           crate::audit::journal_resolved(purpose, false);
           return Ok(false);
         }
@@ -594,13 +597,193 @@ impl MetadataStore {
 
   /// Returns a frozen store recovered on journal evidence back to ready.
   ///
-  /// Precondition: the caller runs inside the journaled flow's writer
-  /// permit (see [`Self::resolve_pending_journal`]): the unfreeze and
-  /// the notify are state mutations that must not interleave with
-  /// another resolver's evidence read.
-  fn finish_journal_recovery(&self) -> Result<()> {
-    *self.lock_state()? = CommitState::Ready;
+  /// Permit-holding resolvers (see [`Self::resolve_pending_journal`])
+  /// still own the frozen slot when they unfreeze, so the identity
+  /// condition below always holds for them. The declared-uncommitted
+  /// command runs outside the writer permit by design, so its unfreeze
+  /// is conditioned on the slot still holding the exact resolved
+  /// identity: a slot that moved on during the delete await (unfrozen by
+  /// another resolver, or re-purposed by a new in-flight commit) keeps
+  /// its state, because clobbering it would break the
+  /// single-in-flight-commit invariant.
+  fn finish_journal_recovery(&self, resolved: &PendingCommit) -> Result<()> {
+    let mut state = self.lock_state()?;
+    match &*state {
+      CommitState::Frozen { pending, .. }
+        if pending.transaction == resolved.transaction && pending.digest == resolved.digest => {}
+      // The slot moved on while this resolver was reading durable
+      // evidence: the resolution outcome is classified from durable
+      // evidence either way, so only the state write is skipped.
+      _ => return Ok(()),
+    }
+    *state = CommitState::Ready;
+    drop(state);
     self.ready_notify.notify_waiters();
+    Ok(())
+  }
+
+  /// Resolves a store frozen on a pending journal whose durable provider
+  /// evidence permanently contradicts the journal (the record is present,
+  /// but the provider proves no committed receipt for the journaled
+  /// transaction), by declaring the interrupted transaction not durably
+  /// committed. This is the operator-confirmed last resort for the
+  /// permanent-contradiction freeze; restart-based reconciliation remains
+  /// the first remedy and stays authoritative whenever the evidence
+  /// resolves.
+  ///
+  /// The resolution deletes the pending journal record for the frozen
+  /// purpose — paired, exactly as the normal pending cleanup pairs them,
+  /// with removing the journal's receipt-reference token from the live
+  /// target receipt — in one atomic, never-journaled transaction and
+  /// only then unfreezes the store, so a crash at any point leaves the
+  /// store either still frozen with its journal or cleanly unfrozen
+  /// without one — never half-cleared. A restart after the delete
+  /// reopens ready with no pending journal. The unfreeze is conditioned
+  /// on the slot still holding the exact frozen identity (see
+  /// [`Self::finish_journal_recovery`]): a slot that moved on during the
+  /// delete await keeps its state, and the landed delete still stands.
+  ///
+  /// Writer gate: the frozen slot replaces the writer exclusion here.
+  /// While frozen, every normal commit path refuses at the slot, so this
+  /// direct provider commit is the only durable writer; operator
+  /// commands serialize on the supervisor's control loop, and the slot's
+  /// fate is mutated only under the state mutex through the same finish
+  /// path the normal resolver uses. The delete is re-anchored to the
+  /// still-frozen slot immediately before it commits.
+  ///
+  /// Typed rejections that change nothing: a ready store, an in-flight
+  /// commit freeze, and a frozen slot matching no durable journal record
+  /// reject with `Conflict`; a fresh evidence read proving the transaction
+  /// committed or digest-conflicted rejects with `StorageCorrupt` (a
+  /// committed journal resolves through restart instead); an evidence read
+  /// failure propagates and keeps the store frozen.
+  pub(crate) async fn resolve_frozen_journal_uncommitted(
+    &self, operation: TransactionId,
+  ) -> Result<()> {
+    let pending = self.lock_frozen_slot()?;
+    let purpose = {
+      let snapshot = self.snapshot().await?;
+      pending::discover_frozen_journal_purpose(
+        snapshot.as_ref(),
+        &pending.transaction,
+        &pending.digest,
+      )
+      .await?
+    };
+    let Some(purpose) = purpose else {
+      // No durable journal matches the frozen slot: the freeze is an
+      // in-flight commit slot, not a recovered journal, and aborting it
+      // has nothing to anchor on.
+      return Err(Error::conflict("frozen journal resolution"));
+    };
+    // The delete is anchored to a fresh durable verdict: evidence of a
+    // committed or digest-conflicted transaction contradicts the
+    // declaration and keeps the store frozen, while a definitively
+    // uncommitted or indeterminate verdict accepts the declaration. An
+    // evidence failure is not a classification and changes nothing.
+    match self
+      .provider
+      .reconcile(&pending.transaction, &pending.digest)
+      .await
+    {
+      Ok(ReconcileOutcome::Aborted | ReconcileOutcome::Unknown) => {}
+      Ok(ReconcileOutcome::Committed(_) | ReconcileOutcome::DigestConflict) => {
+        return Err(storage_corrupt(ProviderErrorContext::StorageReconcile));
+      }
+      Err(error) => return Err(error),
+    }
+    let snapshot = self.snapshot().await?;
+    let Some((stored, record)) = pending::discover_pending(snapshot.as_ref(), &purpose).await?
+    else {
+      // The journal vanished between reads: there is nothing left to
+      // abort, and the frozen premise no longer holds.
+      return Err(Error::conflict("frozen journal resolution"));
+    };
+    let identity = record.recover_identity(&stored)?;
+    if identity.transaction() != &pending.transaction
+      || identity.operation_digest() != &pending.digest
+    {
+      return Err(storage_corrupt(ProviderErrorContext::StorageSnapshot));
+    }
+    let base_revision = snapshot.revision().clone();
+    // The delete is paired — in the same shape as the normal pending
+    // cleanup — with removing the journal's receipt-reference token from
+    // the live target receipt, so a receipt touched by a
+    // declared-uncommitted transaction can anchor and be forgotten again
+    // instead of staying permanently referenced. A forgotten target
+    // receipt carries no reachable reference set, so the record delete
+    // alone applies.
+    let record_token = ReceiptReferenceToken::for_record(
+      &pending::pending_namespace()?,
+      &pending::pending_key(&purpose),
+    );
+    let delete_operations = build_pending_record_delete_operations(
+      snapshot.as_ref(),
+      &operation,
+      &identity,
+      &record_token,
+      pending::pending_namespace()?,
+      pending::pending_key(&purpose),
+      stored.digest().clone(),
+    )
+    .await?;
+    drop(snapshot);
+    // The slot must still be the exact frozen journal: nothing else may
+    // unfreeze between the evidence read and the delete, and a flipped
+    // slot means the premise broke while this resolution was reading.
+    let frozen_now = self.lock_frozen_slot()?;
+    if frozen_now.transaction != pending.transaction || frozen_now.digest != pending.digest {
+      return Err(Error::conflict("frozen journal resolution"));
+    }
+    drop(frozen_now);
+    let delete_id = operation.clone();
+    let prepared = prepare_internal_transaction(operation, base_revision, delete_operations)?;
+    let delete_digest = prepared.operation_digest().clone();
+    // The delete bypasses the commit slot's state machine on purpose:
+    // the machine refuses any commit while frozen, and this delete is
+    // the resolution that ends the freeze. The frozen slot itself gates
+    // the writers: every normal commit path refuses while frozen.
+    match self.provider.commit(prepared.0).await {
+      Ok(CommitOutcome::Committed(receipt)) => {
+        self.validate_receipt(
+          &PendingCommit {
+            transaction: delete_id,
+            digest: delete_digest,
+            journal_proven: false,
+          },
+          &receipt,
+          ProviderErrorContext::StorageCommit,
+        )?;
+      }
+      Ok(CommitOutcome::Unknown {
+        transaction,
+        operation_digest,
+      }) => {
+        if transaction != delete_id || operation_digest != delete_digest {
+          return Err(storage_corrupt(ProviderErrorContext::StorageCommit));
+        }
+        // Classify the unknown by the journal's presence, the same
+        // evidence read the resolver classifies by: gone means the delete
+        // landed; still present means it did not and the contradiction
+        // stands, so a retry re-enters the same resolution.
+        if self.recover_pending(&purpose).await?.is_some() {
+          return Err(Error::conflict("frozen journal resolution"));
+        }
+      }
+      // The conditional delete definitively did not land: the record's
+      // expected digest no longer matches, so the frozen premise broke.
+      Ok(CommitOutcome::Aborted | CommitOutcome::Conflict) => {
+        return Err(Error::conflict("frozen journal resolution"));
+      }
+      Err(error) => return Err(error),
+    }
+    self.finish_journal_recovery(&pending)?;
+    crate::audit::journal_declared_uncommitted(&purpose);
+    tracing::info!(
+      purpose = %purpose,
+      transaction = %pending.transaction.as_str(),
+      "frozen journal resolved as uncommitted"
+    );
     Ok(())
   }
 
@@ -651,6 +834,20 @@ impl MetadataStore {
       .state
       .lock()
       .map_err(|_| Error::internal("metadata storage commit state"))
+  }
+
+  /// Clones the frozen slot's pending identity while the slot is a
+  /// settled freeze (no provider call in flight); every other state is
+  /// not a resolvable frozen journal.
+  fn lock_frozen_slot(&self) -> Result<PendingCommit> {
+    let state = self.lock_state()?;
+    match &*state {
+      CommitState::Frozen {
+        pending,
+        provider_call_active: false,
+      } => Ok(pending.clone()),
+      _ => Err(Error::conflict("frozen journal resolution")),
+    }
   }
 }
 #[cfg(any(test, fuzzing))]

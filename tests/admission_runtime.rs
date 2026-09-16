@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use radiata::{
-  Endpoint, ErrorKind, GetLocalNode, Listen, MergeCluster, MergeCredential, NodeBuilder,
-  NodeHandle, RotateMergeCredential, Shutdown, extension::StorageFactory,
+  DeclareInterruptedTransactionUncommitted, Endpoint, ErrorKind, GetLocalNode, Listen,
+  MergeCluster, MergeCredential, NodeBuilder, NodeHandle, ResolveFrozenJournal,
+  RotateMergeCredential, Shutdown, extension::StorageFactory,
 };
 
 mod common;
@@ -177,6 +178,86 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   let local = later.handle.query(GetLocalNode::new()).await.unwrap();
   assert_eq!(local.node_id(), merge.node());
   later.handle.command(Shutdown::new()).await.unwrap();
+  receiver.handle.command(Shutdown::new()).await.unwrap();
+}
+
+/// The permanent-contradiction freeze: the journaled adoption landed but
+/// the provider's receipt is gone, so every reopen re-derives the same
+/// contradiction and the store stays blocked. The acknowledged
+/// `ResolveFrozenJournal` declaration resolves the frozen journal as
+/// uncommitted: the node unfreezes in place, admission-sensitive
+/// commands work again, and the resolution is durable across a restart
+/// on the same storage. On a healthy store the command is a typed
+/// rejection, never an accidental unfreeze.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_contradiction() {
+  let memory = Arc::new(MemoryStorageFactory::new(required_capabilities()));
+  let fault = Arc::new(FaultingFactory::new(Arc::clone(&memory), Vec::new()));
+  fault.add_reconcile_unknowns(1);
+
+  let provider: Arc<dyn StorageFactory> = fault.clone();
+  let receiver = start(provider.clone(), keys_at(5_000)).await;
+  let listener = receiver
+    .handle
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap();
+
+  // Typed rejection on a healthy store: nothing is frozen, so the
+  // command refuses and the node keeps serving.
+  let healthy = receiver
+    .handle
+    .command(ResolveFrozenJournal::new(
+      DeclareInterruptedTransactionUncommitted::new(),
+    ))
+    .await
+    .unwrap_err();
+  assert_eq!(healthy.kind(), ErrorKind::Conflict);
+  let issued = rotate_with_retry(&receiver).await;
+
+  // Freeze the receiver on the journaled adoption: the commit lands
+  // (journal and receipt) but answers unknown, and the in-process
+  // reconciliation stays unknown too. The journal-targeted fault passes
+  // every plain commit (credential use) through unfaulted, so the
+  // script arms several entries to survive the plain pre-commit commits
+  // of the merge handshake.
+  fault.reset_script(vec![CommitFault::JournalUnknownApplied; 8]);
+  let (joiner, _) = fresh_node(6_000).await;
+  let merge_outcome = merge(&joiner, listener.endpoint(), issued.into_credential()).await;
+  assert!(
+    merge_outcome.is_err(),
+    "the faulted merge unexpectedly succeeded: {merge_outcome:?}"
+  );
+  joiner.handle.command(Shutdown::new()).await.unwrap();
+  let blocked = receiver
+    .handle
+    .command(RotateMergeCredential::new())
+    .await
+    .unwrap_err();
+  assert_eq!(blocked.kind(), ErrorKind::NotReady);
+
+  // Make the contradiction permanent: the adoption receipt disappears,
+  // so every reconcile re-derives journal-present, receipt-absent.
+  let adopted = fault.last_unknown_applied().expect("applied unknown");
+  memory.forget_receipt(&adopted);
+
+  // The acknowledged declaration resolves the frozen journal: the store
+  // unfreezes and admission-sensitive commands work again.
+  receiver
+    .handle
+    .command(ResolveFrozenJournal::new(
+      DeclareInterruptedTransactionUncommitted::new(),
+    ))
+    .await
+    .unwrap();
+  rotate_with_retry(&receiver).await;
+
+  // The resolution is durable: a restart on the same storage finds no
+  // pending journal and starts unblocked.
+  let receiver_keys = receiver.keys.clone();
+  drop(receiver);
+  let receiver = start(provider, receiver_keys).await;
+  rotate_with_retry(&receiver).await;
   receiver.handle.command(Shutdown::new()).await.unwrap();
 }
 

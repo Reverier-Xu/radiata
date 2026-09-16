@@ -5,16 +5,17 @@
 //! routed TLS 1.3 packet data plane. The facade exposes deterministic
 //! foundation values, provider boundaries, and the node lifecycle through
 //! this crate root and the [`extension`] module; every implementation
-//! module remains private.
+//! module remains private except the task-oriented [`guide`].
 
 mod api;
 mod audit;
 mod config;
 mod error;
 mod extension_registry;
-mod guide;
+pub mod guide;
 mod hex;
 mod identity;
+mod keys;
 mod label;
 mod membership;
 mod node;
@@ -67,9 +68,10 @@ pub use operation::{
   GetMember, GetNodeStatus, GetObservability, GetRecovery, GetResource, GetRoute, IdentityReplaced,
   IssueCleanupCheckpoint, IssueMergeCredential, LeaveCluster, Listen, MemberChanged, MergeCluster,
   NodeRevoked, PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
-  PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResourceChanged,
-  ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources,
-  SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
+  PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResolveFrozenJournal,
+  ResourceChanged, ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound,
+  SelectResources, SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata,
+  WaitForShutdown,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
@@ -91,12 +93,12 @@ pub use routing::{
 };
 pub use transport::{Endpoint, PageCursor};
 pub use view::{
-  ConnectivityStatus, LeaveOutcome, ListenerPage, ListenerView, LocalNodeView, MemberPage,
-  MemberStatus, MemberView, MergeView, NodeMetadataPatch, NodeStatus, ObservabilitySnapshot,
-  PageSpec, ReceiptRetentionReport, RecoveryView, ReplaceIdentityAndDeleteOldCoreMetadata,
-  ResourceMutationView, ResourcePage, ResourceView, RevokeOutcome, SessionFeatureView, SessionPage,
-  SessionView, ShutdownOutcome, ShutdownReason, TopologyEdgeView, TopologyPage, TrustPage,
-  TrustStatus, TrustedIdentityView,
+  ConnectivityStatus, DeclareInterruptedTransactionUncommitted, LeaveOutcome, ListenerPage,
+  ListenerView, LocalNodeView, MemberPage, MemberStatus, MemberView, MergeView, NodeMetadataPatch,
+  NodeStatus, ObservabilitySnapshot, PageSpec, ReceiptRetentionReport, RecoveryView,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView, ResourcePage, ResourceView,
+  RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome, ShutdownReason,
+  TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
 };
 
 pub mod extension {
@@ -107,14 +109,14 @@ pub mod extension {
 }
 
 pub mod adapters {
-  //! Explicit storage-adapter constructors.
+  //! Explicit storage and key-custody adapter constructors.
   //!
   //! Adapter selection is always an explicit caller choice; no feature
   //! selects a backend implicitly.
 
-  #[cfg(any(feature = "json", feature = "redb"))]
   use std::{path::PathBuf, sync::Arc};
 
+  use crate::extension::KeyProvider;
   #[cfg(any(feature = "json", feature = "redb"))]
   use crate::extension::StorageFactory;
 
@@ -137,5 +139,49 @@ pub mod adapters {
   #[cfg(feature = "redb")]
   pub fn redb_store(path: PathBuf) -> Arc<dyn StorageFactory> {
     Arc::new(crate::storage::redb::RedbStoreFactory::new(path))
+  }
+
+  /// Creates a durable file-backed Ed25519 key store rooted at the
+  /// directory `path` (created lazily on the first mutating operation).
+  ///
+  /// This is the zero-effort custody default: one directory holds one
+  /// key file per operation id (the raw 32-byte seed, mode 0600 from
+  /// the first byte on unix) plus one intent marker per in-flight or
+  /// interrupted operation, and every write is fsynced with a
+  /// directory-entry barrier before the operation reports. The crash
+  /// contract is the trait's: a create is idempotent per
+  /// [`KeyOperationId`](crate::KeyOperationId) — the first secret that
+  /// reaches durable storage wins across retries and concurrent
+  /// creators — and the `reconcile_*` methods classify interrupted
+  /// operations purely from durable evidence, failing closed
+  /// (`Unknown`) on an artifact that cannot prove its key. A key file
+  /// that exists but does not parse is never overwritten; delete it
+  /// (through [`KeyProvider::delete`]) to re-issue.
+  ///
+  /// Platform notes: on unix, directory barriers use std's directory
+  /// open + fsync and key files carry mode 0600 from creation. On other
+  /// platforms the directory barrier degrades to a no-op (the last
+  /// crash window may lose a directory entry whose removal or creation
+  /// was not yet persisted — every such state resolves to the same
+  /// tri-state answers, never to a fabricated key) and key files take
+  /// the volume's default permissions; custody on those platforms
+  /// additionally depends on the operator mounting the directory under
+  /// an access-controlled path.
+  pub fn file_key_store(path: PathBuf) -> Arc<dyn KeyProvider> {
+    Arc::new(crate::keys::file::FileKeyStore::new(path))
+  }
+
+  /// Creates a fully in-memory Ed25519 key store.
+  ///
+  /// The same operation-id discipline as [`file_key_store`], held
+  /// entirely in memory: every custody artifact is lost when this value
+  /// is dropped or the process exits. **Identity bindings built on this
+  /// store do not survive a restart** — a restarted node cannot sign,
+  /// so a cluster joined with an ephemeral key must re-join from
+  /// scratch. This constructor exists for tests and for nodes whose
+  /// identity is deliberately ephemeral; nothing else. Keys are
+  /// zeroized on removal and on drop.
+  pub fn ephemeral_key_store() -> Arc<dyn KeyProvider> {
+    Arc::new(crate::keys::ephemeral::EphemeralKeyStore::new())
   }
 }

@@ -218,6 +218,10 @@ pub struct StoreRequirements {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
+  /// Forward infrastructure: no production adapter advertises the
+  /// transactional-migration bit and no production requirement names it,
+  /// so the bit exists only where tests and fuzzing exercise it.
+  #[cfg(any(test, fuzzing))]
   transactional_migration: bool,
 }
 
@@ -229,6 +233,7 @@ impl StoreRequirements {
       ordered_scan: true,
       reconciliation: true,
       exclusive_lifetime_lock: true,
+      #[cfg(any(test, fuzzing))]
       transactional_migration: false,
     }
   }
@@ -253,11 +258,13 @@ impl StoreRequirements {
     self.exclusive_lifetime_lock
   }
 
+  #[cfg(any(test, fuzzing))]
   pub fn requires_transactional_migration(&self) -> bool {
     self.transactional_migration
   }
 
-  #[cfg(test)]
+  #[cfg(any(test, fuzzing))]
+  #[cfg_attr(fuzzing, allow(dead_code))]
   pub(crate) const fn transactional_migration(mut self, required: bool) -> Self {
     self.transactional_migration = required;
     self
@@ -277,6 +284,10 @@ pub struct StoreCapabilities {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
+  /// Forward infrastructure: no production adapter advertises the
+  /// transactional-migration bit, so the bit exists only where tests and
+  /// fuzzing exercise it.
+  #[cfg(any(test, fuzzing))]
   transactional_migration: bool,
 }
 
@@ -288,6 +299,7 @@ impl StoreCapabilities {
       ordered_scan: false,
       reconciliation: false,
       exclusive_lifetime_lock: false,
+      #[cfg(any(test, fuzzing))]
       transactional_migration: false,
     }
   }
@@ -312,6 +324,7 @@ impl StoreCapabilities {
     self
   }
 
+  #[cfg(any(test, fuzzing))]
   pub fn transactional_migration(mut self, supported: bool) -> Self {
     self.transactional_migration = supported;
     self
@@ -337,6 +350,7 @@ impl StoreCapabilities {
     self.exclusive_lifetime_lock
   }
 
+  #[cfg(any(test, fuzzing))]
   pub fn has_transactional_migration(&self) -> bool {
     self.transactional_migration
   }
@@ -347,8 +361,24 @@ impl StoreCapabilities {
       && (!requirements.ordered_scan || self.ordered_scan)
       && (!requirements.reconciliation || self.reconciliation)
       && (!requirements.exclusive_lifetime_lock || self.exclusive_lifetime_lock)
-      && (!requirements.transactional_migration || self.transactional_migration)
+      && transactional_migration_satisfied(self, requirements)
   }
+}
+
+/// The gated capability clause: production requirements cannot name the
+/// transactional-migration bit, so the clause exists only under the gate.
+#[cfg(any(test, fuzzing))]
+const fn transactional_migration_satisfied(
+  capabilities: &StoreCapabilities, requirements: &StoreRequirements,
+) -> bool {
+  !requirements.transactional_migration || capabilities.transactional_migration
+}
+
+/// With the gate off the bit cannot be required or advertised, so the
+/// clause is vacuously true.
+#[cfg(not(any(test, fuzzing)))]
+const fn transactional_migration_satisfied(_: &StoreCapabilities, _: &StoreRequirements) -> bool {
+  true
 }
 
 const fn durability_satisfies(actual: DurabilityLevel, required: DurabilityLevel) -> bool {
@@ -906,6 +936,74 @@ fn expectation_matches(digest: Option<Digest>, expected: &StoreExpectation) -> b
     (None, StoreExpectation::Absent) => true,
     (Some(digest), StoreExpectation::Exact(expected)) => &digest == expected,
     _ => false,
+  }
+}
+
+/// Evaluates the commit precheck in the one pinned order documented on
+/// [`Storage`]: receipt replay first (a stored receipt with the same
+/// operation digest is the idempotent [`CommitOutcome::Committed`] replay,
+/// a different digest is [`CommitOutcome::Conflict`]), then the
+/// base-revision check, then every conditional expectation through
+/// [`condition_matches`]. `None` means the caller may apply the change;
+/// `Some` is the decided outcome. The lookups are per-site closures so
+/// every storage adapter and the reference oracle keep their exact read
+/// order and error contexts: `receipt` resolves one transaction id to its
+/// stored receipt (the replay source and, derived from it, the
+/// `ForgetReceipt` digest expectation), `current_revision` resolves the
+/// current store revision, and `entry` resolves one record to its content
+/// digest.
+#[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
+pub(crate) fn commit_precheck(
+  transaction: &StoreTransaction,
+  mut receipt: impl FnMut(&TransactionId) -> Result<Option<CommitReceipt>>,
+  current_revision: impl FnOnce() -> Result<StoreRevision>,
+  mut entry: impl FnMut(&StoreNamespace, &StoreKey) -> Result<Option<Digest>>,
+) -> Result<Option<CommitOutcome>> {
+  if let Some(existing) = receipt(transaction.id())? {
+    return Ok(Some(
+      if existing.operation_digest() == transaction.operation_digest() {
+        CommitOutcome::Committed(existing)
+      } else {
+        CommitOutcome::Conflict
+      },
+    ));
+  }
+  // Development tripwire: the digest is fixed at prepare over private
+  // immutable fields; recomputing it here is never a release-time gate.
+  debug_assert_eq!(
+    transaction.operation_digest(),
+    &transaction.computed_operation_digest()
+  );
+  if transaction.base_revision() != &current_revision()? {
+    return Ok(Some(CommitOutcome::Conflict));
+  }
+  for operation in transaction.operations() {
+    let receipt_digest = |forgotten: &TransactionId| {
+      receipt(forgotten).map(|stored| stored.map(|receipt| receipt.operation_digest().clone()))
+    };
+    if !condition_matches(&mut entry, receipt_digest, operation)? {
+      return Ok(Some(CommitOutcome::Conflict));
+    }
+  }
+  Ok(None)
+}
+
+/// Classifies one stored-receipt lookup into the three-way
+/// [`ReconcileOutcome`], the single reconcile verdict shared by every
+/// storage adapter and the reference oracle: a receipt carrying the exact
+/// digest is [`ReconcileOutcome::Committed`], the same transaction id
+/// under a different digest is [`ReconcileOutcome::DigestConflict`], and
+/// no receipt is [`ReconcileOutcome::Aborted`]. The lookup itself stays at
+/// each call site so every adapter keeps its exact read order and error
+/// contexts.
+#[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
+pub(crate) fn classify_receipt(
+  receipt: Option<CommitReceipt>, digest: &Digest,
+) -> ReconcileOutcome {
+  match receipt {
+    Some(receipt) if receipt.operation_digest() == digest => ReconcileOutcome::Committed(receipt),
+    Some(_) => ReconcileOutcome::DigestConflict,
+    None => ReconcileOutcome::Aborted,
   }
 }
 

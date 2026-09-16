@@ -16,6 +16,8 @@
 //!    `PacketConsumer`](#4-receiving-packets-packetconsumer)
 //! 5. [Holding identity keys:
 //!    `KeyProvider`](#5-holding-identity-keys-keyprovider)
+//! 6. [Leaving the cluster:
+//!    `LeaveCluster`](#6-leaving-the-cluster-leavecluster)
 //!
 //! # 1. Resource versions across process boundaries
 //!
@@ -101,8 +103,11 @@
 //!
 //! The built-in [`DefaultNextHop`](crate::DefaultNextHop)
 //! relays through the lowest live peer id — deterministic, loop-free,
-//! and a sensible first choice. Implement the trait to replace it (a
-//! hub-and-spoke relay, a latency-aware pick, a shard-affine route):
+//! and the default: the node registers it under its well-known tag and
+//! selects it unless the configuration names another policy, so
+//! multi-hop relay works out of the box. Implement the trait to replace
+//! it (a hub-and-spoke relay, a latency-aware pick, a shard-affine
+//! route):
 //!
 //! ```
 //! use radiata::{BoxFuture, NextHopView, NodeId, Result, RouteNextHop};
@@ -125,8 +130,8 @@
 //! }
 //! ```
 //!
-//! Registration is two steps: install the implementation under a
-//! qualified tag, then select that tag in the node configuration.
+//! Replacing the default is two steps: install the implementation under
+//! a qualified tag, then select that tag in the node configuration.
 //!
 //! ```no_run
 //! # use radiata::{ExtensionRegistry, QualifiedTag, RouteNextHop};
@@ -138,6 +143,7 @@
 //! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop);
 //! registry.register_next_hop(tag.clone(), policy)?;
 //! // NodeConfig::new().with_route_policy(tag) selects it at build time;
+//! // without a selection the built-in DefaultNextHop stays the default.
 //! // NodeBuilder::extensions(registry) installs the registry.
 //! # Ok(())
 //! # }
@@ -192,9 +198,28 @@
 //! cannot answer right now": the runtime fails the operation closed
 //! and the caller retries; they never mean "the key is gone".
 //!
-//! The examples ship `FileKeyProvider` (a reference implementation
-//! with the three-state lifecycle) under `examples/*/src/keys.rs`;
-//! the skeleton below shows the shape every implementation fills in:
+//! Start from the built-in adapters — most integrations never
+//! implement the trait.
+//! [`adapters::file_key_store`](crate::adapters::file_key_store) is the
+//! zero-effort durable default: one directory holds one key file per
+//! operation id plus one intent marker per in-flight operation, with
+//! fsynced writes, mode-0600 seeds from creation on unix, and
+//! evidence-based reconciliation after crashes.
+//! [`adapters::ephemeral_key_store`](crate::adapters::ephemeral_key_store)
+//! holds keys in memory for tests and deliberately ephemeral nodes —
+//! identity bindings built on it do **not** survive a restart.
+//!
+//! ```no_run
+//! # let data_dir = std::path::PathBuf::from("/data");
+//! // Durable custody in one call — the directory is created lazily.
+//! let keys = radiata::adapters::file_key_store(data_dir.join("keys"));
+//! # let _ = keys;
+//! ```
+//!
+//! A real keystore (HSM, cloud KMS, OS keychain) remains the extension
+//! path: implement the trait over your keystore's operations, keeping
+//! the same idempotency per operation id. The skeleton below shows the
+//! shape every implementation fills in:
 //!
 //! ```no_run
 //! # use radiata::extension::KeyProvider;
@@ -252,13 +277,48 @@
 //! Pass the provider to
 //! [`NodeBuilder::new`](crate::NodeBuilder::new) together with the
 //! storage factory; the same provider must back every restart of the
-//! node, or the persisted identity can no longer sign.
+//! node, or the persisted identity can no longer sign. For
+//! `file_key_store` that means the same directory, durably mounted.
+//!
+//! # 6. Leaving the cluster: `LeaveCluster`
+//!
+//! An active leave is three effects behind one command: the node's
+//! identity is replaced with a fresh node id and key, the old
+//! identity's local core metadata is deleted, and the node shuts down
+//! with the active-leave reason. Constructing the
+//! [`ReplaceIdentityAndDeleteOldCoreMetadata`](crate::ReplaceIdentityAndDeleteOldCoreMetadata)
+//! acknowledgement is the confirmation — it has no `Default`, so the
+//! replacement cannot be issued by accident.
+//!
+//! The leave is journaled before any network effect, and once the
+//! journal commits there is no abort: a crash or a restart mid-leave
+//! resumes from the durable record and completes the replacement, so
+//! the node never boots as the former identity again. Treat
+//! [`LeaveCluster`](crate::LeaveCluster) as the point of no return for
+//! that node slot: the returned
+//! [`LeaveOutcome`](crate::LeaveOutcome) names the exact former and
+//! replacement identities, and the same storage restarted afterwards
+//! boots the replacement.
+//!
+//! ```no_run
+//! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
+//! let outcome = node
+//!     .command(radiata::LeaveCluster::new(
+//!         radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new(),
+//!     ))
+//!     .await?;
+//! // Durable from here: the node shuts itself down with the
+//! // active-leave reason and restarts as the replacement identity.
+//! # let _ = (outcome.former_identity(), outcome.replacement_identity());
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Storage
 //!
-//! Storage selection is explicit:
-//! [`adapters::json_store`](crate::adapters::json_store) (test-only) or
-//! [`adapters::redb_store`](crate::adapters::redb_store) (production), or your
-//! own [`StorageFactory`](crate::extension::StorageFactory) for other
+//! Storage selection is explicit: `adapters::json_store` (test-only,
+//! built with the `json` feature), `adapters::redb_store` (production,
+//! built with the `redb` feature), or your own
+//! [`StorageFactory`](crate::extension::StorageFactory) for other
 //! backends. Custom adapters that scan the store directly bridge
 //! through [`store_scan_stream`](crate::store_scan_stream).

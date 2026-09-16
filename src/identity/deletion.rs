@@ -30,13 +30,18 @@ use crate::{
 
 /// Deletes one unreferenced provider handle with exact crash recovery.
 ///
+/// The provider delete is driven under the key's own create `operation`:
+/// the built-in key stores validate that pairing (the handle names that
+/// operation), so a freshly generated id would be rejected as an input
+/// error and the key would never leave the provider.
+///
 /// The call is idempotent: replaying after success performs no provider or
 /// storage mutation. A handle referenced by the local identity conflicts
 /// without any mutation. Provider `Unknown` outcomes quarantine the intent
 /// until `reconcile_delete` proves `Absent`.
 pub(crate) async fn delete_unreferenced_key(
   store: &crate::storage::MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
-  handle: &KeyHandle,
+  operation: &KeyOperationId, handle: &KeyHandle,
 ) -> Result<()> {
   // The whole journaled section holds the writer exclusion: see the
   // same-purpose serialization note on the merge flow.
@@ -85,7 +90,7 @@ pub(crate) async fn delete_unreferenced_key(
       }
       None => {
         let intent = KeyDeletionIntentV1::new(
-          KeyOperationId::generate(entropy)?,
+          operation.clone(),
           handle.clone(),
           purpose.clone(),
           TransactionId::generate(entropy)?,
@@ -163,20 +168,12 @@ async fn delete_provider_step(
   } else {
     keys.delete(intent.operation(), intent.handle()).await?
   };
-  let proven_absent = match outcome {
-    KeyDeleteState::Absent => true,
-    KeyDeleteState::Unknown => {
-      return Err(Error::provider(
-        crate::ProviderErrorKind::CommitUnknown,
-        crate::ProviderErrorContext::KeyDelete,
-      ));
-    }
+  match outcome {
+    // The reconcile reports the removal did not land: issue one fresh
+    // delete under the same durable operation id.
     KeyDeleteState::Present if resumed => {
-      // The provider still reports the handle; issue one fresh delete under
-      // the same durable operation ID.
       match keys.delete(intent.operation(), intent.handle()).await? {
-        KeyDeleteState::Absent => true,
-        KeyDeleteState::Present => false,
+        KeyDeleteState::Absent | KeyDeleteState::Present => {}
         KeyDeleteState::Unknown => {
           return Err(Error::provider(
             crate::ProviderErrorKind::CommitUnknown,
@@ -185,10 +182,16 @@ async fn delete_provider_step(
         }
       }
     }
-    KeyDeleteState::Present => false,
-  };
-  if !proven_absent {
-    return Err(Error::not_ready("key deletion"));
+    // The post-state rule: `Absent` (nothing to remove) and `Present`
+    // (existed and was deleted by this call) both prove the key left the
+    // provider, and the intent finalizes into the tombstone either way.
+    KeyDeleteState::Absent | KeyDeleteState::Present => {}
+    KeyDeleteState::Unknown => {
+      return Err(Error::provider(
+        crate::ProviderErrorKind::CommitUnknown,
+        crate::ProviderErrorContext::KeyDelete,
+      ));
+    }
   }
 
   let snapshot = store.snapshot().await?;
@@ -287,11 +290,12 @@ mod tests {
         local_identity_key,
       },
       testing::{
-        CommitFault, DeleteScript, FaultingFactory, ScriptedKeys, SequenceEntropy,
+        CommitFault, DeleteScript, FaultingFactory, RETENTION, ScriptedKeys, SequenceEntropy,
         assert_never_deleted, commit_calls, entry, fresh_reference, open_context, pending_keys,
         receipt_ids,
       },
     },
+    provider::KeyProvider,
     storage::receipt::internal_namespace,
   };
 
@@ -315,9 +319,10 @@ mod tests {
     }
   }
 
-  fn detached_handle(fixture: &Fixture, index: u64) -> crate::KeyHandle {
+  fn detached_pair(fixture: &Fixture, index: u64) -> (KeyOperationId, crate::KeyHandle) {
     let operation = KeyOperationId::parse(&format!("keyop-{:021}", 10_000 + index)).unwrap();
-    fixture.keys.create_detached(&operation).handle().clone()
+    let handle = fixture.keys.create_detached(&operation).handle().clone();
+    (operation, handle)
   }
 
   fn tombstone_present(
@@ -337,13 +342,14 @@ mod tests {
   #[tokio::test]
   async fn key_intent_delete_unreferenced_handle_installs_tombstone_atomically() {
     let fixture = fixture().await;
-    let handle = detached_handle(&fixture, 1);
+    let (operation, handle) = detached_pair(&fixture, 1);
     assert!(fixture.keys.has_handle(&handle));
 
     delete_unreferenced_key(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await
@@ -361,6 +367,7 @@ mod tests {
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await
@@ -372,7 +379,9 @@ mod tests {
   #[tokio::test]
   async fn key_intent_referenced_local_identity_handle_is_never_deleted() {
     let fixture = fixture().await;
-    let handle = fixture.context.identity().handle().clone();
+    let identity = fixture.context.identity();
+    let operation = identity.operation().clone();
+    let handle = identity.handle().clone();
     let commits_before = commit_calls(&fixture.reference);
     let calls_before = fixture.keys.all_calls().len();
 
@@ -380,6 +389,7 @@ mod tests {
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await
@@ -393,50 +403,16 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn key_intent_present_delete_leaves_intent_and_retry_completes() {
-    let fixture = fixture().await;
-    let handle = detached_handle(&fixture, 2);
-    fixture.keys.push_delete_script(DeleteScript::StillPresent);
-
-    let error = delete_unreferenced_key(
-      fixture.context.store(),
-      &fixture.keys.as_provider(),
-      fixture.entropy.as_ref(),
-      &handle,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::NotReady);
-    assert!(intent_present(&fixture.reference, &handle));
-    assert!(!tombstone_present(&fixture.reference, &handle));
-    assert!(fixture.keys.has_handle(&handle));
-
-    // The intent is resumed without a second install; reconcile reports the
-    // handle still present, one fresh delete under the same operation
-    // completes, and the tombstone commits.
-    delete_unreferenced_key(
-      fixture.context.store(),
-      &fixture.keys.as_provider(),
-      fixture.entropy.as_ref(),
-      &handle,
-    )
-    .await
-    .unwrap();
-    assert!(tombstone_present(&fixture.reference, &handle));
-    assert!(!fixture.keys.has_handle(&handle));
-    assert!(pending_keys(&fixture.reference).is_empty());
-  }
-
-  #[tokio::test]
   async fn key_intent_unknown_delete_reconciles_idempotently() {
     let fixture = fixture().await;
-    let handle = detached_handle(&fixture, 3);
+    let (operation, handle) = detached_pair(&fixture, 3);
     fixture.keys.push_delete_script(DeleteScript::Unknown);
 
     let error = delete_unreferenced_key(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await
@@ -451,6 +427,7 @@ mod tests {
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await
@@ -492,6 +469,7 @@ mod tests {
         context.store(),
         &keys.as_provider(),
         entropy.as_ref(),
+        &operation,
         &handle,
       )
       .await
@@ -532,8 +510,18 @@ mod tests {
     let task = tokio::spawn({
       let provider = keys.as_provider();
       let entropy = Arc::clone(&entropy);
+      let operation = operation.clone();
       let handle = handle.clone();
-      async move { delete_unreferenced_key(context.store(), &provider, entropy.as_ref(), &handle).await }
+      async move {
+        delete_unreferenced_key(
+          context.store(),
+          &provider,
+          entropy.as_ref(),
+          &operation,
+          &handle,
+        )
+        .await
+      }
     });
     committed.notified().await;
     for _ in 0..64 {
@@ -553,6 +541,7 @@ mod tests {
       context.store(),
       &keys.as_provider(),
       entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await
@@ -624,12 +613,13 @@ mod tests {
   #[tokio::test]
   async fn key_intent_deletion_receipts_and_references_are_exact() {
     let fixture = fixture().await;
-    let handle = detached_handle(&fixture, 7);
+    let (operation, handle) = detached_pair(&fixture, 7);
     let receipts_before = receipt_ids(&fixture.reference).len();
     delete_unreferenced_key(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await
@@ -676,6 +666,47 @@ mod tests {
     // provider delete calls.
     assert_never_deleted(&fixture.keys);
   }
+
+  #[tokio::test]
+  async fn key_intent_real_file_provider_delete_pairs_with_the_create_operation() {
+    // The built-in file key store validates the delete pairing against
+    // the key's create operation. This pins the regression where the
+    // deletion intent drove the provider delete under a freshly
+    // generated operation id: the provider rejected it as an input error
+    // and the former identity key never left the provider.
+    let (reference, factory) = fresh_reference();
+    let directory = tempfile::tempdir().unwrap();
+    let keys: Arc<dyn KeyProvider> = Arc::new(crate::keys::file::FileKeyStore::new(
+      directory.path().to_path_buf(),
+    ));
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context =
+      crate::identity::lifecycle::open_local_identity(&factory, &keys, entropy.as_ref(), RETENTION)
+        .await
+        .unwrap();
+
+    // A detached key created through the real provider, deleted the way
+    // the leave pipeline deletes the former identity key: under the
+    // create operation the intent carries.
+    let operation = KeyOperationId::parse("keyop-000000000000000000077").unwrap();
+    let handle = match keys.create_ed25519(&operation).await.unwrap() {
+      crate::KeyCreateState::Present(created) => created.handle().clone(),
+      state => panic!("unexpected create state: {state:?}"),
+    };
+
+    delete_unreferenced_key(
+      context.store(),
+      &keys,
+      entropy.as_ref(),
+      &operation,
+      &handle,
+    )
+    .await
+    .unwrap();
+    assert!(!intent_present(&reference, &handle));
+    assert!(tombstone_present(&reference, &handle));
+    assert!(pending_keys(&reference).is_empty());
+  }
 }
 
 #[cfg(test)]
@@ -707,6 +738,7 @@ mod guard_tests {
       context.store(),
       &keys.as_provider(),
       entropy.as_ref(),
+      &operation,
       &handle,
     )
     .await

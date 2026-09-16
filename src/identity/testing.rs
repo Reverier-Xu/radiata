@@ -90,7 +90,6 @@ pub(crate) enum SignScript {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeleteScript {
   Apply,
-  StillPresent,
   Unknown,
 }
 
@@ -430,7 +429,6 @@ impl KeyProvider for ScriptedKeys {
           .remove(handle.expose_provider_handle());
         KeyDeleteState::Absent
       }
-      DeleteScript::StillPresent => KeyDeleteState::Present,
       DeleteScript::Unknown => KeyDeleteState::Unknown,
     };
     Box::pin(async move { Ok(state) })

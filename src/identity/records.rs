@@ -459,9 +459,9 @@ impl LocalIdentityV1 {
     &self.public_key
   }
 
-  /// The operation id of the bootstrap intent that created this record
-  /// (test-verified against the admission state machine).
-  #[cfg(test)]
+  /// The operation id of the bootstrap intent that created this record;
+  /// the leave flow must drive the former key's provider delete under
+  /// this exact operation.
   pub(crate) fn operation(&self) -> &KeyOperationId {
     &self.operation
   }

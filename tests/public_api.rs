@@ -20,24 +20,25 @@ use std::{
 use radiata::adapters::json_store;
 use radiata::{
   ApplyReceiptRetention, BoxFuture, CommitOutcome, CommitReceipt, ConnectMember,
-  ConnectivityStatus, CreatedKey, DeliveryAck, Digest, DisconnectPeer, Endpoint, EventOptions,
-  EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag, GetLocalNode,
-  GetMember, GetNodeStatus, GetObservability, GetResource, GetRoute, IncomingStream,
-  IssuedMergeCredential, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster, LeaveOutcome, Listen,
-  LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView, MergeCluster, MergeCredential,
-  MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked,
-  NodeStatus, ObservabilitySnapshot, OutboundStream, PacketConsumer, PageCursor, PageListeners,
-  PageMembers, PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition,
-  ProtocolTag, PutResource, QualifiedTag, ReceiptRetentionReport, RecoveryChanged, RecoveryConfig,
-  RecoveryView, RemoveResource, ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged,
-  ResourceLabels, ResourceMutationView, ResourceName, ResourcePage, ResourceUri, ResourceVersion,
-  ResourceWrite, Result, RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop,
-  RouteState, RoutingPolicy, SelectResources, Selector, SessionChanged, SessionView, Shutdown,
-  ShutdownOutcome, ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities,
-  StoreEntry, StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision,
-  StoreTransaction, StoreValue, StreamMetadata, StreamPolicy, StreamTarget, TraceId,
-  TraceMetadataLimits, TransactionId, TransportTag, UpdateNodeMetadata, WaitForShutdown,
+  ConnectivityStatus, CreatedKey, DeclareInterruptedTransactionUncommitted, DeliveryAck, Digest,
+  DisconnectPeer, Endpoint, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
+  FeatureDefinition, FeatureTag, GetLocalNode, GetMember, GetNodeStatus, GetObservability,
+  GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState,
+  KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster,
+  LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView,
+  MergeCluster, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId,
+  NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
+  PacketConsumer, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
+  PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
+  ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResolveFrozenJournal, ResourceChanged, ResourceLabels,
+  ResourceMutationView, ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite,
+  Result, RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState,
+  RoutingPolicy, SelectResources, Selector, SessionChanged, SessionView, Shutdown, ShutdownOutcome,
+  ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities, StoreEntry, StoreKey,
+  StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
+  StreamMetadata, StreamPolicy, StreamTarget, TraceId, TraceMetadataLimits, TransactionId,
+  TransportTag, UpdateNodeMetadata, WaitForShutdown,
   extension::{Entropy, KeyProvider, Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -403,7 +404,6 @@ impl StorageFactory for PubStoreFactory {
       requirements.requires_ordered_scan(),
       requirements.requires_reconciliation(),
       requirements.requires_exclusive_lifetime_lock(),
-      requirements.requires_transactional_migration(),
     );
     Box::pin(async move {
       Ok(Box::new(PubStore {
@@ -468,8 +468,7 @@ fn storage_spi_values_are_externally_constructible() {
     .conditional_batch(true)
     .ordered_scan(true)
     .reconciliation(true)
-    .exclusive_lifetime_lock(true)
-    .transactional_migration(true);
+    .exclusive_lifetime_lock(true);
 }
 
 /// The `StoreScan` to `BoxStream` converter is externally drivable:
@@ -605,7 +604,7 @@ fn config_and_registry_are_externally_constructible() {
     .with_anti_entropy_interval(Duration::from_millis(250))
     .unwrap()
     .with_recovery_policy(
-      RecoveryConfig::new(4, 8, Duration::from_secs(1), Duration::from_secs(300)).unwrap(),
+      RecoveryConfig::new(8, Duration::from_secs(1), Duration::from_secs(300)).unwrap(),
     )
     .unwrap()
     .with_session_queue_limits(64, 1024)
@@ -1115,6 +1114,19 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   assert_eq!(retention.forgotten, 0);
   assert!(!retention.remaining);
 
+  // The frozen-journal recovery command on a healthy store: the typed
+  // rejection is the contract (nothing is frozen), and the acknowledged
+  // marker keeps the recovery decision a deliberate caller construction.
+  let frozen_rejection = member
+    .handle
+    .command(ResolveFrozenJournal::new(
+      DeclareInterruptedTransactionUncommitted::new(),
+    ))
+    .await
+    .unwrap_err();
+  assert_eq!(frozen_rejection.kind(), radiata::ErrorKind::Conflict);
+  let _still_serving: LocalNodeView = member.handle.query(GetLocalNode::new()).await.unwrap();
+
   let shutdown: ShutdownOutcome = issuer.handle.command(Shutdown::new()).await.unwrap();
   assert!(matches!(
     shutdown.reason(),
@@ -1126,6 +1138,96 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     ShutdownReason::Explicit | ShutdownReason::ActiveLeave | ShutdownReason::Fatal(_)
   ));
   member.handle.command(Shutdown::new()).await.unwrap();
+}
+
+/// The built-in file-backed key store is externally drivable: the
+/// adapter constructor hands back the open `KeyProvider` trait object,
+/// and a real directory backs create/replay/reconcile/delete plus the
+/// strict Ed25519 verification the runtime performs.
+#[cfg(all(feature = "json", unix))]
+#[tokio::test]
+async fn file_key_store_is_externally_drivable() {
+  let dir = tempfile::tempdir().unwrap();
+  let store: Arc<dyn KeyProvider> = radiata::adapters::file_key_store(dir.path().to_path_buf());
+  let operation = KeyOperationId::parse("keyop-0000000000000000000f1").unwrap();
+  let message = b"built-in key store strict message";
+
+  let created = store.create_ed25519(&operation).await.unwrap();
+  let created = match created {
+    KeyCreateState::Present(created) => created,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  let public_key = store.public_key(created.handle()).await.unwrap();
+  assert_eq!(public_key.as_bytes(), created.public_key().as_bytes());
+
+  let signature = store.sign(created.handle(), message).await.unwrap();
+  let verifying = ed25519_dalek::VerifyingKey::from_bytes(public_key.as_bytes()).unwrap();
+  verifying
+    .verify_strict(
+      message,
+      &ed25519_dalek::Signature::from_bytes(signature.as_bytes()),
+    )
+    .unwrap();
+
+  let replayed = store.create_ed25519(&operation).await.unwrap();
+  let replayed = match replayed {
+    KeyCreateState::Present(replayed) => replayed,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  assert_eq!(
+    replayed.public_key().as_bytes(),
+    created.public_key().as_bytes()
+  );
+
+  let reconciled = store.reconcile_create(&operation).await.unwrap();
+  assert!(matches!(reconciled, KeyCreateState::Present(_)));
+  let deleted = store.delete(&operation, created.handle()).await.unwrap();
+  assert!(matches!(deleted, KeyDeleteState::Present));
+  let error = store.sign(created.handle(), message).await.unwrap_err();
+  assert_eq!(error.kind(), radiata::ErrorKind::StorageCorrupt);
+}
+
+/// The built-in ephemeral key store is externally drivable: the
+/// in-memory constructor backs the same `KeyProvider` lifecycle within
+/// one process, and deleted keys can never sign again.
+#[tokio::test]
+async fn ephemeral_key_store_is_externally_drivable() {
+  let store: Arc<dyn KeyProvider> = radiata::adapters::ephemeral_key_store();
+  let operation = KeyOperationId::parse("keyop-0000000000000000000f2").unwrap();
+  let message = b"ephemeral key store message";
+
+  assert!(matches!(
+    store.reconcile_create(&operation).await.unwrap(),
+    KeyCreateState::Absent
+  ));
+  let created = store.create_ed25519(&operation).await.unwrap();
+  let created = match created {
+    KeyCreateState::Present(created) => created,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  let signature = store.sign(created.handle(), message).await.unwrap();
+  let verifying = ed25519_dalek::VerifyingKey::from_bytes(created.public_key().as_bytes()).unwrap();
+  verifying
+    .verify_strict(
+      message,
+      &ed25519_dalek::Signature::from_bytes(signature.as_bytes()),
+    )
+    .unwrap();
+
+  let replayed = store.create_ed25519(&operation).await.unwrap();
+  let replayed = match replayed {
+    KeyCreateState::Present(replayed) => replayed,
+    other => panic!("expected Present, got {other:?}"),
+  };
+  assert_eq!(
+    replayed.public_key().as_bytes(),
+    created.public_key().as_bytes()
+  );
+
+  let deleted = store.delete(&operation, created.handle()).await.unwrap();
+  assert!(matches!(deleted, KeyDeleteState::Present));
+  let error = store.sign(created.handle(), message).await.unwrap_err();
+  assert_eq!(error.kind(), radiata::ErrorKind::StorageCorrupt);
 }
 
 // --------------------------------------------------------------- helpers

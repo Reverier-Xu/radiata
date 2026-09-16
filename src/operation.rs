@@ -556,8 +556,13 @@ impl Command for PurgeRevocation {
 
 /// Starts a new cleanup checkpoint GC epoch at the current wall clock.
 /// Max-wins: a stored checkpoint with a higher
-/// watermark survives. Deployments issue checkpoints only against a fully
-/// converged cluster. Returns the persisted watermark.
+/// watermark survives. The library enforces the convergence precondition
+/// itself: the issue is refused with [`crate::ErrorKind::NotReady`] while
+/// any known member other than self whose removal record is not terminal
+/// (left or cleaned) lacks a live authenticated session, because
+/// tombstones that member has not received yet could be collected by the
+/// new epoch. Re-issue once the member is connected. Returns the
+/// persisted watermark.
 pub struct IssueCleanupCheckpoint {
   _private: (),
 }
@@ -577,10 +582,13 @@ impl Command for IssueCleanupCheckpoint {
 /// Applies receipt retention across the node's metadata store: every
 /// anchored receipt whose retention deadline has elapsed is forgotten
 /// through the cleanup state machine, and every other receipt is left
-/// exactly as it is. The pass is explicit, idempotent, and latency
-/// bounded; issue it again while [`crate::ReceiptRetentionReport::
-/// remaining`] reports true. Anchoring itself is the owning state
-/// machine's decision and is not performed by this command.
+/// exactly as it is. The pass is idempotent and latency bounded; issue it
+/// again while [`crate::ReceiptRetentionReport::
+/// remaining`] reports true. The recovery tick runs the same pass
+/// automatically on its sweep cadence; this command forces one
+/// idempotent pass on demand (tests, operations, a bounded drain of a
+/// large backlog). Anchoring itself is the owning state machine's
+/// decision and is not performed by this command.
 pub struct ApplyReceiptRetention {
   _private: (),
 }
@@ -671,6 +679,49 @@ impl private::Sealed for LeaveCluster {}
 
 impl Command for LeaveCluster {
   type Output = crate::LeaveOutcome;
+}
+
+/// Resolves a metadata store frozen on a pending journal whose durable
+/// provider evidence permanently contradicts the journal: the journaled
+/// record is present, but the provider proves no committed receipt for
+/// the journaled transaction, so every restart-based reconciliation
+/// re-derives the same contradiction and the store refuses all
+/// admission-sensitive operations.
+///
+/// Restart-based reconciliation is the first remedy and stays
+/// authoritative whenever the evidence resolves; this command is the
+/// operator-confirmed last resort for the permanent-contradiction case.
+/// The acknowledgement asserts the interrupted journaled transaction did
+/// not durably commit; the node re-checks the durable evidence (a
+/// provider verdict that the transaction committed or digest-conflicted
+/// refuses the declaration and keeps the store frozen), then deletes the
+/// pending journal record for the frozen purpose in one atomic
+/// transaction and unfreezes the store. The resolution is durable: a
+/// restart after it reopens ready with no pending journal. There is
+/// deliberately no opposite declaration — without provider evidence
+/// there is nothing to anchor a "committed" override on.
+///
+/// On a store that is not frozen on a resolvable pending journal — a
+/// ready store, an in-flight commit, or a freeze matching no durable
+/// journal record — the command fails typed without changing anything.
+pub struct ResolveFrozenJournal {
+  acknowledgement: crate::DeclareInterruptedTransactionUncommitted,
+}
+
+impl ResolveFrozenJournal {
+  pub fn new(acknowledgement: crate::DeclareInterruptedTransactionUncommitted) -> Self {
+    Self { acknowledgement }
+  }
+
+  pub(crate) const fn acknowledgement(&self) -> &crate::DeclareInterruptedTransactionUncommitted {
+    &self.acknowledgement
+  }
+}
+
+impl private::Sealed for ResolveFrozenJournal {}
+
+impl Command for ResolveFrozenJournal {
+  type Output = ();
 }
 
 /// The node's identity was replaced by an active leave.

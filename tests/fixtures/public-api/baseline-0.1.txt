@@ -1,5 +1,7 @@
 pub mod radiata
 pub mod radiata::adapters
+pub fn radiata::adapters::ephemeral_key_store() -> alloc::sync::Arc<dyn radiata::extension::KeyProvider>
+pub fn radiata::adapters::file_key_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::KeyProvider>
 pub fn radiata::adapters::json_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
 pub fn radiata::adapters::redb_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
 pub mod radiata::extension
@@ -28,6 +30,7 @@ pub fn radiata::extension::StoreSnapshot::get<'a>(&'a self, &'a radiata::StoreNa
 pub fn radiata::extension::StoreSnapshot::revision(&self) -> &radiata::StoreRevision
 pub fn radiata::extension::StoreSnapshot::scan<'a>(&'a self, &'a radiata::StoreNamespace, &'a [u8]) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<(dyn radiata::extension::StoreScan + 'a)>>>
 pub fn radiata::extension::StoreSnapshot::scan_from<'a>(&'a self, &'a radiata::StoreNamespace, &'a [u8], core::option::Option<&'a [u8]>) -> radiata::BoxFuture<'a, radiata::Result<alloc::boxed::Box<(dyn radiata::extension::StoreScan + 'a)>>>
+pub mod radiata::guide
 #[non_exhaustive] pub enum radiata::CommitOutcome
 pub radiata::CommitOutcome::Aborted
 pub radiata::CommitOutcome::Committed(radiata::CommitReceipt)
@@ -37,7 +40,6 @@ pub radiata::CommitOutcome::Unknown::operation_digest: radiata::Digest
 pub radiata::CommitOutcome::Unknown::transaction: radiata::TransactionId
 #[non_exhaustive] pub enum radiata::ConnectivityStatus
 pub radiata::ConnectivityStatus::Connected
-pub radiata::ConnectivityStatus::Offline
 pub radiata::ConnectivityStatus::Reachable
 pub radiata::ConnectivityStatus::Unknown
 #[non_exhaustive] pub enum radiata::DurabilityLevel
@@ -197,6 +199,9 @@ impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
 pub fn radiata::CreatedKey::new(radiata::KeyHandle, radiata::PublicKey) -> Self
 pub fn radiata::CreatedKey::public_key(&self) -> &radiata::PublicKey
+pub struct radiata::DeclareInterruptedTransactionUncommitted
+impl radiata::DeclareInterruptedTransactionUncommitted
+pub fn radiata::DeclareInterruptedTransactionUncommitted::new() -> Self
 pub struct radiata::DefaultNextHop
 impl radiata::DefaultNextHop
 pub const radiata::DefaultNextHop::TAG: &'static str
@@ -499,6 +504,7 @@ impl radiata::NodeConfig
 pub fn radiata::NodeConfig::new() -> Self
 pub fn radiata::NodeConfig::require_feature(self, radiata::FeatureTag) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_anti_entropy_interval(self, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_dial_deadline(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_parser_limits(self, radiata::ParserLimits) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_receipt_retention(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_recovery_policy(self, radiata::RecoveryConfig) -> radiata::Result<Self>
@@ -566,7 +572,7 @@ pub struct radiata::PageCursor(_)
 impl radiata::PageCursor
 pub fn radiata::PageCursor::as_bytes(&self) -> &[u8]
 pub fn radiata::PageCursor::from_provider_bytes(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
-pub fn radiata::PageCursor::new(alloc::sync::Arc<[u8]>) -> Self
+pub fn radiata::PageCursor::new(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
 pub struct radiata::PageListeners
 impl radiata::PageListeners
 pub fn radiata::PageListeners::new(radiata::PageSpec) -> Self
@@ -661,7 +667,7 @@ pub fn radiata::RecoveryChanged::recovery(&self) -> &radiata::RecoveryView
 impl radiata::Event for radiata::RecoveryChanged
 pub struct radiata::RecoveryConfig
 impl radiata::RecoveryConfig
-pub fn radiata::RecoveryConfig::new(usize, usize, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::RecoveryConfig::new(usize, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
 impl core::default::Default for radiata::RecoveryConfig
 pub fn radiata::RecoveryConfig::default() -> Self
 pub struct radiata::RecoveryView
@@ -677,6 +683,11 @@ pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
 pub struct radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 impl radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 pub fn radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new() -> Self
+pub struct radiata::ResolveFrozenJournal
+impl radiata::ResolveFrozenJournal
+pub fn radiata::ResolveFrozenJournal::new(radiata::DeclareInterruptedTransactionUncommitted) -> Self
+impl radiata::Command for radiata::ResolveFrozenJournal
+pub type radiata::ResolveFrozenJournal::Output = ()
 pub struct radiata::ResourceChanged
 impl radiata::ResourceChanged
 pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
@@ -852,11 +863,9 @@ pub fn radiata::StoreCapabilities::has_conditional_batch(&self) -> bool
 pub fn radiata::StoreCapabilities::has_exclusive_lifetime_lock(&self) -> bool
 pub fn radiata::StoreCapabilities::has_ordered_scan(&self) -> bool
 pub fn radiata::StoreCapabilities::has_reconciliation(&self) -> bool
-pub fn radiata::StoreCapabilities::has_transactional_migration(&self) -> bool
 pub fn radiata::StoreCapabilities::new(radiata::DurabilityLevel) -> Self
 pub fn radiata::StoreCapabilities::ordered_scan(self, bool) -> Self
 pub fn radiata::StoreCapabilities::reconciliation(self, bool) -> Self
-pub fn radiata::StoreCapabilities::transactional_migration(self, bool) -> Self
 pub struct radiata::StoreEntry
 impl radiata::StoreEntry
 pub fn radiata::StoreEntry::key(&self) -> &radiata::StoreKey
@@ -880,7 +889,6 @@ pub fn radiata::StoreRequirements::requires_conditional_batch(&self) -> bool
 pub fn radiata::StoreRequirements::requires_exclusive_lifetime_lock(&self) -> bool
 pub fn radiata::StoreRequirements::requires_ordered_scan(&self) -> bool
 pub fn radiata::StoreRequirements::requires_reconciliation(&self) -> bool
-pub fn radiata::StoreRequirements::requires_transactional_migration(&self) -> bool
 pub struct radiata::StoreRevision(_)
 impl radiata::StoreRevision
 pub fn radiata::StoreRevision::as_bytes(&self) -> &[u8]
@@ -1012,6 +1020,8 @@ impl radiata::Command for radiata::PutResource
 pub type radiata::PutResource::Output = radiata::ResourceMutationView
 impl radiata::Command for radiata::RemoveResource
 pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
+impl radiata::Command for radiata::ResolveFrozenJournal
+pub type radiata::ResolveFrozenJournal::Output = ()
 impl radiata::Command for radiata::RevokeNode
 pub type radiata::RevokeNode::Output = radiata::RevokeOutcome
 impl radiata::Command for radiata::RotateMergeCredential

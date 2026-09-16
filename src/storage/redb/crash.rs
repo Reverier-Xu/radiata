@@ -11,7 +11,10 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use super::RedbStoreFactory;
+use super::{
+  RedbStoreFactory,
+  store::{FIRST_COMMITTED_POINT, LAST_POINT},
+};
 use crate::{
   CommitOutcome, ReconcileOutcome, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
   StoreRequirements, StoreRevision, StoreTransaction, StoreValue, provider::StorageFactory,
@@ -19,15 +22,6 @@ use crate::{
 
 const CRASH_DIR_ENV: &str = "RADIATA_REDB_CRASH_DIR";
 const CRASH_POINT_ENV: &str = "RADIATA_REDB_CRASH_POINT";
-
-/// Crash points inside the commit path.
-///
-/// 1: after write-transaction begin; 2: after conditions pass, before
-/// mutations; 3: after mutations, before revision bump; 4: after revision
-/// bump, before receipt insert; 5: after receipt insert, before redb
-/// commit; 6: after the durable redb commit returns.
-const FIRST_COMMITTED_POINT: u8 = 6;
-const LAST_POINT: u8 = 6;
 
 fn requirements() -> StoreRequirements {
   StoreRequirements::metadata()

@@ -45,6 +45,21 @@ pub(crate) fn select_crash_point(point: u8) {
   CRASH_POINT.store(point, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// First crash point at which the redb commit is already durable, so a
+/// crash from here on reopens to the committed state and every earlier
+/// point (`1..6`: after begin, after conditions, after mutations, after
+/// the revision bump, after the receipt insert) to the old one. The
+/// crash matrices import this instead of restating the boundary, so
+/// renumbering a hook desyncs nothing. Must track the `crash_hook`
+/// numbering in this module.
+#[cfg(test)]
+pub(crate) const FIRST_COMMITTED_POINT: u8 = 6;
+/// Highest live `crash_hook` boundary of this commit path; the crash
+/// matrices scan points `1..=LAST_POINT`. Must track the `crash_hook`
+/// numbering in this module.
+#[cfg(test)]
+pub(crate) const LAST_POINT: u8 = 6;
+
 #[cfg(test)]
 fn crash_hook(point: u8) {
   if CRASH_POINT.load(std::sync::atomic::Ordering::SeqCst) == point {
@@ -167,13 +182,7 @@ impl Storage for RedbStorage {
         .open_table(RECEIPTS_TABLE)
         .map_err(|error| map_table_error(error, ProviderErrorContext::StorageReconcile))?;
       let receipt = read_receipt(&receipts, transaction)?;
-      Ok(match receipt {
-        Some(existing) if existing.operation_digest() == digest => {
-          ReconcileOutcome::Committed(existing)
-        }
-        Some(_) => ReconcileOutcome::DigestConflict,
-        None => ReconcileOutcome::Aborted,
-      })
+      Ok(crate::provider::classify_receipt(receipt, digest))
     })
   }
 
@@ -547,55 +556,42 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
 
     // Idempotent replay: an existing receipt for the same transaction is
     // authoritative; a different digest for that identity fails closed.
-    if let Some(existing) = read_receipt(&receipts, transaction.id())? {
-      return Ok(
-        if existing.operation_digest() == transaction.operation_digest() {
-          CommitOutcome::Committed(existing)
-        } else {
-          CommitOutcome::Conflict
-        },
-      );
+    // The base check is the only reader of the current generation and it
+    // must run strictly between the receipt replay and the condition
+    // loop, so the apply phase reuses the value the check closure stored.
+    let mut generation_slot = None;
+    if let Some(outcome) = crate::provider::commit_precheck(
+      &transaction,
+      |id: &TransactionId| read_receipt(&receipts, id),
+      || {
+        let generation = current_generation(&meta, ProviderErrorContext::StorageCommit)?;
+        generation_slot = Some(generation);
+        StoreRevision::new(Arc::from(generation.to_be_bytes()))
+      },
+      |namespace: &StoreNamespace, key: &StoreKey| {
+        let composite = composite_key(namespace, key);
+        let stored = entries
+          .get(&*composite)
+          .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
+        if stored.is_none() {
+          return Ok(None);
+        }
+        // The commit path keeps every entry's digest row current in the
+        // same transaction, so a missing row is storage corruption.
+        let persisted = digests
+          .get(&*composite)
+          .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?
+          .ok_or_else(|| super::super::storage_corrupt(ProviderErrorContext::StorageCommit))?;
+        let bytes: [u8; VALUE_DIGEST_BYTES] = persisted
+          .value()
+          .try_into()
+          .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageCommit))?;
+        Ok(Some(Digest::from_bytes(bytes)))
+      },
+    )? {
+      return Ok(outcome);
     }
-    // Development tripwire: the digest is fixed at prepare over private
-    // immutable fields (see the json adapter's note).
-    debug_assert_eq!(
-      transaction.operation_digest(),
-      &transaction.computed_operation_digest()
-    );
-    let generation = current_generation(&meta, ProviderErrorContext::StorageCommit)?;
-    if transaction.base_revision().as_bytes() != generation.to_be_bytes() {
-      return Ok(CommitOutcome::Conflict);
-    }
-    for operation in transaction.operations() {
-      if !crate::provider::condition_matches(
-        |namespace: &StoreNamespace, key: &StoreKey| {
-          let composite = composite_key(namespace, key);
-          let stored = entries
-            .get(&*composite)
-            .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?;
-          if stored.is_none() {
-            return Ok(None);
-          }
-          // The commit path keeps every entry's digest row current in the
-          // same transaction, so a missing row is storage corruption.
-          let persisted = digests
-            .get(&*composite)
-            .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageCommit))?
-            .ok_or_else(|| super::super::storage_corrupt(ProviderErrorContext::StorageCommit))?;
-          let bytes: [u8; VALUE_DIGEST_BYTES] = persisted
-            .value()
-            .try_into()
-            .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageCommit))?;
-          Ok(Some(Digest::from_bytes(bytes)))
-        },
-        |forgotten: &TransactionId| {
-          Ok(read_receipt(&receipts, forgotten)?.map(|receipt| receipt.operation_digest().clone()))
-        },
-        operation,
-      )? {
-        return Ok(CommitOutcome::Conflict);
-      }
-    }
+    let generation = generation_slot.ok_or_else(|| Error::internal("redb generation"))?;
     let next_generation = generation.checked_add(1).ok_or_else(|| {
       Error::provider(
         ProviderErrorKind::ResourceExhausted,

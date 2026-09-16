@@ -5,9 +5,11 @@
 //! attempts, per-source and global 60-second fixed windows, a bounded
 //! source-bucket table with idle eviction, and the ten-second
 //! authentication deadline owned by the session driver. A rejected
-//! attempt consumes no credential, performs no signing, and consumes no
-//! rate-window budget: both windows record an attempt only after every
-//! admission check has passed. An [`MergeSlot`] holds the pending count
+//! attempt consumes no credential, performs no signing, consumes no
+//! rate-window budget, and leaves no limiter state behind: both windows
+//! record an attempt only after every admission check has passed, and a
+//! source bucket is created or refreshed only on the grant path. An
+//! [`MergeSlot`] holds the pending count
 //! for exactly one in-flight attempt and releases it on every outcome,
 //! including cancellation.
 //!
@@ -123,7 +125,10 @@ impl MergeLimiter {
   /// never consumes a credential; the per-source and global windows
   /// record the attempt only after every admission check has passed,
   /// immediately before the grant, so rejected attempts never consume
-  /// the rate budget of any source.
+  /// the rate budget of any source. A rejected attempt also neither
+  /// creates nor refreshes the source's bucket — per-source checks
+  /// evaluate the looked-up bucket or the fresh-source defaults — so
+  /// refused sources can never pin the bounded bucket table.
   pub(crate) fn begin(&self, source: MergeSource) -> Result<MergeSlot> {
     let now = Instant::now();
     let mut inner = self
@@ -142,22 +147,37 @@ impl MergeLimiter {
     if !inner.global_window.admits(now) {
       return Err(Error::overloaded("merge rate window"));
     }
+    // Per-source checks evaluate the looked-up bucket, or the fresh
+    // defaults (pending 0, empty window at `now`) for a source with no
+    // bucket yet. Nothing is materialized here: a rejection must leave
+    // no bucket behind and must not refresh an existing one, or refused
+    // sources would keep their buckets alive against the bounded table.
+    let source_admitted = {
+      let existing = inner.sources.get_mut(&source);
+      let pending = existing.as_ref().map_or(0, |bucket| bucket.pending);
+      if pending >= PENDING_PER_SOURCE {
+        return Err(Error::overloaded("merge source pending"));
+      }
+      match existing {
+        Some(bucket) => bucket.window.admits(now),
+        // A brand-new source starts against an empty window.
+        None => true,
+      }
+    };
+    if !source_admitted {
+      return Err(Error::overloaded("merge rate window"));
+    }
+    // Every admission check passed: materialize the bucket, refresh its
+    // idle clock, and record both windows as the final grant step.
+    // Recording is infallible and the per-source bucket is last used
+    // before the global window is touched, so a rejected attempt can
+    // never consume either window's budget.
     let bucket = inner.sources.entry(source).or_insert_with(|| SourceBucket {
       pending: 0,
       window: RateWindow::new(now, RATE_PER_SOURCE),
       last_seen: now,
     });
     bucket.last_seen = now;
-    if bucket.pending >= PENDING_PER_SOURCE {
-      return Err(Error::overloaded("merge source pending"));
-    }
-    if !bucket.window.admits(now) {
-      return Err(Error::overloaded("merge rate window"));
-    }
-    // Every admission check passed: record both windows as the final
-    // grant step. Recording is infallible and the per-source bucket is
-    // last used before the global window is touched, so a rejected
-    // attempt can never consume either window's budget.
     bucket.window.record();
     bucket.pending += 1;
     inner.global_window.record();
@@ -305,6 +325,126 @@ mod tests {
     // A different source still passes global admission inside the same
     // window: none of the hammer's rejections consumed the global budget.
     drop(limiter.begin(other).unwrap());
+  }
+
+  /// A rejected attempt must never create a bucket. A brand-new source
+  /// refused at a window stage leaves the table empty (a brand-new
+  /// source cannot be refused by its own per-source checks: they
+  /// evaluate fresh defaults), and a source refused by its own
+  /// saturated per-source window creates no new bucket and does not
+  /// refresh the one its grants already own.
+  #[test]
+  fn merge_rate_rejected_attempts_never_create_a_bucket() {
+    let limiter = MergeLimiter::new();
+    // Saturate the global window without granting anything, so the
+    // brand-new source is refused at the window stage.
+    {
+      let mut inner = limiter.inner.lock().unwrap();
+      inner.global_window.count = RATE_GLOBAL;
+    }
+    let fresh = source(200);
+    assert_eq!(
+      limiter.begin(fresh).unwrap_err().kind(),
+      ErrorKind::Overloaded,
+      "saturated global window must refuse a brand-new source"
+    );
+    assert!(
+      limiter.inner.lock().unwrap().sources.is_empty(),
+      "a rejected attempt must not create a bucket for a brand-new source"
+    );
+
+    // A source refused by its own saturated per-source window: no new
+    // bucket, no pending slot held, and no idle-clock refresh (only
+    // grants may keep a bucket alive).
+    let limiter = MergeLimiter::new();
+    let origin = source(1);
+    for _ in 0..RATE_PER_SOURCE {
+      drop(limiter.begin(origin).unwrap());
+    }
+    let marked = std::time::Instant::now();
+    for _ in 0..RATE_PER_SOURCE {
+      assert_eq!(
+        limiter.begin(origin).unwrap_err().kind(),
+        ErrorKind::Overloaded,
+        "saturated per-source window must refuse the attempt"
+      );
+    }
+    let inner = limiter.inner.lock().unwrap();
+    assert_eq!(inner.sources.len(), 1, "rejections must not create buckets");
+    let bucket = inner.sources.get(&origin).unwrap();
+    assert_eq!(bucket.pending, 0, "a rejection holds no pending slot");
+    assert!(
+      bucket.last_seen <= marked,
+      "a rejected attempt must not refresh the bucket's idle clock"
+    );
+  }
+
+  /// Window-rejected sources must not keep their buckets alive: a table
+  /// filled to its limit with sources refused by their own per-source
+  /// windows cannot lock out a brand-new source once the idle lifetime
+  /// has passed.
+  #[test]
+  fn merge_rate_window_rejected_sources_do_not_pin_the_bucket_table() {
+    let limiter = MergeLimiter::new();
+    // Fill the table to the limit: one granted attempt per source (the
+    // global rate window is reset per iteration so the test isolates the
+    // bucket bound from the 256/60s global rate).
+    for index in 0..SOURCE_BUCKET_LIMIT as u16 {
+      {
+        let mut inner = limiter.inner.lock().unwrap();
+        inner.global_window.start = std::time::Instant::now();
+        inner.global_window.count = 0;
+      }
+      drop(limiter.begin(source16(index)).unwrap());
+    }
+    // Saturate every per-source window directly; one grant per source is
+    // not enough to reach the rate on its own.
+    {
+      let mut inner = limiter.inner.lock().unwrap();
+      for bucket in inner.sources.values_mut() {
+        bucket.window.count = RATE_PER_SOURCE;
+      }
+    }
+    let marked = std::time::Instant::now();
+    // One more attempt per source: every one is refused by its own
+    // window, and none of those refusals may advance an idle clock.
+    for index in 0..SOURCE_BUCKET_LIMIT as u16 {
+      {
+        let mut inner = limiter.inner.lock().unwrap();
+        inner.global_window.start = std::time::Instant::now();
+        inner.global_window.count = 0;
+      }
+      assert_eq!(
+        limiter.begin(source16(index)).unwrap_err().kind(),
+        ErrorKind::Overloaded,
+        "saturated per-source window must refuse the attempt"
+      );
+    }
+    {
+      let inner = limiter.inner.lock().unwrap();
+      assert!(
+        inner
+          .sources
+          .values()
+          .all(|bucket| bucket.last_seen <= marked),
+        "a window refusal must not refresh the bucket's idle clock"
+      );
+    }
+    // Simulate the idle lifetime passing: every refused bucket is now
+    // evictable, so a brand-new source is admitted instead of refused
+    // with "merge source buckets" forever.
+    {
+      let mut inner = limiter.inner.lock().unwrap();
+      for bucket in inner.sources.values_mut() {
+        bucket.last_seen = bucket
+          .last_seen
+          .checked_sub(super::SOURCE_IDLE_LIFETIME + Duration::from_secs(1))
+          .unwrap();
+      }
+      inner.global_window.start = std::time::Instant::now();
+      inner.global_window.count = 0;
+    }
+    drop(limiter.begin(source16(SOURCE_BUCKET_LIMIT as u16)).unwrap());
   }
 
   #[test]

@@ -23,6 +23,7 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 use crate::{Error, NodeId, QualifiedTag, Result, api::BoxFuture};
 
 pub(crate) mod forward;
+pub(crate) mod outbound;
 pub(crate) mod table;
 pub(crate) mod trace;
 
@@ -729,7 +730,8 @@ impl CandidateNodeReader for StoreCandidateReader {
       .await?;
       let next = paged
         .next
-        .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
+        .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)))
+        .transpose()?;
       Ok(crate::MemberPage::new(paged.items, next))
     })
   }
@@ -773,16 +775,33 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
 /// plane before any policy is consulted, so the policy only ever sees
 /// unconnected destinations and always relays. The choice is
 /// deterministic (canonical peer order, minimum wins), which keeps
-/// loop-freedom reasoning and replay tests simple. Register it under
-/// [`DefaultNextHop::TAG`] (or your own tag) and select that tag in
-/// [`crate::NodeConfig::with_route_policy`]; registering a different
-/// [`RouteNextHop`] implementation replaces it.
+/// loop-freedom reasoning and replay tests simple.
+///
+/// This is the default policy: the node builder registers it under
+/// [`DefaultNextHop::TAG`] unless the caller already did, and a node
+/// without a caller-selected route policy resolves to that tag, so
+/// multi-hop relay works out of the box. [`crate::NodeConfig::
+/// with_route_policy`] selects a different registered policy instead;
+/// registering a caller policy under [`DefaultNextHop::TAG`] replaces the
+/// default outright.
 #[derive(Debug)]
 pub struct DefaultNextHop;
 
 impl DefaultNextHop {
   /// The well-known tag the built-in policy is registered under.
   pub const TAG: &'static str = "radiata.woooo.tech/route-policies/default";
+
+  /// The built-in policy's canonical tag, parsed once. The literal is a
+  /// fixed canonical constant; the impossible parse failure surfaces as
+  /// an internal error instead of a panic.
+  pub(crate) fn tag() -> Result<QualifiedTag> {
+    static TAG: std::sync::OnceLock<std::result::Result<QualifiedTag, ()>> =
+      std::sync::OnceLock::new();
+    TAG
+      .get_or_init(|| QualifiedTag::parse(Self::TAG).map_err(|_| ()))
+      .clone()
+      .map_err(|_| Error::internal("built-in next-hop policy tag"))
+  }
 }
 
 impl RouteNextHop for DefaultNextHop {

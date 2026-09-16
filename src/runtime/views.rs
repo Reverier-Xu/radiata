@@ -15,11 +15,12 @@ use crate::{Error, LocalNodeView, NodeId, Result};
 /// caller's page constructor.
 fn finish_page<T, P>(
   paged: crate::paging::Paged<T>, page: impl FnOnce(Vec<T>, Option<crate::PageCursor>) -> P,
-) -> P {
+) -> Result<P> {
   let next = paged
     .next
-    .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)));
-  page(paged.items, next)
+    .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)))
+    .transpose()?;
+  Ok(page(paged.items, next))
 }
 
 impl Supervisor {
@@ -44,11 +45,7 @@ impl Supervisor {
       crate::identity::cleanup::is_cleaned_ctx(store, &node).await?,
       crate::identity::leave::is_left_ctx(store, &node).await?,
     );
-    let connectivity = if connected {
-      crate::ConnectivityStatus::Connected
-    } else {
-      crate::ConnectivityStatus::Reachable
-    };
+    let connectivity = crate::membership::member_connectivity(connected);
     Ok(Some(
       crate::membership::member_view(&descriptor, connectivity)?.with_status(status),
     ))
@@ -88,17 +85,14 @@ impl Supervisor {
       |_key, bytes| {
         let descriptor = crate::membership::page::decode_descriptor(bytes)?;
         let status = departed.status(descriptor.node());
-        let connectivity = if connected.contains(descriptor.node()) {
-          crate::ConnectivityStatus::Connected
-        } else {
-          crate::ConnectivityStatus::Reachable
-        };
+        let connectivity =
+          crate::membership::member_connectivity(connected.contains(descriptor.node()));
         crate::membership::member_view(&descriptor, connectivity)
           .map(|view| Some(view.with_status(status)))
       },
     )
     .await?;
-    Ok(finish_page(paged, crate::MemberPage::new))
+    finish_page(paged, crate::MemberPage::new)
   }
   /// Pages the live resource winners matching one selector.
   pub(super) async fn select_resources(
@@ -152,7 +146,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    Ok(finish_page(paged, crate::ListenerPage::new))
+    finish_page(paged, crate::ListenerPage::new)
   }
   /// Pages the live authenticated sessions in canonical peer order;
   /// selected features resolve their exact definition digests at query
@@ -201,7 +195,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    Ok(finish_page(paged, crate::SessionPage::new))
+    finish_page(paged, crate::SessionPage::new)
   }
   /// The bounded observability snapshot:
   /// session/listener/task counters, queue totals, route and trace
@@ -301,7 +295,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    Ok(finish_page(paged, crate::TopologyPage::new))
+    finish_page(paged, crate::TopologyPage::new)
   }
   /// Pages the public trust observations: the exact
   /// NodeId-to-key bindings verified locally, deterministically ordered
@@ -337,13 +331,13 @@ impl Supervisor {
         status,
       ));
     }
-    Ok(finish_page(
+    finish_page(
       crate::paging::Paged {
         items,
         next: paged.next,
       },
       crate::TrustPage::new,
-    ))
+    )
   }
   pub(super) async fn local_node(&mut self) -> Result<LocalNodeView> {
     let context = self.context()?;

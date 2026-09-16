@@ -15,13 +15,15 @@ use super::{
 };
 use crate::{
   CommitOutcome, CommitReceipt, Digest, ReconcileOutcome, StoreExpectation, StoreOperation,
+  identity::testing::{CommitFault, FaultingFactory},
   provider::StorageFactory,
   storage::{
     MetadataStore,
     pending::{PendingCleanupOutcome, PendingTransactionV1, pending_key, pending_namespace},
     receipt::{
-      ACTIVE_MARKER_VALUE, ReceiptCleanupOutcome, ReceiptReferenceChange, ReceiptReferenceToken,
-      WallClock, internal_namespace, reference_edge_key, reference_head_key, used_id_key,
+      ACTIVE_MARKER_VALUE, ReceiptCleanupOutcome, ReceiptReferenceChange, ReceiptReferenceOutcome,
+      ReceiptReferenceToken, WallClock, internal_namespace, reference_edge_key, reference_head_key,
+      used_id_key,
     },
   },
 };
@@ -877,6 +879,392 @@ async fn reconcile_on_a_ready_store_fails_immediately() {
   let error = store.reconcile().await.unwrap_err();
   assert_eq!(error.kind(), crate::ErrorKind::NotReady);
   assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// The permanent-contradiction freeze: the journaled transaction landed,
+/// but the provider's receipt is gone, so reconciliation classifies as
+/// aborted while the journal proves committed and the store fails
+/// closed. The operator-confirmed uncommitted declaration deletes the
+/// journal in one atomic transaction and unfreezes the store; the
+/// resolution is durable — a reopen on the same storage (the crash
+/// simulation) finds no pending journal and starts ready.
+#[tokio::test]
+async fn identity_records_declared_uncommitted_resolution_is_durable() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let fault_calls = Arc::new(AtomicUsize::new(0));
+  let fault_factory: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+    reference: Arc::clone(&reference),
+    mode: UnknownFaultMode::Applied,
+    commit_calls: Arc::clone(&fault_calls),
+  });
+  let clock: Arc<dyn WallClock> = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(980)));
+  let store = MetadataStore::open_with_clock(&fault_factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+  let prepared = prepare_journaled_owner_put(&store, 470).await;
+  let transaction = prepared.id().clone();
+  let digest = prepared.operation_digest().clone();
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  drop(store);
+
+  // The provider loses the receipt: the durable evidence now
+  // permanently contradicts the pending journal.
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .remove(&transaction);
+
+  let plain_factory: Arc<dyn StorageFactory> = reference.clone();
+  let (store, recovered) = open_pending(&plain_factory, 981).await;
+  let identity = recovered.unwrap();
+  assert_eq!(identity.transaction(), &transaction);
+  assert_eq!(identity.operation_digest(), &digest);
+  assert!(store.is_blocked().unwrap());
+  let unrelated = prepare_plain_put(&store, 471, 7).await;
+  assert_eq!(
+    store.commit(unrelated).await.unwrap_err().kind(),
+    crate::ErrorKind::NotReady
+  );
+
+  // Every reconcile re-derives the same contradiction: journal present,
+  // receipt absent.
+  assert_eq!(
+    store
+      .resolve_pending_journal(JOURNAL_PURPOSE)
+      .await
+      .unwrap_err()
+      .kind(),
+    crate::ErrorKind::StorageCorrupt
+  );
+  assert!(store.is_blocked().unwrap());
+
+  // The acknowledged declaration resolves the frozen journal: the
+  // pending record is deleted in one atomic transaction and the store
+  // unfreezes.
+  store
+    .resolve_frozen_journal_uncommitted(contract_transaction_id(472))
+    .await
+    .unwrap();
+  assert!(!store.is_blocked().unwrap());
+  let unrelated = prepare_plain_put(&store, 473, 8).await;
+  assert!(matches!(
+    store.commit(unrelated).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&pending_namespace().unwrap(), &pending_key(JOURNAL_PURPOSE))
+      .await
+      .unwrap()
+      .is_none()
+  );
+  drop(snapshot);
+
+  // The resolution pairs the journal-record delete with removing the
+  // record's receipt token, so the touched receipt's reference count
+  // returns to its caller-token baseline and the receipt can anchor
+  // again once its remaining owner references are dropped.
+  let (owner_token, pointer_token, pending_token) = journaled_tokens();
+  let internal = internal_namespace().unwrap();
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(
+        &internal,
+        &reference_edge_key(&transaction, &pending_token).unwrap()
+      )
+      .await
+      .unwrap()
+      .is_none()
+  );
+  for token in [&owner_token, &pointer_token] {
+    assert!(
+      snapshot
+        .get(&internal, &reference_edge_key(&transaction, token).unwrap())
+        .await
+        .unwrap()
+        .is_some()
+    );
+  }
+  assert_eq!(
+    snapshot
+      .get(&internal, &reference_head_key(&transaction).unwrap())
+      .await
+      .unwrap()
+      .unwrap()
+      .as_bytes(),
+    2_u64.to_be_bytes().as_slice()
+  );
+  drop(snapshot);
+  for (offset, token) in [&owner_token, &pointer_token].into_iter().enumerate() {
+    assert!(matches!(
+      store
+        .remove_receipt_reference(
+          &identity,
+          token,
+          contract_transaction_id(481 + u16::try_from(offset).unwrap()),
+        )
+        .await
+        .unwrap(),
+      ReceiptReferenceOutcome::Applied(_)
+    ));
+  }
+  assert!(matches!(
+    store
+      .cleanup_receipt(&identity, contract_transaction_id(483))
+      .await
+      .unwrap(),
+    ReceiptCleanupOutcome::Anchored(_)
+  ));
+
+  // Crash simulation: the resolution survived a restart on the same
+  // storage — no pending journal, no freeze.
+  drop(store);
+  let (store, recovered) = open_pending(&plain_factory, 982).await;
+  assert!(recovered.is_none());
+  assert!(!store.is_blocked().unwrap());
+  let unrelated = prepare_plain_put(&store, 474, 9).await;
+  assert!(matches!(
+    store.commit(unrelated).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+}
+
+/// The declaration refuses every state it does not target: a ready store
+/// and an in-flight commit freeze with no durable journal record behind
+/// it reject typed with `Conflict` and change nothing.
+#[tokio::test]
+async fn identity_records_declared_uncommitted_resolution_refuses_unfrozen_and_non_journal_freezes()
+{
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  {
+    let factory: Arc<dyn StorageFactory> = Arc::clone(&reference) as _;
+    let clock: Arc<dyn WallClock> =
+      Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(990)));
+    let store = MetadataStore::open_with_clock(&factory, Duration::from_secs(10), clock)
+      .await
+      .unwrap();
+    assert_eq!(
+      store
+        .resolve_frozen_journal_uncommitted(contract_transaction_id(475))
+        .await
+        .unwrap_err()
+        .kind(),
+      crate::ErrorKind::Conflict
+    );
+    assert!(!store.is_blocked().unwrap());
+  }
+
+  let fault_calls = Arc::new(AtomicUsize::new(0));
+  let fault_factory: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+    reference: Arc::clone(&reference),
+    mode: UnknownFaultMode::NotApplied,
+    commit_calls: Arc::clone(&fault_calls),
+  });
+  let clock: Arc<dyn WallClock> = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(991)));
+  let store = MetadataStore::open_with_clock(&fault_factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+  let prepared = prepare_plain_put(&store, 476, 10).await;
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  assert!(store.is_blocked().unwrap());
+  assert_eq!(
+    store
+      .resolve_frozen_journal_uncommitted(contract_transaction_id(477))
+      .await
+      .unwrap_err()
+      .kind(),
+    crate::ErrorKind::Conflict
+  );
+  assert!(store.is_blocked().unwrap());
+}
+
+/// The declaration refuses to delete a journal the provider proves
+/// committed: the fresh evidence read rejects typed and the store stays
+/// frozen with its journal intact (a healed provider resolves the
+/// journal through the normal reconciliation).
+#[tokio::test]
+async fn identity_records_declared_uncommitted_resolution_refuses_committed_evidence() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let fault_calls = Arc::new(AtomicUsize::new(0));
+  let fault_factory: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+    reference: Arc::clone(&reference),
+    mode: UnknownFaultMode::Applied,
+    commit_calls: Arc::clone(&fault_calls),
+  });
+  let clock: Arc<dyn WallClock> =
+    Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+  let store = MetadataStore::open_with_clock(&fault_factory, Duration::from_secs(10), clock)
+    .await
+    .unwrap();
+  let prepared = prepare_journaled_owner_put(&store, 479).await;
+  let transaction = prepared.id().clone();
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  drop(store);
+
+  // Lose the receipt, reopen frozen on the contradiction, then heal the
+  // provider: the evidence read inside the resolution now proves the
+  // journaled transaction committed.
+  let healed_receipt = reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .get(&transaction)
+    .unwrap()
+    .clone();
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .remove(&transaction);
+  let plain_factory: Arc<dyn StorageFactory> = reference.clone();
+  let (store, recovered) = open_pending(&plain_factory, 1001).await;
+  assert!(recovered.is_some());
+  assert!(store.is_blocked().unwrap());
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .insert(transaction, healed_receipt);
+
+  assert_eq!(
+    store
+      .resolve_frozen_journal_uncommitted(contract_transaction_id(480))
+      .await
+      .unwrap_err()
+      .kind(),
+    crate::ErrorKind::StorageCorrupt
+  );
+  assert!(store.is_blocked().unwrap());
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&pending_namespace().unwrap(), &pending_key(JOURNAL_PURPOSE))
+      .await
+      .unwrap()
+      .is_some()
+  );
+}
+
+/// An unknown outcome from the resolution delete classifies by the
+/// journal's durable presence: with the record still present the delete
+/// did not land, so the declaration rejects typed with `Conflict`, the
+/// store stays frozen with its journal intact, and a retried resolution
+/// with a passing provider delete lands the declaration and unfreezes
+/// the store.
+#[tokio::test]
+async fn identity_records_declared_uncommitted_unknown_delete_classifies_by_journal_presence() {
+  let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+  let fault_factory = FaultingFactory::new(
+    &reference,
+    vec![CommitFault::UnknownApplied, CommitFault::UnknownNotApplied],
+  );
+  let clock: Arc<dyn WallClock> =
+    Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1010)));
+  let store =
+    MetadataStore::open_with_clock(&fault_factory.as_factory(), Duration::from_secs(10), clock)
+      .await
+      .unwrap();
+  let prepared = prepare_journaled_owner_put(&store, 484).await;
+  let transaction = prepared.id().clone();
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  drop(store);
+
+  // Lose the provider receipt: the durable evidence contradicts the
+  // journal, and a reopen freezes on it.
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .receipts
+    .remove(&transaction);
+  let faulted = fault_factory.as_factory();
+  let (store, recovered) = open_pending(&faulted, 1011).await;
+  assert!(recovered.is_some());
+  assert!(store.is_blocked().unwrap());
+
+  // The delete reports unknown without applying: the journal is still
+  // present, so the delete did not land, the declaration rejects, and
+  // the freeze stands.
+  assert_eq!(
+    store
+      .resolve_frozen_journal_uncommitted(contract_transaction_id(485))
+      .await
+      .unwrap_err()
+      .kind(),
+    crate::ErrorKind::Conflict
+  );
+  assert!(store.is_blocked().unwrap());
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&pending_namespace().unwrap(), &pending_key(JOURNAL_PURPOSE))
+      .await
+      .unwrap()
+      .is_some()
+  );
+  drop(snapshot);
+
+  // The retried resolution (the fault script is exhausted) lands the
+  // delete with its paired receipt cleanup and unfreezes the store.
+  store
+    .resolve_frozen_journal_uncommitted(contract_transaction_id(486))
+    .await
+    .unwrap();
+  assert!(!store.is_blocked().unwrap());
+  let (_, _, pending_token) = journaled_tokens();
+  let internal = internal_namespace().unwrap();
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&pending_namespace().unwrap(), &pending_key(JOURNAL_PURPOSE))
+      .await
+      .unwrap()
+      .is_none()
+  );
+  assert!(
+    snapshot
+      .get(
+        &internal,
+        &reference_edge_key(&transaction, &pending_token).unwrap()
+      )
+      .await
+      .unwrap()
+      .is_none()
+  );
+  assert_eq!(
+    snapshot
+      .get(&internal, &reference_head_key(&transaction).unwrap())
+      .await
+      .unwrap()
+      .unwrap()
+      .as_bytes(),
+    2_u64.to_be_bytes().as_slice()
+  );
+  drop(snapshot);
+  let unrelated = prepare_plain_put(&store, 487, 11).await;
+  assert!(matches!(
+    store.commit(unrelated).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
 }
 
 /// Concurrent same-purpose journal flows serialize through the writer

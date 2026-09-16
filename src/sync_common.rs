@@ -6,6 +6,7 @@
 use std::{pin::Pin, sync::Arc};
 
 use futures_core::Stream;
+use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{
   Error, NodeId, ProtocolTag, Result, TraceId,
@@ -53,6 +54,89 @@ pub(crate) fn chunk_payload(encoded: &[u8]) -> impl Iterator<Item = Arc<[u8]>> +
   encoded
     .chunks(crate::packet::MAX_CHUNK_BYTES)
     .map(Arc::from)
+}
+
+/// The kinded sync payload envelope: `[schema, kind, payload]`.
+#[derive(Encode, Decode)]
+#[cbor(array)]
+struct KindedSyncEnvelopeWire {
+  #[n(0)]
+  schema: String,
+  #[n(1)]
+  kind: u8,
+  #[n(2)]
+  payload: ByteVec,
+}
+
+/// The plain sync payload envelope: `[schema, payload]`.
+#[derive(Encode, Decode)]
+#[cbor(array)]
+struct PlainSyncEnvelopeWire {
+  #[n(0)]
+  schema: String,
+  #[n(1)]
+  payload: ByteVec,
+}
+
+/// Encodes one sync payload under the lane's schema into the canonical
+/// control-body envelope. `Some(kind)` wraps the payload in the kinded
+/// three-field envelope, `None` in the plain two-field envelope; both
+/// byte shapes are frozen wire invariants pinned by golden vectors and
+/// must never change.
+pub(crate) fn encode_sync_envelope(
+  schema: &str, kind: Option<u8>, payload: ByteVec,
+) -> Result<Vec<u8>> {
+  match kind {
+    Some(kind) => crate::protocol::encode_canonical(
+      &KindedSyncEnvelopeWire {
+        schema: schema.to_owned(),
+        kind,
+        payload,
+      },
+      crate::protocol::CONTROL_CBOR_LIMITS,
+    ),
+    None => crate::protocol::encode_canonical(
+      &PlainSyncEnvelopeWire {
+        schema: schema.to_owned(),
+        payload,
+      },
+      crate::protocol::CONTROL_CBOR_LIMITS,
+    ),
+  }
+}
+
+/// Decodes one kinded sync payload envelope into the lane kind and the
+/// wrapped payload bytes, rejecting a foreign schema and any
+/// non-canonical encoding (fail closed) under the lane's error contexts.
+pub(crate) fn decode_kinded_sync_envelope(
+  bytes: &[u8], schema: &str, canonical_context: &'static str, schema_context: &'static str,
+) -> Result<(u8, ByteVec)> {
+  let wire: KindedSyncEnvelopeWire = crate::protocol::decode_canonical_strict(
+    bytes,
+    crate::protocol::CONTROL_CBOR_LIMITS,
+    canonical_context,
+  )?;
+  if wire.schema != schema {
+    return Err(Error::invalid_input(schema_context));
+  }
+  Ok((wire.kind, wire.payload))
+}
+
+/// Decodes one plain sync payload envelope into the wrapped payload
+/// bytes, rejecting a foreign schema and any non-canonical encoding
+/// (fail closed) under the lane's error contexts.
+pub(crate) fn decode_plain_sync_envelope(
+  bytes: &[u8], schema: &str, canonical_context: &'static str, schema_context: &'static str,
+) -> Result<ByteVec> {
+  let wire: PlainSyncEnvelopeWire = crate::protocol::decode_canonical_strict(
+    bytes,
+    crate::protocol::CONTROL_CBOR_LIMITS,
+    canonical_context,
+  )?;
+  if wire.schema != schema {
+    return Err(Error::invalid_input(schema_context));
+  }
+  Ok(wire.payload)
 }
 
 /// The alive-peer set of one node, in stable order.
@@ -141,7 +225,7 @@ pub(crate) fn send_pumped_payload(
   // The pump runs as its own task: the acknowledgement channel resolves
   // at admission and the task itself completes after the record body
   // flushed to the session.
-  let pump = tokio::spawn(crate::session::stream::run_outbound(
+  let pump = tokio::spawn(crate::routing::outbound::run_outbound(
     context.entry,
     context.local.clone(),
     request,
@@ -174,8 +258,70 @@ pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_
 
 #[cfg(test)]
 mod tests {
-  use super::{PageRound, PeerPageCursor, chunk_payload, delivered_within_bound};
+  use minicbor::bytes::ByteVec;
+
+  use super::{
+    PageRound, PeerPageCursor, chunk_payload, decode_kinded_sync_envelope,
+    decode_plain_sync_envelope, delivered_within_bound, encode_sync_envelope,
+  };
   use crate::packet::MAX_CHUNK_BYTES;
+
+  const TEST_SCHEMA: &str = "radiata.woooo.tech/schemas/test-sync-payload-v1";
+
+  /// The kinded envelope round-trips and rejects the plain shape, a
+  /// foreign schema, and non-canonical re-encodings at the strict decode.
+  #[test]
+  fn kinded_envelope_round_trips_and_fails_closed() {
+    let encoded =
+      encode_sync_envelope(TEST_SCHEMA, Some(7), ByteVec::from(vec![0xDE, 0xAD])).unwrap();
+    let (kind, payload) =
+      decode_kinded_sync_envelope(&encoded, TEST_SCHEMA, "canonical", "schema").unwrap();
+    assert_eq!(kind, 7);
+    assert_eq!(&payload[..], &[0xDE, 0xAD]);
+
+    // The plain decoder must not accept the kinded shape and vice versa:
+    // the two envelope byte shapes stay disjoint.
+    assert!(decode_plain_sync_envelope(&encoded, TEST_SCHEMA, "canonical", "schema").is_err());
+    let plain = encode_sync_envelope(TEST_SCHEMA, None, ByteVec::from(vec![1])).unwrap();
+    assert!(decode_kinded_sync_envelope(&plain, TEST_SCHEMA, "canonical", "schema").is_err());
+    assert!(
+      decode_kinded_sync_envelope(
+        &encoded,
+        "radiata.woooo.tech/schemas/other-v1",
+        "canonical",
+        "schema"
+      )
+      .is_err()
+    );
+  }
+
+  /// The plain envelope round-trips and carries the payload unchanged.
+  #[test]
+  fn plain_envelope_round_trips() {
+    let encoded = encode_sync_envelope(TEST_SCHEMA, None, ByteVec::from(vec![4, 2])).unwrap();
+    let payload = decode_plain_sync_envelope(&encoded, TEST_SCHEMA, "canonical", "schema").unwrap();
+    assert_eq!(&payload[..], &[4, 2]);
+  }
+
+  /// The two envelope byte shapes are frozen wire invariants: the exact
+  /// canonical encodings are pinned here so a field or shape change is a
+  /// visible compatibility amendment, never an accident.
+  #[test]
+  fn envelope_wire_shapes_are_frozen() {
+    let kinded =
+      encode_sync_envelope(TEST_SCHEMA, Some(7), ByteVec::from(vec![0xDE, 0xAD])).unwrap();
+    let plain = encode_sync_envelope(TEST_SCHEMA, None, ByteVec::from(vec![4, 2])).unwrap();
+    let kinded_hex: String = kinded.iter().map(|byte| format!("{byte:02x}")).collect();
+    let plain_hex: String = plain.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+      kinded_hex,
+      "83782f726164696174612e776f6f6f6f2e746563682f736368656d61732f746573742d73796e632d7061796c6f61642d76310742dead"
+    );
+    assert_eq!(
+      plain_hex,
+      "82782f726164696174612e776f6f6f6f2e746563682f736368656d61732f746573742d73796e632d7061796c6f61642d7631420402"
+    );
+  }
 
   /// The bounded delivery verdict: a resolved admission is true, and a
   /// dropped admission channel (dead session) resolves false without

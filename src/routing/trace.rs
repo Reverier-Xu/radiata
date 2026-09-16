@@ -16,9 +16,9 @@
 //! - a process restart terminates previously active records explicitly
 //!   (`Failed(StreamInterrupted)`); no reopen path continues a body.
 //!
-//! Record accessors are unit-verified in this module's tests; some stay
-//! intentionally dead in non-test builds, where only tests consume them.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Record accessors that only the unit tests and the compatibility
+//! golden-vector reader consume are `#[cfg(test)]`; the production
+//! surface stays exactly the record writer, decoder, and sweeps.
 
 use std::time::{Duration, SystemTime};
 
@@ -180,18 +180,25 @@ impl TraceRecord {
     self
   }
 
+  /// Test-only identity probes: production code reads these fields
+  /// through the canonical encoder and the retention scans, never through
+  /// accessors.
+  #[cfg(test)]
   pub(crate) fn trace_id(&self) -> &TraceId {
     &self.trace_id
   }
 
+  #[cfg(test)]
   pub(crate) fn source(&self) -> &NodeId {
     &self.source
   }
 
+  #[cfg(test)]
   pub(crate) fn destination(&self) -> &NodeId {
     &self.destination
   }
 
+  #[cfg(test)]
   pub(crate) fn phase(&self) -> &TracePhase {
     &self.phase
   }
@@ -200,9 +207,13 @@ impl TraceRecord {
   pub(crate) fn with_transition(mut self, transition: TraceTransition, at: SystemTime) -> Self {
     self.updated_at = at;
     self.phase = match transition {
-      TraceTransition::Streaming => TracePhase::Streaming,
       TraceTransition::Delivered => TracePhase::Delivered,
       TraceTransition::Failed(kind) => TracePhase::Failed(kind),
+      // The in-flight transition is a persisted phase only: production
+      // records route progress in memory and terminals durably, so the
+      // constructor value exists for the frozen golden-vector fixtures.
+      #[cfg(test)]
+      TraceTransition::Streaming => TracePhase::Streaming,
     };
     self
   }
@@ -217,6 +228,9 @@ impl TraceRecord {
 /// One persisted route transition beyond the initial routing record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TraceTransition {
+  /// Test-only constructor value: the in-flight phase is a persisted
+  /// wire shape (the golden vectors pin it), never a production write.
+  #[cfg(test)]
   Streaming,
   Delivered,
   Failed(ErrorKind),
@@ -342,8 +356,20 @@ pub(crate) async fn terminate_stale(
   let mut scan = snapshot.scan(&space, &[]).await?;
   let mut stale: Vec<(crate::StoreKey, crate::Digest, TraceRecord)> = Vec::new();
   while let Some(entry) = scan.next().await? {
-    let Ok(record) = decode_trace_record(entry.value().as_bytes()) else {
-      continue;
+    let record = match decode_trace_record(entry.value().as_bytes()) {
+      Ok(record) => record,
+      // A stored row that no longer decodes must not fail the restart
+      // sweep: skip it with evidence — the recovery plane's scan policy
+      // — instead of leaving the record in flight forever.
+      Err(error) => {
+        tracing::warn!(
+          namespace = %space.as_str(),
+          key = %String::from_utf8_lossy(entry.key().as_bytes()),
+          kind = ?error.kind(),
+          "trace restart sweep skipped an undecodable record",
+        );
+        continue;
+      }
     };
     if record.phase.is_terminal() {
       continue;
@@ -386,8 +412,20 @@ pub(crate) async fn sweep(
   let mut expired: Vec<(crate::StoreKey, crate::Digest, SystemTime)> = Vec::new();
   let mut fresh_terminals: Vec<(crate::StoreKey, crate::Digest, SystemTime)> = Vec::new();
   while let Some(entry) = scan.next().await? {
-    let Ok(record) = decode_trace_record(entry.value().as_bytes()) else {
-      continue;
+    let record = match decode_trace_record(entry.value().as_bytes()) {
+      Ok(record) => record,
+      // A stored row that no longer decodes must not fail the retention
+      // sweep: skip it with evidence — the recovery plane's scan policy
+      // — and keep removing the records that did decode.
+      Err(error) => {
+        tracing::warn!(
+          namespace = %space.as_str(),
+          key = %String::from_utf8_lossy(entry.key().as_bytes()),
+          kind = ?error.kind(),
+          "trace retention sweep skipped an undecodable record",
+        );
+        continue;
+      }
     };
     if !record.phase.is_terminal() {
       // Active streams never enter the removal sets at all.
@@ -743,6 +781,86 @@ mod tests {
     let reopened = all_records(&reopened_store).await;
     assert_eq!(reopened.len(), 2);
     assert!(reopened.iter().all(|record| record.phase().is_terminal()));
+  }
+
+  /// A stored record that no longer decodes is skipped with a logged
+  /// evidence trail instead of failing the sweeps: the corrupt row is
+  /// left untouched while the decodable records still terminate and
+  /// expire (the recovery plane's best-effort scan policy).
+  #[tokio::test]
+  async fn a_corrupt_row_does_not_stall_the_trace_sweeps() {
+    use crate::{
+      StoreKey,
+      identity::testing::inject_entry,
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn StorageFactory> = reference.clone();
+    let store = MetadataStore::open(&factory, Duration::from_secs(10))
+      .await
+      .unwrap();
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
+    let space = crate::StoreNamespace::new(crate::QualifiedTag::parse(TRACE_NAMESPACE).unwrap());
+
+    // One non-terminal record (the restart sweep terminates it) and one
+    // terminal record (the retention sweep expires it).
+    put_trace(
+      &store,
+      &SystemEntropy,
+      clock.as_ref(),
+      TraceRecord::new(trace(1), node(1), node(2), clock.now()),
+    )
+    .await
+    .unwrap();
+    put_trace(
+      &store,
+      &SystemEntropy,
+      clock.as_ref(),
+      TraceRecord::new(trace(2), node(1), node(3), clock.now())
+        .with_transition(super::TraceTransition::Delivered, clock.now()),
+    )
+    .await
+    .unwrap();
+    // One corrupt row no longer decodes.
+    let corrupt_key = StoreKey::new(Arc::from(b"zzz-corrupt-row".to_vec()));
+    inject_entry(
+      &reference,
+      (space.clone(), corrupt_key.clone()),
+      vec![0xFF, 0x00],
+    );
+
+    clock.set(UNIX_EPOCH + Duration::from_secs(2_000));
+    let terminated = terminate_stale(&store, &SystemEntropy, clock.as_ref())
+      .await
+      .unwrap();
+    assert_eq!(terminated, 1, "the decodable stale record terminated");
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      clock.as_ref(),
+      128,
+      Duration::from_secs(100),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 1, "the decodable expired terminal was removed");
+
+    // The corrupt row survives both sweeps untouched.
+    let snapshot = store.snapshot().await.unwrap();
+    let corrupt = snapshot.get(&space, &corrupt_key).await.unwrap();
+    assert!(
+      corrupt.is_some(),
+      "the corrupt row is skipped, never mutated"
+    );
+    // Exactly the terminated record and the corrupt row remain.
+    let mut remaining = 0_usize;
+    let mut scan = snapshot.scan(&space, &[]).await.unwrap();
+    while let Some(entry) = scan.next().await.unwrap() {
+      let _ = entry;
+      remaining += 1;
+    }
+    assert_eq!(remaining, 2);
   }
 
   // ---- Caller-selected capacity and wall-clock retention ----

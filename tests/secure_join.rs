@@ -554,7 +554,8 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
   };
 
   // No session to any node: routing to an unknown exact node fails before
-  // any delivery work.
+  // any delivery work — the default route policy finds no live peer to
+  // relay through, and the dispatch reports the typed route failure.
   let unknown = radiata::NodeId::parse("node-999999999999999999999").unwrap();
   let packet = receiver
     .handle

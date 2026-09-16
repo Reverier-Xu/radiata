@@ -342,11 +342,10 @@ fn assert_view_old_or_new(
 
 mod killed_restart_json {
   use super::*;
+  use crate::storage::json::{FIRST_COMMITTED_POINT, LAST_POINT};
 
   const CRASH_DIR_ENV: &str = "RADIATA_MIXED_JSON_CRASH_DIR";
   const CRASH_POINT_ENV: &str = "RADIATA_MIXED_JSON_CRASH_POINT";
-  const FIRST_COMMITTED_POINT: u8 = 8;
-  const LAST_POINT: u8 = 13;
 
   #[ignore = "mixed-storage crash-matrix child process entry point"]
   #[tokio::test]
@@ -401,11 +400,10 @@ mod killed_restart_json {
 #[cfg(feature = "redb")]
 mod killed_restart_redb {
   use super::*;
+  use crate::storage::redb::{FIRST_COMMITTED_POINT, LAST_POINT};
 
   const CRASH_DIR_ENV: &str = "RADIATA_MIXED_REDB_CRASH_DIR";
   const CRASH_POINT_ENV: &str = "RADIATA_MIXED_REDB_CRASH_POINT";
-  const FIRST_COMMITTED_POINT: u8 = 6;
-  const LAST_POINT: u8 = 6;
 
   #[ignore = "mixed-storage crash-matrix child process entry point"]
   #[test]

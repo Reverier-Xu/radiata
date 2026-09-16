@@ -16,18 +16,14 @@ use crate::NodeId;
 /// The caller-configured recovery policy (wired from `NodeConfig`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryPolicy {
-  pub(crate) neighbors: usize,
   pub(crate) fan_out: usize,
   pub(crate) initial_backoff: u64,
   pub(crate) maximum_backoff: u64,
 }
 
 impl RecoveryPolicy {
-  pub(crate) const fn new(
-    neighbors: usize, fan_out: usize, initial_backoff: u64, maximum_backoff: u64,
-  ) -> Self {
+  pub(crate) const fn new(fan_out: usize, initial_backoff: u64, maximum_backoff: u64) -> Self {
     Self {
-      neighbors,
       fan_out,
       initial_backoff,
       maximum_backoff,
@@ -139,8 +135,8 @@ impl RecoveryController {
     }
   }
 
-  /// Computes the next recovery step: a bounded set of targets expanded
-  /// only through the configured fan-out from the neighbors, plus the
+  /// Computes the next recovery step: a bounded set of targets within the
+  /// configured fan-out, plus the
   /// wall-clock backoff (re-read every wake; rollback/freeze delays,
   /// forward jump makes it due).
   pub(crate) fn next_step(&mut self, now: u64, candidates: &BTreeSet<NodeId>) -> RecoveryStep {
@@ -216,7 +212,7 @@ mod tests {
   }
 
   fn policy() -> RecoveryPolicy {
-    RecoveryPolicy::new(4, 64, 1, 5 * 60)
+    RecoveryPolicy::new(64, 1, 5 * 60)
   }
 
   /// Recovery activates only on full isolation (no authenticated path
@@ -295,7 +291,7 @@ mod tests {
   /// Each cycle expands only through the configured bounded fan-out.
   #[test]
   fn recovery_expands_through_bounded_fan_out() {
-    let mut controller = RecoveryController::new(RecoveryPolicy::new(4, 2, 1, 60));
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(2, 1, 60));
     let online = set(&[1, 2, 3, 4]);
     controller.observe(&online, &set(&[]));
     let step = controller.next_step(0, &set(&[2, 3, 4, 5, 6]));
@@ -318,7 +314,7 @@ mod tests {
 
 /// Seeded recovery simulation: drives the recovery controller over
 /// a deterministic membership/connectivity scenario and replays the exact
-/// decisions for a seed, matching the configured neighbor/fan-out and
+/// decisions for a seed, matching the configured fan-out and
 /// wall-clock backoff.
 #[cfg(test)]
 pub(crate) mod simulation {
@@ -345,7 +341,7 @@ pub(crate) mod simulation {
   /// seed selects the deterministic order of the *unreachable* members
   /// only; reachable members are never dialed.
   pub(crate) fn run_seed(seed: u64, scenario: &RecoveryScenario) -> Vec<RecoveryDecision> {
-    let mut controller = RecoveryController::new(RecoveryPolicy::new(4, 64, 1, 60));
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(64, 1, 60));
     let mut trace = Vec::new();
     for (now, reachable) in &scenario.steps {
       let reachable: BTreeSet<NodeId> = reachable
@@ -455,7 +451,7 @@ mod scale_tests {
   #[test]
   fn recovery_controller_scales_to_1024_nodes() {
     let online: BTreeSet<NodeId> = (0..1_024).map(node_at).collect();
-    let mut controller = RecoveryController::new(RecoveryPolicy::new(4, 16, 1, 60));
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(16, 1, 60));
     // Full isolation at cluster scale: every member is a retry candidate.
     controller.observe(&online, &set(&[]));
     assert_eq!(controller.state(), RecoveryState::Recovering);

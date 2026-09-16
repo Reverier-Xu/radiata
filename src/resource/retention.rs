@@ -97,7 +97,22 @@ pub(crate) async fn sweep_removed_ctx(
   let mut oldest: std::collections::BinaryHeap<RemovalCandidate> =
     std::collections::BinaryHeap::new();
   while let Some(entry) = scan.next().await? {
-    let record = super::ResourceRecordV1::decode(entry.value().as_bytes())?;
+    let record = match super::ResourceRecordV1::decode(entry.value().as_bytes()) {
+      Ok(record) => record,
+      // A stored row that no longer decodes must not fail the sweep:
+      // that would permanently stall retention for the whole namespace.
+      // Skip the row with evidence — the recovery plane's scan policy —
+      // and keep evicting the records that did decode.
+      Err(error) => {
+        tracing::warn!(
+          namespace = %namespace.as_str(),
+          key = %String::from_utf8_lossy(entry.key().as_bytes()),
+          kind = ?error.kind(),
+          "resource retention sweep skipped an undecodable record",
+        );
+        continue;
+      }
+    };
     if !record.removed() {
       // Live metadata is never evicted by retention.
       continue;
@@ -369,6 +384,61 @@ mod tests {
           .is_some()
       );
     }
+  }
+
+  /// A stored record that no longer decodes must not fail the sweep:
+  /// the corrupt row is skipped with a logged evidence trail, never
+  /// mutated, and the eligible removals still leave.
+  #[tokio::test]
+  async fn a_corrupt_row_does_not_stall_the_removal_sweep() {
+    use crate::{
+      StoreKey,
+      identity::testing::inject_entry,
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn StorageFactory> = reference.clone();
+    let store = MetadataStore::open(&factory, Duration::from_secs(10))
+      .await
+      .unwrap();
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(9_500)));
+    let stale_removal = record(&name(1), 8_000, true, "file:///gone");
+    let fresh_removal = record(&name(2), 9_600_000, true, "file:///recent");
+    install(&store, &stale_removal).await;
+    install(&store, &fresh_removal).await;
+    let namespace = crate::resource::store::namespace().unwrap();
+    let corrupt_key = StoreKey::new(Arc::from(b"zzz-corrupt-row".to_vec()));
+    inject_entry(
+      &reference,
+      (namespace.clone(), corrupt_key.clone()),
+      vec![0x00],
+    );
+
+    let removed = sweep_removed_ctx(&store, clock.as_ref(), Duration::from_secs(1_000), 128)
+      .await
+      .unwrap();
+    assert_eq!(removed, 1, "only the decodable expired removal left");
+    assert!(
+      crate::resource::store::read_record_ctx(&store, &name(1))
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      crate::resource::store::read_record_ctx(&store, &name(2))
+        .await
+        .unwrap()
+        .is_some()
+    );
+    // The corrupt row survives untouched: it can neither decode nor
+    // delete, and the next pass skips it again.
+    let snapshot = store.snapshot().await.unwrap();
+    let corrupt = snapshot.get(&namespace, &corrupt_key).await.unwrap();
+    assert!(
+      corrupt.is_some(),
+      "the corrupt row is skipped, never mutated"
+    );
   }
 
   /// A stale delete expectation fails closed as a typed

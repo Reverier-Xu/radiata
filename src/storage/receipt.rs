@@ -835,6 +835,51 @@ async fn build_self_reference_operations(
   Ok(operations)
 }
 
+/// Builds the pending-record delete for one resolved frozen journal,
+/// paired — in the same shape as the pending cleanup pairs them — with
+/// the removal of the record's reference token from the live target
+/// receipt, so a receipt touched by a declared-uncommitted transaction
+/// can anchor and be forgotten again instead of staying permanently
+/// referenced. A forgotten target receipt carries no reachable reference
+/// set, so the record delete alone applies.
+pub(super) async fn build_pending_record_delete_operations(
+  snapshot: &dyn StoreSnapshot, operation_id: &TransactionId, target: &ReceiptIdentity,
+  token: &ReceiptReferenceToken, record_namespace: StoreNamespace, record_key: StoreKey,
+  record_expected: Digest,
+) -> crate::Result<Vec<StoreOperation>> {
+  let mut operations = Vec::new();
+  operations
+    .try_reserve_exact(1)
+    .map_err(|_| Error::resource_exhausted("pending cleanup transaction"))?;
+  operations.push(StoreOperation::Delete {
+    namespace: record_namespace,
+    key: record_key,
+    expected: record_expected,
+  });
+  let namespace = internal_namespace()?;
+  if matches!(
+    verify_live_marker(snapshot, &namespace, target.transaction()).await?,
+    LiveMarker::Active(_)
+  ) {
+    let groups = group_receipt_changes(
+      operation_id,
+      vec![ReceiptReferenceChange::Remove {
+        target: target.clone(),
+        tokens: vec![token.clone()],
+      }],
+    )?;
+    for group in &groups {
+      let built =
+        build_receipt_change_operations(snapshot, &namespace, operation_id, group).await?;
+      operations
+        .try_reserve_exact(built.len())
+        .map_err(|_| Error::resource_exhausted("pending cleanup transaction"))?;
+      operations.extend(built);
+    }
+  }
+  Ok(operations)
+}
+
 /// One read of the receipt-reference bookkeeping for a target receipt:
 /// the head and eligibility-anchor keys with their current values, plus
 /// the audited live reference count. Every reference mutation and
@@ -1128,5 +1173,27 @@ pub(super) fn decode_wall_time(encoded: &[u8]) -> crate::Result<SystemTime> {
     _ => Err(super::storage_corrupt(
       ProviderErrorContext::StorageSnapshot,
     )),
+  }
+}
+
+/// Test-only anchoring seam for runtime-level tests: the automated
+/// retention tick test drives the real sweep against a receipt anchored
+/// through the owning cleanup state machine, never a synthetic row.
+#[cfg(test)]
+pub(crate) mod retention_testing {
+  use super::{MetadataStore, ReceiptCleanupOutcome, ReceiptIdentity};
+  use crate::{CommitReceipt, Result, api::Entropy};
+
+  /// Anchors one committed receipt through the owning cleanup state
+  /// machine. Returns `false` when the receipt did not grow an anchor —
+  /// after a retention pass forgot it, the forgotten marker wins and the
+  /// state machine conflicts instead.
+  pub(crate) async fn anchor_receipt(
+    store: &MetadataStore, entropy: &dyn Entropy, receipt: &CommitReceipt,
+  ) -> Result<bool> {
+    let identity = ReceiptIdentity::from_receipt(receipt);
+    let operation_id = crate::TransactionId::generate(entropy)?;
+    let outcome = store.cleanup_receipt(&identity, operation_id).await?;
+    Ok(matches!(outcome, ReceiptCleanupOutcome::Anchored(_)))
   }
 }

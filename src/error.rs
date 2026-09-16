@@ -28,6 +28,9 @@ pub enum ErrorKind {
   PermissionDenied,
   Io,
   CommitUnknown,
+  /// Cancellation reported by a provider's own host runtime (see
+  /// [`ProviderErrorKind::Cancelled`]); core code does not originate it
+  /// today.
   Cancelled,
   ShuttingDown,
   /// A caller-originated failure from an extension callback
@@ -59,6 +62,10 @@ pub enum ProviderErrorKind {
   StorageCorrupt,
   PermissionDenied,
   Io,
+  /// Deliberately kept as provider vocabulary: a provider's own host
+  /// runtime can cancel an in-flight operation, and core never
+  /// originates this category itself — the provider-side analog of the
+  /// caller-only [`ErrorKind::CallerError`].
   Cancelled,
   Internal,
 }

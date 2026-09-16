@@ -245,6 +245,16 @@ impl CommandControl for crate::LeaveCluster {
   }
 }
 
+impl CommandControl for crate::ResolveFrozenJournal {
+  fn control(self, reply: oneshot::Sender<Result<()>>) -> Control {
+    let acknowledgement = *self.acknowledgement();
+    Control::ResolveFrozenJournal {
+      acknowledgement,
+      reply,
+    }
+  }
+}
+
 // Queries.
 
 impl QueryControl for GetObservability {

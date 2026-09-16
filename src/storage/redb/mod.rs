@@ -10,7 +10,7 @@ mod store;
 
 pub(crate) use store::RedbStoreFactory;
 #[cfg(test)]
-pub(crate) use store::select_crash_point;
+pub(crate) use store::{FIRST_COMMITTED_POINT, LAST_POINT, select_crash_point};
 
 #[cfg(test)]
 mod crash;

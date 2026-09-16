@@ -39,10 +39,11 @@ const CHILD_ENTROPY_SEED: u8 = 7;
 /// commit lane seed so install and delete in one store never reuse an id.
 const DELETE_ENTROPY_SEED: u8 = 9;
 
-/// Crash points inside the JSON adapter's commit path; the exact
-/// committed-from boundary is discovered monotonically rather than
-/// hardcoded, so adapter changes cannot desynchronize this lane.
-const LAST_POINT: u8 = 13;
+// The JSON adapter's commit-path boundary count, imported beside the
+// `crash_hook` table it mirrors; the exact committed-from boundary is
+// discovered monotonically rather than hardcoded, so adapter changes
+// cannot desynchronize this lane.
+use crate::storage::json::LAST_POINT;
 
 fn requirements() -> StoreRequirements {
   crate::storage::test_util::crash_requirements()

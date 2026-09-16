@@ -339,8 +339,6 @@ impl ShutdownOutcome {
 pub enum ConnectivityStatus {
   /// No observation yet.
   Unknown,
-  /// Known but no session and not a neighbor candidate.
-  Offline,
   /// Has candidate endpoints but no authenticated session.
   Reachable,
   /// Has an authenticated session.
@@ -628,6 +626,29 @@ pub struct ReplaceIdentityAndDeleteOldCoreMetadata {
 impl ReplaceIdentityAndDeleteOldCoreMetadata {
   /// Constructs the acknowledgement; there is deliberately no `Default`
   /// so the acknowledgement cannot be produced accidentally.
+  #[allow(clippy::new_without_default)]
+  pub fn new() -> Self {
+    Self { acknowledged: true }
+  }
+
+  pub(crate) const fn is_acknowledged(&self) -> bool {
+    self.acknowledged
+  }
+}
+
+/// The explicit declaration required by [`crate::ResolveFrozenJournal`]:
+/// constructing it is the operator's deliberate assertion that the
+/// interrupted journaled transaction behind the node's frozen metadata
+/// store did not durably commit. It has no `Default`, so the
+/// declaration cannot be produced accidentally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeclareInterruptedTransactionUncommitted {
+  acknowledged: bool,
+}
+
+impl DeclareInterruptedTransactionUncommitted {
+  /// Constructs the declaration; there is deliberately no `Default`
+  /// so the declaration cannot be produced accidentally.
   #[allow(clippy::new_without_default)]
   pub fn new() -> Self {
     Self { acknowledged: true }

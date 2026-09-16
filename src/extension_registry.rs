@@ -366,4 +366,21 @@ mod tests {
       !registry.has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/gamma").unwrap())
     );
   }
+
+  /// The built-in next-hop policy's well-known tag is an ordinary
+  /// registry tag: a caller may claim it (the builder only auto-registers
+  /// when absent), but a duplicate registration for it stays a conflict —
+  /// the same insertion-once rule the built-in transport tag follows.
+  #[test]
+  fn next_hop_registry_rejects_duplicate_builtin_tag_registrations() {
+    let mut registry = ExtensionRegistry::new();
+    let tag = crate::routing::DefaultNextHop::tag().unwrap();
+    registry
+      .register_next_hop(tag.clone(), Arc::new(crate::routing::DefaultNextHop))
+      .unwrap();
+    let error = registry
+      .register_next_hop(tag, Arc::new(crate::routing::DefaultNextHop))
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+  }
 }

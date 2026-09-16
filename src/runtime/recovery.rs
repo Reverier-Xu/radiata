@@ -50,20 +50,18 @@ const RECOVERY_PRUNE_COOLDOWN_TICKS: u32 = 4;
 
 impl Supervisor {
   /// Resolves one live downstream session for a routed first hop through
-  /// the node's configured next-hop policy. `Ok(None)` means no policy or
-  /// no eligible hop exists and the caller fails the route explicitly.
+  /// the node's effective next-hop policy (the caller selection, or the
+  /// built-in default policy). `Ok(None)` means no eligible hop exists and
+  /// the caller fails the route explicitly.
   pub(super) async fn select_forward_entry(
     &self, destination: &NodeId,
   ) -> Result<Option<SessionEntry>> {
-    let Some(tag) = self.dependencies.config.route_policy() else {
-      debug!(destination = %destination, "no route policy configured; forward unavailable");
-      return Ok(None);
-    };
+    let tag = self.dependencies.config.route_policy()?;
     let local = self.packet.local().clone();
     let peers = crate::sync_common::alive_peers(&self.dependencies.sessions)?;
     let hop = match crate::routing::resolve_next_hop(
       &self.dependencies.extensions,
-      tag,
+      &tag,
       destination,
       &local,
       &peers,
@@ -330,7 +328,8 @@ impl Supervisor {
     for (member, endpoint) in candidates {
       if step.targets.contains(&member) {
         // Recovery dials run in a detached task so the supervisor select
-        // loop never blocks on a handshake (each can take the full
+        // loop never blocks on a handshake (each holds its in-flight
+        // slot no longer than the configured dial deadline plus the
         // authentication deadline); the result is reconciled by the next
         // observation tick.
         self
@@ -344,9 +343,18 @@ impl Supervisor {
         let shutdown = self.shutdown_tx.subscribe();
         let pending = std::sync::Arc::clone(&self.recovery_pending);
         let transport = Arc::clone(&self.dependencies.transport);
+        let dial_deadline = self.dependencies.config.dial_deadline();
         tokio::spawn(async move {
           if let Err(error) = dial_member(
-            transport, driver, sessions, packet, shutdown, receiver, &peer, true,
+            transport,
+            driver,
+            sessions,
+            packet,
+            shutdown,
+            receiver,
+            &peer,
+            true,
+            dial_deadline,
           )
           .await
           {

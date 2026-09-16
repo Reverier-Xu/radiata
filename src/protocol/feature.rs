@@ -33,12 +33,11 @@
 use std::collections::BTreeMap;
 
 use minicbor::Encode;
-use sha2::{Digest as ShaDigest, Sha256};
 
 use super::{
   ADR0002_BODY_BYTES, CborLimits, FeatureTag, ProtocolTag, QualifiedTag, encode_canonical,
 };
-use crate::{Digest, Error, Result};
+use crate::{Digest, Error, Result, identity::signature::body_digest};
 
 const BUILTIN_DOMAIN: &str = super::tag::BUILTIN_DOMAIN;
 const BUILTIN_TEST_OWNER: &str = "VERIFY-G03-01";
@@ -191,7 +190,7 @@ impl FeatureDefinition {
   /// Computes SHA-256 over the deterministic-CBOR canonical definition.
   pub(crate) fn definition_digest(&self) -> Result<Digest> {
     let bytes = encode_canonical(&self.wire(), DEFINITION_LIMITS)?;
-    Ok(Digest::from_bytes(Sha256::digest(bytes).into()))
+    Ok(body_digest(&bytes))
   }
 
   fn wire(&self) -> DefinitionWire {
@@ -588,7 +587,7 @@ fn builtin_fingerprint(tag: &FeatureTag) -> Digest {
   let mut seed = String::with_capacity(FINGERPRINT_SEED_PREFIX.len() + tag.as_str().len());
   seed.push_str(FINGERPRINT_SEED_PREFIX);
   seed.push_str(tag.as_str());
-  Digest::from_bytes(Sha256::digest(seed.as_bytes()).into())
+  body_digest(seed.as_bytes())
 }
 
 #[cfg(test)]

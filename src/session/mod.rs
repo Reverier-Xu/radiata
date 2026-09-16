@@ -5,6 +5,9 @@
 //! Nothing here crosses the crate boundary.
 
 mod driver;
+mod inbound;
+mod liveness;
+mod queue;
 pub(crate) mod stream;
 
 pub(crate) use driver::{EstablishedSession, SessionDriver};

@@ -599,6 +599,12 @@ async fn prior_initiator_interops_with_current_responder() {
     );
     tokio::time::sleep(POLL).await;
   }
+  // Retirement: the pair-scoped selection disappears with the session
+  // and never authorizes dispatch by itself (no node-wide claim). The
+  // built-in default route policy still reaches the member through the
+  // issuer's live bystander session — explicit relay, never a
+  // resurrection of the retired pair session, which stays gone from the
+  // session page while the packet arrives.
   let protocol = ProtocolTag::parse(ECHO_PROTOCOL).unwrap();
   let policy = StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
   let packet = issuer
@@ -610,24 +616,29 @@ async fn prior_initiator_interops_with_current_responder() {
       StreamMetadata::new(),
     )
     .unwrap();
-  let error = packet.send_sync(echo_body(&[])).await.unwrap_err();
+  let ack = packet.send_sync(echo_body(&[])).await.unwrap();
+  assert_eq!(ack.destination(), &member_id);
+  let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+  loop {
+    let delivered = member.collector.packets.lock().unwrap().len() > collected_before_retirement;
+    if delivered {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the relayed dispatch never reached the member"
+    );
+    tokio::time::sleep(POLL).await;
+  }
+  // The relayed arrival never rebuilt the retired pair session.
+  let page = issuer
+    .handle
+    .query(PageSessions::new(PageSpec::first(8).unwrap()))
+    .await
+    .unwrap();
   assert!(
-    matches!(
-      error.kind(),
-      ErrorKind::RouteUnavailable
-        | ErrorKind::Unsupported
-        | ErrorKind::StreamInterrupted
-        | ErrorKind::Overloaded
-    ),
-    "dispatch without a session must fail closed: {error:?}"
-  );
-  // No stray delivery raced the failed dispatch: the retired session's
-  // collector state is frozen at its pre-retirement count.
-  tokio::time::sleep(Duration::from_millis(200)).await;
-  assert_eq!(
-    member.collector.packets.lock().unwrap().len(),
-    collected_before_retirement,
-    "dispatch without a session must never deliver"
+    page.items().iter().all(|s| s.peer() != &member_id),
+    "a relayed dispatch must never resurrect the retired pair session"
   );
 
   member
