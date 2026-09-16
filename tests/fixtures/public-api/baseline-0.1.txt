@@ -573,7 +573,7 @@ pub struct radiata::PageCursor(_)
 impl radiata::PageCursor
 pub fn radiata::PageCursor::as_bytes(&self) -> &[u8]
 pub fn radiata::PageCursor::from_provider_bytes(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
-pub fn radiata::PageCursor::new(alloc::sync::Arc<[u8]>) -> Self
+pub fn radiata::PageCursor::new(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
 pub struct radiata::PageListeners
 impl radiata::PageListeners
 pub fn radiata::PageListeners::new(radiata::PageSpec) -> Self

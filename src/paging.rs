@@ -8,6 +8,8 @@
 //! storage scans, one `partition_point` for in-memory tables), so a
 //! page costs O(page) reads instead of replaying the namespace head.
 
+use std::sync::Arc;
+
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{Error, Result};
@@ -121,6 +123,36 @@ pub(crate) fn decode_page(
 pub(crate) struct Paged<T> {
   pub(crate) items: Vec<T>,
   pub(crate) next: Option<Vec<u8>>,
+}
+
+/// The public continuation cursor carried by every paged view (members,
+/// resources, sessions, listeners, topology, trust, candidate reads):
+/// a page resumes strictly after the cursor's opaque bytes. Both
+/// constructors enforce one emptiness rule — a page without a
+/// continuation is `Option::None` (`PageSpec::first`), never an empty
+/// cursor, so an assembly mistake cannot pose as a first page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageCursor(Arc<[u8]>);
+
+impl PageCursor {
+  /// Wraps one non-empty continuation key.
+  pub fn new(value: Arc<[u8]>) -> Result<Self> {
+    if value.is_empty() {
+      return Err(Error::invalid_input("page cursor"));
+    }
+    Ok(Self(value))
+  }
+
+  /// Builds a cursor from provider bytes under the same emptiness rule
+  /// as [`Self::new`].
+  pub fn from_provider_bytes(value: Arc<[u8]>) -> Result<Self> {
+    Self::new(value)
+  }
+
+  /// The opaque cursor bytes.
+  pub fn as_bytes(&self) -> &[u8] {
+    &self.0
+  }
 }
 
 /// Collects up to `limit` items past `cursor` from one positioned
@@ -302,6 +334,22 @@ mod tests {
 
   fn bytes(paged: &Paged<Vec<u8>>) -> &[u8] {
     paged.items.first().map(Vec::as_slice).unwrap_or(&[])
+  }
+
+  /// Both cursor constructors enforce the same emptiness rule: a
+  /// continuation is either real bytes or `Option::None`, never the
+  /// empty byte string.
+  #[test]
+  fn cursor_constructors_agree_on_the_emptiness_rule() {
+    let value: Arc<[u8]> = Arc::from(b"tail-key".to_vec());
+    let built = super::PageCursor::new(Arc::clone(&value)).unwrap();
+    let provided = super::PageCursor::from_provider_bytes(Arc::clone(&value)).unwrap();
+    assert_eq!(built, provided);
+    assert_eq!(built.as_bytes(), b"tail-key");
+
+    let empty: Arc<[u8]> = Arc::from(Vec::new());
+    assert!(super::PageCursor::new(Arc::clone(&empty)).is_err());
+    assert!(super::PageCursor::from_provider_bytes(empty).is_err());
   }
 
   /// The end-of-stream rule: a page that ends exactly at the store's last

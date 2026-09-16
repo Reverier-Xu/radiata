@@ -70,7 +70,10 @@ pub(crate) async fn select_page_ctx(
     },
   )
   .await?;
-  let next = paged.next.map(|key| crate::PageCursor::new(Arc::from(key)));
+  let next = paged
+    .next
+    .map(|key| crate::PageCursor::new(Arc::from(key)))
+    .transpose()?;
   Ok(crate::ResourcePage::new(paged.items, next))
 }
 
