@@ -213,9 +213,10 @@ pub(crate) fn page_keys<T>(
   Paged { items, next: None }
 }
 
-/// The bound for public paged views (members, topology, trust): one
-/// named constant so the facade's page clamps cannot drift apart.
-pub(crate) const MAX_VIEW_PAGE_ITEMS: usize = 64;
+/// The bound for public paged views (members, topology, trust) is the
+/// shared page maximum: one value, so the facade's page clamps and the
+/// wire receiver's over-capacity rejection cannot drift apart.
+pub(crate) use self::PAGE_MAX_ITEMS as MAX_VIEW_PAGE_ITEMS;
 
 /// Emits one wire-deliverable page through the size ladder (single
 /// source for the membership and resource lanes): emit at the candidate
