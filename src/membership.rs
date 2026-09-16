@@ -239,6 +239,18 @@ pub(crate) fn member_status(cleaned: bool, left: bool) -> crate::MemberStatus {
   }
 }
 
+/// The single session-table → connectivity rule for member views: an
+/// authenticated session is `Connected`, and every other observed
+/// member is at least `Reachable`. The exact lookup and the paged
+/// population read both flow through here so the decision cannot drift.
+pub(crate) fn member_connectivity(connected: bool) -> crate::ConnectivityStatus {
+  if connected {
+    crate::ConnectivityStatus::Connected
+  } else {
+    crate::ConnectivityStatus::Reachable
+  }
+}
+
 /// The single descriptor → public member view mapper: annotates the
 /// owner-revision descriptor with the session-table connectivity decision.
 /// Every public member view (exact lookup, paged population read, and
@@ -527,6 +539,21 @@ mod tests {
         .with_status(crate::MemberStatus::Cleaned)
         .status(),
       crate::MemberStatus::Cleaned
+    );
+  }
+
+  /// The connectivity rule has exactly two outcomes: a session is
+  /// `Connected`, no session is still `Reachable` (never an unknown or
+  /// offline downgrade for an observed member).
+  #[test]
+  fn member_connectivity_has_two_outcomes() {
+    assert_eq!(
+      super::member_connectivity(true),
+      crate::ConnectivityStatus::Connected
+    );
+    assert_eq!(
+      super::member_connectivity(false),
+      crate::ConnectivityStatus::Reachable
     );
   }
 

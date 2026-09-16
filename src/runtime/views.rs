@@ -45,11 +45,7 @@ impl Supervisor {
       crate::identity::cleanup::is_cleaned_ctx(store, &node).await?,
       crate::identity::leave::is_left_ctx(store, &node).await?,
     );
-    let connectivity = if connected {
-      crate::ConnectivityStatus::Connected
-    } else {
-      crate::ConnectivityStatus::Reachable
-    };
+    let connectivity = crate::membership::member_connectivity(connected);
     Ok(Some(
       crate::membership::member_view(&descriptor, connectivity)?.with_status(status),
     ))
@@ -89,11 +85,8 @@ impl Supervisor {
       |_key, bytes| {
         let descriptor = crate::membership::page::decode_descriptor(bytes)?;
         let status = departed.status(descriptor.node());
-        let connectivity = if connected.contains(descriptor.node()) {
-          crate::ConnectivityStatus::Connected
-        } else {
-          crate::ConnectivityStatus::Reachable
-        };
+        let connectivity =
+          crate::membership::member_connectivity(connected.contains(descriptor.node()));
         crate::membership::member_view(&descriptor, connectivity)
           .map(|view| Some(view.with_status(status)))
       },
