@@ -196,9 +196,28 @@
 //! cannot answer right now": the runtime fails the operation closed
 //! and the caller retries; they never mean "the key is gone".
 //!
-//! The examples ship `FileKeyProvider` (a reference implementation
-//! with the three-state lifecycle) under `examples/*/src/keys.rs`;
-//! the skeleton below shows the shape every implementation fills in:
+//! Start from the built-in adapters — most integrations never
+//! implement the trait.
+//! [`adapters::file_key_store`](crate::adapters::file_key_store) is the
+//! zero-effort durable default: one directory holds one key file per
+//! operation id plus one intent marker per in-flight operation, with
+//! fsynced writes, mode-0600 seeds from creation on unix, and
+//! evidence-based reconciliation after crashes.
+//! [`adapters::ephemeral_key_store`](crate::adapters::ephemeral_key_store)
+//! holds keys in memory for tests and deliberately ephemeral nodes —
+//! identity bindings built on it do **not** survive a restart.
+//!
+//! ```no_run
+//! # let data_dir = std::path::PathBuf::from("/data");
+//! // Durable custody in one call — the directory is created lazily.
+//! let keys = radiata::adapters::file_key_store(data_dir.join("keys"));
+//! # let _ = keys;
+//! ```
+//!
+//! A real keystore (HSM, cloud KMS, OS keychain) remains the extension
+//! path: implement the trait over your keystore's operations, keeping
+//! the same idempotency per operation id. The skeleton below shows the
+//! shape every implementation fills in:
 //!
 //! ```no_run
 //! # use radiata::extension::KeyProvider;
@@ -256,7 +275,8 @@
 //! Pass the provider to
 //! [`NodeBuilder::new`](crate::NodeBuilder::new) together with the
 //! storage factory; the same provider must back every restart of the
-//! node, or the persisted identity can no longer sign.
+//! node, or the persisted identity can no longer sign. For
+//! `file_key_store` that means the same directory, durably mounted.
 //!
 //! # Storage
 //!

@@ -7,7 +7,6 @@
 
 mod http;
 mod http_client;
-mod keys;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -90,7 +89,7 @@ async fn main() {
   let config = load_config();
 
   let storage = radiata::adapters::redb_store(config.data.join("store.redb"));
-  let keys = keys::FileKeyProvider::new(&config.data).expect("key directory");
+  let keys = radiata::adapters::file_key_store(config.data.join("keys"));
 
   // The self-probe consumer must be registered before the node starts:
   // ExtensionRegistry is frozen at build time by design.
@@ -123,7 +122,7 @@ async fn main() {
     )
     .expect("register route policy");
 
-  let node = NodeBuilder::new(storage, Arc::new(keys))
+  let node = NodeBuilder::new(storage, Arc::clone(&keys))
     .config(
       radiata::NodeConfig::new()
         .with_session_liveness(

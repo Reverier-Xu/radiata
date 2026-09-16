@@ -902,9 +902,7 @@ name = "radiata-chat-node"
 version = "0.1.0"
 dependencies = [
  "axum",
- "ed25519-dalek",
  "futures-util",
- "getrandom 0.4.3",
  "radiata",
  "serde",
  "serde_json",
