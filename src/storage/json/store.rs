@@ -319,45 +319,23 @@ impl JsonStorage {
       .state
       .lock()
       .map_err(|_| Error::internal("json storage state"))?;
-    if let Some(receipt) = state.receipts.get(transaction.id()) {
-      return if receipt.operation_digest() == transaction.operation_digest() {
-        Ok(CommitOutcome::Committed(receipt.clone()))
-      } else {
-        Ok(CommitOutcome::Conflict)
-      };
-    }
-    // The operation digest is transaction identity, fixed at prepare
-    // over private immutable fields; recomputing it here is a
-    // development tripwire, never a release-time gate.
-    debug_assert_eq!(
-      transaction.operation_digest(),
-      &transaction.computed_operation_digest()
-    );
-    if transaction.base_revision().as_bytes() != state.generation.to_be_bytes() {
-      return Ok(CommitOutcome::Conflict);
-    }
-    for operation in transaction.operations() {
-      if !crate::provider::condition_matches(
-        |namespace: &StoreNamespace, key: &StoreKey| {
-          Ok(
-            state
-              .entries
-              .get(&(namespace.clone(), key.clone()))
-              .map(|value| value.digest().clone()),
-          )
-        },
-        |transaction: &TransactionId| {
-          Ok(
-            state
-              .receipts
-              .get(transaction)
-              .map(|receipt| receipt.operation_digest().clone()),
-          )
-        },
-        operation,
-      )? {
-        return Ok(CommitOutcome::Conflict);
-      }
+    if let Some(outcome) = crate::provider::commit_precheck(
+      &transaction,
+      |id: &TransactionId| Ok(state.receipts.get(id).cloned()),
+      || {
+        StoreRevision::new(Arc::from(state.generation.to_be_bytes()))
+          .map_err(|_| Error::internal("json revision"))
+      },
+      |namespace: &StoreNamespace, key: &StoreKey| {
+        Ok(
+          state
+            .entries
+            .get(&(namespace.clone(), key.clone()))
+            .map(|value| value.digest().clone()),
+        )
+      },
+    )? {
+      return Ok(outcome);
     }
     let next_generation = state
       .generation
@@ -934,12 +912,8 @@ impl Storage for JsonStorage {
       .state
       .lock()
       .map_err(|_| Error::internal("json storage state"))
-      .map(|state| match state.receipts.get(transaction) {
-        Some(receipt) if receipt.operation_digest() == digest => {
-          crate::ReconcileOutcome::Committed(receipt.clone())
-        }
-        Some(_) => crate::ReconcileOutcome::DigestConflict,
-        None => crate::ReconcileOutcome::Aborted,
+      .map(|state| {
+        crate::provider::classify_receipt(state.receipts.get(transaction).cloned(), digest)
       });
     Box::pin(async move { outcome })
   }

@@ -939,6 +939,74 @@ fn expectation_matches(digest: Option<Digest>, expected: &StoreExpectation) -> b
   }
 }
 
+/// Evaluates the commit precheck in the one pinned order documented on
+/// [`Storage`]: receipt replay first (a stored receipt with the same
+/// operation digest is the idempotent [`CommitOutcome::Committed`] replay,
+/// a different digest is [`CommitOutcome::Conflict`]), then the
+/// base-revision check, then every conditional expectation through
+/// [`condition_matches`]. `None` means the caller may apply the change;
+/// `Some` is the decided outcome. The lookups are per-site closures so
+/// every storage adapter and the reference oracle keep their exact read
+/// order and error contexts: `receipt` resolves one transaction id to its
+/// stored receipt (the replay source and, derived from it, the
+/// `ForgetReceipt` digest expectation), `current_revision` resolves the
+/// current store revision, and `entry` resolves one record to its content
+/// digest.
+#[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
+pub(crate) fn commit_precheck(
+  transaction: &StoreTransaction,
+  mut receipt: impl FnMut(&TransactionId) -> Result<Option<CommitReceipt>>,
+  current_revision: impl FnOnce() -> Result<StoreRevision>,
+  mut entry: impl FnMut(&StoreNamespace, &StoreKey) -> Result<Option<Digest>>,
+) -> Result<Option<CommitOutcome>> {
+  if let Some(existing) = receipt(transaction.id())? {
+    return Ok(Some(
+      if existing.operation_digest() == transaction.operation_digest() {
+        CommitOutcome::Committed(existing)
+      } else {
+        CommitOutcome::Conflict
+      },
+    ));
+  }
+  // Development tripwire: the digest is fixed at prepare over private
+  // immutable fields; recomputing it here is never a release-time gate.
+  debug_assert_eq!(
+    transaction.operation_digest(),
+    &transaction.computed_operation_digest()
+  );
+  if transaction.base_revision() != &current_revision()? {
+    return Ok(Some(CommitOutcome::Conflict));
+  }
+  for operation in transaction.operations() {
+    let receipt_digest = |forgotten: &TransactionId| {
+      receipt(forgotten).map(|stored| stored.map(|receipt| receipt.operation_digest().clone()))
+    };
+    if !condition_matches(&mut entry, receipt_digest, operation)? {
+      return Ok(Some(CommitOutcome::Conflict));
+    }
+  }
+  Ok(None)
+}
+
+/// Classifies one stored-receipt lookup into the three-way
+/// [`ReconcileOutcome`], the single reconcile verdict shared by every
+/// storage adapter and the reference oracle: a receipt carrying the exact
+/// digest is [`ReconcileOutcome::Committed`], the same transaction id
+/// under a different digest is [`ReconcileOutcome::DigestConflict`], and
+/// no receipt is [`ReconcileOutcome::Aborted`]. The lookup itself stays at
+/// each call site so every adapter keeps its exact read order and error
+/// contexts.
+#[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
+pub(crate) fn classify_receipt(
+  receipt: Option<CommitReceipt>, digest: &Digest,
+) -> ReconcileOutcome {
+  match receipt {
+    Some(receipt) if receipt.operation_digest() == digest => ReconcileOutcome::Committed(receipt),
+    Some(_) => ReconcileOutcome::DigestConflict,
+    None => ReconcileOutcome::Aborted,
+  }
+}
+
 fn digest_store_operations(base_revision: &StoreRevision, operations: &[StoreOperation]) -> Digest {
   let mut hasher = Sha256::new();
   hasher.update(STORE_TRANSACTION_DOMAIN);

@@ -156,13 +156,8 @@ impl Storage for ReferenceStorage {
     &'a self, transaction: &'a TransactionId, digest: &'a Digest,
   ) -> BoxFuture<'a, Result<ReconcileOutcome>> {
     let state = self.state.lock().unwrap();
-    let outcome = match state.receipts.get(transaction) {
-      Some(receipt) if receipt.operation_digest() == digest => {
-        ReconcileOutcome::Committed(receipt.clone())
-      }
-      Some(_) => ReconcileOutcome::DigestConflict,
-      None => ReconcileOutcome::Aborted,
-    };
+    let outcome =
+      crate::provider::classify_receipt(state.receipts.get(transaction).cloned(), digest);
     Box::pin(async move { Ok(outcome) })
   }
 
@@ -302,44 +297,20 @@ fn reference_commit(
   state: &Mutex<ReferenceState>, transaction: StoreTransaction,
 ) -> Result<CommitOutcome> {
   let mut state = state.lock().unwrap();
-  if let Some(receipt) = state.receipts.get(transaction.id()) {
-    return if receipt.operation_digest() == transaction.operation_digest() {
-      Ok(CommitOutcome::Committed(receipt.clone()))
-    } else {
-      Ok(CommitOutcome::Conflict)
-    };
-  }
-  // Development tripwire: the digest is fixed at prepare over private
-  // immutable fields (see the json adapter's note).
-  debug_assert_eq!(
-    transaction.operation_digest(),
-    &transaction.computed_operation_digest()
-  );
-  if transaction.base_revision() != &reference_revision(state.generation) {
-    return Ok(CommitOutcome::Conflict);
-  }
-  for operation in transaction.operations() {
-    if !crate::provider::condition_matches(
-      |namespace: &StoreNamespace, key: &StoreKey| {
-        Ok(
-          state
-            .entries
-            .get(&(namespace.clone(), key.clone()))
-            .map(|value| value.digest().clone()),
-        )
-      },
-      |transaction: &TransactionId| {
-        Ok(
-          state
-            .receipts
-            .get(transaction)
-            .map(|receipt| receipt.operation_digest().clone()),
-        )
-      },
-      operation,
-    )? {
-      return Ok(CommitOutcome::Conflict);
-    }
+  if let Some(outcome) = crate::provider::commit_precheck(
+    &transaction,
+    |id: &TransactionId| Ok(state.receipts.get(id).cloned()),
+    || Ok(reference_revision(state.generation)),
+    |namespace: &StoreNamespace, key: &StoreKey| {
+      Ok(
+        state
+          .entries
+          .get(&(namespace.clone(), key.clone()))
+          .map(|value| value.digest().clone()),
+      )
+    },
+  )? {
+    return Ok(outcome);
   }
 
   let next_generation = state.generation.checked_add(1).ok_or_else(|| {
