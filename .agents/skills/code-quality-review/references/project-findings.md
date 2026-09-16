@@ -28,10 +28,13 @@
 > Public API changes (baseline regenerated each commit): with_dial_deadline,
 > RecoveryConfig::new 4→3 args, file/ephemeral key stores, pub mod guide,
 > ResolveFrozenJournal + token, PageCursor::new -> Result, Offline removed,
-> transactional_migration SPI removed. Not done (owner-visible leftovers):
-> ProviderErrorKind::Cancelled kept (provider SPI vocabulary), LeaveCluster
-> post-journal no-abort semantics documented in rustdoc only via the
-> audit trail — add a guide paragraph when the guide grows.
+> transactional_migration SPI removed. Leftovers closed pre-merge
+> (2026-09-16): guide §6 now documents the `LeaveCluster` post-journal
+> no-abort contract; `ProviderErrorKind::Cancelled` stays as deliberate
+> provider vocabulary (core never originates it — the provider-side
+> analog of caller-only `CallerError`), pinned on both variants. The
+> 0.1.0 version bump was rolled back to 0.0.2 before the PR: the owner
+> cuts the real release after the outstanding non-code changes land.
 
 > **Full audit 2026-09-16 (main @ 17a8c20, seven lanes: 5 module partitions +
 > user-path + dependency/ecosystem; docs/ ignored by owner instruction — code

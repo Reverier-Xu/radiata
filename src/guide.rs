@@ -16,6 +16,8 @@
 //!    `PacketConsumer`](#4-receiving-packets-packetconsumer)
 //! 5. [Holding identity keys:
 //!    `KeyProvider`](#5-holding-identity-keys-keyprovider)
+//! 6. [Leaving the cluster:
+//!    `LeaveCluster`](#6-leaving-the-cluster-leavecluster)
 //!
 //! # 1. Resource versions across process boundaries
 //!
@@ -277,6 +279,40 @@
 //! storage factory; the same provider must back every restart of the
 //! node, or the persisted identity can no longer sign. For
 //! `file_key_store` that means the same directory, durably mounted.
+//!
+//! # 6. Leaving the cluster: `LeaveCluster`
+//!
+//! An active leave is three effects behind one command: the node's
+//! identity is replaced with a fresh node id and key, the old
+//! identity's local core metadata is deleted, and the node shuts down
+//! with the active-leave reason. Constructing the
+//! [`ReplaceIdentityAndDeleteOldCoreMetadata`](crate::ReplaceIdentityAndDeleteOldCoreMetadata)
+//! acknowledgement is the confirmation — it has no `Default`, so the
+//! replacement cannot be issued by accident.
+//!
+//! The leave is journaled before any network effect, and once the
+//! journal commits there is no abort: a crash or a restart mid-leave
+//! resumes from the durable record and completes the replacement, so
+//! the node never boots as the former identity again. Treat
+//! [`LeaveCluster`](crate::LeaveCluster) as the point of no return for
+//! that node slot: the returned
+//! [`LeaveOutcome`](crate::LeaveOutcome) names the exact former and
+//! replacement identities, and the same storage restarted afterwards
+//! boots the replacement.
+//!
+//! ```no_run
+//! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
+//! let outcome = node
+//!     .command(radiata::LeaveCluster::new(
+//!         radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new(),
+//!     ))
+//!     .await?;
+//! // Durable from here: the node shuts itself down with the
+//! // active-leave reason and restarts as the replacement identity.
+//! # let _ = (outcome.former_identity(), outcome.replacement_identity());
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Storage
 //!
