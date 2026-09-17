@@ -287,13 +287,15 @@ pub(crate) mod sync {
 
   /// Applies one received page over the running node's metadata store.
   /// Every record's writer signature is validated against the locally
-  /// trusted member descriptors **before** comparison; records with an
-  /// unknown writer get one bounded wait plus one end-of-page retry
-  /// before they are skipped fail-closed (the periodic watermark refresh
-  /// remains the final backstop for a writer whose descriptor never
-  /// lands). Installation goes through the conditional
-  /// register commit, so stale, duplicated, and losing permutations cannot
-  /// replace a greater stored winner.
+  /// trusted member descriptors **before** comparison. Writers the local
+  /// descriptor store does not know yet wait concurrently for one bounded
+  /// period (serializing those waits would pin this page's consumer —
+  /// and its inbound admission slot — for writers x the bound, which
+  /// gridlocked receivers at join fan-out), then get one end-of-page
+  /// retry before their records skip fail-closed (the periodic watermark
+  /// refresh remains the final backstop). Installation goes through the
+  /// conditional register commit, so stale, duplicated, and losing
+  /// permutations cannot replace a greater stored winner.
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
   ) -> Result<usize> {
@@ -319,6 +321,28 @@ pub(crate) mod sync {
       };
       resolved.insert(writer.clone(), key);
     }
+    // The not-yet-converged writers wait concurrently, not serially: a
+    // full page of fat unknown writers must not pin this page's consumer
+    // (and with it an inbound admission slot) for
+    // writers x WRITER_TRUST_WAIT. At join fan-out that serialized wait
+    // saturated receivers' admission tables, which then rejected the
+    // membership pages that would have resolved the very writers the
+    // waiters were polling — a self-sustaining gridlock where nothing
+    // converged. Concurrent waits bound one page's apply to roughly one
+    // wait period total.
+    let unknown: Vec<NodeId> = resolved
+      .iter()
+      .filter(|(_, key)| key.is_none())
+      .map(|(writer, _)| writer.clone())
+      .collect();
+    let waits = futures_util::future::join_all(unknown.into_iter().map(|writer| async move {
+      let key = writer_key(store, &writer).await;
+      (writer, key)
+    }))
+    .await;
+    for (writer, key) in waits {
+      resolved.insert(writer, key.ok());
+    }
     let mut applied = 0;
     // Records whose writer's descriptor was unknown even after the
     // bounded wait. They get one retry pass after the main loop.
@@ -327,22 +351,13 @@ pub(crate) mod sync {
       let writer_key = match resolved.get(record.writer()) {
         Some(Some(key)) => key.clone(),
         Some(None) => {
-          // Unknown writer: the bounded wait runs once per writer (the
-          // result is cached above for the rest of the page). Without
-          // the writer's trusted key no signature check is possible, so
-          // nothing is compared or stored yet — but the skip is not
-          // final: the retry pass below re-resolves after all waits
-          // have run.
-          match writer_key(store, record.writer()).await {
-            Ok(key) => {
-              resolved.insert(record.writer().clone(), Some(key.clone()));
-              key
-            }
-            Err(_) => {
-              stranded.push(record);
-              continue;
-            }
-          }
+          // Unknown writer past the bounded wait: without the writer's
+          // trusted key no signature check is possible, so nothing is
+          // compared or stored yet — but the skip is not final: the
+          // retry pass below re-resolves once more before the record is
+          // given up for this page.
+          stranded.push(record);
+          continue;
         }
         None => continue,
       };
@@ -667,12 +682,13 @@ mod tests {
   }
 
   /// Regression: a record whose writer's descriptor lands while this very
-  /// page is still applying must not be stranded. Writer A's descriptor
-  /// arrives after A's bounded wait failed but before the page's
-  /// end-of-apply retry pass runs — the retry applies A's record. The old
-  /// code skipped it finally, and the sender's delivery watermark was
-  /// already committed, so the record waited for the periodic
-  /// whole-catalog refresh (many detection cadences at join scale).
+  /// page is still applying must not be stranded. The page's unknown
+  /// writers wait concurrently (bounded); writer A's descriptor arrives
+  /// mid-wait and resolves through the poll, while writer B never lands
+  /// and runs through the end-of-apply retry pass before the fail-closed
+  /// skip. The old serial-per-writer wait pinned a page's consumer for
+  /// writers x the wait bound, which at join fan-out saturated inbound
+  /// admission tables and gridlocked the mesh.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_descriptor_landing_mid_apply_is_retried_before_the_page_ends() {
     use std::time::Duration;
@@ -687,14 +703,13 @@ mod tests {
       None,
     )
     .unwrap();
-    // Neither writer is trusted up front. Each record's bounded wait
-    // serializes (~2s per writer): writer A's wait fails first, and the
-    // descriptor lands while writer B's wait is still running — before
-    // the retry pass.
+    // Neither writer is trusted up front. Both bounded waits run
+    // concurrently; writer A's descriptor lands mid-wait, writer B's
+    // never lands.
     let installer = Arc::clone(&store);
     let landed_writer = writer();
     tokio::spawn(async move {
-      tokio::time::sleep(Duration::from_secs(3)).await;
+      tokio::time::sleep(Duration::from_secs(1)).await;
       trust(&installer, &landed_writer, SEED).await;
     });
 
@@ -703,7 +718,7 @@ mod tests {
       .unwrap();
     assert_eq!(
       applied, 1,
-      "the mid-apply descriptor's record applies on the retry pass"
+      "the mid-wait descriptor's record applies; the never-landed one skips"
     );
     let got = read_current(&store, &name(1)).await;
     assert!(got.is_some(), "writer A's record is installed");
