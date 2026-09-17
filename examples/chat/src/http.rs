@@ -187,36 +187,46 @@ async fn list_kind(
 ) -> Result<Vec<(Value, radiata::ResourceVersion)>, (StatusCode, Json<Value>)> {
   let selector =
     Selector::parse(&format!("radiata.woooo.tech/resources/type={kind}")).map_err(name_error)?;
-  let page = state
-    .node
-    .query(SelectResources::new(
-      selector,
-      PageSpec::first(64).map_err(name_error)?,
-    ))
-    .await
-    .map_err(internal)?;
+  // Page through the whole selection: a single first page caps the
+  // listing at one page's worth of entries, which silently truncated
+  // every roster at the page bound (the star-128 "never converges"
+  // measurement artifact).
   let mut out = Vec::new();
-  for view in page.items() {
-    let custom: serde_json::Map<String, Value> = view
-      .labels()
-      .custom_labels()
-      .entries()
-      .map(|(key, value)| (key.as_str().to_owned(), json!(value.as_str())))
-      .collect();
-    let version = view.version();
-    let timestamp = version
-      .timestamp()
-      .duration_since(std::time::UNIX_EPOCH)
-      .map(|age| age.as_millis() as u64)
-      .unwrap_or(0);
-    out.push((
-      json!({
-        "name": view.name().as_str(),
-        "labels": custom,
-        "timestamp_millis": timestamp,
-      }),
-      version.clone(),
-    ));
+  let mut next = Some(PageSpec::first(64).map_err(name_error)?);
+  while let Some(spec) = next {
+    let page = state
+      .node
+      .query(SelectResources::new(selector.clone(), spec))
+      .await
+      .map_err(internal)?;
+    for view in page.items() {
+      let custom: serde_json::Map<String, Value> = view
+        .labels()
+        .custom_labels()
+        .entries()
+        .map(|(key, value)| (key.as_str().to_owned(), json!(value.as_str())))
+        .collect();
+      let version = view.version();
+      let timestamp = version
+        .timestamp()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or(0);
+      out.push((
+        json!({
+          "name": view.name().as_str(),
+          "labels": custom,
+          "timestamp_millis": timestamp,
+        }),
+        version.clone(),
+      ));
+    }
+    next = page
+      .next()
+      .cloned()
+      .map(|cursor| PageSpec::after(cursor, 64))
+      .transpose()
+      .map_err(name_error)?;
   }
   out.sort_by_key(|(view, _)| view["timestamp_millis"].as_u64().unwrap_or(0));
   Ok(out)
