@@ -381,6 +381,40 @@ mod tests {
     assert_eq!(state.page_round(7), PageRound::Quiet);
   }
 
+  /// A catalog change is observed on the very next idle round: the
+  /// page-round fingerprint covers the whole sender catalog, not the
+  /// emitted page range. The old page-range fingerprint was blind to a
+  /// tail-appended member (the common join case — keys sort after the
+  /// existing prefix), which silenced the peer for a full resend cadence
+  /// per propagation hop and made multi-hop convergence grow
+  /// super-linearly.
+  #[test]
+  fn a_catalog_change_sends_on_the_next_idle_round() {
+    let mut state = PeerPageCursor::default();
+    assert_eq!(state.page_round(7), PageRound::Send);
+    state.record_send(Some(&[9, 9]));
+    // Mid-pass rounds always send, and record nothing: the recorded
+    // fingerprint stays 7 while the catalog changes to 8 mid-pass.
+    assert_eq!(state.page_round(8), PageRound::Send);
+    state.record_send(None);
+    assert_eq!(
+      state.page_round(8),
+      PageRound::Send,
+      "a mid-pass catalog change is due on the next idle round"
+    );
+    state.record_send(None);
+    assert_eq!(state.page_round(8), PageRound::Quiet);
+    // A tail append (a different catalog fingerprint) is due immediately —
+    // no resend-cadence wait.
+    assert_eq!(
+      state.page_round(9),
+      PageRound::Send,
+      "a catalog change must not wait out the resend cadence"
+    );
+    state.record_send(None);
+    assert_eq!(state.page_round(9), PageRound::Quiet);
+  }
+
   /// A payload above the 32 KiB chunk bound splits into pump-legal
   /// chunks whose concatenation is exactly the payload: a fat page
   /// delivers instead of terminating the pump as oversize.
@@ -418,8 +452,13 @@ mod tests {
 /// cadence change would silently fork the anti-entropy behavior.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PeerPageCursor {
-  /// Fingerprint of the last page sent to this peer, so an unchanged
-  /// catalog costs no delivery at all.
+  /// Fingerprint of the sender's whole catalog at this peer's last idle
+  /// round, so an unchanged catalog costs no delivery at all. The value
+  /// is lane-computed (the membership lane folds the descriptor
+  /// namespace once per tick) and independent of the emitted page
+  /// range, so a change anywhere in the catalog — including a
+  /// tail-appended entry beyond the first page — is observed on the
+  /// very next idle round.
   page_fingerprint: u64,
   /// Ticks since this peer's last page send: a lost delivery must be
   /// retried on a slow cadence even when nothing changed.
@@ -473,12 +512,15 @@ impl PeerPageCursor {
     }
   }
 
-  /// The round's page-plane decision against the next page range's
-  /// fingerprint. The fingerprint is recorded on starting rounds only: a
-  /// continuation round hashes a tail range of the catalog, and
-  /// recording that range would make the next from-scratch range never
-  /// match — a catalog larger than one page would then resend in full
-  /// every tick and never go quiet.
+  /// The round's page-plane decision against the lane's whole-catalog
+  /// fingerprint. The fingerprint covers the entire catalog, not the
+  /// emitted page range: a page-range fingerprint is blind to changes
+  /// behind the first page (a tail-appended member is exactly the
+  /// common join case), which used to silence the peer for a full
+  /// resend cadence per propagation hop. Recording on every idle round
+  /// is now valid because the value no longer depends on the emitted
+  /// range; a continuation round still skips the comparison entirely —
+  /// an in-flight pass always sends.
   pub(crate) fn page_round(&mut self, fingerprint: u64) -> PageRound {
     if self.page.is_some() {
       return PageRound::Send;

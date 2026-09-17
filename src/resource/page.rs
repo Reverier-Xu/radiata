@@ -92,9 +92,11 @@ pub(crate) mod sync {
   /// The descriptor re-poll interval inside the bounded wait.
   const WRITER_TRUST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-  /// Emits one bounded page of resource records starting after `cursor`,
-  /// filtered through the peer's delivered-version watermark table: an
-  /// entry whose stored digest matches the peer's watermark is unchanged
+  /// Emits one bounded page of resource records starting after `cursor`
+  /// from an existing store snapshot (the sync tick's shared per-tick
+  /// snapshot: one snapshot, not one per peer), filtered through the
+  /// peer's delivered-version watermark table: an entry whose stored
+  /// digest matches the peer's watermark is unchanged
   /// for that peer and is skipped, so a page carries only records the
   /// peer has never seen. The cursor is the last scanned name's text
   /// (changed or skipped), so paging continues across ticks without
@@ -109,14 +111,14 @@ pub(crate) mod sync {
   /// its continuation cursor (the size-ladder note in
   /// `crate::paging::encode_page`).
   pub(crate) async fn emit_page_filtered_ctx(
-    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize, scan_budget: usize,
-    watermarks: &std::collections::BTreeMap<Vec<u8>, Digest>,
+    snapshot: &(dyn crate::provider::StoreSnapshot + '_), cursor: Option<&[u8]>, limit: usize,
+    scan_budget: usize, watermarks: &std::collections::BTreeMap<Vec<u8>, Digest>,
   ) -> Result<FilteredEmission> {
     crate::paging::emit_with_size_ladder(
       limit.clamp(1, MAX_PAGE_RECORDS),
       "resource page",
       |changed_limit| {
-        emit_filtered_at_capacity(store, cursor, changed_limit, scan_budget, watermarks)
+        emit_filtered_at_capacity(snapshot, cursor, changed_limit, scan_budget, watermarks)
       },
       |emission: &FilteredEmission| match &emission.page {
         Some(page) => wire_payload_fits(page),
@@ -147,11 +149,11 @@ pub(crate) mod sync {
   /// first quiet window: the pass would "close" at entry 256 of 4096
   /// and never reach the tail.
   async fn emit_filtered_at_capacity(
-    store: &MetadataStore, cursor: Option<&[u8]>, changed_limit: usize, scan_budget: usize,
+    snapshot: &(dyn crate::provider::StoreSnapshot + '_), cursor: Option<&[u8]>,
+    changed_limit: usize, scan_budget: usize,
     watermarks: &std::collections::BTreeMap<Vec<u8>, Digest>,
   ) -> Result<FilteredEmission> {
     let namespace = super::super::store::namespace()?;
-    let snapshot = store.snapshot().await?;
     let mut scan = snapshot.scan_from(&namespace, &[], cursor).await?;
     let mut changed: Vec<ResourceRecordV1> = Vec::new();
     let mut marks: Vec<(Vec<u8>, Digest)> = Vec::new();
@@ -273,7 +275,9 @@ pub(crate) mod sync {
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<ResourcePage> {
     let empty = std::collections::BTreeMap::new();
-    let emission = emit_page_filtered_ctx(store, cursor, limit, usize::MAX, &empty).await?;
+    let snapshot = store.snapshot().await?;
+    let emission =
+      emit_page_filtered_ctx(snapshot.as_ref(), cursor, limit, usize::MAX, &empty).await?;
     Ok(
       emission
         .page

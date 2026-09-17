@@ -79,34 +79,6 @@ impl MembershipPage {
     MembershipPage::new(descriptors, cursor)
   }
 
-  pub(crate) fn fingerprint(&self) -> u64 {
-    Self::fingerprint_of(
-      self.descriptors.len(),
-      self.cursor.as_deref().map_or(0, |value| value.len()),
-      &self.descriptors,
-    )
-  }
-
-  fn fingerprint_of(count: usize, cursor_len: usize, descriptors: &[NodeDescriptorV1]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    count.hash(&mut hasher);
-    cursor_len.hash(&mut hasher);
-    for descriptor in descriptors {
-      descriptor.node.hash(&mut hasher);
-      descriptor.revision.hash(&mut hasher);
-      descriptor.removed.hash(&mut hasher);
-      for endpoint in &descriptor.endpoints {
-        endpoint.as_str().hash(&mut hasher);
-      }
-      for (key, value) in descriptor.labels.entries() {
-        key.as_str().hash(&mut hasher);
-        value.as_str().hash(&mut hasher);
-      }
-    }
-    hasher.finish()
-  }
-
   /// True when the cursor does not advance (loop protection).
   #[cfg(test)]
   pub(crate) fn cursor_loops(&self, previous: Option<&[u8]>) -> bool {
@@ -121,11 +93,14 @@ impl MembershipPage {
 /// and applies received pages under strict validation.
 pub(crate) mod sync {
   use super::{MAX_PAGE_DESCRIPTORS, MembershipPage};
-  use crate::{NodeId, Result, api::Entropy, storage::MetadataStore};
+  use crate::{NodeId, Result, api::Entropy, provider::StoreSnapshot, storage::MetadataStore};
 
-  /// Emits one bounded page over the running node's metadata store. The
-  /// cursor is the last emitted node's text, so pages continue without
-  /// allocating the whole population.
+  /// Emits one bounded page of descriptors from an existing store
+  /// snapshot. The sync tick takes one snapshot per tick and reuses it
+  /// across every per-peer round: a hub advertising to a hundred peers
+  /// pays one snapshot, not a hundred. The cursor is the last emitted
+  /// node's text, so pages continue without allocating the whole
+  /// population.
   ///
   /// A page of fat descriptors can overflow the 64 KiB control-body
   /// bound, which failed the whole sync tick every tick and stalled the
@@ -135,16 +110,27 @@ pub(crate) mod sync {
   /// bound, so the ladder always terminates, and a halved page still
   /// carries its continuation cursor (the size-ladder note in
   /// `crate::paging::encode_page`).
-  pub(crate) async fn emit_page_ctx(
-    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
+  pub(crate) async fn emit_page_from_snapshot(
+    snapshot: &(dyn StoreSnapshot + '_), cursor: Option<&[u8]>, limit: usize,
   ) -> Result<MembershipPage> {
     crate::paging::emit_with_size_ladder(
       limit.clamp(1, MAX_PAGE_DESCRIPTORS),
       "membership page",
-      |limit| emit_at_capacity(store, cursor, limit),
+      |limit| emit_at_capacity(snapshot, cursor, limit),
       wire_payload_fits,
     )
     .await
+  }
+
+  /// Emits one bounded page over the running node's metadata store.
+  /// Convenience for tests and offline paths; the live tick uses
+  /// [`emit_page_from_snapshot`] with its per-tick shared snapshot.
+  #[cfg(any(test, fuzzing))]
+  pub(crate) async fn emit_page_ctx(
+    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
+  ) -> Result<MembershipPage> {
+    let snapshot = store.snapshot().await?;
+    emit_page_from_snapshot(snapshot.as_ref(), cursor, limit).await
   }
 
   /// True when the page's full wire payload (page envelope plus sync
@@ -157,37 +143,51 @@ pub(crate) mod sync {
 
   /// Emits one page at an exact candidate capacity (one ladder step).
   async fn emit_at_capacity(
-    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
+    snapshot: &(dyn StoreSnapshot + '_), cursor: Option<&[u8]>, limit: usize,
   ) -> Result<MembershipPage> {
     let namespace = crate::storage::families::namespace(super::super::NODE_DESCRIPTOR_NAMESPACE)?;
-    let snapshot = store.snapshot().await?;
-    let paged = crate::paging::scan_paged(
-      snapshot.as_ref(),
-      &namespace,
-      &[],
-      cursor,
-      limit,
-      |key, bytes| match super::decode_descriptor(bytes) {
-        // The sender only pages its own stored records; entries are trusted
-        // through the session that delivers them.
-        Ok(descriptor) => Ok(Some(descriptor)),
-        // A stored row that no longer decodes must not fail the whole
-        // page: that would permanently kill descriptor anti-entropy
-        // egress for every member. Skip the row with evidence — the
-        // recovery plane's scan policy — and keep advertising the rest.
-        Err(error) => {
-          tracing::debug!(
-            namespace = %namespace.as_str(),
-            key = %String::from_utf8_lossy(key),
-            kind = ?error.kind(),
-            "membership page skipped an undecodable descriptor row",
-          );
-          Ok(None)
+    let paged =
+      crate::paging::scan_paged(snapshot, &namespace, &[], cursor, limit, |key, bytes| {
+        match super::decode_descriptor(bytes) {
+          // The sender only pages its own stored records; entries are trusted
+          // through the session that delivers them.
+          Ok(descriptor) => Ok(Some(descriptor)),
+          // A stored row that no longer decodes must not fail the whole
+          // page: that would permanently kill descriptor anti-entropy
+          // egress for every member. Skip the row with evidence — the
+          // recovery plane's scan policy — and keep advertising the rest.
+          Err(error) => {
+            tracing::debug!(
+              namespace = %namespace.as_str(),
+              key = %String::from_utf8_lossy(key),
+              kind = ?error.kind(),
+              "membership page skipped an undecodable descriptor row",
+            );
+            Ok(None)
+          }
         }
-      },
-    )
-    .await?;
+      })
+      .await?;
     MembershipPage::new(paged.items, paged.next)
+  }
+
+  /// Folds the whole descriptor catalog's raw key and value bytes into
+  /// one fingerprint, computed once per tick from the tick's shared
+  /// snapshot and compared per peer by the page-round decision. Raw
+  /// bytes, not decoded records: the fold costs one ordered scan with no
+  /// per-entry allocation or canonical decode, and it observes every
+  /// change the page plane can deliver — a new, revised, removed, or
+  /// tail-appended descriptor all alter some bytes or the key set.
+  pub(crate) async fn catalog_fingerprint(snapshot: &(dyn StoreSnapshot + '_)) -> Result<u64> {
+    use std::hash::{Hash, Hasher};
+    let namespace = crate::storage::families::namespace(super::super::NODE_DESCRIPTOR_NAMESPACE)?;
+    let mut scan = snapshot.scan(&namespace, &[]).await?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    while let Some(entry) = scan.next().await? {
+      entry.key().as_bytes().hash(&mut hasher);
+      entry.value().as_bytes().hash(&mut hasher);
+    }
+    Ok(hasher.finish())
   }
 
   /// Applies one received page over the running node's metadata store:
@@ -414,6 +414,44 @@ mod tests {
     let page = sync::emit_page(&factory, page.cursor(), 2).await.unwrap();
     assert_eq!(page.descriptors().len(), 1);
     assert!(page.cursor().is_none());
+  }
+
+  /// The catalog fingerprint folds every descriptor's raw bytes, so a
+  /// tail-appended member — which never appears in the catalog's first
+  /// page — flips it, and an identical catalog reproduces it.
+  #[tokio::test]
+  async fn the_catalog_fingerprint_observes_a_tail_append() {
+    // The store locks its factory against concurrent opens, so every
+    // step opens, snapshots, and releases.
+    async fn fingerprint(factory: &Arc<dyn StorageFactory>) -> u64 {
+      let store = crate::storage::MetadataStore::open(factory, std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+      let snapshot = store.snapshot().await.unwrap();
+      sync::catalog_fingerprint(snapshot.as_ref()).await.unwrap()
+    }
+    let factory = factory();
+    let empty = fingerprint(&factory).await;
+    crate::membership::store::store_descriptor(&factory, &descriptor(1, 1, "one"))
+      .await
+      .unwrap();
+    let one = fingerprint(&factory).await;
+    assert_ne!(empty, one, "a first member changes the fingerprint");
+    assert_eq!(
+      one,
+      fingerprint(&factory).await,
+      "an unchanged catalog is stable"
+    );
+    // The tail append: a descriptor sorting strictly after the existing
+    // key prefix (the join case the page-range fingerprint was blind to).
+    crate::membership::store::store_descriptor(&factory, &descriptor(2, 1, "two"))
+      .await
+      .unwrap();
+    assert_ne!(
+      one,
+      fingerprint(&factory).await,
+      "a tail-appended member changes the fingerprint"
+    );
   }
 
   /// A stored descriptor row that no longer decodes is skipped with a

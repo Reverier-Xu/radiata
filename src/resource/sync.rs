@@ -257,13 +257,16 @@ pub(crate) async fn resource_sync_tick(
     return Ok(());
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
+  // One snapshot per tick, shared by every per-peer round: a hub
+  // catching up a hundred leaves pays one snapshot, not a hundred.
+  let catalog = store.snapshot().await?;
   let protocol = ProtocolTag::parse(RESOURCE_SYNC_PROTOCOL)?;
   let mut pending: Vec<(NodeId, ResourcePeerRound)> = Vec::new();
   let mut acks = Vec::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let mut round =
-      resource_sync_tick_peer(store, entropy, runtime, peer, state, &protocol).await?;
+      resource_sync_tick_peer(catalog.as_ref(), entropy, runtime, peer, state, &protocol).await?;
     if !round.dispatched {
       // A quiet round: nothing was due and the state already advanced.
       continue;
@@ -310,7 +313,7 @@ pub(crate) async fn resource_sync_tick(
 /// re-delivers the whole catalog so a payload lost mid-flight is bounded
 /// to one full-sync window.
 async fn resource_sync_tick_peer(
-  store: &crate::storage::MetadataStore, entropy: &Arc<dyn crate::api::Entropy>,
+  snapshot: &(dyn crate::provider::StoreSnapshot + '_), entropy: &Arc<dyn crate::api::Entropy>,
   runtime: &RuntimeClient, peer: &NodeId, state: &mut ResourcePeerState, protocol: &ProtocolTag,
 ) -> Result<ResourcePeerRound> {
   // Pass due: a walk in flight, or the detection cadence elapsed.
@@ -326,7 +329,7 @@ async fn resource_sync_tick_peer(
     });
   }
   let emission = page_sync::emit_page_filtered_ctx(
-    store,
+    snapshot,
     state.cursor.as_deref(),
     super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
     SCAN_BUDGET_PER_TICK,
@@ -517,10 +520,12 @@ mod tests {
     runtime: &RuntimeClient, peer: &NodeId, cursors: &mut ResourceSyncCursors,
     protocol: &ProtocolTag,
   ) {
+    let catalog = store.snapshot().await.unwrap();
     let state = cursors.peers.entry(peer.clone()).or_default();
-    let mut round = resource_sync_tick_peer(store, entropy, runtime, peer, state, protocol)
-      .await
-      .unwrap();
+    let mut round =
+      resource_sync_tick_peer(catalog.as_ref(), entropy, runtime, peer, state, protocol)
+        .await
+        .unwrap();
     if let Some(ack) = round.ack.take() {
       if delivered_within_bound(ack).await {
         round.commit_delivered(state);
@@ -712,11 +717,18 @@ mod tests {
     // Round 1: the scratch-start page dispatches, but the delivery
     // fails (the admission ack is dropped, like a peer that never
     // admits).
+    let catalog = store.snapshot().await.unwrap();
     let state = cursors.peers.entry(peer.clone()).or_default();
-    let mut round =
-      resource_sync_tick_peer(store.as_ref(), &entropy, &runtime, &peer, state, &protocol)
-        .await
-        .unwrap();
+    let mut round = resource_sync_tick_peer(
+      catalog.as_ref(),
+      &entropy,
+      &runtime,
+      &peer,
+      state,
+      &protocol,
+    )
+    .await
+    .unwrap();
     let ack = round
       .ack
       .take()
@@ -727,10 +739,16 @@ mod tests {
     // Round 2: the same page must dispatch again — the rewind forced
     // the pass due instead of waiting out the detection cadence.
     let state = cursors.peers.get_mut(&peer).unwrap();
-    let round =
-      resource_sync_tick_peer(store.as_ref(), &entropy, &runtime, &peer, state, &protocol)
-        .await
-        .unwrap();
+    let round = resource_sync_tick_peer(
+      catalog.as_ref(),
+      &entropy,
+      &runtime,
+      &peer,
+      state,
+      &protocol,
+    )
+    .await
+    .unwrap();
     assert!(
       round.ack.is_some(),
       "the rewound scratch page must retry on the next tick, not after the cadence"

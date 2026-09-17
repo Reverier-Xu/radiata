@@ -668,15 +668,18 @@ struct MembershipPeerRound {
 }
 
 /// One per-peer membership anti-entropy step, mirroring the resource
-/// lane's `resource_sync_tick_peer`: emit the bounded descriptor page,
-/// decide the snapshot/tombstone legs, dispatch one round, and advance
-/// the peer's continuation state. The delivery verdicts are aggregated
-/// (and cursor commits gated) by the tick's caller.
+/// lane's `resource_sync_tick_peer`: decide the round against the
+/// whole-catalog fingerprint, emit the bounded descriptor page only when
+/// the round dispatches, decide the snapshot/tombstone legs, dispatch one
+/// round, and advance the peer's continuation state. The delivery
+/// verdicts are aggregated (and cursor commits gated) by the tick's
+/// caller.
 #[allow(clippy::too_many_arguments)]
 async fn membership_sync_tick_peer(
-  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>, runtime: &RuntimeClient,
-  peer: &NodeId, state: &mut PeerSyncState, protocol: &ProtocolTag,
+  catalog: &(dyn crate::provider::StoreSnapshot + '_), entropy: &Arc<dyn Entropy>,
+  runtime: &RuntimeClient, peer: &NodeId, state: &mut PeerSyncState, protocol: &ProtocolTag,
   snapshot: Option<&crate::identity::trust::TrustSnapshotV1>, tombstone_bytes: &[Vec<u8>],
+  catalog_fingerprint: u64,
 ) -> Result<MembershipPeerRound> {
   state.page.arm_full_pass();
   // The snapshot and tombstone resend cadences advance on every tick —
@@ -686,18 +689,13 @@ async fn membership_sync_tick_peer(
   // instead of waiting out the full resend interval.
   state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
   state.ticks_since_tombstone_send = state.ticks_since_tombstone_send.saturating_add(1);
-  let page = page_sync::emit_page_ctx(
-    store,
-    state.page.continuation(),
-    crate::membership::page::DEFAULT_PAGE_LIMIT,
-  )
-  .await?;
-  let page_bytes = SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?;
-  // The page-round decision records the fingerprint against the emitted
-  // page on starting rounds only: a stale recorded fingerprint would
-  // mark every round as changed, keep the page due forever, and never
-  // let the page plane go quiet between unchanged pages.
-  let page_round = state.page.page_round(page.fingerprint());
+  // The page-round decision comes first, against the whole-catalog
+  // fingerprint: a quiet peer costs no emission at all. The old order
+  // emitted (snapshot, decode, encode, hash) before deciding, so a hub's
+  // tick cost was O(peers) even with every peer quiet — and under the
+  // driver's skip-on-overrun behavior the tick period itself grew with
+  // the mesh size.
+  let page_round = state.page.page_round(catalog_fingerprint);
   // A snapshot pass is due for this peer when its revision advanced past
   // what this peer last fully received, or on the slow resend cadence.
   // Tombstones ride their own cadence against the same revision marker:
@@ -720,7 +718,7 @@ async fn membership_sync_tick_peer(
     state.ticks_since_tombstone_send,
     snapshot_due,
   );
-  match page_round {
+  let page_bytes = match page_round {
     crate::sync_common::PageRound::Quiet if !snapshot_due && !tombstones_due => {
       state.page.quiet_tick();
       return Ok(MembershipPeerRound {
@@ -730,14 +728,22 @@ async fn membership_sync_tick_peer(
         dispatched: false,
       });
     }
-    crate::sync_common::PageRound::Quiet => {
-      // The page is not due, but the snapshot/tombstone leg is: dispatch
-      // that round without advancing the page cursor.
+    // A due page starts (or continues) its pass; a quiet page whose
+    // snapshot/tombstone leg is due still rides the dispatch without
+    // advancing the page cursor.
+    crate::sync_common::PageRound::Quiet | crate::sync_common::PageRound::Send => {
+      let page = page_sync::emit_page_from_snapshot(
+        catalog,
+        state.page.continuation(),
+        crate::membership::page::DEFAULT_PAGE_LIMIT,
+      )
+      .await?;
+      if page_round == crate::sync_common::PageRound::Send {
+        state.page.record_send(page.cursor());
+      }
+      SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?
     }
-    crate::sync_common::PageRound::Send => {
-      state.page.record_send(page.cursor());
-    }
-  }
+  };
   // The trust snapshot leg pages through the issuer's binding set one
   // wire page per tick (keyset cursor per peer); the revision is only
   // marked fully delivered on the closing empty-page tick, so an
@@ -854,6 +860,12 @@ pub(crate) async fn sync_tick(
     return Ok(());
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
+  // One snapshot and one whole-catalog fingerprint per tick: every
+  // per-peer round decides against the same immutable view, so a hub
+  // with a hundred quiet peers pays one scan per tick, not a hundred
+  // snapshot-plus-emit passes.
+  let catalog = store.snapshot().await?;
+  let fingerprint = page_sync::catalog_fingerprint(catalog.as_ref()).await?;
   // Tombstone wire bytes are peer-independent: encode once. The trust
   // snapshot legs are paged per peer (keyset cursor), so they cannot be
   // hoisted out of the loop. The bytes are snapshot-INDEPENDENT: a
@@ -898,7 +910,7 @@ pub(crate) async fn sync_tick(
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let round = membership_sync_tick_peer(
-      store,
+      catalog.as_ref(),
       entropy,
       runtime,
       peer,
@@ -906,6 +918,7 @@ pub(crate) async fn sync_tick(
       &protocol,
       snapshot.as_ref(),
       &tombstone_bytes,
+      fingerprint,
     )
     .await?;
     if !round.dispatched {
