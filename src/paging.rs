@@ -16,8 +16,11 @@ use crate::{Error, Result};
 
 /// The default page limit when the caller supplies none: one constant
 /// for every paging lane (membership descriptors, resource records), so
-/// per-lane copies cannot drift apart.
-pub(crate) const PAGE_DEFAULT_LIMIT: usize = 16;
+/// per-lane copies cannot drift apart. It sits at the receiver cap: one
+/// full-catalog walk costs the fewest round trips the wire cap allows,
+/// and the size ladder halves a page of fat records that overflows the
+/// control-body encode bound.
+pub(crate) const PAGE_DEFAULT_LIMIT: usize = PAGE_MAX_ITEMS;
 
 /// The maximum page size a receiver accepts, bounding one page's bytes:
 /// a page above this bound fails closed instead of being truncated.

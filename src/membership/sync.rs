@@ -1694,7 +1694,7 @@ mod tests {
     let descriptor_namespace =
       crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
         .unwrap();
-    for index in 0..100_u64 {
+    for index in 0..200_u64 {
       let member = node_at(500 + index);
       let descriptor = crate::membership::NodeDescriptorV1::new(
         member.clone(),
