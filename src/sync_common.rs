@@ -415,6 +415,44 @@ mod tests {
     assert_eq!(state.page_round(9), PageRound::Quiet);
   }
 
+  /// The full-pass arm must not truncate an in-flight walk: a catalog
+  /// longer than `FULL_SYNC_ROUNDS` pages used to have its continuation
+  /// reset mid-pass every 128 dispatched rounds, so the tail never
+  /// delivered and the catalog never converged.
+  #[test]
+  fn the_full_pass_arm_keeps_an_in_flight_walk() {
+    let mut state = PeerPageCursor::default();
+    assert_eq!(state.page_round(1), PageRound::Send);
+    state.record_send(Some(&[9, 9]));
+    for _ in 0..PeerPageCursor::FULL_SYNC_ROUNDS {
+      state.count_round();
+    }
+    // The arm fires with a walk in flight: the continuation survives and
+    // the pass continues from its cursor.
+    state.arm_full_pass();
+    assert_eq!(
+      state.continuation(),
+      Some(&[9, 9][..]),
+      "an in-flight walk keeps its continuation across the arm"
+    );
+    assert_eq!(state.page_round(1), PageRound::Send);
+    // After the walk completes, the next due pass still starts from
+    // scratch — the from-scratch property lives in the cursor being
+    // `None` between passes, not in the arm forcing a send.
+    state.record_send(None);
+    assert_eq!(state.page_round(1), PageRound::Quiet);
+    state.arm_full_pass();
+    for _ in 0..PeerPageCursor::PAGE_RESEND_TICKS {
+      state.quiet_tick();
+    }
+    assert_eq!(
+      state.page_round(1),
+      PageRound::Send,
+      "the periodic from-scratch pass starts at the empty cursor"
+    );
+    assert_eq!(state.continuation(), None);
+  }
+
   /// A payload above the 32 KiB chunk bound splits into pump-legal
   /// chunks whose concatenation is exactly the payload: a fat page
   /// delivers instead of terminating the pump as oversize.
@@ -463,9 +501,9 @@ pub(crate) struct PeerPageCursor {
   /// Ticks since this peer's last page send: a lost delivery must be
   /// retried on a slow cadence even when nothing changed.
   ticks_since_page_send: u32,
-  /// Page rounds sent since this peer's last full from-scratch pass:
-  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
-  /// into a dying session) can stay missing.
+  /// Dispatched rounds since this peer's last full-pass arm: the arm
+  /// re-arms the from-scratch liveness bound (see
+  /// [`Self::FULL_SYNC_ROUNDS`]) without touching an in-flight walk.
   rounds_since_full: u32,
   /// This peer's page continuation cursor, so sync converges beyond a
   /// single page.
@@ -502,12 +540,15 @@ impl PeerPageCursor {
   /// peers do not count.
   pub(crate) const FULL_SYNC_ROUNDS: u32 = 128;
 
-  /// After [`Self::FULL_SYNC_ROUNDS`] dispatched rounds the next round
-  /// re-delivers from scratch: reset the continuation cursor and the
-  /// round counter.
+  /// After [`Self::FULL_SYNC_ROUNDS`] dispatched rounds the arm fires:
+  /// the round counter resets so the next idle stretch arms again. An
+  /// in-flight walk keeps its continuation — every pass already starts
+  /// from scratch (the cursor is `None` between passes), so the old
+  /// cursor reset bought nothing when idle and truncated walks when
+  /// busy: a catalog longer than [`Self::FULL_SYNC_ROUNDS`] pages
+  /// restarted before its tail ever delivered and could never converge.
   pub(crate) fn arm_full_pass(&mut self) {
     if self.rounds_since_full >= Self::FULL_SYNC_ROUNDS {
-      self.page = None;
       self.rounds_since_full = 0;
     }
   }
