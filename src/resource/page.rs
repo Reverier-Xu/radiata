@@ -288,9 +288,10 @@ pub(crate) mod sync {
   /// Applies one received page over the running node's metadata store.
   /// Every record's writer signature is validated against the locally
   /// trusted member descriptors **before** comparison; records with an
-  /// unknown writer or a bad signature are skipped fail-closed (the next
-  /// anti-entropy pass retries after membership metadata delivers the
-  /// writer's descriptor). Installation goes through the conditional
+  /// unknown writer get one bounded wait plus one end-of-page retry
+  /// before they are skipped fail-closed (the periodic watermark refresh
+  /// remains the final backstop for a writer whose descriptor never
+  /// lands). Installation goes through the conditional
   /// register commit, so stale, duplicated, and losing permutations cannot
   /// replace a greater stored winner.
   pub(crate) async fn apply_page_ctx(
@@ -319,6 +320,9 @@ pub(crate) mod sync {
       resolved.insert(writer.clone(), key);
     }
     let mut applied = 0;
+    // Records whose writer's descriptor was unknown even after the
+    // bounded wait. They get one retry pass after the main loop.
+    let mut stranded: Vec<&ResourceRecordV1> = Vec::new();
     for record in page.records() {
       let writer_key = match resolved.get(record.writer()) {
         Some(Some(key)) => key.clone(),
@@ -326,44 +330,92 @@ pub(crate) mod sync {
           // Unknown writer: the bounded wait runs once per writer (the
           // result is cached above for the rest of the page). Without
           // the writer's trusted key no signature check is possible, so
-          // nothing is compared or stored. The wait already absorbed the
-          // normal descriptor-convergence race; past it the skip is
-          // final for this pass and the periodic watermark refresh
-          // re-delivers the record. Past-the-bound skips are an
-          // internal-consistency anomaly (the membership lane stalled)
-          // and warn.
+          // nothing is compared or stored yet — but the skip is not
+          // final: the retry pass below re-resolves after all waits
+          // have run.
           match writer_key(store, record.writer()).await {
             Ok(key) => {
               resolved.insert(record.writer().clone(), Some(key.clone()));
               key
             }
-            Err(error) => {
-              tracing::warn!(
-                writer = %record.writer(),
-                kind = ?error.kind(),
-                "resource page writer never converged; page records skipped"
-              );
+            Err(_) => {
+              stranded.push(record);
               continue;
             }
           }
         }
         None => continue,
       };
-      match record.verify(&writer_key) {
-        Ok(()) => {}
-        Err(error) => {
-          tracing::debug!(writer = %record.writer(), kind = ?error.kind(), "resource page record skipped: bad signature");
-          continue;
-        }
+      if let Some(applied_delta) =
+        verify_and_commit_ctx(store, entropy, record, &writer_key).await?
+      {
+        applied += applied_delta;
       }
-      if matches!(
-        super::super::store::commit_record_ctx(store, entropy, record).await?,
-        super::super::store::ResourceCommitOutcome::Installed(_)
-      ) {
-        applied += 1;
+    }
+    // The retry pass. This page's apply serialized one bounded wait per
+    // unknown writer, and membership pages apply concurrently on other
+    // consumer tasks — a descriptor that landed while those waits ran is
+    // only visible now. The old code skipped these records finally,
+    // stranding them behind the sender's already-committed delivery
+    // watermark until the periodic whole-catalog refresh re-delivered
+    // them: at join scale that refresh is many detection cadences away
+    // and dominated roster convergence.
+    if !stranded.is_empty() {
+      let mut retried: HashMap<NodeId, Option<crate::PublicKey>> = HashMap::new();
+      for record in stranded {
+        let writer_key = match retried.get(record.writer()) {
+          Some(resolution) => resolution.clone(),
+          None => {
+            let resolution =
+              match crate::membership::store::read_descriptor_ctx(store, record.writer()).await {
+                Ok(Some(descriptor)) if !descriptor.removed() => {
+                  Some(descriptor.public_key().clone())
+                }
+                _ => None,
+              };
+            retried.insert(record.writer().clone(), resolution.clone());
+            resolution
+          }
+        };
+        let Some(writer_key) = writer_key else {
+          tracing::warn!(
+            writer = %record.writer(),
+            "resource page writer never converged; page records skipped"
+          );
+          continue;
+        };
+        if let Some(applied_delta) =
+          verify_and_commit_ctx(store, entropy, record, &writer_key).await?
+        {
+          applied += applied_delta;
+        }
       }
     }
     Ok(applied)
+  }
+
+  /// Verifies one record against its writer's trusted key and commits it
+  /// through the conditional register. A bad signature is a debug-evident
+  /// skip; an installed commit reports `Some(1)`.
+  async fn verify_and_commit_ctx(
+    store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
+    writer_key: &crate::PublicKey,
+  ) -> Result<Option<usize>> {
+    if let Err(error) = record.verify(writer_key) {
+      tracing::debug!(
+        writer = %record.writer(),
+        kind = ?error.kind(),
+        "resource page record skipped: bad signature"
+      );
+      return Ok(None);
+    }
+    if matches!(
+      super::super::store::commit_record_ctx(store, entropy, record).await?,
+      super::super::store::ResourceCommitOutcome::Installed(_)
+    ) {
+      return Ok(Some(1));
+    }
+    Ok(None)
   }
 
   /// The trusted public key of `writer`, resolved from the locally stored
@@ -374,8 +426,9 @@ pub(crate) mod sync {
   /// therefore waits a bounded time for the descriptor to converge
   /// instead of skipping immediately — a skip here would strand the
   /// record behind an already-delivered watermark. Past the bound the
-  /// lookup fails closed and the periodic watermark refresh re-delivers
-  /// the record later.
+  /// lookup fails closed; the page's end-of-apply retry pass re-resolves
+  /// once more, and the periodic watermark refresh remains the final
+  /// backstop.
   async fn writer_key(store: &MetadataStore, writer: &crate::NodeId) -> Result<crate::PublicKey> {
     let deadline = std::time::Instant::now() + WRITER_TRUST_WAIT;
     loop {
@@ -611,6 +664,54 @@ mod tests {
     super::super::store::read_record_ctx(store, name)
       .await
       .unwrap()
+  }
+
+  /// Regression: a record whose writer's descriptor lands while this very
+  /// page is still applying must not be stranded. Writer A's descriptor
+  /// arrives after A's bounded wait failed but before the page's
+  /// end-of-apply retry pass runs — the retry applies A's record. The old
+  /// code skipped it finally, and the sender's delivery watermark was
+  /// already committed, so the record waited for the periodic
+  /// whole-catalog refresh (many detection cadences at join scale).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_descriptor_landing_mid_apply_is_retried_before_the_page_ends() {
+    use std::time::Duration;
+
+    let (_factory, store) = open_store().await;
+    let store = Arc::new(store);
+    let page = ResourcePage::new(
+      vec![
+        record(&name(1), 1_000, &writer(), "u://a", SEED),
+        record(&name(2), 1_000, &other_writer(), "u://b", OTHER_SEED),
+      ],
+      None,
+    )
+    .unwrap();
+    // Neither writer is trusted up front. Each record's bounded wait
+    // serializes (~2s per writer): writer A's wait fails first, and the
+    // descriptor lands while writer B's wait is still running — before
+    // the retry pass.
+    let installer = Arc::clone(&store);
+    let landed_writer = writer();
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_secs(3)).await;
+      trust(&installer, &landed_writer, SEED).await;
+    });
+
+    let applied = sync::apply_page_ctx(&store, &SystemEntropy, &page)
+      .await
+      .unwrap();
+    assert_eq!(
+      applied, 1,
+      "the mid-apply descriptor's record applies on the retry pass"
+    );
+    let got = read_current(&store, &name(1)).await;
+    assert!(got.is_some(), "writer A's record is installed");
+    let missing = read_current(&store, &name(2)).await;
+    assert!(
+      missing.is_none(),
+      "the never-converged writer stays skipped"
+    );
   }
 
   /// Signature validation happens before comparison — a
