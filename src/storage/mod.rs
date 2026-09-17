@@ -143,6 +143,11 @@ pub(crate) struct MetadataStore {
   ready_notify: tokio::sync::Notify,
   clock: Arc<dyn WallClock>,
   receipt_retention: Duration,
+  /// The register-install epoch: one monotonic bump per installed
+  /// resource record commit (see [`Self::note_register_install`]), so
+  /// the sync driver observes local catalog changes with one atomic
+  /// load per tick instead of a catalog scan.
+  register_epoch: std::sync::atomic::AtomicU64,
 }
 
 struct ProviderCall<'a> {
@@ -256,7 +261,25 @@ impl MetadataStore {
       ready_notify: tokio::sync::Notify::new(),
       clock,
       receipt_retention,
+      register_epoch: std::sync::atomic::AtomicU64::new(0),
     })
+  }
+
+  /// Records one installed register entry: the sync driver reads the
+  /// epoch once per tick ([`Self::register_epoch`]) and treats any
+  /// advance as "some peer's diff may have changed", turning local
+  /// writes into next-tick pushes instead of one detection-cadence wait
+  /// per hop.
+  pub(crate) fn note_register_install(&self) {
+    use std::sync::atomic::Ordering;
+    self.register_epoch.fetch_add(1, Ordering::Relaxed);
+  }
+
+  /// The current register-install epoch. `Relaxed` suffices: the value
+  /// is a change detector across ticks, never a synchronization point.
+  pub(crate) fn register_epoch(&self) -> u64 {
+    use std::sync::atomic::Ordering;
+    self.register_epoch.load(Ordering::Relaxed)
   }
 
   /// Acquires the writer exclusion: while held, no other task can enter

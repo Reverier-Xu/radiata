@@ -114,6 +114,10 @@ pub(crate) fn resource_sync_protocol_definition() -> Result<ProtocolDefinition> 
 #[derive(Debug, Default)]
 pub(crate) struct ResourceSyncCursors {
   peers: std::collections::BTreeMap<NodeId, ResourcePeerState>,
+  /// The register-install epoch at this driver's last tick: any advance
+  /// since then means a local install (a caller write, an applied page,
+  /// a retention rewrite) may belong in some peer's diff.
+  install_epoch: u64,
 }
 
 /// The per-peer resource sync state: the filtered-walk cursor plus the
@@ -257,6 +261,19 @@ pub(crate) async fn resource_sync_tick(
     return Ok(());
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
+  // A local install since the last tick arms every peer's detection pass
+  // for this tick: the changed record pushes within one tick per hop
+  // instead of one detection cadence per hop, which is what kept
+  // multi-hop roster convergence growing linearly with path length. The
+  // watermark filter keeps the pushed pages diff-shaped, and a quiet
+  // steady state (no installs) still walks nothing between passes.
+  let epoch = store.register_epoch();
+  if epoch != cursors.install_epoch {
+    cursors.install_epoch = epoch;
+    for state in cursors.peers.values_mut() {
+      state.ticks_since_pass = DETECTION_CADENCE_TICKS;
+    }
+  }
   // One snapshot per tick, shared by every per-peer round: a hub
   // catching up a hundred leaves pays one snapshot, not a hundred.
   let catalog = store.snapshot().await?;
@@ -830,7 +847,6 @@ mod tests {
       scratch.ticks_since_pass, DETECTION_CADENCE_TICKS,
       "a scratch-start rejection re-forces the pass due instead of silencing the peer"
     );
-
     // The next tick over a healthy queue re-sends both peers' pages
     // from their page starts.
     let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(64);
@@ -846,6 +862,86 @@ mod tests {
       delivered.lock().unwrap().len(),
       2,
       "both rewound peers re-dispatch their pages on the next tick"
+    );
+  }
+
+  /// A locally installed record (an applied page here — the same commit
+  /// path a caller write and a retention rewrite take) arms every peer's
+  /// detection pass for the next tick. Under the cadence-only design the
+  /// peer stayed quiet for a full detection window per hop, which made
+  /// multi-hop roster convergence grow linearly with path length.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_local_install_pushes_the_diff_on_the_next_tick() {
+    let factory: Arc<dyn crate::provider::StorageFactory> =
+      Arc::new(crate::storage::contract::ReferenceFactory::new(
+        crate::storage::contract::required_capabilities(),
+      ));
+    let keys = crate::identity::testing::ScriptedKeys::full();
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SystemEntropy);
+    let context = Arc::new(
+      crate::identity::lifecycle::open_local_identity(
+        &factory,
+        &keys.as_provider(),
+        &SystemEntropy,
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    let store = context.store();
+    trust(store, &node(1), [9; 32]).await;
+    crate::resource::page::sync::apply_page_ctx(
+      store,
+      entropy.as_ref(),
+      &ResourcePage::new(vec![record("demo.org/resources/inst-first", 1_000)], None).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    seed_peer_session(&sessions, &entropy);
+    let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(64);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = RuntimeClient::routing_only(packet_tx, routes);
+    let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    ack_drainer(packet_rx, Arc::clone(&delivered));
+    let mut cursors = ResourceSyncCursors::default();
+
+    // Tick 1: the fresh peer is due anyway; the first record delivers and
+    // its watermark commits, so the peer would now stay quiet until the
+    // detection cadence elapsed.
+    resource_sync_tick(&context, &entropy, &sessions, &runtime, &mut cursors)
+      .await
+      .unwrap();
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert_eq!(
+      cursors.peers.get(&node(2)).unwrap().ticks_since_pass,
+      0,
+      "the delivered pass re-arms the cadence"
+    );
+
+    // A second local install: the next tick must push the diff despite
+    // the freshly re-armed cadence.
+    crate::resource::page::sync::apply_page_ctx(
+      store,
+      entropy.as_ref(),
+      &ResourcePage::new(vec![record("demo.org/resources/inst-second", 2_000)], None).unwrap(),
+    )
+    .await
+    .unwrap();
+    resource_sync_tick(&context, &entropy, &sessions, &runtime, &mut cursors)
+      .await
+      .unwrap();
+    assert_eq!(
+      delivered.lock().unwrap().len(),
+      2,
+      "the install arms the pass for the very next tick"
+    );
+    assert_eq!(
+      delivered.lock().unwrap().last().unwrap(),
+      &vec!["demo.org/resources/inst-second".to_owned()],
+      "the pushed page carries the diff, not the catalog"
     );
   }
 

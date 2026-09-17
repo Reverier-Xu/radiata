@@ -98,6 +98,14 @@ pub(crate) async fn commit_record_ctx(
     "resource record",
   )
   .await
+  .inspect(|outcome| {
+    // Every install path funnels through here (caller writes, applied
+    // sync pages, retention rewrites), so this one bump is the change
+    // signal the sync driver turns into next-tick pushes.
+    if matches!(outcome, ResourceCommitOutcome::Installed(_)) {
+      store.note_register_install();
+    }
+  })
 }
 
 /// The shared conditional-put tail of both register commits: one
@@ -267,6 +275,32 @@ mod tests {
     assert_eq!(&stored, &record);
     assert_eq!(stored.labels().entries().count(), 1);
     assert!(!stored.removed());
+  }
+
+  /// The register-install epoch advances only on installs: the sync
+  /// driver reads it once per tick and turns an advance into next-tick
+  /// pushes, so a losing (superseded) write must leave it alone.
+  #[tokio::test]
+  async fn the_install_epoch_observes_installs_not_losses() {
+    let (_factory, store) = open_store().await;
+    assert_eq!(store.register_epoch(), 0);
+    assert!(matches!(
+      commit_record_ctx(&store, &SystemEntropy, &put(2_000, "file:///live"))
+        .await
+        .unwrap(),
+      ResourceCommitOutcome::Installed(_)
+    ));
+    let after_install = store.register_epoch();
+    assert_eq!(after_install, 1);
+    // An older-stamped write loses the tuple: no install, no bump.
+    commit_record_ctx(&store, &SystemEntropy, &put(1_000, "file:///loser"))
+      .await
+      .unwrap();
+    assert_eq!(
+      store.register_epoch(),
+      after_install,
+      "a superseded write does not arm the sync plane"
+    );
   }
 
   /// A losing write is accepted but stores nothing and wins nothing —
