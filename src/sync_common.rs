@@ -151,59 +151,30 @@ pub(crate) fn alive_peers(sessions: &SessionTable) -> Result<Vec<NodeId>> {
   )
 }
 
-/// The bounded backoff for one sync payload dispatch rejected by a
-/// transiently full packet channel (`Overloaded`): the shared outbound
-/// channel is drained by the runtime loop, so saturation lasts one
-/// scheduling window, not forever. Without the retry, one transient
-/// saturation window fails the whole dispatch and the round's verdict
-/// aggregator rewinds every affected peer to the page start — a full
-/// resend-cadence wait (anti-entropy ticks) to re-deliver pages that were
-/// never lost. Starting at [`DISPATCH_RETRY_BACKOFF`] and doubling up to
-/// [`DISPATCH_RETRY_MAX_BACKOFF`], the budget rides out scheduler
-/// starvation windows at high fan-out while a persistently saturated
-/// channel still fails closed within roughly a second, exactly as before.
-const DISPATCH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
-const DISPATCH_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
-const DISPATCH_RETRY_ATTEMPTS: u32 = 7;
-
 /// Sends one sync payload to one peer over the packet data plane as an
 /// exact-target, max-hops-1 internal stream, and returns the
 /// destination's admission acknowledgement receiver. Queuing is
 /// fire-and-forget, but the receiver is the delivery truth: a page
 /// swallowed by a session that still looks alive never resolves it. The
 /// payload streams as bounded chunks ([`chunk_payload`]), so an encoded
-/// page above the single-chunk bound still delivers. A dispatch rejected
-/// by a transiently full packet channel retries under the bounded
-/// backoff ([`DISPATCH_RETRY_ATTEMPTS`]); every attempt carries a fresh
-/// trace id, and a rejected attempt never reached the routing plane, so
-/// no route record or wire artifact of the failed attempt exists.
-pub(crate) async fn send_payload(
+/// page above the single-chunk bound still delivers. A channel-saturated
+/// dispatch fails closed immediately and the caller's verdict aggregator
+/// re-sends the page next round: retrying here would stall the
+/// deterministic sync round behind a channel nobody drains while the
+/// round itself blocks the runtime loop.
+pub(crate) fn send_payload(
   runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, peer: &NodeId, protocol: &ProtocolTag,
   encoded: &[u8],
 ) -> Result<tokio::sync::oneshot::Receiver<RoutedAckOutcome>> {
-  let mut backoff = DISPATCH_RETRY_BACKOFF;
-  let mut attempt = 1_u32;
-  loop {
-    let trace_id = TraceId::generate(entropy.as_ref())?;
-    // The chunk vec owns its bytes, so the body stream is 'static and the
-    // request never borrows this call's slice.
-    let chunks: Vec<Arc<[u8]>> = chunk_payload(encoded).collect();
-    let body: crate::packet::BodyStream =
-      Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)));
-    let (request, ack_rx) = outbound_request(peer, protocol, trace_id, body);
-    match runtime.try_send_packet(request) {
-      Ok(()) => return Ok(ack_rx),
-      Err(error)
-        if error.kind() == crate::ErrorKind::Overloaded && attempt < DISPATCH_RETRY_ATTEMPTS =>
-      {
-        tracing::debug!(peer = %peer.as_str(), attempt, "sync dispatch channel saturated; retrying");
-        tokio::time::sleep(backoff).await;
-        backoff = backoff.saturating_mul(2).min(DISPATCH_RETRY_MAX_BACKOFF);
-        attempt += 1;
-      }
-      Err(error) => return Err(error),
-    }
-  }
+  let trace_id = TraceId::generate(entropy.as_ref())?;
+  // The chunk vec owns its bytes, so the body stream is 'static and the
+  // request never borrows this call's slice.
+  let chunks: Vec<Arc<[u8]>> = chunk_payload(encoded).collect();
+  let body: crate::packet::BodyStream =
+    Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)));
+  let (request, ack_rx) = outbound_request(peer, protocol, trace_id, body);
+  runtime.try_send_packet(request)?;
+  Ok(ack_rx)
 }
 
 /// The one constructor for a sync lane's internal outbound request:
@@ -300,16 +271,13 @@ pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_
 
 #[cfg(test)]
 mod tests {
-  use std::{collections::BTreeMap, sync::Arc};
-
   use minicbor::bytes::ByteVec;
 
   use super::{
     PageRound, PeerPageCursor, chunk_payload, decode_kinded_sync_envelope,
-    decode_plain_sync_envelope, delivered_within_bound, encode_sync_envelope, outbound_request,
-    send_payload,
+    decode_plain_sync_envelope, delivered_within_bound, encode_sync_envelope,
   };
-  use crate::{TraceId, packet::MAX_CHUNK_BYTES};
+  use crate::packet::MAX_CHUNK_BYTES;
 
   const TEST_SCHEMA: &str = "radiata.woooo.tech/schemas/test-sync-payload-v1";
 
@@ -406,94 +374,6 @@ mod tests {
       !delivered_within_bound(ack).await,
       "a mid-pump interruption must read as undelivered"
     );
-  }
-
-  // ---- bounded dispatch retry on a transiently saturated channel ----
-
-  /// The dispatch fixture: a routing-only runtime client whose outbound
-  /// packet channel holds exactly one request, a deterministic entropy
-  /// source, and one peer/protocol pair.
-  fn dispatch_fixture() -> (
-    tokio::sync::mpsc::Sender<crate::packet::OutboundRequest>,
-    tokio::sync::mpsc::Receiver<crate::packet::OutboundRequest>,
-    crate::runtime::RuntimeClient,
-    Arc<dyn crate::api::Entropy>,
-    crate::NodeId,
-    crate::ProtocolTag,
-  ) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<crate::packet::OutboundRequest>(1);
-    let routes: crate::routing::RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-    let runtime = crate::runtime::RuntimeClient::routing_only(tx.clone(), routes);
-    let entropy: Arc<dyn crate::api::Entropy> =
-      Arc::new(crate::identity::testing::SequenceEntropy::default());
-    let peer = crate::NodeId::generate(entropy.as_ref()).expect("peer id");
-    let protocol =
-      crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-sync-payload").expect("tag");
-    (tx, rx, runtime, entropy, peer, protocol)
-  }
-
-  /// A transiently saturated channel heals inside the bounded dispatch
-  /// budget: the first attempt observes the full channel, the backoff
-  /// lets the consumer drain, and a later attempt queues the payload.
-  #[tokio::test]
-  async fn a_transiently_saturated_channel_retries_within_the_dispatch_budget() {
-    let (tx, mut rx, runtime, entropy, peer, protocol) = dispatch_fixture();
-    // Occupy the only channel slot so the first dispatch attempt hits
-    // `Overloaded`.
-    let (filler, _fill_ack) = outbound_request(
-      &peer,
-      &protocol,
-      TraceId::generate(entropy.as_ref()).expect("trace id"),
-      Box::pin(futures_util::stream::iter(Vec::new())),
-    );
-    tx.send(filler).await.expect("fill the channel");
-    // Drain one request after a delay longer than the first backoff
-    // step, then keep receiving so the receiver never drops (a dropped
-    // receiver would close the channel and fail the retry as
-    // `ShuttingDown` instead of queuing it).
-    tokio::spawn(async move {
-      tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-      while rx.recv().await.is_some() {}
-    });
-    let ack = send_payload(&runtime, &entropy, &peer, &protocol, b"payload").await;
-    assert!(
-      ack.is_ok(),
-      "the retry must ride out the transient saturation"
-    );
-  }
-
-  /// A persistently saturated channel fails closed with the typed
-  /// overload after the bounded budget (time is auto-advanced, so the
-  /// test costs no wall clock). The receiver stays bound but never
-  /// drained, so every attempt observes the full channel.
-  #[tokio::test(start_paused = true)]
-  async fn a_persistently_saturated_channel_fails_closed_after_the_budget() {
-    let (tx, _rx, runtime, entropy, peer, protocol) = dispatch_fixture();
-    let (filler, _fill_ack) = outbound_request(
-      &peer,
-      &protocol,
-      TraceId::generate(entropy.as_ref()).expect("trace id"),
-      Box::pin(futures_util::stream::iter(Vec::new())),
-    );
-    tx.send(filler).await.expect("fill the channel");
-    let error = match send_payload(&runtime, &entropy, &peer, &protocol, b"payload").await {
-      Ok(_) => panic!("a persistently full channel must fail closed"),
-      Err(error) => error,
-    };
-    assert_eq!(error.kind(), crate::ErrorKind::Overloaded);
-  }
-
-  /// A closed channel is not a transient saturation: the dispatch fails
-  /// immediately with the shutdown kind, never retrying a dead runtime.
-  #[tokio::test]
-  async fn a_closed_channel_fails_without_retry() {
-    let (_tx, rx, runtime, entropy, peer, protocol) = dispatch_fixture();
-    drop(rx);
-    let error = match send_payload(&runtime, &entropy, &peer, &protocol, b"payload").await {
-      Ok(_) => panic!("a closed channel must fail the dispatch"),
-      Err(error) => error,
-    };
-    assert_eq!(error.kind(), crate::ErrorKind::ShuttingDown);
   }
 
   /// A delivery failure heals within one tick by re-sending exactly the
