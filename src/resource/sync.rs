@@ -383,6 +383,7 @@ async fn resource_sync_tick_peer(
   tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
   let ack = match crate::sync_common::send_payload(runtime, entropy, peer, protocol, &payload_bytes)
+    .await
   {
     Ok(ack) => Some(ack),
     Err(error) => {

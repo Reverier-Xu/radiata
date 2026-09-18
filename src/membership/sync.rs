@@ -415,7 +415,7 @@ async fn accept_payload(
       // the pump never serializes behind it, and a failed admission is
       // diagnostics only — the receipt is a hint, never a trust
       // decision, and is never retried here.
-      match crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt) {
+      match crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt).await {
         Ok(ack) => {
           let peer = source.clone();
           tokio::spawn(async move {
@@ -1039,31 +1039,35 @@ async fn dispatch_to_peer(
   Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
   Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
 ) {
-  let snapshot_ack = snapshot_page.and_then(|payload| {
-    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload) {
-      Ok(ack) => Some(ack),
-      Err(error) => {
-        tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
-        None
+  let snapshot_ack = match snapshot_page {
+    Some(payload) => {
+      match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await {
+        Ok(ack) => Some(ack),
+        Err(error) => {
+          tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
+          None
+        }
       }
     }
-  });
+    None => None,
+  };
   let mut tombstone_acks = Vec::new();
   for payload in tombstones {
-    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload) {
+    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await {
       Ok(ack) => tombstone_acks.push(ack),
       Err(error) => {
         tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
       }
     }
   }
-  let page_ack = match crate::sync_common::send_payload(runtime, entropy, peer, protocol, page) {
-    Ok(ack) => Some(ack),
-    Err(error) => {
-      tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
-      None
-    }
-  };
+  let page_ack =
+    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, page).await {
+      Ok(ack) => Some(ack),
+      Err(error) => {
+        tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
+        None
+      }
+    };
   (tombstone_acks, page_ack, snapshot_ack)
 }
 

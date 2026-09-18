@@ -428,8 +428,24 @@ async fn supervise(
         let _ = reply.send(result);
       }
       Control::RunSyncRound { reply } => {
-        let result = supervisor.run_sync_round().await;
-        let _ = reply.send(result);
+        // The round runs in the sync driver; waiting it out here would
+        // freeze this select loop for the round's whole duration, and the
+        // loop is the only drainer of the outbound packet channel the
+        // round dispatches through: a saturated round would then deadlock
+        // against its own dispatch queue. The wait is owned by a tracked
+        // task instead, so the loop keeps routing while the round runs and
+        // the caller still observes its completion.
+        let requests = supervisor.dependencies.sync_round_requests.clone();
+        tasks.spawn(async move {
+          let (round, round_rx) = tokio::sync::oneshot::channel();
+          let result = match requests.send(round).await {
+            Ok(()) => round_rx
+              .await
+              .map_err(|_| Error::shutting_down("sync round")),
+            Err(_) => Err(Error::shutting_down("sync round")),
+          };
+          let _ = reply.send(result);
+        });
       }
       Control::RemoveResource {
         name,
@@ -934,24 +950,6 @@ impl Supervisor {
     self.require_unblocked()?;
     let context = self.context()?;
     context.store().apply_receipt_retention().await
-  }
-
-  /// Forwards the RunSyncRound request to the sync driver (the cursor
-  /// owner) and awaits the round's completion. A dropped reply means the
-  /// node is shutting down.
-  async fn run_sync_round(&self) -> Result<()> {
-    let (reply, reply_rx) = tokio::sync::oneshot::channel();
-    self
-      .dependencies
-      .sync_round_requests
-      .clone()
-      .send(reply)
-      .await
-      .map_err(|_| Error::shutting_down("sync round"))?;
-    reply_rx
-      .await
-      .map_err(|_| Error::shutting_down("sync round"))?;
-    Ok(())
   }
 
   pub(super) fn context(&self) -> Result<Arc<LocalIdentityContext>> {
