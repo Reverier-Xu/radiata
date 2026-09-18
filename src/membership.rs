@@ -380,6 +380,89 @@ pub(crate) mod store {
     Ok(())
   }
 
+  /// Applies one received descriptor page as ONE durable transaction: the
+  /// per-descriptor decisions mirror [`store_descriptor_ctx`] exactly
+  /// (older revisions, removal protection, illegal first revisions, and
+  /// unadopted skipped-revision installs skip; everything else
+  /// installs), but the page costs one permit hold, one snapshot, and
+  /// one fsync-bound commit instead of one per descriptor. At join
+  /// fan-out a leaf applies hundreds of descriptors, and the
+  /// per-record commit queue — every commit a full durable transaction
+  /// serialized through the single-commit state machine — was the
+  /// minutes-long roster-convergence tail. Returns the installed node
+  /// ids; a raced register (a non-permit writer moved under one of the
+  /// batch's CAS expectations) landed nothing and retries once from a
+  /// fresh snapshot before failing the page to the anti-entropy cadence.
+  pub(crate) async fn apply_descriptor_batch_ctx(
+    store: &MetadataStore, entropy: &dyn Entropy, page: &super::page::MembershipPage,
+  ) -> Result<Vec<NodeId>> {
+    let _permit = store.write_permit().await;
+    let namespace = namespace()?;
+    let mut attempt = 0_u8;
+    loop {
+      let snapshot = store.snapshot().await?;
+      let mut operations = Vec::new();
+      let mut applied = Vec::new();
+      for descriptor in page.descriptors() {
+        let key = descriptor_key(descriptor.node());
+        if let Some(existing) = snapshot.get(&namespace, &key).await? {
+          let existing = crate::membership::page::decode_descriptor(existing.as_bytes())?;
+          if descriptor.revision() <= existing.revision() {
+            continue;
+          }
+          // A removal marker is never replaced by a live descriptor of
+          // any revision (see `store_descriptor_ctx`).
+          if existing.removed() && !descriptor.removed() {
+            continue;
+          }
+        } else if descriptor.revision() == 0 {
+          continue;
+        } else if descriptor.revision() > 1 {
+          // A skipped-revision first install heals only over an adopted
+          // binding (see `store_descriptor_ctx`).
+          let (binding_namespace, binding_key) =
+            crate::identity::records::identity_binding_key(descriptor.node())?;
+          if snapshot
+            .get(&binding_namespace, &binding_key)
+            .await?
+            .is_none()
+          {
+            continue;
+          }
+        }
+        let expected =
+          crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
+        operations.push(StoreOperation::Put {
+          namespace: namespace.clone(),
+          key,
+          expected,
+          value: StoreValue::new(Arc::from(descriptor.encode()?)),
+        });
+        applied.push(descriptor.node().clone());
+      }
+      if operations.is_empty() {
+        return Ok(applied);
+      }
+      let transaction = store.prepare_transaction(
+        TransactionId::generate(entropy)?,
+        snapshot.revision().clone(),
+        operations,
+      )?;
+      let outcome = store.commit(transaction).await?;
+      match outcome {
+        crate::CommitOutcome::Committed(_) => return Ok(applied),
+        // A conflict landed nothing: one re-decide from a fresh snapshot
+        // is safe, a second one surfaces to the cadence.
+        crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted if attempt == 0 => {
+          attempt += 1;
+        }
+        outcome => {
+          crate::provider::commit_verdict(outcome, "membership page")?;
+        }
+      }
+    }
+  }
+
   /// Reads the current descriptor for one node over a standalone factory
   /// handle (unit/offline path; the caller owns the opened store).
   #[cfg(test)]

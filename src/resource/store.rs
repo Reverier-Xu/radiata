@@ -11,14 +11,14 @@
 //! concurrent exact-version writes resolve to typed conflicts or one
 //! commit.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use super::{ResourceName, ResourceRecordV1};
 /// The durable namespace holding one register per resource name.
 pub(crate) use crate::storage::families::RESOURCE_RECORD_NAMESPACE;
 use crate::{
-  CommitReceipt, Digest, Error, Result, StoreKey, StoreNamespace, StoreOperation, StoreValue,
-  TransactionId, api::Entropy, storage::MetadataStore,
+  CommitReceipt, Digest, Error, NodeId, Result, StoreKey, StoreNamespace, StoreOperation,
+  StoreValue, TransactionId, api::Entropy, storage::MetadataStore,
 };
 
 pub(crate) fn namespace() -> Result<StoreNamespace> {
@@ -106,6 +106,100 @@ pub(crate) async fn commit_record_ctx(
       store.note_register_install();
     }
   })
+}
+
+/// One batched register commit for a received page: every record that
+/// verifies against its resolved writer key, wins over the snapshot's
+/// stored winner, and wins the page's own same-key ordering lands in ONE
+/// durable transaction — one permit hold, one snapshot, one fsync-bound
+/// commit — instead of one transaction per record. At join fan-out a
+/// leaf applies hundreds of records, and the per-record commit queue
+/// (every commit a full durable transaction serialized through the
+/// single-commit state machine) was the minutes-long roster-convergence
+/// tail. Returns the installed record count; a conflicted commit landed
+/// nothing and retries once from a fresh snapshot before surfacing to
+/// the anti-entropy cadence. Records whose writer key is absent from
+/// `writer_keys` (unresolved past the bounded trust wait) are skipped —
+/// the page apply's own retry pass re-resolves them before this runs.
+pub(crate) async fn commit_page_batch_ctx(
+  store: &MetadataStore, entropy: &dyn Entropy, records: &[&ResourceRecordV1],
+  writer_keys: &HashMap<NodeId, crate::PublicKey>,
+) -> Result<usize> {
+  let _permit = store.write_permit().await;
+  let namespace = namespace()?;
+  // Same-key page-order contest: within one page, the last record that
+  // wins over its incumbent sibling represents the key. A store scan
+  // never repeats a key; the dedup guards reassembly paths so a batched
+  // put can never overwrite a winner with a loser.
+  let mut order: Vec<StoreKey> = Vec::new();
+  let mut by_key: HashMap<StoreKey, &ResourceRecordV1> = HashMap::new();
+  for record in records {
+    let Some(writer_key) = writer_keys.get(record.writer()) else {
+      continue;
+    };
+    if let Err(error) = record.verify(writer_key) {
+      tracing::debug!(
+        writer = %record.writer(),
+        kind = ?error.kind(),
+        "resource page record skipped: bad signature"
+      );
+      continue;
+    }
+    let key = record_key(record.name());
+    match by_key.get(&key) {
+      Some(incumbent) if !record.wins_over(incumbent) => continue,
+      _ => {
+        if !by_key.contains_key(&key) {
+          order.push(key.clone());
+        }
+        by_key.insert(key, record);
+      }
+    }
+  }
+  let mut attempt = 0_u8;
+  loop {
+    let snapshot = store.snapshot().await?;
+    let mut operations = Vec::new();
+    for key in &order {
+      let record = by_key[key];
+      if let Some(existing) = snapshot.get(&namespace, key).await? {
+        let existing = ResourceRecordV1::decode(existing.as_bytes())?;
+        if !record.wins_over(&existing) {
+          // Superseded by the stored winner: the register keeps it.
+          continue;
+        }
+      }
+      let expected =
+        crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, key).await?;
+      operations.push(StoreOperation::Put {
+        namespace: namespace.clone(),
+        key: key.clone(),
+        expected,
+        value: StoreValue::new(Arc::from(record.encode()?)),
+      });
+    }
+    if operations.is_empty() {
+      return Ok(0);
+    }
+    let installed = operations.len();
+    let transaction = store.prepare_transaction(
+      TransactionId::generate(entropy)?,
+      snapshot.revision().clone(),
+      operations,
+    )?;
+    let outcome = store.commit(transaction).await?;
+    if !matches!(outcome, crate::CommitOutcome::Committed(_)) && attempt == 0 {
+      // A conflict landed nothing: one re-decide from a fresh snapshot
+      // is safe, a second one surfaces to the anti-entropy cadence.
+      attempt = 1;
+      continue;
+    }
+    crate::provider::commit_verdict(outcome, "resource page")?;
+    if installed > 0 {
+      store.note_register_install();
+    }
+    return Ok(installed);
+  }
 }
 
 /// The shared conditional-put tail of both register commits: one

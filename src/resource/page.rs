@@ -343,30 +343,17 @@ pub(crate) mod sync {
     for (writer, key) in waits {
       resolved.insert(writer, key.ok());
     }
-    let mut applied = 0;
-    // Records whose writer's descriptor was unknown even after the
-    // bounded wait. They get one retry pass after the main loop.
-    let mut stranded: Vec<&ResourceRecordV1> = Vec::new();
-    for record in page.records() {
-      let writer_key = match resolved.get(record.writer()) {
-        Some(Some(key)) => key.clone(),
-        Some(None) => {
-          // Unknown writer past the bounded wait: without the writer's
-          // trusted key no signature check is possible, so nothing is
-          // compared or stored yet — but the skip is not final: the
-          // retry pass below re-resolves once more before the record is
-          // given up for this page.
-          stranded.push(record);
-          continue;
-        }
-        None => continue,
-      };
-      if let Some(applied_delta) =
-        verify_and_commit_ctx(store, entropy, record, &writer_key).await?
-      {
-        applied += applied_delta;
-      }
-    }
+    // One batched register commit for everything resolved: the whole
+    // page lands in a single durable transaction instead of one per
+    // record (the per-record commit queue at join fan-out was the
+    // minutes-long roster-convergence tail).
+    let resolved_keys: HashMap<NodeId, crate::PublicKey> = resolved
+      .iter()
+      .filter_map(|(writer, key)| key.clone().map(|key| (writer.clone(), key)))
+      .collect();
+    let records: Vec<&ResourceRecordV1> = page.records().iter().collect();
+    let mut applied =
+      super::super::store::commit_page_batch_ctx(store, entropy, &records, &resolved_keys).await?;
     // The retry pass. This page's apply serialized one bounded wait per
     // unknown writer, and membership pages apply concurrently on other
     // consumer tasks — a descriptor that landed while those waits ran is
@@ -375,62 +362,35 @@ pub(crate) mod sync {
     // watermark until the periodic whole-catalog refresh re-delivered
     // them: at join scale that refresh is many detection cadences away
     // and dominated roster convergence.
+    let stranded: Vec<&ResourceRecordV1> = records
+      .iter()
+      .copied()
+      .filter(|record| !resolved_keys.contains_key(record.writer()))
+      .collect();
     if !stranded.is_empty() {
-      let mut retried: HashMap<NodeId, Option<crate::PublicKey>> = HashMap::new();
-      for record in stranded {
-        let writer_key = match retried.get(record.writer()) {
-          Some(resolution) => resolution.clone(),
-          None => {
-            let resolution =
-              match crate::membership::store::read_descriptor_ctx(store, record.writer()).await {
-                Ok(Some(descriptor)) if !descriptor.removed() => {
-                  Some(descriptor.public_key().clone())
-                }
-                _ => None,
-              };
-            retried.insert(record.writer().clone(), resolution.clone());
-            resolution
-          }
-        };
-        let Some(writer_key) = writer_key else {
+      let mut retried: HashMap<NodeId, crate::PublicKey> = HashMap::new();
+      for record in &stranded {
+        if retried.contains_key(record.writer()) {
+          continue;
+        }
+        let resolution =
+          match crate::membership::store::read_descriptor_ctx(store, record.writer()).await {
+            Ok(Some(descriptor)) if !descriptor.removed() => Some(descriptor.public_key().clone()),
+            _ => None,
+          };
+        if let Some(key) = resolution {
+          retried.insert(record.writer().clone(), key);
+        } else {
           tracing::warn!(
             writer = %record.writer(),
             "resource page writer never converged; page records skipped"
           );
-          continue;
-        };
-        if let Some(applied_delta) =
-          verify_and_commit_ctx(store, entropy, record, &writer_key).await?
-        {
-          applied += applied_delta;
         }
       }
+      applied +=
+        super::super::store::commit_page_batch_ctx(store, entropy, &stranded, &retried).await?;
     }
     Ok(applied)
-  }
-
-  /// Verifies one record against its writer's trusted key and commits it
-  /// through the conditional register. A bad signature is a debug-evident
-  /// skip; an installed commit reports `Some(1)`.
-  async fn verify_and_commit_ctx(
-    store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
-    writer_key: &crate::PublicKey,
-  ) -> Result<Option<usize>> {
-    if let Err(error) = record.verify(writer_key) {
-      tracing::debug!(
-        writer = %record.writer(),
-        kind = ?error.kind(),
-        "resource page record skipped: bad signature"
-      );
-      return Ok(None);
-    }
-    if matches!(
-      super::super::store::commit_record_ctx(store, entropy, record).await?,
-      super::super::store::ResourceCommitOutcome::Installed(_)
-    ) {
-      return Ok(Some(1));
-    }
-    Ok(None)
   }
 
   /// The trusted public key of `writer`, resolved from the locally stored

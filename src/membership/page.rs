@@ -193,32 +193,14 @@ pub(crate) mod sync {
   /// Applies one received page over the running node's metadata store:
   /// the store accepts only the exact next revision, so stale, repeated,
   /// downgraded, and replayed descriptors cannot replace a newer record.
+  /// One batched transaction for the whole page — the per-descriptor
+  /// decisions live in the store module beside the single-descriptor
+  /// commit they mirror — so a page costs one durable commit, not one
+  /// per descriptor.
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &MembershipPage,
   ) -> Result<Vec<NodeId>> {
-    let _permit = store.write_permit().await;
-    let mut applied = Vec::new();
-    for descriptor in page.descriptors() {
-      // Skip descriptors we already have at an equal or higher revision.
-      if let Ok(Some(current)) = super::store::read_descriptor_ctx(store, descriptor.node()).await
-        && current.revision() >= descriptor.revision()
-      {
-        continue;
-      }
-      match super::store::store_descriptor_ctx(store, entropy, descriptor).await {
-        Ok(()) => applied.push(descriptor.node().clone()),
-        // A store-level refusal (a concurrent newer revision won, or a
-        // storage failure) is a skip, not a page failure: the anti-
-        // entropy cadence re-delivers, and the refusal is observable.
-        Err(error) => tracing::debug!(
-          node = %descriptor.node(),
-          revision = descriptor.revision(),
-          kind = ?error.kind(),
-          "membership page descriptor skipped: store refused",
-        ),
-      }
-    }
-    Ok(applied)
+    super::store::apply_descriptor_batch_ctx(store, entropy, page).await
   }
 
   /// Emits one bounded page of descriptors starting after `cursor` over a
