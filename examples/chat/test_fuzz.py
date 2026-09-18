@@ -619,6 +619,18 @@ def main() -> None:
     "the command is issued into a possibly-unconverged cluster and the "
     "next checked op absorbs the verification",
   )
+  parser.add_argument(
+    "--graph-seed", type=int, default=None,
+    help="with --extra-edges: pre-shape a seeded random connected graph "
+    "(shuffled backbone + extra edges dialed via /connect) under the "
+    "join star, so the operation matrix runs over chaotic multi-hop "
+    "paths instead of a pure star",
+  )
+  parser.add_argument(
+    "--extra-edges", type=int, default=0,
+    help="number of extra random edges dialed on top of the backbone "
+    "(requires --graph-seed)",
+  )
   args = parser.parse_args()
 
   rng = random.Random(args.seed)
@@ -629,19 +641,91 @@ def main() -> None:
   # Freshness preflight: the model assumes a fresh cluster (only the
   # hub, nothing merged). A dirty cluster from a previous run would
   # violate the model immediately — fail fast with the remedy instead.
+  # With a pre-shaped graph the configured edges are the harness's own
+  # doings, so the sessions check is skipped but liveness stays checked.
   for node in range(1, N + 1):
     ok, payload = http(node, "GET", "/whoami")
     if not ok:
       print(f"[fuzz] c{node} is not responding; run ./down.sh && FUZZ=1 ./up.sh first")
       sys.exit(1)
-  for node in range(args.node_start, N + 1):
-    ok, sessions = sessions_of(node)
-    if ok and sessions != 0:
-      print(
+  if args.graph_seed is None:
+    for node in range(args.node_start, N + 1):
+      ok, sessions = sessions_of(node)
+      if ok and sessions != 0:
+        print(
         f"[fuzz] c{node} already holds {sessions} sessions; "
         "the cluster is not fresh — run ./down.sh && FUZZ=1 ./up.sh first"
       )
       sys.exit(1)
+
+  # The topology seam: every node first merges through the bootstrap hub
+  # (so trust bindings propagate cluster-wide), then a seeded random set
+  # of extra edges is dialed via /connect on top of the star — the
+  # operation matrix then runs over chaotic multi-hop paths instead of a
+  # pure star. Join ops no-op afterwards (everything is merged); the
+  # join-timing races stay covered by the pure-star lanes.
+  if args.graph_seed is not None:
+    graph_rng = random.Random(args.graph_seed)
+    ids: dict[int, str] = {}
+    hosts: dict[int, str] = {}
+    for node in range(1, N + 1):
+      ok, payload = http(node, "GET", "/whoami")
+      if not ok:
+        raise HarnessError(f"c{node} /whoami failed during graph shaping")
+      ids[node] = payload["node_id"]
+      hosts[node] = f"{NAME_PREFIX}c{node}" if NAME_PREFIX else f"c{node}"
+    bootstrap_host = hosts[1]
+    for node in range(2, N + 1):
+      deadline = time.monotonic() + 60
+      joined = False
+      while time.monotonic() < deadline and not joined:
+        status, payload = http(
+          node, "POST", "/join-chat",
+          {"bootstrap_http": f"{bootstrap_host}:8080",
+           "bootstrap_wss": f"wss://{bootstrap_host}:9443"},
+          timeout=30,
+        )
+        joined = status == 200 and (payload or {}).get("joined")
+        if not joined:
+          time.sleep(0.5)
+      if not joined:
+        raise HarnessError(f"c{node} pre-join never settled")
+    model.merged.update(u for u in model.alive)
+    perm = list(range(1, N + 1))
+    graph_rng.shuffle(perm)
+    edges = set()
+    for a, b in zip(perm, perm[1:]):
+      edges.add((min(a, b), max(a, b)))
+    extra = max(1, args.extra_edges)
+    while extra > 0:
+      a, b = graph_rng.sample(range(1, N + 1), 2)
+      e = (min(a, b), max(a, b))
+      if e not in edges:
+        edges.add(e)
+        extra -= 1
+    dialed = 0
+    skipped = []
+    for a, b in sorted(edges):
+      deadline = time.monotonic() + 180
+      dialed_ok = False
+      while time.monotonic() < deadline and not dialed_ok:
+        status, payload = http(
+          a, "POST", "/connect",
+          {"endpoint": f"wss://{hosts[b]}:9443", "node_id": ids[b]},
+          timeout=30,
+        )
+        if status == 200 and (payload or {}).get("connected"):
+          dialed_ok = True
+          dialed += 1
+        time.sleep(1.0)
+      if not dialed_ok:
+        skipped.append(f"{a}->{b}")
+    if skipped:
+      print(f"[fuzz] graph edges skipped after 180s (auth not converged): {skipped}")
+    print(
+      f"[fuzz] pre-shaped random graph: seed={args.graph_seed} "
+      f"edges={len(edges)} dialed={dialed}"
+    )
 
   print(f"[fuzz] seed={args.seed} ops={args.ops} nodes={N}")
   step = 0

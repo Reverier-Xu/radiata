@@ -994,6 +994,29 @@ async fn disconnect(
   Ok(Json(json!({"disconnected": true})))
 }
 
+#[derive(serde::Deserialize)]
+pub struct ConnectRequest {
+  pub endpoint: String,
+  pub node_id: String,
+}
+
+/// Dials one peer explicitly: the topology shaper uses it to add the
+/// non-tree edges of a shaped graph after the roster converges. A
+/// caller-directed dial is a configured edge — the recovery pruner
+/// never reclaims it.
+async fn connect(
+  state: State<SharedState>, Json(request): Json<ConnectRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let endpoint = radiata::Endpoint::parse(&request.endpoint).map_err(name_error)?;
+  let node_id = NodeId::parse(&request.node_id).map_err(name_error)?;
+  let connected = state
+    .node
+    .command(radiata::ConnectMember::new(endpoint, node_id))
+    .await
+    .map_err(internal)?;
+  Ok(Json(json!({"connected": connected.as_str()})))
+}
+
 /// Leaves the cluster: the identity is replaced and the old identity's
 /// core metadata is deleted (the operator acknowledges deliberately).
 /// The former user's chat identity resource stays behind as departed
@@ -1033,6 +1056,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/labels/{user}", get(member_labels))
     .route("/mesh-sessions", get(mesh_sessions))
     .route("/disconnect", post(disconnect))
+    .route("/connect", post(connect))
     .route("/leave", post(leave))
     .with_state(state)
 }
