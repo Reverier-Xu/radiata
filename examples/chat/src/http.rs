@@ -860,7 +860,12 @@ async fn mesh_sessions(
       .await
       .map_err(internal)?;
     raw += view.items().len();
-    peers.extend(view.items().iter().map(|session| session.peer().as_str().to_owned()));
+    peers.extend(
+      view
+        .items()
+        .iter()
+        .map(|session| session.peer().as_str().to_owned()),
+    );
     next = view
       .next()
       .cloned()
@@ -870,7 +875,9 @@ async fn mesh_sessions(
   }
   peers.sort();
   peers.dedup();
-  Ok(Json(json!({"sessions": raw, "distinct": peers.len(), "peers": peers})))
+  Ok(Json(
+    json!({"sessions": raw, "distinct": peers.len(), "peers": peers}),
+  ))
 }
 
 fn label_map_json(view: &radiata::MemberView) -> serde_json::Map<String, Value> {
