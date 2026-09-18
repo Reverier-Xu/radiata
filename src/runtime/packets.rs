@@ -106,7 +106,7 @@ impl Supervisor {
     );
     let (entry, force_routed) = match direct {
       Some(entry) => (entry, false),
-      None => match self.select_forward_entry(&destination).await {
+      None => match self.select_forward_entry(&trace_id, &destination).await {
         Ok(Some(entry)) => (entry, true),
         Ok(None) => {
           fail(request, ErrorKind::RouteUnavailable);

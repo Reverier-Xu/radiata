@@ -244,7 +244,11 @@ async fn send_wire(
   let payload = serde_json::to_vec(message).map_err(|error| error.to_string())?;
   let protocol =
     radiata::ProtocolTag::parse(crate::chat::CHAT_PROTOCOL).map_err(|error| error.to_string())?;
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).map_err(|error| error.to_string())?;
+  // The hop budget must cover the mesh's longest simple path, not a
+  // typical depth: a 32-node chain relay needs 31 hops (an 8-hop budget
+  // never delivered across it), and routes are loop-free by validation,
+  // so a generous budget costs nothing beyond one check per hop.
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 128).map_err(|error| error.to_string())?;
   let stream = state
     .node
     .open_stream(

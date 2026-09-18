@@ -54,7 +54,7 @@ impl Supervisor {
   /// built-in default policy). `Ok(None)` means no eligible hop exists and
   /// the caller fails the route explicitly.
   pub(super) async fn select_forward_entry(
-    &self, destination: &NodeId,
+    &self, trace: &crate::TraceId, destination: &NodeId,
   ) -> Result<Option<SessionEntry>> {
     let tag = self.dependencies.config.route_policy()?;
     let local = self.packet.local().clone();
@@ -62,6 +62,7 @@ impl Supervisor {
     let hop = match crate::routing::resolve_next_hop(
       &self.dependencies.extensions,
       &tag,
+      trace,
       destination,
       &local,
       &peers,

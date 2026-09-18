@@ -738,16 +738,26 @@ impl CandidateNodeReader for StoreCandidateReader {
 }
 
 /// The sealed per-hop decision inputs handed to a registered
-/// [`RouteNextHop`] policy: the final destination, this node, and the
-/// live session peers available as next hops (canonical order).
+/// [`RouteNextHop`] policy: the packet's trace, the final destination,
+/// this node, and the live session peers available as next hops
+/// (canonical order).
 #[derive(Debug)]
 pub struct NextHopView<'a> {
+  pub(crate) trace: &'a crate::TraceId,
   pub(crate) destination: &'a NodeId,
   pub(crate) local: &'a NodeId,
   pub(crate) peers: &'a [NodeId],
 }
 
 impl NextHopView<'_> {
+  /// The routed packet's trace id: stable across every hop of one
+  /// delivery attempt and fresh per retry, so a policy can spread retry
+  /// attempts across candidate relays while staying deterministic for a
+  /// given attempt.
+  pub fn trace(&self) -> &crate::TraceId {
+    self.trace
+  }
+
   pub fn destination(&self) -> &NodeId {
     self.destination
   }
@@ -770,12 +780,22 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
   fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>>;
 }
 
-/// The built-in next-hop policy: relays through the lowest live peer id.
-/// Direct delivery to a connected destination is resolved by the routing
-/// plane before any policy is consulted, so the policy only ever sees
-/// unconnected destinations and always relays. The choice is
-/// deterministic (canonical peer order, minimum wins), which keeps
-/// loop-freedom reasoning and replay tests simple.
+/// The built-in next-hop policy: relays through the live peer that
+/// minimizes a trace-keyed hash of the peer id — a stable, uniform
+/// shuffle of the candidate set for the current delivery attempt. Direct
+/// delivery to a connected destination is resolved by the routing plane
+/// before any policy is consulted, so the policy only ever sees
+/// unconnected destinations and always relays.
+///
+/// The choice is deterministic for a given trace and candidate set (the
+/// same attempt always picks the same relay, which keeps loop-freedom
+/// reasoning and replay tests simple) and fresh per retry: a caller
+/// retrying a failed delivery opens a new trace, so the next attempt
+/// takes a different relay path instead of repeating a failed one. On
+/// branching topologies, where no stateless policy can tell which
+/// neighbor leads toward the destination, that per-attempt variation is
+/// what turns bounded caller-level retries into delivery — a pick that
+/// walked into a dead-end subtree is never repeated verbatim.
 ///
 /// This is the default policy: the node builder registers it under
 /// [`DefaultNextHop::TAG`] unless the caller already did, and a node
@@ -802,6 +822,18 @@ impl DefaultNextHop {
       .clone()
       .map_err(|_| Error::internal("built-in next-hop policy tag"))
   }
+
+  /// The trace-keyed relay rank of one candidate peer. The hash is keyed
+  /// by the current attempt's trace, so the same attempt ranks a peer
+  /// identically at every evaluation and a retry attempt (fresh trace)
+  /// ranks it independently.
+  fn rank(trace: &crate::TraceId, peer: &NodeId) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&trace.as_str(), &mut hasher);
+    std::hash::Hash::hash(&0_u8, &mut hasher);
+    std::hash::Hash::hash(&peer.as_str(), &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+  }
 }
 
 impl RouteNextHop for DefaultNextHop {
@@ -810,7 +842,7 @@ impl RouteNextHop for DefaultNextHop {
       view
         .peers()
         .iter()
-        .min()
+        .min_by_key(|peer| Self::rank(view.trace(), peer))
         .cloned()
         .ok_or_else(|| Error::caller("no live peer to relay through"))
     })
@@ -819,18 +851,19 @@ impl RouteNextHop for DefaultNextHop {
 
 /// The shared next-hop resolution for the routing plane: resolves the
 /// registered [`RouteNextHop`] policy named by `tag` against the route
-/// view built from `destination`, `local`, and the alive `peers`.
-/// `Ok(None)` means `tag` names no registered policy — the callers apply
-/// their own observability and fallback; the policy's own rejection
-/// propagates as `Err`.
+/// view built from `trace`, `destination`, `local`, and the alive
+/// `peers`. `Ok(None)` means `tag` names no registered policy — the
+/// callers apply their own observability and fallback; the policy's own
+/// rejection propagates as `Err`.
 pub(crate) async fn resolve_next_hop(
   registry: &crate::extension_registry::ExtensionRegistry, tag: &QualifiedTag,
-  destination: &NodeId, local: &NodeId, peers: &[NodeId],
+  trace: &crate::TraceId, destination: &NodeId, local: &NodeId, peers: &[NodeId],
 ) -> Result<Option<NodeId>> {
   let Some(policy) = registry.next_hop_policy(tag) else {
     return Ok(None);
   };
   let view = NextHopView {
+    trace,
     destination,
     local,
     peers,
@@ -854,9 +887,10 @@ mod tests {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
-  /// The built-in default policy always relays through the lowest live
-  /// peer id regardless of input order, and fails closed with a typed
-  /// caller error when no live peer exists.
+  /// The built-in default policy is deterministic for a given trace
+  /// (order-independent), varies across fresh traces so caller retries
+  /// explore different relay paths, and fails closed with a typed caller
+  /// error when no live peer exists.
   #[tokio::test]
   async fn default_next_hop_is_deterministic_and_fails_closed() {
     use super::{DefaultNextHop, NextHopView, RouteNextHop};
@@ -864,16 +898,43 @@ mod tests {
     let destination = node(9);
     let local = node(0);
     let policy = DefaultNextHop;
+    let trace = TraceId::parse("trace-000000000000000000001").unwrap();
+    let peers: Vec<NodeId> = [4, 2, 7].iter().map(|value| node(*value)).collect();
+    let mut picks = std::collections::BTreeSet::new();
     for ordering in [[4, 2, 7], [7, 4, 2], [2, 7, 4]] {
-      let peers: Vec<NodeId> = ordering.iter().map(|value| node(*value)).collect();
+      let shuffled: Vec<NodeId> = ordering.iter().map(|value| node(*value)).collect();
       let view = NextHopView {
+        trace: &trace,
+        destination: &destination,
+        local: &local,
+        peers: &shuffled,
+      };
+      picks.insert(policy.next_hop(view).await.unwrap());
+    }
+    assert_eq!(
+      picks.len(),
+      1,
+      "one trace must pick one relay regardless of peer order"
+    );
+    // Fresh traces (retry attempts) explore the candidate set instead of
+    // repeating one pick: over 64 traces, several distinct relays win.
+    let mut winners = std::collections::BTreeSet::new();
+    for seed in 1..=64_u32 {
+      let trace = TraceId::parse(&format!("trace-{seed:021}")).unwrap();
+      let view = NextHopView {
+        trace: &trace,
         destination: &destination,
         local: &local,
         peers: &peers,
       };
-      assert_eq!(policy.next_hop(view).await.unwrap(), node(2));
+      winners.insert(policy.next_hop(view).await.unwrap());
     }
+    assert!(
+      winners.len() >= 2,
+      "retry attempts must not all repeat one relay: {winners:?}"
+    );
     let view = NextHopView {
+      trace: &trace,
       destination: &destination,
       local: &local,
       peers: &[],

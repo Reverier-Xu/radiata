@@ -787,7 +787,10 @@ async fn routed_probe(
     ));
   };
   let selector = Selector::parse(selector_text).map_err(bad_request)?;
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8)
+  // The budget covers the mesh's longest simple path: routes are
+  // loop-free by validation, so a generous budget only costs one check
+  // per hop while an 8-hop cap silently fails long relay chains.
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 128)
     .map_err(internal_error)?
     .load_balancer(QualifiedTag::parse(FIRST_MATCH_BALANCER).map_err(bad_request)?);
   let started = std::time::Instant::now();

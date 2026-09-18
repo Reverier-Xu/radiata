@@ -132,6 +132,7 @@ pub(crate) async fn open(
       select_next_hop(
         registry,
         route_policy,
+        &open.trace_id,
         &open.destination,
         local,
         &candidates,
@@ -353,8 +354,8 @@ async fn relay_open(
 }
 
 async fn select_next_hop(
-  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, destination: &NodeId,
-  local: &NodeId, peers: &[NodeId],
+  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, trace: &TraceId,
+  destination: &NodeId, local: &NodeId, peers: &[NodeId],
 ) -> Result<NodeId> {
   if peers.contains(destination) {
     return Ok(destination.clone());
@@ -362,9 +363,10 @@ async fn select_next_hop(
   // A tag naming no registered policy fails closed: with the builder's
   // built-in registration this only happens for a caller tag that was
   // never registered on this node.
-  let hop = crate::routing::resolve_next_hop(registry, route_policy, destination, local, peers)
-    .await?
-    .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
+  let hop =
+    crate::routing::resolve_next_hop(registry, route_policy, trace, destination, local, peers)
+      .await?
+      .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
   if peers.contains(&hop) {
     Ok(hop)
   } else {

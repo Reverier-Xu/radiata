@@ -102,19 +102,23 @@
 //! closed at the route boundary.
 //!
 //! The built-in [`DefaultNextHop`](crate::DefaultNextHop)
-//! relays through the lowest live peer id — deterministic, loop-free,
-//! and the default: the node registers it under its well-known tag and
-//! selects it unless the configuration names another policy, so
-//! multi-hop relay works out of the box. Implement the trait to replace
-//! it (a hub-and-spoke relay, a latency-aware pick, a shard-affine
-//! route):
+//! relays through the live peer a trace-keyed hash ranks first — a
+//! stable shuffle per delivery attempt, loop-free, and the default: the
+//! node registers it under its well-known tag and selects it unless the
+//! configuration names another policy, so multi-hop relay works out of
+//! the box. Because a retry opens a fresh trace, each retry attempt
+//! takes a different relay path instead of repeating a failed one, so
+//! caller-level retries deliver over branching topologies where a
+//! fixed pick could keep walking into a dead-end subtree. Implement the
+//! trait to replace it (a hub-and-spoke relay, a latency-aware pick, a
+//! shard-affine route):
 //!
 //! ```
 //! use radiata::{BoxFuture, NextHopView, NodeId, Result, RouteNextHop};
 //!
-//! /// Relays every unconnected destination through the lowest live
-//! /// peer — the same deterministic choice the built-in
-//! /// `DefaultNextHop` makes, spelled out as a starting point.
+//! /// Relays every unconnected destination through the first live
+//! /// peer in canonical order — a deterministic pick spelled out as
+//! /// a starting point.
 //! #[derive(Debug)]
 //! struct LowestPeerFirst;
 //!
