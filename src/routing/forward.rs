@@ -51,12 +51,29 @@ pub(crate) enum PendingAck {
 /// The per-session pending-admission map keyed by trace id.
 pub(crate) type PendingAcks = Arc<std::sync::Mutex<HashMap<TraceId, PendingAck>>>;
 
+/// The untried candidates of a discovering hop: the open frame is
+/// re-encoded per attempt with the SAME envelope state (the attempt is
+/// an alternative branch at this hop, not extra depth), so a failed
+/// subtree costs one re-dispatch here instead of an exponential
+/// re-walk from the origin.
+#[derive(Clone)]
+pub(crate) struct RetryState {
+  open: OpenFrame,
+  context: crate::routing::RouteContext,
+  candidates: Vec<NodeId>,
+  downstream_acks: PendingAcks,
+}
+
 #[derive(Clone)]
 pub(crate) struct ForwardingHop {
   /// Frames toward the upstream holder: acknowledgement relays.
   pub(crate) upstream: BoundedSender,
   /// Frames toward the validated next hop: payload relay.
   pub(crate) downstream: BoundedSender,
+  /// The current attempt's downstream session's pending-admission map:
+  /// a failure acknowledgement is consumed here (the entry would
+  /// otherwise relay the failure upstream past this hop's own retry).
+  pub(crate) downstream_acks: PendingAcks,
   /// The authenticated peer this hop came from; the session that owns the
   /// upstream sender above cleans its hops up when it ends.
   pub(crate) upstream_peer: NodeId,
@@ -66,7 +83,11 @@ pub(crate) struct ForwardingHop {
   /// chunk-then-end order) or observes the entry already gone. The entry
   /// stays in the table throughout, so cancellation or session death can
   /// never orphan a downstream leg without an explicit end.
-  relay_lock: Arc<tokio::sync::Mutex<()>>,
+  pub(crate) relay_lock: Arc<tokio::sync::Mutex<()>>,
+  /// `Some` while the hop is discovering a live downstream branch
+  /// (pre-admission DFS); `None` once the destination admitted and the
+  /// hop is a pure relay.
+  pub(crate) retry: Option<RetryState>,
 }
 
 /// The node-local table of in-flight forwarded routes.
@@ -160,7 +181,14 @@ pub(crate) async fn open(
         send_status(upstream, &open.trace_id, AckStatus::Overloaded);
       } else {
         relay_open(
-          &context, &next_hop, peer, &open, upstream, sessions, forwarding,
+          &context,
+          &next_hop,
+          peer,
+          &open,
+          upstream,
+          sessions,
+          forwarding,
+          &candidates,
         )
         .await;
       }
@@ -270,9 +298,15 @@ pub(crate) async fn close_for_peer(table: &ForwardingTable, upstream_peer: &Node
   }
 }
 
+/// Queues one routed open on its validated downstream session and
+/// registers the relay hop (with its untried branches for the failure-
+/// driven branch search). The argument list mirrors the hop's
+/// collaborators; no subset forms a meaningful grouping.
+#[allow(clippy::too_many_arguments)]
 async fn relay_open(
   context: &crate::routing::RouteContext, next_hop: &NodeId, peer: &NodeId, open: &OpenFrame,
   upstream: &BoundedSender, sessions: &SessionTable, forwarding: &ForwardingTable,
+  candidates: &[NodeId],
 ) {
   let downstream = match sessions.lock() {
     Ok(guard) => guard
@@ -342,14 +376,154 @@ async fn relay_open(
     ForwardingHop {
       upstream: upstream.clone(),
       downstream: downstream_frames,
+      downstream_acks: downstream_acks.clone(),
       upstream_peer: peer.clone(),
       relay_lock: Arc::new(tokio::sync::Mutex::new(())),
+      // The untried branches of this hop: a failure acknowledgement from
+      // downstream re-dispatches here before surfacing upstream.
+      retry: Some(RetryState {
+        open: open.clone(),
+        context: context.clone(),
+        candidates: candidates
+          .iter()
+          .filter(|candidate| *candidate != next_hop)
+          .cloned()
+          .collect(),
+        downstream_acks: downstream_acks.clone(),
+      }),
     },
   )
   .is_err()
   {
     remove_pending(&downstream_acks, &open.trace_id);
     reject_open(upstream, &open.trace_id);
+  }
+}
+
+/// Whether this node's forwarding table owns `trace_id` in its
+/// discovering (pre-admission) state: a failure acknowledgement for such
+/// a trace belongs to this hop's retry, not to a plain upstream relay.
+pub(crate) fn owns_discovering(table: &ForwardingTable, trace_id: &TraceId) -> bool {
+  locked(table)
+    .get(trace_id)
+    .is_some_and(|hop| hop.retry.is_some())
+}
+
+/// Marks a discovering hop admitted: the destination acknowledged the
+/// current branch, so the hop becomes a pure relay and later failures
+/// travel upstream exactly as before (never retried mid-stream).
+pub(crate) fn mark_admitted(table: &ForwardingTable, trace_id: &TraceId) {
+  if let Some(hop) = locked(table).get_mut(trace_id) {
+    hop.retry = None;
+  }
+}
+
+/// One downstream attempt failed before admission: consume the failed
+/// attempt's pending entry, re-dispatch the open to this hop's next
+/// untried candidate, and re-register there — a distributed
+/// depth-first search over this hop's loop-free branches. Exhausted
+/// candidates fail the route upstream, where the upstream holder runs
+/// its own retry; the whole exploration is bounded because every
+/// (hop, candidate) pair is tried at most once per trace.
+pub(crate) async fn on_downstream_failure(
+  forwarding: &ForwardingTable, trace_id: &TraceId, sessions: &SessionTable,
+) {
+  let (mut retry, upstream) = {
+    let mut guard = locked(forwarding);
+    let Some(hop) = guard.get_mut(trace_id) else {
+      return;
+    };
+    let Some(retry) = hop.retry.take() else {
+      return;
+    };
+    // The failed attempt's pending entry would relay this failure
+    // upstream past this hop's own retry: consume it here.
+    remove_pending(&retry.downstream_acks, trace_id);
+    (retry, hop.upstream.clone())
+  };
+  loop {
+    let Some(candidate) = retry.candidates.pop() else {
+      // Every untried branch at this hop failed: the route is over —
+      // remove the hop so later frames for the trace drop silently —
+      // and the failure goes upstream, where the upstream holder runs
+      // its own retry over its own untried branches.
+      let upstream = {
+        let mut guard = locked(forwarding);
+        let upstream = guard.get(trace_id).map(|hop| hop.upstream.clone());
+        guard.remove(trace_id);
+        upstream
+      };
+      let Some(upstream) = upstream else {
+        return;
+      };
+      debug!(trace_id = %trace_id, "forwarded route exhausted its branches; failing upstream");
+      send_status(&upstream, trace_id, AckStatus::Failed);
+      return;
+    };
+    let entry = sessions
+      .lock()
+      .ok()
+      .and_then(|guard| guard.get(&candidate).cloned())
+      .filter(|entry| entry.alive());
+    let Some(entry) = entry else {
+      debug!(
+        candidate = %candidate,
+        trace_id = %trace_id,
+        "retry candidate has no live session"
+      );
+      continue;
+    };
+    let downstream_acks = entry.pending_acks.clone();
+    let queued = (|| {
+      let mut acks = downstream_acks.lock().ok()?;
+      if acks.contains_key(trace_id) || acks.len() >= crate::session::stream::MAX_PENDING_ADMISSIONS
+      {
+        return None;
+      }
+      acks.insert(
+        trace_id.clone(),
+        PendingAck::Relay {
+          upstream: upstream.clone(),
+        },
+      );
+      // Re-encode the open with the SAME envelope state: the retry is
+      // an alternative branch at this hop, not extra depth.
+      let context = retry.context.hop_state();
+      wire::encode_open(&OpenFrame {
+        trace_id: trace_id.clone(),
+        source: retry.open.source.clone(),
+        destination: retry.open.destination.clone(),
+        protocol: retry.open.protocol.clone(),
+        metadata: retry.open.metadata.clone(),
+        route: Some(context),
+      })
+      .ok()
+    })();
+    let Some(body) = queued else {
+      // The candidate cannot carry the frame right now: count it as a
+      // failed attempt and continue the search.
+      continue;
+    };
+    if entry
+      .frames
+      .send_waiting(SessionFrame::new(PacketKind::Open, body))
+      .await
+      .is_err()
+    {
+      remove_pending(&downstream_acks, trace_id);
+      continue;
+    }
+    if let Some(hop) = locked(forwarding).get_mut(trace_id) {
+      hop.downstream = entry.frames.clone();
+      hop.downstream_acks = downstream_acks;
+      hop.retry = Some(retry);
+    }
+    debug!(
+      candidate = %candidate,
+      trace_id = %trace_id,
+      "forwarded route retried on the next branch"
+    );
+    return;
   }
 }
 
@@ -515,8 +689,12 @@ mod tests {
       ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
+        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
+          std::collections::HashMap::new(),
+        )),
         upstream_peer: node(9),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        retry: None,
       },
     )
     .unwrap();
@@ -578,8 +756,12 @@ mod tests {
       ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
+        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
+          std::collections::HashMap::new(),
+        )),
         upstream_peer: node(9),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        retry: None,
       },
     )
     .unwrap();
@@ -620,8 +802,12 @@ mod tests {
       ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
+        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
+          std::collections::HashMap::new(),
+        )),
         upstream_peer: node(9),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        retry: None,
       },
     )
     .unwrap();
@@ -661,8 +847,12 @@ mod tests {
         ForwardingHop {
           upstream: upstream_tx,
           downstream: downstream_tx,
+          downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+          )),
           upstream_peer: feeder.clone(),
           relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+          retry: None,
         },
       )
       .unwrap();
@@ -680,8 +870,12 @@ mod tests {
       ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
+        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
+          std::collections::HashMap::new(),
+        )),
         upstream_peer: node(8),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        retry: None,
       },
     )
     .unwrap();
@@ -705,8 +899,12 @@ mod tests {
       ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
+        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
+          std::collections::HashMap::new(),
+        )),
         upstream_peer: feeder.clone(),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        retry: None,
       },
     )
     .unwrap();
@@ -742,5 +940,167 @@ mod tests {
     assert_eq!(frame.kind, PacketKind::End);
     closer.await.unwrap();
     assert!(!super::contains(&table, &trace(7)));
+  }
+}
+
+// ---- failure-driven branch search (pre-admission DFS) ----
+
+#[cfg(test)]
+mod retry_tests {
+  use std::sync::Arc;
+
+  use futures_util::FutureExt as _;
+
+  use super::{ForwardingHop, RetryState, new_table, owns_discovering, register};
+  use crate::{
+    api::Entropy,
+    session::stream::{SessionTable, test_entry, test_queue},
+  };
+
+  fn node(value: u8) -> crate::NodeId {
+    crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> crate::TraceId {
+    crate::TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  fn entropy() -> Arc<dyn Entropy> {
+    Arc::new(crate::identity::testing::SequenceEntropy::default())
+  }
+
+  fn hop_with_retry(
+    upstream: crate::session::stream::BoundedSender,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: super::PendingAcks,
+    candidates: Vec<crate::NodeId>,
+  ) -> ForwardingHop {
+    let trace_id = trace(99);
+    ForwardingHop {
+      upstream,
+      downstream,
+      downstream_acks: downstream_acks.clone(),
+      upstream_peer: node(1),
+      relay_lock: Arc::new(tokio::sync::Mutex::new(())),
+      retry: Some(RetryState {
+        open: crate::packet::wire::OpenFrame {
+          trace_id: trace_id.clone(),
+          source: node(1),
+          destination: node(9),
+          protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+          metadata: crate::StreamMetadata::new(),
+          route: None,
+        },
+        context: crate::routing::RouteContext::new(trace_id, node(1), node(9), 8),
+        candidates,
+        downstream_acks,
+      }),
+    }
+  }
+
+  /// A failed downstream attempt re-dispatches the open to the hop's
+  /// next untried candidate: the new session receives the open, the hop
+  /// switches its downstream leg, and the failed session's pending entry
+  /// is consumed instead of relayed upstream.
+  #[tokio::test]
+  async fn a_failed_branch_redispatches_on_the_next_candidate() {
+    let table = new_table();
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
+    let entropy = entropy();
+
+    // The next candidate holds a live session.
+    let (good_entry, mut good_rx) = test_entry(entropy.as_ref());
+    let good_id = node(7);
+    sessions.lock().unwrap().insert(good_id.clone(), good_entry);
+
+    // The hop: currently on a failed branch whose pending map holds the
+    // trace, with one untried candidate (the live session above).
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let _upstream_keep = upstream_tx.clone();
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    let failed_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    failed_acks.lock().unwrap().insert(
+      trace(99),
+      super::PendingAck::Relay {
+        upstream: upstream_tx.clone(),
+      },
+    );
+    let candidates = vec![good_id.clone()];
+    register(
+      &table,
+      trace(99),
+      hop_with_retry(upstream_tx, downstream_tx, failed_acks.clone(), candidates),
+    )
+    .unwrap();
+    assert!(owns_discovering(&table, &trace(99)));
+
+    super::on_downstream_failure(&table, &trace(99), &sessions).await;
+
+    // The open was re-dispatched to the live candidate.
+    let frame = good_rx.recv().await.expect("redispatched open");
+    assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Open);
+    // The failed branch's pending entry was consumed...
+    assert!(!failed_acks.lock().unwrap().contains_key(&trace(99)));
+    // ...the hop switched legs and stays discovering...
+    let guard = super::locked(&table);
+    let hop = guard.get(&trace(99)).expect("hop stays registered");
+    assert!(hop.retry.is_some());
+    // ...and nothing failed upstream (the search continues silently).
+    assert!(upstream_rx.recv().now_or_never().is_none());
+  }
+
+  /// An exhausted branch list fails the route upstream exactly once and
+  /// removes the hop: the upstream holder runs its own branch search.
+  #[tokio::test]
+  async fn an_exhausted_branch_list_fails_upstream_once() {
+    let table = new_table();
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
+
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    let failed_acks: super::PendingAcks =
+      Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    failed_acks.lock().unwrap().insert(
+      trace(99),
+      super::PendingAck::Relay {
+        upstream: upstream_tx.clone(),
+      },
+    );
+    register(
+      &table,
+      trace(99),
+      hop_with_retry(upstream_tx, downstream_tx, failed_acks.clone(), Vec::new()),
+    )
+    .unwrap();
+
+    super::on_downstream_failure(&table, &trace(99), &sessions).await;
+
+    let frame = upstream_rx.recv().await.expect("typed failure upstream");
+    assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Ack);
+    let ack =
+      crate::packet::wire::decode_ack(&frame.body, crate::protocol::CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.status, crate::packet::wire::AckStatus::Failed);
+    assert!(!super::contains(&table, &trace(99)));
+    // The failed attempt's pending entry was consumed on the way out.
+    assert!(failed_acks.lock().unwrap().is_empty());
+  }
+
+  /// Once the destination admits a branch, the hop is a pure relay: a
+  /// later failure is never retried, it surfaces upstream immediately.
+  #[test]
+  fn an_admitted_hop_stops_discovering() {
+    let table = new_table();
+    assert!(!owns_discovering(&table, &trace(99)));
+    let (upstream_tx, _upstream_rx) = test_queue(16, usize::MAX);
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    register(
+      &table,
+      trace(99),
+      hop_with_retry(upstream_tx, downstream_tx, acks, Vec::new()),
+    )
+    .unwrap();
+    assert!(owns_discovering(&table, &trace(99)));
+    super::mark_admitted(&table, &trace(99));
+    assert!(!owns_discovering(&table, &trace(99)));
   }
 }

@@ -199,13 +199,31 @@ pub(super) async fn read_loop(
       },
       PacketKind::Ack => match wire::decode_ack(&message.body, context.parser_limits()) {
         Ok(ack) => {
-          resolve_ack(ack.clone(), pending_acks);
-          // A late failure for an admitted stream (a downstream hop died
-          // mid-flight) still terminates the origin's route observation.
-          if ack.status == crate::packet::wire::AckStatus::Failed {
-            update_route(&context.routes, &ack.trace_id, |record| {
-              record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
-            });
+          // A failure for a trace this node is still discovering (it
+          // forwarded the open and the destination has not admitted it
+          // yet) belongs to this hop's branch search: the failed
+          // attempt's pending entry is consumed and the next untried
+          // branch is re-dispatched, instead of relaying the failure
+          // upstream. Every other acknowledgement resolves the session's
+          // pending admission exactly as before.
+          if ack.status != crate::packet::wire::AckStatus::Admitted
+            && forward::owns_discovering(&context.forwarding, &ack.trace_id)
+          {
+            forward::on_downstream_failure(&context.forwarding, &ack.trace_id, &context.sessions)
+              .await;
+          } else {
+            if ack.status == crate::packet::wire::AckStatus::Admitted {
+              forward::mark_admitted(&context.forwarding, &ack.trace_id);
+            }
+            resolve_ack(ack.clone(), pending_acks);
+            // A late failure for an admitted stream (a downstream hop
+            // died mid-flight) still terminates the origin's route
+            // observation.
+            if ack.status == crate::packet::wire::AckStatus::Failed {
+              update_route(&context.routes, &ack.trace_id, |record| {
+                record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
+              });
+            }
           }
         }
         Err(_) => {
