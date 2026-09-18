@@ -368,27 +368,35 @@ pub(crate) mod sync {
       .filter(|record| !resolved_keys.contains_key(record.writer()))
       .collect();
     if !stranded.is_empty() {
-      let mut retried: HashMap<NodeId, crate::PublicKey> = HashMap::new();
+      // One re-resolution (and one warn) per writer, not per record: the
+      // negative cache keeps unresolved writers in the map so the warn
+      // cannot repeat.
+      let mut retried: HashMap<NodeId, Option<crate::PublicKey>> = HashMap::new();
       for record in &stranded {
-        if retried.contains_key(record.writer()) {
-          continue;
-        }
-        let resolution =
-          match crate::membership::store::read_descriptor_ctx(store, record.writer()).await {
-            Ok(Some(descriptor)) if !descriptor.removed() => Some(descriptor.public_key().clone()),
-            _ => None,
-          };
-        if let Some(key) = resolution {
-          retried.insert(record.writer().clone(), key);
-        } else {
-          tracing::warn!(
-            writer = %record.writer(),
-            "resource page writer never converged; page records skipped"
-          );
+        if !retried.contains_key(record.writer()) {
+          let resolution =
+            match crate::membership::store::read_descriptor_ctx(store, record.writer()).await {
+              Ok(Some(descriptor)) if !descriptor.removed() => {
+                Some(descriptor.public_key().clone())
+              }
+              _ => None,
+            };
+          if resolution.is_none() {
+            tracing::warn!(
+              writer = %record.writer(),
+              "resource page writer never converged; page records skipped"
+            );
+          }
+          retried.insert(record.writer().clone(), resolution);
         }
       }
+      let resolved_retry: HashMap<NodeId, crate::PublicKey> = retried
+        .iter()
+        .filter_map(|(writer, key)| key.clone().map(|key| (writer.clone(), key)))
+        .collect();
       applied +=
-        super::super::store::commit_page_batch_ctx(store, entropy, &stranded, &retried).await?;
+        super::super::store::commit_page_batch_ctx(store, entropy, &stranded, &resolved_retry)
+          .await?;
     }
     Ok(applied)
   }

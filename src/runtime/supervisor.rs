@@ -438,11 +438,10 @@ async fn supervise(
         let requests = supervisor.dependencies.sync_round_requests.clone();
         tasks.spawn(async move {
           let (round, round_rx) = tokio::sync::oneshot::channel();
+          let shut_down = Error::shutting_down("sync round");
           let result = match requests.send(round).await {
-            Ok(()) => round_rx
-              .await
-              .map_err(|_| Error::shutting_down("sync round")),
-            Err(_) => Err(Error::shutting_down("sync round")),
+            Ok(()) => round_rx.await.map_err(|_| shut_down),
+            Err(_) => Err(shut_down),
           };
           let _ = reply.send(result);
         });

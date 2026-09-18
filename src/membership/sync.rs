@@ -400,9 +400,6 @@ async fn accept_payload(
       crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
       tracing::debug!(node = %record.node(), "leave record persisted on peer");
       member_changed(events, revision, record.node().clone());
-      // The applied receipt: one durable-install
-      // confirmation back to the leaver, best-effort and retried by the
-      // announcement budget. Pre-receipt peers simply never send it.
       let receipt = SyncPayload::LeaveApplied {
         node: record.node().clone(),
       }
@@ -571,15 +568,6 @@ pub(crate) async fn ensure_local_descriptor(
   Ok(())
 }
 
-/// One anti-entropy tick: publish the local descriptor, refresh the issuer
-/// snapshot when this node is the creator, and push a bounded page plus the
-/// latest snapshot over every authenticated session. The work per tick is
-/// bounded: one page and one snapshot per session, nothing paged to
-/// exhaustion. A snapshot refresh failure (an issuer binding set that
-/// overflows the single-record control bound) skips only that round's
-/// snapshot send: the descriptor-page and tombstone anti-entropy below
-/// keeps running, so a large membership degrades the snapshot leg instead
-/// of stalling every sync lane.
 /// The driver's per-peer anti-entropy continuation state, tracked
 /// separately for every alive peer: the state is dropped when a peer's
 /// session is gone, so the returning peer's first round re-delivers
@@ -788,6 +776,15 @@ async fn membership_sync_tick_peer(
   })
 }
 
+/// One anti-entropy tick: publish the local descriptor, refresh the issuer
+/// snapshot when this node is the creator, and push a bounded page plus the
+/// latest snapshot over every authenticated session. The work per tick is
+/// bounded: one page and one snapshot per session, nothing paged to
+/// exhaustion. A snapshot refresh failure (an issuer binding set that
+/// overflows the single-record control bound) skips only that round's
+/// snapshot send: the descriptor-page and tombstone anti-entropy below
+/// keeps running, so a large membership degrades the snapshot leg instead
+/// of stalling every sync lane.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>, sessions: &SessionTable,
@@ -947,6 +944,13 @@ pub(crate) async fn sync_tick(
     pending_tombstone_acks.extend(tombstone_acks.into_iter().map(|ack| (peer.clone(), ack)));
     if let Some(ack) = page_ack {
       pending_page_acks.push((peer.clone(), ack));
+    } else {
+      // The descriptor page's dispatch was rejected while a sibling leg
+      // dispatched: the page cursor already advanced past the emitted
+      // range, so without a rewind the skipped range would wait for the
+      // full-pass arm. Rewind to the page's start — the next round
+      // re-sends exactly that page.
+      state.page.discard_progress();
     }
   }
   // Delivery verdicts resolve concurrently: one unreachable peer must
@@ -1023,6 +1027,23 @@ pub(crate) async fn sync_tick(
   Ok(())
 }
 
+/// One dispatch attempt with the lane's shared rejection diagnostics: a
+/// rejected payload resolves to `None` (the round's verdict aggregator
+/// rewinds the lane), the failure lands in the debug log once, in one
+/// place.
+async fn dispatch_or_log(
+  peer: &NodeId, payload: &[u8], runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>,
+  protocol: &ProtocolTag,
+) -> Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>> {
+  match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await {
+    Ok(ack) => Some(ack),
+    Err(error) => {
+      tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
+      None
+    }
+  }
+}
+
 /// The per-tick fan-out to one peer: sends every payload in order and
 /// returns their admission receivers, grouped by lane so each cadence
 /// commit can be gated on its own delivery verdict. The trust snapshot
@@ -1040,34 +1061,16 @@ async fn dispatch_to_peer(
   Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
 ) {
   let snapshot_ack = match snapshot_page {
-    Some(payload) => {
-      match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await {
-        Ok(ack) => Some(ack),
-        Err(error) => {
-          tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
-          None
-        }
-      }
-    }
+    Some(payload) => dispatch_or_log(peer, payload, runtime, entropy, protocol).await,
     None => None,
   };
   let mut tombstone_acks = Vec::new();
   for payload in tombstones {
-    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, payload).await {
-      Ok(ack) => tombstone_acks.push(ack),
-      Err(error) => {
-        tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
-      }
+    if let Some(ack) = dispatch_or_log(peer, payload, runtime, entropy, protocol).await {
+      tombstone_acks.push(ack);
     }
   }
-  let page_ack =
-    match crate::sync_common::send_payload(runtime, entropy, peer, protocol, page).await {
-      Ok(ack) => Some(ack),
-      Err(error) => {
-        tracing::debug!(kind = ?error.kind(), "sync payload dispatch failed");
-        None
-      }
-    };
+  let page_ack = dispatch_or_log(peer, page, runtime, entropy, protocol).await;
   (tombstone_acks, page_ack, snapshot_ack)
 }
 

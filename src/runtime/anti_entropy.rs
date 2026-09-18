@@ -95,8 +95,7 @@ pub(super) fn spawn_sync_driver(
         // The RunSyncRound command's deterministic round: identical work
         // to a wall-clock tick, but the caller awaits its completion, so
         // convergence checks need no interval-cadence sleeps.
-        round = round_requests.recv() => {
-          let reply = round;
+        Some(round) = round_requests.recv() => {
           let endpoints: Vec<Endpoint> = driver_endpoints
             .lock()
             .map(|endpoints| endpoints.clone())
@@ -113,9 +112,7 @@ pub(super) fn spawn_sync_driver(
             &driver_revision,
           )
           .await;
-          if let Some(reply) = reply {
-            let _ = reply.send(());
-          }
+          let _ = round.send(());
         }
       }
     }

@@ -789,7 +789,9 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
 ///
 /// The choice is deterministic for a given trace and candidate set (the
 /// same attempt always picks the same relay, which keeps loop-freedom
-/// reasoning and replay tests simple) and fresh per retry: a caller
+/// reasoning and replay tests simple; the hash is stable within one
+/// build, which is the only determinism any single node needs) and
+/// fresh per retry: a caller
 /// retrying a failed delivery opens a new trace, so the next attempt
 /// takes a different relay path instead of repeating a failed one. On
 /// branching topologies, where no stateless policy can tell which
@@ -829,9 +831,7 @@ impl DefaultNextHop {
   /// ranks it independently.
   fn rank(trace: &crate::TraceId, peer: &NodeId) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
-    std::hash::Hash::hash(&trace.as_str(), &mut hasher);
-    std::hash::Hash::hash(&0_u8, &mut hasher);
-    std::hash::Hash::hash(&peer.as_str(), &mut hasher);
+    std::hash::Hash::hash(&(trace.as_str(), peer.as_str()), &mut hasher);
     std::hash::Hasher::finish(&hasher)
   }
 }

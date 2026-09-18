@@ -108,16 +108,19 @@ impl Supervisor {
       Some(entry) => (entry, false),
       None => match self.select_forward_entry(&trace_id, &destination).await {
         Ok(Some(entry)) => (entry, true),
+        // No eligible hop exists: the caller observes the typed refusal
+        // through the request's rejection and the recorded route
+        // failure, so the dispatch outcome itself is not interesting.
         Ok(None) => {
           fail(request, ErrorKind::RouteUnavailable);
-          return Err(Error::route_unavailable("packet session"));
+          return Ok(());
         }
+        // A failed first-hop resolution still ends the route explicitly:
+        // bounded terminal trace metadata records the resolution
+        // failure's own kind, while the caller sees the stable
+        // route-unavailable dispatch outcome (a policy's internal
+        // rejection kind is not a caller-facing ack status).
         Err(error) => {
-          // A failed first-hop resolution still ends the route
-          // explicitly: bounded terminal trace metadata records the
-          // resolution failure's own kind, while the caller sees the
-          // stable route-unavailable dispatch outcome (a policy's
-          // internal rejection kind is not a caller-facing ack status).
           self.record_route_failure(&trace_id, error.kind());
           request.reject(ErrorKind::RouteUnavailable);
           return Ok(());

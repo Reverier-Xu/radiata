@@ -205,6 +205,17 @@ struct ResourcePeerRound {
 }
 
 impl ResourcePeerRound {
+  /// A quiet round: nothing was due, the peer state already advanced.
+  fn quiet() -> Self {
+    Self {
+      ack: None,
+      commit_cursor: None,
+      rewind_cursor: None,
+      marks: Vec::new(),
+      dispatched: false,
+    }
+  }
+
   /// Commits a delivered page: the walk cursor advances to the step's
   /// boundary (past every scanned entry) and the page's records enter
   /// the peer's watermark table (bounded; overflow resets the table so
@@ -337,13 +348,7 @@ async fn resource_sync_tick_peer(
   let pass_due = state.cursor.is_some() || state.ticks_since_pass >= DETECTION_CADENCE_TICKS;
   if !pass_due {
     state.ticks_since_pass = state.ticks_since_pass.saturating_add(1);
-    return Ok(ResourcePeerRound {
-      ack: None,
-      commit_cursor: None,
-      rewind_cursor: None,
-      marks: Vec::new(),
-      dispatched: false,
-    });
+    return Ok(ResourcePeerRound::quiet());
   }
   let emission = page_sync::emit_page_filtered_ctx(
     snapshot,
@@ -372,13 +377,7 @@ async fn resource_sync_tick_peer(
     crate::audit::resource_pass_settled(peer.as_str(), emission.walk_cursor.is_some());
     state.cursor = emission.walk_cursor.clone();
     state.scan_start = None;
-    return Ok(ResourcePeerRound {
-      ack: None,
-      commit_cursor: None,
-      rewind_cursor: None,
-      marks: Vec::new(),
-      dispatched: false,
-    });
+    return Ok(ResourcePeerRound::quiet());
   };
   tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;

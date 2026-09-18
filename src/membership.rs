@@ -276,7 +276,7 @@ pub(crate) mod recovery;
 pub(crate) mod sync;
 
 pub(crate) mod store {
-  use std::sync::Arc;
+  use std::{collections::HashMap, sync::Arc};
 
   use super::{NODE_DESCRIPTOR_NAMESPACE, NodeDescriptorV1};
   use crate::{
@@ -324,39 +324,26 @@ pub(crate) mod store {
     let namespace = namespace()?;
     let key = descriptor_key(descriptor.node());
     let snapshot = store.snapshot().await?;
-    let current = snapshot.get(&namespace, &key).await?;
-    if let Some(existing) = current {
-      let existing = crate::membership::page::decode_descriptor(existing.as_bytes())?;
-      if descriptor.revision() <= existing.revision() {
-        return Err(Error::conflict("node descriptor revision"));
-      }
-      // A removal marker is never replaced by a live descriptor of any
-      // revision: rejoining requires a newer signed-out-of-band removal
-      // reversal, not a replayed old record.
-      if existing.removed() && !descriptor.removed() {
-        return Err(Error::conflict("node descriptor removal"));
-      }
-    } else if descriptor.revision() == 0 {
-      // The descriptor register starts at revision 1: a zero-revision
-      // descriptor is never a legal first install, not even for a node
-      // whose binding is already adopted.
-      return Err(Error::conflict("node descriptor revision"));
-    } else if descriptor.revision() > 1 {
-      // A first install at a revision above 1 is only healable when the
-      // node is already trusted (its adopted binding exists): the page
-      // arrived over an authenticated session from a trusted member, so
-      // the skipped revisions are lost deliveries, never fabrications.
-      // A node with no binding and no descriptor is unknown here; its
-      // first descriptor must be revision 1.
+    let existing = match snapshot.get(&namespace, &key).await? {
+      Some(value) => Some(crate::membership::page::decode_descriptor(
+        value.as_bytes(),
+      )?),
+      None => None,
+    };
+    // The adopted-binding probe only matters for a skipped-revision
+    // first install (see `descriptor_skip_reason`).
+    let adopted = if existing.is_none() && descriptor.revision() > 1 {
       let (binding_namespace, binding_key) =
         crate::identity::records::identity_binding_key(descriptor.node())?;
-      let adopted = snapshot
+      snapshot
         .get(&binding_namespace, &binding_key)
         .await?
-        .is_some();
-      if !adopted {
-        return Err(Error::conflict("node descriptor revision"));
-      }
+        .is_some()
+    } else {
+      false
+    };
+    if let Some(reason) = descriptor_skip_reason(existing.as_ref(), descriptor, adopted) {
+      return Err(Error::conflict(reason));
     }
     // One snapshot view for both the per-key expectation and the CAS
     // revision, so a concurrent writer cannot make them disagree.
@@ -380,6 +367,40 @@ pub(crate) mod store {
     Ok(())
   }
 
+  /// Why a page apply skips one descriptor. The reason strings are the
+  /// single-record conflict contexts, so both apply paths report
+  /// identical refusals: the single-record path maps `Some` to its typed
+  /// conflict, the page batch maps it to a skip — the RULES live here
+  /// and only here.
+  ///
+  /// - an equal or higher stored revision wins (the register accepts only the
+  ///   strictly next revision);
+  /// - a removal marker is never replaced by a live descriptor of any revision:
+  ///   rejoining requires a newer signed-out-of-band removal reversal, not a
+  ///   replayed old record;
+  /// - the descriptor register starts at revision 1: a zero-revision descriptor
+  ///   is never a legal first install, not even for a node whose binding is
+  ///   already adopted;
+  /// - a first install at a revision above 1 is only healable when the node is
+  ///   already trusted (its adopted binding exists): the page arrived over an
+  ///   authenticated session from a trusted member, so the skipped revisions
+  ///   are lost deliveries, never fabrications.
+  fn descriptor_skip_reason(
+    existing: Option<&NodeDescriptorV1>, descriptor: &NodeDescriptorV1, adopted_binding: bool,
+  ) -> Option<&'static str> {
+    if let Some(existing) = existing {
+      if descriptor.revision() <= existing.revision() {
+        return Some("node descriptor revision");
+      }
+      if existing.removed() && !descriptor.removed() {
+        return Some("node descriptor removal");
+      }
+    } else if descriptor.revision() == 0 || (descriptor.revision() > 1 && !adopted_binding) {
+      return Some("node descriptor revision");
+    }
+    None
+  }
+
   /// Applies one received descriptor page as ONE durable transaction: the
   /// per-descriptor decisions mirror [`store_descriptor_ctx`] exactly
   /// (older revisions, removal protection, illegal first revisions, and
@@ -398,37 +419,71 @@ pub(crate) mod store {
   ) -> Result<Vec<NodeId>> {
     let _permit = store.write_permit().await;
     let namespace = namespace()?;
+    // Page-order contest for repeated nodes: the highest revision wins,
+    // first among equals — exactly what the sequential single-record
+    // apply committed — and the transaction's keys stay distinct.
+    let mut contenders: Vec<&NodeDescriptorV1> = Vec::new();
+    let mut index_by_key: HashMap<StoreKey, usize> = HashMap::new();
+    for descriptor in page.descriptors() {
+      let key = descriptor_key(descriptor.node());
+      match index_by_key.get(&key) {
+        Some(&index) => {
+          if descriptor.revision() > contenders[index].revision() {
+            contenders[index] = descriptor;
+          }
+        }
+        None => {
+          index_by_key.insert(key, contenders.len());
+          contenders.push(descriptor);
+        }
+      }
+    }
     let mut attempt = 0_u8;
     loop {
       let snapshot = store.snapshot().await?;
       let mut operations = Vec::new();
       let mut applied = Vec::new();
-      for descriptor in page.descriptors() {
+      for descriptor in contenders.iter().copied() {
         let key = descriptor_key(descriptor.node());
-        if let Some(existing) = snapshot.get(&namespace, &key).await? {
-          let existing = crate::membership::page::decode_descriptor(existing.as_bytes())?;
-          if descriptor.revision() <= existing.revision() {
-            continue;
+        let existing = match snapshot.get(&namespace, &key).await? {
+          Some(value) => {
+            match crate::membership::page::decode_descriptor(value.as_bytes()) {
+              Ok(existing) => Some(existing),
+              // One corrupt durable row must not fail the whole page
+              // (the emit path holds the same principle): treat it as
+              // an incumbent the incoming record cannot beat.
+              Err(error) => {
+                tracing::warn!(
+                  node = %descriptor.node(),
+                  kind = ?error.kind(),
+                  "membership page skipped over an undecodable stored descriptor"
+                );
+                continue;
+              }
+            }
           }
-          // A removal marker is never replaced by a live descriptor of
-          // any revision (see `store_descriptor_ctx`).
-          if existing.removed() && !descriptor.removed() {
-            continue;
-          }
-        } else if descriptor.revision() == 0 {
-          continue;
-        } else if descriptor.revision() > 1 {
-          // A skipped-revision first install heals only over an adopted
-          // binding (see `store_descriptor_ctx`).
+          None => None,
+        };
+        // The adopted-binding probe only matters for a skipped-revision
+        // first install (see `descriptor_skip_reason`).
+        let adopted = if existing.is_none() && descriptor.revision() > 1 {
           let (binding_namespace, binding_key) =
             crate::identity::records::identity_binding_key(descriptor.node())?;
-          if snapshot
+          snapshot
             .get(&binding_namespace, &binding_key)
             .await?
-            .is_none()
-          {
-            continue;
-          }
+            .is_some()
+        } else {
+          false
+        };
+        if let Some(reason) = descriptor_skip_reason(existing.as_ref(), descriptor, adopted) {
+          tracing::debug!(
+            node = %descriptor.node(),
+            revision = descriptor.revision(),
+            reason,
+            "membership page descriptor skipped"
+          );
+          continue;
         }
         let expected =
           crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
@@ -454,6 +509,7 @@ pub(crate) mod store {
         // A conflict landed nothing: one re-decide from a fresh snapshot
         // is safe, a second one surfaces to the cadence.
         crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted if attempt == 0 => {
+          tracing::debug!("membership page batch conflicted; re-deciding from a fresh snapshot");
           attempt += 1;
         }
         outcome => {

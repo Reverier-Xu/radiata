@@ -188,13 +188,21 @@ pub(crate) async fn commit_page_batch_ctx(
       operations,
     )?;
     let outcome = store.commit(transaction).await?;
-    if !matches!(outcome, crate::CommitOutcome::Committed(_)) && attempt == 0 {
+    match outcome {
+      crate::CommitOutcome::Committed(_) => {}
       // A conflict landed nothing: one re-decide from a fresh snapshot
       // is safe, a second one surfaces to the anti-entropy cadence.
-      attempt = 1;
-      continue;
+      // An Unknown outcome never retries — durability is indeterminate,
+      // and a retry over a frozen store would mask the CommitUnknown.
+      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted if attempt == 0 => {
+        tracing::debug!("resource page batch conflicted; re-deciding from a fresh snapshot");
+        attempt = 1;
+        continue;
+      }
+      outcome => {
+        crate::provider::commit_verdict(outcome, "resource page")?;
+      }
     }
-    crate::provider::commit_verdict(outcome, "resource page")?;
     if installed > 0 {
       store.note_register_install();
     }

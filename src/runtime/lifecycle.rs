@@ -264,9 +264,17 @@ impl RuntimeClient {
       .send(build(reply))
       .await
       .map_err(|_| Error::shutting_down("node control"))?;
-    response
-      .await
-      .map_err(|_| Error::internal("node control reply"))?
+    match response.await {
+      Ok(result) => result,
+      // The command's executor is gone: a shutdown races the reply, and
+      // the lifecycle state names it instead of a generic internal error.
+      Err(_) => {
+        if self.status() != crate::NodeStatus::Running {
+          return Err(Error::shutting_down("node control"));
+        }
+        Err(Error::internal("node control reply"))
+      }
+    }
   }
 
   /// Hands one outbound packet to the supervisor over the dedicated packet

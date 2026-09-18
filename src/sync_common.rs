@@ -772,11 +772,6 @@ impl PeerPageCursor {
 /// to encode is simply "does not fit" — the halving ladder's whole
 /// reason to step down. Both sync lanes share this so the fit rule
 /// cannot drift between them.
-/// True when one page's envelope encoding, wrapped for the sync lane's
-/// wire payload, fits the control-body bound. A page envelope that fails
-/// to encode is simply "does not fit" — the halving ladder's whole
-/// reason to step down. Both sync lanes share this so the fit rule
-/// cannot drift between them.
 pub(crate) fn page_wire_fits(
   encoded_page: crate::Result<Vec<u8>>,
   encode_payload: impl FnOnce(Vec<u8>) -> crate::Result<Vec<u8>>,
