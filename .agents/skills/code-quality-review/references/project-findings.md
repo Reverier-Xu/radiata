@@ -1208,3 +1208,37 @@ god-function).
   given the doc as authority will report every session/routing file as a violation.
   Give them the doc PLUS the convention note (session = integration hub, facade types
   flow downward by convention) so real violations stand out.
+
+## Remediation batch 2026-09-20 (main @ b3f9374, squash of post-review-fixes)
+
+All P1s + top quick-wins landed: WallClock→time.rs, StoreCapabilities::full_metadata,
+redb composite_key fold, stale allow(dead_code) dropped, reserved error contexts
+documented, LocalIdentityContext::require_unblocked, label::validate_bounded_value,
+resource namespace via families::registry, BoundedSender::channel (fields private
+again), identity::trust::store::{trusted_binding, peer_is_terminal} (driver's private
+twin deleted), leave intent-without-record re-drive repaired via ensure_journaled_record
+(+ regression test re_drive_repairs_an_intent_without_record). Local gates green; CI
+16/16.
+
+**CI flake note:** the container job failed once on
+secure_join_peer_shutdown_interrupts_inflight_stream_explicitly ("in-flight route never
+reached a terminal state", 60s bound at secure_join.rs:1440) — runner stall, not a
+regression. Confirmation path that worked: 10× local runs (0.08s each), full container
+gate under podman with the pinned image (green incl. that test), all other CI jobs
+green on the same commit, then gh run rerun --failed → green. The test's 60s bound was
+already bumped once (00aa39d); if it recurs on busy runners, raise that specific bound
+again rather than touching code.
+
+## Still open (deliberately deferred, medium refactors)
+
+- Shared per-peer anti-entropy round driver in sync_common (membership≡resource skeleton)
+- Shared sweep helpers (undecodable-row skip ×3, sweep commit-outcome ×2)
+- membership::store::active_descriptors (identity_ops ≡ recovery enumeration)
+- membership/page.rs decode_canonical_strict_or adoption; tombstone-binding guard helper
+- routing.rs reserved-label resolver shared with resource/select.rs
+- trace.rs ErrorKind↔u8 single const table
+- ErrorKind::fixed_bytes bypasses (offer.rs, membership/page.rs, cbor.rs read_array)
+- view.rs Page<T> consolidation; operation.rs marker-command macro
+- L3↔L7 cycle: narrow packet-dispatch port instead of RuntimeClient in SessionPacketContext
+- routing/trace.rs relocation to the metadata domain; architecture doc alignment
+  (session module list, neighbor.rs ghost, L5/L6 order, session-as-hub note)
