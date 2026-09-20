@@ -1273,3 +1273,30 @@ Gaps found:
 
 Decision: keep the seed-7005 replay byte-identical until the F-12 lane completes;
 apply the supplement after, then run two dedicated validation lanes.
+
+## Rerun campaign 2026-09-21 (main @ f584220/5537cf6) — results
+
+Matrix rerun under podman (f10 image @ f584220): random-64 fuzz lane (seed 7006,
+512 ops) PASS; all four random-64 sweeps (s7/s23/s41/s91) PASS; **both 2048-op
+lanes reproduced the F-12 freeze signature** (7005 → c4 froze settled at op 4782;
+7004 → c5 at op ~1390): "cN has 0 sessions", inbound+dial NotReady
+("metadata storage reconciliation"), no crash, and NO freeze-transition warn
+despite 20cefdd — so the freeze enters via a path none of the warns cover.
+Pinpointed the only silent entries: a commit/reconcile future dropped mid
+provider-await (ProviderCall::drop settles the slot silently) — instrumentation
+now warns with the transaction id (5537cf6); next occurrence names the flow.
+Note the freeze reproduces at a much higher rate on a contended host (2/2 lanes)
+than the archived calm-host campaign (2/~15k ops) — host contention is a factor.
+Boot cycling observed before both freezes (5-10 process restarts from restart-op
+rng streaks + SIGKILL mid-commit).
+
+Supplements validated (400-op lane, seed 11, random graph, zero violations):
+rotate-credential fired 303× (rotation × in-flight joins × leaves all clean),
+label-remove 6× with absence-convergence asserted on every peer, and — after the
+metadata_of boolean/status fix — label ops now actually execute their
+cluster-wide convergence assertions for the first time (they silently no-oped
+since the harness was born: `status != 200` against an (ok, payload) tuple).
+Also: flush op prints are line-flushed (long lanes are observable again).
+
+Still open: F-12 root cause (instrumented, awaiting next recurrence); the medium
+refactor backlog (shared round driver, sweep helpers, Page<T>, doc alignment).
