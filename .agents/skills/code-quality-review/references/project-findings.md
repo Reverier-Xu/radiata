@@ -1242,3 +1242,34 @@ again rather than touching code.
 - L3↔L7 cycle: narrow packet-dispatch port instead of RuntimeClient in SessionPacketContext
 - routing/trace.rs relocation to the metadata domain; architecture doc alignment
   (session module list, neighbor.rs ghost, L5/L6 order, session-as-hub note)
+
+## Harness coverage analysis 2026-09-21 (rerun campaign, main @ f584220)
+
+Scope judged: test_fuzz.py (10 model-tracked ops, dual state+path assertion,
+op-anchored windows) and scale_sweep.py (7 stages: star/chain/tree/random/prunestar/
+killstorm/partition, 8–128 nodes, exact-edge + symmetry + no-duplicate invariants,
+BFS-farthest dm probes, roster SLOs with per-node traces).
+
+Strengths: structural exactness at scale; crash chaos (SIGKILL restarts, killstorm,
+one-edge cuts with any-one-route isolation-heal); terminal identity lifecycle proven
+through the audit surface; CAS conflicts retried not violated; seeded reproducibility.
+
+Gaps found:
+- G1 label/metadata REMOVAL never fuzzed (ops only set; remove_labels +
+  absence-convergence unexercised) → supplemented: op_label_remove.
+- G2 credential ROTATION never fuzzed (example only issued; RotateMergeCredential —
+  the revocation/upgrade path — unreachable; in-flight join × rotation interaction
+  untested) → supplemented: /rotate-token endpoint (examples/chat/src/http.rs) +
+  op_rotate_credential (hub-only precondition; join_chat's 10-attempt re-fetching
+  retry absorbs mid-join rotation; rotate on an expired generation is safe —
+  replace() is unconditional).
+- G3 concurrent same-key writers never race at mesh level (ops sequential; nw lanes
+  overlap convergence windows partially) — noted, unit lanes cover CAS conflicts.
+- G4 resource-record deletion (RemoveResource/group delete) has no example surface —
+  future work if wanted at harness level.
+- G5 revocation + cleanup checkpoints have no example surface (unit/integration-only).
+- G6 two-component split-brain not a fuzz op (partition stage covers a single cut).
+- QoL: harness stdout is block-buffered on long lanes — add flush=True to op prints.
+
+Decision: keep the seed-7005 replay byte-identical until the F-12 lane completes;
+apply the supplement after, then run two dedicated validation lanes.

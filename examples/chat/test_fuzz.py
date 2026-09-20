@@ -525,8 +525,8 @@ def op_label(model: Model, rng: random.Random, node: int):
   descriptor convergence carries the label to the cluster."""
   if node not in model.alive:
     return None, []
-  status, payload = metadata_of(node)
-  if status != 200:
+  ok, payload = metadata_of(node)
+  if not ok:
     return None, []
   key = f"fuzz-{rng.randrange(1 << 16)}"
   value = f"v{rng.randrange(1 << 30)}"
@@ -568,6 +568,62 @@ def op_label(model: Model, rng: random.Random, node: int):
   return state_check, path
 
 
+def label_removed(model: Model, node: int, key_name: str, revision: int):
+  """State predicate factory: the removed label must read back absent on
+  every live merged peer, each reader at least the removal revision."""
+  user = f"u{node}"
+  readers = sorted(u for u in model.alive & model.merged if u != node)
+
+  def check():
+    for peer in readers:
+      ok, payload = labels_of(peer, user)
+      if not ok:
+        return False, f"c{peer} label view for {user} unreachable"
+      for full_key, full_value in payload.get("labels", {}).items():
+        if full_key.endswith(f"/{key_name}"):
+          return False, f"c{peer} still has {key_name}={full_value!r}"
+      if payload.get("revision", 0) < revision:
+        return False, f"c{peer} revision {payload.get('revision')} < {revision}"
+    return True, f"{key_name} absent on {readers}"
+
+  return f"label {key_name} removal converged on every live merged peer", check
+
+
+def op_label_remove(model: Model, rng: random.Random, node: int):
+  """The node removes one of its own labels: the conditional update
+  without the set. Absence is metadata too — the descriptor page plane
+  must converge the removal, not merely stop advertising the value."""
+  if node not in model.alive:
+    return None, []
+  mine = model.labels.get(node, {})
+  if not mine:
+    return None, []
+  key_name = rng.choice(sorted(mine))
+  ok, payload = metadata_of(node)
+  if not ok:
+    return None, []
+  revision = payload.get("revision", 0)
+  body = {"remove_labels": [key_name], "set_labels": {}, "expected_revision": revision}
+  deadline = time.monotonic() + 20
+  while True:
+    status, payload = http(node, "POST", "/metadata", body)
+    if status == 200:
+      break
+    # A raced update conflicts; re-read the revision and retry within
+    # the deadline — same contract as op_label.
+    if status != 409 or time.monotonic() > deadline:
+      raise HarnessError(f"label removal failed: {status} {payload}")
+    _, fresh = metadata_of(node)
+    body["expected_revision"] = fresh.get("revision", revision)
+    time.sleep(POLL)
+  landed_revision = (payload or {}).get("revision", revision)
+  del model.labels[node][key_name]
+  if node not in model.merged:
+    # A standalone node's descriptor is outside the membership plane.
+    return None, []
+  return label_removed(model, node, key_name, landed_revision), []
+
+
 def op_restart(model: Model, rng: random.Random, node: int):
   """SIGKILL-style container restart: sessions drop cluster-wide, the
   store persists, the node heals back in through its persisted identity."""
@@ -597,6 +653,25 @@ def op_flush(model: Model, rng: random.Random, node: int):
   return None, []
 
 
+def op_rotate_credential(model: Model, rng: random.Random, node: int):
+  """Rotates the bootstrap hub's join credential generation: the retired
+  generation stops admitting immediately, an in-flight join re-fetches
+  its token on retry, and every later join issues from the new
+  generation. No model change — membership is untouched by an
+  issuer-side rotation; the assertion is that rotation never strands
+  the join plane. The issuer is the bootstrap hub c1, which never
+  carries fuzzed ops itself, so the precondition reads the model and
+  the mutator drives c1 regardless of the picked node."""
+  del rng, node
+  status, payload = http(1, "POST", "/rotate-token", timeout=30)
+  if status != 200 or not (payload or {}).get("rotated"):
+    raise HarnessError(f"rotate endpoint failed: {status} {payload}")
+  status, token = http(1, "GET", "/join-token")
+  if status != 200 or not (token or {}).get("credential"):
+    raise HarnessError(f"post-rotation issue failed: {status} {token}")
+  return None, []
+
+
 # Every generator: (name, precondition(model, node), mutator(model, rng,
 # node) -> (state_check | None, path expectations)). Preconditions keep
 # operations legal (no messaging from a dead node); the state map covers
@@ -610,6 +685,10 @@ OPERATIONS = [
   ("join-group", lambda m, node: node in m.merged and node in m.alive and node not in m.left
    and m.group_exists and node not in m.group_members and len(m.group_members) < 16, op_join_group),
   ("label", lambda m, node: node in m.alive and node not in m.left, op_label),
+  ("label-remove", lambda m, node: node in m.alive and node not in m.left
+   and bool(m.labels.get(node)), op_label_remove),
+  ("rotate-credential", lambda m, node: 1 in m.alive and 1 in m.merged,
+   op_rotate_credential),
   ("restart", lambda m, node: node in m.alive and node not in m.left, op_restart),
   ("start", lambda m, node: node not in m.alive and node not in m.left, op_start),
   ("flush", lambda m, node: node in m.alive and node not in m.left, op_flush),
@@ -813,7 +892,7 @@ def main() -> None:
     executed += 1
     started = time.time()
     history.append(f"{name} c{node}")
-    print(f"[op {step:04d}] {name} c{node}")
+    print(f"[op {step:04d}] {name} c{node}", flush=True)
     state_check, path_expectations = mutator(model, rng, node)
     if rng.random() < args.no_wait_prob:
       history[-1] += " [no-wait]"
@@ -824,7 +903,7 @@ def main() -> None:
         print(violation)
         sys.exit(1)
     history[-1] += f" ({time.time() - started:.1f}s)"
-    print(f"[done {step:04d}] {name} c{node} {time.time() - started:.1f}s")
+    print(f"[done {step:04d}] {name} c{node} {time.time() - started:.1f}s", flush=True)
 
   print(f"[fuzz] seed={args.seed}: {args.ops} operations, zero violations")
 

@@ -154,6 +154,11 @@ pub(crate) struct MetadataStore {
 struct ProviderCall<'a> {
   state: &'a Mutex<CommitState>,
   active: bool,
+  /// The in-doubt transaction this call froze the slot on, so a dropped
+  /// call can name it: a cancelled commit is the one freeze transition
+  /// with no other log line, and an unattributed settled freeze is
+  /// undebuggable in the field.
+  transaction: TransactionId,
 }
 
 impl ProviderCall<'_> {
@@ -175,6 +180,11 @@ impl Drop for ProviderCall<'_> {
     {
       *provider_call_active = false;
     }
+    tracing::warn!(
+      transaction = %self.transaction,
+      "metadata store commit future dropped mid-flight; the slot stays \
+       frozen on this transaction until an authoritative reconcile"
+    );
   }
 }
 
@@ -365,6 +375,17 @@ impl MetadataStore {
         operation_digest,
       }) => {
         if transaction != pending.transaction || operation_digest != pending.digest {
+          // The slot still holds an indeterminate outcome (the provider
+          // reported Unknown for some transaction), so it must go through
+          // the proper frozen-state finish instead of being dropped:
+          // dropping the call here would settle the freeze silently.
+          tracing::warn!(
+            transaction = %pending.transaction,
+            reported = %transaction,
+            "metadata store frozen: commit outcome unknown for a foreign \
+             transaction identity"
+          );
+          self.finish_frozen(call)?;
           return Err(Error::provider(
             ProviderErrorKind::StorageCorrupt,
             ProviderErrorContext::StorageCommit,
@@ -471,13 +492,14 @@ impl MetadataStore {
       return Err(Error::not_ready("metadata storage commit"));
     }
     *state = CommitState::Frozen {
-      pending,
+      pending: pending.clone(),
       provider_call_active: true,
     };
     drop(state);
     Ok(ProviderCall {
       state: &self.state,
       active: true,
+      transaction: pending.transaction,
     })
   }
 
@@ -497,13 +519,12 @@ impl MetadataStore {
       }
     };
     drop(state);
-    Ok((
-      pending,
-      ProviderCall {
-        state: &self.state,
-        active: true,
-      },
-    ))
+    let call = ProviderCall {
+      state: &self.state,
+      active: true,
+      transaction: pending.transaction.clone(),
+    };
+    Ok((pending, call))
   }
 
   fn finish_ready(&self, call: ProviderCall<'_>) -> Result<()> {

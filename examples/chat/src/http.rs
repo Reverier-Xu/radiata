@@ -782,6 +782,24 @@ async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCod
   })))
 }
 
+/// Rotates this issuer's join credential generation: the retired
+/// generation stops admitting immediately, and the returned credential
+/// is the new generation's first issue. Callers that fetched the old
+/// token mid-join re-fetch on their retry, so an in-flight merge
+/// survives a rotation by re-issuing.
+async fn rotate_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let issued = state
+    .node
+    .command(radiata::RotateMergeCredential::new())
+    .await
+    .map_err(internal)?;
+  Ok(Json(json!({
+    "credential": issued.credential().expose_secret(),
+    "node_id": state.node_id.as_str(),
+    "rotated": true,
+  })))
+}
+
 #[derive(serde::Deserialize)]
 pub struct JoinRequest {
   /// Bootstrap node's HTTP address, e.g. "c1:8080".
@@ -1051,6 +1069,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/groups/{name}/send", post(send_group_message))
     .route("/groups/{name}/dissolve", post(dissolve_group))
     .route("/join-token", get(join_token))
+    .route("/rotate-token", post(rotate_token))
     .route("/join-chat", post(join_chat))
     .route("/metadata", get(get_metadata).post(update_metadata))
     .route("/labels/{user}", get(member_labels))
