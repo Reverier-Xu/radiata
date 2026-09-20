@@ -13,10 +13,7 @@
 
 use std::time::Duration;
 
-use crate::{
-  Result, StoreKey, StoreOperation,
-  storage::{MetadataStore, receipt::WallClock},
-};
+use crate::{Result, StoreKey, StoreOperation, storage::MetadataStore, time::WallClock};
 
 /// The caller-selected default removal-evidence retention window: a signed
 /// removal record survives this long after its own timestamp before the

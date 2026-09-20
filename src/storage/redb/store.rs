@@ -82,11 +82,7 @@ impl RedbStoreFactory {
   }
 
   fn capabilities() -> StoreCapabilities {
-    StoreCapabilities::new(DurabilityLevel::OsCrashDurable)
-      .conditional_batch(true)
-      .ordered_scan(true)
-      .reconciliation(true)
-      .exclusive_lifetime_lock(true)
+    StoreCapabilities::full_metadata(DurabilityLevel::OsCrashDurable)
   }
 }
 
@@ -365,11 +361,7 @@ fn internal(context: ProviderErrorContext) -> Error {
 /// A persisted digest sidecar row is missing or malformed: the commit
 /// path maintains both sides atomically, so this is storage corruption.
 fn composite_key(namespace: &StoreNamespace, key: &StoreKey) -> Vec<u8> {
-  let mut bytes = Vec::with_capacity(namespace.as_str().len() + 1 + key.as_bytes().len());
-  bytes.extend_from_slice(namespace.as_str().as_bytes());
-  bytes.push(0);
-  bytes.extend_from_slice(key.as_bytes());
-  bytes
+  composite_prefix(namespace, key.as_bytes())
 }
 
 fn composite_prefix(namespace: &StoreNamespace, prefix: &[u8]) -> Vec<u8> {

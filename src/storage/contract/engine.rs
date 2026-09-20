@@ -15,12 +15,12 @@ use crate::{
     MetadataStore,
     receipt::{
       ACTIVE_MARKER_VALUE, FORGOTTEN_MARKER_VALUE, ReceiptCleanupOutcome, ReceiptIdentity,
-      ReceiptReferenceOutcome, ReceiptReferenceToken, WallClock, decode_anchor_value,
-      decode_wall_time, eligibility_anchor_key, encode_anchor_value, encode_wall_time,
-      increment_reference_count, internal_namespace, reference_edge_key, reference_head_key,
-      used_id_key,
+      ReceiptReferenceOutcome, ReceiptReferenceToken, decode_anchor_value, decode_wall_time,
+      eligibility_anchor_key, encode_anchor_value, encode_wall_time, increment_reference_count,
+      internal_namespace, reference_edge_key, reference_head_key, used_id_key,
     },
   },
+  time::WallClock,
 };
 #[tokio::test]
 async fn storage_contract_prepared_transactions_are_atomic_idempotent_and_permanently_used() {

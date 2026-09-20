@@ -26,15 +26,13 @@ use std::{
   time::Duration,
 };
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, instrument, trace, warn};
 
 #[cfg(test)]
 pub(crate) use super::queue::test_queue;
 pub(crate) use super::queue::{BoundedReceiver, BoundedSender, SessionFrame};
-use super::{
-  driver::EstablishedSession, inbound::read_loop, liveness::liveness_observer, queue::QueueState,
-};
+use super::{driver::EstablishedSession, inbound::read_loop, liveness::liveness_observer};
 use crate::{
   ErrorKind, NodeId, QualifiedTag, Result, TraceId,
   extension_registry::ExtensionRegistry,
@@ -106,7 +104,7 @@ pub(crate) struct SessionPacketContext {
   pub(super) registry: Arc<ExtensionRegistry>,
   pub(super) policy: SessionPolicy,
   pub(super) runtime: crate::runtime::RuntimeClient,
-  pub(super) clock: Arc<dyn crate::storage::receipt::WallClock>,
+  pub(super) clock: Arc<dyn crate::time::WallClock>,
   /// Injected entropy for per-session identifiers.
   pub(super) entropy: Arc<dyn crate::api::Entropy>,
   /// The typed event hub: session and route transitions emit through it.
@@ -131,7 +129,7 @@ impl SessionPacketContext {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     local: NodeId, registry: Arc<ExtensionRegistry>, policy: SessionPolicy,
-    runtime: crate::runtime::RuntimeClient, clock: Arc<dyn crate::storage::receipt::WallClock>,
+    runtime: crate::runtime::RuntimeClient, clock: Arc<dyn crate::time::WallClock>,
     entropy: Arc<dyn crate::api::Entropy>, events: Arc<crate::node::EventHub>,
     route_policy: QualifiedTag, sessions: SessionTable, routes_clone: RouteTable,
     forwarding_capacity: usize, route_capacity: usize,
@@ -224,7 +222,7 @@ pub(crate) struct SessionEntry {
   /// carried here so the outbound pump (which runs without the session
   /// context) can enforce typed backpressure.
   pub(crate) pending_admissions: usize,
-  pub(crate) clock: Arc<dyn crate::storage::receipt::WallClock>,
+  pub(crate) clock: Arc<dyn crate::time::WallClock>,
   /// The public session metadata.
   pub(crate) meta: Arc<SessionMeta>,
   alive: Arc<AtomicBool>,
@@ -280,18 +278,8 @@ pub(crate) async fn run_session(
 ) {
   let peer = session.peer().clone();
   let (writer, mut reader) = connection.into_split();
-  let (frames_tx, frames_rx) = mpsc::channel(context.policy.queue_messages);
-  let queue_state = Arc::new(QueueState::default());
-  let frames = BoundedSender {
-    inner: frames_tx,
-    state: Arc::clone(&queue_state),
-    max_count: context.policy.queue_messages,
-    max_bytes: context.policy.queue_bytes,
-  };
-  let frames_rx = BoundedReceiver {
-    inner: frames_rx,
-    state: Arc::clone(&queue_state),
-  };
+  let (frames, frames_rx) =
+    BoundedSender::channel(context.policy.queue_messages, context.policy.queue_bytes);
   let pending_acks = Arc::new(Mutex::new(HashMap::new()));
   let alive = Arc::new(AtomicBool::new(true));
   let (retire_tx, retire_rx) = watch::channel(());
@@ -480,7 +468,7 @@ async fn retire_observer(mut signal: watch::Receiver<()>) {
 }
 
 /// UNIX-seconds from the injected wall clock.
-pub(crate) fn clock_seconds(clock: &dyn crate::storage::receipt::WallClock) -> u64 {
+pub(crate) fn clock_seconds(clock: &dyn crate::time::WallClock) -> u64 {
   crate::time::to_seconds(clock.now())
 }
 
@@ -593,7 +581,7 @@ pub(crate) fn test_entry(entropy: &dyn crate::api::Entropy) -> (SessionEntry, Bo
     frames,
     pending_acks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     pending_admissions: MAX_PENDING_ADMISSIONS,
-    clock: Arc::new(crate::storage::receipt::HostWallClock),
+    clock: Arc::new(crate::time::HostWallClock),
     meta: Arc::new(SessionMeta {
       id: crate::SessionId::generate(entropy).unwrap(),
       generation: 0,
@@ -652,11 +640,10 @@ mod pending_admission_tests {
     time::{Duration, UNIX_EPOCH},
   };
 
-  use tokio::sync::{mpsc, oneshot, watch};
+  use tokio::sync::{oneshot, watch};
 
   use super::{
-    BoundedSender, DialDirection, PendingAck, PendingAcks, QueueState, RouteTable, SessionEntry,
-    SessionMeta,
+    BoundedSender, DialDirection, PendingAck, PendingAcks, RouteTable, SessionEntry, SessionMeta,
   };
   use crate::{
     ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId, packet::StaticBody,
@@ -670,13 +657,7 @@ mod pending_admission_tests {
   /// A session entry whose pending map is pre-filled with relayed
   /// admissions, ready for one more outbound pump.
   fn saturated_entry(pending_admissions: usize) -> SessionEntry {
-    let (frames_tx, _frames_rx) = mpsc::channel(8);
-    let frames = BoundedSender {
-      inner: frames_tx,
-      state: Arc::new(QueueState::default()),
-      max_count: 8,
-      max_bytes: 1 << 20,
-    };
+    let (frames, _frames_rx) = BoundedSender::channel(8, 1 << 20);
     let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
     for seed in 0..pending_admissions {
       let trace_id = TraceId::parse(&format!("trace-{seed:021}")).unwrap();

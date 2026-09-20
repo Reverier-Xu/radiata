@@ -22,7 +22,7 @@ use crate::{
 };
 
 pub(crate) fn namespace() -> Result<StoreNamespace> {
-  crate::identity::records::metadata_namespace(RESOURCE_RECORD_NAMESPACE)
+  crate::storage::families::namespace(RESOURCE_RECORD_NAMESPACE)
 }
 
 fn record_key(name: &ResourceName) -> StoreKey {

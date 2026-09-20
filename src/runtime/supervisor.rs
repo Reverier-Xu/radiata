@@ -268,7 +268,7 @@ async fn supervise(
     && let Err(error) = crate::routing::trace::terminate_stale(
       context.store(),
       supervisor.dependencies.entropy.as_ref(),
-      &crate::storage::receipt::HostWallClock,
+      &crate::time::HostWallClock,
     )
     .await
   {
@@ -637,7 +637,7 @@ fn session_packet_context(
     dependencies.extensions.clone(),
     policy,
     crate::runtime::RuntimeClient::routing_only(packet_tx, dependencies.routes.clone()),
-    std::sync::Arc::new(crate::storage::receipt::HostWallClock),
+    std::sync::Arc::new(crate::time::HostWallClock),
     dependencies.entropy.clone(),
     dependencies.events.clone(),
     route_policy,
@@ -699,7 +699,7 @@ impl Supervisor {
     let trace_sink = crate::routing::trace::TraceSink::new(
       Arc::clone(&context),
       dependencies.entropy.clone(),
-      std::sync::Arc::new(crate::storage::receipt::HostWallClock),
+      std::sync::Arc::new(crate::time::HostWallClock),
       std::sync::Arc::clone(&trace_records),
     );
     let recovery = crate::membership::recovery::RecoveryController::new(
@@ -965,11 +965,7 @@ impl Supervisor {
   /// an authoritative reopen reconciles the exact transaction or proves
   /// absence. Established authenticated sessions are unaffected.
   pub(super) fn require_unblocked(&self) -> Result<()> {
-    let context = self.context()?;
-    if context.store().is_blocked()? {
-      return Err(Error::not_ready("metadata storage reconciliation"));
-    }
-    Ok(())
+    self.context()?.require_unblocked()
   }
 }
 

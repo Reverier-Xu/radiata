@@ -19,8 +19,8 @@ use crate::routing::forward::{PendingAck, PendingAcks};
 /// deadlines and a forward jump makes them immediately due.
 pub(super) async fn liveness_observer(
   last_activity: &Arc<std::sync::atomic::AtomicU64>, pending_acks: &PendingAcks,
-  clock: Arc<dyn crate::storage::receipt::WallClock>, idle_timeout: Duration,
-  keepalive_interval: Duration, keepalive_timeout: Duration, ping_tx: &watch::Sender<()>,
+  clock: Arc<dyn crate::time::WallClock>, idle_timeout: Duration, keepalive_interval: Duration,
+  keepalive_timeout: Duration, ping_tx: &watch::Sender<()>,
 ) {
   if idle_timeout.is_zero() && keepalive_interval.is_zero() {
     // No liveness policy configured; never resolves.

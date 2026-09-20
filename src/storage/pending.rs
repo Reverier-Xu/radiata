@@ -23,9 +23,9 @@ use minicbor::{
 use super::{
   CommitState, MetadataStore, PendingCommit,
   receipt::{
-    HostWallClock, PreparedTransaction, ReceiptIdentity, ReceiptReferenceChange,
-    ReceiptReferenceToken, WallClock, build_receipt_change_operations, group_receipt_changes,
-    internal_namespace, operation_uses_reserved_namespace, prepare_internal_transaction,
+    PreparedTransaction, ReceiptIdentity, ReceiptReferenceChange, ReceiptReferenceToken,
+    build_receipt_change_operations, group_receipt_changes, internal_namespace,
+    operation_uses_reserved_namespace, prepare_internal_transaction,
   },
 };
 pub(crate) use crate::storage::families::PENDING_NAMESPACE;
@@ -35,6 +35,7 @@ use crate::{
   error::fixed_bytes,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
   provider::{StorageFactory, StoreSnapshot},
+  time::{HostWallClock, WallClock},
 };
 const PENDING_SCHEMA: &str = "radiata.woooo.tech/schemas/pending-transaction-v1";
 const RECORD_VERSION: u64 = 1;

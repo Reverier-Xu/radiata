@@ -307,8 +307,9 @@ pub(crate) struct JournaledLeave {
 /// intent, then sign and persist the terminal record into the leave
 /// family (which the wipe deliberately spares). The intent leads so a
 /// crash in between resumes as "intent without record" — the record is
-/// signed fresh because nothing was announced yet. A crash after this
-/// phase resumes at startup with the same journaled record.
+/// signed fresh because nothing was announced yet, by the startup resume
+/// or by a same-process re-drive alike. A crash after this phase resumes
+/// at startup with the same journaled record.
 pub(crate) async fn journal_leave(
   context: &LocalIdentityContext, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
 ) -> Result<JournaledLeave> {
@@ -316,6 +317,14 @@ pub(crate) async fn journal_leave(
   // A pending intent from a crashed earlier drive owns its journaled
   // record: reuse it verbatim.
   if let Some((stored, intent)) = discover_leave_intent(store).await? {
+    // A same-process re-drive can land here with the intent committed but
+    // the record persist never completed (the first drive failed between
+    // the two writes). Repair exactly like the startup resume: sign fresh
+    // while the former key is still live. The identity swap cannot have
+    // happened — the swap runs strictly after this function returns a
+    // record — and a replacement-side identity without a record fails
+    // closed inside the repair.
+    ensure_journaled_record(context, keys, store, entropy, &intent).await?;
     let record = self_leave_record(store, &intent.former_node)
       .await?
       .ok_or_else(|| Error::internal("journaled leave record"))?;
@@ -1069,6 +1078,55 @@ mod tests {
       is_left_ctx(context.store(), first.intent.former_node())
         .await
         .unwrap()
+    );
+  }
+
+  /// A same-process re-drive in the intent-without-record window (the
+  /// first drive failed between the two journaled writes) repairs exactly
+  /// like the startup resume: the record is signed fresh while the former
+  /// key is still live, instead of failing the command with a misleading
+  /// internal error.
+  #[tokio::test]
+  async fn re_drive_repairs_an_intent_without_record() {
+    let factory = reference_factory();
+    let (keys, entropy, context) = open_store(&factory).await.unwrap();
+
+    // Phase J interrupted between its two writes: the intent is durable,
+    // the terminal record is not.
+    let (_, intent) = super::begin_intent(&context, entropy.as_ref())
+      .await
+      .unwrap();
+    assert!(
+      super::self_leave_record(context.store(), intent.former_node())
+        .await
+        .unwrap()
+        .is_none(),
+      "the crash window: intent without record"
+    );
+
+    // The re-drive repairs the window and returns a usable record.
+    let journaled = super::journal_leave(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap();
+    assert_eq!(
+      journaled.intent.encode().unwrap(),
+      intent.encode().unwrap(),
+      "the re-drive owns the pending intent verbatim"
+    );
+    assert_eq!(journaled.record.node(), intent.former_node());
+
+    // The repaired leave completes: the startup resume consumes it to a
+    // replacement identity with no leftover pending journal.
+    let identity = resume_if_pending(&context, &keys.as_provider(), entropy.as_ref())
+      .await
+      .unwrap()
+      .expect("the journaled leave resumes to a replacement identity");
+    assert_eq!(identity.node(), &intent.replacement_node);
+    assert!(
+      discover_leave_intent(context.store())
+        .await
+        .unwrap()
+        .is_none()
     );
   }
 

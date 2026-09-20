@@ -25,10 +25,8 @@ use std::time::{Duration, SystemTime};
 use minicbor::{Decode, Encode};
 
 use crate::{
-  Error, ErrorKind, NodeId, Result, TraceId,
-  api::Entropy,
-  protocol::decode_canonical_strict,
-  storage::{MetadataStore, receipt::WallClock},
+  Error, ErrorKind, NodeId, Result, TraceId, api::Entropy, protocol::decode_canonical_strict,
+  storage::MetadataStore, time::WallClock,
 };
 
 /// The durable schema and namespace of one route-trace record.
@@ -536,7 +534,8 @@ mod tests {
       testing::{ScriptedKeys, SequenceEntropy},
     },
     provider::StorageFactory,
-    storage::{MetadataStore, contract::helpers::ManualClock, receipt::WallClock},
+    storage::{MetadataStore, contract::helpers::ManualClock},
+    time::WallClock,
   };
 
   fn node(value: u8) -> NodeId {

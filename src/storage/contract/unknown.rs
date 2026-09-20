@@ -83,11 +83,7 @@ fn storage_contract_capability_refusal_checks_each_phase_a_requirement() {
     .build()
     .unwrap();
   let capabilities = [
-    StoreCapabilities::new(DurabilityLevel::ProcessCrashAtomic)
-      .conditional_batch(true)
-      .ordered_scan(true)
-      .reconciliation(true)
-      .exclusive_lifetime_lock(true),
+    StoreCapabilities::full_metadata(DurabilityLevel::ProcessCrashAtomic),
     required_capabilities().conditional_batch(false),
     required_capabilities().ordered_scan(false),
     required_capabilities().reconciliation(false),

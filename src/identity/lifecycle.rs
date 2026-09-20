@@ -75,6 +75,19 @@ impl LocalIdentityContext {
   pub(crate) fn replace_identity(&mut self, identity: LocalIdentityV1) {
     self.identity = identity;
   }
+
+  /// Blocks admission-sensitive operations while the metadata store is
+  /// frozen on an indeterminate outcome: the node refuses to sign, merge,
+  /// or admit until an authoritative reopen reconciles the exact
+  /// transaction or proves absence. Established authenticated sessions
+  /// are unaffected. The single precondition check for every identity
+  /// admission path, session establishment included.
+  pub(crate) fn require_unblocked(&self) -> Result<()> {
+    if self.store.is_blocked()? {
+      return Err(Error::not_ready("metadata storage reconciliation"));
+    }
+    Ok(())
+  }
 }
 
 /// Ensures the born-with-cluster self binding exists:

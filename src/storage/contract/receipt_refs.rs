@@ -17,11 +17,12 @@ use crate::{
     pending::{pending_key, pending_namespace},
     receipt::{
       ACTIVE_MARKER_VALUE, PreparedTransaction, ReceiptCleanupOutcome, ReceiptIdentity,
-      ReceiptReferenceChange, ReceiptReferenceOutcome, ReceiptReferenceToken, WallClock,
+      ReceiptReferenceChange, ReceiptReferenceOutcome, ReceiptReferenceToken,
       eligibility_anchor_key, internal_namespace, reference_edge_key, reference_head_key,
       used_id_key,
     },
   },
+  time::WallClock,
 };
 
 #[test]

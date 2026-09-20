@@ -22,10 +22,11 @@ use crate::{
     pending::{PendingCleanupOutcome, PendingTransactionV1, pending_key, pending_namespace},
     receipt::{
       ACTIVE_MARKER_VALUE, ReceiptCleanupOutcome, ReceiptReferenceChange, ReceiptReferenceOutcome,
-      ReceiptReferenceToken, WallClock, internal_namespace, reference_edge_key, reference_head_key,
+      ReceiptReferenceToken, internal_namespace, reference_edge_key, reference_head_key,
       used_id_key,
     },
   },
+  time::WallClock,
 };
 #[tokio::test]
 async fn identity_records_journaled_prepare_writes_exact_plan_record_and_marker() {

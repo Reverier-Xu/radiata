@@ -3,16 +3,17 @@ use std::{
   time::Duration,
 };
 
-#[cfg(test)]
-use self::receipt::HostWallClock;
 use self::receipt::{
-  PreparedTransaction, ReceiptReferenceToken, WallClock, build_pending_record_delete_operations,
+  PreparedTransaction, ReceiptReferenceToken, build_pending_record_delete_operations,
   prepare_internal_transaction,
 };
+#[cfg(test)]
+use crate::time::HostWallClock;
 use crate::{
   CommitOutcome, CommitReceipt, Digest, Error, ErrorKind, ProviderErrorContext, ProviderErrorKind,
   ReconcileOutcome, Result, StoreRequirements, TransactionId,
   provider::{Storage, StorageFactory, StoreSnapshot},
+  time::WallClock,
 };
 
 /// The bounded wait for the single commit slot: internal committers are

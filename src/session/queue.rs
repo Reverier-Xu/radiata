@@ -60,13 +60,34 @@ const WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 /// a typed overload error at either boundary without partial enqueue.
 #[derive(Clone)]
 pub(crate) struct BoundedSender {
-  pub(super) inner: mpsc::Sender<SessionFrame>,
-  pub(super) state: Arc<QueueState>,
-  pub(super) max_count: usize,
-  pub(super) max_bytes: usize,
+  inner: mpsc::Sender<SessionFrame>,
+  state: Arc<QueueState>,
+  max_count: usize,
+  max_bytes: usize,
 }
 
 impl BoundedSender {
+  /// The single construction site for a bounded queue pair: both halves
+  /// share one fresh admission state, and the count and byte bounds are
+  /// fixed at construction. Field access stays private to this module so
+  /// no caller can bypass the atomic admission invariants.
+  pub(crate) fn channel(max_count: usize, max_bytes: usize) -> (BoundedSender, BoundedReceiver) {
+    let (inner, receiver_inner) = mpsc::channel(max_count);
+    let state = Arc::new(QueueState::default());
+    (
+      BoundedSender {
+        inner,
+        state: Arc::clone(&state),
+        max_count,
+        max_bytes,
+      },
+      BoundedReceiver {
+        inner: receiver_inner,
+        state,
+      },
+    )
+  }
+
   /// The current queued frame count (runtime status view).
   pub(crate) fn queued_messages(&self) -> usize {
     self.state.count.load(Ordering::Relaxed)
@@ -212,8 +233,8 @@ impl BoundedSender {
 
 /// The receiving half that releases queue reservations as frames drain.
 pub(crate) struct BoundedReceiver {
-  pub(super) inner: mpsc::Receiver<SessionFrame>,
-  pub(super) state: Arc<QueueState>,
+  inner: mpsc::Receiver<SessionFrame>,
+  state: Arc<QueueState>,
 }
 
 impl BoundedReceiver {
@@ -230,27 +251,14 @@ impl BoundedReceiver {
 
 #[cfg(test)]
 pub(crate) fn test_queue(max_count: usize, max_bytes: usize) -> (BoundedSender, BoundedReceiver) {
-  let (tx, rx) = mpsc::channel(max_count);
-  let state = Arc::new(QueueState::default());
-  (
-    BoundedSender {
-      inner: tx,
-      state: Arc::clone(&state),
-      max_count,
-      max_bytes,
-    },
-    BoundedReceiver { inner: rx, state },
-  )
+  BoundedSender::channel(max_count, max_bytes)
 }
 
 #[cfg(test)]
 mod queue_tests {
-  use std::sync::Arc;
-
   use futures_util::FutureExt;
-  use tokio::sync::mpsc;
 
-  use super::{BoundedReceiver, BoundedSender, FRAME_OVERHEAD, QueueState, SessionFrame};
+  use super::{BoundedReceiver, BoundedSender, FRAME_OVERHEAD, SessionFrame};
   use crate::{ErrorKind, protocol::wire::PacketKind};
 
   fn frame(bytes: usize) -> SessionFrame {
@@ -261,17 +269,7 @@ mod queue_tests {
   }
 
   fn queue(max_count: usize, max_bytes: usize) -> (BoundedSender, BoundedReceiver) {
-    let (tx, rx) = mpsc::channel(max_count);
-    let state = Arc::new(QueueState::default());
-    (
-      BoundedSender {
-        inner: tx,
-        state: Arc::clone(&state),
-        max_count,
-        max_bytes,
-      },
-      BoundedReceiver { inner: rx, state },
-    )
+    super::test_queue(max_count, max_bytes)
   }
 
   /// Count and byte bounds are checked atomically and a rejected frame is

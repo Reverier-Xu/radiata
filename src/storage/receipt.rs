@@ -1,6 +1,5 @@
 use std::{
   collections::BTreeSet,
-  fmt,
   sync::Arc,
   time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -42,19 +41,6 @@ pub struct ReceiptRetentionReport {
 const REFERENCE_TOKEN_WIDTH: usize = 32;
 const WALL_TIME_WIDTH: usize = 13;
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
-
-pub(crate) trait WallClock: fmt::Debug + Send + Sync + 'static {
-  fn now(&self) -> SystemTime;
-}
-
-#[derive(Debug)]
-pub(crate) struct HostWallClock;
-
-impl WallClock for HostWallClock {
-  fn now(&self) -> SystemTime {
-    SystemTime::now()
-  }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedTransaction(pub(super) StoreTransaction);

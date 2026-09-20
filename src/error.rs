@@ -91,8 +91,12 @@ pub enum ProviderErrorContext {
   TransportSend,
   TransportReceive,
   TransportClose,
+  /// Reserved projection vocabulary for a discovery extension surface;
+  /// the registry is test-only today, so core code does not originate it.
   Discovery,
   PacketConsumer,
+  /// Reserved projection vocabulary retained from the retired
+  /// deterministic neighbor planner; no core path originates it today.
   NeighborPolicy,
   LoadBalancingPolicy,
   RoutingPolicy,

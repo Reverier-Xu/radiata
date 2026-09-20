@@ -1,17 +1,38 @@
-//! Shared wall-clock conversion helpers.
+//! Shared wall-clock source and conversion helpers.
 //!
-//! One home for the UNIX-epoch second/millisecond conversions that every
-//! subsystem needs, so saturation and epoch handling cannot drift between
-//! modules. The `to_*`/`from_*` functions are pure conversions over a
-//! [`SystemTime`] value. The `now_seconds`/`now_millis` functions are the
+//! One home for the injectable [`WallClock`] source and the UNIX-epoch
+//! second/millisecond conversions that every subsystem needs, so the
+//! clock seam and saturation handling cannot drift between modules. The
+//! `to_*`/`from_*` functions are pure conversions over a [`SystemTime`]
+//! value. The `now_seconds`/`now_millis` functions are the
 //! protocol-visible liveness readings taken directly from the host clock
 //! (`SystemTime::now`) — deliberately not pure, because production code
 //! calls them exactly where the host wall clock is the required
-//! authority (storage receipt internals instead take the injected
-//! [`WallClock`](crate::storage::receipt::WallClock), which wraps these
-//! conversions for tests).
+//! authority (injected boundaries instead take a
+//! [`WallClock`], which wraps these conversions for tests).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+  fmt,
+  time::{SystemTime, UNIX_EPOCH},
+};
+
+/// The injected wall-clock seam: production wires
+/// [`HostWallClock`], tests freeze or script readings. L0 by content —
+/// every layer reads time through this trait, so it lives beside the
+/// conversions instead of inside one consumer domain.
+pub(crate) trait WallClock: fmt::Debug + Send + Sync + 'static {
+  fn now(&self) -> SystemTime;
+}
+
+/// The production clock: an unadorned host `SystemTime::now` reader.
+#[derive(Debug)]
+pub(crate) struct HostWallClock;
+
+impl WallClock for HostWallClock {
+  fn now(&self) -> SystemTime {
+    SystemTime::now()
+  }
+}
 
 /// UNIX seconds of `time`, saturating at the epoch (a pre-epoch reading
 /// reports zero rather than failing bounded work).

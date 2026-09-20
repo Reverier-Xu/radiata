@@ -18,6 +18,17 @@ use crate::{Error, QualifiedTag, Result};
 /// persistence instead of being truncated.
 pub(crate) const LABEL_VALUE_MAX_BYTES: usize = 256;
 
+/// The shared bounded-value rule: non-empty, at most
+/// [`LABEL_VALUE_MAX_BYTES`] UTF-8 bytes. Every free-form opaque value
+/// (label values, resource URIs, selector values) validates through this
+/// one check so the budget cannot drift between consumers.
+pub(crate) fn validate_bounded_value(value: &str, context: &'static str) -> Result<()> {
+  if value.is_empty() || value.len() > LABEL_VALUE_MAX_BYTES {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 /// The maximum number of entries in one label set, matching the descriptor
 /// page's per-record budget so a single record can never dominate a page.
 pub(crate) const LABEL_SET_MAX_ENTRIES: usize = 64;
@@ -87,9 +98,7 @@ impl LabelValue {
   /// Validates and stores one label value: non-empty, at most
   /// `LABEL_VALUE_MAX_BYTES` UTF-8 bytes.
   pub fn parse(value: &str) -> Result<Self> {
-    if value.is_empty() || value.len() > LABEL_VALUE_MAX_BYTES {
-      return Err(Error::invalid_input("label value"));
-    }
+    crate::label::validate_bounded_value(value, "label value")?;
     Ok(Self(Arc::from(value)))
   }
 

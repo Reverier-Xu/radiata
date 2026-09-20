@@ -576,11 +576,7 @@ fn capability_set(os_crash: bool) -> StoreCapabilities {
   } else {
     DurabilityLevel::ProcessCrashAtomic
   };
-  StoreCapabilities::new(durability)
-    .conditional_batch(true)
-    .ordered_scan(true)
-    .reconciliation(true)
-    .exclusive_lifetime_lock(true)
+  StoreCapabilities::full_metadata(durability)
 }
 
 #[cfg(unix)]

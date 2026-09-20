@@ -111,9 +111,7 @@ impl ResourceUri {
   /// Validates and stores one URI value: non-empty, at most the shared
   /// label-value byte budget of UTF-8 text.
   pub fn parse(value: &str) -> Result<Self> {
-    if value.is_empty() || value.len() > crate::label::LABEL_VALUE_MAX_BYTES {
-      return Err(Error::invalid_input("resource uri"));
-    }
+    crate::label::validate_bounded_value(value, "resource uri")?;
     Ok(Self(Arc::from(value)))
   }
 

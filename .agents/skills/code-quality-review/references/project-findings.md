@@ -1101,3 +1101,110 @@ total order verified by unit and integration tests.
   divergence is the finding.
 - give each reviewer explicit "answer this question" items (lane B was
   asked to compare against the membership-side shape and found it).
+
+---
+
+# Full-Tree Review 2026-09-20 (main @ dfd7df6, 7 lanes: identity+keys, protocol+membership,
+# transport+session+packet+node, storage+provider, resource+routing, runtime+simulation,
+# facade+crosscut+architecture audit vs docs/architecture.md)
+
+Context: landed `fix-f8-sync-storm` as dfd7df6 (sync-storm fix: page plane no longer
+rides every leg dispatch; page-scoped rewinds), CI 16/16 green. Review = 7 read-only
+reviewer lanes over ~68k lines; quality suite Q green pre-land; parent spot-checked
+both P1s + all head P2s against real code. Verdict: **no P0, 2×P1, ~20×P2 (deduped),
+long P3 tail; merge-healthy, structurally debt-free at the module level (no god-modules).**
+
+## P1 (both verified in code)
+
+- **Identity admission logic hosted in L3 session driver.** `session/driver.rs:549-575`
+  `trusted_binding` re-implements the identity-domain binding resolution (terminal gate
+  `is_left_ctx||is_cleaned_ctx` → `identity_binding_key` → snapshot get → decode →
+  revocation gate). Terminal gate duplicated driver.rs:248-250 + runtime/views.rs:44-46;
+  parallel population scan `identity::trust::trusted_bindings` (trust.rs:1042) shares the
+  decode path. Fix: `identity::trust::trusted_binding(store, peer)` + `peer_is_terminal`
+  helpers, driver consumes them.
+- **BoundedSender/Receiver pair construction duplicated 6 sites via `pub(super)` fields.**
+  Production: stream.rs:283-294; test-shape: queue.rs:232-241 (`test_queue`), queue.rs:263-272
+  (byte-identical copy), stream.rs:589-611, 733-737. Fix: `BoundedSender::channel(max_count,
+  max_bytes)` beside `QueueState`, re-privatize fields.
+
+## Architecture (the doc-vs-code layer map)
+
+The L0–L7 "top-down" story in docs/architecture.md does not match the middle of the
+stack; only `sync_common.rs` is a *declared* cross-cutting exception. Real edges:
+L3 session → L4/L5/L6/L7 (stream.rs:108-114, driver.rs:143/384/553, inbound.rs:277,
+queue.rs:17); L4 routing/trace.rs → L5 identity + L6 storage (trace.rs:27-33,1170);
+L4 routing.rs → L5 membership decode + resource reserved labels (routing.rs:214-222,
+711-730); L0 paging → L6 provider SPI (paging.rs:168); `WallClock` home = L6
+storage/receipt.rs:46 but consumed by L3/L4/L5 (time.rs:11 documents the detour);
+L3↔L7 conceptual cycle (SessionPacketContext holds RuntimeClient+EventHub, wired at
+supervisor.rs:631-635, cloned back inbound.rs:343); identity↔provider two-way over
+KeyOperationId/id helpers (provider.rs:52-66 vs identity/id.rs:48-88 — every other id
+family lives in identity/id.rs). Doc drift: neighbor.rs listed but deleted (ghost +
+dead ProviderErrorContext::NeighborPolicy/Discovery error.rs:96/300-302); session/
+has inbound/liveness/queue the doc never lists (stream.rs row describes inbound.rs);
+L5→L6 numbering contradicts the drawn order. Healthy: protocol/* and transport/*
+have ZERO upward imports; no god-modules (largest: resource/mod ~1337, receipt ~1182,
+membership/sync ~1123 production).
+
+## Top P2 hotspots (deduped; full file:line in lane reports)
+
+1. **Anti-entropy tick skeleton duplicated membership≡resource** — empty-peer drop,
+   retain, rejected-dispatch rewind, verdict join all near-byte-identical
+   (resource/sync.rs:266-323 ≡ membership/sync.rs:873-1042). Lift the generic per-peer
+   round driver into sync_common. (Same-mechanism-two-lanes again — third occurrence
+   of the 2026-08 lesson.)
+2. **WallClock → time.rs** — mechanical move erases 3 upward edges.
+3. **Lift identity trust helpers** (P1-1 above) + **membership.rs:337/471 probes
+   identity binding key layout** — expose `trust::binding_adopted`.
+4. **Storage capability set ×4 hand-built chains** (redb/store.rs:84, json/store.rs:579,
+   contract/helpers.rs:117, contract/unknown.rs:86) → `StoreCapabilities::full_metadata`.
+5. **Sweep helpers**: "skip undecodable row with warn" ×3 (trace.rs:357,412,
+   resource/retention.rs:100) + sweep commit-outcome mapping ×2 (trace.rs:505,
+   retention.rs:193) → shared storage helpers.
+6. **Active-descriptor enumeration ×2** (runtime/identity_ops.rs:76-111 ≡
+   runtime/recovery.rs:263-298) → `membership::store::active_descriptors`.
+7. **routing/trace.rs ErrorKind↔u8 dual 22-arm tables** (trace.rs:88-149) → one const
+   table driving both directions.
+8. **reserved-label knowledge ×2** (routing.rs:214 ≡ resource/select.rs:21) → one
+   resource-owned resolver.
+9. **resource/store.rs:25 namespace hop via identity::records::metadata_namespace** —
+   call families::namespace directly (also drop/dual-home the wrapper itself).
+10. **KeyOperationId + prefixed_id/body_digest homes** (P2 #5 above) → hoist to L0.
+11. **Bounded-value rule ×3** (label.rs:89, resource/mod.rs:112, routing.rs:251) →
+    `label::validate_bounded_value`; **fixed_bytes bypassed** ×3 (offer.rs:228,
+    membership/page.rs:308, cbor.rs:400).
+12. **membership/page.rs decode_descriptor hand-rolls canonical check ×2** — use
+    `decode_canonical_strict_or` (its doc claims "exactly once crate-wide").
+13. **Wire-ack build+enqueue ×3** (queue.rs:95-117, inbound.rs:457-467) →
+    `try_send_ack`/`send_ack` on BoundedSender.
+14. **require_unblocked ×2** (driver.rs:538 ≡ supervisor.rs:967) → on
+    LocalIdentityContext.
+15. **tombstone-binding guard triplication + matches! trigger** (membership/sync.rs:
+    356-472) → one `require_tombstone_bindings` helper.
+
+## Behavior finding (only one)
+
+- `identity/leave.rs:320-328` — in-process re-drive after intent-committed/record-failed
+  errors `Error::internal("journaled leave record")`, while `ensure_journaled_record`
+  (leave.rs:706) safely repairs exactly this window at resume only. Fix: call it in the
+  intent-found branch (behavior change — schedule with a test).
+
+## Healthy (re-confirmed)
+
+hex/time/alive_peers/paging-size-ladder/audit-events/insert-once all single-source
+verified; protocol+transport zero upward imports; storage contract split is real
+(not god-module); no unsafe/prod-unwrap/prod-println; stringly surface is typed consts
+everywhere (wire kinds, features, namespaces, schema tags); registries table-driven;
+packet wire correctly reuses protocol CBOR (no encode duplication); simulation fully
+cfg(test)-quarantined; new sync-storm sync.rs leg logic judged well-factored (not a
+god-function).
+
+## Lesson for next review
+
+- Same-mechanism-two-lanes drift struck AGAIN (anti-entropy skeleton) — keep the
+  "diff the twin lanes" question mandatory in both sync lanes' prompts.
+- The layer table in docs/architecture.md is aspirational for the mid-stack; reviewers
+  given the doc as authority will report every session/routing file as a violation.
+  Give them the doc PLUS the convention note (session = integration hub, facade types
+  flow downward by convention) so real violations stand out.

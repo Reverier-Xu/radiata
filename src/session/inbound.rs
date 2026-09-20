@@ -48,7 +48,7 @@ struct AdmittedStream {
 
 /// UNIX-milliseconds from the injected wall clock, used for the admission
 /// timestamps reported in acknowledgements so simulation controls them too.
-fn clock_millis(clock: &dyn crate::storage::receipt::WallClock) -> u64 {
+fn clock_millis(clock: &dyn crate::time::WallClock) -> u64 {
   crate::time::to_millis(clock.now())
 }
 
@@ -743,7 +743,7 @@ mod read_loop_liveness_tests {
     }
   }
 
-  fn context(clock: Arc<dyn crate::storage::receipt::WallClock>) -> SessionPacketContext {
+  fn context(clock: Arc<dyn crate::time::WallClock>) -> SessionPacketContext {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
     SessionPacketContext::new(
       node(1),
@@ -787,7 +787,7 @@ mod read_loop_liveness_tests {
       now: 0,
     };
     let session = crate::session::driver::EstablishedSession::test_session(node(2));
-    let context = context(Arc::clone(&clock) as Arc<dyn crate::storage::receipt::WallClock>);
+    let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
 

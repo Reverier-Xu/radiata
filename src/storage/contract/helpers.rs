@@ -12,8 +12,9 @@ use crate::{
   provider::{StorageFactory, StoreScan},
   storage::{
     MetadataStore,
-    receipt::{PreparedTransaction, ReceiptIdentity, WallClock},
+    receipt::{PreparedTransaction, ReceiptIdentity},
   },
+  time::WallClock,
 };
 
 #[derive(Debug)]
@@ -115,11 +116,7 @@ pub(crate) async fn collect_scan(mut scan: Box<dyn StoreScan + '_>) -> Vec<Store
 }
 
 pub(crate) fn required_capabilities() -> StoreCapabilities {
-  StoreCapabilities::new(DurabilityLevel::OsCrashDurable)
-    .conditional_batch(true)
-    .ordered_scan(true)
-    .reconciliation(true)
-    .exclusive_lifetime_lock(true)
+  StoreCapabilities::full_metadata(DurabilityLevel::OsCrashDurable)
 }
 
 pub(crate) use crate::storage::test_util::{key as store_key, namespace, value};

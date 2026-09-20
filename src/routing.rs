@@ -249,9 +249,7 @@ impl<'a> SelectorParser<'a> {
         }
       }
     }
-    if value.is_empty() || value.len() > crate::label::LABEL_VALUE_MAX_BYTES {
-      return Err(Error::invalid_input("selector value"));
-    }
+    crate::label::validate_bounded_value(&value, "selector value")?;
     Ok(Arc::from(value))
   }
 

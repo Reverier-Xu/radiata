@@ -57,7 +57,6 @@ impl KeyOperationId {
     Ok(Self(value.to_owned()))
   }
 
-  #[allow(dead_code)]
   pub(crate) fn generate(entropy: &dyn crate::api::Entropy) -> Result<Self> {
     let value = crate::identity::id::random_prefixed_id(KEY_OPERATION_PREFIX, entropy)?;
     Ok(Self(value))
@@ -302,6 +301,19 @@ impl StoreCapabilities {
       #[cfg(any(test, fuzzing))]
       transactional_migration: false,
     }
+  }
+
+  /// The complete metadata capability set every built-in backend
+  /// advertises: conditional batches, ordered scans, reconciliation, and
+  /// the exclusive lifetime lock, at the caller's durability level. One
+  /// named constructor so a newly required capability extends a single
+  /// chain instead of one per adapter.
+  pub fn full_metadata(durability: DurabilityLevel) -> Self {
+    Self::new(durability)
+      .conditional_batch(true)
+      .ordered_scan(true)
+      .reconciliation(true)
+      .exclusive_lifetime_lock(true)
   }
 
   pub fn conditional_batch(mut self, supported: bool) -> Self {

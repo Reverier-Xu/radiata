@@ -892,6 +892,42 @@ pub(crate) mod store {
   /// order must equal revision order, which requires a fixed width.
   const REVISION_KEY_DIGITS: usize = 20;
 
+  /// Whether the node carries terminal departure evidence — an
+  /// owner-signed leave record or an issuer-signed cleanup tombstone.
+  /// Terminal members are excluded from session establishment, and every
+  /// admission-sensitive read shares this one gate.
+  pub(crate) async fn peer_is_terminal(store: &MetadataStore, node: &NodeId) -> Result<bool> {
+    Ok(
+      crate::identity::leave::is_left_ctx(store, node).await?
+        || crate::identity::cleanup::is_cleaned_ctx(store, node).await?,
+    )
+  }
+
+  /// Resolves the trusted member-mode binding for `peer` from durable
+  /// storage: terminal departure evidence fails closed before any signing
+  /// work (a locally revoked binding fails the same way, after the
+  /// decode), the single authoritative binding decodes once, and the
+  /// revocation gate has the final word. The one admission-time binding
+  /// resolution — session establishment signs against exactly this key.
+  pub(crate) async fn trusted_binding(store: &MetadataStore, peer: &NodeId) -> Result<PublicKey> {
+    if peer_is_terminal(store, peer).await? {
+      return Err(crate::Error::not_trusted("peer left"));
+    }
+    let (namespace, key) = crate::identity::records::identity_binding_key(peer)?;
+    let snapshot = store.snapshot().await?;
+    let value = snapshot
+      .get(&namespace, &key)
+      .await?
+      .ok_or_else(|| crate::Error::authentication_failed("session binding"))?;
+    let binding = crate::identity::records::IdentityBindingV1::decode(value.as_bytes())
+      .map_err(|_| crate::Error::authentication_failed("session binding"))?;
+    let public_key = binding.public_key().clone();
+    if crate::identity::revocation::is_revoked_ctx(store, peer, &public_key).await? {
+      return Err(crate::Error::revoked("session binding"));
+    }
+    Ok(public_key)
+  }
+
   fn snapshot_namespace() -> Result<StoreNamespace> {
     crate::storage::families::namespace(TRUST_SNAPSHOT_NAMESPACE)
   }

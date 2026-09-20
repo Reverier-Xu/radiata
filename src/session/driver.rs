@@ -33,9 +33,7 @@ use crate::{
     lifecycle::LocalIdentityContext,
     merge::{MergeProposal, adopt_merge, commit_merge},
     merge_rate::MergeSource,
-    records::{
-      GenerationId, IdentityBindingV1, LocalIdentityV1, MergeGrantV1, MergeId, identity_binding_key,
-    },
+    records::{GenerationId, LocalIdentityV1, MergeGrantV1, MergeId},
   },
   protocol::{
     credential::CredentialSecret,
@@ -245,9 +243,7 @@ impl SessionDriver {
     // A locally revoked or already-left identity never completes a new
     // merge through this node: the exact revoked or left binding fails
     // closed before any credential or signing work.
-    if crate::identity::leave::is_left_ctx(self.context.store(), &peek.node_id).await?
-      || crate::identity::cleanup::is_cleaned_ctx(self.context.store(), &peek.node_id).await?
-    {
+    if crate::identity::trust::store::peer_is_terminal(self.context.store(), &peek.node_id).await? {
       return Err(Error::not_trusted("peer left"));
     }
     if crate::identity::revocation::is_revoked_ctx(
@@ -290,7 +286,9 @@ impl SessionDriver {
         (None, Some(active.0), Some(active.1))
       }
       HandshakeMode::Member => {
-        let binding = trusted_binding(&self.context, &peek.node_id).await?;
+        let binding =
+          crate::identity::trust::store::trusted_binding(self.context.store(), &peek.node_id)
+            .await?;
         // Early rejection: the advertised public key must match the trusted
         // binding before any signing work.
         if peek.public_key != binding {
@@ -472,7 +470,8 @@ impl SessionDriver {
     &self, connection: &mut Connection, peer: &NodeId,
   ) -> Result<EstablishedSession> {
     self.require_unblocked()?;
-    let binding = trusted_binding(&self.context, peer).await?;
+    let binding =
+      crate::identity::trust::store::trusted_binding(self.context.store(), peer).await?;
     let identity = self.context.identity();
     let mut nonce = [0_u8; 32];
     self.entropy.fill(&mut nonce)?;
@@ -536,40 +535,11 @@ impl SessionDriver {
   /// sign or admit until an authoritative reopen reconciles the exact
   /// transaction or proves absence.
   fn require_unblocked(&self) -> Result<()> {
-    if self.context.store().is_blocked()? {
-      return Err(Error::not_ready("metadata storage reconciliation"));
-    }
-    Ok(())
+    self.context.require_unblocked()
   }
 }
 
 /// Reads the trusted member-mode binding for `peer` from durable storage.
-/// A locally revoked binding fails closed with the typed revocation error
-/// before any signing work (revocation removes connection authority).
-async fn trusted_binding(context: &LocalIdentityContext, peer: &NodeId) -> Result<PublicKey> {
-  // A node with an owner-signed leave record or an issuer-signed cleanup
-  // tombstone is terminal evidence: it is excluded from session
-  // establishment.
-  if crate::identity::leave::is_left_ctx(context.store(), peer).await?
-    || crate::identity::cleanup::is_cleaned_ctx(context.store(), peer).await?
-  {
-    return Err(Error::not_trusted("peer left"));
-  }
-  let snapshot = context.store().snapshot().await?;
-  let (namespace, key) = identity_binding_key(peer)?;
-  let value = snapshot
-    .get(&namespace, &key)
-    .await?
-    .ok_or_else(|| Error::authentication_failed("session binding"))?;
-  let binding = IdentityBindingV1::decode(value.as_bytes())
-    .map_err(|_| Error::authentication_failed("session binding"))?;
-  let public_key = binding.public_key().clone();
-  if crate::identity::revocation::is_revoked_ctx(context.store(), peer, &public_key).await? {
-    return Err(Error::revoked("session binding"));
-  }
-  Ok(public_key)
-}
-
 /// Sends one handshake state machine message under its published kind.
 async fn send(connection: &mut Connection, kind: HandshakeKind, body: &[u8]) -> Result<()> {
   connection

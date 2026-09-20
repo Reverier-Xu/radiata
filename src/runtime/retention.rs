@@ -25,7 +25,7 @@ impl Supervisor {
     match crate::routing::trace::sweep(
       context.store(),
       self.dependencies.entropy.as_ref(),
-      &crate::storage::receipt::HostWallClock,
+      &crate::time::HostWallClock,
       limits.terminal(),
       limits.retention(),
     )
@@ -57,7 +57,7 @@ impl Supervisor {
     };
     if let Err(error) = crate::resource::retention::sweep_removed_ctx(
       context.store(),
-      &crate::storage::receipt::HostWallClock,
+      &crate::time::HostWallClock,
       crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
       crate::resource::retention::RESOURCE_REGISTER_CAP,
     )
