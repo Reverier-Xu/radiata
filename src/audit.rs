@@ -98,3 +98,35 @@ pub(crate) fn journal_declared_uncommitted(purpose: &str) {
   #[cfg(not(feature = "audit"))]
   let _ = purpose;
 }
+
+/// The leave-plane announcement began: `peers` live sessions will carry
+/// the owner-signed record. The harness asserts this line as the proof
+/// that a leave went through the announcement plane instead of silently
+/// degrading to the tombstone lane.
+pub(crate) fn leave_announcement_started(peers: usize) {
+  #[cfg(feature = "audit")]
+  debug!(target: "audit", peers, "leave announcement starting");
+  #[cfg(not(feature = "audit"))]
+  let _ = peers;
+}
+
+/// The announcement degraded to the documented silent leave: no live
+/// session can carry the record right now, so the journaled record
+/// converges through the tombstone lane and the cleanup path instead.
+/// Without this line a silent leave is indistinguishable from a lost
+/// log line, which made fuzz violations unverifiable (F-10).
+pub(crate) fn leave_announcement_skipped() {
+  #[cfg(feature = "audit")]
+  debug!(target: "audit", "leave announcement skipped: no live sessions");
+}
+
+/// A verified owner-signed leave record was persisted into the local
+/// store: the receiving-side terminal evidence of a departure,
+/// delivered through the sync plane. The harness asserts this line as
+/// the propagation proof after a leave operation.
+pub(crate) fn leave_record_persisted(node: &str) {
+  #[cfg(feature = "audit")]
+  debug!(target: "audit", node, "leave record persisted on peer");
+  #[cfg(not(feature = "audit"))]
+  let _ = node;
+}

@@ -254,9 +254,13 @@ pub(crate) async fn announce_leave(
 ) -> Result<()> {
   let peers = crate::sync_common::alive_peers(sessions)?;
   if peers.is_empty() {
+    // The documented silent-leave degradation, made audible: without
+    // this line a silent leave is indistinguishable from a lost log
+    // line (F-10).
+    crate::audit::leave_announcement_skipped();
     return Ok(());
   }
-  tracing::debug!(peers = peers.len(), "leave announcement starting");
+  crate::audit::leave_announcement_started(peers.len());
   let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
   let encoded = SyncPayload::Leave(minicbor::bytes::ByteVec::from(record.encode()?)).encode()?;
   let acked = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -311,6 +315,9 @@ pub(crate) async fn announce_leave(
     pumps.push(pump);
   }
   if pumps.is_empty() {
+    // Every alive-peer entry died between the table read and the pump
+    // setup: the same silent-leave degradation as above.
+    crate::audit::leave_announcement_skipped();
     return Ok(());
   }
   let deadline = tokio::time::Instant::now() + LEAVE_ACK_WAIT;
@@ -398,7 +405,7 @@ async fn accept_payload(
       // The writer exclusion serializes the persist against every other
       // store writer, so terminal evidence cannot be dropped on contention.
       crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
-      tracing::debug!(node = %record.node(), "leave record persisted on peer");
+      crate::audit::leave_record_persisted(record.node().as_str());
       member_changed(events, revision, record.node().clone());
       let receipt = SyncPayload::LeaveApplied {
         node: record.node().clone(),
@@ -648,9 +655,13 @@ struct MembershipPeerRound {
   /// The round's tombstone payloads' admission receivers: a fully
   /// delivered set re-arms the tombstone resend cadence.
   tombstone_acks: Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
-  /// The descriptor page's admission receiver: the page rides every
-  /// dispatched round, and its verdict feeds the peer-level failure set.
+  /// The descriptor page's admission receiver, set only when a page was
+  /// due and dispatched; its verdict rewinds the page cursor on failure.
   page_ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  /// True when a page payload was due and handed to dispatch: a `None`
+  /// `page_ack` beside it means the dispatch was rejected and the page
+  /// cursor must rewind. A quiet page sets neither.
+  page_dispatched: bool,
   snapshot_page: Option<SnapshotPageDispatch>,
   dispatched: bool,
 }
@@ -658,8 +669,8 @@ struct MembershipPeerRound {
 /// One per-peer membership anti-entropy step, mirroring the resource
 /// lane's `resource_sync_tick_peer`: decide the round against the
 /// whole-catalog fingerprint, emit the bounded descriptor page only when
-/// the round dispatches, decide the snapshot/tombstone legs, dispatch one
-/// round, and advance the peer's continuation state. The delivery
+/// the page plane is due, decide the snapshot/tombstone legs, dispatch
+/// one round, and advance the peer's continuation state. The delivery
 /// verdicts are aggregated (and cursor commits gated) by the tick's
 /// caller.
 #[allow(clippy::too_many_arguments)]
@@ -706,32 +717,6 @@ async fn membership_sync_tick_peer(
     state.ticks_since_tombstone_send,
     snapshot_due,
   );
-  let page_bytes = match page_round {
-    crate::sync_common::PageRound::Quiet if !snapshot_due && !tombstones_due => {
-      state.page.quiet_tick();
-      return Ok(MembershipPeerRound {
-        tombstone_acks: Vec::new(),
-        page_ack: None,
-        snapshot_page: None,
-        dispatched: false,
-      });
-    }
-    // A due page starts (or continues) its pass; a quiet page whose
-    // snapshot/tombstone leg is due still rides the dispatch without
-    // advancing the page cursor.
-    crate::sync_common::PageRound::Quiet | crate::sync_common::PageRound::Send => {
-      let page = page_sync::emit_page_from_snapshot(
-        catalog,
-        state.page.continuation(),
-        crate::membership::page::DEFAULT_PAGE_LIMIT,
-      )
-      .await?;
-      if page_round == crate::sync_common::PageRound::Send {
-        state.page.record_send(page.cursor());
-      }
-      SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?
-    }
-  };
   // The trust snapshot leg pages through the issuer's binding set one
   // wire page per tick (keyset cursor per peer); the revision is only
   // marked fully delivered on the closing empty-page tick, so an
@@ -756,11 +741,48 @@ async fn membership_sync_tick_peer(
   if tombstones_due {
     tombstone_payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
   }
+  // A page plane that is not due — catalog fingerprint unchanged, liveness
+  // cadence not reached, no pass in flight — dispatches NOTHING, even when
+  // a snapshot/tombstone leg is due. The old ride-along emitted the whole
+  // catalog beside every leg dispatch, so a converged mesh re-sent every
+  // descriptor at the legs' resend cadence forever: each peer received the
+  // entire skip-everything catalog on both rounds of every trust cycle
+  // (walk page and closing round), and the per-leaf receive rate scaled
+  // with its degree — the redundant-edge re-emission storm. The page
+  // plane's own triggers are the only reasons a page goes on the wire: a
+  // catalog fingerprint change on the next idle round, an in-flight
+  // continuation, or the page resend cadence.
+  if page_round == crate::sync_common::PageRound::Quiet
+    && snapshot_page.is_none()
+    && tombstone_payloads.is_empty()
+  {
+    state.page.quiet_tick();
+    return Ok(MembershipPeerRound {
+      tombstone_acks: Vec::new(),
+      page_ack: None,
+      page_dispatched: false,
+      snapshot_page: None,
+      dispatched: false,
+    });
+  }
+  let page_bytes = match page_round {
+    crate::sync_common::PageRound::Quiet => None,
+    crate::sync_common::PageRound::Send => {
+      let page = page_sync::emit_page_from_snapshot(
+        catalog,
+        state.page.continuation(),
+        crate::membership::page::DEFAULT_PAGE_LIMIT,
+      )
+      .await?;
+      state.page.record_send(page.cursor());
+      Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?)
+    }
+  };
   let (tombstone_acks, page_ack, snapshot_ack) = dispatch_to_peer(
     peer,
     snapshot_page.as_deref(),
     &tombstone_payloads,
-    &page_bytes,
+    page_bytes.as_deref(),
     runtime,
     entropy,
     protocol,
@@ -768,6 +790,7 @@ async fn membership_sync_tick_peer(
   .await;
   Ok(MembershipPeerRound {
     tombstone_acks,
+    page_dispatched: page_bytes.is_some(),
     page_ack,
     snapshot_page: snapshot_ack
       .zip(snapshot_page_cursor)
@@ -903,7 +926,13 @@ pub(crate) async fn sync_tick(
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
   let mut pending_trust_pages: Vec<(NodeId, SnapshotPageDispatch)> = Vec::new();
-  let mut failed_peers: Vec<NodeId> = Vec::new();
+  // The descriptor page's own failures: an undelivered page or a
+  // rejected page dispatch rewinds that peer's page cursor to the
+  // failed page's start. The rewind is page-plane-scoped by contract —
+  // a failed trust or tombstone payload says nothing about the page
+  // plane, and rewinding the page cursor beside it used to force a full
+  // catalog re-send on the next round.
+  let mut page_rewinds: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let round = membership_sync_tick_peer(
@@ -925,13 +954,17 @@ pub(crate) async fn sync_tick(
     let MembershipPeerRound {
       tombstone_acks,
       page_ack,
+      page_dispatched,
       snapshot_page,
       ..
     } = round;
     if tombstone_acks.is_empty() && page_ack.is_none() && snapshot_page.is_none() {
       // Nothing was queued (the routing queue rejected outright): the
-      // round never left this node.
-      failed_peers.push(peer.clone());
+      // round never left this node. A due-but-rejected page rewinds to
+      // its start so the next round re-sends exactly that page.
+      if page_dispatched {
+        page_rewinds.insert(peer.clone());
+      }
       continue;
     }
     state.page.count_round();
@@ -944,13 +977,13 @@ pub(crate) async fn sync_tick(
     pending_tombstone_acks.extend(tombstone_acks.into_iter().map(|ack| (peer.clone(), ack)));
     if let Some(ack) = page_ack {
       pending_page_acks.push((peer.clone(), ack));
-    } else {
-      // The descriptor page's dispatch was rejected while a sibling leg
-      // dispatched: the page cursor already advanced past the emitted
-      // range, so without a rewind the skipped range would wait for the
-      // full-pass arm. Rewind to the page's start — the next round
-      // re-sends exactly that page.
-      state.page.discard_progress();
+    } else if page_dispatched {
+      // The descriptor page was due but its dispatch was rejected while
+      // a sibling leg dispatched: the page cursor already advanced past
+      // the emitted range, so without a rewind the skipped range would
+      // wait for the full-pass arm. Rewind to the page's start — the
+      // next round re-sends exactly that page.
+      page_rewinds.insert(peer.clone());
     }
   }
   // Delivery verdicts resolve concurrently: one unreachable peer must
@@ -977,15 +1010,14 @@ pub(crate) async fn sync_tick(
   let mut tombstone_rounds: std::collections::BTreeMap<NodeId, bool> =
     std::collections::BTreeMap::new();
   for (peer, delivered) in tombstone_verdicts {
-    if !delivered {
-      failed_peers.push(peer.clone());
-    }
     let entry = tombstone_rounds.entry(peer).or_insert(true);
     *entry &= delivered;
   }
+  // A failed page verdict rewinds that peer's page cursor: the next
+  // round re-sends exactly the failed page's range.
   for (peer, delivered) in page_verdicts {
     if !delivered {
-      failed_peers.push(peer);
+      page_rewinds.insert(peer);
     }
   }
   // The trust page resolves to its own verdict, never the peer-level OR
@@ -996,14 +1028,12 @@ pub(crate) async fn sync_tick(
   for (peer, cursor, delivered) in trust_verdicts {
     if delivered {
       trust_commits.push((peer, cursor));
-    } else {
-      failed_peers.push(peer);
     }
   }
-  for peer in failed_peers {
-    // An unadmitted payload means the peer may hold none of this round:
-    // rewind to the failed page's start so the next tick re-sends exactly
-    // that page (the snapshot stays due through its unrecorded revision).
+  for peer in page_rewinds {
+    // An unadmitted page means the peer may hold none of the page
+    // range: rewind to the failed page's start so the next tick
+    // re-sends exactly that page.
     if let Some(state) = cursors.peers.get_mut(&peer) {
       state.page.discard_progress();
     }
@@ -1044,16 +1074,17 @@ async fn dispatch_or_log(
   }
 }
 
-/// The per-tick fan-out to one peer: sends every payload in order and
-/// returns their admission receivers, grouped by lane so each cadence
+/// The per-tick fan-out to one peer: sends every due payload in order
+/// and returns their admission receivers, grouped by lane so each cadence
 /// commit can be gated on its own delivery verdict. The trust snapshot
 /// page's receiver is kept separate from the rest so its own verdict —
 /// not a peer-level OR over the round — gates the snapshot cursor
-/// commit. A payload swallowed by a session that still looks alive never
-/// resolves its receiver, which is exactly the signal the caller needs
-/// to re-deliver from scratch.
+/// commit. A `None` page dispatches no descriptor payload at all. A
+/// payload swallowed by a session that still looks alive never resolves
+/// its receiver, which is exactly the signal the caller needs to
+/// re-deliver from scratch.
 async fn dispatch_to_peer(
-  peer: &NodeId, snapshot_page: Option<&[u8]>, tombstones: &[&[u8]], page: &[u8],
+  peer: &NodeId, snapshot_page: Option<&[u8]>, tombstones: &[&[u8]], page: Option<&[u8]>,
   runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, protocol: &ProtocolTag,
 ) -> (
   Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
@@ -1070,7 +1101,10 @@ async fn dispatch_to_peer(
       tombstone_acks.push(ack);
     }
   }
-  let page_ack = dispatch_or_log(peer, page, runtime, entropy, protocol).await;
+  let page_ack = match page {
+    Some(payload) => dispatch_or_log(peer, payload, runtime, entropy, protocol).await,
+    None => None,
+  };
   (tombstone_acks, page_ack, snapshot_ack)
 }
 
@@ -1474,6 +1508,7 @@ mod tests {
     admit_all: Arc<std::sync::Mutex<bool>>,
     snapshot_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     leave_dispatches: Arc<std::sync::atomic::AtomicUsize>,
+    page_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     /// The typed reference factory behind the context's store: tests
     /// inject raw family entries straight into its shared state.
     reference: Arc<crate::storage::contract::ReferenceFactory>,
@@ -1549,9 +1584,11 @@ mod tests {
       let admit_all = Arc::new(std::sync::Mutex::new(true));
       let snapshot_dispatches = Arc::new(AtomicUsize::new(0));
       let leave_dispatches = Arc::new(AtomicUsize::new(0));
+      let page_dispatches = Arc::new(AtomicUsize::new(0));
       let drainer_admit = Arc::clone(&admit_all);
       let drainer_snapshots = Arc::clone(&snapshot_dispatches);
       let drainer_leaves = Arc::clone(&leave_dispatches);
+      let drainer_pages = Arc::clone(&page_dispatches);
       let drainer_peer = peer.clone();
       tokio::spawn(async move {
         while let Some(mut request) = packet_rx.recv().await {
@@ -1565,6 +1602,9 @@ mod tests {
             }
             SyncPayload::Leave(_) => {
               drainer_leaves.fetch_add(1, Ordering::SeqCst);
+            }
+            SyncPayload::Page(_) => {
+              drainer_pages.fetch_add(1, Ordering::SeqCst);
             }
             _ => {}
           }
@@ -1589,6 +1629,7 @@ mod tests {
         admit_all,
         snapshot_dispatches,
         leave_dispatches,
+        page_dispatches,
         reference,
       }
     }
@@ -1776,6 +1817,85 @@ mod tests {
       harness.leave_dispatches.load(Ordering::SeqCst),
       1,
       "the delivered round reset the tombstone cadence"
+    );
+  }
+
+  /// Regression (the redundant-edge re-emission storm): a converged page
+  /// plane dispatches NO descriptor page when a snapshot/tombstone leg
+  /// round goes out. The old ride-along emitted the whole catalog beside
+  /// every leg dispatch, so a converged mesh re-sent every descriptor at
+  /// the legs' resend cadence forever — each peer received the entire
+  /// skip-everything catalog on both rounds of every trust cycle, and the
+  /// per-leaf receive rate scaled with its degree. A page goes on the
+  /// wire only on the page plane's own triggers: a catalog fingerprint
+  /// change, an in-flight pass, or the page resend cadence.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_converged_page_plane_does_not_ride_leg_rounds() {
+    use std::sync::atomic::Ordering;
+
+    use crate::{StoreKey, identity::testing::inject_entry};
+
+    let harness = CadenceHarness::build().await;
+    let mut cursors = MembershipSyncCursors::default();
+
+    // Converge: round 1 sends the page (a fresh peer's first round is
+    // always due) beside the trust and leave legs; round 2 closes the
+    // trust pass and forwards the tombstones on the revision change
+    // WITHOUT a page; round 3 is fully quiet.
+    harness.tick(&mut cursors).await;
+    harness.tick(&mut cursors).await;
+    harness.tick(&mut cursors).await;
+    assert_eq!(
+      harness.page_dispatches.load(Ordering::SeqCst),
+      1,
+      "only the first round's page: no ride-along beside the leg rounds"
+    );
+
+    // Arming only the snapshot cadence re-sends the trust page WITHOUT a
+    // descriptor page beside it.
+    {
+      let state = cursors.peers.get_mut(&harness.peer).unwrap();
+      state.ticks_since_snapshot_send = SNAPSHOT_RESEND_TICKS;
+    }
+    harness.tick(&mut cursors).await;
+    assert_eq!(
+      harness.snapshot_dispatches.load(Ordering::SeqCst),
+      2,
+      "the trust page re-sent on its own cadence"
+    );
+    assert_eq!(
+      harness.page_dispatches.load(Ordering::SeqCst),
+      1,
+      "a quiet page plane does not ride the snapshot round"
+    );
+
+    // A catalog change still puts the page on the wire on the next idle
+    // round, alone.
+    let descriptor_namespace =
+      crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
+        .unwrap();
+    let joined = node_at(600);
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      joined.clone(),
+      key_at(1),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()],
+      1,
+      false,
+      1,
+    );
+    inject_entry(
+      &harness.reference,
+      (
+        descriptor_namespace,
+        StoreKey::new(std::sync::Arc::from(joined.as_str().as_bytes().to_vec())),
+      ),
+      descriptor.encode().unwrap(),
+    );
+    harness.tick(&mut cursors).await;
+    assert_eq!(
+      harness.page_dispatches.load(Ordering::SeqCst),
+      2,
+      "a catalog change sends the page on the next idle round"
     );
   }
 }

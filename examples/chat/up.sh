@@ -2,7 +2,7 @@
 # Builds the chat node image and starts the N-instance chat cluster.
 #
 #   ./up.sh            # default: 5 chat users on network "radiata-chat"
-#   FUZZ=1 ./up.sh     # audit build + debug logs for the fuzz harness
+#   FUZZ=1 ./up.sh     # audit build + audit-target debug logs for the fuzz harness
 #
 # Topology at start: standalone nodes; the driver chooses the shape
 # (test_chat.py joins a star through c1, the fuzz harness merges
@@ -26,11 +26,15 @@ FEATURES=""
 LOG_LEVEL=info
 if [ "$FUZZ" = "1" ]; then
   # The fuzz harness parses the library's semantic path events from the
-  # container logs; the audit build emits them and debug level carries
-  # the full sync/session decision trace.
+  # container logs; the audit build emits them, and every asserted event
+  # lives at the `audit` target. The default filter keeps the audit
+  # target at debug and everything else at info: a full debug mesh at
+  # n>=16 overwhelms the host's container log pipeline, which then
+  # silently drops exactly the lines the harness asserts on (F-9/F-10).
+  # Set RUST_LOG=debug explicitly for deep-dive diagnostic runs.
   FEATURES=audit
-  LOG_LEVEL=debug
-  echo "fuzz mode: audit build + debug logs"
+  LOG_LEVEL="info,audit=debug"
+  echo "fuzz mode: audit build + audit-target debug logs"
 fi
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then

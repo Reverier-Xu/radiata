@@ -25,9 +25,11 @@ history, the failing assertion, and the relevant audit-log excerpts.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -41,6 +43,15 @@ N = int(os.environ.get("N", "5"))
 # Container names carry the parallel-mesh prefix (hostnames stay c$i).
 NAME_PREFIX = os.environ.get("NAME_PREFIX", "")
 POLL = 0.5
+
+# The hub's fixed merge limiter admits 16 handshakes per source per
+# 60 s window, and on a single-host mesh every container's dial shares
+# one normalized source address: the deterministic pre-merge fan-in is
+# paced in waves that fit the window instead of riding the per-join
+# retry deadline into timing-dependent rejections (F-11). One under the
+# limit covers handshake retries inside a single join command.
+MERGE_WINDOW_S = 61.0
+MERGE_WAVE = 15
 
 
 class HarnessError(Exception):
@@ -78,9 +89,29 @@ def podman_logs(node: int, since_epoch: float) -> str:
   return result.stdout + result.stderr
 
 
-def path_lines(log_text: str, needle: str) -> list[str]:
-  """Log lines containing `needle` (stable event text)."""
-  return [line for line in log_text.splitlines() if needle in line]
+def log_stream_stale(node: int, since: float) -> bool:
+  """The node's newest log line predates the operation: the container's
+  log stream died mid-run (F-9 class: single-host container logging is
+  lossy — full-debug host-wide windows, per-stream deaths), so a missing
+  path line is unverifiable rather than a violation. A live stream
+  always carries at least the operation's own audit lines."""
+  result = subprocess.run(
+    ["podman", "logs", "--tail", "1", f"{NAME_PREFIX}c{node}"],
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+  match = re.search(r"(\d{4}-\d{2}-\d{2}T[\d:.]+)", result.stdout + result.stderr)
+  if not match:
+    return True
+  stamp = datetime.datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+  return stamp.timestamp() < since
+
+
+def path_lines(log_text: str, needle) -> list[str]:
+  """Log lines containing `needle` (stable event text; a tuple matches any)."""
+  needles = (needle,) if isinstance(needle, str) else tuple(needle)
+  return [line for line in log_text.splitlines() if any(n in line for n in needles)]
 
 
 class Model:
@@ -133,19 +164,24 @@ class Checker:
     raise self.fail(f"state not converged within {deadline_s}s: {description} (last: {last})")
 
   def wait_path(
-    self, node, since: float, needle: str, description: str,
+    self, node, since: float, needle, description: str,
     deadline_s: float = 30, also: str | None = None,
   ):
     """One of `node`'s logs (a single node id or a tuple of candidates)
     must contain `needle` (and `also` on the same line when given)
     within the deadline. Multi-node targets cover heals that may be
-    performed by either endpoint of the broken edge."""
+    performed by either endpoint of the broken edge. A needle tuple
+    covers alternative legal paths (e.g. the leave's documented silent
+    degradation beside the announcement)."""
     targets = tuple(node) if isinstance(node, (tuple, list)) else (node,)
+    needles = (needle,) if isinstance(needle, str) else tuple(needle)
     deadline = time.monotonic() + deadline_s
 
     def hit(text: str) -> bool:
-      return any(needle in line and (also is None or also in line)
-                 for line in path_lines(text, needle))
+      return any(
+        any(n in line for n in needles) and (also is None or also in line)
+        for line in text.splitlines()
+      )
 
     def hit_any() -> bool:
       return any(hit(podman_logs(target, since)) for target in targets)
@@ -159,6 +195,16 @@ class Checker:
       for target in targets
       for line in path_lines(podman_logs(target, since), needle)[-5:]
     )
+    # A dead log stream cannot prove or disprove the event: on a
+    # single-host mesh the container log pipeline occasionally kills one
+    # stream mid-run while the process keeps working (F-9/F-10 class).
+    # Degrade to a warning; the operation's state assertions and the
+    # peer-side propagation checks already gated the outcome. A
+    # multi-node target needs every stream alive to convict: the
+    # emitting endpoint may be exactly the dead one.
+    if any(log_stream_stale(target, since) for target in targets):
+      print(f"[fuzz] WARN path unverifiable on {targets} (log stream stale): {description}")
+      return
     raise self.fail(
       f"path event missing on {targets}: {description}"
       + (f" (line must also contain {also!r})" if also else "")
@@ -276,7 +322,12 @@ def op_leave(model: Model, rng: random.Random, node: int):
   # lingers in the resource label as evidence, exactly like their chat
   # identity resource.
   return None, [
-    (node, "leave announcement starting", None, "the leave announcement started"),
+    # The announcement plane has two documented outcomes and both prove
+    # the journaled leave went through it: the announcement ran, or it
+    # degraded to the silent leave because no live session could carry
+    # the record (the tombstone lane still converges the record).
+    (node, ("leave announcement starting", "leave announcement skipped"), None,
+     "the leave went through the announcement plane"),
     (peer, "leave record persisted on peer", None, "the leave record propagated to a peer"),
   ]
 
@@ -565,10 +616,14 @@ OPERATIONS = [
 ]
 
 
-def checkpoint(checker: Checker, model: Model, state_check, path_expectations: list):
+def checkpoint(checker: Checker, model: Model, state_check, path_expectations: list, since: float):
   """The dual assertion: state convergence against the model (the shared
   cluster checkpoint plus the operation's own predicate), then the
-  operation's audit path on the responsible nodes."""
+  operation's audit path on the responsible nodes. `since` is the
+  operation's start: path events emitted any time during the operation
+  (including while the state checks or earlier peers' path checks were
+  still waiting) must stay inside the log window — a per-check window
+  silently filters out events of fast nodes checked after slow ones."""
   live = sorted(model.alive & model.merged)
 
   def state_ok():
@@ -597,7 +652,7 @@ def checkpoint(checker: Checker, model: Model, state_check, path_expectations: l
     description, predicate = state_check
     checker.wait_state(description, predicate, deadline_s=60)
   for node, needle, also, description in path_expectations:
-    checker.wait_path(node, time.time() - 5, needle, description, deadline_s=30, also=also)
+    checker.wait_path(node, since, needle, description, deadline_s=30, also=also)
 
 
 def pick_operation(model: Model, rng: random.Random, node: int):
@@ -653,10 +708,10 @@ def main() -> None:
       ok, sessions = sessions_of(node)
       if ok and sessions != 0:
         print(
-        f"[fuzz] c{node} already holds {sessions} sessions; "
-        "the cluster is not fresh — run ./down.sh && FUZZ=1 ./up.sh first"
-      )
-      sys.exit(1)
+          f"[fuzz] c{node} already holds {sessions} sessions; "
+          "the cluster is not fresh — run ./down.sh && FUZZ=1 ./up.sh first"
+        )
+        sys.exit(1)
 
   # The topology seam: every node first merges through the bootstrap hub
   # (so trust bindings propagate cluster-wide), then a seeded random set
@@ -675,7 +730,16 @@ def main() -> None:
       ids[node] = payload["node_id"]
       hosts[node] = f"{NAME_PREFIX}c{node}" if NAME_PREFIX else f"c{node}"
     bootstrap_host = hosts[1]
+    wave_started = time.monotonic()
     for node in range(2, N + 1):
+      # Wave pacing: after every MERGE_WAVE joins, wait out the rest of
+      # the hub's limiter window before starting the next wave.
+      if (node - 2) > 0 and (node - 2) % MERGE_WAVE == 0:
+        wait = MERGE_WINDOW_S - (time.monotonic() - wave_started)
+        if wait > 0:
+          print(f"[fuzz] pre-merge wave pause: {wait:.0f}s under the merge window")
+          time.sleep(wait)
+        wave_started = time.monotonic()
       deadline = time.monotonic() + 60
       joined = False
       while time.monotonic() < deadline and not joined:
@@ -755,7 +819,7 @@ def main() -> None:
       history[-1] += " [no-wait]"
     else:
       try:
-        checkpoint(checker, model, state_check, path_expectations)
+        checkpoint(checker, model, state_check, path_expectations, started - 1)
       except HarnessError as violation:
         print(violation)
         sys.exit(1)

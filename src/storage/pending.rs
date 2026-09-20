@@ -574,6 +574,11 @@ impl MetadataStore {
       return Ok((store, None));
     };
     let identity = record.recover_identity(&stored)?;
+    tracing::warn!(
+      purpose,
+      transaction = %identity.transaction(),
+      "metadata store opens frozen on a recovered pending journal"
+    );
     *store.lock_state()? = CommitState::Frozen {
       pending: PendingCommit {
         transaction: identity.transaction().clone(),

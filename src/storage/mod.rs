@@ -369,6 +369,10 @@ impl MetadataStore {
             ProviderErrorContext::StorageCommit,
           ));
         }
+        tracing::warn!(
+          transaction = %pending.transaction,
+          "metadata store frozen: commit outcome unknown"
+        );
         self.finish_frozen(call)?;
         Ok(CommitOutcome::Unknown {
           transaction,
@@ -376,6 +380,10 @@ impl MetadataStore {
         })
       }
       Err(error) if error.kind() == ErrorKind::CommitUnknown => {
+        tracing::warn!(
+          transaction = %pending.transaction,
+          "metadata store frozen: commit outcome unknown"
+        );
         self.finish_frozen(call)?;
         Err(error)
       }
@@ -415,6 +423,10 @@ impl MetadataStore {
           // A recovered pending record proves the journaled transaction
           // committed atomically, so an aborted reconciliation contradicts
           // the durable journal and must fail closed.
+          tracing::warn!(
+            transaction = %pending.transaction,
+            "metadata store stays frozen: reconcile aborted a journal-proven commit"
+          );
           self.finish_frozen(call)?;
           return Err(Error::provider(
             ProviderErrorKind::StorageCorrupt,
@@ -425,14 +437,27 @@ impl MetadataStore {
         Ok(ReconcileOutcome::Aborted)
       }
       Ok(ReconcileOutcome::DigestConflict) => {
+        tracing::warn!(
+          transaction = %pending.transaction,
+          "metadata store stays frozen: reconcile digest conflict"
+        );
         self.finish_frozen(call)?;
         Ok(ReconcileOutcome::DigestConflict)
       }
       Ok(ReconcileOutcome::Unknown) => {
+        tracing::warn!(
+          transaction = %pending.transaction,
+          "metadata store stays frozen: reconcile outcome unknown"
+        );
         self.finish_frozen(call)?;
         Ok(ReconcileOutcome::Unknown)
       }
       Err(error) => {
+        tracing::warn!(
+          transaction = %pending.transaction,
+          kind = ?error.kind(),
+          "metadata store stays frozen: reconcile failed"
+        );
         self.finish_frozen(call)?;
         Err(error)
       }
@@ -526,6 +551,10 @@ impl MetadataStore {
     let mut state = self.lock_state()?;
     match &mut *state {
       CommitState::Ready => {
+        tracing::warn!(
+          transaction = %identity.transaction(),
+          "metadata store frozen on a recovered pending journal"
+        );
         *state = CommitState::Frozen {
           pending: PendingCommit {
             transaction: identity.transaction().clone(),
