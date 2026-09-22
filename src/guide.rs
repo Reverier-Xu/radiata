@@ -200,10 +200,11 @@
 //! one backup, one exclusive lifetime lock, and one restart story.
 //!
 //! ```no_run
-//! # async fn demo() -> radiata::Result<()> {
-//! # let data_dir = std::path::PathBuf::from("/data");
+//! # use radiata::extension::StorageFactory;
+//! # async fn demo(
+//! #   storage: std::sync::Arc<dyn StorageFactory>,
+//! # ) -> radiata::Result<()> {
 //! // Default custody: the identity key lives in the metadata store.
-//! # let storage = radiata::adapters::redb_store(data_dir.join("node.db"));
 //! let node = radiata::NodeBuilder::new(storage).start().await?;
 //! # let _ = node;
 //! # Ok(())
@@ -224,11 +225,13 @@
 //! the persisted identity can no longer sign.
 //!
 //! ```no_run
-//! # async fn demo() -> radiata::Result<()> {
+//! # use radiata::extension::StorageFactory;
+//! # async fn demo(
+//! #   storage: std::sync::Arc<dyn StorageFactory>,
+//! # ) -> radiata::Result<()> {
 //! # let data_dir = std::path::PathBuf::from("/data");
 //! // Built-in file custody rooted wherever the operator mounts it.
 //! let keys = radiata::adapters::file_key_store(data_dir.join("keys"));
-//! # let storage = radiata::adapters::redb_store(data_dir.join("node.db"));
 //! let node = radiata::NodeBuilder::new(storage).keys(keys).start().await?;
 //! # let _ = node;
 //! # Ok(())
