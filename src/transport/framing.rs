@@ -148,34 +148,42 @@ where
 }
 
 /// Reads one frame from a byte stream. `Ok(None)` on a clean EOF before
-/// the first byte of a frame, or on a ping answered inside the framing
-/// layer; a truncated frame fails closed. The shared write half answers
-/// pings, so the reader never needs the writer's exclusive attention.
+/// the first byte of a frame. A received ping is answered inside the
+/// framing layer and the read continues: a keepalive must never surface
+/// as an orderly close, or every Raw-class session dies on its first
+/// keepalive round. A truncated frame fails closed. The shared write
+/// half answers pings, so the reader never needs the writer's exclusive
+/// attention.
 pub(crate) async fn read_frame(
   read: &mut (dyn AsyncRead + Unpin + Send), pong_write: &SharedWrite, rules: FrameRules,
 ) -> Result<Option<RawFrame>> {
-  let tag = match read.read_u8().await {
-    Ok(tag) => tag,
-    // An empty read is an orderly close; every later truncation is a
-    // framing violation.
-    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-    Err(_) => {
-      return Err(Error::provider(
-        crate::ProviderErrorKind::Io,
-        crate::ProviderErrorContext::TransportReceive,
-      ));
+  loop {
+    let tag = match read.read_u8().await {
+      Ok(tag) => tag,
+      // An empty read is an orderly close; every later truncation is a
+      // framing violation.
+      Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+      Err(_) => {
+        return Err(Error::provider(
+          crate::ProviderErrorKind::Io,
+          crate::ProviderErrorContext::TransportReceive,
+        ));
+      }
+    };
+    match tag {
+      TAG_DATA => return read_data(read, rules).await.map(Some),
+      TAG_PONG => return Ok(Some(RawFrame::Pong)),
+      TAG_PING => {
+        let mut write = pong_write.lock().await;
+        write_all(&mut *write, &[TAG_PONG]).await?;
+        // Answered: keep reading. Returning here would surface the
+        // keepalive as an orderly peer close and tear down a healthy
+        // session.
+        continue;
+      }
+      TAG_HINT => return read_hint(read).await.map(Some),
+      _ => return Err(Error::invalid_input("wire frame tag")),
     }
-  };
-  match tag {
-    TAG_DATA => read_data(read, rules).await.map(Some),
-    TAG_PONG => Ok(Some(RawFrame::Pong)),
-    TAG_PING => {
-      let mut write = pong_write.lock().await;
-      write_all(&mut *write, &[TAG_PONG]).await?;
-      Ok(None)
-    }
-    TAG_HINT => read_hint(read).await.map(Some),
-    _ => Err(Error::invalid_input("wire frame tag")),
   }
 }
 
@@ -283,4 +291,81 @@ fn send_io(_: std::io::Error) -> Error {
     crate::ProviderErrorKind::Io,
     crate::ProviderErrorContext::TransportSend,
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
+
+  use super::{FrameRules, RawFrame, SharedWrite, read_frame, write_data, write_ping};
+  use crate::Result;
+
+  fn rules() -> FrameRules {
+    FrameRules {
+      allowed_flags: 0,
+      message_limit: 1_024,
+      receive_limit: 1_024,
+      is_declared: |schema, kind| schema == 1 && kind == 7,
+    }
+  }
+
+  fn shared(write: tokio::io::WriteHalf<tokio::io::DuplexStream>) -> SharedWrite {
+    Arc::new(tokio::sync::Mutex::new(
+      Box::new(write) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>
+    ))
+  }
+
+  /// A received keepalive ping is answered on the shared write half and
+  /// the read CONTINUES to the next frame. The regression this guards is
+  /// the ping surfacing as `Ok(None)` — the orderly-close value every
+  /// caller maps to a peer close — which tore down every Raw-class
+  /// session (tls, tcp, and custom media) on its first keepalive round.
+  #[tokio::test]
+  async fn a_ping_is_answered_and_the_read_continues_to_the_next_frame() -> Result<()> {
+    let (mut client, server) = duplex(64);
+    let (server_read, server_write) = split(server);
+    let pong_write = shared(server_write);
+
+    write_ping(&mut client).await?;
+    write_data(&mut client, rules(), 1, 7, 0, b"payload").await?;
+
+    let mut read = server_read;
+    let frame = read_frame(&mut read, &pong_write, rules()).await?;
+    let Some(RawFrame::Data(message)) = frame else {
+      panic!("the data frame after the answered ping must arrive");
+    };
+    assert_eq!(message.body, b"payload");
+
+    // The framing layer answered the ping on the shared write half: the
+    // peer reads exactly one pong byte before any data.
+    let mut pong = [0_u8; 1];
+    client.read_exact(&mut pong).await.expect("pong byte");
+    assert_eq!(pong[0], super::TAG_PONG);
+    Ok(())
+  }
+
+  /// A ping followed by a clean peer close still reads as an orderly
+  /// close: the ping is answered first, then the next read reports EOF.
+  #[tokio::test]
+  async fn a_ping_before_a_clean_close_still_reads_as_orderly_eof() -> Result<()> {
+    let (mut client, server) = duplex(64);
+    let (server_read, server_write) = split(server);
+    let pong_write = shared(server_write);
+
+    write_ping(&mut client).await.expect("ping write");
+    // Close the client's write half only: the pong answer below must
+    // still be deliverable to the client's read half.
+    client.shutdown().await.expect("orderly client shutdown");
+
+    let mut read = server_read;
+    let frame = read_frame(&mut read, &pong_write, rules()).await?;
+    assert!(
+      frame.is_none(),
+      "the close after the answered ping is orderly"
+    );
+    drop(client);
+    Ok(())
+  }
 }
