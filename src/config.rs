@@ -210,9 +210,14 @@ impl Default for NodeConfig {
       recovery: RecoveryConfig::default(),
       session_queue_messages: 256,
       session_queue_bytes: 8 * 1024 * 1024,
-      session_idle_timeout: Duration::from_secs(0),
-      keepalive_interval: Duration::from_secs(0),
-      keepalive_timeout: Duration::from_secs(0),
+      // Enabled by default: a silently dead peer (lost partition, frozen
+      // process, starved scheduler) must fail in-flight streams within a
+      // bounded window instead of hanging until TCP's own retransmit
+      // timeouts. A live peer's keepalive results keep both deadlines
+      // refreshing, so only real silence closes.
+      session_idle_timeout: Duration::from_secs(30),
+      keepalive_interval: Duration::from_secs(10),
+      keepalive_timeout: Duration::from_secs(30),
       parser_limits: ParserLimits::default(),
       trace_metadata_limits: TraceMetadataLimits::default(),
       route_policy: None,
@@ -375,16 +380,25 @@ mod tests {
   /// keepalive pair.
   #[test]
   fn session_liveness_accepts_disabled_and_valid_policies() {
-    // All-zero disables the policy and matches the default.
+    // All-zero explicitly disables the policy.
     let disabled = NodeConfig::new()
       .with_session_liveness(Duration::ZERO, Duration::ZERO, Duration::ZERO)
       .unwrap();
     assert!(disabled.session_idle_timeout().is_zero());
     assert!(disabled.keepalive_interval().is_zero());
     assert!(disabled.keepalive_timeout().is_zero());
-    assert_eq!(
+
+    // The default policy is enabled: a silently dead peer must be
+    // detected within a bounded window, not TCP's own retransmit
+    // timeouts, so the defaults satisfy the keepalive ordering invariant
+    // and stay nonzero.
+    let default = NodeConfig::new();
+    assert_eq!(default.session_idle_timeout(), Duration::from_secs(30));
+    assert_eq!(default.keepalive_interval(), Duration::from_secs(10));
+    assert_eq!(default.keepalive_timeout(), Duration::from_secs(30));
+    assert_ne!(
       disabled.session_idle_timeout(),
-      NodeConfig::new().session_idle_timeout()
+      default.session_idle_timeout()
     );
 
     let idle_only = NodeConfig::new()
