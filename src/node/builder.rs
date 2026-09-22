@@ -58,18 +58,34 @@ impl NodeBuilder {
 
   pub async fn start(self) -> Result<NodeHandle> {
     let mut extensions = self.extensions;
-    // The built-in WSS transport is always available; a caller registration
-    // for the same tag is a conflict, so only add it when absent. WSS is
-    // currently the only dial/listen transport the runtime resolves: the
-    // open registry accepts further transports for future milestones, but
-    // `spawn_runtime` is wired to the WSS tag until a config-selected
-    // transport tag exists.
-    let wss_tag = crate::transport::registry::WssTransport::tag()?;
-    if extensions.transport(&wss_tag).is_none() {
-      extensions.register_transport(
-        wss_tag,
-        std::sync::Arc::new(crate::transport::registry::WssTransport::new()),
-      )?;
+    // The built-in transports seed the registry when their tags are
+    // still free: the direct TLS transport is the default choice, the
+    // WebSocket transport covers firewall-traversal deployments, and the
+    // plaintext transport serves closed intranet segments with
+    // constrained IoT devices. A caller registration under a built-in
+    // tag wins, so a caller can replace a built-in wholesale; dial and
+    // listen resolve their transport from the endpoint's selector
+    // through the registry at runtime.
+    for (tag, transport) in [
+      (
+        crate::transport::tls_transport::TlsTransport::tag()?,
+        Arc::new(crate::transport::tls_transport::TlsTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+      (
+        crate::transport::wss::WssTransport::tag()?,
+        Arc::new(crate::transport::wss::WssTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+      (
+        crate::transport::plain::PlainTransport::tag()?,
+        Arc::new(crate::transport::plain::PlainTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+    ] {
+      if extensions.transport(&tag).is_none() {
+        extensions.register_builtin_transport(tag, transport)?;
+      }
     }
     // The built-in next-hop policy is the default route policy: a node
     // without a caller-selected tag relays through it, so multi-hop
@@ -93,10 +109,6 @@ impl NodeBuilder {
         tokio::sync::mpsc::channel(crate::runtime::PACKET_CHANNEL_CAPACITY);
       spawn_runtime(
         RuntimeDependencies {
-          transport: extensions
-            .transport(&crate::transport::registry::WssTransport::tag()?)
-            .cloned()
-            .ok_or_else(|| crate::Error::internal("built-in transport"))?,
           storage_factory: self.storage,
           context: None,
           keys: self.keys,

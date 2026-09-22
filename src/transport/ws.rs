@@ -23,6 +23,7 @@ use tokio_tungstenite::{
   },
 };
 
+use super::framing::MergeHint;
 use crate::{Error, Result, protocol::PRELUDE_LEN};
 
 /// The fixed WebSocket upgrade path.
@@ -37,43 +38,6 @@ pub(crate) const GENERATION_HINT_HEADER: &str = "mrly-generation";
 /// as the member-mode TLS trust anchor, so a reconnect to the same
 /// listener cannot be replayed against a different certificate.
 pub(crate) const SPKI_HINT_HEADER: &str = "mrly-leaf-spki";
-
-/// The non-secret merge hint a listener publishes inside the TLS channel
-/// during the WebSocket upgrade.
-///
-/// The generation ID is a handshake transcript input and is never trusted
-/// on receipt: the merger uses it only to construct its hello, the state
-/// machine equality-checks it against the responder's own configuration,
-/// and the final signed merge grant is verified before any adoption.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MergeHint {
-  generation: [u8; 16],
-  leaf_spki: Vec<u8>,
-}
-
-impl MergeHint {
-  pub(crate) const fn new(generation: [u8; 16]) -> Self {
-    Self {
-      generation,
-      leaf_spki: Vec::new(),
-    }
-  }
-
-  /// Attaches the listener's current leaf certificate SPKI as the
-  /// member-mode trust anchor for reconnect pinning.
-  pub(crate) fn with_leaf_spki(mut self, spki: Vec<u8>) -> Self {
-    self.leaf_spki = spki;
-    self
-  }
-
-  pub(crate) fn leaf_spki(&self) -> &[u8] {
-    &self.leaf_spki
-  }
-
-  pub(crate) const fn generation(&self) -> &[u8; 16] {
-    &self.generation
-  }
-}
 
 fn generation_hex(generation: &[u8; 16]) -> String {
   crate::hex::encode(generation)

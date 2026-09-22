@@ -725,7 +725,7 @@ mod tests {
       .unwrap()
       .unwrap();
     assert_eq!(current.revision(), 3);
-    assert_eq!(current.endpoints()[0].host(), "three.example");
+    assert_eq!(current.endpoints()[0].host(), Some("three.example"));
 
     // Rollback to an older revision after the heal is still rejected.
     assert!(

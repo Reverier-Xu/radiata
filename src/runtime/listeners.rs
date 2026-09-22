@@ -5,8 +5,7 @@ use tokio::task::JoinSet;
 
 use super::supervisor::Supervisor;
 use crate::{
-  Endpoint, Error, ListenerView, Result, session::stream::run_session,
-  transport::registry::TransportListener,
+  Endpoint, Error, ListenerView, Result, session::stream::run_session, transport::TransportSelector,
 };
 
 /// The accept-loop backoff: every consecutive failed upgrade delays the
@@ -22,8 +21,12 @@ impl Supervisor {
     &mut self, endpoint: Endpoint, tasks: &mut JoinSet<()>,
   ) -> Result<ListenerView> {
     self.require_unblocked()?;
-    let listener: std::sync::Arc<dyn TransportListener> =
-      std::sync::Arc::from(self.dependencies.transport.bind(endpoint.clone()).await?);
+    let transport = self
+      .dependencies
+      .extensions
+      .resolve_transport(&endpoint.selector())?;
+    let listener: std::sync::Arc<dyn crate::transport::registry::TransportListener> =
+      std::sync::Arc::from(transport.bind(endpoint.clone()).await?);
     let bound = listener.local_endpoint();
     let driver = self.driver.clone();
     let sessions = self.dependencies.sessions.clone();
@@ -108,14 +111,26 @@ impl Supervisor {
     // Publish the caller's advertised endpoint, not the bound socket
     // address: peers dial the advertised name, which re-resolves across
     // network moves. A named endpoint binds the wildcard socket (see
-    // WssTransport::bind), whose local address (0.0.0.0) is local
+    // the TCP bind rule), whose local address (0.0.0.0) is local
     // plumbing and undialable from other nodes. Literal-IP endpoints
     // publish the bound form directly: the requested host is the bound
-    // host, and a wildcard port resolves to the real one.
-    let published = if endpoint.host() == bound.host() {
-      bound
-    } else {
-      endpoint.with_port(bound.port())
+    // host, and a wildcard port resolves to the real one. Custom
+    // transports publish the endpoint their listener reports: the
+    // medium owns its own address resolution, and the reported form is
+    // its dialable contract.
+    let published = match endpoint.selector() {
+      TransportSelector::Custom(_) => bound,
+      TransportSelector::Builtin(_) => {
+        if endpoint.host() == bound.host() {
+          bound
+        } else {
+          endpoint.with_port(
+            bound
+              .port()
+              .ok_or_else(|| Error::internal("listener port"))?,
+          )?
+        }
+      }
     };
     self.listeners.insert(
       id.clone(),

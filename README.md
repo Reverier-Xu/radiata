@@ -67,7 +67,12 @@ async fn main() -> Result<()> {
         .start()
         .await?;
     node
-        .command(Listen::new(Endpoint::parse("wss://node1.example.net:9443")?))
+        // The direct TLS 1.3 transport is the default choice. Use the
+        // `wss://` scheme instead when the node sits behind a proxy or
+        // firewall that only passes web traffic (the WebSocket upgrade
+        // masquerades as HTTPS), and `tcp://` only for closed intranet
+        // segments with devices that cannot run TLS 1.3.
+        .command(Listen::new(Endpoint::parse("tls://node1.example.net:9443")?))
         .await?;
     Ok(())
 }

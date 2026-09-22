@@ -48,7 +48,7 @@ use crate::{
   provider::KeyProvider,
   transport::{
     connection::{Connection, Message},
-    ws::MergeHint,
+    framing::MergeHint,
   },
   view::MergeView,
 };
@@ -221,16 +221,17 @@ impl SessionDriver {
     // step; a rejected attempt consumes no credential. The admission
     // source is the accepted peer socket address, normalized here because
     // the identity domain owns merge-admission semantics — transport only
-    // carries the raw address. A missing address never means "admit an
-    // unattributed attempt": with no source there is no bucket to charge,
-    // so admitting it would let an unattributable connection bypass the
-    // fixed policy; it fails closed as a typed authentication failure
-    // instead.
-    let source = MergeSource::normalize(
-      connection
-        .peer_addr()
-        .ok_or_else(|| Error::authentication_failed("admission source"))?,
-    );
+    // carries the raw address. A medium that attributes its connections
+    // to peers (every TCP class) fails closed on a missing address: with
+    // no source there is no bucket to charge, so admitting it would let
+    // an unattributable connection bypass the fixed policy. An
+    // addressless medium (a caller-registered custom transport) shares
+    // one per-medium bucket derived from its class binding.
+    let source = match connection.peer_addr() {
+      Some(address) => MergeSource::normalize(address),
+      None if !connection.attributable() => MergeSource::medium(connection.channel_binding()),
+      None => return Err(Error::authentication_failed("admission source")),
+    };
     let _slot = self.limiter.begin(source)?;
     let first = receive_kind(connection, HandshakeKind::InitiatorHello).await?;
     let peek = peek_initiator_hello(&first.body)?;

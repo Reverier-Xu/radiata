@@ -32,7 +32,7 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn load_config() -> Config {
   Config {
-    listen: env_or("LISTEN", "wss://127.0.0.1:9443"),
+    listen: env_or("LISTEN", "tls://127.0.0.1:9443"), // wss:// for firewalls, tcp:// for closed intranets
     http_listen: env_or("HTTP_LISTEN", "0.0.0.0:8080"),
     data: PathBuf::from(env_or("DATA", "/data")),
     user: env_or("CHAT_USER", "anonymous"),

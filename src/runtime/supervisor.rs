@@ -24,10 +24,7 @@ use crate::{
     SessionDriver,
     stream::{SessionPacketContext, SessionTable, run_session},
   },
-  transport::{
-    registry::{Transport, TransportListener},
-    tls,
-  },
+  transport::registry::{Transport, TransportListener, TransportTrust},
 };
 
 const CONTROL_CAPACITY: usize = 32;
@@ -89,9 +86,6 @@ pub(crate) struct RuntimeDependencies {
   pub(crate) config: NodeConfig,
   pub(crate) entropy: Arc<dyn Entropy>,
   pub(crate) extensions: Arc<ExtensionRegistry>,
-  /// The registered transport every dial and listen flows through, so
-  /// configured attempts are observable at one boundary.
-  pub(crate) transport: Arc<dyn Transport>,
   pub(crate) sessions: SessionTable,
   pub(crate) routes: RouteTable,
   /// The typed event hub shared with every node handle.
@@ -131,11 +125,10 @@ pub(crate) async fn spawn_runtime(
   let mut runtime_seed = [0; 32];
   dependencies.entropy.fill(&mut runtime_seed)?;
   dependencies.runtime_seed = Some(runtime_seed);
-  // `dependencies.transport` is resolved once in the builder from the
-  // extension registry, so every dial and listen flows through the
-  // registered transport (a counting wrapper registered under the WSS tag
-  // observes configured attempts). It is not re-resolved or
-  // overridden here.
+  // Every dial and listen resolves its transport from the endpoint's
+  // selector through the extension registry at call time (the built-in
+  // tags merged with caller registrations), so configured attempts stay
+  // observable at one boundary per transport.
   let receipt_retention = dependencies.config.receipt_retention();
   let context = open_local_identity(
     &dependencies.storage_factory,
@@ -790,10 +783,14 @@ impl Supervisor {
     // The configured dial deadline bounds the connect so a peer that
     // accepts and then goes silent cannot stall the supervisor's control
     // loop (every command, tick, and keepalive shares that loop).
+    let transport = self
+      .dependencies
+      .extensions
+      .resolve_transport(&receiver.selector())?;
     let mut connection = connect_with_deadline(
-      &self.dependencies.transport,
+      &transport,
       receiver.clone(),
-      tls::merge_client_config()?,
+      TransportTrust::for_dial(&receiver.selector(), None),
       self.dependencies.config.dial_deadline(),
     )
     .await?;
@@ -844,8 +841,12 @@ impl Supervisor {
     let sessions = self.dependencies.sessions.clone();
     let packet = self.packet.clone();
     let shutdown = self.shutdown_tx.subscribe();
+    let transport = self
+      .dependencies
+      .extensions
+      .resolve_transport(&receiver.selector())?;
     dial_member(
-      self.dependencies.transport.clone(),
+      transport,
       driver,
       sessions,
       packet,
@@ -982,10 +983,10 @@ impl Supervisor {
 /// future is cancelled, so the deadline and endpoint are the only real
 /// cause a diagnostic can carry.
 async fn connect_with_deadline(
-  transport: &Arc<dyn Transport>, receiver: Endpoint, client: std::sync::Arc<rustls::ClientConfig>,
+  transport: &Arc<dyn Transport>, receiver: Endpoint, trust: TransportTrust,
   deadline: std::time::Duration,
 ) -> Result<crate::transport::connection::Connection> {
-  match tokio::time::timeout(deadline, transport.connect(receiver.clone(), client)).await {
+  match tokio::time::timeout(deadline, transport.connect(receiver.clone(), trust)).await {
     Ok(result) => result,
     Err(_) => {
       tracing::debug!(
@@ -1019,15 +1020,16 @@ pub(super) async fn dial_member(
     // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
     // at join (same-listener reconnects); without an anchor this process
     // falls back to the join-mode relaxation and the application proof
-    // layer remains the authenticator.
-    let config = match driver.peer_spki(peer) {
-      Some(spki) => {
-        tls::member_client_config(rustls::pki_types::SubjectPublicKeyInfoDer::from(spki))?
-      }
-      None => tls::merge_client_config()?,
-    };
+    // layer remains the authenticator. The endpoint's transport class
+    // decides whether either TLS mode applies at all.
+    let trust = TransportTrust::for_dial(
+      &receiver.selector(),
+      driver
+        .peer_spki(peer)
+        .map(rustls::pki_types::SubjectPublicKeyInfoDer::from),
+    );
     let mut connection =
-      connect_with_deadline(&transport, receiver.clone(), config, dial_deadline).await?;
+      connect_with_deadline(&transport, receiver.clone(), trust, dial_deadline).await?;
     let session = driver.initiate_member(&mut connection, peer).await?;
     let authenticated = session.peer().clone();
     // The member-mode dial returns only after the session table settles, so
@@ -1093,7 +1095,7 @@ mod dial_deadline_tests {
   use super::connect_with_deadline;
   use crate::{
     Endpoint, ErrorKind,
-    transport::{registry::WssTransport, tls},
+    transport::{registry::TransportTrust, wss::WssTransport},
   };
 
   /// A peer that accepts TCP and then goes silent must surface the typed
@@ -1121,14 +1123,9 @@ mod dial_deadline_tests {
     let endpoint = Endpoint::parse(&format!("wss://127.0.0.1:{}", address.port())).unwrap();
     let deadline = Duration::from_millis(100);
     let started = Instant::now();
-    let error = connect_with_deadline(
-      &transport,
-      endpoint,
-      tls::merge_client_config().unwrap(),
-      deadline,
-    )
-    .await
-    .unwrap_err();
+    let error = connect_with_deadline(&transport, endpoint, TransportTrust::Merge, deadline)
+      .await
+      .unwrap_err();
     let elapsed = started.elapsed();
 
     // The same coarse typed classification as any other dial failure.
@@ -1196,7 +1193,6 @@ mod receipt_retention_sweep_tests {
     let (revision_tx, _) = watch::channel(0_u64);
     let (packet_tx, _packet_rx) = mpsc::channel(super::PACKET_CHANNEL_CAPACITY);
     let dependencies = RuntimeDependencies {
-      transport: Arc::new(crate::transport::registry::WssTransport::new()),
       storage_factory: factory.clone(),
       context: Some(context.clone()),
       keys: Some(keys),

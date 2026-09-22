@@ -31,6 +31,7 @@ use rustls::{
 
 use super::{
   cert::EphemeralCertificate,
+  registry::TransportTrust,
   verify::{BootstrapCertVerifier, TrustMode},
 };
 use crate::{Error, Result};
@@ -77,6 +78,18 @@ pub(crate) fn member_client_config(
   client_config(TrustMode::Member { expected_spki })
 }
 
+/// Maps the semantic trust a dial carries onto the client TLS
+/// configuration: the transport owns the wire details, the caller owns
+/// the intent. A plaintext trust on a TLS transport is a caller bug and
+/// fails typed instead of silently downgrading the channel.
+pub(crate) fn client_config_for_trust(trust: &TransportTrust) -> Result<Arc<ClientConfig>> {
+  match trust {
+    TransportTrust::Merge => merge_client_config(),
+    TransportTrust::Member { expected_spki } => member_client_config(expected_spki.clone()),
+    TransportTrust::Plaintext => Err(Error::invalid_input("transport trust")),
+  }
+}
+
 fn client_config(mode: TrustMode) -> Result<Arc<ClientConfig>> {
   let provider = crypto_provider();
   let verifier = BootstrapCertVerifier::new(provider.signature_verification_algorithms, mode);
@@ -92,6 +105,33 @@ fn client_config(mode: TrustMode) -> Result<Arc<ClientConfig>> {
   config.alpn_protocols = Vec::new();
 
   Ok(Arc::new(config))
+}
+
+/// The listener security material of one ephemeral certificate: the
+/// server TLS configuration plus the leaf SPKI the join hint carries for
+/// reconnect pinning. Fresh per listener, memory-only, never a node
+/// identity or trust record.
+pub(crate) struct ListenerSecurity {
+  pub(crate) config: Arc<ServerConfig>,
+  pub(crate) leaf_spki: Option<Vec<u8>>,
+}
+
+/// Generates the listener's ephemeral self-signed certificate from the
+/// injected entropy and builds its TLS 1.3 server configuration.
+pub(crate) fn listener_tls(entropy: &dyn crate::api::Entropy) -> Result<ListenerSecurity> {
+  let certificate = EphemeralCertificate::generate(entropy)?;
+  let config = server_config(&certificate)?;
+  let leaf_spki = match certificate.leaf_spki() {
+    Ok(spki) => Some(spki.as_ref().to_vec()),
+    // Without the SPKI the join hint loses its reconnect anchor
+    // (member-mode dialing cannot pin). This is a soft degradation,
+    // but it must never happen silently.
+    Err(error) => {
+      tracing::warn!(kind = ?error.kind(), "leaf spki unavailable; serving hint without pin");
+      None
+    }
+  };
+  Ok(ListenerSecurity { config, leaf_spki })
 }
 
 #[cfg(test)]

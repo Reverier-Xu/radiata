@@ -91,7 +91,10 @@ pub use routing::{
   CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteContext,
   RouteNextHop, Selector,
 };
-pub use transport::{Endpoint, PageCursor};
+pub use transport::{
+  CustomListener, CustomTransport, Endpoint, PageCursor, TransportScheme, TransportSelector,
+  TransportStream,
+};
 pub use view::{
   ConnectivityStatus, DeclareInterruptedTransactionUncommitted, LeaveOutcome, ListenerPage,
   ListenerView, LocalNodeView, MemberPage, MemberStatus, MemberView, MergeView, NodeMetadataPatch,

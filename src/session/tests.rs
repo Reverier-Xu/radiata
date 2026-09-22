@@ -125,7 +125,7 @@ async fn listen(
     } else {
       None
     };
-    let mut connection = Connection::accept(
+    let mut connection = Connection::accept_tls_ws(
       tcp,
       config,
       connection_frame_rules().unwrap(),
@@ -140,7 +140,7 @@ async fn listen(
 
 async fn connect(address: std::net::SocketAddr) -> Connection {
   let tcp = TcpStream::connect(address).await.unwrap();
-  Connection::connect(
+  Connection::connect_tls_ws(
     tcp,
     merge_client_config().unwrap(),
     "127.0.0.1".try_into().unwrap(),
