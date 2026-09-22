@@ -84,7 +84,7 @@ radiata 是一个确定性中继节点运行时库：为群组应用提供认证
 
 | 模块 | 职责 |
 | --- | --- |
-| `transport/tls.rs` | TLS 1.3-only rustls 配置（ring、无 1.2、无 early data、无会话恢复）。 |
+| `transport/tls.rs` | TLS 1.3-only rustls 配置（aws-lc-rs、无 1.2、无 early data、无会话恢复）。 |
 | `transport/verify.rs` | **安全关键**服务端证书验证器：join 模式仅放宽链/主机名信任，`CertificateVerify` 签名无条件全验证。 |
 | `transport/cert.rs` | 接收方临时自签监听证书（注入熵生成、仅内存、每监听器一份，非节点身份）。 |
 | `transport/ws.rs` | 固定 `/mrly` 路径的 WebSocket 升级（仅二进制、无压缩）；升级响应携带非秘密 join 提示（cluster ID、凭据 generation ID）。 |

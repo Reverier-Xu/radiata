@@ -167,7 +167,7 @@ fn hostile_server_config(certified: CertifiedKey) -> Arc<ServerConfig> {
 }
 
 fn signing_key(certificate: &EphemeralCertificate) -> Arc<dyn SigningKey> {
-  rustls::crypto::ring::sign::any_supported_type(&certificate.private_key()).unwrap()
+  rustls::crypto::aws_lc_rs::sign::any_supported_type(&certificate.private_key()).unwrap()
 }
 
 /// A signing key that produces a valid signature over a *different*

@@ -1,5 +1,7 @@
 use std::{fmt, future::Future, pin::Pin};
 
+use rand::TryRng;
+
 use crate::{Error, ProviderErrorContext, ProviderErrorKind, Result};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -13,7 +15,9 @@ pub(crate) struct SystemEntropy;
 
 impl Entropy for SystemEntropy {
   fn fill(&self, output: &mut [u8]) -> Result<()> {
-    getrandom::fill(output).map_err(|_| system_entropy_error())
+    rand::rngs::SysRng
+      .try_fill_bytes(output)
+      .map_err(|_| system_entropy_error())
   }
 }
 

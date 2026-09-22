@@ -16,7 +16,10 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use crate::{Error, KeyHandle, KeyOperationId, ProviderErrorContext, ProviderErrorKind, Result};
+use crate::{
+  Error, KeyHandle, KeyOperationId, ProviderErrorContext, ProviderErrorKind, Result,
+  api::{Entropy, SystemEntropy},
+};
 
 /// The Ed25519 seed length every built-in adapter stores and loads.
 pub(crate) const SECRET_LEN: usize = 32;
@@ -27,8 +30,7 @@ pub(crate) const SECRET_LEN: usize = 32;
 /// drift per adapter.
 pub(crate) fn fresh_secret() -> Result<Zeroizing<[u8; SECRET_LEN]>> {
   let mut secret = Zeroizing::new([0_u8; SECRET_LEN]);
-  getrandom::fill(&mut secret[..])
-    .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::Entropy))?;
+  SystemEntropy.fill(&mut secret[..])?;
   Ok(secret)
 }
 

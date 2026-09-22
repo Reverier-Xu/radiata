@@ -68,6 +68,7 @@ use crate::{
   BoxFuture, CommitOutcome, CommitReceipt, Digest, DurabilityLevel, Error, ProviderErrorContext,
   ProviderErrorKind, Result, StoreCapabilities, StoreEntry, StoreKey, StoreNamespace,
   StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue, TransactionId,
+  api::{Entropy, SystemEntropy},
   hex::{decode as hex_decode_bytes, encode as hex_encode},
   provider::{Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
@@ -291,8 +292,7 @@ impl JsonStorage {
       .map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))?;
     let store_uuid = if lock_bytes.is_empty() {
       let mut uuid = [0_u8; 16];
-      getrandom::fill(&mut uuid)
-        .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::Entropy))?;
+      SystemEntropy.fill(&mut uuid)?;
       guard
         .write_lock_bytes(&LockHeader::new(uuid).encode()?)
         .map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))?;
