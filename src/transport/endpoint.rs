@@ -3,18 +3,24 @@
 //!
 //! Two canonical forms exist:
 //!
-//! - The URL form `<scheme>host[:port]` addresses the three built-in transports
-//!   (`tls://`, the firewall-traversal `wss://`, and the plaintext `tcp://`).
-//!   The canonical text carries an explicit port (the scheme's default when
-//!   omitted), a lowercase DNS name or an IP literal host, and no userinfo,
-//!   path, query, or fragment: every built-in transport addresses a fixed
-//!   upgrade path or a bare stream, so a path in the address would be
+//! - The built-in URL form `<scheme>host[:port]` addresses the three built-in
+//!   transports (`tls://`, the firewall-traversal `wss://`, and the plaintext
+//!   `tcp://`). The canonical text carries an explicit port (the scheme's
+//!   default when omitted), a lowercase DNS name or an IP literal host, and no
+//!   userinfo, path, query, or fragment: every built-in transport addresses a
+//!   fixed upgrade path or a bare stream, so a path in the address would be
 //!   meaningless.
-//! - The custom form `<transport-tag>+<opaque>` addresses a caller-registered
+//! - The custom scheme form `<name>://<opaque>` addresses a caller-registered
 //!   transport (an ESP-NOW radio, an 802.11 link, a serial bus) by its
-//!   canonical [`TransportTag`], with the medium's own address after the `+`.
-//!   The form is open-ended: new transports need no new address grammar, only a
-//!   valid tag.
+//!   registered scheme name — the protocol prefix the caller reserves for that
+//!   medium — with the medium's own address as the opaque remainder. The name
+//!   is registered once per node (`ExtensionRegistry::register_transport`), and
+//!   each registered transport owns exactly one name, so a caller operating
+//!   many transports registers many names. The binding is node-local: an
+//!   address carrying a custom scheme resolves to whatever the local registry
+//!   binds that name to, and endpoints exchanged across nodes assume both sides
+//!   bound the name identically — a mismatch fails at the session handshake's
+//!   identity proofs, never silently.
 //!
 //! Addresses are endpoint candidates and never identities. Parsing is
 //! purely syntactic and deterministic: it never consults a registry, so
@@ -34,12 +40,85 @@ use std::{fmt, str::FromStr};
 
 use rustls::pki_types::ServerName;
 
-use crate::{Error, Result, TransportTag};
+use crate::{Error, Result};
 
 const MAX_HOST_LEN: usize = 253;
 
+/// The maximum length of a custom scheme name (one DNS label).
+const MAX_NAME_LEN: usize = 63;
+
 /// The maximum length of a custom-form opaque address.
 const MAX_OPAQUE_LEN: usize = 255;
+
+/// The scheme names reserved for the built-in transports and for the
+/// insecure-WebSocket spelling the crate rejects outright.
+const RESERVED_NAMES: [&str; 4] = ["tls", "wss", "tcp", "ws"];
+
+/// The protocol prefix (addressing scheme) of one caller-registered
+/// transport.
+///
+/// A caller with many transports registers many names: the name is the
+/// sole selector in the custom endpoint form `<name>://<opaque>`, is
+/// unique per node (a duplicate registration conflicts), and binds the
+/// transport to every address that carries it. Grammar:
+/// `[a-z][a-z0-9-]{0,62}`, no leading or trailing hyphen; the built-in
+/// schemes and the insecure `ws` spelling are reserved and never
+/// parse as custom names.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TransportName {
+  value: String,
+}
+
+impl TransportName {
+  /// Parses one canonical scheme name.
+  pub fn parse(value: &str) -> Result<Self> {
+    let error = || Error::invalid_input("transport name");
+    let bytes = value.as_bytes();
+    if value.is_empty()
+      || value.len() > MAX_NAME_LEN
+      || RESERVED_NAMES.contains(&value)
+      || !bytes[0].is_ascii_lowercase()
+      || bytes.ends_with(b"-")
+      || !bytes[1..]
+        .iter()
+        .copied()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+      return Err(error());
+    }
+    Ok(Self {
+      value: value.to_owned(),
+    })
+  }
+
+  /// The canonical name text.
+  pub fn as_str(&self) -> &str {
+    &self.value
+  }
+}
+
+impl FromStr for TransportName {
+  type Err = Error;
+
+  fn from_str(value: &str) -> Result<Self> {
+    Self::parse(value)
+  }
+}
+
+impl fmt::Display for TransportName {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(&self.value)
+  }
+}
+
+impl fmt::Debug for TransportName {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_tuple("TransportName")
+      .field(&self.value)
+      .finish()
+  }
+}
 
 /// The transport class selected by a built-in endpoint's URL scheme.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -101,17 +180,17 @@ impl fmt::Display for TransportScheme {
 /// The transport an endpoint selects: the resolution key every dial and
 /// bind looks up in the extension registry.
 ///
-/// The registry is the single transport map: the built-in tags and every
-/// caller-registered custom transport merge into one namespace, and a
-/// selector that resolves to nothing fails typed at dial or listen time.
+/// The registry is the single transport map: the built-in transports and
+/// every caller-registered custom transport merge into one namespace,
+/// and a selector that resolves to nothing fails typed at dial or
+/// listen time.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum TransportSelector {
   /// One of the built-in transports, selected by URL scheme.
   Builtin(TransportScheme),
-  /// A caller-registered custom transport, selected by its canonical
-  /// tag. The tag namespaces custom media (ESP-NOW, 802.11, serial) so
-  /// they need no address grammar of their own.
-  Custom(TransportTag),
+  /// A caller-registered custom transport, selected by the scheme name
+  /// the caller registered for it.
+  Custom(TransportName),
 }
 
 /// The address form carried by one [`Endpoint`].
@@ -123,8 +202,8 @@ enum AddressForm {
     host: String,
     port: u16,
   },
-  /// A custom tag form.
-  Custom { tag: TransportTag, opaque: String },
+  /// A custom scheme form.
+  Custom { name: TransportName, opaque: String },
 }
 
 /// A canonical transport endpoint address.
@@ -139,22 +218,24 @@ impl Endpoint {
   /// path, query, fragment, non-canonical host or port text, or
   /// malformed custom address is rejected.
   pub fn parse(value: &str) -> Result<Self> {
-    // A `+` can never occur in a URL form (the host grammar rejects it),
-    // so its presence selects the custom form unambiguously.
-    match value.split_once('+') {
-      Some((tag_text, opaque)) => Self::parse_custom(tag_text, opaque),
-      None => Self::parse_url(value),
+    // The built-in schemes own their prefixes; every other well-formed
+    // `<name>://` prefix selects the custom scheme form.
+    if TransportScheme::from_prefix(value).is_none()
+      && let Some((name_text, opaque)) = value.split_once("://")
+    {
+      return Self::parse_custom(name_text, opaque);
     }
+    Self::parse_url(value)
   }
 
-  /// Parses one custom `<transport-tag>+<opaque>` address.
-  fn parse_custom(tag_text: &str, opaque: &str) -> Result<Self> {
-    let tag = TransportTag::parse(tag_text)?;
+  /// Parses one custom `<name>://<opaque>` address.
+  fn parse_custom(name_text: &str, opaque: &str) -> Result<Self> {
+    let name = TransportName::parse(name_text)?;
     validate_opaque(opaque)?;
     Ok(Self {
-      canonical: format!("{tag_text}+{opaque}"),
+      canonical: format!("{name_text}://{opaque}"),
       form: AddressForm::Custom {
-        tag,
+        name,
         opaque: opaque.to_owned(),
       },
     })
@@ -213,7 +294,7 @@ impl Endpoint {
   pub fn selector(&self) -> TransportSelector {
     match &self.form {
       AddressForm::Builtin { scheme, .. } => TransportSelector::Builtin(*scheme),
-      AddressForm::Custom { tag, .. } => TransportSelector::Custom(tag.clone()),
+      AddressForm::Custom { name, .. } => TransportSelector::Custom(name.clone()),
     }
   }
 
@@ -347,11 +428,11 @@ fn validate_opaque(opaque: &str) -> Result<()> {
     return Err(error());
   }
   // The opaque address stays as given: printable ASCII without the
-  // characters that would make the tag/opaque split or future URL-ish
-  // forms ambiguous. Canonicalization is the transport's business.
+  // characters that would make future URL-ish extensions ambiguous.
+  // Canonicalization is the transport's business.
   if opaque
     .bytes()
-    .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'+' | b'?' | b'#'))
+    .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'?' | b'#'))
   {
     return Err(error());
   }
@@ -437,13 +518,12 @@ fn validate_dns_hostname(host: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-  use super::{AddressForm, Endpoint, TransportScheme, TransportSelector};
-  use crate::TransportTag;
+  use super::{AddressForm, Endpoint, TransportName, TransportScheme, TransportSelector};
 
-  const ESPNOW_TAG: &str = "radiata.woooo.tech/transports/espnow";
+  const ESPNOW_NAME: &str = "espnow";
 
   fn custom_endpoint(opaque: &str) -> Endpoint {
-    Endpoint::parse(&format!("{ESPNOW_TAG}+{opaque}")).unwrap()
+    Endpoint::parse(&format!("{ESPNOW_NAME}://{opaque}")).unwrap()
   }
 
   /// Swapping the port keeps the advertised host, the scheme, and the
@@ -548,11 +628,11 @@ mod tests {
   fn tls_transport_endpoint_rejects_noncanonical_forms() {
     for text in [
       "",
-      "http://relay.example.com",
-      // The insecure WebSocket scheme is a different transport class and
-      // is never canonical.
+      // Unknown-but-well-formed schemes parse as the custom form (they
+      // fail at registry resolution, not at parse); the rejected spellings
+      // below are grammatically malformed for every form.
+      // The insecure WebSocket scheme is reserved and never canonical.
       "ws://relay.example.com",
-      "ssl://relay.example.com",
       "TLS://relay.example.com",
       "WSS://relay.example.com",
       "TCP://relay.example.com",
@@ -587,8 +667,7 @@ mod tests {
       "wss://[::1",
       "wss://[::1]x",
       "wss://[fe80::1%eth0]:9000",
-      // A `+` in a URL form is a host-grammar violation (and would fall
-      // into the custom form, whose left side is not a tag).
+      // A `+` in a URL form is a host-grammar violation.
       "tls://relay.example.com+x",
       "wss://relay.example.com:+",
     ] {
@@ -596,12 +675,12 @@ mod tests {
     }
   }
 
-  // ---- The custom tag form ----
+  // ---- The custom scheme form ----
 
   #[test]
-  fn custom_form_parses_tag_and_opaque() {
+  fn custom_form_parses_scheme_and_opaque() {
     let endpoint = custom_endpoint("aa:bb:cc:dd:ee:ff");
-    assert_eq!(endpoint.as_str(), format!("{ESPNOW_TAG}+aa:bb:cc:dd:ee:ff"));
+    assert_eq!(endpoint.as_str(), "espnow://aa:bb:cc:dd:ee:ff");
     assert_eq!(endpoint.host(), None);
     assert_eq!(endpoint.port(), None);
     assert_eq!(endpoint.opaque(), Some("aa:bb:cc:dd:ee:ff"));
@@ -610,43 +689,72 @@ mod tests {
     assert!(endpoint.with_port(1).is_err());
 
     let selector = endpoint.selector();
-    let TransportSelector::Custom(tag) = selector else {
+    let TransportSelector::Custom(name) = selector else {
       panic!("the custom form selects a custom transport");
     };
-    assert_eq!(tag.as_str(), ESPNOW_TAG);
-    assert_eq!(tag, TransportTag::parse(ESPNOW_TAG).unwrap());
+    assert_eq!(name.as_str(), ESPNOW_NAME);
+    assert_eq!(name, TransportName::parse(ESPNOW_NAME).unwrap());
 
     // The canonical round trip holds.
     assert_eq!(Endpoint::parse(endpoint.as_str()).unwrap(), endpoint);
-    // A different transport tag is a different endpoint.
-    let other = Endpoint::parse(&format!(
-      "{}+{}",
-      "radiata.woooo.tech/transports/ieee80211", "aa:bb:cc:dd:ee:ff"
-    ))
-    .unwrap();
+    // A different scheme name is a different endpoint.
+    let other = Endpoint::parse("ieee80211://aa:bb:cc:dd:ee:ff").unwrap();
     assert_ne!(other, endpoint);
+    // A plus inside the opaque is an ordinary opaque character now.
+    let plus = Endpoint::parse("espnow://aa+bb").unwrap();
+    assert_eq!(plus.opaque(), Some("aa+bb"));
   }
 
   #[test]
   fn custom_form_rejects_malformed_addresses() {
     for text in [
-      // Malformed tags on the left side.
-      "+aa:bb:cc:dd:ee:ff",
-      "espnow+aa:bb:cc:dd:ee:ff",
-      "radiata.woooo.tech/transports/+aa",
-      "radiata.woooo.tech/transports/espnow+",
-      // The split is at the first `+`, so a plus inside the opaque can
-      // never form a valid address.
-      "radiata.woooo.tech/transports/espnow+aa+bb",
+      // Malformed scheme names.
+      "://aa:bb:cc:dd:ee:ff",
+      "espnow:/aa:bb:cc:dd:ee:ff",
+      "espnow:aa:bb:cc:dd:ee:ff",
+      "espnow//aa:bb:cc:dd:ee:ff",
+      "Espnow://aa:bb:cc:dd:ee:ff",
+      "9live://aa:bb:cc:dd:ee:ff",
+      "-lead://aa",
+      "trail-://aa",
+      "under_score://aa",
+      // The insecure WebSocket spelling stays rejected outright.
+      "ws://aa:bb:cc:dd:ee:ff",
+      // Empty and over-long opaque addresses.
+      "espnow://",
+      &format!("espnow://{}", "a".repeat(256)),
       // Non-graphic, non-ASCII, and ambiguous characters.
-      "radiata.woooo.tech/transports/espnow+aa bb",
-      "radiata.woooo.tech/transports/espnow+aa?bb",
-      "radiata.woooo.tech/transports/espnow+aa#bb",
-      "radiata.woooo.tech/transports/espnow+raïo",
-      // An over-long opaque address.
-      &format!("{ESPNOW_TAG}+{}", "a".repeat(256)),
+      "espnow://aa bb",
+      "espnow://aa?bb",
+      "espnow://aa#bb",
+      "espnow://raïo",
     ] {
       assert!(Endpoint::parse(text).is_err(), "text: {text:?}");
+    }
+  }
+
+  #[test]
+  fn transport_name_grammar_and_reservations() {
+    for name in ["a", "espnow", "ieee80211", "a-b", "a-1", "serial0"] {
+      assert!(TransportName::parse(name).is_ok(), "name: {name}");
+    }
+    for name in [
+      "",
+      "A",
+      "9bus",
+      "-lead",
+      "trail-",
+      "under_score",
+      "has space",
+      // Reserved: the built-ins and the insecure WebSocket spelling.
+      "tls",
+      "wss",
+      "tcp",
+      "ws",
+      // Over-long names.
+      &"a".repeat(64),
+    ] {
+      assert!(TransportName::parse(name).is_err(), "name: {name:?}");
     }
   }
 

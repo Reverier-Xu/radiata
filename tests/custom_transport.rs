@@ -4,9 +4,9 @@
 //! would: one in-memory hub medium implements [`radiata::CustomTransport`]
 //! (a stream type implementing [`radiata::TransportStream`] plus a
 //! listener implementing [`radiata::CustomListener`]), registers under a
-//! caller-owned tag, and two real nodes complete a full secure merge
-//! across it, addressed by the canonical custom form
-//! `<transport-tag>+<opaque>`. No built-in transport participates.
+//! caller-owned scheme name, and two real nodes complete a full secure
+//! merge across it, addressed by the canonical custom form
+//! `<name>://<opaque>`. No built-in transport participates.
 
 use std::{
   collections::HashMap,
@@ -15,7 +15,7 @@ use std::{
 
 use radiata::{
   CustomListener, CustomTransport, Endpoint, GetLocalNode, Listen, MergeCluster, MergeCredential,
-  NodeBuilder, NodeHandle, RotateMergeCredential, Shutdown, TransportStream, TransportTag,
+  NodeBuilder, NodeHandle, RotateMergeCredential, Shutdown, TransportName, TransportStream,
 };
 use tokio::sync::mpsc;
 
@@ -24,7 +24,8 @@ mod common;
 use common::{MemoryStorageFactory, ScriptedKeys};
 
 /// The caller-owned tag of the demonstration medium.
-const HUB_TAG: &str = "example.test/transports/hub";
+/// The protocol prefix (scheme) the demonstration medium registers.
+const HUB_SCHEME: &str = "hub";
 
 /// The stream type of the hub medium: one half of an in-memory duplex
 /// pipe, wrapped in a caller-owned newtype (a real medium wraps its own
@@ -179,7 +180,7 @@ async fn start_node(hub: &Arc<Hub>, seed: u64) -> NodeHandle {
   let mut extensions = radiata::ExtensionRegistry::new();
   extensions
     .register_transport(
-      TransportTag::parse(HUB_TAG).unwrap(),
+      TransportName::parse(HUB_SCHEME).unwrap(),
       Arc::new(HubTransport(Arc::clone(hub))),
     )
     .unwrap();
@@ -197,7 +198,7 @@ async fn custom_transport_carries_a_full_secure_merge() {
   let receiver = start_node(&hub, 10_000).await;
   let joiner = start_node(&hub, 20_000).await;
 
-  let endpoint = Endpoint::parse(&format!("{HUB_TAG}+receiver")).unwrap();
+  let endpoint = Endpoint::parse(&format!("{HUB_SCHEME}://receiver")).unwrap();
   let listener = receiver
     .command(Listen::new(endpoint.clone()))
     .await

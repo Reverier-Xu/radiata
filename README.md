@@ -84,6 +84,26 @@ replacement). Routing, recovery, and convergence are the library's responsibilit
 registers extensions before the node starts and drives commands and queries through the
 `NodeHandle` afterward.
 
+### Custom transports
+
+Beyond the three built-ins, a caller can register its own medium — an ESP-NOW radio, an 802.11
+link, a serial bus — by implementing `CustomTransport` (one ordered, reliable byte stream per
+session) and registering an addressing scheme for it:
+
+```rust,ignore
+let mut extensions = ExtensionRegistry::new();
+extensions.register_transport(TransportName::parse("espnow")?, Arc::new(EspnowTransport::new()))?;
+let node = NodeBuilder::new(storage).extensions(extensions).start().await?;
+// Peers address the medium through the canonical form `<name>://<opaque>`:
+node.command(Listen::new(Endpoint::parse("espnow://aa:bb:cc:dd:ee:ff")?)).await?;
+```
+
+A caller operating many transports registers many scheme names; each name is unique per node and
+binds node-locally (endpoints exchanged across nodes assume both sides bound the name identically;
+a mismatch fails the session handshake's identity proofs, never silently). Core owns every wire
+semantic above your bytes — framing, bounds, keepalive, and the join hint — so an implementation
+cannot corrupt message boundaries; the medium contributes no confidentiality by itself.
+
 ## Security and trust model
 
 radiata defends the **wire**, not the members. Transport-path security is unconditional: TLS 1.3

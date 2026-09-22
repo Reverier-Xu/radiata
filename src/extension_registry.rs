@@ -69,6 +69,9 @@ pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,
   protocols: std::sync::Mutex<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
   transports: BTreeMap<TransportTag, Arc<dyn Transport>>,
+  /// The caller-registered custom transports, keyed by the scheme name
+  /// (protocol prefix) each one owns.
+  schemes: BTreeMap<crate::transport::TransportName, Arc<dyn Transport>>,
   #[cfg(test)]
   discoveries: BTreeMap<DiscoveryTag, Arc<dyn Discovery>>,
   load_balancers:
@@ -126,25 +129,28 @@ impl ExtensionRegistry {
     definition.and_then(|definition| definition.definition_digest().ok())
   }
 
-  /// Registers one caller-defined transport under a canonical tag. A
-  /// duplicate tag, a malformed or reserved tag, or a registration that
-  /// conflicts with an existing entry is rejected before use; the
-  /// built-in TLS, WebSocket, and plaintext transports are seeded by the
-  /// runtime only when their tags are still free, so a caller may
-  /// register under any tag it owns, including a built-in one, and win.
+  /// Registers one caller-defined transport under its addressing scheme
+  /// name (the protocol prefix of the custom endpoint form
+  /// `<name>://<opaque>`). The name is unique per node: a duplicate, a
+  /// reserved name, or any other conflict is rejected before use. The
+  /// built-in transports are seeded by the runtime under their own
+  /// schemes and cannot be shadowed from here.
   ///
   /// This is the public extension surface of the transport layer: the
   /// registry is the single map from endpoint selector to transport,
-  /// and a registered tag becomes dialable through the canonical
-  /// custom endpoint form `<tag>+<opaque-address>`.
+  /// and a registered name becomes dialable through the canonical
+  /// custom form `<name>://<opaque-address>`. The binding is node-local:
+  /// endpoints exchanged across nodes assume both sides bound the name
+  /// identically, and a mismatch fails at the session handshake's
+  /// identity proofs rather than silently.
   pub fn register_transport(
-    &mut self, tag: TransportTag, transport: Arc<dyn CustomTransport>,
+    &mut self, name: crate::transport::TransportName, transport: Arc<dyn CustomTransport>,
   ) -> Result<&mut Self> {
     let adapter = Arc::new(CustomTransportAdapter::new(
       Arc::clone(&transport),
-      tag.clone(),
+      name.clone(),
     )?);
-    insert_once(&mut self.transports, tag, adapter, "transport registration")?;
+    insert_once(&mut self.schemes, name, adapter, "transport registration")?;
     Ok(self)
   }
 
@@ -159,21 +165,28 @@ impl ExtensionRegistry {
   }
 
   /// Resolves one endpoint's transport selector through the map: the
-  /// built-in tags and every caller-registered custom transport merge
-  /// into one namespace, and a selector that resolves to nothing fails
-  /// typed here — at dial or listen time, never at parse time (endpoint
-  /// parsing is purely syntactic and registry-free).
+  /// built-in transports and every caller-registered custom transport
+  /// merge into one resolution namespace, and a selector that resolves
+  /// to nothing fails typed here — at dial or listen time, never at
+  /// parse time (endpoint parsing is purely syntactic and
+  /// registry-free).
   pub(crate) fn resolve_transport(
     &self, selector: &TransportSelector,
   ) -> Result<Arc<dyn Transport>> {
-    let tag = match selector {
-      TransportSelector::Builtin(scheme) => builtin_transport_tag(*scheme)?,
-      TransportSelector::Custom(tag) => tag.clone(),
-    };
-    self
-      .transport(&tag)
-      .cloned()
-      .ok_or_else(|| Error::not_found("transport"))
+    match selector {
+      TransportSelector::Builtin(scheme) => {
+        let tag = builtin_transport_tag(*scheme)?;
+        self
+          .transport(&tag)
+          .cloned()
+          .ok_or_else(|| Error::not_found("transport"))
+      }
+      TransportSelector::Custom(name) => self
+        .schemes
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Error::not_found("transport")),
+    }
   }
 
   /// Registers one discovery implementation under its canonical tag, with

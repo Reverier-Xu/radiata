@@ -2,14 +2,14 @@
 //! transport implementation.
 //!
 //! A registered [`Transport`] owns the listener/connection lifecycle for
-//! one canonical [`TransportTag`]; the map merges the three built-in
+//! one addressing selector; the map merges the three built-in
 //! transports (direct TLS, WebSocket, plaintext TCP) with every
 //! caller-registered custom transport, and a dial or bind resolves its
 //! implementation from the endpoint's [`TransportSelector`] alone — the
-//! URL scheme for built-ins, the tag for customs. Core retains
-//! authentication and stream safety: a transport only carries prelude
-//! frames, the session handshake always authenticates, and registration
-//! never bypasses either.
+//! URL scheme for built-ins, the registered scheme name for customs.
+//! Core retains authentication and stream safety: a transport only
+//! carries prelude frames, the session handshake always authenticates,
+//! and registration never bypasses either.
 //!
 //! ## Writing a custom transport
 //!
@@ -210,12 +210,12 @@ pub trait CustomListener: fmt::Debug + Send + Sync + 'static {
 ///
 /// Implement this trait to bridge a medium the built-ins do not cover —
 /// an ESP-NOW radio, an 802.11 link, a serial bus, a tunneled socket —
-/// and register it under a canonical tag you own
+/// and register it under an addressing scheme name you own
 /// (`ExtensionRegistry::register_transport`). Peers address the
-/// transport with the canonical custom form
-/// `<transport-tag>+<opaque-address>`, where the opaque address grammar
-/// is yours: the endpoint hands it to you verbatim through
-/// [`CustomTransport::connect`] and [`CustomListener::local_endpoint`].
+/// transport with the canonical custom form `<name>://<opaque-address>`,
+/// where the opaque address grammar is yours: the endpoint hands it to
+/// you verbatim through [`CustomTransport::connect`] and
+/// [`CustomListener::local_endpoint`].
 ///
 /// Core wraps every stream you produce in the crate's framing: bounded
 /// length-prefixed messages, keepalive, and the join hint all work over
@@ -240,7 +240,7 @@ pub trait CustomTransport: fmt::Debug + Send + Sync + 'static {
 /// per-tag channel binding, and the plaintext-class trust contract.
 pub(crate) struct CustomTransportAdapter {
   inner: Arc<dyn CustomTransport>,
-  tag: TransportTag,
+  name: crate::transport::TransportName,
   binding: [u8; crate::transport::connection::CHANNEL_BINDING_LEN],
 }
 
@@ -248,20 +248,23 @@ impl fmt::Debug for CustomTransportAdapter {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("CustomTransportAdapter")
-      .field("tag", &self.tag.as_str())
+      .field("scheme", &self.name.as_str())
       .finish_non_exhaustive()
   }
 }
 
 impl CustomTransportAdapter {
-  /// Wraps one custom transport under its tag. The channel binding
-  /// derives once from the canonical tag, so every session over this
-  /// transport salts its proofs with the same per-class constant.
-  pub(crate) fn new(inner: Arc<dyn CustomTransport>, tag: TransportTag) -> Result<Self> {
-    let binding = crate::transport::connection::custom_channel_binding(tag.as_str())?;
+  /// Wraps one custom transport under its registered scheme name. The
+  /// channel binding derives once from the canonical name, so every
+  /// session over this transport salts its proofs with the same
+  /// per-scheme constant.
+  pub(crate) fn new(
+    inner: Arc<dyn CustomTransport>, name: crate::transport::TransportName,
+  ) -> Result<Self> {
+    let binding = crate::transport::connection::custom_channel_binding(name.as_str())?;
     Ok(Self {
       inner,
-      tag,
+      name,
       binding,
     })
   }
@@ -429,8 +432,8 @@ mod tests {
     builtin_transport_tag,
   };
   use crate::{
-    Endpoint, ErrorKind, ExtensionRegistry, Result, TransportSelector, TransportStream,
-    TransportTag,
+    Endpoint, ErrorKind, ExtensionRegistry, Result, TransportName, TransportSelector,
+    TransportStream, TransportTag,
     api::BoxFuture,
     protocol::DiscoveryTag,
     transport::{
@@ -443,6 +446,10 @@ mod tests {
     TransportTag::parse(&format!("radiata.woooo.tech/transports/{value}")).unwrap()
   }
 
+  fn transport_name(value: &str) -> TransportName {
+    TransportName::parse(value).unwrap()
+  }
+
   fn discovery_tag(value: &str) -> DiscoveryTag {
     DiscoveryTag::parse(&format!("radiata.woooo.tech/discovery/{value}")).unwrap()
   }
@@ -451,8 +458,8 @@ mod tests {
     super::EndpointCandidate::new(Endpoint::parse(&format!("wss://{host}:9000")).unwrap())
   }
 
-  fn custom_endpoint(tag: &TransportTag, opaque: &str) -> Endpoint {
-    Endpoint::parse(&format!("{}+{opaque}", tag.as_str())).unwrap()
+  fn custom_endpoint(name: &str, opaque: &str) -> Endpoint {
+    Endpoint::parse(&format!("{name}://{opaque}")).unwrap()
   }
 
   // ---- Transport registration by canonical tag ----
@@ -510,7 +517,7 @@ mod tests {
       };
       registry.register_builtin_transport(tag, transport).unwrap();
     }
-    // Every built-in scheme resolves; an unknown custom tag fails typed.
+    // Every built-in scheme resolves; an unknown custom scheme fails typed.
     for scheme in TransportScheme::ALL {
       assert!(
         registry
@@ -519,20 +526,37 @@ mod tests {
       );
     }
     let error = registry
-      .resolve_transport(&TransportSelector::Custom(transport_tag("espnow")))
+      .resolve_transport(&TransportSelector::Custom(transport_name("espnow")))
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
 
-    // A caller registration under the custom tag closes the gap.
+    // A caller registration under the scheme name closes the gap.
     let wire = test_wire();
     registry
-      .register_transport(transport_tag("espnow"), Arc::new(wire))
+      .register_transport(transport_name("espnow"), Arc::new(wire))
       .unwrap();
     assert!(
       registry
-        .resolve_transport(&TransportSelector::Custom(transport_tag("espnow")))
+        .resolve_transport(&TransportSelector::Custom(transport_name("espnow")))
         .is_ok()
     );
+
+    // A second transport registers under its own name; names never
+    // collide and each resolves independently (many transports, many
+    // prefixes).
+    let wire = test_wire();
+    registry
+      .register_transport(transport_name("ieee80211"), Arc::new(wire))
+      .unwrap();
+    assert!(
+      registry
+        .resolve_transport(&TransportSelector::Custom(transport_name("ieee80211")))
+        .is_ok()
+    );
+    let error = registry
+      .register_transport(transport_name("espnow"), Arc::new(test_wire()))
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
   }
 
   // ---- Discovery registration without central switching ----
@@ -879,10 +903,10 @@ mod tests {
 
   #[tokio::test]
   async fn custom_transport_loopback_carries_hint_and_class_binding() {
-    let tag = transport_tag("espnow");
+    let name = transport_name("espnow");
     let wire = test_wire();
-    let adapter = Arc::new(CustomTransportAdapter::new(Arc::new(wire), tag.clone()).unwrap());
-    let endpoint = custom_endpoint(&tag, "aa:bb:cc:dd:ee:ff");
+    let adapter = Arc::new(CustomTransportAdapter::new(Arc::new(wire), name.clone()).unwrap());
+    let endpoint = custom_endpoint("espnow", "aa:bb:cc:dd:ee:ff");
     assert_eq!(endpoint.opaque(), Some("aa:bb:cc:dd:ee:ff"));
 
     let listener = adapter.bind(endpoint.clone()).await.unwrap();

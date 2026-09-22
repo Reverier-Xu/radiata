@@ -92,8 +92,8 @@ pub use routing::{
   RouteNextHop, Selector,
 };
 pub use transport::{
-  CustomListener, CustomTransport, Endpoint, PageCursor, TransportScheme, TransportSelector,
-  TransportStream,
+  CustomListener, CustomTransport, Endpoint, PageCursor, TransportName, TransportScheme,
+  TransportSelector, TransportStream,
 };
 pub use view::{
   ConnectivityStatus, DeclareInterruptedTransactionUncommitted, LeaveOutcome, ListenerPage,

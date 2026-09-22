@@ -37,9 +37,9 @@
 //! - [`connection`] carries the framed wire messages of every class with
 //!   identical prelude and limit semantics, and derives the channel binding
 //!   each class authenticates over.
-//! - [`endpoint`] carries the public `Endpoint` value type (canonical
-//!   `<scheme>host[:port]` and `<tag>+<opaque>` forms) used to address
-//!   listeners and peers.
+//! - [`endpoint`] carries the public `Endpoint` value type (the built-in
+//!   `<scheme>host[:port]` and the custom `<name>://<opaque>` forms) used to
+//!   address listeners and peers.
 //! - [`registry`] carries the open transport map: the internal
 //!   [`registry::Transport`] boundary, the public [`registry::CustomTransport`]
 //!   extension surface, and the trust intent dials carry.
@@ -58,7 +58,7 @@ pub(crate) mod verify;
 pub(crate) mod ws;
 pub(crate) mod wss;
 
-pub use endpoint::{Endpoint, TransportScheme, TransportSelector};
+pub use endpoint::{Endpoint, TransportName, TransportScheme, TransportSelector};
 pub use registry::{CustomListener, CustomTransport, TransportStream};
 
 pub use crate::paging::PageCursor;
