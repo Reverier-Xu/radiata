@@ -40,6 +40,26 @@ member that answers, and quiesces the moment any one route exists (the
 "any one route" contract). Messages sent during an outage queue as
 `pending` in the customer's store and flush when connectivity returns.
 
+## Transports
+
+The `LISTEN` endpoint selects the wire transport, and every merge
+endpoint accepts the same four schemes:
+
+| Scheme | Medium | When |
+| --- | --- | --- |
+| `tls://host:port` | TLS 1.3 over TCP | The default; the open internet. |
+| `wss://host:port` | WebSocket over TLS 1.3 | Behind proxies and web-traffic-only firewalls. |
+| `tcp://host:port` | Plaintext TCP | Closed intranets with constrained devices. |
+| `unix:///path.sock` | Unix domain socket | Same-host IPC between co-located nodes. |
+
+The `unix://` scheme is a custom transport registered in
+`src/unix_transport.rs` — the complete caller-side recipe for
+`radiata::CustomTransport`. The scheme name is caller-owned; the opaque
+remainder is the socket path, interpreted by that module alone. The
+channel is plaintext-class: socket file permissions are the
+confidentiality boundary, and the session handshake authenticates every
+peer as on any other transport.
+
 ## Run
 
 ```bash
