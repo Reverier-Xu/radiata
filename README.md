@@ -100,9 +100,8 @@ guarantees:
 - **Integration guide** — `radiata::guide` in the rustdoc: resource-version round trips across
   process boundaries, the any-one-route contract, and step-by-step wiring for the three extension
   points, each with compiling examples.
-- **Architecture** — [docs/architecture.md](docs/architecture.md): the layered module map, key
-  data flows, and the design constraints visible in the code.
-- **API reference** — `cargo doc --open`.
+- **API reference** — `cargo doc --open`. The code and its comments are the single source of
+  truth; module-level rustdoc carries the architecture and design constraints.
 
 ## Examples
 

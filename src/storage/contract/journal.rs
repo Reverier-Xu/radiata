@@ -796,8 +796,8 @@ async fn identity_records_journaled_cleanup_unknown_stays_exact_and_restart_retr
   }
 }
 
-/// The concurrent same-generation merge defect found during the P2-3
-/// acceptance run, at the storage layer: a same-purpose journal residue
+/// The concurrent same-generation merge defect, at the storage layer:
+/// a same-purpose journal residue
 /// resolved by one flow must stay resolvable for every later flow on the
 /// same ready store — the resolution reads durable evidence idempotently
 /// instead of parking on the ready-state refusal and failing with

@@ -34,9 +34,7 @@ use std::collections::BTreeMap;
 
 use minicbor::Encode;
 
-use super::{
-  ADR0002_BODY_BYTES, CborLimits, FeatureTag, ProtocolTag, QualifiedTag, encode_canonical,
-};
+use super::{CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, QualifiedTag, encode_canonical};
 use crate::{Digest, Error, Result, identity::signature::body_digest};
 
 const BUILTIN_DOMAIN: &str = super::tag::BUILTIN_DOMAIN;
@@ -71,7 +69,7 @@ const IN_FLIGHT_FLOOR: u64 = 1;
 const IN_FLIGHT_DEFAULT: u64 = 256;
 const IN_FLIGHT_CEILING: u64 = 1_024;
 
-const DEFINITION_LIMITS: CborLimits = CborLimits::new(16, 1_024, ADR0002_BODY_BYTES);
+const DEFINITION_LIMITS: CborLimits = CborLimits::new(16, 1_024, MAX_BODY_BYTES);
 
 /// The canonical immutable contract behind one negotiated feature label.
 #[derive(Clone, Debug)]

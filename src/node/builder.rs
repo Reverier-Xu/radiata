@@ -63,7 +63,7 @@ impl NodeBuilder {
     // currently the only dial/listen transport the runtime resolves: the
     // open registry accepts further transports for future milestones, but
     // `spawn_runtime` is wired to the WSS tag until a config-selected
-    // transport tag exists (roadmap: transports open behind traits).
+    // transport tag exists.
     let wss_tag = crate::transport::registry::WssTransport::tag()?;
     if extensions.transport(&wss_tag).is_none() {
       extensions.register_transport(

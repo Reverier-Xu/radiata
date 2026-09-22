@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scenario fuzz harness for the chat example cluster (P2-9).
+"""Scenario fuzz harness for the chat example cluster.
 
 Model-driven stateful fuzzing over the chat HTTP surface: a random
 (but seed-reproducible) sequence of atomic cluster operations — merge,

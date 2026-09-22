@@ -34,7 +34,7 @@ highlight = "all"
 multiple-versions = "deny"
 multiple-versions-include-dev = false
 skip = [
-  { crate = "syn@2.0.119", reason = "owner=T-G01-05: minicbor-derive 0.19.5 (latest) uses syn 2 while tokio-macros uses syn 3; drop when minicbor-derive upgrades" },
+  { crate = "syn@2.0.119", reason = "minicbor-derive 0.19.5 (latest) uses syn 2 while tokio-macros uses syn 3; drop when minicbor-derive upgrades" },
 ]
 wildcards = "deny"
 

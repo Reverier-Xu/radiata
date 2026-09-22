@@ -5,81 +5,81 @@ description: >-
   read-only review across 7 dimensions — thin wrappers, cross-module
   responsibility coupling, duplicated helper logic, poor helper factoring,
   over-abstraction, hardcoded if-else special-casing, and hardcoded strings
-  where extensibility is needed — plus gate-closure evidence verification
-  against the repo's planning documents. Use before gate closure, before
-  major refactors, when a codebase grows past a few thousand lines, or when
-  the user asks to review code quality, find duplicated helpers, audit module
-  boundaries, or verify a development milestone is actually complete.
+  where extensibility is needed — plus evidence verification that milestone
+  claims are backed by real tests and verify scripts. Use before closing a
+  milestone, before major refactors, when a codebase grows past a few
+  thousand lines, or when the user asks to review code quality, find
+  duplicated helpers, audit module boundaries, or verify a development
+  milestone is actually complete.
 ---
 
 # Code Quality Review
 
 A structured, read-only review methodology for Rust libraries. It combines:
 
-1. **Gate-closure verification** — proving a milestone's claims against the
-   repo's own planning evidence (scenarios → tests → verify scripts).
+1. **Milestone verification** — proving a milestone's claims against the
+   repo's own evidence (tests → verify scripts → quality gates). The code,
+   its comments, and its rustdoc are the single source of truth; there are
+   no separate planning documents to consult.
 2. **Multi-agent code quality review** — parallel reviewer subagents over
    module partitions, each covering 7 quality dimensions.
 3. **Skill output** — findings triaged into a fixable report.
 
-Do this when: a development gate is about to close, the user suspects quality
-debt (duplicated helpers, coupling, hardcoded strings), or the codebase has
-grown past roughly 5k lines and module boundaries need an audit.
+Do this when: a milestone is about to close, the user suspects quality debt
+(duplicated helpers, coupling, hardcoded strings), or the codebase has grown
+past roughly 5k lines and module boundaries need an audit.
 
-## 0. Setup: Read the Planning Documents First
+## 0. Setup: Map the Code First
 
-Before any code review, read (in order):
+Before any review, build the module map from the code itself (in order):
 
-- `docs/roadmap.md` — product contract, architecture rules, **planned module
-  boundaries** (the authority for judging responsibility coupling).
-- `docs/development-gates.md` — each gate's Build/Verify/Pass criteria and the
-  E2E catalog.
-- `docs/implementation-plan.md` — the 69 task rows; each task names its owned
-  paths, evidence, and rollback code.
-- `docs/task-verification.toml` — maps each task to a `scripts/verify-*.sh`.
-- `docs/scenario-catalog.toml` — the SC-* acceptance text per scenario.
-- `docs/threat-model.toml`, `docs/api-inventory.toml` — threat and API shape.
+- `src/lib.rs` — the facade: what is public, how modules re-export.
+- Module-level rustdoc (`//!` headers) of each top-level module — ownership
+  boundaries and invariants live here.
+- `tests/` — the integration surface and the public-API baseline
+  (`tests/public_api.rs`, `tests/fixtures/public-api/`).
+- `scripts/verify-*.sh` — the per-family verification lanes and the exact
+  `cargo test` filters each runs.
 
-Record the target gate (e.g. G3) and its tasks (e.g. T-G03-01..06), scenarios
-(SC-G03-P0-01..22), and E2E IDs.
+Record the milestone claims under review (from the user or commit history)
+and the module partitions for section 2.
 
-## 1. Gate-Closure Verification (Is the Milestone Actually Done?)
+## 1. Milestone Verification (Is It Actually Done?)
 
 Do not trust commit messages. Prove closure from evidence:
 
-1. Run every `scripts/verify-*.sh` verification script. Each must exit 0.
-   Capture the exact `cargo test` lanes each script runs (they encode which
-   scenarios the gate considers covered).
-2. Map every SC-* acceptance item to a concrete test:
-   - grep the test name from the verify script lane;
-   - confirm the test body asserts the acceptance's key claims (e.g. "body
+1. Run every `scripts/verify-*.sh` verification script relevant to the
+   claim. Each must exit 0. Capture the exact `cargo test` lanes each
+   script runs (they encode which behavior the repo considers covered).
+2. Map every claim to a concrete test:
+   - grep the test name from the verify script lane or `tests/*.rs`;
+   - confirm the test body asserts the claim's key statements (e.g. "body
      bytes never enter storage", "interruption is explicit", "no downgrade");
-   - note any acceptance phrase with no visible test (gap).
-3. Map E2E IDs to `tests/*.rs` `#[tokio::test]` functions.
-4. Run the repository quality suite `Q`:
+   - note any claim with no visible test (gap).
+3. Run the repository quality suite `Q`:
    - `taplo fmt --check`
    - `cargo +nightly fmt --all -- --check`
    - `cargo check --workspace --all-targets --all-features --locked`
    - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
    - `cargo test --workspace --all-features --locked`
-5. Check the gate's **pass predicate** verbatim (e.g. "Either endpoint streams
-   opaque packets; interruption is explicit and no conversation semantics
-   exist in core") and state a verdict: PASS / PASS-WITH-GAPS / NOT-PASS.
-   List gaps explicitly — a gate can be PASS while leaving P2/P3 findings.
+4. State a verdict: PASS / PASS-WITH-GAPS / NOT-PASS. List gaps explicitly —
+   a milestone can pass while leaving P2/P3 findings.
 
-Output: a table `SC / acceptance claim / test / status` plus the verdict.
+Output: a table `claim / key assertions / test / status` plus the verdict.
 
 ## 2. Multi-Agent Code Quality Review
 
 ### 2.1 Partition by Module Boundary
 
-Split `src/` by the roadmap's planned module boundaries, grouping related
-areas so each child gets a coherent responsibility slice:
+Split `src/` into coherent responsibility slices (typically 5 lanes), each
+child getting files whose ownership is contiguous. Derive the slices from
+the module map built in section 0 — never from a stale document.
 
 | Partition | Typical files |
 | --- | --- |
-| protocol + identity | `src/protocol/*`, `src/identity/*` |
+| protocol + identity + keys | `src/protocol/*`, `src/identity/*`, `src/keys/*` |
 | transport + session + packet + node | `src/transport/*`, `src/session/*`, `src/packet/*`, `src/node/*` |
+| membership + resource + routing | `src/membership/*`, `src/resource/*`, `src/routing/*`, `src/sync_common.rs` |
 | storage + provider + runtime + simulation | `src/storage/*`, `src/provider.rs`, `src/runtime/*`, `src/simulation/*` |
 | facade + cross-cutting | `src/lib.rs`, `src/api.rs`, `src/config.rs`, `src/error.rs`, `src/operation.rs`, `src/view.rs`, registry files + a **cross-module duplication scan** over all of `src/` |
 
@@ -95,9 +95,10 @@ files and focus hints. The 7 dimensions, with concrete signals:
    that discard information; traits with exactly one impl; `pub` fn that
    forwards to a private twin.
 2. **Cross-module responsibility coupling** — module A reaching into B's
-   internals; work in the wrong module per roadmap boundaries (identity logic
-   inside protocol, storage logic inside session, transport leaking into
-   packet); knowing another mod's private types.
+   internals; work in the wrong module per the ownership boundaries the
+   module rustdoc states (identity logic inside protocol, storage logic
+   inside session, transport leaking into packet); knowing another mod's
+   private types.
 3. **Duplicated helper logic** — same logic in 2+ files: canonical text
    encoding, hex/base64, time conversion, error construction, hash/credential
    derivation, limit validation, sorted inserts. Require exact file:line pairs.
@@ -133,21 +134,13 @@ Aggregate findings across children:
 - Deduplicate (the facade child often re-finds what others found).
 - Re-verify high-severity findings against the real code before reporting —
   subagents hallucinate line numbers; spot-check every P0/P1.
-- Classify by the gate's own risk language (P0/H vs P1/L) where useful.
 - Produce a report: per-dimension findings table + a short "what is healthy"
   section (findings alone overstate debt) + prioritized remediation list.
 
-## 4. Persist the Experience as a Skill
-
-After each review, update this skill's `references/project-findings.md` with
-the concrete hotspots found (module, pattern, fix), so the next review starts
-from known territory. Keep the 7 dimensions stable; only the evidence mapping
-and hotspot list evolve.
-
 ## Check Yourself
 
-- [ ] Ran every verify script for the gate; recorded PASS/FAIL.
-- [ ] Every SC acceptance phrase has a mapped test or an explicit gap.
+- [ ] Ran every relevant verify script; recorded PASS/FAIL.
+- [ ] Every milestone claim has a mapped test or an explicit gap.
 - [ ] Every child reported per-dimension; cross-cutting child did the scan.
 - [ ] P0/P1 findings spot-checked against real code.
-- [ ] Verdict stated against the gate's verbatim pass predicate.
+- [ ] Verdict stated against the milestone's claims.
