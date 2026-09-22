@@ -38,7 +38,6 @@ use super::{CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, QualifiedTag, e
 use crate::{Digest, Error, Result, identity::signature::body_digest};
 
 const BUILTIN_DOMAIN: &str = super::tag::BUILTIN_DOMAIN;
-const BUILTIN_TEST_OWNER: &str = "VERIFY-G03-01";
 const FINGERPRINT_SEED_PREFIX: &str = "radiata.woooo.tech/crypto/feature-fingerprint-v1/";
 
 pub(crate) const AUTH_ED25519_SESSION: &str = "radiata.woooo.tech/features/auth-ed25519-session";
@@ -80,7 +79,6 @@ pub struct FeatureDefinition {
   conflicts: Vec<FeatureTag>,
   protocols: Vec<ProtocolTag>,
   limits: Vec<LimitDefinition>,
-  test_owner: String,
 }
 
 impl FeatureDefinition {
@@ -95,7 +93,7 @@ impl FeatureDefinition {
         "feature definition reserved namespace",
       ));
     }
-    Ok(Self::unchecked(tag, fingerprint, String::new()))
+    Ok(Self::unchecked(tag, fingerprint))
   }
 
   /// Adds an immutable required feature label.
@@ -131,7 +129,7 @@ impl FeatureDefinition {
     Ok(self)
   }
 
-  fn unchecked(tag: FeatureTag, fingerprint: Digest, test_owner: String) -> Self {
+  fn unchecked(tag: FeatureTag, fingerprint: Digest) -> Self {
     Self {
       tag,
       fingerprint,
@@ -139,7 +137,6 @@ impl FeatureDefinition {
       conflicts: Vec::new(),
       protocols: Vec::new(),
       limits: Vec::new(),
-      test_owner,
     }
   }
 
@@ -220,7 +217,6 @@ impl FeatureDefinition {
       conflicts,
       protocols,
       limits,
-      test_owner: self.test_owner.clone(),
     }
   }
 }
@@ -398,8 +394,6 @@ struct DefinitionWire {
   protocols: Vec<String>,
   #[n(5)]
   limits: Vec<LimitDefinitionWire>,
-  #[n(6)]
-  test_owner: String,
 }
 
 /// The closed, validated set of locally implemented feature definitions.
@@ -574,11 +568,7 @@ pub(crate) fn builtin_definitions() -> Result<Vec<FeatureDefinition>> {
 fn builtin(tag: &str) -> Result<FeatureDefinition> {
   let tag = FeatureTag::parse(tag)?;
   let fingerprint = builtin_fingerprint(&tag);
-  Ok(FeatureDefinition::unchecked(
-    tag,
-    fingerprint,
-    BUILTIN_TEST_OWNER.to_owned(),
-  ))
+  Ok(FeatureDefinition::unchecked(tag, fingerprint))
 }
 
 fn builtin_fingerprint(tag: &FeatureTag) -> Digest {
@@ -623,27 +613,27 @@ mod tests {
       (
         AUTH_ED25519_SESSION,
         "a6aae08b63bae00caa00aab679575305a1706fe438b4f6174cb557ffc1494325",
-        "7e1cd8b5da6a7073ecf8bcc214f3bc23fd0e8aa5d039df81d051aebc6261dbb2",
+        "068169abb577cd92c8f018ddb594aba6bedcd949f1614163b39c941efc83f906",
       ),
       (
         SESSION_CORE,
         "ee00fbe9538f70fd59221ce29662b3c2e7ca641435c8d7ef9885c1b0c92404c4",
-        "c7d97780c1919caa52efbf957e11a6ed3e894724558bf0e80497996536e2fa6e",
+        "b5117204b611a8e851c65a9d42e1c226b02655029b0383c13171650fc66928dc",
       ),
       (
         DATA_MESSAGES,
         "1eefa1f2d6d8693aaf50c2104446b70b7f17fa5edb6f770292c98c1e79e98446",
-        "594268233e6759361cfe2a5ddb5fe318375670bd6d3c74a9dfd7970378328ba8",
+        "08095643a94e9724b23fa3d28a4b8590b2958a413b15af2d98f9b1b4f567ad8e",
       ),
       (
         DIRECT_REQUEST,
         "b6b33d30b0f540cd765d7dcf9ba3b348073e0ebfce6614e5444a4d2c68ea5ca2",
-        "9b6e0d583656d859650b5b2f983772d13f37f0ddcb800cb5ae73b92d521d1f08",
+        "7ead874dd685cc92ac6d7b8688351067f9fa79626ea2995d1712a4d9b7c69db7",
       ),
       (
         ROUTED_DELIVERY,
         "98754ce760dd2308e7ee914e3575cb0cc69e4281bcda0889f13aeb35e5651609",
-        "348d89297781958b76a3b261ef9a9a1c47d5231102afad3f1a30fbce07a37537",
+        "5c7aff71c2dd5df6cfdaa6a3448dc08685bc3d00b905d1401af6196ba270b396",
       ),
     ];
     for (name, fingerprint, digest) in cases {
@@ -815,9 +805,6 @@ mod tests {
       definition
         .protocols
         .push(ProtocolTag::parse("radiata.woooo.tech/protocols/routed-delivery").unwrap());
-    });
-    assert_mutation_detected(AUTH_ED25519_SESSION, |definition| {
-      definition.test_owner = "VERIFY-OTHER".to_owned();
     });
   }
 

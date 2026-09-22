@@ -598,7 +598,7 @@ async fn remove_resource_requires_the_exact_version() {
 
 /// Conditional write (`PutResource::with_expected`): the preconditioned
 /// candidate installs only while the stored winner equals the observed
-/// version exactly — a stale observation conflicts explicitly (D7), an
+/// version exactly — a stale observation conflicts explicitly, an
 /// unknown name fails NotFound, and the plain write path stays
 /// last-writer-wins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

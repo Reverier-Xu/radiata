@@ -592,7 +592,7 @@ pub(super) struct Supervisor {
   >,
   pub(super) recovery: crate::membership::recovery::RecoveryController,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-  /// Recovery-tick cooldown before the next redundant-edge cut (D10).
+  /// Recovery-tick cooldown before the next redundant-edge cut.
   pub(super) prune_cooldown: u32,
   pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
   /// Memoized departed-members exclusion set, keyed by the store

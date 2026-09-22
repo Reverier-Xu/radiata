@@ -1230,7 +1230,7 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
 /// merge attempt on the same generation is refused without a merge and
 /// without consuming another generation.
 /// Credential copies share one live generation: a second node replaying
-/// the copied credential bytes also merges (D8 — admission is
+/// the copied credential bytes also merges (admission is
 /// per-subject, not per-generation), and only rotation retires the
 /// copied text, after which a further copy fails closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

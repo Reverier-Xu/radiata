@@ -69,7 +69,7 @@ impl Supervisor {
   /// tuple, signs through the node's key provider, and commits the whole
   /// record in one conditional transaction. With an `expected` version
   /// the commit installs only while the stored winner equals it exactly
-  /// — a raced read-modify-write is an explicit conflict (D7). A
+  /// — a raced read-modify-write is an explicit conflict. A
   /// committed winner emits exactly one [`crate::ResourceChanged`] after
   /// durability; an accepted but superseded candidate emits nothing, and
   /// an indeterminate commit reports `CommitUnknown` without an event.
@@ -143,7 +143,7 @@ impl Supervisor {
     .await?;
     // A preconditioned write that lost the tuple can no longer be
     // replacing the expected version: the register moved past it, so the
-    // precondition surfaces as an explicit conflict (D7) instead of a
+    // precondition surfaces as an explicit conflict instead of a
     // silently accepted loser.
     let superseded = if expected.is_some() {
       None
@@ -279,7 +279,7 @@ impl Supervisor {
             // A committed removal emits exactly one event after
             // durability; the raced/moved/indeterminate arms below never
             // reach the emit as successes. A removal has no accepted-
-            // loser report: a register move conflicts (D7).
+            // loser report: a register move conflicts.
             Ok(CommitRace::Final(Self::resource_mutation_outcome(
               &this.dependencies.events,
               name,

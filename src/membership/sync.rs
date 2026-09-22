@@ -256,7 +256,7 @@ pub(crate) async fn announce_leave(
   if peers.is_empty() {
     // The documented silent-leave degradation, made audible: without
     // this line a silent leave is indistinguishable from a lost log
-    // line (F-10).
+    // line.
     crate::audit::leave_announcement_skipped();
     return Ok(());
   }
@@ -415,7 +415,7 @@ async fn accept_payload(
       // The applied receipt: one durable-install confirmation back to
       // the leaver, best-effort and retried by the announcement budget.
       // Pre-receipt peers simply never send it. The admission ack is
-      // still observed (delivery truth, D2): the wait runs detached so
+      // still observed (delivery truth): the wait runs detached so
       // the pump never serializes behind it, and a failed admission is
       // diagnostics only — the receipt is a hint, never a trust
       // decision, and is never retried here.

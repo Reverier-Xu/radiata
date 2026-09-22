@@ -30,7 +30,7 @@ if [ "$FUZZ" = "1" ]; then
   # lives at the `audit` target. The default filter keeps the audit
   # target at debug and everything else at info: a full debug mesh at
   # n>=16 overwhelms the host's container log pipeline, which then
-  # silently drops exactly the lines the harness asserts on (F-9/F-10).
+  # silently drops exactly the lines the harness asserts on.
   # Set RUST_LOG=debug explicitly for deep-dive diagnostic runs.
   FEATURES=audit
   LOG_LEVEL="info,audit=debug"

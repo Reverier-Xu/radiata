@@ -372,7 +372,7 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
 
   // Flap the last leaf's session to the hub every two seconds while the
   // survivors converge: every flap resolves in-flight admissions as
-  // undelivered and the next tick re-delivers from scratch (D2).
+  // undelivered and the next tick re-delivers from scratch.
   let flap_id = nodes[0].id.clone();
   let flap = nodes[nodes.len() - 1].handle.clone();
   let flapper = tokio::spawn(async move {
