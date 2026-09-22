@@ -791,7 +791,7 @@ mod tests {
     let context = Arc::new(
       crate::identity::lifecycle::open_local_identity(
         &factory,
-        &keys.as_provider(),
+        Some(&keys.as_provider()),
         &SystemEntropy,
         std::time::Duration::from_secs(10),
       )
@@ -881,7 +881,7 @@ mod tests {
     let context = Arc::new(
       crate::identity::lifecycle::open_local_identity(
         &factory,
-        &keys.as_provider(),
+        Some(&keys.as_provider()),
         &SystemEntropy,
         std::time::Duration::from_secs(10),
       )

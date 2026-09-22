@@ -1,6 +1,8 @@
-//! The built-in key-custody adapters behind [`crate::adapters`].
+//! The built-in key-custody adapters behind [`crate::adapters`], plus
+//! the default store-backed custody the runtime assembles itself when no
+//! provider is injected.
 //!
-//! Both adapters share one operation-id discipline: one
+//! All adapters share one operation-id discipline: one
 //! [`KeyOperationId`] maps to exactly one [`KeyHandle`] — the operation
 //! id's own UTF-8 bytes — so every durable or in-memory artifact is
 //! self-describing after a restart and a retried operation resolves to
@@ -8,10 +10,27 @@
 
 pub(crate) mod ephemeral;
 pub(crate) mod file;
+pub(crate) mod metadata;
 
 use std::sync::Arc;
 
+use zeroize::Zeroizing;
+
 use crate::{Error, KeyHandle, KeyOperationId, ProviderErrorContext, ProviderErrorKind, Result};
+
+/// The Ed25519 seed length every built-in adapter stores and loads.
+pub(crate) const SECRET_LEN: usize = 32;
+
+/// Draws one fresh seed from the host entropy source, zeroized on drop.
+/// Both the built-in adapters and the default store-backed custody share
+/// this one draw so the entropy source and its failure mapping cannot
+/// drift per adapter.
+pub(crate) fn fresh_secret() -> Result<Zeroizing<[u8; SECRET_LEN]>> {
+  let mut secret = Zeroizing::new([0_u8; SECRET_LEN]);
+  getrandom::fill(&mut secret[..])
+    .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::Entropy))?;
+  Ok(secret)
+}
 
 /// The handle the built-in adapters issue for one operation id: the
 /// operation id's own UTF-8 bytes. The 1:1 mapping is what lets every

@@ -497,7 +497,8 @@ impl radiata::NodeBuilder
 pub fn radiata::NodeBuilder::config(self, radiata::NodeConfig) -> Self
 pub fn radiata::NodeBuilder::entropy(self, alloc::sync::Arc<dyn radiata::extension::Entropy>) -> Self
 pub fn radiata::NodeBuilder::extensions(self, radiata::ExtensionRegistry) -> Self
-pub fn radiata::NodeBuilder::new(alloc::sync::Arc<dyn radiata::extension::StorageFactory>, alloc::sync::Arc<dyn radiata::extension::KeyProvider>) -> Self
+pub fn radiata::NodeBuilder::keys(self, alloc::sync::Arc<dyn radiata::extension::KeyProvider>) -> Self
+pub fn radiata::NodeBuilder::new(alloc::sync::Arc<dyn radiata::extension::StorageFactory>) -> Self
 pub async fn radiata::NodeBuilder::start(self) -> radiata::Result<radiata::NodeHandle>
 pub struct radiata::NodeConfig
 impl radiata::NodeConfig

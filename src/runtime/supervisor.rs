@@ -81,7 +81,11 @@ impl Drop for LifecyclePublisher {
 pub(crate) struct RuntimeDependencies {
   pub(crate) storage_factory: Arc<dyn StorageFactory>,
   pub(crate) context: Option<Arc<LocalIdentityContext>>,
-  pub(crate) keys: Arc<dyn KeyProvider>,
+  /// The caller's custody injection, if any. `open_local_identity`
+  /// resolves `None` to the default store-backed provider, and the
+  /// resolved provider lives on the identity context; this field is only
+  /// the pre-open injection.
+  pub(crate) keys: Option<Arc<dyn KeyProvider>>,
   pub(crate) config: NodeConfig,
   pub(crate) entropy: Arc<dyn Entropy>,
   pub(crate) extensions: Arc<ExtensionRegistry>,
@@ -135,7 +139,7 @@ pub(crate) async fn spawn_runtime(
   let receipt_retention = dependencies.config.receipt_retention();
   let context = open_local_identity(
     &dependencies.storage_factory,
-    &dependencies.keys,
+    dependencies.keys.as_ref(),
     dependencies.entropy.as_ref(),
     receipt_retention,
   )
@@ -672,7 +676,7 @@ impl Supervisor {
     let driver_context = Arc::clone(&context);
     let driver = SessionDriver::new(
       driver_context,
-      dependencies.keys.clone(),
+      context.keys().clone(),
       dependencies.entropy.clone(),
       Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
       offer,
@@ -1179,7 +1183,7 @@ mod receipt_retention_sweep_tests {
     let keys: Arc<dyn KeyProvider> = ScriptedKeys::full().as_provider();
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
     let context = Arc::new(
-      open_local_identity(&factory, &keys, entropy.as_ref(), retention)
+      open_local_identity(&factory, Some(&keys), entropy.as_ref(), retention)
         .await
         .unwrap(),
     );
@@ -1195,7 +1199,7 @@ mod receipt_retention_sweep_tests {
       transport: Arc::new(crate::transport::registry::WssTransport::new()),
       storage_factory: factory.clone(),
       context: Some(context.clone()),
-      keys,
+      keys: Some(keys),
       config,
       entropy: entropy.clone(),
       extensions: Arc::new(ExtensionRegistry::new()),

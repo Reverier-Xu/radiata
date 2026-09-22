@@ -89,7 +89,6 @@ async fn main() {
   let config = load_config();
 
   let storage = radiata::adapters::redb_store(config.data.join("store.redb"));
-  let keys = radiata::adapters::file_key_store(config.data.join("keys"));
 
   // The self-probe consumer must be registered before the node starts:
   // ExtensionRegistry is frozen at build time by design.
@@ -122,7 +121,7 @@ async fn main() {
     )
     .expect("register route policy");
 
-  let node = NodeBuilder::new(storage, Arc::clone(&keys))
+  let node = NodeBuilder::new(storage)
     .config(
       radiata::NodeConfig::new()
         .with_session_liveness(

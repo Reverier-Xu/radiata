@@ -47,7 +47,8 @@ async fn start_node(seed: u64) -> Node {
   let config = NodeConfig::new()
     .with_anti_entropy_interval(SYNC_INTERVAL)
     .unwrap();
-  let handle = NodeBuilder::new(storage.clone(), keys)
+  let handle = NodeBuilder::new(storage.clone())
+    .keys(keys)
     .config(config)
     .start()
     .await

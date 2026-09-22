@@ -38,11 +38,13 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use tokio::time::sleep;
 use zeroize::Zeroizing;
 
-use super::{custody_corrupt, handle_for, io_error, operation_from_handle, validate_delete_pair};
+use super::{
+  SECRET_LEN, custody_corrupt, fresh_secret, handle_for, io_error, operation_from_handle,
+  validate_delete_pair,
+};
 use crate::{
-  BoxFuture, CreatedKey, Error, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, ProviderErrorContext, ProviderErrorKind, PublicKey, Result, Signature,
-  provider::KeyProvider,
+  BoxFuture, CreatedKey, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
+  KeyOperationId, ProviderErrorContext, PublicKey, Result, Signature, provider::KeyProvider,
 };
 
 /// Suffix of the durable key artifact: the raw 32-byte Ed25519 seed.
@@ -54,10 +56,6 @@ const INTENT_SUFFIX: &str = ".intent";
 const INTENT_MINT: &[u8] = b"radiata/key-intent/v1 mint\n";
 /// The delete marker, written durably before the key file is removed.
 const INTENT_DELETE: &[u8] = b"radiata/key-intent/v1 delete\n";
-/// The Ed25519 seed length; a key file of exactly this length is
-/// complete, an empty one proves nothing was ever stored, and anything
-/// between is a torn artifact.
-const SECRET_LEN: usize = 32;
 /// How long a creator waits for an empty key artifact to grow before
 /// concluding its writer is dead and taking the operation over. Within
 /// one process the mint writes create and fill in one unawaited block,
@@ -569,13 +567,6 @@ impl KeyProvider for FileKeyStore {
       }
     })
   }
-}
-
-fn fresh_secret() -> Result<Zeroizing<[u8; SECRET_LEN]>> {
-  let mut secret = Zeroizing::new([0_u8; SECRET_LEN]);
-  getrandom::fill(&mut secret[..])
-    .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::Entropy))?;
-  Ok(secret)
 }
 
 #[cfg(test)]

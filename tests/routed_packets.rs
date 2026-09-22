@@ -166,7 +166,8 @@ async fn start_node(
       .unwrap();
     config = config.with_route_policy(QualifiedTag::parse(POLICY_TAG).unwrap());
   }
-  let handle = NodeBuilder::new(factory, keys)
+  let handle = NodeBuilder::new(factory)
+    .keys(keys)
     .config(config)
     .extensions(registry)
     .start()

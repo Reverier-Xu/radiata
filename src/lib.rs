@@ -111,8 +111,10 @@ pub mod extension {
 pub mod adapters {
   //! Explicit storage and key-custody adapter constructors.
   //!
-  //! Adapter selection is always an explicit caller choice; no feature
-  //! selects a backend implicitly.
+  //! Storage backend selection is always an explicit caller choice; no
+  //! feature selects a backend implicitly. Key custody has a documented
+  //! default — the node's metadata store — and these constructors exist
+  //! for custody that must live elsewhere, or for tests.
 
   use std::{path::PathBuf, sync::Arc};
 
@@ -144,16 +146,17 @@ pub mod adapters {
   /// Creates a durable file-backed Ed25519 key store rooted at the
   /// directory `path` (created lazily on the first mutating operation).
   ///
-  /// This is the zero-effort custody default: one directory holds one
-  /// key file per operation id (the raw 32-byte seed, mode 0600 from
-  /// the first byte on unix) plus one intent marker per in-flight or
-  /// interrupted operation, and every write is fsynced with a
-  /// directory-entry barrier before the operation reports. The crash
-  /// contract is the trait's: a create is idempotent per
-  /// [`KeyOperationId`](crate::KeyOperationId) — the first secret that
-  /// reaches durable storage wins across retries and concurrent
-  /// creators — and the `reconcile_*` methods classify interrupted
-  /// operations purely from durable evidence, failing closed
+  /// Custody for keys that must live outside the node's metadata
+  /// storage — a separate volume, an operator-mounted directory, a
+  /// compliance boundary. One directory holds one key file per operation
+  /// id (the raw 32-byte seed, mode 0600 from the first byte on unix)
+  /// plus one intent marker per in-flight or interrupted operation, and
+  /// every write is fsynced with a directory-entry barrier before the
+  /// operation reports. The crash contract is the trait's: a create is
+  /// idempotent per [`KeyOperationId`](crate::KeyOperationId) — the
+  /// first secret that reaches durable storage wins across retries and
+  /// concurrent creators — and the `reconcile_*` methods classify
+  /// interrupted operations purely from durable evidence, failing closed
   /// (`Unknown`) on an artifact that cannot prove its key. A key file
   /// that exists but does not parse is never overwritten; delete it
   /// (through [`KeyProvider::delete`]) to re-issue.

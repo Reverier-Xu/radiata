@@ -191,39 +191,71 @@
 //! owning feature) and the consumer; the runtime starts dispatching
 //! streams once the first matching session admits them.
 //!
-//! # 5. Holding identity keys: `KeyProvider`
+//! # 5. Holding identity keys: the built-in custody and `KeyProvider`
 //!
-//! Identity is only as durable as its private keys. The
-//! [`KeyProvider`](crate::extension::KeyProvider) trait hands the node
-//! creation, signing, and deletion over your keystore; the two
+//! Identity is only as durable as its private keys. By default you never
+//! touch key custody at all: the node stores its identity seed inside the
+//! metadata storage you already provide, in a reserved namespace that is
+//! never synced and never exposed to features, so keys and metadata share
+//! one backup, one exclusive lifetime lock, and one restart story.
+//!
+//! ```no_run
+//! # async fn demo() -> radiata::Result<()> {
+//! # let data_dir = std::path::PathBuf::from("/data");
+//! // Default custody: the identity key lives in the metadata store.
+//! # let storage = radiata::adapters::redb_store(data_dir.join("node.db"));
+//! let node = radiata::NodeBuilder::new(storage).start().await?;
+//! # let _ = node;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The node's own custody follows the same crash contract as everything
+//! else in the runtime: creates and deletions are conditional commits
+//! whose durable evidence answers `reconcile_*` exactly, so an
+//! interrupted bootstrap or leave resumes from storage, never from a
+//! guess.
+//!
+//! ## Injecting a different custody provider
+//!
+//! When the key must live outside the metadata storage — on a separate
+//! volume, in an HSM, or in a cloud KMS — inject a provider on the
+//! builder. The same provider must back every restart of the node, or
+//! the persisted identity can no longer sign.
+//!
+//! ```no_run
+//! # async fn demo() -> radiata::Result<()> {
+//! # let data_dir = std::path::PathBuf::from("/data");
+//! // Built-in file custody rooted wherever the operator mounts it.
+//! let keys = radiata::adapters::file_key_store(data_dir.join("keys"));
+//! # let storage = radiata::adapters::redb_store(data_dir.join("node.db"));
+//! let node = radiata::NodeBuilder::new(storage).keys(keys).start().await?;
+//! # let _ = node;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Built-in constructors:
+//! [`adapters::file_key_store`](crate::adapters::file_key_store) is the
+//! durable file-backed store (one directory, fsynced writes, mode-0600
+//! seeds from creation on unix, evidence-based reconciliation after
+//! crashes). [`adapters::ephemeral_key_store`](crate::adapters::ephemeral_key_store)
+//! holds keys in memory for tests and deliberately ephemeral nodes —
+//! identity bindings built on it do **not** survive a restart.
+//!
+//! ## The `KeyProvider` extension point
+//!
+//! The [`KeyProvider`](crate::extension::KeyProvider) trait hands the
+//! node creation, signing, and deletion over your keystore; the two
 //! `reconcile_*` methods are the crash-recovery contract — after a
 //! restart they report what actually landed, without assuming the
 //! outcome of an interrupted operation. Errors mean "this provider
 //! cannot answer right now": the runtime fails the operation closed
 //! and the caller retries; they never mean "the key is gone".
 //!
-//! Start from the built-in adapters — most integrations never
-//! implement the trait.
-//! [`adapters::file_key_store`](crate::adapters::file_key_store) is the
-//! zero-effort durable default: one directory holds one key file per
-//! operation id plus one intent marker per in-flight operation, with
-//! fsynced writes, mode-0600 seeds from creation on unix, and
-//! evidence-based reconciliation after crashes.
-//! [`adapters::ephemeral_key_store`](crate::adapters::ephemeral_key_store)
-//! holds keys in memory for tests and deliberately ephemeral nodes —
-//! identity bindings built on it do **not** survive a restart.
-//!
-//! ```no_run
-//! # let data_dir = std::path::PathBuf::from("/data");
-//! // Durable custody in one call — the directory is created lazily.
-//! let keys = radiata::adapters::file_key_store(data_dir.join("keys"));
-//! # let _ = keys;
-//! ```
-//!
-//! A real keystore (HSM, cloud KMS, OS keychain) remains the extension
-//! path: implement the trait over your keystore's operations, keeping
-//! the same idempotency per operation id. The skeleton below shows the
-//! shape every implementation fills in:
+//! A real keystore (HSM, cloud KMS, OS keychain) implements the trait
+//! over its operations, keeping the same idempotency per operation id.
+//! The skeleton below shows the shape every implementation fills in:
 //!
 //! ```no_run
 //! # use radiata::extension::KeyProvider;
@@ -279,10 +311,10 @@
 //! ```
 //!
 //! Pass the provider to
-//! [`NodeBuilder::new`](crate::NodeBuilder::new) together with the
-//! storage factory; the same provider must back every restart of the
-//! node, or the persisted identity can no longer sign. For
-//! `file_key_store` that means the same directory, durably mounted.
+//! [`NodeBuilder::keys`](crate::NodeBuilder::keys); the same provider
+//! must back every restart of the node, or the persisted identity can
+//! no longer sign. For `file_key_store` that means the same directory,
+//! durably mounted.
 //!
 //! # 6. Leaving the cluster: `LeaveCluster`
 //!

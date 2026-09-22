@@ -139,7 +139,8 @@ async fn start_node(seed: u64, current: bool) -> Node {
   let config = NodeConfig::new()
     .with_anti_entropy_interval(SYNC_INTERVAL)
     .unwrap();
-  let handle = NodeBuilder::new(factory, keys)
+  let handle = NodeBuilder::new(factory)
+    .keys(keys)
     .config(config)
     .extensions(extensions)
     .start()
@@ -174,7 +175,8 @@ async fn start_node_requiring(seed: u64, feature: &str, register: bool) -> Node 
   let config = NodeConfig::new()
     .require_feature(FeatureTag::parse(feature).unwrap())
     .unwrap();
-  let handle = NodeBuilder::new(factory, keys)
+  let handle = NodeBuilder::new(factory)
+    .keys(keys)
     .config(config)
     .extensions(extensions)
     .start()

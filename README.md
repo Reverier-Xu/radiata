@@ -46,24 +46,23 @@ fuzz harness) are opt-in. Rust 1.98 or newer is required.
 
 ## Quick start
 
-A node needs three things: a storage factory, a keystore-backed `KeyProvider`, and a configuration.
-The crate deliberately ships no production key provider — identity is only as durable as your
-keystore — so you implement `radiata::extension::KeyProvider` (see the [`radiata::guide`
-chapter](#documentation) and `examples/chat/src/keys.rs` for a reference implementation).
+A node needs two things: a storage factory and a configuration. Identity keys are custody-managed
+by default — the node stores its identity seed inside the metadata storage itself, in a reserved
+namespace that is never synced and never exposed to features, so keys and metadata share one
+backup and one restart story. When the key must live elsewhere (a separate volume, an HSM, a
+cloud KMS), implement `radiata::extension::KeyProvider` and pass it to
+[`NodeBuilder::keys`](#documentation) (see the [`radiata::guide` chapter](#documentation)).
 
 ```rust
-use std::sync::Arc;
-
 use radiata::{adapters::redb_store, Endpoint, Listen, NodeBuilder, NodeConfig, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let storage = redb_store("node-data/store.redb".into());
-    let keys: Arc<dyn radiata::extension::KeyProvider> = my_keystore_provider();
 
     // Bootstrap a new cluster by listening; join an existing one by
     // additionally running `MergeCluster` through any live member.
-    let node = NodeBuilder::new(storage, keys)
+    let node = NodeBuilder::new(storage)
         .config(NodeConfig::new())
         .start()
         .await?;

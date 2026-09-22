@@ -396,8 +396,9 @@ const WIPE_DOMAINS: &[crate::storage::families::MetadataDomain] = &[
 /// identity singleton is swapped, never wiped, and the leave intent,
 /// cleanup tombstones, and checkpoint are hygiene records of the store,
 /// not credentials of the old identity. Key-custody families (the
-/// KeyIntent domain) and the storage infrastructure domains (pending
-/// journal, receipts, schema) stay for the same reason.
+/// KeyIntent and Custody domains: the seed rows leave through the
+/// provider's own deletion flow) and the storage infrastructure domains
+/// (pending journal, receipts, schema) stay for the same reason.
 const WIPE_IDENTITY_FAMILIES: &[&str] = &[
   crate::storage::families::IDENTITY_BINDING_NAMESPACE,
   crate::storage::families::CREDENTIAL_USE_NAMESPACE,
@@ -760,7 +761,7 @@ mod tests {
     let entropy = Arc::new(SequenceEntropy::default());
     let context = lifecycle::open_local_identity(
       factory,
-      &keys.as_provider(),
+      Some(&keys.as_provider()),
       entropy.as_ref(),
       Duration::from_secs(10),
     )
@@ -1295,7 +1296,7 @@ mod crash {
     let entropy = Arc::new(SequenceEntropy::starting_at(entropy_offset));
     let context = lifecycle::open_local_identity(
       factory,
-      &keys.as_provider(),
+      Some(&keys.as_provider()),
       entropy.as_ref(),
       Duration::from_secs(10),
     )

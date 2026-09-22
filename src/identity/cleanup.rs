@@ -469,7 +469,7 @@ mod tests {
     let entropy = Arc::new(SequenceEntropy::default());
     let context = lifecycle::open_local_identity(
       &factory,
-      &keys.as_provider(),
+      Some(&keys.as_provider()),
       entropy.as_ref(),
       std::time::Duration::from_secs(10),
     )
@@ -514,7 +514,7 @@ mod tests {
     let entropy = Arc::new(SequenceEntropy::default());
     let context = lifecycle::open_local_identity(
       &factory,
-      &keys.as_provider(),
+      Some(&keys.as_provider()),
       entropy.as_ref(),
       std::time::Duration::from_secs(10),
     )
@@ -584,7 +584,7 @@ mod tests {
     let entropy = Arc::new(SequenceEntropy::default());
     let context = lifecycle::open_local_identity(
       &factory,
-      &keys.as_provider(),
+      Some(&keys.as_provider()),
       entropy.as_ref(),
       std::time::Duration::from_secs(10),
     )

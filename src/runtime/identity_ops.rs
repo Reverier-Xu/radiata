@@ -24,8 +24,7 @@ impl Supervisor {
       return Err(Error::invalid_input("cleanup subject"));
     }
     let record =
-      crate::identity::cleanup::sign_cleanup_record(&context, &self.dependencies.keys, &subject)
-        .await?;
+      crate::identity::cleanup::sign_cleanup_record(&context, context.keys(), &subject).await?;
     crate::identity::cleanup::persist_cleanup_record_ctx(
       context.store(),
       self.dependencies.entropy.as_ref(),
@@ -141,7 +140,7 @@ impl Supervisor {
     // purge.
     let record = crate::identity::revocation::sign_revocation_record(
       &context,
-      &self.dependencies.keys,
+      context.keys(),
       &subject,
       &expected_key,
     )
@@ -200,7 +199,7 @@ impl Supervisor {
     // leave, which the cleanup path covers.
     let journaled = crate::identity::leave::journal_leave(
       &context,
-      &self.dependencies.keys,
+      context.keys(),
       self.dependencies.entropy.as_ref(),
     )
     .await?;
@@ -235,7 +234,7 @@ impl Supervisor {
 
     crate::identity::leave::run_leave(
       context.store(),
-      &self.dependencies.keys,
+      context.keys(),
       self.dependencies.entropy.as_ref(),
       &journaled.stored,
       &journaled.intent,

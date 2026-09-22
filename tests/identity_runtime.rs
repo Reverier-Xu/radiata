@@ -55,7 +55,7 @@ fn builder(
   factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>, entropy: Arc<SequenceEntropy>,
 ) -> NodeBuilder {
   let provider: Arc<dyn KeyProvider> = keys;
-  NodeBuilder::new(factory, provider).entropy(entropy)
+  NodeBuilder::new(factory).keys(provider).entropy(entropy)
 }
 
 fn factory_arc(providers: &Providers) -> Arc<dyn StorageFactory> {

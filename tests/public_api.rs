@@ -1260,7 +1260,8 @@ async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<dyn KeyProvider>) -> 
       Arc::new(PubConsumer::default()),
     )
     .unwrap();
-  let handle = NodeBuilder::new(factory, keys)
+  let handle = NodeBuilder::new(factory)
+    .keys(keys)
     .config(config)
     .extensions(extensions)
     .entropy(Arc::new(PubEntropy::default()))

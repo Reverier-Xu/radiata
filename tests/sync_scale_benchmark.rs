@@ -79,7 +79,8 @@ async fn start(seed: u64) -> Node {
       RecoveryConfig::new(64, Duration::from_secs(2), Duration::from_secs(60)).unwrap(),
     )
     .unwrap();
-  let handle = NodeBuilder::new(storage, keys)
+  let handle = NodeBuilder::new(storage)
+    .keys(keys)
     .config(config)
     .start()
     .await

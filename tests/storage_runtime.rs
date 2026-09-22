@@ -109,9 +109,11 @@ impl Providers {
   fn builder(&self) -> NodeBuilder {
     let factory: Arc<dyn StorageFactory> = Arc::<MemoryStorageFactory>::clone(&self.factory);
     let keys: Arc<dyn KeyProvider> = Arc::<ScriptedKeys>::clone(&self.keys);
-    NodeBuilder::new(factory, keys).entropy(Arc::new(SequenceEntropy::with_events(Arc::clone(
-      &self.events,
-    ))))
+    NodeBuilder::new(factory)
+      .keys(keys)
+      .entropy(Arc::new(SequenceEntropy::with_events(Arc::clone(
+        &self.events,
+      ))))
   }
 }
 

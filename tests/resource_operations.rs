@@ -31,7 +31,8 @@ async fn start_node(seed: u64, storage: Arc<MemoryStorageFactory>) -> Node {
   let config = NodeConfig::new()
     .with_anti_entropy_interval(SYNC_INTERVAL)
     .unwrap();
-  let handle = NodeBuilder::new(storage, keys)
+  let handle = NodeBuilder::new(storage)
+    .keys(keys)
     .config(config)
     .start()
     .await
@@ -380,7 +381,8 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
   // identity's key handle must resolve after the reopen.
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(900_000));
   {
-    let handle = NodeBuilder::new(Arc::clone(&storage), Arc::clone(&keys))
+    let handle = NodeBuilder::new(Arc::clone(&storage))
+      .keys(Arc::clone(&keys))
       .start()
       .await
       .unwrap();
@@ -399,7 +401,7 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
 
   // Reopen the same store: the identity and the committed candidate load
   // intact.
-  let handle = NodeBuilder::new(storage, keys).start().await.unwrap();
+  let handle = NodeBuilder::new(storage).keys(keys).start().await.unwrap();
   let mut events = handle
     .events::<ResourceChanged>(EventOptions::new())
     .unwrap();

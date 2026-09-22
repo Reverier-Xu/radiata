@@ -50,7 +50,6 @@ async fn main() {
   let config = load_config();
 
   let storage = radiata::adapters::redb_store(config.data.join("store.redb"));
-  let chat_keys = radiata::adapters::file_key_store(config.data.join("keys"));
   let store = Arc::new(
     ChatStore::open(config.data.join("messages.json"))
       .await
@@ -77,7 +76,7 @@ async fn main() {
     )
     .expect("register chat protocol");
 
-  let node = NodeBuilder::new(storage, Arc::clone(&chat_keys))
+  let node = NodeBuilder::new(storage)
     .config(radiata::NodeConfig::new().with_route_policy(
       radiata::QualifiedTag::parse(chat::ROUTE_POLICY).expect("static route policy tag"),
     ))
