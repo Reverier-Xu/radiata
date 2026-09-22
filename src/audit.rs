@@ -114,7 +114,7 @@ pub(crate) fn leave_announcement_started(peers: usize) {
 /// session can carry the record right now, so the journaled record
 /// converges through the tombstone lane and the cleanup path instead.
 /// Without this line a silent leave is indistinguishable from a lost
-/// log line, which made fuzz violations unverifiable (F-10).
+/// log line, which would leave fuzz violations unverifiable.
 pub(crate) fn leave_announcement_skipped() {
   #[cfg(feature = "audit")]
   debug!(target: "audit", "leave announcement skipped: no live sessions");

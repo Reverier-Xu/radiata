@@ -5,15 +5,17 @@ Copy this into every reviewer child's task, then append the lane-specific
 
 ````text
 You are a senior Rust code quality reviewer. The crate under review is
-"radiata" at /home/reverier/Code/Rust/radiata — a Rust 2024 library
+"radiata", the Rust 2024 library at the repository root you were launched
+from — resolve every path below relative to that root. It is a library
 for authenticated cluster connectivity, opaque packet streams, and convergent
-core metadata. Its roadmap (docs/roadmap.md) defines planned module
-boundaries: identity (IDs, admission, trust), protocol (prelude,
+core metadata. The module layout itself defines the responsibility
+boundaries: identity (IDs, admission, trust, key custody), protocol (prelude,
 deterministic CBOR, feature intersection), transport (TLS/WS sessions),
-membership, topology, routing, resource, storage (internal metadata), node
-(builder, lifecycle, typed bus). Project principles: forbid unsafe, no
-unwrap()/expect() in production, minimal deliberate public API, simplest
-design that preserves ownership.
+membership, resource, routing, storage (internal metadata), node (builder,
+lifecycle, typed bus). Each module's rustdoc header states its ownership
+contract — treat it as the authority for boundary judgments. Project
+principles: forbid unsafe, no unwrap()/expect() in production, minimal
+deliberate public API, simplest design that preserves ownership.
 
 Review ONLY the files assigned to you. Read them fully (use the read tool;
 files may exceed 2000 lines so read in chunks). Analyze the code against
@@ -24,7 +26,7 @@ these 7 quality dimensions:
    exactly one impl that no other type implements; pub functions that only
    forward to a private twin.
 2. CROSS-MODULE RESPONSIBILITY COUPLING: module A reaching into module B's
-   internals; work done in the wrong module per the roadmap boundaries;
+   internals; work done in the wrong module per the ownership boundaries;
    mod A knowing B's private types; circular conceptual dependency.
 3. DUPLICATED HELPER LOGIC: the same logic reimplemented in multiple
    files/modules — canonical text encoding, hex/base64 helpers, time
@@ -58,22 +60,21 @@ Keep report under ~450 lines.
 
 ## Lane Templates
 
-### protocol + identity
+Use directory globs so the lanes survive ordinary file churn; the reviewing
+child should enumerate the exact files itself with `ls`/`rg` before reading.
+
+### protocol + identity + keys
 
 ```text
-FILES YOU OWN (protocol + identity):
-- src/protocol/mod.rs, src/protocol/cbor.rs, src/protocol/credential.rs,
-  src/protocol/envelope.rs, src/protocol/feature.rs, src/protocol/handshake.rs,
-  src/protocol/offer.rs, src/protocol/selection.rs, src/protocol/tag.rs,
-  src/protocol/wire.rs
-- src/identity/mod.rs, src/identity/admission.rs, src/identity/admission_rate.rs,
-  src/identity/credential.rs, src/identity/deletion.rs, src/identity/genesis.rs,
-  src/identity/id.rs, src/identity/lifecycle.rs, src/identity/records.rs,
-  src/identity/signature.rs, src/identity/testing.rs, src/identity/value.rs
+FILES YOU OWN (protocol + identity + keys):
+- everything under src/protocol/
+- everything under src/identity/
+- everything under src/keys/
 
 Pay special attention to: handshake state machine vs selection/offer
 duplication; credential handling split between protocol/credential.rs and
-identity/credential.rs; admission_rate logic duplication; if-else chains on
+identity/credential.rs; merge vs merge_rate logic duplication; revocation,
+leave, and cleanup flows sharing half-written logic; if-else chains on
 string kind/schema identifiers; hardcoded magic strings in feature labels,
 tags, wire kinds.
 ```
@@ -82,34 +83,51 @@ tags, wire kinds.
 
 ```text
 FILES YOU OWN (transport + session + packet + node):
-- src/transport/mod.rs, cert.rs, connection.rs, connection/tests.rs,
-  endpoint.rs, tls.rs, verify.rs, ws.rs
-- src/session/mod.rs, driver.rs, stream.rs, tests.rs
-- src/packet/mod.rs, wire.rs
-- src/node/mod.rs, builder.rs, event.rs, handle.rs
+- everything under src/transport/ (including transport/connection/tests.rs)
+- everything under src/session/
+- everything under src/packet/
+- everything under src/node/
 
 Pay special attention to: session driver vs stream responsibilities; endpoint
-vs connection thin wrappers; TLS/verify/ws separation; packet wire encoding
-vs protocol/wire.rs duplication; node builder coupling to session/transport
-internals; hardcoded strings in connection setup and error messages.
+vs connection thin wrappers; TLS/verify/ws separation; the transport registry
+vs hardcoded transport wiring; packet wire encoding vs protocol/wire.rs
+duplication; node builder coupling to session/transport internals; hardcoded
+strings in connection setup and error messages.
+```
+
+### membership + resource + routing
+
+```text
+FILES YOU OWN (membership + resource + routing):
+- src/membership.rs and everything under src/membership/
+- everything under src/resource/
+- src/routing.rs and everything under src/routing/
+- src/sync_common.rs
+
+Pay special attention to: page assembly and watermark logic duplicated
+between membership/sync.rs and resource/sync.rs; shared sync logic leaking
+between sync_common.rs and its two consumers; routing table vs forward vs
+outbound responsibilities; selector matching special-casing; recovery
+fan-out logic vs runtime/recovery.rs; hardcoded label/uri/wire-kind strings.
 ```
 
 ### storage + provider + runtime + simulation
 
 ```text
 FILES YOU OWN (storage + provider + runtime + simulation):
-- src/storage/mod.rs, contract.rs, pending.rs, receipt.rs, json/*.rs
+- everything under src/storage/ (contract/, json/, redb/, and top-level files)
 - src/provider.rs
-- src/runtime/mod.rs, lifecycle.rs, supervisor.rs
-- src/simulation/mod.rs, artifact.rs, event.rs, fixture.rs, network.rs,
-  redaction.rs, scenario.rs, topology.rs
+- everything under src/runtime/
+- everything under src/simulation/
 
-Pay special attention to: oversized contract.rs — is it a god-module;
-json/helpers.rs vs json/document.rs vs store.rs helper overlap; pending.rs
-vs receipt.rs vs contract.rs transaction logic duplication; provider.rs thin
-wrappers; simulation/network.rs vs topology.rs overlap; hardcoded string keys
-in JSON documents, storage families, redaction categories; if-else chains on
-family/kind identifiers.
+Pay special attention to: the contract/ suite's runner vs engine split —
+is either a god-module; json/helpers.rs vs json/document.rs vs store.rs
+helper overlap; pending.rs vs receipt.rs vs contract/ transaction logic
+duplication; the json and redb adapters staying symmetric (one growing
+behavior the other lacks); provider.rs thin wrappers; runtime/ modules
+reaching into storage or session internals; simulation/network.rs vs
+topology.rs overlap; hardcoded string keys in JSON documents, storage
+families, redaction categories; if-else chains on family/kind identifiers.
 ```
 
 ### facade + cross-cutting
@@ -118,6 +136,8 @@ family/kind identifiers.
 FILES YOU OWN (facade + cross-cutting duplication scan):
 - src/lib.rs, src/api.rs, src/config.rs, src/error.rs, src/operation.rs,
   src/view.rs, src/extension_registry.rs
+- src/audit.rs, src/compatibility.rs, src/fuzz_adapters.rs, src/guide.rs,
+  src/hex.rs, src/label.rs, src/paging.rs, src/time.rs
 - PLUS a cross-module duplication scan across the ENTIRE src/ tree: use
   grep/bash to find repeated helper logic — 'fn encode', 'hex', 'base64',
   'canonical', id to_string, time conversion, error mapping, limit checks,

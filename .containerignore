@@ -1,6 +1,5 @@
 target/
 .git/
-docs/
 slo/
 fuzz/
 scripts/

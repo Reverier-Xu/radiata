@@ -795,7 +795,7 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   }
 }
 
-/// Recovery pruning (D10): losing the hub meshes the leaves through
+/// Recovery pruning: losing the hub meshes the leaves through
 /// recovery-dialed edges; the restarted hub re-dials the leaves (marked
 /// on the hub, inbound on the leaves), and each leaf then prunes its
 /// recovery-dialed leaf-leaf edge because an inbound anchor edge keeps

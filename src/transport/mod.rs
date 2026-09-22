@@ -4,9 +4,9 @@
 //! the public facade; only the [`Endpoint`] value type crosses the crate
 //! boundary (re-exported at the crate root). Ownership boundaries:
 //!
-//! - [`tls`] builds the TLS 1.3-only rustls client/server configurations: ring
-//!   provider, no TLS 1.2 (the rustls `tls12` feature is not compiled in), no
-//!   early data, no session resumption, no ALPN requirement.
+//! - [`tls`] builds the TLS 1.3-only rustls client/server configurations:
+//!   aws-lc-rs provider, no TLS 1.2 (the rustls `tls12` feature is not compiled
+//!   in), no early data, no session resumption, no ALPN requirement.
 //! - [`verify`] holds the security-critical server certificate verifier: join
 //!   mode relaxes chain and hostname trust, but every mode fully validates the
 //!   TLS 1.3 `CertificateVerify` signature. There is no accept-anything path.

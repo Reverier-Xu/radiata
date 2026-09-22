@@ -2,9 +2,9 @@
 //!
 //! Every bootstrap and member session uses TLS 1.3:
 //!
-//! - The provider is rustls's `ring` provider. The rustls `tls12` feature is
-//!   not compiled in, so the provider exposes only TLS 1.3 cipher suites; both
-//!   configurations additionally pin `&[&TLS13]` explicitly. A TLS 1.2
+//! - The provider is rustls's `aws_lc_rs` provider. The rustls `tls12` feature
+//!   is not compiled in, so the provider exposes only TLS 1.3 cipher suites;
+//!   both configurations additionally pin `&[&TLS13]` explicitly. A TLS 1.2
 //!   ClientHello therefore cannot negotiate.
 //! - Early data is off: the server keeps `max_early_data_size = 0` and the
 //!   client keeps `enable_early_data = false`.
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use rustls::{
   ClientConfig, ServerConfig,
   client::Resumption,
-  crypto::{CryptoProvider, ring::default_provider},
+  crypto::{CryptoProvider, aws_lc_rs::default_provider},
   pki_types::SubjectPublicKeyInfoDer,
   server::NoServerSessionStorage,
   version::TLS13,
@@ -35,7 +35,7 @@ use super::{
 };
 use crate::{Error, Result};
 
-/// The ring-backed TLS 1.3-only provider.
+/// The aws-lc-rs-backed TLS 1.3-only provider.
 pub(crate) fn crypto_provider() -> Arc<CryptoProvider> {
   Arc::new(default_provider())
 }

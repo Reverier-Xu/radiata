@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scenario fuzz harness for the chat example cluster (P2-9).
+"""Scenario fuzz harness for the chat example cluster.
 
 Model-driven stateful fuzzing over the chat HTTP surface: a random
 (but seed-reproducible) sequence of atomic cluster operations — merge,
@@ -48,7 +48,7 @@ POLL = 0.5
 # 60 s window, and on a single-host mesh every container's dial shares
 # one normalized source address: the deterministic pre-merge fan-in is
 # paced in waves that fit the window instead of riding the per-join
-# retry deadline into timing-dependent rejections (F-11). One under the
+# retry deadline into timing-dependent rejections. One under the
 # limit covers handshake retries inside a single join command.
 MERGE_WINDOW_S = 61.0
 MERGE_WAVE = 15
@@ -91,7 +91,7 @@ def podman_logs(node: int, since_epoch: float) -> str:
 
 def log_stream_stale(node: int, since: float) -> bool:
   """The node's newest log line predates the operation: the container's
-  log stream died mid-run (F-9 class: single-host container logging is
+  log stream died mid-run (single-host container logging is
   lossy — full-debug host-wide windows, per-stream deaths), so a missing
   path line is unverifiable rather than a violation. A live stream
   always carries at least the operation's own audit lines."""
@@ -197,7 +197,7 @@ class Checker:
     )
     # A dead log stream cannot prove or disprove the event: on a
     # single-host mesh the container log pipeline occasionally kills one
-    # stream mid-run while the process keeps working (F-9/F-10 class).
+    # stream mid-run while the process keeps working.
     # Degrade to a warning; the operation's state assertions and the
     # peer-side propagation checks already gated the outcome. A
     # multi-node target needs every stream alive to convict: the

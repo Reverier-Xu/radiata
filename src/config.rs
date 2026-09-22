@@ -245,7 +245,7 @@ impl ParserLimits {
 impl Default for ParserLimits {
   fn default() -> Self {
     Self {
-      frame_bytes: crate::protocol::ADR0002_BODY_BYTES,
+      frame_bytes: crate::protocol::MAX_BODY_BYTES,
       depth: 16,
       collection_items: 1_024,
     }

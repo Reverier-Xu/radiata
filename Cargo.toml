@@ -17,6 +17,11 @@ json    = ["dep:fs4", "dep:rustix", "dep:serde", "dep:serde_json"]
 redb    = ["dep:redb"]
 
 [dependencies]
+# Feature plumbing only: enables aws-lc-sys's prebuilt NASM objects so
+# Windows x86-64 source builds do not require an installed NASM assembler.
+aws-lc-rs = { version = "1", default-features = false, features = [
+  "prebuilt-nasm",
+] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "3.0", default-features = false, features = [
   "fast",
@@ -30,18 +35,21 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await",
   "sink",
 ] }
-getrandom = "0.4"
 hkdf = "0.13"
 hmac = "0.13"
 minicbor = { version = "2.3", features = ["derive", "std"] }
+rand = { version = "0.10", default-features = false, features = [
+  "std",
+  "sys_rng",
+] }
 rcgen = { version = "0.14", default-features = false, features = [
   "crypto",
-  "ring",
+  "aws_lc_rs",
 ] }
 redb = { version = "4.2", optional = true }
 rustls = { version = "0.23", default-features = false, features = [
   "std",
-  "ring",
+  "aws_lc_rs",
 ] }
 secrecy = { version = "0.10", default-features = false }
 serde = { version = "1.0", features = ["derive"], optional = true }
@@ -60,7 +68,7 @@ tokio = { version = "1.53", features = [
   "macros",
 ] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
-  "ring",
+  "aws_lc_rs",
 ] }
 tokio-stream = { version = "0.1", default-features = false, features = [
   "sync",

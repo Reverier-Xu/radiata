@@ -187,7 +187,7 @@ async fn session_merge_then_member_reconnect_round_trips() {
   assert_ne!(view.node(), &issuer_id);
 
   // A fresh merger replaying the same credential generation succeeds:
-  // one live generation admits any number of subjects (D8); the durable
+  // one live generation admits any number of subjects; the durable
   // commit layer owns per-subject replay refusal.
   let second = node().await;
   let (address, second_responder) = listen(&receiver, true).await;
@@ -256,7 +256,7 @@ async fn session_merge_rejects_wrong_credential_without_consuming() {
 
   // The generation is untouched by the failed proof: the same live
   // credential remains derivable for the next attempt (no consumption,
-  // no reservation — D8).
+  // no reservation).
   assert!(responder.await.unwrap().is_err());
   let guard = receiver.issuer.lock().unwrap();
   assert!(

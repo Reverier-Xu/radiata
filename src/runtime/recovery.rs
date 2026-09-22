@@ -117,7 +117,7 @@ impl Supervisor {
     }
     Ok(selected)
   }
-  /// Bounded pruning of recovery-accumulated redundant edges (D10).
+  /// Bounded pruning of recovery-accumulated redundant edges.
   /// While connected, retires at most one recovery-dialed session per
   /// cooldown, choosing the highest peer id deterministically. An edge is
   /// pruned only while at least one caller-configured or inbound session

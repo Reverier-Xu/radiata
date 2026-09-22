@@ -1,18 +1,18 @@
 #![cfg(feature = "redb")]
 
-//! Scale benchmark for the ack-gated anti-entropy planes (P0-2) and
-//! the per-key resource watermark (P2-3).
+//! Scale benchmark for the ack-gated anti-entropy planes and the
+//! per-key resource watermark.
 //!
 //! Measures convergence time of the resource sync plane at
 //! 512–4096 resources × 8–16 members on loopback, the failure
 //! shape of a flapping peer (session churn resolving ack verdicts as
-//! undelivered), and the P2-3 watermark acceptance sample: exactly one
+//! undelivered), and the watermark acceptance sample: exactly one
 //! write into a converged mid-size catalog must converge within one
 //! detection cadence window plus an amortized scan walk — not the full
 //! catalog re-send cycle the previous fingerprint design paid on every
 //! quiet window. The matrix quantifies whether the per-page admission
 //! ack wait (2s bound) changes convergence or steady-state behavior at
-//! scale, replacing the archived loopback baseline.
+//! scale.
 //!
 //! Run: cargo test --release --test sync_scale_benchmark -- --ignored
 //! --nocapture
@@ -321,7 +321,7 @@ async fn sync_ack_convergence_matrix() {
   }
 }
 
-/// The P2-3 watermark acceptance sample: a converged 4096-record
+/// The watermark acceptance sample: a converged 4096-record
 /// catalog receives exactly one mid-catalog write. The sample must be
 /// one detection cadence window plus an amortized scan walk (a single
 /// changed page) — orders of magnitude below the full-catalog re-send
@@ -372,7 +372,7 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
 
   // Flap the last leaf's session to the hub every two seconds while the
   // survivors converge: every flap resolves in-flight admissions as
-  // undelivered and the next tick re-delivers from scratch (D2).
+  // undelivered and the next tick re-delivers from scratch.
   let flap_id = nodes[0].id.clone();
   let flap = nodes[nodes.len() - 1].handle.clone();
   let flapper = tokio::spawn(async move {

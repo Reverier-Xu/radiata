@@ -423,8 +423,8 @@ def main() -> None:
 
     print("=== E8.5 disconnect is not a departure ===")
     # Owner decisions: DisconnectPeer only tears the session down — it is
-    # not a removal from the cluster; and under D1 (any one route
-    # suffices) a node that keeps any authenticated path stays Connected
+    # not a removal from the cluster; and under the any-one-route
+    # contract a node that keeps any authenticated path stays Connected
     # and never re-expands its topology — only a fully isolated member
     # re-dials. So after a one-sided teardown the edge returns only when
     # the drop isolated an endpoint; otherwise the cluster simply routes
@@ -460,11 +460,12 @@ def main() -> None:
         print(f"[heal] isolated endpoint re-connected by recovery in "
               f"{report['disconnect_self_heal_seconds']:.0f}s")
     else:
-        # Both sides kept other routes: D1 leaves the dropped edge down
-        # and the cluster routes around it — assert exactly that.
+        # Both sides kept other routes: the any-one-route contract leaves
+        # the dropped edge down and the cluster routes around it — assert
+        # exactly that.
         report["disconnect_self_heal_seconds"] = None
         print(f"[heal] both endpoints stayed connected (sessions "
-              f"{sessions_of(1)}/{sessions_of(2)}); the dropped edge is not re-dialed (D1)")
+              f"{sessions_of(1)}/{sessions_of(2)}); the dropped edge is not re-dialed")
     # And the whole cluster still converges after the edge dance.
     digest = write_resource(2, "demo.org/resources/post-heal-check", "converged")
     converge(list(range(1, N + 1)), "demo.org/resources/post-heal-check", digest)

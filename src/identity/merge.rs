@@ -834,7 +834,7 @@ mod tests {
       }
     }
 
-    // Same generation with another subject admits independently (D8):
+    // Same generation with another subject admits independently:
     // the use record is subject-scoped, so replay refusal applies to the
     // (generation, subject) pair, not the generation.
     let mut other_subject = proposal(13, &fixture.entropy);
@@ -908,8 +908,8 @@ mod tests {
         let grant = result.unwrap();
         grant.verify(context.identity().public_key()).unwrap();
         assert!(pending_keys(&reference).is_empty());
-        // The same generation admits a second subject independently
-        // (D8); the committed first merge survives.
+        // The same generation admits a second subject independently;
+        // the committed first merge survives.
         let mut second = proposal(18, &entropy);
         set_generation(&mut second, proposal_generation(&first).clone());
         commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &second)
@@ -1163,7 +1163,7 @@ mod tests {
       );
 
       // A second subject for the same generation now admits: one
-      // generation may commit any number of distinct subjects (D8); the
+      // generation may commit any number of distinct subjects; the
       // use record is subject-scoped, so only same-subject replays
       // classify against it.
       let mut another = proposal(47, &entropy);

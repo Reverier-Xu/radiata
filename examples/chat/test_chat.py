@@ -317,7 +317,7 @@ def phase_hub_death_recovery(report: dict) -> None:
     # Recovery is an observation, not a per-sample SLO: the wall clock
     # here includes two container restarts and the recovery backoff.
     report["hub_death_recovery_seconds"] = round(time.monotonic() - recovery_started, 1)
-    # Recovery pruning (D10): the leaf-leaf edges the outage accumulated
+    # Recovery pruning: the leaf-leaf edges the outage accumulated
     # are retired once the hub edge anchors each leaf again; every leaf
     # settles back to exactly one session (the hub).
     # The re-formed star may re-center on ANY member (the deterministic

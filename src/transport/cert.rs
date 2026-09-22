@@ -6,10 +6,10 @@
 //! identity or trust record; it may change on every restart and on every
 //! `Listen`.
 //!
-//! Algorithm choice: Ed25519. rcgen's `ring` crypto backend supports Ed25519
-//! signing and PKCS#8 import, so the certificate key shares no code path
-//! with the durable identity key even though both use Ed25519. (ECDSA P-256
-//! would be the fallback if ring Ed25519 support were
+//! Algorithm choice: Ed25519. rcgen's `aws_lc_rs` crypto backend supports
+//! Ed25519 signing and PKCS#8 import, so the certificate key shares no code
+//! path with the durable identity key even though both use Ed25519. (ECDSA
+//! P-256 would be the fallback if aws-lc-rs Ed25519 support were
 //! unavailable.) The 32-byte seed comes entirely from the injected
 //! [`Entropy`]; rcgen's own randomness is only used internally for ECDSA
 //! key import, which Ed25519 never touches.
