@@ -197,7 +197,8 @@ async fn start_node(
 ) -> (NodeHandle, Endpoint) {
   let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let keys: Arc<dyn radiata::extension::KeyProvider> = Arc::new(ScriptedKeys::full_at(key_seed));
-  let handle = NodeBuilder::new(storage, keys)
+  let handle = NodeBuilder::new(storage)
+    .keys(keys)
     .config(NodeConfig::new())
     .extensions(extensions)
     .start()

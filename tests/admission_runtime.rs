@@ -33,7 +33,8 @@ async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Nod
   // exclusive-open flag under load, so the open is retried to a deadline.
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
   loop {
-    match NodeBuilder::new(factory.clone(), keys.clone())
+    match NodeBuilder::new(factory.clone())
+      .keys(keys.clone())
       .start()
       .await
     {

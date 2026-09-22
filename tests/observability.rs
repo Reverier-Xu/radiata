@@ -67,7 +67,8 @@ async fn start_node(seed: u64) -> Node {
   let config = NodeConfig::new()
     .with_anti_entropy_interval(Duration::from_millis(50))
     .unwrap();
-  let handle = NodeBuilder::new(factory, keys)
+  let handle = NodeBuilder::new(factory)
+    .keys(keys)
     .config(config)
     .start()
     .await
@@ -266,7 +267,8 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     let config = NodeConfig::new()
       .with_anti_entropy_interval(Duration::from_millis(50))
       .unwrap();
-    let handle = NodeBuilder::new(factory, keys)
+    let handle = NodeBuilder::new(factory)
+      .keys(keys)
       .config(config)
       .start()
       .await

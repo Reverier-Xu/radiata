@@ -108,7 +108,8 @@ async fn start_node(seed: u64, sink: Arc<Sink>) -> (NodeHandle, Endpoint) {
       sink,
     )
     .unwrap();
-  let handle = NodeBuilder::new(storage, keys)
+  let handle = NodeBuilder::new(storage)
+    .keys(keys)
     .config(config)
     .extensions(extensions)
     .start()

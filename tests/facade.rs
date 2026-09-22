@@ -91,7 +91,7 @@ async fn start_node(seed: u64, echo: bool) -> Node {
   let config = NodeConfig::new()
     .with_anti_entropy_interval(SYNC_INTERVAL)
     .unwrap();
-  let mut builder = NodeBuilder::new(storage, keys).config(config);
+  let mut builder = NodeBuilder::new(storage).keys(keys).config(config);
   if echo {
     let mut extensions = radiata::ExtensionRegistry::new();
     extensions
@@ -330,7 +330,8 @@ async fn resources_revoke_and_leave() {
   let issuer_storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let issuer_keys = Arc::new(LeaveCapableKeys::default());
   let provider: Arc<dyn KeyProvider> = issuer_keys.clone();
-  let issuer_handle = NodeBuilder::new(issuer_storage, provider)
+  let issuer_handle = NodeBuilder::new(issuer_storage)
+    .keys(provider)
     .config(
       NodeConfig::new()
         .with_anti_entropy_interval(SYNC_INTERVAL)

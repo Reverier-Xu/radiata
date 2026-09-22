@@ -115,7 +115,7 @@ async fn start_node_with_keys(
       RecoveryConfig::new(64, Duration::from_secs(2), Duration::from_secs(60)).unwrap(),
     )
     .unwrap();
-  let mut builder = NodeBuilder::new(factory, keys).config(config);
+  let mut builder = NodeBuilder::new(factory).keys(keys).config(config);
   if let Some(echo) = echo {
     let mut extensions = radiata::ExtensionRegistry::new();
     extensions

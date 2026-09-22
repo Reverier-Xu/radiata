@@ -656,7 +656,13 @@ pub(crate) fn fresh_reference() -> (Arc<ReferenceFactory>, Arc<dyn StorageFactor
 pub(crate) async fn open_context(
   factory: &Arc<dyn StorageFactory>, keys: &Arc<ScriptedKeys>, entropy: &Arc<SequenceEntropy>,
 ) -> Result<LocalIdentityContext> {
-  open_local_identity(factory, &keys.as_provider(), entropy.as_ref(), RETENTION).await
+  open_local_identity(
+    factory,
+    Some(&keys.as_provider()),
+    entropy.as_ref(),
+    RETENTION,
+  )
+  .await
 }
 
 pub(crate) fn node(value: u128) -> NodeId {

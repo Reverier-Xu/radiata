@@ -131,7 +131,7 @@ async fn merge_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radia
 async fn start(storage: Arc<MemoryStorageFactory>, keys: Arc<ScriptedKeys>) -> Node {
   init_tracing();
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage;
-  let handle = NodeBuilder::new(factory, keys).start().await.unwrap();
+  let handle = NodeBuilder::new(factory).keys(keys).start().await.unwrap();
   Node {
     handle,
     _keys: Arc::new(ScriptedKeys::full()),
@@ -140,13 +140,11 @@ async fn start(storage: Arc<MemoryStorageFactory>, keys: Arc<ScriptedKeys>) -> N
 
 #[cfg(all(unix, feature = "json"))]
 async fn start_json(dir: &TempDir, keys: Arc<ScriptedKeys>) -> Node {
-  let handle = NodeBuilder::new(
-    radiata::adapters::json_store(dir.path().to_path_buf()),
-    keys,
-  )
-  .start()
-  .await
-  .unwrap();
+  let handle = NodeBuilder::new(radiata::adapters::json_store(dir.path().to_path_buf()))
+    .keys(keys)
+    .start()
+    .await
+    .unwrap();
   Node {
     handle,
     _keys: Arc::new(ScriptedKeys::full()),
@@ -395,7 +393,8 @@ async fn start_with_protocol(
   let mut extensions = ExtensionRegistry::new();
   extensions.register_protocol(definition, consumer).unwrap();
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage;
-  NodeBuilder::new(factory, keys)
+  NodeBuilder::new(factory)
+    .keys(keys)
     .extensions(extensions)
     .start()
     .await
@@ -441,7 +440,8 @@ async fn start_with_protocol_result(
   let mut extensions = ExtensionRegistry::new();
   extensions.register_protocol(definition, consumer)?;
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage;
-  NodeBuilder::new(factory, keys)
+  NodeBuilder::new(factory)
+    .keys(keys)
     .extensions(extensions)
     .start()
     .await
@@ -857,7 +857,8 @@ async fn start_with_config<C: radiata::PacketConsumer + Send + Sync + 'static>(
   let mut extensions = ExtensionRegistry::new();
   extensions.register_protocol(definition, consumer).unwrap();
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage;
-  NodeBuilder::new(factory, keys)
+  NodeBuilder::new(factory)
+    .keys(keys)
     .extensions(extensions)
     .config(config)
     .start()
@@ -872,7 +873,8 @@ async fn start_with_reply_consumer(
   let mut extensions = ExtensionRegistry::new();
   extensions.register_protocol(definition, consumer).unwrap();
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage;
-  NodeBuilder::new(factory, keys)
+  NodeBuilder::new(factory)
+    .keys(keys)
     .extensions(extensions)
     .start()
     .await

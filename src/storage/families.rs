@@ -24,6 +24,11 @@ pub(crate) const KEY_DELETION_INTENT_NAMESPACE: &str =
   "radiata.woooo.tech/metadata/key-deletion-intent-v1";
 /// Committed key deletion outcome per provider handle.
 pub(crate) const KEY_DELETED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-deleted-v1";
+/// Custodial Ed25519 seed material per custody operation: the default
+/// [`crate::keys::MetadataKeyStore`]'s durable artifact, one row per
+/// operation id. Swept only by the provider's own deletion flow, never
+/// by a domain wipe.
+pub(crate) const KEY_SEED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-seed-v1";
 /// One issuer trust snapshot per issuer and revision.
 pub(crate) const TRUST_SNAPSHOT_NAMESPACE: &str = "radiata.woooo.tech/metadata/trust-snapshot-v1";
 /// Local authorization revocation per exact subject binding.
@@ -76,6 +81,9 @@ mod catalog {
     Identity,
     /// Key custody intents and their committed outcomes.
     KeyIntent,
+    /// Key custody seed material (the default key store's durable
+    /// artifact), removable only through the provider deletion flow.
+    Custody,
     /// Issuer trust snapshots.
     Trust,
     /// Owner-revision-marked node descriptors.
@@ -126,7 +134,7 @@ mod catalog {
   use super::{
     CHECKPOINT_NAMESPACE, CLEANUP_NAMESPACE, CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE,
     INTERNAL_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE,
-    KEY_DELETION_INTENT_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
+    KEY_DELETION_INTENT_NAMESPACE, KEY_SEED_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
     MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE,
     REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE, TRUST_SNAPSHOT_NAMESPACE,
   };
@@ -145,6 +153,7 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_CREATION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETED_NAMESPACE),
+      MetadataFamily::new(MetadataDomain::Custody, KEY_SEED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Trust, TRUST_SNAPSHOT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Node, NODE_DESCRIPTOR_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Resource, RESOURCE_RECORD_NAMESPACE),
@@ -183,6 +192,7 @@ mod catalog {
       for domain in [
         MetadataDomain::Identity,
         MetadataDomain::KeyIntent,
+        MetadataDomain::Custody,
         MetadataDomain::Trust,
         MetadataDomain::Node,
         MetadataDomain::Resource,

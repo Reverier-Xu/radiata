@@ -1008,7 +1008,7 @@ mod tests {
     let context = Arc::new(
       lifecycle::open_local_identity(
         &factory,
-        &keys.as_provider(),
+        Some(&keys.as_provider()),
         entropy.as_ref(),
         Duration::from_secs(10),
       )

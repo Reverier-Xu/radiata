@@ -17,11 +17,12 @@ use std::{collections::BTreeMap, fmt, sync::Mutex};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 
-use super::{custody_corrupt, handle_for, operation_from_handle, validate_delete_pair};
+use super::{
+  custody_corrupt, fresh_secret, handle_for, operation_from_handle, validate_delete_pair,
+};
 use crate::{
-  BoxFuture, CreatedKey, Error, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, ProviderErrorContext, ProviderErrorKind, PublicKey, Result, Signature,
-  provider::KeyProvider,
+  BoxFuture, CreatedKey, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
+  KeyOperationId, ProviderErrorContext, PublicKey, Result, Signature, provider::KeyProvider,
 };
 
 /// The process-lifetime key store: all custody is lost when the value
@@ -160,13 +161,6 @@ impl KeyProvider for EphemeralKeyStore {
       })
     })
   }
-}
-
-fn fresh_secret() -> Result<zeroize::Zeroizing<[u8; 32]>> {
-  let mut secret = zeroize::Zeroizing::new([0_u8; 32]);
-  getrandom::fill(&mut secret[..])
-    .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::Entropy))?;
-  Ok(secret)
 }
 
 #[cfg(test)]

@@ -160,7 +160,7 @@ fn temp_files(dir: &Path) -> Vec<String> {
 async fn start(
   factory: Arc<dyn StorageFactory>, keys: Arc<DeterministicKeys>,
 ) -> radiata::Result<radiata::NodeHandle> {
-  NodeBuilder::new(factory, keys).start().await
+  NodeBuilder::new(factory).keys(keys).start().await
 }
 
 #[cfg(unix)]

@@ -117,7 +117,7 @@ impl KeyProvider for DeterministicKeys {
 async fn start(
   factory: Arc<dyn StorageFactory>, keys: Arc<DeterministicKeys>,
 ) -> Result<NodeHandle> {
-  NodeBuilder::new(factory, keys).start().await
+  NodeBuilder::new(factory).keys(keys).start().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

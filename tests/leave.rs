@@ -226,7 +226,7 @@ async fn leave_replaces_identity_and_shuts_down_with_active_leave() {
     common::required_capabilities(),
   ));
   let keys: Arc<dyn KeyProvider> = Arc::new(LeaveKeys::default());
-  let handle = NodeBuilder::new(storage, keys).start().await.unwrap();
+  let handle = NodeBuilder::new(storage).keys(keys).start().await.unwrap();
   handle
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
@@ -304,20 +304,16 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   let leaver_storage = Arc::new(common::MemoryStorageFactory::new(
     common::required_capabilities(),
   ));
-  let listener = NodeBuilder::new(
-    listener_storage,
-    Arc::new(LeaveKeys::with_base(100)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
-  let leaver = NodeBuilder::new(
-    leaver_storage,
-    Arc::new(LeaveKeys::with_base(200)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
+  let listener = NodeBuilder::new(listener_storage)
+    .keys(Arc::new(LeaveKeys::with_base(100)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
+  let leaver = NodeBuilder::new(leaver_storage)
+    .keys(Arc::new(LeaveKeys::with_base(200)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
   let endpoint = listener
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
@@ -420,27 +416,21 @@ async fn recovery_quiesces_after_a_member_departs() {
   let c_storage = Arc::new(common::MemoryStorageFactory::new(
     common::required_capabilities(),
   ));
-  let a = NodeBuilder::new(
-    a_storage,
-    Arc::new(LeaveKeys::with_base(300)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
-  let b = NodeBuilder::new(
-    b_storage,
-    Arc::new(LeaveKeys::with_base(400)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
-  let c = NodeBuilder::new(
-    c_storage,
-    Arc::new(LeaveKeys::with_base(500)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
+  let a = NodeBuilder::new(a_storage)
+    .keys(Arc::new(LeaveKeys::with_base(300)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
+  let b = NodeBuilder::new(b_storage)
+    .keys(Arc::new(LeaveKeys::with_base(400)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
+  let c = NodeBuilder::new(c_storage)
+    .keys(Arc::new(LeaveKeys::with_base(500)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
   let a_endpoint = a
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
@@ -507,20 +497,16 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
   let b_storage = Arc::new(common::MemoryStorageFactory::new(
     common::required_capabilities(),
   ));
-  let a = NodeBuilder::new(
-    a_storage,
-    Arc::new(LeaveKeys::with_base(600)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
-  let b = NodeBuilder::new(
-    b_storage,
-    Arc::new(LeaveKeys::with_base(700)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
+  let a = NodeBuilder::new(a_storage)
+    .keys(Arc::new(LeaveKeys::with_base(600)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
+  let b = NodeBuilder::new(b_storage)
+    .keys(Arc::new(LeaveKeys::with_base(700)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
   let a_endpoint = a
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
@@ -601,7 +587,8 @@ async fn leave_without_peers_completes_without_waiting() {
   let storage = Arc::new(common::MemoryStorageFactory::new(
     common::required_capabilities(),
   ));
-  let handle = NodeBuilder::new(storage, Arc::new(LeaveKeys::default()))
+  let handle = NodeBuilder::new(storage)
+    .keys(Arc::new(LeaveKeys::default()))
     .start()
     .await
     .unwrap();
@@ -686,13 +673,11 @@ async fn redb_restarted_node_passively_reconnects() {
 async fn restarted_node_passively_reconnects(
   peer_storage: Arc<dyn StorageFactory>, storage: Arc<dyn StorageFactory>,
 ) {
-  let peer = NodeBuilder::new(
-    peer_storage,
-    Arc::new(LeaveKeys::with_base(600)) as Arc<dyn KeyProvider>,
-  )
-  .start()
-  .await
-  .unwrap();
+  let peer = NodeBuilder::new(peer_storage)
+    .keys(Arc::new(LeaveKeys::with_base(600)) as Arc<dyn KeyProvider>)
+    .start()
+    .await
+    .unwrap();
   let peer_endpoint = peer
     .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
     .await
@@ -705,7 +690,8 @@ async fn restarted_node_passively_reconnects(
   // key provider instance is shared across the restart so the scripted
   // keys reproduce the persisted identity.
   let keys: Arc<dyn KeyProvider> = Arc::new(LeaveKeys::with_base(700));
-  let node = NodeBuilder::new(Arc::clone(&storage), keys.clone())
+  let node = NodeBuilder::new(Arc::clone(&storage))
+    .keys(keys.clone())
     .start()
     .await
     .unwrap();
@@ -750,7 +736,8 @@ async fn restarted_node_passively_reconnects(
   // store's exclusive-open flag under load, so the start is retried to a
   // deadline (the established admission-lane pattern).
   let restarted = loop {
-    match NodeBuilder::new(storage.clone(), keys.clone())
+    match NodeBuilder::new(storage.clone())
+      .keys(keys.clone())
       .start()
       .await
     {
@@ -805,7 +792,8 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   let former_handle_bytes;
   let replacement;
   {
-    let handle = NodeBuilder::new(Arc::clone(&storage), provider.clone())
+    let handle = NodeBuilder::new(Arc::clone(&storage))
+      .keys(provider.clone())
       .start()
       .await
       .unwrap();
@@ -838,7 +826,11 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   // Restart on the same store: members, trust, and resources are wiped —
   // the replacement identity is born with its own singleton cluster, so
   // the local view resolves to exactly the replacement.
-  let handle = NodeBuilder::new(storage, provider).start().await.unwrap();
+  let handle = NodeBuilder::new(storage)
+    .keys(provider)
+    .start()
+    .await
+    .unwrap();
   let local = handle.query(radiata::GetLocalNode::new()).await.unwrap();
   assert_eq!(local.node_id(), &replacement);
   assert_ne!(local.node_id(), &former_handle_bytes);

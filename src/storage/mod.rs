@@ -133,7 +133,7 @@ enum CommitState {
 
 #[derive(Debug)]
 pub(crate) struct MetadataStore {
-  provider: Box<dyn Storage>,
+  provider: Arc<dyn Storage>,
   state: Mutex<CommitState>,
   /// The writer exclusion: serializes every read-decide-commit section
   /// (see [`WriterLock`]).
@@ -249,7 +249,7 @@ impl MetadataStore {
     state: CommitState,
   ) -> Result<Self> {
     let requirements = StoreRequirements::metadata();
-    let provider = factory.open(requirements).await?;
+    let provider: Arc<dyn Storage> = factory.open(requirements).await?.into();
     if !provider.capabilities().satisfies(&requirements) {
       return Err(Error::provider(
         ProviderErrorKind::UnsupportedCapability,
@@ -291,6 +291,14 @@ impl MetadataStore {
   pub(crate) fn register_epoch(&self) -> u64 {
     use std::sync::atomic::Ordering;
     self.register_epoch.load(Ordering::Relaxed)
+  }
+
+  /// The shared storage handle this store commits through. The default
+  /// key custody wraps the same instance, so keys and metadata share one
+  /// exclusive lifetime lock and one crash domain. Callers must hold the
+  /// store open for as long as the handle is used.
+  pub(crate) fn provider(&self) -> Arc<dyn Storage> {
+    self.provider.clone()
   }
 
   /// Acquires the writer exclusion: while held, no other task can enter

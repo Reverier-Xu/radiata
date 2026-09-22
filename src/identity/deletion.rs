@@ -680,10 +680,14 @@ mod tests {
       directory.path().to_path_buf(),
     ));
     let entropy = Arc::new(SequenceEntropy::default());
-    let context =
-      crate::identity::lifecycle::open_local_identity(&factory, &keys, entropy.as_ref(), RETENTION)
-        .await
-        .unwrap();
+    let context = crate::identity::lifecycle::open_local_identity(
+      &factory,
+      Some(&keys),
+      entropy.as_ref(),
+      RETENTION,
+    )
+    .await
+    .unwrap();
 
     // A detached key created through the real provider, deleted the way
     // the leave pipeline deletes the former identity key: under the

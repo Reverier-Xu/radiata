@@ -9,21 +9,36 @@ use crate::{
 
 pub struct NodeBuilder {
   storage: Arc<dyn StorageFactory>,
-  keys: Arc<dyn KeyProvider>,
+  /// The caller's custody injection; `None` lets the runtime assemble the
+  /// default store-backed key custody over the opened metadata store.
+  keys: Option<Arc<dyn KeyProvider>>,
   config: NodeConfig,
   entropy: Arc<dyn Entropy>,
   extensions: ExtensionRegistry,
 }
 
 impl NodeBuilder {
-  pub fn new(storage: Arc<dyn StorageFactory>, keys: Arc<dyn KeyProvider>) -> Self {
+  /// Creates a builder over one storage factory. Key custody defaults to
+  /// the store-backed provider over the same storage; pass
+  /// [`NodeBuilder::keys`] to inject a custom [`KeyProvider`] (a file
+  /// store on another volume, an HSM, a cloud KMS).
+  pub fn new(storage: Arc<dyn StorageFactory>) -> Self {
     Self {
       storage,
-      keys,
+      keys: None,
       config: NodeConfig::new(),
       entropy: Arc::new(SystemEntropy),
       extensions: ExtensionRegistry::new(),
     }
+  }
+
+  /// Injects the key custody provider for this node. The same provider
+  /// must back every restart of the node, or the persisted identity can
+  /// no longer sign; without an injection, custody lives in the metadata
+  /// store itself and follows it across restarts and moves.
+  pub fn keys(mut self, keys: Arc<dyn KeyProvider>) -> Self {
+    self.keys = Some(keys);
+    self
   }
 
   pub fn config(mut self, value: NodeConfig) -> Self {

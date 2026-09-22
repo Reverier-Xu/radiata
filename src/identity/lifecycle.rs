@@ -59,6 +59,11 @@ const LOCAL_IDENTITY_PURPOSE: &str = crate::identity::records::LOCAL_IDENTITY_PU
 pub(crate) struct LocalIdentityContext {
   store: MetadataStore,
   identity: LocalIdentityV1,
+  /// The custody provider this identity was opened against: the caller
+  /// injection, or the default store-backed provider assembled over the
+  /// store's own storage handle. Every signature and key operation on
+  /// this identity flows through it.
+  keys: Arc<dyn KeyProvider>,
 }
 
 impl LocalIdentityContext {
@@ -68,6 +73,10 @@ impl LocalIdentityContext {
 
   pub(crate) const fn identity(&self) -> &LocalIdentityV1 {
     &self.identity
+  }
+
+  pub(crate) const fn keys(&self) -> &Arc<dyn KeyProvider> {
+    &self.keys
   }
 
   /// Replaces the in-memory identity after a startup leave resume swapped
@@ -150,12 +159,16 @@ fn expect_exact_self_binding(bytes: &[u8], identity: &LocalIdentityV1) -> Result
 
 /// Opens or creates the local node identity with exact crash recovery.
 ///
-/// `keys` must report ed25519, reconciliation, and deletion capabilities
-/// before any key operation runs. `entropy` supplies every generated node,
-/// operation, and transaction ID. `receipt_retention` is forwarded to the
-/// metadata store's receipt-retention policy.
+/// `keys` is the caller's custody injection; `None` assembles the default
+/// [`MetadataKeyStore`](crate::keys::MetadataKeyStore) over the opened
+/// store's own storage handle, so identity and its key share one durable
+/// root. Either way the provider must report ed25519, reconciliation,
+/// and deletion capabilities before any key operation runs. `entropy`
+/// supplies every generated node, operation, and transaction ID.
+/// `receipt_retention` is forwarded to the metadata store's
+/// receipt-retention policy.
 pub(crate) async fn open_local_identity(
-  factory: &Arc<dyn StorageFactory>, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+  factory: &Arc<dyn StorageFactory>, keys: Option<&Arc<dyn KeyProvider>>, entropy: &dyn Entropy,
   receipt_retention: Duration,
 ) -> Result<LocalIdentityContext> {
   let (store, recovered) =
@@ -171,24 +184,30 @@ pub(crate) async fn open_local_identity(
     )
     .await?;
   }
-  require_key_capabilities(keys)?;
+  let keys: Arc<dyn KeyProvider> = match keys {
+    Some(keys) => keys.clone(),
+    None => Arc::new(crate::keys::metadata::MetadataKeyStore::new(
+      store.provider(),
+    )),
+  };
+  require_key_capabilities(&keys)?;
 
   let snapshot = store.snapshot().await?;
   let local = discover_local_identity(snapshot.as_ref()).await?;
   let intent = discover_key_creation_intent(snapshot.as_ref()).await?;
   let context = match (local, intent) {
     (Some(_), Some(_)) => Err(discovery_corrupt()),
-    (Some((_, identity)), None) => load_existing_identity(store, keys, identity).await,
-    (None, None) => create_identity(store, keys, entropy, snapshot).await,
+    (Some((_, identity)), None) => load_existing_identity(store, &keys, identity).await,
+    (None, None) => create_identity(store, &keys, entropy, snapshot).await,
     (None, Some((stored, intent))) => {
-      resume_identity_creation(store, keys, entropy, stored, intent).await
+      resume_identity_creation(store, &keys, entropy, stored, intent).await
     }
   }?;
   // A pending leave-intent resumes and completes before the node serves:
   // the returned context always reflects the post-leave identity, never a
   // mixed one.
   let mut context = context;
-  if let Some(replacement) = super::leave::resume_if_pending(&context, keys, entropy).await? {
+  if let Some(replacement) = super::leave::resume_if_pending(&context, &keys, entropy).await? {
     context.replace_identity(replacement);
   }
   Ok(context)
@@ -329,7 +348,11 @@ async fn load_existing_identity(
   store: MetadataStore, keys: &Arc<dyn KeyProvider>, identity: LocalIdentityV1,
 ) -> Result<LocalIdentityContext> {
   verify_provider_key(keys, identity.handle(), identity.public_key()).await?;
-  Ok(LocalIdentityContext { store, identity })
+  Ok(LocalIdentityContext {
+    store,
+    identity,
+    keys: keys.clone(),
+  })
 }
 
 /// Creates a fresh identity: generate coordinates, commit the key-creation
@@ -371,7 +394,7 @@ async fn create_identity(
     CommitWithReconcile::Aborted => return Err(Error::conflict("local identity intent commit")),
   }
   let created = create_key_exact(keys, intent.operation()).await?;
-  finalize_identity(store, entropy, intent, value, created).await
+  finalize_identity(store, keys.clone(), entropy, intent, value, created).await
 }
 
 /// Resumes creation from a persisted intent: reconcile the provider
@@ -393,7 +416,7 @@ async fn resume_identity_creation(
       ));
     }
   };
-  finalize_identity(store, entropy, intent, stored, created).await
+  finalize_identity(store, keys.clone(), entropy, intent, stored, created).await
 }
 
 async fn create_key_exact(
@@ -435,8 +458,8 @@ async fn verify_provider_key(
 /// proven abort is accepted only when a fresh snapshot shows the exact final
 /// state.
 async fn finalize_identity(
-  store: MetadataStore, entropy: &dyn Entropy, intent: KeyCreationIntentV1,
-  stored_intent: StoreValue, created: CreatedKey,
+  store: MetadataStore, keys: Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+  intent: KeyCreationIntentV1, stored_intent: StoreValue, created: CreatedKey,
 ) -> Result<LocalIdentityContext> {
   let identity = LocalIdentityV1::new(
     intent.intended_node().clone(),
@@ -500,7 +523,11 @@ async fn finalize_identity(
     "local identity pending cleanup",
   )
   .await?;
-  Ok(LocalIdentityContext { store, identity })
+  Ok(LocalIdentityContext {
+    store,
+    identity,
+    keys,
+  })
 }
 
 /// Accepts a proven-abort finalize only when a fresh snapshot shows the
@@ -720,7 +747,7 @@ mod tests {
     factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>, entropy: Arc<SequenceEntropy>,
   ) -> Result<LocalIdentityContext> {
     let keys: Arc<dyn KeyProvider> = keys;
-    open_local_identity(&factory, &keys, entropy.as_ref(), RETENTION).await
+    open_local_identity(&factory, Some(&keys), entropy.as_ref(), RETENTION).await
   }
 
   fn stored_local(reference: &Arc<ReferenceFactory>) -> Option<LocalIdentityV1> {
@@ -732,6 +759,20 @@ mod tests {
       .entries
       .get(&(namespace, key))
       .map(|value| LocalIdentityV1::decode(value.as_bytes()).unwrap())
+  }
+
+  /// Whether the default custody's seed row exists for one handle in the
+  /// shared reference state.
+  fn stored_seed_row(reference: &Arc<ReferenceFactory>, handle: &crate::KeyHandle) -> bool {
+    let namespace =
+      crate::storage::families::namespace(crate::storage::families::KEY_SEED_NAMESPACE).unwrap();
+    let key = crate::StoreKey::new(handle.expose_provider_handle().into());
+    reference
+      .state
+      .lock()
+      .unwrap()
+      .entries
+      .contains_key(&(namespace, key))
   }
 
   fn stored_intents(reference: &Arc<ReferenceFactory>) -> Vec<KeyCreationIntentV1> {
@@ -791,6 +832,35 @@ mod tests {
     assert_eq!(stored_local(reference).as_ref(), Some(expected));
     assert!(stored_intents(reference).is_empty());
     assert!(!pending_present(reference));
+  }
+
+  #[tokio::test]
+  async fn default_custody_lives_in_the_store_and_reopens_the_same_identity() {
+    let (reference, factory) = fresh_reference();
+    let entropy = Arc::new(SequenceEntropy::default());
+
+    // No provider injected: custody is assembled over the store's own
+    // storage, so the seed row and the identity record share one root.
+    let context = open_local_identity(&factory, None, entropy.as_ref(), RETENTION)
+      .await
+      .unwrap();
+    let identity = context.identity().clone();
+    assert_eq!(stored_local(&reference).as_ref(), Some(&identity));
+    assert!(stored_seed_row(&reference, identity.handle()));
+    drop(context);
+
+    // A reopen over the same storage resolves the same identity through
+    // the default custody, and the context's provider can still sign.
+    let reopened = open_local_identity(&factory, None, entropy.as_ref(), RETENTION)
+      .await
+      .unwrap();
+    assert_eq!(reopened.identity(), &identity);
+    let signature = reopened
+      .keys()
+      .sign(identity.handle(), b"default custody")
+      .await
+      .unwrap();
+    assert_ne!(signature.as_bytes(), &[0u8; 64][..]);
   }
 
   #[tokio::test]

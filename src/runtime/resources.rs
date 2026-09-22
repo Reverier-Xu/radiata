@@ -116,7 +116,7 @@ impl Supervisor {
           writer.clone(),
           0,
           false,
-          &this.dependencies.keys,
+          context.keys(),
           context.identity().handle(),
         )
         .await?;
@@ -253,7 +253,7 @@ impl Supervisor {
           writer.clone(),
           removal_rank,
           true,
-          &this.dependencies.keys,
+          context.keys(),
           context.identity().handle(),
         )
         .await?;
