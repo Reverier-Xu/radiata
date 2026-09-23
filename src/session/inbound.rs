@@ -137,6 +137,7 @@ pub(super) async fn read_loop(
               &context.registry,
               context.route_policy(),
               context.forwarding_capacity(),
+              context.relay_hop_deadline(),
             )
             .await;
           } else if admit_open(
@@ -209,8 +210,13 @@ pub(super) async fn read_loop(
           if ack.status != crate::packet::wire::AckStatus::Admitted
             && forward::owns_discovering(&context.forwarding, &ack.trace_id)
           {
-            forward::on_downstream_failure(&context.forwarding, &ack.trace_id, &context.sessions)
-              .await;
+            forward::on_downstream_failure(
+              &context.forwarding,
+              &ack.trace_id,
+              &context.sessions,
+              context.relay_hop_deadline(),
+            )
+            .await;
           } else {
             if ack.status == crate::packet::wire::AckStatus::Admitted {
               forward::mark_admitted(&context.forwarding, &ack.trace_id);
@@ -769,6 +775,7 @@ mod read_loop_liveness_tests {
       16,
       Arc::new(Mutex::new(Vec::new())),
       crate::protocol::CONTROL_CBOR_LIMITS,
+      Duration::from_secs(5),
     )
   }
 

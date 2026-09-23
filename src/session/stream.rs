@@ -121,6 +121,9 @@ pub(crate) struct SessionPacketContext {
   /// it so a teardown cannot abort an in-flight apply unnoticed.
   pub(super) task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
   pub(super) parser_limits: crate::protocol::CborLimits,
+  /// The acknowledgment budget one forwarded-open hop gets (see
+  /// `NodeConfig::with_relay_hop_deadline`).
+  pub(super) relay_hop_deadline: Duration,
 }
 
 impl SessionPacketContext {
@@ -134,7 +137,7 @@ impl SessionPacketContext {
     route_policy: QualifiedTag, sessions: SessionTable, routes_clone: RouteTable,
     forwarding_capacity: usize, route_capacity: usize,
     task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    parser_limits: crate::protocol::CborLimits,
+    parser_limits: crate::protocol::CborLimits, relay_hop_deadline: Duration,
   ) -> Self {
     Self {
       local,
@@ -152,6 +155,7 @@ impl SessionPacketContext {
       route_capacity,
       task_drains,
       parser_limits,
+      relay_hop_deadline,
     }
   }
 
@@ -178,6 +182,11 @@ impl SessionPacketContext {
   /// The caller-selected packet parser limits.
   pub(crate) const fn parser_limits(&self) -> crate::protocol::CborLimits {
     self.parser_limits
+  }
+
+  /// The acknowledgment budget one forwarded-open hop gets.
+  pub(crate) const fn relay_hop_deadline(&self) -> Duration {
+    self.relay_hop_deadline
   }
 }
 

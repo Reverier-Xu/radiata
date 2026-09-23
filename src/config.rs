@@ -25,6 +25,10 @@ pub struct NodeConfig {
   // latencies still admits its tail, and tightened only downward by
   // fast deployments (see `with_authentication_deadline`).
   authentication_deadline: Duration,
+  // The acknowledgment budget one forwarded-open hop gets before the
+  // attempt fails locally and the typed failure propagates (see
+  // `with_relay_hop_deadline`).
+  relay_hop_deadline: Duration,
   // A session with no authenticated traffic or owned in-flight work for
   // this long closes on host wall time. Zero disables.
   session_idle_timeout: Duration,
@@ -154,6 +158,20 @@ impl NodeConfig {
     Ok(self)
   }
 
+  /// Sets the per-hop relay budget: how long one forwarded-open hop
+  /// waits for its downstream acknowledgment before the attempt fails
+  /// locally (the branch search continues, or the typed `Failed`
+  /// surfaces upstream). Without this budget a k-hop attempt's latency
+  /// is bounded only transitively, by the liveness policies of the
+  /// sessions on both ends of every hop, so one hiccup at any hop
+  /// stranded the whole attempt for the longest bound in the chain.
+  /// With it, a k-hop attempt is bounded by `k ×` this budget.
+  pub fn with_relay_hop_deadline(mut self, value: Duration) -> Result<Self> {
+    ensure_nonzero_duration(value, "relay hop deadline")?;
+    self.relay_hop_deadline = value;
+    Ok(self)
+  }
+
   /// The dial deadline after which one outbound transport connect fails
   /// (consumed by the supervisor's dial paths; nonzero by construction).
   pub(crate) const fn dial_deadline(&self) -> Duration {
@@ -165,6 +183,12 @@ impl NodeConfig {
   /// construction).
   pub(crate) const fn authentication_deadline(&self) -> Duration {
     self.authentication_deadline
+  }
+
+  /// The acknowledgment budget one forwarded-open hop gets (consumed by
+  /// the forwarding plane's deadline tasks; nonzero by construction).
+  pub(crate) const fn relay_hop_deadline(&self) -> Duration {
+    self.relay_hop_deadline
   }
 
   pub(crate) const fn receipt_retention(&self) -> Duration {
@@ -260,6 +284,11 @@ impl Default for NodeConfig {
       // shape). The default must be safe on the slowest supported
       // device; fast deployments tighten it, never the reverse.
       authentication_deadline: Duration::from_secs(30),
+      // Five seconds per hop: long enough for a slow hop to answer,
+      // short enough that a long relay attempt fails its stuck branch
+      // and moves on instead of hanging to the transitive liveness
+      // bound (the incident-C shape).
+      relay_hop_deadline: Duration::from_secs(5),
       recovery: RecoveryConfig::default(),
       session_queue_messages: 256,
       session_queue_bytes: 8 * 1024 * 1024,
@@ -623,7 +652,8 @@ mod tests {
   /// The authentication deadline accepts any nonzero duration, rejects
   /// zero, and defaults to the 30 s calibration: the join-mode
   /// admission commit sits inside the deadline, and slow-flash commits
-  /// pushed concurrent join bursts past the old 10 s value.
+  /// pushed concurrent join bursts past the old 10 s value. The relay
+  /// hop deadline behaves the same and defaults to 5 s per hop.
   #[test]
   fn authentication_deadline_accepts_nonzero_and_rejects_zero() {
     let configured = NodeConfig::new()
@@ -639,6 +669,24 @@ mod tests {
     );
     let error = NodeConfig::new()
       .with_authentication_deadline(Duration::ZERO)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// The relay hop deadline accepts any nonzero duration, rejects zero,
+  /// and defaults to 5 s per hop.
+  #[test]
+  fn relay_hop_deadline_accepts_nonzero_and_rejects_zero() {
+    let configured = NodeConfig::new()
+      .with_relay_hop_deadline(Duration::from_secs(9))
+      .unwrap();
+    assert_eq!(configured.relay_hop_deadline(), Duration::from_secs(9));
+    assert_eq!(
+      NodeConfig::new().relay_hop_deadline(),
+      Duration::from_secs(5)
+    );
+    let error = NodeConfig::new()
+      .with_relay_hop_deadline(Duration::ZERO)
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }

@@ -13,7 +13,7 @@
 //! infrastructure — bounded frame senders and the session table — but
 //! forwarding-domain concepts are never defined in the session module.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
@@ -123,7 +123,7 @@ pub(crate) const FORWARDING_ROUTE_CAPACITY_DEFAULT: usize = 8_192;
 pub(crate) async fn open(
   local: &NodeId, peer: &NodeId, open: OpenFrame, upstream: &BoundedSender,
   sessions: &SessionTable, forwarding: &ForwardingTable, registry: &ExtensionRegistry,
-  route_policy: &crate::QualifiedTag, forwarding_capacity: usize,
+  route_policy: &crate::QualifiedTag, forwarding_capacity: usize, relay_hop_deadline: Duration,
 ) -> bool {
   let envelope = crate::routing::RouteContext::from_frame(
     open.trace_id.clone(),
@@ -189,6 +189,7 @@ pub(crate) async fn open(
           sessions,
           forwarding,
           &candidates,
+          relay_hop_deadline,
         )
         .await;
       }
@@ -306,7 +307,7 @@ pub(crate) async fn close_for_peer(table: &ForwardingTable, upstream_peer: &Node
 async fn relay_open(
   context: &crate::routing::RouteContext, next_hop: &NodeId, peer: &NodeId, open: &OpenFrame,
   upstream: &BoundedSender, sessions: &SessionTable, forwarding: &ForwardingTable,
-  candidates: &[NodeId],
+  candidates: &[NodeId], relay_hop_deadline: Duration,
 ) {
   let downstream = match sessions.lock() {
     Ok(guard) => guard
@@ -397,6 +398,18 @@ async fn relay_open(
   {
     remove_pending(&downstream_acks, &open.trace_id);
     reject_open(upstream, &open.trace_id);
+  } else {
+    // The open is on the wire and its acknowledgment is now expected:
+    // bound this hop's wait explicitly so a stuck branch fails and the
+    // search moves on instead of hanging to the transitive liveness
+    // bounds of the sessions on the path.
+    arm_hop_deadline(
+      forwarding,
+      &downstream_acks,
+      sessions,
+      &open.trace_id,
+      relay_hop_deadline,
+    );
   }
 }
 
@@ -418,15 +431,17 @@ pub(crate) fn mark_admitted(table: &ForwardingTable, trace_id: &TraceId) {
   }
 }
 
-/// One downstream attempt failed before admission: consume the failed
-/// attempt's pending entry, re-dispatch the open to this hop's next
-/// untried candidate, and re-register there — a distributed
+/// One downstream attempt failed before admission — a typed failure from
+/// downstream, or this hop's own relay deadline expiring: consume the
+/// failed attempt's pending entry, re-dispatch the open to this hop's
+/// next untried candidate, and re-register there — a distributed
 /// depth-first search over this hop's loop-free branches. Exhausted
 /// candidates fail the route upstream, where the upstream holder runs
 /// its own retry; the whole exploration is bounded because every
 /// (hop, candidate) pair is tried at most once per trace.
 pub(crate) async fn on_downstream_failure(
   forwarding: &ForwardingTable, trace_id: &TraceId, sessions: &SessionTable,
+  relay_hop_deadline: Duration,
 ) {
   let (mut retry, upstream) = {
     let mut guard = locked(forwarding);
@@ -515,9 +530,17 @@ pub(crate) async fn on_downstream_failure(
     }
     if let Some(hop) = locked(forwarding).get_mut(trace_id) {
       hop.downstream = entry.frames.clone();
-      hop.downstream_acks = downstream_acks;
+      hop.downstream_acks = Arc::clone(&downstream_acks);
       hop.retry = Some(retry);
     }
+    // The re-dispatched branch gets its own full hop budget.
+    arm_hop_deadline(
+      forwarding,
+      &downstream_acks,
+      sessions,
+      trace_id,
+      relay_hop_deadline,
+    );
     debug!(
       candidate = %candidate,
       trace_id = %trace_id,
@@ -578,6 +601,41 @@ fn remove_pending(acks: &PendingAcks, trace_id: &TraceId) {
   if let Ok(mut acks) = acks.lock() {
     acks.remove(trace_id);
   }
+}
+
+/// Removes `trace_id`'s pending entry only if it is still a relay: an
+/// acknowledged attempt already resolved its entry, and the deadline
+/// task's removal then reports nothing to expire. A poisoned map
+/// conservatively reports nothing — the session teardown owns the
+/// entries in that case.
+fn take_expired_relay(acks: &PendingAcks, trace_id: &TraceId) -> bool {
+  match acks.lock() {
+    Ok(mut acks) => matches!(acks.remove(trace_id), Some(PendingAck::Relay { .. })),
+    Err(_) => false,
+  }
+}
+
+/// Arms the explicit per-hop budget for one forwarded open: after
+/// `relay_hop_deadline` a still-pending relay entry expires, its
+/// attempt counts as failed, and the hop's branch search proceeds
+/// exactly as if the downstream had answered with a typed failure. A
+/// faster outcome (acknowledged, failed, or session teardown) removes
+/// the entry first, so the task's removal finds nothing and exits.
+fn arm_hop_deadline(
+  forwarding: &ForwardingTable, downstream_acks: &PendingAcks, sessions: &SessionTable,
+  trace_id: &TraceId, relay_hop_deadline: Duration,
+) {
+  let forwarding = Arc::clone(forwarding);
+  let downstream_acks = Arc::clone(downstream_acks);
+  let sessions = Arc::clone(sessions);
+  let trace_id = trace_id.clone();
+  tokio::spawn(async move {
+    tokio::time::sleep(relay_hop_deadline).await;
+    if take_expired_relay(&downstream_acks, &trace_id) {
+      debug!(trace_id = %trace_id, deadline = ?relay_hop_deadline, "relay hop deadline expired");
+      on_downstream_failure(&forwarding, &trace_id, &sessions, relay_hop_deadline).await;
+    }
+  });
 }
 
 /// The loop-free next-hop candidates for one forwarded open: the alive
@@ -947,7 +1005,7 @@ mod tests {
 
 #[cfg(test)]
 mod retry_tests {
-  use std::sync::Arc;
+  use std::{sync::Arc, time::Duration};
 
   use futures_util::FutureExt as _;
 
@@ -1033,7 +1091,7 @@ mod retry_tests {
     .unwrap();
     assert!(owns_discovering(&table, &trace(99)));
 
-    super::on_downstream_failure(&table, &trace(99), &sessions).await;
+    super::on_downstream_failure(&table, &trace(99), &sessions, Duration::from_secs(5)).await;
 
     // The open was re-dispatched to the live candidate.
     let frame = good_rx.recv().await.expect("redispatched open");
@@ -1072,7 +1130,7 @@ mod retry_tests {
     )
     .unwrap();
 
-    super::on_downstream_failure(&table, &trace(99), &sessions).await;
+    super::on_downstream_failure(&table, &trace(99), &sessions, Duration::from_secs(5)).await;
 
     let frame = upstream_rx.recv().await.expect("typed failure upstream");
     assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Ack);
@@ -1102,5 +1160,52 @@ mod retry_tests {
     assert!(owns_discovering(&table, &trace(99)));
     super::mark_admitted(&table, &trace(99));
     assert!(!owns_discovering(&table, &trace(99)));
+  }
+
+  /// A silent downstream expires at the configured hop budget: the
+  /// pending entry is consumed and the branch search proceeds — the
+  /// next live candidate is re-dispatched — exactly as if the
+  /// downstream had answered with a typed failure. This is the bound
+  /// that keeps a k-hop attempt's latency at k × the hop budget
+  /// instead of the transitive liveness bound.
+  #[tokio::test(start_paused = true)]
+  async fn a_silent_downstream_expires_at_the_hop_budget() {
+    let table = new_table();
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
+
+    // The next candidate holds a live session.
+    let entropy = entropy();
+    let (good_entry, mut good_rx) = test_entry(entropy.as_ref());
+    sessions.lock().unwrap().insert(node(7), good_entry);
+
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    acks.lock().unwrap().insert(
+      trace(99),
+      super::PendingAck::Relay {
+        upstream: upstream_tx.clone(),
+      },
+    );
+    register(
+      &table,
+      trace(99),
+      hop_with_retry(upstream_tx, downstream_tx, acks.clone(), vec![node(7)]),
+    )
+    .unwrap();
+
+    super::arm_hop_deadline(&table, &acks, &sessions, &trace(99), Duration::from_secs(5));
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    // The expired branch was re-dispatched to the live candidate...
+    let frame = good_rx
+      .recv()
+      .await
+      .expect("redispatched open after the hop budget");
+    assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Open);
+    // ...the expired pending entry was consumed...
+    assert!(!acks.lock().unwrap().contains_key(&trace(99)));
+    // ...and nothing failed upstream (the search continues silently).
+    assert!(upstream_rx.recv().now_or_never().is_none());
   }
 }

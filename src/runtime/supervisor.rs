@@ -644,6 +644,7 @@ fn session_packet_context(
     dependencies.config.trace_metadata_limits().active(),
     Arc::clone(&dependencies.connection_tasks),
     dependencies.config.parser_cbor_limits(),
+    dependencies.config.relay_hop_deadline(),
   ))
 }
 
