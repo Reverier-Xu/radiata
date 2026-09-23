@@ -52,10 +52,21 @@ use common::MemoryStorageFactory;
 const NODES: usize = 64;
 const STAR_SPOKES: usize = 12;
 const BUS_LINES: usize = 3;
+/// The recovery burst is capped well below the cluster size: on a
+/// two-vcpu CI runner a 63-dial step starves its own tail past the
+/// fixed ten-second authentication deadline, so every dial in the burst
+/// fails and the isolated member never heals. Sixteen concurrent dials
+/// converge in a step or two under the same starvation; the
+/// any-one-route contract needs exactly one to land.
+const RECOVERY_FAN_OUT: usize = 16;
 /// The per-phase budgets assume a contended machine, not a quiet one:
 /// 63 joins, 256 listeners, and the churn window share one runtime.
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(240);
 const MERGE_TIMEOUT: Duration = Duration::from_secs(300);
+/// The per-command ceiling: a wedged runtime must fail the lane loudly
+/// instead of hanging the CI job past its timeout. Generous enough that
+/// a merely starved runner never trips it.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bounded retry budget for a restart racing the previous runtime's
 /// storage release (the store unlocks when the old runtime's task
 /// drops it, which can land a tick after the shutdown observation).
@@ -472,8 +483,12 @@ fn node_config() -> NodeConfig {
     .with_anti_entropy_interval(Duration::from_millis(250))
     .expect("nonzero interval")
     .with_recovery_policy(
-      RecoveryConfig::new(NODES, Duration::from_secs(2), Duration::from_secs(60))
-        .expect("valid recovery policy"),
+      RecoveryConfig::new(
+        RECOVERY_FAN_OUT,
+        Duration::from_secs(2),
+        Duration::from_secs(60),
+      )
+      .expect("valid recovery policy"),
     )
     .expect("valid node config")
 }
@@ -518,7 +533,12 @@ async fn listen_all(handle: &NodeHandle, sockets: &Path, index: usize) -> Vec<En
     // the same unix path; the bind retries briefly and bounded.
     let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
     let listener = loop {
-      match handle.command(Listen::new(requested.clone())).await {
+      match bounded(
+        handle.command(Listen::new(requested.clone())),
+        "listen {scheme}",
+      )
+      .await
+      {
         Ok(listener) => break listener,
         Err(_) if std::time::Instant::now() < deadline => {
           tokio::time::sleep(Duration::from_millis(50)).await;
@@ -592,14 +612,28 @@ fn retry_backoff(attempts: u32) -> Duration {
   Duration::from_millis(250_u64.saturating_mul(1_u64 << shift)).min(Duration::from_secs(4))
 }
 
+/// Bounds every runtime interaction: a wedged supervisor (dead control
+/// loop, poisoned internal channel) must fail the lane with a named
+/// call instead of hanging the CI job past its timeout. The wrapper is
+/// deliberately applied at every `handle` call site — the in-test
+/// convergence timeouts below cannot fire while a single await inside
+/// them never resolves.
+async fn bounded<F: std::future::Future>(future: F, what: &str) -> F::Output {
+  match tokio::time::timeout(COMMAND_TIMEOUT, future).await {
+    Ok(output) => output,
+    Err(_) => panic!("wedged runtime: {what} did not answer within {COMMAND_TIMEOUT:?}"),
+  }
+}
+
 /// The live join credential of one node (any number of joins until
 /// rotation or expiry, so receivers need no per-join rotation).
 async fn issue_credential(slot: &Slot) -> String {
-  let issued = slot
-    .handle()
-    .command(IssueMergeCredential::new())
-    .await
-    .expect("issue merge credential");
+  let issued = bounded(
+    slot.handle().command(IssueMergeCredential::new()),
+    "issue merge credential",
+  )
+  .await
+  .expect("issue merge credential");
   issued.credential().expose_secret().to_owned()
 }
 
@@ -612,13 +646,14 @@ async fn merge_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match joiner
-      .handle()
-      .command(MergeCluster::new(
+    match bounded(
+      joiner.handle().command(MergeCluster::new(
         endpoint.clone(),
         MergeCredential::parse(secret).expect("valid credential"),
-      ))
-      .await
+      )),
+      "merge join",
+    )
+    .await
     {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
@@ -637,10 +672,13 @@ async fn connect_member_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match node
-      .handle()
-      .command(ConnectMember::new(endpoint.clone(), peer.clone()))
-      .await
+    match bounded(
+      node
+        .handle()
+        .command(ConnectMember::new(endpoint.clone(), peer.clone())),
+      "member reconnect",
+    )
+    .await
     {
       Ok(authenticated) => return authenticated,
       Err(_) if std::time::Instant::now() < deadline => {
@@ -710,11 +748,12 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
   let mut last_report = std::time::Instant::now() - CONVERGE_TIMEOUT;
   loop {
     for index in indices {
-      slots[*index]
-        .handle()
-        .command(radiata::RunSyncRound::new())
-        .await
-        .expect("sync round");
+      bounded(
+        slots[*index].handle().command(radiata::RunSyncRound::new()),
+        "sync round",
+      )
+      .await
+      .expect("sync round");
     }
     let mut ready = true;
     for index in indices {
@@ -723,9 +762,7 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
         ready = false;
         break;
       }
-      let recovery = slot
-        .handle()
-        .query(GetRecovery::new())
+      let recovery = bounded(slot.handle().query(GetRecovery::new()), "recovery view")
         .await
         .expect("recovery view");
       if !recovery.is_connected() {
@@ -742,11 +779,12 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
       last_report = std::time::Instant::now();
       for index in indices {
         let slot = &slots[*index];
-        let recovery = slot
-          .handle()
-          .query(GetRecovery::new())
-          .await
-          .expect("recovery view");
+        let recovery = bounded(
+          slot.handle().query(GetRecovery::new()),
+          "recovery view diag",
+        )
+        .await
+        .expect("recovery view");
         if !recovery.is_connected() || active_members(slot).await != expected {
           let sessions = slot
             .handle()
@@ -774,24 +812,44 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
 
 /// Sends one relay-check packet `from` to `to` and waits for it to land
 /// in `to`'s collector. Routed over the current mesh: distant pairs
-/// traverse the star or the bus through the default next-hop policy.
+/// traverse the star or the bus through the default next-hop policy. A
+/// send that races a churn wave surfaces as StreamInterrupted (delivery
+/// is at-most-once per attempt, by contract); the retry loop re-sends
+/// until the packet lands, which is the same customer-side pattern the
+/// library documents for real traffic.
 async fn relay_packet(from: &Slot, to: &Slot, what: &str) {
   let before = *to.collector.packets.lock().unwrap();
-  let packet = from
-    .handle()
-    .open_stream(
-      StreamTarget::Exact(to.id().clone()),
-      ProtocolTag::parse(ECHO_PROTOCOL).expect("static protocol tag"),
-      StreamPolicy::new(RoutingPolicy::Direct, NODES as u32).expect("valid policy"),
-      StreamMetadata::new(),
-    )
-    .expect("open relay stream");
-  packet
-    .send_sync(echo_body(Arc::from(what.as_bytes())))
-    .await
-    .expect("relay send");
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
-  while *to.collector.packets.lock().unwrap() == before {
+  let mut attempts = 0_u32;
+  loop {
+    attempts = attempts.wrapping_add(1);
+    let packet = from
+      .handle()
+      .open_stream(
+        StreamTarget::Exact(to.id().clone()),
+        ProtocolTag::parse(ECHO_PROTOCOL).expect("static protocol tag"),
+        StreamPolicy::new(RoutingPolicy::Direct, NODES as u32).expect("valid policy"),
+        StreamMetadata::new(),
+      )
+      .expect("open relay stream");
+    let sent = bounded(
+      packet.send_sync(echo_body(Arc::from(what.as_bytes()))),
+      "relay send",
+    )
+    .await;
+    match sent {
+      Ok(_ack) => {}
+      // The churn may interrupt the carrying session mid-send; a fresh
+      // attempt rides the healed mesh.
+      Err(_) if std::time::Instant::now() < deadline => {
+        tokio::time::sleep(retry_backoff(attempts)).await;
+        continue;
+      }
+      Err(error) => panic!("{what}: relay send failed persistently: {error:?}"),
+    }
+    if *to.collector.packets.lock().unwrap() > before {
+      return;
+    }
     assert!(
       std::time::Instant::now() < deadline,
       "{what}: relayed packet never arrived"
@@ -803,9 +861,7 @@ async fn relay_packet(from: &Slot, to: &Slot, what: &str) {
 /// Shuts one slot down (the shutdown must already have been requested)
 /// and waits for the reported reason.
 async fn await_shutdown(slot: &mut Slot) -> ShutdownReason {
-  let reason = slot
-    .handle()
-    .query(WaitForShutdown::new())
+  let reason = bounded(slot.handle().query(WaitForShutdown::new()), "shutdown wait")
     .await
     .expect("shutdown wait");
   slot.handle = None;
@@ -854,9 +910,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
     slots.push(start_slot(index, sockets.path()).await);
   }
   for slot in &mut slots {
-    let id = slot
-      .handle()
-      .query(GetLocalNode::new())
+    let id = bounded(slot.handle().query(GetLocalNode::new()), "local node")
       .await
       .expect("local node")
       .node_id()
@@ -915,10 +969,13 @@ async fn sixty_four_node_mixed_transport_chaos() {
     let what = format!("kick {step} ({from}->{to})");
     // Absence after a concurrent prune is benign; a real failure
     // surfaces through the convergence check below.
-    let _ = slots[from]
-      .handle()
-      .command(DisconnectPeer::new(ids[to].clone()))
-      .await;
+    let _ = bounded(
+      slots[from]
+        .handle()
+        .command(DisconnectPeer::new(ids[to].clone())),
+      "disconnect peer",
+    )
+    .await;
     wait_converged(&slots, NODES, &what).await;
   }
 
@@ -949,13 +1006,14 @@ async fn sixty_four_node_mixed_transport_chaos() {
 
     // Leave: acknowledged replacement, old identity tombstoned, node
     // shuts down with the active-leave reason.
-    let outcome = slots[leaver]
-      .handle()
-      .command(LeaveCluster::new(
+    let outcome = bounded(
+      slots[leaver].handle().command(LeaveCluster::new(
         radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-      ))
-      .await
-      .unwrap_or_else(|error| panic!("leave round {round}: {error:?}"));
+      )),
+      "leave cluster",
+    )
+    .await
+    .unwrap_or_else(|error| panic!("leave round {round}: {error:?}"));
     assert_eq!(outcome.former_identity(), &former);
     assert_ne!(outcome.former_identity(), outcome.replacement_identity());
     assert_eq!(
@@ -966,13 +1024,14 @@ async fn sixty_four_node_mixed_transport_chaos() {
     // The replacement identity boots on the same slot (same storage
     // and keys): a fresh outsider, per the leave custody contract.
     restart_slot(&mut slots[leaver], sockets.path(), leaver).await;
-    let replacement = slots[leaver]
-      .handle()
-      .query(GetLocalNode::new())
-      .await
-      .expect("local node")
-      .node_id()
-      .clone();
+    let replacement = bounded(
+      slots[leaver].handle().query(GetLocalNode::new()),
+      "local node after leave",
+    )
+    .await
+    .expect("local node")
+    .node_id()
+    .clone();
     assert_ne!(replacement, former, "the leave replaced the identity");
 
     // The survivors converge on 63 actives with the former identity
@@ -1031,23 +1090,25 @@ async fn sixty_four_node_mixed_transport_chaos() {
   // kicks lane already exercised).
   let tail = NODES - 1;
   let restarted_id = slots[tail].id().clone();
-  slots[tail]
-    .handle()
-    .command(radiata::Shutdown::new())
-    .await
-    .expect("graceful shutdown");
+  bounded(
+    slots[tail].handle().command(radiata::Shutdown::new()),
+    "graceful shutdown",
+  )
+  .await
+  .expect("graceful shutdown");
   assert_eq!(
     await_shutdown(&mut slots[tail]).await,
     ShutdownReason::Explicit
   );
   restart_slot(&mut slots[tail], sockets.path(), tail).await;
-  let booted = slots[tail]
-    .handle()
-    .query(GetLocalNode::new())
-    .await
-    .expect("local node")
-    .node_id()
-    .clone();
+  let booted = bounded(
+    slots[tail].handle().query(GetLocalNode::new()),
+    "local node after restart",
+  )
+  .await
+  .expect("local node")
+  .node_id()
+  .clone();
   assert_eq!(booted, restarted_id, "a restart resumes the same identity");
   let scheme = rng.scheme();
   let peer = if tail > STAR_SPOKES + 1 { tail - 1 } else { 0 };
@@ -1074,11 +1135,12 @@ async fn sixty_four_node_mixed_transport_chaos() {
       NODES,
       "node {index} lost members under churn"
     );
-    let recovery = slot
-      .handle()
-      .query(GetRecovery::new())
-      .await
-      .expect("recovery view");
+    let recovery = bounded(
+      slot.handle().query(GetRecovery::new()),
+      "recovery view post-churn",
+    )
+    .await
+    .expect("recovery view");
     assert!(recovery.is_connected(), "node {index} never reconnected");
   }
   for former in [&ids[3], &ids[35]] {
@@ -1102,8 +1164,12 @@ async fn sixty_four_node_mixed_transport_chaos() {
   // ---- Teardown ------------------------------------------------------
   for slot in &mut slots {
     if let Some(handle) = slot.handle.take() {
-      let _ = handle.command(radiata::Shutdown::new()).await;
-      let _ = handle.query(WaitForShutdown::new()).await;
+      let _ = bounded(
+        handle.command(radiata::Shutdown::new()),
+        "teardown shutdown",
+      )
+      .await;
+      let _ = bounded(handle.query(WaitForShutdown::new()), "teardown wait").await;
     }
   }
 }
