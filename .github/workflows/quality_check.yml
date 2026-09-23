@@ -228,6 +228,93 @@ jobs:
           path: target/attestation-quality-stable.json
           retention-days: 30
 
+  starvation:
+    name: starvation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -Dwarnings
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install MSRV toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.98.0
+
+      # The starvation gate replays the transport-chaos incidents on a
+      # single core: the lanes compile unpinned, then execute under
+      # `taskset -c 0` so every task, handshake, and storage commit
+      # shares one CPU. Defects invisible on fast runners starve here
+      # before merge.
+      - name: build the starvation lanes
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 test --locked --no-run \
+            --test transport_chaos --test membership_sync \
+            --message-format=json > target/starvation-build.json
+          jq -r 'select(.executable != null and ((.target.kind // []) | index("test"))) | .executable' \
+            target/starvation-build.json > target/starvation-lanes.txt
+
+      - name: record start
+        id: start
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: chaos lane pinned to one core
+        id: chaos
+        shell: bash
+        run: |
+          set -euo pipefail
+          lane=$(grep transport_chaos target/starvation-lanes.txt)
+          taskset -c 0 "$lane" --test-threads=1
+
+      - name: sixteen-node membership lane pinned to one core
+        id: membership
+        shell: bash
+        run: |
+          set -euo pipefail
+          lane=$(grep membership_sync target/starvation-lanes.txt)
+          taskset -c 0 "$lane" sixteen_node --test-threads=1
+
+      - name: quality attestation
+        if: always()
+        shell: bash
+        env:
+          CHAOS: ${{ steps.chaos.outcome }}
+          MEMBERSHIP: ${{ steps.membership.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          STARTED: ${{ steps.start.outputs.started }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          commit=$(git rev-parse HEAD)
+          lock=$(sha256sum Cargo.lock | awk '{ print $1 }')
+          now=$(date +%s)
+          duration=$((now - ${STARTED:-$now}))
+          if [ "$duration" -lt 0 ]; then duration=0; fi
+          uninterrupted=true
+          [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
+          result=fail
+          if [ "$CHAOS" = "success" ] && [ "$MEMBERSHIP" = "success" ] \
+            && [ "$uninterrupted" = "true" ]; then
+            result=pass
+          fi
+          printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"starvation","target":"quality-starvation","budget_seconds":1200,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
+            "$commit" "$lock" "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "$duration" "$uninterrupted" "$result" > target/attestation-quality-starvation.json
+          cat target/attestation-quality-starvation.json
+
+      - name: upload attestation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-attestation-starvation
+          path: target/attestation-quality-starvation.json
+          retention-days: 30
+
   macos:
     name: macos
     runs-on: macos-latest
