@@ -59,9 +59,13 @@ fn register_admission(
 }
 
 /// Streams one admitted body as ordered bounded chunks over the session
-/// queue, advancing the route record's forwarded-bytes counter. Returns
-/// the wire failure if the session queue dies mid-stream or the body
-/// violates the chunk bound.
+/// queue, advancing the route record's forwarded-bytes counter. Caller
+/// chunks larger than the wire's chunk bound are re-chunked into
+/// wire-legal slices here — chunk boundaries are transport-internal (the
+/// receiver reassembles the body), so one choke point keeps every
+/// caller's body deliverable instead of failing it after the open was
+/// already admitted. Returns the wire failure if the session queue dies
+/// mid-stream.
 async fn pump_chunks(
   entry: &SessionEntry, routes: &RouteTable, trace_id: &TraceId,
   mut body: crate::packet::BodyStream,
@@ -70,29 +74,27 @@ async fn pump_chunks(
   loop {
     match std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
       Some(Ok(bytes)) => {
-        if bytes.len() > MAX_CHUNK_BYTES {
-          return Err(ErrorKind::InvalidInput);
+        for slice in bytes.chunks(MAX_CHUNK_BYTES) {
+          let chunk = ChunkFrame {
+            trace_id: trace_id.clone(),
+            sequence,
+            bytes: ByteVec::from(slice.to_vec()),
+          };
+          sequence = sequence.saturating_add(1);
+          let encoded = wire::encode_chunk(&chunk).map_err(|error| error.kind())?;
+          entry
+            .frames
+            .send(SessionFrame {
+              kind: PacketKind::Chunk,
+              body: encoded,
+            })
+            .await
+            .map_err(|_| ErrorKind::StreamInterrupted)?;
+          update_route(routes, trace_id, |record| {
+            record.forward(slice.len() as u64);
+          });
         }
-        let forwarded = bytes.len() as u64;
-        let chunk = ChunkFrame {
-          trace_id: trace_id.clone(),
-          sequence,
-          bytes: ByteVec::from(bytes.to_vec()),
-        };
-        sequence = sequence.saturating_add(1);
-        let encoded = wire::encode_chunk(&chunk).map_err(|error| error.kind())?;
-        entry
-          .frames
-          .send(SessionFrame {
-            kind: PacketKind::Chunk,
-            body: encoded,
-          })
-          .await
-          .map_err(|_| ErrorKind::StreamInterrupted)?;
-        trace!(sequence, bytes = forwarded, "packet chunk queued");
-        update_route(routes, trace_id, |record| {
-          record.forward(forwarded);
-        });
+        trace!(sequence, bytes = bytes.len(), "packet chunk queued");
       }
       None => return Ok(()),
       Some(Err(error)) => return Err(error.kind()),
