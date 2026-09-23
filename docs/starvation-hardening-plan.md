@@ -204,12 +204,17 @@ documentation walkthrough.
   core via `taskset -c 0` or docker `--cpus=1`) running the full
   `transport_chaos` lane and the sixteen-node `membership_sync` lane.
   Budget 15 min (measured 3–5 min per lane on 2 vCPUs, scaled up).
-- `simulation::network` fault matrix gains three injection dimensions:
-  **slow CPU** (fixed inter-task delay injection), **slow storage**
-  (commit delay injection — directly serves WP1 acceptance), and
-  **slow clock** (ManualClock forward-jump/backward sequences),
-  reusing the existing sealed-gate/replay machinery
-  (`simulation_network_fault_matrix_gate`, already run in CI).
+- Fault-injection dimensions land where they have semantics.
+  **Slow CPU** is the one-core job itself: real starvation of real
+  tasks, which the sealed frame simulator cannot express.
+  **Slow storage** is the commit-delay injection in
+  `tests/admission_runtime.rs` (`DelayingFactory` over the in-memory
+  store, armed after startup), which doubles as WP1's acceptance
+  scenario. **Slow clock** stays covered where clock semantics live:
+  the sealed gate's wall-clock rollback/freeze/forward-jump dimensions
+  and the `ManualClock` liveness/storage unit tests — the runtime wall
+  clock has no public injection seam by design, and a test-only clock
+  knob would be surface without a production user.
 
 **Acceptance**: WP1–WP5 are all protected by this gate. Scenarios are
 written red before their fix and green after — the gate lands first so

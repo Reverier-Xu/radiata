@@ -792,6 +792,89 @@ impl Storage for FaultingStorage {
   }
 }
 
+/// Slow-storage injection over the in-memory storage: every commit pays
+/// a configured delay and commits serialize, the slow-flash shape behind
+/// the admission-deadline calibration (device writes never overlap, so N
+/// concurrent commits cost N × delay at the tail). The delay starts at
+/// zero and is armed once setup commits are done, so node startup stays
+/// fast and only the scenario's own writes pay the latency.
+#[derive(Debug)]
+pub struct DelayingFactory {
+  memory: Arc<MemoryStorageFactory>,
+  commit_delay: Arc<std::sync::Mutex<Duration>>,
+  write_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl DelayingFactory {
+  pub fn new(memory: Arc<MemoryStorageFactory>) -> Self {
+    Self {
+      memory,
+      commit_delay: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+      write_gate: Arc::new(tokio::sync::Mutex::new(())),
+    }
+  }
+
+  /// Sets the delay every subsequent commit pays. Commits already in
+  /// flight keep the delay they read when they acquired the gate.
+  pub fn set_commit_delay(&self, delay: Duration) {
+    *self.commit_delay.lock().unwrap() = delay;
+  }
+}
+
+impl StorageFactory for DelayingFactory {
+  fn open<'a>(
+    &'a self, requirements: StoreRequirements,
+  ) -> BoxFuture<'a, Result<Box<dyn Storage>>> {
+    Box::pin(async move {
+      let memory = self.memory.open(requirements).await?;
+      Ok(Box::new(DelayingStorage {
+        memory,
+        commit_delay: Arc::clone(&self.commit_delay),
+        write_gate: Arc::clone(&self.write_gate),
+      }) as Box<dyn Storage>)
+    })
+  }
+}
+
+#[derive(Debug)]
+struct DelayingStorage {
+  memory: Box<dyn Storage>,
+  commit_delay: Arc<std::sync::Mutex<Duration>>,
+  write_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Storage for DelayingStorage {
+  fn capabilities(&self) -> StoreCapabilities {
+    self.memory.capabilities()
+  }
+
+  fn snapshot<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn StoreSnapshot>>> {
+    self.memory.snapshot()
+  }
+
+  fn commit<'a>(&'a self, transaction: StoreTransaction) -> BoxFuture<'a, Result<CommitOutcome>> {
+    let write_gate = Arc::clone(&self.write_gate);
+    let delay = *self.commit_delay.lock().unwrap();
+    Box::pin(async move {
+      // Hold the device gate across the delay and the write: a slow
+      // commit blocks the queued ones behind it, exactly like flash.
+      let _gate = write_gate.lock().await;
+      tokio::time::sleep(delay).await;
+      self.memory.commit(transaction).await
+    })
+  }
+
+  fn reconcile<'a>(
+    &'a self, transaction: &'a TransactionId, digest: &'a Digest,
+  ) -> BoxFuture<'a, Result<ReconcileOutcome>> {
+    self.memory.reconcile(transaction, digest)
+  }
+
+  fn flush<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+    self.memory.flush()
+  }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyCall {
   Create(KeyOperationId),

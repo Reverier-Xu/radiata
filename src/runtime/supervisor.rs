@@ -673,6 +673,7 @@ impl Supervisor {
       dependencies.entropy.clone(),
       Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
       offer,
+      dependencies.config.authentication_deadline(),
     );
     // The membership sync protocol was registered by `spawn_runtime`
     // before the runtime was marked ready.

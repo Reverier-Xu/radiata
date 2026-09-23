@@ -82,9 +82,9 @@ async fn rotate_with_retry(issuer: &NodeHandle) -> radiata::IssuedMergeCredentia
 async fn merge_with_retry(
   node: &NodeHandle, endpoint: &Endpoint, secret: &str,
 ) -> radiata::MergeView {
-  // The fixed authentication deadline expires on starved runners; the
-  // bound covers a fully loaded CI machine (the sixteen-node lane runs
-  // alongside every other test binary in the workspace suite).
+  // The configured authentication deadline expires on starved runners;
+  // the bound covers a fully loaded CI machine (the sixteen-node lane
+  // runs alongside every other test binary in the workspace suite).
   let deadline = std::time::Instant::now() + Duration::from_secs(300);
   let mut attempts = 0_u32;
   loop {
@@ -107,7 +107,7 @@ async fn merge_with_retry(
 
 /// One success-expecting merge with bounded retries: the typed rejection
 /// lanes stay single-shot, but a success path must not fail the lane when
-/// a loaded runner expires the fixed authentication deadline. The same
+/// a loaded runner expires the configured authentication deadline. The same
 /// credential is reused (a failed merge consumes no credential).
 async fn merge_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radiata::MergeView {
   let deadline = std::time::Instant::now() + Duration::from_secs(120);

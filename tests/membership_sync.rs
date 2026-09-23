@@ -25,7 +25,7 @@ use common::{MemoryStorageFactory, ScriptedKeys};
 
 /// The sixteen-node lanes share one process: the test harness runs them
 /// concurrently on a runner that cannot carry several oversubscribed
-/// clusters at once, which starves the fixed authentication deadline.
+/// clusters at once, which starves the configured authentication deadline.
 /// The lanes serialize on this shared gate so each cluster owns the
 /// process while it runs.
 fn cluster_gate() -> &'static tokio::sync::Mutex<()> {
@@ -657,8 +657,8 @@ async fn merge_with_retry(node: &Node, endpoint: Endpoint, secret: &str) {
 /// failure fails the harness.
 async fn connect_with_retry(node: &Node, endpoint: Endpoint, peer: radiata::NodeId) {
   // A handshake can be dropped under load and take the full
-  // authentication deadline (10s) to fail, so the retry window is
-  // generous.
+  // authentication deadline (30 s by default) to fail, so the retry
+  // window is generous.
   let deadline = std::time::Instant::now() + Duration::from_secs(300);
   let mut attempts = 0;
   loop {

@@ -225,8 +225,8 @@ impl LeaveAppliedSignal {
 }
 
 /// The bounded wait for the first leave-record admission acknowledgement:
-/// five seconds, well inside the fixed authentication deadline's order of
-/// magnitude.
+/// five seconds, well inside the configured authentication deadline's
+/// order of magnitude.
 const LEAVE_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The bounded wait for flushing the record bodies after the first

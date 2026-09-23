@@ -1,8 +1,9 @@
 //! Authenticated session driver over the framed TLS WebSocket transport.
 //!
 //! The driver sequences the private [`Handshake`] state machine over a
-//! [`Connection`] under the fixed ten-second authentication deadline
-//! (`tokio::time::timeout`). It owns the two things
+//! [`Connection`] under the configured authentication deadline
+//! (`tokio::time::timeout`, wired from `NodeConfig` through the
+//! runtime dependencies). It owns the two things
 //! the pure state machine deliberately does not:
 //!
 //! - signing order: the initiator calls `KeyProvider::sign` for its identity
@@ -52,11 +53,6 @@ use crate::{
   },
   view::MergeView,
 };
-
-/// The fixed authentication deadline for the full session
-/// bootstrap exchange (positions one through six, including the join-mode
-/// admission commit and grant adoption).
-pub(crate) const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The bounded grace for draining an in-flight initiator hello before a
 /// rejection close (see `respond`); long enough to cover loopback and
@@ -123,6 +119,7 @@ pub(crate) struct SessionDriver {
   entropy: Arc<dyn Entropy>,
   issuer: Arc<Mutex<MergeCredentialIssuer>>,
   offer: FeatureOffer,
+  authentication_deadline: Duration,
   limiter: crate::identity::merge_rate::MergeLimiter,
   member_spkis: Arc<MemberSpkiTable>,
 }
@@ -131,6 +128,7 @@ impl SessionDriver {
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, keys: Arc<dyn KeyProvider>, entropy: Arc<dyn Entropy>,
     issuer: Arc<Mutex<MergeCredentialIssuer>>, offer: FeatureOffer,
+    authentication_deadline: Duration,
   ) -> Self {
     Self {
       context,
@@ -138,6 +136,7 @@ impl SessionDriver {
       entropy,
       issuer,
       offer,
+      authentication_deadline,
       limiter: crate::identity::merge_rate::MergeLimiter::new(),
       member_spkis: Arc::new(MemberSpkiTable::default()),
     }
@@ -196,7 +195,7 @@ impl SessionDriver {
   /// Returns the authenticated session. In join mode this commits
   /// the admission triple and delivers the signed grant before returning.
   pub(crate) async fn respond(&self, connection: &mut Connection) -> Result<EstablishedSession> {
-    let result = timeout(AUTHENTICATION_DEADLINE, self.respond_inner(connection))
+    let result = timeout(self.authentication_deadline, self.respond_inner(connection))
       .await
       .map_err(|_| Error::authentication_failed("authentication deadline"))?;
     if result.is_err() {
@@ -396,7 +395,7 @@ impl SessionDriver {
     &self, connection: &mut Connection, hint: &MergeHint, credential: CredentialSecret,
   ) -> Result<(EstablishedSession, MergeView)> {
     timeout(
-      AUTHENTICATION_DEADLINE,
+      self.authentication_deadline,
       self.merge_inner(connection, hint, credential),
     )
     .await
@@ -462,9 +461,12 @@ impl SessionDriver {
   pub(crate) async fn initiate_member(
     &self, connection: &mut Connection, peer: &NodeId,
   ) -> Result<EstablishedSession> {
-    timeout(AUTHENTICATION_DEADLINE, self.member_inner(connection, peer))
-      .await
-      .map_err(|_| Error::authentication_failed("authentication deadline"))?
+    timeout(
+      self.authentication_deadline,
+      self.member_inner(connection, peer),
+    )
+    .await
+    .map_err(|_| Error::authentication_failed("authentication deadline"))?
   }
 
   async fn member_inner(

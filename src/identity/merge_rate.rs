@@ -3,7 +3,7 @@
 //! Before any handshake or signing work, each connection attempt is
 //! admitted against the fixed policy: per-source and global pending
 //! attempts, per-source and global 60-second fixed windows, a bounded
-//! source-bucket table with idle eviction, and the ten-second
+//! source-bucket table with idle eviction, and the configured
 //! authentication deadline owned by the session driver. A rejected
 //! attempt consumes no credential, performs no signing, consumes no
 //! rate-window budget, and leaves no limiter state behind: both windows

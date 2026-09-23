@@ -2,7 +2,10 @@ use std::{collections::BTreeSet, time::Duration};
 
 use crate::{Error, FeatureTag, Result};
 
-#[derive(Debug)]
+/// The node configuration: every knob is a plain value, clonable so one
+/// construction site can share a calibrated config across nodes or retry
+/// a start without rebuilding it.
+#[derive(Clone, Debug)]
 pub struct NodeConfig {
   anti_entropy_interval: Duration,
   recovery: RecoveryConfig,
@@ -15,6 +18,13 @@ pub struct NodeConfig {
   // authentication deadline, which starts only after the connect
   // returns.
   dial_deadline: Duration,
+  // The wall-clock bound for the full session bootstrap exchange
+  // (handshake positions one through six, including the join-mode
+  // admission commit and grant adoption). One cluster-wide timing
+  // contract: recalibrated so a burst of joins paying slow-flash commit
+  // latencies still admits its tail, and tightened only downward by
+  // fast deployments (see `with_authentication_deadline`).
+  authentication_deadline: Duration,
   // A session with no authenticated traffic or owned in-flight work for
   // this long closes on host wall time. Zero disables.
   session_idle_timeout: Duration,
@@ -121,10 +131,31 @@ impl NodeConfig {
     Ok(self)
   }
 
+  /// Sets the authentication deadline: the wall-clock bound for the full
+  /// session bootstrap exchange, including the join-mode admission
+  /// commit and grant adoption (a durable fsync may cost hundreds of
+  /// milliseconds on slow flash, and concurrent joins queue behind it).
+  /// This constant is peer-visible — it bounds the other side's
+  /// handshake too — so it is part of the cluster-wide timing contract:
+  /// keep it uniform across a cluster and tighten it only for
+  /// uniformly fast deployments.
+  pub fn with_authentication_deadline(mut self, value: Duration) -> Result<Self> {
+    ensure_nonzero_duration(value, "authentication deadline")?;
+    self.authentication_deadline = value;
+    Ok(self)
+  }
+
   /// The dial deadline after which one outbound transport connect fails
   /// (consumed by the supervisor's dial paths; nonzero by construction).
   pub(crate) const fn dial_deadline(&self) -> Duration {
     self.dial_deadline
+  }
+
+  /// The authentication deadline for the full session bootstrap exchange
+  /// (consumed by the session driver's three timeout sites; nonzero by
+  /// construction).
+  pub(crate) const fn authentication_deadline(&self) -> Duration {
+    self.authentication_deadline
   }
 
   pub(crate) const fn receipt_retention(&self) -> Duration {
@@ -207,6 +238,13 @@ impl Default for NodeConfig {
     Self {
       anti_entropy_interval: Duration::from_millis(250),
       dial_deadline: Duration::from_secs(10),
+      // 30 s, not 10 s: the deadline covers the join-mode admission
+      // commit, and on slow flash one commit costs hundreds of
+      // milliseconds — a few concurrent joins pushed the tail of a
+      // burst past 10 s so joins failed persistently (the incident-B
+      // shape). The default must be safe on the slowest supported
+      // device; fast deployments tighten it, never the reverse.
+      authentication_deadline: Duration::from_secs(30),
       recovery: RecoveryConfig::default(),
       session_queue_messages: 256,
       session_queue_bytes: 8 * 1024 * 1024,
@@ -431,9 +469,10 @@ mod tests {
     assert_eq!(both.keepalive_timeout(), Duration::from_secs(15));
   }
 
-  /// The dial deadline accepts any nonzero duration (the default
-  /// matches the authentication deadline) and rejects zero: a zero
-  /// deadline would cancel every dial before the OS connect resolves.
+  /// The dial deadline accepts any nonzero duration and rejects zero: a
+  /// zero deadline would cancel every dial before the OS connect
+  /// resolves. The authentication deadline behaves the same, and its
+  /// default is the slow-device-safe 30 s calibration.
   #[test]
   fn dial_deadline_accepts_nonzero_and_rejects_zero() {
     let configured = NodeConfig::new()
@@ -443,6 +482,29 @@ mod tests {
     assert_eq!(NodeConfig::new().dial_deadline(), Duration::from_secs(10));
     let error = NodeConfig::new()
       .with_dial_deadline(Duration::ZERO)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// The authentication deadline accepts any nonzero duration, rejects
+  /// zero, and defaults to the 30 s calibration: the join-mode
+  /// admission commit sits inside the deadline, and slow-flash commits
+  /// pushed concurrent join bursts past the old 10 s value.
+  #[test]
+  fn authentication_deadline_accepts_nonzero_and_rejects_zero() {
+    let configured = NodeConfig::new()
+      .with_authentication_deadline(Duration::from_secs(45))
+      .unwrap();
+    assert_eq!(
+      configured.authentication_deadline(),
+      Duration::from_secs(45)
+    );
+    assert_eq!(
+      NodeConfig::new().authentication_deadline(),
+      Duration::from_secs(30)
+    );
+    let error = NodeConfig::new()
+      .with_authentication_deadline(Duration::ZERO)
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }

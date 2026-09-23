@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::{SessionDriver, connection_frame_rules};
 use crate::{
-  Digest, ErrorKind, FeatureTag,
+  Digest, ErrorKind, FeatureTag, NodeConfig,
   identity::{
     credential::MergeCredentialIssuer,
     lifecycle::{LocalIdentityContext, ensure_self_binding},
@@ -68,6 +68,7 @@ async fn node_from(
     entropy.clone(),
     issuer.clone(),
     offer,
+    NodeConfig::new().authentication_deadline(),
   );
   Node {
     context,
