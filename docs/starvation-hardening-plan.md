@@ -62,16 +62,21 @@ the deadline, and joins fail **persistently** (every attempt times
 out) — the same shape as incident B.
 
 **Change**:
-- `NodeConfig::with_authentication_deadline(Duration)`, default stays
-  10 s; the supervisor passes it into the runtime dependencies and
+- `NodeConfig::with_authentication_deadline(Duration)`, default
+  recalibrated 10 s → 30 s (WP5's single timing profile: the default is
+  the cluster-wide contract and must be safe on slow flash; fast
+  deployments tighten it back — tuning direction is "faster"); the
+  supervisor passes it into the runtime dependencies and
   `SessionDriver` reads it from there.
 - The three call sites (`driver.rs:201`, `:403`, `:467`) converge to
   that single source for both the join and member paths.
-- `guide` gains the low-power recommendation: 30–60 s.
+- `guide` documents the knob under the mixed-cluster uniformity rule
+  (WP5): keep it cluster-wide, do not tune per device.
 
 **Acceptance**: the simulation matrix gains a "commit latency
-injection" scenario (see WP6) where joins fail under the default
-deadline and succeed with the enlarged one; neither path regresses.
+injection" scenario (see WP6) where joins fail under a tightened
+deadline and succeed under the recalibrated default; neither path
+regresses.
 
 ### WP2 — Merge admission limiter redesign 【P0 · largest item】
 
@@ -156,24 +161,41 @@ whole attempt (the structural cause of incident C).
 hops × budget; a simulation injecting delay at hop ⌈k/2⌉ shows the
 attempt failing within a deterministic bound and succeeding on retry.
 
-### WP5 — Low-power device profile 【P1 · medium】
+### WP5 — One timing profile: recalibrated defaults, no device profiles 【P1 · medium】
+
+**Adjustment (design review)**: a second, named low-power profile is
+architecturally wrong for this stack. Every protocol-timing constant is
+peer-visible — keepalive and idle deadlines, authentication deadlines,
+anti-entropy cadence — so two coexisting profile classes produce mixed
+clusters where the fast profile's observers close sessions the slow
+profile still considers alive, and each side's recovery plane then
+triggers the other's admission limits. Timing constants are a
+cluster-wide contract, not a per-device choice.
 
 **Change**:
-- `NodeBuilder` gains a first-class profile: `NodeBuilder::low_power()`
-  (or `DeviceProfile::LowPower`) setting, in one place:
-  anti-entropy 1–2 s, liveness (idle 90 s / ping 20 s / timeout 60 s),
-  queues (64 messages / 1 MiB), recovery (fan_out 8 / max 120 s),
-  dial deadline 30 s, authentication deadline 30 s (WP1), trace
-  metadata one notch down, parser limits tightened.
+- No `DeviceProfile`, no `NodeBuilder::low_power()`. `NodeConfig`
+  stays the single knob surface, and the library ships exactly one
+  profile — the defaults — recalibrated to be safe on the slowest
+  supported device (principle 2): authentication deadline 30 s (WP1),
+  anti-entropy 1 s (incident C), liveness idle 90 s / ping 20 s /
+  timeout 60 s, recovery fan_out 16 / initial backoff 2 s (WP3), relay
+  per-hop budget 5 s (WP4). Tuning direction is "faster"; nothing
+  needs tuning to work.
+- Device-*local* knobs stay generous by default (session queues,
+  parser limits, trace metadata): they never cross the wire, so tuning
+  them per device is safe; the guide documents that distinction
+  instead of encoding it as a second profile.
 - `guide` gains a "deploying on low-performance devices" chapter: the
   memory/neighbor budget formula (per-session queue × neighbors +
-  trace metadata + storage), the application retry-queue pattern under
-  the at-most-once contract (referencing the chat example), and
-  liveness tuning for duty-cycled devices.
+  trace metadata + storage), the cluster-uniformity rule for timing
+  knobs, the per-device-safe resource knobs, and the application
+  retry-queue pattern under the at-most-once contract (referencing the
+  chat example).
 
-**Acceptance**: the profile expands to exactly the hand-written
-equivalent (unit test asserts every expanded value); documentation
-walkthrough.
+**Acceptance**: a defaults test asserts every recalibrated value with
+its incident rationale; the mixed-cluster simulation runs the same
+defaults on fast and slow (injected-delay) nodes without divergence;
+documentation walkthrough.
 
 ### WP6 — Starvation CI gate 【P0 · small, lands first】
 
@@ -193,22 +215,24 @@ walkthrough.
 written red before their fix and green after — the gate lands first so
 behavior changes cannot outrun the tests.
 
-### WP7 — Anti-entropy load adaptation 【P2 · deferrable】
+### WP7 — Anti-entropy load: recalibrated interval + documented formula 【P2 · documentation】
 
-A fixed 250 ms interval at N nodes costs O(N²) aggregate load per
-interval. Options: step the interval by member-table scale (≤16 nodes:
-250 ms, ≤64: 1 s, larger: 2 s), or at minimum document the
-N × interval load formula with recommendations in `guide`. Depends on
-the WP6 gate to prove no regression.
+A fixed interval at N nodes costs O(N × interval) per-node load per
+round (O(N²) aggregate). No adaptive machinery: stepped intervals
+would reintroduce per-node divergence of a timing constant — the exact
+mixed-cluster failure WP5 removes. WP5's single profile recalibrates
+the default 250 ms → 1 s (incident C), and the `guide` documents the
+N × interval load formula with sizing recommendations. Depends on the
+WP6 gate to prove no regression.
 
 ## 4. Sequencing and dependencies
 
 ```
 WP6 (gate first) ──► WP1 (deadline configurable) ──┐
-                 └─► WP3 (defaults + jitter) ──────┼─► WP5 (profile closes it out)
+                 └─► WP3 (defaults + jitter) ──────┼─► WP5 (recalibrated defaults close it out)
 WP2 (limiter redesign, separate branch) ───────────┤
 WP4 (per-hop budgets) ─────────────────────────────┘
-WP7 as needed
+WP7 (documentation) rides with WP5
 ```
 
 - **WP6 lands first**: everything after it needs its regression
@@ -240,7 +264,8 @@ WP7 as needed
 
 - The WP6 gate is green, and each historical incident (A/B/C) has a
   red-to-green case reproducing the old defect.
-- WP1–WP5 merged; defaults satisfy the "safe on the slowest supported
-  device" principle.
+- WP1–WP5 merged; the single recalibrated profile (the defaults)
+  satisfies the "safe on the slowest supported device" principle with
+  no second profile in the codebase.
 - The `guide` low-power chapter is live; per the lifecycle rules in
   `README.md`, this file is archived/deleted.
