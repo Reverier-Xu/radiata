@@ -729,10 +729,21 @@ async fn membership_sync_tick_peer(
       // The pass is complete for this revision: reset the cursor and
       // mark the peer fully delivered. No payload this round, so no
       // delivery verdict is needed to re-arm the snapshot cadence.
+      tracing::debug!(
+        peer = %peer,
+        revision = snapshot.revision(),
+        "trust snapshot pass complete"
+      );
       state.snapshot_cursor = None;
       state.snapshot_rev = snapshot.revision();
       state.ticks_since_snapshot_send = 0;
     } else {
+      tracing::debug!(
+        peer = %peer,
+        revision = snapshot.revision(),
+        bindings = page.bindings().len(),
+        "dispatching trust snapshot page"
+      );
       snapshot_page_cursor = page.continuation().cloned();
       snapshot_page = Some(SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?);
     }

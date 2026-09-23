@@ -1,6 +1,6 @@
 {
   "dm_receipt_seconds": 0.0,
-  "hub_death_recovery_seconds": 0.8,
+  "hub_death_recovery_seconds": 6.7,
   "hub_death_recovery": "isolated-queued-reconnected-through-another-member-flushed",
   "offline_dm": {
     "path": "queued-delivered-read",
