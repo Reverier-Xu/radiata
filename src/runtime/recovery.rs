@@ -2,8 +2,6 @@
 //! authenticated session set, forward-entry selection for packet relay,
 //! and the bounded recovery tick.
 
-use std::sync::Arc;
-
 use tracing::debug;
 
 use super::supervisor::{Supervisor, dial_member};
@@ -343,7 +341,22 @@ impl Supervisor {
         let packet = self.packet.clone();
         let shutdown = self.shutdown_tx.subscribe();
         let pending = std::sync::Arc::clone(&self.recovery_pending);
-        let transport = Arc::clone(&self.dependencies.transport);
+        let transport = match self
+          .dependencies
+          .extensions
+          .resolve_transport(&endpoint.selector())
+        {
+          Ok(transport) => transport,
+          // No transport for the endpoint: the detached dial fails and
+          // releases its in-flight slot through the normal error path.
+          Err(error) => {
+            let _ = self
+              .recovery_pending
+              .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(endpoint = %endpoint.as_str(), kind = ?error.kind(), "recovery dial unresolvable");
+            continue;
+          }
+        };
         let dial_deadline = self.dependencies.config.dial_deadline();
         tokio::spawn(async move {
           if let Err(error) = dial_member(

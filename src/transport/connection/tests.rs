@@ -20,9 +20,10 @@ use crate::{
   ErrorKind, Result,
   transport::{
     cert::EphemeralCertificate,
+    framing::MergeHint,
     testing::{SeedEntropy, server_name},
     tls::{crypto_provider, member_client_config, merge_client_config, server_config},
-    ws::{self, MAX_MESSAGE_BYTES, MergeHint},
+    ws::{self, MAX_MESSAGE_BYTES},
   },
 };
 
@@ -61,14 +62,15 @@ async fn tls_transport_merge_hint_round_trips_inside_the_tls_channel() {
     let hint = hint.clone();
     async move {
       let (tcp, _) = listener.accept().await.unwrap();
-      Connection::accept(tcp, config, rules(), Some(&hint)).await
+      Connection::accept_tls_ws(tcp, config, rules(), Some(&hint)).await
     }
   });
 
   let tcp = TcpStream::connect(address).await.unwrap();
-  let client = Connection::connect(tcp, merge_client_config().unwrap(), server_name(), rules())
-    .await
-    .unwrap();
+  let client =
+    Connection::connect_tls_ws(tcp, merge_client_config().unwrap(), server_name(), rules())
+      .await
+      .unwrap();
   assert_eq!(client.merge_hint(), Some(&hint));
   let server = server.await.unwrap().unwrap();
   assert_eq!(server.merge_hint(), None);
@@ -97,11 +99,11 @@ async fn loopback_pair_with(
   let address = listener.local_addr().unwrap();
   let server = tokio::spawn(async move {
     let (tcp, _) = listener.accept().await.unwrap();
-    Connection::accept(tcp, config, rules(), None).await
+    Connection::accept_tls_ws(tcp, config, rules(), None).await
   });
 
   let tcp = TcpStream::connect(address).await.unwrap();
-  let client = Connection::connect(tcp, client_config, server_name(), rules())
+  let client = Connection::connect_tls_ws(tcp, client_config, server_name(), rules())
     .await
     .unwrap();
   let server = server.await.unwrap().unwrap();
@@ -136,11 +138,12 @@ async fn raw_loopback() -> (
 
 fn framed(stream: WebSocketStream<TlsStream<TcpStream>>) -> Connection {
   Connection {
-    stream,
+    io: super::TransportIo::Ws(Box::new(stream)),
     rules: rules(),
     channel_binding: [0; CHANNEL_BINDING_LEN],
     merge_hint: None,
     peer_addr: None,
+    attributable: true,
     pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
   }
 }
@@ -255,7 +258,7 @@ async fn connect_to_hostile_server(
 
   let tcp = TcpStream::connect(address).await.unwrap();
   let client =
-    Connection::connect(tcp, merge_client_config().unwrap(), server_name(), rules()).await;
+    Connection::connect_tls_ws(tcp, merge_client_config().unwrap(), server_name(), rules()).await;
   let outcome = server.await.unwrap();
   (
     client,
@@ -470,10 +473,10 @@ async fn tls_transport_member_mode_binds_expected_leaf_key() {
   let address = listener.local_addr().unwrap();
   let server = tokio::spawn(async move {
     let (tcp, _) = listener.accept().await.unwrap();
-    Connection::accept(tcp, config, rules(), None).await
+    Connection::accept_tls_ws(tcp, config, rules(), None).await
   });
   let tcp = TcpStream::connect(address).await.unwrap();
-  let result = Connection::connect(
+  let result = Connection::connect_tls_ws(
     tcp,
     member_client_config(unexpected).unwrap(),
     server_name(),

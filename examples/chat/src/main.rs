@@ -8,6 +8,8 @@ mod chat;
 mod http;
 mod http_client;
 mod store;
+#[cfg(unix)]
+mod unix_transport;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -32,7 +34,11 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn load_config() -> Config {
   Config {
-    listen: env_or("LISTEN", "wss://127.0.0.1:9443"),
+    // tls:// (default) for the open internet, wss:// behind
+    // web-traffic-only firewalls, tcp:// on closed intranets with
+    // constrained devices, and unix:///path/to/socket for same-host
+    // IPC between co-located nodes (see src/unix_transport.rs).
+    listen: env_or("LISTEN", "tls://127.0.0.1:9443"),
     http_listen: env_or("HTTP_LISTEN", "0.0.0.0:8080"),
     data: PathBuf::from(env_or("DATA", "/data")),
     user: env_or("CHAT_USER", "anonymous"),
@@ -75,6 +81,18 @@ async fn main() {
       Arc::new(ChatConsumer::new(Arc::clone(&store))),
     )
     .expect("register chat protocol");
+
+  // The unix:// transport is one extra registration: once the scheme
+  // name is bound, LISTEN=unix:///run/chat.sock and every merge target
+  // of the form unix://... dial through it. Unix sockets are same-host
+  // only; nodes behind that address scheme must share the filesystem.
+  #[cfg(unix)]
+  extensions
+    .register_transport(
+      radiata::TransportName::parse(unix_transport::UNIX_SCHEME).expect("static scheme name"),
+      Arc::new(unix_transport::UnixTransport),
+    )
+    .expect("register unix transport");
 
   let node = NodeBuilder::new(storage)
     .config(radiata::NodeConfig::new().with_route_policy(

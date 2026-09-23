@@ -3,9 +3,10 @@
 //! [`ExtensionRegistry::register_protocol`] binds a [`ProtocolDefinition`]
 //! to the [`PacketConsumer`] that receives admitted incoming streams for
 //! that protocol tag, alongside caller registration of feature
-//! definitions, load-balancing policies, and next-hop routing policies.
-//! The runtime installs the built-in WSS transport and core protocols at
-//! startup through the same registry.
+//! definitions, load-balancing policies, and next-hop routing policies,
+//! and caller registration of custom transports. The runtime seeds the
+//! built-in transports and core protocols at startup through the same
+//! registry: it is the single map from endpoint selector to transport.
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -14,8 +15,12 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 #[cfg(test)]
 use crate::{DiscoveryTag, transport::registry::Discovery};
 use crate::{
-  Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag, api::BoxFuture,
-  transport::registry::Transport,
+  Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag,
+  api::BoxFuture,
+  transport::{
+    TransportSelector,
+    registry::{CustomTransport, CustomTransportAdapter, Transport, builtin_transport_tag},
+  },
 };
 
 /// The immutable definition of one domain-qualified packet protocol: its
@@ -64,6 +69,9 @@ pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,
   protocols: std::sync::Mutex<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
   transports: BTreeMap<TransportTag, Arc<dyn Transport>>,
+  /// The caller-registered custom transports, keyed by the scheme name
+  /// (protocol prefix) each one owns.
+  schemes: BTreeMap<crate::transport::TransportName, Arc<dyn Transport>>,
   #[cfg(test)]
   discoveries: BTreeMap<DiscoveryTag, Arc<dyn Discovery>>,
   load_balancers:
@@ -121,15 +129,64 @@ impl ExtensionRegistry {
     definition.and_then(|definition| definition.definition_digest().ok())
   }
 
-  /// Registers one transport implementation under its canonical tag. A
-  /// duplicate tag, a malformed or reserved tag, or a registration that
-  /// conflicts with an existing entry is rejected before use; the built-in
-  /// WSS transport is always present.
-  pub(crate) fn register_transport(
+  /// Registers one caller-defined transport under its addressing scheme
+  /// name (the protocol prefix of the custom endpoint form
+  /// `<name>://<opaque>`). The name is unique per node: a duplicate, a
+  /// reserved name, or any other conflict is rejected before use. The
+  /// built-in transports are seeded by the runtime under their own
+  /// schemes and cannot be shadowed from here.
+  ///
+  /// This is the public extension surface of the transport layer: the
+  /// registry is the single map from endpoint selector to transport,
+  /// and a registered name becomes dialable through the canonical
+  /// custom form `<name>://<opaque-address>`. The binding is node-local:
+  /// endpoints exchanged across nodes assume both sides bound the name
+  /// identically, and a mismatch fails at the session handshake's
+  /// identity proofs rather than silently.
+  pub fn register_transport(
+    &mut self, name: crate::transport::TransportName, transport: Arc<dyn CustomTransport>,
+  ) -> Result<&mut Self> {
+    let adapter = Arc::new(CustomTransportAdapter::new(
+      Arc::clone(&transport),
+      name.clone(),
+    )?);
+    insert_once(&mut self.schemes, name, adapter, "transport registration")?;
+    Ok(self)
+  }
+
+  /// Registers one built-in transport implementation under its canonical
+  /// tag. Crate-private: only the runtime seeds built-ins, and only when
+  /// the tag is still free.
+  pub(crate) fn register_builtin_transport(
     &mut self, tag: TransportTag, value: Arc<dyn Transport>,
   ) -> Result<&mut Self> {
     insert_once(&mut self.transports, tag, value, "transport registration")?;
     Ok(self)
+  }
+
+  /// Resolves one endpoint's transport selector through the map: the
+  /// built-in transports and every caller-registered custom transport
+  /// merge into one resolution namespace, and a selector that resolves
+  /// to nothing fails typed here — at dial or listen time, never at
+  /// parse time (endpoint parsing is purely syntactic and
+  /// registry-free).
+  pub(crate) fn resolve_transport(
+    &self, selector: &TransportSelector,
+  ) -> Result<Arc<dyn Transport>> {
+    match selector {
+      TransportSelector::Builtin(scheme) => {
+        let tag = builtin_transport_tag(*scheme)?;
+        self
+          .transport(&tag)
+          .cloned()
+          .ok_or_else(|| Error::not_found("transport"))
+      }
+      TransportSelector::Custom(name) => self
+        .schemes
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Error::not_found("transport")),
+    }
   }
 
   /// Registers one discovery implementation under its canonical tag, with

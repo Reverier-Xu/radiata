@@ -57,7 +57,12 @@ impl Prelude {
     ]
   }
 
-  fn decode(bytes: &[u8]) -> Result<Self> {
+  /// The declared body length in bytes.
+  pub(crate) const fn body_len(self) -> u32 {
+    self.body_len
+  }
+
+  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
     if bytes.len() < PRELUDE_LEN || bytes[..4] != MAGIC {
       return Err(Error::invalid_input("wire prelude"));
     }

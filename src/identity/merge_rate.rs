@@ -38,11 +38,16 @@ pub(crate) const SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(600);
 /// The canonical merge source. The peer port is dropped (ephemeral
 /// reconnects are aliases of one source), IPv4-mapped IPv6 collapses to its
 /// IPv4 form, so every alias of one source shares one bucket
-/// (normalized-source aliases).
+/// (normalized-source aliases). A medium without peer addresses (a
+/// caller-registered custom transport) attributes its attempts to one
+/// shared per-medium bucket derived from the transport class binding:
+/// the fixed limits still bound it, just at the coarsest attribution
+/// the medium supports.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MergeSource {
   V4([u8; 4]),
   V6([u8; 16]),
+  Medium([u8; 16]),
 }
 
 impl MergeSource {
@@ -54,6 +59,14 @@ impl MergeSource {
         None => Self::V6(v6.octets()),
       },
     }
+  }
+
+  /// The shared bucket of one addressless medium, derived from the
+  /// transport class channel binding (per-transport-tag constant).
+  pub(crate) fn medium(class_binding: &[u8; 32]) -> Self {
+    let mut medium = [0_u8; 16];
+    medium.copy_from_slice(&class_binding[..16]);
+    Self::Medium(medium)
   }
 }
 
