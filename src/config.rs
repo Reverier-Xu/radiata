@@ -36,9 +36,6 @@ pub struct NodeConfig {
   // keepalive result is closed. Zero disables keepalive.
   keepalive_interval: Duration,
   keepalive_timeout: Duration,
-  // Caller-selected packet parser limits: depth, collection items,
-  // and frame bytes bound every packet-body decode allocation.
-  parser_limits: ParserLimits,
   trace_metadata_limits: TraceMetadataLimits,
   route_policy: Option<crate::QualifiedTag>,
   receipt_retention: Duration,
@@ -51,17 +48,27 @@ impl NodeConfig {
     Self::default()
   }
 
+  /// Sets the anti-entropy tick interval. The tick's cost scales with
+  /// the member table (N × interval per round cluster-wide); a cluster
+  /// keeping one interval keeps its load predictable (nonzero).
   pub fn with_anti_entropy_interval(mut self, value: Duration) -> Result<Self> {
     ensure_nonzero_duration(value, "anti-entropy interval")?;
     self.anti_entropy_interval = value;
     Ok(self)
   }
 
+  /// Sets the recovery policy: fan-out, initial backoff, and maximum
+  /// backoff for the any-one-route healing plane. A purely self-side
+  /// cadence — peers observe dials, never the policy.
   pub fn with_recovery_policy(mut self, value: RecoveryConfig) -> Result<Self> {
     self.recovery = value;
     Ok(self)
   }
 
+  /// Sets the session queue limits: the outbound frame queue's message
+  /// count (also the per-session concurrent admission bound) and byte
+  /// budget. Local memory and backpressure only — it never crosses the
+  /// wire, so per-device scaling is safe (both nonzero).
   pub fn with_session_queue_limits(mut self, messages: usize, bytes: usize) -> Result<Self> {
     ensure_nonzero(messages, "session queue messages")?;
     ensure_nonzero(bytes, "session queue bytes")?;
@@ -76,7 +83,9 @@ impl NodeConfig {
   /// values zero disable the policy; otherwise `idle_timeout` or
   /// `keepalive_interval` must be nonzero, and a configured keepalive
   /// requires `keepalive_interval > 0` with
-  /// `keepalive_timeout > keepalive_interval`.
+  /// `keepalive_timeout > keepalive_interval`. These deadlines are
+  /// peer-visible: keep them uniform across a cluster, or the tighter
+  /// side closes sessions the looser side still holds alive.
   pub fn with_session_liveness(
     mut self, idle_timeout: Duration, keepalive_interval: Duration, keepalive_timeout: Duration,
   ) -> Result<Self> {
@@ -98,12 +107,10 @@ impl NodeConfig {
     Ok(self)
   }
 
-  /// Sets the parser limits: every packet-frame decode enforces them.
-  pub fn with_parser_limits(mut self, value: ParserLimits) -> Result<Self> {
-    self.parser_limits = value;
-    Ok(self)
-  }
-
+  /// Sets the trace metadata budget: the bounded population of in-flight
+  /// route traces, terminal records, and their retention. Purely local
+  /// diagnostics — it never crosses the wire, so shrinking it per
+  /// device is safe (the cost is only diagnostic depth).
   pub fn with_trace_metadata_limits(mut self, value: TraceMetadataLimits) -> Result<Self> {
     self.trace_metadata_limits = value;
     Ok(self)
@@ -135,9 +142,12 @@ impl NodeConfig {
   }
 
   /// Sets the outbound dial deadline: the bound for one transport
-  /// connect (TCP dial, TLS handshake, and WebSocket upgrade). Distinct
-  /// from the authentication deadline, which starts only after the
-  /// connect returns.
+  /// connect (TCP dial, TLS handshake, and WebSocket upgrade). The
+  /// dialed peer never observes it, so per-device tuning is safe — but
+  /// keep it above this device's worst-case connect plus handshake
+  /// time, or every dial expires before it can succeed. Distinct from
+  /// the authentication deadline, which starts only after the connect
+  /// returns.
   pub fn with_dial_deadline(mut self, value: Duration) -> Result<Self> {
     ensure_nonzero_duration(value, "dial deadline")?;
     self.dial_deadline = value;
@@ -161,11 +171,11 @@ impl NodeConfig {
   /// Sets the per-hop relay budget: how long one forwarded-open hop
   /// waits for its downstream acknowledgment before the attempt fails
   /// locally (the branch search continues, or the typed `Failed`
-  /// surfaces upstream). Without this budget a k-hop attempt's latency
-  /// is bounded only transitively, by the liveness policies of the
-  /// sessions on both ends of every hop, so one hiccup at any hop
-  /// stranded the whole attempt for the longest bound in the chain.
-  /// With it, a k-hop attempt is bounded by `k ×` this budget.
+  /// surfaces upstream). Each hop bounds its own branch and the value
+  /// never crosses the wire, but uniform values keep a k-hop attempt's
+  /// latency predictable at `k ×` this budget. Without a budget at all
+  /// a stuck hop would hang to the transitive liveness bound of the
+  /// sessions on the path.
   pub fn with_relay_hop_deadline(mut self, value: Duration) -> Result<Self> {
     ensure_nonzero_duration(value, "relay hop deadline")?;
     self.relay_hop_deadline = value;
@@ -234,16 +244,6 @@ impl NodeConfig {
   pub(crate) const fn trace_metadata_limits(&self) -> &TraceMetadataLimits {
     &self.trace_metadata_limits
   }
-
-  /// The packet parser limits as canonical-decoder bounds: depth, item
-  /// count, and frame bytes map one-to-one onto the CBOR layer's checks.
-  pub(crate) const fn parser_cbor_limits(&self) -> crate::protocol::CborLimits {
-    crate::protocol::CborLimits::new(
-      self.parser_limits.depth,
-      self.parser_limits.collection_items as u64,
-      self.parser_limits.frame_bytes,
-    )
-  }
   /// The node's effective next-hop routing policy tag: the caller-selected
   /// tag, or the built-in default policy's tag when unset (the builder
   /// registers that policy out of the box).
@@ -309,7 +309,6 @@ impl Default for NodeConfig {
       session_idle_timeout: Duration::from_secs(90),
       keepalive_interval: Duration::from_secs(20),
       keepalive_timeout: Duration::from_secs(60),
-      parser_limits: ParserLimits::default(),
       trace_metadata_limits: TraceMetadataLimits::default(),
       route_policy: None,
       receipt_retention: Duration::from_secs(30 * 24 * 60 * 60),
@@ -423,36 +422,6 @@ impl Default for MergeAdmissionLimits {
     // 64-node deployments the chaos lane exercises, and every value is
     // overridable through `for_cluster` or the pool setters.
     Self::scaled(64)
-  }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ParserLimits {
-  frame_bytes: usize,
-  depth: usize,
-  collection_items: usize,
-}
-
-impl ParserLimits {
-  pub fn new(frame_bytes: usize, depth: usize, collection_items: usize) -> Result<Self> {
-    ensure_nonzero(frame_bytes, "parser frame bytes")?;
-    ensure_nonzero(depth, "parser depth")?;
-    ensure_nonzero(collection_items, "parser collection items")?;
-    Ok(Self {
-      frame_bytes,
-      depth,
-      collection_items,
-    })
-  }
-}
-
-impl Default for ParserLimits {
-  fn default() -> Self {
-    Self {
-      frame_bytes: crate::protocol::MAX_BODY_BYTES,
-      depth: 16,
-      collection_items: 1_024,
-    }
   }
 }
 

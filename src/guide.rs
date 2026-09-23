@@ -357,58 +357,37 @@
 //!
 //! # 7. Deploying on low-performance devices
 //!
-//! There is exactly **one timing profile in this library: the
-//! defaults**. Every timing constant is peer-visible — the other side
-//! of each session enforces the same deadlines you do — so timing is a
-//! cluster-wide contract, not a per-device choice. The defaults are
-//! already calibrated for the slowest supported device (slow flash,
-//! one or two cores, duty-cycled peers); a mixed cluster of fast and
-//! slow nodes needs no configuration at all. Tuning direction is
-//! "faster": tighten only for uniformly fast deployments, never loosen
-//! per device.
+//! **There is nothing to configure.** Build the node, form the
+//! cluster, send data — the defaults are the deployment. The library
+//! ships exactly one timing profile and it is calibrated for the
+//! slowest supported device (slow flash, one or two cores, duty-cycled
+//! peers): a mixed cluster of fast and slow nodes runs on the same
+//! defaults with no per-device profiles, because every timing constant
+//! is peer-visible and timing divergence is what breaks mixed
+//! clusters.
 //!
-//! **Timing knobs — keep uniform across the cluster:**
+//! Two sizes are worth knowing, and the defaults already answer both:
 //!
-//! - `with_authentication_deadline` (30 s): bounds the full bootstrap exchange
-//!   including the join admission commit, so a burst of joins paying slow-flash
-//!   writes still admits its tail.
-//! - `with_session_liveness` (90 s idle, 20 s ping, 60 s timeout): a
-//!   duty-cycled peer may skip several pings without the faster side tearing
-//!   its sessions down.
-//! - `with_anti_entropy_interval` (1 s): the tick costs N × interval per-node
-//!   load per round (N² aggregate over a cluster), so size the interval by the
-//!   member count — 16 nodes ≈ 16 ticks/s of work cluster-wide at 1 s, and 64
-//!   nodes is the practical ceiling at this cadence on two slow cores.
-//! - `with_recovery_policy` (fan-out 16, 2 s initial backoff): the
-//!   any-one-route contract needs exactly one route; larger bursts starve their
-//!   own tails on slow cores.
-//! - `with_relay_hop_deadline` (5 s): a routed stream that crosses k hops is
-//!   acknowledged within k × this budget, and a stuck hop fails its branch
-//!   locally instead of stranding the attempt.
+//! - **Memory** is roughly `queue bytes × live neighbors` plus local
+//!   diagnostics and storage. The defaults fit the reference scale;
+//!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
+//!   is the one knob that changes it materially.
+//! - **Background load** is the anti-entropy tick: `N × interval` work per
+//!   round cluster-wide. At the default one-second tick this stays negligible
+//!   through the tens of nodes and bounded at the 64-node reference scale.
 //!
-//! **Resource knobs — safe to tune per device:**
+//! Delivery across restarts stays the application's job (the data
+//! plane is at-most-once): a `Failed` or interrupted stream is a
+//! typed, bounded observation, not a silent loss. The chat example
+//! ships the reference pattern — queue locally, re-drive on the typed
+//! outcome, and let the bounded budgets turn congestion into fast
+//! failures instead of queueing.
 //!
-//! These never cross the wire; scale them to the local hardware:
-//!
-//! - `with_session_queue_limits`: the memory formula is roughly `queue_bytes ×
-//!   live neighbors + terminal route records` (plus storage). A 64-neighbor
-//!   node with 1 MiB queues should budget at least 64 MiB for the data plane
-//!   alone.
-//! - `with_parser_limits`: shrinking frame bytes, depth, and collection items
-//!   bounds every decode allocation on small devices.
-//! - `with_trace_metadata_limits`: terminal route-record retention is pure
-//!   local memory; one notch down frees it for queues.
-//! - `with_dial_deadline`: bounds only this node's outbound connects; the
-//!   dialed peer never observes it.
-//!
-//! **Application retries stay yours.** The data plane is at-most-once:
-//! a `Failed` or interrupted stream is a typed, bounded observation,
-//! not a silent loss, and delivery across restarts belongs to the
-//! application (or durable resources). The chat example ships the
-//! reference pattern — an outbound queue that re-drives on typed
-//! stream outcomes — which is also the right shape for slow devices:
-//! queue locally, retry with backoff, and let the bounded budgets
-//! above turn congestion into fast failures instead of queueing.
+//! The setters on [`NodeConfig`](crate::NodeConfig) are operator
+//! escape hatches for *measured* problems, not integration steps: the
+//! timing ones are cluster-wide contracts and must move together; the
+//! resource ones (queues, diagnostics budget, dial deadline) are safe
+//! to scale per device. Their contracts live on the type.
 //!
 //! # Storage
 //!

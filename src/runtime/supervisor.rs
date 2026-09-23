@@ -643,7 +643,7 @@ fn session_packet_context(
     crate::routing::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
     dependencies.config.trace_metadata_limits().active(),
     Arc::clone(&dependencies.connection_tasks),
-    dependencies.config.parser_cbor_limits(),
+    crate::protocol::CONTROL_CBOR_LIMITS,
     dependencies.config.relay_hop_deadline(),
   ))
 }

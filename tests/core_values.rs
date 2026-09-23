@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 use radiata::{
-  Digest, DiscoveryTag, Endpoint, ErrorKind, FeatureTag, NodeConfig, NodeId, ParserLimits,
-  ProtocolTag, ProviderErrorContext, ProviderErrorKind, PublicKey, QualifiedTag, RecoveryConfig,
-  Signature, TraceId, TraceMetadataLimits, TransactionId, TransportTag,
+  Digest, DiscoveryTag, Endpoint, ErrorKind, FeatureTag, NodeConfig, NodeId, ProtocolTag,
+  ProviderErrorContext, ProviderErrorKind, PublicKey, QualifiedTag, RecoveryConfig, Signature,
+  TraceId, TraceMetadataLimits, TransactionId, TransportTag,
 };
 
 #[test]
@@ -115,7 +115,6 @@ fn core_endpoints_reject_noncanonical_dns_hosts() {
 
 #[test]
 fn core_config_accepts_nonzero_values_above_the_default_maxima() {
-  let parser = ParserLimits::new(16 * 1024 * 1024, 2_048, 2_048).unwrap();
   let trace =
     TraceMetadataLimits::new(65_537, 1_048_577, Duration::from_secs(31 * 24 * 60 * 60)).unwrap();
   let recovery =
@@ -129,8 +128,6 @@ fn core_config_accepts_nonzero_values_above_the_default_maxima() {
     .unwrap()
     .with_session_queue_limits(1_025, 32 * 1024 * 1024 + 1)
     .unwrap()
-    .with_parser_limits(parser)
-    .unwrap()
     .with_trace_metadata_limits(trace)
     .unwrap()
     .with_receipt_retention(Duration::from_secs(31 * 24 * 60 * 60))
@@ -141,9 +138,6 @@ fn core_config_accepts_nonzero_values_above_the_default_maxima() {
 
 #[test]
 fn core_config_rejects_only_invalid_foundation_relationships() {
-  assert!(ParserLimits::new(0, 1, 1).is_err());
-  assert!(ParserLimits::new(1, 0, 1).is_err());
-  assert!(ParserLimits::new(1, 1, 0).is_err());
   assert!(TraceMetadataLimits::new(0, 1, Duration::from_secs(1)).is_err());
   assert!(TraceMetadataLimits::new(1, 0, Duration::from_secs(1)).is_err());
   assert!(TraceMetadataLimits::new(1, 1, Duration::ZERO).is_err());
