@@ -43,9 +43,8 @@ use radiata::{
   BoxFuture, ConnectMember, CustomListener, CustomTransport, DisconnectPeer, Endpoint, Error,
   FeatureTag, GetLocalNode, GetRecovery, IssueMergeCredential, LeaveCluster, Listen, MemberStatus,
   MergeCluster, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer,
-  PageMembers, PageSpec, ProtocolDefinition, ProtocolTag, RecoveryConfig, Result, RoutingPolicy,
-  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TransportName, TransportStream,
-  WaitForShutdown,
+  PageMembers, PageSpec, ProtocolDefinition, ProtocolTag, Result, RoutingPolicy, ShutdownReason,
+  StreamMetadata, StreamPolicy, StreamTarget, TransportName, TransportStream, WaitForShutdown,
 };
 mod common;
 
@@ -56,13 +55,6 @@ use common::MemoryStorageFactory;
 const NODES: usize = 64;
 const STAR_SPOKES: usize = 12;
 const BUS_LINES: usize = 3;
-/// The recovery burst is capped well below the cluster size: on a
-/// two-vcpu CI runner a 63-dial step starves its own tail past the
-/// fixed ten-second authentication deadline, so every dial in the burst
-/// fails and the isolated member never heals. Sixteen concurrent dials
-/// converge in a step or two under the same starvation; the
-/// any-one-route contract needs exactly one to land.
-const RECOVERY_FAN_OUT: usize = 16;
 /// The per-phase budgets assume a contended machine, not a quiet one:
 /// 63 joins, 256 listeners, and the churn window share one runtime.
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(240);
@@ -483,21 +475,15 @@ fn init_tracing() {
 }
 
 fn node_config() -> NodeConfig {
-  // One second, not the sixteen-node lanes' 250 ms: sixty-four nodes
-  // ticking four times a second saturate a two-vcpu runner and starve
-  // the data plane's relay acks. Convergence checks drive their own
-  // deterministic rounds, so the wall interval only backstops them.
+  // The recovery policy is the recalibrated default (fan-out sixteen,
+  // two-second initial backoff): the lane is the evidence that the
+  // defaults survive a starved two-vcpu-class runner, so it pins
+  // nothing. One second, not the sixteen-node lanes' 500 ms: sixty-four
+  // nodes ticking four times a second saturate a two-vcpu runner and
+  // starve the data plane's relay acks. Convergence checks drive their
+  // own deterministic rounds, so the wall interval only backstops them.
   NodeConfig::new()
     .with_anti_entropy_interval(Duration::from_secs(1))
-    .expect("nonzero interval")
-    .with_recovery_policy(
-      RecoveryConfig::new(
-        RECOVERY_FAN_OUT,
-        Duration::from_secs(2),
-        Duration::from_secs(60),
-      )
-      .expect("valid recovery policy"),
-    )
     .expect("valid node config")
 }
 

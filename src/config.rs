@@ -385,8 +385,19 @@ impl RecoveryConfig {
 impl Default for RecoveryConfig {
   fn default() -> Self {
     Self {
-      fan_out: 64,
-      initial_backoff: Duration::from_secs(1),
+      // Sixteen, not sixty-four: the any-one-route contract needs exactly
+      // one route, and on two slow cores a sixty-four-dial burst starved
+      // its own tail past the authentication deadline so every dial in
+      // the burst failed and the isolated member never healed (incident
+      // B). Sixteen converges in a step or two under the same
+      // starvation.
+      fan_out: 16,
+      // Two seconds, not one: with identical backoff sequences many
+      // devices recovering from one shared event retry in lockstep and
+      // slam the far end's admission limits together; the sampled jitter
+      // (±25%, seeded from the injected entropy) decorrelates them from
+      // the first doubling on.
+      initial_backoff: Duration::from_secs(2),
       maximum_backoff: Duration::from_secs(5 * 60),
     }
   }
