@@ -72,7 +72,8 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn load_config() -> Config {
   Config {
-    listen: env_or("LISTEN", "tls://127.0.0.1:9443"), // wss:// for firewalls, tcp:// for closed intranets
+    // wss:// for firewalls, tcp:// for closed intranets
+    listen: env_or("LISTEN", "tls://127.0.0.1:9443"),
     http_listen: env_or("HTTP_LISTEN", "0.0.0.0:8080"),
     data: PathBuf::from(env_or("DATA", "/data")),
   }

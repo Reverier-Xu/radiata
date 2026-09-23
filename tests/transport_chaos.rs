@@ -19,6 +19,11 @@
 //! rejoiners stay `Active` everywhere, the left identities stay
 //! tombstoned as `Left`, and relayed packets still cross the star and
 //! the bus lines multi-hop after the churn window.
+//
+// Unix-only: the fourth transport is a Unix domain socket medium. The
+// whole lane compiles to nothing elsewhere, so the cross-platform
+// gates stay green.
+#![cfg(unix)]
 
 use std::{
   os::unix::fs::FileTypeExt,
