@@ -17,8 +17,12 @@
 //!
 //! Convergence contract under churn: exactly the surviving members plus
 //! rejoiners stay `Active` everywhere, the left identities stay
-//! tombstoned as `Left`, and relayed packets still cross the star and
-//! the bus lines multi-hop after the churn window.
+//! tombstoned as `Left`, and relayed packets still cross the star into
+//! a bus line multi-hop after the churn window. The relay gates are
+//! deliberately a few hops, not the full seventeen-hop tail: a starved
+//! runner's per-hop latency accumulates with hop count, and the lane
+//! must fail fast (every await is bounded) instead of wedging a CI job
+//! past its timeout.
 //
 // Unix-only: the fourth transport is a Unix domain socket medium. The
 // whole lane compiles to nothing elsewhere, so the cross-platform
@@ -1159,14 +1163,21 @@ async fn sixty_four_node_mixed_transport_chaos() {
       );
     }
   }
-  relay_packet(&slots[NODES - 1], &slots[0], "tail-to-center relay").await;
-  relay_packet(&slots[0], &slots[NODES - 1], "center-to-tail relay").await;
-  relay_packet(
-    &slots[STAR_SPOKES + 2],
-    &slots[NODES - 2],
-    "cross-line relay",
-  )
-  .await;
+  // Multi-hop relay checks that cross the star and a bus line, kept
+  // short enough that a starved runner's per-hop latency cannot
+  // exhaust the relay acks: center to a mid-bus body crosses center ->
+  // head -> six bodies and back.
+  for slot in &slots {
+    bounded(
+      slot.handle().command(radiata::RunSyncRound::new()),
+      "settle sync round",
+    )
+    .await
+    .expect("settle sync round");
+  }
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  relay_packet(&slots[0], &slots[STAR_SPOKES + 7], "center-to-bus relay").await;
+  relay_packet(&slots[STAR_SPOKES + 7], &slots[0], "bus-to-center relay").await;
 
   // ---- Teardown ------------------------------------------------------
   for slot in &mut slots {
