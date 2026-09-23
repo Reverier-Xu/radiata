@@ -479,8 +479,12 @@ fn init_tracing() {
 }
 
 fn node_config() -> NodeConfig {
+  // One second, not the sixteen-node lanes' 250 ms: sixty-four nodes
+  // ticking four times a second saturate a two-vcpu runner and starve
+  // the data plane's relay acks. Convergence checks drive their own
+  // deterministic rounds, so the wall interval only backstops them.
   NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_millis(250))
+    .with_anti_entropy_interval(Duration::from_secs(1))
     .expect("nonzero interval")
     .with_recovery_policy(
       RecoveryConfig::new(
@@ -819,7 +823,10 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
 /// library documents for real traffic.
 async fn relay_packet(from: &Slot, to: &Slot, what: &str) {
   let before = *to.collector.packets.lock().unwrap();
-  let deadline = std::time::Instant::now() + Duration::from_secs(60);
+  // A long relay (bus tail to center crosses seventeen hops) on a
+  // starved two-vcpu runner legitimately takes tens of seconds per
+  // attempt; the retry budget outlives that, not the other way round.
+  let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);

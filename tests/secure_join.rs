@@ -140,14 +140,31 @@ async fn start(storage: Arc<MemoryStorageFactory>, keys: Arc<ScriptedKeys>) -> N
 
 #[cfg(all(unix, feature = "json"))]
 async fn start_json(dir: &TempDir, keys: Arc<ScriptedKeys>) -> Node {
-  let handle = NodeBuilder::new(radiata::adapters::json_store(dir.path().to_path_buf()))
-    .keys(keys)
-    .start()
-    .await
-    .unwrap();
-  Node {
-    handle,
-    _keys: Arc::new(ScriptedKeys::full()),
+  // A restart races the previous runtime's file-lock release: the store
+  // unlocks when the old runtime's task drops it, which can land a tick
+  // after the shutdown observation on a contended runner. The open
+  // retries briefly and bounded; every other failure stays fatal.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    match NodeBuilder::new(radiata::adapters::json_store(dir.path().to_path_buf()))
+      .keys(keys.clone())
+      .start()
+      .await
+    {
+      Ok(handle) => {
+        return Node {
+          handle,
+          _keys: Arc::new(ScriptedKeys::full()),
+        };
+      }
+      Err(error)
+        if error.kind() == radiata::ErrorKind::StorageLocked
+          && std::time::Instant::now() < deadline =>
+      {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(error) => panic!("json node start: {error:?}"),
+    }
   }
 }
 
