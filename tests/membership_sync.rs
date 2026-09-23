@@ -15,19 +15,23 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use radiata::{
   ConnectMember, DisconnectPeer, Endpoint, GetLocalNode, Listen, MergeCluster, NodeBuilder,
-  NodeConfig, NodeHandle, PageMembers, PageSpec, PageTopology, PageTrust, RecoveryConfig,
-  RotateMergeCredential, Shutdown, StartRecovery, UpdateNodeMetadata,
+  NodeConfig, NodeHandle, PageMembers, PageSpec, PageTopology, PageTrust, RotateMergeCredential,
+  Shutdown, StartRecovery, UpdateNodeMetadata,
 };
 
 mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-/// The sixteen-node lanes share one process: the test harness runs them
-/// concurrently on a runner that cannot carry several oversubscribed
-/// clusters at once, which starves the configured authentication deadline.
-/// The lanes serialize on this shared gate so each cluster owns the
-/// process while it runs.
+/// The sixteen-node lanes run the shipped defaults — one anti-entropy
+/// tick per second, recovery fan-out sixteen with a two-second initial
+/// backoff — so the lanes double as the evidence that the single
+/// timing profile converges at sixteen-node scale (well inside the
+/// 10,000 ms SLO bound under the strict harness profile). The lanes
+/// share one process: the test harness runs them concurrently on a
+/// runner that cannot carry several oversubscribed clusters at once,
+/// so the lanes serialize on this shared gate and each cluster owns
+/// the process while it runs.
 fn cluster_gate() -> &'static tokio::sync::Mutex<()> {
   static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
   GATE.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -43,11 +47,6 @@ fn init_tracing() {
       .init();
   });
 }
-
-/// The anti-entropy interval used by the harness. At sixteen-node scale a
-/// faster tick starves the shared runtime and the transport drops
-/// handshakes; 250 ms still converges far under the 10,000 ms SLO bound.
-const SYNC_INTERVAL: Duration = Duration::from_millis(500);
 
 struct Node {
   handle: NodeHandle,
@@ -108,13 +107,9 @@ async fn start_node_with_keys(
   echo: Option<Arc<EchoCollector>>,
 ) -> Node {
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage.clone();
-  let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_INTERVAL)
-    .unwrap()
-    .with_recovery_policy(
-      RecoveryConfig::new(64, Duration::from_secs(2), Duration::from_secs(60)).unwrap(),
-    )
-    .unwrap();
+  // The shipped defaults: the sixteen-node lanes are the defaults'
+  // own convergence and SLO evidence, so nothing is overridden.
+  let config = NodeConfig::new();
   let mut builder = NodeBuilder::new(factory).keys(keys).config(config);
   if let Some(echo) = echo {
     let mut extensions = radiata::ExtensionRegistry::new();

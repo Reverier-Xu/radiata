@@ -52,7 +52,9 @@ mod compatibility;
 mod simulation;
 
 pub use api::BoxFuture;
-pub use config::{NodeConfig, ParserLimits, RecoveryConfig, TraceMetadataLimits};
+pub use config::{
+  MergeAdmissionLimits, NodeConfig, ParserLimits, RecoveryConfig, TraceMetadataLimits,
+};
 pub use error::{Error, ErrorKind, ProviderErrorContext, ProviderErrorKind, Result};
 pub use extension_registry::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
 pub use identity::{

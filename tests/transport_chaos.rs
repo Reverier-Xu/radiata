@@ -475,16 +475,11 @@ fn init_tracing() {
 }
 
 fn node_config() -> NodeConfig {
-  // The recovery policy is the recalibrated default (fan-out sixteen,
-  // two-second initial backoff): the lane is the evidence that the
-  // defaults survive a starved two-vcpu-class runner, so it pins
-  // nothing. One second, not the sixteen-node lanes' 500 ms: sixty-four
-  // nodes ticking four times a second saturate a two-vcpu runner and
-  // starve the data plane's relay acks. Convergence checks drive their
-  // own deterministic rounds, so the wall interval only backstops them.
+  // The shipped defaults, unpinned: the chaos lane is the evidence that
+  // the single timing profile (one anti-entropy tick per second,
+  // recovery fan-out sixteen with a two-second initial backoff, 30 s
+  // authentication deadline) survives a starved two-vcpu-class runner.
   NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_secs(1))
-    .expect("valid node config")
 }
 
 fn runtime_extensions(collector: &Arc<EchoCollector>) -> radiata::ExtensionRegistry {

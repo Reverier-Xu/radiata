@@ -275,7 +275,12 @@ impl NodeConfig {
 impl Default for NodeConfig {
   fn default() -> Self {
     Self {
-      anti_entropy_interval: Duration::from_millis(250),
+      // One second, not 250 ms: the anti-entropy cadence is a fixed
+      // per-node cost paid N-wide every tick, and 64 nodes × 4 ticks/s
+      // saturated a two-vcpu runner until the data plane's relay acks
+      // starved (incident C). Convergence at one tick/s stays far
+      // inside the sync SLOs; fast deployments may tighten it.
+      anti_entropy_interval: Duration::from_secs(1),
       dial_deadline: Duration::from_secs(10),
       // 30 s, not 10 s: the deadline covers the join-mode admission
       // commit, and on slow flash one commit costs hundreds of
@@ -296,10 +301,14 @@ impl Default for NodeConfig {
       // process, starved scheduler) must fail in-flight streams within a
       // bounded window instead of hanging until TCP's own retransmit
       // timeouts. A live peer's keepalive results keep both deadlines
-      // refreshing, so only real silence closes.
-      session_idle_timeout: Duration::from_secs(30),
-      keepalive_interval: Duration::from_secs(10),
-      keepalive_timeout: Duration::from_secs(30),
+      // refreshing, so only real silence closes. The values are the
+      // cluster-wide liveness contract, calibrated for duty-cycled and
+      // slow devices: a 90 s idle and a 20 s/60 s keepalive pair let a
+      // deep-sleeping peer skip several pings without its sessions
+      // being torn down by the faster side of a mixed cluster.
+      session_idle_timeout: Duration::from_secs(90),
+      keepalive_interval: Duration::from_secs(20),
+      keepalive_timeout: Duration::from_secs(60),
       parser_limits: ParserLimits::default(),
       trace_metadata_limits: TraceMetadataLimits::default(),
       route_policy: None,
@@ -592,11 +601,13 @@ mod tests {
     // The default policy is enabled: a silently dead peer must be
     // detected within a bounded window, not TCP's own retransmit
     // timeouts, so the defaults satisfy the keepalive ordering invariant
-    // and stay nonzero.
+    // and stay nonzero. The values are the slow-device-safe liveness
+    // contract (90 s idle, 20 s ping, 60 s timeout — see
+    // `liveness_defaults_are_the_slow_device_calibration`).
     let default = NodeConfig::new();
-    assert_eq!(default.session_idle_timeout(), Duration::from_secs(30));
-    assert_eq!(default.keepalive_interval(), Duration::from_secs(10));
-    assert_eq!(default.keepalive_timeout(), Duration::from_secs(30));
+    assert_eq!(default.session_idle_timeout(), Duration::from_secs(90));
+    assert_eq!(default.keepalive_interval(), Duration::from_secs(20));
+    assert_eq!(default.keepalive_timeout(), Duration::from_secs(60));
     assert_ne!(
       disabled.session_idle_timeout(),
       default.session_idle_timeout()
@@ -689,6 +700,37 @@ mod tests {
       .with_relay_hop_deadline(Duration::ZERO)
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// The library ships exactly one profile — the defaults — and it must
+  /// be safe on the slowest supported device (the mixed-cluster rule:
+  /// timing constants are peer-visible, so there is no second, named
+  /// low-power profile). Every recalibrated value traces to a
+  /// transport-chaos incident or a slow-device bound.
+  #[test]
+  fn liveness_defaults_are_the_slow_device_calibration() {
+    let config = NodeConfig::new();
+    // Incident C: 64 nodes x 4 anti-entropy ticks/s starved a two-vcpu
+    // runner's data plane; one tick/s keeps the O(N x interval) load
+    // bounded while converging far inside the sync SLOs.
+    assert_eq!(config.anti_entropy_interval(), Duration::from_secs(1));
+    // Incident B, deadline half: slow-flash admission commits pushed
+    // concurrent join tails past the old 10 s deadline into persistent
+    // join failure.
+    assert_eq!(config.authentication_deadline(), Duration::from_secs(30));
+    // Duty-cycled peers skip several 20 s pings before the 60 s
+    // keepalive timeout closes them, and a 90 s idle tolerates a slow
+    // scheduling environment without tearing down live sessions.
+    assert_eq!(config.session_idle_timeout(), Duration::from_secs(90));
+    assert_eq!(config.keepalive_interval(), Duration::from_secs(20));
+    assert_eq!(config.keepalive_timeout(), Duration::from_secs(60));
+    // Incident B: the recovery plane's own defaults (fan-out sixteen,
+    // two-second initial backoff) are asserted in the recovery
+    // controller's tests; here only the ordering invariant repeats:
+    assert!(config.recovery().fan_out() >= 1);
+    assert!(config.recovery().maximum_backoff >= config.recovery().initial_backoff);
+    // A k-hop relay attempt is bounded by k x the per-hop budget.
+    assert_eq!(config.relay_hop_deadline(), Duration::from_secs(5));
   }
 
   /// A deadline without either driver, a keepalive without a deadline,
