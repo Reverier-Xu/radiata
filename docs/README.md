@@ -18,9 +18,10 @@ Lifecycle rules:
 
 ## Current documents
 
-- [`starvation-hardening-plan.md`](./starvation-hardening-plan.md) —
-  the low-power-device starvation-hardening refactor: configurable
-  admission and authentication bounds, recovery defaults and jitter,
-  per-hop relay budgets, a low-power device profile, and a
-  starvation CI gate. Motivated by the transport-chaos incidents
-  surfaced on the `pluggable-transports` cycle.
+None. The `starvation-hardening-plan` cycle (configurable admission
+and authentication bounds, smooth token-bucket merge admission split
+by pool, recovery defaults and jitter, per-hop relay budgets, the
+single recalibrated timing profile, and the one-core starvation CI
+gate) is complete: the plan document was deleted per the lifecycle
+rules and its acceptance evidence lives in the commit history of the
+`starvation-hardening-plan` branch.
