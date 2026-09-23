@@ -39,6 +39,7 @@ pub struct NodeConfig {
   route_policy: Option<crate::QualifiedTag>,
   receipt_retention: Duration,
   required_features: BTreeSet<FeatureTag>,
+  merge_admission: MergeAdmissionLimits,
 }
 
 impl NodeConfig {
@@ -112,6 +113,14 @@ impl NodeConfig {
   /// routes work out of the box; setting a tag overrides the default.
   pub fn with_route_policy(mut self, tag: crate::QualifiedTag) -> Self {
     self.route_policy = Some(tag);
+    self
+  }
+
+  /// Replaces the merge admission limits (see
+  /// [`MergeAdmissionLimits`]): the limits are validated at
+  /// construction, so this only stores them.
+  pub fn with_merge_admission(mut self, value: MergeAdmissionLimits) -> Self {
+    self.merge_admission = value;
     self
   }
 
@@ -225,6 +234,12 @@ impl NodeConfig {
     &self.required_features
   }
 
+  /// The configured merge admission limits (consumed by the session
+  /// driver's limiter).
+  pub(crate) const fn merge_admission(&self) -> MergeAdmissionLimits {
+    self.merge_admission
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -261,7 +276,115 @@ impl Default for NodeConfig {
       route_policy: None,
       receipt_retention: Duration::from_secs(30 * 24 * 60 * 60),
       required_features: BTreeSet::new(),
+      merge_admission: MergeAdmissionLimits::default(),
     }
+  }
+}
+
+/// The per-pool admission budgets the limiter reads out of
+/// [`MergeAdmissionLimits`]: one per-source and one global token bucket
+/// each.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdmissionPoolLimits {
+  pub(crate) source: (u32, Duration),
+  pub(crate) global: (u32, Duration),
+}
+
+/// The merge admission limits: two pools of token buckets metering the
+/// authenticated session admission. **Joins** (untrusted strangers
+/// carrying a credential) keep the strictest budget — a burst of 16 per
+/// source per minute, 256 per node per minute. **Member reconnects**
+/// (holders of a trusted binding — the self-healing path) are budgeted
+/// by the cluster scale: `max(16, 4 × expected_members)` per source and
+/// `max(256, 4 × expected_members)` per node per minute, so a whole
+/// site reconnecting behind one address never starves its tail (the
+/// incident-B shape). Tokens refill continuously at `burst / window`
+/// per second.
+#[derive(Clone, Copy, Debug)]
+pub struct MergeAdmissionLimits {
+  join_source: (u32, Duration),
+  join_global: (u32, Duration),
+  member_source: (u32, Duration),
+  member_global: (u32, Duration),
+}
+
+impl MergeAdmissionLimits {
+  /// Derives the limits for a cluster of `expected_members` nodes. The
+  /// join pool stays fixed (strangers do not scale with the cluster);
+  /// only the member pool grows with the expected member count.
+  pub fn for_cluster(expected_members: usize) -> Result<Self> {
+    ensure_nonzero(expected_members, "expected members")?;
+    Ok(Self::scaled(expected_members))
+  }
+
+  fn scaled(expected_members: usize) -> Self {
+    let member_burst = |floor: u32| {
+      u32::try_from(expected_members.saturating_mul(4))
+        .unwrap_or(u32::MAX)
+        .max(floor)
+    };
+    let minute = Duration::from_secs(60);
+    Self {
+      join_source: (16, minute),
+      join_global: (256, minute),
+      member_source: (member_burst(16), minute),
+      member_global: (member_burst(256), minute),
+    }
+  }
+
+  /// Replaces the join pool's per-source and global budgets (burst
+  /// tokens per window). Strangers carrying credentials: keep this the
+  /// tightest budget in the node.
+  pub fn with_join_pool(
+    mut self, source_burst: u32, source_window: Duration, global_burst: u32,
+    global_window: Duration,
+  ) -> Result<Self> {
+    ensure_nonzero(source_burst as usize, "join source burst")?;
+    ensure_nonzero(global_burst as usize, "join global burst")?;
+    ensure_nonzero_duration(source_window, "join source window")?;
+    ensure_nonzero_duration(global_window, "join global window")?;
+    self.join_source = (source_burst, source_window);
+    self.join_global = (global_burst, global_window);
+    Ok(self)
+  }
+
+  /// Replaces the member pool's per-source and global budgets (burst
+  /// tokens per window). Holders of a trusted binding: this is the
+  /// self-healing path and must stay the more generous pool.
+  pub fn with_member_pool(
+    mut self, source_burst: u32, source_window: Duration, global_burst: u32,
+    global_window: Duration,
+  ) -> Result<Self> {
+    ensure_nonzero(source_burst as usize, "member source burst")?;
+    ensure_nonzero(global_burst as usize, "member global burst")?;
+    ensure_nonzero_duration(source_window, "member source window")?;
+    ensure_nonzero_duration(global_window, "member global window")?;
+    self.member_source = (source_burst, source_window);
+    self.member_global = (global_burst, global_window);
+    Ok(self)
+  }
+
+  pub(crate) fn join_pool(&self) -> AdmissionPoolLimits {
+    AdmissionPoolLimits {
+      source: self.join_source,
+      global: self.join_global,
+    }
+  }
+
+  pub(crate) fn member_pool(&self) -> AdmissionPoolLimits {
+    AdmissionPoolLimits {
+      source: self.member_source,
+      global: self.member_global,
+    }
+  }
+}
+
+impl Default for MergeAdmissionLimits {
+  fn default() -> Self {
+    // The reference cluster scale: the defaults ship safe for the
+    // 64-node deployments the chaos lane exercises, and every value is
+    // overridable through `for_cluster` or the pool setters.
+    Self::scaled(64)
   }
 }
 

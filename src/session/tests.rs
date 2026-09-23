@@ -62,13 +62,15 @@ async fn node_from(
     .await
     .unwrap();
   let issuer = Arc::new(Mutex::new(MergeCredentialIssuer::new()));
+  let config = NodeConfig::new();
   let driver = SessionDriver::new(
     context.clone(),
     keys.as_provider(),
     entropy.clone(),
     issuer.clone(),
     offer,
-    NodeConfig::new().authentication_deadline(),
+    config.authentication_deadline(),
+    config.merge_admission(),
   );
   Node {
     context,

@@ -125,10 +125,11 @@ pub(crate) struct SessionDriver {
 }
 
 impl SessionDriver {
+  #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, keys: Arc<dyn KeyProvider>, entropy: Arc<dyn Entropy>,
     issuer: Arc<Mutex<MergeCredentialIssuer>>, offer: FeatureOffer,
-    authentication_deadline: Duration,
+    authentication_deadline: Duration, merge_admission: crate::config::MergeAdmissionLimits,
   ) -> Self {
     Self {
       context,
@@ -137,7 +138,7 @@ impl SessionDriver {
       issuer,
       offer,
       authentication_deadline,
-      limiter: crate::identity::merge_rate::MergeLimiter::new(),
+      limiter: crate::identity::merge_rate::MergeLimiter::new(merge_admission),
       member_spkis: Arc::new(MemberSpkiTable::default()),
     }
   }
@@ -216,28 +217,37 @@ impl SessionDriver {
   }
 
   async fn respond_inner(&self, connection: &mut Connection) -> Result<EstablishedSession> {
-    // Fixed admission rate limiting precedes every handshake and signing
-    // step; a rejected attempt consumes no credential. The admission
-    // source is the accepted peer socket address, normalized here because
-    // the identity domain owns merge-admission semantics — transport only
-    // carries the raw address. A medium that attributes its connections
-    // to peers (every TCP class) fails closed on a missing address: with
-    // no source there is no bucket to charge, so admitting it would let
-    // an unattributable connection bypass the fixed policy. An
-    // addressless medium (a caller-registered custom transport) shares
-    // one per-medium bucket derived from its class binding.
+    // The admission source is the accepted peer socket address,
+    // normalized here because the identity domain owns merge-admission
+    // semantics — transport only carries the raw address. A medium that
+    // attributes its connections to peers (every TCP class) fails closed
+    // on a missing address: with no source there is no bucket to charge,
+    // so admitting it would let an unattributable connection bypass the
+    // fixed policy. An addressless medium (a caller-registered custom
+    // transport) shares one per-medium bucket derived from its class
+    // binding.
     let source = match connection.peer_addr() {
       Some(address) => MergeSource::normalize(address),
       None if !connection.attributable() => MergeSource::medium(connection.channel_binding()),
       None => return Err(Error::authentication_failed("admission source")),
     };
-    let _slot = self.limiter.begin(source)?;
+    // The bounded hello peek classifies the attempt before admission:
+    // joins (credentials from strangers) and member reconnects (holders
+    // of a trusted binding, the self-healing path) draw from separate
+    // pools. Reading one parser-bounded frame before admission is the
+    // price of that classification; every credential, signing, and
+    // commit step still sits behind the limiter.
     let first = receive_kind(connection, HandshakeKind::InitiatorHello).await?;
     let peek = peek_initiator_hello(&first.body)?;
-    // The frozen-store gate refuses before credential verification or any
-    // identity signature; draining the initiator hello first keeps the
-    // graceful close free of unread inbound bytes (whose reset would mask
-    // the typed rejection on some platforms).
+    let pool = match peek.mode {
+      HandshakeMode::Merge => crate::identity::merge_rate::AdmissionPool::Join,
+      HandshakeMode::Member => crate::identity::merge_rate::AdmissionPool::Member,
+    };
+    let _slot = self.limiter.begin(source, pool)?;
+    // The frozen-store gate refuses before credential verification or
+    // any identity signature; draining the initiator hello first keeps
+    // the graceful close free of unread inbound bytes (whose reset would
+    // mask the typed rejection on some platforms).
     self.require_unblocked()?;
 
     // A locally revoked or already-left identity never completes a new
