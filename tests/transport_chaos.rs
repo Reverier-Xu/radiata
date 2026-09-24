@@ -770,9 +770,9 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
         )
         .await
         .expect("recovery view");
-        let missing = member_views(slot)
-          .await
-          .into_iter()
+        let views = member_views(slot).await;
+        let missing = views
+          .iter()
           .filter(|member| member.status() != MemberStatus::Active)
           .map(|member| format!("{}={:?}", member.node_id(), member.status()))
           .collect::<Vec<_>>()
@@ -786,7 +786,8 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
           .map(|page| page.items().len())
           .unwrap_or(0);
         eprintln!(
-          "CONVERGE {what}: node {index} expected={expected} recovery_connected={} sessions={sessions} not-active=[{missing}]",
+          "CONVERGE {what}: node {index} rows={} expected={expected} recovery_connected={} sessions={sessions} not-active=[{missing}]",
+          views.len(),
           recovery.is_connected(),
         );
       }
