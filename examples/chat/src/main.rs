@@ -94,8 +94,31 @@ async fn main() {
     )
     .expect("register unix transport");
 
+  // Diagnostic switch for the acceptance bisect: restores the
+  // pre-recalibration timing defaults when set.
+  let mut node_config = radiata::NodeConfig::new();
+  if std::env::var_os("LEGACY_TIMING").is_some() {
+    use std::time::Duration;
+    node_config = node_config
+      .with_anti_entropy_interval(Duration::from_millis(250))
+      .expect("nonzero interval")
+      .with_session_liveness(
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+      )
+      .expect("valid liveness")
+      .with_authentication_deadline(Duration::from_secs(10))
+      .expect("nonzero deadline")
+      .with_recovery_policy(
+        radiata::RecoveryConfig::new(64, Duration::from_secs(1), Duration::from_secs(300))
+          .expect("valid recovery"),
+      )
+      .expect("valid config");
+  }
+
   let node = NodeBuilder::new(storage)
-    .config(radiata::NodeConfig::new().with_route_policy(
+    .config(node_config.with_route_policy(
       radiata::QualifiedTag::parse(chat::ROUTE_POLICY).expect("static route policy tag"),
     ))
     .extensions(extensions)

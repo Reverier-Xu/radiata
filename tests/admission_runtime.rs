@@ -11,14 +11,15 @@ use std::sync::Arc;
 
 use radiata::{
   DeclareInterruptedTransactionUncommitted, Endpoint, ErrorKind, GetLocalNode, Listen,
-  MergeCluster, MergeCredential, NodeBuilder, NodeHandle, ResolveFrozenJournal,
+  MergeCluster, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, ResolveFrozenJournal,
   RotateMergeCredential, Shutdown, extension::StorageFactory,
 };
 
 mod common;
 
 use common::{
-  CommitFault, FaultingFactory, MemoryStorageFactory, ScriptedKeys, required_capabilities,
+  CommitFault, DelayingFactory, FaultingFactory, MemoryStorageFactory, ScriptedKeys,
+  required_capabilities,
 };
 
 struct Node {
@@ -26,7 +27,10 @@ struct Node {
   keys: Arc<ScriptedKeys>,
 }
 
-async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Node {
+async fn start_configured(
+  factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>, config: NodeConfig,
+) -> Node {
+  common::init_tracing();
   // The runtime default entropy (system randomness) keeps every node's id
   // unique; deterministic entropy would collide across nodes. A prior
   // runtime instance's detached teardown can briefly hold the factory's
@@ -35,6 +39,7 @@ async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Nod
   loop {
     match NodeBuilder::new(factory.clone())
       .keys(keys.clone())
+      .config(config.clone())
       .start()
       .await
     {
@@ -52,6 +57,34 @@ async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Nod
       Err(error) => panic!("node start failed persistently: {error:?}"),
     }
   }
+}
+
+/// Bounds a node shutdown so a stuck teardown fails the lane with a
+/// name instead of hanging the job past its budget (the windows-runner
+/// hang shape).
+async fn stop(node: &Node, what: &'static str) {
+  tokio::time::timeout(
+    std::time::Duration::from_secs(120),
+    node.handle.command(Shutdown::new()),
+  )
+  .await
+  .unwrap_or_else(|_| panic!("{what}: shutdown never completed"))
+  .unwrap();
+}
+
+async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Node {
+  start_configured(factory, keys, NodeConfig::new()).await
+}
+
+/// A node whose anti-entropy driver ticks hourly: the slow-flash lanes
+/// measure the ADMISSION path against the gated device, and a stray
+/// driver commit queued on the same gate would sit inside the measured
+/// deadline (the tick economics changed when verdict settlement left
+/// the tick path, so the old implicit spacing no longer holds).
+fn quiet_driver_config() -> NodeConfig {
+  NodeConfig::new()
+    .with_anti_entropy_interval(std::time::Duration::from_secs(3_600))
+    .unwrap()
 }
 
 fn keys_at(seed: u64) -> Arc<ScriptedKeys> {
@@ -318,4 +351,106 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
   assert_eq!(local.node_id(), merge.node());
   later.handle.command(Shutdown::new()).await.unwrap();
   receiver.handle.command(Shutdown::new()).await.unwrap();
+}
+
+/// Slow-flash commit injection (the starvation gate's slow-storage
+/// dimension and the deadline-calibration acceptance): the join-mode
+/// admission path performs two serialized device writes — the journaled
+/// admission (binding, credential use, grant) and its receipt cleanup —
+/// so a join pays both inside the authentication deadline. A 12 s
+/// injected write is one flash burst in that regime: the two writes cost
+/// 24 s, beyond the 10 s-shaped deadlines that starved join bursts,
+/// inside the recalibrated 30 s default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadline() {
+  // Each device write pays 12 s once armed: a tightened deadline cannot
+  // admit even the first write; the default admits the two-write
+  // admission path (24 s) with headroom.
+  let commit_delay = std::time::Duration::from_secs(12);
+
+  // Phase A: a tightened deadline expires while its commit is still on
+  // the slow device — the persistent-failure shape the calibration
+  // removes.
+  let slow_a = Arc::new(DelayingFactory::new(Arc::new(MemoryStorageFactory::new(
+    required_capabilities(),
+  ))));
+  let issuer_a = start_configured(
+    Arc::clone(&slow_a) as Arc<dyn StorageFactory>,
+    keys_at(4_000),
+    quiet_driver_config(),
+  )
+  .await;
+  let issued_a = rotate_with_retry(&issuer_a).await;
+  let listener_a = issuer_a
+    .handle
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap();
+  // Let the sync driver's startup descriptor ensure land unwrapped:
+  // arming before it would measure a stray first tick, not the join
+  // path.
+  tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+  slow_a.set_commit_delay(commit_delay);
+  let tightened = NodeConfig::new()
+    .with_authentication_deadline(std::time::Duration::from_millis(1_500))
+    .unwrap();
+  let joiner_a = start_configured(
+    Arc::new(MemoryStorageFactory::new(required_capabilities())),
+    keys_at(4_100),
+    tightened,
+  )
+  .await;
+  let error = tokio::time::timeout(
+    std::time::Duration::from_secs(120),
+    merge(&joiner_a, listener_a.endpoint(), issued_a.into_credential()),
+  )
+  .await
+  .expect("the tightened-deadline merge must resolve at the hub's 1.5s expiry")
+  .unwrap_err();
+  assert_eq!(
+    error.kind(),
+    ErrorKind::AuthenticationFailed,
+    "a commit latency beyond the tightened deadline must expire it"
+  );
+  stop(&joiner_a, "phase a joiner").await;
+  stop(&issuer_a, "phase a issuer").await;
+
+  // Phase B: the same injected write under the recalibrated default —
+  // the two-write admission path (24 s) that expires 10 s-shaped
+  // deadlines admits at 30 s.
+  let slow_b = Arc::new(DelayingFactory::new(Arc::new(MemoryStorageFactory::new(
+    required_capabilities(),
+  ))));
+  let issuer_b = start_configured(
+    Arc::clone(&slow_b) as Arc<dyn StorageFactory>,
+    keys_at(5_000),
+    quiet_driver_config(),
+  )
+  .await;
+  let issued_b = rotate_with_retry(&issuer_b).await;
+  let listener_b = issuer_b
+    .handle
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap();
+  tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+  slow_b.set_commit_delay(commit_delay);
+  let joiner_b = start(
+    Arc::new(MemoryStorageFactory::new(required_capabilities())),
+    keys_at(5_100),
+  )
+  .await;
+  let view = tokio::time::timeout(
+    std::time::Duration::from_secs(120),
+    merge(&joiner_b, listener_b.endpoint(), issued_b.into_credential()),
+  )
+  .await
+  .expect("the calibrated-deadline merge must resolve inside two gated writes")
+  .unwrap_or_else(|error| {
+    panic!("the calibrated default must admit the two-write admission path: {error:?}")
+  });
+  let local = joiner_b.handle.query(GetLocalNode::new()).await.unwrap();
+  assert_eq!(local.node_id(), view.node());
+  stop(&joiner_b, "phase b joiner").await;
+  stop(&issuer_b, "phase b issuer").await;
 }

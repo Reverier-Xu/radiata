@@ -2,7 +2,10 @@ use std::{collections::BTreeSet, time::Duration};
 
 use crate::{Error, FeatureTag, Result};
 
-#[derive(Debug)]
+/// The node configuration: every knob is a plain value, clonable so one
+/// construction site can share a calibrated config across nodes or retry
+/// a start without rebuilding it.
+#[derive(Clone, Debug)]
 pub struct NodeConfig {
   anti_entropy_interval: Duration,
   recovery: RecoveryConfig,
@@ -15,6 +18,17 @@ pub struct NodeConfig {
   // authentication deadline, which starts only after the connect
   // returns.
   dial_deadline: Duration,
+  // The wall-clock bound for the full session bootstrap exchange
+  // (handshake positions one through six, including the join-mode
+  // admission commit and grant adoption). One cluster-wide timing
+  // contract: recalibrated so a burst of joins paying slow-flash commit
+  // latencies still admits its tail, and tightened only downward by
+  // fast deployments (see `with_authentication_deadline`).
+  authentication_deadline: Duration,
+  // The acknowledgment budget one forwarded-open hop gets before the
+  // attempt fails locally and the typed failure propagates (see
+  // `with_relay_hop_deadline`).
+  relay_hop_deadline: Duration,
   // A session with no authenticated traffic or owned in-flight work for
   // this long closes on host wall time. Zero disables.
   session_idle_timeout: Duration,
@@ -22,13 +36,11 @@ pub struct NodeConfig {
   // keepalive result is closed. Zero disables keepalive.
   keepalive_interval: Duration,
   keepalive_timeout: Duration,
-  // Caller-selected packet parser limits: depth, collection items,
-  // and frame bytes bound every packet-body decode allocation.
-  parser_limits: ParserLimits,
   trace_metadata_limits: TraceMetadataLimits,
   route_policy: Option<crate::QualifiedTag>,
   receipt_retention: Duration,
   required_features: BTreeSet<FeatureTag>,
+  merge_admission: MergeAdmissionLimits,
 }
 
 impl NodeConfig {
@@ -36,17 +48,27 @@ impl NodeConfig {
     Self::default()
   }
 
+  /// Sets the anti-entropy tick interval. The tick's cost scales with
+  /// the member table (N × interval per round cluster-wide); a cluster
+  /// keeping one interval keeps its load predictable (nonzero).
   pub fn with_anti_entropy_interval(mut self, value: Duration) -> Result<Self> {
     ensure_nonzero_duration(value, "anti-entropy interval")?;
     self.anti_entropy_interval = value;
     Ok(self)
   }
 
+  /// Sets the recovery policy: fan-out, initial backoff, and maximum
+  /// backoff for the any-one-route healing plane. A purely self-side
+  /// cadence — peers observe dials, never the policy.
   pub fn with_recovery_policy(mut self, value: RecoveryConfig) -> Result<Self> {
     self.recovery = value;
     Ok(self)
   }
 
+  /// Sets the session queue limits: the outbound frame queue's message
+  /// count (also the per-session concurrent admission bound) and byte
+  /// budget. Local memory and backpressure only — it never crosses the
+  /// wire, so per-device scaling is safe (both nonzero).
   pub fn with_session_queue_limits(mut self, messages: usize, bytes: usize) -> Result<Self> {
     ensure_nonzero(messages, "session queue messages")?;
     ensure_nonzero(bytes, "session queue bytes")?;
@@ -61,7 +83,9 @@ impl NodeConfig {
   /// values zero disable the policy; otherwise `idle_timeout` or
   /// `keepalive_interval` must be nonzero, and a configured keepalive
   /// requires `keepalive_interval > 0` with
-  /// `keepalive_timeout > keepalive_interval`.
+  /// `keepalive_timeout > keepalive_interval`. These deadlines are
+  /// peer-visible: keep them uniform across a cluster, or the tighter
+  /// side closes sessions the looser side still holds alive.
   pub fn with_session_liveness(
     mut self, idle_timeout: Duration, keepalive_interval: Duration, keepalive_timeout: Duration,
   ) -> Result<Self> {
@@ -83,12 +107,10 @@ impl NodeConfig {
     Ok(self)
   }
 
-  /// Sets the parser limits: every packet-frame decode enforces them.
-  pub fn with_parser_limits(mut self, value: ParserLimits) -> Result<Self> {
-    self.parser_limits = value;
-    Ok(self)
-  }
-
+  /// Sets the trace metadata budget: the bounded population of in-flight
+  /// route traces, terminal records, and their retention. Purely local
+  /// diagnostics — it never crosses the wire, so shrinking it per
+  /// device is safe (the cost is only diagnostic depth).
   pub fn with_trace_metadata_limits(mut self, value: TraceMetadataLimits) -> Result<Self> {
     self.trace_metadata_limits = value;
     Ok(self)
@@ -105,6 +127,14 @@ impl NodeConfig {
     self
   }
 
+  /// Replaces the merge admission limits (see
+  /// [`MergeAdmissionLimits`]): the limits are validated at
+  /// construction, so this only stores them.
+  pub fn with_merge_admission(mut self, value: MergeAdmissionLimits) -> Self {
+    self.merge_admission = value;
+    self
+  }
+
   pub fn with_receipt_retention(mut self, value: Duration) -> Result<Self> {
     ensure_nonzero_duration(value, "receipt retention")?;
     self.receipt_retention = value;
@@ -112,12 +142,43 @@ impl NodeConfig {
   }
 
   /// Sets the outbound dial deadline: the bound for one transport
-  /// connect (TCP dial, TLS handshake, and WebSocket upgrade). Distinct
-  /// from the authentication deadline, which starts only after the
-  /// connect returns.
+  /// connect (TCP dial, TLS handshake, and WebSocket upgrade). The
+  /// dialed peer never observes it, so per-device tuning is safe — but
+  /// keep it above this device's worst-case connect plus handshake
+  /// time, or every dial expires before it can succeed. Distinct from
+  /// the authentication deadline, which starts only after the connect
+  /// returns.
   pub fn with_dial_deadline(mut self, value: Duration) -> Result<Self> {
     ensure_nonzero_duration(value, "dial deadline")?;
     self.dial_deadline = value;
+    Ok(self)
+  }
+
+  /// Sets the authentication deadline: the wall-clock bound for the full
+  /// session bootstrap exchange, including the join-mode admission
+  /// commit and grant adoption (a durable fsync may cost hundreds of
+  /// milliseconds on slow flash, and concurrent joins queue behind it).
+  /// This constant is peer-visible — it bounds the other side's
+  /// handshake too — so it is part of the cluster-wide timing contract:
+  /// keep it uniform across a cluster and tighten it only for
+  /// uniformly fast deployments.
+  pub fn with_authentication_deadline(mut self, value: Duration) -> Result<Self> {
+    ensure_nonzero_duration(value, "authentication deadline")?;
+    self.authentication_deadline = value;
+    Ok(self)
+  }
+
+  /// Sets the per-hop relay budget: how long one forwarded-open hop
+  /// waits for its downstream acknowledgment before the attempt fails
+  /// locally (the branch search continues, or the typed `Failed`
+  /// surfaces upstream). Each hop bounds its own branch and the value
+  /// never crosses the wire, but uniform values keep a k-hop attempt's
+  /// latency predictable at `k ×` this budget. Without a budget at all
+  /// a stuck hop would hang to the transitive liveness bound of the
+  /// sessions on the path.
+  pub fn with_relay_hop_deadline(mut self, value: Duration) -> Result<Self> {
+    ensure_nonzero_duration(value, "relay hop deadline")?;
+    self.relay_hop_deadline = value;
     Ok(self)
   }
 
@@ -125,6 +186,19 @@ impl NodeConfig {
   /// (consumed by the supervisor's dial paths; nonzero by construction).
   pub(crate) const fn dial_deadline(&self) -> Duration {
     self.dial_deadline
+  }
+
+  /// The authentication deadline for the full session bootstrap exchange
+  /// (consumed by the session driver's three timeout sites; nonzero by
+  /// construction).
+  pub(crate) const fn authentication_deadline(&self) -> Duration {
+    self.authentication_deadline
+  }
+
+  /// The acknowledgment budget one forwarded-open hop gets (consumed by
+  /// the forwarding plane's deadline tasks; nonzero by construction).
+  pub(crate) const fn relay_hop_deadline(&self) -> Duration {
+    self.relay_hop_deadline
   }
 
   pub(crate) const fn receipt_retention(&self) -> Duration {
@@ -170,16 +244,6 @@ impl NodeConfig {
   pub(crate) const fn trace_metadata_limits(&self) -> &TraceMetadataLimits {
     &self.trace_metadata_limits
   }
-
-  /// The packet parser limits as canonical-decoder bounds: depth, item
-  /// count, and frame bytes map one-to-one onto the CBOR layer's checks.
-  pub(crate) const fn parser_cbor_limits(&self) -> crate::protocol::CborLimits {
-    crate::protocol::CborLimits::new(
-      self.parser_limits.depth,
-      self.parser_limits.collection_items as u64,
-      self.parser_limits.frame_bytes,
-    )
-  }
   /// The node's effective next-hop routing policy tag: the caller-selected
   /// tag, or the built-in default policy's tag when unset (the builder
   /// registers that policy out of the box).
@@ -194,6 +258,12 @@ impl NodeConfig {
     &self.required_features
   }
 
+  /// The configured merge admission limits (consumed by the session
+  /// driver's limiter).
+  pub(crate) const fn merge_admission(&self) -> MergeAdmissionLimits {
+    self.merge_admission
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -205,8 +275,25 @@ impl NodeConfig {
 impl Default for NodeConfig {
   fn default() -> Self {
     Self {
-      anti_entropy_interval: Duration::from_millis(250),
+      // One second, not 250 ms: the anti-entropy cadence is a fixed
+      // per-node cost paid N-wide every tick, and 64 nodes × 4 ticks/s
+      // saturated a two-vcpu runner until the data plane's relay acks
+      // starved (incident C). Convergence at one tick/s stays far
+      // inside the sync SLOs; fast deployments may tighten it.
+      anti_entropy_interval: Duration::from_secs(1),
       dial_deadline: Duration::from_secs(10),
+      // 30 s, not 10 s: the deadline covers the join-mode admission
+      // commit, and on slow flash one commit costs hundreds of
+      // milliseconds — a few concurrent joins pushed the tail of a
+      // burst past 10 s so joins failed persistently (the incident-B
+      // shape). The default must be safe on the slowest supported
+      // device; fast deployments tighten it, never the reverse.
+      authentication_deadline: Duration::from_secs(30),
+      // Five seconds per hop: long enough for a slow hop to answer,
+      // short enough that a long relay attempt fails its stuck branch
+      // and moves on instead of hanging to the transitive liveness
+      // bound (the incident-C shape).
+      relay_hop_deadline: Duration::from_secs(5),
       recovery: RecoveryConfig::default(),
       session_queue_messages: 256,
       session_queue_bytes: 8 * 1024 * 1024,
@@ -214,46 +301,127 @@ impl Default for NodeConfig {
       // process, starved scheduler) must fail in-flight streams within a
       // bounded window instead of hanging until TCP's own retransmit
       // timeouts. A live peer's keepalive results keep both deadlines
-      // refreshing, so only real silence closes.
-      session_idle_timeout: Duration::from_secs(30),
-      keepalive_interval: Duration::from_secs(10),
-      keepalive_timeout: Duration::from_secs(30),
-      parser_limits: ParserLimits::default(),
+      // refreshing, so only real silence closes. The values are the
+      // cluster-wide liveness contract, calibrated for duty-cycled and
+      // slow devices: a 90 s idle and a 20 s/60 s keepalive pair let a
+      // deep-sleeping peer skip several pings without its sessions
+      // being torn down by the faster side of a mixed cluster.
+      session_idle_timeout: Duration::from_secs(90),
+      keepalive_interval: Duration::from_secs(20),
+      keepalive_timeout: Duration::from_secs(60),
       trace_metadata_limits: TraceMetadataLimits::default(),
       route_policy: None,
       receipt_retention: Duration::from_secs(30 * 24 * 60 * 60),
       required_features: BTreeSet::new(),
+      merge_admission: MergeAdmissionLimits::default(),
     }
   }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ParserLimits {
-  frame_bytes: usize,
-  depth: usize,
-  collection_items: usize,
+/// The per-pool admission budgets the limiter reads out of
+/// [`MergeAdmissionLimits`]: one per-source and one global token bucket
+/// each.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdmissionPoolLimits {
+  pub(crate) source: (u32, Duration),
+  pub(crate) global: (u32, Duration),
 }
 
-impl ParserLimits {
-  pub fn new(frame_bytes: usize, depth: usize, collection_items: usize) -> Result<Self> {
-    ensure_nonzero(frame_bytes, "parser frame bytes")?;
-    ensure_nonzero(depth, "parser depth")?;
-    ensure_nonzero(collection_items, "parser collection items")?;
-    Ok(Self {
-      frame_bytes,
-      depth,
-      collection_items,
-    })
+/// The merge admission limits: two pools of token buckets metering the
+/// authenticated session admission. **Joins** (untrusted strangers
+/// carrying a credential) keep the strictest budget — a burst of 16 per
+/// source per minute, 256 per node per minute. **Member reconnects**
+/// (holders of a trusted binding — the self-healing path) are budgeted
+/// by the cluster scale: `max(16, 4 × expected_members)` per source and
+/// `max(256, 4 × expected_members)` per node per minute, so a whole
+/// site reconnecting behind one address never starves its tail (the
+/// incident-B shape). Tokens refill continuously at `burst / window`
+/// per second.
+#[derive(Clone, Copy, Debug)]
+pub struct MergeAdmissionLimits {
+  join_source: (u32, Duration),
+  join_global: (u32, Duration),
+  member_source: (u32, Duration),
+  member_global: (u32, Duration),
+}
+
+impl MergeAdmissionLimits {
+  /// Derives the limits for a cluster of `expected_members` nodes. The
+  /// join pool stays fixed (strangers do not scale with the cluster);
+  /// only the member pool grows with the expected member count.
+  pub fn for_cluster(expected_members: usize) -> Result<Self> {
+    ensure_nonzero(expected_members, "expected members")?;
+    Ok(Self::scaled(expected_members))
   }
-}
 
-impl Default for ParserLimits {
-  fn default() -> Self {
+  fn scaled(expected_members: usize) -> Self {
+    let member_burst = |floor: u32| {
+      u32::try_from(expected_members.saturating_mul(4))
+        .unwrap_or(u32::MAX)
+        .max(floor)
+    };
+    let minute = Duration::from_secs(60);
     Self {
-      frame_bytes: crate::protocol::MAX_BODY_BYTES,
-      depth: 16,
-      collection_items: 1_024,
+      join_source: (16, minute),
+      join_global: (256, minute),
+      member_source: (member_burst(16), minute),
+      member_global: (member_burst(256), minute),
     }
+  }
+
+  /// Replaces the join pool's per-source and global budgets (burst
+  /// tokens per window). Strangers carrying credentials: keep this the
+  /// tightest budget in the node.
+  pub fn with_join_pool(
+    mut self, source_burst: u32, source_window: Duration, global_burst: u32,
+    global_window: Duration,
+  ) -> Result<Self> {
+    ensure_nonzero(source_burst as usize, "join source burst")?;
+    ensure_nonzero(global_burst as usize, "join global burst")?;
+    ensure_nonzero_duration(source_window, "join source window")?;
+    ensure_nonzero_duration(global_window, "join global window")?;
+    self.join_source = (source_burst, source_window);
+    self.join_global = (global_burst, global_window);
+    Ok(self)
+  }
+
+  /// Replaces the member pool's per-source and global budgets (burst
+  /// tokens per window). Holders of a trusted binding: this is the
+  /// self-healing path and must stay the more generous pool.
+  pub fn with_member_pool(
+    mut self, source_burst: u32, source_window: Duration, global_burst: u32,
+    global_window: Duration,
+  ) -> Result<Self> {
+    ensure_nonzero(source_burst as usize, "member source burst")?;
+    ensure_nonzero(global_burst as usize, "member global burst")?;
+    ensure_nonzero_duration(source_window, "member source window")?;
+    ensure_nonzero_duration(global_window, "member global window")?;
+    self.member_source = (source_burst, source_window);
+    self.member_global = (global_burst, global_window);
+    Ok(self)
+  }
+
+  pub(crate) fn join_pool(&self) -> AdmissionPoolLimits {
+    AdmissionPoolLimits {
+      source: self.join_source,
+      global: self.join_global,
+    }
+  }
+
+  pub(crate) fn member_pool(&self) -> AdmissionPoolLimits {
+    AdmissionPoolLimits {
+      source: self.member_source,
+      global: self.member_global,
+    }
+  }
+}
+
+impl Default for MergeAdmissionLimits {
+  fn default() -> Self {
+    // The reference cluster scale: the defaults ship safe for the
+    // 64-node deployments the chaos lane exercises, and every value is
+    // overridable through `for_cluster` or the pool setters.
+    Self::scaled(64)
   }
 }
 
@@ -347,8 +515,19 @@ impl RecoveryConfig {
 impl Default for RecoveryConfig {
   fn default() -> Self {
     Self {
-      fan_out: 64,
-      initial_backoff: Duration::from_secs(1),
+      // Sixteen, not sixty-four: the any-one-route contract needs exactly
+      // one route, and on two slow cores a sixty-four-dial burst starved
+      // its own tail past the authentication deadline so every dial in
+      // the burst failed and the isolated member never healed (incident
+      // B). Sixteen converges in a step or two under the same
+      // starvation.
+      fan_out: 16,
+      // Two seconds, not one: with identical backoff sequences many
+      // devices recovering from one shared event retry in lockstep and
+      // slam the far end's admission limits together; the sampled jitter
+      // (±25%, seeded from the injected entropy) decorrelates them from
+      // the first doubling on.
+      initial_backoff: Duration::from_secs(2),
       maximum_backoff: Duration::from_secs(5 * 60),
     }
   }
@@ -391,11 +570,13 @@ mod tests {
     // The default policy is enabled: a silently dead peer must be
     // detected within a bounded window, not TCP's own retransmit
     // timeouts, so the defaults satisfy the keepalive ordering invariant
-    // and stay nonzero.
+    // and stay nonzero. The values are the slow-device-safe liveness
+    // contract (90 s idle, 20 s ping, 60 s timeout — see
+    // `liveness_defaults_are_the_slow_device_calibration`).
     let default = NodeConfig::new();
-    assert_eq!(default.session_idle_timeout(), Duration::from_secs(30));
-    assert_eq!(default.keepalive_interval(), Duration::from_secs(10));
-    assert_eq!(default.keepalive_timeout(), Duration::from_secs(30));
+    assert_eq!(default.session_idle_timeout(), Duration::from_secs(90));
+    assert_eq!(default.keepalive_interval(), Duration::from_secs(20));
+    assert_eq!(default.keepalive_timeout(), Duration::from_secs(60));
     assert_ne!(
       disabled.session_idle_timeout(),
       default.session_idle_timeout()
@@ -431,9 +612,10 @@ mod tests {
     assert_eq!(both.keepalive_timeout(), Duration::from_secs(15));
   }
 
-  /// The dial deadline accepts any nonzero duration (the default
-  /// matches the authentication deadline) and rejects zero: a zero
-  /// deadline would cancel every dial before the OS connect resolves.
+  /// The dial deadline accepts any nonzero duration and rejects zero: a
+  /// zero deadline would cancel every dial before the OS connect
+  /// resolves. The authentication deadline behaves the same, and its
+  /// default is the slow-device-safe 30 s calibration.
   #[test]
   fn dial_deadline_accepts_nonzero_and_rejects_zero() {
     let configured = NodeConfig::new()
@@ -445,6 +627,79 @@ mod tests {
       .with_dial_deadline(Duration::ZERO)
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// The authentication deadline accepts any nonzero duration, rejects
+  /// zero, and defaults to the 30 s calibration: the join-mode
+  /// admission commit sits inside the deadline, and slow-flash commits
+  /// pushed concurrent join bursts past the old 10 s value. The relay
+  /// hop deadline behaves the same and defaults to 5 s per hop.
+  #[test]
+  fn authentication_deadline_accepts_nonzero_and_rejects_zero() {
+    let configured = NodeConfig::new()
+      .with_authentication_deadline(Duration::from_secs(45))
+      .unwrap();
+    assert_eq!(
+      configured.authentication_deadline(),
+      Duration::from_secs(45)
+    );
+    assert_eq!(
+      NodeConfig::new().authentication_deadline(),
+      Duration::from_secs(30)
+    );
+    let error = NodeConfig::new()
+      .with_authentication_deadline(Duration::ZERO)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// The relay hop deadline accepts any nonzero duration, rejects zero,
+  /// and defaults to 5 s per hop.
+  #[test]
+  fn relay_hop_deadline_accepts_nonzero_and_rejects_zero() {
+    let configured = NodeConfig::new()
+      .with_relay_hop_deadline(Duration::from_secs(9))
+      .unwrap();
+    assert_eq!(configured.relay_hop_deadline(), Duration::from_secs(9));
+    assert_eq!(
+      NodeConfig::new().relay_hop_deadline(),
+      Duration::from_secs(5)
+    );
+    let error = NodeConfig::new()
+      .with_relay_hop_deadline(Duration::ZERO)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// The library ships exactly one profile — the defaults — and it must
+  /// be safe on the slowest supported device (the mixed-cluster rule:
+  /// timing constants are peer-visible, so there is no second, named
+  /// low-power profile). Every recalibrated value traces to a
+  /// transport-chaos incident or a slow-device bound.
+  #[test]
+  fn liveness_defaults_are_the_slow_device_calibration() {
+    let config = NodeConfig::new();
+    // Incident C: 64 nodes x 4 anti-entropy ticks/s starved a two-vcpu
+    // runner's data plane; one tick/s keeps the O(N x interval) load
+    // bounded while converging far inside the sync SLOs.
+    assert_eq!(config.anti_entropy_interval(), Duration::from_secs(1));
+    // Incident B, deadline half: slow-flash admission commits pushed
+    // concurrent join tails past the old 10 s deadline into persistent
+    // join failure.
+    assert_eq!(config.authentication_deadline(), Duration::from_secs(30));
+    // Duty-cycled peers skip several 20 s pings before the 60 s
+    // keepalive timeout closes them, and a 90 s idle tolerates a slow
+    // scheduling environment without tearing down live sessions.
+    assert_eq!(config.session_idle_timeout(), Duration::from_secs(90));
+    assert_eq!(config.keepalive_interval(), Duration::from_secs(20));
+    assert_eq!(config.keepalive_timeout(), Duration::from_secs(60));
+    // Incident B: the recovery plane's own defaults (fan-out sixteen,
+    // two-second initial backoff) are asserted in the recovery
+    // controller's tests; here only the ordering invariant repeats:
+    assert!(config.recovery().fan_out() >= 1);
+    assert!(config.recovery().maximum_backoff >= config.recovery().initial_backoff);
+    // A k-hop relay attempt is bounded by k x the per-hop budget.
+    assert_eq!(config.relay_hop_deadline(), Duration::from_secs(5));
   }
 
   /// A deadline without either driver, a keepalive without a deadline,

@@ -296,6 +296,15 @@ pub(crate) async fn delivered_within_bound(
 /// long enough to cover a healthy round trip on a loaded session, short
 /// enough that one unreachable peer cannot stall the anti-entropy tick
 /// beyond a small multiple of its cadence.
+///
+/// Known margin: on a starved single-core runner the routed ack can
+/// exceed this bound, and a trust pass then retries its head page while
+/// later pages wait — the pass truncates until an ack gets through (the
+/// diagnostics name the affected roster). A longer global bound is not
+/// the answer: it uniformly slows every sync-bound phase (measured: the
+/// sixty-four-node lane stopped reaching its convergence waits at all).
+/// The structural repair is receiver-side cursor evidence, not a bigger
+/// timer.
 pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::{SessionDriver, connection_frame_rules};
 use crate::{
-  Digest, ErrorKind, FeatureTag,
+  Digest, ErrorKind, FeatureTag, NodeConfig,
   identity::{
     credential::MergeCredentialIssuer,
     lifecycle::{LocalIdentityContext, ensure_self_binding},
@@ -62,12 +62,15 @@ async fn node_from(
     .await
     .unwrap();
   let issuer = Arc::new(Mutex::new(MergeCredentialIssuer::new()));
+  let config = NodeConfig::new();
   let driver = SessionDriver::new(
     context.clone(),
     keys.as_provider(),
     entropy.clone(),
     issuer.clone(),
     offer,
+    config.authentication_deadline(),
+    config.merge_admission(),
   );
   Node {
     context,

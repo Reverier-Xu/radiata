@@ -65,8 +65,14 @@ peer as on any other transport.
 ```bash
 ./up.sh                      # 5 chat nodes (u1..u5), http 19081..19085
 python3 test_chat.py         # the full scenario matrix, writes chat-report.json
+python3 test_boundary.py     # boundary-condition edges, writes boundary-report.json
+python3 test_fuzz.py --seed 7 --ops 60   # seeded scenario fuzz (FUZZ=1 mesh)
+./soak_hub_loss.sh 6         # repeat the hub-loss matrix to catch rare races
 ./down.sh
 ```
+
+`./run_acceptance.sh` runs the whole acceptance in one shot on fresh
+meshes (matrix, boundary, two fuzz seeds).
 
 The node binary speaks the same command set over HTTP: `/whoami`,
 `/identities`, `/announce`, `/announcements`, `/dm`, `/flush`,

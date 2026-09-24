@@ -609,8 +609,6 @@ fn config_and_registry_are_externally_constructible() {
     .unwrap()
     .with_session_queue_limits(64, 1024)
     .unwrap()
-    .with_parser_limits(radiata::ParserLimits::new(4096, 8, 128).unwrap())
-    .unwrap()
     .with_trace_metadata_limits(
       TraceMetadataLimits::new(64, 256, Duration::from_secs(3600)).unwrap(),
     )

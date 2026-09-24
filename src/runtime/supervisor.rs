@@ -643,7 +643,8 @@ fn session_packet_context(
     crate::routing::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
     dependencies.config.trace_metadata_limits().active(),
     Arc::clone(&dependencies.connection_tasks),
-    dependencies.config.parser_cbor_limits(),
+    crate::protocol::CONTROL_CBOR_LIMITS,
+    dependencies.config.relay_hop_deadline(),
   ))
 }
 
@@ -673,6 +674,8 @@ impl Supervisor {
       dependencies.entropy.clone(),
       Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
       offer,
+      dependencies.config.authentication_deadline(),
+      dependencies.config.merge_admission(),
     );
     // The membership sync protocol was registered by `spawn_runtime`
     // before the runtime was marked ready.

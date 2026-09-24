@@ -43,9 +43,8 @@ use radiata::{
   BoxFuture, ConnectMember, CustomListener, CustomTransport, DisconnectPeer, Endpoint, Error,
   FeatureTag, GetLocalNode, GetRecovery, IssueMergeCredential, LeaveCluster, Listen, MemberStatus,
   MergeCluster, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer,
-  PageMembers, PageSpec, ProtocolDefinition, ProtocolTag, RecoveryConfig, Result, RoutingPolicy,
-  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TransportName, TransportStream,
-  WaitForShutdown,
+  PageMembers, PageSpec, ProtocolDefinition, ProtocolTag, Result, RoutingPolicy, ShutdownReason,
+  StreamMetadata, StreamPolicy, StreamTarget, TransportName, TransportStream, WaitForShutdown,
 };
 mod common;
 
@@ -56,13 +55,6 @@ use common::MemoryStorageFactory;
 const NODES: usize = 64;
 const STAR_SPOKES: usize = 12;
 const BUS_LINES: usize = 3;
-/// The recovery burst is capped well below the cluster size: on a
-/// two-vcpu CI runner a 63-dial step starves its own tail past the
-/// fixed ten-second authentication deadline, so every dial in the burst
-/// fails and the isolated member never heals. Sixteen concurrent dials
-/// converge in a step or two under the same starvation; the
-/// any-one-route contract needs exactly one to land.
-const RECOVERY_FAN_OUT: usize = 16;
 /// The per-phase budgets assume a contended machine, not a quiet one:
 /// 63 joins, 256 listeners, and the churn window share one runtime.
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(240);
@@ -472,33 +464,15 @@ impl Slot {
 }
 
 fn init_tracing() {
-  use std::sync::Once;
-  static INIT: Once = Once::new();
-  INIT.call_once(|| {
-    tracing_subscriber::fmt()
-      .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=debug"))
-      .with_test_writer()
-      .init();
-  });
+  common::init_tracing();
 }
 
 fn node_config() -> NodeConfig {
-  // One second, not the sixteen-node lanes' 250 ms: sixty-four nodes
-  // ticking four times a second saturate a two-vcpu runner and starve
-  // the data plane's relay acks. Convergence checks drive their own
-  // deterministic rounds, so the wall interval only backstops them.
+  // The shipped defaults, unpinned: the chaos lane is the evidence that
+  // the single timing profile (one anti-entropy tick per second,
+  // recovery fan-out sixteen with a two-second initial backoff, 30 s
+  // authentication deadline) survives a starved two-vcpu-class runner.
   NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_secs(1))
-    .expect("nonzero interval")
-    .with_recovery_policy(
-      RecoveryConfig::new(
-        RECOVERY_FAN_OUT,
-        Duration::from_secs(2),
-        Duration::from_secs(60),
-      )
-      .expect("valid recovery policy"),
-    )
-    .expect("valid node config")
 }
 
 fn runtime_extensions(collector: &Arc<EchoCollector>) -> radiata::ExtensionRegistry {
@@ -755,37 +729,40 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
   let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
   let mut last_report = std::time::Instant::now() - CONVERGE_TIMEOUT;
   loop {
-    for index in indices {
-      bounded(
-        slots[*index].handle().command(radiata::RunSyncRound::new()),
-        "sync round",
-      )
-      .await
-      .expect("sync round");
-    }
-    let mut ready = true;
-    for index in indices {
+    // Observe first, concurrently: only the nodes that have not
+    // converged drive a round. The driven rounds themselves run
+    // concurrently — each round holds open for its slowest delivery
+    // verdict (a fixed bound), so driving them serially would scale the
+    // iteration cost by the node count and starve convergence on a
+    // single slow core (the CI starvation-gate failure shape).
+    let checks = futures_util::future::join_all(indices.iter().map(|index| async move {
       let slot = &slots[*index];
-      if active_members(slot).await != expected {
-        ready = false;
-        break;
-      }
+      let members = active_members(slot).await == expected;
       let recovery = bounded(slot.handle().query(GetRecovery::new()), "recovery view")
         .await
-        .expect("recovery view");
-      if !recovery.is_connected() {
-        ready = false;
-        break;
+        .map(|view| view.is_connected())
+        .unwrap_or(false);
+      (*index, members && recovery)
+    }))
+    .await;
+    let mut ready = true;
+    let mut stragglers = Vec::new();
+    for (index, converged) in checks {
+      if converged {
+        continue;
       }
+      ready = false;
+      stragglers.push(index);
     }
     if ready {
       return;
     }
     // Diagnose the stragglers every ten seconds so a timeout names the
-    // stuck nodes instead of leaving an anonymous hole.
+    // stuck nodes AND the exact member each one is missing, instead of
+    // leaving an anonymous count.
     if last_report.elapsed() >= Duration::from_secs(10) {
       last_report = std::time::Instant::now();
-      for index in indices {
+      for index in &stragglers {
         let slot = &slots[*index];
         let recovery = bounded(
           slot.handle().query(GetRecovery::new()),
@@ -793,23 +770,36 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
         )
         .await
         .expect("recovery view");
-        if !recovery.is_connected() || active_members(slot).await != expected {
-          let sessions = slot
-            .handle()
-            .query(radiata::PageSessions::new(
-              PageSpec::first(NODES).expect("page size"),
-            ))
-            .await
-            .map(|page| page.items().len())
-            .unwrap_or(0);
-          eprintln!(
-            "CONVERGE {what}: node {index} active={} expected={expected} recovery_connected={} sessions={sessions}",
-            active_members(slot).await,
-            recovery.is_connected(),
-          );
-        }
+        let missing = member_views(slot)
+          .await
+          .into_iter()
+          .filter(|member| member.status() != MemberStatus::Active)
+          .map(|member| format!("{}={:?}", member.node_id(), member.status()))
+          .collect::<Vec<_>>()
+          .join(",");
+        let sessions = slot
+          .handle()
+          .query(radiata::PageSessions::new(
+            PageSpec::first(NODES).expect("page size"),
+          ))
+          .await
+          .map(|page| page.items().len())
+          .unwrap_or(0);
+        eprintln!(
+          "CONVERGE {what}: node {index} expected={expected} recovery_connected={} sessions={sessions} not-active=[{missing}]",
+          recovery.is_connected(),
+        );
       }
     }
+    futures_util::future::join_all(stragglers.iter().map(|index| async move {
+      bounded(
+        slots[*index].handle().command(radiata::RunSyncRound::new()),
+        "sync round",
+      )
+      .await
+      .expect("sync round");
+    }))
+    .await;
     assert!(
       std::time::Instant::now() < deadline,
       "{what}: convergence timeout after {CONVERGE_TIMEOUT:?}"

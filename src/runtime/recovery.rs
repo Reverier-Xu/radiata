@@ -323,6 +323,7 @@ impl Supervisor {
         .iter()
         .map(|(member, _)| member.clone())
         .collect(),
+      self.dependencies.entropy.as_ref(),
     );
     for (member, endpoint) in candidates {
       if step.targets.contains(&member) {

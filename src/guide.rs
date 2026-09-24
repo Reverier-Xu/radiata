@@ -18,6 +18,8 @@
 //!    `KeyProvider`](#5-holding-identity-keys-keyprovider)
 //! 6. [Leaving the cluster:
 //!    `LeaveCluster`](#6-leaving-the-cluster-leavecluster)
+//! 7. [Deploying on low-performance
+//!    devices](#7-deploying-on-low-performance-devices)
 //!
 //! # 1. Resource versions across process boundaries
 //!
@@ -352,6 +354,42 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # 7. Deploying on low-performance devices
+//!
+//! **There is nothing to configure.** Build the node, form the
+//! cluster, send data — the defaults are the deployment. The library
+//! ships exactly one timing profile and it is calibrated for the
+//! slowest supported device (slow flash, one or two cores, duty-cycled
+//! peers): a mixed cluster of fast and slow nodes runs on the same
+//! defaults with no per-device profiles, because every timing constant
+//! is peer-visible and timing divergence is what breaks mixed
+//! clusters.
+//!
+//! Two sizes are worth knowing, and the defaults already answer both:
+//!
+//! - **Memory** is roughly `queue bytes × live neighbors` plus local
+//!   diagnostics and storage. The defaults fit the reference scale;
+//!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
+//!   is the one knob that changes it materially.
+//! - **Background load** is the anti-entropy tick: `N × interval` work per
+//!   round cluster-wide. The tick dispatches to its peers and settles delivery
+//!   verdicts off the tick path, so a hub's per-tick hold-down stays at the
+//!   dispatch cost rather than the slowest peer's ack bound — the reference
+//!   64-node mesh holds the one-second cadence even on a single slow core.
+//!
+//! Delivery across restarts stays the application's job (the data
+//! plane is at-most-once): a `Failed` or interrupted stream is a
+//! typed, bounded observation, not a silent loss. The chat example
+//! ships the reference pattern — queue locally, re-drive on the typed
+//! outcome, and let the bounded budgets turn congestion into fast
+//! failures instead of queueing.
+//!
+//! The setters on [`NodeConfig`](crate::NodeConfig) are operator
+//! escape hatches for *measured* problems, not integration steps: the
+//! timing ones are cluster-wide contracts and must move together; the
+//! resource ones (queues, diagnostics budget, dial deadline) are safe
+//! to scale per device. Their contracts live on the type.
 //!
 //! # Storage
 //!

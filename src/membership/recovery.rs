@@ -5,13 +5,20 @@
 //! expands its topology, while a fully isolated node retries every
 //! member in its table (bounded fan-out, caller-configured wall-clock
 //! backoff re-read from `SystemTime` after every wake, including
-//! rollback/freeze/forward-jump) until any one connects. A `NodeId` is
-//! authenticated before a session is accepted, and the single
-//! controller re-arms after any later isolation without storms.
+//! rollback/freeze/forward-jump) until any one connects. Each taken step
+//! samples a ±25% uniform jitter around the base backoff from the
+//! injected entropy, so devices recovering from one shared event do not
+//! retry in lockstep. A `NodeId` is authenticated before a session is
+//! accepted, and the single controller re-arms after any later isolation
+//! without storms.
 
 use std::collections::BTreeSet;
 
-use crate::NodeId;
+use crate::{NodeId, api::Entropy};
+
+/// The jitter granularity: the sampled wait deviates from the base
+/// backoff by at most one quarter in either direction (±25% uniform).
+const JITTER_QUARTER: u64 = 4;
 
 /// The caller-configured recovery policy (wired from `NodeConfig`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,23 +53,26 @@ pub(crate) enum RecoveryState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryStep {
   pub(crate) targets: Vec<NodeId>,
-  /// The wall-clock backoff as computed BEFORE the attempt counter
-  /// advanced (the pre-increment value), and `0` when the deadline is
-  /// already due (the caller wakes immediately). It is the delay the
-  /// just-taken attempt scheduled, not a remaining wait.
+  /// The wall-clock wait the just-taken attempt scheduled (the jittered
+  /// next doubling's base), and `0` when the deadline is already due
+  /// (the caller wakes immediately).
   pub(crate) backoff_seconds: u64,
 }
 
-/// The continuous recovery controller. Pure state logic: the caller feeds
-/// membership/connectivity observations and wall-clock seconds; the
-/// controller decides activation, backoff, fan-out, quiescence, and
-/// reactivation.
+/// The continuous recovery controller. Pure state logic: the caller
+/// feeds membership/connectivity observations, wall-clock seconds, and
+/// the entropy the jitter samples; the controller decides activation,
+/// backoff, fan-out, quiescence, and reactivation.
 #[derive(Clone, Debug)]
 pub(crate) struct RecoveryController {
   policy: RecoveryPolicy,
   state: RecoveryState,
   attempts: u64,
   last_attempt_at: u64,
+  /// The jittered wait the just-taken step sampled, stable between
+  /// wakes: every due-check inside one schedule compares against the
+  /// same sampled value. `None` before the first step of a schedule.
+  scheduled_backoff: Option<u64>,
   pending: BTreeSet<NodeId>,
 }
 
@@ -73,6 +83,7 @@ impl RecoveryController {
       state: RecoveryState::Idle,
       attempts: 0,
       last_attempt_at: 0,
+      scheduled_backoff: None,
       pending: BTreeSet::new(),
     }
   }
@@ -111,6 +122,7 @@ impl RecoveryController {
         // No members known yet: nothing to recover toward.
         self.state = RecoveryState::Idle;
         self.pending.clear();
+        self.scheduled_backoff = None;
         return;
       }
       // Fully isolated: every table member is a retry candidate, and the
@@ -119,6 +131,7 @@ impl RecoveryController {
       if self.state != RecoveryState::Recovering {
         self.state = RecoveryState::Recovering;
         self.attempts = 0;
+        self.scheduled_backoff = None;
       }
       // Reactivation while isolated re-arms the controller without a
       // storm (single controller, bounded attempts).
@@ -132,43 +145,84 @@ impl RecoveryController {
     if self.state != RecoveryState::Connected {
       self.state = RecoveryState::Connected;
       self.attempts = 0;
+      self.scheduled_backoff = None;
     }
   }
 
   /// Computes the next recovery step: a bounded set of targets within the
-  /// configured fan-out, plus the
-  /// wall-clock backoff (re-read every wake; rollback/freeze delays,
-  /// forward jump makes it due).
-  pub(crate) fn next_step(&mut self, now: u64, candidates: &BTreeSet<NodeId>) -> RecoveryStep {
-    let backoff = self.backoff_seconds(now);
+  /// configured fan-out, plus the wall-clock wait this attempt schedules —
+  /// the next doubling's base with the sampled ±25% jitter applied
+  /// (rollback/freeze delays it, a forward jump makes it due and the
+  /// returned wait collapses to zero). The first attempt runs immediately
+  /// upon activation, so the first retry waits the doubled initial.
+  pub(crate) fn next_step(
+    &mut self, now: u64, candidates: &BTreeSet<NodeId>, entropy: &dyn Entropy,
+  ) -> RecoveryStep {
     let targets: Vec<NodeId> = candidates
       .iter()
       .take(self.policy.fan_out.max(1))
       .cloned()
       .collect();
-    self.last_attempt_at = now;
     self.attempts = self.attempts.saturating_add(1);
+    let sampled = self.sample_jitter(self.base_seconds(), entropy);
+    let due_already = now >= self.last_attempt_at.saturating_add(sampled);
+    self.last_attempt_at = now;
+    self.scheduled_backoff = Some(sampled);
     RecoveryStep {
       targets,
-      backoff_seconds: backoff,
+      backoff_seconds: if due_already { 0 } else { sampled },
     }
   }
 
-  /// The wall-clock backoff for the next attempt: doubles from the initial
-  /// value up to the maximum; a forward jump in wall time makes the next
-  /// attempt immediately due.
-  pub(crate) fn backoff_seconds(&self, now: u64) -> u64 {
+  /// The deterministic base backoff: doubles from the initial value up
+  /// to the maximum.
+  fn base_seconds(&self) -> u64 {
     let exponent = self.attempts.min(16);
-    let doubled = self
+    self
       .policy
       .initial_backoff
-      .saturating_mul(1_u64 << exponent);
-    let capped = doubled.min(self.policy.maximum_backoff);
-    if now >= self.last_attempt_at.saturating_add(capped) {
+      .saturating_mul(1_u64 << exponent)
+      .min(self.policy.maximum_backoff)
+  }
+
+  /// Samples the ±25% uniform jitter around `base` from the injected
+  /// entropy: devices recovering from one power or network event share
+  /// identical base sequences and would otherwise slam the far end's
+  /// admission limits in lockstep. An entropy fault degrades to the
+  /// unjittered base — recovery stays best-effort, and the fault is
+  /// already visible wherever the entropy surfaces it.
+  fn sample_jitter(&self, base: u64, entropy: &dyn Entropy) -> u64 {
+    let spread = base / JITTER_QUARTER;
+    if spread == 0 {
+      // Sub-second bases have no whole-second spread to sample.
+      return base;
+    }
+    let mut word = [0_u8; 8];
+    if entropy.fill(&mut word).is_err() {
+      return base;
+    }
+    let range = 2 * spread;
+    let offset = if range == u64::MAX {
+      u64::from_be_bytes(word)
+    } else {
+      ((u128::from(u64::from_be_bytes(word)) * u128::from(range + 1)) >> 64) as u64
+    };
+    (base - spread).saturating_add(offset)
+  }
+
+  /// The wall-clock seconds of the currently scheduled wait: the jittered
+  /// value the just-taken step sampled, or the deterministic base before
+  /// the first step of a schedule. A deadline already due under `now`
+  /// collapses to zero.
+  pub(crate) fn backoff_seconds(&self, now: u64) -> u64 {
+    let scheduled = self
+      .scheduled_backoff
+      .unwrap_or_else(|| self.base_seconds());
+    if now >= self.last_attempt_at.saturating_add(scheduled) {
       // The deadline is already due; wake immediately.
       return 0;
     }
-    capped
+    scheduled
   }
 
   /// Whether the controller should run a cycle now (deadline due under the
@@ -196,11 +250,44 @@ impl RecoveryController {
   }
 }
 
+/// A deterministic entropy whose every fill yields the same word: the
+/// jitter sample is pinned, so backoff assertions and seeded replays
+/// stay exact.
+#[cfg(test)]
+#[derive(Debug)]
+struct WordEntropy(u64);
+
+#[cfg(test)]
+impl Entropy for WordEntropy {
+  fn fill(&self, output: &mut [u8]) -> crate::Result<()> {
+    let len = output.len();
+    let word = self.0.to_be_bytes();
+    output.copy_from_slice(&word[(word.len() - len)..]);
+    Ok(())
+  }
+}
+
+/// An entropy that fails like a faulty provider: the jitter must
+/// degrade to the unjittered base instead of failing recovery.
+#[cfg(test)]
+#[derive(Debug)]
+struct FailingEntropy;
+
+#[cfg(test)]
+impl Entropy for FailingEntropy {
+  fn fill(&self, _output: &mut [u8]) -> crate::Result<()> {
+    Err(crate::Error::provider(
+      crate::ProviderErrorKind::Io,
+      crate::ProviderErrorContext::Entropy,
+    ))
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::collections::BTreeSet;
 
-  use super::{RecoveryController, RecoveryPolicy, RecoveryState};
+  use super::{FailingEntropy, RecoveryController, RecoveryPolicy, RecoveryState, WordEntropy};
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
@@ -266,13 +353,17 @@ mod tests {
 
   /// Backoff doubles from the initial value up to the maximum and
   /// re-reads wall time; a forward jump makes it immediately due,
-  /// rollback/freeze delays it.
+  /// rollback/freeze delays it. The pinned jitter word samples the base
+  /// exactly, so the doubling stays observable at the fourth-second step.
   #[test]
   fn recovery_backoff_follows_wall_clock() {
+    // Samples offset one out of the [0, 2] range: the jittered wait
+    // equals the unjittered base whenever the spread is a whole second.
+    let entropy = WordEntropy(0xAAAA_AAAA_AAAA_AAAA);
     let mut controller = RecoveryController::new(policy());
     let online = set(&[1, 2]);
     controller.observe(&online, &set(&[]));
-    let _ = controller.next_step(100, &set(&[2]));
+    let _ = controller.next_step(100, &set(&[2]), &entropy);
 
     // Not due yet: 101 < 100 + 2 (initial backoff 1, doubled after attempt).
     assert!(!controller.due(101));
@@ -282,32 +373,80 @@ mod tests {
     assert!(controller.due(10_000));
 
     // The next backoff doubles again (attempt 2: 1 << 2 = 4).
-    let step = controller.next_step(10_000, &set(&[2]));
+    let step = controller.next_step(10_000, &set(&[2]), &entropy);
     assert_eq!(step.backoff_seconds, 0); // immediately due after the jump
     assert!(!controller.due(10_003));
     assert!(controller.due(10_004));
   }
 
+  /// The sampled jitter stays inside ±25% of the base and decorrelates
+  /// two devices that share one base sequence: different entropy words
+  /// produce different waits for the same state.
+  #[test]
+  fn jitter_stays_bounded_and_decorrelates_identical_sequences() {
+    let base_policy = RecoveryPolicy::new(4, 8, 8);
+    let online = set(&[1, 2]);
+    let sampled = |word: u64| {
+      let mut controller = RecoveryController::new(base_policy);
+      controller.observe(&online, &set(&[]));
+      let step = controller.next_step(0, &online, &WordEntropy(word));
+      (step.backoff_seconds, controller)
+    };
+
+    // Word 0 samples the low end (8 - 2), u64::MAX the high end (8 + 2).
+    let (low, controller_low) = sampled(0);
+    let (high, _) = sampled(u64::MAX);
+    assert_eq!(low, 6);
+    assert_eq!(high, 10);
+
+    // Every sampled word stays within one quarter of the base.
+    for word in [1, 7, 123, 0xDEAD_BEEF, u64::MAX - 1] {
+      let (value, _) = sampled(word);
+      assert!(
+        (6..=10).contains(&value),
+        "jitter word {word} sampled {value}, outside ±25% of 8"
+      );
+    }
+
+    // The sampled schedule is stable across due checks: the wait the
+    // step announced is the wait the controller enforces.
+    assert!(!controller_low.due(low - 1));
+    assert!(controller_low.due(low));
+  }
+
+  /// An entropy fault degrades to the unjittered base instead of
+  /// failing the recovery step.
+  #[test]
+  fn an_entropy_fault_degrades_to_the_unjittered_base() {
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(4, 8, 8));
+    let online = set(&[1, 2]);
+    controller.observe(&online, &set(&[]));
+    let step = controller.next_step(0, &online, &FailingEntropy);
+    assert_eq!(step.backoff_seconds, 8);
+  }
+
   /// Each cycle expands only through the configured bounded fan-out.
   #[test]
   fn recovery_expands_through_bounded_fan_out() {
+    let entropy = WordEntropy(0);
     let mut controller = RecoveryController::new(RecoveryPolicy::new(2, 1, 60));
     let online = set(&[1, 2, 3, 4]);
     controller.observe(&online, &set(&[]));
-    let step = controller.next_step(0, &set(&[2, 3, 4, 5, 6]));
+    let step = controller.next_step(0, &set(&[2, 3, 4, 5, 6]), &entropy);
     assert_eq!(step.targets.len(), 2, "fan-out bounds each cycle");
   }
 
   /// An immediate-recovery command forces one cycle without storms.
   #[test]
   fn recovery_immediate_forces_one_cycle() {
+    let entropy = WordEntropy(0);
     let mut controller = RecoveryController::new(policy());
     let online = set(&[1, 2]);
     controller.observe(&online, &set(&[]));
     controller.immediate(50);
     assert!(controller.due(50));
     // One step consumes the immediate trigger.
-    let _ = controller.next_step(50, &set(&[2]));
+    let _ = controller.next_step(50, &set(&[2]), &entropy);
     assert!(!controller.due(50));
   }
 }
@@ -320,7 +459,7 @@ mod tests {
 pub(crate) mod simulation {
   use std::collections::BTreeSet;
 
-  use super::{RecoveryController, RecoveryPolicy, RecoveryState};
+  use super::{RecoveryController, RecoveryPolicy, RecoveryState, WordEntropy};
   use crate::NodeId;
 
   /// The deterministic scenario script: (wall seconds, reachable set).
@@ -360,7 +499,7 @@ pub(crate) mod simulation {
         let mut ordered = unreachable.clone();
         ordered.sort();
         ordered.rotate_left(offset);
-        let step = controller.next_step(*now, &ordered.into_iter().collect());
+        let step = controller.next_step(*now, &ordered.into_iter().collect(), &WordEntropy(seed));
         trace.push(RecoveryDecision {
           at_seconds: *now,
           targets: step.targets,
@@ -434,7 +573,7 @@ pub(crate) mod simulation {
 mod scale_tests {
   use std::collections::BTreeSet;
 
-  use super::{RecoveryController, RecoveryPolicy, RecoveryState};
+  use super::{RecoveryController, RecoveryPolicy, RecoveryState, WordEntropy};
   use crate::NodeId;
 
   fn node_at(index: usize) -> NodeId {
@@ -456,7 +595,7 @@ mod scale_tests {
     controller.observe(&online, &set(&[]));
     assert_eq!(controller.state(), RecoveryState::Recovering);
 
-    let step = controller.next_step(0, &online);
+    let step = controller.next_step(0, &online, &WordEntropy(0));
     assert!(
       step.targets.len() <= 16,
       "each cycle expands only through the bounded fan-out"

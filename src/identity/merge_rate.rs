@@ -1,22 +1,29 @@
-//! Fixed credential-merge rate limiting.
+//! Credential-merge admission control.
 //!
-//! Before any handshake or signing work, each connection attempt is
-//! admitted against the fixed policy: per-source and global pending
-//! attempts, per-source and global 60-second fixed windows, a bounded
-//! source-bucket table with idle eviction, and the ten-second
-//! authentication deadline owned by the session driver. A rejected
-//! attempt consumes no credential, performs no signing, consumes no
-//! rate-window budget, and leaves no limiter state behind: both windows
-//! record an attempt only after every admission check has passed, and a
-//! source bucket is created or refreshed only on the grant path. An
-//! [`MergeSlot`] holds the pending count
-//! for exactly one in-flight attempt and releases it on every outcome,
-//! including cancellation.
+//! Admission classifies each accepted connection by its hello mode and
+//! meters it against a smooth token-bucket policy in two separate
+//! pools: **join** attempts (untrusted strangers carrying a credential —
+//! the strictest budget) and **member reconnects** (holders of a trusted
+//! binding — the self-healing path, budgeted by the cluster scale). Each
+//! pool holds a per-source and a global bucket, per-pool
+//! pending-attempt bounds, and one bounded source-bucket table with
+//! idle eviction shared by both pools; the session driver owns the
+//! configured authentication deadline. Tokens refill continuously at
+//! `burst / window` per second, so a refused party advances at the
+//! refill rate instead of waiting for a window edge, and the head of a
+//! burst can no longer consume a whole window for the tail.
 //!
-//! Rate windows use the monotonic clock, so host wall-clock rollback can
+//! A refused attempt consumes no budget, performs no signing, creates
+//! no bucket, and refreshes no idle clock: buckets and idle clocks
+//! record only on the grant path. A rejected attempt also neither
+//! creates nor refreshes the source's bucket, so refused sources can
+//! never pin the bounded table. A [`MergeSlot`] holds the pool's
+//! pending count for exactly one in-flight attempt and releases it on
+//! every outcome, including cancellation.
+//!
+//! Buckets run on the monotonic clock: host wall-clock rollback can
 //! delay the authentication deadline and a forward jump can make it
-//! immediately due, but neither ever widens or narrows the fixed rate
-//! counts (host-wall-clock semantics).
+//! immediately due, but neither widens or narrows the admission rates.
 
 use std::{
   collections::BTreeMap,
@@ -25,24 +32,29 @@ use std::{
   time::{Duration, Instant},
 };
 
-use crate::{Error, Result};
+use crate::{Error, Result, config::MergeAdmissionLimits};
 
-pub(crate) const PENDING_PER_SOURCE: usize = 4;
-pub(crate) const PENDING_GLOBAL: usize = 64;
-pub(crate) const RATE_PER_SOURCE: usize = 16;
-pub(crate) const RATE_GLOBAL: usize = 256;
-pub(crate) const WINDOW_SECONDS: Duration = Duration::from_secs(60);
-pub(crate) const SOURCE_BUCKET_LIMIT: usize = 1024;
-pub(crate) const SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(600);
+/// The scaled token unit: one admission consumes `TOKEN_SCALE` fixed
+/// points, so continuous refill keeps sub-token remainders.
+const TOKEN_SCALE: u64 = 1 << 32;
+
+/// The concurrent in-flight attempts one source may hold per pool.
+const PENDING_PER_SOURCE: usize = 4;
+/// The concurrent in-flight attempts the node may hold per pool.
+const PENDING_GLOBAL: usize = 64;
+/// The bounded number of tracked sources; idle eviction keeps one
+/// source from pinning the table.
+const SOURCE_BUCKET_LIMIT: usize = 1024;
+/// How long a bucket stays evictable after its last grant.
+const SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(600);
 
 /// The canonical merge source. The peer port is dropped (ephemeral
-/// reconnects are aliases of one source), IPv4-mapped IPv6 collapses to its
-/// IPv4 form, so every alias of one source shares one bucket
-/// (normalized-source aliases). A medium without peer addresses (a
-/// caller-registered custom transport) attributes its attempts to one
-/// shared per-medium bucket derived from the transport class binding:
-/// the fixed limits still bound it, just at the coarsest attribution
-/// the medium supports.
+/// reconnects are aliases of one source), IPv4-mapped IPv6 collapses to
+/// its IPv4 form, so every alias of one source shares one bucket. A
+/// medium without peer addresses (a caller-registered custom transport)
+/// attributes its attempts to one shared per-medium bucket derived from
+/// the transport class binding: the configured limits still bound it,
+/// just at the coarsest attribution the medium supports.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MergeSource {
   V4([u8; 4]),
@@ -70,79 +82,149 @@ impl MergeSource {
   }
 }
 
-struct RateWindow {
-  start: Instant,
-  count: usize,
-  limit: usize,
+/// The admission pool a handshake draws from, classified by the hello
+/// mode before any credential or signing work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionPool {
+  Join,
+  Member,
 }
 
-impl RateWindow {
-  const fn new(now: Instant, limit: usize) -> Self {
+impl AdmissionPool {
+  const INDEX: usize = 2;
+
+  fn index(self) -> usize {
+    match self {
+      Self::Join => 0,
+      Self::Member => 1,
+    }
+  }
+}
+
+/// One continuously refilling token bucket: capacity `burst` tokens,
+/// refilled at `burst / window` per second. `tokens` is fixed point at
+/// `TOKEN_SCALE` per token.
+struct TokenBucket {
+  burst: u32,
+  window: Duration,
+  tokens: u64,
+  last_refill: Instant,
+}
+
+impl TokenBucket {
+  fn new(now: Instant, burst: u32, window: Duration) -> Self {
     Self {
-      start: now,
-      count: 0,
-      limit,
+      burst,
+      window,
+      tokens: u64::from(burst) * TOKEN_SCALE,
+      last_refill: now,
     }
   }
 
-  /// Reports whether one attempt is admitted by the fixed 60-second
-  /// window, rotating to a fresh window first. Rotation is deterministic
-  /// on `now` and consumes nothing; only [`RateWindow::record`] does.
-  fn admits(&mut self, now: Instant) -> bool {
-    if now.duration_since(self.start) >= WINDOW_SECONDS {
-      self.start = now;
-      self.count = 0;
-    }
-    self.count < self.limit
+  /// Empties the bucket (a freshly saturated budget); test-only state
+  /// surgery alongside the same-module tests that pin refill behavior.
+  #[cfg(test)]
+  fn drain(&mut self) {
+    self.tokens = 0;
   }
 
-  /// Records one admitted attempt. Saturation was already refused by
-  /// [`RateWindow::admits`]; callers must check before recording.
-  fn record(&mut self) {
-    self.count += 1;
+  /// Refills continuously up to capacity. A forward jump fills the
+  /// bucket; the monotonic clock makes rollback a no-op.
+  fn refill(&mut self, now: Instant) {
+    let elapsed = now.saturating_duration_since(self.last_refill);
+    if elapsed.is_zero() {
+      return;
+    }
+    self.last_refill = now;
+    if self.burst == 0 || self.window.is_zero() {
+      return;
+    }
+    let gained = (elapsed.as_nanos() * u128::from(self.burst) * u128::from(TOKEN_SCALE))
+      / self.window.as_nanos().max(1);
+    self.tokens = (u128::from(self.tokens))
+      .saturating_add(gained)
+      .min(u128::from(self.capacity())) as u64;
+  }
+
+  fn capacity(&self) -> u64 {
+    u64::from(self.burst) * TOKEN_SCALE
+  }
+
+  fn admits(&self) -> bool {
+    self.tokens >= TOKEN_SCALE
+  }
+
+  fn consume(&mut self) {
+    self.tokens -= TOKEN_SCALE;
   }
 }
 
-struct SourceBucket {
-  pending: usize,
-  window: RateWindow,
+/// The per-pool limits the limiter reads out of the configured
+/// [`MergeAdmissionLimits`] (source bucket, global bucket).
+use crate::config::AdmissionPoolLimits;
+
+/// One source's two pool buckets, its per-pool pending counts, and the
+/// idle clock only grants refresh.
+struct SourceBuckets {
+  buckets: [TokenBucket; AdmissionPool::INDEX],
+  pending: [usize; AdmissionPool::INDEX],
   last_seen: Instant,
 }
 
-struct Inner {
-  sources: BTreeMap<MergeSource, SourceBucket>,
-  global_pending: usize,
-  global_window: RateWindow,
+impl SourceBuckets {
+  fn new(now: Instant, join: AdmissionPoolLimits, member: AdmissionPoolLimits) -> Self {
+    Self {
+      buckets: [
+        TokenBucket::new(now, join.source.0, join.source.1),
+        TokenBucket::new(now, member.source.0, member.source.1),
+      ],
+      pending: [0; AdmissionPool::INDEX],
+      last_seen: now,
+    }
+  }
 }
 
-/// The fixed merge limiter shared by every accepted connection.
+struct Inner {
+  sources: BTreeMap<MergeSource, SourceBuckets>,
+  global: [TokenBucket; AdmissionPool::INDEX],
+  global_pending: [usize; AdmissionPool::INDEX],
+  limits: MergeAdmissionLimits,
+}
+
+/// The merge admission limiter shared by every accepted connection.
 #[derive(Clone)]
 pub(crate) struct MergeLimiter {
   inner: Arc<Mutex<Inner>>,
 }
 
 impl MergeLimiter {
-  pub(crate) fn new() -> Self {
+  pub(crate) fn new(limits: MergeAdmissionLimits) -> Self {
     let now = Instant::now();
+    let join = limits.join_pool();
+    let member = limits.member_pool();
     Self {
       inner: Arc::new(Mutex::new(Inner {
         sources: BTreeMap::new(),
-        global_pending: 0,
-        global_window: RateWindow::new(now, RATE_GLOBAL),
+        global: [
+          TokenBucket::new(now, join.global.0, join.global.1),
+          TokenBucket::new(now, member.global.0, member.global.1),
+        ],
+        global_pending: [0; AdmissionPool::INDEX],
+        limits,
       })),
     }
   }
 
-  /// Admits one connection attempt from `source`, holding its pending slot
-  /// until the [`MergeSlot`] drops. Rejection is a typed overload and
-  /// never consumes a credential; the per-source and global windows
-  /// record the attempt only after every admission check has passed,
-  /// immediately before the grant, so rejected attempts never consume
-  /// the rate budget of any source. A rejected attempt also neither
-  /// creates nor refreshes the source's bucket — per-source checks
-  /// evaluate the looked-up bucket or the fresh-source defaults — so
-  /// refused sources can never pin the bounded bucket table.
-  pub(crate) fn begin(&self, source: MergeSource) -> Result<MergeSlot> {
+  /// Admits one connection attempt from `source` against `pool`,
+  /// holding its pending slot until the [`MergeSlot`] drops. Rejection
+  /// is a typed overload and never consumes a credential or budget: the
+  /// buckets, pending counts, and idle clocks record only after every
+  /// admission check has passed. The per-source checks evaluate the
+  /// looked-up bucket or the fresh defaults (full bucket, no pending)
+  /// for a source with no bucket yet, so a rejection leaves no bucket
+  /// behind and cannot pin the bounded table.
+  pub(crate) fn begin(&self, source: MergeSource, pool: AdmissionPool) -> Result<MergeSlot> {
+    let index = pool.index();
     let now = Instant::now();
     let mut inner = self
       .inner
@@ -154,50 +236,53 @@ impl MergeLimiter {
         return Err(Error::overloaded("merge source buckets"));
       }
     }
-    if inner.global_pending >= PENDING_GLOBAL {
+    if inner.global_pending[index] >= PENDING_GLOBAL {
       return Err(Error::overloaded("merge global pending"));
     }
-    if !inner.global_window.admits(now) {
-      return Err(Error::overloaded("merge rate window"));
+    // The global bucket is checked and refilled before anything is
+    // materialized; the consume happens on the grant path only.
+    inner.global[index].refill(now);
+    if !inner.global[index].admits() {
+      return Err(Error::overloaded("merge rate budget"));
     }
     // Per-source checks evaluate the looked-up bucket, or the fresh
-    // defaults (pending 0, empty window at `now`) for a source with no
-    // bucket yet. Nothing is materialized here: a rejection must leave
-    // no bucket behind and must not refresh an existing one, or refused
-    // sources would keep their buckets alive against the bounded table.
+    // defaults (full bucket, zero pending) for a source with no bucket
+    // yet. Nothing is materialized until every check has passed.
+    let join_limits = inner.limits.join_pool();
+    let member_limits = inner.limits.member_pool();
     let source_admitted = {
       let existing = inner.sources.get_mut(&source);
-      let pending = existing.as_ref().map_or(0, |bucket| bucket.pending);
+      let pending = existing.as_ref().map_or(0, |bucket| bucket.pending[index]);
       if pending >= PENDING_PER_SOURCE {
         return Err(Error::overloaded("merge source pending"));
       }
       match existing {
-        Some(bucket) => bucket.window.admits(now),
-        // A brand-new source starts against an empty window.
+        Some(bucket) => {
+          bucket.buckets[index].refill(now);
+          bucket.buckets[index].admits()
+        }
+        // A brand-new source starts against a full bucket.
         None => true,
       }
     };
     if !source_admitted {
-      return Err(Error::overloaded("merge rate window"));
+      return Err(Error::overloaded("merge rate budget"));
     }
     // Every admission check passed: materialize the bucket, refresh its
-    // idle clock, and record both windows as the final grant step.
-    // Recording is infallible and the per-source bucket is last used
-    // before the global window is touched, so a rejected attempt can
-    // never consume either window's budget.
-    let bucket = inner.sources.entry(source).or_insert_with(|| SourceBucket {
-      pending: 0,
-      window: RateWindow::new(now, RATE_PER_SOURCE),
-      last_seen: now,
-    });
+    // idle clock, and consume both buckets as the final grant step.
+    let bucket = inner
+      .sources
+      .entry(source)
+      .or_insert_with(|| SourceBuckets::new(now, join_limits, member_limits));
     bucket.last_seen = now;
-    bucket.window.record();
-    bucket.pending += 1;
-    inner.global_window.record();
-    inner.global_pending += 1;
+    bucket.buckets[index].consume();
+    bucket.pending[index] += 1;
+    inner.global[index].consume();
+    inner.global_pending[index] += 1;
     Ok(MergeSlot {
       limiter: self.clone(),
       source,
+      pool,
     })
   }
 }
@@ -210,7 +295,8 @@ impl Inner {
       .sources
       .iter()
       .filter(|(_, bucket)| {
-        bucket.pending == 0 && now.duration_since(bucket.last_seen) >= SOURCE_IDLE_LIFETIME
+        bucket.pending == [0; AdmissionPool::INDEX]
+          && now.duration_since(bucket.last_seen) >= SOURCE_IDLE_LIFETIME
       })
       .map(|(source, _)| *source)
       .collect();
@@ -220,11 +306,12 @@ impl Inner {
   }
 }
 
-/// One in-flight admission attempt. Holds the per-source and global
-/// pending counts until dropped, whatever the handshake outcome.
+/// One in-flight admission attempt. Holds the pool's per-source and
+/// global pending counts until dropped, whatever the handshake outcome.
 pub(crate) struct MergeSlot {
   limiter: MergeLimiter,
   source: MergeSource,
+  pool: AdmissionPool,
 }
 
 impl core::fmt::Debug for MergeSlot {
@@ -236,9 +323,10 @@ impl core::fmt::Debug for MergeSlot {
 impl Drop for MergeSlot {
   fn drop(&mut self) {
     if let Ok(mut inner) = self.limiter.inner.lock() {
-      inner.global_pending = inner.global_pending.saturating_sub(1);
+      let index = self.pool.index();
+      inner.global_pending[index] = inner.global_pending[index].saturating_sub(1);
       if let Some(bucket) = inner.sources.get_mut(&self.source) {
-        bucket.pending = bucket.pending.saturating_sub(1);
+        bucket.pending[index] = bucket.pending[index].saturating_sub(1);
       }
     }
   }
@@ -252,10 +340,10 @@ mod tests {
   };
 
   use super::{
-    MergeLimiter, MergeSource, PENDING_GLOBAL, PENDING_PER_SOURCE, RATE_GLOBAL, RATE_PER_SOURCE,
-    SOURCE_BUCKET_LIMIT,
+    AdmissionPool, MergeLimiter, MergeSource, PENDING_GLOBAL, PENDING_PER_SOURCE,
+    SOURCE_BUCKET_LIMIT, SOURCE_IDLE_LIFETIME, TOKEN_SCALE,
   };
-  use crate::ErrorKind;
+  use crate::{ErrorKind, config::MergeAdmissionLimits};
 
   fn source(octet: u8) -> MergeSource {
     MergeSource::V4([10, 0, 0, octet])
@@ -267,6 +355,10 @@ mod tests {
 
   fn addr(ip: IpAddr) -> SocketAddr {
     SocketAddr::new(ip, 443)
+  }
+
+  fn limiter() -> MergeLimiter {
+    MergeLimiter::new(MergeAdmissionLimits::default())
   }
 
   #[test]
@@ -282,155 +374,236 @@ mod tests {
     assert_ne!(v4, native);
   }
 
+  /// The default limits derive from the reference cluster scale: the
+  /// join pool keeps today's strict per-source budget, and the member
+  /// pool admits a whole same-site cluster reconnecting at once (the
+  /// incident-B shape) instead of starving it.
   #[test]
-  fn merge_rate_per_source_window_and_pending_are_bounded() {
-    let limiter = MergeLimiter::new();
+  fn merge_rate_defaults_derive_from_the_reference_cluster_scale() {
+    let limits = MergeAdmissionLimits::default();
+    let join = limits.join_pool();
+    let member = limits.member_pool();
+    assert_eq!(join.source, (16, Duration::from_secs(60)));
+    assert_eq!(join.global, (256, Duration::from_secs(60)));
+    assert_eq!(member.source, (256, Duration::from_secs(60)));
+    assert_eq!(member.global, (256, Duration::from_secs(60)));
+
+    let small = MergeAdmissionLimits::for_cluster(4).unwrap();
+    assert_eq!(small.member_pool().source.0, 16, "the floor is 16");
+    let large = MergeAdmissionLimits::for_cluster(1_000).unwrap();
+    assert_eq!(large.member_pool().source.0, 4_000);
+    assert!(MergeAdmissionLimits::for_cluster(0).is_err());
+  }
+
+  /// A same-site cluster reconnecting as members draws the generous
+  /// pool: sixty-four same-source member reconnects are all admitted
+  /// outright (the incident-B shape now converges in one step), and
+  /// member volume consumes none of the same source's strict join
+  /// budget: sixteen joins still pass, the seventeenth is refused.
+  #[test]
+  fn merge_rate_member_pool_admits_a_same_site_burst_and_joins_stay_strict() {
+    let limiter = limiter();
     let origin = source(1);
-    // The per-source fixed window saturates at the configured rate.
-    for _ in 0..RATE_PER_SOURCE {
-      drop(limiter.begin(origin).unwrap());
+    for _ in 0..64 {
+      drop(limiter.begin(origin, AdmissionPool::Member).unwrap());
+    }
+    for _ in 0..16 {
+      drop(limiter.begin(origin, AdmissionPool::Join).unwrap());
     }
     assert_eq!(
-      limiter.begin(origin).unwrap_err().kind(),
+      limiter
+        .begin(origin, AdmissionPool::Join)
+        .unwrap_err()
+        .kind(),
       ErrorKind::Overloaded,
-      "per-source rate window must saturate"
+      "the same site's joins stay strictly budgeted"
     );
-    // A different source is unaffected.
-    drop(limiter.begin(source(2)).unwrap());
+  }
 
-    // Pending: hold the per-source limit, then one more is refused.
-    let limiter = MergeLimiter::new();
-    let held: Vec<_> = (0..PENDING_PER_SOURCE)
-      .map(|_| limiter.begin(origin).unwrap())
-      .collect();
+  #[test]
+  fn merge_rate_join_pool_saturates_and_refills_smoothly() {
+    let limiter = limiter();
+    let origin = source(1);
+    // The join pool saturates at its per-source burst.
+    for _ in 0..16 {
+      drop(limiter.begin(origin, AdmissionPool::Join).unwrap());
+    }
     assert_eq!(
-      limiter.begin(origin).unwrap_err().kind(),
+      limiter
+        .begin(origin, AdmissionPool::Join)
+        .unwrap_err()
+        .kind(),
       ErrorKind::Overloaded,
-      "per-source pending must saturate"
+      "the per-source join bucket must saturate"
     );
-    drop(held);
-    drop(limiter.begin(origin).unwrap());
-  }
+    // The member pool of the same source is untouched: the pools are
+    // independent budgets.
+    drop(limiter.begin(origin, AdmissionPool::Member).unwrap());
+    // A different source's joins are unaffected.
+    drop(limiter.begin(source(2), AdmissionPool::Join).unwrap());
 
-  /// Rejected attempts must not consume the global rate budget: one
-  /// source hammering past its per-source window cannot exhaust the
-  /// global 60-second window for every other source.
-  #[test]
-  fn merge_rate_rejected_attempts_do_not_consume_the_global_window() {
-    let limiter = MergeLimiter::new();
-    let hammer = source(1);
-    let other = source(2);
-    // The hammer saturates its per-source window with granted attempts.
-    for _ in 0..RATE_PER_SOURCE {
-      drop(limiter.begin(hammer).unwrap());
-    }
-    // Rapid-fire past the saturated window: every further attempt is
-    // rejected (and, before the fix, each of these consumed a global
-    // slot because the global window recorded before the per-source
-    // check).
-    for _ in 0..RATE_GLOBAL {
-      assert_eq!(
-        limiter.begin(hammer).unwrap_err().kind(),
-        ErrorKind::Overloaded,
-        "saturated source must be rejected"
-      );
-    }
-    // A different source still passes global admission inside the same
-    // window: none of the hammer's rejections consumed the global budget.
-    drop(limiter.begin(other).unwrap());
-  }
-
-  /// A rejected attempt must never create a bucket. A brand-new source
-  /// refused at a window stage leaves the table empty (a brand-new
-  /// source cannot be refused by its own per-source checks: they
-  /// evaluate fresh defaults), and a source refused by its own
-  /// saturated per-source window creates no new bucket and does not
-  /// refresh the one its grants already own.
-  #[test]
-  fn merge_rate_rejected_attempts_never_create_a_bucket() {
-    let limiter = MergeLimiter::new();
-    // Saturate the global window without granting anything, so the
-    // brand-new source is refused at the window stage.
+    // Half a window later the bucket has refilled half its burst:
+    // smooth refill, no window edge to wait for.
     {
       let mut inner = limiter.inner.lock().unwrap();
-      inner.global_window.count = RATE_GLOBAL;
+      let bucket = inner.sources.get_mut(&origin).unwrap();
+      assert!(
+        bucket.buckets[0].tokens < TOKEN_SCALE,
+        "the join bucket must be saturated below one token"
+      );
+      bucket.buckets[0].last_refill -= Duration::from_secs(30);
+    }
+    for _ in 0..8 {
+      drop(limiter.begin(origin, AdmissionPool::Join).unwrap());
+    }
+    assert_eq!(
+      limiter
+        .begin(origin, AdmissionPool::Join)
+        .unwrap_err()
+        .kind(),
+      ErrorKind::Overloaded,
+      "the refill grants exactly half a burst per half window"
+    );
+  }
+
+  /// Rejected attempts must not consume any budget: one source hammering
+  /// past its saturated join bucket cannot drain the global buckets or
+  /// the member pool of any other source.
+  #[test]
+  fn merge_rate_rejected_attempts_do_not_consume_budget() {
+    let limiter = limiter();
+    let hammer = source(1);
+    for _ in 0..16 {
+      drop(limiter.begin(hammer, AdmissionPool::Join).unwrap());
+    }
+    for _ in 0..256 {
+      assert_eq!(
+        limiter
+          .begin(hammer, AdmissionPool::Join)
+          .unwrap_err()
+          .kind(),
+        ErrorKind::Overloaded,
+        "the saturated join bucket must refuse the attempt"
+      );
+    }
+    // None of the hammer's refusals touched the global join bucket:
+    // a different source still passes, and the member pools are full.
+    // (Whole-token counts tolerate the sub-token refill remainder that
+    // accrued across the grants.)
+    drop(limiter.begin(source(2), AdmissionPool::Join).unwrap());
+    drop(limiter.begin(source(2), AdmissionPool::Member).unwrap());
+    {
+      let inner = limiter.inner.lock().unwrap();
+      let join_tokens = inner.global[0].tokens / TOKEN_SCALE;
+      let member_tokens = inner.global[1].tokens / TOKEN_SCALE;
+      assert!(
+        (239..=240).contains(&join_tokens),
+        "the hammer's refusals must not drain the global join bucket"
+      );
+      assert!(
+        (255..=256).contains(&member_tokens),
+        "the hammer's refusals must not drain the global member bucket"
+      );
+    }
+  }
+
+  /// A rejected attempt must never create a bucket nor refresh the idle
+  /// clock: a brand-new source refused at the global stage leaves the
+  /// table empty, and a saturated source's refusals keep its bucket
+  /// evictable.
+  #[test]
+  fn merge_rate_rejected_attempts_never_create_or_refresh_a_bucket() {
+    let limiter = limiter();
+    // Saturate the global join bucket without granting anything, so a
+    // brand-new source is refused at the global stage.
+    {
+      let mut inner = limiter.inner.lock().unwrap();
+      inner.global[0].drain();
     }
     let fresh = source(200);
     assert_eq!(
-      limiter.begin(fresh).unwrap_err().kind(),
+      limiter
+        .begin(fresh, AdmissionPool::Join)
+        .unwrap_err()
+        .kind(),
       ErrorKind::Overloaded,
-      "saturated global window must refuse a brand-new source"
+      "a drained global join bucket must refuse a brand-new source"
     );
     assert!(
       limiter.inner.lock().unwrap().sources.is_empty(),
       "a rejected attempt must not create a bucket for a brand-new source"
     );
 
-    // A source refused by its own saturated per-source window: no new
+    // A source refused by its own saturated per-source bucket: no new
     // bucket, no pending slot held, and no idle-clock refresh (only
-    // grants may keep a bucket alive).
-    let limiter = MergeLimiter::new();
+    // grants may keep a bucket alive). The global bucket drained above
+    // is refilled first: this half isolates the per-source budget.
     let origin = source(1);
-    for _ in 0..RATE_PER_SOURCE {
-      drop(limiter.begin(origin).unwrap());
+    {
+      let mut inner = limiter.inner.lock().unwrap();
+      inner.global[0].tokens = inner.global[0].capacity();
+    }
+    for _ in 0..16 {
+      drop(limiter.begin(origin, AdmissionPool::Join).unwrap());
     }
     let marked = std::time::Instant::now();
-    for _ in 0..RATE_PER_SOURCE {
+    for _ in 0..16 {
       assert_eq!(
-        limiter.begin(origin).unwrap_err().kind(),
+        limiter
+          .begin(origin, AdmissionPool::Join)
+          .unwrap_err()
+          .kind(),
         ErrorKind::Overloaded,
-        "saturated per-source window must refuse the attempt"
+        "the saturated per-source join bucket must refuse the attempt"
       );
     }
     let inner = limiter.inner.lock().unwrap();
     assert_eq!(inner.sources.len(), 1, "rejections must not create buckets");
     let bucket = inner.sources.get(&origin).unwrap();
-    assert_eq!(bucket.pending, 0, "a rejection holds no pending slot");
+    assert_eq!(bucket.pending, [0, 0], "a rejection holds no pending slot");
     assert!(
       bucket.last_seen <= marked,
       "a rejected attempt must not refresh the bucket's idle clock"
     );
   }
 
-  /// Window-rejected sources must not keep their buckets alive: a table
-  /// filled to its limit with sources refused by their own per-source
-  /// windows cannot lock out a brand-new source once the idle lifetime
-  /// has passed.
+  /// Refused sources must not keep their buckets alive: a table filled
+  /// to its limit with drained (refusing) sources cannot lock out a
+  /// brand-new source once the idle lifetime has passed.
   #[test]
-  fn merge_rate_window_rejected_sources_do_not_pin_the_bucket_table() {
-    let limiter = MergeLimiter::new();
-    // Fill the table to the limit: one granted attempt per source (the
-    // global rate window is reset per iteration so the test isolates the
-    // bucket bound from the 256/60s global rate).
+  fn merge_rate_refused_sources_do_not_pin_the_bucket_table() {
+    let limiter = limiter();
+    // Fill the table to the limit with one member grant per source; the
+    // global member bucket is refilled per iteration so the test
+    // isolates the table bound from the global budget.
     for index in 0..SOURCE_BUCKET_LIMIT as u16 {
       {
         let mut inner = limiter.inner.lock().unwrap();
-        inner.global_window.start = std::time::Instant::now();
-        inner.global_window.count = 0;
+        inner.global[1].tokens = inner.global[1].capacity();
       }
-      drop(limiter.begin(source16(index)).unwrap());
+      drop(
+        limiter
+          .begin(source16(index), AdmissionPool::Member)
+          .unwrap(),
+      );
     }
-    // Saturate every per-source window directly; one grant per source is
-    // not enough to reach the rate on its own.
+    // Drain every per-source member bucket: further member attempts are
+    // refused by their own bucket and must not refresh the idle clock.
     {
       let mut inner = limiter.inner.lock().unwrap();
       for bucket in inner.sources.values_mut() {
-        bucket.window.count = RATE_PER_SOURCE;
+        bucket.buckets[1].drain();
       }
     }
     let marked = std::time::Instant::now();
-    // One more attempt per source: every one is refused by its own
-    // window, and none of those refusals may advance an idle clock.
     for index in 0..SOURCE_BUCKET_LIMIT as u16 {
-      {
-        let mut inner = limiter.inner.lock().unwrap();
-        inner.global_window.start = std::time::Instant::now();
-        inner.global_window.count = 0;
-      }
       assert_eq!(
-        limiter.begin(source16(index)).unwrap_err().kind(),
+        limiter
+          .begin(source16(index), AdmissionPool::Member)
+          .unwrap_err()
+          .kind(),
         ErrorKind::Overloaded,
-        "saturated per-source window must refuse the attempt"
+        "the drained per-source bucket must refuse the attempt"
       );
     }
     {
@@ -440,7 +613,7 @@ mod tests {
           .sources
           .values()
           .all(|bucket| bucket.last_seen <= marked),
-        "a window refusal must not refresh the bucket's idle clock"
+        "a refusal must not refresh the bucket's idle clock"
       );
     }
     // Simulate the idle lifetime passing: every refused bucket is now
@@ -454,85 +627,99 @@ mod tests {
           .checked_sub(super::SOURCE_IDLE_LIFETIME + Duration::from_secs(1))
           .unwrap();
       }
-      inner.global_window.start = std::time::Instant::now();
-      inner.global_window.count = 0;
+      inner.global[1].tokens = inner.global[1].capacity();
     }
-    drop(limiter.begin(source16(SOURCE_BUCKET_LIMIT as u16)).unwrap());
+    drop(
+      limiter
+        .begin(source16(SOURCE_BUCKET_LIMIT as u16), AdmissionPool::Member)
+        .unwrap(),
+    );
   }
 
+  /// Pending bounds are per pool: a site's concurrent joins cannot take
+  /// the concurrent reconnect slots its members need to heal (and vice
+  /// versa), and both pools' global pending bounds hold.
   #[test]
-  fn merge_rate_global_window_and_pending_are_bounded() {
-    let limiter = MergeLimiter::new();
-    let mut held = Vec::new();
-    // Hold the global pending limit from distinct sources.
-    let mut octet = 1;
-    while held.len() < PENDING_GLOBAL {
-      held.push(limiter.begin(source(octet)).unwrap());
-      octet = octet.wrapping_add(1);
-    }
+  fn merge_rate_pending_bounds_are_per_pool() {
+    let limiter = limiter();
+    let origin = source(1);
+    // Hold the per-source join pending limit; the same source's member
+    // reconnect still passes.
+    let held: Vec<_> = (0..PENDING_PER_SOURCE)
+      .map(|_| limiter.begin(origin, AdmissionPool::Join).unwrap())
+      .collect();
     assert_eq!(
-      limiter.begin(source(octet)).unwrap_err().kind(),
+      limiter
+        .begin(origin, AdmissionPool::Join)
+        .unwrap_err()
+        .kind(),
       ErrorKind::Overloaded,
-      "global pending must saturate"
+      "per-source join pending must saturate"
     );
+    drop(limiter.begin(origin, AdmissionPool::Member).unwrap());
     drop(held);
 
-    // Global rate window saturates across sources.
-    let limiter = MergeLimiter::new();
-    let mut octet = 1;
-    for _ in 0..RATE_GLOBAL {
-      drop(limiter.begin(source(octet)).unwrap());
-      octet = octet.wrapping_add(1);
+    // Hold the global member pending limit from distinct sources; one
+    // more is refused, and a join still passes (independent pool).
+    let mut held_global = Vec::new();
+    let mut octet = 1_u16;
+    while held_global.len() < PENDING_GLOBAL {
+      held_global.push(
+        limiter
+          .begin(source16(octet), AdmissionPool::Member)
+          .unwrap(),
+      );
+      octet += 1;
     }
     assert_eq!(
-      limiter.begin(source(octet)).unwrap_err().kind(),
+      limiter
+        .begin(source16(octet), AdmissionPool::Member)
+        .unwrap_err()
+        .kind(),
       ErrorKind::Overloaded,
-      "global rate window must saturate"
+      "global member pending must saturate"
     );
+    drop(limiter.begin(source(9), AdmissionPool::Join).unwrap());
+    drop(held_global);
+    drop(limiter.begin(source(9), AdmissionPool::Member).unwrap());
   }
 
+  /// The source bucket table is bounded and evicts idle sources.
   #[test]
   fn merge_rate_bucket_table_is_bounded_and_evicts_idle_sources() {
-    let limiter = MergeLimiter::new();
-    // Fill the table up to the limit with distinct sources. The global
-    // rate window is reset per iteration so the test isolates the bucket
-    // bound from the 256/60s global rate (which would legitimately cap a
-    // 1,024-bucket fill in one window).
+    let limiter = limiter();
     for index in 0..SOURCE_BUCKET_LIMIT as u16 {
       {
         let mut inner = limiter.inner.lock().unwrap();
-        inner.global_window.start = std::time::Instant::now();
-        inner.global_window.count = 0;
+        inner.global[1].tokens = inner.global[1].capacity();
       }
-      drop(limiter.begin(source16(index)).unwrap());
+      drop(
+        limiter
+          .begin(source16(index), AdmissionPool::Member)
+          .unwrap(),
+      );
     }
-    // A brand-new source is refused while every bucket is live.
     let fresh = source16(SOURCE_BUCKET_LIMIT as u16);
     assert_eq!(
-      limiter.begin(fresh).unwrap_err().kind(),
+      limiter
+        .begin(fresh, AdmissionPool::Member)
+        .unwrap_err()
+        .kind(),
       ErrorKind::Overloaded,
       "full bucket table must refuse new sources"
     );
-    // Idle eviction uses the monotonic clock: force the last-seen far back
-    // by draining live buckets, then a new source is admitted again.
+    // Idle eviction uses the monotonic clock: force the last-seen far
+    // back, then a new source is admitted again.
     let mut inner = limiter.inner.lock().unwrap();
     for bucket in inner.sources.values_mut() {
       bucket.last_seen = bucket
         .last_seen
-        .checked_sub(super::SOURCE_IDLE_LIFETIME + Duration::from_secs(1))
+        .checked_sub(SOURCE_IDLE_LIFETIME + Duration::from_secs(1))
         .unwrap();
     }
+    inner.evict_idle(std::time::Instant::now());
+    inner.global[1].tokens = inner.global[1].capacity();
     drop(inner);
-    limiter
-      .inner
-      .lock()
-      .unwrap()
-      .evict_idle(std::time::Instant::now());
-    {
-      let mut inner = limiter.inner.lock().unwrap();
-      inner.global_window.start = std::time::Instant::now();
-      inner.global_window.count = 0;
-    }
-    drop(limiter.begin(fresh).unwrap());
+    drop(limiter.begin(fresh, AdmissionPool::Member).unwrap());
   }
 }
