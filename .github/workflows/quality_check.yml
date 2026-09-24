@@ -234,6 +234,10 @@ jobs:
     timeout-minutes: 20
     env:
       RUSTFLAGS: -Dwarnings
+      # The single core is the experiment: per-line debug logging is a
+      # measurable share of its budget, and the lanes' own diagnostics
+      # (the CONVERGE reports) print unconditionally.
+      RUST_LOG: radiata=warn
 
     steps:
       - name: checkout
