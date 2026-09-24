@@ -260,7 +260,8 @@ impl ResourcePeerRound {
 pub(crate) async fn resource_sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn crate::api::Entropy>,
   sessions: &SessionTable, runtime: &RuntimeClient, cursors: &mut ResourceSyncCursors,
-) -> Result<()> {
+  in_flight: &std::collections::BTreeSet<NodeId>,
+) -> Result<Option<ResourcePendingRound>> {
   let store = context.store();
   let peers = crate::sync_common::alive_peers(sessions)?;
   if peers.is_empty() {
@@ -269,7 +270,7 @@ pub(crate) async fn resource_sync_tick(
     // including everything written while it was unreachable — on its
     // first tick back.
     cursors.peers.clear();
-    return Ok(());
+    return Ok(None);
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
   // A local install since the last tick arms every peer's detection pass
@@ -289,19 +290,29 @@ pub(crate) async fn resource_sync_tick(
   // catching up a hundred leaves pays one snapshot, not a hundred.
   let catalog = store.snapshot().await?;
   let protocol = ProtocolTag::parse(RESOURCE_SYNC_PROTOCOL)?;
-  let mut pending: Vec<(NodeId, ResourcePeerRound)> = Vec::new();
-  let mut acks = Vec::new();
+  let mut dispatched: Vec<(
+    NodeId,
+    ResourcePeerRound,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )> = Vec::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
-    let mut round =
-      resource_sync_tick_peer(catalog.as_ref(), entropy, runtime, peer, state, &protocol).await?;
+    let mut round = resource_sync_tick_peer(
+      catalog.as_ref(),
+      entropy,
+      runtime,
+      peer,
+      state,
+      &protocol,
+      in_flight.contains(peer),
+    )
+    .await?;
     if !round.dispatched {
       // A quiet round: nothing was due and the state already advanced.
       continue;
     }
     if let Some(ack) = round.ack.take() {
-      pending.push((peer.clone(), round));
-      acks.push(ack);
+      dispatched.push((peer.clone(), round, ack));
     } else {
       // The routing queue rejected the dispatch: the page never left
       // this node. Treat it like an undelivered verdict — rewind to the
@@ -313,16 +324,69 @@ pub(crate) async fn resource_sync_tick(
       round.rewind(state);
     }
   }
-  // Delivery verdicts resolve concurrently: one unreachable peer must
-  // not serialize the round behind its ack wait (that would make the
-  // convergence bound liveness teardown, not the anti-entropy cadence).
-  let verdicts = futures_util::future::join_all(
-    acks
-      .into_iter()
-      .map(|ack| async move { delivered_within_bound(ack).await }),
-  )
-  .await;
-  for ((peer, round), delivered) in pending.drain(..).zip(verdicts) {
+  if dispatched.is_empty() {
+    return Ok(None);
+  }
+  Ok(Some(ResourcePendingRound { dispatched }))
+}
+
+/// The unsettled delivery verdict of one dispatched resource round. The
+/// tick returns after handing every due page to the wire; the owner
+/// settles it when the verdicts resolve — inline for the deterministic
+/// seam, detached for the periodic driver, whose next round harvests the
+/// effects without holding the tick open for the slowest peer's ack.
+pub(crate) struct ResourcePendingRound {
+  dispatched: Vec<(
+    NodeId,
+    ResourcePeerRound,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )>,
+}
+
+impl ResourcePendingRound {
+  /// The peers with unresolved verdicts: the skip set the next round's
+  /// dispatch must respect (the resource plane has a single page lane
+  /// per peer).
+  pub(crate) fn in_flight(&self) -> std::collections::BTreeSet<NodeId> {
+    self
+      .dispatched
+      .iter()
+      .map(|(peer, ..)| peer.clone())
+      .collect()
+  }
+
+  /// Awaits every verdict (concurrently) and folds them into the
+  /// round's cursor effects.
+  pub(crate) async fn settle(self) -> ResourceRoundEffects {
+    // Delivery verdicts resolve concurrently: one unreachable peer must
+    // not serialize the settlement behind its ack wait (that would make
+    // the convergence bound liveness teardown, not the anti-entropy
+    // cadence).
+    let verdicts = futures_util::future::join_all(self.dispatched.into_iter().map(
+      |(peer, round, ack)| async move {
+        let delivered = delivered_within_bound(ack).await;
+        (peer, round, delivered)
+      },
+    ))
+    .await;
+    ResourceRoundEffects { verdicts }
+  }
+}
+
+/// The verdict effects of one dispatched resource round, ready to apply
+/// to the cursors.
+pub(crate) struct ResourceRoundEffects {
+  verdicts: Vec<(NodeId, ResourcePeerRound, bool)>,
+}
+
+/// Applies one settled round's verdict effects to the cursors: a
+/// delivered page commits its walk cursor and watermarks; an undelivered
+/// one rewinds to the page's scan start so the next tick re-sends
+/// exactly that page.
+pub(crate) fn apply_resource_round_effects(
+  cursors: &mut ResourceSyncCursors, effects: ResourceRoundEffects,
+) {
+  for (peer, round, delivered) in effects.verdicts {
     if let Some(state) = cursors.peers.get_mut(&peer) {
       if delivered {
         round.commit_delivered(state);
@@ -332,18 +396,34 @@ pub(crate) async fn resource_sync_tick(
       }
     }
   }
-  Ok(())
+}
+
+/// The deterministic-seam consumption of one dispatched round: settle it
+/// inline and apply the effects — the unit tests' consumption, with
+/// settled cursor state on return. (The driver's `RunSyncRound` arm
+/// settles through the harvested join handle instead: one mechanism,
+/// two consumption policies.)
+#[cfg(test)]
+pub(crate) async fn settle_round(pending: ResourcePendingRound, cursors: &mut ResourceSyncCursors) {
+  apply_resource_round_effects(cursors, pending.settle().await);
 }
 
 /// One resource anti-entropy round toward a single peer, from that
 /// peer's own cursor: the quiet state sends nothing, a changed catalog
 /// sends the next bounded page, and a periodic from-scratch pass
 /// re-delivers the whole catalog so a payload lost mid-flight is bounded
-/// to one full-sync window.
+/// to one full-sync window. An in-flight verdict skips the round: the
+/// previous page's cursors are neither committed nor rewound yet, and
+/// re-emitting the same scan window would double-send it.
 async fn resource_sync_tick_peer(
   snapshot: &(dyn crate::provider::StoreSnapshot + '_), entropy: &Arc<dyn crate::api::Entropy>,
   runtime: &RuntimeClient, peer: &NodeId, state: &mut ResourcePeerState, protocol: &ProtocolTag,
+  in_flight: bool,
 ) -> Result<ResourcePeerRound> {
+  if in_flight {
+    state.ticks_since_pass = state.ticks_since_pass.saturating_add(1);
+    return Ok(ResourcePeerRound::quiet());
+  }
   // Pass due: a walk in flight, or the detection cadence elapsed.
   let pass_due = state.cursor.is_some() || state.ticks_since_pass >= DETECTION_CADENCE_TICKS;
   if !pass_due {
@@ -415,7 +495,7 @@ mod tests {
 
   use super::{
     DETECTION_CADENCE_TICKS, ResourceSyncCursors, ResourceSyncPayload, delivered_within_bound,
-    resource_sync_tick, resource_sync_tick_peer,
+    resource_sync_tick, resource_sync_tick_peer, settle_round,
   };
   use crate::{
     LabelValue, NodeId, ProtocolTag,
@@ -539,10 +619,17 @@ mod tests {
   ) {
     let catalog = store.snapshot().await.unwrap();
     let state = cursors.peers.entry(peer.clone()).or_default();
-    let mut round =
-      resource_sync_tick_peer(catalog.as_ref(), entropy, runtime, peer, state, protocol)
-        .await
-        .unwrap();
+    let mut round = resource_sync_tick_peer(
+      catalog.as_ref(),
+      entropy,
+      runtime,
+      peer,
+      state,
+      protocol,
+      false,
+    )
+    .await
+    .unwrap();
     if let Some(ack) = round.ack.take() {
       if delivered_within_bound(ack).await {
         round.commit_delivered(state);
@@ -743,6 +830,7 @@ mod tests {
       &peer,
       state,
       &protocol,
+      false,
     )
     .await
     .unwrap();
@@ -763,6 +851,7 @@ mod tests {
       &peer,
       state,
       &protocol,
+      false,
     )
     .await
     .unwrap();
@@ -827,9 +916,19 @@ mod tests {
     // its page start, not to scratch.
     cursors.peers.entry(node(2)).or_default().cursor = Some(b"aaa-page-start".to_vec());
 
-    resource_sync_tick(&context, &entropy, &sessions, &rejecting, &mut cursors)
-      .await
-      .unwrap();
+    if let Some(pending) = resource_sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &rejecting,
+      &mut cursors,
+      &Default::default(),
+    )
+    .await
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
 
     let mid = cursors.peers.get(&node(2)).unwrap();
     assert_eq!(
@@ -855,9 +954,19 @@ mod tests {
     let working = RuntimeClient::routing_only(packet_tx, routes);
     let delivered: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
     ack_drainer(packet_rx, Arc::clone(&delivered));
-    resource_sync_tick(&context, &entropy, &sessions, &working, &mut cursors)
-      .await
-      .unwrap();
+    if let Some(pending) = resource_sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &working,
+      &mut cursors,
+      &Default::default(),
+    )
+    .await
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     assert_eq!(
       delivered.lock().unwrap().len(),
       2,
@@ -911,9 +1020,19 @@ mod tests {
     // Tick 1: the fresh peer is due anyway; the first record delivers and
     // its watermark commits, so the peer would now stay quiet until the
     // detection cadence elapsed.
-    resource_sync_tick(&context, &entropy, &sessions, &runtime, &mut cursors)
-      .await
-      .unwrap();
+    if let Some(pending) = resource_sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &mut cursors,
+      &Default::default(),
+    )
+    .await
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     assert_eq!(delivered.lock().unwrap().len(), 1);
     assert_eq!(
       cursors.peers.get(&node(2)).unwrap().ticks_since_pass,
@@ -930,9 +1049,19 @@ mod tests {
     )
     .await
     .unwrap();
-    resource_sync_tick(&context, &entropy, &sessions, &runtime, &mut cursors)
-      .await
-      .unwrap();
+    if let Some(pending) = resource_sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &mut cursors,
+      &Default::default(),
+    )
+    .await
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     assert_eq!(
       delivered.lock().unwrap().len(),
       2,

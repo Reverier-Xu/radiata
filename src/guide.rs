@@ -373,8 +373,10 @@
 //!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
 //!   is the one knob that changes it materially.
 //! - **Background load** is the anti-entropy tick: `N × interval` work per
-//!   round cluster-wide. At the default one-second tick this stays negligible
-//!   through the tens of nodes and bounded at the 64-node reference scale.
+//!   round cluster-wide. The tick dispatches to its peers and settles delivery
+//!   verdicts off the tick path, so a hub's per-tick hold-down stays at the
+//!   dispatch cost rather than the slowest peer's ack bound — the reference
+//!   64-node mesh holds the one-second cadence even on a single slow core.
 //!
 //! Delivery across restarts stays the application's job (the data
 //! plane is at-most-once): a `Failed` or interrupted stream is a

@@ -646,6 +646,161 @@ struct SnapshotPageDispatch {
   ack: tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
 }
 
+/// The planes of one peer's previous round whose delivery verdicts are
+/// still unresolved. An in-flight plane skips this round's dispatch for
+/// that peer: the previous dispatch's cursor state is neither committed
+/// nor rewound yet, so a second dispatch could double-send a page the
+/// pending verdict is about to rewind. The verdict resolves within
+/// [`crate::sync_common::SEND_ACK_WAIT`], so the skip costs at most one
+/// interval.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PeerPlanesInFlight {
+  pub(crate) tombstones: bool,
+  pub(crate) pages: bool,
+  pub(crate) trust: bool,
+}
+
+/// Per-peer in-flight planes, consulted by the next round's dispatch.
+pub(crate) type InFlightRounds = std::collections::BTreeMap<NodeId, PeerPlanesInFlight>;
+
+/// The unsettled delivery verdicts of one dispatched membership round.
+/// The round returns after handing every payload to the wire; the owner
+/// settles it when the verdicts resolve — inline for the deterministic
+/// seam (the `RunSyncRound` command), detached for the periodic driver,
+/// whose next round harvests the effects without holding the tick open
+/// for the slowest peer's ack.
+pub(crate) struct MembershipPendingRound {
+  tombstone_acks: Vec<(
+    NodeId,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )>,
+  page_acks: Vec<(
+    NodeId,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )>,
+  trust_pages: Vec<(NodeId, SnapshotPageDispatch)>,
+}
+
+impl MembershipPendingRound {
+  /// The peers with unresolved verdicts and their planes: the skip set
+  /// the next round's dispatch must respect.
+  pub(crate) fn in_flight(&self) -> InFlightRounds {
+    let mut in_flight = InFlightRounds::new();
+    for (peer, _) in &self.tombstone_acks {
+      in_flight.entry(peer.clone()).or_default().tombstones = true;
+    }
+    for (peer, _) in &self.page_acks {
+      in_flight.entry(peer.clone()).or_default().pages = true;
+    }
+    for (peer, _) in &self.trust_pages {
+      in_flight.entry(peer.clone()).or_default().trust = true;
+    }
+    in_flight
+  }
+
+  /// Awaits every verdict (concurrently per plane) and folds them into
+  /// the round's cursor effects.
+  pub(crate) async fn settle(self) -> MembershipRoundEffects {
+    // Delivery verdicts resolve concurrently: one unreachable peer must
+    // not serialize the settlement behind its ack wait (that would make
+    // the convergence bound liveness teardown, not the anti-entropy
+    // cadence).
+    let (tombstone_verdicts, page_verdicts, trust_verdicts) = futures_util::future::join3(
+      futures_util::future::join_all(self.tombstone_acks.into_iter().map(
+        |(peer, ack)| async move { (peer, crate::sync_common::delivered_within_bound(ack).await) },
+      )),
+      futures_util::future::join_all(self.page_acks.into_iter().map(|(peer, ack)| async move {
+        (peer, crate::sync_common::delivered_within_bound(ack).await)
+      })),
+      futures_util::future::join_all(self.trust_pages.into_iter().map(|(peer, page)| async move {
+        let delivered = crate::sync_common::delivered_within_bound(page.ack).await;
+        (peer, page.cursor, delivered)
+      })),
+    )
+    .await;
+    // A tombstone round re-arms its resend cadence only when EVERY
+    // tombstone of the round was admitted; any lost one retries on the
+    // next tick (the cadence counters kept advancing meanwhile).
+    let mut tombstone_rounds: std::collections::BTreeMap<NodeId, bool> =
+      std::collections::BTreeMap::new();
+    for (peer, delivered) in tombstone_verdicts {
+      let entry = tombstone_rounds.entry(peer).or_insert(true);
+      *entry &= delivered;
+    }
+    // A failed page verdict rewinds that peer's page cursor: the next
+    // round re-sends exactly the failed page's range.
+    let mut page_rewinds = std::collections::BTreeSet::new();
+    for (peer, delivered) in page_verdicts {
+      if !delivered {
+        page_rewinds.insert(peer);
+      }
+    }
+    // The trust page resolves to its own verdict, never the peer-level
+    // OR over the round: a round dispatches several payloads per peer
+    // (trust page, tombstones, descriptor page), and another payload's
+    // ack says nothing about the trust page.
+    let mut trust_commits = Vec::new();
+    for (peer, cursor, delivered) in trust_verdicts {
+      if delivered {
+        trust_commits.push((peer, cursor));
+      }
+    }
+    MembershipRoundEffects {
+      page_rewinds,
+      tombstone_rounds,
+      trust_commits,
+    }
+  }
+}
+
+/// The verdict effects of one dispatched round, ready to apply to the
+/// cursors.
+pub(crate) struct MembershipRoundEffects {
+  page_rewinds: std::collections::BTreeSet<NodeId>,
+  tombstone_rounds: std::collections::BTreeMap<NodeId, bool>,
+  trust_commits: Vec<(NodeId, NodeId)>,
+}
+
+/// Applies one settled round's verdict effects to the cursors: an
+/// unadmitted page rewinds that peer's page cursor to the failed page's
+/// start so the next tick re-sends exactly that page, a fully delivered
+/// tombstone round re-arms the tombstone resend cadence, and a delivered
+/// trust page re-arms the snapshot cadence while advancing the keyset
+/// cursor. An undelivered round resets nothing, so the next tick retries
+/// it.
+pub(crate) fn apply_round_effects(
+  cursors: &mut MembershipSyncCursors, effects: MembershipRoundEffects,
+) {
+  for peer in effects.page_rewinds {
+    if let Some(state) = cursors.peers.get_mut(&peer) {
+      state.page.discard_progress();
+    }
+  }
+  for (peer, tombstones_delivered) in effects.tombstone_rounds {
+    if tombstones_delivered && let Some(state) = cursors.peers.get_mut(&peer) {
+      state.ticks_since_tombstone_send = 0;
+    }
+  }
+  for (peer, cursor) in effects.trust_commits {
+    if let Some(state) = cursors.peers.get_mut(&peer) {
+      state.snapshot_cursor = Some(cursor);
+      state.ticks_since_snapshot_send = 0;
+    }
+  }
+}
+
+/// The deterministic-seam consumption of one dispatched round: settle it
+/// inline and apply the effects — the unit tests' consumption, with
+/// settled cursor state on return. (The driver's `RunSyncRound` arm
+/// settles through the harvested join handle instead: one mechanism,
+/// two consumption policies.)
+#[cfg(test)]
+pub(crate) async fn settle_round(
+  pending: MembershipPendingRound, cursors: &mut MembershipSyncCursors,
+) {
+  apply_round_effects(cursors, pending.settle().await);
+}
+
 /// The outcome of one per-peer membership round: the admission receivers
 /// for every dispatched payload (grouped so each lane's cadence commit is
 /// verdict-gated by the tick aggregator), the dispatched trust page if
@@ -678,7 +833,7 @@ async fn membership_sync_tick_peer(
   catalog: &(dyn crate::provider::StoreSnapshot + '_), entropy: &Arc<dyn Entropy>,
   runtime: &RuntimeClient, peer: &NodeId, state: &mut PeerSyncState, protocol: &ProtocolTag,
   snapshot: Option<&crate::identity::trust::TrustSnapshotV1>, tombstone_bytes: &[Vec<u8>],
-  catalog_fingerprint: u64,
+  catalog_fingerprint: u64, planes: PeerPlanesInFlight,
 ) -> Result<MembershipPeerRound> {
   state.page.arm_full_pass();
   // The snapshot and tombstone resend cadences advance on every tick —
@@ -695,6 +850,9 @@ async fn membership_sync_tick_peer(
   // driver's skip-on-overrun behavior the tick period itself grew with
   // the mesh size.
   let page_round = state.page.page_round(catalog_fingerprint);
+  // An in-flight page plane skips this round's dispatch: its continuation
+  // is not committed or rewound until the pending verdict lands.
+  let page_due = page_round == crate::sync_common::PageRound::Send && !planes.pages;
   // A snapshot pass is due for this peer when its revision advanced past
   // what this peer last fully received, or on the slow resend cadence.
   // Tombstones ride their own cadence against the same revision marker:
@@ -711,19 +869,22 @@ async fn membership_sync_tick_peer(
       Some(_) => state.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS,
       None => false,
     };
+  // An in-flight trust plane keeps its verdict pending: the pass neither
+  // advances nor closes until the verdict commits or rewinds the cursor.
+  let trust_due = snapshot_due && !planes.trust;
   let tombstones_due = tombstone_round_due(
     revision_advanced,
     !tombstone_bytes.is_empty(),
     state.ticks_since_tombstone_send,
     snapshot_due,
-  );
+  ) && !planes.tombstones;
   // The trust snapshot leg pages through the issuer's binding set one
   // wire page per tick (keyset cursor per peer); the revision is only
   // marked fully delivered on the closing empty-page tick, so an
   // undelivered page leaves the pass due instead of truncated.
   let mut snapshot_page: Option<Vec<u8>> = None;
   let mut snapshot_page_cursor: Option<NodeId> = None;
-  if snapshot_due && let Some(snapshot) = snapshot {
+  if trust_due && let Some(snapshot) = snapshot {
     let page = snapshot.page_after(state.snapshot_cursor.as_ref(), TRUST_BINDINGS_PAGE_LIMIT);
     if page.bindings().is_empty() {
       // The pass is complete for this revision: reset the cursor and
@@ -763,10 +924,7 @@ async fn membership_sync_tick_peer(
   // plane's own triggers are the only reasons a page goes on the wire: a
   // catalog fingerprint change on the next idle round, an in-flight
   // continuation, or the page resend cadence.
-  if page_round == crate::sync_common::PageRound::Quiet
-    && snapshot_page.is_none()
-    && tombstone_payloads.is_empty()
-  {
+  if !page_due && snapshot_page.is_none() && tombstone_payloads.is_empty() {
     state.page.quiet_tick();
     return Ok(MembershipPeerRound {
       tombstone_acks: Vec::new(),
@@ -776,18 +934,17 @@ async fn membership_sync_tick_peer(
       dispatched: false,
     });
   }
-  let page_bytes = match page_round {
-    crate::sync_common::PageRound::Quiet => None,
-    crate::sync_common::PageRound::Send => {
-      let page = page_sync::emit_page_from_snapshot(
-        catalog,
-        state.page.continuation(),
-        crate::membership::page::DEFAULT_PAGE_LIMIT,
-      )
-      .await?;
-      state.page.record_send(page.cursor());
-      Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?)
-    }
+  let page_bytes = if page_due {
+    let page = page_sync::emit_page_from_snapshot(
+      catalog,
+      state.page.continuation(),
+      crate::membership::page::DEFAULT_PAGE_LIMIT,
+    )
+    .await?;
+    state.page.record_send(page.cursor());
+    Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?)
+  } else {
+    None
   };
   let (tombstone_acks, page_ack, snapshot_ack) = dispatch_to_peer(
     peer,
@@ -819,13 +976,20 @@ async fn membership_sync_tick_peer(
 /// snapshot send: the descriptor-page and tombstone anti-entropy below
 /// keeps running, so a large membership degrades the snapshot leg instead
 /// of stalling every sync lane.
+///
+/// The tick returns after handing every due payload to the wire — the
+/// delivery verdicts come back as the [`MembershipPendingRound`] the
+/// caller settles (inline for the deterministic seam, detached for the
+/// periodic driver). Peers listed in `in_flight` skip their in-flight
+/// planes this round: their previous dispatch's cursors are not settled
+/// yet.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>, sessions: &SessionTable,
   runtime: &RuntimeClient, local_endpoints: &[crate::Endpoint],
-  cursors: &mut MembershipSyncCursors, events: &Arc<crate::node::EventHub>,
-  revision: &crate::node::MemberRevisionSignal,
-) -> Result<()> {
+  cursors: &mut MembershipSyncCursors, in_flight: &InFlightRounds,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+) -> Result<Option<MembershipPendingRound>> {
   let store = context.store();
   // Nothing to advertise at startup: the supervisor publishes the local
   // descriptor (with endpoints) when a query or listener first needs it,
@@ -843,7 +1007,7 @@ pub(crate) async fn sync_tick(
   let has_members = trust_store::has_more_than_bindings(store, 1).await?;
   if !has_members {
     // No membership yet: no descriptors exist to anti-entropize.
-    return Ok(());
+    return Ok(None);
   }
   // A snapshot refresh or encode failure (a binding set that overflows
   // the single-record control bound) must not fail the whole tick: every
@@ -888,7 +1052,7 @@ pub(crate) async fn sync_tick(
     // first tick back.
     cursors.peers.clear();
     gc_collected_tombstones(store, entropy).await;
-    return Ok(());
+    return Ok(None);
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
   // One snapshot and one whole-catalog fingerprint per tick: every
@@ -956,6 +1120,7 @@ pub(crate) async fn sync_tick(
       snapshot.as_ref(),
       &tombstone_bytes,
       fingerprint,
+      in_flight.get(peer).copied().unwrap_or_default(),
     )
     .await?;
     if !round.dispatched {
@@ -997,75 +1162,25 @@ pub(crate) async fn sync_tick(
       page_rewinds.insert(peer.clone());
     }
   }
-  // Delivery verdicts resolve concurrently: one unreachable peer must
-  // not serialize the round behind its ack wait (that would make the
-  // convergence bound liveness teardown, not the anti-entropy cadence).
-  let (tombstone_verdicts, page_verdicts, trust_verdicts) = futures_util::future::join3(
-    futures_util::future::join_all(pending_tombstone_acks.into_iter().map(
-      |(peer, ack)| async move { (peer, crate::sync_common::delivered_within_bound(ack).await) },
-    )),
-    futures_util::future::join_all(pending_page_acks.into_iter().map(|(peer, ack)| async move {
-      (peer, crate::sync_common::delivered_within_bound(ack).await)
-    })),
-    futures_util::future::join_all(pending_trust_pages.into_iter().map(
-      |(peer, page)| async move {
-        let delivered = crate::sync_common::delivered_within_bound(page.ack).await;
-        (peer, page.cursor, delivered)
-      },
-    )),
-  )
-  .await;
-  // A tombstone round re-arms its resend cadence only when EVERY
-  // tombstone of the round was admitted; any lost one retries on the
-  // next tick (the cadence counters kept advancing meanwhile).
-  let mut tombstone_rounds: std::collections::BTreeMap<NodeId, bool> =
-    std::collections::BTreeMap::new();
-  for (peer, delivered) in tombstone_verdicts {
-    let entry = tombstone_rounds.entry(peer).or_insert(true);
-    *entry &= delivered;
-  }
-  // A failed page verdict rewinds that peer's page cursor: the next
-  // round re-sends exactly the failed page's range.
-  for (peer, delivered) in page_verdicts {
-    if !delivered {
-      page_rewinds.insert(peer);
-    }
-  }
-  // The trust page resolves to its own verdict, never the peer-level OR
-  // over the round: a round dispatches several payloads per peer (trust
-  // page, tombstones, descriptor page), and another payload's ack says
-  // nothing about the trust page.
-  let mut trust_commits: Vec<(NodeId, NodeId)> = Vec::new();
-  for (peer, cursor, delivered) in trust_verdicts {
-    if delivered {
-      trust_commits.push((peer, cursor));
-    }
-  }
+  // Synchronous page-plane rejections rewind now: their failure is
+  // already known, no verdict to await.
   for peer in page_rewinds {
-    // An unadmitted page means the peer may hold none of the page
-    // range: rewind to the failed page's start so the next tick
-    // re-sends exactly that page.
     if let Some(state) = cursors.peers.get_mut(&peer) {
       state.page.discard_progress();
     }
   }
-  // Verdict-gated cadence commits: a fully delivered tombstone round
-  // re-arms the tombstone resend cadence, and a delivered trust page
-  // re-arms the snapshot cadence while advancing the keyset cursor. An
-  // undelivered round resets nothing, so the next tick retries it.
-  for (peer, tombstones_delivered) in tombstone_rounds {
-    if tombstones_delivered && let Some(state) = cursors.peers.get_mut(&peer) {
-      state.ticks_since_tombstone_send = 0;
-    }
-  }
-  for (peer, cursor) in trust_commits {
-    if let Some(state) = cursors.peers.get_mut(&peer) {
-      state.snapshot_cursor = Some(cursor);
-      state.ticks_since_snapshot_send = 0;
-    }
-  }
   gc_collected_tombstones(store, entropy).await;
-  Ok(())
+  if pending_tombstone_acks.is_empty()
+    && pending_page_acks.is_empty()
+    && pending_trust_pages.is_empty()
+  {
+    return Ok(None);
+  }
+  Ok(Some(MembershipPendingRound {
+    tombstone_acks: pending_tombstone_acks,
+    page_acks: pending_page_acks,
+    trust_pages: pending_trust_pages,
+  }))
 }
 
 /// One dispatch attempt with the lane's shared rejection diagnostics: a
@@ -1271,6 +1386,7 @@ mod tests {
       &runtime,
       &endpoints,
       &mut cursors,
+      &InFlightRounds::new(),
       &events,
       &revision,
     )
@@ -1289,6 +1405,7 @@ mod tests {
       &runtime,
       &endpoints,
       &mut cursors,
+      &InFlightRounds::new(),
       &events,
       &revision,
     )
@@ -1414,18 +1531,22 @@ mod tests {
 
     // Round 1: the trust page dispatches and its admission fails while
     // the descriptor page admits; the cursor must not advance.
-    sync_tick(
+    if let Some(pending) = sync_tick(
       &context,
       &entropy,
       &sessions,
       &runtime,
       &endpoints,
       &mut cursors,
+      &InFlightRounds::new(),
       &events,
       &revision,
     )
     .await
-    .unwrap();
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     assert_eq!(
       snapshot_dispatches.load(Ordering::SeqCst),
       1,
@@ -1439,18 +1560,22 @@ mod tests {
     // Round 2: the undelivered page retries on the next tick (the pass
     // is still due through its unrecorded revision) and still must not
     // commit past its failure.
-    sync_tick(
+    if let Some(pending) = sync_tick(
       &context,
       &entropy,
       &sessions,
       &runtime,
       &endpoints,
       &mut cursors,
+      &InFlightRounds::new(),
       &events,
       &revision,
     )
     .await
-    .unwrap();
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     assert_eq!(
       snapshot_dispatches.load(Ordering::SeqCst),
       2,
@@ -1461,18 +1586,22 @@ mod tests {
     // Round 3: the trust page's own verdict resolves as delivered; only
     // now the cursor commits.
     *admit_snapshots.lock().unwrap() = true;
-    sync_tick(
+    if let Some(pending) = sync_tick(
       &context,
       &entropy,
       &sessions,
       &runtime,
       &endpoints,
       &mut cursors,
+      &InFlightRounds::new(),
       &events,
       &revision,
     )
     .await
-    .unwrap();
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     assert_eq!(snapshot_dispatches.load(Ordering::SeqCst), 3);
     assert!(
       cursors.peers.get(&peer).unwrap().snapshot_cursor.is_some(),
@@ -1481,18 +1610,22 @@ mod tests {
 
     // Round 4: the closing empty page completes the pass for this
     // revision.
-    sync_tick(
+    if let Some(pending) = sync_tick(
       &context,
       &entropy,
       &sessions,
       &runtime,
       &endpoints,
       &mut cursors,
+      &InFlightRounds::new(),
       &events,
       &revision,
     )
     .await
-    .unwrap();
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     let state = cursors.peers.get(&peer).unwrap();
     assert_eq!(state.snapshot_rev, 1, "the pass completed for revision 1");
     assert!(
@@ -1647,18 +1780,22 @@ mod tests {
 
     async fn tick(&self, cursors: &mut MembershipSyncCursors) {
       let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
-      sync_tick(
+      if let Some(pending) = sync_tick(
         &self.context,
         &self.entropy,
         &self.sessions,
         &self.runtime,
         &endpoints,
         cursors,
+        &InFlightRounds::new(),
         &self.events,
         &self.revision,
       )
       .await
-      .unwrap();
+      .unwrap()
+      {
+        settle_round(pending, cursors).await;
+      }
     }
   }
 
