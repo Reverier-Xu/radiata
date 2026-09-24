@@ -46,15 +46,6 @@ fn init_tracing() {
   });
 }
 
-/// The anti-entropy cadence under measurement (the library default;
-/// `RADIATA_BENCH_SYNC_MS` overrides it for pacing experiments).
-fn sync_interval() -> Duration {
-  std::env::var("RADIATA_BENCH_SYNC_MS")
-    .ok()
-    .and_then(|value| value.parse().ok())
-    .map(Duration::from_millis)
-    .unwrap_or(Duration::from_millis(250))
-}
 /// The per-cell convergence bound: generous on shared runners; the
 /// benchmark reports the sample, it does not assert tight latency.
 const CELL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -72,9 +63,9 @@ async fn start(seed: u64) -> Node {
   let dir = tempfile::tempdir().unwrap();
   let keys = Arc::new(ScriptedKeys::full_at(700_000 + seed * 1_000));
   let storage = radiata::adapters::redb_store(dir.path().join("store.redb"));
+  // The shipped defaults, unpinned: the benchmark samples the
+  // deployment shape, not an experiment.
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(sync_interval())
-    .unwrap()
     .with_recovery_policy(
       RecoveryConfig::new(64, Duration::from_secs(2), Duration::from_secs(60)).unwrap(),
     )
