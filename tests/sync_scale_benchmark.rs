@@ -105,6 +105,38 @@ async fn start(seed: u64) -> Node {
   }
 }
 
+/// A scale-lane node over an explicit config (the 128-node lanes tune
+/// the admission block; the other cells ship the legacy defaults).
+async fn start_with(seed: u64, config: NodeConfig) -> Node {
+  let dir = tempfile::tempdir().unwrap();
+  let keys = Arc::new(ScriptedKeys::full_at(700_000 + seed * 1_000));
+  let storage = radiata::adapters::redb_store(dir.path().join("store.redb"));
+  let handle = NodeBuilder::new(storage)
+    .keys(keys)
+    .config(config)
+    .start()
+    .await
+    .unwrap();
+  let endpoint = handle
+    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .await
+    .unwrap()
+    .endpoint()
+    .clone();
+  let id = handle
+    .query(GetLocalNode::new())
+    .await
+    .unwrap()
+    .node_id()
+    .clone();
+  Node {
+    handle,
+    endpoint,
+    id,
+    _dir: dir,
+  }
+}
+
 fn resource(seed: u32) -> (ResourceName, ResourceLabels) {
   (
     ResourceName::parse(&format!("radiata.woooo.tech/resources/scale-{seed:05}")).unwrap(),
@@ -508,6 +540,156 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
   println!(
     "cell peers={peers} bindings={expected} (two pages) converge={:.1}s",
     started.elapsed().as_secs_f64(),
+  );
+
+  for node in nodes {
+    node.handle.command(Shutdown::new()).await.unwrap();
+  }
+}
+
+/// The one-host 128-node shape: every dialer normalizes to one source
+/// address (the port is dropped by design), so the default strict join
+/// pool — strangers carrying credentials keep the tightest budget, 16
+/// per source per 60 s — paces the bootstrap at the refill rate past the
+/// 16-token burst. This lane measures that pacing: the join phase is
+/// expected to dominate at roughly one admission per 3.75 seconds. The
+/// production shape (a distinct address per device) does not alias and
+/// admits at the global budget without this wait; the operator answer
+/// for a one-host bootstrap storm is the admission block (the
+/// raised-pool sibling lane).
+#[ignore = "explicit benchmark: cargo test --release --features redb --test sync_scale_benchmark sync_128_node_star_join_paces_at_the_default_join_pool -- --ignored --nocapture"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn sync_128_node_star_join_paces_at_the_default_join_pool() {
+  let limits = radiata::MergeAdmissionLimits::for_cluster(128).unwrap();
+  let config = NodeConfig::new()
+    .with_anti_entropy_interval(Duration::from_secs(1))
+    .unwrap()
+    .with_merge_admission(limits);
+  run_128_node_star(config, Duration::from_secs(900)).await;
+}
+
+/// The same 128-node one-host bootstrap with the operator's admission
+/// block raised for the storm: the join phase collapses to the hub's
+/// handshake-and-commit throughput, and the trust snapshot (128 bindings
+/// over the 64-binding page limit) still converges through two pages per
+/// peer.
+#[ignore = "explicit benchmark: cargo test --release --features redb --test sync_scale_benchmark sync_128_node_star_bootstrap_with_raised_join_pool -- --ignored --nocapture"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn sync_128_node_star_bootstrap_with_raised_join_pool() {
+  let limits = radiata::MergeAdmissionLimits::for_cluster(128)
+    .unwrap()
+    .with_join_pool(256, Duration::from_secs(60), 2_048, Duration::from_secs(60))
+    .unwrap();
+  let config = NodeConfig::new()
+    .with_anti_entropy_interval(Duration::from_secs(1))
+    .unwrap()
+    .with_merge_admission(limits);
+  run_128_node_star(config, Duration::from_secs(300)).await;
+}
+
+/// The shared 128-node star body: issuer + 127 members over real TLS
+/// loopback and redb storage, phased timing (join admission vs trust
+/// convergence), and the full-reciprocal-trust assertion over the paged
+/// view.
+async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
+  init_tracing();
+  let peers = 128_usize;
+  let started = Instant::now();
+  let mut nodes = vec![start_with(0, config.clone()).await];
+  let secret = nodes[0]
+    .handle
+    .command(RotateMergeCredential::new())
+    .await
+    .unwrap()
+    .into_credential()
+    .expose_secret()
+    .to_owned();
+  for index in 1..peers as u64 {
+    let member = start_with(index, config.clone()).await;
+    // NotReady (a prior merge's reconcile still in flight) and the
+    // aliased join pool's typed overload are both transient: bounded
+    // retry is the caller contract, convergence is asserted below.
+    let deadline = Instant::now() + merge_deadline;
+    loop {
+      let credential = radiata::MergeCredential::parse(&secret).unwrap();
+      match member
+        .handle
+        .command(MergeCluster::new(nodes[0].endpoint.clone(), credential))
+        .await
+      {
+        Ok(_) => break,
+        Err(error) => {
+          assert!(
+            Instant::now() < deadline,
+            "merge never succeeded for member {index}: {error:?}"
+          );
+          tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+      }
+    }
+    nodes.push(member);
+  }
+  let join_seconds = started.elapsed().as_secs_f64();
+  eprintln!(
+    "PHASE join admission: {join_seconds:.1}s for {} nodes",
+    peers
+  );
+
+  // Trust convergence: every member's paged trust view shows all
+  // `peers` bindings (128 = two wire pages at the 64-binding limit).
+  let expected = peers;
+  let converge_started = Instant::now();
+  let deadline = converge_started + CELL_TIMEOUT;
+  loop {
+    let mut pending = 0_usize;
+    for node in &nodes {
+      let trust = node
+        .handle
+        .query(radiata::PageTrust::new(PageSpec::first(64).unwrap()))
+        .await
+        .unwrap();
+      let mut seen = trust.items().len();
+      if let Some(cursor) = trust.next() {
+        let second_page = node
+          .handle
+          .query(radiata::PageTrust::new(
+            PageSpec::after(cursor.clone(), 64).unwrap(),
+          ))
+          .await
+          .unwrap();
+        seen += second_page.items().len();
+      }
+      if seen != expected {
+        pending += 1;
+      }
+    }
+    if pending == 0 {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "trust never converged to {expected} ({pending} members short)"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+  }
+  let converge_seconds = converge_started.elapsed().as_secs_f64();
+  // The member view pages at 64 entries: walk every page before
+  // asserting the cluster size.
+  let mut members = 0_usize;
+  let mut spec = PageSpec::first(64).unwrap();
+  loop {
+    let page = nodes[0]
+      .handle
+      .query(radiata::PageMembers::new(spec.clone()))
+      .await
+      .unwrap();
+    members += page.items().len();
+    let Some(cursor) = page.next() else { break };
+    spec = PageSpec::after(cursor.clone(), 64).unwrap();
+  }
+  assert_eq!(members, expected, "the member pages must list the cluster");
+  println!(
+    "cell peers={peers} bindings={expected} (two pages) join={join_seconds:.1}s converge={converge_seconds:.1}s"
   );
 
   for node in nodes {
