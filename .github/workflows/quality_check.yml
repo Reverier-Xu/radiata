@@ -252,6 +252,7 @@ jobs:
       - name: build the starvation lanes
         run: |
           set -euo pipefail
+          mkdir -p target
           cargo +1.98.0 test --locked --no-run \
             --test transport_chaos --test membership_sync \
             --message-format=json > target/starvation-build.json
