@@ -736,28 +736,30 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
   let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
   let mut last_report = std::time::Instant::now() - CONVERGE_TIMEOUT;
   loop {
-    for index in indices {
-      bounded(
-        slots[*index].handle().command(radiata::RunSyncRound::new()),
-        "sync round",
-      )
-      .await
-      .expect("sync round");
-    }
-    let mut ready = true;
-    for index in indices {
+    // Observe first, concurrently: only the nodes that have not
+    // converged drive a round. The driven rounds themselves run
+    // concurrently — each round holds open for its slowest delivery
+    // verdict (a fixed bound), so driving them serially would scale the
+    // iteration cost by the node count and starve convergence on a
+    // single slow core (the CI starvation-gate failure shape).
+    let checks = futures_util::future::join_all(indices.iter().map(|index| async move {
       let slot = &slots[*index];
-      if active_members(slot).await != expected {
-        ready = false;
-        break;
-      }
+      let members = active_members(slot).await == expected;
       let recovery = bounded(slot.handle().query(GetRecovery::new()), "recovery view")
         .await
-        .expect("recovery view");
-      if !recovery.is_connected() {
-        ready = false;
-        break;
+        .map(|view| view.is_connected())
+        .unwrap_or(false);
+      (*index, members && recovery)
+    }))
+    .await;
+    let mut ready = true;
+    let mut stragglers = Vec::new();
+    for (index, converged) in checks {
+      if converged {
+        continue;
       }
+      ready = false;
+      stragglers.push(index);
     }
     if ready {
       return;
@@ -766,7 +768,7 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
     // stuck nodes instead of leaving an anonymous hole.
     if last_report.elapsed() >= Duration::from_secs(10) {
       last_report = std::time::Instant::now();
-      for index in indices {
+      for index in &stragglers {
         let slot = &slots[*index];
         let recovery = bounded(
           slot.handle().query(GetRecovery::new()),
@@ -774,23 +776,30 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
         )
         .await
         .expect("recovery view");
-        if !recovery.is_connected() || active_members(slot).await != expected {
-          let sessions = slot
-            .handle()
-            .query(radiata::PageSessions::new(
-              PageSpec::first(NODES).expect("page size"),
-            ))
-            .await
-            .map(|page| page.items().len())
-            .unwrap_or(0);
-          eprintln!(
-            "CONVERGE {what}: node {index} active={} expected={expected} recovery_connected={} sessions={sessions}",
-            active_members(slot).await,
-            recovery.is_connected(),
-          );
-        }
+        let sessions = slot
+          .handle()
+          .query(radiata::PageSessions::new(
+            PageSpec::first(NODES).expect("page size"),
+          ))
+          .await
+          .map(|page| page.items().len())
+          .unwrap_or(0);
+        eprintln!(
+          "CONVERGE {what}: node {index} active={} expected={expected} recovery_connected={} sessions={sessions}",
+          active_members(slot).await,
+          recovery.is_connected(),
+        );
       }
     }
+    futures_util::future::join_all(stragglers.iter().map(|index| async move {
+      bounded(
+        slots[*index].handle().command(radiata::RunSyncRound::new()),
+        "sync round",
+      )
+      .await
+      .expect("sync round");
+    }))
+    .await;
     assert!(
       std::time::Instant::now() < deadline,
       "{what}: convergence timeout after {CONVERGE_TIMEOUT:?}"
