@@ -30,6 +30,7 @@ struct Node {
 async fn start_configured(
   factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>, config: NodeConfig,
 ) -> Node {
+  common::init_tracing();
   // The runtime default entropy (system randomness) keeps every node's id
   // unique; deterministic entropy would collide across nodes. A prior
   // runtime instance's detached teardown can briefly hold the factory's
@@ -56,6 +57,19 @@ async fn start_configured(
       Err(error) => panic!("node start failed persistently: {error:?}"),
     }
   }
+}
+
+/// Bounds a node shutdown so a stuck teardown fails the lane with a
+/// name instead of hanging the job past its budget (the windows-runner
+/// hang shape).
+async fn stop(node: &Node, what: &'static str) {
+  tokio::time::timeout(
+    std::time::Duration::from_secs(120),
+    node.handle.command(Shutdown::new()),
+  )
+  .await
+  .unwrap_or_else(|_| panic!("{what}: shutdown never completed"))
+  .unwrap();
 }
 
 async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Node {
@@ -374,16 +388,20 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
     tightened,
   )
   .await;
-  let error = merge(&joiner_a, listener_a.endpoint(), issued_a.into_credential())
-    .await
-    .unwrap_err();
+  let error = tokio::time::timeout(
+    std::time::Duration::from_secs(120),
+    merge(&joiner_a, listener_a.endpoint(), issued_a.into_credential()),
+  )
+  .await
+  .expect("the tightened-deadline merge must resolve at the hub's 1.5s expiry")
+  .unwrap_err();
   assert_eq!(
     error.kind(),
     ErrorKind::AuthenticationFailed,
     "a commit latency beyond the tightened deadline must expire it"
   );
-  joiner_a.handle.command(Shutdown::new()).await.unwrap();
-  issuer_a.handle.command(Shutdown::new()).await.unwrap();
+  stop(&joiner_a, "phase a joiner").await;
+  stop(&issuer_a, "phase a issuer").await;
 
   // Phase B: the same injected write under the recalibrated default —
   // the two-write admission path (24 s) that expires 10 s-shaped
@@ -409,13 +427,17 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
     keys_at(5_100),
   )
   .await;
-  let view = merge(&joiner_b, listener_b.endpoint(), issued_b.into_credential())
-    .await
-    .unwrap_or_else(|error| {
-      panic!("the calibrated default must admit the two-write admission path: {error:?}")
-    });
+  let view = tokio::time::timeout(
+    std::time::Duration::from_secs(120),
+    merge(&joiner_b, listener_b.endpoint(), issued_b.into_credential()),
+  )
+  .await
+  .expect("the calibrated-deadline merge must resolve inside two gated writes")
+  .unwrap_or_else(|error| {
+    panic!("the calibrated default must admit the two-write admission path: {error:?}")
+  });
   let local = joiner_b.handle.query(GetLocalNode::new()).await.unwrap();
   assert_eq!(local.node_id(), view.node());
-  joiner_b.handle.command(Shutdown::new()).await.unwrap();
-  issuer_b.handle.command(Shutdown::new()).await.unwrap();
+  stop(&joiner_b, "phase b joiner").await;
+  stop(&issuer_b, "phase b issuer").await;
 }

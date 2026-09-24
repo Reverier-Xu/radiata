@@ -464,14 +464,7 @@ impl Slot {
 }
 
 fn init_tracing() {
-  use std::sync::Once;
-  static INIT: Once = Once::new();
-  INIT.call_once(|| {
-    tracing_subscriber::fmt()
-      .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=debug"))
-      .with_test_writer()
-      .init();
-  });
+  common::init_tracing();
 }
 
 fn node_config() -> NodeConfig {
@@ -765,7 +758,8 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
       return;
     }
     // Diagnose the stragglers every ten seconds so a timeout names the
-    // stuck nodes instead of leaving an anonymous hole.
+    // stuck nodes AND the exact member each one is missing, instead of
+    // leaving an anonymous count.
     if last_report.elapsed() >= Duration::from_secs(10) {
       last_report = std::time::Instant::now();
       for index in &stragglers {
@@ -776,6 +770,13 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
         )
         .await
         .expect("recovery view");
+        let missing = member_views(slot)
+          .await
+          .into_iter()
+          .filter(|member| member.status() != MemberStatus::Active)
+          .map(|member| format!("{}={:?}", member.node_id(), member.status()))
+          .collect::<Vec<_>>()
+          .join(",");
         let sessions = slot
           .handle()
           .query(radiata::PageSessions::new(
@@ -785,8 +786,7 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
           .map(|page| page.items().len())
           .unwrap_or(0);
         eprintln!(
-          "CONVERGE {what}: node {index} active={} expected={expected} recovery_connected={} sessions={sessions}",
-          active_members(slot).await,
+          "CONVERGE {what}: node {index} expected={expected} recovery_connected={} sessions={sessions} not-active=[{missing}]",
           recovery.is_connected(),
         );
       }

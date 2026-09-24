@@ -515,6 +515,10 @@ jobs:
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
+      # Node diagnostics must survive a failure: the tracing subscriber
+      # writes to stderr, which the test harness captures and reports on
+      # a failing (not hanging) test. Warnings keep the volume bounded.
+      RUST_LOG: radiata=warn
     strategy:
       fail-fast: false
       matrix:
