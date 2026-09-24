@@ -594,6 +594,25 @@ pub(crate) struct PeerSyncState {
   /// trust page's final binding, so a set larger than one wire page
   /// pages through across ticks.
   snapshot_cursor: Option<NodeId>,
+  /// The trust pages dispatched but not yet folded into the committed
+  /// cursor, in dispatch order. A failed head page rewinds the dispatch
+  /// position to its own start while later pages keep flowing (the
+  /// receiver adopts per binding, idempotently), so one slow or lost
+  /// acknowledgement cannot truncate the pass before its later pages —
+  /// the head-of-line stall the starvation gate caught.
+  trust_in_flight: std::collections::VecDeque<TrustPageInFlight>,
+  /// The dispatch position of the trust pass: the keyset cursor the
+  /// next page pages from. Runs ahead of `snapshot_cursor` (the
+  /// committed position) while pages are in flight.
+  trust_dispatch_cursor: Option<NodeId>,
+  /// Set once the pass dispatched past the final binding: the pass is
+  /// fully dispatched at this revision and completes when its window
+  /// drains. The value is the revision the pass itself dispatched, so
+  /// completion never claims pages a verdict lost.
+  trust_end: Option<u64>,
+  /// Monotonic sequence correlating a settled verdict to its window
+  /// entry.
+  trust_seq: u64,
   /// Ticks since this peer's last DELIVERED snapshot send: a lost
   /// delivery must be retried without waiting for the next grant-set
   /// change. The counter advances every tick — independent of the
@@ -642,8 +661,28 @@ fn tombstone_round_due(
 /// cursor must commit on this payload's verdict alone — another
 /// payload's ack says nothing about the trust page.
 struct SnapshotPageDispatch {
-  cursor: NodeId,
+  seq: u64,
   ack: tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+}
+
+/// How many trust pages may be in flight per peer at once. Two is the
+/// minimum that defeats a head-of-line stall: a slow or lost
+/// acknowledgement on page one no longer blocks page two from reaching
+/// the peer, whose adoption is per binding and idempotent.
+const TRUST_PIPELINE_PAGES: usize = 2;
+
+/// One dispatched trust page awaiting its delivery verdict, in dispatch
+/// order. The committed cursor advances to `cursor` only when every
+/// earlier page in the window delivered (a later page's continuation
+/// must never claim an earlier lost page's range); a failed head page
+/// rewinds the dispatch position to `start` for its retry while the
+/// rest of the window keeps flowing.
+#[derive(Debug)]
+struct TrustPageInFlight {
+  seq: u64,
+  start: Option<NodeId>,
+  cursor: Option<NodeId>,
+  delivered: Option<bool>,
 }
 
 /// The planes of one peer's previous round whose delivery verdicts are
@@ -657,7 +696,6 @@ struct SnapshotPageDispatch {
 pub(crate) struct PeerPlanesInFlight {
   pub(crate) tombstones: bool,
   pub(crate) pages: bool,
-  pub(crate) trust: bool,
 }
 
 /// Per-peer in-flight planes, consulted by the next round's dispatch.
@@ -692,9 +730,6 @@ impl MembershipPendingRound {
     for (peer, _) in &self.page_acks {
       in_flight.entry(peer.clone()).or_default().pages = true;
     }
-    for (peer, _) in &self.trust_pages {
-      in_flight.entry(peer.clone()).or_default().trust = true;
-    }
     in_flight
   }
 
@@ -714,7 +749,7 @@ impl MembershipPendingRound {
       })),
       futures_util::future::join_all(self.trust_pages.into_iter().map(|(peer, page)| async move {
         let delivered = crate::sync_common::delivered_within_bound(page.ack).await;
-        (peer, page.cursor, delivered)
+        (peer, page.seq, delivered)
       })),
     )
     .await;
@@ -738,17 +773,13 @@ impl MembershipPendingRound {
     // The trust page resolves to its own verdict, never the peer-level
     // OR over the round: a round dispatches several payloads per peer
     // (trust page, tombstones, descriptor page), and another payload's
-    // ack says nothing about the trust page.
-    let mut trust_commits = Vec::new();
-    for (peer, cursor, delivered) in trust_verdicts {
-      if delivered {
-        trust_commits.push((peer, cursor));
-      }
-    }
+    // ack says nothing about the trust page. Every verdict — delivered
+    // or not — folds into the peer's in-flight window; the prefix rule
+    // decides what the committed cursor may claim.
     MembershipRoundEffects {
       page_rewinds,
       tombstone_rounds,
-      trust_commits,
+      trust_verdicts,
     }
   }
 }
@@ -758,7 +789,7 @@ impl MembershipPendingRound {
 pub(crate) struct MembershipRoundEffects {
   page_rewinds: std::collections::BTreeSet<NodeId>,
   tombstone_rounds: std::collections::BTreeMap<NodeId, bool>,
-  trust_commits: Vec<(NodeId, NodeId)>,
+  trust_verdicts: Vec<(NodeId, u64, bool)>,
 }
 
 /// Applies one settled round's verdict effects to the cursors: an
@@ -781,11 +812,63 @@ pub(crate) fn apply_round_effects(
       state.ticks_since_tombstone_send = 0;
     }
   }
-  for (peer, cursor) in effects.trust_commits {
+  let mut touched: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+  for (peer, seq, delivered) in effects.trust_verdicts {
+    if let Some(state) = cursors.peers.get_mut(&peer)
+      && let Some(entry) = state
+        .trust_in_flight
+        .iter_mut()
+        .find(|entry| entry.seq == seq)
+    {
+      entry.delivered = Some(delivered);
+      touched.insert(peer);
+    }
+  }
+  for peer in touched {
     if let Some(state) = cursors.peers.get_mut(&peer) {
-      state.snapshot_cursor = Some(cursor);
+      settle_trust_window(state);
+    }
+  }
+}
+
+/// Folds settled verdicts into a peer's committed cursor: the prefix of
+/// consecutive delivered pages commits its continuations in order, and
+/// stops at the first failed or still-unsettled page. A failed head
+/// page stays in the window as the retry barrier: later pages may keep
+/// flowing behind it (the receiver adopts per binding, idempotently),
+/// but the committed cursor never claims a range a verdict lost.
+fn settle_trust_window(state: &mut PeerSyncState) {
+  loop {
+    let advance = matches!(
+      state.trust_in_flight.front().map(|head| head.delivered),
+      Some(Some(true))
+    );
+    if !advance {
+      break;
+    }
+    if let Some(head) = state.trust_in_flight.pop_front() {
+      if let Some(cursor) = head.cursor {
+        state.snapshot_cursor = Some(cursor);
+      }
       state.ticks_since_snapshot_send = 0;
     }
+  }
+  complete_settled_pass(state);
+}
+
+/// Marks a fully dispatched pass complete once its window drained: the
+/// recorded revision — the one the pass itself dispatched — is the
+/// revision the marker claims, so completion never asserts pages a
+/// verdict lost.
+fn complete_settled_pass(state: &mut PeerSyncState) {
+  if let Some(rev) = state.trust_end
+    && state.trust_in_flight.is_empty()
+  {
+    state.snapshot_cursor = None;
+    state.trust_dispatch_cursor = None;
+    state.snapshot_rev = rev;
+    state.ticks_since_snapshot_send = 0;
+    state.trust_end = None;
   }
 }
 
@@ -869,35 +952,84 @@ async fn membership_sync_tick_peer(
       Some(_) => state.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS,
       None => false,
     };
-  // An in-flight trust plane keeps its verdict pending: the pass neither
-  // advances nor closes until the verdict commits or rewinds the cursor.
-  let trust_due = snapshot_due && !planes.trust;
+  // An unsettled trust page no longer gates the leg: the pass pipelines
+  // up to TRUST_PIPELINE_PAGES pages per peer, so a slow or lost
+  // acknowledgement stalls the committed cursor, not the data.
+  let trust_due = snapshot_due;
   let tombstones_due = tombstone_round_due(
     revision_advanced,
     !tombstone_bytes.is_empty(),
     state.ticks_since_tombstone_send,
     snapshot_due,
   ) && !planes.tombstones;
+  // A fully dispatched pass whose window drained is complete.
+  complete_settled_pass(state);
   // The trust snapshot leg pages through the issuer's binding set one
-  // wire page per tick (keyset cursor per peer); the revision is only
-  // marked fully delivered on the closing empty-page tick, so an
-  // undelivered page leaves the pass due instead of truncated.
+  // wire page per tick per peer (keyset cursor per peer), pipelined to
+  // a bounded window: page N+1 dispatches while page N's verdict is
+  // still pending, and the committed cursor advances only over the
+  // consecutive-delivered prefix (see `settle_trust_window`). The
+  // window entry lands only after the wire accepted the page: a
+  // rejected dispatch rewinds the dispatch position instead of leaving
+  // an entry whose verdict can never resolve.
   let mut snapshot_page: Option<Vec<u8>> = None;
-  let mut snapshot_page_cursor: Option<NodeId> = None;
-  if trust_due && let Some(snapshot) = snapshot {
-    let page = snapshot.page_after(state.snapshot_cursor.as_ref(), TRUST_BINDINGS_PAGE_LIMIT);
+  let mut reserved: Option<(u64, Option<NodeId>, Option<NodeId>)> = None;
+  // The retry of a failed head page takes this tick's dispatch: the
+  // entry re-arms with a fresh sequence and the page re-sends from its
+  // own start. The failed entry stays in the window as the commit
+  // barrier until a retry delivers, so the retry is the dispatch — no
+  // new page joins the window behind it this tick.
+  let head_retry = matches!(
+    state.trust_in_flight.front().map(|head| head.delivered),
+    Some(Some(false))
+  );
+  if head_retry && let Some(snapshot) = snapshot {
+    let head = state.trust_in_flight.pop_front();
+    if let Some(head) = head {
+      let page = snapshot.page_after(head.start.as_ref(), TRUST_BINDINGS_PAGE_LIMIT);
+      if !page.bindings().is_empty() {
+        tracing::debug!(
+          peer = %peer,
+          revision = snapshot.revision(),
+          bindings = page.bindings().len(),
+          "retrying trust snapshot page"
+        );
+        let continuation = page.continuation().cloned();
+        let seq = state.trust_seq;
+        state.trust_seq += 1;
+        reserved = Some((seq, head.start.clone(), continuation.clone()));
+        state.trust_dispatch_cursor = continuation;
+        snapshot_page = Some(SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?);
+      }
+      if page.bindings().is_empty() {
+        // The snapshot shrank past this page's start between dispatch
+        // and retry: re-arm the entry unchanged, the completion rule
+        // will close the pass when the window drains.
+        state.trust_in_flight.push_front(TrustPageInFlight {
+          seq: head.seq,
+          start: head.start,
+          cursor: head.cursor,
+          delivered: None,
+        });
+      }
+    }
+  } else if trust_due
+    && let Some(snapshot) = snapshot
+    && state.trust_in_flight.len() < TRUST_PIPELINE_PAGES
+  {
+    let page = snapshot.page_after(
+      state.trust_dispatch_cursor.as_ref(),
+      TRUST_BINDINGS_PAGE_LIMIT,
+    );
     if page.bindings().is_empty() {
-      // The pass is complete for this revision: reset the cursor and
-      // mark the peer fully delivered. No payload this round, so no
-      // delivery verdict is needed to re-arm the snapshot cadence.
+      // Every page of the pass is dispatched (and the window's own
+      // completion rule still holds them to their verdicts).
       tracing::debug!(
         peer = %peer,
         revision = snapshot.revision(),
-        "trust snapshot pass complete"
+        "trust snapshot pass fully dispatched"
       );
-      state.snapshot_cursor = None;
-      state.snapshot_rev = snapshot.revision();
-      state.ticks_since_snapshot_send = 0;
+      state.trust_end = Some(snapshot.revision());
     } else {
       tracing::debug!(
         peer = %peer,
@@ -905,10 +1037,20 @@ async fn membership_sync_tick_peer(
         bindings = page.bindings().len(),
         "dispatching trust snapshot page"
       );
-      snapshot_page_cursor = page.continuation().cloned();
+      let continuation = page.continuation().cloned();
+      let seq = state.trust_seq;
+      state.trust_seq += 1;
+      reserved = Some((
+        seq,
+        state.trust_dispatch_cursor.clone(),
+        continuation.clone(),
+      ));
+      state.trust_dispatch_cursor = continuation;
       snapshot_page = Some(SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?);
     }
   }
+  // The end reached with an empty window completes the pass immediately.
+  complete_settled_pass(state);
   let mut tombstone_payloads: Vec<&[u8]> = Vec::new();
   if tombstones_due {
     tombstone_payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
@@ -956,13 +1098,36 @@ async fn membership_sync_tick_peer(
     protocol,
   )
   .await;
+  // The window entry lands only on an accepted dispatch: a rejected
+  // page never enters the window (its verdict could never resolve), so
+  // the dispatch position rewinds to the page's start for the next
+  // round's retry.
+  let snapshot_page = match (snapshot_page, snapshot_ack, reserved) {
+    (Some(_), Some(ack), Some((seq, start, continuation))) => {
+      state.trust_in_flight.push_back(TrustPageInFlight {
+        seq,
+        start,
+        cursor: continuation,
+        delivered: None,
+      });
+      Some(SnapshotPageDispatch { seq, ack })
+    }
+    (Some(_), None, reserved) => {
+      if let Some((_, start, _)) = reserved {
+        state.trust_dispatch_cursor = start;
+      }
+      None
+    }
+    // No reserved page: nothing to dispatch (or the pass is fully
+    // dispatched past its final binding). A reservation without bytes
+    // cannot arise — the reservation is made when the bytes are.
+    (..) => None,
+  };
   Ok(MembershipPeerRound {
     tombstone_acks,
     page_dispatched: page_bytes.is_some(),
     page_ack,
-    snapshot_page: snapshot_ack
-      .zip(snapshot_page_cursor)
-      .map(|(ack, cursor)| SnapshotPageDispatch { cursor, ack }),
+    snapshot_page,
     dispatched: true,
   })
 }
@@ -1628,6 +1793,190 @@ mod tests {
     }
     let state = cursors.peers.get(&peer).unwrap();
     assert_eq!(state.snapshot_rev, 1, "the pass completed for revision 1");
+    assert!(
+      state.snapshot_cursor.is_none(),
+      "the completed pass resets the cursor"
+    );
+  }
+
+  /// Regression (the starvation-gate rejoin stall): a lost head page's
+  /// acknowledgement must not truncate the trust pass. While the head
+  /// page keeps failing its verdict, the NEXT page still dispatches
+  /// behind it — the peer's adoption is per binding and idempotent —
+  /// and the committed cursor never claims the head page's range. When
+  /// the head page finally delivers, the whole window commits and the
+  /// pass completes.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn the_trust_pass_flows_past_a_lost_head_page_verdict() {
+    use std::sync::{Arc, Mutex};
+
+    use futures_util::StreamExt as _;
+
+    use crate::{
+      identity::{
+        lifecycle,
+        records::{IdentityBindingV1, identity_binding_key},
+        testing::{ScriptedKeys, SequenceEntropy, inject_entry},
+      },
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn crate::provider::StorageFactory> = reference.clone();
+    let keys = ScriptedKeys::full();
+    let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        Some(&keys.as_provider()),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    // Sixty-five injected bindings: exactly two wire pages (64 + 1), so
+    // the pass cannot complete on its head page alone.
+    let shared_key = key_at(0);
+    for index in 101..=165_u64 {
+      let bound = node_at(index);
+      let (namespace, key) = identity_binding_key(&bound).unwrap();
+      let binding = IdentityBindingV1::new(bound, shared_key.clone());
+      inject_entry(&reference, (namespace, key), binding.encode().unwrap());
+    }
+
+    let peer = node(2);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let (entry, _rx) = crate::session::stream::test_entry(entropy.as_ref());
+    sessions.lock().unwrap().insert(peer.clone(), entry);
+
+    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(64);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = RuntimeClient::routing_only(packet_tx, routes);
+    // The drainer drops every head-page (the 64-binding page)
+    // admission until `admit_head` flips, and admits every other
+    // payload always — the starved-runner shape where one page's
+    // acknowledgement never arrives within the bound. The observed
+    // snapshot page sizes, in dispatch order, are the evidence.
+    let admit_head = Arc::new(Mutex::new(false));
+    let page_sizes: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let drainer_peer = peer.clone();
+    let drainer_admit = Arc::clone(&admit_head);
+    let drainer_sizes = Arc::clone(&page_sizes);
+    tokio::spawn(async move {
+      while let Some(mut request) = packet_rx.recv().await {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = request.body.as_mut().next().await {
+          bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let payload = SyncPayload::decode(&bytes).unwrap();
+        if let SyncPayload::Snapshot(encoded) = &payload {
+          let page = crate::identity::trust::TrustSnapshotPage::decode(encoded.as_ref()).unwrap();
+          let size = page.bindings().len();
+          drainer_sizes.lock().unwrap().push(size);
+          // The head page carries the whole first wire page; the
+          // second page carries the remainder.
+          if size > 1 && !*drainer_admit.lock().unwrap() {
+            continue;
+          }
+        }
+        let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
+          by: drainer_peer.clone(),
+          admitted_at: std::time::SystemTime::now(),
+        }));
+      }
+    });
+
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
+    let mut cursors = MembershipSyncCursors::default();
+
+    // Round 1: the head page dispatches; its acknowledgement is
+    // dropped, and the round is NOT settled yet — the verdict is still
+    // pending, exactly like a driver tick racing the ack bound.
+    let first = sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursors,
+      &InFlightRounds::new(),
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap()
+    .expect("the head page dispatched");
+
+    // Round 2: with the head page's verdict still pending, the SECOND
+    // page dispatches behind it — the pipelining property this
+    // regression exists for.
+    let second = sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursors,
+      &InFlightRounds::new(),
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap()
+    .expect("the second page dispatched behind the unsettled head");
+
+    // Settle both rounds: the head page's verdict fails; the second
+    // page's ack resolved as admitted.
+    settle_round(first, &mut cursors).await;
+    settle_round(second, &mut cursors).await;
+    assert_eq!(
+      page_sizes.lock().unwrap().as_slice(),
+      &[64, 1],
+      "the second page flowed while the head page's verdict was lost"
+    );
+    assert!(
+      cursors.peers.get(&peer).unwrap().snapshot_cursor.is_none(),
+      "the committed cursor never claims the lost head page's range"
+    );
+
+    // Admitting the head page delivers its retry: the window commits
+    // across the recovered page and the pass completes.
+    *admit_head.lock().unwrap() = true;
+    for _ in 0..6 {
+      if cursors
+        .peers
+        .get(&peer)
+        .is_some_and(|state| state.snapshot_rev == 1)
+      {
+        break;
+      }
+      if let Some(pending) = sync_tick(
+        &context,
+        &entropy,
+        &sessions,
+        &runtime,
+        &endpoints,
+        &mut cursors,
+        &InFlightRounds::new(),
+        &events,
+        &revision,
+      )
+      .await
+      .unwrap()
+      {
+        settle_round(pending, &mut cursors).await;
+      }
+    }
+    let state = cursors.peers.get(&peer).unwrap();
+    assert_eq!(
+      state.snapshot_rev, 1,
+      "the pass completed once the head page delivered"
+    );
     assert!(
       state.snapshot_cursor.is_none(),
       "the completed pass resets the cursor"
