@@ -293,15 +293,19 @@ pub(crate) async fn delivered_within_bound(
 }
 
 /// The bounded wait for one sync payload's admission acknowledgement:
-/// long enough to cover a healthy round trip on a starved runner (a
-/// single slow core serving sixty-four peers), where an acknowledgement
-/// is itself a routed packet waiting behind everything else. Since the
-/// rounds settle their verdicts off the tick path, this bound no longer
-/// stalls the anti-entropy cadence — it only gates how long the
-/// affected planes stay in flight (skipped) before the retry, so a
-/// generous bound costs one delayed retry on genuine loss and nothing
-/// on the happy path.
-pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// long enough to cover a healthy round trip on a loaded session, short
+/// enough that one unreachable peer cannot stall the anti-entropy tick
+/// beyond a small multiple of its cadence.
+///
+/// Known margin: on a starved single-core runner the routed ack can
+/// exceed this bound, and a trust pass then retries its head page while
+/// later pages wait — the pass truncates until an ack gets through (the
+/// diagnostics name the affected roster). A longer global bound is not
+/// the answer: it uniformly slows every sync-bound phase (measured: the
+/// sixty-four-node lane stopped reaching its convergence waits at all).
+/// The structural repair is receiver-side cursor evidence, not a bigger
+/// timer.
+pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
