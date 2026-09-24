@@ -76,6 +76,17 @@ async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Nod
   start_configured(factory, keys, NodeConfig::new()).await
 }
 
+/// A node whose anti-entropy driver ticks hourly: the slow-flash lanes
+/// measure the ADMISSION path against the gated device, and a stray
+/// driver commit queued on the same gate would sit inside the measured
+/// deadline (the tick economics changed when verdict settlement left
+/// the tick path, so the old implicit spacing no longer holds).
+fn quiet_driver_config() -> NodeConfig {
+  NodeConfig::new()
+    .with_anti_entropy_interval(std::time::Duration::from_secs(3_600))
+    .unwrap()
+}
+
 fn keys_at(seed: u64) -> Arc<ScriptedKeys> {
   Arc::new(ScriptedKeys::full_at(seed))
 }
@@ -363,9 +374,10 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
   let slow_a = Arc::new(DelayingFactory::new(Arc::new(MemoryStorageFactory::new(
     required_capabilities(),
   ))));
-  let issuer_a = start(
+  let issuer_a = start_configured(
     Arc::clone(&slow_a) as Arc<dyn StorageFactory>,
     keys_at(4_000),
+    quiet_driver_config(),
   )
   .await;
   let issued_a = rotate_with_retry(&issuer_a).await;
@@ -409,9 +421,10 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
   let slow_b = Arc::new(DelayingFactory::new(Arc::new(MemoryStorageFactory::new(
     required_capabilities(),
   ))));
-  let issuer_b = start(
+  let issuer_b = start_configured(
     Arc::clone(&slow_b) as Arc<dyn StorageFactory>,
     keys_at(5_000),
+    quiet_driver_config(),
   )
   .await;
   let issued_b = rotate_with_retry(&issuer_b).await;
