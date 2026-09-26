@@ -49,45 +49,55 @@ pub(super) fn spawn_sync_driver(
       tokio::task::JoinHandle<crate::resource::sync::ResourceRoundEffects>,
       std::collections::BTreeSet<crate::NodeId>,
     );
-    let mut pending_sync: Option<SyncPending> = None;
-    let mut pending_resource: Option<ResourcePending> = None;
-    // Applies the previous round's verdict effects once they resolved.
-    // With `settle_all` the wait blocks until they do (the deterministic
-    // seam: a requested round must leave settled cursor state).
+    let mut pending_sync: Vec<SyncPending> = Vec::new();
+    let mut pending_resource: Vec<ResourcePending> = Vec::new();
+    // Applies every round's verdict effects whose settlement resolved.
+    // With `settle_all` the wait blocks until each does (the
+    // deterministic seam: a requested round must leave settled cursor
+    // state). Unsettled rounds stay queued: a later dispatch NEVER
+    // overwrites them — a dropped settlement would strand its window
+    // entries at `delivered = None` forever, permanently stalling those
+    // peers.
     async fn harvest_sync(
-      pending: &mut Option<SyncPending>,
-      cursors: &mut crate::membership::sync::MembershipSyncCursors, settle_all: bool,
+      pending: &mut Vec<SyncPending>, cursors: &mut crate::membership::sync::MembershipSyncCursors,
+      settle_all: bool,
     ) {
-      let Some((handle, _)) = pending else { return };
-      if !settle_all && !handle.is_finished() {
-        return;
-      }
-      match handle.await {
-        Ok(effects) => crate::membership::sync::apply_round_effects(cursors, effects),
-        Err(error) => {
-          tracing::warn!(error = %error, "membership round settlement failed");
+      let mut remaining = Vec::new();
+      for (handle, in_flight) in pending.drain(..) {
+        if !settle_all && !handle.is_finished() {
+          remaining.push((handle, in_flight));
+          continue;
+        }
+        match handle.await {
+          Ok(effects) => crate::membership::sync::apply_round_effects(cursors, effects),
+          Err(error) => {
+            tracing::warn!(error = %error, "membership round settlement failed");
+          }
         }
       }
-      *pending = None;
+      *pending = remaining;
     }
     async fn harvest_resource(
-      pending: &mut Option<ResourcePending>,
-      cursors: &mut crate::resource::sync::ResourceSyncCursors, settle_all: bool,
+      pending: &mut Vec<ResourcePending>, cursors: &mut crate::resource::sync::ResourceSyncCursors,
+      settle_all: bool,
     ) {
-      let Some((handle, _)) = pending else { return };
-      if !settle_all && !handle.is_finished() {
-        return;
-      }
-      match handle.await {
-        Ok(effects) => crate::resource::sync::apply_resource_round_effects(cursors, effects),
-        Err(error) => {
-          tracing::warn!(error = %error, "resource round settlement failed");
+      let mut remaining = Vec::new();
+      for (handle, in_flight) in pending.drain(..) {
+        if !settle_all && !handle.is_finished() {
+          remaining.push((handle, in_flight));
+          continue;
+        }
+        match handle.await {
+          Ok(effects) => crate::resource::sync::apply_resource_round_effects(cursors, effects),
+          Err(error) => {
+            tracing::warn!(error = %error, "resource round settlement failed");
+          }
         }
       }
-      *pending = None;
+      *pending = remaining;
     }
     // Dispatches one full round for both planes against the current
-    // cursors and in-flight sets, and stores each plane's unsettled
+    // cursors and in-flight sets, and queues each plane's unsettled
     // verdicts (spawned, so the next tick harvests them without
     // blocking this one).
     #[allow(clippy::too_many_arguments)]
@@ -96,17 +106,23 @@ pub(super) fn spawn_sync_driver(
       sessions: &crate::session::stream::SessionTable, runtime: &crate::runtime::RuntimeClient,
       endpoints: &[Endpoint], sync_cursor: &mut crate::membership::sync::MembershipSyncCursors,
       resource_cursor: &mut crate::resource::sync::ResourceSyncCursors,
-      pending_sync: &mut Option<SyncPending>, pending_resource: &mut Option<ResourcePending>,
+      pending_sync: &mut Vec<SyncPending>, pending_resource: &mut Vec<ResourcePending>,
       events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
     ) {
-      let sync_in_flight = pending_sync
-        .as_ref()
-        .map(|(_, in_flight)| in_flight.clone())
-        .unwrap_or_default();
-      let resource_in_flight = pending_resource
-        .as_ref()
-        .map(|(_, in_flight)| in_flight.clone())
-        .unwrap_or_default();
+      // The skip set is the union over every unsettled round: a peer
+      // with an in-flight plane skips that plane's dispatch regardless
+      // of which round dispatched it.
+      let mut sync_in_flight = crate::membership::sync::InFlightRounds::new();
+      for (_, in_flight) in pending_sync.iter() {
+        for (peer, planes) in in_flight {
+          let entry = sync_in_flight.entry(peer.clone()).or_default();
+          entry.tombstones |= planes.tombstones;
+        }
+      }
+      let mut resource_in_flight = std::collections::BTreeSet::new();
+      for (_, in_flight) in pending_resource.iter() {
+        resource_in_flight.extend(in_flight.iter().cloned());
+      }
       match crate::membership::sync::sync_tick(
         context,
         entropy,
@@ -122,7 +138,7 @@ pub(super) fn spawn_sync_driver(
       {
         Ok(Some(pending)) => {
           let in_flight = pending.in_flight();
-          *pending_sync = Some((tokio::spawn(pending.settle()), in_flight));
+          pending_sync.push((tokio::spawn(pending.settle()), in_flight));
         }
         Ok(None) => {}
         // Persistent anti-entropy failure must stay visible in
@@ -141,7 +157,7 @@ pub(super) fn spawn_sync_driver(
       {
         Ok(Some(pending)) => {
           let in_flight = pending.in_flight();
-          *pending_resource = Some((tokio::spawn(pending.settle()), in_flight));
+          pending_resource.push((tokio::spawn(pending.settle()), in_flight));
         }
         Ok(None) => {}
         Err(error) => tracing::warn!(kind = ?error.kind(), "resource sync tick failed"),

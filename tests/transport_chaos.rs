@@ -770,13 +770,42 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
         )
         .await
         .expect("recovery view");
-        let missing = member_views(slot)
-          .await
-          .into_iter()
+        // Name absent identities: diff each straggler's member ids
+        // against a converged reference node's set, so a missing row
+        // names itself instead of hiding behind a count.
+        let reference_ids =
+          if let Some(index) = indices.iter().find(|index| !stragglers.contains(index)) {
+            Some(
+              member_views(&slots[*index])
+                .await
+                .into_iter()
+                .map(|member| member.node_id().clone())
+                .collect::<std::collections::BTreeSet<NodeId>>(),
+            )
+          } else {
+            None
+          };
+        let views = member_views(slot).await;
+        let ids: std::collections::BTreeSet<NodeId> = views
+          .iter()
+          .map(|member| member.node_id().clone())
+          .collect();
+        let missing = views
+          .iter()
           .filter(|member| member.status() != MemberStatus::Active)
           .map(|member| format!("{}={:?}", member.node_id(), member.status()))
           .collect::<Vec<_>>()
           .join(",");
+        let absent = reference_ids
+          .as_ref()
+          .map(|reference| {
+            reference
+              .difference(&ids)
+              .map(|id| id.as_str().to_owned())
+              .collect::<Vec<_>>()
+              .join(",")
+          })
+          .unwrap_or_default();
         let sessions = slot
           .handle()
           .query(radiata::PageSessions::new(
@@ -786,7 +815,8 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
           .map(|page| page.items().len())
           .unwrap_or(0);
         eprintln!(
-          "CONVERGE {what}: node {index} expected={expected} recovery_connected={} sessions={sessions} not-active=[{missing}]",
+          "CONVERGE {what}: node {index} rows={} expected={expected} recovery_connected={} sessions={sessions} not-active=[{missing}] absent=[{absent}]",
+          views.len(),
           recovery.is_connected(),
         );
       }

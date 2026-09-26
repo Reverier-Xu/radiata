@@ -293,19 +293,21 @@ pub(crate) async fn delivered_within_bound(
 }
 
 /// The bounded wait for one sync payload's admission acknowledgement:
-/// long enough to cover a healthy round trip on a loaded session, short
-/// enough that one unreachable peer cannot stall the anti-entropy tick
-/// beyond a small multiple of its cadence.
+/// long enough to cover a legitimate admission on the slowest supported
+/// deployment — the receiver's admission is a durable commit, and a
+/// single-core sixty-four-peer reference mesh pushes that latency past
+/// a couple of seconds, where a shorter bound fails the same page's
+/// verdict every round and strands its range.
 ///
-/// Known margin: on a starved single-core runner the routed ack can
-/// exceed this bound, and a trust pass then retries its head page while
-/// later pages wait — the pass truncates until an ack gets through (the
-/// diagnostics name the affected roster). A longer global bound is not
-/// the answer: it uniformly slows every sync-bound phase (measured: the
-/// sixty-four-node lane stopped reaching its convergence waits at all).
-/// The structural repair is receiver-side cursor evidence, not a bigger
-/// timer.
-pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// The original two-second value existed to keep the anti-entropy tick
+/// from stalling on one unreachable peer; the rounds now settle their
+/// verdicts off the tick path and gate dispatch through bounded
+/// windows, so the bound only decides how long an affected plane stays
+/// in flight before its retry — it can cover starved-runner commits
+/// without stalling anything. If admission latency ever grows with
+/// scale, the structural answer is receiver-side cursor evidence (a
+/// pull-based repair), not a larger timer.
+pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
@@ -505,43 +507,54 @@ mod tests {
     assert_eq!(error.kind(), crate::ErrorKind::ShuttingDown);
   }
 
-  /// A delivery failure heals within one tick by re-sending exactly the
-  /// failed page: the continuation rewinds to the page's start (acked
-  /// predecessors stay delivered), and the forced resend-due state makes
-  /// the retry fire immediately regardless of the recorded fingerprint.
+  /// A delivery failure heals without truncating the pass: the failed
+  /// head page stays in the window as the retry barrier — the committed
+  /// cursor never claims its range while later pages keep flowing — and
+  /// the retry re-sends exactly the failed page's range. When the retry
+  /// delivers, the whole window commits and the pass completes.
   #[test]
-  fn discarded_progress_re_sends_the_failed_page_on_the_next_round() {
+  fn a_failed_head_page_flows_later_pages_and_retries_exactly_its_range() {
     let mut state = PeerPageCursor::default();
-    // First page (from scratch): its start is the empty continuation.
     assert_eq!(state.page_round(7), PageRound::Send);
-    state.record_send(Some(&[9, 9]));
-    // Second page dispatched from cursor [9, 9]: its failure rewinds to
-    // [9, 9], not to scratch.
-    state.discard_progress();
+    // Two pages dispatch while both verdicts are pending: the window
+    // carries exactly PIPELINE_PAGES entries.
+    let (first, first_start) = state.page_reserve();
+    assert_eq!(first_start, None, "the first page starts from scratch");
+    state.page_accept(first, first_start.clone(), Some(vec![9, 9]));
+    let (second, second_start) = state.page_reserve();
+    assert_eq!(second_start, Some(vec![9, 9]));
+    state.page_accept(second, second_start, None);
+    assert!(!state.page_room(), "the window is full at two pages");
+    // The head page's verdict fails while the second page's resolves:
+    // the barrier holds the cursor at scratch — page two's data is on
+    // the peer, but the cursor never claims page one's range.
+    state.page_settle(first, false);
+    state.page_settle(second, true);
+    assert!(state.page_head_retry(), "the failed head must retry");
     assert_eq!(
       state.continuation(),
       None,
-      "first-page failure rewinds to scratch"
+      "the retry re-emits from the failed page's start, not past it"
     );
-
-    // Mid-pass failure: page two's start is cursor [9, 9].
-    state.record_send(Some(&[9, 9]));
-    state.record_send(Some(&[4, 4]));
-    state.discard_progress();
+    // The retry re-sends exactly page one's range and delivers: the
+    // whole window commits and the pass completes.
+    let retry = state
+      .page_pop_failed_head()
+      .expect("the failed head pops for retry");
+    assert_eq!(retry.start, None);
+    state.page_accept(retry.seq, retry.start, Some(vec![9, 9]));
+    state.page_settle(retry.seq, true);
     assert_eq!(
       state.continuation(),
-      Some(&[9, 9][..]),
-      "mid-pass failure rewinds to the failed page's start"
+      None,
+      "the completed pass leaves the cursor at scratch"
     );
+    assert!(!state.page_head_retry());
     assert_eq!(
       state.page_round(7),
-      PageRound::Send,
-      "continuation round always sends"
+      PageRound::Quiet,
+      "a settled catalog goes quiet"
     );
-
-    // A settled catalog goes quiet after a complete pass.
-    state.record_send(None);
-    assert_eq!(state.page_round(7), PageRound::Quiet);
   }
 
   /// A catalog change is observed on the very next idle round: the
@@ -555,17 +568,24 @@ mod tests {
   fn a_catalog_change_sends_on_the_next_idle_round() {
     let mut state = PeerPageCursor::default();
     assert_eq!(state.page_round(7), PageRound::Send);
-    state.record_send(Some(&[9, 9]));
+    let (first, first_start) = state.page_reserve();
+    state.page_accept(first, first_start, Some(vec![9, 9]));
+    state.page_settle(first, true);
     // Mid-pass rounds always send, and record nothing: the recorded
     // fingerprint stays 7 while the catalog changes to 8 mid-pass.
     assert_eq!(state.page_round(8), PageRound::Send);
-    state.record_send(None);
+    let (second, second_start) = state.page_reserve();
+    assert_eq!(second_start, Some(vec![9, 9]));
+    state.page_accept(second, second_start, None);
+    state.page_settle(second, true);
     assert_eq!(
       state.page_round(8),
       PageRound::Send,
       "a mid-pass catalog change is due on the next idle round"
     );
-    state.record_send(None);
+    let (third, third_start) = state.page_reserve();
+    state.page_accept(third, third_start, None);
+    state.page_settle(third, true);
     assert_eq!(state.page_round(8), PageRound::Quiet);
     // A tail append (a different catalog fingerprint) is due immediately —
     // no resend-cadence wait.
@@ -574,7 +594,9 @@ mod tests {
       PageRound::Send,
       "a catalog change must not wait out the resend cadence"
     );
-    state.record_send(None);
+    let (fourth, fourth_start) = state.page_reserve();
+    state.page_accept(fourth, fourth_start, None);
+    state.page_settle(fourth, true);
     assert_eq!(state.page_round(9), PageRound::Quiet);
   }
 
@@ -586,7 +608,9 @@ mod tests {
   fn the_full_pass_arm_keeps_an_in_flight_walk() {
     let mut state = PeerPageCursor::default();
     assert_eq!(state.page_round(1), PageRound::Send);
-    state.record_send(Some(&[9, 9]));
+    let (first, first_start) = state.page_reserve();
+    state.page_accept(first, first_start, Some(vec![9, 9]));
+    state.page_settle(first, true);
     for _ in 0..PeerPageCursor::FULL_SYNC_ROUNDS {
       state.count_round();
     }
@@ -602,7 +626,10 @@ mod tests {
     // After the walk completes, the next due pass still starts from
     // scratch — the from-scratch property lives in the cursor being
     // `None` between passes, not in the arm forcing a send.
-    state.record_send(None);
+    let (second, second_start) = state.page_reserve();
+    assert_eq!(second_start, Some(vec![9, 9]));
+    state.page_accept(second, second_start, None);
+    state.page_settle(second, true);
     assert_eq!(state.page_round(1), PageRound::Quiet);
     state.arm_full_pass();
     for _ in 0..PeerPageCursor::PAGE_RESEND_TICKS {
@@ -651,6 +678,25 @@ mod tests {
 /// machine by design (per-key watermarks replace the fingerprint), but
 /// both lanes share this struct's cadence constants — a one-lane
 /// cadence change would silently fork the anti-entropy behavior.
+/// One dispatched sync page awaiting its delivery verdict, in dispatch
+/// order. The shared window entry of both page planes (membership
+/// descriptors and trust snapshots): the committed cursor advances to
+/// `cursor` only when every earlier page in the window delivered (a
+/// later page's continuation must never claim an earlier lost page's
+/// range); a failed head page stays in the window as the retry barrier
+/// while later pages keep flowing — the receiver's application is per
+/// record and idempotent.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPageInFlight<C> {
+  pub(crate) seq: u64,
+  pub(crate) start: Option<C>,
+  pub(crate) cursor: Option<C>,
+  pub(crate) delivered: Option<bool>,
+}
+
+/// The membership lane's per-peer page anti-entropy continuation state:
+/// the continuation cursor, the steady-state page fingerprint, and the
+/// resend cadence.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PeerPageCursor {
   /// Fingerprint of the sender's whole catalog at this peer's last idle
@@ -668,15 +714,20 @@ pub(crate) struct PeerPageCursor {
   /// re-arms the from-scratch liveness bound (see
   /// [`Self::FULL_SYNC_ROUNDS`]) without touching an in-flight walk.
   rounds_since_full: u32,
-  /// This peer's page continuation cursor, so sync converges beyond a
-  /// single page.
+  /// The COMMITTED page continuation cursor: the last consecutively
+  /// delivered page's cursor, so everything before it is provably on
+  /// the peer and sync converges beyond a single page.
   page: Option<Vec<u8>>,
-  /// The continuation the last dispatched page was emitted from: an
-  /// undelivered page rewinds to exactly this point — the failed page
-  /// is re-sent, not the whole prefix (acked pages are already durable
-  /// on the peer and re-sending them under load turns convergence into
-  /// a random walk that stalls deep catalogs).
-  page_start: Option<Vec<u8>>,
+  /// The dispatched-but-unsettled pages, in dispatch order. A failed
+  /// head page is the retry barrier: later pages keep flowing behind it
+  /// (the receiver's application is per record and idempotent) while
+  /// the committed cursor never claims the failed page's range — the
+  /// head-of-line truncation the starvation gate caught on the trust
+  /// plane, closed here by the same window mechanism.
+  in_flight: std::collections::VecDeque<SyncPageInFlight<Vec<u8>>>,
+  /// Monotonic sequence correlating a settled verdict to its window
+  /// entry.
+  seq: u64,
 }
 
 /// One page-plane round outcome for a peer.
@@ -703,6 +754,12 @@ impl PeerPageCursor {
   /// peers do not count.
   pub(crate) const FULL_SYNC_ROUNDS: u32 = 128;
 
+  /// How many pages may be in flight per peer at once. Two is the
+  /// minimum that defeats a head-of-line stall: a slow or lost
+  /// acknowledgement on page one no longer blocks page two from
+  /// reaching the peer, whose application is per record and idempotent.
+  pub(crate) const PIPELINE_PAGES: usize = 2;
+
   /// After [`Self::FULL_SYNC_ROUNDS`] dispatched rounds the arm fires:
   /// the round counter resets so the next idle stretch arms again. An
   /// in-flight walk keeps its continuation — every pass already starts
@@ -726,7 +783,7 @@ impl PeerPageCursor {
   /// range; a continuation round still skips the comparison entirely —
   /// an in-flight pass always sends.
   pub(crate) fn page_round(&mut self, fingerprint: u64) -> PageRound {
-    if self.page.is_some() {
+    if self.page.is_some() || !self.in_flight.is_empty() {
       return PageRound::Send;
     }
     let due =
@@ -745,23 +802,102 @@ impl PeerPageCursor {
     self.rounds_since_full = self.rounds_since_full.saturating_add(1);
   }
 
-  /// Records one dispatched page: advances the continuation cursor,
-  /// remembers where the page started (for a single-page re-send on
-  /// delivery failure), and resets the page resend cadence.
-  pub(crate) fn record_send(&mut self, next_cursor: Option<&[u8]>) {
-    self.page_start = self.page.take();
-    self.page = next_cursor.map(|value| value.to_vec());
+  /// The room left in the page pipeline: a peer carries at most
+  /// [`Self::PIPELINE_PAGES`] unsettled pages, so one slow or lost
+  /// acknowledgement cannot truncate the pass before its later pages —
+  /// the head-of-line truncation the starvation gate caught.
+  pub(crate) fn page_room(&self) -> bool {
+    self.in_flight.len() < Self::PIPELINE_PAGES
+  }
+
+  /// Whether the head page failed its verdict and must re-send: the
+  /// failed entry stays in the window as the commit barrier until a
+  /// retry delivers, and the retry takes the tick's dispatch.
+  pub(crate) fn page_head_retry(&self) -> bool {
+    matches!(
+      self.in_flight.front().map(|head| head.delivered),
+      Some(Some(false))
+    )
+  }
+
+  /// Pops the failed head entry for a retry: the caller re-emits the
+  /// page from the entry's start and re-arms the window through
+  /// [`Self::page_accept`] (or re-pushes it through
+  /// [`Self::page_repush_failed`] when the wire rejects the retry).
+  /// The entry keeps its sequence: its verdict is already settled, so
+  /// the retry's re-armed entry reuses it without conflict.
+  pub(crate) fn page_pop_failed_head(&mut self) -> Option<SyncPageInFlight<Vec<u8>>> {
+    if !self.page_head_retry() {
+      return None;
+    }
+    self.in_flight.pop_front()
+  }
+
+  /// Re-arms a failed head entry whose retry dispatch was rejected by
+  /// the wire: the barrier stays, unchanged, for the next round's
+  /// retry.
+  pub(crate) fn page_repush_failed(&mut self, mut entry: SyncPageInFlight<Vec<u8>>) {
+    entry.delivered = Some(false);
+    self.in_flight.push_front(entry);
+  }
+
+  /// Reserves the next page's sequence and start: called when the page
+  /// bytes are emitted, before the wire accepts them. A rejected
+  /// dispatch simply drops the reservation — nothing entered the
+  /// window, so the next round re-emits from the same position.
+  pub(crate) fn page_reserve(&mut self) -> (u64, Option<Vec<u8>>) {
+    let seq = self.seq;
+    self.seq += 1;
+    let start = self.continuation().map(|value| value.to_vec());
+    (seq, start)
+  }
+
+  /// Lands a dispatched page in the window (wire accepted, verdict
+  /// pending).
+  pub(crate) fn page_accept(
+    &mut self, seq: u64, start: Option<Vec<u8>>, continuation: Option<Vec<u8>>,
+  ) {
+    self.in_flight.push_back(SyncPageInFlight {
+      seq,
+      start,
+      cursor: continuation,
+      delivered: None,
+    });
     self.ticks_since_page_send = 0;
   }
 
-  /// Rewinds the continuation to the start of the undelivered page: the
-  /// next round re-sends exactly that page — acked predecessors stay
-  /// delivered — and the forced resend-due state makes the retry fire on
-  /// the next tick even on an otherwise quiet peer. A failure on the
-  /// first page of a pass rewinds to scratch.
-  pub(crate) fn discard_progress(&mut self) {
-    self.page = self.page_start.take();
-    self.ticks_since_page_send = Self::PAGE_RESEND_TICKS;
+  /// Folds one settled verdict into the window and advances the
+  /// committed cursor across the consecutive-delivered prefix: a later
+  /// page's delivery never claims an earlier lost page's range, and a
+  /// failed head page stays as the retry barrier. Each delivered page
+  /// re-arms the resend cadence.
+  pub(crate) fn page_settle(&mut self, seq: u64, delivered: bool) {
+    if let Some(entry) = self.in_flight.iter_mut().find(|entry| entry.seq == seq) {
+      entry.delivered = Some(delivered);
+    }
+    while matches!(
+      self.in_flight.front().map(|head| head.delivered),
+      Some(Some(true))
+    ) {
+      if let Some(head) = self.in_flight.pop_front() {
+        match head.cursor {
+          Some(cursor) => {
+            self.page = Some(cursor);
+            self.ticks_since_page_send = 0;
+          }
+          None => {
+            // The pass end delivered: the catalog is fully dispatched
+            // and admitted. Anything still in the window sits behind
+            // the end and is subsumed by it (the periodic full-pass
+            // arm bounds any pending retry the end subsumed).
+            self.page = None;
+            self.in_flight.clear();
+            self.ticks_since_page_send = 0;
+            return;
+          }
+        }
+      }
+    }
   }
 
   /// Advances the full-pass counter after one dispatched round (a round
@@ -770,9 +906,15 @@ impl PeerPageCursor {
     self.rounds_since_full = self.rounds_since_full.saturating_add(1);
   }
 
-  /// The continuation cursor the next emit resumes from.
+  /// The continuation cursor the next emit resumes from: the tail of
+  /// the in-flight window (a mid-pass dispatch position) or the
+  /// committed cursor (a fresh page).
   pub(crate) fn continuation(&self) -> Option<&[u8]> {
-    self.page.as_deref()
+    self
+      .in_flight
+      .back()
+      .and_then(|entry| entry.cursor.as_deref())
+      .or(self.page.as_deref())
   }
 }
 
