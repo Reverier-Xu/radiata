@@ -773,16 +773,18 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
         // Name absent identities: diff each straggler's member ids
         // against a converged reference node's set, so a missing row
         // names itself instead of hiding behind a count.
-        let reference_ids = indices
-          .iter()
-          .find(|index| !stragglers.contains(index))
-          .map(|index| {
-            member_views(&slots[*index])
-              .await
-              .into_iter()
-              .map(|member| member.node_id().clone())
-              .collect::<std::collections::BTreeSet<NodeId>>()
-          });
+        let reference_ids =
+          if let Some(index) = indices.iter().find(|index| !stragglers.contains(index)) {
+            Some(
+              member_views(&slots[*index])
+                .await
+                .into_iter()
+                .map(|member| member.node_id().clone())
+                .collect::<std::collections::BTreeSet<NodeId>>(),
+            )
+          } else {
+            None
+          };
         let views = member_views(slot).await;
         let ids: std::collections::BTreeSet<NodeId> = views
           .iter()
