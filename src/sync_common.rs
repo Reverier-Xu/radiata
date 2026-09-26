@@ -293,19 +293,21 @@ pub(crate) async fn delivered_within_bound(
 }
 
 /// The bounded wait for one sync payload's admission acknowledgement:
-/// long enough to cover a healthy round trip on a loaded session, short
-/// enough that one unreachable peer cannot stall the anti-entropy tick
-/// beyond a small multiple of its cadence.
+/// long enough to cover a legitimate admission on the slowest supported
+/// deployment — the receiver's admission is a durable commit, and a
+/// single-core sixty-four-peer reference mesh pushes that latency past
+/// a couple of seconds, where a shorter bound fails the same page's
+/// verdict every round and strands its range.
 ///
-/// Known margin: on a starved single-core runner the routed ack can
-/// exceed this bound, and a trust pass then retries its head page while
-/// later pages wait — the pass truncates until an ack gets through (the
-/// diagnostics name the affected roster). A longer global bound is not
-/// the answer: it uniformly slows every sync-bound phase (measured: the
-/// sixty-four-node lane stopped reaching its convergence waits at all).
-/// The structural repair is receiver-side cursor evidence, not a bigger
-/// timer.
-pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// The original two-second value existed to keep the anti-entropy tick
+/// from stalling on one unreachable peer; the rounds now settle their
+/// verdicts off the tick path and gate dispatch through bounded
+/// windows, so the bound only decides how long an affected plane stays
+/// in flight before its retry — it can cover starved-runner commits
+/// without stalling anything. If admission latency ever grows with
+/// scale, the structural answer is receiver-side cursor evidence (a
+/// pull-based repair), not a larger timer.
+pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {

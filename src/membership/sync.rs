@@ -1074,19 +1074,38 @@ async fn membership_sync_tick_peer(
     // The failed head page takes this tick's dispatch: re-emit from its
     // own start and re-arm its window entry (same sequence — its
     // verdict is already settled). The popped entry is held for the
-    // re-push when the wire rejects the retry.
+    // re-push when the wire rejects the retry OR when the emit itself
+    // fails — losing it would strand the page's range behind a
+    // vanished barrier.
     if let Some(entry) = state.page.page_pop_failed_head() {
-      let page =
+      let emitted =
         page_sync::emit_page_from_snapshot(catalog, entry.start.as_deref(), DEFAULT_PAGE_LIMIT)
-          .await?;
+          .await;
+      let page = match emitted {
+        Ok(page) => page,
+        Err(error) => {
+          state.page.page_repush_failed(entry);
+          return Err(error);
+        }
+      };
       let continuation = page.cursor().map(|value| value.to_vec());
+      let encoded = page
+        .encode()
+        .and_then(|bytes| SyncPayload::Page(ByteVec::from(bytes)).encode());
+      let bytes = match encoded {
+        Ok(bytes) => bytes,
+        Err(error) => {
+          state.page.page_repush_failed(entry);
+          return Err(error);
+        }
+      };
       page_reserved = Some(PageReservation {
         seq: entry.seq,
         start: entry.start.clone(),
         continuation,
       });
       page_retry_entry = Some(entry);
-      page_bytes = Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?);
+      page_bytes = Some(bytes);
     }
   } else if page_due {
     let (seq, start) = state.page.page_reserve();
