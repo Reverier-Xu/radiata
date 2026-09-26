@@ -25,9 +25,10 @@ use crate::{
       TRUST_BINDINGS_PAGE_LIMIT, accept_snapshot, refresh_issuer_snapshot, store as trust_store,
     },
   },
-  membership::page::{MembershipPage, sync as page_sync},
+  membership::page::{DEFAULT_PAGE_LIMIT, MembershipPage, sync as page_sync},
   runtime::RuntimeClient,
   session::stream::SessionTable,
+  sync_common::SyncPageInFlight,
 };
 
 /// The canonical protocol tag of the membership sync stream.
@@ -600,7 +601,7 @@ pub(crate) struct PeerSyncState {
   /// receiver adopts per binding, idempotently), so one slow or lost
   /// acknowledgement cannot truncate the pass before its later pages —
   /// the head-of-line stall the starvation gate caught.
-  trust_in_flight: std::collections::VecDeque<TrustPageInFlight>,
+  trust_in_flight: std::collections::VecDeque<crate::sync_common::SyncPageInFlight<NodeId>>,
   /// The dispatch position of the trust pass: the keyset cursor the
   /// next page pages from. Runs ahead of `snapshot_cursor` (the
   /// committed position) while pages are in flight.
@@ -671,31 +672,15 @@ struct SnapshotPageDispatch {
 /// the peer, whose adoption is per binding and idempotent.
 const TRUST_PIPELINE_PAGES: usize = 2;
 
-/// One dispatched trust page awaiting its delivery verdict, in dispatch
-/// order. The committed cursor advances to `cursor` only when every
-/// earlier page in the window delivered (a later page's continuation
-/// must never claim an earlier lost page's range); a failed head page
-/// rewinds the dispatch position to `start` for its retry while the
-/// rest of the window keeps flowing.
-#[derive(Debug)]
-struct TrustPageInFlight {
-  seq: u64,
-  start: Option<NodeId>,
-  cursor: Option<NodeId>,
-  delivered: Option<bool>,
-}
-
-/// The planes of one peer's previous round whose delivery verdicts are
-/// still unresolved. An in-flight plane skips this round's dispatch for
-/// that peer: the previous dispatch's cursor state is neither committed
-/// nor rewound yet, so a second dispatch could double-send a page the
-/// pending verdict is about to rewind. The verdict resolves within
-/// [`crate::sync_common::SEND_ACK_WAIT`], so the skip costs at most one
-/// interval.
+/// The peers of one round whose tombstone verdicts are still
+/// unresolved: tombstones are the one plane without per-payload window
+/// state (their cadence re-arms only when every tombstone of the round
+/// delivered), so an in-flight round skips tombstone forwarding for
+/// that peer. The page and trust planes gate themselves through their
+/// own windows.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PeerPlanesInFlight {
   pub(crate) tombstones: bool,
-  pub(crate) pages: bool,
 }
 
 /// Per-peer in-flight planes, consulted by the next round's dispatch.
@@ -714,6 +699,7 @@ pub(crate) struct MembershipPendingRound {
   )>,
   page_acks: Vec<(
     NodeId,
+    u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )>,
   trust_pages: Vec<(NodeId, SnapshotPageDispatch)>,
@@ -726,9 +712,6 @@ impl MembershipPendingRound {
     let mut in_flight = InFlightRounds::new();
     for (peer, _) in &self.tombstone_acks {
       in_flight.entry(peer.clone()).or_default().tombstones = true;
-    }
-    for (peer, _) in &self.page_acks {
-      in_flight.entry(peer.clone()).or_default().pages = true;
     }
     in_flight
   }
@@ -744,9 +727,15 @@ impl MembershipPendingRound {
       futures_util::future::join_all(self.tombstone_acks.into_iter().map(
         |(peer, ack)| async move { (peer, crate::sync_common::delivered_within_bound(ack).await) },
       )),
-      futures_util::future::join_all(self.page_acks.into_iter().map(|(peer, ack)| async move {
-        (peer, crate::sync_common::delivered_within_bound(ack).await)
-      })),
+      futures_util::future::join_all(self.page_acks.into_iter().map(
+        |(peer, seq, ack)| async move {
+          (
+            peer,
+            seq,
+            crate::sync_common::delivered_within_bound(ack).await,
+          )
+        },
+      )),
       futures_util::future::join_all(self.trust_pages.into_iter().map(|(peer, page)| async move {
         let delivered = crate::sync_common::delivered_within_bound(page.ack).await;
         (peer, page.seq, delivered)
@@ -762,24 +751,14 @@ impl MembershipPendingRound {
       let entry = tombstone_rounds.entry(peer).or_insert(true);
       *entry &= delivered;
     }
-    // A failed page verdict rewinds that peer's page cursor: the next
-    // round re-sends exactly the failed page's range.
-    let mut page_rewinds = std::collections::BTreeSet::new();
-    for (peer, delivered) in page_verdicts {
-      if !delivered {
-        page_rewinds.insert(peer);
-      }
-    }
-    // The trust page resolves to its own verdict, never the peer-level
-    // OR over the round: a round dispatches several payloads per peer
-    // (trust page, tombstones, descriptor page), and another payload's
-    // ack says nothing about the trust page. Every verdict — delivered
-    // or not — folds into the peer's in-flight window; the prefix rule
-    // decides what the committed cursor may claim.
+    // A failed page verdict stays in the peer's window as the retry
+    // barrier: later pages keep flowing (their application is per
+    // record and idempotent) while the committed cursor never claims
+    // the failed page's range.
     MembershipRoundEffects {
-      page_rewinds,
       tombstone_rounds,
       trust_verdicts,
+      page_verdicts,
     }
   }
 }
@@ -787,9 +766,9 @@ impl MembershipPendingRound {
 /// The verdict effects of one dispatched round, ready to apply to the
 /// cursors.
 pub(crate) struct MembershipRoundEffects {
-  page_rewinds: std::collections::BTreeSet<NodeId>,
   tombstone_rounds: std::collections::BTreeMap<NodeId, bool>,
   trust_verdicts: Vec<(NodeId, u64, bool)>,
+  page_verdicts: Vec<(NodeId, u64, bool)>,
 }
 
 /// Applies one settled round's verdict effects to the cursors: an
@@ -802,11 +781,6 @@ pub(crate) struct MembershipRoundEffects {
 pub(crate) fn apply_round_effects(
   cursors: &mut MembershipSyncCursors, effects: MembershipRoundEffects,
 ) {
-  for peer in effects.page_rewinds {
-    if let Some(state) = cursors.peers.get_mut(&peer) {
-      state.page.discard_progress();
-    }
-  }
   for (peer, tombstones_delivered) in effects.tombstone_rounds {
     if tombstones_delivered && let Some(state) = cursors.peers.get_mut(&peer) {
       state.ticks_since_tombstone_send = 0;
@@ -822,6 +796,11 @@ pub(crate) fn apply_round_effects(
     {
       entry.delivered = Some(delivered);
       touched.insert(peer);
+    }
+  }
+  for peer in effects.page_verdicts {
+    if let Some(state) = cursors.peers.get_mut(&peer.0) {
+      state.page.page_settle(peer.1, peer.2);
     }
   }
   for peer in touched {
@@ -894,14 +873,22 @@ struct MembershipPeerRound {
   /// delivered set re-arms the tombstone resend cadence.
   tombstone_acks: Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
   /// The descriptor page's admission receiver, set only when a page was
-  /// due and dispatched; its verdict rewinds the page cursor on failure.
-  page_ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
-  /// True when a page payload was due and handed to dispatch: a `None`
-  /// `page_ack` beside it means the dispatch was rejected and the page
-  /// cursor must rewind. A quiet page sets neither.
-  page_dispatched: bool,
+  /// due and dispatched; its verdict commits or rewinds the page cursor
+  /// through the peer's window. A `None` beside dispatched bytes means
+  /// the wire rejected the page: no window entry landed, and the
+  /// derived dispatch position re-emits the page next round.
+  page_dispatch: Option<SnapshotPageDispatch>,
   snapshot_page: Option<SnapshotPageDispatch>,
   dispatched: bool,
+}
+
+/// One page dispatch reservation: the sequence and start handed to the
+/// wire plus the freshly computed continuation, everything needed to
+/// land the window entry once the wire accepts the page.
+struct PageReservation {
+  seq: u64,
+  start: Option<Vec<u8>>,
+  continuation: Option<Vec<u8>>,
 }
 
 /// One per-peer membership anti-entropy step, mirroring the resource
@@ -933,9 +920,12 @@ async fn membership_sync_tick_peer(
   // driver's skip-on-overrun behavior the tick period itself grew with
   // the mesh size.
   let page_round = state.page.page_round(catalog_fingerprint);
-  // An in-flight page plane skips this round's dispatch: its continuation
-  // is not committed or rewound until the pending verdict lands.
-  let page_due = page_round == crate::sync_common::PageRound::Send && !planes.pages;
+  // The page plane pipelines up to two pages per peer (the window lives
+  // in the cursor and gates itself): a failed head page retries this
+  // tick while later pages keep flowing behind it.
+  let page_head_retry = state.page.page_head_retry();
+  let page_due = (page_round == crate::sync_common::PageRound::Send && state.page.page_room())
+    || page_head_retry;
   // A snapshot pass is due for this peer when its revision advanced past
   // what this peer last fully received, or on the slow resend cadence.
   // Tombstones ride their own cadence against the same revision marker:
@@ -1005,12 +995,14 @@ async fn membership_sync_tick_peer(
         // The snapshot shrank past this page's start between dispatch
         // and retry: re-arm the entry unchanged, the completion rule
         // will close the pass when the window drains.
-        state.trust_in_flight.push_front(TrustPageInFlight {
-          seq: head.seq,
-          start: head.start,
-          cursor: head.cursor,
-          delivered: None,
-        });
+        state
+          .trust_in_flight
+          .push_front(crate::sync_common::SyncPageInFlight {
+            seq: head.seq,
+            start: head.start,
+            cursor: head.cursor,
+            delivered: None,
+          });
       }
     }
   } else if trust_due
@@ -1070,25 +1062,45 @@ async fn membership_sync_tick_peer(
     state.page.quiet_tick();
     return Ok(MembershipPeerRound {
       tombstone_acks: Vec::new(),
-      page_ack: None,
-      page_dispatched: false,
+      page_dispatch: None,
       snapshot_page: None,
       dispatched: false,
     });
   }
-  let page_bytes = if page_due {
-    let page = page_sync::emit_page_from_snapshot(
-      catalog,
-      state.page.continuation(),
-      crate::membership::page::DEFAULT_PAGE_LIMIT,
-    )
-    .await?;
-    state.page.record_send(page.cursor());
-    Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?)
-  } else {
-    None
-  };
-  let (tombstone_acks, page_ack, snapshot_ack) = dispatch_to_peer(
+  let mut page_bytes: Option<Vec<u8>> = None;
+  let mut page_reserved: Option<PageReservation> = None;
+  let mut page_retry_entry: Option<SyncPageInFlight<Vec<u8>>> = None;
+  if page_head_retry {
+    // The failed head page takes this tick's dispatch: re-emit from its
+    // own start and re-arm its window entry (same sequence — its
+    // verdict is already settled). The popped entry is held for the
+    // re-push when the wire rejects the retry.
+    if let Some(entry) = state.page.page_pop_failed_head() {
+      let page =
+        page_sync::emit_page_from_snapshot(catalog, entry.start.as_deref(), DEFAULT_PAGE_LIMIT)
+          .await?;
+      let continuation = page.cursor().map(|value| value.to_vec());
+      page_reserved = Some(PageReservation {
+        seq: entry.seq,
+        start: entry.start.clone(),
+        continuation,
+      });
+      page_retry_entry = Some(entry);
+      page_bytes = Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?);
+    }
+  } else if page_due {
+    let (seq, start) = state.page.page_reserve();
+    let page =
+      page_sync::emit_page_from_snapshot(catalog, start.as_deref(), DEFAULT_PAGE_LIMIT).await?;
+    let continuation = page.cursor().map(|value| value.to_vec());
+    page_reserved = Some(PageReservation {
+      seq,
+      start,
+      continuation,
+    });
+    page_bytes = Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?);
+  }
+  let (tombstone_acks, page_dispatched_ack, snapshot_ack) = dispatch_to_peer(
     peer,
     snapshot_page.as_deref(),
     &tombstone_payloads,
@@ -1104,7 +1116,7 @@ async fn membership_sync_tick_peer(
   // round's retry.
   let snapshot_page = match (snapshot_page, snapshot_ack, reserved) {
     (Some(_), Some(ack), Some((seq, start, continuation))) => {
-      state.trust_in_flight.push_back(TrustPageInFlight {
+      state.trust_in_flight.push_back(SyncPageInFlight {
         seq,
         start,
         cursor: continuation,
@@ -1123,10 +1135,34 @@ async fn membership_sync_tick_peer(
     // cannot arise — the reservation is made when the bytes are.
     (..) => None,
   };
+  // The page plane's window entry lands only on an accepted dispatch
+  // too: a rejected fresh page never entered the window (the derived
+  // dispatch position re-emits it next round), and a rejected retry
+  // re-arms its barrier entry unchanged.
+  let page_dispatch = match (page_bytes.is_some(), page_dispatched_ack, page_reserved) {
+    (true, Some(ack), Some(reservation)) => {
+      state
+        .page
+        .page_accept(reservation.seq, reservation.start, reservation.continuation);
+      Some(SnapshotPageDispatch {
+        seq: reservation.seq,
+        ack,
+      })
+    }
+    (true, None, Some(_)) => {
+      // A rejected retry re-arms its barrier entry unchanged; a rejected
+      // fresh page never entered the window (the derived dispatch
+      // position re-emits it next round).
+      if let Some(entry) = page_retry_entry {
+        state.page.page_repush_failed(entry);
+      }
+      None
+    }
+    (..) => None,
+  };
   Ok(MembershipPeerRound {
     tombstone_acks,
-    page_dispatched: page_bytes.is_some(),
-    page_ack,
+    page_dispatch,
     snapshot_page,
     dispatched: true,
   })
@@ -1263,16 +1299,10 @@ pub(crate) async fn sync_tick(
   )> = Vec::new();
   let mut pending_page_acks: Vec<(
     NodeId,
+    u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
   let mut pending_trust_pages: Vec<(NodeId, SnapshotPageDispatch)> = Vec::new();
-  // The descriptor page's own failures: an undelivered page or a
-  // rejected page dispatch rewinds that peer's page cursor to the
-  // failed page's start. The rewind is page-plane-scoped by contract —
-  // a failed trust or tombstone payload says nothing about the page
-  // plane, and rewinding the page cursor beside it used to force a full
-  // catalog re-send on the next round.
-  let mut page_rewinds: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
   for peer in &peers {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let round = membership_sync_tick_peer(
@@ -1294,18 +1324,14 @@ pub(crate) async fn sync_tick(
     }
     let MembershipPeerRound {
       tombstone_acks,
-      page_ack,
-      page_dispatched,
+      page_dispatch,
       snapshot_page,
       ..
     } = round;
-    if tombstone_acks.is_empty() && page_ack.is_none() && snapshot_page.is_none() {
+    if tombstone_acks.is_empty() && page_dispatch.is_none() && snapshot_page.is_none() {
       // Nothing was queued (the routing queue rejected outright): the
-      // round never left this node. A due-but-rejected page rewinds to
-      // its start so the next round re-sends exactly that page.
-      if page_dispatched {
-        page_rewinds.insert(peer.clone());
-      }
+      // round never left this node. A rejected page never entered its
+      // window, so the derived dispatch position re-emits it next round.
       continue;
     }
     state.page.count_round();
@@ -1316,22 +1342,9 @@ pub(crate) async fn sync_tick(
       pending_trust_pages.push((peer.clone(), page));
     }
     pending_tombstone_acks.extend(tombstone_acks.into_iter().map(|ack| (peer.clone(), ack)));
-    if let Some(ack) = page_ack {
-      pending_page_acks.push((peer.clone(), ack));
-    } else if page_dispatched {
-      // The descriptor page was due but its dispatch was rejected while
-      // a sibling leg dispatched: the page cursor already advanced past
-      // the emitted range, so without a rewind the skipped range would
-      // wait for the full-pass arm. Rewind to the page's start — the
-      // next round re-sends exactly that page.
-      page_rewinds.insert(peer.clone());
-    }
-  }
-  // Synchronous page-plane rejections rewind now: their failure is
-  // already known, no verdict to await.
-  for peer in page_rewinds {
-    if let Some(state) = cursors.peers.get_mut(&peer) {
-      state.page.discard_progress();
+    if let Some(page_dispatch) = page_dispatch {
+      let SnapshotPageDispatch { seq, ack } = page_dispatch;
+      pending_page_acks.push((peer.clone(), seq, ack));
     }
   }
   gc_collected_tombstones(store, entropy).await;
