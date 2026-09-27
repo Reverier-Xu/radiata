@@ -151,10 +151,10 @@ async fn resource_crash_child_entry() {
   let factory: Arc<dyn StorageFactory> = Arc::new(JsonStoreFactory::new(directory));
   // The parent seeds the register before spawning this process; opening a
   // fresh store here would crash inside the seed commit instead of the
-  // child's own routed-record transaction.
-  let store = MetadataStore::open(&factory, Duration::from_secs(10))
-    .await
-    .unwrap();
+  // child's own routed-record transaction. The open retries the
+  // cross-process lock window: a bare open racing the parent's release
+  // would panic the child before its scripted crash point.
+  let store = crate::storage::test_util::crash_reopen::open_store_with_lock_retry(&factory).await;
   let outcome = commit_record_ctx(&store, &SeedEntropy(CHILD_ENTROPY_SEED), &new_record())
     .await
     .unwrap();
@@ -328,9 +328,9 @@ async fn resource_delete_child_entry() {
   crate::storage::json::select_crash_point(point);
   let directory = std::path::PathBuf::from(_directory);
   let factory: Arc<dyn StorageFactory> = Arc::new(JsonStoreFactory::new(directory));
-  let store = MetadataStore::open(&factory, Duration::from_secs(10))
-    .await
-    .unwrap();
+  // The parent seeded the register and released it; retry the release
+  // window instead of panicking before the scripted crash point.
+  let store = crate::storage::test_util::crash_reopen::open_store_with_lock_retry(&factory).await;
   drop(store);
   let provider = factory.open(requirements()).await.unwrap();
   let snapshot = provider.snapshot().await.unwrap();

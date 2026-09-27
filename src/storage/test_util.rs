@@ -100,8 +100,18 @@ pub(crate) mod crash_reopen {
 
   use crate::{ErrorKind, provider::StorageFactory};
 
-  /// Opens the store retrying the cross-process lock window. Its
-  /// callers (the resource and revocation crash matrices) are unix-only.
+  /// Opens the store retrying the cross-process lock window: the
+  /// crashed child releases its lock when the process dies, but a
+  /// loaded or overlay-filesystem runner may schedule the reopen before
+  /// the release lands. Parents AND crash children reopen through this,
+  /// never through a bare open — a bare open in a child aborts it
+  /// before its scripted crash point, which the crash matrices read as
+  /// a spurious abort and report as a non-monotonic boundary.
+  ///
+  /// Unix-gated with its callers: every store-level crash matrix is
+  /// unix-only (its children need the directory-barrier crash hooks),
+  /// while the provider-level twin below is used by the all-platform
+  /// adapter children.
   #[cfg(all(test, unix))]
   pub(crate) async fn open_store_with_lock_retry(
     factory: &Arc<dyn StorageFactory>,

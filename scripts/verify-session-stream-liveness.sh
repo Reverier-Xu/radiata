@@ -25,12 +25,12 @@ require_nonempty_tests() {
 }
 
 # Queue bounds lane.
-cargo test --locked --lib session::stream::queue_tests -- --list > "$TMP/queue.list"
+cargo test --locked --lib session::queue::queue_tests -- --list > "$TMP/queue.list"
 require_nonempty_tests session_queue "$TMP/queue.list"
-cargo test --locked --lib session::stream::queue_tests
+cargo test --locked --lib session::queue::queue_tests
 
 # Wall-clock liveness lane.
-cargo test --locked --lib session::stream::liveness_tests
+cargo test --locked --lib session::liveness::liveness_tests
 
 # Shutdown completion lane.
 cargo test --locked --test secure_join secure_join_shutdown_rejects_new_work_after_drain
