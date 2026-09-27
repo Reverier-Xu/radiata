@@ -21,8 +21,6 @@ use crate::{
   storage::{MetadataStore, families::metadata_families},
 };
 
-const RECEIPT_RETENTION: std::time::Duration = std::time::Duration::from_secs(10);
-
 fn json_factory(directory: &std::path::Path) -> Arc<dyn StorageFactory> {
   Arc::new(crate::storage::json::JsonStoreFactory::new(
     directory.to_path_buf(),
@@ -37,9 +35,9 @@ fn redb_factory(path: &std::path::Path) -> Arc<dyn StorageFactory> {
 }
 
 async fn open_metadata(factory: &Arc<dyn StorageFactory>) -> MetadataStore {
-  MetadataStore::open(factory, RECEIPT_RETENTION)
-    .await
-    .unwrap()
+  // Crash-matrix children and parents both arrive here right after a
+  // process released the store: retry the cross-process release window.
+  crate::storage::test_util::crash_reopen::open_store_with_lock_retry(factory).await
 }
 
 /// The logical families: every domain except the storage-internal receipt

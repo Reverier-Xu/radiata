@@ -51,7 +51,14 @@ async fn json_crash_child_entry() {
     .expect("numeric crash point");
   super::store::select_crash_point(point);
   let factory: Arc<dyn StorageFactory> = Arc::new(JsonStoreFactory::new(directory.into()));
-  let storage = factory.open(requirements()).await.unwrap();
+  // The parent released the store before spawning this process: retry
+  // the cross-process release window instead of panicking before the
+  // scripted crash point.
+  let storage = crate::storage::test_util::crash_reopen::open_provider_with_lock_retry(
+    &factory,
+    requirements(),
+  )
+  .await;
   let base = storage.snapshot().await.unwrap().revision().clone();
   let outcome = storage.commit(child_transaction(base)).await.unwrap();
   match outcome {

@@ -534,7 +534,7 @@ mod tests {
 /// binding — and that the child's transaction reconciles consistently.
 #[cfg(all(test, unix, any(feature = "json", feature = "redb")))]
 mod crash {
-  use std::{sync::Arc, time::Duration};
+  use std::sync::Arc;
 
   use tempfile::TempDir;
 
@@ -708,9 +708,10 @@ mod crash {
     let backend = std::env::var(CRASH_BACKEND_ENV).unwrap_or_else(|_| "json".to_owned());
     select_point(&backend, point);
     let factory = factory(&backend, &std::path::PathBuf::from(directory));
-    let store = MetadataStore::open(&factory, Duration::from_secs(10))
-      .await
-      .unwrap();
+    // The parent seeded and released the store; retry the cross-process
+    // release window instead of panicking before the scripted crash
+    // point (the same reopen policy the matrix's parent side uses).
+    let store = crate::storage::test_util::crash_reopen::open_store_with_lock_retry(&factory).await;
     match revoke_binding_ctx(
       &store,
       &SeedEntropy(CHILD_ENTROPY_SEED),

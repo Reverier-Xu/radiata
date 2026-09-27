@@ -936,8 +936,13 @@ mod crash_tests {
     let factory: Arc<dyn StorageFactory> = Arc::new(crate::storage::json::JsonStoreFactory::new(
       directory.into(),
     ));
-    let storage: Arc<dyn Storage> =
-      Arc::from(factory.open(StoreRequirements::metadata()).await.unwrap());
+    let storage: Arc<dyn Storage> = Arc::from(
+      crate::storage::test_util::crash_reopen::open_provider_with_lock_retry(
+        &factory,
+        StoreRequirements::metadata(),
+      )
+      .await,
+    );
     seed_base_and_legacy(&*storage).await;
     crate::storage::json::select_crash_point(point);
     registry_one_edge().ensure_schema(&*storage).await.unwrap();
@@ -992,8 +997,13 @@ mod crash_tests {
       .build()
       .unwrap();
     runtime.block_on(async move {
-      let storage: Arc<dyn Storage> =
-        Arc::from(factory.open(StoreRequirements::metadata()).await.unwrap());
+      let storage: Arc<dyn Storage> = Arc::from(
+        crate::storage::test_util::crash_reopen::open_provider_with_lock_retry(
+          &factory,
+          StoreRequirements::metadata(),
+        )
+        .await,
+      );
       seed_base_and_legacy(&*storage).await;
       crate::storage::redb::select_crash_point(point);
       registry_one_edge().ensure_schema(&*storage).await.unwrap();

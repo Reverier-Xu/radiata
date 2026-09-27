@@ -1294,14 +1294,30 @@ mod crash {
       parent_keys
     };
     let entropy = Arc::new(SequenceEntropy::starting_at(entropy_offset));
-    let context = lifecycle::open_local_identity(
-      factory,
-      Some(&keys.as_provider()),
-      entropy.as_ref(),
-      Duration::from_secs(10),
-    )
-    .await
-    .unwrap();
+    // Crash-matrix children open right after the parent released the
+    // store: retry the cross-process release window instead of failing
+    // before the scripted crash point.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let context = loop {
+      match lifecycle::open_local_identity(
+        factory,
+        Some(&keys.as_provider()),
+        entropy.as_ref(),
+        Duration::from_secs(10),
+      )
+      .await
+      {
+        Ok(context) => break context,
+        Err(error) if error.kind() == crate::ErrorKind::StorageLocked => {
+          assert!(
+            std::time::Instant::now() < deadline,
+            "identity store lock never released: {error:?}"
+          );
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(error) => panic!("identity open failed: {error:?}"),
+      }
+    };
     (keys, entropy, context)
   }
 
