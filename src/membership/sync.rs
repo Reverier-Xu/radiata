@@ -405,7 +405,19 @@ async fn accept_payload(
       }
       // The writer exclusion serializes the persist against every other
       // store writer, so terminal evidence cannot be dropped on contention.
-      crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await?;
+      // A persist failure must be attributable at the apply site: the
+      // sender keeps forwarding the record (the resend cadence heals), so
+      // an unlogged failure here looks like a receiver-side roster stall.
+      if let Err(error) =
+        crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await
+      {
+        tracing::debug!(
+          node = %record.node(),
+          kind = ?error.kind(),
+          "leave record persist failed"
+        );
+        return Err(error);
+      }
       crate::audit::leave_record_persisted(record.node().as_str());
       member_changed(events, revision, record.node().clone());
       let receipt = SyncPayload::LeaveApplied {
@@ -1634,6 +1646,101 @@ mod tests {
         .await
         .is_err(),
       "without a fresh bump the next wait parks"
+    );
+  }
+
+  /// Regression: a receiver-side leave persist failure used to surface
+  /// nowhere — the `?` propagated a silent error while the sender kept
+  /// forwarding, so an audit stall (leaver still Active everywhere) could
+  /// not be attributed from the log. The apply site now logs the typed
+  /// failure and propagates it; this lane pins both halves: the payload
+  /// errors, and the store stays without the leave record.
+  #[tokio::test]
+  async fn leave_persist_failure_is_logged_and_propagated_at_the_apply_site() {
+    use crate::identity::{
+      leave::{LeaveRecordV1, sign_leave_record},
+      records::{IdentityBindingV1, identity_binding_key},
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, inject_entry, open_context},
+    };
+
+    // The receiver: a clean reference store whose context applies the
+    // payload; the leaver: an independent identity signing its own record.
+    let (_receiver_reference, receiver_factory) = fresh_reference();
+    let receiver_keys = ScriptedKeys::full_at(9_100);
+    let receiver_entropy = Arc::new(SequenceEntropy::default());
+    let receiver = Arc::new(
+      open_context(&receiver_factory, &receiver_keys, &receiver_entropy)
+        .await
+        .unwrap(),
+    );
+    let (_leaver_reference, leaver_factory) = fresh_reference();
+    let leaver_keys = ScriptedKeys::full_at(9_200);
+    let leaver_entropy = Arc::new(SequenceEntropy::default());
+    let leaver = Arc::new(
+      open_context(&leaver_factory, &leaver_keys, &leaver_entropy)
+        .await
+        .unwrap(),
+    );
+    let record = sign_leave_record(&leaver, &leaver_keys.as_provider())
+      .await
+      .unwrap();
+
+    // The accept path's precondition: the receiver holds the leaver's
+    // trusted binding, so the record passes verification gating and the
+    // failure must come from the persist site, not earlier.
+    let (namespace, key) = identity_binding_key(record.node()).unwrap();
+    let binding = IdentityBindingV1::new(record.node().clone(), record.public_key().clone());
+    inject_entry(
+      &_receiver_reference,
+      (namespace, key),
+      binding.encode().unwrap(),
+    );
+
+    // A divergent body (garbage signature over the recorded node and
+    // key) passes the binding gate and fails inside the persist call:
+    // exactly the failure the apply site must make attributable.
+    let divergent = LeaveRecordV1::new(
+      record.node().clone(),
+      record.public_key().clone(),
+      record.timestamp_millis(),
+      crate::Signature::from_bytes([0x5A; 64]),
+    );
+    let payload = SyncPayload::Leave(minicbor::bytes::ByteVec::from(divergent.encode().unwrap()));
+
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let (packet, _received) = tokio::sync::mpsc::channel(16);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = RuntimeClient::routing_only(packet, routes);
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let leave_applied = LeaveAppliedSignal::new();
+
+    let error = accept_payload(
+      &receiver,
+      Arc::clone(&receiver_entropy) as Arc<dyn Entropy>,
+      &events,
+      &revision,
+      &leave_applied,
+      &sessions,
+      &runtime,
+      record.node(),
+      &payload,
+    )
+    .await
+    .expect_err("the failed persist must fail the payload");
+    assert_ne!(
+      error.kind(),
+      crate::ErrorKind::Internal,
+      "the failure is the persist site's typed error, not an internal fault"
+    );
+    // Nothing landed: the store holds no leave record for the leaver.
+    assert!(
+      !crate::identity::leave::is_left_ctx(receiver.store(), record.node())
+        .await
+        .unwrap(),
+      "the failed persist must not leave a leave record behind"
     );
   }
 
