@@ -107,6 +107,12 @@ pub(crate) mod crash_reopen {
   /// never through a bare open — a bare open in a child aborts it
   /// before its scripted crash point, which the crash matrices read as
   /// a spurious abort and report as a non-monotonic boundary.
+  ///
+  /// Unix-gated with its callers: every store-level crash matrix is
+  /// unix-only (its children need the directory-barrier crash hooks),
+  /// while the provider-level twin below is used by the all-platform
+  /// adapter children.
+  #[cfg(all(test, unix))]
   pub(crate) async fn open_store_with_lock_retry(
     factory: &Arc<dyn StorageFactory>,
   ) -> crate::storage::MetadataStore {
