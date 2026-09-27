@@ -219,10 +219,11 @@ mod tests {
       .await
       .unwrap(),
     );
-    // A short dial deadline: the tick's detached dials against the
-    // unreachable test endpoints fail and release their slots fast.
+    // A dial deadline long enough that the tick's detached dials stay in
+    // flight while the test observes them: they stall in the TLS
+    // handshake against the held silent listener below.
     let config = NodeConfig::new()
-      .with_dial_deadline(std::time::Duration::from_millis(200))
+      .with_dial_deadline(std::time::Duration::from_secs(2))
       .unwrap();
     let mut extensions = ExtensionRegistry::new();
     // The built-in transports the node builder installs: the tick
@@ -289,15 +290,17 @@ mod tests {
   }
 
   /// Installs one active member: trusted binding (injected) plus
-  /// descriptor (committed through the store path) with one unreachable
-  /// endpoint, so the member universe counts it and any dial to it
-  /// fails fast.
-  async fn install_member(supervisor: &Supervisor, reference: &Arc<ReferenceFactory>, seed: u64) {
+  /// descriptor (committed through the store path) with one silently
+  /// held endpoint, so the member universe counts it and any dial to it
+  /// stalls in flight instead of failing before the test can observe it.
+  async fn install_member(
+    supervisor: &Supervisor, reference: &Arc<ReferenceFactory>, seed: u64, port: u16,
+  ) {
     let node = member_id(seed);
     let descriptor = crate::membership::NodeDescriptorV1::new(
       node.clone(),
       member_key(seed),
-      vec![crate::Endpoint::parse("wss://127.0.0.1:1").unwrap()],
+      vec![crate::Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap()],
       1,
       false,
       1,
@@ -327,21 +330,41 @@ mod tests {
     sessions.lock().unwrap().insert(peer, entry);
   }
 
+  /// A silent TCP peer: accepts every connection and holds it open, so a
+  /// wss dial stalls in the TLS handshake until its deadline. The tick's
+  /// in-flight slots are then observable deterministically instead of
+  /// racing a connection-refused failure.
+  async fn silent_peer() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let held: Arc<std::sync::Mutex<Vec<tokio::net::TcpStream>>> =
+      Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handle = tokio::spawn(async move {
+      while let Ok((stream, _)) = listener.accept().await {
+        // Holding the socket is the point: dropping it would reset the
+        // connection and fail the dial early.
+        held.lock().unwrap().push(stream);
+      }
+    });
+    (port, handle)
+  }
+
   /// The maintenance tick's wiring: with one live session and four
   /// dialable members, the derived plan for five nodes is k(5) = 3, so
   /// the tick dials the deficit of two in detached tasks (observed as
   /// in-flight slots), the status view reports the same plan, and the
-  /// slots release once the dials fail against unreachable endpoints.
-  /// With zero sessions the tick must defer to the recovery plane.
+  /// slots release once the dials hit their deadline. With zero sessions
+  /// the tick must defer to the recovery plane.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn maintenance_tick_dials_the_deficit_and_defers_when_offline() {
     let (mut supervisor, reference, entropy, sessions) = maintenance_supervisor().await;
+    let (port, holder) = silent_peer().await;
 
     // Four active members (seeds offset above the supervisor's own
     // deterministic identity space): the cluster size is five
     // including self.
     for seed in 101..=104 {
-      install_member(&supervisor, &reference, seed).await;
+      install_member(&supervisor, &reference, seed, port).await;
     }
 
     // Fully offline: the recovery plane owns the zero-session case.
@@ -358,7 +381,8 @@ mod tests {
     assert_eq!(view.target(), 3, "k(5) = 3 from the shipped degree table");
     assert_eq!(view.state(), crate::ConnectionDegreeState::Unhealthy);
 
-    // One live session: the deficit is two, dialed immediately.
+    // One live session: the deficit is two, dialed immediately and kept
+    // in flight by the silent peer, so the slot count is deterministic.
     insert_live_session(&sessions, member_id(101), entropy.as_ref());
     supervisor.maintenance_tick().await.unwrap();
     let pending = supervisor
@@ -369,9 +393,9 @@ mod tests {
     assert_eq!(view.sessions(), 1);
     assert_eq!(view.state(), crate::ConnectionDegreeState::Unhealthy);
 
-    // The slots release when the dials resolve (refused endpoints), so
-    // a later tick can dial again instead of piling up in-flight work.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // The slots release when the dials hit their deadline, so a later
+    // tick can dial again instead of piling up in-flight work.
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
       loop {
         if supervisor
           .maintenance_pending
@@ -384,7 +408,8 @@ mod tests {
       }
     })
     .await
-    .expect("the failed dials must release their in-flight slots");
+    .expect("the expired dials must release their in-flight slots");
+    holder.abort();
   }
 
   /// The maintenance cadence stays purely local (never a cluster-wide
