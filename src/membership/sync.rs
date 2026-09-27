@@ -596,6 +596,11 @@ pub(crate) async fn ensure_local_descriptor(
 #[derive(Debug, Default)]
 pub(crate) struct MembershipSyncCursors {
   peers: std::collections::BTreeMap<NodeId, PeerSyncState>,
+  /// The rotation continuation point: the last peer the previous round
+  /// served, so consecutive rounds cover the alive set fairly while each
+  /// round's dispatch stays bounded (see
+  /// [`crate::sync_common::SYNC_PEERS_PER_ROUND`]).
+  rotation: Option<NodeId>,
 }
 
 #[derive(Debug, Default)]
@@ -1283,10 +1288,22 @@ pub(crate) async fn sync_tick(
     // including everything written while it was unreachable — on its
     // first tick back.
     cursors.peers.clear();
+    cursors.rotation = None;
     gc_collected_tombstones(store, entropy).await;
     return Ok(None);
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
+  // One round serves a bounded, fair window of the alive set: per-round
+  // dispatch cost is independent of the node's connection degree, so a
+  // dense mesh cannot starve the runtime's shared task; the cursor keeps
+  // every unserved peer's state so the next round resumes after this
+  // window's last peer.
+  let (window, rotation) = crate::sync_common::rotation_window(
+    &peers,
+    cursors.rotation.as_ref(),
+    crate::sync_common::SYNC_PEERS_PER_ROUND,
+  );
+  cursors.rotation = rotation.cloned();
   // One snapshot and one whole-catalog fingerprint per tick: every
   // per-peer round decides against the same immutable view, so a hub
   // with a hundred quiet peers pays one scan per tick, not a hundred
@@ -1334,7 +1351,7 @@ pub(crate) async fn sync_tick(
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
   let mut pending_trust_pages: Vec<(NodeId, SnapshotPageDispatch)> = Vec::new();
-  for peer in &peers {
+  for peer in window.iter().copied() {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let round = membership_sync_tick_peer(
       catalog.as_ref(),
