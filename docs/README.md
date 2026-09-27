@@ -18,10 +18,20 @@ Lifecycle rules:
 
 ## Current documents
 
-None. The `starvation-hardening-plan` cycle (configurable admission
-and authentication bounds, smooth token-bucket merge admission split
-by pool, recovery defaults and jitter, per-hop relay budgets, the
-single recalibrated timing profile, and the one-core starvation CI
-gate) is complete: the plan document was deleted per the lifecycle
-rules and its acceptance evidence lives in the commit history of the
-`starvation-hardening-plan` branch.
+- [`backlog.md`](backlog.md) — the open-work ledger: decisions already
+  made, the scoped items with their evidence, acceptance criteria and
+  guarding gates, and the recorded environmental limits that audits
+  must budget for.
+- [`connectivity-degree-design.md`](connectivity-degree-design.md) —
+  the design input for the connection-degree maintenance item: the
+  Poisson/isolated-vertex degree formula, its table, and the operator
+  override contract.
+
+Completed cycles do not keep their documents here: the
+`starvation-hardening-plan` cycle (configurable admission and
+authentication bounds, smooth token-bucket merge admission split by
+pool, recovery defaults and jitter, per-hop relay budgets, the single
+recalibrated timing profile, the one-core starvation CI gate, and the
+pipelined sync planes that followed) deleted its plan per the lifecycle
+rules, and its acceptance evidence lives in the commit history of the
+`starvation-hardening-plan` and `trust-pass-repair` branches.
