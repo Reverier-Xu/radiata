@@ -42,6 +42,10 @@ BASE_HTTP_PORT = int(os.environ.get("BASE_HTTP_PORT", "19080"))
 N = int(os.environ.get("N", "5"))
 # Container names carry the parallel-mesh prefix (hostnames stay c$i).
 NAME_PREFIX = os.environ.get("NAME_PREFIX", "")
+# The container CLI the harness drives: CONTAINER_ENGINE selects the
+# engine (podman locally, docker in CI); the log and lifecycle flags used
+# here exist in both.
+ENGINE = os.environ.get("CONTAINER_ENGINE", "podman")
 POLL = 0.5
 
 # The hub's fixed merge limiter admits 16 handshakes per source per
@@ -80,8 +84,14 @@ def http(node: int, method: str, path: str, body: dict | None = None, timeout: f
 
 def podman_logs(node: int, since_epoch: float) -> str:
   """The node's container logs newer than `since_epoch` (unix seconds)."""
+  # RFC3339 with sub-second precision: podman accepts a raw unix epoch
+  # but docker does not, and truncation to whole seconds could admit a
+  # pre-operation line into a path assertion.
+  since = datetime.datetime.fromtimestamp(
+    since_epoch, datetime.timezone.utc
+  ).isoformat()
   result = subprocess.run(
-    [ "podman", "logs", "--since", str(int(since_epoch)), f"{NAME_PREFIX}c{node}"],
+    [ENGINE, "logs", "--since", since, f"{NAME_PREFIX}c{node}"],
     capture_output=True,
     text=True,
     check=False,
@@ -96,7 +106,7 @@ def log_stream_stale(node: int, since: float) -> bool:
   path line is unverifiable rather than a violation. A live stream
   always carries at least the operation's own audit lines."""
   result = subprocess.run(
-    ["podman", "logs", "--tail", "1", f"{NAME_PREFIX}c{node}"],
+    [ENGINE, "logs", "--tail", "1", f"{NAME_PREFIX}c{node}"],
     capture_output=True,
     text=True,
     check=False,
@@ -394,7 +404,7 @@ def op_dm(model: Model, rng: random.Random, node: int):
       diagnostics = []
       for peer in sorted({node, 1}):
         logs = subprocess.run(
-          [ "podman", "logs", f"{NAME_PREFIX}c{peer}"], capture_output=True, text=True, check=False
+          [ENGINE, "logs", f"{NAME_PREFIX}c{peer}"], capture_output=True, text=True, check=False
         )
         lines = [
           line for line in (logs.stdout + logs.stderr).splitlines()
@@ -628,7 +638,7 @@ def op_restart(model: Model, rng: random.Random, node: int):
   """SIGKILL-style container restart: sessions drop cluster-wide, the
   store persists, the node heals back in through its persisted identity."""
   del rng
-  subprocess.run(["podman", "kill", f"{NAME_PREFIX}c{node}"], capture_output=True, check=False)
+  subprocess.run([ENGINE, "kill", f"{NAME_PREFIX}c{node}"], capture_output=True, check=False)
   model.alive.discard(node)
   return None, []
 
@@ -637,7 +647,7 @@ def op_start(model: Model, rng: random.Random, node: int):
   """Starts a stopped container; the node rejoins through persisted state.
   Membership is unchanged: a killed member auto-rejoins via recovery, a
   never-merged node stays standalone."""
-  subprocess.run(["podman", "start", f"{NAME_PREFIX}c{node}"], capture_output=True, check=False)
+  subprocess.run([ENGINE, "start", f"{NAME_PREFIX}c{node}"], capture_output=True, check=False)
   model.alive.add(node)
   model.labels.setdefault(node, {})
   return None, []
