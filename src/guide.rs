@@ -401,10 +401,13 @@
 //!   round cluster-wide. The tick dispatches to its peers and settles delivery
 //!   verdicts off the tick path, so a hub's per-tick hold-down stays at the
 //!   dispatch cost rather than the slowest peer's ack bound — the reference
-//!   64-node mesh holds the one-second cadence even on a single slow core. The
-//!   degree-maintenance tick adds bounded work only while a node is below its
-//!   target: nothing while healthy, one deficit-sized dial batch per 30 seconds
-//!   while healing.
+//!   64-node mesh holds the one-second cadence even on a single slow core. Each
+//!   round's dispatch is bounded to a small fair window of the live sessions,
+//!   so the per-round cost is independent of the connection degree: a denser
+//!   node spreads its peers across consecutive rounds instead of bursting once.
+//!   The degree-maintenance tick adds bounded work only while a node is below
+//!   its target: nothing while healthy, one deficit-sized dial batch per 30
+//!   seconds while healing.
 //!
 //! Delivery across restarts stays the application's job (the data
 //! plane is at-most-once): a `Failed` or interrupted stream is a

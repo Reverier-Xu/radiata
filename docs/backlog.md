@@ -65,6 +65,13 @@ evidence lands in the commit history.
   spokes, degree maintenance for the below-target bus members), a
   spoke-to-bus relay crosses the bridged mesh, and the center restarts
   and rejoins through its own healing planes.
+- The anti-entropy planes bound each round's dispatch to a small fair
+  window of the live sessions, so per-round cost is independent of the
+  connection degree. This is the degree plane's load consequence made
+  explicit: the unbounded round starved the runtime's shared task on a
+  single core at the reference scale (the starvation lane wedged at
+  1661 s where `main` passes in 230 s); with the bound the same lane
+  passes in 217 s.
 
 ## Landed earlier (2026-09-27 audit cycle, no action)
 
