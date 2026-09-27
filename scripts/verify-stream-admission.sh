@@ -24,9 +24,11 @@ require_nonempty_tests() {
   fi
 }
 
-# Destination-admission lane: single admission per
-# stream, identical-opening status, conflict fail-closed, saturation
-# prioritisation, and bounded terminal metadata for rejections.
-cargo test --locked --lib session::stream::admission -- --list > "$TMP/adm.list"
+# Destination-admission lane: single admission per stream, identical
+# opening status, conflict fail-closed, and bounded terminal metadata
+# for rejections (the inbound admission contexts), plus saturation
+# prioritisation on the stream's pending-admission bound.
+cargo test --locked --lib session::inbound::admission_tests -- --list > "$TMP/adm.list"
 require_nonempty_tests session_admission "$TMP/adm.list"
-cargo test --locked --lib session::stream::admission
+cargo test --locked --lib session::inbound::admission_tests
+cargo test --locked --lib session::stream::pending_admission_tests

@@ -29,7 +29,7 @@ require_nonempty_tests() {
 # connectivity, retry, expiration, migration, compaction, and URI
 # traversal can never invoke it.
 actual=$(rg -l 'commit_removal_ctx' src --no-filename | sort -u | tr '\n' ' ')
-expected="src/resource/store.rs src/runtime/supervisor.rs "
+expected="src/resource/store.rs src/runtime/resources.rs "
 if [[ $actual != "$expected" ]]; then
   printf 'unexpected commit_removal_ctx callers: %s\n' "$actual" >&2
   exit 1
