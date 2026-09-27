@@ -64,14 +64,14 @@ pub use node::{
   EventOptions, EventReceive, EventSubscription, MemberRevision, NodeBuilder, NodeHandle,
 };
 pub use operation::{
-  ApplyReceiptRetention, CleanupNode, Command, ConnectMember, DisconnectPeer, Event, GetLocalNode,
-  GetMember, GetNodeStatus, GetObservability, GetRecovery, GetResource, GetRoute, IdentityReplaced,
-  IssueCleanupCheckpoint, IssueMergeCredential, LeaveCluster, Listen, MemberChanged, MergeCluster,
-  NodeRevoked, PageListeners, PageMembers, PageResources, PageSessions, PageTopology, PageTrust,
-  PurgeRevocation, PutResource, Query, RecoveryChanged, RemoveResource, ResolveFrozenJournal,
-  ResourceChanged, ResourceWrite, RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound,
-  SelectResources, SessionChanged, Shutdown, StartRecovery, StopListener, UpdateNodeMetadata,
-  WaitForShutdown,
+  ApplyReceiptRetention, CleanupNode, Command, ConnectMember, DisconnectPeer, Event,
+  GetConnectionDegree, GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRecovery,
+  GetResource, GetRoute, IdentityReplaced, IssueCleanupCheckpoint, IssueMergeCredential,
+  LeaveCluster, Listen, MemberChanged, MergeCluster, NodeRevoked, PageListeners, PageMembers,
+  PageResources, PageSessions, PageTopology, PageTrust, PurgeRevocation, PutResource, Query,
+  RecoveryChanged, RemoveResource, ResolveFrozenJournal, ResourceChanged, ResourceWrite,
+  RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources, SessionChanged,
+  Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
@@ -96,9 +96,10 @@ pub use transport::{
   TransportSelector, TransportStream,
 };
 pub use view::{
-  ConnectivityStatus, DeclareInterruptedTransactionUncommitted, LeaveOutcome, ListenerPage,
-  ListenerView, LocalNodeView, MemberPage, MemberStatus, MemberView, MergeView, NodeMetadataPatch,
-  NodeStatus, ObservabilitySnapshot, PageSpec, ReceiptRetentionReport, RecoveryView,
+  ConnectionDegreeState, ConnectionDegreeView, ConnectivityStatus,
+  DeclareInterruptedTransactionUncommitted, LeaveOutcome, ListenerPage, ListenerView,
+  LocalNodeView, MemberPage, MemberStatus, MemberView, MergeView, NodeMetadataPatch, NodeStatus,
+  ObservabilitySnapshot, PageSpec, ReceiptRetentionReport, RecoveryView,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView, ResourcePage, ResourceView,
   RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome, ShutdownReason,
   TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,

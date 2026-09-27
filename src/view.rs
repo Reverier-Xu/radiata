@@ -869,6 +869,61 @@ impl TrustPage {
   }
 }
 
+/// The connection-degree maintenance state: whether the node's live
+/// authenticated session count has reached its target peer degree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectionDegreeState {
+  /// At least the target number of authenticated sessions is live.
+  Healthy,
+  /// Below the target degree. Everything keeps working — the degree
+  /// gates only this status and the maintenance cadence, never
+  /// functionality — and maintenance is dialing toward the target.
+  Unhealthy,
+}
+
+/// The public view of the node's connection-degree maintenance: the
+/// effective target, the live session count, and whether the target is
+/// met. The operator's network-health signal: `Unhealthy` with a
+/// session count stuck below the target means the network (or the
+/// peers' published endpoints) cannot carry the mesh the degree
+/// contract asks for — fix the network, or override the target for a
+/// topology the library cannot know.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionDegreeView {
+  state: ConnectionDegreeState,
+  sessions: usize,
+  target: usize,
+}
+
+impl ConnectionDegreeView {
+  /// The maintenance state: healthy once the live session count
+  /// reaches the target.
+  pub const fn state(&self) -> ConnectionDegreeState {
+    self.state
+  }
+
+  /// The live authenticated session count at observation time.
+  pub const fn sessions(&self) -> usize {
+    self.sessions
+  }
+
+  /// The effective target degree: the operator override when set,
+  /// the derived `k(n)` from the cluster's active member count
+  /// otherwise (see the crate guide's connectivity chapter).
+  pub const fn target(&self) -> usize {
+    self.target
+  }
+
+  pub(crate) const fn new(state: ConnectionDegreeState, sessions: usize, target: usize) -> Self {
+    Self {
+      state,
+      sessions,
+      target,
+    }
+  }
+}
+
 /// The public view of one immediate recovery observation.
 ///
 /// The recovery contract is "any one route suffices": a node with at

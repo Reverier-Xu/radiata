@@ -97,6 +97,9 @@ pub(crate) enum Control {
   GetRecovery {
     reply: oneshot::Sender<Result<crate::RecoveryView>>,
   },
+  GetConnectionDegree {
+    reply: oneshot::Sender<Result<crate::ConnectionDegreeView>>,
+  },
   PageMembers {
     cursor: Option<crate::PageCursor>,
     limit: usize,

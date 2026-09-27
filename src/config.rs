@@ -41,6 +41,7 @@ pub struct NodeConfig {
   receipt_retention: Duration,
   required_features: BTreeSet<FeatureTag>,
   merge_admission: MergeAdmissionLimits,
+  connection_degree: usize,
 }
 
 impl NodeConfig {
@@ -132,6 +133,25 @@ impl NodeConfig {
   /// construction, so this only stores them.
   pub fn with_merge_admission(mut self, value: MergeAdmissionLimits) -> Self {
     self.merge_admission = value;
+    self
+  }
+
+  /// Sets the connection-degree maintenance target: while the node's
+  /// live authenticated session count sits below this value, a periodic
+  /// maintenance tick dials uniformly random unconnected members until
+  /// the target is reached. This is a maintenance target, never a hard
+  /// limit — sessions above the target are never pruned by it, and
+  /// below-target operation never restricts functionality (the degree
+  /// gates only the status query and the maintenance cadence).
+  ///
+  /// Zero (the default) derives the target from the cluster size with
+  /// the exact isolated-vertex connectivity formula
+  /// `k(n)` = smallest `k` with `n·(1 − k/(n−1))^(n−1) ≤ −ln 0.9`,
+  /// tracking the live member count as the cluster grows and shrinks.
+  /// Set an explicit value for topologies the library cannot know: a
+  /// single public-IP relay where one link is enough stays at `1`.
+  pub fn with_connection_degree(mut self, target: usize) -> Self {
+    self.connection_degree = target;
     self
   }
 
@@ -264,6 +284,12 @@ impl NodeConfig {
     self.merge_admission
   }
 
+  /// The connection-degree maintenance target (`0` = derived from the
+  /// cluster size; consumed by the degree maintenance tick).
+  pub(crate) const fn connection_degree(&self) -> usize {
+    self.connection_degree
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -314,6 +340,7 @@ impl Default for NodeConfig {
       receipt_retention: Duration::from_secs(30 * 24 * 60 * 60),
       required_features: BTreeSet::new(),
       merge_admission: MergeAdmissionLimits::default(),
+      connection_degree: 0,
     }
   }
 }
@@ -700,6 +727,21 @@ mod tests {
     assert!(config.recovery().maximum_backoff >= config.recovery().initial_backoff);
     // A k-hop relay attempt is bounded by k x the per-hop budget.
     assert_eq!(config.relay_hop_deadline(), Duration::from_secs(5));
+  }
+
+  /// The liveness setter accepts every disabled/ordered shape and the
+  /// degree override defaults to the derived value (zero).
+  #[test]
+  fn connection_degree_defaults_to_derived_and_accepts_overrides() {
+    // Unset: zero, meaning the derived k(n) at tick time.
+    assert_eq!(NodeConfig::new().connection_degree(), 0);
+    // The operator override stores any value, including zero (derived).
+    let configured = NodeConfig::new().with_connection_degree(1);
+    assert_eq!(configured.connection_degree(), 1);
+    let relay = NodeConfig::new().with_connection_degree(3);
+    assert_eq!(relay.connection_degree(), 3);
+    let derived = NodeConfig::new().with_connection_degree(0);
+    assert_eq!(derived.connection_degree(), 0);
   }
 
   /// A deadline without either driver, a keepalive without a deadline,

@@ -909,6 +909,18 @@ pub(crate) mod store {
   /// decode), the single authoritative binding decodes once, and the
   /// revocation gate has the final word. The one admission-time binding
   /// resolution — session establishment signs against exactly this key.
+  /// Reads the trusted member-mode binding for `peer` from durable
+  /// storage.
+  ///
+  /// The typed contract distinguishes the two failure modes a dialer
+  /// must not conflate: an **absent** binding is
+  /// [`ErrorKind::NotFound`] — the peer is not (yet) known here, which is
+  /// a retryable convergence state while bindings spread over sync, and
+  /// the healing planes (recovery, connection-degree maintenance) and
+  /// caller retry policies treat it exactly that way — while a binding
+  /// that exists but fails to decode, contradicts the presented key, or
+  /// is revoked stays an authentication or revocation failure, which is
+  /// never retryable.
   pub(crate) async fn trusted_binding(store: &MetadataStore, peer: &NodeId) -> Result<PublicKey> {
     if peer_is_terminal(store, peer).await? {
       return Err(crate::Error::not_trusted("peer left"));
@@ -918,7 +930,7 @@ pub(crate) mod store {
     let value = snapshot
       .get(&namespace, &key)
       .await?
-      .ok_or_else(|| crate::Error::authentication_failed("session binding"))?;
+      .ok_or_else(|| crate::Error::not_found("session binding"))?;
     let binding = crate::identity::records::IdentityBindingV1::decode(value.as_bytes())
       .map_err(|_| crate::Error::authentication_failed("session binding"))?;
     let public_key = binding.public_key().clone();

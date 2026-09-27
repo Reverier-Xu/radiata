@@ -38,6 +38,9 @@ pub radiata::CommitOutcome::Conflict
 pub radiata::CommitOutcome::Unknown
 pub radiata::CommitOutcome::Unknown::operation_digest: radiata::Digest
 pub radiata::CommitOutcome::Unknown::transaction: radiata::TransactionId
+#[non_exhaustive] pub enum radiata::ConnectionDegreeState
+pub radiata::ConnectionDegreeState::Healthy
+pub radiata::ConnectionDegreeState::Unhealthy
 #[non_exhaustive] pub enum radiata::ConnectivityStatus
 pub radiata::ConnectivityStatus::Connected
 pub radiata::ConnectivityStatus::Reachable
@@ -205,6 +208,11 @@ impl radiata::ConnectMember
 pub fn radiata::ConnectMember::new(radiata::Endpoint, radiata::NodeId) -> Self
 impl radiata::Command for radiata::ConnectMember
 pub type radiata::ConnectMember::Output = radiata::NodeId
+pub struct radiata::ConnectionDegreeView
+impl radiata::ConnectionDegreeView
+pub const fn radiata::ConnectionDegreeView::sessions(&self) -> usize
+pub const fn radiata::ConnectionDegreeView::state(&self) -> radiata::ConnectionDegreeState
+pub const fn radiata::ConnectionDegreeView::target(&self) -> usize
 pub struct radiata::CreatedKey
 impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
@@ -306,6 +314,11 @@ pub fn radiata::FeatureTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::f
 impl core::str::traits::FromStr for radiata::FeatureTag
 pub type radiata::FeatureTag::Err = radiata::Error
 pub fn radiata::FeatureTag::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::GetConnectionDegree
+impl radiata::GetConnectionDegree
+pub fn radiata::GetConnectionDegree::new() -> Self
+impl radiata::Query for radiata::GetConnectionDegree
+pub type radiata::GetConnectionDegree::Output = radiata::ConnectionDegreeView
 pub struct radiata::GetLocalNode
 impl radiata::GetLocalNode
 pub fn radiata::GetLocalNode::new() -> Self
@@ -528,6 +541,7 @@ pub fn radiata::NodeConfig::new() -> Self
 pub fn radiata::NodeConfig::require_feature(self, radiata::FeatureTag) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_anti_entropy_interval(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_authentication_deadline(self, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_connection_degree(self, usize) -> Self
 pub fn radiata::NodeConfig::with_dial_deadline(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_merge_admission(self, radiata::MergeAdmissionLimits) -> Self
 pub fn radiata::NodeConfig::with_receipt_retention(self, core::time::Duration) -> radiata::Result<Self>
@@ -1089,6 +1103,8 @@ pub trait radiata::PacketConsumer: core::fmt::Debug + core::marker::Send + core:
 pub fn radiata::PacketConsumer::accept<'a>(&'a self, radiata::IncomingStream) -> radiata::BoxFuture<'a, radiata::Result<()>>
 pub trait radiata::Query: radiata::operation::private::Sealed + core::marker::Send + 'static
 pub type radiata::Query::Output: core::marker::Send + 'static
+impl radiata::Query for radiata::GetConnectionDegree
+pub type radiata::GetConnectionDegree::Output = radiata::ConnectionDegreeView
 impl radiata::Query for radiata::GetLocalNode
 pub type radiata::GetLocalNode::Output = radiata::LocalNodeView
 impl radiata::Query for radiata::GetMember

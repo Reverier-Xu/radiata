@@ -141,6 +141,14 @@ impl Command for MergeCluster {
 /// join credential is consulted or required, the expected peer's trusted
 /// identity binding gates the handshake, and the negotiated feature policy
 /// is the same exact offer/selection machinery as a join.
+///
+/// Typed dial contract: a peer whose trusted binding has not spread to
+/// this node yet fails with [`crate::ErrorKind::NotFound`] — a retryable
+/// convergence state that the runtime's healing planes (recovery,
+/// connection-degree maintenance) also absorb on their own cadence. A
+/// contradicted or revoked binding, or any handshake failure, is
+/// [`crate::ErrorKind::AuthenticationFailed`] or
+/// [`crate::ErrorKind::Revoked`] and is never retryable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectMember {
   receiver: Endpoint,
@@ -201,6 +209,27 @@ impl private::Sealed for GetRecovery {}
 
 impl Query for GetRecovery {
   type Output = crate::RecoveryView;
+}
+
+/// The connection-degree maintenance observation: the effective target
+/// degree, the live authenticated session count, and whether the target
+/// is met. The pull complement of the maintenance plane's work — the
+/// operator's signal for reading (and fixing) mesh health.
+pub struct GetConnectionDegree {
+  _private: (),
+}
+
+#[allow(clippy::new_without_default)]
+impl GetConnectionDegree {
+  pub fn new() -> Self {
+    Self { _private: () }
+  }
+}
+
+impl private::Sealed for GetConnectionDegree {}
+
+impl Query for GetConnectionDegree {
+  type Output = crate::ConnectionDegreeView;
 }
 
 /// The bounded observability snapshot query: one snapshot of

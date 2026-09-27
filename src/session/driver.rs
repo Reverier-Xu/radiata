@@ -300,7 +300,9 @@ impl SessionDriver {
           crate::identity::trust::store::trusted_binding(self.context.store(), &peek.node_id)
             .await?;
         // Early rejection: the advertised public key must match the trusted
-        // binding before any signing work.
+        // binding before any signing work. A missing binding already
+        // surfaced as the retryable NotFound above; a mismatching one is
+        // a genuine authentication failure.
         if peek.public_key != binding {
           return Err(Error::authentication_failed("session binding"));
         }
@@ -468,6 +470,14 @@ impl SessionDriver {
   /// the expected peer's trusted binding must already exist from an earlier
   /// join or sync, and both sides prove their identity keys over the fresh
   /// transcript. Returns the authenticated session.
+  ///
+  /// A binding that has not spread to this node yet fails with
+  /// [`ErrorKind::NotFound`](crate::ErrorKind::NotFound) — the retryable
+  /// convergence state, distinct from the non-retryable authentication
+  /// failures (a contradicted or revoked binding). The healing planes
+  /// (recovery, connection-degree maintenance) re-dial on their own
+  /// cadence; a caller that needs the session sooner retries with its
+  /// own bounded budget.
   pub(crate) async fn initiate_member(
     &self, connection: &mut Connection, peer: &NodeId,
   ) -> Result<EstablishedSession> {

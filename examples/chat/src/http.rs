@@ -13,9 +13,10 @@ use axum::{
   routing::{get, post},
 };
 use radiata::{
-  GetResource, LabelKey, LabelValue, NodeHandle, NodeId, PageSessions, PageSpec, PutResource,
-  RemoveResource, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RoutingPolicy,
-  SelectResources, Selector, StreamMetadata, StreamPolicy, StreamTarget,
+  ConnectionDegreeState, GetConnectionDegree, GetResource, LabelKey, LabelValue, NodeHandle, NodeId,
+  PageSessions, PageSpec, PutResource, RemoveResource, ResourceLabels, ResourceName, ResourceUri,
+  ResourceWrite, RoutingPolicy, SelectResources, Selector, StreamMetadata, StreamPolicy,
+  StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -859,12 +860,16 @@ async fn join_chat(
   }
 }
 
-/// The node's full session table, for the harness's mesh waits and the
-/// redundant-edge verification: walks every page so the count and the
-/// peer edge set stay exact at any cluster size, not just the first 64
-/// sessions. `sessions` is the raw live-session count and `distinct` the
-/// deduplicated peer count — a gap between the two is a parallel
-/// duplicate edge.
+/// The node's full session table plus its connection-degree contract,
+/// for the harness's mesh waits and the redundant-edge verification:
+/// walks every page so the count and the peer edge set stay exact at any
+/// cluster size, not just the first 64 sessions. `sessions` is the raw
+/// live-session count and `distinct` the deduplicated peer count — a gap
+/// between the two is a parallel duplicate edge. `target` is the
+/// maintenance target degree the library derives from the cluster size
+/// (or the operator override) and `healthy` reports whether the node
+/// holds at least that many sessions: the mesh's steady state under the
+/// degree contract is a k-out graph, not a full mesh.
 async fn mesh_sessions(
   state: State<SharedState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -893,9 +898,18 @@ async fn mesh_sessions(
   }
   peers.sort();
   peers.dedup();
-  Ok(Json(
-    json!({"sessions": raw, "distinct": peers.len(), "peers": peers}),
-  ))
+  let degree = state
+    .node
+    .query(GetConnectionDegree::new())
+    .await
+    .map_err(internal)?;
+  Ok(Json(json!({
+    "sessions": raw,
+    "distinct": peers.len(),
+    "peers": peers,
+    "target": degree.target(),
+    "healthy": degree.state() == ConnectionDegreeState::Healthy,
+  })))
 }
 
 fn label_map_json(view: &radiata::MemberView) -> serde_json::Map<String, Value> {

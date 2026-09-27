@@ -41,10 +41,11 @@ use std::{
 
 use radiata::{
   BoxFuture, ConnectMember, CustomListener, CustomTransport, DisconnectPeer, Endpoint, Error,
-  FeatureTag, GetLocalNode, GetRecovery, IssueMergeCredential, LeaveCluster, Listen, MemberStatus,
-  MergeCluster, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer,
-  PageMembers, PageSpec, ProtocolDefinition, ProtocolTag, Result, RoutingPolicy, ShutdownReason,
-  StreamMetadata, StreamPolicy, StreamTarget, TransportName, TransportStream, WaitForShutdown,
+  FeatureTag, GetConnectionDegree, GetLocalNode, GetRecovery, IssueMergeCredential, LeaveCluster,
+  Listen, MemberStatus, MergeCluster, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId,
+  PacketConsumer, PageMembers, PageSpec, ProtocolDefinition, ProtocolTag, Result, RoutingPolicy,
+  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TransportName, TransportStream,
+  WaitForShutdown,
 };
 mod common;
 
@@ -725,6 +726,86 @@ async fn wait_converged(slots: &[Slot], expected: usize, what: &str) {
   wait_converged_indices(slots, &indices, expected, what).await;
 }
 
+/// Bounded wait until every indexed slot reports an authenticated path
+/// (the any-one-route contract), driving sync rounds like the
+/// convergence wait. Used where the roster criterion cannot apply — a
+/// hub lost without a tombstone keeps its Active row everywhere.
+async fn wait_recovery_connected(slots: &[Slot], indices: &[usize], what: &str) {
+  let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+  loop {
+    let mut all_connected = true;
+    for index in indices {
+      let connected = bounded(
+        slots[*index].handle().query(GetRecovery::new()),
+        "recovery view",
+      )
+      .await
+      .map(|view| view.is_connected())
+      .unwrap_or(false);
+      if !connected {
+        all_connected = false;
+        break;
+      }
+    }
+    if all_connected {
+      return;
+    }
+    for index in indices {
+      bounded(
+        slots[*index].handle().command(radiata::RunSyncRound::new()),
+        "sync round",
+      )
+      .await
+      .expect("sync round");
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: recovery-connected timeout after {CONVERGE_TIMEOUT:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+  }
+}
+
+/// Bounded wait until every indexed slot reports the connection-degree
+/// maintenance state `Healthy` (sessions at or above the derived
+/// target), driving sync rounds so the maintenance universe converges
+/// on the test's schedule.
+async fn wait_degree_healthy(slots: &[Slot], indices: &[usize], what: &str) {
+  let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+  loop {
+    let mut all_healthy = true;
+    for index in indices {
+      let healthy = bounded(
+        slots[*index].handle().query(GetConnectionDegree::new()),
+        "degree view",
+      )
+      .await
+      .map(|view| view.state() == radiata::ConnectionDegreeState::Healthy)
+      .unwrap_or(false);
+      if !healthy {
+        all_healthy = false;
+        break;
+      }
+    }
+    if all_healthy {
+      return;
+    }
+    for index in indices {
+      bounded(
+        slots[*index].handle().command(radiata::RunSyncRound::new()),
+        "sync round",
+      )
+      .await
+      .expect("sync round");
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: degree-healthy timeout after {CONVERGE_TIMEOUT:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+  }
+}
+
 async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usize, what: &str) {
   let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
   let mut last_report = std::time::Instant::now() - CONVERGE_TIMEOUT;
@@ -983,6 +1064,70 @@ async fn sixty_four_node_mixed_transport_chaos() {
     );
   }
   relay_packet(&slots[13], &slots[0], "assembly relay").await;
+
+  // ---- Mode-1: hub lost before convergence --------------------------
+  //
+  // The center is the mesh's articulation point: its loss splits the
+  // cluster into four components (twelve isolated spokes plus three bus
+  // lines). This is the audit's mode-1 incident shape — a hub dies
+  // while leaves must re-connect leaf-to-leaf — and the survivors must
+  // converge without it: the isolated spokes heal through the recovery
+  // plane, the below-target bus members densify through the
+  // connection-degree maintenance plane, and the components bridge as
+  // soon as one cross-component dial lands. The center then restarts on
+  // the same identity and rejoins through its own healing planes.
+  bounded(
+    slots[0].handle().command(radiata::Shutdown::new()),
+    "hub shutdown",
+  )
+  .await
+  .expect("hub shutdown");
+  assert_eq!(
+    await_shutdown(&mut slots[0]).await,
+    ShutdownReason::Explicit
+  );
+
+  // Every survivor restores an authenticated path (the any-one-route
+  // contract; the roster itself never shrinks — the hub left no
+  // tombstone, so its member row stays Active everywhere).
+  let survivors: Vec<usize> = (1..NODES).collect();
+  wait_recovery_connected(&slots, &survivors, "hub loss: survivors re-mesh").await;
+
+  // Data crosses the bridged mesh: a spoke to a mid-bus body used to be
+  // unreachable without the center.
+  relay_packet(
+    &slots[1],
+    &slots[STAR_SPOKES + 7],
+    "spoke-to-bus relay after hub loss",
+  )
+  .await;
+
+  // The incident's victims — the isolated spokes — also climb back to
+  // the derived target degree through the maintenance plane, not just
+  // to any one route.
+  wait_degree_healthy(
+    &slots,
+    &(1..=STAR_SPOKES).collect::<Vec<usize>>(),
+    "hub loss: spokes back to target degree",
+  )
+  .await;
+
+  // The center restarts on the same identity and rejoins by itself: its
+  // recovery plane dials the persisted member table and the maintenance
+  // plane brings the degree back to target.
+  restart_slot(&mut slots[0], sockets.path(), 0).await;
+  let rebooted = bounded(
+    slots[0].handle().query(GetLocalNode::new()),
+    "hub local node after restart",
+  )
+  .await
+  .expect("hub local node");
+  assert_eq!(
+    rebooted.node_id(),
+    &ids[0],
+    "the restart resumes the center's identity"
+  );
+  wait_converged(&slots, NODES, "hub restart: full roster").await;
 
   // ---- Fuzz churn ---------------------------------------------------
   //

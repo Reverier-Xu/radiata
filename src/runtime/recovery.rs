@@ -228,31 +228,15 @@ impl Supervisor {
     Ok(departed)
   }
 
-  pub(super) async fn recovery_tick_inner(&mut self) -> Result<()> {
-    // Finished connection tasks keep their JoinHandles until reaped, so a
-    // long-lived listener would otherwise grow one dead handle per ever
-    // accepted connection and inflate the observability counts. Reaping
-    // each tick keeps the vec and the counts live-work only; abort() on a
-    // finished handle is a no-op, so shutdown semantics are unchanged.
-    if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
-      handles.retain(|handle| !handle.is_finished());
-    }
-    let direct: std::collections::BTreeSet<NodeId> = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .iter()
-      .filter(|(_, entry)| entry.alive())
-      .map(|(peer, _)| peer.clone())
-      .collect();
+  pub(super) async fn known_online_members(
+    &self, store: &crate::storage::MetadataStore,
+  ) -> Result<std::collections::BTreeMap<NodeId, Endpoint>> {
+    let context = self.context()?;
     // Departed identities (left or cleaned) are no longer cluster
     // members: they never enter the member table, so the recovery plane
     // cannot count one as pending — that would keep the controller
     // Recovering forever, never quiescent, attempts unbounded, and peg
     // the dial backoff at its maximum for every future partition.
-    let context = self.context()?;
-    let store = context.store();
     let excluded = self.departed_exclusions(store).await?.union();
     // The member table IS the recovery universe: every member with a
     // trusted binding, a live descriptor, and a published endpoint is a
@@ -293,6 +277,30 @@ impl Supervisor {
         tracing::debug!(member = %node.as_str(), "no published endpoint; skipped");
       }
     }
+    Ok(known_members)
+  }
+
+  pub(super) async fn recovery_tick_inner(&mut self) -> Result<()> {
+    // Finished connection tasks keep their JoinHandles until reaped, so a
+    // long-lived listener would otherwise grow one dead handle per ever
+    // accepted connection and inflate the observability counts. Reaping
+    // each tick keeps the vec and the counts live-work only; abort() on a
+    // finished handle is a no-op, so shutdown semantics are unchanged.
+    if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
+      handles.retain(|handle| !handle.is_finished());
+    }
+    let direct: std::collections::BTreeSet<NodeId> = self
+      .dependencies
+      .sessions
+      .lock()
+      .map_err(Error::session_table)?
+      .iter()
+      .filter(|(_, entry)| entry.alive())
+      .map(|(peer, _)| peer.clone())
+      .collect();
+    let context = self.context()?;
+    let store = context.store();
+    let known_members = self.known_online_members(store).await?;
     let known: std::collections::BTreeSet<NodeId> = known_members.keys().cloned().collect();
     let now = crate::time::now_seconds();
     self.recovery.observe(&known, &direct);

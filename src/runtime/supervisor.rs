@@ -33,6 +33,10 @@ const CONTROL_CAPACITY: usize = 32;
 /// every other period out of `NodeConfig`).
 const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The connection-degree maintenance cadence (see `runtime/degree.rs`):
+/// purely local behavior, not a peer-visible contract.
+use super::degree::DEGREE_MAINTENANCE_TICK_PERIOD;
+
 /// Capacity of the node's outbound packet command channel:
 /// `PACKET_CHANNEL_CAPACITY` derives from it so one bound governs both
 /// control ends.
@@ -273,6 +277,8 @@ async fn supervise(
   }
   let mut recovery_timer = tokio::time::interval(RECOVERY_TICK_PERIOD);
   recovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+  let mut maintenance_timer = tokio::time::interval(DEGREE_MAINTENANCE_TICK_PERIOD);
+  maintenance_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
   loop {
     tokio::select! {
       message = control.recv() => {
@@ -338,6 +344,10 @@ async fn supervise(
       }
       Control::GetRecovery { reply } => {
         let _ = reply.send(Ok(supervisor.recovery_view()));
+      }
+      Control::GetConnectionDegree { reply } => {
+        let result = supervisor.connection_degree_view().await;
+        let _ = reply.send(result);
       }
       Control::PageMembers { cursor, limit, reply } => {
         let result = supervisor.page_members(cursor, limit).await;
@@ -502,6 +512,14 @@ async fn supervise(
         supervisor.resource_removal_sweep().await;
         supervisor.receipt_retention_sweep().await;
       }
+      _ = maintenance_timer.tick() => {
+        // Best-effort by contract: a failed tick (store outage) waits
+        // for the next one, but never silently — the same attribution
+        // rule as the recovery tick.
+        if let Err(error) = supervisor.maintenance_tick().await {
+          tracing::warn!(kind = ?error.kind(), "degree maintenance tick failed");
+        }
+      }
     }
   }
   let (dependencies, drained) = supervisor.into_dependencies();
@@ -585,6 +603,10 @@ pub(super) struct Supervisor {
   >,
   pub(super) recovery: crate::membership::recovery::RecoveryController,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  /// In-flight connection-degree maintenance dials: bounds one tick's
+  /// batch so a slow mesh never doubles its own dial load every cadence
+  /// (see `runtime/degree.rs`).
+  pub(super) maintenance_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// Recovery-tick cooldown before the next redundant-edge cut.
   pub(super) prune_cooldown: u32,
   pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
@@ -651,7 +673,7 @@ fn session_packet_context(
 impl Supervisor {
   /// Builds the supervisor; provisioning failures return the dependencies
   /// so the caller can still run a clean shutdown instead of panicking.
-  fn new(
+  pub(super) fn new(
     dependencies: RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
     sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
     offer: crate::protocol::offer::FeatureOffer,
@@ -718,6 +740,7 @@ impl Supervisor {
       listeners: BTreeMap::new(),
       recovery,
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+      maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       prune_cooldown: 0,
       published_endpoints,
       exclusion_cache: std::sync::Mutex::new(None),

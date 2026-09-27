@@ -1,4 +1,5 @@
 mod anti_entropy;
+mod degree;
 mod identity_ops;
 mod lifecycle;
 mod listeners;

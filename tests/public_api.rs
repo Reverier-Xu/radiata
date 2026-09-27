@@ -22,12 +22,12 @@ use radiata::{
   ApplyReceiptRetention, BoxFuture, CommitOutcome, CommitReceipt, ConnectMember,
   ConnectivityStatus, CreatedKey, DeclareInterruptedTransactionUncommitted, DeliveryAck, Digest,
   DisconnectPeer, Endpoint, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
-  FeatureDefinition, FeatureTag, GetLocalNode, GetMember, GetNodeStatus, GetObservability,
-  GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState,
-  KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveCluster,
-  LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged, MemberView,
-  MergeCluster, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle, NodeId,
-  NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
+  FeatureDefinition, FeatureTag, GetConnectionDegree, GetLocalNode, GetMember, GetNodeStatus,
+  GetObservability, GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities,
+  KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue,
+  LeaveCluster, LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged,
+  MemberView, MergeCluster, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle,
+  NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
   PacketConsumer, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
   PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
   ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
@@ -615,6 +615,8 @@ fn config_and_registry_are_externally_constructible() {
     .unwrap()
     .with_receipt_retention(Duration::from_secs(86400))
     .unwrap()
+    // The degree override: a maintenance target, never a hard limit.
+    .with_connection_degree(3)
     .require_feature(FeatureTag::parse("example.org/features/echo").unwrap())
     .unwrap();
   let _default = NodeConfig::default();
@@ -1005,13 +1007,19 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     Err(error) => assert_eq!(error.kind(), radiata::ErrorKind::NotFound),
   }
 
-  // Recovery, revocation, observability.
+  // Recovery, connection degree, observability.
   let recovery: RecoveryView = issuer.handle.command(StartRecovery::new()).await.unwrap();
   let _ = (
     recovery.is_connected(),
     recovery.unreachable_members(),
     recovery.next_attempt_at(),
   );
+  let degree: radiata::ConnectionDegreeView = issuer
+    .handle
+    .query(GetConnectionDegree::new())
+    .await
+    .unwrap();
+  let _ = (degree.state(), degree.sessions(), degree.target());
   let observability: ObservabilitySnapshot =
     issuer.handle.query(GetObservability::new()).await.unwrap();
   let _ = observability.captured_at();
