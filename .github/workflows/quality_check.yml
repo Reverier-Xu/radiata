@@ -62,8 +62,8 @@ jobs:
 
       # The examples live outside the workspace on purpose (customer-style
       # consumers), so the workspace gates never see them: lint, format, and
-      # the e2e scripts' syntax are gated here instead. Container e2e stays
-      # manual/nightly (podman is not a CI gate).
+      # the e2e scripts' syntax are gated here instead. The container e2e
+      # itself runs in the chat-acceptance job below.
       - name: examples quality gates
         run: |
           set -euo pipefail
@@ -667,6 +667,53 @@ jobs:
           docker run --rm
           --volume "${GITHUB_WORKSPACE}/.git:/workspace/.git:ro"
           radiata-quality:${{ github.sha }}
+
+  chat-acceptance:
+    name: chat acceptance
+    runs-on: ubuntu-latest
+    # Recorded expected duration: ~20 minutes total on a clean runner —
+    # the release image build dominates (8-12 min uncached), the
+    # scenario matrix plus boundary suite take ~3 min, and the four
+    # must-pass hub-loss soak attempts take ~5 min. The 45-minute
+    # ceiling leaves starvation headroom without hiding a hang.
+    timeout-minutes: 45
+    env:
+      # The runner ships docker; the example scripts accept either
+      # engine through CONTAINER_ENGINE.
+      CONTAINER_ENGINE: docker
+      IMAGE: radiata-chat-node:ci
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: build the chat node image
+        run: >-
+          docker build
+          --build-arg CARGO_FEATURES=""
+          --tag "$IMAGE"
+          --file examples/chat/Containerfile .
+
+      # The scenario matrix joins the star, exercises every chat
+      # contract, then the boundary suite pins the data plane's chunking
+      # edges and the metadata plane's validation cliffs — the suite
+      # that caught the real 32 KiB chunk-bound loss before it shipped.
+      - name: scenario matrix and boundary suite
+        working-directory: examples/chat
+        env:
+          SKIP_BUILD: "1"
+        run: ./run_acceptance.sh --no-fuzz
+
+      # The hub-loss soak is a must-pass lane: four seeded attempts of
+      # the mode-1 incident (hub lost, leaves re-connect leaf-to-leaf).
+      - name: hub-loss soak (mode-1, must-pass)
+        working-directory: examples/chat
+        run: ./soak_hub_loss.sh 4 "$IMAGE"
+
+      - name: teardown
+        if: always()
+        working-directory: examples/chat
+        run: ./down.sh >/dev/null 2>&1 || true
 
   dependency-policy:
     name: dependency-policy
