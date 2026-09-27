@@ -114,6 +114,11 @@ pub(crate) fn resource_sync_protocol_definition() -> Result<ProtocolDefinition> 
 #[derive(Debug, Default)]
 pub(crate) struct ResourceSyncCursors {
   peers: std::collections::BTreeMap<NodeId, ResourcePeerState>,
+  /// The rotation continuation point: the last peer the previous round
+  /// served, so consecutive rounds cover the alive set fairly while each
+  /// round's dispatch stays bounded (see
+  /// [`crate::sync_common::SYNC_PEERS_PER_ROUND`]).
+  rotation: Option<NodeId>,
   /// The register-install epoch at this driver's last tick: any advance
   /// since then means a local install (a caller write, an applied page,
   /// a retention rewrite) may belong in some peer's diff.
@@ -270,9 +275,20 @@ pub(crate) async fn resource_sync_tick(
     // including everything written while it was unreachable — on its
     // first tick back.
     cursors.peers.clear();
+    cursors.rotation = None;
     return Ok(None);
   }
   cursors.peers.retain(|peer, _| peers.contains(peer));
+  // One round serves a bounded, fair window of the alive set: per-round
+  // dispatch cost is independent of the node's connection degree, so a
+  // dense mesh cannot starve the runtime's shared task (the membership
+  // plane applies the identical bound for the identical reason).
+  let (window, rotation) = crate::sync_common::rotation_window(
+    &peers,
+    cursors.rotation.as_ref(),
+    crate::sync_common::SYNC_PEERS_PER_ROUND,
+  );
+  cursors.rotation = rotation.cloned();
   // A local install since the last tick arms every peer's detection pass
   // for this tick: the changed record pushes within one tick per hop
   // instead of one detection cadence per hop, which is what kept
@@ -295,7 +311,7 @@ pub(crate) async fn resource_sync_tick(
     ResourcePeerRound,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
-  for peer in &peers {
+  for peer in window.iter().copied() {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let mut round = resource_sync_tick_peer(
       catalog.as_ref(),

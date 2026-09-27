@@ -309,6 +309,46 @@ pub(crate) async fn delivered_within_bound(
 /// pull-based repair), not a larger timer.
 pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The per-round anti-entropy peer bound: one membership or resource
+/// round pushes to at most this many peers, in fair rotation.
+///
+/// Anti-entropy dispatch is session-carried, so an unbounded round costs
+/// one payload set per live session — and the connection-degree
+/// maintenance plane deliberately grows a node's session count with the
+/// cluster size. Without a bound, the unattended cadence would scale its
+/// per-round burst with the degree, and at the reference 64-node scale
+/// that burst starves the runtime's shared task on a single core (the
+/// starvation gate's measurement). The bound decouples per-round cost
+/// from the degree: a node with at most this many sessions covers every
+/// peer every round (no change for sparse meshes), while a denser node
+/// covers its peers across `ceil(peers / bound)` consecutive rounds.
+/// Convergence latency then grows in rounds, never in per-round load.
+pub(crate) const SYNC_PEERS_PER_ROUND: usize = 2;
+
+/// The fair rotation window over one canonical peer list: at most `cap`
+/// peers starting immediately after `after` (wrapping), so consecutive
+/// rounds cover the whole list without starving any peer. `after` is the
+/// previous window's last peer; an unknown or absent continuation point
+/// restarts from the front, so membership churn only re-orders
+/// coverage. Returns the window and its last peer as the next
+/// continuation point.
+pub(crate) fn rotation_window<'a>(
+  peers: &'a [NodeId], after: Option<&NodeId>, cap: usize,
+) -> (Vec<&'a NodeId>, Option<&'a NodeId>) {
+  if peers.is_empty() || cap == 0 {
+    return (Vec::new(), None);
+  }
+  let start = after
+    .and_then(|last| peers.iter().position(|peer| peer == last))
+    .map_or(0, |index| (index + 1) % peers.len());
+  let take = cap.min(peers.len());
+  let window: Vec<&NodeId> = (0..take)
+    .map(|offset| &peers[(start + offset) % peers.len()])
+    .collect();
+  let next = window.last().copied();
+  (window, next)
+}
+
 #[cfg(test)]
 mod tests {
   use std::{collections::BTreeMap, sync::Arc};
@@ -318,9 +358,62 @@ mod tests {
   use super::{
     PageRound, PeerPageCursor, chunk_payload, decode_kinded_sync_envelope,
     decode_plain_sync_envelope, delivered_within_bound, encode_sync_envelope, outbound_request,
-    send_payload,
+    rotation_window, send_payload,
   };
   use crate::{TraceId, packet::MAX_CHUNK_BYTES};
+
+  fn rotation_peers(count: u8) -> Vec<crate::NodeId> {
+    (0..count)
+      .map(|seed| crate::NodeId::parse(&format!("node-{seed:021}")).unwrap())
+      .collect()
+  }
+
+  /// The rotation window covers the peer list in order, wraps, resumes
+  /// after the previous window's last peer, and never repeats a peer
+  /// before every peer has been served once.
+  #[test]
+  fn rotation_window_covers_peers_fairly_and_resumes() {
+    let peers = rotation_peers(5);
+
+    // Cap below the peer count: consecutive windows partition the list.
+    let (first, next) = rotation_window(&peers, None, 2);
+    assert_eq!(
+      first.iter().map(|peer| peer.as_str()).collect::<Vec<_>>(),
+      vec![peers[0].as_str(), peers[1].as_str()]
+    );
+    let (second, next) = rotation_window(&peers, next, 2);
+    assert_eq!(
+      second.iter().map(|peer| peer.as_str()).collect::<Vec<_>>(),
+      vec![peers[2].as_str(), peers[3].as_str()]
+    );
+    let (third, next) = rotation_window(&peers, next, 2);
+    assert_eq!(
+      third.iter().map(|peer| peer.as_str()).collect::<Vec<_>>(),
+      vec![peers[4].as_str(), peers[0].as_str()],
+      "the window wraps to the front"
+    );
+    let (fourth, _) = rotation_window(&peers, next, 2);
+    assert_eq!(
+      fourth.iter().map(|peer| peer.as_str()).collect::<Vec<_>>(),
+      vec![peers[1].as_str(), peers[2].as_str()]
+    );
+
+    // Cap above the peer count: the whole list, and the next window
+    // restarts from the front after wrapping.
+    let (all, next) = rotation_window(&peers, None, 9);
+    assert_eq!(all.len(), peers.len());
+    let (wrapped, _) = rotation_window(&peers, next, 9);
+    assert_eq!(wrapped.len(), peers.len());
+    assert_eq!(wrapped[0].as_str(), peers[0].as_str());
+
+    // An unknown continuation point restarts from the front; an empty
+    // list or a zero cap yields nothing.
+    let unknown = crate::NodeId::parse("node-000000000000000000099").unwrap();
+    let (restart, _) = rotation_window(&peers, Some(&unknown), 1);
+    assert_eq!(restart[0].as_str(), peers[0].as_str());
+    assert!(rotation_window(&[], None, 2).0.is_empty());
+    assert!(rotation_window(&peers, None, 0).0.is_empty());
+  }
 
   const TEST_SCHEMA: &str = "radiata.woooo.tech/schemas/test-sync-payload-v1";
 

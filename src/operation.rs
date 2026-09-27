@@ -635,11 +635,13 @@ impl Command for ApplyReceiptRetention {
   type Output = crate::view::ReceiptRetentionReport;
 }
 
-/// Runs one full anti-entropy round now: pages the local membership and
-/// resource registers and pushes them over every authenticated session,
-/// exactly like a wall-clock tick, and completes when the round finishes.
-/// Convergence checks become deterministic: drive a round, await it, then
-/// read the pages — no tick-cadence sleeps.
+/// Runs one bounded anti-entropy round now: pages the local membership
+/// and resource registers and pushes them over a fair window of the
+/// authenticated sessions (a small bounded fan-out per round, in
+/// rotation), exactly like a wall-clock tick, and completes when the
+/// round finishes. Convergence checks become deterministic: drive
+/// rounds, await each, then read the pages — no tick-cadence sleeps; a
+/// cluster denser than the window converges across consecutive rounds.
 pub struct RunSyncRound {
   _private: (),
 }
