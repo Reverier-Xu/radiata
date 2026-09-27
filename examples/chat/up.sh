@@ -7,8 +7,13 @@
 # Topology at start: standalone nodes; the driver chooses the shape
 # (test_chat.py joins a star through c1, the fuzz harness merges
 # organically, scale_sweep builds chains/trees via bootstrap choice).
+#
+# CONTAINER_ENGINE selects the container CLI (default podman; CI uses
+# docker). Everything the scripts call exists in both engines.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+ENGINE=${CONTAINER_ENGINE:-podman}
 
 NETWORK=${NETWORK:-radiata-chat}
 N=${N:-5}
@@ -20,7 +25,7 @@ FUZZ=${FUZZ:-0}
 # and bootstrap addresses never change.
 NAME_PREFIX=${NAME_PREFIX:-}
 
-podman network create "$NETWORK" 2>/dev/null || true
+"$ENGINE" network create "$NETWORK" 2>/dev/null || true
 
 FEATURES=""
 LOG_LEVEL=info
@@ -39,7 +44,7 @@ fi
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
   echo "building the chat node image (release; several minutes on first run)..."
-  podman build --build-arg CARGO_FEATURES="$FEATURES" -t "$IMAGE" -f Containerfile ../..
+  "$ENGINE" build --build-arg CARGO_FEATURES="$FEATURES" -t "$IMAGE" -f Containerfile ../..
 fi
 
 for i in $(seq 1 "$N"); do
@@ -47,7 +52,7 @@ for i in $(seq 1 "$N"); do
   # The DNS hostname carries the mesh prefix: aardvark resolves
   # hostnames across networks on the same host, so two parallel meshes
   # with plain c1..cN hostnames would dial into each other.
-  podman run -d --name "${NAME_PREFIX}c$i" --hostname "${NAME_PREFIX}c$i" --network "$NETWORK" \
+  "$ENGINE" run -d --name "${NAME_PREFIX}c$i" --hostname "${NAME_PREFIX}c$i" --network "$NETWORK" \
     -v "${NAME_PREFIX}radiata-chat-data-$i:/data" \
     -e "LISTEN=wss://${NAME_PREFIX}c$i:9443" -e "CHAT_USER=u$i" -e "RUST_LOG=${RUST_LOG:-$LOG_LEVEL}" \
     -p "$((BASE_HTTP_PORT + i)):8080" \
