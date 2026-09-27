@@ -71,12 +71,34 @@
 //! anti-entropy (membership descriptors, resources, trust bindings)
 //! converges the rest over that route.
 //!
-//! [`RecoveryView`](crate::RecoveryView) reports this contract:
-//! `is_connected` means "at least one path", and `unreachable_members`
-//! is a bounded diagnostic counter of members the recovery plane has
-//! not reached yet — not a loss list and not a connectivity verdict.
+//! The **connection-degree maintenance plane** complements that
+//! contract: while a node's live session count sits below its target
+//! degree, a periodic tick (30 seconds, purely local) dials uniformly
+//! random unconnected members until the target is reached. The target
+//! is the derived `k(n)` for a cluster of `n` active members — the
+//! smallest `k` keeping the expected number of isolated vertices under
+//! the ten-percent connectivity threshold — and
+//! [`with_connection_degree`](crate::NodeConfig::with_connection_degree)
+//! overrides it for topologies the library cannot know (a single
+//! public-IP relay needs one link, not seven). The degree is a
+//! maintenance target, never a functional gate: below target everything
+//! keeps working, above target nothing is pruned, and only a fully
+//! offline node falls back to the recovery plane's high-frequency
+//! backoff.
+//!
+//! [`RecoveryView`](crate::RecoveryView) reports the any-one-route
+//! contract: `is_connected` means "at least one path", and
+//! `unreachable_members` is a bounded diagnostic counter of members the
+//! recovery plane has not reached yet — not a loss list and not a
+//! connectivity verdict.
+//! [`GetConnectionDegree`](crate::GetConnectionDegree) reports the
+//! degree contract: the effective target, the live session count, and
+//! whether the mesh is `Healthy`. A node stuck `Unhealthy` below target
+//! is the operator's signal that the network (or the peers' published
+//! endpoints) cannot carry the mesh the degree contract asks for.
 //! Convergence after a partition is bounded by the anti-entropy tick
-//! period times the recovery backoff, not by any fixed topology.
+//! period times the recovery backoff, plus one maintenance tick for the
+//! degree top-up — not by any fixed topology.
 //!
 //! ```no_run
 //! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
@@ -369,14 +391,20 @@
 //! Two sizes are worth knowing, and the defaults already answer both:
 //!
 //! - **Memory** is roughly `queue bytes × live neighbors` plus local
-//!   diagnostics and storage. The defaults fit the reference scale;
+//!   diagnostics and storage. The degree contract gives "live neighbors" a
+//!   practical ceiling: every node maintains about `k(n)` sessions (seven at 64
+//!   members, growing with the logarithm of the cluster), so a 64-node member
+//!   holds roughly `8 MiB × 7 ≈ 56 MiB` of queue capacity at the defaults.
 //!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
-//!   is the one knob that changes it materially.
+//!   and the degree override are the two knobs that change it materially.
 //! - **Background load** is the anti-entropy tick: `N × interval` work per
 //!   round cluster-wide. The tick dispatches to its peers and settles delivery
 //!   verdicts off the tick path, so a hub's per-tick hold-down stays at the
 //!   dispatch cost rather than the slowest peer's ack bound — the reference
-//!   64-node mesh holds the one-second cadence even on a single slow core.
+//!   64-node mesh holds the one-second cadence even on a single slow core. The
+//!   degree-maintenance tick adds bounded work only while a node is below its
+//!   target: nothing while healthy, one deficit-sized dial batch per 30 seconds
+//!   while healing.
 //!
 //! Delivery across restarts stays the application's job (the data
 //! plane is at-most-once): a `Failed` or interrupted stream is a

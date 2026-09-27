@@ -17,7 +17,10 @@ application owns the semantics that ride on top — the crate never interprets p
   credentials; identity bindings converge to every peer and anchor all further authentication.
 - **Any-one-route connectivity** — a node is connected when at least one authenticated path
   exists. While fully isolated, the recovery plane dials the member table with bounded fan-out and
-  backoff; while connected, it never expands the topology (and prunes redundant recovery edges).
+  backoff; while connected, the connection-degree maintenance plane dials uniformly random
+  unconnected members until the node holds its target peer degree — the exact isolated-vertex
+  formula `k(n)` derived from the cluster size, or an operator override — so a mesh survives any
+  single member's loss without a hub.
 - **Convergent metadata** — signed resources (last-writer-wins versioned registers with CAS
   conditional writes) and owner-marked member descriptors, both delivered by bounded-page
   anti-entropy with admission-ack delivery truth and per-key watermarks.

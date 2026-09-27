@@ -271,6 +271,7 @@ pub(crate) fn member_view(
 }
 
 /// The bounded descriptor observation store.
+pub(crate) mod degree;
 pub(crate) mod page;
 pub(crate) mod recovery;
 pub(crate) mod sync;

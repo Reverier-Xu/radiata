@@ -37,7 +37,12 @@ the library's built-in `DefaultNextHop`), and **leave**. There is no
 business-side meshing: the library's recovery plane retries every member
 in the table while the node is fully isolated, reconnects through any
 member that answers, and quiesces the moment any one route exists (the
-"any one route" contract). Messages sent during an outage queue as
+"any one route" contract); the connection-degree maintenance plane then
+dials uniformly random unconnected members until the node holds its
+target peer degree — derived from the live cluster size with the exact
+isolated-vertex formula, or an operator override — so the steady mesh
+is a k-out graph rather than a star or spanning tree, and no single
+member's loss can strand a leaf. Messages sent during an outage queue as
 `pending` in the customer's store and flush when connectivity returns.
 
 ## Transports

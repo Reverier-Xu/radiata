@@ -269,6 +269,33 @@ impl SessionEntry {
   pub(crate) fn queue_audit_delta(&self) -> usize {
     self.frames.audit_delta()
   }
+
+  /// A synthetic live entry for runtime wiring tests: lanes that drive
+  /// the session table without a real connection (the degree
+  /// maintenance tick's unit lane) need a liveness-carrying entry and
+  /// nothing more. Never compiled outside the test profile.
+  #[cfg(test)]
+  pub(crate) fn synthetic_entry(
+    entropy: &dyn crate::api::Entropy, endpoint: crate::Endpoint,
+  ) -> crate::Result<Self> {
+    let (frames, _receiver) = super::queue::BoundedSender::channel(8, 4096);
+    Ok(Self {
+      frames,
+      pending_acks: Arc::new(Mutex::new(HashMap::new())),
+      pending_admissions: 1,
+      clock: Arc::new(crate::time::HostWallClock),
+      meta: Arc::new(SessionMeta {
+        id: crate::SessionId::generate(entropy)?,
+        generation: 0,
+        endpoint,
+        features: Vec::new(),
+      }),
+      alive: Arc::new(AtomicBool::new(true)),
+      direction: DialDirection::Outgoing,
+      recovery_dialed: false,
+      retire: watch::channel(()).0,
+    })
+  }
 }
 
 /// Runs one established session until the connection closes or the node

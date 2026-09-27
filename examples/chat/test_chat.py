@@ -108,6 +108,20 @@ def sessions_via_status(node: int) -> int:
     return payload.get("sessions", -1) if payload else -1
 
 
+def degree_via_status(node: int) -> dict:
+    # The connection-degree contract: the maintenance target the library
+    # derives from the cluster size (or the operator override) and
+    # whether the node holds at least that many sessions. The mesh's
+    # steady state under this contract is a k-out graph, never a full
+    # mesh, so the harness waits on health and stability, not on N-1.
+    status, payload = http_status("GET", node, "/mesh-sessions", timeout=3)
+    return payload if status == 200 and payload else {}
+
+
+def mesh_healthy(node: int) -> bool:
+    return degree_via_status(node).get("healthy", False)
+
+
 def roster(node: int) -> dict:
     return {entry["user"]: entry["node_id"] for entry in http("GET", node, "/identities")["identities"]}
 
@@ -147,13 +161,15 @@ def phase_join_and_mesh() -> None:
     with ThreadPoolExecutor(max_workers=N - 1) as pool:
         list(pool.map(join, range(2, N + 1)))
     print(f"[join] c2..c{N} merged concurrently")
-    # The join star is the whole topology: the hub holds N-1 sessions,
-    # every leaf exactly one - routing and recovery are the library's
-    # job, the business never meshes.
+    # The join star is the initial topology: the hub holds N-1 sessions
+    # and every leaf its one bootstrap session. The connection-degree
+    # maintenance plane may then densify the leaves toward the derived
+    # target k(N) - routing and recovery are the library's job, the
+    # business never meshes.
     wait(lambda: sessions_via_status(1) == N - 1,
          f"the hub holds {N - 1} sessions", deadline_s=60)
-    wait(lambda: all(sessions_via_status(node) == 1 for node in range(2, N + 1)),
-         "every leaf holds exactly one session (the hub)")
+    wait(lambda: all(sessions_via_status(node) >= 1 for node in range(2, N + 1)),
+         "every leaf holds at least its bootstrap hub session")
     wait(lambda: all(len(roster(node)) == N for node in range(1, N + 1)),
          "the identity roster converged on every node")
 
@@ -310,36 +326,36 @@ def phase_hub_death_recovery(report: dict) -> None:
     assert view2["receipts_sent"] >= 1
     wait_outbox_state(3, inc["msg_id"], "read")
 
-    # The hub restarts and heals back in through its persisted identity.
+    # The hub restarts and heals back in through its persisted identity:
+    # recovery gives it a route and the maintenance plane brings its
+    # degree back to target.
     podman("start", "c1")
-    wait(lambda: sessions_via_status(1) == N - 1,
+    wait(lambda: sessions_via_status(1) >= 1 and len(roster(1)) == N,
          "the restarted hub rejoined and re-connected", deadline_s=180)
     back = http("POST", 2, "/dm", {"to": "u1", "body": "hub is back"})
-    assert back["state"] == "sent", "the hub edge is direct again"
+    assert back["state"] == "sent", "a route to the hub must exist again"
     http("GET", 1, "/messages?unread=true")
     wait_outbox_state(2, back["msg_id"], "read")
     # Recovery is an observation, not a per-sample SLO: the wall clock
     # here includes two container restarts and the recovery backoff.
     report["hub_death_recovery_seconds"] = round(time.monotonic() - recovery_started, 1)
-    # Recovery pruning: the leaf-leaf edges the outage accumulated
-    # are retired once the hub edge anchors each leaf again; every leaf
-    # settles back to exactly one session (the hub).
-    # The re-formed star may re-center on ANY member (the deterministic
-    # owner rule decides per pair which dial survives, and the pruner
-    # cuts marked recovery dials gradually), so the settle condition is
-    # TOPOLOGY STABILITY - a spanning tree (N-1 edges, everyone linked)
-    # that stops changing - not a specific center.
+    # The connection-degree contract: every node settles at or above
+    # its maintenance target and the session vector stops changing. The
+    # steady state is a k-out mesh (recovery edges retire once the
+    # maintenance edges anchor a node), not a spanning tree, and the
+    # degree of each node follows the cluster size.
     samples: list[tuple[int, ...]] = []
     def topology_settled() -> bool:
         samples.append(tuple(sessions_via_status(node) for node in range(1, N + 1)))
         if len(samples) > 3:
             samples.pop(0)
-        return (len(samples) == 3
+        healthy = all(mesh_healthy(node) for node in range(1, N + 1))
+        return (healthy
+                and len(samples) == 3
                 and len(set(samples)) == 1
-                and min(samples[0]) >= 1
-                and sum(samples[0]) == 2 * (N - 1))
+                and min(samples[0]) >= 1)
     wait(topology_settled,
-         "recovery pruning settles into a stable spanning tree", deadline_s=180)
+         "the degree mesh settles at or above every node's target", deadline_s=180)
     report["hub_death_recovery"] = "isolated-queued-reconnected-through-another-member-flushed"
     print("[hub loss] isolate queued both ways, recovered via another member, flushed, receipted")
 
@@ -408,7 +424,8 @@ def phase_groups(report: dict) -> None:
     assert sent["recipients"]["u3"]["state"] == "pending"
     offline_id = sent["recipients"]["u3"]["msg_id"]
     podman("start", "c3")
-    wait(lambda: sessions_via_status(3) == N - 1, "c3 back online", deadline_s=120)
+    wait(lambda: sessions_via_status(3) >= 1 and len(roster(3)) == N and mesh_healthy(3),
+         "c3 back online", deadline_s=120)
     flushed = http("POST", 1, "/flush")
     assert flushed["delivered"] >= 1, f"the queued group copy must flush: {flushed}"
     view = http("GET", 3, "/messages?unread=true")
@@ -441,7 +458,8 @@ def phase_chaos(report: dict) -> None:
     queued = http("POST", 1, "/dm", {"to": "u2", "body": "sent into the void"})
     assert queued["state"] == "pending"
     podman("start", "c2")
-    wait(lambda: sessions_via_status(2) == N - 1, "c2 re-meshed after SIGKILL", deadline_s=120)
+    wait(lambda: sessions_via_status(2) >= 1 and len(roster(2)) == N and mesh_healthy(2),
+         "c2 re-meshed after SIGKILL", deadline_s=120)
     assert http("POST", 1, "/flush")["delivered"] >= 1
     view = http("GET", 2, "/messages?unread=true")
     assert any(m["body"] == "sent into the void" for m in view["messages"])
