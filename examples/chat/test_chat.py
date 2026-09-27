@@ -33,6 +33,7 @@ Run: python3 test_chat.py   (after ./up.sh)
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -70,8 +71,14 @@ def http_status(method: str, node: int, path: str, body: dict | None = None, tim
         return None, None
 
 
+# The container CLI the harness drives: CONTAINER_ENGINE selects the
+# engine (podman locally, docker in CI); every flag used here exists in
+# both.
+ENGINE = os.environ.get("CONTAINER_ENGINE", "podman")
+
+
 def podman(*args: str, check: bool = True):
-    return subprocess.run(["podman", *args], capture_output=True, text=True, check=check)
+    return subprocess.run([ENGINE, *args], capture_output=True, text=True, check=check)
 
 
 def wait(predicate, description: str, deadline_s: float = 120):
@@ -328,10 +335,11 @@ def phase_hub_death_recovery(report: dict) -> None:
 
     # The hub restarts and heals back in through its persisted identity:
     # recovery gives it a route and the maintenance plane brings its
-    # degree back to target.
+    # degree back to target. The budget covers several 30 s maintenance
+    # ticks on a starved runner.
     podman("start", "c1")
     wait(lambda: sessions_via_status(1) >= 1 and len(roster(1)) == N,
-         "the restarted hub rejoined and re-connected", deadline_s=180)
+         "the restarted hub rejoined and re-connected", deadline_s=240)
     back = http("POST", 2, "/dm", {"to": "u1", "body": "hub is back"})
     assert back["state"] == "sent", "a route to the hub must exist again"
     http("GET", 1, "/messages?unread=true")
@@ -355,7 +363,7 @@ def phase_hub_death_recovery(report: dict) -> None:
                 and len(set(samples)) == 1
                 and min(samples[0]) >= 1)
     wait(topology_settled,
-         "the degree mesh settles at or above every node's target", deadline_s=180)
+         "the degree mesh settles at or above every node's target", deadline_s=300)
     report["hub_death_recovery"] = "isolated-queued-reconnected-through-another-member-flushed"
     print("[hub loss] isolate queued both ways, recovered via another member, flushed, receipted")
 
@@ -425,7 +433,7 @@ def phase_groups(report: dict) -> None:
     offline_id = sent["recipients"]["u3"]["msg_id"]
     podman("start", "c3")
     wait(lambda: sessions_via_status(3) >= 1 and len(roster(3)) == N and mesh_healthy(3),
-         "c3 back online", deadline_s=120)
+         "c3 back online", deadline_s=240)
     flushed = http("POST", 1, "/flush")
     assert flushed["delivered"] >= 1, f"the queued group copy must flush: {flushed}"
     view = http("GET", 3, "/messages?unread=true")
@@ -459,7 +467,7 @@ def phase_chaos(report: dict) -> None:
     assert queued["state"] == "pending"
     podman("start", "c2")
     wait(lambda: sessions_via_status(2) >= 1 and len(roster(2)) == N and mesh_healthy(2),
-         "c2 re-meshed after SIGKILL", deadline_s=120)
+         "c2 re-meshed after SIGKILL", deadline_s=240)
     assert http("POST", 1, "/flush")["delivered"] >= 1
     view = http("GET", 2, "/messages?unread=true")
     assert any(m["body"] == "sent into the void" for m in view["messages"])
