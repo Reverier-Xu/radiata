@@ -698,17 +698,46 @@ jobs:
       # contract, then the boundary suite pins the data plane's chunking
       # edges and the metadata plane's validation cliffs — the suite
       # that caught the real 32 KiB chunk-bound loss before it shipped.
+      # A failure dumps the phase logs and the node log tails: the
+      # runner is otherwise opaque, and the failing wait must be
+      # attributable without a re-run.
       - name: scenario matrix and boundary suite
         working-directory: examples/chat
         env:
           SKIP_BUILD: "1"
-        run: ./run_acceptance.sh --no-fuzz
+        run: |
+          set -euo pipefail
+          if ! ./run_acceptance.sh --no-fuzz; then
+            echo "=== acceptance phase logs (tails) ==="
+            tail -n 150 /tmp/acceptance_matrix.log 2>/dev/null || true
+            tail -n 150 /tmp/acceptance_boundary.log 2>/dev/null || true
+            echo "=== chat node log tails ==="
+            for c in c1 c2 c3 c4 c5; do
+              echo "--- $c ---"
+              "${CONTAINER_ENGINE:-docker}" logs --tail 80 "$c" 2>&1 || true
+            done
+            exit 1
+          fi
 
       # The hub-loss soak is a must-pass lane: four seeded attempts of
       # the mode-1 incident (hub lost, leaves re-connect leaf-to-leaf).
       - name: hub-loss soak (mode-1, must-pass)
         working-directory: examples/chat
-        run: ./soak_hub_loss.sh 4 "$IMAGE"
+        run: |
+          set -euo pipefail
+          if ! ./soak_hub_loss.sh 4 "$IMAGE"; then
+            echo "=== soak attempt logs (tails) ==="
+            for log in /tmp/chat_soak_*.log; do
+              echo "--- $log ---"
+              tail -n 150 "$log" 2>/dev/null || true
+            done
+            echo "=== chat node log tails ==="
+            for c in c1 c2 c3 c4 c5; do
+              echo "--- $c ---"
+              "${CONTAINER_ENGINE:-docker}" logs --tail 80 "$c" 2>&1 || true
+            done
+            exit 1
+          fi
 
       - name: teardown
         if: always()
