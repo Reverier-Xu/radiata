@@ -22,6 +22,10 @@ Lifecycle rules:
   made, the scoped items with their evidence, acceptance criteria and
   guarding gates, and the recorded environmental limits that audits
   must budget for.
+- [`node-handle-api-plan.md`](node-handle-api-plan.md) — the scoped
+  cycle replacing the public command/query struct dispatch with the
+  client-go-shaped verb surface (resource accessors, operation verbs,
+  `watch`, `send`).
 
 Completed cycles do not keep their documents here. The
 `starvation-hardening-plan` cycle (configurable admission and

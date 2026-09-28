@@ -28,6 +28,13 @@ evidence lands in the commit history.
   dial path stays an immediate refusal and the healing planes plus
   caller retry policies absorb it (decided with the operator, landed
   with the connection-degree cycle).
+- **The public handle API is the client-go-shaped verb surface.**
+  `node.command(...)`/`node.query(...)` over sealed command structs are
+  replaced by resource-scoped accessors (`members()`, `resources()`, …
+  with `get`/`list`/`put`/`delete`) plus domain operation verbs
+  (`join`, `leave`, `revoke`, `sync`, `shutdown`, `watch`, `send`).
+  Evidence and migration plan:
+  [`node-handle-api-plan.md`](node-handle-api-plan.md).
 
 ## Landed in the connection-degree cycle (2026-09-27, no action)
 
