@@ -9,12 +9,10 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  BoxFuture, Endpoint, ErrorKind, EventOptions, EventReceive, GetResource, Listen,
-  LoadBalancingPolicy, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageListeners, PageMembers,
-  PageResources, PageSessions, PageSpec, PageTopology, PageTrust, ProtocolDefinition, ProtocolTag,
-  PutResource, RemoveResource, ResourceChanged, ResourceLabels, ResourceName, ResourceUri,
-  ResourceWrite, Result, RevokeNode, RoutingPolicy, SelectResources, Selector, SessionChanged,
-  Shutdown, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, UpdateNodeMetadata,
+  BoxFuture, Endpoint, ErrorKind, EventOptions, EventReceive, LoadBalancingPolicy, NodeBuilder,
+  NodeConfig, NodeHandle, NodeId, PageSpec, ProtocolDefinition, ProtocolTag, ResourceChanged,
+  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, RoutingPolicy, Selector,
+  SessionChanged, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget,
   extension::KeyProvider,
 };
 
@@ -121,7 +119,8 @@ async fn start_node(seed: u64, echo: bool) -> Node {
 async fn listen(node: &Node) -> Endpoint {
   let listener = node
     .handle
-    .command(Listen::new(node.endpoint.clone()))
+    .listeners()
+    .create(node.endpoint.clone())
     .await
     .unwrap();
   listener.endpoint().clone()
@@ -300,8 +299,8 @@ impl KeyProvider for LeaveCapableKeys {
   }
 }
 
-fn resource_write(name_seed: u8, resource_type: &str) -> PutResource {
-  PutResource::new(ResourceWrite::new(
+fn resource_write(name_seed: u8, resource_type: &str) -> ResourceWrite {
+  ResourceWrite::new(
     ResourceName::parse(&format!(
       "radiata.woooo.tech/resources/facade-{name_seed:03}"
     ))
@@ -310,8 +309,7 @@ fn resource_write(name_seed: u8, resource_type: &str) -> PutResource {
       radiata::LabelValue::parse(resource_type).unwrap(),
       ResourceUri::parse(&format!("file:///facade/{name_seed:03}")).unwrap(),
     ),
-  ))
-  .unwrap()
+  )
 }
 
 /// Generic capability resources flow through the facade, every member
@@ -349,19 +347,14 @@ async fn resources_revoke_and_leave() {
   let mut member = start_node(1, false).await;
   member.endpoint = listen(&member).await;
   common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
-  let member_id = member
-    .handle
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let member_id = member.handle.local_node().await.unwrap().node_id().clone();
 
   // The member publishes a generic capability resource whose URI points
   // at the caller object.
   member
     .handle
-    .command(resource_write(1, "gpu-worker"))
+    .resources()
+    .put(resource_write(1, "gpu-worker"))
     .await
     .unwrap();
 
@@ -371,17 +364,14 @@ async fn resources_revoke_and_leave() {
   loop {
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer instead of the wall-clock tick.
-    issuer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    issuer.handle.sync().await.unwrap();
     let page = issuer
       .handle
-      .query(SelectResources::new(
+      .resources()
+      .select(
         Selector::parse("radiata.woooo.tech/resources/type=gpu-worker").unwrap(),
         PageSpec::first(8).unwrap(),
-      ))
+      )
       .await
       .unwrap();
     if page.items().len() == 1 {
@@ -399,7 +389,8 @@ async fn resources_revoke_and_leave() {
   let member_key = {
     let page = issuer
       .handle
-      .query(PageTrust::new(PageSpec::first(8).unwrap()))
+      .trust()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     page
@@ -412,16 +403,17 @@ async fn resources_revoke_and_leave() {
   };
   issuer
     .handle
-    .command(RevokeNode::new(member_id.clone(), member_key))
+    .revoke(member_id.clone(), member_key)
     .await
     .unwrap();
 
   let still_there = issuer
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type=gpu-worker").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   assert_eq!(
@@ -439,13 +431,11 @@ async fn resources_revoke_and_leave() {
   // still intact afterwards.
   let mut events = issuer
     .handle
-    .events::<radiata::IdentityReplaced>(EventOptions::new())
+    .watch::<radiata::IdentityReplaced>(EventOptions::new())
     .unwrap();
   let outcome = issuer
     .handle
-    .command(radiata::LeaveCluster::new(
-      radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-    ))
+    .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
     .unwrap();
   let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -454,11 +444,7 @@ async fn resources_revoke_and_leave() {
     .unwrap();
   assert!(matches!(event, EventReceive::Item(_)));
   assert_ne!(outcome.former_identity(), outcome.replacement_identity());
-  let reason = issuer
-    .handle
-    .query(radiata::WaitForShutdown::new())
-    .await
-    .unwrap();
+  let reason = issuer.handle.wait_for_shutdown().await.unwrap();
   assert_eq!(reason, ShutdownReason::ActiveLeave);
   // The leave deleted exactly the former identity's key through the
   // custody protocol.
@@ -470,7 +456,7 @@ async fn resources_revoke_and_leave() {
     "leave never deletes caller objects"
   );
 
-  member.handle.command(Shutdown::new()).await.unwrap();
+  member.handle.shutdown().await.unwrap();
 }
 
 /// Label-selected packet delivery, every paged view, the resource
@@ -493,13 +479,7 @@ async fn facade_core_only_operations() {
   let mut member = start_node(1, true).await;
   member.endpoint = listen(&member).await;
   common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint).await;
-  let member_id = member
-    .handle
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let member_id = member.handle.local_node().await.unwrap().node_id().clone();
 
   // The member's first-seen descriptor must reach the issuer at revision
   // 1 before any owner-revision bump (the store accepts only the exact
@@ -508,14 +488,11 @@ async fn facade_core_only_operations() {
   loop {
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer instead of the wall-clock tick.
-    issuer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    issuer.handle.sync().await.unwrap();
     let members = issuer
       .handle
-      .query(PageMembers::new(PageSpec::first(8).unwrap()))
+      .members()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     if members
@@ -544,18 +521,11 @@ async fn facade_core_only_operations() {
   // the revision).
   let members_self = member
     .handle
-    .query(radiata::PageMembers::new(
-      radiata::PageSpec::first(8).unwrap(),
-    ))
+    .members()
+    .list(radiata::PageSpec::first(8).unwrap())
     .await
     .unwrap();
-  let member_id = member
-    .handle
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let member_id = member.handle.local_node().await.unwrap().node_id().clone();
   let revision = members_self
     .items()
     .iter()
@@ -566,11 +536,7 @@ async fn facade_core_only_operations() {
   // observation and the command: re-observe and retry within a bound.
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match member
-      .handle
-      .command(UpdateNodeMetadata::new(revision, patch.clone()))
-      .await
-    {
+    match member.handle.patch_metadata(revision, patch.clone()).await {
       Ok(_) => break,
       Err(error) if error.kind() == ErrorKind::Conflict => {
         assert!(
@@ -591,7 +557,8 @@ async fn facade_core_only_operations() {
   loop {
     let members = issuer
       .handle
-      .query(PageMembers::new(PageSpec::first(8).unwrap()))
+      .members()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     let labeled = members.items().iter().any(|member| {
@@ -610,11 +577,7 @@ async fn facade_core_only_operations() {
     );
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer instead of the wall-clock tick.
-    issuer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    issuer.handle.sync().await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
@@ -638,19 +601,22 @@ async fn facade_core_only_operations() {
   // Paged population views: members, trust, topology.
   let members = issuer
     .handle
-    .query(PageMembers::new(PageSpec::first(8).unwrap()))
+    .members()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(members.items().len() >= 2);
   let trust = issuer
     .handle
-    .query(PageTrust::new(PageSpec::first(8).unwrap()))
+    .trust()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(trust.items().len() >= 2);
   let topology = issuer
     .handle
-    .query(PageTopology::new(PageSpec::first(8).unwrap()))
+    .topology()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(!topology.items().is_empty());
@@ -658,25 +624,26 @@ async fn facade_core_only_operations() {
   // Resource lifecycle: put, read, page, remove.
   let mut resource_events = issuer
     .handle
-    .events::<ResourceChanged>(EventOptions::new())
+    .watch::<ResourceChanged>(EventOptions::new())
     .unwrap();
   issuer
     .handle
-    .command(resource_write(2, "storage"))
+    .resources()
+    .put(resource_write(2, "storage"))
     .await
     .unwrap();
   let view = issuer
     .handle
-    .query(GetResource::new(
-      ResourceName::parse("radiata.woooo.tech/resources/facade-002").unwrap(),
-    ))
+    .resources()
+    .get(ResourceName::parse("radiata.woooo.tech/resources/facade-002").unwrap())
     .await
     .unwrap()
     .expect("the committed resource reads back");
   assert_eq!(view.labels().resource_type().as_str(), "storage");
   let resources = issuer
     .handle
-    .query(PageResources::new(PageSpec::first(8).unwrap()))
+    .resources()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert_eq!(resources.items().len(), 1);
@@ -688,18 +655,18 @@ async fn facade_core_only_operations() {
 
   issuer
     .handle
-    .command(RemoveResource::new(
+    .resources()
+    .delete(
       ResourceName::parse("radiata.woooo.tech/resources/facade-002").unwrap(),
       view.version().clone(),
-    ))
+    )
     .await
     .unwrap();
   assert!(
     issuer
       .handle
-      .query(GetResource::new(
-        ResourceName::parse("radiata.woooo.tech/resources/facade-002").unwrap(),
-      ))
+      .resources()
+      .get(ResourceName::parse("radiata.woooo.tech/resources/facade-002").unwrap(),)
       .await
       .unwrap()
       .is_none()
@@ -708,7 +675,8 @@ async fn facade_core_only_operations() {
   // Listener and session views.
   let listeners = issuer
     .handle
-    .query(PageListeners::new(PageSpec::first(8).unwrap()))
+    .listeners()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert_eq!(listeners.items().len(), 1);
@@ -716,7 +684,8 @@ async fn facade_core_only_operations() {
   loop {
     let sessions = issuer
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     if sessions
@@ -738,9 +707,9 @@ async fn facade_core_only_operations() {
   // Session events: the member's shutdown retires its session.
   let mut session_events = issuer
     .handle
-    .events::<SessionChanged>(EventOptions::new())
+    .watch::<SessionChanged>(EventOptions::new())
     .unwrap();
-  member.handle.command(Shutdown::new()).await.unwrap();
+  member.handle.shutdown().await.unwrap();
   let event = tokio::time::timeout(Duration::from_secs(10), session_events.recv())
     .await
     .unwrap()
@@ -750,7 +719,7 @@ async fn facade_core_only_operations() {
     _ => panic!("expected the session change event"),
   }
 
-  issuer.handle.command(Shutdown::new()).await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
 }
 
 /// Resource labels never enable protocol behavior — a resource whose
@@ -769,20 +738,22 @@ async fn resource_labels_never_enable_protocols() {
   // A resource claiming to be the echo protocol.
   member
     .handle
-    .command(resource_write(3, ECHO_PROTOCOL))
+    .resources()
+    .put(resource_write(3, ECHO_PROTOCOL))
     .await
     .unwrap();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     let page = issuer
       .handle
-      .query(SelectResources::new(
+      .resources()
+      .select(
         Selector::parse(&format!(
           "radiata.woooo.tech/resources/type={ECHO_PROTOCOL}"
         ))
         .unwrap(),
         PageSpec::first(8).unwrap(),
-      ))
+      )
       .await
       .unwrap();
     if page.items().len() == 1 {
@@ -791,11 +762,7 @@ async fn resource_labels_never_enable_protocols() {
     assert!(deadline.elapsed() < Duration::from_secs(30));
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer instead of the wall-clock tick.
-    issuer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    issuer.handle.sync().await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
@@ -804,15 +771,7 @@ async fn resource_labels_never_enable_protocols() {
   let error = issuer
     .handle
     .open_stream(
-      StreamTarget::Exact(
-        member
-          .handle
-          .query(radiata::GetLocalNode::new())
-          .await
-          .unwrap()
-          .node_id()
-          .clone(),
-      ),
+      StreamTarget::Exact(member.handle.local_node().await.unwrap().node_id().clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
       StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
       StreamMetadata::new(),
@@ -821,6 +780,6 @@ async fn resource_labels_never_enable_protocols() {
   assert_eq!(error.kind(), ErrorKind::Unsupported);
 
   for node in [issuer, member] {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }

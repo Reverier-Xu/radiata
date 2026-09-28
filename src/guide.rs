@@ -16,8 +16,7 @@
 //!    `PacketConsumer`](#4-receiving-packets-packetconsumer)
 //! 5. [Holding identity keys:
 //!    `KeyProvider`](#5-holding-identity-keys-keyprovider)
-//! 6. [Leaving the cluster:
-//!    `LeaveCluster`](#6-leaving-the-cluster-leavecluster)
+//! 6. [Leaving the cluster: `node.leave`](#6-leaving-the-cluster-nodeleave)
 //! 7. [Deploying on low-performance
 //!    devices](#7-deploying-on-low-performance-devices)
 //!
@@ -26,7 +25,8 @@
 //! Every resource is a last-writer-wins register ordered by the signed
 //! [`ResourceVersion`](crate::ResourceVersion) tuple: wall-clock
 //! timestamp, writer [`NodeId`](crate::NodeId), removal flag, record
-//! digest. A plain [`PutResource`](crate::PutResource) replaces the
+//! digest. A plain
+//! [`Resources::put`](crate::Resources::put) replaces the
 //! winner unconditionally — a concurrent read-modify-write can silently
 //! lose its update.
 //!
@@ -38,26 +38,28 @@
 //! and commit conditionally. A raced write fails as
 //! [`ErrorKind::Conflict`](crate::ErrorKind::Conflict) instead of
 //! landing quietly; removal is conditional the same way through
-//! [`RemoveResource`](crate::RemoveResource).
+//! [`node.leave`](crate::NodeHandle::leave)'s resource-plane sibling
+//! [`Resources::delete`](crate::Resources::delete).
 //!
 //! ```
-//! use radiata::{PutResource, ResourceLabels, ResourceName, ResourceVersion, ResourceWrite};
+//! use radiata::{NodeHandle, ResourceLabels, ResourceName, ResourceVersion, ResourceWrite};
 //!
 //! /// Builds the conditional write a worker performs after the
 //! /// observed version traveled through a queue: the tuple is rebuilt
 //! /// exactly, and a raced write surfaces as `ErrorKind::Conflict`.
 //! fn enqueue_update(
+//!     node: &NodeHandle,
 //!     observed: &ResourceVersion,
 //!     name: ResourceName,
 //!     labels: ResourceLabels,
-//! ) -> radiata::Result<PutResource> {
+//! ) -> impl Future<Output = radiata::Result<radiata::ResourceMutationView>> {
 //!     let expected = ResourceVersion::from_parts(
 //!         observed.timestamp(),
 //!         observed.writer().clone(),
 //!         observed.is_removal(),
 //!         observed.digest().clone(),
 //!     );
-//!     PutResource::with_expected(ResourceWrite::new(name, labels), expected)
+//!     node.resources().put_expected(ResourceWrite::new(name, labels), expected)
 //! }
 //! ```
 //!
@@ -91,7 +93,8 @@
 //! `unreachable_members` is a bounded diagnostic counter of members the
 //! recovery plane has not reached yet — not a loss list and not a
 //! connectivity verdict.
-//! [`GetConnectionDegree`](crate::GetConnectionDegree) reports the
+//! [`node.connection_degree()`](crate::NodeHandle::connection_degree)
+//! reports the
 //! degree contract: the effective target, the live session count, and
 //! whether the mesh is `Healthy`. A node stuck `Unhealthy` below target
 //! is the operator's signal that the network (or the peers' published
@@ -102,7 +105,7 @@
 //!
 //! ```no_run
 //! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
-//! let view = node.query(radiata::GetRecovery::new()).await?;
+//! let view = node.recovery().await?;
 //! if view.is_connected() {
 //!     // At least one authenticated path exists: business traffic
 //!     // flows, and background anti-entropy converges the rest.
@@ -343,9 +346,9 @@
 //! no longer sign. For `file_key_store` that means the same directory,
 //! durably mounted.
 //!
-//! # 6. Leaving the cluster: `LeaveCluster`
+//! # 6. Leaving the cluster: `node.leave`
 //!
-//! An active leave is three effects behind one command: the node's
+//! An active leave is three effects behind one verb: the node's
 //! identity is replaced with a fresh node id and key, the old
 //! identity's local core metadata is deleted, and the node shuts down
 //! with the active-leave reason. Constructing the
@@ -357,7 +360,7 @@
 //! journal commits there is no abort: a crash or a restart mid-leave
 //! resumes from the durable record and completes the replacement, so
 //! the node never boots as the former identity again. Treat
-//! [`LeaveCluster`](crate::LeaveCluster) as the point of no return for
+//! [`node.leave`](crate::NodeHandle::leave) as the point of no return for
 //! that node slot: the returned
 //! [`LeaveOutcome`](crate::LeaveOutcome) names the exact former and
 //! replacement identities, and the same storage restarted afterwards
@@ -366,9 +369,7 @@
 //! ```no_run
 //! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
 //! let outcome = node
-//!     .command(radiata::LeaveCluster::new(
-//!         radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-//!     ))
+//!     .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
 //!     .await?;
 //! // Durable from here: the node shuts itself down with the
 //! // active-leave reason and restarts as the replacement identity.

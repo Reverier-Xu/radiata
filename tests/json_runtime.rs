@@ -10,14 +10,14 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::{fs, path::Path};
 
+#[cfg(unix)]
+use radiata::NodeStatus;
 use radiata::{
   BoxFuture, Error, ErrorKind, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
   KeyOperationId, NodeBuilder, ProviderErrorContext, ProviderErrorKind, PublicKey, Result,
   Signature,
   extension::{KeyProvider, StorageFactory},
 };
-#[cfg(unix)]
-use radiata::{GetNodeStatus, NodeStatus, Shutdown};
 
 #[derive(Debug, Default)]
 struct Calls {
@@ -175,11 +175,8 @@ async fn json_runtime_node_start_restart_preserves_identity_and_generations() {
   )
   .await
   .unwrap();
-  assert_eq!(
-    first.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running
-  );
-  first.command(Shutdown::new()).await.unwrap();
+  assert_eq!(first.status(), NodeStatus::Running);
+  first.shutdown().await.unwrap();
   let creates_after_first = calls.create.lock().unwrap().len();
   assert_eq!(creates_after_first, 1);
   let files_after_first = generation_files(dir.path());
@@ -193,11 +190,8 @@ async fn json_runtime_node_start_restart_preserves_identity_and_generations() {
   )
   .await
   .unwrap();
-  assert_eq!(
-    second.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running
-  );
-  second.command(Shutdown::new()).await.unwrap();
+  assert_eq!(second.status(), NodeStatus::Running);
+  second.shutdown().await.unwrap();
   assert_eq!(calls.create.lock().unwrap().len(), creates_after_first);
   assert!(*calls.public_key.lock().unwrap() >= 2);
   assert_eq!(generation_files(dir.path()), files_after_first);
@@ -225,14 +219,14 @@ async fn json_runtime_second_node_open_is_storage_locked_until_drop() {
   };
   assert_eq!(error.kind(), ErrorKind::StorageLocked);
 
-  first.command(Shutdown::new()).await.unwrap();
+  first.shutdown().await.unwrap();
   let second = start(
     radiata::adapters::json_store(dir.path().to_path_buf()),
     Arc::new(DeterministicKeys::new(9, Arc::new(Calls::default()))),
   )
   .await
   .unwrap();
-  second.command(Shutdown::new()).await.unwrap();
+  second.shutdown().await.unwrap();
 }
 
 #[cfg(unix)]
@@ -248,7 +242,7 @@ async fn json_runtime_repeated_restarts_keep_every_final_generation() {
     )
     .await
     .unwrap();
-    handle.command(Shutdown::new()).await.unwrap();
+    handle.shutdown().await.unwrap();
     let files = generation_files(dir.path());
     assert!(files.len() >= expected_files.len());
     expected_files = files;

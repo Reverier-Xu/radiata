@@ -31,8 +31,8 @@ use std::{
 };
 
 use radiata::{
-  Endpoint, GetLocalNode, Listen, NodeBuilder, NodeConfig, NodeHandle, NodeId, ProtocolDefinition,
-  ProtocolTag, QualifiedTag, RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
+  Endpoint, NodeBuilder, NodeConfig, NodeHandle, NodeId, ProtocolDefinition, ProtocolTag,
+  QualifiedTag, RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
 };
 use tokio::{
   io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -205,7 +205,8 @@ async fn start_node(
     .await
     .unwrap();
   let listener = handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   (handle, listener.endpoint().clone())
@@ -272,12 +273,7 @@ async fn lane_radiata() {
     "  [radiata] establishment (full merge): {merge:.1?}  (single sample; TLS+WS+5-position auth+admission)"
   );
 
-  let peer = receiver
-    .query(GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let peer = receiver.local_node().await.unwrap().node_id().clone();
   let payload: Arc<[u8]> = Arc::from(vec![0xA5u8; RTT_BYTES]);
 
   // Warmup (results discarded).
@@ -285,13 +281,13 @@ async fn lane_radiata() {
 
   let (ack_rtts, e2e) = run_probes(&sender, &peer, &payload, &mut arrivals_rx).await;
 
-  println!("  [radiata] synchronous admission round trip (open_stream + send_sync -> ack):");
+  println!("  [radiata] synchronous admission round trip (send -> ack):");
   print_latency("send_sync ack round trip", ack_rtts);
   println!("  [radiata] end-to-end delivery (send -> consumer arrival):");
   print_latency("one-probe-stream delivery", e2e);
 
-  sender.command(radiata::Shutdown::new()).await.unwrap();
-  receiver.command(radiata::Shutdown::new()).await.unwrap();
+  sender.shutdown().await.unwrap();
+  receiver.shutdown().await.unwrap();
 }
 
 /// The radiata throughput lane: 32 sequential streams of 1 MiB each.
@@ -308,12 +304,7 @@ async fn lane_radiata_throughput() {
   .await;
   let (sender, _) = start_node(sender_protocols(Arc::clone(&bulk)), 2_500_004).await;
   common::merge_with_retry(&sender, &receiver, receiver_endpoint).await;
-  let peer = receiver
-    .query(GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let peer = receiver.local_node().await.unwrap().node_id().clone();
 
   const STREAMS: usize = 32;
   const CHUNKS_PER_STREAM: usize = 32; // 32 x 32 KiB = 1 MiB per stream
@@ -352,8 +343,8 @@ async fn lane_radiata_throughput() {
     bytes as f64 / (1 << 20) as f64 / wall.as_secs_f64()
   );
 
-  sender.command(radiata::Shutdown::new()).await.unwrap();
-  receiver.command(radiata::Shutdown::new()).await.unwrap();
+  sender.shutdown().await.unwrap();
+  receiver.shutdown().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------

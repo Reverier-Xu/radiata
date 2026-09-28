@@ -42,18 +42,15 @@ pub const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/pending-transac
 pub async fn merge_with_retry(
   node: &radiata::NodeHandle, issuer: &radiata::NodeHandle, endpoint: radiata::Endpoint,
 ) {
-  use radiata::{MergeCluster, MergeCredential, RotateMergeCredential};
-  let issued = issuer.command(RotateMergeCredential::new()).await.unwrap();
+  use radiata::MergeCredential;
+  let issued = issuer.credentials().rotate().await.unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut attempts = 0_u32;
   loop {
     attempts += 1;
     let credential = MergeCredential::parse(&secret).unwrap();
-    match node
-      .command(MergeCluster::new(endpoint.clone(), credential))
-      .await
-    {
+    match node.join(endpoint.clone(), credential).await {
       Ok(_) => return,
       Err(error) => {
         assert!(
@@ -70,14 +67,14 @@ pub async fn merge_with_retry(
 /// One resource write with bounded retries: a commit racing the
 /// anti-entropy driver's writes transiently refuses with NotReady (the
 /// single-store in-flight-commit rule). Retries with a bound, matching
-/// the merge harness precedent. `write` rebuilds the command for
-/// each attempt (commands are single-use values).
+/// the merge harness precedent. `write` rebuilds the write intent for
+/// each attempt (put futures are single-use values).
 pub async fn put_resource_with_retry(
-  node: &radiata::NodeHandle, mut write: impl FnMut() -> radiata::PutResource,
+  node: &radiata::NodeHandle, mut write: impl FnMut() -> radiata::ResourceWrite,
 ) {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match node.command(write()).await {
+    match node.resources().put(write()).await {
       Ok(_) => return,
       Err(error) => {
         assert!(

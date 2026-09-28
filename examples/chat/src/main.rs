@@ -13,9 +13,7 @@ mod unix_transport;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use radiata::{
-  ExtensionRegistry, GetLocalNode, Listen, NodeBuilder, ProtocolDefinition, ProtocolTag,
-};
+use radiata::{ExtensionRegistry, NodeBuilder, ProtocolDefinition, ProtocolTag};
 
 use crate::{chat::ChatConsumer, http::SharedState, store::ChatStore};
 
@@ -126,13 +124,12 @@ async fn main() {
     .await
     .expect("radiata node start");
   node
-    .command(Listen::new(
-      radiata::Endpoint::parse(&config.listen).expect("LISTEN endpoint"),
-    ))
+    .listeners()
+    .create(radiata::Endpoint::parse(&config.listen).expect("LISTEN endpoint"))
     .await
     .expect("listen");
   let node_id = node
-    .query(GetLocalNode::new())
+    .local_node()
     .await
     .expect("local node")
     .node_id()

@@ -6,8 +6,7 @@ use std::{
 };
 
 use radiata::{
-  Command, ErrorKind, GetNodeStatus, NodeBuilder, NodeHandle, NodeStatus, Query, Shutdown,
-  ShutdownOutcome, ShutdownReason, WaitForShutdown,
+  ErrorKind, NodeBuilder, NodeHandle, NodeStatus, ShutdownOutcome, ShutdownReason,
   extension::{KeyProvider, StorageFactory},
 };
 
@@ -68,14 +67,23 @@ impl Providers {
 }
 
 #[test]
-fn lifecycle_sealed_operations_preserve_outputs() {
-  fn assert_command<Operation: Command<Output = ShutdownOutcome>>() {}
-  fn assert_status_query<Operation: Query<Output = NodeStatus>>() {}
-  fn assert_wait_query<Operation: Query<Output = ShutdownReason>>() {}
-
-  assert_command::<Shutdown>();
-  assert_status_query::<GetNodeStatus>();
-  assert_wait_query::<WaitForShutdown>();
+fn lifecycle_verbs_preserve_outputs() {
+  // Pins the three lifecycle signatures through one never-called async
+  // fn: the output types are the contract the verb surface must keep.
+  async fn pinned(
+    node: &NodeHandle,
+  ) -> (
+    radiata::Result<ShutdownOutcome>,
+    NodeStatus,
+    radiata::Result<ShutdownReason>,
+  ) {
+    (
+      node.shutdown().await,
+      node.status(),
+      node.wait_for_shutdown().await,
+    )
+  }
+  let _ = pinned;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -83,10 +91,7 @@ async fn lifecycle_start_and_shutdown_provisions_identity_once() {
   let providers = Providers::new();
   let handle = providers.start().await;
 
-  assert_eq!(
-    handle.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running,
-  );
+  assert_eq!(handle.status(), NodeStatus::Running,);
   assert_eq!(
     providers.entropy.fills(),
     &[32, 14, 14, 14, 14, 14, 14],
@@ -102,7 +107,7 @@ async fn lifecycle_start_and_shutdown_provisions_identity_once() {
   );
   assert_eq!(providers.factory.commit_calls(), 4);
 
-  let outcome = handle.command(Shutdown::new()).await.unwrap();
+  let outcome = handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
   assert_eq!(providers.entropy.fills().len(), 7);
   assert_eq!(providers.factory.commit_calls(), 4);
@@ -115,15 +120,9 @@ async fn lifecycle_cloned_handles_share_runtime_status() {
   let first = providers.start().await;
   let second = first.clone();
 
-  assert_eq!(
-    first.query(GetNodeStatus::new()).await.unwrap(),
-    second.query(GetNodeStatus::new()).await.unwrap(),
-  );
-  first.command(Shutdown::new()).await.unwrap();
-  assert_eq!(
-    second.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Stopped,
-  );
+  assert_eq!(first.status(), second.status(),);
+  first.shutdown().await.unwrap();
+  assert_eq!(second.status(), NodeStatus::Stopped,);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -131,24 +130,21 @@ async fn lifecycle_shutdown_and_wait_are_idempotent() {
   let providers = Providers::new();
   let handle = providers.start().await;
   let waiter = handle.clone();
-  let waiting = tokio::spawn(async move { waiter.query(WaitForShutdown::new()).await });
+  let waiting = tokio::spawn(async move { waiter.wait_for_shutdown().await });
   tokio::task::yield_now().await;
 
-  let first = handle.command(Shutdown::new()).await.unwrap();
+  let first = handle.shutdown().await.unwrap();
   let reason = waiting.await.unwrap().unwrap();
-  let second = handle.command(Shutdown::new()).await.unwrap();
+  let second = handle.shutdown().await.unwrap();
 
   assert_eq!(first.reason(), &ShutdownReason::Explicit);
   assert_eq!(second.reason(), &ShutdownReason::Explicit);
   assert_eq!(reason, ShutdownReason::Explicit);
   assert_eq!(
-    handle.query(WaitForShutdown::new()).await.unwrap(),
+    handle.wait_for_shutdown().await.unwrap(),
     ShutdownReason::Explicit,
   );
-  assert_eq!(
-    handle.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Stopped,
-  );
+  assert_eq!(handle.status(), NodeStatus::Stopped,);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -162,7 +158,7 @@ async fn lifecycle_concurrent_shutdown_runs_one_drain() {
     let barrier = Arc::clone(&barrier);
     callers.push(tokio::spawn(async move {
       barrier.wait().await;
-      caller.command(Shutdown::new()).await
+      caller.shutdown().await
     }));
   }
 
@@ -225,12 +221,9 @@ fn lifecycle_runtime_loss_publishes_failed_terminal_state() {
     .build()
     .unwrap();
   observer.block_on(async {
+    assert_eq!(handle.status(), NodeStatus::Failed,);
     assert_eq!(
-      handle.query(GetNodeStatus::new()).await.unwrap(),
-      NodeStatus::Failed,
-    );
-    assert_eq!(
-      handle.query(WaitForShutdown::new()).await.unwrap(),
+      handle.wait_for_shutdown().await.unwrap(),
       ShutdownReason::Fatal(ErrorKind::Internal),
     );
   });
@@ -241,7 +234,7 @@ async fn lifecycle_shutdown_releases_retained_providers() {
   let providers = Providers::new();
   let handle = providers.start().await;
 
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 
   assert_eq!(providers.storage_drops.count(), 1);
   assert_eq!(providers.factory_drops.count(), 0);
@@ -290,16 +283,14 @@ async fn select_resources_pages_the_empty_catalog() {
 
   let selector = radiata::Selector::parse("radiata.woooo.tech/resources/type=document").unwrap();
   let page = handle
-    .query(radiata::SelectResources::new(
-      selector,
-      radiata::PageSpec::first(8).unwrap(),
-    ))
+    .resources()
+    .select(selector, radiata::PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(page.items().is_empty());
   assert!(page.next().is_none());
 
-  let outcome = handle.command(Shutdown::new()).await.unwrap();
+  let outcome = handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
@@ -312,17 +303,16 @@ async fn select_resources_pages_the_empty_catalog() {
 async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
   let providers = Providers::new();
   let node = providers.start().await;
-  let local = node.query(radiata::GetLocalNode::new()).await.unwrap();
+  let local = node.local_node().await.unwrap();
   let mut events = node
-    .events::<radiata::MemberChanged>(radiata::EventOptions::new())
+    .watch::<radiata::MemberChanged>(radiata::EventOptions::new())
     .unwrap();
 
   // No listener has ever published endpoints, so the anti-entropy loop
   // skips the ensure; this query performs the install itself.
   node
-    .query(radiata::PageMembers::new(
-      radiata::PageSpec::first(8).unwrap(),
-    ))
+    .members()
+    .list(radiata::PageSpec::first(8).unwrap())
     .await
     .unwrap();
   let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -338,9 +328,8 @@ async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
 
   // A steady second query changes nothing and fires nothing.
   node
-    .query(radiata::PageMembers::new(
-      radiata::PageSpec::first(8).unwrap(),
-    ))
+    .members()
+    .list(radiata::PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(
@@ -348,7 +337,7 @@ async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
     "an unchanged ensure must not announce"
   );
 
-  node.command(Shutdown::new()).await.unwrap();
+  node.shutdown().await.unwrap();
 }
 
 /// A caller-required feature outside the negotiation registry fails

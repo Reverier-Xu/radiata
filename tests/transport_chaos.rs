@@ -40,12 +40,10 @@ use std::{
 };
 
 use radiata::{
-  BoxFuture, ConnectMember, CustomListener, CustomTransport, DisconnectPeer, Endpoint, Error,
-  FeatureTag, GetConnectionDegree, GetLocalNode, GetRecovery, IssueMergeCredential, LeaveCluster,
-  Listen, MemberStatus, MergeCluster, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId,
-  PacketConsumer, PageMembers, PageSpec, ProtocolDefinition, ProtocolTag, Result, RoutingPolicy,
-  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TransportName, TransportStream,
-  WaitForShutdown,
+  BoxFuture, CustomListener, CustomTransport, Endpoint, Error, FeatureTag, MemberStatus,
+  MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer, PageSpec,
+  ProtocolDefinition, ProtocolTag, Result, RoutingPolicy, ShutdownReason, StreamMetadata,
+  StreamPolicy, StreamTarget, TransportName, TransportStream,
 };
 mod common;
 
@@ -517,7 +515,7 @@ async fn listen_all(handle: &NodeHandle, sockets: &Path, index: usize) -> Vec<En
     let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
     let listener = loop {
       match bounded(
-        handle.command(Listen::new(requested.clone())),
+        handle.listeners().create(requested.clone()),
         "listen {scheme}",
       )
       .await
@@ -612,7 +610,7 @@ async fn bounded<F: std::future::Future>(future: F, what: &str) -> F::Output {
 /// rotation or expiry, so receivers need no per-join rotation).
 async fn issue_credential(slot: &Slot) -> String {
   let issued = bounded(
-    slot.handle().command(IssueMergeCredential::new()),
+    slot.handle().credentials().issue(),
     "issue merge credential",
   )
   .await
@@ -630,10 +628,10 @@ async fn merge_with_retry(
   loop {
     attempts = attempts.wrapping_add(1);
     match bounded(
-      joiner.handle().command(MergeCluster::new(
+      joiner.handle().join(
         endpoint.clone(),
         MergeCredential::parse(secret).expect("valid credential"),
-      )),
+      ),
       "merge join",
     )
     .await
@@ -656,9 +654,7 @@ async fn connect_member_with_retry(
   loop {
     attempts = attempts.wrapping_add(1);
     match bounded(
-      node
-        .handle()
-        .command(ConnectMember::new(endpoint.clone(), peer.clone())),
+      node.handle().connect(endpoint.clone(), peer.clone()),
       "member reconnect",
     )
     .await
@@ -680,14 +676,14 @@ async fn member_views(slot: &Slot) -> Vec<radiata::MemberView> {
     let page = match cursor {
       None => slot
         .handle()
-        .query(PageMembers::new(PageSpec::first(NODES).expect("page size")))
+        .members()
+        .list(PageSpec::first(NODES).expect("page size"))
         .await
         .expect("member page"),
       Some(cursor) => slot
         .handle()
-        .query(PageMembers::new(
-          PageSpec::after(cursor, NODES).expect("page size"),
-        ))
+        .members()
+        .list(PageSpec::after(cursor, NODES).expect("page size"))
         .await
         .expect("member page"),
     };
@@ -735,13 +731,10 @@ async fn wait_recovery_connected(slots: &[Slot], indices: &[usize], what: &str) 
   loop {
     let mut all_connected = true;
     for index in indices {
-      let connected = bounded(
-        slots[*index].handle().query(GetRecovery::new()),
-        "recovery view",
-      )
-      .await
-      .map(|view| view.is_connected())
-      .unwrap_or(false);
+      let connected = bounded(slots[*index].handle().recovery(), "recovery view")
+        .await
+        .map(|view| view.is_connected())
+        .unwrap_or(false);
       if !connected {
         all_connected = false;
         break;
@@ -751,12 +744,9 @@ async fn wait_recovery_connected(slots: &[Slot], indices: &[usize], what: &str) 
       return;
     }
     for index in indices {
-      bounded(
-        slots[*index].handle().command(radiata::RunSyncRound::new()),
-        "sync round",
-      )
-      .await
-      .expect("sync round");
+      bounded(slots[*index].handle().sync(), "sync round")
+        .await
+        .expect("sync round");
     }
     assert!(
       std::time::Instant::now() < deadline,
@@ -775,13 +765,10 @@ async fn wait_degree_healthy(slots: &[Slot], indices: &[usize], what: &str) {
   loop {
     let mut all_healthy = true;
     for index in indices {
-      let healthy = bounded(
-        slots[*index].handle().query(GetConnectionDegree::new()),
-        "degree view",
-      )
-      .await
-      .map(|view| view.state() == radiata::ConnectionDegreeState::Healthy)
-      .unwrap_or(false);
+      let healthy = bounded(slots[*index].handle().connection_degree(), "degree view")
+        .await
+        .map(|view| view.state() == radiata::ConnectionDegreeState::Healthy)
+        .unwrap_or(false);
       if !healthy {
         all_healthy = false;
         break;
@@ -791,12 +778,9 @@ async fn wait_degree_healthy(slots: &[Slot], indices: &[usize], what: &str) {
       return;
     }
     for index in indices {
-      bounded(
-        slots[*index].handle().command(radiata::RunSyncRound::new()),
-        "sync round",
-      )
-      .await
-      .expect("sync round");
+      bounded(slots[*index].handle().sync(), "sync round")
+        .await
+        .expect("sync round");
     }
     assert!(
       std::time::Instant::now() < deadline,
@@ -819,7 +803,7 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
     let checks = futures_util::future::join_all(indices.iter().map(|index| async move {
       let slot = &slots[*index];
       let members = active_members(slot).await == expected;
-      let recovery = bounded(slot.handle().query(GetRecovery::new()), "recovery view")
+      let recovery = bounded(slot.handle().recovery(), "recovery view")
         .await
         .map(|view| view.is_connected())
         .unwrap_or(false);
@@ -845,12 +829,9 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
       last_report = std::time::Instant::now();
       for index in &stragglers {
         let slot = &slots[*index];
-        let recovery = bounded(
-          slot.handle().query(GetRecovery::new()),
-          "recovery view diag",
-        )
-        .await
-        .expect("recovery view");
+        let recovery = bounded(slot.handle().recovery(), "recovery view diag")
+          .await
+          .expect("recovery view");
         // Name absent identities: diff each straggler's member ids
         // against a converged reference node's set, so a missing row
         // names itself instead of hiding behind a count.
@@ -889,9 +870,8 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
           .unwrap_or_default();
         let sessions = slot
           .handle()
-          .query(radiata::PageSessions::new(
-            PageSpec::first(NODES).expect("page size"),
-          ))
+          .sessions()
+          .list(PageSpec::first(NODES).expect("page size"))
           .await
           .map(|page| page.items().len())
           .unwrap_or(0);
@@ -903,12 +883,9 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
       }
     }
     futures_util::future::join_all(stragglers.iter().map(|index| async move {
-      bounded(
-        slots[*index].handle().command(radiata::RunSyncRound::new()),
-        "sync round",
-      )
-      .await
-      .expect("sync round");
+      bounded(slots[*index].handle().sync(), "sync round")
+        .await
+        .expect("sync round");
     }))
     .await;
     assert!(
@@ -973,7 +950,7 @@ async fn relay_packet(from: &Slot, to: &Slot, what: &str) {
 /// Shuts one slot down (the shutdown must already have been requested)
 /// and waits for the reported reason.
 async fn await_shutdown(slot: &mut Slot) -> ShutdownReason {
-  let reason = bounded(slot.handle().query(WaitForShutdown::new()), "shutdown wait")
+  let reason = bounded(slot.handle().wait_for_shutdown(), "shutdown wait")
     .await
     .expect("shutdown wait");
   slot.handle = None;
@@ -1022,7 +999,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
     slots.push(start_slot(index, sockets.path()).await);
   }
   for slot in &mut slots {
-    let id = bounded(slot.handle().query(GetLocalNode::new()), "local node")
+    let id = bounded(slot.handle().local_node(), "local node")
       .await
       .expect("local node")
       .node_id()
@@ -1076,12 +1053,9 @@ async fn sixty_four_node_mixed_transport_chaos() {
   // connection-degree maintenance plane, and the components bridge as
   // soon as one cross-component dial lands. The center then restarts on
   // the same identity and rejoins through its own healing planes.
-  bounded(
-    slots[0].handle().command(radiata::Shutdown::new()),
-    "hub shutdown",
-  )
-  .await
-  .expect("hub shutdown");
+  bounded(slots[0].handle().shutdown(), "hub shutdown")
+    .await
+    .expect("hub shutdown");
   assert_eq!(
     await_shutdown(&mut slots[0]).await,
     ShutdownReason::Explicit
@@ -1117,7 +1091,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
   // plane brings the degree back to target.
   restart_slot(&mut slots[0], sockets.path(), 0).await;
   let rebooted = bounded(
-    slots[0].handle().query(GetLocalNode::new()),
+    slots[0].handle().local_node(),
     "hub local node after restart",
   )
   .await
@@ -1146,9 +1120,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
     // Absence after a concurrent prune is benign; a real failure
     // surfaces through the convergence check below.
     let _ = bounded(
-      slots[from]
-        .handle()
-        .command(DisconnectPeer::new(ids[to].clone())),
+      slots[from].handle().disconnect(ids[to].clone()),
       "disconnect peer",
     )
     .await;
@@ -1183,9 +1155,9 @@ async fn sixty_four_node_mixed_transport_chaos() {
     // Leave: acknowledged replacement, old identity tombstoned, node
     // shuts down with the active-leave reason.
     let outcome = bounded(
-      slots[leaver].handle().command(LeaveCluster::new(
-        radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-      )),
+      slots[leaver]
+        .handle()
+        .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new()),
       "leave cluster",
     )
     .await
@@ -1201,7 +1173,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
     // and keys): a fresh outsider, per the leave custody contract.
     restart_slot(&mut slots[leaver], sockets.path(), leaver).await;
     let replacement = bounded(
-      slots[leaver].handle().query(GetLocalNode::new()),
+      slots[leaver].handle().local_node(),
       "local node after leave",
     )
     .await
@@ -1266,19 +1238,16 @@ async fn sixty_four_node_mixed_transport_chaos() {
   // kicks lane already exercised).
   let tail = NODES - 1;
   let restarted_id = slots[tail].id().clone();
-  bounded(
-    slots[tail].handle().command(radiata::Shutdown::new()),
-    "graceful shutdown",
-  )
-  .await
-  .expect("graceful shutdown");
+  bounded(slots[tail].handle().shutdown(), "graceful shutdown")
+    .await
+    .expect("graceful shutdown");
   assert_eq!(
     await_shutdown(&mut slots[tail]).await,
     ShutdownReason::Explicit
   );
   restart_slot(&mut slots[tail], sockets.path(), tail).await;
   let booted = bounded(
-    slots[tail].handle().query(GetLocalNode::new()),
+    slots[tail].handle().local_node(),
     "local node after restart",
   )
   .await
@@ -1311,12 +1280,9 @@ async fn sixty_four_node_mixed_transport_chaos() {
       NODES,
       "node {index} lost members under churn"
     );
-    let recovery = bounded(
-      slot.handle().query(GetRecovery::new()),
-      "recovery view post-churn",
-    )
-    .await
-    .expect("recovery view");
+    let recovery = bounded(slot.handle().recovery(), "recovery view post-churn")
+      .await
+      .expect("recovery view");
     assert!(recovery.is_connected(), "node {index} never reconnected");
   }
   for former in [&ids[3], &ids[35]] {
@@ -1333,12 +1299,9 @@ async fn sixty_four_node_mixed_transport_chaos() {
   // exhaust the relay acks: center to a mid-bus body crosses center ->
   // head -> six bodies and back.
   for slot in &slots {
-    bounded(
-      slot.handle().command(radiata::RunSyncRound::new()),
-      "settle sync round",
-    )
-    .await
-    .expect("settle sync round");
+    bounded(slot.handle().sync(), "settle sync round")
+      .await
+      .expect("settle sync round");
   }
   tokio::time::sleep(Duration::from_secs(2)).await;
   relay_packet(&slots[0], &slots[STAR_SPOKES + 7], "center-to-bus relay").await;
@@ -1347,12 +1310,8 @@ async fn sixty_four_node_mixed_transport_chaos() {
   // ---- Teardown ------------------------------------------------------
   for slot in &mut slots {
     if let Some(handle) = slot.handle.take() {
-      let _ = bounded(
-        handle.command(radiata::Shutdown::new()),
-        "teardown shutdown",
-      )
-      .await;
-      let _ = bounded(handle.query(WaitForShutdown::new()), "teardown wait").await;
+      let _ = bounded(handle.shutdown(), "teardown shutdown").await;
+      let _ = bounded(handle.wait_for_shutdown(), "teardown wait").await;
     }
   }
 }

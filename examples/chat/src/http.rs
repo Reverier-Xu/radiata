@@ -13,10 +13,9 @@ use axum::{
   routing::{get, post},
 };
 use radiata::{
-  ConnectionDegreeState, GetConnectionDegree, GetResource, LabelKey, LabelValue, NodeHandle,
-  NodeId, PageSessions, PageSpec, PutResource, RemoveResource, ResourceLabels, ResourceName,
-  ResourceUri, ResourceWrite, RoutingPolicy, SelectResources, Selector, StreamMetadata,
-  StreamPolicy, StreamTarget,
+  ConnectionDegreeState, LabelKey, LabelValue, NodeHandle, NodeId, PageSpec, ResourceLabels,
+  ResourceName, ResourceUri, ResourceWrite, RoutingPolicy, Selector, StreamPolicy,
+  StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -119,11 +118,11 @@ pub async fn publish_identity(state: &SharedState) -> Result<(), String> {
     LabelValue::parse(state.node_id.as_str()).map_err(|error| error.to_string())?,
   )
   .map_err(|error| error.to_string())?;
-  let put =
-    PutResource::new(ResourceWrite::new(name, labels)).map_err(|error| error.to_string())?;
+  let write = ResourceWrite::new(name, labels);
   state
     .node
-    .command(put)
+    .resources()
+    .put(write)
     .await
     .map_err(|error| error.to_string())?;
   Ok(())
@@ -133,7 +132,7 @@ pub async fn publish_identity(state: &SharedState) -> Result<(), String> {
 /// roster. A missing identity reads as an unknown user.
 async fn resolve_user(state: &SharedState, user: &str) -> Option<NodeId> {
   let name = ResourceName::parse(&domain_tag("resources", &format!("user-{user}"))).ok()?;
-  let view = state.node.query(GetResource::new(name)).await.ok()??;
+  let view = state.node.resources().get(name).await.ok()??;
   let node_id = view
     .labels()
     .custom_labels()
@@ -148,7 +147,7 @@ async fn get_resource_json(
   state: &SharedState, name: &str,
 ) -> Result<Option<(Value, radiata::ResourceVersion)>, (StatusCode, Json<Value>)> {
   let name = ResourceName::parse(name).map_err(name_error)?;
-  match state.node.query(GetResource::new(name)).await {
+  match state.node.resources().get(name).await {
     Ok(Some(view)) => {
       let custom: serde_json::Map<String, Value> = view
         .labels()
@@ -197,7 +196,8 @@ async fn list_kind(
   while let Some(spec) = next {
     let page = state
       .node
-      .query(SelectResources::new(selector.clone(), spec))
+      .resources()
+      .select(selector.clone(), spec)
       .await
       .map_err(internal)?;
     for view in page.items() {
@@ -250,19 +250,11 @@ async fn send_wire(
   // never delivered across it), and routes are loop-free by validation,
   // so a generous budget costs nothing beyond one check per hop.
   let policy = StreamPolicy::new(RoutingPolicy::Direct, 128).map_err(|error| error.to_string())?;
-  let stream = state
-    .node
-    .open_stream(
-      StreamTarget::Exact(peer.clone()),
-      protocol,
-      policy,
-      StreamMetadata::new(),
-    )
-    .map_err(|error| error.to_string())?;
   let chunk: Arc<[u8]> = Arc::from(payload.into_boxed_slice());
   let body = futures_util::stream::iter([Ok(chunk)]);
-  stream
-    .send_sync(body)
+  state
+    .node
+    .send(StreamTarget::Exact(peer.clone()), protocol, policy, body)
     .await
     .map(|_ack| ())
     .map_err(|error| error.to_string())
@@ -313,8 +305,12 @@ async fn announce(
     .map_err(name_error)?;
   let resource = format!("resources/{name}");
   let resource_name = ResourceName::parse(&domain_tag("resources", &name)).map_err(name_error)?;
-  let put = PutResource::new(ResourceWrite::new(resource_name, labels)).map_err(name_error)?;
-  state.node.command(put).await.map_err(conflict_error)?;
+  state
+    .node
+    .resources()
+    .put(ResourceWrite::new(resource_name, labels))
+    .await
+    .map_err(conflict_error)?;
   Ok(Json(
     json!({"created": true, "name": domain_tag("resources", &name), "resource": resource}),
   ))
@@ -603,12 +599,15 @@ async fn create_group(
     return Err(conflict_msg("group already exists"));
   }
   let labels = group_labels(&state.user, &state.user, &request.name).map_err(name_error)?;
-  let put = PutResource::new(ResourceWrite::new(
-    ResourceName::parse(&name).map_err(name_error)?,
-    labels,
-  ))
-  .map_err(name_error)?;
-  state.node.command(put).await.map_err(conflict_error)?;
+  state
+    .node
+    .resources()
+    .put(ResourceWrite::new(
+      ResourceName::parse(&name).map_err(name_error)?,
+      labels,
+    ))
+    .await
+    .map_err(conflict_error)?;
   Ok(Json(
     json!({"created": true, "group": request.name, "members": [state.user]}),
   ))
@@ -647,12 +646,15 @@ async fn join_group(
       .unwrap_or(&state.user)
       .to_owned();
     let labels = group_labels(&roster, &owner, &name).map_err(name_error)?;
-    let put = PutResource::with_expected(
-      ResourceWrite::new(ResourceName::parse(&full).map_err(name_error)?, labels),
-      version,
-    )
-    .map_err(name_error)?;
-    match state.node.command(put).await {
+    match state
+      .node
+      .resources()
+      .put_expected(
+        ResourceWrite::new(ResourceName::parse(&full).map_err(name_error)?, labels),
+        version,
+      )
+      .await
+    {
       Ok(_) => return Ok(Json(json!({"joined": true, "members": members}))),
       // The precondition lost a race: re-read and rebuild.
       Err(error) if error.kind() == radiata::ErrorKind::Conflict => continue,
@@ -695,10 +697,8 @@ async fn dissolve_group(
   }
   state
     .node
-    .command(RemoveResource::new(
-      ResourceName::parse(&full).map_err(name_error)?,
-      version,
-    ))
+    .resources()
+    .delete(ResourceName::parse(&full).map_err(name_error)?, version)
     .await
     .map_err(conflict_error)?;
   Ok(Json(json!({"dissolved": true})))
@@ -774,7 +774,8 @@ async fn send_group_message(
 async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let issued = state
     .node
-    .command(radiata::IssueMergeCredential::new())
+    .credentials()
+    .issue()
     .await
     .map_err(internal)?;
   Ok(Json(json!({
@@ -791,7 +792,8 @@ async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCod
 async fn rotate_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let issued = state
     .node
-    .command(radiata::RotateMergeCredential::new())
+    .credentials()
+    .rotate()
     .await
     .map_err(internal)?;
   Ok(Json(json!({
@@ -840,11 +842,7 @@ async fn join_chat(
       )
     })?;
     let endpoint = radiata::Endpoint::parse(&request.bootstrap_wss).map_err(name_error)?;
-    match state
-      .node
-      .command(radiata::MergeCluster::new(endpoint, credential))
-      .await
-    {
+    match state.node.join(endpoint, credential).await {
       Ok(_) => return Ok(Json(json!({"joined": true}))),
       Err(error) => {
         if attempt >= 10 {
@@ -879,7 +877,8 @@ async fn mesh_sessions(
   while let Some(page) = next {
     let view = state
       .node
-      .query(PageSessions::new(page))
+      .sessions()
+      .list(page)
       .await
       .map_err(internal)?;
     raw += view.items().len();
@@ -900,7 +899,7 @@ async fn mesh_sessions(
   peers.dedup();
   let degree = state
     .node
-    .query(GetConnectionDegree::new())
+    .connection_degree()
     .await
     .map_err(internal)?;
   Ok(Json(json!({
@@ -926,7 +925,8 @@ fn label_map_json(view: &radiata::MemberView) -> serde_json::Map<String, Value> 
 async fn get_metadata(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let view = state
     .node
-    .query(radiata::GetMember::new(state.node_id.clone()))
+    .members()
+    .get(state.node_id.clone())
     .await
     .map_err(internal)?
     .ok_or_else(|| not_found("local member view"))?;
@@ -952,7 +952,8 @@ async fn member_labels(
   };
   let view = state
     .node
-    .query(radiata::GetMember::new(node_id))
+    .members()
+    .get(node_id)
     .await
     .map_err(internal)?
     .ok_or_else(|| not_found("member view not converged"))?;
@@ -994,10 +995,7 @@ async fn update_metadata(
   }
   let view = state
     .node
-    .command(radiata::UpdateNodeMetadata::new(
-      request.expected_revision,
-      patch,
-    ))
+    .patch_metadata(request.expected_revision, patch)
     .await
     .map_err(conflict_error)?;
   Ok(Json(json!({
@@ -1018,11 +1016,7 @@ async fn disconnect(
   state: State<SharedState>, Json(request): Json<DisconnectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let peer = NodeId::parse(&request.node_id).map_err(name_error)?;
-  state
-    .node
-    .command(radiata::DisconnectPeer::new(peer))
-    .await
-    .map_err(internal)?;
+  state.node.disconnect(peer).await.map_err(internal)?;
   Ok(Json(json!({"disconnected": true})))
 }
 
@@ -1043,7 +1037,7 @@ async fn connect(
   let node_id = NodeId::parse(&request.node_id).map_err(name_error)?;
   let connected = state
     .node
-    .command(radiata::ConnectMember::new(endpoint, node_id))
+    .connect(endpoint, node_id)
     .await
     .map_err(internal)?;
   Ok(Json(json!({"connected": connected.as_str()})))
@@ -1056,9 +1050,7 @@ async fn connect(
 async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let outcome = state
     .node
-    .command(radiata::LeaveCluster::new(
-      radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-    ))
+    .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
     .map_err(internal)?;
   Ok(Json(json!({

@@ -1,6 +1,6 @@
 //! Public-API integration tests for authorization revocation.
 //!
-//! Every test drives the facade only: `RevokeNode` durably revokes one
+//! Every test drives the facade only: `node.revoke` durably revokes one
 //! exact binding, closes its sessions, and denies its new sessions,
 //! admissions, and dials — while stored metadata stays eligible for
 //! ordinary sync and unrelated members are untouched.
@@ -8,10 +8,9 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  Endpoint, ErrorKind, EventOptions, EventReceive, Listen, MergeCluster, MergeCredential,
-  NodeBuilder, NodeConfig, NodeHandle, NodeId, NodeRevoked, PageSpec, PageTrust, PutResource,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RevokeNode, RotateMergeCredential,
-  SelectResources, Selector, Shutdown, TrustStatus, extension::KeyProvider,
+  Endpoint, ErrorKind, EventOptions, EventReceive, MergeCredential, NodeBuilder, NodeConfig,
+  NodeHandle, NodeId, NodeRevoked, PageSpec, ResourceLabels, ResourceName, ResourceUri,
+  ResourceWrite, Selector, TrustStatus, extension::KeyProvider,
 };
 
 mod common;
@@ -48,19 +47,15 @@ async fn start_node(seed: u64) -> Node {
 async fn listen(node: &Node) -> Endpoint {
   let listener = node
     .handle
-    .command(Listen::new(node.endpoint.clone()))
+    .listeners()
+    .create(node.endpoint.clone())
     .await
     .unwrap();
   listener.endpoint().clone()
 }
 
 async fn local_id(node: &NodeHandle) -> NodeId {
-  node
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone()
+  node.local_node().await.unwrap().node_id().clone()
 }
 
 /// The member's trusted public key as the issuer observes it. Trust
@@ -71,9 +66,10 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
   loop {
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer instead of the wall-clock tick.
-    issuer.command(radiata::RunSyncRound::new()).await.unwrap();
+    issuer.sync().await.unwrap();
     let page = issuer
-      .query(PageTrust::new(PageSpec::first(64).unwrap()))
+      .trust()
+      .list(PageSpec::first(64).unwrap())
       .await
       .unwrap();
     if let Some(view) = page.items().iter().find(|view| view.node_id() == member) {
@@ -90,7 +86,8 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
 /// The member's trust status as the issuer observes it.
 async fn trust_status(issuer: &NodeHandle, member: &NodeId) -> Option<TrustStatus> {
   issuer
-    .query(PageTrust::new(PageSpec::first(64).unwrap()))
+    .trust()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap()
     .items()
@@ -99,8 +96,8 @@ async fn trust_status(issuer: &NodeHandle, member: &NodeId) -> Option<TrustStatu
     .map(|view| view.status())
 }
 
-fn write(name_seed: u8) -> PutResource {
-  PutResource::new(ResourceWrite::new(
+fn write(name_seed: u8) -> ResourceWrite {
+  ResourceWrite::new(
     ResourceName::parse(&format!(
       "radiata.woooo.tech/resources/revoke-{name_seed:03}"
     ))
@@ -109,16 +106,16 @@ fn write(name_seed: u8) -> PutResource {
       radiata::LabelValue::parse("document").unwrap(),
       ResourceUri::parse(&format!("file:///revoke/{name_seed:03}")).unwrap(),
     ),
-  ))
-  .unwrap()
+  )
 }
 
 async fn selected_names(node: &NodeHandle) -> Vec<String> {
   let page = node
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
       PageSpec::first(64).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   page
@@ -144,7 +141,7 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
 
   // The member commits a resource the issuer converges on before the
   // revoke (delayed content must stay eligible afterwards).
-  member.handle.command(write(1)).await.unwrap();
+  member.handle.resources().put(write(1)).await.unwrap();
   let member_resource = "radiata.woooo.tech/resources/revoke-001".to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   while !selected_names(&issuer.handle)
@@ -156,23 +153,19 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
       "no resource sync"
     );
     // Schedule the next convergence observation on the observer.
-    issuer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    issuer.handle.sync().await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
   let member_key = trusted_key(&issuer.handle, &member.id).await;
   let mut events = issuer
     .handle
-    .events::<NodeRevoked>(EventOptions::new())
+    .watch::<NodeRevoked>(EventOptions::new())
     .unwrap();
 
   let outcome = issuer
     .handle
-    .command(RevokeNode::new(member.id.clone(), member_key.clone()))
+    .revoke(member.id.clone(), member_key.clone())
     .await
     .unwrap();
   assert_eq!(outcome.subject(), &member.id);
@@ -206,10 +199,7 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   // New dials to the revoked identity fail with the typed revocation.
   let error = issuer
     .handle
-    .command(radiata::ConnectMember::new(
-      member.endpoint.clone(),
-      member.id.clone(),
-    ))
+    .connect(member.endpoint.clone(), member.id.clone())
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Revoked);
@@ -219,16 +209,9 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   // responder-side revocation check rejects a revoked subject's join
   // after a leave: every lane fails closed, never with admission.
   let rejoin = async {
-    let issued = issuer
-      .handle
-      .command(RotateMergeCredential::new())
-      .await
-      .unwrap();
+    let issued = issuer.handle.credentials().rotate().await.unwrap();
     let credential = MergeCredential::parse(issued.credential().expose_secret()).unwrap();
-    member
-      .handle
-      .command(MergeCluster::new(listen(&issuer).await, credential))
-      .await
+    member.handle.join(listen(&issuer).await, credential).await
   };
   let error = rejoin.await.unwrap_err();
   assert!(
@@ -258,7 +241,8 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   tokio::time::sleep(SYNC_INTERVAL * 6).await;
   let members = issuer
     .handle
-    .query(radiata::PageMembers::new(PageSpec::first(8).unwrap()))
+    .members()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   let member_view = members
@@ -273,7 +257,7 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   );
 
   for node in [issuer, member] {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -293,7 +277,7 @@ async fn revoke_is_exact_and_idempotent() {
 
   let mut events = issuer
     .handle
-    .events::<NodeRevoked>(EventOptions::new())
+    .watch::<NodeRevoked>(EventOptions::new())
     .unwrap();
 
   // Unknown subject: nothing trusted to revoke.
@@ -301,7 +285,7 @@ async fn revoke_is_exact_and_idempotent() {
   assert_eq!(
     issuer
       .handle
-      .command(RevokeNode::new(unknown, member_key.clone()))
+      .revoke(unknown, member_key.clone())
       .await
       .unwrap_err()
       .kind(),
@@ -312,7 +296,7 @@ async fn revoke_is_exact_and_idempotent() {
   assert_eq!(
     issuer
       .handle
-      .command(RevokeNode::new(member.id.clone(), wrong_key))
+      .revoke(member.id.clone(), wrong_key)
       .await
       .unwrap_err()
       .kind(),
@@ -324,7 +308,7 @@ async fn revoke_is_exact_and_idempotent() {
   assert_eq!(
     issuer
       .handle
-      .command(RevokeNode::new(issuer_id, issuer_key))
+      .revoke(issuer_id, issuer_key)
       .await
       .unwrap_err()
       .kind(),
@@ -338,7 +322,7 @@ async fn revoke_is_exact_and_idempotent() {
   // The exact revoke commits once; the repeat is idempotent.
   let outcome = issuer
     .handle
-    .command(RevokeNode::new(member.id.clone(), member_key.clone()))
+    .revoke(member.id.clone(), member_key.clone())
     .await
     .unwrap();
   assert!(!outcome.was_already_revoked());
@@ -350,7 +334,7 @@ async fn revoke_is_exact_and_idempotent() {
 
   let outcome = issuer
     .handle
-    .command(RevokeNode::new(member.id.clone(), member_key))
+    .revoke(member.id.clone(), member_key)
     .await
     .unwrap();
   assert!(outcome.was_already_revoked());
@@ -360,7 +344,7 @@ async fn revoke_is_exact_and_idempotent() {
   ));
 
   for node in [issuer, member] {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -376,7 +360,7 @@ async fn delayed_content_converges_after_revoke() {
   common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
   let member_id = local_id(&member.handle).await;
 
-  member.handle.command(write(2)).await.unwrap();
+  member.handle.resources().put(write(2)).await.unwrap();
   let member_resource = "radiata.woooo.tech/resources/revoke-002".to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   while !selected_names(&issuer.handle)
@@ -388,11 +372,7 @@ async fn delayed_content_converges_after_revoke() {
       "no resource sync"
     );
     // Schedule the next convergence observation on the observer.
-    issuer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    issuer.handle.sync().await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
@@ -402,7 +382,7 @@ async fn delayed_content_converges_after_revoke() {
   let member_key = trusted_key(&issuer.handle, &member_id).await;
   issuer
     .handle
-    .command(RevokeNode::new(member_id.clone(), member_key))
+    .revoke(member_id.clone(), member_key)
     .await
     .unwrap();
 
@@ -418,11 +398,7 @@ async fn delayed_content_converges_after_revoke() {
       "delayed content must converge to the new member"
     );
     // Schedule the next convergence observation on the observer.
-    third
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    third.handle.sync().await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
@@ -444,11 +420,7 @@ async fn delayed_content_converges_after_revoke() {
           "binding never converged"
         );
         // Schedule the next convergence observation on the observer.
-        third
-          .handle
-          .command(radiata::RunSyncRound::new())
-          .await
-          .unwrap();
+        third.handle.sync().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         continue;
       };
@@ -460,11 +432,7 @@ async fn delayed_content_converges_after_revoke() {
         "revocation tombstone never converged: {status:?}"
       );
       // Schedule the next convergence observation on the observer.
-      third
-        .handle
-        .command(radiata::RunSyncRound::new())
-        .await
-        .unwrap();
+      third.handle.sync().await.unwrap();
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
   })
@@ -472,6 +440,6 @@ async fn delayed_content_converges_after_revoke() {
   .unwrap();
 
   for node in [issuer, member, third] {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }

@@ -10,9 +10,8 @@
 use std::sync::Arc;
 
 use radiata::{
-  DeclareInterruptedTransactionUncommitted, Endpoint, ErrorKind, GetLocalNode, Listen,
-  MergeCluster, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, ResolveFrozenJournal,
-  RotateMergeCredential, Shutdown, extension::StorageFactory,
+  DeclareInterruptedTransactionUncommitted, Endpoint, ErrorKind, MergeCredential, NodeBuilder,
+  NodeConfig, NodeHandle, extension::StorageFactory,
 };
 
 mod common;
@@ -63,13 +62,10 @@ async fn start_configured(
 /// name instead of hanging the job past its budget (the windows-runner
 /// hang shape).
 async fn stop(node: &Node, what: &'static str) {
-  tokio::time::timeout(
-    std::time::Duration::from_secs(120),
-    node.handle.command(Shutdown::new()),
-  )
-  .await
-  .unwrap_or_else(|_| panic!("{what}: shutdown never completed"))
-  .unwrap();
+  tokio::time::timeout(std::time::Duration::from_secs(120), node.handle.shutdown())
+    .await
+    .unwrap_or_else(|_| panic!("{what}: shutdown never completed"))
+    .unwrap();
 }
 
 async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Node {
@@ -94,10 +90,7 @@ fn keys_at(seed: u64) -> Arc<ScriptedKeys> {
 async fn merge(
   node: &Node, endpoint: &Endpoint, credential: MergeCredential,
 ) -> radiata::Result<radiata::MergeView> {
-  node
-    .handle
-    .command(MergeCluster::new(endpoint.clone(), credential))
-    .await
+  node.handle.join(endpoint.clone(), credential).await
 }
 
 /// Issues one merge credential with bounded retries: merge-sensitive
@@ -106,7 +99,7 @@ async fn merge(
 async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
   loop {
-    match issuer.handle.command(RotateMergeCredential::new()).await {
+    match issuer.handle.credentials().rotate().await {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -138,7 +131,8 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
 
@@ -152,21 +146,18 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-  joiner.handle.command(Shutdown::new()).await.unwrap();
+  joiner.handle.shutdown().await.unwrap();
 
   // The indeterminate outcome froze the receiver: credential rotation
   // and new listening are blocked with NotReady, and a merge attempt is
   // refused before any credential validation or signing work.
   let _signing_calls_after_freeze = receiver.keys.take_calls();
-  let rotation = receiver
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap_err();
+  let rotation = receiver.handle.credentials().rotate().await.unwrap_err();
   assert_eq!(rotation.kind(), ErrorKind::NotReady);
   let listen = receiver
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap_err();
   assert_eq!(listen.kind(), ErrorKind::NotReady);
@@ -177,10 +168,7 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
     MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
   let merge_result = fresh_joiner
     .handle
-    .command(MergeCluster::new(
-      listener.endpoint().clone(),
-      gate_credential,
-    ))
+    .join(listener.endpoint().clone(), gate_credential)
     .await;
   assert!(
     merge_result.is_err(),
@@ -190,8 +178,8 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
     receiver.keys.take_calls().is_empty(),
     "blocked operations must not sign"
   );
-  fresh_joiner.handle.command(Shutdown::new()).await.unwrap();
-  receiver.handle.command(Shutdown::new()).await.unwrap();
+  fresh_joiner.handle.shutdown().await.unwrap();
+  receiver.handle.shutdown().await.unwrap();
 
   // Authoritative reopen with the same identity reconciles the journal to
   // committed: the receiver starts unblocked and the durable merge
@@ -202,26 +190,27 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   let (later, _) = fresh_node(4_000).await;
   let merge = merge(&later, listener.endpoint(), issued.into_credential())
     .await
     .unwrap();
-  let local = later.handle.query(GetLocalNode::new()).await.unwrap();
+  let local = later.handle.local_node().await.unwrap();
   assert_eq!(local.node_id(), merge.node());
-  later.handle.command(Shutdown::new()).await.unwrap();
-  receiver.handle.command(Shutdown::new()).await.unwrap();
+  later.handle.shutdown().await.unwrap();
+  receiver.handle.shutdown().await.unwrap();
 }
 
 /// The permanent-contradiction freeze: the journaled adoption landed but
 /// the provider's receipt is gone, so every reopen re-derives the same
 /// contradiction and the store stays blocked. The acknowledged
-/// `ResolveFrozenJournal` declaration resolves the frozen journal as
+/// `resolve_frozen_journal` declaration resolves the frozen journal as
 /// uncommitted: the node unfreezes in place, admission-sensitive
-/// commands work again, and the resolution is durable across a restart
-/// on the same storage. On a healthy store the command is a typed
+/// verbs work again, and the resolution is durable across a restart
+/// on the same storage. On a healthy store the verb is a typed
 /// rejection, never an accidental unfreeze.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_contradiction() {
@@ -233,17 +222,16 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
   let receiver = start(provider.clone(), keys_at(5_000)).await;
   let listener = receiver
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
 
   // Typed rejection on a healthy store: nothing is frozen, so the
-  // command refuses and the node keeps serving.
+  // verb refuses and the node keeps serving.
   let healthy = receiver
     .handle
-    .command(ResolveFrozenJournal::new(
-      DeclareInterruptedTransactionUncommitted::new(),
-    ))
+    .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
     .await
     .unwrap_err();
   assert_eq!(healthy.kind(), ErrorKind::Conflict);
@@ -262,12 +250,8 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
     merge_outcome.is_err(),
     "the faulted merge unexpectedly succeeded: {merge_outcome:?}"
   );
-  joiner.handle.command(Shutdown::new()).await.unwrap();
-  let blocked = receiver
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap_err();
+  joiner.handle.shutdown().await.unwrap();
+  let blocked = receiver.handle.credentials().rotate().await.unwrap_err();
   assert_eq!(blocked.kind(), ErrorKind::NotReady);
 
   // Make the contradiction permanent: the adoption receipt disappears,
@@ -276,12 +260,10 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
   memory.forget_receipt(&adopted);
 
   // The acknowledged declaration resolves the frozen journal: the store
-  // unfreezes and admission-sensitive commands work again.
+  // unfreezes and admission-sensitive verbs work again.
   receiver
     .handle
-    .command(ResolveFrozenJournal::new(
-      DeclareInterruptedTransactionUncommitted::new(),
-    ))
+    .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
     .await
     .unwrap();
   rotate_with_retry(&receiver).await;
@@ -292,7 +274,7 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
   drop(receiver);
   let receiver = start(provider, receiver_keys).await;
   rotate_with_retry(&receiver).await;
-  receiver.handle.command(Shutdown::new()).await.unwrap();
+  receiver.handle.shutdown().await.unwrap();
 }
 
 /// A definite pre-commit abort leaves the node unblocked and
@@ -309,7 +291,8 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
 
@@ -332,7 +315,7 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
   // Prove the abort was final before the later attempt: no evidence of
   // the abandoned merge survives.
   fault.reset_script(Vec::new());
-  joiner.handle.command(Shutdown::new()).await.unwrap();
+  joiner.handle.shutdown().await.unwrap();
 
   // The abort is final: the binding, the credential use, and the grant
   // are all absent, the store is not frozen, and one later attempt with
@@ -340,17 +323,18 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
   let issued = rotate_with_retry(&receiver).await;
   let listener = receiver
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   let (later, _) = fresh_node(3_100).await;
   let merge = merge(&later, listener.endpoint(), issued.into_credential())
     .await
     .unwrap();
-  let local = later.handle.query(GetLocalNode::new()).await.unwrap();
+  let local = later.handle.local_node().await.unwrap();
   assert_eq!(local.node_id(), merge.node());
-  later.handle.command(Shutdown::new()).await.unwrap();
-  receiver.handle.command(Shutdown::new()).await.unwrap();
+  later.handle.shutdown().await.unwrap();
+  receiver.handle.shutdown().await.unwrap();
 }
 
 /// Slow-flash commit injection (the starvation gate's slow-storage
@@ -383,7 +367,8 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
   let issued_a = rotate_with_retry(&issuer_a).await;
   let listener_a = issuer_a
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   // Let the sync driver's startup descriptor ensure land unwrapped:
@@ -430,7 +415,8 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
   let issued_b = rotate_with_retry(&issuer_b).await;
   let listener_b = issuer_b
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -449,7 +435,7 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
   .unwrap_or_else(|error| {
     panic!("the calibrated default must admit the two-write admission path: {error:?}")
   });
-  let local = joiner_b.handle.query(GetLocalNode::new()).await.unwrap();
+  let local = joiner_b.handle.local_node().await.unwrap();
   assert_eq!(local.node_id(), view.node());
   stop(&joiner_b, "phase b joiner").await;
   stop(&issuer_b, "phase b issuer").await;

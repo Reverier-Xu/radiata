@@ -510,46 +510,46 @@ impl NodeHandle {
 
   /// The public membership observations: point reads (`get`) and pages
   /// (`list`).
-  pub fn members(&self) -> Members<'_> {
+  pub fn members(&self) -> Members {
     Members::new(&self.runtime)
   }
 
   /// The node's resource register: `get`, `list`, `select`, `put`,
   /// `put_expected`, and `delete` over the live winners.
-  pub fn resources(&self) -> Resources<'_> {
+  pub fn resources(&self) -> Resources {
     Resources::new(&self.runtime)
   }
 
   /// The node's bound listeners: `create` binds a new listener,
   /// `delete` unbinds one, `list` pages the live set.
-  pub fn listeners(&self) -> Listeners<'_> {
+  pub fn listeners(&self) -> Listeners {
     Listeners::new(&self.runtime)
   }
 
   /// The live authenticated sessions: `list` pages the session set.
-  pub fn sessions(&self) -> Sessions<'_> {
+  pub fn sessions(&self) -> Sessions {
     Sessions::new(&self.runtime)
   }
 
   /// The public topology edges: `list` pages the edge set.
-  pub fn topology(&self) -> Topology<'_> {
+  pub fn topology(&self) -> Topology {
     Topology::new(&self.runtime)
   }
 
   /// The public trust observations: `list` pages the trust set.
-  pub fn trust(&self) -> Trust<'_> {
+  pub fn trust(&self) -> Trust {
     Trust::new(&self.runtime)
   }
 
   /// The cluster's live join credentials: `issue` hands out the live
   /// generation, `rotate` replaces it.
-  pub fn credentials(&self) -> Credentials<'_> {
+  pub fn credentials(&self) -> Credentials {
     Credentials::new(&self.runtime)
   }
 
   /// The in-memory packet route records: `get` reads one route's
   /// bounded status.
-  pub fn routes(&self) -> Routes<'_> {
+  pub fn routes(&self) -> Routes {
     Routes::new(&self.runtime)
   }
 

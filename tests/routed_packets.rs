@@ -16,10 +16,9 @@ use std::{
 };
 
 use radiata::{
-  ConnectMember, DisconnectPeer, ErrorKind, GetRoute, IncomingStream, Listen, MergeCluster,
-  NodeBuilder, NodeConfig, NodeHandle, PacketConsumer, PageTopology, ProtocolTag, QualifiedTag,
-  RotateMergeCredential, RouteNextHop, RouteState, RoutingPolicy, Shutdown, StreamMetadata,
-  StreamPolicy, StreamTarget,
+  ErrorKind, IncomingStream, NodeBuilder, NodeConfig, NodeHandle, PacketConsumer, ProtocolTag,
+  QualifiedTag, RouteNextHop, RouteState, RoutingPolicy, StreamMetadata, StreamPolicy,
+  StreamTarget,
 };
 
 mod common;
@@ -195,9 +194,8 @@ impl Node {
   async fn listen(&mut self) {
     let listener = self
       .handle
-      .command(Listen::new(
-        radiata::Endpoint::parse("wss://127.0.0.1:0").unwrap(),
-      ))
+      .listeners()
+      .create(radiata::Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
       .unwrap();
     self.endpoint = Some(listener.endpoint().clone());
@@ -216,7 +214,7 @@ impl Node {
     loop {
       match self
         .handle
-        .command(ConnectMember::new(endpoint.clone(), peer.id().clone()))
+        .connect(endpoint.clone(), peer.id().clone())
         .await
       {
         Ok(_) => return,
@@ -258,7 +256,7 @@ fn init_tracing() {
 async fn wait_until_terminal(handle: &NodeHandle, route: &radiata::RouteHandle) -> RouteState {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    let state = match handle.query(GetRoute::new(route.clone())).await {
+    let state = match handle.routes().get(route) {
       Ok(view) => view.state().clone(),
       Err(_) => continue,
     };
@@ -293,7 +291,7 @@ async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
   // listeners come up and each merge reports the member's identity.
   let anchor_id = nodes[0]
     .handle
-    .query(radiata::GetLocalNode::new())
+    .local_node()
     .await
     .unwrap()
     .node_id()
@@ -302,11 +300,7 @@ async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
   nodes[0].listen().await;
 
   for member_index in 1..=3usize {
-    let issued = nodes[0]
-      .handle
-      .command(RotateMergeCredential::new())
-      .await
-      .unwrap();
+    let issued = nodes[0].handle.credentials().rotate().await.unwrap();
     let secret = issued.credential().expose_secret().to_owned();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     let mut attempts = 0_u32;
@@ -314,10 +308,10 @@ async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
       attempts += 1;
       let result = nodes[member_index]
         .handle
-        .command(MergeCluster::new(
+        .join(
           nodes[0].endpoint().clone(),
           radiata::MergeCredential::parse(&secret).unwrap(),
-        ))
+        )
         .await;
       match result {
         Ok(view) => {
@@ -349,9 +343,8 @@ async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
     for node in &nodes {
       let page = node
         .handle
-        .query(radiata::PageTrust::new(
-          radiata::PageSpec::first(64).unwrap(),
-        ))
+        .trust()
+        .list(radiata::PageSpec::first(64).unwrap())
         .await;
       match page {
         Ok(page) if page.items().len() >= 4 => {}
@@ -368,11 +361,7 @@ async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round per node instead of the wall-clock tick.
     for node in &nodes {
-      node
-        .handle
-        .command(radiata::RunSyncRound::new())
-        .await
-        .unwrap();
+      node.handle.sync().await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
@@ -390,12 +379,12 @@ async fn settle_linear_chain(nodes: &[Node]) {
   nodes[2].connect_to(&nodes[3]).await;
   nodes[0]
     .handle
-    .command(DisconnectPeer::new(nodes[3].id().clone()))
+    .disconnect(nodes[3].id().clone())
     .await
     .unwrap();
   nodes[3]
     .handle
-    .command(DisconnectPeer::new(nodes[0].id().clone()))
+    .disconnect(nodes[0].id().clone())
     .await
     .unwrap();
 
@@ -417,7 +406,8 @@ async fn settle_linear_chain(nodes: &[Node]) {
     for node in nodes {
       let page = node
         .handle
-        .query(PageTopology::new(radiata::PageSpec::first(64).unwrap()))
+        .topology()
+        .list(radiata::PageSpec::first(64).unwrap())
         .await
         .unwrap();
       for edge in page.items() {
@@ -528,11 +518,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   loop {
     // The supervisor inserts the route record asynchronously after
     // `send_async` queues the request; keep waiting until it exists.
-    let view = match nodes[0]
-      .handle
-      .query(radiata::GetRoute::new(route_handle.clone()))
-      .await
-    {
+    let view = match nodes[0].handle.routes().get(&route_handle) {
       Ok(view) => view,
       Err(error) if error.kind() == radiata::ErrorKind::NotFound => {
         assert!(
@@ -561,7 +547,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   // Break the last leg while the body is still gated.
   nodes[2]
     .handle
-    .command(DisconnectPeer::new(nodes[3].id().clone()))
+    .disconnect(nodes[3].id().clone())
     .await
     .unwrap();
 
@@ -606,7 +592,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   );
 
   for node in &nodes {
-    let _ = node.handle.command(Shutdown::new()).await;
+    let _ = node.handle.shutdown().await;
   }
 }
 
@@ -658,7 +644,7 @@ async fn default_policy_relays_routed_packets_without_configuration() {
   }
 
   for node in &nodes {
-    let _ = node.handle.command(Shutdown::new()).await;
+    let _ = node.handle.shutdown().await;
   }
 }
 
@@ -715,6 +701,6 @@ async fn a_body_above_the_chunk_bound_crosses_three_hops_byte_exact() {
   }
 
   for node in &nodes {
-    let _ = node.handle.command(Shutdown::new()).await;
+    let _ = node.handle.shutdown().await;
   }
 }
