@@ -65,14 +65,8 @@ pub use node::{
   NodeBuilder, NodeHandle, Resources, Routes, Sessions, Topology, Trust,
 };
 pub use operation::{
-  ApplyReceiptRetention, CleanupNode, Command, ConnectMember, DisconnectPeer, Event,
-  GetConnectionDegree, GetLocalNode, GetMember, GetNodeStatus, GetObservability, GetRecovery,
-  GetResource, GetRoute, IdentityReplaced, IssueCleanupCheckpoint, IssueMergeCredential,
-  LeaveCluster, Listen, MemberChanged, MergeCluster, NodeRevoked, PageListeners, PageMembers,
-  PageResources, PageSessions, PageTopology, PageTrust, PurgeRevocation, PutResource, Query,
-  RecoveryChanged, RemoveResource, ResolveFrozenJournal, ResourceChanged, ResourceWrite,
-  RevokeNode, RotateMergeCredential, RouteChanged, RunSyncRound, SelectResources, SessionChanged,
-  Shutdown, StartRecovery, StopListener, UpdateNodeMetadata, WaitForShutdown,
+  Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
+  ResourceWrite, RouteChanged, SessionChanged,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
