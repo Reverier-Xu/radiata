@@ -14,8 +14,7 @@ use axum::{
 };
 use radiata::{
   ConnectionDegreeState, LabelKey, LabelValue, NodeHandle, NodeId, PageSpec, ResourceLabels,
-  ResourceName, ResourceUri, ResourceWrite, RoutingPolicy, Selector, StreamPolicy,
-  StreamTarget,
+  ResourceName, ResourceUri, ResourceWrite, RoutingPolicy, Selector, StreamPolicy, StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -772,12 +771,7 @@ async fn send_group_message(
 /// generation admits any number of concurrent joins until it is rotated
 /// (explicit revocation) or expires.
 async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let issued = state
-    .node
-    .credentials()
-    .issue()
-    .await
-    .map_err(internal)?;
+  let issued = state.node.credentials().issue().await.map_err(internal)?;
   Ok(Json(json!({
     "credential": issued.credential().expose_secret(),
     "node_id": state.node_id.as_str(),
@@ -790,12 +784,7 @@ async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCod
 /// token mid-join re-fetch on their retry, so an in-flight merge
 /// survives a rotation by re-issuing.
 async fn rotate_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let issued = state
-    .node
-    .credentials()
-    .rotate()
-    .await
-    .map_err(internal)?;
+  let issued = state.node.credentials().rotate().await.map_err(internal)?;
   Ok(Json(json!({
     "credential": issued.credential().expose_secret(),
     "node_id": state.node_id.as_str(),
@@ -875,12 +864,7 @@ async fn mesh_sessions(
   let mut peers: Vec<String> = Vec::new();
   let mut next = Some(PageSpec::first(64).map_err(name_error)?);
   while let Some(page) = next {
-    let view = state
-      .node
-      .sessions()
-      .list(page)
-      .await
-      .map_err(internal)?;
+    let view = state.node.sessions().list(page).await.map_err(internal)?;
     raw += view.items().len();
     peers.extend(
       view
@@ -897,11 +881,7 @@ async fn mesh_sessions(
   }
   peers.sort();
   peers.dedup();
-  let degree = state
-    .node
-    .connection_degree()
-    .await
-    .map_err(internal)?;
+  let degree = state.node.connection_degree().await.map_err(internal)?;
   Ok(Json(json!({
     "sessions": raw,
     "distinct": peers.len(),
