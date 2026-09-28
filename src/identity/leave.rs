@@ -796,6 +796,9 @@ mod tests {
         store.commit(prepared).await?,
         crate::CommitOutcome::Committed(_)
       ));
+      // The persisted record is new tombstone evidence: the write epoch
+      // arms the tombstone cadence for a next-tick push.
+      store.note_local_write();
     }
     Ok(())
   }

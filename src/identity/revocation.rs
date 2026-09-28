@@ -222,7 +222,12 @@ pub(crate) async fn revoke_binding_ctx(
     ],
   )?;
   match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(receipt) => Ok(RevokeStoreOutcome::Revoked(receipt)),
+    crate::CommitOutcome::Committed(receipt) => {
+      // The persisted revocation is new tombstone evidence: the write
+      // epoch arms the cadence for a next-tick push.
+      store.note_local_write();
+      Ok(RevokeStoreOutcome::Revoked(receipt))
+    }
     // A raced exact revocation committed first: idempotent. Any other
     // interleaving fails closed and the caller retries the operation.
     crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {
@@ -334,7 +339,12 @@ pub(crate) async fn purge_revocation_ctx(
   )?;
   drop(snapshot);
   match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) => Ok(()),
+    crate::CommitOutcome::Committed(_) => {
+      // The persisted revocation is new tombstone evidence: the write
+      // epoch arms the cadence for a next-tick push.
+      store.note_local_write();
+      Ok(())
+    }
     // Defensive: under the exclusion this is unreachable in-process.
     _ => Err(Error::conflict("revocation purge")),
   }

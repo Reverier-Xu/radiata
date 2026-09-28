@@ -398,16 +398,23 @@
 //!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
 //!   and the degree override are the two knobs that change it materially.
 //! - **Background load** is the anti-entropy tick: `N × interval` work per
-//!   round cluster-wide. The tick dispatches to its peers and settles delivery
-//!   verdicts off the tick path, so a hub's per-tick hold-down stays at the
-//!   dispatch cost rather than the slowest peer's ack bound — the reference
-//!   64-node mesh holds the one-second cadence even on a single slow core. Each
-//!   round's dispatch is bounded to a small fair window of the live sessions,
-//!   so the per-round cost is independent of the connection degree: a denser
-//!   node spreads its peers across consecutive rounds instead of bursting once.
-//!   The degree-maintenance tick adds bounded work only while a node is below
-//!   its target: nothing while healthy, one deficit-sized dial batch per 30
-//!   seconds while healing.
+//!   round cluster-wide, and the traffic it emits is diff-only — every sync
+//!   plane tracks, per peer, the digest of each row it has delivered, so the
+//!   descriptor and trust-binding planes send nothing once converged (quiet
+//!   digest scans) and a change costs its changed rows per peer per hop, never
+//!   a whole-catalog re-send. The removal-tombstone plane forwards only
+//!   unconfirmed records and keeps a bounded periodic refresh (an admission
+//!   acknowledgement cannot prove the receiver applied a tombstone whose
+//!   subject's binding had not converged yet). The tick dispatches to its peers
+//!   and settles delivery verdicts off the tick path, so a hub's per-tick
+//!   hold-down stays at the dispatch cost rather than the slowest peer's ack
+//!   bound — the reference 64-node mesh holds the one-second cadence even on a
+//!   single slow core. Each round's dispatch is bounded to a small fair window
+//!   of the live sessions, so the per-round cost is independent of the
+//!   connection degree: a denser node spreads its peers across consecutive
+//!   rounds instead of bursting once. The degree-maintenance tick adds bounded
+//!   work only while a node is below its target: nothing while healthy, one
+//!   deficit-sized dial batch per 30 seconds while healing.
 //!
 //! Delivery across restarts stays the application's job (the data
 //! plane is at-most-once): a `Failed` or interrupted stream is a

@@ -103,7 +103,7 @@ pub(crate) async fn commit_record_ctx(
     // sync pages, retention rewrites), so this one bump is the change
     // signal the sync driver turns into next-tick pushes.
     if matches!(outcome, ResourceCommitOutcome::Installed(_)) {
-      store.note_register_install();
+      store.note_local_write();
     }
   })
 }
@@ -204,7 +204,7 @@ pub(crate) async fn commit_page_batch_ctx(
       }
     }
     if installed > 0 {
-      store.note_register_install();
+      store.note_local_write();
     }
     return Ok(installed);
   }

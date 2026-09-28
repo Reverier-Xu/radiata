@@ -39,7 +39,7 @@ impl ResourcePage {
     &self.records
   }
 
-  #[cfg(any(test, fuzzing))]
+  #[cfg(test)]
   pub(crate) fn cursor(&self) -> Option<&[u8]> {
     self.cursor.as_deref()
   }
@@ -80,7 +80,7 @@ pub(crate) mod sync {
   use std::collections::HashMap;
 
   use super::{MAX_PAGE_RECORDS, ResourcePage, ResourceRecordV1};
-  use crate::{Digest, Error, NodeId, Result, api::Entropy, storage::MetadataStore};
+  use crate::{Error, NodeId, Result, api::Entropy, storage::MetadataStore};
 
   /// How long one record's writer-descriptor lookup waits for the
   /// membership lane to converge before the record skips: the descriptor
@@ -112,15 +112,25 @@ pub(crate) mod sync {
   /// `crate::paging::encode_page`).
   pub(crate) async fn emit_page_filtered_ctx(
     snapshot: &(dyn crate::provider::StoreSnapshot + '_), cursor: Option<&[u8]>, limit: usize,
-    scan_budget: usize, watermarks: &std::collections::BTreeMap<Vec<u8>, Digest>,
-  ) -> Result<FilteredEmission> {
+    scan_budget: usize, watermarks: &std::collections::BTreeMap<Vec<u8>, u64>,
+  ) -> Result<crate::sync_common::FilteredEmission<ResourcePage>> {
+    let namespace = super::super::store::namespace()?;
     crate::paging::emit_with_size_ladder(
       limit.clamp(1, MAX_PAGE_RECORDS),
       "resource page",
       |changed_limit| {
-        emit_filtered_at_capacity(snapshot, cursor, changed_limit, scan_budget, watermarks)
+        crate::sync_common::walk_namespace_filtered(
+          snapshot,
+          &namespace,
+          cursor,
+          changed_limit,
+          scan_budget,
+          watermarks,
+          |_key, value| ResourceRecordV1::decode(value).map(Some),
+          ResourcePage::new,
+        )
       },
-      |emission: &FilteredEmission| match &emission.page {
+      |emission: &crate::sync_common::FilteredEmission<ResourcePage>| match &emission.page {
         Some(page) => wire_payload_fits(page),
         None => Ok(true),
       },
@@ -136,141 +146,11 @@ pub(crate) mod sync {
     })
   }
 
-  /// Emits one filtered detection/emission step at an exact candidate
-  /// capacity (one ladder step): scans a bounded budget of entries from
-  /// `cursor`, collecting records whose stored digest differs from the
-  /// peer's watermark. Skipped (unchanged) entries advance the scan
-  /// without entering the page.
-  ///
-  /// The returned emission distinguishes a budget window that closed
-  /// change-free mid-catalog (the walk continues from its boundary on
-  /// the next tick) from the scan reaching the catalog end (the pass is
-  /// complete). Conflating the two would strand every record behind the
-  /// first quiet window: the pass would "close" at entry 256 of 4096
-  /// and never reach the tail.
-  async fn emit_filtered_at_capacity(
-    snapshot: &(dyn crate::provider::StoreSnapshot + '_), cursor: Option<&[u8]>,
-    changed_limit: usize, scan_budget: usize,
-    watermarks: &std::collections::BTreeMap<Vec<u8>, Digest>,
-  ) -> Result<FilteredEmission> {
-    let namespace = super::super::store::namespace()?;
-    let mut scan = snapshot.scan_from(&namespace, &[], cursor).await?;
-    let mut changed: Vec<ResourceRecordV1> = Vec::new();
-    let mut marks: Vec<(Vec<u8>, Digest)> = Vec::new();
-    let mut last_included = Option::<Vec<u8>>::None;
-    // The walk boundary: the key of the last scanned entry, changed or
-    // not. The pass resumes strictly after it on the next tick.
-    let mut boundary;
-    let mut scanned = 0_usize;
-    while let Some(entry) = scan.next().await? {
-      scanned += 1;
-      let key = entry.key().as_bytes().to_vec();
-      let record = ResourceRecordV1::decode(entry.value().as_bytes())?;
-      let digest = record.digest.clone();
-      boundary = Some(key.clone());
-      // Changed records enter the page and update the page's wire
-      // cursor (the last included record). Unchanged records only
-      // advance the boundary: re-scanning them on later steps is
-      // harmless because application is idempotent.
-      if watermarks.get(&key) != Some(&digest) {
-        changed.push(record);
-        last_included = Some(key.clone());
-        marks.push((key, digest));
-        if changed.len() >= changed_limit {
-          return FilteredEmission::page(
-            changed,
-            last_included,
-            boundary,
-            cursor.map(|value| value.to_vec()),
-            marks,
-          );
-        }
-      }
-      if scanned >= scan_budget {
-        // The scan budget is spent: the pass continues after the
-        // boundary on the next tick, with or without a page.
-        return FilteredEmission::page(
-          changed,
-          last_included,
-          boundary,
-          cursor.map(|value| value.to_vec()),
-          marks,
-        );
-      }
-    }
-    // The scan reached the catalog end: the pass is complete. The page
-    // (if any) still delivers the collected tail records; an empty
-    // emission closes the pass and the cadence restarts.
-    FilteredEmission::finish(
-      changed,
-      last_included,
-      cursor.map(|value| value.to_vec()),
-      marks,
-    )
-  }
-
-  /// One filtered detection/emission step: the bounded changed-record
-  /// page plus the scan bookkeeping the caller needs to commit the walk
-  /// on delivery or rewind on failure.
-  pub(crate) struct FilteredEmission {
-    /// The page of changed records; `None` when the step found nothing
-    /// to deliver.
-    pub(crate) page: Option<ResourcePage>,
-    /// The walk continuation: `Some(boundary key)` while the pass is in
-    /// flight — the next step resumes strictly after it, and a delivered
-    /// page commits exactly here — or `None` when the scan reached the
-    /// catalog end and the pass is complete.
-    pub(crate) walk_cursor: Option<Vec<u8>>,
-    /// The scan position where this step started: an undelivered page
-    /// rewinds to exactly here.
-    pub(crate) scan_start: Option<Vec<u8>>,
-    /// The page records' (store key, digest) delivery marks: committed
-    /// into the peer's watermark table when the page is delivered.
-    pub(crate) marks: Vec<(Vec<u8>, Digest)>,
-  }
-
-  impl FilteredEmission {
-    fn page(
-      changed: Vec<ResourceRecordV1>, last_included: Option<Vec<u8>>, boundary: Option<Vec<u8>>,
-      scan_start: Option<Vec<u8>>, marks: Vec<(Vec<u8>, Digest)>,
-    ) -> Result<Self> {
-      let page = match changed.is_empty() {
-        true => None,
-        false => Some(ResourcePage::new(changed, last_included)?),
-      };
-      Ok(Self {
-        page,
-        walk_cursor: boundary,
-        scan_start,
-        marks,
-      })
-    }
-
-    /// The scan reached the catalog end: with collected records the
-    /// step still emits their page (the pass completes after its
-    /// delivery); without any the pass closes change-free.
-    fn finish(
-      changed: Vec<ResourceRecordV1>, last_included: Option<Vec<u8>>, scan_start: Option<Vec<u8>>,
-      marks: Vec<(Vec<u8>, Digest)>,
-    ) -> Result<Self> {
-      let page = match changed.is_empty() {
-        true => None,
-        false => Some(ResourcePage::new(changed, last_included)?),
-      };
-      Ok(Self {
-        page,
-        walk_cursor: None,
-        scan_start,
-        marks,
-      })
-    }
-  }
-
   /// The unfiltered test/select emit: identical to a filtered pass with
   /// an empty watermark table (every record is changed) and an
   /// unbounded scan budget. A catalog shorter than the limit yields a
   /// page whose cursor is `None` (pass complete).
-  #[cfg(any(test, fuzzing))]
+  #[cfg(test)]
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<ResourcePage> {

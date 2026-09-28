@@ -28,7 +28,6 @@ use crate::{
   membership::page::{DEFAULT_PAGE_LIMIT, MembershipPage, sync as page_sync},
   runtime::RuntimeClient,
   session::stream::SessionTable,
-  sync_common::SyncPageInFlight,
 };
 
 /// The canonical protocol tag of the membership sync stream.
@@ -601,103 +600,122 @@ pub(crate) struct MembershipSyncCursors {
   /// round's dispatch stays bounded (see
   /// [`crate::sync_common::SYNC_PEERS_PER_ROUND`]).
   rotation: Option<NodeId>,
+  /// The register-install epoch at this driver's last tick: any advance
+  /// since then means a local store write (a caller write, an applied
+  /// page, a persisted tombstone, a snapshot refresh) may belong in some
+  /// peer's diff, so every walk arms and pushes the diff within one tick
+  /// per hop instead of one detection cadence per hop.
+  install_epoch: u64,
 }
 
-#[derive(Debug, Default)]
+/// One peer's membership anti-entropy state: the descriptor and trust
+/// planes' shared watermark walks (see
+/// [`crate::sync_common::WatermarkWalk`]) plus the tombstone plane's
+/// confirmed set. Every plane sends only what the peer is missing —
+/// the git remote-tracking model — so a changed row costs one diff row
+/// per peer per hop, never a whole-catalog pass (the 2026-10 audit's
+/// 98% redundancy finding against the whole-catalog fingerprint
+/// rounds this replaced).
+#[derive(Debug, Clone)]
 pub(crate) struct PeerSyncState {
-  /// The last snapshot revision fully delivered to this peer, so
-  /// unchanged grant sets are not re-sent every tick.
-  snapshot_rev: u64,
-  /// The keyset cursor into the issuer's binding set: the last delivered
-  /// trust page's final binding, so a set larger than one wire page
-  /// pages through across ticks.
-  snapshot_cursor: Option<NodeId>,
-  /// The trust pages dispatched but not yet folded into the committed
-  /// cursor, in dispatch order. A failed head page rewinds the dispatch
-  /// position to its own start while later pages keep flowing (the
-  /// receiver adopts per binding, idempotently), so one slow or lost
-  /// acknowledgement cannot truncate the pass before its later pages —
-  /// the head-of-line stall the starvation gate caught.
-  trust_in_flight: std::collections::VecDeque<crate::sync_common::SyncPageInFlight<NodeId>>,
-  /// The dispatch position of the trust pass: the keyset cursor the
-  /// next page pages from. Runs ahead of `snapshot_cursor` (the
-  /// committed position) while pages are in flight.
-  trust_dispatch_cursor: Option<NodeId>,
-  /// Set once the pass dispatched past the final binding: the pass is
-  /// fully dispatched at this revision and completes when its window
-  /// drains. The value is the revision the pass itself dispatched, so
-  /// completion never claims pages a verdict lost.
-  trust_end: Option<u64>,
-  /// Monotonic sequence correlating a settled verdict to its window
-  /// entry.
-  trust_seq: u64,
-  /// Ticks since this peer's last DELIVERED snapshot send: a lost
-  /// delivery must be retried without waiting for the next grant-set
-  /// change. The counter advances every tick — independent of the
-  /// (possibly multi-tick) descriptor-page pass — and is pulled back to
-  /// zero only by a delivered trust page's verdict (or the pass's
-  /// closing tick), so an undelivered round retries on the next tick
-  /// instead of after a full resend interval.
-  ticks_since_snapshot_send: u32,
-  /// Ticks since this peer's last DELIVERED tombstone send: lost removal
-  /// evidence retries on the same slow cadence, independent of the
-  /// (possibly multi-tick) trust-page pass and of the descriptor-page
-  /// plane's state. The counter advances every tick and is pulled back
-  /// to zero only by a fully delivered tombstone round.
+  /// The descriptor plane's watermark walk over the node's descriptor
+  /// catalog: diff pages only, detection cadence shared with the
+  /// resource lane.
+  descriptors: crate::sync_common::WatermarkWalk<Vec<u8>>,
+  /// The trust plane's watermark walk over the local issuer snapshot's
+  /// binding set. Bindings are append-only and adopted per record, so a
+  /// missing binding in a diff page is never a removal (removals retire
+  /// through the tombstone planes), and the digest filter is exact.
+  trust: crate::sync_common::WatermarkWalk<NodeId>,
+  /// The digests of tombstone payloads this peer has admitted, paired
+  /// with the dispatched-round counter since the last confirmation
+  /// refresh: a confirmed tombstone is not re-forwarded until
+  /// [`TOMBSTONE_CONFIRM_REFRESH_TICKS`] ticks have passed (bounded by
+  /// [`TOMBSTONE_CONFIRMED_CAP`]; overflow clears the set for a full
+  /// re-forward — bounded memory over bounded re-delivery). Admission
+  /// is not application: a receiver skips a tombstone whose bindings
+  /// have not converged yet (the leave/revocation evidence out-runs its
+  /// subject's binding on a fresh peer), so the confirmations expire on
+  /// a slow roll and the set re-forwards — the old design's every-
+  /// cadence resend, at an eighth of its cadence and zero traffic in
+  /// between.
+  confirmed_tombstones: std::collections::BTreeSet<u64>,
+  /// Ticks since the last confirmation refresh: the confirmed set
+  /// expires when it reaches
+  /// [`TOMBSTONE_CONFIRM_REFRESH_TICKS`].
+  tombstone_ticks: u32,
+  /// Ticks since this peer's last fully delivered tombstone round: a
+  /// lost payload retries on this cadence with only the unconfirmed
+  /// remainder. Advances every tick, independent of the page planes.
   ticks_since_tombstone_send: u32,
-  /// The shared page-plane continuation state (fingerprint, resend
-  /// cadences, continuation cursor).
-  page: crate::sync_common::PeerPageCursor,
+}
+
+impl Default for PeerSyncState {
+  fn default() -> Self {
+    Self {
+      descriptors: crate::sync_common::WatermarkWalk::new(
+        crate::sync_common::DETECTION_CADENCE_TICKS,
+      ),
+      trust: crate::sync_common::WatermarkWalk::new(SNAPSHOT_RESEND_TICKS),
+      confirmed_tombstones: std::collections::BTreeSet::new(),
+      tombstone_ticks: 0,
+      // A fresh peer is immediately due its first tombstone round: the
+      // confirmed set is empty, so the full bounded set forwards at
+      // once.
+      ticks_since_tombstone_send: SNAPSHOT_RESEND_TICKS,
+    }
+  }
 }
 
 /// The bounded number of known leave records forwarded per snapshot
 /// round (anti-entropy healing without unbounded per-tick work).
 const LEAVE_RESEND_CAP: usize = 64;
 
-/// Snapshot deliveries are retried on this slow cadence even when the
-/// grant set is unchanged, so a dropped payload heals instead of stalling
-/// a peer forever (anti-entropy). The page cadences are single-sourced in
-/// [`crate::sync_common::PeerPageCursor`].
+/// Confirmed tombstone digests held per peer before the set resets to a
+/// full re-forward: the loaded tombstone set is bounded by
+/// [`LEAVE_RESEND_CAP`] plus one checkpoint, so this cap never binds in
+/// practice — it only guards a slow leak if the loading policy ever
+/// changes.
+const TOMBSTONE_CONFIRMED_CAP: usize = LEAVE_RESEND_CAP + 16;
+
+/// Ticks between tombstone-confirmation refreshes: after this many
+/// ticks the peer's confirmed set expires and the next cadence round
+/// re-forwards the whole bounded set, healing the admitted-but-not-
+/// applied divergence (a tombstone skipped because its bindings had
+/// not converged yet). Binding deliveries to the peer also expire the
+/// set (see `apply_round_effects`), which makes the common case heal
+/// within a round; this tick roll is the backstop for a binding the
+/// peer learned from a third party.
+const TOMBSTONE_CONFIRM_REFRESH_TICKS: u32 = SNAPSHOT_RESEND_TICKS * 2;
+
+/// The trust and tombstone planes' shared detection cadence (ticks): a
+/// quiet peer's binding walk re-runs on it — an in-memory digest walk
+/// that emits nothing when every binding matches — and unconfirmed
+/// tombstones retry on it. The descriptor plane runs on the page
+/// lanes' shared cadence (single-sourced in [`crate::sync_common`]).
 const SNAPSHOT_RESEND_TICKS: u32 = 8;
 
-/// The tombstone forwarding decision for one peer round: a revision
-/// change forwards the accumulated tombstones once, and the slow
-/// cadence heals lost ones. The decision is snapshot-INDEPENDENT — a
-/// degraded snapshot leg (refresh failing) must never stall tombstone
-/// propagation, because the tombstones are what retire removed
-/// identities on peers.
-fn tombstone_round_due(
-  revision_advanced: bool, has_tombstones: bool, ticks_since_send: u32, snapshot_due: bool,
-) -> bool {
-  (revision_advanced || has_tombstones)
-    && (ticks_since_send >= SNAPSHOT_RESEND_TICKS || snapshot_due)
+/// The tombstone forwarding decision for one peer round: unconfirmed
+/// tombstones exist and the slow cadence elapsed (a fresh peer, or the
+/// epoch arm after a local persist, starts at the threshold, so new
+/// evidence forwards immediately). The decision is snapshot-INDEPENDENT
+/// — a degraded snapshot leg (refresh failing) must never stall
+/// tombstone propagation, because the tombstones are what retire
+/// removed identities on peers.
+fn tombstone_round_due(unconfirmed: usize, ticks_since_send: u32) -> bool {
+  unconfirmed > 0 && ticks_since_send >= SNAPSHOT_RESEND_TICKS
 }
 
-/// One dispatched trust snapshot page: the keyset cursor it advances
-/// paired with ITS OWN admission receiver. A round dispatches several
-/// payloads per peer (trust page, tombstones, descriptor page), so the
-/// cursor must commit on this payload's verdict alone — another
-/// payload's ack says nothing about the trust page.
-struct SnapshotPageDispatch {
-  seq: u64,
-  ack: tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
-}
-
-/// How many trust pages may be in flight per peer at once. Two is the
-/// minimum that defeats a head-of-line stall: a slow or lost
-/// acknowledgement on page one no longer blocks page two from reaching
-/// the peer, whose adoption is per binding and idempotent.
-const TRUST_PIPELINE_PAGES: usize = 2;
-
-/// The peers of one round whose tombstone verdicts are still
-/// unresolved: tombstones are the one plane without per-payload window
-/// state (their cadence re-arms only when every tombstone of the round
-/// delivered), so an in-flight round skips tombstone forwarding for
-/// that peer. The page and trust planes gate themselves through their
-/// own windows.
+/// The peers of one round whose payload verdicts are still unresolved:
+/// each plane's walk holds its own pending page, and the tombstone plane
+/// holds its unconfirmed remainder, so an in-flight plane skips its
+/// peers this round (their walk state is neither committed nor rewound
+/// yet).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PeerPlanesInFlight {
   pub(crate) tombstones: bool,
+  pub(crate) descriptors: bool,
+  pub(crate) trust: bool,
 }
 
 /// Per-peer in-flight planes, consulted by the next round's dispatch.
@@ -712,23 +730,33 @@ pub(crate) type InFlightRounds = std::collections::BTreeMap<NodeId, PeerPlanesIn
 pub(crate) struct MembershipPendingRound {
   tombstone_acks: Vec<(
     NodeId,
+    u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )>,
   page_acks: Vec<(
     NodeId,
-    u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )>,
-  trust_pages: Vec<(NodeId, SnapshotPageDispatch)>,
+  trust_acks: Vec<(
+    NodeId,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )>,
 }
 
 impl MembershipPendingRound {
   /// The peers with unresolved verdicts and their planes: the skip set
-  /// the next round's dispatch must respect.
+  /// the next round's dispatch must respect (a plane's walk holds its
+  /// pending page until the verdict settles it).
   pub(crate) fn in_flight(&self) -> InFlightRounds {
     let mut in_flight = InFlightRounds::new();
-    for (peer, _) in &self.tombstone_acks {
+    for (peer, ..) in &self.tombstone_acks {
       in_flight.entry(peer.clone()).or_default().tombstones = true;
+    }
+    for (peer, _) in &self.page_acks {
+      in_flight.entry(peer.clone()).or_default().descriptors = true;
+    }
+    for (peer, _) in &self.trust_acks {
+      in_flight.entry(peer.clone()).or_default().trust = true;
     }
     in_flight
   }
@@ -742,40 +770,26 @@ impl MembershipPendingRound {
     // cadence).
     let (tombstone_verdicts, page_verdicts, trust_verdicts) = futures_util::future::join3(
       futures_util::future::join_all(self.tombstone_acks.into_iter().map(
-        |(peer, ack)| async move { (peer, crate::sync_common::delivered_within_bound(ack).await) },
-      )),
-      futures_util::future::join_all(self.page_acks.into_iter().map(
-        |(peer, seq, ack)| async move {
+        |(peer, digest, ack)| async move {
           (
             peer,
-            seq,
+            digest,
             crate::sync_common::delivered_within_bound(ack).await,
           )
         },
       )),
-      futures_util::future::join_all(self.trust_pages.into_iter().map(|(peer, page)| async move {
-        let delivered = crate::sync_common::delivered_within_bound(page.ack).await;
-        (peer, page.seq, delivered)
+      futures_util::future::join_all(self.page_acks.into_iter().map(|(peer, ack)| async move {
+        (peer, crate::sync_common::delivered_within_bound(ack).await)
+      })),
+      futures_util::future::join_all(self.trust_acks.into_iter().map(|(peer, ack)| async move {
+        (peer, crate::sync_common::delivered_within_bound(ack).await)
       })),
     )
     .await;
-    // A tombstone round re-arms its resend cadence only when EVERY
-    // tombstone of the round was admitted; any lost one retries on the
-    // next tick (the cadence counters kept advancing meanwhile).
-    let mut tombstone_rounds: std::collections::BTreeMap<NodeId, bool> =
-      std::collections::BTreeMap::new();
-    for (peer, delivered) in tombstone_verdicts {
-      let entry = tombstone_rounds.entry(peer).or_insert(true);
-      *entry &= delivered;
-    }
-    // A failed page verdict stays in the peer's window as the retry
-    // barrier: later pages keep flowing (their application is per
-    // record and idempotent) while the committed cursor never claims
-    // the failed page's range.
     MembershipRoundEffects {
-      tombstone_rounds,
-      trust_verdicts,
+      tombstone_verdicts,
       page_verdicts,
+      trust_verdicts,
     }
   }
 }
@@ -783,88 +797,56 @@ impl MembershipPendingRound {
 /// The verdict effects of one dispatched round, ready to apply to the
 /// cursors.
 pub(crate) struct MembershipRoundEffects {
-  tombstone_rounds: std::collections::BTreeMap<NodeId, bool>,
-  trust_verdicts: Vec<(NodeId, u64, bool)>,
-  page_verdicts: Vec<(NodeId, u64, bool)>,
+  tombstone_verdicts: Vec<(NodeId, u64, bool)>,
+  page_verdicts: Vec<(NodeId, bool)>,
+  trust_verdicts: Vec<(NodeId, bool)>,
 }
 
-/// Applies one settled round's verdict effects to the cursors: an
-/// unadmitted page rewinds that peer's page cursor to the failed page's
-/// start so the next tick re-sends exactly that page, a fully delivered
-/// tombstone round re-arms the tombstone resend cadence, and a delivered
-/// trust page re-arms the snapshot cadence while advancing the keyset
-/// cursor. An undelivered round resets nothing, so the next tick retries
-/// it.
+/// Applies one settled round's verdict effects to the cursors: a page
+/// verdict settles its walk (delivered commits the marks and boundary,
+/// undelivered rewinds to the page's scan start), a delivered tombstone
+/// confirms its digest (never re-forwarded), and a fully delivered
+/// tombstone round re-arms the resend cadence. An undelivered page
+/// resets nothing beyond the rewind, so the next tick retries exactly
+/// that range.
 pub(crate) fn apply_round_effects(
   cursors: &mut MembershipSyncCursors, effects: MembershipRoundEffects,
 ) {
-  for (peer, tombstones_delivered) in effects.tombstone_rounds {
-    if tombstones_delivered && let Some(state) = cursors.peers.get_mut(&peer) {
+  for (peer, digest, delivered) in effects.tombstone_verdicts {
+    if let Some(state) = cursors.peers.get_mut(&peer)
+      && delivered
+    {
+      if state.confirmed_tombstones.len() >= TOMBSTONE_CONFIRMED_CAP {
+        state.confirmed_tombstones.clear();
+      }
+      state.confirmed_tombstones.insert(digest);
       state.ticks_since_tombstone_send = 0;
     }
   }
-  let mut touched: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
-  for (peer, seq, delivered) in effects.trust_verdicts {
+  for (peer, delivered) in effects.page_verdicts {
     if let Some(state) = cursors.peers.get_mut(&peer)
-      && let Some(entry) = state
-        .trust_in_flight
-        .iter_mut()
-        .find(|entry| entry.seq == seq)
+      && let Some(settled) = state.descriptors.settle_outcome(delivered)
+      && settled.refreshed
     {
-      entry.delivered = Some(delivered);
-      touched.insert(peer);
+      crate::audit::membership_watermarks_refreshed(peer.as_str());
     }
   }
-  for peer in effects.page_verdicts {
-    if let Some(state) = cursors.peers.get_mut(&peer.0) {
-      state.page.page_settle(peer.1, peer.2);
-    }
-  }
-  for peer in touched {
+  for (peer, delivered) in effects.trust_verdicts {
     if let Some(state) = cursors.peers.get_mut(&peer) {
-      settle_trust_window(state);
-    }
-  }
-}
-
-/// Folds settled verdicts into a peer's committed cursor: the prefix of
-/// consecutive delivered pages commits its continuations in order, and
-/// stops at the first failed or still-unsettled page. A failed head
-/// page stays in the window as the retry barrier: later pages may keep
-/// flowing behind it (the receiver adopts per binding, idempotently),
-/// but the committed cursor never claims a range a verdict lost.
-fn settle_trust_window(state: &mut PeerSyncState) {
-  loop {
-    let advance = matches!(
-      state.trust_in_flight.front().map(|head| head.delivered),
-      Some(Some(true))
-    );
-    if !advance {
-      break;
-    }
-    if let Some(head) = state.trust_in_flight.pop_front() {
-      if let Some(cursor) = head.cursor {
-        state.snapshot_cursor = Some(cursor);
+      let settled = state.trust.settle_outcome(delivered);
+      if settled.is_some_and(|outcome| outcome.refreshed) {
+        crate::audit::membership_watermarks_refreshed(peer.as_str());
       }
-      state.ticks_since_snapshot_send = 0;
+      if settled.is_some_and(|outcome| outcome.advanced) {
+        // New binding evidence reached this peer: any tombstone it
+        // skipped for a not-yet-known binding may apply now, so its
+        // confirmations expire and the next cadence round re-forwards
+        // the set (the common admitted-but-not-applied heal). A page
+        // whose marks were all already known advances nothing and
+        // leaves the confirmations alone.
+        state.confirmed_tombstones.clear();
+      }
     }
-  }
-  complete_settled_pass(state);
-}
-
-/// Marks a fully dispatched pass complete once its window drained: the
-/// recorded revision — the one the pass itself dispatched — is the
-/// revision the marker claims, so completion never asserts pages a
-/// verdict lost.
-fn complete_settled_pass(state: &mut PeerSyncState) {
-  if let Some(rev) = state.trust_end
-    && state.trust_in_flight.is_empty()
-  {
-    state.snapshot_cursor = None;
-    state.trust_dispatch_cursor = None;
-    state.snapshot_rev = rev;
-    state.ticks_since_snapshot_send = 0;
-    state.trust_end = None;
   }
 }
 
@@ -881,325 +863,239 @@ pub(crate) async fn settle_round(
 }
 
 /// The outcome of one per-peer membership round: the admission receivers
-/// for every dispatched payload (grouped so each lane's cadence commit is
-/// verdict-gated by the tick aggregator), the dispatched trust page if
-/// any, and whether any payload dispatched at all (a rejected dispatch
-/// fails the peer for this round).
+/// for every dispatched payload (grouped per plane so each lane's commit
+/// is verdict-gated by the tick aggregator), and whether any payload
+/// dispatched at all (a rejected dispatch fails the peer for this
+/// round).
 struct MembershipPeerRound {
-  /// The round's tombstone payloads' admission receivers: a fully
-  /// delivered set re-arms the tombstone resend cadence.
-  tombstone_acks: Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
-  /// The descriptor page's admission receiver, set only when a page was
-  /// due and dispatched; its verdict commits or rewinds the page cursor
-  /// through the peer's window. A `None` beside dispatched bytes means
-  /// the wire rejected the page: no window entry landed, and the
-  /// derived dispatch position re-emits the page next round.
-  page_dispatch: Option<SnapshotPageDispatch>,
-  snapshot_page: Option<SnapshotPageDispatch>,
+  /// The round's tombstone payloads' digests paired with their admission
+  /// receivers: a delivered digest confirms against the peer's set.
+  tombstone_acks: Vec<(
+    u64,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )>,
+  /// The descriptor page's admission receiver: its verdict settles the
+  /// peer's descriptor walk. A `None` beside dispatched bytes means the
+  /// wire rejected the page: no pending entry landed, and the walk
+  /// re-emits the same range next round.
+  page_ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  /// The trust page's admission receiver: its verdict settles the peer's
+  /// trust walk.
+  trust_ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
   dispatched: bool,
 }
 
-/// One page dispatch reservation: the sequence and start handed to the
-/// wire plus the freshly computed continuation, everything needed to
-/// land the window entry once the wire accepts the page.
-struct PageReservation {
-  seq: u64,
-  start: Option<Vec<u8>>,
-  continuation: Option<Vec<u8>>,
+/// One dispatch prepared by a plane's walk: the encoded payload bytes
+/// paired with the walk bookkeeping the delivery verdict settles.
+struct PendingDispatch<K> {
+  bytes: Vec<u8>,
+  boundary: Option<K>,
+  marks: Vec<(Vec<u8>, u64)>,
 }
 
 /// One per-peer membership anti-entropy step, mirroring the resource
-/// lane's `resource_sync_tick_peer`: decide the round against the
-/// whole-catalog fingerprint, emit the bounded descriptor page only when
-/// the page plane is due, decide the snapshot/tombstone legs, dispatch
-/// one round, and advance the peer's continuation state. The delivery
-/// verdicts are aggregated (and cursor commits gated) by the tick's
-/// caller.
+/// lane's `resource_sync_tick_peer`: each plane's watermark walk decides
+/// its own round — a quiet walk dispatches nothing at all (an unchanged
+/// catalog, an unchanged binding set, a fully confirmed tombstone set),
+/// and a due walk emits the next bounded diff page carrying only the
+/// rows the peer is missing. The delivery verdicts are aggregated (and
+/// walk commits gated) by the tick's caller.
 #[allow(clippy::too_many_arguments)]
 async fn membership_sync_tick_peer(
   catalog: &(dyn crate::provider::StoreSnapshot + '_), entropy: &Arc<dyn Entropy>,
   runtime: &RuntimeClient, peer: &NodeId, state: &mut PeerSyncState, protocol: &ProtocolTag,
-  snapshot: Option<&crate::identity::trust::TrustSnapshotV1>, tombstone_bytes: &[Vec<u8>],
-  catalog_fingerprint: u64, planes: PeerPlanesInFlight,
+  snapshot: Option<&crate::identity::trust::TrustSnapshotV1>, tombstones: &[(u64, Vec<u8>)],
+  planes: PeerPlanesInFlight,
 ) -> Result<MembershipPeerRound> {
-  state.page.arm_full_pass();
-  // The snapshot and tombstone resend cadences advance on every tick —
-  // they are independent of the (possibly multi-tick) descriptor-page
-  // pass — and are pulled back to zero only by delivery verdicts in the
-  // tick's aggregator, so an undelivered round retries on the next tick
-  // instead of waiting out the full resend interval.
-  state.ticks_since_snapshot_send = state.ticks_since_snapshot_send.saturating_add(1);
+  // The tombstone cadence advances every tick — independent of the page
+  // planes' (possibly multi-tick) passes — and is pulled back to zero
+  // only by delivered tombstone verdicts in the tick's aggregator, so
+  // an undelivered round retries on the cadence instead of waiting out
+  // a full resend interval.
   state.ticks_since_tombstone_send = state.ticks_since_tombstone_send.saturating_add(1);
-  // The page-round decision comes first, against the whole-catalog
-  // fingerprint: a quiet peer costs no emission at all. The old order
-  // emitted (snapshot, decode, encode, hash) before deciding, so a hub's
-  // tick cost was O(peers) even with every peer quiet — and under the
-  // driver's skip-on-overrun behavior the tick period itself grew with
-  // the mesh size.
-  let page_round = state.page.page_round(catalog_fingerprint);
-  // The page plane pipelines up to two pages per peer (the window lives
-  // in the cursor and gates itself): a failed head page retries this
-  // tick while later pages keep flowing behind it.
-  let page_head_retry = state.page.page_head_retry();
-  let page_due = (page_round == crate::sync_common::PageRound::Send && state.page.page_room())
-    || page_head_retry;
-  // A snapshot pass is due for this peer when its revision advanced past
-  // what this peer last fully received, or on the slow resend cadence.
-  // Tombstones ride their own cadence against the same revision marker:
-  // a revision change forwards the accumulated tombstones once, and the
-  // slow cadence heals lost ones. The cadence runs even while the
-  // snapshot leg is degraded (refresh failing): tombstone forwarding is
-  // snapshot-independent by contract.
-  let revision_advanced = match snapshot {
-    Some(snapshot) => snapshot.revision() != state.snapshot_rev,
-    None => false,
-  };
-  let snapshot_due = revision_advanced
-    || match snapshot {
-      Some(_) => state.ticks_since_snapshot_send >= SNAPSHOT_RESEND_TICKS,
-      None => false,
-    };
-  // An unsettled trust page no longer gates the leg: the pass pipelines
-  // up to TRUST_PIPELINE_PAGES pages per peer, so a slow or lost
-  // acknowledgement stalls the committed cursor, not the data.
-  let trust_due = snapshot_due;
-  let tombstones_due = tombstone_round_due(
-    revision_advanced,
-    !tombstone_bytes.is_empty(),
-    state.ticks_since_tombstone_send,
-    snapshot_due,
-  ) && !planes.tombstones;
-  // A fully dispatched pass whose window drained is complete.
-  complete_settled_pass(state);
-  // The trust snapshot leg pages through the issuer's binding set one
-  // wire page per tick per peer (keyset cursor per peer), pipelined to
-  // a bounded window: page N+1 dispatches while page N's verdict is
-  // still pending, and the committed cursor advances only over the
-  // consecutive-delivered prefix (see `settle_trust_window`). The
-  // window entry lands only after the wire accepted the page: a
-  // rejected dispatch rewinds the dispatch position instead of leaving
-  // an entry whose verdict can never resolve.
-  let mut snapshot_page: Option<Vec<u8>> = None;
-  let mut reserved: Option<(u64, Option<NodeId>, Option<NodeId>)> = None;
-  // The retry of a failed head page takes this tick's dispatch: the
-  // entry re-arms with a fresh sequence and the page re-sends from its
-  // own start. The failed entry stays in the window as the commit
-  // barrier until a retry delivers, so the retry is the dispatch — no
-  // new page joins the window behind it this tick.
-  let head_retry = matches!(
-    state.trust_in_flight.front().map(|head| head.delivered),
-    Some(Some(false))
-  );
-  if head_retry && let Some(snapshot) = snapshot {
-    let head = state.trust_in_flight.pop_front();
-    if let Some(head) = head {
-      let page = snapshot.page_after(head.start.as_ref(), TRUST_BINDINGS_PAGE_LIMIT);
-      if !page.bindings().is_empty() {
+  state.tombstone_ticks = state.tombstone_ticks.saturating_add(1);
+
+  // ---- the descriptor plane: one diff page over the catalog ----
+  let mut page_dispatch: Option<PendingDispatch<Vec<u8>>> = None;
+  if planes.descriptors {
+    state.descriptors.quiet_tick();
+  } else if state.descriptors.pass_due() {
+    let emission = page_sync::emit_page_filtered_from_snapshot(
+      catalog,
+      state.descriptors.cursor().map(|value| value.as_slice()),
+      DEFAULT_PAGE_LIMIT,
+      crate::sync_common::SCAN_BUDGET_PER_TICK,
+      state.descriptors.watermarks(),
+    )
+    .await?;
+    match emission.page {
+      Some(page) => {
+        tracing::debug!(
+          peer = %peer,
+          descriptors = page.descriptors().len(),
+          "membership diff page emitted"
+        );
+        crate::audit::membership_page_emitted(page.descriptors().len());
+        page_dispatch = Some(PendingDispatch {
+          bytes: SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?,
+          boundary: emission.walk_cursor,
+          marks: emission.marks,
+        });
+      }
+      None => {
+        // Nothing to deliver in this step: either the scan reached the
+        // catalog end (the pass completes, the cadence restarts, and the
+        // refresh counter advances) or a budget window closed
+        // change-free mid-catalog (the pass continues from its boundary
+        // next tick — closing there would strand every record behind
+        // the window until the peer's state resets).
+        if state.descriptors.step_quiet(emission.walk_cursor) {
+          crate::audit::membership_watermarks_refreshed(peer.as_str());
+        }
+      }
+    }
+  } else {
+    state.descriptors.quiet_tick();
+  }
+
+  // ---- the trust plane: one diff page over the issuer binding set ----
+  // Bindings are append-only and adopted per record, so a diff page
+  // never implies a removal (removals retire through the tombstone
+  // planes) — the digest filter is exact over the binding set.
+  let mut trust_dispatch: Option<PendingDispatch<NodeId>> = None;
+  if planes.trust {
+    state.trust.quiet_tick();
+  } else if let Some(snapshot) = snapshot
+    && state.trust.pass_due()
+  {
+    let emission = snapshot.filtered_page_after(
+      state.trust.cursor(),
+      TRUST_BINDINGS_PAGE_LIMIT,
+      crate::sync_common::SCAN_BUDGET_PER_TICK,
+      state.trust.watermarks(),
+    );
+    match emission.page {
+      Some(page) => {
         tracing::debug!(
           peer = %peer,
           revision = snapshot.revision(),
           bindings = page.bindings().len(),
-          "retrying trust snapshot page"
+          "trust diff page emitted"
         );
-        let continuation = page.continuation().cloned();
-        let seq = state.trust_seq;
-        state.trust_seq += 1;
-        reserved = Some((seq, head.start.clone(), continuation.clone()));
-        state.trust_dispatch_cursor = continuation;
-        snapshot_page = Some(SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?);
+        trust_dispatch = Some(PendingDispatch {
+          bytes: SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?,
+          boundary: emission.boundary,
+          marks: emission.marks,
+        });
       }
-      if page.bindings().is_empty() {
-        // The snapshot shrank past this page's start between dispatch
-        // and retry: re-arm the entry unchanged, the completion rule
-        // will close the pass when the window drains.
-        state
-          .trust_in_flight
-          .push_front(crate::sync_common::SyncPageInFlight {
-            seq: head.seq,
-            start: head.start,
-            cursor: head.cursor,
-            delivered: None,
-          });
+      None => {
+        if state.trust.step_quiet(emission.boundary) {
+          crate::audit::membership_watermarks_refreshed(peer.as_str());
+        }
       }
     }
-  } else if trust_due
-    && let Some(snapshot) = snapshot
-    && state.trust_in_flight.len() < TRUST_PIPELINE_PAGES
-  {
-    let page = snapshot.page_after(
-      state.trust_dispatch_cursor.as_ref(),
-      TRUST_BINDINGS_PAGE_LIMIT,
-    );
-    if page.bindings().is_empty() {
-      // Every page of the pass is dispatched (and the window's own
-      // completion rule still holds them to their verdicts).
-      tracing::debug!(
-        peer = %peer,
-        revision = snapshot.revision(),
-        "trust snapshot pass fully dispatched"
-      );
-      state.trust_end = Some(snapshot.revision());
+  } else {
+    state.trust.quiet_tick();
+  }
+
+  // ---- the tombstone plane: only the peer's unconfirmed records ----
+  // A degraded snapshot leg (refresh failing) never stalls this plane:
+  // tombstone forwarding is snapshot-independent by contract.
+  // The confirmation-expiry roll first: after
+  // TOMBSTONE_CONFIRM_REFRESH_TICKS the confirmed set expires (admission
+  // is not application — a receiver skips a tombstone whose bindings
+  // have not converged yet — so the set re-forwards on a slow roll; see
+  // `confirmed_tombstones`), which re-arms the round below with the
+  // whole bounded set.
+  if !planes.tombstones && state.tombstone_ticks >= TOMBSTONE_CONFIRM_REFRESH_TICKS {
+    state.tombstone_ticks = 0;
+    state.confirmed_tombstones.clear();
+  }
+  let unconfirmed: Vec<(u64, &[u8])> = if planes.tombstones {
+    Vec::new()
+  } else {
+    tombstones
+      .iter()
+      .filter(|(digest, _)| !state.confirmed_tombstones.contains(digest))
+      .map(|(digest, bytes)| (*digest, bytes.as_slice()))
+      .collect()
+  };
+  let tombstone_payloads: Vec<&[u8]> =
+    if tombstone_round_due(unconfirmed.len(), state.ticks_since_tombstone_send) {
+      unconfirmed.iter().map(|(_, bytes)| *bytes).collect()
     } else {
-      tracing::debug!(
-        peer = %peer,
-        revision = snapshot.revision(),
-        bindings = page.bindings().len(),
-        "dispatching trust snapshot page"
-      );
-      let continuation = page.continuation().cloned();
-      let seq = state.trust_seq;
-      state.trust_seq += 1;
-      reserved = Some((
-        seq,
-        state.trust_dispatch_cursor.clone(),
-        continuation.clone(),
-      ));
-      state.trust_dispatch_cursor = continuation;
-      snapshot_page = Some(SyncPayload::Snapshot(ByteVec::from(page.encode()?)).encode()?);
-    }
-  }
-  // The end reached with an empty window completes the pass immediately.
-  complete_settled_pass(state);
-  let mut tombstone_payloads: Vec<&[u8]> = Vec::new();
-  if tombstones_due {
-    tombstone_payloads.extend(tombstone_bytes.iter().map(Vec::as_slice));
-  }
-  // A page plane that is not due — catalog fingerprint unchanged, liveness
-  // cadence not reached, no pass in flight — dispatches NOTHING, even when
-  // a snapshot/tombstone leg is due. The old ride-along emitted the whole
-  // catalog beside every leg dispatch, so a converged mesh re-sent every
-  // descriptor at the legs' resend cadence forever: each peer received the
-  // entire skip-everything catalog on both rounds of every trust cycle
-  // (walk page and closing round), and the per-leaf receive rate scaled
-  // with its degree — the redundant-edge re-emission storm. The page
-  // plane's own triggers are the only reasons a page goes on the wire: a
-  // catalog fingerprint change on the next idle round, an in-flight
-  // continuation, or the page resend cadence.
-  if !page_due && snapshot_page.is_none() && tombstone_payloads.is_empty() {
-    state.page.quiet_tick();
+      Vec::new()
+    };
+
+  // A round with nothing due on any plane dispatches nothing at all:
+  // the planes' own triggers (a diff row, an unconfirmed tombstone, the
+  // detection cadence) are the only reasons anything goes on the wire.
+  if page_dispatch.is_none() && trust_dispatch.is_none() && tombstone_payloads.is_empty() {
     return Ok(MembershipPeerRound {
       tombstone_acks: Vec::new(),
-      page_dispatch: None,
-      snapshot_page: None,
+      page_ack: None,
+      trust_ack: None,
       dispatched: false,
     });
   }
-  let mut page_bytes: Option<Vec<u8>> = None;
-  let mut page_reserved: Option<PageReservation> = None;
-  let mut page_retry_entry: Option<SyncPageInFlight<Vec<u8>>> = None;
-  if page_head_retry {
-    // The failed head page takes this tick's dispatch: re-emit from its
-    // own start and re-arm its window entry (same sequence — its
-    // verdict is already settled). The popped entry is held for the
-    // re-push when the wire rejects the retry OR when the emit itself
-    // fails — losing it would strand the page's range behind a
-    // vanished barrier.
-    if let Some(entry) = state.page.page_pop_failed_head() {
-      let emitted =
-        page_sync::emit_page_from_snapshot(catalog, entry.start.as_deref(), DEFAULT_PAGE_LIMIT)
-          .await;
-      let page = match emitted {
-        Ok(page) => page,
-        Err(error) => {
-          state.page.page_repush_failed(entry);
-          return Err(error);
-        }
-      };
-      let continuation = page.cursor().map(|value| value.to_vec());
-      let encoded = page
-        .encode()
-        .and_then(|bytes| SyncPayload::Page(ByteVec::from(bytes)).encode());
-      let bytes = match encoded {
-        Ok(bytes) => bytes,
-        Err(error) => {
-          state.page.page_repush_failed(entry);
-          return Err(error);
-        }
-      };
-      page_reserved = Some(PageReservation {
-        seq: entry.seq,
-        start: entry.start.clone(),
-        continuation,
-      });
-      page_retry_entry = Some(entry);
-      page_bytes = Some(bytes);
-    }
-  } else if page_due {
-    let (seq, start) = state.page.page_reserve();
-    let page =
-      page_sync::emit_page_from_snapshot(catalog, start.as_deref(), DEFAULT_PAGE_LIMIT).await?;
-    let continuation = page.cursor().map(|value| value.to_vec());
-    page_reserved = Some(PageReservation {
-      seq,
-      start,
-      continuation,
-    });
-    page_bytes = Some(SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?);
-  }
-  let (tombstone_acks, page_dispatched_ack, snapshot_ack) = dispatch_to_peer(
+  let (tombstone_ack_options, page_ack, trust_ack) = dispatch_to_peer(
     peer,
-    snapshot_page.as_deref(),
+    trust_dispatch
+      .as_ref()
+      .map(|dispatch| dispatch.bytes.as_slice()),
     &tombstone_payloads,
-    page_bytes.as_deref(),
+    page_dispatch
+      .as_ref()
+      .map(|dispatch| dispatch.bytes.as_slice()),
     runtime,
     entropy,
     protocol,
   )
   .await;
-  // The window entry lands only on an accepted dispatch: a rejected
-  // page never enters the window (its verdict could never resolve), so
-  // the dispatch position rewinds to the page's start for the next
-  // round's retry.
-  let snapshot_page = match (snapshot_page, snapshot_ack, reserved) {
-    (Some(_), Some(ack), Some((seq, start, continuation))) => {
-      state.trust_in_flight.push_back(SyncPageInFlight {
-        seq,
-        start,
-        cursor: continuation,
-        delivered: None,
-      });
-      Some(SnapshotPageDispatch { seq, ack })
-    }
-    (Some(_), None, reserved) => {
-      if let Some((_, start, _)) = reserved {
-        state.trust_dispatch_cursor = start;
-      }
-      None
-    }
-    // No reserved page: nothing to dispatch (or the pass is fully
-    // dispatched past its final binding). A reservation without bytes
-    // cannot arise — the reservation is made when the bytes are.
-    (..) => None,
-  };
-  // The page plane's window entry lands only on an accepted dispatch
-  // too: a rejected fresh page never entered the window (the derived
-  // dispatch position re-emits it next round), and a rejected retry
-  // re-arms its barrier entry unchanged.
-  let page_dispatch = match (page_bytes.is_some(), page_dispatched_ack, page_reserved) {
-    (true, Some(ack), Some(reservation)) => {
+  // The tombstone receivers pair with their digests by dispatch order:
+  // a payload the queue rejected has no receiver and stays unconfirmed
+  // for the next round.
+  let tombstone_acks: Vec<(
+    u64,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )> = unconfirmed
+    .into_iter()
+    .zip(tombstone_ack_options)
+    .filter_map(|((digest, _), ack)| ack.map(|ack| (digest, ack)))
+    .collect();
+  // Each pending page lands in its walk only on an accepted dispatch: a
+  // rejected dispatch never entered the walk (nothing to settle) — the
+  // walk's cursor still sits at this step's scan start and its cadence
+  // counter was never reset, so the next tick re-emits exactly the same
+  // range.
+  let page_ack = match (page_dispatch, page_ack) {
+    (Some(dispatch), Some(ack)) => {
       state
-        .page
-        .page_accept(reservation.seq, reservation.start, reservation.continuation);
-      Some(SnapshotPageDispatch {
-        seq: reservation.seq,
-        ack,
-      })
+        .descriptors
+        .dispatched(dispatch.boundary, dispatch.marks);
+      Some(ack)
     }
-    (true, None, Some(_)) => {
-      // A rejected retry re-arms its barrier entry unchanged; a rejected
-      // fresh page never entered the window (the derived dispatch
-      // position re-emits it next round).
-      if let Some(entry) = page_retry_entry {
-        state.page.page_repush_failed(entry);
-      }
+    (Some(_), None) => {
+      crate::audit::membership_page_rewound(peer.as_str());
       None
     }
-    (..) => None,
+    (None, ack) => ack,
+  };
+  let trust_ack = match (trust_dispatch, trust_ack) {
+    (Some(dispatch), Some(ack)) => {
+      state.trust.dispatched(dispatch.boundary, dispatch.marks);
+      Some(ack)
+    }
+    (Some(_), None) => {
+      crate::audit::membership_page_rewound(peer.as_str());
+      None
+    }
+    (None, ack) => ack,
   };
   Ok(MembershipPeerRound {
     tombstone_acks,
-    page_dispatch,
-    snapshot_page,
+    page_ack,
+    trust_ack,
     dispatched: true,
   })
 }
@@ -1304,32 +1200,50 @@ pub(crate) async fn sync_tick(
     crate::sync_common::SYNC_PEERS_PER_ROUND,
   );
   cursors.rotation = rotation.cloned();
-  // One snapshot and one whole-catalog fingerprint per tick: every
-  // per-peer round decides against the same immutable view, so a hub
-  // with a hundred quiet peers pays one scan per tick, not a hundred
-  // snapshot-plus-emit passes.
+  // One snapshot per tick, shared by every per-peer round: a hub
+  // catching up a hundred leaves pays one scan, not a hundred.
   let catalog = store.snapshot().await?;
-  let fingerprint = page_sync::catalog_fingerprint(catalog.as_ref()).await?;
-  // Tombstone wire bytes are peer-independent: encode once. The trust
-  // snapshot legs are paged per peer (keyset cursor), so they cannot be
-  // hoisted out of the loop. The bytes are snapshot-INDEPENDENT: a
-  // failed refresh must never stall this lane (the tombstones are what
-  // retire removed identities on peers).
-  let tombstone_bytes: Vec<Vec<u8>> = {
+  // A local store write since the last tick (a caller write, an applied
+  // page, a persisted tombstone, a snapshot refresh) arms every peer's
+  // walks and the tombstone cadence: the changed rows push within one
+  // tick per hop instead of one detection cadence per hop — the
+  // push-per-change that keeps multi-hop convergence from growing
+  // linearly with path length. The watermark filters keep the pushed
+  // pages diff-shaped, and a quiet steady state (no writes) walks
+  // nothing between passes.
+  let epoch = store.register_epoch();
+  if epoch != cursors.install_epoch {
+    cursors.install_epoch = epoch;
+    for state in cursors.peers.values_mut() {
+      state.descriptors.arm();
+      state.trust.arm();
+      state.ticks_since_tombstone_send = SNAPSHOT_RESEND_TICKS;
+    }
+  }
+  // Tombstone wire bytes are peer-independent: encode once, digest
+  // once. The per-peer rounds filter them through the peer's confirmed
+  // set. The bytes are snapshot-INDEPENDENT: a failed refresh must
+  // never stall this lane (the tombstones are what retire removed
+  // identities on peers).
+  let tombstones: Vec<(u64, Vec<u8>)> = {
     let mut out = Vec::with_capacity(
       leave_records.len() + cleanup_records.len() + revocation_records.len() + 1,
     );
     for record in &leave_records {
-      out.push(SyncPayload::Leave(ByteVec::from(record.encode()?)).encode()?);
+      let bytes = SyncPayload::Leave(ByteVec::from(record.encode()?)).encode()?;
+      out.push((crate::sync_common::row_digest(&bytes), bytes));
     }
     for record in &cleanup_records {
-      out.push(SyncPayload::Cleanup(ByteVec::from(record.encode()?)).encode()?);
+      let bytes = SyncPayload::Cleanup(ByteVec::from(record.encode()?)).encode()?;
+      out.push((crate::sync_common::row_digest(&bytes), bytes));
     }
     for record in &revocation_records {
-      out.push(SyncPayload::Revocation(ByteVec::from(record.encode()?)).encode()?);
+      let bytes = SyncPayload::Revocation(ByteVec::from(record.encode()?)).encode()?;
+      out.push((crate::sync_common::row_digest(&bytes), bytes));
     }
     if let Some(checkpoint) = &local_checkpoint {
-      out.push(SyncPayload::Checkpoint(ByteVec::from(checkpoint.encode()?)).encode()?);
+      let bytes = SyncPayload::Checkpoint(ByteVec::from(checkpoint.encode()?)).encode()?;
+      out.push((crate::sync_common::row_digest(&bytes), bytes));
     }
     out
   };
@@ -1337,20 +1251,23 @@ pub(crate) async fn sync_tick(
     tracing::debug!(
       leave = leave_records.len(),
       cleanup = cleanup_records.len(),
-      send = !tombstone_bytes.is_empty(),
+      send = !tombstones.is_empty(),
       "removal tombstones considered for forwarding"
     );
   }
   let mut pending_tombstone_acks: Vec<(
     NodeId,
+    u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
   let mut pending_page_acks: Vec<(
     NodeId,
-    u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
-  let mut pending_trust_pages: Vec<(NodeId, SnapshotPageDispatch)> = Vec::new();
+  let mut pending_trust_acks: Vec<(
+    NodeId,
+    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
+  )> = Vec::new();
   for peer in window.iter().copied() {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let round = membership_sync_tick_peer(
@@ -1361,8 +1278,7 @@ pub(crate) async fn sync_tick(
       state,
       &protocol,
       snapshot.as_ref(),
-      &tombstone_bytes,
-      fingerprint,
+      &tombstones,
       in_flight.get(peer).copied().unwrap_or_default(),
     )
     .await?;
@@ -1372,40 +1288,39 @@ pub(crate) async fn sync_tick(
     }
     let MembershipPeerRound {
       tombstone_acks,
-      page_dispatch,
-      snapshot_page,
+      page_ack,
+      trust_ack,
       ..
     } = round;
-    if tombstone_acks.is_empty() && page_dispatch.is_none() && snapshot_page.is_none() {
+    if tombstone_acks.is_empty() && page_ack.is_none() && trust_ack.is_none() {
       // Nothing was queued (the routing queue rejected outright): the
       // round never left this node. A rejected page never entered its
-      // window, so the derived dispatch position re-emits it next round.
+      // walk, so the next round re-emits the same range.
       continue;
     }
-    state.page.count_round();
-    if let Some(page) = snapshot_page {
-      // The page dispatched: commit the trust cursor only after the
-      // page's OWN delivery verdict (see below) — an unadmitted page
-      // rewinds.
-      pending_trust_pages.push((peer.clone(), page));
+    pending_tombstone_acks.extend(
+      tombstone_acks
+        .into_iter()
+        .map(|(digest, ack)| (peer.clone(), digest, ack)),
+    );
+    if let Some(ack) = page_ack {
+      pending_page_acks.push((peer.clone(), ack));
     }
-    pending_tombstone_acks.extend(tombstone_acks.into_iter().map(|ack| (peer.clone(), ack)));
-    if let Some(page_dispatch) = page_dispatch {
-      let SnapshotPageDispatch { seq, ack } = page_dispatch;
-      pending_page_acks.push((peer.clone(), seq, ack));
+    if let Some(ack) = trust_ack {
+      pending_trust_acks.push((peer.clone(), ack));
     }
   }
   gc_collected_tombstones(store, entropy).await;
   if pending_tombstone_acks.is_empty()
     && pending_page_acks.is_empty()
-    && pending_trust_pages.is_empty()
+    && pending_trust_acks.is_empty()
   {
     return Ok(None);
   }
   Ok(Some(MembershipPendingRound {
     tombstone_acks: pending_tombstone_acks,
     page_acks: pending_page_acks,
-    trust_pages: pending_trust_pages,
+    trust_acks: pending_trust_acks,
   }))
 }
 
@@ -1427,37 +1342,35 @@ async fn dispatch_or_log(
 }
 
 /// The per-tick fan-out to one peer: sends every due payload in order
-/// and returns their admission receivers, grouped by lane so each cadence
-/// commit can be gated on its own delivery verdict. The trust snapshot
-/// page's receiver is kept separate from the rest so its own verdict —
-/// not a peer-level OR over the round — gates the snapshot cursor
-/// commit. A `None` page dispatches no descriptor payload at all. A
-/// payload swallowed by a session that still looks alive never resolves
-/// its receiver, which is exactly the signal the caller needs to
-/// re-deliver from scratch.
+/// and returns their admission receivers — the tombstone receivers
+/// aligned with the input payloads (a payload the queue rejected has
+/// `None` at its slot and stays unconfirmed for the next round), the
+/// trust page's receiver, and the descriptor page's receiver, so each
+/// plane's commit is gated on its own delivery verdict. A payload
+/// swallowed by a session that still looks alive never resolves its
+/// receiver, which is exactly the signal the caller needs to re-deliver
+/// from scratch.
 async fn dispatch_to_peer(
-  peer: &NodeId, snapshot_page: Option<&[u8]>, tombstones: &[&[u8]], page: Option<&[u8]>,
+  peer: &NodeId, trust_page: Option<&[u8]>, tombstones: &[&[u8]], page: Option<&[u8]>,
   runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, protocol: &ProtocolTag,
 ) -> (
-  Vec<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
+  Vec<Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>>,
   Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
   Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
 ) {
-  let snapshot_ack = match snapshot_page {
+  let trust_ack = match trust_page {
     Some(payload) => dispatch_or_log(peer, payload, runtime, entropy, protocol).await,
     None => None,
   };
-  let mut tombstone_acks = Vec::new();
+  let mut tombstone_acks = Vec::with_capacity(tombstones.len());
   for payload in tombstones {
-    if let Some(ack) = dispatch_or_log(peer, payload, runtime, entropy, protocol).await {
-      tombstone_acks.push(ack);
-    }
+    tombstone_acks.push(dispatch_or_log(peer, payload, runtime, entropy, protocol).await);
   }
   let page_ack = match page {
     Some(payload) => dispatch_or_log(peer, payload, runtime, entropy, protocol).await,
     None => None,
   };
-  (tombstone_acks, page_ack, snapshot_ack)
+  (tombstone_acks, page_ack, trust_ack)
 }
 
 /// The post-round checkpoint GC: collect the
@@ -1506,36 +1419,18 @@ mod tests {
   }
 
   // The tombstone decision is snapshot-independent: with the snapshot
-  // leg degraded (refresh failing, no revision signal), the slow
-  // cadence alone keeps forwarding accumulated tombstones.
+  // leg degraded (refresh failing), unconfirmed tombstones still
+  // forward on the slow cadence alone.
   #[test]
   fn tombstones_forward_on_the_slow_cadence_without_a_snapshot() {
-    // No snapshot: revision_advanced and snapshot_due are both false.
-    let revision_advanced = false;
-    let snapshot_due = false;
-    // Tombstones present and the resend cadence reached: due.
-    assert!(tombstone_round_due(
-      revision_advanced,
-      true,
-      SNAPSHOT_RESEND_TICKS,
-      snapshot_due
-    ));
+    // Unconfirmed tombstones present and the resend cadence reached:
+    // due.
+    assert!(tombstone_round_due(3, SNAPSHOT_RESEND_TICKS));
     // Before the cadence: quiet.
-    assert!(!tombstone_round_due(
-      revision_advanced,
-      true,
-      0,
-      snapshot_due
-    ));
-    // No tombstones: nothing to forward, cadence or not.
-    assert!(!tombstone_round_due(
-      revision_advanced,
-      false,
-      SNAPSHOT_RESEND_TICKS,
-      snapshot_due
-    ));
-    // With a healthy snapshot, a revision advance forwards immediately.
-    assert!(tombstone_round_due(true, true, 0, true));
+    assert!(!tombstone_round_due(3, 0));
+    // Nothing unconfirmed (a fresh peer, or everything confirmed):
+    // nothing to forward, cadence or not.
+    assert!(!tombstone_round_due(0, SNAPSHOT_RESEND_TICKS));
   }
 
   /// Regression: a snapshot refresh failure used to fail the whole sync
@@ -1850,8 +1745,10 @@ mod tests {
     let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
     let mut cursors = MembershipSyncCursors::default();
 
-    // Round 1: the trust page dispatches and its admission fails while
-    // the descriptor page admits; the cursor must not advance.
+    // Round 1: the trust diff page dispatches (the fresh peer's walk is
+    // due) and its admission fails while the descriptor page admits;
+    // nothing commits — the walk's marks stay empty and its cursor
+    // stays at scratch.
     if let Some(pending) = sync_tick(
       &context,
       &entropy,
@@ -1874,13 +1771,19 @@ mod tests {
       "the trust page dispatched"
     );
     assert!(
-      cursors.peers.get(&peer).unwrap().snapshot_cursor.is_none(),
-      "a failed trust page verdict must not advance the snapshot cursor"
+      cursors
+        .peers
+        .get(&peer)
+        .unwrap()
+        .trust
+        .watermarks()
+        .is_empty(),
+      "a failed trust page verdict must not commit its marks"
     );
 
-    // Round 2: the undelivered page retries on the next tick (the pass
-    // is still due through its unrecorded revision) and still must not
-    // commit past its failure.
+    // Round 2: the undelivered page retries on the next tick (the
+    // walk's cadence counter was never reset by the failed round) and
+    // still commits nothing.
     if let Some(pending) = sync_tick(
       &context,
       &entropy,
@@ -1902,10 +1805,19 @@ mod tests {
       2,
       "the undelivered trust page retried on the next tick"
     );
-    assert!(cursors.peers.get(&peer).unwrap().snapshot_cursor.is_none());
+    assert!(
+      cursors
+        .peers
+        .get(&peer)
+        .unwrap()
+        .trust
+        .watermarks()
+        .is_empty()
+    );
 
-    // Round 3: the trust page's own verdict resolves as delivered; only
-    // now the cursor commits.
+    // Round 3: the trust page's own verdict resolves as delivered; the
+    // marks commit and the pass completes (the page walked to the set's
+    // end).
     *admit_snapshots.lock().unwrap() = true;
     if let Some(pending) = sync_tick(
       &context,
@@ -1924,13 +1836,19 @@ mod tests {
       settle_round(pending, &mut cursors).await;
     }
     assert_eq!(snapshot_dispatches.load(Ordering::SeqCst), 3);
+    let state = cursors.peers.get(&peer).unwrap();
     assert!(
-      cursors.peers.get(&peer).unwrap().snapshot_cursor.is_some(),
-      "the delivered trust page commits its cursor"
+      !state.trust.watermarks().is_empty(),
+      "the delivered trust page commits its binding marks"
+    );
+    assert_eq!(
+      state.trust.cursor(),
+      None,
+      "the completed pass closes the walk"
     );
 
-    // Round 4: the closing empty page completes the pass for this
-    // revision.
+    // Round 4: the converged walk is quiet — no snapshot payload at
+    // all, even on the detection cadence.
     if let Some(pending) = sync_tick(
       &context,
       &entropy,
@@ -1947,23 +1865,23 @@ mod tests {
     {
       settle_round(pending, &mut cursors).await;
     }
-    let state = cursors.peers.get(&peer).unwrap();
-    assert_eq!(state.snapshot_rev, 1, "the pass completed for revision 1");
-    assert!(
-      state.snapshot_cursor.is_none(),
-      "the completed pass resets the cursor"
+    assert_eq!(
+      snapshot_dispatches.load(Ordering::SeqCst),
+      3,
+      "a converged binding walk emits nothing"
     );
   }
 
-  /// Regression (the starvation-gate rejoin stall): a lost head page's
-  /// acknowledgement must not truncate the trust pass. While the head
-  /// page keeps failing its verdict, the NEXT page still dispatches
-  /// behind it — the peer's adoption is per binding and idempotent —
-  /// and the committed cursor never claims the head page's range. When
-  /// the head page finally delivers, the whole window commits and the
-  /// pass completes.
+  /// The trust walk's diff shape: after one converged pass, an added
+  /// binding dispatches ALONE (one binding row on the wire, not the
+  /// whole grant set), the walk completes on that single-row page, and
+  /// an armed next pass emits nothing. This is the trust plane's half
+  /// of the anti-redundancy contract: a one-binding change costs one
+  /// binding row per peer per hop, never a whole-set re-page — the
+  /// trust equivalent of the descriptor fingerprint cascade the
+  /// 2026-10 audit removed.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn the_trust_pass_flows_past_a_lost_head_page_verdict() {
+  async fn the_trust_walk_dispatches_only_the_binding_diff() {
     use std::sync::{Arc, Mutex};
 
     use futures_util::StreamExt as _;
@@ -1991,10 +1909,9 @@ mod tests {
       .await
       .unwrap(),
     );
-    // Sixty-five injected bindings: exactly two wire pages (64 + 1), so
-    // the pass cannot complete on its head page alone.
+    // Two injected bindings: a small, stable grant set.
     let shared_key = key_at(0);
-    for index in 101..=165_u64 {
+    for index in 101..=102_u64 {
       let bound = node_at(index);
       let (namespace, key) = identity_binding_key(&bound).unwrap();
       let binding = IdentityBindingV1::new(bound, shared_key.clone());
@@ -2005,20 +1922,12 @@ mod tests {
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let (entry, _rx) = crate::session::stream::test_entry(entropy.as_ref());
     sessions.lock().unwrap().insert(peer.clone(), entry);
-
     let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(64);
     let routes: crate::routing::RouteTable =
       Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let runtime = RuntimeClient::routing_only(packet_tx, routes);
-    // The drainer drops every head-page (the 64-binding page)
-    // admission until `admit_head` flips, and admits every other
-    // payload always — the starved-runner shape where one page's
-    // acknowledgement never arrives within the bound. The observed
-    // snapshot page sizes, in dispatch order, are the evidence.
-    let admit_head = Arc::new(Mutex::new(false));
     let page_sizes: Arc<Mutex<Vec<usize>>> = Arc::default();
     let drainer_peer = peer.clone();
-    let drainer_admit = Arc::clone(&admit_head);
     let drainer_sizes = Arc::clone(&page_sizes);
     tokio::spawn(async move {
       while let Some(mut request) = packet_rx.recv().await {
@@ -2029,13 +1938,7 @@ mod tests {
         let payload = SyncPayload::decode(&bytes).unwrap();
         if let SyncPayload::Snapshot(encoded) = &payload {
           let page = crate::identity::trust::TrustSnapshotPage::decode(encoded.as_ref()).unwrap();
-          let size = page.bindings().len();
-          drainer_sizes.lock().unwrap().push(size);
-          // The head page carries the whole first wire page; the
-          // second page carries the remainder.
-          if size > 1 && !*drainer_admit.lock().unwrap() {
-            continue;
-          }
+          drainer_sizes.lock().unwrap().push(page.bindings().len());
         }
         let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
           by: drainer_peer.clone(),
@@ -2050,10 +1953,9 @@ mod tests {
     let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
     let mut cursors = MembershipSyncCursors::default();
 
-    // Round 1: the head page dispatches; its acknowledgement is
-    // dropped, and the round is NOT settled yet — the verdict is still
-    // pending, exactly like a driver tick racing the ack bound.
-    let first = sync_tick(
+    // Round 1: the fresh peer's walk delivers the whole grant set in
+    // one page and completes.
+    if let Some(pending) = sync_tick(
       &context,
       &entropy,
       &sessions,
@@ -2066,12 +1968,22 @@ mod tests {
     )
     .await
     .unwrap()
-    .expect("the head page dispatched");
+    {
+      settle_round(pending, &mut cursors).await;
+    }
+    let converged = cursors.peers.get(&peer).unwrap().trust.watermarks().len();
+    assert!(converged >= 2, "the whole grant set committed its marks");
+    assert_eq!(page_sizes.lock().unwrap().as_slice(), &[converged]);
 
-    // Round 2: with the head page's verdict still pending, the SECOND
-    // page dispatches behind it — the pipelining property this
-    // regression exists for.
-    let second = sync_tick(
+    // One join: a third binding. The tick's refresh enumerates and
+    // persists a new snapshot revision (a store write), which arms
+    // every walk through the register epoch, and the next page carries
+    // EXACTLY the new binding.
+    let bound = node_at(103);
+    let (namespace, key) = identity_binding_key(&bound).unwrap();
+    let binding = IdentityBindingV1::new(bound, shared_key.clone());
+    inject_entry(&reference, (namespace, key), binding.encode().unwrap());
+    if let Some(pending) = sync_tick(
       &context,
       &entropy,
       &sessions,
@@ -2084,58 +1996,43 @@ mod tests {
     )
     .await
     .unwrap()
-    .expect("the second page dispatched behind the unsettled head");
-
-    // Settle both rounds: the head page's verdict fails; the second
-    // page's ack resolved as admitted.
-    settle_round(first, &mut cursors).await;
-    settle_round(second, &mut cursors).await;
+    {
+      settle_round(pending, &mut cursors).await;
+    }
     assert_eq!(
       page_sizes.lock().unwrap().as_slice(),
-      &[64, 1],
-      "the second page flowed while the head page's verdict was lost"
+      &[converged, 1],
+      "the join dispatched one binding row, not the whole grant set"
     );
-    assert!(
-      cursors.peers.get(&peer).unwrap().snapshot_cursor.is_none(),
-      "the committed cursor never claims the lost head page's range"
+    assert_eq!(
+      cursors.peers.get(&peer).unwrap().trust.watermarks().len(),
+      converged + 1,
+      "the diff page's marks committed"
     );
 
-    // Admitting the head page delivers its retry: the window commits
-    // across the recovered page and the pass completes.
-    *admit_head.lock().unwrap() = true;
-    for _ in 0..6 {
-      if cursors
-        .peers
-        .get(&peer)
-        .is_some_and(|state| state.snapshot_rev == 1)
-      {
-        break;
-      }
-      if let Some(pending) = sync_tick(
-        &context,
-        &entropy,
-        &sessions,
-        &runtime,
-        &endpoints,
-        &mut cursors,
-        &InFlightRounds::new(),
-        &events,
-        &revision,
-      )
-      .await
-      .unwrap()
-      {
-        settle_round(pending, &mut cursors).await;
-      }
+    // The next pass — armed explicitly, past every cadence — emits
+    // nothing: the converged walk is quiet.
+    cursors.peers.get_mut(&peer).unwrap().trust.arm();
+    if let Some(pending) = sync_tick(
+      &context,
+      &entropy,
+      &sessions,
+      &runtime,
+      &endpoints,
+      &mut cursors,
+      &InFlightRounds::new(),
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap()
+    {
+      settle_round(pending, &mut cursors).await;
     }
-    let state = cursors.peers.get(&peer).unwrap();
     assert_eq!(
-      state.snapshot_rev, 1,
-      "the pass completed once the head page delivered"
-    );
-    assert!(
-      state.snapshot_cursor.is_none(),
-      "the completed pass resets the cursor"
+      page_sizes.lock().unwrap().len(),
+      2,
+      "a converged binding walk emits nothing even when armed"
     );
   }
 
@@ -2158,6 +2055,10 @@ mod tests {
     snapshot_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     leave_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     page_dispatches: Arc<std::sync::atomic::AtomicUsize>,
+    /// The descriptor rows sent on the wire (the redundancy ledger's
+    /// sent side: the ratio of this to the peer's adopted rows is the
+    /// delivered-versus-useful traffic the watermark design bounds).
+    page_rows: Arc<std::sync::atomic::AtomicUsize>,
     /// The typed reference factory behind the context's store: tests
     /// inject raw family entries straight into its shared state.
     reference: Arc<crate::storage::contract::ReferenceFactory>,
@@ -2234,10 +2135,15 @@ mod tests {
       let snapshot_dispatches = Arc::new(AtomicUsize::new(0));
       let leave_dispatches = Arc::new(AtomicUsize::new(0));
       let page_dispatches = Arc::new(AtomicUsize::new(0));
+      // The descriptor rows that actually went on the wire — the
+      // redundancy ledger's sent side (the received side is what the
+      // peer's store adopts).
+      let page_rows = Arc::new(AtomicUsize::new(0));
       let drainer_admit = Arc::clone(&admit_all);
       let drainer_snapshots = Arc::clone(&snapshot_dispatches);
       let drainer_leaves = Arc::clone(&leave_dispatches);
       let drainer_pages = Arc::clone(&page_dispatches);
+      let drainer_rows = Arc::clone(&page_rows);
       let drainer_peer = peer.clone();
       tokio::spawn(async move {
         while let Some(mut request) = packet_rx.recv().await {
@@ -2252,8 +2158,11 @@ mod tests {
             SyncPayload::Leave(_) => {
               drainer_leaves.fetch_add(1, Ordering::SeqCst);
             }
-            SyncPayload::Page(_) => {
+            SyncPayload::Page(encoded) => {
               drainer_pages.fetch_add(1, Ordering::SeqCst);
+              if let Ok(page) = MembershipPage::decode(encoded.as_ref()) {
+                drainer_rows.fetch_add(page.descriptors().len(), Ordering::SeqCst);
+              }
             }
             _ => {}
           }
@@ -2279,6 +2188,7 @@ mod tests {
         snapshot_dispatches,
         leave_dispatches,
         page_dispatches,
+        page_rows,
         reference,
       }
     }
@@ -2302,13 +2212,49 @@ mod tests {
         settle_round(pending, cursors).await;
       }
     }
+
+    /// Injects one more identity binding into the shared store: the
+    /// next tick's issuer refresh enumerates and persists a new
+    /// snapshot revision — a real store write, which arms every walk
+    /// through the register epoch exactly as a live join would.
+    async fn inject_binding(&self, bound: NodeId) {
+      use crate::identity::records::{IdentityBindingV1, identity_binding_key};
+      let (namespace, key) = identity_binding_key(&bound).unwrap();
+      let binding = IdentityBindingV1::new(bound, key_at(0));
+      crate::identity::testing::inject_entry(
+        &self.reference,
+        (namespace, key),
+        binding.encode().unwrap(),
+      );
+    }
+
+    /// Injects one more known leave record: the tombstone plane's new
+    /// unconfirmed evidence.
+    async fn inject_leave(&self, leaver: NodeId) {
+      let record = crate::identity::leave::LeaveRecordV1::new(
+        leaver.clone(),
+        key_at(9),
+        2_000,
+        crate::Signature::from_bytes([0_u8; 64]),
+      );
+      let leave_namespace =
+        crate::storage::families::namespace(crate::storage::families::LEAVE_NAMESPACE).unwrap();
+      crate::identity::testing::inject_entry(
+        &self.reference,
+        (
+          leave_namespace,
+          crate::StoreKey::new(std::sync::Arc::from(leaver.as_str().as_bytes().to_vec())),
+        ),
+        record.encode().unwrap(),
+      );
+    }
   }
 
   /// Regression: an undelivered round must retry on the NEXT tick, not
-  /// after a full SNAPSHOT_RESEND_TICKS interval. The cadence counters
-  /// advance every tick and are reset only by delivery verdicts; under
-  /// the dispatch-time reset a single failed round consumed the cadence
-  /// and silenced both lanes for the whole resend interval.
+  /// after a full detection interval. The walks' cadence counters are
+  /// reset only by delivery verdicts (a failed round consumed nothing);
+  /// under the dispatch-time reset a single failed round silenced both
+  /// lanes for the whole resend interval.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn an_undelivered_round_retries_on_the_next_tick_not_after_the_full_interval() {
     use std::sync::atomic::Ordering;
@@ -2316,82 +2262,100 @@ mod tests {
     let harness = CadenceHarness::build().await;
     let mut cursors = MembershipSyncCursors::default();
 
-    // Converge one full snapshot pass first: round 1 delivers the trust
-    // page (the tombstones ride the revision change), round 2 closes the
-    // pass at revision 1. Round 3 is fully quiet.
+    // Round 1: the fresh peer's planes deliver the grant set, the
+    // catalog, and the known tombstone. Disarm the tombstone cadence so
+    // the diff setup below is deterministic; the tombstone plane's own
+    // cadence and confirmation semantics are pinned by the sibling
+    // tests.
     harness.tick(&mut cursors).await;
-    harness.tick(&mut cursors).await;
-    harness.tick(&mut cursors).await;
-    let state = cursors.peers.get(&harness.peer).unwrap();
-    assert_eq!(state.snapshot_rev, 1, "the snapshot pass completed");
-    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 1);
-    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 2);
-
-    // Arm both cadences, then fail a round completely: nothing may reset
-    // the counters.
+    let base_snapshot = harness.snapshot_dispatches.load(Ordering::SeqCst);
+    let base_leave = harness.leave_dispatches.load(Ordering::SeqCst);
+    let base_page = harness.page_dispatches.load(Ordering::SeqCst);
+    let base_confirmed = cursors
+      .peers
+      .get(&harness.peer)
+      .unwrap()
+      .confirmed_tombstones
+      .len();
+    assert_eq!(base_snapshot, 1, "the grant set converged");
+    assert!(base_leave >= 1, "the known tombstone converged");
+    assert_eq!(base_page, 1, "the catalog converged");
     {
       let state = cursors.peers.get_mut(&harness.peer).unwrap();
-      state.ticks_since_snapshot_send = SNAPSHOT_RESEND_TICKS;
-      state.ticks_since_tombstone_send = SNAPSHOT_RESEND_TICKS;
+      state.ticks_since_tombstone_send = 0;
     }
-    *harness.admit_all.lock().unwrap() = false;
-    harness.tick(&mut cursors).await;
-    let state = cursors.peers.get(&harness.peer).unwrap();
-    assert!(
-      state.snapshot_cursor.is_none(),
-      "the failed round delivered nothing"
-    );
-    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 2);
-    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 3);
 
-    // The next tick retries BOTH lanes: the counters were not consumed
-    // by the failed round.
+    // A new leave record and a new binding: both planes have a diff to
+    // deliver (the refresh persist arms every walk through the register
+    // epoch). Every dispatch fails: nothing commits.
+    harness.inject_leave(node_at(78)).await;
+    harness.inject_binding(node_at(104)).await;
+    *harness.admit_all.lock().unwrap() = false;
     harness.tick(&mut cursors).await;
     assert_eq!(
       harness.snapshot_dispatches.load(Ordering::SeqCst),
-      3,
-      "the snapshot lane retried on the next tick"
-    );
-    assert_eq!(
-      harness.leave_dispatches.load(Ordering::SeqCst),
-      4,
-      "the tombstone lane retried on the next tick"
+      base_snapshot + 1,
+      "the binding diff dispatched"
     );
     assert!(
+      harness.leave_dispatches.load(Ordering::SeqCst) > base_leave,
+      "the new tombstone dispatched"
+    );
+    assert_eq!(
       cursors
         .peers
         .get(&harness.peer)
         .unwrap()
-        .snapshot_cursor
-        .is_none()
+        .confirmed_tombstones
+        .len(),
+      base_confirmed,
+      "the failed tombstone round confirmed nothing"
     );
 
-    // Delivery heals both lanes: the verdict resets the cadences and
-    // commits the cursor.
+    // The next tick retries BOTH lanes with the same unconfirmed set:
+    // the failed round consumed neither cadence.
+    let failed_snapshot = harness.snapshot_dispatches.load(Ordering::SeqCst);
+    let failed_leave = harness.leave_dispatches.load(Ordering::SeqCst);
+    assert!(failed_leave > base_leave, "the new tombstone dispatched");
+    harness.tick(&mut cursors).await;
+    assert_eq!(
+      harness.snapshot_dispatches.load(Ordering::SeqCst),
+      failed_snapshot + 1,
+      "the snapshot lane retried on the next tick"
+    );
+    assert_eq!(
+      harness.leave_dispatches.load(Ordering::SeqCst),
+      failed_leave + (failed_leave - base_leave),
+      "the tombstone lane retried the same unconfirmed set on the next tick"
+    );
+
+    // Delivery heals both lanes: the marks and confirmations commit.
     *harness.admit_all.lock().unwrap() = true;
     harness.tick(&mut cursors).await;
-    let state = cursors.peers.get(&harness.peer).unwrap();
-    assert!(
-      state.snapshot_cursor.is_some(),
-      "the delivered trust page commits its cursor"
+    assert_eq!(
+      harness.snapshot_dispatches.load(Ordering::SeqCst),
+      failed_snapshot + 2,
+      "the healed binding diff delivered"
     );
-    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 4);
-    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 5);
+    assert_eq!(
+      harness.leave_dispatches.load(Ordering::SeqCst),
+      failed_leave + 2 * (failed_leave - base_leave),
+      "the healed tombstone set delivered"
+    );
+    assert_eq!(harness.page_dispatches.load(Ordering::SeqCst), 1);
   }
 
-  /// Regression: the snapshot/tombstone cadence counters must advance on
-  /// every tick — independent of the (possibly multi-tick)
-  /// descriptor-page pass. Under quiet-round-only advancement a long
-  /// descriptor pass froze the tombstone lane for the whole pass.
+  /// Regression: the tombstone plane's cadence advances on every tick
+  /// — independent of the (possibly multi-tick) descriptor-page pass.
+  /// Under quiet-round-only advancement a long descriptor pass froze
+  /// the tombstone lane for the whole pass.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_long_descriptor_pass_does_not_stall_the_tombstone_lane() {
     use std::sync::atomic::Ordering;
 
-    use crate::{StoreKey, identity::testing::inject_entry};
-
     let harness = CadenceHarness::build().await;
-    // A catalog far larger than one descriptor page: the page plane runs
-    // a multi-tick Send pass once the first tick records its cursor.
+    // A catalog far larger than one descriptor page: the walk runs a
+    // multi-tick diff pass once the first tick records its boundary.
     let descriptor_namespace =
       crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
         .unwrap();
@@ -2405,51 +2369,51 @@ mod tests {
         false,
         1,
       );
-      inject_entry(
+      crate::identity::testing::inject_entry(
         &harness.reference,
         (
           descriptor_namespace.clone(),
-          StoreKey::new(std::sync::Arc::from(member.as_str().as_bytes().to_vec())),
+          crate::StoreKey::new(std::sync::Arc::from(member.as_str().as_bytes().to_vec())),
         ),
         descriptor.encode().unwrap(),
       );
     }
 
     let mut cursors = MembershipSyncCursors::default();
-    // Pre-arm the tick state: the snapshot pass is already converged at
-    // revision 1 (no revision signal), and the tombstone cadence is two
-    // ticks from its resend threshold.
-    cursors.peers.insert(
-      harness.peer.clone(),
-      PeerSyncState {
-        snapshot_rev: 1,
-        ticks_since_tombstone_send: SNAPSHOT_RESEND_TICKS - 2,
-        ..PeerSyncState::default()
-      },
-    );
 
-    // Tick 1: the descriptor page dispatches (the pass starts) but the
-    // tombstone cadence is not reached yet.
+    // Tick 1: the fresh peer's round dispatches the first descriptor
+    // page (the pass starts), the trust page, and the known tombstone;
+    // everything delivers. The page walk is mid-pass. The trust page's
+    // delivery expires the peer's tombstone confirmations, so tick 2
+    // re-forwards the known tombstone beside the page pass.
     harness.tick(&mut cursors).await;
-    assert_eq!(harness.leave_dispatches.load(Ordering::SeqCst), 0);
-    // The page plane is mid-pass: its continuation cursor is set.
+    assert!(harness.leave_dispatches.load(Ordering::SeqCst) >= 1);
     assert!(
       cursors
         .peers
         .get(&harness.peer)
         .unwrap()
-        .page
-        .continuation()
+        .descriptors
+        .cursor()
         .is_some(),
       "the descriptor pass is in flight"
     );
-
-    // Tick 2: still mid-pass, but the tombstone cadence elapsed — the
-    // leave record must forward even though no round was quiet.
     harness.tick(&mut cursors).await;
-    assert_eq!(
-      harness.leave_dispatches.load(Ordering::SeqCst),
-      1,
+    let settled = harness.leave_dispatches.load(Ordering::SeqCst);
+    assert!(settled >= 1, "the binding delivery re-forwarded the set");
+
+    // A second tombstone arrives while the descriptor pass is still
+    // mid-flight: its cadence is armed, so the next tick forwards it
+    // beside the ongoing page pass — the tombstone lane never waits
+    // for a quiet round.
+    harness.inject_leave(node_at(78)).await;
+    {
+      let state = cursors.peers.get_mut(&harness.peer).unwrap();
+      state.ticks_since_tombstone_send = SNAPSHOT_RESEND_TICKS;
+    }
+    harness.tick(&mut cursors).await;
+    assert!(
+      harness.leave_dispatches.load(Ordering::SeqCst) > settled,
       "the tombstone lane forwarded mid-pass"
     );
     assert!(
@@ -2457,98 +2421,123 @@ mod tests {
         .peers
         .get(&harness.peer)
         .unwrap()
-        .page
-        .continuation()
+        .descriptors
+        .cursor()
         .is_some(),
       "the descriptor pass is still in flight"
     );
 
-    // The delivered tombstone round re-arms the cadence: no immediate
-    // re-fire on the next tick.
+    // The delivered tombstone round confirmed the records; with no new
+    // binding progress, the lane goes quiet.
+    let before = harness.leave_dispatches.load(Ordering::SeqCst);
     harness.tick(&mut cursors).await;
     assert_eq!(
       harness.leave_dispatches.load(Ordering::SeqCst),
-      1,
-      "the delivered round reset the tombstone cadence"
+      before,
+      "the confirmed tombstones never re-forward"
     );
   }
 
-  /// Regression (the redundant-edge re-emission storm): a converged page
-  /// plane dispatches NO descriptor page when a snapshot/tombstone leg
-  /// round goes out. The old ride-along emitted the whole catalog beside
-  /// every leg dispatch, so a converged mesh re-sent every descriptor at
-  /// the legs' resend cadence forever — each peer received the entire
-  /// skip-everything catalog on both rounds of every trust cycle, and the
-  /// per-leaf receive rate scaled with its degree. A page goes on the
-  /// wire only on the page plane's own triggers: a catalog fingerprint
-  /// change, an in-flight pass, or the page resend cadence.
+  /// Regression (the redundant-edge re-emission storm, now the
+  /// zero-emission steady state): a converged mesh dispatches NOTHING —
+  /// not on the detection cadences, not when they are armed — and a
+  /// real catalog change (a store write) pushes exactly one diff page
+  /// on the next tick, alone. The old ride-along emitted the whole
+  /// catalog beside every leg dispatch, so a converged mesh re-sent
+  /// every descriptor at the legs' resend cadence forever; the
+  /// watermark walks replaced that with quiet digest scans.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn a_converged_page_plane_does_not_ride_leg_rounds() {
+  async fn a_converged_mesh_emits_nothing_until_a_real_change() {
     use std::sync::atomic::Ordering;
-
-    use crate::{StoreKey, identity::testing::inject_entry};
 
     let harness = CadenceHarness::build().await;
     let mut cursors = MembershipSyncCursors::default();
 
-    // Converge: round 1 sends the page (a fresh peer's first round is
-    // always due) beside the trust and leave legs; round 2 closes the
-    // trust pass and forwards the tombstones on the revision change
-    // WITHOUT a page; round 3 is fully quiet.
-    harness.tick(&mut cursors).await;
-    harness.tick(&mut cursors).await;
-    harness.tick(&mut cursors).await;
+    // Run well past several detection cadences and confirmation-refresh
+    // windows. The descriptor and trust planes converge on the first
+    // round and NEVER emit again; the tombstone plane's only steady
+    // traffic is its bounded confirmation refresh.
+    for _ in 0..40 {
+      harness.tick(&mut cursors).await;
+    }
     assert_eq!(
       harness.page_dispatches.load(Ordering::SeqCst),
       1,
-      "only the first round's page: no ride-along beside the leg rounds"
+      "one page delivered the catalog; the descriptor plane never re-sends"
     );
-
-    // Arming only the snapshot cadence re-sends the trust page WITHOUT a
-    // descriptor page beside it.
-    {
-      let state = cursors.peers.get_mut(&harness.peer).unwrap();
-      state.ticks_since_snapshot_send = SNAPSHOT_RESEND_TICKS;
-    }
-    harness.tick(&mut cursors).await;
+    let converged_rows = harness.page_rows.load(Ordering::SeqCst);
+    assert!(
+      converged_rows >= 1,
+      "the catalog delivered at least one row"
+    );
     assert_eq!(
       harness.snapshot_dispatches.load(Ordering::SeqCst),
-      2,
-      "the trust page re-sent on its own cadence"
+      1,
+      "the converged binding walk emits nothing"
     );
+    let converged_leaves = harness.leave_dispatches.load(Ordering::SeqCst);
+    assert!(
+      (1..=5).contains(&converged_leaves),
+      "the tombstone plane's steady traffic is bounded to the refresh roll"
+    );
+
+    // Armed detection passes over a converged state are quiet scans: the
+    // descriptor and trust planes put nothing on the wire and the row
+    // count — the redundancy ledger — does not move.
+    {
+      let state = cursors.peers.get_mut(&harness.peer).unwrap();
+      state.descriptors.arm();
+      state.trust.arm();
+    }
+    harness.tick(&mut cursors).await;
+    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 1);
     assert_eq!(
       harness.page_dispatches.load(Ordering::SeqCst),
       1,
-      "a quiet page plane does not ride the snapshot round"
+      "an armed quiet scan dispatches nothing"
+    );
+    assert_eq!(
+      harness.page_rows.load(Ordering::SeqCst),
+      converged_rows,
+      "an armed quiet scan sends zero rows — the whole-catalog resend
+      the fingerprint design performed on every cadence is gone"
     );
 
-    // A catalog change still puts the page on the wire on the next idle
-    // round, alone.
-    let descriptor_namespace =
-      crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
-        .unwrap();
+    // A real catalog change (a store-committed join) arms the walk
+    // through the register epoch and pushes exactly one diff row on
+    // the next tick, alone: one changed row costs one row on the wire,
+    // not a catalog-sized page (the cascade's amplifier removed).
     let joined = node_at(600);
     let descriptor = crate::membership::NodeDescriptorV1::new(
-      joined.clone(),
+      joined,
       key_at(1),
       vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()],
       1,
       false,
       1,
     );
-    inject_entry(
-      &harness.reference,
-      (
-        descriptor_namespace,
-        StoreKey::new(std::sync::Arc::from(joined.as_str().as_bytes().to_vec())),
-      ),
-      descriptor.encode().unwrap(),
-    );
+    crate::membership::store::store_descriptor_ctx(
+      harness.context.store(),
+      &crate::api::SystemEntropy,
+      &descriptor,
+    )
+    .await
+    .unwrap();
     harness.tick(&mut cursors).await;
     assert_eq!(
       harness.page_dispatches.load(Ordering::SeqCst),
       2,
-      "a catalog change sends the page on the next idle round"
+      "a committed catalog change sends the diff page on the next tick"
+    );
+    assert_eq!(
+      harness.page_rows.load(Ordering::SeqCst),
+      converged_rows + 1,
+      "one changed descriptor = exactly one row on the wire"
+    );
+    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 1);
+    assert!(
+      harness.leave_dispatches.load(Ordering::SeqCst) - converged_leaves <= 1,
+      "a descriptor change does not amplify the tombstone plane"
     );
   }
 }

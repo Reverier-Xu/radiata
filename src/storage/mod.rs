@@ -145,7 +145,7 @@ pub(crate) struct MetadataStore {
   clock: Arc<dyn WallClock>,
   receipt_retention: Duration,
   /// The register-install epoch: one monotonic bump per installed
-  /// resource record commit (see [`Self::note_register_install`]), so
+  /// resource record commit (see [`Self::note_local_write`]), so
   /// the sync driver observes local catalog changes with one atomic
   /// load per tick instead of a catalog scan.
   register_epoch: std::sync::atomic::AtomicU64,
@@ -276,12 +276,13 @@ impl MetadataStore {
     })
   }
 
-  /// Records one installed register entry: the sync driver reads the
-  /// epoch once per tick ([`Self::register_epoch`]) and treats any
-  /// advance as "some peer's diff may have changed", turning local
-  /// writes into next-tick pushes instead of one detection-cadence wait
-  /// per hop.
-  pub(crate) fn note_register_install(&self) {
+  /// Records one local metadata write (an installed register entry, an
+  /// adopted descriptor or binding, a persisted snapshot or tombstone):
+  /// the sync drivers read the epoch once per tick
+  /// ([`Self::register_epoch`]) and treat any advance as "some peer's
+  /// diff may have changed", turning local writes into next-tick
+  /// pushes instead of one detection-cadence wait per hop.
+  pub(crate) fn note_local_write(&self) {
     use std::sync::atomic::Ordering;
     self.register_epoch.fetch_add(1, Ordering::Relaxed);
   }

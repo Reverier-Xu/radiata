@@ -200,6 +200,9 @@ impl TrustSnapshotV1 {
   /// last delivered binding's node id). The page carries at most
   /// [`TRUST_BINDINGS_PAGE_LIMIT`] bindings under the 64 KiB control
   /// envelope, so membership size no longer caps the snapshot wire.
+  /// Tests and fixtures only: the live sync walk uses
+  /// [`Self::filtered_page_after`].
+  #[cfg(test)]
   pub(crate) fn page_after(
     &self, continuation: Option<&NodeId>, limit: usize,
   ) -> TrustSnapshotPage {
@@ -263,6 +266,84 @@ impl TrustSnapshotV1 {
     }
   }
 
+  /// One filtered walk step over the binding set: the diff page plus
+  /// the walk bookkeeping the sender's per-peer watermark walk settles
+  /// on the page's verdict. Mirrors the shared store walk
+  /// ([`crate::sync_common::walk_namespace_filtered`]) over the
+  /// snapshot's in-memory binding slice: bindings whose digest matches
+  /// the peer's watermark are skipped without entering the page, the
+  /// boundary is the last scanned binding (a `None` boundary closes the
+  /// pass), and the marks carry the (node-key, digest) delivery
+  /// evidence.
+  pub(crate) fn filtered_page_after(
+    &self, cursor: Option<&NodeId>, limit: usize, budget: usize,
+    watermarks: &std::collections::BTreeMap<Vec<u8>, u64>,
+  ) -> FilteredBindingStep {
+    let start = match cursor {
+      Some(cursor) => self
+        .bindings
+        .iter()
+        .position(|binding| cursor < binding.node())
+        .unwrap_or(self.bindings.len()),
+      None => 0,
+    };
+    let mut changed: Vec<TrustBinding> = Vec::new();
+    let mut marks: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut boundary_node: Option<NodeId> = None;
+    // Whether the walk consumed the set to its end (a completed pass)
+    // rather than stopping at the changed-limit or the scan budget (a
+    // mid-pass step whose boundary the next page resumes after).
+    let mut completed = true;
+    let mut scanned = 0_usize;
+    for binding in &self.bindings[start..] {
+      scanned += 1;
+      let key = binding.node().as_str().as_bytes().to_vec();
+      // The binding digest covers the node id and the bound key: a
+      // re-bound node (rotation) flips it, an identical binding
+      // reproduces it.
+      let digest = crate::sync_common::row_digest(
+        &[binding.node().as_str().as_bytes(), binding.key().as_bytes()].concat(),
+      );
+      boundary_node = Some(binding.node().clone());
+      if watermarks.get(&key) != Some(&digest) {
+        changed.push(binding.clone());
+        marks.push((key, digest));
+        if changed.len() >= limit {
+          completed = false;
+          break;
+        }
+      }
+      if scanned >= budget {
+        completed = false;
+        break;
+      }
+    }
+    let boundary = if completed { None } else { boundary_node };
+    if changed.is_empty() {
+      return FilteredBindingStep {
+        page: None,
+        boundary,
+        marks,
+      };
+    }
+    let page = TrustSnapshotPage {
+      revision: self.revision,
+      version: self.version,
+      issuer: self.issuer.clone(),
+      issuer_key: self.issuer_key.clone(),
+      // The continuation is the walk boundary (the next page resumes
+      // strictly after it), matching the shared walk's cursor
+      // semantics; diff pages are non-contiguous by construction.
+      continuation: boundary.clone(),
+      bindings: changed,
+    };
+    FilteredBindingStep {
+      page: Some(page),
+      boundary,
+      marks,
+    }
+  }
+
   /// Decodes one durable full-set record (store limits; see
   /// [`Self::encode_store`]). The wire page form decodes through
   /// [`TrustSnapshotPage::decode`].
@@ -300,12 +381,27 @@ impl TrustSnapshotV1 {
   }
 }
 
+/// One filtered walk step over an issuer snapshot's binding set: the
+/// diff page (bindings the peer is missing) plus the walk bookkeeping
+/// the sender's watermark walk settles on the page's delivery verdict.
+#[derive(Debug)]
+pub(crate) struct FilteredBindingStep {
+  /// The diff page; `None` when the step found nothing to deliver.
+  pub(crate) page: Option<TrustSnapshotPage>,
+  /// The walk boundary: the last scanned binding's node id (`None`
+  /// closes the pass — the scan reached the set's end).
+  pub(crate) boundary: Option<NodeId>,
+  /// The page bindings' (node-key, digest) delivery marks.
+  pub(crate) marks: Vec<(Vec<u8>, u64)>,
+}
+
 /// The wire page form of one issuer snapshot (the only snapshot shape
 /// crossing an authenticated session): one keyset-paged slice of the
 /// issuer's binding set under the 64 KiB control envelope. Entries are
 /// trusted through the session that delivered them; `continuation` is
 /// the last delivered binding's node id, and an empty `bindings` vec
 /// closes the delivery pass.
+#[derive(Clone, Debug)]
 pub(crate) struct TrustSnapshotPage {
   revision: u64,
   version: u16,
@@ -393,6 +489,7 @@ impl TrustSnapshotPage {
 
   /// The keyset cursor for the next page (the last delivered binding's
   /// node id); `None` when the pass is complete.
+  #[cfg(test)]
   pub(crate) const fn continuation(&self) -> Option<&NodeId> {
     self.continuation.as_ref()
   }
@@ -914,13 +1011,13 @@ pub(crate) mod store {
   ///
   /// The typed contract distinguishes the two failure modes a dialer
   /// must not conflate: an **absent** binding is
-  /// [`ErrorKind::NotFound`] — the peer is not (yet) known here, which is
-  /// a retryable convergence state while bindings spread over sync, and
-  /// the healing planes (recovery, connection-degree maintenance) and
-  /// caller retry policies treat it exactly that way — while a binding
-  /// that exists but fails to decode, contradicts the presented key, or
-  /// is revoked stays an authentication or revocation failure, which is
-  /// never retryable.
+  /// [`ErrorKind::NotFound`](crate::ErrorKind::NotFound) — the peer is not
+  /// (yet) known here, which is a retryable convergence state while bindings
+  /// spread over sync, and the healing planes (recovery, connection-degree
+  /// maintenance) and caller retry policies treat it exactly that way — while
+  /// a binding that exists but fails to decode, contradicts the presented
+  /// key, or is revoked stays an authentication or revocation failure, which
+  /// is never retryable.
   pub(crate) async fn trusted_binding(store: &MetadataStore, peer: &NodeId) -> Result<PublicKey> {
     if peer_is_terminal(store, peer).await? {
       return Err(crate::Error::not_trusted("peer left"));
@@ -1000,6 +1097,9 @@ pub(crate) mod store {
     // definitively did not land, and Unknown leaves durability
     // indeterminate — both must surface (the sync lane isolates them).
     crate::provider::commit_verdict(store.commit(transaction).await?, "trust snapshot")?;
+    // The persisted revision changes what the trust walks send: the
+    // write epoch arms them for a next-tick push.
+    store.note_local_write();
     Ok(())
   }
 
@@ -1167,6 +1267,10 @@ pub(crate) mod store {
     // indeterminate — the snapshot-accept lane treats a surfaced
     // conflict as skippable and everything else as evidence failure.
     crate::provider::commit_verdict(store.commit(transaction).await?, "trust binding adoption")?;
+    // The adopted binding changes what every plane sends (descriptors
+    // of the bound node become healable, the grant set grew): the write
+    // epoch arms the walks for a next-tick push.
+    store.note_local_write();
     Ok(())
   }
 

@@ -365,6 +365,9 @@ pub(crate) mod store {
     // (definitively not applied) must surface so the anti-entropy page
     // applies on a later tick instead of vanishing.
     crate::provider::commit_verdict(store.commit(transaction).await?, "node descriptor revision")?;
+    // The committed descriptor belongs in some peer's diff: the write
+    // epoch turns it into a next-tick push.
+    store.note_local_write();
     Ok(())
   }
 
@@ -506,7 +509,12 @@ pub(crate) mod store {
       )?;
       let outcome = store.commit(transaction).await?;
       match outcome {
-        crate::CommitOutcome::Committed(_) => return Ok(applied),
+        crate::CommitOutcome::Committed(_) => {
+          // The committed descriptors belong in some peer's diff: the
+          // write epoch turns them into a next-tick push.
+          store.note_local_write();
+          return Ok(applied);
+        }
         // A conflict landed nothing: one re-decide from a fresh snapshot
         // is safe, a second one surfaces to the cadence.
         crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted if attempt == 0 => {

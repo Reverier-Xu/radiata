@@ -302,7 +302,12 @@ pub(crate) async fn issue_checkpoint_ctx(
   )?;
   drop(snapshot);
   match context.store().commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) => Ok(requested),
+    crate::CommitOutcome::Committed(_) => {
+      // The persisted record is new tombstone evidence: the write epoch
+      // arms the tombstone cadence for a next-tick push.
+      context.store().note_local_write();
+      Ok(requested)
+    }
     // The only semantic failure left: an equal-or-higher checkpoint
     // landed between the read and the commit through a path that did not
     // hold the permit (impossible in-process; defensive).
@@ -366,6 +371,9 @@ pub(crate) async fn persist_checkpoint_ctx(
   // Without a committed outcome behind it: Conflict/Aborted definitively
   // did not land, and Unknown leaves durability indeterminate.
   crate::provider::commit_verdict(store.commit(transaction).await?, "cleanup checkpoint")?;
+  // The checkpoint record rides the tombstone plane: the write epoch
+  // arms it for a next-tick push.
+  store.note_local_write();
   Ok(())
 }
 
@@ -387,7 +395,8 @@ pub(crate) async fn collect_collected_tombstones_ctx(
 }
 
 /// The cleanup-side sweep: conditional exact-digest deletes of collected
-/// cleanup tombstones, bounded by [`GC_BATCH`].
+/// cleanup tombstones, bounded by
+/// [`TOMBSTONE_GC_BATCH`](crate::identity::records::TOMBSTONE_GC_BATCH).
 async fn collect_cleanup_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {

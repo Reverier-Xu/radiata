@@ -1,7 +1,12 @@
 //! Shared session-carried anti-entropy plumbing (single source): the
 //! membership and resource sync lanes read bounded bodies, enumerate the
-//! alive-peer set, fingerprint it, and push fire-and-forget payloads
-//! through identical code so a fix in one lane cannot miss the other.
+//! alive-peer set, diff against per-peer watermarks, and push
+//! fire-and-forget payloads through identical code so a fix in one lane
+//! cannot miss the other. The watermark walks below are the lanes'//! shared
+//! diff-only exchange model (the git remote-tracking idea: the sender keeps its
+//! own record of what the peer already holds and sends only the mismatched
+//! rows), so redundancy scales with the change set, never with the catalog
+//! size.
 
 use std::{pin::Pin, sync::Arc};
 
@@ -356,9 +361,9 @@ mod tests {
   use minicbor::bytes::ByteVec;
 
   use super::{
-    PageRound, PeerPageCursor, chunk_payload, decode_kinded_sync_envelope,
-    decode_plain_sync_envelope, delivered_within_bound, encode_sync_envelope, outbound_request,
-    rotation_window, send_payload,
+    WatermarkWalk, chunk_payload, decode_kinded_sync_envelope, decode_plain_sync_envelope,
+    delivered_within_bound, encode_sync_envelope, outbound_request, rotation_window, row_digest,
+    send_payload,
   };
   use crate::{TraceId, packet::MAX_CHUNK_BYTES};
 
@@ -600,140 +605,93 @@ mod tests {
     assert_eq!(error.kind(), crate::ErrorKind::ShuttingDown);
   }
 
-  /// A delivery failure heals without truncating the pass: the failed
-  /// head page stays in the window as the retry barrier — the committed
-  /// cursor never claims its range while later pages keep flowing — and
-  /// the retry re-sends exactly the failed page's range. When the retry
-  /// delivers, the whole window commits and the pass completes.
+  // ---- the shared watermark walk state machine ----
+
+  /// The walk lifecycle: a fresh peer is immediately due, a dispatched
+  /// page makes the walk busy, a delivered verdict commits the marks and
+  /// advances the boundary, a lost verdict rewinds to the page's start,
+  /// and the completed pass goes quiet until the cadence re-arms.
   #[test]
-  fn a_failed_head_page_flows_later_pages_and_retries_exactly_its_range() {
-    let mut state = PeerPageCursor::default();
-    assert_eq!(state.page_round(7), PageRound::Send);
-    // Two pages dispatch while both verdicts are pending: the window
-    // carries exactly PIPELINE_PAGES entries.
-    let (first, first_start) = state.page_reserve();
-    assert_eq!(first_start, None, "the first page starts from scratch");
-    state.page_accept(first, first_start.clone(), Some(vec![9, 9]));
-    let (second, second_start) = state.page_reserve();
-    assert_eq!(second_start, Some(vec![9, 9]));
-    state.page_accept(second, second_start, None);
-    assert!(!state.page_room(), "the window is full at two pages");
-    // The head page's verdict fails while the second page's resolves:
-    // the barrier holds the cursor at scratch — page two's data is on
-    // the peer, but the cursor never claims page one's range.
-    state.page_settle(first, false);
-    state.page_settle(second, true);
-    assert!(state.page_head_retry(), "the failed head must retry");
+  fn the_watermark_walk_commits_rewinds_and_rearms() {
+    let mut walk = WatermarkWalk::<Vec<u8>>::new(8);
+    assert!(walk.pass_due(), "a fresh peer is immediately due");
+    // A mid-pass step with no page commits the boundary directly.
+    assert!(!walk.step_quiet(Some(vec![5])));
+    assert!(walk.pass_due(), "an in-flight pass continues");
+    // A dispatched page holds the walk busy until its verdict.
+    walk.dispatched(Some(vec![9]), vec![(vec![7], row_digest(b"seven"))]);
+    assert!(walk.busy());
+    assert!(!walk.pass_due(), "a busy walk dispatches nothing");
+    // A lost page rewinds to the page's scan start: the boundary the
+    // pass had committed before the dispatch.
+    walk.settle_outcome(false);
+    assert!(!walk.busy());
+    assert_eq!(walk.cursor(), Some(&vec![5]), "the rewind target");
+    // The re-dispatched page delivers: marks commit, boundary advances,
+    // and the pass completes at a `None` boundary.
+    walk.dispatched(None, vec![(vec![7], row_digest(b"seven"))]);
+    let settled = walk.settle_outcome(true).expect("a pending page settles");
+    assert!(settled.completed, "the None boundary completes the pass");
+    assert!(!settled.refreshed, "no refresh on an ordinary pass");
+    assert_eq!(walk.cursor(), None);
     assert_eq!(
-      state.continuation(),
-      None,
-      "the retry re-emits from the failed page's start, not past it"
+      walk.watermarks().get(&vec![7]),
+      Some(&row_digest(b"seven")),
+      "delivered marks commit into the watermark table"
     );
-    // The retry re-sends exactly page one's range and delivers: the
-    // whole window commits and the pass completes.
-    let retry = state
-      .page_pop_failed_head()
-      .expect("the failed head pops for retry");
-    assert_eq!(retry.start, None);
-    state.page_accept(retry.seq, retry.start, Some(vec![9, 9]));
-    state.page_settle(retry.seq, true);
-    assert_eq!(
-      state.continuation(),
-      None,
-      "the completed pass leaves the cursor at scratch"
-    );
-    assert!(!state.page_head_retry());
-    assert_eq!(
-      state.page_round(7),
-      PageRound::Quiet,
-      "a settled catalog goes quiet"
+    assert!(!walk.pass_due(), "a completed pass goes quiet");
+    // A stale verdict without a pending page settles nothing.
+    assert!(walk.settle_outcome(true).is_none());
+  }
+
+  /// A scratch-start failure retries on the next tick, not after a full
+  /// cadence: the pass-start tick reset would otherwise silence the
+  /// peer for the whole detection cadence.
+  #[test]
+  fn a_lost_scratch_start_page_retries_on_the_next_tick() {
+    let mut walk = WatermarkWalk::<Vec<u8>>::new(8);
+    walk.dispatched(Some(vec![3]), Vec::new());
+    walk.settle_outcome(false);
+    assert_eq!(walk.cursor(), None);
+    assert!(
+      walk.pass_due(),
+      "the scratch-start failure forces the next tick"
     );
   }
 
-  /// A catalog change is observed on the very next idle round: the
-  /// page-round fingerprint covers the whole sender catalog, not the
-  /// emitted page range. The old page-range fingerprint was blind to a
-  /// tail-appended member (the common join case — keys sort after the
-  /// existing prefix), which silenced the peer for a full resend cadence
-  /// per propagation hop and made multi-hop convergence grow
-  /// super-linearly.
+  /// Every `WATERMARK_REFRESH_PASSES` completed passes clear the
+  /// watermark table, restoring the from-scratch re-delivery bound over
+  /// the sender's delivery memory.
   #[test]
-  fn a_catalog_change_sends_on_the_next_idle_round() {
-    let mut state = PeerPageCursor::default();
-    assert_eq!(state.page_round(7), PageRound::Send);
-    let (first, first_start) = state.page_reserve();
-    state.page_accept(first, first_start, Some(vec![9, 9]));
-    state.page_settle(first, true);
-    // Mid-pass rounds always send, and record nothing: the recorded
-    // fingerprint stays 7 while the catalog changes to 8 mid-pass.
-    assert_eq!(state.page_round(8), PageRound::Send);
-    let (second, second_start) = state.page_reserve();
-    assert_eq!(second_start, Some(vec![9, 9]));
-    state.page_accept(second, second_start, None);
-    state.page_settle(second, true);
-    assert_eq!(
-      state.page_round(8),
-      PageRound::Send,
-      "a mid-pass catalog change is due on the next idle round"
+  fn completed_passes_refresh_the_watermark_table_on_cadence() {
+    let mut walk = WatermarkWalk::<Vec<u8>>::new(8);
+    walk.dispatched(None, vec![(vec![1], 11)]);
+    walk.settle_outcome(true);
+    assert_eq!(walk.watermarks().len(), 1);
+    for _ in 1..(super::WATERMARK_REFRESH_PASSES - 1) {
+      assert!(!walk.step_quiet(None), "only the cadence-th pass refreshes");
+    }
+    assert_eq!(walk.watermarks().len(), 1);
+    assert!(
+      walk.step_quiet(None),
+      "the refresh-th completed pass clears the table"
     );
-    let (third, third_start) = state.page_reserve();
-    state.page_accept(third, third_start, None);
-    state.page_settle(third, true);
-    assert_eq!(state.page_round(8), PageRound::Quiet);
-    // A tail append (a different catalog fingerprint) is due immediately —
-    // no resend-cadence wait.
-    assert_eq!(
-      state.page_round(9),
-      PageRound::Send,
-      "a catalog change must not wait out the resend cadence"
-    );
-    let (fourth, fourth_start) = state.page_reserve();
-    state.page_accept(fourth, fourth_start, None);
-    state.page_settle(fourth, true);
-    assert_eq!(state.page_round(9), PageRound::Quiet);
+    assert!(walk.watermarks().is_empty());
   }
 
-  /// The full-pass arm must not truncate an in-flight walk: a catalog
-  /// longer than `FULL_SYNC_ROUNDS` pages used to have its continuation
-  /// reset mid-pass every 128 dispatched rounds, so the tail never
-  /// delivered and the catalog never converged.
+  /// Arming jumps the cadence counter to the threshold so the next tick
+  /// runs the pass — the one-tick-per-hop push that keeps multi-hop
+  /// convergence from growing one cadence per hop.
   #[test]
-  fn the_full_pass_arm_keeps_an_in_flight_walk() {
-    let mut state = PeerPageCursor::default();
-    assert_eq!(state.page_round(1), PageRound::Send);
-    let (first, first_start) = state.page_reserve();
-    state.page_accept(first, first_start, Some(vec![9, 9]));
-    state.page_settle(first, true);
-    for _ in 0..PeerPageCursor::FULL_SYNC_ROUNDS {
-      state.count_round();
-    }
-    // The arm fires with a walk in flight: the continuation survives and
-    // the pass continues from its cursor.
-    state.arm_full_pass();
-    assert_eq!(
-      state.continuation(),
-      Some(&[9, 9][..]),
-      "an in-flight walk keeps its continuation across the arm"
-    );
-    assert_eq!(state.page_round(1), PageRound::Send);
-    // After the walk completes, the next due pass still starts from
-    // scratch — the from-scratch property lives in the cursor being
-    // `None` between passes, not in the arm forcing a send.
-    let (second, second_start) = state.page_reserve();
-    assert_eq!(second_start, Some(vec![9, 9]));
-    state.page_accept(second, second_start, None);
-    state.page_settle(second, true);
-    assert_eq!(state.page_round(1), PageRound::Quiet);
-    state.arm_full_pass();
-    for _ in 0..PeerPageCursor::PAGE_RESEND_TICKS {
-      state.quiet_tick();
-    }
-    assert_eq!(
-      state.page_round(1),
-      PageRound::Send,
-      "the periodic from-scratch pass starts at the empty cursor"
-    );
-    assert_eq!(state.continuation(), None);
+  fn arming_makes_the_next_tick_due() {
+    let mut walk = WatermarkWalk::<Vec<u8>>::new(32);
+    walk.dispatched(None, Vec::new());
+    walk.settle_outcome(true);
+    assert!(!walk.pass_due());
+    walk.quiet_tick();
+    assert!(!walk.pass_due(), "one quiet tick is not a cadence");
+    walk.arm();
+    assert!(walk.pass_due(), "an armed peer is immediately due");
   }
 
   /// A payload above the 32 KiB chunk bound splits into pump-legal
@@ -765,249 +723,375 @@ mod tests {
   }
 }
 
-/// The membership lane's per-peer page anti-entropy continuation state:
-/// the continuation cursor, the steady-state page fingerprint, and the
-/// resend cadence. The resource lane runs its own watermark-walk state
-/// machine by design (per-key watermarks replace the fingerprint), but
-/// both lanes share this struct's cadence constants — a one-lane
-/// cadence change would silently fork the anti-entropy behavior.
-/// One dispatched sync page awaiting its delivery verdict, in dispatch
-/// order. The shared window entry of both page planes (membership
-/// descriptors and trust snapshots): the committed cursor advances to
-/// `cursor` only when every earlier page in the window delivered (a
-/// later page's continuation must never claim an earlier lost page's
-/// range); a failed head page stays in the window as the retry barrier
-/// while later pages keep flowing — the receiver's application is per
-/// record and idempotent.
-#[derive(Debug, Clone)]
-pub(crate) struct SyncPageInFlight<C> {
-  pub(crate) seq: u64,
-  pub(crate) start: Option<C>,
-  pub(crate) cursor: Option<C>,
-  pub(crate) delivered: Option<bool>,
+// ---- the shared watermark anti-entropy model ----
+
+/// The sync lanes' shared detection cadence (ticks): a quiet peer's
+/// watermark walk re-runs on this cadence — a bounded scan that emits
+/// nothing when every stored digest matches the peer's watermark — so a
+/// payload lost mid-flight (or a watermark that drifted from the
+/// peer's truth) heals without waiting for the next catalog change.
+/// One constant, so the lanes cannot drift.
+pub(crate) const DETECTION_CADENCE_TICKS: u32 = 32;
+
+/// Entries per peer watermark table before it resets to full
+/// re-delivery: bounds the in-memory table while keeping whole-catalog
+/// watermarks for every realistic catalog size.
+pub(crate) const WATERMARK_TABLE_CAP: usize = 8_192;
+
+/// Completed passes between watermark-table refreshes: each refresh
+/// clears the table once, so the next pass re-delivers the whole
+/// catalog. This bounds how long any admission-versus-application
+/// divergence — a page the destination admitted but skipped applying,
+/// or state lost on the peer beyond this node's knowledge — can stay
+/// unrepaired, restoring a from-scratch liveness bound over a design
+/// that otherwise trusts its own delivery memory.
+pub(crate) const WATERMARK_REFRESH_PASSES: u32 = 64;
+
+/// Store entries scanned per tick while a pass is in flight: bounds the
+/// per-tick decode cost and the walk amortizes across ticks.
+pub(crate) const SCAN_BUDGET_PER_TICK: usize = 256;
+
+/// The content digest of one stored row: the watermark identity of a
+/// catalog entry. Any change to the row's bytes flips it, an unchanged
+/// row reproduces it, and identical rows across nodes agree — the
+/// content-addressing that makes the diff-only exchange possible. The
+/// value is never serialized (watermarks live in this process's
+/// memory), so the hash needs in-process determinism only.
+pub(crate) fn row_digest(value: &[u8]) -> u64 {
+  use std::hash::{Hash, Hasher};
+  let mut hasher = std::collections::hash_map::DefaultHasher::new();
+  value.hash(&mut hasher);
+  hasher.finish()
 }
 
-/// The membership lane's per-peer page anti-entropy continuation state:
-/// the continuation cursor, the steady-state page fingerprint, and the
-/// resend cadence.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PeerPageCursor {
-  /// Fingerprint of the sender's whole catalog at this peer's last idle
-  /// round, so an unchanged catalog costs no delivery at all. The value
-  /// is lane-computed (the membership lane folds the descriptor
-  /// namespace once per tick) and independent of the emitted page
-  /// range, so a change anywhere in the catalog — including a
-  /// tail-appended entry beyond the first page — is observed on the
-  /// very next idle round.
-  page_fingerprint: u64,
-  /// Ticks since this peer's last page send: a lost delivery must be
-  /// retried on a slow cadence even when nothing changed.
-  ticks_since_page_send: u32,
-  /// Dispatched rounds since this peer's last full-pass arm: the arm
-  /// re-arms the from-scratch liveness bound (see
-  /// [`Self::FULL_SYNC_ROUNDS`]) without touching an in-flight walk.
-  rounds_since_full: u32,
-  /// The COMMITTED page continuation cursor: the last consecutively
-  /// delivered page's cursor, so everything before it is provably on
-  /// the peer and sync converges beyond a single page.
-  page: Option<Vec<u8>>,
-  /// The dispatched-but-unsettled pages, in dispatch order. A failed
-  /// head page is the retry barrier: later pages keep flowing behind it
-  /// (the receiver's application is per record and idempotent) while
-  /// the committed cursor never claims the failed page's range — the
-  /// head-of-line truncation the starvation gate caught on the trust
-  /// plane, closed here by the same window mechanism.
-  in_flight: std::collections::VecDeque<SyncPageInFlight<Vec<u8>>>,
-  /// Monotonic sequence correlating a settled verdict to its window
-  /// entry.
-  seq: u64,
+/// One filtered detection/emission step, lane-generic over the page
+/// type: the bounded changed-row page plus the scan bookkeeping the
+/// caller needs to commit the walk on delivery (the walk itself keeps
+/// the pre-dispatch boundary as its rewind target, so the emission
+/// carries only the commit boundary and the marks).
+pub(crate) struct FilteredEmission<P> {
+  /// The page of changed rows; `None` when the step found nothing to
+  /// deliver.
+  pub(crate) page: Option<P>,
+  /// The walk continuation: `Some(boundary key)` while the pass is in
+  /// flight — the next step resumes strictly after it, and a delivered
+  /// page commits exactly here — or `None` when the scan reached the
+  /// catalog end and the pass is complete.
+  pub(crate) walk_cursor: Option<Vec<u8>>,
+  /// The page rows' (store key, digest) delivery marks: committed into
+  /// the peer's watermark table when the page is delivered.
+  pub(crate) marks: Vec<(Vec<u8>, u64)>,
 }
 
-/// One page-plane round outcome for a peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PageRound {
-  /// Starting round with an unchanged fingerprint and the resend
-  /// cadence not reached: the peer stays silent this round.
-  Quiet,
-  /// The page must be sent this round: a changed fingerprint, a resend
-  /// cadence reached, or a continuation of a multi-page pass.
-  Send,
-}
-
-impl PeerPageCursor {
-  /// The sync lanes' shared resend cadence (ticks): the membership lane
-  /// re-sends a quiet page on it, and the resource lane's detection
-  /// passes run on it — one constant, so the twin state machines cannot
-  /// drift.
-  pub(crate) const PAGE_RESEND_TICKS: u32 = 32;
-
-  /// Page rounds between full from-scratch catch-up passes per peer:
-  /// bounds how long a payload lost mid-flight (fire-and-forget delivery
-  /// into a dying session) can stay missing. Rounds, not ticks: quiet
-  /// peers do not count.
-  pub(crate) const FULL_SYNC_ROUNDS: u32 = 128;
-
-  /// How many pages may be in flight per peer at once. Two is the
-  /// minimum that defeats a head-of-line stall: a slow or lost
-  /// acknowledgement on page one no longer blocks page two from
-  /// reaching the peer, whose application is per record and idempotent.
-  pub(crate) const PIPELINE_PAGES: usize = 2;
-
-  /// After [`Self::FULL_SYNC_ROUNDS`] dispatched rounds the arm fires:
-  /// the round counter resets so the next idle stretch arms again. An
-  /// in-flight walk keeps its continuation — every pass already starts
-  /// from scratch (the cursor is `None` between passes), so the old
-  /// cursor reset bought nothing when idle and truncated walks when
-  /// busy: a catalog longer than [`Self::FULL_SYNC_ROUNDS`] pages
-  /// restarted before its tail ever delivered and could never converge.
-  pub(crate) fn arm_full_pass(&mut self) {
-    if self.rounds_since_full >= Self::FULL_SYNC_ROUNDS {
-      self.rounds_since_full = 0;
-    }
-  }
-
-  /// The round's page-plane decision against the lane's whole-catalog
-  /// fingerprint. The fingerprint covers the entire catalog, not the
-  /// emitted page range: a page-range fingerprint is blind to changes
-  /// behind the first page (a tail-appended member is exactly the
-  /// common join case), which used to silence the peer for a full
-  /// resend cadence per propagation hop. Recording on every idle round
-  /// is now valid because the value no longer depends on the emitted
-  /// range; a continuation round still skips the comparison entirely —
-  /// an in-flight pass always sends.
-  pub(crate) fn page_round(&mut self, fingerprint: u64) -> PageRound {
-    if self.page.is_some() || !self.in_flight.is_empty() {
-      return PageRound::Send;
-    }
-    let due =
-      fingerprint != self.page_fingerprint || self.ticks_since_page_send >= Self::PAGE_RESEND_TICKS;
-    self.page_fingerprint = fingerprint;
-    if due {
-      PageRound::Send
-    } else {
-      PageRound::Quiet
-    }
-  }
-
-  /// A quiet round: no page is due, so both cadence counters advance.
-  pub(crate) fn quiet_tick(&mut self) {
-    self.ticks_since_page_send = self.ticks_since_page_send.saturating_add(1);
-    self.rounds_since_full = self.rounds_since_full.saturating_add(1);
-  }
-
-  /// The room left in the page pipeline: a peer carries at most
-  /// [`Self::PIPELINE_PAGES`] unsettled pages, so one slow or lost
-  /// acknowledgement cannot truncate the pass before its later pages —
-  /// the head-of-line truncation the starvation gate caught.
-  pub(crate) fn page_room(&self) -> bool {
-    self.in_flight.len() < Self::PIPELINE_PAGES
-  }
-
-  /// Whether the head page failed its verdict and must re-send: the
-  /// failed entry stays in the window as the commit barrier until a
-  /// retry delivers, and the retry takes the tick's dispatch.
-  pub(crate) fn page_head_retry(&self) -> bool {
-    matches!(
-      self.in_flight.front().map(|head| head.delivered),
-      Some(Some(false))
-    )
-  }
-
-  /// Pops the failed head entry for a retry: the caller re-emits the
-  /// page from the entry's start and re-arms the window through
-  /// [`Self::page_accept`] (or re-pushes it through
-  /// [`Self::page_repush_failed`] when the wire rejects the retry).
-  /// The entry keeps its sequence: its verdict is already settled, so
-  /// the retry's re-armed entry reuses it without conflict.
-  pub(crate) fn page_pop_failed_head(&mut self) -> Option<SyncPageInFlight<Vec<u8>>> {
-    if !self.page_head_retry() {
-      return None;
-    }
-    self.in_flight.pop_front()
-  }
-
-  /// Re-arms a failed head entry whose retry dispatch was rejected by
-  /// the wire: the barrier stays, unchanged, for the next round's
-  /// retry.
-  pub(crate) fn page_repush_failed(&mut self, mut entry: SyncPageInFlight<Vec<u8>>) {
-    entry.delivered = Some(false);
-    self.in_flight.push_front(entry);
-  }
-
-  /// Reserves the next page's sequence and start: called when the page
-  /// bytes are emitted, before the wire accepts them. A rejected
-  /// dispatch simply drops the reservation — nothing entered the
-  /// window, so the next round re-emits from the same position.
-  pub(crate) fn page_reserve(&mut self) -> (u64, Option<Vec<u8>>) {
-    let seq = self.seq;
-    self.seq += 1;
-    let start = self.continuation().map(|value| value.to_vec());
-    (seq, start)
-  }
-
-  /// Lands a dispatched page in the window (wire accepted, verdict
-  /// pending).
-  pub(crate) fn page_accept(
-    &mut self, seq: u64, start: Option<Vec<u8>>, continuation: Option<Vec<u8>>,
-  ) {
-    self.in_flight.push_back(SyncPageInFlight {
-      seq,
-      start,
-      cursor: continuation,
-      delivered: None,
-    });
-    self.ticks_since_page_send = 0;
-  }
-
-  /// Folds one settled verdict into the window and advances the
-  /// committed cursor across the consecutive-delivered prefix: a later
-  /// page's delivery never claims an earlier lost page's range, and a
-  /// failed head page stays as the retry barrier. Each delivered page
-  /// re-arms the resend cadence.
-  pub(crate) fn page_settle(&mut self, seq: u64, delivered: bool) {
-    if let Some(entry) = self.in_flight.iter_mut().find(|entry| entry.seq == seq) {
-      entry.delivered = Some(delivered);
-    }
-    while matches!(
-      self.in_flight.front().map(|head| head.delivered),
-      Some(Some(true))
-    ) {
-      if let Some(head) = self.in_flight.pop_front() {
-        match head.cursor {
-          Some(cursor) => {
-            self.page = Some(cursor);
-            self.ticks_since_page_send = 0;
-          }
-          None => {
-            // The pass end delivered: the catalog is fully dispatched
-            // and admitted. Anything still in the window sits behind
-            // the end and is subsumed by it (the periodic full-pass
-            // arm bounds any pending retry the end subsumed).
-            self.page = None;
-            self.in_flight.clear();
-            self.ticks_since_page_send = 0;
-            return;
-          }
-        }
+/// Emits one bounded filtered walk step over a store namespace from
+/// `cursor`: scans a bounded budget of entries, digesting every row
+/// without decoding it (the digest covers the raw value bytes, so an
+/// unchanged row costs one hash, not one decode), and collects only
+/// rows whose digest differs from the peer's watermark into the page.
+/// `decode_row` runs for changed rows only and may return `None` to
+/// skip a row that no longer decodes (the lane's corrupt-row policy:
+/// one bad row must not kill egress for every other row); `make_page`
+/// wraps the collected rows and the last included row's key into the
+/// lane's page shape.
+///
+/// The returned emission distinguishes a budget window that closed
+/// change-free mid-catalog (the walk continues from its boundary on the
+/// next tick) from the scan reaching the catalog end (the pass is
+/// complete). Conflating the two would strand every record behind the
+/// first quiet window: the pass would "close" at entry 256 of 4096 and
+/// never reach the tail.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn walk_namespace_filtered<R, P>(
+  snapshot: &(dyn crate::provider::StoreSnapshot + '_), namespace: &crate::StoreNamespace,
+  cursor: Option<&[u8]>, changed_limit: usize, scan_budget: usize,
+  watermarks: &std::collections::BTreeMap<Vec<u8>, u64>,
+  decode_row: impl Fn(&[u8], &[u8]) -> Result<Option<R>>,
+  make_page: impl Fn(Vec<R>, Option<Vec<u8>>) -> Result<P>,
+) -> Result<FilteredEmission<P>> {
+  let mut scan = snapshot.scan_from(namespace, &[], cursor).await?;
+  let mut rows: Vec<R> = Vec::new();
+  let mut marks: Vec<(Vec<u8>, u64)> = Vec::new();
+  let mut last_included: Option<Vec<u8>> = None;
+  let mut scanned = 0_usize;
+  while let Some(entry) = scan.next().await? {
+    scanned += 1;
+    let key = entry.key().as_bytes().to_vec();
+    let digest = row_digest(entry.value().as_bytes());
+    // The walk boundary: the key of the last scanned entry, changed or
+    // not. The pass resumes strictly after it on the next tick.
+    let boundary = Some(key.clone());
+    // Changed rows enter the page and update the page's wire cursor
+    // (the last included row). Unchanged rows only advance the
+    // boundary: re-scanning them on later steps is harmless because
+    // application is idempotent.
+    if watermarks.get(&key) != Some(&digest)
+      && let Some(row) = decode_row(&key, entry.value().as_bytes())?
+    {
+      rows.push(row);
+      last_included = Some(key.clone());
+      marks.push((key, digest));
+      if rows.len() >= changed_limit {
+        return FilteredEmission::page(make_page, rows, last_included, boundary, marks);
       }
     }
+    if scanned >= scan_budget {
+      // The scan budget is spent: the pass continues after the
+      // boundary on the next tick, with or without a page.
+      return FilteredEmission::page(make_page, rows, last_included, boundary, marks);
+    }
+  }
+  // The scan reached the catalog end: the pass is complete. The page
+  // (if any) still delivers the collected tail rows; an empty emission
+  // closes the pass and the cadence restarts.
+  FilteredEmission::finish(make_page, rows, last_included, marks)
+}
+
+impl<P> FilteredEmission<P> {
+  /// A mid-pass step: the walk continues from `boundary` next tick.
+  fn page<R>(
+    make_page: impl FnOnce(Vec<R>, Option<Vec<u8>>) -> Result<P>, rows: Vec<R>,
+    last_included: Option<Vec<u8>>, boundary: Option<Vec<u8>>, marks: Vec<(Vec<u8>, u64)>,
+  ) -> Result<Self> {
+    let page = match rows.is_empty() {
+      true => None,
+      false => Some(make_page(rows, last_included)?),
+    };
+    Ok(Self {
+      page,
+      walk_cursor: boundary,
+      marks,
+    })
   }
 
-  /// Advances the full-pass counter after one dispatched round (a round
-  /// that dispatched without a page due still counts).
-  pub(crate) fn count_round(&mut self) {
-    self.rounds_since_full = self.rounds_since_full.saturating_add(1);
+  /// The scan reached the catalog end: with collected rows the step
+  /// still emits their page — its continuation is `None`, the wire
+  /// signal that the pass is complete (the sender-side completion lives
+  /// in the emission's `walk_cursor`) — and without any rows the pass
+  /// closes change-free.
+  fn finish<R>(
+    make_page: impl FnOnce(Vec<R>, Option<Vec<u8>>) -> Result<P>, rows: Vec<R>,
+    _last_included: Option<Vec<u8>>, marks: Vec<(Vec<u8>, u64)>,
+  ) -> Result<Self> {
+    let page = match rows.is_empty() {
+      true => None,
+      false => Some(make_page(rows, None)?),
+    };
+    Ok(Self {
+      page,
+      walk_cursor: None,
+      marks,
+    })
+  }
+}
+
+/// One dispatched page awaiting its delivery verdict: the walk boundary
+/// it started from (the rewind target), the boundary it reached (the
+/// commit target), and the delivery marks it carries.
+#[derive(Debug, Clone)]
+struct PendingWalkPage<K> {
+  from: Option<K>,
+  to: Option<K>,
+  marks: Vec<(Vec<u8>, u64)>,
+}
+
+/// One peer's watermark walk: the per-lane anti-entropy state machine
+/// behind every diff-only sync plane (membership descriptors, issuer
+/// trust bindings, resource records). The sender tracks, per peer, the
+/// digest of every row it has delivered — its own record of the peer's
+/// state — and a pass emits only rows whose stored digest differs. A
+/// delivered verdict commits the page's marks and advances the walk
+/// boundary; an undelivered one rewinds to the page's scan start so the
+/// next tick re-sends exactly that range; and every
+/// [`WATERMARK_REFRESH_PASSES`] completed passes clear the table so a
+/// periodic full re-delivery bounds any divergence between the
+/// sender's memory and the peer's truth.
+///
+/// This replaced the whole-catalog fingerprint rounds (2026-10 audit):
+/// a fingerprint flip re-sent the entire catalog to every peer and
+/// cascaded, so delivering one changed row cost O(catalog × peers ×
+/// hops) — 98% redundant traffic under churn. The watermark model
+/// costs O(changed rows) per peer per hop; the structural remainder is
+/// epidemic-wave duplication (a row crosses each session edge about
+/// once), which no push design removes.
+#[derive(Debug, Clone)]
+pub(crate) struct WatermarkWalk<K> {
+  /// The walk boundary: the last scanned key while a pass is in
+  /// flight; `None` between passes.
+  cursor: Option<K>,
+  /// Last delivered row digest per store key (bounded by
+  /// [`WATERMARK_TABLE_CAP`]).
+  watermarks: std::collections::BTreeMap<Vec<u8>, u64>,
+  /// Ticks since this peer's last pass ran (delivery or empty
+  /// detection). Starts at the cadence threshold: a freshly discovered
+  /// peer is immediately due its first detection pass.
+  ticks_since_pass: u32,
+  /// Completed passes since the watermark table was last refreshed.
+  passes_since_refresh: u32,
+  /// The lane's detection cadence in ticks.
+  cadence: u32,
+  /// The dispatched-but-unsettled page, if any: its verdict commits or
+  /// rewinds the walk, and a busy walk dispatches nothing further.
+  in_flight: Option<PendingWalkPage<K>>,
+}
+
+/// One settled verdict's outcome for a dispatched page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalkSettlement {
+  /// The verdict completed the pass (the page's boundary was the
+  /// catalog end).
+  pub(crate) completed: bool,
+  /// The completed pass was the refresh-th: the watermark table
+  /// cleared, so the next pass re-delivers the whole catalog.
+  pub(crate) refreshed: bool,
+  /// The delivered page carried at least one delivery mark — the peer's
+  /// knowledge actually advanced on this page (a lane may key
+  /// invalidation off it).
+  pub(crate) advanced: bool,
+}
+
+impl<K: Clone> WatermarkWalk<K> {
+  /// A walk on the lane's cadence, armed for its first immediate pass.
+  pub(crate) fn new(cadence: u32) -> Self {
+    Self {
+      cursor: None,
+      watermarks: std::collections::BTreeMap::new(),
+      ticks_since_pass: cadence,
+      passes_since_refresh: 0,
+      cadence,
+      in_flight: None,
+    }
   }
 
-  /// The continuation cursor the next emit resumes from: the tail of
-  /// the in-flight window (a mid-pass dispatch position) or the
-  /// committed cursor (a fresh page).
-  pub(crate) fn continuation(&self) -> Option<&[u8]> {
-    self
-      .in_flight
-      .back()
-      .and_then(|entry| entry.cursor.as_deref())
-      .or(self.page.as_deref())
+  /// A dispatched page is awaiting its verdict: the lane must not emit
+  /// again for this peer until it settles.
+  pub(crate) fn busy(&self) -> bool {
+    self.in_flight.is_some()
+  }
+
+  /// A pass is due: a walk in flight, or the detection cadence elapsed
+  /// (freshly armed peers start at the threshold, so an armed peer is
+  /// due immediately).
+  pub(crate) fn pass_due(&self) -> bool {
+    !self.busy() && (self.cursor.is_some() || self.ticks_since_pass >= self.cadence)
+  }
+
+  /// A quiet round: no pass ran, so the cadence counter advances.
+  pub(crate) fn quiet_tick(&mut self) {
+    self.ticks_since_pass = self.ticks_since_pass.saturating_add(1);
+  }
+
+  /// Arms the next detection pass (a local install, a revision
+  /// advance): the counter jumps to the cadence threshold so the very
+  /// next tick runs the pass and pushes the diff within one hop
+  /// instead of one cadence per propagation hop.
+  pub(crate) fn arm(&mut self) {
+    self.ticks_since_pass = self.cadence;
+  }
+
+  /// The walk boundary the next emission step resumes from.
+  pub(crate) fn cursor(&self) -> Option<&K> {
+    self.cursor.as_ref()
+  }
+
+  /// The cadence counter (tests and diagnostics).
+  #[cfg(test)]
+  pub(crate) fn ticks_since_pass(&self) -> u32 {
+    self.ticks_since_pass
+  }
+
+  /// Forces the walk boundary (tests: constructing a mid-pass state
+  /// the production paths only reach through delivery verdicts).
+  #[cfg(test)]
+  pub(crate) fn force_cursor(&mut self, cursor: Option<K>) {
+    self.cursor = cursor;
+  }
+
+  /// The peer's watermark table (the emission filter).
+  pub(crate) fn watermarks(&self) -> &std::collections::BTreeMap<Vec<u8>, u64> {
+    &self.watermarks
+  }
+
+  /// A walk step that emitted no page: the walk commits to `boundary`
+  /// immediately (nothing is in flight), and a `None` boundary closes
+  /// the pass. Returns true when closing the pass refreshed the
+  /// watermark table (the periodic from-scratch re-delivery arm).
+  pub(crate) fn step_quiet(&mut self, boundary: Option<K>) -> bool {
+    self.cursor = boundary.clone();
+    self.ticks_since_pass = 0;
+    match boundary {
+      Some(_) => false,
+      None => self.pass_complete(),
+    }
+  }
+
+  /// A page the wire accepted: its verdict settles later, and the
+  /// pending entry carries everything the verdict needs.
+  pub(crate) fn dispatched(&mut self, boundary: Option<K>, marks: Vec<(Vec<u8>, u64)>) {
+    self.in_flight = Some(PendingWalkPage {
+      from: self.cursor.clone(),
+      to: boundary,
+      marks,
+    });
+    self.ticks_since_pass = 0;
+  }
+
+  /// The dispatched page's delivery verdict: a delivered page commits
+  /// its marks into the watermark table (bounded; overflow clears it so
+  /// the next pass re-delivers the full catalog) and advances the walk
+  /// to the page's boundary — completing the pass when the boundary is
+  /// `None`. An undelivered page rewinds to its scan start so the next
+  /// tick re-sends exactly that range; a scratch-start failure forces
+  /// the next-tick retry (otherwise the pass-start tick reset would
+  /// silence the peer for a full cadence). `None` means no page was
+  /// pending (a stale verdict after the peer's state reset) — nothing
+  /// to settle.
+  pub(crate) fn settle_outcome(&mut self, delivered: bool) -> Option<WalkSettlement> {
+    let page = self.in_flight.take()?;
+    if delivered {
+      let advanced = !page.marks.is_empty();
+      self.cursor = page.to;
+      if self.watermarks.len() + page.marks.len() > WATERMARK_TABLE_CAP {
+        self.watermarks.clear();
+      }
+      self.watermarks.extend(page.marks);
+      if self.cursor.is_none() {
+        let refreshed = self.pass_complete();
+        return Some(WalkSettlement {
+          completed: true,
+          refreshed,
+          advanced,
+        });
+      }
+      Some(WalkSettlement {
+        completed: false,
+        refreshed: false,
+        advanced,
+      })
+    } else {
+      self.cursor = page.from;
+      if self.cursor.is_none() {
+        self.ticks_since_pass = self.cadence;
+      }
+      Some(WalkSettlement {
+        completed: false,
+        refreshed: false,
+        advanced: false,
+      })
+    }
+  }
+
+  /// One pass reached the catalog end: the refresh counter advances,
+  /// and every [`WATERMARK_REFRESH_PASSES`] completed passes clear the
+  /// table so the next pass re-delivers the whole catalog (the
+  /// from-scratch liveness bound over the sender's delivery memory).
+  fn pass_complete(&mut self) -> bool {
+    self.passes_since_refresh = self.passes_since_refresh.saturating_add(1);
+    if self.passes_since_refresh >= WATERMARK_REFRESH_PASSES {
+      self.passes_since_refresh = 0;
+      self.watermarks.clear();
+      return true;
+    }
+    false
   }
 }
 
