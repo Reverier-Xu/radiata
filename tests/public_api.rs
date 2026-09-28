@@ -19,26 +19,22 @@ use std::{
 #[cfg(all(feature = "json", unix))]
 use radiata::adapters::json_store;
 use radiata::{
-  ApplyReceiptRetention, BoxFuture, CommitOutcome, CommitReceipt, ConnectMember,
-  ConnectivityStatus, CreatedKey, DeclareInterruptedTransactionUncommitted, DeliveryAck, Digest,
-  DisconnectPeer, Endpoint, EventOptions, EventReceive, EventSubscription, ExtensionRegistry,
-  FeatureDefinition, FeatureTag, GetConnectionDegree, GetLocalNode, GetMember, GetNodeStatus,
-  GetObservability, GetResource, GetRoute, IncomingStream, IssuedMergeCredential, KeyCapabilities,
-  KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue,
-  LeaveCluster, LeaveOutcome, Listen, LoadBalancingPolicy, LocalNodeView, MemberChanged,
-  MemberView, MergeCluster, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle,
-  NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
-  PacketConsumer, PageCursor, PageListeners, PageMembers, PageResources, PageSessions, PageSpec,
-  PageTopology, PageTrust, ProtocolDefinition, ProtocolTag, PutResource, QualifiedTag,
-  ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView, RemoveResource,
-  ReplaceIdentityAndDeleteOldCoreMetadata, ResolveFrozenJournal, ResourceChanged, ResourceLabels,
-  ResourceMutationView, ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite,
-  Result, RotateMergeCredential, RouteChanged, RouteHandle, RouteNextHop, RouteState,
-  RoutingPolicy, SelectResources, Selector, SessionChanged, SessionView, Shutdown, ShutdownOutcome,
-  ShutdownReason, Signature, StartRecovery, StopListener, StoreCapabilities, StoreEntry, StoreKey,
+  BoxFuture, CommitOutcome, CommitReceipt, ConnectivityStatus, CreatedKey,
+  DeclareInterruptedTransactionUncommitted, DeliveryAck, Digest, Endpoint, EventOptions,
+  EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag,
+  IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState, KeyDeleteState,
+  KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveOutcome, LoadBalancingPolicy,
+  LocalNodeView, MemberChanged, MemberView, MergeCredential, MergeView, NodeBuilder, NodeConfig,
+  NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot,
+  OutboundStream, PacketConsumer, PageCursor, PageSpec, ProtocolDefinition, ProtocolTag,
+  QualifiedTag, ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView,
+  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
+  ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result, RouteChanged,
+  RouteHandle, RouteNextHop, RouteState, RoutingPolicy, Selector, SessionChanged, SessionView,
+  ShutdownOutcome, ShutdownReason, Signature, StoreCapabilities, StoreEntry, StoreKey,
   StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
   StreamMetadata, StreamPolicy, StreamTarget, TraceId, TraceMetadataLimits, TransactionId,
-  TransportTag, UpdateNodeMetadata, WaitForShutdown,
+  TransportTag,
   extension::{Entropy, KeyProvider, Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -663,9 +659,9 @@ fn config_and_registry_are_externally_constructible() {
   let _config = config;
 }
 
-/// The full typed command/query/event surface drives one real two-node
-/// cluster from outside the crate: every public command and query is
-/// dispatched and every event kind is subscribed.
+/// The full verb surface drives one real two-node cluster from outside
+/// the crate: every public resource accessor verb, node operation verb,
+/// and event subscription is dispatched.
 #[cfg(all(feature = "json", unix))]
 #[cfg(all(feature = "json", unix))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -678,31 +674,23 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
 
   let issuer = start(factory.clone(), keys.clone()).await;
   let endpoint = listen(&issuer).await;
-  let local: LocalNodeView = issuer.handle.query(GetLocalNode::new()).await.unwrap();
+  let local: LocalNodeView = issuer.handle.local_node().await.unwrap();
   let issuer_id: NodeId = local.node_id().clone();
   assert_eq!(local.public_key().as_bytes().len(), 32);
 
-  let status: NodeStatus = issuer.handle.query(GetNodeStatus::new()).await.unwrap();
+  let status: NodeStatus = issuer.handle.status();
   assert!(matches!(status, NodeStatus::Running));
 
   // External provider SPI is honored through a second node.
   let member_factory: Arc<dyn StorageFactory> = Arc::new(PubStoreFactory);
   let member = start(member_factory, keys).await;
-  let issued: IssuedMergeCredential = issuer
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap();
+  let issued: IssuedMergeCredential = issuer.handle.credentials().rotate().await.unwrap();
   let expires = issued.expires_at();
   let _ = expires;
 
   // Non-rotating issue hands out the same live generation: concurrent
-  // joins share it, and only Rotate replaces the credential.
-  let reissued: IssuedMergeCredential = issuer
-    .handle
-    .command(radiata::IssueMergeCredential::new())
-    .await
-    .unwrap();
+  // joins share it, and only rotate replaces the credential.
+  let reissued: IssuedMergeCredential = issuer.handle.credentials().issue().await.unwrap();
   assert_eq!(
     reissued.credential().expose_secret(),
     issued.credential().expose_secret()
@@ -719,7 +707,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   wait_for_session(&member).await;
   let sessions = member
     .handle
-    .query(PageSessions::new(PageSpec::first(8).unwrap()))
+    .sessions()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   let session: &SessionView = sessions.items().first().unwrap();
@@ -733,7 +722,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
 
   let listeners = issuer
     .handle
-    .query(PageListeners::new(PageSpec::first(8).unwrap()))
+    .listeners()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   let listener_view = listeners.items().first().unwrap();
@@ -742,7 +732,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
 
   let members = issuer
     .handle
-    .query(PageMembers::new(PageSpec::first(8).unwrap()))
+    .members()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   let member_view: &MemberView = members.items().last().unwrap();
@@ -757,14 +748,16 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   );
   let one: Option<MemberView> = issuer
     .handle
-    .query(GetMember::new(member_view.node_id().clone()))
+    .members()
+    .get(member_view.node_id().clone())
     .await
     .unwrap();
   assert!(one.is_some());
 
   let trust = issuer
     .handle
-    .query(PageTrust::new(PageSpec::first(8).unwrap()))
+    .trust()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(
@@ -776,7 +769,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
 
   let topology = issuer
     .handle
-    .query(PageTopology::new(PageSpec::first(8).unwrap()))
+    .topology()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   for edge in topology.items() {
@@ -794,7 +788,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // each patch applies to that observed revision.
   async fn current_issuer_revision(handle: &NodeHandle, issuer_id: &NodeId) -> u64 {
     let members = handle
-      .query(PageMembers::new(PageSpec::first(8).unwrap()))
+      .members()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     members
@@ -811,11 +806,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       LabelValue::parse("pub-api").unwrap(),
     )
     .unwrap();
-  let updated: MemberView = issuer
-    .handle
-    .command(UpdateNodeMetadata::new(revision, patch))
-    .await
-    .unwrap();
+  let updated: MemberView = issuer.handle.patch_metadata(revision, patch).await.unwrap();
   assert_eq!(updated.owner_revision(), revision + 1);
   let patch2 = NodeMetadataPatch::new()
     .remove_capability(LabelKey::parse("example.org/labels/lane").unwrap())
@@ -823,16 +814,16 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let revision2 = current_issuer_revision(&issuer.handle, &issuer_id).await;
   let _updated2: MemberView = issuer
     .handle
-    .command(UpdateNodeMetadata::new(revision2, patch2))
+    .patch_metadata(revision2, patch2)
     .await
     .unwrap();
 
   // Resource writes, paged reads, and selection.
   let _events = issuer
     .handle
-    .events::<ResourceChanged>(EventOptions::new().capacity(8).unwrap())
+    .watch::<ResourceChanged>(EventOptions::new().capacity(8).unwrap())
     .unwrap();
-  let write = PutResource::new(ResourceWrite::new(
+  let write = ResourceWrite::new(
     ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
     ResourceLabels::new(
       LabelValue::parse("document").unwrap(),
@@ -843,9 +834,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       LabelValue::parse("one").unwrap(),
     )
     .unwrap(),
-  ))
-  .unwrap();
-  let mutation: ResourceMutationView = issuer.handle.command(write).await.unwrap();
+  );
+  let mutation: ResourceMutationView = issuer.handle.resources().put(write).await.unwrap();
   assert!(mutation.is_current_winner());
   let accepted = mutation.accepted();
   let version: &ResourceVersion = accepted.version();
@@ -857,25 +847,26 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   );
   let _ = (accepted.name(), accepted.labels());
 
-  // The conditional write constructor drives a real cluster: the exact
+  // The conditional write verb drives a real cluster: the exact
   // observed version conditions the write, and the write wins.
-  let conditional = PutResource::with_expected(
-    ResourceWrite::new(
-      ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
-      ResourceLabels::new(
-        LabelValue::parse("document").unwrap(),
-        ResourceUri::parse("file:///pub-api-conditional").unwrap(),
-      )
-      .custom(
-        LabelKey::parse("example.org/labels/lane").unwrap(),
-        LabelValue::parse("two").unwrap(),
-      )
-      .unwrap(),
-    ),
-    version.clone(),
-  )
-  .unwrap();
-  let mutation: ResourceMutationView = issuer.handle.command(conditional).await.unwrap();
+  let conditional = ResourceWrite::new(
+    ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
+    ResourceLabels::new(
+      LabelValue::parse("document").unwrap(),
+      ResourceUri::parse("file:///pub-api-conditional").unwrap(),
+    )
+    .custom(
+      LabelKey::parse("example.org/labels/lane").unwrap(),
+      LabelValue::parse("two").unwrap(),
+    )
+    .unwrap(),
+  );
+  let mutation: ResourceMutationView = issuer
+    .handle
+    .resources()
+    .put_expected(conditional, version.clone())
+    .await
+    .unwrap();
   assert!(mutation.is_current_winner());
   assert_eq!(
     mutation.accepted().labels().uri().as_str(),
@@ -884,24 +875,25 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
 
   let page: ResourcePage = issuer
     .handle
-    .query(PageResources::new(PageSpec::first(8).unwrap()))
+    .resources()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(!page.items().is_empty());
   let selected: ResourcePage = issuer
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type=document").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   assert_eq!(selected.items().len(), 1);
   let one_resource = issuer
     .handle
-    .query(GetResource::new(
-      ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
-    ))
+    .resources()
+    .get(ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap())
     .await
     .unwrap();
   assert!(one_resource.is_some());
@@ -921,39 +913,43 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let _ = ack.destination();
   let _ = ack.admitted_at();
 
-  // Connect/disconnect member commands: the member publishes a listener,
+  // The one-shot send sugar: open + sync-send with empty metadata.
+  let one_shot: DeliveryAck = issuer
+    .handle
+    .send(
+      StreamTarget::Exact(member_id.clone()),
+      ProtocolTag::parse("example.org/protocols/echo").unwrap(),
+      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      pub_body(b"pub-body"),
+    )
+    .await
+    .unwrap();
+  let _ = one_shot.trace_id();
+
+  // Connect/disconnect member verbs: the member publishes a listener,
   // the issuer dials it explicitly, then disconnects and lets the
   // recovery controller re-dial the published endpoint (the reconnect
   // path used by the membership harness).
   let member_listener = member
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   let member_endpoint = member_listener.endpoint().clone();
   let _connected: NodeId = issuer
     .handle
-    .command(ConnectMember::new(
-      member_endpoint.clone(),
-      member_id.clone(),
-    ))
+    .connect(member_endpoint.clone(), member_id.clone())
     .await
     .unwrap();
-  let _disconnected: () = issuer
-    .handle
-    .command(DisconnectPeer::new(member_id.clone()))
-    .await
-    .unwrap();
+  let _disconnected: () = issuer.handle.disconnect(member_id.clone()).await.unwrap();
   // A deliberately disconnected peer is reconnected deliberately: recovery
   // never dials it on its own.
   let reconnect_deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     match issuer
       .handle
-      .command(ConnectMember::new(
-        member_endpoint.clone(),
-        member_id.clone(),
-      ))
+      .connect(member_endpoint.clone(), member_id.clone())
       .await
     {
       Ok(_reconnected) => break,
@@ -963,12 +959,15 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       Err(error) => panic!("reconnect never succeeded: {error:?}"),
     }
   }
-  let recovery: RecoveryView = issuer.handle.command(StartRecovery::new()).await.unwrap();
+  let recovery: RecoveryView = issuer.handle.start_recovery().await.unwrap();
   let _ = (
     recovery.is_connected(),
     recovery.unreachable_members(),
     recovery.next_attempt_at(),
   );
+
+  // One deterministic anti-entropy round, driven and awaited.
+  issuer.handle.sync().await.unwrap();
 
   // Async route handle and route status.
   let routed = issuer
@@ -985,7 +984,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // An async route retires its record after the terminal state, so the
   // status query races completion: a live route exposes every accessor,
   // a retired one reports NotFound.
-  match issuer.handle.query(GetRoute::new(handle.clone())).await {
+  match issuer.handle.routes().get(&handle) {
     Ok(route_status) => {
       let _ = (
         route_status.handle(),
@@ -1008,35 +1007,30 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   }
 
   // Recovery, connection degree, observability.
-  let recovery: RecoveryView = issuer.handle.command(StartRecovery::new()).await.unwrap();
+  let recovery: RecoveryView = issuer.handle.start_recovery().await.unwrap();
   let _ = (
     recovery.is_connected(),
     recovery.unreachable_members(),
     recovery.next_attempt_at(),
   );
-  let degree: radiata::ConnectionDegreeView = issuer
-    .handle
-    .query(GetConnectionDegree::new())
-    .await
-    .unwrap();
+  let degree: radiata::ConnectionDegreeView = issuer.handle.connection_degree().await.unwrap();
   let _ = (degree.state(), degree.sessions(), degree.target());
-  let observability: ObservabilitySnapshot =
-    issuer.handle.query(GetObservability::new()).await.unwrap();
+  let observability: ObservabilitySnapshot = issuer.handle.metrics().await.unwrap();
   let _ = observability.captured_at();
   let _counter =
     observability.counter(&QualifiedTag::parse(ObservabilitySnapshot::SESSIONS).unwrap());
 
   // Every event subscription type.
   let mut session_events: EventSubscription<SessionChanged> =
-    issuer.handle.events(EventOptions::new()).unwrap();
+    issuer.handle.watch(EventOptions::new()).unwrap();
   let mut member_events: EventSubscription<MemberChanged> =
-    issuer.handle.events(EventOptions::new()).unwrap();
+    issuer.handle.watch(EventOptions::new()).unwrap();
   let mut route_events: EventSubscription<RouteChanged> =
-    issuer.handle.events(EventOptions::new()).unwrap();
+    issuer.handle.watch(EventOptions::new()).unwrap();
   let mut revoked_events: EventSubscription<NodeRevoked> =
-    issuer.handle.events(EventOptions::new()).unwrap();
+    issuer.handle.watch(EventOptions::new()).unwrap();
   let mut recovery_events: EventSubscription<RecoveryChanged> =
-    issuer.handle.events(EventOptions::new()).unwrap();
+    issuer.handle.watch(EventOptions::new()).unwrap();
   let _closed = matches!(session_events.try_recv(), Ok(EventReceive::Empty));
   let _closed = matches!(member_events.try_recv(), Ok(EventReceive::Empty));
   let _closed = matches!(route_events.try_recv(), Ok(EventReceive::Empty));
@@ -1055,20 +1049,15 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   })
   .await;
 
-  // Listener stop command.
-  let _stopped: () = issuer
-    .handle
-    .command(StopListener::new(listener_id))
-    .await
-    .unwrap();
+  // Listener stop verb.
+  let _stopped: () = issuer.handle.listeners().delete(listener_id).await.unwrap();
 
   // Resource removal with the exact observed version: re-observe
   // immediately before the removal so the precondition is never stale.
   let expected = issuer
     .handle
-    .query(GetResource::new(
-      ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
-    ))
+    .resources()
+    .get(ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap())
     .await
     .unwrap()
     .unwrap()
@@ -1076,10 +1065,11 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .clone();
   let removal: ResourceMutationView = issuer
     .handle
-    .command(RemoveResource::new(
+    .resources()
+    .delete(
       ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
       expected,
-    ))
+    )
     .await
     .unwrap();
   assert!(removal.accepted().version().is_removal());
@@ -1091,9 +1081,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let outcome: LeaveOutcome = loop {
     match issuer
       .handle
-      .command(LeaveCluster::new(
-        ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-      ))
+      .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
       .await
     {
       Ok(outcome) => break outcome,
@@ -1112,11 +1100,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // The explicit receipt-retention pass drives over the member's real
   // store: the node's own receipts are not anchored, so the pass
   // forgets nothing. (The issuer has left and is already shut down.)
-  let retention: ReceiptRetentionReport = member
-    .handle
-    .command(ApplyReceiptRetention::new())
-    .await
-    .unwrap();
+  let retention: ReceiptRetentionReport = member.handle.apply_receipt_retention().await.unwrap();
   assert_eq!(retention.forgotten, 0);
   assert!(!retention.remaining);
 
@@ -1125,25 +1109,23 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // marker keeps the recovery decision a deliberate caller construction.
   let frozen_rejection = member
     .handle
-    .command(ResolveFrozenJournal::new(
-      DeclareInterruptedTransactionUncommitted::new(),
-    ))
+    .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
     .await
     .unwrap_err();
   assert_eq!(frozen_rejection.kind(), radiata::ErrorKind::Conflict);
-  let _still_serving: LocalNodeView = member.handle.query(GetLocalNode::new()).await.unwrap();
+  let _still_serving: LocalNodeView = member.handle.local_node().await.unwrap();
 
-  let shutdown: ShutdownOutcome = issuer.handle.command(Shutdown::new()).await.unwrap();
+  let shutdown: ShutdownOutcome = issuer.handle.shutdown().await.unwrap();
   assert!(matches!(
     shutdown.reason(),
     ShutdownReason::Explicit | ShutdownReason::ActiveLeave | ShutdownReason::Fatal(_)
   ));
-  let reason: ShutdownReason = issuer.handle.query(WaitForShutdown::new()).await.unwrap();
+  let reason: ShutdownReason = issuer.handle.wait_for_shutdown().await.unwrap();
   assert!(matches!(
     reason,
     ShutdownReason::Explicit | ShutdownReason::ActiveLeave | ShutdownReason::Fatal(_)
   ));
-  member.handle.command(Shutdown::new()).await.unwrap();
+  member.handle.shutdown().await.unwrap();
 }
 
 /// The built-in file-backed key store is externally drivable: the
@@ -1288,7 +1270,8 @@ struct Node {
 async fn listen(node: &Node) -> Endpoint {
   let listener = node
     .handle
-    .command(Listen::new(node.endpoint.clone()))
+    .listeners()
+    .create(node.endpoint.clone())
     .await
     .unwrap();
   listener.endpoint().clone()
@@ -1298,10 +1281,7 @@ async fn merge_with_retry(node: &NodeHandle, endpoint: &Endpoint, secret: &str) 
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   loop {
     match node
-      .command(MergeCluster::new(
-        endpoint.clone(),
-        MergeCredential::parse(secret).unwrap(),
-      ))
+      .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
       .await
     {
       Ok(view) => return view,
@@ -1320,7 +1300,8 @@ async fn wait_for_session(node: &Node) {
   loop {
     let sessions = node
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     if !sessions.items().is_empty() {
