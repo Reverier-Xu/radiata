@@ -613,7 +613,8 @@ impl ResourceMutationView {
   }
 }
 
-/// The explicit acknowledgement required by [`crate::LeaveCluster`]:
+/// The explicit acknowledgement required by
+/// [`NodeHandle::leave`](crate::NodeHandle::leave):
 /// constructing it is the caller's deliberate confirmation
 /// that the leave replaces the node's identity and deletes the old
 /// identity's local core metadata. It has no `Default`, so the
@@ -636,7 +637,8 @@ impl ReplaceIdentityAndDeleteOldCoreMetadata {
   }
 }
 
-/// The explicit declaration required by [`crate::ResolveFrozenJournal`]:
+/// The explicit declaration required by
+/// [`NodeHandle::resolve_frozen_journal`](crate::NodeHandle::resolve_frozen_journal):
 /// constructing it is the operator's deliberate assertion that the
 /// interrupted journaled transaction behind the node's frozen metadata
 /// store did not durably commit. It has no `Default`, so the
