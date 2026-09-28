@@ -160,8 +160,8 @@ fn expect_exact_self_binding(bytes: &[u8], identity: &LocalIdentityV1) -> Result
 /// Opens or creates the local node identity with exact crash recovery.
 ///
 /// `keys` is the caller's custody injection; `None` assembles the default
-/// [`MetadataKeyStore`](crate::keys::MetadataKeyStore) over the opened
-/// store's own storage handle, so identity and its key share one durable
+/// [`MetadataKeyStore`](crate::keys::metadata::MetadataKeyStore) over the
+/// opened store's own storage handle, so identity and its key share one durable
 /// root. Either way the provider must report ed25519, reconciliation,
 /// and deletion capabilities before any key operation runs. `entropy`
 /// supplies every generated node, operation, and transaction ID.

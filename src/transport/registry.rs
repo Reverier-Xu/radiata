@@ -5,7 +5,8 @@
 //! one addressing selector; the map merges the three built-in
 //! transports (direct TLS, WebSocket, plaintext TCP) with every
 //! caller-registered custom transport, and a dial or bind resolves its
-//! implementation from the endpoint's [`TransportSelector`] alone — the
+//! implementation from the endpoint's
+//! [`TransportSelector`](crate::transport::TransportSelector) alone — the
 //! URL scheme for built-ins, the registered scheme name for customs.
 //! Core retains authentication and stream safety: a transport only
 //! carries prelude frames, the session handshake always authenticates,

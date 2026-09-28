@@ -2,12 +2,12 @@
 //! connection contract.
 //!
 //! The layer is open by construction: a transport owns the
-//! listener/connection lifecycle for one canonical [`TransportTag`],
-//! the endpoint's [`TransportSelector`] is the resolution key, and the
-//! extension registry is the single map from selector to implementation.
-//! Callers register custom media (an ESP-NOW radio, an 802.11 link, a
-//! serial bus) through [`crate::CustomTransport`]; the three built-ins
-//! cover the ordinary deployment space:
+//! listener/connection lifecycle for one canonical
+//! [`TransportTag`](crate::TransportTag), the endpoint's [`TransportSelector`]
+//! is the resolution key, and the extension registry is the single map from
+//! selector to implementation. Callers register custom media (an ESP-NOW radio,
+//! an 802.11 link, a serial bus) through [`crate::CustomTransport`]; the three
+//! built-ins cover the ordinary deployment space:
 //!
 //! - [`tls_transport`] — direct TLS 1.3 over TCP. **The default**: the
 //!   simplest, cheapest stream; advertise `tls://` endpoints unless a

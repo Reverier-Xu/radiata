@@ -25,7 +25,7 @@ pub(crate) const KEY_DELETION_INTENT_NAMESPACE: &str =
 /// Committed key deletion outcome per provider handle.
 pub(crate) const KEY_DELETED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-deleted-v1";
 /// Custodial Ed25519 seed material per custody operation: the default
-/// [`crate::keys::MetadataKeyStore`]'s durable artifact, one row per
+/// [`crate::keys::metadata::MetadataKeyStore`]'s durable artifact, one row per
 /// operation id. Swept only by the provider's own deletion flow, never
 /// by a domain wipe.
 pub(crate) const KEY_SEED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-seed-v1";
