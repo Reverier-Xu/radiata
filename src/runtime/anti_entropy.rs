@@ -117,6 +117,8 @@ pub(super) fn spawn_sync_driver(
         for (peer, planes) in in_flight {
           let entry = sync_in_flight.entry(peer.clone()).or_default();
           entry.tombstones |= planes.tombstones;
+          entry.descriptors |= planes.descriptors;
+          entry.trust |= planes.trust;
         }
       }
       let mut resource_in_flight = std::collections::BTreeSet::new();

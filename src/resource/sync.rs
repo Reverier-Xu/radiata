@@ -15,7 +15,7 @@ use minicbor::bytes::ByteVec;
 
 use super::page::{ResourcePage, sync as page_sync};
 use crate::{
-  Digest, Error, IncomingStream, NodeId, ProtocolTag, Result,
+  Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::BoxFuture,
   extension_registry::{PacketConsumer, ProtocolDefinition},
   identity::lifecycle::LocalIdentityContext,
@@ -125,130 +125,43 @@ pub(crate) struct ResourceSyncCursors {
   install_epoch: u64,
 }
 
-/// The per-peer resource sync state: the filtered-walk cursor plus the
-/// bounded delivered-version watermark table. The cursor is the walk
-/// boundary — the last scanned entry's key while a pass is in flight —
-/// so a delivered page resumes the walk exactly where its budget window
-/// ended, and an undelivered one rewinds to its scan start; `None` means
-/// the pass is complete and the next one starts from scratch.
-///
-/// The watermark table is in memory only: a process restart clears it,
-/// and the next pass re-delivers the whole catalog (idempotent on the
-/// receiver). Overflowing the table cap clears it for the same reason:
-/// bounded memory over bounded re-delivery.
-#[derive(Debug)]
+/// Quiet ticks between detection passes: a mid-catalog write is
+/// detected within one cadence window and delivered as one page. The
+/// value is the sync plane's shared detection cadence (single-sourced in
+/// [`crate::sync_common`]), so the membership and resource lanes
+/// cannot drift.
+pub(crate) const DETECTION_CADENCE_TICKS: u32 = crate::sync_common::DETECTION_CADENCE_TICKS;
+
+/// The per-peer resource sync state: the shared watermark walk (the
+/// walk boundary, the delivered-digest table, the detection cadence, and
+/// the pending page's verdict bookkeeping — see
+/// [`crate::sync_common::WatermarkWalk`]). The state is dropped when a
+/// peer's session is gone, so the returning peer's first round
+/// re-delivers everything it missed, and a newly connected peer receives
+/// the full catalog on its first tick without any global state churn.
+#[derive(Debug, Clone)]
 pub(crate) struct ResourcePeerState {
-  /// The walk boundary: the last scanned entry's key while a detection
-  /// pass is in flight; `None` means the pass is complete and the next
-  /// one starts from scratch.
-  cursor: Option<Vec<u8>>,
-  /// The scan position where the in-flight page started: an undelivered
-  /// page rewinds to exactly here.
-  scan_start: Option<Vec<u8>>,
-  /// Last delivered record digest per store key (bounded by
-  /// [`WATERMARK_TABLE_CAP`]).
-  watermarks: std::collections::BTreeMap<Vec<u8>, Digest>,
-  /// Ticks since this peer's last pass ran (delivery or empty
-  /// detection). Starts at the cadence threshold: a freshly discovered
-  /// peer is immediately due its first detection pass.
-  ticks_since_pass: u32,
-  /// Completed detection passes since the watermark table was last
-  /// refreshed (see [`WATERMARK_REFRESH_PASSES`]).
-  passes_since_refresh: u32,
+  walk: crate::sync_common::WatermarkWalk<Vec<u8>>,
 }
 
 impl Default for ResourcePeerState {
   fn default() -> Self {
     Self {
-      cursor: None,
-      scan_start: None,
-      watermarks: std::collections::BTreeMap::new(),
-      ticks_since_pass: DETECTION_CADENCE_TICKS,
-      passes_since_refresh: 0,
+      walk: crate::sync_common::WatermarkWalk::new(DETECTION_CADENCE_TICKS),
     }
   }
 }
-
-/// Entries per peer watermark table before it resets to full
-/// re-delivery: bounds the in-memory table while keeping whole-catalog
-/// watermarks for every realistic catalog size.
-const WATERMARK_TABLE_CAP: usize = 8_192;
-
-/// Completed detection passes between watermark-table refreshes: each
-/// refresh clears the table once, so the next pass re-delivers the whole
-/// catalog. This bounds how long any admission-versus-application
-/// divergence — a page the destination admitted but skipped applying —
-/// can stay unrepaired, restoring the from-scratch liveness bound the
-/// fingerprint design provided.
-const WATERMARK_REFRESH_PASSES: u32 = 64;
-
-/// Quiet ticks between detection passes: a mid-catalog write is
-/// detected within one cadence window and delivered as one page. The
-/// value is the sync plane's shared resend cadence (single-sourced in
-/// [`crate::sync_common`]), so the membership and resource lanes
-/// cannot drift.
-pub(crate) const DETECTION_CADENCE_TICKS: u32 =
-  crate::sync_common::PeerPageCursor::PAGE_RESEND_TICKS;
-
-/// Store entries scanned per tick while a pass is in flight: bounds the
-/// per-tick decode cost and the walk amortizes across ticks.
-const SCAN_BUDGET_PER_TICK: usize = 256;
 
 /// The outcome of one per-peer resource round: the admission ack (when
-/// a page was dispatched) plus the verdict-gated state commit it
-/// carries.
+/// a page was dispatched) plus whether a page was dispatched at all (a
+/// round with this flag set but no ack means the routing queue rejected
+/// the dispatch, and the walk rewinds exactly like an undelivered
+/// verdict). The verdict's cursor effects live inside the peer's
+/// [`crate::sync_common::WatermarkWalk`], committed or rewound by the
+/// settled verdict.
 struct ResourcePeerRound {
   ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
-  commit_cursor: Option<Vec<u8>>,
-  rewind_cursor: Option<Vec<u8>>,
-  marks: Vec<(Vec<u8>, Digest)>,
-  /// Whether a page was assembled and handed to dispatch: a round with
-  /// this flag set but no ack means the routing queue rejected the
-  /// dispatch, and the tick applies the same rewind an undelivered
-  /// verdict gets.
   dispatched: bool,
-}
-
-impl ResourcePeerRound {
-  /// A quiet round: nothing was due, the peer state already advanced.
-  fn quiet() -> Self {
-    Self {
-      ack: None,
-      commit_cursor: None,
-      rewind_cursor: None,
-      marks: Vec::new(),
-      dispatched: false,
-    }
-  }
-
-  /// Commits a delivered page: the walk cursor advances to the step's
-  /// boundary (past every scanned entry) and the page's records enter
-  /// the peer's watermark table (bounded; overflow resets the table so
-  /// the next pass re-delivers the full catalog).
-  fn commit_delivered(&self, state: &mut ResourcePeerState) {
-    state.cursor = self.commit_cursor.clone();
-    state.scan_start = None;
-    if state.watermarks.len() + self.marks.len() > WATERMARK_TABLE_CAP {
-      state.watermarks.clear();
-    }
-    state.watermarks.extend(self.marks.iter().cloned());
-    state.ticks_since_pass = 0;
-  }
-
-  /// Rewinds an undelivered page to its scan start so the next tick
-  /// re-collects exactly the same changed records (watermark entries
-  /// were never committed). A scratch-start failure (`None` rewind
-  /// target) also forces the next pass due: otherwise the pass-start
-  /// tick reset would silence the peer for a full detection cadence —
-  /// the same next-tick retry the membership lane's
-  /// `PeerPageCursor::discard_progress` implements.
-  fn rewind(&self, state: &mut ResourcePeerState) {
-    state.cursor = self.rewind_cursor.clone();
-    state.scan_start = None;
-    if self.rewind_cursor.is_none() {
-      state.ticks_since_pass = DETECTION_CADENCE_TICKS;
-    }
-  }
 }
 
 /// One resource anti-entropy step: for every alive peer, run one
@@ -299,7 +212,7 @@ pub(crate) async fn resource_sync_tick(
   if epoch != cursors.install_epoch {
     cursors.install_epoch = epoch;
     for state in cursors.peers.values_mut() {
-      state.ticks_since_pass = DETECTION_CADENCE_TICKS;
+      state.walk.arm();
     }
   }
   // One snapshot per tick, shared by every per-peer round: a hub
@@ -308,7 +221,6 @@ pub(crate) async fn resource_sync_tick(
   let protocol = ProtocolTag::parse(RESOURCE_SYNC_PROTOCOL)?;
   let mut dispatched: Vec<(
     NodeId,
-    ResourcePeerRound,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
   for peer in window.iter().copied() {
@@ -328,16 +240,15 @@ pub(crate) async fn resource_sync_tick(
       continue;
     }
     if let Some(ack) = round.ack.take() {
-      dispatched.push((peer.clone(), round, ack));
+      dispatched.push((peer.clone(), ack));
     } else {
       // The routing queue rejected the dispatch: the page never left
-      // this node. Treat it like an undelivered verdict — rewind to the
-      // page's scan start so the next tick re-sends exactly that page —
-      // and move on to the remaining peers instead of aborting the
-      // whole tick (the membership lane's per-payload rejection
-      // policy).
+      // this node. Treat it like an undelivered verdict — the walk
+      // rewinds to the page's scan start so the next tick re-sends
+      // exactly that page — and move on to the remaining peers instead
+      // of aborting the whole tick (the membership lane's per-payload
+      // rejection policy).
       crate::audit::resource_page_rewound(peer.as_str());
-      round.rewind(state);
     }
   }
   if dispatched.is_empty() {
@@ -354,7 +265,6 @@ pub(crate) async fn resource_sync_tick(
 pub(crate) struct ResourcePendingRound {
   dispatched: Vec<(
     NodeId,
-    ResourcePeerRound,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )>,
 }
@@ -367,7 +277,7 @@ impl ResourcePendingRound {
     self
       .dispatched
       .iter()
-      .map(|(peer, ..)| peer.clone())
+      .map(|(peer, _)| peer.clone())
       .collect()
   }
 
@@ -378,12 +288,12 @@ impl ResourcePendingRound {
     // not serialize the settlement behind its ack wait (that would make
     // the convergence bound liveness teardown, not the anti-entropy
     // cadence).
-    let verdicts = futures_util::future::join_all(self.dispatched.into_iter().map(
-      |(peer, round, ack)| async move {
-        let delivered = delivered_within_bound(ack).await;
-        (peer, round, delivered)
-      },
-    ))
+    let verdicts = futures_util::future::join_all(
+      self
+        .dispatched
+        .into_iter()
+        .map(|(peer, ack)| async move { (peer, delivered_within_bound(ack).await) }),
+    )
     .await;
     ResourceRoundEffects { verdicts }
   }
@@ -392,23 +302,25 @@ impl ResourcePendingRound {
 /// The verdict effects of one dispatched resource round, ready to apply
 /// to the cursors.
 pub(crate) struct ResourceRoundEffects {
-  verdicts: Vec<(NodeId, ResourcePeerRound, bool)>,
+  verdicts: Vec<(NodeId, bool)>,
 }
 
 /// Applies one settled round's verdict effects to the cursors: a
-/// delivered page commits its walk cursor and watermarks; an undelivered
-/// one rewinds to the page's scan start so the next tick re-sends
-/// exactly that page.
+/// delivered page commits its marks and walk boundary inside the peer's
+/// watermark walk; an undelivered one rewinds to the page's scan start
+/// so the next tick re-sends exactly that page.
 pub(crate) fn apply_resource_round_effects(
   cursors: &mut ResourceSyncCursors, effects: ResourceRoundEffects,
 ) {
-  for (peer, round, delivered) in effects.verdicts {
+  for (peer, delivered) in effects.verdicts {
     if let Some(state) = cursors.peers.get_mut(&peer) {
-      if delivered {
-        round.commit_delivered(state);
-      } else {
+      if !delivered {
         crate::audit::resource_page_rewound(peer.as_str());
-        round.rewind(state);
+      }
+      if let Some(settled) = state.walk.settle_outcome(delivered)
+        && settled.refreshed
+      {
+        crate::audit::resource_watermarks_refreshed(peer.as_str());
       }
     }
   }
@@ -425,36 +337,33 @@ pub(crate) async fn settle_round(pending: ResourcePendingRound, cursors: &mut Re
 }
 
 /// One resource anti-entropy round toward a single peer, from that
-/// peer's own cursor: the quiet state sends nothing, a changed catalog
-/// sends the next bounded page, and a periodic from-scratch pass
-/// re-delivers the whole catalog so a payload lost mid-flight is bounded
-/// to one full-sync window. An in-flight verdict skips the round: the
-/// previous page's cursors are neither committed nor rewound yet, and
-/// re-emitting the same scan window would double-send it.
+/// peer's own walk: the quiet state sends nothing, a changed catalog
+/// sends the next bounded page of mismatched rows only, and a periodic
+/// from-scratch refresh pass re-delivers the whole catalog so a payload
+/// lost mid-flight is bounded to one refresh window. An in-flight
+/// verdict skips the round: the previous page's walk state is neither
+/// committed nor rewound yet, and re-emitting the same scan window
+/// would double-send it.
 async fn resource_sync_tick_peer(
   snapshot: &(dyn crate::provider::StoreSnapshot + '_), entropy: &Arc<dyn crate::api::Entropy>,
   runtime: &RuntimeClient, peer: &NodeId, state: &mut ResourcePeerState, protocol: &ProtocolTag,
   in_flight: bool,
 ) -> Result<ResourcePeerRound> {
-  if in_flight {
-    state.ticks_since_pass = state.ticks_since_pass.saturating_add(1);
-    return Ok(ResourcePeerRound::quiet());
-  }
-  // Pass due: a walk in flight, or the detection cadence elapsed.
-  let pass_due = state.cursor.is_some() || state.ticks_since_pass >= DETECTION_CADENCE_TICKS;
-  if !pass_due {
-    state.ticks_since_pass = state.ticks_since_pass.saturating_add(1);
-    return Ok(ResourcePeerRound::quiet());
+  if in_flight || !state.walk.pass_due() {
+    state.walk.quiet_tick();
+    return Ok(ResourcePeerRound {
+      ack: None,
+      dispatched: false,
+    });
   }
   let emission = page_sync::emit_page_filtered_ctx(
     snapshot,
-    state.cursor.as_deref(),
+    state.walk.cursor().map(|value| value.as_slice()),
     super::page::DEFAULT_RESOURCE_PAGE_LIMIT,
-    SCAN_BUDGET_PER_TICK,
-    &state.watermarks,
+    crate::sync_common::SCAN_BUDGET_PER_TICK,
+    state.walk.watermarks(),
   )
   .await?;
-  state.ticks_since_pass = 0;
   let Some(page) = &emission.page else {
     // Nothing to deliver in this step: either the scan reached the
     // catalog end (the pass completes, the cadence restarts, and the
@@ -462,18 +371,16 @@ async fn resource_sync_tick_peer(
     // mid-catalog (the pass continues from its boundary next tick —
     // closing there would strand every record behind the window until
     // the peer's state resets).
-    if emission.walk_cursor.is_none() {
-      state.passes_since_refresh = state.passes_since_refresh.saturating_add(1);
-      if state.passes_since_refresh >= WATERMARK_REFRESH_PASSES {
-        state.passes_since_refresh = 0;
-        state.watermarks.clear();
-        crate::audit::resource_watermarks_refreshed(peer.as_str());
-      }
+    let continued = emission.walk_cursor.is_some();
+    let refreshed = state.walk.step_quiet(emission.walk_cursor);
+    if refreshed {
+      crate::audit::resource_watermarks_refreshed(peer.as_str());
     }
-    crate::audit::resource_pass_settled(peer.as_str(), emission.walk_cursor.is_some());
-    state.cursor = emission.walk_cursor.clone();
-    state.scan_start = None;
-    return Ok(ResourcePeerRound::quiet());
+    crate::audit::resource_pass_settled(peer.as_str(), continued);
+    return Ok(ResourcePeerRound {
+      ack: None,
+      dispatched: false,
+    });
   };
   tracing::debug!(peer = %peer.as_str(), count = page.records().len(), "resource sync page emitted");
   let payload_bytes = ResourceSyncPayload(ByteVec::from(page.encode()?)).encode()?;
@@ -493,11 +400,18 @@ async fn resource_sync_tick_peer(
       None
     }
   };
+  // The pending page lands in the walk only when the wire accepted it:
+  // a rejected dispatch never entered it (nothing to settle) — the
+  // walk's cursor still sits at this step's scan start and the cadence
+  // counter was never reset, so the next tick re-emits exactly this
+  // range.
+  if ack.is_some() {
+    state.walk.dispatched(emission.walk_cursor, emission.marks);
+  } else {
+    crate::audit::resource_page_rewound(peer.as_str());
+  }
   Ok(ResourcePeerRound {
     ack,
-    commit_cursor: emission.walk_cursor.clone(),
-    rewind_cursor: emission.scan_start.clone(),
-    marks: emission.marks,
     dispatched: true,
   })
 }
@@ -647,11 +561,8 @@ mod tests {
     .await
     .unwrap();
     if let Some(ack) = round.ack.take() {
-      if delivered_within_bound(ack).await {
-        round.commit_delivered(state);
-      } else {
-        round.rewind(state);
-      }
+      let delivered = delivered_within_bound(ack).await;
+      state.walk.settle_outcome(delivered);
     }
     // A quiet round (no page due) carries no verdict to commit.
   }
@@ -775,7 +686,7 @@ mod tests {
     // records reaches entry 256), then force the walk state back to a
     // closed pass while the watermarks stay: the exact state a premature
     // pass close leaves behind.
-    for _ in 0..(super::SCAN_BUDGET_PER_TICK / 16) {
+    for _ in 0..(crate::sync_common::SCAN_BUDGET_PER_TICK / 16) {
       tick_delivered(
         store.as_ref(),
         &entropy,
@@ -786,7 +697,12 @@ mod tests {
       )
       .await;
     }
-    cursors.peers.get_mut(&peer).unwrap().cursor = None;
+    cursors
+      .peers
+      .get_mut(&peer)
+      .unwrap()
+      .walk
+      .force_cursor(None);
 
     // The next pass must walk past the quiet delivered prefix and
     // deliver the tail within the cadence window.
@@ -855,7 +771,7 @@ mod tests {
       .take()
       .expect("the scratch round dispatches a page");
     drop(ack);
-    round.rewind(state);
+    state.walk.settle_outcome(false);
 
     // Round 2: the same page must dispatch again — the rewind forced
     // the pass due instead of waiting out the detection cadence.
@@ -930,7 +846,12 @@ mod tests {
     let mut cursors = ResourceSyncCursors::default();
     // The first peer starts mid-pass: its rejected page must rewind to
     // its page start, not to scratch.
-    cursors.peers.entry(node(2)).or_default().cursor = Some(b"aaa-page-start".to_vec());
+    cursors
+      .peers
+      .entry(node(2))
+      .or_default()
+      .walk
+      .force_cursor(Some(b"aaa-page-start".to_vec()));
 
     if let Some(pending) = resource_sync_tick(
       &context,
@@ -948,18 +869,19 @@ mod tests {
 
     let mid = cursors.peers.get(&node(2)).unwrap();
     assert_eq!(
-      mid.cursor.as_deref(),
+      mid.walk.cursor().map(|value| value.as_slice()),
       Some(b"aaa-page-start".as_slice()),
       "the in-flight page rewinds to its scan start"
     );
-    assert_eq!(mid.scan_start, None);
     let scratch = cursors.peers.get(&node(3)).unwrap();
     assert_eq!(
-      scratch.cursor, None,
+      scratch.walk.cursor(),
+      None,
       "the second peer still ran its round and rewound to scratch"
     );
     assert_eq!(
-      scratch.ticks_since_pass, DETECTION_CADENCE_TICKS,
+      scratch.walk.ticks_since_pass(),
+      DETECTION_CADENCE_TICKS,
       "a scratch-start rejection re-forces the pass due instead of silencing the peer"
     );
     // The next tick over a healthy queue re-sends both peers' pages
@@ -1051,7 +973,7 @@ mod tests {
     }
     assert_eq!(delivered.lock().unwrap().len(), 1);
     assert_eq!(
-      cursors.peers.get(&node(2)).unwrap().ticks_since_pass,
+      cursors.peers.get(&node(2)).unwrap().walk.ticks_since_pass(),
       0,
       "the delivered pass re-arms the cadence"
     );

@@ -73,6 +73,50 @@ evidence lands in the commit history.
   1661 s where `main` passes in 230 s); with the bound the same lane
   passes in 217 s.
 
+## Landed in the watermark anti-entropy cycle (2026-10, no action)
+
+- The membership sync planes (descriptors, issuer trust bindings,
+  tombstones) converged on the shared per-peer watermark walk
+  (`sync_common::WatermarkWalk`, the resource lane's proven model):
+  every plane tracks the digest of each row it has delivered to a peer
+  and emits only mismatched rows, so redundancy scales with the change
+  set — never with the catalog size. This retired the whole-catalog
+  fingerprint rounds whose cascade the 2026-10 audit measured at 98%
+  redundant descriptor traffic under churn (a one-row join re-sent the
+  whole catalog per peer per hop). The from-scratch liveness bound is
+  the periodic watermark refresh (every 64 completed passes per peer,
+  pinned by the `sync_common` walk tests); the one-tick-per-hop push is
+  the register-write epoch, now noted by every membership store write
+  path (`note_local_write`).
+- The trust plane's binding pages are diff-shaped on the same walk
+  (append-only bindings make a missing row never a removal — pinned by
+  `the_trust_walk_dispatches_only_the_binding_diff`); the tombstone
+  plane forwards only a peer's unconfirmed records, and its
+  confirmations expire both when binding evidence reaches the peer
+  (the admitted-but-not-applied heal: a revocation skipped because its
+  subject's binding had not converged yet — pinned by
+  `delayed_content_converges_after_revoke` and the 64-node chaos lane)
+  and on a bounded tick refresh (`TOMBSTONE_CONFIRM_REFRESH_TICKS`) as
+  the backstop for a binding learned from a third party. Tombstones are
+  the one plane without a zero-traffic steady state: admission-only
+  acknowledgements cannot prove application, so the bounded refresh
+  stands in for the receiver-side receipt the leave plane has.
+- The zero-emission steady state of the descriptor and trust planes,
+  and the one-row join push, are pinned by
+  `a_converged_mesh_emits_nothing_until_a_real_change`: over forty
+  ticks the descriptor plane sends exactly one page (one row) and the
+  converged binding walk sends exactly one page, an armed quiet scan
+  sends zero rows, and one committed descriptor change sends exactly
+  one row. The tombstone plane keeps a bounded confirmation refresh
+  (see below) as its only steady traffic. The audit-feature counters
+  (`membership_page_emitted` vs `descriptor_installed`) carry the same
+  ratio for harness-level measurement.
+- Deleted with the design: `PeerPageCursor` (the fingerprint and
+  page-window machinery), the trust page window, and the per-tick
+  whole-catalog fingerprint fold — the membership and resource lanes
+  now share one walk implementation (`walk_namespace_filtered`) and
+  one state machine.
+
 ## Landed earlier (2026-09-27 audit cycle, no action)
 
 - The sync planes pipeline (descriptor and trust), round settlements are
