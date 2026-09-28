@@ -76,14 +76,39 @@ def wait_outbox_state(node: int, msg_id: str, expected: str, deadline_s: float =
          f"u{node}'s outbox {msg_id} -> {expected}", deadline_s=deadline_s)
 
 
+def wait_viewable(node: int, msg_id: str, deadline_s: float = 30):
+    """Waits until `msg_id` is viewable in the recipient's inbox, then
+    returns that message.
+
+    The `/dm` verdict reads `sent` on the wire admission ack, which
+    proves current-process admission only: the chunk pump and the
+    receiver's store write complete asynchronously afterwards. A large
+    body spans many wire chunks, so it becomes viewable well after the
+    sender's HTTP call returns. Viewability must therefore be waited
+    for, never asserted straight off the ack — and the body comparison
+    stays byte-exact, so a truncated or reordered chunk sequence still
+    fails (it either never decodes into the inbox, or decodes wrong).
+    """
+    seen = {}
+
+    def probe():
+        match = [m for m in inbox(node, unread=True)["messages"]
+                 if m["msg_id"] == msg_id]
+        if not match:
+            return False
+        seen["message"] = match[0]
+        return True
+
+    wait(probe, f"u{node}'s inbox {msg_id} becomes viewable", deadline_s=deadline_s)
+    return seen["message"]
+
+
 def b_empty_body_dm():
     """An empty body is legal chat content: delivered, viewable, receipted.
     The data plane carries bytes; validation is the sender's job."""
     result = http("POST", 1, "/dm", {"to": "u2", "body": ""})
     assert result["state"] == "sent", f"empty body must deliver: {result}"
-    view = inbox(2, unread=True)
-    assert any(m["msg_id"] == result["msg_id"] for m in view["messages"]), \
-        "the empty-body dm must be viewable"
+    wait_viewable(2, result["msg_id"])
     wait_outbox_state(1, result["msg_id"], "read")
     print("[b1] empty-body dm delivers, views, receipts")
 
@@ -91,9 +116,8 @@ def b_empty_body_dm():
 def b_whitespace_body_dm():
     result = http("POST", 1, "/dm", {"to": "u2", "body": "   \n\t  "})
     assert result["state"] == "sent", f"whitespace body must deliver: {result}"
-    view = inbox(2, unread=True)
-    match = [m for m in view["messages"] if m["msg_id"] == result["msg_id"]]
-    assert match and match[0]["body"] == "   \n\t  ", "whitespace must round-trip exactly"
+    message = wait_viewable(2, result["msg_id"])
+    assert message["body"] == "   \n\t  ", "whitespace must round-trip exactly"
     wait_outbox_state(1, result["msg_id"], "read")
     print("[b2] whitespace-only body round-trips byte-exact")
 
@@ -102,10 +126,9 @@ def b_unicode_body_dm():
     body = "héllo 世界 🌍🚀 テスト — dashes — emoji 👍🏽"
     result = http("POST", 1, "/dm", {"to": "u3", "body": body})
     assert result["state"] == "sent", f"unicode body must deliver: {result}"
-    view = inbox(3, unread=True)
-    match = [m for m in view["messages"] if m["msg_id"] == result["msg_id"]]
-    assert match and match[0]["body"] == body, \
-        f"unicode must round-trip byte-exact through chunking, got {match}"
+    message = wait_viewable(3, result["msg_id"])
+    assert message["body"] == body, \
+        f"unicode must round-trip byte-exact through chunking, got {message['body']!r}"
     wait_outbox_state(1, result["msg_id"], "read")
     print("[b3] unicode/emoji body round-trips byte-exact")
 
@@ -114,21 +137,22 @@ def b_multichunk_large_dm():
     """A body larger than several wire chunks must arrive byte-exact: the
     chunk sequence, its ordering, and the end frame all carry real weight
     here."""
-    body = "".join(chr(0x4E00 + (i % 5000)) for i in range(100_000))  # ~3.1 chunks
-    assert len(body.encode()) > 3 * CHUNK_BYTES, "the sample must exceed three chunks"
+    # 100_000 CJK code points encode to ~300 KiB, ten wire slices at the
+    # 32 KiB chunk bound.
+    body = "".join(chr(0x4E00 + (i % 5000)) for i in range(100_000))
+    chunks = -(-len(body.encode()) // CHUNK_BYTES)
+    assert chunks > 3, f"the sample must exceed three chunks, got {chunks}"
     started = time.monotonic()
     result = http("POST", 1, "/dm", {"to": "u2", "body": body}, timeout=60)
     assert result["state"] == "sent", f"the large body must deliver: {result['state']}"
-    view = inbox(2, unread=True)
-    match = [m for m in view["messages"] if m["msg_id"] == result["msg_id"]]
-    assert match, "the large dm must be viewable"
-    assert match[0]["body"] == body, \
-        f"large body corrupted in transit: {len(match[0]['body'])} vs {len(body)}"
+    message = wait_viewable(2, result["msg_id"])
+    assert message["body"] == body, \
+        f"large body corrupted in transit: {len(message['body'])} vs {len(body)}"
     wait_outbox_state(1, result["msg_id"], "read")
     seconds = time.monotonic() - started
     assert seconds <= 10, f"large dm round trip {seconds:.1f}s exceeds the 10s SLO"
-    print(f"[b4] {len(body.encode()) // 1024} KiB multi-chunk dm round-trips byte-exact "
-          f"({seconds:.1f}s)")
+    print(f"[b4] {len(body.encode()) // 1024} KiB ({chunks} chunks) multi-chunk dm "
+          f"round-trips byte-exact ({seconds:.1f}s)")
 
 
 def b_oversized_http_body():
@@ -207,12 +231,28 @@ def b_concurrent_burst():
         msg_ids = list(pool.map(send, bodies.items()))
     assert all(outbox_state(1, m) in ("sent", "read") for m in msg_ids), \
         "every burst dm must leave the outbox as sent"
-    view = inbox(2, unread=True)
-    arrived = {m["body"] for m in view["messages"] if m["msg_id"] in set(msg_ids)}
-    assert arrived == set(bodies.values()), \
-        f"the burst must arrive complete: {len(arrived)}/20"
-    assert view["receipts_sent"] == 20, \
-        f"exactly twenty receipts must flow, got {view['receipts_sent']}"
+    # The ack is admission-only, and each listing consumes the read event
+    # for whatever it shows, so completeness accumulates across polls:
+    # every distinct message must arrive with its own body, and the
+    # receipts fired over those polls must total exactly one per message.
+    ids = set(msg_ids)
+    expected = dict(zip(msg_ids, bodies.values()))
+    received = {}
+    receipts = 0
+
+    def probe():
+        nonlocal receipts
+        view = inbox(2, unread=True)
+        receipts += view["receipts_sent"]
+        received.update((m["msg_id"], m["body"]) for m in view["messages"]
+                        if m["msg_id"] in ids)
+        return received.keys() == ids
+
+    wait(probe, "all twenty burst dms arrive whole", deadline_s=60)
+    assert received == expected, \
+        f"the burst must arrive complete and unmixed: {len(received)}/20"
+    assert receipts == 20, \
+        f"exactly twenty receipts must flow, got {receipts}"
     wait(lambda: all(outbox_state(1, m) == "read" for m in msg_ids),
          "all twenty burst dms read", deadline_s=60)
     print("[b10] 20-dm concurrent burst: complete delivery, 20 receipts, no loss")

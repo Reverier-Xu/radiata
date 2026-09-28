@@ -44,6 +44,11 @@ isolated-vertex formula, or an operator override — so the steady mesh
 is a k-out graph rather than a star or spanning tree, and no single
 member's loss can strand a leaf. Messages sent during an outage queue as
 `pending` in the customer's store and flush when connectivity returns.
+A `sent` verdict is the wire **admission** ack, not a delivery
+guarantee: the chunk pump and the recipient's store write complete
+asynchronously after it, so delivery is confirmed end-to-end by the
+read receipt, never by assuming a send implies an immediate inbox
+entry.
 
 ## Transports
 
