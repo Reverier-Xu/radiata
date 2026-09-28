@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use radiata::{
-  Error, ErrorKind, GetNodeStatus, KeyCapabilities, KeyOperationId, NodeBuilder, NodeHandle,
-  NodeStatus, Shutdown, StoreKey,
+  Error, ErrorKind, KeyCapabilities, KeyOperationId, NodeBuilder, NodeHandle, NodeStatus, StoreKey,
   extension::{KeyProvider, StorageFactory},
 };
 
@@ -68,10 +67,7 @@ fn fault_factory(fault: &Arc<FaultingFactory>) -> Arc<dyn StorageFactory> {
 
 async fn start(providers: &Providers) -> NodeHandle {
   let handle = providers.builder().start().await.unwrap();
-  assert_eq!(
-    handle.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running,
-  );
+  assert_eq!(handle.status(), NodeStatus::Running,);
   handle
 }
 
@@ -123,7 +119,7 @@ async fn identity_runtime_fresh_start_provisions_once_and_restart_reloads_same_i
   assert_eq!(pending_count(&providers.factory), 0);
   assert_eq!(providers.factory.commit_calls(), 4);
   assert_eq!(providers.factory.receipt_count(), 4);
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
   assert_eq!(providers.storage_drops.count(), 1);
   assert_eq!(providers.factory_drops.count(), 0);
   assert_eq!(providers.key_drops.count(), 0);
@@ -148,7 +144,7 @@ async fn identity_runtime_fresh_start_provisions_once_and_restart_reloads_same_i
     "restart must keep the exact persisted identity",
   );
   assert!(intent_keys(&providers.factory).is_empty());
-  restarted.command(Shutdown::new()).await.unwrap();
+  restarted.shutdown().await.unwrap();
   assert_eq!(providers.storage_drops.count(), 2);
 
   drop(handle);
@@ -169,7 +165,7 @@ async fn identity_runtime_missing_handle_stops_before_running_without_replacemen
   };
   let handle_bytes = handle_bytes.clone();
   let stored = local_identity_bytes(&providers.factory).unwrap();
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 
   let missing = Arc::new(ScriptedKeys::full());
   let error: Error = builder(
@@ -208,7 +204,7 @@ async fn identity_runtime_mismatched_public_key_stops_before_running_without_rep
     panic!("unexpected key calls: {calls:?}");
   };
   let handle_bytes = handle_bytes.clone();
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 
   let mismatched = ScriptedKeys::full();
   mismatched.override_public_key(radiata::PublicKey::from_bytes(
@@ -317,7 +313,7 @@ async fn identity_runtime_create_unknown_restart_reconciles_the_same_operation()
   assert!(local_identity_bytes(&providers.factory).is_some());
   assert!(intent_keys(&providers.factory).is_empty());
   assert_eq!(providers.factory.commit_calls(), 4);
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -361,10 +357,7 @@ async fn identity_runtime_finalize_unknown_applied_recovers_journal_on_restart()
   .start()
   .await
   .unwrap();
-  assert_eq!(
-    handle.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running,
-  );
+  assert_eq!(handle.status(), NodeStatus::Running,);
   assert_eq!(
     providers.keys.take_calls(),
     vec![KeyCall::PublicKey(handle_bytes)],
@@ -372,7 +365,7 @@ async fn identity_runtime_finalize_unknown_applied_recovers_journal_on_restart()
   );
   assert_eq!(pending_count(&providers.factory), 0);
   assert_eq!(providers.factory.commit_calls(), 4);
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -411,10 +404,7 @@ async fn identity_runtime_finalize_unknown_not_applied_resumes_intent_on_restart
   .start()
   .await
   .unwrap();
-  assert_eq!(
-    handle.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running,
-  );
+  assert_eq!(handle.status(), NodeStatus::Running,);
   let created = providers.keys.lookup_operation(&operation).unwrap();
   assert_eq!(
     providers.keys.take_calls(),
@@ -427,7 +417,7 @@ async fn identity_runtime_finalize_unknown_not_applied_resumes_intent_on_restart
   assert!(local_identity_bytes(&providers.factory).is_some());
   assert!(intent_keys(&providers.factory).is_empty());
   assert_eq!(providers.factory.commit_calls(), 4);
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -439,7 +429,7 @@ async fn identity_runtime_storage_corruption_error_never_leaks_handle_bytes() {
     panic!("unexpected key calls: {calls:?}");
   };
   let handle_bytes = handle_bytes.clone();
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 
   providers.factory.inject_entry(
     namespace(KEY_CREATION_INTENT_NAMESPACE),

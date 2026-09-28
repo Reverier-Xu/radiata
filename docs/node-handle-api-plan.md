@@ -67,10 +67,13 @@ Three layers on `NodeHandle`:
 3. **Observation.** `watch::<E>` replaces `events::<E>` (the k8s API
    verb); status reads become cheap, honest signatures.
 
-Accessor structs borrow the handle (`Members<'a>`); all methods are
-`&self` async, so `node.members().list(page).await` is a temporary with
-no lifetime friction. The `RuntimeClient` stays `Clone` if an owned form
-is ever needed.
+Accessor structs are cheap single-use values holding a cloned runtime
+client (`node.members()`); every verb consumes the accessor and returns
+an owned future, so a write intent built now can be held and driven
+later exactly like any other value. The `RuntimeClient` clone is a few
+channel handles; the borrowing form (`Members<'a>`) was rejected
+because it made deferred futures un-returnable (verified by the
+`resources.version` guide chapter's enqueue pattern).
 
 ### Layer 1 — resource accessors
 

@@ -10,9 +10,9 @@ use std::{sync::Arc, time::Duration};
 #[cfg(any(feature = "json", feature = "redb"))]
 use radiata::extension::StorageFactory;
 use radiata::{
-  Endpoint, EventOptions, EventReceive, NodeBuilder, NodeConfig, NodeHandle, PageSpec, PutResource,
-  ResourceChanged, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, SelectResources,
-  Selector, Shutdown, ShutdownReason, extension::KeyProvider,
+  Endpoint, EventOptions, EventReceive, NodeBuilder, NodeConfig, NodeHandle, PageSpec,
+  ResourceChanged, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Selector,
+  ShutdownReason, extension::KeyProvider,
 };
 
 mod common;
@@ -46,7 +46,8 @@ async fn start_node(seed: u64, storage: Arc<MemoryStorageFactory>) -> Node {
 async fn listen(node: &Node) -> Endpoint {
   let listener = node
     .handle
-    .command(radiata::Listen::new(node.endpoint.clone()))
+    .listeners()
+    .create(node.endpoint.clone())
     .await
     .unwrap();
   listener.endpoint().clone()
@@ -70,10 +71,11 @@ fn resource_labels(kind: &str, seed: u8) -> ResourceLabels {
 
 async fn select_names(node: &NodeHandle, selector: &str) -> Vec<String> {
   let page = node
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse(selector).unwrap(),
       PageSpec::first(64).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   assert!(page.next().is_none(), "the test catalog fits one page");
@@ -95,18 +97,16 @@ async fn put_resource_commits_atomically_and_emits_one_event() {
   .await;
   let mut events = node
     .handle
-    .events::<ResourceChanged>(EventOptions::new())
+    .watch::<ResourceChanged>(EventOptions::new())
     .unwrap();
 
   let outcome = node
     .handle
-    .command(
-      PutResource::new(ResourceWrite::new(
-        resource_name(1),
-        resource_labels("document", 1),
-      ))
-      .unwrap(),
-    )
+    .resources()
+    .put(ResourceWrite::new(
+      resource_name(1),
+      resource_labels("document", 1),
+    ))
     .await
     .unwrap();
   assert_eq!(outcome.accepted().name(), &resource_name(1));
@@ -137,13 +137,11 @@ async fn put_resource_commits_atomically_and_emits_one_event() {
   // A second write to the same name emits exactly one more event.
   let outcome = node
     .handle
-    .command(
-      PutResource::new(ResourceWrite::new(
-        resource_name(1),
-        resource_labels("document", 1),
-      ))
-      .unwrap(),
-    )
+    .resources()
+    .put(ResourceWrite::new(
+      resource_name(1),
+      resource_labels("document", 1),
+    ))
     .await
     .unwrap();
   assert!(outcome.is_current_winner());
@@ -157,7 +155,7 @@ async fn put_resource_commits_atomically_and_emits_one_event() {
     EventReceive::Empty | EventReceive::Closed
   ));
 
-  let outcome = node.handle.command(Shutdown::new()).await.unwrap();
+  let outcome = node.handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
@@ -183,20 +181,14 @@ async fn concurrent_resource_writes_converge_to_one_winner() {
   // Both members write the same name concurrently with competing labels.
   let shared = resource_name(3);
   let (first, second) = tokio::join!(
-    issuer.handle.command(
-      PutResource::new(ResourceWrite::new(
-        shared.clone(),
-        resource_labels("document", 3)
-      ))
-      .unwrap(),
-    ),
-    member.handle.command(
-      PutResource::new(ResourceWrite::new(
-        shared.clone(),
-        resource_labels("blob", 3)
-      ))
-      .unwrap(),
-    ),
+    issuer.handle.resources().put(ResourceWrite::new(
+      shared.clone(),
+      resource_labels("document", 3)
+    )),
+    member.handle.resources().put(ResourceWrite::new(
+      shared.clone(),
+      resource_labels("blob", 3)
+    )),
   );
   // Both candidates are accepted; at most one is the local winner.
   let first = first.unwrap();
@@ -213,18 +205,20 @@ async fn concurrent_resource_writes_converge_to_one_winner() {
   loop {
     let view_a = issuer
       .handle
-      .query(SelectResources::new(
+      .resources()
+      .select(
         Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
         PageSpec::first(64).unwrap(),
-      ))
+      )
       .await
       .unwrap();
     let view_b = member
       .handle
-      .query(SelectResources::new(
+      .resources()
+      .select(
         Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
         PageSpec::first(64).unwrap(),
-      ))
+      )
       .await
       .unwrap();
     if view_a.items() == view_b.items()
@@ -235,25 +229,19 @@ async fn concurrent_resource_writes_converge_to_one_winner() {
     }
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round per node instead of the wall-clock tick.
-    issuer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
-    member
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    issuer.handle.sync().await.unwrap();
+    member.handle.sync().await.unwrap();
     if deadline.elapsed() >= Duration::from_secs(30) {
       let members_a = issuer
         .handle
-        .query(radiata::PageMembers::new(PageSpec::first(8).unwrap()))
+        .members()
+        .list(PageSpec::first(8).unwrap())
         .await
         .unwrap();
       let members_b = member
         .handle
-        .query(radiata::PageMembers::new(PageSpec::first(8).unwrap()))
+        .members()
+        .list(PageSpec::first(8).unwrap())
         .await
         .unwrap();
       panic!(
@@ -276,7 +264,7 @@ async fn concurrent_resource_writes_converge_to_one_winner() {
   }
 
   for node in [issuer, member] {
-    let outcome = node.handle.command(Shutdown::new()).await.unwrap();
+    let outcome = node.handle.shutdown().await.unwrap();
     assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
   }
 }
@@ -293,11 +281,7 @@ async fn maintenance_preserves_labels_and_emits_nothing() {
   .await;
   let issuer_endpoint = listen(&issuer).await;
   common::put_resource_with_retry(&issuer.handle, || {
-    PutResource::new(ResourceWrite::new(
-      resource_name(4),
-      resource_labels("document", 4),
-    ))
-    .unwrap()
+    ResourceWrite::new(resource_name(4), resource_labels("document", 4))
   })
   .await;
 
@@ -308,7 +292,7 @@ async fn maintenance_preserves_labels_and_emits_nothing() {
   .await;
   let mut member_events = member
     .handle
-    .events::<ResourceChanged>(EventOptions::new())
+    .watch::<ResourceChanged>(EventOptions::new())
     .unwrap();
   common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
 
@@ -325,11 +309,7 @@ async fn maintenance_preserves_labels_and_emits_nothing() {
       "no convergence"
     );
     // Schedule the next convergence observation on the observer.
-    member
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    member.handle.sync().await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
@@ -346,7 +326,7 @@ async fn maintenance_preserves_labels_and_emits_nothing() {
   );
 
   for node in [issuer, member] {
-    let outcome = node.handle.command(Shutdown::new()).await.unwrap();
+    let outcome = node.handle.shutdown().await.unwrap();
     assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
   }
 }
@@ -387,29 +367,28 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
       .await
       .unwrap();
     handle
-      .command(
-        PutResource::new(ResourceWrite::new(
-          name.clone(),
-          resource_labels("document", 9),
-        ))
-        .unwrap(),
-      )
+      .resources()
+      .put(ResourceWrite::new(
+        name.clone(),
+        resource_labels("document", 9),
+      ))
       .await
       .unwrap();
-    handle.command(Shutdown::new()).await.unwrap();
+    handle.shutdown().await.unwrap();
   }
 
   // Reopen the same store: the identity and the committed candidate load
   // intact.
   let handle = NodeBuilder::new(storage).keys(keys).start().await.unwrap();
   let mut events = handle
-    .events::<ResourceChanged>(EventOptions::new())
+    .watch::<ResourceChanged>(EventOptions::new())
     .unwrap();
   let page = handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("example.org/labels/lane=lane-9").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   assert_eq!(page.items().len(), 1);
@@ -425,7 +404,7 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
     EventReceive::Empty | EventReceive::Closed
   ));
 
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 }
 
 /// Removal requires the exact observed version — a stale version fails
@@ -450,19 +429,17 @@ async fn remove_resource_requires_the_exact_version() {
   .await;
   let mut events = node
     .handle
-    .events::<ResourceChanged>(EventOptions::new())
+    .watch::<ResourceChanged>(EventOptions::new())
     .unwrap();
 
   let name = resource_name(20);
   node
     .handle
-    .command(
-      PutResource::new(ResourceWrite::new(
-        name.clone(),
-        resource_labels("document", 20),
-      ))
-      .unwrap(),
-    )
+    .resources()
+    .put(ResourceWrite::new(
+      name.clone(),
+      resource_labels("document", 20),
+    ))
     .await
     .unwrap();
   // Drain the put's event.
@@ -471,10 +448,11 @@ async fn remove_resource_requires_the_exact_version() {
     .unwrap();
   let stale = node
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap()
     .items()[0]
@@ -484,13 +462,11 @@ async fn remove_resource_requires_the_exact_version() {
   // A second write supersedes the first: version one is now stale.
   node
     .handle
-    .command(
-      PutResource::new(ResourceWrite::new(
-        name.clone(),
-        resource_labels("blob", 20),
-      ))
-      .unwrap(),
-    )
+    .resources()
+    .put(ResourceWrite::new(
+      name.clone(),
+      resource_labels("blob", 20),
+    ))
     .await
     .unwrap();
   let _ = tokio::time::timeout(Duration::from_secs(90), events.recv())
@@ -501,10 +477,11 @@ async fn remove_resource_requires_the_exact_version() {
   assert_eq!(current, [name.as_str().to_owned()]);
   let page = node
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   let winner = page.items()[0].version().clone();
@@ -514,7 +491,8 @@ async fn remove_resource_requires_the_exact_version() {
   assert_eq!(
     node
       .handle
-      .command(radiata::RemoveResource::new(name.clone(), stale))
+      .resources()
+      .delete(name.clone(), stale)
       .await
       .unwrap_err()
       .kind(),
@@ -529,10 +507,8 @@ async fn remove_resource_requires_the_exact_version() {
   assert_eq!(
     node
       .handle
-      .command(radiata::RemoveResource::new(
-        resource_name(21),
-        winner.clone()
-      ))
+      .resources()
+      .delete(resource_name(21), winner.clone())
       .await
       .unwrap_err()
       .kind(),
@@ -543,7 +519,8 @@ async fn remove_resource_requires_the_exact_version() {
   // and the resource leaves selection.
   let outcome = node
     .handle
-    .command(radiata::RemoveResource::new(name.clone(), winner.clone()))
+    .resources()
+    .delete(name.clone(), winner.clone())
     .await
     .unwrap();
   assert!(outcome.is_current_winner());
@@ -568,7 +545,8 @@ async fn remove_resource_requires_the_exact_version() {
   assert_eq!(
     node
       .handle
-      .command(radiata::RemoveResource::new(name.clone(), winner))
+      .resources()
+      .delete(name.clone(), winner)
       .await
       .unwrap_err()
       .kind(),
@@ -583,7 +561,8 @@ async fn remove_resource_requires_the_exact_version() {
   let removal_version = outcome.accepted().version().clone();
   let again = node
     .handle
-    .command(radiata::RemoveResource::new(name, removal_version))
+    .resources()
+    .delete(name, removal_version)
     .await
     .unwrap();
   assert!(again.is_current_winner());
@@ -592,11 +571,11 @@ async fn remove_resource_requires_the_exact_version() {
     EventReceive::Empty | EventReceive::Closed
   ));
 
-  let outcome = node.handle.command(Shutdown::new()).await.unwrap();
+  let outcome = node.handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
-/// Conditional write (`PutResource::with_expected`): the preconditioned
+/// Conditional write (`resources().put_expected`): the preconditioned
 /// candidate installs only while the stored winner equals the observed
 /// version exactly — a stale observation conflicts explicitly, an
 /// unknown name fails NotFound, and the plain write path stays
@@ -612,21 +591,20 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
   let name = resource_name(40);
   node
     .handle
-    .command(
-      PutResource::new(ResourceWrite::new(
-        name.clone(),
-        resource_labels("document", 40),
-      ))
-      .unwrap(),
-    )
+    .resources()
+    .put(ResourceWrite::new(
+      name.clone(),
+      resource_labels("document", 40),
+    ))
     .await
     .unwrap();
   let page = node
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type=document").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   let version = page.items()[0].version().clone();
@@ -635,12 +613,10 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
   // wins.
   let outcome = node
     .handle
-    .command(
-      PutResource::with_expected(
-        ResourceWrite::new(name.clone(), resource_labels("blob", 41)),
-        version.clone(),
-      )
-      .unwrap(),
+    .resources()
+    .put_expected(
+      ResourceWrite::new(name.clone(), resource_labels("blob", 41)),
+      version.clone(),
     )
     .await
     .unwrap();
@@ -651,12 +627,10 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
   assert_eq!(
     node
       .handle
-      .command(
-        PutResource::with_expected(
-          ResourceWrite::new(name.clone(), resource_labels("blob", 42)),
-          version.clone(),
-        )
-        .unwrap(),
+      .resources()
+      .put_expected(
+        ResourceWrite::new(name.clone(), resource_labels("blob", 42)),
+        version.clone(),
       )
       .await
       .unwrap_err()
@@ -670,12 +644,10 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
   assert_eq!(
     node
       .handle
-      .command(
-        PutResource::with_expected(
-          ResourceWrite::new(resource_name(41), resource_labels("blob", 43)),
-          version,
-        )
-        .unwrap(),
+      .resources()
+      .put_expected(
+        ResourceWrite::new(resource_name(41), resource_labels("blob", 43)),
+        version,
       )
       .await
       .unwrap_err()
@@ -690,10 +662,11 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
   );
   let current = node
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   assert_eq!(
@@ -702,7 +675,7 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
     "only the preconditioned write landed"
   );
 
-  let outcome = node.handle.command(Shutdown::new()).await.unwrap();
+  let outcome = node.handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
@@ -720,22 +693,21 @@ async fn remove_preserves_unrelated_metadata() {
   for seed in [30_u8, 31] {
     node
       .handle
-      .command(
-        PutResource::new(ResourceWrite::new(
-          resource_name(seed),
-          resource_labels("document", seed),
-        ))
-        .unwrap(),
-      )
+      .resources()
+      .put(ResourceWrite::new(
+        resource_name(seed),
+        resource_labels("document", seed),
+      ))
       .await
       .unwrap();
   }
   let page = node
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type=document").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   let target = page
@@ -747,17 +719,19 @@ async fn remove_preserves_unrelated_metadata() {
 
   node
     .handle
-    .command(radiata::RemoveResource::new(resource_name(30), version))
+    .resources()
+    .delete(resource_name(30), version)
     .await
     .unwrap();
 
   // The unrelated resource is byte-identical and still selected.
   let remaining = node
     .handle
-    .query(SelectResources::new(
+    .resources()
+    .select(
       Selector::parse("radiata.woooo.tech/resources/type=document").unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   assert_eq!(remaining.items().len(), 1);
@@ -767,6 +741,6 @@ async fn remove_preserves_unrelated_metadata() {
     "file:///g9/031"
   );
 
-  let outcome = node.handle.command(Shutdown::new()).await.unwrap();
+  let outcome = node.handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }

@@ -12,11 +12,10 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  ConnectMember, DisconnectPeer, Endpoint, ErrorKind, FeatureDefinition, FeatureTag, GetMember,
-  GetResource, IssueMergeCredential, Listen, LoadBalancingPolicy, MergeCluster, NodeBuilder,
-  NodeConfig, NodeHandle, PageMembers, PageSessions, PageSpec, PageTrust, ProtocolDefinition,
-  ProtocolTag, QualifiedTag, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result,
-  RotateMergeCredential, StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
+  Endpoint, ErrorKind, FeatureDefinition, FeatureTag, LoadBalancingPolicy, NodeBuilder, NodeConfig,
+  NodeHandle, PageSpec, ProtocolDefinition, ProtocolTag, QualifiedTag, ResourceLabels,
+  ResourceName, ResourceUri, ResourceWrite, Result, StreamMetadata, StreamPolicy, StreamTarget,
+  extension::KeyProvider,
 };
 
 mod common;
@@ -194,7 +193,8 @@ impl Node {
   async fn listen(&mut self) {
     let listener = self
       .handle
-      .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+      .listeners()
+      .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
       .unwrap();
     self.endpoint = Some(listener.endpoint().clone());
@@ -213,21 +213,9 @@ impl Node {
 /// credential issuer; `member` joins as the initiator. Returns the
 /// member's node id.
 async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeId {
-  issuer.id = Some(
-    issuer
-      .handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone(),
-  );
+  issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   issuer.listen().await;
-  let issued = issuer
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap();
+  let issued = issuer.handle.credentials().rotate().await.unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut attempts = 0_u32;
@@ -235,10 +223,10 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
     attempts += 1;
     match member
       .handle
-      .command(MergeCluster::new(
+      .join(
         issuer.endpoint().clone(),
         radiata::MergeCredential::parse(&secret).unwrap(),
-      ))
+      )
       .await
     {
       Ok(view) => {
@@ -266,23 +254,19 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
 async fn join_bystander(issuer: &Node, member: &Node) -> Node {
   let mut bystander = start_node(3, false).await;
   bystander.listen().await;
-  let issued = issuer
-    .handle
-    .command(IssueMergeCredential::new())
-    .await
-    .unwrap();
+  let issued = issuer.handle.credentials().issue().await.unwrap();
   bystander
     .handle
-    .command(MergeCluster::new(
+    .join(
       issuer.endpoint().clone(),
       radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
-    ))
+    )
     .await
     .unwrap();
   bystander.id = Some(
     bystander
       .handle
-      .query(radiata::GetLocalNode::new())
+      .local_node()
       .await
       .unwrap()
       .node_id()
@@ -296,10 +280,7 @@ async fn join_bystander(issuer: &Node, member: &Node) -> Node {
   loop {
     match bystander
       .handle
-      .command(ConnectMember::new(
-        member.endpoint().clone(),
-        member.id().clone(),
-      ))
+      .connect(member.endpoint().clone(), member.id().clone())
       .await
     {
       Ok(_) => break,
@@ -323,7 +304,8 @@ async fn assert_identical_pair_scoped_selection(issuer: &Node, member: &Node) {
   let issuer_features = loop {
     if let Ok(page) = issuer
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
       && let Some(session) = page
         .items()
@@ -341,7 +323,8 @@ async fn assert_identical_pair_scoped_selection(issuer: &Node, member: &Node) {
   };
   let member_page = member
     .handle
-    .query(PageSessions::new(PageSpec::first(8).unwrap()))
+    .sessions()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   let member_session = member_page
@@ -361,11 +344,7 @@ async fn assert_metadata_interop(issuer: &Node, member: &Node) {
   for node in [issuer, member] {
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
-      let Ok(page) = node
-        .handle
-        .query(PageTrust::new(PageSpec::first(8).unwrap()))
-        .await
-      else {
+      let Ok(page) = node.handle.trust().list(PageSpec::first(8).unwrap()).await else {
         tokio::time::sleep(POLL).await;
         continue;
       };
@@ -382,11 +361,7 @@ async fn assert_metadata_interop(issuer: &Node, member: &Node) {
   // The member's member view resolves the issuer's descriptor.
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
-    match member
-      .handle
-      .query(GetMember::new(issuer.id().clone()))
-      .await
-    {
+    match member.handle.members().get(issuer.id().clone()).await {
       Ok(Some(view)) => {
         assert_eq!(view.node_id(), issuer.id());
         break;
@@ -486,21 +461,19 @@ async fn prior_initiator_interops_with_current_responder() {
   let name = ResourceName::parse("radiata.woooo.tech/resources/mixed-e2e").unwrap();
   member
     .handle
-    .command(
-      radiata::PutResource::new(ResourceWrite::new(
-        name.clone(),
-        ResourceLabels::new(
-          radiata::LabelValue::parse("document").unwrap(),
-          ResourceUri::parse("file:///tmp/mixed-e2e").unwrap(),
-        ),
-      ))
-      .unwrap(),
-    )
+    .resources()
+    .put(ResourceWrite::new(
+      name.clone(),
+      ResourceLabels::new(
+        radiata::LabelValue::parse("document").unwrap(),
+        ResourceUri::parse("file:///tmp/mixed-e2e").unwrap(),
+      ),
+    ))
     .await
     .unwrap();
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
-    match issuer.handle.query(GetResource::new(name.clone())).await {
+    match issuer.handle.resources().get(name.clone()).await {
       Ok(Some(_)) => break,
       _ => {
         assert!(
@@ -530,7 +503,8 @@ async fn prior_initiator_interops_with_current_responder() {
   let first_selection = {
     let page = issuer
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     page
@@ -543,17 +517,15 @@ async fn prior_initiator_interops_with_current_responder() {
   };
   member
     .handle
-    .command(ConnectMember::new(
-      issuer.endpoint().clone(),
-      issuer.id().clone(),
-    ))
+    .connect(issuer.endpoint().clone(), issuer.id().clone())
     .await
     .unwrap();
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
     let replaced = match issuer
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
     {
       Ok(page) => match page.items().iter().find(|s| s.peer() == &member_id) {
@@ -577,16 +549,13 @@ async fn prior_initiator_interops_with_current_responder() {
   // Retirement: the pair-scoped selection disappears with the session and
   // never authorizes dispatch without a session (no node-wide claim).
   let collected_before_retirement = member.collector.packets.lock().unwrap().len();
-  member
-    .handle
-    .command(DisconnectPeer::new(issuer.id().clone()))
-    .await
-    .unwrap();
+  member.handle.disconnect(issuer.id().clone()).await.unwrap();
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
     let retired = match issuer
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
     {
       Ok(page) => page.items().iter().all(|s| s.peer() != &member_id),
@@ -635,7 +604,8 @@ async fn prior_initiator_interops_with_current_responder() {
   // The relayed arrival never rebuilt the retired pair session.
   let page = issuer
     .handle
-    .query(PageSessions::new(PageSpec::first(8).unwrap()))
+    .sessions()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(
@@ -643,21 +613,9 @@ async fn prior_initiator_interops_with_current_responder() {
     "a relayed dispatch must never resurrect the retired pair session"
   );
 
-  member
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
-  bystander
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
-  issuer
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
+  member.handle.shutdown().await.unwrap();
+  bystander.handle.shutdown().await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
 }
 
 /// A current initiator and a prior responder reach the identical
@@ -682,7 +640,8 @@ async fn current_initiator_interops_with_prior_responder() {
   loop {
     let page = issuer
       .handle
-      .query(PageMembers::new(PageSpec::first(8).unwrap()))
+      .members()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     if page.items().iter().any(|m| m.node_id() == &member_id) {
@@ -695,16 +654,8 @@ async fn current_initiator_interops_with_prior_responder() {
     tokio::time::sleep(POLL).await;
   }
 
-  member
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
-  issuer
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
+  member.handle.shutdown().await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
 }
 
 /// Incompatible required features are refused in both
@@ -715,28 +666,16 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
   // Current initiator requires the current-only feature; the prior
   // responder never published it.
   let mut issuer = start_node(5, false).await;
-  issuer.id = Some(
-    issuer
-      .handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone(),
-  );
+  issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   issuer.listen().await;
   let joiner = start_node_requiring(6, CURRENT_FEATURE, true).await;
-  let issued = issuer
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap();
+  let issued = issuer.handle.credentials().rotate().await.unwrap();
   let error = joiner
     .handle
-    .command(MergeCluster::new(
+    .join(
       issuer.endpoint().clone(),
       radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
-    ))
+    )
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -745,7 +684,8 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
     let empty = matches!(
       issuer
         .handle
-        .query(PageSessions::new(PageSpec::first(8).unwrap()))
+        .sessions()
+        .list(PageSpec::first(8).unwrap())
         .await,
       Ok(page) if page.items().is_empty()
     );
@@ -758,11 +698,7 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
     );
     tokio::time::sleep(POLL).await;
   }
-  issuer
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
+  issuer.handle.shutdown().await.unwrap();
 
   // Prior initiator requires a prior-only feature; the current responder
   // has never published it.
@@ -770,7 +706,7 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
   prior_issuer.id = Some(
     prior_issuer
       .handle
-      .query(radiata::GetLocalNode::new())
+      .local_node()
       .await
       .unwrap()
       .node_id()
@@ -778,17 +714,13 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
   );
   prior_issuer.listen().await;
   let prior_joiner = start_node_requiring(8, PRIOR_FEATURE, true).await;
-  let issued = prior_issuer
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap();
+  let issued = prior_issuer.handle.credentials().rotate().await.unwrap();
   let error = prior_joiner
     .handle
-    .command(MergeCluster::new(
+    .join(
       prior_issuer.endpoint().clone(),
       radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
-    ))
+    )
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -797,7 +729,8 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
     let empty = matches!(
       prior_issuer
         .handle
-        .query(PageSessions::new(PageSpec::first(8).unwrap()))
+        .sessions()
+        .list(PageSpec::first(8).unwrap())
         .await,
       Ok(page) if page.items().is_empty()
     );
@@ -810,14 +743,6 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
     );
     tokio::time::sleep(POLL).await;
   }
-  prior_joiner
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
-  prior_issuer
-    .handle
-    .command(radiata::Shutdown::new())
-    .await
-    .unwrap();
+  prior_joiner.handle.shutdown().await.unwrap();
+  prior_issuer.handle.shutdown().await.unwrap();
 }

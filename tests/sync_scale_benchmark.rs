@@ -23,10 +23,8 @@ use std::{
 };
 
 use radiata::{
-  DisconnectPeer, Endpoint, GetLocalNode, GetObservability, Listen, MergeCluster, NodeBuilder,
-  NodeConfig, NodeHandle, NodeId, PageResources, PageSpec, PutResource, RecoveryConfig,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, RotateMergeCredential, Shutdown,
-  StartRecovery,
+  Endpoint, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageSpec, RecoveryConfig, ResourceLabels,
+  ResourceName, ResourceUri, ResourceWrite,
 };
 
 mod common;
@@ -77,17 +75,13 @@ async fn start(seed: u64) -> Node {
     .await
     .unwrap();
   let endpoint = handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
     .endpoint()
     .clone();
-  let id = handle
-    .query(GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let id = handle.local_node().await.unwrap().node_id().clone();
   Node {
     handle,
     endpoint,
@@ -109,17 +103,13 @@ async fn start_with(seed: u64, config: NodeConfig) -> Node {
     .await
     .unwrap();
   let endpoint = handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
     .endpoint()
     .clone();
-  let id = handle
-    .query(GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let id = handle.local_node().await.unwrap().node_id().clone();
   Node {
     handle,
     endpoint,
@@ -143,7 +133,7 @@ async fn resource_count(handle: &NodeHandle) -> usize {
   let mut count = 0;
   let mut spec = PageSpec::first(64).unwrap();
   loop {
-    let page = handle.query(PageResources::new(spec)).await.unwrap();
+    let page = handle.resources().list(spec).await.unwrap();
     count += page.items().len();
     let Some(cursor) = page.next() else { break };
     spec = PageSpec::after(cursor.clone(), 64).unwrap();
@@ -178,7 +168,8 @@ async fn convergence_cell(peers: usize, resources: u32) {
   let mut nodes = vec![start(0).await];
   let secret = nodes[0]
     .handle
-    .command(RotateMergeCredential::new())
+    .credentials()
+    .rotate()
     .await
     .unwrap()
     .into_credential()
@@ -196,7 +187,8 @@ async fn convergence_cell(peers: usize, resources: u32) {
     let (name, labels) = resource(seed);
     nodes[0]
       .handle
-      .command(PutResource::new(ResourceWrite::new(name, labels)).unwrap())
+      .resources()
+      .put(ResourceWrite::new(name, labels))
       .await
       .unwrap();
   }
@@ -208,7 +200,7 @@ async fn convergence_cell(peers: usize, resources: u32) {
   // pending transactions must be drained on every node.
   let mut queued_bytes = Vec::new();
   for node in &nodes {
-    let snapshot = node.handle.query(GetObservability::new()).await.unwrap();
+    let snapshot = node.handle.metrics().await.unwrap();
     queued_bytes.push(snapshot.counter(
       &radiata::QualifiedTag::parse(radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES).unwrap(),
     ));
@@ -219,7 +211,7 @@ async fn convergence_cell(peers: usize, resources: u32) {
   );
 
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -233,11 +225,7 @@ async fn merge_with_retry(hub: &mut Node, member: &Node, secret: &str) {
   loop {
     attempts += 1;
     let credential = radiata::MergeCredential::parse(secret).unwrap();
-    match member
-      .handle
-      .command(MergeCluster::new(hub.endpoint.clone(), credential))
-      .await
-    {
+    match member.handle.join(hub.endpoint.clone(), credential).await {
       Ok(_) => return,
       Err(_) if Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(
@@ -261,7 +249,8 @@ async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
   let mut nodes = vec![start(0).await];
   let secret = nodes[0]
     .handle
-    .command(RotateMergeCredential::new())
+    .credentials()
+    .rotate()
     .await
     .unwrap()
     .into_credential()
@@ -278,7 +267,8 @@ async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
     let (name, labels) = resource(seed);
     nodes[0]
       .handle
-      .command(PutResource::new(ResourceWrite::new(name, labels)).unwrap())
+      .resources()
+      .put(ResourceWrite::new(name, labels))
       .await
       .unwrap();
   }
@@ -292,16 +282,14 @@ async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
   let started = Instant::now();
   nodes[0]
     .handle
-    .command(
-      PutResource::new(ResourceWrite::new(
-        name,
-        ResourceLabels::new(
-          radiata::LabelValue::parse("benchmark").unwrap(),
-          ResourceUri::parse("file:///scale/mid-write").unwrap(),
-        ),
-      ))
-      .unwrap(),
-    )
+    .resources()
+    .put(ResourceWrite::new(
+      name,
+      ResourceLabels::new(
+        radiata::LabelValue::parse("benchmark").unwrap(),
+        ResourceUri::parse("file:///scale/mid-write").unwrap(),
+      ),
+    ))
     .await
     .unwrap();
   convergence_time(&leaves, resources as usize + 1).await;
@@ -311,7 +299,7 @@ async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
   // bytes must be drained on every node.
   let mut queued_bytes = Vec::new();
   for node in &nodes {
-    let snapshot = node.handle.query(GetObservability::new()).await.unwrap();
+    let snapshot = node.handle.metrics().await.unwrap();
     queued_bytes.push(snapshot.counter(
       &radiata::QualifiedTag::parse(radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES).unwrap(),
     ));
@@ -322,7 +310,7 @@ async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
   );
 
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -368,7 +356,8 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
   let mut nodes = vec![start(0).await];
   let secret = nodes[0]
     .handle
-    .command(RotateMergeCredential::new())
+    .credentials()
+    .rotate()
     .await
     .unwrap()
     .into_credential()
@@ -379,7 +368,7 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
     let credential = radiata::MergeCredential::parse(&secret).unwrap();
     member
       .handle
-      .command(MergeCluster::new(nodes[0].endpoint.clone(), credential))
+      .join(nodes[0].endpoint.clone(), credential)
       .await
       .unwrap();
     nodes.push(member);
@@ -388,7 +377,8 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
     let (name, labels) = resource(seed);
     nodes[0]
       .handle
-      .command(PutResource::new(ResourceWrite::new(name, labels)).unwrap())
+      .resources()
+      .put(ResourceWrite::new(name, labels))
       .await
       .unwrap();
   }
@@ -401,8 +391,8 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
   let flapper = tokio::spawn(async move {
     for _ in 0..8 {
       tokio::time::sleep(Duration::from_secs(2)).await;
-      let _ = flap.command(DisconnectPeer::new(flap_id.clone())).await;
-      let _ = flap.command(StartRecovery::new()).await;
+      let _ = flap.disconnect(flap_id.clone()).await;
+      let _ = flap.start_recovery().await;
     }
   });
 
@@ -417,7 +407,7 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
   );
   flapper.abort();
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -432,7 +422,8 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
   let mut nodes = vec![start(0).await];
   let secret = nodes[0]
     .handle
-    .command(RotateMergeCredential::new())
+    .credentials()
+    .rotate()
     .await
     .unwrap()
     .into_credential()
@@ -449,7 +440,7 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
       let credential = radiata::MergeCredential::parse(&secret).unwrap();
       match member
         .handle
-        .command(MergeCluster::new(nodes[0].endpoint.clone(), credential))
+        .join(nodes[0].endpoint.clone(), credential)
         .await
       {
         Ok(_) => break,
@@ -477,16 +468,16 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
     for node in &nodes {
       let trust = node
         .handle
-        .query(radiata::PageTrust::new(PageSpec::first(64).unwrap()))
+        .trust()
+        .list(PageSpec::first(64).unwrap())
         .await
         .unwrap();
       let mut seen = trust.items().len();
       if let Some(cursor) = trust.next() {
         let second_page = node
           .handle
-          .query(radiata::PageTrust::new(
-            PageSpec::after(cursor.clone(), 64).unwrap(),
-          ))
+          .trust()
+          .list(PageSpec::after(cursor.clone(), 64).unwrap())
           .await
           .unwrap();
         seen += second_page.items().len();
@@ -503,16 +494,16 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
       for node in &nodes {
         let trust = node
           .handle
-          .query(radiata::PageTrust::new(PageSpec::first(64).unwrap()))
+          .trust()
+          .list(PageSpec::first(64).unwrap())
           .await
           .unwrap();
         let mut seen = trust.items().len();
         if let Some(cursor) = trust.next() {
           let second_page = node
             .handle
-            .query(radiata::PageTrust::new(
-              PageSpec::after(cursor.clone(), 64).unwrap(),
-            ))
+            .trust()
+            .list(PageSpec::after(cursor.clone(), 64).unwrap())
             .await
             .unwrap();
           seen += second_page.items().len();
@@ -534,7 +525,7 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
   );
 
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -589,7 +580,8 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
   let mut nodes = vec![start_with(0, config.clone()).await];
   let secret = nodes[0]
     .handle
-    .command(RotateMergeCredential::new())
+    .credentials()
+    .rotate()
     .await
     .unwrap()
     .into_credential()
@@ -605,7 +597,7 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
       let credential = radiata::MergeCredential::parse(&secret).unwrap();
       match member
         .handle
-        .command(MergeCluster::new(nodes[0].endpoint.clone(), credential))
+        .join(nodes[0].endpoint.clone(), credential)
         .await
       {
         Ok(_) => break,
@@ -636,16 +628,16 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
     for node in &nodes {
       let trust = node
         .handle
-        .query(radiata::PageTrust::new(PageSpec::first(64).unwrap()))
+        .trust()
+        .list(PageSpec::first(64).unwrap())
         .await
         .unwrap();
       let mut seen = trust.items().len();
       if let Some(cursor) = trust.next() {
         let second_page = node
           .handle
-          .query(radiata::PageTrust::new(
-            PageSpec::after(cursor.clone(), 64).unwrap(),
-          ))
+          .trust()
+          .list(PageSpec::after(cursor.clone(), 64).unwrap())
           .await
           .unwrap();
         seen += second_page.items().len();
@@ -669,11 +661,7 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
   let mut members = 0_usize;
   let mut spec = PageSpec::first(64).unwrap();
   loop {
-    let page = nodes[0]
-      .handle
-      .query(radiata::PageMembers::new(spec.clone()))
-      .await
-      .unwrap();
+    let page = nodes[0].handle.members().list(spec.clone()).await.unwrap();
     members += page.items().len();
     let Some(cursor) = page.next() else { break };
     spec = PageSpec::after(cursor.clone(), 64).unwrap();
@@ -684,6 +672,6 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
   );
 
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }

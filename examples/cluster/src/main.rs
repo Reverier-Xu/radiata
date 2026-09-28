@@ -10,7 +10,7 @@ mod http_client;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use radiata::{GetLocalNode, Listen, NodeBuilder, ProtocolDefinition, ProtocolTag};
+use radiata::{NodeBuilder, ProtocolDefinition, ProtocolTag};
 use serde_json::json;
 
 /// The first-match load balancer: selects the first matching candidate
@@ -138,13 +138,12 @@ async fn main() {
     .await
     .expect("radiata node start");
   node
-    .command(Listen::new(
-      radiata::Endpoint::parse(&config.listen).expect("LISTEN endpoint"),
-    ))
+    .listeners()
+    .create(radiata::Endpoint::parse(&config.listen).expect("LISTEN endpoint"))
     .await
     .expect("listen");
   let node_id = node
-    .query(GetLocalNode::new())
+    .local_node()
     .await
     .expect("local node")
     .node_id()
@@ -175,6 +174,6 @@ async fn main() {
     })
     .await
     .expect("http serve");
-  state.node.command(radiata::Shutdown::new()).await.ok();
+  state.node.shutdown().await.ok();
   let _ = json!({}); // serde_json stays referenced from this crate root too
 }

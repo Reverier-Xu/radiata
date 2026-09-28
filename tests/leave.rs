@@ -14,14 +14,13 @@ use std::{
 
 use radiata::{
   BoxFuture, Endpoint, Error, ErrorKind, EventOptions, EventReceive, IdentityReplaced,
-  KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, LeaveCluster, Listen,
-  NodeBuilder, NodeHandle, PageMembers, PageSpec, PublicKey, PutResource,
-  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
-  ResourceWrite, Result, Shutdown, ShutdownReason, Signature, WaitForShutdown,
+  KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, NodeBuilder,
+  NodeHandle, PageSpec, PublicKey, ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels,
+  ResourceName, ResourceUri, ResourceWrite, Result, ShutdownReason, Signature,
   extension::KeyProvider,
 };
 #[cfg(any(feature = "json", feature = "redb"))]
-use radiata::{PageTrust, SelectResources, Selector, extension::StorageFactory};
+use radiata::{Selector, extension::StorageFactory};
 
 mod common;
 
@@ -183,8 +182,8 @@ impl KeyProvider for LeaveKeys {
   }
 }
 
-fn write(name_seed: u8) -> PutResource {
-  PutResource::new(ResourceWrite::new(
+fn write(name_seed: u8) -> ResourceWrite {
+  ResourceWrite::new(
     ResourceName::parse(&format!(
       "radiata.woooo.tech/resources/leave-{name_seed:03}"
     ))
@@ -193,8 +192,7 @@ fn write(name_seed: u8) -> PutResource {
       radiata::LabelValue::parse("document").unwrap(),
       ResourceUri::parse(&format!("file:///leave/{name_seed:03}")).unwrap(),
     ),
-  ))
-  .unwrap()
+  )
 }
 
 /// One resource write with bounded retries: a commit racing the
@@ -203,7 +201,7 @@ fn write(name_seed: u8) -> PutResource {
 async fn put_with_retry(handle: &NodeHandle, name_seed: u8) {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match handle.command(write(name_seed)).await {
+    match handle.resources().put(write(name_seed)).await {
       Ok(_) => return,
       Err(error) if error.kind() == ErrorKind::NotReady => {
         assert!(
@@ -228,24 +226,18 @@ async fn leave_replaces_identity_and_shuts_down_with_active_leave() {
   let keys: Arc<dyn KeyProvider> = Arc::new(LeaveKeys::default());
   let handle = NodeBuilder::new(storage).keys(keys).start().await.unwrap();
   handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   put_with_retry(&handle, 1).await;
-  let former = handle
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let former = handle.local_node().await.unwrap().node_id().clone();
   let mut events = handle
-    .events::<IdentityReplaced>(EventOptions::new())
+    .watch::<IdentityReplaced>(EventOptions::new())
     .unwrap();
 
   let outcome = handle
-    .command(LeaveCluster::new(
-      ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-    ))
+    .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
     .unwrap();
   assert_eq!(outcome.former_identity(), &former);
@@ -272,12 +264,9 @@ async fn leave_replaces_identity_and_shuts_down_with_active_leave() {
   ));
 
   // The node shuts down with the active-leave reason.
-  let reason = handle.query(WaitForShutdown::new()).await.unwrap();
+  let reason = handle.wait_for_shutdown().await.unwrap();
   assert_eq!(reason, ShutdownReason::ActiveLeave);
-  assert_eq!(
-    handle.query(radiata::GetNodeStatus::new()).await.unwrap(),
-    radiata::NodeStatus::Stopped
-  );
+  assert_eq!(handle.status(), radiata::NodeStatus::Stopped);
 }
 
 /// The leaver announces its owner-signed leave record to
@@ -315,27 +304,21 @@ async fn leave_announces_to_connected_peers_before_rotating() {
     .await
     .unwrap();
   let endpoint = listener
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
     .endpoint()
     .clone();
   common::merge_with_retry(&leaver, &listener, endpoint).await;
-  let former = leaver
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let former = leaver.local_node().await.unwrap().node_id().clone();
   let mut member_events = listener
-    .events::<radiata::MemberChanged>(EventOptions::new())
+    .watch::<radiata::MemberChanged>(EventOptions::new())
     .unwrap();
 
   let started = std::time::Instant::now();
   let outcome = leaver
-    .command(LeaveCluster::new(
-      ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-    ))
+    .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
     .unwrap();
   assert_eq!(outcome.former_identity(), &former);
@@ -350,7 +333,8 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   let observed = tokio::time::timeout(Duration::from_secs(60), async {
     loop {
       let present = listener
-        .query(PageMembers::new(PageSpec::first(8).unwrap()))
+        .members()
+        .list(PageSpec::first(8).unwrap())
         .await
         .unwrap()
         .items()
@@ -373,7 +357,8 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   // descriptor stays as verification evidence, so the status is the
   // liveness signal (finding #9).
   let page = listener
-    .query(PageMembers::new(PageSpec::first(8).unwrap()))
+    .members()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(
@@ -383,7 +368,7 @@ async fn leave_announces_to_connected_peers_before_rotating() {
       .all(|member| member.node_id() != &former || member.status() == radiata::MemberStatus::Left)
   );
 
-  listener.command(Shutdown::new()).await.unwrap();
+  listener.shutdown().await.unwrap();
 }
 
 /// Recovery must treat a departed member as forgotten rather than
@@ -432,7 +417,8 @@ async fn recovery_quiesces_after_a_member_departs() {
     .await
     .unwrap();
   let a_endpoint = a
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
     .endpoint()
@@ -445,11 +431,9 @@ async fn recovery_quiesces_after_a_member_departs() {
   // vacuously).
   tokio::time::sleep(Duration::from_secs(5)).await;
 
-  c.command(LeaveCluster::new(
-    ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-  ))
-  .await
-  .unwrap();
+  c.leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap();
 
   // The decisive invariant is the pull view: the departed member must
   // never appear as unreachable. Across several recovery ticks after
@@ -461,7 +445,7 @@ async fn recovery_quiesces_after_a_member_departs() {
   let quiesced = tokio::time::timeout(Duration::from_secs(30), async {
     let mut settled = 0_u32;
     loop {
-      let view = a.query(radiata::GetRecovery::new()).await.unwrap();
+      let view = a.recovery().await.unwrap();
       assert_eq!(
         view.unreachable_members(),
         0,
@@ -480,8 +464,8 @@ async fn recovery_quiesces_after_a_member_departs() {
     "the recovery view was not observable after the departure"
   );
 
-  a.command(Shutdown::new()).await.unwrap();
-  b.command(Shutdown::new()).await.unwrap();
+  a.shutdown().await.unwrap();
+  b.shutdown().await.unwrap();
 }
 
 /// A disconnected session is not a departure: the peer keeps its
@@ -508,51 +492,37 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
     .await
     .unwrap();
   let a_endpoint = a
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
     .endpoint()
     .clone();
   // b listens too: its descriptor must publish an endpoint for the
   // recovery plane to dial after the later drop.
-  b.command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+  b.listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   common::merge_with_retry(&b, &a, a_endpoint.clone()).await;
-  let a_id = a
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
-  let b_id = b
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let a_id = a.local_node().await.unwrap().node_id().clone();
+  let b_id = b.local_node().await.unwrap().node_id().clone();
   // Let anti-entropy publish b's descriptor (with its endpoint) on a,
   // and one recovery tick observe the connected pair.
   tokio::time::sleep(Duration::from_secs(5)).await;
 
   // a disconnects b: the session is torn down and b leaves a's recovery
   // history for now.
-  a.command(radiata::DisconnectPeer::new(b_id.clone()))
-    .await
-    .unwrap();
+  a.disconnect(b_id.clone()).await.unwrap();
   // b dials back on its own: a accepts the inbound member session, and
   // b is known-online again through it.
-  b.command(radiata::ConnectMember::new(a_endpoint, a_id.clone()))
-    .await
-    .unwrap();
+  b.connect(a_endpoint, a_id.clone()).await.unwrap();
   // Let a recovery tick observe the alive session.
   tokio::time::sleep(Duration::from_secs(5)).await;
   // b drops the session from its side: b is now an unreachable known
   // member with a published endpoint — the recovery plane must count it
   // pending and dial it back.
-  b.command(radiata::DisconnectPeer::new(a_id.clone()))
-    .await
-    .unwrap();
+  b.disconnect(a_id.clone()).await.unwrap();
 
   // First the drop must surface as unreachability (a genuinely counts
   // the member again), then recovery must heal the session without
@@ -560,7 +530,7 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
   let healed = tokio::time::timeout(Duration::from_secs(60), async {
     let mut observed_unreachable = false;
     loop {
-      let view = a.query(radiata::GetRecovery::new()).await.unwrap();
+      let view = a.recovery().await.unwrap();
       if view.unreachable_members() > 0 {
         observed_unreachable = true;
       } else if observed_unreachable {
@@ -575,8 +545,8 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
     "the disconnected peer's session was not healed back by recovery"
   );
 
-  a.command(Shutdown::new()).await.unwrap();
-  b.command(Shutdown::new()).await.unwrap();
+  a.shutdown().await.unwrap();
+  b.shutdown().await.unwrap();
 }
 
 /// With no connected session the announcement has nobody to
@@ -593,13 +563,11 @@ async fn leave_without_peers_completes_without_waiting() {
     .await
     .unwrap();
   let outcome = handle
-    .command(LeaveCluster::new(
-      ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-    ))
+    .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
     .unwrap();
   assert_ne!(outcome.former_identity(), outcome.replacement_identity());
-  let reason = handle.query(WaitForShutdown::new()).await.unwrap();
+  let reason = handle.wait_for_shutdown().await.unwrap();
   assert_eq!(reason, ShutdownReason::ActiveLeave);
 }
 
@@ -679,7 +647,8 @@ async fn restarted_node_passively_reconnects(
     .await
     .unwrap();
   let peer_endpoint = peer
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
     .endpoint()
@@ -696,18 +665,8 @@ async fn restarted_node_passively_reconnects(
     .await
     .unwrap();
   common::merge_with_retry(&node, &peer, peer_endpoint.clone()).await;
-  let node_id = node
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
-  let peer_id = peer
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let node_id = node.local_node().await.unwrap().node_id().clone();
+  let peer_id = peer.local_node().await.unwrap().node_id().clone();
 
   // The passive reconnect seeds from persisted descriptors, so wait for
   // the peer's descriptor (with its dialable endpoint) to converge into
@@ -715,7 +674,8 @@ async fn restarted_node_passively_reconnects(
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     let converged = node
-      .query(radiata::GetMember::new(peer_id.clone()))
+      .members()
+      .get(peer_id.clone())
       .await
       .unwrap()
       .is_some_and(|view| !view.endpoints().is_empty());
@@ -728,7 +688,7 @@ async fn restarted_node_passively_reconnects(
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
   }
-  node.command(Shutdown::new()).await.unwrap();
+  node.shutdown().await.unwrap();
 
   // Restart on the SAME durable store: no Listen, no join, no connect —
   // the only path back is recovery seeding from the persisted evidence.
@@ -751,11 +711,7 @@ async fn restarted_node_passively_reconnects(
     }
   };
   assert_eq!(
-    restarted
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id(),
+    restarted.local_node().await.unwrap().node_id(),
     &node_id,
     "the restart must resume the persisted identity"
   );
@@ -765,7 +721,8 @@ async fn restarted_node_passively_reconnects(
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     let reconnected = restarted
-      .query(radiata::PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap()
       .items()
@@ -781,8 +738,8 @@ async fn restarted_node_passively_reconnects(
     tokio::time::sleep(Duration::from_millis(200)).await;
   }
 
-  restarted.command(Shutdown::new()).await.unwrap();
-  peer.command(Shutdown::new()).await.unwrap();
+  restarted.shutdown().await.unwrap();
+  peer.shutdown().await.unwrap();
 }
 
 #[cfg(any(feature = "json", feature = "redb"))]
@@ -798,26 +755,20 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
       .await
       .unwrap();
     handle
-      .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+      .listeners()
+      .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
       .unwrap();
     put_with_retry(&handle, 2).await;
-    let former = handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone();
+    let former = handle.local_node().await.unwrap().node_id().clone();
     former_handle_bytes = former.clone();
     let outcome = handle
-      .command(LeaveCluster::new(
-        ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-      ))
+      .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
       .await
       .unwrap();
     assert_eq!(outcome.former_identity(), &former_handle_bytes);
     replacement = outcome.replacement_identity().clone();
-    let reason = handle.query(WaitForShutdown::new()).await.unwrap();
+    let reason = handle.wait_for_shutdown().await.unwrap();
     assert_eq!(reason, ShutdownReason::ActiveLeave);
     // The former identity's key passed the custody protocol exactly once.
     assert_eq!(keys.deleted_count(), 1);
@@ -831,15 +782,16 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
     .start()
     .await
     .unwrap();
-  let local = handle.query(radiata::GetLocalNode::new()).await.unwrap();
+  let local = handle.local_node().await.unwrap();
   assert_eq!(local.node_id(), &replacement);
   assert_ne!(local.node_id(), &former_handle_bytes);
   assert!(
     handle
-      .query(SelectResources::new(
+      .resources()
+      .select(
         Selector::parse("radiata.woooo.tech/resources/type").unwrap(),
         PageSpec::first(8).unwrap(),
-      ))
+      )
       .await
       .unwrap()
       .items()
@@ -848,7 +800,8 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   // The member page can carry only the restarted node's own descriptor;
   // the old cluster's members (including the former identity) are gone.
   let members = handle
-    .query(PageMembers::new(PageSpec::first(8).unwrap()))
+    .members()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(members.items().len() <= 1, "old membership must be wiped");
@@ -863,7 +816,8 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   // removed the old cluster's bindings, leaving at most the restarted
   // node's own born-with-cluster binding.
   let trust = handle
-    .query(PageTrust::new(PageSpec::first(8).unwrap()))
+    .trust()
+    .list(PageSpec::first(8).unwrap())
     .await
     .unwrap();
   assert!(
@@ -881,5 +835,5 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   // The old identity never returns: the restarted node is exactly the
   // replacement identity's singleton cluster (asserted above).
 
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
 }

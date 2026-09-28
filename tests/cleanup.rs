@@ -9,10 +9,8 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  CleanupNode, ConnectMember, Endpoint, ErrorKind, Listen, MemberStatus, MergeCluster,
-  MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageMembers, PageSessions,
-  PageSpec, PageTrust, PurgeRevocation, RevokeNode, RotateMergeCredential, Shutdown,
-  extension::KeyProvider,
+  Endpoint, ErrorKind, MemberStatus, MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId,
+  PageSpec, extension::KeyProvider,
 };
 
 mod common;
@@ -63,19 +61,15 @@ async fn start_node(seed: u64) -> Node {
 async fn listen(node: &Node) -> Endpoint {
   let listener = node
     .handle
-    .command(Listen::new(node.endpoint.clone()))
+    .listeners()
+    .create(node.endpoint.clone())
     .await
     .unwrap();
   listener.endpoint().clone()
 }
 
 async fn local_id(node: &NodeHandle) -> NodeId {
-  node
-    .query(radiata::GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone()
+  node.local_node().await.unwrap().node_id().clone()
 }
 
 /// The member's trusted public key as the issuer observes it, polled with
@@ -88,9 +82,10 @@ async fn trusted_key(issuer: &NodeHandle, member: &NodeId) -> radiata::PublicKey
   loop {
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer instead of the wall-clock tick.
-    issuer.command(radiata::RunSyncRound::new()).await.unwrap();
+    issuer.sync().await.unwrap();
     let page = issuer
-      .query(PageTrust::new(PageSpec::first(64).unwrap()))
+      .trust()
+      .list(PageSpec::first(64).unwrap())
       .await
       .unwrap();
     if let Some(view) = page.items().iter().find(|view| view.node_id() == member) {
@@ -113,9 +108,10 @@ async fn wait_member_status(node: &NodeHandle, member: &NodeId, expected: Member
   loop {
     // Schedule the next convergence observation: one deterministic
     // anti-entropy round on the observer.
-    node.command(radiata::RunSyncRound::new()).await.unwrap();
+    node.sync().await.unwrap();
     let status = node
-      .query(radiata::GetMember::new(member.clone()))
+      .members()
+      .get(member.clone())
       .await
       .unwrap()
       .map(|view| view.status());
@@ -156,7 +152,7 @@ async fn cleanup_converges_and_excludes_the_subject() {
   assert_eq!(
     issuer
       .handle
-      .command(CleanupNode::new(issuer_id.clone()))
+      .cleanup(issuer_id.clone())
       .await
       .unwrap_err()
       .kind(),
@@ -164,20 +160,11 @@ async fn cleanup_converges_and_excludes_the_subject() {
   );
   let stranger = NodeId::parse("node-999999999999999999999").unwrap();
   assert_eq!(
-    issuer
-      .handle
-      .command(CleanupNode::new(stranger))
-      .await
-      .unwrap_err()
-      .kind(),
+    issuer.handle.cleanup(stranger).await.unwrap_err().kind(),
     ErrorKind::NotFound
   );
 
-  issuer
-    .handle
-    .command(CleanupNode::new(subject_id.clone()))
-    .await
-    .unwrap();
+  issuer.handle.cleanup(subject_id.clone()).await.unwrap();
 
   // The tombstone converges to the observer through ordinary sync: a new
   // member session to the cleaned subject is refused once the record
@@ -186,10 +173,7 @@ async fn cleanup_converges_and_excludes_the_subject() {
   loop {
     let refused = observer
       .handle
-      .command(ConnectMember::new(
-        subject_endpoint.clone(),
-        subject_id.clone(),
-      ))
+      .connect(subject_endpoint.clone(), subject_id.clone())
       .await
       .is_err_and(|error| error.kind() == ErrorKind::NotTrusted);
     if refused {
@@ -201,11 +185,7 @@ async fn cleanup_converges_and_excludes_the_subject() {
     );
     // The tombstone converges through ordinary sync: schedule the next
     // observation round on the observer.
-    observer
-      .handle
-      .command(radiata::RunSyncRound::new())
-      .await
-      .unwrap();
+    observer.handle.sync().await.unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
   }
 
@@ -216,7 +196,8 @@ async fn cleanup_converges_and_excludes_the_subject() {
     loop {
       let status = observer
         .handle
-        .query(PageMembers::new(PageSpec::first(64).unwrap()))
+        .members()
+        .list(PageSpec::first(64).unwrap())
         .await
         .unwrap()
         .items()
@@ -241,18 +222,14 @@ async fn cleanup_converges_and_excludes_the_subject() {
 
   // The issuer refuses the cleaned subject's re-merge even with a fresh
   // credential.
-  let issued = issuer
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap();
+  let issued = issuer.handle.credentials().rotate().await.unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let error = subject
     .handle
-    .command(MergeCluster::new(
+    .join(
       issuer_endpoint.clone(),
       MergeCredential::parse(&secret).unwrap(),
-    ))
+    )
     .await
     .unwrap_err();
   // The responder's cleaned-subject rejection crosses the wire as the
@@ -262,7 +239,8 @@ async fn cleanup_converges_and_excludes_the_subject() {
   // The subject's binding remains as permanent verification evidence.
   let page = issuer
     .handle
-    .query(PageTrust::new(PageSpec::first(64).unwrap()))
+    .trust()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap();
   assert!(
@@ -273,11 +251,11 @@ async fn cleanup_converges_and_excludes_the_subject() {
   );
 
   for node in [&issuer, &subject, &observer] {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
-/// `PurgeRevocation` clears the local revocation record
+/// `purge_revocation` clears the local revocation record
 /// explicitly and idempotently; the revoked member's sessions work again
 /// afterwards (fat-finger recovery).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -293,15 +271,12 @@ async fn purge_revocation_clears_the_local_boundary() {
 
   issuer
     .handle
-    .command(RevokeNode::new(member_id.clone(), member_key))
+    .revoke(member_id.clone(), member_key)
     .await
     .unwrap();
   let error = issuer
     .handle
-    .command(ConnectMember::new(
-      member_endpoint.clone(),
-      member_id.clone(),
-    ))
+    .connect(member_endpoint.clone(), member_id.clone())
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Revoked);
@@ -309,22 +284,22 @@ async fn purge_revocation_clears_the_local_boundary() {
   // Purge is idempotent and restores the local boundary.
   issuer
     .handle
-    .command(PurgeRevocation::new(member_id.clone()))
+    .purge_revocation(member_id.clone())
     .await
     .unwrap();
   issuer
     .handle
-    .command(PurgeRevocation::new(member_id.clone()))
+    .purge_revocation(member_id.clone())
     .await
     .unwrap();
   issuer
     .handle
-    .command(ConnectMember::new(member_endpoint.clone(), member_id))
+    .connect(member_endpoint.clone(), member_id)
     .await
     .unwrap();
 
-  issuer.handle.command(Shutdown::new()).await.unwrap();
-  member.handle.command(Shutdown::new()).await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
+  member.handle.shutdown().await.unwrap();
 }
 
 /// The issuer cleans a member and starts the GC epoch;
@@ -363,36 +338,20 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   // record off the issuer, so the epoch must not start while a member is
   // still owed the delivery — which is exactly what the precondition
   // enforces.
-  issuer
-    .handle
-    .command(CleanupNode::new(subject_id.clone()))
-    .await
-    .unwrap();
+  issuer.handle.cleanup(subject_id.clone()).await.unwrap();
   wait_member_status(&observer.handle, &subject_id, MemberStatus::Cleaned).await;
 
   // Start the epoch. Max-wins: the second issue never rolls the watermark
   // back.
-  let first = issuer
-    .handle
-    .command(radiata::IssueCleanupCheckpoint::new())
-    .await
-    .unwrap();
-  let second = issuer
-    .handle
-    .command(radiata::IssueCleanupCheckpoint::new())
-    .await
-    .unwrap();
+  let first = issuer.handle.issue_cleanup_checkpoint().await.unwrap();
+  let second = issuer.handle.issue_cleanup_checkpoint().await.unwrap();
   assert!(second >= first, "the watermark is monotonic");
 
   // The observer also issues: the cleaned subject is terminal locally, so
   // the precondition is satisfied with the live issuer session alone. The
   // epoch converges through sync and stays monotonic across issuers (any
   // member may checkpoint).
-  let on_observer = observer
-    .handle
-    .command(radiata::IssueCleanupCheckpoint::new())
-    .await
-    .unwrap();
+  let on_observer = observer.handle.issue_cleanup_checkpoint().await.unwrap();
   assert!(on_observer >= first);
 
   // The cluster stays compositional after checkpointing: a fresh node
@@ -405,7 +364,8 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   // The cleaned subject's binding stays as permanent evidence everywhere.
   let page = observer
     .handle
-    .query(PageTrust::new(PageSpec::first(64).unwrap()))
+    .trust()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap();
   assert!(
@@ -417,7 +377,7 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   );
 
   for node in [&issuer, &subject, &observer, &late] {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -427,18 +387,10 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_issues_on_a_singleton_node() {
   let node = start_node(31).await;
-  let first = node
-    .handle
-    .command(radiata::IssueCleanupCheckpoint::new())
-    .await
-    .unwrap();
-  let second = node
-    .handle
-    .command(radiata::IssueCleanupCheckpoint::new())
-    .await
-    .unwrap();
+  let first = node.handle.issue_cleanup_checkpoint().await.unwrap();
+  let second = node.handle.issue_cleanup_checkpoint().await.unwrap();
   assert!(second >= first, "the watermark is monotonic");
-  node.handle.command(Shutdown::new()).await.unwrap();
+  node.handle.shutdown().await.unwrap();
 }
 
 /// A known non-terminal member without a live session blocks the issue
@@ -458,12 +410,13 @@ async fn checkpoint_refuses_an_unreachable_member_without_writing_an_epoch() {
 
   // The member leaves the mesh without a terminal record: its descriptor
   // stays an active member, its session tears down.
-  member.handle.command(Shutdown::new()).await.unwrap();
+  member.handle.shutdown().await.unwrap();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     let connected = issuer
       .handle
-      .query(PageSessions::new(PageSpec::first(64).unwrap()))
+      .sessions()
+      .list(PageSpec::first(64).unwrap())
       .await
       .unwrap()
       .items()
@@ -480,11 +433,7 @@ async fn checkpoint_refuses_an_unreachable_member_without_writing_an_epoch() {
   }
 
   // The precondition rejects the issue while the member is unreachable.
-  let error = issuer
-    .handle
-    .command(radiata::IssueCleanupCheckpoint::new())
-    .await
-    .unwrap_err();
+  let error = issuer.handle.issue_cleanup_checkpoint().await.unwrap_err();
   assert_eq!(error.kind(), ErrorKind::NotReady);
 
   // No epoch record may exist behind the refusal.
@@ -498,5 +447,5 @@ async fn checkpoint_refuses_an_unreachable_member_without_writing_an_epoch() {
     "the refused issue must not write a checkpoint"
   );
 
-  issuer.handle.command(Shutdown::new()).await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
 }

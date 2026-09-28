@@ -13,11 +13,7 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use radiata::{
-  ConnectMember, DisconnectPeer, Endpoint, GetLocalNode, Listen, MergeCluster, NodeBuilder,
-  NodeConfig, NodeHandle, PageMembers, PageSpec, PageTopology, PageTrust, RotateMergeCredential,
-  Shutdown, StartRecovery, UpdateNodeMetadata,
-};
+use radiata::{Endpoint, NodeBuilder, NodeConfig, NodeHandle, PageSpec};
 
 mod common;
 
@@ -137,19 +133,14 @@ async fn start_node_with_keys(
 /// Reads the node's authenticated id from the public facade (valid once
 /// the node has a cluster).
 async fn node_id(node: &Node) -> radiata::NodeId {
-  node
-    .handle
-    .query(GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone()
+  node.handle.local_node().await.unwrap().node_id().clone()
 }
 
 async fn listen(node: &Node) -> Endpoint {
   let listener = node
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   listener.endpoint().clone()
@@ -182,11 +173,7 @@ async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
     // is scheduled by the test, not by the wall-clock tick cadence; the
     // bounded check below stays the convergence verdict.
     for node in nodes {
-      node
-        .handle
-        .command(radiata::RunSyncRound::new())
-        .await
-        .unwrap();
+      node.handle.sync().await.unwrap();
     }
     let mut complete = true;
     let mut views: Vec<Vec<radiata::TrustedIdentityView>> = Vec::new();
@@ -247,11 +234,7 @@ async fn wait_descriptors(nodes: &[Node], expected: usize, revision: u64, timeou
     // Drive one deterministic anti-entropy round per node so convergence
     // is scheduled by the test, not by the wall-clock tick cadence.
     for node in nodes {
-      node
-        .handle
-        .command(radiata::RunSyncRound::new())
-        .await
-        .unwrap();
+      node.handle.sync().await.unwrap();
     }
     let mut pages = Vec::new();
     let mut complete = true;
@@ -323,15 +306,9 @@ async fn close_star_sessions(nodes: &[Node], issuer: usize) {
       // Disconnect the issuer side first: removing the peer from the
       // issuer's recovery history before the connection close propagates
       // prevents the recovery controller from re-dialing it.
-      let _ = nodes[issuer]
-        .handle
-        .command(DisconnectPeer::new(peer.clone()))
-        .await;
+      let _ = nodes[issuer].handle.disconnect(peer.clone()).await;
       if let Some(member) = nodes.iter().find(|node| node.id == peer) {
-        let _ = member
-          .handle
-          .command(DisconnectPeer::new(nodes[issuer].id.clone()))
-          .await;
+        let _ = member.handle.disconnect(nodes[issuer].id.clone()).await;
       }
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -393,7 +370,7 @@ async fn wait_settled(
       // recovery pass on every member so healing does not starve the
       // settle window.
       for node in nodes {
-        let _ = node.handle.command(radiata::StartRecovery::new()).await;
+        let _ = node.handle.start_recovery().await;
       }
     }
     if std::time::Instant::now() >= deadline {
@@ -456,7 +433,8 @@ async fn build_cluster(count: usize) -> Vec<Node> {
 async fn trust_page(node: &Node) -> Vec<radiata::TrustedIdentityView> {
   node
     .handle
-    .query(PageTrust::new(PageSpec::first(64).unwrap()))
+    .trust()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap()
     .items()
@@ -466,7 +444,8 @@ async fn trust_page(node: &Node) -> Vec<radiata::TrustedIdentityView> {
 async fn member_page(node: &Node) -> Vec<radiata::MemberView> {
   node
     .handle
-    .query(PageMembers::new(PageSpec::first(64).unwrap()))
+    .members()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap()
     .items()
@@ -476,7 +455,8 @@ async fn member_page(node: &Node) -> Vec<radiata::MemberView> {
 async fn topology_edges(node: &Node) -> Vec<radiata::TopologyEdgeView> {
   node
     .handle
-    .query(PageTopology::new(PageSpec::first(64).unwrap()))
+    .topology()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap()
     .items()
@@ -598,7 +578,7 @@ async fn connect_cq4(nodes: &[Node]) {
 async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer.handle.command(RotateMergeCredential::new()).await {
+    match issuer.handle.credentials().rotate().await {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -632,11 +612,7 @@ async fn merge_with_retry(node: &Node, endpoint: Endpoint, secret: &str) {
   loop {
     attempts = attempts.wrapping_add(1);
     let credential = radiata::MergeCredential::parse(secret).unwrap();
-    match node
-      .handle
-      .command(MergeCluster::new(endpoint.clone(), credential))
-      .await
-    {
+    match node.handle.join(endpoint.clone(), credential).await {
       Ok(_) => return,
       Err(error) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -658,11 +634,7 @@ async fn connect_with_retry(node: &Node, endpoint: Endpoint, peer: radiata::Node
   let mut attempts = 0;
   loop {
     attempts += 1;
-    match node
-      .handle
-      .command(ConnectMember::new(endpoint.clone(), peer.clone()))
-      .await
-    {
+    match node.handle.connect(endpoint.clone(), peer.clone()).await {
       Ok(_) => return,
       Err(error) if std::time::Instant::now() < deadline => {
         eprintln!("dial {} -> {} attempt {attempts}: {error:?}", node.id, peer);
@@ -757,9 +729,10 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
     move || {
       let handle = node15_handle.clone();
       Box::pin(async move {
-        let _ = handle.command(radiata::RunSyncRound::new()).await;
+        let _ = handle.sync().await;
         let page = handle
-          .query(PageTrust::new(PageSpec::first(64).unwrap()))
+          .trust()
+          .list(PageSpec::first(64).unwrap())
           .await
           .unwrap();
         (page.items().len() >= 16).then_some(page.items().len())
@@ -786,7 +759,7 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   assert_exact_cq4(&edges);
 
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -826,7 +799,8 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   }
   let secret = nodes[0]
     .handle
-    .command(RotateMergeCredential::new())
+    .credentials()
+    .rotate()
     .await
     .unwrap()
     .into_credential()
@@ -849,7 +823,7 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   let left_id = nodes[1].id.clone();
   let right_handle = nodes[2].handle.clone();
   let right_id = nodes[2].id.clone();
-  nodes[0].handle.command(Shutdown::new()).await.unwrap();
+  nodes[0].handle.shutdown().await.unwrap();
   wait_until(
     move || {
       let left_handle = left_handle.clone();
@@ -872,7 +846,7 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   let mut hub = start_node_with_keys(0, hub_storage, hub_keys, None).await;
   hub.id = node_id(&hub).await;
   hub.endpoint = listen(&hub).await;
-  let _ = hub.handle.command(StartRecovery::new()).await;
+  let _ = hub.handle.start_recovery().await;
   nodes[0] = hub;
 
   // The leaves prune the redundant recovery edge once the hub edge
@@ -882,14 +856,15 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   wait_settled(&nodes, &expected, Duration::from_secs(120)).await;
 
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
 /// Whether the node currently reports a connected session to `peer`.
 async fn topology_edges_by(handle: &NodeHandle, peer: &radiata::NodeId) -> bool {
   handle
-    .query(PageTopology::new(PageSpec::first(64).unwrap()))
+    .topology()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap()
     .items()
@@ -924,10 +899,10 @@ async fn membership_sync_failure_matrix_partition_healing() {
   let edge = (0_u8, 1_u8);
   let _ = nodes[edge.0 as usize]
     .handle
-    .command(ConnectMember::new(
+    .connect(
       nodes[edge.1 as usize].endpoint.clone(),
       nodes[edge.1 as usize].id.clone(),
-    ))
+    )
     .await;
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   loop {
@@ -956,14 +931,11 @@ async fn membership_sync_failure_matrix_partition_healing() {
   // WITHOUT re-dialing the lost edge (a connected node never expands its
   // topology), and the data plane's routed relay covers the missing edge
   // for node pairs whose direct session is gone.
-  let _ = nodes[1]
-    .handle
-    .command(DisconnectPeer::new(nodes[0].id.clone()))
-    .await;
+  let _ = nodes[1].handle.disconnect(nodes[0].id.clone()).await;
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut connected = false;
   while std::time::Instant::now() < deadline {
-    let view = nodes[1].handle.command(StartRecovery::new()).await.unwrap();
+    let view = nodes[1].handle.start_recovery().await.unwrap();
     if view.is_connected() {
       connected = true;
       break;
@@ -980,7 +952,7 @@ async fn membership_sync_failure_matrix_partition_healing() {
   wait_connected(&nodes, 1, 3, Duration::from_secs(45)).await;
   wait_connected(&nodes, 0, 2, Duration::from_secs(45)).await;
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -1011,7 +983,7 @@ async fn membership_sync_slo_trend_stays_below_bound() {
     );
   }
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -1098,11 +1070,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
       radiata::LabelValue::parse("slo").unwrap(),
     )
     .unwrap();
-  nodes[15]
-    .handle
-    .command(radiata::UpdateNodeMetadata::new(1, patch))
-    .await
-    .unwrap();
+  nodes[15].handle.patch_metadata(1, patch).await.unwrap();
 
   // Convergence: every member observes the bumped descriptor at revision 2.
   let target = nodes[15].id.clone();
@@ -1112,7 +1080,8 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
     for node in &nodes {
       let page = node
         .handle
-        .query(PageMembers::new(PageSpec::first(64).unwrap()))
+        .members()
+        .list(PageSpec::first(64).unwrap())
         .await
         .unwrap();
       observed.push(
@@ -1133,11 +1102,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
     // Schedule the next convergence sample: one deterministic round per
     // node instead of waiting on the wall-clock tick cadence.
     for node in &nodes {
-      node
-        .handle
-        .command(radiata::RunSyncRound::new())
-        .await
-        .unwrap();
+      node.handle.sync().await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(5)).await;
   }
@@ -1160,7 +1125,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
     );
   }
   for node in nodes {
-    node.handle.command(Shutdown::new()).await.unwrap();
+    node.handle.shutdown().await.unwrap();
   }
 }
 
@@ -1200,18 +1165,13 @@ async fn membership_sync_delivers_fat_descriptor_pages() {
   // Every member labels itself at the maximum; the owner-revision CAS
   // re-observes the current revision on a lost race.
   for member in &nodes[1..] {
-    let member_id = member
-      .handle
-      .query(GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone();
+    let member_id = member.handle.local_node().await.unwrap().node_id().clone();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
       let members = member
         .handle
-        .query(PageMembers::new(PageSpec::first(8).unwrap()))
+        .members()
+        .list(PageSpec::first(8).unwrap())
         .await
         .unwrap();
       let revision = members
@@ -1220,11 +1180,7 @@ async fn membership_sync_delivers_fat_descriptor_pages() {
         .find(|view| view.node_id() == &member_id)
         .map(|view| view.owner_revision())
         .unwrap_or(1);
-      match member
-        .handle
-        .command(UpdateNodeMetadata::new(revision, fat_patch()))
-        .await
-      {
+      match member.handle.patch_metadata(revision, fat_patch()).await {
         Ok(_) => break,
         Err(error) if error.kind() == radiata::ErrorKind::Conflict => {
           assert!(
@@ -1246,10 +1202,11 @@ async fn membership_sync_delivers_fat_descriptor_pages() {
   let expected = member_ids.len();
   let deadline = std::time::Instant::now() + Duration::from_secs(120);
   loop {
-    issuer.handle.run_sync_round().await.unwrap();
+    issuer.handle.sync().await.unwrap();
     let members = issuer
       .handle
-      .query(PageMembers::new(PageSpec::first(64).unwrap()))
+      .members()
+      .list(PageSpec::first(64).unwrap())
       .await
       .unwrap();
     let converged = members

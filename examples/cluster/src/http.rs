@@ -10,13 +10,10 @@ use axum::{
   routing::{get, post},
 };
 use radiata::{
-  CleanupNode, ConnectMember, Digest, GetObservability, GetResource, IssueCleanupCheckpoint,
-  IssueMergeCredential, LabelKey, LabelValue, LeaveCluster, MemberPage, MergeCluster,
-  MergeCredential, NodeHandle, NodeId, NodeMetadataPatch, PageCursor, PageMembers, PageResources,
-  PageSessions, PageSpec, PageTrust, ProtocolTag, PutResource, QualifiedTag, RemoveResource,
-  ReplaceIdentityAndDeleteOldCoreMetadata, ResourceLabels, ResourceName, ResourceUri,
-  ResourceVersion, ResourceWrite, RevokeNode, RoutingPolicy, SelectResources, Selector,
-  StreamMetadata, StreamPolicy, StreamTarget, UpdateNodeMetadata,
+  Digest, LabelKey, LabelValue, MemberPage, MergeCredential, NodeHandle, NodeId, NodeMetadataPatch,
+  PageCursor, PageSpec, ProtocolTag, QualifiedTag, ReplaceIdentityAndDeleteOldCoreMetadata,
+  ResourceLabels, ResourceName, ResourceUri, ResourceVersion, ResourceWrite, RoutingPolicy,
+  Selector, StreamPolicy, StreamTarget,
 };
 use serde_json::{Value, json};
 
@@ -95,11 +92,8 @@ fn page_spec(
 
 async fn status(state: State<SharedState>) -> Json<Value> {
   let node = &state.node;
-  let observability = node.query(GetObservability::new()).await;
-  let members: Option<MemberPage> = node
-    .query(PageMembers::new(PageSpec::first(64).unwrap()))
-    .await
-    .ok();
+  let observability = node.metrics().await;
+  let members: Option<MemberPage> = node.members().list(PageSpec::first(64).unwrap()).await.ok();
   let member_count = members.as_ref().map_or(0, |page| page.items().len());
   // The library annotates every member page entry with its lifecycle
   // status (active / left / cleaned), so an operator — and the scenario
@@ -143,7 +137,8 @@ async fn status(state: State<SharedState>) -> Json<Value> {
 async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let issued = state
     .node
-    .command(IssueMergeCredential::new())
+    .credentials()
+    .issue()
     .await
     .map_err(internal_error)?;
   Ok(Json(json!({
@@ -188,7 +183,7 @@ async fn join(
     })?;
     match state
       .node
-      .command(MergeCluster::new(
+      .join(
         radiata::Endpoint::parse(&request.bootstrap_wss).map_err(|error| {
           (
             StatusCode::BAD_REQUEST,
@@ -196,7 +191,7 @@ async fn join(
           )
         })?,
         credential,
-      ))
+      )
       .await
     {
       Ok(view) => {
@@ -242,7 +237,7 @@ async fn connect(
   })?;
   let connected = state
     .node
-    .command(ConnectMember::new(endpoint, node_id))
+    .connect(endpoint, node_id)
     .await
     .map_err(|error| {
       (
@@ -269,16 +264,12 @@ async fn disconnect(
       Json(json!({"error": error.to_string()})),
     )
   })?;
-  state
-    .node
-    .command(radiata::DisconnectPeer::new(node_id))
-    .await
-    .map_err(|error| {
-      (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({"error": error.to_string()})),
-      )
-    })?;
+  state.node.disconnect(node_id).await.map_err(|error| {
+    (
+      StatusCode::BAD_GATEWAY,
+      Json(json!({"error": error.to_string()})),
+    )
+  })?;
   Ok(Json(json!({"disconnected": true})))
 }
 
@@ -289,9 +280,7 @@ async fn disconnect(
 async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let outcome = state
     .node
-    .command(LeaveCluster::new(
-      ReplaceIdentityAndDeleteOldCoreMetadata::new(),
-    ))
+    .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
     .map_err(|error| {
       (
@@ -344,7 +333,7 @@ async fn get_resource(
   state: State<SharedState>, AxumPath(name): AxumPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
   let name = ResourceName::parse(&name).map_err(|_| StatusCode::NOT_FOUND)?;
-  match state.node.query(GetResource::new(name)).await {
+  match state.node.resources().get(name).await {
     Ok(Some(view)) => Ok(Json(json!({
       "name": view.name().as_str(),
       "labels": labels_json(&view),
@@ -406,18 +395,17 @@ async fn put_resource(
       )
     })?;
   }
-  let put = PutResource::new(ResourceWrite::new(name, labels)).map_err(|error| {
-    (
-      StatusCode::BAD_REQUEST,
-      Json(json!({"error": error.to_string()})),
-    )
-  })?;
-  let outcome = state.node.command(put).await.map_err(|error| {
-    (
-      StatusCode::CONFLICT,
-      Json(json!({"error": error.to_string()})),
-    )
-  })?;
+  let outcome = state
+    .node
+    .resources()
+    .put(ResourceWrite::new(name, labels))
+    .await
+    .map_err(|error| {
+      (
+        StatusCode::CONFLICT,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
   Ok(Json(json!({
     "accepted": true,
     "is_winner": outcome.is_current_winner(),
@@ -438,7 +426,8 @@ async fn list_resources(
   let spec = page_spec(query.limit, query.cursor)?;
   let page = state
     .node
-    .query(PageResources::new(spec))
+    .resources()
+    .list(spec)
     .await
     .map_err(internal_error)?;
   let items: Vec<Value> = page
@@ -474,7 +463,8 @@ async fn select_resources(
   let spec = page_spec(request.limit, request.cursor)?;
   let page = state
     .node
-    .query(SelectResources::new(selector, spec))
+    .resources()
+    .select(selector, spec)
     .await
     .map_err(internal_error)?;
   let items: Vec<Value> = page
@@ -538,7 +528,8 @@ async fn remove_resource(
   );
   let outcome = state
     .node
-    .command(RemoveResource::new(name, expected))
+    .resources()
+    .delete(name, expected)
     .await
     .map_err(|error| {
       // A stale expectation is a conflict, not a server fault: the
@@ -560,9 +551,8 @@ async fn remove_resource(
 async fn trust(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let page = state
     .node
-    .query(PageTrust::new(
-      PageSpec::first(PAGE_LIMIT).map_err(bad_request)?,
-    ))
+    .trust()
+    .list(PageSpec::first(PAGE_LIMIT).map_err(bad_request)?)
     .await
     .map_err(internal_error)?;
   let items: Vec<Value> = page
@@ -593,9 +583,8 @@ async fn revoke(
   let subject = NodeId::parse(&request.node_id).map_err(bad_request)?;
   let page = state
     .node
-    .query(PageTrust::new(
-      PageSpec::first(PAGE_LIMIT).map_err(bad_request)?,
-    ))
+    .trust()
+    .list(PageSpec::first(PAGE_LIMIT).map_err(bad_request)?)
     .await
     .map_err(internal_error)?;
   let binding = page
@@ -610,7 +599,7 @@ async fn revoke(
     })?;
   let outcome = state
     .node
-    .command(RevokeNode::new(subject, binding.public_key().clone()))
+    .revoke(subject, binding.public_key().clone())
     .await
     .map_err(internal_error)?;
   Ok(Json(json!({
@@ -627,11 +616,7 @@ async fn cleanup(
   state: State<SharedState>, Json(request): Json<SubjectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let subject = NodeId::parse(&request.node_id).map_err(bad_request)?;
-  state
-    .node
-    .command(CleanupNode::new(subject))
-    .await
-    .map_err(internal_error)?;
+  state.node.cleanup(subject).await.map_err(internal_error)?;
   Ok(Json(json!({"cleaned": true})))
 }
 
@@ -642,7 +627,7 @@ async fn cleanup_checkpoint(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let watermark = state
     .node
-    .command(IssueCleanupCheckpoint::new())
+    .issue_cleanup_checkpoint()
     .await
     .map_err(internal_error)?;
   Ok(Json(json!({"watermark": watermark})))
@@ -657,9 +642,8 @@ async fn stream_probe(state: State<SharedState>) -> Result<Json<Value>, (StatusC
   // its target from the live session table.
   let sessions = state
     .node
-    .query(PageSessions::new(
-      PageSpec::first(64).map_err(internal_error)?,
-    ))
+    .sessions()
+    .list(PageSpec::first(64).map_err(internal_error)?)
     .await
     .map_err(internal_error)?;
   let peer = sessions
@@ -673,27 +657,22 @@ async fn stream_probe(state: State<SharedState>) -> Result<Json<Value>, (StatusC
       )
     })?;
   let started = std::time::Instant::now();
-  let stream = state
+  let body = futures_util::stream::iter([Ok(Arc::from(vec![0xA5u8; 1024].into_boxed_slice()))]);
+  state
     .node
-    .open_stream(
+    .send(
       StreamTarget::Exact(peer),
       ProtocolTag::parse("radiata.woooo.tech/protocols/probe").unwrap(),
       StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
-      StreamMetadata::new(),
+      body,
     )
+    .await
     .map_err(|error| {
       (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": error.to_string()})),
       )
     })?;
-  let body = futures_util::stream::iter([Ok(Arc::from(vec![0xA5u8; 1024].into_boxed_slice()))]);
-  stream.send_sync(body).await.map_err(|error| {
-    (
-      StatusCode::INTERNAL_SERVER_ERROR,
-      Json(json!({"error": error.to_string()})),
-    )
-  })?;
   let acked = started.elapsed();
   Ok(Json(json!({"ack_us": acked.as_micros() as u64})))
 }
@@ -731,11 +710,7 @@ async fn update_metadata(
   // register only ever accepts the exact current revision.
   let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
   loop {
-    match state
-      .node
-      .command(UpdateNodeMetadata::new(revision, patch.clone()))
-      .await
-    {
+    match state.node.patch_metadata(revision, patch.clone()).await {
       Ok(view) => {
         return Ok(Json(json!({"revision": view.owner_revision()})));
       }
@@ -754,9 +729,8 @@ async fn update_metadata(
 async fn self_owner_revision(state: &SharedState) -> Result<u64, (StatusCode, Json<Value>)> {
   let page = state
     .node
-    .query(PageMembers::new(
-      PageSpec::first(PAGE_LIMIT).map_err(internal_error)?,
-    ))
+    .members()
+    .list(PageSpec::first(PAGE_LIMIT).map_err(internal_error)?)
     .await
     .map_err(internal_error)?;
   page
@@ -794,27 +768,22 @@ async fn routed_probe(
     .map_err(internal_error)?
     .load_balancer(QualifiedTag::parse(FIRST_MATCH_BALANCER).map_err(bad_request)?);
   let started = std::time::Instant::now();
-  let stream = state
+  let body = futures_util::stream::iter([Ok(Arc::from(vec![0xA5_u8; 1024].into_boxed_slice()))]);
+  let ack = state
     .node
-    .open_stream(
+    .send(
       StreamTarget::MatchingNodes(selector),
       ProtocolTag::parse(PROBE_PROTOCOL).map_err(bad_request)?,
       policy,
-      StreamMetadata::new(),
+      body,
     )
+    .await
     .map_err(|error| {
       (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": error.to_string()})),
       )
     })?;
-  let body = futures_util::stream::iter([Ok(Arc::from(vec![0xA5_u8; 1024].into_boxed_slice()))]);
-  let ack = stream.send_sync(body).await.map_err(|error| {
-    (
-      StatusCode::INTERNAL_SERVER_ERROR,
-      Json(json!({"error": error.to_string()})),
-    )
-  })?;
   let acked = started.elapsed();
   Ok(Json(json!({
     "ack_us": acked.as_micros() as u64,
@@ -833,7 +802,7 @@ pub fn internal_error(error: radiata::Error) -> (StatusCode, Json<Value>) {
 /// an authenticated path, how many members remain unreachable, and the
 /// next scheduled attempt (operator debugging for partition healing).
 async fn recovery(state: State<SharedState>) -> Json<Value> {
-  match state.node.query(radiata::GetRecovery::new()).await {
+  match state.node.recovery().await {
     Ok(view) => Json(json!({
       "connected": view.is_connected(),
       "unreachable_members": view.unreachable_members(),

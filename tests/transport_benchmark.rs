@@ -24,8 +24,8 @@ use std::{
 };
 
 use radiata::{
-  Endpoint, GetLocalNode, Listen, NodeBuilder, NodeConfig, NodeHandle, NodeId, ProtocolDefinition,
-  ProtocolTag, RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
+  Endpoint, NodeBuilder, NodeConfig, NodeHandle, NodeId, ProtocolDefinition, ProtocolTag,
+  RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -116,7 +116,8 @@ async fn start_node(seed: u64, sink: Arc<Sink>) -> (NodeHandle, Endpoint) {
     .await
     .unwrap();
   let listener = handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   (handle, listener.endpoint().clone())
@@ -128,12 +129,7 @@ async fn merged_pair(receiver_sink: Arc<Sink>) -> (NodeHandle, NodeHandle, NodeI
   let (receiver, receiver_endpoint) = start_node(1, Arc::clone(&receiver_sink)).await;
   let (sender, _) = start_node(2, sender_sink).await;
   common::merge_with_retry(&sender, &receiver, receiver_endpoint).await;
-  let peer = receiver
-    .query(GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone();
+  let peer = receiver.local_node().await.unwrap().node_id().clone();
   (receiver, sender, peer, receiver_sink)
 }
 
@@ -284,8 +280,8 @@ async fn transport_cpu_ticks_full_pipeline_vs_bare_tls() {
   let a_ticks = cpu_ticks() - start_ticks;
   let a_bytes = sink.bytes.load(Ordering::Relaxed);
 
-  sender.command(radiata::Shutdown::new()).await.unwrap();
-  receiver.command(radiata::Shutdown::new()).await.unwrap();
+  sender.shutdown().await.unwrap();
+  receiver.shutdown().await.unwrap();
   println!(
     "lane A full pipeline : {a_ticks:>6} cpu ticks | {:>9.2} ms wall | {a_bytes} B delivered",
     a_wall.as_secs_f64() * 1e3

@@ -17,11 +17,7 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use radiata::{
-  ConnectMember, Endpoint, ErrorKind, GetConnectionDegree, GetLocalNode, GetRecovery, Listen,
-  NodeBuilder, NodeConfig, NodeHandle, NodeId, PageMembers, PageSpec, RunSyncRound, Shutdown,
-  WaitForShutdown,
-};
+use radiata::{Endpoint, ErrorKind, NodeBuilder, NodeConfig, NodeHandle, NodeId, PageSpec};
 mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys, merge_with_retry};
@@ -68,31 +64,27 @@ async fn start_node(seed: u64, storage: Arc<MemoryStorageFactory>, config: NodeC
 
 /// Reads the node's authenticated id from the public facade.
 async fn node_id(node: &Node) -> NodeId {
-  node
-    .handle
-    .query(GetLocalNode::new())
-    .await
-    .unwrap()
-    .node_id()
-    .clone()
+  node.handle.local_node().await.unwrap().node_id().clone()
 }
 
 async fn listen(node: &mut Node) {
   let listener = node
     .handle
-    .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap();
   node.endpoint = listener.endpoint().clone();
 }
 
 async fn connection_degree(node: &Node) -> radiata::ConnectionDegreeView {
-  node.handle.query(GetConnectionDegree::new()).await.unwrap()
+  node.handle.connection_degree().await.unwrap()
 }
 
 async fn member_count_page(handle: &NodeHandle) -> usize {
   handle
-    .query(PageMembers::new(PageSpec::first(64).unwrap()))
+    .members()
+    .list(PageSpec::first(64).unwrap())
     .await
     .unwrap()
     .items()
@@ -100,7 +92,7 @@ async fn member_count_page(handle: &NodeHandle) -> usize {
 }
 
 async fn degree_view_handle(handle: &NodeHandle) -> radiata::ConnectionDegreeView {
-  handle.query(GetConnectionDegree::new()).await.unwrap()
+  handle.connection_degree().await.unwrap()
 }
 
 /// Polls `probe` until it returns `Some(value)` or the deadline passes.
@@ -221,7 +213,7 @@ async fn an_unhealthy_node_dials_its_way_back_to_target() {
   // The degree never gates functionality: the any-one-route contract
   // holds everywhere while maintenance runs.
   for node in &nodes {
-    let recovery = node.handle.query(GetRecovery::new()).await.unwrap();
+    let recovery = node.handle.recovery().await.unwrap();
     assert!(
       recovery.is_connected(),
       "{} must stay connected throughout",
@@ -230,8 +222,8 @@ async fn an_unhealthy_node_dials_its_way_back_to_target() {
   }
 
   for node in &nodes {
-    let _ = node.handle.command(Shutdown::new()).await;
-    let _ = node.handle.query(WaitForShutdown::new()).await;
+    let _ = node.handle.shutdown().await;
+    let _ = node.handle.wait_for_shutdown().await;
   }
 }
 
@@ -301,10 +293,7 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   // binding is the retryable NotFound, never "untrusted".
   let raced = dialer
     .handle
-    .command(ConnectMember::new(
-      member.endpoint.clone(),
-      member.id.clone(),
-    ))
+    .connect(member.endpoint.clone(), member.id.clone())
     .await;
   if let Err(error) = &raced {
     assert_eq!(
@@ -318,10 +307,7 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   // not exist anywhere in A's reach.
   let unknown = dialer
     .handle
-    .command(ConnectMember::new(
-      stranger.endpoint.clone(),
-      stranger.id.clone(),
-    ))
+    .connect(stranger.endpoint.clone(), stranger.id.clone())
     .await
     .unwrap_err();
   assert_eq!(
@@ -340,7 +326,7 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
         let dialer_handle = dialer_handle.clone();
         let member_id = member_id.clone();
         Box::pin(async move {
-          let _ = dialer_handle.command(RunSyncRound::new()).await;
+          let _ = dialer_handle.sync().await;
           if trust_ids_node(&dialer_handle).await.contains(&member_id) {
             return Some(());
           }
@@ -357,10 +343,7 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   let authenticated = loop {
     match dialer
       .handle
-      .command(ConnectMember::new(
-        member.endpoint.clone(),
-        member.id.clone(),
-      ))
+      .connect(member.endpoint.clone(), member.id.clone())
       .await
     {
       Ok(peer) => break peer,
@@ -381,8 +364,8 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   assert_eq!(authenticated, member.id);
 
   for node in [&hub, &member, &stranger, &dialer] {
-    let _ = node.handle.command(Shutdown::new()).await;
-    let _ = node.handle.query(WaitForShutdown::new()).await;
+    let _ = node.handle.shutdown().await;
+    let _ = node.handle.wait_for_shutdown().await;
   }
 }
 
@@ -390,9 +373,8 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
 /// borrow the test's `Node`).
 async fn trust_ids_node(handle: &NodeHandle) -> BTreeSet<NodeId> {
   handle
-    .query(radiata::PageTrust::new(
-      radiata::PageSpec::first(64).unwrap(),
-    ))
+    .trust()
+    .list(radiata::PageSpec::first(64).unwrap())
     .await
     .unwrap()
     .items()

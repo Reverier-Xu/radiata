@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use radiata::{
-  BoxFuture, ErrorKind, GetNodeStatus, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, NodeBuilder, NodeHandle, NodeStatus, PublicKey, Result, Shutdown, Signature,
+  BoxFuture, ErrorKind, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId,
+  NodeBuilder, NodeHandle, NodeStatus, PublicKey, Result, Signature,
   extension::{KeyProvider, StorageFactory},
 };
 
@@ -131,11 +131,8 @@ async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
   )
   .await
   .unwrap();
-  assert_eq!(
-    first.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running
-  );
-  first.command(Shutdown::new()).await.unwrap();
+  assert_eq!(first.status(), NodeStatus::Running);
+  first.shutdown().await.unwrap();
   assert_eq!(calls.create.lock().unwrap().len(), 1);
 
   let second = start(
@@ -144,11 +141,8 @@ async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
   )
   .await
   .unwrap();
-  assert_eq!(
-    second.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running
-  );
-  second.command(Shutdown::new()).await.unwrap();
+  assert_eq!(second.status(), NodeStatus::Running);
+  second.shutdown().await.unwrap();
   assert_eq!(calls.create.lock().unwrap().len(), 1);
   assert!(*calls.public_key.lock().unwrap() >= 2);
 }
@@ -165,7 +159,7 @@ async fn redb_runtime_concurrent_open_is_typed_locked_and_error_is_redacted() {
   let error = match start(Arc::clone(&storage), Arc::clone(&keys)).await {
     Err(error) => error,
     Ok(second) => {
-      second.command(Shutdown::new()).await.unwrap();
+      second.shutdown().await.unwrap();
       panic!("concurrent open unexpectedly succeeded");
     }
   };
@@ -175,5 +169,5 @@ async fn redb_runtime_concurrent_open_is_typed_locked_and_error_is_redacted() {
     !rendered.contains(dir.path().to_str().unwrap()),
     "error rendering leaks the storage path: {rendered}"
   );
-  first.command(Shutdown::new()).await.unwrap();
+  first.shutdown().await.unwrap();
 }

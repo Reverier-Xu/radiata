@@ -3,8 +3,10 @@
 //! off one resource (`node.members()`, `node.resources()`, …) and
 //! carries exactly the verbs that resource supports — a read-only
 //! resource gets `get`/`list`, a mutable one gets `create`/`delete`.
-//! Accessors borrow the handle; every method is cheap to construct and
-//! owns no state beyond the runtime client reference.
+//!
+//! Accessors are cheap single-use values: every verb consumes the
+//! accessor and returns an owned future, so a write intent built now
+//! can be held and driven later exactly like any other value.
 
 use crate::{
   Endpoint, IssuedMergeCredential, ListenerId, NodeId, PageSpec, Result, RouteHandle,
@@ -14,17 +16,19 @@ use crate::{
 };
 
 /// The public membership observations.
-pub struct Members<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Members {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Members<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Members {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Queries one member's public observation.
-  pub async fn get(&self, node: NodeId) -> Result<Option<MemberView>> {
+  pub async fn get(self, node: NodeId) -> Result<Option<MemberView>> {
     self
       .runtime
       .send_command(move |reply| Control::GetMember { node, reply })
@@ -32,7 +36,7 @@ impl<'a> Members<'a> {
   }
 
   /// Pages the public membership observations.
-  pub async fn list(&self, page: PageSpec) -> Result<MemberPage> {
+  pub async fn list(self, page: PageSpec) -> Result<MemberPage> {
     let cursor = page.cursor().cloned();
     let limit = page.limit();
     self
@@ -47,17 +51,19 @@ impl<'a> Members<'a> {
 }
 
 /// The node's resource register.
-pub struct Resources<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Resources {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Resources<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Resources {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Reads the live winner of one named resource, when present.
-  pub async fn get(&self, name: crate::ResourceName) -> Result<Option<ResourceView>> {
+  pub async fn get(self, name: crate::ResourceName) -> Result<Option<ResourceView>> {
     self
       .runtime
       .send_command(move |reply| Control::GetResource { name, reply })
@@ -65,7 +71,7 @@ impl<'a> Resources<'a> {
   }
 
   /// Pages the live resource winners in canonical name order.
-  pub async fn list(&self, page: PageSpec) -> Result<ResourcePage> {
+  pub async fn list(self, page: PageSpec) -> Result<ResourcePage> {
     let cursor = page.cursor().cloned();
     let limit = page.limit();
     self
@@ -79,7 +85,7 @@ impl<'a> Resources<'a> {
   }
 
   /// Pages the live resource winners matching one selector.
-  pub async fn select(&self, selector: Selector, page: PageSpec) -> Result<ResourcePage> {
+  pub async fn select(self, selector: Selector, page: PageSpec) -> Result<ResourcePage> {
     let cursor = page.cursor().cloned();
     let limit = page.limit();
     self
@@ -99,9 +105,7 @@ impl<'a> Resources<'a> {
   /// reports the accepted record and whether it is the current winner.
   /// For the conditional (compare-and-swap) form, see
   /// [`Resources::put_expected`](Resources::put_expected).
-  pub async fn put(
-    &self, write: crate::ResourceWrite,
-  ) -> Result<crate::view::ResourceMutationView> {
+  pub async fn put(self, write: crate::ResourceWrite) -> Result<crate::view::ResourceMutationView> {
     crate::resource::check_write_shape(write.name(), write.labels())?;
     self
       .runtime
@@ -119,7 +123,7 @@ impl<'a> Resources<'a> {
   /// read-modify-write surfaces as an explicit
   /// [`crate::ErrorKind::Conflict`] instead of a silently lost update.
   pub async fn put_expected(
-    &self, write: crate::ResourceWrite, expected: crate::ResourceVersion,
+    self, write: crate::ResourceWrite, expected: crate::ResourceVersion,
   ) -> Result<crate::view::ResourceMutationView> {
     crate::resource::check_write_shape(write.name(), write.labels())?;
     self
@@ -139,7 +143,7 @@ impl<'a> Resources<'a> {
   /// winner. Removal is limited to core metadata; core never follows the
   /// resource URI or touches the caller's object.
   pub async fn delete(
-    &self, name: crate::ResourceName, expected: crate::ResourceVersion,
+    self, name: crate::ResourceName, expected: crate::ResourceVersion,
   ) -> Result<crate::view::ResourceMutationView> {
     self
       .runtime
@@ -153,17 +157,19 @@ impl<'a> Resources<'a> {
 }
 
 /// The node's bound listeners.
-pub struct Listeners<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Listeners {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Listeners<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Listeners {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Binds one new listener on the endpoint and returns its live view.
-  pub async fn create(&self, endpoint: Endpoint) -> Result<ListenerView> {
+  pub async fn create(self, endpoint: Endpoint) -> Result<ListenerView> {
     self
       .runtime
       .send_command(move |reply| Control::Listen { endpoint, reply })
@@ -171,7 +177,7 @@ impl<'a> Listeners<'a> {
   }
 
   /// Unbinds one listener by id.
-  pub async fn delete(&self, listener: ListenerId) -> Result<()> {
+  pub async fn delete(self, listener: ListenerId) -> Result<()> {
     self
       .runtime
       .send_command(move |reply| Control::StopListener { listener, reply })
@@ -179,7 +185,7 @@ impl<'a> Listeners<'a> {
   }
 
   /// Pages the node's bound listeners.
-  pub async fn list(&self, page: PageSpec) -> Result<ListenerPage> {
+  pub async fn list(self, page: PageSpec) -> Result<ListenerPage> {
     let cursor = page.cursor().cloned();
     let limit = page.limit();
     self
@@ -194,17 +200,19 @@ impl<'a> Listeners<'a> {
 }
 
 /// The live authenticated sessions.
-pub struct Sessions<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Sessions {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Sessions<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Sessions {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Pages the live authenticated sessions.
-  pub async fn list(&self, page: PageSpec) -> Result<crate::SessionPage> {
+  pub async fn list(self, page: PageSpec) -> Result<crate::SessionPage> {
     let cursor = page.cursor().cloned();
     let limit = page.limit();
     self
@@ -219,17 +227,19 @@ impl<'a> Sessions<'a> {
 }
 
 /// The public topology edges.
-pub struct Topology<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Topology {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Topology<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Topology {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Pages the public topology edges.
-  pub async fn list(&self, page: PageSpec) -> Result<crate::TopologyPage> {
+  pub async fn list(self, page: PageSpec) -> Result<crate::TopologyPage> {
     let cursor = page.cursor().cloned();
     let limit = page.limit();
     self
@@ -244,17 +254,19 @@ impl<'a> Topology<'a> {
 }
 
 /// The public trust observations.
-pub struct Trust<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Trust {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Trust<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Trust {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Pages the public trust observations.
-  pub async fn list(&self, page: PageSpec) -> Result<crate::TrustPage> {
+  pub async fn list(self, page: PageSpec) -> Result<crate::TrustPage> {
     let cursor = page.cursor().cloned();
     let limit = page.limit();
     self
@@ -269,13 +281,15 @@ impl<'a> Trust<'a> {
 }
 
 /// The cluster's live join credentials.
-pub struct Credentials<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Credentials {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Credentials<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Credentials {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Issues the current live join credential generation without rotating
@@ -284,7 +298,7 @@ impl<'a> Credentials<'a> {
   /// share one generation. With no live generation, one is created.
   /// [`Credentials::rotate`](Credentials::rotate) remains the
   /// revocation/upgrade step.
-  pub async fn issue(&self) -> Result<IssuedMergeCredential> {
+  pub async fn issue(self) -> Result<IssuedMergeCredential> {
     self
       .runtime
       .send_command(|reply| Control::IssueMergeCredential { reply })
@@ -295,7 +309,7 @@ impl<'a> Credentials<'a> {
   /// replacement admits joins from now on and the former generation
   /// admits none — the revocation/upgrade step next to
   /// [`Credentials::issue`](Credentials::issue).
-  pub async fn rotate(&self) -> Result<IssuedMergeCredential> {
+  pub async fn rotate(self) -> Result<IssuedMergeCredential> {
     self
       .runtime
       .send_command(|reply| Control::RotateMergeCredential { reply })
@@ -304,18 +318,20 @@ impl<'a> Credentials<'a> {
 }
 
 /// The in-memory packet route records.
-pub struct Routes<'a> {
-  runtime: &'a RuntimeClient,
+pub struct Routes {
+  runtime: RuntimeClient,
 }
 
-impl<'a> Routes<'a> {
-  pub(crate) fn new(runtime: &'a RuntimeClient) -> Self {
-    Self { runtime }
+impl Routes {
+  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+    Self {
+      runtime: runtime.clone(),
+    }
   }
 
   /// Reads the in-memory route status of one packet route handle
   /// (bounded trace metadata only, no durability claim).
-  pub fn get(&self, handle: &RouteHandle) -> Result<RouteStatusView> {
+  pub fn get(self, handle: &RouteHandle) -> Result<RouteStatusView> {
     self.runtime.route_status(handle)
   }
 }

@@ -11,16 +11,12 @@
 use std::sync::Mutex;
 use std::{sync::Arc, time::Duration};
 
+use radiata::{
+  Endpoint, ErrorKind, NodeBuilder, NodeConfig, PageSpec, ProtocolTag, QualifiedTag,
+  StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
+};
 #[cfg(all(test, feature = "json", unix))]
-use radiata::{
-  DisconnectPeer, PageResources, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
-  RotateMergeCredential,
-};
-use radiata::{
-  Endpoint, ErrorKind, GetObservability, Listen, NodeBuilder, NodeConfig, PageSessions, PageSpec,
-  ProtocolTag, QualifiedTag, Shutdown, StreamMetadata, StreamPolicy, StreamTarget,
-  extension::KeyProvider,
-};
+use radiata::{ResourceLabels, ResourceName, ResourceUri, ResourceWrite};
 
 mod common;
 
@@ -83,7 +79,8 @@ async fn start_node(seed: u64) -> Node {
 async fn listen(node: &mut Node) {
   let listener = node
     .handle
-    .command(Listen::new(node.endpoint.clone()))
+    .listeners()
+    .create(node.endpoint.clone())
     .await
     .unwrap();
   node.endpoint = listener.endpoint().clone();
@@ -95,33 +92,18 @@ async fn listen(node: &mut Node) {
 async fn observability_snapshot_covers_bounded_responsibilities() {
   let mut issuer = start_node(1).await;
   let mut member = start_node(2).await;
-  issuer.id = Some(
-    issuer
-      .handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone(),
-  );
+  issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   listen(&mut issuer).await;
   common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
-  member.id = Some(
-    member
-      .handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone(),
-  );
+  member.id = Some(member.handle.local_node().await.unwrap().node_id().clone());
 
   // Wait for the session to register on both sides.
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     let sessions = member
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     if !sessions.items().is_empty() {
@@ -140,7 +122,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
       .unwrap()
   };
   for (node, listeners) in [(&issuer, 1_u64), (&member, 0)] {
-    let status = node.handle.query(GetObservability::new()).await.unwrap();
+    let status = node.handle.metrics().await.unwrap();
     assert_eq!(
       counter(&status, radiata::ObservabilitySnapshot::SESSIONS),
       1
@@ -175,8 +157,8 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   // drains.
   let drain = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    let issuer_status = issuer.handle.query(GetObservability::new()).await.unwrap();
-    let member_status = member.handle.query(GetObservability::new()).await.unwrap();
+    let issuer_status = issuer.handle.metrics().await.unwrap();
+    let member_status = member.handle.metrics().await.unwrap();
     let drained = [issuer_status, member_status].iter().all(|status| {
       counter(
         status,
@@ -192,7 +174,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   }
 
   // A failing route leaves no queue residue after the typed interruption.
-  let unknown = issuer.handle.query(GetObservability::new()).await.unwrap();
+  let unknown = issuer.handle.metrics().await.unwrap();
   let result = issuer.handle.open_stream(
     StreamTarget::Exact(member.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered").unwrap(),
@@ -214,7 +196,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   // observed through the same bounded drain window as above.
   let residue = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    let after = issuer.handle.query(GetObservability::new()).await.unwrap();
+    let after = issuer.handle.metrics().await.unwrap();
     if counter(
       &after,
       radiata::ObservabilitySnapshot::QUEUED_SESSION_MESSAGES,
@@ -234,8 +216,8 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
     tokio::time::sleep(Duration::from_millis(20)).await;
   }
 
-  issuer.handle.command(Shutdown::new()).await.unwrap();
-  member.handle.command(Shutdown::new()).await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
+  member.handle.shutdown().await.unwrap();
 }
 
 /// Injected credential, key, packet-body, path, address,
@@ -281,45 +263,26 @@ async fn redaction_lane_rejects_every_forbidden_class() {
   };
   let mut member = start_node(3).await;
 
-  issuer.id = Some(
-    issuer
-      .handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone(),
-  );
+  issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   listen(&mut issuer).await;
 
   // Markers: the credential secret, the packet body, a hostile label
   // value, a selector text, and the storage path.
-  let issued = issuer
-    .handle
-    .command(RotateMergeCredential::new())
-    .await
-    .unwrap();
+  let issued = issuer.handle.credentials().rotate().await.unwrap();
   let credential_marker = issued.credential().expose_secret().to_owned();
   let body_marker: Arc<[u8]> = Arc::from(b"PACKET-BODY-MARKER-9w4e".as_slice());
   let label_marker = "hostile\nlabel\x00value-MARKER";
   let selector_marker = "radiata.woooo.tech/labels/marker-selector-x1q9";
 
   common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
-  member.id = Some(
-    member
-      .handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone(),
-  );
+  member.id = Some(member.handle.local_node().await.unwrap().node_id().clone());
   listen(&mut member).await;
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
     let sessions = member
       .handle
-      .query(PageSessions::new(PageSpec::first(8).unwrap()))
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
       .await
       .unwrap();
     if !sessions.items().is_empty() {
@@ -359,30 +322,29 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     )
     .unwrap(),
   );
+  let _ = member.handle.resources().put(write).await;
   let _ = member
     .handle
-    .command(radiata::PutResource::new(write).unwrap())
+    .resources()
+    .list(PageSpec::first(8).unwrap())
     .await;
   let _ = member
     .handle
-    .query(PageResources::new(PageSpec::first(8).unwrap()))
-    .await;
-  let _ = member
-    .handle
-    .query(radiata::SelectResources::new(
+    .resources()
+    .select(
       radiata::Selector::parse(selector_marker).unwrap(),
       PageSpec::first(8).unwrap(),
-    ))
+    )
     .await;
 
   // A session close churns the driver before the scan.
   member
     .handle
-    .command(DisconnectPeer::new(issuer.id.clone().unwrap()))
+    .disconnect(issuer.id.clone().unwrap())
     .await
     .unwrap();
-  issuer.handle.command(Shutdown::new()).await.unwrap();
-  member.handle.command(Shutdown::new()).await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
+  member.handle.shutdown().await.unwrap();
 
   let captured = String::from_utf8_lossy(&capture.buffer.lock().unwrap()).to_string();
   assert!(!captured.is_empty(), "the workflow emitted no log events");

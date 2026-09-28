@@ -57,14 +57,14 @@ cloud KMS), implement `radiata::extension::KeyProvider` and pass it to
 [`NodeBuilder::keys`](#documentation) (see the [`radiata::guide` chapter](#documentation)).
 
 ```rust
-use radiata::{adapters::redb_store, Endpoint, Listen, NodeBuilder, NodeConfig, Result};
+use radiata::{adapters::redb_store, Endpoint, NodeBuilder, NodeConfig, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let storage = redb_store("node-data/store.redb".into());
 
     // Bootstrap a new cluster by listening; join an existing one by
-    // additionally running `MergeCluster` through any live member.
+    // additionally running `node.join` through any live member.
     let node = NodeBuilder::new(storage)
         .config(NodeConfig::new())
         .start()
@@ -75,7 +75,8 @@ async fn main() -> Result<()> {
         // firewall that only passes web traffic (the WebSocket upgrade
         // masquerades as HTTPS), and `tcp://` only for closed intranet
         // segments with devices that cannot run TLS 1.3.
-        .command(Listen::new(Endpoint::parse("tls://node1.example.net:9443")?))
+        .listeners()
+        .create(Endpoint::parse("tls://node1.example.net:9443")?)
         .await?;
     Ok(())
 }
@@ -84,8 +85,8 @@ async fn main() -> Result<()> {
 The deployment-facing surface is deliberately small: **join** (one credential-authorized merge),
 **send** (packets over the routed data plane), and **leave** (terminal departure with identity
 replacement). Routing, recovery, and convergence are the library's responsibility; your code
-registers extensions before the node starts and drives commands and queries through the
-`NodeHandle` afterward.
+registers extensions before the node starts and drives the resource accessors and
+operation verbs through the `NodeHandle` afterward.
 
 ### Custom transports
 
@@ -98,7 +99,10 @@ let mut extensions = ExtensionRegistry::new();
 extensions.register_transport(TransportName::parse("espnow")?, Arc::new(EspnowTransport::new()))?;
 let node = NodeBuilder::new(storage).extensions(extensions).start().await?;
 // Peers address the medium through the canonical form `<name>://<opaque>`:
-node.command(Listen::new(Endpoint::parse("espnow://aa:bb:cc:dd:ee:ff")?)).await?;
+node
+    .listeners()
+    .create(Endpoint::parse("espnow://aa:bb:cc:dd:ee:ff")?)
+    .await?;
 ```
 
 A caller operating many transports registers many scheme names; each name is unique per node and

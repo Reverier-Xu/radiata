@@ -16,10 +16,9 @@ use std::{
 };
 
 use radiata::{
-  ConnectMember, DisconnectPeer, Endpoint, GetObservability, GetResource, Listen, NodeBuilder,
-  NodeConfig, NodeHandle, NodeId, ProtocolTag, PutResource, QualifiedTag, RemoveResource,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, RotateMergeCredential,
-  Shutdown, StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
+  Endpoint, NodeBuilder, NodeConfig, NodeHandle, NodeId, ProtocolTag, QualifiedTag, ResourceLabels,
+  ResourceName, ResourceUri, ResourceWrite, Result, StreamMetadata, StreamPolicy, StreamTarget,
+  extension::KeyProvider,
 };
 
 mod common;
@@ -129,7 +128,8 @@ impl Node {
   async fn listen(&mut self) {
     let listener = self
       .handle
-      .command(Listen::new(Endpoint::parse("wss://127.0.0.1:0").unwrap()))
+      .listeners()
+      .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
       .unwrap();
     self.endpoint = Some(listener.endpoint().clone());
@@ -168,7 +168,7 @@ fn counter(snapshot: &radiata::ObservabilitySnapshot, tag: &str) -> u64 {
 }
 
 async fn snapshot_of(handle: &NodeHandle) -> radiata::ObservabilitySnapshot {
-  handle.query(GetObservability::new()).await.unwrap()
+  handle.metrics().await.unwrap()
 }
 
 /// Waits until every node's session count equals `expected`, returning
@@ -308,27 +308,11 @@ async fn soak_churn_then_baseline_return() {
     members.push(start_node(seed).await);
   }
 
-  issuer.id = Some(
-    issuer
-      .handle
-      .query(radiata::GetLocalNode::new())
-      .await
-      .unwrap()
-      .node_id()
-      .clone(),
-  );
+  issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   issuer.listen().await;
   for member in &mut members {
     common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint().clone()).await;
-    member.id = Some(
-      member
-        .handle
-        .query(radiata::GetLocalNode::new())
-        .await
-        .unwrap()
-        .node_id()
-        .clone(),
-    );
+    member.id = Some(member.handle.local_node().await.unwrap().node_id().clone());
     member.listen().await;
   }
   wait_sessions(&[&issuer], 3).await;
@@ -377,11 +361,7 @@ async fn soak_churn_then_baseline_return() {
         ResourceUri::parse("file:///soak/placeholder").unwrap(),
       ),
     );
-    match issuer
-      .handle
-      .command(PutResource::new(write).unwrap())
-      .await
-    {
+    match issuer.handle.resources().put(write).await {
       Ok(view) => {
         stats.resources_written += 1;
         last_resource = Some((name, view.accepted().version().clone()));
@@ -394,11 +374,7 @@ async fn soak_churn_then_baseline_return() {
     if tick.is_multiple_of(8)
       && let Some((previous, version)) = last_resource.take()
     {
-      match issuer
-        .handle
-        .command(RemoveResource::new(previous, version))
-        .await
-      {
+      match issuer.handle.resources().delete(previous, version).await {
         Ok(_) => {}
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "resource-remove",
@@ -412,11 +388,7 @@ async fn soak_churn_then_baseline_return() {
     // every sixty-four ticks, rotate the admission credential.
     if tick.is_multiple_of(16) && std::env::var("RADIATA_SOAK_NO_CHURN").is_err() {
       let churned = &members[(tick as usize / 16) % members.len()];
-      match issuer
-        .handle
-        .command(DisconnectPeer::new(churned.id().clone()))
-        .await
-      {
+      match issuer.handle.disconnect(churned.id().clone()).await {
         Ok(_) => {}
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "disconnect",
@@ -425,10 +397,7 @@ async fn soak_churn_then_baseline_return() {
       }
       match issuer
         .handle
-        .command(ConnectMember::new(
-          churned.endpoint().clone(),
-          churned.id().clone(),
-        ))
+        .connect(churned.endpoint().clone(), churned.id().clone())
         .await
       {
         Ok(_) => stats.reconnects += 1,
@@ -439,7 +408,7 @@ async fn soak_churn_then_baseline_return() {
       }
     }
     if tick.is_multiple_of(64) {
-      match issuer.handle.command(RotateMergeCredential::new()).await {
+      match issuer.handle.credentials().rotate().await {
         Ok(_) => stats.credential_rotations += 1,
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "rotate",
@@ -462,10 +431,7 @@ async fn soak_churn_then_baseline_return() {
     loop {
       match issuer
         .handle
-        .command(ConnectMember::new(
-          member.endpoint().clone(),
-          member.id().clone(),
-        ))
+        .connect(member.endpoint().clone(), member.id().clone())
         .await
       {
         Ok(_) => break,
@@ -627,21 +593,22 @@ async fn soak_churn_then_baseline_return() {
   assert!(
     issuer
       .handle
-      .query(GetResource::new(
+      .resources()
+      .get(
         ResourceName::parse(&format!(
           "{ISSUER_RESOURCE_PREFIX}-{:04}",
           tick.saturating_sub(1)
         ))
-        .unwrap()
-      ))
+        .unwrap(),
+      )
       .await
       .is_ok()
   );
 
   for member in &members {
-    member.handle.command(Shutdown::new()).await.unwrap();
+    member.handle.shutdown().await.unwrap();
   }
-  issuer.handle.command(Shutdown::new()).await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
 
   append_ledger(
     std::path::Path::new(&ledger),

@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use radiata::{
-  DurabilityLevel, ErrorKind, GetNodeStatus, NodeBuilder, NodeStatus, ProviderErrorKind, Shutdown,
-  StoreCapabilities,
+  DurabilityLevel, ErrorKind, NodeBuilder, NodeStatus, ProviderErrorKind, StoreCapabilities,
   extension::{KeyProvider, StorageFactory},
 };
 
@@ -122,10 +121,7 @@ async fn storage_runtime_success_orders_storage_probe_before_identity_and_releas
   let providers = Providers::new(required_capabilities(), None);
   let handle = providers.builder().start().await.unwrap();
 
-  assert_eq!(
-    handle.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running,
-  );
+  assert_eq!(handle.status(), NodeStatus::Running,);
   // The startup order is a prefix property: after the identity init the
   // recovery plane's first tick appends its own reads (the departed prune
   // and the finding-#4 known-online seeding), so the observation is
@@ -149,7 +145,7 @@ async fn storage_runtime_success_orders_storage_probe_before_identity_and_releas
   assert_eq!(providers.storage_drops.count(), 0);
   assert_eq!(providers.key_drops.count(), 0);
 
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
   assert_eq!(providers.storage_drops.count(), 1);
   assert_eq!(providers.factory.commit_calls(), 4);
   assert_eq!(providers.keys.take_calls(), vec![]);
@@ -222,11 +218,8 @@ async fn storage_runtime_exclusive_lifetime_lock_rejects_concurrent_open() {
     "a locked store must produce zero key calls",
   );
 
-  handle.command(Shutdown::new()).await.unwrap();
+  handle.shutdown().await.unwrap();
   let reopened = providers.builder().start().await.unwrap();
-  assert_eq!(
-    reopened.query(GetNodeStatus::new()).await.unwrap(),
-    NodeStatus::Running,
-  );
-  reopened.command(Shutdown::new()).await.unwrap();
+  assert_eq!(reopened.status(), NodeStatus::Running,);
+  reopened.shutdown().await.unwrap();
 }
