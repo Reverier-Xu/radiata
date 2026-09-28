@@ -147,6 +147,17 @@ evidence lands in the commit history.
   elsewhere) and was cancelled at the 30-minute job timeout; the same
   gate passes locally in 6m30s and passed on re-run. Treat a silent
   container hang as runner-side until a local container run reproduces it.
+- The chat boundary suite asserted DM viewability straight off the wire
+  admission ack, which proves current-process admission only: the chunk
+  pump and the recipient's store write land after it. A single
+  non-retrying inbox poll therefore lost a millisecond-scale race that a
+  loaded runner reliably loses — the lane was red on `main` from
+  2026-09-27 while the identical flow completed locally inside the
+  poll's own round trip (300 KiB / 10 chunks, 13–49 ms measured). The
+  suite now waits for viewability (`wait_viewable`, cumulative burst
+  polling) and the library gained the missing above-chunk-bound delivery
+  test (`a_body_above_the_chunk_bound_crosses_three_hops_byte_exact`);
+  the data plane itself was never at fault.
 
 ## 2. Conditional: receiver-side cursor evidence for sync planes
 
