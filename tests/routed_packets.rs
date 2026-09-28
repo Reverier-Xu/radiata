@@ -88,6 +88,16 @@ impl PacketConsumer for Collector {
   }
 }
 
+/// A body stream yielding one caller chunk far larger than the wire's
+/// chunk bound: the pump must re-chunk it into wire-legal slices, and
+/// the receiver must reassemble the exact original sequence.
+fn oversized_body(
+  bytes: Vec<u8>,
+) -> impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static {
+  let chunk: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+  futures_util::stream::iter([Ok(chunk)])
+}
+
 /// A body stream that stalls after creation until released.
 fn gated_body() -> (
   impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static,
@@ -639,6 +649,63 @@ async fn default_policy_relays_routed_packets_without_configuration() {
     },
     Duration::from_secs(30),
     "the ordered body must reach D through the default policy",
+  )
+  .await;
+
+  // No intermediate consumer ran anywhere along the route.
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
+
+  for node in &nodes {
+    let _ = node.handle.command(Shutdown::new()).await;
+  }
+}
+
+/// A caller body above the wire's 32 KiB chunk bound must cross three
+/// hops byte-exact: the pump re-chunks it, every relay re-forwards the
+/// ordered slices, and the receiver reassembles the original sequence.
+/// The pattern is position-derived, so a dropped, duplicated, or
+/// reordered slice cannot survive the comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_body_above_the_chunk_bound_crosses_three_hops_byte_exact() {
+  init_tracing();
+  let (nodes, _table) = boot_linear_four(false).await;
+  settle_linear_chain(&nodes).await;
+
+  // 300 KiB in one caller chunk: ten wire slices at the 32 KiB bound.
+  let expected: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol,
+      policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet
+    .send_sync(oversized_body(expected.clone()))
+    .await
+    .unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .first()
+        .map(|(_, body)| body.as_slice() == expected.as_slice())
+        .unwrap_or(false)
+    },
+    Duration::from_secs(60),
+    "the multi-chunk body must reach D byte-exact across three hops",
   )
   .await;
 
