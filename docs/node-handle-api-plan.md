@@ -7,6 +7,12 @@ domain operation verbs on the handle (`join`/`leave`/`revoke`/`sync`/
 `shutdown`), and `watch` for event subscription. The runtime's internal
 `Control` bus, wire formats, and storage contracts are untouched.
 
+**Status:** W1, W3, and W4 are complete on the `node-handle-api` branch
+(the full quality gates and the 758-test suite pass locally). W2's
+examples work is done; its chat acceptance lane is the CI container job.
+This document deletes itself per the lifecycle rules once that lane is
+green on the merge commit.
+
 **Breaking, deliberately:** the crate is `0.0.2`, unreleased. No
 compatibility surface is kept for the command/query layer.
 
