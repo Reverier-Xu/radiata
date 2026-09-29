@@ -51,7 +51,7 @@ const SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(600);
 /// The canonical merge source. The peer port is dropped (ephemeral
 /// reconnects are aliases of one source), IPv4-mapped IPv6 collapses to
 /// its IPv4 form, so every alias of one source shares one bucket. A
-/// medium without peer addresses (a caller-registered custom transport)
+/// medium without peer addresses (a caller-registered transport provider)
 /// attributes its attempts to one shared per-medium bucket derived from
 /// the transport class binding: the configured limits still bound it,
 /// just at the coarsest attribution the medium supports.

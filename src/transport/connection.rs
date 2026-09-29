@@ -120,7 +120,7 @@ pub(crate) struct Connection {
   /// The accepted peer's socket address, carried raw for the upper
   /// layer: this transport knows nothing about admission semantics and
   /// never normalizes or interprets the address. It is `None` only when
-  /// the medium could not report a peer address (custom transports
+  /// the medium could not report a peer address (transport providers
   /// always; the kernel failing on a TCP accept); dialer-side
   /// connections carry none.
   peer_addr: Option<SocketAddr>,
@@ -604,8 +604,8 @@ pub(crate) fn plaintext_channel_binding() -> Result<[u8; CHANNEL_BINDING_LEN]> {
   class_channel_binding("tcp-plaintext:v1")
 }
 
-/// The channel-binding class constant of one caller-registered custom
-/// transport, derived over its canonical tag so proofs stay distinct per
+/// The channel-binding class constant of one caller-registered transport
+/// provider, derived over its canonical tag so proofs stay distinct per
 /// transport class.
 pub(crate) fn custom_channel_binding(tag: &str) -> Result<[u8; CHANNEL_BINDING_LEN]> {
   class_channel_binding(&format!("custom:{tag}"))

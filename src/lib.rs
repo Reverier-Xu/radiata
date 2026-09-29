@@ -87,7 +87,7 @@ pub use routing::{
   RouteNextHop, Selector,
 };
 pub use transport::{
-  CustomListener, CustomTransport, Endpoint, PageCursor, TransportName, TransportScheme,
+  CustomListener, Endpoint, PageCursor, TransportName, TransportProvider, TransportScheme,
   TransportSelector, TransportStream,
 };
 pub use view::{

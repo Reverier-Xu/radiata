@@ -4,7 +4,7 @@
 //! A registered [`Transport`] owns the listener/connection lifecycle for
 //! one addressing selector; the map merges the three built-in
 //! transports (direct TLS, WebSocket, plaintext TCP) with every
-//! caller-registered custom transport, and a dial or bind resolves its
+//! caller-registered transport provider, and a dial or bind resolves its
 //! implementation from the endpoint's
 //! [`TransportSelector`](crate::transport::TransportSelector) alone — the
 //! URL scheme for built-ins, the registered scheme name for customs.
@@ -12,9 +12,9 @@
 //! carries prelude frames, the session handshake always authenticates,
 //! and registration never bypasses either.
 //!
-//! ## Writing a custom transport
+//! ## Writing a transport provider
 //!
-//! Caller-registered transports implement [`CustomTransport`]: they own
+//! Caller-registered transports implement [`TransportProvider`]: they own
 //! one medium (an ESP-NOW radio, an 802.11 link, a serial bus, a
 //! tunneled socket) and produce ordered, reliable, complete byte
 //! streams. Core owns every wire semantic above the bytes — the frame
@@ -137,7 +137,7 @@ impl TransportTrust {
 /// second format generalizes behind this same trait.
 pub(crate) trait TransportListener: fmt::Debug + Send + Sync + 'static {
   /// The real bound endpoint (port zero resolves to the OS-assigned
-  /// port; a custom transport reports its own dialable form).
+  /// port; a transport provider reports its own dialable form).
   fn local_endpoint(&self) -> Endpoint;
 
   /// Accepts the next inbound session stream, completing the channel
@@ -164,9 +164,9 @@ pub(crate) trait TransportListener: fmt::Debug + Send + Sync + 'static {
 /// boundary, so configured attempts are observable and bounded here.
 ///
 /// This is the internal boundary: the built-in transports implement it
-/// directly, and every caller-registered [`CustomTransport`] is wrapped
-/// into it by [`CustomTransportAdapter`]. Callers never implement this
-/// trait; the public extension surface is [`CustomTransport`].
+/// directly, and every caller-registered [`TransportProvider`] is wrapped
+/// into it by [`TransportProviderAdapter`]. Callers never implement this
+/// trait; the public extension surface is [`TransportProvider`].
 pub(crate) trait Transport: fmt::Debug + Send + Sync + 'static {
   /// Binds one listener at `endpoint`.
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>>;
@@ -179,18 +179,18 @@ pub(crate) trait Transport: fmt::Debug + Send + Sync + 'static {
 }
 
 /// One ordered, reliable, complete byte stream of a session over a
-/// custom transport medium.
+/// transport-provider medium.
 ///
-/// This is the entire stream contract a custom transport must satisfy;
+/// This is the entire stream contract a transport provider must satisfy;
 /// every wire semantic above the bytes (framing, limits, keepalive, the
-/// join hint) is owned by core. See the [`CustomTransport`] module docs
+/// join hint) is owned by core. See the [`TransportProvider`] module docs
 /// for the medium requirements (ordering, completeness, frame size) and
 /// the security model.
 pub trait TransportStream:
   tokio::io::AsyncRead + tokio::io::AsyncWrite + std::fmt::Debug + Unpin + Send + 'static {
 }
 
-/// The listener half of a custom transport.
+/// The listener half of a transport provider.
 pub trait CustomListener: fmt::Debug + Send + Sync + 'static {
   /// The dialable endpoint of this listener: the canonical custom form
   /// of the transport's tag plus the medium address peers must use.
@@ -215,7 +215,7 @@ pub trait CustomListener: fmt::Debug + Send + Sync + 'static {
 /// (`ExtensionRegistry::register_transport`). Peers address the
 /// transport with the canonical custom form `<name>://<opaque-address>`,
 /// where the opaque address grammar is yours: the endpoint hands it to
-/// you verbatim through [`CustomTransport::connect`] and
+/// you verbatim through [`TransportProvider::connect`] and
 /// [`CustomListener::local_endpoint`].
 ///
 /// Core wraps every stream you produce in the crate's framing: bounded
@@ -224,7 +224,7 @@ pub trait CustomListener: fmt::Debug + Send + Sync + 'static {
 /// model are in the module docs; the short version: your stream must be
 /// ordered, reliable, and complete, and your medium contributes no
 /// confidentiality unless you add it.
-pub trait CustomTransport: fmt::Debug + Send + Sync + 'static {
+pub trait TransportProvider: fmt::Debug + Send + Sync + 'static {
   /// Binds one listener at `endpoint`. The endpoint's opaque address is
   /// yours to interpret; report the real dialable form from the
   /// listener's `local_endpoint` after a wildcard-style bind resolves
@@ -236,31 +236,31 @@ pub trait CustomTransport: fmt::Debug + Send + Sync + 'static {
   fn connect(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportStream>>>;
 }
 
-/// The adapter that wraps a caller-registered [`CustomTransport`] into
+/// The adapter that wraps a caller-registered [`TransportProvider`] into
 /// the internal [`Transport`] boundary: core framing on both sides, the
 /// per-tag channel binding, and the plaintext-class trust contract.
-pub(crate) struct CustomTransportAdapter {
-  inner: Arc<dyn CustomTransport>,
+pub(crate) struct TransportProviderAdapter {
+  inner: Arc<dyn TransportProvider>,
   name: crate::transport::TransportName,
   binding: [u8; crate::transport::connection::CHANNEL_BINDING_LEN],
 }
 
-impl fmt::Debug for CustomTransportAdapter {
+impl fmt::Debug for TransportProviderAdapter {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
-      .debug_struct("CustomTransportAdapter")
+      .debug_struct("TransportProviderAdapter")
       .field("scheme", &self.name.as_str())
       .finish_non_exhaustive()
   }
 }
 
-impl CustomTransportAdapter {
-  /// Wraps one custom transport under its registered scheme name. The
+impl TransportProviderAdapter {
+  /// Wraps one transport provider under its registered scheme name. The
   /// channel binding derives once from the canonical name, so every
   /// session over this transport salts its proofs with the same
   /// per-scheme constant.
   pub(crate) fn new(
-    inner: Arc<dyn CustomTransport>, name: crate::transport::TransportName,
+    inner: Arc<dyn TransportProvider>, name: crate::transport::TransportName,
   ) -> Result<Self> {
     let binding = crate::transport::connection::custom_channel_binding(name.as_str())?;
     Ok(Self {
@@ -271,7 +271,7 @@ impl CustomTransportAdapter {
   }
 }
 
-impl Transport for CustomTransportAdapter {
+impl Transport for TransportProviderAdapter {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
     let inner = Arc::clone(&self.inner);
     let binding = self.binding;
@@ -429,8 +429,8 @@ mod tests {
   use tokio::sync::mpsc;
 
   use super::{
-    CustomListener, CustomTransport, CustomTransportAdapter, Discovery, Transport, TransportTrust,
-    builtin_transport_tag,
+    CustomListener, Discovery, Transport, TransportProvider, TransportProviderAdapter,
+    TransportTrust, builtin_transport_tag,
   };
   use crate::{
     Endpoint, ErrorKind, ExtensionRegistry, Result, TransportName, TransportSelector,
@@ -818,7 +818,7 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }
 
-  // ---- The custom transport extension surface ----
+  // ---- The transport provider extension surface ----
 
   /// The shared bus between the in-memory transport and its listeners:
   /// the dialer hands its stream half to the bus, the bound listener
@@ -833,7 +833,7 @@ mod tests {
   #[derive(Debug)]
   struct WireTransport(Arc<WireBus>);
 
-  impl CustomTransport for WireTransport {
+  impl TransportProvider for WireTransport {
     fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn CustomListener>>> {
       let bus = Arc::clone(&self.0);
       Box::pin(
@@ -844,7 +844,7 @@ mod tests {
     fn connect(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportStream>>> {
       let bus = Arc::clone(&self.0);
       Box::pin(async move {
-        // The opaque address is the custom transport's own grammar; the
+        // The opaque address is the transport provider's own grammar; the
         // wire bus validates it is present and well-formed enough to
         // carry.
         let opaque = endpoint
@@ -858,7 +858,7 @@ mod tests {
           .tx
           .send(Box::new(server_side))
           .await
-          .map_err(|_| crate::Error::not_ready("custom transport wire"))?;
+          .map_err(|_| crate::Error::not_ready("transport provider wire"))?;
         Ok(Box::new(client_side) as Box<dyn TransportStream>)
       })
     }
@@ -881,7 +881,7 @@ mod tests {
         received
           .recv()
           .await
-          .ok_or_else(|| crate::Error::not_ready("custom transport wire"))
+          .ok_or_else(|| crate::Error::not_ready("transport provider wire"))
       })
     }
 
@@ -903,10 +903,10 @@ mod tests {
   impl TransportStream for tokio::io::DuplexStream {}
 
   #[tokio::test]
-  async fn custom_transport_loopback_carries_hint_and_class_binding() {
+  async fn transport_provider_loopback_carries_hint_and_class_binding() {
     let name = transport_name("espnow");
     let wire = test_wire();
-    let adapter = Arc::new(CustomTransportAdapter::new(Arc::new(wire), name.clone()).unwrap());
+    let adapter = Arc::new(TransportProviderAdapter::new(Arc::new(wire), name.clone()).unwrap());
     let endpoint = custom_endpoint("espnow", "aa:bb:cc:dd:ee:ff");
     assert_eq!(endpoint.opaque(), Some("aa:bb:cc:dd:ee:ff"));
 

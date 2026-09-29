@@ -2,7 +2,7 @@
 //!
 //! The WebSocket transport is message-oriented and frames through
 //! tungstenite; every other stream (direct TLS, plaintext TCP, and every
-//! caller-registered custom transport) is a bare byte stream and frames
+//! caller-registered transport provider) is a bare byte stream and frames
 //! through this module. One frame is one tag byte followed by a
 //! tag-specific payload:
 //!

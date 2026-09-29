@@ -1,7 +1,7 @@
-//! Custom-transport integration lane.
+//! Transport-provider integration lane.
 //!
 //! Exercises the public transport extension surface exactly as a caller
-//! would: one in-memory hub medium implements [`radiata::CustomTransport`]
+//! would: one in-memory hub medium implements [`radiata::TransportProvider`]
 //! (a stream type implementing [`radiata::TransportStream`] plus a
 //! listener implementing [`radiata::CustomListener`]), registers under a
 //! caller-owned scheme name, and two real nodes complete a full secure
@@ -14,8 +14,8 @@ use std::{
 };
 
 use radiata::{
-  CustomListener, CustomTransport, Endpoint, MergeCredential, NodeBuilder, NodeHandle,
-  TransportName, TransportStream,
+  CustomListener, Endpoint, MergeCredential, NodeBuilder, NodeHandle, TransportName,
+  TransportProvider, TransportStream,
 };
 use tokio::sync::mpsc;
 
@@ -99,7 +99,7 @@ impl Hub {
 #[derive(Debug)]
 struct HubTransport(Arc<Hub>);
 
-impl CustomTransport for HubTransport {
+impl TransportProvider for HubTransport {
   fn bind(
     &self, endpoint: Endpoint,
   ) -> radiata::BoxFuture<'static, radiata::Result<Box<dyn CustomListener>>> {
@@ -193,7 +193,7 @@ async fn start_node(hub: &Arc<Hub>, seed: u64) -> NodeHandle {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn custom_transport_carries_a_full_secure_merge() {
+async fn transport_provider_carries_a_full_secure_merge() {
   let hub = Arc::new(Hub::default());
   let receiver = start_node(&hub, 10_000).await;
   let joiner = start_node(&hub, 20_000).await;

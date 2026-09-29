@@ -6,8 +6,8 @@
 //! [`TransportTag`](crate::TransportTag), the endpoint's [`TransportSelector`]
 //! is the resolution key, and the extension registry is the single map from
 //! selector to implementation. Callers register custom media (an ESP-NOW radio,
-//! an 802.11 link, a serial bus) through [`crate::CustomTransport`]; the three
-//! built-ins cover the ordinary deployment space:
+//! an 802.11 link, a serial bus) through [`crate::TransportProvider`]; the
+//! three built-ins cover the ordinary deployment space:
 //!
 //! - [`tls_transport`] — direct TLS 1.3 over TCP. **The default**: the
 //!   simplest, cheapest stream; advertise `tls://` endpoints unless a
@@ -31,7 +31,7 @@
 //!   certificate from injected entropy. The certificate is memory-only, fresh
 //!   per listener, and never a node identity or trust record.
 //! - [`framing`] frames wire messages over bare byte streams (direct TLS,
-//!   plaintext TCP, custom transports) with bounded length discipline,
+//!   plaintext TCP, transport providers) with bounded length discipline,
 //!   keepalive, and the single-frame join hint; the WebSocket class frames
 //!   through tungstenite with the same bounds.
 //! - [`connection`] carries the framed wire messages of every class with
@@ -41,8 +41,9 @@
 //!   `<scheme>host[:port]` and the custom `<name>://<opaque>` forms) used to
 //!   address listeners and peers.
 //! - [`registry`] carries the open transport map: the internal
-//!   [`registry::Transport`] boundary, the public [`registry::CustomTransport`]
-//!   extension surface, and the trust intent dials carry.
+//!   [`registry::Transport`] boundary, the public
+//!   [`registry::TransportProvider`] extension surface, and the trust intent
+//!   dials carry.
 
 pub(crate) mod cert;
 pub(crate) mod connection;
@@ -59,7 +60,7 @@ pub(crate) mod ws;
 pub(crate) mod wss;
 
 pub use endpoint::{Endpoint, TransportName, TransportScheme, TransportSelector};
-pub use registry::{CustomListener, CustomTransport, TransportStream};
+pub use registry::{CustomListener, TransportProvider, TransportStream};
 
 pub use crate::paging::PageCursor;
 
