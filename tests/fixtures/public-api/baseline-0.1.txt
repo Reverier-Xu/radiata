@@ -187,27 +187,12 @@ pub radiata::TransportSelector::Custom(radiata::TransportName)
 #[non_exhaustive] pub enum radiata::TrustStatus
 pub radiata::TrustStatus::Revoked
 pub radiata::TrustStatus::Trusted
-pub struct radiata::ApplyReceiptRetention
-impl radiata::ApplyReceiptRetention
-pub fn radiata::ApplyReceiptRetention::new() -> Self
-impl radiata::Command for radiata::ApplyReceiptRetention
-pub type radiata::ApplyReceiptRetention::Output = radiata::ReceiptRetentionReport
-pub struct radiata::CleanupNode
-impl radiata::CleanupNode
-pub fn radiata::CleanupNode::new(radiata::NodeId) -> Self
-impl radiata::Command for radiata::CleanupNode
-pub type radiata::CleanupNode::Output = ()
 pub struct radiata::CommitReceipt
 impl radiata::CommitReceipt
 pub fn radiata::CommitReceipt::committed_revision(&self) -> &radiata::StoreRevision
 pub fn radiata::CommitReceipt::new(radiata::TransactionId, radiata::Digest, radiata::StoreRevision) -> Self
 pub fn radiata::CommitReceipt::operation_digest(&self) -> &radiata::Digest
 pub fn radiata::CommitReceipt::transaction(&self) -> &radiata::TransactionId
-pub struct radiata::ConnectMember
-impl radiata::ConnectMember
-pub fn radiata::ConnectMember::new(radiata::Endpoint, radiata::NodeId) -> Self
-impl radiata::Command for radiata::ConnectMember
-pub type radiata::ConnectMember::Output = radiata::NodeId
 pub struct radiata::ConnectionDegreeView
 impl radiata::ConnectionDegreeView
 pub const fn radiata::ConnectionDegreeView::sessions(&self) -> usize
@@ -218,6 +203,10 @@ impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
 pub fn radiata::CreatedKey::new(radiata::KeyHandle, radiata::PublicKey) -> Self
 pub fn radiata::CreatedKey::public_key(&self) -> &radiata::PublicKey
+pub struct radiata::Credentials
+impl radiata::Credentials
+pub async fn radiata::Credentials::issue(self) -> radiata::Result<radiata::IssuedMergeCredential>
+pub async fn radiata::Credentials::rotate(self) -> radiata::Result<radiata::IssuedMergeCredential>
 pub struct radiata::DeclareInterruptedTransactionUncommitted
 impl radiata::DeclareInterruptedTransactionUncommitted
 pub fn radiata::DeclareInterruptedTransactionUncommitted::new() -> Self
@@ -237,11 +226,6 @@ pub const fn radiata::Digest::as_bytes(&self) -> &[u8; 32]
 pub const fn radiata::Digest::from_bytes([u8; 32]) -> Self
 impl core::fmt::Debug for radiata::Digest
 pub fn radiata::Digest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::DisconnectPeer
-impl radiata::DisconnectPeer
-pub fn radiata::DisconnectPeer::new(radiata::NodeId) -> Self
-impl radiata::Command for radiata::DisconnectPeer
-pub type radiata::DisconnectPeer::Output = ()
 pub struct radiata::DiscoveryTag(_)
 impl radiata::DiscoveryTag
 pub fn radiata::DiscoveryTag::as_str(&self) -> &str
@@ -314,46 +298,6 @@ pub fn radiata::FeatureTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::f
 impl core::str::traits::FromStr for radiata::FeatureTag
 pub type radiata::FeatureTag::Err = radiata::Error
 pub fn radiata::FeatureTag::from_str(&str) -> radiata::Result<Self>
-pub struct radiata::GetConnectionDegree
-impl radiata::GetConnectionDegree
-pub fn radiata::GetConnectionDegree::new() -> Self
-impl radiata::Query for radiata::GetConnectionDegree
-pub type radiata::GetConnectionDegree::Output = radiata::ConnectionDegreeView
-pub struct radiata::GetLocalNode
-impl radiata::GetLocalNode
-pub fn radiata::GetLocalNode::new() -> Self
-impl radiata::Query for radiata::GetLocalNode
-pub type radiata::GetLocalNode::Output = radiata::LocalNodeView
-pub struct radiata::GetMember
-impl radiata::GetMember
-pub fn radiata::GetMember::new(radiata::NodeId) -> Self
-impl radiata::Query for radiata::GetMember
-pub type radiata::GetMember::Output = core::option::Option<radiata::MemberView>
-pub struct radiata::GetNodeStatus
-impl radiata::GetNodeStatus
-pub fn radiata::GetNodeStatus::new() -> Self
-impl radiata::Query for radiata::GetNodeStatus
-pub type radiata::GetNodeStatus::Output = radiata::NodeStatus
-pub struct radiata::GetObservability
-impl radiata::GetObservability
-pub fn radiata::GetObservability::new() -> Self
-impl radiata::Query for radiata::GetObservability
-pub type radiata::GetObservability::Output = radiata::ObservabilitySnapshot
-pub struct radiata::GetRecovery
-impl radiata::GetRecovery
-pub fn radiata::GetRecovery::new() -> Self
-impl radiata::Query for radiata::GetRecovery
-pub type radiata::GetRecovery::Output = radiata::RecoveryView
-pub struct radiata::GetResource
-impl radiata::GetResource
-pub fn radiata::GetResource::new(radiata::ResourceName) -> Self
-impl radiata::Query for radiata::GetResource
-pub type radiata::GetResource::Output = core::option::Option<radiata::ResourceView>
-pub struct radiata::GetRoute
-impl radiata::GetRoute
-pub fn radiata::GetRoute::new(radiata::RouteHandle) -> Self
-impl radiata::Query for radiata::GetRoute
-pub type radiata::GetRoute::Output = radiata::RouteStatusView
 pub struct radiata::IdentityReplaced
 impl radiata::IdentityReplaced
 pub fn radiata::IdentityReplaced::former_identity(&self) -> &radiata::NodeId
@@ -370,16 +314,6 @@ pub fn radiata::IncomingStream::source(&self) -> &radiata::NodeId
 pub fn radiata::IncomingStream::trace_id(&self) -> &radiata::TraceId
 impl core::fmt::Debug for radiata::IncomingStream
 pub fn radiata::IncomingStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::IssueCleanupCheckpoint
-impl radiata::IssueCleanupCheckpoint
-pub fn radiata::IssueCleanupCheckpoint::new() -> Self
-impl radiata::Command for radiata::IssueCleanupCheckpoint
-pub type radiata::IssueCleanupCheckpoint::Output = u64
-pub struct radiata::IssueMergeCredential
-impl radiata::IssueMergeCredential
-pub fn radiata::IssueMergeCredential::new() -> Self
-impl radiata::Command for radiata::IssueMergeCredential
-pub type radiata::IssueMergeCredential::Output = radiata::IssuedMergeCredential
 pub struct radiata::IssuedMergeCredential
 impl radiata::IssuedMergeCredential
 pub fn radiata::IssuedMergeCredential::credential(&self) -> &radiata::MergeCredential
@@ -440,20 +374,10 @@ impl core::fmt::Debug for radiata::LabelValue
 pub fn radiata::LabelValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::LabelValue
 pub fn radiata::LabelValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::LeaveCluster
-impl radiata::LeaveCluster
-pub fn radiata::LeaveCluster::new(radiata::ReplaceIdentityAndDeleteOldCoreMetadata) -> Self
-impl radiata::Command for radiata::LeaveCluster
-pub type radiata::LeaveCluster::Output = radiata::LeaveOutcome
 pub struct radiata::LeaveOutcome
 impl radiata::LeaveOutcome
 pub fn radiata::LeaveOutcome::former_identity(&self) -> &radiata::NodeId
 pub fn radiata::LeaveOutcome::replacement_identity(&self) -> &radiata::NodeId
-pub struct radiata::Listen
-impl radiata::Listen
-pub fn radiata::Listen::new(radiata::Endpoint) -> Self
-impl radiata::Command for radiata::Listen
-pub type radiata::Listen::Output = radiata::ListenerView
 pub struct radiata::ListenerId(_)
 impl radiata::ListenerId
 pub fn radiata::ListenerId::as_str(&self) -> &str
@@ -473,6 +397,11 @@ pub struct radiata::ListenerView
 impl radiata::ListenerView
 pub fn radiata::ListenerView::endpoint(&self) -> &radiata::Endpoint
 pub fn radiata::ListenerView::id(&self) -> &radiata::ListenerId
+pub struct radiata::Listeners
+impl radiata::Listeners
+pub async fn radiata::Listeners::create(self, radiata::Endpoint) -> radiata::Result<radiata::ListenerView>
+pub async fn radiata::Listeners::delete(self, radiata::ListenerId) -> radiata::Result<()>
+pub async fn radiata::Listeners::list(self, radiata::PageSpec) -> radiata::Result<radiata::ListenerPage>
 pub struct radiata::LocalNodeView
 impl radiata::LocalNodeView
 pub fn radiata::LocalNodeView::node_id(&self) -> &radiata::NodeId
@@ -499,6 +428,10 @@ pub fn radiata::MemberView::node_id(&self) -> &radiata::NodeId
 pub fn radiata::MemberView::owner_revision(&self) -> u64
 pub fn radiata::MemberView::public_key(&self) -> &radiata::PublicKey
 pub fn radiata::MemberView::status(&self) -> radiata::MemberStatus
+pub struct radiata::Members
+impl radiata::Members
+pub async fn radiata::Members::get(self, radiata::NodeId) -> radiata::Result<core::option::Option<radiata::MemberView>>
+pub async fn radiata::Members::list(self, radiata::PageSpec) -> radiata::Result<radiata::MemberPage>
 pub struct radiata::MergeAdmissionLimits
 impl radiata::MergeAdmissionLimits
 pub fn radiata::MergeAdmissionLimits::for_cluster(usize) -> radiata::Result<Self>
@@ -506,11 +439,6 @@ pub fn radiata::MergeAdmissionLimits::with_join_pool(self, u32, core::time::Dura
 pub fn radiata::MergeAdmissionLimits::with_member_pool(self, u32, core::time::Duration, u32, core::time::Duration) -> radiata::Result<Self>
 impl core::default::Default for radiata::MergeAdmissionLimits
 pub fn radiata::MergeAdmissionLimits::default() -> Self
-pub struct radiata::MergeCluster
-impl radiata::MergeCluster
-pub fn radiata::MergeCluster::new(radiata::Endpoint, radiata::MergeCredential) -> Self
-impl radiata::Command for radiata::MergeCluster
-pub type radiata::MergeCluster::Output = radiata::MergeView
 pub struct radiata::MergeCredential
 impl radiata::MergeCredential
 pub fn radiata::MergeCredential::expose_secret(&self) -> &str
@@ -555,12 +483,39 @@ impl core::default::Default for radiata::NodeConfig
 pub fn radiata::NodeConfig::default() -> Self
 pub struct radiata::NodeHandle
 impl radiata::NodeHandle
-pub async fn radiata::NodeHandle::command<C: radiata::Command + DispatchCommand>(&self, C) -> radiata::Result<<C as radiata::Command>::Output>
-pub fn radiata::NodeHandle::events<E: radiata::Event>(&self, radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
+pub async fn radiata::NodeHandle::apply_receipt_retention(&self) -> radiata::Result<radiata::ReceiptRetentionReport>
+pub async fn radiata::NodeHandle::cleanup(&self, radiata::NodeId) -> radiata::Result<()>
+pub async fn radiata::NodeHandle::connect(&self, radiata::Endpoint, radiata::NodeId) -> radiata::Result<radiata::NodeId>
+pub async fn radiata::NodeHandle::connection_degree(&self) -> radiata::Result<radiata::ConnectionDegreeView>
+pub fn radiata::NodeHandle::credentials(&self) -> radiata::Credentials
+pub async fn radiata::NodeHandle::disconnect(&self, radiata::NodeId) -> radiata::Result<()>
+pub async fn radiata::NodeHandle::issue_cleanup_checkpoint(&self) -> radiata::Result<u64>
+pub async fn radiata::NodeHandle::join(&self, radiata::Endpoint, radiata::MergeCredential) -> radiata::Result<radiata::MergeView>
+pub async fn radiata::NodeHandle::leave(&self, radiata::ReplaceIdentityAndDeleteOldCoreMetadata) -> radiata::Result<radiata::LeaveOutcome>
+pub fn radiata::NodeHandle::listeners(&self) -> radiata::Listeners
+pub async fn radiata::NodeHandle::local_node(&self) -> radiata::Result<radiata::LocalNodeView>
+pub fn radiata::NodeHandle::members(&self) -> radiata::Members
+pub async fn radiata::NodeHandle::metrics(&self) -> radiata::Result<radiata::ObservabilitySnapshot>
+pub async fn radiata::NodeHandle::patch_metadata(&self, u64, radiata::NodeMetadataPatch) -> radiata::Result<radiata::MemberView>
+pub async fn radiata::NodeHandle::purge_revocation(&self, radiata::NodeId) -> radiata::Result<()>
+pub async fn radiata::NodeHandle::recovery(&self) -> radiata::Result<radiata::RecoveryView>
+pub async fn radiata::NodeHandle::resolve_frozen_journal(&self, radiata::DeclareInterruptedTransactionUncommitted) -> radiata::Result<()>
+pub fn radiata::NodeHandle::resources(&self) -> radiata::Resources
+pub async fn radiata::NodeHandle::revoke(&self, radiata::NodeId, radiata::PublicKey) -> radiata::Result<radiata::RevokeOutcome>
+pub fn radiata::NodeHandle::routes(&self) -> radiata::Routes
+pub fn radiata::NodeHandle::send<S>(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, S) -> radiata::BoxFuture<'static, radiata::Result<radiata::DeliveryAck>> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send + 'static
+pub fn radiata::NodeHandle::sessions(&self) -> radiata::Sessions
+pub async fn radiata::NodeHandle::shutdown(&self) -> radiata::Result<radiata::ShutdownOutcome>
+pub async fn radiata::NodeHandle::start_recovery(&self) -> radiata::Result<radiata::RecoveryView>
+pub fn radiata::NodeHandle::status(&self) -> radiata::NodeStatus
+pub fn radiata::NodeHandle::sync(&self) -> impl core::future::future::Future<Output = radiata::Result<()>> + core::marker::Send
+pub fn radiata::NodeHandle::topology(&self) -> radiata::Topology
+pub fn radiata::NodeHandle::trust(&self) -> radiata::Trust
+pub async fn radiata::NodeHandle::wait_for_shutdown(&self) -> radiata::Result<radiata::ShutdownReason>
+pub fn radiata::NodeHandle::watch<E: radiata::Event>(&self, radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
+impl radiata::NodeHandle
 pub fn radiata::NodeHandle::member_revision(&self) -> radiata::MemberRevision
 pub fn radiata::NodeHandle::open_stream(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
-pub async fn radiata::NodeHandle::query<Q: radiata::Query + DispatchQuery>(&self, Q) -> radiata::Result<<Q as radiata::Query>::Output>
-pub fn radiata::NodeHandle::run_sync_round(&self) -> impl core::future::future::Future<Output = radiata::Result<()>> + core::marker::Send
 pub struct radiata::NodeId(_)
 impl radiata::NodeId
 pub fn radiata::NodeId::as_str(&self) -> &str
@@ -612,40 +567,10 @@ impl radiata::PageCursor
 pub fn radiata::PageCursor::as_bytes(&self) -> &[u8]
 pub fn radiata::PageCursor::from_provider_bytes(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
 pub fn radiata::PageCursor::new(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
-pub struct radiata::PageListeners
-impl radiata::PageListeners
-pub fn radiata::PageListeners::new(radiata::PageSpec) -> Self
-impl radiata::Query for radiata::PageListeners
-pub type radiata::PageListeners::Output = radiata::ListenerPage
-pub struct radiata::PageMembers
-impl radiata::PageMembers
-pub fn radiata::PageMembers::new(radiata::PageSpec) -> Self
-impl radiata::Query for radiata::PageMembers
-pub type radiata::PageMembers::Output = radiata::MemberPage
-pub struct radiata::PageResources
-impl radiata::PageResources
-pub fn radiata::PageResources::new(radiata::PageSpec) -> Self
-impl radiata::Query for radiata::PageResources
-pub type radiata::PageResources::Output = radiata::ResourcePage
-pub struct radiata::PageSessions
-impl radiata::PageSessions
-pub fn radiata::PageSessions::new(radiata::PageSpec) -> Self
-impl radiata::Query for radiata::PageSessions
-pub type radiata::PageSessions::Output = radiata::SessionPage
 pub struct radiata::PageSpec
 impl radiata::PageSpec
 pub fn radiata::PageSpec::after(radiata::PageCursor, usize) -> radiata::Result<Self>
 pub fn radiata::PageSpec::first(usize) -> radiata::Result<Self>
-pub struct radiata::PageTopology
-impl radiata::PageTopology
-pub fn radiata::PageTopology::new(radiata::PageSpec) -> Self
-impl radiata::Query for radiata::PageTopology
-pub type radiata::PageTopology::Output = radiata::TopologyPage
-pub struct radiata::PageTrust
-impl radiata::PageTrust
-pub fn radiata::PageTrust::new(radiata::PageSpec) -> Self
-impl radiata::Query for radiata::PageTrust
-pub type radiata::PageTrust::Output = radiata::TrustPage
 pub struct radiata::ProtocolDefinition
 impl radiata::ProtocolDefinition
 pub fn radiata::ProtocolDefinition::new(radiata::ProtocolTag, radiata::FeatureTag) -> Self
@@ -667,17 +592,6 @@ pub const fn radiata::PublicKey::as_bytes(&self) -> &[u8; 32]
 pub const fn radiata::PublicKey::from_bytes([u8; 32]) -> Self
 impl core::fmt::Debug for radiata::PublicKey
 pub fn radiata::PublicKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::PurgeRevocation
-impl radiata::PurgeRevocation
-pub fn radiata::PurgeRevocation::new(radiata::NodeId) -> Self
-impl radiata::Command for radiata::PurgeRevocation
-pub type radiata::PurgeRevocation::Output = ()
-pub struct radiata::PutResource
-impl radiata::PutResource
-pub fn radiata::PutResource::new(radiata::ResourceWrite) -> radiata::Result<Self>
-pub fn radiata::PutResource::with_expected(radiata::ResourceWrite, radiata::ResourceVersion) -> radiata::Result<Self>
-impl radiata::Command for radiata::PutResource
-pub type radiata::PutResource::Output = radiata::ResourceMutationView
 pub struct radiata::QualifiedTag
 impl radiata::QualifiedTag
 pub fn radiata::QualifiedTag::as_str(&self) -> &str
@@ -709,19 +623,9 @@ impl radiata::RecoveryView
 pub const fn radiata::RecoveryView::is_connected(&self) -> bool
 pub const fn radiata::RecoveryView::next_attempt_at(&self) -> core::option::Option<std::time::SystemTime>
 pub const fn radiata::RecoveryView::unreachable_members(&self) -> usize
-pub struct radiata::RemoveResource
-impl radiata::RemoveResource
-pub fn radiata::RemoveResource::new(radiata::ResourceName, radiata::ResourceVersion) -> Self
-impl radiata::Command for radiata::RemoveResource
-pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
 pub struct radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 impl radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 pub fn radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new() -> Self
-pub struct radiata::ResolveFrozenJournal
-impl radiata::ResolveFrozenJournal
-pub fn radiata::ResolveFrozenJournal::new(radiata::DeclareInterruptedTransactionUncommitted) -> Self
-impl radiata::Command for radiata::ResolveFrozenJournal
-pub type radiata::ResolveFrozenJournal::Output = ()
 pub struct radiata::ResourceChanged
 impl radiata::ResourceChanged
 pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
@@ -782,20 +686,18 @@ pub fn radiata::ResourceView::version(&self) -> &radiata::ResourceVersion
 pub struct radiata::ResourceWrite
 impl radiata::ResourceWrite
 pub fn radiata::ResourceWrite::new(radiata::ResourceName, radiata::ResourceLabels) -> Self
-pub struct radiata::RevokeNode
-impl radiata::RevokeNode
-pub fn radiata::RevokeNode::new(radiata::NodeId, radiata::PublicKey) -> Self
-impl radiata::Command for radiata::RevokeNode
-pub type radiata::RevokeNode::Output = radiata::RevokeOutcome
+pub struct radiata::Resources
+impl radiata::Resources
+pub async fn radiata::Resources::delete(self, radiata::ResourceName, radiata::ResourceVersion) -> radiata::Result<radiata::ResourceMutationView>
+pub async fn radiata::Resources::get(self, radiata::ResourceName) -> radiata::Result<core::option::Option<radiata::ResourceView>>
+pub async fn radiata::Resources::list(self, radiata::PageSpec) -> radiata::Result<radiata::ResourcePage>
+pub async fn radiata::Resources::put(self, radiata::ResourceWrite) -> radiata::Result<radiata::ResourceMutationView>
+pub async fn radiata::Resources::put_expected(self, radiata::ResourceWrite, radiata::ResourceVersion) -> radiata::Result<radiata::ResourceMutationView>
+pub async fn radiata::Resources::select(self, radiata::Selector, radiata::PageSpec) -> radiata::Result<radiata::ResourcePage>
 pub struct radiata::RevokeOutcome
 impl radiata::RevokeOutcome
 pub fn radiata::RevokeOutcome::subject(&self) -> &radiata::NodeId
 pub fn radiata::RevokeOutcome::was_already_revoked(&self) -> bool
-pub struct radiata::RotateMergeCredential
-impl radiata::RotateMergeCredential
-pub fn radiata::RotateMergeCredential::new() -> Self
-impl radiata::Command for radiata::RotateMergeCredential
-pub type radiata::RotateMergeCredential::Output = radiata::IssuedMergeCredential
 pub struct radiata::RouteChanged
 impl radiata::RouteChanged
 pub fn radiata::RouteChanged::handle(&self) -> &radiata::RouteHandle
@@ -818,16 +720,9 @@ pub fn radiata::RouteStatusView::selected_node(&self) -> core::option::Option<&r
 pub fn radiata::RouteStatusView::state(&self) -> &radiata::RouteState
 pub fn radiata::RouteStatusView::trace_id(&self) -> &radiata::TraceId
 pub fn radiata::RouteStatusView::updated_at(&self) -> std::time::SystemTime
-pub struct radiata::RunSyncRound
-impl radiata::RunSyncRound
-pub fn radiata::RunSyncRound::new() -> Self
-impl radiata::Command for radiata::RunSyncRound
-pub type radiata::RunSyncRound::Output = ()
-pub struct radiata::SelectResources
-impl radiata::SelectResources
-pub fn radiata::SelectResources::new(radiata::Selector, radiata::PageSpec) -> Self
-impl radiata::Query for radiata::SelectResources
-pub type radiata::SelectResources::Output = radiata::ResourcePage
+pub struct radiata::Routes
+impl radiata::Routes
+pub fn radiata::Routes::get(self, &radiata::RouteHandle) -> radiata::Result<radiata::RouteStatusView>
 pub struct radiata::Selector
 impl radiata::Selector
 pub fn radiata::Selector::as_str(&self) -> &str
@@ -864,11 +759,9 @@ pub fn radiata::SessionView::generation(&self) -> u64
 pub fn radiata::SessionView::id(&self) -> &radiata::SessionId
 pub fn radiata::SessionView::peer(&self) -> &radiata::NodeId
 pub fn radiata::SessionView::selected_features(&self) -> &[radiata::SessionFeatureView]
-pub struct radiata::Shutdown
-impl radiata::Shutdown
-pub fn radiata::Shutdown::new() -> Self
-impl radiata::Command for radiata::Shutdown
-pub type radiata::Shutdown::Output = radiata::ShutdownOutcome
+pub struct radiata::Sessions
+impl radiata::Sessions
+pub async fn radiata::Sessions::list(self, radiata::PageSpec) -> radiata::Result<radiata::SessionPage>
 pub struct radiata::ShutdownOutcome
 impl radiata::ShutdownOutcome
 pub fn radiata::ShutdownOutcome::reason(&self) -> &radiata::ShutdownReason
@@ -878,16 +771,6 @@ pub const fn radiata::Signature::as_bytes(&self) -> &[u8; 64]
 pub const fn radiata::Signature::from_bytes([u8; 64]) -> Self
 impl core::fmt::Debug for radiata::Signature
 pub fn radiata::Signature::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::StartRecovery
-impl radiata::StartRecovery
-pub fn radiata::StartRecovery::new() -> Self
-impl radiata::Command for radiata::StartRecovery
-pub type radiata::StartRecovery::Output = radiata::RecoveryView
-pub struct radiata::StopListener
-impl radiata::StopListener
-pub fn radiata::StopListener::new(radiata::ListenerId) -> Self
-impl radiata::Command for radiata::StopListener
-pub type radiata::StopListener::Output = ()
 pub struct radiata::StoreCapabilities
 impl radiata::StoreCapabilities
 pub fn radiata::StoreCapabilities::conditional_batch(self, bool) -> Self
@@ -959,6 +842,9 @@ pub fn radiata::StreamPolicy::load_balancing_policy(&self) -> core::option::Opti
 pub fn radiata::StreamPolicy::max_hops(&self) -> u32
 pub fn radiata::StreamPolicy::new(radiata::RoutingPolicy, u32) -> radiata::Result<Self>
 pub fn radiata::StreamPolicy::routing_policy(&self) -> &radiata::RoutingPolicy
+pub struct radiata::Topology
+impl radiata::Topology
+pub async fn radiata::Topology::list(self, radiata::PageSpec) -> radiata::Result<radiata::TopologyPage>
 pub struct radiata::TopologyEdgeView
 impl radiata::TopologyEdgeView
 pub fn radiata::TopologyEdgeView::connected(&self) -> bool
@@ -1019,6 +905,9 @@ pub fn radiata::TransportTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core:
 impl core::str::traits::FromStr for radiata::TransportTag
 pub type radiata::TransportTag::Err = radiata::Error
 pub fn radiata::TransportTag::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::Trust
+impl radiata::Trust
+pub async fn radiata::Trust::list(self, radiata::PageSpec) -> radiata::Result<radiata::TrustPage>
 pub struct radiata::TrustPage
 impl radiata::TrustPage
 pub fn radiata::TrustPage::items(&self) -> &[radiata::TrustedIdentityView]
@@ -1028,60 +917,8 @@ impl radiata::TrustedIdentityView
 pub fn radiata::TrustedIdentityView::node_id(&self) -> &radiata::NodeId
 pub fn radiata::TrustedIdentityView::public_key(&self) -> &radiata::PublicKey
 pub const fn radiata::TrustedIdentityView::status(&self) -> radiata::TrustStatus
-pub struct radiata::UpdateNodeMetadata
-impl radiata::UpdateNodeMetadata
-pub fn radiata::UpdateNodeMetadata::new(u64, radiata::NodeMetadataPatch) -> Self
-impl radiata::Command for radiata::UpdateNodeMetadata
-pub type radiata::UpdateNodeMetadata::Output = radiata::MemberView
-pub struct radiata::WaitForShutdown
-impl radiata::WaitForShutdown
-pub fn radiata::WaitForShutdown::new() -> Self
-impl radiata::Query for radiata::WaitForShutdown
-pub type radiata::WaitForShutdown::Output = radiata::ShutdownReason
 pub trait radiata::CandidateNodeReader: radiata::routing::private::Sealed + core::fmt::Debug + core::marker::Send + core::marker::Sync
 pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, &'a radiata::Selector, core::option::Option<radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
-pub trait radiata::Command: radiata::operation::private::Sealed + core::marker::Send + 'static
-pub type radiata::Command::Output: core::marker::Send + 'static
-impl radiata::Command for radiata::ApplyReceiptRetention
-pub type radiata::ApplyReceiptRetention::Output = radiata::ReceiptRetentionReport
-impl radiata::Command for radiata::CleanupNode
-pub type radiata::CleanupNode::Output = ()
-impl radiata::Command for radiata::ConnectMember
-pub type radiata::ConnectMember::Output = radiata::NodeId
-impl radiata::Command for radiata::DisconnectPeer
-pub type radiata::DisconnectPeer::Output = ()
-impl radiata::Command for radiata::IssueCleanupCheckpoint
-pub type radiata::IssueCleanupCheckpoint::Output = u64
-impl radiata::Command for radiata::IssueMergeCredential
-pub type radiata::IssueMergeCredential::Output = radiata::IssuedMergeCredential
-impl radiata::Command for radiata::LeaveCluster
-pub type radiata::LeaveCluster::Output = radiata::LeaveOutcome
-impl radiata::Command for radiata::Listen
-pub type radiata::Listen::Output = radiata::ListenerView
-impl radiata::Command for radiata::MergeCluster
-pub type radiata::MergeCluster::Output = radiata::MergeView
-impl radiata::Command for radiata::PurgeRevocation
-pub type radiata::PurgeRevocation::Output = ()
-impl radiata::Command for radiata::PutResource
-pub type radiata::PutResource::Output = radiata::ResourceMutationView
-impl radiata::Command for radiata::RemoveResource
-pub type radiata::RemoveResource::Output = radiata::ResourceMutationView
-impl radiata::Command for radiata::ResolveFrozenJournal
-pub type radiata::ResolveFrozenJournal::Output = ()
-impl radiata::Command for radiata::RevokeNode
-pub type radiata::RevokeNode::Output = radiata::RevokeOutcome
-impl radiata::Command for radiata::RotateMergeCredential
-pub type radiata::RotateMergeCredential::Output = radiata::IssuedMergeCredential
-impl radiata::Command for radiata::RunSyncRound
-pub type radiata::RunSyncRound::Output = ()
-impl radiata::Command for radiata::Shutdown
-pub type radiata::Shutdown::Output = radiata::ShutdownOutcome
-impl radiata::Command for radiata::StartRecovery
-pub type radiata::StartRecovery::Output = radiata::RecoveryView
-impl radiata::Command for radiata::StopListener
-pub type radiata::StopListener::Output = ()
-impl radiata::Command for radiata::UpdateNodeMetadata
-pub type radiata::UpdateNodeMetadata::Output = radiata::MemberView
 pub trait radiata::CustomListener: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::CustomListener::accept(&self) -> radiata::BoxFuture<'_, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
 pub fn radiata::CustomListener::close(&self) -> radiata::BoxFuture<'_, radiata::Result<()>>
@@ -1101,40 +938,6 @@ pub trait radiata::LoadBalancingPolicy: core::fmt::Debug + core::marker::Send + 
 pub fn radiata::LoadBalancingPolicy::select<'a>(&'a self, &'a radiata::Selector, &'a dyn radiata::CandidateNodeReader) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub trait radiata::PacketConsumer: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::PacketConsumer::accept<'a>(&'a self, radiata::IncomingStream) -> radiata::BoxFuture<'a, radiata::Result<()>>
-pub trait radiata::Query: radiata::operation::private::Sealed + core::marker::Send + 'static
-pub type radiata::Query::Output: core::marker::Send + 'static
-impl radiata::Query for radiata::GetConnectionDegree
-pub type radiata::GetConnectionDegree::Output = radiata::ConnectionDegreeView
-impl radiata::Query for radiata::GetLocalNode
-pub type radiata::GetLocalNode::Output = radiata::LocalNodeView
-impl radiata::Query for radiata::GetMember
-pub type radiata::GetMember::Output = core::option::Option<radiata::MemberView>
-impl radiata::Query for radiata::GetNodeStatus
-pub type radiata::GetNodeStatus::Output = radiata::NodeStatus
-impl radiata::Query for radiata::GetObservability
-pub type radiata::GetObservability::Output = radiata::ObservabilitySnapshot
-impl radiata::Query for radiata::GetRecovery
-pub type radiata::GetRecovery::Output = radiata::RecoveryView
-impl radiata::Query for radiata::GetResource
-pub type radiata::GetResource::Output = core::option::Option<radiata::ResourceView>
-impl radiata::Query for radiata::GetRoute
-pub type radiata::GetRoute::Output = radiata::RouteStatusView
-impl radiata::Query for radiata::PageListeners
-pub type radiata::PageListeners::Output = radiata::ListenerPage
-impl radiata::Query for radiata::PageMembers
-pub type radiata::PageMembers::Output = radiata::MemberPage
-impl radiata::Query for radiata::PageResources
-pub type radiata::PageResources::Output = radiata::ResourcePage
-impl radiata::Query for radiata::PageSessions
-pub type radiata::PageSessions::Output = radiata::SessionPage
-impl radiata::Query for radiata::PageTopology
-pub type radiata::PageTopology::Output = radiata::TopologyPage
-impl radiata::Query for radiata::PageTrust
-pub type radiata::PageTrust::Output = radiata::TrustPage
-impl radiata::Query for radiata::SelectResources
-pub type radiata::SelectResources::Output = radiata::ResourcePage
-impl radiata::Query for radiata::WaitForShutdown
-pub type radiata::WaitForShutdown::Output = radiata::ShutdownReason
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 impl radiata::RouteNextHop for radiata::DefaultNextHop
