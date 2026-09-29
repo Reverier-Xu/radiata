@@ -33,8 +33,8 @@ evidence lands in the commit history.
   replaced by resource-scoped accessors (`members()`, `resources()`, …
   with `get`/`list`/`put`/`delete`) plus domain operation verbs
   (`join`, `leave`, `revoke`, `sync`, `shutdown`, `watch`, `send`).
-  Evidence and migration plan:
-  [`node-handle-api-plan.md`](node-handle-api-plan.md).
+  Landed 2026-09-29 (PR #54, rebase history with the full plan; the
+  chat acceptance lane green on the merge commit closed the cycle).
 
 ## Landed in the connection-degree cycle (2026-09-27, no action)
 
