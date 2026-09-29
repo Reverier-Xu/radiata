@@ -191,7 +191,7 @@ pub trait TransportStream:
 }
 
 /// The listener half of a transport provider.
-pub trait CustomListener: fmt::Debug + Send + Sync + 'static {
+pub trait ProviderListener: fmt::Debug + Send + Sync + 'static {
   /// The dialable endpoint of this listener: the canonical custom form
   /// of the transport's tag plus the medium address peers must use.
   /// Report the real address after a wildcard-style bind resolves it.
@@ -216,7 +216,7 @@ pub trait CustomListener: fmt::Debug + Send + Sync + 'static {
 /// transport with the canonical custom form `<name>://<opaque-address>`,
 /// where the opaque address grammar is yours: the endpoint hands it to
 /// you verbatim through [`TransportProvider::connect`] and
-/// [`CustomListener::local_endpoint`].
+/// [`ProviderListener::local_endpoint`].
 ///
 /// Core wraps every stream you produce in the crate's framing: bounded
 /// length-prefixed messages, keepalive, and the join hint all work over
@@ -229,7 +229,7 @@ pub trait TransportProvider: fmt::Debug + Send + Sync + 'static {
   /// yours to interpret; report the real dialable form from the
   /// listener's `local_endpoint` after a wildcard-style bind resolves
   /// it.
-  fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn CustomListener>>>;
+  fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn ProviderListener>>>;
 
   /// Connects to `endpoint`. The endpoint's opaque address is yours to
   /// interpret; return the established stream, ready to carry frames.
@@ -277,7 +277,7 @@ impl Transport for TransportProviderAdapter {
     let binding = self.binding;
     Box::pin(async move {
       let listener = inner.bind(endpoint).await?;
-      Ok(Box::new(CustomListenerAdapter {
+      Ok(Box::new(ProviderListenerAdapter {
         inner: listener,
         binding,
       }) as Box<dyn TransportListener>)
@@ -312,20 +312,20 @@ impl Transport for TransportProviderAdapter {
 
 /// The listener adapter: publishes the join hint over the core framing
 /// layer and hands the session driver a framed [`Connection`].
-struct CustomListenerAdapter {
-  inner: Box<dyn CustomListener>,
+struct ProviderListenerAdapter {
+  inner: Box<dyn ProviderListener>,
   binding: [u8; crate::transport::connection::CHANNEL_BINDING_LEN],
 }
 
-impl fmt::Debug for CustomListenerAdapter {
+impl fmt::Debug for ProviderListenerAdapter {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
-      .debug_struct("CustomListenerAdapter")
+      .debug_struct("ProviderListenerAdapter")
       .finish_non_exhaustive()
   }
 }
 
-impl TransportListener for CustomListenerAdapter {
+impl TransportListener for ProviderListenerAdapter {
   fn local_endpoint(&self) -> Endpoint {
     self.inner.local_endpoint()
   }
@@ -429,7 +429,7 @@ mod tests {
   use tokio::sync::mpsc;
 
   use super::{
-    CustomListener, Discovery, Transport, TransportProvider, TransportProviderAdapter,
+    Discovery, ProviderListener, Transport, TransportProvider, TransportProviderAdapter,
     TransportTrust, builtin_transport_tag,
   };
   use crate::{
@@ -834,10 +834,10 @@ mod tests {
   struct WireTransport(Arc<WireBus>);
 
   impl TransportProvider for WireTransport {
-    fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn CustomListener>>> {
+    fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn ProviderListener>>> {
       let bus = Arc::clone(&self.0);
       Box::pin(
-        async move { Ok(Box::new(WireListener { endpoint, bus }) as Box<dyn CustomListener>) },
+        async move { Ok(Box::new(WireListener { endpoint, bus }) as Box<dyn ProviderListener>) },
       )
     }
 
@@ -870,7 +870,7 @@ mod tests {
     bus: Arc<WireBus>,
   }
 
-  impl CustomListener for WireListener {
+  impl ProviderListener for WireListener {
     fn local_endpoint(&self) -> Endpoint {
       self.endpoint.clone()
     }

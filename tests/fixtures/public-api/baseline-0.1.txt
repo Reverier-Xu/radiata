@@ -919,10 +919,6 @@ pub fn radiata::TrustedIdentityView::public_key(&self) -> &radiata::PublicKey
 pub const fn radiata::TrustedIdentityView::status(&self) -> radiata::TrustStatus
 pub trait radiata::CandidateNodeReader: radiata::routing::private::Sealed + core::fmt::Debug + core::marker::Send + core::marker::Sync
 pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, &'a radiata::Selector, core::option::Option<radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
-pub trait radiata::CustomListener: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::CustomListener::accept(&self) -> radiata::BoxFuture<'_, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
-pub fn radiata::CustomListener::close(&self) -> radiata::BoxFuture<'_, radiata::Result<()>>
-pub fn radiata::CustomListener::local_endpoint(&self) -> radiata::Endpoint
 pub trait radiata::Event: radiata::operation::private::Sealed + core::clone::Clone + core::marker::Send + core::marker::Sync + 'static
 impl radiata::Event for radiata::IdentityReplaced
 impl radiata::Event for radiata::MemberChanged
@@ -935,12 +931,16 @@ pub trait radiata::LoadBalancingPolicy: core::fmt::Debug + core::marker::Send + 
 pub fn radiata::LoadBalancingPolicy::select<'a>(&'a self, &'a radiata::Selector, &'a dyn radiata::CandidateNodeReader) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub trait radiata::PacketConsumer: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::PacketConsumer::accept<'a>(&'a self, radiata::IncomingStream) -> radiata::BoxFuture<'a, radiata::Result<()>>
+pub trait radiata::ProviderListener: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
+pub fn radiata::ProviderListener::accept(&self) -> radiata::BoxFuture<'_, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
+pub fn radiata::ProviderListener::close(&self) -> radiata::BoxFuture<'_, radiata::Result<()>>
+pub fn radiata::ProviderListener::local_endpoint(&self) -> radiata::Endpoint
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 impl radiata::RouteNextHop for radiata::DefaultNextHop
 pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub trait radiata::TransportProvider: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::TransportProvider::bind(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::CustomListener>>>
+pub fn radiata::TransportProvider::bind(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::ProviderListener>>>
 pub fn radiata::TransportProvider::connect(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
 pub trait radiata::TransportStream: tokio::io::async_read::AsyncRead + tokio::io::async_write::AsyncWrite + core::fmt::Debug + core::marker::Unpin + core::marker::Send + 'static
 pub fn radiata::store_scan_stream(alloc::boxed::Box<(dyn radiata::extension::StoreScan + '_)>) -> futures_core::stream::BoxStream<'_, radiata::Result<radiata::StoreEntry>>
