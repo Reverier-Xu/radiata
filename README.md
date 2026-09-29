@@ -91,7 +91,7 @@ operation verbs through the `NodeHandle` afterward.
 ### Custom transports
 
 Beyond the three built-ins, a caller can register its own medium — an ESP-NOW radio, an 802.11
-link, a serial bus — by implementing `CustomTransport` (one ordered, reliable byte stream per
+link, a serial bus — by implementing `TransportProvider` (one ordered, reliable byte stream per
 session) and registering an addressing scheme for it:
 
 ```rust,ignore

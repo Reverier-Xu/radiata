@@ -4,7 +4,7 @@
 //! to the [`PacketConsumer`] that receives admitted incoming streams for
 //! that protocol tag, alongside caller registration of feature
 //! definitions, load-balancing policies, and next-hop routing policies,
-//! and caller registration of custom transports. The runtime seeds the
+//! and caller registration of transport providers. The runtime seeds the
 //! built-in transports and core protocols at startup through the same
 //! registry: it is the single map from endpoint selector to transport.
 
@@ -19,7 +19,7 @@ use crate::{
   api::BoxFuture,
   transport::{
     TransportSelector,
-    registry::{CustomTransport, CustomTransportAdapter, Transport, builtin_transport_tag},
+    registry::{Transport, TransportProvider, TransportProviderAdapter, builtin_transport_tag},
   },
 };
 
@@ -69,7 +69,7 @@ pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,
   protocols: std::sync::Mutex<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
   transports: BTreeMap<TransportTag, Arc<dyn Transport>>,
-  /// The caller-registered custom transports, keyed by the scheme name
+  /// The caller-registered transport providers, keyed by the scheme name
   /// (protocol prefix) each one owns.
   schemes: BTreeMap<crate::transport::TransportName, Arc<dyn Transport>>,
   #[cfg(test)]
@@ -144,9 +144,9 @@ impl ExtensionRegistry {
   /// identically, and a mismatch fails at the session handshake's
   /// identity proofs rather than silently.
   pub fn register_transport(
-    &mut self, name: crate::transport::TransportName, transport: Arc<dyn CustomTransport>,
+    &mut self, name: crate::transport::TransportName, transport: Arc<dyn TransportProvider>,
   ) -> Result<&mut Self> {
-    let adapter = Arc::new(CustomTransportAdapter::new(
+    let adapter = Arc::new(TransportProviderAdapter::new(
       Arc::clone(&transport),
       name.clone(),
     )?);
@@ -165,7 +165,7 @@ impl ExtensionRegistry {
   }
 
   /// Resolves one endpoint's transport selector through the map: the
-  /// built-in transports and every caller-registered custom transport
+  /// built-in transports and every caller-registered transport provider
   /// merge into one resolution namespace, and a selector that resolves
   /// to nothing fails typed here — at dial or listen time, never at
   /// parse time (endpoint parsing is purely syntactic and

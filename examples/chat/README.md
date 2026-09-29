@@ -64,7 +64,7 @@ endpoint accepts the same four schemes:
 
 The `unix://` scheme is a custom transport registered in
 `src/unix_transport.rs` — the complete caller-side recipe for
-`radiata::CustomTransport`. The scheme name is caller-owned; the opaque
+`radiata::TransportProvider`. The scheme name is caller-owned; the opaque
 remainder is the socket path, interpreted by that module alone. The
 channel is plaintext-class: socket file permissions are the
 confidentiality boundary, and the session handshake authenticates every

@@ -2,7 +2,7 @@
 //! registry: a same-host IPC medium the built-ins do not cover.
 //!
 //! This module is the complete caller-side recipe for a custom
-//! transport. It implements `radiata::CustomTransport` (the dial/bind
+//! transport. It implements `radiata::TransportProvider` (the dial/bind
 //! surface), `radiata::CustomListener` (the inbound surface), and
 //! `radiata::TransportStream` (the byte-stream contract) over
 //! `tokio::net::UnixListener`/`UnixStream`, and registers under the
@@ -23,7 +23,7 @@
 use std::{os::unix::fs::FileTypeExt, path::PathBuf};
 
 use radiata::{
-  BoxFuture, CustomListener, CustomTransport, Endpoint, Error, Result, TransportStream,
+  BoxFuture, CustomListener, Endpoint, Error, Result, TransportProvider, TransportStream,
 };
 
 /// The scheme name this transport registers under. Peers dial
@@ -47,7 +47,7 @@ fn socket_path(endpoint: &Endpoint) -> Result<PathBuf> {
 /// The stream half: one established Unix socket connection. The newtype
 /// exists because `TransportStream` is a foreign trait over a foreign
 /// type; forwarding keeps the kernel's ordering and reliability
-/// guarantees intact — the entire stream contract a custom transport
+/// guarantees intact — the entire stream contract a transport provider
 /// must satisfy.
 #[derive(Debug)]
 struct IpcStream(tokio::net::UnixStream);
@@ -88,7 +88,7 @@ impl tokio::io::AsyncWrite for IpcStream {
 #[derive(Debug, Default)]
 pub struct UnixTransport;
 
-impl CustomTransport for UnixTransport {
+impl TransportProvider for UnixTransport {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn CustomListener>>> {
     Box::pin(async move {
       let path = socket_path(&endpoint)?;

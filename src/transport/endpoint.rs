@@ -181,14 +181,14 @@ impl fmt::Display for TransportScheme {
 /// bind looks up in the extension registry.
 ///
 /// The registry is the single transport map: the built-in transports and
-/// every caller-registered custom transport merge into one namespace,
+/// every caller-registered transport provider merge into one namespace,
 /// and a selector that resolves to nothing fails typed at dial or
 /// listen time.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum TransportSelector {
   /// One of the built-in transports, selected by URL scheme.
   Builtin(TransportScheme),
-  /// A caller-registered custom transport, selected by the scheme name
+  /// A caller-registered transport provider, selected by the scheme name
   /// the caller registered for it.
   Custom(TransportName),
 }
@@ -690,7 +690,7 @@ mod tests {
 
     let selector = endpoint.selector();
     let TransportSelector::Custom(name) = selector else {
-      panic!("the custom form selects a custom transport");
+      panic!("the custom form selects a transport provider");
     };
     assert_eq!(name.as_str(), ESPNOW_NAME);
     assert_eq!(name, TransportName::parse(ESPNOW_NAME).unwrap());

@@ -9,7 +9,7 @@
 //! The four transports in play: the built-in direct `tls://`, the
 //! WebSocket `wss://`, the plaintext `tcp://`, and a test-owned
 //! `unix://` custom transport registered through the public
-//! [`radiata::CustomTransport`] surface (a Unix domain socket medium,
+//! [`radiata::TransportProvider`] surface (a Unix domain socket medium,
 //! the same recipe the chat example ships). Every node listens on all
 //! four, so every member advertises one dialable endpoint per scheme,
 //! and the recovery plane's first-endpoint dials themselves cross
@@ -40,10 +40,10 @@ use std::{
 };
 
 use radiata::{
-  BoxFuture, CustomListener, CustomTransport, Endpoint, Error, FeatureTag, MemberStatus,
-  MergeCredential, NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer, PageSpec,
-  ProtocolDefinition, ProtocolTag, Result, RoutingPolicy, ShutdownReason, StreamMetadata,
-  StreamPolicy, StreamTarget, TransportName, TransportStream,
+  BoxFuture, CustomListener, Endpoint, Error, FeatureTag, MemberStatus, MergeCredential,
+  NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer, PageSpec, ProtocolDefinition,
+  ProtocolTag, Result, RoutingPolicy, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget,
+  TransportName, TransportProvider, TransportStream,
 };
 mod common;
 
@@ -105,7 +105,7 @@ impl Chaos {
 
 // ---- The test-owned unix:// transport -------------------------------------
 //
-// A Unix domain socket medium over the public custom-transport surface.
+// A Unix domain socket medium over the public transport-provider surface.
 // The kernel routes by socket path, so the transport itself is
 // stateless; the listener owns its path, wakes a pending accept on
 // close, and unlinks the socket on drop so a restart rebinds cleanly.
@@ -155,11 +155,11 @@ impl tokio::io::AsyncWrite for UnixStream {
   }
 }
 
-/// The stateless custom transport: bind and connect by socket path.
+/// The stateless transport provider: bind and connect by socket path.
 #[derive(Debug, Default)]
 struct UnixTransport;
 
-impl CustomTransport for UnixTransport {
+impl TransportProvider for UnixTransport {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn CustomListener>>> {
     Box::pin(async move {
       let path = socket_path(&endpoint)?;
