@@ -60,7 +60,7 @@ pub(crate) mod ws;
 pub(crate) mod wss;
 
 pub use endpoint::{Endpoint, TransportName, TransportScheme, TransportSelector};
-pub use registry::{CustomListener, TransportProvider, TransportStream};
+pub use registry::{ProviderListener, TransportProvider, TransportStream};
 
 pub use crate::paging::PageCursor;
 

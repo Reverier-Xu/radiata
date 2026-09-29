@@ -3,7 +3,7 @@
 //! Exercises the public transport extension surface exactly as a caller
 //! would: one in-memory hub medium implements [`radiata::TransportProvider`]
 //! (a stream type implementing [`radiata::TransportStream`] plus a
-//! listener implementing [`radiata::CustomListener`]), registers under a
+//! listener implementing [`radiata::ProviderListener`]), registers under a
 //! caller-owned scheme name, and two real nodes complete a full secure
 //! merge across it, addressed by the canonical custom form
 //! `<name>://<opaque>`. No built-in transport participates.
@@ -14,7 +14,7 @@ use std::{
 };
 
 use radiata::{
-  CustomListener, Endpoint, MergeCredential, NodeBuilder, NodeHandle, TransportName,
+  Endpoint, MergeCredential, NodeBuilder, NodeHandle, ProviderListener, TransportName,
   TransportProvider, TransportStream,
 };
 use tokio::sync::mpsc;
@@ -102,7 +102,7 @@ struct HubTransport(Arc<Hub>);
 impl TransportProvider for HubTransport {
   fn bind(
     &self, endpoint: Endpoint,
-  ) -> radiata::BoxFuture<'static, radiata::Result<Box<dyn CustomListener>>> {
+  ) -> radiata::BoxFuture<'static, radiata::Result<Box<dyn ProviderListener>>> {
     let hub = Arc::clone(&self.0);
     Box::pin(async move {
       let opaque = endpoint
@@ -114,7 +114,7 @@ impl TransportProvider for HubTransport {
       Ok(Box::new(HubListener {
         endpoint,
         receiver: tokio::sync::Mutex::new(receiver),
-      }) as Box<dyn CustomListener>)
+      }) as Box<dyn ProviderListener>)
     })
   }
 
@@ -140,7 +140,7 @@ struct HubListener {
   receiver: tokio::sync::Mutex<mpsc::Receiver<Box<dyn TransportStream>>>,
 }
 
-impl CustomListener for HubListener {
+impl ProviderListener for HubListener {
   fn local_endpoint(&self) -> Endpoint {
     self.endpoint.clone()
   }

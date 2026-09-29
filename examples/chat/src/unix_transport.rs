@@ -3,7 +3,7 @@
 //!
 //! This module is the complete caller-side recipe for a custom
 //! transport. It implements `radiata::TransportProvider` (the dial/bind
-//! surface), `radiata::CustomListener` (the inbound surface), and
+//! surface), `radiata::ProviderListener` (the inbound surface), and
 //! `radiata::TransportStream` (the byte-stream contract) over
 //! `tokio::net::UnixListener`/`UnixStream`, and registers under the
 //! caller-owned scheme name `unix`. Peers address the transport with
@@ -23,7 +23,7 @@
 use std::{os::unix::fs::FileTypeExt, path::PathBuf};
 
 use radiata::{
-  BoxFuture, CustomListener, Endpoint, Error, Result, TransportProvider, TransportStream,
+  BoxFuture, Endpoint, Error, ProviderListener, Result, TransportProvider, TransportStream,
 };
 
 /// The scheme name this transport registers under. Peers dial
@@ -89,7 +89,7 @@ impl tokio::io::AsyncWrite for IpcStream {
 pub struct UnixTransport;
 
 impl TransportProvider for UnixTransport {
-  fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn CustomListener>>> {
+  fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn ProviderListener>>> {
     Box::pin(async move {
       let path = socket_path(&endpoint)?;
       // A previous run's socket file makes bind fail with EADDRINUSE
@@ -113,7 +113,7 @@ impl TransportProvider for UnixTransport {
         path,
         listener,
         shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
-      }) as Box<dyn CustomListener>)
+      }) as Box<dyn ProviderListener>)
     })
   }
 
@@ -142,7 +142,7 @@ struct IpcListener {
   shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
-impl CustomListener for IpcListener {
+impl ProviderListener for IpcListener {
   fn local_endpoint(&self) -> Endpoint {
     self.endpoint.clone()
   }

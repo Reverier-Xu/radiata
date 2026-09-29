@@ -40,10 +40,10 @@ use std::{
 };
 
 use radiata::{
-  BoxFuture, CustomListener, Endpoint, Error, FeatureTag, MemberStatus, MergeCredential,
-  NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer, PageSpec, ProtocolDefinition,
-  ProtocolTag, Result, RoutingPolicy, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget,
-  TransportName, TransportProvider, TransportStream,
+  BoxFuture, Endpoint, Error, FeatureTag, MemberStatus, MergeCredential, NodeBuilder, NodeConfig,
+  NodeHandle, NodeId, PacketConsumer, PageSpec, ProtocolDefinition, ProtocolTag, ProviderListener,
+  Result, RoutingPolicy, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TransportName,
+  TransportProvider, TransportStream,
 };
 mod common;
 
@@ -160,7 +160,7 @@ impl tokio::io::AsyncWrite for UnixStream {
 struct UnixTransport;
 
 impl TransportProvider for UnixTransport {
-  fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn CustomListener>>> {
+  fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn ProviderListener>>> {
     Box::pin(async move {
       let path = socket_path(&endpoint)?;
       let listener =
@@ -170,7 +170,7 @@ impl TransportProvider for UnixTransport {
         endpoint,
         listener,
         shutdown: Arc::new(tokio::sync::Notify::new()),
-      }) as Box<dyn CustomListener>)
+      }) as Box<dyn ProviderListener>)
     })
   }
 
@@ -208,7 +208,7 @@ impl Drop for UnixListener {
   }
 }
 
-impl CustomListener for UnixListener {
+impl ProviderListener for UnixListener {
   fn local_endpoint(&self) -> Endpoint {
     self.endpoint.clone()
   }
