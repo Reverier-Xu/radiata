@@ -29,10 +29,13 @@
 //!   with an OFFER carrying its aggregate for each child. The children cover
 //!   the parent exactly; when the range is three digests wide or narrower the
 //!   children are the singleton ranges themselves. Every level shrinks the
-//!   range at least fourfold, so a divergence isolates in at most ⌈log₄(2⁶⁴)⌉ =
-//!   32 OFFER rounds; at singleton width the two non-empty cases above are
-//!   exhaustive (two rows with the same digest are the same row by the frozen
-//!   digest contract), which is the termination argument.
+//!   range strictly and geometrically (each child is at most a quarter of the
+//!   parent plus three digests), so a divergence over the whole digest space
+//!   isolates in 32 OFFER rounds and over any narrower range in at most 34 (the
+//!   last child inherits the division remainder, which is where the couple of
+//!   extra levels over log₄ come from); at singleton width the two non-empty
+//!   cases above are exhaustive (two rows with the same digest are the same row
+//!   by the frozen digest contract), which is the termination argument.
 //!
 //! ## NEED direction semantics
 //!
@@ -85,11 +88,33 @@
 //! rows: content carries whatever merge state the lane encodes
 //! (versions, tombstone markers), and the engine reconciles sets — key
 //! replacement and merge semantics live in the lane's row encoding, not
-//! here. The phase-3 migration maps each lane's store to one engine per
-//! session: local writes feed [`Engine::insert_row`], session frames
-//! decode to [`Drive::Message`], the session establishment and the R4
-//! cadence drive [`Drive::RootExchange`], and returned messages encode
-//! through [`super::wire`] onto the session.
+//! here. The row-size ceiling is likewise a lane-layer contract: one
+//! row must independently fit one ROWS message inside the 64 KiB wire
+//! envelope ([`super::wire::row_fits_message`]), enforced with a typed
+//! error at [`Engine::insert_row`] — a row that cannot cross a session
+//! never enters the index.
+//!
+//! The phase-3 migration hooks each lane's store to one engine per
+//! session through five attachment points:
+//!
+//! 1. local writes feed [`Engine::insert_row`];
+//! 2. session frames decode to [`Drive::Message`];
+//! 3. the session establishment and the R4 cadence drive
+//!    [`Drive::RootExchange`];
+//! 4. returned messages encode through [`super::wire`] onto the session;
+//! 5. applied-rows fan-out: after this engine applies received ROWS, the
+//!    session layer propagates them to the sibling-session engines of the same
+//!    lane with `insert_row` plus a `Drive::LocalChange` (the multi-hop
+//!    propagation of the proposal §3: the epidemic wave is hints between
+//!    sessions). The engine is per-session isolated — it only marks its own
+//!    dirty set — so the fan-out belongs to the session layer, not here.
+//!
+//! One deliberate deviation from the proposal's wording: ROWS carries
+//! its own minimal `[key, content]` row encoding rather than reusing
+//! the existing paged row encodings, because the engine is
+//! lane-agnostic and must not know any lane's row schema; the chunk
+//! discipline (32/64 KiB pump bounds) is reused where it belongs, at
+//! the R3 session layer that carries the encoded bodies.
 
 use std::{collections::VecDeque, mem};
 
@@ -98,7 +123,7 @@ use super::{
   fingerprint::{Fingerprint, FingerprintIndex},
   wire::{
     DigestRange, LaneId, MAX_RANGES_PER_MESSAGE, MAX_ROWS_PER_MESSAGE, Message, RangeFingerprint,
-    Row,
+    Row, row_fits_message,
   },
 };
 use crate::{Error, Result};
@@ -186,11 +211,19 @@ impl Engine {
   }
 
   /// Stores one local row (an insert or an in-place replacement of the
-  /// identical `(key, content)` pair). Row updates are the lane's
-  /// concern: an update is a new `(key, content)` identity, and the old
-  /// identity leaves the set only through the lane's own row encoding
-  /// (versions or tombstones), never through this engine.
+  /// identical `(key, content)` pair). The row must independently fit
+  /// one ROWS message inside the wire body envelope — the plane's
+  /// tightest row-size constraint, checked here with a typed error so a
+  /// row that could never cross a session fails at the local-write
+  /// boundary instead of failing every later ROWS encode. Row updates
+  /// are the lane's concern: an update is a new `(key, content)`
+  /// identity, and the old identity leaves the set only through the
+  /// lane's own row encoding (versions or tombstones), never through
+  /// this engine.
   pub(crate) fn insert_row(&mut self, key: &[u8], content: &[u8]) -> Result<()> {
+    if !row_fits_message(key.len(), content.len()) {
+      return Err(Error::invalid_input("reconcile row size"));
+    }
     let row = Row {
       key: key.to_vec(),
       content: content.to_vec(),
@@ -211,7 +244,10 @@ impl Engine {
 
   /// Drives the engine: returns the messages to send the peer, at most
   /// [`MESSAGE_BUDGET_PER_DRIVE`] of them, in a deterministic order
-  /// (backlog first, then the input's generated work).
+  /// (backlog first, then the input's generated work). The quiescence
+  /// DONE rides the backlog like every other message, so a
+  /// budget-exhausted drive defers it to the next drive instead of
+  /// exceeding the bound — it is postponed, never dropped.
   pub(crate) fn drive(&mut self, drive: Drive) -> Result<Vec<Message>> {
     let mut out = Vec::new();
     self.drain_backlog(&mut out);
@@ -228,8 +264,9 @@ impl Engine {
     if self.round_open && self.backlog.is_empty() && generated == 0 {
       self.round_open = false;
       let done = self.done_message();
-      out.push(done);
+      self.backlog.push_back(done);
     }
+    self.drain_backlog(&mut out);
     Ok(out)
   }
 
@@ -951,6 +988,63 @@ mod tests {
     }
   }
 
+  /// The drive budget is a hard ceiling, DONE included: with the entry
+  /// backlog at exactly the budget and an open round, the quiescence
+  /// DONE cannot push the drive over — it rides the backlog and the
+  /// next drive delivers it (postponed, never dropped).
+  #[test]
+  fn reconcile_drive_budget_defers_the_quiescence_done() {
+    let mut engine = Engine::new(LaneId::Descriptors);
+    engine.insert_row(b"k", b"v").unwrap();
+    engine.round_open = true;
+    for _ in 0..MESSAGE_BUDGET_PER_DRIVE {
+      engine.backlog.push_back(Message::Root {
+        lane: LaneId::Descriptors,
+        count: 0,
+        xor: 0,
+      });
+    }
+    let out = engine.drive(Drive::Drain).unwrap();
+    assert_eq!(out.len(), MESSAGE_BUDGET_PER_DRIVE);
+    assert!(
+      out
+        .iter()
+        .all(|message| !matches!(message, Message::Done { .. })),
+      "the budgeted drive carries only backlog"
+    );
+    assert!(!engine.round_open, "the round closed on schedule");
+    let deferred = engine.drive(Drive::Drain).unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert!(matches!(deferred[0], Message::Done { .. }));
+    assert!(engine.drive(Drive::Drain).unwrap().is_empty());
+  }
+
+  /// The row-size ceiling is exactly the single-row ROWS fit, checked
+  /// at the local-write boundary: a row at the byte boundary enters
+  /// the index, one byte more is a typed error, and the gap band —
+  /// rows whose digest preimage still fits but whose ROWS body never
+  /// can — is rejected by the gate (not by the digest).
+  #[test]
+  fn reconcile_row_size_ceiling_is_enforced_at_the_write_boundary() {
+    let mut engine = Engine::new(LaneId::Descriptors);
+    // 23-byte key (1-byte header), content below 64 KiB (3-byte
+    // header): 5 + 1 + 23 + 3 + 65_504 = 65_536 exactly.
+    let key = vec![0x41u8; 23];
+    let fitting = vec![0x42u8; 65_504];
+    assert!(engine.insert_row(&key, &fitting).is_ok());
+    let one_over = vec![0x43u8; 65_505];
+    let error = engine.insert_row(&key, &one_over).unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    // The gap band: the digest preimage (7-byte overhead) still fits,
+    // so only the row-size gate can reject it.
+    let gap = vec![0x44u8; 65_507];
+    assert!(item_digest(&key, &gap).is_ok());
+    let error = engine.insert_row(&key, &gap).unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    // Only the boundary row is held.
+    assert_eq!(engine.len(), 1);
+  }
+
   /// A scripted total-loss scenario: every message is dropped for a
   /// while, inserts accumulate, and the root re-drive recovers full
   /// convergence — the loss-recovery contract the detection cadence
@@ -1094,7 +1188,6 @@ mod tests {
     /// en route to `b`).
     deferred: Vec<(bool, Message)>,
     log: Vec<Message>,
-    offers_a: usize,
     max_drive_batch: usize,
   }
 
@@ -1143,7 +1236,6 @@ mod tests {
         to_a: VecDeque::new(),
         deferred: Vec::new(),
         log: Vec::new(),
-        offers_a: 0,
         max_drive_batch: 0,
       }
     }
@@ -1157,9 +1249,6 @@ mod tests {
 
     fn record(&mut self, peer: Peer, out: Vec<Message>) {
       self.max_drive_batch = self.max_drive_batch.max(out.len());
-      if peer == Peer::A {
-        self.offers_a += out.iter().filter(|message| message.kind_is_offer()).count();
-      }
       for message in out {
         self.log.push(message.clone());
         match peer {
@@ -1270,14 +1359,6 @@ mod tests {
 
     fn count_kind(&self, predicate: impl Fn(&Message) -> bool) -> usize {
       self.log.iter().filter(|message| predicate(message)).count()
-    }
-
-    fn offers_by(&self, peer: Peer) -> usize {
-      match peer {
-        Peer::A => self.offers_a,
-        // The pair is symmetric: the log records both directions.
-        Peer::B => self.count_kind(Message::kind_is_offer) - self.offers_a,
-      }
     }
 
     fn apply(&mut self, op: Op) {

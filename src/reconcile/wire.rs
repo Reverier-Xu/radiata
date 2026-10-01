@@ -563,6 +563,41 @@ fn check_bounds(bounds: &[DigestRange]) -> Result<()> {
   Ok(())
 }
 
+/// The exact encoded length of one ROWS message carrying the single
+/// row `(key_len, content_len)`: five fixed header bytes (the message
+/// array, kind, lane, one-entry rows array, the row array) plus the
+/// two byte-string headers.
+fn single_row_message_len(key_len: usize, content_len: usize) -> usize {
+  5 + bstr_header_len(key_len) + key_len + bstr_header_len(content_len) + content_len
+}
+
+/// The canonical CBOR byte-string header length for a payload of
+/// `len` bytes (shortest-argument form).
+fn bstr_header_len(len: usize) -> usize {
+  if len < 24 {
+    1
+  } else if len < 0x100 {
+    2
+  } else if len < 0x1_0000 {
+    3
+  } else if len < 0x1_0000_0000 {
+    5
+  } else {
+    9
+  }
+}
+
+/// The plane's row-size contract: one row must independently fit one
+/// ROWS message body inside the wire envelope ([`MAX_BODY_BYTES`]).
+/// This is the tightest row-size constraint there is — the digest
+/// preimage and every piggybacked framing of the same row are strictly
+/// smaller — so the engine enforces exactly this at the local-write
+/// boundary: a row that cannot ride one ROWS message alone can never
+/// cross a session.
+pub(crate) fn row_fits_message(key_len: usize, content_len: usize) -> bool {
+  single_row_message_len(key_len, content_len) <= MAX_BODY_BYTES
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
@@ -848,6 +883,96 @@ mod tests {
       .unwrap_err()
       .kind(),
       ErrorKind::InvalidInput
+    );
+
+    // The decode side of the same bound: a hand-encoded canonical body
+    // (bypassing the encoder's own shape checks) with 65 rows fails
+    // closed too.
+    let hand_encoded_rows = {
+      use minicbor::bytes::ByteVec;
+
+      use super::{RowWire, RowsWire};
+      let rows = (0..=MAX_ROWS_PER_MESSAGE)
+        .map(|index| RowWire {
+          key: ByteVec::from(index.to_be_bytes().to_vec()),
+          content: ByteVec::from(Vec::new()),
+        })
+        .collect();
+      encode_canonical(
+        &RowsWire {
+          kind: KIND_ROWS,
+          lane: LaneId::Descriptors.code(),
+          rows,
+        },
+        super::RECONCILE_CBOR_LIMITS,
+      )
+      .unwrap()
+    };
+    assert_eq!(
+      decode(&hand_encoded_rows).unwrap_err().kind(),
+      ErrorKind::InvalidInput
+    );
+  }
+
+  /// The row-size contract is exact to the byte: `row_fits_message`
+  /// agrees with the actual encoder at the envelope boundary (a row
+  /// that fits is a single-row ROWS body of exactly
+  /// [`super::MAX_BODY_BYTES`] bytes; one byte more fails the encode).
+  #[test]
+  fn reconcile_wire_row_size_contract_matches_the_encoder_at_the_boundary() {
+    use super::{MAX_BODY_BYTES, row_fits_message};
+    // 23-byte key (1-byte header) + content below 64 KiB (3-byte
+    // header): the fit boundary is content = 65_504.
+    let key = vec![0x41u8; 23];
+    let fitting = vec![0x42u8; 65_504];
+    let one_over = vec![0x43u8; 65_505];
+    assert!(row_fits_message(key.len(), fitting.len()));
+    assert!(!row_fits_message(key.len(), one_over.len()));
+    let message = Message::Rows {
+      lane: LaneId::Descriptors,
+      rows: vec![Row {
+        key: key.clone(),
+        content: fitting,
+      }],
+    };
+    let bytes = encode(&message).unwrap();
+    assert_eq!(bytes.len(), MAX_BODY_BYTES);
+    let error = encode(&Message::Rows {
+      lane: LaneId::Descriptors,
+      rows: vec![Row {
+        key,
+        content: one_over,
+      }],
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    // Header-size classes shift the boundary exactly as the arithmetic
+    // says: a 24-byte key needs one header byte more, so the largest
+    // fitting content shrinks by two (one for the key byte, one for the
+    // header byte).
+    let key24 = vec![0x41u8; 24];
+    let fitting24 = vec![0x42u8; 65_502];
+    let one_over24 = vec![0x43u8; 65_503];
+    assert!(row_fits_message(key24.len(), fitting24.len()));
+    assert!(!row_fits_message(key24.len(), one_over24.len()));
+    let bytes = encode(&Message::Rows {
+      lane: LaneId::Descriptors,
+      rows: vec![Row {
+        key: key24.clone(),
+        content: fitting24,
+      }],
+    })
+    .unwrap();
+    assert_eq!(bytes.len(), MAX_BODY_BYTES);
+    assert!(
+      encode(&Message::Rows {
+        lane: LaneId::Descriptors,
+        rows: vec![Row {
+          key: key24,
+          content: one_over24
+        }],
+      })
+      .is_err()
     );
   }
 

@@ -28,10 +28,12 @@ use crate::{
   protocol::{CborLimits, MAX_BODY_BYTES, encode_canonical},
 };
 
-/// The canonical preimage budget: the key and content together must fit
-/// the control-plane body ceiling, because a row that cannot be hashed
-/// cannot be carried in a ROWS message either (both live inside the
-/// same 64 KiB wire envelope).
+/// The canonical preimage budget: a backstop at the control-plane body
+/// ceiling, not the plane's row-size contract. The binding constraint
+/// is tighter — one row must independently fit one ROWS message
+/// (`super::wire::row_fits_message`), which the engine enforces with a
+/// typed error at the local-write boundary — so any row that reaches
+/// this budget's limit was already rejected before hashing mattered.
 const PREIMAGE_LIMITS: CborLimits = CborLimits::new(4, 4, MAX_BODY_BYTES);
 
 /// The digest preimage: exactly the canonical CBOR encoding of the
