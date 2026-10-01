@@ -24,6 +24,7 @@ mod packet;
 mod paging;
 mod protocol;
 mod provider;
+mod reconcile;
 mod resource;
 mod routing;
 mod runtime;
