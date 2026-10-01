@@ -22,6 +22,12 @@ Lifecycle rules:
   made, the scoped items with their evidence, acceptance criteria and
   guarding gates, and the recorded environmental limits that audits
   must budget for.
+- [`research/`](research/) — the sync-redundancy research cycle's evidence
+  library and architecture decision record: a source-grounded baseline of
+  the current anti-entropy redundancy, survey notes (gossip theory, set
+  reconciliation, delta CRDTs), a candidate comparison, and the target
+  architecture proposal. The proposal's accepted work items migrate into
+  `backlog.md` when the cycle is scoped.
 
 Completed cycles do not keep their documents here. The
 `starvation-hardening-plan` cycle (configurable admission and
