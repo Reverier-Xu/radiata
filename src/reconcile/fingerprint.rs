@@ -60,6 +60,14 @@ impl Fingerprint {
   /// The identity element: the empty set's aggregate.
   pub(crate) const EMPTY: Self = Self { count: 0, xor: 0 };
 
+  /// Constructs an arbitrary aggregate directly. Wire intake is the
+  /// production caller: a received ROOT or range fingerprint carries a
+  /// peer's `(count, xor)` pair that no combination of local
+  /// singletons can synthesize.
+  pub(crate) const fn new(count: u64, xor: u64) -> Self {
+    Self { count, xor }
+  }
+
   /// The aggregate of the one-digest set `{digest}`.
   pub(crate) const fn singleton(digest: u64) -> Self {
     Self {
