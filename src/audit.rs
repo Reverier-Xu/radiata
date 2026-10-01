@@ -27,26 +27,6 @@ pub(crate) fn resource_pass_settled(peer: &str, continued: bool) {
   let _ = (peer, continued);
 }
 
-/// A dispatched sync page failed its admission verdict and rewound to
-/// its scan start: the records re-collect on the next tick. Verdict
-/// failures during steady state mean the session cannot carry the page.
-pub(crate) fn resource_page_rewound(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "resource page rewound");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
-}
-
-/// A peer's watermark table refreshed to empty: the next pass
-/// re-delivers the whole catalog once, bounding any
-/// admission-versus-application divergence.
-pub(crate) fn resource_watermarks_refreshed(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "resource watermarks refreshed");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
-}
-
 /// A member dial toward `peer` was attempted; `recovery` records
 /// whether the recovery plane (rather than an operator) initiated it.
 pub(crate) fn dial_started(peer: &str, recovery: bool) {

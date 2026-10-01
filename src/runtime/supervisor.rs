@@ -175,16 +175,6 @@ pub(crate) async fn spawn_runtime(
   dependencies
     .extensions
     .register_core_protocol(sync_definition, sync_consumer)?;
-  // The core resource sync protocol rides the same authenticated sessions
-  // and anti-entropy driver as membership sync.
-  let resource_definition = crate::resource::sync::resource_sync_protocol_definition()?;
-  let resource_consumer = Arc::new(crate::resource::sync::ResourceSyncConsumer::new(
-    Arc::clone(&runtime_context),
-    dependencies.entropy.clone(),
-  ));
-  dependencies
-    .extensions
-    .register_core_protocol(resource_definition, resource_consumer)?;
   // The core reconciliation plane rides the same authenticated sessions
   // as the sync lanes: one consumer for the reconcile-v1 protocol, one
   // shared plane behind it (the anti-entropy driver ticks the same

@@ -79,7 +79,7 @@ pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/reconcile-
 /// lanes one commit at a time (descriptors, trust, resources,
 /// tombstones); a lane joins this list only by migrating onto the
 /// engine, and a lane not in it still rides the watermark walks.
-const ACTIVE_LANES: [LaneId; 2] = [LaneId::Descriptors, LaneId::Trust];
+const ACTIVE_LANES: [LaneId; 3] = [LaneId::Descriptors, LaneId::Trust, LaneId::Resources];
 
 /// The peers one tick drives with a cadence ROOT exchange: the bounded
 /// fair window over the alive set — the old push-round bound repurposed
@@ -382,6 +382,14 @@ impl ReconcilePlane {
           for lane in ACTIVE_LANES {
             match state.engine(lane).drive(Drive::RootExchange) {
               Ok(messages) => {
+                // The resources lane's quiet-pass audit event: the SLO
+                // harness asserts its presence as the resource plane's
+                // settled-pass proof — the reconcile equivalent of the
+                // walk's changeless scan (`continued = false`: the
+                // exchange observed the whole lane).
+                if lane == LaneId::Resources {
+                  crate::audit::resource_pass_settled(peer.as_str(), false);
+                }
                 outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
               }
               Err(error) => {
@@ -901,5 +909,84 @@ mod tests {
       let text = std::str::from_utf8(row_key).unwrap();
       assert!(text.starts_with("node-"), "keys are node ids: {text}");
     }
+  }
+
+  /// The resources lane's per-writer bounded wait keeps its liveness in
+  /// the row shape: a row batch whose writer is not (and never becomes)
+  /// trusted applies within the page's own bounded window — one wait
+  /// shared by the batch's records from that writer, then a fail-closed
+  /// skip — never a dead wait. This is the page-lane contract carried
+  /// over unchanged: the plane batches its rows into the same page
+  /// apply, so the wait bound cannot regress by row-ization.
+  #[tokio::test]
+  async fn the_resources_lane_skips_unknown_writers_within_the_bounded_wait() {
+    use crate::resource::ResourceRecordV1;
+
+    let context = context_with_bindings(&[]).await;
+    let writer = node(7);
+    let signing = crate::identity::testing::scripted_signing(7);
+    let mut rows = Vec::new();
+    for index in 0..4_u64 {
+      let name =
+        crate::ResourceName::parse(&format!("example.org/resources/unknown-{index}")).unwrap();
+      let record = ResourceRecordV1::sign(
+        name.clone(),
+        crate::LabelValue::parse("document").unwrap(),
+        crate::ResourceUri::parse("u://unknown").unwrap(),
+        crate::LabelSet::new(),
+        1_000 + index,
+        writer.clone(),
+        0,
+        false,
+        &signing,
+      )
+      .unwrap();
+      rows.push((name.as_str().as_bytes().to_vec(), record.encode().unwrap()));
+    }
+    let started = std::time::Instant::now();
+    let shared = plane_shared(&context).await;
+    super::apply_rows(
+      shared.as_ref(),
+      &super::super::wire::LaneId::Resources,
+      &rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+      elapsed < std::time::Duration::from_secs(6),
+      "the batch bounded-waited once, not once per row: {elapsed:?}"
+    );
+    // Nothing installed: the writer never became trusted, so every
+    // record skipped fail-closed.
+    for (row_key, _) in &rows {
+      let name = crate::ResourceName::parse(std::str::from_utf8(row_key).unwrap()).unwrap();
+      assert!(
+        crate::resource::store::read_record_ctx(context.store(), &name)
+          .await
+          .unwrap()
+          .is_none(),
+        "an unknown writer's record must not install"
+      );
+    }
+  }
+
+  /// One plane-shared fixture around a context.
+  async fn plane_shared(context: &Arc<LocalIdentityContext>) -> Arc<super::PlaneShared> {
+    let entropy = std::sync::Arc::new(crate::identity::testing::SequenceEntropy::default());
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let sessions: crate::session::stream::SessionTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    super::ReconcilePlane::new(
+      Arc::clone(context),
+      entropy,
+      events,
+      crate::node::MemberRevisionSignal::new(revision_tx),
+      sessions,
+    )
+    .shared()
   }
 }

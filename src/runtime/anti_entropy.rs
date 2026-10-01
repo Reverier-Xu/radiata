@@ -1,16 +1,17 @@
-//! The anti-entropy subsystem: the self-contained sync driver that pages
-//! membership descriptors and resource records over every authenticated
-//! session on the configured interval, plus the on-demand round requests
-//! that run the identical round for deterministic convergence checks.
+//! The anti-entropy subsystem: the self-contained sync driver that
+//! carries the membership tombstone plane and the reconciliation lanes
+//! over every authenticated session on the configured interval, plus
+//! the on-demand round requests that run the identical round for
+//! deterministic convergence checks.
 
 use std::sync::Arc;
 
 use crate::{Endpoint, identity::lifecycle::LocalIdentityContext};
 
-/// Spawns the anti-entropy membership-sync driver: it pages descriptors
-/// and the issuer trust snapshot over every authenticated session on the
-/// configured interval and stops on the shutdown signal (streams metadata
-/// pages; bounded work per tick).
+/// Spawns the anti-entropy membership-sync driver: it forwards the
+/// removal tombstones over every authenticated session on the
+/// configured interval, drives the reconciliation plane's lanes, and
+/// stops on the shutdown signal (bounded work per tick).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_sync_driver(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn crate::api::Entropy>,
@@ -34,7 +35,6 @@ pub(super) fn spawn_sync_driver(
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sync_cursor = crate::membership::sync::MembershipSyncCursors::default();
-    let mut resource_cursor = crate::resource::sync::ResourceSyncCursors::default();
     // The previous round's unsettled delivery verdicts, per plane, with
     // the peers whose planes they hold in flight. The periodic tick
     // settles them opportunistically: resolved effects apply before the
@@ -47,12 +47,7 @@ pub(super) fn spawn_sync_driver(
       tokio::task::JoinHandle<crate::membership::sync::MembershipRoundEffects>,
       crate::membership::sync::InFlightRounds,
     );
-    type ResourcePending = (
-      tokio::task::JoinHandle<crate::resource::sync::ResourceRoundEffects>,
-      std::collections::BTreeSet<crate::NodeId>,
-    );
     let mut pending_sync: Vec<SyncPending> = Vec::new();
-    let mut pending_resource: Vec<ResourcePending> = Vec::new();
     // Applies every round's verdict effects whose settlement resolved.
     // With `settle_all` the wait blocks until each does (the
     // deterministic seam: a requested round must leave settled cursor
@@ -79,25 +74,6 @@ pub(super) fn spawn_sync_driver(
       }
       *pending = remaining;
     }
-    async fn harvest_resource(
-      pending: &mut Vec<ResourcePending>, cursors: &mut crate::resource::sync::ResourceSyncCursors,
-      settle_all: bool,
-    ) {
-      let mut remaining = Vec::new();
-      for (handle, in_flight) in pending.drain(..) {
-        if !settle_all && !handle.is_finished() {
-          remaining.push((handle, in_flight));
-          continue;
-        }
-        match handle.await {
-          Ok(effects) => crate::resource::sync::apply_resource_round_effects(cursors, effects),
-          Err(error) => {
-            tracing::warn!(error = %error, "resource round settlement failed");
-          }
-        }
-      }
-      *pending = remaining;
-    }
     // Dispatches one full round for both planes against the current
     // cursors and in-flight sets, and queues each plane's unsettled
     // verdicts (spawned, so the next tick harvests them without
@@ -107,9 +83,8 @@ pub(super) fn spawn_sync_driver(
       context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn crate::api::Entropy>,
       sessions: &crate::session::stream::SessionTable, runtime: &crate::runtime::RuntimeClient,
       endpoints: &[Endpoint], sync_cursor: &mut crate::membership::sync::MembershipSyncCursors,
-      resource_cursor: &mut crate::resource::sync::ResourceSyncCursors,
-      pending_sync: &mut Vec<SyncPending>, pending_resource: &mut Vec<ResourcePending>,
-      events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+      pending_sync: &mut Vec<SyncPending>, events: &Arc<crate::node::EventHub>,
+      revision: &crate::node::MemberRevisionSignal,
       reconcile: Option<&crate::reconcile::plane::ReconcilePlane>,
     ) {
       // The skip set is the union over every unsettled round: a peer
@@ -118,10 +93,6 @@ pub(super) fn spawn_sync_driver(
       let mut sync_in_flight = crate::membership::sync::InFlightRounds::new();
       for (_, in_flight) in pending_sync.iter() {
         sync_in_flight.extend(in_flight.iter().cloned());
-      }
-      let mut resource_in_flight = std::collections::BTreeSet::new();
-      for (_, in_flight) in pending_resource.iter() {
-        resource_in_flight.extend(in_flight.iter().cloned());
       }
       match crate::membership::sync::sync_tick(
         context,
@@ -157,23 +128,6 @@ pub(super) fn spawn_sync_driver(
       {
         tracing::warn!(kind = ?error.kind(), "reconcile tick failed");
       }
-      match crate::resource::sync::resource_sync_tick(
-        context,
-        entropy,
-        sessions,
-        runtime,
-        resource_cursor,
-        &resource_in_flight,
-      )
-      .await
-      {
-        Ok(Some(pending)) => {
-          let in_flight = pending.in_flight();
-          pending_resource.push((tokio::spawn(pending.settle()), in_flight));
-        }
-        Ok(None) => {}
-        Err(error) => tracing::warn!(kind = ?error.kind(), "resource sync tick failed"),
-      }
     }
     loop {
       tokio::select! {
@@ -185,7 +139,6 @@ pub(super) fn spawn_sync_driver(
           // Opportunistic harvest: resolved verdicts apply, unresolved
           // planes skip their peers in this round's dispatch.
           harvest_sync(&mut pending_sync, &mut sync_cursor, false).await;
-          harvest_resource(&mut pending_resource, &mut resource_cursor, false).await;
           let endpoints: Vec<Endpoint> = driver_endpoints
             .lock()
             .map(|endpoints| endpoints.clone())
@@ -197,9 +150,7 @@ pub(super) fn spawn_sync_driver(
             &driver_runtime,
             &endpoints,
             &mut sync_cursor,
-            &mut resource_cursor,
             &mut pending_sync,
-            &mut pending_resource,
             &driver_events,
             &driver_revision,
             driver_reconcile.as_ref(),
@@ -213,7 +164,6 @@ pub(super) fn spawn_sync_driver(
         // observes settled cursor state.
         Some(round) = round_requests.recv() => {
           harvest_sync(&mut pending_sync, &mut sync_cursor, true).await;
-          harvest_resource(&mut pending_resource, &mut resource_cursor, true).await;
           let endpoints: Vec<Endpoint> = driver_endpoints
             .lock()
             .map(|endpoints| endpoints.clone())
@@ -225,9 +175,7 @@ pub(super) fn spawn_sync_driver(
             &driver_runtime,
             &endpoints,
             &mut sync_cursor,
-            &mut resource_cursor,
             &mut pending_sync,
-            &mut pending_resource,
             &driver_events,
             &driver_revision,
             driver_reconcile.as_ref(),
@@ -236,7 +184,6 @@ pub(super) fn spawn_sync_driver(
           // Settle this round's verdicts inline: the requested round's
           // effects must be visible when the command returns.
           harvest_sync(&mut pending_sync, &mut sync_cursor, true).await;
-          harvest_resource(&mut pending_resource, &mut resource_cursor, true).await;
           let _ = round.send(());
         }
       }

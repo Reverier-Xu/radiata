@@ -740,8 +740,6 @@ pub(crate) mod e2e;
 #[cfg(all(test, feature = "json", unix))]
 mod crash;
 
-pub(crate) mod sync;
-
 #[cfg(test)]
 mod tests {
   use std::cmp::Ordering;
