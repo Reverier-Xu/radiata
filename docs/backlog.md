@@ -28,6 +28,15 @@ evidence lands in the commit history.
   dial path stays an immediate refusal and the healing planes plus
   caller retry policies absorb it (decided with the operator, landed
   with the connection-degree cycle).
+- **The sync plane converges on range-fingerprint reconciliation.**
+  Decided 2026-10 with the research cycle (`docs/research/`, decision
+  record in `research/06-architecture-proposal.md`): the push
+  watermark anti-entropy is structurally redundant (per-edge payload
+  duplication ≈ 1−1/k at degree k; the 2026-10 loopback observation
+  measured ~95%) and is replaced — not tuned — by receiver-evidenced
+  range reconciliation over `(count, xor)` fingerprints, with payload
+  bytes only crossing a session for ranges the receiver proves it
+  lacks. Scope below in item 3.
 - **The public handle API is the client-go-shaped verb surface.**
   `node.command(...)`/`node.query(...)` over sealed command structs are
   replaced by resource-scoped accessors (`members()`, `resources()`, …
@@ -174,4 +183,56 @@ window slot instead of truncating a pass. If admission latency ever
 grows with scale beyond that bound, the structural answer is
 receiver-side cursor evidence (a pull-based repair) — a bigger timer is
 explicitly not the answer (it uniformly slows every sync-bound phase;
-measured during the 2026-09-27 cycle).
+measured during the 2026-09-27 cycle). *Superseded by item 3: the
+reconciliation rewrite is that pull-based repair, generalized to the
+whole sync plane.*
+
+## 3. Scoped: the reconciliation plane rewrite (2026-10 cycle)
+
+Evidence and decision record: `docs/research/` (the baseline audit of
+the watermark model's structural redundancy, the survey of gossip
+theory / set reconciliation / delta CRDTs, the comparison matrix, and
+the target architecture in `research/06-architecture-proposal.md`).
+Rewrite authorization: pre-release, no compatibility surface, no
+migration burden. Items:
+
+- **R1 — the fingerprint index primitive** *(in flight)*. The
+  digest-ordered aggregate index (`src/reconcile/fingerprint.rs`):
+  `(count, xor)` group fingerprints, strict-prefix and half-open range
+  queries, digest-ascending enumeration, derived-view semantics (never
+  persisted, rebuilt from the snapshot). Acceptance: group-law,
+  BTreeMap-oracle (random operation sequences),
+  construction-order-independence, bucket-boundary, and
+  inverted-range property tests, all deterministic. Gate: the unit
+  lane in the module; clippy/fmt gates as usual.
+- **R2 — the reconciliation engine and wire v1.** The per-session,
+  per-lane state machine (`ROOT/HINT/OFFER/NEED/ROWS/DONE`), canonical
+  CBOR encodings, the frozen digest function (truncated SHA-256 over
+  the canonical row bytes), bounded ranges per message, one in-flight
+  round per session-lane. Acceptance: golden vectors for every message
+  shape; dual-instance in-process convergence property tests
+  (identical final state for arbitrary divergent starts and
+  adversarial message reorderings/losses with re-drive). Gate:
+  `reconcile` unit lane + the wire golden-vector suite.
+- **R3 — lane migration.** Descriptors, trust, resources, and
+  tombstones ride the engine; `WatermarkWalk`, the per-peer watermark
+  tables, the refresh passes, and the tombstone resend cadence are
+  deleted; the cleanup checkpoint GC stays. Acceptance: the existing
+  membership/trust/resource convergence, crash, and chaos lanes pass
+  unchanged (they are the equivalence proof). Gate:
+  `cargo test --workspace --all-features --locked` plus the
+  `verify-*` membership and fuzz lanes.
+- **R4 — the trigger and adaptation layer.** Change-driven `HINT`
+  debounced per tick, the quiet-cadence `ROOT` exchange,
+  eager-delta piggyback for healthy links, per-session link profiling
+  (EWMA RTT, loss/retry rate) driving only hint redundancy and
+  eager-delta toggles. Acceptance: `scripts/verify-sync-budget.sh`
+  (new): payload delivery redundancy ≤ 1.05× on the steady-state
+  matrices (n ∈ {8, 64, 256} × single-row/batch/reconnect), hint
+  traffic within the budget bound, and no convergence regression at
+  20% loss injection. Gate: the new lane plus the chat acceptance
+  lane.
+- **R5 — guide and cleanup.** The `radiata::guide` sync chapters
+  rewritten for the reconciliation contract; the research cycle's
+  proposal marked landed; this section deleted per the lifecycle
+  rules.
