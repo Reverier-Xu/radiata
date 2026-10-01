@@ -50,6 +50,32 @@
 //! "payload only crosses a session for ranges the receiver proves it
 //! lacks" holds on both sides of the exchange.
 //!
+//! ## NEED answer amplification cap
+//!
+//! A NEED answer clones the answering range's rows into the backlog,
+//! so a forged or duplicated NEED is an amplification vector: without a
+//! cap, a flood of NEED frames multiplies the whole catalog into queued
+//! ROWS messages (memory) and onto the wire (send). Three bounds close
+//! it, all engine-level:
+//!
+//! - **duplicate merge** — a NEED bound subsumed by a bound whose answer is
+//!   still queued adds zero work (the pending window closes with the backlog:
+//!   once every queued answer has been emitted, a repeated NEED is a fresh
+//!   request — the earlier answer may have been lost — and is answered again);
+//! - **bounded merge set** — at most [`NEED_PENDING_BOUNDS`] distinct bounds
+//!   are remembered; beyond that a NEED is dropped, and a bound that queued
+//!   nothing is never remembered;
+//! - **rows backlog ceiling** — row emission (NEED answers and direct pushes
+//!   alike) stops packing once [`ROWS_BACKLOG_CEILING`] ROWS messages are
+//!   queued; the remainder waits for a later round.
+//!
+//! Dropped work is never lost state: the peer's fingerprints still
+//! mismatch, and the next root exchange re-drives the transfer in a
+//! fresh bounded batch — the cap trades round count under flood for a
+//! hard memory bound. The per-drive send bound
+//! ([`MESSAGE_BUDGET_PER_DRIVE`]) holds regardless: no inbound frame,
+//! however forged, makes one drive emit more than the budget.
+//!
 //! # Rounds, DONE, and the in-flight bound
 //!
 //! At most one negotiated round is in flight per engine. A round opens
@@ -80,7 +106,10 @@
 //! the 64 KiB envelope by a per-message byte budget). One drive returns
 //! at most [`MESSAGE_BUDGET_PER_DRIVE`] messages; surplus work waits in
 //! the outbound backlog and later drives drain it, so a malicious peer
-//! cannot make one drive unbounded.
+//! cannot make one drive unbounded. The backlog itself is bounded for
+//! row payloads by [`ROWS_BACKLOG_CEILING`] (see the amplification cap
+//! below), so neither the drive nor the queue behind it is a flood
+//! vector.
 //!
 //! # Lane seam (phase 3)
 //!
@@ -143,6 +172,28 @@ pub(crate) const MESSAGE_BUDGET_PER_DRIVE: usize = 64;
 /// wire envelope for the CBOR framing of up to 64 rows.
 const ROW_BYTES_BUDGET: usize = 48 * 1_024;
 
+/// The ceiling on ROWS messages waiting in the engine's outbound
+/// backlog: row emission (NEED answers and direct pushes) stops packing
+/// once this many ROWS messages are queued, so a message flood bounds
+/// the engine's queued memory at `ROWS_BACKLOG_CEILING` messages of
+/// cloned local rows (≤ `ROWS_BACKLOG_CEILING × ROW_BYTES_BUDGET` bytes
+/// absolutely; rows that do not exist locally cannot be cloned). The
+/// dropped remainder is never lost state — the peer's fingerprints
+/// still mismatch and the next root exchange re-drives the transfer in
+/// a fresh batch. Sized at the pump lanes' 4 096-chunk drain discipline
+/// so every honest whole-catalog transfer the tests exercise still fits
+/// one round.
+const ROWS_BACKLOG_CEILING: usize = 4_096;
+
+/// Distinct NEED bounds remembered while their answers sit queued in
+/// the backlog: the duplicate-NEED merge set, bounded so a flood of
+/// pairwise-non-subsumed bounds cannot grow it without limit. An honest
+/// round's NEEDs arrive in [`MAX_RANGES_PER_MESSAGE`]-bound messages,
+/// so four messages' worth of distinct bounds covers a negotiated round
+/// with headroom; a NEED beyond the cap is dropped (bounded set, the
+/// root re-drive re-discovers the range).
+const NEED_PENDING_BOUNDS: usize = 4 * MAX_RANGES_PER_MESSAGE;
+
 /// One engine drive input.
 #[derive(Debug)]
 pub(crate) enum Drive {
@@ -175,6 +226,11 @@ pub(crate) struct Engine {
   dirty: Option<Vec<(u64, u64)>>,
   /// Outbound work beyond the current drive's message budget.
   backlog: VecDeque<Message>,
+  /// NEED bounds whose answer work is queued in the backlog: the
+  /// duplicate-NEED merge set (see the module's amplification-cap
+  /// section). Cleared wholesale whenever the backlog empties — at that
+  /// moment no answer is pending, so a repeated NEED is a fresh request.
+  pending_needs: Vec<(u64, u64)>,
 }
 
 impl Engine {
@@ -187,6 +243,7 @@ impl Engine {
       round_open: false,
       dirty: Some(Vec::new()),
       backlog: VecDeque::new(),
+      pending_needs: Vec::new(),
     }
   }
 
@@ -250,6 +307,13 @@ impl Engine {
   /// exceeding the bound — it is postponed, never dropped.
   pub(crate) fn drive(&mut self, drive: Drive) -> Result<Vec<Message>> {
     let mut out = Vec::new();
+    // The pending-NEED window closes with the backlog: with every
+    // queued answer emitted, a repeated NEED is a fresh request (the
+    // earlier answer may have been lost in flight), so the merge set
+    // empties with it.
+    if self.backlog.is_empty() {
+      self.pending_needs.clear();
+    }
     self.drain_backlog(&mut out);
     let generated = match drive {
       Drive::Drain => 0,
@@ -337,7 +401,7 @@ impl Engine {
       }
       Message::Need { bounds, .. } => {
         for bound in &bounds {
-          self.push_rows(bound.start, bound.end, true);
+          self.answer_need(bound.start, bound.end);
         }
       }
       Message::Rows { rows, .. } => {
@@ -497,49 +561,97 @@ impl Engine {
     }
   }
 
+  /// Answers one NEED bound under the amplification cap: a bound
+  /// subsumed by a pending answer merges into it (a duplicate or
+  /// contained NEED adds zero work), the merge set is bounded
+  /// ([`NEED_PENDING_BOUNDS`]), and the emission itself stops at the
+  /// rows backlog ceiling ([`ROWS_BACKLOG_CEILING`]). A bound that
+  /// queued nothing is not remembered — the merge set never silences a
+  /// NEED that was not actually answered.
+  fn answer_need(&mut self, start: u64, end: u64) {
+    if self
+      .pending_needs
+      .iter()
+      .any(|&(pending_start, pending_end)| pending_start <= start && end <= pending_end)
+    {
+      return;
+    }
+    if self.pending_needs.len() >= NEED_PENDING_BOUNDS {
+      return;
+    }
+    let queued = self.push_rows(start, end, true);
+    if queued > 0 {
+      self.pending_needs.push((start, end));
+    }
+  }
+
   /// Queues the engine's rows in `[start, end]` as bounded ROWS
-  /// messages. An `answer` to a NEED always emits a message — even an
-  /// empty one — so the requester observes the request completed; a
-  /// push emits nothing for an empty range.
-  fn push_rows(&mut self, start: u64, end: u64, answer: bool) {
-    let rows: Vec<Row> = if end < u64::MAX {
-      self
-        .index
-        .range_entries(start, end + 1)
-        .map(|(_, row)| row.clone())
-        .collect()
+  /// messages, streaming entry-by-entry and stopping at the rows
+  /// backlog ceiling — the remainder waits for a later round's fresh
+  /// budget, never silently lost (fingerprints re-drive it). An
+  /// `answer` to a NEED always emits a message — even an empty one —
+  /// while ceiling room remains, so the requester observes the request
+  /// completed; a push emits nothing for an empty range. Returns how
+  /// many messages were queued.
+  fn push_rows(&mut self, start: u64, end: u64, answer: bool) -> usize {
+    let mut room = ROWS_BACKLOG_CEILING.saturating_sub(self.queued_rows_messages());
+    let mut queued = 0;
+    // Split borrow: the entries iterator holds `index` immutably while
+    // packed messages push into `backlog`.
+    let Self {
+      lane,
+      index,
+      backlog,
+      ..
+    } = self;
+    let entries: Box<dyn Iterator<Item = (u64, &Row)> + '_> = if end < u64::MAX {
+      Box::new(index.range_entries(start, end + 1))
     } else {
-      self
-        .index
-        .iter()
-        .filter(|(digest, _)| *digest >= start)
-        .map(|(_, row)| row.clone())
-        .collect()
+      Box::new(index.iter().filter(|(digest, _)| *digest >= start))
     };
     let mut chunk: Vec<Row> = Vec::new();
     let mut bytes = 0;
-    for row in rows {
+    for (_, row) in entries {
       let cost = row.key.len() + row.content.len();
       if !chunk.is_empty()
         && (chunk.len() >= MAX_ROWS_PER_MESSAGE || bytes + cost > ROW_BYTES_BUDGET)
       {
+        if room == 0 {
+          // The ceiling is spent: the remaining rows are a later
+          // round's work, not this backlog's.
+          return queued;
+        }
         let message = Message::Rows {
-          lane: self.lane,
+          lane: *lane,
           rows: mem::take(&mut chunk),
         };
-        self.backlog.push_back(message);
+        backlog.push_back(message);
+        room -= 1;
+        queued += 1;
         bytes = 0;
       }
       bytes += cost;
-      chunk.push(row);
+      chunk.push(row.clone());
     }
-    if !chunk.is_empty() || answer {
+    if (!chunk.is_empty() || answer) && room > 0 {
       let message = Message::Rows {
-        lane: self.lane,
+        lane: *lane,
         rows: chunk,
       };
-      self.backlog.push_back(message);
+      backlog.push_back(message);
+      queued += 1;
     }
+    queued
+  }
+
+  /// The ROWS messages currently queued in the backlog: the ceiling's
+  /// accounting unit.
+  fn queued_rows_messages(&self) -> usize {
+    self
+      .backlog
+      .iter()
+      .filter(|message| matches!(message, Message::Rows { .. }))
+      .count()
   }
 
   /// The local aggregate over the inclusive range `[start, end]`. The
@@ -647,11 +759,14 @@ mod tests {
 
   use proptest::prelude::*;
 
-  use super::{Drive, Engine, FANOUT, MESSAGE_BUDGET_PER_DRIVE, mix64, split, state_token};
+  use super::{
+    Drive, Engine, FANOUT, MESSAGE_BUDGET_PER_DRIVE, NEED_PENDING_BOUNDS, ROWS_BACKLOG_CEILING,
+    mix64, split, state_token,
+  };
   use crate::reconcile::{
     digest::item_digest,
     fingerprint::Fingerprint,
-    wire::{LaneId, MAX_RANGES_PER_MESSAGE, MAX_ROWS_PER_MESSAGE, Message},
+    wire::{DigestRange, LaneId, MAX_RANGES_PER_MESSAGE, MAX_ROWS_PER_MESSAGE, Message},
   };
 
   /// A deterministic xorshift64* generator: the property loops below
@@ -1043,6 +1158,152 @@ mod tests {
     assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     // Only the boundary row is held.
     assert_eq!(engine.len(), 1);
+  }
+
+  /// The duplicate-NEED merge: while an answer is still pending in
+  /// the backlog, a repeated (or contained) NEED bound queues exactly
+  /// zero new work — the drive's whole output is the pending answer's
+  /// remainder. This is the duplicate half of the amplification cap:
+  /// a flood of identical NEEDs multiplies the catalog into the
+  /// backlog exactly once, not once per frame.
+  #[test]
+  fn reconcile_duplicate_needs_merge_into_one_pending_answer() {
+    // 5 000 rows: one whole-space answer is 79 messages (5 000/64),
+    // which outlives the first drive's 64-message budget, so the
+    // duplicate below arrives while its answer is still pending.
+    let mut engine = Engine::new(LaneId::Resources);
+    for index in 0..5_000_u32 {
+      let key = format!("need-{index:05}");
+      let content = format!("content-{index}");
+      engine
+        .insert_row(key.as_bytes(), content.as_bytes())
+        .unwrap();
+    }
+    let need = Message::Need {
+      lane: LaneId::Resources,
+      bounds: vec![DigestRange {
+        start: 0,
+        end: u64::MAX,
+      }],
+    };
+    let first = engine.drive(Drive::Message(need.clone())).unwrap();
+    assert_eq!(first.len(), MESSAGE_BUDGET_PER_DRIVE);
+    assert_eq!(engine.pending_needs, vec![(0, u64::MAX)]);
+    let remainder = engine.queued_rows_messages();
+    assert!(remainder > 0, "the answer outlives one drive");
+
+    // The duplicate adds zero work: the drive's entire output is the
+    // first answer's backlog remainder, and nothing new is queued.
+    let second = engine.drive(Drive::Message(need)).unwrap();
+    assert_eq!(second.len(), remainder, "the duplicate queued nothing");
+    assert_eq!(engine.pending_needs.len(), 1);
+    assert!(engine.drive(Drive::Drain).unwrap().is_empty());
+  }
+
+  /// The rows-backlog ceiling: a flood of NEEDs with strictly widening
+  /// bounds (each containing every previous one, so no subsumption ever
+  /// merges them — the forged-bound shape no duplicate filter can
+  /// catch) cannot push the queued ROWS backlog past the ceiling, the
+  /// per-drive send bound holds throughout, and the engine still
+  /// serves a root exchange normally afterward.
+  #[test]
+  fn reconcile_forged_need_flood_pins_the_rows_backlog_at_the_ceiling() {
+    let mut engine = Engine::new(LaneId::Descriptors);
+    for index in 0..12_000_u32 {
+      let key = format!("flood-{index:05}");
+      let content = format!("content-{index}");
+      engine
+        .insert_row(key.as_bytes(), content.as_bytes())
+        .unwrap();
+    }
+    let mut reached_ceiling = false;
+    for offset in 0..80_u64 {
+      let need = Message::Need {
+        lane: LaneId::Descriptors,
+        bounds: vec![DigestRange {
+          start: 80 - offset,
+          end: u64::MAX,
+        }],
+      };
+      let out = engine.drive(Drive::Message(need)).unwrap();
+      assert!(
+        out.len() <= MESSAGE_BUDGET_PER_DRIVE,
+        "the per-drive send bound holds under flood"
+      );
+      let queued = engine.queued_rows_messages();
+      assert!(
+        queued <= ROWS_BACKLOG_CEILING,
+        "drive {offset}: queued {queued} exceeds the ceiling"
+      );
+      reached_ceiling |= queued == ROWS_BACKLOG_CEILING;
+    }
+    assert!(
+      reached_ceiling,
+      "the flood must actually reach the ceiling for this test to bind"
+    );
+    // The engine is unharmed: the backlog still drains to quiet and a
+    // root exchange still emits its ROOT (behind the pinned backlog, so
+    // the drain runs until it surfaces).
+    let drained = engine.drive(Drive::RootExchange).unwrap();
+    assert_eq!(drained.len(), MESSAGE_BUDGET_PER_DRIVE);
+    let mut saw_root = drained
+      .iter()
+      .any(|message| matches!(message, Message::Root { .. }));
+    for _ in 0..(ROWS_BACKLOG_CEILING / MESSAGE_BUDGET_PER_DRIVE + 4) {
+      if engine.backlog.is_empty() {
+        break;
+      }
+      let out = engine.drive(Drive::Drain).unwrap();
+      saw_root |= out
+        .iter()
+        .any(|message| matches!(message, Message::Root { .. }));
+    }
+    assert!(
+      engine.backlog.is_empty(),
+      "the flooded backlog still drains"
+    );
+    assert!(saw_root, "the root exchange still emits its ROOT");
+  }
+
+  /// The merge-set cap: a flood of pairwise-non-subsumed NEED bounds
+  /// (strictly widening starts, answers kept pending by an oversized
+  /// catalog) stops growing the remembered set at
+  /// [`NEED_PENDING_BOUNDS`], and a flooded engine still converges —
+  /// the pair settles byte-identically afterward, because every
+  /// dropped bound is re-discovered by the next root exchange.
+  #[test]
+  fn reconcile_need_flood_bounds_the_merge_set_and_recovers() {
+    let rows: Vec<(String, String)> = (0..5_000)
+      .map(|index| (format!("k-{index:05}"), format!("v-{index}")))
+      .collect();
+    let owned: Vec<(Vec<u8>, Vec<u8>)> = rows
+      .iter()
+      .map(|(key, content)| (key.as_bytes().to_vec(), content.as_bytes().to_vec()))
+      .collect();
+    let mut pair = Pair::from_owned(&owned, &[]);
+    let flood_drives = NEED_PENDING_BOUNDS as u64 + 16;
+    let mut hit_cap = false;
+    for offset in 0..flood_drives {
+      let need = Message::Need {
+        lane: LaneId::Descriptors,
+        bounds: vec![DigestRange {
+          start: flood_drives - offset,
+          end: u64::MAX,
+        }],
+      };
+      pair.deliver_raw(Peer::A, need);
+      assert!(
+        pair.a.pending_needs.len() <= NEED_PENDING_BOUNDS,
+        "drive {offset}: the merge set grew past its bound"
+      );
+      hit_cap |= pair.a.pending_needs.len() == NEED_PENDING_BOUNDS;
+    }
+    assert!(hit_cap, "the flood must reach the merge-set cap");
+    // The flood dropped bounds, never state: the pair still settles.
+    pair.settle();
+    assert!(pair.quiet());
+    assert_eq!(row_set(&pair.a), row_set(&pair.b));
+    assert_eq!(pair.b.len(), 5_000);
   }
 
   /// A scripted total-loss scenario: every message is dropped for a
