@@ -91,6 +91,16 @@ async fn member_count_page(handle: &NodeHandle) -> usize {
     .len()
 }
 
+async fn trust_count_page(handle: &NodeHandle) -> usize {
+  handle
+    .trust()
+    .list(PageSpec::first(64).unwrap())
+    .await
+    .unwrap()
+    .items()
+    .len()
+}
+
 async fn degree_view_handle(handle: &NodeHandle) -> radiata::ConnectionDegreeView {
   handle.connection_degree().await.unwrap()
 }
@@ -145,8 +155,13 @@ async fn an_unhealthy_node_dials_its_way_back_to_target() {
     merge_with_retry(&leaf.handle, &nodes[0].handle, nodes[0].endpoint.clone()).await;
   }
 
-  // The maintenance universe is the member page: wait until every node
-  // counts all five members before reading the derived target.
+  // The maintenance universe is the trusted-binding set: wait until
+  // every node counts all five members AND all five bindings before
+  // reading the derived target. The member-page wait used to imply the
+  // binding wait transitively (descriptor pages were the slowest
+  // lane); the reconciliation plane converges descriptors at wire
+  // speed, so the binding universe — still on the watermark cadence —
+  // is now the later of the two and must be waited on explicitly.
   let members: Vec<(NodeHandle, NodeId)> = nodes
     .iter()
     .map(|node| (node.handle.clone(), node.id.clone()))
@@ -159,12 +174,15 @@ async fn an_unhealthy_node_dials_its_way_back_to_target() {
           if member_count_page(handle).await != 5 {
             return None;
           }
+          if trust_count_page(handle).await != 5 {
+            return None;
+          }
         }
         Some(())
       })
     },
     Duration::from_secs(60),
-    "member pages converge to five",
+    "member and trust pages converge to five",
   )
   .await;
 

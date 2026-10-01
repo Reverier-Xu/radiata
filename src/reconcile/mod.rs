@@ -22,16 +22,16 @@
 //!   2): pure deterministic drives from inputs (messages, local changes, root
 //!   exchanges) to the exact outbound message set.
 
-// Phases 1 and 2 land the primitive, the wire contract, and the engine
-// before any production caller exists: the phase-3 lane migration
-// (descriptors, trust, resources, tombstones riding the engine) is the
-// first production consumer. Remove this allowance when the lanes ride
-// the engine.
-#[allow(dead_code)]
+// The phase-3 lane migration is the first production consumer of the
+// primitive, the wire contract, and the engine: the plane module wires
+// them to the session and the tick.
 pub(crate) mod digest;
-#[allow(dead_code)]
 pub(crate) mod engine;
+// The fingerprint index is the plane's primitive: its full query
+// surface (point lookups, removal, set algebra) lands ahead of its
+// consumers — the engine exercises the aggregate paths today, and the
+// R4 trigger layer and lane pruning pick up the rest.
 #[allow(dead_code)]
 pub(crate) mod fingerprint;
-#[allow(dead_code)]
+pub(crate) mod plane;
 pub(crate) mod wire;

@@ -102,6 +102,11 @@ pub(crate) struct RuntimeDependencies {
   /// consumer bumps it when this node durably installs a peer's leave
   /// applied receipt addressed to this node.
   pub(crate) leave_applied: crate::membership::sync::LeaveAppliedSignal,
+  /// The reconciliation plane shared by the registered consumer and the
+  /// anti-entropy driver: created in `spawn_runtime` when the
+  /// reconcile-v1 protocol registers, consumed by `supervise` when the
+  /// sync driver spawns.
+  pub(crate) reconcile: Option<crate::reconcile::plane::ReconcilePlane>,
   /// Requests for one immediate anti-entropy round, forwarded to the
   /// sync driver (the cursor owner) by the RunSyncRound command.
   pub(crate) sync_round_requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
@@ -174,12 +179,31 @@ pub(crate) async fn spawn_runtime(
   // and anti-entropy driver as membership sync.
   let resource_definition = crate::resource::sync::resource_sync_protocol_definition()?;
   let resource_consumer = Arc::new(crate::resource::sync::ResourceSyncConsumer::new(
-    runtime_context,
+    Arc::clone(&runtime_context),
     dependencies.entropy.clone(),
   ));
   dependencies
     .extensions
     .register_core_protocol(resource_definition, resource_consumer)?;
+  // The core reconciliation plane rides the same authenticated sessions
+  // as the sync lanes: one consumer for the reconcile-v1 protocol, one
+  // shared plane behind it (the anti-entropy driver ticks the same
+  // plane once the supervisor spawns it).
+  let reconcile_plane = crate::reconcile::plane::ReconcilePlane::new(
+    Arc::clone(&runtime_context),
+    dependencies.entropy.clone(),
+    dependencies.events.clone(),
+    dependencies.member_revision.clone(),
+    dependencies.sessions.clone(),
+  );
+  let reconcile_consumer = Arc::new(crate::reconcile::plane::ReconcileConsumer::new(
+    reconcile_plane.shared(),
+  ));
+  dependencies.extensions.register_core_protocol(
+    crate::reconcile::plane::ReconcilePlane::protocol_definition()?,
+    reconcile_consumer,
+  )?;
+  dependencies.reconcile = Some(reconcile_plane);
   // The negotiation registry and the node offer are built before the
   // runtime is marked ready (the core protocols above joined the feature
   // set): a provisioning failure (a caller-required feature outside the
@@ -714,6 +738,7 @@ impl Supervisor {
       sync_rounds,
       dependencies.events.clone(),
       dependencies.member_revision.clone(),
+      dependencies.reconcile.clone(),
     ));
     // The durable trace-metadata sink shares the runtime identity context
     // and injected entropy; persistence failures never touch the data plane.
@@ -1230,6 +1255,7 @@ mod receipt_retention_sweep_tests {
       events: Arc::new(crate::node::EventHub::new()),
       member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
       leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
+      reconcile: None,
       sync_round_requests: round_tx,
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
       runtime_seed: None,

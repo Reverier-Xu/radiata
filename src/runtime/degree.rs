@@ -269,6 +269,7 @@ mod tests {
       events: Arc::new(crate::node::EventHub::new()),
       member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
       leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
+      reconcile: None,
       sync_round_requests: round_tx,
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
       runtime_seed: None,

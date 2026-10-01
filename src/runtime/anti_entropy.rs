@@ -19,6 +19,7 @@ pub(super) fn spawn_sync_driver(
   shutdown: tokio::sync::watch::Receiver<()>,
   mut round_requests: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
   events: Arc<crate::node::EventHub>, revision: crate::node::MemberRevisionSignal,
+  reconcile: Option<crate::reconcile::plane::ReconcilePlane>,
 ) -> tokio::task::JoinHandle<()> {
   let driver_context = Arc::clone(context);
   let driver_entropy = entropy;
@@ -28,6 +29,7 @@ pub(super) fn spawn_sync_driver(
   let mut driver_shutdown = shutdown;
   let driver_events = events;
   let driver_revision = revision;
+  let driver_reconcile = reconcile;
   tokio::spawn(async move {
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -108,6 +110,7 @@ pub(super) fn spawn_sync_driver(
       resource_cursor: &mut crate::resource::sync::ResourceSyncCursors,
       pending_sync: &mut Vec<SyncPending>, pending_resource: &mut Vec<ResourcePending>,
       events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+      reconcile: Option<&crate::reconcile::plane::ReconcilePlane>,
     ) {
       // The skip set is the union over every unsettled round: a peer
       // with an in-flight plane skips that plane's dispatch regardless
@@ -117,7 +120,6 @@ pub(super) fn spawn_sync_driver(
         for (peer, planes) in in_flight {
           let entry = sync_in_flight.entry(peer.clone()).or_default();
           entry.tombstones |= planes.tombstones;
-          entry.descriptors |= planes.descriptors;
           entry.trust |= planes.trust;
         }
       }
@@ -146,6 +148,18 @@ pub(super) fn spawn_sync_driver(
         // Persistent anti-entropy failure must stay visible in
         // diagnostics; the next tick retries regardless.
         Err(error) => tracing::warn!(kind = ?error.kind(), "membership sync tick failed"),
+      }
+      // The reconciliation plane's tick: the migrated lanes ride it
+      // (priming, epoch-driven local changes, the cadence root
+      // exchange, and the backlog drain). Its dispatches are
+      // fire-and-forget under the admission-ack discipline, so a
+      // failure is diagnostics only — the next root exchange re-drives.
+      // A driver spawned without a plane (the supervisor always passes
+      // one) simply runs the watermark lanes alone.
+      if let Some(reconcile) = reconcile
+        && let Err(error) = reconcile.tick(runtime).await
+      {
+        tracing::warn!(kind = ?error.kind(), "reconcile tick failed");
       }
       match crate::resource::sync::resource_sync_tick(
         context,
@@ -192,6 +206,7 @@ pub(super) fn spawn_sync_driver(
             &mut pending_resource,
             &driver_events,
             &driver_revision,
+            driver_reconcile.as_ref(),
           )
           .await;
         }
@@ -219,6 +234,7 @@ pub(super) fn spawn_sync_driver(
             &mut pending_resource,
             &driver_events,
             &driver_revision,
+            driver_reconcile.as_ref(),
           )
           .await;
           // Settle this round's verdicts inline: the requested round's

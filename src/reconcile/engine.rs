@@ -247,24 +247,16 @@ impl Engine {
     }
   }
 
-  /// The lane this engine reconciles.
-  pub(crate) fn lane(&self) -> LaneId {
-    self.lane
-  }
-
   /// The whole-lane aggregate: the ROOT fingerprint.
+  #[cfg(test)]
   pub(crate) fn root(&self) -> Fingerprint {
     self.index.root()
   }
 
   /// The number of rows held.
+  #[cfg(test)]
   pub(crate) fn len(&self) -> usize {
     self.index.len()
-  }
-
-  /// No row is held.
-  pub(crate) fn is_empty(&self) -> bool {
-    self.index.is_empty()
   }
 
   /// Stores one local row (an insert or an in-place replacement of the

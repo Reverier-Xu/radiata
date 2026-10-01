@@ -25,7 +25,6 @@ use crate::{
       TRUST_BINDINGS_PAGE_LIMIT, accept_snapshot, refresh_issuer_snapshot, store as trust_store,
     },
   },
-  membership::page::{DEFAULT_PAGE_LIMIT, MembershipPage, sync as page_sync},
   runtime::RuntimeClient,
   session::stream::SessionTable,
 };
@@ -36,9 +35,11 @@ pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str = "radiata.woooo.tech/protocols/
 /// The wire schema of one sync payload.
 const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-sync-payload-v1";
 
-/// Payload kinds: a membership page of descriptors, or an issuer trust
-/// snapshot (grant set).
-pub(crate) const SYNC_KIND_PAGE: u8 = 1;
+/// Payload kinds: an issuer trust snapshot (grant set), or the removal
+/// tombstones. The descriptor lane rides the reconciliation plane
+/// (`crate::reconcile::plane`); the membership-sync protocol carries the
+/// interactive leave plane (announcement plus applied receipt) and the
+/// tombstones until that lane migrates too.
 pub(crate) const SYNC_KIND_SNAPSHOT: u8 = 2;
 pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
 pub(crate) const SYNC_KIND_CLEANUP: u8 = 4;
@@ -49,12 +50,10 @@ pub(crate) const SYNC_KIND_CHECKPOINT: u8 = 6;
 /// leave the announcement on its documented bounded-degradation path.
 pub(crate) const SYNC_KIND_LEAVE_APPLIED: u8 = 7;
 
-/// One sync payload: an encoded membership page, an encoded issuer trust
-/// snapshot, or an encoded signed removal tombstone.
+/// One sync payload: an encoded issuer trust snapshot, or an encoded
+/// signed removal tombstone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SyncPayload {
-  /// An encoded [`MembershipPage`].
-  Page(ByteVec),
   /// One encoded issuer snapshot page.
   Snapshot(ByteVec),
   /// An encoded [`crate::identity::leave::LeaveRecordV1`].
@@ -74,7 +73,6 @@ pub(crate) enum SyncPayload {
 impl SyncPayload {
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     let (kind, payload) = match self {
-      Self::Page(encoded) => (SYNC_KIND_PAGE, encoded.clone()),
       Self::Snapshot(encoded) => (SYNC_KIND_SNAPSHOT, encoded.clone()),
       Self::Leave(encoded) => (SYNC_KIND_LEAVE, encoded.clone()),
       Self::Cleanup(encoded) => (SYNC_KIND_CLEANUP, encoded.clone()),
@@ -98,7 +96,6 @@ impl SyncPayload {
       "membership sync payload schema",
     )?;
     match kind {
-      SYNC_KIND_PAGE => Ok(Self::Page(payload)),
       SYNC_KIND_SNAPSHOT => Ok(Self::Snapshot(payload)),
       SYNC_KIND_LEAVE => Ok(Self::Leave(payload)),
       SYNC_KIND_CLEANUP => Ok(Self::Cleanup(payload)),
@@ -186,8 +183,9 @@ impl PacketConsumer for MembershipSyncConsumer {
 /// Emits the paired member-set change notification: the transient event
 /// for live subscribers plus the persistent revision bump for watch-based
 /// observers. The bump trails the persist, so a released watcher is
-/// guaranteed the change is durable and query-visible.
-fn member_changed(
+/// guaranteed the change is durable and query-visible. Shared with the
+/// reconciliation plane so both install paths bump exactly once.
+pub(crate) fn member_changed(
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal, node: NodeId,
 ) {
   events.emit(crate::MemberChanged::new(node));
@@ -344,6 +342,257 @@ pub(crate) async fn announce_leave(
   Ok(())
 }
 
+/// The tombstone arms' shared verification context: the trusted-binding
+/// set plus the collected-tombstone watermark, loaded once per payload
+/// or row batch (every arm consults both).
+struct TombstoneEvidence {
+  bindings: std::collections::BTreeMap<NodeId, crate::PublicKey>,
+  checkpoint: Option<u64>,
+}
+
+async fn tombstone_evidence(store: &crate::storage::MetadataStore) -> Result<TombstoneEvidence> {
+  Ok(TombstoneEvidence {
+    bindings: trust_store::trusted_bindings(store).await?,
+    checkpoint: crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await?,
+  })
+}
+
+/// True when the record's timestamp sits at or before the collected
+/// tombstone watermark: the cluster already asserted it collectable, so
+/// re-persisting it would resurrect collected evidence — the receive
+/// side of the sender-side store filter the watermark walk had (a
+/// sender never forwarded a record its own GC had collected; the
+/// reconciliation engines cannot forget rows, so the filter lives
+/// here).
+fn collected(checkpoint: Option<u64>, timestamp_millis: u64) -> bool {
+  checkpoint.is_some_and(|watermark| timestamp_millis <= watermark)
+}
+
+/// Applies one encoded owner-signed leave record: verified against the
+/// permanently retained binding before any persistence. A record whose
+/// binding has not converged yet is skipped; the next epoch pass of the
+/// reconciliation plane (or the resend cadence until that lane migrates)
+/// heals the ordering. `expected_subject` guards the row-key↔record
+/// attribution when the record arrives as a reconciliation row. A
+/// durable install answers the sender with the applied receipt when
+/// `runtime` and `source` are present.
+#[allow(clippy::too_many_arguments)]
+async fn apply_leave_record(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+  evidence: &TombstoneEvidence, encoded: &[u8], expected_subject: Option<&[u8]>,
+  source: Option<&NodeId>, runtime: Option<&RuntimeClient>,
+) -> Result<()> {
+  let record = crate::identity::leave::LeaveRecordV1::decode(encoded)?;
+  if let Some(subject) = expected_subject
+    && subject != record.node().as_str().as_bytes()
+  {
+    return Err(Error::invalid_input("reconcile leave subject"));
+  }
+  if collected(evidence.checkpoint, record.timestamp_millis()) {
+    tracing::debug!(node = %record.node(), "leave record skipped: already collected");
+    return Ok(());
+  }
+  let Some(bound_key) = evidence.bindings.get(record.node()) else {
+    tracing::debug!(node = %record.node(), "leave record skipped: binding unknown");
+    return Ok(());
+  };
+  if bound_key != record.public_key() {
+    return Err(Error::not_trusted("leave record binding"));
+  }
+  // The writer exclusion serializes the persist against every other
+  // store writer, so terminal evidence cannot be dropped on contention.
+  // A persist failure must be attributable at the apply site: the
+  // sender keeps forwarding the record, so an unlogged failure here
+  // looks like a receiver-side roster stall.
+  if let Err(error) =
+    crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await
+  {
+    tracing::debug!(
+      node = %record.node(),
+      kind = ?error.kind(),
+      "leave record persist failed"
+    );
+    return Err(error);
+  }
+  crate::audit::leave_record_persisted(record.node().as_str());
+  member_changed(events, revision, record.node().clone());
+  let (Some(source), Some(runtime)) = (source, runtime) else {
+    return Ok(());
+  };
+  let receipt = SyncPayload::LeaveApplied {
+    node: record.node().clone(),
+  }
+  .encode()?;
+  let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
+  // The applied receipt: one durable-install confirmation back to the
+  // leaver, best-effort and retried by the announcement budget.
+  // Pre-receipt peers simply never send it. The admission ack is
+  // still observed (delivery truth): the wait runs detached so the
+  // pump never serializes behind it, and a failed admission is
+  // diagnostics only — the receipt is a hint, never a trust decision.
+  let entropy = Arc::clone(entropy);
+  let peer = source.clone();
+  match crate::sync_common::send_payload(runtime, &entropy, &peer, &protocol, &receipt).await {
+    Ok(ack) => {
+      tokio::spawn(async move {
+        if !crate::sync_common::delivered_within_bound(ack).await {
+          tracing::debug!(peer = %peer.as_str(), "leave applied receipt not admitted");
+        }
+      });
+    }
+    Err(error) => {
+      tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
+    }
+  }
+  Ok(())
+}
+
+/// Applies one encoded issuer-signed cleanup tombstone: verified
+/// against the retained issuer and subject bindings before any
+/// persistence. A tombstone whose bindings have not converged yet is
+/// skipped; the ordering heals on the next pass.
+#[allow(clippy::too_many_arguments)]
+async fn apply_cleanup_record(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+  evidence: &TombstoneEvidence, encoded: &[u8], expected_subject: Option<&[u8]>,
+) -> Result<()> {
+  let record = crate::identity::cleanup::CleanupRecordV1::decode(encoded)?;
+  if let Some(subject) = expected_subject
+    && subject != record.subject().as_str().as_bytes()
+  {
+    return Err(Error::invalid_input("reconcile cleanup subject"));
+  }
+  if collected(evidence.checkpoint, record.timestamp_millis()) {
+    tracing::debug!(subject = %record.subject(), "cleanup record skipped: already collected");
+    return Ok(());
+  }
+  if !evidence.bindings.contains_key(record.issuer())
+    || !evidence.bindings.contains_key(record.subject())
+  {
+    tracing::debug!(subject = %record.subject(), "cleanup record skipped: bindings unknown");
+    return Ok(());
+  }
+  crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), &record).await?;
+  member_changed(events, revision, record.subject().clone());
+  Ok(())
+}
+
+/// Applies one encoded revocation tombstone: convergent permanent
+/// evidence, verified against the retained issuer and subject bindings
+/// before any persistence, never covered by checkpoints, and never
+/// re-adoptable away. A persisted revocation closes the authorization
+/// boundary immediately on this node too: any live session with the
+/// revoked identity retires (its recovery dials race the propagation,
+/// so a session admitted before this tombstone landed must not linger).
+#[allow(clippy::too_many_arguments)]
+async fn apply_revocation_record(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+  events: &Arc<crate::node::EventHub>, evidence: &TombstoneEvidence, encoded: &[u8],
+  expected_subject: Option<&[u8]>, sessions: &crate::session::stream::SessionTable,
+) -> Result<()> {
+  let record = crate::identity::revocation::RevocationRecordV1::decode(encoded)?;
+  if let Some(subject) = expected_subject
+    && subject != record.subject().as_str().as_bytes()
+  {
+    return Err(Error::invalid_input("reconcile revocation subject"));
+  }
+  if !evidence.bindings.contains_key(record.issuer())
+    || !evidence.bindings.contains_key(record.subject())
+  {
+    tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
+    return Ok(());
+  }
+  crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record).await?;
+  events.emit(crate::NodeRevoked::new(record.subject().clone()));
+  crate::session::stream::retire_session(sessions, record.subject())?;
+  Ok(())
+}
+
+/// Applies one encoded cleanup checkpoint: unsigned hygiene knowledge,
+/// max-wins by watermark, never gating live entries or revocations.
+async fn apply_checkpoint_record(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>, encoded: &[u8],
+  expected_subject: Option<&[u8]>,
+) -> Result<()> {
+  let checkpoint = crate::identity::cleanup::CleanupCheckpointV1::decode(encoded)?;
+  if let Some(subject) = expected_subject
+    && subject != b"checkpoint"
+  {
+    return Err(Error::invalid_input("reconcile checkpoint subject"));
+  }
+  crate::identity::cleanup::persist_checkpoint_ctx(store, entropy.as_ref(), &checkpoint).await?;
+  Ok(())
+}
+
+/// The tombstone lane's reconciliation row apply: kind-prefixed keys
+/// (the plane's `TombstoneKind` prefixes) dispatch to the same per-record
+/// arms the announcement payload uses, so both planes verify, persist,
+/// notify, and collect identically. `source` addresses the applied
+/// receipt to the peer that carried the rows; the derived-view repair
+/// passes `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_tombstone_rows(
+  context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+  sessions: &crate::session::stream::SessionTable, rows: &[(Vec<u8>, Vec<u8>)],
+  source: Option<&NodeId>, runtime: Option<&RuntimeClient>,
+) -> Result<()> {
+  let store = context.store();
+  let evidence = tombstone_evidence(store).await?;
+  for (key, content) in rows {
+    let Some((kind, subject)) = key.split_first() else {
+      return Err(Error::invalid_input("reconcile tombstone key"));
+    };
+    match kind {
+      1 => {
+        apply_leave_record(
+          store,
+          entropy,
+          events,
+          revision,
+          &evidence,
+          content,
+          Some(subject),
+          source,
+          runtime,
+        )
+        .await?;
+      }
+      2 => {
+        apply_cleanup_record(
+          store,
+          entropy,
+          events,
+          revision,
+          &evidence,
+          content,
+          Some(subject),
+        )
+        .await?;
+      }
+      3 => {
+        apply_revocation_record(
+          store,
+          entropy,
+          events,
+          &evidence,
+          content,
+          Some(subject),
+          sessions,
+        )
+        .await?;
+      }
+      4 => {
+        apply_checkpoint_record(store, entropy, content, Some(subject)).await?;
+      }
+      _ => return Err(Error::invalid_input("reconcile tombstone kind")),
+    }
+  }
+  Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn accept_payload(
   context: &Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>,
@@ -352,32 +601,7 @@ async fn accept_payload(
   runtime: &RuntimeClient, source: &NodeId, payload: &SyncPayload,
 ) -> Result<()> {
   let store = context.store();
-  // The three tombstone lanes verify against the same trusted-binding
-  // set: one load per payload covers every tombstone arm (the snapshot
-  // lane keeps its own accept policy inside the trust module).
-  let tombstone_bindings = if matches!(
-    payload,
-    SyncPayload::Leave(_) | SyncPayload::Cleanup(_) | SyncPayload::Revocation(_)
-  ) {
-    Some(trust_store::trusted_bindings(store).await?)
-  } else {
-    None
-  };
   match payload {
-    SyncPayload::Page(encoded) => {
-      let page = MembershipPage::decode(encoded.as_ref())?;
-      // Every newly installed descriptor is one member change.
-      let installed = page_sync::apply_page_ctx(store, entropy.as_ref(), &page).await?;
-      for descriptor in page.descriptors() {
-        if installed.contains(descriptor.node()) {
-          // The audit event is the propagation path proof: a
-          // descriptor exists on this peer only because this page
-          // carried it.
-          crate::audit::descriptor_installed(descriptor.node().as_str(), descriptor.revision());
-          member_changed(events, revision, descriptor.node().clone());
-        }
-      }
-    }
     SyncPayload::Snapshot(encoded) => {
       let page = crate::identity::trust::TrustSnapshotPage::decode(encoded.as_ref())?;
       // The trust adoption policy lives in the trust module: issuer key
@@ -386,64 +610,19 @@ async fn accept_payload(
       accept_snapshot(store, entropy.as_ref(), &page).await?;
     }
     SyncPayload::Leave(encoded) => {
-      // An owner-signed leave record is terminal evidence: verified
-      // against the permanently retained binding
-      // before any persistence. A record whose binding has not converged
-      // yet is skipped; the resend cadence heals the ordering.
-      let record = crate::identity::leave::LeaveRecordV1::decode(encoded.as_ref())?;
-      let Some(bindings) = tombstone_bindings.as_ref() else {
-        // Unreachable: the Leave arm pre-loads the tombstone binding set.
-        return Err(Error::internal("tombstone bindings"));
-      };
-      let Some(bound_key) = bindings.get(record.node()) else {
-        tracing::debug!(node = %record.node(), "leave record skipped: binding unknown");
-        return Ok(());
-      };
-      if bound_key != record.public_key() {
-        return Err(Error::not_trusted("leave record binding"));
-      }
-      // The writer exclusion serializes the persist against every other
-      // store writer, so terminal evidence cannot be dropped on contention.
-      // A persist failure must be attributable at the apply site: the
-      // sender keeps forwarding the record (the resend cadence heals), so
-      // an unlogged failure here looks like a receiver-side roster stall.
-      if let Err(error) =
-        crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await
-      {
-        tracing::debug!(
-          node = %record.node(),
-          kind = ?error.kind(),
-          "leave record persist failed"
-        );
-        return Err(error);
-      }
-      crate::audit::leave_record_persisted(record.node().as_str());
-      member_changed(events, revision, record.node().clone());
-      let receipt = SyncPayload::LeaveApplied {
-        node: record.node().clone(),
-      }
-      .encode()?;
-      let protocol = ProtocolTag::parse(MEMBERSHIP_SYNC_PROTOCOL)?;
-      // The applied receipt: one durable-install confirmation back to
-      // the leaver, best-effort and retried by the announcement budget.
-      // Pre-receipt peers simply never send it. The admission ack is
-      // still observed (delivery truth): the wait runs detached so
-      // the pump never serializes behind it, and a failed admission is
-      // diagnostics only — the receipt is a hint, never a trust
-      // decision, and is never retried here.
-      match crate::sync_common::send_payload(runtime, &entropy, source, &protocol, &receipt).await {
-        Ok(ack) => {
-          let peer = source.clone();
-          tokio::spawn(async move {
-            if !crate::sync_common::delivered_within_bound(ack).await {
-              tracing::debug!(peer = %peer.as_str(), "leave applied receipt not admitted");
-            }
-          });
-        }
-        Err(error) => {
-          tracing::debug!(kind = ?error.kind(), "leave applied receipt skipped");
-        }
-      }
+      let evidence = tombstone_evidence(store).await?;
+      apply_leave_record(
+        store,
+        &entropy,
+        events,
+        revision,
+        &evidence,
+        encoded.as_ref(),
+        None,
+        Some(source),
+        Some(runtime),
+      )
+      .await?;
     }
     SyncPayload::LeaveApplied { node } => {
       // A receipt is a hint addressed to the record's subject only:
@@ -454,53 +633,33 @@ async fn accept_payload(
       leave_applied.bump();
     }
     SyncPayload::Cleanup(encoded) => {
-      // An issuer-signed cleanup tombstone is terminal evidence: verified
-      // against the retained issuer and subject
-      // bindings before any persistence. A tombstone whose bindings have
-      // not converged yet is skipped; the resend cadence heals ordering.
-      let record = crate::identity::cleanup::CleanupRecordV1::decode(encoded.as_ref())?;
-      let Some(bindings) = tombstone_bindings.as_ref() else {
-        // Unreachable: the Cleanup arm pre-loads the tombstone binding set.
-        return Err(Error::internal("tombstone bindings"));
-      };
-      if !bindings.contains_key(record.issuer()) || !bindings.contains_key(record.subject()) {
-        tracing::debug!(subject = %record.subject(), "cleanup record skipped: bindings unknown");
-        return Ok(());
-      }
-      crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), &record)
-        .await?;
-      member_changed(events, revision, record.subject().clone());
+      let evidence = tombstone_evidence(store).await?;
+      apply_cleanup_record(
+        store,
+        &entropy,
+        events,
+        revision,
+        &evidence,
+        encoded.as_ref(),
+        None,
+      )
+      .await?;
     }
     SyncPayload::Revocation(encoded) => {
-      // A revocation tombstone is convergent permanent evidence: verified
-      // against the retained issuer and subject
-      // bindings before any persistence, never covered by checkpoints, and
-      // never re-adoptable away. A tombstone whose bindings have not
-      // converged yet is skipped; the resend cadence heals ordering.
-      let record = crate::identity::revocation::RevocationRecordV1::decode(encoded.as_ref())?;
-      let Some(bindings) = tombstone_bindings.as_ref() else {
-        // Unreachable: the Revocation arm pre-loads the tombstone binding set.
-        return Err(Error::internal("tombstone bindings"));
-      };
-      if !bindings.contains_key(record.issuer()) || !bindings.contains_key(record.subject()) {
-        tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
-        return Ok(());
-      }
-      crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record).await?;
-      events.emit(crate::NodeRevoked::new(record.subject().clone()));
-      // A persisted revocation closes the authorization boundary
-      // immediately on this node too: retire any live session with the
-      // revoked identity (its recovery dials race the propagation, so a
-      // session admitted before this tombstone landed must not linger).
-      crate::session::stream::retire_session(sessions, record.subject())?;
+      let evidence = tombstone_evidence(store).await?;
+      apply_revocation_record(
+        store,
+        &entropy,
+        events,
+        &evidence,
+        encoded.as_ref(),
+        None,
+        sessions,
+      )
+      .await?;
     }
     SyncPayload::Checkpoint(encoded) => {
-      // A cleanup checkpoint is unsigned hygiene knowledge: max-wins by
-      // watermark, never gating live entries or
-      // revocations.
-      let checkpoint = crate::identity::cleanup::CleanupCheckpointV1::decode(encoded.as_ref())?;
-      crate::identity::cleanup::persist_checkpoint_ctx(store, entropy.as_ref(), &checkpoint)
-        .await?;
+      apply_checkpoint_record(store, &entropy, encoded.as_ref(), None).await?;
     }
   }
   Ok(())
@@ -618,10 +777,6 @@ pub(crate) struct MembershipSyncCursors {
 /// rounds this replaced).
 #[derive(Debug, Clone)]
 pub(crate) struct PeerSyncState {
-  /// The descriptor plane's watermark walk over the node's descriptor
-  /// catalog: diff pages only, detection cadence shared with the
-  /// resource lane.
-  descriptors: crate::sync_common::WatermarkWalk<Vec<u8>>,
   /// The trust plane's watermark walk over the local issuer snapshot's
   /// binding set. Bindings are append-only and adopted per record, so a
   /// missing binding in a diff page is never a removal (removals retire
@@ -653,9 +808,6 @@ pub(crate) struct PeerSyncState {
 impl Default for PeerSyncState {
   fn default() -> Self {
     Self {
-      descriptors: crate::sync_common::WatermarkWalk::new(
-        crate::sync_common::DETECTION_CADENCE_TICKS,
-      ),
       trust: crate::sync_common::WatermarkWalk::new(SNAPSHOT_RESEND_TICKS),
       confirmed_tombstones: std::collections::BTreeSet::new(),
       tombstone_ticks: 0,
@@ -714,7 +866,6 @@ fn tombstone_round_due(unconfirmed: usize, ticks_since_send: u32) -> bool {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PeerPlanesInFlight {
   pub(crate) tombstones: bool,
-  pub(crate) descriptors: bool,
   pub(crate) trust: bool,
 }
 
@@ -733,10 +884,6 @@ pub(crate) struct MembershipPendingRound {
     u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )>,
-  page_acks: Vec<(
-    NodeId,
-    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
-  )>,
   trust_acks: Vec<(
     NodeId,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
@@ -752,9 +899,6 @@ impl MembershipPendingRound {
     for (peer, ..) in &self.tombstone_acks {
       in_flight.entry(peer.clone()).or_default().tombstones = true;
     }
-    for (peer, _) in &self.page_acks {
-      in_flight.entry(peer.clone()).or_default().descriptors = true;
-    }
     for (peer, _) in &self.trust_acks {
       in_flight.entry(peer.clone()).or_default().trust = true;
     }
@@ -768,7 +912,7 @@ impl MembershipPendingRound {
     // not serialize the settlement behind its ack wait (that would make
     // the convergence bound liveness teardown, not the anti-entropy
     // cadence).
-    let (tombstone_verdicts, page_verdicts, trust_verdicts) = futures_util::future::join3(
+    let (tombstone_verdicts, trust_verdicts) = futures_util::future::join(
       futures_util::future::join_all(self.tombstone_acks.into_iter().map(
         |(peer, digest, ack)| async move {
           (
@@ -778,9 +922,6 @@ impl MembershipPendingRound {
           )
         },
       )),
-      futures_util::future::join_all(self.page_acks.into_iter().map(|(peer, ack)| async move {
-        (peer, crate::sync_common::delivered_within_bound(ack).await)
-      })),
       futures_util::future::join_all(self.trust_acks.into_iter().map(|(peer, ack)| async move {
         (peer, crate::sync_common::delivered_within_bound(ack).await)
       })),
@@ -788,7 +929,6 @@ impl MembershipPendingRound {
     .await;
     MembershipRoundEffects {
       tombstone_verdicts,
-      page_verdicts,
       trust_verdicts,
     }
   }
@@ -798,7 +938,6 @@ impl MembershipPendingRound {
 /// cursors.
 pub(crate) struct MembershipRoundEffects {
   tombstone_verdicts: Vec<(NodeId, u64, bool)>,
-  page_verdicts: Vec<(NodeId, bool)>,
   trust_verdicts: Vec<(NodeId, bool)>,
 }
 
@@ -821,14 +960,6 @@ pub(crate) fn apply_round_effects(
       }
       state.confirmed_tombstones.insert(digest);
       state.ticks_since_tombstone_send = 0;
-    }
-  }
-  for (peer, delivered) in effects.page_verdicts {
-    if let Some(state) = cursors.peers.get_mut(&peer)
-      && let Some(settled) = state.descriptors.settle_outcome(delivered)
-      && settled.refreshed
-    {
-      crate::audit::membership_watermarks_refreshed(peer.as_str());
     }
   }
   for (peer, delivered) in effects.trust_verdicts {
@@ -874,11 +1005,6 @@ struct MembershipPeerRound {
     u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )>,
-  /// The descriptor page's admission receiver: its verdict settles the
-  /// peer's descriptor walk. A `None` beside dispatched bytes means the
-  /// wire rejected the page: no pending entry landed, and the walk
-  /// re-emits the same range next round.
-  page_ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
   /// The trust page's admission receiver: its verdict settles the peer's
   /// trust walk.
   trust_ack: Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
@@ -893,70 +1019,27 @@ struct PendingDispatch<K> {
   marks: Vec<(Vec<u8>, u64)>,
 }
 
-/// One per-peer membership anti-entropy step, mirroring the resource
-/// lane's `resource_sync_tick_peer`: each plane's watermark walk decides
-/// its own round — a quiet walk dispatches nothing at all (an unchanged
-/// catalog, an unchanged binding set, a fully confirmed tombstone set),
-/// and a due walk emits the next bounded diff page carrying only the
-/// rows the peer is missing. The delivery verdicts are aggregated (and
-/// walk commits gated) by the tick's caller.
+/// One per-peer membership anti-entropy step: each plane's watermark
+/// walk decides its own round — a quiet walk dispatches nothing at all
+/// (an unchanged binding set, a fully confirmed tombstone set), and a
+/// due walk emits the next bounded diff page carrying only the rows
+/// the peer is missing. The descriptor lane rides the reconciliation
+/// plane; this step carries the trust and tombstone planes. The
+/// delivery verdicts are aggregated (and walk commits gated) by the
+/// tick's caller.
 #[allow(clippy::too_many_arguments)]
 async fn membership_sync_tick_peer(
-  catalog: &(dyn crate::provider::StoreSnapshot + '_), entropy: &Arc<dyn Entropy>,
-  runtime: &RuntimeClient, peer: &NodeId, state: &mut PeerSyncState, protocol: &ProtocolTag,
-  snapshot: Option<&crate::identity::trust::TrustSnapshotV1>, tombstones: &[(u64, Vec<u8>)],
-  planes: PeerPlanesInFlight,
+  entropy: &Arc<dyn Entropy>, runtime: &RuntimeClient, peer: &NodeId, state: &mut PeerSyncState,
+  protocol: &ProtocolTag, snapshot: Option<&crate::identity::trust::TrustSnapshotV1>,
+  tombstones: &[(u64, Vec<u8>)], planes: PeerPlanesInFlight,
 ) -> Result<MembershipPeerRound> {
-  // The tombstone cadence advances every tick — independent of the page
-  // planes' (possibly multi-tick) passes — and is pulled back to zero
-  // only by delivered tombstone verdicts in the tick's aggregator, so
-  // an undelivered round retries on the cadence instead of waiting out
-  // a full resend interval.
+  // The tombstone cadence advances every tick — independent of the
+  // (possibly multi-tick) trust pass — and is pulled back to zero only
+  // by delivered tombstone verdicts in the tick's aggregator, so an
+  // undelivered round retries on the cadence instead of waiting out a
+  // full resend interval.
   state.ticks_since_tombstone_send = state.ticks_since_tombstone_send.saturating_add(1);
   state.tombstone_ticks = state.tombstone_ticks.saturating_add(1);
-
-  // ---- the descriptor plane: one diff page over the catalog ----
-  let mut page_dispatch: Option<PendingDispatch<Vec<u8>>> = None;
-  if planes.descriptors {
-    state.descriptors.quiet_tick();
-  } else if state.descriptors.pass_due() {
-    let emission = page_sync::emit_page_filtered_from_snapshot(
-      catalog,
-      state.descriptors.cursor().map(|value| value.as_slice()),
-      DEFAULT_PAGE_LIMIT,
-      crate::sync_common::SCAN_BUDGET_PER_TICK,
-      state.descriptors.watermarks(),
-    )
-    .await?;
-    match emission.page {
-      Some(page) => {
-        tracing::debug!(
-          peer = %peer,
-          descriptors = page.descriptors().len(),
-          "membership diff page emitted"
-        );
-        crate::audit::membership_page_emitted(page.descriptors().len());
-        page_dispatch = Some(PendingDispatch {
-          bytes: SyncPayload::Page(ByteVec::from(page.encode()?)).encode()?,
-          boundary: emission.walk_cursor,
-          marks: emission.marks,
-        });
-      }
-      None => {
-        // Nothing to deliver in this step: either the scan reached the
-        // catalog end (the pass completes, the cadence restarts, and the
-        // refresh counter advances) or a budget window closed
-        // change-free mid-catalog (the pass continues from its boundary
-        // next tick — closing there would strand every record behind
-        // the window until the peer's state resets).
-        if state.descriptors.step_quiet(emission.walk_cursor) {
-          crate::audit::membership_watermarks_refreshed(peer.as_str());
-        }
-      }
-    }
-  } else {
-    state.descriptors.quiet_tick();
-  }
 
   // ---- the trust plane: one diff page over the issuer binding set ----
   // Bindings are append-only and adopted per record, so a diff page
@@ -1030,23 +1113,19 @@ async fn membership_sync_tick_peer(
   // A round with nothing due on any plane dispatches nothing at all:
   // the planes' own triggers (a diff row, an unconfirmed tombstone, the
   // detection cadence) are the only reasons anything goes on the wire.
-  if page_dispatch.is_none() && trust_dispatch.is_none() && tombstone_payloads.is_empty() {
+  if trust_dispatch.is_none() && tombstone_payloads.is_empty() {
     return Ok(MembershipPeerRound {
       tombstone_acks: Vec::new(),
-      page_ack: None,
       trust_ack: None,
       dispatched: false,
     });
   }
-  let (tombstone_ack_options, page_ack, trust_ack) = dispatch_to_peer(
+  let (tombstone_ack_options, trust_ack) = dispatch_to_peer(
     peer,
     trust_dispatch
       .as_ref()
       .map(|dispatch| dispatch.bytes.as_slice()),
     &tombstone_payloads,
-    page_dispatch
-      .as_ref()
-      .map(|dispatch| dispatch.bytes.as_slice()),
     runtime,
     entropy,
     protocol,
@@ -1068,19 +1147,6 @@ async fn membership_sync_tick_peer(
   // walk's cursor still sits at this step's scan start and its cadence
   // counter was never reset, so the next tick re-emits exactly the same
   // range.
-  let page_ack = match (page_dispatch, page_ack) {
-    (Some(dispatch), Some(ack)) => {
-      state
-        .descriptors
-        .dispatched(dispatch.boundary, dispatch.marks);
-      Some(ack)
-    }
-    (Some(_), None) => {
-      crate::audit::membership_page_rewound(peer.as_str());
-      None
-    }
-    (None, ack) => ack,
-  };
   let trust_ack = match (trust_dispatch, trust_ack) {
     (Some(dispatch), Some(ack)) => {
       state.trust.dispatched(dispatch.boundary, dispatch.marks);
@@ -1094,7 +1160,6 @@ async fn membership_sync_tick_peer(
   };
   Ok(MembershipPeerRound {
     tombstone_acks,
-    page_ack,
     trust_ack,
     dispatched: true,
   })
@@ -1200,9 +1265,6 @@ pub(crate) async fn sync_tick(
     crate::sync_common::SYNC_PEERS_PER_ROUND,
   );
   cursors.rotation = rotation.cloned();
-  // One snapshot per tick, shared by every per-peer round: a hub
-  // catching up a hundred leaves pays one scan, not a hundred.
-  let catalog = store.snapshot().await?;
   // A local store write since the last tick (a caller write, an applied
   // page, a persisted tombstone, a snapshot refresh) arms every peer's
   // walks and the tombstone cadence: the changed rows push within one
@@ -1215,7 +1277,6 @@ pub(crate) async fn sync_tick(
   if epoch != cursors.install_epoch {
     cursors.install_epoch = epoch;
     for state in cursors.peers.values_mut() {
-      state.descriptors.arm();
       state.trust.arm();
       state.ticks_since_tombstone_send = SNAPSHOT_RESEND_TICKS;
     }
@@ -1260,10 +1321,6 @@ pub(crate) async fn sync_tick(
     u64,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
   )> = Vec::new();
-  let mut pending_page_acks: Vec<(
-    NodeId,
-    tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
-  )> = Vec::new();
   let mut pending_trust_acks: Vec<(
     NodeId,
     tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>,
@@ -1271,7 +1328,6 @@ pub(crate) async fn sync_tick(
   for peer in window.iter().copied() {
     let state = cursors.peers.entry(peer.clone()).or_default();
     let round = membership_sync_tick_peer(
-      catalog.as_ref(),
       entropy,
       runtime,
       peer,
@@ -1288,11 +1344,10 @@ pub(crate) async fn sync_tick(
     }
     let MembershipPeerRound {
       tombstone_acks,
-      page_ack,
       trust_ack,
       ..
     } = round;
-    if tombstone_acks.is_empty() && page_ack.is_none() && trust_ack.is_none() {
+    if tombstone_acks.is_empty() && trust_ack.is_none() {
       // Nothing was queued (the routing queue rejected outright): the
       // round never left this node. A rejected page never entered its
       // walk, so the next round re-emits the same range.
@@ -1303,23 +1358,16 @@ pub(crate) async fn sync_tick(
         .into_iter()
         .map(|(digest, ack)| (peer.clone(), digest, ack)),
     );
-    if let Some(ack) = page_ack {
-      pending_page_acks.push((peer.clone(), ack));
-    }
     if let Some(ack) = trust_ack {
       pending_trust_acks.push((peer.clone(), ack));
     }
   }
   gc_collected_tombstones(store, entropy).await;
-  if pending_tombstone_acks.is_empty()
-    && pending_page_acks.is_empty()
-    && pending_trust_acks.is_empty()
-  {
+  if pending_tombstone_acks.is_empty() && pending_trust_acks.is_empty() {
     return Ok(None);
   }
   Ok(Some(MembershipPendingRound {
     tombstone_acks: pending_tombstone_acks,
-    page_acks: pending_page_acks,
     trust_acks: pending_trust_acks,
   }))
 }
@@ -1344,18 +1392,16 @@ async fn dispatch_or_log(
 /// The per-tick fan-out to one peer: sends every due payload in order
 /// and returns their admission receivers — the tombstone receivers
 /// aligned with the input payloads (a payload the queue rejected has
-/// `None` at its slot and stays unconfirmed for the next round), the
-/// trust page's receiver, and the descriptor page's receiver, so each
-/// plane's commit is gated on its own delivery verdict. A payload
-/// swallowed by a session that still looks alive never resolves its
-/// receiver, which is exactly the signal the caller needs to re-deliver
-/// from scratch.
+/// `None` at its slot and stays unconfirmed for the next round) and the
+/// trust page's receiver, so each plane's commit is gated on its own
+/// delivery verdict. A payload swallowed by a session that still looks
+/// alive never resolves its receiver, which is exactly the signal the
+/// caller needs to re-deliver from scratch.
 async fn dispatch_to_peer(
-  peer: &NodeId, trust_page: Option<&[u8]>, tombstones: &[&[u8]], page: Option<&[u8]>,
-  runtime: &RuntimeClient, entropy: &Arc<dyn Entropy>, protocol: &ProtocolTag,
+  peer: &NodeId, trust_page: Option<&[u8]>, tombstones: &[&[u8]], runtime: &RuntimeClient,
+  entropy: &Arc<dyn Entropy>, protocol: &ProtocolTag,
 ) -> (
   Vec<Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>>,
-  Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
   Option<tokio::sync::oneshot::Receiver<crate::packet::RoutedAckOutcome>>,
 ) {
   let trust_ack = match trust_page {
@@ -1366,11 +1412,7 @@ async fn dispatch_to_peer(
   for payload in tombstones {
     tombstone_acks.push(dispatch_or_log(peer, payload, runtime, entropy, protocol).await);
   }
-  let page_ack = match page {
-    Some(payload) => dispatch_or_log(peer, payload, runtime, entropy, protocol).await,
-    None => None,
-  };
-  (tombstone_acks, page_ack, trust_ack)
+  (tombstone_acks, trust_ack)
 }
 
 /// The post-round checkpoint GC: collect the
@@ -2051,6 +2093,9 @@ mod tests {
     peer: NodeId,
     events: Arc<crate::node::EventHub>,
     revision: crate::node::MemberRevisionSignal,
+    /// The reconciliation plane driven beside the walk lanes: the
+    /// descriptors lane rides it.
+    plane: crate::reconcile::plane::ReconcilePlane,
     admit_all: Arc<std::sync::Mutex<bool>>,
     snapshot_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     leave_dispatches: Arc<std::sync::atomic::AtomicUsize>,
@@ -2130,7 +2175,19 @@ mod tests {
       let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(64);
       let routes: crate::routing::RouteTable =
         Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-      let runtime = RuntimeClient::routing_only(packet_tx, routes);
+      let runtime = RuntimeClient::routing_only(packet_tx.clone(), routes);
+      let events = Arc::new(crate::node::EventHub::new());
+      let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+      let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+      // The reconciliation plane: the descriptors lane rides it, and
+      // the harness tick drives it beside the walk lanes.
+      let plane = crate::reconcile::plane::ReconcilePlane::new(
+        Arc::clone(&context),
+        Arc::clone(&entropy) as Arc<dyn Entropy>,
+        Arc::clone(&events),
+        revision.clone(),
+        sessions.clone(),
+      );
       let admit_all = Arc::new(std::sync::Mutex::new(true));
       let snapshot_dispatches = Arc::new(AtomicUsize::new(0));
       let leave_dispatches = Arc::new(AtomicUsize::new(0));
@@ -2145,26 +2202,70 @@ mod tests {
       let drainer_pages = Arc::clone(&page_dispatches);
       let drainer_rows = Arc::clone(&page_rows);
       let drainer_peer = peer.clone();
+      // The far side of the reconcile lane: an independent node (its own
+      // store and plane) whose engines the drainer drives with every
+      // frame we send, and whose responses come back to ours — the
+      // same loopback shape the walk harnesses always used, now with a
+      // real negotiation partner.
+      let (_peer_reference, peer_factory) = crate::identity::testing::fresh_reference();
+      let peer_keys = crate::identity::testing::ScriptedKeys::full_at(9_400);
+      let peer_entropy = Arc::new(crate::identity::testing::SequenceEntropy::default());
+      let peer_context = Arc::new(
+        crate::identity::testing::open_context(&peer_factory, &peer_keys, &peer_entropy)
+          .await
+          .unwrap(),
+      );
+      let peer_sessions: SessionTable =
+        Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+      let peer_plane = crate::reconcile::plane::ReconcilePlane::new(
+        peer_context,
+        peer_entropy,
+        events.clone(),
+        revision.clone(),
+        peer_sessions,
+      );
+      let local = context.identity().node().clone();
+      let drainer_own_plane = plane.clone();
+      let drainer_peer_plane = peer_plane.clone();
+      let drainer_runtime = runtime.clone();
       tokio::spawn(async move {
         while let Some(mut request) = packet_rx.recv().await {
           let mut bytes = Vec::new();
           while let Some(chunk) = request.body.as_mut().next().await {
             bytes.extend_from_slice(&chunk.unwrap());
           }
-          match SyncPayload::decode(&bytes).unwrap() {
-            SyncPayload::Snapshot(_) => {
-              drainer_snapshots.fetch_add(1, Ordering::SeqCst);
-            }
-            SyncPayload::Leave(_) => {
-              drainer_leaves.fetch_add(1, Ordering::SeqCst);
-            }
-            SyncPayload::Page(encoded) => {
-              drainer_pages.fetch_add(1, Ordering::SeqCst);
-              if let Ok(page) = MembershipPage::decode(encoded.as_ref()) {
-                drainer_rows.fetch_add(page.descriptors().len(), Ordering::SeqCst);
+          let to_peer = matches!(&request.target, crate::StreamTarget::Exact(target) if *target == drainer_peer);
+          if let Ok(payload) = crate::sync_common::decode_plain_sync_envelope(
+            &bytes,
+            crate::reconcile::plane::RECONCILE_SCHEMA,
+            "harness reconcile canonical",
+            "harness reconcile schema",
+          ) {
+            if let Ok(message) = crate::reconcile::wire::decode(payload.as_ref()) {
+              if to_peer {
+                if let crate::reconcile::wire::Message::Rows { rows, .. } = &message {
+                  drainer_pages.fetch_add(1, Ordering::SeqCst);
+                  drainer_rows.fetch_add(rows.len(), Ordering::SeqCst);
+                }
+                let _ = drainer_peer_plane
+                  .deliver(&drainer_runtime, &local, message.clone())
+                  .await;
+              } else {
+                let _ = drainer_own_plane
+                  .deliver(&drainer_runtime, &drainer_peer, message.clone())
+                  .await;
               }
             }
-            _ => {}
+          } else {
+            match SyncPayload::decode(&bytes).unwrap() {
+              SyncPayload::Snapshot(_) => {
+                drainer_snapshots.fetch_add(1, Ordering::SeqCst);
+              }
+              SyncPayload::Leave(_) => {
+                drainer_leaves.fetch_add(1, Ordering::SeqCst);
+              }
+              _ => {}
+            }
           }
           if *drainer_admit.lock().unwrap() {
             let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
@@ -2174,8 +2275,6 @@ mod tests {
           }
         }
       });
-      let events = Arc::new(crate::node::EventHub::new());
-      let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
       Self {
         context,
         entropy,
@@ -2183,7 +2282,8 @@ mod tests {
         runtime,
         peer,
         events,
-        revision: crate::node::MemberRevisionSignal::new(revision_tx),
+        revision,
+        plane,
         admit_all,
         snapshot_dispatches,
         leave_dispatches,
@@ -2211,6 +2311,21 @@ mod tests {
       {
         settle_round(pending, cursors).await;
       }
+      self.plane.tick(&self.runtime).await.unwrap();
+    }
+
+    /// Waits for the harness's asynchronous lanes (the reconcile
+    /// negotiation runs in the drainer task) to satisfy `condition`,
+    /// returning the harness for chained reads. The bounded wait keeps
+    /// a wedged lane a test failure, never a hang.
+    async fn wait_until(&self, condition: impl Fn(&Self) -> bool) -> &Self {
+      for _ in 0..400 {
+        if condition(self) {
+          return self;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+      }
+      self
     }
 
     /// Injects one more identity binding into the shared store: the
@@ -2270,7 +2385,6 @@ mod tests {
     harness.tick(&mut cursors).await;
     let base_snapshot = harness.snapshot_dispatches.load(Ordering::SeqCst);
     let base_leave = harness.leave_dispatches.load(Ordering::SeqCst);
-    let base_page = harness.page_dispatches.load(Ordering::SeqCst);
     let base_confirmed = cursors
       .peers
       .get(&harness.peer)
@@ -2279,7 +2393,6 @@ mod tests {
       .len();
     assert_eq!(base_snapshot, 1, "the grant set converged");
     assert!(base_leave >= 1, "the known tombstone converged");
-    assert_eq!(base_page, 1, "the catalog converged");
     {
       let state = cursors.peers.get_mut(&harness.peer).unwrap();
       state.ticks_since_tombstone_send = 0;
@@ -2345,107 +2458,15 @@ mod tests {
     assert_eq!(harness.page_dispatches.load(Ordering::SeqCst), 1);
   }
 
-  /// Regression: the tombstone plane's cadence advances on every tick
-  /// — independent of the (possibly multi-tick) descriptor-page pass.
-  /// Under quiet-round-only advancement a long descriptor pass froze
-  /// the tombstone lane for the whole pass.
-  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn a_long_descriptor_pass_does_not_stall_the_tombstone_lane() {
-    use std::sync::atomic::Ordering;
-
-    let harness = CadenceHarness::build().await;
-    // A catalog far larger than one descriptor page: the walk runs a
-    // multi-tick diff pass once the first tick records its boundary.
-    let descriptor_namespace =
-      crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
-        .unwrap();
-    for index in 0..200_u64 {
-      let member = node_at(500 + index);
-      let descriptor = crate::membership::NodeDescriptorV1::new(
-        member.clone(),
-        key_at(1),
-        vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()],
-        1,
-        false,
-        1,
-      );
-      crate::identity::testing::inject_entry(
-        &harness.reference,
-        (
-          descriptor_namespace.clone(),
-          crate::StoreKey::new(std::sync::Arc::from(member.as_str().as_bytes().to_vec())),
-        ),
-        descriptor.encode().unwrap(),
-      );
-    }
-
-    let mut cursors = MembershipSyncCursors::default();
-
-    // Tick 1: the fresh peer's round dispatches the first descriptor
-    // page (the pass starts), the trust page, and the known tombstone;
-    // everything delivers. The page walk is mid-pass. The trust page's
-    // delivery expires the peer's tombstone confirmations, so tick 2
-    // re-forwards the known tombstone beside the page pass.
-    harness.tick(&mut cursors).await;
-    assert!(harness.leave_dispatches.load(Ordering::SeqCst) >= 1);
-    assert!(
-      cursors
-        .peers
-        .get(&harness.peer)
-        .unwrap()
-        .descriptors
-        .cursor()
-        .is_some(),
-      "the descriptor pass is in flight"
-    );
-    harness.tick(&mut cursors).await;
-    let settled = harness.leave_dispatches.load(Ordering::SeqCst);
-    assert!(settled >= 1, "the binding delivery re-forwarded the set");
-
-    // A second tombstone arrives while the descriptor pass is still
-    // mid-flight: its cadence is armed, so the next tick forwards it
-    // beside the ongoing page pass — the tombstone lane never waits
-    // for a quiet round.
-    harness.inject_leave(node_at(78)).await;
-    {
-      let state = cursors.peers.get_mut(&harness.peer).unwrap();
-      state.ticks_since_tombstone_send = SNAPSHOT_RESEND_TICKS;
-    }
-    harness.tick(&mut cursors).await;
-    assert!(
-      harness.leave_dispatches.load(Ordering::SeqCst) > settled,
-      "the tombstone lane forwarded mid-pass"
-    );
-    assert!(
-      cursors
-        .peers
-        .get(&harness.peer)
-        .unwrap()
-        .descriptors
-        .cursor()
-        .is_some(),
-      "the descriptor pass is still in flight"
-    );
-
-    // The delivered tombstone round confirmed the records; with no new
-    // binding progress, the lane goes quiet.
-    let before = harness.leave_dispatches.load(Ordering::SeqCst);
-    harness.tick(&mut cursors).await;
-    assert_eq!(
-      harness.leave_dispatches.load(Ordering::SeqCst),
-      before,
-      "the confirmed tombstones never re-forward"
-    );
-  }
-
   /// Regression (the redundant-edge re-emission storm, now the
-  /// zero-emission steady state): a converged mesh dispatches NOTHING —
-  /// not on the detection cadences, not when they are armed — and a
-  /// real catalog change (a store write) pushes exactly one diff page
-  /// on the next tick, alone. The old ride-along emitted the whole
-  /// catalog beside every leg dispatch, so a converged mesh re-sent
-  /// every descriptor at the legs' resend cadence forever; the
-  /// watermark walks replaced that with quiet digest scans.
+  /// zero-emission steady state): a converged mesh emits no ROWS. The
+  /// reconciliation contract's steady state: the descriptor lane's
+  /// only steady traffic is the cadence ROOT exchange, the converged
+  /// binding walk emits nothing, the tombstone plane's only steady
+  /// traffic is its bounded confirmation refresh, and a real catalog
+  /// change pushes exactly one row on the next tick, alone — one
+  /// changed row costs one row on the wire, never a catalog-sized
+  /// re-send (the 2026-10 audit's cascade amplifier stays removed).
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_converged_mesh_emits_nothing_until_a_real_change() {
     use std::sync::atomic::Ordering;
@@ -2454,59 +2475,64 @@ mod tests {
     let mut cursors = MembershipSyncCursors::default();
 
     // Run well past several detection cadences and confirmation-refresh
-    // windows. The descriptor and trust planes converge on the first
-    // round and NEVER emit again; the tombstone plane's only steady
-    // traffic is its bounded confirmation refresh.
+    // windows: the planes converge in the first round.
     for _ in 0..40 {
       harness.tick(&mut cursors).await;
     }
+    // The initial reconciliation runs asynchronously through the
+    // harness drainer: wait for the ledger to settle before pinning it.
+    let settled = harness
+      .wait_until(|harness| {
+        harness.page_dispatches.load(Ordering::SeqCst) >= 1
+          && harness.page_rows.load(Ordering::SeqCst) >= 1
+      })
+      .await;
     assert_eq!(
-      harness.page_dispatches.load(Ordering::SeqCst),
+      settled.page_dispatches.load(Ordering::SeqCst),
       1,
-      "one page delivered the catalog; the descriptor plane never re-sends"
+      "one reconciliation delivered the catalog; the descriptor lane never re-sends"
     );
-    let converged_rows = harness.page_rows.load(Ordering::SeqCst);
+    let converged_rows = settled.page_rows.load(Ordering::SeqCst);
     assert!(
       converged_rows >= 1,
       "the catalog delivered at least one row"
     );
     assert_eq!(
-      harness.snapshot_dispatches.load(Ordering::SeqCst),
+      settled.snapshot_dispatches.load(Ordering::SeqCst),
       1,
       "the converged binding walk emits nothing"
     );
-    let converged_leaves = harness.leave_dispatches.load(Ordering::SeqCst);
+    let converged_leaves = settled.leave_dispatches.load(Ordering::SeqCst);
     assert!(
       (1..=5).contains(&converged_leaves),
       "the tombstone plane's steady traffic is bounded to the refresh roll"
     );
 
-    // Armed detection passes over a converged state are quiet scans: the
-    // descriptor and trust planes put nothing on the wire and the row
-    // count — the redundancy ledger — does not move.
-    {
-      let state = cursors.peers.get_mut(&harness.peer).unwrap();
-      state.descriptors.arm();
-      state.trust.arm();
+    // Steady state over more cadence windows: the ROOT exchanges carry
+    // no rows — the redundancy ledger does not move.
+    for _ in 0..40 {
+      harness.tick(&mut cursors).await;
     }
-    harness.tick(&mut cursors).await;
-    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 1);
+    let quiet = harness.wait_until(|_| true).await;
     assert_eq!(
-      harness.page_dispatches.load(Ordering::SeqCst),
+      quiet.page_dispatches.load(Ordering::SeqCst),
       1,
-      "an armed quiet scan dispatches nothing"
+      "a converged reconciliation emits no ROWS on the cadence"
     );
     assert_eq!(
-      harness.page_rows.load(Ordering::SeqCst),
+      quiet.page_rows.load(Ordering::SeqCst),
       converged_rows,
-      "an armed quiet scan sends zero rows — the whole-catalog resend
-      the fingerprint design performed on every cadence is gone"
+      "the cadence ROOT exchanges send zero rows"
+    );
+    assert_eq!(quiet.snapshot_dispatches.load(Ordering::SeqCst), 1);
+    assert!(
+      quiet.leave_dispatches.load(Ordering::SeqCst) - converged_leaves <= 5,
+      "a quiet mesh does not amplify the tombstone plane"
     );
 
-    // A real catalog change (a store-committed join) arms the walk
+    // A real catalog change (a store-committed join) drives the lane
     // through the register epoch and pushes exactly one diff row on
-    // the next tick, alone: one changed row costs one row on the wire,
-    // not a catalog-sized page (the cascade's amplifier removed).
+    // the next tick, alone.
     let joined = node_at(600);
     let descriptor = crate::membership::NodeDescriptorV1::new(
       joined,
@@ -2524,20 +2550,19 @@ mod tests {
     .await
     .unwrap();
     harness.tick(&mut cursors).await;
+    let changed = harness
+      .wait_until(|harness| harness.page_rows.load(Ordering::SeqCst) > converged_rows)
+      .await;
     assert_eq!(
-      harness.page_dispatches.load(Ordering::SeqCst),
+      changed.page_dispatches.load(Ordering::SeqCst),
       2,
-      "a committed catalog change sends the diff page on the next tick"
+      "a committed catalog change reconciles on the next tick"
     );
     assert_eq!(
-      harness.page_rows.load(Ordering::SeqCst),
+      changed.page_rows.load(Ordering::SeqCst),
       converged_rows + 1,
       "one changed descriptor = exactly one row on the wire"
     );
-    assert_eq!(harness.snapshot_dispatches.load(Ordering::SeqCst), 1);
-    assert!(
-      harness.leave_dispatches.load(Ordering::SeqCst) - converged_leaves <= 1,
-      "a descriptor change does not amplify the tombstone plane"
-    );
+    assert_eq!(changed.snapshot_dispatches.load(Ordering::SeqCst), 1);
   }
 }

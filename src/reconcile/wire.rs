@@ -77,6 +77,7 @@ pub(crate) enum LaneId {
 
 impl LaneId {
   /// Every lane, in wire-code order.
+  #[cfg(test)]
   pub(crate) const ALL: [Self; 4] = [
     Self::Descriptors,
     Self::Trust,
