@@ -113,15 +113,11 @@ pub(super) fn spawn_sync_driver(
       reconcile: Option<&crate::reconcile::plane::ReconcilePlane>,
     ) {
       // The skip set is the union over every unsettled round: a peer
-      // with an in-flight plane skips that plane's dispatch regardless
+      // with an in-flight tombstone dispatch skips its round regardless
       // of which round dispatched it.
       let mut sync_in_flight = crate::membership::sync::InFlightRounds::new();
       for (_, in_flight) in pending_sync.iter() {
-        for (peer, planes) in in_flight {
-          let entry = sync_in_flight.entry(peer.clone()).or_default();
-          entry.tombstones |= planes.tombstones;
-          entry.trust |= planes.trust;
-        }
+        sync_in_flight.extend(in_flight.iter().cloned());
       }
       let mut resource_in_flight = std::collections::BTreeSet::new();
       for (_, in_flight) in pending_resource.iter() {

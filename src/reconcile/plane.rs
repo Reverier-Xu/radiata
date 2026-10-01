@@ -79,7 +79,7 @@ pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/reconcile-
 /// lanes one commit at a time (descriptors, trust, resources,
 /// tombstones); a lane joins this list only by migrating onto the
 /// engine, and a lane not in it still rides the watermark walks.
-const ACTIVE_LANES: [LaneId; 1] = [LaneId::Descriptors];
+const ACTIVE_LANES: [LaneId; 2] = [LaneId::Descriptors, LaneId::Trust];
 
 /// The peers one tick drives with a cadence ROOT exchange: the bounded
 /// fair window over the alive set — the old push-round bound repurposed
@@ -839,6 +839,67 @@ async fn apply_rows(
         runtime,
       )
       .await
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use super::scan_lanes;
+  use crate::identity::lifecycle::LocalIdentityContext;
+
+  fn node(value: u64) -> crate::NodeId {
+    crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn key(value: u64) -> crate::PublicKey {
+    let signing = crate::identity::testing::scripted_signing(value);
+    crate::PublicKey::from_bytes(signing.verifying_key().to_bytes())
+  }
+
+  async fn context_with_bindings(bindings: &[u64]) -> Arc<LocalIdentityContext> {
+    let (_reference, factory) = crate::identity::testing::fresh_reference();
+    let keys = crate::identity::testing::ScriptedKeys::full_at(9_100);
+    let entropy = Arc::new(crate::identity::testing::SequenceEntropy::default());
+    let context = Arc::new(
+      crate::identity::testing::open_context(&factory, &keys, &entropy)
+        .await
+        .unwrap(),
+    );
+    for value in bindings {
+      let (namespace, store_key) =
+        crate::identity::records::identity_binding_key(&node(*value)).unwrap();
+      let binding = crate::identity::records::IdentityBindingV1::new(node(*value), key(*value));
+      crate::identity::trust::store::adopt_binding_ctx(
+        context.store(),
+        entropy.as_ref(),
+        &node(*value),
+        &key(*value),
+      )
+      .await
+      .unwrap();
+      let _ = (namespace, store_key, binding);
+    }
+    context
+  }
+
+  /// The trust lane's row projection: the binding namespace scans into
+  /// one row per binding, keyed by the node id — the append-only key
+  /// space the plane reconciles.
+  #[tokio::test]
+  async fn the_trust_lane_scans_one_row_per_binding() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let lanes = scan_lanes(context.store()).await.unwrap();
+    let trust = lanes
+      .iter()
+      .find(|(lane, _)| matches!(lane, super::super::wire::LaneId::Trust))
+      .unwrap();
+    assert_eq!(trust.1.len(), 2, "one row per adopted binding");
+    for (row_key, _) in &trust.1 {
+      let text = std::str::from_utf8(row_key).unwrap();
+      assert!(text.starts_with("node-"), "keys are node ids: {text}");
     }
   }
 }

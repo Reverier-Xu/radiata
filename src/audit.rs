@@ -92,26 +92,6 @@ pub(crate) fn membership_page_emitted(rows: usize) {
   let _ = rows;
 }
 
-/// One membership page's dispatch was rejected by the wire or lost its
-/// delivery verdict: the peer's walk rewinds, and the same range
-/// re-emits next round.
-pub(crate) fn membership_page_rewound(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "membership page rewound");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
-}
-
-/// One membership watermark table refreshed: the refresh-th pass
-/// completed, so the next pass re-delivers the whole catalog (the
-/// from-scratch liveness bound over the sender's delivery memory).
-pub(crate) fn membership_watermarks_refreshed(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "membership watermarks refreshed");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
-}
-
 /// One purpose-scoped pending journal resolved against durable
 /// evidence: `committed` records the classification.
 pub(crate) fn journal_resolved(purpose: &str, committed: bool) {
