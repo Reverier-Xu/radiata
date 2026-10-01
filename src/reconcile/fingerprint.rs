@@ -90,6 +90,19 @@ impl Fingerprint {
     }
   }
 
+  /// The inverse element under [`Fingerprint::combine`]: combining
+  /// `self` with its inverse yields the identity. The count negates
+  /// (wrapping, so the inverse stays exact) while the xor is its own
+  /// inverse and passes through unchanged. The Fenwick point update
+  /// only folds deltas together, so a removal feeds it the
+  /// singleton's inverse rather than the singleton itself.
+  pub(crate) const fn inverse(self) -> Self {
+    Self {
+      count: self.count.wrapping_neg(),
+      xor: self.xor,
+    }
+  }
+
   /// The aggregated digest count.
   pub(crate) const fn count(&self) -> u64 {
     self.count
@@ -227,7 +240,7 @@ impl<V> FingerprintIndex<V> {
         debug_assert_eq!(removed, digest);
         bucket.fingerprint = bucket.fingerprint.remove(singleton);
         let fenwick_slot = bucket_of(digest) + 1;
-        self.fenwick_update(fenwick_slot, singleton);
+        self.fenwick_update(fenwick_slot, singleton.inverse());
         self.root = self.root.remove(singleton);
         self.len -= 1;
         Some(value)
@@ -385,14 +398,16 @@ mod tests {
   /// Random operation sequences against a BTreeMap oracle: length,
   /// lookups, prefix/range fingerprints, and the root must always
   /// agree with the explicit fold, through interleaved inserts and
-  /// removes.
+  /// removes. Digests draw from a 512-wide key space so the replace
+  /// and remove-hit branches are both reached with real probability —
+  /// uniform 64-bit digests would essentially never repeat.
   #[test]
   fn random_operations_match_the_btree_map_oracle() {
     let mut rng = Rng::new(0x0AC1_E000);
     let mut index: FingerprintIndex<u32> = FingerprintIndex::new();
     let mut oracle_map: BTreeMap<u64, u32> = BTreeMap::new();
     for step in 0..4_000u32 {
-      let digest = rng.next();
+      let digest = rng.next() % 512;
       match rng.next() % 4 {
         0 | 1 => {
           let value = step % 97;
@@ -470,7 +485,9 @@ mod tests {
   /// The exact bucket edges: digests at bucket boundaries, the two
   /// u64 extremes, and the strict-prefix boundary semantics. A
   /// re-inserted digest replaces the value without moving any
-  /// aggregate, and a remove-then-reinsert cycle restores them.
+  /// aggregate, and remove-then-reinsert cycles restore them — with
+  /// the tree-backed prefix and range asserted between the removal
+  /// and the reinsertion.
   #[test]
   fn bucket_boundaries_and_strict_prefixes() {
     let shift = 64 - BUCKET_BITS;
@@ -504,10 +521,37 @@ mod tests {
     assert_eq!(index.insert(1u64 << shift, "replaced"), Some("edge"));
     assert_eq!(index.get(1u64 << shift), Some(&"replaced"));
     assert_eq!(index.root(), root);
-    // Remove and reinsert restores the aggregate exactly.
+    // Remove and reinsert restores the aggregate exactly. The second
+    // removal comes from the low bucket, and its prefix/range are
+    // asserted before the reinsert, so the tree path is observed
+    // directly after a successful remove — not only through root.
     let removed = index.remove(u64::MAX).expect("the max digest is stored");
     assert_eq!(removed, "edge");
     assert_ne!(index.root(), root);
+    let removed = index.remove(0).expect("the zero digest is stored");
+    assert_eq!(removed, "edge");
+    let low_bound = 1u64 << shift;
+    let surviving: Vec<u64> = edges
+      .iter()
+      .copied()
+      .filter(|edge| *edge != 0 && *edge != u64::MAX)
+      .collect();
+    assert_eq!(
+      index.prefix(low_bound),
+      oracle(surviving.iter().copied().filter(|edge| *edge < low_bound)),
+      "tree prefix after the low-bucket remove"
+    );
+    assert_eq!(
+      index.range(2, low_bound + 2),
+      oracle(
+        surviving
+          .iter()
+          .copied()
+          .filter(|edge| *edge >= 2 && *edge < low_bound + 2)
+      ),
+      "tree range after the low-bucket remove"
+    );
+    index.insert(0, "edge");
     index.insert(u64::MAX, "edge");
     assert_eq!(index.root(), root);
   }
