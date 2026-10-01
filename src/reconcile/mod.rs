@@ -2,9 +2,9 @@
 //!
 //! Scope, evidence, and the phased plan live in
 //! `docs/research/06-architecture-proposal.md` (the research cycle's
-//! architecture decision record). In target form the plane replaces the
-//! push watermark anti-entropy (`sync_common`'s `WatermarkWalk`) with
-//! receiver-evidenced range reconciliation: lanes exchange
+//! architecture decision record). The plane replaced the push watermark
+//! anti-entropy with receiver-evidenced range reconciliation: lanes
+//! exchange
 //! `(count, xor)` range fingerprints over their item-digest space, and
 //! row bytes only cross a session for ranges whose fingerprints prove
 //! the receiving side lacks them.

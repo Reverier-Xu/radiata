@@ -79,7 +79,12 @@ pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/reconcile-
 /// lanes one commit at a time (descriptors, trust, resources,
 /// tombstones); a lane joins this list only by migrating onto the
 /// engine, and a lane not in it still rides the watermark walks.
-const ACTIVE_LANES: [LaneId; 3] = [LaneId::Descriptors, LaneId::Trust, LaneId::Resources];
+const ACTIVE_LANES: [LaneId; 4] = [
+  LaneId::Descriptors,
+  LaneId::Trust,
+  LaneId::Resources,
+  LaneId::Tombstones,
+];
 
 /// The peers one tick drives with a cadence ROOT exchange: the bounded
 /// fair window over the alive set — the old push-round bound repurposed

@@ -314,22 +314,6 @@ pub(crate) async fn delivered_within_bound(
 /// pull-based repair), not a larger timer.
 pub(crate) const SEND_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The per-round anti-entropy peer bound: one membership or resource
-/// round pushes to at most this many peers, in fair rotation.
-///
-/// Anti-entropy dispatch is session-carried, so an unbounded round costs
-/// one payload set per live session — and the connection-degree
-/// maintenance plane deliberately grows a node's session count with the
-/// cluster size. Without a bound, the unattended cadence would scale its
-/// per-round burst with the degree, and at the reference 64-node scale
-/// that burst starves the runtime's shared task on a single core (the
-/// starvation gate's measurement). The bound decouples per-round cost
-/// from the degree: a node with at most this many sessions covers every
-/// peer every round (no change for sparse meshes), while a denser node
-/// covers its peers across `ceil(peers / bound)` consecutive rounds.
-/// Convergence latency then grows in rounds, never in per-round load.
-pub(crate) const SYNC_PEERS_PER_ROUND: usize = 2;
-
 /// The fair rotation window over one canonical peer list: at most `cap`
 /// peers starting immediately after `after` (wrapping), so consecutive
 /// rounds cover the whole list without starving any peer. `after` is the
@@ -361,18 +345,6 @@ pub(crate) fn rotation_window<'a>(
 /// mid-flight heals without waiting for the next catalog change. One
 /// constant, so the lanes cannot drift.
 pub(crate) const DETECTION_CADENCE_TICKS: u32 = 32;
-
-/// The content digest of one tombstone payload: the confirmation
-/// identity of a forwarded record. Any change to the bytes flips it and
-/// identical records agree. The value is never serialized (it lives in
-/// this process's memory), so the hash needs in-process determinism
-/// only.
-pub(crate) fn row_digest(value: &[u8]) -> u64 {
-  use std::hash::{Hash, Hasher};
-  let mut hasher = std::collections::hash_map::DefaultHasher::new();
-  value.hash(&mut hasher);
-  hasher.finish()
-}
 
 #[cfg(test)]
 mod tests {

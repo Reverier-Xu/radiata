@@ -15,8 +15,8 @@
 //! The structure is a derived view of storage: never persisted, never
 //! expired, rebuilt from the store snapshot on start. It therefore
 //! cannot drift from the rows it summarizes — the failure mode that
-//! forced the watermark tables' periodic whole-catalog refresh
-//! (`src/sync_common.rs`, `WATERMARK_REFRESH_PASSES`).
+//! forced the watermark tables' periodic whole-catalog refresh, which
+//! the reconciliation engines' derived-view repair replaced.
 //!
 //! Layout: digests partition into `2^BUCKET_BITS` buckets by their top
 //! bits (content digests are uniformly distributed, so buckets stay

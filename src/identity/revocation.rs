@@ -274,6 +274,7 @@ pub(crate) async fn persist_revocation_ctx(
 }
 
 /// Every known revocation tombstone, bounded by `cap`, for sync
+#[cfg(test)]
 /// forwarding. Permanent records: never pruned by any GC pass.
 pub(crate) async fn known_revocation_records_ctx(
   store: &MetadataStore, cap: usize,

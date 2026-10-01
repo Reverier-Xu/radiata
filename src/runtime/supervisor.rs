@@ -170,7 +170,6 @@ pub(crate) async fn spawn_runtime(
     dependencies.events.clone(),
     dependencies.member_revision.clone(),
     dependencies.leave_applied.clone(),
-    dependencies.sessions.clone(),
   ));
   dependencies
     .extensions
@@ -720,7 +719,6 @@ impl Supervisor {
     let sync_driver = Some(spawn_sync_driver(
       &sync_context,
       dependencies.entropy.clone(),
-      dependencies.sessions.clone(),
       crate::runtime::RuntimeClient::routing_only(packet_tx.clone(), dependencies.routes.clone()),
       Arc::clone(&published_endpoints),
       dependencies.config.anti_entropy_interval(),

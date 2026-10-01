@@ -237,11 +237,12 @@ pub(crate) async fn persist_terminal_record(
   // Conflict or Aborted commit definitively did not land, and an Unknown
   // leaves durability indeterminate — the caller must never report a
   // terminal record as persisted without a committed outcome.
-  // A discarded commit outcome would silently drop the tombstone: a
-  // Conflict or Aborted commit definitively did not land, and an Unknown
-  // leaves durability indeterminate — the caller must never report a
-  // terminal record as persisted without a committed outcome.
   crate::provider::commit_verdict(store.commit(transaction).await?, label)?;
+  // The register-write epoch is the reconciliation plane's local-write
+  // trigger: a persisted terminal record (leave, cleanup, revocation)
+  // enters the tombstones lane on the next rescan, so the write must
+  // arm it exactly like every other store write.
+  store.note_local_write();
   Ok(())
 }
 
