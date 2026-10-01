@@ -89,6 +89,30 @@ pub fn persisted_decode(input: &[u8]) {
   let _ = decode_schema_record(&crate::StoreValue::new(std::sync::Arc::from(input)));
 }
 
+/// The reconcile-wire target (`reconcile_decode`): the six reconcile-v1
+/// message shapes under the frozen canonical contract. Every input runs
+/// the exact fail-closed production decode; an input that decodes must
+/// re-encode byte-exactly and re-decode to the identical message — the
+/// canonical round-trip invariant the golden vectors pin pointwise,
+/// asserted here over arbitrary bytes. Any panic is a finding; every
+/// malformed shape (unknown kinds and lanes, over-bound lists, inverted
+/// ranges, non-canonical integers, padding, truncation) stays a typed
+/// rejection.
+pub fn reconcile_decode(input: &[u8]) -> Option<u8> {
+  let Ok(message) = crate::reconcile::wire::decode(input) else {
+    return None;
+  };
+  let encoded = crate::reconcile::wire::encode(&message)
+    .unwrap_or_else(|error| panic!("a decoded message must re-encode: {error:?}"));
+  let round_tripped = crate::reconcile::wire::decode(&encoded)
+    .unwrap_or_else(|error| panic!("the re-encoded body must re-decode: {error:?}"));
+  assert_eq!(
+    round_tripped, message,
+    "the canonical round trip is not a fixed point"
+  );
+  Some(message.lane().code())
+}
+
 /// The selector target (`selector`): the bounded parser plus the
 /// canonical round-trip invariant. Two parses of one input converge, the
 /// canonical text reparses to itself, and every outcome is a value.
@@ -594,6 +618,17 @@ mod replay_tests {
   fn persisted_corpus_replays_in_filename_order() {
     for (name, path, bytes) in corpus_files("persisted_decode") {
       super::persisted_decode(&bytes);
+      let _ = (name, path);
+    }
+  }
+
+  /// Replays one input exactly once through the reconcile-wire target;
+  /// valid entries must satisfy the canonical round-trip invariant
+  /// inside the adapter, malformed entries stay typed rejections.
+  #[test]
+  fn reconcile_corpus_replays_in_filename_order() {
+    for (name, path, bytes) in corpus_files("reconcile_decode") {
+      let _ = super::reconcile_decode(&bytes);
       let _ = (name, path);
     }
   }

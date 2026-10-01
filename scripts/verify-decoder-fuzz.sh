@@ -16,7 +16,7 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-TARGETS=(wire_decode persisted_decode selector)
+TARGETS=(wire_decode reconcile_decode persisted_decode selector)
 FUZZ_TARGET=x86_64-unknown-linux-gnu
 # Gate-closure budget: five uninterrupted wall-clock minutes per
 # activated canonical target, ten-second input timeout, 4 GiB RSS bound.

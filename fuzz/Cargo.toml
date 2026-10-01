@@ -19,6 +19,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "reconcile_decode"
+path = "fuzz_targets/reconcile_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "persisted_decode"
 path = "fuzz_targets/persisted_decode.rs"
 test = false
