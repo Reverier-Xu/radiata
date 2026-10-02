@@ -1022,6 +1022,69 @@ mod tests {
     );
   }
 
+  /// The header-size classes shift the row-fit boundary exactly as
+  /// the arithmetic says at the 255/256 switch: a 255-byte key takes a
+  /// two-byte header, a 256-byte key a three-byte one, so the largest
+  /// fitting content shrinks by two (one key byte, one header byte).
+  /// The `row_fits_message` predicate and the actual encoder agree to
+  /// the byte at the switch.
+  #[test]
+  fn reconcile_wire_row_size_switches_header_class_at_255() {
+    use super::{MAX_BODY_BYTES, row_fits_message};
+    // 255-byte key: 1-byte header for kind/lane/rows-array/row-array
+    // (5 fixed) + 2 (key header) + 3 (content header below 64 KiB).
+    let key255 = vec![0x41u8; 255];
+    let fitting255 = vec![0x42u8; MAX_BODY_BYTES - 5 - 2 - 255 - 3];
+    let one_over255 = vec![0x43u8; MAX_BODY_BYTES - 5 - 2 - 255 - 3 + 1];
+    assert!(row_fits_message(key255.len(), fitting255.len()));
+    assert!(!row_fits_message(key255.len(), one_over255.len()));
+    let bytes = encode(&Message::Rows {
+      lane: LaneId::Descriptors,
+      rows: vec![Row {
+        key: key255.clone(),
+        content: fitting255,
+      }],
+    })
+    .unwrap();
+    assert_eq!(bytes.len(), MAX_BODY_BYTES);
+    assert!(
+      encode(&Message::Rows {
+        lane: LaneId::Descriptors,
+        rows: vec![Row {
+          key: key255,
+          content: one_over255,
+        }],
+      })
+      .is_err()
+    );
+    // 256-byte key: the three-byte header class, the boundary shrinks
+    // by exactly two.
+    let key256 = vec![0x44u8; 256];
+    let fitting256 = vec![0x45u8; MAX_BODY_BYTES - 5 - 3 - 256 - 3];
+    let one_over256 = vec![0x46u8; MAX_BODY_BYTES - 5 - 3 - 256 - 3 + 1];
+    assert!(row_fits_message(key256.len(), fitting256.len()));
+    assert!(!row_fits_message(key256.len(), one_over256.len()));
+    let bytes = encode(&Message::Rows {
+      lane: LaneId::Descriptors,
+      rows: vec![Row {
+        key: key256.clone(),
+        content: fitting256,
+      }],
+    })
+    .unwrap();
+    assert_eq!(bytes.len(), MAX_BODY_BYTES);
+    assert!(
+      encode(&Message::Rows {
+        lane: LaneId::Descriptors,
+        rows: vec![Row {
+          key: key256,
+          content: one_over256,
+        }],
+      })
+      .is_err()
+    );
+  }
+
   /// Inverted ranges and unknown lane codes fail closed even when the
   /// body itself is canonical.
   #[test]

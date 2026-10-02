@@ -307,13 +307,20 @@ struct PlaneState {
   repair_pending: BTreeSet<LaneId>,
   /// The per-lane pull serialization: hints held while any engine of
   /// the lane has an open round (their rows applied, their ranges
-  /// waiting). One node never runs two negotiations of one lane at
-  /// once, so two parallel answerers can never race the same rows onto
-  /// the wire twice — the payload-once discipline of the proposal §8,
-  /// extended from "one round per session" to "one round per node".
-  /// Responses are never held (a peer's initiation must always answer,
-  /// or two nodes holding each other's hints would deadlock).
+  /// waiting), and root-exchange drives (the prime and the cadence
+  /// re-drive are initiations too) held under the same rule. One node
+  /// never runs two negotiations of one lane at once, so two parallel
+  /// answerers can never race the same rows onto the wire twice — the
+  /// payload-once discipline of the proposal §8, extended from "one
+  /// round per session" to "one round per node". Responses are never
+  /// held (a peer's initiation must always answer, or two nodes holding
+  /// each other's hints would deadlock).
   held_hints: BTreeMap<LaneId, Vec<(NodeId, Vec<crate::reconcile::wire::RangeFingerprint>)>>,
+  /// Root-exchange drives waiting out their lane's open round: the
+  /// prime's and the cadence's initiations, re-driven at the release
+  /// point when the lane goes quiet (a fresh whole-lane claim then
+  /// replaces the stale one the wait would have acted on).
+  held_roots: BTreeMap<LaneId, Vec<NodeId>>,
   /// The monotonic tick counter (the hint-retry backoff clock).
   tick_count: u64,
 }
@@ -323,46 +330,91 @@ struct PlaneState {
 const HELD_HINTS_PER_LANE: usize = 8;
 
 impl PlaneState {
-  /// Whether any engine of one lane has an open round.
-  fn lane_in_round(&self, lane: LaneId) -> bool {
-    self
-      .peers
-      .values()
-      .any(|state| state.engines.get(&lane).is_some_and(|e| e.round_open()))
+  /// Whether any engine of one lane has an open round, optionally
+  /// excluding one session's engine (a message from that session walks
+  /// the engine's own round discipline — its `pending_hints` — not the
+  /// node-level hold; a different session's round is what serializes).
+  fn lane_in_round(&self, lane: LaneId, except: Option<&NodeId>) -> bool {
+    self.peers.iter().any(|(peer, state)| {
+      Some(peer) != except && state.engines.get(&lane).is_some_and(|e| e.round_open())
+    })
   }
 
-  /// Releases every held hint whose lane went quiet, driving each into
-  /// its source engine; returns the outbound messages the releases
-  /// generated.
+  /// Whether one more held entry fits the lane's bounded hold.
+  fn hold_room(&self, lane: LaneId) -> bool {
+    self
+      .held_hints
+      .get(&lane)
+      .is_none_or(|held| held.len() < HELD_HINTS_PER_LANE)
+      && self
+        .held_roots
+        .get(&lane)
+        .is_none_or(|held| held.len() < HELD_HINTS_PER_LANE)
+  }
+
+  /// Holds one root-exchange drive (the prime's or the cadence's
+  /// initiation) until the lane goes quiet.
+  fn hold_root_exchange(&mut self, lane: LaneId, peer: NodeId) {
+    self.held_roots.entry(lane).or_default().push(peer);
+  }
+
+  /// Releases every held hint and root-exchange drive whose lane went
+  /// quiet, driving each into its source engine; returns the outbound
+  /// messages the releases generated.
   fn release_held_hints(&mut self) -> Vec<(NodeId, Message)> {
     let mut outbound = Vec::new();
-    let lanes: Vec<LaneId> = self.held_hints.keys().copied().collect();
+    let lanes: Vec<LaneId> = self
+      .held_hints
+      .keys()
+      .chain(self.held_roots.keys())
+      .copied()
+      .collect();
     for lane in lanes {
-      if self.lane_in_round(lane) {
+      if self.lane_in_round(lane, None) {
         continue;
       }
-      let Some(held) = self.held_hints.remove(&lane) else {
-        continue;
-      };
-      for (source, ranges) in held {
-        let Some(state) = self.peers.get_mut(&source) else {
-          continue;
-        };
-        let hint = Message::Hint {
-          lane,
-          ranges,
-          rows: Vec::new(),
-        };
-        match state.engine(lane).drive(Drive::Message(hint)) {
-          Ok(messages) => {
-            outbound.extend(
-              messages
-                .into_iter()
-                .map(|message| (source.clone(), message)),
-            );
+      if let Some(held) = self.held_hints.remove(&lane) {
+        for (source, ranges) in held {
+          let Some(state) = self.peers.get_mut(&source) else {
+            continue;
+          };
+          let hint = Message::Hint {
+            lane,
+            ranges,
+            rows: Vec::new(),
+          };
+          match state.engine(lane).drive(Drive::Message(hint)) {
+            Ok(messages) => {
+              outbound.extend(
+                messages
+                  .into_iter()
+                  .map(|message| (source.clone(), message)),
+              );
+            }
+            Err(error) => {
+              tracing::debug!(lane = ?lane, kind = ?error.kind(), "reconcile held hint failed");
+            }
           }
-          Err(error) => {
-            tracing::debug!(lane = ?lane, kind = ?error.kind(), "reconcile held hint failed");
+        }
+      }
+      if let Some(held) = self.held_roots.remove(&lane) {
+        for peer in held {
+          let Some(state) = self.peers.get_mut(&peer) else {
+            continue;
+          };
+          match state.engine(lane).drive(Drive::RootExchange) {
+            Ok(messages) => {
+              // The same quiet-pass audit event the direct cadence
+              // drive emits: a released re-drive that observes
+              // agreement is a settled pass like any other.
+              if lane == LaneId::Resources && state.engine(lane).peer_agrees() {
+                crate::audit::resource_pass_settled(peer.as_str(), false);
+              }
+              outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
+            }
+            Err(error) => {
+              tracing::debug!(lane = ?lane, kind = ?error.kind(), "reconcile held root failed");
+            }
           }
         }
       }
@@ -435,6 +487,7 @@ impl ReconcilePlane {
           repair_pending: BTreeSet::new(),
           tick_count: 0,
           held_hints: BTreeMap::new(),
+          held_roots: BTreeMap::new(),
         }),
       }),
     }
@@ -565,7 +618,19 @@ impl ReconcilePlane {
           )
         })
         .collect();
+      // The prime's held root exchanges accumulate here (the state
+      // borrow outlives each peer's body) and land in the hold set
+      // after the loop.
+      let mut prime_holds: Vec<(LaneId, NodeId)> = Vec::new();
       for peer in &peers {
+        // The per-lane gating computed ahead of the state borrow:
+        // which lanes' root exchanges hold out the rounds of other
+        // sessions.
+        let held_prime_lanes: Vec<LaneId> = ACTIVE_LANES
+          .iter()
+          .copied()
+          .filter(|lane| guard.lane_in_round(*lane, Some(peer)) && guard.hold_room(*lane))
+          .collect();
         let state = guard
           .peers
           .entry(peer.clone())
@@ -584,10 +649,14 @@ impl ReconcilePlane {
         }
         if !state.primed {
           // Session establishment: the full row set is in, the root
-          // exchange opens the first negotiation.
+          // exchange opens the first negotiation — gated by the
+          // per-lane serialization like every initiation.
           state.primed = true;
           state.ticks_since_exchange = 0;
           for lane in ACTIVE_LANES {
+            if held_prime_lanes.contains(&lane) {
+              continue;
+            }
             match state.engine(lane).drive(Drive::RootExchange) {
               Ok(messages) => {
                 outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
@@ -596,6 +665,9 @@ impl ReconcilePlane {
                 tracing::debug!(lane = ?lane, kind = ?error.kind(), "reconcile prime failed");
               }
             }
+          }
+          for lane in held_prime_lanes {
+            prime_holds.push((lane, peer.clone()));
           }
         } else {
           // The local-write drive over the scanned lanes: the eager
@@ -642,7 +714,8 @@ impl ReconcilePlane {
             }
             let collected_row =
               lane == LaneId::Tombstones && tombstone_collected(checkpoint, key, content);
-            if collected_row || keys.contains(key) {
+            let swept_row = lane == LaneId::Resources && resource_swept(keys, key, content);
+            if collected_row || swept_row || keys.contains(key) {
               prune.push((key.to_vec(), content.to_vec()));
             }
           }
@@ -655,6 +728,11 @@ impl ReconcilePlane {
             }
           }
         }
+      }
+      // The prime's held root exchanges land now that the state
+      // borrows are spent.
+      for (lane, peer) in prime_holds {
+        guard.hold_root_exchange(lane, peer);
       }
       if !plan.is_empty() {
         // The derived-view repair set — engine rows the store scan did
@@ -678,6 +756,11 @@ impl ReconcilePlane {
               if *lane == LaneId::Tombstones && tombstone_collected(checkpoint, key, content) {
                 continue;
               }
+              // The retention-reclaimed exemption: a swept removal row
+              // is not repair work — re-applying it is the resurrection.
+              if *lane == LaneId::Resources && resource_swept(keys, key, content) {
+                continue;
+              }
               if keys.contains(key) {
                 continue;
               }
@@ -696,7 +779,13 @@ impl ReconcilePlane {
           .collect();
         // The outstanding-repair lanes: every epoch advance rescans
         // them until their repair set empties (the cross-lane retry).
-        guard.repair_pending = repair.iter().map(|(lane, _)| *lane).collect();
+        // Lanes outside this pass's plan keep their marks — a narrow
+        // plan (one dirty namespace) must not erase another lane's
+        // pending repair, or its cross-lane retry waits for its own
+        // namespace to dirty again.
+        let recomputed: BTreeSet<LaneId> = repair.iter().map(|(lane, _)| *lane).collect();
+        guard.repair_pending.retain(|lane| !plan.contains(lane));
+        guard.repair_pending.extend(recomputed);
       }
       // The cadence window: ROOT exchanges for the due peers a bounded
       // fair window of the alive set serves this tick. The per-session
@@ -721,9 +810,22 @@ impl ReconcilePlane {
         crate::sync_common::rotation_window(&due, guard.rotation.as_ref(), ROOT_EXCHANGE_WINDOW);
       guard.rotation = rotation.cloned();
       for peer in window.iter().copied() {
+        // The cadence's per-lane gating, computed ahead of the state
+        // borrow.
+        let held_cadence_lanes: Vec<LaneId> = ACTIVE_LANES
+          .iter()
+          .copied()
+          .filter(|lane| guard.lane_in_round(*lane, Some(peer)) && guard.hold_room(*lane))
+          .collect();
         if let Some(state) = guard.peers.get_mut(peer) {
           state.ticks_since_exchange = 0;
           for lane in ACTIVE_LANES {
+            // The cadence initiation is gated like every other: a lane
+            // still negotiating elsewhere re-drives at the release
+            // point with a fresh claim.
+            if held_cadence_lanes.contains(&lane) {
+              continue;
+            }
             match state.engine(lane).drive(Drive::RootExchange) {
               Ok(messages) => {
                 // The resources lane's quiet-pass audit event: the SLO
@@ -745,8 +847,12 @@ impl ReconcilePlane {
             }
           }
         }
+        for lane in held_cadence_lanes {
+          guard.hold_root_exchange(lane, peer.clone());
+        }
       }
-      // Rounds the cadence closed release their held hints too.
+      // Rounds the cadence closed release their held hints and root
+      // re-drives too.
       outbound.extend(guard.release_held_hints());
       // Drain every engine's backlog behind the triggered drives.
       for peer in &peers {
@@ -834,6 +940,7 @@ impl ReconcilePlane {
       // the wire is foreign input.
       return Err(Error::invalid_input("reconcile lane"));
     }
+    let mut message = message;
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = match &message {
       Message::Rows { rows, .. } | Message::Hint { rows, .. } => rows
         .iter()
@@ -841,6 +948,7 @@ impl ReconcilePlane {
         .collect(),
       _ => Vec::new(),
     };
+    let carried = rows.len();
     if !rows.is_empty() && lane == LaneId::Tombstones {
       // The collected-row receive filter: a leave or cleanup record at
       // or before the local checkpoint watermark never enters an
@@ -852,24 +960,88 @@ impl ReconcilePlane {
           .await?;
       rows.retain(|(key, content)| !tombstone_collected(checkpoint, key, content));
     }
+    if !rows.is_empty() && lane == LaneId::Resources {
+      // The retention-reclaimed receive filter, the tombstone mirror:
+      // a removal row whose subject the local store does not hold
+      // never enters an engine. Its subject is already gone here —
+      // admitting the row would only materialize a tombstone that the
+      // next sweep deletes again (the resurrection churn), and a newly
+      // primed peer would receive the whole historical removal set.
+      let context = self.shared.context()?;
+      let store = context.store();
+      let namespace = crate::resource::store::namespace()?;
+      let snapshot = store.snapshot().await?;
+      let mut retained = Vec::with_capacity(rows.len());
+      for (key, content) in rows {
+        let swept = crate::resource::ResourceRecordV1::decode(&content)
+          .ok()
+          .is_some_and(|record| record.removed())
+          && snapshot
+            .get(
+              &namespace,
+              &crate::StoreKey::new(std::sync::Arc::from(key.clone())),
+            )
+            .await?
+            .is_none();
+        if !swept {
+          retained.push((key, content));
+        }
+      }
+      rows = retained;
+    }
+    if rows.len() != carried {
+      // A receive filter dropped rows: the engine's message must carry
+      // the retained set only — driving the original body would
+      // re-admit exactly what the filter refused (the engine applies
+      // piggybacked and carried rows alike before any comparison).
+      let retained_rows = rows
+        .iter()
+        .map(|(key, content)| crate::reconcile::wire::Row {
+          key: key.clone(),
+          content: content.clone(),
+        })
+        .collect();
+      message = match message {
+        Message::Rows { lane, .. } => Message::Rows {
+          lane,
+          rows: retained_rows,
+        },
+        Message::Hint { lane, ranges, .. } => Message::Hint {
+          lane,
+          ranges,
+          rows: retained_rows,
+        },
+        other => other,
+      };
+    }
     let mut outbound: Vec<(NodeId, Message)> = Vec::new();
     {
       let mut guard = self.shared.lock()?;
-      // The per-lane pull serialization: a hint arriving while any
-      // engine of the lane still negotiates holds its ranges (the
-      // piggyback rows below still apply — payload is never held) and
-      // releases when the lane goes quiet, where a fingerprint
-      // comparison usually resolves it to silence. Without the hold,
-      // two parallel answerers race the same rows onto the wire twice.
-      // Responses are never held: a peer's initiation must always
-      // answer, or two nodes holding each other's hints would deadlock.
+      // An inbound root whose lane still negotiates elsewhere at this
+      // node drops: its whole-lane claim is a then-snapshot, and
+      // initiating from a stale claim re-delivers what the open round
+      // is already bringing over the same edge. Roots are cheap and
+      // cadence-refreshed, so the drop costs one quiet window of
+      // peer-view latency, never correctness — the fresh claim comes
+      // back with the next exchange. A root from the round's own
+      // session still processes (the engine suppresses its initiation
+      // against its own open round; its agreement close must run).
+      if matches!(message, Message::Root { .. }) && guard.lane_in_round(lane, Some(source)) {
+        drop(guard);
+        return Ok(());
+      }
+      // The per-lane pull serialization: a hint arriving while a
+      // *different* session's engine of the lane still negotiates
+      // holds its ranges (the piggyback rows below still apply —
+      // payload is never held) and releases when the lane goes quiet,
+      // where a fingerprint comparison usually resolves it to silence.
+      // A hint from the round's own session walks the engine's pending
+      // set instead (its own discipline). Responses are never held: a
+      // peer's initiation must always answer, or two nodes holding
+      // each other's hints would deadlock.
       let hold = match &message {
         Message::Hint { ranges, .. }
-          if guard.lane_in_round(lane)
-            && guard
-              .held_hints
-              .get(&lane)
-              .is_none_or(|held| held.len() < HELD_HINTS_PER_LANE) =>
+          if guard.lane_in_round(lane, Some(source)) && guard.hold_room(lane) =>
         {
           Some(ranges.clone())
         }
@@ -882,14 +1054,16 @@ impl ReconcilePlane {
           .or_default()
           .push((source.clone(), ranges));
         // The piggyback rows still enter the source engine: payload is
-        // never held, only the negotiation candidacy.
+        // never held, only the negotiation candidacy — and without
+        // eager candidacy (a receive path is not the originator's
+        // local write; its rows never ride a later piggyback).
         let engine = guard
           .peers
           .entry(source.clone())
           .or_insert_with(PeerState::fresh)
           .engine(lane);
         for (key, content) in &rows {
-          if let Err(error) = engine.insert_row(key, content) {
+          if let Err(error) = engine.insert_row_quiet(key, content) {
             tracing::debug!(kind = ?error.kind(), "reconcile held-hint row skipped");
           }
         }
@@ -1076,6 +1250,10 @@ fn send_message(
     // hints (a piggybacked hint re-sent blind would spend the eager
     // budget on a link the profile already distrusts) and only while
     // the profile still reads weak — the knob, not the sender, decides.
+    // The budget arms once: a slot already holding a retry keeps its
+    // remaining attempts, so a persistently failing session exhausts
+    // the bounded budget and the detection cadence absorbs the loss
+    // instead of the retry loop running forever.
     if let Ok(mut guard) = shared.state.lock() {
       let tick_now = guard.tick_count;
       if let Some(state) = guard.peers.get_mut(&peer) {
@@ -1083,6 +1261,7 @@ fn send_message(
         if !delivered
           && let Some(message) = retry_message
           && state.profile.weak()
+          && state.hint_retry.is_none()
         {
           state.hint_retry = Some(PendingHint {
             message,
@@ -1143,6 +1322,21 @@ fn tombstone_collected(checkpoint: Option<u64>, key: &[u8], content: &[u8]) -> b
     ),
     _ => false,
   }
+}
+
+/// Whether one resources-lane row is retention-reclaimed evidence: a
+/// `removed()` record whose key the local store no longer holds (the
+/// sweep deleted it, or the node never held the resource — either way
+/// the terminal row's subject is absent and re-admitting it would only
+/// materialize a tombstone for nothing). The tombstone lane's
+/// collected-mode mirror: swept rows leave the engines (the prune
+/// below), never re-enter them (the receive filter), and a newly
+/// primed peer does not receive the historical removal set back.
+fn resource_swept(keys: &BTreeSet<Vec<u8>>, key: &[u8], content: &[u8]) -> bool {
+  crate::resource::ResourceRecordV1::decode(content)
+    .ok()
+    .is_some_and(|record| record.removed())
+    && !keys.contains(key)
 }
 
 /// Scans the planned lanes' namespaces into canonical
@@ -1482,7 +1676,10 @@ async fn apply_rows(
 
 #[cfg(test)]
 mod tests {
-  use std::{collections::BTreeSet, sync::Arc};
+  use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+  };
 
   use super::{super::wire::LaneId, scan_lanes};
   use crate::identity::lifecycle::LocalIdentityContext;
@@ -1958,6 +2155,230 @@ mod tests {
           .collect()
       })
       .unwrap_or_default()
+  }
+
+  /// B-P2: a narrow scan plan keeps the other lanes' repair marks.
+  /// The repair-pending set is what makes a policy-skipped row retry on
+  /// any epoch advance (the cross-lane retry); a pass whose plan covers
+  /// only one lane must not erase a different lane's mark, or that
+  /// lane's retry stalls until its own namespace dirties again.
+  #[test]
+  fn a_narrow_plan_keeps_other_lanes_repair_marks() {
+    let mut state = super::PlaneState {
+      peers: BTreeMap::new(),
+      install_epoch: 0,
+      rotation: None,
+      force_rescan: BTreeSet::new(),
+      repair_pending: BTreeSet::new(),
+      tick_count: 0,
+      held_hints: BTreeMap::new(),
+      held_roots: BTreeMap::new(),
+    };
+    state.repair_pending.insert(LaneId::Tombstones);
+    state.repair_pending.insert(LaneId::Trust);
+    // One narrow pass over the descriptors lane: its repair set is
+    // empty (the store scan and the engines agree), the tombstones
+    // mark stays.
+    let plan: BTreeSet<LaneId> = [LaneId::Descriptors].into_iter().collect();
+    let repair: super::LaneScan = Vec::new();
+    let recomputed: BTreeSet<LaneId> = repair.iter().map(|(lane, _)| *lane).collect();
+    state.repair_pending.retain(|lane| !plan.contains(lane));
+    state.repair_pending.extend(recomputed);
+    assert!(
+      state.repair_pending.contains(&LaneId::Tombstones),
+      "a lane outside the plan keeps its repair mark"
+    );
+    assert!(state.repair_pending.contains(&LaneId::Trust));
+  }
+
+  /// B-P2: the hint-retry budget exhausts. A weak link's pending hint
+  /// spends its attempts one backoff at a time, the exhausted slot
+  /// drops (the detection cadence is the backstop), and the budget
+  /// never re-arms while a retry is still pending — a persistently
+  /// failing session cannot loop forever.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn the_hint_retry_budget_exhausts_to_the_cadence() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    {
+      let mut guard = shared.state.lock().unwrap();
+      let state = guard
+        .peers
+        .entry(peer.clone())
+        .or_insert_with(super::PeerState::fresh);
+      // A weak link (sustained loss) with one retry attempt left.
+      for _ in 0..12 {
+        state.profile.observe(None);
+      }
+      state.hint_retry = Some(super::PendingHint {
+        message: crate::reconcile::wire::Message::Hint {
+          lane: LaneId::Trust,
+          ranges: Vec::new(),
+          rows: Vec::new(),
+        },
+        attempts_left: 2,
+        resume_at_tick: 1,
+      });
+    }
+    plane.tick(&runtime).await.unwrap();
+    {
+      let guard = shared.state.lock().unwrap();
+      let state = guard.peers.get(&peer).unwrap();
+      let pending = state.hint_retry.as_ref().unwrap();
+      assert_eq!(
+        pending.attempts_left, 1,
+        "the due retry spent one attempt and kept its remaining budget"
+      );
+    }
+    // Burn the last attempt: the next due tick spends it and drops the
+    // exhausted slot; a further tick never resurrects it.
+    plane.tick(&runtime).await.unwrap();
+    plane.tick(&runtime).await.unwrap();
+    plane.tick(&runtime).await.unwrap();
+    let guard = shared.state.lock().unwrap();
+    let state = guard.peers.get(&peer).unwrap();
+    assert!(
+      state.hint_retry.is_none(),
+      "the exhausted retry slot dropped to the detection cadence"
+    );
+  }
+
+  /// A1/B-P1: the retention resurrection — a swept removal row leaves
+  /// the engines on the sweep-noted epoch pass, a re-primed peer never
+  /// receives the historical removal set back, and a peer re-delivering
+  /// the swept row is filtered at the receive boundary (the tombstone
+  /// collected-mode mirror for resources).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_swept_removal_row_never_resurrects() {
+    use crate::resource::{ResourceName, ResourceRecordV1};
+
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    // A removal record the writer signs directly into the store (the
+    // writer's descriptor is trusted so the page apply accepts it).
+    let writer = node(701);
+    let signing = crate::identity::testing::scripted_signing(701);
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      writer.clone(),
+      key(701),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:3").unwrap()],
+      1,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(
+      context.store(),
+      &crate::api::SystemEntropy,
+      &descriptor,
+    )
+    .await
+    .unwrap();
+    let name = ResourceName::parse("radiata.woooo.tech/resources/swept").unwrap();
+    let removal = ResourceRecordV1::sign(
+      name.clone(),
+      crate::LabelValue::parse("document").unwrap(),
+      crate::ResourceUri::parse("file:///swept").unwrap(),
+      crate::LabelSet::new(),
+      1_000,
+      writer,
+      1,
+      true,
+      &signing,
+    )
+    .unwrap();
+    let encoded = removal.encode().unwrap();
+    crate::resource::store::commit_record_ctx(
+      context.store(),
+      &crate::api::SystemEntropy,
+      &removal,
+    )
+    .await
+    .unwrap();
+    // The plane primes: the removal row is live data (within any
+    // retention window) and enters the engines.
+    plane.tick(&runtime).await.unwrap();
+    let primed = engine_rows(&shared, &peer, LaneId::Resources);
+    assert_eq!(
+      primed.len(),
+      1,
+      "the removal row enters the engine while the store holds it"
+    );
+
+    // The retention sweep reclaims it (zero window, immediate).
+    let swept = crate::resource::retention::sweep_removed_ctx(
+      context.store(),
+      &crate::time::HostWallClock,
+      std::time::Duration::ZERO,
+      0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(swept, 1, "the removal swept");
+    // The sweep-noted epoch pass prunes the row out of the engines
+    // instead of feeding it to the repair set.
+    plane.tick(&runtime).await.unwrap();
+    let pruned = engine_rows(&shared, &peer, LaneId::Resources);
+    assert!(
+      pruned.is_empty(),
+      "the swept removal row left the engines, not the repair set"
+    );
+    assert!(
+      crate::resource::store::read_record_ctx(context.store(), &name)
+        .await
+        .unwrap()
+        .is_none(),
+      "the repair did not resurrect the swept row"
+    );
+
+    // A peer re-delivering the swept row is filtered at the receive
+    // boundary: no engine admission, no store write.
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Resources,
+          rows: vec![crate::reconcile::wire::Row {
+            key: name.as_str().as_bytes().to_vec(),
+            content: encoded.clone(),
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    assert!(
+      engine_rows(&shared, &peer, LaneId::Resources).is_empty(),
+      "the swept row never re-enters the engine"
+    );
+    assert!(
+      crate::resource::store::read_record_ctx(context.store(), &name)
+        .await
+        .unwrap()
+        .is_none(),
+      "the swept row never re-materializes in the store"
+    );
+
+    // The re-prime contract: a returning session receives only the
+    // current row set — the historical removal is gone with the sweep.
+    shared.sessions.lock().unwrap().clear();
+    plane.tick(&runtime).await.unwrap();
+    shared.sessions.lock().unwrap().insert(
+      peer.clone(),
+      crate::session::stream::test_entry(shared.entropy.as_ref()).0,
+    );
+    plane.tick(&runtime).await.unwrap();
+    assert!(
+      engine_rows(&shared, &peer, LaneId::Resources).is_empty(),
+      "a re-primed peer receives no historical removal set"
+    );
   }
 
   /// A1: a superseded identity (a descriptor revision bump) leaves the

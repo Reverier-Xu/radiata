@@ -187,7 +187,15 @@ pub(crate) async fn sweep_removed_ctx(
   let removed = due.len();
   let transaction = store.prepare_transaction(transaction, snapshot.revision().clone(), due)?;
   match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(_) => Ok(removed),
+    crate::CommitOutcome::Committed(_) => {
+      // The sweep's deletions are resources-lane writes the plane must
+      // observe: without the note the engines keep holding the swept
+      // removal rows, and the derived-view repair re-applies them —
+      // the retention resurrection (the sweep and the repair loop
+      // forever over the same rows).
+      store.note_local_write_tag(super::store::NAMESPACE_TAG);
+      Ok(removed)
+    }
     // A conflict or abort mutates nothing: the newer winner (or the
     // moved base revision) stays untouched, and the next bounded pass
     // retries the whole batch.
@@ -501,5 +509,29 @@ mod tests {
         .is_none()
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"caller data");
+  }
+
+  /// The sweep's commit is a resources-lane write the plane observes:
+  /// the note lands the resource namespace in the incremental scan's
+  /// dirty set, so the next epoch pass prunes the swept removal rows
+  /// out of the engines instead of leaving them for the derived-view
+  /// repair to resurrect.
+  #[tokio::test]
+  async fn the_sweep_notes_the_resources_lane_write() {
+    let (_factory, store, clock) = open_store().await;
+    install(&store, &record(&name(7), 1_000, true, "file:///noted")).await;
+    let epoch = store.register_epoch();
+    clock.set(UNIX_EPOCH + Duration::from_secs(20_000));
+    let removed = sweep_removed_ctx(&store, clock.as_ref(), Duration::ZERO, 0)
+      .await
+      .unwrap();
+    assert_eq!(removed, 1, "the removal swept");
+    let (dirty, untracked) = store.dirty_namespaces_since(epoch);
+    assert_eq!(untracked, None, "the note is namespaced");
+    let namespace = crate::resource::store::namespace().unwrap();
+    assert!(
+      dirty.contains(&namespace),
+      "the sweep's deletions arm the resources lane rescan"
+    );
   }
 }

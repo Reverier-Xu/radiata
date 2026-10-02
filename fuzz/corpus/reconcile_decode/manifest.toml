@@ -3,7 +3,7 @@ status = "accepted"
 target = "reconcile_decode"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
 minimizer = { tool = "none", version = "0" }
-aggregate = { entry_count = 30, total_bytes = 1358 }
+aggregate = { entry_count = 31, total_bytes = 1571 }
 
 [[entry]]
 digest = "9ef91667367a87846264c5e682c7546f738230ca30e2527ae5fef6860a785d36"
@@ -13,10 +13,17 @@ lineage = "golden vector root descriptors"
 schema_tags = ["reconcile kind 1..6"]
 
 [[entry]]
-digest = "9924bb5b1dfd534c738ecd33a1570edfa71f7adc3fdae7421c2807faf26c626d"
-byte_count = 37
+digest = "58ebd2310d9b25941df19c409793de16f222bba64231fbe45bdd6f7ed0e2ae6b"
+byte_count = 49
 origin = "golden-fixture"
-lineage = "golden vector hint trust two ranges"
+lineage = "golden vector hint trust two ranges with eager-delta row"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "a92194b4a4ce486989f7dc9ba7095c03a70e109569f44256b079d4f884cc2be3"
+byte_count = 201
+origin = "hand-adversarial"
+lineage = "hint rows over the 64-row bound (65 empty rows), typed rejection"
 schema_tags = ["reconcile kind 1..6"]
 
 [[entry]]

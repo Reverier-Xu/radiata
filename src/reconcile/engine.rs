@@ -332,6 +332,20 @@ impl Engine {
   /// lane's own row encoding (versions or tombstones), never through
   /// this engine.
   pub(crate) fn insert_row(&mut self, key: &[u8], content: &[u8]) -> Result<()> {
+    self.insert_row_inner(key, content, true)
+  }
+
+  /// Stores one row without eager-delta candidacy: the receive paths
+  /// (a held hint's piggyback applying while its ranges wait) are not
+  /// the originator's local write, and their rows must never ride a
+  /// later eager piggyback — the invariant that keeps the eager budget
+  /// on first-hop pushes only.
+  pub(crate) fn insert_row_quiet(&mut self, key: &[u8], content: &[u8]) -> Result<()> {
+    self.insert_row_inner(key, content, false)
+  }
+
+  /// The shared insert core; `eager` arms the piggyback candidacy.
+  fn insert_row_inner(&mut self, key: &[u8], content: &[u8], eager: bool) -> Result<()> {
     if !row_fits_message(key.len(), content.len()) {
       return Err(Error::invalid_input("reconcile row size"));
     }
@@ -346,7 +360,9 @@ impl Engine {
     // the steady-state zero-hint contract of the trigger layer.
     if self.index.insert(digest, row).is_none() {
       self.mark_dirty(digest);
-      self.note_eager(digest, key.len() + content.len());
+      if eager {
+        self.note_eager(digest, key.len() + content.len());
+      }
     }
     Ok(())
   }
@@ -490,10 +506,12 @@ impl Engine {
         if self.backlog.len() == before {
           // The offer matched everywhere (silent success): answer with
           // the DONE receipt so the peer's round closes without
-          // waiting for a root exchange.
+          // waiting for a root exchange — and re-examine the hints that
+          // waited the round out, exactly like every other close.
           self.round_open = false;
           let done = self.done_message();
           self.backlog.push_back(done);
+          self.replay_pending_hints();
         }
       }
       Message::Need { bounds, .. } => {
@@ -1786,6 +1804,84 @@ mod tests {
   /// The pending-hint set is bounded: hints beyond the cap drop (the
   /// cadence ROOT is the backstop), and the set empties with the
   /// replay.
+  /// A-P3: the awaiting-response invariant, directly. An engine whose
+  /// OFFER/NEED question is in flight (no answer has arrived) must not
+  /// close its round on a Drain — the early quiescence DONE is what
+  /// let a second hint open a duplicate negotiation for the same
+  /// divergence (the budget lane's original 1.7× finding). The answer
+  /// arrives, the round closes, and only then does the DONE ride.
+  #[test]
+  fn reconcile_an_unanswered_question_blocks_the_quiescence_done() {
+    let mut a = Engine::new(LaneId::Descriptors);
+    let mut b = Engine::new(LaneId::Descriptors);
+    a.insert_row(b"a-only", b"1").unwrap();
+    b.insert_row(b"shared", b"2").unwrap();
+    a.insert_row(b"shared", b"2").unwrap();
+    // B initiates (a divergent hint from A) and its OFFER question is
+    // on the wire.
+    let hint = a.drive(Drive::LocalChange).unwrap().remove(0);
+    let questions = b.drive(Drive::Message(hint)).unwrap();
+    assert!(
+      questions
+        .iter()
+        .any(|message| matches!(message, Message::Offer { .. } | Message::Need { .. })),
+      "the initiation asked a question"
+    );
+    assert!(b.round_open && b.awaiting_response);
+    // Drains while the question is in flight: no DONE, the round stays
+    // open.
+    for _ in 0..3 {
+      let drained = b.drive(Drive::Drain).unwrap();
+      assert!(
+        drained
+          .iter()
+          .all(|message| !matches!(message, Message::Done { .. })),
+        "an unanswered question blocks the quiescence DONE"
+      );
+    }
+    assert!(b.round_open, "the round waits for its answer");
+    // The answer arrives: the round may close now (the DONE rides this
+    // drive or the next).
+    let mut answered = false;
+    for question in questions {
+      for response in a.drive(Drive::Message(question)).unwrap() {
+        answered |= b
+          .drive(Drive::Message(response))
+          .unwrap()
+          .iter()
+          .any(|message| matches!(message, Message::Done { .. }));
+      }
+    }
+    let _ = answered;
+    let tail = b.drive(Drive::Drain).unwrap();
+    assert!(
+      !b.round_open,
+      "the answered round closed (done in flight: {answered}, tail: {tail:?})"
+    );
+  }
+
+  /// B-P3: the quiet insert keeps the eager budget on the
+  /// originator's local-write path. Rows entering an engine through a
+  /// receive path (a held hint's piggyback) mark their digests dirty —
+  /// the peer still needs the change notice — but never arm the
+  /// piggyback candidacy, so a later local change's eager hint cannot
+  /// carry rows this node received (the redundancy the budget lane
+  /// exists to bound).
+  #[test]
+  fn reconcile_quiet_inserts_never_arm_eager_candidacy() {
+    let mut engine = Engine::new(LaneId::Resources);
+    engine.insert_row_quiet(b"received", b"row").unwrap();
+    engine.insert_row(b"originated", b"row").unwrap();
+    let out = engine.drive(Drive::LocalChangeEager).unwrap();
+    match &out[0] {
+      Message::Hint { rows, .. } => {
+        assert_eq!(rows.len(), 1, "only the originated row rides");
+        assert_eq!(rows[0].key, b"originated".to_vec());
+      }
+      other => panic!("expected a hint, got {other:?}"),
+    }
+  }
+
   #[test]
   fn reconcile_pending_hints_are_bounded() {
     let mut engine = Engine::new(LaneId::Descriptors);

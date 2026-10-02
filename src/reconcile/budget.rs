@@ -93,11 +93,16 @@ struct Frame {
 /// The measurement ledger of one run.
 #[derive(Default)]
 struct Ledger {
-  /// Row bytes that crossed an edge (ROWS payloads plus eager-delta
-  /// piggybacks), delivered or dropped.
+  /// Row bytes that actually crossed an edge and landed (ROWS payloads
+  /// plus eager-delta piggybacks): counted at delivery only — a frame
+  /// a dead session swallowed (the reconnect partition window) is
+  /// emission, not delivery, and the redundancy numerator counts what
+  /// the receiver took.
   row_bytes_delivered: usize,
   /// The summary bytes of hint messages (message size minus the
-  /// piggyback's row bytes, re-encoded without rows).
+  /// piggyback's row bytes, re-encoded without rows), counted at
+  /// emission: hints are fire-and-forget notices, so the hint budget
+  /// is what went on the wire whether or not it landed.
   hint_summary_bytes: usize,
   hints: usize,
   roots: usize,
