@@ -631,8 +631,8 @@ pub(crate) mod store {
     // definitively did not land, and Unknown leaves durability
     // indeterminate — both must surface (the sync lane isolates them).
     crate::provider::commit_verdict(store.commit(transaction).await?, "trust snapshot")?;
-    // The persisted revision changes what the trust walks send: the
-    // write epoch arms them for a next-tick push.
+    // The persisted revision is a local store write: the register
+    // epoch arms the reconciliation plane's next rescan pass.
     store.note_local_write();
     Ok(())
   }

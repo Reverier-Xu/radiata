@@ -157,11 +157,9 @@ async fn an_unhealthy_node_dials_its_way_back_to_target() {
 
   // The maintenance universe is the trusted-binding set: wait until
   // every node counts all five members AND all five bindings before
-  // reading the derived target. The member-page wait used to imply the
-  // binding wait transitively (descriptor pages were the slowest
-  // lane); the reconciliation plane converges descriptors at wire
-  // speed, so the binding universe — still on the watermark cadence —
-  // is now the later of the two and must be waited on explicitly.
+  // reading the derived target. Both lanes ride the reconciliation
+  // plane; the binding set is simply the later of the two universes to
+  // finish, so both waits are explicit.
   let members: Vec<(NodeHandle, NodeId)> = nodes
     .iter()
     .map(|node| (node.handle.clone(), node.id.clone()))

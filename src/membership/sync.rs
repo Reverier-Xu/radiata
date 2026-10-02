@@ -32,11 +32,10 @@ pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str = "radiata.woooo.tech/protocols/
 /// The wire schema of one sync payload.
 const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-sync-payload-v1";
 
-/// Payload kinds: the removal tombstones. The descriptor and trust
-/// lanes ride the reconciliation plane (`crate::reconcile::plane`);
-/// the membership-sync protocol carries the interactive leave plane
-/// (announcement plus applied receipt) and the tombstones until that
-/// lane migrates too.
+/// Payload kinds: this protocol carries the interactive leave plane
+/// only — the owner-signed leave announcement and its applied receipt.
+/// Every anti-entropy lane (descriptors, trust, resources, tombstones)
+/// rides the reconciliation plane (`crate::reconcile::plane`).
 pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
 /// A leave-applied receipt: the applying peer confirms one leave record
 /// persisted. Additive (post-0.1 peers only): peers that never send it
@@ -343,24 +342,17 @@ fn collected(checkpoint: Option<u64>, timestamp_millis: u64) -> bool {
 /// Applies one encoded owner-signed leave record: verified against the
 /// permanently retained binding before any persistence. A record whose
 /// binding has not converged yet is skipped; the next epoch pass of the
-/// reconciliation plane (or the resend cadence until that lane migrates)
-/// heals the ordering. `expected_subject` guards the row-key↔record
-/// attribution when the record arrives as a reconciliation row. A
+/// reconciliation plane heals the ordering. The row-key↔record
+/// attribution is checked at the lane's dispatch boundary. A
 /// durable install answers the sender with the applied receipt when
 /// `runtime` and `source` are present.
 #[allow(clippy::too_many_arguments)]
 async fn apply_leave_record(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
-  evidence: &TombstoneEvidence, encoded: &[u8], expected_subject: Option<&[u8]>,
+  evidence: &TombstoneEvidence, record: &crate::identity::leave::LeaveRecordV1,
   source: Option<&NodeId>, runtime: Option<&RuntimeClient>,
 ) -> Result<()> {
-  let record = crate::identity::leave::LeaveRecordV1::decode(encoded)?;
-  if let Some(subject) = expected_subject
-    && subject != record.node().as_str().as_bytes()
-  {
-    return Err(Error::invalid_input("reconcile leave subject"));
-  }
   if collected(evidence.checkpoint, record.timestamp_millis()) {
     tracing::debug!(node = %record.node(), "leave record skipped: already collected");
     return Ok(());
@@ -378,7 +370,7 @@ async fn apply_leave_record(
   // sender keeps forwarding the record, so an unlogged failure here
   // looks like a receiver-side roster stall.
   if let Err(error) =
-    crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), &record).await
+    crate::identity::leave::persist_leave_record_ctx(store, entropy.as_ref(), record).await
   {
     tracing::debug!(
       node = %record.node(),
@@ -428,14 +420,8 @@ async fn apply_leave_record(
 async fn apply_cleanup_record(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
-  evidence: &TombstoneEvidence, encoded: &[u8], expected_subject: Option<&[u8]>,
+  evidence: &TombstoneEvidence, record: &crate::identity::cleanup::CleanupRecordV1,
 ) -> Result<()> {
-  let record = crate::identity::cleanup::CleanupRecordV1::decode(encoded)?;
-  if let Some(subject) = expected_subject
-    && subject != record.subject().as_str().as_bytes()
-  {
-    return Err(Error::invalid_input("reconcile cleanup subject"));
-  }
   if collected(evidence.checkpoint, record.timestamp_millis()) {
     tracing::debug!(subject = %record.subject(), "cleanup record skipped: already collected");
     return Ok(());
@@ -446,7 +432,7 @@ async fn apply_cleanup_record(
     tracing::debug!(subject = %record.subject(), "cleanup record skipped: bindings unknown");
     return Ok(());
   }
-  crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), &record).await?;
+  crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), record).await?;
   member_changed(events, revision, record.subject().clone());
   Ok(())
 }
@@ -461,22 +447,17 @@ async fn apply_cleanup_record(
 #[allow(clippy::too_many_arguments)]
 async fn apply_revocation_record(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
-  events: &Arc<crate::node::EventHub>, evidence: &TombstoneEvidence, encoded: &[u8],
-  expected_subject: Option<&[u8]>, sessions: &crate::session::stream::SessionTable,
+  events: &Arc<crate::node::EventHub>, evidence: &TombstoneEvidence,
+  record: &crate::identity::revocation::RevocationRecordV1,
+  sessions: &crate::session::stream::SessionTable,
 ) -> Result<()> {
-  let record = crate::identity::revocation::RevocationRecordV1::decode(encoded)?;
-  if let Some(subject) = expected_subject
-    && subject != record.subject().as_str().as_bytes()
-  {
-    return Err(Error::invalid_input("reconcile revocation subject"));
-  }
   if !evidence.bindings.contains_key(record.issuer())
     || !evidence.bindings.contains_key(record.subject())
   {
     tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
     return Ok(());
   }
-  crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), &record).await?;
+  crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), record).await?;
   events.emit(crate::NodeRevoked::new(record.subject().clone()));
   crate::session::stream::retire_session(sessions, record.subject())?;
   Ok(())
@@ -485,16 +466,10 @@ async fn apply_revocation_record(
 /// Applies one encoded cleanup checkpoint: unsigned hygiene knowledge,
 /// max-wins by watermark, never gating live entries or revocations.
 async fn apply_checkpoint_record(
-  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>, encoded: &[u8],
-  expected_subject: Option<&[u8]>,
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+  checkpoint: &crate::identity::cleanup::CleanupCheckpointV1,
 ) -> Result<()> {
-  let checkpoint = crate::identity::cleanup::CleanupCheckpointV1::decode(encoded)?;
-  if let Some(subject) = expected_subject
-    && subject != b"checkpoint"
-  {
-    return Err(Error::invalid_input("reconcile checkpoint subject"));
-  }
-  crate::identity::cleanup::persist_checkpoint_ctx(store, entropy.as_ref(), &checkpoint).await?;
+  crate::identity::cleanup::persist_checkpoint_ctx(store, entropy.as_ref(), checkpoint).await?;
   Ok(())
 }
 
@@ -513,53 +488,95 @@ pub(crate) async fn apply_tombstone_rows(
 ) -> Result<()> {
   let store = context.store();
   let evidence = tombstone_evidence(store).await?;
+  // Row-level fault tolerance, the scan side's corrupt-row policy: one
+  // undecodable or misattributed tombstone row skips with a typed reason
+  // instead of failing the batch — a whole-batch error would wedge the
+  // derived-view repair on the same poison row forever. Store failures
+  // inside the apply arms still propagate: they are real write faults.
   for (key, content) in rows {
     let Some((kind, subject)) = key.split_first() else {
-      return Err(Error::invalid_input("reconcile tombstone key"));
+      tracing::debug!("reconcile tombstone row skipped: no kind prefix");
+      continue;
     };
+    let subject: &[u8] = subject;
     match kind {
       1 => {
+        let record = match crate::identity::leave::LeaveRecordV1::decode(content) {
+          Ok(record) if record.node().as_str().as_bytes() == subject => record,
+          Ok(record) => {
+            tracing::debug!(
+              node = %record.node(),
+              "reconcile leave row skipped: subject mismatch"
+            );
+            continue;
+          }
+          Err(error) => {
+            tracing::debug!(kind = ?error.kind(), "reconcile leave row skipped: undecodable");
+            continue;
+          }
+        };
         apply_leave_record(
-          store,
-          entropy,
-          events,
-          revision,
-          &evidence,
-          content,
-          Some(subject),
-          source,
-          runtime,
+          store, entropy, events, revision, &evidence, &record, source, runtime,
         )
         .await?;
       }
       2 => {
-        apply_cleanup_record(
-          store,
-          entropy,
-          events,
-          revision,
-          &evidence,
-          content,
-          Some(subject),
-        )
-        .await?;
+        let record = match crate::identity::cleanup::CleanupRecordV1::decode(content) {
+          Ok(record) if record.subject().as_str().as_bytes() == subject => record,
+          Ok(record) => {
+            tracing::debug!(
+              subject = %record.subject(),
+              "reconcile cleanup row skipped: subject mismatch"
+            );
+            continue;
+          }
+          Err(error) => {
+            tracing::debug!(kind = ?error.kind(), "reconcile cleanup row skipped: undecodable");
+            continue;
+          }
+        };
+        apply_cleanup_record(store, entropy, events, revision, &evidence, &record).await?;
       }
       3 => {
-        apply_revocation_record(
-          store,
-          entropy,
-          events,
-          &evidence,
-          content,
-          Some(subject),
-          sessions,
-        )
-        .await?;
+        let record = match crate::identity::revocation::RevocationRecordV1::decode(content) {
+          Ok(record) if record.subject().as_str().as_bytes() == subject => record,
+          Ok(record) => {
+            tracing::debug!(
+              subject = %record.subject(),
+              "reconcile revocation row skipped: subject mismatch"
+            );
+            continue;
+          }
+          Err(error) => {
+            tracing::debug!(
+              kind = ?error.kind(),
+              "reconcile revocation row skipped: undecodable"
+            );
+            continue;
+          }
+        };
+        apply_revocation_record(store, entropy, events, &evidence, &record, sessions).await?;
       }
       4 => {
-        apply_checkpoint_record(store, entropy, content, Some(subject)).await?;
+        let checkpoint = match crate::identity::cleanup::CleanupCheckpointV1::decode(content) {
+          Ok(checkpoint) if subject == b"checkpoint" => checkpoint,
+          Ok(_) => {
+            tracing::debug!("reconcile checkpoint row skipped: subject mismatch");
+            continue;
+          }
+          Err(error) => {
+            tracing::debug!(
+              kind = ?error.kind(),
+              "reconcile checkpoint row skipped: undecodable"
+            );
+            continue;
+          }
+        };
+        apply_checkpoint_record(store, entropy, &checkpoint).await?;
       }
-      _ => return Err(Error::invalid_input("reconcile tombstone kind")),
+      _ => {
+        tracing::debug!(kind, "reconcile tombstone row skipped: unknown kind");
+      }
     }
   }
   Ok(())
@@ -575,6 +592,7 @@ async fn accept_payload(
   let store = context.store();
   match payload {
     SyncPayload::Leave(encoded) => {
+      let record = crate::identity::leave::LeaveRecordV1::decode(encoded.as_ref())?;
       let evidence = tombstone_evidence(store).await?;
       apply_leave_record(
         store,
@@ -582,8 +600,7 @@ async fn accept_payload(
         events,
         revision,
         &evidence,
-        encoded.as_ref(),
-        None,
+        &record,
         Some(source),
         Some(runtime),
       )
@@ -775,11 +792,10 @@ mod tests {
   /// Regression: a snapshot refresh failure used to fail the whole sync
   /// tick every round — an issuer binding set over the single-record
   /// store bound cannot encode (past the 16 384-entry collection cap of
-  /// the 1 MiB store body), so descriptor and tombstone anti-entropy
-  /// stalled permanently. The oversized issuer refresh fails in
-  /// isolation, the tick still returns success, and the page plane keeps
-  /// advancing (round dispatched, resend cadence armed) while no snapshot
-  /// revision is ever recorded.
+  /// the 1 MiB store body), so the maintenance tick would fail
+  /// permanently. The oversized issuer refresh fails in isolation, the
+  /// tick still returns success, and the reconciliation lanes keep
+  /// running while no snapshot revision is ever recorded.
   #[tokio::test]
   async fn sync_tick_survives_snapshot_refresh_overflow() {
     use crate::{
@@ -978,7 +994,8 @@ mod tests {
     page_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     /// The descriptor rows sent on the wire (the redundancy ledger's
     /// sent side: the ratio of this to the peer's adopted rows is the
-    /// delivered-versus-useful traffic the watermark design bounds).
+    /// delivered-versus-useful traffic the plane's diff-only contract
+    /// bounds).
     page_rows: Arc<std::sync::atomic::AtomicUsize>,
     /// The trust-lane rows sent on the wire (the binding redundancy
     /// ledger's sent side).

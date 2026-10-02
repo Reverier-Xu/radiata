@@ -408,9 +408,9 @@ async fn delayed_content_converges_after_revoke() {
   // content converges, the binding converges, and every member treats
   // the identity as unauthorized.
   tokio::time::timeout(Duration::from_secs(30), async {
-    // The tombstone trails its binding (the revocation forwards on the
-    // snapshot resend cadence), so under a loaded runner the binding can
-    // converge as still-Trusted first. Poll past every intermediate
+    // The tombstone trails its binding (the tombstones lane delivers
+    // the row whenever it arrives), so under a loaded runner the binding
+    // can converge as still-Trusted first. Poll past every intermediate
     // status until the revoked status lands or the deadline expires.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {

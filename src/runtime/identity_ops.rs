@@ -54,9 +54,9 @@ impl Supervisor {
 
   /// Starts a new checkpoint GC epoch at the current wall clock. The
   /// convergence precondition is enforced here, not by the caller: the
-  /// watermark converges through the sync plane, collected tombstones are
-  /// swept after sync rounds, and a member still owed tombstones must be
-  /// connected before any epoch may start.
+  /// watermark converges through the tombstones lane, collected
+  /// tombstones are swept after maintenance ticks, and a member still
+  /// owed tombstones must be connected before any epoch may start.
   pub(super) async fn issue_cleanup_checkpoint(&mut self) -> Result<u64> {
     self.require_unblocked()?;
     let context = self.context()?;

@@ -253,6 +253,14 @@ impl Engine {
     self.index.root()
   }
 
+  /// Whether the peer's last-seen whole-lane fingerprint equals this
+  /// engine's: protocol-internal agreement evidence (the peer's ROOT,
+  /// as last received, matches ours). The session layer reads it after
+  /// a root exchange to report observed agreement.
+  pub(crate) fn peer_agrees(&self) -> bool {
+    self.peer_root == Some(self.index.root())
+  }
+
   /// The number of rows held.
   #[cfg(test)]
   pub(crate) fn len(&self) -> usize {
@@ -840,6 +848,25 @@ mod tests {
       state_token(Fingerprint::new(17, 0x2233)),
       0xEFA7_3A97_1927_E0CC
     );
+  }
+
+  /// The agreement flag reflects the last-seen peer ROOT: false before
+  /// any exchange and after divergence, true once the peer's ROOT
+  /// matches the local aggregate.
+  #[test]
+  fn reconcile_peer_agreement_reflects_the_last_root() {
+    let rows: [(&[u8], &[u8]); 2] = [(b"a", b"1"), (b"b", b"2")];
+    let mut pair = Pair::new(&rows, &rows);
+    assert!(!pair.a.peer_agrees(), "no peer root seen yet");
+    pair.drive_root_exchange(Peer::A);
+    pair.drive_root_exchange(Peer::B);
+    pair.pump();
+    assert!(
+      pair.a.peer_agrees() && pair.b.peer_agrees(),
+      "both sides observed matching roots"
+    );
+    pair.a.insert_row(b"extra", b"row").unwrap();
+    assert!(!pair.a.peer_agrees(), "a local change diverges the flag");
   }
 
   /// The engine's range fingerprints are inclusive and reach the top

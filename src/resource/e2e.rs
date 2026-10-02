@@ -109,7 +109,8 @@ async fn put_descriptor(store: &MetadataStore, descriptor: &NodeDescriptorV1) {
 
 /// Runs one full bidirectional convergence pass: A applies every page
 /// emitted by B and vice versa, until neither side applies any change.
-/// Uses the same page emit/apply functions the anti-entropy driver calls.
+/// Uses the same page apply path the reconciliation plane's row batches
+/// ride (the test emit pages the store directly).
 async fn converge(sides: [&MetadataStore; 2]) -> usize {
   let mut total_applied = 0;
   loop {

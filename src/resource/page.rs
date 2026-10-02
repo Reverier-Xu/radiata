@@ -101,10 +101,10 @@ pub(crate) mod sync {
   const WRITER_TRUST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
   /// The unfiltered test/select emit: one page over the store's current
-  /// records after `cursor` (the reconciliation plane's row shape — the
-  /// watermark walk is gone; tests and offline harnesses page with it).
-  /// A catalog shorter than the limit yields a page whose cursor is
-  /// `None` (pass complete).
+  /// records after `cursor` (the reconciliation plane carries the rows;
+  /// tests and offline harnesses page with this). A catalog shorter
+  /// than the limit yields a page whose cursor is `None` (pass
+  /// complete).
   #[cfg(test)]
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
@@ -136,8 +136,9 @@ pub(crate) mod sync {
   /// period (serializing those waits would pin this page's consumer —
   /// and its inbound admission slot — for writers x the bound, which
   /// gridlocked receivers at join fan-out), then get one end-of-page
-  /// retry before their records skip fail-closed (the periodic watermark
-  /// refresh remains the final backstop). Installation goes through the
+  /// retry before their records skip fail-closed (the reconciliation
+  /// plane's derived-view repair remains the final backstop).
+  /// Installation goes through the
   /// conditional register commit, so stale, duplicated, and losing
   /// permutations cannot replace a greater stored winner.
   pub(crate) async fn apply_page_ctx(
@@ -203,7 +204,7 @@ pub(crate) mod sync {
     // consumer tasks — a descriptor that landed while those waits ran is
     // only visible now. The old code skipped these records finally,
     // stranding them behind the sender's already-committed delivery
-    // watermark until the periodic whole-catalog refresh re-delivered
+    // record until a periodic whole-catalog refresh re-delivered
     // them: at join scale that refresh is many detection cadences away
     // and dominated roster convergence.
     let stranded: Vec<&ResourceRecordV1> = records
@@ -252,9 +253,10 @@ pub(crate) mod sync {
   /// ride the same anti-entropy tick in either order. The resolution
   /// therefore waits a bounded time for the descriptor to converge
   /// instead of skipping immediately — a skip here would strand the
-  /// record behind an already-delivered watermark. Past the bound the
+  /// record behind an already-delivered row. Past the bound the
   /// lookup fails closed; the page's end-of-apply retry pass re-resolves
-  /// once more, and the periodic watermark refresh remains the final
+  /// once more, and the reconciliation plane's derived-view repair
+  /// remains the final
   /// backstop.
   async fn writer_key(store: &MetadataStore, writer: &crate::NodeId) -> Result<crate::PublicKey> {
     let deadline = std::time::Instant::now() + WRITER_TRUST_WAIT;

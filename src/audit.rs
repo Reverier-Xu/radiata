@@ -15,11 +15,12 @@
 #[cfg(feature = "audit")]
 use tracing::debug;
 
-/// One watermark-filtered sync step settled without a page: `continued`
-/// records whether the walk advances from its budget boundary (`true`)
-/// or the pass closed at the catalog end (`false`). Closing on a quiet
-/// mid-catalog window instead of continuing is the stranded-tail defect
-/// the fuzz suite watches for.
+/// One resources-lane pass settled on observed agreement: the peer's
+/// last-seen whole-lane fingerprint equals the emitter's at a cadence
+/// root exchange, so `continued = false` (the reconciliation plane's
+/// equivalent of the walk's changeless whole-catalog scan). The SLO
+/// harness asserts this line as the resource plane's settled-pass
+/// proof; an exchange that did not observe agreement emits nothing.
 pub(crate) fn resource_pass_settled(peer: &str, continued: bool) {
   #[cfg(feature = "audit")]
   debug!(target: "audit", peer, continued, "resource pass settled");

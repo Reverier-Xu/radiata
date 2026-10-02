@@ -55,7 +55,6 @@ impl MembershipPage {
   }
 
   #[cfg(test)]
-  #[cfg(test)]
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     // A descriptor that cannot encode must fail the page: shipping empty
     // bytes would produce an entry every remote peer rejects.
@@ -285,11 +284,11 @@ mod tests {
   /// the highest revision.
   #[tokio::test]
   async fn apply_pages_repairs_and_converges() {
-    let factory = factory();
-    crate::membership::store::store_descriptor(&factory, &descriptor(1, 1, "one"))
+    // A stale receiver holds revision 1; the page carries revision 2.
+    let receiver = factory();
+    crate::membership::store::store_descriptor(&receiver, &descriptor(1, 1, "one"))
       .await
       .unwrap();
-    // A stale peer holds revision 1; the peer pages revision 2.
     let fresh = crate::membership::NodeDescriptorV1::new(
       node(1),
       key(1),
@@ -298,21 +297,27 @@ mod tests {
       false,
       1,
     );
-    crate::membership::store::store_descriptor(&factory, &fresh)
-      .await
-      .unwrap();
-
     let page = MembershipPage::new(vec![fresh.clone()], None).unwrap();
     let encoded = page.encode().unwrap();
     let decoded = MembershipPage::decode(&encoded).unwrap();
-    // Applying again is idempotent (no downgrade, no duplicate install).
-    let applied = sync::apply_page(&factory, &decoded).await.unwrap();
-    let current = crate::membership::store::read_descriptor(&factory, &node(1))
+    // The repair slice: the page repairs the stale receiver exactly
+    // once (the row applies), and re-applying is idempotent — no
+    // downgrade, no duplicate install.
+    assert_eq!(
+      sync::apply_page(&receiver, &decoded).await.unwrap(),
+      1,
+      "the stale receiver installs the fresher revision"
+    );
+    assert_eq!(
+      sync::apply_page(&receiver, &decoded).await.unwrap(),
+      0,
+      "re-applying installs nothing"
+    );
+    let current = crate::membership::store::read_descriptor(&receiver, &node(1))
       .await
       .unwrap()
       .unwrap();
     assert_eq!(current.revision(), 2);
-    let _ = applied;
   }
 
   /// A dishonest page cannot loop a cursor or exceed capacities; unknown

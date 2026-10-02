@@ -8,7 +8,7 @@
 //! shape of a flapping peer (session churn resolving ack verdicts as
 //! undelivered), and the watermark acceptance sample: exactly one
 //! write into a converged mid-size catalog must converge within one
-//! detection cadence window plus an amortized scan walk — not the full
+//! detection cadence window plus one reconciliation round — not the full
 //! catalog re-send cycle the previous fingerprint design paid on every
 //! quiet window. The matrix quantifies whether the per-page admission
 //! ack wait (2s bound) changes convergence or steady-state behavior at

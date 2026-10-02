@@ -75,10 +75,9 @@ pub(crate) const RECONCILE_PROTOCOL: &str = "radiata.woooo.tech/protocols/reconc
 /// [`super::wire::Message`] per body.
 pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/reconcile-v1";
 
-/// The lanes this build carries on the engine. The migration walks the
-/// lanes one commit at a time (descriptors, trust, resources,
-/// tombstones); a lane joins this list only by migrating onto the
-/// engine, and a lane not in it still rides the watermark walks.
+/// The lanes this build carries on the engine: all four (descriptors,
+/// trust, resources, tombstones) migrated onto the plane, retiring the
+/// watermark walks entirely.
 const ACTIVE_LANES: [LaneId; 4] = [
   LaneId::Descriptors,
   LaneId::Trust,
@@ -389,10 +388,13 @@ impl ReconcilePlane {
               Ok(messages) => {
                 // The resources lane's quiet-pass audit event: the SLO
                 // harness asserts its presence as the resource plane's
-                // settled-pass proof — the reconcile equivalent of the
-                // walk's changeless scan (`continued = false`: the
-                // exchange observed the whole lane).
-                if lane == LaneId::Resources {
+                // settled-pass proof. It fires only on observed
+                // agreement — the peer's last-seen whole-lane
+                // fingerprint equals ours after the exchange — so the
+                // event means the same thing the walk's changeless scan
+                // meant (`continued = false`: a settled whole lane),
+                // never a bare dispatch.
+                if lane == LaneId::Resources && state.engine(lane).peer_agrees() {
                   crate::audit::resource_pass_settled(peer.as_str(), false);
                 }
                 outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
@@ -758,14 +760,33 @@ async fn apply_rows(
   let store = context.store();
   match lane {
     LaneId::Descriptors => {
+      // Row-level fault tolerance, the scan side's corrupt-row policy:
+      // one undecodable or misattributed row skips with a typed reason
+      // instead of failing the batch — a whole-batch error would wedge
+      // the derived-view repair on the same poison row forever (the
+      // engines hold it, so the fingerprints look converged while the
+      // store never receives the good rows behind it). Store failures
+      // below still propagate: they are real write faults, not corrupt
+      // input.
       let mut descriptors = Vec::with_capacity(rows.len());
-      for (key, content) in rows {
-        let descriptor = crate::membership::page::decode_descriptor(content)
-          .map_err(|_| Error::invalid_input("reconcile descriptor row"))?;
-        if key.as_slice() != descriptor.node().as_str().as_bytes() {
-          return Err(Error::invalid_input("reconcile descriptor key"));
+      for (row_key, content) in rows {
+        match crate::membership::page::decode_descriptor(content) {
+          Ok(descriptor) if row_key.as_slice() == descriptor.node().as_str().as_bytes() => {
+            descriptors.push(descriptor);
+          }
+          Ok(descriptor) => {
+            tracing::debug!(
+              node = %descriptor.node(),
+              "reconcile descriptor row skipped: key mismatch"
+            );
+          }
+          Err(error) => {
+            tracing::debug!(
+              kind = ?error.kind(),
+              "reconcile descriptor row skipped: undecodable"
+            );
+          }
         }
-        descriptors.push(descriptor);
       }
       for chunk in descriptors.chunks(crate::paging::PAGE_MAX_ITEMS) {
         let page = crate::membership::page::MembershipPage::new(chunk.to_vec(), None)?;
@@ -792,12 +813,29 @@ async fn apply_rows(
       Ok(())
     }
     LaneId::Trust => {
-      for (key, content) in rows {
-        let binding = crate::identity::records::IdentityBindingV1::decode(content)
-          .map_err(|_| Error::invalid_input("reconcile binding row"))?;
-        if key.as_slice() != binding.node().as_str().as_bytes() {
-          return Err(Error::invalid_input("reconcile binding key"));
-        }
+      // The same row-level policy as the descriptors arm: a corrupt or
+      // misattributed binding row skips; adoption failures keep the
+      // snapshot-accept semantics (transient contention skips one
+      // binding — the repair retries it — and everything else, key
+      // substitution above all, fails closed and propagates).
+      for (row_key, content) in rows {
+        let binding = match crate::identity::records::IdentityBindingV1::decode(content) {
+          Ok(binding) if row_key.as_slice() == binding.node().as_str().as_bytes() => binding,
+          Ok(binding) => {
+            tracing::debug!(
+              node = %binding.node(),
+              "reconcile binding row skipped: key mismatch"
+            );
+            continue;
+          }
+          Err(error) => {
+            tracing::debug!(
+              kind = ?error.kind(),
+              "reconcile binding row skipped: undecodable"
+            );
+            continue;
+          }
+        };
         // The snapshot-accept policy, per record: transient contention
         // skips one binding (the repair retries it); everything else —
         // key substitution above all — fails closed.
@@ -822,14 +860,29 @@ async fn apply_rows(
       Ok(())
     }
     LaneId::Resources => {
+      // The same row-level policy as the descriptors arm: a corrupt or
+      // misattributed record row skips; the page apply below keeps its
+      // per-writer bounded wait and fail-closed skip for unknown
+      // writers, and its store faults propagate.
       let mut records = Vec::with_capacity(rows.len());
-      for (key, content) in rows {
-        let record = crate::resource::ResourceRecordV1::decode(content)
-          .map_err(|_| Error::invalid_input("reconcile resource row"))?;
-        if key.as_slice() != record.name().as_str().as_bytes() {
-          return Err(Error::invalid_input("reconcile resource key"));
+      for (row_key, content) in rows {
+        match crate::resource::ResourceRecordV1::decode(content) {
+          Ok(record) if row_key.as_slice() == record.name().as_str().as_bytes() => {
+            records.push(record);
+          }
+          Ok(record) => {
+            tracing::debug!(
+              name = %record.name().as_str(),
+              "reconcile resource row skipped: key mismatch"
+            );
+          }
+          Err(error) => {
+            tracing::debug!(
+              kind = ?error.kind(),
+              "reconcile resource row skipped: undecodable"
+            );
+          }
         }
-        records.push(record);
       }
       for chunk in records.chunks(crate::paging::PAGE_MAX_ITEMS) {
         let page = crate::resource::page::ResourcePage::new(chunk.to_vec(), None)?;
@@ -976,6 +1029,165 @@ mod tests {
         "an unknown writer's record must not install"
       );
     }
+  }
+
+  /// The poison-row contract, descriptors and trust arms: a batch
+  /// carrying undecodable or key-misattributed rows applies its good
+  /// rows and skips the poison with a typed reason — and a second pass
+  /// over the same batch (the derived-view repair's shape) succeeds
+  /// instead of wedging on the same row forever.
+  #[tokio::test]
+  async fn poison_rows_skip_and_good_rows_apply() {
+    use super::super::wire::LaneId;
+
+    let context = context_with_bindings(&[]).await;
+    let shared = plane_shared(&context).await;
+
+    // Descriptors: one good row, one undecodable, one misattributed key.
+    let good = crate::membership::NodeDescriptorV1::new(
+      node(51),
+      key(51),
+      vec![crate::Endpoint::parse("wss://good:9000").unwrap()],
+      1,
+      false,
+      1,
+    );
+    let good_key = node(51).as_str().as_bytes().to_vec();
+    let stale_key = node(52).as_str().as_bytes().to_vec();
+    let descriptor_rows = vec![
+      (good_key, good.encode().unwrap()),
+      (node(53).as_str().as_bytes().to_vec(), vec![0xFF, 0x00]),
+      (stale_key, good.encode().unwrap()),
+    ];
+    super::apply_rows(
+      shared.as_ref(),
+      &LaneId::Descriptors,
+      &descriptor_rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert!(
+      crate::membership::store::read_descriptor_ctx(context.store(), &node(51))
+        .await
+        .unwrap()
+        .is_some(),
+      "the good descriptor row applied"
+    );
+    // The repair channel's shape: the same batch applies again without
+    // wedging on its poison rows.
+    super::apply_rows(
+      shared.as_ref(),
+      &LaneId::Descriptors,
+      &descriptor_rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+
+    // Trust: one good binding, one undecodable, one misattributed key.
+    let binding = crate::identity::records::IdentityBindingV1::new(node(54), key(54));
+    let binding_rows = vec![
+      (
+        node(54).as_str().as_bytes().to_vec(),
+        binding.encode().unwrap(),
+      ),
+      (node(55).as_str().as_bytes().to_vec(), vec![0xFF, 0x00]),
+      (
+        node(56).as_str().as_bytes().to_vec(),
+        binding.encode().unwrap(),
+      ),
+    ];
+    super::apply_rows(shared.as_ref(), &LaneId::Trust, &binding_rows, None, None)
+      .await
+      .unwrap();
+    super::apply_rows(shared.as_ref(), &LaneId::Trust, &binding_rows, None, None)
+      .await
+      .unwrap();
+    let bindings = crate::identity::trust::store::trusted_bindings(context.store())
+      .await
+      .unwrap();
+    assert_eq!(
+      bindings.get(&node(54)),
+      Some(&key(54)),
+      "the good binding row applied"
+    );
+    assert!(
+      !bindings.contains_key(&node(56)),
+      "the misattributed row did not adopt under a foreign key"
+    );
+  }
+
+  /// The poison-row contract, resources arm: the same skip policy with
+  /// the per-writer trust intact — a good record from a trusted writer
+  /// lands, poison rows skip, and the repair shape does not wedge.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn poison_rows_skip_and_good_resource_rows_apply() {
+    use crate::resource::ResourceRecordV1;
+
+    let context = context_with_bindings(&[]).await;
+    let shared = plane_shared(&context).await;
+    // The writer is trusted: its descriptor is in the local store.
+    let writer = node(57);
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      writer.clone(),
+      key(57),
+      vec![crate::Endpoint::parse("wss://writer:9000").unwrap()],
+      1,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(
+      context.store(),
+      &crate::api::SystemEntropy,
+      &descriptor,
+    )
+    .await
+    .unwrap();
+    let name = crate::ResourceName::parse("example.org/resources/good").unwrap();
+    let record = ResourceRecordV1::sign(
+      name.clone(),
+      crate::LabelValue::parse("document").unwrap(),
+      crate::ResourceUri::parse("u://good").unwrap(),
+      crate::LabelSet::new(),
+      1_000,
+      writer,
+      0,
+      false,
+      &crate::identity::testing::scripted_signing(57),
+    )
+    .unwrap();
+    let rows = vec![
+      (name.as_str().as_bytes().to_vec(), record.encode().unwrap()),
+      (b"example.org/resources/poison".to_vec(), vec![0xFF, 0x00]),
+    ];
+    super::apply_rows(
+      shared.as_ref(),
+      &super::super::wire::LaneId::Resources,
+      &rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    super::apply_rows(
+      shared.as_ref(),
+      &super::super::wire::LaneId::Resources,
+      &rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert!(
+      crate::resource::store::read_record_ctx(context.store(), &name)
+        .await
+        .unwrap()
+        .is_some(),
+      "the good resource row applied behind the poison row"
+    );
   }
 
   /// One plane-shared fixture around a context.

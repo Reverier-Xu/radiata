@@ -1,12 +1,10 @@
-//! Shared session-carried anti-entropy plumbing (single source): the
-//! membership and resource sync lanes read bounded bodies, enumerate the
-//! alive-peer set, diff against per-peer watermarks, and push
+//! Shared session-carried sync plumbing (single source): the sync lanes
+//! read bounded bodies, enumerate the alive-peer set, and push
 //! fire-and-forget payloads through identical code so a fix in one lane
-//! cannot miss the other. The watermark walks below are the lanes'//! shared
-//! diff-only exchange model (the git remote-tracking idea: the sender keeps its
-//! own record of what the peer already holds and sends only the mismatched
-//! rows), so redundancy scales with the change set, never with the catalog
-//! size.
+//! cannot miss the other. The reconciliation plane's sessions carry the
+//! same pump, envelope, and admission-ack discipline; the rotation
+//! window and the shared detection cadence below schedule its root
+//! exchanges.
 
 use std::{pin::Pin, sync::Arc};
 

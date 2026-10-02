@@ -1327,10 +1327,10 @@ mod tests {
   }
 }
 
-/// Test-only shared convergence walk: the same emit/apply path the
-/// anti-entropy driver calls, driven bidirectionally between two stores
-/// until neither side applies any change. One home for the e2e, select,
-/// and page convergence tests.
+/// Test-only shared convergence walk: the same apply path the
+/// reconciliation plane's row batches ride, driven bidirectionally
+/// between two stores until neither side applies any change. One home
+/// for the e2e, select, and page convergence tests.
 #[cfg(test)]
 pub(crate) mod test_support {
   use super::page;
