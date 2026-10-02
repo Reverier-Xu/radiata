@@ -288,6 +288,13 @@ struct PlaneState {
   /// the derived-view repair must retry even though no new write armed
   /// the lane.
   force_rescan: BTreeSet<LaneId>,
+  /// Lanes with an outstanding derived-view repair set at the last
+  /// pass: a policy-skipped row (a tombstone whose subject binding has
+  /// not converged yet) heals when *another* lane's write advances the
+  /// epoch, so these lanes rescan on every epoch advance — the
+  /// pre-incremental retry semantics — while a clean steady state
+  /// (empty repair set everywhere) still scans nothing.
+  repair_pending: BTreeSet<LaneId>,
   /// The monotonic tick counter (the hint-retry backoff clock).
   tick_count: u64,
 }
@@ -353,6 +360,7 @@ impl ReconcilePlane {
           install_epoch: 0,
           rotation: None,
           force_rescan: BTreeSet::new(),
+          repair_pending: BTreeSet::new(),
           tick_count: 0,
         }),
       }),
@@ -419,6 +427,15 @@ impl ReconcilePlane {
         .iter()
         .any(|peer| guard.peers.get(peer).is_none_or(|state| !state.primed));
       let forced = std::mem::take(&mut guard.force_rescan);
+      // The cross-lane repair retry: an epoch advance with any lane
+      // still carrying a repair set rescans those lanes (a refused
+      // tombstone heals on the binding lane's write, never its own).
+      let epoch_advanced = epoch != guard.install_epoch;
+      let repair_lanes = if epoch_advanced {
+        std::mem::take(&mut guard.repair_pending)
+      } else {
+        BTreeSet::new()
+      };
       if has_unprimed {
         ACTIVE_LANES.into_iter().collect()
       } else {
@@ -427,6 +444,7 @@ impl ReconcilePlane {
           ACTIVE_LANES.into_iter().collect()
         } else {
           let mut lanes = forced;
+          lanes.extend(repair_lanes);
           for namespace in dirty {
             if let Some(lane) = lane_of_namespace(&namespace) {
               lanes.insert(lane);
@@ -603,6 +621,9 @@ impl ReconcilePlane {
           .into_iter()
           .map(|(lane, rows)| (lane, rows.into_values().collect()))
           .collect();
+        // The outstanding-repair lanes: every epoch advance rescans
+        // them until their repair set empties (the cross-lane retry).
+        guard.repair_pending = repair.iter().map(|(lane, _)| *lane).collect();
       }
       // The cadence window: ROOT exchanges for the due peers a bounded
       // fair window of the alive set serves this tick. The per-session
@@ -776,20 +797,25 @@ impl ReconcilePlane {
       // fan-out observes them; a failed application still fans out —
       // propagation and application are decoupled (the derived-view
       // repair retries the application side on the next epoch pass).
-      if let Err(error) = apply_rows(&self.shared, &lane, &rows, Some(source), Some(runtime)).await
-      {
+      // Either way the lane schedules one confirmation scan: the apply
+      // may have skipped rows the store cannot take yet (a tombstone
+      // whose subject binding has not converged), and those rows' retry
+      // lives in the next repair pass — without the scan the pass never
+      // recomputes (the delayed-content regression: the revocation
+      // arrived before its binding and never retried).
+      let applied = apply_rows(&self.shared, &lane, &rows, Some(source), Some(runtime)).await;
+      if let Err(error) = &applied {
         // Row-level refusals are skipped in-line by the arms; an error
         // here is a batch-level store fault — the rows stay in the
-        // engines and the derived-view repair retries them (the forced
-        // rescan keeps that retry armed even without a further write).
+        // engines and the derived-view repair retries them.
         tracing::warn!(
           lane = ?lane,
           kind = ?error.kind(),
           "reconcile rows apply aborted by a store fault; the repair retries"
         );
-        if let Ok(mut guard) = self.shared.lock() {
-          guard.force_rescan.insert(lane);
-        }
+      }
+      if let Ok(mut guard) = self.shared.lock() {
+        guard.force_rescan.insert(lane);
       }
       let mut guard = self.shared.lock()?;
       for (peer, state) in guard.peers.iter_mut() {

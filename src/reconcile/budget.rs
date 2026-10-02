@@ -455,9 +455,10 @@ impl Mesh {
   }
 
   /// The necessary row bytes of the run: every distinct row, once per
-  /// node that lacked it (all nodes but its writer).
-  fn necessary_row_bytes(&self, written: usize, row_len: usize) -> usize {
-    written * (self.nodes.len() - 1) * row_len
+  /// node that lacked it (all nodes but its writer), at the row's
+  /// actual wire size.
+  fn necessary_row_bytes(&self, written: usize, row_bytes: usize) -> usize {
+    written * (self.nodes.len() - 1) * row_bytes
   }
 }
 
@@ -473,6 +474,10 @@ fn steady_cell(nodes: usize, batch: usize, ticks: usize, reconnect: bool) -> (f6
   }
   mesh.pump(false, &mut rng);
   let row_len = 48_usize;
+  // The row's actual wire footprint (key + content bytes): the
+  // necessary-delivery denominator must count real bytes, not the
+  // nominal length.
+  let row_bytes = "budget-0000-00000".len() + (row_len - 21);
   let mut written = 0_usize;
   let mut changes = 0_usize;
   let offline = reconnect.then_some(nodes - 1);
@@ -510,9 +515,14 @@ fn steady_cell(nodes: usize, batch: usize, ticks: usize, reconnect: bool) -> (f6
     mesh.tick(false, &mut rng);
   }
   assert!(mesh.converged(), "the {} cell must converge", mesh.label);
-  let necessary = mesh.necessary_row_bytes(written, row_len);
+  let necessary = mesh.necessary_row_bytes(written, row_bytes);
   let redundancy = mesh.ledger.row_bytes_delivered as f64 / necessary as f64;
-  let hint_per_change_edge = mesh.ledger.hint_summary_bytes as f64 / (changes * DEGREE) as f64;
+  // The hint budget normalizes per change per session edge (the
+  // proposal's O(changes × k × ~40 B): an epidemic change crosses every
+  // node's k sessions once, so the denominator is changes × nodes ×
+  // degree, not the writer's degree alone).
+  let hint_per_change_edge =
+    mesh.ledger.hint_summary_bytes as f64 / (changes * nodes * DEGREE) as f64;
   (redundancy, hint_per_change_edge, mesh.ledger.breakdown())
 }
 

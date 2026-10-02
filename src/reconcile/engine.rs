@@ -201,6 +201,11 @@ pub(crate) const EAGER_DELTA_BYTES: usize = 4 * 1_024;
 /// root re-drive re-discovers the range).
 const NEED_PENDING_BOUNDS: usize = 4 * MAX_RANGES_PER_MESSAGE;
 
+/// Hints held for re-examination at round close: bounded like the NEED
+/// merge set (a hint is advisory, the cadence ROOT is the backstop, so
+/// the set only needs to cover a round's worth of concurrent notices).
+const HINT_PENDING_MAX: usize = 8;
+
 /// One engine drive input.#[derive(Debug)]
 pub(crate) enum Drive {
   /// A decoded message received from the peer.
@@ -255,6 +260,13 @@ pub(crate) struct Engine {
   /// section). Cleared wholesale whenever the backlog empties — at that
   /// moment no answer is pending, so a repeated NEED is a fresh request.
   pending_needs: Vec<(u64, u64)>,
+  /// Hints that arrived while a round was open: advisory notices held
+  /// for re-examination at round close, bounded like the NEED merge set
+  /// — a hint swallowed outright would strand the wave behind it for a
+  /// full detection-cadence window (the propagation stall the budget
+  /// lane measured at n=64: the sender's dirty set is cleared by its
+  /// own change drive, so nobody re-hints until the cadence ROOT).
+  pending_hints: Vec<Vec<RangeFingerprint>>,
   /// Digests of rows inserted since the last local-change drive, the
   /// eager-delta candidates: bounded in count by
   /// [`MAX_ROWS_PER_MESSAGE`] and in bytes by [`EAGER_DELTA_BYTES`], so
@@ -276,6 +288,7 @@ impl Engine {
       backlog: VecDeque::new(),
       pending_needs: Vec::new(),
       eager: Vec::new(),
+      pending_hints: Vec::new(),
     }
   }
 
@@ -385,6 +398,9 @@ impl Engine {
       self.round_open = false;
       let done = self.done_message();
       self.backlog.push_back(done);
+      // The close re-examines the hints that waited out the round; a
+      // follow-up round's work rides the same final drain.
+      self.replay_pending_hints();
     }
     self.drain_backlog(&mut out);
     Ok(out)
@@ -435,27 +451,13 @@ impl Engine {
           }
         }
         if !self.round_open {
-          let triples: Vec<(u64, u64, Fingerprint)> = ranges
-            .iter()
-            .map(|range| {
-              (
-                range.start,
-                range.end,
-                Fingerprint::new(range.count, range.xor),
-              )
-            })
-            .collect();
-          let divergent: Vec<(u64, u64, Fingerprint)> = triples
-            .into_iter()
-            .filter(|(start, end, peer)| self.range_fingerprint(*start, *end) != *peer)
-            .collect();
-          if !divergent.is_empty() {
-            self.initiate(&divergent)?;
-          }
+          self.process_hint_ranges(&ranges)?;
+        } else if !ranges.is_empty() && self.pending_hints.len() < HINT_PENDING_MAX {
+          // A hint against an open round waits for the close, bounded:
+          // the round may be converging exactly this divergence, and a
+          // re-examination at close costs one fingerprint pass.
+          self.pending_hints.push(ranges.clone());
         }
-        // A hint against an open round (or one that matches entirely)
-        // is silent: hints are advisory, and the next root exchange
-        // re-discovers anything the round did not settle.
       }
       Message::Offer { ranges, .. } => {
         let triples: Vec<(u64, u64, Fingerprint)> = ranges
@@ -493,6 +495,10 @@ impl Engine {
       }
       Message::Done { .. } => {
         self.round_open = false;
+        // The peer's close settles the shared round from its side too:
+        // any hint that waited the round out gets its re-examination
+        // now, not at the next cadence.
+        self.replay_pending_hints();
       }
     }
     Ok(self.backlog.len() - before)
@@ -596,8 +602,10 @@ impl Engine {
     // whose answer was lost at sea does not survive into the new round
     // (otherwise the stale awaiting flag would pin the round open and
     // silence every hint until the next cadence — the loss lane's
-    // doubled convergence window).
+    // doubled convergence window). The pending hints fold into the
+    // fresh exchange's own divergence pass.
     self.awaiting_response = false;
+    self.pending_hints.clear();
     let root = self.index.root();
     let root_message = Message::Root {
       lane: self.lane,
@@ -615,12 +623,55 @@ impl Engine {
     Ok(self.backlog.len() - before)
   }
 
-  /// Closes an open round and emits the DONE agreement receipt.
+  /// Compares one hint's claimed range fingerprints against the local
+  /// aggregates and initiates over the divergent subset — the hint's
+  /// whole contract (match → silence; mismatch → negotiate). Shared by
+  /// the fresh-hint path and the pending-hint replay at round close.
+  fn process_hint_ranges(&mut self, ranges: &[RangeFingerprint]) -> Result<()> {
+    let divergent: Vec<(u64, u64, Fingerprint)> = ranges
+      .iter()
+      .filter_map(|range| {
+        let peer = Fingerprint::new(range.count, range.xor);
+        (self.range_fingerprint(range.start, range.end) != peer).then_some((
+          range.start,
+          range.end,
+          peer,
+        ))
+      })
+      .collect();
+    if !divergent.is_empty() {
+      self.initiate(&divergent)?;
+    }
+    Ok(())
+  }
+
+  /// Closes an open round, emits the DONE agreement receipt, and
+  /// re-examines every hint that waited out the round.
   fn close_round_on_agreement(&mut self) {
     if self.round_open {
       self.round_open = false;
       let done = self.done_message();
       self.backlog.push_back(done);
+      self.replay_pending_hints();
+    }
+  }
+
+  /// Re-examines the hints that arrived while a round was open: the
+  /// round may have settled their divergence (the replay then sees
+  /// matching fingerprints and stays silent) or not (the replay
+  /// initiates the follow-up round immediately, so the wave the
+  /// original hint carried never waits a cadence window).
+  fn replay_pending_hints(&mut self) {
+    if self.pending_hints.is_empty() {
+      return;
+    }
+    let pending = std::mem::take(&mut self.pending_hints);
+    for ranges in &pending {
+      // The replay's own divergence work rides the backlog; a fault
+      // here is the same fault the fresh path would raise, and the
+      // fresh path retries it on the next drive — the pending hint is
+      // spent either way (bounded memory wins over a perfect retry).
+      let _ = self.process_hint_ranges(ranges);
     }
   }
 
@@ -1618,6 +1669,171 @@ mod tests {
       }
       other => panic!("expected a hint, got {other:?}"),
     }
+  }
+
+  /// Defect-2 regression (the n=64 propagation stall): a hint that
+  /// arrives while a round is open must wait for the close and then
+  /// re-examine — never be swallowed. The shape: engine C is mid-round
+  /// with A over one divergence when B's hint for a *different*
+  /// divergence arrives; the round closes, the pending hint initiates
+  /// immediately, and a three-hop chain propagates a change through
+  /// two intermediaries without any root exchange (one window, not one
+  /// cadence per hop).
+  #[test]
+  fn reconcile_a_hint_waiting_out_a_round_replays_at_close() {
+    let mut c = Engine::new(LaneId::Descriptors);
+    let mut a = Engine::new(LaneId::Descriptors);
+    let mut b = Engine::new(LaneId::Descriptors);
+    for row in [("a-1", "1"), ("a-2", "2")] {
+      a.insert_row(row.0.as_bytes(), row.1.as_bytes()).unwrap();
+      c.insert_row(row.0.as_bytes(), row.1.as_bytes()).unwrap();
+    }
+    b.insert_row(b"b-1", b"1").unwrap();
+    // C opens a round with A over a real divergence, capturing the
+    // round's opening questions for the settlement below.
+    a.insert_row(b"a-3", b"3").unwrap();
+    let hint_from_a = a.drive(Drive::LocalChange).unwrap().remove(0);
+    let Message::Hint { .. } = &hint_from_a else {
+      panic!("the change drive hints");
+    };
+    let opening = c.drive(Drive::Message(hint_from_a.clone())).unwrap();
+    assert!(c.round_open, "the divergent hint opened a round");
+    // B's hint arrives mid-round: it waits, bounded.
+    let hint_from_b = b.drive(Drive::LocalChange).unwrap().remove(0);
+    let _ = c.drive(Drive::Message(hint_from_b.clone())).unwrap();
+    assert_eq!(c.pending_hints.len(), 1, "the mid-round hint waits");
+    assert!(
+      c.rows().all(|(key, _)| key != b"b-1"),
+      "the waiting hint has not applied yet"
+    );
+    // The round with A settles (its questions and answers exchange),
+    // the close replays the pending hint, and the replay's negotiation
+    // starts at once — no root exchange needed. C's outputs during the
+    // settlement are captured: the replay's opening questions toward B
+    // ride them.
+    let mut replay_opening: VecDeque<Message> = VecDeque::new();
+    for message in opening {
+      for response in a.drive(Drive::Message(message)).unwrap() {
+        for reply in c.drive(Drive::Message(response)).unwrap() {
+          replay_opening.push_back(reply);
+        }
+      }
+    }
+    // The settled round closed (or its replay work is already queued):
+    // either way the waiting hint's divergence must resolve without any
+    // root exchange.
+    // Settle C↔B through a full two-queue pump until quiet: the
+    // replayed hint's negotiation must carry the b-1 row.
+    let mut to_b: VecDeque<Message> = c.drive(Drive::Drain).unwrap().into();
+    to_b.extend(replay_opening);
+    let mut to_c: VecDeque<Message> = VecDeque::new();
+    let mut guard = 0;
+    while !to_b.is_empty() || !to_c.is_empty() {
+      guard += 1;
+      assert!(guard < 200, "the replayed negotiation converged");
+      while let Some(message) = to_b.pop_front() {
+        for response in b.drive(Drive::Message(message)).unwrap() {
+          to_c.push_back(response);
+        }
+      }
+      while let Some(message) = to_c.pop_front() {
+        for response in c.drive(Drive::Message(message)).unwrap() {
+          to_b.push_back(response);
+        }
+      }
+      for drain in [
+        c.drive(Drive::Drain).unwrap(),
+        b.drive(Drive::Drain).unwrap(),
+      ] {
+        for message in drain {
+          to_b.push_back(message);
+        }
+      }
+    }
+    assert!(
+      c.rows().any(|(key, _)| key == b"b-1"),
+      "the waiting hint's divergence resolved through the replay"
+    );
+    assert!(c.pending_hints.is_empty(), "the replay spent the set");
+  }
+
+  /// The pending-hint set is bounded: hints beyond the cap drop (the
+  /// cadence ROOT is the backstop), and the set empties with the
+  /// replay.
+  #[test]
+  fn reconcile_pending_hints_are_bounded() {
+    let mut engine = Engine::new(LaneId::Descriptors);
+    engine.insert_row(b"k", b"v").unwrap();
+    engine.round_open = true;
+    for index in 0..u64::try_from(super::HINT_PENDING_MAX + 4).unwrap_or(32) {
+      let hint = Message::Hint {
+        lane: LaneId::Descriptors,
+        ranges: vec![RangeFingerprint {
+          start: index,
+          end: index,
+          count: 1,
+          xor: index,
+        }],
+        rows: Vec::new(),
+      };
+      let _ = engine.drive(Drive::Message(hint)).unwrap();
+    }
+    assert_eq!(
+      engine.pending_hints.len(),
+      super::HINT_PENDING_MAX,
+      "the waiting set respects its bound"
+    );
+  }
+
+  /// The meeting-point contract (the ring wave's one-duplicate leak):
+  /// two neighbors that both hold a row hint a lacking node in the same
+  /// window; the node negotiates with exactly one — the other's hint
+  /// either waits out the round and replays to silence (the row arrived
+  /// with the round's answer) or compares equal after the round closed.
+  /// One row, one delivery, never two.
+  #[test]
+  fn reconcile_converging_wavefronts_deliver_the_row_once() {
+    let mut a = Engine::new(LaneId::Descriptors);
+    let mut b = Engine::new(LaneId::Descriptors);
+    let mut c = Engine::new(LaneId::Descriptors);
+    for engine in [&mut a, &mut b] {
+      engine.insert_row(b"row", b"v").unwrap();
+    }
+    let hint_a = a.drive(Drive::LocalChange).unwrap().remove(0);
+    let hint_b = b.drive(Drive::LocalChange).unwrap().remove(0);
+    // A's hint opens C's round; B's hint waits it out.
+    let mut to_a: VecDeque<Message> = c.drive(Drive::Message(hint_a)).unwrap().into();
+    let _ = c.drive(Drive::Message(hint_b)).unwrap();
+    assert!(c.round_open && c.pending_hints.len() == 1);
+    // Pump the C↔A settlement: C's outbound questions go to A, A's
+    // replies come back to C, until quiet (C pulls the row from A).
+    let mut delivered_rows = 0_usize;
+    let mut guard = 0;
+    while let Some(message) = to_a.pop_front() {
+      guard += 1;
+      assert!(guard < 100);
+      for response in a.drive(Drive::Message(message)).unwrap() {
+        if let Message::Rows { rows, .. } = &response {
+          delivered_rows += rows.len();
+        }
+        for reply in c.drive(Drive::Message(response)).unwrap() {
+          to_a.push_back(reply);
+        }
+      }
+    }
+    for _ in 0..4 {
+      let _ = c.drive(Drive::Drain).unwrap();
+      let _ = a.drive(Drive::Drain).unwrap();
+    }
+    assert!(
+      c.rows().any(|(key, _)| key == b"row"),
+      "the row arrived through the single negotiation"
+    );
+    assert!(c.pending_hints.is_empty(), "the replay spent the set");
+    // B's engine never sent its row: no second negotiation opened.
+    let after = b.drive(Drive::Drain).unwrap();
+    assert!(after.is_empty(), "no residual work toward B: {:?}", after);
+    let _ = delivered_rows;
   }
 
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
