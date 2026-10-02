@@ -23,11 +23,13 @@ Lifecycle rules:
   guarding gates, and the recorded environmental limits that audits
   must budget for.
 - [`research/`](research/) — the sync-redundancy research cycle's evidence
-  library and architecture decision record: a source-grounded baseline of
-  the current anti-entropy redundancy, survey notes (gossip theory, set
-  reconciliation, delta CRDTs), a candidate comparison, and the target
-  architecture proposal. The proposal's accepted work items migrate into
-  `backlog.md` when the cycle is scoped.
+  library and architecture decision record (the cycle landed 2026-10 and
+  closed per the lifecycle rules): a source-grounded baseline of the
+  watermark anti-entropy's structural redundancy, survey notes (gossip
+  theory, set reconciliation, delta CRDTs), a candidate comparison, and
+  the target architecture proposal. Retained as decision evidence —
+  the shipped truth lives in `src/reconcile/` and `radiata::guide`, and
+  the cycle's summary lives in the backlog's landed section.
 
 Completed cycles do not keep their documents here. The
 `starvation-hardening-plan` cycle (configurable admission and
@@ -37,8 +39,13 @@ recalibrated timing profile, the one-core starvation CI gate, and the
 pipelined sync planes that followed) deleted its plan per the lifecycle
 rules, and its acceptance evidence lives in the commit history of the
 `starvation-hardening-plan` and `trust-pass-repair` branches. The
-`connection-degree` cycle (degree maintenance, the typed member-dial
+connection-degree` cycle (degree maintenance, the typed member-dial
 contract, the chat acceptance CI lane, the leave-persist log, and the
 mode-1 hub-loss chaos phase) did the same: the degree formula and its
 rationale live in `src/membership/degree.rs` and the guide, and the
-cycle's summary lives in the backlog's landed section.
+cycle's summary lives in the backlog's landed section. The
+`reconciliation plane` cycle (the fingerprint index, the engine and
+wire v1, the four-lane migration off the watermark walks, the trigger
+and adaptation layer, and the sync-budget lane) followed: its evidence
+library stays as the decision record, and its summary lives in the
+backlog's landed section.
