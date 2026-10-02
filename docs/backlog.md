@@ -175,8 +175,8 @@ evidence lands in the commit history.
   erasing other lanes' repair marks (`e3891de`).
 - The equivalence proof is the pre-existing suite: the membership,
   trust, resource, crash, and chaos lanes pass unchanged over the new
-  plane — 804 tests green at the cycle's acceptance point (the R3
-  gate), 805 after R5's guide doctest — and the `radiata::guide` sync
+  plane — 804 tests green at the R3/R4 acceptance points, 805 after
+  R5's guide doctest — and the `radiata::guide` sync
   chapters now describe the reconciliation contract (chapter 3 and the
   deployment chapter's background-load sizing).
 

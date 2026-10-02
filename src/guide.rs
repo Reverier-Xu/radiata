@@ -175,9 +175,10 @@
 //! Divergence is isolated by multi-way search: each OFFER round splits
 //! a divergent range into four children (the fan-out `b = 4`, a
 //! constant, not a negotiation parameter), so every divergence
-//! isolates in a bounded logarithmic descent — at most 34 OFFER
-//! rounds even over the whole digest space. Two short circuits skip
-//! the search entirely: a side whose range is empty sends its rows
+//! isolates in a bounded logarithmic descent — the whole digest space
+//! isolates in 32 OFFER rounds, and any narrower range in at most 34
+//! (the last split child inherits the division remainder). Two short circuits
+//! skip the search entirely: a side whose range is empty sends its rows
 //! directly (the peer's empty fingerprint is itself proof of lack),
 //! and a side holding nothing in the range sends NEED. Those two
 //! paths are the only ways row bytes cross a session — the
@@ -186,11 +187,14 @@
 //! Concurrency is bounded on both sides of an edge. Each session
 //! holds at most one negotiated round per lane in flight, and each
 //! node serializes further: while any engine of a lane has a round
-//! open, the node holds sibling sessions' hints and root initiations
-//! (a bounded hold of eight entries per lane; responses are never
-//! held — a peer's initiation must always answer, or two nodes
-//! holding each other's hints would deadlock). Whole-lane initiations
-//! are ordered: the data-poorer side of an edge — the `(count,
+//! open, the node holds sibling sessions' hints and its own queued
+//! root initiations (the prime and cadence drives), while a peer's
+//! inbound ROOT arriving mid-round is dropped rather than held (a
+//! stale whole-lane claim must not initiate; the cadence refresh
+//! replaces it) — all holds bounded at eight entries per lane;
+//! responses are never held — a peer's initiation must always
+//! answer, or two nodes holding each other's hints would deadlock). Whole-lane
+//! initiations are ordered: the data-poorer side of an edge — the `(count,
 //! xor)`-lesser root — initiates, so the richer side never pushes
 //! from a stale claim. Lost messages always recover through the
 //! cadence ROOT exchange, never through re-sending payloads.
