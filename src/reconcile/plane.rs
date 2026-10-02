@@ -31,10 +31,12 @@
 //!
 //! The per-lane pull serialization closes the payload-once invariant:
 //! a node holds a sibling session's hint (rows still applying) while
-//! any engine of the same lane has an open round, and the engine's
-//! root initiation is ordered (`root_precedes`: the data-poorer side
-//! of an edge initiates, so the richer side never pushes from a stale
-//! whole-lane claim). One node, one negotiation per lane — two
+//! any engine of the same lane but the source session's own has an
+//! open round (a hint from the round's own session walks the engine's
+//! pending-hint discipline instead), and the engine's root initiation
+//! is ordered (`root_precedes`: the data-poorer side of an edge
+//! initiates, so the richer side never pushes from a stale whole-lane
+//! claim). One node, one negotiation per lane — two
 //! parallel answerers can never race the same rows onto the wire
 //! twice. Responses are never held: a peer's initiation must always
 //! answer, or two nodes holding each other's hints would deadlock.
@@ -185,9 +187,11 @@ impl PeerState {
 
 /// One undelivered hint awaiting its backoff on a weak link: the
 /// message, the remaining retry budget, and the tick it may re-send at.
-/// A fresh hint for the same lane replaces it; the budget's exhaustion
-/// drops it (the detection cadence is the backstop, and hints are
-/// advisory by contract).
+/// The slot arms once: a session already holding a retry keeps its
+/// remaining attempts (a later undelivered hint does not replace it),
+/// a recovered link drops its pending hint, and the budget's
+/// exhaustion drops it (the detection cadence is the backstop, and
+/// hints are advisory by contract).
 struct PendingHint {
   message: Message,
   attempts_left: u8,

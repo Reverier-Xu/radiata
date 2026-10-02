@@ -11,14 +11,16 @@
 //!    boundaries](#1-resource-versions-across-process-boundaries)
 //! 2. [The any-one-route connectivity
 //!    contract](#2-the-any-one-route-connectivity-contract)
-//! 3. [Routing packets: `RouteNextHop`](#3-routing-packets-routenexthop)
-//! 4. [Receiving packets:
-//!    `PacketConsumer`](#4-receiving-packets-packetconsumer)
-//! 5. [Holding identity keys:
-//!    `KeyProvider`](#5-holding-identity-keys-keyprovider)
-//! 6. [Leaving the cluster: `node.leave`](#6-leaving-the-cluster-nodeleave)
-//! 7. [Deploying on low-performance
-//!    devices](#7-deploying-on-low-performance-devices)
+//! 3. [How state converges: the reconciliation
+//!    contract](#3-how-state-converges-the-reconciliation-contract)
+//! 4. [Routing packets: `RouteNextHop`](#4-routing-packets-routenexthop)
+//! 5. [Receiving packets:
+//!    `PacketConsumer`](#5-receiving-packets-packetconsumer)
+//! 6. [Holding identity keys:
+//!    `KeyProvider`](#6-holding-identity-keys-keyprovider)
+//! 7. [Leaving the cluster: `node.leave`](#7-leaving-the-cluster-nodeleave)
+//! 8. [Deploying on low-performance
+//!    devices](#8-deploying-on-low-performance-devices)
 //!
 //! # 1. Resource versions across process boundaries
 //!
@@ -70,8 +72,12 @@
 //! recovery plane never expands the topology of a connected node; it
 //! dials candidates from the member table only while the node is fully
 //! isolated, with bounded fan-out and backoff. Once any route works,
-//! anti-entropy (membership descriptors, resources, trust bindings)
-//! converges the rest over that route.
+//! the reconciliation plane
+//! ([chapter 3](#3-how-state-converges-the-reconciliation-contract))
+//! converges the rest over that route: membership descriptors, issuer
+//! trust bindings, resource rows, and removal tombstones spread as
+//! receiver-evidenced exchanges hop by hop, so a wider topology only
+//! shortens paths — it is never a convergence requirement.
 //!
 //! The **connection-degree maintenance plane** complements that
 //! contract: while a node's live session count sits below its target
@@ -99,16 +105,20 @@
 //! whether the mesh is `Healthy`. A node stuck `Unhealthy` below target
 //! is the operator's signal that the network (or the peers' published
 //! endpoints) cannot carry the mesh the degree contract asks for.
-//! Convergence after a partition is bounded by the anti-entropy tick
-//! period times the recovery backoff, plus one maintenance tick for the
-//! degree top-up — not by any fixed topology.
+//! Convergence after a partition is bounded by the recovery backoff
+//! plus the sync plane's own cadence — a rejoined session opens with a
+//! whole-lane summary exchange, changes ride the tick-debounced hints,
+//! and whatever no message ever observed heals at the quiet detection
+//! cadence of [chapter
+//! 3](#3-how-state-converges-the-reconciliation-contract) — plus one
+//! maintenance tick for the degree top-up, never by any fixed topology.
 //!
 //! ```no_run
 //! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
 //! let view = node.recovery().await?;
 //! if view.is_connected() {
 //!     // At least one authenticated path exists: business traffic
-//!     // flows, and background anti-entropy converges the rest.
+//!     // flows, and the reconciliation plane converges the rest.
 //! } else {
 //!     // Fully isolated: recovery is dialing the member table with
 //!     // bounded fan-out; `unreachable_members` tracks its progress.
@@ -117,7 +127,131 @@
 //! # }
 //! ```
 //!
-//! # 3. Routing packets: `RouteNextHop`
+//! # 3. How state converges: the reconciliation contract
+//!
+//! Membership descriptors, issuer trust bindings, resource rows, and
+//! removal tombstones converge under one contract, the reconciliation
+//! plane: peers compare **range fingerprints** over their row sets and
+//! exchange row bytes only where the receiving side proves it lacks
+//! them — the one bounded exception is the eager piggyback below. A
+//! push to a peer that may already hold a row is exactly the per-edge
+//! duplication this contract exists to eliminate, so a changed row
+//! crosses each edge at most once per lacking receiver, whatever the
+//! mesh looks like. There is nothing to configure: the plane runs over
+//! the authenticated sessions the connection planes maintain.
+//!
+//! Each converged key space (a **lane**) is indexed by content: every
+//! row's `(key, content)` pair is hashed by a frozen digest function —
+//! the first eight bytes of SHA-256 over the canonical CBOR encoding
+//! of the pair, a wire-contract constant pinned by golden vectors —
+//! and any digest range aggregates to the pair `(count, xor of
+//! digests)`. The pair forms a commutative group, so any range's
+//! fingerprint is the difference of two prefix fingerprints, and two
+//! peers that agree on a range's fingerprint hold the same rows there
+//! (the remaining disagreement needs a digest collision *and* a
+//! matching count, bounded far below any operational catalog). Merge
+//! semantics stay where they always were — in the lane's row content
+//! and its apply path — so reconciliation changes how rows travel,
+//! never who wins.
+//!
+//! One protocol stream carries six message kinds, every message naming
+//! its lane:
+//!
+//! - `ROOT` — the sender's whole-lane aggregate, exchanged when a session is
+//!   established and on the quiet detection cadence.
+//! - `HINT` — a best-effort notice that these ranges changed. Hints may be
+//!   lost, duplicated, or ignored; one that matches the local fingerprints is
+//!   answered with silence.
+//! - `OFFER` — the sender's fingerprints for negotiated subranges.
+//! - `NEED` — the ranges whose rows the sender lacks: the side that observes
+//!   itself lacking asks, the other side answers.
+//! - `ROWS` — row payloads, applied idempotently through the lane's merge
+//!   semantics.
+//! - `DONE` — the round-close receipt: the sender's whole-lane state digest.
+//!   Matching tokens when both sides close the same round are a cheap agreement
+//!   proof; completeness is always re-established by fingerprint evidence,
+//!   never by counting messages.
+//!
+//! Divergence is isolated by multi-way search: each OFFER round splits
+//! a divergent range into four children (the fan-out `b = 4`, a
+//! constant, not a negotiation parameter), so every divergence
+//! isolates in a bounded logarithmic descent — at most 34 OFFER
+//! rounds even over the whole digest space. Two short circuits skip
+//! the search entirely: a side whose range is empty sends its rows
+//! directly (the peer's empty fingerprint is itself proof of lack),
+//! and a side holding nothing in the range sends NEED. Those two
+//! paths are the only ways row bytes cross a session — the
+//! **receiver-evidenced payload rule**.
+//!
+//! Concurrency is bounded on both sides of an edge. Each session
+//! holds at most one negotiated round per lane in flight, and each
+//! node serializes further: while any engine of a lane has a round
+//! open, the node holds sibling sessions' hints and root initiations
+//! (a bounded hold of eight entries per lane; responses are never
+//! held — a peer's initiation must always answer, or two nodes
+//! holding each other's hints would deadlock). Whole-lane initiations
+//! are ordered: the data-poorer side of an edge — the `(count,
+//! xor)`-lesser root — initiates, so the richer side never pushes
+//! from a stale claim. Lost messages always recover through the
+//! cadence ROOT exchange, never through re-sending payloads.
+//!
+//! ## Triggers and adaptation
+//!
+//! The plane is change-driven, with a quiet backstop:
+//!
+//! - **Local writes** note their store namespace; the next sync tick rescans
+//!   only the lanes whose key spaces changed (a quiet steady state scans
+//!   nothing) and leaves each peer's engine as one coalesced HINT. Rows a
+//!   consumer applies fan out to the sibling engines at apply time, so a change
+//!   propagates hop by hop as hints — the epidemic wave carries summaries,
+//!   never payloads.
+//! - **Eager-delta**: on a healthy link, the originator's local-write path
+//!   piggybacks the changed rows onto the HINT under a 4 KiB budget; applied
+//!   idempotently, it usually makes the negotiation unnecessary. It is the
+//!   plane's only unsolicited payload — bounded, and disabled on links the
+//!   profile distrusts.
+//! - **The quiet cadence**: every 32 sync ticks (32 seconds at the default
+//!   one-second tick) a bounded rotation of peers exchanges ROOTs — the
+//!   loss-recovery backstop that heals any drift no message ever observed. On a
+//!   weak link the cadence runs four times as often, every 8 ticks.
+//! - **Link profiles**: each session tracks an EWMA of admission round-trip
+//!   time and dispatch loss. A link is *weak* when loss reaches 10% or RTT
+//!   reaches 1.5 s, and the verdict drives exactly three knobs — the cadence
+//!   multiplier above, an undelivered hint's retry on a doubling backoff of 1,
+//!   2, 4, 8 ticks (then the cadence absorbs the loss), and the eager-delta
+//!   toggle. All three spend summary redundancy only: the payload path is not a
+//!   knob, and a weak link's premium is retry latency, never duplicate bytes.
+//! - **Pruning and the epoch index**: the incremental scan also prunes engine
+//!   rows the store superseded (a revision bump, a lost last-writer-wins race)
+//!   and tombstones the cleanup checkpoint already collected, so a newly
+//!   connected peer receives the lane's current truth, never its history.
+//!
+//! ```no_run
+//! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
+//! # use radiata::ResourceName;
+//! // A resource another member wrote arrives through the plane: from
+//! // the business side it is a plain read once converged. Convergence
+//! // needs no verb — `node.sync()` exists to drive one round now (for
+//! // deterministic tests), not because the plane waits for it; a
+//! // bounded poll like this is the integration's own deadline.
+//! let name = ResourceName::parse("example.woooo.tech/config/edge")?;
+//! let mut waited = 0;
+//! let view = loop {
+//!   if let Some(view) = node.resources().get(name.clone()).await? {
+//!     break view;
+//!   }
+//!   waited += 1;
+//!   if waited == 120 {
+//!     return Err(radiata::Error::caller("the edge never converged"));
+//!   }
+//!   tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+//! };
+//! # let _ = view;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # 4. Routing packets: `RouteNextHop`
 //!
 //! The routing plane delivers a packet to a destination the sender may
 //! not hold a session with. Direct delivery to a connected destination
@@ -180,7 +314,7 @@
 //! # }
 //! ```
 //!
-//! # 4. Receiving packets: `PacketConsumer`
+//! # 5. Receiving packets: `PacketConsumer`
 //!
 //! A protocol is one wire contract: a [`ProtocolTag`](crate::ProtocolTag)
 //! plus the [`PacketConsumer`](crate::PacketConsumer) that receives its
@@ -218,7 +352,7 @@
 //! owning feature) and the consumer; the runtime starts dispatching
 //! streams once the first matching session admits them.
 //!
-//! # 5. Holding identity keys: the built-in custody and `KeyProvider`
+//! # 6. Holding identity keys: the built-in custody and `KeyProvider`
 //!
 //! Identity is only as durable as its private keys. By default you never
 //! touch key custody at all: the node stores its identity seed inside the
@@ -346,7 +480,7 @@
 //! no longer sign. For `file_key_store` that means the same directory,
 //! durably mounted.
 //!
-//! # 6. Leaving the cluster: `node.leave`
+//! # 7. Leaving the cluster: `node.leave`
 //!
 //! An active leave is three effects behind one verb: the node's
 //! identity is replaced with a fresh node id and key, the old
@@ -378,7 +512,7 @@
 //! # }
 //! ```
 //!
-//! # 7. Deploying on low-performance devices
+//! # 8. Deploying on low-performance devices
 //!
 //! **There is nothing to configure.** Build the node, form the
 //! cluster, send data — the defaults are the deployment. The library
@@ -398,22 +532,22 @@
 //!   holds roughly `8 MiB × 7 ≈ 56 MiB` of queue capacity at the defaults.
 //!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
 //!   and the degree override are the two knobs that change it materially.
-//! - **Background load** is the anti-entropy tick: `N × interval` work per
-//!   round cluster-wide, and the traffic it emits is diff-only — every sync
-//!   plane tracks, per peer, the digest of each row it has delivered, so the
-//!   descriptor and trust-binding planes send nothing once converged (quiet
-//!   digest scans) and a change costs its changed rows per peer per hop, never
-//!   a whole-catalog re-send. The removal-tombstone plane forwards only
-//!   unconfirmed records and keeps a bounded periodic refresh (an admission
-//!   acknowledgement cannot prove the receiver applied a tombstone whose
-//!   subject's binding had not converged yet). The tick dispatches to its peers
-//!   and settles delivery verdicts off the tick path, so a hub's per-tick
-//!   hold-down stays at the dispatch cost rather than the slowest peer's ack
-//!   bound — the reference 64-node mesh holds the one-second cadence even on a
-//!   single slow core. Each round's dispatch is bounded to a small fair window
-//!   of the live sessions, so the per-round cost is independent of the
-//!   connection degree: a denser node spreads its peers across consecutive
-//!   rounds instead of bursting once. The degree-maintenance tick adds bounded
+//! - **Background load** is the reconciliation plane ([chapter
+//!   3](#3-how-state-converges-the-reconciliation-contract)) riding the sync
+//!   tick (one second by default,
+//!   [`with_anti_entropy_interval`](crate::NodeConfig::with_anti_entropy_interval)):
+//!   the tick's store scan is incremental — only lanes whose key spaces were
+//!   written since the last pass rescan, so a quiet node scans nothing — and a
+//!   change costs one coalesced summary hint per live session plus the changed
+//!   rows themselves, which cross an edge only under the receiver-evidenced
+//!   rule or as the bounded eager piggyback, never as a whole-catalog re-send
+//!   or a per-edge duplicate. The quiet steady state is one tens-of-bytes
+//!   whole-lane summary per peer per 32 ticks, dispatched through a bounded
+//!   rotation window (two peers per tick), so the per-tick cost is independent
+//!   of the connection degree: a denser node spreads its cadence exchanges
+//!   across consecutive ticks. The tick settles delivery verdicts off the tick
+//!   path, so a hub's per-tick hold-down stays at the dispatch cost rather than
+//!   the slowest peer's ack bound. The degree-maintenance tick adds bounded
 //!   work only while a node is below its target: nothing while healthy, one
 //!   deficit-sized dial batch per 30 seconds while healing.
 //!

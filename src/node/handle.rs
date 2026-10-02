@@ -425,13 +425,12 @@ impl NodeHandle {
       .await
   }
 
-  /// Runs one full anti-entropy round now: pages the local membership
-  /// and resource registers and pushes them over a fair window of the
-  /// authenticated sessions (a small bounded fan-out per round, in
-  /// rotation), exactly like a wall-clock tick, and completes when the
-  /// round finishes. Convergence checks become deterministic: drive
-  /// rounds, await each, then read the pages — no tick-cadence sleeps; a
-  /// cluster denser than the window converges across consecutive rounds.
+  /// Runs one full sync round now — the membership maintenance tick
+  /// plus the reconciliation plane's tick — exactly like a wall-clock
+  /// tick, and completes when the round finishes. Convergence checks
+  /// become deterministic: drive rounds, await each, then read the
+  /// registers — no tick-cadence sleeps; the quiet ROOT rotation covers
+  /// the alive set across consecutive rounds.
   pub fn sync(&self) -> impl Future<Output = Result<()>> + Send {
     let runtime = self.runtime.clone();
     async move {
