@@ -29,6 +29,16 @@
 //!    [`Drive::LocalChange`] (the epidemic wave is hints between sessions;
 //!    payload crosses each edge once).
 //!
+//! The per-lane pull serialization closes the payload-once invariant:
+//! a node holds a sibling session's hint (rows still applying) while
+//! any engine of the same lane has an open round, and the engine's
+//! root initiation is ordered (`root_precedes`: the data-poorer side
+//! of an edge initiates, so the richer side never pushes from a stale
+//! whole-lane claim). One node, one negotiation per lane — two
+//! parallel answerers can never race the same rows onto the wire
+//! twice. Responses are never held: a peer's initiation must always
+//! answer, or two nodes holding each other's hints would deadlock.
+//!
 //! The trigger layer rides the same five seams: a local write debounces
 //! into the next tick's lane scan and leaves the engine as one coalesced
 //! HINT (plus, on a healthy link, the eager-delta row piggyback — the
@@ -295,8 +305,70 @@ struct PlaneState {
   /// pre-incremental retry semantics — while a clean steady state
   /// (empty repair set everywhere) still scans nothing.
   repair_pending: BTreeSet<LaneId>,
+  /// The per-lane pull serialization: hints held while any engine of
+  /// the lane has an open round (their rows applied, their ranges
+  /// waiting). One node never runs two negotiations of one lane at
+  /// once, so two parallel answerers can never race the same rows onto
+  /// the wire twice — the payload-once discipline of the proposal §8,
+  /// extended from "one round per session" to "one round per node".
+  /// Responses are never held (a peer's initiation must always answer,
+  /// or two nodes holding each other's hints would deadlock).
+  held_hints: BTreeMap<LaneId, Vec<(NodeId, Vec<crate::reconcile::wire::RangeFingerprint>)>>,
   /// The monotonic tick counter (the hint-retry backoff clock).
   tick_count: u64,
+}
+
+/// The per-lane hold on held hints: one round's worth of concurrent
+/// notices, the same discipline as the engine's pending set.
+const HELD_HINTS_PER_LANE: usize = 8;
+
+impl PlaneState {
+  /// Whether any engine of one lane has an open round.
+  fn lane_in_round(&self, lane: LaneId) -> bool {
+    self
+      .peers
+      .values()
+      .any(|state| state.engines.get(&lane).is_some_and(|e| e.round_open()))
+  }
+
+  /// Releases every held hint whose lane went quiet, driving each into
+  /// its source engine; returns the outbound messages the releases
+  /// generated.
+  fn release_held_hints(&mut self) -> Vec<(NodeId, Message)> {
+    let mut outbound = Vec::new();
+    let lanes: Vec<LaneId> = self.held_hints.keys().copied().collect();
+    for lane in lanes {
+      if self.lane_in_round(lane) {
+        continue;
+      }
+      let Some(held) = self.held_hints.remove(&lane) else {
+        continue;
+      };
+      for (source, ranges) in held {
+        let Some(state) = self.peers.get_mut(&source) else {
+          continue;
+        };
+        let hint = Message::Hint {
+          lane,
+          ranges,
+          rows: Vec::new(),
+        };
+        match state.engine(lane).drive(Drive::Message(hint)) {
+          Ok(messages) => {
+            outbound.extend(
+              messages
+                .into_iter()
+                .map(|message| (source.clone(), message)),
+            );
+          }
+          Err(error) => {
+            tracing::debug!(lane = ?lane, kind = ?error.kind(), "reconcile held hint failed");
+          }
+        }
+      }
+    }
+    outbound
+  }
 }
 
 /// The plane's shared state: the per-peer engines plus the node-scoped
@@ -362,6 +434,7 @@ impl ReconcilePlane {
           force_rescan: BTreeSet::new(),
           repair_pending: BTreeSet::new(),
           tick_count: 0,
+          held_hints: BTreeMap::new(),
         }),
       }),
     }
@@ -673,6 +746,8 @@ impl ReconcilePlane {
           }
         }
       }
+      // Rounds the cadence closed release their held hints too.
+      outbound.extend(guard.release_held_hints());
       // Drain every engine's backlog behind the triggered drives.
       for peer in &peers {
         if let Some(state) = guard.peers.get_mut(peer) {
@@ -780,17 +855,61 @@ impl ReconcilePlane {
     let mut outbound: Vec<(NodeId, Message)> = Vec::new();
     {
       let mut guard = self.shared.lock()?;
-      let engine = guard
-        .peers
-        .entry(source.clone())
-        .or_insert_with(PeerState::fresh)
-        .engine(lane);
-      let messages = engine.drive(Drive::Message(message))?;
-      outbound.extend(
-        messages
-          .into_iter()
-          .map(|message| (source.clone(), message)),
-      );
+      // The per-lane pull serialization: a hint arriving while any
+      // engine of the lane still negotiates holds its ranges (the
+      // piggyback rows below still apply — payload is never held) and
+      // releases when the lane goes quiet, where a fingerprint
+      // comparison usually resolves it to silence. Without the hold,
+      // two parallel answerers race the same rows onto the wire twice.
+      // Responses are never held: a peer's initiation must always
+      // answer, or two nodes holding each other's hints would deadlock.
+      let hold = match &message {
+        Message::Hint { ranges, .. }
+          if guard.lane_in_round(lane)
+            && guard
+              .held_hints
+              .get(&lane)
+              .is_none_or(|held| held.len() < HELD_HINTS_PER_LANE) =>
+        {
+          Some(ranges.clone())
+        }
+        _ => None,
+      };
+      if let Some(ranges) = hold {
+        guard
+          .held_hints
+          .entry(lane)
+          .or_default()
+          .push((source.clone(), ranges));
+        // The piggyback rows still enter the source engine: payload is
+        // never held, only the negotiation candidacy.
+        let engine = guard
+          .peers
+          .entry(source.clone())
+          .or_insert_with(PeerState::fresh)
+          .engine(lane);
+        for (key, content) in &rows {
+          if let Err(error) = engine.insert_row(key, content) {
+            tracing::debug!(kind = ?error.kind(), "reconcile held-hint row skipped");
+          }
+        }
+      } else {
+        let engine = guard
+          .peers
+          .entry(source.clone())
+          .or_insert_with(PeerState::fresh)
+          .engine(lane);
+        let messages = engine.drive(Drive::Message(message))?;
+        outbound.extend(
+          messages
+            .into_iter()
+            .map(|message| (source.clone(), message)),
+        );
+      }
+      // A round the delivery just closed releases whatever it was
+      // holding — the released hint compares against the settled state
+      // and stays silent when its divergence was the round's own.
+      outbound.extend(guard.release_held_hints());
     }
     if !rows.is_empty() {
       // Rows apply through the lane's merge semantics before any

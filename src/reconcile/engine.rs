@@ -306,6 +306,15 @@ impl Engine {
     self.peer_root == Some(self.index.root())
   }
 
+  /// Whether a negotiated round this engine initiated is in flight —
+  /// the plane's per-lane pull serialization reads it (a node holds a
+  /// sibling session's hint while any engine of the same lane still
+  /// negotiates, so two parallel answers can never race the same rows
+  /// onto the wire twice).
+  pub(crate) fn round_open(&self) -> bool {
+    self.round_open
+  }
+
   /// The number of rows held.
   #[cfg(test)]
   pub(crate) fn len(&self) -> usize {
@@ -430,11 +439,18 @@ impl Engine {
         self.peer_root = Some(peer);
         if peer == local {
           self.close_round_on_agreement();
-        } else if !self.round_open {
+        } else if !self.round_open && root_precedes(local, peer) {
+          // Only the data-poorer side initiates from a whole-lane claim:
+          // a claim is a then-snapshot, and the richer side pushing from
+          // one re-delivers everything the poorer side's own pull is
+          // already bringing over the same edge (the reconnect
+          // double-pull). The poorer side's descent NEEDs exactly what
+          // it lacks — receiver-evidenced, never redundant.
           self.initiate(&[(0, u64::MAX, peer)])?;
         }
-        // A divergent ROOT against an open round is suppressed: the
-        // round's own exchange (or the next root re-drive) carries it.
+        // A divergent ROOT against an open round (or on the richer
+        // side) is suppressed: the round's own exchange (or the poorer
+        // side's descent) carries it.
       }
       Message::Hint { ranges, rows, .. } => {
         // The eager-delta piggyback applies first, exactly like a ROWS
@@ -616,7 +632,9 @@ impl Engine {
     if let Some(peer) = self.peer_root {
       if peer == root {
         self.close_round_on_agreement();
-      } else {
+      } else if root_precedes(root, peer) {
+        // The same ordering rule as a received ROOT: the re-drive
+        // initiates only from the poorer side.
         self.initiate(&[(0, u64::MAX, peer)])?;
       }
     }
@@ -912,6 +930,14 @@ impl Engine {
       round_token: state_token(root),
     }
   }
+}
+
+/// The initiation ordering over whole-lane roots: the
+/// `(count, xor)`-lesser side initiates. Both sides of an edge compute
+/// the same order, so exactly one initiates — the side whose own state
+/// is the pull's evidence, never the side acting on a stale claim.
+fn root_precedes(local: Fingerprint, peer: Fingerprint) -> bool {
+  (local.count(), local.xor()) < (peer.count(), peer.xor())
 }
 
 /// Splits the inclusive range `[start, end]` into [`FANOUT`] children

@@ -57,6 +57,10 @@ const LOSS_INTERVAL: u64 = 5;
 /// plane.
 const CADENCE_TICKS: u32 = 32;
 
+/// The per-node hold on held hints (one round's worth of concurrent
+/// notices per peer, matching the engine's pending set discipline).
+const HELD_HINTS_PER_NODE: usize = 8;
+
 /// The ROOT exchange window per tick per node, shared with the plane.
 const ROOT_WINDOW: usize = 2;
 
@@ -98,10 +102,10 @@ struct Ledger {
   hints: usize,
   roots: usize,
   /// The delivery-shape breakdown for diagnostics: negotiated ROWS
-  /// bytes versus eager piggyback bytes, with message counts.
+  /// bytes with message counts, and the eager piggyback hint count
+  /// (its row bytes are inside `row_bytes_delivered`).
   rows_bytes: usize,
   rows_messages: usize,
-  eager_bytes: usize,
   eager_hints: usize,
   /// The duplicate-delivery oracle: each delivered row's sender→receiver
   /// edge, counted per (row, edge) — a count above one is redundant
@@ -110,26 +114,13 @@ struct Ledger {
 }
 
 impl Ledger {
-  /// Accounts one crossing frame.
+  /// Accounts one crossing frame's summary traffic at emission (hints
+  /// are fire-and-forget notices: what went on the wire is the hint
+  /// budget, whether it landed).
   fn record(&mut self, message: &Message) {
     match message {
-      Message::Rows { rows, .. } => {
-        let bytes: usize = rows
-          .iter()
-          .map(|row| row.key.len() + row.content.len())
-          .sum();
-        self.row_bytes_delivered += bytes;
-        self.rows_bytes += bytes;
-        self.rows_messages += 1;
-      }
+      Message::Rows { .. } => {}
       Message::Hint { ranges, rows, lane } => {
-        let row_bytes: usize = rows
-          .iter()
-          .map(|row| row.key.len() + row.content.len())
-          .sum();
-        self.row_bytes_delivered += row_bytes;
-        self.eager_bytes += row_bytes;
-        self.eager_hints += !rows.is_empty() as usize;
         let summary = Message::Hint {
           lane: *lane,
           ranges: ranges.clone(),
@@ -139,14 +130,25 @@ impl Ledger {
           .map(|bytes| bytes.len())
           .unwrap_or_default();
         self.hints += 1;
+        self.eager_hints += !rows.is_empty() as usize;
       }
       Message::Root { .. } => self.roots += 1,
       _ => {}
     }
   }
 
-  /// Accounts one delivered (not dropped) frame's rows on its edge.
+  /// Accounts one delivered (not dropped) frame's rows on its edge:
+  /// payload redundancy counts what actually crossed, so a frame the
+  /// dead session swallowed (the reconnect partition window) is not
+  /// delivery.
   fn record_delivery(&mut self, from: usize, to: usize, rows: &[super::wire::Row]) {
+    let bytes: usize = rows
+      .iter()
+      .map(|row| row.key.len() + row.content.len())
+      .sum();
+    self.row_bytes_delivered += bytes;
+    self.rows_messages += 1;
+    self.rows_bytes += bytes;
     for row in rows {
       *self
         .row_deliveries
@@ -178,12 +180,11 @@ impl Ledger {
       .map(|((from, to, _), count)| format!("{from}->{to}x{count}"))
       .collect();
     format!(
-      "rows_messages={} rows_bytes={} eager_hints={} eager_bytes={} hints={} roots={} \
+      "rows_messages={} rows_bytes={} eager_hints={} hints={} roots={} \
        unique_row_node_deliveries={} duplicate_deliveries={} exemplar=[{}]",
       self.rows_messages,
       self.rows_bytes,
       self.eager_hints,
-      self.eager_bytes,
       self.hints,
       self.roots,
       unique,
@@ -193,11 +194,21 @@ impl Ledger {
   }
 }
 
-/// One simulated node: its applied store and one engine per directed
-/// session.
+/// One simulated node: its applied store, one engine per directed
+/// session, and the per-lane held sets (the pull-serialization
+/// discipline the plane enforces — one negotiation per lane per node:
+/// held hints and held root-exchange drives release when the lane goes
+/// quiet).
 struct Node {
   store: BTreeMap<Vec<u8>, Vec<u8>>,
   engines: BTreeMap<usize, Engine>,
+  /// Held inbound hints (rows stripped and applied) whose lane still
+  /// negotiates elsewhere at the node; inbound roots in the same window
+  /// drop instead (a stale whole-lane claim must never initiate).
+  held: BTreeMap<usize, Vec<Message>>,
+  /// Peers whose root-exchange drive waits out the lane's open round
+  /// (the prime and the cadence re-drive are initiations too).
+  held_roots: Vec<usize>,
 }
 
 impl Node {
@@ -205,6 +216,8 @@ impl Node {
     Self {
       store: BTreeMap::new(),
       engines: BTreeMap::new(),
+      held: BTreeMap::new(),
+      held_roots: Vec::new(),
     }
   }
 
@@ -213,6 +226,17 @@ impl Node {
       .engines
       .entry(peer)
       .or_insert_with(|| Engine::new(LaneId::Resources))
+  }
+
+  /// Whether any session engine of the (single) lane has an open
+  /// round, optionally excluding one engine (its own round never gates
+  /// its root re-drive, which replaces it).
+  fn lane_in_round(&self, except: Option<usize>) -> bool {
+    self
+      .engines
+      .iter()
+      .filter(|(peer, _)| Some(**peer) != except)
+      .any(|(_, engine)| engine.round_open())
   }
 }
 
@@ -275,7 +299,9 @@ impl Mesh {
     }
   }
 
-  /// The cadence ROOT rotation for one node (the bounded fair window).
+  /// The cadence ROOT rotation for one node (the bounded fair window),
+  /// gated by the per-lane serialization: an exchange whose lane still
+  /// negotiates elsewhere at the node waits in the held set.
   fn cadence_node(&mut self, index: usize) {
     let peers = self.edges[index].clone();
     let offset = (self.tick / u64::from(CADENCE_TICKS)) as usize;
@@ -287,9 +313,21 @@ impl Mesh {
       .copied()
       .collect();
     for peer in window {
-      let out = self.nodes[index].engine(peer).drive(Drive::RootExchange);
-      self.emit(index, peer, out);
+      self.root_exchange_gated(index, peer);
     }
+  }
+
+  /// Drives one root exchange unless the lane is busy elsewhere at the
+  /// node (the held re-drive releases with the lane's quiet).
+  fn root_exchange_gated(&mut self, index: usize, peer: usize) {
+    if self.nodes[index].lane_in_round(Some(peer))
+      && self.nodes[index].held_roots.len() < HELD_HINTS_PER_NODE
+    {
+      self.nodes[index].held_roots.push(peer);
+      return;
+    }
+    let out = self.nodes[index].engine(peer).drive(Drive::RootExchange);
+    self.emit(index, peer, out);
   }
 
   /// Applies one node's local writes: the store row feeds every
@@ -355,8 +393,50 @@ impl Mesh {
         }
         _ => {}
       }
-      let out = self.nodes[to].engine(from).drive(Drive::Message(message));
-      self.emit(to, from, out);
+      // The per-lane pull serialization, mirrored from the plane: a
+      // hint arriving while a *different* engine of the node's lane
+      // negotiates holds (its rows still apply; the release compares
+      // its claimed ranges against the settled state and usually stays
+      // silent). An inbound root in the same window drops instead: its
+      // whole-lane claim is stale the moment it waits, and initiating
+      // from a stale claim re-delivers what the round it waited for
+      // already delivered (the reconnect double-pull). Roots are cheap
+      // and cadence-refreshed, so the drop costs one quiet window of
+      // peer-view latency, never correctness. Responses (offer, need,
+      // rows, done) always process — a peer's negotiation must never
+      // wait on ours, or two nodes holding each other deadlock.
+      let hold = match &message {
+        Message::Hint { lane, ranges, .. }
+          if self.nodes[to].lane_in_round(Some(from))
+            && self.nodes[to].held.values().map(Vec::len).sum::<usize>() < HELD_HINTS_PER_NODE =>
+        {
+          Some(Message::Hint {
+            lane: *lane,
+            ranges: ranges.clone(),
+            rows: Vec::new(),
+          })
+        }
+        _ => None,
+      };
+      let drop_root =
+        matches!(message, Message::Root { .. }) && self.nodes[to].lane_in_round(Some(from));
+      if drop_root {
+        self.dropped += 1;
+        continue;
+      }
+      if let Some(held_message) = hold {
+        for (key, content) in &rows {
+          let _ = self.nodes[to].engine(from).insert_row(key, content);
+        }
+        self.nodes[to]
+          .held
+          .entry(from)
+          .or_default()
+          .push(held_message);
+      } else {
+        let out = self.nodes[to].engine(from).drive(Drive::Message(message));
+        self.emit(to, from, out);
+      }
       // The applied-rows fan-out: the row enters the store and every
       // sibling engine, then the plain (row-less) change drive.
       if !rows.is_empty() {
@@ -376,9 +456,35 @@ impl Mesh {
           self.emit(to, sibling, out);
         }
       }
-      // The drain behind every delivery: backlogs surface.
+      // The drain behind every delivery: backlogs surface, and a lane
+      // that just went quiet releases its held hints (they usually
+      // compare equal against the settled state and stay silent).
       self.drain_node(to);
       self.drain_node(from);
+      self.release_held(to);
+    }
+  }
+
+  /// Releases one node's held messages and root exchanges when no
+  /// engine of the lane has an open round, driving each into its source
+  /// engine.
+  fn release_held(&mut self, index: usize) {
+    if self.nodes[index].lane_in_round(None) {
+      return;
+    }
+    let held = std::mem::take(&mut self.nodes[index].held);
+    let roots = std::mem::take(&mut self.nodes[index].held_roots);
+    for (from, messages) in held {
+      for message in messages {
+        let out = self.nodes[index]
+          .engine(from)
+          .drive(Drive::Message(message));
+        self.emit(index, from, out);
+      }
+    }
+    for peer in roots {
+      let out = self.nodes[index].engine(peer).drive(Drive::RootExchange);
+      self.emit(index, peer, out);
     }
   }
 
@@ -423,6 +529,10 @@ impl Mesh {
   /// Brings one node back: the next tick's prime fills both directions'
   /// engines with the full row sets and opens with ROOT exchanges — the
   /// session-establishment contract.
+  /// Brings one node back: the next tick's prime fills both directions'
+  /// engines with the full row sets and opens with gated ROOT exchanges
+  /// — the session-establishment contract under the per-lane
+  /// serialization.
   fn heal(&mut self, index: usize) {
     for peer in self.edges[index].clone() {
       let rows: Vec<(Vec<u8>, Vec<u8>)> = self.nodes[index]
@@ -433,8 +543,7 @@ impl Mesh {
       for (key, content) in &rows {
         let _ = self.nodes[index].engine(peer).insert_row(key, content);
       }
-      let out = self.nodes[index].engine(peer).drive(Drive::RootExchange);
-      self.emit(index, peer, out);
+      self.root_exchange_gated(index, peer);
       let theirs: Vec<(Vec<u8>, Vec<u8>)> = self.nodes[peer]
         .store
         .iter()
@@ -443,8 +552,7 @@ impl Mesh {
       for (key, content) in &theirs {
         let _ = self.nodes[peer].engine(index).insert_row(key, content);
       }
-      let out = self.nodes[peer].engine(index).drive(Drive::RootExchange);
-      self.emit(peer, index, out);
+      self.root_exchange_gated(peer, index);
     }
   }
 
@@ -590,6 +698,9 @@ fn sync_budget_matrix_payload_redundancy_and_hint_traffic() {
     "sync budget matrix failures: {}; measurements: {report}",
     failures.join("; ")
   );
+  // The lane's own measurement record: one line per run, matching the
+  // benchmark lanes' reporting convention.
+  eprintln!("sync budget matrix: {report}");
 }
 
 /// The loss matrix: under a deterministic 20% drop the full trigger
@@ -600,6 +711,9 @@ fn sync_budget_matrix_payload_redundancy_and_hint_traffic() {
 fn sync_budget_loss_convergence_not_worse_than_baseline() {
   for (nodes, batch) in [(8_usize, 4_usize), (64, 16)] {
     let (full, baseline) = loss_cell(nodes, batch);
+    eprintln!(
+      "sync budget loss cell n={nodes} batch={batch}: full={full} ticks baseline={baseline} ticks"
+    );
     assert!(
       full <= baseline,
       "n={nodes}: the full layer took {full} ticks against the baseline's {baseline}"
