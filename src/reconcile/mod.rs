@@ -35,3 +35,9 @@ pub(crate) mod engine;
 pub(crate) mod fingerprint;
 pub(crate) mod plane;
 pub(crate) mod wire;
+
+// The R4 acceptance lane: the deterministic engine-level budget matrix
+// (payload redundancy, hint traffic, loss convergence) over the same
+// engine the plane drives.
+#[cfg(test)]
+mod budget;

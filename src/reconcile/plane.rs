@@ -1787,7 +1787,7 @@ mod tests {
       Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let runtime = crate::runtime::RuntimeClient::routing_only(packet_tx, routes);
     tokio::spawn(async move {
-      while let Some(mut request) = packet_rx.recv().await {
+      while let Some(request) = packet_rx.recv().await {
         let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
           by: crate::NodeId::parse("node-000000000000000000090").unwrap(),
           admitted_at: std::time::SystemTime::now(),

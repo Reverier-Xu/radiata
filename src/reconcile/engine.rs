@@ -201,8 +201,7 @@ pub(crate) const EAGER_DELTA_BYTES: usize = 4 * 1_024;
 /// root re-drive re-discovers the range).
 const NEED_PENDING_BOUNDS: usize = 4 * MAX_RANGES_PER_MESSAGE;
 
-/// One engine drive input.
-#[derive(Debug)]
+/// One engine drive input.#[derive(Debug)]
 pub(crate) enum Drive {
   /// A decoded message received from the peer.
   Message(Message),
@@ -236,6 +235,15 @@ pub(crate) struct Engine {
   peer_root: Option<Fingerprint>,
   /// Whether a negotiated round this engine initiated is in flight.
   round_open: bool,
+  /// Whether this engine's last outbound negotiation traffic asked the
+  /// peer a question (an OFFER or NEED) that has not been answered yet:
+  /// a round with an open question is *in motion*, not quiescent, so
+  /// the quiescence DONE must not close it — closing early lets the
+  /// next hint open a second negotiation for the same divergence, and
+  /// both complete, delivering the payload twice (the budget lane's
+  /// 1.7× finding). Any inbound message clears the flag (it is the
+  /// answer, whatever else it carries).
+  awaiting_response: bool,
   /// Locally changed digest ranges, coalesced into sorted disjoint
   /// inclusive bounds; `None` means the overflow fallback (the whole
   /// digest space). Cleared by every `Drive::LocalChange`.
@@ -263,6 +271,7 @@ impl Engine {
       index: FingerprintIndex::new(),
       peer_root: None,
       round_open: false,
+      awaiting_response: false,
       dirty: Some(Vec::new()),
       backlog: VecDeque::new(),
       pending_needs: Vec::new(),
@@ -368,9 +377,11 @@ impl Engine {
     };
     self.drain_backlog(&mut out);
     // Quiescence: an open round with nothing left to say closes with a
-    // DONE receipt. Never fires while work was generated or backlog
-    // remains — those are the round still in motion.
-    if self.round_open && self.backlog.is_empty() && generated == 0 {
+    // DONE receipt — but never a round whose question is still in
+    // flight (see `awaiting_response`). Never fires while work was
+    // generated or backlog remains — those are the round still in
+    // motion.
+    if self.round_open && !self.awaiting_response && self.backlog.is_empty() && generated == 0 {
       self.round_open = false;
       let done = self.done_message();
       self.backlog.push_back(done);
@@ -384,6 +395,16 @@ impl Engine {
   fn apply_message(&mut self, message: Message) -> Result<usize> {
     if message.lane() != self.lane {
       return Err(Error::invalid_input("reconcile lane mismatch"));
+    }
+    // Any inbound *response* (root, offer, need, rows, done) is the
+    // answer our last question was waiting for; a hint is an
+    // asynchronous notice, never an answer — clearing on one would let
+    // the next drain close the round (quiescence DONE) while our
+    // question is still in flight, which re-opens the door to a second
+    // negotiation for the same divergence (the duplicate-delivery
+    // amplifier the budget lane measured).
+    if !matches!(message, Message::Hint { .. }) {
+      self.awaiting_response = false;
     }
     let before = self.backlog.len();
     match message {
@@ -403,11 +424,15 @@ impl Engine {
         // The eager-delta piggyback applies first, exactly like a ROWS
         // message: the rows are the sender's changed set, idempotent at
         // this boundary, and applying them before the range comparison
-        // is what lets a covered hint resolve to silence.
+        // is what lets a covered hint resolve to silence. A row the
+        // engine already holds is not a change — re-dirtying it would
+        // re-hint identical state (and with a stale peer root, re-push
+        // whole ranges) every time a duplicate delivery lands.
         for row in rows {
           let digest = digest::item_digest(&row.key, &row.content)?;
-          self.index.insert(digest, row);
-          self.mark_dirty(digest);
+          if self.index.insert(digest, row).is_none() {
+            self.mark_dirty(digest);
+          }
         }
         if !self.round_open {
           let triples: Vec<(u64, u64, Fingerprint)> = ranges
@@ -461,8 +486,9 @@ impl Engine {
       Message::Rows { rows, .. } => {
         for row in rows {
           let digest = digest::item_digest(&row.key, &row.content)?;
-          self.index.insert(digest, row);
-          self.mark_dirty(digest);
+          if self.index.insert(digest, row).is_none() {
+            self.mark_dirty(digest);
+          }
         }
       }
       Message::Done { .. } => {
@@ -473,9 +499,17 @@ impl Engine {
   }
 
   /// The local-change drive: one coalesced HINT over the changed
-  /// ranges, plus an initiation when divergence is already known. The
-  /// eager variant piggybacks the changed rows (bounded by the eager
-  /// budget) onto the same hint.
+  /// ranges. The hint itself is the trigger — the proposal §4's
+  /// "receive a hint, compare, stay silent or initiate" — so this side
+  /// does not initiate against its last-seen peer root: that root is a
+  /// stale observation, and initiating against it (a primed-empty peer
+  /// root above all) pushes whole ranges the peer may already hold,
+  /// which ping-pongs full-catalog payloads between sessions until a
+  /// cadence ROOT refreshes the view. The receiver of the hint
+  /// initiates on its own observed divergence; the cadence ROOT
+  /// exchange is the loss backstop.
+  /// The eager variant piggybacks the changed rows (bounded by the
+  /// eager budget) onto the same hint.
   fn drive_local_change(&mut self, eager: bool) -> Result<usize> {
     let before = self.backlog.len();
     let bounds = self.dirty.replace(Vec::new());
@@ -500,12 +534,6 @@ impl Engine {
         rows: piggyback,
       };
       self.backlog.push_back(hint);
-    }
-    if let Some(peer) = self.peer_root
-      && peer != self.index.root()
-      && !self.round_open
-    {
-      self.initiate(&[(0, u64::MAX, peer)])?;
     }
     Ok(self.backlog.len() - before)
   }
@@ -564,6 +592,12 @@ impl Engine {
   fn drive_root_exchange(&mut self) -> Result<usize> {
     let before = self.backlog.len();
     self.eager.clear();
+    // The root exchange replaces any open round wholesale: a question
+    // whose answer was lost at sea does not survive into the new round
+    // (otherwise the stale awaiting flag would pin the round open and
+    // silence every hint until the next cadence — the loss lane's
+    // doubled convergence window).
+    self.awaiting_response = false;
     let root = self.index.root();
     let root_message = Message::Root {
       lane: self.lane,
@@ -646,7 +680,8 @@ impl Engine {
     Ok(())
   }
 
-  /// Packs offered ranges into bounded OFFER messages.
+  /// Packs offered ranges into bounded OFFER messages: each offer is a
+  /// question the peer must answer, so the round is awaiting.
   fn push_offers(&mut self, offers: Vec<RangeFingerprint>) {
     for chunk in offers.chunks(MAX_RANGES_PER_MESSAGE) {
       let offer = Message::Offer {
@@ -655,9 +690,13 @@ impl Engine {
       };
       self.backlog.push_back(offer);
     }
+    if !offers.is_empty() {
+      self.awaiting_response = true;
+    }
   }
 
-  /// Packs needed bounds into bounded NEED messages.
+  /// Packs needed bounds into bounded NEED messages: a need is a
+  /// question too.
   fn push_needs(&mut self, needs: Vec<DigestRange>) {
     for chunk in needs.chunks(MAX_RANGES_PER_MESSAGE) {
       let need = Message::Need {
@@ -665,6 +704,9 @@ impl Engine {
         bounds: chunk.to_vec(),
       };
       self.backlog.push_back(need);
+    }
+    if !needs.is_empty() {
+      self.awaiting_response = true;
     }
   }
 
