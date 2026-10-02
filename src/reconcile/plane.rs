@@ -430,11 +430,15 @@ impl ReconcilePlane {
         continue;
       }
       tracing::debug!(lane = ?lane, rows = lane_rows.len(), "reconcile derived-view repair");
+      // Row-level refusals (undecodable, misattributed, policy-skipped)
+      // never reach here — the arms skip them in-line. An error at this
+      // boundary is a batch-level fault (a store write failure): the
+      // rows stay pending and the next epoch pass retries them.
       if let Err(error) = apply_rows(&self.shared, lane, lane_rows, None, Some(runtime)).await {
-        tracing::debug!(
+        tracing::warn!(
           lane = ?lane,
           kind = ?error.kind(),
-          "reconcile derived-view repair skipped rows"
+          "reconcile derived-view repair aborted by a store fault; retrying next epoch pass"
         );
       }
     }
@@ -488,7 +492,14 @@ impl ReconcilePlane {
       // repair retries the application side on the next epoch pass).
       if let Err(error) = apply_rows(&self.shared, &lane, &rows, Some(source), Some(runtime)).await
       {
-        tracing::debug!(lane = ?lane, kind = ?error.kind(), "reconcile rows apply failed");
+        // Row-level refusals are skipped in-line by the arms; an error
+        // here is a batch-level store fault — the rows stay in the
+        // engines and the derived-view repair retries them.
+        tracing::warn!(
+          lane = ?lane,
+          kind = ?error.kind(),
+          "reconcile rows apply aborted by a store fault; the repair retries"
+        );
       }
       let mut guard = self.shared.lock()?;
       for (peer, state) in guard.peers.iter_mut() {
@@ -836,9 +847,15 @@ async fn apply_rows(
             continue;
           }
         };
-        // The snapshot-accept policy, per record: transient contention
-        // skips one binding (the repair retries it); everything else —
-        // key substitution above all — fails closed.
+        // The per-record adoption policy, row-scoped: transient
+        // contention skips one binding (the repair retries it); a
+        // revoked subject (revocation tombstones out-rank late binding
+        // rows — the delayed-content mirror order) and a substituted
+        // key are refused evidence — the row is skipped, not stored,
+        // and the batch continues (skipping IS the correct outcome;
+        // these fire on honest input, so an abort here would wedge the
+        // repair on every re-delivery). Everything else — provider
+        // faults above all — is a real write fault and propagates.
         if let Err(error) = crate::identity::trust::store::adopt_binding_ctx(
           store,
           shared.entropy.as_ref(),
@@ -849,9 +866,16 @@ async fn apply_rows(
         {
           if matches!(
             error.kind(),
-            crate::ErrorKind::Conflict | crate::ErrorKind::NotReady
+            crate::ErrorKind::Conflict
+              | crate::ErrorKind::NotReady
+              | crate::ErrorKind::Revoked
+              | crate::ErrorKind::NotTrusted
           ) {
-            tracing::debug!(node = %binding.node(), "trust binding adoption skipped");
+            tracing::warn!(
+              node = %binding.node(),
+              kind = ?error.kind(),
+              "reconcile binding row refused by policy; skipping"
+            );
             continue;
           }
           return Err(error);
@@ -1187,6 +1211,146 @@ mod tests {
         .unwrap()
         .is_some(),
       "the good resource row applied behind the poison row"
+    );
+  }
+
+  /// The poison-row contract, tombstone dispatch: undecodable
+  /// leave/cleanup/revocation/checkpoint rows and unknown-kind rows
+  /// skip; a good signed leave row in the same batch persists; the
+  /// repair shape re-applies the batch without wedging.
+  #[tokio::test]
+  async fn poison_rows_skip_and_good_tombstone_rows_apply() {
+    let context = context_with_bindings(&[]).await;
+    let shared = plane_shared(&context).await;
+    // A properly signed leave for the context's own node; its binding
+    // is adopted into the trusted set first, so the evidence gate
+    // passes and the signature verifies.
+    crate::identity::trust::store::adopt_binding_ctx(
+      context.store(),
+      &crate::api::SystemEntropy,
+      context.identity().node(),
+      context.identity().public_key(),
+    )
+    .await
+    .unwrap();
+    let record = crate::identity::leave::sign_leave_record(&context, context.keys())
+      .await
+      .unwrap();
+    let leaver = context.identity().node().clone();
+    let mut key = vec![1_u8];
+    key.extend_from_slice(leaver.as_str().as_bytes());
+    let rows = vec![
+      // Undecodable leave row.
+      (vec![1_u8, 0xFF], vec![0xFF, 0x00]),
+      // The good leave row.
+      (key, record.encode().unwrap()),
+      // Undecodable cleanup, revocation, and checkpoint rows.
+      (vec![2_u8, 0xFF], vec![0xFF, 0x00]),
+      (vec![3_u8, 0xFF], vec![0xFF, 0x00]),
+      (vec![4_u8], vec![0xFF, 0x00]),
+      // An unknown kind byte.
+      (vec![9_u8], record.encode().unwrap()),
+    ];
+    let apply = |rows: Vec<_>| {
+      let shared = std::sync::Arc::clone(&shared);
+      async move {
+        super::apply_rows(
+          shared.as_ref(),
+          &super::super::wire::LaneId::Tombstones,
+          &rows,
+          None,
+          None,
+        )
+        .await
+      }
+    };
+    apply(rows.clone()).await.unwrap();
+    apply(rows).await.unwrap();
+    assert!(
+      crate::identity::leave::is_left_ctx(context.store(), &leaver)
+        .await
+        .unwrap(),
+      "the good leave row applied behind the poison rows"
+    );
+  }
+
+  /// The revoked-subject ordering (the delayed-content mirror): a node
+  /// that received the revocation tombstone first refuses the subject's
+  /// later binding row — the refusal skips the row instead of aborting
+  /// the batch, so good bindings behind it still land and the repair
+  /// shape re-applies without wedging.
+  #[tokio::test]
+  async fn a_revoked_subjects_binding_row_skips_without_wedging_the_batch() {
+    let (reference, factory) = crate::identity::testing::fresh_reference();
+    let keys = crate::identity::testing::ScriptedKeys::full_at(9_700);
+    let entropy = std::sync::Arc::new(crate::identity::testing::SequenceEntropy::default());
+    let context = std::sync::Arc::new(
+      crate::identity::testing::open_context(&factory, &keys, &entropy)
+        .await
+        .unwrap(),
+    );
+    let shared = plane_shared(&context).await;
+    // The revocation tombstone for node(61) arrives first: a stored
+    // revocation record outranks any later binding row.
+    let revoked = node(61);
+    let revocation = crate::identity::revocation::RevocationRecordV1::new(
+      revoked.clone(),
+      key(61),
+      context.identity().node().clone(),
+      crate::Signature::from_bytes([0_u8; 64]),
+    );
+    let (namespace, store_key) = (
+      crate::storage::families::namespace(crate::storage::families::REVOCATION_NAMESPACE).unwrap(),
+      crate::StoreKey::new(std::sync::Arc::from(revoked.as_str().as_bytes().to_vec())),
+    );
+    crate::identity::testing::inject_entry(
+      &reference,
+      (namespace, store_key),
+      revocation.encode().unwrap(),
+    );
+    // The batch: the revoked subject's binding row, then a good row.
+    let revoked_binding =
+      crate::identity::records::IdentityBindingV1::new(revoked.clone(), key(61));
+    let good_binding = crate::identity::records::IdentityBindingV1::new(node(62), key(62));
+    let rows = vec![
+      (
+        revoked.as_str().as_bytes().to_vec(),
+        revoked_binding.encode().unwrap(),
+      ),
+      (
+        node(62).as_str().as_bytes().to_vec(),
+        good_binding.encode().unwrap(),
+      ),
+    ];
+    super::apply_rows(
+      shared.as_ref(),
+      &super::super::wire::LaneId::Trust,
+      &rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    super::apply_rows(
+      shared.as_ref(),
+      &super::super::wire::LaneId::Trust,
+      &rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    let bindings = crate::identity::trust::store::trusted_bindings(context.store())
+      .await
+      .unwrap();
+    assert!(
+      !bindings.contains_key(&revoked),
+      "the revoked subject's binding row was refused"
+    );
+    assert_eq!(
+      bindings.get(&node(62)),
+      Some(&key(62)),
+      "the good binding behind the refused row still applied"
     );
   }
 

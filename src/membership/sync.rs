@@ -515,10 +515,35 @@ pub(crate) async fn apply_tombstone_rows(
             continue;
           }
         };
-        apply_leave_record(
+        // A leave row is terminal evidence carried by its own
+        // signature: a failed signature (AuthenticationFailed from the
+        // strict verify) is an untrustworthy row — skip it, exactly
+        // like a corrupt row, instead of failing the batch. The
+        // evidence check inside the apply (the bound key mismatching
+        // the record's key, NotTrusted) is a policy refusal of the
+        // same class: the row is refused, the batch continues. Real
+        // store write faults still propagate.
+        if let Err(error) = record.verify() {
+          tracing::warn!(
+            node = %record.node(),
+            kind = ?error.kind(),
+            "reconcile leave row skipped: untrusted signature"
+          );
+          continue;
+        }
+        match apply_leave_record(
           store, entropy, events, revision, &evidence, &record, source, runtime,
         )
-        .await?;
+        .await
+        {
+          Err(error) if error.kind() == crate::ErrorKind::NotTrusted => {
+            tracing::warn!(
+              node = %record.node(),
+              "reconcile leave row refused by policy: binding mismatch; skipping"
+            );
+          }
+          other => other?,
+        }
       }
       2 => {
         let record = match crate::identity::cleanup::CleanupRecordV1::decode(content) {
