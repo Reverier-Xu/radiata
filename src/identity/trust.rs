@@ -633,7 +633,7 @@ pub(crate) mod store {
     crate::provider::commit_verdict(store.commit(transaction).await?, "trust snapshot")?;
     // The persisted revision is a local store write: the register
     // epoch arms the reconciliation plane's next rescan pass.
-    store.note_local_write();
+    store.note_local_write_tag(crate::storage::families::TRUST_SNAPSHOT_NAMESPACE);
     Ok(())
   }
 
@@ -804,7 +804,7 @@ pub(crate) mod store {
     // The adopted binding changes what every plane sends (descriptors
     // of the bound node become healable, the grant set grew): the write
     // epoch arms the walks for a next-tick push.
-    store.note_local_write();
+    store.note_local_write_tag(crate::storage::families::IDENTITY_BINDING_NAMESPACE);
     Ok(())
   }
 

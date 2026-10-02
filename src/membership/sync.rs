@@ -1172,7 +1172,19 @@ mod tests {
           ) && let Ok(message) = crate::reconcile::wire::decode(payload.as_ref())
           {
             if to_peer {
-              if let crate::reconcile::wire::Message::Rows { rows, lane } = &message {
+              // The redundancy ledger counts every row byte crossing
+              // the wire: a ROWS message and an eager-delta piggyback
+              // are the same delivery to the receiver's store.
+              let carried = match &message {
+                crate::reconcile::wire::Message::Rows { rows, lane } => {
+                  Some((rows.as_slice(), *lane))
+                }
+                crate::reconcile::wire::Message::Hint { rows, lane, .. } if !rows.is_empty() => {
+                  Some((rows.as_slice(), *lane))
+                }
+                _ => None,
+              };
+              if let Some((rows, lane)) = carried {
                 match lane {
                   crate::reconcile::wire::LaneId::Trust => {
                     drainer_trust_rows.fetch_add(rows.len(), Ordering::SeqCst);

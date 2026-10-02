@@ -226,7 +226,7 @@ pub(crate) async fn persist_terminal_record(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Put {
-      namespace,
+      namespace: namespace.clone(),
       key,
       expected: StoreExpectation::Absent,
       value: StoreValue::new(encoded),
@@ -242,7 +242,7 @@ pub(crate) async fn persist_terminal_record(
   // trigger: a persisted terminal record (leave, cleanup, revocation)
   // enters the tombstones lane on the next rescan, so the write must
   // arm it exactly like every other store write.
-  store.note_local_write();
+  store.note_local_write_in(&namespace);
   Ok(())
 }
 

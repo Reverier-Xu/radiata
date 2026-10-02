@@ -373,7 +373,7 @@ pub(crate) async fn persist_checkpoint_ctx(
   crate::provider::commit_verdict(store.commit(transaction).await?, "cleanup checkpoint")?;
   // The checkpoint record rides the tombstone plane: the write epoch
   // arms it for a next-tick push.
-  store.note_local_write();
+  store.note_local_write_tag(crate::storage::families::CHECKPOINT_NAMESPACE);
   Ok(())
 }
 

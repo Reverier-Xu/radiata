@@ -158,13 +158,21 @@ pub(crate) enum Message {
     xor: u64,
   },
   /// A best-effort notice that the sender's rows inside these ranges
-  /// changed. Lossy, duplicable, ignorable by design.
+  /// changed. Lossy, duplicable, ignorable by design. The eager-delta
+  /// piggyback (the proposal §4): a healthy-link originator may carry
+  /// the changed rows themselves (at most [`MAX_ROWS_PER_MESSAGE`],
+  /// byte-bounded by the engine's eager budget) so the receiver's
+  /// idempotent apply usually closes the change without a negotiation.
+  /// An empty list is the plain notice.
   Hint {
     /// The sender's lane.
     lane: LaneId,
     /// The changed ranges with the sender's current aggregates (at most
     /// [`MAX_RANGES_PER_MESSAGE`]).
     ranges: Vec<RangeFingerprint>,
+    /// The eager-delta rows (at most [`MAX_ROWS_PER_MESSAGE`], each row
+    /// within the single-row ROWS fit contract).
+    rows: Vec<Row>,
   },
   /// The sender's aggregates for the negotiated ranges: one recursion
   /// level of a reconciliation round.
@@ -268,6 +276,8 @@ struct HintWire {
   lane: u8,
   #[n(2)]
   ranges: Vec<RangeWire>,
+  #[n(3)]
+  rows: Vec<RowWire>,
 }
 
 #[derive(Encode, Decode)]
@@ -328,13 +338,15 @@ pub(crate) fn encode(message: &Message) -> Result<Vec<u8>> {
       },
       RECONCILE_CBOR_LIMITS,
     ),
-    Message::Hint { lane, ranges } => {
+    Message::Hint { lane, ranges, rows } => {
       let ranges = ranges_to_wire(ranges)?;
+      let rows = rows_to_wire(rows)?;
       encode_canonical(
         &HintWire {
           kind: KIND_HINT,
           lane: lane.code(),
           ranges,
+          rows,
         },
         RECONCILE_CBOR_LIMITS,
       )
@@ -362,16 +374,7 @@ pub(crate) fn encode(message: &Message) -> Result<Vec<u8>> {
       )
     }
     Message::Rows { lane, rows } => {
-      if rows.len() > MAX_ROWS_PER_MESSAGE {
-        return Err(Error::invalid_input("reconcile rows bound"));
-      }
-      let rows = rows
-        .iter()
-        .map(|row| RowWire {
-          key: ByteVec::from(row.key.clone()),
-          content: ByteVec::from(row.content.clone()),
-        })
-        .collect();
+      let rows = rows_to_wire(rows)?;
       encode_canonical(
         &RowsWire {
           kind: KIND_ROWS,
@@ -411,9 +414,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message> {
       let wire: HintWire =
         decode_canonical_strict(bytes, RECONCILE_CBOR_LIMITS, "reconcile hint canonical")?;
       let ranges = ranges_from_wire(wire.ranges)?;
+      let rows = rows_from_wire(wire.rows)?;
       Ok(Message::Hint {
         lane: lane_from(wire.lane)?,
         ranges,
+        rows,
       })
     }
     KIND_OFFER => {
@@ -510,6 +515,39 @@ fn bounds_to_wire(bounds: &[DigestRange]) -> Result<Vec<BoundWire>> {
     });
   }
   Ok(wire)
+}
+
+/// Validates row entries (the ROWS and eager-HINT policy: at most
+/// [`MAX_ROWS_PER_MESSAGE`]) and converts them to the wire shape.
+fn rows_to_wire(rows: &[Row]) -> Result<Vec<RowWire>> {
+  if rows.len() > MAX_ROWS_PER_MESSAGE {
+    return Err(Error::invalid_input("reconcile rows bound"));
+  }
+  Ok(
+    rows
+      .iter()
+      .map(|row| RowWire {
+        key: ByteVec::from(row.key.clone()),
+        content: ByteVec::from(row.content.clone()),
+      })
+      .collect(),
+  )
+}
+
+/// Validates row entries and converts them from the wire shape.
+fn rows_from_wire(wire: Vec<RowWire>) -> Result<Vec<Row>> {
+  if wire.len() > MAX_ROWS_PER_MESSAGE {
+    return Err(Error::invalid_input("reconcile rows bound"));
+  }
+  Ok(
+    wire
+      .into_iter()
+      .map(|row| Row {
+        key: row.key.to_vec(),
+        content: row.content.to_vec(),
+      })
+      .collect(),
+  )
 }
 
 /// Validates range entries and converts them from the wire shape.
@@ -632,6 +670,10 @@ mod tests {
           xor: 0x0123_4567_89AB_CDEF,
         },
       ],
+      rows: vec![Row {
+        key: b"delta".to_vec(),
+        content: b"row".to_vec(),
+      }],
     }
   }
 
@@ -686,9 +728,10 @@ mod tests {
     ),
     (
       &[
-        0x83, KIND_HINT, 0x02, 0x82, 0x84, 0x00, 0x18, 0xFF, 0x01, 0x19, 0xAA, 0xBB, 0x84, 0x1A,
+        0x84, KIND_HINT, 0x02, 0x82, 0x84, 0x00, 0x18, 0xFF, 0x01, 0x19, 0xAA, 0xBB, 0x84, 0x1A,
         0x00, 0x01, 0x00, 0x00, 0x1B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x1B,
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x81, 0x82, 0x45, 0x64, 0x65, 0x6C, 0x74,
+        0x61, 0x43, 0x72, 0x6F, 0x77,
       ],
       hint_message,
     ),
@@ -842,6 +885,7 @@ mod tests {
           kind: KIND_HINT,
           lane: LaneId::Descriptors.code(),
           ranges,
+          rows: Vec::new(),
         },
         super::RECONCILE_CBOR_LIMITS,
       )
@@ -855,6 +899,7 @@ mod tests {
       encode(&Message::Hint {
         lane: LaneId::Descriptors,
         ranges: over.clone(),
+        rows: Vec::new(),
       })
       .unwrap_err()
       .kind(),
@@ -1034,6 +1079,7 @@ mod tests {
       Message::Hint {
         lane: LaneId::Trust,
         ranges: Vec::new(),
+        rows: Vec::new(),
       },
       Message::Offer {
         lane: LaneId::Trust,
@@ -1051,5 +1097,50 @@ mod tests {
       let bytes = encode(&message).unwrap();
       assert_eq!(decode(&bytes).unwrap(), message);
     }
+  }
+
+  /// The eager-delta piggyback fails closed past the row bound on both
+  /// directions, exactly like a ROWS message.
+  #[test]
+  fn reconcile_wire_rejects_over_bound_hint_rows() {
+    let rows: Vec<Row> = (0..=MAX_ROWS_PER_MESSAGE)
+      .map(|index| Row {
+        key: index.to_be_bytes().to_vec(),
+        content: Vec::new(),
+      })
+      .collect();
+    assert_eq!(
+      encode(&Message::Hint {
+        lane: LaneId::Descriptors,
+        ranges: Vec::new(),
+        rows: rows.clone(),
+      })
+      .unwrap_err()
+      .kind(),
+      ErrorKind::InvalidInput
+    );
+    let hand_encoded = {
+      use super::{HintWire, RowWire};
+      encode_canonical(
+        &HintWire {
+          kind: KIND_HINT,
+          lane: LaneId::Descriptors.code(),
+          ranges: Vec::new(),
+          rows: rows
+            .into_iter()
+            .map(|row| RowWire {
+              key: minicbor::bytes::ByteVec::from(row.key),
+              content: minicbor::bytes::ByteVec::from(row.content),
+            })
+            .collect(),
+        },
+        super::RECONCILE_CBOR_LIMITS,
+      )
+      .unwrap()
+    };
+    assert_eq!(
+      decode(&hand_encoded).unwrap_err().kind(),
+      ErrorKind::InvalidInput
+    );
   }
 }

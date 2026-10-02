@@ -185,6 +185,13 @@ const ROW_BYTES_BUDGET: usize = 48 * 1_024;
 /// one round.
 const ROWS_BACKLOG_CEILING: usize = 4_096;
 
+/// The row-byte ceiling of one eager-delta attachment: the proposal §4's
+/// 4 KiB baseline. A piggyback competes with the hint it rides, so the
+/// budget is an order of magnitude under the ROWS message budget — a
+/// lost eager row costs at most this many bytes, and the negotiation it
+/// was meant to pre-empt re-drives at the detection cadence anyway.
+pub(crate) const EAGER_DELTA_BYTES: usize = 4 * 1_024;
+
 /// Distinct NEED bounds remembered while their answers sit queued in
 /// the backlog: the duplicate-NEED merge set, bounded so a flood of
 /// pairwise-non-subsumed bounds cannot grow it without limit. An honest
@@ -200,8 +207,17 @@ pub(crate) enum Drive {
   /// A decoded message received from the peer.
   Message(Message),
   /// Local rows changed since the last such drive: emit the coalesced
-  /// HINT and initiate if divergence is already known.
+  /// HINT and initiate if divergence is already known. The fan-out path
+  /// (rows applied from a peer, propagated to siblings) uses this — the
+  /// epidemic wave is notices, never payload.
   LocalChange,
+  /// The local-write variant of [`Drive::LocalChange`]: the originator
+  /// of a change may piggyback the changed rows themselves onto the
+  /// HINT (eager-delta, bounded by the engine's row budget) when the
+  /// session link is healthy — the "push head" of the pull tail. The
+  /// receiver applies the rows idempotently, so the round trip a
+  /// negotiation would spend on a small change usually never starts.
+  LocalChangeEager,
   /// The explicit root exchange: emit ROOT, and initiate on any
   /// observed divergence regardless of an open round (the
   /// loss-recovery re-drive).
@@ -231,6 +247,12 @@ pub(crate) struct Engine {
   /// section). Cleared wholesale whenever the backlog empties — at that
   /// moment no answer is pending, so a repeated NEED is a fresh request.
   pending_needs: Vec<(u64, u64)>,
+  /// Digests of rows inserted since the last local-change drive, the
+  /// eager-delta candidates: bounded in count by
+  /// [`MAX_ROWS_PER_MESSAGE`] and in bytes by [`EAGER_DELTA_BYTES`], so
+  /// the piggyback set is a small constant regardless of catalog size.
+  /// Cleared by every `Drive::LocalChange*`.
+  eager: Vec<u64>,
 }
 
 impl Engine {
@@ -244,6 +266,7 @@ impl Engine {
       dirty: Some(Vec::new()),
       backlog: VecDeque::new(),
       pending_needs: Vec::new(),
+      eager: Vec::new(),
     }
   }
 
@@ -286,9 +309,30 @@ impl Engine {
       content: content.to_vec(),
     };
     let digest = digest::item_digest(key, content)?;
-    self.index.insert(digest, row);
-    self.mark_dirty(digest);
+    // An identical re-insert changes nothing: the digest set (every
+    // aggregate) is unchanged and the row was never news to the peer,
+    // so a rescan pass that re-feeds unchanged rows stays silent —
+    // the steady-state zero-hint contract of the trigger layer.
+    if self.index.insert(digest, row).is_none() {
+      self.mark_dirty(digest);
+      self.note_eager(digest, key.len() + content.len());
+    }
     Ok(())
+  }
+
+  /// Removes one held row. The lane-seam counterpart of
+  /// [`Engine::insert_row`]: the plane prunes rows the store scan no
+  /// longer lists (superseded identities, collected tombstones), so the
+  /// derived view tracks removals instead of growing monotonically. A
+  /// removal is a local change like an insert — the peer's fingerprints
+  /// still carry the removed digest until the next exchange.
+  pub(crate) fn remove_row(&mut self, key: &[u8], content: &[u8]) -> Result<bool> {
+    let digest = digest::item_digest(key, content)?;
+    if self.index.remove(digest).is_some() {
+      self.mark_dirty(digest);
+      return Ok(true);
+    }
+    Ok(false)
   }
 
   /// Every held row, digest-ascending.
@@ -318,7 +362,8 @@ impl Engine {
     let generated = match drive {
       Drive::Drain => 0,
       Drive::Message(message) => self.apply_message(message)?,
-      Drive::LocalChange => self.drive_local_change()?,
+      Drive::LocalChange => self.drive_local_change(false)?,
+      Drive::LocalChangeEager => self.drive_local_change(true)?,
       Drive::RootExchange => self.drive_root_exchange()?,
     };
     self.drain_backlog(&mut out);
@@ -354,7 +399,16 @@ impl Engine {
         // A divergent ROOT against an open round is suppressed: the
         // round's own exchange (or the next root re-drive) carries it.
       }
-      Message::Hint { ranges, .. } => {
+      Message::Hint { ranges, rows, .. } => {
+        // The eager-delta piggyback applies first, exactly like a ROWS
+        // message: the rows are the sender's changed set, idempotent at
+        // this boundary, and applying them before the range comparison
+        // is what lets a covered hint resolve to silence.
+        for row in rows {
+          let digest = digest::item_digest(&row.key, &row.content)?;
+          self.index.insert(digest, row);
+          self.mark_dirty(digest);
+        }
         if !self.round_open {
           let triples: Vec<(u64, u64, Fingerprint)> = ranges
             .iter()
@@ -419,8 +473,10 @@ impl Engine {
   }
 
   /// The local-change drive: one coalesced HINT over the changed
-  /// ranges, plus an initiation when divergence is already known.
-  fn drive_local_change(&mut self) -> Result<usize> {
+  /// ranges, plus an initiation when divergence is already known. The
+  /// eager variant piggybacks the changed rows (bounded by the eager
+  /// budget) onto the same hint.
+  fn drive_local_change(&mut self, eager: bool) -> Result<usize> {
     let before = self.backlog.len();
     let bounds = self.dirty.replace(Vec::new());
     let bounds = bounds.unwrap_or_else(|| vec![(0, u64::MAX)]);
@@ -436,10 +492,12 @@ impl Engine {
         }
       })
       .collect();
+    let piggyback = self.take_eager_rows(eager);
     if !ranges.is_empty() {
       let hint = Message::Hint {
         lane: self.lane,
         ranges,
+        rows: piggyback,
       };
       self.backlog.push_back(hint);
     }
@@ -452,11 +510,60 @@ impl Engine {
     Ok(self.backlog.len() - before)
   }
 
+  /// Records one newly inserted digest as an eager-delta candidate,
+  /// under the piggyback's count and byte ceilings.
+  fn note_eager(&mut self, digest: u64, row_bytes: usize) {
+    if self.eager.len() >= MAX_ROWS_PER_MESSAGE
+      || self.eager_bytes() + row_bytes > EAGER_DELTA_BYTES
+    {
+      return;
+    }
+    self.eager.push(digest);
+  }
+
+  /// The held rows for the recorded eager digests, when the drive may
+  /// piggyback them; always clears the candidate set.
+  fn take_eager_rows(&mut self, eager: bool) -> Vec<Row> {
+    let digests = std::mem::take(&mut self.eager);
+    if !eager {
+      return Vec::new();
+    }
+    let mut rows = Vec::with_capacity(digests.len());
+    let mut bytes = 0;
+    for digest in digests {
+      let Some(row) = self.index.get(digest).cloned() else {
+        continue;
+      };
+      bytes += row.key.len() + row.content.len();
+      if bytes > EAGER_DELTA_BYTES {
+        break;
+      }
+      rows.push(row);
+    }
+    rows
+  }
+
+  /// The recorded eager candidates' byte total.
+  fn eager_bytes(&self) -> usize {
+    self
+      .eager
+      .iter()
+      .filter_map(|digest| self.index.get(*digest))
+      .map(|row| row.key.len() + row.content.len())
+      .sum()
+  }
+
   /// The root-exchange drive: emit ROOT, then either close on observed
   /// agreement or initiate over the whole digest space — replacing any
-  /// open round, because this drive is the loss-recovery re-drive.
+  /// open round, because this drive is the loss-recovery re-drive. The
+  /// eager-delta candidacy is consumed here too: this drive is the
+  /// session's prime or its cadence re-drive, and a row whose whole set
+  /// is being negotiated (or confirmed equal) has no piggyback to
+  /// pre-empt — leaving the candidates pending would piggyback stale
+  /// rows onto the next change's hint.
   fn drive_root_exchange(&mut self) -> Result<usize> {
     let before = self.backlog.len();
+    self.eager.clear();
     let root = self.index.root();
     let root_message = Message::Root {
       lane: self.lane,

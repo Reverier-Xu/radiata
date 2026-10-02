@@ -367,7 +367,7 @@ pub(crate) mod store {
     crate::provider::commit_verdict(store.commit(transaction).await?, "node descriptor revision")?;
     // The committed descriptor belongs in some peer's diff: the write
     // epoch turns it into a next-tick push.
-    store.note_local_write();
+    store.note_local_write_tag(NODE_DESCRIPTOR_NAMESPACE);
     Ok(())
   }
 
@@ -512,7 +512,7 @@ pub(crate) mod store {
         crate::CommitOutcome::Committed(_) => {
           // The committed descriptors belong in some peer's diff: the
           // write epoch turns them into a next-tick push.
-          store.note_local_write();
+          store.note_local_write_tag(NODE_DESCRIPTOR_NAMESPACE);
           return Ok(applied);
         }
         // A conflict landed nothing: one re-decide from a fresh snapshot

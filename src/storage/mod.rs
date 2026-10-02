@@ -149,6 +149,19 @@ pub(crate) struct MetadataStore {
   /// the sync driver observes local catalog changes with one atomic
   /// load per tick instead of a catalog scan.
   register_epoch: std::sync::atomic::AtomicU64,
+  /// The per-namespace write epochs: `namespace → the register epoch
+  /// of its latest noted write`. The reconciliation plane reads the
+  /// namespaces advanced past its per-lane watermark and rescans only
+  /// those lanes — the incremental successor of the whole-catalog
+  /// rescan the single counter used to force. Un-namespaced notes
+  /// (see [`Self::note_local_write`]) are recorded separately so the
+  /// plane can fall back to a full rescan and never miss a change.
+  namespace_epochs: std::sync::Mutex<std::collections::BTreeMap<crate::StoreNamespace, u64>>,
+  /// The latest register epoch carrying an un-namespaced note: a
+  /// change whose namespace is unknown degrades the plane's
+  /// incremental scan to the full rescan (the pre-incremental
+  /// semantics), so no write can hide behind an untracked bump.
+  untracked_epoch: std::sync::atomic::AtomicU64,
 }
 
 struct ProviderCall<'a> {
@@ -273,6 +286,8 @@ impl MetadataStore {
       clock,
       receipt_retention,
       register_epoch: std::sync::atomic::AtomicU64::new(0),
+      namespace_epochs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+      untracked_epoch: std::sync::atomic::AtomicU64::new(0),
     })
   }
 
@@ -281,10 +296,73 @@ impl MetadataStore {
   /// the sync drivers read the epoch once per tick
   /// ([`Self::register_epoch`]) and treat any advance as "some peer's
   /// diff may have changed", turning local writes into next-tick
-  /// pushes instead of one detection-cadence wait per hop.
+  /// pushes instead of one detection-cadence wait per hop. The note
+  /// carries no namespace, so the reconciliation plane's incremental
+  /// scan treats it as untracked and rescans every lane (the
+  /// pre-incremental semantics).
   pub(crate) fn note_local_write(&self) {
     use std::sync::atomic::Ordering;
-    self.register_epoch.fetch_add(1, Ordering::Relaxed);
+    let epoch = self.register_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+    self.untracked_epoch.fetch_max(epoch, Ordering::Relaxed);
+  }
+
+  /// The namespaced variant of [`Self::note_local_write`]: the note
+  /// names the store namespace the write landed in, so the
+  /// reconciliation plane can rescan exactly the lane whose key space
+  /// changed instead of every lane.
+  pub(crate) fn note_local_write_in(&self, namespace: &crate::StoreNamespace) {
+    use std::sync::atomic::Ordering;
+    let epoch = self.register_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut epochs) = self.namespace_epochs.lock() {
+      epochs.insert(namespace.clone(), epoch);
+    } else {
+      // A poisoned map degrades to the tracked-but-lost case; the
+      // untracked fallback below keeps the plane from missing the
+      // write entirely.
+      self.untracked_epoch.fetch_max(epoch, Ordering::Relaxed);
+    }
+  }
+
+  /// The namespaces whose latest noted write carries an epoch past
+  /// `since`, plus whether any untracked write landed past it. `None`
+  /// for the second element means "nothing untracked advanced"; `Some`
+  /// means the caller must treat every namespace as dirty — the
+  /// full-rescan fallback that keeps the incremental path from ever
+  /// missing a change the single counter would have caught.
+  pub(crate) fn dirty_namespaces_since(
+    &self, since: u64,
+  ) -> (
+    std::collections::BTreeSet<crate::StoreNamespace>,
+    Option<u64>,
+  ) {
+    use std::sync::atomic::Ordering;
+    let untracked = self.untracked_epoch.load(Ordering::Relaxed);
+    let untracked = (untracked > since).then_some(untracked);
+    let namespaces = self
+      .namespace_epochs
+      .lock()
+      .map(|epochs| {
+        epochs
+          .iter()
+          .filter(|(_, epoch)| **epoch > since)
+          .map(|(namespace, _)| namespace.clone())
+          .collect()
+      })
+      .unwrap_or_default();
+    (namespaces, untracked)
+  }
+
+  /// The tag-level variant of [`Self::note_local_write_in`]: resolves
+  /// one family tag (the `storage::families` constants) and notes the
+  /// write in its namespace. The tags are validated constants, so the
+  /// resolution cannot fail in practice; the unreachable error path
+  /// falls back to the untracked full-rescan note rather than dropping
+  /// the write signal.
+  pub(crate) fn note_local_write_tag(&self, tag: &'static str) {
+    match crate::storage::families::namespace(tag) {
+      Ok(namespace) => self.note_local_write_in(&namespace),
+      Err(_) => self.note_local_write(),
+    }
   }
 
   /// The current register-install epoch. `Relaxed` suffices: the value
