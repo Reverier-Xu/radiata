@@ -1773,4 +1773,203 @@ mod tests {
     )
     .shared()
   }
+
+  /// A live single-peer session fixture: the session table holds one
+  /// alive peer, and the runtime's packet channel drains (and acks) in
+  /// the background so the plane's fire-and-forget dispatches never
+  /// wedge the tick.
+  fn live_peer(shared: &Arc<super::PlaneShared>) -> (crate::NodeId, crate::runtime::RuntimeClient) {
+    let peer = node(900);
+    let (entry, _rx) = crate::session::stream::test_entry(shared.entropy.as_ref());
+    shared.sessions.lock().unwrap().insert(peer.clone(), entry);
+    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(64);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = crate::runtime::RuntimeClient::routing_only(packet_tx, routes);
+    tokio::spawn(async move {
+      while let Some(mut request) = packet_rx.recv().await {
+        let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
+          by: crate::NodeId::parse("node-000000000000000000090").unwrap(),
+          admitted_at: std::time::SystemTime::now(),
+        }));
+      }
+    });
+    (peer, runtime)
+  }
+
+  /// The peer's engine row count for one lane.
+  fn engine_rows(
+    shared: &Arc<super::PlaneShared>, peer: &crate::NodeId, lane: LaneId,
+  ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let guard = shared.state.lock().unwrap();
+    guard
+      .peers
+      .get(peer)
+      .and_then(|state| state.engines.get(&lane))
+      .map(|engine| {
+        engine
+          .rows()
+          .map(|(key, content)| (key.to_vec(), content.to_vec()))
+          .collect()
+      })
+      .unwrap_or_default()
+  }
+
+  /// A1: a superseded identity (a descriptor revision bump) leaves the
+  /// engine row set on the epoch pass — the engine tracks the store's
+  /// current row per key instead of growing monotonically — and a peer
+  /// re-primed afterwards receives only the current identity (no
+  /// historical rows).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_revision_bump_prunes_the_superseded_engine_row() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      node(700),
+      key(700),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:1").unwrap()],
+      1,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(
+      context.store(),
+      &crate::api::SystemEntropy,
+      &descriptor,
+    )
+    .await
+    .unwrap();
+    plane.tick(&runtime).await.unwrap();
+    let primed = engine_rows(&shared, &peer, LaneId::Descriptors);
+    assert_eq!(primed.len(), 1, "the engine holds the one descriptor row");
+    let old_identity = primed[0].clone();
+
+    // The revision bump: the same key under new content supersedes the
+    // primed identity.
+    let bumped = crate::membership::NodeDescriptorV1::new(
+      node(700),
+      key(700),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:2").unwrap()],
+      2,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(
+      context.store(),
+      &crate::api::SystemEntropy,
+      &bumped,
+    )
+    .await
+    .unwrap();
+    plane.tick(&runtime).await.unwrap();
+    let pruned = engine_rows(&shared, &peer, LaneId::Descriptors);
+    assert_eq!(
+      pruned.len(),
+      1,
+      "the engine row set did not grow on a revision bump"
+    );
+    assert_eq!(
+      pruned[0].1,
+      bumped.encode().unwrap(),
+      "the current identity"
+    );
+    assert_ne!(pruned[0], old_identity, "the superseded identity left");
+
+    // The re-prime contract: the session drops and returns, the fresh
+    // engine fills with exactly the current row set — the historical
+    // identity never re-crosses.
+    shared.sessions.lock().unwrap().clear();
+    plane.tick(&runtime).await.unwrap();
+    shared.sessions.lock().unwrap().insert(
+      peer.clone(),
+      crate::session::stream::test_entry(shared.entropy.as_ref()).0,
+    );
+    plane.tick(&runtime).await.unwrap();
+    let reprimed = engine_rows(&shared, &peer, LaneId::Descriptors);
+    assert_eq!(
+      reprimed.len(),
+      1,
+      "a re-primed peer receives only the current row set"
+    );
+    assert_eq!(reprimed[0].1, bumped.encode().unwrap());
+  }
+
+  /// A1: collected tombstone rows never enter the derived view on
+  /// either side — the scan filters them (so a prime cannot carry them)
+  /// and the receive-side predicate is exactly the apply boundary's
+  /// collected test.
+  #[tokio::test]
+  async fn collected_tombstone_rows_stay_out_of_the_scan() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let record = crate::identity::leave::sign_leave_record(&context, context.keys())
+      .await
+      .unwrap();
+    let stamp = record.timestamp_millis();
+    let leaver = context.identity().node().clone();
+    let mut key = vec![1_u8];
+    key.extend_from_slice(leaver.as_str().as_bytes());
+    let content = record.encode().unwrap();
+    // The checkpoint sits past the record's stamp: the row is collected.
+    let collected = super::tombstone_collected(Some(stamp), &key, &content);
+    assert!(collected, "a record at the watermark is collected");
+    assert!(
+      !super::tombstone_collected(Some(stamp - 1), &key, &content),
+      "a record after the watermark is live"
+    );
+    assert!(
+      !super::tombstone_collected(None, &key, &content),
+      "no checkpoint means nothing is collected"
+    );
+    // The revocation and checkpoint rows are never collected evidence.
+    let revocation_key = vec![3_u8];
+    assert!(!super::tombstone_collected(
+      Some(u64::MAX),
+      &revocation_key,
+      &content
+    ));
+  }
+
+  /// B2/B4: the link profile's knob curve. A fresh session (no
+  /// samples) is healthy with every knob open; sustained undelivered
+  /// dispatches cross the loss threshold and flip all three knobs; a
+  /// slow-but-delivered session crosses on the RTT threshold alone;
+  /// recovery (delivered traffic decaying the loss EWMA) restores the
+  /// healthy band. The knobs never touch the payload path.
+  #[test]
+  fn the_link_profile_curve_drives_exactly_three_knobs() {
+    let mut profile = super::LinkProfile::default();
+    assert!(!profile.weak(), "a fresh session is healthy");
+    assert_eq!(profile.cadence_divisor(), 1, "the base cadence");
+    assert!(profile.eager_delta(), "eager-delta defaults on");
+
+    // Sustained loss: twelve undelivered dispatches push the loss EWMA
+    // (≈ 1 − 0.875¹² ≈ 0.80) far past the 10% threshold.
+    for _ in 0..12 {
+      profile.observe(None);
+    }
+    assert!(profile.weak(), "a lossy link is weak");
+    assert_eq!(profile.cadence_divisor(), 4, "the weak-link cadence ¼");
+    assert!(!profile.eager_delta(), "eager-delta off on a weak link");
+
+    // Recovery: delivered traffic decays the loss EWMA below the
+    // threshold (0.8 × 0.875ⁿ < 0.10 needs n ≥ 15).
+    for _ in 0..16 {
+      profile.observe(Some(std::time::Duration::from_micros(400)));
+    }
+    assert!(!profile.weak(), "a recovered link is healthy again");
+    assert!(profile.eager_delta());
+
+    // The RTT band: a delivered but slow session is weak on latency
+    // alone — a 3 s admission latency crosses the 1.5 s threshold even
+    // with zero loss.
+    let mut slow = super::LinkProfile::default();
+    slow.observe(Some(std::time::Duration::from_secs(3)));
+    assert!(slow.weak(), "a slow link is weak");
+    assert_eq!(slow.cadence_divisor(), 4);
+    assert!(!slow.eager_delta());
+  }
 }

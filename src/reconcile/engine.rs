@@ -873,7 +873,10 @@ mod tests {
   use crate::reconcile::{
     digest::item_digest,
     fingerprint::Fingerprint,
-    wire::{DigestRange, LaneId, MAX_RANGES_PER_MESSAGE, MAX_ROWS_PER_MESSAGE, Message},
+    wire::{
+      DigestRange, LaneId, MAX_RANGES_PER_MESSAGE, MAX_ROWS_PER_MESSAGE, Message, RangeFingerprint,
+      Row,
+    },
   };
 
   /// A deterministic xorshift64* generator: the property loops below
@@ -1460,6 +1463,119 @@ mod tests {
     assert!(pair.quiet());
     assert_eq!(row_set(&pair.a), row_set(&pair.b));
     assert_eq!(pair.b.len(), 5);
+  }
+
+  /// A1: the row-removal seam. A removed row leaves the index, marks
+  /// its digest dirty (the peer's fingerprints still carry it until the
+  /// next exchange), and a repeated removal is a no-op. Superseded
+  /// identities therefore leave the derived view instead of
+  /// accumulating for the process lifetime.
+  #[test]
+  fn reconcile_removed_rows_leave_the_index_and_mark_dirty() {
+    let mut engine = Engine::new(LaneId::Descriptors);
+    engine.insert_row(b"node", b"v1").unwrap();
+    assert_eq!(engine.len(), 1);
+    let digest = item_digest(b"node", b"v1").unwrap();
+    assert!(engine.remove_row(b"node", b"v1").unwrap());
+    assert_eq!(engine.len(), 0, "the superseded identity left the index");
+    assert_eq!(
+      engine.dirty,
+      Some(vec![(digest, digest)]),
+      "the removal left the digest in the changed-range set"
+    );
+    assert!(!engine.remove_row(b"node", b"v1").unwrap());
+  }
+
+  /// The steady-state silence contract: re-inserting the identical row
+  /// (a rescan pass that re-feeds unchanged rows) marks nothing dirty,
+  /// so a quiet epoch pass emits no hint — only real changes hint.
+  #[test]
+  fn reconcile_identical_reinserts_stay_silent() {
+    let mut engine = Engine::new(LaneId::Descriptors);
+    engine.insert_row(b"k", b"v").unwrap();
+    let out = engine.drive(Drive::LocalChange).unwrap();
+    assert_eq!(out.len(), 1, "the first insert hints");
+    for _ in 0..3 {
+      engine.insert_row(b"k", b"v").unwrap();
+    }
+    let quiet = engine.drive(Drive::LocalChange).unwrap();
+    assert!(quiet.is_empty(), "an unchanged rescan emits nothing");
+  }
+
+  /// B3: the eager-delta piggyback. A healthy-link local change carries
+  /// the changed rows on the hint (bounded by the row budget); the
+  /// plain drive carries none; and a root exchange (the prime) consumes
+  /// the candidacy so primed rows never piggyback onto a later hint.
+  #[test]
+  fn reconcile_eager_delta_piggybacks_bounded_rows() {
+    let mut engine = Engine::new(LaneId::Resources);
+    engine.insert_row(b"small", b"row").unwrap();
+    let eager = engine.drive(Drive::LocalChangeEager).unwrap();
+    match &eager[0] {
+      Message::Hint { rows, .. } => assert_eq!(rows.len(), 1, "the changed row rides the hint"),
+      other => panic!("the eager drive emits a hint, not {other:?}"),
+    }
+    // The plain (fan-out) drive never carries rows.
+    engine.insert_row(b"second", b"row").unwrap();
+    let plain = engine.drive(Drive::LocalChange).unwrap();
+    match &plain[0] {
+      Message::Hint { rows, .. } => assert!(rows.is_empty(), "the fan-out wave is notices only"),
+      other => panic!("expected a hint, got {other:?}"),
+    }
+    // A received hint with rows applies them idempotently and resolves
+    // to silence when the piggyback covered the divergence.
+    let mut receiver = Engine::new(LaneId::Resources);
+    let digest = item_digest(b"second", b"row").unwrap();
+    let fingerprint = Fingerprint::singleton(digest);
+    let out = receiver
+      .drive(Drive::Message(Message::Hint {
+        lane: LaneId::Resources,
+        ranges: vec![RangeFingerprint {
+          start: digest,
+          end: digest,
+          count: 1,
+          xor: fingerprint.xor(),
+        }],
+        rows: vec![Row {
+          key: b"second".to_vec(),
+          content: b"row".to_vec(),
+        }],
+      }))
+      .unwrap();
+    assert!(out.is_empty(), "a covered hint is silence");
+    assert_eq!(receiver.len(), 1, "the piggybacked row applied");
+    // The byte budget: rows beyond the eager ceiling wait for the
+    // negotiation instead of piggybacking.
+    let mut big = Engine::new(LaneId::Resources);
+    let oversized = vec![0x45u8; super::EAGER_DELTA_BYTES];
+    big.insert_row(b"k", &oversized).unwrap();
+    let out = big.drive(Drive::LocalChangeEager).unwrap();
+    match &out[0] {
+      Message::Hint { rows, .. } => assert!(
+        rows.is_empty(),
+        "a row over the eager byte budget never piggybacks"
+      ),
+      other => panic!("expected a hint, got {other:?}"),
+    }
+  }
+
+  /// The prime consumes the eager candidacy: rows that entered the
+  /// engine through a root-exchange drive (the session prime) never
+  /// piggyback onto the next change's hint — only originator rows do.
+  #[test]
+  fn reconcile_the_prime_consumes_eager_candidacy() {
+    let mut engine = Engine::new(LaneId::Descriptors);
+    engine.insert_row(b"primed", b"row").unwrap();
+    engine.drive(Drive::RootExchange).unwrap();
+    engine.insert_row(b"fresh", b"row").unwrap();
+    let out = engine.drive(Drive::LocalChangeEager).unwrap();
+    match &out[0] {
+      Message::Hint { rows, .. } => {
+        assert_eq!(rows.len(), 1, "only the fresh row piggybacks");
+        assert_eq!(rows[0].key, b"fresh".to_vec(), "the primed row never rides");
+      }
+      other => panic!("expected a hint, got {other:?}"),
+    }
   }
 
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
