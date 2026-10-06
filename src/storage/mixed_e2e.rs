@@ -228,6 +228,7 @@ async fn converge(sides: [&MetadataStore; 2]) {
         applied += member_page::sync::apply_page_ctx(receiver, &SystemEntropy, &page)
           .await
           .unwrap()
+          .0
           .len();
       }
     }

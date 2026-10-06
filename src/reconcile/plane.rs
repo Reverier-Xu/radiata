@@ -68,7 +68,18 @@
 //! the whole historical row set. Collected tombstone rows are filtered
 //! at the scan and the receive boundary alike (collected evidence never
 //! enters an engine), so the checkpoint GC stops propagating reclaimed
-//! rows.
+//! rows. The same receive-boundary discipline gates the rows the lane's
+//! apply *refuses* — a stale descriptor revision, a binding for a revoked
+//! subject, an unhealable first install: a refused row never enters an
+//! engine, because the store will refuse it again on every re-delivery
+//! while the peers whose stores list it keep answering the resulting
+//! fingerprint divergence with the same bytes — an unbounded
+//! re-negotiation loop (the leave/restart livelock the transport-chaos
+//! lane caught on a starved core). The apply still runs first and its
+//! outcome decides the gate, so the lane's merge semantics stay the one
+//! source of truth; the transient deferrals (a tombstone whose subject
+//! binding has not converged, a contended binding adoption) keep their
+//! engine rows — their retry is the cross-lane repair, exactly as before.
 //!
 //! Rows carry each lane's merge state in their content and apply through
 //! the lane's existing semantics — descriptors batch into one
@@ -993,11 +1004,68 @@ impl ReconcilePlane {
       }
       rows = retained;
     }
+    if !rows.is_empty() {
+      // The store decides before any engine does: rows apply through
+      // the lane's merge semantics FIRST, and the rows the lane
+      // deterministically refused never reach the derived view — the
+      // same receive-boundary discipline the collected-tombstone and
+      // swept-resource filters enforce above. Without this gate a
+      // refused row (a stale descriptor revision, a binding for a
+      // revoked subject) enters the engine anyway, the epoch pass
+      // prunes it as superseded, the prune's hint re-announces the
+      // change, and the peers that still list the row re-deliver it —
+      // an unbounded re-negotiation loop between the refusing node and
+      // every fingerprint it exchanges (the leave/restart livelock:
+      // one starved core never drains it and the data plane starves).
+      // A batch-level store fault keeps every row in the message: the
+      // engines hold them and the derived-view repair retries, exactly
+      // as before.
+      match apply_rows(&self.shared, &lane, &rows, Some(source), Some(runtime)).await {
+        Ok(refused) => {
+          if !refused.is_empty() {
+            rows.retain(|(key, content)| {
+              !refused.iter().any(|(refused_key, refused_content)| {
+                refused_key == key && refused_content == content
+              })
+            });
+            tracing::debug!(
+              lane = ?lane,
+              refused = refused.len(),
+              "reconcile receive refused rows; they never enter the engines"
+            );
+          }
+        }
+        Err(error) => {
+          // Row-level refusals are skipped in-line by the arms; an error
+          // here is a batch-level store fault — the rows stay in the
+          // engines and the derived-view repair retries them.
+          tracing::warn!(
+            lane = ?lane,
+            kind = ?error.kind(),
+            "reconcile rows apply aborted by a store fault; the repair retries"
+          );
+        }
+      }
+      if !rows.is_empty() {
+        // The lane schedules one confirmation scan: the apply may have
+        // deferred rows the store cannot take yet (a tombstone whose
+        // subject binding has not converged), and those rows' retry
+        // lives in the next repair pass — without the scan the pass
+        // never recomputes (the delayed-content regression: the
+        // revocation arrived before its binding and never retried).
+        // A fully-refused batch needs no scan: nothing entered the
+        // store or the engines.
+        if let Ok(mut guard) = self.shared.lock() {
+          guard.force_rescan.insert(lane);
+        }
+      }
+    }
     if rows.len() != carried {
-      // A receive filter dropped rows: the engine's message must carry
-      // the retained set only — driving the original body would
-      // re-admit exactly what the filter refused (the engine applies
-      // piggybacked and carried rows alike before any comparison).
+      // A receive filter or the apply refusal dropped rows: the
+      // engine's message must carry the retained set only — driving
+      // the original body would re-admit exactly what was refused (the
+      // engine applies piggybacked and carried rows alike before any
+      // comparison).
       let retained_rows = rows
         .iter()
         .map(|(key, content)| crate::reconcile::wire::Row {
@@ -1090,30 +1158,11 @@ impl ReconcilePlane {
       outbound.extend(guard.release_held_hints());
     }
     if !rows.is_empty() {
-      // Rows apply through the lane's merge semantics before any
-      // fan-out observes them; a failed application still fans out —
-      // propagation and application are decoupled (the derived-view
-      // repair retries the application side on the next epoch pass).
-      // Either way the lane schedules one confirmation scan: the apply
-      // may have skipped rows the store cannot take yet (a tombstone
-      // whose subject binding has not converged), and those rows' retry
-      // lives in the next repair pass — without the scan the pass never
-      // recomputes (the delayed-content regression: the revocation
-      // arrived before its binding and never retried).
-      let applied = apply_rows(&self.shared, &lane, &rows, Some(source), Some(runtime)).await;
-      if let Err(error) = &applied {
-        // Row-level refusals are skipped in-line by the arms; an error
-        // here is a batch-level store fault — the rows stay in the
-        // engines and the derived-view repair retries them.
-        tracing::warn!(
-          lane = ?lane,
-          kind = ?error.kind(),
-          "reconcile rows apply aborted by a store fault; the repair retries"
-        );
-      }
-      if let Ok(mut guard) = self.shared.lock() {
-        guard.force_rescan.insert(lane);
-      }
+      // The kept rows — installed or deferred — fan out to the
+      // sibling engines: propagation and application are decoupled
+      // (the derived-view repair retries the application side on the
+      // next epoch pass), and a refused row never propagates from a
+      // node that will not hold it.
       let mut guard = self.shared.lock()?;
       for (peer, state) in guard.peers.iter_mut() {
         if peer == source || !state.primed {
@@ -1507,11 +1556,22 @@ impl TombstoneKind {
 /// Applies one message batch of rows through the lane's merge
 /// semantics. `source` is the sending peer when the rows arrived on the
 /// wire (the leave receipt addresses it); the derived-view repair path
-/// passes `None`.
+/// passes `None`. Returns the rows the lane **refused** — the
+/// deterministic policy skips (a stale descriptor revision, an
+/// unhealable first install, a revoked or substituted binding, a
+/// corrupt or misattributed row) whose outcome no retry can change.
+/// The receive boundary gates engine admission on this list: a refused
+/// row must never enter the derived view, because the row would then
+/// diverge every fingerprint exchange against the peers whose stores
+/// do list it, and the prune/hint/re-push cycle would re-deliver the
+/// refusal forever (the leave/restart livelock). Deferred classes —
+/// the transient contention and not-yet-converged-binding skips — do
+/// NOT appear here: their retry lives in the engine (the cross-lane
+/// repair), exactly as before.
 async fn apply_rows(
   shared: &PlaneShared, lane: &LaneId, rows: &[(Vec<u8>, Vec<u8>)], source: Option<&NodeId>,
   runtime: Option<&RuntimeClient>,
-) -> Result<()> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
   let context = shared.context()?;
   let store = context.store();
   match lane {
@@ -1523,36 +1583,69 @@ async fn apply_rows(
       // engines hold it, so the fingerprints look converged while the
       // store never receives the good rows behind it). Store failures
       // below still propagate: they are real write faults, not corrupt
-      // input.
-      let mut descriptors = Vec::with_capacity(rows.len());
+      // input. The refused list carries the rows in their original
+      // wire shape, so the receive boundary can keep them out of the
+      // engines — including the same-key duplicates the page-order
+      // contest below drops (their loser is stale-or-equal by
+      // construction, the same refusal the store would make).
+      let mut descriptors: Vec<(Vec<u8>, Vec<u8>, crate::membership::NodeDescriptorV1)> =
+        Vec::with_capacity(rows.len());
+      let mut refused = Vec::new();
+      let mut index_by_node: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
       for (row_key, content) in rows {
         match crate::membership::page::decode_descriptor(content) {
           Ok(descriptor) if row_key.as_slice() == descriptor.node().as_str().as_bytes() => {
-            descriptors.push(descriptor);
+            let node = descriptor.node().as_str().to_owned();
+            match index_by_node.get(&node) {
+              Some(&index) if descriptors[index].2.revision() >= descriptor.revision() => {
+                refused.push((row_key.clone(), content.clone()));
+              }
+              Some(&index) => {
+                let superseded_content =
+                  std::mem::replace(&mut descriptors[index].1, content.clone());
+                refused.push((row_key.clone(), superseded_content));
+                descriptors[index].2 = descriptor;
+              }
+              None => {
+                index_by_node.insert(node, descriptors.len());
+                descriptors.push((row_key.clone(), content.clone(), descriptor));
+              }
+            }
           }
           Ok(descriptor) => {
             tracing::debug!(
               node = %descriptor.node(),
               "reconcile descriptor row skipped: key mismatch"
             );
+            refused.push((row_key.clone(), content.clone()));
           }
           Err(error) => {
             tracing::debug!(
               kind = ?error.kind(),
               "reconcile descriptor row skipped: undecodable"
             );
+            refused.push((row_key.clone(), content.clone()));
           }
         }
       }
+      let mut skipped_ids = Vec::new();
       for chunk in descriptors.chunks(crate::paging::PAGE_MAX_ITEMS) {
-        let page = crate::membership::page::MembershipPage::new(chunk.to_vec(), None)?;
-        let installed = crate::membership::store::apply_descriptor_batch_ctx(
+        let page = crate::membership::page::MembershipPage::new(
+          chunk
+            .iter()
+            .map(|(_, _, descriptor)| descriptor.clone())
+            .collect(),
+          None,
+        )?;
+        let (installed, skipped) = crate::membership::store::apply_descriptor_batch_ctx(
           store,
           shared.entropy.as_ref(),
           &page,
         )
         .await?;
-        for descriptor in chunk {
+        skipped_ids.extend(skipped);
+        for (_, _, descriptor) in chunk {
           if installed.contains(descriptor.node()) {
             // The audit event is the propagation path proof: a
             // descriptor exists on this peer only because these rows
@@ -1566,7 +1659,17 @@ async fn apply_rows(
           }
         }
       }
-      Ok(())
+      // The batch's refused node ids map back onto exactly the rows
+      // that carried them (the dedup above left one row per node id).
+      for (row_key, content, _) in &descriptors {
+        if skipped_ids
+          .iter()
+          .any(|node| node.as_str().as_bytes() == row_key.as_slice())
+        {
+          refused.push((row_key.clone(), content.clone()));
+        }
+      }
+      Ok(refused)
     }
     LaneId::Trust => {
       // The same row-level policy as the descriptors arm: a corrupt or
@@ -1574,6 +1677,7 @@ async fn apply_rows(
       // snapshot-accept semantics (transient contention skips one
       // binding — the repair retries it — and everything else, key
       // substitution above all, fails closed and propagates).
+      let mut refused = Vec::new();
       for (row_key, content) in rows {
         let binding = match crate::identity::records::IdentityBindingV1::decode(content) {
           Ok(binding) if row_key.as_slice() == binding.node().as_str().as_bytes() => binding,
@@ -1582,6 +1686,7 @@ async fn apply_rows(
               node = %binding.node(),
               "reconcile binding row skipped: key mismatch"
             );
+            refused.push((row_key.clone(), content.clone()));
             continue;
           }
           Err(error) => {
@@ -1589,6 +1694,7 @@ async fn apply_rows(
               kind = ?error.kind(),
               "reconcile binding row skipped: undecodable"
             );
+            refused.push((row_key.clone(), content.clone()));
             continue;
           }
         };
@@ -1621,12 +1727,23 @@ async fn apply_rows(
               kind = ?error.kind(),
               "reconcile binding row refused by policy; skipping"
             );
+            // Revoked and substituted-key rows are refused evidence
+            // whose outcome no retry changes: they join the refused
+            // list so the receive boundary keeps them out of the
+            // engines. Contention and not-ready are transient — the
+            // row stays a repair candidate exactly as before.
+            if matches!(
+              error.kind(),
+              crate::ErrorKind::Revoked | crate::ErrorKind::NotTrusted
+            ) {
+              refused.push((row_key.clone(), content.clone()));
+            }
             continue;
           }
           return Err(error);
         }
       }
-      Ok(())
+      Ok(refused)
     }
     LaneId::Resources => {
       // The same row-level policy as the descriptors arm: a corrupt or
@@ -1634,6 +1751,7 @@ async fn apply_rows(
       // per-writer bounded wait and fail-closed skip for unknown
       // writers, and its store faults propagate.
       let mut records = Vec::with_capacity(rows.len());
+      let mut refused = Vec::new();
       for (row_key, content) in rows {
         match crate::resource::ResourceRecordV1::decode(content) {
           Ok(record) if row_key.as_slice() == record.name().as_str().as_bytes() => {
@@ -1644,12 +1762,14 @@ async fn apply_rows(
               name = %record.name().as_str(),
               "reconcile resource row skipped: key mismatch"
             );
+            refused.push((row_key.clone(), content.clone()));
           }
           Err(error) => {
             tracing::debug!(
               kind = ?error.kind(),
               "reconcile resource row skipped: undecodable"
             );
+            refused.push((row_key.clone(), content.clone()));
           }
         }
       }
@@ -1660,7 +1780,7 @@ async fn apply_rows(
             .await?;
         tracing::debug!(installed, "reconcile resource rows applied");
       }
-      Ok(())
+      Ok(refused)
     }
     LaneId::Tombstones => {
       crate::membership::sync::apply_tombstone_rows(
@@ -1673,7 +1793,12 @@ async fn apply_rows(
         source,
         runtime,
       )
-      .await
+      .await?;
+      // No refused rows on this lane: the policy skips (a subject
+      // binding that has not converged) are the designed transient
+      // retries — every tombstone row the collected filter passed
+      // stays a repair candidate until its binding lands.
+      Ok(Vec::new())
     }
   }
 }
@@ -2466,6 +2591,214 @@ mod tests {
       "a re-primed peer receives only the current row set"
     );
     assert_eq!(reprimed[0].1, bumped.encode().unwrap());
+  }
+
+  /// A2 (the leave/restart livelock): a descriptor row the store
+  /// deterministically refuses — a stale revision here — never enters
+  /// the engines at the receive boundary. Admitting it made every
+  /// fingerprint exchange re-detect the divergence: the epoch pass
+  /// pruned the row, the prune's hint re-announced the change, and the
+  /// peers that still listed the stale revision pushed it back — an
+  /// unbounded re-negotiation loop that starved a single core's data
+  /// plane (the transport-chaos relay wedges).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_stale_descriptor_row_never_enters_the_engines() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    // The store holds node(700) at revision 2 (its binding is adopted,
+    // so the first install at revision 1 was healable and applied).
+    let stale = crate::membership::NodeDescriptorV1::new(
+      node(700),
+      key(700),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:1").unwrap()],
+      1,
+      false,
+      1,
+    );
+    let current = crate::membership::NodeDescriptorV1::new(
+      node(700),
+      key(700),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:2").unwrap()],
+      2,
+      false,
+      1,
+    );
+    for descriptor in [&stale, &current] {
+      crate::membership::store::store_descriptor_ctx(
+        context.store(),
+        &crate::api::SystemEntropy,
+        descriptor,
+      )
+      .await
+      .unwrap();
+    }
+    plane.tick(&runtime).await.unwrap();
+    assert_eq!(
+      engine_rows(&shared, &peer, LaneId::Descriptors).len(),
+      1,
+      "the engine holds the one current descriptor row"
+    );
+
+    // A lagging peer re-delivers the superseded revision.
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Descriptors,
+          rows: vec![crate::reconcile::wire::Row {
+            key: node(700).as_str().as_bytes().to_vec(),
+            content: stale.encode().unwrap(),
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    let rows = engine_rows(&shared, &peer, LaneId::Descriptors);
+    assert_eq!(
+      rows.len(),
+      1,
+      "the refused row never entered the engine, even transiently"
+    );
+    assert_eq!(rows[0].1, current.encode().unwrap(), "the current row only");
+    assert_eq!(
+      crate::membership::store::read_descriptor_ctx(context.store(), &node(700))
+        .await
+        .unwrap()
+        .as_ref()
+        .map(crate::membership::NodeDescriptorV1::revision),
+      Some(2),
+      "the store kept the newer revision"
+    );
+    // The follow-up epoch pass stays quiet: nothing to prune, nothing
+    // to repair, no hint about a change that was never news.
+    plane.tick(&runtime).await.unwrap();
+    assert_eq!(
+      engine_rows(&shared, &peer, LaneId::Descriptors).len(),
+      1,
+      "the pass found no superseded row to prune"
+    );
+  }
+
+  /// A2's leaver shape: a wiped store holds no binding for the row's
+  /// subject, so a first descriptor install above revision 1 is refused
+  /// forever. The row must not sit in the engines as repair evidence —
+  /// the repair can never succeed, and every exchange would re-deliver
+  /// the same refused bytes (the leave/rejoin livelock carrier).
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_unhealable_first_install_stays_out_of_the_engines() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    plane.tick(&runtime).await.unwrap();
+    // node(700) has no binding here and no stored descriptor: revision 3
+    // is an unhealable first install.
+    let orphan = crate::membership::NodeDescriptorV1::new(
+      node(700),
+      key(700),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:1").unwrap()],
+      3,
+      false,
+      1,
+    );
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Descriptors,
+          rows: vec![crate::reconcile::wire::Row {
+            key: node(700).as_str().as_bytes().to_vec(),
+            content: orphan.encode().unwrap(),
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    assert!(
+      engine_rows(&shared, &peer, LaneId::Descriptors).is_empty(),
+      "the unhealable first install never entered the engine"
+    );
+    assert!(
+      crate::membership::store::read_descriptor_ctx(context.store(), &node(700))
+        .await
+        .unwrap()
+        .is_none(),
+      "the store refused the first install, as designed"
+    );
+    // The epoch pass does not adopt it as repair work: the repair set
+    // stays empty and the row never re-crosses to a peer.
+    plane.tick(&runtime).await.unwrap();
+    assert!(
+      engine_rows(&shared, &peer, LaneId::Descriptors).is_empty(),
+      "no repair candidate appeared for the refused row"
+    );
+  }
+
+  /// The trust-lane mirror of the same gate: a revoked subject's
+  /// binding row is refused evidence — it applies never, so it must not
+  /// enter the engines and answer later exchanges with bytes the store
+  /// will refuse again.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_revoked_binding_row_never_enters_the_engines() {
+    let (reference, factory) = crate::identity::testing::fresh_reference();
+    let keys = crate::identity::testing::ScriptedKeys::full_at(9_700);
+    let entropy = Arc::new(crate::identity::testing::SequenceEntropy::default());
+    let context = Arc::new(
+      crate::identity::testing::open_context(&factory, &keys, &entropy)
+        .await
+        .unwrap(),
+    );
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    let revoked = node(61);
+    let revocation = crate::identity::revocation::RevocationRecordV1::new(
+      revoked.clone(),
+      key(61),
+      context.identity().node().clone(),
+      crate::Signature::from_bytes([0_u8; 64]),
+    );
+    let (namespace, store_key) = (
+      crate::storage::families::namespace(crate::storage::families::REVOCATION_NAMESPACE).unwrap(),
+      crate::StoreKey::new(Arc::from(revoked.as_str().as_bytes().to_vec())),
+    );
+    crate::identity::testing::inject_entry(
+      &reference,
+      (namespace, store_key),
+      revocation.encode().unwrap(),
+    );
+    plane.tick(&runtime).await.unwrap();
+    let binding = crate::identity::records::IdentityBindingV1::new(revoked.clone(), key(61));
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Trust,
+          rows: vec![crate::reconcile::wire::Row {
+            key: revoked.as_str().as_bytes().to_vec(),
+            content: binding.encode().unwrap(),
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    assert!(
+      engine_rows(&shared, &peer, LaneId::Trust)
+        .iter()
+        .all(|(key, _)| key.as_slice() != revoked.as_str().as_bytes()),
+      "the revoked subject's binding row never entered the engine"
+    );
   }
 
   /// A1: collected tombstone rows never enter the derived view on

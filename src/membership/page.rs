@@ -113,7 +113,7 @@ pub(crate) mod sync {
   #[cfg(test)]
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &MembershipPage,
-  ) -> Result<Vec<NodeId>> {
+  ) -> Result<(Vec<NodeId>, Vec<NodeId>)> {
     super::store::apply_descriptor_batch_ctx(store, entropy, page).await
   }
 
@@ -126,7 +126,7 @@ pub(crate) mod sync {
     let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
     apply_page_ctx(&store, &crate::api::SystemEntropy, page)
       .await
-      .map(|installed| installed.len())
+      .map(|(installed, _)| installed.len())
   }
 }
 
