@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{Error, Result};
@@ -29,6 +30,7 @@ pub(crate) const PAGE_MAX_ITEMS: usize = 64;
 /// The one bounded-page wire envelope every anti-entropy lane encodes:
 /// positional array layout, so membership pages and resource pages share
 /// the exact byte shape (golden vectors pin both).
+#[cfg(test)]
 #[derive(Encode, Decode)]
 #[cbor(array)]
 struct PageEnvelopeWire {
@@ -70,6 +72,7 @@ pub(crate) fn check_page_shape(
 /// 3. **256 KiB receive bound** ([`crate::sync_common::MAX_SYNC_BYTES`] with
 ///    [`crate::sync_common::MAX_SYNC_CHUNKS`]): the receiver-side defense for
 ///    one drained sync body.
+#[cfg(test)]
 pub(crate) fn encode_page(
   schema: &str, items: &[Vec<u8>], cursor: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
@@ -88,10 +91,12 @@ pub(crate) fn encode_page(
 
 /// The decoded content of one page envelope: pre-decoded items plus the
 /// continuation cursor.
+#[cfg(test)]
 type PageEnvelope = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
 /// Decodes one bounded page envelope, rejecting unknown schemas,
 /// non-canonical encodings, and over-capacity item lists (fail closed).
+#[cfg(test)]
 pub(crate) fn decode_page(
   bytes: &[u8], schema: &str, max_items: usize, context: &'static str,
 ) -> Result<PageEnvelope> {
@@ -220,31 +225,6 @@ pub(crate) fn page_keys<T>(
 /// shared page maximum: one value, so the facade's page clamps and the
 /// wire receiver's over-capacity rejection cannot drift apart.
 pub(crate) use self::PAGE_MAX_ITEMS as MAX_VIEW_PAGE_ITEMS;
-
-/// Emits one wire-deliverable page through the size ladder (single
-/// source for the membership and resource lanes): emit at the candidate
-/// capacity, halve until the lane's `fits` predicate accepts the page
-/// (a fat record set can overflow the control-body bound), and fail
-/// closed when even a single-record page does not fit — a record is
-/// bounded far below the control bound, so reaching that arm means a
-/// bound regressed elsewhere.
-pub(crate) async fn emit_with_size_ladder<T, F, Fut>(
-  mut limit: usize, context: &'static str, mut emit: F, fits: impl Fn(&T) -> Result<bool>,
-) -> Result<T>
-where
-  F: FnMut(usize) -> Fut,
-  Fut: std::future::Future<Output = Result<T>>, {
-  loop {
-    let page = emit(limit).await?;
-    if fits(&page)? {
-      return Ok(page);
-    }
-    if limit == 1 {
-      return Err(Error::resource_exhausted(context));
-    }
-    limit /= 2;
-  }
-}
 
 #[cfg(test)]
 mod tests {

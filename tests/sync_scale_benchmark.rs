@@ -8,7 +8,7 @@
 //! shape of a flapping peer (session churn resolving ack verdicts as
 //! undelivered), and the watermark acceptance sample: exactly one
 //! write into a converged mid-size catalog must converge within one
-//! detection cadence window plus an amortized scan walk — not the full
+//! detection cadence window plus one reconciliation round — not the full
 //! catalog re-send cycle the previous fingerprint design paid on every
 //! quiet window. The matrix quantifies whether the per-page admission
 //! ack wait (2s bound) changes convergence or steady-state behavior at
@@ -569,10 +569,25 @@ async fn sync_128_node_star_bootstrap_with_raised_join_pool() {
   run_128_node_star(config, Duration::from_secs(300)).await;
 }
 
+/// Counts one node's locally visible members by paging the public view
+/// (the 128-node lane's descriptor convergence wait and its final
+/// assertion share this walk).
+async fn member_count(handle: &NodeHandle) -> usize {
+  let mut count = 0_usize;
+  let mut spec = PageSpec::first(64).unwrap();
+  loop {
+    let page = handle.members().list(spec).await.unwrap();
+    count += page.items().len();
+    let Some(cursor) = page.next() else { break };
+    spec = PageSpec::after(cursor.clone(), 64).unwrap();
+  }
+  count
+}
+
 /// The shared 128-node star body: issuer + 127 members over real TLS
-/// loopback and redb storage, phased timing (join admission vs trust
-/// convergence), and the full-reciprocal-trust assertion over the paged
-/// view.
+/// loopback and redb storage, phased timing (join admission, trust
+/// convergence, descriptor convergence), and the full-reciprocal-trust
+/// assertion over the paged view.
 async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
   init_tracing();
   let peers = 128_usize;
@@ -656,19 +671,40 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
     tokio::time::sleep(Duration::from_millis(500)).await;
   }
   let converge_seconds = converge_started.elapsed().as_secs_f64();
-  // The member view pages at 64 entries: walk every page before
-  // asserting the cluster size.
-  let mut members = 0_usize;
-  let mut spec = PageSpec::first(64).unwrap();
-  loop {
-    let page = nodes[0].handle.members().list(spec.clone()).await.unwrap();
-    members += page.items().len();
-    let Some(cursor) = page.next() else { break };
-    spec = PageSpec::after(cursor.clone(), 64).unwrap();
+  eprintln!("PHASE trust convergence: {converge_seconds:.1}s for {expected} bindings");
+
+  // Descriptor convergence: the trust binding commits ride the join
+  // handshake, but the member descriptor rows reconcile through the
+  // plane, which serializes one open round per lane per node (see the
+  // held-hints discipline in `src/reconcile/plane.rs`) — so the hub
+  // serves its peers' descriptor lanes pairwise and the trust loop
+  // above exits well before the derived member view is full. Wait for
+  // the hub's paged member view explicitly (the assertion below walks
+  // the same pages), reporting progress every 10s of the wait.
+  let descriptor_started = Instant::now();
+  let deadline = descriptor_started + CELL_TIMEOUT;
+  let mut last_progress = descriptor_started;
+  let mut members = member_count(&nodes[0].handle).await;
+  while members != expected {
+    if last_progress.elapsed() >= Duration::from_secs(10) {
+      eprintln!(
+        "descriptor convergence progress: {members}/{expected} at {}s",
+        descriptor_started.elapsed().as_secs()
+      );
+      last_progress = Instant::now();
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the hub's member view never reached {expected} (stuck at {members})"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    members = member_count(&nodes[0].handle).await;
   }
+  let descriptor_seconds = descriptor_started.elapsed().as_secs_f64();
+  eprintln!("PHASE descriptor convergence: {descriptor_seconds:.1}s for {members} members");
   assert_eq!(members, expected, "the member pages must list the cluster");
   println!(
-    "cell peers={peers} bindings={expected} (two pages) join={join_seconds:.1}s converge={converge_seconds:.1}s"
+    "cell peers={peers} bindings={expected} (two pages) join={join_seconds:.1}s converge={converge_seconds:.1}s descriptor={descriptor_seconds:.1}s"
   );
 
   for node in nodes {

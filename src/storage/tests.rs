@@ -603,3 +603,44 @@ fn transaction(index: u8) -> PreparedTransaction {
 fn revision(index: u8) -> StoreRevision {
   StoreRevision::new(Arc::from([index])).unwrap()
 }
+
+/// The namespace-granular write epochs (the reconciliation plane's
+/// incremental scan input): a namespaced note lands the namespace in
+/// the dirty set past the caller's watermark, a second query from the
+/// advanced watermark sees it clean, and an un-namespaced note degrades
+/// the query to the untracked fallback so no write can hide behind an
+/// uncovered path.
+#[tokio::test]
+async fn namespace_write_epochs_drive_the_incremental_scan() {
+  let (store, _state) = scripted(vec![], vec![]).await;
+  let descriptors =
+    crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
+      .unwrap();
+  let bindings =
+    crate::storage::families::namespace(crate::storage::families::IDENTITY_BINDING_NAMESPACE)
+      .unwrap();
+  store.note_local_write_in(&descriptors);
+  store.note_local_write_in(&bindings);
+  let epoch = store.register_epoch();
+  let (dirty, untracked) = store.dirty_namespaces_since(0);
+  assert_eq!(untracked, None, "no untracked note landed");
+  assert!(dirty.contains(&descriptors) && dirty.contains(&bindings));
+  // Consumed at the observed epoch: the steady state is zero dirty.
+  let (steady, untracked) = store.dirty_namespaces_since(epoch);
+  assert!(steady.is_empty() && untracked.is_none());
+  // A further namespaced write re-dirties exactly its namespace.
+  store.note_local_write_in(&descriptors);
+  let (dirty, untracked) = store.dirty_namespaces_since(epoch);
+  assert_eq!(untracked, None);
+  assert_eq!(dirty.len(), 1, "only the written family is dirty");
+  assert!(dirty.contains(&descriptors));
+  // The untracked note degrades to the full-rescan fallback.
+  let epoch = store.register_epoch();
+  store.note_local_write();
+  let (dirty, untracked) = store.dirty_namespaces_since(epoch);
+  assert!(dirty.is_empty());
+  assert!(
+    untracked.is_some(),
+    "the untracked note forces the fallback"
+  );
+}

@@ -15,36 +15,17 @@
 #[cfg(feature = "audit")]
 use tracing::debug;
 
-/// One watermark-filtered sync step settled without a page: `continued`
-/// records whether the walk advances from its budget boundary (`true`)
-/// or the pass closed at the catalog end (`false`). Closing on a quiet
-/// mid-catalog window instead of continuing is the stranded-tail defect
-/// the fuzz suite watches for.
+/// One resources-lane pass settled on observed agreement: the peer's
+/// last-seen whole-lane fingerprint equals the emitter's at a cadence
+/// root exchange, so `continued = false` (the reconciliation plane's
+/// equivalent of the walk's changeless whole-catalog scan). The SLO
+/// harness asserts this line as the resource plane's settled-pass
+/// proof; an exchange that did not observe agreement emits nothing.
 pub(crate) fn resource_pass_settled(peer: &str, continued: bool) {
   #[cfg(feature = "audit")]
   debug!(target: "audit", peer, continued, "resource pass settled");
   #[cfg(not(feature = "audit"))]
   let _ = (peer, continued);
-}
-
-/// A dispatched sync page failed its admission verdict and rewound to
-/// its scan start: the records re-collect on the next tick. Verdict
-/// failures during steady state mean the session cannot carry the page.
-pub(crate) fn resource_page_rewound(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "resource page rewound");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
-}
-
-/// A peer's watermark table refreshed to empty: the next pass
-/// re-delivers the whole catalog once, bounding any
-/// admission-versus-application divergence.
-pub(crate) fn resource_watermarks_refreshed(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "resource watermarks refreshed");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
 }
 
 /// A member dial toward `peer` was attempted; `recovery` records
@@ -90,26 +71,6 @@ pub(crate) fn membership_page_emitted(rows: usize) {
   debug!(target: "audit", rows, "membership diff page emitted");
   #[cfg(not(feature = "audit"))]
   let _ = rows;
-}
-
-/// One membership page's dispatch was rejected by the wire or lost its
-/// delivery verdict: the peer's walk rewinds, and the same range
-/// re-emits next round.
-pub(crate) fn membership_page_rewound(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "membership page rewound");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
-}
-
-/// One membership watermark table refreshed: the refresh-th pass
-/// completed, so the next pass re-delivers the whole catalog (the
-/// from-scratch liveness bound over the sender's delivery memory).
-pub(crate) fn membership_watermarks_refreshed(peer: &str) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, "membership watermarks refreshed");
-  #[cfg(not(feature = "audit"))]
-  let _ = peer;
 }
 
 /// One purpose-scoped pending journal resolved against durable

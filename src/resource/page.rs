@@ -11,15 +11,21 @@
 //! converge to one stable winner set.
 
 use super::ResourceRecordV1;
-use crate::{Error, Result};
+#[cfg(test)]
+use crate::Error;
+use crate::Result;
 
+/// The schema of one resource page record envelope (tests pin the wire
+/// shape the page round-trips through).
+#[cfg(test)]
 pub(crate) const RESOURCE_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/resource-page-v1";
 
-/// The default records-per-page emission limit (single-sourced in the
-/// paging module; lane-local name for readable call sites).
+/// The default records-per-page limit (single-sourced in the paging
+/// module; lane-local name for readable call sites).
+#[cfg(test)]
 pub(crate) use crate::paging::PAGE_DEFAULT_LIMIT as DEFAULT_RESOURCE_PAGE_LIMIT;
-/// The receiver-side per-page capacity: a page above this bound fails
-/// closed instead of being truncated.
+/// The per-page capacity: a page above this bound fails closed instead
+/// of being truncated.
 pub(crate) use crate::paging::PAGE_MAX_ITEMS as MAX_PAGE_RECORDS;
 
 /// One bounded page of signed resource records plus a continuation cursor.
@@ -44,6 +50,7 @@ impl ResourcePage {
     self.cursor.as_deref()
   }
 
+  #[cfg(test)]
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     // A record that cannot encode must fail the page: shipping empty bytes
     // would produce an entry every remote peer rejects.
@@ -57,6 +64,7 @@ impl ResourcePage {
   /// Decodes one page. Every entry is fully decoded and digest-checked
   /// here; writer-signature validation happens against the local trust
   /// anchors during application, before comparison.
+  #[cfg(test)]
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
     let (items, cursor) = crate::paging::decode_page(
       bytes,
@@ -79,7 +87,7 @@ impl ResourcePage {
 pub(crate) mod sync {
   use std::collections::HashMap;
 
-  use super::{MAX_PAGE_RECORDS, ResourcePage, ResourceRecordV1};
+  use super::{ResourcePage, ResourceRecordV1};
   use crate::{Error, NodeId, Result, api::Entropy, storage::MetadataStore};
 
   /// How long one record's writer-descriptor lookup waits for the
@@ -92,77 +100,33 @@ pub(crate) mod sync {
   /// The descriptor re-poll interval inside the bounded wait.
   const WRITER_TRUST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-  /// Emits one bounded page of resource records starting after `cursor`
-  /// from an existing store snapshot (the sync tick's shared per-tick
-  /// snapshot: one snapshot, not one per peer), filtered through the
-  /// peer's delivered-version watermark table: an entry whose stored
-  /// digest matches the peer's watermark is unchanged
-  /// for that peer and is skipped, so a page carries only records the
-  /// peer has never seen. The cursor is the last scanned name's text
-  /// (changed or skipped), so paging continues across ticks without
-  /// allocating the whole catalog.
-  ///
-  /// A page of fat records can overflow the 64 KiB control-body bound,
-  /// which failed the whole sync tick every tick and stalled the cursor
-  /// forever. The bounded halving ladder below retries at half the page
-  /// capacity until the full wire payload (page envelope plus sync
-  /// wrapper) fits: one record is bounded far below the control bound,
-  /// so the ladder always terminates, and a halved page still carries
-  /// its continuation cursor (the size-ladder note in
-  /// `crate::paging::encode_page`).
-  pub(crate) async fn emit_page_filtered_ctx(
-    snapshot: &(dyn crate::provider::StoreSnapshot + '_), cursor: Option<&[u8]>, limit: usize,
-    scan_budget: usize, watermarks: &std::collections::BTreeMap<Vec<u8>, u64>,
-  ) -> Result<crate::sync_common::FilteredEmission<ResourcePage>> {
-    let namespace = super::super::store::namespace()?;
-    crate::paging::emit_with_size_ladder(
-      limit.clamp(1, MAX_PAGE_RECORDS),
-      "resource page",
-      |changed_limit| {
-        crate::sync_common::walk_namespace_filtered(
-          snapshot,
-          &namespace,
-          cursor,
-          changed_limit,
-          scan_budget,
-          watermarks,
-          |_key, value| ResourceRecordV1::decode(value).map(Some),
-          ResourcePage::new,
-        )
-      },
-      |emission: &crate::sync_common::FilteredEmission<ResourcePage>| match &emission.page {
-        Some(page) => wire_payload_fits(page),
-        None => Ok(true),
-      },
-    )
-    .await
-  }
-
-  /// True when the page's full wire payload (page envelope plus sync
-  /// wrapper) encodes inside the control-body bound.
-  fn wire_payload_fits(page: &ResourcePage) -> Result<bool> {
-    crate::sync_common::page_wire_fits(page.encode(), |bytes| {
-      super::super::sync::ResourceSyncPayload(minicbor::bytes::ByteVec::from(bytes)).encode()
-    })
-  }
-
-  /// The unfiltered test/select emit: identical to a filtered pass with
-  /// an empty watermark table (every record is changed) and an
-  /// unbounded scan budget. A catalog shorter than the limit yields a
-  /// page whose cursor is `None` (pass complete).
+  /// The unfiltered test/select emit: one page over the store's current
+  /// records after `cursor` (the reconciliation plane carries the rows;
+  /// tests and offline harnesses page with this). A catalog shorter
+  /// than the limit yields a page whose cursor is `None` (pass
+  /// complete).
   #[cfg(test)]
   pub(crate) async fn emit_page_ctx(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<ResourcePage> {
-    let empty = std::collections::BTreeMap::new();
+    let namespace = super::super::store::namespace()?;
     let snapshot = store.snapshot().await?;
-    let emission =
-      emit_page_filtered_ctx(snapshot.as_ref(), cursor, limit, usize::MAX, &empty).await?;
-    Ok(
-      emission
-        .page
-        .unwrap_or_else(|| ResourcePage::new(Vec::new(), None).expect("empty page is well-formed")),
-    )
+    let mut scan = snapshot.scan_from(&namespace, &[], cursor).await?;
+    let mut records = Vec::new();
+    let mut last: Option<Vec<u8>> = None;
+    let mut exhausted = true;
+    while let Some(entry) = scan.next().await? {
+      if let Ok(record) = ResourceRecordV1::decode(entry.value().as_bytes()) {
+        if records.len() >= limit.clamp(1, super::MAX_PAGE_RECORDS) {
+          exhausted = false;
+          break;
+        }
+        records.push(record);
+      }
+      last = Some(entry.key().as_bytes().to_vec());
+    }
+    let cursor = if exhausted { None } else { last };
+    ResourcePage::new(records, cursor)
   }
 
   /// Applies one received page over the running node's metadata store.
@@ -172,8 +136,9 @@ pub(crate) mod sync {
   /// period (serializing those waits would pin this page's consumer —
   /// and its inbound admission slot — for writers x the bound, which
   /// gridlocked receivers at join fan-out), then get one end-of-page
-  /// retry before their records skip fail-closed (the periodic watermark
-  /// refresh remains the final backstop). Installation goes through the
+  /// retry before their records skip fail-closed (the reconciliation
+  /// plane's derived-view repair remains the final backstop).
+  /// Installation goes through the
   /// conditional register commit, so stale, duplicated, and losing
   /// permutations cannot replace a greater stored winner.
   pub(crate) async fn apply_page_ctx(
@@ -239,7 +204,7 @@ pub(crate) mod sync {
     // consumer tasks — a descriptor that landed while those waits ran is
     // only visible now. The old code skipped these records finally,
     // stranding them behind the sender's already-committed delivery
-    // watermark until the periodic whole-catalog refresh re-delivered
+    // record until a periodic whole-catalog refresh re-delivered
     // them: at join scale that refresh is many detection cadences away
     // and dominated roster convergence.
     let stranded: Vec<&ResourceRecordV1> = records
@@ -288,9 +253,10 @@ pub(crate) mod sync {
   /// ride the same anti-entropy tick in either order. The resolution
   /// therefore waits a bounded time for the descriptor to converge
   /// instead of skipping immediately — a skip here would strand the
-  /// record behind an already-delivered watermark. Past the bound the
+  /// record behind an already-delivered row. Past the bound the
   /// lookup fails closed; the page's end-of-apply retry pass re-resolves
-  /// once more, and the periodic watermark refresh remains the final
+  /// once more, and the reconciliation plane's derived-view repair
+  /// remains the final
   /// backstop.
   async fn writer_key(store: &MetadataStore, writer: &crate::NodeId) -> Result<crate::PublicKey> {
     let deadline = std::time::Instant::now() + WRITER_TRUST_WAIT;

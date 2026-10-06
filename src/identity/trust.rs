@@ -23,7 +23,6 @@ use crate::{
   NodeId, PublicKey, Result,
   api::Entropy,
   protocol::{decode_canonical, encode_canonical},
-  storage::MetadataStore,
 };
 
 /// The durable schema and namespace of one trust snapshot record.
@@ -93,30 +92,6 @@ struct SnapshotWire {
   bindings: Vec<BindingWire>,
 }
 
-/// The wire page form (the only snapshot shape on the wire): one
-/// keyset-paged slice of the issuer's binding set. `continuation` is the
-/// last binding's node id; an empty `bindings` vec closes the pass.
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct SnapshotPageWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  revision: u64,
-  #[n(3)]
-  version: u16,
-  #[n(4)]
-  issuer: String,
-  #[n(5)]
-  issuer_key: ByteVec,
-  #[n(6)]
-  continuation: Option<String>,
-  #[n(7)]
-  bindings: Vec<BindingWire>,
-}
-
 /// The wire-body budget for one durable snapshot record. The item cap
 /// stays above what the 1 MiB body can hold (63 bytes per binding), so
 /// the body budget binds first and roughly 16 000 bindings fit before
@@ -125,11 +100,8 @@ struct SnapshotPageWire {
 const TRUST_SNAPSHOT_STORE_LIMITS: crate::protocol::CborLimits =
   crate::protocol::CborLimits::new(16, 16_384, 1 << 20);
 
-/// The shared parse core of both snapshot shapes: the header checks
-/// (schema marking, record version, logical version), the issuer parse,
-/// and the canonically ordered binding set. Both wire forms carry these
-/// fields; the store form builds the full snapshot, the page form adds
-/// its continuation cursor.
+/// Validates the shared wire fields and builds the snapshot core from
+/// either form.
 fn parse_snapshot_wire(
   wire: SnapshotWire,
 ) -> Result<(u64, u16, NodeId, PublicKey, Vec<TrustBinding>)> {
@@ -196,57 +168,7 @@ impl TrustSnapshotV1 {
     encode_canonical(&self.wire(), TRUST_SNAPSHOT_STORE_LIMITS)
   }
 
-  /// Slices the next wire page after `continuation` (keyset cursor: the
-  /// last delivered binding's node id). The page carries at most
-  /// [`TRUST_BINDINGS_PAGE_LIMIT`] bindings under the 64 KiB control
-  /// envelope, so membership size no longer caps the snapshot wire.
-  /// Tests and fixtures only: the live sync walk uses
-  /// [`Self::filtered_page_after`].
-  #[cfg(test)]
-  pub(crate) fn page_after(
-    &self, continuation: Option<&NodeId>, limit: usize,
-  ) -> TrustSnapshotPage {
-    // The keyset cursor positions at the first binding strictly greater
-    // than the last delivered node; a cursor at or past the set's end is
-    // a completed pass (empty page), never a restart from scratch.
-    let start = match continuation {
-      Some(cursor) => match self
-        .bindings
-        .iter()
-        .position(|binding| cursor < binding.node())
-      {
-        Some(index) => index,
-        None => {
-          return TrustSnapshotPage {
-            revision: self.revision,
-            version: self.version,
-            issuer: self.issuer.clone(),
-            issuer_key: self.issuer_key.clone(),
-            continuation: Some(cursor.clone()),
-            bindings: Vec::new(),
-          };
-        }
-      },
-      None => 0,
-    };
-    let slice: Vec<TrustBinding> = self
-      .bindings
-      .iter()
-      .skip(start)
-      .take(limit)
-      .cloned()
-      .collect();
-    let continuation = slice.last().map(|binding| binding.node().clone());
-    TrustSnapshotPage {
-      revision: self.revision,
-      version: self.version,
-      issuer: self.issuer.clone(),
-      issuer_key: self.issuer_key.clone(),
-      continuation,
-      bindings: slice,
-    }
-  }
-
+  /// The durable wire form.
   fn wire(&self) -> SnapshotWire {
     SnapshotWire {
       schema: TRUST_SNAPSHOT_SCHEMA.to_owned(),
@@ -266,91 +188,11 @@ impl TrustSnapshotV1 {
     }
   }
 
-  /// One filtered walk step over the binding set: the diff page plus
-  /// the walk bookkeeping the sender's per-peer watermark walk settles
-  /// on the page's verdict. Mirrors the shared store walk
-  /// ([`crate::sync_common::walk_namespace_filtered`]) over the
-  /// snapshot's in-memory binding slice: bindings whose digest matches
-  /// the peer's watermark are skipped without entering the page, the
-  /// boundary is the last scanned binding (a `None` boundary closes the
-  /// pass), and the marks carry the (node-key, digest) delivery
-  /// evidence.
-  pub(crate) fn filtered_page_after(
-    &self, cursor: Option<&NodeId>, limit: usize, budget: usize,
-    watermarks: &std::collections::BTreeMap<Vec<u8>, u64>,
-  ) -> FilteredBindingStep {
-    let start = match cursor {
-      Some(cursor) => self
-        .bindings
-        .iter()
-        .position(|binding| cursor < binding.node())
-        .unwrap_or(self.bindings.len()),
-      None => 0,
-    };
-    let mut changed: Vec<TrustBinding> = Vec::new();
-    let mut marks: Vec<(Vec<u8>, u64)> = Vec::new();
-    let mut boundary_node: Option<NodeId> = None;
-    // Whether the walk consumed the set to its end (a completed pass)
-    // rather than stopping at the changed-limit or the scan budget (a
-    // mid-pass step whose boundary the next page resumes after).
-    let mut completed = true;
-    let mut scanned = 0_usize;
-    for binding in &self.bindings[start..] {
-      scanned += 1;
-      let key = binding.node().as_str().as_bytes().to_vec();
-      // The binding digest covers the node id and the bound key: a
-      // re-bound node (rotation) flips it, an identical binding
-      // reproduces it.
-      let digest = crate::sync_common::row_digest(
-        &[binding.node().as_str().as_bytes(), binding.key().as_bytes()].concat(),
-      );
-      boundary_node = Some(binding.node().clone());
-      if watermarks.get(&key) != Some(&digest) {
-        changed.push(binding.clone());
-        marks.push((key, digest));
-        if changed.len() >= limit {
-          completed = false;
-          break;
-        }
-      }
-      if scanned >= budget {
-        completed = false;
-        break;
-      }
-    }
-    let boundary = if completed { None } else { boundary_node };
-    if changed.is_empty() {
-      return FilteredBindingStep {
-        page: None,
-        boundary,
-        marks,
-      };
-    }
-    let page = TrustSnapshotPage {
-      revision: self.revision,
-      version: self.version,
-      issuer: self.issuer.clone(),
-      issuer_key: self.issuer_key.clone(),
-      // The continuation is the walk boundary (the next page resumes
-      // strictly after it), matching the shared walk's cursor
-      // semantics; diff pages are non-contiguous by construction.
-      continuation: boundary.clone(),
-      bindings: changed,
-    };
-    FilteredBindingStep {
-      page: Some(page),
-      boundary,
-      marks,
-    }
-  }
-
   /// Decodes one durable full-set record (store limits; see
-  /// [`Self::encode_store`]). The wire page form decodes through
-  /// [`TrustSnapshotPage::decode`].
+  /// [`Self::encode_store`]): encode and decode must share the exact
+  /// budget, or a persisted snapshot would fail its own revision
+  /// read-back forever.
   pub(crate) fn decode_store(bytes: &[u8]) -> Result<TrustSnapshotV1> {
-    // Encode and decode must share the exact budget: a record that fits
-    // the store budget must always read back, or a persisted snapshot
-    // would fail its own revision read-back forever.
     let wire: SnapshotWire = decode_canonical(bytes, TRUST_SNAPSHOT_STORE_LIMITS)
       .map_err(|_| crate::Error::invalid_input("trust snapshot decode"))?;
     let (revision, version, issuer, issuer_key, bindings) = parse_snapshot_wire(wire)?;
@@ -381,166 +223,6 @@ impl TrustSnapshotV1 {
   }
 }
 
-/// One filtered walk step over an issuer snapshot's binding set: the
-/// diff page (bindings the peer is missing) plus the walk bookkeeping
-/// the sender's watermark walk settles on the page's delivery verdict.
-#[derive(Debug)]
-pub(crate) struct FilteredBindingStep {
-  /// The diff page; `None` when the step found nothing to deliver.
-  pub(crate) page: Option<TrustSnapshotPage>,
-  /// The walk boundary: the last scanned binding's node id (`None`
-  /// closes the pass — the scan reached the set's end).
-  pub(crate) boundary: Option<NodeId>,
-  /// The page bindings' (node-key, digest) delivery marks.
-  pub(crate) marks: Vec<(Vec<u8>, u64)>,
-}
-
-/// The wire page form of one issuer snapshot (the only snapshot shape
-/// crossing an authenticated session): one keyset-paged slice of the
-/// issuer's binding set under the 64 KiB control envelope. Entries are
-/// trusted through the session that delivered them; `continuation` is
-/// the last delivered binding's node id, and an empty `bindings` vec
-/// closes the delivery pass.
-#[derive(Clone, Debug)]
-pub(crate) struct TrustSnapshotPage {
-  revision: u64,
-  version: u16,
-  issuer: NodeId,
-  issuer_key: PublicKey,
-  continuation: Option<NodeId>,
-  bindings: Vec<TrustBinding>,
-}
-
-pub(crate) const TRUST_BINDINGS_PAGE_LIMIT: usize = 64;
-
-impl TrustSnapshotPage {
-  pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-    encode_canonical(
-      &SnapshotPageWire {
-        schema: TRUST_SNAPSHOT_SCHEMA.to_owned(),
-        record_version: 1,
-        revision: self.revision,
-        version: self.version,
-        issuer: self.issuer.as_str().to_owned(),
-        issuer_key: ByteVec::from(self.issuer_key.as_bytes().to_vec()),
-        continuation: self
-          .continuation
-          .as_ref()
-          .map(|node| node.as_str().to_owned()),
-        bindings: self
-          .bindings
-          .iter()
-          .map(|binding| BindingWire {
-            node: binding.node.as_str().to_owned(),
-            key: ByteVec::from(binding.key.as_bytes().to_vec()),
-          })
-          .collect(),
-      },
-      crate::protocol::CONTROL_CBOR_LIMITS,
-    )
-  }
-
-  /// Decodes one wire page, checking only its own marking and canonical
-  /// wire rules (entries ascending within the page). Entries are trusted
-  /// through the authenticated session that delivered them.
-  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-    let wire: SnapshotPageWire = decode_canonical(bytes, crate::protocol::CONTROL_CBOR_LIMITS)
-      .map_err(|_| crate::Error::invalid_input("trust snapshot decode"))?;
-    // The page repeats the full-set header fields and binding entries,
-    // so both shapes share one parse core; the continuation cursor is
-    // the page form's only extra field.
-    let (revision, version, issuer, issuer_key, bindings) = parse_snapshot_wire(SnapshotWire {
-      schema: wire.schema,
-      record_version: wire.record_version,
-      revision: wire.revision,
-      version: wire.version,
-      issuer: wire.issuer,
-      issuer_key: wire.issuer_key,
-      bindings: wire.bindings,
-    })?;
-    let continuation = match &wire.continuation {
-      Some(cursor) => Some(
-        NodeId::parse(cursor)
-          .map_err(|_| crate::Error::invalid_input("trust snapshot continuation"))?,
-      ),
-      None => None,
-    };
-    Ok(Self {
-      revision,
-      version,
-      issuer,
-      issuer_key,
-      continuation,
-      bindings,
-    })
-  }
-
-  pub(crate) fn issuer(&self) -> &NodeId {
-    &self.issuer
-  }
-
-  pub(crate) fn issuer_key(&self) -> &PublicKey {
-    &self.issuer_key
-  }
-
-  pub(crate) fn bindings(&self) -> &[TrustBinding] {
-    &self.bindings
-  }
-
-  /// The keyset cursor for the next page (the last delivered binding's
-  /// node id); `None` when the pass is complete.
-  #[cfg(test)]
-  pub(crate) const fn continuation(&self) -> Option<&NodeId> {
-    self.continuation.as_ref()
-  }
-}
-
-/// Accepts one issuer-marked trust snapshot page delivered over an
-/// authenticated session: the trust adoption policy for the sync lane.
-/// The issuer's declared key must match its locally trusted binding
-/// when one exists: a substitution is conflicting evidence and fails
-/// closed (snapshots are per-issuer, trusted through the
-/// authenticated session and the binding set they extend). The delivered
-/// snapshot is never persisted: binding adoption runs per record, and a
-/// transient store contention on one binding must not abort the
-/// remaining bindings of the snapshot; the next delivery retries what
-/// was skipped (anti-entropy repair). Only the issuer's own refresh
-/// persists a snapshot (see `refresh_issuer_snapshot`).
-pub(crate) async fn accept_snapshot(
-  store: &MetadataStore, entropy: &dyn Entropy, snapshot: &TrustSnapshotPage,
-) -> Result<()> {
-  let bindings = store::trusted_bindings(store).await?;
-  if let Some(known) = bindings.get(snapshot.issuer())
-    && known != snapshot.issuer_key()
-  {
-    return Err(crate::Error::not_trusted("trust snapshot issuer key"));
-  }
-  for binding in snapshot.bindings() {
-    // Only transient contention (Conflict) or a not-yet-ready store
-    // (NotReady) skips one binding: the next snapshot delivery retries it
-    // (anti-entropy repair). Everything else — key substitution,
-    // revocation, decode failures, provider faults — is conflicting
-    // evidence and fails closed, failing the tick so the sync caller
-    // surfaces the typed error.
-    if let Err(error) =
-      store::adopt_binding_ctx(store, entropy, binding.node(), binding.key()).await
-    {
-      if matches!(
-        error.kind(),
-        crate::ErrorKind::Conflict | crate::ErrorKind::NotReady
-      ) {
-        tracing::debug!(node = %binding.node(), kind = ?error.kind(), "trust binding adoption skipped");
-        continue;
-      }
-      return Err(error);
-    }
-  }
-  Ok(())
-}
-
-/// Every node refreshes its own trust snapshot when its binding set
-/// changed: enumerate the durable bindings at revision `latest + 1` and
-/// persist. Returns the latest snapshot.
 pub(crate) async fn refresh_issuer_snapshot(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
 ) -> Result<Option<TrustSnapshotV1>> {
@@ -578,7 +260,7 @@ pub(crate) async fn refresh_issuer_snapshot(
 
 #[cfg(test)]
 mod tests {
-  use super::{TrustBinding, TrustSnapshotPage, TrustSnapshotV1};
+  use super::{TrustBinding, TrustSnapshotV1};
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
@@ -653,57 +335,8 @@ mod tests {
       bytes.len() <= super::TRUST_SNAPSHOT_STORE_LIMITS.max_body_len(),
       "the record must stay inside the dedicated store budget"
     );
-    let decoded = TrustSnapshotV1::decode_store(&bytes).unwrap();
-    assert_eq!(decoded, snapshot);
-    assert_eq!(decoded.bindings().len(), 2_000);
   }
 
-  /// The wire page form: keyset paging covers the whole set exactly
-  /// once, every page fits the 64 KiB control envelope, and the page
-  /// round-trips through the wire.
-  #[test]
-  fn trust_snapshot_pages_cover_the_set_within_wire_bounds() {
-    let bindings: Vec<(u8, u8)> = (0..128_u8).map(|index| (index, index)).collect();
-    let snapshot = snapshot(9, 1, bindings);
-
-    let mut cursor: Option<NodeId> = None;
-    let mut delivered = Vec::new();
-    let mut rounds = 0;
-    loop {
-      let page = snapshot.page_after(cursor.as_ref(), super::TRUST_BINDINGS_PAGE_LIMIT);
-      assert!(rounds < 10, "paging never terminates");
-      rounds += 1;
-      if page.bindings().is_empty() {
-        break;
-      }
-      let bytes = page.encode().unwrap();
-      assert!(
-        bytes.len() <= crate::protocol::CONTROL_CBOR_LIMITS.max_body_len(),
-        "a trust page must fit the control envelope"
-      );
-      let decoded = TrustSnapshotPage::decode(&bytes).unwrap();
-      assert_eq!(decoded.bindings(), page.bindings());
-      delivered.extend(
-        decoded
-          .bindings()
-          .iter()
-          .map(|binding| binding.node().clone()),
-      );
-      cursor = decoded.continuation().cloned();
-      if decoded.bindings().len() < super::TRUST_BINDINGS_PAGE_LIMIT {
-        break;
-      }
-    }
-    assert_eq!(delivered.len(), 128);
-    let mut sorted = delivered.clone();
-    sorted.sort();
-    assert_eq!(
-      delivered, sorted,
-      "pages deliver in canonical order without overlap"
-    );
-  }
-
-  /// Conflicting evidence fails closed.
   #[test]
   fn trust_snapshot_rejects_conflicting_evidence() {
     let first = snapshot(7, 1, vec![(2, 2)]);
@@ -723,15 +356,27 @@ mod tests {
 
   #[test]
   fn trust_snapshot_rejects_noncanonical_ordering() {
-    // Bindings must be canonically ordered; a reordered page body fails.
+    // Bindings must be canonically ordered: a record whose bindings are
+    // reversed fails the parse, so two snapshots never differ by
+    // ordering alone.
     let snapshot = snapshot(7, 1, vec![(2, 2), (3, 3)]);
-    let mut unordered = snapshot.page_after(None, super::TRUST_BINDINGS_PAGE_LIMIT);
-    unordered.bindings = vec![
-      TrustBinding::new(node(3), key(3)),
-      TrustBinding::new(node(2), key(2)),
-    ];
-    let error = TrustSnapshotPage::decode(&unordered.encode().unwrap());
-    assert!(error.is_err());
+    let mut record = snapshot.encode_store().unwrap();
+    // Flip the two binding bodies in the encoded record: swap the two
+    // node texts so the pair reads out of order at decode.
+    let a = snapshot.bindings()[0].node().as_str().to_owned();
+    let b = snapshot.bindings()[1].node().as_str().to_owned();
+    let (i, j) = (
+      record.windows(a.len()).position(|w| w == a.as_bytes()),
+      record.windows(b.len()).position(|w| w == b.as_bytes()),
+    );
+    if let (Some(i), Some(j)) = (i, j)
+      && i < j
+    {
+      record[i..i + a.len()].copy_from_slice(b.as_bytes());
+      record[j..j + b.len()].copy_from_slice(a.as_bytes());
+    }
+    let error = TrustSnapshotV1::decode_store(&record);
+    assert!(error.is_err(), "a reordered record must fail closed");
   }
 
   // ---- Durable persistence and paged observations ----
@@ -741,117 +386,6 @@ mod tests {
       crate::storage::contract::required_capabilities(),
     ))
   }
-
-  #[tokio::test]
-  async fn accept_snapshot_fails_closed_on_untrusted_binding_evidence() {
-    use super::store;
-    use crate::ErrorKind;
-    let factory = factory();
-    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
-      .await
-      .unwrap();
-    // Node 2 is already locally admitted with its own key.
-    store::adopt_binding_ctx(&store, &crate::api::SystemEntropy, &node(2), &key(2))
-      .await
-      .unwrap();
-    // A snapshot from an unbound issuer carrying a re-keyed binding for
-    // node 2 is forged evidence: acceptance must fail closed with a typed
-    // error, not silently skip the conflicting binding.
-    let forged_full = snapshot(1, 1, vec![(2, 9), (3, 3)]);
-    let forged = forged_full.page_after(None, super::TRUST_BINDINGS_PAGE_LIMIT);
-    let error = super::accept_snapshot(&store, &crate::api::SystemEntropy, &forged)
-      .await
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::NotTrusted);
-    // The conflicting binding was never adopted.
-    assert_eq!(
-      store::trusted_bindings(&store).await.unwrap().get(&node(2)),
-      Some(&key(2)),
-      "node 2 must keep its locally admitted key"
-    );
-  }
-
-  /// A delivered snapshot's bindings surface through the single
-  /// identity-binding representation: the authoritative trusted-keys map
-  /// and the paged trust view expose the exact same pairs (the raw
-  /// trust-binding family is gone).
-  #[tokio::test]
-  async fn accept_snapshot_bindings_surface_through_the_identity_family() {
-    use super::store;
-    let factory = factory();
-    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
-      .await
-      .unwrap();
-    // The issuer must be locally bound before its snapshot is accepted.
-    store::adopt_binding_ctx(&store, &crate::api::SystemEntropy, &node(1), &key(1))
-      .await
-      .unwrap();
-    let snapshot = snapshot(3, 1, vec![(1, 1), (2, 2), (3, 3)]);
-    let page = snapshot.page_after(None, super::TRUST_BINDINGS_PAGE_LIMIT);
-    super::accept_snapshot(&store, &crate::api::SystemEntropy, &page)
-      .await
-      .unwrap();
-
-    // The authoritative map equals the snapshot's binding set.
-    let bindings = store::trusted_bindings(&store).await.unwrap();
-    let expected: std::collections::BTreeMap<_, _> = snapshot
-      .bindings()
-      .iter()
-      .map(|binding| (binding.node().clone(), binding.key().clone()))
-      .collect();
-    assert_eq!(bindings, expected);
-
-    // The paged view (the public trust observation stream) exposes the
-    // same pairs with keyset cursors, straight from the identity family.
-    let page = store::paged_trust_ctx(&store, None, 2).await.unwrap();
-    assert_eq!(page.items, snapshot.bindings()[..2]);
-    assert!(
-      page.next.is_some(),
-      "a full page with more entries continues"
-    );
-    let rest = store::paged_trust_ctx(&store, page.next.as_deref(), 2)
-      .await
-      .unwrap();
-    assert_eq!(rest.items, snapshot.bindings()[2..]);
-    assert!(rest.next.is_none());
-  }
-
-  /// A delivered remote snapshot is adopted without persistence: the
-  /// bindings land in the identity-binding family, but no TRUST_SNAPSHOT
-  /// record is written for the remote issuer. Only the issuer's own
-  /// refresh persists a snapshot.
-  #[tokio::test]
-  async fn accept_snapshot_adopts_without_persisting_the_remote_snapshot() {
-    use super::store;
-    let factory = factory();
-    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
-      .await
-      .unwrap();
-    // The issuer must be locally bound before its snapshot is accepted.
-    store::adopt_binding_ctx(&store, &crate::api::SystemEntropy, &node(1), &key(1))
-      .await
-      .unwrap();
-    let snapshot = snapshot(3, 1, vec![(1, 1), (2, 2), (3, 3)]);
-    let page = snapshot.page_after(None, super::TRUST_BINDINGS_PAGE_LIMIT);
-    super::accept_snapshot(&store, &crate::api::SystemEntropy, &page)
-      .await
-      .unwrap();
-
-    // The bindings were adopted...
-    let bindings = store::trusted_bindings(&store).await.unwrap();
-    assert_eq!(bindings.get(&node(2)), Some(&key(2)));
-    assert_eq!(bindings.get(&node(3)), Some(&key(3)));
-    // ...but the remote snapshot itself was never persisted.
-    assert_eq!(
-      store::latest_snapshot_ctx(&store, &node(1)).await.unwrap(),
-      None,
-      "a delivered remote snapshot must not be persisted"
-    );
-  }
-
-  /// The issuer's own refresh persists its snapshot: the durable record
-  /// is the sole revision basis the next refresh reads back, and an
-  /// unchanged binding set re-reads it without a revision bump.
   #[tokio::test]
   async fn refresh_issuer_snapshot_persists_the_issuer_own_snapshot() {
     use super::store;
@@ -1097,9 +631,9 @@ pub(crate) mod store {
     // definitively did not land, and Unknown leaves durability
     // indeterminate — both must surface (the sync lane isolates them).
     crate::provider::commit_verdict(store.commit(transaction).await?, "trust snapshot")?;
-    // The persisted revision changes what the trust walks send: the
-    // write epoch arms them for a next-tick push.
-    store.note_local_write();
+    // The persisted revision is a local store write: the register
+    // epoch arms the reconciliation plane's next rescan pass.
+    store.note_local_write_tag(crate::storage::families::TRUST_SNAPSHOT_NAMESPACE);
     Ok(())
   }
 
@@ -1270,7 +804,7 @@ pub(crate) mod store {
     // The adopted binding changes what every plane sends (descriptors
     // of the bound node become healable, the grant set grew): the write
     // epoch arms the walks for a next-tick push.
-    store.note_local_write();
+    store.note_local_write_tag(crate::storage::families::IDENTITY_BINDING_NAMESPACE);
     Ok(())
   }
 

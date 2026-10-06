@@ -8,9 +8,12 @@
 //! revision, and rejects over-capacity pages and looping cursors.
 
 /// The schema of one membership sync page.
+#[cfg(test)]
 pub(crate) const MEMBERSHIP_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-page-v1";
 
-use super::{NodeDescriptorV1, store};
+use super::NodeDescriptorV1;
+#[cfg(test)]
+use super::store;
 /// The default page limit when the caller supplies none (single-sourced
 /// in the paging module; lane-local name for readable call sites).
 pub(crate) use crate::paging::PAGE_DEFAULT_LIMIT as DEFAULT_PAGE_LIMIT;
@@ -51,6 +54,7 @@ impl MembershipPage {
     self.cursor.as_deref()
   }
 
+  #[cfg(test)]
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     // A descriptor that cannot encode must fail the page: shipping empty
     // bytes would produce an entry every remote peer rejects.
@@ -64,6 +68,7 @@ impl MembershipPage {
   /// Decodes one page. Entries are trusted through the authenticated
   /// session that delivered them: decoding checks only the
   /// canonical wire rules and page capacity.
+  #[cfg(test)]
   pub(crate) fn decode(bytes: &[u8]) -> Result<MembershipPage> {
     let (items, cursor) = crate::paging::decode_page(
       bytes,
@@ -90,101 +95,13 @@ impl MembershipPage {
   }
 }
 
-/// The anti-entropy driver: pages the local descriptor store from a cursor
-/// and applies received pages under strict validation.
+/// The anti-entropy apply path: the reconciliation plane's descriptors
+/// lane applies its row batches through these page commits (the emit
+/// side lives in `crate::reconcile::plane`).
+#[cfg(test)]
 pub(crate) mod sync {
-  use super::{MAX_PAGE_DESCRIPTORS, MembershipPage};
-  use crate::{NodeId, Result, api::Entropy, provider::StoreSnapshot, storage::MetadataStore};
-
-  /// True when the page's full wire payload (page envelope plus sync
-  /// wrapper) encodes inside the control-body bound.
-  fn wire_payload_fits(page: &MembershipPage) -> Result<bool> {
-    crate::sync_common::page_wire_fits(page.encode(), |bytes| {
-      crate::membership::sync::SyncPayload::Page(minicbor::bytes::ByteVec::from(bytes)).encode()
-    })
-  }
-
-  /// Emits one bounded diff page of descriptors from an existing store
-  /// snapshot (the sync tick's shared per-tick snapshot), filtered
-  /// through the peer's delivered-digest watermark table: a row whose
-  /// stored digest matches the peer's watermark is unchanged for that
-  /// peer and is skipped without decoding, so a page carries only
-  /// descriptors the peer has never seen at this revision. The walk
-  /// cursor is the last scanned key (changed or skipped), so paging
-  /// continues across ticks without allocating the whole population —
-  /// the shared walk in [`crate::sync_common::walk_namespace_filtered`].
-  ///
-  /// A page of fat descriptors can overflow the 64 KiB control-body
-  /// bound, which failed the whole sync tick every tick and stalled the
-  /// cursor forever. The bounded halving ladder retries at half the page
-  /// capacity until the full wire payload (page envelope plus sync
-  /// wrapper) fits: one descriptor is bounded far below the control
-  /// bound, so the ladder always terminates, and a halved page still
-  /// carries its continuation cursor (the size-ladder note in
-  /// `crate::paging::encode_page`).
-  pub(crate) async fn emit_page_filtered_from_snapshot(
-    snapshot: &(dyn StoreSnapshot + '_), cursor: Option<&[u8]>, limit: usize, scan_budget: usize,
-    watermarks: &std::collections::BTreeMap<Vec<u8>, u64>,
-  ) -> Result<crate::sync_common::FilteredEmission<MembershipPage>> {
-    let namespace = crate::storage::families::namespace(super::super::NODE_DESCRIPTOR_NAMESPACE)?;
-    crate::paging::emit_with_size_ladder(
-      limit.clamp(1, MAX_PAGE_DESCRIPTORS),
-      "membership page",
-      |changed_limit| {
-        crate::sync_common::walk_namespace_filtered(
-          snapshot,
-          &namespace,
-          cursor,
-          changed_limit,
-          scan_budget,
-          watermarks,
-          |key, value| match super::decode_descriptor(value) {
-            // The sender only pages its own stored records; entries are
-            // trusted through the session that delivers them. A stored
-            // row that no longer decodes must not fail the whole page
-            // (that would permanently kill descriptor anti-entropy
-            // egress for every member): skip the row with evidence and
-            // keep advertising the rest.
-            Ok(descriptor) => Ok(Some(descriptor)),
-            Err(error) => {
-              tracing::debug!(
-                key = %String::from_utf8_lossy(key),
-                kind = ?error.kind(),
-                "membership page skipped an undecodable descriptor row",
-              );
-              Ok(None)
-            }
-          },
-          MembershipPage::new,
-        )
-      },
-      |emission: &crate::sync_common::FilteredEmission<MembershipPage>| match &emission.page {
-        Some(page) => wire_payload_fits(page),
-        None => Ok(true),
-      },
-    )
-    .await
-  }
-
-  /// Emits one bounded page over the running node's metadata store.
-  /// Convenience for tests and offline paths; the live tick uses
-  /// [`emit_page_filtered_from_snapshot`] with its per-tick shared
-  /// snapshot.
-  #[cfg(test)]
-  pub(crate) async fn emit_page_ctx(
-    store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
-  ) -> Result<MembershipPage> {
-    let snapshot = store.snapshot().await?;
-    let empty = std::collections::BTreeMap::new();
-    let emission =
-      emit_page_filtered_from_snapshot(snapshot.as_ref(), cursor, limit, usize::MAX, &empty)
-        .await?;
-    Ok(
-      emission.page.unwrap_or_else(|| {
-        MembershipPage::new(Vec::new(), None).expect("empty page is well-formed")
-      }),
-    )
-  }
+  use super::MembershipPage;
+  use crate::{NodeId, Result, api::Entropy, storage::MetadataStore};
 
   /// Applies one received page over the running node's metadata store:
   /// the store accepts only the exact next revision, so stale, repeated,
@@ -193,24 +110,15 @@ pub(crate) mod sync {
   /// decisions live in the store module beside the single-descriptor
   /// commit they mirror — so a page costs one durable commit, not one
   /// per descriptor.
+  #[cfg(test)]
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &MembershipPage,
-  ) -> Result<Vec<NodeId>> {
+  ) -> Result<(Vec<NodeId>, Vec<NodeId>)> {
     super::store::apply_descriptor_batch_ctx(store, entropy, page).await
   }
 
   /// Emits one bounded page of descriptors starting after `cursor` over a
   /// standalone factory handle (unit/offline path).
-  #[cfg(test)]
-  pub(crate) async fn emit_page(
-    factory: &std::sync::Arc<dyn crate::provider::StorageFactory>, cursor: Option<&[u8]>,
-    limit: usize,
-  ) -> Result<MembershipPage> {
-    let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
-    emit_page_ctx(&store, cursor, limit).await
-  }
-
-  /// Applies one received page over a standalone factory handle.
   #[cfg(test)]
   pub(crate) async fn apply_page(
     factory: &std::sync::Arc<dyn crate::provider::StorageFactory>, page: &MembershipPage,
@@ -218,7 +126,7 @@ pub(crate) mod sync {
     let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
     apply_page_ctx(&store, &crate::api::SystemEntropy, page)
       .await
-      .map(|installed| installed.len())
+      .map(|(installed, _)| installed.len())
   }
 }
 
@@ -372,214 +280,15 @@ mod tests {
     ))
   }
 
-  /// A tick emits bounded pages without a whole-population allocation.
-  #[tokio::test]
-  async fn emit_pages_bounded_without_whole_members() {
-    let factory = factory();
-    crate::membership::store::store_descriptor(&factory, &descriptor(1, 1, "one"))
-      .await
-      .unwrap();
-    crate::membership::store::store_descriptor(&factory, &descriptor(2, 1, "two"))
-      .await
-      .unwrap();
-    crate::membership::store::store_descriptor(&factory, &descriptor(3, 1, "three"))
-      .await
-      .unwrap();
-
-    let page = sync::emit_page(&factory, None, 2).await.unwrap();
-    assert_eq!(page.descriptors().len(), 2);
-    assert!(page.cursor().is_some());
-    let page = sync::emit_page(&factory, page.cursor(), 2).await.unwrap();
-    assert_eq!(page.descriptors().len(), 1);
-    assert!(page.cursor().is_none());
-  }
-
-  /// The filtered walk observes a tail-appended member — the join case
-  /// whose blindness motivated the whole-catalog fingerprint — and stays
-  /// quiet over an unchanged catalog: after one full pass commits every
-  /// watermark, the next pass over the same catalog emits nothing, and a
-  /// tail-appended member appears alone in the next page (the diff, not
-  /// the whole catalog).
-  #[tokio::test]
-  async fn the_filtered_walk_emits_only_the_tail_append() {
-    let factory = factory();
-    crate::membership::store::store_descriptor(&factory, &descriptor(1, 1, "one"))
-      .await
-      .unwrap();
-    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
-      .await
-      .unwrap();
-    let snapshot = store.snapshot().await.unwrap();
-    let mut watermarks = std::collections::BTreeMap::new();
-
-    // The first pass delivers the whole (one-row) catalog and commits
-    // its watermark.
-    let emission =
-      sync::emit_page_filtered_from_snapshot(snapshot.as_ref(), None, 4, 64, &watermarks)
-        .await
-        .unwrap();
-    assert_eq!(emission.page.as_ref().unwrap().descriptors().len(), 1);
-    assert_eq!(
-      emission.walk_cursor, None,
-      "the pass reaches the catalog end"
-    );
-    watermarks.extend(emission.marks);
-
-    // An unchanged catalog is quiet: the next pass emits nothing.
-    let quiet = sync::emit_page_filtered_from_snapshot(snapshot.as_ref(), None, 4, 64, &watermarks)
-      .await
-      .unwrap();
-    assert!(quiet.page.is_none(), "an unchanged catalog emits nothing");
-    assert_eq!(quiet.walk_cursor, None);
-
-    // The tail append: a descriptor sorting strictly after the existing
-    // key prefix (the join case the page-range fingerprint was blind
-    // to). The next pass emits exactly that row — one descriptor, not
-    // the whole catalog.
-    drop(snapshot);
-    drop(store);
-    crate::membership::store::store_descriptor(&factory, &descriptor(2, 1, "two"))
-      .await
-      .unwrap();
-    let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(10))
-      .await
-      .unwrap();
-    let snapshot = store.snapshot().await.unwrap();
-    let diff = sync::emit_page_filtered_from_snapshot(snapshot.as_ref(), None, 4, 64, &watermarks)
-      .await
-      .unwrap();
-    let page = diff.page.expect("the tail append is due immediately");
-    assert_eq!(page.descriptors().len(), 1, "only the appended row flows");
-    assert_eq!(page.descriptors()[0].node(), &node(2));
-    assert_eq!(diff.walk_cursor, None);
-  }
-
-  /// A stored descriptor row that no longer decodes is skipped with a
-  /// logged evidence trail instead of failing the page: one corrupt row
-  /// must not kill descriptor anti-entropy egress for every member (nor
-  /// strand the rows behind it in the paging order).
-  #[tokio::test]
-  async fn a_corrupt_descriptor_row_is_skipped_and_the_page_still_emits() {
-    use crate::{
-      StoreKey,
-      identity::testing::inject_entry,
-      storage::contract::{ReferenceFactory, required_capabilities},
-    };
-
-    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
-    let factory: Arc<dyn StorageFactory> = reference.clone();
-    crate::membership::store::store_descriptor(&factory, &descriptor(1, 1, "one"))
-      .await
-      .unwrap();
-    crate::membership::store::store_descriptor(&factory, &descriptor(2, 1, "two"))
-      .await
-      .unwrap();
-    // The corrupt row sorts last: a single page delivers both good rows
-    // and ends the stream.
-    let namespace =
-      crate::storage::families::namespace(crate::membership::NODE_DESCRIPTOR_NAMESPACE).unwrap();
-    inject_entry(
-      &reference,
-      (
-        namespace,
-        StoreKey::new(Arc::from(b"node-corrupt-row".to_vec())),
-      ),
-      vec![0xFF, 0x00, 0x01],
-    );
-
-    let page = sync::emit_page(&factory, None, super::DEFAULT_PAGE_LIMIT)
-      .await
-      .unwrap();
-    assert_eq!(page.descriptors().len(), 2);
-    assert!(page.cursor().is_none());
-
-    // Paging at capacity one walks past the corrupt row: both good rows
-    // still deliver across pages and the walk terminates cleanly.
-    let mut cursor: Option<Vec<u8>> = None;
-    let mut delivered: Vec<NodeId> = Vec::new();
-    loop {
-      let page = sync::emit_page(&factory, cursor.as_deref(), 1)
-        .await
-        .unwrap();
-      delivered.extend(page.descriptors().iter().map(|entry| entry.node().clone()));
-      match page.cursor() {
-        Some(next) => cursor = Some(next.to_vec()),
-        None => break,
-      }
-    }
-    delivered.sort();
-    delivered.dedup();
-    assert_eq!(delivered.len(), 2, "every decodable row was advertised");
-  }
-
-  /// A page of fat descriptors (label sets at their maximum) splits
-  /// through the bounded halving ladder instead of overflowing the 64 KiB
-  /// control-body bound: every emitted page's full wire payload (page
-  /// envelope plus sync wrapper) encodes, paging continues past halved
-  /// pages, and every descriptor is delivered. Under the pre-ladder code
-  /// this page overflowed the bound and failed the sync tick forever.
-  #[tokio::test]
-  async fn fat_descriptor_pages_halve_instead_of_overflowing() {
-    fn fat_labels() -> crate::LabelSet {
-      let mut labels = crate::LabelSet::new();
-      for index in 0..crate::label::LABEL_SET_MAX_ENTRIES {
-        labels = labels
-          .insert(
-            crate::LabelKey::parse(&format!("example.org/labels/fat-{index:02}")).unwrap(),
-            crate::LabelValue::parse(&"v".repeat(crate::label::LABEL_VALUE_MAX_BYTES)).unwrap(),
-          )
-          .unwrap();
-      }
-      labels
-    }
-    let factory = factory();
-    for seed in 1..=6_u8 {
-      let fat = descriptor(seed, 1, "fat").with_labels(fat_labels());
-      crate::membership::store::store_descriptor(&factory, &fat)
-        .await
-        .unwrap();
-    }
-
-    let mut cursor: Option<Vec<u8>> = None;
-    let mut delivered: Vec<NodeId> = Vec::new();
-    let mut pages = 0_usize;
-    loop {
-      let page = sync::emit_page(&factory, cursor.as_deref(), super::DEFAULT_PAGE_LIMIT)
-        .await
-        .unwrap();
-      // The full wire payload (page envelope plus sync wrapper) fits the
-      // control-body bound: the ladder halved the capacity to get here.
-      let wrapped = crate::membership::sync::SyncPayload::Page(minicbor::bytes::ByteVec::from(
-        page.encode().unwrap(),
-      ));
-      assert!(wrapped.encode().is_ok());
-      pages += 1;
-      assert!(
-        page.descriptors().len() < 6,
-        "an over-bound page never reaches the wire whole"
-      );
-      delivered.extend(page.descriptors().iter().map(|entry| entry.node().clone()));
-      let done = page.cursor().is_none();
-      cursor = page.cursor().map(|value| value.to_vec());
-      if done {
-        break;
-      }
-    }
-    assert!(pages >= 3, "six fat descriptors split over several pages");
-    delivered.sort();
-    delivered.dedup();
-    assert_eq!(delivered.len(), 6);
-  }
-
   /// Repeated pages repair missing revisions and stale peers converge to
   /// the highest revision.
   #[tokio::test]
   async fn apply_pages_repairs_and_converges() {
-    let factory = factory();
-    crate::membership::store::store_descriptor(&factory, &descriptor(1, 1, "one"))
+    // A stale receiver holds revision 1; the page carries revision 2.
+    let receiver = factory();
+    crate::membership::store::store_descriptor(&receiver, &descriptor(1, 1, "one"))
       .await
       .unwrap();
-    // A stale peer holds revision 1; the peer pages revision 2.
     let fresh = crate::membership::NodeDescriptorV1::new(
       node(1),
       key(1),
@@ -588,21 +297,27 @@ mod tests {
       false,
       1,
     );
-    crate::membership::store::store_descriptor(&factory, &fresh)
-      .await
-      .unwrap();
-
-    let page = sync::emit_page(&factory, None, 4).await.unwrap();
+    let page = MembershipPage::new(vec![fresh.clone()], None).unwrap();
     let encoded = page.encode().unwrap();
     let decoded = MembershipPage::decode(&encoded).unwrap();
-    // Applying again is idempotent (no downgrade, no duplicate install).
-    let applied = sync::apply_page(&factory, &decoded).await.unwrap();
-    let current = crate::membership::store::read_descriptor(&factory, &node(1))
+    // The repair slice: the page repairs the stale receiver exactly
+    // once (the row applies), and re-applying is idempotent — no
+    // downgrade, no duplicate install.
+    assert_eq!(
+      sync::apply_page(&receiver, &decoded).await.unwrap(),
+      1,
+      "the stale receiver installs the fresher revision"
+    );
+    assert_eq!(
+      sync::apply_page(&receiver, &decoded).await.unwrap(),
+      0,
+      "re-applying installs nothing"
+    );
+    let current = crate::membership::store::read_descriptor(&receiver, &node(1))
       .await
       .unwrap()
       .unwrap();
     assert_eq!(current.revision(), 2);
-    let _ = applied;
   }
 
   /// A dishonest page cannot loop a cursor or exceed capacities; unknown

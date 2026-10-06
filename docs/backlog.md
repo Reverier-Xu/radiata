@@ -36,7 +36,7 @@ evidence lands in the commit history.
   measured ~95%) and is replaced — not tuned — by receiver-evidenced
   range reconciliation over `(count, xor)` fingerprints, with payload
   bytes only crossing a session for ranges the receiver proves it
-  lacks. Scope below in item 3.
+  lacks. Landed (the cycle's summary is in the landed section below).
 - **The public handle API is the client-go-shaped verb surface.**
   `node.command(...)`/`node.query(...)` over sealed command structs are
   replaced by resource-scoped accessors (`members()`, `resources()`, …
@@ -133,6 +133,53 @@ evidence lands in the commit history.
   now share one walk implementation (`walk_namespace_filtered`) and
   one state machine.
 
+## Landed in the reconciliation plane cycle (2026-10, no action)
+
+- The reconciliation plane: all four lanes (descriptors, trust,
+  resources, tombstones) converge by receiver-evidenced range
+  reconciliation — `(count, xor)` fingerprints over each lane's
+  item-digest space, the six-message `reconcile-v1` wire contract
+  (ROOT/HINT/OFFER/NEED/ROWS/DONE, canonical CBOR, fail-closed
+  decode, golden vectors), the frozen digest function (truncated
+  SHA-256 over the canonical `[key, content]` pair), the `b = 4`
+  multi-way negotiation, one in-flight round per session-lane, the
+  per-node per-lane pull serialization (held hints bounded at eight
+  per lane), and `(count, xor)`-ordered root initiation. The
+  `WatermarkWalk`, the per-peer watermark tables, the refresh passes,
+  and the tombstone resend cadence are deleted; the cleanup checkpoint
+  GC and every lane's merge semantics are untouched (the primitive
+  `c54382d`, the engine and wire `14b780d`/`b055a31`/`028fcdf`, the
+  lane migration `b49c787`…`a359379`).
+- The trigger and adaptation layer: local writes debounce into one
+  coalesced HINT per tick through namespace-granular epoch indexing (a
+  quiet steady state scans nothing), the 32-tick quiet ROOT detection
+  cadence (8 ticks on weak links), the 4 KiB eager-delta piggyback on
+  healthy links, and the per-session link profile (EWMA RTT and loss;
+  weak = loss ≥ 10% or RTT ≥ 1.5 s) driving exactly three knobs — the
+  cadence multiplier, the hint retry on a 1/2/4/8-tick backoff, and
+  the eager-delta toggle — with the payload path never a knob
+  (`5d240d9`, pinned by `654cd64`).
+- The budget evidence (`scripts/verify-sync-budget.sh`, the
+  engine-level matrix over n ∈ {8, 64, 256} × single-row / batch /
+  reconnect): payload delivery redundancy measured 1.000–1.040×
+  against the 1.05× bound (1.143/3.381/2.630/1.471 before the
+  per-lane serialization), hint traffic held within changes × degree ×
+  200 B, and the 20%-loss cell converging in 64 ticks against the
+  eager-off baseline's 192 at n=8 (`30c6b5c`, `697eb15`).
+- Defect classes the budget lane and the dual-perspective audit
+  caught and fixed in-cycle: the cross-lane repair retry (a
+  policy-skipped revocation waiting out a cadence window, `0d67596`),
+  the wedged apply batch on refused rows (`900641c`), the root-side
+  serialization gaps, the retention resurrection of swept removal
+  rows, the hint-retry re-arming loop, and the narrow-scan plan
+  erasing other lanes' repair marks (`e3891de`).
+- The equivalence proof is the pre-existing suite: the membership,
+  trust, resource, crash, and chaos lanes pass unchanged over the new
+  plane — 804 tests green at the R3/R4 acceptance points, 805 after
+  R5's guide doctest — and the `radiata::guide` sync
+  chapters now describe the reconciliation contract (chapter 3 and the
+  deployment chapter's background-load sizing).
+
 ## Landed earlier (2026-09-27 audit cycle, no action)
 
 - The sync planes pipeline (descriptor and trust), round settlements are
@@ -174,65 +221,3 @@ evidence lands in the commit history.
   polling) and the library gained the missing above-chunk-bound delivery
   test (`a_body_above_the_chunk_bound_crosses_three_hops_byte_exact`);
   the data plane itself was never at fault.
-
-## 2. Conditional: receiver-side cursor evidence for sync planes
-
-**Recorded, not scheduled.** The acknowledgement bound is now five
-seconds and the planes pipeline, so a lost acknowledgement delays one
-window slot instead of truncating a pass. If admission latency ever
-grows with scale beyond that bound, the structural answer is
-receiver-side cursor evidence (a pull-based repair) — a bigger timer is
-explicitly not the answer (it uniformly slows every sync-bound phase;
-measured during the 2026-09-27 cycle). *Superseded by item 3: the
-reconciliation rewrite is that pull-based repair, generalized to the
-whole sync plane.*
-
-## 3. Scoped: the reconciliation plane rewrite (2026-10 cycle)
-
-Evidence and decision record: `docs/research/` (the baseline audit of
-the watermark model's structural redundancy, the survey of gossip
-theory / set reconciliation / delta CRDTs, the comparison matrix, and
-the target architecture in `research/06-architecture-proposal.md`).
-Rewrite authorization: pre-release, no compatibility surface, no
-migration burden. Items:
-
-- **R1 — the fingerprint index primitive** *(in flight)*. The
-  digest-ordered aggregate index (`src/reconcile/fingerprint.rs`):
-  `(count, xor)` group fingerprints, strict-prefix and half-open range
-  queries, digest-ascending enumeration, derived-view semantics (never
-  persisted, rebuilt from the snapshot). Acceptance: group-law,
-  BTreeMap-oracle (random operation sequences),
-  construction-order-independence, bucket-boundary, and
-  inverted-range property tests, all deterministic. Gate: the unit
-  lane in the module; clippy/fmt gates as usual.
-- **R2 — the reconciliation engine and wire v1.** The per-session,
-  per-lane state machine (`ROOT/HINT/OFFER/NEED/ROWS/DONE`), canonical
-  CBOR encodings, the frozen digest function (truncated SHA-256 over
-  the canonical row bytes), bounded ranges per message, one in-flight
-  round per session-lane. Acceptance: golden vectors for every message
-  shape; dual-instance in-process convergence property tests
-  (identical final state for arbitrary divergent starts and
-  adversarial message reorderings/losses with re-drive). Gate:
-  `reconcile` unit lane + the wire golden-vector suite.
-- **R3 — lane migration.** Descriptors, trust, resources, and
-  tombstones ride the engine; `WatermarkWalk`, the per-peer watermark
-  tables, the refresh passes, and the tombstone resend cadence are
-  deleted; the cleanup checkpoint GC stays. Acceptance: the existing
-  membership/trust/resource convergence, crash, and chaos lanes pass
-  unchanged (they are the equivalence proof). Gate:
-  `cargo test --workspace --all-features --locked` plus the
-  `verify-*` membership and fuzz lanes.
-- **R4 — the trigger and adaptation layer.** Change-driven `HINT`
-  debounced per tick, the quiet-cadence `ROOT` exchange,
-  eager-delta piggyback for healthy links, per-session link profiling
-  (EWMA RTT, loss/retry rate) driving only hint redundancy and
-  eager-delta toggles. Acceptance: `scripts/verify-sync-budget.sh`
-  (new): payload delivery redundancy ≤ 1.05× on the steady-state
-  matrices (n ∈ {8, 64, 256} × single-row/batch/reconnect), hint
-  traffic within the budget bound, and no convergence regression at
-  20% loss injection. Gate: the new lane plus the chat acceptance
-  lane.
-- **R5 — guide and cleanup.** The `radiata::guide` sync chapters
-  rewritten for the reconciliation contract; the research cycle's
-  proposal marked landed; this section deleted per the lifecycle
-  rules.

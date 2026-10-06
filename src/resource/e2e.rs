@@ -109,7 +109,8 @@ async fn put_descriptor(store: &MetadataStore, descriptor: &NodeDescriptorV1) {
 
 /// Runs one full bidirectional convergence pass: A applies every page
 /// emitted by B and vice versa, until neither side applies any change.
-/// Uses the same page emit/apply functions the anti-entropy driver calls.
+/// Uses the same page apply path the reconciliation plane's row batches
+/// ride (the test emit pages the store directly).
 async fn converge(sides: [&MetadataStore; 2]) -> usize {
   let mut total_applied = 0;
   loop {
@@ -135,21 +136,27 @@ async fn converge(sides: [&MetadataStore; 2]) -> usize {
           break;
         }
       }
-      // The member-descriptor side rides the same pages.
-      let mut cursor: Option<Vec<u8>> = None;
-      loop {
-        let page = member_page::sync::emit_page_ctx(emitter, cursor.as_deref(), 16)
-          .await
-          .unwrap();
-        let done = page.cursor().is_none();
-        cursor = page.cursor().map(|value| value.to_vec());
+      // The member-descriptor side: one page over the emitter's stored
+      // descriptors (the reconcile plane's row shape — the page walk is
+      // gone), applied through the same batched commit.
+      let mut descriptors = Vec::new();
+      let snapshot = emitter.snapshot().await.unwrap();
+      let namespace =
+        crate::storage::families::namespace(crate::membership::NODE_DESCRIPTOR_NAMESPACE).unwrap();
+      let mut scan = snapshot.scan_from(&namespace, &[], None).await.unwrap();
+      while let Some(entry) = scan.next().await.unwrap() {
+        if let Ok(descriptor) = crate::membership::page::decode_descriptor(entry.value().as_bytes())
+        {
+          descriptors.push(descriptor);
+        }
+      }
+      for chunk in descriptors.chunks(16) {
+        let page = member_page::MembershipPage::new(chunk.to_vec(), None).unwrap();
         applied += member_page::sync::apply_page_ctx(receiver, &SystemEntropy, &page)
           .await
           .unwrap()
+          .0
           .len();
-        if done {
-          break;
-        }
       }
     }
     if applied == 0 {
@@ -474,98 +481,4 @@ async fn restart_and_readdress_repair_through_ordinary_pages() {
     resource(&name(1), 2_000, &writer_b(), "u://b1", SECOND_SEED).digest(),
     "the timestamp-maximum tuple wins on both sides"
   );
-}
-
-/// Eight fat resources (label sets near their per-record bound) overflow
-/// one 64 KiB control-bound page: the emission ladder halves the page
-/// capacity, so every page's full wire payload (page envelope plus sync
-/// wrapper) encodes, paging continues across the halved pages, and both
-/// sides still converge. Under the pre-ladder code the page encode
-/// failed the sync tick forever and the cursor never advanced.
-#[tokio::test]
-async fn fat_resource_pages_halve_and_still_converge() {
-  // One record must stay inside its own 16 KiB record wire bound
-  // (RECORD_LIMITS), so a fat label set stops short of the full entry
-  // maximum — but eight such records still overflow the 64 KiB page
-  // bound many times over.
-  const FAT_ENTRIES: usize = 48;
-  fn fat_labels() -> crate::LabelSet {
-    let mut labels = crate::LabelSet::new();
-    for index in 0..FAT_ENTRIES {
-      labels = labels
-        .insert(
-          crate::LabelKey::parse(&format!("example.org/labels/fat-{index:02}")).unwrap(),
-          crate::LabelValue::parse(&"v".repeat(crate::label::LABEL_VALUE_MAX_BYTES)).unwrap(),
-        )
-        .unwrap();
-    }
-    labels
-  }
-
-  let (_, side_a) = open_store().await;
-  let (_, side_b) = open_store().await;
-  // The fat resource writer must be a trusted member on both sides or
-  // every page entry would skip for an unknown writer.
-  put_descriptor(&side_a, &descriptor(&writer_a(), 1, RECORD_SEED)).await;
-  put_descriptor(&side_b, &descriptor(&writer_a(), 1, RECORD_SEED)).await;
-  for seed in 1..=8_u8 {
-    let record = ResourceRecordV1::sign(
-      name(seed),
-      LabelValue::parse("document").unwrap(),
-      crate::ResourceUri::parse(&format!("u://fat-{seed}")).unwrap(),
-      fat_labels(),
-      5_000 + u64::from(seed),
-      writer_a(),
-      0,
-      false,
-      &SigningKey::from_bytes(&RECORD_SEED),
-    )
-    .unwrap();
-    put_resource(&side_a, &record).await;
-  }
-
-  let mut cursor: Option<Vec<u8>> = None;
-  let mut applied_total = 0_usize;
-  let mut pages = 0_usize;
-  loop {
-    let page = resource_page::sync::emit_page_ctx(
-      &side_a,
-      cursor.as_deref(),
-      resource_page::DEFAULT_RESOURCE_PAGE_LIMIT,
-    )
-    .await
-    .unwrap();
-    // The full wire payload (page envelope plus sync wrapper) fits the
-    // control bound: the ladder halved the capacity to get here.
-    let wrapped = crate::resource::sync::ResourceSyncPayload(minicbor::bytes::ByteVec::from(
-      page.encode().unwrap(),
-    ));
-    assert!(wrapped.encode().is_ok());
-    pages += 1;
-    assert!(
-      page.records().len() < 8,
-      "an over-bound page never reaches the wire whole"
-    );
-    let done = page.cursor().is_none();
-    cursor = page.cursor().map(|value| value.to_vec());
-    applied_total += resource_page::sync::apply_page_ctx(&side_b, &SystemEntropy, &page)
-      .await
-      .unwrap();
-    if done {
-      break;
-    }
-  }
-  assert!(pages >= 2, "eight fat records split over several pages");
-  assert_eq!(applied_total, 8);
-  for seed in 1..=8_u8 {
-    let left = resource_store::read_record_ctx(&side_a, &name(seed))
-      .await
-      .unwrap()
-      .unwrap();
-    let right = resource_store::read_record_ctx(&side_b, &name(seed))
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(left.digest(), right.digest(), "fat record {seed} converged");
-  }
 }

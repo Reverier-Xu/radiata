@@ -1,0 +1,223 @@
+schema = "radiata.woooo.tech/schemas/fuzz-corpus-v1"
+status = "accepted"
+target = "reconcile_decode"
+privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
+minimizer = { tool = "none", version = "0" }
+aggregate = { entry_count = 31, total_bytes = 1571 }
+
+[[entry]]
+digest = "9ef91667367a87846264c5e682c7546f738230ca30e2527ae5fef6860a785d36"
+byte_count = 7
+origin = "golden-fixture"
+lineage = "golden vector root descriptors"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "58ebd2310d9b25941df19c409793de16f222bba64231fbe45bdd6f7ed0e2ae6b"
+byte_count = 49
+origin = "golden-fixture"
+lineage = "golden vector hint trust two ranges with eager-delta row"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "a92194b4a4ce486989f7dc9ba7095c03a70e109569f44256b079d4f884cc2be3"
+byte_count = 201
+origin = "hand-adversarial"
+lineage = "hint rows over the 64-row bound (65 empty rows), typed rejection"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "f0d4f1635fb17becf076a45b01e62c288ca5b497a6f8ed232c5a83238099104b"
+byte_count = 17
+origin = "golden-fixture"
+lineage = "golden vector offer resources"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "9757fe77af0ae0d0e81359e8458989817cc7d3a4c67c2eb8988becc3e3f19148"
+byte_count = 8
+origin = "golden-fixture"
+lineage = "golden vector need tombstones"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "f596cf9a560fed616b2fede1824b432238dfe7474a7f8efa28c66d6660d73531"
+byte_count = 16
+origin = "golden-fixture"
+lineage = "golden vector rows descriptors"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "98606d23d7a4566fe1be35cf80e4db32f18fc848195e4fd3c4e5de1dbe8e3631"
+byte_count = 12
+origin = "golden-fixture"
+lineage = "golden vector done trust"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "0016dd14b0f77d63bc0b9fb1c4523882bbc0c4090e3588378f9e5ef05d3ea4b3"
+byte_count = 181
+origin = "adversarial-fixture"
+lineage = "hint with exactly 32 ranges (the bound)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "a3e397f51ec2faaf5ee71a6138141a2010febaf58318fd8c98f7bfd8b2ab7b77"
+byte_count = 117
+origin = "adversarial-fixture"
+lineage = "need with exactly 32 bounds (the bound)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "d58e1034b4ba6f5d249d16990d29fa99e300d49e8e1e21f4fd7cec3dfbfe2f94"
+byte_count = 188
+origin = "adversarial-fixture"
+lineage = "hint with 33 ranges (over bound)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "087dddf35115157bd9cb3ab782505b83d64b9db915b15bc119aeb9eb8f234ee7"
+byte_count = 188
+origin = "adversarial-fixture"
+lineage = "offer with 33 ranges (over bound)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "143bdd9886debb84433621a2b9f2d341f09adcccb6d153d3b8963207087514d3"
+byte_count = 122
+origin = "adversarial-fixture"
+lineage = "need with 33 bounds (over bound)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "815c60e52f367f7aed9ccc9dafbbc4010b19f6e3e78985522d99d70a137f2360"
+byte_count = 330
+origin = "adversarial-fixture"
+lineage = "rows with 65 rows (over bound)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "889afa7b7bc17ac7a79c47446796857e9a5b041b9b1bce0becb4cd08c77961e5"
+byte_count = 4
+origin = "adversarial-fixture"
+lineage = "rows with zero rows (valid no-op shape)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "59e88748ce6c2e10f84e162b85a0fff2d429922113e8b67a8df358844be58e40"
+byte_count = 5
+origin = "adversarial-fixture"
+lineage = "unknown message kind 0"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "7365c5c3d299219c602a7c766f234a65bece549e8c34caf7ddcb229f644caa46"
+byte_count = 5
+origin = "adversarial-fixture"
+lineage = "unknown message kind 7"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "5e11cc9be8948780a7b3ba05206dc500a7c9ef1238c75d5ea5fd8490d325b04b"
+byte_count = 6
+origin = "adversarial-fixture"
+lineage = "unknown message kind 255"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "7707f450a09d25ef4c92f7b110b8ca15b907e1629d09c3fc203123474133815a"
+byte_count = 5
+origin = "adversarial-fixture"
+lineage = "unknown lane 0"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "4cb2c15dfbf5e5d57e3ac41c241bdc35dffb5dad89d397266343c97d89d04ea1"
+byte_count = 5
+origin = "adversarial-fixture"
+lineage = "unknown lane 5"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "c2e41dccc7df43ce92f68f50947b009d18d875903c01c5e1a4b7b54fbef4006f"
+byte_count = 6
+origin = "adversarial-fixture"
+lineage = "unknown lane 255"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "87c221bbd1826608ac80db9dc1e37dd28db39f4b65e9c98b4e97a4709f6a8c5f"
+byte_count = 8
+origin = "adversarial-fixture"
+lineage = "root with one trailing padding byte"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "3569a7c70b0706c4135b9c40ec2fceedaf5b46a602ce4d1160b83025e8187785"
+byte_count = 6
+origin = "adversarial-fixture"
+lineage = "root missing its final byte"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "25aa9ac7dd025488011338f7372368e1fe0dcacd0f0bde85ec1ee023f109f292"
+byte_count = 8
+origin = "adversarial-fixture"
+lineage = "root count 17 in two-byte non-shortest form"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "2d8787f6d784a6f2ac91f70b3d988a6791fc898bf5f3a3b79ed1b2c76d6e63ac"
+byte_count = 17
+origin = "adversarial-fixture"
+lineage = "rows key in two-byte non-shortest byte-string form"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "63489b9104a06713d42dd1b84901faab36a39aab046d25fd8d9639917e6d21b6"
+byte_count = 3
+origin = "adversarial-fixture"
+lineage = "done as a two-element array (wrong arity)"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "e8b11aaf3cb969b8987fcb10fdb473a6f0969c7b0b2bf166b47988f135cd2b4e"
+byte_count = 3
+origin = "adversarial-fixture"
+lineage = "a one-entry map where an array is required"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "a49a6247f54efa221732a1e2b340713b709f0c1349ecef2d96bcee14f08c81d2"
+byte_count = 6
+origin = "adversarial-fixture"
+lineage = "indefinite-length root array"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "6a5ab3460b8ac5c1c52720fa32b102b5474d1aa2e356796c76cbbb2691c39a06"
+byte_count = 9
+origin = "adversarial-fixture"
+lineage = "hint range start beyond end"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "ba485fde85fbb102e620bfed76d34f5360ccc3ba62ebcc3e53a742b47be27a5c"
+byte_count = 7
+origin = "adversarial-fixture"
+lineage = "need bound start beyond end"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "955b103e0cd15fcc296c433e57cbcb510f87f236d7b4a625bc75fce1dcac0532"
+byte_count = 11
+origin = "adversarial-fixture"
+lineage = "rows array declaring 27 entries with one present"
+schema_tags = ["reconcile kind 1..6"]
+
+[[entry]]
+digest = "7c84fee7baaffdc8aff07c9624a080d8228d80556b9f5aca00e8bc72aa2af435"
+byte_count = 21
+origin = "adversarial-fixture"
+lineage = "root over the full digest space with maximal values"
+schema_tags = ["reconcile kind 1..6"]

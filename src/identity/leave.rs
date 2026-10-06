@@ -278,6 +278,13 @@ fn intent_key_skip(key: &StoreKey) -> bool {
   key.as_bytes() == INTENT_KEY
 }
 
+/// Whether a leave-family store key is the intent singleton (not a
+/// record): the reconciliation lane's row scan skips it exactly like
+/// the known-records scan.
+pub(crate) fn is_intent_key(key: &[u8]) -> bool {
+  key == INTENT_KEY
+}
+
 /// The leave-side checkpoint sweep: conditional
 /// exact-digest deletes of collected leave records stamped at or before
 /// `watermark`. The leave intent singleton is never touched.

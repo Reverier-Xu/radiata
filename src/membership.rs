@@ -367,7 +367,7 @@ pub(crate) mod store {
     crate::provider::commit_verdict(store.commit(transaction).await?, "node descriptor revision")?;
     // The committed descriptor belongs in some peer's diff: the write
     // epoch turns it into a next-tick push.
-    store.note_local_write();
+    store.note_local_write_tag(NODE_DESCRIPTOR_NAMESPACE);
     Ok(())
   }
 
@@ -415,12 +415,15 @@ pub(crate) mod store {
   /// per-record commit queue — every commit a full durable transaction
   /// serialized through the single-commit state machine — was the
   /// minutes-long roster-convergence tail. Returns the installed node
-  /// ids; a raced register (a non-permit writer moved under one of the
+  /// ids and the refused node ids (the deterministic skips above — the
+  /// caller needs the split to gate its derived view: a row the store
+  /// refuses must not enter it, or the refusal re-delivers forever);
+  /// a raced register (a non-permit writer moved under one of the
   /// batch's CAS expectations) landed nothing and retries once from a
   /// fresh snapshot before failing the page to the anti-entropy cadence.
   pub(crate) async fn apply_descriptor_batch_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &super::page::MembershipPage,
-  ) -> Result<Vec<NodeId>> {
+  ) -> Result<(Vec<NodeId>, Vec<NodeId>)> {
     let _permit = store.write_permit().await;
     let namespace = namespace()?;
     // Page-order contest for repeated nodes: the highest revision wins,
@@ -447,6 +450,7 @@ pub(crate) mod store {
       let snapshot = store.snapshot().await?;
       let mut operations = Vec::new();
       let mut applied = Vec::new();
+      let mut skipped = Vec::new();
       for descriptor in contenders.iter().copied() {
         let key = descriptor_key(descriptor.node());
         let existing = match snapshot.get(&namespace, &key).await? {
@@ -487,6 +491,7 @@ pub(crate) mod store {
             reason,
             "membership page descriptor skipped"
           );
+          skipped.push(descriptor.node().clone());
           continue;
         }
         let expected =
@@ -500,7 +505,7 @@ pub(crate) mod store {
         applied.push(descriptor.node().clone());
       }
       if operations.is_empty() {
-        return Ok(applied);
+        return Ok((applied, skipped));
       }
       let transaction = store.prepare_transaction(
         TransactionId::generate(entropy)?,
@@ -512,8 +517,8 @@ pub(crate) mod store {
         crate::CommitOutcome::Committed(_) => {
           // The committed descriptors belong in some peer's diff: the
           // write epoch turns them into a next-tick push.
-          store.note_local_write();
-          return Ok(applied);
+          store.note_local_write_tag(NODE_DESCRIPTOR_NAMESPACE);
+          return Ok((applied, skipped));
         }
         // A conflict landed nothing: one re-decide from a fresh snapshot
         // is safe, a second one surfaces to the cadence.

@@ -209,20 +209,27 @@ async fn converge(sides: [&MetadataStore; 2]) {
           break;
         }
       }
-      let mut cursor: Option<Vec<u8>> = None;
-      loop {
-        let page = member_page::sync::emit_page_ctx(emitter, cursor.as_deref(), 16)
-          .await
-          .unwrap();
-        let done = page.cursor().is_none();
-        cursor = page.cursor().map(|value| value.to_vec());
+      // The member-descriptor side: one page over the emitter's stored
+      // descriptors (the reconcile plane's row shape — the page walk is
+      // gone), applied through the same batched commit.
+      let mut descriptors = Vec::new();
+      let snapshot = emitter.snapshot().await.unwrap();
+      let namespace =
+        crate::storage::families::namespace(crate::membership::NODE_DESCRIPTOR_NAMESPACE).unwrap();
+      let mut scan = snapshot.scan_from(&namespace, &[], None).await.unwrap();
+      while let Some(entry) = scan.next().await.unwrap() {
+        if let Ok(descriptor) = crate::membership::page::decode_descriptor(entry.value().as_bytes())
+        {
+          descriptors.push(descriptor);
+        }
+      }
+      for chunk in descriptors.chunks(16) {
+        let page = member_page::MembershipPage::new(chunk.to_vec(), None).unwrap();
         applied += member_page::sync::apply_page_ctx(receiver, &SystemEntropy, &page)
           .await
           .unwrap()
+          .0
           .len();
-        if done {
-          break;
-        }
       }
     }
     if applied == 0 {

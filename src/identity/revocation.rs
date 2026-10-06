@@ -225,7 +225,7 @@ pub(crate) async fn revoke_binding_ctx(
     crate::CommitOutcome::Committed(receipt) => {
       // The persisted revocation is new tombstone evidence: the write
       // epoch arms the cadence for a next-tick push.
-      store.note_local_write();
+      store.note_local_write_tag(crate::storage::families::REVOCATION_NAMESPACE);
       Ok(RevokeStoreOutcome::Revoked(receipt))
     }
     // A raced exact revocation committed first: idempotent. Any other
@@ -274,6 +274,7 @@ pub(crate) async fn persist_revocation_ctx(
 }
 
 /// Every known revocation tombstone, bounded by `cap`, for sync
+#[cfg(test)]
 /// forwarding. Permanent records: never pruned by any GC pass.
 pub(crate) async fn known_revocation_records_ctx(
   store: &MetadataStore, cap: usize,
@@ -340,9 +341,10 @@ pub(crate) async fn purge_revocation_ctx(
   drop(snapshot);
   match store.commit(transaction).await? {
     crate::CommitOutcome::Committed(_) => {
-      // The persisted revocation is new tombstone evidence: the write
-      // epoch arms the cadence for a next-tick push.
-      store.note_local_write();
+      // The purge is still a write the tombstone lane must observe (its
+      // row set lost a member): the write epoch arms the cadence for a
+      // next-tick rescan.
+      store.note_local_write_tag(crate::storage::families::REVOCATION_NAMESPACE);
       Ok(())
     }
     // Defensive: under the exclusion this is unreachable in-process.

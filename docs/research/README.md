@@ -1,5 +1,12 @@
 # research — 同步冗余优化调研与架构方案
 
+> **周期状态：已落地（2026-10）。** 方案的全部阶段（R1–R5）已实现并通过验收：
+> 指纹索引、和解引擎与 wire v1、四泳道迁移、触发与自适应层、指南重写与归档。
+> 验收证据见 `docs/backlog.md` 的 landed 段、`scripts/verify-sync-budget.sh` 与
+> 提交历史。本目录按 `docs/README.md` 的生命周期规则作为**调研证据库与决策记录**
+> 长期保留；实现真相的唯一来源是代码与其 rustdoc（`src/reconcile/`），阅读
+> `06` 时以代码为准。
+
 本目录是「数据同步冗余策略改良」这个工作周期的**调研资料库与决策记录**：
 
 - `01-problem-baseline.md` — 现状基线：radiata 当前同步架构的还原与冗余来源的定量分析（全部结论落到源码证据）。
@@ -28,5 +35,6 @@
 ## 与 docs/ 生命周期规则的关系
 
 按 `docs/README.md` 的约定，本目录属于「驱动即将到来的工作周期的证据与计划」：
-`06-architecture-proposal.md` 中被采纳的工作项在开工时应迁入 `docs/backlog.md`
-并挂上验收 gate；调研笔记本身作为决策证据保留（或在方案完全落地后随周期归档）。
+`06-architecture-proposal.md` 中被采纳的工作项已迁入 `docs/backlog.md` 并挂上
+验收 gate，随周期落地结项（2026-10）。调研笔记与决策记录作为证据保留；实现
+真相以代码与其 rustdoc（`src/reconcile/`）为准。
