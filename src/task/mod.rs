@@ -57,6 +57,17 @@ pub enum TaskKind {
   Extension(QualifiedTag),
 }
 
+impl TaskKind {
+  /// Whether the kind's effect is awaited to its terminal phase during
+  /// node shutdown instead of being cancelled on the manager's cancel
+  /// watch: the journaled/store-atomic kinds whose outcome must settle
+  /// before teardown completes. Every other kind's effect may exit
+  /// mid-flight, leaving the task non-terminal for the process.
+  pub(crate) const fn drains_on_shutdown(&self) -> bool {
+    matches!(self, Self::Leave | Self::ResolveFrozenJournal)
+  }
+}
+
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
 /// transition ever leaves a terminal state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -319,6 +330,36 @@ impl TaskTable {
     let mut entries = self.lock()?;
     Ok(entries.get_mut(id).map(mutate))
   }
+
+  /// Evicts oldest-terminal entries beyond `keep` (the bounded
+  /// terminal history), dropping each evicted entry's consumed-once
+  /// secret with it. Id order is admission order, so the first terminal
+  /// entries encountered are the oldest; non-terminal entries are never
+  /// evicted. Called by the manager's retention pass after each
+  /// terminal transition.
+  #[allow(dead_code)] // driven by the task manager's retention pass; the runtime wiring lands with the supervisor stages
+  pub(crate) fn retain_terminal_history(&self, keep: usize) {
+    let Ok(mut entries) = self.lock() else {
+      return;
+    };
+    let excess = entries
+      .values()
+      .filter(|entry| entry.status.borrow().phase.is_terminal())
+      .count()
+      .saturating_sub(keep);
+    if excess == 0 {
+      return;
+    }
+    let evicted: Vec<TaskId> = entries
+      .iter()
+      .filter(|(_, entry)| entry.status.borrow().phase.is_terminal())
+      .map(|(id, _)| id.clone())
+      .take(excess)
+      .collect();
+    for id in evicted {
+      entries.remove(&id);
+    }
+  }
 }
 
 /// The caller's observation half over the shared task table: the table
@@ -534,7 +575,10 @@ impl<T: TaskResult> Task<T> {
 
   /// Resolves when the task reaches a terminal phase: `Ok(T)` on
   /// `Succeeded`, the typed effect error on `Failed`, and
-  /// [`ErrorKind::ShuttingDown`] if the node stops first.
+  /// [`ErrorKind::ShuttingDown`] if the node stops before the effect
+  /// settles. A kind the shutdown drain awaits to terminality
+  /// ([`TaskKind::drains_on_shutdown`]) still resolves with its real
+  /// outcome: the manager publishes it before the drain completes.
   pub async fn wait(self) -> Result<T> {
     let Some(mut status) = self.observer.table.watch(&self.id) else {
       return Err(Error::not_found("task"));
@@ -544,20 +588,20 @@ impl<T: TaskResult> Task<T> {
       if let Some(result) = resolve_terminal::<T>(&self.id, &status, &self.observer.table) {
         return result;
       }
-      tokio::select! {
-        changed = status.changed() => {
-          if changed.is_err() {
-            // The entry's watch sender only outlives the table; a
-            // dropped sender means the runtime is gone.
-            return Err(Error::shutting_down("task wait"));
-          }
+      // The task will never terminalize once either watch closes, or
+      // once the stop signal reaches a kind the drain does not await.
+      let stopped = tokio::select! {
+        changed = status.changed() => changed.is_err(),
+        changed = stop.changed() => changed.is_err() || !self.kind.drains_on_shutdown(),
+      };
+      if stopped {
+        // The terminal publication can land in the same wake as the
+        // stop signal (the manager publishes before it stops), so the
+        // outcome is still read before the typed shutdown failure.
+        if let Some(result) = resolve_terminal::<T>(&self.id, &status, &self.observer.table) {
+          return result;
         }
-        _ = stop.changed() => {
-          if let Some(result) = resolve_terminal::<T>(&self.id, &status, &self.observer.table) {
-            return result;
-          }
-          return Err(Error::shutting_down("task wait"));
-        }
+        return Err(Error::shutting_down("task wait"));
       }
     }
   }

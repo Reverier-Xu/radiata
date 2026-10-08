@@ -8,6 +8,7 @@ mod recovery;
 mod resources;
 mod retention;
 mod supervisor;
+mod task_manager;
 mod views;
 
 pub(crate) use lifecycle::{Control, LifecycleSnapshot, RuntimeClient};
