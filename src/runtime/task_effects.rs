@@ -230,7 +230,15 @@ pub(crate) async fn connect(
   extensions: &ExtensionRegistry, tasks: &TaskClient, receiver: Endpoint, peer: NodeId,
 ) -> Result<Task<NodeId>> {
   let transport = extensions.resolve_transport(&receiver.selector())?;
-  let payload = TaskPayload::Peer(peer.clone());
+  // The endpoint rides the payload, not just the effect closure: a
+  // coalesced submission joins the in-flight dial only when the whole
+  // intent (endpoint and peer) equals the in-flight one — a different
+  // endpoint for the same peer conflicts instead of silently riding a
+  // dial to the old endpoint.
+  let payload = TaskPayload::PeerDial {
+    endpoint: receiver.clone(),
+    peer: peer.clone(),
+  };
   let effect: TaskEffect = Arc::new(move |deps, _attempt| {
     let transport = Arc::clone(&transport);
     let receiver = receiver.clone();

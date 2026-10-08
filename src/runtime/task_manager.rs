@@ -231,9 +231,18 @@ pub(crate) type TaskEffect = Arc<
 pub(crate) enum TaskPayload {
   /// No coalescing subject: the kind never coalesces.
   None,
-  /// The coalescing subject: the dialed peer for Connect/Disconnect,
-  /// the acted-on node for Revoke/PurgeRevocation/Cleanup.
+  /// The coalescing subject: the dialed peer for Disconnect, the
+  /// acted-on node for Revoke/PurgeRevocation/Cleanup. The whole dial
+  /// intent is the payload, so coalescing compares it too.
   Peer(NodeId),
+  /// The full dial intent for Connect: the endpoint plus the dialed
+  /// peer. The endpoint is part of the compared payload — a coalesced
+  /// submission may join an in-flight dial only when it targets the
+  /// same endpoint, never silently smuggle a different one.
+  PeerDial {
+    endpoint: crate::Endpoint,
+    peer: NodeId,
+  },
 }
 
 /// One admitted task's immutable intent: the kind plus the payload the
@@ -261,14 +270,14 @@ impl TaskSpec {
   /// (only crate-internal wiring builds specs, so a miss is the typed
   /// internal invariant, never caller data).
   pub(crate) fn check_shape(&self) -> Result<()> {
+    let requires_dial = matches!(self.kind, TaskKind::Connect);
     let requires_subject = matches!(
       self.kind,
-      TaskKind::Connect
-        | TaskKind::Disconnect
-        | TaskKind::Revoke
-        | TaskKind::PurgeRevocation
-        | TaskKind::Cleanup
+      TaskKind::Disconnect | TaskKind::Revoke | TaskKind::PurgeRevocation | TaskKind::Cleanup,
     );
+    if requires_dial && !matches!(self.payload, TaskPayload::PeerDial { .. }) {
+      return Err(Error::internal("task coalescing subject"));
+    }
     if requires_subject && !matches!(self.payload, TaskPayload::Peer(_)) {
       return Err(Error::internal("task coalescing subject"));
     }
@@ -278,14 +287,18 @@ impl TaskSpec {
   /// The coalescing subject, when the kind coalesces.
   pub(crate) fn coalesce_key(&self) -> Option<NodeId> {
     match &self.kind {
-      TaskKind::Connect
-      | TaskKind::Disconnect
-      | TaskKind::Revoke
-      | TaskKind::PurgeRevocation
-      | TaskKind::Cleanup => match &self.payload {
+      TaskKind::Connect => match &self.payload {
+        TaskPayload::PeerDial { peer, .. } => Some(peer.clone()),
         TaskPayload::Peer(subject) => Some(subject.clone()),
         TaskPayload::None => None,
       },
+      TaskKind::Disconnect | TaskKind::Revoke | TaskKind::PurgeRevocation | TaskKind::Cleanup => {
+        match &self.payload {
+          TaskPayload::Peer(subject) => Some(subject.clone()),
+          TaskPayload::PeerDial { peer, .. } => Some(peer.clone()),
+          TaskPayload::None => None,
+        }
+      }
       _ => None,
     }
   }
@@ -1554,7 +1567,12 @@ mod tests {
   async fn coalescing_returns_the_in_flight_task_id() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
     let peer = node('p');
-    let spec = TaskSpec::new(TaskKind::Connect, TaskPayload::Peer(peer.clone()));
+    let endpoint = crate::Endpoint::parse("wss://coalesce.test:1000").expect("endpoint");
+    let dial = |peer: NodeId, port: u16| TaskPayload::PeerDial {
+      endpoint: crate::Endpoint::parse(&format!("wss://coalesce.test:{port}")).expect("endpoint"),
+      peer,
+    };
+    let spec = TaskSpec::new(TaskKind::Connect, dial(peer.clone(), 1000));
     let first = client
       .submit(spec.clone(), wedged_effect())
       .await
@@ -1565,10 +1583,21 @@ mod tests {
       .await
       .expect("coalesced admission");
     assert_eq!(first, second);
+    // The same peer behind a different endpoint is a different intent:
+    // it conflicts instead of silently riding the in-flight dial.
+    let smuggle = client
+      .submit(
+        TaskSpec::new(TaskKind::Connect, dial(peer.clone(), 2000)),
+        wedged_effect(),
+      )
+      .await
+      .expect_err("different endpoint conflicts");
+    assert_eq!(smuggle.kind(), ErrorKind::Conflict);
+    assert_eq!(smuggle.context(), "task in flight");
     // A different subject: a distinct task.
     let other = client
       .submit(
-        TaskSpec::new(TaskKind::Connect, TaskPayload::Peer(node('q'))),
+        TaskSpec::new(TaskKind::Connect, dial(node('q'), 1000)),
         wedged_effect(),
       )
       .await
@@ -1587,7 +1616,7 @@ mod tests {
     // task (the coalescing window closes with terminality).
     let quick = client
       .submit(
-        TaskSpec::new(TaskKind::Connect, TaskPayload::Peer(node('z'))),
+        TaskSpec::new(TaskKind::Connect, dial(node('z'), 1000)),
         ok_effect(TaskOutput::Connect(node('z'))),
       )
       .await
@@ -1603,13 +1632,13 @@ mod tests {
     // never re-reads) a terminal task's outcome.
     let resubmitted = client
       .submit(
-        TaskSpec::new(TaskKind::Connect, TaskPayload::Peer(node('z'))),
+        TaskSpec::new(TaskKind::Connect, dial(node('z'), 1000)),
         wedged_effect(),
       )
       .await
       .expect("fresh admission after terminality");
     assert_ne!(quick, resubmitted);
-    let _ = first; // the wedged first task stays non-terminal for the rest of the test
+    let _ = (first, endpoint); // the wedged first task stays non-terminal for the rest of the test
   }
 
   #[tokio::test]
