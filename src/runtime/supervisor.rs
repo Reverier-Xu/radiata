@@ -43,9 +43,10 @@ use super::degree::DEGREE_MAINTENANCE_TICK_PERIOD;
 /// `PACKET_CHANNEL_CAPACITY` derives from it so one bound governs both
 /// control ends.
 ///
-/// The bounded request channel for `RunSyncRound` commands: rounds are
-/// self-limiting (one page per session per round), so a small queue with
-/// typed backpressure matches the work.
+/// The bounded channel for immediate sync-round requests forwarded to
+/// the sync driver (the cursor owner; the `SyncRound` task effect holds
+/// a sender): rounds are self-limiting (one page per session per
+/// round), so a small queue with typed backpressure matches the work.
 pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
@@ -915,10 +916,11 @@ mod dial_deadline_tests {
   /// A peer that accepts TCP and then goes silent must surface the typed
   /// dial failure within the configured deadline instead of hanging the
   /// dialer. This exercises the one helper every production dial path
-  /// shares (`merge_cluster`, `connect_member`, and the detached
-  /// recovery dials through `dial_member`); the regression it guards is
-  /// a connect with no bound at all, which stalled the supervisor's
-  /// control loop and pinned recovery slots forever.
+  /// shares (`reconcile_join`, and `reconcile_connect` plus the detached
+  /// recovery and connection-degree dials through `dial_member`); the
+  /// regression it guards is a connect with no bound at all, which
+  /// stalled the supervisor's control loop and pinned recovery slots
+  /// forever.
   #[tokio::test]
   async fn a_silent_peer_fails_the_dial_within_the_deadline() {
     // The listener accepts and then holds the socket without ever
