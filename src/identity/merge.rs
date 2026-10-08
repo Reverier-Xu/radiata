@@ -25,7 +25,7 @@ use super::{
     CredentialUseV1, GenerationId, IdentityBindingV1, MergeGrantV1, MergeId, credential_use_key,
     identity_binding_key, local_identity_key, merge_grant_key,
   },
-  signature::{MERGE_GRANT_V1_DOMAIN, signature_message},
+  signature::{MERGE_GRANT_DOMAIN, signature_message},
 };
 use crate::{
   Error, NodeId, PublicKey, Result, StoreExpectation, StoreOperation, StoreValue, TransactionId,
@@ -197,7 +197,7 @@ pub(crate) async fn commit_merge(
   let signature = keys
     .sign(
       identity.handle(),
-      &signature_message(MERGE_GRANT_V1_DOMAIN, &body),
+      &signature_message(MERGE_GRANT_DOMAIN, &body),
     )
     .await?;
   let grant = MergeGrantV1::new(
@@ -621,7 +621,7 @@ mod tests {
         CredentialUseV1, GenerationId, MergeGrantV1, MergeId, credential_use_key,
         identity_binding_key, merge_grant_key,
       },
-      signature::MERGE_GRANT_V1_DOMAIN,
+      signature::MERGE_GRANT_DOMAIN,
       testing::{
         CommitFault, CommitFault::Pass, FaultingFactory, ScriptedKeys, SequenceEntropy, SignScript,
         assert_never_deleted, commit_calls, entry, fresh_reference, node, open_context,
@@ -1329,7 +1329,7 @@ mod tests {
     )
     .unwrap();
     let signature = issuer_signing.sign(&crate::identity::signature::signature_message(
-      MERGE_GRANT_V1_DOMAIN,
+      MERGE_GRANT_DOMAIN,
       &body,
     ));
     MergeGrantV1::new(

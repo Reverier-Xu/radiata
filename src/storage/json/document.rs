@@ -14,9 +14,9 @@ use crate::{
   hex::{decode as hex_decode_bytes, decode_array as hex_decode, encode as hex_encode},
 };
 
-pub(super) const GENERATION_SCHEMA: &str = "radiata.woooo.tech/schemas/json-generation-v1";
-pub(super) const STORE_SCHEMA: &str = "radiata.woooo.tech/schemas/json-store-v1";
-pub(super) const LOCK_SCHEMA: &str = "radiata.woooo.tech/schemas/json-store-lock-v1";
+pub(super) const GENERATION_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/json-generation";
+pub(super) const STORE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/json-store";
+pub(super) const LOCK_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/json-store-lock";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

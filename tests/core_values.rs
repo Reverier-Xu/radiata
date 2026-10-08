@@ -76,7 +76,7 @@ fn core_tags_reject_noncanonical_namespaces() {
     "example.com/features/work-",
     "example.com/features/work/extra",
     "example.com/features/wörk",
-    "radiata.woooo.tech/crypto/admission-grant-v1",
+    "radiata.woooo.tech/crypto/v1/admission-grant",
     // Canonical domains only: the trailing dot, uppercase spellings, and
     // underscores all parse as DNS grammar but must not become tag
     // identities.
@@ -92,8 +92,8 @@ fn core_tags_reject_noncanonical_namespaces() {
   // non-canonical spelling: every case or dot variant is rejected before
   // any reserved comparison sees it.
   for value in [
-    "RADIATA.WOOOO.TECH/crypto/session-v1",
-    "radiata.woooo.tech./crypto/session-v1",
+    "RADIATA.WOOOO.TECH/crypto/v1/session",
+    "radiata.woooo.tech./crypto/v1/session",
   ] {
     assert!(QualifiedTag::parse(value).is_err(), "accepted {value:?}");
   }

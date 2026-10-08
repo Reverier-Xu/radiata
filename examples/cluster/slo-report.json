@@ -1,5 +1,5 @@
 {
-  "schema": "radiata.woooo.tech/schemas/slo-report-v1",
+  "schema": "radiata.woooo.tech/schemas/v1/slo-report",
   "profile": {
     "members": 9,
     "deadline_ms": 10000,

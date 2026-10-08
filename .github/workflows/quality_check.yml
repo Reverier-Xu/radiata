@@ -790,7 +790,7 @@ jobs:
             esac
           done
           jq -n \
-            --arg schema "radiata.woooo.tech/schemas/dependency-duplicates-v1" \
+            --arg schema "radiata.woooo.tech/schemas/v1/dependency-duplicates" \
             --rawfile duplicates target/dependency-duplicates.txt \
             '{schema: $schema, duplicates: $duplicates}' \
             > target/dependency-duplicates.json

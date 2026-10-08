@@ -252,7 +252,7 @@ fn append_ledger(
     .join(",");
   let record = format!(
     concat!(
-      "{{\"schema\":\"radiata.woooo.tech/schemas/soak-attempt-v1\",",
+      "{{\"schema\":\"radiata.woooo.tech/schemas/v1/soak-attempt\",",
       "\"commit\":\"{}\",\"predecessor\":\"{}\",\"retry\":\"complete\",",
       "\"duration_secs\":{},\"packets_sent\":{},",
       "\"packets_received\":{},\"resources_written\":{},\"reconnects\":{},",
