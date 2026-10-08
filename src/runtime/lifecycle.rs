@@ -154,10 +154,6 @@ pub(crate) enum Control {
     expected: crate::ResourceVersion,
     reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
   },
-  LeaveCluster {
-    acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
-    reply: oneshot::Sender<Result<crate::LeaveOutcome>>,
-  },
   Observability {
     reply: oneshot::Sender<Result<crate::ObservabilitySnapshot>>,
   },

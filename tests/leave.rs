@@ -239,6 +239,9 @@ async fn leave_replaces_identity_and_shuts_down_with_active_leave() {
   let outcome = handle
     .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   assert_eq!(outcome.former_identity(), &former);
   assert_ne!(outcome.former_identity(), outcome.replacement_identity());
@@ -319,6 +322,9 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   let started = std::time::Instant::now();
   let outcome = leaver
     .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(outcome.former_identity(), &former);
@@ -432,6 +438,9 @@ async fn recovery_quiesces_after_a_member_departs() {
   tokio::time::sleep(Duration::from_secs(5)).await;
 
   c.leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -579,6 +588,9 @@ async fn leave_without_peers_completes_without_waiting() {
     .unwrap();
   let outcome = handle
     .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_ne!(outcome.former_identity(), outcome.replacement_identity());
@@ -779,6 +791,9 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
     former_handle_bytes = former.clone();
     let outcome = handle
       .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap();
     assert_eq!(outcome.former_identity(), &former_handle_bytes);

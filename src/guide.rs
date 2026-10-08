@@ -509,8 +509,10 @@
 //! let outcome = node
 //!     .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
 //!     .await?;
-//! // Durable from here: the node shuts itself down with the
-//! // active-leave reason and restarts as the replacement identity.
+//! // The task's `wait` resolves with the outcome before the
+//! // active-leave teardown begins: durable from here, the node shuts
+//! // itself down and restarts as the replacement identity.
+//! let outcome = outcome.wait().await?;
 //! # let _ = (outcome.former_identity(), outcome.replacement_identity());
 //! # Ok(())
 //! # }

@@ -1,6 +1,5 @@
 mod anti_entropy;
 mod degree;
-mod identity_ops;
 mod lifecycle;
 mod listeners;
 mod packets;
@@ -17,6 +16,6 @@ pub(crate) use supervisor::{
   PACKET_CHANNEL_CAPACITY, RuntimeDependencies, SYNC_ROUND_CHANNEL_CAPACITY, spawn_runtime,
 };
 pub(crate) use task_effects::{
-  cleanup, connect, disconnect, issue_cleanup_checkpoint, join, purge_revocation,
+  cleanup, connect, disconnect, issue_cleanup_checkpoint, join, leave, purge_revocation,
   resolve_frozen_journal, revoke,
 };

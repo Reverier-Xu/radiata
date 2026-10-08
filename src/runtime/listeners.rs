@@ -159,24 +159,39 @@ impl Supervisor {
   pub(super) async fn stop_listener(
     &mut self, listener: &crate::identity::ListenerId,
   ) -> Result<()> {
-    let removed = self
-      .dependencies
-      .listeners
-      .lock()
-      .map_err(|_| Error::internal("listener registry"))?
-      .remove(listener);
-    let Some((endpoint, listener_handle, abort)) = removed else {
-      return Err(Error::not_found("listener"));
-    };
-    // Close only wakes the pending accept so it observes the shutdown;
-    // the address is released by dropping the listener — the removal
-    // above and the aborted accept task drop the last owners, so a
-    // later rebind on the same port works.
-    let _ = listener_handle.close().await;
-    abort.abort();
-    if let Ok(mut endpoints) = self.published_endpoints.lock() {
-      endpoints.retain(|candidate| candidate != &endpoint);
-    }
-    Ok(())
+    stop_listener(
+      &self.dependencies.listeners,
+      &self.published_endpoints,
+      listener,
+    )
+    .await
   }
+}
+
+/// Tears one bound listener down: removes the registry entry, wakes and
+/// aborts the accept loop, and unpublishes the advertised endpoint.
+/// Shared by the supervisor's `StopListener` command and the leave
+/// effect's network teardown, so both mutate the one registry.
+pub(super) async fn stop_listener(
+  listeners: &super::supervisor::ListenerRegistry,
+  published_endpoints: &std::sync::Arc<std::sync::Mutex<Vec<Endpoint>>>,
+  listener: &crate::identity::ListenerId,
+) -> Result<()> {
+  let removed = listeners
+    .lock()
+    .map_err(|_| Error::internal("listener registry"))?
+    .remove(listener);
+  let Some((endpoint, listener_handle, abort)) = removed else {
+    return Err(Error::not_found("listener"));
+  };
+  // Close only wakes the pending accept so it observes the shutdown;
+  // the address is released by dropping the listener — the removal
+  // above and the aborted accept task drop the last owners, so a
+  // later rebind on the same port works.
+  let _ = listener_handle.close().await;
+  abort.abort();
+  if let Ok(mut endpoints) = published_endpoints.lock() {
+    endpoints.retain(|candidate| candidate != &endpoint);
+  }
+  Ok(())
 }

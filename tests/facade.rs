@@ -440,6 +440,9 @@ async fn resources_revoke_and_leave() {
     .handle
     .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
     .await

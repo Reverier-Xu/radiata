@@ -209,26 +209,28 @@ impl NodeHandle {
   /// metadata and key through the journaled custody protocols, and shuts
   /// the node down with [`ShutdownReason::ActiveLeave`]. The explicit
   /// acknowledgement makes the identity replacement and metadata deletion
-  /// a deliberate caller decision.
+  /// a deliberate caller decision. Returns the admitted [`Task`], whose
+  /// `wait` resolves with the outcome; the active-leave shutdown starts
+  /// only after the task terminalizes, and the terminal publication
+  /// precedes the shutdown signal, so `wait` always observes the outcome
+  /// before any teardown begins.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node, a
+  /// missing acknowledgement marker, a second leave while one is in
+  /// flight); the frozen-store refusal and every journal/teardown failure
+  /// are effect-time and surface on the task's `wait`.
   ///
   /// The leave is journaled before any network effect, and once the
   /// journal commits there is no abort: a crash or a restart mid-leave
   /// resumes from the durable record and completes the replacement, so
   /// the node never boots as the former identity again. Treat this as
-  /// the point of no return for that node slot: the returned
-  /// [`LeaveOutcome`](crate::LeaveOutcome) names the exact former and
-  /// replacement identities, and the same storage restarted afterwards
-  /// boots the replacement.
+  /// the point of no return for that node slot: the outcome names the
+  /// exact former and replacement identities, and the same storage
+  /// restarted afterwards boots the replacement.
   pub async fn leave(
     &self, acknowledgement: ReplaceIdentityAndDeleteOldCoreMetadata,
-  ) -> Result<LeaveOutcome> {
-    self
-      .runtime
-      .send_command(move |reply| Control::LeaveCluster {
-        acknowledgement,
-        reply,
-      })
-      .await
+  ) -> Result<Task<LeaveOutcome>> {
+    crate::runtime::leave(self.runtime.admit()?, acknowledgement).await
   }
 
   /// Connects to an already-admitted peer using key trust only: no

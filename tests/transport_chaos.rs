@@ -1167,9 +1167,15 @@ async fn sixty_four_node_mixed_transport_chaos() {
     // Leave: acknowledged replacement, old identity tombstoned, node
     // shuts down with the active-leave reason.
     let outcome = bounded(
-      slots[leaver]
-        .handle()
-        .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new()),
+      async {
+        slots[leaver]
+          .handle()
+          .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
+          .await
+          .unwrap()
+          .wait()
+          .await
+      },
       "leave cluster",
     )
     .await

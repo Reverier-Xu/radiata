@@ -1093,11 +1093,18 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // conflict retries with a bound (the harness precedent).
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   let outcome: LeaveOutcome = loop {
-    match issuer
+    // The ladder covers both halves of the migrated leave: the
+    // admission (a leave already in flight conflicts) and the effect
+    // (a store race refuses typed and is re-admitted).
+    let left = match issuer
       .handle
       .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match left {
       Ok(outcome) => break outcome,
       Err(error) if error.kind() == radiata::ErrorKind::Conflict => {
         assert!(

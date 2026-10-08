@@ -369,8 +369,8 @@ struct ManagerShared {
   #[allow(dead_code)] // read by the listener effects; that migration stage lands next
   listeners: super::supervisor::ListenerRegistry,
   /// The leave completion signal, sent once the leave task terminalized
-  /// (the supervisor owns the receiver).
-  #[allow(dead_code)] // sent by the leave verb's reconciliation; that stage lands next
+  /// with success (the supervisor owns the receiver and answers with the
+  /// active-leave shutdown).
   leave_complete: mpsc::Sender<()>,
   semaphore: Arc<Semaphore>,
 }
@@ -558,8 +558,10 @@ struct RetryTicket {
 /// worker's last action; the terminal publications themselves already
 /// ran inside the worker's own future.
 enum WorkerReport {
-  /// The task terminalized (success or typed failure).
-  Terminal(TaskId),
+  /// The task terminalized (success or typed failure); `succeeded`
+  /// distinguishes the terminal phase — the leave completion signal
+  /// fires on success only, exactly like the verb's old inline shutdown.
+  Terminal { id: TaskId, succeeded: bool },
   /// The attempt failed retryably; re-spawn after the delay.
   Retry {
     id: TaskId,
@@ -684,10 +686,19 @@ async fn run_manager(
       LoopEvent::Report(Some(report)) => {
         outstanding -= 1;
         match report {
-          WorkerReport::Terminal(id) => {
+          WorkerReport::Terminal { id, succeeded } => {
             coalescing.retain(|_, (in_flight, _)| in_flight != &id);
             if leave_task.as_ref() == Some(&id) {
               leave_task = None;
+              if succeeded {
+                // The supervisor's active-leave shutdown starts here. The
+                // terminal publication already landed inside the attempt
+                // body, so every `wait` caller observed the outcome before
+                // any teardown begins. The channel is capacity-one and a
+                // leave is once-per-incarnation, so a refused send only
+                // means the supervisor is already shutting down.
+                let _ = shared.leave_complete.try_send(());
+              }
             }
             shared.table.retain_terminal_history(TASK_TERMINAL_HISTORY);
           }
@@ -779,21 +790,37 @@ fn admit_inner(
   spec.check_shape()?;
   let kind = spec.kind().clone();
   // Coalescing: kind + subject, accepted only when the whole spec
-  // equals the in-flight one.
+  // equals the in-flight one. A task's terminal publication (which
+  // wakes every `wait`) lands inside its attempt body, before this
+  // loop processes the worker's terminal report — so the bookkeeping
+  // can still name a task the table already shows terminal. The table
+  // is the phase's single truth: a terminal candidate is no longer in
+  // flight, and its stale entry is dropped in favor of a fresh
+  // admission.
+  let in_flight = |id: &TaskId| {
+    shared
+      .table
+      .status(id)
+      .is_some_and(|(_, status)| !status.phase().is_terminal())
+  };
   if let Some(subject) = spec.coalesce_key() {
     let key = (kind.clone(), subject);
-    if let Some((existing, in_flight_spec)) = coalescing.get(&key)
-      && *in_flight_spec == *spec
-    {
-      return Ok(existing.clone());
-    }
-    // A same-subject but different-intent submission conflicts while
-    // the in-flight task runs.
-    if coalescing.contains_key(&key) {
-      return Err(Error::conflict("task in flight"));
+    if let Some((existing, in_flight_spec)) = coalescing.get(&key).cloned() {
+      if in_flight(&existing) {
+        // A same-subject, same-intent submission joins the in-flight
+        // task; a different intent conflicts while it runs.
+        if in_flight_spec == *spec {
+          return Ok(existing);
+        }
+        return Err(Error::conflict("task in flight"));
+      }
+      coalescing.remove(&key);
     }
   }
-  if matches!(kind, TaskKind::Leave) && leave_task.is_some() {
+  if matches!(kind, TaskKind::Leave)
+    && let Some(existing) = leave_task.clone()
+    && in_flight(&existing)
+  {
     return Err(Error::conflict("task in flight"));
   }
   let next = *counter;
@@ -882,7 +909,10 @@ impl Worker {
             Error::internal("task reconcile permit"),
           )
           .await;
-        return WorkerReport::Terminal(self.id);
+        return WorkerReport::Terminal {
+          id: self.id,
+          succeeded: false,
+        };
       }
     };
     // The whole attempt body — the `Running` publication, its transition
@@ -911,7 +941,10 @@ impl Worker {
       body.await
     };
     match joined {
-      Ok(AttemptOutcome::Terminal) => WorkerReport::Terminal(self.id),
+      Ok(AttemptOutcome::Terminal { succeeded }) => WorkerReport::Terminal {
+        id: self.id,
+        succeeded,
+      },
       Ok(AttemptOutcome::Retry { delay }) => WorkerReport::Retry {
         id: self.id,
         kind: self.kind,
@@ -932,7 +965,10 @@ impl Worker {
           Error::internal("reconciler cancelled")
         };
         self.shared.publish_panicked(&self.id, &self.kind, failure);
-        WorkerReport::Terminal(self.id)
+        WorkerReport::Terminal {
+          id: self.id,
+          succeeded: false,
+        }
       }
     }
   }
@@ -941,8 +977,9 @@ impl Worker {
 /// One attempt body, run as its own spawned task (see
 /// [`Worker::run_attempt`]).
 enum AttemptOutcome {
-  /// The task terminalized (succeeded, or failed its last attempt).
-  Terminal,
+  /// The task terminalized; `succeeded` distinguishes the terminal
+  /// phase.
+  Terminal { succeeded: bool },
   /// The attempt failed retryably; the manager re-arms the delay.
   Retry { delay: Duration },
 }
@@ -964,7 +1001,7 @@ impl Attempt {
     {
       // The entry is gone (evicted terminal history) or its lock is
       // poisoned: there is no state left to publish onto.
-      return AttemptOutcome::Terminal;
+      return AttemptOutcome::Terminal { succeeded: false };
     }
     match (self.effect)(Arc::clone(&self.shared.operations), self.attempt).await {
       Ok(EffectOutcome { output, secret }) => {
@@ -972,7 +1009,7 @@ impl Attempt {
           .shared
           .publish_success(&self.id, &self.kind, output, secret)
           .await;
-        AttemptOutcome::Terminal
+        AttemptOutcome::Terminal { succeeded: true }
       }
       Err(error) => {
         let policy = retry_policy(&self.kind);
@@ -985,7 +1022,7 @@ impl Attempt {
             .shared
             .publish_failure(&self.id, &self.kind, error)
             .await;
-          AttemptOutcome::Terminal
+          AttemptOutcome::Terminal { succeeded: false }
         }
       }
     }
@@ -1494,24 +1531,74 @@ mod tests {
       .wait()
       .await
       .expect("terminal");
+    // A same-subject re-submission right after the terminal publication
+    // is a fresh task even when the manager loop has not yet processed
+    // the terminal report: the table's phase is the single truth, so a
+    // `wait` caller that immediately re-submits never rejoins (and
+    // never re-reads) a terminal task's outcome.
+    let resubmitted = client
+      .submit(
+        TaskSpec::new(TaskKind::Connect, TaskPayload::Peer(node('z'))),
+        wedged_effect(),
+      )
+      .await
+      .expect("fresh admission after terminality");
+    assert_ne!(quick, resubmitted);
     let _ = first; // the wedged first task stays non-terminal for the rest of the test
   }
 
   #[tokio::test]
   async fn leave_is_exclusive_while_in_flight() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let spec = TaskSpec::new(TaskKind::Leave, TaskPayload::None);
+    // A gated leave: terminalizes only when released, so the exclusivity
+    // window is deterministic. `Notify::notify_one` stores its permit, so
+    // the release is not lost to a gate that has not subscribed yet.
+    let release = Arc::new(Notify::new());
+    let gate = release.clone();
     let first = client
-      .submit(spec.clone(), wedged_effect())
+      .submit(
+        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        Arc::new(move |_deps, _attempt| {
+          let gate = gate.clone();
+          Box::pin(async move {
+            gate.notified().await;
+            Err(Error::from_parts(
+              ErrorKind::NotReady,
+              "scripted leave failure",
+            ))
+          })
+        }),
+      )
       .await
       .expect("admission");
     let conflict = client
-      .submit(spec, wedged_effect())
+      .submit(
+        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        wedged_effect(),
+      )
       .await
       .expect_err("leave exclusivity");
     assert_eq!(conflict.kind(), ErrorKind::Conflict);
     assert_eq!(conflict.context(), "task in flight");
-    let _ = first;
+    // Release the gated leave to its typed failure (the `ONCE` policy
+    // never retries it): the exclusivity window closes with
+    // terminality — the table's phase is the single truth, so the
+    // re-issue never waits on the manager's report processing. A
+    // successful leave shuts the node down, so only the failed leave
+    // has a re-issue path at all.
+    release.notify_one();
+    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::Leave)
+      .wait()
+      .await
+      .expect_err("scripted leave failure");
+    let reissued = client
+      .submit(
+        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        wedged_effect(),
+      )
+      .await
+      .expect("re-issue after a failed leave");
+    assert_ne!(first, reissued);
   }
 
   #[tokio::test]

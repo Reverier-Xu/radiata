@@ -506,28 +506,6 @@ async fn supervise(
         let result = supervisor.remove_resource(name, expected).await;
         let _ = reply.send(result);
       }
-      Control::LeaveCluster {
-        acknowledgement,
-        reply,
-      } => {
-        match supervisor.leave_cluster(acknowledgement).await {
-          Ok(outcome) => {
-            handle_leave(
-              outcome,
-              reply,
-              supervisor.into_dependencies(),
-              control,
-              tasks,
-              &mut lifecycle,
-            )
-            .await;
-            return;
-          }
-          Err(error) => {
-            let _ = reply.send(Err(error));
-          }
-        }
-      }
       Control::Observability { reply } => {
         let result = supervisor.observability_snapshot(&tasks).await;
         let _ = reply.send(result);
@@ -592,31 +570,11 @@ async fn supervise(
   .await;
 }
 
-/// The `LeaveCluster` shutdown sequence, hoisted out of the select arm so
-/// the arm stays symmetric with the observation arms: the leave outcome
-/// reaches the caller before teardown begins, then the runtime drains and
-/// shuts down with the active-leave reason. Consumes the control loop and
-/// task set, so `supervise` returns right after.
-async fn handle_leave(
-  outcome: crate::LeaveOutcome, reply: oneshot::Sender<Result<crate::LeaveOutcome>>,
-  (dependencies, drained): (RuntimeDependencies, Vec<tokio::task::JoinHandle<()>>),
-  control: mpsc::Receiver<Control>, tasks: JoinSet<()>, lifecycle: &mut LifecyclePublisher,
-) {
-  // The outcome reaches the caller before teardown begins; the node then
-  // shuts down with the active-leave reason.
-  let _ = reply.send(Ok(outcome));
-  finish_shutdown(
-    control,
-    tasks,
-    dependencies,
-    drained,
-    lifecycle,
-    None,
-    ShutdownReason::ActiveLeave,
-  )
-  .await;
-}
-
+/// The shutdown sequence shared by the explicit, fatal, and active-leave
+/// exits: the control channel closes, the task manager drains (the
+/// journaled kinds run to their terminal phase), the runtime's own task
+/// set tears down, and every queued shutdown reply answers with the one
+/// reason.
 async fn finish_shutdown(
   mut control: mpsc::Receiver<Control>, mut tasks: JoinSet<()>,
   mut dependencies: RuntimeDependencies, drained: Vec<tokio::task::JoinHandle<()>>,
@@ -790,20 +748,21 @@ impl Supervisor {
         dependencies,
       )));
     };
-    let (packet, driver, shutdown_tx, exclusion_cache) = match operations.planes() {
-      Ok(planes) => (
-        Arc::clone(&planes.packet),
-        planes.driver.clone(),
-        planes.shutdown.clone(),
-        Arc::clone(&planes.exclusion_cache),
-      ),
-      Err(error) => return Err(Box::new((error, dependencies))),
-    };
+    let (packet, driver, shutdown_tx, exclusion_cache, published_endpoints) =
+      match operations.planes() {
+        Ok(planes) => (
+          Arc::clone(&planes.packet),
+          planes.driver.clone(),
+          planes.shutdown.clone(),
+          Arc::clone(&planes.exclusion_cache),
+          Arc::clone(&planes.published_endpoints),
+        ),
+        Err(error) => return Err(Box::new((error, dependencies))),
+      };
     let route_capacity = dependencies.config.trace_metadata_limits().active();
     let sync_context = Arc::clone(&context);
     // The membership sync protocol was registered by `spawn_runtime`
     // before the runtime was marked ready.
-    let published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>> = Arc::default();
     let sync_driver = Some(spawn_sync_driver(
       &sync_context,
       dependencies.entropy.clone(),

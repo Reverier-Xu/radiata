@@ -66,7 +66,6 @@ pub(crate) struct EffectPlanes {
   /// The live authenticated sessions.
   pub(crate) sessions: SessionTable,
   /// The in-memory route records the leave announcement dispatches over.
-  #[allow(dead_code)] // read by the leave-effect stage; that migration lands next
   pub(crate) routes: crate::routing::RouteTable,
   /// The graceful-shutdown signal every kept session observes.
   pub(crate) shutdown: watch::Sender<()>,
@@ -76,15 +75,12 @@ pub(crate) struct EffectPlanes {
   /// events the identity effects emit.
   pub(crate) member_revision: MemberRevisionSignal,
   /// The leave-plane applied-receipt signal the announcement parks on.
-  #[allow(dead_code)] // read by the leave-effect stage; that migration lands next
   pub(crate) leave_applied: crate::membership::sync::LeaveAppliedSignal,
   /// The node's bound listeners: the listen/stop effects mutate the same
   /// registry the supervisor's pages read.
-  #[allow(dead_code)] // torn down by the leave-effect stage; that migration lands next
   pub(crate) listeners: ListenerRegistry,
   /// The advertised endpoints the listeners publish (never the bound
   /// wildcard sockets).
-  #[allow(dead_code)] // unpublished by the leave-effect stage; that migration lands next
   pub(crate) published_endpoints: Arc<Mutex<Vec<Endpoint>>>,
   /// The memoized departed-members exclusion set, shared with the
   /// supervisor's own pages: the checkpoint guard reads the same cache.
@@ -651,4 +647,108 @@ async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
     return Err(Error::not_ready("cleanup checkpoint"));
   }
   Ok(())
+}
+
+// -- the leave verb ------------------------------------------------------
+
+/// Admits one acknowledged active leave. The effect journals the intent,
+/// announces the leave, tears the network down, replaces the identity,
+/// wipes the old core metadata, and deletes the old key; the node then
+/// shuts down with the active-leave reason.
+///
+/// Admission-time failures are the pure shape checks (a stopped node, a
+/// missing acknowledgement marker, a second leave while one is in
+/// flight — [`crate::ErrorKind::Conflict`]); the frozen-store refusal
+/// and every journal/teardown failure are effect-time and surface on the
+/// task's [`Task::wait`].
+pub(crate) async fn leave(
+  tasks: &TaskClient, acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
+) -> Result<Task<crate::LeaveOutcome>> {
+  // The acknowledgement is a proof-of-construction marker: only the
+  // deliberate constructor produces it.
+  if !acknowledgement.is_acknowledged() {
+    return Err(Error::invalid_input("leave acknowledgement"));
+  }
+  let effect: TaskEffect =
+    Arc::new(|deps, _attempt| Box::pin(async move { reconcile_leave(deps).await }));
+  let id = tasks
+    .submit(TaskSpec::new(TaskKind::Leave, TaskPayload::None), effect)
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::Leave,
+    tasks.observer.clone(),
+  ))
+}
+
+/// The leave effect: crash-retryable ordering — journal the intent and the
+/// signed record before any network effect, announce with the journaled
+/// record, tear the network down, then rotate. A crash anywhere before
+/// rotation resumes at startup with the same journaled record, so the
+/// leave is never forgotten and never diverges from what peers may
+/// already hold. A receipt-less budget expires into the documented
+/// silent leave, which the cleanup path covers. The task's terminal
+/// publication lands before the manager signals the supervisor's
+/// active-leave shutdown, so a `wait` caller always observes the outcome
+/// before any teardown begins.
+async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  let context = &planes.context;
+  let journaled =
+    crate::identity::leave::journal_leave(context, context.keys(), planes.entropy.as_ref()).await?;
+  crate::membership::sync::announce_leave(
+    context,
+    &planes.entropy,
+    &journaled.record,
+    &planes.sessions,
+    &planes.routes,
+    deps.events(),
+    &planes.leave_applied,
+  )
+  .await?;
+
+  // Network teardown first: no new sessions or inbound metadata while
+  // the identity is replaced and the old metadata is wiped.
+  let listener_ids: Vec<crate::identity::ListenerId> = planes
+    .listeners
+    .lock()
+    .map_err(|_| Error::internal("listener registry"))?
+    .keys()
+    .cloned()
+    .collect();
+  for listener in listener_ids {
+    super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
+      .await?;
+  }
+  let peers: Vec<NodeId> = planes
+    .sessions
+    .lock()
+    .map_err(Error::session_table)?
+    .keys()
+    .cloned()
+    .collect();
+  for peer in peers {
+    retire_session(&planes.sessions, &peer)?;
+  }
+
+  crate::identity::leave::run_leave(
+    context.store(),
+    context.keys(),
+    planes.entropy.as_ref(),
+    &journaled.stored,
+    &journaled.intent,
+  )
+  .await?;
+  let (former, replacement) = (
+    journaled.intent.former_node().clone(),
+    journaled.intent.replacement_node().clone(),
+  );
+  deps.events().emit(crate::IdentityReplaced::new(
+    former.clone(),
+    replacement.clone(),
+  ));
+  Ok(EffectOutcome::new(TaskOutput::Leave(
+    crate::LeaveOutcome::new(former, replacement),
+  )))
 }
