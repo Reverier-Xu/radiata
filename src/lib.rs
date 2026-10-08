@@ -58,7 +58,7 @@ pub use error::{Error, ErrorKind, ProviderErrorContext, ProviderErrorKind, Resul
 pub use extension_registry::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
 pub use identity::{
   Digest, IssuedMergeCredential, ListenerId, MergeCredential, NodeId, OperationId, PublicKey,
-  SessionId, Signature, TraceId, TransactionId,
+  SessionId, Signature, TaskId, TraceId, TransactionId,
 };
 pub use label::{LabelKey, LabelSet, LabelValue};
 pub use node::{
