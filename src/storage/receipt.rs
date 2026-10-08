@@ -30,6 +30,7 @@ pub(crate) const RETENTION_SWEEP_BOUND: usize = 4096;
 
 /// The outcome of one retention sweep; the public report lives in the
 /// view module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiptRetentionReport {
   /// Anchored receipts whose retention deadline had elapsed and whose
   /// forget transaction committed.

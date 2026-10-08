@@ -31,6 +31,7 @@ mod runtime;
 mod session;
 mod storage;
 mod sync_common;
+mod task;
 mod time;
 mod transport;
 mod view;
@@ -87,6 +88,7 @@ pub use routing::{
   CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteContext,
   RouteNextHop, Selector,
 };
+pub use task::{CredentialIssued, Task, TaskError, TaskKind, TaskOutput, TaskPhase, TaskStatus};
 pub use transport::{
   Endpoint, PageCursor, ProviderListener, TransportName, TransportProvider, TransportScheme,
   TransportSelector, TransportStream,
