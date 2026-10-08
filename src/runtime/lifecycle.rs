@@ -175,6 +175,15 @@ impl RuntimeClient {
       .ok_or_else(|| Error::not_ready("node operations"))
   }
 
+  /// The task manager's observation client: the `node.tasks()` accessor
+  /// reads the shared table and submits custom kinds through it.
+  pub(crate) fn task_client(&self) -> Result<&super::task_manager::TaskClient> {
+    self
+      .tasks
+      .as_ref()
+      .ok_or_else(|| Error::not_ready("node tasks"))
+  }
+
   pub(crate) fn status(&self) -> NodeStatus {
     self.state.borrow().status()
   }

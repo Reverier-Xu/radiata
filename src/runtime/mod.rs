@@ -21,3 +21,4 @@ pub(crate) use task_effects::{
   resolve_frozen_journal, revoke, rotate_merge_credential, start_recovery, stop_listener,
   sync_round,
 };
+pub(crate) use task_manager::{EffectOutcome, TaskClient, TaskEffect, TaskPayload, TaskSpec};

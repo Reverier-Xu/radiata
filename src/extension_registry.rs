@@ -357,6 +357,19 @@ impl ExtensionRegistry {
       .unwrap_or_default()
   }
 
+  /// The reconciler registered for one custom task kind tag, when
+  /// present (the `tasks().submit` admission resolves the kind's
+  /// effect through this lookup).
+  pub(crate) fn task_reconciler(
+    &self, kind: &crate::QualifiedTag,
+  ) -> Option<Arc<dyn crate::TaskReconciler>> {
+    self
+      .task_reconcilers
+      .lock()
+      .ok()
+      .and_then(|reconcilers| reconcilers.get(kind).cloned())
+  }
+
   /// Registers one packet protocol and its consumer. A duplicate protocol
   /// tag is a conflict; registration never replaces an existing entry.
   pub fn register_protocol(

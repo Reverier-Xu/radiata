@@ -4,7 +4,9 @@ mod event;
 mod handle;
 mod revision;
 
-pub use api::{Credentials, Listeners, Members, Resources, Routes, Sessions, Topology, Trust};
+pub use api::{
+  Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Trust,
+};
 pub use builder::NodeBuilder;
 pub(crate) use event::EventHub;
 pub use event::{EventOptions, EventReceive, EventSubscription};

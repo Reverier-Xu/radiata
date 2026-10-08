@@ -944,7 +944,6 @@ impl TaskView {
   /// Snapshots one table entry's record and payload. The consumed-once
   /// credential slot is deliberately not part of the input: no view can
   /// carry the secret.
-  #[allow(dead_code)] // driven by the `node.tasks()` accessor; that wiring lands with the task-surface stage
   pub(crate) fn from_record(
     id: crate::TaskId, kind: crate::TaskKind, record: &crate::task::TaskStatusRecord,
     output: Option<crate::TaskOutput>,
@@ -980,7 +979,6 @@ impl TaskPage {
     self.next.as_ref()
   }
 
-  #[allow(dead_code)] // built by the `node.tasks()` accessor; that wiring lands with the task-surface stage
   pub(crate) fn new(items: Vec<TaskView>, next: Option<crate::PageCursor>) -> Self {
     Self { items, next }
   }

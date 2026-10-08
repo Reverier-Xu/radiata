@@ -8,11 +8,13 @@
 //! accessor and returns an owned future, so a write intent built now
 //! can be held and driven later exactly like any other value.
 
+use std::sync::Arc;
+
 use crate::{
   Endpoint, IssuedMergeCredential, ListenerId, NodeId, PageSpec, Result, RouteHandle,
-  RouteStatusView, Selector, Task,
+  RouteStatusView, Selector, Task, TaskKind, TaskOutput,
   extension_registry::ExtensionRegistry,
-  runtime::{Control, RuntimeClient},
+  runtime::{Control, EffectOutcome, RuntimeClient, TaskClient, TaskEffect, TaskPayload, TaskSpec},
   view::{ListenerPage, ListenerView, MemberPage, MemberView, ResourcePage, ResourceView},
 };
 
@@ -363,5 +365,168 @@ impl Routes {
   /// (bounded trace metadata only, no durability claim).
   pub fn get(self, handle: &RouteHandle) -> Result<RouteStatusView> {
     self.runtime.route_status(handle)
+  }
+}
+
+/// The node's admitted operation tasks: `get`/`list`/`wait` over the
+/// bounded live+terminal task table, and `submit` for caller-registered
+/// extension kinds.
+pub struct Tasks {
+  runtime: RuntimeClient,
+  /// The node-local extension registry: the custom-kind reconciler
+  /// lookup behind `submit`.
+  extensions: std::sync::Arc<ExtensionRegistry>,
+  /// The ordinary public handle the custom-kind reconcilers receive in
+  /// their [`crate::ReconcileContext`]: a caller workflow over the
+  /// public surface, never privileged core access.
+  handle: crate::NodeHandle,
+}
+
+impl Tasks {
+  pub(crate) fn new(
+    runtime: &RuntimeClient, extensions: &std::sync::Arc<ExtensionRegistry>,
+    handle: &crate::NodeHandle,
+  ) -> Self {
+    Self {
+      runtime: runtime.clone(),
+      extensions: extensions.clone(),
+      handle: handle.clone(),
+    }
+  }
+
+  /// One task's current status, when live or inside the bounded
+  /// terminal history. `Ok(None)` for an unknown or evicted id.
+  ///
+  /// The read is local (no supervisor round trip) and refuses typed once
+  /// the node stopped: the table's post-shutdown state is not part of
+  /// the public contract.
+  pub async fn get(&self, id: crate::TaskId) -> Result<Option<crate::view::TaskView>> {
+    self.require_running()?;
+    Ok(self.client()?.observer.table.view(&id))
+  }
+
+  /// Tasks in canonical id order (= admission order, newest last).
+  /// Local read like [`Tasks::get`]; see its shutdown note.
+  pub async fn list(&self, page: PageSpec) -> Result<crate::view::TaskPage> {
+    self.require_running()?;
+    let cursor = page.cursor().cloned();
+    let limit = page.limit().clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
+    Ok(
+      self
+        .client()?
+        .observer
+        .table
+        .page_views(cursor.as_ref().map(|cursor| cursor.as_bytes()), limit),
+    )
+  }
+
+  /// Awaits one task's terminal phase and resolves with its terminal
+  /// view (value-based: an already-terminal task resolves immediately,
+  /// so there is no missed-transition race). [`crate::ErrorKind::NotFound`]
+  /// for an unknown or evicted id; [`crate::ErrorKind::ShuttingDown`] if
+  /// the node stops before the effect settles (a kind the shutdown drain
+  /// awaits to terminality still resolves with its real outcome, exactly
+  /// like [`crate::Task::wait`]). No timeout is built in: callers compose
+  /// `tokio::time::timeout` over the runtime's own bounded retry
+  /// schedules.
+  pub async fn wait(&self, id: crate::TaskId) -> Result<crate::view::TaskView> {
+    self.require_running()?;
+    let client = self.client()?;
+    let Some((kind, _)) = client.observer.table.status(&id) else {
+      return Err(crate::Error::not_found("task"));
+    };
+    let Some(mut status) = client.observer.table.watch(&id) else {
+      return Err(crate::Error::not_found("task"));
+    };
+    let mut stop = client.observer.stop.clone();
+    loop {
+      if status.borrow().phase.is_terminal() {
+        return client
+          .observer
+          .table
+          .view(&id)
+          .ok_or_else(|| crate::Error::not_found("task"));
+      }
+      let stopped = tokio::select! {
+        changed = status.changed() => changed.is_err(),
+        changed = stop.changed() => changed.is_err() || !kind.drains_on_shutdown(),
+      };
+      if stopped {
+        // The terminal publication can land in the same wake as the stop
+        // signal (the manager publishes before it stops), so the view is
+        // still read before the typed shutdown failure.
+        if status.borrow().phase.is_terminal() {
+          return client
+            .observer
+            .table
+            .view(&id)
+            .ok_or_else(|| crate::Error::not_found("task"));
+        }
+        return Err(crate::Error::shutting_down("task wait"));
+      }
+    }
+  }
+
+  /// Submits one custom-kind task. The kind tag must live under a
+  /// caller-owned domain (never the builtin `radiata.woooo.tech`
+  /// domain) and must have a registered
+  /// [`TaskReconciler`](crate::TaskReconciler); anything else is
+  /// [`crate::ErrorKind::Unsupported`]. The admitted [`Task`] resolves
+  /// with `()` on the reconciler's success — the workflow's observations
+  /// ride the handle the reconciler itself received.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// the reserved domain, an unregistered kind); every reconciler error
+  /// is effect-time, retried within the bounded extension schedule, and
+  /// surfaces on the task's `wait`.
+  pub async fn submit(&self, spec: crate::CustomTaskSpec) -> Result<Task<()>> {
+    let client = self.client()?.clone();
+    if spec.kind().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
+      return Err(crate::Error::unsupported("task kind"));
+    }
+    let Some(reconciler) = self.extensions.task_reconciler(spec.kind()) else {
+      return Err(crate::Error::unsupported("task kind"));
+    };
+    self.require_running()?;
+    let kind = TaskKind::Extension(spec.kind().clone());
+    let handle = self.handle.clone();
+    let effect: TaskEffect = Arc::new(move |_deps, attempt| {
+      let reconciler = Arc::clone(&reconciler);
+      let handle = handle.clone();
+      let spec = spec.clone();
+      Box::pin(async move {
+        let context = crate::ReconcileContext {
+          handle,
+          spec,
+          attempt: attempt.attempt,
+          last_error: attempt.last_error,
+        };
+        match reconciler.reconcile(context).await {
+          Ok(crate::ReconcileDecision::Succeeded) => {
+            Ok(EffectOutcome::new(TaskOutput::Extension(())))
+          }
+          // The explicit no-progress decision re-arms the same bounded
+          // extension schedule an error rides, as the typed overload.
+          Ok(crate::ReconcileDecision::Retry) => Err(crate::Error::overloaded("custom task retry")),
+          Err(error) => Err(error),
+        }
+      })
+    });
+    let id = client
+      .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
+      .await?;
+    Ok(Task::from_parts(id, kind, client.observer.clone()))
+  }
+
+  /// The local shutdown gate shared by every accessor verb.
+  fn require_running(&self) -> Result<()> {
+    if self.runtime.status() != crate::NodeStatus::Running {
+      return Err(crate::Error::shutting_down("node tasks"));
+    }
+    Ok(())
+  }
+
+  fn client(&self) -> Result<&TaskClient> {
+    self.runtime.task_client()
   }
 }

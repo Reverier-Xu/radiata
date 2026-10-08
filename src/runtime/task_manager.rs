@@ -62,6 +62,10 @@ pub(crate) enum RetryClass {
   /// Resource writes: only the snapshot-commit register race retries
   /// (the `RESOURCE_COMMIT_RACE_ATTEMPTS` precedent).
   Local,
+  /// Caller-registered custom kinds: the reconciler owns the semantics,
+  /// so every error retries within the bounded budget (the reconciler's
+  /// own `Retry` decision rides the same schedule as a typed overload).
+  Extension,
   /// Everything else: one attempt, no retry.
   Once,
 }
@@ -79,6 +83,7 @@ impl RetryClass {
           | ErrorKind::StreamInterrupted
       ),
       RetryClass::Local => matches!(kind, ErrorKind::Conflict),
+      RetryClass::Extension => true,
       RetryClass::Once => false,
     }
   }
@@ -129,11 +134,22 @@ const ONCE: RetryPolicy = RetryPolicy {
   class: RetryClass::Once,
 };
 
+/// Caller-registered custom kinds: the reconciler's errors and explicit
+/// `Retry` decisions re-arm the same bounded schedule the network dials
+/// use (the reconciler owns the semantics; the manager owns the bound).
+const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
+  max_attempts: 4,
+  initial: Duration::from_millis(100),
+  max: Duration::from_secs(10),
+  class: RetryClass::Extension,
+};
+
 /// The kind's retry policy (single classification site).
 pub(crate) fn retry_policy(kind: &TaskKind) -> &'static RetryPolicy {
   match kind {
     TaskKind::Join | TaskKind::Connect => &NETWORK_RETRY,
     TaskKind::PutResource | TaskKind::DeleteResource => &LOCAL_RETRY,
+    TaskKind::Extension(_) => &EXTENSION_RETRY,
     _ => &ONCE,
   }
 }
@@ -183,12 +199,25 @@ impl EffectOutcome {
   }
 }
 
+/// One attempt's invocation context: the 1-based attempt index plus,
+/// from the second attempt on, the previous attempt's typed terminal
+/// error (the custom-kind reconcilers read it through
+/// [`crate::ReconcileContext`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AttemptContext {
+  pub(crate) attempt: u32,
+  pub(crate) last_error: Option<TaskError>,
+}
+
 /// One admitted task's effect: a factory called once per attempt with the
 /// node-shared operation handles the manager owns. The verb admissions
 /// build these closures over the moved verb bodies; the effect body is a
 /// `reconcile_*` function in [`super::task_effects`].
 pub(crate) type TaskEffect = Arc<
-  dyn Fn(Arc<super::task_effects::OperationDeps>, u32) -> BoxFuture<'static, Result<EffectOutcome>>
+  dyn Fn(
+      Arc<super::task_effects::OperationDeps>,
+      AttemptContext,
+    ) -> BoxFuture<'static, Result<EffectOutcome>>
     + Send
     + Sync,
 >;
@@ -552,6 +581,7 @@ struct RetryTicket {
   kind: TaskKind,
   effect: TaskEffect,
   attempt: u32,
+  last_error: Option<TaskError>,
 }
 
 /// One worker's completion report to the manager loop. Sent as the
@@ -568,6 +598,7 @@ enum WorkerReport {
     kind: TaskKind,
     effect: TaskEffect,
     attempt: u32,
+    last_error: Option<TaskError>,
     delay: Duration,
   },
   /// Shutdown cancelled a cancellable kind mid-flight; the task stays
@@ -679,6 +710,7 @@ async fn run_manager(
               ticket.kind,
               ticket.effect,
               ticket.attempt,
+              ticket.last_error,
             );
           }
         }
@@ -707,6 +739,7 @@ async fn run_manager(
             kind,
             effect,
             attempt,
+            last_error,
             delay,
           } => {
             // Only cancellable kinds retry; during the drain the wake is
@@ -721,6 +754,7 @@ async fn run_manager(
                   kind,
                   effect,
                   attempt,
+                  last_error,
                 });
             }
           }
@@ -857,6 +891,7 @@ fn admit_inner(
     kind,
     effect,
     1,
+    None,
   );
   Ok(id)
 }
@@ -871,6 +906,9 @@ struct Worker {
   kind: TaskKind,
   effect: TaskEffect,
   attempt: u32,
+  /// The previous attempt's typed error, handed to the effect from the
+  /// second attempt on.
+  last_error: Option<TaskError>,
   cancel: watch::Receiver<bool>,
 }
 
@@ -928,7 +966,10 @@ impl Worker {
         id: self.id.clone(),
         kind: self.kind.clone(),
         effect: self.effect.clone(),
-        attempt: self.attempt,
+        attempt: AttemptContext {
+          attempt: self.attempt,
+          last_error: self.last_error,
+        },
       }
       .run(),
     ));
@@ -955,7 +996,7 @@ impl Worker {
         id: self.id,
         succeeded,
       },
-      Ok(AttemptOutcome::Retry { delay }) => WorkerReport::Retry {
+      Ok(AttemptOutcome::Retry { delay, last_error }) => WorkerReport::Retry {
         id: self.id,
         kind: self.kind,
         effect: self.effect,
@@ -963,6 +1004,7 @@ impl Worker {
         // incremented index, so the budget is spent monotonically and
         // the backoff schedule is keyed on the failed attempt.
         attempt: self.attempt + 1,
+        last_error,
         delay,
       },
       Err(join_error) => {
@@ -991,7 +1033,10 @@ enum AttemptOutcome {
   /// phase.
   Terminal { succeeded: bool },
   /// The attempt failed retryably; the manager re-arms the delay.
-  Retry { delay: Duration },
+  Retry {
+    delay: Duration,
+    last_error: Option<TaskError>,
+  },
 }
 
 struct Attempt {
@@ -999,14 +1044,14 @@ struct Attempt {
   id: TaskId,
   kind: TaskKind,
   effect: TaskEffect,
-  attempt: u32,
+  attempt: AttemptContext,
 }
 
 impl Attempt {
   async fn run(self) -> AttemptOutcome {
     if !self
       .shared
-      .publish_running(&self.id, &self.kind, self.attempt)
+      .publish_running(&self.id, &self.kind, self.attempt.attempt)
       .await
     {
       // The entry is gone (evicted terminal history) or its lock is
@@ -1023,9 +1068,10 @@ impl Attempt {
       }
       Err(error) => {
         let policy = retry_policy(&self.kind);
-        if self.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
+        if self.attempt.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
           AttemptOutcome::Retry {
-            delay: policy.backoff(self.attempt),
+            delay: policy.backoff(self.attempt.attempt),
+            last_error: Some(TaskError::from_error(error)),
           }
         } else {
           self
@@ -1043,7 +1089,7 @@ impl Attempt {
 fn spawn_worker(
   shared: &Arc<ManagerShared>, cancel_watch: &watch::Receiver<bool>,
   reports: &mpsc::UnboundedSender<WorkerReport>, outstanding: &mut usize, id: TaskId,
-  kind: TaskKind, effect: TaskEffect, attempt: u32,
+  kind: TaskKind, effect: TaskEffect, attempt: u32, last_error: Option<TaskError>,
 ) {
   *outstanding += 1;
   let worker = Worker {
@@ -1053,6 +1099,7 @@ fn spawn_worker(
     kind,
     effect,
     attempt,
+    last_error,
     cancel: cancel_watch.clone(),
   };
   tokio::spawn(worker.run());
@@ -1078,7 +1125,7 @@ mod tests {
     time::Duration,
   };
 
-  use tokio::sync::{Notify, mpsc};
+  use tokio::sync::{Notify, mpsc, watch};
 
   use super::{
     EffectOutcome, TaskClient, TaskEffect, TaskManagerDeps, TaskPayload, TaskSpec,
@@ -1086,8 +1133,12 @@ mod tests {
   };
   use crate::{
     ActionHook, BoxFuture, Error, ErrorKind, EventOptions, EventReceive, ExtensionRegistry,
-    MergeView, NodeId, QualifiedTag, Result, TaskChanged, TaskId, TaskKind, TaskOutput, TaskPhase,
-    TaskTransition, identity::testing::SequenceEntropy, task::Task, time::HostWallClock,
+    MergeView, NodeId, QualifiedTag, ReconcileDecision, Result, TaskChanged, TaskId, TaskKind,
+    TaskOutput, TaskPhase, TaskTransition,
+    identity::testing::SequenceEntropy,
+    runtime::{LifecycleSnapshot, RuntimeClient},
+    task::Task,
+    time::HostWallClock,
   };
 
   fn deps_with(
@@ -1382,10 +1433,14 @@ mod tests {
 
     fn effect(self: &Arc<Self>) -> TaskEffect {
       let scripted = Arc::clone(self);
-      Arc::new(move |_deps, attempt| {
+      Arc::new(move |_deps, context| {
         let scripted = Arc::clone(&scripted);
         Box::pin(async move {
-          scripted.attempts.lock().expect("attempts").push(attempt);
+          scripted
+            .attempts
+            .lock()
+            .expect("attempts")
+            .push(context.attempt);
           let mut steps = scripted.steps.lock().expect("steps");
           let step = match steps.len() {
             0 => Step::Ok(TaskOutput::SyncRound(())),
@@ -1950,5 +2005,198 @@ mod tests {
     let status = handle::<MergeView>(&client, &id, TaskKind::Join).status();
     assert_eq!(status.attempts(), 2, "attempts: {:?}", scripted.attempts());
     assert_eq!(scripted.attempts(), vec![1, 2]);
+  }
+
+  /// One recorded reconciler call: the attempt index plus the previous
+  /// attempt's typed error kind.
+  type ReconcileCall = (u32, Option<ErrorKind>);
+
+  /// A reconciler that records every attempt's call and decides through
+  /// a scripted queue of decisions.
+  #[derive(Debug)]
+  struct RecordingReconciler {
+    calls: Arc<Mutex<Vec<ReconcileCall>>>,
+    decisions: Mutex<VecDeque<ReconcileDecision>>, // pop_front per call, repeat last
+  }
+
+  impl RecordingReconciler {
+    fn new(decisions: Vec<ReconcileDecision>) -> Arc<Self> {
+      Arc::new(Self {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        decisions: Mutex::new(decisions.into()),
+      })
+    }
+  }
+
+  impl crate::TaskReconciler for RecordingReconciler {
+    fn reconcile<'a>(
+      &'a self, context: crate::ReconcileContext,
+    ) -> BoxFuture<'a, Result<ReconcileDecision>> {
+      Box::pin(async move {
+        self.calls.lock().expect("reconciler calls").push((
+          context.attempt,
+          context.last_error.map(|error| error.kind()),
+        ));
+        let mut decisions = self.decisions.lock().expect("decisions");
+        let decision = decisions
+          .pop_front()
+          .unwrap_or(ReconcileDecision::Succeeded);
+        match decision {
+          ReconcileDecision::Succeeded => Ok(ReconcileDecision::Succeeded),
+          ReconcileDecision::Retry => Err(Error::from_parts(
+            ErrorKind::Overloaded,
+            "custom task retry",
+          )),
+        }
+      })
+    }
+  }
+
+  /// Builds a running-status runtime client plus its node handle over
+  /// the test manager, so the accessor test drives the real public
+  /// surface (`node.tasks()`) against the real manager machinery — one
+  /// registry instance serves both the handle (the reconciler lookup)
+  /// and the manager (the hook source).
+  fn handle_over_manager(
+    extensions: std::sync::Arc<ExtensionRegistry>, events: Arc<crate::node::EventHub>,
+  ) -> (crate::NodeHandle, crate::Tasks) {
+    let (leave_complete, _leave_signals) = mpsc::channel(1);
+    let deps = TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
+        events,
+        extensions.clone(),
+      )),
+      listeners: Default::default(),
+      leave_complete,
+    };
+    let (client, _manager) = spawn_task_manager(deps).expect("manager");
+    let (control_tx, _control_rx) = mpsc::channel(32);
+    let (_state_tx, state_rx) = watch::channel(LifecycleSnapshot::running());
+    let (packet_tx, _packet_rx) = mpsc::channel(super::TASK_CHANNEL_CAPACITY);
+    let runtime = RuntimeClient::new(
+      control_tx,
+      state_rx,
+      Default::default(),
+      packet_tx,
+      Some(client),
+    );
+    let (_revision_tx, revision_rx) = watch::channel(0_u64);
+    let handle = crate::NodeHandle::new(
+      runtime,
+      Arc::new(SequenceEntropy::default()),
+      extensions,
+      Arc::new(crate::node::EventHub::new()),
+      crate::node::MemberRevision::new(revision_rx),
+    );
+    let tasks = handle.tasks();
+    (handle, tasks)
+  }
+
+  fn custom_labels() -> crate::LabelSet {
+    crate::LabelSet::new()
+      .insert(
+        crate::LabelKey::parse("example.com/labels/lane").expect("key"),
+        crate::LabelValue::parse("one").expect("value"),
+      )
+      .expect("labels")
+  }
+
+  #[tokio::test]
+  async fn custom_kinds_submit_get_list_and_wait_through_the_accessor() {
+    let mut extensions = ExtensionRegistry::new();
+    let kind = crate::QualifiedTag::parse("example.com/tasks/v1/rotate-secret").expect("tag");
+    extensions
+      .register_task_reconciler(kind.clone(), RecordingReconciler::new(Vec::new()))
+      .expect("registration");
+    let (_handle, tasks) =
+      handle_over_manager(Arc::new(extensions), Arc::new(crate::node::EventHub::new()));
+
+    // The builtin domain is reserved and an unregistered kind is
+    // unsupported: both refuse at admission, typed.
+    let builtin = crate::CustomTaskSpec::new(
+      crate::QualifiedTag::parse("radiata.woooo.tech/tasks/v1/record").expect("tag"),
+      crate::LabelSet::new(),
+    );
+    assert_eq!(
+      tasks
+        .submit(builtin)
+        .await
+        .expect_err("reserved domain")
+        .kind(),
+      ErrorKind::Unsupported
+    );
+    let unregistered = crate::CustomTaskSpec::new(
+      crate::QualifiedTag::parse("example.com/tasks/v1/other").expect("tag"),
+      crate::LabelSet::new(),
+    );
+    assert_eq!(
+      tasks
+        .submit(unregistered)
+        .await
+        .expect_err("unregistered kind")
+        .kind(),
+      ErrorKind::Unsupported
+    );
+
+    // The registered kind submits, terminalizes, and stays observable
+    // through get/list/wait — the wait is value-based, so a wait after
+    // the terminal view still resolves immediately.
+    let spec = crate::CustomTaskSpec::new(kind.clone(), custom_labels());
+    let task = tasks.submit(spec).await.expect("custom admission");
+    assert_eq!(task.kind(), &TaskKind::Extension(kind.clone()));
+    let id = task.id().clone();
+    task.wait().await.expect("custom terminal");
+    let view = tasks.wait(id.clone()).await.expect("terminal view");
+    assert_eq!(view.phase(), TaskPhase::Succeeded);
+    assert_eq!(view.kind(), &TaskKind::Extension(kind));
+    assert_eq!(view.attempts(), 1);
+    let got = tasks
+      .get(id.clone())
+      .await
+      .expect("get")
+      .expect("live entry");
+    assert_eq!(got.id(), &id);
+    let page = tasks
+      .list(crate::PageSpec::first(8).expect("page"))
+      .await
+      .expect("list");
+    assert!(page.items().iter().any(|view| view.id() == &id));
+    // An unknown id reads as absent.
+    let unknown = TaskId::compose(0, 99_999).expect("composition");
+    assert!(tasks.get(unknown.clone()).await.expect("get").is_none());
+    assert_eq!(
+      tasks.wait(unknown).await.expect_err("unknown id").kind(),
+      ErrorKind::NotFound
+    );
+  }
+
+  #[tokio::test]
+  async fn custom_kind_retries_carry_the_last_error_into_the_context() {
+    let mut extensions = ExtensionRegistry::new();
+    let kind = crate::QualifiedTag::parse("example.com/tasks/v1/flaky").expect("tag");
+    let reconciler =
+      RecordingReconciler::new(vec![ReconcileDecision::Retry, ReconcileDecision::Retry]);
+    let calls = Arc::clone(&reconciler.calls);
+    extensions
+      .register_task_reconciler(kind.clone(), reconciler)
+      .expect("registration");
+    let (_handle, tasks) =
+      handle_over_manager(Arc::new(extensions), Arc::new(crate::node::EventHub::new()));
+
+    let spec = crate::CustomTaskSpec::new(kind, custom_labels());
+    let task = tasks.submit(spec).await.expect("custom admission");
+    task.wait().await.expect("terminal");
+    // The first attempt has no predecessor; every later attempt observes
+    // the previous attempt's typed error through the context.
+    assert_eq!(
+      calls.lock().expect("calls").clone(),
+      vec![
+        (1, None),
+        (2, Some(ErrorKind::Overloaded)),
+        (3, Some(ErrorKind::Overloaded)),
+      ]
+    );
   }
 }

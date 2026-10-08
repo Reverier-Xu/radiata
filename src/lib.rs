@@ -64,7 +64,7 @@ pub use identity::{
 pub use label::{LabelKey, LabelSet, LabelValue};
 pub use node::{
   Credentials, EventOptions, EventReceive, EventSubscription, Listeners, MemberRevision, Members,
-  NodeBuilder, NodeHandle, Resources, Routes, Sessions, Topology, Trust,
+  NodeBuilder, NodeHandle, Resources, Routes, Sessions, Tasks, Topology, Trust,
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,

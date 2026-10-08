@@ -6,7 +6,7 @@ use crate::{
   ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, Task, TraceId,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
-  node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Topology, Trust},
+  node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Trust},
   packet::DeliveryAck,
   runtime::{Control, RuntimeClient},
   view::{
@@ -149,6 +149,13 @@ impl NodeHandle {
   /// bounded status.
   pub fn routes(&self) -> Routes {
     Routes::new(&self.runtime)
+  }
+
+  /// The node's admitted operation tasks: `get`, `list`, and `wait` over
+  /// the bounded live+terminal task table, and `submit` for
+  /// caller-registered extension kinds.
+  pub fn tasks(&self) -> Tasks {
+    Tasks::new(&self.runtime, &self.extensions, self)
   }
 
   // -- lifecycle ------------------------------------------------------

@@ -321,6 +321,60 @@ impl TaskTable {
     })
   }
 
+  /// One task's full observation view (the never-secret surface: the
+  /// consumed-once credential slot is deliberately unread here), when
+  /// the id is live or inside the bounded terminal history.
+  pub(crate) fn view(&self, id: &TaskId) -> Option<crate::view::TaskView> {
+    self.lock().ok().and_then(|entries| {
+      entries.get(id).map(|entry| {
+        crate::view::TaskView::from_record(
+          id.clone(),
+          entry.kind.clone(),
+          &entry.status.borrow(),
+          entry.output.clone(),
+        )
+      })
+    })
+  }
+
+  /// Pages the task views in canonical id order (= admission order,
+  /// newest last), keyset-paginated on the id like every other view.
+  pub(crate) fn page_views(&self, cursor: Option<&[u8]>, limit: usize) -> crate::view::TaskPage {
+    let entries = self.lock().ok();
+    let mut views = Vec::new();
+    let mut next = None;
+    let Some(entries) = entries else {
+      return crate::view::TaskPage::new(views, None);
+    };
+    for (id, entry) in entries.iter() {
+      // The cursor is the last delivered id: everything after it, in
+      // id order, is the next page.
+      if let Some(cursor) = cursor
+        && id.as_str().as_bytes() <= cursor
+      {
+        continue;
+      }
+      if views.len() >= limit {
+        next = Some(id.as_str().as_bytes().to_vec());
+        break;
+      }
+      views.push(crate::view::TaskView::from_record(
+        id.clone(),
+        entry.kind.clone(),
+        &entry.status.borrow(),
+        entry.output.clone(),
+      ));
+    }
+    let next = next
+      .map(std::sync::Arc::from)
+      .map(crate::PageCursor::new)
+      .transpose();
+    match next {
+      Ok(next) => crate::view::TaskPage::new(views, next),
+      Err(_) => crate::view::TaskPage::new(views, None),
+    }
+  }
+
   /// Runs one mutation over the entry: the single lock discipline for
   /// the manager's transitions. `Ok(None)` when the id is unknown
   /// (evicted); a poisoned lock is the typed internal error.
