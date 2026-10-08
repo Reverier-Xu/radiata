@@ -1,4 +1,4 @@
-schema = "radiata.woooo.tech/schemas/fuzz-corpus-v1"
+schema = "radiata.woooo.tech/schemas/v1/fuzz-corpus"
 status = "accepted"
 target = "wire_decode"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
@@ -6,14 +6,14 @@ minimizer = { tool = "none", version = "0" }
 aggregate = { entry_count = 10, total_bytes = 871 }
 
 [[entry]]
-digest = "a128e9f015c02cc6392fcc59bcfb965072298c54be938d91f9d5516e638c29ac"
+digest = "aeba287b3d3af48d711b53ecc32de10918c3123ad66058d65dd248017e5d5b86"
 byte_count = 171
 origin = "golden-fixture"
 lineage = "compatibility manifest open-direct-v1"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
-digest = "4ed045aaa9eea669de8fda0da0282c35549f6a8a71052a8f9fac7382a65c49ed"
+digest = "b6c90494bc4a5a2514810ab5ce20e079c62b71f4eae1eb7c0f5b0801e7de618b"
 byte_count = 226
 origin = "golden-fixture"
 lineage = "compatibility manifest open-routed-v1"
@@ -55,7 +55,7 @@ lineage = "truncated open frame"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
-digest = "e5d62cd6fe9bd98c29540e7503965e7a84eac893ef339aa24d43f3d63c811682"
+digest = "e0076fcbd20c7732e4e55ae8723eeac6caf4d34214e52482f5a4a0ac8b448fc0"
 byte_count = 171
 origin = "synthetic-generator"
 lineage = "bit-inverted open frame"
@@ -69,7 +69,7 @@ lineage = "oversized prelude body length"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
-digest = "937cae60ed3316bb8bb5f24c6a051954c3e6bb55bafba419d14629d49e5f6a4f"
+digest = "04a5349eb093b7c28546f1d116d52f59a6d7112531fdc36597000c45af9e80ee"
 byte_count = 170
 origin = "synthetic-generator"
 lineage = "open frame missing final byte"

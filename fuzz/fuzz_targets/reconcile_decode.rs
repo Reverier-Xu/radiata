@@ -1,6 +1,6 @@
 //! The canonical `reconcile_decode` fuzz target.
 //!
-//! Feeds every input through the reconcile-v1 production decoder under
+//! Feeds every input through the reconcile v1 production decoder under
 //! the frozen canonical CBOR contract: unknown message kinds and lanes,
 //! over-bound lists, inverted ranges, non-canonical integers, padding,
 //! and truncation must all return typed errors and never panic, while a
