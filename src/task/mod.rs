@@ -21,7 +21,7 @@ use std::{
 use tokio::sync::watch;
 
 use crate::{
-  Error, ErrorKind, IssuedMergeCredential, NodeId, QualifiedTag, Result, TaskId,
+  BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeId, QualifiedTag, Result, TaskId,
   view::{
     LeaveOutcome, ListenerView, MemberView, MergeView, ReceiptRetentionReport, RecoveryView,
     ResourceMutationView, RevokeOutcome,
@@ -636,6 +636,182 @@ fn resolve_terminal<T: TaskResult>(
   }
 }
 
+/// Admission-time and post-commit observation hooks for resource writes.
+///
+/// Hooks registered through
+/// [`ExtensionRegistry::register_resource_hook`](crate::ExtensionRegistry::register_resource_hook)
+/// run in canonical tag order. `validate` and `mutate` run on the
+/// caller's admission path, before any IO; `observed` runs inside the
+/// write task's own future, after this node's own commit lands.
+pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
+  /// Rejects a write at admission, before any IO runs. The first
+  /// rejection in tag order wins and the verb fails typed with it.
+  fn validate(&self, _write: &crate::ResourceWrite) -> Result<()> {
+    Ok(())
+  }
+
+  /// Defaults or normalizes the write at admission; the hooks compose
+  /// left to right in canonical tag order, and the composed result is
+  /// the intent the effect signs.
+  fn mutate(&self, write: crate::ResourceWrite) -> Result<crate::ResourceWrite> {
+    Ok(write)
+  }
+
+  /// Fires after this node's own commit lands and before the write task
+  /// terminalizes: the local observation of the put or delete, never a
+  /// cluster-convergence promise (cluster visibility stays the reconcile
+  /// plane's domain, observable through [`crate::ResourceChanged`]). An
+  /// error is a diagnostic and never fails or blocks the task.
+  fn observed<'a>(&'a self, _view: &'a crate::ResourceView) -> BoxFuture<'a, Result<()>> {
+    Box::pin(async { Ok(()) })
+  }
+}
+
+/// Observer over one task's phase transitions.
+///
+/// Hooks registered through
+/// [`ExtensionRegistry::register_action_hook`](crate::ExtensionRegistry::register_action_hook)
+/// run sequentially in canonical tag order inside the task's own future
+/// (never on the manager task). They observe only: an error is a
+/// `tracing` diagnostic and the sequence continues, so no hook can wedge
+/// a task or its shutdown drain.
+pub trait ActionHook: std::fmt::Debug + Send + Sync + 'static {
+  fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+    Box::pin(async { Ok(()) })
+  }
+}
+
+/// One observed phase transition of one task.
+pub struct TaskTransition {
+  id: TaskId,
+  kind: TaskKind,
+  from: TaskPhase,
+  to: TaskPhase,
+}
+
+impl TaskTransition {
+  /// The task that transitioned.
+  pub const fn id(&self) -> &TaskId {
+    &self.id
+  }
+
+  /// The task's kind (immutable for its lifetime).
+  pub const fn kind(&self) -> &TaskKind {
+    &self.kind
+  }
+
+  /// The phase the task held before this transition.
+  pub const fn from(&self) -> TaskPhase {
+    self.from
+  }
+
+  /// The phase the task holds now.
+  pub const fn to(&self) -> TaskPhase {
+    self.to
+  }
+
+  pub(crate) const fn new(id: TaskId, kind: TaskKind, from: TaskPhase, to: TaskPhase) -> Self {
+    Self { id, kind, from, to }
+  }
+}
+
+impl std::fmt::Debug for TaskTransition {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("TaskTransition")
+      .field("id", &self.id)
+      .field("kind", &self.kind)
+      .field("from", &self.from)
+      .field("to", &self.to)
+      .finish()
+  }
+}
+
+/// Runs one transition's action hooks sequentially in canonical tag
+/// order (the registry's own order). Called inside the task's own future:
+/// a panic in a hook aborts that future and surfaces as the task's typed
+/// internal failure, and a hook error is a diagnostic that never fails,
+/// retries, or blocks the task.
+pub(crate) async fn notify_action_hooks(
+  hooks: &[Arc<dyn ActionHook>], transition: &TaskTransition,
+) {
+  for hook in hooks {
+    if let Err(error) = hook.on_transition(transition).await {
+      tracing::warn!(kind = ?error.kind(), "action hook failed");
+    }
+  }
+}
+
+/// The caller-supplied effect behind one custom task kind: the
+/// reconcile half of [`TaskKind::Extension`]. Registered through
+/// [`ExtensionRegistry::register_task_reconciler`](crate::ExtensionRegistry::register_task_reconciler)
+/// under a caller-owned tag and dispatched by the `tasks().submit`
+/// admission.
+pub trait TaskReconciler: std::fmt::Debug + Send + Sync + 'static {
+  /// Produces the effect for one attempt. `Ok(Succeeded)` completes the
+  /// task, `Ok(Retry)` re-arms the retry schedule without progress, and
+  /// `Err` retries (bounded) before failing the task with that error.
+  fn reconcile<'a>(&'a self, ctx: ReconcileContext) -> BoxFuture<'a, Result<ReconcileDecision>>;
+}
+
+/// What one reconcile attempt decided.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconcileDecision {
+  /// The effect completed: the task terminalizes `Succeeded`.
+  Succeeded,
+  /// The effect made no progress: re-arm the retry schedule.
+  Retry,
+}
+
+/// The owned context of one reconcile attempt.
+///
+/// The handle is the ordinary public node surface — reads, watches,
+/// `send`, `open_stream`: a custom kind is a caller workflow over the
+/// crate's public contract, never privileged core access (no store, no
+/// sessions, no supervisor internals).
+#[derive(Clone)]
+pub struct ReconcileContext {
+  pub handle: crate::NodeHandle,
+  pub spec: CustomTaskSpec,
+  pub attempt: u32,
+  pub last_error: Option<TaskError>,
+}
+
+impl std::fmt::Debug for ReconcileContext {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("ReconcileContext")
+      .field("spec", &self.spec)
+      .field("attempt", &self.attempt)
+      .field("last_error", &self.last_error)
+      .field("handle", &"NodeHandle")
+      .finish()
+  }
+}
+
+/// One caller-registered custom task submission: the kind tag (the
+/// registry key of the caller's [`TaskReconciler`]) plus the caller's
+/// labels.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomTaskSpec {
+  kind: QualifiedTag,
+  labels: crate::LabelSet,
+}
+
+impl CustomTaskSpec {
+  pub fn new(kind: QualifiedTag, labels: crate::LabelSet) -> Self {
+    Self { kind, labels }
+  }
+
+  pub const fn kind(&self) -> &QualifiedTag {
+    &self.kind
+  }
+
+  pub const fn labels(&self) -> &crate::LabelSet {
+    &self.labels
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::time::{Duration, SystemTime};
@@ -643,11 +819,11 @@ mod tests {
   use tokio::sync::watch;
 
   use super::{
-    CredentialIssued, Task, TaskError, TaskKind, TaskObserver, TaskOutput, TaskPhase, TaskResult,
-    TaskStatusRecord, TaskTable,
+    ActionHook, CredentialIssued, CustomTaskSpec, ResourceHook, Task, TaskError, TaskKind,
+    TaskObserver, TaskOutput, TaskPhase, TaskResult, TaskStatusRecord, TaskTable, TaskTransition,
   };
   use crate::{
-    Error, ErrorKind, IssuedMergeCredential, MergeView, NodeId, Result, TaskId,
+    Error, ErrorKind, IssuedMergeCredential, MergeView, NodeId, QualifiedTag, Result, TaskId,
     identity::testing::SequenceEntropy,
   };
 
@@ -721,6 +897,62 @@ mod tests {
 
   fn merge_view() -> MergeView {
     MergeView::new(node('a'), node('b'))
+  }
+
+  #[test]
+  fn resource_hook_defaults_are_no_ops() {
+    #[derive(Debug)]
+    struct NoopHook;
+
+    impl ResourceHook for NoopHook {}
+
+    let hook = NoopHook;
+    let name = crate::ResourceName::parse("radiata.woooo.tech/resources/hook-001").expect("name");
+    let labels = crate::ResourceLabels::new(
+      crate::LabelValue::parse("document").expect("type"),
+      crate::ResourceUri::parse("file:///hook").expect("uri"),
+    );
+    let write = crate::ResourceWrite::new(name.clone(), labels.clone());
+    assert!(hook.validate(&write).is_ok());
+    let mutated = hook.mutate(write).expect("default mutate");
+    assert_eq!(mutated.name(), &name);
+    assert_eq!(mutated.labels(), &labels);
+  }
+
+  #[tokio::test]
+  async fn action_hook_default_ignores_the_transition() {
+    #[derive(Debug)]
+    struct NoopHook;
+
+    impl ActionHook for NoopHook {}
+
+    let id = TaskId::compose(0, 1).expect("composition");
+    let transition = TaskTransition::new(
+      id.clone(),
+      TaskKind::Join,
+      TaskPhase::Pending,
+      TaskPhase::Running,
+    );
+    assert_eq!(transition.id(), &id);
+    assert_eq!(transition.kind(), &TaskKind::Join);
+    assert_eq!(transition.from(), TaskPhase::Pending);
+    assert_eq!(transition.to(), TaskPhase::Running);
+    assert!(NoopHook.on_transition(&transition).await.is_ok());
+    assert!(format!("{} {transition:?}", transition.id()).contains("TaskTransition"));
+  }
+
+  #[test]
+  fn custom_task_spec_keeps_its_kind_and_labels() {
+    let kind = QualifiedTag::parse("example.com/tasks/rotate-secret").expect("tag");
+    let labels = crate::LabelSet::new()
+      .insert(
+        crate::LabelKey::parse("example.com/labels/lane").expect("key"),
+        crate::LabelValue::parse("one").expect("value"),
+      )
+      .expect("labels");
+    let spec = CustomTaskSpec::new(kind.clone(), labels.clone());
+    assert_eq!(spec.kind(), &kind);
+    assert_eq!(spec.labels(), &labels);
   }
 
   #[test]

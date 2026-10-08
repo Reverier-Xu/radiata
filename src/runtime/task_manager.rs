@@ -340,60 +340,127 @@ impl TaskManagerHandle {
 pub(crate) struct TaskManagerDeps {
   pub(crate) entropy: Arc<dyn Entropy>,
   pub(crate) clock: Arc<dyn WallClock>,
+  /// The typed event hub shared with the node's handles: every task
+  /// phase transition emits its [`crate::TaskChanged`] here.
+  pub(crate) events: Arc<crate::node::EventHub>,
+  /// The node-local extension registry: the source of the registered
+  /// action hooks (and, for the verb stages, the resource hooks and
+  /// custom-kind reconcilers).
+  pub(crate) extensions: Arc<crate::ExtensionRegistry>,
 }
 
 /// The per-incarnation state shared with every worker future.
 struct ManagerShared {
   table: TaskTable,
   clock: Arc<dyn WallClock>,
+  events: Arc<crate::node::EventHub>,
+  extensions: Arc<crate::ExtensionRegistry>,
   semaphore: Arc<Semaphore>,
 }
 
 impl ManagerShared {
   /// Publishes one `Running` record (the running re-emission at each
-  /// retry wake rides the attempt counter). Returns whether the entry
-  /// was live; a missing entry (evicted) needs no further work.
-  fn publish_running(&self, id: &TaskId, attempt: u32) -> bool {
-    matches!(
-      self.table.update(id, |entry| {
-        let mut record = entry.status.borrow().clone();
-        record.phase = TaskPhase::Running;
-        record.attempts = attempt;
-        if record.started.is_none() {
-          record.started = Some(self.clock.now());
-        }
-        entry.status.send_replace(record);
-      }),
-      Ok(Some(()))
-    )
+  /// retry wake rides the attempt counter) plus its transition
+  /// observation. Returns whether the entry was live; a missing entry
+  /// (evicted) needs no further work.
+  async fn publish_running(&self, id: &TaskId, kind: &TaskKind, attempt: u32) -> bool {
+    let previous = self.table.update(id, |entry| {
+      let from = entry.status.borrow().phase;
+      let mut record = entry.status.borrow().clone();
+      record.phase = TaskPhase::Running;
+      record.attempts = attempt;
+      if record.started.is_none() {
+        record.started = Some(self.clock.now());
+      }
+      entry.status.send_replace(record);
+      from
+    });
+    match previous {
+      Ok(Some(from)) => {
+        self.observe(id, kind, from, TaskPhase::Running).await;
+        true
+      }
+      Ok(None) | Err(_) => false,
+    }
   }
 
-  /// Publishes the terminal success with its payloads.
-  fn publish_success(
-    &self, id: &TaskId, output: TaskOutput, secret: Option<IssuedMergeCredential>,
+  /// Publishes the terminal success with its payloads and its transition
+  /// observation.
+  async fn publish_success(
+    &self, id: &TaskId, kind: &TaskKind, output: TaskOutput, secret: Option<IssuedMergeCredential>,
   ) {
     let finished = self.clock.now();
-    let _ = self.table.update(id, |entry| {
+    let previous = self.table.update(id, |entry| {
+      let from = entry.status.borrow().phase;
       let mut record = entry.status.borrow().clone();
       record.phase = TaskPhase::Succeeded;
       record.finished = Some(finished);
       entry.output = Some(output);
       entry.secret = secret;
       entry.status.send_replace(record);
+      from
     });
+    if let Ok(Some(from)) = previous {
+      self.observe(id, kind, from, TaskPhase::Succeeded).await;
+    }
   }
 
-  /// Publishes the terminal failure with its typed error.
-  fn publish_failure(&self, id: &TaskId, error: Error) {
+  /// Publishes the terminal failure with its typed error and its
+  /// transition observation.
+  async fn publish_failure(&self, id: &TaskId, kind: &TaskKind, error: Error) {
+    if let Some(from) = self.record_failure(id, error) {
+      self.observe(id, kind, from, TaskPhase::Failed).await;
+    }
+  }
+
+  /// Publishes the terminal failure of an attempt that panicked. The
+  /// failure *is* uncontained user code, so the transition is emitted
+  /// but the hooks are not re-run: hooks never observe their own
+  /// failure. The table publication itself emits nothing a panicking
+  /// hook could abort into.
+  fn publish_panicked(&self, id: &TaskId, kind: &TaskKind, error: Error) {
+    if let Some(from) = self.record_failure(id, error) {
+      self.events.emit(crate::TaskChanged::new(
+        id.clone(),
+        kind.clone(),
+        TaskPhase::Failed,
+      ));
+      tracing::warn!(
+        task = %id,
+        from = ?from,
+        "task failed after a panicking reconcile attempt"
+      );
+    }
+  }
+
+  /// The table half of a terminal failure: the typed error, the finish
+  /// instant, and the phase the entry held before.
+  fn record_failure(&self, id: &TaskId, error: Error) -> Option<TaskPhase> {
     let failure = TaskError::from_error(error);
     let finished = self.clock.now();
-    let _ = self.table.update(id, |entry| {
+    match self.table.update(id, |entry| {
+      let from = entry.status.borrow().phase;
       let mut record = entry.status.borrow().clone();
       record.phase = TaskPhase::Failed;
       record.error = Some(failure);
       record.finished = Some(finished);
       entry.status.send_replace(record);
-    });
+      from
+    }) {
+      Ok(Some(from)) => Some(from),
+      Ok(None) | Err(_) => None,
+    }
+  }
+
+  /// The transition observation, in the design's order: the typed event
+  /// first, then the registered action hooks in canonical tag order.
+  /// Runs inside the task's own future, never on the manager task.
+  async fn observe(&self, id: &TaskId, kind: &TaskKind, from: TaskPhase, to: TaskPhase) {
+    self
+      .events
+      .emit(crate::TaskChanged::new(id.clone(), kind.clone(), to));
+    let transition = crate::task::TaskTransition::new(id.clone(), kind.clone(), from, to);
+    crate::task::notify_action_hooks(&self.extensions.action_hooks(), &transition).await;
   }
 }
 
@@ -413,6 +480,8 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
   let shared = Arc::new(ManagerShared {
     table,
     clock: deps.clock,
+    events: deps.events,
+    extensions: deps.extensions,
     semaphore: Arc::new(Semaphore::new(TASK_RECONCILE_CONCURRENCY)),
   });
   let (reports_tx, reports_rx) = mpsc::unbounded_channel();
@@ -459,19 +528,19 @@ enum WorkerReport {
 }
 
 /// A [`tokio::task::JoinHandle`] that aborts its task on drop: the
-/// shutdown cancel path drops the guard when its select branch loses,
-/// so no detached effect task outlives its worker. (`JoinHandle` is
+/// shutdown cancel path drops the guard when its select branch loses, so
+/// no detached attempt task outlives its worker. (`JoinHandle` is
 /// `Unpin`, so the delegation needs no pin projection.)
-struct AbortOnDrop(tokio::task::JoinHandle<Result<EffectOutcome>>);
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
   fn drop(&mut self) {
     self.0.abort();
   }
 }
 
-impl std::future::Future for AbortOnDrop {
-  type Output = std::result::Result<Result<EffectOutcome>, tokio::task::JoinError>;
+impl<T> std::future::Future for AbortOnDrop<T> {
+  type Output = std::result::Result<T, tokio::task::JoinError>;
 
   fn poll(
     mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>,
@@ -692,6 +761,14 @@ fn admit_inner(
   {
     return Err(Error::internal("task admission"));
   }
+  // The admission transition is an event only: the action hooks first
+  // observe at `Running`, because no caller code ever runs on the
+  // manager task (the admission is crate-side bookkeeping).
+  shared.events.emit(crate::TaskChanged::new(
+    id.clone(),
+    kind.clone(),
+    TaskPhase::Pending,
+  ));
   if let Some(subject) = spec.coalesce_key() {
     coalescing.insert((kind.clone(), subject), (id.clone(), spec.clone()));
   }
@@ -753,61 +830,117 @@ impl Worker {
       Err(_) => {
         self
           .shared
-          .publish_failure(&self.id, Error::internal("task reconcile permit"));
+          .publish_failure(
+            &self.id,
+            &self.kind,
+            Error::internal("task reconcile permit"),
+          )
+          .await;
         return WorkerReport::Terminal(self.id);
       }
     };
-    // The running publication (and its later emission/hook seams) runs
-    // inside this task's own future, never on the manager.
-    if !self.shared.publish_running(&self.id, self.attempt) {
-      return WorkerReport::Terminal(self.id);
-    }
-    // The effect as its own task: panic isolation per task, and the
-    // abort-on-drop guard cancels it when shutdown wins the select.
-    let mut effect = AbortOnDrop(tokio::spawn((self.effect)(self.attempt)));
+    // The whole attempt body — the `Running` publication, its transition
+    // observation (event plus action hooks), the effect, and the terminal
+    // publication — runs as its own spawned task, so a panic anywhere in
+    // it (including inside caller-registered hook code) surfaces as the
+    // aborted join handled below, and the worker always reports back to
+    // the manager. The abort-on-drop guard cancels the body when the
+    // shutdown cancel wins the select.
+    let mut body = AbortOnDrop(tokio::spawn(
+      Attempt {
+        shared: Arc::clone(&self.shared),
+        id: self.id.clone(),
+        kind: self.kind.clone(),
+        effect: self.effect.clone(),
+        attempt: self.attempt,
+      }
+      .run(),
+    ));
     let joined = if cancellable {
       tokio::select! {
-        joined = &mut effect => joined,
+        joined = &mut body => joined,
         _ = self.cancel.changed() => return WorkerReport::Cancelled,
       }
     } else {
-      effect.await
+      body.await
     };
     match joined {
-      Ok(Ok(outcome)) => {
-        let EffectOutcome { output, secret } = outcome;
-        self.shared.publish_success(&self.id, output, secret);
-        WorkerReport::Terminal(self.id)
-      }
-      Ok(Err(error)) => {
-        let policy = retry_policy(&self.kind);
-        if self.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
-          WorkerReport::Retry {
-            id: self.id,
-            kind: self.kind,
-            effect: self.effect,
-            // The wake runs the next attempt: the ticket carries the
-            // incremented index, so the budget is spent monotonically
-            // and the backoff schedule is keyed on the failed attempt.
-            attempt: self.attempt + 1,
-            delay: policy.backoff(self.attempt),
-          }
-        } else {
-          self.shared.publish_failure(&self.id, error);
-          WorkerReport::Terminal(self.id)
-        }
-      }
+      Ok(AttemptOutcome::Terminal) => WorkerReport::Terminal(self.id),
+      Ok(AttemptOutcome::Retry { delay }) => WorkerReport::Retry {
+        id: self.id,
+        kind: self.kind,
+        effect: self.effect,
+        // The wake runs the next attempt: the ticket carries the
+        // incremented index, so the budget is spent monotonically and
+        // the backoff schedule is keyed on the failed attempt.
+        attempt: self.attempt + 1,
+        delay,
+      },
       Err(join_error) => {
-        // The effect future panicked (or was aborted from outside,
-        // which nothing does): the typed internal terminal failure
-        // through the task's own publication path.
+        // The attempt body panicked (or was aborted from outside, which
+        // nothing does): the typed internal terminal failure through the
+        // task's own publication path.
         let failure = if join_error.is_panic() {
           Error::internal("reconciler panicked")
         } else {
           Error::internal("reconciler cancelled")
         };
-        self.shared.publish_failure(&self.id, failure);
+        self.shared.publish_panicked(&self.id, &self.kind, failure);
         WorkerReport::Terminal(self.id)
+      }
+    }
+  }
+}
+
+/// One attempt body, run as its own spawned task (see
+/// [`Worker::run_attempt`]).
+enum AttemptOutcome {
+  /// The task terminalized (succeeded, or failed its last attempt).
+  Terminal,
+  /// The attempt failed retryably; the manager re-arms the delay.
+  Retry { delay: Duration },
+}
+
+struct Attempt {
+  shared: Arc<ManagerShared>,
+  id: TaskId,
+  kind: TaskKind,
+  effect: TaskEffect,
+  attempt: u32,
+}
+
+impl Attempt {
+  async fn run(self) -> AttemptOutcome {
+    if !self
+      .shared
+      .publish_running(&self.id, &self.kind, self.attempt)
+      .await
+    {
+      // The entry is gone (evicted terminal history) or its lock is
+      // poisoned: there is no state left to publish onto.
+      return AttemptOutcome::Terminal;
+    }
+    match (self.effect)(self.attempt).await {
+      Ok(EffectOutcome { output, secret }) => {
+        self
+          .shared
+          .publish_success(&self.id, &self.kind, output, secret)
+          .await;
+        AttemptOutcome::Terminal
+      }
+      Err(error) => {
+        let policy = retry_policy(&self.kind);
+        if self.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
+          AttemptOutcome::Retry {
+            delay: policy.backoff(self.attempt),
+          }
+        } else {
+          self
+            .shared
+            .publish_failure(&self.id, &self.kind, error)
+            .await;
+          AttemptOutcome::Terminal
+        }
       }
     }
   }
@@ -859,14 +992,183 @@ mod tests {
     spawn_task_manager,
   };
   use crate::{
-    Error, ErrorKind, MergeView, NodeId, TaskId, TaskKind, TaskOutput, TaskPhase,
-    identity::testing::SequenceEntropy, task::Task, time::HostWallClock,
+    ActionHook, BoxFuture, Error, ErrorKind, EventOptions, EventReceive, ExtensionRegistry,
+    MergeView, NodeId, QualifiedTag, Result, TaskChanged, TaskId, TaskKind, TaskOutput, TaskPhase,
+    TaskTransition, identity::testing::SequenceEntropy, task::Task, time::HostWallClock,
   };
+
   fn deps() -> TaskManagerDeps {
     TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
+      events: Arc::new(crate::node::EventHub::new()),
+      extensions: Arc::new(crate::ExtensionRegistry::new()),
     }
+  }
+
+  /// One recorded `(hook tag, from, to)` transition observation.
+  type HookCall = (&'static str, TaskPhase, TaskPhase);
+
+  /// An action hook recording every transition it observes, tagged so a
+  /// test can assert the canonical tag order of the sequence.
+  #[derive(Debug)]
+  struct RecordingHook {
+    tag: &'static str,
+    calls: Arc<Mutex<Vec<HookCall>>>,
+  }
+
+  impl ActionHook for RecordingHook {
+    fn on_transition<'a>(&'a self, transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      Box::pin(async move {
+        self
+          .calls
+          .lock()
+          .expect("hook calls")
+          .push((self.tag, transition.from(), transition.to()));
+        Ok(())
+      })
+    }
+  }
+
+  /// An action hook that panics on every transition it observes.
+  #[derive(Debug)]
+  struct PanickingHook;
+
+  impl ActionHook for PanickingHook {
+    fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      Box::pin(async { panic!("scripted action hook panic") })
+    }
+  }
+
+  #[tokio::test]
+  async fn action_hooks_run_in_canonical_tag_order() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut extensions = ExtensionRegistry::new();
+    // Registered out of tag order: the registry's own order (not the
+    // registration order) decides who observes first.
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/zeta").expect("tag"),
+        Arc::new(RecordingHook {
+          tag: "zeta",
+          calls: Arc::clone(&calls),
+        }),
+      )
+      .expect("registration");
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/alpha").expect("tag"),
+        Arc::new(RecordingHook {
+          tag: "alpha",
+          calls: Arc::clone(&calls),
+        }),
+      )
+      .expect("registration");
+    let (client, _manager) = spawn_task_manager(TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      events: Arc::new(crate::node::EventHub::new()),
+      extensions: Arc::new(extensions),
+    })
+    .expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("admission");
+    handle::<()>(&client, &id, TaskKind::SyncRound)
+      .wait()
+      .await
+      .expect("terminal");
+    assert_eq!(
+      calls.lock().expect("hook calls").clone(),
+      vec![
+        ("alpha", TaskPhase::Pending, TaskPhase::Running),
+        ("zeta", TaskPhase::Pending, TaskPhase::Running),
+        ("alpha", TaskPhase::Running, TaskPhase::Succeeded),
+        ("zeta", TaskPhase::Running, TaskPhase::Succeeded),
+      ]
+    );
+  }
+
+  #[tokio::test]
+  async fn a_panicking_action_hook_fails_the_task_typed_and_the_manager_keeps_serving() {
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/boom").expect("tag"),
+        Arc::new(PanickingHook),
+      )
+      .expect("registration");
+    let (client, _manager) = spawn_task_manager(TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      events: Arc::new(crate::node::EventHub::new()),
+      extensions: Arc::new(extensions),
+    })
+    .expect("manager");
+    for counter in 0..2 {
+      let id = client
+        .submit(
+          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          ok_effect(TaskOutput::SyncRound(())),
+        )
+        .await
+        .expect("admission");
+      let error = handle::<()>(&client, &id, TaskKind::SyncRound)
+        .wait()
+        .await
+        .expect_err("panicking hook");
+      assert_eq!(error.kind(), ErrorKind::Internal);
+      assert_eq!(error.context(), "reconciler panicked");
+      assert_eq!(
+        handle::<()>(&client, &id, TaskKind::SyncRound)
+          .status()
+          .phase(),
+        TaskPhase::Failed,
+        "submission {counter} terminalized"
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn every_transition_emits_its_task_changed_event() {
+    let events = Arc::new(crate::node::EventHub::new());
+    let mut subscription =
+      events.subscribe::<TaskChanged>(EventOptions::new().capacity(16).expect("capacity"));
+    let (client, _manager) = spawn_task_manager(TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      events: Arc::clone(&events),
+      extensions: Arc::new(crate::ExtensionRegistry::new()),
+    })
+    .expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("admission");
+    handle::<()>(&client, &id, TaskKind::SyncRound)
+      .wait()
+      .await
+      .expect("terminal");
+    let mut phases = Vec::new();
+    while phases.len() < 3 {
+      let EventReceive::Item(event) = subscription.recv().await.expect("event") else {
+        panic!("unexpected subscription state");
+      };
+      assert_eq!(event.task(), &id);
+      assert_eq!(event.kind(), &TaskKind::SyncRound);
+      phases.push(event.phase());
+    }
+    assert_eq!(
+      phases,
+      vec![TaskPhase::Pending, TaskPhase::Running, TaskPhase::Succeeded]
+    );
   }
 
   fn node(suffix: char) -> NodeId {

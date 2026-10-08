@@ -77,6 +77,9 @@ pub struct ExtensionRegistry {
   load_balancers:
     std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
   next_hops: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
+  resource_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ResourceHook>>>,
+  action_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ActionHook>>>,
+  task_reconcilers: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::TaskReconciler>>>,
 }
 
 impl ExtensionRegistry {
@@ -272,6 +275,76 @@ impl ExtensionRegistry {
       .and_then(|policies| policies.get(tag).cloned())
   }
 
+  /// Registers one resource-write hook under a canonical tag. All hooks
+  /// registered here run in canonical tag order; a duplicate tag is a
+  /// conflict and registration never replaces an existing entry.
+  pub fn register_resource_hook(
+    &mut self, tag: crate::QualifiedTag, hook: Arc<dyn crate::ResourceHook>,
+  ) -> Result<&mut Self> {
+    {
+      let mut hooks = self
+        .resource_hooks
+        .lock()
+        .map_err(Error::extension_registry)?;
+      insert_once(&mut hooks, tag, hook, "resource hook registration")?;
+    }
+    Ok(self)
+  }
+
+  /// Registers one task phase-transition observer under a canonical tag.
+  /// All hooks registered here run in canonical tag order; a duplicate
+  /// tag is a conflict and registration never replaces an existing entry.
+  pub fn register_action_hook(
+    &mut self, tag: crate::QualifiedTag, hook: Arc<dyn crate::ActionHook>,
+  ) -> Result<&mut Self> {
+    {
+      let mut hooks = self
+        .action_hooks
+        .lock()
+        .map_err(Error::extension_registry)?;
+      insert_once(&mut hooks, tag, hook, "action hook registration")?;
+    }
+    Ok(self)
+  }
+
+  /// Registers one custom task kind's reconciler under the kind tag.
+  /// A duplicate tag is a conflict. The built-in `radiata.woooo.tech`
+  /// domain is reserved: the core kinds are the [`crate::TaskKind`] set,
+  /// never tags, so a reconciler registered under that domain is refused
+  /// (the same reserved-domain rule the tag grammar applies to crypto
+  /// tags).
+  pub fn register_task_reconciler(
+    &mut self, kind: crate::QualifiedTag, reconciler: Arc<dyn crate::TaskReconciler>,
+  ) -> Result<&mut Self> {
+    if kind.domain() == crate::protocol::tag::BUILTIN_DOMAIN {
+      return Err(Error::invalid_input("task reconciler kind"));
+    }
+    {
+      let mut reconcilers = self
+        .task_reconcilers
+        .lock()
+        .map_err(Error::extension_registry)?;
+      insert_once(
+        &mut reconcilers,
+        kind,
+        reconciler,
+        "task reconciler registration",
+      )?;
+    }
+    Ok(self)
+  }
+
+  /// The registered action hooks in canonical tag order (the order they
+  /// observe a transition in). Cloned per transition: the hook map is a
+  /// `std` mutex and must not be held across the hooks' awaits.
+  pub(crate) fn action_hooks(&self) -> Vec<Arc<dyn crate::ActionHook>> {
+    self
+      .action_hooks
+      .lock()
+      .map(|hooks| hooks.values().cloned().collect())
+      .unwrap_or_default()
+  }
+
   /// Registers one packet protocol and its consumer. A duplicate protocol
   /// tag is a conflict; registration never replaces an existing entry.
   pub fn register_protocol(
@@ -355,6 +428,30 @@ impl fmt::Debug for ExtensionRegistry {
           .map(|policies| policies.len())
           .unwrap_or(0),
       )
+      .field(
+        "resource_hooks",
+        &self
+          .resource_hooks
+          .lock()
+          .map(|hooks| hooks.len())
+          .unwrap_or(0),
+      )
+      .field(
+        "action_hooks",
+        &self
+          .action_hooks
+          .lock()
+          .map(|hooks| hooks.len())
+          .unwrap_or(0),
+      )
+      .field(
+        "task_reconcilers",
+        &self
+          .task_reconcilers
+          .lock()
+          .map(|reconcilers| reconcilers.len())
+          .unwrap_or(0),
+      )
       .finish()
   }
 }
@@ -390,6 +487,27 @@ mod tests {
     }
   }
 
+  #[derive(Debug)]
+  struct NoopResourceHook;
+
+  impl crate::ResourceHook for NoopResourceHook {}
+
+  #[derive(Debug)]
+  struct NoopActionHook;
+
+  impl crate::ActionHook for NoopActionHook {}
+
+  #[derive(Debug)]
+  struct NoopReconciler;
+
+  impl crate::TaskReconciler for NoopReconciler {
+    fn reconcile<'a>(
+      &'a self, _ctx: crate::ReconcileContext,
+    ) -> crate::BoxFuture<'a, Result<crate::ReconcileDecision>> {
+      Box::pin(async { Ok(crate::ReconcileDecision::Succeeded) })
+    }
+  }
+
   fn definition(name: &str) -> ProtocolDefinition {
     ProtocolDefinition::new(
       ProtocolTag::parse(&format!("radiata.woooo.tech/protocols/{name}")).unwrap(),
@@ -422,6 +540,65 @@ mod tests {
     assert!(
       !registry.has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/gamma").unwrap())
     );
+  }
+
+  /// The three hook maps follow the same insertion-once rule as every
+  /// other registry map, and the registry's `Debug` keeps summarizing
+  /// them as counts.
+  #[test]
+  fn hook_registrations_are_insertion_once() {
+    let mut registry = ExtensionRegistry::new();
+    let alpha = crate::QualifiedTag::parse("example.com/hooks/alpha").unwrap();
+    let zeta = crate::QualifiedTag::parse("example.com/hooks/zeta").unwrap();
+    registry
+      .register_action_hook(zeta, Arc::new(NoopActionHook))
+      .unwrap();
+    registry
+      .register_action_hook(alpha.clone(), Arc::new(NoopActionHook))
+      .unwrap();
+    let duplicate = registry
+      .register_action_hook(alpha, Arc::new(NoopActionHook))
+      .unwrap_err();
+    assert_eq!(duplicate.kind(), ErrorKind::Conflict);
+
+    let guard = crate::QualifiedTag::parse("example.com/hooks/guard").unwrap();
+    registry
+      .register_resource_hook(guard.clone(), Arc::new(NoopResourceHook))
+      .unwrap();
+    let duplicate = registry
+      .register_resource_hook(guard, Arc::new(NoopResourceHook))
+      .unwrap_err();
+    assert_eq!(duplicate.kind(), ErrorKind::Conflict);
+
+    // The hook order the manager runs is the registry's own tag order.
+    assert_eq!(registry.action_hooks().len(), 2);
+    let summary = format!("{registry:?}");
+    assert!(summary.contains("action_hooks: 2"), "{summary}");
+    assert!(summary.contains("resource_hooks: 1"), "{summary}");
+  }
+
+  /// Core kinds are the `TaskKind` set, never tags: the built-in domain
+  /// is reserved for task-reconciler registrations, and caller domains
+  /// register under the ordinary duplicate rule.
+  #[test]
+  fn task_reconciler_registration_reserves_the_builtin_domain() {
+    let mut registry = ExtensionRegistry::new();
+    let builtin = crate::QualifiedTag::parse("radiata.woooo.tech/tasks/rotate").unwrap();
+    let refused = registry
+      .register_task_reconciler(builtin, Arc::new(NoopReconciler))
+      .unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(refused.context(), "task reconciler kind");
+
+    let caller = crate::QualifiedTag::parse("example.com/tasks/rotate-secret").unwrap();
+    registry
+      .register_task_reconciler(caller.clone(), Arc::new(NoopReconciler))
+      .unwrap();
+    let duplicate = registry
+      .register_task_reconciler(caller, Arc::new(NoopReconciler))
+      .unwrap_err();
+    assert_eq!(duplicate.kind(), ErrorKind::Conflict);
+    assert!(format!("{registry:?}").contains("task_reconcilers: 1"));
   }
 
   /// The built-in next-hop policy's well-known tag is an ordinary

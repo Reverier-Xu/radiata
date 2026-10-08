@@ -88,7 +88,10 @@ pub use routing::{
   CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteContext,
   RouteNextHop, Selector,
 };
-pub use task::{CredentialIssued, Task, TaskError, TaskKind, TaskOutput, TaskPhase, TaskStatus};
+pub use task::{
+  ActionHook, CredentialIssued, CustomTaskSpec, ReconcileContext, ReconcileDecision, ResourceHook,
+  Task, TaskError, TaskKind, TaskOutput, TaskPhase, TaskReconciler, TaskStatus, TaskTransition,
+};
 pub use transport::{
   Endpoint, PageCursor, ProviderListener, TransportName, TransportProvider, TransportScheme,
   TransportSelector, TransportStream,
