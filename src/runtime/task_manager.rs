@@ -431,8 +431,8 @@ impl ManagerShared {
   /// Publishes the terminal failure of an attempt that panicked. The
   /// failure *is* uncontained user code, so the transition is emitted
   /// but the hooks are not re-run: hooks never observe their own
-  /// failure. The table publication itself emits nothing a panicking
-  /// hook could abort into.
+  /// failure. The table publication itself is crate code, so nothing a
+  /// panicking hook could do remains on this path.
   fn publish_panicked(&self, id: &TaskId, kind: &TaskKind, error: Error) {
     if let Some(from) = self.record_failure(id, error) {
       self.events.emit(crate::TaskChanged::new(
@@ -445,24 +445,37 @@ impl ManagerShared {
         from = ?from,
         "task failed after a panicking reconcile attempt"
       );
+    } else {
+      // The entry already terminalized: the panic landed in the terminal
+      // transition's own observation (a hook panicking on `Succeeded`),
+      // and terminality is monotone, so the phase stands.
+      tracing::warn!(
+        task = %id,
+        "a reconcile attempt panicked after the task terminalized"
+      );
     }
   }
 
   /// The table half of a terminal failure: the typed error, the finish
-  /// instant, and the phase the entry held before.
+  /// instant, and the phase the entry held before. `None` when the entry
+  /// is gone, or already terminal — no phase transition ever leaves a
+  /// terminal state, so a failure publication never overwrites one.
   fn record_failure(&self, id: &TaskId, error: Error) -> Option<TaskPhase> {
     let failure = TaskError::from_error(error);
     let finished = self.clock.now();
     match self.table.update(id, |entry| {
       let from = entry.status.borrow().phase;
+      if from.is_terminal() {
+        return None;
+      }
       let mut record = entry.status.borrow().clone();
       record.phase = TaskPhase::Failed;
       record.error = Some(failure);
       record.finished = Some(finished);
       entry.status.send_replace(record);
-      from
+      Some(from)
     }) {
-      Ok(Some(from)) => Some(from),
+      Ok(Some(from)) => from,
       Ok(None) | Err(_) => None,
     }
   }
@@ -1071,6 +1084,19 @@ mod tests {
     }
   }
 
+  /// An action hook that panics only on the terminal success transition.
+  #[derive(Debug)]
+  struct PanicOnSucceededHook;
+
+  impl ActionHook for PanicOnSucceededHook {
+    fn on_transition<'a>(&'a self, transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      Box::pin(async move {
+        assert_ne!(transition.to(), TaskPhase::Succeeded, "scripted hook panic");
+        Ok(())
+      })
+    }
+  }
+
   #[tokio::test]
   async fn action_hooks_run_in_canonical_tag_order() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1158,6 +1184,42 @@ mod tests {
         "submission {counter} terminalized"
       );
     }
+  }
+
+  #[tokio::test]
+  async fn a_panicking_terminal_hook_leaves_the_succeeded_phase_standing() {
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/late-boom").expect("tag"),
+        Arc::new(PanicOnSucceededHook),
+      )
+      .expect("registration");
+    let (client, _manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
+    .expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("admission");
+    // The effect succeeded and published `Succeeded`; the hook panicked
+    // while observing that terminal transition. Terminality is monotone,
+    // so the phase stands and the waiter still receives the outcome.
+    handle::<()>(&client, &id, TaskKind::SyncRound)
+      .wait()
+      .await
+      .expect("the terminal success stands");
+    assert_eq!(
+      handle::<()>(&client, &id, TaskKind::SyncRound)
+        .status()
+        .phase(),
+      TaskPhase::Succeeded
+    );
   }
 
   #[tokio::test]
