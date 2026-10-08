@@ -293,36 +293,41 @@ impl NodeHandle {
   /// closes the identity's sessions and rejects its new sessions, raw
   /// grants, and admissions — without deleting or reinterpreting any
   /// stored metadata. `expected_key` pins the exact trusted binding so a
-  /// stale or substituted revocation fails closed.
-  pub async fn revoke(&self, subject: NodeId, expected_key: PublicKey) -> Result<RevokeOutcome> {
-    self
-      .runtime
-      .send_command(move |reply| Control::RevokeNode {
-        subject,
-        expected_key,
-        reply,
-      })
-      .await
+  /// stale or substituted revocation fails closed. Returns the admitted
+  /// [`Task`], whose `wait` resolves with the outcome (already-revoked is
+  /// a success, not an error).
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal, the self-subject refusal, and the
+  /// expected-key pin are effect-time and surface on the task's `wait`.
+  pub async fn revoke(
+    &self, subject: NodeId, expected_key: PublicKey,
+  ) -> Result<Task<RevokeOutcome>> {
+    crate::runtime::revoke(self.runtime.admit()?, subject, expected_key).await
   }
 
   /// Explicitly clears the local revocation record for one subject.
-  /// Local-only and idempotent.
-  pub async fn purge_revocation(&self, subject: NodeId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::PurgeRevocation { subject, reply })
-      .await
+  /// Local-only and idempotent. Returns the admitted [`Task`], whose
+  /// `wait` resolves once the record is gone.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal is effect-time and surfaces on the
+  /// task's `wait`.
+  pub async fn purge_revocation(&self, subject: NodeId) -> Result<Task<()>> {
+    crate::runtime::purge_revocation(self.runtime.admit()?, subject).await
   }
 
   /// Issues a convergent issuer-signed cleanup tombstone for one
   /// decommissioned node. Terminal: there is no
   /// resurrection path. The caller is responsible for never cleaning a
-  /// node that is merely offline.
-  pub async fn cleanup(&self, subject: NodeId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::CleanupNode { subject, reply })
-      .await
+  /// node that is merely offline. Returns the admitted [`Task`], whose
+  /// `wait` resolves once the tombstone is persisted.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal and the self-subject refusal are
+  /// effect-time and surface on the task's `wait`.
+  pub async fn cleanup(&self, subject: NodeId) -> Result<Task<()>> {
+    crate::runtime::cleanup(self.runtime.admit()?, subject).await
   }
 
   /// Starts a new cleanup checkpoint GC epoch at the current wall
@@ -333,12 +338,14 @@ impl NodeHandle {
   /// self whose removal record is not terminal (left or cleaned) lacks a
   /// live authenticated session, because tombstones that member has not
   /// received yet could be collected by the new epoch. Re-issue once the
-  /// member is connected. Returns the persisted watermark.
-  pub async fn issue_cleanup_checkpoint(&self) -> Result<u64> {
-    self
-      .runtime
-      .send_command(|reply| Control::IssueCleanupCheckpoint { reply })
-      .await
+  /// member is connected. Returns the admitted [`Task`], whose `wait`
+  /// resolves with the persisted watermark.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal and the member-connectivity
+  /// precondition are effect-time and surface on the task's `wait`.
+  pub async fn issue_cleanup_checkpoint(&self) -> Result<Task<u64>> {
+    crate::runtime::issue_cleanup_checkpoint(self.runtime.admit()?).await
   }
 
   /// Resolves a metadata store frozen on a pending journal whose
@@ -365,16 +372,17 @@ impl NodeHandle {
   /// On a store that is not frozen on a resolvable pending journal — a
   /// ready store, an in-flight commit, or a freeze matching no durable
   /// journal record — the command fails typed without changing anything.
+  /// Returns the admitted [`Task`], whose `wait` resolves once the store
+  /// is unfrozen. The task is deliberately non-cancellable on shutdown:
+  /// the resolution is one atomic store transaction.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// a missing acknowledgement marker); the store's evidence verdict on
+  /// the declaration is effect-time and surfaces on the task's `wait`.
   pub async fn resolve_frozen_journal(
     &self, acknowledgement: DeclareInterruptedTransactionUncommitted,
-  ) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::ResolveFrozenJournal {
-        acknowledgement,
-        reply,
-      })
-      .await
+  ) -> Result<Task<()>> {
+    crate::runtime::resolve_frozen_journal(self.runtime.admit()?, acknowledgement).await
   }
 
   // -- maintenance and diagnostics -------------------------------------

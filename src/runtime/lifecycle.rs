@@ -143,22 +143,6 @@ pub(crate) enum Control {
     expected: Option<crate::ResourceVersion>,
     reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
   },
-  RevokeNode {
-    subject: NodeId,
-    expected_key: crate::PublicKey,
-    reply: oneshot::Sender<Result<crate::RevokeOutcome>>,
-  },
-  PurgeRevocation {
-    subject: NodeId,
-    reply: oneshot::Sender<Result<()>>,
-  },
-  CleanupNode {
-    subject: NodeId,
-    reply: oneshot::Sender<Result<()>>,
-  },
-  IssueCleanupCheckpoint {
-    reply: oneshot::Sender<Result<u64>>,
-  },
   ApplyReceiptRetention {
     reply: oneshot::Sender<Result<crate::view::ReceiptRetentionReport>>,
   },
@@ -173,10 +157,6 @@ pub(crate) enum Control {
   LeaveCluster {
     acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
     reply: oneshot::Sender<Result<crate::LeaveOutcome>>,
-  },
-  ResolveFrozenJournal {
-    acknowledgement: crate::DeclareInterruptedTransactionUncommitted,
-    reply: oneshot::Sender<Result<()>>,
   },
   Observability {
     reply: oneshot::Sender<Result<crate::ObservabilitySnapshot>>,

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use super::{
-  recovery::Departed,
+  recovery::departed_exclusions,
   supervisor::{
     ListenerRegistry, RuntimeDependencies, connect_with_deadline, dial_member,
     keep_outbound_session,
@@ -28,7 +28,7 @@ use super::{
   task_manager::{EffectOutcome, TaskClient, TaskEffect, TaskPayload, TaskSpec},
 };
 use crate::{
-  Endpoint, Error, MergeView, NodeConfig, NodeId, Result, StoreRevision, Task, TaskKind,
+  Endpoint, Error, MergeView, NodeConfig, NodeId, PublicKey, Result, RevokeOutcome, Task, TaskKind,
   TaskOutput,
   api::Entropy,
   extension_registry::ExtensionRegistry,
@@ -57,7 +57,6 @@ pub(crate) struct EffectPlanes {
   /// The calibrated node configuration (dial deadline, admission limits).
   pub(crate) config: NodeConfig,
   /// The node's entropy source (the effects' draws).
-  #[allow(dead_code)] // read by the identity-effect stage; that migration lands next
   pub(crate) entropy: Arc<dyn Entropy>,
   /// The session driver shared with the supervisor and the recovery
   /// plane: its credential issuer and leaf-SPKI anchors are process-wide.
@@ -75,7 +74,6 @@ pub(crate) struct EffectPlanes {
   pub(crate) connection_tasks: ConnectionTasks,
   /// The member-set revision signal, bumped one-to-one with the member
   /// events the identity effects emit.
-  #[allow(dead_code)] // bumped by the identity-effect stage; that migration lands next
   pub(crate) member_revision: MemberRevisionSignal,
   /// The leave-plane applied-receipt signal the announcement parks on.
   #[allow(dead_code)] // read by the leave-effect stage; that migration lands next
@@ -90,8 +88,7 @@ pub(crate) struct EffectPlanes {
   pub(crate) published_endpoints: Arc<Mutex<Vec<Endpoint>>>,
   /// The memoized departed-members exclusion set, shared with the
   /// supervisor's own pages: the checkpoint guard reads the same cache.
-  #[allow(dead_code)] // read by the identity-effect stage; that migration lands next
-  pub(crate) exclusion_cache: Arc<Mutex<Option<(StoreRevision, Departed)>>>,
+  pub(crate) exclusion_cache: super::recovery::ExclusionCache,
 }
 
 /// The node-shared operation handles behind every migrated mutating verb,
@@ -162,24 +159,6 @@ impl OperationDeps {
   /// The node-local extension registry.
   pub(super) fn extensions(&self) -> &Arc<ExtensionRegistry> {
     &self.extensions
-  }
-
-  /// The process-wide session driver (one credential issuer, one
-  /// leaf-SPKI anchor table). Production incarnations always carry it.
-  pub(super) fn driver(&self) -> Result<&SessionDriver> {
-    Ok(&self.planes()?.driver)
-  }
-
-  /// The node-shared packet context every kept session routes through.
-  /// Production incarnations always carry it.
-  pub(super) fn packet(&self) -> Result<&Arc<SessionPacketContext>> {
-    Ok(&self.planes()?.packet)
-  }
-
-  /// The graceful-shutdown signal every kept session observes.
-  /// Production incarnations always carry it.
-  pub(super) fn shutdown(&self) -> Result<&watch::Sender<()>> {
-    Ok(&self.planes()?.shutdown)
   }
 
   /// The effect planes: every production incarnation carries them; the
@@ -363,4 +342,313 @@ fn track_connection_task(
   if let Ok(mut tasks) = tasks.lock() {
     tasks.push(handle);
   }
+}
+
+// -- identity, trust, and cleanup verbs ---------------------------------
+
+/// Admits one revocation of an exact subject binding. The effect signs and
+/// commits the tombstone, closes the subject's sessions, and announces the
+/// revocation.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the frozen-store refusal, the self-subject refusal, and the
+/// expected-key pin are effect-time and surface on the task's
+/// [`Task::wait`].
+pub(crate) async fn revoke(
+  tasks: &TaskClient, subject: NodeId, expected_key: PublicKey,
+) -> Result<Task<RevokeOutcome>> {
+  let payload = TaskPayload::Peer(subject.clone());
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let subject = subject.clone();
+    let expected_key = expected_key.clone();
+    Box::pin(async move { reconcile_revoke(deps, subject, expected_key).await })
+  });
+  let id = tasks
+    .submit(TaskSpec::new(TaskKind::Revoke, payload), effect)
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::Revoke,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one local revocation-record purge. The effect deletes the
+/// record; the purge is local-only and idempotent.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the frozen-store refusal is effect-time and surfaces on the
+/// task's [`Task::wait`].
+pub(crate) async fn purge_revocation(tasks: &TaskClient, subject: NodeId) -> Result<Task<()>> {
+  let payload = TaskPayload::Peer(subject.clone());
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let subject = subject.clone();
+    Box::pin(async move { reconcile_purge_revocation(deps, subject).await })
+  });
+  let id = tasks
+    .submit(TaskSpec::new(TaskKind::PurgeRevocation, payload), effect)
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::PurgeRevocation,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one convergent issuer-signed cleanup tombstone for a
+/// decommissioned node. The effect signs and persists the record.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the frozen-store refusal and the self-subject refusal are
+/// effect-time and surface on the task's [`Task::wait`].
+pub(crate) async fn cleanup(tasks: &TaskClient, subject: NodeId) -> Result<Task<()>> {
+  let payload = TaskPayload::Peer(subject.clone());
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let subject = subject.clone();
+    Box::pin(async move { reconcile_cleanup(deps, subject).await })
+  });
+  let id = tasks
+    .submit(TaskSpec::new(TaskKind::Cleanup, payload), effect)
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::Cleanup,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one cleanup checkpoint GC epoch. The effect enforces the
+/// convergence precondition (every non-terminal member connected) and
+/// persists the watermark.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the frozen-store refusal and the member-connectivity
+/// precondition are effect-time and surface on the task's [`Task::wait`]
+/// (the precondition as [`crate::ErrorKind::NotReady`]).
+pub(crate) async fn issue_cleanup_checkpoint(tasks: &TaskClient) -> Result<Task<u64>> {
+  let effect: TaskEffect = Arc::new(|deps, _attempt| {
+    Box::pin(async move { reconcile_issue_cleanup_checkpoint(deps).await })
+  });
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::IssueCleanupCheckpoint, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::IssueCleanupCheckpoint,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one operator-acknowledged frozen-journal resolution. The effect
+/// re-checks the durable evidence and resolves the frozen pending journal
+/// in one atomic transaction.
+///
+/// Admission-time failures are the pure shape checks (a stopped node, a
+/// missing acknowledgement marker); the store's evidence verdict on the
+/// declaration is effect-time and surfaces on the task's [`Task::wait`].
+pub(crate) async fn resolve_frozen_journal(
+  tasks: &TaskClient, acknowledgement: crate::DeclareInterruptedTransactionUncommitted,
+) -> Result<Task<()>> {
+  // The acknowledgement is a proof-of-construction marker: only the
+  // deliberate constructor produces it.
+  if !acknowledgement.is_acknowledged() {
+    return Err(Error::invalid_input("frozen journal acknowledgement"));
+  }
+  let effect: TaskEffect = Arc::new(|deps, _attempt| {
+    Box::pin(async move { reconcile_resolve_frozen_journal(deps).await })
+  });
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::ResolveFrozenJournal, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::ResolveFrozenJournal,
+    tasks.observer.clone(),
+  ))
+}
+
+/// The revoke effect: sign the tombstone against the pinned expected key,
+/// commit it, then close the exact identity's sessions and announce the
+/// revocation (skipped when the binding was already revoked — the record
+/// is permanent until an explicit local purge).
+async fn reconcile_revoke(
+  deps: Arc<OperationDeps>, subject: NodeId, expected_key: PublicKey,
+) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  let context = &planes.context;
+  if &subject == context.identity().node() {
+    // Self-removal is the explicit leave path, never a self-revoke.
+    return Err(Error::invalid_input("revoke subject"));
+  }
+  // The tombstone is issuer-signed and converges through the sync plane:
+  // any member may expel a compromised binding cluster-wide, and the
+  // record is permanent until an explicit local purge.
+  let record = crate::identity::revocation::sign_revocation_record(
+    context,
+    context.keys(),
+    &subject,
+    &expected_key,
+  )
+  .await?;
+  let outcome = crate::identity::revocation::revoke_binding_ctx(
+    context.store(),
+    planes.entropy.as_ref(),
+    &record,
+  )
+  .await?;
+  let was_already_revoked = matches!(
+    outcome,
+    crate::identity::revocation::RevokeStoreOutcome::AlreadyRevoked
+  );
+  if !was_already_revoked {
+    // After the known-committed transition: close the exact identity's
+    // active sessions. Redial is impossible by construction — the revoked
+    // binding is gone, so neither recovery candidates nor an inbound
+    // handshake can admit this identity again.
+    retire_session(&planes.sessions, &subject)?;
+    deps
+      .events()
+      .emit(crate::SessionChanged::new(subject.clone()));
+    deps.events().emit(crate::NodeRevoked::new(subject.clone()));
+  }
+  Ok(EffectOutcome::new(TaskOutput::Revoke(RevokeOutcome::new(
+    subject,
+    was_already_revoked,
+  ))))
+}
+
+/// The cleanup effect: sign and persist one convergent cleanup tombstone,
+/// then announce the member change.
+async fn reconcile_cleanup(deps: Arc<OperationDeps>, subject: NodeId) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  let context = &planes.context;
+  if &subject == context.identity().node() {
+    // Self-removal is the explicit leave path, never a self-cleanup.
+    return Err(Error::invalid_input("cleanup subject"));
+  }
+  let record =
+    crate::identity::cleanup::sign_cleanup_record(context, context.keys(), &subject).await?;
+  crate::identity::cleanup::persist_cleanup_record_ctx(
+    context.store(),
+    planes.entropy.as_ref(),
+    &record,
+  )
+  .await?;
+  deps.events().emit(crate::MemberChanged::new(subject));
+  planes.member_revision.bump();
+  Ok(EffectOutcome::new(TaskOutput::Cleanup(())))
+}
+
+/// The purge effect: clear the local revocation record (local-only,
+/// idempotent, deliberate).
+async fn reconcile_purge_revocation(
+  deps: Arc<OperationDeps>, subject: NodeId,
+) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  crate::identity::revocation::purge_revocation_ctx(
+    planes.context.store(),
+    planes.entropy.as_ref(),
+    &subject,
+  )
+  .await?;
+  Ok(EffectOutcome::new(TaskOutput::PurgeRevocation(())))
+}
+
+/// The checkpoint effect: enforce the convergence precondition, then
+/// start the new GC epoch at the current wall clock.
+async fn reconcile_issue_cleanup_checkpoint(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  require_members_connected(planes).await?;
+  let watermark =
+    crate::identity::cleanup::issue_checkpoint_ctx(&planes.context, planes.entropy.as_ref())
+      .await?;
+  Ok(EffectOutcome::new(TaskOutput::IssueCleanupCheckpoint(
+    watermark,
+  )))
+}
+
+/// The frozen-journal resolution effect: resolve the store's frozen
+/// pending journal as uncommitted and unfreeze the store. The store's
+/// blocked state is this operation's precondition, so the
+/// `require_unblocked` gate that refuses admission-sensitive effects
+/// while frozen deliberately does not apply here. The effect deliberately
+/// does not queue on the store's writer exclusion: on a frozen store the
+/// background anti-entropy writers park inside that exclusion on the
+/// commit-slot refusal and would starve the operator resolution forever.
+async fn reconcile_resolve_frozen_journal(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  let operation = crate::TransactionId::generate(planes.entropy.as_ref())?;
+  planes
+    .context
+    .store()
+    .resolve_frozen_journal_uncommitted(operation)
+    .await?;
+  Ok(EffectOutcome::new(TaskOutput::ResolveFrozenJournal(())))
+}
+
+/// The checkpoint issue precondition: every known member other than self
+/// whose removal record is not terminal (left or cleaned) must hold at
+/// least one live authenticated session — the crate's own any-one-route
+/// connectivity contract. A non-terminal member is still owed tombstone
+/// deliveries, so an epoch issued while it is unreachable could collect
+/// records it has not received yet; a member with a terminal removal
+/// record is exactly what the epoch may collect and never blocks. A
+/// singleton cluster passes trivially (no other member).
+async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
+  // Snapshot the live-session peers under the lock, then release it
+  // before any await so the effect future stays `Send`.
+  let live: std::collections::BTreeSet<NodeId> = planes
+    .sessions
+    .lock()
+    .map_err(Error::session_table)?
+    .iter()
+    .filter(|(_, entry)| entry.alive())
+    .map(|(peer, _)| peer.clone())
+    .collect();
+  let store = planes.context.store();
+  let departed = departed_exclusions(&planes.exclusion_cache, store).await?;
+  let snapshot = store.snapshot().await?;
+  let namespace = crate::membership::descriptor_namespace()?;
+  let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
+  let mut unreachable = 0_usize;
+  while let Some(entry) = scan.next().await? {
+    let descriptor = match crate::membership::page::decode_descriptor(entry.value().as_bytes()) {
+      Ok(descriptor) => descriptor,
+      // The scan is best-effort over durable evidence, matching the
+      // recovery tick's enumeration; an undecodable entry stays visible
+      // in diagnostics.
+      Err(error) => {
+        tracing::debug!(kind = ?error.kind(), "checkpoint guard skipped an undecodable descriptor");
+        continue;
+      }
+    };
+    let node = descriptor.node();
+    if descriptor.removed()
+      || node == planes.context.identity().node()
+      || departed.status(node) != crate::MemberStatus::Active
+    {
+      continue;
+    }
+    if !live.contains(node) {
+      unreachable += 1;
+    }
+  }
+  if unreachable > 0 {
+    tracing::debug!(
+      unreachable,
+      "cleanup checkpoint refused: non-terminal members without a live session"
+    );
+    return Err(Error::not_ready("cleanup checkpoint"));
+  }
+  Ok(())
 }

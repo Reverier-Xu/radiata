@@ -167,6 +167,9 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
     .handle
     .revoke(member.id.clone(), member_key.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   assert_eq!(outcome.subject(), &member.id);
   assert!(!outcome.was_already_revoked());
@@ -293,6 +296,9 @@ async fn revoke_is_exact_and_idempotent() {
       .handle
       .revoke(unknown, member_key.clone())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err()
       .kind(),
     ErrorKind::NotFound
@@ -303,6 +309,9 @@ async fn revoke_is_exact_and_idempotent() {
     issuer
       .handle
       .revoke(member.id.clone(), wrong_key)
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap_err()
       .kind(),
@@ -315,6 +324,9 @@ async fn revoke_is_exact_and_idempotent() {
     issuer
       .handle
       .revoke(issuer_id, issuer_key)
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap_err()
       .kind(),
@@ -330,6 +342,9 @@ async fn revoke_is_exact_and_idempotent() {
     .handle
     .revoke(member.id.clone(), member_key.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   assert!(!outcome.was_already_revoked());
   let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -341,6 +356,9 @@ async fn revoke_is_exact_and_idempotent() {
   let outcome = issuer
     .handle
     .revoke(member.id.clone(), member_key)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(outcome.was_already_revoked());
@@ -389,6 +407,9 @@ async fn delayed_content_converges_after_revoke() {
   issuer
     .handle
     .revoke(member_id.clone(), member_key)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 

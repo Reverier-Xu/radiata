@@ -1125,6 +1125,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .handle
     .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert_eq!(frozen_rejection.kind(), radiata::ErrorKind::Conflict);
   let _still_serving: LocalNodeView = member.handle.local_node().await.unwrap();

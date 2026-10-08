@@ -154,17 +154,35 @@ async fn cleanup_converges_and_excludes_the_subject() {
       .handle
       .cleanup(issuer_id.clone())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err()
       .kind(),
     ErrorKind::InvalidInput
   );
   let stranger = NodeId::parse("node-999999999999999999999").unwrap();
   assert_eq!(
-    issuer.handle.cleanup(stranger).await.unwrap_err().kind(),
+    issuer
+      .handle
+      .cleanup(stranger)
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap_err()
+      .kind(),
     ErrorKind::NotFound
   );
 
-  issuer.handle.cleanup(subject_id.clone()).await.unwrap();
+  issuer
+    .handle
+    .cleanup(subject_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
 
   // The tombstone converges to the observer through ordinary sync: a new
   // member session to the cleaned subject is refused once the record
@@ -280,6 +298,9 @@ async fn purge_revocation_clears_the_local_boundary() {
     .handle
     .revoke(member_id.clone(), member_key)
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let error = issuer
     .handle
@@ -296,10 +317,16 @@ async fn purge_revocation_clears_the_local_boundary() {
     .handle
     .purge_revocation(member_id.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   issuer
     .handle
     .purge_revocation(member_id.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   issuer
@@ -351,20 +378,48 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
   // record off the issuer, so the epoch must not start while a member is
   // still owed the delivery — which is exactly what the precondition
   // enforces.
-  issuer.handle.cleanup(subject_id.clone()).await.unwrap();
+  issuer
+    .handle
+    .cleanup(subject_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   wait_member_status(&observer.handle, &subject_id, MemberStatus::Cleaned).await;
 
   // Start the epoch. Max-wins: the second issue never rolls the watermark
   // back.
-  let first = issuer.handle.issue_cleanup_checkpoint().await.unwrap();
-  let second = issuer.handle.issue_cleanup_checkpoint().await.unwrap();
+  let first = issuer
+    .handle
+    .issue_cleanup_checkpoint()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let second = issuer
+    .handle
+    .issue_cleanup_checkpoint()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert!(second >= first, "the watermark is monotonic");
 
   // The observer also issues: the cleaned subject is terminal locally, so
   // the precondition is satisfied with the live issuer session alone. The
   // epoch converges through sync and stays monotonic across issuers (any
   // member may checkpoint).
-  let on_observer = observer.handle.issue_cleanup_checkpoint().await.unwrap();
+  let on_observer = observer
+    .handle
+    .issue_cleanup_checkpoint()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert!(on_observer >= first);
 
   // The cluster stays compositional after checkpointing: a fresh node
@@ -400,8 +455,22 @@ async fn checkpoint_converges_and_keeps_the_cluster_compositional() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_issues_on_a_singleton_node() {
   let node = start_node(31).await;
-  let first = node.handle.issue_cleanup_checkpoint().await.unwrap();
-  let second = node.handle.issue_cleanup_checkpoint().await.unwrap();
+  let first = node
+    .handle
+    .issue_cleanup_checkpoint()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let second = node
+    .handle
+    .issue_cleanup_checkpoint()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert!(second >= first, "the watermark is monotonic");
   node.handle.shutdown().await.unwrap();
 }
@@ -446,7 +515,14 @@ async fn checkpoint_refuses_an_unreachable_member_without_writing_an_epoch() {
   }
 
   // The precondition rejects the issue while the member is unreachable.
-  let error = issuer.handle.issue_cleanup_checkpoint().await.unwrap_err();
+  let error = issuer
+    .handle
+    .issue_cleanup_checkpoint()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::NotReady);
 
   // No epoch record may exist behind the refusal.

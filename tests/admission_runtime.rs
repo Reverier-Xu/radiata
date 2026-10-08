@@ -242,6 +242,9 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
     .handle
     .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert_eq!(healthy.kind(), ErrorKind::Conflict);
   let issued = rotate_with_retry(&receiver).await;
@@ -273,6 +276,9 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
   receiver
     .handle
     .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   rotate_with_retry(&receiver).await;

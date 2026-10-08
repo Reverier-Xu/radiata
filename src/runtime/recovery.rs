@@ -214,18 +214,7 @@ impl Supervisor {
   pub(super) async fn departed_exclusions(
     &self, store: &crate::storage::MetadataStore,
   ) -> Result<Departed> {
-    let revision = store.snapshot().await?.revision().clone();
-    if let Ok(guard) = self.exclusion_cache.lock()
-      && let Some((cached_revision, cached)) = guard.as_ref()
-      && cached_revision == &revision
-    {
-      return Ok(cached.clone());
-    }
-    let departed = Departed::compute(store).await?;
-    if let Ok(mut guard) = self.exclusion_cache.lock() {
-      *guard = Some((revision, departed.clone()));
-    }
-    Ok(departed)
+    departed_exclusions(&self.exclusion_cache, store).await
   }
 
   pub(super) async fn known_online_members(
@@ -399,4 +388,34 @@ impl Supervisor {
     }
     Ok(())
   }
+}
+
+/// The memoized departed-members exclusion set, keyed by the store
+/// revision it was computed at. Shared between the supervisor's own
+/// pages/ticks and the identity effects (the checkpoint guard), so the
+/// memo serves one truth per incarnation.
+pub(super) type ExclusionCache =
+  std::sync::Arc<std::sync::Mutex<Option<(crate::StoreRevision, Departed)>>>;
+
+/// The departed-members exclusion state (cleaned + left), memoized per
+/// store revision in the shared cache: rescanning and decoding every
+/// accumulated tombstone on every two-second tick (and every member
+/// page) is unbounded work for an answer that only changes when a
+/// tombstone commit moves the revision. A poisoned cache only costs a
+/// recompute.
+pub(super) async fn departed_exclusions(
+  cache: &ExclusionCache, store: &crate::storage::MetadataStore,
+) -> Result<Departed> {
+  let revision = store.snapshot().await?.revision().clone();
+  if let Ok(guard) = cache.lock()
+    && let Some((cached_revision, cached)) = guard.as_ref()
+    && cached_revision == &revision
+  {
+    return Ok(cached.clone());
+  }
+  let departed = Departed::compute(store).await?;
+  if let Ok(mut guard) = cache.lock() {
+    *guard = Some((revision, departed.clone()));
+  }
+  Ok(departed)
 }

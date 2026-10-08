@@ -405,6 +405,9 @@ async fn resources_revoke_and_leave() {
     .handle
     .revoke(member_id.clone(), member_key)
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
 
   let still_there = issuer

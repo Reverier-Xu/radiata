@@ -475,26 +475,6 @@ async fn supervise(
         let result = supervisor.put_resource(write, expected).await;
         let _ = reply.send(result);
       }
-      Control::RevokeNode {
-        subject,
-        expected_key,
-        reply,
-      } => {
-        let result = supervisor.revoke_node(subject, expected_key).await;
-        let _ = reply.send(result);
-      }
-      Control::CleanupNode { subject, reply } => {
-        let result = supervisor.cleanup_node(subject).await;
-        let _ = reply.send(result);
-      }
-      Control::PurgeRevocation { subject, reply } => {
-        let result = supervisor.purge_revocation(subject).await;
-        let _ = reply.send(result);
-      }
-      Control::IssueCleanupCheckpoint { reply } => {
-        let result = supervisor.issue_cleanup_checkpoint().await;
-        let _ = reply.send(result);
-      }
       Control::ApplyReceiptRetention { reply } => {
         let result = supervisor.apply_receipt_retention().await;
         let _ = reply.send(result);
@@ -547,13 +527,6 @@ async fn supervise(
             let _ = reply.send(Err(error));
           }
         }
-      }
-      Control::ResolveFrozenJournal {
-        acknowledgement,
-        reply,
-      } => {
-        let result = supervisor.resolve_frozen_journal(acknowledgement).await;
-        let _ = reply.send(result);
       }
       Control::Observability { reply } => {
         let result = supervisor.observability_snapshot(&tasks).await;
@@ -708,9 +681,9 @@ pub(super) struct Supervisor {
   /// revision reuses the cached set instead of rescanning and decoding
   /// every accumulated tombstone; any other commit also invalidates,
   /// which merely recomputes once (commit-writes are rare metadata
-  /// events).
-  pub(super) exclusion_cache:
-    std::sync::Mutex<Option<(crate::StoreRevision, super::recovery::Departed)>>,
+  /// events). The cache is the one shared with the task effects' plane,
+  /// so the checkpoint guard memoizes with the same truth.
+  pub(super) exclusion_cache: super::recovery::ExclusionCache,
   /// The highest resource-write stamp this writer has issued: a
   /// writer's own successive writes must strictly outrank their
   /// predecessor, so the issue clock advances at least one millisecond
@@ -817,20 +790,14 @@ impl Supervisor {
         dependencies,
       )));
     };
-    let (packet, driver, shutdown_tx) = match (
-      operations.packet(),
-      operations.driver(),
-      operations.shutdown(),
-    ) {
-      (Ok(packet), Ok(driver), Ok(shutdown_tx)) => {
-        (Arc::clone(packet), driver.clone(), shutdown_tx.clone())
-      }
-      _ => {
-        return Err(Box::new((
-          Error::internal("runtime operations"),
-          dependencies,
-        )));
-      }
+    let (packet, driver, shutdown_tx, exclusion_cache) = match operations.planes() {
+      Ok(planes) => (
+        Arc::clone(&planes.packet),
+        planes.driver.clone(),
+        planes.shutdown.clone(),
+        Arc::clone(&planes.exclusion_cache),
+      ),
+      Err(error) => return Err(Box::new((error, dependencies))),
     };
     let route_capacity = dependencies.config.trace_metadata_limits().active();
     let sync_context = Arc::clone(&context);
@@ -876,7 +843,7 @@ impl Supervisor {
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       prune_cooldown: 0,
       published_endpoints,
-      exclusion_cache: std::sync::Mutex::new(None),
+      exclusion_cache,
       resource_write_clock: std::sync::atomic::AtomicU64::new(0),
       sync_driver,
       trace_sink,
