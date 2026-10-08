@@ -1,9 +1,9 @@
 pub mod radiata
 pub mod radiata::adapters
-pub fn radiata::adapters::ephemeral_key_store() -> alloc::sync::Arc<dyn radiata::extension::KeyProvider>
-pub fn radiata::adapters::file_key_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::KeyProvider>
-pub fn radiata::adapters::json_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
-pub fn radiata::adapters::redb_store(std::path::PathBuf) -> alloc::sync::Arc<dyn radiata::extension::StorageFactory>
+pub fn radiata::adapters::ephemeral_key_store() -> alloc::rcs::arc::Arc<dyn radiata::extension::KeyProvider>
+pub fn radiata::adapters::file_key_store(std::path::PathBuf) -> alloc::rcs::arc::Arc<dyn radiata::extension::KeyProvider>
+pub fn radiata::adapters::json_store(std::path::PathBuf) -> alloc::rcs::arc::Arc<dyn radiata::extension::StorageFactory>
+pub fn radiata::adapters::redb_store(std::path::PathBuf) -> alloc::rcs::arc::Arc<dyn radiata::extension::StorageFactory>
 pub mod radiata::extension
 pub trait radiata::extension::Entropy: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::extension::Entropy::fill(&self, &mut [u8]) -> radiata::Result<()>
@@ -133,6 +133,9 @@ pub radiata::ProviderErrorKind::StorageLocked
 pub radiata::ProviderErrorKind::Unsupported
 pub radiata::ProviderErrorKind::UnsupportedCapability
 pub radiata::ProviderErrorKind::UnsupportedSchema
+pub enum radiata::ReconcileDecision
+pub radiata::ReconcileDecision::Retry
+pub radiata::ReconcileDecision::Succeeded
 #[non_exhaustive] pub enum radiata::ReconcileOutcome
 pub radiata::ReconcileOutcome::Aborted
 pub radiata::ReconcileOutcome::Committed(radiata::CommitReceipt)
@@ -173,6 +176,55 @@ pub radiata::StoreOperation::Put::value: radiata::StoreValue
 #[non_exhaustive] pub enum radiata::StreamTarget
 pub radiata::StreamTarget::Exact(radiata::NodeId)
 pub radiata::StreamTarget::MatchingNodes(radiata::Selector)
+pub enum radiata::TaskKind
+pub radiata::TaskKind::ApplyReceiptRetention
+pub radiata::TaskKind::Cleanup
+pub radiata::TaskKind::Connect
+pub radiata::TaskKind::DeleteResource
+pub radiata::TaskKind::Disconnect
+pub radiata::TaskKind::Extension(radiata::QualifiedTag)
+pub radiata::TaskKind::IssueCleanupCheckpoint
+pub radiata::TaskKind::IssueCredential
+pub radiata::TaskKind::Join
+pub radiata::TaskKind::Leave
+pub radiata::TaskKind::Listen
+pub radiata::TaskKind::PatchNodeMetadata
+pub radiata::TaskKind::PurgeRevocation
+pub radiata::TaskKind::PutResource
+pub radiata::TaskKind::ResolveFrozenJournal
+pub radiata::TaskKind::Revoke
+pub radiata::TaskKind::RotateCredential
+pub radiata::TaskKind::StartRecovery
+pub radiata::TaskKind::StopListener
+pub radiata::TaskKind::SyncRound
+pub enum radiata::TaskOutput
+pub radiata::TaskOutput::ApplyReceiptRetention(radiata::ReceiptRetentionReport)
+pub radiata::TaskOutput::Cleanup(())
+pub radiata::TaskOutput::Connect(radiata::NodeId)
+pub radiata::TaskOutput::DeleteResource(radiata::ResourceMutationView)
+pub radiata::TaskOutput::Disconnect(())
+pub radiata::TaskOutput::Extension(())
+pub radiata::TaskOutput::IssueCleanupCheckpoint(u64)
+pub radiata::TaskOutput::IssueCredential(radiata::CredentialIssued)
+pub radiata::TaskOutput::Join(radiata::MergeView)
+pub radiata::TaskOutput::Leave(radiata::LeaveOutcome)
+pub radiata::TaskOutput::Listen(radiata::ListenerView)
+pub radiata::TaskOutput::PatchNodeMetadata(radiata::MemberView)
+pub radiata::TaskOutput::PurgeRevocation(())
+pub radiata::TaskOutput::PutResource(radiata::ResourceMutationView)
+pub radiata::TaskOutput::ResolveFrozenJournal(())
+pub radiata::TaskOutput::Revoke(radiata::RevokeOutcome)
+pub radiata::TaskOutput::RotateCredential(radiata::CredentialIssued)
+pub radiata::TaskOutput::StartRecovery(radiata::RecoveryView)
+pub radiata::TaskOutput::StopListener(())
+pub radiata::TaskOutput::SyncRound(())
+pub enum radiata::TaskPhase
+pub radiata::TaskPhase::Failed
+pub radiata::TaskPhase::Pending
+pub radiata::TaskPhase::Running
+pub radiata::TaskPhase::Succeeded
+impl radiata::TaskPhase
+pub const fn radiata::TaskPhase::is_terminal(self) -> bool
 pub enum radiata::TransportScheme
 pub radiata::TransportScheme::Tcp
 pub radiata::TransportScheme::Tls
@@ -203,10 +255,18 @@ impl radiata::CreatedKey
 pub fn radiata::CreatedKey::handle(&self) -> &radiata::KeyHandle
 pub fn radiata::CreatedKey::new(radiata::KeyHandle, radiata::PublicKey) -> Self
 pub fn radiata::CreatedKey::public_key(&self) -> &radiata::PublicKey
+pub struct radiata::CredentialIssued
+impl radiata::CredentialIssued
+pub const fn radiata::CredentialIssued::expires_at(&self) -> std::time::SystemTime
 pub struct radiata::Credentials
 impl radiata::Credentials
-pub async fn radiata::Credentials::issue(self) -> radiata::Result<radiata::IssuedMergeCredential>
-pub async fn radiata::Credentials::rotate(self) -> radiata::Result<radiata::IssuedMergeCredential>
+pub async fn radiata::Credentials::issue(self) -> radiata::Result<radiata::Task<radiata::IssuedMergeCredential>>
+pub async fn radiata::Credentials::rotate(self) -> radiata::Result<radiata::Task<radiata::IssuedMergeCredential>>
+pub struct radiata::CustomTaskSpec
+impl radiata::CustomTaskSpec
+pub const fn radiata::CustomTaskSpec::kind(&self) -> &radiata::QualifiedTag
+pub const fn radiata::CustomTaskSpec::labels(&self) -> &radiata::LabelSet
+pub fn radiata::CustomTaskSpec::new(radiata::QualifiedTag, radiata::LabelSet) -> Self
 pub struct radiata::DeclareInterruptedTransactionUncommitted
 impl radiata::DeclareInterruptedTransactionUncommitted
 pub fn radiata::DeclareInterruptedTransactionUncommitted::new() -> Self
@@ -273,11 +333,14 @@ pub fn radiata::EventSubscription<E>::poll_next(core::pin::Pin<&mut Self>, &mut 
 pub struct radiata::ExtensionRegistry
 impl radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::new() -> Self
+pub fn radiata::ExtensionRegistry::register_action_hook(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::ActionHook>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_feature(&mut self, radiata::FeatureDefinition) -> radiata::Result<&mut Self>
-pub fn radiata::ExtensionRegistry::register_load_balancer(&mut self, radiata::QualifiedTag, alloc::sync::Arc<dyn radiata::LoadBalancingPolicy>) -> radiata::Result<&mut Self>
-pub fn radiata::ExtensionRegistry::register_next_hop(&mut self, radiata::QualifiedTag, alloc::sync::Arc<dyn radiata::RouteNextHop>) -> radiata::Result<&mut Self>
-pub fn radiata::ExtensionRegistry::register_protocol(&mut self, radiata::ProtocolDefinition, alloc::sync::Arc<dyn radiata::PacketConsumer>) -> radiata::Result<&mut Self>
-pub fn radiata::ExtensionRegistry::register_transport(&mut self, radiata::TransportName, alloc::sync::Arc<dyn radiata::TransportProvider>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_load_balancer(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::LoadBalancingPolicy>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_next_hop(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::RouteNextHop>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_protocol(&mut self, radiata::ProtocolDefinition, alloc::rcs::arc::Arc<dyn radiata::PacketConsumer>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_resource_hook(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::ResourceHook>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_task_reconciler(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::TaskReconciler>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_transport(&mut self, radiata::TransportName, alloc::rcs::arc::Arc<dyn radiata::TransportProvider>) -> radiata::Result<&mut Self>
 impl core::fmt::Debug for radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::FeatureDefinition
@@ -305,7 +368,7 @@ pub fn radiata::IdentityReplaced::replacement_identity(&self) -> &radiata::NodeI
 impl radiata::Event for radiata::IdentityReplaced
 pub struct radiata::IncomingStream
 impl radiata::IncomingStream
-pub fn radiata::IncomingStream::body(&mut self) -> core::pin::Pin<&mut (dyn futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send)>
+pub fn radiata::IncomingStream::body(&mut self) -> core::pin::Pin<&mut (dyn futures_core::stream::Stream<Item = radiata::Result<alloc::rcs::arc::Arc<[u8]>>> + core::marker::Send)>
 pub fn radiata::IncomingStream::derive_return_stream(&self, radiata::ProtocolTag, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
 pub fn radiata::IncomingStream::destination(&self) -> &radiata::NodeId
 pub fn radiata::IncomingStream::metadata(&self) -> &radiata::StreamMetadata
@@ -333,7 +396,7 @@ pub fn radiata::KeyCapabilities::reconciliation(self, bool) -> Self
 pub struct radiata::KeyHandle(_)
 impl radiata::KeyHandle
 pub fn radiata::KeyHandle::expose_provider_handle(&self) -> &[u8]
-pub fn radiata::KeyHandle::from_provider_bytes(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::KeyHandle::from_provider_bytes(alloc::rcs::arc::Arc<[u8]>) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::KeyHandle
 pub fn radiata::KeyHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::KeyOperationId(_)
@@ -399,8 +462,8 @@ pub fn radiata::ListenerView::endpoint(&self) -> &radiata::Endpoint
 pub fn radiata::ListenerView::id(&self) -> &radiata::ListenerId
 pub struct radiata::Listeners
 impl radiata::Listeners
-pub async fn radiata::Listeners::create(self, radiata::Endpoint) -> radiata::Result<radiata::ListenerView>
-pub async fn radiata::Listeners::delete(self, radiata::ListenerId) -> radiata::Result<()>
+pub async fn radiata::Listeners::create(self, radiata::Endpoint) -> radiata::Result<radiata::Task<radiata::ListenerView>>
+pub async fn radiata::Listeners::delete(self, radiata::ListenerId) -> radiata::Result<radiata::Task<()>>
 pub async fn radiata::Listeners::list(self, radiata::PageSpec) -> radiata::Result<radiata::ListenerPage>
 pub struct radiata::LocalNodeView
 impl radiata::LocalNodeView
@@ -458,10 +521,10 @@ pub fn radiata::NextHopView<'_>::trace(&self) -> &radiata::TraceId
 pub struct radiata::NodeBuilder
 impl radiata::NodeBuilder
 pub fn radiata::NodeBuilder::config(self, radiata::NodeConfig) -> Self
-pub fn radiata::NodeBuilder::entropy(self, alloc::sync::Arc<dyn radiata::extension::Entropy>) -> Self
+pub fn radiata::NodeBuilder::entropy(self, alloc::rcs::arc::Arc<dyn radiata::extension::Entropy>) -> Self
 pub fn radiata::NodeBuilder::extensions(self, radiata::ExtensionRegistry) -> Self
-pub fn radiata::NodeBuilder::keys(self, alloc::sync::Arc<dyn radiata::extension::KeyProvider>) -> Self
-pub fn radiata::NodeBuilder::new(alloc::sync::Arc<dyn radiata::extension::StorageFactory>) -> Self
+pub fn radiata::NodeBuilder::keys(self, alloc::rcs::arc::Arc<dyn radiata::extension::KeyProvider>) -> Self
+pub fn radiata::NodeBuilder::new(alloc::rcs::arc::Arc<dyn radiata::extension::StorageFactory>) -> Self
 pub async fn radiata::NodeBuilder::start(self) -> radiata::Result<radiata::NodeHandle>
 pub struct radiata::NodeConfig
 impl radiata::NodeConfig
@@ -483,32 +546,33 @@ impl core::default::Default for radiata::NodeConfig
 pub fn radiata::NodeConfig::default() -> Self
 pub struct radiata::NodeHandle
 impl radiata::NodeHandle
-pub async fn radiata::NodeHandle::apply_receipt_retention(&self) -> radiata::Result<radiata::ReceiptRetentionReport>
-pub async fn radiata::NodeHandle::cleanup(&self, radiata::NodeId) -> radiata::Result<()>
-pub async fn radiata::NodeHandle::connect(&self, radiata::Endpoint, radiata::NodeId) -> radiata::Result<radiata::NodeId>
+pub async fn radiata::NodeHandle::apply_receipt_retention(&self) -> radiata::Result<radiata::Task<radiata::ReceiptRetentionReport>>
+pub async fn radiata::NodeHandle::cleanup(&self, radiata::NodeId) -> radiata::Result<radiata::Task<()>>
+pub async fn radiata::NodeHandle::connect(&self, radiata::Endpoint, radiata::NodeId) -> radiata::Result<radiata::Task<radiata::NodeId>>
 pub async fn radiata::NodeHandle::connection_degree(&self) -> radiata::Result<radiata::ConnectionDegreeView>
 pub fn radiata::NodeHandle::credentials(&self) -> radiata::Credentials
-pub async fn radiata::NodeHandle::disconnect(&self, radiata::NodeId) -> radiata::Result<()>
-pub async fn radiata::NodeHandle::issue_cleanup_checkpoint(&self) -> radiata::Result<u64>
-pub async fn radiata::NodeHandle::join(&self, radiata::Endpoint, radiata::MergeCredential) -> radiata::Result<radiata::MergeView>
-pub async fn radiata::NodeHandle::leave(&self, radiata::ReplaceIdentityAndDeleteOldCoreMetadata) -> radiata::Result<radiata::LeaveOutcome>
+pub async fn radiata::NodeHandle::disconnect(&self, radiata::NodeId) -> radiata::Result<radiata::Task<()>>
+pub async fn radiata::NodeHandle::issue_cleanup_checkpoint(&self) -> radiata::Result<radiata::Task<u64>>
+pub async fn radiata::NodeHandle::join(&self, radiata::Endpoint, radiata::MergeCredential) -> radiata::Result<radiata::Task<radiata::MergeView>>
+pub async fn radiata::NodeHandle::leave(&self, radiata::ReplaceIdentityAndDeleteOldCoreMetadata) -> radiata::Result<radiata::Task<radiata::LeaveOutcome>>
 pub fn radiata::NodeHandle::listeners(&self) -> radiata::Listeners
 pub async fn radiata::NodeHandle::local_node(&self) -> radiata::Result<radiata::LocalNodeView>
 pub fn radiata::NodeHandle::members(&self) -> radiata::Members
 pub async fn radiata::NodeHandle::metrics(&self) -> radiata::Result<radiata::ObservabilitySnapshot>
-pub async fn radiata::NodeHandle::patch_metadata(&self, u64, radiata::NodeMetadataPatch) -> radiata::Result<radiata::MemberView>
-pub async fn radiata::NodeHandle::purge_revocation(&self, radiata::NodeId) -> radiata::Result<()>
+pub async fn radiata::NodeHandle::patch_metadata(&self, u64, radiata::NodeMetadataPatch) -> radiata::Result<radiata::Task<radiata::MemberView>>
+pub async fn radiata::NodeHandle::purge_revocation(&self, radiata::NodeId) -> radiata::Result<radiata::Task<()>>
 pub async fn radiata::NodeHandle::recovery(&self) -> radiata::Result<radiata::RecoveryView>
-pub async fn radiata::NodeHandle::resolve_frozen_journal(&self, radiata::DeclareInterruptedTransactionUncommitted) -> radiata::Result<()>
+pub async fn radiata::NodeHandle::resolve_frozen_journal(&self, radiata::DeclareInterruptedTransactionUncommitted) -> radiata::Result<radiata::Task<()>>
 pub fn radiata::NodeHandle::resources(&self) -> radiata::Resources
-pub async fn radiata::NodeHandle::revoke(&self, radiata::NodeId, radiata::PublicKey) -> radiata::Result<radiata::RevokeOutcome>
+pub async fn radiata::NodeHandle::revoke(&self, radiata::NodeId, radiata::PublicKey) -> radiata::Result<radiata::Task<radiata::RevokeOutcome>>
 pub fn radiata::NodeHandle::routes(&self) -> radiata::Routes
-pub fn radiata::NodeHandle::send<S>(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, S) -> radiata::BoxFuture<'static, radiata::Result<radiata::DeliveryAck>> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send + 'static
+pub fn radiata::NodeHandle::send<S>(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, S) -> radiata::BoxFuture<'static, radiata::Result<radiata::DeliveryAck>> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::rcs::arc::Arc<[u8]>>> + core::marker::Send + 'static
 pub fn radiata::NodeHandle::sessions(&self) -> radiata::Sessions
 pub async fn radiata::NodeHandle::shutdown(&self) -> radiata::Result<radiata::ShutdownOutcome>
-pub async fn radiata::NodeHandle::start_recovery(&self) -> radiata::Result<radiata::RecoveryView>
+pub async fn radiata::NodeHandle::start_recovery(&self) -> radiata::Result<radiata::Task<radiata::RecoveryView>>
 pub fn radiata::NodeHandle::status(&self) -> radiata::NodeStatus
 pub fn radiata::NodeHandle::sync(&self) -> impl core::future::future::Future<Output = radiata::Result<()>> + core::marker::Send
+pub fn radiata::NodeHandle::tasks(&self) -> radiata::Tasks
 pub fn radiata::NodeHandle::topology(&self) -> radiata::Topology
 pub fn radiata::NodeHandle::trust(&self) -> radiata::Trust
 pub async fn radiata::NodeHandle::wait_for_shutdown(&self) -> radiata::Result<radiata::ShutdownReason>
@@ -557,16 +621,16 @@ impl core::fmt::Debug for radiata::OperationId
 pub fn radiata::OperationId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::OutboundStream
 impl radiata::OutboundStream
-pub fn radiata::OutboundStream::send_async<S>(self, S) -> radiata::Result<radiata::RouteHandle> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send + 'static
-pub fn radiata::OutboundStream::send_sync<S>(self, S) -> radiata::BoxFuture<'static, radiata::Result<radiata::DeliveryAck>> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::sync::Arc<[u8]>>> + core::marker::Send + 'static
+pub fn radiata::OutboundStream::send_async<S>(self, S) -> radiata::Result<radiata::RouteHandle> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::rcs::arc::Arc<[u8]>>> + core::marker::Send + 'static
+pub fn radiata::OutboundStream::send_sync<S>(self, S) -> radiata::BoxFuture<'static, radiata::Result<radiata::DeliveryAck>> where S: futures_core::stream::Stream<Item = radiata::Result<alloc::rcs::arc::Arc<[u8]>>> + core::marker::Send + 'static
 pub fn radiata::OutboundStream::trace_id(&self) -> &radiata::TraceId
 impl core::fmt::Debug for radiata::OutboundStream
 pub fn radiata::OutboundStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::PageCursor(_)
 impl radiata::PageCursor
 pub fn radiata::PageCursor::as_bytes(&self) -> &[u8]
-pub fn radiata::PageCursor::from_provider_bytes(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
-pub fn radiata::PageCursor::new(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::PageCursor::from_provider_bytes(alloc::rcs::arc::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::PageCursor::new(alloc::rcs::arc::Arc<[u8]>) -> radiata::Result<Self>
 pub struct radiata::PageSpec
 impl radiata::PageSpec
 pub fn radiata::PageSpec::after(radiata::PageCursor, usize) -> radiata::Result<Self>
@@ -610,6 +674,13 @@ pub fn radiata::QualifiedTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ReceiptRetentionReport
 pub radiata::ReceiptRetentionReport::forgotten: u64
 pub radiata::ReceiptRetentionReport::remaining: bool
+pub struct radiata::ReconcileContext
+pub radiata::ReconcileContext::attempt: u32
+pub radiata::ReconcileContext::handle: radiata::NodeHandle
+pub radiata::ReconcileContext::last_error: core::option::Option<radiata::TaskError>
+pub radiata::ReconcileContext::spec: radiata::CustomTaskSpec
+impl core::fmt::Debug for radiata::ReconcileContext
+pub fn radiata::ReconcileContext::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::RecoveryChanged
 impl radiata::RecoveryChanged
 pub fn radiata::RecoveryChanged::recovery(&self) -> &radiata::RecoveryView
@@ -686,14 +757,16 @@ pub fn radiata::ResourceView::name(&self) -> &radiata::ResourceName
 pub fn radiata::ResourceView::version(&self) -> &radiata::ResourceVersion
 pub struct radiata::ResourceWrite
 impl radiata::ResourceWrite
+pub const fn radiata::ResourceWrite::labels(&self) -> &radiata::ResourceLabels
+pub const fn radiata::ResourceWrite::name(&self) -> &radiata::ResourceName
 pub fn radiata::ResourceWrite::new(radiata::ResourceName, radiata::ResourceLabels) -> Self
 pub struct radiata::Resources
 impl radiata::Resources
-pub async fn radiata::Resources::delete(self, radiata::ResourceName, radiata::ResourceVersion) -> radiata::Result<radiata::ResourceMutationView>
+pub async fn radiata::Resources::delete(self, radiata::ResourceName, radiata::ResourceVersion) -> radiata::Result<radiata::Task<radiata::ResourceMutationView>>
 pub async fn radiata::Resources::get(self, radiata::ResourceName) -> radiata::Result<core::option::Option<radiata::ResourceView>>
 pub async fn radiata::Resources::list(self, radiata::PageSpec) -> radiata::Result<radiata::ResourcePage>
-pub async fn radiata::Resources::put(self, radiata::ResourceWrite) -> radiata::Result<radiata::ResourceMutationView>
-pub async fn radiata::Resources::put_expected(self, radiata::ResourceWrite, radiata::ResourceVersion) -> radiata::Result<radiata::ResourceMutationView>
+pub async fn radiata::Resources::put(self, radiata::ResourceWrite) -> radiata::Result<radiata::Task<radiata::ResourceMutationView>>
+pub async fn radiata::Resources::put_expected(self, radiata::ResourceWrite, radiata::ResourceVersion) -> radiata::Result<radiata::Task<radiata::ResourceMutationView>>
 pub async fn radiata::Resources::select(self, radiata::Selector, radiata::PageSpec) -> radiata::Result<radiata::ResourcePage>
 pub struct radiata::RevokeOutcome
 impl radiata::RevokeOutcome
@@ -794,7 +867,7 @@ pub fn radiata::StoreEntry::value(&self) -> &radiata::StoreValue
 pub struct radiata::StoreKey(_)
 impl radiata::StoreKey
 pub fn radiata::StoreKey::as_bytes(&self) -> &[u8]
-pub fn radiata::StoreKey::new(alloc::sync::Arc<[u8]>) -> Self
+pub fn radiata::StoreKey::new(alloc::rcs::arc::Arc<[u8]>) -> Self
 impl core::fmt::Debug for radiata::StoreKey
 pub fn radiata::StoreKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::StoreNamespace(_)
@@ -811,7 +884,7 @@ pub fn radiata::StoreRequirements::requires_reconciliation(&self) -> bool
 pub struct radiata::StoreRevision(_)
 impl radiata::StoreRevision
 pub fn radiata::StoreRevision::as_bytes(&self) -> &[u8]
-pub fn radiata::StoreRevision::new(alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::StoreRevision::new(alloc::rcs::arc::Arc<[u8]>) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::StoreRevision
 pub fn radiata::StoreRevision::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::StoreTransaction
@@ -825,14 +898,14 @@ pub struct radiata::StoreValue
 impl radiata::StoreValue
 pub fn radiata::StoreValue::as_bytes(&self) -> &[u8]
 pub fn radiata::StoreValue::digest(&self) -> &radiata::Digest
-pub fn radiata::StoreValue::new(alloc::sync::Arc<[u8]>) -> Self
+pub fn radiata::StoreValue::new(alloc::rcs::arc::Arc<[u8]>) -> Self
 impl core::fmt::Debug for radiata::StoreValue
 pub fn radiata::StoreValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::StreamMetadata
 impl radiata::StreamMetadata
 pub fn radiata::StreamMetadata::entries(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = (&radiata::QualifiedTag, &[u8])>
 pub fn radiata::StreamMetadata::get(&self, &radiata::QualifiedTag) -> core::option::Option<&[u8]>
-pub fn radiata::StreamMetadata::insert(self, radiata::QualifiedTag, alloc::sync::Arc<[u8]>) -> radiata::Result<Self>
+pub fn radiata::StreamMetadata::insert(self, radiata::QualifiedTag, alloc::rcs::arc::Arc<[u8]>) -> radiata::Result<Self>
 pub fn radiata::StreamMetadata::new() -> Self
 impl core::fmt::Debug for radiata::StreamMetadata
 pub fn radiata::StreamMetadata::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -843,6 +916,67 @@ pub fn radiata::StreamPolicy::load_balancing_policy(&self) -> core::option::Opti
 pub fn radiata::StreamPolicy::max_hops(&self) -> u32
 pub fn radiata::StreamPolicy::new(radiata::RoutingPolicy, u32) -> radiata::Result<Self>
 pub fn radiata::StreamPolicy::routing_policy(&self) -> &radiata::RoutingPolicy
+pub struct radiata::Task<T>
+impl<T: TaskResult> radiata::Task<T>
+pub fn radiata::Task<T>::id(&self) -> &radiata::TaskId
+pub fn radiata::Task<T>::kind(&self) -> &radiata::TaskKind
+pub fn radiata::Task<T>::status(&self) -> radiata::TaskStatus
+pub async fn radiata::Task<T>::wait(self) -> radiata::Result<T>
+pub struct radiata::TaskChanged
+impl radiata::TaskChanged
+pub const fn radiata::TaskChanged::kind(&self) -> &radiata::TaskKind
+pub const fn radiata::TaskChanged::phase(&self) -> radiata::TaskPhase
+pub const fn radiata::TaskChanged::task(&self) -> &radiata::TaskId
+impl radiata::Event for radiata::TaskChanged
+pub struct radiata::TaskError
+impl radiata::TaskError
+pub fn radiata::TaskError::as_str(&self) -> &'static str
+pub const fn radiata::TaskError::kind(&self) -> radiata::ErrorKind
+pub struct radiata::TaskId(_)
+impl radiata::TaskId
+pub fn radiata::TaskId::as_str(&self) -> &str
+pub fn radiata::TaskId::parse(&str) -> radiata::Result<Self>
+impl core::fmt::Debug for radiata::TaskId
+pub fn radiata::TaskId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for radiata::TaskId
+pub fn radiata::TaskId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for radiata::TaskId
+pub type radiata::TaskId::Err = radiata::Error
+pub fn radiata::TaskId::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::TaskPage
+impl radiata::TaskPage
+pub fn radiata::TaskPage::items(&self) -> &[radiata::TaskView]
+pub fn radiata::TaskPage::next(&self) -> core::option::Option<&radiata::PageCursor>
+pub struct radiata::TaskStatus
+impl radiata::TaskStatus
+pub const fn radiata::TaskStatus::attempts(&self) -> u32
+pub const fn radiata::TaskStatus::error(&self) -> core::option::Option<radiata::TaskError>
+pub const fn radiata::TaskStatus::phase(&self) -> radiata::TaskPhase
+pub struct radiata::TaskTransition
+impl radiata::TaskTransition
+pub const fn radiata::TaskTransition::from(&self) -> radiata::TaskPhase
+pub const fn radiata::TaskTransition::id(&self) -> &radiata::TaskId
+pub const fn radiata::TaskTransition::kind(&self) -> &radiata::TaskKind
+pub const fn radiata::TaskTransition::to(&self) -> radiata::TaskPhase
+impl core::fmt::Debug for radiata::TaskTransition
+pub fn radiata::TaskTransition::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::TaskView
+impl radiata::TaskView
+pub const fn radiata::TaskView::attempts(&self) -> u32
+pub const fn radiata::TaskView::created(&self) -> std::time::SystemTime
+pub const fn radiata::TaskView::error(&self) -> core::option::Option<radiata::TaskError>
+pub const fn radiata::TaskView::finished(&self) -> core::option::Option<std::time::SystemTime>
+pub const fn radiata::TaskView::id(&self) -> &radiata::TaskId
+pub const fn radiata::TaskView::kind(&self) -> &radiata::TaskKind
+pub const fn radiata::TaskView::output(&self) -> core::option::Option<&radiata::TaskOutput>
+pub const fn radiata::TaskView::phase(&self) -> radiata::TaskPhase
+pub const fn radiata::TaskView::started(&self) -> core::option::Option<std::time::SystemTime>
+pub struct radiata::Tasks
+impl radiata::Tasks
+pub async fn radiata::Tasks::get(&self, radiata::TaskId) -> radiata::Result<core::option::Option<radiata::TaskView>>
+pub async fn radiata::Tasks::list(&self, radiata::PageSpec) -> radiata::Result<radiata::TaskPage>
+pub async fn radiata::Tasks::submit(&self, radiata::CustomTaskSpec) -> radiata::Result<radiata::Task<()>>
+pub async fn radiata::Tasks::wait(&self, radiata::TaskId) -> radiata::Result<radiata::TaskView>
 pub struct radiata::Topology
 impl radiata::Topology
 pub async fn radiata::Topology::list(self, radiata::PageSpec) -> radiata::Result<radiata::TopologyPage>
@@ -918,6 +1052,8 @@ impl radiata::TrustedIdentityView
 pub fn radiata::TrustedIdentityView::node_id(&self) -> &radiata::NodeId
 pub fn radiata::TrustedIdentityView::public_key(&self) -> &radiata::PublicKey
 pub const fn radiata::TrustedIdentityView::status(&self) -> radiata::TrustStatus
+pub trait radiata::ActionHook: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
+pub fn radiata::ActionHook::on_transition<'a>(&'a self, &'a radiata::TaskTransition) -> radiata::BoxFuture<'a, radiata::Result<()>>
 pub trait radiata::CandidateNodeReader: radiata::routing::private::Sealed + core::fmt::Debug + core::marker::Send + core::marker::Sync
 pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, &'a radiata::Selector, core::option::Option<radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
 pub trait radiata::Event: radiata::operation::private::Sealed + core::clone::Clone + core::marker::Send + core::marker::Sync + 'static
@@ -928,6 +1064,7 @@ impl radiata::Event for radiata::RecoveryChanged
 impl radiata::Event for radiata::ResourceChanged
 impl radiata::Event for radiata::RouteChanged
 impl radiata::Event for radiata::SessionChanged
+impl radiata::Event for radiata::TaskChanged
 pub trait radiata::LoadBalancingPolicy: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::LoadBalancingPolicy::select<'a>(&'a self, &'a radiata::Selector, &'a dyn radiata::CandidateNodeReader) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 pub trait radiata::PacketConsumer: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
@@ -936,10 +1073,16 @@ pub trait radiata::ProviderListener: core::fmt::Debug + core::marker::Send + cor
 pub fn radiata::ProviderListener::accept(&self) -> radiata::BoxFuture<'_, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
 pub fn radiata::ProviderListener::close(&self) -> radiata::BoxFuture<'_, radiata::Result<()>>
 pub fn radiata::ProviderListener::local_endpoint(&self) -> radiata::Endpoint
+pub trait radiata::ResourceHook: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
+pub fn radiata::ResourceHook::mutate(&self, radiata::ResourceWrite) -> radiata::Result<radiata::ResourceWrite>
+pub fn radiata::ResourceHook::observed<'a>(&'a self, &'a radiata::ResourceView) -> radiata::BoxFuture<'a, radiata::Result<()>>
+pub fn radiata::ResourceHook::validate(&self, &radiata::ResourceWrite) -> radiata::Result<()>
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 impl radiata::RouteNextHop for radiata::DefaultNextHop
 pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+pub trait radiata::TaskReconciler: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
+pub fn radiata::TaskReconciler::reconcile<'a>(&'a self, radiata::ReconcileContext) -> radiata::BoxFuture<'a, radiata::Result<radiata::ReconcileDecision>>
 pub trait radiata::TransportProvider: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::TransportProvider::bind(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::ProviderListener>>>
 pub fn radiata::TransportProvider::connect(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
