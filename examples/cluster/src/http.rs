@@ -140,6 +140,9 @@ async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCod
     .credentials()
     .issue()
     .await
+    .map_err(internal_error)?
+    .wait()
+    .await
     .map_err(internal_error)?;
   Ok(Json(json!({
     "credential": issued.credential().expose_secret(),
@@ -181,7 +184,7 @@ async fn join(
         Json(json!({"error": error.to_string()})),
       )
     })?;
-    match state
+    let outcome = match state
       .node
       .join(
         radiata::Endpoint::parse(&request.bootstrap_wss).map_err(|error| {
@@ -194,6 +197,10 @@ async fn join(
       )
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match outcome {
       Ok(view) => {
         return Ok(Json(json!({
           "merged": true,
@@ -244,6 +251,14 @@ async fn connect(
         StatusCode::BAD_GATEWAY,
         Json(json!({"error": error.to_string()})),
       )
+    })?
+    .wait()
+    .await
+    .map_err(|error| {
+      (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": error.to_string()})),
+      )
     })?;
   Ok(Json(json!({"connected": connected.as_str()})))
 }
@@ -264,12 +279,24 @@ async fn disconnect(
       Json(json!({"error": error.to_string()})),
     )
   })?;
-  state.node.disconnect(node_id).await.map_err(|error| {
-    (
-      StatusCode::BAD_GATEWAY,
-      Json(json!({"error": error.to_string()})),
-    )
-  })?;
+  state
+    .node
+    .disconnect(node_id)
+    .await
+    .map_err(|error| {
+      (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?
+    .wait()
+    .await
+    .map_err(|error| {
+      (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?;
   Ok(Json(json!({"disconnected": true})))
 }
 
@@ -281,6 +308,14 @@ async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Js
   let outcome = state
     .node
     .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .map_err(|error| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?
+    .wait()
     .await
     .map_err(|error| {
       (
@@ -399,6 +434,14 @@ async fn put_resource(
     .node
     .resources()
     .put(ResourceWrite::new(name, labels))
+    .await
+    .map_err(|error| {
+      (
+        StatusCode::CONFLICT,
+        Json(json!({"error": error.to_string()})),
+      )
+    })?
+    .wait()
     .await
     .map_err(|error| {
       (
@@ -538,6 +581,16 @@ async fn remove_resource(
         StatusCode::CONFLICT,
         Json(json!({"error": error.to_string()})),
       )
+    })?
+    .wait()
+    .await
+    .map_err(|error| {
+      // A stale expectation is a conflict, not a server fault: the
+      // caller must re-observe and retry.
+      (
+        StatusCode::CONFLICT,
+        Json(json!({"error": error.to_string()})),
+      )
     })?;
   Ok(Json(json!({
     "removed": true,
@@ -601,6 +654,9 @@ async fn revoke(
     .node
     .revoke(subject, binding.public_key().clone())
     .await
+    .map_err(internal_error)?
+    .wait()
+    .await
     .map_err(internal_error)?;
   Ok(Json(json!({
     "revoked": true,
@@ -616,7 +672,14 @@ async fn cleanup(
   state: State<SharedState>, Json(request): Json<SubjectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let subject = NodeId::parse(&request.node_id).map_err(bad_request)?;
-  state.node.cleanup(subject).await.map_err(internal_error)?;
+  state
+    .node
+    .cleanup(subject)
+    .await
+    .map_err(internal_error)?
+    .wait()
+    .await
+    .map_err(internal_error)?;
   Ok(Json(json!({"cleaned": true})))
 }
 
@@ -628,6 +691,9 @@ async fn cleanup_checkpoint(
   let watermark = state
     .node
     .issue_cleanup_checkpoint()
+    .await
+    .map_err(internal_error)?
+    .wait()
     .await
     .map_err(internal_error)?;
   Ok(Json(json!({"watermark": watermark})))
@@ -710,7 +776,11 @@ async fn update_metadata(
   // register only ever accepts the exact current revision.
   let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
   loop {
-    match state.node.patch_metadata(revision, patch.clone()).await {
+    let outcome = match state.node.patch_metadata(revision, patch.clone()).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match outcome {
       Ok(view) => {
         return Ok(Json(json!({"revision": view.owner_revision()})));
       }

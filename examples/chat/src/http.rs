@@ -123,6 +123,9 @@ pub async fn publish_identity(state: &SharedState) -> Result<(), String> {
     .resources()
     .put(write)
     .await
+    .map_err(|error| error.to_string())?
+    .wait()
+    .await
     .map_err(|error| error.to_string())?;
   Ok(())
 }
@@ -308,6 +311,9 @@ async fn announce(
     .node
     .resources()
     .put(ResourceWrite::new(resource_name, labels))
+    .await
+    .map_err(conflict_error)?
+    .wait()
     .await
     .map_err(conflict_error)?;
   Ok(Json(
@@ -606,6 +612,9 @@ async fn create_group(
       labels,
     ))
     .await
+    .map_err(conflict_error)?
+    .wait()
+    .await
     .map_err(conflict_error)?;
   Ok(Json(
     json!({"created": true, "group": request.name, "members": [state.user]}),
@@ -645,7 +654,7 @@ async fn join_group(
       .unwrap_or(&state.user)
       .to_owned();
     let labels = group_labels(&roster, &owner, &name).map_err(name_error)?;
-    match state
+    let outcome = match state
       .node
       .resources()
       .put_expected(
@@ -654,6 +663,10 @@ async fn join_group(
       )
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match outcome {
       Ok(_) => return Ok(Json(json!({"joined": true, "members": members}))),
       // The precondition lost a race: re-read and rebuild.
       Err(error) if error.kind() == radiata::ErrorKind::Conflict => continue,
@@ -698,6 +711,9 @@ async fn dissolve_group(
     .node
     .resources()
     .delete(ResourceName::parse(&full).map_err(name_error)?, version)
+    .await
+    .map_err(conflict_error)?
+    .wait()
     .await
     .map_err(conflict_error)?;
   Ok(Json(json!({"dissolved": true})))
@@ -771,7 +787,15 @@ async fn send_group_message(
 /// generation admits any number of concurrent joins until it is rotated
 /// (explicit revocation) or expires.
 async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let issued = state.node.credentials().issue().await.map_err(internal)?;
+  let issued = state
+    .node
+    .credentials()
+    .issue()
+    .await
+    .map_err(internal)?
+    .wait()
+    .await
+    .map_err(internal)?;
   Ok(Json(json!({
     "credential": issued.credential().expose_secret(),
     "node_id": state.node_id.as_str(),
@@ -784,7 +808,15 @@ async fn join_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCod
 /// token mid-join re-fetch on their retry, so an in-flight merge
 /// survives a rotation by re-issuing.
 async fn rotate_token(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-  let issued = state.node.credentials().rotate().await.map_err(internal)?;
+  let issued = state
+    .node
+    .credentials()
+    .rotate()
+    .await
+    .map_err(internal)?
+    .wait()
+    .await
+    .map_err(internal)?;
   Ok(Json(json!({
     "credential": issued.credential().expose_secret(),
     "node_id": state.node_id.as_str(),
@@ -831,7 +863,11 @@ async fn join_chat(
       )
     })?;
     let endpoint = radiata::Endpoint::parse(&request.bootstrap_wss).map_err(name_error)?;
-    match state.node.join(endpoint, credential).await {
+    let outcome = match state.node.join(endpoint, credential).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match outcome {
       Ok(_) => return Ok(Json(json!({"joined": true}))),
       Err(error) => {
         if attempt >= 10 {
@@ -977,6 +1013,9 @@ async fn update_metadata(
     .node
     .patch_metadata(request.expected_revision, patch)
     .await
+    .map_err(conflict_error)?
+    .wait()
+    .await
     .map_err(conflict_error)?;
   Ok(Json(json!({
     "labels": label_map_json(&view),
@@ -996,7 +1035,14 @@ async fn disconnect(
   state: State<SharedState>, Json(request): Json<DisconnectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
   let peer = NodeId::parse(&request.node_id).map_err(name_error)?;
-  state.node.disconnect(peer).await.map_err(internal)?;
+  state
+    .node
+    .disconnect(peer)
+    .await
+    .map_err(internal)?
+    .wait()
+    .await
+    .map_err(internal)?;
   Ok(Json(json!({"disconnected": true})))
 }
 
@@ -1019,6 +1065,9 @@ async fn connect(
     .node
     .connect(endpoint, node_id)
     .await
+    .map_err(internal)?
+    .wait()
+    .await
     .map_err(internal)?;
   Ok(Json(json!({"connected": connected.as_str()})))
 }
@@ -1031,6 +1080,9 @@ async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Js
   let outcome = state
     .node
     .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .map_err(internal)?
+    .wait()
     .await
     .map_err(internal)?;
   Ok(Json(json!({
