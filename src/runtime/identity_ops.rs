@@ -216,7 +216,14 @@ impl Supervisor {
 
     // Network teardown first: no new sessions or inbound metadata while
     // the identity is replaced and the old metadata is wiped.
-    let listener_ids: Vec<crate::identity::ListenerId> = self.listeners.keys().cloned().collect();
+    let listener_ids: Vec<crate::identity::ListenerId> = self
+      .dependencies
+      .listeners
+      .lock()
+      .map_err(|_| Error::internal("listener registry"))?
+      .keys()
+      .cloned()
+      .collect();
     for listener in listener_ids {
       self.stop_listener(&listener).await?;
     }

@@ -132,14 +132,19 @@ impl Supervisor {
         }
       }
     };
-    self.listeners.insert(
-      id.clone(),
-      (
-        published.clone(),
-        std::sync::Arc::clone(&insert_listener),
-        abort,
-      ),
-    );
+    self
+      .dependencies
+      .listeners
+      .lock()
+      .map_err(|_| Error::internal("listener registry"))?
+      .insert(
+        id.clone(),
+        (
+          published.clone(),
+          std::sync::Arc::clone(&insert_listener),
+          abort,
+        ),
+      );
     // Publish the advertised endpoint so the next anti-entropy tick pages
     // it in the local descriptor (recovery dials peers through published
     // endpoints).
@@ -154,7 +159,13 @@ impl Supervisor {
   pub(super) async fn stop_listener(
     &mut self, listener: &crate::identity::ListenerId,
   ) -> Result<()> {
-    let Some((endpoint, listener_handle, abort)) = self.listeners.remove(listener) else {
+    let removed = self
+      .dependencies
+      .listeners
+      .lock()
+      .map_err(|_| Error::internal("listener registry"))?
+      .remove(listener);
+    let Some((endpoint, listener_handle, abort)) = removed else {
       return Err(Error::not_found("listener"));
     };
     // Close only wakes the pending accept so it observes the shutdown;

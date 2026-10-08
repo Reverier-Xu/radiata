@@ -6,7 +6,10 @@ use tokio::{
   task::{AbortHandle, JoinSet},
 };
 
-use super::anti_entropy::spawn_sync_driver;
+use super::{
+  anti_entropy::spawn_sync_driver,
+  task_manager::{TaskManagerHandle, spawn_task_manager},
+};
 use crate::{
   Endpoint, Error, IssuedMergeCredential, MergeView, NodeConfig, NodeId, Result, ShutdownOutcome,
   ShutdownReason,
@@ -47,6 +50,16 @@ use super::degree::DEGREE_MAINTENANCE_TICK_PERIOD;
 pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
+
+/// One bound listener's supervisor-side entry: the published endpoint,
+/// the listener handle, and the abort handle of its accept loop.
+pub(crate) type ListenerEntry = (Endpoint, std::sync::Arc<dyn TransportListener>, AbortHandle);
+
+/// The node's bound listeners, shared by the supervisor's pages, the
+/// leave teardown, and the task manager's listen/stop effects: one
+/// registry, mutated under one lock.
+pub(crate) type ListenerRegistry =
+  Arc<std::sync::Mutex<BTreeMap<crate::identity::ListenerId, ListenerEntry>>>;
 
 struct LifecyclePublisher {
   state: watch::Sender<LifecycleSnapshot>,
@@ -114,6 +127,13 @@ pub(crate) struct RuntimeDependencies {
   /// consumer-drain tasks. Shutdown awaits them and the recovery tick
   /// reaps finished ones (bounded task accounting).
   pub(crate) connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+  /// The node's bound listeners: the supervisor's pages and leave teardown
+  /// read the same registry the task manager's listen/stop effects mutate.
+  pub(crate) listeners: ListenerRegistry,
+  /// The task manager's teardown handle: the shutdown path closes its
+  /// admission, broadcasts its cancel watch, and drains it before the
+  /// node's own task set is shut down.
+  pub(crate) task_manager: Option<TaskManagerHandle>,
   /// The 32-byte runtime seed drawn once at startup, before identity
   /// provisioning. Deliberately reserved and pinned by the lifecycle
   /// entropy-sequence test.
@@ -207,15 +227,38 @@ pub(crate) async fn spawn_runtime(
   let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
   let (ready_tx, ready_rx) = oneshot::channel();
   let (packet_tx, packet_rx) = packets;
-  let client = RuntimeClient::new(control_tx, state_rx, routes, packet_tx.clone());
+  // The task manager is spawned here, beside the supervisor and before the
+  // node is marked running: the client side rides the node handle (so an
+  // admitted task always has a live manager) and the teardown handle rides
+  // the runtime dependencies (so the shutdown path drains it in order).
+  let (leave_complete, leave_signals) = mpsc::channel(1);
+  let (task_client, task_manager) = spawn_task_manager(super::task_manager::TaskManagerDeps {
+    entropy: dependencies.entropy.clone(),
+    clock: Arc::new(crate::time::HostWallClock),
+    events: dependencies.events.clone(),
+    extensions: dependencies.extensions.clone(),
+    listeners: dependencies.listeners.clone(),
+    leave_complete,
+  })?;
+  dependencies.task_manager = Some(task_manager);
+  let client = RuntimeClient::new(
+    control_tx,
+    state_rx,
+    routes,
+    packet_tx.clone(),
+    Some(task_client),
+  );
 
   runtime.spawn(supervise(
     dependencies,
-    control_rx,
     (packet_tx, packet_rx),
     sync_rounds,
-    state_tx,
-    ready_tx,
+    RuntimeSignals {
+      control: control_rx,
+      leave_complete: leave_signals,
+      state: state_tx,
+      ready: ready_tx,
+    },
     offer,
   ));
 
@@ -225,16 +268,31 @@ pub(crate) async fn spawn_runtime(
   Ok(client)
 }
 
+/// The runtime's signal ends, grouped so the start-up call cannot
+/// transpose two same-typed channels.
+struct RuntimeSignals {
+  control: mpsc::Receiver<Control>,
+  /// The task manager's leave-completion signal (see `finish_shutdown`).
+  leave_complete: mpsc::Receiver<()>,
+  state: watch::Sender<LifecycleSnapshot>,
+  ready: oneshot::Sender<()>,
+}
+
 async fn supervise(
-  dependencies: RuntimeDependencies, mut control: mpsc::Receiver<Control>,
+  dependencies: RuntimeDependencies,
   packets: (
     mpsc::Sender<crate::packet::OutboundRequest>,
     mpsc::Receiver<crate::packet::OutboundRequest>,
   ),
-  sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
-  state: watch::Sender<LifecycleSnapshot>, ready: oneshot::Sender<()>,
+  sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>, signals: RuntimeSignals,
   offer: crate::protocol::offer::FeatureOffer,
 ) {
+  let RuntimeSignals {
+    mut control,
+    mut leave_complete,
+    state,
+    ready,
+  } = signals;
   let (packet_tx, mut packet_rx) = packets;
   let mut tasks = JoinSet::<()>::new();
   let mut lifecycle = LifecyclePublisher::new(state);
@@ -292,6 +350,12 @@ async fn supervise(
   recovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
   let mut maintenance_timer = tokio::time::interval(DEGREE_MAINTENANCE_TICK_PERIOD);
   maintenance_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+  // The leave effect's completion signal: once it lands, the caller has
+  // already observed the task's terminal outcome (the publication precedes
+  // the signal) and the node tears down with the active-leave reason. A
+  // closed channel means the manager (the sender's only owner) is gone, so
+  // the arm is disabled rather than polled again.
+  let mut leave_signals_open = true;
   loop {
     tokio::select! {
       message = control.recv() => {
@@ -515,6 +579,25 @@ async fn supervise(
         };
         let _ = supervisor.send_packet(request, &mut tasks).await;
       }
+      signal = leave_complete.recv(), if leave_signals_open => {
+        match signal {
+          Some(()) => {
+            let (dependencies, drained) = supervisor.into_dependencies();
+            finish_shutdown(
+              control,
+              tasks,
+              dependencies,
+              drained,
+              &mut lifecycle,
+              None,
+              ShutdownReason::ActiveLeave,
+            )
+            .await;
+            return;
+          }
+          None => leave_signals_open = false,
+        }
+      }
       _ = recovery_timer.tick() => {
         // A failed tick (store outage, tombstone scan failure) must stay
         // visible: silent drops would starve recovery diagnostics.
@@ -574,12 +657,23 @@ async fn handle_leave(
 }
 
 async fn finish_shutdown(
-  mut control: mpsc::Receiver<Control>, mut tasks: JoinSet<()>, dependencies: RuntimeDependencies,
-  drained: Vec<tokio::task::JoinHandle<()>>, lifecycle: &mut LifecyclePublisher,
-  first_reply: Option<oneshot::Sender<ShutdownOutcome>>, reason: ShutdownReason,
+  mut control: mpsc::Receiver<Control>, mut tasks: JoinSet<()>,
+  mut dependencies: RuntimeDependencies, drained: Vec<tokio::task::JoinHandle<()>>,
+  lifecycle: &mut LifecyclePublisher, first_reply: Option<oneshot::Sender<ShutdownOutcome>>,
+  reason: ShutdownReason,
 ) {
   lifecycle.publish(LifecycleSnapshot::shutting_down());
   control.close();
+
+  // The task manager goes first: it stops admitting, releases every
+  // cancellable effect, and awaits the journaled kinds (leave,
+  // frozen-journal resolution) to their terminal phase. Only then does the
+  // node's own task set shut down — the effects still need the storage and
+  // session machinery this teardown releases.
+  if let Some(manager) = dependencies.task_manager.take() {
+    manager.begin_shutdown();
+    manager.drain().await;
+  }
 
   let mut queued_replies = Vec::with_capacity(CONTROL_CAPACITY);
   while let Ok(Control::Shutdown { reply }) = control.try_recv() {
@@ -610,10 +704,6 @@ pub(super) struct Supervisor {
   pub(super) driver: SessionDriver,
   pub(super) packet: Arc<SessionPacketContext>,
   pub(super) route_capacity: usize,
-  pub(super) listeners: BTreeMap<
-    crate::identity::ListenerId,
-    (Endpoint, std::sync::Arc<dyn TransportListener>, AbortHandle),
-  >,
   pub(super) recovery: crate::membership::recovery::RecoveryController,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// In-flight connection-degree maintenance dials: bounds one tick's
@@ -750,7 +840,6 @@ impl Supervisor {
       driver,
       packet,
       route_capacity,
-      listeners: BTreeMap::new(),
       recovery,
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1246,6 +1335,8 @@ mod receipt_retention_sweep_tests {
       reconcile: None,
       sync_round_requests: round_tx,
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+      listeners: Default::default(),
+      task_manager: None,
       runtime_seed: None,
     };
     // Supervisor::new builds the shared packet context itself, so the

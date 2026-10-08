@@ -123,6 +123,8 @@ impl NodeBuilder {
           reconcile: None,
           sync_round_requests: round_tx,
           connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+          listeners: Default::default(),
+          task_manager: None,
           runtime_seed: None,
         },
         (packet_tx, packet_rx),

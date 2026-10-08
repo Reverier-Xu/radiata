@@ -272,6 +272,8 @@ mod tests {
       reconcile: None,
       sync_round_requests: round_tx,
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+      listeners: Default::default(),
+      task_manager: None,
       runtime_seed: None,
     };
     let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx, offer) {

@@ -203,32 +203,46 @@ pub(crate) struct RuntimeClient {
   state: watch::Receiver<LifecycleSnapshot>,
   routes: RouteTable,
   packet: mpsc::Sender<OutboundRequest>,
+  /// The node's task-manager client, carried by every handle-creating
+  /// client the way the control sender is: a live handle keeps the manager
+  /// admitting, and a routing-only client deliberately holds none.
+  tasks: Option<super::task_manager::TaskClient>,
 }
 
 impl RuntimeClient {
   pub(crate) fn new(
     control: mpsc::Sender<Control>, state: watch::Receiver<LifecycleSnapshot>, routes: RouteTable,
-    packet: mpsc::Sender<OutboundRequest>,
+    packet: mpsc::Sender<OutboundRequest>, tasks: Option<super::task_manager::TaskClient>,
   ) -> Self {
     Self {
       control: Some(control),
       state,
       routes,
       packet,
+      tasks,
     }
   }
 
   /// A routing-only client for the packet session context: it can route
-  /// outbound packets but holds no node-command sender, so an admitted
-  /// packet's reply capability never keeps the supervisor's command
-  /// channel open after the last `NodeHandle` drops.
+  /// outbound packets but holds no node-command sender and no task client,
+  /// so an admitted packet's reply capability never keeps the supervisor's
+  /// command channel or the task manager open after the last `NodeHandle`
+  /// drops.
   pub(crate) fn routing_only(packet: mpsc::Sender<OutboundRequest>, routes: RouteTable) -> Self {
     Self {
       control: None,
       state: watch::channel(LifecycleSnapshot::running()).1,
       routes,
       packet,
+      tasks: None,
     }
+  }
+
+  /// The node's task-manager client, on the clients a node handle is built
+  /// from (never on a routing-only client).
+  #[allow(dead_code)] // read by the `node.tasks()` accessor; that surface lands with the task-surface stage
+  pub(crate) fn task_client(&self) -> Option<&super::task_manager::TaskClient> {
+    self.tasks.as_ref()
   }
 
   pub(crate) fn status(&self) -> NodeStatus {

@@ -347,6 +347,14 @@ pub(crate) struct TaskManagerDeps {
   /// action hooks (and, for the verb stages, the resource hooks and
   /// custom-kind reconcilers).
   pub(crate) extensions: Arc<crate::ExtensionRegistry>,
+  /// The node's bound listeners, shared with the supervisor's views: the
+  /// listen/stop effects mutate the same registry the pages read.
+  pub(crate) listeners: super::supervisor::ListenerRegistry,
+  /// The leave reconciler's completion signal to the supervisor
+  /// ([`super::supervisor::spawn_runtime`] owns the receiving end). The
+  /// leave effect sends it once its terminal publication landed, which is
+  /// what starts the `ActiveLeave` shutdown.
+  pub(crate) leave_complete: mpsc::Sender<()>,
 }
 
 /// The per-incarnation state shared with every worker future.
@@ -355,6 +363,13 @@ struct ManagerShared {
   clock: Arc<dyn WallClock>,
   events: Arc<crate::node::EventHub>,
   extensions: Arc<crate::ExtensionRegistry>,
+  /// The shared listener registry, read by the listen/stop effects.
+  #[allow(dead_code)] // read by the listener effects; that migration stage lands next
+  listeners: super::supervisor::ListenerRegistry,
+  /// The leave completion signal, sent by the leave effect (the
+  /// supervisor owns the receiver).
+  #[allow(dead_code)] // sent by the leave effect; that migration stage lands next
+  leave_complete: mpsc::Sender<()>,
   semaphore: Arc<Semaphore>,
 }
 
@@ -482,6 +497,8 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     clock: deps.clock,
     events: deps.events,
     extensions: deps.extensions,
+    listeners: deps.listeners,
+    leave_complete: deps.leave_complete,
     semaphore: Arc::new(Semaphore::new(TASK_RECONCILE_CONCURRENCY)),
   });
   let (reports_tx, reports_rx) = mpsc::unbounded_channel();
@@ -985,7 +1002,7 @@ mod tests {
     time::Duration,
   };
 
-  use tokio::sync::Notify;
+  use tokio::sync::{Notify, mpsc};
 
   use super::{
     EffectOutcome, TaskClient, TaskEffect, TaskManagerDeps, TaskPayload, TaskSpec,
@@ -997,13 +1014,27 @@ mod tests {
     TaskTransition, identity::testing::SequenceEntropy, task::Task, time::HostWallClock,
   };
 
-  fn deps() -> TaskManagerDeps {
+  fn deps_with(
+    events: Arc<crate::node::EventHub>, extensions: ExtensionRegistry,
+  ) -> TaskManagerDeps {
+    // The leave signal's receiver is the supervisor's in production; the
+    // manager tests never admit a leave effect that sends it.
+    let (leave_complete, _leave_signals) = mpsc::channel(1);
     TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
-      events: Arc::new(crate::node::EventHub::new()),
-      extensions: Arc::new(crate::ExtensionRegistry::new()),
+      events,
+      extensions: Arc::new(extensions),
+      listeners: Default::default(),
+      leave_complete,
     }
+  }
+
+  fn deps() -> TaskManagerDeps {
+    deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      ExtensionRegistry::new(),
+    )
   }
 
   /// One recorded `(hook tag, from, to)` transition observation.
@@ -1064,12 +1095,10 @@ mod tests {
         }),
       )
       .expect("registration");
-    let (client, _manager) = spawn_task_manager(TaskManagerDeps {
-      entropy: Arc::new(SequenceEntropy::default()),
-      clock: Arc::new(HostWallClock),
-      events: Arc::new(crate::node::EventHub::new()),
-      extensions: Arc::new(extensions),
-    })
+    let (client, _manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
     .expect("manager");
     let id = client
       .submit(
@@ -1102,12 +1131,10 @@ mod tests {
         Arc::new(PanickingHook),
       )
       .expect("registration");
-    let (client, _manager) = spawn_task_manager(TaskManagerDeps {
-      entropy: Arc::new(SequenceEntropy::default()),
-      clock: Arc::new(HostWallClock),
-      events: Arc::new(crate::node::EventHub::new()),
-      extensions: Arc::new(extensions),
-    })
+    let (client, _manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
     .expect("manager");
     for counter in 0..2 {
       let id = client
@@ -1138,13 +1165,9 @@ mod tests {
     let events = Arc::new(crate::node::EventHub::new());
     let mut subscription =
       events.subscribe::<TaskChanged>(EventOptions::new().capacity(16).expect("capacity"));
-    let (client, _manager) = spawn_task_manager(TaskManagerDeps {
-      entropy: Arc::new(SequenceEntropy::default()),
-      clock: Arc::new(HostWallClock),
-      events: Arc::clone(&events),
-      extensions: Arc::new(crate::ExtensionRegistry::new()),
-    })
-    .expect("manager");
+    let (client, _manager) =
+      spawn_task_manager(deps_with(Arc::clone(&events), ExtensionRegistry::new()))
+        .expect("manager");
     let id = client
       .submit(
         TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
