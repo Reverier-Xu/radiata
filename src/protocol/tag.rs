@@ -31,15 +31,19 @@ pub struct QualifiedTag {
   value: String,
   domain_end: usize,
   category_end: usize,
+  /// The end offset of the version segment when the tag carries one;
+  /// `None` for the unversioned three-segment shape.
+  version_end: Option<usize>,
 }
 
 impl QualifiedTag {
   pub fn parse(value: &str) -> Result<Self> {
-    let (value, domain_end, category_end) = validate_tag(value)?;
+    let (value, domain_end, category_end, version_end) = validate_tag(value)?;
     Ok(Self {
       value,
       domain_end,
       category_end,
+      version_end,
     })
   }
 
@@ -55,8 +59,20 @@ impl QualifiedTag {
     &self.value[self.domain_end + 1..self.category_end]
   }
 
+  /// The explicit record version segment (`v1`, `v2`, …) when the tag
+  /// carries one, `None` for the unversioned three-segment shape.
+  pub fn version(&self) -> Option<&str> {
+    self
+      .version_end
+      .map(|end| &self.value[self.category_end + 1..end])
+  }
+
+  /// The name: the last segment, after the version when one is present.
   pub fn name(&self) -> &str {
-    &self.value[self.category_end + 1..]
+    match self.version_end {
+      Some(end) => &self.value[end + 1..],
+      None => &self.value[self.category_end + 1..],
+    }
   }
 }
 
@@ -138,14 +154,19 @@ category_tag!(ProtocolTag, "protocols", "protocol tag");
 category_tag!(TransportTag, "transports", "transport tag");
 category_tag!(DiscoveryTag, "discovery", "discovery tag");
 
-/// Validates one tag and returns its canonical text with the domain and
-/// category split offsets. Every reserved-domain and reserved-category
-/// comparison runs on the canonical text: the domain is lowercased before
-/// the builtin check, so no uppercase, trailing-dot, or other non-canonical
-/// spelling variant can bypass a reservation. The ASCII case fold never
-/// changes byte length, so the split offsets stay valid for the folded
-/// text.
-fn validate_tag(value: &str) -> Result<(String, usize, usize)> {
+/// Validates one tag and returns its canonical text with the domain,
+/// category, and version split offsets. The grammar admits exactly two
+/// shapes: `<domain>/<category>/<name>` and
+/// `<domain>/<category>/<version>/<name>` where the version segment
+/// matches `v[0-9]+`. A four-segment tag whose third segment is not a
+/// valid version is rejected, never reinterpreted as a name, and five
+/// or more segments stay invalid. Every reserved-domain and
+/// reserved-category comparison runs on the canonical text: the domain
+/// is lowercased before the builtin check, so no uppercase,
+/// trailing-dot, or other non-canonical spelling variant can bypass a
+/// reservation. The ASCII case fold never changes byte length, so the
+/// split offsets stay valid for the folded text.
+fn validate_tag(value: &str) -> Result<(String, usize, usize, Option<usize>)> {
   if !(MIN_TAG_LEN..=MAX_TAG_LEN).contains(&value.len()) || !value.is_ascii() {
     return Err(Error::invalid_input("qualified tag"));
   }
@@ -157,16 +178,30 @@ fn validate_tag(value: &str) -> Result<(String, usize, usize)> {
   let category = parts
     .next()
     .ok_or_else(|| Error::invalid_input("qualified tag"))?;
-  let name = parts
+  let third = parts
     .next()
     .ok_or_else(|| Error::invalid_input("qualified tag"))?;
-  if parts.next().is_some()
-    || !valid_dns_hostname(domain)
-    || !valid_name_component(category)
-    || !valid_name_component(name)
-  {
+  let fourth = parts.next();
+  if parts.next().is_some() || !valid_dns_hostname(domain) || !valid_name_component(category) {
     return Err(Error::invalid_input("qualified tag"));
   }
+
+  // Four segments pin an explicit version in front of the name; the
+  // version slot never falls back to a second name segment.
+  let version_end = match fourth {
+    Some(name) => {
+      if !valid_version_component(third) || !valid_name_component(name) {
+        return Err(Error::invalid_input("qualified tag"));
+      }
+      Some(domain.len() + 1 + category.len() + 1 + third.len())
+    }
+    None => {
+      if !valid_name_component(third) {
+        return Err(Error::invalid_input("qualified tag"));
+      }
+      None
+    }
+  };
 
   let domain = domain.to_ascii_lowercase();
   if domain == BUILTIN_DOMAIN && category == CATEGORY_CRYPTO {
@@ -176,16 +211,16 @@ fn validate_tag(value: &str) -> Result<(String, usize, usize)> {
   let domain_end = domain.len();
   let category_end = domain_end + 1 + category.len();
   let value = format!("{domain}{}", &value[domain_end..]);
-  Ok((value, domain_end, category_end))
+  Ok((value, domain_end, category_end, version_end))
 }
 
-/// Lowercases the domain segment of one `<domain>/<category>/<name>`
+/// Lowercases the domain segment of one `<domain>/<category>[/vN]/<name>`
 /// text before tag parsing, for callers whose contract is normalization
 /// rather than rejection: a case variant of a reserved domain must land
 /// on the canonical reserved spelling, so lookups and reservations
 /// cannot be split across case forgeries. Only the domain folds — the
-/// tag grammar accepts lowercase alone in the category and name
-/// segments.
+/// tag grammar accepts lowercase alone in the category, version, and
+/// name segments.
 pub(crate) fn fold_tag_domain(value: &str) -> String {
   match value.split_once('/') {
     Some((domain, rest)) => format!("{}/{}", domain.to_ascii_lowercase(), rest),
@@ -249,9 +284,65 @@ fn valid_name_component(component: &str) -> bool {
       .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+/// One explicit version segment: a lowercase `v` followed by one or
+/// more ASCII digits, within the shared component-length cap. Leading
+/// zeros and multi-digit numbers are literal text identities — the tag
+/// grammar never normalizes them.
+fn valid_version_component(component: &str) -> bool {
+  let bytes = component.as_bytes();
+  bytes.len() >= 2
+    && bytes.len() <= MAX_COMPONENT_LEN
+    && bytes[0] == b'v'
+    && bytes[1..].iter().all(|byte| byte.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, valid_dns_hostname};
+  use super::{MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, QualifiedTag, valid_dns_hostname};
+
+  #[test]
+  fn parses_versioned_tags_with_split_accessors() {
+    let tag = QualifiedTag::parse("a.b/schemas/v1/x").unwrap();
+    assert_eq!(tag.domain(), "a.b");
+    assert_eq!(tag.category(), "schemas");
+    assert_eq!(tag.version(), Some("v1"));
+    assert_eq!(tag.name(), "x");
+    assert_eq!(tag.as_str(), "a.b/schemas/v1/x");
+
+    let multi_digit = QualifiedTag::parse("a.b/schemas/v12/multi-word-name").unwrap();
+    assert_eq!(multi_digit.version(), Some("v12"));
+    assert_eq!(multi_digit.name(), "multi-word-name");
+  }
+
+  #[test]
+  fn rejects_four_segment_tags_without_a_version_third_segment() {
+    // A third segment that is not exactly `v` + ASCII digits is a
+    // malformed version slot, never a reinterpreted name.
+    for value in [
+      "a.b/schemas/1v/x",
+      "a.b/schemas/v/x",
+      "a.b/schemas/vx/y",
+      "a.b/schemas/V1/x",
+      "a.b/schemas/v1x/y",
+      "a.b/schemas/v-1/x",
+    ] {
+      assert!(QualifiedTag::parse(value).is_err(), "accepted {value:?}");
+    }
+  }
+
+  #[test]
+  fn rejects_five_segment_tags() {
+    for value in ["a.b/schemas/v1/x/y", "a.b/schemas/x/y/z", "a.b/c/d/e/f"] {
+      assert!(QualifiedTag::parse(value).is_err(), "accepted {value:?}");
+    }
+  }
+
+  #[test]
+  fn unversioned_tags_report_no_version() {
+    let tag = QualifiedTag::parse("a.b/schemas/x").unwrap();
+    assert_eq!(tag.version(), None);
+    assert_eq!(tag.name(), "x");
+  }
 
   #[test]
   fn accepts_canonical_hostnames_within_rfc1035_caps() {

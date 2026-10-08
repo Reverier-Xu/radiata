@@ -409,7 +409,7 @@ mod tests {
     assert!(rotation_window(&peers, None, 0).0.is_empty());
   }
 
-  const TEST_SCHEMA: &str = "radiata.woooo.tech/schemas/test-sync-payload-v1";
+  const TEST_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/test-sync-payload";
 
   /// The kinded envelope round-trips and rejects the plain shape, a
   /// foreign schema, and non-canonical re-encodings at the strict decode.
@@ -430,7 +430,7 @@ mod tests {
     assert!(
       decode_kinded_sync_envelope(
         &encoded,
-        "radiata.woooo.tech/schemas/other-v1",
+        "radiata.woooo.tech/schemas/v1/other",
         "canonical",
         "schema"
       )
@@ -458,11 +458,11 @@ mod tests {
     let plain_hex: String = plain.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
       kinded_hex,
-      "83782f726164696174612e776f6f6f6f2e746563682f736368656d61732f746573742d73796e632d7061796c6f61642d76310742dead"
+      "83782f726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f746573742d73796e632d7061796c6f61640742dead"
     );
     assert_eq!(
       plain_hex,
-      "82782f726164696174612e776f6f6f6f2e746563682f736368656d61732f746573742d73796e632d7061796c6f61642d7631420402"
+      "82782f726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f746573742d73796e632d7061796c6f6164420402"
     );
   }
 

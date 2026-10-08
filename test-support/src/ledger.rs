@@ -16,7 +16,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 /// The canonical test-attestation schema tag.
 pub const ATTESTATION_SCHEMA: &str = "radiata.woooo.tech/schemas/test-attestation";
 /// The canonical soak attempt schema tag.
-pub const SOAK_ATTEMPT_SCHEMA: &str = "radiata.woooo.tech/schemas/soak-attempt-v1";
+pub const SOAK_ATTEMPT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/soak-attempt";
 
 /// The closed retry classification set. A lineage continues only through
 /// an independently classified infrastructure failure; every other value

@@ -15,7 +15,7 @@
 //!   derived local view a lane negotiates over;
 //! - [`digest`] — the frozen row-digest function every fingerprint aggregates
 //!   (a wire-contract constant, pinned by golden vectors);
-//! - [`wire`] — the reconcile-v1 message contract: canonical CBOR encodings for
+//! - [`wire`] — the reconcile v1 message contract: canonical CBOR encodings for
 //!   ROOT/HINT/OFFER/NEED/ROWS/DONE, fail-closed decode, bounded shapes, golden
 //!   vectors;
 //! - [`engine`] — the per-session, per-lane negotiation state machine (phase

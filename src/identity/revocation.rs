@@ -31,10 +31,10 @@ use crate::{
 };
 
 /// The durable schema of the issuer-signed revocation record.
-pub(crate) const REVOCATION_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/revocation-record-v1";
+pub(crate) const REVOCATION_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/revocation-record";
 /// The signature domain of the issuer-signed revocation record.
-pub(crate) const REVOCATION_RECORD_V1_DOMAIN: &[u8] =
-  b"radiata.woooo.tech/crypto/revocation-record-v1";
+pub(crate) const REVOCATION_RECORD_DOMAIN: &[u8] =
+  b"radiata.woooo.tech/crypto/v1/revocation-record";
 
 /// Canonical-decoder bounds for the flat revocation record.
 const REVOCATION_LIMITS: crate::protocol::CborLimits =
@@ -97,7 +97,7 @@ impl RevocationRecordV1 {
   /// permanently retained binding).
   pub(crate) fn verify(&self, issuer_key: &PublicKey) -> Result<()> {
     crate::identity::signature::verify_strict(
-      REVOCATION_RECORD_V1_DOMAIN,
+      REVOCATION_RECORD_DOMAIN,
       &Self::encode_signed_body(&self.subject, &self.subject_key, &self.issuer)?,
       issuer_key,
       &self.signature,
@@ -125,7 +125,7 @@ pub(crate) async fn sign_revocation_record(
   let signature = crate::identity::records::sign_tombstone(
     context,
     keys,
-    REVOCATION_RECORD_V1_DOMAIN,
+    REVOCATION_RECORD_DOMAIN,
     "revocation record signature",
     |identity| RevocationRecordV1::encode_signed_body(subject, expected_key, identity.node()),
   )
@@ -359,7 +359,7 @@ mod tests {
   use ed25519_dalek::Signer as _;
 
   use super::{
-    REVOCATION_RECORD_V1_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, is_revoked_ctx,
+    REVOCATION_RECORD_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, is_revoked_ctx,
     known_revocation_records_ctx, revoke_binding_ctx, revoked_key_ctx,
   };
   use crate::{
@@ -396,7 +396,7 @@ mod tests {
   /// and child processes construct byte-identical records).
   fn signed_record(subject: &NodeId, subject_key: &PublicKey) -> RevocationRecordV1 {
     let body = RevocationRecordV1::encode_signed_body(subject, subject_key, &issuer()).unwrap();
-    let signature = issuer_signing().sign(&signature_message(REVOCATION_RECORD_V1_DOMAIN, &body));
+    let signature = issuer_signing().sign(&signature_message(REVOCATION_RECORD_DOMAIN, &body));
     RevocationRecordV1::new(
       subject.clone(),
       subject_key.clone(),
@@ -551,7 +551,7 @@ mod crash {
   use tempfile::TempDir;
 
   use super::{
-    REVOCATION_RECORD_V1_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, revoke_binding_ctx,
+    REVOCATION_RECORD_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, revoke_binding_ctx,
     revoked_key_ctx,
   };
   use crate::{
@@ -579,7 +579,7 @@ mod crash {
   fn signed_record(subject: &NodeId, subject_key: &PublicKey) -> RevocationRecordV1 {
     use ed25519_dalek::Signer as _;
     let body = RevocationRecordV1::encode_signed_body(subject, subject_key, &issuer()).unwrap();
-    let signature = issuer_signing().sign(&signature_message(REVOCATION_RECORD_V1_DOMAIN, &body));
+    let signature = issuer_signing().sign(&signature_message(REVOCATION_RECORD_DOMAIN, &body));
     RevocationRecordV1::new(
       subject.clone(),
       subject_key.clone(),

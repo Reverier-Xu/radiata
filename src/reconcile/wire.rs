@@ -144,7 +144,7 @@ pub(crate) struct Row {
   pub(crate) content: Vec<u8>,
 }
 
-/// One decoded reconcile-v1 message.
+/// One decoded reconcile v1 message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Message {
   /// The sender's whole-lane aggregate: count and xor over every row it
@@ -324,7 +324,7 @@ struct DoneWire {
   round_token: u64,
 }
 
-/// Encodes one reconcile-v1 message body in canonical CBOR. Shape
+/// Encodes one reconcile v1 message body in canonical CBOR. Shape
 /// violations (over-bound lists, inverted ranges, unknown lanes) fail
 /// closed before any byte is emitted.
 pub(crate) fn encode(message: &Message) -> Result<Vec<u8>> {
@@ -395,7 +395,7 @@ pub(crate) fn encode(message: &Message) -> Result<Vec<u8>> {
   }
 }
 
-/// Decodes one reconcile-v1 message body, fail-closed on every
+/// Decodes one reconcile v1 message body, fail-closed on every
 /// contract violation: unknown kinds, unknown lanes, non-canonical
 /// bytes, wrong arity, trailing data, over-bound lists, and inverted
 /// ranges all return typed errors.

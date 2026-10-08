@@ -29,10 +29,10 @@ use radiata::{
 };
 use tokio::sync::Notify;
 
-pub const LOCAL_IDENTITY_NAMESPACE: &str = "radiata.woooo.tech/metadata/local-identity-v1";
+pub const LOCAL_IDENTITY_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/local-identity";
 pub const KEY_CREATION_INTENT_NAMESPACE: &str =
-  "radiata.woooo.tech/metadata/key-creation-intent-v1";
-pub const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/pending-transaction-v1";
+  "radiata.woooo.tech/metadata/v1/key-creation-intent";
+pub const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/pending-transaction";
 
 /// One merge with bounded retries against one stable credential: the
 /// accept loop precomputes its merge hint, so rotating on every retry
@@ -652,7 +652,7 @@ pub enum CommitFault {
 /// The pending-transaction journal namespace: a journaled commit is
 /// recognizable by its pending-record put into this namespace.
 fn pending_journal_namespace() -> StoreNamespace {
-  namespace("radiata.woooo.tech/metadata/pending-transaction-v1")
+  namespace("radiata.woooo.tech/metadata/v1/pending-transaction")
 }
 
 #[derive(Debug)]

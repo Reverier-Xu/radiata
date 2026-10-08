@@ -10,7 +10,7 @@
 //!    the steady state (the incremental successor of the whole-catalog rescan;
 //!    an un-namespaced note degrades to the full rescan so no write can hide);
 //! 2. **session frames** — the [`ReconcileConsumer`] receives admitted streams
-//!    on the reconcile-v1 protocol, decodes one [`super::wire::Message`] per
+//!    on the reconcile v1 protocol, decodes one [`super::wire::Message`] per
 //!    frame, and drives the sender's engine with [`Drive::Message`];
 //! 3. **establishment and cadence** — a peer newly present in the alive set (or
 //!    one whose engines an inbound frame created before the driver saw the
@@ -116,11 +116,11 @@ use crate::{
 };
 
 /// The canonical protocol tag of the reconciliation stream.
-pub(crate) const RECONCILE_PROTOCOL: &str = "radiata.woooo.tech/protocols/reconcile-v1";
+pub(crate) const RECONCILE_PROTOCOL: &str = "radiata.woooo.tech/protocols/v1/reconcile";
 
 /// The wire schema of one reconciliation frame: one encoded
 /// [`super::wire::Message`] per body.
-pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/reconcile-v1";
+pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/reconcile";
 
 /// The lanes this build carries on the engine: all four (descriptors,
 /// trust, resources, tombstones) migrated onto the plane, retiring the

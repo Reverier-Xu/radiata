@@ -1,4 +1,4 @@
-schema = "radiata.woooo.tech/schemas/fuzz-corpus-v1"
+schema = "radiata.woooo.tech/schemas/v1/fuzz-corpus"
 status = "accepted"
 target = "selector"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }

@@ -11,20 +11,20 @@
 //! SHA-256 of one exact frozen seed string per feature:
 //!
 //! ```text
-//! seed = "radiata.woooo.tech/crypto/feature-fingerprint-v1/" ++ <full feature tag>
+//! seed = "radiata.woooo.tech/crypto/v1/feature-fingerprint/" ++ <full feature tag>
 //! ```
 //!
 //! The five frozen seeds are:
 //!
-//! - `radiata.woooo.tech/crypto/feature-fingerprint-v1/radiata.woooo.tech/
+//! - `radiata.woooo.tech/crypto/v1/feature-fingerprint/radiata.woooo.tech/
 //!   features/ auth-ed25519-session`
-//! - `radiata.woooo.tech/crypto/feature-fingerprint-v1/radiata.woooo.tech/
+//! - `radiata.woooo.tech/crypto/v1/feature-fingerprint/radiata.woooo.tech/
 //!   features/ session-core`
-//! - `radiata.woooo.tech/crypto/feature-fingerprint-v1/radiata.woooo.tech/
+//! - `radiata.woooo.tech/crypto/v1/feature-fingerprint/radiata.woooo.tech/
 //!   features/ data-messages`
-//! - `radiata.woooo.tech/crypto/feature-fingerprint-v1/radiata.woooo.tech/
+//! - `radiata.woooo.tech/crypto/v1/feature-fingerprint/radiata.woooo.tech/
 //!   features/ direct-request`
-//! - `radiata.woooo.tech/crypto/feature-fingerprint-v1/radiata.woooo.tech/
+//! - `radiata.woooo.tech/crypto/v1/feature-fingerprint/radiata.woooo.tech/
 //!   features/ routed-delivery`
 //!
 //! `handshake_feature_registry_golden_fixture_is_frozen` pins the exact
@@ -38,7 +38,7 @@ use super::{CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, QualifiedTag, e
 use crate::{Digest, Error, Result, identity::signature::body_digest};
 
 const BUILTIN_DOMAIN: &str = super::tag::BUILTIN_DOMAIN;
-const FINGERPRINT_SEED_PREFIX: &str = "radiata.woooo.tech/crypto/feature-fingerprint-v1/";
+const FINGERPRINT_SEED_PREFIX: &str = "radiata.woooo.tech/crypto/v1/feature-fingerprint/";
 
 pub(crate) const AUTH_ED25519_SESSION: &str = "radiata.woooo.tech/features/auth-ed25519-session";
 pub(crate) const SESSION_CORE: &str = "radiata.woooo.tech/features/session-core";
@@ -612,28 +612,28 @@ mod tests {
     let cases = [
       (
         AUTH_ED25519_SESSION,
-        "a6aae08b63bae00caa00aab679575305a1706fe438b4f6174cb557ffc1494325",
-        "068169abb577cd92c8f018ddb594aba6bedcd949f1614163b39c941efc83f906",
+        "8f83df98c958318ec3d96e4b0d16fa0e49550244a56c3e62580248a499b3ad43",
+        "34762210f55bb8d37e57cb41ce39f2754e1ef90a0f5cb336f3adde7d50ab6af7",
       ),
       (
         SESSION_CORE,
-        "ee00fbe9538f70fd59221ce29662b3c2e7ca641435c8d7ef9885c1b0c92404c4",
-        "b5117204b611a8e851c65a9d42e1c226b02655029b0383c13171650fc66928dc",
+        "c1e856e3ba8381bb6fbead84dfff0f28aaee5b77e4a54efd47293e2357091edd",
+        "e47a216fe9756b4fbbf7f0453164ce4fd85edb57e45132aa88d0eab391c6cfee",
       ),
       (
         DATA_MESSAGES,
-        "1eefa1f2d6d8693aaf50c2104446b70b7f17fa5edb6f770292c98c1e79e98446",
-        "08095643a94e9724b23fa3d28a4b8590b2958a413b15af2d98f9b1b4f567ad8e",
+        "c5145330004d71f5bc628652ff94689c944ff21a288cb8230d732cbd3ff6a62f",
+        "ef2862cce032c9326511a6cd37ce797d23f66b9c1a4cc3888f22ce5b1892fcb6",
       ),
       (
         DIRECT_REQUEST,
-        "b6b33d30b0f540cd765d7dcf9ba3b348073e0ebfce6614e5444a4d2c68ea5ca2",
-        "7ead874dd685cc92ac6d7b8688351067f9fa79626ea2995d1712a4d9b7c69db7",
+        "f267e89141b80aab766cd167502a55e5662567a7ca5ac02c091f1ec5c5003d8b",
+        "a3c455472662f27e0c7821d35ce753d5308b6c38cdc848d97a73b1226c10f546",
       ),
       (
         ROUTED_DELIVERY,
-        "98754ce760dd2308e7ee914e3575cb0cc69e4281bcda0889f13aeb35e5651609",
-        "5c7aff71c2dd5df6cfdaa6a3448dc08685bc3d00b905d1401af6196ba270b396",
+        "6ba9b5e1ff674801f0fcb9f91c58971bec5fb085cf9f6d61674d028655f66db7",
+        "0b6419664f5a5499f9416b5cc9bafcefcdb1bf7cffad70c611f0e29bae7e3066",
       ),
     ];
     for (name, fingerprint, digest) in cases {
@@ -747,7 +747,7 @@ mod tests {
       "feature definition reserved namespace"
     );
 
-    let crypto = QualifiedTag::parse("radiata.woooo.tech/crypto/session-v1");
+    let crypto = QualifiedTag::parse("radiata.woooo.tech/crypto/v1/session");
     assert!(crypto.is_err());
 
     let valid = FeatureRegistry::build(vec![

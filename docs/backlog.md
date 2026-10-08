@@ -138,7 +138,7 @@ evidence lands in the commit history.
 - The reconciliation plane: all four lanes (descriptors, trust,
   resources, tombstones) converge by receiver-evidenced range
   reconciliation — `(count, xor)` fingerprints over each lane's
-  item-digest space, the six-message `reconcile-v1` wire contract
+  item-digest space, the six-message `reconcile v1` wire contract
   (ROOT/HINT/OFFER/NEED/ROWS/DONE, canonical CBOR, fail-closed
   decode, golden vectors), the frozen digest function (truncated
   SHA-256 over the canonical `[key, content]` pair), the `b = 4`

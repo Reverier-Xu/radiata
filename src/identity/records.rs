@@ -5,7 +5,7 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 use super::{
   canonical::canonical_record,
   lifecycle::LocalIdentityContext,
-  signature::{MERGE_GRANT_V1_DOMAIN, signature_message, verify_strict},
+  signature::{MERGE_GRANT_DOMAIN, signature_message, verify_strict},
 };
 use crate::{
   BoxFuture, Error, KeyHandle, KeyOperationId, NodeId, OperationId, PublicKey, Result, Signature,
@@ -63,13 +63,13 @@ impl JournalPurpose {
 
 const ED25519_ALGORITHM: &str = "radiata.woooo.tech/crypto/ed25519";
 
-const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/local-identity-v1";
-const KEY_CREATION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/key-creation-intent-v1";
-const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/identity-binding-v1";
-const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/credential-use-v1";
-const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/merge-grant-v1";
-const KEY_DELETION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/key-deletion-intent-v1";
-const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/key-deleted-v1";
+const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/local-identity";
+const KEY_CREATION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-creation-intent";
+const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/identity-binding";
+const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/credential-use";
+const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/merge-grant";
+const KEY_DELETION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deletion-intent";
+const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deleted";
 
 pub(crate) use crate::storage::families::{
   CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE,
@@ -862,7 +862,7 @@ impl MergeGrantV1 {
 
   pub(crate) fn verify(&self, issuer_key: &PublicKey) -> Result<()> {
     verify_strict(
-      MERGE_GRANT_V1_DOMAIN,
+      MERGE_GRANT_DOMAIN,
       &self.signed_body()?,
       issuer_key,
       &self.signature,
@@ -972,7 +972,7 @@ mod tests {
     )
     .unwrap();
     let signature = issuer_signing_key().sign(&super::super::signature::signature_message(
-      MERGE_GRANT_V1_DOMAIN,
+      MERGE_GRANT_DOMAIN,
       &body_bytes,
     ));
     MergeGrantV1::new(
@@ -989,12 +989,12 @@ mod tests {
     crate::hex::decode(hex, "golden").unwrap()
   }
 
-  const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f6c6f63616c2d6964656e746974792d763101781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
-  const KEY_CREATION_INTENT_GOLDEN: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f6b65792d6372656174696f6e2d696e74656e742d763101781b6b65796f702d353030303030303030303030303030303030303030781a6e6f64652d3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e2d3630303030303030303030303030303030303030304107";
-  const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f6f2e746563682f736368656d61732f6964656e746974792d62696e64696e672d763101781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139";
-  const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f63726564656e7469616c2d7573652d763101781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
-  const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840621e250937af13187933854eee29d10f832f52cc1139193f8ecd538f8abcc3db21c04d4bcc1bd9c7edbffc84b897576a7a29547c856c46d3fdfd1619b40b5c06";
-  const MERGE_GRANT_BODY_GOLDEN: &str = "877829726164696174612e776f6f6f6f2e746563682f736368656d61732f6d657267652d6772616e742d76310150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+  const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6c6f63616c2d6964656e7469747901781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
+  const KEY_CREATION_INTENT_GOLDEN: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6b65792d6372656174696f6e2d696e74656e7401781b6b65796f702d353030303030303030303030303030303030303030781a6e6f64652d3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e2d3630303030303030303030303030303030303030304107";
+  const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6964656e746974792d62696e64696e6701781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139";
+  const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f63726564656e7469616c2d75736501781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+  const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d657267652d6772616e740150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840ec05240b0a1a205f4e52e9ef3d4bf18aed07f901110c65f564b40f4672df7afd13e961eafd674ad47c86d93ef086daa568745b6adca6a8ee7b8c6af93428fe0a";
+  const MERGE_GRANT_BODY_GOLDEN: &str = "877829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d657267652d6772616e740150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 
   #[test]
   fn identity_records_golden_vectors_match_exact_bytes() {
@@ -1054,8 +1054,10 @@ mod tests {
   }
 
   fn wrong_schema(schema: &str) -> String {
-    let stem = schema.strip_suffix("v1").unwrap();
-    format!("{stem}v0")
+    // The version segment pins the schema generation: downgrading `v1`
+    // to `v0` at the same width yields a foreign schema tag of identical
+    // byte length.
+    schema.replacen("/v1/", "/v0/", 1)
   }
 
   #[test]
@@ -1414,21 +1416,21 @@ mod tests {
     let (identity_namespace, identity_key) = local_identity_key().unwrap();
     assert_eq!(
       identity_namespace.as_str(),
-      "radiata.woooo.tech/metadata/local-identity-v1"
+      "radiata.woooo.tech/metadata/v1/local-identity"
     );
     assert_eq!(identity_key.as_bytes(), b"self");
 
     let (intent_namespace, intent_key) = key_creation_intent_key(&operation()).unwrap();
     assert_eq!(
       intent_namespace.as_str(),
-      "radiata.woooo.tech/metadata/key-creation-intent-v1"
+      "radiata.woooo.tech/metadata/v1/key-creation-intent"
     );
     assert_eq!(intent_key.as_bytes(), OPERATION.as_bytes());
 
     let (binding_namespace, binding_key) = identity_binding_key(&node(SUBJECT_NODE)).unwrap();
     assert_eq!(
       binding_namespace.as_str(),
-      "radiata.woooo.tech/metadata/identity-binding-v1"
+      "radiata.woooo.tech/metadata/v1/identity-binding"
     );
     assert_eq!(binding_key.as_bytes(), SUBJECT_NODE.as_bytes());
 
@@ -1436,7 +1438,7 @@ mod tests {
       credential_use_key(&node(ISSUER_NODE), &generation(), &node(SUBJECT_NODE)).unwrap();
     assert_eq!(
       use_namespace.as_str(),
-      "radiata.woooo.tech/metadata/credential-use-v1"
+      "radiata.woooo.tech/metadata/v1/credential-use"
     );
     let mut expected_use_key = ISSUER_NODE.as_bytes().to_vec();
     expected_use_key.extend_from_slice(&GENERATION_BYTES);
@@ -1446,7 +1448,7 @@ mod tests {
     let (grant_namespace, grant_key) = merge_grant_key(&merge()).unwrap();
     assert_eq!(
       grant_namespace.as_str(),
-      "radiata.woooo.tech/metadata/merge-grant-v1"
+      "radiata.woooo.tech/metadata/v1/merge-grant"
     );
     assert_eq!(grant_key.as_bytes(), &ADMISSION_BYTES);
   }

@@ -1,4 +1,4 @@
-schema = "radiata.woooo.tech/schemas/fuzz-corpus-v1"
+schema = "radiata.woooo.tech/schemas/v1/fuzz-corpus"
 status = "accepted"
 target = "persisted_decode"
 privacy_screen = { tool = "owner-manual-review", version = "1", result = "approved" }
@@ -6,156 +6,156 @@ minimizer = { tool = "none", version = "0" }
 aggregate = { entry_count = 22, total_bytes = 3838 }
 
 [[entry]]
-digest = "9dc3ed02f400510b0a646e49e1235490c1a56c9d5744a00b69a296a20d4eacb5"
+digest = "8029b63cf6bfadab5c1b1f5188fe34157da7f1c00d8e0122b83f0f8e7cd8291e"
 byte_count = 187
 origin = "golden-fixture"
 lineage = "compatibility manifest local-identity-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "fe8bebd2e23ae8c233b9433c7f5ec037aa66d0aec9ea343632ff238bcc2926b7"
+digest = "7b6a6b9ba2a647d8d7add78049c103e6fe4cf86705c79eca61c0a67b1f1d4716"
 byte_count = 184
 origin = "golden-fixture"
 lineage = "compatibility manifest key-creation-intent-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "60229a737950248e7ddc306ec403f1e946008f50439fa4b3c13803d05e892e7b"
+digest = "aae1a6a23589f9c66b1e8e50cc42dc0f5a7b0df18a6dcb7647407e675fd4360b"
 byte_count = 143
 origin = "golden-fixture"
 lineage = "compatibility manifest identity-binding-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "300527f955297c6e361c97b7f0bc466f8c39e94f7c63301de3606c9dfce0ce2b"
+digest = "7091ff7573a72637a33b4e8625c51757a3400fe7fb5c1ae091ee85913f570125"
 byte_count = 206
 origin = "golden-fixture"
 lineage = "compatibility manifest cluster-genesis-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "d5475059b9c9935340c7e74f15ae16f751b52387907a714039099c7a35f9ab7f"
+digest = "b0d021a566b97113be71fed275be5df6665840295df1a17a35a552a86a294dbe"
 byte_count = 118
 origin = "golden-fixture"
 lineage = "compatibility manifest local-cluster-pointer-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "950182f068cb044d90423ba7f3c37f5b44bd8cf7bc404b29763fc5331887147a"
+digest = "46c255a0ff6e06cb158015fbe701ff04fc3f443904981004074126a31655763b"
 byte_count = 201
 origin = "golden-fixture"
 lineage = "compatibility manifest credential-use-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "7ce6749d840ad1fb772292f496fbd074c7c6fc39d49ee9d81ea91cd736c8b8ca"
+digest = "660d06a59b4068357275ce84f1e9a99f4e37739f596c9113d0db566b89d2f0a0"
 byte_count = 268
 origin = "golden-fixture"
 lineage = "compatibility manifest admission-grant-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "fa8e4171946ee0cf371e43fa131b6ad2f720689bfabe59927353e327f055018f"
+digest = "3130aae70a1c97b8a19191be1ae9f420a2663ed2a84ea5d0ea334d3c9a0cc8ff"
 byte_count = 91
 origin = "golden-fixture"
 lineage = "compatibility manifest key-deleted-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "4019c745edaa58a529fbdb2d91bc7ca7a2e0ed4c7d9d0ab1b84ee3cfd0e4ef0e"
+digest = "c0b9528cc3d40b96cdeba885e4efacbf831bab38e2a3997f7a864cf080257271"
 byte_count = 142
 origin = "golden-fixture"
 lineage = "compatibility manifest descriptor-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "aaae7f28d7163fe6017801b3351b1ebc8c6b34fd55ce9bb59eaa7af6bd3662fa"
+digest = "11e4286d9c2173d6efa2bb1f4e8202fded00460e3582975a2a4ce3103812bec2"
 byte_count = 177
 origin = "golden-fixture"
 lineage = "compatibility manifest descriptor-v2"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "9ec54c92b0024d222554ac711352ad8d9f8b8a298c3effe7e6bdd1d56ca5ed05"
+digest = "4ddb8a126551d28df4096d0ff04dd4e72118bc718c7b71e083a9905e377aa91f"
 byte_count = 309
 origin = "golden-fixture"
 lineage = "compatibility manifest record-g7-previous"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "69d4c23ab522a886c1b2c056121c39696392b38d0bf86cc18ed39d5187d8307c"
+digest = "91a9d82d485dac7d7a6edc8964a9fe3b8589bf71ea7112e47beb67178693cb03"
 byte_count = 334
 origin = "golden-fixture"
 lineage = "compatibility manifest record-g9-live"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "cad9f785c798d96997450ddd202b22216e8d6142826f5e1c8916703b9b676f6e"
+digest = "1306807189b91f9fa369704944eba1df05155dfc6809a1e896ee4b7624dca099"
 byte_count = 283
 origin = "golden-fixture"
 lineage = "compatibility manifest record-g9-removal"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "e57e4ea1965d772550575536f809109148140233ac58b5990f9a8d50fb751078"
+digest = "4380a8e8e5f268cca6f9f61a1309a46f251e108078b31f5aebf6c33999a9961f"
 byte_count = 134
 origin = "golden-fixture"
 lineage = "compatibility manifest record-routing-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "2a6cdf4eed28de2250102dfcc643deaa0ad669d760164b5845795d675501a7b1"
+digest = "ae21670afe28f5a527933df5d1904bb0248201dddd686a739d6042646571eae1"
 byte_count = 134
 origin = "golden-fixture"
 lineage = "compatibility manifest record-delivered-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "c9a66e532fd6f03fdb6613b5c4c62f13a21a584b0fcce528ed79d7c203399e07"
+digest = "a0200e4bbdf3dcc9b252e6e9f3cf631258fcd0ae66c31ed3ca84ecb0f2c6313f"
 byte_count = 403
 origin = "golden-fixture"
 lineage = "compatibility manifest pending-record-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "104bfc9b8f0b16a7231ac1d2dfdd79721fd6f2b054c39de00dbfa9392b816d76"
+digest = "b96b2ffb17c7fce847f0cdb70d104db5a97658e8a8869cd086be8ee79d015e56"
 byte_count = 43
 origin = "golden-fixture"
 lineage = "compatibility manifest base-record-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "8816dded854c82fa8165177557b0888887e5e02661fcbc02b2fac25bbfe33e17"
+digest = "9a005100c7895bff417927bfc7d1cb4f7d046ae5c7669b00ca3caf2a93937fd3"
 byte_count = 80
 origin = "golden-fixture"
 lineage = "compatibility manifest edge-record-v1"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 byte_count = 0
 origin = "synthetic-generator"
 lineage = "empty input"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "555de59e5f6b5b533ffe58e77e72ec37f442eb7a78685e08f64ec586de378d5d"
 byte_count = 24
 origin = "synthetic-generator"
 lineage = "truncated cluster genesis"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "9d2253f067ab8951acd795619473ab343a47a5cb024e11e66d7d560803a6dc7b"
+digest = "51ce36ff62eadd9e77349e21ec2d574f1711b96bfd20c3b00c9056658793b96e"
 byte_count = 334
 origin = "synthetic-generator"
 lineage = "corrupted array header of resource record"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
-digest = "cc0ac88c8048fee1fca0afb9e81de1f8f0dd8f2811da2e84446cc5a07ca36307"
+digest = "ddf2cd50282d6fc2dcc91db887327ef9eeccdbc2e188ebb37ce41c5f86369ef4"
 byte_count = 43
 origin = "synthetic-generator"
 lineage = "unknown migration record kind"
-schema_tags = ["radiata.woooo.tech/schemas/resource-record-v1"]
+schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 

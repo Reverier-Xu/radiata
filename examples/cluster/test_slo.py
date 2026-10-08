@@ -253,7 +253,7 @@ def write_report(samples: list[dict]) -> bool:
         }
     passed = all(s["outcome"] == "ok" for s in samples)
     report = {
-        "schema": "radiata.woooo.tech/schemas/slo-report-v1",
+        "schema": "radiata.woooo.tech/schemas/v1/slo-report",
         "profile": {
             "members": N,
             "deadline_ms": DEADLINE_MS,
