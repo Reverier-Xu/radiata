@@ -142,6 +142,9 @@ async fn listen(node: &Node) -> Endpoint {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   listener.endpoint().clone()
 }
@@ -582,7 +585,13 @@ async fn connect_cq4(nodes: &[Node]) {
 async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer.handle.credentials().rotate().await {
+    // The ladder covers both halves of the migrated rotation: the
+    // admission and the once-only secret's wait.
+    let rotated = match issuer.handle.credentials().rotate().await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match rotated {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -815,6 +824,9 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
     .rotate()
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .into_credential()
     .expose_secret()
     .to_owned();
@@ -952,7 +964,14 @@ async fn membership_sync_failure_matrix_partition_healing() {
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut connected = false;
   while std::time::Instant::now() < deadline {
-    let view = nodes[1].handle.start_recovery().await.unwrap();
+    let view = nodes[1]
+      .handle
+      .start_recovery()
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
     if view.is_connected() {
       connected = true;
       break;
@@ -1087,7 +1106,14 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
       radiata::LabelValue::parse("slo").unwrap(),
     )
     .unwrap();
-  nodes[15].handle.patch_metadata(1, patch).await.unwrap();
+  nodes[15]
+    .handle
+    .patch_metadata(1, patch)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
 
   // Convergence: every member observes the bumped descriptor at revision 2.
   let target = nodes[15].id.clone();

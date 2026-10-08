@@ -64,6 +64,9 @@ async fn listen(node: &Node) -> Endpoint {
     .listeners()
     .create(node.endpoint.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   listener.endpoint().clone()
 }
@@ -244,7 +247,15 @@ async fn cleanup_converges_and_excludes_the_subject() {
 
   // The issuer refuses the cleaned subject's re-merge even with a fresh
   // credential.
-  let issued = issuer.handle.credentials().rotate().await.unwrap();
+  let issued = issuer
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let error = subject
     .handle

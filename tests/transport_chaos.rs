@@ -511,15 +511,21 @@ async fn listen_all(handle: &NodeHandle, sockets: &Path, index: usize) -> Vec<En
       _ => Endpoint::parse(&format!("{scheme}://127.0.0.1:0")).expect("builtin endpoint"),
     };
     // A restart may race the previous runtime's listener teardown for
-    // the same unix path; the bind retries briefly and bounded.
+    // the same unix path; the bind retries briefly and bounded. The
+    // retry ladder covers both halves of the migrated listen: the
+    // admission and the bind effect's wait.
     let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
     let listener = loop {
-      match bounded(
+      let bound = match bounded(
         handle.listeners().create(requested.clone()),
         "listen {scheme}",
       )
       .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match bound {
         Ok(listener) => break listener,
         Err(_) if std::time::Instant::now() < deadline => {
           tokio::time::sleep(Duration::from_millis(50)).await;
@@ -610,7 +616,16 @@ async fn bounded<F: std::future::Future>(future: F, what: &str) -> F::Output {
 /// rotation or expiry, so receivers need no per-join rotation).
 async fn issue_credential(slot: &Slot) -> String {
   let issued = bounded(
-    slot.handle().credentials().issue(),
+    async {
+      slot
+        .handle()
+        .credentials()
+        .issue()
+        .await?
+        // The issued secret is once-only: the first wait collects it.
+        .wait()
+        .await
+    },
     "issue merge credential",
   )
   .await

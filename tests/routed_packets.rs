@@ -197,6 +197,9 @@ impl Node {
       .listeners()
       .create(radiata::Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap();
     self.endpoint = Some(listener.endpoint().clone());
   }
@@ -304,7 +307,15 @@ async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
   nodes[0].listen().await;
 
   for member_index in 1..=3usize {
-    let issued = nodes[0].handle.credentials().rotate().await.unwrap();
+    let issued = nodes[0]
+      .handle
+      .credentials()
+      .rotate()
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
     let secret = issued.credential().expose_secret().to_owned();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     let mut attempts = 0_u32;

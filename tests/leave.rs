@@ -201,7 +201,14 @@ fn write(name_seed: u8) -> ResourceWrite {
 async fn put_with_retry(handle: &NodeHandle, name_seed: u8) {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match handle.resources().put(write(name_seed)).await {
+    // The ladder covers both halves of the migrated write: the
+    // admission and the commit effect, observed through the task's
+    // `wait` — a put whose effect still runs would race the leave.
+    let committed = match handle.resources().put(write(name_seed)).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match committed {
       Ok(_) => return,
       Err(error) if error.kind() == ErrorKind::NotReady => {
         assert!(
@@ -309,6 +316,9 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   let endpoint = listener
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap()
     .endpoint()
@@ -427,6 +437,9 @@ async fn recovery_quiesces_after_a_member_departs() {
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .endpoint()
     .clone();
   common::merge_with_retry(&b, &a, a_endpoint.clone()).await;
@@ -503,6 +516,9 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
   let a_endpoint = a
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap()
     .endpoint()
@@ -678,6 +694,9 @@ async fn restarted_node_passively_reconnects(
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .endpoint()
     .clone();
 
@@ -784,6 +803,9 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
     handle
       .listeners()
       .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap();
     put_with_retry(&handle, 2).await;

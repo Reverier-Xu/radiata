@@ -166,29 +166,40 @@ impl Resources {
 /// The node's bound listeners.
 pub struct Listeners {
   runtime: RuntimeClient,
+  /// The node-local extension registry: the listen admission resolves
+  /// the endpoint's transport selector (a pure registry lookup).
+  extensions: std::sync::Arc<ExtensionRegistry>,
 }
 
 impl Listeners {
-  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+  pub(crate) fn new(
+    runtime: &RuntimeClient, extensions: &std::sync::Arc<ExtensionRegistry>,
+  ) -> Self {
     Self {
       runtime: runtime.clone(),
+      extensions: extensions.clone(),
     }
   }
 
-  /// Binds one new listener on the endpoint and returns its live view.
-  pub async fn create(self, endpoint: Endpoint) -> Result<ListenerView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::Listen { endpoint, reply })
-      .await
+  /// Binds one new listener on the endpoint and returns the admitted
+  /// [`Task`], whose `wait` resolves with the listener's live view.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// an endpoint whose transport selector does not resolve in the
+  /// registry); the bind syscall and the frozen-store refusal are
+  /// effect-time and surface on the task's `wait`.
+  pub async fn create(self, endpoint: Endpoint) -> Result<Task<ListenerView>> {
+    crate::runtime::listen(&self.extensions, self.runtime.admit()?, endpoint).await
   }
 
-  /// Unbinds one listener by id.
-  pub async fn delete(self, listener: ListenerId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::StopListener { listener, reply })
-      .await
+  /// Unbinds one listener by id through the admitted [`Task`], whose
+  /// `wait` resolves once the listener is down.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); an unknown listener id is effect-time and surfaces on the
+  /// task's `wait` as [`crate::ErrorKind::NotFound`].
+  pub async fn delete(self, listener: ListenerId) -> Result<Task<()>> {
+    crate::runtime::stop_listener(self.runtime.admit()?, listener).await
   }
 
   /// Pages the node's bound listeners.
@@ -300,27 +311,39 @@ impl Credentials {
   }
 
   /// Issues the current live join credential generation without rotating
-  /// it: the returned credential admits any number of joins until the
+  /// it: the issued credential admits any number of joins until the
   /// generation is rotated or expires (ten minutes), so concurrent joins
   /// share one generation. With no live generation, one is created.
   /// [`Credentials::rotate`](Credentials::rotate) remains the
   /// revocation/upgrade step.
-  pub async fn issue(self) -> Result<IssuedMergeCredential> {
-    self
-      .runtime
-      .send_command(|reply| Control::IssueMergeCredential { reply })
-      .await
+  ///
+  /// The credential is deliberately once-only: exactly the *first*
+  /// [`Task::wait`] on the returned task collects the secret, any later
+  /// `wait` fails with [`crate::ErrorKind::InvalidInput`] ("task output
+  /// already collected"), and every status view exposes only the
+  /// generation's expiry — an issued credential is a value to hand out
+  /// once, never an observation to keep re-reading. Admission-time
+  /// failures are the pure shape checks only (a stopped node); the
+  /// frozen-store refusal is effect-time and surfaces on the task's
+  /// `wait`.
+  pub async fn issue(self) -> Result<Task<IssuedMergeCredential>> {
+    crate::runtime::issue_merge_credential(self.runtime.admit()?).await
   }
 
   /// Replaces the live join credential generation: the issued
   /// replacement admits joins from now on and the former generation
   /// admits none — the revocation/upgrade step next to
   /// [`Credentials::issue`](Credentials::issue).
-  pub async fn rotate(self) -> Result<IssuedMergeCredential> {
-    self
-      .runtime
-      .send_command(|reply| Control::RotateMergeCredential { reply })
-      .await
+  ///
+  /// The replacement is deliberately once-only: exactly the *first*
+  /// [`Task::wait`] on the returned task collects the secret, any later
+  /// `wait` fails with [`crate::ErrorKind::InvalidInput`] ("task output
+  /// already collected"), and every status view exposes only the
+  /// generation's expiry. Admission-time failures are the pure shape
+  /// checks only (a stopped node); the frozen-store refusal is
+  /// effect-time and surfaces on the task's `wait`.
+  pub async fn rotate(self) -> Result<Task<IssuedMergeCredential>> {
+    crate::runtime::rotate_merge_credential(self.runtime.admit()?).await
   }
 }
 

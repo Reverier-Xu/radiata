@@ -684,13 +684,30 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // External provider SPI is honored through a second node.
   let member_factory: Arc<dyn StorageFactory> = Arc::new(PubStoreFactory);
   let member = start(member_factory, keys).await;
-  let issued: IssuedMergeCredential = issuer.handle.credentials().rotate().await.unwrap();
+  let issued: IssuedMergeCredential = issuer
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let expires = issued.expires_at();
   let _ = expires;
 
   // Non-rotating issue hands out the same live generation: concurrent
-  // joins share it, and only rotate replaces the credential.
-  let reissued: IssuedMergeCredential = issuer.handle.credentials().issue().await.unwrap();
+  // joins share it, and only rotate replaces the credential. Each
+  // issued secret is once-only, collected by exactly the first wait.
+  let reissued: IssuedMergeCredential = issuer
+    .handle
+    .credentials()
+    .issue()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert_eq!(
     reissued.credential().expose_secret(),
     issued.credential().expose_secret()
@@ -956,6 +973,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let member_endpoint = member_listener.endpoint().clone();
   let _connected: NodeId = issuer
@@ -994,7 +1014,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       Err(error) => panic!("reconnect never succeeded: {error:?}"),
     }
   }
-  let recovery: RecoveryView = issuer.handle.start_recovery().await.unwrap();
+  let recovery: RecoveryView = issuer
+    .handle
+    .start_recovery()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let _ = (
     recovery.is_connected(),
     recovery.unreachable_members(),
@@ -1042,7 +1069,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   }
 
   // Recovery, connection degree, observability.
-  let recovery: RecoveryView = issuer.handle.start_recovery().await.unwrap();
+  let recovery: RecoveryView = issuer
+    .handle
+    .start_recovery()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let _ = (
     recovery.is_connected(),
     recovery.unreachable_members(),
@@ -1085,7 +1119,15 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   .await;
 
   // Listener stop verb.
-  let _stopped: () = issuer.handle.listeners().delete(listener_id).await.unwrap();
+  let _stopped: () = issuer
+    .handle
+    .listeners()
+    .delete(listener_id)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
 
   // Resource removal with the exact observed version: re-observe
   // immediately before the removal so the precondition is never stale.
@@ -1145,7 +1187,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // The explicit receipt-retention pass drives over the member's real
   // store: the node's own receipts are not anchored, so the pass
   // forgets nothing. (The issuer has left and is already shut down.)
-  let retention: ReceiptRetentionReport = member.handle.apply_receipt_retention().await.unwrap();
+  let retention: ReceiptRetentionReport = member
+    .handle
+    .apply_receipt_retention()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert_eq!(retention.forgotten, 0);
   assert!(!retention.remaining);
 
@@ -1320,6 +1369,9 @@ async fn listen(node: &Node) -> Endpoint {
     .handle
     .listeners()
     .create(node.endpoint.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   listener.endpoint().clone()

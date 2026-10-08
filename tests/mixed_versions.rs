@@ -196,6 +196,9 @@ impl Node {
       .listeners()
       .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap();
     self.endpoint = Some(listener.endpoint().clone());
   }
@@ -215,7 +218,15 @@ impl Node {
 async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeId {
   issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   issuer.listen().await;
-  let issued = issuer.handle.credentials().rotate().await.unwrap();
+  let issued = issuer
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut attempts = 0_u32;
@@ -258,7 +269,15 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
 async fn join_bystander(issuer: &Node, member: &Node) -> Node {
   let mut bystander = start_node(3, false).await;
   bystander.listen().await;
-  let issued = issuer.handle.credentials().issue().await.unwrap();
+  let issued = issuer
+    .handle
+    .credentials()
+    .issue()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   bystander
     .handle
     .join(
@@ -690,7 +709,15 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
   issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   issuer.listen().await;
   let joiner = start_node_requiring(6, CURRENT_FEATURE, true).await;
-  let issued = issuer.handle.credentials().rotate().await.unwrap();
+  let issued = issuer
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let error = joiner
     .handle
     .join(
@@ -738,7 +765,15 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
   );
   prior_issuer.listen().await;
   let prior_joiner = start_node_requiring(8, PRIOR_FEATURE, true).await;
-  let issued = prior_issuer.handle.credentials().rotate().await.unwrap();
+  let issued = prior_issuer
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let error = prior_joiner
     .handle
     .join(

@@ -16,6 +16,8 @@ pub(crate) use supervisor::{
   PACKET_CHANNEL_CAPACITY, RuntimeDependencies, SYNC_ROUND_CHANNEL_CAPACITY, spawn_runtime,
 };
 pub(crate) use task_effects::{
-  cleanup, connect, delete_resource, disconnect, issue_cleanup_checkpoint, join, leave,
-  patch_metadata, purge_revocation, put_resource, resolve_frozen_journal, revoke,
+  apply_receipt_retention, cleanup, connect, delete_resource, disconnect, issue_cleanup_checkpoint,
+  issue_merge_credential, join, leave, listen, patch_metadata, purge_revocation, put_resource,
+  resolve_frozen_journal, revoke, rotate_merge_credential, start_recovery, stop_listener,
+  sync_round,
 };

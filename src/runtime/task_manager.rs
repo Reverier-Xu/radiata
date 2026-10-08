@@ -935,7 +935,17 @@ impl Worker {
     let joined = if cancellable {
       tokio::select! {
         joined = &mut body => joined,
-        _ = self.cancel.changed() => return WorkerReport::Cancelled,
+        _ = self.cancel.changed() => {
+          // Abort the body first (the guard's own semantics), then await
+          // the aborted join: the body's resources (any store handles it
+          // reached through the shared operation planes) are released
+          // before this worker reports, so the shutdown drain never
+          // resolves while effect-held state is still live — and a
+          // wedged effect still releases instead of parking the join.
+          body.0.abort();
+          let _ = (&mut body).await;
+          return WorkerReport::Cancelled;
+        }
       }
     } else {
       body.await

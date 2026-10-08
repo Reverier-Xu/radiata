@@ -1,9 +1,8 @@
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-  Endpoint, Error, IssuedMergeCredential, ListenerView, LocalNodeView, NodeId, NodeStatus, Result,
-  RouteStatusView, ShutdownOutcome, ShutdownReason,
-  identity::ListenerId,
+  Error, LocalNodeView, NodeId, NodeStatus, Result, RouteStatusView, ShutdownOutcome,
+  ShutdownReason,
   packet::{OutboundRequest, RouteHandle},
   routing::RouteTable,
 };
@@ -63,20 +62,6 @@ pub(crate) enum Control {
   Shutdown {
     reply: oneshot::Sender<ShutdownOutcome>,
   },
-  RotateMergeCredential {
-    reply: oneshot::Sender<Result<IssuedMergeCredential>>,
-  },
-  IssueMergeCredential {
-    reply: oneshot::Sender<Result<IssuedMergeCredential>>,
-  },
-  Listen {
-    endpoint: Endpoint,
-    reply: oneshot::Sender<Result<ListenerView>>,
-  },
-  StopListener {
-    listener: ListenerId,
-    reply: oneshot::Sender<Result<()>>,
-  },
   GetLocalNode {
     reply: oneshot::Sender<Result<LocalNodeView>>,
   },
@@ -129,15 +114,6 @@ pub(crate) enum Control {
     cursor: Option<crate::PageCursor>,
     limit: usize,
     reply: oneshot::Sender<Result<crate::TrustPage>>,
-  },
-  StartRecovery {
-    reply: oneshot::Sender<Result<crate::RecoveryView>>,
-  },
-  ApplyReceiptRetention {
-    reply: oneshot::Sender<Result<crate::view::ReceiptRetentionReport>>,
-  },
-  RunSyncRound {
-    reply: oneshot::Sender<Result<()>>,
   },
   Observability {
     reply: oneshot::Sender<Result<crate::ObservabilitySnapshot>>,

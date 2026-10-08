@@ -47,7 +47,15 @@ pub async fn merge_with_retry(
   node: &radiata::NodeHandle, issuer: &radiata::NodeHandle, endpoint: radiata::Endpoint,
 ) {
   use radiata::MergeCredential;
-  let issued = issuer.credentials().rotate().await.unwrap();
+  let issued = issuer
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    // The rotated secret is once-only: the first wait collects it.
+    .wait()
+    .await
+    .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut attempts = 0_u32;

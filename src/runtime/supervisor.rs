@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, sync::Arc};
 
 use tokio::{
   runtime::Handle,
@@ -11,8 +11,7 @@ use super::{
   task_manager::{TaskManagerHandle, spawn_task_manager},
 };
 use crate::{
-  Endpoint, Error, IssuedMergeCredential, NodeConfig, NodeId, Result, ShutdownOutcome,
-  ShutdownReason,
+  Endpoint, Error, NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{
@@ -387,22 +386,6 @@ async fn supervise(
         .await;
         return;
       }
-      Control::RotateMergeCredential { reply } => {
-        let result = supervisor.rotate_merge_credential();
-        let _ = reply.send(result);
-      }
-      Control::IssueMergeCredential { reply } => {
-        let result = supervisor.issue_merge_credential();
-        let _ = reply.send(result);
-      }
-      Control::Listen { endpoint, reply } => {
-        let result = supervisor.listen(endpoint, &mut tasks).await;
-        let _ = reply.send(result);
-      }
-      Control::StopListener { listener, reply } => {
-        let result = supervisor.stop_listener(&listener).await;
-        let _ = reply.send(result);
-      }
       Control::GetLocalNode { reply } => {
         let result = supervisor.local_node().await;
         let _ = reply.send(result);
@@ -454,33 +437,6 @@ async fn supervise(
       Control::PageTrust { cursor, limit, reply } => {
         let result = supervisor.page_trust(cursor, limit).await;
         let _ = reply.send(result);
-      }
-      Control::StartRecovery { reply } => {
-        let result = supervisor.start_recovery();
-        let _ = reply.send(result);
-      }
-      Control::ApplyReceiptRetention { reply } => {
-        let result = supervisor.apply_receipt_retention().await;
-        let _ = reply.send(result);
-      }
-      Control::RunSyncRound { reply } => {
-        // The round runs in the sync driver; waiting it out here would
-        // freeze this select loop for the round's whole duration, and the
-        // loop is the only drainer of the outbound packet channel the
-        // round dispatches through: a saturated round would then deadlock
-        // against its own dispatch queue. The wait is owned by a tracked
-        // task instead, so the loop keeps routing while the round runs and
-        // the caller still observes its completion.
-        let requests = supervisor.dependencies.sync_round_requests.clone();
-        tasks.spawn(async move {
-          let (round, round_rx) = tokio::sync::oneshot::channel();
-          let shut_down = Error::shutting_down("sync round");
-          let result = match requests.send(round).await {
-            Ok(()) => round_rx.await.map_err(|_| shut_down),
-            Err(_) => Err(shut_down),
-          };
-          let _ = reply.send(result);
-        });
       }
       Control::Observability { reply } => {
         let result = supervisor.observability_snapshot(&tasks).await;
@@ -599,7 +555,11 @@ pub(super) struct Supervisor {
   pub(super) driver: SessionDriver,
   pub(super) packet: Arc<SessionPacketContext>,
   pub(super) route_capacity: usize,
-  pub(super) recovery: crate::membership::recovery::RecoveryController,
+  /// The recovery controller, shared with the start-recovery effect's
+  /// plane: one controller truth per incarnation, briefly locked (never
+  /// across an await) by this tick and the effect alike.
+  pub(super) recovery:
+    std::sync::Arc<std::sync::Mutex<crate::membership::recovery::RecoveryController>>,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// In-flight connection-degree maintenance dials: bounds one tick's
   /// batch so a slow mesh never doubles its own dial load every cadence
@@ -607,7 +567,6 @@ pub(super) struct Supervisor {
   pub(super) maintenance_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// Recovery-tick cooldown before the next redundant-edge cut.
   pub(super) prune_cooldown: u32,
-  pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
   /// Memoized departed-members exclusion set, keyed by the store
   /// revision it was computed at: the set only changes when a leave or
   /// cleanup tombstone lands or gets GC'd, and every such change commits
@@ -752,13 +711,15 @@ impl Supervisor {
       std::sync::Arc::new(crate::time::HostWallClock),
       std::sync::Arc::clone(&trace_records),
     );
-    let recovery = crate::membership::recovery::RecoveryController::new(
-      crate::membership::recovery::RecoveryPolicy::new(
-        dependencies.config.recovery().fan_out(),
-        dependencies.config.recovery().initial_backoff_seconds(),
-        dependencies.config.recovery().maximum_backoff_seconds(),
-      ),
-    );
+    let recovery = {
+      let Ok(planes) = operations.planes() else {
+        return Err(Box::new((
+          Error::internal("runtime operations"),
+          dependencies,
+        )));
+      };
+      std::sync::Arc::clone(&planes.recovery)
+    };
     Ok(Self {
       dependencies,
       shutdown_tx,
@@ -769,7 +730,6 @@ impl Supervisor {
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       prune_cooldown: 0,
-      published_endpoints,
       exclusion_cache,
       sync_driver,
       trace_sink,
@@ -806,26 +766,6 @@ impl Supervisor {
     (self.dependencies, aborted)
   }
 
-  fn rotate_merge_credential(&mut self) -> Result<IssuedMergeCredential> {
-    self.require_unblocked()?;
-    self
-      .driver
-      .issuer()
-      .lock()
-      .map_err(|_| Error::internal("join credential issuer"))?
-      .rotate(self.dependencies.entropy.as_ref(), SystemTime::now())
-  }
-
-  fn issue_merge_credential(&mut self) -> Result<IssuedMergeCredential> {
-    self.require_unblocked()?;
-    self
-      .driver
-      .issuer()
-      .lock()
-      .map_err(|_| Error::internal("join credential issuer"))?
-      .issue(self.dependencies.entropy.as_ref(), SystemTime::now())
-  }
-
   /// Lazily publishes this node's own signed descriptor (revision 1) so
   /// the public views always expose the local identity, with the
   /// published listener endpoints. Delegates to the one shared
@@ -840,32 +780,6 @@ impl Supervisor {
     super::task_effects::ensure_self_descriptor(operations).await
   }
 
-  /// Forces one bounded immediate recovery cycle and
-  /// returns the public recovery view.
-  fn start_recovery(&mut self) -> Result<crate::RecoveryView> {
-    let before = self.recovery_view();
-    self.recovery.immediate(crate::time::now_seconds());
-    let after = self.recovery_view();
-    if after != before {
-      self
-        .dependencies
-        .events
-        .emit(crate::RecoveryChanged::new(after.clone()));
-    }
-    Ok(after)
-  }
-
-  /// Forgets every anchored receipt past its retention deadline. The
-  /// recovery tick runs the same pass on every sweep cadence; the explicit
-  /// command remains the way to force an idempotent pass on demand. The
-  /// unknown-outcome freeze blocks the pass: a pending unknown may still
-  /// reference its receipt, and cleanup conflicts rather than guesses.
-  async fn apply_receipt_retention(&mut self) -> Result<crate::view::ReceiptRetentionReport> {
-    self.require_unblocked()?;
-    let context = self.context()?;
-    context.store().apply_receipt_retention().await
-  }
-
   pub(super) fn context(&self) -> Result<Arc<LocalIdentityContext>> {
     self
       .dependencies
@@ -873,19 +787,10 @@ impl Supervisor {
       .clone()
       .ok_or_else(|| Error::internal("runtime context"))
   }
-
-  /// Blocks admission-sensitive operations while the metadata store is
-  /// frozen on an indeterminate outcome: credential
-  /// reuse, rotation, signing, and new networking stay unavailable until
-  /// an authoritative reopen reconciles the exact transaction or proves
-  /// absence. Established authenticated sessions are unaffected.
-  pub(super) fn require_unblocked(&self) -> Result<()> {
-    self.context()?.require_unblocked()
-  }
 }
 
-/// Dials one transport connection under the configured dial deadline:
-/// the deadline bounds the whole connect (TCP dial, TLS handshake, and
+/// Dials one transport connection under the configured dial deadline: the
+/// deadline bounds the whole connect (TCP dial, TLS handshake, and
 /// WebSocket upgrade), so a peer that accepts and then goes silent
 /// cannot stall the supervisor's control loop or hold a recovery slot
 /// forever. An elapsed deadline maps onto the same coarse typed
@@ -1176,7 +1081,13 @@ mod receipt_retention_sweep_tests {
 
     // The explicit command keeps working: over an empty anchor set it is
     // an idempotent no-op.
-    let report = supervisor.apply_receipt_retention().await.unwrap();
+    let report = supervisor
+      .context()
+      .unwrap()
+      .store()
+      .apply_receipt_retention()
+      .await
+      .unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining);
 
@@ -1194,7 +1105,13 @@ mod receipt_retention_sweep_tests {
     tokio::time::sleep(retention + Duration::from_millis(250)).await;
 
     // The manual command forgets the elapsed receipt exactly once.
-    let report = supervisor.apply_receipt_retention().await.unwrap();
+    let report = supervisor
+      .context()
+      .unwrap()
+      .store()
+      .apply_receipt_retention()
+      .await
+      .unwrap();
     assert_eq!(report.forgotten, 1);
     assert!(!report.remaining);
     // A forgotten receipt never grows a second anchor.
@@ -1234,7 +1151,13 @@ mod receipt_retention_sweep_tests {
     );
 
     // The explicit command stays available and idempotent afterwards.
-    let report = supervisor.apply_receipt_retention().await.unwrap();
+    let report = supervisor
+      .context()
+      .unwrap()
+      .store()
+      .apply_receipt_retention()
+      .await
+      .unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining);
   }

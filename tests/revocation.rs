@@ -50,6 +50,9 @@ async fn listen(node: &Node) -> Endpoint {
     .listeners()
     .create(node.endpoint.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   listener.endpoint().clone()
 }
@@ -141,7 +144,15 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
 
   // The member commits a resource the issuer converges on before the
   // revoke (delayed content must stay eligible afterwards).
-  member.handle.resources().put(write(1)).await.unwrap();
+  member
+    .handle
+    .resources()
+    .put(write(1))
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let member_resource = "radiata.woooo.tech/resources/revoke-001".to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   while !selected_names(&issuer.handle)
@@ -215,7 +226,15 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   // responder-side revocation check rejects a revoked subject's join
   // after a leave: every lane fails closed, never with admission.
   let rejoin = async {
-    let issued = issuer.handle.credentials().rotate().await.unwrap();
+    let issued = issuer
+      .handle
+      .credentials()
+      .rotate()
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
     let credential = MergeCredential::parse(issued.credential().expose_secret()).unwrap();
     match member.handle.join(listen(&issuer).await, credential).await {
       Ok(task) => task.wait().await,
@@ -384,7 +403,15 @@ async fn delayed_content_converges_after_revoke() {
   common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
   let member_id = local_id(&member.handle).await;
 
-  member.handle.resources().put(write(2)).await.unwrap();
+  member
+    .handle
+    .resources()
+    .put(write(2))
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let member_resource = "radiata.woooo.tech/resources/revoke-002".to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   while !selected_names(&issuer.handle)

@@ -131,6 +131,9 @@ impl Node {
       .listeners()
       .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap();
     self.endpoint = Some(listener.endpoint().clone());
   }

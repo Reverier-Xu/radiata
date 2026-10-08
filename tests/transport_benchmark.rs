@@ -119,6 +119,9 @@ async fn start_node(seed: u64, sink: Arc<Sink>) -> (NodeHandle, Endpoint) {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   (handle, listener.endpoint().clone())
 }

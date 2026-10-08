@@ -89,6 +89,14 @@ pub(crate) struct EffectPlanes {
   /// put and removal effects (see
   /// [`super::resources::issue_write_stamp`]).
   pub(crate) resource_write_clock: super::resources::ResourceWriteClock,
+  /// The recovery controller, shared with the supervisor's recovery
+  /// tick: the start-recovery effect forces the immediate cycle on the
+  /// one controller instance the tick observes (one truth per
+  /// incarnation).
+  pub(crate) recovery: Arc<Mutex<crate::membership::recovery::RecoveryController>>,
+  /// Requests for one immediate anti-entropy round, forwarded to the
+  /// sync driver (the cursor owner) by the sync-round effect.
+  pub(crate) sync_round_requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// The node-shared operation handles behind every migrated mutating verb,
@@ -136,6 +144,16 @@ impl OperationDeps {
         published_endpoints: Arc::default(),
         exclusion_cache: Arc::new(Mutex::new(None)),
         resource_write_clock: Arc::default(),
+        recovery: Arc::new(Mutex::new(
+          crate::membership::recovery::RecoveryController::new(
+            crate::membership::recovery::RecoveryPolicy::new(
+              dependencies.config.recovery().fan_out(),
+              dependencies.config.recovery().initial_backoff_seconds(),
+              dependencies.config.recovery().maximum_backoff_seconds(),
+            ),
+          ),
+        )),
+        sync_round_requests: dependencies.sync_round_requests.clone(),
       }),
     })
   }
@@ -1012,6 +1030,416 @@ async fn reconcile_patch_metadata(
   planes.member_revision.bump();
   let view = crate::membership::member_view(&updated, crate::ConnectivityStatus::Connected)?;
   Ok(EffectOutcome::new(TaskOutput::PatchNodeMetadata(view)))
+}
+
+// -- listener, credential, recovery, retention, and sync verbs ------
+
+/// Admits one new listener binding. The effect binds the advertised
+/// endpoint and runs its bounded-backoff accept loop.
+///
+/// Admission-time failures are the pure shape checks (a stopped node,
+/// an endpoint whose transport selector does not resolve in the
+/// registry); the bind syscall and the frozen-store refusal are
+/// effect-time and surface on the task's [`Task::wait`].
+pub(crate) async fn listen(
+  extensions: &ExtensionRegistry, tasks: &TaskClient, endpoint: Endpoint,
+) -> Result<Task<crate::ListenerView>> {
+  let transport = extensions.resolve_transport(&endpoint.selector())?;
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let transport = Arc::clone(&transport);
+    let endpoint = endpoint.clone();
+    Box::pin(async move { reconcile_listen(deps, transport, endpoint).await })
+  });
+  let id = tasks
+    .submit(TaskSpec::new(TaskKind::Listen, TaskPayload::None), effect)
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::Listen,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one listener teardown by id. The effect unbinds the listener
+/// and unpublishes its advertised endpoint.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); an unknown listener id is effect-time and surfaces on the
+/// task's [`Task::wait`] as [`crate::ErrorKind::NotFound`].
+pub(crate) async fn stop_listener(
+  tasks: &TaskClient, listener: crate::identity::ListenerId,
+) -> Result<Task<()>> {
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let listener = listener.clone();
+    Box::pin(async move { reconcile_stop_listener(deps, listener).await })
+  });
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::StopListener, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::StopListener,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one non-rotating issue of the live join credential
+/// generation. The effect issues (or creates) the generation and hands
+/// the secret to the first [`Task::wait`] caller only.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the frozen-store refusal is effect-time and surfaces on the
+/// task's `wait`. The issued secret is deliberately once-only: a later
+/// `wait` on the same task fails typed, and the status views carry the
+/// generation's expiry alone.
+pub(crate) async fn issue_merge_credential(
+  tasks: &TaskClient,
+) -> Result<Task<crate::IssuedMergeCredential>> {
+  let effect: TaskEffect =
+    Arc::new(|deps, _attempt| Box::pin(async move { reconcile_credential(deps, false).await }));
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::IssueCredential, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::IssueCredential,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one rotation of the live join credential generation. The
+/// effect replaces the generation (the revocation/upgrade step) and
+/// hands the replacement secret to the first [`Task::wait`] caller only.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the frozen-store refusal is effect-time and surfaces on the
+/// task's `wait`. The replacement secret is deliberately once-only: a
+/// later `wait` on the same task fails typed, and the status views carry
+/// the generation's expiry alone.
+pub(crate) async fn rotate_merge_credential(
+  tasks: &TaskClient,
+) -> Result<Task<crate::IssuedMergeCredential>> {
+  let effect: TaskEffect =
+    Arc::new(|deps, _attempt| Box::pin(async move { reconcile_credential(deps, true).await }));
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::RotateCredential, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::RotateCredential,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one bounded immediate recovery cycle. The effect forces the
+/// controller's immediate cycle on the shared controller instance and
+/// publishes the recovery view (with its [`crate::RecoveryChanged`]
+/// event when the observation moved).
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the cycle itself never fails the task.
+pub(crate) async fn start_recovery(tasks: &TaskClient) -> Result<Task<crate::RecoveryView>> {
+  let effect: TaskEffect =
+    Arc::new(|deps, _attempt| Box::pin(async move { reconcile_start_recovery(deps).await }));
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::StartRecovery, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::StartRecovery,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one on-demand receipt-retention pass. The effect runs the
+/// same idempotent pass the recovery tick runs on its sweep cadence.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); the frozen-store refusal is effect-time and surfaces on the
+/// task's `wait`.
+pub(crate) async fn apply_receipt_retention(
+  tasks: &TaskClient,
+) -> Result<Task<crate::ReceiptRetentionReport>> {
+  let effect: TaskEffect = Arc::new(|deps, _attempt| {
+    Box::pin(async move { reconcile_apply_receipt_retention(deps).await })
+  });
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::ApplyReceiptRetention, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::ApplyReceiptRetention,
+    tasks.observer.clone(),
+  ))
+}
+
+/// Admits one immediate anti-entropy round. The effect forwards the
+/// round request to the sync driver (the cursor owner) and resolves
+/// when the round finishes — the driver-side round the wall-clock tick
+/// also schedules.
+///
+/// Admission-time failures are the pure shape checks only (a stopped
+/// node); a driver that stopped first surfaces as the task's typed
+/// [`crate::ErrorKind::ShuttingDown`].
+pub(crate) async fn sync_round(tasks: &TaskClient) -> Result<Task<()>> {
+  let effect: TaskEffect =
+    Arc::new(|deps, _attempt| Box::pin(async move { reconcile_sync_round(deps).await }));
+  let id = tasks
+    .submit(
+      TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+      effect,
+    )
+    .await?;
+  Ok(Task::from_parts(
+    id,
+    TaskKind::SyncRound,
+    tasks.observer.clone(),
+  ))
+}
+
+/// The listen effect: the moved supervisor body — bind the advertised
+/// endpoint, spawn the bounded-backoff accept loop into the node's
+/// tracked connection tasks, register the listener, and publish the
+/// advertised endpoint. Peers dial the advertised name (never the bound
+/// wildcard socket); custom transports publish the endpoint their
+/// listener reports.
+async fn reconcile_listen(
+  deps: Arc<OperationDeps>, transport: Arc<dyn crate::transport::registry::Transport>,
+  endpoint: Endpoint,
+) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  let listener: std::sync::Arc<dyn crate::transport::registry::TransportListener> =
+    std::sync::Arc::from(transport.bind(endpoint.clone()).await?);
+  let bound = listener.local_endpoint();
+  let driver = planes.driver.clone();
+  let sessions = planes.sessions.clone();
+  let packet = Arc::clone(&planes.packet);
+  let shutdown = planes.shutdown.subscribe();
+  let connection_tasks = Arc::clone(&planes.connection_tasks);
+  let accept_listener = std::sync::Arc::clone(&listener);
+  let insert_listener = std::sync::Arc::clone(&listener);
+  let attachment = bound.clone();
+  // The accept loop is a tracked connection task: shutdown aborts it
+  // with the rest of the tracked set, and the registry keeps its abort
+  // handle for the explicit stop and the leave teardown (a second abort
+  // of an already-aborted task is a no-op).
+  let accept = tokio::spawn(async move {
+    tracing::debug!("accept loop started");
+    // The hint provider is evaluated per accepted connection (after the
+    // kernel accept, before the upgrade response): a credential rotation
+    // during the blocking wait is reflected in the very next join.
+    let hint_provider_driver = driver.clone();
+    let hint_provider = move || hint_provider_driver.merge_hint().ok().flatten();
+    // Consecutive failed upgrades: drives the bounded accept backoff,
+    // so a persistently failing accept sleeps longer instead of
+    // spinning; a success clears it.
+    let mut accept_failures: u32 = 0;
+    loop {
+      let accepted = accept_listener.accept(&hint_provider).await;
+      let mut connection = match accepted {
+        Ok(connection) => {
+          accept_failures = 0;
+          connection
+        }
+        Err(error) => {
+          // A failed TLS/prelude upgrade must not kill the listener;
+          // consecutive failures back off on a bounded growing delay.
+          accept_failures = accept_failures.saturating_add(1);
+          let delay = super::listeners::ACCEPT_BACKOFF_STEP
+            .saturating_mul(accept_failures.min(super::listeners::ACCEPT_BACKOFF_MAX_STEPS));
+          tracing::debug!(
+            kind = ?error.kind(),
+            consecutive = accept_failures,
+            delay_ms = delay.as_millis(),
+            "accept failed; backing off"
+          );
+          tokio::time::sleep(delay).await;
+          continue;
+        }
+      };
+      let driver = driver.clone();
+      let packet = packet.clone();
+      let sessions = sessions.clone();
+      let shutdown = shutdown.clone();
+      let attachment = attachment.clone();
+      let task = tokio::spawn(async move {
+        match driver.respond(&mut connection).await {
+          Ok(session) => {
+            // Keep the authenticated session open: it serves packet
+            // streams until the connection closes.
+            crate::session::stream::run_session(
+              connection,
+              session,
+              packet,
+              sessions,
+              shutdown,
+              crate::session::stream::DialDirection::Incoming,
+              attachment.clone(),
+              None,
+              false,
+            )
+            .await;
+          }
+          Err(error) => {
+            // A typed rejection must reach the dialer before the socket
+            // disappears: close gracefully so the failure frame drains
+            // instead of being lost to a reset (hardening).
+            let _ = connection.close().await;
+            tracing::warn!(kind = ?error.kind(), context = %error, "session establishment failed");
+          }
+        }
+      });
+      if let Ok(mut tasks) = connection_tasks.lock() {
+        tasks.push(task);
+      }
+    }
+  });
+  let abort = accept.abort_handle();
+  if let Ok(mut tasks) = planes.connection_tasks.lock() {
+    tasks.push(accept);
+  }
+  let id = crate::identity::ListenerId::generate(planes.entropy.as_ref())?;
+  // Publish the caller's advertised endpoint, not the bound socket
+  // address: peers dial the advertised name, which re-resolves across
+  // network moves. A named endpoint binds the wildcard socket (see
+  // the TCP bind rule), whose local address (0.0.0.0) is local
+  // plumbing and undialable from other nodes. Literal-IP endpoints
+  // publish the bound form directly: the requested host is the bound
+  // host, and a wildcard port resolves to the real one. Custom
+  // transports publish the endpoint their listener reports: the
+  // medium owns its own address resolution, and the reported form is
+  // its dialable contract.
+  let published = match endpoint.selector() {
+    crate::transport::TransportSelector::Custom(_) => bound,
+    crate::transport::TransportSelector::Builtin(_) => {
+      if endpoint.host() == bound.host() {
+        bound
+      } else {
+        endpoint.with_port(
+          bound
+            .port()
+            .ok_or_else(|| Error::internal("listener port"))?,
+        )?
+      }
+    }
+  };
+  planes
+    .listeners
+    .lock()
+    .map_err(|_| Error::internal("listener registry"))?
+    .insert(id.clone(), (published.clone(), insert_listener, abort));
+  // Publish the advertised endpoint so the next anti-entropy tick pages
+  // it in the local descriptor (recovery dials peers through published
+  // endpoints).
+  if let Ok(mut endpoints) = planes.published_endpoints.lock()
+    && !endpoints.contains(&published)
+  {
+    endpoints.push(published.clone());
+  }
+  Ok(EffectOutcome::new(TaskOutput::Listen(
+    crate::ListenerView::new(id, published),
+  )))
+}
+
+/// The stop-listener effect: the shared teardown — remove the registry
+/// entry, wake and abort the accept loop, unpublish the advertised
+/// endpoint.
+async fn reconcile_stop_listener(
+  deps: Arc<OperationDeps>, listener: crate::identity::ListenerId,
+) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
+    .await?;
+  Ok(EffectOutcome::new(TaskOutput::StopListener(())))
+}
+
+/// The credential effect: issue (or rotate) the live join credential
+/// generation through the session driver's one issuer. The secret rides
+/// the consumed-once slot: the task's observation carries the expiry,
+/// and exactly the first `wait` collects the credential.
+async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  let mut issuer = planes
+    .driver
+    .issuer()
+    .lock()
+    .map_err(|_| Error::internal("join credential issuer"))?;
+  let issued = if rotate {
+    issuer.rotate(planes.entropy.as_ref(), std::time::SystemTime::now())?
+  } else {
+    issuer.issue(planes.entropy.as_ref(), std::time::SystemTime::now())?
+  };
+  Ok(if rotate {
+    EffectOutcome::credential_rotated(issued)
+  } else {
+    EffectOutcome::credential_issued(issued)
+  })
+}
+
+/// The start-recovery effect: force the immediate cycle on the shared
+/// controller, publish the view, and emit the change event when the
+/// observation moved — the moved supervisor body.
+async fn reconcile_start_recovery(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  let mut controller = planes
+    .recovery
+    .lock()
+    .map_err(|_| Error::internal("recovery controller"))?;
+  let before = super::recovery::recovery_view(&controller);
+  controller.immediate(crate::time::now_seconds());
+  let after = super::recovery::recovery_view(&controller);
+  drop(controller);
+  if after != before {
+    deps
+      .events()
+      .emit(crate::RecoveryChanged::new(after.clone()));
+  }
+  Ok(EffectOutcome::new(TaskOutput::StartRecovery(after)))
+}
+
+/// The receipt-retention effect: the idempotent on-demand pass — the
+/// moved supervisor body. The unknown-outcome freeze blocks the pass:
+/// a pending unknown may still reference its receipt, and cleanup
+/// conflicts rather than guesses.
+async fn reconcile_apply_receipt_retention(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  planes.context.require_unblocked()?;
+  let report = planes.context.store().apply_receipt_retention().await?;
+  Ok(EffectOutcome::new(TaskOutput::ApplyReceiptRetention(
+    report,
+  )))
+}
+
+/// The sync-round effect: forward one round request to the sync driver
+/// and resolve when the round finishes. The round still executes in
+/// the driver (the cursor owner), exactly like the wall-clock tick.
+async fn reconcile_sync_round(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
+  let planes = deps.planes()?;
+  let (round, round_rx) = tokio::sync::oneshot::channel();
+  if planes.sync_round_requests.send(round).await.is_err() {
+    return Err(Error::shutting_down("sync round"));
+  }
+  round_rx
+    .await
+    .map_err(|_| Error::shutting_down("sync round"))?;
+  Ok(EffectOutcome::new(TaskOutput::SyncRound(())))
 }
 
 // -- the leave verb ------------------------------------------------------

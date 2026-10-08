@@ -82,6 +82,9 @@ async fn listen(node: &mut Node) {
     .listeners()
     .create(node.endpoint.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   node.endpoint = listener.endpoint().clone();
 }
@@ -268,7 +271,15 @@ async fn redaction_lane_rejects_every_forbidden_class() {
 
   // Markers: the credential secret, the packet body, a hostile label
   // value, a selector text, and the storage path.
-  let issued = issuer.handle.credentials().rotate().await.unwrap();
+  let issued = issuer
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let credential_marker = issued.credential().expose_secret().to_owned();
   let body_marker: Arc<[u8]> = Arc::from(b"PACKET-BODY-MARKER-9w4e".as_slice());
   let label_marker = "hostile\nlabel\x00value-MARKER";
@@ -322,7 +333,14 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     )
     .unwrap(),
   );
-  let _ = member.handle.resources().put(write).await;
+  let _ = member
+    .handle
+    .resources()
+    .put(write)
+    .await
+    .unwrap()
+    .wait()
+    .await;
   let _ = member
     .handle
     .resources()

@@ -79,6 +79,9 @@ async fn start(seed: u64) -> Node {
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .endpoint()
     .clone();
   let id = handle.local_node().await.unwrap().node_id().clone();
@@ -105,6 +108,9 @@ async fn start_with(seed: u64, config: NodeConfig) -> Node {
   let endpoint = handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap()
     .endpoint()
@@ -172,6 +178,9 @@ async fn convergence_cell(peers: usize, resources: u32) {
     .rotate()
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .into_credential()
     .expose_secret()
     .to_owned();
@@ -225,7 +234,11 @@ async fn merge_with_retry(hub: &mut Node, member: &Node, secret: &str) {
   loop {
     attempts += 1;
     let credential = radiata::MergeCredential::parse(secret).unwrap();
-    match member.handle.join(hub.endpoint.clone(), credential).await {
+    let joined = match member.handle.join(hub.endpoint.clone(), credential).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(_) => return,
       Err(_) if Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(
@@ -251,6 +264,9 @@ async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
     .handle
     .credentials()
     .rotate()
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap()
     .into_credential()
@@ -360,6 +376,9 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
     .rotate()
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .into_credential()
     .expose_secret()
     .to_owned();
@@ -424,6 +443,9 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
     .handle
     .credentials()
     .rotate()
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap()
     .into_credential()
@@ -601,6 +623,9 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
     .handle
     .credentials()
     .rotate()
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap()
     .into_credential()

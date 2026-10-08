@@ -121,7 +121,7 @@ impl NodeHandle {
   /// The node's bound listeners: `create` binds a new listener,
   /// `delete` unbinds one, `list` pages the live set.
   pub fn listeners(&self) -> Listeners {
-    Listeners::new(&self.runtime)
+    Listeners::new(&self.runtime, &self.extensions)
   }
 
   /// The live authenticated sessions: `list` pages the session set.
@@ -387,12 +387,15 @@ impl NodeHandle {
 
   // -- maintenance and diagnostics -------------------------------------
 
-  /// Forces one bounded immediate recovery cycle and returns its view.
-  pub async fn start_recovery(&self) -> Result<RecoveryView> {
-    self
-      .runtime
-      .send_command(|reply| Control::StartRecovery { reply })
-      .await
+  /// Forces one bounded immediate recovery cycle and returns the
+  /// admitted [`Task`], whose `wait` resolves with the recovery view
+  /// (with its [`crate::RecoveryChanged`] event when the observation
+  /// moved).
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the cycle itself never fails the task.
+  pub async fn start_recovery(&self) -> Result<Task<RecoveryView>> {
+    crate::runtime::start_recovery(self.runtime.admit()?).await
   }
 
   /// The recovery plane's current observation: whether every known
@@ -435,11 +438,14 @@ impl NodeHandle {
   /// sweep cadence; this forces one idempotent pass on demand (tests,
   /// operations, a bounded drain of a large backlog). Anchoring itself
   /// is the owning state machine's decision and is not performed here.
-  pub async fn apply_receipt_retention(&self) -> Result<ReceiptRetentionReport> {
-    self
-      .runtime
-      .send_command(|reply| Control::ApplyReceiptRetention { reply })
-      .await
+  /// Returns the admitted [`Task`], whose `wait` resolves with the pass
+  /// report.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal is effect-time and surfaces on the
+  /// task's `wait`.
+  pub async fn apply_receipt_retention(&self) -> Result<Task<ReceiptRetentionReport>> {
+    crate::runtime::apply_receipt_retention(self.runtime.admit()?).await
   }
 
   /// Runs one full sync round now — the membership maintenance tick
@@ -448,12 +454,17 @@ impl NodeHandle {
   /// become deterministic: drive rounds, await each, then read the
   /// registers — no tick-cadence sleeps; the quiet ROOT rotation covers
   /// the alive set across consecutive rounds.
+  ///
+  /// Internally this is the submit-and-wait of one `SyncRound` task
+  /// whose effect forwards the round request to the sync driver (the
+  /// cursor owner): the round still executes in the driver, exactly
+  /// like the wall-clock tick, and the signature stays the awaited
+  /// completion callers already compose.
   pub fn sync(&self) -> impl Future<Output = Result<()>> + Send {
-    let runtime = self.runtime.clone();
+    let admission = self.runtime.admit().cloned();
     async move {
-      runtime
-        .send_command(|reply| Control::RunSyncRound { reply })
-        .await
+      let tasks = admission?;
+      crate::runtime::sync_round(&tasks).await?.wait().await
     }
   }
 

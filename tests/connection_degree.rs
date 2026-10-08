@@ -73,6 +73,9 @@ async fn listen(node: &mut Node) {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   node.endpoint = listener.endpoint().clone();
 }

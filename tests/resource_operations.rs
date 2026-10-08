@@ -49,6 +49,9 @@ async fn listen(node: &Node) -> Endpoint {
     .listeners()
     .create(node.endpoint.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   listener.endpoint().clone()
 }
