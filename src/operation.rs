@@ -21,11 +21,15 @@ impl ResourceWrite {
     Self { name, labels }
   }
 
-  pub(crate) const fn name(&self) -> &crate::ResourceName {
+  /// The write's stable resource name. Public so admission-time hooks
+  /// can inspect the intent before any IO runs.
+  pub const fn name(&self) -> &crate::ResourceName {
     &self.name
   }
 
-  pub(crate) const fn labels(&self) -> &crate::ResourceLabels {
+  /// The write's reserved and custom labels. Public so admission-time
+  /// hooks can inspect the intent before any IO runs.
+  pub const fn labels(&self) -> &crate::ResourceLabels {
     &self.labels
   }
 }
@@ -192,3 +196,79 @@ impl ResourceChanged {
 impl private::Sealed for ResourceChanged {}
 
 impl Event for ResourceChanged {}
+
+/// One admitted operation's phase changed. Emitted on every transition,
+/// after the task table and its per-task status watch have published:
+/// `Pending` at admission, `Running` at the first reconcile spawn and
+/// at each retry wake, and once when the task terminalizes.
+///
+/// Transient like every node event, and the streaming view of the task
+/// surface: a lagging subscriber re-reads through
+/// [`NodeHandle::tasks`](crate::NodeHandle::tasks) instead of polling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskChanged {
+  task: crate::TaskId,
+  kind: crate::TaskKind,
+  phase: crate::TaskPhase,
+}
+
+impl TaskChanged {
+  /// The task that changed.
+  pub const fn task(&self) -> &crate::TaskId {
+    &self.task
+  }
+
+  /// The changed task's kind (immutable for the task's lifetime).
+  pub const fn kind(&self) -> &crate::TaskKind {
+    &self.kind
+  }
+
+  /// The phase the task now holds.
+  pub const fn phase(&self) -> crate::TaskPhase {
+    self.phase
+  }
+
+  #[allow(dead_code)] // emitted by the task manager on every transition; that wiring lands with the supervisor stage
+  pub(crate) const fn new(
+    task: crate::TaskId, kind: crate::TaskKind, phase: crate::TaskPhase,
+  ) -> Self {
+    Self { task, kind, phase }
+  }
+}
+
+impl private::Sealed for TaskChanged {}
+
+impl Event for TaskChanged {}
+
+#[cfg(test)]
+mod tests {
+  use super::{Event, ResourceWrite, TaskChanged};
+  use crate::{LabelValue, ResourceLabels, ResourceName, ResourceUri, TaskId, TaskKind, TaskPhase};
+
+  #[test]
+  fn task_changed_reports_the_transition_it_carries() {
+    let id = TaskId::compose(0, 1).expect("composition");
+    let changed = TaskChanged::new(id.clone(), TaskKind::SyncRound, TaskPhase::Running);
+    assert_eq!(changed.task(), &id);
+    assert_eq!(changed.kind(), &TaskKind::SyncRound);
+    assert_eq!(changed.phase(), TaskPhase::Running);
+  }
+
+  #[test]
+  fn task_changed_is_one_of_the_node_events() {
+    fn assert_event<E: Event>() {}
+    assert_event::<TaskChanged>();
+  }
+
+  #[test]
+  fn resource_write_exposes_its_intent() {
+    let name = ResourceName::parse("radiata.woooo.tech/resources/hook-001").expect("resource name");
+    let labels = ResourceLabels::new(
+      LabelValue::parse("document").expect("resource type"),
+      ResourceUri::parse("file:///hook").expect("resource uri"),
+    );
+    let write = ResourceWrite::new(name.clone(), labels.clone());
+    assert_eq!(write.name(), &name);
+    assert_eq!(write.labels(), &labels);
+  }
+}

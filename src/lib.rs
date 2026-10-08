@@ -68,7 +68,7 @@ pub use node::{
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
-  ResourceWrite, RouteChanged, SessionChanged,
+  ResourceWrite, RouteChanged, SessionChanged, TaskChanged,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
@@ -100,7 +100,7 @@ pub use view::{
   ObservabilitySnapshot, PageSpec, ReceiptRetentionReport, RecoveryView,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView, ResourcePage, ResourceView,
   RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome, ShutdownReason,
-  TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
+  TaskPage, TaskView, TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
 };
 
 pub mod extension {
