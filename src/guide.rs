@@ -48,13 +48,14 @@
 //!
 //! /// Builds the conditional write a worker performs after the
 //! /// observed version traveled through a queue: the tuple is rebuilt
-//! /// exactly, and a raced write surfaces as `ErrorKind::Conflict`.
+//! /// exactly, and a raced write surfaces as `ErrorKind::Conflict`
+//! /// through the admitted task's `wait`.
 //! fn enqueue_update(
 //!     node: &NodeHandle,
 //!     observed: &ResourceVersion,
 //!     name: ResourceName,
 //!     labels: ResourceLabels,
-//! ) -> impl Future<Output = radiata::Result<radiata::ResourceMutationView>> {
+//! ) -> impl Future<Output = radiata::Result<radiata::Task<radiata::ResourceMutationView>>> {
 //!     let expected = ResourceVersion::from_parts(
 //!         observed.timestamp(),
 //!         observed.writer().clone(),

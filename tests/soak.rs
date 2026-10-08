@@ -362,10 +362,16 @@ async fn soak_churn_then_baseline_return() {
       ),
     );
     match issuer.handle.resources().put(write).await {
-      Ok(view) => {
-        stats.resources_written += 1;
-        last_resource = Some((name, view.accepted().version().clone()));
-      }
+      Ok(task) => match task.wait().await {
+        Ok(view) => {
+          stats.resources_written += 1;
+          last_resource = Some((name, view.accepted().version().clone()));
+        }
+        Err(error) => stats.failures.push(WorkloadFailure {
+          operation: "resource-put",
+          kind: format!("{:?}", error.kind()),
+        }),
+      },
       Err(error) => stats.failures.push(WorkloadFailure {
         operation: "resource-put",
         kind: format!("{:?}", error.kind()),
@@ -375,7 +381,14 @@ async fn soak_churn_then_baseline_return() {
       && let Some((previous, version)) = last_resource.take()
     {
       match issuer.handle.resources().delete(previous, version).await {
-        Ok(_) => {}
+        Ok(task) => {
+          if let Err(error) = task.wait().await {
+            stats.failures.push(WorkloadFailure {
+              operation: "resource-remove",
+              kind: format!("{:?}", error.kind()),
+            });
+          }
+        }
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "resource-remove",
           kind: format!("{:?}", error.kind()),

@@ -133,26 +133,11 @@ pub(crate) enum Control {
   StartRecovery {
     reply: oneshot::Sender<Result<crate::RecoveryView>>,
   },
-  UpdateNodeMetadata {
-    expected_revision: u64,
-    patch: crate::NodeMetadataPatch,
-    reply: oneshot::Sender<Result<crate::MemberView>>,
-  },
-  PutResource {
-    write: crate::ResourceWrite,
-    expected: Option<crate::ResourceVersion>,
-    reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
-  },
   ApplyReceiptRetention {
     reply: oneshot::Sender<Result<crate::view::ReceiptRetentionReport>>,
   },
   RunSyncRound {
     reply: oneshot::Sender<Result<()>>,
-  },
-  RemoveResource {
-    name: crate::ResourceName,
-    expected: crate::ResourceVersion,
-    reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
   },
   Observability {
     reply: oneshot::Sender<Result<crate::ObservabilitySnapshot>>,

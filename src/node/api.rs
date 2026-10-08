@@ -10,7 +10,8 @@
 
 use crate::{
   Endpoint, IssuedMergeCredential, ListenerId, NodeId, PageSpec, Result, RouteHandle,
-  RouteStatusView, Selector,
+  RouteStatusView, Selector, Task,
+  extension_registry::ExtensionRegistry,
   runtime::{Control, RuntimeClient},
   view::{ListenerPage, ListenerView, MemberPage, MemberView, ResourcePage, ResourceView},
 };
@@ -53,12 +54,19 @@ impl Members {
 /// The node's resource register.
 pub struct Resources {
   runtime: RuntimeClient,
+  /// The node-local extension registry: the resource hooks' admission
+  /// source (validate and mutate run on the caller's task before any
+  /// IO).
+  extensions: std::sync::Arc<ExtensionRegistry>,
 }
 
 impl Resources {
-  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+  pub(crate) fn new(
+    runtime: &RuntimeClient, extensions: &std::sync::Arc<ExtensionRegistry>,
+  ) -> Self {
     Self {
       runtime: runtime.clone(),
+      extensions: extensions.clone(),
     }
   }
 
@@ -105,16 +113,15 @@ impl Resources {
   /// reports the accepted record and whether it is the current winner.
   /// For the conditional (compare-and-swap) form, see
   /// [`Resources::put_expected`](Resources::put_expected).
-  pub async fn put(self, write: crate::ResourceWrite) -> Result<crate::view::ResourceMutationView> {
-    crate::resource::check_write_shape(write.name(), write.labels())?;
-    self
-      .runtime
-      .send_command(move |reply| Control::PutResource {
-        write,
-        expected: None,
-        reply,
-      })
-      .await
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// a malformed write, a resource hook's rejection); the frozen-store
+  /// refusal and every commit failure are effect-time and surface on
+  /// the returned task's [`Task::wait`].
+  pub async fn put(
+    self, write: crate::ResourceWrite,
+  ) -> Result<Task<crate::view::ResourceMutationView>> {
+    crate::runtime::put_resource(&self.extensions, self.runtime.admit()?, write, None).await
   }
 
   /// Commits one resource write intent as a signed candidate record
@@ -122,18 +129,21 @@ impl Resources {
   /// when the stored winner still equals `expected` exactly, so a raced
   /// read-modify-write surfaces as an explicit
   /// [`crate::ErrorKind::Conflict`] instead of a silently lost update.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// a malformed write, a resource hook's rejection); the CAS outcome is
+  /// effect-time and surfaces on the returned task's [`Task::wait`] (a
+  /// lost race as [`crate::ErrorKind::Conflict`]).
   pub async fn put_expected(
     self, write: crate::ResourceWrite, expected: crate::ResourceVersion,
-  ) -> Result<crate::view::ResourceMutationView> {
-    crate::resource::check_write_shape(write.name(), write.labels())?;
-    self
-      .runtime
-      .send_command(move |reply| Control::PutResource {
-        write,
-        expected: Some(expected),
-        reply,
-      })
-      .await
+  ) -> Result<Task<crate::view::ResourceMutationView>> {
+    crate::runtime::put_resource(
+      &self.extensions,
+      self.runtime.admit()?,
+      write,
+      Some(expected),
+    )
+    .await
   }
 
   /// Creates signed removal evidence for one resource: the removal
@@ -142,17 +152,14 @@ impl Resources {
   /// never removes newer metadata and never poses as a newer wall-clock
   /// winner. Removal is limited to core metadata; core never follows the
   /// resource URI or touches the caller's object.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the stale-observation conflict and every commit failure are
+  /// effect-time and surface on the returned task's [`Task::wait`].
   pub async fn delete(
     self, name: crate::ResourceName, expected: crate::ResourceVersion,
-  ) -> Result<crate::view::ResourceMutationView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::RemoveResource {
-        name,
-        expected,
-        reply,
-      })
-      .await
+  ) -> Result<Task<crate::view::ResourceMutationView>> {
+    crate::runtime::delete_resource(self.runtime.admit()?, name, expected).await
   }
 }
 

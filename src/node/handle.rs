@@ -115,7 +115,7 @@ impl NodeHandle {
   /// The node's resource register: `get`, `list`, `select`, `put`,
   /// `put_expected`, and `delete` over the live winners.
   pub fn resources(&self) -> Resources {
-    Resources::new(&self.runtime)
+    Resources::new(&self.runtime, &self.extensions)
   }
 
   /// The node's bound listeners: `create` binds a new listener,
@@ -273,19 +273,17 @@ impl NodeHandle {
   /// Updates the local node's own descriptor (owner-only node
   /// metadata): endpoint candidates and capability labels are applied at
   /// a strictly higher revision than `expected_revision`, and the updated
-  /// member view is returned. Same-revision or stale expectations
-  /// conflict.
+  /// member view is returned. Returns the admitted [`Task`], whose `wait`
+  /// resolves with the updated view.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the revision compare-and-swap (same-revision or stale
+  /// expectations conflict) and the frozen-store refusal are effect-time
+  /// and surface on the task's `wait`.
   pub async fn patch_metadata(
     &self, expected_revision: u64, patch: NodeMetadataPatch,
-  ) -> Result<MemberView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::UpdateNodeMetadata {
-        expected_revision,
-        patch,
-        reply,
-      })
-      .await
+  ) -> Result<Task<MemberView>> {
+    crate::runtime::patch_metadata(self.runtime.admit()?, expected_revision, patch).await
   }
 
   // -- identity, trust, and cleanup ------------------------------------

@@ -742,6 +742,39 @@ pub(crate) async fn notify_action_hooks(
   }
 }
 
+/// Runs one write's admission hooks on the caller's task, in canonical
+/// tag order: every `validate` runs first (the first rejection wins and
+/// fails the verb with that error), then the `mutate`s compose
+/// left-to-right, so the composed result is the intent the effect signs.
+/// A panic in a hook aborts the caller's future only — the node is
+/// unaffected (the same isolation class as any panicking caller code).
+pub(crate) fn apply_resource_hooks(
+  hooks: &[Arc<dyn ResourceHook>], mut write: crate::ResourceWrite,
+) -> Result<crate::ResourceWrite> {
+  for hook in hooks {
+    hook.validate(&write)?;
+  }
+  for hook in hooks {
+    write = hook.mutate(write)?;
+  }
+  Ok(write)
+}
+
+/// Runs one write task's post-commit observations sequentially in
+/// canonical tag order, inside the task's own future: an error is a
+/// `tracing` diagnostic that never fails or blocks the task, and a panic
+/// surfaces as the task's typed internal failure through the same path
+/// as any other panicking effect code.
+pub(crate) async fn notify_resource_observers(
+  hooks: &[Arc<dyn ResourceHook>], view: &crate::ResourceView,
+) {
+  for hook in hooks {
+    if let Err(error) = hook.observed(view).await {
+      tracing::warn!(kind = ?error.kind(), "resource hook failed");
+    }
+  }
+}
+
 /// The caller-supplied effect behind one custom task kind: the
 /// reconcile half of [`TaskKind::Extension`]. Registered through
 /// [`ExtensionRegistry::register_task_reconciler`](crate::ExtensionRegistry::register_task_reconciler)

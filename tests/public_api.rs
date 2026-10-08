@@ -806,7 +806,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       LabelValue::parse("pub-api").unwrap(),
     )
     .unwrap();
-  let updated: MemberView = issuer.handle.patch_metadata(revision, patch).await.unwrap();
+  let updated: MemberView = issuer
+    .handle
+    .patch_metadata(revision, patch)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert_eq!(updated.owner_revision(), revision + 1);
   let patch2 = NodeMetadataPatch::new()
     .remove_capability(LabelKey::parse("example.org/labels/lane").unwrap())
@@ -815,6 +822,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let _updated2: MemberView = issuer
     .handle
     .patch_metadata(revision2, patch2)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -835,7 +845,15 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     )
     .unwrap(),
   );
-  let mutation: ResourceMutationView = issuer.handle.resources().put(write).await.unwrap();
+  let mutation: ResourceMutationView = issuer
+    .handle
+    .resources()
+    .put(write)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert!(mutation.is_current_winner());
   let accepted = mutation.accepted();
   let version: &ResourceVersion = accepted.version();
@@ -865,6 +883,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .handle
     .resources()
     .put_expected(conditional, version.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(mutation.is_current_winner());
@@ -1084,6 +1105,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap(),
       expected,
     )
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(removal.accepted().version().is_removal());

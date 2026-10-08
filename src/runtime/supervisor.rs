@@ -459,22 +459,6 @@ async fn supervise(
         let result = supervisor.start_recovery();
         let _ = reply.send(result);
       }
-      Control::UpdateNodeMetadata {
-        expected_revision,
-        patch,
-        reply,
-      } => {
-        let result = supervisor.update_node_metadata(expected_revision, patch).await;
-        let _ = reply.send(result);
-      }
-      Control::PutResource {
-        write,
-        expected,
-        reply,
-      } => {
-        let result = supervisor.put_resource(write, expected).await;
-        let _ = reply.send(result);
-      }
       Control::ApplyReceiptRetention { reply } => {
         let result = supervisor.apply_receipt_retention().await;
         let _ = reply.send(result);
@@ -497,14 +481,6 @@ async fn supervise(
           };
           let _ = reply.send(result);
         });
-      }
-      Control::RemoveResource {
-        name,
-        expected,
-        reply,
-      } => {
-        let result = supervisor.remove_resource(name, expected).await;
-        let _ = reply.send(result);
       }
       Control::Observability { reply } => {
         let result = supervisor.observability_snapshot(&tasks).await;
@@ -642,14 +618,6 @@ pub(super) struct Supervisor {
   /// events). The cache is the one shared with the task effects' plane,
   /// so the checkpoint guard memoizes with the same truth.
   pub(super) exclusion_cache: super::recovery::ExclusionCache,
-  /// The highest resource-write stamp this writer has issued: a
-  /// writer's own successive writes must strictly outrank their
-  /// predecessor, so the issue clock advances at least one millisecond
-  /// per write and rides through wall-clock regressions (a
-  /// same-millisecond stamp would fall to the digest tie-break, and the
-  /// writer's own second write could lose to its first). Both the put
-  /// and the remove paths issue through [`Self::issue_resource_stamp`].
-  pub(super) resource_write_clock: std::sync::atomic::AtomicU64,
   // The anti-entropy driver task: aborted on shutdown so the node's
   // storage handle is released promptly (a restarted node reopening the
   // same factory must not race a lingering driver).
@@ -803,7 +771,6 @@ impl Supervisor {
       prune_cooldown: 0,
       published_endpoints,
       exclusion_cache,
-      resource_write_clock: std::sync::atomic::AtomicU64::new(0),
       sync_driver,
       trace_sink,
       trace_records,
@@ -861,22 +828,16 @@ impl Supervisor {
 
   /// Lazily publishes this node's own signed descriptor (revision 1) so
   /// the public views always expose the local identity, with the
-  /// published listener endpoints.
+  /// published listener endpoints. Delegates to the one shared
+  /// implementation the resource-write effects also use
+  /// ([`super::task_effects::ensure_self_descriptor`]).
   pub(super) async fn ensure_self_descriptor(&mut self) -> Result<()> {
-    let context = self.context()?;
-    let endpoints = self
-      .published_endpoints
-      .lock()
-      .map(|endpoints| endpoints.clone())
-      .unwrap_or_default();
-    crate::membership::sync::ensure_local_descriptor(
-      &context,
-      &self.dependencies.entropy,
-      endpoints,
-      &self.dependencies.events,
-      &self.dependencies.member_revision,
-    )
-    .await
+    let operations = self
+      .dependencies
+      .operations
+      .as_ref()
+      .ok_or_else(|| Error::internal("runtime operations"))?;
+    super::task_effects::ensure_self_descriptor(operations).await
   }
 
   /// Forces one bounded immediate recovery cycle and
@@ -892,38 +853,6 @@ impl Supervisor {
         .emit(crate::RecoveryChanged::new(after.clone()));
     }
     Ok(after)
-  }
-
-  /// Applies one owner-only metadata patch to this node's own descriptor
-  /// (`UpdateNodeMetadata`): endpoint candidates and capability labels are
-  /// replaced at a strictly higher revision than `expected_revision`, and
-  /// the updated member view is returned (owner records).
-  async fn update_node_metadata(
-    &mut self, expected_revision: u64, patch: crate::NodeMetadataPatch,
-  ) -> Result<crate::MemberView> {
-    self.require_unblocked()?;
-    let context = self.context()?;
-    let local = context.identity().node().clone();
-    let store = context.store();
-    let current = crate::membership::store::read_descriptor_ctx(store, &local)
-      .await?
-      .ok_or_else(|| Error::not_ready("local descriptor"))?;
-    if current.revision() != expected_revision {
-      return Err(Error::conflict("node metadata revision"));
-    }
-    let updated = crate::membership::apply_metadata_patch(&current, patch)?;
-    crate::membership::store::store_descriptor_ctx(
-      store,
-      self.dependencies.entropy.as_ref(),
-      &updated,
-    )
-    .await?;
-    self
-      .dependencies
-      .events
-      .emit(crate::MemberChanged::new(local.clone()));
-    self.dependencies.member_revision.bump();
-    crate::membership::member_view(&updated, crate::ConnectivityStatus::Connected)
   }
 
   /// Forgets every anchored receipt past its retention deadline. The

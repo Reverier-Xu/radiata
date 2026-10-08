@@ -356,6 +356,9 @@ async fn resources_revoke_and_leave() {
     .resources()
     .put(resource_write(1, "gpu-worker"))
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
 
   // Both members observe it (only generic named resources with reserved
@@ -522,35 +525,37 @@ async fn facade_core_only_operations() {
       radiata::LabelValue::parse("edge").unwrap(),
     )
     .unwrap();
-  // The exact expected revision is observed through the member's own
-  // public page (a concurrent descriptor ensure may legitimately bump
-  // the revision).
-  let members_self = member
-    .handle
-    .members()
-    .list(radiata::PageSpec::first(8).unwrap())
-    .await
-    .unwrap();
   let member_id = member.handle.local_node().await.unwrap().node_id().clone();
-  let revision = members_self
-    .items()
-    .iter()
-    .find(|view| view.node_id() == &member_id)
-    .map(|view| view.owner_revision())
-    .unwrap_or(1);
-  // A concurrent descriptor ensure may bump the revision between the
-  // observation and the command: re-observe and retry within a bound.
+  // The exact expected revision is observed through the member's own
+  // public page; the revision compare-and-swap is effect-time now, so a
+  // raced descriptor ensure surfaces as the task's typed conflict and
+  // the ladder re-observes before re-admitting within a bound.
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
+    let members_self = member
+      .handle
+      .members()
+      .list(radiata::PageSpec::first(8).unwrap())
+      .await
+      .unwrap();
+    let revision = members_self
+      .items()
+      .iter()
+      .find(|view| view.node_id() == &member_id)
+      .map(|view| view.owner_revision())
+      .unwrap_or(1);
     match member.handle.patch_metadata(revision, patch.clone()).await {
-      Ok(_) => break,
-      Err(error) if error.kind() == ErrorKind::Conflict => {
-        assert!(
-          std::time::Instant::now() < deadline,
-          "metadata update never succeeded"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-      }
+      Ok(task) => match task.wait().await {
+        Ok(_) => break,
+        Err(error) if error.kind() == ErrorKind::Conflict => {
+          assert!(
+            std::time::Instant::now() < deadline,
+            "metadata update never succeeded"
+          );
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(error) => panic!("update failed persistently: {error:?}"),
+      },
       Err(error) => panic!("update failed persistently: {error:?}"),
     }
   }
@@ -637,6 +642,9 @@ async fn facade_core_only_operations() {
     .resources()
     .put(resource_write(2, "storage"))
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let view = issuer
     .handle
@@ -666,6 +674,9 @@ async fn facade_core_only_operations() {
       ResourceName::parse("radiata.woooo.tech/resources/facade-002").unwrap(),
       view.version().clone(),
     )
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(
@@ -746,6 +757,9 @@ async fn resource_labels_never_enable_protocols() {
     .handle
     .resources()
     .put(resource_write(3, ECHO_PROTOCOL))
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);

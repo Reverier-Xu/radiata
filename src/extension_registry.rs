@@ -345,6 +345,18 @@ impl ExtensionRegistry {
       .unwrap_or_default()
   }
 
+  /// The registered resource hooks in canonical tag order (the order
+  /// they validate, mutate, and observe one write in). Cloned per use:
+  /// the hook map is a `std` mutex and must not be held across the
+  /// hooks' awaits.
+  pub(crate) fn resource_hooks(&self) -> Vec<Arc<dyn crate::ResourceHook>> {
+    self
+      .resource_hooks
+      .lock()
+      .map(|hooks| hooks.values().cloned().collect())
+      .unwrap_or_default()
+  }
+
   /// Registers one packet protocol and its consumer. A duplicate protocol
   /// tag is a conflict; registration never replaces an existing entry.
   pub fn register_protocol(

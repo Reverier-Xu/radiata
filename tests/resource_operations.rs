@@ -108,6 +108,9 @@ async fn put_resource_commits_atomically_and_emits_one_event() {
       resource_labels("document", 1),
     ))
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   assert_eq!(outcome.accepted().name(), &resource_name(1));
   assert!(outcome.is_current_winner());
@@ -142,6 +145,9 @@ async fn put_resource_commits_atomically_and_emits_one_event() {
       resource_name(1),
       resource_labels("document", 1),
     ))
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(outcome.is_current_winner());
@@ -191,8 +197,8 @@ async fn concurrent_resource_writes_converge_to_one_winner() {
     )),
   );
   // Both candidates are accepted; at most one is the local winner.
-  let first = first.unwrap();
-  let second = second.unwrap();
+  let first = first.unwrap().wait().await.unwrap();
+  let second = second.unwrap().wait().await.unwrap();
   assert!(
     first.is_current_winner() || second.is_current_winner(),
     "at least one candidate wins somewhere"
@@ -373,6 +379,9 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
         resource_labels("document", 9),
       ))
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap();
     handle.shutdown().await.unwrap();
   }
@@ -441,6 +450,9 @@ async fn remove_resource_requires_the_exact_version() {
       resource_labels("document", 20),
     ))
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   // Drain the put's event.
   let _ = tokio::time::timeout(Duration::from_secs(90), events.recv())
@@ -468,6 +480,9 @@ async fn remove_resource_requires_the_exact_version() {
       resource_labels("blob", 20),
     ))
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let _ = tokio::time::timeout(Duration::from_secs(90), events.recv())
     .await
@@ -494,6 +509,9 @@ async fn remove_resource_requires_the_exact_version() {
       .resources()
       .delete(name.clone(), stale)
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err()
       .kind(),
     radiata::ErrorKind::Conflict,
@@ -510,6 +528,9 @@ async fn remove_resource_requires_the_exact_version() {
       .resources()
       .delete(resource_name(21), winner.clone())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err()
       .kind(),
     radiata::ErrorKind::NotFound,
@@ -521,6 +542,9 @@ async fn remove_resource_requires_the_exact_version() {
     .handle
     .resources()
     .delete(name.clone(), winner.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(outcome.is_current_winner());
@@ -548,6 +572,9 @@ async fn remove_resource_requires_the_exact_version() {
       .resources()
       .delete(name.clone(), winner)
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err()
       .kind(),
     radiata::ErrorKind::Conflict
@@ -563,6 +590,9 @@ async fn remove_resource_requires_the_exact_version() {
     .handle
     .resources()
     .delete(name, removal_version)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(again.is_current_winner());
@@ -597,6 +627,9 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
       resource_labels("document", 40),
     ))
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let page = node
     .handle
@@ -619,6 +652,9 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
       version.clone(),
     )
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   assert!(outcome.is_current_winner());
 
@@ -632,6 +668,9 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
         ResourceWrite::new(name.clone(), resource_labels("blob", 42)),
         version.clone(),
       )
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap_err()
       .kind(),
@@ -649,6 +688,9 @@ async fn put_resource_with_expected_enforces_the_version_precondition() {
         ResourceWrite::new(resource_name(41), resource_labels("blob", 43)),
         version,
       )
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap_err()
       .kind(),
@@ -699,6 +741,9 @@ async fn remove_preserves_unrelated_metadata() {
         resource_labels("document", seed),
       ))
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap();
   }
   let page = node
@@ -721,6 +766,9 @@ async fn remove_preserves_unrelated_metadata() {
     .handle
     .resources()
     .delete(resource_name(30), version)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 

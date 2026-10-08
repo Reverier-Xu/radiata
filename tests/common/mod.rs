@@ -77,12 +77,20 @@ pub async fn merge_with_retry(
 /// single-store in-flight-commit rule). Retries with a bound, matching
 /// the merge harness precedent. `write` rebuilds the write intent for
 /// each attempt (put futures are single-use values).
+///
+/// The retry ladder covers both halves of the migrated write: the
+/// admission (a stopping node refuses admission typed) and the effect
+/// (the store race, observed through the task's `wait`).
 pub async fn put_resource_with_retry(
   node: &radiata::NodeHandle, mut write: impl FnMut() -> radiata::ResourceWrite,
 ) {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match node.resources().put(write()).await {
+    let committed = match node.resources().put(write()).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match committed {
       Ok(_) => return,
       Err(error) => {
         assert!(
