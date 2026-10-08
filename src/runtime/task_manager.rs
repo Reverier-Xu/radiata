@@ -59,9 +59,6 @@ const RETRY_TIMER_IDLE: Duration = Duration::from_secs(86_400 * 365);
 pub(crate) enum RetryClass {
   /// Join/connect dials: convergence and transport transients retry.
   Network,
-  /// Resource writes: only the snapshot-commit register race retries
-  /// (the `RESOURCE_COMMIT_RACE_ATTEMPTS` precedent).
-  Local,
   /// Caller-registered custom kinds: the reconciler owns the semantics,
   /// so every error retries within the bounded budget (the reconciler's
   /// own `Retry` decision rides the same schedule as a typed overload).
@@ -82,7 +79,6 @@ impl RetryClass {
           | ErrorKind::RouteUnavailable
           | ErrorKind::StreamInterrupted
       ),
-      RetryClass::Local => matches!(kind, ErrorKind::Conflict),
       RetryClass::Extension => true,
       RetryClass::Once => false,
     }
@@ -116,17 +112,13 @@ const NETWORK_RETRY: RetryPolicy = RetryPolicy {
   class: RetryClass::Network,
 };
 
-/// Resource writes: three attempts, 10 ms → 30 ms — the register
-/// commit-race budget.
-const LOCAL_RETRY: RetryPolicy = RetryPolicy {
-  max_attempts: 3,
-  initial: Duration::from_millis(10),
-  max: Duration::from_millis(30),
-  class: RetryClass::Local,
-};
-
-/// Everything else (leave, credentials, recovery, retention, the sync
-/// round, frozen-journal resolution): one attempt.
+/// Everything else (resource writes, leave, credentials, recovery,
+/// retention, the sync round, frozen-journal resolution): one attempt.
+/// The resource effects own their bounded commit-race retry internally
+/// ([`super::resources::with_commit_race_retry`]), so a `Conflict` that
+/// escapes one of them is a lost CAS — the caller's expected version no
+/// longer matches the register — and is deliberately final: the manager
+/// never re-runs it.
 const ONCE: RetryPolicy = RetryPolicy {
   max_attempts: 1,
   initial: Duration::ZERO,
@@ -148,7 +140,6 @@ const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
 pub(crate) fn retry_policy(kind: &TaskKind) -> &'static RetryPolicy {
   match kind {
     TaskKind::Join | TaskKind::Connect => &NETWORK_RETRY,
-    TaskKind::PutResource | TaskKind::DeleteResource => &LOCAL_RETRY,
     TaskKind::Extension(_) => &EXTENSION_RETRY,
     _ => &ONCE,
   }
@@ -1542,8 +1533,12 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn local_conflicts_retry_until_the_budget_ends() {
+  async fn final_cas_conflicts_terminalize_after_one_attempt() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // The resource effects return a lost CAS (the caller's expected
+    // version no longer matches the register) as a final Conflict: the
+    // bounded register-race retry lives inside the effect
+    // (`with_commit_race_retry`), so the manager never re-runs it.
     let scripted = Scripted::new(vec![Step::Fail(ErrorKind::Conflict, "resource version")]);
     let id = client
       .submit(
@@ -1555,12 +1550,13 @@ mod tests {
     let error = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource)
       .wait()
       .await
-      .expect_err("local budget");
+      .expect_err("final CAS conflict");
     assert_eq!(error.kind(), ErrorKind::Conflict);
+    assert_eq!(error.context(), "resource version");
     let status =
       handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource).status();
-    assert_eq!(status.attempts(), 3, "local budget");
-    assert_eq!(scripted.attempts(), vec![1, 2, 3]);
+    assert_eq!(status.attempts(), 1, "never retried at the manager level");
+    assert_eq!(scripted.attempts(), vec![1]);
   }
 
   #[tokio::test]
@@ -1944,10 +1940,14 @@ mod tests {
     assert_eq!(network.backoff(3), Duration::from_millis(1_600));
     assert_eq!(network.backoff(4), Duration::from_millis(6_400));
     assert_eq!(network.backoff(5), Duration::from_secs(10), "capped");
-    let local = super::retry_policy(&TaskKind::PutResource);
-    assert_eq!(local.max_attempts, 3);
-    assert_eq!(local.backoff(1), Duration::from_millis(10));
-    assert_eq!(local.backoff(2), Duration::from_millis(30), "capped");
+    // Resource writes share the once policy: the commit-race retry
+    // lives inside the effects, and a final lost-CAS Conflict never
+    // re-runs at the manager level.
+    assert_eq!(super::retry_policy(&TaskKind::PutResource).max_attempts, 1);
+    assert_eq!(
+      super::retry_policy(&TaskKind::DeleteResource).max_attempts,
+      1
+    );
     let once = super::retry_policy(&TaskKind::Leave);
     assert_eq!(once.max_attempts, 1);
     assert_eq!(once.backoff(1), Duration::ZERO);
