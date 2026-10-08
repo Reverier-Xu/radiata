@@ -355,7 +355,12 @@ impl TaskTable {
         continue;
       }
       if views.len() >= limit {
-        next = Some(id.as_str().as_bytes().to_vec());
+        // The boundary entry is *not* delivered on this page, so the
+        // cursor must name the last delivered id — naming the boundary
+        // entry would skip it on the continuation page.
+        next = views
+          .last()
+          .map(|view| view.id().as_str().as_bytes().to_vec());
         break;
       }
       views.push(crate::view::TaskView::from_record(
@@ -1241,5 +1246,39 @@ mod tests {
     assert_eq!(record.status().phase(), TaskPhase::Pending);
     assert_eq!(record.status().attempts(), 0);
     Ok(())
+  }
+
+  #[test]
+  fn page_views_walk_every_task_across_page_boundaries() {
+    let mut harness = Harness::new();
+    let ids = [
+      harness.admit(TaskKind::SyncRound),
+      harness.admit(TaskKind::SyncRound),
+      harness.admit(TaskKind::SyncRound),
+    ];
+    for id in &ids {
+      harness.finish(id, TaskPhase::Succeeded, Some(TaskOutput::SyncRound(())));
+    }
+
+    // Keyset pages must deliver every task exactly once: the cursor is
+    // the last delivered id, so a page boundary never swallows its own
+    // successor.
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut walked = Vec::new();
+    loop {
+      let page = harness.table.page_views(cursor.as_deref(), 1);
+      match page.next() {
+        Some(next) => {
+          assert_eq!(page.items().len(), 1, "a bounded page is full");
+          cursor = Some(next.as_bytes().to_vec());
+          walked.push(page.items()[0].id().clone());
+        }
+        None => {
+          walked.extend(page.items().iter().map(|view| view.id().clone()));
+          break;
+        }
+      }
+    }
+    assert_eq!(walked, ids.to_vec());
   }
 }
