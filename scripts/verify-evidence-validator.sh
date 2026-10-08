@@ -42,7 +42,7 @@ RADIATA_SOAK_DURATION_SECS=20 \
 RADIATA_SOAK_LEDGER="$SOAK_LEDGER" \
 RADIATA_SOAK_COMMIT="$(git rev-parse HEAD)" \
   cargo test --locked --all-features --test soak -- --ignored --exact soak_churn_then_baseline_return
-grep -q 'soak-attempt-v1' "$SOAK_LEDGER" || {
+grep -q 'radiata.woooo.tech/schemas/v1/soak-attempt' "$SOAK_LEDGER" || {
   printf 'soak ledger does not carry the current schema tag\n' >&2
   exit 1
 }

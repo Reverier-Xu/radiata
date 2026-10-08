@@ -14,7 +14,7 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 use crate::{Endpoint, LabelSet, NodeId, PublicKey, Result, protocol::encode_canonical};
 
 /// The durable schema, namespace, and key of one node descriptor record.
-pub(crate) const NODE_DESCRIPTOR_SCHEMA: &str = "radiata.woooo.tech/schemas/node-descriptor-v1";
+pub(crate) const NODE_DESCRIPTOR_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/node-descriptor";
 pub(crate) use crate::storage::families::NODE_DESCRIPTOR_NAMESPACE;
 
 /// The descriptor family's store namespace: the single constructor for

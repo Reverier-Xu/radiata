@@ -8,49 +8,49 @@
 //! namespace appears here.
 
 /// Local identity singleton record.
-pub(crate) const LOCAL_IDENTITY_NAMESPACE: &str = "radiata.woooo.tech/metadata/local-identity-v1";
+pub(crate) const LOCAL_IDENTITY_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/local-identity";
 /// One immutable node-to-key identity binding per node.
 pub(crate) const IDENTITY_BINDING_NAMESPACE: &str =
-  "radiata.woooo.tech/metadata/identity-binding-v1";
+  "radiata.woooo.tech/metadata/v1/identity-binding";
 /// Single-use credential use evidence per issuer generation.
-pub(crate) const CREDENTIAL_USE_NAMESPACE: &str = "radiata.woooo.tech/metadata/credential-use-v1";
+pub(crate) const CREDENTIAL_USE_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/credential-use";
 /// Committed merge grant per credential.
-pub(crate) const MERGE_GRANT_NAMESPACE: &str = "radiata.woooo.tech/metadata/merge-grant-v1";
+pub(crate) const MERGE_GRANT_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/merge-grant";
 /// Pending Ed25519 key creation intent per operation.
 pub(crate) const KEY_CREATION_INTENT_NAMESPACE: &str =
-  "radiata.woooo.tech/metadata/key-creation-intent-v1";
+  "radiata.woooo.tech/metadata/v1/key-creation-intent";
 /// Pending key deletion intent per provider handle.
 pub(crate) const KEY_DELETION_INTENT_NAMESPACE: &str =
-  "radiata.woooo.tech/metadata/key-deletion-intent-v1";
+  "radiata.woooo.tech/metadata/v1/key-deletion-intent";
 /// Committed key deletion outcome per provider handle.
-pub(crate) const KEY_DELETED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-deleted-v1";
+pub(crate) const KEY_DELETED_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/key-deleted";
 /// Custodial Ed25519 seed material per custody operation: the default
 /// [`crate::keys::metadata::MetadataKeyStore`]'s durable artifact, one row per
 /// operation id. Swept only by the provider's own deletion flow, never
 /// by a domain wipe.
-pub(crate) const KEY_SEED_NAMESPACE: &str = "radiata.woooo.tech/metadata/key-seed-v1";
+pub(crate) const KEY_SEED_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/key-seed";
 /// One issuer trust snapshot per issuer and revision.
-pub(crate) const TRUST_SNAPSHOT_NAMESPACE: &str = "radiata.woooo.tech/metadata/trust-snapshot-v1";
+pub(crate) const TRUST_SNAPSHOT_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/trust-snapshot";
 /// Local authorization revocation per exact subject binding.
-pub(crate) const REVOCATION_NAMESPACE: &str = "radiata.woooo.tech/metadata/revocation-v1";
+pub(crate) const REVOCATION_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/revocation";
 /// Cleanup checkpoint GC epoch marker, max-wins by watermark.
-pub(crate) const CHECKPOINT_NAMESPACE: &str = "radiata.woooo.tech/metadata/cleanup-checkpoint-v1";
+pub(crate) const CHECKPOINT_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/cleanup-checkpoint";
 /// In-progress active-leave intent.
-pub(crate) const LEAVE_NAMESPACE: &str = "radiata.woooo.tech/metadata/leave-v1";
+pub(crate) const LEAVE_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/leave";
 /// One issuer-signed dead-node cleanup tombstone per subject.
-pub(crate) const CLEANUP_NAMESPACE: &str = "radiata.woooo.tech/metadata/cleanup-v1";
+pub(crate) const CLEANUP_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/cleanup";
 /// Owner-revision-marked node descriptor per node.
-pub(crate) const NODE_DESCRIPTOR_NAMESPACE: &str = "radiata.woooo.tech/metadata/node-descriptor-v1";
+pub(crate) const NODE_DESCRIPTOR_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/node-descriptor";
 /// One multiwriter generic resource register per resource name.
-pub(crate) const RESOURCE_RECORD_NAMESPACE: &str = "radiata.woooo.tech/metadata/resource-record-v1";
+pub(crate) const RESOURCE_RECORD_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/resource-record";
 /// Bounded route-trace metadata per trace.
-pub(crate) const TRACE_NAMESPACE: &str = "radiata.woooo.tech/metadata/route-trace-v1";
+pub(crate) const TRACE_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/route-trace";
 /// Durable pending-transaction journal record per transaction.
-pub(crate) const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/pending-transaction-v1";
+pub(crate) const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/pending-transaction";
 /// Storage-internal receipt markers and reference anchors.
-pub(crate) const INTERNAL_NAMESPACE: &str = "radiata.woooo.tech/metadata/receipt-internal-v1";
+pub(crate) const INTERNAL_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/receipt-internal";
 /// The store's current logical schema version record.
-pub(crate) const SCHEMA_NAMESPACE: &str = "radiata.woooo.tech/metadata/store-schema-v1";
+pub(crate) const SCHEMA_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/store-schema";
 
 /// Parses one catalog family tag into its provider namespace: the single
 /// constant-to-namespace conversion for the catalog. The tag grammar
@@ -222,7 +222,7 @@ mod catalog {
         );
       }
       assert_eq!(
-        domain_lookup("radiata.woooo.tech/metadata/not-a-family-v1"),
+        domain_lookup("radiata.woooo.tech/metadata/v1/not-a-family"),
         None
       );
     }

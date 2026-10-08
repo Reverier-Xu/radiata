@@ -29,9 +29,9 @@ use crate::{
 };
 
 /// The durable schema of the issuer-signed cleanup tombstone.
-pub(crate) const CLEANUP_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/cleanup-record-v1";
+pub(crate) const CLEANUP_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/cleanup-record";
 /// The signature domain of the issuer-signed cleanup tombstone.
-pub(crate) const CLEANUP_RECORD_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/cleanup-record-v1";
+pub(crate) const CLEANUP_RECORD_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/cleanup-record";
 
 /// Canonical-decoder bounds for the flat cleanup record.
 const CLEANUP_LIMITS: crate::protocol::CborLimits = crate::protocol::CborLimits::new(1, 8, 1_024);
@@ -102,7 +102,7 @@ impl CleanupRecordV1 {
   /// permanently retained binding).
   pub(crate) fn verify(&self, issuer_key: &PublicKey) -> Result<()> {
     verify_strict(
-      CLEANUP_RECORD_V1_DOMAIN,
+      CLEANUP_RECORD_DOMAIN,
       &Self::encode_signed_body(
         &self.subject,
         &self.subject_key,
@@ -136,7 +136,7 @@ pub(crate) async fn sign_cleanup_record(
   let signature = records::sign_tombstone(
     context,
     keys,
-    CLEANUP_RECORD_V1_DOMAIN,
+    CLEANUP_RECORD_DOMAIN,
     "cleanup record signature",
     |identity| {
       CleanupRecordV1::encode_signed_body(subject, &subject_key, identity.node(), timestamp_millis)
@@ -216,7 +216,7 @@ pub(crate) async fn cleaned_nodes_ctx(
 }
 
 /// The durable schema of the cleanup checkpoint (GC epoch) record.
-pub(crate) const CHECKPOINT_SCHEMA: &str = "radiata.woooo.tech/schemas/cleanup-checkpoint-v1";
+pub(crate) const CHECKPOINT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/cleanup-checkpoint";
 
 /// The durable namespace of cleanup checkpoint (GC epoch) records.
 pub(crate) use crate::storage::families::CHECKPOINT_NAMESPACE;
@@ -421,7 +421,7 @@ mod tests {
   use std::sync::Arc;
 
   use super::{
-    CHECKPOINT_NAMESPACE, CLEANUP_RECORD_V1_DOMAIN, CleanupCheckpointV1, CleanupRecordV1,
+    CHECKPOINT_NAMESPACE, CLEANUP_RECORD_DOMAIN, CleanupCheckpointV1, CleanupRecordV1,
     cleaned_nodes_ctx, collect_collected_tombstones_ctx, is_cleaned_ctx, issue_checkpoint_ctx,
     known_cleanup_records_ctx, latest_checkpoint_millis_ctx, metadata_namespace,
     persist_cleanup_record_ctx, sign_cleanup_record,
@@ -456,7 +456,7 @@ mod tests {
       .as_provider()
       .sign(
         identity.handle(),
-        &signature_message(CLEANUP_RECORD_V1_DOMAIN, &body),
+        &signature_message(CLEANUP_RECORD_DOMAIN, &body),
       )
       .await
       .unwrap();
@@ -651,7 +651,7 @@ mod tests {
       .sign(
         context.identity().handle(),
         &signature_message(
-          crate::identity::revocation::REVOCATION_RECORD_V1_DOMAIN,
+          crate::identity::revocation::REVOCATION_RECORD_DOMAIN,
           &revocation_body,
         ),
       )

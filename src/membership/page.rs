@@ -9,7 +9,7 @@
 
 /// The schema of one membership sync page.
 #[cfg(test)]
-pub(crate) const MEMBERSHIP_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-page-v1";
+pub(crate) const MEMBERSHIP_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/membership-page";
 
 use super::NodeDescriptorV1;
 #[cfg(test)]

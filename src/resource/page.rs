@@ -18,7 +18,7 @@ use crate::Result;
 /// The schema of one resource page record envelope (tests pin the wire
 /// shape the page round-trips through).
 #[cfg(test)]
-pub(crate) const RESOURCE_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/resource-page-v1";
+pub(crate) const RESOURCE_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/resource-page";
 
 /// The default records-per-page limit (single-sourced in the paging
 /// module; lane-local name for readable call sites).
@@ -588,7 +588,7 @@ mod tests {
     let signature = crate::Signature::from_bytes(
       key
         .sign(&crate::identity::signature::signature_message(
-          crate::resource::RESOURCE_RECORD_V1_DOMAIN,
+          crate::resource::RESOURCE_RECORD_DOMAIN,
           &forged_body,
         ))
         .to_bytes(),

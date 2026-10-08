@@ -31,7 +31,7 @@ cargo test --locked --all-features --test soak -- --ignored --exact soak_churn_t
 LINES=$(wc -l < "$RADIATA_SOAK_LEDGER")
 [[ $LINES -ge 1 ]] || { printf 'soak produced no ledger record\n' >&2; exit 1; }
 jq -e '
-  .schema == "radiata.woooo.tech/schemas/soak-attempt-v1"
+  .schema == "radiata.woooo.tech/schemas/v1/soak-attempt"
   and (.commit | length) > 0
   and (.predecessor | length) == 0
   and .retry == "complete"

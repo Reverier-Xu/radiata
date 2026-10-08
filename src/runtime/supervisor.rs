@@ -117,7 +117,7 @@ pub(crate) struct RuntimeDependencies {
   pub(crate) leave_applied: crate::membership::sync::LeaveAppliedSignal,
   /// The reconciliation plane shared by the registered consumer and the
   /// anti-entropy driver: created in `spawn_runtime` when the
-  /// reconcile-v1 protocol registers, consumed by `supervise` when the
+  /// reconcile v1 protocol registers, consumed by `supervise` when the
   /// sync driver spawns.
   pub(crate) reconcile: Option<crate::reconcile::plane::ReconcilePlane>,
   /// Requests for one immediate anti-entropy round, forwarded to the
@@ -195,7 +195,7 @@ pub(crate) async fn spawn_runtime(
     .extensions
     .register_core_protocol(sync_definition, sync_consumer)?;
   // The core reconciliation plane rides the same authenticated sessions
-  // as the sync lanes: one consumer for the reconcile-v1 protocol, one
+  // as the sync lanes: one consumer for the reconcile v1 protocol, one
   // shared plane behind it (the anti-entropy driver ticks the same
   // plane once the supervisor spawns it).
   let reconcile_plane = crate::reconcile::plane::ReconcilePlane::new(

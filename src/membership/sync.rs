@@ -30,7 +30,7 @@ use crate::{
 pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str = "radiata.woooo.tech/protocols/membership-sync";
 
 /// The wire schema of one sync payload.
-const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/membership-sync-payload-v1";
+const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/membership-sync-payload";
 
 /// Payload kinds: this protocol carries the interactive leave plane
 /// only — the owner-signed leave announcement and its applied receipt.

@@ -37,7 +37,7 @@ use crate::{
   provider::{StorageFactory, StoreSnapshot},
   time::{HostWallClock, WallClock},
 };
-const PENDING_SCHEMA: &str = "radiata.woooo.tech/schemas/pending-transaction-v1";
+const PENDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/pending-transaction";
 const RECORD_VERSION: u64 = 1;
 const PENDING_LIMITS: CborLimits = CborLimits::new(8, 1_024, 65_536);
 
@@ -886,7 +886,7 @@ mod tests {
 
   use crate::hex::encode as hex;
 
-  const PENDING_RECORD_GOLDEN: &str = "867831726164696174612e776f6f6f6f2e746563682f736368656d61732f70656e64696e672d7472616e73616374696f6e2d7631016e6c6f63616c2d6964656e74697479781974786e2d303132333435363738396162636465666768696a6b4101848400782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f6c6f63616c2d6964656e746974792d76314473656c6681008501782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f6c6f63616c2d6964656e746974792d76314762696e64696e67820158200b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b4c7265636f72642d62797465738402782a726164696174612e776f6f6f6f2e746563682f6d657461646174612f6d657267652d6772616e742d7631436f6c6458200c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c8303781974786e2d31313131313131313131313131313131313131313158200d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d";
+  const PENDING_RECORD_GOLDEN: &str = "867831726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f70656e64696e672d7472616e73616374696f6e016e6c6f63616c2d6964656e74697479781974786e2d303132333435363738396162636465666768696a6b4101848400782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f6c6f63616c2d6964656e746974794473656c6681008501782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f6c6f63616c2d6964656e746974794762696e64696e67820158200b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b4c7265636f72642d62797465738402782a726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f6d657267652d6772616e74436f6c6458200c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c8303781974786e2d31313131313131313131313131313131313131313158200d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d";
 
   #[test]
   fn identity_records_pending_record_golden_matches_exact_bytes() {
@@ -949,12 +949,14 @@ mod tests {
     assert!(PendingTransactionV1::decode(&wrong_version).is_err());
 
     let mut wrong_schema = encoded.clone();
-    let needle = b"pending-transaction-v1";
+    // Flip the version segment digit: a foreign schema of identical
+    // width must fail the schema check.
+    let needle = b"schemas/v1/pending-transaction";
     let start = wrong_schema
       .windows(needle.len())
       .position(|window| window == needle)
       .unwrap();
-    wrong_schema[start + needle.len() - 1] = b'0';
+    wrong_schema[start + b"schemas/v".len()] = b'0';
     assert!(PendingTransactionV1::decode(&wrong_schema).is_err());
   }
 
@@ -1169,7 +1171,7 @@ mod tests {
     let namespace = pending_namespace().unwrap();
     assert_eq!(
       namespace.as_str(),
-      "radiata.woooo.tech/metadata/pending-transaction-v1"
+      "radiata.woooo.tech/metadata/v1/pending-transaction"
     );
     assert_eq!(
       QualifiedTag::parse(namespace.as_str()).unwrap().category(),

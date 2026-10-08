@@ -89,7 +89,7 @@ pub fn persisted_decode(input: &[u8]) {
   let _ = decode_schema_record(&crate::StoreValue::new(std::sync::Arc::from(input)));
 }
 
-/// The reconcile-wire target (`reconcile_decode`): the six reconcile-v1
+/// The reconcile-wire target (`reconcile_decode`): the six reconcile v1
 /// message shapes under the frozen canonical contract. Every input runs
 /// the exact fail-closed production decode; an input that decodes must
 /// re-encode byte-exactly and re-decode to the identical message — the

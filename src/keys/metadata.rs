@@ -1,7 +1,7 @@
 //! The default metadata-store-backed Ed25519 key store: the runtime's
 //! built-in custody when the caller does not inject a `KeyProvider`.
 //!
-//! One reserved metadata family (`key-seed-v1`) holds one seed row per
+//! One reserved metadata family (`metadata/v1/key-seed`) holds one seed row per
 //! custody operation, in the same store that journals the key-creation
 //! and key-deletion intents referring to it. The custody contract maps
 //! onto the storage contract directly:
@@ -72,9 +72,9 @@ impl MetadataKeyStore {
     }
   }
 
-  /// The seed-row namespace: the reserved `key-seed-v1` catalog family,
-  /// parsed through the catalog's single conversion point. The tag is a
-  /// compile-time constant; a parse failure is a programming error that
+  /// The seed-row namespace: the reserved `metadata/v1/key-seed` catalog
+  /// family, parsed through the catalog's single conversion point. The tag is
+  /// a compile-time constant; a parse failure is a programming error that
   /// fails closed as a typed provider error instead of a panic.
   fn namespace() -> Result<crate::StoreNamespace> {
     families::namespace(families::KEY_SEED_NAMESPACE)

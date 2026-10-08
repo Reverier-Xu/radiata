@@ -79,7 +79,7 @@ radiata 的愿景：任何网络环境（同机回环、局域网、跨域 WAN�
 
 ## 3. wire 契约（新泳道协议，冻结后 golden vector 钉死）
 
-在现有会话多路复用上注册一个新协议标签（如 `radiata…/protocols/reconcile-v1`），
+在现有会话多路复用上注册一个新协议标签（如 `radiata…/protocols/v1/reconcile`），
 消息体 CBOR canonical 编码，全部有界：
 
 | 消息 | 方向 | 载荷 | 语义 |

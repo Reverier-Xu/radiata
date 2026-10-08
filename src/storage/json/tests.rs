@@ -414,7 +414,7 @@ async fn json_adapter_reopen_rejects_corruption_and_never_selects_older() {
   let files = generation_files(dir.path());
   let bytes = fs::read(&files[0]).unwrap();
   let text = String::from_utf8(bytes).unwrap();
-  let edited = text.replace("json-generation-v1", "json-generation-v9");
+  let edited = text.replace("schemas/v1/json-generation", "schemas/v9/json-generation");
   fs::write(&files[0], edited).unwrap();
   expect_reopen_error(&dir, ErrorKind::UnsupportedSchema).await;
 

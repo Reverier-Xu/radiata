@@ -599,6 +599,7 @@ pub fn radiata::QualifiedTag::category(&self) -> &str
 pub fn radiata::QualifiedTag::domain(&self) -> &str
 pub fn radiata::QualifiedTag::name(&self) -> &str
 pub fn radiata::QualifiedTag::parse(&str) -> radiata::Result<Self>
+pub fn radiata::QualifiedTag::version(&self) -> core::option::Option<&str>
 impl core::fmt::Debug for radiata::QualifiedTag
 pub fn radiata::QualifiedTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::QualifiedTag

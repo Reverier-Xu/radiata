@@ -100,7 +100,7 @@ fn corrupt() -> Error {
 /// The production metadata schema baseline: the record format every
 /// store carries before any migration edge exists. Stores created before
 /// versioning stamp this baseline on their first versioned open.
-pub(crate) const METADATA_SCHEMA_V1: &str = "radiata.woooo.tech/schemas/metadata-v1";
+pub(crate) const METADATA_SCHEMA_V1: &str = "radiata.woooo.tech/schemas/v1/metadata";
 
 /// The production migration chain. Every metadata format change lands
 /// here as one explicit edge, so an opened store always ends at the
@@ -395,15 +395,15 @@ fn migration_transaction_value(parts: &[&[u8]]) -> Result<u128> {
 /// compatibility manifest tests. These literals are frozen; every
 /// fixture must agree with them byte-for-byte.
 #[cfg(test)]
-pub(crate) const BASE_VERSION: &str = "radiata.woooo.tech/schemas/metadata-test-v1";
+pub(crate) const BASE_VERSION: &str = "radiata.woooo.tech/schemas/v1/metadata-test";
 #[cfg(test)]
-pub(crate) const V2: &str = "radiata.woooo.tech/schemas/metadata-test-v2";
+pub(crate) const V2: &str = "radiata.woooo.tech/schemas/v2/metadata-test";
 #[cfg(test)]
-pub(crate) const V3: &str = "radiata.woooo.tech/schemas/metadata-test-v3";
+pub(crate) const V3: &str = "radiata.woooo.tech/schemas/v3/metadata-test";
 #[cfg(test)]
-pub(crate) const EDGE_ONE_TAG: &str = "radiata.woooo.tech/schemas/migration-edge-one-v1";
+pub(crate) const EDGE_ONE_TAG: &str = "radiata.woooo.tech/schemas/v1/migration-edge-one";
 #[cfg(test)]
-pub(crate) const EDGE_TWO_TAG: &str = "radiata.woooo.tech/schemas/migration-edge-two-v1";
+pub(crate) const EDGE_TWO_TAG: &str = "radiata.woooo.tech/schemas/v1/migration-edge-two";
 
 #[cfg(test)]
 mod tests {
@@ -594,7 +594,7 @@ mod tests {
     let snapshot = raw.snapshot().await.unwrap();
     let foreign = encode_schema_record(
       BASE_RECORD_KIND,
-      "radiata.woooo.tech/schemas/metadata-foreign-v9",
+      "radiata.woooo.tech/schemas/v9/metadata-foreign",
       None,
     );
     let transaction = StoreTransaction::new(
@@ -636,7 +636,7 @@ mod tests {
     let snapshot = raw.snapshot().await.unwrap();
     let foreign = encode_schema_record(
       BASE_RECORD_KIND,
-      "radiata.woooo.tech/schemas/metadata-foreign-v9",
+      "radiata.woooo.tech/schemas/v9/metadata-foreign",
       None,
     );
     let transaction = StoreTransaction::new(

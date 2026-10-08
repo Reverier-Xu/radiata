@@ -41,7 +41,7 @@ use crate::{
 };
 
 /// The durable schema of the leave-intent record.
-const LEAVE_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/leave-intent-v1";
+const LEAVE_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/leave-intent";
 pub(crate) use crate::storage::families::LEAVE_NAMESPACE;
 
 /// Canonical-decoder bounds for the flat intent record.
@@ -115,9 +115,9 @@ fn leave_key() -> StoreKey {
 }
 
 /// The durable schema of the owner-signed leave record.
-pub(crate) const LEAVE_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/leave-record-v1";
+pub(crate) const LEAVE_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/leave-record";
 /// The signature domain of the owner-signed leave record.
-pub(crate) const LEAVE_RECORD_V1_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/leave-record-v1";
+pub(crate) const LEAVE_RECORD_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/leave-record";
 
 /// Canonical-decoder bounds for the flat leave record.
 const LEAVE_RECORD_LIMITS: crate::protocol::CborLimits =
@@ -185,7 +185,7 @@ impl LeaveRecordV1 {
   /// Verifies the owner signature against the permanently retained binding.
   pub(crate) fn verify(&self) -> Result<()> {
     crate::identity::signature::verify_strict(
-      LEAVE_RECORD_V1_DOMAIN,
+      LEAVE_RECORD_DOMAIN,
       &Self::encode_signed_body(&self.node, &self.public_key, self.timestamp_millis)?,
       &self.public_key,
       &self.signature,
@@ -204,7 +204,7 @@ pub(crate) async fn sign_leave_record(
   let signature = records::sign_tombstone(
     context,
     keys,
-    LEAVE_RECORD_V1_DOMAIN,
+    LEAVE_RECORD_DOMAIN,
     "leave record signature",
     |identity| {
       LeaveRecordV1::encode_signed_body(identity.node(), identity.public_key(), timestamp_millis)
