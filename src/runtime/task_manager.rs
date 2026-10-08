@@ -382,9 +382,6 @@ pub(crate) struct TaskManagerDeps {
   /// the submit half, so holding a handle never keeps the metadata store
   /// locked past shutdown).
   pub(crate) operations: Arc<super::task_effects::OperationDeps>,
-  /// The node's bound listeners, shared with the supervisor's views: the
-  /// listen/stop effects mutate the same registry the pages read.
-  pub(crate) listeners: super::supervisor::ListenerRegistry,
   /// The leave reconciler's completion signal to the supervisor
   /// ([`super::supervisor::spawn_runtime`] owns the receiving end). The
   /// manager sends it once the leave task's terminal publication landed,
@@ -398,9 +395,6 @@ struct ManagerShared {
   clock: Arc<dyn WallClock>,
   /// The node-shared operation handles every effect reads.
   operations: Arc<super::task_effects::OperationDeps>,
-  /// The shared listener registry, read by the listen/stop effects.
-  #[allow(dead_code)] // read by the listener effects; that migration stage lands next
-  listeners: super::supervisor::ListenerRegistry,
   /// The leave completion signal, sent once the leave task terminalized
   /// with success (the supervisor owns the receiver and answers with the
   /// active-leave shutdown).
@@ -559,7 +553,6 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     table,
     clock: deps.clock,
     operations: deps.operations,
-    listeners: deps.listeners,
     leave_complete: deps.leave_complete,
     semaphore: Arc::new(Semaphore::new(TASK_RECONCILE_CONCURRENCY)),
   });
@@ -1160,7 +1153,6 @@ mod tests {
         events,
         Arc::new(extensions),
       )),
-      listeners: Default::default(),
       leave_complete,
     }
   }
@@ -1361,7 +1353,6 @@ mod tests {
         Arc::new(crate::node::EventHub::new()),
         Arc::new(extensions),
       )),
-      listeners: Default::default(),
       leave_complete,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
@@ -2145,7 +2136,6 @@ mod tests {
         events,
         extensions.clone(),
       )),
-      listeners: Default::default(),
       leave_complete,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");

@@ -248,7 +248,6 @@ pub(crate) async fn spawn_runtime(
     entropy: dependencies.entropy.clone(),
     clock: Arc::new(crate::time::HostWallClock),
     operations,
-    listeners: dependencies.listeners.clone(),
     leave_complete,
   })?;
   dependencies.task_manager = Some(task_manager);
