@@ -629,9 +629,10 @@ impl<T: TaskResult> Task<T> {
   /// Resolves when the task reaches a terminal phase: `Ok(T)` on
   /// `Succeeded`, the typed effect error on `Failed`, and
   /// [`ErrorKind::ShuttingDown`] if the node stops before the effect
-  /// settles. A kind the shutdown drain awaits to terminality
-  /// ([`TaskKind::drains_on_shutdown`]) still resolves with its real
-  /// outcome: the manager publishes it before the drain completes.
+  /// settles. A kind the shutdown drain awaits to terminality (the
+  /// journaled leave and frozen-journal resolution) still resolves with
+  /// its real outcome: the manager publishes it before the drain
+  /// completes.
   pub async fn wait(self) -> Result<T> {
     let Some(mut status) = self.observer.table.watch(&self.id) else {
       return Err(Error::not_found("task"));
