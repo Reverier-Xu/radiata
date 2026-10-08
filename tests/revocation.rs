@@ -50,6 +50,9 @@ async fn listen(node: &Node) -> Endpoint {
     .listeners()
     .create(node.endpoint.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   listener.endpoint().clone()
 }
@@ -141,7 +144,15 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
 
   // The member commits a resource the issuer converges on before the
   // revoke (delayed content must stay eligible afterwards).
-  member.handle.resources().put(write(1)).await.unwrap();
+  member
+    .handle
+    .resources()
+    .put(write(1))
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let member_resource = "radiata.woooo.tech/resources/revoke-001".to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   while !selected_names(&issuer.handle)
@@ -166,6 +177,9 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   let outcome = issuer
     .handle
     .revoke(member.id.clone(), member_key.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(outcome.subject(), &member.id);
@@ -201,6 +215,9 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
     .handle
     .connect(member.endpoint.clone(), member.id.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Revoked);
 
@@ -209,9 +226,20 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   // responder-side revocation check rejects a revoked subject's join
   // after a leave: every lane fails closed, never with admission.
   let rejoin = async {
-    let issued = issuer.handle.credentials().rotate().await.unwrap();
+    let issued = issuer
+      .handle
+      .credentials()
+      .rotate()
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
     let credential = MergeCredential::parse(issued.credential().expose_secret()).unwrap();
-    member.handle.join(listen(&issuer).await, credential).await
+    match member.handle.join(listen(&issuer).await, credential).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    }
   };
   let error = rejoin.await.unwrap_err();
   assert!(
@@ -287,6 +315,9 @@ async fn revoke_is_exact_and_idempotent() {
       .handle
       .revoke(unknown, member_key.clone())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err()
       .kind(),
     ErrorKind::NotFound
@@ -297,6 +328,9 @@ async fn revoke_is_exact_and_idempotent() {
     issuer
       .handle
       .revoke(member.id.clone(), wrong_key)
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap_err()
       .kind(),
@@ -309,6 +343,9 @@ async fn revoke_is_exact_and_idempotent() {
     issuer
       .handle
       .revoke(issuer_id, issuer_key)
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap_err()
       .kind(),
@@ -324,6 +361,9 @@ async fn revoke_is_exact_and_idempotent() {
     .handle
     .revoke(member.id.clone(), member_key.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   assert!(!outcome.was_already_revoked());
   let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -335,6 +375,9 @@ async fn revoke_is_exact_and_idempotent() {
   let outcome = issuer
     .handle
     .revoke(member.id.clone(), member_key)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(outcome.was_already_revoked());
@@ -360,7 +403,15 @@ async fn delayed_content_converges_after_revoke() {
   common::merge_with_retry(&member.handle, &issuer.handle, issuer_endpoint.clone()).await;
   let member_id = local_id(&member.handle).await;
 
-  member.handle.resources().put(write(2)).await.unwrap();
+  member
+    .handle
+    .resources()
+    .put(write(2))
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let member_resource = "radiata.woooo.tech/resources/revoke-002".to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   while !selected_names(&issuer.handle)
@@ -383,6 +434,9 @@ async fn delayed_content_converges_after_revoke() {
   issuer
     .handle
     .revoke(member_id.clone(), member_key)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 

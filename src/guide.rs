@@ -19,8 +19,9 @@
 //! 6. [Holding identity keys:
 //!    `KeyProvider`](#6-holding-identity-keys-keyprovider)
 //! 7. [Leaving the cluster: `node.leave`](#7-leaving-the-cluster-nodeleave)
-//! 8. [Deploying on low-performance
-//!    devices](#8-deploying-on-low-performance-devices)
+//! 8. [Operations are tasks](#8-operations-are-tasks)
+//! 9. [Deploying on low-performance
+//!    devices](#9-deploying-on-low-performance-devices)
 //!
 //! # 1. Resource versions across process boundaries
 //!
@@ -38,30 +39,39 @@
 //! four parts (an HTTP body, a job queue message), rebuild it with
 //! [`ResourceVersion::from_parts`](crate::ResourceVersion::from_parts),
 //! and commit conditionally. A raced write fails as
-//! [`ErrorKind::Conflict`](crate::ErrorKind::Conflict) instead of
-//! landing quietly; removal is conditional the same way through
-//! [`node.leave`](crate::NodeHandle::leave)'s resource-plane sibling
-//! [`Resources::delete`](crate::Resources::delete).
+//! [`ErrorKind::Conflict`](crate::ErrorKind::Conflict) from the admitted
+//! task's `wait` instead of landing quietly; removal is conditional the
+//! same way through [`node.leave`](crate::NodeHandle::leave)'s
+//! resource-plane sibling [`Resources::delete`](crate::Resources::delete).
 //!
 //! ```
-//! use radiata::{NodeHandle, ResourceLabels, ResourceName, ResourceVersion, ResourceWrite};
+//! use radiata::{
+//!     NodeHandle, ResourceLabels, ResourceMutationView, ResourceName, ResourceVersion,
+//!     ResourceWrite,
+//! };
 //!
-//! /// Builds the conditional write a worker performs after the
+//! /// Commits the conditional write a worker performs after the
 //! /// observed version traveled through a queue: the tuple is rebuilt
-//! /// exactly, and a raced write surfaces as `ErrorKind::Conflict`.
-//! fn enqueue_update(
+//! /// exactly, admission accepts the compare-and-swap, and the effect is
+//! /// awaited through the task — a raced write surfaces as
+//! /// `ErrorKind::Conflict` from `wait`.
+//! async fn commit_update(
 //!     node: &NodeHandle,
 //!     observed: &ResourceVersion,
 //!     name: ResourceName,
 //!     labels: ResourceLabels,
-//! ) -> impl Future<Output = radiata::Result<radiata::ResourceMutationView>> {
+//! ) -> radiata::Result<ResourceMutationView> {
 //!     let expected = ResourceVersion::from_parts(
 //!         observed.timestamp(),
 //!         observed.writer().clone(),
 //!         observed.is_removal(),
 //!         observed.digest().clone(),
 //!     );
-//!     node.resources().put_expected(ResourceWrite::new(name, labels), expected)
+//!     let task = node
+//!         .resources()
+//!         .put_expected(ResourceWrite::new(name, labels), expected)
+//!         .await?;
+//!     task.wait().await
 //! }
 //! ```
 //!
@@ -506,17 +516,103 @@
 //!
 //! ```no_run
 //! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
-//! let outcome = node
+//! let task = node
 //!     .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
 //!     .await?;
-//! // Durable from here: the node shuts itself down with the
-//! // active-leave reason and restarts as the replacement identity.
+//! // The task's `wait` resolves with the outcome before the
+//! // active-leave teardown begins: durable from here, the node shuts
+//! // itself down and restarts as the replacement identity.
+//! let outcome = task.wait().await?;
 //! # let _ = (outcome.former_identity(), outcome.replacement_identity());
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! # 8. Deploying on low-performance devices
+//! # 8. Operations are tasks
+//!
+//! Every mutating verb — `join`, `leave`, `connect`, `disconnect`,
+//! `revoke`, `cleanup`, the resource writes, `patch_metadata`, the
+//! listener and credential verbs — has the same two-step shape:
+//! **admission** is fast and does no IO, and the **effect** runs as an
+//! admitted task on the node's task manager.
+//!
+//! ```no_run
+//! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
+//! // Admission: pure validation plus hooks, no dial, no store commit.
+//! // An `Err` here is a bad request (a stopped node, a malformed write,
+//! // a rejected hook) and means nothing was enqueued.
+//! let task = node
+//!     .listeners()
+//!     .create(radiata::Endpoint::parse("tls://0.0.0.0:9443")?)
+//!     .await?;
+//! // The effect: `wait` resolves with the verb's historical return type
+//! // (here a `ListenerView`) and its typed errors.
+//! let listener = task.wait().await?;
+//! # let _ = listener;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! `wait` is value-based: an already-terminal task resolves immediately,
+//! so a caller that admitted a task and only later reads its outcome
+//! never misses the transition. It is the only per-operation await —
+//! nothing polls and nothing sleeps. A task the node's shutdown cancels
+//! before it settles fails with
+//! [`ErrorKind::ShuttingDown`](crate::ErrorKind::ShuttingDown); the two
+//! journaled/store-atomic kinds (`leave`, `resolve_frozen_journal`)
+//! still resolve with their real outcome, because the shutdown drain
+//! awaits them.
+//!
+//! ## Three ways to observe the same operation
+//!
+//! Pick by *who needs the outcome*, not by the verb:
+//!
+//! - **`task.wait()`** — this caller wants this one operation's result before
+//!   moving on. It hands back the verb's historical success type, so a
+//!   read-modify-write (a conditional resource write, a descriptor revision
+//!   CAS) checks its typed [`ErrorKind::Conflict`](crate::ErrorKind::Conflict)
+//!   right here and retries. This is the primary pattern: admit, then wait.
+//! - **`node.tasks().get` / `node.tasks().list`** — this caller wants a status
+//!   snapshot without blocking: the phase, the attempt count, the time bounds,
+//!   the typed terminal error, and the payload of a succeeded task. Both read
+//!   the node-local table directly (no supervisor round trip) over the bounded
+//!   live-plus-terminal history; an unknown or evicted id reads as `None`. Use
+//!   them for a dashboard, an operator surface, or the "did it finish while I
+//!   was away" question.
+//! - **`node.watch::<TaskChanged>(...)`** — this caller wants to react to
+//!   *every* task transition of the node, streaming. It is a transient event
+//!   like the rest of the hub: a lagging subscriber observes
+//!   [`EventReceive::Lagged`](crate::EventReceive::Lagged) and re-reads through
+//!   `tasks().get/list` instead of assuming the missed transitions.
+//!
+//! ```no_run
+//! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
+//! use radiata::{EventOptions, EventReceive, TaskChanged};
+//!
+//! let mut changes = node.watch::<TaskChanged>(EventOptions::new())?;
+//! while let EventReceive::Item(changed) = changes.recv().await? {
+//!     if changed.phase().is_terminal() {
+//!         // Re-read the table for the payload or the typed error: the
+//!         // event is a pointer, never the record.
+//!         let _ = node.tasks().get(changed.task().clone()).await?;
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The three compose: a caller may wait on the tasks it admitted while a
+//! node-local observer watches `TaskChanged` for the operator surface,
+//! and a caller that restarted can re-read `tasks().get` for any task
+//! still inside the bounded terminal history.
+//!
+//! Custom kinds extend the same surface: register a
+//! [`TaskReconciler`](crate::TaskReconciler) under a caller-owned
+//! qualified tag, then submit it through `node.tasks().submit`; the
+//! returned `Task<()>` waits exactly like a core kind. The reserved
+//! builtin domain is refused, so custom kinds never shadow core ones.
+//!
+//! # 9. Deploying on low-performance devices
 //!
 //! **There is nothing to configure.** Build the node, form the
 //! cluster, send data — the defaults are the deployment. The library

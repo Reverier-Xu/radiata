@@ -131,6 +131,9 @@ impl Node {
       .listeners()
       .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap();
     self.endpoint = Some(listener.endpoint().clone());
   }
@@ -362,10 +365,16 @@ async fn soak_churn_then_baseline_return() {
       ),
     );
     match issuer.handle.resources().put(write).await {
-      Ok(view) => {
-        stats.resources_written += 1;
-        last_resource = Some((name, view.accepted().version().clone()));
-      }
+      Ok(task) => match task.wait().await {
+        Ok(view) => {
+          stats.resources_written += 1;
+          last_resource = Some((name, view.accepted().version().clone()));
+        }
+        Err(error) => stats.failures.push(WorkloadFailure {
+          operation: "resource-put",
+          kind: format!("{:?}", error.kind()),
+        }),
+      },
       Err(error) => stats.failures.push(WorkloadFailure {
         operation: "resource-put",
         kind: format!("{:?}", error.kind()),
@@ -375,7 +384,14 @@ async fn soak_churn_then_baseline_return() {
       && let Some((previous, version)) = last_resource.take()
     {
       match issuer.handle.resources().delete(previous, version).await {
-        Ok(_) => {}
+        Ok(task) => {
+          if let Err(error) = task.wait().await {
+            stats.failures.push(WorkloadFailure {
+              operation: "resource-remove",
+              kind: format!("{:?}", error.kind()),
+            });
+          }
+        }
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "resource-remove",
           kind: format!("{:?}", error.kind()),
@@ -388,18 +404,25 @@ async fn soak_churn_then_baseline_return() {
     // every sixty-four ticks, rotate the admission credential.
     if tick.is_multiple_of(16) && std::env::var("RADIATA_SOAK_NO_CHURN").is_err() {
       let churned = &members[(tick as usize / 16) % members.len()];
-      match issuer.handle.disconnect(churned.id().clone()).await {
-        Ok(_) => {}
-        Err(error) => stats.failures.push(WorkloadFailure {
+      let disconnected = match issuer.handle.disconnect(churned.id().clone()).await {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      if let Err(error) = disconnected {
+        stats.failures.push(WorkloadFailure {
           operation: "disconnect",
           kind: format!("{:?}", error.kind()),
-        }),
+        });
       }
-      match issuer
+      let reconnected = match issuer
         .handle
         .connect(churned.endpoint().clone(), churned.id().clone())
         .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match reconnected {
         Ok(_) => stats.reconnects += 1,
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "reconnect",
@@ -429,11 +452,15 @@ async fn soak_churn_then_baseline_return() {
   for member in &members {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-      match issuer
+      let reconnected = match issuer
         .handle
         .connect(member.endpoint().clone(), member.id().clone())
         .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match reconnected {
         Ok(_) => break,
         Err(error) => {
           assert!(

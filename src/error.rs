@@ -209,6 +209,19 @@ impl Error {
     Self::internal("session table")
   }
 
+  /// The poisoned-lock mapper for the shared task table (the same
+  /// one-named-site-per-table rule as [`Error::session_table`]).
+  pub(crate) fn task_table<T>(_: T) -> Self {
+    Self::internal("task table")
+  }
+
+  /// Rebuilds an error from its stable parts. The task table stores the
+  /// terminal error as its kind-and-context projection; the typed wait
+  /// path reconstructs the caller-facing error through this one site.
+  pub(crate) const fn from_parts(kind: ErrorKind, context: &'static str) -> Self {
+    Self { kind, context }
+  }
+
   /// The poisoned-lock mapper for the shared extension registry.
   pub(crate) fn extension_registry<T>(_: T) -> Self {
     Self::internal("extension registry")

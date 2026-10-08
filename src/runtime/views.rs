@@ -132,7 +132,10 @@ impl Supervisor {
   ) -> Result<crate::ListenerPage> {
     let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
     let entries = self
+      .dependencies
       .listeners
+      .lock()
+      .map_err(|_| Error::internal("listener registry"))?
       .iter()
       .map(|(id, (endpoint, ..))| {
         (
@@ -254,7 +257,12 @@ impl Supervisor {
     crate::ObservabilitySnapshot::new(
       std::time::SystemTime::now(),
       sessions,
-      self.listeners.len(),
+      self
+        .dependencies
+        .listeners
+        .lock()
+        .map(|listeners| listeners.len())
+        .unwrap_or(0),
       background_tasks,
       queued_messages,
       queued_bytes,

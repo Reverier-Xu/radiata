@@ -871,6 +871,119 @@ impl TrustPage {
   }
 }
 
+/// One admitted operation's observation: the task's identity, kind, and
+/// phase, its attempt count, and its terminal error and payload.
+///
+/// The credential kinds' payloads carry the issued generation's expiry
+/// only: the secret itself is handed to the first
+/// [`Task::wait`](crate::Task::wait) caller and never enters this
+/// repeatedly readable surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskView {
+  id: crate::TaskId,
+  kind: crate::TaskKind,
+  phase: crate::TaskPhase,
+  attempts: u32,
+  created: std::time::SystemTime,
+  started: Option<std::time::SystemTime>,
+  finished: Option<std::time::SystemTime>,
+  error: Option<crate::TaskError>,
+  output: Option<crate::TaskOutput>,
+}
+
+impl TaskView {
+  /// The task's admission-ordered id.
+  pub const fn id(&self) -> &crate::TaskId {
+    &self.id
+  }
+
+  /// The admitted kind, including caller-registered extension kinds.
+  pub const fn kind(&self) -> &crate::TaskKind {
+    &self.kind
+  }
+
+  /// The current phase. `Succeeded` and `Failed` are terminal.
+  pub const fn phase(&self) -> crate::TaskPhase {
+    self.phase
+  }
+
+  /// The number of reconcile attempts spent (1 once running).
+  pub const fn attempts(&self) -> u32 {
+    self.attempts
+  }
+
+  /// The host wall clock at admission (observability only).
+  pub const fn created(&self) -> std::time::SystemTime {
+    self.created
+  }
+
+  /// The host wall clock at the first reconcile spawn, once one ran
+  /// (observability only).
+  pub const fn started(&self) -> Option<std::time::SystemTime> {
+    self.started
+  }
+
+  /// The host wall clock at the terminal transition, once one happened
+  /// (observability only).
+  pub const fn finished(&self) -> Option<std::time::SystemTime> {
+    self.finished
+  }
+
+  /// The typed terminal failure, when the task failed.
+  pub const fn error(&self) -> Option<crate::TaskError> {
+    self.error
+  }
+
+  /// The verb payload of a succeeded task. For the credential kinds this
+  /// is the issued generation's expiry observation only — see
+  /// [`TaskView`].
+  pub const fn output(&self) -> Option<&crate::TaskOutput> {
+    self.output.as_ref()
+  }
+
+  /// Snapshots one table entry's record and payload. The consumed-once
+  /// credential slot is deliberately not part of the input: no view can
+  /// carry the secret.
+  pub(crate) fn from_record(
+    id: crate::TaskId, kind: crate::TaskKind, record: &crate::task::TaskStatusRecord,
+    output: Option<crate::TaskOutput>,
+  ) -> Self {
+    Self {
+      id,
+      kind,
+      phase: record.phase,
+      attempts: record.attempts,
+      created: record.created,
+      started: record.started,
+      finished: record.finished,
+      error: record.error,
+      output,
+    }
+  }
+}
+
+/// One bounded page of task observations, in canonical id order
+/// (= admission order, newest last).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskPage {
+  items: Vec<TaskView>,
+  next: Option<crate::PageCursor>,
+}
+
+impl TaskPage {
+  pub fn items(&self) -> &[TaskView] {
+    &self.items
+  }
+
+  pub fn next(&self) -> Option<&crate::PageCursor> {
+    self.next.as_ref()
+  }
+
+  pub(crate) fn new(items: Vec<TaskView>, next: Option<crate::PageCursor>) -> Self {
+    Self { items, next }
+  }
+}
+
 /// The connection-degree maintenance state: whether the node's live
 /// authenticated session count has reached its target peer degree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -974,5 +1087,125 @@ impl RecoveryView {
       unreachable_members,
       next_attempt_at,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::{Duration, SystemTime};
+
+  use super::{TaskPage, TaskView};
+  use crate::{
+    CredentialIssued, TaskId, TaskKind, TaskOutput, TaskPhase,
+    task::{TaskError, TaskStatusRecord},
+  };
+
+  fn task_id(counter: u64) -> TaskId {
+    TaskId::compose(0, counter).expect("composition")
+  }
+
+  fn record(phase: TaskPhase) -> TaskStatusRecord {
+    TaskStatusRecord {
+      phase,
+      attempts: 2,
+      error: None,
+      created: SystemTime::UNIX_EPOCH,
+      started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+      finished: None,
+    }
+  }
+
+  #[test]
+  fn task_view_mirrors_the_record_it_snapshots() {
+    let id = task_id(1);
+    let node = crate::NodeId::parse("node-00000000000000000000a").expect("node id");
+    let view = TaskView::from_record(
+      id.clone(),
+      TaskKind::Connect,
+      &record(TaskPhase::Running),
+      Some(TaskOutput::Connect(node.clone())),
+    );
+    assert_eq!(view.id(), &id);
+    assert_eq!(view.kind(), &TaskKind::Connect);
+    assert_eq!(view.phase(), TaskPhase::Running);
+    assert_eq!(view.attempts(), 2);
+    assert_eq!(view.created(), SystemTime::UNIX_EPOCH);
+    assert_eq!(
+      view.started(),
+      Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+    );
+    assert_eq!(view.finished(), None);
+    assert_eq!(view.error(), None);
+    assert_eq!(view.output(), Some(&TaskOutput::Connect(node)));
+  }
+
+  #[test]
+  fn task_view_carries_the_terminal_error_and_finish_instant() {
+    let id = task_id(2);
+    let failed = TaskStatusRecord {
+      phase: TaskPhase::Failed,
+      attempts: 4,
+      error: Some(TaskError::from_error(crate::Error::not_found(
+        "peer binding",
+      ))),
+      created: SystemTime::UNIX_EPOCH,
+      started: Some(SystemTime::UNIX_EPOCH),
+      finished: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+    };
+    let view = TaskView::from_record(id, TaskKind::Connect, &failed, None);
+    assert_eq!(view.phase(), TaskPhase::Failed);
+    assert_eq!(view.attempts(), 4);
+    assert_eq!(
+      view.error().map(|error| error.kind()),
+      Some(crate::ErrorKind::NotFound)
+    );
+    assert_eq!(
+      view.finished(),
+      Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2))
+    );
+    assert_eq!(view.output(), None);
+  }
+
+  #[test]
+  fn task_view_observes_only_the_credential_expiry() {
+    let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+    let view = TaskView::from_record(
+      task_id(3),
+      TaskKind::IssueCredential,
+      &record(TaskPhase::Succeeded),
+      Some(TaskOutput::IssueCredential(CredentialIssued::new(
+        expires_at,
+      ))),
+    );
+    assert_eq!(
+      view.output(),
+      Some(&TaskOutput::IssueCredential(CredentialIssued::new(
+        expires_at
+      )))
+    );
+  }
+
+  #[test]
+  fn task_page_keeps_admission_order_and_the_cursor() {
+    let page = TaskPage::new(
+      vec![
+        TaskView::from_record(
+          task_id(1),
+          TaskKind::Join,
+          &record(TaskPhase::Succeeded),
+          None,
+        ),
+        TaskView::from_record(
+          task_id(2),
+          TaskKind::Leave,
+          &record(TaskPhase::Pending),
+          None,
+        ),
+      ],
+      None,
+    );
+    let ids: Vec<TaskId> = page.items().iter().map(|view| view.id().clone()).collect();
+    assert_eq!(ids, vec![task_id(1), task_id(2)]);
+    assert_eq!(page.next(), None);
   }
 }

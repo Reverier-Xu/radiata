@@ -511,15 +511,21 @@ async fn listen_all(handle: &NodeHandle, sockets: &Path, index: usize) -> Vec<En
       _ => Endpoint::parse(&format!("{scheme}://127.0.0.1:0")).expect("builtin endpoint"),
     };
     // A restart may race the previous runtime's listener teardown for
-    // the same unix path; the bind retries briefly and bounded.
+    // the same unix path; the bind retries briefly and bounded. The
+    // retry ladder covers both halves of the migrated listen: the
+    // admission and the bind effect's wait.
     let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
     let listener = loop {
-      match bounded(
+      let bound = match bounded(
         handle.listeners().create(requested.clone()),
         "listen {scheme}",
       )
       .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match bound {
         Ok(listener) => break listener,
         Err(_) if std::time::Instant::now() < deadline => {
           tokio::time::sleep(Duration::from_millis(50)).await;
@@ -610,7 +616,16 @@ async fn bounded<F: std::future::Future>(future: F, what: &str) -> F::Output {
 /// rotation or expiry, so receivers need no per-join rotation).
 async fn issue_credential(slot: &Slot) -> String {
   let issued = bounded(
-    slot.handle().credentials().issue(),
+    async {
+      slot
+        .handle()
+        .credentials()
+        .issue()
+        .await?
+        // The issued secret is once-only: the first wait collects it.
+        .wait()
+        .await
+    },
     "issue merge credential",
   )
   .await
@@ -627,7 +642,7 @@ async fn merge_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match bounded(
+    let joined = match bounded(
       joiner.handle().join(
         endpoint.clone(),
         MergeCredential::parse(secret).expect("valid credential"),
@@ -636,6 +651,10 @@ async fn merge_with_retry(
     )
     .await
     {
+      Ok(task) => bounded(task.wait(), "merge wait").await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -653,12 +672,16 @@ async fn connect_member_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match bounded(
+    let connected = match bounded(
       node.handle().connect(endpoint.clone(), peer.clone()),
       "member reconnect",
     )
     .await
     {
+      Ok(task) => bounded(task.wait(), "member reconnect wait").await,
+      Err(error) => Err(error),
+    };
+    match connected {
       Ok(authenticated) => return authenticated,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -1118,12 +1141,16 @@ async fn sixty_four_node_mixed_transport_chaos() {
   for (step, (from, to)) in kicks.into_iter().enumerate() {
     let what = format!("kick {step} ({from}->{to})");
     // Absence after a concurrent prune is benign; a real failure
-    // surfaces through the convergence check below.
-    let _ = bounded(
+    // surfaces through the convergence check below. The teardown task is
+    // awaited before the convergence check reads the session set.
+    if let Ok(task) = bounded(
       slots[from].handle().disconnect(ids[to].clone()),
       "disconnect peer",
     )
-    .await;
+    .await
+    {
+      let _ = bounded(task.wait(), "disconnect peer wait").await;
+    }
     wait_converged(&slots, NODES, &what).await;
   }
 
@@ -1155,9 +1182,15 @@ async fn sixty_four_node_mixed_transport_chaos() {
     // Leave: acknowledged replacement, old identity tombstoned, node
     // shuts down with the active-leave reason.
     let outcome = bounded(
-      slots[leaver]
-        .handle()
-        .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new()),
+      async {
+        slots[leaver]
+          .handle()
+          .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
+          .await
+          .unwrap()
+          .wait()
+          .await
+      },
       "leave cluster",
     )
     .await

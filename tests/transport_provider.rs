@@ -199,14 +199,31 @@ async fn transport_provider_carries_a_full_secure_merge() {
   let joiner = start_node(&hub, 20_000).await;
 
   let endpoint = Endpoint::parse(&format!("{HUB_SCHEME}://receiver")).unwrap();
-  let listener = receiver.listeners().create(endpoint.clone()).await.unwrap();
+  let listener = receiver
+    .listeners()
+    .create(endpoint.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert_eq!(listener.endpoint(), &endpoint);
 
-  let issued = receiver.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
 
   let merge = joiner
     .join(endpoint.clone(), MergeCredential::parse(&secret).unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let _ = listener;

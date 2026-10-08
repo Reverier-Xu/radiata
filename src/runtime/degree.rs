@@ -257,7 +257,7 @@ mod tests {
     let (revision_tx, _revision_rx) = watch::channel(0_u64);
     let (packet_tx, _packet_rx) = mpsc::channel(crate::runtime::PACKET_CHANNEL_CAPACITY);
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-    let dependencies = RuntimeDependencies {
+    let mut dependencies = RuntimeDependencies {
       storage_factory: factory,
       context: Some(context),
       keys: Some(keys),
@@ -272,9 +272,19 @@ mod tests {
       reconcile: None,
       sync_round_requests: round_tx,
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+      listeners: Default::default(),
+      task_manager: None,
+      operations: None,
       runtime_seed: None,
     };
-    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx, offer) {
+    // The operation handles are built the way `spawn_runtime` builds them,
+    // so the tick drives the exact production packet context and session
+    // driver instead of a stand-in.
+    let operations =
+      crate::runtime::supervisor::operation_deps(&dependencies, packet_tx.clone(), offer)
+        .expect("operation handles");
+    dependencies.operations = Some(operations);
+    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
       Ok(supervisor) => supervisor,
       Err(boxed) => panic!("supervisor construction failed: {}", boxed.0),
     };

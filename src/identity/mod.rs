@@ -18,5 +18,5 @@ mod value;
 
 pub use credential::{IssuedMergeCredential, MergeCredential};
 pub(crate) use id::validate_id;
-pub use id::{ListenerId, NodeId, OperationId, SessionId, TraceId, TransactionId};
+pub use id::{ListenerId, NodeId, OperationId, SessionId, TaskId, TraceId, TransactionId};
 pub use value::{Digest, PublicKey, Signature};

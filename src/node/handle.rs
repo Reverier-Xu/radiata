@@ -3,10 +3,10 @@ use std::sync::Arc;
 use crate::{
   Endpoint, Error, Event, EventOptions, EventSubscription, MergeCredential, NodeId,
   NodeMetadataPatch, NodeStatus, OutboundStream, ProtocolTag, PublicKey, Result, ShutdownOutcome,
-  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TraceId,
+  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, Task, TraceId,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
-  node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Topology, Trust},
+  node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Trust},
   packet::DeliveryAck,
   runtime::{Control, RuntimeClient},
   view::{
@@ -115,13 +115,13 @@ impl NodeHandle {
   /// The node's resource register: `get`, `list`, `select`, `put`,
   /// `put_expected`, and `delete` over the live winners.
   pub fn resources(&self) -> Resources {
-    Resources::new(&self.runtime)
+    Resources::new(&self.runtime, &self.extensions)
   }
 
   /// The node's bound listeners: `create` binds a new listener,
   /// `delete` unbinds one, `list` pages the live set.
   pub fn listeners(&self) -> Listeners {
-    Listeners::new(&self.runtime)
+    Listeners::new(&self.runtime, &self.extensions)
   }
 
   /// The live authenticated sessions: `list` pages the session set.
@@ -149,6 +149,13 @@ impl NodeHandle {
   /// bounded status.
   pub fn routes(&self) -> Routes {
     Routes::new(&self.runtime)
+  }
+
+  /// The node's admitted operation tasks: `get`, `list`, and `wait` over
+  /// the bounded live+terminal task table, and `submit` for
+  /// caller-registered extension kinds.
+  pub fn tasks(&self) -> Tasks {
+    Tasks::new(&self.runtime, &self.extensions, self)
   }
 
   // -- lifecycle ------------------------------------------------------
@@ -185,16 +192,23 @@ impl NodeHandle {
   /// Merges this node into the receiver's cluster by presenting the
   /// join credential: `receiver` is the receiver's listen endpoint and
   /// `credential` is the live credential the receiver issued
-  /// ([`NodeHandle::credentials`]). Returns the merged membership view.
-  pub async fn join(&self, receiver: Endpoint, credential: MergeCredential) -> Result<MergeView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::MergeCluster {
-        receiver,
-        credential,
-        reply,
-      })
-      .await
+  /// ([`NodeHandle::credentials`]). Returns the admitted [`Task`], whose
+  /// `wait` resolves with the merged membership view.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// an endpoint whose transport selector does not resolve); the dial,
+  /// the merge handshake, and the frozen-store refusal are effect-time
+  /// and surface on the task's `wait`.
+  pub async fn join(
+    &self, receiver: Endpoint, credential: MergeCredential,
+  ) -> Result<Task<MergeView>> {
+    crate::runtime::join(
+      &self.extensions,
+      self.runtime.admit()?,
+      receiver,
+      credential,
+    )
+    .await
   }
 
   /// Actively leaves the cluster: replaces the node's identity
@@ -202,26 +216,28 @@ impl NodeHandle {
   /// metadata and key through the journaled custody protocols, and shuts
   /// the node down with [`ShutdownReason::ActiveLeave`]. The explicit
   /// acknowledgement makes the identity replacement and metadata deletion
-  /// a deliberate caller decision.
+  /// a deliberate caller decision. Returns the admitted [`Task`], whose
+  /// `wait` resolves with the outcome; the active-leave shutdown starts
+  /// only after the task terminalizes, and the terminal publication
+  /// precedes the shutdown signal, so `wait` always observes the outcome
+  /// before any teardown begins.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node, a
+  /// missing acknowledgement marker, a second leave while one is in
+  /// flight); the frozen-store refusal and every journal/teardown failure
+  /// are effect-time and surface on the task's `wait`.
   ///
   /// The leave is journaled before any network effect, and once the
   /// journal commits there is no abort: a crash or a restart mid-leave
   /// resumes from the durable record and completes the replacement, so
   /// the node never boots as the former identity again. Treat this as
-  /// the point of no return for that node slot: the returned
-  /// [`LeaveOutcome`](crate::LeaveOutcome) names the exact former and
-  /// replacement identities, and the same storage restarted afterwards
-  /// boots the replacement.
+  /// the point of no return for that node slot: the outcome names the
+  /// exact former and replacement identities, and the same storage
+  /// restarted afterwards boots the replacement.
   pub async fn leave(
     &self, acknowledgement: ReplaceIdentityAndDeleteOldCoreMetadata,
-  ) -> Result<LeaveOutcome> {
-    self
-      .runtime
-      .send_command(move |reply| Control::LeaveCluster {
-        acknowledgement,
-        reply,
-      })
-      .await
+  ) -> Result<Task<LeaveOutcome>> {
+    crate::runtime::leave(self.runtime.admit()?, acknowledgement).await
   }
 
   /// Connects to an already-admitted peer using key trust only: no
@@ -237,44 +253,44 @@ impl NodeHandle {
   /// cadence. A contradicted or revoked binding, or any handshake
   /// failure, is [`crate::ErrorKind::AuthenticationFailed`] or
   /// [`crate::ErrorKind::Revoked`] and is never retryable.
-  pub async fn connect(&self, receiver: Endpoint, peer: NodeId) -> Result<NodeId> {
-    self
-      .runtime
-      .send_command(move |reply| Control::ConnectMember {
-        receiver,
-        peer,
-        reply,
-      })
-      .await
+  ///
+  /// Returns the admitted [`Task`], whose `wait` resolves with the
+  /// authenticated peer. Admission-time failures are the pure shape
+  /// checks (a stopped node, an endpoint whose transport selector does
+  /// not resolve); the dial and handshake failures are effect-time and
+  /// surface on the task's `wait`.
+  pub async fn connect(&self, receiver: Endpoint, peer: NodeId) -> Result<Task<NodeId>> {
+    crate::runtime::connect(&self.extensions, self.runtime.admit()?, receiver, peer).await
   }
 
   /// Closes the authenticated session to one peer: the session is torn
-  /// down now and the peer leaves the recovery plane until a later
-  /// session restores it. The peer's membership (binding and descriptor)
-  /// is untouched — to end a membership, use the leave flow instead.
-  pub async fn disconnect(&self, peer: NodeId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::DisconnectPeer { peer, reply })
-      .await
+  /// down by the admitted task and the peer leaves the recovery plane
+  /// until a later session restores it. The peer's membership (binding
+  /// and descriptor) is untouched — to end a membership, use the leave
+  /// flow instead.
+  ///
+  /// The verb's only failure is the admission-time shutdown gate; the
+  /// teardown itself is idempotent (a peer with no session is not an
+  /// error), so a `wait` on the task fails only with a store or session
+  /// table failure.
+  pub async fn disconnect(&self, peer: NodeId) -> Result<Task<()>> {
+    crate::runtime::disconnect(self.runtime.admit()?, peer).await
   }
 
   /// Updates the local node's own descriptor (owner-only node
   /// metadata): endpoint candidates and capability labels are applied at
   /// a strictly higher revision than `expected_revision`, and the updated
-  /// member view is returned. Same-revision or stale expectations
-  /// conflict.
+  /// member view is returned. Returns the admitted [`Task`], whose `wait`
+  /// resolves with the updated view.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the revision compare-and-swap (same-revision or stale
+  /// expectations conflict) and the frozen-store refusal are effect-time
+  /// and surface on the task's `wait`.
   pub async fn patch_metadata(
     &self, expected_revision: u64, patch: NodeMetadataPatch,
-  ) -> Result<MemberView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::UpdateNodeMetadata {
-        expected_revision,
-        patch,
-        reply,
-      })
-      .await
+  ) -> Result<Task<MemberView>> {
+    crate::runtime::patch_metadata(self.runtime.admit()?, expected_revision, patch).await
   }
 
   // -- identity, trust, and cleanup ------------------------------------
@@ -284,36 +300,41 @@ impl NodeHandle {
   /// closes the identity's sessions and rejects its new sessions, raw
   /// grants, and admissions — without deleting or reinterpreting any
   /// stored metadata. `expected_key` pins the exact trusted binding so a
-  /// stale or substituted revocation fails closed.
-  pub async fn revoke(&self, subject: NodeId, expected_key: PublicKey) -> Result<RevokeOutcome> {
-    self
-      .runtime
-      .send_command(move |reply| Control::RevokeNode {
-        subject,
-        expected_key,
-        reply,
-      })
-      .await
+  /// stale or substituted revocation fails closed. Returns the admitted
+  /// [`Task`], whose `wait` resolves with the outcome (already-revoked is
+  /// a success, not an error).
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal, the self-subject refusal, and the
+  /// expected-key pin are effect-time and surface on the task's `wait`.
+  pub async fn revoke(
+    &self, subject: NodeId, expected_key: PublicKey,
+  ) -> Result<Task<RevokeOutcome>> {
+    crate::runtime::revoke(self.runtime.admit()?, subject, expected_key).await
   }
 
   /// Explicitly clears the local revocation record for one subject.
-  /// Local-only and idempotent.
-  pub async fn purge_revocation(&self, subject: NodeId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::PurgeRevocation { subject, reply })
-      .await
+  /// Local-only and idempotent. Returns the admitted [`Task`], whose
+  /// `wait` resolves once the record is gone.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal is effect-time and surfaces on the
+  /// task's `wait`.
+  pub async fn purge_revocation(&self, subject: NodeId) -> Result<Task<()>> {
+    crate::runtime::purge_revocation(self.runtime.admit()?, subject).await
   }
 
   /// Issues a convergent issuer-signed cleanup tombstone for one
   /// decommissioned node. Terminal: there is no
   /// resurrection path. The caller is responsible for never cleaning a
-  /// node that is merely offline.
-  pub async fn cleanup(&self, subject: NodeId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::CleanupNode { subject, reply })
-      .await
+  /// node that is merely offline. Returns the admitted [`Task`], whose
+  /// `wait` resolves once the tombstone is persisted.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal and the self-subject refusal are
+  /// effect-time and surface on the task's `wait`.
+  pub async fn cleanup(&self, subject: NodeId) -> Result<Task<()>> {
+    crate::runtime::cleanup(self.runtime.admit()?, subject).await
   }
 
   /// Starts a new cleanup checkpoint GC epoch at the current wall
@@ -324,12 +345,14 @@ impl NodeHandle {
   /// self whose removal record is not terminal (left or cleaned) lacks a
   /// live authenticated session, because tombstones that member has not
   /// received yet could be collected by the new epoch. Re-issue once the
-  /// member is connected. Returns the persisted watermark.
-  pub async fn issue_cleanup_checkpoint(&self) -> Result<u64> {
-    self
-      .runtime
-      .send_command(|reply| Control::IssueCleanupCheckpoint { reply })
-      .await
+  /// member is connected. Returns the admitted [`Task`], whose `wait`
+  /// resolves with the persisted watermark.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal and the member-connectivity
+  /// precondition are effect-time and surface on the task's `wait`.
+  pub async fn issue_cleanup_checkpoint(&self) -> Result<Task<u64>> {
+    crate::runtime::issue_cleanup_checkpoint(self.runtime.admit()?).await
   }
 
   /// Resolves a metadata store frozen on a pending journal whose
@@ -356,26 +379,30 @@ impl NodeHandle {
   /// On a store that is not frozen on a resolvable pending journal — a
   /// ready store, an in-flight commit, or a freeze matching no durable
   /// journal record — the command fails typed without changing anything.
+  /// Returns the admitted [`Task`], whose `wait` resolves once the store
+  /// is unfrozen. The task is deliberately non-cancellable on shutdown:
+  /// the resolution is one atomic store transaction.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// a missing acknowledgement marker); the store's evidence verdict on
+  /// the declaration is effect-time and surfaces on the task's `wait`.
   pub async fn resolve_frozen_journal(
     &self, acknowledgement: DeclareInterruptedTransactionUncommitted,
-  ) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::ResolveFrozenJournal {
-        acknowledgement,
-        reply,
-      })
-      .await
+  ) -> Result<Task<()>> {
+    crate::runtime::resolve_frozen_journal(self.runtime.admit()?, acknowledgement).await
   }
 
   // -- maintenance and diagnostics -------------------------------------
 
-  /// Forces one bounded immediate recovery cycle and returns its view.
-  pub async fn start_recovery(&self) -> Result<RecoveryView> {
-    self
-      .runtime
-      .send_command(|reply| Control::StartRecovery { reply })
-      .await
+  /// Forces one bounded immediate recovery cycle and returns the
+  /// admitted [`Task`], whose `wait` resolves with the recovery view
+  /// (with its [`crate::RecoveryChanged`] event when the observation
+  /// moved).
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the cycle itself never fails the task.
+  pub async fn start_recovery(&self) -> Result<Task<RecoveryView>> {
+    crate::runtime::start_recovery(self.runtime.admit()?).await
   }
 
   /// The recovery plane's current observation: whether every known
@@ -418,11 +445,14 @@ impl NodeHandle {
   /// sweep cadence; this forces one idempotent pass on demand (tests,
   /// operations, a bounded drain of a large backlog). Anchoring itself
   /// is the owning state machine's decision and is not performed here.
-  pub async fn apply_receipt_retention(&self) -> Result<ReceiptRetentionReport> {
-    self
-      .runtime
-      .send_command(|reply| Control::ApplyReceiptRetention { reply })
-      .await
+  /// Returns the admitted [`Task`], whose `wait` resolves with the pass
+  /// report.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the frozen-store refusal is effect-time and surfaces on the
+  /// task's `wait`.
+  pub async fn apply_receipt_retention(&self) -> Result<Task<ReceiptRetentionReport>> {
+    crate::runtime::apply_receipt_retention(self.runtime.admit()?).await
   }
 
   /// Runs one full sync round now — the membership maintenance tick
@@ -431,12 +461,17 @@ impl NodeHandle {
   /// become deterministic: drive rounds, await each, then read the
   /// registers — no tick-cadence sleeps; the quiet ROOT rotation covers
   /// the alive set across consecutive rounds.
+  ///
+  /// Internally this is the submit-and-wait of one `SyncRound` task
+  /// whose effect forwards the round request to the sync driver (the
+  /// cursor owner): the round still executes in the driver, exactly
+  /// like the wall-clock tick, and the signature stays the awaited
+  /// completion callers already compose.
   pub fn sync(&self) -> impl Future<Output = Result<()>> + Send {
-    let runtime = self.runtime.clone();
+    let admission = self.runtime.admit().cloned();
     async move {
-      runtime
-        .send_command(|reply| Control::RunSyncRound { reply })
-        .await
+      let tasks = admission?;
+      crate::runtime::sync_round(&tasks).await?.wait().await
     }
   }
 

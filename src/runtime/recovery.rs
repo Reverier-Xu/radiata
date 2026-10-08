@@ -127,7 +127,13 @@ impl Supervisor {
   pub(super) fn maybe_prune_recovery_edges(
     &mut self, direct: &std::collections::BTreeSet<NodeId>,
   ) -> Result<()> {
-    if self.recovery.state() != crate::membership::recovery::RecoveryState::Connected {
+    let connected = match self.recovery.lock() {
+      Ok(controller) => controller.state() == crate::membership::recovery::RecoveryState::Connected,
+      // A poisoned lock only costs this tick's prune: the edge set
+      // stays as it is.
+      Err(_) => false,
+    };
+    if !connected {
       return Ok(());
     }
     self.prune_cooldown = self.prune_cooldown.saturating_sub(1);
@@ -176,15 +182,12 @@ impl Supervisor {
   /// has an authenticated path, how many members remain unreachable, and
   /// the next scheduled attempt.
   pub(super) fn recovery_view(&self) -> crate::RecoveryView {
-    let now = crate::time::now_seconds();
-    crate::RecoveryView::new(
-      self.recovery.state() == crate::membership::recovery::RecoveryState::Connected,
-      self.recovery.pending_count(),
-      self
-        .recovery
-        .next_attempt_seconds(now)
-        .map(crate::time::from_seconds),
-    )
+    match self.recovery.lock() {
+      Ok(controller) => recovery_view(&controller),
+      // A poisoned lock only costs the observation: the view reports
+      // the recovering fallback instead of failing the read.
+      Err(_) => crate::RecoveryView::new(false, 0, None),
+    }
   }
   /// One recovery observation tick: feed the controller the member-table
   /// set (the recovery universe) and the current direct sessions, prune
@@ -214,18 +217,7 @@ impl Supervisor {
   pub(super) async fn departed_exclusions(
     &self, store: &crate::storage::MetadataStore,
   ) -> Result<Departed> {
-    let revision = store.snapshot().await?.revision().clone();
-    if let Ok(guard) = self.exclusion_cache.lock()
-      && let Some((cached_revision, cached)) = guard.as_ref()
-      && cached_revision == &revision
-    {
-      return Ok(cached.clone());
-    }
-    let departed = Departed::compute(store).await?;
-    if let Ok(mut guard) = self.exclusion_cache.lock() {
-      *guard = Some((revision, departed.clone()));
-    }
-    Ok(departed)
+    departed_exclusions(&self.exclusion_cache, store).await
   }
 
   pub(super) async fn known_online_members(
@@ -303,17 +295,22 @@ impl Supervisor {
     let known_members = self.known_online_members(store).await?;
     let known: std::collections::BTreeSet<NodeId> = known_members.keys().cloned().collect();
     let now = crate::time::now_seconds();
-    self.recovery.observe(&known, &direct);
+    let dial_due = {
+      let mut controller = self
+        .recovery
+        .lock()
+        .map_err(|_| crate::Error::internal("recovery controller"))?;
+      controller.observe(&known, &direct);
+      controller.state() == crate::membership::recovery::RecoveryState::Recovering
+        && controller.due(now)
+    };
     self.maybe_prune_recovery_edges(&direct)?;
-    if self.recovery.state() != crate::membership::recovery::RecoveryState::Recovering
-      || !self.recovery.due(now)
-      || {
-        self
-          .recovery_pending
-          .load(std::sync::atomic::Ordering::Relaxed)
-          >= self.dependencies.config.recovery().fan_out().max(1)
-      }
-    {
+    if !dial_due || {
+      self
+        .recovery_pending
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= self.dependencies.config.recovery().fan_out().max(1)
+    } {
       return Ok(());
     }
     // The node is fully isolated: retry every table member it is not
@@ -325,14 +322,20 @@ impl Supervisor {
         candidates.insert((member.clone(), endpoint.clone()));
       }
     }
-    let step = self.recovery.next_step(
-      now,
-      &candidates
-        .iter()
-        .map(|(member, _)| member.clone())
-        .collect(),
-      self.dependencies.entropy.as_ref(),
-    );
+    let step = {
+      let mut controller = self
+        .recovery
+        .lock()
+        .map_err(|_| crate::Error::internal("recovery controller"))?;
+      controller.next_step(
+        now,
+        &candidates
+          .iter()
+          .map(|(member, _)| member.clone())
+          .collect(),
+        self.dependencies.entropy.as_ref(),
+      )
+    };
     for (member, endpoint) in candidates {
       if step.targets.contains(&member) {
         // Recovery dials run in a detached task so the supervisor select
@@ -399,4 +402,52 @@ impl Supervisor {
     }
     Ok(())
   }
+}
+
+/// The memoized departed-members exclusion set, keyed by the store
+/// revision it was computed at. Shared between the supervisor's own
+/// pages/ticks and the identity effects (the checkpoint guard), so the
+/// memo serves one truth per incarnation.
+pub(super) type ExclusionCache =
+  std::sync::Arc<std::sync::Mutex<Option<(crate::StoreRevision, Departed)>>>;
+
+/// The public recovery observation over one controller snapshot:
+/// whether every known online member has an authenticated path, how
+/// many members remain unreachable, and the next scheduled attempt.
+/// Shared by the supervisor's read and the start-recovery effect, so
+/// both report the one controller truth.
+pub(super) fn recovery_view(
+  controller: &crate::membership::recovery::RecoveryController,
+) -> crate::RecoveryView {
+  let now = crate::time::now_seconds();
+  crate::RecoveryView::new(
+    controller.state() == crate::membership::recovery::RecoveryState::Connected,
+    controller.pending_count(),
+    controller
+      .next_attempt_seconds(now)
+      .map(crate::time::from_seconds),
+  )
+}
+
+/// The departed-members exclusion state (cleaned + left), memoized per
+/// store revision in the shared cache: rescanning and decoding every
+/// accumulated tombstone on every two-second tick (and every member
+/// page) is unbounded work for an answer that only changes when a
+/// tombstone commit moves the revision. A poisoned cache only costs a
+/// recompute.
+pub(super) async fn departed_exclusions(
+  cache: &ExclusionCache, store: &crate::storage::MetadataStore,
+) -> Result<Departed> {
+  let revision = store.snapshot().await?.revision().clone();
+  if let Ok(guard) = cache.lock()
+    && let Some((cached_revision, cached)) = guard.as_ref()
+    && cached_revision == &revision
+  {
+    return Ok(cached.clone());
+  }
+  let departed = Departed::compute(store).await?;
+  if let Ok(mut guard) = cache.lock() {
+    *guard = Some((revision, departed.clone()));
+  }
+  Ok(departed)
 }

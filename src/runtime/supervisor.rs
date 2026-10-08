@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, sync::Arc};
 
 use tokio::{
   runtime::Handle,
@@ -6,10 +6,12 @@ use tokio::{
   task::{AbortHandle, JoinSet},
 };
 
-use super::anti_entropy::spawn_sync_driver;
+use super::{
+  anti_entropy::spawn_sync_driver,
+  task_manager::{TaskManagerHandle, spawn_task_manager},
+};
 use crate::{
-  Endpoint, Error, IssuedMergeCredential, MergeView, NodeConfig, NodeId, Result, ShutdownOutcome,
-  ShutdownReason,
+  Endpoint, Error, NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{
@@ -41,12 +43,23 @@ use super::degree::DEGREE_MAINTENANCE_TICK_PERIOD;
 /// `PACKET_CHANNEL_CAPACITY` derives from it so one bound governs both
 /// control ends.
 ///
-/// The bounded request channel for `RunSyncRound` commands: rounds are
-/// self-limiting (one page per session per round), so a small queue with
-/// typed backpressure matches the work.
+/// The bounded channel for immediate sync-round requests forwarded to
+/// the sync driver (the cursor owner; the `SyncRound` task effect holds
+/// a sender): rounds are self-limiting (one page per session per
+/// round), so a small queue with typed backpressure matches the work.
 pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
+
+/// One bound listener's supervisor-side entry: the published endpoint,
+/// the listener handle, and the abort handle of its accept loop.
+pub(crate) type ListenerEntry = (Endpoint, std::sync::Arc<dyn TransportListener>, AbortHandle);
+
+/// The node's bound listeners, shared by the supervisor's pages, the
+/// leave teardown, and the task manager's listen/stop effects: one
+/// registry, mutated under one lock.
+pub(crate) type ListenerRegistry =
+  Arc<std::sync::Mutex<BTreeMap<crate::identity::ListenerId, ListenerEntry>>>;
 
 struct LifecyclePublisher {
   state: watch::Sender<LifecycleSnapshot>,
@@ -114,6 +127,19 @@ pub(crate) struct RuntimeDependencies {
   /// consumer-drain tasks. Shutdown awaits them and the recovery tick
   /// reaps finished ones (bounded task accounting).
   pub(crate) connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+  /// The node's bound listeners: the supervisor's pages and leave teardown
+  /// read the same registry the task manager's listen/stop effects mutate.
+  pub(crate) listeners: ListenerRegistry,
+  /// The task manager's teardown handle: the shutdown path closes its
+  /// admission, broadcasts its cancel watch, and drains it before the
+  /// node's own task set is shut down.
+  pub(crate) task_manager: Option<TaskManagerHandle>,
+  /// The node-shared operation handles: the session driver, packet
+  /// context, shutdown signal, and the effect-side collaborators every
+  /// migrated mutating verb reads. Built here (one construction site)
+  /// and read by the supervisor, the verb effects, and every node
+  /// handle.
+  pub(crate) operations: Option<Arc<super::task_effects::OperationDeps>>,
   /// The 32-byte runtime seed drawn once at startup, before identity
   /// provisioning. Deliberately reserved and pinned by the lifecycle
   /// entropy-sequence test.
@@ -207,16 +233,43 @@ pub(crate) async fn spawn_runtime(
   let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
   let (ready_tx, ready_rx) = oneshot::channel();
   let (packet_tx, packet_rx) = packets;
-  let client = RuntimeClient::new(control_tx, state_rx, routes, packet_tx.clone());
+  // The node-shared operation handles are built here rather than inside
+  // the supervisor: the supervisor's own fields, the verb effects, and
+  // every node handle must read the same session driver (one credential
+  // issuer, one SPKI anchor table), the same packet context, and the same
+  // shutdown signal.
+  let operations = operation_deps(&dependencies, packet_tx.clone(), offer)?;
+  dependencies.operations = Some(Arc::clone(&operations));
+  // The task manager is spawned here, beside the supervisor and before the
+  // node is marked running: the client side rides the node handle (so an
+  // admitted task always has a live manager) and the teardown handle rides
+  // the runtime dependencies (so the shutdown path drains it in order).
+  let (leave_complete, leave_signals) = mpsc::channel(1);
+  let (task_client, task_manager) = spawn_task_manager(super::task_manager::TaskManagerDeps {
+    entropy: dependencies.entropy.clone(),
+    clock: Arc::new(crate::time::HostWallClock),
+    operations,
+    leave_complete,
+  })?;
+  dependencies.task_manager = Some(task_manager);
+  let client = RuntimeClient::new(
+    control_tx,
+    state_rx,
+    routes,
+    packet_tx.clone(),
+    Some(task_client),
+  );
 
   runtime.spawn(supervise(
     dependencies,
-    control_rx,
     (packet_tx, packet_rx),
     sync_rounds,
-    state_tx,
-    ready_tx,
-    offer,
+    RuntimeSignals {
+      control: control_rx,
+      leave_complete: leave_signals,
+      state: state_tx,
+      ready: ready_tx,
+    },
   ));
 
   ready_rx
@@ -225,16 +278,30 @@ pub(crate) async fn spawn_runtime(
   Ok(client)
 }
 
+/// The runtime's signal ends, grouped so the start-up call cannot
+/// transpose two same-typed channels.
+struct RuntimeSignals {
+  control: mpsc::Receiver<Control>,
+  /// The task manager's leave-completion signal (see `finish_shutdown`).
+  leave_complete: mpsc::Receiver<()>,
+  state: watch::Sender<LifecycleSnapshot>,
+  ready: oneshot::Sender<()>,
+}
+
 async fn supervise(
-  dependencies: RuntimeDependencies, mut control: mpsc::Receiver<Control>,
+  dependencies: RuntimeDependencies,
   packets: (
     mpsc::Sender<crate::packet::OutboundRequest>,
     mpsc::Receiver<crate::packet::OutboundRequest>,
   ),
-  sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
-  state: watch::Sender<LifecycleSnapshot>, ready: oneshot::Sender<()>,
-  offer: crate::protocol::offer::FeatureOffer,
+  sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>, signals: RuntimeSignals,
 ) {
+  let RuntimeSignals {
+    mut control,
+    mut leave_complete,
+    state,
+    ready,
+  } = signals;
   let (packet_tx, mut packet_rx) = packets;
   let mut tasks = JoinSet::<()>::new();
   let mut lifecycle = LifecyclePublisher::new(state);
@@ -253,7 +320,7 @@ async fn supervise(
     return;
   }
 
-  let mut supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds, offer) {
+  let mut supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds) {
     Ok(supervisor) => supervisor,
     Err(failure) => {
       // Unreachable today: the offer was built in spawn_runtime before
@@ -292,6 +359,12 @@ async fn supervise(
   recovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
   let mut maintenance_timer = tokio::time::interval(DEGREE_MAINTENANCE_TICK_PERIOD);
   maintenance_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+  // The leave effect's completion signal: once it lands, the caller has
+  // already observed the task's terminal outcome (the publication precedes
+  // the signal) and the node tears down with the active-leave reason. A
+  // closed channel means the manager (the sender's only owner) is gone, so
+  // the arm is disabled rather than polled again.
+  let mut leave_signals_open = true;
   loop {
     tokio::select! {
       message = control.recv() => {
@@ -312,40 +385,6 @@ async fn supervise(
         )
         .await;
         return;
-      }
-      Control::RotateMergeCredential { reply } => {
-        let result = supervisor.rotate_merge_credential();
-        let _ = reply.send(result);
-      }
-      Control::IssueMergeCredential { reply } => {
-        let result = supervisor.issue_merge_credential();
-        let _ = reply.send(result);
-      }
-      Control::Listen { endpoint, reply } => {
-        let result = supervisor.listen(endpoint, &mut tasks).await;
-        let _ = reply.send(result);
-      }
-      Control::StopListener { listener, reply } => {
-        let result = supervisor.stop_listener(&listener).await;
-        let _ = reply.send(result);
-      }
-      Control::MergeCluster {
-        receiver,
-        credential,
-        reply,
-      } => {
-        let result = supervisor
-          .merge_cluster(receiver, credential, &mut tasks)
-          .await;
-        let _ = reply.send(result);
-      }
-      Control::ConnectMember {
-        receiver,
-        peer,
-        reply,
-      } => {
-        let result = supervisor.connect_member(receiver, peer).await;
-        let _ = reply.send(result);
       }
       Control::GetLocalNode { reply } => {
         let result = supervisor.local_node().await;
@@ -399,110 +438,6 @@ async fn supervise(
         let result = supervisor.page_trust(cursor, limit).await;
         let _ = reply.send(result);
       }
-      Control::StartRecovery { reply } => {
-        let result = supervisor.start_recovery();
-        let _ = reply.send(result);
-      }
-      Control::DisconnectPeer { peer, reply } => {
-        let result = supervisor.disconnect_peer(&peer);
-        let _ = reply.send(result);
-      }
-      Control::UpdateNodeMetadata {
-        expected_revision,
-        patch,
-        reply,
-      } => {
-        let result = supervisor.update_node_metadata(expected_revision, patch).await;
-        let _ = reply.send(result);
-      }
-      Control::PutResource {
-        write,
-        expected,
-        reply,
-      } => {
-        let result = supervisor.put_resource(write, expected).await;
-        let _ = reply.send(result);
-      }
-      Control::RevokeNode {
-        subject,
-        expected_key,
-        reply,
-      } => {
-        let result = supervisor.revoke_node(subject, expected_key).await;
-        let _ = reply.send(result);
-      }
-      Control::CleanupNode { subject, reply } => {
-        let result = supervisor.cleanup_node(subject).await;
-        let _ = reply.send(result);
-      }
-      Control::PurgeRevocation { subject, reply } => {
-        let result = supervisor.purge_revocation(subject).await;
-        let _ = reply.send(result);
-      }
-      Control::IssueCleanupCheckpoint { reply } => {
-        let result = supervisor.issue_cleanup_checkpoint().await;
-        let _ = reply.send(result);
-      }
-      Control::ApplyReceiptRetention { reply } => {
-        let result = supervisor.apply_receipt_retention().await;
-        let _ = reply.send(result);
-      }
-      Control::RunSyncRound { reply } => {
-        // The round runs in the sync driver; waiting it out here would
-        // freeze this select loop for the round's whole duration, and the
-        // loop is the only drainer of the outbound packet channel the
-        // round dispatches through: a saturated round would then deadlock
-        // against its own dispatch queue. The wait is owned by a tracked
-        // task instead, so the loop keeps routing while the round runs and
-        // the caller still observes its completion.
-        let requests = supervisor.dependencies.sync_round_requests.clone();
-        tasks.spawn(async move {
-          let (round, round_rx) = tokio::sync::oneshot::channel();
-          let shut_down = Error::shutting_down("sync round");
-          let result = match requests.send(round).await {
-            Ok(()) => round_rx.await.map_err(|_| shut_down),
-            Err(_) => Err(shut_down),
-          };
-          let _ = reply.send(result);
-        });
-      }
-      Control::RemoveResource {
-        name,
-        expected,
-        reply,
-      } => {
-        let result = supervisor.remove_resource(name, expected).await;
-        let _ = reply.send(result);
-      }
-      Control::LeaveCluster {
-        acknowledgement,
-        reply,
-      } => {
-        match supervisor.leave_cluster(acknowledgement).await {
-          Ok(outcome) => {
-            handle_leave(
-              outcome,
-              reply,
-              supervisor.into_dependencies(),
-              control,
-              tasks,
-              &mut lifecycle,
-            )
-            .await;
-            return;
-          }
-          Err(error) => {
-            let _ = reply.send(Err(error));
-          }
-        }
-      }
-      Control::ResolveFrozenJournal {
-        acknowledgement,
-        reply,
-      } => {
-        let result = supervisor.resolve_frozen_journal(acknowledgement).await;
-        let _ = reply.send(result);
-      }
       Control::Observability { reply } => {
         let result = supervisor.observability_snapshot(&tasks).await;
         let _ = reply.send(result);
@@ -514,6 +449,25 @@ async fn supervise(
           continue;
         };
         let _ = supervisor.send_packet(request, &mut tasks).await;
+      }
+      signal = leave_complete.recv(), if leave_signals_open => {
+        match signal {
+          Some(()) => {
+            let (dependencies, drained) = supervisor.into_dependencies();
+            finish_shutdown(
+              control,
+              tasks,
+              dependencies,
+              drained,
+              &mut lifecycle,
+              None,
+              ShutdownReason::ActiveLeave,
+            )
+            .await;
+            return;
+          }
+          None => leave_signals_open = false,
+        }
       }
       _ = recovery_timer.tick() => {
         // A failed tick (store outage, tombstone scan failure) must stay
@@ -548,38 +502,29 @@ async fn supervise(
   .await;
 }
 
-/// The `LeaveCluster` shutdown sequence, hoisted out of the select arm so
-/// the arm stays symmetric with the observation arms: the leave outcome
-/// reaches the caller before teardown begins, then the runtime drains and
-/// shuts down with the active-leave reason. Consumes the control loop and
-/// task set, so `supervise` returns right after.
-async fn handle_leave(
-  outcome: crate::LeaveOutcome, reply: oneshot::Sender<Result<crate::LeaveOutcome>>,
-  (dependencies, drained): (RuntimeDependencies, Vec<tokio::task::JoinHandle<()>>),
-  control: mpsc::Receiver<Control>, tasks: JoinSet<()>, lifecycle: &mut LifecyclePublisher,
-) {
-  // The outcome reaches the caller before teardown begins; the node then
-  // shuts down with the active-leave reason.
-  let _ = reply.send(Ok(outcome));
-  finish_shutdown(
-    control,
-    tasks,
-    dependencies,
-    drained,
-    lifecycle,
-    None,
-    ShutdownReason::ActiveLeave,
-  )
-  .await;
-}
-
+/// The shutdown sequence shared by the explicit, fatal, and active-leave
+/// exits: the control channel closes, the task manager drains (the
+/// journaled kinds run to their terminal phase), the runtime's own task
+/// set tears down, and every queued shutdown reply answers with the one
+/// reason.
 async fn finish_shutdown(
-  mut control: mpsc::Receiver<Control>, mut tasks: JoinSet<()>, dependencies: RuntimeDependencies,
-  drained: Vec<tokio::task::JoinHandle<()>>, lifecycle: &mut LifecyclePublisher,
-  first_reply: Option<oneshot::Sender<ShutdownOutcome>>, reason: ShutdownReason,
+  mut control: mpsc::Receiver<Control>, mut tasks: JoinSet<()>,
+  mut dependencies: RuntimeDependencies, drained: Vec<tokio::task::JoinHandle<()>>,
+  lifecycle: &mut LifecyclePublisher, first_reply: Option<oneshot::Sender<ShutdownOutcome>>,
+  reason: ShutdownReason,
 ) {
   lifecycle.publish(LifecycleSnapshot::shutting_down());
   control.close();
+
+  // The task manager goes first: it stops admitting, releases every
+  // cancellable effect, and awaits the journaled kinds (leave,
+  // frozen-journal resolution) to their terminal phase. Only then does the
+  // node's own task set shut down — the effects still need the storage and
+  // session machinery this teardown releases.
+  if let Some(manager) = dependencies.task_manager.take() {
+    manager.begin_shutdown();
+    manager.drain().await;
+  }
 
   let mut queued_replies = Vec::with_capacity(CONTROL_CAPACITY);
   while let Ok(Control::Shutdown { reply }) = control.try_recv() {
@@ -610,11 +555,11 @@ pub(super) struct Supervisor {
   pub(super) driver: SessionDriver,
   pub(super) packet: Arc<SessionPacketContext>,
   pub(super) route_capacity: usize,
-  pub(super) listeners: BTreeMap<
-    crate::identity::ListenerId,
-    (Endpoint, std::sync::Arc<dyn TransportListener>, AbortHandle),
-  >,
-  pub(super) recovery: crate::membership::recovery::RecoveryController,
+  /// The recovery controller, shared with the start-recovery effect's
+  /// plane: one controller truth per incarnation, briefly locked (never
+  /// across an await) by this tick and the effect alike.
+  pub(super) recovery:
+    std::sync::Arc<std::sync::Mutex<crate::membership::recovery::RecoveryController>>,
   pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// In-flight connection-degree maintenance dials: bounds one tick's
   /// batch so a slow mesh never doubles its own dial load every cadence
@@ -622,7 +567,6 @@ pub(super) struct Supervisor {
   pub(super) maintenance_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// Recovery-tick cooldown before the next redundant-edge cut.
   pub(super) prune_cooldown: u32,
-  pub(super) published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>>,
   /// Memoized departed-members exclusion set, keyed by the store
   /// revision it was computed at: the set only changes when a leave or
   /// cleanup tombstone lands or gets GC'd, and every such change commits
@@ -630,17 +574,9 @@ pub(super) struct Supervisor {
   /// revision reuses the cached set instead of rescanning and decoding
   /// every accumulated tombstone; any other commit also invalidates,
   /// which merely recomputes once (commit-writes are rare metadata
-  /// events).
-  pub(super) exclusion_cache:
-    std::sync::Mutex<Option<(crate::StoreRevision, super::recovery::Departed)>>,
-  /// The highest resource-write stamp this writer has issued: a
-  /// writer's own successive writes must strictly outrank their
-  /// predecessor, so the issue clock advances at least one millisecond
-  /// per write and rides through wall-clock regressions (a
-  /// same-millisecond stamp would fall to the digest tie-break, and the
-  /// writer's own second write could lose to its first). Both the put
-  /// and the remove paths issue through [`Self::issue_resource_stamp`].
-  pub(super) resource_write_clock: std::sync::atomic::AtomicU64,
+  /// events). The cache is the one shared with the task effects' plane,
+  /// so the checkpoint guard memoizes with the same truth.
+  pub(super) exclusion_cache: super::recovery::ExclusionCache,
   // The anti-entropy driver task: aborted on shutdown so the node's
   // storage handle is released promptly (a restarted node reopening the
   // same factory must not race a lingering driver).
@@ -683,39 +619,77 @@ fn session_packet_context(
   ))
 }
 
+/// Builds the node-shared operation handles: the session driver (one
+/// credential issuer and one leaf-SPKI anchor table for the whole
+/// incarnation), the packet context, and the graceful-shutdown signal.
+/// Called once by `spawn_runtime`, and by the supervisor unit tests that
+/// build a standalone supervisor without the runtime's task manager.
+pub(super) fn operation_deps(
+  dependencies: &RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
+  offer: crate::protocol::offer::FeatureOffer,
+) -> Result<Arc<super::task_effects::OperationDeps>> {
+  let Some(context) = dependencies.context.clone() else {
+    return Err(Error::internal("runtime context"));
+  };
+  let policy = crate::session::stream::SessionPolicy::from_config(&dependencies.config);
+  let packet = Arc::new(session_packet_context(
+    &context,
+    dependencies,
+    packet_tx,
+    policy,
+  )?);
+  let (shutdown, _) = watch::channel(());
+  let driver = SessionDriver::new(
+    Arc::clone(&context),
+    context.keys().clone(),
+    dependencies.entropy.clone(),
+    Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
+    offer,
+    dependencies.config.authentication_deadline(),
+    dependencies.config.merge_admission(),
+  );
+  Ok(Arc::new(super::task_effects::OperationDeps::new(
+    dependencies,
+    driver,
+    packet,
+    shutdown,
+  )?))
+}
+
 impl Supervisor {
   /// Builds the supervisor; provisioning failures return the dependencies
   /// so the caller can still run a clean shutdown instead of panicking.
   pub(super) fn new(
     dependencies: RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
     sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
-    offer: crate::protocol::offer::FeatureOffer,
   ) -> std::result::Result<Self, Box<(Error, RuntimeDependencies)>> {
     let Some(context) = dependencies.context.clone() else {
       return Err(Box::new((Error::internal("runtime context"), dependencies)));
     };
-    let policy = crate::session::stream::SessionPolicy::from_config(&dependencies.config);
-    let packet = match session_packet_context(&context, &dependencies, packet_tx.clone(), policy) {
-      Ok(packet) => packet,
-      Err(error) => return Err(Box::new((error, dependencies))),
+    // The operation handles were built by `spawn_runtime` (one construction
+    // site for the driver, packet context, and shutdown signal this
+    // supervisor shares with every migrated verb effect).
+    let Some(operations) = dependencies.operations.clone() else {
+      return Err(Box::new((
+        Error::internal("runtime operations"),
+        dependencies,
+      )));
     };
-    let packet = Arc::new(packet);
+    let (packet, driver, shutdown_tx, exclusion_cache, published_endpoints) =
+      match operations.planes() {
+        Ok(planes) => (
+          Arc::clone(&planes.packet),
+          planes.driver.clone(),
+          planes.shutdown.clone(),
+          Arc::clone(&planes.exclusion_cache),
+          Arc::clone(&planes.published_endpoints),
+        ),
+        Err(error) => return Err(Box::new((error, dependencies))),
+      };
     let route_capacity = dependencies.config.trace_metadata_limits().active();
     let sync_context = Arc::clone(&context);
-    let driver_context = Arc::clone(&context);
-    let driver = SessionDriver::new(
-      driver_context,
-      context.keys().clone(),
-      dependencies.entropy.clone(),
-      Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
-      offer,
-      dependencies.config.authentication_deadline(),
-      dependencies.config.merge_admission(),
-    );
     // The membership sync protocol was registered by `spawn_runtime`
     // before the runtime was marked ready.
-    let (shutdown_tx, _) = watch::channel(());
-    let published_endpoints: Arc<std::sync::Mutex<Vec<Endpoint>>> = Arc::default();
     let sync_driver = Some(spawn_sync_driver(
       &sync_context,
       dependencies.entropy.clone(),
@@ -737,27 +711,26 @@ impl Supervisor {
       std::sync::Arc::new(crate::time::HostWallClock),
       std::sync::Arc::clone(&trace_records),
     );
-    let recovery = crate::membership::recovery::RecoveryController::new(
-      crate::membership::recovery::RecoveryPolicy::new(
-        dependencies.config.recovery().fan_out(),
-        dependencies.config.recovery().initial_backoff_seconds(),
-        dependencies.config.recovery().maximum_backoff_seconds(),
-      ),
-    );
+    let recovery = {
+      let Ok(planes) = operations.planes() else {
+        return Err(Box::new((
+          Error::internal("runtime operations"),
+          dependencies,
+        )));
+      };
+      std::sync::Arc::clone(&planes.recovery)
+    };
     Ok(Self {
       dependencies,
       shutdown_tx,
       driver,
       packet,
       route_capacity,
-      listeners: BTreeMap::new(),
       recovery,
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       prune_cooldown: 0,
-      published_endpoints,
-      exclusion_cache: std::sync::Mutex::new(None),
-      resource_write_clock: std::sync::atomic::AtomicU64::new(0),
+      exclusion_cache,
       sync_driver,
       trace_sink,
       trace_records,
@@ -793,206 +766,18 @@ impl Supervisor {
     (self.dependencies, aborted)
   }
 
-  fn rotate_merge_credential(&mut self) -> Result<IssuedMergeCredential> {
-    self.require_unblocked()?;
-    self
-      .driver
-      .issuer()
-      .lock()
-      .map_err(|_| Error::internal("join credential issuer"))?
-      .rotate(self.dependencies.entropy.as_ref(), SystemTime::now())
-  }
-
-  fn issue_merge_credential(&mut self) -> Result<IssuedMergeCredential> {
-    self.require_unblocked()?;
-    self
-      .driver
-      .issuer()
-      .lock()
-      .map_err(|_| Error::internal("join credential issuer"))?
-      .issue(self.dependencies.entropy.as_ref(), SystemTime::now())
-  }
-
-  async fn merge_cluster(
-    &mut self, receiver: Endpoint, credential: crate::identity::credential::MergeCredential,
-    tasks: &mut JoinSet<()>,
-  ) -> Result<MergeView> {
-    self.require_unblocked()?;
-    crate::audit::dial_started(&receiver.to_string(), false);
-    // The configured dial deadline bounds the connect so a peer that
-    // accepts and then goes silent cannot stall the supervisor's control
-    // loop (every command, tick, and keepalive shares that loop).
-    let transport = self
-      .dependencies
-      .extensions
-      .resolve_transport(&receiver.selector())?;
-    let mut connection = connect_with_deadline(
-      &transport,
-      receiver.clone(),
-      TransportTrust::for_dial(&receiver.selector(), None),
-      self.dependencies.config.dial_deadline(),
-    )
-    .await?;
-    let hint = connection
-      .merge_hint()
-      .cloned()
-      .ok_or_else(|| Error::authentication_failed("join hint"))?;
-    let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
-    let (session, view) = self.driver.merge(&mut connection, &hint, secret).await?;
-    // Remember the peer's leaf SPKI from the merge as the member-mode
-    // reconnect pinning anchor (hardening).
-    let peer = session.peer().clone();
-    crate::audit::dial_settled(peer.as_str(), false, true);
-    if !hint.leaf_spki().is_empty() {
-      self
-        .driver
-        .record_peer_spki(&peer, hint.leaf_spki().to_vec());
-    }
-    // Keep the merge session open so both sides can stream packets over
-    // it. The merge view returns only after the session table registers
-    // the entry, so the caller's first packet cannot race registration.
-    let sessions = self.dependencies.sessions.clone();
-    let packet = self.packet.clone();
-    let shutdown = self.shutdown_tx.subscribe();
-    keep_outbound_session(
-      connection,
-      session,
-      packet,
-      sessions,
-      shutdown,
-      receiver,
-      false,
-      |session_task| {
-        tasks.spawn(session_task);
-      },
-    )
-    .await?;
-    Ok(view)
-  }
-
-  /// Reconnects to an already-admitted peer with key trust only: the
-  /// member-mode handshake proves both identities over a fresh transcript
-  /// and exporter binding without consulting any join credential, then
-  /// keeps the session open for packet streams.
-  async fn connect_member(&mut self, receiver: Endpoint, peer: NodeId) -> Result<NodeId> {
-    self.require_unblocked()?;
-    let driver = self.driver.clone();
-    let sessions = self.dependencies.sessions.clone();
-    let packet = self.packet.clone();
-    let shutdown = self.shutdown_tx.subscribe();
-    let transport = self
-      .dependencies
-      .extensions
-      .resolve_transport(&receiver.selector())?;
-    dial_member(
-      transport,
-      driver,
-      sessions,
-      packet,
-      shutdown,
-      receiver,
-      &peer,
-      false,
-      self.dependencies.config.dial_deadline(),
-    )
-    .await
-  }
-
   /// Lazily publishes this node's own signed descriptor (revision 1) so
   /// the public views always expose the local identity, with the
-  /// published listener endpoints.
+  /// published listener endpoints. Delegates to the one shared
+  /// implementation the resource-write effects also use
+  /// ([`super::task_effects::ensure_self_descriptor`]).
   pub(super) async fn ensure_self_descriptor(&mut self) -> Result<()> {
-    let context = self.context()?;
-    let endpoints = self
-      .published_endpoints
-      .lock()
-      .map(|endpoints| endpoints.clone())
-      .unwrap_or_default();
-    crate::membership::sync::ensure_local_descriptor(
-      &context,
-      &self.dependencies.entropy,
-      endpoints,
-      &self.dependencies.events,
-      &self.dependencies.member_revision,
-    )
-    .await
-  }
-
-  /// Forces one bounded immediate recovery cycle and
-  /// returns the public recovery view.
-  fn start_recovery(&mut self) -> Result<crate::RecoveryView> {
-    let before = self.recovery_view();
-    self.recovery.immediate(crate::time::now_seconds());
-    let after = self.recovery_view();
-    if after != before {
-      self
-        .dependencies
-        .events
-        .emit(crate::RecoveryChanged::new(after.clone()));
-    }
-    Ok(after)
-  }
-
-  /// Closes the authenticated session to one peer and forgets it in the
-  /// recovery plane for now: the member keeps its binding and descriptor,
-  /// so any later session (inbound, healed, or a deliberate connect)
-  /// restores it to the recovery plane like any other member. Ending a
-  /// membership is the leave flow, not disconnecting a session.
-  fn disconnect_peer(&mut self, peer: &NodeId) -> Result<()> {
-    crate::session::stream::retire_session(&self.dependencies.sessions, peer)?;
-    self
+    let operations = self
       .dependencies
-      .events
-      .emit(crate::SessionChanged::new(peer.clone()));
-    // A disconnect only tears the session down: the peer stays a known
-    // member (its binding and descriptor are untouched), so a later
-    // session — inbound or healed — restores it to the recovery plane
-    // like any other member. Leaving the cluster is the way to end a
-    // membership, not disconnecting a session.
-    Ok(())
-  }
-
-  /// Applies one owner-only metadata patch to this node's own descriptor
-  /// (`UpdateNodeMetadata`): endpoint candidates and capability labels are
-  /// replaced at a strictly higher revision than `expected_revision`, and
-  /// the updated member view is returned (owner records).
-  async fn update_node_metadata(
-    &mut self, expected_revision: u64, patch: crate::NodeMetadataPatch,
-  ) -> Result<crate::MemberView> {
-    self.require_unblocked()?;
-    let context = self.context()?;
-    let local = context.identity().node().clone();
-    let store = context.store();
-    let current = crate::membership::store::read_descriptor_ctx(store, &local)
-      .await?
-      .ok_or_else(|| Error::not_ready("local descriptor"))?;
-    if current.revision() != expected_revision {
-      return Err(Error::conflict("node metadata revision"));
-    }
-    let updated = crate::membership::apply_metadata_patch(&current, patch)?;
-    crate::membership::store::store_descriptor_ctx(
-      store,
-      self.dependencies.entropy.as_ref(),
-      &updated,
-    )
-    .await?;
-    self
-      .dependencies
-      .events
-      .emit(crate::MemberChanged::new(local.clone()));
-    self.dependencies.member_revision.bump();
-    crate::membership::member_view(&updated, crate::ConnectivityStatus::Connected)
-  }
-
-  /// Forgets every anchored receipt past its retention deadline. The
-  /// recovery tick runs the same pass on every sweep cadence; the explicit
-  /// command remains the way to force an idempotent pass on demand. The
-  /// unknown-outcome freeze blocks the pass: a pending unknown may still
-  /// reference its receipt, and cleanup conflicts rather than guesses.
-  async fn apply_receipt_retention(&mut self) -> Result<crate::view::ReceiptRetentionReport> {
-    self.require_unblocked()?;
-    let context = self.context()?;
-    context.store().apply_receipt_retention().await
+      .operations
+      .as_ref()
+      .ok_or_else(|| Error::internal("runtime operations"))?;
+    super::task_effects::ensure_self_descriptor(operations).await
   }
 
   pub(super) fn context(&self) -> Result<Arc<LocalIdentityContext>> {
@@ -1002,26 +787,17 @@ impl Supervisor {
       .clone()
       .ok_or_else(|| Error::internal("runtime context"))
   }
-
-  /// Blocks admission-sensitive operations while the metadata store is
-  /// frozen on an indeterminate outcome: credential
-  /// reuse, rotation, signing, and new networking stay unavailable until
-  /// an authoritative reopen reconciles the exact transaction or proves
-  /// absence. Established authenticated sessions are unaffected.
-  pub(super) fn require_unblocked(&self) -> Result<()> {
-    self.context()?.require_unblocked()
-  }
 }
 
-/// Dials one transport connection under the configured dial deadline:
-/// the deadline bounds the whole connect (TCP dial, TLS handshake, and
+/// Dials one transport connection under the configured dial deadline: the
+/// deadline bounds the whole connect (TCP dial, TLS handshake, and
 /// WebSocket upgrade), so a peer that accepts and then goes silent
 /// cannot stall the supervisor's control loop or hold a recovery slot
 /// forever. An elapsed deadline maps onto the same coarse typed
 /// transport-connect failure as any other dial error; the connect
 /// future is cancelled, so the deadline and endpoint are the only real
 /// cause a diagnostic can carry.
-async fn connect_with_deadline(
+pub(super) async fn connect_with_deadline(
   transport: &Arc<dyn Transport>, receiver: Endpoint, trust: TransportTrust,
   deadline: std::time::Duration,
 ) -> Result<crate::transport::connection::Connection> {
@@ -1099,7 +875,7 @@ pub(super) async fn dial_member(
 /// after the session table registers the entry, so the caller's first
 /// packet cannot race registration.
 #[allow(clippy::too_many_arguments)]
-async fn keep_outbound_session(
+pub(super) async fn keep_outbound_session(
   connection: crate::transport::connection::Connection,
   session: crate::session::EstablishedSession, packet: Arc<SessionPacketContext>,
   sessions: SessionTable, shutdown: watch::Receiver<()>, attachment: Endpoint,
@@ -1140,10 +916,11 @@ mod dial_deadline_tests {
   /// A peer that accepts TCP and then goes silent must surface the typed
   /// dial failure within the configured deadline instead of hanging the
   /// dialer. This exercises the one helper every production dial path
-  /// shares (`merge_cluster`, `connect_member`, and the detached
-  /// recovery dials through `dial_member`); the regression it guards is
-  /// a connect with no bound at all, which stalled the supervisor's
-  /// control loop and pinned recovery slots forever.
+  /// shares (`reconcile_join`, and `reconcile_connect` plus the detached
+  /// recovery and connection-degree dials through `dial_member`); the
+  /// regression it guards is a connect with no bound at all, which
+  /// stalled the supervisor's control loop and pinned recovery slots
+  /// forever.
   #[tokio::test]
   async fn a_silent_peer_fails_the_dial_within_the_deadline() {
     // The listener accepts and then holds the socket without ever
@@ -1231,7 +1008,7 @@ mod receipt_retention_sweep_tests {
     let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
     let (revision_tx, _) = watch::channel(0_u64);
     let (packet_tx, _packet_rx) = mpsc::channel(super::PACKET_CHANNEL_CAPACITY);
-    let dependencies = RuntimeDependencies {
+    let mut dependencies = RuntimeDependencies {
       storage_factory: factory.clone(),
       context: Some(context.clone()),
       keys: Some(keys),
@@ -1246,11 +1023,18 @@ mod receipt_retention_sweep_tests {
       reconcile: None,
       sync_round_requests: round_tx,
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+      listeners: Default::default(),
+      task_manager: None,
+      operations: None,
       runtime_seed: None,
     };
-    // Supervisor::new builds the shared packet context itself, so the
-    // test drives the exact production construction path.
-    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx, offer) {
+    // The operation handles are built the way `spawn_runtime` builds them,
+    // so the test drives the exact production construction path for the
+    // packet context and the session driver too.
+    let operations =
+      super::operation_deps(&dependencies, packet_tx.clone(), offer).expect("operation handles");
+    dependencies.operations = Some(operations);
+    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
       Ok(supervisor) => supervisor,
       Err(boxed) => panic!("supervisor construction failed: {}", boxed.0),
     };
@@ -1298,7 +1082,13 @@ mod receipt_retention_sweep_tests {
 
     // The explicit command keeps working: over an empty anchor set it is
     // an idempotent no-op.
-    let report = supervisor.apply_receipt_retention().await.unwrap();
+    let report = supervisor
+      .context()
+      .unwrap()
+      .store()
+      .apply_receipt_retention()
+      .await
+      .unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining);
 
@@ -1316,7 +1106,13 @@ mod receipt_retention_sweep_tests {
     tokio::time::sleep(retention + Duration::from_millis(250)).await;
 
     // The manual command forgets the elapsed receipt exactly once.
-    let report = supervisor.apply_receipt_retention().await.unwrap();
+    let report = supervisor
+      .context()
+      .unwrap()
+      .store()
+      .apply_receipt_retention()
+      .await
+      .unwrap();
     assert_eq!(report.forgotten, 1);
     assert!(!report.remaining);
     // A forgotten receipt never grows a second anchor.
@@ -1356,7 +1152,13 @@ mod receipt_retention_sweep_tests {
     );
 
     // The explicit command stays available and idempotent afterwards.
-    let report = supervisor.apply_receipt_retention().await.unwrap();
+    let report = supervisor
+      .context()
+      .unwrap()
+      .store()
+      .apply_receipt_retention()
+      .await
+      .unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining);
   }

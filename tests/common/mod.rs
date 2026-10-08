@@ -39,18 +39,34 @@ pub const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/pending-tran
 /// would invalidate the in-flight accept's hint forever (rotate once,
 /// retry with the same secret). Merge-sensitive operations
 /// transiently refuse while concurrent metadata commits hold the store.
+///
+/// The retry ladder covers both halves of the migrated join: the
+/// admission (a stopping node refuses admission typed) and the effect
+/// (the dial and merge handshake, observed through the task's `wait`).
 pub async fn merge_with_retry(
   node: &radiata::NodeHandle, issuer: &radiata::NodeHandle, endpoint: radiata::Endpoint,
 ) {
   use radiata::MergeCredential;
-  let issued = issuer.credentials().rotate().await.unwrap();
+  let issued = issuer
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    // The rotated secret is once-only: the first wait collects it.
+    .wait()
+    .await
+    .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut attempts = 0_u32;
   loop {
     attempts += 1;
     let credential = MergeCredential::parse(&secret).unwrap();
-    match node.join(endpoint.clone(), credential).await {
+    let joined = match node.join(endpoint.clone(), credential).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(_) => return,
       Err(error) => {
         assert!(
@@ -69,12 +85,20 @@ pub async fn merge_with_retry(
 /// single-store in-flight-commit rule). Retries with a bound, matching
 /// the merge harness precedent. `write` rebuilds the write intent for
 /// each attempt (put futures are single-use values).
+///
+/// The retry ladder covers both halves of the migrated write: the
+/// admission (a stopping node refuses admission typed) and the effect
+/// (the store race, observed through the task's `wait`).
 pub async fn put_resource_with_retry(
   node: &radiata::NodeHandle, mut write: impl FnMut() -> radiata::ResourceWrite,
 ) {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match node.resources().put(write()).await {
+    let committed = match node.resources().put(write()).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match committed {
       Ok(_) => return,
       Err(error) => {
         assert!(

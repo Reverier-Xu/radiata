@@ -684,13 +684,30 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // External provider SPI is honored through a second node.
   let member_factory: Arc<dyn StorageFactory> = Arc::new(PubStoreFactory);
   let member = start(member_factory, keys).await;
-  let issued: IssuedMergeCredential = issuer.handle.credentials().rotate().await.unwrap();
+  let issued: IssuedMergeCredential = issuer
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let expires = issued.expires_at();
   let _ = expires;
 
   // Non-rotating issue hands out the same live generation: concurrent
-  // joins share it, and only rotate replaces the credential.
-  let reissued: IssuedMergeCredential = issuer.handle.credentials().issue().await.unwrap();
+  // joins share it, and only rotate replaces the credential. Each
+  // issued secret is once-only, collected by exactly the first wait.
+  let reissued: IssuedMergeCredential = issuer
+    .handle
+    .credentials()
+    .issue()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert_eq!(
     reissued.credential().expose_secret(),
     issued.credential().expose_secret()
@@ -806,7 +823,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       LabelValue::parse("pub-api").unwrap(),
     )
     .unwrap();
-  let updated: MemberView = issuer.handle.patch_metadata(revision, patch).await.unwrap();
+  let updated: MemberView = issuer
+    .handle
+    .patch_metadata(revision, patch)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert_eq!(updated.owner_revision(), revision + 1);
   let patch2 = NodeMetadataPatch::new()
     .remove_capability(LabelKey::parse("example.org/labels/lane").unwrap())
@@ -815,6 +839,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let _updated2: MemberView = issuer
     .handle
     .patch_metadata(revision2, patch2)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -835,7 +862,15 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     )
     .unwrap(),
   );
-  let mutation: ResourceMutationView = issuer.handle.resources().put(write).await.unwrap();
+  let mutation: ResourceMutationView = issuer
+    .handle
+    .resources()
+    .put(write)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert!(mutation.is_current_winner());
   let accepted = mutation.accepted();
   let version: &ResourceVersion = accepted.version();
@@ -865,6 +900,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .handle
     .resources()
     .put_expected(conditional, version.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert!(mutation.is_current_winner());
@@ -935,23 +973,40 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let member_endpoint = member_listener.endpoint().clone();
   let _connected: NodeId = issuer
     .handle
     .connect(member_endpoint.clone(), member_id.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
-  let _disconnected: () = issuer.handle.disconnect(member_id.clone()).await.unwrap();
+  let _disconnected: () = issuer
+    .handle
+    .disconnect(member_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   // A deliberately disconnected peer is reconnected deliberately: recovery
   // never dials it on its own.
   let reconnect_deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer
+    let reconnected = match issuer
       .handle
       .connect(member_endpoint.clone(), member_id.clone())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match reconnected {
       Ok(_reconnected) => break,
       Err(_) if std::time::Instant::now() < reconnect_deadline => {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -959,7 +1014,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       Err(error) => panic!("reconnect never succeeded: {error:?}"),
     }
   }
-  let recovery: RecoveryView = issuer.handle.start_recovery().await.unwrap();
+  let recovery: RecoveryView = issuer
+    .handle
+    .start_recovery()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let _ = (
     recovery.is_connected(),
     recovery.unreachable_members(),
@@ -1007,7 +1069,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   }
 
   // Recovery, connection degree, observability.
-  let recovery: RecoveryView = issuer.handle.start_recovery().await.unwrap();
+  let recovery: RecoveryView = issuer
+    .handle
+    .start_recovery()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let _ = (
     recovery.is_connected(),
     recovery.unreachable_members(),
@@ -1050,7 +1119,15 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   .await;
 
   // Listener stop verb.
-  let _stopped: () = issuer.handle.listeners().delete(listener_id).await.unwrap();
+  let _stopped: () = issuer
+    .handle
+    .listeners()
+    .delete(listener_id)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
 
   // Resource removal with the exact observed version: re-observe
   // immediately before the removal so the precondition is never stale.
@@ -1071,6 +1148,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
       expected,
     )
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   assert!(removal.accepted().version().is_removal());
 
@@ -1079,11 +1159,18 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // conflict retries with a bound (the harness precedent).
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   let outcome: LeaveOutcome = loop {
-    match issuer
+    // The ladder covers both halves of the migrated leave: the
+    // admission (a leave already in flight conflicts) and the effect
+    // (a store race refuses typed and is re-admitted).
+    let left = match issuer
       .handle
       .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match left {
       Ok(outcome) => break outcome,
       Err(error) if error.kind() == radiata::ErrorKind::Conflict => {
         assert!(
@@ -1100,7 +1187,14 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   // The explicit receipt-retention pass drives over the member's real
   // store: the node's own receipts are not anchored, so the pass
   // forgets nothing. (The issuer has left and is already shut down.)
-  let retention: ReceiptRetentionReport = member.handle.apply_receipt_retention().await.unwrap();
+  let retention: ReceiptRetentionReport = member
+    .handle
+    .apply_receipt_retention()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   assert_eq!(retention.forgotten, 0);
   assert!(!retention.remaining);
 
@@ -1110,6 +1204,9 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
   let frozen_rejection = member
     .handle
     .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(frozen_rejection.kind(), radiata::ErrorKind::Conflict);
@@ -1273,6 +1370,9 @@ async fn listen(node: &Node) -> Endpoint {
     .listeners()
     .create(node.endpoint.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   listener.endpoint().clone()
 }
@@ -1280,10 +1380,14 @@ async fn listen(node: &Node) -> Endpoint {
 async fn merge_with_retry(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> MergeView {
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   loop {
-    match node
+    let joined = match node
       .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         // Pace the retries outside the fixed per-source merge window

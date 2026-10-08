@@ -90,7 +90,12 @@ fn keys_at(seed: u64) -> Arc<ScriptedKeys> {
 async fn merge(
   node: &Node, endpoint: &Endpoint, credential: MergeCredential,
 ) -> radiata::Result<radiata::MergeView> {
-  node.handle.join(endpoint.clone(), credential).await
+  node
+    .handle
+    .join(endpoint.clone(), credential)
+    .await?
+    .wait()
+    .await
 }
 
 /// Issues one merge credential with bounded retries: merge-sensitive
@@ -99,7 +104,14 @@ async fn merge(
 async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
   loop {
-    match issuer.handle.credentials().rotate().await {
+    // The retry ladder covers both halves of the migrated rotation: the
+    // admission (a stopping node refuses admission typed) and the effect
+    // (the store race, observed through the once-only secret's wait).
+    let rotated = match issuer.handle.credentials().rotate().await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match rotated {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -134,6 +146,9 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
 
   // Pin an indeterminate outcome to the merge commit: the number of setup
@@ -152,12 +167,21 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   // and new listening are blocked with NotReady, and a merge attempt is
   // refused before any credential validation or signing work.
   let _signing_calls_after_freeze = receiver.keys.take_calls();
-  let rotation = receiver.handle.credentials().rotate().await.unwrap_err();
+  let rotation = match receiver.handle.credentials().rotate().await {
+    Ok(task) => task.wait().await,
+    Err(error) => Err(error),
+  }
+  .unwrap_err();
   assert_eq!(rotation.kind(), ErrorKind::NotReady);
   let listen = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    // The frozen-store gate is effect-time now: the typed NotReady
+    // surfaces on the admitted task's wait.
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(listen.kind(), ErrorKind::NotReady);
@@ -166,10 +190,14 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   // before the credential is verified or any identity signature is made.
   let gate_credential =
     MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-  let merge_result = fresh_joiner
+  let merge_result = match fresh_joiner
     .handle
     .join(listener.endpoint().clone(), gate_credential)
-    .await;
+    .await
+  {
+    Ok(task) => task.wait().await,
+    Err(error) => Err(error),
+  };
   assert!(
     merge_result.is_err(),
     "frozen receiver must refuse the merge at the responder gate"
@@ -192,6 +220,9 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let (later, _) = fresh_node(4_000).await;
@@ -225,6 +256,9 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
 
   // Typed rejection on a healthy store: nothing is frozen, so the
@@ -232,6 +266,9 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
   let healthy = receiver
     .handle
     .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(healthy.kind(), ErrorKind::Conflict);
@@ -251,7 +288,11 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
     "the faulted merge unexpectedly succeeded: {merge_outcome:?}"
   );
   joiner.handle.shutdown().await.unwrap();
-  let blocked = receiver.handle.credentials().rotate().await.unwrap_err();
+  let blocked = match receiver.handle.credentials().rotate().await {
+    Ok(task) => task.wait().await,
+    Err(error) => Err(error),
+  }
+  .unwrap_err();
   assert_eq!(blocked.kind(), ErrorKind::NotReady);
 
   // Make the contradiction permanent: the adoption receipt disappears,
@@ -264,6 +305,9 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
   receiver
     .handle
     .resolve_frozen_journal(DeclareInterruptedTransactionUncommitted::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   rotate_with_retry(&receiver).await;
@@ -293,6 +337,9 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -325,6 +372,9 @@ async fn admission_runtime_definite_abort_unblocks_and_allows_later_merge() {
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let (later, _) = fresh_node(3_100).await;
@@ -369,6 +419,9 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   // Let the sync driver's startup descriptor ensure land unwrapped:
@@ -417,6 +470,9 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   tokio::time::sleep(std::time::Duration::from_secs(1)).await;

@@ -142,6 +142,9 @@ async fn listen(node: &Node) -> Endpoint {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   listener.endpoint().clone()
 }
@@ -306,9 +309,13 @@ async fn close_star_sessions(nodes: &[Node], issuer: usize) {
       // Disconnect the issuer side first: removing the peer from the
       // issuer's recovery history before the connection close propagates
       // prevents the recovery controller from re-dialing it.
-      let _ = nodes[issuer].handle.disconnect(peer.clone()).await;
-      if let Some(member) = nodes.iter().find(|node| node.id == peer) {
-        let _ = member.handle.disconnect(nodes[issuer].id.clone()).await;
+      if let Ok(task) = nodes[issuer].handle.disconnect(peer.clone()).await {
+        let _ = task.wait().await;
+      }
+      if let Some(member) = nodes.iter().find(|node| node.id == peer)
+        && let Ok(task) = member.handle.disconnect(nodes[issuer].id.clone()).await
+      {
+        let _ = task.wait().await;
       }
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -578,7 +585,13 @@ async fn connect_cq4(nodes: &[Node]) {
 async fn rotate_with_retry(issuer: &Node) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer.handle.credentials().rotate().await {
+    // The ladder covers both halves of the migrated rotation: the
+    // admission and the once-only secret's wait.
+    let rotated = match issuer.handle.credentials().rotate().await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match rotated {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -612,7 +625,11 @@ async fn merge_with_retry(node: &Node, endpoint: Endpoint, secret: &str) {
   loop {
     attempts = attempts.wrapping_add(1);
     let credential = radiata::MergeCredential::parse(secret).unwrap();
-    match node.handle.join(endpoint.clone(), credential).await {
+    let joined = match node.handle.join(endpoint.clone(), credential).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(_) => return,
       Err(error) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -634,7 +651,11 @@ async fn connect_with_retry(node: &Node, endpoint: Endpoint, peer: radiata::Node
   let mut attempts = 0;
   loop {
     attempts += 1;
-    match node.handle.connect(endpoint.clone(), peer.clone()).await {
+    let connected = match node.handle.connect(endpoint.clone(), peer.clone()).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match connected {
       Ok(_) => return,
       Err(error) if std::time::Instant::now() < deadline => {
         eprintln!("dial {} -> {} attempt {attempts}: {error:?}", node.id, peer);
@@ -803,6 +824,9 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
     .rotate()
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .into_credential()
     .expose_secret()
     .to_owned();
@@ -897,13 +921,16 @@ async fn membership_sync_failure_matrix_partition_healing() {
   // Duplicate delivery: a second connect to the same peer converges to one
   // authenticated session (no duplicate edge).
   let edge = (0_u8, 1_u8);
-  let _ = nodes[edge.0 as usize]
+  if let Ok(task) = nodes[edge.0 as usize]
     .handle
     .connect(
       nodes[edge.1 as usize].endpoint.clone(),
       nodes[edge.1 as usize].id.clone(),
     )
-    .await;
+    .await
+  {
+    let _ = task.wait().await;
+  }
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   loop {
     let edges = collected_topology(&nodes).await;
@@ -931,11 +958,20 @@ async fn membership_sync_failure_matrix_partition_healing() {
   // WITHOUT re-dialing the lost edge (a connected node never expands its
   // topology), and the data plane's routed relay covers the missing edge
   // for node pairs whose direct session is gone.
-  let _ = nodes[1].handle.disconnect(nodes[0].id.clone()).await;
+  if let Ok(task) = nodes[1].handle.disconnect(nodes[0].id.clone()).await {
+    let _ = task.wait().await;
+  }
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let mut connected = false;
   while std::time::Instant::now() < deadline {
-    let view = nodes[1].handle.start_recovery().await.unwrap();
+    let view = nodes[1]
+      .handle
+      .start_recovery()
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
     if view.is_connected() {
       connected = true;
       break;
@@ -1070,7 +1106,14 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
       radiata::LabelValue::parse("slo").unwrap(),
     )
     .unwrap();
-  nodes[15].handle.patch_metadata(1, patch).await.unwrap();
+  nodes[15]
+    .handle
+    .patch_metadata(1, patch)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
 
   // Convergence: every member observes the bumped descriptor at revision 2.
   let target = nodes[15].id.clone();

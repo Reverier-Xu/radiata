@@ -31,6 +31,7 @@ mod runtime;
 mod session;
 mod storage;
 mod sync_common;
+mod task;
 mod time;
 mod transport;
 mod view;
@@ -58,16 +59,16 @@ pub use error::{Error, ErrorKind, ProviderErrorContext, ProviderErrorKind, Resul
 pub use extension_registry::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
 pub use identity::{
   Digest, IssuedMergeCredential, ListenerId, MergeCredential, NodeId, OperationId, PublicKey,
-  SessionId, Signature, TraceId, TransactionId,
+  SessionId, Signature, TaskId, TraceId, TransactionId,
 };
 pub use label::{LabelKey, LabelSet, LabelValue};
 pub use node::{
   Credentials, EventOptions, EventReceive, EventSubscription, Listeners, MemberRevision, Members,
-  NodeBuilder, NodeHandle, Resources, Routes, Sessions, Topology, Trust,
+  NodeBuilder, NodeHandle, Resources, Routes, Sessions, Tasks, Topology, Trust,
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
-  ResourceWrite, RouteChanged, SessionChanged,
+  ResourceWrite, RouteChanged, SessionChanged, TaskChanged,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
@@ -87,6 +88,10 @@ pub use routing::{
   CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteContext,
   RouteNextHop, Selector,
 };
+pub use task::{
+  ActionHook, CredentialIssued, CustomTaskSpec, ReconcileContext, ReconcileDecision, ResourceHook,
+  Task, TaskError, TaskKind, TaskOutput, TaskPhase, TaskReconciler, TaskStatus, TaskTransition,
+};
 pub use transport::{
   Endpoint, PageCursor, ProviderListener, TransportName, TransportProvider, TransportScheme,
   TransportSelector, TransportStream,
@@ -98,7 +103,7 @@ pub use view::{
   ObservabilitySnapshot, PageSpec, ReceiptRetentionReport, RecoveryView,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceMutationView, ResourcePage, ResourceView,
   RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome, ShutdownReason,
-  TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
+  TaskPage, TaskView, TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
 };
 
 pub mod extension {

@@ -77,6 +77,10 @@ async fn main() -> Result<()> {
         // segments with devices that cannot run TLS 1.3.
         .listeners()
         .create(Endpoint::parse("tls://node1.example.net:9443")?)
+        .await?
+        // Admission is fast; `wait` drives the bind to its terminal
+        // phase and resolves with the listener view.
+        .wait()
         .await?;
     Ok(())
 }
@@ -86,7 +90,10 @@ The deployment-facing surface is deliberately small: **join** (one credential-au
 **send** (packets over the routed data plane), and **leave** (terminal departure with identity
 replacement). Routing, recovery, and convergence are the library's responsibility; your code
 registers extensions before the node starts and drives the resource accessors and
-operation verbs through the `NodeHandle` afterward.
+operation verbs through the `NodeHandle` afterward. Every mutating verb admits fast and returns a
+`Task<T>`: `task.wait().await` resolves with the verb's historical result, and `node.tasks()` (plus
+the `TaskChanged` event) observes the node's admitted operations (see the `radiata::guide` chapter
+[operations are tasks](#documentation)).
 
 ### Custom transports
 
@@ -102,6 +109,8 @@ let node = NodeBuilder::new(storage).extensions(extensions).start().await?;
 node
     .listeners()
     .create(Endpoint::parse("espnow://aa:bb:cc:dd:ee:ff")?)
+    .await?
+    .wait()
     .await?;
 ```
 
@@ -130,8 +139,9 @@ guarantees:
 ## Documentation
 
 - **Integration guide** — `radiata::guide` in the rustdoc: resource-version round trips across
-  process boundaries, the any-one-route contract, and step-by-step wiring for the three extension
-  points, each with compiling examples.
+  process boundaries, the any-one-route contract, operations-as-tasks (`wait`/`tasks()`/
+  `TaskChanged`), and step-by-step wiring for the three extension points, each with compiling
+  examples.
 - **API reference** — `cargo doc --open`. The code and its comments are the single source of
   truth; module-level rustdoc carries the architecture and design constraints.
 

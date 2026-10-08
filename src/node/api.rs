@@ -8,10 +8,13 @@
 //! accessor and returns an owned future, so a write intent built now
 //! can be held and driven later exactly like any other value.
 
+use std::sync::Arc;
+
 use crate::{
   Endpoint, IssuedMergeCredential, ListenerId, NodeId, PageSpec, Result, RouteHandle,
-  RouteStatusView, Selector,
-  runtime::{Control, RuntimeClient},
+  RouteStatusView, Selector, Task, TaskKind, TaskOutput,
+  extension_registry::ExtensionRegistry,
+  runtime::{Control, EffectOutcome, RuntimeClient, TaskClient, TaskEffect, TaskPayload, TaskSpec},
   view::{ListenerPage, ListenerView, MemberPage, MemberView, ResourcePage, ResourceView},
 };
 
@@ -53,12 +56,19 @@ impl Members {
 /// The node's resource register.
 pub struct Resources {
   runtime: RuntimeClient,
+  /// The node-local extension registry: the resource hooks' admission
+  /// source (validate and mutate run on the caller's task before any
+  /// IO).
+  extensions: std::sync::Arc<ExtensionRegistry>,
 }
 
 impl Resources {
-  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+  pub(crate) fn new(
+    runtime: &RuntimeClient, extensions: &std::sync::Arc<ExtensionRegistry>,
+  ) -> Self {
     Self {
       runtime: runtime.clone(),
+      extensions: extensions.clone(),
     }
   }
 
@@ -105,16 +115,15 @@ impl Resources {
   /// reports the accepted record and whether it is the current winner.
   /// For the conditional (compare-and-swap) form, see
   /// [`Resources::put_expected`](Resources::put_expected).
-  pub async fn put(self, write: crate::ResourceWrite) -> Result<crate::view::ResourceMutationView> {
-    crate::resource::check_write_shape(write.name(), write.labels())?;
-    self
-      .runtime
-      .send_command(move |reply| Control::PutResource {
-        write,
-        expected: None,
-        reply,
-      })
-      .await
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// a malformed write, a resource hook's rejection); the frozen-store
+  /// refusal and every commit failure are effect-time and surface on
+  /// the returned task's [`Task::wait`].
+  pub async fn put(
+    self, write: crate::ResourceWrite,
+  ) -> Result<Task<crate::view::ResourceMutationView>> {
+    crate::runtime::put_resource(&self.extensions, self.runtime.admit()?, write, None).await
   }
 
   /// Commits one resource write intent as a signed candidate record
@@ -122,18 +131,21 @@ impl Resources {
   /// when the stored winner still equals `expected` exactly, so a raced
   /// read-modify-write surfaces as an explicit
   /// [`crate::ErrorKind::Conflict`] instead of a silently lost update.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// a malformed write, a resource hook's rejection); the CAS outcome is
+  /// effect-time and surfaces on the returned task's [`Task::wait`] (a
+  /// lost race as [`crate::ErrorKind::Conflict`]).
   pub async fn put_expected(
     self, write: crate::ResourceWrite, expected: crate::ResourceVersion,
-  ) -> Result<crate::view::ResourceMutationView> {
-    crate::resource::check_write_shape(write.name(), write.labels())?;
-    self
-      .runtime
-      .send_command(move |reply| Control::PutResource {
-        write,
-        expected: Some(expected),
-        reply,
-      })
-      .await
+  ) -> Result<Task<crate::view::ResourceMutationView>> {
+    crate::runtime::put_resource(
+      &self.extensions,
+      self.runtime.admit()?,
+      write,
+      Some(expected),
+    )
+    .await
   }
 
   /// Creates signed removal evidence for one resource: the removal
@@ -142,46 +154,54 @@ impl Resources {
   /// never removes newer metadata and never poses as a newer wall-clock
   /// winner. Removal is limited to core metadata; core never follows the
   /// resource URI or touches the caller's object.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); the stale-observation conflict and every commit failure are
+  /// effect-time and surface on the returned task's [`Task::wait`].
   pub async fn delete(
     self, name: crate::ResourceName, expected: crate::ResourceVersion,
-  ) -> Result<crate::view::ResourceMutationView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::RemoveResource {
-        name,
-        expected,
-        reply,
-      })
-      .await
+  ) -> Result<Task<crate::view::ResourceMutationView>> {
+    crate::runtime::delete_resource(self.runtime.admit()?, name, expected).await
   }
 }
 
 /// The node's bound listeners.
 pub struct Listeners {
   runtime: RuntimeClient,
+  /// The node-local extension registry: the listen admission resolves
+  /// the endpoint's transport selector (a pure registry lookup).
+  extensions: std::sync::Arc<ExtensionRegistry>,
 }
 
 impl Listeners {
-  pub(crate) fn new(runtime: &RuntimeClient) -> Self {
+  pub(crate) fn new(
+    runtime: &RuntimeClient, extensions: &std::sync::Arc<ExtensionRegistry>,
+  ) -> Self {
     Self {
       runtime: runtime.clone(),
+      extensions: extensions.clone(),
     }
   }
 
-  /// Binds one new listener on the endpoint and returns its live view.
-  pub async fn create(self, endpoint: Endpoint) -> Result<ListenerView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::Listen { endpoint, reply })
-      .await
+  /// Binds one new listener on the endpoint and returns the admitted
+  /// [`Task`], whose `wait` resolves with the listener's live view.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// an endpoint whose transport selector does not resolve in the
+  /// registry); the bind syscall and the frozen-store refusal are
+  /// effect-time and surface on the task's `wait`.
+  pub async fn create(self, endpoint: Endpoint) -> Result<Task<ListenerView>> {
+    crate::runtime::listen(&self.extensions, self.runtime.admit()?, endpoint).await
   }
 
-  /// Unbinds one listener by id.
-  pub async fn delete(self, listener: ListenerId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::StopListener { listener, reply })
-      .await
+  /// Unbinds one listener by id through the admitted [`Task`], whose
+  /// `wait` resolves once the listener is down.
+  ///
+  /// Admission-time failures are the pure shape checks only (a stopped
+  /// node); an unknown listener id is effect-time and surfaces on the
+  /// task's `wait` as [`crate::ErrorKind::NotFound`].
+  pub async fn delete(self, listener: ListenerId) -> Result<Task<()>> {
+    crate::runtime::stop_listener(self.runtime.admit()?, listener).await
   }
 
   /// Pages the node's bound listeners.
@@ -293,27 +313,39 @@ impl Credentials {
   }
 
   /// Issues the current live join credential generation without rotating
-  /// it: the returned credential admits any number of joins until the
+  /// it: the issued credential admits any number of joins until the
   /// generation is rotated or expires (ten minutes), so concurrent joins
   /// share one generation. With no live generation, one is created.
   /// [`Credentials::rotate`](Credentials::rotate) remains the
   /// revocation/upgrade step.
-  pub async fn issue(self) -> Result<IssuedMergeCredential> {
-    self
-      .runtime
-      .send_command(|reply| Control::IssueMergeCredential { reply })
-      .await
+  ///
+  /// The credential is deliberately once-only: exactly the *first*
+  /// [`Task::wait`] on the returned task collects the secret, any later
+  /// `wait` fails with [`crate::ErrorKind::InvalidInput`] ("task output
+  /// already collected"), and every status view exposes only the
+  /// generation's expiry — an issued credential is a value to hand out
+  /// once, never an observation to keep re-reading. Admission-time
+  /// failures are the pure shape checks only (a stopped node); the
+  /// frozen-store refusal is effect-time and surfaces on the task's
+  /// `wait`.
+  pub async fn issue(self) -> Result<Task<IssuedMergeCredential>> {
+    crate::runtime::issue_merge_credential(self.runtime.admit()?).await
   }
 
   /// Replaces the live join credential generation: the issued
   /// replacement admits joins from now on and the former generation
   /// admits none — the revocation/upgrade step next to
   /// [`Credentials::issue`](Credentials::issue).
-  pub async fn rotate(self) -> Result<IssuedMergeCredential> {
-    self
-      .runtime
-      .send_command(|reply| Control::RotateMergeCredential { reply })
-      .await
+  ///
+  /// The replacement is deliberately once-only: exactly the *first*
+  /// [`Task::wait`] on the returned task collects the secret, any later
+  /// `wait` fails with [`crate::ErrorKind::InvalidInput`] ("task output
+  /// already collected"), and every status view exposes only the
+  /// generation's expiry. Admission-time failures are the pure shape
+  /// checks only (a stopped node); the frozen-store refusal is
+  /// effect-time and surfaces on the task's `wait`.
+  pub async fn rotate(self) -> Result<Task<IssuedMergeCredential>> {
+    crate::runtime::rotate_merge_credential(self.runtime.admit()?).await
   }
 }
 
@@ -333,5 +365,168 @@ impl Routes {
   /// (bounded trace metadata only, no durability claim).
   pub fn get(self, handle: &RouteHandle) -> Result<RouteStatusView> {
     self.runtime.route_status(handle)
+  }
+}
+
+/// The node's admitted operation tasks: `get`/`list`/`wait` over the
+/// bounded live+terminal task table, and `submit` for caller-registered
+/// extension kinds.
+pub struct Tasks {
+  runtime: RuntimeClient,
+  /// The node-local extension registry: the custom-kind reconciler
+  /// lookup behind `submit`.
+  extensions: std::sync::Arc<ExtensionRegistry>,
+  /// The ordinary public handle the custom-kind reconcilers receive in
+  /// their [`crate::ReconcileContext`]: a caller workflow over the
+  /// public surface, never privileged core access.
+  handle: crate::NodeHandle,
+}
+
+impl Tasks {
+  pub(crate) fn new(
+    runtime: &RuntimeClient, extensions: &std::sync::Arc<ExtensionRegistry>,
+    handle: &crate::NodeHandle,
+  ) -> Self {
+    Self {
+      runtime: runtime.clone(),
+      extensions: extensions.clone(),
+      handle: handle.clone(),
+    }
+  }
+
+  /// One task's current status, when live or inside the bounded
+  /// terminal history. `Ok(None)` for an unknown or evicted id.
+  ///
+  /// The read is local (no supervisor round trip) and refuses typed once
+  /// the node stopped: the table's post-shutdown state is not part of
+  /// the public contract.
+  pub async fn get(&self, id: crate::TaskId) -> Result<Option<crate::view::TaskView>> {
+    self.require_running()?;
+    Ok(self.client()?.observer.table.view(&id))
+  }
+
+  /// Tasks in canonical id order (= admission order, newest last).
+  /// Local read like [`Tasks::get`]; see its shutdown note.
+  pub async fn list(&self, page: PageSpec) -> Result<crate::view::TaskPage> {
+    self.require_running()?;
+    let cursor = page.cursor().cloned();
+    let limit = page.limit().clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
+    Ok(
+      self
+        .client()?
+        .observer
+        .table
+        .page_views(cursor.as_ref().map(|cursor| cursor.as_bytes()), limit),
+    )
+  }
+
+  /// Awaits one task's terminal phase and resolves with its terminal
+  /// view (value-based: an already-terminal task resolves immediately,
+  /// so there is no missed-transition race). [`crate::ErrorKind::NotFound`]
+  /// for an unknown or evicted id; [`crate::ErrorKind::ShuttingDown`] if
+  /// the node stops before the effect settles (a kind the shutdown drain
+  /// awaits to terminality still resolves with its real outcome, exactly
+  /// like [`crate::Task::wait`]). No timeout is built in: callers compose
+  /// `tokio::time::timeout` over the runtime's own bounded retry
+  /// schedules.
+  pub async fn wait(&self, id: crate::TaskId) -> Result<crate::view::TaskView> {
+    self.require_running()?;
+    let client = self.client()?;
+    let Some((kind, _)) = client.observer.table.status(&id) else {
+      return Err(crate::Error::not_found("task"));
+    };
+    let Some(mut status) = client.observer.table.watch(&id) else {
+      return Err(crate::Error::not_found("task"));
+    };
+    let mut stop = client.observer.stop.clone();
+    loop {
+      if status.borrow().phase.is_terminal() {
+        return client
+          .observer
+          .table
+          .view(&id)
+          .ok_or_else(|| crate::Error::not_found("task"));
+      }
+      let stopped = tokio::select! {
+        changed = status.changed() => changed.is_err(),
+        changed = stop.changed() => changed.is_err() || !kind.drains_on_shutdown(),
+      };
+      if stopped {
+        // The terminal publication can land in the same wake as the stop
+        // signal (the manager publishes before it stops), so the view is
+        // still read before the typed shutdown failure.
+        if status.borrow().phase.is_terminal() {
+          return client
+            .observer
+            .table
+            .view(&id)
+            .ok_or_else(|| crate::Error::not_found("task"));
+        }
+        return Err(crate::Error::shutting_down("task wait"));
+      }
+    }
+  }
+
+  /// Submits one custom-kind task. The kind tag must live under a
+  /// caller-owned domain (never the builtin `radiata.woooo.tech`
+  /// domain) and must have a registered
+  /// [`TaskReconciler`](crate::TaskReconciler); anything else is
+  /// [`crate::ErrorKind::Unsupported`]. The admitted [`Task`] resolves
+  /// with `()` on the reconciler's success — the workflow's observations
+  /// ride the handle the reconciler itself received.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// the reserved domain, an unregistered kind); every reconciler error
+  /// is effect-time, retried within the bounded extension schedule, and
+  /// surfaces on the task's `wait`.
+  pub async fn submit(&self, spec: crate::CustomTaskSpec) -> Result<Task<()>> {
+    let client = self.client()?.clone();
+    if spec.kind().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
+      return Err(crate::Error::unsupported("task kind"));
+    }
+    let Some(reconciler) = self.extensions.task_reconciler(spec.kind()) else {
+      return Err(crate::Error::unsupported("task kind"));
+    };
+    self.require_running()?;
+    let kind = TaskKind::Extension(spec.kind().clone());
+    let handle = self.handle.clone();
+    let effect: TaskEffect = Arc::new(move |_deps, attempt| {
+      let reconciler = Arc::clone(&reconciler);
+      let handle = handle.clone();
+      let spec = spec.clone();
+      Box::pin(async move {
+        let context = crate::ReconcileContext {
+          handle,
+          spec,
+          attempt: attempt.attempt,
+          last_error: attempt.last_error,
+        };
+        match reconciler.reconcile(context).await {
+          Ok(crate::ReconcileDecision::Succeeded) => {
+            Ok(EffectOutcome::new(TaskOutput::Extension(())))
+          }
+          // The explicit no-progress decision re-arms the same bounded
+          // extension schedule an error rides, as the typed overload.
+          Ok(crate::ReconcileDecision::Retry) => Err(crate::Error::overloaded("custom task retry")),
+          Err(error) => Err(error),
+        }
+      })
+    });
+    let id = client
+      .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
+      .await?;
+    Ok(Task::from_parts(id, kind, client.observer.clone()))
+  }
+
+  /// The local shutdown gate shared by every accessor verb.
+  fn require_running(&self) -> Result<()> {
+    if self.runtime.status() != crate::NodeStatus::Running {
+      return Err(crate::Error::shutting_down("node tasks"));
+    }
+    Ok(())
+  }
+
+  fn client(&self) -> Result<&TaskClient> {
+    self.runtime.task_client()
   }
 }

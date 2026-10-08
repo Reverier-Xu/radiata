@@ -141,6 +141,9 @@ async fn main() {
     .listeners()
     .create(radiata::Endpoint::parse(&config.listen).expect("LISTEN endpoint"))
     .await
+    .expect("listen")
+    .wait()
+    .await
     .expect("listen");
   let node_id = node
     .local_node()

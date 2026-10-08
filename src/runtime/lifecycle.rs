@@ -1,9 +1,8 @@
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-  Endpoint, Error, IssuedMergeCredential, ListenerView, LocalNodeView, MergeView, NodeId,
-  NodeStatus, Result, RouteStatusView, ShutdownOutcome, ShutdownReason,
-  identity::{ListenerId, credential::MergeCredential},
+  Error, LocalNodeView, NodeId, NodeStatus, Result, RouteStatusView, ShutdownOutcome,
+  ShutdownReason,
   packet::{OutboundRequest, RouteHandle},
   routing::RouteTable,
 };
@@ -63,30 +62,6 @@ pub(crate) enum Control {
   Shutdown {
     reply: oneshot::Sender<ShutdownOutcome>,
   },
-  RotateMergeCredential {
-    reply: oneshot::Sender<Result<IssuedMergeCredential>>,
-  },
-  IssueMergeCredential {
-    reply: oneshot::Sender<Result<IssuedMergeCredential>>,
-  },
-  Listen {
-    endpoint: Endpoint,
-    reply: oneshot::Sender<Result<ListenerView>>,
-  },
-  StopListener {
-    listener: ListenerId,
-    reply: oneshot::Sender<Result<()>>,
-  },
-  MergeCluster {
-    receiver: Endpoint,
-    credential: MergeCredential,
-    reply: oneshot::Sender<Result<MergeView>>,
-  },
-  ConnectMember {
-    receiver: Endpoint,
-    peer: NodeId,
-    reply: oneshot::Sender<Result<NodeId>>,
-  },
   GetLocalNode {
     reply: oneshot::Sender<Result<LocalNodeView>>,
   },
@@ -140,58 +115,6 @@ pub(crate) enum Control {
     limit: usize,
     reply: oneshot::Sender<Result<crate::TrustPage>>,
   },
-  StartRecovery {
-    reply: oneshot::Sender<Result<crate::RecoveryView>>,
-  },
-  DisconnectPeer {
-    peer: NodeId,
-    reply: oneshot::Sender<Result<()>>,
-  },
-  UpdateNodeMetadata {
-    expected_revision: u64,
-    patch: crate::NodeMetadataPatch,
-    reply: oneshot::Sender<Result<crate::MemberView>>,
-  },
-  PutResource {
-    write: crate::ResourceWrite,
-    expected: Option<crate::ResourceVersion>,
-    reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
-  },
-  RevokeNode {
-    subject: NodeId,
-    expected_key: crate::PublicKey,
-    reply: oneshot::Sender<Result<crate::RevokeOutcome>>,
-  },
-  PurgeRevocation {
-    subject: NodeId,
-    reply: oneshot::Sender<Result<()>>,
-  },
-  CleanupNode {
-    subject: NodeId,
-    reply: oneshot::Sender<Result<()>>,
-  },
-  IssueCleanupCheckpoint {
-    reply: oneshot::Sender<Result<u64>>,
-  },
-  ApplyReceiptRetention {
-    reply: oneshot::Sender<Result<crate::view::ReceiptRetentionReport>>,
-  },
-  RunSyncRound {
-    reply: oneshot::Sender<Result<()>>,
-  },
-  RemoveResource {
-    name: crate::ResourceName,
-    expected: crate::ResourceVersion,
-    reply: oneshot::Sender<Result<crate::ResourceMutationView>>,
-  },
-  LeaveCluster {
-    acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
-    reply: oneshot::Sender<Result<crate::LeaveOutcome>>,
-  },
-  ResolveFrozenJournal {
-    acknowledgement: crate::DeclareInterruptedTransactionUncommitted,
-    reply: oneshot::Sender<Result<()>>,
-  },
   Observability {
     reply: oneshot::Sender<Result<crate::ObservabilitySnapshot>>,
   },
@@ -203,32 +126,62 @@ pub(crate) struct RuntimeClient {
   state: watch::Receiver<LifecycleSnapshot>,
   routes: RouteTable,
   packet: mpsc::Sender<OutboundRequest>,
+  /// The node's task-manager client, carried by every handle-creating
+  /// client the way the control sender is: a live handle keeps the manager
+  /// admitting, and a routing-only client deliberately holds none.
+  tasks: Option<super::task_manager::TaskClient>,
 }
 
 impl RuntimeClient {
   pub(crate) fn new(
     control: mpsc::Sender<Control>, state: watch::Receiver<LifecycleSnapshot>, routes: RouteTable,
-    packet: mpsc::Sender<OutboundRequest>,
+    packet: mpsc::Sender<OutboundRequest>, tasks: Option<super::task_manager::TaskClient>,
   ) -> Self {
     Self {
       control: Some(control),
       state,
       routes,
       packet,
+      tasks,
     }
   }
 
   /// A routing-only client for the packet session context: it can route
-  /// outbound packets but holds no node-command sender, so an admitted
-  /// packet's reply capability never keeps the supervisor's command
-  /// channel open after the last `NodeHandle` drops.
+  /// outbound packets but holds no node-command sender and no task client,
+  /// so an admitted packet's reply capability never keeps the supervisor's
+  /// command channel or the task manager open after the last `NodeHandle`
+  /// drops.
   pub(crate) fn routing_only(packet: mpsc::Sender<OutboundRequest>, routes: RouteTable) -> Self {
     Self {
       control: None,
       state: watch::channel(LifecycleSnapshot::running()).1,
       routes,
       packet,
+      tasks: None,
     }
+  }
+
+  /// The task manager's client for one mutating verb. Both halves of the
+  /// admission gate live here: mutation admits only while the node runs
+  /// (exactly like [`crate::NodeHandle::watch`]), and only a node handle
+  /// carries a task client (a routing-only client deliberately does not).
+  pub(crate) fn admit(&self) -> Result<&super::task_manager::TaskClient> {
+    if self.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("node operations"));
+    }
+    self
+      .tasks
+      .as_ref()
+      .ok_or_else(|| Error::not_ready("node operations"))
+  }
+
+  /// The task manager's observation client: the `node.tasks()` accessor
+  /// reads the shared table and submits custom kinds through it.
+  pub(crate) fn task_client(&self) -> Result<&super::task_manager::TaskClient> {
+    self
+      .tasks
+      .as_ref()
+      .ok_or_else(|| Error::not_ready("node tasks"))
   }
 
   pub(crate) fn status(&self) -> NodeStatus {

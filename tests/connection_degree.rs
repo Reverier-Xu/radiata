@@ -73,6 +73,9 @@ async fn listen(node: &mut Node) {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   node.endpoint = listener.endpoint().clone();
 }
@@ -304,18 +307,31 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
 
   merge_with_retry(&dialer.handle, &hub.handle, hub.endpoint.clone()).await;
 
-  // The racing dial against the joined member: whatever the outcome,
-  // an authentication failure is a contract violation — an absent
-  // binding is the retryable NotFound, never "untrusted".
-  let raced = dialer
+  // The racing dial against the joined member: the binding spread is a
+  // convergence race, and the migrated connect retries the retryable
+  // `NotFound`, so three outcomes are all contract-honoring — the dial
+  // succeeds once the binding spread lands; it exhausts the retry
+  // budget still `NotFound` (the binding never spread to the dialer);
+  // or a retry lands after the local spread but before the member
+  // learned the dialer's own binding, and the responder's refusal
+  // crosses the wire as the generic `AuthenticationFailed`. What is
+  // never acceptable is `NotTrusted`: a contradicted binding is a
+  // contract violation, not a convergence state.
+  let raced = match dialer
     .handle
     .connect(member.endpoint.clone(), member.id.clone())
-    .await;
+    .await
+  {
+    Ok(task) => task.wait().await,
+    Err(error) => Err(error),
+  };
   if let Err(error) = &raced {
-    assert_eq!(
-      error.kind(),
-      ErrorKind::NotFound,
-      "a dial racing the binding spread must be the retryable NotFound, got {error:?}"
+    assert!(
+      matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::AuthenticationFailed
+      ),
+      "a dial racing the binding spread must be a convergence state, got {error:?}"
     );
   }
 
@@ -324,6 +340,9 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   let unknown = dialer
     .handle
     .connect(stranger.endpoint.clone(), stranger.id.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(
@@ -357,11 +376,15 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
 
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let authenticated = loop {
-    match dialer
+    let dialed = match dialer
       .handle
       .connect(member.endpoint.clone(), member.id.clone())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match dialed {
       Ok(peer) => break peer,
       Err(error) => {
         assert_eq!(

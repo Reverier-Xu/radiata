@@ -94,8 +94,8 @@ async fn lifecycle_start_and_shutdown_provisions_identity_once() {
   assert_eq!(handle.status(), NodeStatus::Running,);
   assert_eq!(
     providers.entropy.fills(),
-    &[32, 14, 14, 14, 14, 14, 14],
-    "startup fills the runtime seed, then generates node, operation, and transaction IDs (including the self-binding transaction)",
+    &[32, 14, 14, 14, 14, 14, 14, 14],
+    "startup fills the runtime seed, then generates node, operation, and transaction IDs (including the self-binding transaction), then the task-id base",
   );
   let calls = providers.keys.take_calls();
   assert!(
@@ -109,7 +109,7 @@ async fn lifecycle_start_and_shutdown_provisions_identity_once() {
 
   let outcome = handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
-  assert_eq!(providers.entropy.fills().len(), 7);
+  assert_eq!(providers.entropy.fills().len(), 8);
   assert_eq!(providers.factory.commit_calls(), 4);
   assert_eq!(providers.keys.take_calls(), vec![]);
 }

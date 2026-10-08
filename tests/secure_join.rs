@@ -64,7 +64,14 @@ fn retry_backoff(attempts: u32) -> Duration {
 async fn rotate_with_retry(issuer: &NodeHandle) -> radiata::IssuedMergeCredential {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer.credentials().rotate().await {
+    // The ladder covers both halves of the migrated rotation: the
+    // admission and the once-only secret's wait (the effect's store
+    // race refusal re-admits here).
+    let rotated = match issuer.credentials().rotate().await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match rotated {
       Ok(issued) => return issued,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -75,7 +82,9 @@ async fn rotate_with_retry(issuer: &NodeHandle) -> radiata::IssuedMergeCredentia
 }
 
 /// One merge with bounded retries: a transient refusal consumes no
-/// credential, so each attempt reuses the same secret.
+/// credential, so each attempt reuses the same secret. The ladder covers
+/// both halves of the migrated join — the admission and the dial/merge
+/// effect observed through the task's `wait`.
 async fn merge_with_retry(
   node: &NodeHandle, endpoint: &Endpoint, secret: &str,
 ) -> radiata::MergeView {
@@ -86,10 +95,14 @@ async fn merge_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match node
+    let joined = match node
       .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -106,10 +119,14 @@ async fn merge_with_retry(
 async fn merge_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radiata::MergeView {
   let deadline = std::time::Instant::now() + Duration::from_secs(120);
   loop {
-    match node
+    let joined = match node
       .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -172,11 +189,22 @@ async fn secure_join_completes_exporter_bound_merge_and_persists_binding() {
   )
   .await;
 
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -231,11 +259,22 @@ async fn born_with_cluster_serves_immediately_without_ceremony() {
 
   // The fresh node issues a merge credential and admits a merger with no
   // prior state beyond its own birth binding.
-  let issued = node.handle.credentials().rotate().await.unwrap();
+  let issued = node
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = node
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let secret = issued.credential().expose_secret().to_owned();
@@ -261,11 +300,22 @@ async fn secure_join_json_backend_round_trips_the_same_merge() {
   let receiver = start_json(&receiver_dir, receiver_keys.clone()).await;
   let joiner = start_json(&joiner_dir, joiner_keys.clone()).await;
 
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -298,11 +348,22 @@ async fn secure_join_wrong_credential_fails_without_merge() {
   )
   .await;
 
-  receiver.handle.credentials().rotate().await.unwrap();
+  receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -310,6 +371,9 @@ async fn secure_join_wrong_credential_fails_without_merge() {
   let error = joiner
     .handle
     .join(listener.endpoint().clone(), wrong)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -484,11 +548,22 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
   )
   .await;
 
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let merge = {
@@ -574,11 +649,22 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
     collector,
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let merge = {
@@ -663,11 +749,22 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
     .await,
     _keys: receiver_keys.clone(),
   };
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -693,7 +790,15 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
   let receiver_view = receiver.handle.local_node().await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
   packet_round_trip(&joiner.handle, &receiver_id, &receiver_collector).await;
-  receiver.handle.credentials().rotate().await.unwrap();
+  receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   receiver_collector.packets.lock().unwrap().clear();
   packet_round_trip(&joiner.handle, &receiver_id, &receiver_collector).await;
 
@@ -714,6 +819,9 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
   let authenticated = restarted
     .handle
     .connect(listener.endpoint().clone(), receiver_id.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(authenticated, receiver_id.clone());
@@ -905,11 +1013,22 @@ async fn secure_join_packets_flow_concurrently_in_both_directions() {
     collector.clone(),
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let merge = {
@@ -974,11 +1093,22 @@ async fn secure_join_derived_return_stream_reuses_trace_id() {
     reply_collector.clone(),
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let merge = {
@@ -1037,11 +1167,22 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
     Arc::new(Collector::default()),
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let merge = {
@@ -1133,11 +1274,22 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
     .await,
     _keys: receiver_keys.clone(),
   };
-  receiver.handle.credentials().rotate().await.unwrap();
+  receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -1159,6 +1311,9 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
         MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
       )
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
   }
@@ -1171,6 +1326,9 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
   // normalize to one source) is refused before any signing work.
   let error = attacker
     .join(listener.endpoint().clone(), hostile)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -1205,11 +1363,22 @@ async fn secure_join_copied_credential_shares_generation_until_rotated() {
     Arc::new(ScriptedKeys::full_at(120_000)),
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -1236,6 +1405,9 @@ async fn secure_join_copied_credential_shares_generation_until_rotated() {
     .handle
     .join(listener.endpoint().clone(), copied)
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let receiver_id = receiver
     .handle
@@ -1247,7 +1419,15 @@ async fn secure_join_copied_credential_shares_generation_until_rotated() {
   assert_eq!(merge.peer(), &receiver_id);
 
   // Rotation retires the copied generation: a further copy fails closed.
-  receiver.handle.credentials().rotate().await.unwrap();
+  receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let third = start(
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     Arc::new(ScriptedKeys::full_at(150_000)),
@@ -1257,6 +1437,9 @@ async fn secure_join_copied_credential_shares_generation_until_rotated() {
   let error = third
     .handle
     .join(listener.endpoint().clone(), copied)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -1293,11 +1476,22 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   )
   .await;
 
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let _merge = {
@@ -1417,11 +1611,22 @@ async fn secure_join_merge_after_listener_stop_fails_closed() {
     Arc::new(ScriptedKeys::full_at(170_000)),
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   receiver
@@ -1459,6 +1664,9 @@ async fn secure_join_merge_after_listener_stop_fails_closed() {
     .handle
     .join(listener.endpoint().clone(), issued.into_credential())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert!(
     matches!(
@@ -1493,11 +1701,22 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
     .await,
     _keys: Arc::new(ScriptedKeys::full()),
   };
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let receiver_listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -1521,6 +1740,9 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let receiver_view = receiver.handle.local_node().await.unwrap();
   let receiver_id = receiver_view.node_id().clone();
@@ -1531,6 +1753,9 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
   let authenticated = receiver
     .handle
     .connect(joiner_listener.endpoint().clone(), joiner_id.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(authenticated, joiner_id);
@@ -1557,11 +1782,22 @@ async fn secure_join_shutdown_rejects_new_work_after_drain() {
     Arc::new(ScriptedKeys::full_at(220_000)),
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let joiner = start(
@@ -1592,11 +1828,22 @@ async fn secure_join_public_membership_and_topology_views() {
     Arc::new(ScriptedKeys::full_at(400_000)),
   )
   .await;
-  let issued = receiver.handle.credentials().rotate().await.unwrap();
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let listener = receiver
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   let joiner = start(
@@ -1667,6 +1914,9 @@ async fn secure_join_sixteen_node_membership_merges_and_views() {
     .handle
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 

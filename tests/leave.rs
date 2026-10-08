@@ -201,7 +201,14 @@ fn write(name_seed: u8) -> ResourceWrite {
 async fn put_with_retry(handle: &NodeHandle, name_seed: u8) {
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match handle.resources().put(write(name_seed)).await {
+    // The ladder covers both halves of the migrated write: the
+    // admission and the commit effect, observed through the task's
+    // `wait` — a put whose effect still runs would race the leave.
+    let committed = match handle.resources().put(write(name_seed)).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match committed {
       Ok(_) => return,
       Err(error) if error.kind() == ErrorKind::NotReady => {
         assert!(
@@ -238,6 +245,9 @@ async fn leave_replaces_identity_and_shuts_down_with_active_leave() {
 
   let outcome = handle
     .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(outcome.former_identity(), &former);
@@ -308,6 +318,9 @@ async fn leave_announces_to_connected_peers_before_rotating() {
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .endpoint()
     .clone();
   common::merge_with_retry(&leaver, &listener, endpoint).await;
@@ -319,6 +332,9 @@ async fn leave_announces_to_connected_peers_before_rotating() {
   let started = std::time::Instant::now();
   let outcome = leaver
     .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(outcome.former_identity(), &former);
@@ -421,6 +437,9 @@ async fn recovery_quiesces_after_a_member_departs() {
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .endpoint()
     .clone();
   common::merge_with_retry(&b, &a, a_endpoint.clone()).await;
@@ -432,6 +451,9 @@ async fn recovery_quiesces_after_a_member_departs() {
   tokio::time::sleep(Duration::from_secs(5)).await;
 
   c.leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -496,6 +518,9 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
     .await
     .unwrap()
+    .wait()
+    .await
+    .unwrap()
     .endpoint()
     .clone();
   // b listens too: its descriptor must publish an endpoint for the
@@ -513,16 +538,31 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
 
   // a disconnects b: the session is torn down and b leaves a's recovery
   // history for now.
-  a.disconnect(b_id.clone()).await.unwrap();
+  a.disconnect(b_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   // b dials back on its own: a accepts the inbound member session, and
   // b is known-online again through it.
-  b.connect(a_endpoint, a_id.clone()).await.unwrap();
+  b.connect(a_endpoint, a_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   // Let a recovery tick observe the alive session.
   tokio::time::sleep(Duration::from_secs(5)).await;
   // b drops the session from its side: b is now an unreachable known
   // member with a published endpoint — the recovery plane must count it
   // pending and dial it back.
-  b.disconnect(a_id.clone()).await.unwrap();
+  b.disconnect(a_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
 
   // First the drop must surface as unreachability (a genuinely counts
   // the member again), then recovery must heal the session without
@@ -564,6 +604,9 @@ async fn leave_without_peers_completes_without_waiting() {
     .unwrap();
   let outcome = handle
     .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_ne!(outcome.former_identity(), outcome.replacement_identity());
@@ -649,6 +692,9 @@ async fn restarted_node_passively_reconnects(
   let peer_endpoint = peer
     .listeners()
     .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap()
     .endpoint()
@@ -758,12 +804,18 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
       .listeners()
       .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap();
     put_with_retry(&handle, 2).await;
     let former = handle.local_node().await.unwrap().node_id().clone();
     former_handle_bytes = former.clone();
     let outcome = handle
       .leave(ReplaceIdentityAndDeleteOldCoreMetadata::new())
+      .await
+      .unwrap()
+      .wait()
       .await
       .unwrap();
     assert_eq!(outcome.former_identity(), &former_handle_bytes);
