@@ -592,10 +592,12 @@ struct RetryTicket {
 /// worker's last action; the terminal publications themselves already
 /// ran inside the worker's own future.
 enum WorkerReport {
-  /// The task terminalized (success or typed failure); `succeeded`
-  /// distinguishes the terminal phase — the leave completion signal
-  /// fires on success only, exactly like the verb's old inline shutdown.
-  Terminal { id: TaskId, succeeded: bool },
+  /// The task terminalized (success or typed failure). The table's
+  /// terminal phase — read when this report is processed — is the
+  /// single truth for the leave completion signal: a leave that
+  /// published `Succeeded` still signals the active-leave shutdown even
+  /// when a hook panicked after that publication and lost the attempt.
+  Terminal { id: TaskId },
   /// The attempt failed retryably; re-spawn after the delay.
   Retry {
     id: TaskId,
@@ -722,10 +724,20 @@ async fn run_manager(
       LoopEvent::Report(Some(report)) => {
         outstanding -= 1;
         match report {
-          WorkerReport::Terminal { id, succeeded } => {
+          WorkerReport::Terminal { id } => {
             coalescing.retain(|_, (in_flight, _)| in_flight != &id);
             if leave_task.as_ref() == Some(&id) {
               leave_task = None;
+              // The table's terminal phase is the single truth, not the
+              // attempt's own outcome: a leave whose `Succeeded`
+              // publication already landed signals the active-leave
+              // shutdown even when a hook panicked after it (the panic
+              // leaves the terminal phase standing but loses the
+              // attempt).
+              let succeeded = shared
+                .table
+                .status(&id)
+                .is_some_and(|(_, status)| status.phase() == TaskPhase::Succeeded);
               if succeeded {
                 // The supervisor's active-leave shutdown starts here. The
                 // terminal publication already landed inside the attempt
@@ -951,10 +963,7 @@ impl Worker {
             Error::internal("task reconcile permit"),
           )
           .await;
-        return WorkerReport::Terminal {
-          id: self.id,
-          succeeded: false,
-        };
+        return WorkerReport::Terminal { id: self.id };
       }
     };
     // The whole attempt body — the `Running` publication, its transition
@@ -996,10 +1005,7 @@ impl Worker {
       body.await
     };
     match joined {
-      Ok(AttemptOutcome::Terminal { succeeded }) => WorkerReport::Terminal {
-        id: self.id,
-        succeeded,
-      },
+      Ok(AttemptOutcome::Terminal) => WorkerReport::Terminal { id: self.id },
       Ok(AttemptOutcome::Retry { delay, last_error }) => WorkerReport::Retry {
         id: self.id,
         kind: self.kind,
@@ -1021,10 +1027,7 @@ impl Worker {
           Error::internal("reconciler cancelled")
         };
         self.shared.publish_panicked(&self.id, &self.kind, failure);
-        WorkerReport::Terminal {
-          id: self.id,
-          succeeded: false,
-        }
+        WorkerReport::Terminal { id: self.id }
       }
     }
   }
@@ -1033,9 +1036,8 @@ impl Worker {
 /// One attempt body, run as its own spawned task (see
 /// [`Worker::run_attempt`]).
 enum AttemptOutcome {
-  /// The task terminalized; `succeeded` distinguishes the terminal
-  /// phase.
-  Terminal { succeeded: bool },
+  /// The task terminalized; the table holds the terminal phase.
+  Terminal,
   /// The attempt failed retryably; the manager re-arms the delay.
   Retry {
     delay: Duration,
@@ -1060,7 +1062,7 @@ impl Attempt {
     {
       // The entry is gone (evicted terminal history) or its lock is
       // poisoned: there is no state left to publish onto.
-      return AttemptOutcome::Terminal { succeeded: false };
+      return AttemptOutcome::Terminal;
     }
     match (self.effect)(Arc::clone(&self.shared.operations), self.attempt).await {
       Ok(EffectOutcome { output, secret }) => {
@@ -1068,7 +1070,7 @@ impl Attempt {
           .shared
           .publish_success(&self.id, &self.kind, output, secret)
           .await;
-        AttemptOutcome::Terminal { succeeded: true }
+        AttemptOutcome::Terminal
       }
       Err(error) => {
         let policy = retry_policy(&self.kind);
@@ -1082,7 +1084,7 @@ impl Attempt {
             .shared
             .publish_failure(&self.id, &self.kind, error)
             .await;
-          AttemptOutcome::Terminal { succeeded: false }
+          AttemptOutcome::Terminal
         }
       }
     }
@@ -1340,6 +1342,52 @@ mod tests {
         .phase(),
       TaskPhase::Succeeded
     );
+  }
+
+  #[tokio::test]
+  async fn a_leave_that_succeeded_still_signals_the_shutdown_when_a_late_hook_panics() {
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/late-boom").expect("tag"),
+        Arc::new(PanicOnSucceededHook),
+      )
+      .expect("registration");
+    let (leave_complete, mut leave_signals) = mpsc::channel(1);
+    let deps = TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
+        Arc::new(crate::node::EventHub::new()),
+        Arc::new(extensions),
+      )),
+      listeners: Default::default(),
+      leave_complete,
+    };
+    let (client, _manager) = spawn_task_manager(deps).expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        ok_effect(TaskOutput::Leave(crate::LeaveOutcome::new(
+          node('a'),
+          node('b'),
+        ))),
+      )
+      .await
+      .expect("admission");
+    // The leave effect succeeded and published `Succeeded`; the hook
+    // panicked observing that terminal transition, so the attempt
+    // itself is lost. The table's terminal phase — the single truth —
+    // still drives the active-leave signal: the node must not hang on
+    // shutdown waiting for a leave that already succeeded.
+    handle::<crate::LeaveOutcome>(&client, &id, TaskKind::Leave)
+      .wait()
+      .await
+      .expect("the terminal success stands");
+    tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
+      .await
+      .expect("the leave signal fires")
+      .expect("receiver live");
   }
 
   #[tokio::test]
