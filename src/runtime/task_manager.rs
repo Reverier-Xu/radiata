@@ -161,7 +161,6 @@ pub(crate) struct EffectOutcome {
 }
 
 impl EffectOutcome {
-  #[allow(dead_code)] // driven by the verb migration stage's effects
   pub(crate) fn new(output: TaskOutput) -> Self {
     Self {
       output,
@@ -171,7 +170,6 @@ impl EffectOutcome {
 
   /// The issue-credential effect's outcome: the observation carries the
   /// generation's expiry; the secret rides the consumed-once slot.
-  #[allow(dead_code)] // driven by the verb migration stage's effects
   pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Self {
     Self {
       output: TaskOutput::IssueCredential(CredentialIssued::new(issued.expires_at())),
@@ -181,7 +179,6 @@ impl EffectOutcome {
 
   /// The rotate-credential effect's outcome (the same consumed-once
   /// rule).
-  #[allow(dead_code)] // driven by the verb migration stage's effects
   pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Self {
     Self {
       output: TaskOutput::RotateCredential(CredentialIssued::new(issued.expires_at())),
@@ -217,7 +214,6 @@ pub(crate) type TaskEffect = Arc<
 /// stage) extend the set with their verb inputs; today the effect
 /// closure owns the whole verb input and the payload carries only the
 /// coalescing subject.
-#[allow(dead_code)] // constructed by the verb migration stage's admission paths and the manager tests
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TaskPayload {
   /// No coalescing subject: the kind never coalesces.
@@ -248,7 +244,6 @@ pub(crate) struct TaskSpec {
 }
 
 impl TaskSpec {
-  #[allow(dead_code)] // constructed by the verb migration stage's admission paths
   pub(crate) fn new(kind: TaskKind, payload: TaskPayload) -> Self {
     Self { kind, payload }
   }
@@ -326,7 +321,6 @@ impl TaskClient {
   /// hooks have already run caller-side; this is id composition, the
   /// dedup/coalescing check, the `Pending` publication, and the first
   /// reconcile spawn. No IO ever runs on this path.
-  #[allow(dead_code)] // submissions arrive with the verb migration stage
   pub(crate) async fn submit(&self, spec: TaskSpec, effect: TaskEffect) -> Result<TaskId> {
     let (reply, response) = oneshot::channel();
     self
@@ -346,7 +340,6 @@ impl TaskClient {
 
 /// The supervisor's half: the cancel watch (begin_shutdown) and the
 /// manager's join handle (drain awaits the journaled kinds).
-#[allow(dead_code)] // driven by the supervisor's teardown; the wiring lands with the supervisor stages
 pub(crate) struct TaskManagerHandle {
   cancel: watch::Sender<bool>,
   task: tokio::task::JoinHandle<()>,
@@ -356,7 +349,6 @@ impl TaskManagerHandle {
   /// Closes admissions (subsequent submissions fail typed) and
   /// broadcasts the cancel watch: cancellable kinds exit immediately,
   /// the journaled kinds keep running to their terminal phase.
-  #[allow(dead_code)] // called by the supervisor's teardown; the wiring lands with the supervisor stages
   pub(crate) fn begin_shutdown(&self) {
     let _ = self.cancel.send(true);
   }
@@ -364,7 +356,6 @@ impl TaskManagerHandle {
   /// Awaits the manager's exit: every spawned worker has settled
   /// (cancelled, or terminal for the journaled kinds) before this
   /// resolves.
-  #[allow(dead_code)] // awaited by the supervisor's teardown; the wiring lands with the supervisor stages
   pub(crate) async fn drain(self) {
     let _ = self.task.await;
   }
@@ -539,7 +530,6 @@ impl ManagerShared {
 /// Spawns the task manager. The startup id-base draw is the single new
 /// startup entropy fill (pinned by the lifecycle entropy-sequence
 /// test).
-#[allow(dead_code)] // spawned beside the sync driver; the supervisor wiring lands with the supervisor stages
 pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, TaskManagerHandle)> {
   let base = TaskId::draw_base(deps.entropy.as_ref())?;
   let (submit, submissions) = mpsc::channel(TASK_CHANNEL_CAPACITY);

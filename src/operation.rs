@@ -228,7 +228,6 @@ impl TaskChanged {
     self.phase
   }
 
-  #[allow(dead_code)] // emitted by the task manager on every transition; that wiring lands with the supervisor stage
   pub(crate) const fn new(
     task: crate::TaskId, kind: crate::TaskKind, phase: crate::TaskPhase,
   ) -> Self {

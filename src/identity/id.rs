@@ -142,7 +142,6 @@ impl TaskId {
   /// The counter bound is the admission count per incarnation: past
   /// `2^40` admissions the composition is refused typed instead of
   /// wrapping onto an earlier id.
-  #[allow(dead_code)] // driven by the task manager constructor; the runtime wiring lands with the supervisor stages
   pub(crate) fn compose(base: u128, counter: u64) -> Result<Self> {
     let counter = u128::from(counter);
     if counter >= TASK_COUNTER_LIMIT {
@@ -156,7 +155,6 @@ impl TaskId {
   /// overflow masks are applied by [`TaskId::compose`], so the draw needs
   /// no rejection loop and the startup entropy budget gains exactly one
   /// fill (pinned by the lifecycle entropy-sequence test).
-  #[allow(dead_code)] // driven by the task manager constructor; the runtime wiring lands with the supervisor stages
   pub(crate) fn draw_base(entropy: &dyn Entropy) -> Result<u128> {
     let mut draw = [0_u8; SUFFIX_DRAW_BYTES];
     entropy.fill(&mut draw)?;

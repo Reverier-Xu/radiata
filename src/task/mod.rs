@@ -95,7 +95,6 @@ pub struct TaskError {
 }
 
 impl TaskError {
-  #[allow(dead_code)] // constructed by the task manager's terminal transitions; the runtime wiring lands with the supervisor stages
   pub(crate) fn from_error(error: Error) -> Self {
     Self {
       kind: error.kind(),
@@ -132,7 +131,6 @@ pub struct CredentialIssued {
 }
 
 impl CredentialIssued {
-  #[allow(dead_code)] // constructed by the credential effects; the verb migration stage drives it
   pub(crate) const fn new(expires_at: SystemTime) -> Self {
     Self { expires_at }
   }
@@ -268,7 +266,6 @@ pub(crate) struct TaskTable {
 }
 
 impl TaskTable {
-  #[allow(dead_code)] // the manager constructs the shared table; the runtime wiring lands with the supervisor stages
   pub(crate) fn new() -> Self {
     Self::default()
   }
@@ -282,7 +279,6 @@ impl TaskTable {
   /// Inserts one admitted task's `Pending` entry. `false` when the id
   /// already exists (an admission invariant violation, never a caller
   /// path).
-  #[allow(dead_code)] // driven by the task manager's admission; the runtime wiring lands with the supervisor stages
   pub(crate) fn insert_pending(&self, id: &TaskId, kind: TaskKind, created: SystemTime) -> bool {
     let Ok(mut entries) = self.lock() else {
       return false;
@@ -396,7 +392,6 @@ impl TaskTable {
   /// entries encountered are the oldest; non-terminal entries are never
   /// evicted. Called by the manager's retention pass after each
   /// terminal transition.
-  #[allow(dead_code)] // driven by the task manager's retention pass; the runtime wiring lands with the supervisor stages
   pub(crate) fn retain_terminal_history(&self, keep: usize) {
     let Ok(mut entries) = self.lock() else {
       return;
@@ -600,7 +595,6 @@ pub struct Task<T> {
 
 #[allow(private_bounds)]
 impl<T: TaskResult> Task<T> {
-  #[allow(dead_code)] // constructed by the verb migration stage's admission paths
   pub(crate) fn from_parts(id: TaskId, kind: TaskKind, observer: TaskObserver) -> Self {
     Self {
       id,
