@@ -627,7 +627,7 @@ async fn merge_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match bounded(
+    let joined = match bounded(
       joiner.handle().join(
         endpoint.clone(),
         MergeCredential::parse(secret).expect("valid credential"),
@@ -636,6 +636,10 @@ async fn merge_with_retry(
     )
     .await
     {
+      Ok(task) => bounded(task.wait(), "merge wait").await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -653,12 +657,16 @@ async fn connect_member_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match bounded(
+    let connected = match bounded(
       node.handle().connect(endpoint.clone(), peer.clone()),
       "member reconnect",
     )
     .await
     {
+      Ok(task) => bounded(task.wait(), "member reconnect wait").await,
+      Err(error) => Err(error),
+    };
+    match connected {
       Ok(authenticated) => return authenticated,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -1118,12 +1126,16 @@ async fn sixty_four_node_mixed_transport_chaos() {
   for (step, (from, to)) in kicks.into_iter().enumerate() {
     let what = format!("kick {step} ({from}->{to})");
     // Absence after a concurrent prune is benign; a real failure
-    // surfaces through the convergence check below.
-    let _ = bounded(
+    // surfaces through the convergence check below. The teardown task is
+    // awaited before the convergence check reads the session set.
+    if let Ok(task) = bounded(
       slots[from].handle().disconnect(ids[to].clone()),
       "disconnect peer",
     )
-    .await;
+    .await
+    {
+      let _ = bounded(task.wait(), "disconnect peer wait").await;
+    }
     wait_converged(&slots, NODES, &what).await;
   }
 

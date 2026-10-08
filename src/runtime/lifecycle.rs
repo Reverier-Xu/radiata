@@ -1,9 +1,9 @@
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-  Endpoint, Error, IssuedMergeCredential, ListenerView, LocalNodeView, MergeView, NodeId,
-  NodeStatus, Result, RouteStatusView, ShutdownOutcome, ShutdownReason,
-  identity::{ListenerId, credential::MergeCredential},
+  Endpoint, Error, IssuedMergeCredential, ListenerView, LocalNodeView, NodeId, NodeStatus, Result,
+  RouteStatusView, ShutdownOutcome, ShutdownReason,
+  identity::ListenerId,
   packet::{OutboundRequest, RouteHandle},
   routing::RouteTable,
 };
@@ -77,16 +77,6 @@ pub(crate) enum Control {
     listener: ListenerId,
     reply: oneshot::Sender<Result<()>>,
   },
-  MergeCluster {
-    receiver: Endpoint,
-    credential: MergeCredential,
-    reply: oneshot::Sender<Result<MergeView>>,
-  },
-  ConnectMember {
-    receiver: Endpoint,
-    peer: NodeId,
-    reply: oneshot::Sender<Result<NodeId>>,
-  },
   GetLocalNode {
     reply: oneshot::Sender<Result<LocalNodeView>>,
   },
@@ -142,10 +132,6 @@ pub(crate) enum Control {
   },
   StartRecovery {
     reply: oneshot::Sender<Result<crate::RecoveryView>>,
-  },
-  DisconnectPeer {
-    peer: NodeId,
-    reply: oneshot::Sender<Result<()>>,
   },
   UpdateNodeMetadata {
     expected_revision: u64,
@@ -238,11 +224,18 @@ impl RuntimeClient {
     }
   }
 
-  /// The node's task-manager client, on the clients a node handle is built
-  /// from (never on a routing-only client).
-  #[allow(dead_code)] // read by the `node.tasks()` accessor; that surface lands with the task-surface stage
-  pub(crate) fn task_client(&self) -> Option<&super::task_manager::TaskClient> {
-    self.tasks.as_ref()
+  /// The task manager's client for one mutating verb. Both halves of the
+  /// admission gate live here: mutation admits only while the node runs
+  /// (exactly like [`crate::NodeHandle::watch`]), and only a node handle
+  /// carries a task client (a routing-only client deliberately does not).
+  pub(crate) fn admit(&self) -> Result<&super::task_manager::TaskClient> {
+    if self.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("node operations"));
+    }
+    self
+      .tasks
+      .as_ref()
+      .ok_or_else(|| Error::not_ready("node operations"))
   }
 
   pub(crate) fn status(&self) -> NodeStatus {

@@ -221,7 +221,7 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
   let mut attempts = 0_u32;
   loop {
     attempts += 1;
-    match member
+    let joined = match member
       .handle
       .join(
         issuer.endpoint().clone(),
@@ -229,6 +229,10 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
       )
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => {
         member.id = Some(view.node().clone());
         break;
@@ -262,6 +266,9 @@ async fn join_bystander(issuer: &Node, member: &Node) -> Node {
       radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
     )
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   bystander.id = Some(
     bystander
@@ -278,11 +285,15 @@ async fn join_bystander(issuer: &Node, member: &Node) -> Node {
   // ticks before the member admits the bystander, so retry until then.
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
-    match bystander
+    let connected = match bystander
       .handle
       .connect(member.endpoint().clone(), member.id().clone())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match connected {
       Ok(_) => break,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(POLL).await;
@@ -519,6 +530,9 @@ async fn prior_initiator_interops_with_current_responder() {
     .handle
     .connect(issuer.endpoint().clone(), issuer.id().clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
@@ -549,7 +563,14 @@ async fn prior_initiator_interops_with_current_responder() {
   // Retirement: the pair-scoped selection disappears with the session and
   // never authorizes dispatch without a session (no node-wide claim).
   let collected_before_retirement = member.collector.packets.lock().unwrap().len();
-  member.handle.disconnect(issuer.id().clone()).await.unwrap();
+  member
+    .handle
+    .disconnect(issuer.id().clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
   loop {
     let retired = match issuer
@@ -677,6 +698,9 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
       radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
     )
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
   let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -721,6 +745,9 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
       prior_issuer.endpoint().clone(),
       radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
     )
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);

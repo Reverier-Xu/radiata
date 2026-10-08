@@ -201,6 +201,9 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
     .handle
     .connect(member.endpoint.clone(), member.id.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Revoked);
 
@@ -211,7 +214,10 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
   let rejoin = async {
     let issued = issuer.handle.credentials().rotate().await.unwrap();
     let credential = MergeCredential::parse(issued.credential().expose_secret()).unwrap();
-    member.handle.join(listen(&issuer).await, credential).await
+    match member.handle.join(listen(&issuer).await, credential).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    }
   };
   let error = rejoin.await.unwrap_err();
   assert!(

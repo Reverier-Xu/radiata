@@ -941,17 +941,31 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .handle
     .connect(member_endpoint.clone(), member_id.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
-  let _disconnected: () = issuer.handle.disconnect(member_id.clone()).await.unwrap();
+  let _disconnected: () = issuer
+    .handle
+    .disconnect(member_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   // A deliberately disconnected peer is reconnected deliberately: recovery
   // never dials it on its own.
   let reconnect_deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    match issuer
+    let reconnected = match issuer
       .handle
       .connect(member_endpoint.clone(), member_id.clone())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match reconnected {
       Ok(_reconnected) => break,
       Err(_) if std::time::Instant::now() < reconnect_deadline => {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1280,10 +1294,14 @@ async fn listen(node: &Node) -> Endpoint {
 async fn merge_with_retry(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> MergeView {
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   loop {
-    match node
+    let joined = match node
       .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         // Pace the retries outside the fixed per-source merge window

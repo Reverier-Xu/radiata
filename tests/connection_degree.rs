@@ -307,10 +307,14 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   // The racing dial against the joined member: whatever the outcome,
   // an authentication failure is a contract violation — an absent
   // binding is the retryable NotFound, never "untrusted".
-  let raced = dialer
+  let raced = match dialer
     .handle
     .connect(member.endpoint.clone(), member.id.clone())
-    .await;
+    .await
+  {
+    Ok(task) => task.wait().await,
+    Err(error) => Err(error),
+  };
   if let Err(error) = &raced {
     assert_eq!(
       error.kind(),
@@ -324,6 +328,9 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   let unknown = dialer
     .handle
     .connect(stranger.endpoint.clone(), stranger.id.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(
@@ -357,11 +364,15 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
 
   let deadline = std::time::Instant::now() + Duration::from_secs(60);
   let authenticated = loop {
-    match dialer
+    let dialed = match dialer
       .handle
       .connect(member.endpoint.clone(), member.id.clone())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match dialed {
       Ok(peer) => break peer,
       Err(error) => {
         assert_eq!(

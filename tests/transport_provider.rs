@@ -208,6 +208,9 @@ async fn transport_provider_carries_a_full_secure_merge() {
   let merge = joiner
     .join(endpoint.clone(), MergeCredential::parse(&secret).unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let _ = listener;
 

@@ -183,11 +183,15 @@ impl EffectOutcome {
   }
 }
 
-/// One admitted task's effect: an attempt-indexed future factory. The
-/// verb migrations build these closures over the moved verb bodies; the
-/// manager calls the factory once per attempt.
-pub(crate) type TaskEffect =
-  Arc<dyn Fn(u32) -> BoxFuture<'static, Result<EffectOutcome>> + Send + Sync>;
+/// One admitted task's effect: a factory called once per attempt with the
+/// node-shared operation handles the manager owns. The verb admissions
+/// build these closures over the moved verb bodies; the effect body is a
+/// `reconcile_*` function in [`super::task_effects`].
+pub(crate) type TaskEffect = Arc<
+  dyn Fn(Arc<super::task_effects::OperationDeps>, u32) -> BoxFuture<'static, Result<EffectOutcome>>
+    + Send
+    + Sync,
+>;
 
 /// The payload the coalescing rules compare. The verb migrations (next
 /// stage) extend the set with their verb inputs; today the effect
@@ -340,20 +344,18 @@ impl TaskManagerHandle {
 pub(crate) struct TaskManagerDeps {
   pub(crate) entropy: Arc<dyn Entropy>,
   pub(crate) clock: Arc<dyn WallClock>,
-  /// The typed event hub shared with the node's handles: every task
-  /// phase transition emits its [`crate::TaskChanged`] here.
-  pub(crate) events: Arc<crate::node::EventHub>,
-  /// The node-local extension registry: the source of the registered
-  /// action hooks (and, for the verb stages, the resource hooks and
-  /// custom-kind reconcilers).
-  pub(crate) extensions: Arc<crate::ExtensionRegistry>,
+  /// The node-shared operation handles: every effect reads them, and the
+  /// manager owns the only long-lived reference (a node handle keeps just
+  /// the submit half, so holding a handle never keeps the metadata store
+  /// locked past shutdown).
+  pub(crate) operations: Arc<super::task_effects::OperationDeps>,
   /// The node's bound listeners, shared with the supervisor's views: the
   /// listen/stop effects mutate the same registry the pages read.
   pub(crate) listeners: super::supervisor::ListenerRegistry,
   /// The leave reconciler's completion signal to the supervisor
   /// ([`super::supervisor::spawn_runtime`] owns the receiving end). The
-  /// leave effect sends it once its terminal publication landed, which is
-  /// what starts the `ActiveLeave` shutdown.
+  /// manager sends it once the leave task's terminal publication landed,
+  /// which is what starts the `ActiveLeave` shutdown.
   pub(crate) leave_complete: mpsc::Sender<()>,
 }
 
@@ -361,16 +363,31 @@ pub(crate) struct TaskManagerDeps {
 struct ManagerShared {
   table: TaskTable,
   clock: Arc<dyn WallClock>,
-  events: Arc<crate::node::EventHub>,
-  extensions: Arc<crate::ExtensionRegistry>,
+  /// The node-shared operation handles every effect reads.
+  operations: Arc<super::task_effects::OperationDeps>,
   /// The shared listener registry, read by the listen/stop effects.
   #[allow(dead_code)] // read by the listener effects; that migration stage lands next
   listeners: super::supervisor::ListenerRegistry,
-  /// The leave completion signal, sent by the leave effect (the
-  /// supervisor owns the receiver).
-  #[allow(dead_code)] // sent by the leave effect; that migration stage lands next
+  /// The leave completion signal, sent once the leave task terminalized
+  /// (the supervisor owns the receiver).
+  #[allow(dead_code)] // sent by the leave verb's reconciliation; that stage lands next
   leave_complete: mpsc::Sender<()>,
   semaphore: Arc<Semaphore>,
+}
+
+impl ManagerShared {
+  /// The typed event hub: every phase transition emits its
+  /// [`crate::TaskChanged`] through it.
+  fn events(&self) -> &Arc<crate::node::EventHub> {
+    self.operations.events()
+  }
+
+  /// The node-local extension registry: the source of the registered
+  /// action hooks (and, for the verb stages, the resource hooks and
+  /// custom-kind reconcilers).
+  fn extensions(&self) -> &Arc<crate::ExtensionRegistry> {
+    self.operations.extensions()
+  }
 }
 
 impl ManagerShared {
@@ -435,7 +452,7 @@ impl ManagerShared {
   /// panicking hook could do remains on this path.
   fn publish_panicked(&self, id: &TaskId, kind: &TaskKind, error: Error) {
     if let Some(from) = self.record_failure(id, error) {
-      self.events.emit(crate::TaskChanged::new(
+      self.events().emit(crate::TaskChanged::new(
         id.clone(),
         kind.clone(),
         TaskPhase::Failed,
@@ -485,10 +502,10 @@ impl ManagerShared {
   /// Runs inside the task's own future, never on the manager task.
   async fn observe(&self, id: &TaskId, kind: &TaskKind, from: TaskPhase, to: TaskPhase) {
     self
-      .events
+      .events()
       .emit(crate::TaskChanged::new(id.clone(), kind.clone(), to));
     let transition = crate::task::TaskTransition::new(id.clone(), kind.clone(), from, to);
-    crate::task::notify_action_hooks(&self.extensions.action_hooks(), &transition).await;
+    crate::task::notify_action_hooks(&self.extensions().action_hooks(), &transition).await;
   }
 }
 
@@ -508,8 +525,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
   let shared = Arc::new(ManagerShared {
     table,
     clock: deps.clock,
-    events: deps.events,
-    extensions: deps.extensions,
+    operations: deps.operations,
     listeners: deps.listeners,
     leave_complete: deps.leave_complete,
     semaphore: Arc::new(Semaphore::new(TASK_RECONCILE_CONCURRENCY)),
@@ -794,7 +810,7 @@ fn admit_inner(
   // The admission transition is an event only: the action hooks first
   // observe at `Running`, because no caller code ever runs on the
   // manager task (the admission is crate-side bookkeeping).
-  shared.events.emit(crate::TaskChanged::new(
+  shared.events().emit(crate::TaskChanged::new(
     id.clone(),
     kind.clone(),
     TaskPhase::Pending,
@@ -950,7 +966,7 @@ impl Attempt {
       // poisoned: there is no state left to publish onto.
       return AttemptOutcome::Terminal;
     }
-    match (self.effect)(self.attempt).await {
+    match (self.effect)(Arc::clone(&self.shared.operations), self.attempt).await {
       Ok(EffectOutcome { output, secret }) => {
         self
           .shared
@@ -1036,8 +1052,10 @@ mod tests {
     TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
-      events,
-      extensions: Arc::new(extensions),
+      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
+        events,
+        Arc::new(extensions),
+      )),
       listeners: Default::default(),
       leave_complete,
     }
@@ -1283,7 +1301,7 @@ mod tests {
 
   /// An effect that always succeeds with one output.
   fn ok_effect(output: TaskOutput) -> TaskEffect {
-    Arc::new(move |_attempt| {
+    Arc::new(move |_deps, _attempt| {
       let output = output.clone();
       Box::pin(async move { Ok(EffectOutcome::new(output)) })
     })
@@ -1291,7 +1309,7 @@ mod tests {
 
   /// An effect that never settles (a wedged effect under test).
   fn wedged_effect() -> TaskEffect {
-    Arc::new(|_attempt| Box::pin(std::future::pending()))
+    Arc::new(|_deps, _attempt| Box::pin(std::future::pending()))
   }
 
   /// A scripted effect: one queued step per attempt (the last step
@@ -1317,7 +1335,7 @@ mod tests {
 
     fn effect(self: &Arc<Self>) -> TaskEffect {
       let scripted = Arc::clone(self);
-      Arc::new(move |attempt| {
+      Arc::new(move |_deps, attempt| {
         let scripted = Arc::clone(&scripted);
         Box::pin(async move {
           scripted.attempts.lock().expect("attempts").push(attempt);
@@ -1510,7 +1528,7 @@ mod tests {
     // A journaled kind whose effect completes only when released.
     let release = Arc::new(Notify::new());
     let gate = release.clone();
-    let journaled_effect: TaskEffect = Arc::new(move |_attempt| {
+    let journaled_effect: TaskEffect = Arc::new(move |_deps, _attempt| {
       let gate = gate.clone();
       Box::pin(async move {
         gate.notified().await;
@@ -1585,7 +1603,7 @@ mod tests {
     for index in 0..8 {
       let live = live.clone();
       let peak = peak.clone();
-      let effect: TaskEffect = Arc::new(move |_attempt| {
+      let effect: TaskEffect = Arc::new(move |_deps, _attempt| {
         let live = live.clone();
         let peak = peak.clone();
         Box::pin(async move {
@@ -1623,7 +1641,7 @@ mod tests {
   #[tokio::test]
   async fn a_panicking_effect_fails_the_task_typed() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let panicking: TaskEffect = Arc::new(|_attempt| {
+    let panicking: TaskEffect = Arc::new(|_deps, _attempt| {
       Box::pin(async {
         panic!("scripted reconciler panic");
       })
@@ -1774,7 +1792,7 @@ mod tests {
     // The consume-once slot under test: a credential effect can only
     // hand its non-Clone secret out once.
     let slot = Arc::new(Mutex::new(Some(issued)));
-    let effect: TaskEffect = Arc::new(move |_attempt| {
+    let effect: TaskEffect = Arc::new(move |_deps, _attempt| {
       let slot = Arc::clone(&slot);
       Box::pin(async move {
         let issued = slot

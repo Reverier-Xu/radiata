@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
   Endpoint, Error, Event, EventOptions, EventSubscription, MergeCredential, NodeId,
   NodeMetadataPatch, NodeStatus, OutboundStream, ProtocolTag, PublicKey, Result, ShutdownOutcome,
-  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TraceId,
+  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, Task, TraceId,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
   node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Topology, Trust},
@@ -185,16 +185,23 @@ impl NodeHandle {
   /// Merges this node into the receiver's cluster by presenting the
   /// join credential: `receiver` is the receiver's listen endpoint and
   /// `credential` is the live credential the receiver issued
-  /// ([`NodeHandle::credentials`]). Returns the merged membership view.
-  pub async fn join(&self, receiver: Endpoint, credential: MergeCredential) -> Result<MergeView> {
-    self
-      .runtime
-      .send_command(move |reply| Control::MergeCluster {
-        receiver,
-        credential,
-        reply,
-      })
-      .await
+  /// ([`NodeHandle::credentials`]). Returns the admitted [`Task`], whose
+  /// `wait` resolves with the merged membership view.
+  ///
+  /// Admission-time failures are the pure shape checks (a stopped node,
+  /// an endpoint whose transport selector does not resolve); the dial,
+  /// the merge handshake, and the frozen-store refusal are effect-time
+  /// and surface on the task's `wait`.
+  pub async fn join(
+    &self, receiver: Endpoint, credential: MergeCredential,
+  ) -> Result<Task<MergeView>> {
+    crate::runtime::join(
+      &self.extensions,
+      self.runtime.admit()?,
+      receiver,
+      credential,
+    )
+    .await
   }
 
   /// Actively leaves the cluster: replaces the node's identity
@@ -237,26 +244,28 @@ impl NodeHandle {
   /// cadence. A contradicted or revoked binding, or any handshake
   /// failure, is [`crate::ErrorKind::AuthenticationFailed`] or
   /// [`crate::ErrorKind::Revoked`] and is never retryable.
-  pub async fn connect(&self, receiver: Endpoint, peer: NodeId) -> Result<NodeId> {
-    self
-      .runtime
-      .send_command(move |reply| Control::ConnectMember {
-        receiver,
-        peer,
-        reply,
-      })
-      .await
+  ///
+  /// Returns the admitted [`Task`], whose `wait` resolves with the
+  /// authenticated peer. Admission-time failures are the pure shape
+  /// checks (a stopped node, an endpoint whose transport selector does
+  /// not resolve); the dial and handshake failures are effect-time and
+  /// surface on the task's `wait`.
+  pub async fn connect(&self, receiver: Endpoint, peer: NodeId) -> Result<Task<NodeId>> {
+    crate::runtime::connect(&self.extensions, self.runtime.admit()?, receiver, peer).await
   }
 
   /// Closes the authenticated session to one peer: the session is torn
-  /// down now and the peer leaves the recovery plane until a later
-  /// session restores it. The peer's membership (binding and descriptor)
-  /// is untouched — to end a membership, use the leave flow instead.
-  pub async fn disconnect(&self, peer: NodeId) -> Result<()> {
-    self
-      .runtime
-      .send_command(move |reply| Control::DisconnectPeer { peer, reply })
-      .await
+  /// down by the admitted task and the peer leaves the recovery plane
+  /// until a later session restores it. The peer's membership (binding
+  /// and descriptor) is untouched — to end a membership, use the leave
+  /// flow instead.
+  ///
+  /// The verb's only failure is the admission-time shutdown gate; the
+  /// teardown itself is idempotent (a peer with no session is not an
+  /// error), so a `wait` on the task fails only with a store or session
+  /// table failure.
+  pub async fn disconnect(&self, peer: NodeId) -> Result<Task<()>> {
+    crate::runtime::disconnect(self.runtime.admit()?, peer).await
   }
 
   /// Updates the local node's own descriptor (owner-only node

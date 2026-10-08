@@ -39,6 +39,10 @@ pub const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/pending-tran
 /// would invalidate the in-flight accept's hint forever (rotate once,
 /// retry with the same secret). Merge-sensitive operations
 /// transiently refuse while concurrent metadata commits hold the store.
+///
+/// The retry ladder covers both halves of the migrated join: the
+/// admission (a stopping node refuses admission typed) and the effect
+/// (the dial and merge handshake, observed through the task's `wait`).
 pub async fn merge_with_retry(
   node: &radiata::NodeHandle, issuer: &radiata::NodeHandle, endpoint: radiata::Endpoint,
 ) {
@@ -50,7 +54,11 @@ pub async fn merge_with_retry(
   loop {
     attempts += 1;
     let credential = MergeCredential::parse(&secret).unwrap();
-    match node.join(endpoint.clone(), credential).await {
+    let joined = match node.join(endpoint.clone(), credential).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(_) => return,
       Err(error) => {
         assert!(

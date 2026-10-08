@@ -342,6 +342,9 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     .handle
     .disconnect(issuer.id.clone().unwrap())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   issuer.handle.shutdown().await.unwrap();
   member.handle.shutdown().await.unwrap();

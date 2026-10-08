@@ -513,16 +513,31 @@ async fn recovery_heals_a_disconnected_peer_whose_session_returns_and_drops() {
 
   // a disconnects b: the session is torn down and b leaves a's recovery
   // history for now.
-  a.disconnect(b_id.clone()).await.unwrap();
+  a.disconnect(b_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   // b dials back on its own: a accepts the inbound member session, and
   // b is known-online again through it.
-  b.connect(a_endpoint, a_id.clone()).await.unwrap();
+  b.connect(a_endpoint, a_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
   // Let a recovery tick observe the alive session.
   tokio::time::sleep(Duration::from_secs(5)).await;
   // b drops the session from its side: b is now an unreachable known
   // member with a published endpoint — the recovery plane must count it
   // pending and dial it back.
-  b.disconnect(a_id.clone()).await.unwrap();
+  b.disconnect(a_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
 
   // First the drop must surface as unreachability (a genuinely counts
   // the member again), then recovery must heal the session without

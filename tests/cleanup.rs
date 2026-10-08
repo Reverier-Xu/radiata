@@ -171,11 +171,15 @@ async fn cleanup_converges_and_excludes_the_subject() {
   // arrives (the refusal happens before any dial).
   let deadline = std::time::Instant::now() + Duration::from_secs(30);
   loop {
-    let refused = observer
+    let refused = match observer
       .handle
       .connect(subject_endpoint.clone(), subject_id.clone())
       .await
-      .is_err_and(|error| error.kind() == ErrorKind::NotTrusted);
+    {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    }
+    .is_err_and(|error| error.kind() == ErrorKind::NotTrusted);
     if refused {
       break;
     }
@@ -231,6 +235,9 @@ async fn cleanup_converges_and_excludes_the_subject() {
       MergeCredential::parse(&secret).unwrap(),
     )
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   // The responder's cleaned-subject rejection crosses the wire as the
   // generic authentication failure (no handshake detail leaks).
@@ -278,6 +285,9 @@ async fn purge_revocation_clears_the_local_boundary() {
     .handle
     .connect(member_endpoint.clone(), member_id.clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Revoked);
 
@@ -295,6 +305,9 @@ async fn purge_revocation_clears_the_local_boundary() {
   issuer
     .handle
     .connect(member_endpoint.clone(), member_id)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 

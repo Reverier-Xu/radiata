@@ -75,7 +75,9 @@ async fn rotate_with_retry(issuer: &NodeHandle) -> radiata::IssuedMergeCredentia
 }
 
 /// One merge with bounded retries: a transient refusal consumes no
-/// credential, so each attempt reuses the same secret.
+/// credential, so each attempt reuses the same secret. The ladder covers
+/// both halves of the migrated join — the admission and the dial/merge
+/// effect observed through the task's `wait`.
 async fn merge_with_retry(
   node: &NodeHandle, endpoint: &Endpoint, secret: &str,
 ) -> radiata::MergeView {
@@ -86,10 +88,14 @@ async fn merge_with_retry(
   let mut attempts = 0_u32;
   loop {
     attempts = attempts.wrapping_add(1);
-    match node
+    let joined = match node
       .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(retry_backoff(attempts)).await;
@@ -106,10 +112,14 @@ async fn merge_with_retry(
 async fn merge_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radiata::MergeView {
   let deadline = std::time::Instant::now() + Duration::from_secs(120);
   loop {
-    match node
+    let joined = match node
       .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
       .await
     {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match joined {
       Ok(view) => return view,
       Err(_) if std::time::Instant::now() < deadline => {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -310,6 +320,9 @@ async fn secure_join_wrong_credential_fails_without_merge() {
   let error = joiner
     .handle
     .join(listener.endpoint().clone(), wrong)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -714,6 +727,9 @@ async fn secure_join_rotation_keeps_members_and_reconnect_is_credential_free() {
   let authenticated = restarted
     .handle
     .connect(listener.endpoint().clone(), receiver_id.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(authenticated, receiver_id.clone());
@@ -1159,6 +1175,9 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
         MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
       )
       .await
+      .unwrap()
+      .wait()
+      .await
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
   }
@@ -1171,6 +1190,9 @@ async fn secure_join_merge_rate_window_refuses_before_signing() {
   // normalize to one source) is refused before any signing work.
   let error = attacker
     .join(listener.endpoint().clone(), hostile)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -1236,6 +1258,9 @@ async fn secure_join_copied_credential_shares_generation_until_rotated() {
     .handle
     .join(listener.endpoint().clone(), copied)
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   let receiver_id = receiver
     .handle
@@ -1257,6 +1282,9 @@ async fn secure_join_copied_credential_shares_generation_until_rotated() {
   let error = third
     .handle
     .join(listener.endpoint().clone(), copied)
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
@@ -1459,6 +1487,9 @@ async fn secure_join_merge_after_listener_stop_fails_closed() {
     .handle
     .join(listener.endpoint().clone(), issued.into_credential())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap_err();
   assert!(
     matches!(
@@ -1531,6 +1562,9 @@ async fn secure_join_crossed_dial_converges_to_one_session() {
   let authenticated = receiver
     .handle
     .connect(joiner_listener.endpoint().clone(), joiner_id.clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
   assert_eq!(authenticated, joiner_id);

@@ -212,11 +212,15 @@ impl Node {
     let endpoint = peer.endpoint().clone();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-      match self
+      let connected = match self
         .handle
         .connect(endpoint.clone(), peer.id().clone())
         .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match connected {
         Ok(_) => return,
         Err(error) => {
           assert!(
@@ -306,13 +310,17 @@ async fn boot_linear_four(with_policy: bool) -> (Vec<Node>, SharedTable) {
     let mut attempts = 0_u32;
     loop {
       attempts += 1;
-      let result = nodes[member_index]
+      let result = match nodes[member_index]
         .handle
         .join(
           nodes[0].endpoint().clone(),
           radiata::MergeCredential::parse(&secret).unwrap(),
         )
-        .await;
+        .await
+      {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
       match result {
         Ok(view) => {
           nodes[member_index].set_id(view.node().clone());
@@ -381,10 +389,16 @@ async fn settle_linear_chain(nodes: &[Node]) {
     .handle
     .disconnect(nodes[3].id().clone())
     .await
+    .unwrap()
+    .wait()
+    .await
     .unwrap();
   nodes[3]
     .handle
     .disconnect(nodes[0].id().clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 
@@ -548,6 +562,9 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   nodes[2]
     .handle
     .disconnect(nodes[3].id().clone())
+    .await
+    .unwrap()
+    .wait()
     .await
     .unwrap();
 

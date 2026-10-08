@@ -438,11 +438,15 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
       let credential = radiata::MergeCredential::parse(&secret).unwrap();
-      match member
+      let joined = match member
         .handle
         .join(nodes[0].endpoint.clone(), credential)
         .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match joined {
         Ok(_) => break,
         Err(error) => {
           assert!(
@@ -610,11 +614,15 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
     let deadline = Instant::now() + merge_deadline;
     loop {
       let credential = radiata::MergeCredential::parse(&secret).unwrap();
-      match member
+      let joined = match member
         .handle
         .join(nodes[0].endpoint.clone(), credential)
         .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match joined {
         Ok(_) => break,
         Err(error) => {
           assert!(

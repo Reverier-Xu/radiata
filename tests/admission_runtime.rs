@@ -90,7 +90,12 @@ fn keys_at(seed: u64) -> Arc<ScriptedKeys> {
 async fn merge(
   node: &Node, endpoint: &Endpoint, credential: MergeCredential,
 ) -> radiata::Result<radiata::MergeView> {
-  node.handle.join(endpoint.clone(), credential).await
+  node
+    .handle
+    .join(endpoint.clone(), credential)
+    .await?
+    .wait()
+    .await
 }
 
 /// Issues one merge credential with bounded retries: merge-sensitive
@@ -166,10 +171,14 @@ async fn admission_runtime_indeterminate_blocks_rotation_reuse_and_listening() {
   // before the credential is verified or any identity signature is made.
   let gate_credential =
     MergeCredential::parse("join_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-  let merge_result = fresh_joiner
+  let merge_result = match fresh_joiner
     .handle
     .join(listener.endpoint().clone(), gate_credential)
-    .await;
+    .await
+  {
+    Ok(task) => task.wait().await,
+    Err(error) => Err(error),
+  };
   assert!(
     merge_result.is_err(),
     "frozen receiver must refuse the merge at the responder gate"

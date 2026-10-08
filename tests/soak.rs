@@ -388,18 +388,25 @@ async fn soak_churn_then_baseline_return() {
     // every sixty-four ticks, rotate the admission credential.
     if tick.is_multiple_of(16) && std::env::var("RADIATA_SOAK_NO_CHURN").is_err() {
       let churned = &members[(tick as usize / 16) % members.len()];
-      match issuer.handle.disconnect(churned.id().clone()).await {
-        Ok(_) => {}
-        Err(error) => stats.failures.push(WorkloadFailure {
+      let disconnected = match issuer.handle.disconnect(churned.id().clone()).await {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      if let Err(error) = disconnected {
+        stats.failures.push(WorkloadFailure {
           operation: "disconnect",
           kind: format!("{:?}", error.kind()),
-        }),
+        });
       }
-      match issuer
+      let reconnected = match issuer
         .handle
         .connect(churned.endpoint().clone(), churned.id().clone())
         .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match reconnected {
         Ok(_) => stats.reconnects += 1,
         Err(error) => stats.failures.push(WorkloadFailure {
           operation: "reconnect",
@@ -429,11 +436,15 @@ async fn soak_churn_then_baseline_return() {
   for member in &members {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-      match issuer
+      let reconnected = match issuer
         .handle
         .connect(member.endpoint().clone(), member.id().clone())
         .await
       {
+        Ok(task) => task.wait().await,
+        Err(error) => Err(error),
+      };
+      match reconnected {
         Ok(_) => break,
         Err(error) => {
           assert!(
