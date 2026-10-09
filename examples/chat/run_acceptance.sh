@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-shot real-scenario acceptance for the chat example: fresh 5-node
-# mesh, the full scenario matrix, the boundary-condition suite, then the
-# scenario fuzz harness over seeded operations.
+# mesh, the full scenario matrix, the boundary-condition suite, the
+# async-task scenarios, then the scenario fuzz harness over seeded
+# operations.
 #
 #   ./run_acceptance.sh              # matrix + boundary + fuzz (2 seeds)
 #   ./run_acceptance.sh --no-fuzz    # skip the fuzz phase
@@ -31,6 +32,13 @@ if ! python3 test_boundary.py > /tmp/acceptance_boundary.log 2>&1; then
   exit 1
 fi
 grep -E "^\[b" /tmp/acceptance_boundary.log
+
+echo "=== acceptance: async-task scenarios ==="
+if ! python3 test_tasks.py > /tmp/acceptance_tasks.log 2>&1; then
+  echo "FAIL: async-task scenarios — see /tmp/acceptance_tasks.log"
+  exit 1
+fi
+grep -E "^\[|===" /tmp/acceptance_tasks.log | tail -6
 
 if [ "$FUZZ_ENABLED" = "1" ]; then
   echo "=== acceptance: scenario fuzz (audit mesh) ==="

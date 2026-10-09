@@ -159,11 +159,22 @@ async fn main() {
   tracing::info!(%addr, "chat http api up");
   axum::serve(listener, http::router(Arc::clone(&state)))
     .with_graceful_shutdown(async {
-      let _ = tokio::signal::ctrl_c().await;
-      if let Ok(mut term) =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-      {
-        let _ = term.recv().await;
+      // SIGINT and SIGTERM must race, not queue: the operator's stop
+      // signal arrives as SIGTERM (docker/podman stop, systemd), and a
+      // sequential `ctrl_c().await` would never wake to subscribe for
+      // it — the stop would degenerate into the engine's SIGKILL.
+      let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+      tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = async move {
+          match term {
+            Ok(mut term) => {
+              term.recv().await;
+            }
+            // No SIGTERM on this platform: SIGINT owns the shutdown.
+            Err(_) => std::future::pending::<()>().await,
+          }
+        } => {}
       }
       tracing::info!("shutting down");
     })
