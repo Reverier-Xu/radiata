@@ -70,6 +70,21 @@ channel is plaintext-class: socket file permissions are the
 confidentiality boundary, and the session handshake authenticates every
 peer as on any other transport.
 
+## Task observability
+
+Every mutating verb (`join`, `leave`, `connect`, resource writes, …)
+admits a task: the effect runs inside the node's task manager, walks the
+phase machine (`Pending` → `Running` → `Succeeded`/`Failed`) within a
+bounded retry budget, and `send`/reads stay synchronous. `GET /tasks`
+exposes that table read-only as one compact JSON array of
+`{id, kind, phase, attempts}` per task, so the async model is observable
+from the user seat. `test_tasks.py` exercises it: a concurrent join
+storm (3 extra nodes joining at once), a wedged join against a dead
+endpoint that must fail typed without stalling the data plane, the
+success-path observability check, and the terminal semantics of
+`/leave` (active-leave shutdown, clean container exit, peer-roster
+convergence).
+
 ## Run
 
 ```bash
@@ -82,12 +97,12 @@ python3 test_fuzz.py --seed 7 --ops 60   # seeded scenario fuzz (FUZZ=1 mesh)
 ```
 
 `./run_acceptance.sh` runs the whole acceptance in one shot on fresh
-meshes (matrix, boundary, two fuzz seeds).
+meshes (matrix, boundary, async-task scenarios, two fuzz seeds).
 
 The node binary speaks the same command set over HTTP: `/whoami`,
 `/identities`, `/announce`, `/announcements`, `/dm`, `/flush`,
 `/messages`, `/read`, `/groups`, `/groups/{name}/join|send|dissolve`,
-`/disconnect`, `/mesh`.
+`/disconnect`, `/tasks`, `/mesh`.
 
 ## Deliberate example limitations
 

@@ -927,6 +927,35 @@ async fn mesh_sessions(
   })))
 }
 
+/// Read-only task observability: walks every page of the node's task
+/// table into one compact JSON array ({id, kind, phase, attempts}). The
+/// declarative async model — every mutating verb admits a task that walks
+/// the phase machine to a terminal verdict inside the task manager — is
+/// observable from the user seat without any library internals. Kinds
+/// render via Debug.
+async fn tasks(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+  let mut tasks: Vec<Value> = Vec::new();
+  let mut next = Some(PageSpec::first(64).map_err(name_error)?);
+  while let Some(page) = next {
+    let view = state.node.tasks().list(page).await.map_err(internal)?;
+    tasks.extend(view.items().iter().map(|task| {
+      json!({
+        "id": task.id().to_string(),
+        "kind": format!("{:?}", task.kind()),
+        "phase": format!("{:?}", task.phase()),
+        "attempts": task.attempts(),
+      })
+    }));
+    next = view
+      .next()
+      .cloned()
+      .map(|cursor| PageSpec::after(cursor, 64))
+      .transpose()
+      .map_err(name_error)?;
+  }
+  Ok(Json(Value::Array(tasks)))
+}
+
 fn label_map_json(view: &radiata::MemberView) -> serde_json::Map<String, Value> {
   view
     .labels()
@@ -1085,6 +1114,18 @@ async fn leave(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Js
     .wait()
     .await
     .map_err(internal)?;
+  // The task's wait resolves with the outcome before any teardown
+  // begins; awaiting the shutdown here makes this response and the log
+  // line below observe the settled post-leave state: the node stopped
+  // with the active-leave reason, and only this HTTP surface keeps the
+  // process alive — the operator stops the container from here.
+  let reason = state.node.wait_for_shutdown().await.map_err(internal)?;
+  tracing::info!(
+    former = %outcome.former_identity().as_str(),
+    replacement = %outcome.replacement_identity().as_str(),
+    ?reason,
+    "chat node left the cluster: active-leave shutdown complete"
+  );
   Ok(Json(json!({
     "left": true,
     "former_identity": outcome.former_identity().as_str(),
@@ -1112,6 +1153,7 @@ pub fn router(state: SharedState) -> Router {
     .route("/metadata", get(get_metadata).post(update_metadata))
     .route("/labels/{user}", get(member_labels))
     .route("/mesh-sessions", get(mesh_sessions))
+    .route("/tasks", get(tasks))
     .route("/disconnect", post(disconnect))
     .route("/connect", post(connect))
     .route("/leave", post(leave))
