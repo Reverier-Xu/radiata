@@ -98,8 +98,13 @@
      `StreamInterrupted` 解决，本项只余 route record 语义。
    - 文件面：`src/routing/outbound.rs`、`src/session/inbound.rs`。
 7. **durable route-trace 终态与内存 record 分叉（durable twin 未镜像迟到失败）**
-   （lane-g 复核发现，主控裁决登记）
-   - 证据：`src/routing/outbound.rs` pump 尾部——`update_route(Delivered)` 被单调终态机
+   （lane-g 复核发现，主控裁决登记）——**已修复（lane-i，方向 a 完整镜像，本 PR）**：
+   迟到 Failed 翻转内存 record 时经 `revise_terminal_failure` 修订 durable 行（单次修订
+   原语 + 有界重试，全局 revision CAS 下 fail-safe）；pump 尾部在 Delivered 被拒时跳过
+   emit 与 durable 写；TraceSink 经 `SessionPacketContext` 单构造点穿进 read loop。
+   审查修正一并落地：内部控制流量的排除扩展到修订路径（`RouteRecord.internal` 旗标）、
+   翻转路径补 `RouteChanged` 事件（订阅者不再漏掉终态转换）、重试充分性注释修正。
+   - 原证据：`src/routing/outbound.rs` pump 尾部——`update_route(Delivered)` 被单调终态机
      拒绝后，仍无条件 emit RouteChanged 并经 `record_terminal_trace` 持久化 durable
      终态 `Delivered`；真实落序下 pump 尾部先落，durable store 对一条消费者已收到
      `StreamInterrupted` 的路由保留 `Delivered` 整个保留期。durable trace 的记录访问器
@@ -223,6 +228,16 @@ landing hold RAII 化 + 时限盒（`store.rs:105-119` 的 `LandingHold`）；in
 4. **SPKI 锚仍为进程内有效（语义与修复前一致，#67 补充了换证兜底）**。重启丢锚、
    不再重新 pin 的行为不变（`src/session/driver.rs` 的 `MemberSpkiTable` 语义注释）；
    对端合法换证由 pin 失败回退一次 Merge 拨号 + 认证后重录锚兜底（#67）。
+
+## 已知 CI flake（观察登记）
+
+以下失败已证实与被测改动无关（重跑即过 / 出现在 docs-only PR 上），登记以便后续审计不归因错误：
+
+1. `secure_join_packet_streams_ordered_after_authentication`（windows-latest, redb-only）：
+   2026-10-10 在 PR #73 上以 `RouteUnavailable` 失败一次（会话建立时序竞态），重跑通过。
+2. `event_parity::existing_events_fire_exactly_once_for_the_scripted_sequence`（container job）：
+   2026-10-10 在 main 的 docs-only 合并（#68）后失败一次，下轮通过。事件恰好一次语义
+   有 suite 内其它确定性测试钉住，此例疑似容器环境时序抖动，若复发需专项排查。
 
 ---
 
