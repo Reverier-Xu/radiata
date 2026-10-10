@@ -140,8 +140,15 @@ impl Supervisor {
     if self.prune_cooldown > 0 {
       return Ok(());
     }
-    let (marked, unmarked): (Vec<NodeId>, Vec<NodeId>) = {
-      let sessions = self
+    // The scan and the removal share ONE session-table lock span: the
+    // victim is removed by the exact entry identity the scan observed
+    // (re-verified as an alive, direct, recovery-dialed edge), so a
+    // reconnect that replaces the map entry in any window can never be
+    // retired as the old redundant edge (audit 2026-10-09 item 13
+    // addendum:
+    // the recovery-dialed flag belongs to the entry, not the key).
+    let victim: Option<(NodeId, crate::session::stream::SessionEntry)> = {
+      let mut sessions = self
         .dependencies
         .sessions
         .lock()
@@ -158,17 +165,28 @@ impl Supervisor {
           unmarked.push(peer.clone());
         }
       }
-      (marked, unmarked)
+      // The star-preservation rule: pruning requires a non-recovery edge
+      // to keep this node connected, so the fallback route survives the
+      // cut. The highest peer id remains the deterministic victim.
+      let Some(victim) = marked.iter().max().cloned() else {
+        return Ok(());
+      };
+      if unmarked.is_empty() {
+        return Ok(());
+      }
+      let removable = sessions
+        .get(&victim)
+        .is_some_and(|entry| entry.alive() && entry.recovery_dialed());
+      removable
+        .then(|| sessions.remove(&victim).map(|entry| (victim, entry)))
+        .flatten()
     };
-    // The star-preservation rule: pruning requires a non-recovery edge to
-    // keep this node connected, so the fallback route survives the cut.
-    let Some(victim) = marked.iter().max().cloned() else {
+    // Retire the exact observed entry outside the table lock; the entry
+    // is already removed, so the key is free for a concurrent dial.
+    let Some((victim, entry)) = victim else {
       return Ok(());
     };
-    if unmarked.is_empty() {
-      return Ok(());
-    }
-    crate::session::stream::retire_session(&self.dependencies.sessions, &victim)?;
+    crate::session::stream::retire(&entry);
     self
       .dependencies
       .events
@@ -223,6 +241,32 @@ impl Supervisor {
   pub(super) async fn known_online_members(
     &self, store: &crate::storage::MetadataStore,
   ) -> Result<std::collections::BTreeMap<NodeId, Endpoint>> {
+    // The degree plane's member view: the same recovery universe
+    // projected to each member's first published endpoint (the degree
+    // dialer's single-endpoint selection contract).
+    let members = self.known_online_member_endpoints(store).await?;
+    Ok(
+      members
+        .into_iter()
+        .filter_map(|(node, endpoints)| {
+          endpoints
+            .into_iter()
+            .next()
+            .map(|endpoint| (node, endpoint))
+        })
+        .collect(),
+    )
+  }
+
+  /// The full recovery universe with EVERY published endpoint per
+  /// member: a multi-homed member's later endpoints stay dial candidates,
+  /// and the recovery tick rotates through them across attempts
+  /// (endpoint-level failover), so a member whose first endpoint is
+  /// unreachable is still reached on the others (audit 2026-10-09
+  /// item 7).
+  async fn known_online_member_endpoints(
+    &self, store: &crate::storage::MetadataStore,
+  ) -> Result<std::collections::BTreeMap<NodeId, Vec<Endpoint>>> {
     let context = self.context()?;
     // Departed identities (left or cleaned) are no longer cluster
     // members: they never enter the member table, so the recovery plane
@@ -240,7 +284,7 @@ impl Supervisor {
     let snapshot = store.snapshot().await?;
     let namespace = crate::membership::descriptor_namespace()?;
     let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
-    let mut known_members: std::collections::BTreeMap<NodeId, Endpoint> =
+    let mut known_members: std::collections::BTreeMap<NodeId, Vec<Endpoint>> =
       std::collections::BTreeMap::new();
     while let Some(entry) = scan.next().await? {
       let decoded = crate::membership::page::decode_descriptor(entry.value().as_bytes());
@@ -261,13 +305,13 @@ impl Supervisor {
       {
         continue;
       }
-      if let Some(endpoint) = descriptor.endpoints().first() {
-        known_members.insert(node, endpoint.clone());
-      } else {
+      if descriptor.endpoints().is_empty() {
         // No published endpoint: recovery stays best-effort, but the
         // skip is visible in diagnostics instead of silent.
         tracing::debug!(member = %node.as_str(), "no published endpoint; skipped");
+        continue;
       }
+      known_members.insert(node, descriptor.endpoints().to_vec());
     }
     Ok(known_members)
   }
@@ -292,7 +336,7 @@ impl Supervisor {
       .collect();
     let context = self.context()?;
     let store = context.store();
-    let known_members = self.known_online_members(store).await?;
+    let known_members = self.known_online_member_endpoints(store).await?;
     let known: std::collections::BTreeSet<NodeId> = known_members.keys().cloned().collect();
     let now = crate::time::now_seconds();
     let dial_due = {
@@ -315,11 +359,13 @@ impl Supervisor {
     }
     // The node is fully isolated: retry every table member it is not
     // directly connected to, one bounded fan-out step at a time, until
-    // any one connects (the "any one route" deployment contract).
-    let mut candidates = std::collections::BTreeSet::new();
+    // any one connects (the "any one route" deployment contract). The
+    // candidate set carries every published endpoint per member.
+    let mut candidates: std::collections::BTreeMap<NodeId, Vec<Endpoint>> =
+      std::collections::BTreeMap::new();
     for member in known.difference(&direct) {
-      if let Some(endpoint) = known_members.get(member) {
-        candidates.insert((member.clone(), endpoint.clone()));
+      if let Some(endpoints) = known_members.get(member) {
+        candidates.insert(member.clone(), endpoints.clone());
       }
     }
     let step = {
@@ -329,79 +375,94 @@ impl Supervisor {
         .map_err(|_| crate::Error::internal("recovery controller"))?;
       controller.next_step(
         now,
-        &candidates
-          .iter()
-          .map(|(member, _)| member.clone())
-          .collect(),
+        &candidates.keys().cloned().collect(),
         self.dependencies.entropy.as_ref(),
       )
     };
-    for (member, endpoint) in candidates {
-      if step.targets.contains(&member) {
-        // Recovery dials run in a detached task so the supervisor select
-        // loop never blocks on a handshake (each holds its in-flight
-        // slot no longer than the configured dial deadline plus the
-        // authentication deadline); the result is reconciled by the next
-        // observation tick.
-        self
-          .recovery_pending
-          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let receiver = endpoint.clone();
-        let peer = member.clone();
-        let driver = self.driver.clone();
-        let sessions = self.dependencies.sessions.clone();
-        let packet = self.packet.clone();
-        let shutdown = self.shutdown_tx.subscribe();
-        let pending = std::sync::Arc::clone(&self.recovery_pending);
-        let transport = match self
-          .dependencies
-          .extensions
-          .resolve_transport(&endpoint.selector())
+    for member in step.targets {
+      let Some(endpoints) = candidates.get(&member) else {
+        continue;
+      };
+      // Endpoint-level failover: successive attempts for one member
+      // rotate through its published endpoints (audit 2026-10-09
+      // item 7), so a multi-homed member whose current endpoint is
+      // unreachable is retried on the others.
+      let Some(endpoint) = recovery_endpoint(endpoints, step.attempt) else {
+        continue;
+      };
+      // Recovery dials run in a detached task so the supervisor select
+      // loop never blocks on a handshake (each holds its in-flight
+      // slot no longer than the configured dial deadline plus the
+      // authentication deadline); the result is reconciled by the next
+      // observation tick.
+      self
+        .recovery_pending
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      let receiver = endpoint.clone();
+      let peer = member.clone();
+      let driver = self.driver.clone();
+      let sessions = self.dependencies.sessions.clone();
+      let packet = self.packet.clone();
+      let shutdown = self.shutdown_tx.subscribe();
+      let pending = std::sync::Arc::clone(&self.recovery_pending);
+      let transport = match self
+        .dependencies
+        .extensions
+        .resolve_transport(&endpoint.selector())
+      {
+        Ok(transport) => transport,
+        // No transport for the endpoint: the detached dial fails and
+        // releases its in-flight slot through the normal error path.
+        Err(error) => {
+          let _ = self
+            .recovery_pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+          tracing::debug!(endpoint = %endpoint.as_str(), kind = ?error.kind(), "recovery dial unresolvable");
+          continue;
+        }
+      };
+      let dial_deadline = self.dependencies.config.dial_deadline();
+      tokio::spawn(async move {
+        if let Err(error) = dial_member(
+          transport,
+          driver,
+          sessions,
+          packet,
+          shutdown,
+          receiver,
+          &peer,
+          true,
+          dial_deadline,
+        )
+        .await
         {
-          Ok(transport) => transport,
-          // No transport for the endpoint: the detached dial fails and
-          // releases its in-flight slot through the normal error path.
-          Err(error) => {
-            let _ = self
-              .recovery_pending
-              .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(endpoint = %endpoint.as_str(), kind = ?error.kind(), "recovery dial unresolvable");
-            continue;
-          }
-        };
-        let dial_deadline = self.dependencies.config.dial_deadline();
-        tokio::spawn(async move {
-          if let Err(error) = dial_member(
-            transport,
-            driver,
-            sessions,
-            packet,
-            shutdown,
-            receiver,
-            &peer,
-            true,
-            dial_deadline,
-          )
-          .await
-          {
-            // A refused dial is expected while a peer restarts; the
-            // failure surfaces for the recovery controller's next
-            // observation tick instead of vanishing here.
-            tracing::warn!(
-              peer = %peer.as_str(),
-              kind = ?error.kind(),
-              "recovery dial failed"
-            );
-          }
-          // Release the in-flight slot when the dial resolves, so recovery
-          // stays alive across repeated partition waves (the counter bounds
-          // in-flight dials, not lifetime volume).
-          pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        });
-      }
+          // A refused dial is expected while a peer restarts; the
+          // failure surfaces for the recovery controller's next
+          // observation tick instead of vanishing here.
+          tracing::warn!(
+            peer = %peer.as_str(),
+            kind = ?error.kind(),
+            "recovery dial failed"
+          );
+        }
+        // Release the in-flight slot when the dial resolves, so recovery
+        // stays alive across repeated partition waves (the counter bounds
+        // in-flight dials, not lifetime volume).
+        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+      });
     }
     Ok(())
   }
+}
+
+/// The endpoint one recovery attempt dials for a multi-homed member:
+/// the attempt serial rotates through the member's published endpoints,
+/// so a member whose current endpoint is unreachable is retried on the
+/// others across successive attempts (audit 2026-10-09 item 7). The
+/// first attempt of every schedule dials the first published endpoint.
+fn recovery_endpoint(endpoints: &[Endpoint], attempt: u64) -> Option<&Endpoint> {
+  let index = attempt.saturating_sub(1) as usize % endpoints.len().max(1);
+  endpoints.get(index)
 }
 
 /// The memoized departed-members exclusion set, keyed by the store
@@ -450,4 +511,33 @@ pub(super) async fn departed_exclusions(
     *guard = Some((revision, departed.clone()));
   }
   Ok(departed)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::recovery_endpoint;
+  use crate::Endpoint;
+
+  fn endpoint(port: u16) -> Endpoint {
+    Endpoint::parse(&format!("wss://10.0.0.1:{port}")).unwrap()
+  }
+
+  /// Endpoint-level failover (audit 2026-10-09 item 7): the attempt
+  /// serial rotates a multi-homed member through its published endpoints
+  /// — the first attempt of every schedule dials the first endpoint,
+  /// later attempts the others, and the sweep wraps.
+  #[test]
+  fn recovery_endpoints_rotate_with_the_attempt_serial() {
+    let endpoints = vec![endpoint(1), endpoint(2), endpoint(3)];
+    assert_eq!(recovery_endpoint(&endpoints, 1), Some(&endpoints[0]));
+    assert_eq!(recovery_endpoint(&endpoints, 2), Some(&endpoints[1]));
+    assert_eq!(recovery_endpoint(&endpoints, 3), Some(&endpoints[2]));
+    assert_eq!(recovery_endpoint(&endpoints, 4), Some(&endpoints[0]));
+
+    // A single-endpoint member always dials it...
+    let single = vec![endpoint(9)];
+    assert_eq!(recovery_endpoint(&single, 7), Some(&single[0]));
+    // ...and an endpointless member (never a candidate) dials nothing.
+    assert_eq!(recovery_endpoint(&[], 7), None);
+  }
 }

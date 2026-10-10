@@ -53,6 +53,10 @@ pub(crate) enum RecoveryState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryStep {
   pub(crate) targets: Vec<NodeId>,
+  /// The attempt serial this step consumed: the dial plane rotates a
+  /// multi-homed member through its published endpoints with this serial
+  /// (endpoint-level failover, audit 2026-10-09 item 7).
+  pub(crate) attempt: u64,
   /// The wall-clock wait the just-taken attempt scheduled (the jittered
   /// next doubling's base), and `0` when the deadline is already due
   /// (the caller wakes immediately).
@@ -74,6 +78,12 @@ pub(crate) struct RecoveryController {
   /// same sampled value. `None` before the first step of a schedule.
   scheduled_backoff: Option<u64>,
   pending: BTreeSet<NodeId>,
+  /// The rotating candidate window: each step takes the next `fan_out`
+  /// candidates starting at this offset (modulo the candidate count), so
+  /// an isolated node sweeps its whole member table across successive
+  /// attempts instead of retrying the same dictionary-order prefix
+  /// forever (audit 2026-10-09 item 7).
+  cursor: usize,
 }
 
 impl RecoveryController {
@@ -85,6 +95,7 @@ impl RecoveryController {
       last_attempt_at: 0,
       scheduled_backoff: None,
       pending: BTreeSet::new(),
+      cursor: 0,
     }
   }
 
@@ -155,21 +166,35 @@ impl RecoveryController {
   /// (rollback/freeze delays it, a forward jump makes it due and the
   /// returned wait collapses to zero). The first attempt runs immediately
   /// upon activation, so the first retry waits the doubled initial.
+  ///
+  /// The target window ROTATES: each step starts at the cursor's offset
+  /// in the deterministic candidate order and advances by the width
+  /// taken, so consecutive steps cover disjoint members until the sweep
+  /// wraps — a prefix of permanently-down members can no longer starve
+  /// the rest of the table (audit 2026-10-09 item 7).
   pub(crate) fn next_step(
     &mut self, now: u64, candidates: &BTreeSet<NodeId>, entropy: &dyn Entropy,
   ) -> RecoveryStep {
-    let targets: Vec<NodeId> = candidates
-      .iter()
-      .take(self.policy.fan_out.max(1))
-      .cloned()
+    let fan_out = self.policy.fan_out.max(1);
+    let ordered: Vec<NodeId> = candidates.iter().cloned().collect();
+    let count = ordered.len();
+    let take = fan_out.min(count);
+    let start = if count == 0 { 0 } else { self.cursor % count };
+    let targets: Vec<NodeId> = (0..take)
+      .map(|offset| ordered[(start + offset) % count].clone())
       .collect();
+    if count > 0 {
+      self.cursor = self.cursor.wrapping_add(take);
+    }
     self.attempts = self.attempts.saturating_add(1);
+    let attempt = self.attempts;
     let sampled = self.sample_jitter(self.base_seconds(), entropy);
     let due_already = now >= self.last_attempt_at.saturating_add(sampled);
     self.last_attempt_at = now;
     self.scheduled_backoff = Some(sampled);
     RecoveryStep {
       targets,
+      attempt,
       backoff_seconds: if due_already { 0 } else { sampled },
     }
   }
@@ -434,6 +459,65 @@ mod tests {
     controller.observe(&online, &set(&[]));
     let step = controller.next_step(0, &set(&[2, 3, 4, 5, 6]), &entropy);
     assert_eq!(step.targets.len(), 2, "fan-out bounds each cycle");
+  }
+
+  /// The candidate window rotates (audit 2026-10-09 item 7): consecutive
+  /// steps cover disjoint members until the sweep wraps, so an isolated
+  /// node dials its whole member table across successive attempts
+  /// instead of retrying the same dictionary-order prefix forever.
+  #[test]
+  fn recovery_rotates_the_candidate_window_across_steps() {
+    let entropy = WordEntropy(0);
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(2, 1, 60));
+    let online = set(&[1, 2, 3, 4, 5, 6]);
+    controller.observe(&online, &set(&[]));
+
+    let first = controller.next_step(0, &online, &entropy);
+    assert_eq!(first.targets, vec![node(1), node(2)]);
+    let second = controller.next_step(1, &online, &entropy);
+    assert_eq!(second.targets, vec![node(3), node(4)]);
+    let third = controller.next_step(2, &online, &entropy);
+    assert_eq!(third.targets, vec![node(5), node(6)]);
+    // The sweep wraps to the beginning after covering every member.
+    let fourth = controller.next_step(3, &online, &entropy);
+    assert_eq!(fourth.targets, vec![node(1), node(2)]);
+
+    // Three fan-out-2 steps covered all six members exactly once.
+    let mut swept: Vec<crate::NodeId> = [
+      first.targets.clone(),
+      second.targets.clone(),
+      third.targets.clone(),
+    ]
+    .concat();
+    swept.sort();
+    assert_eq!(swept, online.iter().cloned().collect::<Vec<_>>());
+  }
+
+  /// The rotation survives a changing candidate set: after members leave
+  /// or connect, every target is still a current candidate and the window
+  /// stays inside the fan-out (the modulo just re-anchors the offset).
+  #[test]
+  fn the_rotating_window_survives_a_changing_candidate_set() {
+    let entropy = WordEntropy(0);
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(2, 1, 60));
+    let online = set(&[1, 2, 3, 4, 5, 6]);
+    controller.observe(&online, &set(&[]));
+    let _ = controller.next_step(0, &online, &entropy);
+    let _ = controller.next_step(1, &online, &entropy);
+
+    // Two members disappear (partition healed elsewhere): the remaining
+    // candidates are all that may be dialed.
+    let shrunk = set(&[1, 3, 5]);
+    let step = controller.next_step(2, &shrunk, &entropy);
+    assert!(step.targets.len() <= 2);
+    assert!(
+      step.targets.iter().all(|target| shrunk.contains(target)),
+      "every target must be a current candidate"
+    );
+    // A later step still dials further members of the shrunk set.
+    let next = controller.next_step(3, &shrunk, &entropy);
+    assert!(next.targets.iter().all(|target| shrunk.contains(target)));
+    assert!(!next.targets.is_empty());
   }
 
   /// An immediate-recovery command forces one cycle without storms.
