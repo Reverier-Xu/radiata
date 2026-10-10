@@ -909,20 +909,6 @@ impl Supervisor {
     (self.dependencies, aborted)
   }
 
-  /// Lazily publishes this node's own signed descriptor (revision 1) so
-  /// the public views always expose the local identity, with the
-  /// published listener endpoints. Delegates to the one shared
-  /// implementation the resource-write effects also use
-  /// ([`super::task_effects::ensure_self_descriptor`]).
-  pub(super) async fn ensure_self_descriptor(&mut self) -> Result<()> {
-    let operations = self
-      .dependencies
-      .operations
-      .as_ref()
-      .ok_or_else(|| Error::internal("runtime operations"))?;
-    super::task_effects::ensure_self_descriptor(operations).await
-  }
-
   pub(super) fn context(&self) -> Result<Arc<LocalIdentityContext>> {
     self
       .dependencies

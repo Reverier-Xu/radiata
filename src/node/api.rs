@@ -19,6 +19,16 @@ use crate::{
 };
 
 /// The public membership observations.
+///
+/// The local node's own descriptor publishes lazily: binding a
+/// listener publishes it synchronously with the listen task, but on a
+/// node that never bound one, the first member query only SCHEDULES
+/// that publication (so a slow store can never stall the query behind
+/// the descriptor's commit) and answers from committed state — that
+/// single first query may not yet list the local node. The scheduled
+/// publication lands with its paired
+/// [`MemberChanged`](crate::MemberChanged) event and member-revision
+/// bump, and every later query observes the local node.
 pub struct Members {
   runtime: RuntimeClient,
 }

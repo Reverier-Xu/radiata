@@ -242,14 +242,30 @@ async fn born_with_cluster_serves_immediately_without_ceremony() {
 
   // No creation ceremony exists: the local view resolves from the first
   // instant, and the singleton membership page is exactly the self node.
+  // (The listenerless self-descriptor publication is scheduled
+  // asynchronously now, so poll briefly until the self row lands.)
   let local = node.handle.local_node().await.unwrap();
   assert!(local.node_id().as_str().starts_with("node-"));
-  let members = node
+  let mut members = node
     .handle
     .members()
     .list(radiata::PageSpec::first(8).unwrap())
     .await
     .unwrap();
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while members.items().is_empty() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the lazy self-descriptor publication never landed"
+    );
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    members = node
+      .handle
+      .members()
+      .list(radiata::PageSpec::first(8).unwrap())
+      .await
+      .unwrap();
+  }
   assert!(
     members
       .items()
