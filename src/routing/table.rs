@@ -21,12 +21,26 @@ pub(crate) type RouteTable = Arc<Mutex<BTreeMap<TraceId, RouteRecord>>>;
 
 /// Inserts one route record under the configured capacity, evicting the
 /// oldest terminal record when full. Active records are never evicted.
+/// A recorded failure is final: an insert never replaces an existing
+/// `Failed` record — the same stickiness [`update_route`] enforces on
+/// updates — so no route progress can overwrite a terminal fact.
 pub(crate) fn insert_route(
   routes: &RouteTable, capacity: usize, record: RouteRecord,
 ) -> Result<()> {
   let mut table = routes
     .lock()
     .map_err(|_| Error::internal("route records"))?;
+  insert_locked(&mut table, capacity, record)
+}
+
+/// The shared insert body for callers already holding the table lock:
+/// presence decisions (capacity eviction, `Failed` stickiness) and the
+/// write land in one lock span, so [`record_terminal_failure`] can decide
+/// a trace is untracked and insert its terminal record without an
+/// untracked gap a concurrent write could slip into.
+fn insert_locked(
+  table: &mut BTreeMap<TraceId, RouteRecord>, capacity: usize, record: RouteRecord,
+) -> Result<()> {
   if !table.contains_key(&record.trace_id) && table.len() >= capacity {
     let oldest = table
       .iter()
@@ -39,6 +53,15 @@ pub(crate) fn insert_route(
       }
       None => return Err(Error::resource_exhausted("route records")),
     }
+  }
+  // A recorded failure is final at insert time too: a late insert for an
+  // already-failed trace is a no-op, exactly like [`update_route`] on the
+  // same state, so fresh route progress can never overwrite the first
+  // terminal fact.
+  if let Some(existing) = table.get(&record.trace_id)
+    && matches!(existing.state, RouteState::Failed(_))
+  {
+    return Ok(());
   }
   table.insert(record.trace_id.clone(), record);
   Ok(())
@@ -81,10 +104,14 @@ pub(crate) fn record_terminal_failure(
     }
     return;
   }
-  drop(table);
+  // Presence was decided and the insert lands inside the same lock span:
+  // no concurrent write can slip a record between the absent check and
+  // the terminal insert (the drop-then-relock gap once let the fresh
+  // terminal `failing()` record overwrite a racing active insert,
+  // losing its real selected node).
   let mut record = RouteRecord::failing(trace_id.clone());
   record.update(RouteState::Failed(kind));
-  let _ = insert_route(routes, capacity, record);
+  let _ = insert_locked(&mut table, capacity, record);
 }
 
 #[cfg(test)]
@@ -169,5 +196,61 @@ mod terminal_failure_tests {
       record.state,
       RouteState::Failed(ErrorKind::Unsupported)
     ));
+  }
+}
+
+#[cfg(test)]
+mod insert_route_tests {
+  use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+  };
+
+  use super::*;
+  use crate::NodeId;
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// A recorded failure is final at insert time too: a late insert for an
+  /// already-failed trace succeeds as a no-op and never replaces the
+  /// terminal fact — the same stickiness `update_route` enforces, now
+  /// covering the route table's one unguarded write point.
+  #[test]
+  fn insert_route_never_overwrites_a_recorded_failure() {
+    let routes: RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+    insert_route(&routes, 8, RouteRecord::new(trace(1), node(7))).unwrap();
+    record_terminal_failure(&routes, 8, &trace(1), ErrorKind::StreamInterrupted);
+
+    insert_route(&routes, 8, RouteRecord::new(trace(1), node(9))).unwrap();
+
+    let table = routes.lock().unwrap();
+    assert_eq!(table.len(), 1);
+    let record = table.get(&trace(1)).unwrap();
+    assert_eq!(
+      record.state,
+      RouteState::Failed(ErrorKind::StreamInterrupted)
+    );
+    assert_eq!(record.selected_node.as_ref(), Some(&node(7)));
+  }
+
+  /// The normal new-route path is untouched: an untracked trace gets its
+  /// fresh routing record carrying the resolved selected node.
+  #[test]
+  fn insert_route_tracks_a_new_route() {
+    let routes: RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+
+    insert_route(&routes, 8, RouteRecord::new(trace(1), node(7))).unwrap();
+
+    let table = routes.lock().unwrap();
+    assert_eq!(table.len(), 1);
+    let record = table.get(&trace(1)).unwrap();
+    assert_eq!(record.state, RouteState::Routing);
+    assert_eq!(record.selected_node.as_ref(), Some(&node(7)));
   }
 }
