@@ -11,13 +11,24 @@
 //! pruning never fights the maintenance target. The degree gates only
 //! the status query and this cadence; below target with at least one
 //! session everything keeps working.
+//!
+//! The tick runs on the dedicated maintenance worker (audit 2026-10-09
+//! item 3), never inline in the supervisor's select loop, and every
+//! selected member carries ALL of its published endpoints: the dial
+//! rotates through them across successive ticks with the same
+//! endpoint-level failover the recovery plane applies (remaining-items
+//! list P2-5), so a multi-homed member whose first endpoint is
+//! unreachable is retried on the others.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use tracing::debug;
 
-use super::supervisor::{Supervisor, dial_member};
-use crate::{Endpoint, Error, NodeId, Result};
+use super::{
+  recovery::recovery_endpoint,
+  supervisor::{Supervisor, TickState, dial_member},
+};
+use crate::{Error, NodeId, Result};
 
 /// The maintenance cadence: nothing while healthy; while below target,
 /// one deficit-bounded batch of random dials per tick. Purely local
@@ -27,19 +38,56 @@ use crate::{Endpoint, Error, NodeId, Result};
 pub(super) const DEGREE_MAINTENANCE_TICK_PERIOD: std::time::Duration =
   std::time::Duration::from_secs(30);
 
-impl Supervisor {
+/// Runs the degree-maintenance worker: one long-lived task that owns the
+/// maintenance cadence — the tick the supervisor's select loop used to
+/// await inline (audit 2026-10-09 item 3), so a slow member-table scan
+/// or a stalled dial batch no longer parks control-plane reads and
+/// packet admission behind it.
+///
+/// Overlap policy — SKIP, never queue: the worker is a single task that
+/// runs each tick inline in its own loop, and the timer's
+/// `MissedTickBehavior::Skip` drops every deadline that fires while a
+/// tick is still running. A tick recomputes the dial plan from current
+/// state (and its dials are already bounded by the in-flight counter),
+/// so a skipped tick only delays the next deficit batch — queueing
+/// would stack stale plans behind a slow store for no gain. Bounded
+/// accounting (audit item 4's lesson): exactly one task for the node's
+/// lifetime, aborted and awaited by the shutdown path.
+pub(super) async fn run_maintenance_worker(state: Arc<TickState>) {
+  let mut shutdown = state.shutdown.clone();
+  let mut timer = tokio::time::interval(DEGREE_MAINTENANCE_TICK_PERIOD);
+  timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+  loop {
+    tokio::select! {
+      changed = shutdown.changed() => {
+        let _ = changed;
+        break;
+      }
+      _ = timer.tick() => {
+        // Best-effort by contract: a failed tick (store outage) waits
+        // for the next one, but never silently — the same attribution
+        // rule as the recovery tick.
+        if let Err(error) = state.maintenance_tick().await {
+          tracing::warn!(kind = ?error.kind(), "degree maintenance tick failed");
+        }
+      }
+    }
+  }
+}
+
+impl TickState {
   /// One maintenance tick: recompute the degree plan from the active
   /// member universe and the live session table, and dial the deficit
   /// in detached tasks (each bounded by the configured dial deadline
   /// plus the authentication deadline, reconciled by the next tick).
   /// A skipped or failed dial simply waits for the next tick — the
   /// plane is best-effort by contract.
-  pub(super) async fn maintenance_tick(&mut self) -> Result<()> {
-    let context = self.context()?;
-    let store = context.store();
-    let members = self.known_online_members(store).await?;
+  pub(super) async fn maintenance_tick(&self) -> Result<()> {
+    let store = self.context.store();
+    let local = self.context.identity().node().clone();
+    let members =
+      super::recovery::known_online_member_endpoints(&self.exclusion_cache, store, &local).await?;
     let connected: BTreeSet<NodeId> = self
-      .dependencies
       .sessions
       .lock()
       .map_err(Error::session_table)?
@@ -50,7 +98,7 @@ impl Supervisor {
     // The cluster size includes this node; the universe map excludes it.
     let plan = crate::membership::degree::degree_plan(
       members.len().saturating_add(1),
-      self.dependencies.config.connection_degree(),
+      self.config.connection_degree(),
       connected.len(),
     );
     if plan.dial_budget == 0 {
@@ -75,29 +123,42 @@ impl Supervisor {
       );
       return Ok(());
     }
-    let local = context.identity().node().clone();
     let dials = crate::membership::degree::select_degree_dials(
       plan.dial_budget,
       &local,
       &members,
       &connected,
-      self.dependencies.entropy.as_ref(),
+      self.entropy.as_ref(),
     )?;
-    for (peer, endpoint) in dials {
-      self.spawn_maintenance_dial(peer, endpoint);
+    // One attempt serial per dialing tick: every selected member's
+    // published endpoints rotate by it (remaining-items list P2-5), the
+    // same `recovery_endpoint` rotation the recovery plane applies to
+    // its own dials. Like recovery, the rotation advances across
+    // ATTEMPTS (ticks), not within one batch: a member whose dialed
+    // endpoint is unreachable is retried on its next endpoint by the
+    // next tick that selects it. A member skipped for a few ticks may
+    // land past an endpoint when reselected — acceptable for this
+    // best-effort plane, whose only contract is covering the deficit,
+    // while the recovery plane's per-schedule rotation stays the
+    // guaranteed failover for an isolated node.
+    let attempt = self
+      .degree_attempt
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+      + 1;
+    for (peer, endpoints) in dials {
+      let Some(endpoint) = recovery_endpoint(&endpoints, attempt) else {
+        continue;
+      };
+      self.spawn_maintenance_dial(peer, endpoint.clone());
     }
     Ok(())
   }
 
-  /// Spawns one detached maintenance dial: the supervisor select loop
-  /// never blocks on a handshake, and the in-flight slot releases when
-  /// the dial resolves (success, refusal, or deadline).
-  fn spawn_maintenance_dial(&mut self, peer: NodeId, receiver: Endpoint) {
-    let transport = match self
-      .dependencies
-      .extensions
-      .resolve_transport(&receiver.selector())
-    {
+  /// Spawns one detached maintenance dial: the maintenance worker never
+  /// blocks on a handshake, and the in-flight slot releases when the
+  /// dial resolves (success, refusal, or deadline).
+  fn spawn_maintenance_dial(&self, peer: NodeId, receiver: crate::Endpoint) {
+    let transport = match self.extensions.resolve_transport(&receiver.selector()) {
       Ok(transport) => transport,
       // No transport for the endpoint: the dial cannot even start; the
       // next tick picks again (possibly the same member).
@@ -114,12 +175,12 @@ impl Supervisor {
     self
       .maintenance_pending
       .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pending = std::sync::Arc::clone(&self.maintenance_pending);
+    let pending = Arc::clone(&self.maintenance_pending);
     let driver = self.driver.clone();
-    let sessions = self.dependencies.sessions.clone();
+    let sessions = self.sessions.clone();
     let packet = self.packet.clone();
-    let shutdown = self.shutdown_tx.subscribe();
-    let dial_deadline = self.dependencies.config.dial_deadline();
+    let shutdown = self.shutdown.clone();
+    let dial_deadline = self.config.dial_deadline();
     tokio::spawn(async move {
       if let Err(error) = dial_member(
         transport,
@@ -145,7 +206,9 @@ impl Supervisor {
       pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
   }
+}
 
+impl Supervisor {
   /// The public connection-degree observation: the effective target,
   /// the live session count, and the resulting health. Recomputed from
   /// the stores per query (the same bounded scan the recovery tick
@@ -153,7 +216,13 @@ impl Supervisor {
   /// membership change by more than the store itself.
   pub(super) async fn connection_degree_view(&self) -> Result<crate::ConnectionDegreeView> {
     let context = self.context()?;
-    let members = self.known_online_members(context.store()).await?;
+    let local = context.identity().node().clone();
+    let members = super::recovery::known_online_member_endpoints(
+      &self.exclusion_cache,
+      context.store(),
+      &local,
+    )
+    .await?;
     let sessions = self
       .dependencies
       .sessions
@@ -179,190 +248,9 @@ impl Supervisor {
 mod tests {
   use std::sync::Arc;
 
-  use tokio::sync::{mpsc, watch};
-
-  use super::{DEGREE_MAINTENANCE_TICK_PERIOD, Supervisor};
-  use crate::{
-    NodeConfig,
-    extension_registry::ExtensionRegistry,
-    identity::{
-      lifecycle::open_local_identity,
-      records::{IdentityBindingV1, identity_binding_key},
-      testing::{ScriptedKeys, SequenceEntropy, inject_entry},
-    },
-    protocol::{feature, offer::node_offer},
-    provider::StorageFactory,
-    runtime::RuntimeDependencies,
-    session::stream::{SessionEntry, SessionTable},
-    storage::contract::{ReferenceFactory, required_capabilities},
+  use crate::runtime::supervisor::test_support::{
+    self, insert_live_session, install_member, member_id, silent_peer, supervisor_over,
   };
-
-  /// Builds a supervisor over a fresh in-memory identity: no sessions,
-  /// no listeners — the maintenance tick runs against a real store.
-  async fn maintenance_supervisor() -> (
-    Supervisor,
-    Arc<ReferenceFactory>,
-    Arc<dyn crate::api::Entropy>,
-    SessionTable,
-  ) {
-    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
-    let factory: Arc<dyn StorageFactory> = reference.clone();
-    let keys = ScriptedKeys::full();
-    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
-    let context = Arc::new(
-      open_local_identity(
-        &factory,
-        Some(&keys.as_provider()),
-        entropy.as_ref(),
-        std::time::Duration::from_secs(3_600),
-      )
-      .await
-      .unwrap(),
-    );
-    // A dial deadline long enough that the tick's detached dials stay in
-    // flight while the test observes them: they stall in the TLS
-    // handshake against the held silent listener below.
-    let config = NodeConfig::new()
-      .with_dial_deadline(std::time::Duration::from_secs(2))
-      .unwrap();
-    let mut extensions = ExtensionRegistry::new();
-    // The built-in transports the node builder installs: the tick
-    // resolves the members' wss endpoints through this registry.
-    for (tag, transport) in [
-      (
-        crate::transport::tls_transport::TlsTransport::tag().unwrap(),
-        Arc::new(crate::transport::tls_transport::TlsTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        crate::transport::wss::WssTransport::tag().unwrap(),
-        Arc::new(crate::transport::wss::WssTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        crate::transport::plain::PlainTransport::tag().unwrap(),
-        Arc::new(crate::transport::plain::PlainTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-    ] {
-      extensions
-        .register_builtin_transport(tag, transport)
-        .unwrap();
-    }
-    let mut definitions = feature::builtin_definitions().unwrap();
-    definitions.extend(extensions.feature_definitions());
-    let registry = feature::FeatureRegistry::build(definitions).unwrap();
-    let offer = node_offer(&registry, config.required_features()).unwrap();
-    let (round_tx, round_rx) = mpsc::channel(crate::runtime::SYNC_ROUND_CHANNEL_CAPACITY);
-    let (revision_tx, _revision_rx) = watch::channel(0_u64);
-    let (packet_tx, _packet_rx) = mpsc::channel(crate::runtime::PACKET_CHANNEL_CAPACITY);
-    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-    let mut dependencies = RuntimeDependencies {
-      storage_factory: factory,
-      context: Some(context),
-      keys: Some(keys),
-      config,
-      entropy: entropy.clone(),
-      extensions: Arc::new(extensions),
-      sessions: sessions.clone(),
-      routes: Default::default(),
-      events: Arc::new(crate::node::EventHub::new()),
-      member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
-      leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
-      reconcile: None,
-      sync_round_requests: round_tx,
-      connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
-      listeners: Default::default(),
-      task_manager: None,
-      operations: None,
-      runtime_seed: None,
-    };
-    // The operation handles are built the way `spawn_runtime` builds them,
-    // so the tick drives the exact production packet context and session
-    // driver instead of a stand-in.
-    let operations = crate::runtime::supervisor::operation_deps(
-      &dependencies,
-      packet_tx.clone(),
-      offer,
-      Arc::new(registry),
-    )
-    .expect("operation handles");
-    dependencies.operations = Some(operations);
-    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
-      Ok(supervisor) => supervisor,
-      Err(boxed) => panic!("supervisor construction failed: {}", boxed.0),
-    };
-    (supervisor, reference, entropy, sessions)
-  }
-
-  fn member_id(seed: u64) -> crate::NodeId {
-    crate::NodeId::parse(&format!("node-{seed:021}")).unwrap()
-  }
-
-  fn member_key(seed: u64) -> crate::PublicKey {
-    let signing = crate::identity::testing::scripted_signing(seed);
-    crate::PublicKey::from_bytes(signing.verifying_key().to_bytes())
-  }
-
-  /// Installs one active member: trusted binding (injected) plus
-  /// descriptor (committed through the store path) with one silently
-  /// held endpoint, so the member universe counts it and any dial to it
-  /// stalls in flight instead of failing before the test can observe it.
-  async fn install_member(
-    supervisor: &Supervisor, reference: &Arc<ReferenceFactory>, seed: u64, port: u16,
-  ) {
-    let node = member_id(seed);
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node.clone(),
-      member_key(seed),
-      vec![crate::Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap()],
-      1,
-      false,
-      1,
-    );
-    crate::membership::store::store_descriptor_ctx(
-      supervisor.context().unwrap().store(),
-      supervisor.dependencies.entropy.as_ref(),
-      &descriptor,
-    )
-    .await
-    .unwrap();
-    let (namespace, key) = identity_binding_key(&node).unwrap();
-    let binding = IdentityBindingV1::new(node, member_key(seed));
-    inject_entry(reference, (namespace, key), binding.encode().unwrap());
-  }
-
-  /// Inserts one live session entry for `peer` into the table: a
-  /// synthetic entry is enough — the tick only reads liveness.
-  fn insert_live_session(
-    sessions: &SessionTable, peer: crate::NodeId, entropy: &dyn crate::api::Entropy,
-  ) {
-    let entry = SessionEntry::synthetic_entry(
-      entropy,
-      crate::Endpoint::parse("wss://127.0.0.1:1").unwrap(),
-    )
-    .unwrap();
-    sessions.lock().unwrap().insert(peer, entry);
-  }
-
-  /// A silent TCP peer: accepts every connection and holds it open, so a
-  /// wss dial stalls in the TLS handshake until its deadline. The tick's
-  /// in-flight slots are then observable deterministically instead of
-  /// racing a connection-refused failure.
-  async fn silent_peer() -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let held: Arc<std::sync::Mutex<Vec<tokio::net::TcpStream>>> =
-      Arc::new(std::sync::Mutex::new(Vec::new()));
-    let handle = tokio::spawn(async move {
-      while let Ok((stream, _)) = listener.accept().await {
-        // Holding the socket is the point: dropping it would reset the
-        // connection and fail the dial early.
-        held.lock().unwrap().push(stream);
-      }
-    });
-    (port, handle)
-  }
 
   /// The maintenance tick's wiring: with one live session and four
   /// dialable members, the derived plan for five nodes is k(5) = 3, so
@@ -372,20 +260,26 @@ mod tests {
   /// the tick must defer to the recovery plane.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn maintenance_tick_dials_the_deficit_and_defers_when_offline() {
-    let (mut supervisor, reference, entropy, sessions) = maintenance_supervisor().await;
-    let (port, holder) = silent_peer().await;
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (port, _connections, holder) = silent_peer().await;
 
     // Four active members (seeds offset above the supervisor's own
     // deterministic identity space): the cluster size is five
     // including self.
     for seed in 101..=104 {
-      install_member(&supervisor, &reference, seed, port).await;
+      install_member(&supervisor, &reference, seed, &[port]).await;
     }
 
     // Fully offline: the recovery plane owns the zero-session case.
-    supervisor.maintenance_tick().await.unwrap();
+    ticks.maintenance_tick().await.unwrap();
     assert_eq!(
-      supervisor
+      ticks
         .maintenance_pending
         .load(std::sync::atomic::Ordering::Relaxed),
       0,
@@ -398,9 +292,9 @@ mod tests {
 
     // One live session: the deficit is two, dialed immediately and kept
     // in flight by the silent peer, so the slot count is deterministic.
-    insert_live_session(&sessions, member_id(101), entropy.as_ref());
-    supervisor.maintenance_tick().await.unwrap();
-    let pending = supervisor
+    insert_live_session(&sessions, member_id(101), ticks.entropy.as_ref());
+    ticks.maintenance_tick().await.unwrap();
+    let pending = ticks
       .maintenance_pending
       .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(pending, 2, "the tick dials exactly the deficit");
@@ -412,7 +306,7 @@ mod tests {
     // tick can dial again instead of piling up in-flight work.
     tokio::time::timeout(std::time::Duration::from_secs(6), async {
       loop {
-        if supervisor
+        if ticks
           .maintenance_pending
           .load(std::sync::atomic::Ordering::Relaxed)
           == 0
@@ -427,12 +321,87 @@ mod tests {
     holder.abort();
   }
 
+  /// Endpoint-level failover for the degree plane (remaining-items list
+  /// P2-5): a multi-homed member whose first endpoint is unreachable
+  /// is dialed on its SECOND endpoint by the next maintenance tick —
+  /// the same `recovery_endpoint` rotation the recovery plane applies,
+  /// so maintenance dials no longer hammer a dead first endpoint
+  /// forever. Under the old single-endpoint projection the second tick
+  /// dialed the first endpoint again and the second listener never saw
+  /// a connection.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn maintenance_dials_rotate_to_the_second_endpoint_when_the_first_stalls() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (first_port, first_connections, first_holder) = silent_peer().await;
+    let (second_port, second_connections, second_holder) = silent_peer().await;
+
+    // A three-node cluster: one connected member leaves exactly one
+    // dial candidate — the multi-homed member with both silent
+    // endpoints — so the observed connection counts are deterministic.
+    install_member(&supervisor, &reference, 101, &[first_port]).await;
+    install_member(&supervisor, &reference, 102, &[first_port, second_port]).await;
+    insert_live_session(&sessions, member_id(101), ticks.entropy.as_ref());
+
+    // First tick: attempt 1 dials the member's FIRST endpoint...
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if ticks
+          .maintenance_pending
+          .load(std::sync::atomic::Ordering::Relaxed)
+          == 0
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the first maintenance dial must release its in-flight slot");
+    assert_eq!(
+      first_connections.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "attempt 1 dials the first published endpoint"
+    );
+    assert_eq!(
+      second_connections.load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "attempt 1 must not touch the second endpoint"
+    );
+
+    // ...and the next tick rotates to the SECOND endpoint.
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if second_connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("attempt 2 must dial the second published endpoint");
+    assert_eq!(
+      first_connections.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "attempt 2 leaves the first endpoint alone"
+    );
+    first_holder.abort();
+    second_holder.abort();
+  }
+
   /// The maintenance cadence stays purely local (never a cluster-wide
   /// contract): pinned so a future recalibration is a deliberate act.
   #[test]
   fn maintenance_cadence_is_thirty_seconds() {
     assert_eq!(
-      DEGREE_MAINTENANCE_TICK_PERIOD,
+      super::DEGREE_MAINTENANCE_TICK_PERIOD,
       std::time::Duration::from_secs(30)
     );
   }

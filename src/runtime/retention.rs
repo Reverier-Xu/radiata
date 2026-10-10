@@ -1,16 +1,19 @@
 //! The tick-driven retention sweeps: durable route-trace records,
 //! resource removal evidence, and anchored receipts. Every pass is
 //! bounded by the host wall clock, tolerates failure as a warning (the
-//! next tick retries), and touches core metadata only.
+//! next tick retries), and touches core metadata only. The passes run
+//! on the recovery worker after each recovery tick (see
+//! `runtime/recovery.rs`), never inline in the supervisor's select
+//! loop (audit 2026-10-09 item 3).
 
-use super::supervisor::Supervisor;
+use super::supervisor::TickState;
 
-impl Supervisor {
+impl TickState {
   /// One host-wall-clock retention pass over the durable route-trace
   /// records: terminal records expire at their configured deadline and the
   /// terminal population stays within the caller-selected cap; active
   /// records are never removed. Skipped while no durable record exists.
-  pub(super) async fn trace_retention_sweep(&mut self) {
+  pub(super) async fn trace_retention_sweep(&self) {
     if self
       .trace_records
       .load(std::sync::atomic::Ordering::Relaxed)
@@ -18,13 +21,10 @@ impl Supervisor {
     {
       return;
     }
-    let limits = self.dependencies.config.trace_metadata_limits();
-    let Ok(context) = self.context() else {
-      return;
-    };
+    let limits = self.config.trace_metadata_limits();
     match crate::routing::trace::sweep(
-      context.store(),
-      self.dependencies.entropy.as_ref(),
+      self.context.store(),
+      self.entropy.as_ref(),
       &crate::time::HostWallClock,
       limits.terminal(),
       limits.retention(),
@@ -51,12 +51,9 @@ impl Supervisor {
   /// evidence: expired and excess signed removal records leave
   /// by exact conditional deletes that never dereference a resource URI
   /// or touch caller data; live resource metadata is never evicted.
-  pub(super) async fn resource_removal_sweep(&mut self) {
-    let Ok(context) = self.context() else {
-      return;
-    };
+  pub(super) async fn resource_removal_sweep(&self) {
     if let Err(error) = crate::resource::retention::sweep_removed_ctx(
-      context.store(),
+      self.context.store(),
       &crate::time::HostWallClock,
       crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
       crate::resource::retention::RESOURCE_REGISTER_CAP,
@@ -73,11 +70,8 @@ impl Supervisor {
   /// automatic driver alongside the explicit command. A failure (store
   /// outage, frozen reconciliation) never panics the tick: it surfaces as
   /// a warning and the next bounded pass retries.
-  pub(super) async fn receipt_retention_sweep(&mut self) {
-    let Ok(context) = self.context() else {
-      return;
-    };
-    if let Err(error) = context.store().apply_receipt_retention().await {
+  pub(super) async fn receipt_retention_sweep(&self) {
+    if let Err(error) = self.context.store().apply_receipt_retention().await {
       tracing::warn!(kind = ?error.kind(), "receipt retention sweep failed");
     }
   }
