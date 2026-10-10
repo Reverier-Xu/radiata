@@ -12,8 +12,9 @@ use std::sync::Mutex;
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  Endpoint, ErrorKind, NodeBuilder, NodeConfig, PageSpec, ProtocolTag, QualifiedTag,
-  StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
+  Endpoint, ErrorKind, NodeBuilder, NodeConfig, PacketConsumer, PageSpec, ProtocolDefinition,
+  ProtocolTag, QualifiedTag, RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
+  extension::KeyProvider,
 };
 #[cfg(all(test, feature = "json", unix))]
 use radiata::{ResourceLabels, ResourceName, ResourceUri, ResourceWrite};
@@ -403,4 +404,126 @@ fn marker_body(
   marker: Arc<[u8]>,
 ) -> impl futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send {
   futures_util::stream::once(async move { Ok(marker) })
+}
+
+/// A packet consumer that drains every body to completion.
+#[derive(Debug)]
+struct DrainAll;
+
+impl PacketConsumer for DrainAll {
+  fn accept<'a>(
+    &'a self, mut packet: radiata::IncomingStream,
+  ) -> std::pin::Pin<Box<dyn std::future::Future<Output = radiata::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+      let mut body = packet.body();
+      while std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+        .is_some()
+      {}
+      Ok(())
+    })
+  }
+}
+
+/// Audit 2026-10-09, item 4: a finished packet pump is reaped from the
+/// supervisor's task set as it completes, so the background-task
+/// counter returns to its baseline instead of growing by one per
+/// completed stream until shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finished_packet_pumps_are_reaped_from_the_task_set() {
+  const REAP_PROTOCOL: &str = "radiata.woooo.tech/protocols/observability-reap";
+  const SEND_COUNT: usize = 8;
+
+  let start_with_protocol = async |seed: u64| {
+    let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(9_100_000 + seed * 1_000));
+    let factory: Arc<dyn radiata::extension::StorageFactory> =
+      Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+    let mut extensions = radiata::ExtensionRegistry::new();
+    extensions
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(REAP_PROTOCOL).unwrap(),
+          radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
+        ),
+        Arc::new(DrainAll),
+      )
+      .unwrap();
+    Node {
+      handle: NodeBuilder::new(factory)
+        .keys(keys)
+        .extensions(extensions)
+        .start()
+        .await
+        .unwrap(),
+      endpoint: Endpoint::parse("wss://127.0.0.1:0").unwrap(),
+      id: None,
+    }
+  };
+  let mut issuer = start_with_protocol(1).await;
+  listen(&mut issuer).await;
+  issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
+  let issuer_id = issuer.id.clone().unwrap();
+
+  let member = start_with_protocol(2).await;
+  common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
+
+  // Wait for the session so the steady-state task population settles.
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let sessions = member
+      .handle
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
+      .await
+      .unwrap();
+    if !sessions.items().is_empty() {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no session registered"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
+
+  let counter = |snapshot: &radiata::ObservabilitySnapshot| {
+    snapshot
+      .counter(&QualifiedTag::parse(radiata::ObservabilitySnapshot::BACKGROUND_TASKS).unwrap())
+      .unwrap()
+  };
+  let baseline = counter(&member.handle.metrics().await.unwrap());
+
+  // Each send opens a stream whose outbound pump task ends with the
+  // stream; the receiver drains every body so the streams complete.
+  for index in 0..SEND_COUNT {
+    let chunk: Arc<[u8]> = Arc::from(format!("reap-{index}").into_bytes().into_boxed_slice());
+    member
+      .handle
+      .send(
+        StreamTarget::Exact(issuer_id.clone()),
+        ProtocolTag::parse(REAP_PROTOCOL).unwrap(),
+        StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+        futures_util::stream::once(async move { Ok(chunk) }),
+      )
+      .await
+      .unwrap();
+  }
+
+  // Without the reaping arm every finished pump stays in the set and
+  // the counter sits at baseline + SEND_COUNT; with reaping it returns
+  // to the baseline once the streams end.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let mut observed = counter(&member.handle.metrics().await.unwrap());
+  while observed > baseline {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "finished pumps were never reaped: background tasks stayed at {observed} (baseline {baseline})"
+    );
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    observed = counter(&member.handle.metrics().await.unwrap());
+  }
+
+  member.handle.shutdown().await.unwrap();
+  issuer.handle.shutdown().await.unwrap();
 }

@@ -450,6 +450,16 @@ async fn supervise(
         };
         let _ = supervisor.send_packet(request, &mut tasks).await;
       }
+      finished = tasks.join_next(), if !tasks.is_empty() => {
+        // Reap finished packet tasks as they complete instead of
+        // letting their handles accumulate in the JoinSet until
+        // shutdown (audit 2026-10-09, item 4): the set stays bounded
+        // by the live pump count. A join error (a panicked or aborted
+        // pump) stays visible as a diagnostic.
+        if let Some(Err(error)) = finished {
+          tracing::warn!(%error, "packet task exited abnormally");
+        }
+      }
       signal = leave_complete.recv(), if leave_signals_open => {
         match signal {
           Some(()) => {
