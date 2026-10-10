@@ -71,6 +71,70 @@ fn crash_hook(point: u8) {
 #[inline(always)]
 fn crash_hook(_point: u8) {}
 
+/// Test-only deterministic landing hold for cancellation tests: when
+/// armed, the commit blocks its blocking thread just before the durable
+/// commit (the receipt row is staged but not yet durable), so a test can
+/// observe the not-yet-landed state, cancel the caller, and then release
+/// the landing. Mirrors the crash-hook pattern: test builds only.
+#[cfg(test)]
+static HOLD_BEFORE_COMMIT_ARMED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static HOLD_BEFORE_COMMIT_REACHED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn arm_landing_hold() {
+  HOLD_BEFORE_COMMIT_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn landing_hold_reached() -> bool {
+  HOLD_BEFORE_COMMIT_REACHED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn release_landing_hold() {
+  HOLD_BEFORE_COMMIT_ARMED.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// RAII releaser for the landing hold: arms on construction and
+/// releases on drop, so a panicking test cannot leave the hold armed
+/// and wedge every later commit in the binary. Drop it explicitly at
+/// the moment the landing should proceed.
+#[cfg(test)]
+pub(crate) struct LandingHold;
+
+#[cfg(test)]
+impl LandingHold {
+  pub(crate) fn arm() -> Self {
+    arm_landing_hold();
+    LandingHold
+  }
+}
+
+#[cfg(test)]
+impl Drop for LandingHold {
+  fn drop(&mut self) {
+    release_landing_hold();
+  }
+}
+
+#[cfg(test)]
+fn hold_before_commit() {
+  if HOLD_BEFORE_COMMIT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+    HOLD_BEFORE_COMMIT_REACHED.store(true, std::sync::atomic::Ordering::Release);
+    while HOLD_BEFORE_COMMIT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+  }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn hold_before_commit() {}
+
 /// A factory for redb stores rooted at one database file.
 pub(crate) struct RedbStoreFactory {
   path: PathBuf,
@@ -121,13 +185,48 @@ impl StorageFactory for RedbStoreFactory {
       })
       .await
       .map_err(|_| internal(ProviderErrorContext::StorageOpen))??;
-      Ok(Box::new(RedbStorage { database }) as Box<dyn Storage>)
+      Ok(Box::new(RedbStorage {
+        database,
+        detached: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+      }) as Box<dyn Storage>)
     })
   }
 }
 
 struct RedbStorage {
   database: Arc<Database>,
+  /// The commit executions detached from a cancelled caller, keyed by
+  /// transaction id: redb's `spawn_blocking` commit keeps running and
+  /// lands durably even after the awaiting future is dropped. A
+  /// reconciler of the same transaction waits on the entry's landing
+  /// signal before reading receipts, so a cancelled commit is judged by
+  /// its final receipt and never by a not-yet-landed absence (audit
+  /// 2026-10-09 item 14).
+  detached:
+    Arc<std::sync::Mutex<std::collections::BTreeMap<TransactionId, Arc<tokio::sync::Notify>>>>,
+}
+
+/// Fires one detached commit's landing signal and removes its registry
+/// entry on every exit path of the execution task — completion, error,
+/// or panic — so a reconciler never waits on a finished execution. The
+/// signal fires strictly after the blocking commit returned, so a woken
+/// reconciler reads final durable evidence.
+struct DetachedLandingGuard {
+  registry:
+    Arc<std::sync::Mutex<std::collections::BTreeMap<TransactionId, Arc<tokio::sync::Notify>>>>,
+  id: TransactionId,
+  landed: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for DetachedLandingGuard {
+  fn drop(&mut self) {
+    self
+      .registry
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .remove(&self.id);
+    self.landed.notify_waiters();
+  }
 }
 
 impl fmt::Debug for RedbStorage {
@@ -158,9 +257,33 @@ impl Storage for RedbStorage {
   }
 
   fn commit<'a>(&'a self, transaction: StoreTransaction) -> BoxFuture<'a, Result<CommitOutcome>> {
-    let database = self.database.clone();
+    let registry = Arc::clone(&self.detached);
+    let database = Arc::clone(&self.database);
+    // The execution is registered and spawned eagerly, before the
+    // returned future is ever polled: the commit still lands durably
+    // when the caller is cancelled (or never polls), and a reconcile of
+    // the same transaction observes the in-flight landing from the
+    // moment commit is called — no drop window can hide it (audit
+    // 2026-10-09 item 14).
+    let id = transaction.id().clone();
+    let landed = Arc::new(tokio::sync::Notify::new());
+    registry
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .insert(id.clone(), Arc::clone(&landed));
+    let execution = tokio::spawn(async move {
+      let _landing = DetachedLandingGuard {
+        registry,
+        id,
+        landed,
+      };
+      let outcome = tokio::task::spawn_blocking(move || commit_blocking(&database, transaction))
+        .await
+        .map_err(|_| internal(ProviderErrorContext::StorageCommit))??;
+      Ok(outcome)
+    });
     Box::pin(async move {
-      tokio::task::spawn_blocking(move || commit_blocking(&database, transaction))
+      execution
         .await
         .map_err(|_| internal(ProviderErrorContext::StorageCommit))?
     })
@@ -169,7 +292,36 @@ impl Storage for RedbStorage {
   fn reconcile<'a>(
     &'a self, transaction: &'a TransactionId, digest: &'a Digest,
   ) -> BoxFuture<'a, Result<ReconcileOutcome>> {
+    let registry = Arc::clone(&self.detached);
+    let transaction = transaction.clone();
+    let digest = digest.clone();
     Box::pin(async move {
+      // A detached execution of THIS transaction may still land: wait
+      // for it before reading durable evidence, so a commit whose caller
+      // was cancelled is judged by its final receipt, never by a
+      // not-yet-landed absence (audit 2026-10-09 item 14).
+      loop {
+        let landed = registry
+          .lock()
+          .unwrap_or_else(|poisoned| poisoned.into_inner())
+          .get(&transaction)
+          .cloned();
+        let Some(landed) = landed else { break };
+        let notified = landed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Re-check under the registration the enable observed: a landing
+        // that fired between the lookup and the enable removed the
+        // entry, and its receipt is already durable to read.
+        if !registry
+          .lock()
+          .unwrap_or_else(|poisoned| poisoned.into_inner())
+          .contains_key(&transaction)
+        {
+          break;
+        }
+        notified.await;
+      }
       let read = self
         .database
         .begin_read()
@@ -177,8 +329,8 @@ impl Storage for RedbStorage {
       let receipts = read
         .open_table(RECEIPTS_TABLE)
         .map_err(|error| map_table_error(error, ProviderErrorContext::StorageReconcile))?;
-      let receipt = read_receipt(&receipts, transaction)?;
-      Ok(crate::provider::classify_receipt(receipt, digest))
+      let receipt = read_receipt(&receipts, &transaction)?;
+      Ok(crate::provider::classify_receipt(receipt, &digest))
     })
   }
 
@@ -646,6 +798,7 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
     crash_hook(5);
     receipt
   };
+  hold_before_commit();
   write
     .commit()
     .map_err(|error| map_commit_error(error, ProviderErrorContext::StorageCommit))?;

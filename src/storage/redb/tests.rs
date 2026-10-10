@@ -99,6 +99,127 @@ async fn redb_adapter_reopen_preserves_entries_receipts_and_revision() {
   assert!(matches!(outcome, crate::ReconcileOutcome::DigestConflict));
 }
 
+/// Dropping a commit future's handle must not roll the commit back:
+/// redb's `spawn_blocking` task detaches and still lands the durable
+/// receipt and value (audit 2026-10-09 item 14). This is the reason the
+/// metadata store's frozen slot settles from the landing task's own
+/// completion — never from the future drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redb_adapter_dropped_commit_future_still_lands_durably() {
+  let directory = TempDir::new().unwrap();
+  let factory = factory(&directory);
+  let storage: Arc<dyn crate::provider::Storage> = factory
+    .open(StoreRequirements::metadata())
+    .await
+    .unwrap()
+    .into();
+  let base = storage.snapshot().await.unwrap().revision().clone();
+  let namespace = crate::storage::test_util::namespace("redb-detach");
+  let transaction = StoreTransaction::new(
+    crate::storage::test_util::transaction_id(43),
+    base,
+    vec![StoreOperation::Put {
+      namespace: namespace.clone(),
+      key: crate::storage::test_util::key(b"detached"),
+      expected: StoreExpectation::Absent,
+      value: StoreValue::new(Arc::from(b"lands-anyway".as_slice())),
+    }],
+  )
+  .unwrap();
+  let id = transaction.id().clone();
+  let digest = transaction.operation_digest().clone();
+  // Detach the handle: the caller future is gone, the blocking task
+  // continues and still lands.
+  drop(tokio::spawn({
+    let storage = Arc::clone(&storage);
+    async move { storage.commit(transaction).await }
+  }));
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+  loop {
+    match storage.reconcile(&id, &digest).await.unwrap() {
+      crate::ReconcileOutcome::Committed(_) => break,
+      outcome => {
+        assert!(
+          std::time::Instant::now() < deadline,
+          "detached commit never landed durably: {outcome:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+      }
+    }
+  }
+  let stored = storage
+    .snapshot()
+    .await
+    .unwrap()
+    .get(&namespace, &crate::storage::test_util::key(b"detached"))
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(stored.as_bytes(), b"lands-anyway");
+}
+
+/// A commit whose caller future is cancelled still lands durably, and a
+/// reconcile of the same transaction waits for that detached landing
+/// before reading evidence, so the landing is judged by its final
+/// receipt — never misjudged as `Aborted` while the not-yet-landed
+/// receipt is still absent (audit 2026-10-09 item 14).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redb_adapter_reconcile_waits_for_a_detached_landing_before_judging() {
+  let directory = TempDir::new().unwrap();
+  let factory = factory(&directory);
+  let storage: Arc<dyn crate::provider::Storage> = factory
+    .open(StoreRequirements::metadata())
+    .await
+    .unwrap()
+    .into();
+  let base = storage.snapshot().await.unwrap().revision().clone();
+  let namespace = crate::storage::test_util::namespace("redb-detach-reconcile");
+  let transaction = StoreTransaction::new(
+    crate::storage::test_util::transaction_id(44),
+    base,
+    vec![StoreOperation::Put {
+      namespace: namespace.clone(),
+      key: crate::storage::test_util::key(b"detached-verdict"),
+      expected: StoreExpectation::Absent,
+      value: StoreValue::new(Arc::from(b"lands-anyway".as_slice())),
+    }],
+  )
+  .unwrap();
+  let id = transaction.id().clone();
+  let digest = transaction.operation_digest().clone();
+
+  let hold = crate::storage::redb::store::LandingHold::arm();
+  let task = tokio::spawn({
+    let storage = Arc::clone(&storage);
+    async move { storage.commit(transaction).await }
+  });
+  tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    while !crate::storage::redb::store::landing_hold_reached() {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("the landing hold is reached within the box");
+  // The caller future is cancelled while the landing is held; the
+  // execution task detaches and still lands once released.
+  task.abort();
+  assert!(task.await.unwrap_err().is_cancelled());
+
+  // The reconcile must wait for the detached landing instead of judging
+  // the staged-but-not-durable absence as aborted.
+  let reconcile = tokio::spawn({
+    let storage = Arc::clone(&storage);
+    async move { storage.reconcile(&id, &digest).await }
+  });
+  tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+  drop(hold);
+  let outcome = reconcile.await.unwrap().unwrap();
+  assert!(
+    matches!(outcome, crate::ReconcileOutcome::Committed(_)),
+    "a detached landing was misjudged: {outcome:?}"
+  );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redb_adapter_concurrent_same_generation_commits_exactly_once() {
   let directory = TempDir::new().unwrap();
