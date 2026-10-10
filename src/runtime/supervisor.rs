@@ -854,16 +854,49 @@ pub(super) async fn dial_member(
     // falls back to the join-mode relaxation and the application proof
     // layer remains the authenticator. The endpoint's transport class
     // decides whether either TLS mode applies at all.
+    let pinned = driver.peer_spki(peer);
     let trust = TransportTrust::for_dial(
       &receiver.selector(),
-      driver
-        .peer_spki(peer)
+      pinned
+        .clone()
         .map(rustls::pki_types::SubjectPublicKeyInfoDer::from),
     );
     let mut connection =
-      connect_with_deadline(&transport, receiver.clone(), trust, dial_deadline).await?;
+      match connect_with_deadline(&transport, receiver.clone(), trust, dial_deadline).await {
+        Ok(connection) => connection,
+        // Certificate rollover fallback (audit 2026-10-09 item 8): a
+        // pinned dial whose TLS establishment failed may be facing a peer
+        // that legitimately re-issued its ephemeral leaf (same durable
+        // identity, new certificate). Retry exactly once with the
+        // merge-mode trust: the member-mode handshake still authenticates
+        // the peer's durable identity key over the fresh channel binding —
+        // identity authority lives in the proof layer, not in the pin —
+        // and a success re-records the new leaf as the anchor below.
+        // Network-level failures (unreachable peer, elapsed deadline) map
+        // to other kinds and never take this path.
+        Err(pin_error)
+          if pinned.is_some() && pin_error.kind() == crate::ErrorKind::AuthenticationFailed =>
+        {
+          tracing::debug!(
+            peer = %peer.as_str(),
+            kind = ?pin_error.kind(),
+            "pinned member dial failed; retrying once with merge trust for certificate rollover"
+          );
+          let fallback = TransportTrust::for_dial(&receiver.selector(), None);
+          connect_with_deadline(&transport, receiver.clone(), fallback, dial_deadline).await?
+        }
+        Err(error) => return Err(error),
+      };
     let session = driver.initiate_member(&mut connection, peer).await?;
     let authenticated = session.peer().clone();
+    // Capture the peer's CURRENT leaf SPKI before the session pump takes
+    // ownership of the connection: on a pinned dial whose application
+    // proof just authenticated the identity, this leaf is the anchor of
+    // record (identical on a normal pin, rotated after the fallback).
+    let observed_spki = connection
+      .merge_hint()
+      .map(|hint| hint.leaf_spki().to_vec())
+      .filter(|spki| !spki.is_empty());
     // The member-mode dial returns only after the session table settles, so
     // the caller's first packet cannot race registration (including the
     // crossed-dial loser outcome, which reports no usable session).
@@ -880,6 +913,13 @@ pub(super) async fn dial_member(
       },
     )
     .await?;
+    if pinned.is_some()
+      && let Some(spki) = observed_spki
+    {
+      // Process-local rollover: the re-issued leaf replaces the stale
+      // anchor, so every later member dial to this peer pins again.
+      driver.record_peer_spki(peer, spki);
+    }
     Ok(authenticated)
   }
   .await;
