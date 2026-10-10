@@ -269,6 +269,11 @@ fn checkpoint_namespace() -> Result<StoreNamespace> {
 /// Issues a new cleanup checkpoint at the current wall clock: max-wins,
 /// so a stored checkpoint with a higher watermark survives untouched and
 /// a lower request is a no-op returning the stored watermark.
+///
+/// There is deliberately no acknowledgement protocol: the checkpoint is
+/// one max-wins row — issuing and persisting are complete at the local
+/// commit alone (a stale watermark arriving later is a silent no-op by
+/// design, and no peer receipt is ever owed or tracked).
 pub(crate) async fn issue_checkpoint_ctx(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
 ) -> Result<u64> {
