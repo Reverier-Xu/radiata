@@ -103,9 +103,18 @@ impl TaskReconciler for ProbeReconciler {
 
 /// Starts one isolated node with the given extension registry.
 async fn start_node(seed: u64, extensions: ExtensionRegistry, config: NodeConfig) -> NodeHandle {
+  let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(7_000_000 + seed * 1_000));
+  start_node_with_keys(keys, extensions, config).await
+}
+
+/// Starts one isolated node with the caller's key custody: the leave
+/// regression below needs a provider whose delete actually applies
+/// (`ScriptedKeys::delete` is deliberately the typed failure path).
+async fn start_node_with_keys(
+  keys: Arc<dyn KeyProvider>, extensions: ExtensionRegistry, config: NodeConfig,
+) -> NodeHandle {
   let storage: Arc<dyn StorageFactory> =
     Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
-  let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(7_000_000 + seed * 1_000));
   NodeBuilder::new(storage)
     .keys(keys)
     .extensions(extensions)
@@ -640,8 +649,10 @@ fn resource_write(seed: u8) -> ResourceWrite {
 }
 
 /// Hooks compose at admission in canonical tag order — every `validate`
-/// before any `mutate` — and `observed` fires inside the task after the
-/// local commit, in the same order.
+/// before any `mutate` — and `observed` fires after the local commit,
+/// in the same order, from its own spawned observation task (so the
+/// recorded observations are polled to their final shape: the task's
+/// terminal publication deliberately precedes them).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resource_hooks_compose_in_tag_order_and_observe_after_commit() {
   common::init_tracing();
@@ -667,13 +678,21 @@ async fn resource_hooks_compose_in_tag_order_and_observe_after_commit() {
   let task = node.resources().put(resource_write(1)).await.unwrap();
   task.wait().await.unwrap();
 
-  assert_eq!(
-    log.calls(),
-    [
-      "validate", "validate", "mutate", "mutate", "observed", "observed"
-    ],
-    "every validate precedes any mutate, both in tag order; observed trails the commit"
-  );
+  let expected = [
+    "validate", "validate", "mutate", "mutate", "observed", "observed",
+  ];
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let calls = log.calls();
+    if calls == expected {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "hook calls never reached {expected:?}: {calls:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
   // The committed record is the catalog's winner.
   let view = node
     .resources()
@@ -738,6 +757,16 @@ async fn resource_hook_observed_error_is_diagnostic_only() {
 
   let task = node.resources().put(resource_write(3)).await.unwrap();
   task.wait().await.unwrap();
+  // The observation runs in its own spawned task after the terminal
+  // publication, so its diagnostic is polled for, never assumed.
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  while log.calls().is_empty() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the observer never ran"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
   assert_eq!(log.calls(), ["observed-error"]);
   let view = node
     .resources()
@@ -844,11 +873,12 @@ async fn action_hook_error_is_diagnostic_only() {
   node.shutdown().await.unwrap();
 }
 
-/// An action hook panicking at the running transition fails the task
-/// typed through the manager's panic containment; the node keeps
-/// serving.
+/// An action hook panicking at the running transition is contained in
+/// the observation task: the task still runs its effect to success, and
+/// the node keeps serving. (The observation runs off the attempt body,
+/// so an observer panic is a diagnostic, never the task's failure.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn action_hook_panic_at_running_fails_the_task_typed() {
+async fn action_hook_panic_at_running_is_contained_and_the_task_succeeds() {
   common::init_tracing();
   let extensions = action_extensions(ProbeActionHook::Panicking {
     on: TaskPhase::Running,
@@ -856,9 +886,9 @@ async fn action_hook_panic_at_running_fails_the_task_typed() {
   let (extensions, _log, _release) = with_probe_reconciler(extensions, vec![Step::Succeed]);
   let node = start_node(18, extensions, NodeConfig::new()).await;
   let task = node.tasks().submit(probe_spec()).await.unwrap();
-  let error = task.clone().wait().await.unwrap_err();
-  assert_eq!(error.kind(), ErrorKind::Internal);
-  assert_eq!(error.context(), "reconciler panicked");
+  task.clone().wait().await.unwrap();
+  let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
+  assert_eq!(view.phase(), TaskPhase::Succeeded);
   node
     .members()
     .list(PageSpec::first(8).unwrap())
@@ -883,6 +913,215 @@ async fn action_hook_panic_at_succeeded_keeps_the_terminal_phase() {
   let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
   node.shutdown().await.unwrap();
+}
+
+/// An action hook that never settles: a wedged observer under test.
+#[derive(Debug)]
+struct WedgingActionHook;
+
+impl ActionHook for WedgingActionHook {
+  fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+    Box::pin(std::future::pending())
+  }
+}
+
+/// A deterministic key provider with working deletion, after the
+/// facade's `LeaveCapableKeys` shape: the leave regression below runs a
+/// full identity replacement, whose custody lane deletes the former
+/// identity keys.
+#[derive(Debug, Default)]
+struct LeaveCapableKeys {
+  records: std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, ed25519_dalek::SigningKey>>,
+  operations: std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
+  next: std::sync::Mutex<u64>,
+}
+
+impl LeaveCapableKeys {
+  fn seed_for(base: u64) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&base.to_le_bytes().repeat(4)[..32].try_into().unwrap())
+  }
+
+  fn create_at(&self, operation: &radiata::KeyOperationId) -> radiata::KeyCreateState {
+    let mut operations = self.operations.lock().unwrap();
+    if let Some(handle) = operations.get(operation.as_str().as_bytes()).cloned()
+      && let Some(signing) = self.records.lock().unwrap().get(&handle).cloned()
+    {
+      return radiata::KeyCreateState::Present(radiata::CreatedKey::new(
+        radiata::KeyHandle::from_provider_bytes(Arc::from(handle)).unwrap(),
+        radiata::PublicKey::from_bytes(signing.verifying_key().to_bytes()),
+      ));
+    }
+    let mut next = self.next.lock().unwrap();
+    let index = *next;
+    *next += 1;
+    let signing = Self::seed_for(index + 1);
+    let handle = format!("tasks-leave-handle-{index}").into_bytes();
+    let created = radiata::CreatedKey::new(
+      radiata::KeyHandle::from_provider_bytes(Arc::from(handle.clone())).unwrap(),
+      radiata::PublicKey::from_bytes(signing.verifying_key().to_bytes()),
+    );
+    operations.insert(operation.as_str().as_bytes().to_vec(), handle.clone());
+    self.records.lock().unwrap().insert(handle, signing);
+    radiata::KeyCreateState::Present(created)
+  }
+
+  fn lookup(&self, operation: &radiata::KeyOperationId) -> Option<radiata::KeyCreateState> {
+    let handle = self
+      .operations
+      .lock()
+      .unwrap()
+      .get(operation.as_str().as_bytes())?
+      .clone();
+    let signing = self.records.lock().unwrap().get(&handle).cloned()?;
+    Some(radiata::KeyCreateState::Present(radiata::CreatedKey::new(
+      radiata::KeyHandle::from_provider_bytes(Arc::from(handle)).unwrap(),
+      radiata::PublicKey::from_bytes(signing.verifying_key().to_bytes()),
+    )))
+  }
+}
+
+impl KeyProvider for LeaveCapableKeys {
+  fn capabilities(&self) -> radiata::KeyCapabilities {
+    radiata::KeyCapabilities::new()
+      .ed25519(true)
+      .reconciliation(true)
+      .deletion(true)
+  }
+
+  fn create_ed25519<'a>(
+    &'a self, operation: &'a radiata::KeyOperationId,
+  ) -> BoxFuture<'a, Result<radiata::KeyCreateState>> {
+    let created = self.create_at(operation);
+    Box::pin(async move { Ok(created) })
+  }
+
+  fn reconcile_create<'a>(
+    &'a self, operation: &'a radiata::KeyOperationId,
+  ) -> BoxFuture<'a, Result<radiata::KeyCreateState>> {
+    let created = self.lookup(operation);
+    Box::pin(async move { Ok(created.unwrap_or(radiata::KeyCreateState::Absent)) })
+  }
+
+  fn public_key<'a>(
+    &'a self, handle: &'a radiata::KeyHandle,
+  ) -> BoxFuture<'a, Result<radiata::PublicKey>> {
+    let result = self
+      .records
+      .lock()
+      .unwrap()
+      .get(handle.expose_provider_handle())
+      .map(|signing| radiata::PublicKey::from_bytes(signing.verifying_key().to_bytes()))
+      .ok_or_else(|| {
+        radiata::Error::provider(
+          radiata::ProviderErrorKind::Internal,
+          radiata::ProviderErrorContext::KeyPublicKey,
+        )
+      });
+    Box::pin(async move { result })
+  }
+
+  fn sign<'a>(
+    &'a self, handle: &'a radiata::KeyHandle, message: &'a [u8],
+  ) -> BoxFuture<'a, Result<radiata::Signature>> {
+    use ed25519_dalek::Signer as _;
+    let result = self
+      .records
+      .lock()
+      .unwrap()
+      .get(handle.expose_provider_handle())
+      .map(|signing| radiata::Signature::from_bytes(signing.sign(message).to_bytes()))
+      .ok_or_else(|| {
+        radiata::Error::provider(
+          radiata::ProviderErrorKind::Internal,
+          radiata::ProviderErrorContext::KeySign,
+        )
+      });
+    Box::pin(async move { result })
+  }
+
+  fn delete<'a>(
+    &'a self, _operation: &'a radiata::KeyOperationId, handle: &'a radiata::KeyHandle,
+  ) -> BoxFuture<'a, Result<radiata::KeyDeleteState>> {
+    self
+      .records
+      .lock()
+      .unwrap()
+      .remove(handle.expose_provider_handle());
+    Box::pin(async move { Ok(radiata::KeyDeleteState::Absent) })
+  }
+
+  fn reconcile_delete<'a>(
+    &'a self, _operation: &'a radiata::KeyOperationId, handle: &'a radiata::KeyHandle,
+  ) -> BoxFuture<'a, Result<radiata::KeyDeleteState>> {
+    let present = self
+      .records
+      .lock()
+      .unwrap()
+      .contains_key(handle.expose_provider_handle());
+    Box::pin(async move {
+      Ok(if present {
+        radiata::KeyDeleteState::Present
+      } else {
+        radiata::KeyDeleteState::Absent
+      })
+    })
+  }
+}
+
+/// A never-returning action hook neither occupies an execution slot nor
+/// delays the leave shutdown. The node runs with a single local slot:
+/// the task after the wedged observation must still run (under the old
+/// in-body observation, the wedged hook pinned the slot forever), and a
+/// leave whose observation wedges must still replace the identity and
+/// stop the node with the ActiveLeave reason (the signal is driven by
+/// the task table's terminal phase, not by the hook chain).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wedged_action_hook_holds_no_slot_and_never_delays_leave_shutdown() {
+  common::init_tracing();
+  let mut extensions = ExtensionRegistry::new();
+  extensions
+    .register_action_hook(
+      QualifiedTag::parse("a.example.org/hooks/v1/wedged").unwrap(),
+      Arc::new(WedgingActionHook),
+    )
+    .unwrap();
+  let (extensions, _log, _release) = with_probe_reconciler(extensions, vec![Step::Succeed]);
+  let config = NodeConfig::new().with_task_reconcile_slots(1, 1).unwrap();
+  let node = start_node_with_keys(Arc::new(LeaveCapableKeys::default()), extensions, config).await;
+
+  // The first task completes while its first transition observation
+  // wedges forever — the boxed wait fails fast on a regression instead
+  // of hanging the harness.
+  let first = node.tasks().submit(probe_spec()).await.unwrap();
+  tokio::time::timeout(Duration::from_secs(5), first.clone().wait())
+    .await
+    .expect("the terminal publication must land without the observation")
+    .unwrap();
+
+  // The one local slot is free: the next task runs to completion inside
+  // the box instead of queueing behind the wedged observer.
+  let second = node.tasks().submit(probe_spec()).await.unwrap();
+  tokio::time::timeout(Duration::from_secs(5), second.wait())
+    .await
+    .expect("the wedged observation must not hold the execution slot")
+    .unwrap();
+
+  // The leave shutdown is not delayed either: the leave terminalizes,
+  // the ActiveLeave signal fires from the task table's terminal phase,
+  // and the node stops without ever waiting on the observation.
+  let outcome = node
+    .leave(radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new())
+    .await
+    .unwrap();
+  tokio::time::timeout(Duration::from_secs(30), outcome.wait())
+    .await
+    .expect("the leave completes despite the wedged observer")
+    .unwrap();
+  let reason = tokio::time::timeout(Duration::from_secs(30), node.wait_for_shutdown())
+    .await
+    .expect("the node stops despite the wedged observer")
+    .unwrap();
+  assert_eq!(reason, radiata::ShutdownReason::ActiveLeave);
 }
 
 /// Adds the probe reconciler to an existing registry.

@@ -14,10 +14,12 @@
 use std::{
   collections::BTreeMap,
   marker::PhantomData,
+  panic::AssertUnwindSafe,
   sync::{Arc, Mutex},
   time::SystemTime,
 };
 
+use futures_util::FutureExt;
 use tokio::sync::watch;
 
 use crate::{
@@ -66,6 +68,34 @@ impl TaskKind {
   pub(crate) const fn drains_on_shutdown(&self) -> bool {
     matches!(self, Self::Leave | Self::ResolveFrozenJournal)
   }
+
+  /// The execution-slot channel the kind's effect draws from: the
+  /// network dials (join/connect), which can hold a slot for a whole
+  /// dial deadline, draw from their own channel so local work
+  /// (resource writes, credentials, maintenance) never queues behind a
+  /// wedged dial. The split's budgets live in
+  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots).
+  pub(crate) const fn slot_class(&self) -> SlotClass {
+    match self {
+      Self::Join | Self::Connect => SlotClass::Network,
+      _ => SlotClass::Local,
+    }
+  }
+}
+
+/// Which of the task manager's two execution-slot channels a kind
+/// draws from. Local work keeps its own budget so a fleet of wedged
+/// dials cannot starve the operations whose latency the caller owns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotClass {
+  /// Join and connect dials: bounded by the configured dial deadline
+  /// (seconds), so they are the only kinds that can pin a slot for a
+  /// transport-observable span.
+  Network,
+  /// Everything else (resource writes, credentials, leave, recovery,
+  /// retention, sync, listener and metadata maintenance, custom
+  /// reconcilers): effects whose latency is this node's own.
+  Local,
 }
 
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
@@ -695,8 +725,9 @@ fn resolve_terminal<T: TaskResult>(
 /// Hooks registered through
 /// [`ExtensionRegistry::register_resource_hook`](crate::ExtensionRegistry::register_resource_hook)
 /// run in canonical tag order. `validate` and `mutate` run on the
-/// caller's admission path, before any IO; `observed` runs inside the
-/// write task's own future, after this node's own commit lands.
+/// caller's admission path, before any IO; `observed` runs in its own
+/// spawned observation task after this node's own commit lands, off the
+/// write task's execution slot.
 pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
   /// Rejects a write at admission, before any IO runs. The first
   /// rejection in tag order wins and the verb fails typed with it.
@@ -711,11 +742,14 @@ pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
     Ok(write)
   }
 
-  /// Fires after this node's own commit lands and before the write task
-  /// terminalizes: the local observation of the put or delete, never a
-  /// cluster-convergence promise (cluster visibility stays the reconcile
-  /// plane's domain, observable through [`crate::ResourceChanged`]). An
-  /// error is a diagnostic and never fails or blocks the task.
+  /// Fires after this node's own commit lands: the local observation of
+  /// the put or delete, never a cluster-convergence promise (cluster
+  /// visibility stays the reconcile plane's domain, observable through
+  /// [`crate::ResourceChanged`]). The observation runs in its own
+  /// spawned task, off the write task's execution slot and after the
+  /// commit lands; scheduling does not await the observer, so an error
+  /// or a panic is a diagnostic and never fails, delays, or blocks the
+  /// task or its shutdown.
   fn observed<'a>(&'a self, _view: &'a crate::ResourceView) -> BoxFuture<'a, Result<()>> {
     Box::pin(async { Ok(()) })
   }
@@ -725,10 +759,13 @@ pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
 ///
 /// Hooks registered through
 /// [`ExtensionRegistry::register_action_hook`](crate::ExtensionRegistry::register_action_hook)
-/// run sequentially in canonical tag order inside the task's own future
-/// (never on the manager task). They observe only: an error is a
-/// `tracing` diagnostic and the sequence continues, so no hook can wedge
-/// a task or its shutdown drain.
+/// observe each transition sequentially in canonical tag order, in the
+/// task's own spawned observation task — never on the manager task and
+/// never on one of the manager's execution slots. One task's
+/// observations run in transition order (each awaits its predecessor);
+/// different tasks never observe through each other. They observe only:
+/// an error or a panic is a `tracing` diagnostic, so no hook can fail,
+/// wedge, or delay a task, its slot, or its shutdown drain.
 pub trait ActionHook: std::fmt::Debug + Send + Sync + 'static {
   fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
     Box::pin(async { Ok(()) })
@@ -782,16 +819,25 @@ impl std::fmt::Debug for TaskTransition {
 }
 
 /// Runs one transition's action hooks sequentially in canonical tag
-/// order (the registry's own order). Called inside the task's own future:
-/// a panic in a hook aborts that future and surfaces as the task's typed
-/// internal failure, and a hook error is a diagnostic that never fails,
-/// retries, or blocks the task.
+/// order (the registry's own order). Called from the task's spawned
+/// observation task, never on the manager task and never on an
+/// execution slot: a hook error is a warn diagnostic, and a hook panic
+/// is contained right here (also a warn diagnostic) — an observer can
+/// never fail, retry, wedge, or delay the task it observes.
 pub(crate) async fn notify_action_hooks(
   hooks: &[Arc<dyn ActionHook>], transition: &TaskTransition,
 ) {
   for hook in hooks {
-    if let Err(error) = hook.on_transition(transition).await {
-      tracing::warn!(kind = ?error.kind(), "action hook failed");
+    match AssertUnwindSafe(hook.on_transition(transition))
+      .catch_unwind()
+      .await
+    {
+      Ok(Ok(())) => {}
+      Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "action hook failed"),
+      Err(_panic) => tracing::warn!(
+        task = %transition.id(),
+        "action hook panicked while observing a transition"
+      ),
     }
   }
 }
@@ -814,19 +860,29 @@ pub(crate) fn apply_resource_hooks(
   Ok(write)
 }
 
-/// Runs one write task's post-commit observations sequentially in
-/// canonical tag order, inside the task's own future: an error is a
-/// `tracing` diagnostic that never fails or blocks the task, and a panic
-/// surfaces as the task's typed internal failure through the same path
-/// as any other panicking effect code.
+/// Schedules one write's post-commit observations: each runs
+/// sequentially in canonical tag order inside its own spawned task, off
+/// the write task's execution slot. Awaiting the call only performs the
+/// scheduling, so the write task
+/// never waits on observer code: an error or a panic in an observer is
+/// a `tracing` diagnostic that never fails, delays, or blocks anything.
 pub(crate) async fn notify_resource_observers(
   hooks: &[Arc<dyn ResourceHook>], view: &crate::ResourceView,
 ) {
-  for hook in hooks {
-    if let Err(error) = hook.observed(view).await {
-      tracing::warn!(kind = ?error.kind(), "resource hook failed");
+  let hooks = hooks.to_vec();
+  let view = view.clone();
+  tokio::spawn(async move {
+    for hook in hooks {
+      match AssertUnwindSafe(hook.observed(&view)).catch_unwind().await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "resource hook failed"),
+        Err(_panic) => tracing::warn!(
+          resource = %view.name(),
+          "resource hook panicked while observing the commit"
+        ),
+      }
     }
-  }
+  });
 }
 
 /// The caller-supplied effect behind one custom task kind: the
@@ -1071,6 +1127,40 @@ mod tests {
         beta,
       ]
     );
+  }
+
+  #[test]
+  fn task_kind_slot_classes_split_the_dials_from_local_work() {
+    use super::SlotClass;
+    // The network channel is exactly the dial kinds: they can hold a
+    // slot for a whole dial deadline.
+    assert_eq!(TaskKind::Join.slot_class(), SlotClass::Network);
+    assert_eq!(TaskKind::Connect.slot_class(), SlotClass::Network);
+    // Everything else — resource writes, credentials, leave, and the
+    // maintenance kinds — draws from the local channel, and so do the
+    // caller-registered extension kinds.
+    for kind in [
+      TaskKind::Leave,
+      TaskKind::Disconnect,
+      TaskKind::Revoke,
+      TaskKind::PurgeRevocation,
+      TaskKind::Cleanup,
+      TaskKind::IssueCleanupCheckpoint,
+      TaskKind::ResolveFrozenJournal,
+      TaskKind::Listen,
+      TaskKind::StopListener,
+      TaskKind::PutResource,
+      TaskKind::DeleteResource,
+      TaskKind::PatchNodeMetadata,
+      TaskKind::IssueCredential,
+      TaskKind::RotateCredential,
+      TaskKind::StartRecovery,
+      TaskKind::ApplyReceiptRetention,
+      TaskKind::SyncRound,
+      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/x").expect("tag")),
+    ] {
+      assert_eq!(kind.slot_class(), SlotClass::Local, "{kind:?}");
+    }
   }
 
   #[test]
