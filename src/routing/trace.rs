@@ -14,7 +14,12 @@
 //! - the terminal population never exceeds the caller-selected cap: the oldest
 //!   expired records leave first, then the oldest terminals;
 //! - a process restart terminates previously active records explicitly
-//!   (`Failed(StreamInterrupted)`); no reopen path continues a body.
+//!   (`Failed(StreamInterrupted)`); no reopen path continues a body;
+//! - a terminal record can be revised once more: the same trace id's late
+//!   mid-flight failure rewrites a durable `Delivered` into the explicit
+//!   `Failed(StreamInterrupted)` (the durable twin of the in-memory monotonic
+//!   terminal machine), so the durable evidence converges with the in-memory
+//!   record under either writer ordering (remaining items 2026-10-10, P2-7).
 //!
 //! Record accessors that only the unit tests and the compatibility
 //! golden-vector reader consume are `#[cfg(test)]`; the production
@@ -339,6 +344,36 @@ pub(crate) async fn put_trace(
   )?;
   crate::provider::commit_verdict(store.commit(transaction).await?, "route trace")?;
   Ok(())
+}
+
+/// Revises one durable terminal record to the explicit failure kind: an
+/// existing row keeps its bound identity (source, destination, attempt
+/// count) while only the phase moves; an absent row is written fresh from
+/// the given origin-side identity, because the revision races the origin
+/// pump's still-in-flight terminal write and must be able to win that
+/// ordering too (the durable twin's mirror of the route table's monotonic
+/// terminal machine — remaining items 2026-10-10, P2-7). One conditional
+/// write per call: the caller retries a lost store race against the
+/// winner's committed value instead of silently diverging.
+async fn revise_terminal_once(
+  store: &MetadataStore, entropy: &dyn Entropy, clock: &dyn WallClock, trace_id: &TraceId,
+  source: &NodeId, destination: &NodeId, kind: ErrorKind,
+) -> Result<()> {
+  let space = namespace()?;
+  let key = key(trace_id);
+  let record = {
+    let snapshot = store.snapshot().await?;
+    match snapshot.get(&space, &key).await? {
+      Some(entry) => decode_trace_record(entry.as_bytes())?,
+      None => TraceRecord::new(
+        trace_id.clone(),
+        source.clone(),
+        destination.clone(),
+        clock.now(),
+      ),
+    }
+  };
+  put_trace(store, entropy, clock, record.failed(kind)).await
 }
 
 /// Terminates every non-terminal record left by a previous incarnation:
@@ -1153,6 +1188,97 @@ mod tests {
     // successful-persistence counter.
     assert_eq!(all_records(context.store()).await.len(), persisted);
   }
+
+  // ---- Terminal revision: the durable twin's late-failure mirror ----
+
+  /// Waits (on a wall-clock deadline) until the sink's bounded persistence
+  /// queue is empty, then returns the durable rows.
+  async fn drained_records(sink: &TraceSink) -> Vec<TraceRecord> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while sink.queued() != 0 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the admitted queue never drained"
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sink.persisted_records().await
+  }
+
+  /// A revision moves an existing durable `Delivered` terminal to the
+  /// explicit failure while keeping the row's bound identity — the
+  /// durable twin of the in-memory monotonic terminal machine's
+  /// "a late failure overrides a recorded `Delivered`" (remaining items
+  /// 2026-10-10, P2-7): without it, a relay-leg death leaves the durable
+  /// trace claiming `Delivered` for the whole retention window while the
+  /// in-memory record ends `Failed(StreamInterrupted)`.
+  #[tokio::test]
+  async fn revision_moves_a_delivered_terminal_to_the_failure_kind() {
+    let sink = TraceSink::test_sink().await;
+    sink
+      .record(
+        TraceRecord::new(trace(11), node(1), node(9), sink.clock_now())
+          .with_transition(super::TraceTransition::Delivered, sink.clock_now()),
+      )
+      .await;
+
+    sink.revise_terminal_failure(trace(11), node(1), node(9), ErrorKind::StreamInterrupted);
+
+    let records = drained_records(&sink).await;
+    assert_eq!(records.len(), 1, "one row, revised in place");
+    assert_eq!(records[0].trace_id(), &trace(11));
+    assert_eq!(records[0].source(), &node(1));
+    assert_eq!(records[0].destination(), &node(9));
+    assert_eq!(
+      records[0].phase(),
+      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+    );
+  }
+
+  /// The revision also writes a fresh terminal row when the durable twin
+  /// is still absent — the origin pump's terminal write may be in flight
+  /// when the late failure lands, and the revision must win that ordering
+  /// too (last-writer-wins over one trace id, bounded retries).
+  #[tokio::test]
+  async fn revision_writes_a_fresh_row_when_the_twin_is_absent() {
+    let sink = TraceSink::test_sink().await;
+
+    sink.revise_terminal_failure(trace(12), node(1), node(9), ErrorKind::StreamInterrupted);
+
+    let records = drained_records(&sink).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].trace_id(), &trace(12));
+    assert_eq!(records[0].source(), &node(1));
+    assert_eq!(records[0].destination(), &node(9));
+    assert_eq!(
+      records[0].phase(),
+      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+    );
+  }
+
+  /// A revision against an already-failed row stays idempotent: the row
+  /// count never grows and the first typed failure stays the terminal
+  /// answer (the durable mirror of the in-memory stickiness).
+  #[tokio::test]
+  async fn revision_is_idempotent_on_an_already_failed_row() {
+    let sink = TraceSink::test_sink().await;
+    sink
+      .record(
+        TraceRecord::new(trace(13), node(1), node(9), sink.clock_now()).with_transition(
+          super::TraceTransition::Failed(ErrorKind::StreamInterrupted),
+          sink.clock_now(),
+        ),
+      )
+      .await;
+
+    sink.revise_terminal_failure(trace(13), node(1), node(9), ErrorKind::StreamInterrupted);
+    let records = drained_records(&sink).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+      records[0].phase(),
+      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+    );
+  }
 }
 
 /// The persistence handle shared with the packet pump: clones cheaply and
@@ -1195,6 +1321,16 @@ const MAX_CONCURRENT_TRACE_PERSISTENCE: usize = 16;
 /// dropped and counted rather than queueing without limit.
 const MAX_QUEUED_TRACE_PERSISTENCE: usize = 64;
 
+/// The maximum attempts one terminal revision makes before giving up with
+/// a diagnostic: each attempt re-reads the durable row and re-prepares the
+/// conditional write, so a lost race against the pump tail's single-shot
+/// `Delivered` is retried against the winner's committed value. The
+/// store's CAS base is the global revision, so unrelated concurrent
+/// commits can also spend attempts; exhausting the bound leaves the row at
+/// its pre-revision state with a warning (a best-effort evidence surface),
+/// and keeps a wedged store from looping forever.
+const MAX_TERMINAL_REVISION_ATTEMPTS: usize = 3;
+
 impl TraceSink {
   pub(crate) fn new(
     context: std::sync::Arc<crate::identity::lifecycle::LocalIdentityContext>,
@@ -1214,12 +1350,13 @@ impl TraceSink {
     }
   }
 
-  /// Admits one terminal-record persistence task when the queue bound has
-  /// room, spawning the bounded best-effort write; a full bound drops the
-  /// record, counts the drop, and returns immediately. The counter
-  /// compare-and-swap keeps the queue depth structurally at or below
-  /// [`MAX_QUEUED_TRACE_PERSISTENCE`] under any admission race.
-  pub(crate) fn record_terminal(&self, record: TraceRecord) {
+  /// Admits one bounded persistence task when the queue bound has room,
+  /// spawning it; a full bound drops the work, counts the drop, and
+  /// returns immediately. The counter compare-and-swap keeps the queue
+  /// depth structurally at or below [`MAX_QUEUED_TRACE_PERSISTENCE`]
+  /// under any admission race. One admission truth for every durable
+  /// write — terminal facts and terminal revisions alike.
+  fn admit_persistence(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
     let admitted = self.pending.try_update(
       std::sync::atomic::Ordering::Relaxed,
       std::sync::atomic::Ordering::Relaxed,
@@ -1238,11 +1375,103 @@ impl TraceSink {
     }
     let sink = self.clone();
     tokio::spawn(async move {
-      sink.record(record).await;
+      task.await;
       sink
         .pending
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
+  }
+
+  /// Admits one terminal-record persistence task when the queue bound has
+  /// room, spawning the bounded best-effort write; a full bound drops the
+  /// record, counts the drop, and returns immediately.
+  pub(crate) fn record_terminal(&self, record: TraceRecord) {
+    let sink = self.clone();
+    self.admit_persistence(async move { sink.record(record).await });
+  }
+
+  /// The durable twin's mirror of the route table's monotonic terminal
+  /// machine (remaining items 2026-10-10, P2-7): the same late mid-flight
+  /// failure that flips the in-memory route record to `Failed` revises
+  /// this trace id's durable terminal record to `Failed(kind)`. An
+  /// existing row keeps its bound identity and only the phase moves; an
+  /// absent row is written fresh from the origin-side identity — the
+  /// origin pump's terminal write may still be in flight, and the
+  /// revision must win that ordering too. Admission shares the bounded
+  /// queue with every terminal fact; a lost conditional race is retried
+  /// against a fresh read, bounded; persistence failures stay
+  /// diagnostics and never touch data-plane semantics.
+  pub(crate) fn revise_terminal_failure(
+    &self, trace_id: TraceId, source: NodeId, destination: NodeId, kind: ErrorKind,
+  ) {
+    let sink = self.clone();
+    self.admit_persistence(async move {
+      sink
+        .revise_terminal(trace_id, source, destination, kind)
+        .await;
+    });
+  }
+
+  /// Runs one bounded terminal revision: each attempt re-reads the
+  /// durable row and re-prepares the conditional write, so a lost race
+  /// against a racing terminal write (the pump tail's `Delivered`) is
+  /// retried against the winner's committed value. The pump tail is
+  /// single-shot, but unrelated commits share the store's global revision
+  /// base and can spend attempts too; exhaustion is a warned best-effort
+  /// give-up, and the bound keeps a wedged store from looping forever.
+  async fn revise_terminal(
+    &self, trace_id: TraceId, source: NodeId, destination: NodeId, kind: ErrorKind,
+  ) {
+    let _permit = self.permits.acquire().await;
+    for attempt in 1..=MAX_TERMINAL_REVISION_ATTEMPTS {
+      match revise_terminal_once(
+        self.context.store(),
+        self.entropy.as_ref(),
+        self.clock.as_ref(),
+        &trace_id,
+        &source,
+        &destination,
+        kind,
+      )
+      .await
+      {
+        Ok(()) => {
+          self
+            .live_records
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          return;
+        }
+        Err(error) if error.kind() == ErrorKind::Conflict => {
+          tracing::debug!(
+            attempt,
+            trace_id = %trace_id,
+            "route trace terminal revision lost a store race; retrying"
+          );
+          continue;
+        }
+        Err(error) => {
+          tracing::warn!(
+            kind = ?error.kind(),
+            trace_id = %trace_id,
+            "route trace terminal revision failed"
+          );
+          return;
+        }
+      }
+    }
+    tracing::warn!(
+      trace_id = %trace_id,
+      "route trace terminal revision exhausted its bounded attempts"
+    );
+  }
+
+  /// The shared approximate live-record counter: incremented per
+  /// successful persistence (terminal facts and revisions alike) and
+  /// decremented by the retention sweep's removals. The supervisor reads
+  /// back the one instance its sweeps and observability view share with
+  /// this sink.
+  pub(crate) fn live_records(&self) -> &std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    &self.live_records
   }
 
   /// The terminal records dropped so far because the persistence queue
@@ -1283,5 +1512,50 @@ impl TraceSink {
 
   pub(crate) fn clock_now(&self) -> SystemTime {
     self.clock.now()
+  }
+
+  /// Test-only: every durable row this sink's store currently holds, so
+  /// lib tests outside this module can pin the durable twin's terminal
+  /// convergence without re-implementing the namespace scan.
+  #[cfg(test)]
+  pub(crate) async fn persisted_records(&self) -> Vec<TraceRecord> {
+    let space = namespace().expect("trace namespace");
+    let snapshot = self.context.store().snapshot().await.expect("snapshot");
+    let mut scan = snapshot.scan(&space, &[]).await.expect("trace scan");
+    let mut records = Vec::new();
+    while let Some(entry) = scan.next().await.expect("trace scan row") {
+      records.push(decode_trace_record(entry.value().as_bytes()).expect("trace row decodes"));
+    }
+    records
+  }
+
+  /// Test-only: a sink over a fresh reference store and a scripted
+  /// identity, so session-layer tests can pin the durable twin's mirror
+  /// without a full node.
+  #[cfg(test)]
+  pub(crate) async fn test_sink() -> Self {
+    let factory: std::sync::Arc<dyn crate::provider::StorageFactory> =
+      std::sync::Arc::new(crate::storage::contract::ReferenceFactory::new(
+        crate::storage::contract::required_capabilities(),
+      ));
+    let keys = crate::identity::testing::ScriptedKeys::full();
+    let entropy = std::sync::Arc::new(crate::identity::testing::SequenceEntropy::default());
+    let context = std::sync::Arc::new(
+      crate::identity::lifecycle::open_local_identity(
+        &factory,
+        Some(&keys.as_provider()),
+        entropy.as_ref(),
+        Duration::from_secs(10),
+      )
+      .await
+      .expect("test identity context"),
+    );
+    let live_records = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Self::new(
+      context,
+      entropy,
+      std::sync::Arc::new(crate::time::HostWallClock),
+      live_records,
+    )
   }
 }

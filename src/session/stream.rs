@@ -113,6 +113,11 @@ pub(crate) struct SessionPacketContext {
   pub(super) route_policy: QualifiedTag,
   pub(super) sessions: SessionTable,
   pub(super) routes: RouteTable,
+  /// The node's durable trace sink: the origin pump's terminal facts and
+  /// the read loop's late-failure revisions persist through the one
+  /// bounded instance the supervisor owns (remaining items 2026-10-10,
+  /// P2-7). `None` only in unit-test contexts without a store.
+  pub(super) trace: Option<crate::routing::trace::TraceSink>,
   pub(super) forwarding_capacity: usize,
   /// The node's configured bound on in-memory terminal route records;
   /// admission rejections must respect it like every other writer.
@@ -135,8 +140,8 @@ impl SessionPacketContext {
     runtime: crate::runtime::RuntimeClient, clock: Arc<dyn crate::time::WallClock>,
     entropy: Arc<dyn crate::api::Entropy>, events: Arc<crate::node::EventHub>,
     route_policy: QualifiedTag, sessions: SessionTable, routes_clone: RouteTable,
-    forwarding_capacity: usize, route_capacity: usize,
-    task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    trace: Option<crate::routing::trace::TraceSink>, forwarding_capacity: usize,
+    route_capacity: usize, task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     parser_limits: crate::protocol::CborLimits, relay_hop_deadline: Duration,
   ) -> Self {
     Self {
@@ -151,6 +156,7 @@ impl SessionPacketContext {
       route_policy,
       sessions,
       routes: routes_clone,
+      trace,
       forwarding_capacity,
       route_capacity,
       task_drains,
@@ -177,6 +183,13 @@ impl SessionPacketContext {
   /// The caller-selected bound on in-memory terminal route records.
   pub(crate) const fn route_capacity(&self) -> usize {
     self.route_capacity
+  }
+
+  /// The node's durable trace sink (None only in unit-test contexts
+  /// without a store): the read loop's late-failure revisions share the
+  /// one bounded instance the origin pump's terminal facts use.
+  pub(crate) fn trace_sink(&self) -> Option<&crate::routing::trace::TraceSink> {
+    self.trace.as_ref()
   }
 
   /// The caller-selected packet parser limits.

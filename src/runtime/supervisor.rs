@@ -685,13 +685,25 @@ pub(super) struct TickState {
 /// ten-argument positional call where a transposed same-typed `Arc`
 /// would compile and silently miswire.
 fn session_packet_context(
-  context: &LocalIdentityContext, dependencies: &RuntimeDependencies,
+  context: &Arc<LocalIdentityContext>, dependencies: &RuntimeDependencies,
   packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
   policy: crate::session::stream::SessionPolicy,
 ) -> Result<SessionPacketContext> {
   // The effective route policy: the caller selection, or the built-in
   // default policy tag (registered by the builder out of the box).
   let route_policy = dependencies.config.route_policy()?;
+  // The durable trace sink is born with the packet context it serves (one
+  // construction site): the origin pump's terminal facts and the read
+  // loop's late-failure revisions share one bounded queue and one
+  // live-record counter with the retention sweep and the observability
+  // view (remaining items 2026-10-10, P2-7).
+  let trace_records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+  let trace_sink = crate::routing::trace::TraceSink::new(
+    Arc::clone(context),
+    dependencies.entropy.clone(),
+    Arc::new(crate::time::HostWallClock),
+    Arc::clone(&trace_records),
+  );
   Ok(SessionPacketContext::new(
     context.identity().node().clone(),
     dependencies.extensions.clone(),
@@ -703,6 +715,7 @@ fn session_packet_context(
     route_policy,
     dependencies.sessions.clone(),
     dependencies.routes.clone(),
+    Some(trace_sink),
     crate::routing::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
     dependencies.config.trace_metadata_limits().active(),
     Arc::clone(&dependencies.connection_tasks),
@@ -779,6 +792,15 @@ impl Supervisor {
       Err(error) => return Err(Box::new((error, dependencies))),
     };
     let route_capacity = dependencies.config.trace_metadata_limits().active();
+    // The durable trace sink was constructed with the packet context (one
+    // construction site) and is read back here: the origin pump's terminal
+    // facts, the read loop's late-failure revisions, the retention sweep,
+    // and the observability view all share the one bounded instance and
+    // its live-record counter (remaining items 2026-10-10, P2-7).
+    let Some(trace_sink) = packet.trace_sink().cloned() else {
+      return Err(Box::new((Error::internal("trace sink"), dependencies)));
+    };
+    let trace_records = trace_sink.live_records().clone();
     let sync_context = Arc::clone(&context);
     // The membership sync protocol was registered by `spawn_runtime`
     // before the runtime was marked ready.
@@ -794,15 +816,6 @@ impl Supervisor {
       dependencies.member_revision.clone(),
       dependencies.reconcile.clone(),
     ));
-    // The durable trace-metadata sink shares the runtime identity context
-    // and injected entropy; persistence failures never touch the data plane.
-    let trace_records = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let trace_sink = crate::routing::trace::TraceSink::new(
-      Arc::clone(&context),
-      dependencies.entropy.clone(),
-      std::sync::Arc::new(crate::time::HostWallClock),
-      std::sync::Arc::clone(&trace_records),
-    );
     let recovery = {
       let Ok(planes) = operations.planes() else {
         return Err(Box::new((

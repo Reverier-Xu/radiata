@@ -611,6 +611,11 @@ pub(crate) struct RouteRecord {
   pub(crate) state: RouteState,
   pub(crate) bytes_forwarded: u64,
   pub(crate) updated_at: SystemTime,
+  /// Core-internal control traffic (membership sync): routed
+  /// identically, but kept out of durable trace persistence — the pump
+  /// receives no trace sink for it, and the read loop's late-failure
+  /// revision must not write one either.
+  pub(crate) internal: bool,
 }
 
 impl RouteRecord {
@@ -621,7 +626,14 @@ impl RouteRecord {
       state: RouteState::Routing,
       bytes_forwarded: 0,
       updated_at: SystemTime::now(),
+      internal: false,
     }
+  }
+
+  /// Marks the route as core-internal control traffic (see the field).
+  pub(crate) fn with_internal(mut self, internal: bool) -> Self {
+    self.internal = internal;
+    self
   }
 
   /// A route record for a delivery that failed before any destination was
@@ -633,6 +645,7 @@ impl RouteRecord {
       state: RouteState::Routing,
       bytes_forwarded: 0,
       updated_at: SystemTime::now(),
+      internal: false,
     }
   }
 
