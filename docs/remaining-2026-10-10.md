@@ -121,13 +121,11 @@
      `record_terminal_failure` 的"未追踪"分支放锁后重入加锁，存在窄 TOCTOU
      窗口。当前生产调用点均不可达该竞态（每流新 trace id / 已确认 key 不存在），
      属加固而非缺陷。
-9. **读视图的 ensure_self_descriptor 惰性发布在 supervisor 循环内写 IO**（lane-f 报告发现）
-   - 证据：`src/runtime/views.rs` — `page_members` 等读视图入口的
+9. **读视图的 ensure_self_descriptor 惰性发布在 supervisor 循环内写 IO**（lane-f 报告发现）——**已修复（lane-k，方向 a+b 混合，本 PR）**：读路径改为只“调度”惰性发布（`src/runtime/task_effects.rs` 的 `kick_self_descriptor_publication`，单飞旗标 + endpoint 集戳记——稳态成员读零 spawn、至多一个发布任务在飞；detached 但有界，与 maintenance 拨号同形），查询立即返回已提交视图；listen effect（任务管理器任务上）在 listener 绑定转换处同步主动发布（best-effort：失败降级回惰性路径，不 fail 已绑定的 listener），listen-后-读保持确定性。降级语义（无 listener 节点的那一次首次读可能暂不含本地节点；发布落地伴随成对 MemberChanged/revision bump）三锚点在位：`src/runtime/views.rs` 模块头与 kick 注释、面向使用者的 `src/node/api.rs` `Members` 文档、测试钉（`tests/starvation.rs::first_member_read_on_a_listenerless_node_survives_slow_storage` 红绿验证 + `tests/lifecycle.rs` 惰性安装配对事件与落地后可见性 + 单飞门单元测试）。维护 tick 的 skip-empty 设计与项 10 契约（labels 携带、endpoint 回滚）零改动：`ensure_local_descriptor` 单点未动，`tests/membership_sync.rs` 全绿。
+   - 原证据：`src/runtime/views.rs` — `page_members` 等读视图入口的
      `ensure_self_descriptor()` 在本地描述符缺失时在循环内提交描述符（写 IO）；无 listener
      节点的首次成员读可被慢存储卡住。机制属既有设计（`src/membership/sync.rs` 刻意让维护
      tick 跳过空 endpoint 集、由首次查询惰性发布）。
-   - 方向：读路径预热或惰性发布任务化。
-   - 文件面：`src/runtime/views.rs`、`src/membership/sync.rs`。
 4. **重派指针换出亚毫秒窗口**（lane-cd 审查 P2，已文档化接受）
    - 证据：`src/routing/forward.rs:546-549` 注释在案 — 同分支 ack 落在 `send_waiting`
      返回与 forwarding 表更新之间会被归属门误丢，hop deadline 超时后重派别分支；
