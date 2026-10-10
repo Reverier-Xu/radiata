@@ -295,9 +295,48 @@ pub(super) async fn read_loop(
             // `Failed(StreamInterrupted)` under either ordering
             // (remaining items 2026-10-10, P2-3).
             if ack.status == crate::packet::wire::AckStatus::Failed {
+              // The pre-read decides what this flip owns: a record that
+              // was not yet `Failed` transitions here, so subscribers get
+              // the `RouteChanged` nudge the refused pump tail no longer
+              // emits (remaining items 2026-10-10, P2-3). The durable
+              // twin mirrors exactly the flip: the revision fires only
+              // for caller traffic with an origin-side identity — an
+              // already-failed record is final, a relay hop or a
+              // destination rejection carries no identity to persist,
+              // and internal control traffic stays out of the durable
+              // trace store on this path too — so the same trace id's
+              // durable terminal ends `Failed(StreamInterrupted)` under
+              // either writer ordering instead of keeping the pump tail's
+              // `Delivered` for the whole retention window (remaining
+              // items 2026-10-10, P2-7).
+              let prior = context.routes.lock().ok().and_then(|table| {
+                let record = table.get(&ack.trace_id)?;
+                if matches!(record.state, RouteState::Failed(_)) {
+                  None
+                } else {
+                  Some((record.selected_node.clone(), record.internal))
+                }
+              });
               update_route(&context.routes, &ack.trace_id, |record| {
                 record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
               });
+              if let Some((destination, internal)) = prior {
+                context
+                  .events
+                  .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+                    ack.trace_id.clone(),
+                  )));
+                if let (Some(trace), Some(destination)) =
+                  (context.trace.as_ref(), destination.filter(|_| !internal))
+                {
+                  trace.revise_terminal_failure(
+                    ack.trace_id.clone(),
+                    context.local().clone(),
+                    destination,
+                    ErrorKind::StreamInterrupted,
+                  );
+                }
+              }
             }
           }
         }
@@ -831,6 +870,7 @@ mod read_loop_liveness_tests {
       crate::routing::DefaultNextHop::tag().unwrap(),
       Arc::new(Mutex::new(BTreeMap::new())),
       Arc::new(Mutex::new(BTreeMap::new())),
+      None,
       8,
       16,
       Arc::new(Mutex::new(Vec::new())),
@@ -1051,6 +1091,7 @@ mod ack_attribution_tests {
       crate::routing::DefaultNextHop::tag().unwrap(),
       Arc::new(Mutex::new(std::collections::BTreeMap::new())),
       Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+      None,
       8,
       16,
       Arc::new(Mutex::new(Vec::new())),
@@ -1153,5 +1194,273 @@ mod ack_attribution_tests {
     use futures_util::FutureExt;
     assert!(upstream_rx.recv().now_or_never().is_none());
     assert!(frames_rx.recv().now_or_never().is_none());
+  }
+}
+
+#[cfg(test)]
+mod durable_mirror_tests {
+  use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::Duration,
+  };
+
+  use futures_util::future::BoxFuture;
+
+  use super::{FrameSource, read_loop};
+  use crate::{
+    ErrorKind, NodeId, RouteState, TraceId,
+    identity::testing::SequenceEntropy,
+    node::EventHub,
+    packet::{
+      RouteRecord,
+      wire::{AckFrame, AckStatus},
+    },
+    routing::trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
+    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    transport::{Received, connection::Message},
+  };
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// A frame source yielding one acknowledgement message, then ending
+  /// the session orderly (the read loop processes the ack before its
+  /// final receive).
+  struct AckSource {
+    body: Vec<u8>,
+  }
+
+  impl FrameSource for AckSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      let body = std::mem::take(&mut self.body);
+      Box::pin(async move {
+        if body.is_empty() {
+          Ok(None)
+        } else {
+          Ok(Some(Received::Message(Message {
+            schema_id: crate::protocol::wire::BASE_SCHEMA_ID,
+            kind_id: crate::protocol::wire::PacketKind::Ack.kind_id(),
+            flags: 0,
+            body,
+          })))
+        }
+      })
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      0
+    }
+  }
+
+  /// A packet context carrying a real durable trace sink and the given
+  /// in-memory route table, so the read loop's late-failure handling can
+  /// be observed on both planes at once.
+  fn context_with(sink: TraceSink, routes: crate::routing::RouteTable) -> SessionPacketContext {
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    SessionPacketContext::new(
+      node(1),
+      Arc::new(crate::ExtensionRegistry::new()),
+      SessionPolicy::new(
+        8,
+        1 << 20,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+      ),
+      crate::runtime::RuntimeClient::routing_only(
+        tokio::sync::mpsc::channel(4).0,
+        Arc::new(Mutex::new(BTreeMap::new())),
+      ),
+      Arc::new(crate::time::HostWallClock),
+      entropy,
+      Arc::new(EventHub::new()),
+      crate::routing::DefaultNextHop::tag().unwrap(),
+      Arc::new(Mutex::new(BTreeMap::new())),
+      routes,
+      Some(sink),
+      8,
+      16,
+      Arc::new(Mutex::new(Vec::new())),
+      crate::protocol::CONTROL_CBOR_LIMITS,
+      Duration::from_secs(5),
+    )
+  }
+
+  /// Feeds one failed acknowledgement through the read loop and returns
+  /// the durable rows once the sink's bounded queue drained (wall-clock
+  /// deadline bounded).
+  async fn deliver_failed_ack(
+    sink: &TraceSink, routes: &crate::routing::RouteTable, trace_id: &TraceId,
+  ) -> Vec<TraceRecord> {
+    let context = context_with(sink.clone(), routes.clone());
+    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Failed,
+      admitted_at_millis: 0,
+    })
+    .unwrap();
+    let mut source = AckSource { body };
+    let (frames, _frames_rx) = test_queue(8, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &session,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the acknowledgement source ends the read loop orderly");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while sink.queued() != 0 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the admitted queue never drained"
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sink.persisted_records().await
+  }
+
+  /// Internal control traffic is excluded from durable trace persistence
+  /// on every path: its pump holds no sink, and a late failure flips the
+  /// in-memory record without writing any durable revision.
+  #[tokio::test]
+  async fn internal_traffic_flips_in_memory_but_never_reaches_the_durable_twin() {
+    let sink = TraceSink::test_sink().await;
+    let trace_id = trace(43);
+    let routes: crate::routing::RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(
+      &routes,
+      8,
+      RouteRecord::new(trace_id.clone(), node(9)).with_internal(true),
+    )
+    .unwrap();
+    crate::routing::table::update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Streaming);
+    });
+
+    let records = deliver_failed_ack(&sink, &routes, &trace_id).await;
+
+    // The in-memory flip still happens (routing correctness is identical
+    // for internal traffic)…
+    let memory = routes.lock().unwrap().get(&trace_id).cloned().unwrap();
+    assert_eq!(
+      memory.state,
+      RouteState::Failed(ErrorKind::StreamInterrupted)
+    );
+    // …but the durable twin stays untouched: no row, no revision.
+    assert!(
+      records.is_empty(),
+      "internal traffic must never persist a durable trace row"
+    );
+  }
+
+  /// The durable twin's mirror of the in-memory flip (remaining items
+  /// 2026-10-10, P2-7): a late failed acknowledgement that flips the
+  /// origin's in-memory record to `Failed(StreamInterrupted)` also
+  /// revises the durable terminal that already recorded `Delivered` —
+  /// the realistic ordering, since the failure report trails the pump
+  /// tail — so the durable trace ends failed exactly like the in-memory
+  /// record instead of keeping `Delivered` for the whole retention
+  /// window.
+  #[tokio::test]
+  async fn late_failure_revises_the_durable_delivered_twin() {
+    let sink = TraceSink::test_sink().await;
+    let trace_id = trace(41);
+    let routes: crate::routing::RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(&routes, 8, RouteRecord::new(trace_id.clone(), node(9))).unwrap();
+    // The pump tail already landed on both planes.
+    crate::routing::table::update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Delivered);
+    });
+    sink
+      .record(
+        TraceRecord::new(trace_id.clone(), node(1), node(9), sink.clock_now())
+          .with_transition(TraceTransition::Delivered, sink.clock_now()),
+      )
+      .await;
+
+    let records = deliver_failed_ack(&sink, &routes, &trace_id).await;
+
+    // The in-memory record ends failed (the P2-3 contract, unchanged).
+    let memory = routes.lock().unwrap().get(&trace_id).cloned().unwrap();
+    assert_eq!(
+      memory.state,
+      RouteState::Failed(ErrorKind::StreamInterrupted)
+    );
+    // The durable twin converged with it: revised in place, identity
+    // preserved, terminal answer the same explicit failure.
+    assert_eq!(records.len(), 1, "one revised row, not two");
+    assert_eq!(records[0].trace_id(), &trace_id);
+    assert_eq!(records[0].source(), &node(1));
+    assert_eq!(records[0].destination(), &node(9));
+    assert_eq!(
+      records[0].phase(),
+      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+    );
+  }
+
+  /// The other ordering: when the failure report lands before the pump
+  /// tail's durable write (the write still in flight), the revision
+  /// writes the fresh durable terminal itself, so the durable twin ends
+  /// failed even though no durable row existed at the moment of the
+  /// flip.
+  #[tokio::test]
+  async fn late_failure_writes_the_twin_when_no_durable_row_landed_yet() {
+    let sink = TraceSink::test_sink().await;
+    let trace_id = trace(42);
+    let routes: crate::routing::RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(&routes, 8, RouteRecord::new(trace_id.clone(), node(9))).unwrap();
+    // Still streaming: no durable terminal row exists yet.
+    crate::routing::table::update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Streaming);
+    });
+    assert!(sink.persisted_records().await.is_empty());
+
+    let records = deliver_failed_ack(&sink, &routes, &trace_id).await;
+
+    let memory = routes.lock().unwrap().get(&trace_id).cloned().unwrap();
+    assert_eq!(
+      memory.state,
+      RouteState::Failed(ErrorKind::StreamInterrupted)
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].trace_id(), &trace_id);
+    assert_eq!(records[0].source(), &node(1));
+    assert_eq!(records[0].destination(), &node(9));
+    assert_eq!(
+      records[0].phase(),
+      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+    );
+  }
+
+  /// Containment: the revision fires only for a record this node's route
+  /// table actually flipped. A failed acknowledgement for an untracked
+  /// trace (this node is a relay hop, or the record was evicted) leaves
+  /// the durable store untouched — no fabricated origin-side identity,
+  /// no `StreamInterrupted` row for a route this node never pumped.
+  #[tokio::test]
+  async fn untracked_failure_leaves_the_durable_twin_untouched() {
+    let sink = TraceSink::test_sink().await;
+    let routes: crate::routing::RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+
+    let records = deliver_failed_ack(&sink, &routes, &trace(43)).await;
+
+    assert!(records.is_empty(), "no durable row may be fabricated");
   }
 }

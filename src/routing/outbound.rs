@@ -18,7 +18,12 @@
 //! end frame onto its session" — never "the peer consumed the stream" —
 //! and a downstream death — when its report reaches this node —
 //! deterministically ends the record `Failed(StreamInterrupted)` under
-//! either ordering. The pump
+//! either ordering. The durable route-trace twin mirrors that contract
+//! (remaining items 2026-10-10, P2-7): a refused end-of-stream update
+//! skips the durable `Delivered` write here, and the read loop's late
+//! failure handler revises the same trace id's durable terminal to
+//! `Failed(StreamInterrupted)` — so the durable evidence converges with
+//! the in-memory record under either writer ordering. The pump
 //! deliberately does not poll the record mid-flight (at-most-once data
 //! plane; the consumer-facing interruption is the typed end reason), so
 //! finishing the tail into a route already known dead is accepted here.
@@ -295,23 +300,38 @@ pub(crate) async fn run_outbound(
     // refuses this update and keeps `Failed(StreamInterrupted)` final —
     // that refusal is the contract, not a lost update: `Delivered`
     // states that the full body and end left this node, never that the
-    // peer consumed them (remaining items 2026-10-10, P2-3). Note the
-    // machine's refusal does not reach the durable twin: this branch
-    // still persists a durable `Delivered` trace below (registered as
-    // a separate remaining item).
+    // peer consumed them (remaining items 2026-10-10, P2-3). The refused
+    // tail also skips the `RouteChanged` emit and the durable
+    // `Delivered` twin: the read loop's late-failure flip emits the
+    // nudge and persists the durable revision instead (the other half of
+    // the durable twin's mirror, remaining items 2026-10-10, P2-7), so the
+    // durable trace ends `Failed(StreamInterrupted)` under either
+    // writer ordering instead of keeping a contradicted `Delivered`
+    // for the whole retention window. A poisoned table lock keeps the
+    // legacy behavior (emit plus persist) rather than guessing.
     update_route(&routes, &trace_id, |record| {
       record.update(RouteState::Delivered);
     });
-    events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-      trace_id.clone(),
-    )));
-    record_terminal_trace(
-      &trace,
-      &trace_id,
-      &source,
-      &destination,
-      crate::routing::trace::TraceTransition::Delivered,
-    );
+    let refused = routes
+      .lock()
+      .map(|table| {
+        table
+          .get(&trace_id)
+          .is_some_and(|record| matches!(record.state, RouteState::Failed(_)))
+      })
+      .unwrap_or(false);
+    if !refused {
+      events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+        trace_id.clone(),
+      )));
+      record_terminal_trace(
+        &trace,
+        &trace_id,
+        &source,
+        &destination,
+        crate::routing::trace::TraceTransition::Delivered,
+      );
+    }
   }
   debug!(interrupted, "packet stream finished");
 }
@@ -419,5 +439,193 @@ mod route_terminal_contract_tests {
       state_of(&routes, &trace_id),
       RouteState::Failed(ErrorKind::StreamInterrupted)
     );
+  }
+}
+
+#[cfg(test)]
+mod pump_tail_durable_tests {
+  use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+  use super::*;
+  use crate::packet::{RouteRecord, StaticBody};
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  fn state_of(routes: &RouteTable, trace_id: &TraceId) -> RouteState {
+    routes
+      .lock()
+      .unwrap()
+      .get(trace_id)
+      .map(|record| record.state.clone())
+      .unwrap()
+  }
+
+  /// Resolves the pump's admission wait the moment it registers: takes
+  /// the pending entry out of the session map and answers it with a
+  /// successful admission (bounded by a wall-clock deadline, since the
+  /// pump registers asynchronously after the open frame queues).
+  async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      let resolved = entry
+        .pending_acks
+        .lock()
+        .unwrap()
+        .remove(trace_id)
+        .map(|entry| match entry {
+          PendingAck::Wait { notify, .. } => {
+            let _ = notify.send(Ok(std::time::UNIX_EPOCH));
+            true
+          }
+          PendingAck::Relay { .. } => false,
+        });
+      if resolved == Some(true) {
+        return;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the pump's admission wait never registered"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  /// Waits until the sink's bounded persistence queue drains, then
+  /// returns the durable rows (wall-clock deadline bounded).
+  async fn drained_records(
+    sink: &crate::routing::trace::TraceSink,
+  ) -> Vec<crate::routing::trace::TraceRecord> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while sink.queued() != 0 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the admitted queue never drained"
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sink.persisted_records().await
+  }
+
+  /// The refused tail must not persist a durable `Delivered` (remaining
+  /// items 2026-10-10, P2-7): when a late mid-flight failure already
+  /// terminalised the route record `Failed`, the pump's end-of-stream
+  /// `Delivered` is refused by the monotonic terminal machine — and the
+  /// refused tail skips the durable `Delivered` twin too, so the durable
+  /// trace keeps the read loop's revised `Failed(StreamInterrupted)`
+  /// instead of contradicting it for the whole retention window.
+  #[tokio::test]
+  async fn refused_tail_skips_the_durable_delivered_twin() {
+    let sink = crate::routing::trace::TraceSink::test_sink().await;
+    let trace_id = trace(31);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(&routes, 8, RouteRecord::new(trace_id.clone(), node(2))).unwrap();
+    // The late failure landed first: the record is already terminal.
+    update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
+    });
+
+    let (entry, _receiver) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    let (ack_tx, _ack_rx) = oneshot::channel();
+    let request = crate::packet::OutboundRequest {
+      trace_id: trace_id.clone(),
+      target: crate::packet::StreamTarget::Exact(node(2)),
+      load_balancer: None,
+      max_hops: 1,
+      protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      metadata: crate::StreamMetadata::new(),
+      body: Box::pin(StaticBody::new(Arc::from(&b"tail"[..]))),
+      internal: false,
+      ack_notify: ack_tx,
+    };
+    let events = Arc::new(crate::node::EventHub::new());
+    let arm_entry = entry.clone();
+    let arm_trace = trace_id.clone();
+    let armed = tokio::spawn(async move { arm_admission(&arm_entry, &arm_trace).await });
+
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        request,
+        routes.clone(),
+        false,
+        Some(sink.clone()),
+        events,
+      ),
+    )
+    .await
+    .expect("the pump finishes its tail within the deadline");
+    armed.await.unwrap();
+
+    // The in-memory terminal stays the late failure's answer ...
+    assert_eq!(
+      state_of(&routes, &trace_id),
+      RouteState::Failed(ErrorKind::StreamInterrupted)
+    );
+    // ... and the durable twin never received the contradicted
+    // `Delivered`: without the skip, this pump persisted exactly one
+    // durable `Delivered` terminal on the refused tail.
+    assert!(
+      drained_records(&sink).await.is_empty(),
+      "a refused tail must not persist a durable Delivered"
+    );
+  }
+
+  /// The normal tail is untouched: an admitted, unfailed route still
+  /// records its durable `Delivered` terminal (enqueue evidence).
+  #[tokio::test]
+  async fn unrefused_tail_still_persists_the_durable_delivered() {
+    let sink = crate::routing::trace::TraceSink::test_sink().await;
+    let trace_id = trace(32);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(&routes, 8, RouteRecord::new(trace_id.clone(), node(2))).unwrap();
+
+    let (entry, _receiver) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    let (ack_tx, _ack_rx) = oneshot::channel();
+    let request = crate::packet::OutboundRequest {
+      trace_id: trace_id.clone(),
+      target: crate::packet::StreamTarget::Exact(node(2)),
+      load_balancer: None,
+      max_hops: 1,
+      protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      metadata: crate::StreamMetadata::new(),
+      body: Box::pin(StaticBody::new(Arc::from(&b"ok"[..]))),
+      internal: false,
+      ack_notify: ack_tx,
+    };
+    let events = Arc::new(crate::node::EventHub::new());
+    let arm_entry = entry.clone();
+    let arm_trace = trace_id.clone();
+    let armed = tokio::spawn(async move { arm_admission(&arm_entry, &arm_trace).await });
+
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        request,
+        routes.clone(),
+        false,
+        Some(sink.clone()),
+        events,
+      ),
+    )
+    .await
+    .expect("the pump finishes its tail within the deadline");
+    armed.await.unwrap();
+
+    assert_eq!(state_of(&routes, &trace_id), RouteState::Delivered);
+    let records = drained_records(&sink).await;
+    assert_eq!(records.len(), 1, "the durable Delivered twin persists");
+    assert_eq!(records[0].trace_id(), &trace_id);
   }
 }

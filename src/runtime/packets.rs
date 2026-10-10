@@ -72,7 +72,7 @@ impl Supervisor {
     if let Err(error) = insert_route(
       &self.dependencies.routes,
       self.route_capacity,
-      RouteRecord::new(trace_id.clone(), destination.clone()),
+      RouteRecord::new(trace_id.clone(), destination.clone()).with_internal(request.internal),
     ) {
       request.reject(error.kind());
       return Err(error);
@@ -131,6 +131,8 @@ impl Supervisor {
     let routes = self.dependencies.routes.clone();
     // Core-internal control traffic stays out of the durable trace store:
     // its volume is a runtime implementation detail, not caller evidence.
+    // The pump simply holds no sink for it, and the record flag carries
+    // the same exclusion to the read loop's late-failure revision path.
     let trace = if request.internal {
       None
     } else {
