@@ -693,6 +693,23 @@ pub(crate) async fn ensure_local_descriptor(
   let descriptor_revision = existing
     .as_ref()
     .map_or(1, |current| current.revision().saturating_add(1));
+  // The endpoint rewrite carries the descriptor's existing capability
+  // labels: labels mutate only through the owner patch path
+  // ([`crate::membership::apply_metadata_patch`], which preserves them),
+  // so an endpoint-set rewrite must not clear them. A rewrite that
+  // dropped labels would publish an empty set at a higher revision and
+  // propagate the loss to every peer (audit 2026-10-09, item 10).
+  //
+  // Endpoint-set semantics: the bound listeners' published endpoints
+  // are the descriptor's endpoint truth. An endpoint patched in without
+  // a bound listener is advisory and this rewrite rolls it back on the
+  // next maintenance tick — from `(existing, published)` alone there is
+  // no way to distinguish an owner-added unlistened endpoint from one
+  // whose listener stopped, and resurrecting stopped listeners would
+  // break the unpublish contract of `stop_listener`.
+  let labels = existing
+    .as_ref()
+    .map_or_else(crate::LabelSet::new, |current| current.labels().clone());
   let descriptor = crate::membership::NodeDescriptorV1::new(
     node.clone(),
     public_key,
@@ -700,7 +717,8 @@ pub(crate) async fn ensure_local_descriptor(
     descriptor_revision,
     false,
     1,
-  );
+  )
+  .with_labels(labels);
   if let Err(error) =
     crate::membership::store::store_descriptor_ctx(store, entropy.as_ref(), &descriptor).await
   {
@@ -904,6 +922,94 @@ mod tests {
         .is_err(),
       "without a fresh bump the next wait parks"
     );
+  }
+
+  /// Regression (audit 2026-10-09, item 10): the local descriptor's
+  /// endpoint rewrite must carry the descriptor's existing capability
+  /// labels. The rewrite used to rebuild the descriptor without them,
+  /// publishing an empty label set at a higher revision — and that loss
+  /// then propagated to every peer through sync. Both drift directions
+  /// (a listener added, a listener removed) are pinned; the documented
+  /// rollback of a patched-but-unlistened endpoint is pinned by the
+  /// integration test in `tests/membership_sync.rs`.
+  #[tokio::test]
+  async fn endpoint_rewrites_carry_the_existing_labels() {
+    use crate::identity::{
+      lifecycle,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference},
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let factory: Arc<dyn crate::provider::StorageFactory> = factory;
+    let keys = ScriptedKeys::full_at(9_600);
+    let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        Some(&keys.as_provider()),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let one = crate::Endpoint::parse("wss://one.example:9000").unwrap();
+    let two = crate::Endpoint::parse("wss://two.example:9000").unwrap();
+    let tier = crate::LabelKey::parse("example.org/labels/tier").unwrap();
+    let gold = crate::LabelValue::parse("gold").unwrap();
+    let read_current = |context: Arc<crate::identity::lifecycle::LocalIdentityContext>| async move {
+      crate::membership::store::read_descriptor_ctx(context.store(), context.identity().node())
+        .await
+        .unwrap()
+        .unwrap()
+    };
+
+    // First publication: revision 1, no labels.
+    ensure_local_descriptor(&context, &entropy, vec![one.clone()], &events, &revision)
+      .await
+      .unwrap();
+    assert_eq!(read_current(Arc::clone(&context)).await.revision(), 1);
+
+    // The owner patches capability labels at revision 2.
+    let current = read_current(Arc::clone(&context)).await;
+    let patched = crate::membership::apply_metadata_patch(
+      &current,
+      crate::NodeMetadataPatch::new()
+        .set_capability(tier.clone(), gold.clone())
+        .unwrap(),
+    )
+    .unwrap();
+    crate::membership::store::store_descriptor_ctx(context.store(), entropy.as_ref(), &patched)
+      .await
+      .unwrap();
+
+    // Listener drift rewrites the endpoint set (a listener was added):
+    // the rewrite must carry the patched labels.
+    ensure_local_descriptor(
+      &context,
+      &entropy,
+      vec![one.clone(), two.clone()],
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap();
+    let grown = read_current(Arc::clone(&context)).await;
+    assert_eq!(grown.revision(), 3);
+    assert_eq!(grown.endpoints(), &[one.clone(), two.clone()][..]);
+    assert_eq!(grown.labels().get(&tier), Some(&gold));
+
+    // The shrink side (the listener was removed) preserves them too.
+    ensure_local_descriptor(&context, &entropy, vec![one.clone()], &events, &revision)
+      .await
+      .unwrap();
+    let shrunk = read_current(Arc::clone(&context)).await;
+    assert_eq!(shrunk.revision(), 4);
+    assert_eq!(shrunk.endpoints(), &[one.clone()][..]);
+    assert_eq!(shrunk.labels().get(&tier), Some(&gold));
   }
 
   /// Regression: a receiver-side leave persist failure used to surface
