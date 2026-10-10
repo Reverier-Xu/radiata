@@ -31,14 +31,6 @@ use crate::{
 
 const CONTROL_CAPACITY: usize = 32;
 
-/// The recovery controller's observation period (unnamed literal kept
-/// every other period out of `NodeConfig`).
-const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// The connection-degree maintenance cadence (see `runtime/degree.rs`):
-/// purely local behavior, not a peer-visible contract.
-use super::degree::DEGREE_MAINTENANCE_TICK_PERIOD;
-
 /// Capacity of the node's outbound packet command channel:
 /// `PACKET_CHANNEL_CAPACITY` derives from it so one bound governs both
 /// control ends.
@@ -360,10 +352,45 @@ async fn supervise(
   {
     tracing::warn!(kind = ?error.kind(), "stale trace termination failed");
   }
-  let mut recovery_timer = tokio::time::interval(RECOVERY_TICK_PERIOD);
-  recovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-  let mut maintenance_timer = tokio::time::interval(DEGREE_MAINTENANCE_TICK_PERIOD);
-  maintenance_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+  // The periodic planes run OFF the select loop (audit 2026-10-09
+  // item 3): one long-lived recovery-observation worker (recovery tick
+  // plus the three retention sweeps) and one degree-maintenance worker,
+  // each owning its own timer, so slow storage or a slow policy no
+  // longer parks control-plane reads and packet admission behind a
+  // tick. Bounded accounting (audit item 4's lesson): exactly two tasks
+  // for the node's lifetime, aborted and awaited by the shutdown path —
+  // never one spawned task per tick.
+  let tick_workers = match supervisor.tick_state() {
+    Ok(ticks) => {
+      let ticks = std::sync::Arc::new(ticks);
+      vec![
+        tokio::spawn(super::recovery::run_recovery_worker(std::sync::Arc::clone(
+          &ticks,
+        ))),
+        tokio::spawn(super::degree::run_maintenance_worker(ticks)),
+      ]
+    }
+    Err(error) => {
+      // Unreachable today: `Supervisor::new` already validated the
+      // operation handles `tick_state` reads. A provisioning failure
+      // still tears down with the fatal reason, never a silent
+      // half-running node.
+      tracing::error!(kind = ?error.kind(), "tick worker provisioning failed");
+      let (dependencies, drained) = supervisor.into_dependencies();
+      finish_shutdown(
+        control,
+        tasks,
+        dependencies,
+        drained,
+        &mut lifecycle,
+        None,
+        ShutdownReason::Fatal(error.kind()),
+      )
+      .await;
+      return;
+    }
+  };
+  supervisor.tick_workers = tick_workers;
   // The leave effect's completion signal: once it lands, the caller has
   // already observed the task's terminal outcome (the publication precedes
   // the signal) and the node tears down with the active-leave reason. A
@@ -453,6 +480,20 @@ async fn supervise(
         let Some(request) = request else {
           continue;
         };
+        // Deliberately INLINE (audit 2026-10-09 item 3, partial): the
+        // packet arm is the node's admission backpressure point — the
+        // bounded command channel plus this await is what paces the
+        // outbound pump population. The storage IO it awaits is
+        // per-request bounded (one descriptor snapshot plus one
+        // authoritative descriptor read for matching-node targets; one
+        // policy resolution plus one session-table lock for forwarded
+        // targets), and the route record must land before the pump
+        // starts so asynchronous senders observe the admission
+        // decision. Externalizing that resolution would relocate the
+        // same serialization into a bounded admission worker while
+        // breaking the record-before-pump ordering, so the structural
+        // cost exceeds the win; the periodic ticks (the unbounded
+        // latency source) are the ones that moved off-loop.
         let _ = supervisor.send_packet(request, &mut tasks).await;
       }
       finished = tasks.join_next(), if !tasks.is_empty() => {
@@ -482,24 +523,6 @@ async fn supervise(
             return;
           }
           None => leave_signals_open = false,
-        }
-      }
-      _ = recovery_timer.tick() => {
-        // A failed tick (store outage, tombstone scan failure) must stay
-        // visible: silent drops would starve recovery diagnostics.
-        if let Err(error) = supervisor.recovery_tick().await {
-          tracing::warn!(kind = ?error.kind(), "recovery tick failed");
-        }
-        supervisor.trace_retention_sweep().await;
-        supervisor.resource_removal_sweep().await;
-        supervisor.receipt_retention_sweep().await;
-      }
-      _ = maintenance_timer.tick() => {
-        // Best-effort by contract: a failed tick (store outage) waits
-        // for the next one, but never silently — the same attribution
-        // rule as the recovery tick.
-        if let Err(error) = supervisor.maintenance_tick().await {
-          tracing::warn!(kind = ?error.kind(), "degree maintenance tick failed");
         }
       }
     }
@@ -567,21 +590,14 @@ async fn finish_shutdown(
 pub(super) struct Supervisor {
   pub(super) dependencies: RuntimeDependencies,
   pub(super) shutdown_tx: watch::Sender<()>,
-  pub(super) driver: SessionDriver,
   pub(super) packet: Arc<SessionPacketContext>,
   pub(super) route_capacity: usize,
   /// The recovery controller, shared with the start-recovery effect's
-  /// plane: one controller truth per incarnation, briefly locked (never
-  /// across an await) by this tick and the effect alike.
+  /// plane and the tick workers: one controller truth per incarnation,
+  /// briefly locked (never across an await) by the read view, the
+  /// recovery worker's tick, and the effect alike.
   pub(super) recovery:
     std::sync::Arc<std::sync::Mutex<crate::membership::recovery::RecoveryController>>,
-  pub(super) recovery_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-  /// In-flight connection-degree maintenance dials: bounds one tick's
-  /// batch so a slow mesh never doubles its own dial load every cadence
-  /// (see `runtime/degree.rs`).
-  pub(super) maintenance_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-  /// Recovery-tick cooldown before the next redundant-edge cut.
-  pub(super) prune_cooldown: u32,
   /// Memoized departed-members exclusion set, keyed by the store
   /// revision it was computed at: the set only changes when a leave or
   /// cleanup tombstone lands or gets GC'd, and every such change commits
@@ -589,18 +605,79 @@ pub(super) struct Supervisor {
   /// revision reuses the cached set instead of rescanning and decoding
   /// every accumulated tombstone; any other commit also invalidates,
   /// which merely recomputes once (commit-writes are rare metadata
-  /// events). The cache is the one shared with the task effects' plane,
-  /// so the checkpoint guard memoizes with the same truth.
+  /// events). The cache is the one shared with the task effects' plane
+  /// and the tick workers, so the checkpoint guard memoizes with the
+  /// same truth.
   pub(super) exclusion_cache: super::recovery::ExclusionCache,
   // The anti-entropy driver task: aborted on shutdown so the node's
   // storage handle is released promptly (a restarted node reopening the
   // same factory must not race a lingering driver).
   pub(super) sync_driver: Option<tokio::task::JoinHandle<()>>,
+  // The two periodic-plane workers (recovery observation with the
+  // retention sweeps, degree maintenance): spawned once by `supervise`,
+  // aborted and awaited by `into_dependencies` — a fixed two-handle
+  // population, never one task per tick (audit 2026-10-09 items 3–4).
+  pub(super) tick_workers: Vec<tokio::task::JoinHandle<()>>,
   pub(super) trace_sink: crate::routing::trace::TraceSink,
   // Approximate live durable trace-record population, shared with the
   // sink (incremented per successful persistence) and decremented by the
   // retention sweep's removals; zero means sweeps can stay skipped.
   pub(super) trace_records: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The periodic planes' shared state: everything the recovery-observation
+/// worker (`recovery_tick` plus the three retention sweeps) and the
+/// degree-maintenance worker need to run OFF the supervisor's select loop
+/// (audit 2026-10-09 item 3: slow storage or a slow policy resolution must
+/// never park control-plane reads and packet admission behind a tick).
+/// Built once per incarnation by [`Supervisor::tick_state`] from the same
+/// Arc-held collaborators the supervisor reads, so the workers observe the
+/// one truth per field — no second controller, cache, or session table.
+/// Mutation is confined to atomics and the briefly-held controller mutex,
+/// so every method takes `&self` and both workers share one `Arc<TickState>`.
+pub(super) struct TickState {
+  pub(super) context: Arc<LocalIdentityContext>,
+  pub(super) config: NodeConfig,
+  pub(super) entropy: Arc<dyn crate::api::Entropy>,
+  pub(super) extensions: Arc<ExtensionRegistry>,
+  pub(super) sessions: crate::session::stream::SessionTable,
+  pub(super) events: Arc<crate::node::EventHub>,
+  /// The tracked connection tasks the recovery tick reaps (bounded task
+  /// accounting shared with the shutdown path).
+  pub(super) connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+  pub(super) driver: SessionDriver,
+  pub(super) packet: Arc<SessionPacketContext>,
+  /// The graceful-shutdown signal: each worker clones its receiver and
+  /// exits cooperatively; the abort in `into_dependencies` is the
+  /// backstop for a mid-tick stall.
+  pub(super) shutdown: watch::Receiver<()>,
+  /// The recovery controller (the same instance the supervisor's read
+  /// view locks).
+  pub(super) recovery: Arc<std::sync::Mutex<crate::membership::recovery::RecoveryController>>,
+  /// In-flight recovery dials: bounds the isolated node's dial fan-out
+  /// (the counter bounds in-flight dials, not lifetime volume).
+  pub(super) recovery_pending: Arc<std::sync::atomic::AtomicUsize>,
+  /// In-flight connection-degree maintenance dials: bounds one tick's
+  /// batch so a slow mesh never doubles its own dial load every cadence
+  /// (see `runtime/degree.rs`).
+  pub(super) maintenance_pending: Arc<std::sync::atomic::AtomicUsize>,
+  /// The degree plane's dial-batch serial: every maintenance tick that
+  /// dials advances it once, and each selected member's published
+  /// endpoints rotate by it (endpoint-level failover, aligned with the
+  /// recovery plane's `recovery_endpoint` rotation — see
+  /// `runtime/degree.rs`).
+  pub(super) degree_attempt: Arc<std::sync::atomic::AtomicU64>,
+  /// Recovery-tick cooldown before the next redundant-edge cut. Only
+  /// the recovery worker mutates it; a racing read at worst shifts one
+  /// cut by one tick.
+  pub(super) prune_cooldown: Arc<std::sync::atomic::AtomicU32>,
+  /// The departed-members exclusion cache (the same instance the
+  /// supervisor's member pages memoize through).
+  pub(super) exclusion_cache: super::recovery::ExclusionCache,
+  /// The approximate live durable trace-record population the trace
+  /// retention sweep decrements (the same counter the observability
+  /// view reads).
+  pub(super) trace_records: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Builds the node-shared packet context (single construction site):
@@ -692,17 +769,15 @@ impl Supervisor {
         dependencies,
       )));
     };
-    let (packet, driver, shutdown_tx, exclusion_cache, published_endpoints) =
-      match operations.planes() {
-        Ok(planes) => (
-          Arc::clone(&planes.packet),
-          planes.driver.clone(),
-          planes.shutdown.clone(),
-          Arc::clone(&planes.exclusion_cache),
-          Arc::clone(&planes.published_endpoints),
-        ),
-        Err(error) => return Err(Box::new((error, dependencies))),
-      };
+    let (packet, shutdown_tx, exclusion_cache, published_endpoints) = match operations.planes() {
+      Ok(planes) => (
+        Arc::clone(&planes.packet),
+        planes.shutdown.clone(),
+        Arc::clone(&planes.exclusion_cache),
+        Arc::clone(&planes.published_endpoints),
+      ),
+      Err(error) => return Err(Box::new((error, dependencies))),
+    };
     let route_capacity = dependencies.config.trace_metadata_limits().active();
     let sync_context = Arc::clone(&context);
     // The membership sync protocol was registered by `spawn_runtime`
@@ -740,17 +815,47 @@ impl Supervisor {
     Ok(Self {
       dependencies,
       shutdown_tx,
-      driver,
       packet,
       route_capacity,
       recovery,
-      recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-      maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-      prune_cooldown: 0,
       exclusion_cache,
       sync_driver,
+      tick_workers: Vec::new(),
       trace_sink,
       trace_records,
+    })
+  }
+
+  /// Builds the periodic planes' shared state (see [`TickState`]):
+  /// clones of the Arc-held collaborators this supervisor already
+  /// reads, plus a fresh shutdown subscription and the tick-local
+  /// counters. Called exactly once by `supervise` when it spawns the two
+  /// tick workers.
+  pub(super) fn tick_state(&self) -> Result<TickState> {
+    let planes = self
+      .dependencies
+      .operations
+      .as_ref()
+      .ok_or_else(|| Error::internal("runtime operations"))?
+      .planes()?;
+    Ok(TickState {
+      context: Arc::clone(&planes.context),
+      config: planes.config.clone(),
+      entropy: Arc::clone(&planes.entropy),
+      extensions: Arc::clone(&self.dependencies.extensions),
+      sessions: planes.sessions.clone(),
+      events: Arc::clone(&self.dependencies.events),
+      connection_tasks: Arc::clone(&planes.connection_tasks),
+      driver: planes.driver.clone(),
+      packet: Arc::clone(&planes.packet),
+      shutdown: self.shutdown_tx.subscribe(),
+      recovery: Arc::clone(&self.recovery),
+      recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+      maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+      degree_attempt: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+      prune_cooldown: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+      exclusion_cache: Arc::clone(&self.exclusion_cache),
+      trace_records: Arc::clone(&self.trace_records),
     })
   }
 
@@ -766,6 +871,14 @@ impl Supervisor {
     if let Some(driver) = self.sync_driver.take() {
       driver.abort();
       aborted.push(driver);
+    }
+    // The tick workers observe the shutdown signal above and exit
+    // cooperatively; the abort is the backstop for a worker stalled
+    // mid-tick (its storage handles drop with the task), and the
+    // returned handles keep the shutdown reply behind their teardown.
+    for worker in self.tick_workers.drain(..) {
+      worker.abort();
+      aborted.push(worker);
     }
     if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
       for handle in handles.drain(..) {
@@ -1135,7 +1248,8 @@ mod receipt_retention_sweep_tests {
   #[tokio::test]
   async fn tick_sweep_forgets_elapsed_anchored_receipts() {
     let retention = Duration::from_millis(100);
-    let (mut supervisor, _factory, entropy) = sweep_supervisor(retention).await;
+    let (supervisor, _factory, entropy) = sweep_supervisor(retention).await;
+    let ticks = supervisor.tick_state().unwrap();
 
     // The explicit command keeps working: over an empty anchor set it is
     // an idempotent no-op.
@@ -1196,7 +1310,7 @@ mod receipt_retention_sweep_tests {
       .unwrap()
     );
     tokio::time::sleep(retention + Duration::from_millis(250)).await;
-    supervisor.receipt_retention_sweep().await;
+    ticks.receipt_retention_sweep().await;
     assert!(
       !anchor_receipt(
         supervisor.context().unwrap().store(),
@@ -1218,5 +1332,209 @@ mod receipt_retention_sweep_tests {
       .unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining);
+  }
+}
+
+/// The runtime's shared supervisor-unit-test fixture: builds a
+/// supervisor over a caller-supplied storage factory and config the way
+/// `spawn_runtime` builds the real one (identity provisioning, builtin
+/// transports, operation handles), so tick-plane tests drive the exact
+/// production construction path. Shared by the degree-maintenance and
+/// recovery-worker test modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+  use std::sync::Arc;
+
+  use tokio::sync::{mpsc, watch};
+
+  use super::{RuntimeDependencies, Supervisor, node_offer};
+  use crate::{
+    NodeConfig,
+    extension_registry::ExtensionRegistry,
+    identity::{
+      lifecycle::open_local_identity,
+      testing::{ScriptedKeys, SequenceEntropy},
+    },
+    protocol::feature,
+    provider::StorageFactory,
+    session::stream::SessionTable,
+    storage::contract::{ReferenceFactory, required_capabilities},
+  };
+
+  /// Builds a supervisor over a fresh in-memory identity opened through
+  /// the caller's factory: no sessions, no listeners — the tick planes
+  /// run against a real store.
+  pub(crate) async fn supervisor_over(
+    factory: Arc<dyn StorageFactory>, config: NodeConfig,
+  ) -> (Supervisor, Arc<dyn crate::api::Entropy>, SessionTable) {
+    let keys = ScriptedKeys::full();
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      open_local_identity(
+        &factory,
+        Some(&keys.as_provider()),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(3_600),
+      )
+      .await
+      .unwrap(),
+    );
+    let mut extensions = ExtensionRegistry::new();
+    // The built-in transports the node builder installs: the ticks
+    // resolve the members' wss endpoints through this registry.
+    for (tag, transport) in [
+      (
+        crate::transport::tls_transport::TlsTransport::tag().unwrap(),
+        Arc::new(crate::transport::tls_transport::TlsTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+      (
+        crate::transport::wss::WssTransport::tag().unwrap(),
+        Arc::new(crate::transport::wss::WssTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+      (
+        crate::transport::plain::PlainTransport::tag().unwrap(),
+        Arc::new(crate::transport::plain::PlainTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+    ] {
+      extensions
+        .register_builtin_transport(tag, transport)
+        .unwrap();
+    }
+    let mut definitions = feature::builtin_definitions().unwrap();
+    definitions.extend(extensions.feature_definitions());
+    let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
+    let offer = node_offer(&registry, config.required_features()).unwrap();
+    let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
+    let (revision_tx, _revision_rx) = watch::channel(0_u64);
+    let (packet_tx, _packet_rx) = mpsc::channel(super::PACKET_CHANNEL_CAPACITY);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let mut dependencies = RuntimeDependencies {
+      storage_factory: factory,
+      context: Some(context),
+      keys: Some(keys),
+      config,
+      entropy: entropy.clone(),
+      extensions: Arc::new(extensions),
+      sessions: sessions.clone(),
+      routes: Default::default(),
+      events: Arc::new(crate::node::EventHub::new()),
+      member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
+      leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
+      reconcile: None,
+      sync_round_requests: round_tx,
+      connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+      listeners: Default::default(),
+      task_manager: None,
+      operations: None,
+      runtime_seed: None,
+    };
+    // The operation handles are built the way `spawn_runtime` builds them,
+    // so the tick drives the exact production packet context and session
+    // driver instead of a stand-in.
+    let operations = super::operation_deps(&dependencies, packet_tx.clone(), offer, registry)
+      .expect("operation handles");
+    dependencies.operations = Some(operations);
+    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
+      Ok(supervisor) => supervisor,
+      Err(boxed) => panic!("supervisor construction failed: {}", boxed.0),
+    };
+    (supervisor, entropy, sessions)
+  }
+
+  /// The reference factory plus the dialing config the maintenance
+  /// fixture uses: a dial deadline long enough that the tick's detached
+  /// dials stay in flight (stalled in the TLS handshake against a held
+  /// silent listener) while the test observes them.
+  pub(crate) fn reference_and_config() -> (Arc<ReferenceFactory>, NodeConfig) {
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let config = NodeConfig::new()
+      .with_dial_deadline(std::time::Duration::from_secs(2))
+      .unwrap();
+    (reference, config)
+  }
+
+  pub(crate) fn member_id(seed: u64) -> crate::NodeId {
+    crate::NodeId::parse(&format!("node-{seed:021}")).unwrap()
+  }
+
+  pub(crate) fn member_key(seed: u64) -> crate::PublicKey {
+    let signing = crate::identity::testing::scripted_signing(seed);
+    crate::PublicKey::from_bytes(signing.verifying_key().to_bytes())
+  }
+
+  /// Installs one active member: trusted binding (injected) plus
+  /// descriptor (committed through the store path) with every listed
+  /// endpoint (multi-homed members allowed), so the member universe
+  /// counts it and any dial to a silent endpoint stalls in flight
+  /// instead of failing before the test can observe it.
+  pub(crate) async fn install_member(
+    supervisor: &Supervisor, reference: &Arc<ReferenceFactory>, seed: u64, ports: &[u16],
+  ) {
+    let node = member_id(seed);
+    let endpoints: Vec<crate::Endpoint> = ports
+      .iter()
+      .map(|port| crate::Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap())
+      .collect();
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      node.clone(),
+      member_key(seed),
+      endpoints,
+      1,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(
+      supervisor.context().unwrap().store(),
+      supervisor.dependencies.entropy.as_ref(),
+      &descriptor,
+    )
+    .await
+    .unwrap();
+    let (namespace, key) = crate::identity::records::identity_binding_key(&node).unwrap();
+    let binding = crate::identity::records::IdentityBindingV1::new(node, member_key(seed));
+    crate::identity::testing::inject_entry(reference, (namespace, key), binding.encode().unwrap());
+  }
+
+  /// Inserts one live session entry for `peer` into the table: a
+  /// synthetic entry is enough — the tick only reads liveness.
+  pub(crate) fn insert_live_session(
+    sessions: &SessionTable, peer: crate::NodeId, entropy: &dyn crate::api::Entropy,
+  ) {
+    let entry = crate::session::stream::SessionEntry::synthetic_entry(
+      entropy,
+      crate::Endpoint::parse("wss://127.0.0.1:1").unwrap(),
+    )
+    .unwrap();
+    sessions.lock().unwrap().insert(peer, entry);
+  }
+
+  /// A silent TCP peer: accepts every connection, counts it, and holds
+  /// it open, so a wss dial stalls in the TLS handshake until its
+  /// deadline — and the connection counter tells the test WHICH of a
+  /// member's endpoints was dialed. Holding the socket matters: dropping
+  /// it would reset the connection and fail the dial early.
+  pub(crate) async fn silent_peer() -> (
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+  ) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&connections);
+    let held: Arc<std::sync::Mutex<Vec<tokio::net::TcpStream>>> =
+      Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handle = tokio::spawn(async move {
+      while let Ok((stream, _)) = listener.accept().await {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Holding the socket is the point: dropping it would reset the
+        // connection and fail the dial early.
+        held.lock().unwrap().push(stream);
+      }
+    });
+    (port, connections, handle)
   }
 }
