@@ -30,15 +30,21 @@
 | 15 | CONFIRMED（P1） | 已修复 | #65（`e311ed8`） | 合并后的 `FeatureRegistry` 以 `Arc` 注入 `SessionDriver`，三处握手统一经 `handshake_registry()`（`src/session/driver.rs:214, 357, 466, 543`）；公共 API 级回归 `tests/secure_join.rs:2071`。 |
 | 16 | PARTIAL | 已修复 | #65（`a8cccb9`） | `EventSubscription::recv` 对齐 `poll_next` 的取出-存回模式（`src/node/event.rs:65`），取消后订阅仍可用；回归 `src/node/event.rs:355`。 |
 
-统计：16 项中 12 项已修复（其中 5 项半的落点在待合并的 #67）、3 项驳回（9/12-主项/14-主项，
-其中 9 与 12/14 的附带面已分别处理）、1 项未修复（项 3）。
+统计：16 项中 13 项已修复（其中 5 项半的落点在待合并的 #67；项 3 为部分落地——tick 派生已修、包路由臂有意保留 inline，锚点见待修复区）、3 项驳回（9/12-主项/14-主项，其中 9 与 12/14 的附带面已分别处理）。
 
 ---
 
 ## 待修复（按优先级）
 
-### P1 — 项 3：路由策略与周期维护仍在 supervisor 循环内同步等待（唯一未修复确认项）
+### P1 — 项 3：路由策略与周期维护仍在 supervisor 循环内同步等待——**已修复（部分落地，lane-f，本 PR）**
 
+- 落地：recovery tick + 三个 sweep 与 maintenance tick 迁入两个长寿命 worker
+  （`TickState` 共享态束 + `run_recovery_worker`/`run_maintenance_worker`）；tick 重叠
+  策略 = skip（注释在案）；worker 固定两任务整寿命、shutdown 确定性排干（不重蹈项 4）；
+  回归 `tests/starvation.rs`（慢存储 sweep 下读/发包仍在时限盒内）+ 单飞钉（ stalled
+  store 下恰好一个 tick 在飞）。
+- 保留 inline（有意）：包路由臂的描述符快照/策略解析（背压点 + record-before-pump
+  顺序），理由注释锚在 `src/runtime/supervisor.rs` 的 packet 臂处。
 - 来源：`audit-2026-10-09.md` 项 3（CONFIRMED）；两波 lane 文件面均未覆盖，#67 亦未触及。
 - 当前代码证据（2026-10-10 复核，行号为当前分支实况）：
   - `src/runtime/supervisor.rs:456` — packet 臂 `send_packet(request, &mut tasks).await`
@@ -112,14 +118,24 @@
      属加固而非缺陷。
    - 方向：随 durable twin 条目一并处理，或为 `insert_route` 补 Failed 粘性不变量。
    - 文件面：`src/routing/table.rs`。
+9. **读视图的 ensure_self_descriptor 惰性发布在 supervisor 循环内写 IO**（lane-f 报告发现）
+   - 证据：`src/runtime/views.rs` — `page_members` 等读视图入口的
+     `ensure_self_descriptor()` 在本地描述符缺失时在循环内提交描述符（写 IO）；无 listener
+     节点的首次成员读可被慢存储卡住。机制属既有设计（`src/membership/sync.rs` 刻意让维护
+     tick 跳过空 endpoint 集、由首次查询惰性发布）。
+   - 方向：读路径预热或惰性发布任务化。
+   - 文件面：`src/runtime/views.rs`、`src/membership/sync.rs`。
 4. **重派指针换出亚毫秒窗口**（lane-cd 审查 P2，已文档化接受）
    - 证据：`src/routing/forward.rs:546-549` 注释在案 — 同分支 ack 落在 `send_waiting`
      返回与 forwarding 表更新之间会被归属门误丢，hop deadline 超时后重派别分支；
      fail-closed、自愈，窗口远小于一次网络 RTT。
    - 方向：无需修复（固有局限已注释）；若未来重派路径加 await 点放大窗口，需重新评估。
    - 文件面：`src/routing/forward.rs`（仅注释锚点）。
-5. **degree 平面仍按首 endpoint 投影拨号**（lane-cd 报告遗留 3）
-   - 证据：`src/membership/degree.rs:135` — `select_degree_dials` 签名收
+5. **degree 平面仍按首 endpoint 投影拨号**（lane-cd 报告遗留 3）——**已修复（lane-f，本 PR）**：
+   `select_degree_dials` 升级为携带全部 endpoint（`src/membership/degree.rs`），degree
+   拨号按批次序号复用 `recovery_endpoint` 轮转（`src/runtime/degree.rs`）；首端点投影
+   已删除；回归测试钉住首 endpoint stall 后下一轮拨到第二 endpoint。
+   - 原证据：`src/membership/degree.rs:135` — `select_degree_dials` 签名收
      `BTreeMap<NodeId, Endpoint>`（单 endpoint），该文件未被两波修复触碰（末次变更
      `ffc630a`）；`src/runtime/recovery.rs:241-256` — `known_online_members` 显式投影到
      首 endpoint（注释写明"the degree dialer's single-endpoint selection contract"），

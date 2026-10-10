@@ -127,22 +127,27 @@ pub(crate) const fn degree_plan(n: usize, override_target: usize, sessions: usiz
 /// Picks up to `dial_budget` distinct dial candidates: uniformly random
 /// members outside the connected set and never the local node, by
 /// partial Fisher–Yates over the eligible members with entropy-sourced
-/// indices. Returns fewer than the budget only when fewer members are
+/// indices. Every candidate carries ALL of its published endpoints —
+/// the caller rotates through them across attempts (endpoint-level
+/// failover aligned with the recovery plane, remaining-items list
+/// P2-5) — so a multi-homed member's later endpoints stay dial
+/// candidates instead of being projected away at selection time.
+/// Returns fewer than the budget only when fewer members are
 /// eligible. The index draw reduces one entropy word modulo the
 /// remaining candidate count — the modulo bias is below `2^-32` for any
 /// real cluster size and is deliberately accepted over an unbounded
 /// rejection loop on the tick path.
 pub(crate) fn select_degree_dials(
-  dial_budget: usize, local: &NodeId, members: &BTreeMap<NodeId, Endpoint>,
+  dial_budget: usize, local: &NodeId, members: &BTreeMap<NodeId, Vec<Endpoint>>,
   connected: &BTreeSet<NodeId>, entropy: &dyn Entropy,
-) -> Result<Vec<(NodeId, Endpoint)>> {
+) -> Result<Vec<(NodeId, Vec<Endpoint>)>> {
   if dial_budget == 0 {
     return Ok(Vec::new());
   }
-  let candidates: Vec<(NodeId, Endpoint)> = members
+  let candidates: Vec<(NodeId, Vec<Endpoint>)> = members
     .iter()
     .filter(|(node, _)| *node != local && !connected.contains(*node))
-    .map(|(node, endpoint)| (node.clone(), endpoint.clone()))
+    .map(|(node, endpoints)| (node.clone(), endpoints.clone()))
     .collect();
   let take = dial_budget.min(candidates.len());
   let mut candidates = candidates;
@@ -279,13 +284,16 @@ mod tests {
     assert_eq!(plan.dial_budget, 3);
   }
 
-  fn member_map(entries: &[(u8, &str)]) -> BTreeMap<NodeId, Endpoint> {
+  fn member_map(entries: &[(u8, &[&str])]) -> BTreeMap<NodeId, Vec<Endpoint>> {
     entries
       .iter()
-      .map(|(seed, address)| {
+      .map(|(seed, addresses)| {
         (
           NodeId::parse(&format!("node-{seed:021}")).unwrap(),
-          Endpoint::parse(address).unwrap(),
+          addresses
+            .iter()
+            .map(|address| Endpoint::parse(address).unwrap())
+            .collect::<Vec<_>>(),
         )
       })
       .collect()
@@ -327,16 +335,19 @@ mod tests {
   }
 
   /// Selection never dials the local node, never dials a connected
-  /// peer, stays inside the budget, and returns distinct members.
+  /// peer, stays inside the budget, returns distinct members, and
+  /// carries EVERY published endpoint of a selected multi-homed member
+  /// (the caller rotates through them across attempts —
+  /// remaining-items list P2-5).
   #[test]
-  fn selection_respects_budget_exclusions_and_distinctness() {
+  fn selection_respects_budget_exclusions_distinctness_and_endpoints() {
     let local = node(0);
     let members = member_map(&[
-      (1, "wss://127.0.0.1:9001"),
-      (2, "wss://127.0.0.1:9002"),
-      (3, "wss://127.0.0.1:9003"),
-      (4, "wss://127.0.0.1:9004"),
-      (5, "wss://127.0.0.1:9005"),
+      (1, &["wss://127.0.0.1:9001"]),
+      (2, &["wss://127.0.0.1:9002"]),
+      (3, &["wss://127.0.0.1:9003", "wss://10.0.0.3:9003"]),
+      (4, &["wss://127.0.0.1:9004"]),
+      (5, &["wss://127.0.0.1:9005"]),
     ]);
     let connected: BTreeSet<NodeId> = [node(1), node(2)].into_iter().collect();
     let entropy = Xorshift::new(0x5EED);
@@ -344,7 +355,7 @@ mod tests {
     let dials = select_degree_dials(2, &local, &members, &connected, &entropy).unwrap();
     assert_eq!(dials.len(), 2);
     let mut seen = BTreeSet::new();
-    for (peer, _) in &dials {
+    for (peer, endpoints) in &dials {
       assert_ne!(peer, &local, "selection must never dial the local node");
       assert!(
         !connected.contains(peer),
@@ -353,6 +364,14 @@ mod tests {
       assert!(
         seen.insert(peer.clone()),
         "selection must not repeat a peer"
+      );
+      let published = members
+        .get(peer)
+        .map(|expected| expected.as_slice())
+        .unwrap_or(&[]);
+      assert_eq!(
+        endpoints, published,
+        "selection must carry every published endpoint of the member"
       );
     }
   }
@@ -364,9 +383,9 @@ mod tests {
   fn selection_covers_every_candidate_and_is_deterministic() {
     let local = node(0);
     let members = member_map(&[
-      (1, "wss://127.0.0.1:9001"),
-      (2, "wss://127.0.0.1:9002"),
-      (3, "wss://127.0.0.1:9003"),
+      (1, &["wss://127.0.0.1:9001"]),
+      (2, &["wss://127.0.0.1:9002", "wss://10.0.0.2:9002"]),
+      (3, &["wss://127.0.0.1:9003"]),
     ]);
     let connected = BTreeSet::new();
 
@@ -389,7 +408,7 @@ mod tests {
   #[test]
   fn selection_propagates_entropy_faults() {
     let local = node(0);
-    let members = member_map(&[(1, "wss://127.0.0.1:9001")]);
+    let members = member_map(&[(1, &["wss://127.0.0.1:9001"])]);
     struct Faulting;
 
     impl std::fmt::Debug for Faulting {

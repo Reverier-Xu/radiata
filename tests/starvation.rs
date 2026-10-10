@@ -27,7 +27,7 @@ use tokio::time::Instant;
 
 mod common;
 
-use common::{MemoryStorageFactory, ScriptedKeys};
+use common::{DelayingFactory, MemoryStorageFactory, ScriptedKeys};
 
 /// The dial deadline the wedged join pays: long enough that a read or
 /// packet queued behind the dial would blow the probe boxes below, and
@@ -435,4 +435,227 @@ async fn reads_packets_and_local_writes_flow_while_four_dials_hold_every_network
   for holder in holders {
     holder.abort();
   }
+}
+
+/// An echo consumer that counts completed deliveries, so the test can
+/// await the peer's receipt before arming the slow device.
+#[derive(Debug, Default)]
+struct CountingEcho {
+  delivered: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingEcho {
+  fn delivered(&self) -> usize {
+    self.delivered.load(std::sync::atomic::Ordering::Relaxed)
+  }
+}
+
+impl PacketConsumer for CountingEcho {
+  fn accept<'a>(
+    &'a self, mut packet: radiata::IncomingStream,
+  ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+      let mut body = packet.body();
+      while std::future::poll_fn(|cx| body.as_mut().poll_next(cx))
+        .await
+        .transpose()?
+        .is_some()
+      {}
+      self
+        .delivered
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      Ok(())
+    })
+  }
+}
+
+/// Starts one node over the caller's storage factory and config, with
+/// the caller's echo consumer registered under the shared protocol tag.
+async fn start_over(
+  seed: u64, storage: Arc<dyn StorageFactory>, config: NodeConfig,
+  consumer: Arc<dyn PacketConsumer>,
+) -> NodeHandle {
+  let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(7_000_000 + seed * 1_000));
+  let mut extensions = radiata::ExtensionRegistry::new();
+  extensions
+    .register_protocol(
+      ProtocolDefinition::new(
+        ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
+        radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
+      ),
+      consumer,
+    )
+    .unwrap();
+  NodeBuilder::new(storage)
+    .keys(keys)
+    .extensions(extensions)
+    .config(config)
+    .start()
+    .await
+    .unwrap()
+}
+
+/// The trace-records counter off one observability snapshot.
+fn trace_records(status: &radiata::ObservabilitySnapshot) -> u64 {
+  status
+    .counter(&radiata::QualifiedTag::parse(radiata::ObservabilitySnapshot::TRACE_RECORDS).unwrap())
+    .unwrap()
+}
+
+/// The periodic-tick lane of the starvation contract (audit 2026-10-09
+/// item 3): while a recovery-tick retention sweep commits against a slow
+/// device (every commit serialized behind a 6s delay), the supervisor's
+/// own lanes must keep answering — the storage-free recovery read, the
+/// member page (a read, not a commit), and packet admission. Before the
+/// tick planes moved onto their own workers, the sweep ran inline in the
+/// select loop, so one slow commit parked reads and packet admission
+/// behind it for the whole device delay; with the workers, only the
+/// next tick waits.
+///
+/// The sweep is armed deterministically through the caller-selected
+/// trace retention window (1s): one delivered packet terminalizes a
+/// durable route-trace record on the slow node, the record expires, and
+/// the next tick's trace retention sweep commits its removal — a commit
+/// that pays the injected delay inside the observation window without
+/// waiting out the 30-day receipt default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage() {
+  common::init_tracing();
+  const COMMIT_DELAY: Duration = Duration::from_secs(6);
+  const WINDOW: Duration = Duration::from_secs(11);
+
+  let slow = Arc::new(DelayingFactory::new(Arc::new(MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ))));
+  let trace_limits =
+    radiata::TraceMetadataLimits::new(1_024, 1_024, Duration::from_secs(1)).unwrap();
+  let slow_config = NodeConfig::new()
+    .with_trace_metadata_limits(trace_limits)
+    .unwrap();
+  let probe = start_over(
+    21,
+    Arc::clone(&slow) as Arc<dyn StorageFactory>,
+    slow_config,
+    Arc::new(EchoCollector::default()),
+  )
+  .await;
+  let echo = Arc::new(CountingEcho::default());
+  let peer = start_over(
+    22,
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())) as Arc<dyn StorageFactory>,
+    NodeConfig::new(),
+    Arc::clone(&echo) as Arc<dyn PacketConsumer>,
+  )
+  .await;
+
+  // A two-node mesh: the probe's packets have a live direct session to
+  // admit against.
+  let listener = peer
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  common::merge_with_retry(&probe, &peer, listener.endpoint().clone()).await;
+  let peer_id = peer.local_node().await.unwrap().node_id().clone();
+
+  // One delivered packet terminalizes a durable route-trace record on
+  // the slow node (observed at the peer), then the 1s retention
+  // deadline elapses before the device goes slow — so the very next
+  // retention sweep has an expired terminal record to commit away.
+  probe
+    .send(
+      StreamTarget::Exact(peer_id.clone()),
+      ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
+      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      echo_body(b"sweep-arm"),
+    )
+    .await
+    .unwrap();
+  tokio::time::timeout(Duration::from_secs(10), async {
+    while echo.delivered() < 1 {
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  })
+  .await
+  .expect("the arming packet must be delivered");
+  tokio::time::sleep(Duration::from_millis(1_500)).await;
+  // The probe has no listener, so its local descriptor is published
+  // lazily by the FIRST member read (the maintenance tick deliberately
+  // skips empty endpoint sets): warm that one-time descriptor commit
+  // while the device is still fast, so the probes below exercise read
+  // paths against the slow commits, not the lazy publish itself.
+  let warmed = probe
+    .members()
+    .list(radiata::PageSpec::first(8).unwrap())
+    .await
+    .unwrap();
+  assert!(!warmed.items().is_empty());
+  let armed = trace_records(&probe.metrics().await.unwrap());
+  assert!(
+    armed >= 1,
+    "the arming packet must leave a durable trace record"
+  );
+  slow.set_commit_delay(COMMIT_DELAY);
+
+  // The observation window spans more than one tick period (2s) plus
+  // the device delay (6s): at least one sweep commit is in flight (or
+  // queued behind another) while the probes run.
+  let deadline = Instant::now() + WINDOW;
+  let mut probes = 0_usize;
+  while Instant::now() < deadline {
+    tokio::time::timeout(READ_BOX, probe.recovery())
+      .await
+      .expect("the storage-free recovery read must not queue behind a slow sweep")
+      .unwrap();
+    tokio::time::timeout(
+      READ_BOX,
+      probe.members().list(radiata::PageSpec::first(8).unwrap()),
+    )
+    .await
+    .expect("the member read must not queue behind a slow sweep")
+    .unwrap();
+    tokio::time::timeout(
+      PACKET_BOX,
+      probe.send(
+        StreamTarget::Exact(peer_id.clone()),
+        ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
+        StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+        echo_body(b"still-flowing"),
+      ),
+    )
+    .await
+    .expect("packet admission must not queue behind a slow sweep")
+    .unwrap();
+    probes += 1;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+  }
+  assert!(
+    probes >= 8,
+    "the window must run several probe rounds, ran {probes}"
+  );
+
+  // The slow device really was the shape under test: with the delay
+  // released, the queued sweep work drains and the durable trace
+  // population returns to zero (boxed so a regression fails instead of
+  // hanging).
+  slow.set_commit_delay(Duration::ZERO);
+  tokio::time::timeout(Duration::from_secs(15), async {
+    loop {
+      if trace_records(&probe.metrics().await.unwrap()) == 0 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+  })
+  .await
+  .expect("the retention sweep must drain the terminal records");
+
+  tokio::time::timeout(Duration::from_secs(30), probe.shutdown())
+    .await
+    .expect("shutdown must not drain the slow device's queued commits")
+    .unwrap();
+  peer.shutdown().await.unwrap();
 }
