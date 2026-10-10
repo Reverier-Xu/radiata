@@ -286,7 +286,14 @@ pub(super) async fn read_loop(
             resolve_ack(ack.clone(), pending_acks);
             // A late failure for an admitted stream (a downstream hop
             // died mid-flight) still terminates the origin's route
-            // observation.
+            // observation. This writer races the origin pump's
+            // end-of-stream `Delivered`, and the route table's monotonic
+            // terminal machine converges them deterministically: the
+            // failure overrides a recorded `Delivered`, and once recorded
+            // it refuses every later update — so, when the report
+            // reaches this node, the origin's record ends
+            // `Failed(StreamInterrupted)` under either ordering
+            // (remaining items 2026-10-10, P2-3).
             if ack.status == crate::packet::wire::AckStatus::Failed {
               update_route(&context.routes, &ack.trace_id, |record| {
                 record.update(RouteState::Failed(ErrorKind::StreamInterrupted));

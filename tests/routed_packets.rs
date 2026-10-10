@@ -873,3 +873,188 @@ async fn relay_leg_death_surfaces_typed_interruption_at_the_destination() {
     let _ = node.handle.shutdown().await;
   }
 }
+
+/// The origin-side route record's terminal contract (remaining items
+/// 2026-10-10, P2-3): the pump's end-of-stream `Delivered` and the relay
+/// chain's late mid-flight failure report are two writers on one record,
+/// and the route table's monotonic terminal machine must converge them to
+/// one deterministic final answer. The realistic ordering is pinned here:
+/// a post-admission failure is only reported upstream when the surviving
+/// relay's chunk relay fails (`forward::relay_chunk` → `fail_hop`), so
+/// the pump's tail lands first and the failure report arrives late — and
+/// must still override the recorded `Delivered`. The opposite ordering
+/// (failure first) is exercised by the pump-side lib tests in
+/// `src/routing/outbound.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn relay_leg_death_leaves_the_origin_record_failed_regardless_of_ordering() {
+  init_tracing();
+  let (nodes, table) = boot_linear_four(true).await;
+
+  // Per-node linear chain policy over the concrete identities: for every
+  // origin, the way toward a later member is its right-hand neighbour.
+  {
+    let mut guard = table.lock().unwrap();
+    for origin in 0..4_usize {
+      for destination in (origin + 1)..4_usize {
+        let next = origin + 1;
+        guard.insert(
+          format!(
+            "{}|{}",
+            nodes[origin].id().as_str(),
+            nodes[destination].id.as_ref().unwrap().as_str()
+          ),
+          nodes[next].id().as_str().to_owned(),
+        );
+      }
+    }
+  }
+
+  settle_linear_chain(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let (body, open_flag, notify) = gated_body();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol,
+      policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let route_handle = packet.send_async(body).unwrap();
+
+  // Wait until the stream is observably streaming — the admission ack
+  // from D resolved — so the mid-leg death below is a mid-flight failure
+  // report, not a pre-admission branch search.
+  let inflight_deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let view = match nodes[0].handle.routes().get(&route_handle) {
+      Ok(view) => view,
+      Err(error) if error.kind() == radiata::ErrorKind::NotFound => {
+        assert!(
+          std::time::Instant::now() < inflight_deadline,
+          "the stream never reached its in-flight phase"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        continue;
+      }
+      Err(error) => panic!("route query failed: {error:?}"),
+    };
+    if matches!(view.state(), RouteState::Streaming) {
+      break;
+    }
+    assert!(
+      !matches!(view.state(), RouteState::Failed(_)),
+      "the stream failed before reaching its in-flight phase"
+    );
+    assert!(
+      std::time::Instant::now() < inflight_deadline,
+      "the stream never reached its in-flight phase"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+
+  // Break the middle leg B—C from both sides: the relay chain reports the
+  // mid-flight failure upstream while the origin pump stays parked here.
+  nodes[1]
+    .handle
+    .disconnect(nodes[2].id().clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  nodes[2]
+    .handle
+    .disconnect(nodes[1].id().clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+
+  // D's consumer observes the typed interruption — the consumer-side
+  // semantics of the same death (audit 2026-10-09 item 11).
+  wait_for(
+    || !nodes[3].collector.interruptions.lock().unwrap().is_empty(),
+    Duration::from_secs(30),
+    "the destination must observe the typed interruption",
+  )
+  .await;
+  {
+    let interruptions = nodes[3].collector.interruptions.lock().unwrap();
+    assert_eq!(interruptions.len(), 1);
+    assert_eq!(interruptions[0].1, ErrorKind::StreamInterrupted);
+  }
+  assert!(
+    nodes[3].collector.packets.lock().unwrap().is_empty(),
+    "an interrupted multi-hop stream must never deliver a body"
+  );
+
+  // Release the body: the pump finishes its tail (chunk and end frame
+  // leave this node onto the still-alive origin leg) into a route whose
+  // downstream legs are already dead. The chunk relay failure at the
+  // surviving relay is what triggers the typed failure report upstream —
+  // the pump's `Delivered` therefore lands first, the late failure second.
+  open_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+  notify.notify_waiters();
+  wait_for(
+    || {
+      nodes[0]
+        .handle
+        .routes()
+        .get(&route_handle)
+        .ok()
+        .map(|view| view.bytes_forwarded())
+        .unwrap_or(0)
+        >= 4
+    },
+    Duration::from_secs(30),
+    "the released body chunk must leave the origin",
+  )
+  .await;
+
+  // The late mid-flight failure must override the recorded `Delivered`:
+  // the origin's final terminal answer is `Failed(StreamInterrupted)`,
+  // deterministically, whichever way the two writers interleave.
+  wait_for(
+    || {
+      matches!(
+        nodes[0]
+          .handle
+          .routes()
+          .get(&route_handle)
+          .ok()
+          .map(|view| view.state().clone()),
+        Some(RouteState::Failed(ErrorKind::StreamInterrupted))
+      )
+    },
+    Duration::from_secs(30),
+    "the late mid-flight failure must override the pump's Delivered at the origin",
+  )
+  .await;
+
+  // The failure terminal must stay final: sample past the acknowledgement
+  // window (loopback latency is milliseconds; the window is seconds) and
+  // require `Failed(StreamInterrupted)` as the final answer throughout —
+  // any `Delivered` here would resurrect the ordering race.
+  let settle_deadline = std::time::Instant::now() + Duration::from_secs(2);
+  while std::time::Instant::now() < settle_deadline {
+    let state = nodes[0]
+      .handle
+      .routes()
+      .get(&route_handle)
+      .map(|view| view.state().clone());
+    assert!(
+      matches!(state, Ok(RouteState::Failed(ErrorKind::StreamInterrupted))),
+      "the recorded failure must survive the pump's tail, got {state:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}

@@ -77,7 +77,11 @@
      测试（写入验收纪律）。
    - 文件面：`src/task/mod.rs`。
 3. **源端 pump 在 mid-flight Failed 后仍发完已入队尾部，路由终态存在双写者竞争**
-   （lane-cd 报告遗留 1）
+   （lane-cd 报告遗留 1）——**已收敛（lane-g）**：复核发现内存 record 的单调终态机
+   （`src/routing/table.rs:47-56`，Failed 覆盖一切/Failed 后拒绝一切）早已存在，
+   终态本就确定；lane-g 补齐契约锚点（`src/routing/outbound.rs:11-23,291-306`、
+   `src/session/inbound.rs:287-296`）与回归钉（`tests/routed_packets.rs:864`，
+   红绿验证），生产代码零行为变更。
    - 证据：`src/routing/outbound.rs:247-285` — admission 成功后 pump 无条件泵完 body 并
      发 End，End 入队成功即记 `Delivered`（`:267-274`）；同一时刻
      `src/session/inbound.rs:296-302` 的迟到 Failed 会把 origin 的 route record 翻为
@@ -87,6 +91,27 @@
      "Delivered = 已从本节点出队"语义；中继腿死亡对消费者的可见性已由 #67 的
      `StreamInterrupted` 解决，本项只余 route record 语义。
    - 文件面：`src/routing/outbound.rs`、`src/session/inbound.rs`。
+7. **durable route-trace 终态与内存 record 分叉（durable twin 未镜像迟到失败）**
+   （lane-g 复核发现，主控裁决登记）
+   - 证据：`src/routing/outbound.rs` pump 尾部——`update_route(Delivered)` 被单调终态机
+     拒绝后，仍无条件 emit RouteChanged 并经 `record_terminal_trace` 持久化 durable
+     终态 `Delivered`；真实落序下 pump 尾部先落，durable store 对一条消费者已收到
+     `StreamInterrupted` 的路由保留 `Delivered` 整个保留期。durable trace 的记录访问器
+     为 `#[cfg(test)]`，生产面无内容消费方（只写审计日志），影响为取证失真而非功能
+     正确性。
+   - 方向：二选一——(a) 完整镜像：inbound 迟到 Failed 同步持久化 durable Failed
+     （需把 TraceSink 穿进 `SessionPacketContext` 构造点，`src/session/stream.rs:102-127`），
+     构造点级改动，单独 lane；(b) 文档化"durable 终态 = 源端出队证据（enqueue
+     evidence）"语义并接受与内存 record 的分工。
+   - 文件面（若立项 a）：`src/routing/outbound.rs`、`src/session/stream.rs`、
+     `src/session/inbound.rs`、构造点（`src/session/driver.rs` / `src/runtime/supervisor.rs`）。
+8. **`insert_route` 是唯一不经 Failed 粘性守卫的记录写点**（lane-g 审查 P2，加固项）
+   - 证据：`src/routing/table.rs:24-45`（`:43` 对已存在 key 无条件覆盖）与
+     `record_terminal_failure` 的"未追踪"分支（`:84-87`）放锁后调用它，存在窄 TOCTOU
+     窗口。当前生产调用点均不可达该竞态（每流新 trace id / 已确认 key 不存在），
+     属加固而非缺陷。
+   - 方向：随 durable twin 条目一并处理，或为 `insert_route` 补 Failed 粘性不变量。
+   - 文件面：`src/routing/table.rs`。
 4. **重派指针换出亚毫秒窗口**（lane-cd 审查 P2，已文档化接受）
    - 证据：`src/routing/forward.rs:546-549` 注释在案 — 同分支 ack 落在 `send_waiting`
      返回与 forwarding 表更新之间会被归属门误丢，hop deadline 超时后重派别分支；

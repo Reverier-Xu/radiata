@@ -7,6 +7,21 @@
 //! attaches to the session infrastructure it pumps through — the session
 //! entry's bounded frame queue and its pending-admission map — the
 //! outbound counterpart of the relay path in `crate::routing::forward`.
+//!
+//! Route-record terminal contract (remaining items 2026-10-10, P2-3):
+//! the record is shared between this pump and the session read loop's
+//! late failure reports, and the two writers converge through the route
+//! table's monotonic terminal machine (`update_route`): a recorded
+//! `Failed` is final and refuses every later update, while a failure
+//! reported after a recorded `Delivered` still overrides it. `Delivered`
+//! therefore means exactly "the origin enqueued the full body and the
+//! end frame onto its session" — never "the peer consumed the stream" —
+//! and a downstream death — when its report reaches this node —
+//! deterministically ends the record `Failed(StreamInterrupted)` under
+//! either ordering. The pump
+//! deliberately does not poll the record mid-flight (at-most-once data
+//! plane; the consumer-facing interruption is the typed end reason), so
+//! finishing the tail into a route already known dead is accepted here.
 
 use std::sync::Arc;
 
@@ -274,6 +289,16 @@ pub(crate) async fn run_outbound(
   if interrupted {
     terminal!(ErrorKind::StreamInterrupted);
   } else {
+    // End-of-stream terminal: enqueue completion records `Delivered`
+    // through the route table's monotonic terminal machine. When a late
+    // mid-flight failure already terminalised the record, the machine
+    // refuses this update and keeps `Failed(StreamInterrupted)` final —
+    // that refusal is the contract, not a lost update: `Delivered`
+    // states that the full body and end left this node, never that the
+    // peer consumed them (remaining items 2026-10-10, P2-3). Note the
+    // machine's refusal does not reach the durable twin: this branch
+    // still persists a durable `Delivered` trace below (registered as
+    // a separate remaining item).
     update_route(&routes, &trace_id, |record| {
       record.update(RouteState::Delivered);
     });
@@ -316,5 +341,83 @@ fn record_terminal_trace(
 fn withdraw_pending(entry: &SessionEntry, trace_id: &TraceId) {
   if let Ok(mut pending) = entry.pending_acks.lock() {
     pending.remove(trace_id);
+  }
+}
+
+#[cfg(test)]
+mod route_terminal_contract_tests {
+  use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+  };
+
+  use super::*;
+  use crate::packet::RouteRecord;
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  fn tracked_table(trace_id: &TraceId) -> RouteTable {
+    let routes: RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(&routes, 8, RouteRecord::new(trace_id.clone(), node(7))).unwrap();
+    routes
+  }
+
+  fn state_of(routes: &RouteTable, trace_id: &TraceId) -> RouteState {
+    routes
+      .lock()
+      .unwrap()
+      .get(trace_id)
+      .map(|record| record.state.clone())
+      .unwrap()
+  }
+
+  /// Pump-side half of the terminal contract (remaining items
+  /// 2026-10-10, P2-3): once a mid-flight failure is recorded, the
+  /// end-of-stream `Delivered` must not overwrite it — the route table's
+  /// monotonic terminal machine refuses the update, so the origin's final
+  /// answer stays `Failed` when the failure lands before the pump's tail.
+  #[test]
+  fn recorded_failure_refuses_the_pump_tail_delivered() {
+    let trace_id = trace(1);
+    let routes = tracked_table(&trace_id);
+    update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
+    });
+
+    update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Delivered);
+    });
+
+    assert_eq!(
+      state_of(&routes, &trace_id),
+      RouteState::Failed(ErrorKind::StreamInterrupted)
+    );
+  }
+
+  /// The other half: a failure reported after the pump's `Delivered` —
+  /// the realistic ordering, since the post-admission failure report
+  /// trails the tail — still overrides the recorded success.
+  #[test]
+  fn late_failure_overrides_a_recorded_delivered() {
+    let trace_id = trace(2);
+    let routes = tracked_table(&trace_id);
+    update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Delivered);
+    });
+
+    update_route(&routes, &trace_id, |record| {
+      record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
+    });
+
+    assert_eq!(
+      state_of(&routes, &trace_id),
+      RouteState::Failed(ErrorKind::StreamInterrupted)
+    );
   }
 }
