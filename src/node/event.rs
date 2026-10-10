@@ -63,15 +63,23 @@ fn map_receive<E: Event>(raw: RawReceive<E>) -> (EventReceive<E>, bool) {
 
 impl<E: Event> EventSubscription<E> {
   pub async fn recv(&mut self) -> Result<EventReceive<E>> {
-    let state = std::mem::replace(&mut self.state, SubscriptionState::Terminated);
-    let (raw, receiver) = match state {
+    // Check the receiver out into a pending future parked back on
+    // `self` before awaiting: a cancelled `recv` then leaves the
+    // receiver owned by the subscription (the same take-and-store-back
+    // pattern as `poll_next`) instead of dropping it with this future's
+    // frame, which would silently terminate every later receive.
+    let pending = match std::mem::replace(&mut self.state, SubscriptionState::Terminated) {
       SubscriptionState::Terminated => return Ok(EventReceive::Closed),
       SubscriptionState::Idle(mut receiver) => {
-        let raw = receiver.recv().await;
-        (raw, receiver)
+        Box::pin(async move { (receiver.recv().await, receiver) })
       }
-      SubscriptionState::InFlight(pending) => pending.await,
+      SubscriptionState::InFlight(pending) => pending,
     };
+    self.state = SubscriptionState::InFlight(pending);
+    let SubscriptionState::InFlight(pending) = &mut self.state else {
+      unreachable!("receive future parked on the subscription")
+    };
+    let (raw, receiver) = pending.as_mut().await;
     let (item, terminated) = map_receive(raw);
     self.state = if terminated {
       SubscriptionState::Terminated
@@ -330,6 +338,46 @@ mod tests {
     assert!(matches!(
       subscription.recv().await.unwrap(),
       EventReceive::Item(TestEvent(3))
+    ));
+
+    drop(sender);
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Closed
+    ));
+  }
+
+  /// Cancelling a pending `recv` must not destroy the subscription: the
+  /// receiver stays parked on the subscription (audit 2026-10-09 item
+  /// 16), a later `recv` observes events sent after the cancellation,
+  /// and the terminal close is still delivered exactly once.
+  #[tokio::test]
+  async fn event_subscription_recv_survives_cancellation() {
+    let options = EventOptions::new().capacity(2).unwrap();
+    let (sender, mut subscription) = event_channel::<TestEvent>(options);
+
+    // No event yet: the receive parks, and the timeout cancels it.
+    let cancelled =
+      tokio::time::timeout(std::time::Duration::from_millis(20), subscription.recv()).await;
+    assert!(cancelled.is_err(), "recv completed without any event");
+
+    // The cancelled receive must not have consumed or dropped the
+    // receiver: events sent afterwards are still observed.
+    sender.send(TestEvent(7)).unwrap();
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Item(TestEvent(7))
+    ));
+
+    // A second cancelled receive parks again; the stream view then keeps
+    // working from the same channel position.
+    let cancelled =
+      tokio::time::timeout(std::time::Duration::from_millis(20), subscription.recv()).await;
+    assert!(cancelled.is_err(), "recv completed without any event");
+    sender.send(TestEvent(9)).unwrap();
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Item(TestEvent(9))
     ));
 
     drop(sender);

@@ -226,7 +226,12 @@ pub(crate) async fn spawn_runtime(
   // silently stopped.
   let mut definitions = crate::protocol::feature::builtin_definitions()?;
   definitions.extend(dependencies.extensions.feature_definitions());
-  let registry = crate::protocol::feature::FeatureRegistry::build(definitions)?;
+  // The merged registry is shared with the session driver (Arc): the same
+  // set that built the node offer drives every handshake selection, so
+  // caller-registered features survive into the negotiated intersection.
+  let registry = Arc::new(crate::protocol::feature::FeatureRegistry::build(
+    definitions,
+  )?);
   let offer = node_offer(&registry, dependencies.config.required_features())?;
   let routes = dependencies.routes.clone();
   let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
@@ -238,7 +243,7 @@ pub(crate) async fn spawn_runtime(
   // every node handle must read the same session driver (one credential
   // issuer, one SPKI anchor table), the same packet context, and the same
   // shutdown signal.
-  let operations = operation_deps(&dependencies, packet_tx.clone(), offer)?;
+  let operations = operation_deps(&dependencies, packet_tx.clone(), offer, registry)?;
   dependencies.operations = Some(Arc::clone(&operations));
   // The task manager is spawned here, beside the supervisor and before the
   // node is marked running: the client side rides the node handle (so an
@@ -627,6 +632,7 @@ fn session_packet_context(
 pub(super) fn operation_deps(
   dependencies: &RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
   offer: crate::protocol::offer::FeatureOffer,
+  features: std::sync::Arc<crate::protocol::feature::FeatureRegistry>,
 ) -> Result<Arc<super::task_effects::OperationDeps>> {
   let Some(context) = dependencies.context.clone() else {
     return Err(Error::internal("runtime context"));
@@ -645,6 +651,7 @@ pub(super) fn operation_deps(
     dependencies.entropy.clone(),
     Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
     offer,
+    features,
     dependencies.config.authentication_deadline(),
     dependencies.config.merge_admission(),
   );
@@ -1003,7 +1010,7 @@ mod receipt_retention_sweep_tests {
     let config = NodeConfig::new().with_receipt_retention(retention).unwrap();
     let mut definitions = feature::builtin_definitions().unwrap();
     definitions.extend(ExtensionRegistry::new().feature_definitions());
-    let registry = feature::FeatureRegistry::build(definitions).unwrap();
+    let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
     let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
     let (revision_tx, _) = watch::channel(0_u64);
@@ -1031,8 +1038,8 @@ mod receipt_retention_sweep_tests {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the test drives the exact production construction path for the
     // packet context and the session driver too.
-    let operations =
-      super::operation_deps(&dependencies, packet_tx.clone(), offer).expect("operation handles");
+    let operations = super::operation_deps(&dependencies, packet_tx.clone(), offer, registry)
+      .expect("operation handles");
     dependencies.operations = Some(operations);
     let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
       Ok(supervisor) => supervisor,

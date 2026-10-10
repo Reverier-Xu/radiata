@@ -280,9 +280,13 @@ mod tests {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the tick drives the exact production packet context and session
     // driver instead of a stand-in.
-    let operations =
-      crate::runtime::supervisor::operation_deps(&dependencies, packet_tx.clone(), offer)
-        .expect("operation handles");
+    let operations = crate::runtime::supervisor::operation_deps(
+      &dependencies,
+      packet_tx.clone(),
+      offer,
+      Arc::new(registry),
+    )
+    .expect("operation handles");
     dependencies.operations = Some(operations);
     let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
       Ok(supervisor) => supervisor,
