@@ -2167,3 +2167,129 @@ async fn caller_feature_registry_enters_handshake_selection_and_admission() {
   receiver.shutdown().await.unwrap();
   joiner.shutdown().await.unwrap();
 }
+
+/// Certificate rollover (audit 2026-10-09 item 8): a peer that
+/// legitimately re-issues its ephemeral listener certificate (a restart
+/// with the same durable identity and storage, a fresh leaf, a fresh
+/// port) must stay reachable. The joiner's recorded SPKI pin fails at
+/// the TLS layer; the member dial retries once with merge trust, the
+/// member-mode identity proof authenticates the peer over the fresh
+/// channel binding, the new leaf is re-recorded as the process-local
+/// anchor, and packets flow. Before the fix every reconnect to the
+/// re-certified peer failed TLS forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn secure_join_certificate_rollover_reconnects_through_merge_fallback() {
+  let receiver_keys = Arc::new(ScriptedKeys::full_at(210_000));
+  let receiver_storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+  let receiver_collector = Arc::new(Collector::default());
+  let receiver = Node {
+    handle: start_with_protocol(
+      Arc::clone(&receiver_storage),
+      receiver_keys.clone(),
+      protocol("test-echo"),
+      Arc::clone(&receiver_collector),
+    )
+    .await,
+    _keys: receiver_keys.clone(),
+  };
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let listener = receiver
+    .handle
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let old_endpoint = listener.endpoint().clone();
+
+  let joiner_keys = Arc::new(ScriptedKeys::full_at(215_000));
+  let joiner_storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+  let joiner_collector = Arc::new(Collector::default());
+  let joiner = Node {
+    handle: start_with_protocol(
+      Arc::clone(&joiner_storage),
+      joiner_keys.clone(),
+      protocol("test-echo"),
+      Arc::clone(&joiner_collector),
+    )
+    .await,
+    _keys: joiner_keys.clone(),
+  };
+  let secret = issued.credential().expose_secret().to_owned();
+  let _merge = merge_ok(&joiner.handle, &old_endpoint, &secret).await;
+  let receiver_view = receiver.handle.local_node().await.unwrap();
+  let receiver_id = receiver_view.node_id().clone();
+
+  // Restart the receiver over the same storage: same durable identity,
+  // fresh process, NEW ephemeral leaf certificate, NEW listener port.
+  receiver.handle.shutdown().await.unwrap();
+  let restarted = Node {
+    handle: restart_with_protocol(
+      Arc::clone(&receiver_storage),
+      receiver_keys.clone(),
+      "test-echo",
+      Arc::clone(&receiver_collector),
+    )
+    .await,
+    _keys: receiver_keys.clone(),
+  };
+  let new_listener = restarted
+    .handle
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+
+  // The joiner still pins the OLD leaf: the pinned TLS establishment
+  // fails, the merge-trust fallback runs, the identity proof
+  // authenticates, and the connect must succeed within its bound.
+  let connected = tokio::time::timeout(Duration::from_secs(30), async {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+      match joiner
+        .handle
+        .connect(new_listener.endpoint().clone(), receiver_id.clone())
+        .await
+      {
+        Ok(task) => match task.wait().await {
+          Ok(authenticated) => {
+            return Ok::<radiata::NodeId, std::convert::Infallible>(authenticated);
+          }
+          Err(error) => panic!("rollover reconnect failed: {error:?}"),
+        },
+        Err(error)
+          if matches!(
+            error.kind(),
+            ErrorKind::StreamInterrupted | ErrorKind::RouteUnavailable
+          ) && std::time::Instant::now() < deadline =>
+        {
+          tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(error) => panic!("rollover connect refused: {error:?}"),
+      }
+    }
+  })
+  .await
+  .expect("the rollover reconnect must settle within the bound")
+  .unwrap();
+  assert_eq!(connected, receiver_id);
+
+  // The re-certified peer carries data as an ordinary member.
+  packet_round_trip(&joiner.handle, &receiver_id, &receiver_collector).await;
+
+  joiner.handle.shutdown().await.unwrap();
+  restarted.handle.shutdown().await.unwrap();
+}

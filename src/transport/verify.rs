@@ -48,7 +48,12 @@ pub(crate) enum TrustMode {
   /// Member mode: the merge-mode relaxation plus an exact expected leaf
   /// SubjectPublicKeyInfo binding. The durable Ed25519 identity binding is
   /// still established by the application proof layer, not by this
-  /// verifier.
+  /// verifier. The pin is best-effort hardening for same-listener
+  /// reconnects: a dial layer that observes a pin failure retries once
+  /// with merge trust and re-records the presented leaf as the anchor
+  /// after the identity proof succeeds (audit 2026-10-09 item 8) — a peer
+  /// that legitimately re-issued its ephemeral certificate stays
+  /// reachable instead of failing TLS forever.
   #[allow(dead_code)] // wired through member-mode dialing; loopback tests construct it directly.
   Member {
     /// The exact expected leaf SubjectPublicKeyInfo.

@@ -22,7 +22,7 @@ use crate::{
   ErrorKind, NodeId, Result, TraceId,
   packet::{
     AckOutcome, MAX_CHUNK_BYTES, OutboundRequest, RouteState, StreamTarget,
-    wire::{self, ChunkFrame, EndFrame, OpenFrame},
+    wire::{self, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
   session::stream::{SessionEntry, SessionFrame, clock_seconds},
@@ -250,8 +250,12 @@ pub(crate) async fn run_outbound(
     return;
   }
 
+  // The authenticated sender completed the body: a normal, completed
+  // terminal (an interruption never reaches this path — a failed pump
+  // returned above without an end frame).
   let end = match wire::encode_end(&EndFrame {
     trace_id: trace_id.clone(),
+    reason: EndReason::Completed,
   }) {
     Ok(end) => end,
     Err(error) => {

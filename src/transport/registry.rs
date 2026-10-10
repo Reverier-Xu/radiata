@@ -109,6 +109,13 @@ impl TransportTrust {
   /// where the session handshake proofs alone carry authentication. The
   /// mapping lives here so no dial path can accidentally pair a TLS
   /// trust mode with a plaintext-class endpoint or vice versa.
+  ///
+  /// The member-mode pin is best-effort hardening, never the identity
+  /// authority: a dial layer observing a pin failure retries once with
+  /// merge trust (`pinned_spki` = `None` here) and re-records the
+  /// presented leaf after the application identity proof succeeds, so a
+  /// peer that re-issued its ephemeral certificate stays reachable
+  /// (audit 2026-10-09 item 8).
   pub(crate) fn for_dial(
     selector: &crate::transport::endpoint::TransportSelector,
     pinned_spki: Option<rustls::pki_types::SubjectPublicKeyInfoDer<'static>>,

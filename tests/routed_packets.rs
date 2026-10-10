@@ -64,6 +64,10 @@ impl RouteNextHop for SharedPolicy {
 #[derive(Debug, Default)]
 struct Collector {
   packets: Mutex<Vec<(String, Vec<u8>)>>,
+  /// Typed body interruptions observed mid-stream (a relay leg dying):
+  /// `(trace, error kind)`. A truncated body must surface here, never as
+  /// a delivered packet (audit 2026-10-09 item 11).
+  interruptions: Mutex<Vec<(String, ErrorKind)>>,
 }
 
 impl PacketConsumer for Collector {
@@ -75,11 +79,19 @@ impl PacketConsumer for Collector {
       let trace = packet.trace_id().to_string();
       let mut body = Vec::new();
       let mut chunks = packet.body();
-      while let Some(chunk) = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx))
-        .await
-        .transpose()?
-      {
-        body.extend_from_slice(&chunk);
+      loop {
+        match std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx)).await {
+          Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+          Some(Err(error)) => {
+            self
+              .interruptions
+              .lock()
+              .unwrap()
+              .push((trace, error.kind()));
+            return Ok(());
+          }
+          None => break,
+        }
       }
       self.packets.lock().unwrap().push((trace, body));
       Ok(())
@@ -727,6 +739,135 @@ async fn a_body_above_the_chunk_bound_crosses_three_hops_byte_exact() {
   for node in &nodes[..3] {
     assert!(node.collector.packets.lock().unwrap().is_empty());
   }
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}
+
+/// A mid-route relay leg death (audit 2026-10-09 item 11): while a gated
+/// body is in flight from A toward D across the A—B—C—D chain, the B—C
+/// leg dies. The relay at C must synthesize a typed *interrupted* end for
+/// D — D's consumer observes exactly one typed `StreamInterrupted` and
+/// never a complete body — while the origin's route ends explicitly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn relay_leg_death_surfaces_typed_interruption_at_the_destination() {
+  init_tracing();
+  let (nodes, table) = boot_linear_four(true).await;
+
+  // Per-node linear chain policy over the concrete identities: for every
+  // origin, the way toward a later member is its right-hand neighbour.
+  // The default policy ranks peers by a per-trace hash, so the route (and
+  // with it which leg is mid-route) would be random per stream; the
+  // linear policy pins A→B→C→D deterministically for this scenario.
+  {
+    let mut guard = table.lock().unwrap();
+    for origin in 0..4_usize {
+      for destination in (origin + 1)..4_usize {
+        let next = origin + 1;
+        guard.insert(
+          format!(
+            "{}|{}",
+            nodes[origin].id().as_str(),
+            nodes[destination].id.as_ref().unwrap().as_str()
+          ),
+          nodes[next].id().as_str().to_owned(),
+        );
+      }
+    }
+  }
+
+  settle_linear_chain(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let (body, open_flag, notify) = gated_body();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol,
+      policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let route_handle = packet.send_async(body).unwrap();
+
+  // Wait until the stream is observably streaming — the admission ack
+  // from D resolved — so the relay at C is a pure relay before the middle
+  // leg dies; breaking earlier would exercise the pre-admission branch
+  // search instead of the mid-stream interruption.
+  let inflight_deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let view = match nodes[0].handle.routes().get(&route_handle) {
+      Ok(view) => view,
+      Err(error) if error.kind() == radiata::ErrorKind::NotFound => {
+        assert!(
+          std::time::Instant::now() < inflight_deadline,
+          "the stream never reached its in-flight phase"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        continue;
+      }
+      Err(error) => panic!("route query failed: {error:?}"),
+    };
+    if matches!(view.state(), radiata::RouteState::Streaming) {
+      break;
+    }
+    assert!(
+      !matches!(view.state(), radiata::RouteState::Failed(_)),
+      "the stream failed before reaching its in-flight phase"
+    );
+    assert!(
+      std::time::Instant::now() < inflight_deadline,
+      "the stream never reached its in-flight phase"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+
+  // Break the middle leg B—C from both sides: the relay at C observes its
+  // feeding session die mid-stream and synthesizes the typed interrupted
+  // end for D.
+  nodes[1]
+    .handle
+    .disconnect(nodes[2].id().clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  nodes[2]
+    .handle
+    .disconnect(nodes[1].id().clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+
+  // D's consumer observes the typed interruption — never a normal end, so
+  // the truncated body cannot masquerade as a complete one.
+  wait_for(
+    || !nodes[3].collector.interruptions.lock().unwrap().is_empty(),
+    Duration::from_secs(30),
+    "the destination must observe the typed interruption",
+  )
+  .await;
+  {
+    let interruptions = nodes[3].collector.interruptions.lock().unwrap();
+    assert_eq!(interruptions.len(), 1);
+    assert_eq!(interruptions[0].1, ErrorKind::StreamInterrupted);
+  }
+  assert!(
+    nodes[3].collector.packets.lock().unwrap().is_empty(),
+    "an interrupted multi-hop stream must never deliver a body"
+  );
+
+  // Release the gated body; whatever the origin-side enqueue race
+  // produced, the route must end explicitly and never continue.
+  open_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+  notify.notify_waiters();
+  let _terminal = wait_until_terminal(&nodes[0].handle, &route_handle).await;
 
   for node in &nodes {
     let _ = node.handle.shutdown().await;

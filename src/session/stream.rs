@@ -542,8 +542,11 @@ pub(crate) fn retire_all_sessions(table: &SessionTable) -> Result<()> {
 /// Drains one replaced session: it stops accepting new work, its pending
 /// admissions fail exactly once with `StreamInterrupted`, and the retire
 /// signal closes its reader so the connection tears down after the winner
-/// is registered.
-fn retire(entry: &SessionEntry) {
+/// is registered. Crate-visible so the recovery plane can retire one
+/// exact entry it observed under the session-table lock (identity, not
+/// key: a reconnect in the scan window replaces the map entry, and the
+/// replacement must not be retired as the old edge).
+pub(crate) fn retire(entry: &SessionEntry) {
   entry.alive.store(false, Ordering::SeqCst);
   let (_, relays) = fail_pending_waits(&entry.pending_acks);
   for (trace_id, upstream) in relays {

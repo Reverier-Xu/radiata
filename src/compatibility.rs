@@ -170,7 +170,9 @@ fn read_migration_schema_record(bytes: &[u8]) -> Result<Vec<u8>> {
 /// renaming, or adding a vector without a plan amendment fails.
 pub(crate) const VECTOR_MANIFEST: &[CompatibilityVector] = &[
   // Packet frame bodies: the direct open omits the route element, the
-  // routed open carries it — one canonical wire shape, two frame variants.
+  // routed open carries it — one canonical wire shape, two frame
+  // variants — and the end frame's two terminal outcomes (completed and
+  // relay-synthesized interruption) are each frozen.
   CompatibilityVector {
     family: CompatibilityFamily::Packet,
     name: "open-direct-v1",
@@ -200,6 +202,14 @@ pub(crate) const VECTOR_MANIFEST: &[CompatibilityVector] = &[
     name: "end-v1",
     tag: None,
     hex: PACKET_END_HEX,
+    shape: VectorShape::ByteStable,
+    read: read_packet_end,
+  },
+  CompatibilityVector {
+    family: CompatibilityFamily::Packet,
+    name: "end-interrupted-v1",
+    tag: None,
+    hex: PACKET_END_INTERRUPTED_HEX,
     shape: VectorShape::ByteStable,
     read: read_packet_end,
   },
@@ -360,7 +370,13 @@ const PACKET_OPEN_DIRECT_HEX: &str = "85781b74726163652d303030303030303030303030
 const PACKET_OPEN_ROUTED_HEX: &str = "86781b74726163652d303030303030303030303030303030303030303031781a6e6f64652d303030303030303030303030303030303030303031781a6e6f64652d3030303030303030303030303030303030303030337827726164696174612e776f6f6f6f2e746563682f70726f746f636f6c732f76312f6578616d706c6581827821726164696174612e776f6f6f6f2e746563682f6c6162656c732f6578616d706c654666726f7a656e83781a6e6f64652d30303030303030303030303030303030303030303281781a6e6f64652d30303030303030303030303030303030303030303102";
 const PACKET_CHUNK_HEX: &str =
   "83781b74726163652d303030303030303030303030303030303030303031014a626f64792d6279746573";
-const PACKET_END_HEX: &str = "81781b74726163652d303030303030303030303030303030303030303031";
+/// Regenerated with the typed terminal discriminant (audit 2026-10-09
+/// item 11, a pre-release format amendment): the end frame is a
+/// two-element array whose second element is the terminal reason code
+/// (`0` = sender-completed, `1` = relay-synthesized interruption).
+const PACKET_END_HEX: &str = "82781b74726163652d30303030303030303030303030303030303030303100";
+const PACKET_END_INTERRUPTED_HEX: &str =
+  "82781b74726163652d30303030303030303030303030303030303030303101";
 const PACKET_ACK_HEX: &str = "83781b74726163652d30303030303030303030303030303030303030303100190fa0";
 const LOCAL_IDENTITY_HEX: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6c6f63616c2d6964656e7469747901781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
 const KEY_CREATION_INTENT_HEX: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6b65792d6372656174696f6e2d696e74656e7401781b6b65796f702d353030303030303030303030303030303030303030781a6e6f64652d3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e2d3630303030303030303030303030303030303030304107";
@@ -383,7 +399,7 @@ const MIGRATION_EDGE_HEX: &str = "0230726164696174612e776f6f6f6f2e746563682f7363
 /// The frozen per-family vector inventory: an omitted fixture or reader
 /// changes a count and fails the compatibility suite.
 pub(crate) const FROZEN_FAMILY_COUNTS: [(CompatibilityFamily, usize); 7] = [
-  (CompatibilityFamily::Packet, 5),
+  (CompatibilityFamily::Packet, 6),
   (CompatibilityFamily::Identity, 6),
   (CompatibilityFamily::Node, 2),
   (CompatibilityFamily::Resource, 3),
@@ -536,7 +552,7 @@ mod tests {
         .count();
       assert_eq!(shipped, count, "family {family:?} inventory drifted");
     }
-    assert_eq!(VECTOR_MANIFEST.len(), 21);
+    assert_eq!(VECTOR_MANIFEST.len(), 22);
   }
 
   /// The frozen vector shapes stay accepted by the current readers: the
@@ -703,8 +719,18 @@ mod tests {
     })
     .unwrap();
     assert_eq!(chunk, bytes("chunk-v1"));
-    let end = wire::encode_end(&wire::EndFrame { trace_id: trace() }).unwrap();
+    let end = wire::encode_end(&wire::EndFrame {
+      trace_id: trace(),
+      reason: wire::EndReason::Completed,
+    })
+    .unwrap();
     assert_eq!(end, bytes("end-v1"));
+    let interrupted_end = wire::encode_end(&wire::EndFrame {
+      trace_id: trace(),
+      reason: wire::EndReason::Interrupted,
+    })
+    .unwrap();
+    assert_eq!(interrupted_end, bytes("end-interrupted-v1"));
     let ack = wire::encode_ack(&wire::AckFrame {
       trace_id: trace(),
       status: wire::AckStatus::Admitted,

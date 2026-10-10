@@ -112,10 +112,43 @@ pub(crate) struct ChunkFrame {
   pub(crate) bytes: ByteVec,
 }
 
-/// A decoded packet-end frame.
+/// A decoded packet-end frame. The typed terminal reason separates a
+/// sender-completed body from a transport interruption a relay
+/// synthesized when its upstream leg died mid-stream, so a destination
+/// can never mistake a truncated body for a complete one (audit
+/// 2026-10-09 item 11).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EndFrame {
   pub(crate) trace_id: TraceId,
+  pub(crate) reason: EndReason,
+}
+
+/// The typed terminal outcome of one packet stream's end frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EndReason {
+  /// The authenticated sender completed the body: a normal end.
+  Completed,
+  /// A relay's upstream feeding leg died mid-stream: the body is
+  /// truncated and the destination surfaces it as a typed
+  /// `StreamInterrupted` body error instead of a normal end.
+  Interrupted,
+}
+
+impl EndReason {
+  const fn code(self) -> u8 {
+    match self {
+      Self::Completed => 0,
+      Self::Interrupted => 1,
+    }
+  }
+
+  fn from_code(code: u8) -> Option<Self> {
+    match code {
+      0 => Some(Self::Completed),
+      1 => Some(Self::Interrupted),
+      _ => None,
+    }
+  }
 }
 
 /// The wire-carried per-hop route state of one routed open frame
@@ -168,6 +201,8 @@ struct ChunkWire {
 struct EndWire {
   #[n(0)]
   trace_id: String,
+  #[n(1)]
+  reason: u8,
 }
 
 #[derive(Encode, Decode)]
@@ -290,16 +325,21 @@ pub(crate) fn encode_end(frame: &EndFrame) -> Result<Vec<u8>> {
   encode_canonical(
     &EndWire {
       trace_id: frame.trace_id.to_string(),
+      reason: frame.reason.code(),
     },
     PACKET_CBOR_LIMITS,
   )
 }
 
-/// Decodes one packet-end frame body.
+/// Decodes one packet-end frame body. Unknown terminal reason codes
+/// fail closed.
 pub(crate) fn decode_end(body: &[u8], limits: CborLimits) -> Result<EndFrame> {
   let wire: EndWire = decode_canonical_strict(body, limits, "packet frame canonical")?;
+  let reason =
+    EndReason::from_code(wire.reason).ok_or_else(|| Error::invalid_input("packet end reason"))?;
   Ok(EndFrame {
     trace_id: wire.trace_id.parse()?,
+    reason,
   })
 }
 
@@ -334,9 +374,9 @@ mod tests {
   use minicbor::bytes::ByteVec;
 
   use super::{
-    AckFrame, AckStatus, ChunkFrame, EndFrame, MAX_CHUNK_BYTES, OpenFrame, PACKET_CBOR_LIMITS,
-    decode_ack, decode_chunk, decode_end, decode_open, encode_ack, encode_chunk, encode_end,
-    encode_open,
+    AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, MAX_CHUNK_BYTES, OpenFrame,
+    PACKET_CBOR_LIMITS, decode_ack, decode_chunk, decode_end, decode_open, encode_ack,
+    encode_chunk, encode_end, encode_open,
   };
   use crate::{
     ErrorKind, NodeId, ProtocolTag, StreamMetadata, TraceId,
@@ -459,11 +499,17 @@ mod tests {
   #[test]
   fn tls_transport_packet_end_and_ack_frames_round_trip() {
     let (trace_id, ..) = ids();
-    let end = EndFrame {
-      trace_id: trace_id.clone(),
-    };
-    let decoded = decode_end(&encode_end(&end).unwrap(), PACKET_CBOR_LIMITS).unwrap();
-    assert_eq!(decoded, end);
+    for reason in [EndReason::Completed, EndReason::Interrupted] {
+      let end = EndFrame {
+        trace_id: trace_id.clone(),
+        reason,
+      };
+      let decoded = decode_end(&encode_end(&end).unwrap(), PACKET_CBOR_LIMITS).unwrap();
+      assert_eq!(decoded, end);
+      // The two terminal outcomes carry distinct wire bytes (pinned by
+      // the end-v1 / end-interrupted-v1 goldens in compatibility.rs).
+      assert_eq!(decoded.reason, reason);
+    }
 
     for status in [
       AckStatus::Admitted,
@@ -478,6 +524,20 @@ mod tests {
       let decoded = decode_ack(&encode_ack(&ack).unwrap(), PACKET_CBOR_LIMITS).unwrap();
       assert_eq!(decoded, ack);
     }
+  }
+
+  /// The terminal reason is a closed discriminator: unknown codes fail
+  /// closed at the wire boundary instead of decoding as a normal end.
+  #[test]
+  fn tls_transport_packet_end_rejects_unknown_reason() {
+    let (trace_id, ..) = ids();
+    let wire = super::EndWire {
+      trace_id: trace_id.to_string(),
+      reason: 9,
+    };
+    let body = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();
+    let error = decode_end(&body, PACKET_CBOR_LIMITS).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }
 
   #[test]
@@ -497,6 +557,7 @@ mod tests {
   fn tls_transport_packet_frames_reject_malformed_ids() {
     let wire = super::EndWire {
       trace_id: "trace_NOT-CANONICAL".to_owned(),
+      reason: 0,
     };
     let body = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();
     let error = decode_end(&body, PACKET_CBOR_LIMITS).unwrap_err();

@@ -74,6 +74,41 @@ impl FrameSource for ConnectionReader {
   }
 }
 
+/// Owns the read loop's consumer `JoinSet` and hands it to a node-scoped
+/// drain task when dropped — on the orderly exit AND the cancellation
+/// path. A read loop dropped mid-frame (deterministic replacement,
+/// shutdown, liveness failure, writer death) would otherwise leave its
+/// consumer tasks detached: no owner would join them, shutdown would not
+/// wait for an in-flight apply, and the recovery tick's reaper could not
+/// see them (audit 2026-10-09 item 12附带). Dropping a `JoinSet` detaches
+/// its children — they are aborted only if the drain task itself is —
+/// so the guard moves the set into the drain task on every path. The
+/// guard drops inside the session task's runtime context, so the spawn
+/// is always legal.
+struct ConsumerDrainGuard {
+  consumers: JoinSet<()>,
+  drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Drop for ConsumerDrainGuard {
+  fn drop(&mut self) {
+    let mut consumers = std::mem::take(&mut self.consumers);
+    // Graceful consumer drain: handing the session's consumer tasks to a
+    // node-scoped drain task means a teardown (Io error, deterministic
+    // replacement, shutdown, or the read loop's own cancellation) can no
+    // longer abort an in-flight apply. A fully received control payload
+    // therefore always completes its persist-and-emit (terminal evidence
+    // must not strand on a session end), and a partial body fails closed
+    // at decode instead. The drain handle joins the node's tracked task
+    // vec, so shutdown still awaits it and the recovery tick reaps it
+    // (bounded task accounting).
+    let drain = tokio::spawn(async move { while consumers.join_next().await.is_some() {} });
+    if let Ok(mut tasks) = self.drains.lock() {
+      tasks.push(drain);
+    }
+  }
+}
+
 /// Serves incoming packet frames until the connection closes or a frame
 /// violates the wire contract (fail closed).
 pub(super) async fn read_loop(
@@ -82,7 +117,11 @@ pub(super) async fn read_loop(
   last_activity: &Arc<std::sync::atomic::AtomicU64>,
 ) {
   let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
-  let mut consumers = JoinSet::new();
+  // Registered at entry: the cancellation path must drain consumers too.
+  let mut consumers = ConsumerDrainGuard {
+    consumers: JoinSet::new(),
+    drains: Arc::clone(&context.task_drains),
+  };
   let mut last_pong_seen = source.pong_last_seen();
   loop {
     let message = match source.receive_event().await {
@@ -146,7 +185,7 @@ pub(super) async fn read_loop(
             context,
             frames,
             &mut incoming,
-            &mut consumers,
+            &mut consumers.consumers,
           )
           .await
           .is_err()
@@ -176,7 +215,7 @@ pub(super) async fn read_loop(
       },
       PacketKind::End => match wire::decode_end(&message.body, context.parser_limits()) {
         Ok(end) => {
-          trace!(trace_id = %end.trace_id, "incoming stream ended");
+          trace!(trace_id = %end.trace_id, reason = ?end.reason, "incoming stream ended");
           if forward::contains(&context.forwarding, &end.trace_id) {
             forward::relay_end(&context.forwarding, end).await;
             continue;
@@ -185,7 +224,16 @@ pub(super) async fn read_loop(
             .remove(&end.trace_id)
             .map(|admitted| admitted.stream)
           {
-            let _ = stream.send(StreamItem::End).await;
+            // The typed terminal reason survives the relay: a completed
+            // end closes the body normally; an interrupted end (the
+            // sending leg died mid-stream) surfaces exactly one typed
+            // `StreamInterrupted` to the consumer instead of a silent
+            // truncation (audit 2026-10-09 item 11).
+            let terminal = match end.reason {
+              wire::EndReason::Completed => StreamItem::End,
+              wire::EndReason::Interrupted => StreamItem::Interrupted,
+            };
+            let _ = stream.send(terminal).await;
           } else {
             // A lost consumer means its session task aborted mid-stream:
             // surface it loudly, because silence here looks like a lost
@@ -200,16 +248,30 @@ pub(super) async fn read_loop(
       },
       PacketKind::Ack => match wire::decode_ack(&message.body, context.parser_limits()) {
         Ok(ack) => {
-          // A failure for a trace this node is still discovering (it
-          // forwarded the open and the destination has not admitted it
-          // yet) belongs to this hop's branch search: the failed
-          // attempt's pending entry is consumed and the next untried
-          // branch is re-dispatched, instead of relaying the failure
-          // upstream. Every other acknowledgement resolves the session's
-          // pending admission exactly as before.
-          if ack.status != crate::packet::wire::AckStatus::Admitted
+          // Acknowledgement attribution (audit 2026-10-09 item 13): an
+          // acknowledgement steers a forwarded hop only when it arrives on
+          // that hop's current downstream attempt. A late acknowledgement
+          // from a superseded branch (the hop deadline expired or the
+          // attempt failed and the open was re-dispatched elsewhere) is
+          // dropped: it must not consume the live attempt's pending
+          // entry, clear its retry arm, or flip its route record.
+          if !forward::ack_from_current_downstream(&context.forwarding, pending_acks, &ack.trace_id)
+          {
+            debug!(
+              trace_id = %ack.trace_id,
+              status = ?ack.status,
+              "late acknowledgement from a superseded branch dropped"
+            );
+          } else if ack.status != crate::packet::wire::AckStatus::Admitted
             && forward::owns_discovering(&context.forwarding, &ack.trace_id)
           {
+            // A failure for a trace this node is still discovering (it
+            // forwarded the open and the destination has not admitted it
+            // yet) belongs to this hop's branch search: the failed
+            // attempt's pending entry is consumed and the next untried
+            // branch is re-dispatched, instead of relaying the failure
+            // upstream. Every other acknowledgement resolves the session's
+            // pending admission exactly as before.
             forward::on_downstream_failure(
               &context.forwarding,
               &ack.trace_id,
@@ -239,18 +301,9 @@ pub(super) async fn read_loop(
       },
     }
   }
-  // Graceful consumer drain: handing the session's consumer tasks to a
-  // node-scoped drain task means a teardown (Io error, deterministic
-  // replacement, shutdown) can no longer abort an in-flight apply. A
-  // fully received control payload therefore always completes its
-  // persist-and-emit (terminal evidence must not strand on a session
-  // end), and a partial body fails closed at decode instead. The drain
-  // handle joins the node's tracked task vec, so shutdown still awaits
-  // it and the recovery tick reaps it (bounded task accounting).
-  let drain = tokio::spawn(async move { while consumers.join_next().await.is_some() {} });
-  if let Ok(mut tasks) = context.task_drains.lock() {
-    tasks.push(drain);
-  }
+  // The consumer drain registered when the guard was created: its Drop
+  // hands the JoinSet to the node-scoped drain task on this orderly exit
+  // and on every cancellation path alike.
 }
 
 /// Validates one open frame against the authenticated session and the
@@ -815,5 +868,283 @@ mod read_loop_liveness_tests {
       1_000,
       "the pong wakes must refresh the session activity mark"
     );
+  }
+
+  /// A frame source that never resolves: the read loop stays parked on
+  /// its receive wake until it is cancelled.
+  struct SilentSource;
+
+  impl FrameSource for SilentSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      Box::pin(std::future::pending())
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      0
+    }
+  }
+
+  /// A read loop cancelled mid-frame (a deterministic replacement, a
+  /// shutdown signal, a liveness failure, a writer death) still hands its
+  /// consumer `JoinSet` to the node-scoped drain task: the cancellation
+  /// path must not leave the session's consumer tasks detached (audit
+  /// 2026-10-09 item 12附带).
+  #[tokio::test]
+  async fn cancelled_read_loop_still_registers_the_consumer_drain() {
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
+    let mut source = SilentSource;
+    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
+    let (frames, _receiver) = test_queue(8, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(AtomicU64::new(1));
+
+    // The silent source parks the loop; the bounded timeout cancels it.
+    let cancelled = tokio::time::timeout(
+      Duration::from_millis(100),
+      read_loop(
+        &mut source,
+        &session,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await;
+    assert!(
+      cancelled.is_err(),
+      "the silent source must keep the read loop pending until cancelled"
+    );
+
+    // The cancellation path registered the consumer drain exactly once.
+    assert_eq!(
+      context.task_drains.lock().unwrap().len(),
+      1,
+      "a cancelled read loop must still own its consumer tasks"
+    );
+  }
+
+  /// The orderly exit registers exactly one drain — never two — so the
+  /// guard covers both paths without double-registering.
+  #[tokio::test]
+  async fn orderly_read_loop_registers_exactly_one_consumer_drain() {
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
+    let mut source = PongSource {
+      remaining: 0,
+      now: 0,
+    };
+    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
+    let (frames, _receiver) = test_queue(8, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(AtomicU64::new(1));
+
+    read_loop(
+      &mut source,
+      &session,
+      &context,
+      &frames,
+      &pending_acks,
+      &last_activity,
+    )
+    .await;
+
+    assert_eq!(
+      context.task_drains.lock().unwrap().len(),
+      1,
+      "the orderly exit registers the consumer drain exactly once"
+    );
+  }
+}
+
+#[cfg(test)]
+mod ack_attribution_tests {
+  use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+  };
+
+  use futures_util::future::BoxFuture;
+
+  use super::{FrameSource, read_loop};
+  use crate::{
+    NodeId, TraceId,
+    identity::testing::SequenceEntropy,
+    node::EventHub,
+    packet::wire::{AckFrame, AckStatus, OpenFrame},
+    protocol::{
+      CONTROL_CBOR_LIMITS,
+      wire::{BASE_SCHEMA_ID, PacketKind},
+    },
+    routing::{
+      RouteContext,
+      forward::{ForwardingHop, PendingAck, PendingAcks, RetryState, register},
+    },
+    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    transport::{Received, connection::Message},
+  };
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// A frame source yielding one acknowledgement message for `trace`,
+  /// then ending the session orderly.
+  struct AckSource {
+    body: Vec<u8>,
+  }
+
+  impl FrameSource for AckSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      let body = std::mem::take(&mut self.body);
+      Box::pin(async move {
+        if body.is_empty() {
+          Ok(None)
+        } else {
+          Ok(Some(Received::Message(Message {
+            schema_id: BASE_SCHEMA_ID,
+            kind_id: PacketKind::Ack.kind_id(),
+            flags: 0,
+            body,
+          })))
+        }
+      })
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      0
+    }
+  }
+
+  fn context() -> SessionPacketContext {
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    SessionPacketContext::new(
+      node(1),
+      Arc::new(crate::ExtensionRegistry::new()),
+      SessionPolicy::new(
+        8,
+        1 << 20,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+      ),
+      crate::runtime::RuntimeClient::routing_only(
+        tokio::sync::mpsc::channel(4).0,
+        Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+      ),
+      Arc::new(crate::time::HostWallClock),
+      entropy,
+      Arc::new(EventHub::new()),
+      crate::routing::DefaultNextHop::tag().unwrap(),
+      Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+      Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+      8,
+      16,
+      Arc::new(Mutex::new(Vec::new())),
+      CONTROL_CBOR_LIMITS,
+      Duration::from_secs(5),
+    )
+  }
+
+  /// A late failure acknowledgement from a superseded branch must not
+  /// steer the live hop: this node's discovering retry for the trace
+  /// switched to a new downstream (the first branch's deadline expired),
+  /// and the stale branch's session now delivers its late failure. The
+  /// live hop keeps its retry armed, the live attempt's pending entry
+  /// survives, nothing fails upstream, and no acknowledgement resolves on
+  /// the stale session's map (audit 2026-10-09 item 13).
+  #[tokio::test]
+  async fn late_ack_from_a_superseded_branch_leaves_the_live_hop_untouched() {
+    let trace_id = trace(9);
+    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let context = context();
+
+    // The hop's current downstream attempt: a live relay entry on its
+    // pending map, discovering retry armed with no candidates left to
+    // try (any bogus failure handling would exhaust it and fail the
+    // route upstream immediately).
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let live_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    live_acks.lock().unwrap().insert(
+      trace_id.clone(),
+      PendingAck::Relay {
+        upstream: upstream_tx.clone(),
+      },
+    );
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    register(
+      &context.forwarding,
+      trace_id.clone(),
+      ForwardingHop {
+        upstream: upstream_tx,
+        downstream: downstream_tx,
+        downstream_acks: Arc::clone(&live_acks),
+        upstream_peer: node(3),
+        relay_lock: Arc::new(tokio::sync::Mutex::new(())),
+        retry: Some(RetryState {
+          open: OpenFrame {
+            trace_id: trace_id.clone(),
+            source: node(3),
+            destination: node(9),
+            protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+            metadata: crate::StreamMetadata::new(),
+            route: None,
+          },
+          context: RouteContext::new(trace_id.clone(), node(3), node(9), 8),
+          candidates: Vec::new(),
+          downstream_acks: Arc::clone(&live_acks),
+        }),
+      },
+    )
+    .unwrap();
+
+    // The superseded branch's session map: its entry was already
+    // consumed when the hop re-dispatched.
+    let stale_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Failed,
+      admitted_at_millis: 0,
+    })
+    .unwrap();
+    let mut source = AckSource { body };
+    let (frames, mut frames_rx) = test_queue(8, 1 << 20);
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &session,
+        &context,
+        &frames,
+        &stale_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the acknowledgement source ends the read loop orderly");
+
+    // The live hop is untouched: still registered, still discovering.
+    assert!(crate::routing::forward::contains(
+      &context.forwarding,
+      &trace_id
+    ));
+    assert!(crate::routing::forward::owns_discovering(
+      &context.forwarding,
+      &trace_id
+    ));
+    // The live attempt's pending entry survived.
+    assert!(live_acks.lock().unwrap().contains_key(&trace_id));
+    // Nothing failed upstream and no frame left the stale session.
+    use futures_util::FutureExt;
+    assert!(upstream_rx.recv().now_or_never().is_none());
+    assert!(frames_rx.recv().now_or_never().is_none());
   }
 }

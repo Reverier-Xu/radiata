@@ -108,7 +108,11 @@ fn established(handshake: &Handshake) -> Result<EstablishedSession> {
 /// keyed by peer node. Member-mode reconnects pin the peer's TLS leaf to
 /// this anchor, so a reconnect to the same listener cannot be replayed
 /// against a different certificate. Anchors are process-local by design:
-/// a fresh process re-joins before it reconnects as a member.
+/// a fresh process re-joins before it reconnects as a member. When a
+/// peer legitimately re-issues its ephemeral leaf (same durable identity,
+/// new certificate), a successful merge-trust fallback dial re-records
+/// the presented leaf as the new anchor (audit 2026-10-09 item 8) — the
+/// application identity proof, not the pin, is the authority.
 #[derive(Default)]
 struct MemberSpkiTable(std::sync::Mutex<std::collections::BTreeMap<NodeId, Vec<u8>>>);
 
@@ -154,8 +158,11 @@ impl SessionDriver {
     &self.issuer
   }
 
-  /// Records the peer's leaf SPKI observed during a successful join, as the
-  /// trust anchor for later member-mode reconnect pinning.
+  /// Records the peer's leaf SPKI as the member-mode trust anchor,
+  /// observed at a successful join or after a rollover fallback dial
+  /// authenticated the peer at the application proof layer. The latest
+  /// record wins: a re-issued certificate replaces the stale anchor
+  /// in-process (audit 2026-10-09 item 8).
   pub(crate) fn record_peer_spki(&self, peer: &NodeId, spki: Vec<u8>) {
     if let Ok(mut anchors) = self.member_spkis.0.lock() {
       anchors.insert(peer.clone(), spki);
