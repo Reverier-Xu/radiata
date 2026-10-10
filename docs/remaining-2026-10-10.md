@@ -105,13 +105,11 @@
      evidence）"语义并接受与内存 record 的分工。
    - 文件面（若立项 a）：`src/routing/outbound.rs`、`src/session/stream.rs`、
      `src/session/inbound.rs`、构造点（`src/session/driver.rs` / `src/runtime/supervisor.rs`）。
-8. **`insert_route` 是唯一不经 Failed 粘性守卫的记录写点**（lane-g 审查 P2，加固项）
-   - 证据：`src/routing/table.rs:24-45`（`:43` 对已存在 key 无条件覆盖）与
-     `record_terminal_failure` 的"未追踪"分支（`:84-87`）放锁后调用它，存在窄 TOCTOU
+8. **`insert_route` 是唯一不经 Failed 粘性守卫的记录写点**（lane-g 审查 P2，加固项）——**已修复（lane-j，PR 见合并记录）**：`insert_locked` 新增 Failed 守卫（已 Failed 记录永不被覆盖，插入幂等 no-op），`record_terminal_failure` 未追踪分支收敛为单锁 span（drop-then-relock 窗口关闭）；单测钉住。
+   - 原证据：`src/routing/table.rs`（修复前 `:43` 对已存在 key 无条件覆盖）与
+     `record_terminal_failure` 的"未追踪"分支放锁后重入加锁，存在窄 TOCTOU
      窗口。当前生产调用点均不可达该竞态（每流新 trace id / 已确认 key 不存在），
      属加固而非缺陷。
-   - 方向：随 durable twin 条目一并处理，或为 `insert_route` 补 Failed 粘性不变量。
-   - 文件面：`src/routing/table.rs`。
 4. **重派指针换出亚毫秒窗口**（lane-cd 审查 P2，已文档化接受）
    - 证据：`src/routing/forward.rs:546-549` 注释在案 — 同分支 ack 落在 `send_waiting`
      返回与 forwarding 表更新之间会被归属门误丢，hop deadline 超时后重派别分支；
