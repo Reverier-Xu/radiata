@@ -129,7 +129,7 @@ landing hold RAII 化 + 时限盒（`store.rs:105-119` 的 `LandingHold`）；in
 
 ## 需决策
 
-1. **endpoint patched-but-unlistened 的保留语义**（lane-b 报告遗留 1）
+1. **endpoint patched-but-unlistened 的保留语义**（lane-b 报告遗留 1）——**已决策（2026-10-10）：维持文档化回滚语义，不支持预告未监听 endpoint**，不立项。现状（注释+文档+测试）即终态闭环。
    - 来源：审计项 10 附带。当前语义：patch 进来但没有 listener 绑定的 endpoint 是
      advisory，维护重写会在下一个 tick 回滚它。
    - 当前代码证据：`src/membership/sync.rs:700-709`（回滚语义与理由注释）、
@@ -137,9 +137,9 @@ landing hold RAII 化 + 时限盒（`store.rs:105-119` 的 `LandingHold`）；in
      `tests/membership_sync.rs:1282` 钉住回滚行为。
    - 决策点：仅凭 `(existing, published)` 无法区分"owner 添加但未监听"与"listener 已
      停止"；真正保留需要 per-endpoint 来源追踪（新 durable 状态 + 迁移面），属于架构
-     立项。若维持回滚语义，现状（注释+文档+测试）已闭环，无代码动作。
+     立项。**决策（2026-10-10）：不立项，回滚语义为终态。**
    - 文件面（若立项）：`src/membership/sync.rs`、`src/membership.rs`、描述符存储模式。
-2. **examples/chat 驱动脚本的 b_rapid_disconnect_loop flake**（fix-plan flake 观察的结案）
+2. **examples/chat 驱动脚本的 b_rapid_disconnect_loop flake**（fix-plan flake 观察的结案）——**已决策（2026-10-10）：排期修复驱动脚本（重发改走 /flush 复用 pending 条目方向），由 lane-h 承接。**
    - 结论：**与库无关**。库对两次独立 send 各恰好投递一次；双份 marker 来自驱动脚本
      重发路径：每次 `POST /dm` 都 mint 新 msg_id（`examples/chat/src/http.rs:365-403`
      → `record_outbox`，`examples/chat/src/store.rs:137`），接收端 inbox 仅按 msg_id
@@ -151,16 +151,17 @@ landing hold RAII 化 + 时限盒（`store.rs:105-119` 的 `LandingHold`）；in
      （`http.rs:407` flush 已存在）并由接收端按 (from, 客户端幂等键) 去重；或放宽 3s
      轮询窗 / 先等 edge re-formed（`test_boundary.py:291` 已有 60s 等待臂）再判收敛。
      CI 复验建议按 fresh mesh × ≥10 次重复运行 boundary 套件。
-   - **需用户决策是否排期**（examples 面不在库修复范围内）。
-3. **ActionHook panic 语义变更是否为最终语义**（lane-a 报告遗留 2）
+   - **已排期（2026-10-10，lane-h）**：重发改走 `/flush` 复用 pending 条目（或等价幂等键方案），examples 面修复，不涉及库代码。
+3. **ActionHook panic 语义变更是否为最终语义**（lane-a 报告遗留 2）——**已决策（2026-10-10）：确认为最终语义。** 用户判断：注入资源变更链路的 effect hook（validate/mutate）不在此列；任务完成后的观察 hook 本就不应决定任务成败，不做兜底。
    - 来源：PR #64 的有意语义变更 — hook 在 Running 转换上 panic 原先使任务 typed 失败，
      现在被包含为 warn 诊断、任务照常运行。
    - 当前代码证据：`src/task/mod.rs:760-768`（trait 文档："an error or a panic is a
      `tracing` diagnostic, so no hook can fail, wedge, or delay a task…"）、`:826-842`
      （catch_unwind 实现）；双层测试钉住：`src/runtime/task_manager.rs:1404`、
      `tests/tasks.rs:881`。
-   - 决策点：这是"观察移出 attempt body"的必然推论；若上游认为 Running 转换上的 hook
-     panic 必须失败任务，需要产品决策并重新设计观察相位。当前无此需求证据，默认维持。
+   - 决策点：这是"观察移出 attempt body"的必然推论；任务执行失败的 Failed 落表路径完全
+     不变，观察 hook 运行在终态发布之后，允许其改写状态会破坏终态单调性。**决策
+     （2026-10-10）：维持现状为最终语义，不重新设计观察相位。**
 
 ---
 
