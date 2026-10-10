@@ -42,6 +42,13 @@ pub struct NodeConfig {
   required_features: BTreeSet<FeatureTag>,
   merge_admission: MergeAdmissionLimits,
   connection_degree: usize,
+  // The task manager's local-class execution-slot budget: the resource
+  // writes, credentials, and maintenance kinds draw from their own
+  // admission channel so their latency never queues behind a dial.
+  task_reconcile_local_slots: usize,
+  // The task manager's network-class execution-slot budget: the join and
+  // connect dials, which can each hold a slot for a whole dial deadline.
+  task_reconcile_network_slots: usize,
 }
 
 impl NodeConfig {
@@ -153,6 +160,23 @@ impl NodeConfig {
   pub fn with_connection_degree(mut self, target: usize) -> Self {
     self.connection_degree = target;
     self
+  }
+
+  /// Sets the task manager's execution-slot budgets, split by class:
+  /// `local` admits the resource writes, credentials, leave, and
+  /// maintenance kinds; `network` admits the join and connect dials,
+  /// each of which can hold its slot for a whole dial deadline. The two
+  /// channels are independent, so a fleet of wedged dials cannot starve
+  /// local operations (and vice versa). Purely local admission, never
+  /// peer-visible; both values must be nonzero (the local channel is
+  /// the caller's latency floor, so a deployment that never dials may
+  /// shrink `network` to `1` but never zero).
+  pub fn with_task_reconcile_slots(mut self, local: usize, network: usize) -> Result<Self> {
+    ensure_nonzero(local, "local task reconcile slots")?;
+    ensure_nonzero(network, "network task reconcile slots")?;
+    self.task_reconcile_local_slots = local;
+    self.task_reconcile_network_slots = network;
+    Ok(self)
   }
 
   pub fn with_receipt_retention(mut self, value: Duration) -> Result<Self> {
@@ -290,6 +314,19 @@ impl NodeConfig {
     self.connection_degree
   }
 
+  /// The local-class execution-slot budget consumed by the task
+  /// manager's admission channel (nonzero by construction).
+  pub(crate) const fn task_reconcile_local_slots(&self) -> usize {
+    self.task_reconcile_local_slots
+  }
+
+  /// The network-class (join/connect dial) execution-slot budget
+  /// consumed by the task manager's admission channel (nonzero by
+  /// construction).
+  pub(crate) const fn task_reconcile_network_slots(&self) -> usize {
+    self.task_reconcile_network_slots
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -341,6 +378,14 @@ impl Default for NodeConfig {
       required_features: BTreeSet::new(),
       merge_admission: MergeAdmissionLimits::default(),
       connection_degree: 0,
+      // Two plus two: the historical single semaphore held four permits,
+      // and the split keeps that total while giving each class its own
+      // channel — local work keeps a two-slot floor even while every
+      // network slot sits inside a dial deadline (the starvation
+      // incident behind the split). Deployments that dial heavily may
+      // grow `network`; a deployment that never dials may shrink it.
+      task_reconcile_local_slots: 2,
+      task_reconcile_network_slots: 2,
     }
   }
 }
@@ -742,6 +787,29 @@ mod tests {
     assert_eq!(relay.connection_degree(), 3);
     let derived = NodeConfig::new().with_connection_degree(0);
     assert_eq!(derived.connection_degree(), 0);
+  }
+
+  /// The task reconcile slot split defaults to two plus two (the
+  /// historical four-permit total, one channel per class) and refuses a
+  /// zero budget on either side: a zero local channel would queue every
+  /// resource write behind the dials, a zero network channel would
+  /// never run a dial at all.
+  #[test]
+  fn task_reconcile_slots_split_the_two_channels() {
+    let default = NodeConfig::new();
+    assert_eq!(default.task_reconcile_local_slots(), 2);
+    assert_eq!(default.task_reconcile_network_slots(), 2);
+
+    let configured = NodeConfig::new().with_task_reconcile_slots(4, 8).unwrap();
+    assert_eq!(configured.task_reconcile_local_slots(), 4);
+    assert_eq!(configured.task_reconcile_network_slots(), 8);
+
+    for (local, network) in [(0, 2), (2, 0), (0, 0)] {
+      let error = NodeConfig::new()
+        .with_task_reconcile_slots(local, network)
+        .unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
   }
 
   /// A deadline without either driver, a keepalive without a deadline,

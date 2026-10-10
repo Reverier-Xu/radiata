@@ -1,7 +1,8 @@
 //! The task manager: the node-local reconcile plane behind the
 //! declarative verb surface. One spawned manager owns admission (id
-//! composition, dedup/coalescing, the `Pending` publication), one
-//! bounded worker pool (a counting semaphore over the per-task
+//! composition, dedup/coalescing, the `Pending` publication), two
+//! bounded worker pools (one counting semaphore per slot class — the
+//! local kinds and the join/connect dials — over the per-task
 //! reconcile futures), the bounded retry schedule with per-kind
 //! policies, and the shutdown drain (cancellable kinds exit on the
 //! cancel watch; the journaled kinds are awaited to completion).
@@ -13,9 +14,17 @@
 //! awaited by its task's worker future, so user-registered hook code
 //! and reconcilers never run on the manager task, and a panicking
 //! effect surfaces as the task's typed internal failure without
-//! touching the manager.
+//! touching the manager. Transition observations (the action hooks)
+//! run in their own spawned tasks off the worker pools: a wedged or
+//! panicking hook can never hold an execution slot, delay a terminal
+//! report, or delay the leave shutdown behind the task's own success.
 
-use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
+use std::{
+  collections::BTreeMap,
+  pin::Pin,
+  sync::{Arc, Mutex},
+  time::Duration,
+};
 
 use tokio::{
   sync::{Semaphore, mpsc, oneshot, watch},
@@ -23,10 +32,10 @@ use tokio::{
 };
 
 use crate::{
-  BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeId, Result, TaskId, TaskKind, TaskOutput,
-  TaskPhase,
+  BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeConfig, NodeId, Result, TaskId, TaskKind,
+  TaskOutput, TaskPhase,
   api::Entropy,
-  task::{CredentialIssued, TaskError, TaskObserver, TaskTable},
+  task::{CredentialIssued, SlotClass, TaskError, TaskObserver, TaskTable},
   time::WallClock,
 };
 
@@ -34,11 +43,36 @@ use crate::{
 /// so one bound governs both admission ends.
 pub(crate) const TASK_CHANNEL_CAPACITY: usize = 32;
 
-/// The concurrent reconcile bound: one counting semaphore's permit
-/// count. The two-vcpu-runner starvation precedents keep effects off
-/// the supervision planes; this is not a config knob until evidence
-/// demands one.
-pub(crate) const TASK_RECONCILE_CONCURRENCY: usize = 4;
+/// The two execution-slot channels, one per slot class (see
+/// [`crate::task::SlotClass`]). A join or connect dial can hold its
+/// slot for a whole dial deadline, so the dials draw from their own
+/// semaphore while every local kind keeps its own budget: four wedged
+/// dials must never queue a resource write (the starvation incident
+/// behind the split). The budgets come from
+/// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots)
+/// and default to two slots per channel — the historical four-permit
+/// total, one channel per class.
+struct ReconcileChannels {
+  local: Arc<Semaphore>,
+  network: Arc<Semaphore>,
+}
+
+impl ReconcileChannels {
+  fn new(local: usize, network: usize) -> Self {
+    Self {
+      local: Arc::new(Semaphore::new(local)),
+      network: Arc::new(Semaphore::new(network)),
+    }
+  }
+
+  /// The channel one kind's effect draws from.
+  fn for_class(&self, class: SlotClass) -> &Arc<Semaphore> {
+    match class {
+      SlotClass::Local => &self.local,
+      SlotClass::Network => &self.network,
+    }
+  }
+}
 
 /// The bounded terminal history: the newest terminal tasks stay
 /// readable through the observation surface; older ones are evicted
@@ -390,7 +424,16 @@ struct ManagerShared {
   /// with success (the supervisor owns the receiver and answers with the
   /// active-leave shutdown).
   leave_complete: mpsc::Sender<()>,
-  semaphore: Arc<Semaphore>,
+  /// The two execution-slot channels, one per slot class: the worker's
+  /// permit draw is class-routed so local work never queues behind a
+  /// dial.
+  slots: ReconcileChannels,
+  /// The per-task observation chains: the spawned action-hook
+  /// observation task of each transition awaits the task's predecessor,
+  /// which preserves one task's transition order while running wholly
+  /// off the execution slots and the attempt body. Entries are detached
+  /// at the task's terminal report.
+  observations: Mutex<BTreeMap<TaskId, tokio::task::JoinHandle<()>>>,
 }
 
 impl ManagerShared {
@@ -413,7 +456,7 @@ impl ManagerShared {
   /// retry wake rides the attempt counter) plus its transition
   /// observation. Returns whether the entry was live; a missing entry
   /// (evicted) needs no further work.
-  async fn publish_running(&self, id: &TaskId, kind: &TaskKind, attempt: u32) -> bool {
+  fn publish_running(&self, id: &TaskId, kind: &TaskKind, attempt: u32) -> bool {
     let previous = self.table.update(id, |entry| {
       let from = entry.status.borrow().phase;
       let mut record = entry.status.borrow().clone();
@@ -427,7 +470,7 @@ impl ManagerShared {
     });
     match previous {
       Ok(Some(from)) => {
-        self.observe(id, kind, from, TaskPhase::Running).await;
+        self.observe(id, kind, from, TaskPhase::Running);
         true
       }
       Ok(None) | Err(_) => false,
@@ -435,8 +478,10 @@ impl ManagerShared {
   }
 
   /// Publishes the terminal success with its payloads and its transition
-  /// observation.
-  async fn publish_success(
+  /// observation. The terminal phase lands in the table before this
+  /// returns — the permit release, the terminal report, and the leave
+  /// signal all follow from the table, never from the observation.
+  fn publish_success(
     &self, id: &TaskId, kind: &TaskKind, output: TaskOutput, secret: Option<IssuedMergeCredential>,
   ) {
     let finished = self.clock.now();
@@ -451,23 +496,23 @@ impl ManagerShared {
       from
     });
     if let Ok(Some(from)) = previous {
-      self.observe(id, kind, from, TaskPhase::Succeeded).await;
+      self.observe(id, kind, from, TaskPhase::Succeeded);
     }
   }
 
   /// Publishes the terminal failure with its typed error and its
   /// transition observation.
-  async fn publish_failure(&self, id: &TaskId, kind: &TaskKind, error: Error) {
+  fn publish_failure(&self, id: &TaskId, kind: &TaskKind, error: Error) {
     if let Some(from) = self.record_failure(id, error) {
-      self.observe(id, kind, from, TaskPhase::Failed).await;
+      self.observe(id, kind, from, TaskPhase::Failed);
     }
   }
 
   /// Publishes the terminal failure of an attempt that panicked. The
   /// failure *is* uncontained user code, so the transition is emitted
-  /// but the hooks are not re-run: hooks never observe their own
-  /// failure. The table publication itself is crate code, so nothing a
-  /// panicking hook could do remains on this path.
+  /// but the hooks are not run: hooks never observe a failure their own
+  /// panic caused. The table publication itself is crate code, so
+  /// nothing a panicking effect could do remains on this path.
   fn publish_panicked(&self, id: &TaskId, kind: &TaskKind, error: Error) {
     if let Some(from) = self.record_failure(id, error) {
       self.events().emit(crate::TaskChanged::new(
@@ -481,9 +526,8 @@ impl ManagerShared {
         "task failed after a panicking reconcile attempt"
       );
     } else {
-      // The entry already terminalized: the panic landed in the terminal
-      // transition's own observation (a hook panicking on `Succeeded`),
-      // and terminality is monotone, so the phase stands.
+      // The entry already terminalized, and terminality is monotone, so
+      // the published phase stands.
       tracing::warn!(
         task = %id,
         "a reconcile attempt panicked after the task terminalized"
@@ -516,14 +560,63 @@ impl ManagerShared {
   }
 
   /// The transition observation, in the design's order: the typed event
-  /// first, then the registered action hooks in canonical tag order.
-  /// Runs inside the task's own future, never on the manager task.
-  async fn observe(&self, id: &TaskId, kind: &TaskKind, from: TaskPhase, to: TaskPhase) {
+  /// first — synchronously on the publication path, so the event stream
+  /// is the table's own transition order — then the registered action
+  /// hooks, in canonical tag order, inside the task's own spawned
+  /// observation task. The observation runs off the execution slots and
+  /// off the attempt body, so a wedged or panicking hook can never hold
+  /// a slot, delay the worker's terminal report, or (through it) the
+  /// leave shutdown. One task's observations chain through their
+  /// predecessors, so a task's hooks still observe in transition order
+  /// while different tasks never observe through each other.
+  fn observe(&self, id: &TaskId, kind: &TaskKind, from: TaskPhase, to: TaskPhase) {
     self
       .events()
       .emit(crate::TaskChanged::new(id.clone(), kind.clone(), to));
+    let hooks = self.extensions().action_hooks();
+    if hooks.is_empty() {
+      return;
+    }
     let transition = crate::task::TaskTransition::new(id.clone(), kind.clone(), from, to);
-    crate::task::notify_action_hooks(&self.extensions().action_hooks(), &transition).await;
+    let previous = self
+      .observations
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .remove(id);
+    let observation = tokio::spawn(async move {
+      // A predecessor that ended without settling (an aborted
+      // observation — panics are contained inside the hook runner) is
+      // containment news, never a task outcome: log it and keep the
+      // chain going.
+      if let Some(previous) = previous
+        && let Err(join_error) = previous.await
+      {
+        tracing::warn!(
+          task = %transition.id(),
+          panic = join_error.is_panic(),
+          "an action hook observation ended without settling"
+        );
+      }
+      crate::task::notify_action_hooks(&hooks, &transition).await;
+    });
+    self
+      .observations
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .insert(id.clone(), observation);
+  }
+
+  /// Detaches the task's observation chain: the terminal report is the
+  /// task's last observation spawn site, so dropping the chain-head
+  /// handle here keeps the manager's bookkeeping bounded while any
+  /// still-running (or wedged) observation task stays detached — caller
+  /// code that never settles must not pin the manager.
+  fn detach_observations(&self, id: &TaskId) {
+    self
+      .observations
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .remove(id);
   }
 }
 
@@ -539,12 +632,32 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     table: table.clone(),
     stop: cancel_rx.clone(),
   };
+  // The execution-slot budgets ride the node configuration carried by
+  // the operation planes; the unit-test double (no planes) reads the
+  // same defaults the configuration ships.
+  let (local_slots, network_slots) = deps
+    .operations
+    .planes()
+    .map(|planes| {
+      (
+        planes.config.task_reconcile_local_slots(),
+        planes.config.task_reconcile_network_slots(),
+      )
+    })
+    .unwrap_or_else(|_| {
+      let defaults = NodeConfig::new();
+      (
+        defaults.task_reconcile_local_slots(),
+        defaults.task_reconcile_network_slots(),
+      )
+    });
   let shared = Arc::new(ManagerShared {
     table,
     clock: deps.clock,
     operations: deps.operations,
     leave_complete: deps.leave_complete,
-    semaphore: Arc::new(Semaphore::new(TASK_RECONCILE_CONCURRENCY)),
+    slots: ReconcileChannels::new(local_slots, network_slots),
+    observations: Mutex::new(BTreeMap::new()),
   });
   let (reports_tx, reports_rx) = mpsc::unbounded_channel();
   let task = tokio::spawn(run_manager(
@@ -579,7 +692,8 @@ enum WorkerReport {
   /// terminal phase — read when this report is processed — is the
   /// single truth for the leave completion signal: a leave that
   /// published `Succeeded` still signals the active-leave shutdown even
-  /// when a hook panicked after that publication and lost the attempt.
+  /// when a hook observing that publication wedges or panics (the
+  /// observations run in their own spawned tasks off this path).
   Terminal { id: TaskId },
   /// The attempt failed retryably; re-spawn after the delay.
   Retry {
@@ -709,14 +823,17 @@ async fn run_manager(
         match report {
           WorkerReport::Terminal { id } => {
             coalescing.retain(|_, (in_flight, _)| in_flight != &id);
+            // The terminal publication was this task's last observation
+            // spawn site: detach the chain so the bookkeeping dies with
+            // the task while any wedged observation stays detached.
+            shared.detach_observations(&id);
             if leave_task.as_ref() == Some(&id) {
               leave_task = None;
-              // The table's terminal phase is the single truth, not the
-              // attempt's own outcome: a leave whose `Succeeded`
-              // publication already landed signals the active-leave
-              // shutdown even when a hook panicked after it (the panic
-              // leaves the terminal phase standing but loses the
-              // attempt).
+              // The table's terminal phase is the single truth, driven
+              // straight off the terminal publication: the action-hook
+              // observations run in their own spawned tasks off this
+              // path, so a wedged or panicking hook can never delay the
+              // active-leave shutdown behind the task's own success.
               let succeeded = shared
                 .table
                 .status(&id)
@@ -925,37 +1042,40 @@ impl Worker {
     if cancellable && *self.cancel.borrow() {
       return WorkerReport::Cancelled;
     }
-    // The permit gate: a cancellable kind releases its queue slot on
-    // shutdown instead of waiting out the concurrency bound.
+    // The permit gate, drawn from the kind's slot channel: a
+    // cancellable kind releases its queue slot on shutdown instead of
+    // waiting out the concurrency bound.
+    let slots = self.shared.slots.for_class(self.kind.slot_class());
     let permit = if cancellable {
       tokio::select! {
-        permit = self.shared.semaphore.acquire() => permit,
+        permit = slots.acquire() => permit,
         _ = self.cancel.changed() => return WorkerReport::Cancelled,
       }
     } else {
-      self.shared.semaphore.acquire().await
+      slots.acquire().await
     };
     let _permit = match permit {
       Ok(permit) => permit,
       Err(_) => {
-        self
-          .shared
-          .publish_failure(
-            &self.id,
-            &self.kind,
-            Error::internal("task reconcile permit"),
-          )
-          .await;
+        self.shared.publish_failure(
+          &self.id,
+          &self.kind,
+          Error::internal("task reconcile permit"),
+        );
         return WorkerReport::Terminal { id: self.id };
       }
     };
-    // The whole attempt body — the `Running` publication, its transition
-    // observation (event plus action hooks), the effect, and the terminal
-    // publication — runs as its own spawned task, so a panic anywhere in
-    // it (including inside caller-registered hook code) surfaces as the
-    // aborted join handled below, and the worker always reports back to
-    // the manager. The abort-on-drop guard cancels the body when the
-    // shutdown cancel wins the select.
+    // The whole attempt body — the `Running` publication, the effect,
+    // and the terminal publication — runs as its own spawned task, so
+    // a panic anywhere in it (including inside caller-registered
+    // reconciler code) surfaces as the aborted join handled below, and
+    // the worker always reports back to the manager. The transition
+    // observations (event plus action hooks) do not run here: the event
+    // is emitted synchronously on the publication path and the hooks
+    // run in their own spawned observation tasks, so the body settles
+    // — and the permit releases — without waiting on any observer. The
+    // abort-on-drop guard cancels the body when the shutdown cancel
+    // wins the select.
     let mut body = AbortOnDrop(tokio::spawn(
       Attempt {
         shared: Arc::clone(&self.shared),
@@ -1041,7 +1161,6 @@ impl Attempt {
     if !self
       .shared
       .publish_running(&self.id, &self.kind, self.attempt.attempt)
-      .await
     {
       // The entry is gone (evicted terminal history) or its lock is
       // poisoned: there is no state left to publish onto.
@@ -1051,8 +1170,7 @@ impl Attempt {
       Ok(EffectOutcome { output, secret }) => {
         self
           .shared
-          .publish_success(&self.id, &self.kind, output, secret)
-          .await;
+          .publish_success(&self.id, &self.kind, output, secret);
         AttemptOutcome::Terminal
       }
       Err(error) => {
@@ -1063,10 +1181,7 @@ impl Attempt {
             last_error: Some(TaskError::from_error(error)),
           }
         } else {
-          self
-            .shared
-            .publish_failure(&self.id, &self.kind, error)
-            .await;
+          self.shared.publish_failure(&self.id, &self.kind, error);
           AttemptOutcome::Terminal
         }
       }
@@ -1201,6 +1316,35 @@ mod tests {
     }
   }
 
+  /// An action hook that never settles (a wedged observer under test).
+  #[derive(Debug)]
+  struct WedgingHook;
+
+  impl ActionHook for WedgingHook {
+    fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      Box::pin(std::future::pending())
+    }
+  }
+
+  /// Polls a shared log to its final shape: the hook observations run
+  /// in their own spawned tasks, so the terminal publication precedes
+  /// them and the recorded sequence reaches its pinned shape only
+  /// shortly after.
+  async fn await_hook_calls(calls: &Arc<Mutex<Vec<HookCall>>>, expected: Vec<HookCall>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+      let recorded = calls.lock().expect("hook calls").clone();
+      if recorded == expected {
+        return;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "hook calls never reached {expected:?}: {recorded:?}"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+  }
+
   #[tokio::test]
   async fn action_hooks_run_in_canonical_tag_order() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1241,19 +1385,23 @@ mod tests {
       .wait()
       .await
       .expect("terminal");
-    assert_eq!(
-      calls.lock().expect("hook calls").clone(),
+    // The observations are spawned per transition and chained through
+    // their predecessors, so the sequence still observes each transition
+    // in order, in canonical tag order — it just lands off the slot.
+    await_hook_calls(
+      &calls,
       vec![
         ("alpha", TaskPhase::Pending, TaskPhase::Running),
         ("zeta", TaskPhase::Pending, TaskPhase::Running),
         ("alpha", TaskPhase::Running, TaskPhase::Succeeded),
         ("zeta", TaskPhase::Running, TaskPhase::Succeeded),
-      ]
-    );
+      ],
+    )
+    .await;
   }
 
   #[tokio::test]
-  async fn a_panicking_action_hook_fails_the_task_typed_and_the_manager_keeps_serving() {
+  async fn a_panicking_action_hook_is_contained_and_the_task_still_succeeds() {
     let mut extensions = ExtensionRegistry::new();
     extensions
       .register_action_hook(
@@ -1266,6 +1414,9 @@ mod tests {
       extensions,
     ))
     .expect("manager");
+    // The observation runs in its own spawned task off the attempt body,
+    // so a panicking hook is a contained diagnostic: the task runs its
+    // effect to success, and the manager keeps serving later tasks.
     for counter in 0..2 {
       let id = client
         .submit(
@@ -1274,18 +1425,16 @@ mod tests {
         )
         .await
         .expect("admission");
-      let error = handle::<()>(&client, &id, TaskKind::SyncRound)
+      handle::<()>(&client, &id, TaskKind::SyncRound)
         .wait()
         .await
-        .expect_err("panicking hook");
-      assert_eq!(error.kind(), ErrorKind::Internal);
-      assert_eq!(error.context(), "reconciler panicked");
+        .expect("the observer panic never fails the task");
       assert_eq!(
         handle::<()>(&client, &id, TaskKind::SyncRound)
           .status()
           .phase(),
-        TaskPhase::Failed,
-        "submission {counter} terminalized"
+        TaskPhase::Succeeded,
+        "submission {counter} succeeded despite the panicking observer"
       );
     }
   }
@@ -1311,9 +1460,11 @@ mod tests {
       )
       .await
       .expect("admission");
-    // The effect succeeded and published `Succeeded`; the hook panicked
-    // while observing that terminal transition. Terminality is monotone,
-    // so the phase stands and the waiter still receives the outcome.
+    // The effect succeeded and published `Succeeded`; the hook
+    // panicking while observing that terminal transition is contained
+    // in the observation task. Terminality is monotone and the
+    // observation is off the attempt body, so the phase stands and the
+    // waiter still receives the outcome.
     handle::<()>(&client, &id, TaskKind::SyncRound)
       .wait()
       .await
@@ -1357,10 +1508,11 @@ mod tests {
       .await
       .expect("admission");
     // The leave effect succeeded and published `Succeeded`; the hook
-    // panicked observing that terminal transition, so the attempt
-    // itself is lost. The table's terminal phase — the single truth —
-    // still drives the active-leave signal: the node must not hang on
-    // shutdown waiting for a leave that already succeeded.
+    // panicking while observing that terminal transition is contained
+    // in the observation task and never rides the attempt body. The
+    // table's terminal phase — the single truth — drives the
+    // active-leave signal: the node must not hang on shutdown waiting
+    // for a leave that already succeeded.
     handle::<crate::LeaveOutcome>(&client, &id, TaskKind::Leave)
       .wait()
       .await
@@ -1369,6 +1521,154 @@ mod tests {
       .await
       .expect("the leave signal fires")
       .expect("receiver live");
+  }
+
+  #[tokio::test]
+  async fn a_wedged_action_hook_holds_no_slot_and_never_delays_the_leave_signal_or_drain() {
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/wedged").expect("tag"),
+        Arc::new(WedgingHook),
+      )
+      .expect("registration");
+    let (leave_complete, mut leave_signals) = mpsc::channel(1);
+    let deps = TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
+        Arc::new(crate::node::EventHub::new()),
+        Arc::new(extensions),
+      )),
+      leave_complete,
+    };
+    let (client, manager) = spawn_task_manager(deps).expect("manager");
+    // The leave publishes `Succeeded` while its first transition
+    // observation wedges forever: the wait resolves from the table, and
+    // — because the observations run in their own spawned tasks off the
+    // attempt body — the worker's terminal report still reaches the
+    // manager, whose table read drives the active-leave signal. Under
+    // the old in-body observation this signal never fired.
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        ok_effect(TaskOutput::Leave(crate::LeaveOutcome::new(
+          node('a'),
+          node('b'),
+        ))),
+      )
+      .await
+      .expect("admission");
+    tokio::time::timeout(
+      Duration::from_secs(5),
+      handle::<crate::LeaveOutcome>(&client, &id, TaskKind::Leave).wait(),
+    )
+    .await
+    .expect("the terminal publication must land without the observation")
+    .expect("the terminal success stands");
+    tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
+      .await
+      .expect("the leave signal fires despite the wedged observer")
+      .expect("receiver live");
+    // The manager keeps admitting: the wedged observation holds no
+    // execution slot, so later local kinds keep running to completion.
+    for index in 0..3 {
+      let id = client
+        .submit(
+          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          ok_effect(TaskOutput::SyncRound(())),
+        )
+        .await
+        .expect("admission");
+      tokio::time::timeout(
+        Duration::from_secs(5),
+        handle::<()>(&client, &id, TaskKind::SyncRound).wait(),
+      )
+      .await
+      .expect("submission never terminalized")
+      .expect("terminal");
+      let _ = index;
+    }
+    // The shutdown drain is never pinned by the wedged observer either:
+    // it waits for workers, not for observations.
+    manager.begin_shutdown();
+    let (drained, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    let drain = tokio::spawn(async move {
+      manager.drain().await;
+      let _ = drained.send(());
+    });
+    let drained = tokio::time::timeout(Duration::from_secs(5), drained_rx).await;
+    assert!(
+      drained.is_ok(),
+      "the drain must complete despite the wedged observer"
+    );
+    let _ = drain.await;
+  }
+
+  #[tokio::test]
+  async fn local_kinds_never_queue_behind_a_saturated_network_channel() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // The default network channel holds two slots: two wedged dials
+    // (join effects that never settle) hold both of them.
+    let dial = || async {
+      client
+        .submit(
+          TaskSpec::new(TaskKind::Join, TaskPayload::None),
+          wedged_effect(),
+        )
+        .await
+        .expect("admission")
+    };
+    let first = dial().await;
+    let second = dial().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    for id in [&first, &second] {
+      loop {
+        let running = client
+          .observer
+          .table
+          .status(id)
+          .is_some_and(|(_, status)| status.phase() == TaskPhase::Running);
+        if running {
+          break;
+        }
+        assert!(
+          std::time::Instant::now() < deadline,
+          "a wedged dial never published running"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+    }
+    // A third dial queues on the exhausted network channel: it never
+    // leaves `Pending` for the rest of the test.
+    let queued = dial().await;
+    // A local kind, meanwhile, runs to completion on its own channel —
+    // the split this test pins: no local operation ever queues behind a
+    // dial that can hold its slot for a whole dial deadline.
+    let local = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("admission");
+    tokio::time::timeout(
+      Duration::from_secs(5),
+      handle::<()>(&client, &local, TaskKind::SyncRound).wait(),
+    )
+    .await
+    .expect("the local kind must not queue behind the wedged dials")
+    .expect("terminal");
+    let (_, queued_status) = client
+      .observer
+      .table
+      .status(&queued)
+      .expect("queued dial entry");
+    assert_eq!(
+      queued_status.phase(),
+      TaskPhase::Pending,
+      "the network channel is still saturated"
+    );
   }
 
   #[tokio::test]
@@ -1619,15 +1919,23 @@ mod tests {
       .expect_err("different endpoint conflicts");
     assert_eq!(smuggle.kind(), ErrorKind::Conflict);
     assert_eq!(smuggle.context(), "task in flight");
-    // A different subject: a distinct task.
+    // A different subject: a distinct task. Its effect completes (and so
+    // frees its network slot — the channel's default budget is two and
+    // the wedged first dial already holds one), which is all the
+    // distinctness assertion needs: admission composition, not
+    // in-flight-ness, separates the ids.
     let other = client
       .submit(
         TaskSpec::new(TaskKind::Connect, dial(node('q'), 1000)),
-        wedged_effect(),
+        ok_effect(TaskOutput::Connect(node('q'))),
       )
       .await
       .expect("distinct admission");
     assert_ne!(first, other);
+    handle::<NodeId>(&client, &other, TaskKind::Connect)
+      .wait()
+      .await
+      .expect("distinct dial terminal");
     // A distinct kind over the same subject never coalesces.
     let revoke = client
       .submit(
@@ -1801,7 +2109,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn the_concurrency_bound_bounds_simultaneous_effects() {
+  async fn the_local_slot_channel_bounds_simultaneous_effects() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -1837,9 +2145,11 @@ mod tests {
       let status = handle::<()>(&client, &id, TaskKind::SyncRound).status();
       assert_eq!(status.phase(), TaskPhase::Succeeded);
     }
+    // SyncRound draws from the local channel, whose default budget is
+    // two permits (the network dials own the other channel).
     assert!(
-      peak.load(Ordering::SeqCst) <= 4,
-      "peak simultaneous effects: {}",
+      peak.load(Ordering::SeqCst) <= 2,
+      "peak simultaneous local effects: {}",
       peak.load(Ordering::SeqCst)
     );
   }
