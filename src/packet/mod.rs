@@ -566,12 +566,19 @@ impl OutboundRequest {
 pub(crate) enum StreamItem {
   Chunk(Arc<[u8]>),
   End,
+  /// A relay-synthesized truncated terminal: the sending leg died
+  /// mid-stream. Ends the body prefix without the completed sentinel,
+  /// so the body stream surfaces exactly one typed `StreamInterrupted`
+  /// — the same shape as a dropped channel (audit 2026-10-09 item 11).
+  Interrupted,
 }
 
 /// The body [`Stream`] over one admitted incoming stream's bounded
 /// channel: the standard [`ReceiverStream`] adapter plus the explicit
 /// `End` sentinel. A channel that closes without an `End` item is an
-/// interrupted stream and yields exactly one `StreamInterrupted` error.
+/// interrupted stream and yields exactly one `StreamInterrupted` error;
+/// an [`StreamItem::Interrupted`] terminal ends the prefix the same way
+/// while the channel itself stays open for the reader's teardown.
 pub(crate) fn channel_body(receiver: tokio::sync::mpsc::Receiver<StreamItem>) -> BodyStream {
   let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
   let observed = Arc::clone(&ended);
@@ -582,6 +589,9 @@ pub(crate) fn channel_body(receiver: tokio::sync::mpsc::Receiver<StreamItem>) ->
         observed.store(true, std::sync::atomic::Ordering::SeqCst);
         None
       }
+      // A truncated terminal ends the prefix without the completed
+      // flag: the tail below turns that into exactly one typed error.
+      StreamItem::Interrupted => None,
     })
     .take_while(|item| std::future::ready(item.is_some()))
     .filter_map(std::future::ready);
@@ -778,6 +788,27 @@ mod tests {
     let items: Vec<crate::Result<Arc<[u8]>>> = channel_body(receiver).collect().await;
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].as_ref().unwrap(), &Arc::from(&b"held"[..]));
+    let error = items[1].as_ref().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::StreamInterrupted);
+  }
+
+  /// A relay-synthesized interrupted terminal (a mid-stream death on the
+  /// sending leg) truncates the body with exactly one typed error — the
+  /// same shape as the dropped channel above — instead of completing it
+  /// normally (audit 2026-10-09 item 11).
+  #[tokio::test]
+  async fn channel_body_interrupted_terminal_is_one_typed_interruption() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    sender
+      .send(StreamItem::Chunk(Arc::from(&b"partial"[..])))
+      .await
+      .unwrap();
+    sender.send(StreamItem::Interrupted).await.unwrap();
+    drop(sender);
+
+    let items: Vec<crate::Result<Arc<[u8]>>> = channel_body(receiver).collect().await;
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].as_ref().unwrap(), &Arc::from(&b"partial"[..]));
     let error = items[1].as_ref().unwrap_err();
     assert_eq!(error.kind(), ErrorKind::StreamInterrupted);
   }
