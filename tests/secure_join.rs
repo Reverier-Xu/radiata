@@ -1977,3 +1977,193 @@ async fn secure_join_sixteen_node_membership_merges_and_views() {
   }
   issuer.handle.shutdown().await.unwrap();
 }
+
+// ---- caller feature registry handshake evidence ----
+
+use radiata::{FeatureDefinition, FeatureTag, NodeConfig};
+
+const PROBE_FEATURE: &str = "testing.example/features/handshake-probe";
+const PROBE_PROTOCOL: &str = "radiata.woooo.tech/protocols/handshake-probe-echo";
+
+/// Starts a node with the probe feature registered and the probe protocol
+/// (owned by that feature) wired to `collector`; `require_feature` marks
+/// the feature required in the node's own offer.
+async fn start_probe_node(
+  seed: u64, require_feature: bool, collector: Arc<Collector>,
+) -> NodeHandle {
+  init_tracing();
+  let mut extensions = ExtensionRegistry::new();
+  extensions
+    .register_feature(
+      FeatureDefinition::new(
+        FeatureTag::parse(PROBE_FEATURE).unwrap(),
+        radiata::Digest::from_bytes([0x5A; 32]),
+      )
+      .unwrap(),
+    )
+    .unwrap();
+  extensions
+    .register_protocol(
+      ProtocolDefinition::new(
+        ProtocolTag::parse(PROBE_PROTOCOL).unwrap(),
+        FeatureTag::parse(PROBE_FEATURE).unwrap(),
+      ),
+      collector,
+    )
+    .unwrap();
+  let mut config = NodeConfig::new();
+  if require_feature {
+    config = config
+      .require_feature(FeatureTag::parse(PROBE_FEATURE).unwrap())
+      .unwrap();
+  }
+  let factory: Arc<dyn radiata::extension::StorageFactory> =
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+  NodeBuilder::new(factory)
+    .keys(Arc::new(ScriptedKeys::full_at(seed)))
+    .config(config)
+    .extensions(extensions)
+    .start()
+    .await
+    .unwrap()
+}
+
+/// Sends one packet through the probe protocol and waits for the
+/// receiving collector to observe its body: the protocol's owning
+/// feature must be in the session's selection for the destination to
+/// admit the stream.
+async fn probe_round_trip(
+  sender: &NodeHandle, target: &radiata::NodeId, collector: &Arc<Collector>, body: &'static [u8],
+) {
+  let packet = sender
+    .open_stream(
+      StreamTarget::Exact(target.clone()),
+      ProtocolTag::parse(PROBE_PROTOCOL).unwrap(),
+      policy(),
+      metadata(),
+    )
+    .unwrap();
+  packet.send_sync(VecBody::new(vec![body])).await.unwrap();
+  wait_for(
+    || {
+      collector
+        .packets
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, seen)| seen == body)
+    },
+    Duration::from_secs(10),
+    "probe packet delivery",
+  )
+  .await;
+}
+
+/// Both nodes register the same caller-defined extension feature plus a
+/// protocol owned by it, and the joiner (the handshake caller)
+/// additionally requires the feature. The merged caller registry must
+/// enter every handshake (audit 2026-10-09 item 15): the join succeeds
+/// where a builtin-only rebuild fails as an unknown required label, the
+/// feature survives into both sides' signed selections, the
+/// feature-owned protocol admits packets both ways, and a
+/// credential-free member reconnect negotiates the same surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn caller_feature_registry_enters_handshake_selection_and_admission() {
+  let receiver_collector = Arc::new(Collector::default());
+  let joiner_collector = Arc::new(Collector::default());
+  let receiver = start_probe_node(120_000, false, Arc::clone(&receiver_collector)).await;
+  let joiner = start_probe_node(121_000, true, Arc::clone(&joiner_collector)).await;
+
+  let issued = receiver
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let listener = receiver
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let secret = issued.credential().expose_secret().to_owned();
+  merge_ok(&joiner, listener.endpoint(), &secret).await;
+
+  let receiver_id = receiver.local_node().await.unwrap().node_id().clone();
+  let joiner_id = joiner.local_node().await.unwrap().node_id().clone();
+  let feature = FeatureTag::parse(PROBE_FEATURE).unwrap();
+
+  // The caller-registered feature survives into both sides' signed
+  // selections.
+  for (side, handle, peer) in [
+    ("receiver", &receiver, &joiner_id),
+    ("joiner", &joiner, &receiver_id),
+  ] {
+    let page = handle
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
+      .await
+      .unwrap();
+    let session = page
+      .items()
+      .iter()
+      .find(|session| session.peer() == peer)
+      .unwrap_or_else(|| panic!("{side} holds no session to its peer"));
+    assert!(
+      session
+        .selected_features()
+        .iter()
+        .any(|view| view.feature() == &feature),
+      "{side} selection misses the caller-registered feature: {:?}",
+      session.selected_features(),
+    );
+  }
+
+  // The feature-owned protocol admits packets on the negotiated session,
+  // in both directions.
+  probe_round_trip(&joiner, &receiver_id, &receiver_collector, b"caller-probe").await;
+  probe_round_trip(&receiver, &joiner_id, &joiner_collector, b"responder-probe").await;
+
+  // A credential-free member reconnect (the third handshake role)
+  // negotiates the same caller-registered surface.
+  joiner
+    .connect(listener.endpoint().clone(), receiver_id.clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let reconnected = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    let replaced = joiner
+      .sessions()
+      .list(PageSpec::first(8).unwrap())
+      .await
+      .unwrap()
+      .items()
+      .iter()
+      .any(|session| {
+        session.peer() == &receiver_id
+          && session.generation() >= 1
+          && session
+            .selected_features()
+            .iter()
+            .any(|view| view.feature() == &feature)
+      });
+    if replaced {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < reconnected,
+      "the member reconnect never re-negotiated the caller feature"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
+
+  receiver.shutdown().await.unwrap();
+  joiner.shutdown().await.unwrap();
+}

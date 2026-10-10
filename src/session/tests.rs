@@ -69,6 +69,7 @@ async fn node_from(
     entropy.clone(),
     issuer.clone(),
     offer,
+    Arc::new(FeatureRegistry::builtin().unwrap()),
     config.authentication_deadline(),
     config.merge_admission(),
   );

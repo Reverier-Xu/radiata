@@ -119,6 +119,12 @@ pub(crate) struct SessionDriver {
   entropy: Arc<dyn Entropy>,
   issuer: Arc<Mutex<MergeCredentialIssuer>>,
   offer: FeatureOffer,
+  /// The merged negotiation registry (built-ins plus caller-registered
+  /// features) that built this driver's offer. Every handshake role
+  /// selects against it, so a caller-registered feature survives into
+  /// the session's feature intersection instead of being dropped by a
+  /// builtin-only rebuild (audit 2026-10-09 item 15).
+  features: Arc<FeatureRegistry>,
   authentication_deadline: Duration,
   limiter: crate::identity::merge_rate::MergeLimiter,
   member_spkis: Arc<MemberSpkiTable>,
@@ -128,7 +134,7 @@ impl SessionDriver {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, keys: Arc<dyn KeyProvider>, entropy: Arc<dyn Entropy>,
-    issuer: Arc<Mutex<MergeCredentialIssuer>>, offer: FeatureOffer,
+    issuer: Arc<Mutex<MergeCredentialIssuer>>, offer: FeatureOffer, features: Arc<FeatureRegistry>,
     authentication_deadline: Duration, merge_admission: crate::config::MergeAdmissionLimits,
   ) -> Self {
     Self {
@@ -137,6 +143,7 @@ impl SessionDriver {
       entropy,
       issuer,
       offer,
+      features,
       authentication_deadline,
       limiter: crate::identity::merge_rate::MergeLimiter::new(merge_admission),
       member_spkis: Arc::new(MemberSpkiTable::default()),
@@ -190,6 +197,21 @@ impl SessionDriver {
       }
     };
     Ok(Some(MergeHint::new(generation)))
+  }
+
+  /// The negotiation registry for one handshake state machine.
+  /// `Handshake` owns its registry by value, so the shared merged
+  /// registry is rebuilt from the same immutable definitions per
+  /// handshake — deterministic validation over the set that built the
+  /// node offer, cheap next to the TLS round trips around it.
+  fn handshake_registry(&self) -> Result<FeatureRegistry> {
+    FeatureRegistry::build(
+      self
+        .features
+        .iter()
+        .map(|(_, definition)| definition.clone())
+        .collect(),
+    )
   }
 
   /// Runs the responder (listener) side of one accepted connection.
@@ -325,7 +347,7 @@ impl SessionDriver {
         local_offer: self.offer.clone(),
         channel_binding: *connection.channel_binding(),
       },
-      FeatureRegistry::builtin()?,
+      self.handshake_registry()?,
     )?;
 
     handshake.receive(&first.body)?;
@@ -434,7 +456,7 @@ impl SessionDriver {
         local_offer: self.offer.clone(),
         channel_binding: *connection.channel_binding(),
       },
-      FeatureRegistry::builtin()?,
+      self.handshake_registry()?,
     )?;
     self.initiate(connection, &mut handshake, identity).await?;
 
@@ -511,7 +533,7 @@ impl SessionDriver {
         local_offer: self.offer.clone(),
         channel_binding: *connection.channel_binding(),
       },
-      FeatureRegistry::builtin()?,
+      self.handshake_registry()?,
     )?;
     self.initiate(connection, &mut handshake, identity).await?;
     established(&handshake)
