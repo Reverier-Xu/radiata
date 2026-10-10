@@ -822,9 +822,16 @@ async fn reconcile_put_resource(
   let (accepted, name, outcome) = super::resources::with_commit_race_retry("resource put", || {
     Box::pin(async move {
       // The caller's expected version is the only authority on which
-      // register state the write may replace: a mismatch is final and
-      // never retried (the CAS race guard below covers only the
-      // snapshot-commit window, re-running this check per attempt).
+      // register state the write may replace. This pre-check is the
+      // early bail (a stale observation never pays the signature); the
+      // authoritative re-verification runs inside the commit's own
+      // snapshot (`commit_expected_record_ctx`), so the asynchronous
+      // signature step between the two cannot race the precondition
+      // away — a register that moved past the expected version refuses
+      // the write instead of being silently overwritten by a tuple
+      // winner. A mismatch is final and never retried; the CAS race
+      // guard below covers only the snapshot-commit window and re-runs
+      // this check per attempt.
       if let Some(expected) = expected {
         let stored = crate::resource::store::read_record_ctx(context.store(), write.name())
           .await?
@@ -850,10 +857,11 @@ async fn reconcile_put_resource(
       )
       .await?;
       let accepted = crate::resource::select::resource_view(&record);
-      match crate::resource::store::commit_record_ctx(
+      match crate::resource::store::commit_expected_record_ctx(
         context.store(),
         planes.entropy.as_ref(),
         &record,
+        expected.as_ref(),
       )
       .await
       {

@@ -1269,3 +1269,166 @@ async fn membership_sync_delivers_fat_descriptor_pages() {
     tokio::time::sleep(Duration::from_millis(50)).await;
   }
 }
+
+/// Regression (the 2026-10-09 audit, item 10): the local descriptor's
+/// endpoint rewrite must carry the owner's capability labels. Listener
+/// add/remove drift used to rebuild the descriptor without labels and
+/// propagate the emptied set to peers at a higher revision. The lane
+/// also pins the documented endpoint semantics: a patched-but-unlistened
+/// endpoint is advisory and rolls back on the next maintenance rewrite
+/// (the bound listeners' published endpoints are the descriptor's
+/// endpoint truth).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn descriptor_labels_survive_listener_rewrites_locally_and_on_peers() {
+  // Serialize with the sixteen-node lanes on the shared process.
+  let _gate = cluster_gate().lock().await;
+
+  let issuer = start_node(
+    0,
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+  )
+  .await;
+  let first_endpoint = listen(&issuer).await;
+  let member = start_node(
+    1,
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+  )
+  .await;
+  common::merge_with_retry(&member.handle, &issuer.handle, first_endpoint.clone()).await;
+
+  let issuer_id = node_id(&issuer).await;
+  let tier = radiata::LabelKey::parse("example.org/labels/tier").unwrap();
+  let gold = radiata::LabelValue::parse("gold").unwrap();
+  let own_view = |handle: radiata::NodeHandle, id: radiata::NodeId| async move {
+    handle
+      .members()
+      .get(id)
+      .await
+      .unwrap()
+      .expect("the local descriptor is published")
+  };
+  // Drives the issuer's membership maintenance rewrite (one
+  // deterministic round runs the maintenance tick), then waits for both
+  // the local and the peer view of the issuer to carry the expected
+  // endpoint count with the labels intact.
+  let converge = |endpoints: usize| {
+    let issuer = issuer.handle.clone();
+    let member = member.handle.clone();
+    let issuer_id = issuer_id.clone();
+    let tier = tier.clone();
+    let gold = gold.clone();
+    async move {
+      let deadline = std::time::Instant::now() + Duration::from_secs(60);
+      loop {
+        issuer.sync().await.unwrap();
+        member.sync().await.unwrap();
+        let local = own_view(issuer.clone(), issuer_id.clone()).await;
+        let peer = member.members().get(issuer_id.clone()).await.unwrap();
+        let converged = local.endpoints().len() == endpoints
+          && local.labels().get(&tier) == Some(&gold)
+          && peer
+            .as_ref()
+            .is_some_and(|view| view.endpoints().len() == endpoints)
+          && peer
+            .as_ref()
+            .is_some_and(|view| view.labels().get(&tier) == Some(&gold));
+        if converged {
+          return (local, peer.expect("converged implies the peer view"));
+        }
+        assert!(
+          deadline.elapsed() < Duration::from_secs(60),
+          "descriptor rewrite never converged: local_endpoints={:?} \
+           peer_endpoints={:?} local_labels={:?} peer_labels={:?}",
+          local.endpoints(),
+          peer.as_ref().map(|view| view.endpoints().to_vec()),
+          local.labels().entries().count(),
+          peer.as_ref().map(|view| view.labels().entries().count()),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+    }
+  };
+
+  // The owner patches capability labels at the published revision.
+  let revision = own_view(issuer.handle.clone(), issuer_id.clone())
+    .await
+    .owner_revision();
+  let patched = issuer
+    .handle
+    .patch_metadata(
+      revision,
+      radiata::NodeMetadataPatch::new()
+        .set_capability(tier.clone(), gold.clone())
+        .unwrap(),
+    )
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  assert_eq!(patched.labels().get(&tier), Some(&gold));
+
+  // Listener drift (a second bound listener) forces the maintenance
+  // rewrite; the labels must survive it locally and on the peer.
+  let second_listener = issuer
+    .handle
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let (local, peer) = converge(2).await;
+  assert!(local.endpoints().contains(&first_endpoint));
+  assert!(local.endpoints().contains(second_listener.endpoint()));
+  assert_eq!(peer.endpoints(), local.endpoints());
+
+  // A patched endpoint without a bound listener is advisory: the next
+  // maintenance rewrite rolls it back (documented semantics), while the
+  // labels stay.
+  let revision = own_view(issuer.handle.clone(), issuer_id.clone())
+    .await
+    .owner_revision();
+  let advisory = Endpoint::parse("wss://advisory.example:9000").unwrap();
+  let patched = issuer
+    .handle
+    .patch_metadata(
+      revision,
+      radiata::NodeMetadataPatch::new()
+        .add_endpoint(advisory.clone())
+        .unwrap(),
+    )
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  assert!(patched.endpoints().contains(&advisory));
+  let (local, peer) = converge(2).await;
+  assert!(!local.endpoints().contains(&advisory));
+  assert_eq!(peer.endpoints(), local.endpoints());
+  assert_eq!(local.labels().get(&tier), Some(&gold));
+
+  // The shrink side (the second listener stops): the rewrite unpublishes
+  // its endpoint and still carries the labels.
+  issuer
+    .handle
+    .listeners()
+    .delete(second_listener.id().clone())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let (local, peer) = converge(1).await;
+  assert_eq!(local.endpoints(), &[first_endpoint.clone()][..]);
+  assert_eq!(peer.endpoints(), &[first_endpoint.clone()][..]);
+  assert_eq!(local.labels().get(&tier), Some(&gold));
+  assert_eq!(peer.labels().get(&tier), Some(&gold));
+
+  for node in [issuer, member] {
+    let outcome = node.handle.shutdown().await.unwrap();
+    assert_eq!(outcome.reason(), &radiata::ShutdownReason::Explicit);
+  }
+}

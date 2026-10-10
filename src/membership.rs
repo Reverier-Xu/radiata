@@ -179,6 +179,14 @@ pub(crate) fn node_descriptor_digest(descriptor: &NodeDescriptorV1) -> Result<cr
 /// Single-sourced here — next to the descriptor type it mutates — so any
 /// future writer (sync, recovery) merges identically instead of
 /// re-implementing the rules in the runtime supervisor.
+///
+/// Endpoint edits are advisory until a listener publishes them: the
+/// membership maintenance rewrite (`ensure_local_descriptor`) keeps the
+/// descriptor's endpoint set equal to the bound listeners' published
+/// endpoints, so an endpoint added here without a bound listener is
+/// rolled back by that rewrite, and an endpoint removed here while its
+/// listener stays bound is restored. Labels have no such interplay —
+/// the rewrite always carries the labels this patch installed.
 pub(crate) fn apply_metadata_patch(
   descriptor: &NodeDescriptorV1, patch: crate::NodeMetadataPatch,
 ) -> Result<NodeDescriptorV1> {
@@ -747,6 +755,60 @@ mod tests {
         .await
         .is_err()
     );
+  }
+
+  /// Two owner patches based on one observed revision (the audit's
+  /// window: read → patch → commit) resolve to exactly one commit: the
+  /// descriptor register's commit boundary accepts only a strictly
+  /// higher revision, so the second patch's same-next-revision record
+  /// conflicts instead of silently overwriting the first.
+  #[tokio::test]
+  async fn raced_metadata_patches_resolve_to_one_commit() {
+    let factory = factory();
+    store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"], false))
+      .await
+      .unwrap();
+    let observed = store::read_descriptor(&factory, &node(1))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(observed.revision(), 1);
+
+    let tier = crate::LabelKey::parse("example.org/labels/tier").unwrap();
+    let gold = crate::LabelValue::parse("gold").unwrap();
+    // Both patches are applied to the SAME observed revision.
+    let first = super::apply_metadata_patch(
+      &observed,
+      crate::NodeMetadataPatch::new()
+        .add_endpoint(endpoint("two.example"))
+        .unwrap(),
+    )
+    .unwrap();
+    let second = super::apply_metadata_patch(
+      &observed,
+      crate::NodeMetadataPatch::new()
+        .set_capability(tier.clone(), gold.clone())
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first.revision(), 2);
+    assert_eq!(second.revision(), 2);
+
+    store::store_descriptor(&factory, &first).await.unwrap();
+    let error = store::store_descriptor(&factory, &second)
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+
+    // The register holds exactly the first patch; the loser's labels
+    // never landed.
+    let stored = store::read_descriptor(&factory, &node(1))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(stored.revision(), 2);
+    assert_eq!(stored.endpoints().len(), 2);
+    assert_eq!(stored.labels().get(&tier), None);
   }
 
   /// A first install at revision 0 is rejected even when the node's
