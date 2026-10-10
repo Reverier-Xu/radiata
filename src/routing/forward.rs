@@ -23,7 +23,7 @@ use crate::{
   extension_registry::ExtensionRegistry,
   packet::{
     AckOutcome,
-    wire::{self, AckStatus, ChunkFrame, EndFrame, OpenFrame},
+    wire::{self, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
   session::stream::{BoundedSender, SessionFrame, SessionTable},
@@ -58,10 +58,10 @@ pub(crate) type PendingAcks = Arc<std::sync::Mutex<HashMap<TraceId, PendingAck>>
 /// re-walk from the origin.
 #[derive(Clone)]
 pub(crate) struct RetryState {
-  open: OpenFrame,
-  context: crate::routing::RouteContext,
-  candidates: Vec<NodeId>,
-  downstream_acks: PendingAcks,
+  pub(crate) open: OpenFrame,
+  pub(crate) context: crate::routing::RouteContext,
+  pub(crate) candidates: Vec<NodeId>,
+  pub(crate) downstream_acks: PendingAcks,
 }
 
 #[derive(Clone)]
@@ -270,8 +270,10 @@ pub(crate) async fn relay_end(table: &ForwardingTable, frame: EndFrame) -> bool 
 }
 
 /// Terminates every hop fed by the session of `upstream_peer`: their
-/// downstream legs receive an explicit end so no destination consumer waits
-/// forever, and no reopen path ever continues a body.
+/// downstream legs receive an explicit typed end (the interruption
+/// discriminant) so no destination consumer waits forever and none can
+/// mistake the truncated body for a complete one, and no reopen path
+/// ever continues a body.
 pub(crate) async fn close_for_peer(table: &ForwardingTable, upstream_peer: &NodeId) {
   let candidates: Vec<TraceId> = locked(table)
     .iter()
@@ -290,7 +292,13 @@ pub(crate) async fn close_for_peer(table: &ForwardingTable, upstream_peer: &Node
       continue;
     };
     drop(relay);
-    if let Ok(body) = wire::encode_end(&EndFrame { trace_id }) {
+    // The feeding leg died mid-stream: the synthesized end carries the
+    // typed interruption discriminant, which the destination maps to a
+    // `StreamInterrupted` body error instead of a normal completion.
+    if let Ok(body) = wire::encode_end(&EndFrame {
+      trace_id,
+      reason: EndReason::Interrupted,
+    }) {
       let _ = hop
         .downstream
         .send_waiting(SessionFrame::new(PacketKind::End, body))
@@ -531,6 +539,15 @@ pub(crate) async fn on_downstream_failure(
     if let Some(hop) = locked(forwarding).get_mut(trace_id) {
       hop.downstream = entry.frames.clone();
       hop.downstream_acks = Arc::clone(&downstream_acks);
+      // The re-armed retry must consume its OWN attempt's pending entry:
+      // the live map is the new branch's, so a failure (or deadline) from
+      // this attempt removes exactly the entry it inserted — never a
+      // superseded branch's already-consumed map (audit 2026-10-09
+      // item 13). Note the inherent swap window: a same-branch ack that
+      // lands between send_waiting returning and this table update is
+      // misattributed and dropped; the hop deadline then re-dispatches,
+      // so the window is fail-closed and self-healing.
+      retry.downstream_acks = Arc::clone(&downstream_acks);
       hop.retry = Some(retry);
     }
     // The re-dispatched branch gets its own full hop budget.
@@ -573,6 +590,38 @@ async fn select_next_hop(
   }
 }
 
+/// Whether an acknowledgement arriving on the session that owns `acks`
+/// may steer the hop registered for `trace_id`. With no forwarding hop
+/// at this node the acknowledgement resolves that session's own pending
+/// admission (the origin's synchronous waiter) exactly as before. With
+/// one, the receiving session must still be the hop's current downstream
+/// — the same pending-admission map, still holding the trace's live
+/// relay entry — so a late acknowledgement from a branch the hop already
+/// abandoned (a failed or deadline-expired attempt) cannot consume the
+/// live attempt's entry, clear its retry arm, or flip its route record
+/// (audit 2026-10-09 item 13). Lock order matches `on_downstream_failure`:
+/// the forwarding table guard never outlives this call and the acks lock
+/// nests inside it.
+pub(crate) fn ack_from_current_downstream(
+  table: &ForwardingTable, acks: &PendingAcks, trace_id: &TraceId,
+) -> bool {
+  let guard = locked(table);
+  let Some(hop) = guard.get(trace_id) else {
+    // No forwarding hop at this node: the origin-side (or terminal)
+    // acknowledgement path stays attribution-free by construction.
+    return true;
+  };
+  Arc::ptr_eq(acks, &hop.downstream_acks)
+    && matches!(
+      acks.lock().ok().and_then(|acks| {
+        acks
+          .get(trace_id)
+          .map(|entry| matches!(entry, PendingAck::Relay { .. }))
+      }),
+      Some(true)
+    )
+}
+
 /// Removes the entry (the caller already holds the hop's relay lock, so no
 /// relay can be mid-flight and no other closer can win the race).
 fn take(table: &ForwardingTable, trace_id: &TraceId) -> Option<ForwardingHop> {
@@ -586,7 +635,7 @@ fn snapshot(table: &ForwardingTable, trace_id: &TraceId) -> Option<ForwardingHop
   locked(table).get(trace_id).cloned()
 }
 
-fn register(
+pub(crate) fn register(
   table: &ForwardingTable, trace_id: TraceId, hop: ForwardingHop,
 ) -> Result<(), crate::Error> {
   let mut guard = locked(table);
@@ -708,7 +757,7 @@ mod tests {
 
   use minicbor::bytes::ByteVec;
 
-  use super::{ForwardingHop, new_table, relay_chunk, relay_end};
+  use super::{EndReason, ForwardingHop, new_table, relay_chunk, relay_end};
   use crate::{
     NodeId, TraceId,
     packet::wire::{AckStatus, ChunkFrame, EndFrame},
@@ -760,7 +809,16 @@ mod tests {
     for sequence in 0..5_u64 {
       assert!(relay_chunk(&table, chunk(1, sequence, payload_byte(sequence))).await);
     }
-    assert!(relay_end(&table, EndFrame { trace_id: trace(1) }).await);
+    assert!(
+      relay_end(
+        &table,
+        EndFrame {
+          trace_id: trace(1),
+          reason: EndReason::Completed,
+        }
+      )
+      .await
+    );
     // The terminal direction closed the hop.
     assert!(!super::contains(&table, &trace(1)));
 
@@ -890,12 +948,16 @@ mod tests {
     ));
   }
 
-  /// When the feeding session ends, every hop it feeds receives an explicit
-  /// end downstream and leaves the table; no reopen path continues a body.
+  /// When the feeding session ends, every hop it feeds receives an
+  /// explicit typed end downstream and leaves the table; no reopen path
+  /// continues a body, and the synthesized end carries the interruption
+  /// discriminant so the destination cannot mistake a truncated body for
+  /// a complete one (audit 2026-10-09 item 11).
   #[tokio::test]
   async fn feeding_session_end_terminates_every_downstream_leg() {
     let table = new_table();
     let feeder = node(9);
+    let mut downstreams = Vec::new();
     for seed in [4_u32, 5] {
       let (upstream_tx, _) = crate::session::stream::test_queue(16, usize::MAX);
       let (downstream_tx, downstream_drain) = crate::session::stream::test_queue(16, usize::MAX);
@@ -914,11 +976,21 @@ mod tests {
         },
       )
       .unwrap();
-      let _ = downstream_drain;
+      downstreams.push(downstream_drain);
     }
     super::close_for_peer(&table, &feeder).await;
     assert!(!super::contains(&table, &trace(4)));
     assert!(!super::contains(&table, &trace(5)));
+    // Both downstream legs received the typed interruption end — never a
+    // normal completion — so the destination surfaces a truncated body
+    // instead of a silently complete one (audit 2026-10-09 item 11).
+    for mut drain in downstreams {
+      let frame = drain.recv().await.unwrap();
+      assert_eq!(frame.kind, PacketKind::End);
+      let end =
+        crate::packet::wire::decode_end(&frame.body, crate::protocol::CONTROL_CBOR_LIMITS).unwrap();
+      assert_eq!(end.reason, crate::packet::wire::EndReason::Interrupted);
+    }
     // An unrelated feeder's hops are untouched.
     let (upstream_tx, _) = crate::session::stream::test_queue(16, usize::MAX);
     let (downstream_tx, _) = crate::session::stream::test_queue(16, usize::MAX);
@@ -1099,9 +1171,26 @@ mod retry_tests {
     // The failed branch's pending entry was consumed...
     assert!(!failed_acks.lock().unwrap().contains_key(&trace(99)));
     // ...the hop switched legs and stays discovering...
-    let guard = super::locked(&table);
-    let hop = guard.get(&trace(99)).expect("hop stays registered");
-    assert!(hop.retry.is_some());
+    let live_entry;
+    {
+      let guard = super::locked(&table);
+      let hop = guard.get(&trace(99)).expect("hop stays registered");
+      assert!(hop.retry.is_some());
+      // ...and the re-armed retry carries the NEW branch's map, so the
+      // next failure (or deadline) consumes exactly the live attempt's
+      // entry — never the superseded branch's already-consumed map
+      // (audit 2026-10-09 item 13).
+      let retry = hop.retry.as_ref().expect("retry stays armed");
+      assert!(
+        std::sync::Arc::ptr_eq(&retry.downstream_acks, &hop.downstream_acks),
+        "the re-armed retry consumes its own attempt's pending map"
+      );
+      live_entry = hop.downstream_acks.lock().unwrap().contains_key(&trace(99));
+    }
+    assert!(
+      live_entry,
+      "the redispatched attempt registered a live relay entry"
+    );
     // ...and nothing failed upstream (the search continues silently).
     assert!(upstream_rx.recv().now_or_never().is_none());
   }
@@ -1207,5 +1296,66 @@ mod retry_tests {
     assert!(!acks.lock().unwrap().contains_key(&trace(99)));
     // ...and nothing failed upstream (the search continues silently).
     assert!(upstream_rx.recv().now_or_never().is_none());
+  }
+
+  /// Acknowledgement attribution (audit 2026-10-09 item 13): only the
+  /// hop's current downstream attempt — the same pending map, still
+  /// holding the trace's live relay entry — may steer the hop. A late
+  /// acknowledgement from the abandoned branch (a different map, or the
+  /// same map after its entry was consumed by the failure or deadline
+  /// path) fails the attribution check, and a node without a forwarding
+  /// hop keeps resolving its own admissions as before.
+  #[test]
+  fn ack_attribution_requires_the_current_downstreams_live_entry() {
+    let table = new_table();
+    let live_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    let (upstream_tx, _upstream_rx) = test_queue(16, usize::MAX);
+    live_acks.lock().unwrap().insert(
+      trace(99),
+      super::PendingAck::Relay {
+        upstream: upstream_tx,
+      },
+    );
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    let stale_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    register(
+      &table,
+      trace(99),
+      hop_with_retry(
+        test_queue(16, usize::MAX).0,
+        downstream_tx,
+        live_acks.clone(),
+        Vec::new(),
+      ),
+    )
+    .unwrap();
+
+    // The current downstream's live relay entry is attributed.
+    assert!(super::ack_from_current_downstream(
+      &table,
+      &live_acks,
+      &trace(99)
+    ));
+    // A superseded branch's map is not — even if it once held the entry.
+    assert!(!super::ack_from_current_downstream(
+      &table,
+      &stale_acks,
+      &trace(99)
+    ));
+    // The current map after its entry was consumed (the attempt was
+    // already abandoned) is not: the re-dispatch owns the next entry.
+    live_acks.lock().unwrap().remove(&trace(99));
+    assert!(!super::ack_from_current_downstream(
+      &table,
+      &live_acks,
+      &trace(99)
+    ));
+    // No forwarding hop at this node: the origin-side acknowledgement
+    // path stays attribution-free.
+    assert!(super::ack_from_current_downstream(
+      &table,
+      &live_acks,
+      &trace(98)
+    ));
   }
 }
