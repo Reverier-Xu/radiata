@@ -263,8 +263,13 @@ def b_rapid_disconnect_loop():
     send. A send racing the teardown can be lost - the data plane is
     at-most-once and the admission ack is not a delivery guarantee - so
     the sender re-drives exactly as the documented customer pattern:
-    poll, resend on silence, assert eventual convergence. No round may
-    wedge the mesh, and every accepted message lands exactly once."""
+    poll, re-drive the pending outbox entry on silence, assert eventual
+    convergence. The retry goes through /flush, never a fresh /dm: each
+    /dm mints a new msg_id, so a retry after a slow (not lost) first
+    send would land a second independent copy that the receiver's
+    per-msg_id dedup cannot absorb - exactly-once needs one id per
+    logical message. No round may wedge the mesh, and every accepted
+    message lands exactly once."""
     target = http("GET", 1, "/identities")["identities"]
     hub_id = next(e["node_id"] for e in target if e["user"] == "u1")
     for round_index in range(3):
@@ -272,8 +277,14 @@ def b_rapid_disconnect_loop():
         marker = f"gap round {round_index}"
         arrived = False
         for attempt in range(3):
-            result = http("POST", 1, "/dm", {"to": "u2", "body": marker})
-            if result["state"] == "pending":
+            if attempt == 0:
+                result = http("POST", 1, "/dm", {"to": "u2", "body": marker})
+                if result["state"] == "pending":
+                    http("POST", 1, "/flush")
+            else:
+                # /flush resends the pending entry under its original
+                # msg_id, so a late first landing and a retry landing
+                # dedupe to exactly one inbox copy.
                 http("POST", 1, "/flush")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
