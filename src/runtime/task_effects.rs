@@ -82,6 +82,13 @@ pub(crate) struct EffectPlanes {
   /// The advertised endpoints the listeners publish (never the bound
   /// wildcard sockets).
   pub(crate) published_endpoints: Arc<Mutex<Vec<Endpoint>>>,
+  /// The local descriptor's lazy-publication gate: the endpoint set the
+  /// descriptor was last successfully ensured against plus the
+  /// single-flight flag bounding the read views' kicked publications at
+  /// one task (see [`kick_self_descriptor_publication`]; remaining
+  /// items 2026-10-10, P2-9). Module-private: only this module's ensure
+  /// and kick touch it.
+  descriptor_publication: DescriptorPublication,
   /// The memoized departed-members exclusion set, shared with the
   /// supervisor's own pages: the checkpoint guard reads the same cache.
   pub(crate) exclusion_cache: super::recovery::ExclusionCache,
@@ -142,6 +149,7 @@ impl OperationDeps {
         leave_applied: dependencies.leave_applied.clone(),
         listeners: dependencies.listeners.clone(),
         published_endpoints: Arc::default(),
+        descriptor_publication: DescriptorPublication::default(),
         exclusion_cache: Arc::new(Mutex::new(None)),
         resource_write_clock: Arc::default(),
         recovery: Arc::new(Mutex::new(
@@ -770,11 +778,66 @@ pub(crate) async fn patch_metadata(
   ))
 }
 
+/// The local descriptor's lazy-publication coordination (remaining
+/// items 2026-10-10, P2-9): the endpoint set the descriptor was last
+/// successfully ensured against, plus the single-flight flag for the
+/// publication task the read views schedule. Together they keep the
+/// lazy path's task population bounded — a steady-state member read
+/// spawns nothing (the stamp matches), and at most ONE publication task
+/// is ever alive (the audit item 4 lesson applied to the lazy path).
+#[derive(Default)]
+struct DescriptorPublication {
+  /// Whether a scheduled publication task is currently in flight.
+  in_flight: std::sync::atomic::AtomicBool,
+  /// The published endpoints the descriptor was last ensured against;
+  /// `None` until the first successful ensure. Invalidated only by a
+  /// listener transition (the sole writers of `published_endpoints`).
+  ensured: Mutex<Option<Vec<Endpoint>>>,
+}
+
+impl DescriptorPublication {
+  /// Whether the descriptor was already ensured against exactly this
+  /// published endpoint set — a member read then needs no ensure work.
+  fn ensured_against(&self, endpoints: &[Endpoint]) -> bool {
+    self
+      .ensured
+      .lock()
+      .is_ok_and(|ensured| ensured.as_deref() == Some(endpoints))
+  }
+
+  /// Claims the single publication slot; `false` means a publication
+  /// is already in flight (it re-reads the fresher published set, so
+  /// the losing read needs no second task).
+  fn begin(&self) -> bool {
+    !self
+      .in_flight
+      .swap(true, std::sync::atomic::Ordering::AcqRel)
+  }
+
+  /// Releases the publication slot.
+  fn end(&self) {
+    self
+      .in_flight
+      .store(false, std::sync::atomic::Ordering::Release);
+  }
+
+  /// Records a successful ensure against this published endpoint set.
+  fn record(&self, endpoints: &[Endpoint]) {
+    if let Ok(mut ensured) = self.ensured.lock() {
+      *ensured = Some(endpoints.to_vec());
+    }
+  }
+}
+
 /// Lazily publishes this node's own signed descriptor (revision 1) so
 /// the public views always expose the local identity, with the published
-/// listener endpoints. Shared by the supervisor's member pages and the
-/// resource-write effects (a writer's descriptor anchors every record it
-/// signs), so both read the one published-endpoint truth.
+/// listener endpoints. Shared by the resource-write effects (a writer's
+/// descriptor anchors every record it signs), the listen effect's eager
+/// publication at the listener transition, and the read views' lazy
+/// kick ([`kick_self_descriptor_publication`]) — every caller but the
+/// kick awaits it on its own lane, never the supervisor's select loop.
+/// A successful ensure memoizes the endpoint set it settled against, so
+/// steady-state member reads stop scheduling ensure work entirely.
 pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
   let planes = deps.planes()?;
   let endpoints = planes
@@ -785,11 +848,81 @@ pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
   crate::membership::sync::ensure_local_descriptor(
     &planes.context,
     &planes.entropy,
-    endpoints,
+    endpoints.clone(),
     deps.events(),
     &planes.member_revision,
   )
-  .await
+  .await?;
+  planes.descriptor_publication.record(&endpoints);
+  Ok(())
+}
+
+/// Schedules the local descriptor's lazy publication OFF the
+/// supervisor's select loop (remaining items 2026-10-10, P2-9): the
+/// member read views call this instead of awaiting the ensure, so a
+/// first member read on a node that never bound a listener can no
+/// longer park every control-plane operation behind the descriptor
+/// commit on slow storage. Bounded accounting: the endpoint-set stamp
+/// suppresses the kick in steady state, and the single-flight gate
+/// bounds the population at exactly one task; a failed publication
+/// only clears the slot (never the stamp), so the next member read
+/// retries while the maintenance tick remains the drift backstop.
+/// The task is deliberately detached — it settles with its one commit
+/// and holds only the shared deps Arcs, the same bounded-detached
+/// shape as the maintenance plane's in-flight dials.
+///
+/// The kicking read answers from committed state only: on a node whose
+/// descriptor is not yet published, that single read may not include
+/// the local node — the scheduled publication lands asynchronously with
+/// its paired [`crate::MemberChanged`] event and revision bump (the
+/// one-to-one promise lives inside the ensure itself), and every later
+/// read observes it. Listener transitions publish synchronously in the
+/// listen effect, so a read after a bound listener stays deterministic.
+pub(super) fn kick_self_descriptor_publication(deps: &Arc<OperationDeps>) {
+  let Ok(planes) = deps.planes() else {
+    return;
+  };
+  let endpoints = planes
+    .published_endpoints
+    .lock()
+    .map(|endpoints| endpoints.clone())
+    .unwrap_or_default();
+  if planes.descriptor_publication.ensured_against(&endpoints) {
+    return;
+  }
+  if !planes.descriptor_publication.begin() {
+    return;
+  }
+  let deps = Arc::clone(deps);
+  tokio::spawn(async move {
+    // The slot must release even if the provider-backed ensure panics:
+    // a stuck flag would suppress every later kick for the node's
+    // lifetime, so the guard clears it on any exit path.
+    let slot = PublicationSlot {
+      deps: Arc::clone(&deps),
+    };
+    if let Err(error) = ensure_self_descriptor(&deps).await {
+      tracing::warn!(
+        kind = ?error.kind(),
+        "lazy local-descriptor publication failed; the next member read retries"
+      );
+    }
+    drop(slot);
+  });
+}
+
+/// Releases the single-flight publication slot on every exit path of
+/// the kicked task, including a panic unwind.
+struct PublicationSlot {
+  deps: Arc<OperationDeps>,
+}
+
+impl Drop for PublicationSlot {
+  fn drop(&mut self) {
+    if let Ok(planes) = self.deps.planes() {
+      planes.descriptor_publication.end();
+    }
+  }
 }
 
 /// The put effect: the moved supervisor body — stamp the host wall-clock
@@ -1368,6 +1501,20 @@ async fn reconcile_listen(
   {
     endpoints.push(published.clone());
   }
+  // Eager publication at the listener transition (remaining items
+  // 2026-10-10, P2-9): the member read views no longer await the lazy
+  // ensure inline, so the listener effect publishes the descriptor
+  // here, on this effect's own lane — a read that follows the listen
+  // task's completion deterministically observes the local node.
+  // Best-effort by the maintenance tick's contract: a failed
+  // publication defers to the read views' kick and the tick's own
+  // rewrite without failing the already-bound listener.
+  if let Err(error) = ensure_self_descriptor(&deps).await {
+    tracing::warn!(
+      kind = ?error.kind(),
+      "eager descriptor publication at listen deferred to the lazy paths"
+    );
+  }
   Ok(EffectOutcome::new(TaskOutput::Listen(
     crate::ListenerView::new(id, published),
   )))
@@ -1560,4 +1707,47 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   Ok(EffectOutcome::new(TaskOutput::Leave(
     crate::LeaveOutcome::new(former, replacement),
   )))
+}
+
+#[cfg(test)]
+mod descriptor_publication_tests {
+  use super::DescriptorPublication;
+  use crate::Endpoint;
+
+  fn endpoints(ports: &[u16]) -> Vec<Endpoint> {
+    ports
+      .iter()
+      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap())
+      .collect()
+  }
+
+  /// The gate's two bounds (remaining items 2026-10-10, P2-9): the
+  /// endpoint-set stamp suppresses ensure work while the published
+  /// endpoints are unchanged (a listener transition is the only
+  /// invalidation), and the single-flight flag admits exactly one
+  /// publication task at a time.
+  #[test]
+  fn the_stamp_suppresses_unchanged_kicks_and_the_slot_serializes() {
+    let gate = DescriptorPublication::default();
+    assert!(
+      !gate.ensured_against(&endpoints(&[1])),
+      "nothing is ensured before the first record"
+    );
+    assert!(gate.begin(), "the first publication claims the slot");
+    assert!(
+      !gate.begin(),
+      "a second publication waits for the in-flight one"
+    );
+    gate.end();
+    gate.record(&endpoints(&[1]));
+    assert!(
+      gate.ensured_against(&endpoints(&[1])),
+      "a recorded ensure suppresses the same published set"
+    );
+    assert!(
+      !gate.ensured_against(&endpoints(&[1, 2])),
+      "a listener transition invalidates the stamp"
+    );
+    assert!(gate.begin(), "the slot is free again once released");
+  }
 }

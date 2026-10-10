@@ -750,9 +750,11 @@ pub(crate) async fn ensure_local_descriptor(
 /// epoch-rescan triggers.
 ///
 /// The same quiescence contract the old sync tick held: before any
-/// member is admitted the node's store writes are quiescent (the
-/// supervisor's lazy paths publish the local descriptor on the first
-/// public query), keeping the admission commit sequence deterministic
+/// member is admitted the node's store writes are quiescent (the listen
+/// effect publishes the local descriptor eagerly at the listener bind,
+/// and a member query only SCHEDULES the listenerless node's lazy
+/// publication off the supervisor's select loop — remaining items
+/// 2026-10-10, P2-9), keeping the admission commit sequence deterministic
 /// for fault-injecting providers — nothing here runs before membership
 /// exists.
 pub(crate) async fn membership_maintenance_tick(
@@ -761,10 +763,12 @@ pub(crate) async fn membership_maintenance_tick(
   revision: &crate::node::MemberRevisionSignal,
 ) -> Result<()> {
   let store = context.store();
-  // Nothing to advertise at startup: the supervisor publishes the local
-  // descriptor (with endpoints) when a query or listener first needs it,
-  // so the maintenance loop never races a transient empty endpoint set
-  // into a revision bump.
+  // Nothing to advertise at startup: the listen effect publishes the
+  // local descriptor (with endpoints) when the first listener binds,
+  // and a member query schedules the listenerless node's publication
+  // off the supervisor's select loop (remaining items 2026-10-10,
+  // P2-9), so the maintenance loop never races a transient empty
+  // endpoint set into a revision bump.
   if !local_endpoints.is_empty() {
     ensure_local_descriptor(context, entropy, local_endpoints.to_vec(), events, revision).await?;
   }

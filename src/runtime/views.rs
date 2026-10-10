@@ -1,9 +1,18 @@
 //! Paged reads and point views on the node's observed state: members,
 //! resources, listeners, sessions, topology, trust, and observability.
 //! Pure observation over the signed descriptor stores and the session
-//! table. One deliberate exception: a member query lazily ensures the
-//! local descriptor exists (an install fires the paired member-set
-//! notification inside the ensure, keeping the revision contract).
+//! table. One deliberate nuance: a member query SCHEDULES the local
+//! descriptor's lazy publication (single flight, off the supervisor's
+//! select loop — remaining items 2026-10-10, P2-9) instead of awaiting
+//! it, so a slow descriptor commit can never park the control plane
+//! behind a member read. The query answers from committed state only:
+//! the single kicking read on a node that never bound a listener may
+//! not yet include the local node, while the scheduled publication
+//! lands with its paired [`crate::MemberChanged`] event and revision
+//! bump (the one-to-one promise lives in the ensure itself). Listener
+//! transitions publish synchronously in the listen effect, so a read
+//! after a bound listener still observes the local node
+//! deterministically.
 
 use tokio::task::JoinSet;
 
@@ -24,10 +33,25 @@ fn finish_page<T, P>(
 }
 
 impl Supervisor {
+  /// Schedules the local descriptor's lazy publication without awaiting
+  /// it (remaining items 2026-10-10, P2-9): the member read views stay
+  /// pure reads, and the publication's storage IO — historically
+  /// awaited inline in this loop, parking every control-plane operation
+  /// behind a slow descriptor commit — runs in the single-flight task
+  /// the kick schedules (at most one alive; none in steady state). The
+  /// listener transition publishes synchronously in the listen effect,
+  /// so a read that follows a bound listener observes the local node
+  /// deterministically.
+  fn kick_self_descriptor(&self) {
+    if let Some(operations) = self.dependencies.operations.as_ref() {
+      super::task_effects::kick_self_descriptor_publication(operations);
+    }
+  }
+
   /// One member's public observation from the signed descriptor store and
   /// the session table.
   pub(super) async fn member(&mut self, node: NodeId) -> Result<Option<crate::MemberView>> {
-    self.ensure_self_descriptor().await?;
+    self.kick_self_descriptor();
     let connected = self
       .dependencies
       .sessions
@@ -55,7 +79,7 @@ impl Supervisor {
   pub(super) async fn page_members(
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::MemberPage> {
-    self.ensure_self_descriptor().await?;
+    self.kick_self_descriptor();
     let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
     // Snapshot the connected set under the lock, then release it before
     // any await so the supervisor future stays `Send`.

@@ -294,11 +294,15 @@ async fn select_resources_pages_the_empty_catalog() {
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
-/// The lazy local-descriptor install is a member-set change: the first
-/// public operation that ensures the descriptor (here a paged member
-/// query on a node with no listener yet) must fire the paired
-/// `MemberChanged` event and revision bump, so a watcher that subscribes
-/// before acting never misses the local node joining its own member set.
+/// The lazy local-descriptor install is a member-set change (remaining
+/// items 2026-10-10, P2-9): the first paged member query on a node with
+/// no listener yet SCHEDULES the install — off the supervisor's select
+/// loop, single flight — instead of awaiting it, and the scheduled
+/// install must still fire the paired `MemberChanged` event and
+/// revision bump exactly once, so a watcher that subscribes before
+/// acting never misses the local node joining its own member set. The
+/// node's own page observes the install from the next read on (the one
+/// kicking read answered from committed state only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
   let providers = Providers::new();
@@ -309,7 +313,7 @@ async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
     .unwrap();
 
   // No listener has ever published endpoints, so the anti-entropy loop
-  // skips the ensure; this query performs the install itself.
+  // skips the ensure; this query schedules the install itself.
   node
     .members()
     .list(radiata::PageSpec::first(8).unwrap())
@@ -326,7 +330,21 @@ async fn lazy_local_descriptor_install_fires_the_member_changed_pair() {
     _other => panic!("expected a member-changed event"),
   }
 
-  // A steady second query changes nothing and fires nothing.
+  // The event is paired with the committed install: the next read
+  // observes the local node at its first revision.
+  let page = node
+    .members()
+    .list(radiata::PageSpec::first(8).unwrap())
+    .await
+    .unwrap();
+  let view = page
+    .items()
+    .iter()
+    .find(|view| view.node_id() == local.node_id())
+    .expect("the scheduled install is visible after its paired event");
+  assert_eq!(view.owner_revision(), 1);
+
+  // A steady later query changes nothing and fires nothing.
   node
     .members()
     .list(radiata::PageSpec::first(8).unwrap())

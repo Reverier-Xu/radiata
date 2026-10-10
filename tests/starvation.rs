@@ -154,6 +154,27 @@ async fn reads_and_packets_flow_while_a_join_is_wedged_on_a_silent_peer() {
   common::merge_with_retry(&member, &issuer, listener.endpoint().clone()).await;
   let issuer_id = issuer.local_node().await.unwrap().node_id().clone();
 
+  // Warm the member's lazy self-publication before the wedge (remaining
+  // items 2026-10-10, P2-9): a member read only SCHEDULES the local
+  // descriptor's first publication now, so the probe below exercises
+  // the read lane against the wedged dial, not the publication landing.
+  let warm_deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let warmed = member
+      .members()
+      .list(radiata::PageSpec::first(8).unwrap())
+      .await
+      .unwrap();
+    if !warmed.items().is_empty() {
+      break;
+    }
+    assert!(
+      Instant::now() < warm_deadline,
+      "the lazy self-publication never landed"
+    );
+    tokio::time::sleep(Duration::from_millis(25)).await;
+  }
+
   // The wedge: a join against a peer that accepts TCP and never speaks.
   let (port, holder) = silent_peer().await;
   let wedged_endpoint = Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap();
@@ -310,6 +331,28 @@ async fn reads_packets_and_local_writes_flow_while_four_dials_hold_every_network
     .unwrap();
   common::merge_with_retry(&member, &issuer, listener.endpoint().clone()).await;
   let issuer_id = issuer.local_node().await.unwrap().node_id().clone();
+
+  // Warm the member's lazy self-publication before the wedge (remaining
+  // items 2026-10-10, P2-9): a member read only SCHEDULES the local
+  // descriptor's first publication now, so the saturation probes below
+  // exercise the read lane against the wedged dials, not the
+  // publication landing.
+  let warm_deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let warmed = member
+      .members()
+      .list(radiata::PageSpec::first(8).unwrap())
+      .await
+      .unwrap();
+    if !warmed.items().is_empty() {
+      break;
+    }
+    assert!(
+      Instant::now() < warm_deadline,
+      "the lazy self-publication never landed"
+    );
+    tokio::time::sleep(Duration::from_millis(25)).await;
+  }
 
   // The wedge, fourfold: four silent peers, four distinct dial
   // subjects, so four connect tasks each hold a network slot for the
@@ -658,4 +701,96 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
     .expect("shutdown must not drain the slow device's queued commits")
     .unwrap();
   peer.shutdown().await.unwrap();
+}
+
+/// The lazy-publication lane of the starvation contract (remaining
+/// items 2026-10-10, P2-9): a node that never bound a listener
+/// publishes its local descriptor lazily, and that publication is a
+/// COMMIT. It used to run inline in the supervisor's select loop — the
+/// first member read awaited the descriptor commit itself — so on slow
+/// storage the first member read (and every control operation queued
+/// behind it in the loop) parked for the whole device delay. The read
+/// path now only SCHEDULES the publication (single flight, off the
+/// loop) and answers from committed state: the read returns inside its
+/// box while the publication pays the device delay, and the local node
+/// becomes visible once the scheduled publication lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_member_read_on_a_listenerless_node_survives_slow_storage() {
+  common::init_tracing();
+  const COMMIT_DELAY: Duration = Duration::from_secs(6);
+
+  let slow = Arc::new(DelayingFactory::new(Arc::new(MemoryStorageFactory::new(
+    common::required_capabilities(),
+  ))));
+  let node = start_over(
+    23,
+    Arc::clone(&slow) as Arc<dyn StorageFactory>,
+    NodeConfig::new(),
+    Arc::new(EchoCollector::default()),
+  )
+  .await;
+  // No listener ever binds, so the anti-entropy maintenance tick skips
+  // the descriptor ensure by design and the lazy publication is the
+  // read path's to schedule. The device is armed after the startup
+  // commits (identity provisioning) so the descriptor commit is the
+  // first one the read path would pay.
+  slow.set_commit_delay(COMMIT_DELAY);
+  let local = node.local_node().await.unwrap().node_id().clone();
+
+  // The discriminating read: under the pre-fix inline ensure this call
+  // awaited the six-second descriptor commit inside the supervisor's
+  // select loop and blew the box.
+  let started = Instant::now();
+  let first = tokio::time::timeout(
+    READ_BOX,
+    node.members().list(radiata::PageSpec::first(8).unwrap()),
+  )
+  .await
+  .expect("the first member read must not await the lazy descriptor commit")
+  .unwrap();
+  assert!(
+    started.elapsed() < READ_BOX,
+    "the first member read took {:?} while the descriptor commit paid the device delay",
+    started.elapsed()
+  );
+  assert!(
+    first.items().iter().all(|view| view.node_id() != &local),
+    "the read observes committed state only; the scheduled publication has not landed"
+  );
+
+  // The scheduled publication is still in flight (its commit pays the
+  // full delay): a second read stays a pure read of committed state.
+  let second = tokio::time::timeout(
+    READ_BOX,
+    node.members().list(radiata::PageSpec::first(8).unwrap()),
+  )
+  .await
+  .expect("a member read during the in-flight publication stays pure")
+  .unwrap();
+  assert!(second.items().iter().all(|view| view.node_id() != &local));
+
+  // The scheduled publication still lands: once the device pays the
+  // delay, the local node is visible at its first revision.
+  let deadline = Instant::now() + COMMIT_DELAY + Duration::from_secs(10);
+  loop {
+    let page = node
+      .members()
+      .list(radiata::PageSpec::first(8).unwrap())
+      .await
+      .unwrap();
+    if let Some(view) = page.items().iter().find(|view| view.node_id() == &local) {
+      assert_eq!(view.owner_revision(), 1);
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the scheduled descriptor publication never landed"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+
+  tokio::time::timeout(Duration::from_secs(30), node.shutdown())
+    .await
+    .expect("shutdown must not drain the slow device's queued commits")
+    .unwrap();
 }
