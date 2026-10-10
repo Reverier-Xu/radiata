@@ -13,7 +13,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use super::{ResourceName, ResourceRecordV1};
+use super::{ResourceName, ResourceRecordV1, ResourceVersion};
 /// The durable namespace holding one register per resource name.
 pub(crate) use crate::storage::families::RESOURCE_RECORD_NAMESPACE;
 use crate::{
@@ -40,10 +40,15 @@ pub(crate) enum ResourceCommitOutcome {
   /// The record is now the register's stored winner; the receipt proves
   /// the durable commit.
   Installed(#[allow(dead_code)] CommitReceipt),
-  /// A greater tuple already occupies the register: the write is accepted
-  /// but stores nothing and wins nothing (accepted writes may lose tuple
-  /// order; losers stay harmless). The payload names the stored winner;
-  /// production callers deliberately ignore it, tests read it.
+  /// The register refused the write and keeps its stored winner: either
+  /// a greater tuple already occupies it (an accepted write that stores
+  /// nothing and wins nothing — accepted writes may lose tuple order;
+  /// losers stay harmless), or a preconditioned commit found the stored
+  /// winner moved past the caller's observed version (only the
+  /// preconditioned case maps to the caller's typed version conflict; a
+  /// plain put loser stays an accepted write). The payload names
+  /// the stored winner; production callers deliberately ignore it,
+  /// tests read it.
   Superseded(#[allow(dead_code)] ResourceRecordV1),
   /// The commit ended indeterminate: the caller must reconcile the
   /// pending transaction identity before knowing whether old or new
@@ -76,22 +81,53 @@ pub(crate) async fn read_record_ctx(
 /// the record only when its tuple strictly wins over any stored winner.
 /// The whole record is one store value, so no outcome can expose partial
 /// labels, and every transaction id is freshly generated so digests are
-/// never reused.
+/// never reused. Production callers enter through
+/// [`commit_expected_record_ctx`] (with or without a precondition); this
+/// unconditional entry remains for the crate's test install helpers.
+#[cfg(test)]
 pub(crate) async fn commit_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
+) -> Result<ResourceCommitOutcome> {
+  commit_expected_record_ctx(store, entropy, record, None).await
+}
+
+/// The preconditioned commit for one signed resource record — the form
+/// every production writer enters (plain puts pass `None`): the caller's
+/// observed version (`expected`) is re-verified against the stored
+/// winner **inside the commit's own snapshot**, under the writer
+/// exclusion, so the precondition and the per-key CAS share one view of
+/// the register. The effect's pre-commit check is only an early bail —
+/// the asynchronous signature step between it and this commit (a slow
+/// KMS provider) is exactly the window where a concurrent writer could
+/// otherwise land a record the new write beats by tuple order, silently
+/// violating the caller's compare-and-swap. Here a register that moved
+/// past `expected` refuses the write (`Superseded`, surfaced by the
+/// effect as the caller's version conflict) instead of being
+/// overwritten; an empty register cannot match a named prior version
+/// and reports the same not-found the effect's pre-check does.
+pub(crate) async fn commit_expected_record_ctx(
+  store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
+  expected: Option<&ResourceVersion>,
 ) -> Result<ResourceCommitOutcome> {
   let _permit = store.write_permit().await;
   let namespace = namespace()?;
   let key = record_key(record.name());
-  // One snapshot view for both the tuple decision and the per-key CAS
-  // expectation, so a concurrent writer can only produce a typed conflict,
-  // never an unordered overwrite.
+  // One snapshot view for the caller's precondition, the tuple
+  // decision, and the per-key CAS expectation, so a concurrent writer
+  // can only produce a typed conflict, never an unordered overwrite.
   let snapshot = store.snapshot().await?;
   if let Some(existing) = snapshot.get(&namespace, &key).await? {
     let existing = ResourceRecordV1::decode(existing.as_bytes())?;
+    if let Some(expected) = expected
+      && !expected.matches_record(&existing)
+    {
+      return Ok(ResourceCommitOutcome::Superseded(existing));
+    }
     if !record.wins_over(&existing) {
       return Ok(ResourceCommitOutcome::Superseded(existing));
     }
+  } else if expected.is_some() {
+    return Err(Error::not_found("resource"));
   }
   commit_put_ctx(
     store,
@@ -299,7 +335,8 @@ mod tests {
   use ed25519_dalek::SigningKey;
 
   use super::{
-    ResourceCommitOutcome, ResourceName, ResourceRecordV1, commit_record_ctx, read_record_ctx,
+    ResourceCommitOutcome, ResourceName, ResourceRecordV1, ResourceVersion,
+    commit_expected_record_ctx, commit_record_ctx, commit_removal_ctx, read_record_ctx,
   };
   use crate::{
     LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy, provider::StorageFactory,
@@ -539,6 +576,104 @@ mod tests {
     ));
     let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
     assert!(stored.digest() == first.digest() || stored.digest() == second.digest());
+  }
+
+  /// Two preconditioned puts that both observed the same prior version
+  /// (the audit's race window: pre-check → asynchronous signature →
+  /// commit) resolve to exactly one install at the commit boundary: the
+  /// second commit re-verifies the caller's expected version inside its
+  /// own snapshot, refuses with the superseded outcome (which the effect
+  /// surfaces as the caller's version conflict), and never silently
+  /// overwrites the first winner even though its tuple would win.
+  #[tokio::test]
+  async fn raced_expected_puts_resolve_to_one_install_at_the_boundary() {
+    let (_factory, store) = open_store().await;
+    let observed = put(1_000, "file:///observed");
+    assert!(matches!(
+      commit_record_ctx(&store, &SystemEntropy, &observed)
+        .await
+        .unwrap(),
+      ResourceCommitOutcome::Installed(_)
+    ));
+    let expected = ResourceVersion::from_record(&observed);
+
+    // Both candidates claim the same observed version and the second's
+    // tuple would beat the first (a later stamp): only the commit-time
+    // precondition can stop the silent overwrite.
+    let first = put(2_000, "file:///first");
+    let second = put(3_000, "file:///second");
+    assert!(matches!(
+      commit_expected_record_ctx(&store, &SystemEntropy, &first, Some(&expected))
+        .await
+        .unwrap(),
+      ResourceCommitOutcome::Installed(_)
+    ));
+    match commit_expected_record_ctx(&store, &SystemEntropy, &second, Some(&expected))
+      .await
+      .unwrap()
+    {
+      ResourceCommitOutcome::Superseded(existing) => {
+        assert_eq!(existing.digest(), first.digest());
+      }
+      other => panic!("the raced preconditioned put must refuse, got {other:?}"),
+    }
+    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
+    assert_eq!(stored.digest(), first.digest());
+  }
+
+  /// A preconditioned put against an empty register fails closed at the
+  /// commit boundary with the same not-found the effect's pre-check
+  /// reports: a named prior version cannot match an absent register.
+  #[tokio::test]
+  async fn an_expected_put_on_an_empty_register_fails_closed() {
+    let (_factory, store) = open_store().await;
+    let expected = ResourceVersion::from_record(&put(1_000, "file:///gone"));
+    let error = commit_expected_record_ctx(
+      &store,
+      &SystemEntropy,
+      &put(2_000, "file:///candidate"),
+      Some(&expected),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::NotFound);
+    assert!(read_record_ctx(&store, &name()).await.unwrap().is_none());
+  }
+
+  /// The removal path re-checks its exact-version precondition inside
+  /// the commit's own snapshot: a record that landed after the effect's
+  /// observation (the same signature window) makes the removal refuse
+  /// with the superseded outcome instead of removing newer metadata.
+  #[tokio::test]
+  async fn a_raced_removal_keeps_the_newer_record() {
+    let (_factory, store) = open_store().await;
+    let observed = put(1_000, "file:///observed");
+    assert!(matches!(
+      commit_record_ctx(&store, &SystemEntropy, &observed)
+        .await
+        .unwrap(),
+      ResourceCommitOutcome::Installed(_)
+    ));
+    // The racing writer lands a newer record after the observation.
+    let moved = put(2_000, "file:///moved");
+    assert!(matches!(
+      commit_record_ctx(&store, &SystemEntropy, &moved)
+        .await
+        .unwrap(),
+      ResourceCommitOutcome::Installed(_)
+    ));
+    match commit_removal_ctx(&store, &SystemEntropy, &removal(3_000), &observed)
+      .await
+      .unwrap()
+    {
+      ResourceCommitOutcome::Superseded(existing) => {
+        assert_eq!(existing.digest(), moved.digest());
+      }
+      other => panic!("the raced removal must refuse, got {other:?}"),
+    }
+    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
+    assert!(!stored.removed());
+    assert_eq!(stored.digest(), moved.digest());
   }
 
   /// Both real backends preserve the exact logical tuple version of a
