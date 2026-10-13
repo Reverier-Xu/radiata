@@ -7,6 +7,32 @@
 
 约定：`状态` 取值 `raw`（仅登记）/ `confirmed`（已在当前代码中复核）/ `refuted`（复核后不成立）。
 
+## 修复状态总表
+
+| 条目 | 复核结论 | 状态 | 提交 |
+|---|---|---|---|
+| #3 SPKI pin 阻断换信道 | confirmed（部分） | 已修 | `4b0dc90` |
+| #5 keepalive 超时不可达 | confirmed | 已修 | `d6d25eb` |
+| #7 tombstone GC 头部截断 | confirmed（就地修正） | 已修 | `877ff1a` |
+| #8 inbound consumer JoinSet 不回收 | confirmed（就地修正） | 已修 | `5ef62a6` |
+| #12 redb commit 结果未知被当未提交 | confirmed | 已修 | `26e0caf` |
+| #13 内建 tag 解析冗余 | confirmed | 已修 | `9a4d79b` |
+| #14 冻结 registry 仍用可变锁 | confirmed（定位更正） | 已修 | `c47fb6e` |
+| #18 超大帧无限等待 | confirmed | 已修 | `8bbf0c2` |
+| #19 拨号未纳入 shutdown 所有权 | confirmed（部分） | 已修 | `df4328c` |
+| #1 分区不自动重连 | refuted（所述场景） | 不改；残留边界待决策 | — |
+| #2 fan-out 固定前缀 | refuted | 不改 | — |
+| #4 显式网络命令阻塞 supervisor | refuted | 不改 | — |
+| #6 只用第一个端点 | refuted | 不改 | — |
+| #9 取消绕过 consumer drain | refuted | 不改 | — |
+| #10 watermark 修复不触发 | refuted（结构上已不存在） | 不改 | — |
+| #11 条件 Put 的 expected 非事务 | refuted | 不改 | — |
+| #15 分支切换未同步 retry 副本 | refuted | 不改 | — |
+| #16 取消 recv 永久关闭订阅 | refuted | 不改 | — |
+| #17 被取消 commit 仍在后台 | refuted | 不改 | — |
+
+---
+
 ---
 
 ## 1. 内部联通的分区无法自动重连
