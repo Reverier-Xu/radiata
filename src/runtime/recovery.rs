@@ -351,11 +351,11 @@ impl TickState {
       let Some(endpoint) = recovery_endpoint(endpoints, step.attempt) else {
         continue;
       };
-      // Recovery dials run in a detached task so the supervisor select
-      // loop never blocks on a handshake (each holds its in-flight
-      // slot no longer than the configured dial deadline plus the
-      // authentication deadline); the result is reconciled by the next
-      // observation tick.
+      // Recovery dials run in their own task so the tick worker never
+      // blocks on a handshake (each holds its in-flight slot no longer
+      // than the configured dial deadline plus the authentication
+      // deadline); the result is reconciled by the next observation
+      // tick.
       self
         .recovery_pending
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -368,8 +368,8 @@ impl TickState {
       let pending = Arc::clone(&self.recovery_pending);
       let transport = match self.extensions.resolve_transport(&endpoint.selector()) {
         Ok(transport) => transport,
-        // No transport for the endpoint: the detached dial fails and
-        // releases its in-flight slot through the normal error path.
+        // No transport for the endpoint: the dial fails and releases
+        // its in-flight slot through the normal error path.
         Err(error) => {
           let _ = self
             .recovery_pending
@@ -379,7 +379,7 @@ impl TickState {
         }
       };
       let dial_deadline = self.config.dial_deadline();
-      tokio::spawn(async move {
+      let dial = tokio::spawn(async move {
         if let Err(error) = dial_member(
           transport,
           driver,
@@ -407,6 +407,15 @@ impl TickState {
         // in-flight dials, not lifetime volume).
         pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
       });
+      // The dial's JoinHandle joins the tracked connection-task set the
+      // recovery tick reaps and the shutdown path aborts and awaits
+      // (audit finding #19): a dropped handle would leave an in-flight
+      // handshake unowned — shutdown would neither cancel it nor wait
+      // for it, so a lingering dial would keep holding this
+      // incarnation's store and session Arcs across a restart.
+      if let Ok(mut handles) = self.connection_tasks.lock() {
+        handles.push(dial);
+      }
     }
     Ok(())
   }
@@ -572,7 +581,7 @@ mod tests {
       CommitOutcome, ReconcileOutcome, Storage, StorageFactory, StoreCapabilities,
       StoreRequirements, StoreSnapshot, StoreTransaction,
     },
-    runtime::supervisor::test_support::supervisor_over,
+    runtime::supervisor::test_support::{member_id, member_key, supervisor_over},
   };
 
   fn endpoint(port: u16) -> Endpoint {
@@ -739,5 +748,251 @@ mod tests {
     );
 
     worker.abort();
+  }
+
+  /// A silent peer that reports BOTH acceptance and close: it accepts
+  /// every connection, swallows the client's bytes without ever
+  /// answering (a wss dial parks in the TLS handshake until its
+  /// deadline), and counts the connection closed the moment the dial
+  /// side drops the socket. The close count is the observable the
+  /// shutdown-ordering assertion needs: an aborted dial drops its
+  /// transport immediately, while a dial nobody owns holds it until
+  /// the deadline.
+  async fn closing_silent_peer() -> (
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+  ) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (peer_accepted, peer_closed) = (Arc::clone(&accepted), Arc::clone(&closed));
+    let handle = tokio::spawn(async move {
+      let mut readers = tokio::task::JoinSet::new();
+      while let Ok((stream, _)) = listener.accept().await {
+        peer_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let closed = Arc::clone(&peer_closed);
+        readers.spawn(async move {
+          let mut stream = stream;
+          let mut sink = [0_u8; 256];
+          // Swallow every byte and never answer: the client's handshake
+          // waits forever, and the first EOF or error marks the dial
+          // side gone.
+          loop {
+            match stream.read(&mut sink).await {
+              Ok(0) | Err(_) => break,
+              Ok(_) => {}
+            }
+          }
+          closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+      }
+    });
+    (port, accepted, closed, handle)
+  }
+
+  /// Installs one dialable member (descriptor plus trusted binding)
+  /// straight into the reference factory's state — the same pair
+  /// `test_support::install_member` lays through the supervisor's store,
+  /// injected here before the runtime opens the factory: the real
+  /// supervision path owns the store from `spawn_runtime` on, and the
+  /// reference factory refuses a second open while the node holds it.
+  fn install_dialable_member(
+    reference: &Arc<crate::storage::contract::ReferenceFactory>, seed: u64, port: u16,
+  ) {
+    let node = member_id(seed);
+    let endpoint = Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap();
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      node.clone(),
+      member_key(seed),
+      vec![endpoint],
+      1,
+      false,
+      1,
+    );
+    let namespace =
+      crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
+        .unwrap();
+    let key = crate::StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()));
+    crate::identity::testing::inject_entry(
+      reference,
+      (namespace, key),
+      descriptor.encode().unwrap(),
+    );
+    let (binding_namespace, binding_key) =
+      crate::identity::records::identity_binding_key(&node).unwrap();
+    let binding = crate::identity::records::IdentityBindingV1::new(node, member_key(seed));
+    crate::identity::testing::inject_entry(
+      reference,
+      (binding_namespace, binding_key),
+      binding.encode().unwrap(),
+    );
+  }
+
+  /// Boots a node through the REAL supervision path — `spawn_runtime` →
+  /// `supervise`, the same construction `NodeBuilder::start` performs —
+  /// and hands the test the tracked connection-task registry the
+  /// shutdown path drains, so the test observes exactly the handles
+  /// `into_dependencies` aborts and `finish_shutdown` awaits.
+  async fn supervised_runtime(
+    reference: Arc<crate::storage::contract::ReferenceFactory>, config: NodeConfig,
+  ) -> (
+    crate::runtime::RuntimeClient,
+    Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+  ) {
+    let keys = crate::identity::testing::ScriptedKeys::full();
+    let entropy: Arc<dyn crate::api::Entropy> =
+      Arc::new(crate::identity::testing::SequenceEntropy::default());
+    let mut extensions = crate::extension_registry::ExtensionRegistry::new();
+    for (tag, transport) in [
+      (
+        crate::transport::registry::builtin_transport_tag(crate::TransportScheme::Tls).unwrap(),
+        Arc::new(crate::transport::tls_transport::TlsTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+      (
+        crate::transport::registry::builtin_transport_tag(crate::TransportScheme::Wss).unwrap(),
+        Arc::new(crate::transport::wss::WssTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+      (
+        crate::transport::registry::builtin_transport_tag(crate::TransportScheme::Tcp).unwrap(),
+        Arc::new(crate::transport::plain::PlainTransport::new())
+          as Arc<dyn crate::transport::registry::Transport>,
+      ),
+    ] {
+      extensions
+        .register_builtin_transport(tag, transport)
+        .unwrap();
+    }
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let (round_tx, round_rx) =
+      tokio::sync::mpsc::channel(crate::runtime::SYNC_ROUND_CHANNEL_CAPACITY);
+    let (packet_tx, packet_rx) =
+      tokio::sync::mpsc::channel(crate::runtime::PACKET_CHANNEL_CAPACITY);
+    let connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+      Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = crate::runtime::spawn_runtime(
+      crate::runtime::RuntimeDependencies {
+        storage_factory: reference as Arc<dyn crate::provider::StorageFactory>,
+        context: None,
+        keys: Some(keys.as_provider()),
+        config,
+        entropy,
+        extensions: Arc::new(extensions),
+        sessions: Default::default(),
+        routes: Default::default(),
+        events: Arc::new(crate::node::EventHub::new()),
+        member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
+        leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
+        reconcile: None,
+        sync_round_requests: round_tx,
+        connection_tasks: Arc::clone(&connection_tasks),
+        listeners: Default::default(),
+        task_manager: None,
+        operations: None,
+        runtime_seed: None,
+      },
+      (packet_tx, packet_rx),
+      round_rx,
+    )
+    .await
+    .unwrap();
+    (client, connection_tasks)
+  }
+
+  /// Audit finding #19: a recovery dial is a spawned task whose
+  /// JoinHandle must be registered in the tracked connection-task set,
+  /// or shutdown neither cancels nor awaits it. This drives the real
+  /// shutdown path end to end: the node's recovery worker dials a
+  /// member whose endpoint parks in the TLS handshake against a silent
+  /// peer (a 30s dial deadline holds it there), then
+  /// `RuntimeClient::shutdown` — control message → `into_dependencies`
+  /// → `finish_shutdown` → reply — must (a) resolve far inside that
+  /// deadline because the dial is aborted, and (b) leave the dial task
+  /// finished by then: `finish_shutdown` awaits every drained handle
+  /// before the reply resolves, so the dial's transport drops with it
+  /// and the silent peer observes the connection close with the reply.
+  /// A detached dial (the finding's shape) holds the socket until the
+  /// deadline: the registration poll and the close poll both time out.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn shutdown_aborts_and_awaits_an_in_flight_recovery_dial() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    // A dial deadline far beyond every box below — a parked dial must be
+    // observable as parked, not as briefly slow — and a fan-out of one,
+    // so exactly one dial is ever in flight for the one member.
+    let config = NodeConfig::new()
+      .with_dial_deadline(std::time::Duration::from_secs(30))
+      .unwrap()
+      .with_recovery_policy(
+        crate::RecoveryConfig::new(
+          1,
+          std::time::Duration::from_secs(1),
+          std::time::Duration::from_secs(2),
+        )
+        .unwrap(),
+      )
+      .unwrap();
+    let (port, accepted, closed, holder) = closing_silent_peer().await;
+    install_dialable_member(&reference, 101, port);
+
+    let (client, connection_tasks) = supervised_runtime(reference, config).await;
+
+    // The recovery worker's first tick fires immediately and dials the
+    // only member: the peer accepts the connection and the dial parks
+    // in the TLS handshake for its 30s deadline.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+      loop {
+        if accepted.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the recovery tick must dial the silent member");
+
+    // The parked dial's JoinHandle must sit in the tracked set the
+    // shutdown path drains — an empty set is the finding's detached
+    // shape.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      loop {
+        if !connection_tasks.lock().unwrap().is_empty() {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the recovery dial must register its JoinHandle");
+
+    // (a) The shutdown reply resolves far inside the parked dial's
+    // deadline: the dial is aborted with the node, not awaited alive.
+    tokio::time::timeout(std::time::Duration::from_secs(5), client.shutdown())
+      .await
+      .expect("shutdown must not wait out the parked dial's deadline")
+      .expect("the shutdown reply must resolve");
+
+    // (b) The dial task was aborted and awaited BEFORE the reply
+    // resolved (finish_shutdown awaits every drained handle first), so
+    // its transport is gone and the silent peer sees the connection
+    // close immediately — the box only tolerates the peer-side read
+    // wakeup, never a lingering dial.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+      loop {
+        if closed.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the parked dial must close with the shutdown reply");
+    holder.abort();
   }
 }

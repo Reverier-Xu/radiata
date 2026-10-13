@@ -78,7 +78,7 @@ pub(super) async fn run_maintenance_worker(state: Arc<TickState>) {
 impl TickState {
   /// One maintenance tick: recompute the degree plan from the active
   /// member universe and the live session table, and dial the deficit
-  /// in detached tasks (each bounded by the configured dial deadline
+  /// in tracked tasks (each bounded by the configured dial deadline
   /// plus the authentication deadline, reconciled by the next tick).
   /// A skipped or failed dial simply waits for the next tick — the
   /// plane is best-effort by contract.
@@ -154,9 +154,9 @@ impl TickState {
     Ok(())
   }
 
-  /// Spawns one detached maintenance dial: the maintenance worker never
-  /// blocks on a handshake, and the in-flight slot releases when the
-  /// dial resolves (success, refusal, or deadline).
+  /// Spawns one maintenance dial in its own task: the maintenance
+  /// worker never blocks on a handshake, and the in-flight slot releases
+  /// when the dial resolves (success, refusal, or deadline).
   fn spawn_maintenance_dial(&self, peer: NodeId, receiver: crate::Endpoint) {
     let transport = match self.extensions.resolve_transport(&receiver.selector()) {
       Ok(transport) => transport,
@@ -181,7 +181,7 @@ impl TickState {
     let packet = self.packet.clone();
     let shutdown = self.shutdown.clone();
     let dial_deadline = self.config.dial_deadline();
-    tokio::spawn(async move {
+    let dial = tokio::spawn(async move {
       if let Err(error) = dial_member(
         transport,
         driver,
@@ -205,6 +205,14 @@ impl TickState {
       }
       pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
+    // The maintenance dial's JoinHandle joins the same tracked
+    // connection-task set as the recovery dials (audit finding #19): the
+    // recovery tick reaps finished handles and the shutdown path aborts
+    // and awaits the rest, so an in-flight maintenance handshake is
+    // owned and torn down with the node instead of outliving it.
+    if let Ok(mut handles) = self.connection_tasks.lock() {
+      handles.push(dial);
+    }
   }
 }
 
