@@ -514,6 +514,39 @@ mod tests {
   }
 
   #[test]
+  fn builder_seeded_registry_resolves_builtin_tags_and_transports() {
+    // Mirrors the node builder's seeding loop: every built-in registers
+    // under its canonical `builtin_transport_tag` tag, and a later
+    // lookup by selector resolves the identical registered transport.
+    let mut registry = ExtensionRegistry::new();
+    for (scheme, transport) in [
+      (
+        TransportScheme::Tls,
+        Arc::new(TlsTransport::new()) as Arc<dyn Transport>,
+      ),
+      (
+        TransportScheme::Wss,
+        Arc::new(WssTransport::new()) as Arc<dyn Transport>,
+      ),
+      (
+        TransportScheme::Tcp,
+        Arc::new(super::super::plain::PlainTransport::new()) as Arc<dyn Transport>,
+      ),
+    ] {
+      let tag = builtin_transport_tag(scheme).unwrap();
+      if registry.transport(&tag).is_none() {
+        registry
+          .register_builtin_transport(tag, Arc::clone(&transport))
+          .unwrap();
+      }
+      let resolved = registry
+        .resolve_transport(&TransportSelector::Builtin(scheme))
+        .unwrap();
+      assert!(Arc::ptr_eq(&resolved, &transport));
+    }
+  }
+
+  #[test]
   fn selector_resolution_merges_builtins_and_customs() {
     let mut registry = ExtensionRegistry::new();
     for scheme in TransportScheme::ALL {

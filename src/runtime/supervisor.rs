@@ -1348,7 +1348,7 @@ pub(crate) mod test_support {
 
   use super::{RuntimeDependencies, Supervisor, node_offer};
   use crate::{
-    NodeConfig,
+    NodeConfig, TransportScheme,
     extension_registry::ExtensionRegistry,
     identity::{
       lifecycle::open_local_identity,
@@ -1358,6 +1358,7 @@ pub(crate) mod test_support {
     provider::StorageFactory,
     session::stream::SessionTable,
     storage::contract::{ReferenceFactory, required_capabilities},
+    transport::registry::builtin_transport_tag,
   };
 
   /// Builds a supervisor over a fresh in-memory identity opened through
@@ -1383,17 +1384,17 @@ pub(crate) mod test_support {
     // resolve the members' wss endpoints through this registry.
     for (tag, transport) in [
       (
-        crate::transport::tls_transport::TlsTransport::tag().unwrap(),
+        builtin_transport_tag(TransportScheme::Tls).unwrap(),
         Arc::new(crate::transport::tls_transport::TlsTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),
       (
-        crate::transport::wss::WssTransport::tag().unwrap(),
+        builtin_transport_tag(TransportScheme::Wss).unwrap(),
         Arc::new(crate::transport::wss::WssTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),
       (
-        crate::transport::plain::PlainTransport::tag().unwrap(),
+        builtin_transport_tag(TransportScheme::Tcp).unwrap(),
         Arc::new(crate::transport::plain::PlainTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),
