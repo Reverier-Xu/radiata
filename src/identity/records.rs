@@ -264,6 +264,36 @@ pub(crate) fn scan_decoded_records<'a, T>(
 ) -> BoxFuture<'a, Result<Vec<T>>>
 where
   T: Send + 'a, {
+  scan_records(store, namespace, cap, skip, decode, |_| true)
+}
+
+/// The tombstone-GC twin of [`scan_decoded_records`]: the cap counts
+/// only records stamped at or before `watermark` (through `stamp`), so a
+/// record over the watermark never consumes budget and the collectible
+/// tail behind a fresh head of a family is still reached — a scanned-
+/// records cap would study the same over-window prefix every pass and
+/// never consider it. Returns exactly the collectible records.
+pub(crate) fn scan_collectible_records<'a, T>(
+  store: &'a MetadataStore, namespace: StoreNamespace, watermark: u64, cap: usize,
+  skip: fn(&StoreKey) -> bool, decode: fn(&[u8]) -> Result<T>, stamp: fn(&T) -> u64,
+) -> BoxFuture<'a, Result<Vec<T>>>
+where
+  T: Send + 'a, {
+  scan_records(store, namespace, cap, skip, decode, move |record| {
+    stamp(record) <= watermark
+  })
+}
+
+/// The ordered scan core the known-records and tombstone-GC scans share:
+/// decode through `decode`, skip keys `skip` excludes, drop records
+/// `admit` rejects, and stop after `cap` admitted records.
+fn scan_records<'a, T, F>(
+  store: &'a MetadataStore, namespace: StoreNamespace, cap: usize, skip: fn(&StoreKey) -> bool,
+  decode: fn(&[u8]) -> Result<T>, admit: F,
+) -> BoxFuture<'a, Result<Vec<T>>>
+where
+  T: Send + 'a,
+  F: Fn(&T) -> bool + Send + 'a, {
   Box::pin(async move {
     let snapshot = store.snapshot().await?;
     let mut scan = snapshot.scan(&namespace, &[]).await?;
@@ -272,7 +302,11 @@ where
       if skip(entry.key()) {
         continue;
       }
-      records.push(decode(entry.value().as_bytes())?);
+      let record = decode(entry.value().as_bytes())?;
+      if !admit(&record) {
+        continue;
+      }
+      records.push(record);
       if records.len() >= cap {
         break;
       }
@@ -322,7 +356,9 @@ pub(crate) fn collect_subjects<T>(
 
 /// The bounded per-pass tombstone GC batch shared by the leave and
 /// cleanup sweeps: one pass deletes at most this many collected
-/// tombstones; the next sync round continues.
+/// tombstones, and only records stamped at or before the watermark count
+/// toward the bound (the GC scans admit over-window records without
+/// budget); the next sync round continues.
 pub(crate) const TOMBSTONE_GC_BATCH: usize = 64;
 
 /// The shared checkpoint sweep body: conditional exact-digest deletes of
