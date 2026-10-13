@@ -20,7 +20,7 @@
 | #14 冻结 registry 仍用可变锁 | confirmed（定位更正） | 已修 | `c47fb6e` |
 | #18 超大帧无限等待 | confirmed | 已修 | `8bbf0c2` |
 | #19 拨号未纳入 shutdown 所有权 | confirmed（部分） | 已修 | `df4328c` |
-| #1 分区不自动重连 | refuted（所述场景） | 不改；残留边界待决策 | — |
+| #1 分区不自动重连 | refuted（所述场景）+ 残留边界已修 | 已修（跨区桥接探测） | `8e897f1` |
 | #2 fan-out 固定前缀 | refuted | 不改 | — |
 | #4 显式网络命令阻塞 supervisor | refuted | 不改 | — |
 | #6 只用第一个端点 | refuted | 不改 | — |
@@ -38,7 +38,7 @@
 ## 1. 内部联通的分区无法自动重连
 
 - 状态：**refuted（就所述场景）** — 恢复控制器确实在"任一路由"满足后静默（`src/membership/recovery.rs:129-165`），但**已有预算的周期探测**：连接度维护面 `src/runtime/degree.rs:38-40`（30s tick）+ `degree_plan`/`select_degree_dials`。n=4 时 k(4)=3，每节点 1 session → `dial_budget=2`，首个 tick 即拨向另一分区。已有验收：`tests/connection_degree.rs`、`tests/transport_chaos.rs:1068-1107`。
-- 残留边界（设计缺口，非本条所述缺陷）：当两个子分区各自已达 k(n)（如两个内部 8-mesh）或配置 `connection_degree(1)` 时 `dial_budget=0`，跨区永不重建。详见 `docs/recon/membership-recovery.md`；修复与否列为待决策项。
+- **残留边界已修复**（`8e897f1`）：当两个子分区各自已达 k(n)、`dial_budget=0` 时，度维护面新增低频跨区桥接探测（`BRIDGE_PROBE_INTERVAL_TICKS=10` ≈ 5 分钟，`BRIDGE_PROBE_SLACK=1`），仅对 Healthy 且低于 `target+slack` 且有未连接成员的节点发起单条随机拨号；探测边为 caller-class，稀疏剪边不会剪断。测试：`bridge_probe_dials_a_cross_partition_member_within_two_intervals`、`a_fully_connected_healthy_node_never_probes`。详见 `docs/recon/membership-recovery.md`。
 - 现象
 - 期望：加入**有预算的周期性探测**，与现有的稀疏剪边（sparse edge trimming）算法结合，使分区能够自动重建跨分区的边。
 - 初始定位：`src/membership.rs`、`src/membership/degree.rs`、`src/membership/recovery.rs`、`src/runtime/recovery.rs`、`src/runtime/supervisor.rs`、`src/config.rs`

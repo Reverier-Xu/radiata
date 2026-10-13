@@ -50,14 +50,27 @@
 | F3 | #12 redb commit 不可知结果 | `26e0caf` |
 | F9 | #19 拨号任务所有权 | `df4328c` |
 | F4 | #3 SPKI 按目标 keying | `4b0dc90` |
+| F10 | #1 残留边界：跨区桥接探测 | `8e897f1` |
+| F11 | 基线 verify-tls-transport 门禁（eprintln→tracing） | `553e949` |
 
 终态门禁：`taplo fmt --check`、`cargo +nightly fmt --all -- --check`、`cargo check/clippy --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked`（含 doctest）全部通过。相关 `scripts/verify-*.sh`（membership-recovery、reconnect、transport-registry、session-stream-liveness、revocation、cleanup、leave-rotation、redb-integrity、storage-runtime、packet-forwarding、node-lifecycle、sync-budget）全部通过。
 
-**唯一未绿**：`scripts/verify-tls-transport.sh` —— 其 `secure_join` 测试 18/18 通过，但脚本会扫描整个 `src/` 拒绝 `eprintln!/println!`，而 `src/reconcile/budget.rs:708,719` 的**测量型测试**存在两条 `eprintln!`。该违规在基线 `cb831f4` 已存在（来自提交 `e3891de`），非本轮改动引入，需决定如何处置（见下）。
+**唯一未绿**（已修复）：`scripts/verify-tls-transport.sh` 因基线既有的 `src/reconcile/budget.rs` 测量型测试 `eprintln!` 失败；已按决定改为 `tracing::info!`（`553e949`），现 PASS。
+
+## fuzz 与 chaos 全量模拟（均已在终态树上通过）
+
+- `scripts/verify-decoder-fuzz.sh` → **PASS**（wire_decode / reconcile_decode / persisted_decode / selector，各 5 分钟预算）
+- `scripts/verify-state-fuzz.sh` → **PASS**（admission / feature_selection / routing，各 5 分钟预算）
+- `scripts/verify-simulator.sh` → **PASS**（含 ignored `simulation_network_fault_matrix_gate`）
+- `scripts/verify-simulation-artifacts.sh` → **PASS**
+- `scripts/verify-soak.sh` → **PASS**（90s churn + baseline 回退）
+- `scripts/verify-crash-matrix.sh` → **PASS**
+- `cargo test --workspace --all-features --locked` → EXIT=0，34 个 suite 全 ok
 
 ## 待决策 / 超出本轮
 
 - **#1 残留边界**：两个子分区各自已达 `k(n)`（或 `connection_degree(1)`）时 `dial_budget=0`，跨区永不重建。属设计缺口，非本条所述 4 节点场景。是否需要低频跨区桥接探测，待确认。
 - **#10 guard test**（可选）：为 reconcile plane 的 unknown-writer 修复路径补一个守护测试。
-- **基线既有门禁失败**：`scripts/verify-tls-transport.sh` 因 `src/reconcile/budget.rs:708,719` 的两条测量型测试 `eprintln!` 失败。AGENTS.md 明确禁止 `println!/eprintln!`，但这两条在基线就存在。选项：(a) 把测试输出改为 `tracing`（跨测试可见性可能变差）；(b) 将测量型报告改为写入 `target/` 文件；(c) 在脚本的扫描中排除测量型测试。待确认。
+- **基线既有门禁失败**（已修复）：见上，`553e949`。
+- **#1 残留边界**（已修复）：`8e897f1` 度维护面低频跨区桥接探测。
 - 侦察中发现的相邻问题（不在本 19 条内，暂不修）：member-mode session pump 未纳入 `connection_tasks`；plane prune 把 unknown-writer 跳过行当 superseded；`decode_revision` 错误分类；recovery in-flight 计数可短暂超 `fan_out`；若干文档/注释冗余。
