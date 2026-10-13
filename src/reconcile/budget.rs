@@ -705,7 +705,7 @@ fn sync_budget_matrix_payload_redundancy_and_hint_traffic() {
   );
   // The lane's own measurement record: one line per run, matching the
   // benchmark lanes' reporting convention.
-  eprintln!("sync budget matrix: {report}");
+  tracing::info!(report = %report, "sync budget matrix");
 }
 
 /// The loss matrix: under a deterministic 20% drop the full trigger
@@ -716,8 +716,12 @@ fn sync_budget_matrix_payload_redundancy_and_hint_traffic() {
 fn sync_budget_loss_convergence_not_worse_than_baseline() {
   for (nodes, batch) in [(8_usize, 4_usize), (64, 16)] {
     let (full, baseline) = loss_cell(nodes, batch);
-    eprintln!(
-      "sync budget loss cell n={nodes} batch={batch}: full={full} ticks baseline={baseline} ticks"
+    tracing::info!(
+      nodes,
+      batch,
+      full,
+      baseline,
+      "sync budget loss cell: full and baseline ticks"
     );
     assert!(
       full <= baseline,
