@@ -193,8 +193,12 @@ async fn redb_adapter_reconcile_waits_for_a_detached_landing_before_judging() {
     let storage = Arc::clone(&storage);
     async move { storage.commit(transaction).await }
   });
+  // Wait until THIS transaction holds the landing: the hold-reached
+  // record names the held transaction, so a concurrent test's commit
+  // arriving at the armed hold first cannot satisfy the wait and let
+  // the abort below land before this commit is even in flight.
   tokio::time::timeout(std::time::Duration::from_secs(5), async {
-    while !crate::storage::redb::store::landing_hold_reached() {
+    while !crate::storage::redb::store::landing_hold_reached_by(&id) {
       tokio::task::yield_now().await;
     }
   })
@@ -405,4 +409,129 @@ async fn redb_adapter_transaction_digest_conflicts_fail_closed() {
       .unwrap(),
     crate::ReconcileOutcome::Committed(_)
   ));
+}
+
+/// A final `write.commit()` failing with an outcome-unknown error — an
+/// I/O failure during the durable write-out, or the sticky `PreviousIo`
+/// aftermath of a prior one — must surface as `CommitOutcome::Unknown`
+/// and freeze the metadata store on reconcile evidence (audit finding
+/// #12): never as a definite-abort error that unfreezes the store and
+/// lets a fresh retry proceed while the durable state may already hold
+/// the "failed" write. The injected fault skips the real commit, so
+/// reconcile later proves the transaction aborted.
+#[tokio::test]
+async fn redb_adapter_outcome_unknown_commit_failure_freezes_the_store() {
+  let directory = TempDir::new().unwrap();
+  let factory = factory(&directory);
+  let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(30))
+    .await
+    .unwrap();
+  let namespace = crate::storage::test_util::namespace("redb-commit-unknown");
+
+  async fn put(
+    store: &crate::storage::MetadataStore, namespace: &crate::StoreNamespace, id: u64,
+    key: &'static [u8],
+  ) -> crate::storage::receipt::PreparedTransaction {
+    let base = store.snapshot().await.unwrap().revision().clone();
+    crate::storage::receipt::prepare_internal_transaction(
+      crate::storage::test_util::transaction_id(id),
+      base,
+      vec![StoreOperation::Put {
+        namespace: namespace.clone(),
+        key: crate::storage::test_util::key(key),
+        expected: StoreExpectation::Absent,
+        value: crate::storage::test_util::value(b"maybe-landed"),
+      }],
+    )
+    .unwrap()
+  }
+
+  // An I/O failure during the durable write-out leaves the outcome
+  // indeterminate: the commit surfaces Unknown and the store freezes.
+  let first = put(&store, &namespace, 9001, b"io-failure").await;
+  crate::storage::redb::store::arm_commit_failure(
+    first.id().clone(),
+    redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
+      "injected durable write-out failure",
+    ))),
+  );
+  assert!(matches!(
+    store.commit(first).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  assert!(
+    store.is_blocked().unwrap(),
+    "an outcome-unknown commit failure must leave the store frozen (reconcile-pending), not Ready"
+  );
+  // Durable evidence settles the in-doubt transaction: nothing landed
+  // (the fault skipped the real commit), the verdict is Aborted, and
+  // only then does the store return to Ready.
+  assert!(matches!(
+    store.reconcile().await.unwrap(),
+    crate::ReconcileOutcome::Aborted
+  ));
+  assert!(!store.is_blocked().unwrap());
+  let snapshot = store.snapshot().await.unwrap();
+  assert!(
+    snapshot
+      .get(&namespace, &crate::storage::test_util::key(b"io-failure"))
+      .await
+      .unwrap()
+      .is_none()
+  );
+  drop(snapshot);
+
+  // The sticky PreviousIo aftermath of a prior I/O failure classifies
+  // the same way.
+  let second = put(&store, &namespace, 9002, b"previous-io").await;
+  crate::storage::redb::store::arm_commit_failure(
+    second.id().clone(),
+    redb::CommitError::Storage(redb::StorageError::PreviousIo),
+  );
+  assert!(matches!(
+    store.commit(second).await.unwrap(),
+    CommitOutcome::Unknown { .. }
+  ));
+  assert!(store.is_blocked().unwrap());
+  assert!(matches!(
+    store.reconcile().await.unwrap(),
+    crate::ReconcileOutcome::Aborted
+  ));
+  assert!(!store.is_blocked().unwrap());
+}
+
+/// A definite-abort commit failure — here a poisoned transaction —
+/// must stay a definite abort (the narrow boundary of audit finding
+/// #12): the metadata store unfreezes and returns to Ready instead of
+/// blocking on reconcile evidence.
+#[tokio::test]
+async fn redb_adapter_definite_abort_commit_failure_returns_to_ready() {
+  let directory = TempDir::new().unwrap();
+  let factory = factory(&directory);
+  let store = crate::storage::MetadataStore::open(&factory, std::time::Duration::from_secs(30))
+    .await
+    .unwrap();
+  let namespace = crate::storage::test_util::namespace("redb-commit-definite");
+  let base = store.snapshot().await.unwrap().revision().clone();
+  let prepared = crate::storage::receipt::prepare_internal_transaction(
+    crate::storage::test_util::transaction_id(9003),
+    base,
+    vec![StoreOperation::Put {
+      namespace: namespace.clone(),
+      key: crate::storage::test_util::key(b"definitely-aborted"),
+      expected: StoreExpectation::Absent,
+      value: crate::storage::test_util::value(b"never-lands"),
+    }],
+  )
+  .unwrap();
+  crate::storage::redb::store::arm_commit_failure(
+    prepared.id().clone(),
+    redb::CommitError::TransactionPoisoned,
+  );
+  let error = store.commit(prepared).await.unwrap_err();
+  assert_ne!(error.kind(), ErrorKind::CommitUnknown);
+  assert!(
+    !store.is_blocked().unwrap(),
+    "a definite-abort commit failure must unfreeze the store"
+  );
 }
