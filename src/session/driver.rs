@@ -48,6 +48,7 @@ use crate::{
   },
   provider::KeyProvider,
   transport::{
+    Endpoint,
     connection::{Connection, Message},
     framing::MergeHint,
   },
@@ -105,16 +106,45 @@ fn established(handshake: &Handshake) -> Result<EstablishedSession> {
 
 /// The shared node context every session driver run needs.
 /// The in-memory leaf certificate SPKI anchors learned during a join,
-/// keyed by peer node. Member-mode reconnects pin the peer's TLS leaf to
-/// this anchor, so a reconnect to the same listener cannot be replayed
-/// against a different certificate. Anchors are process-local by design:
-/// a fresh process re-joins before it reconnects as a member. When a
-/// peer legitimately re-issues its ephemeral leaf (same durable identity,
-/// new certificate), a successful merge-trust fallback dial re-records
-/// the presented leaf as the new anchor (audit 2026-10-09 item 8) — the
-/// application identity proof, not the pin, is the authority.
+/// keyed by (peer node, concrete dial endpoint). Each listener of a
+/// node binds its own ephemeral leaf, so the anchor is scoped to one
+/// scheme-and-address target: a reconnect to the SAME target pins the
+/// peer's TLS leaf to it, while a dial to any other listener of the
+/// same node — another scheme (tls after wss or the reverse), a second
+/// listener of the same scheme, or a rebound address — has no anchor
+/// and dials under merge trust, where the member handshake's identity
+/// proof is the authenticator. Keying by the node alone would make
+/// every such legitimate channel change pay one failed TLS handshake
+/// before the merge-trust fallback rescued it (audit 2026-10-09 item
+/// 3). Anchors are process-local by design: a fresh process re-joins
+/// before it reconnects as a member. When a peer legitimately re-issues
+/// its ephemeral leaf on the same target (same durable identity, new
+/// certificate), a successful merge-trust fallback dial re-records the
+/// presented leaf as that target's new anchor (audit 2026-10-09 item 8)
+/// — the application identity proof, not the pin, is the authority.
 #[derive(Default)]
-struct MemberSpkiTable(std::sync::Mutex<std::collections::BTreeMap<NodeId, Vec<u8>>>);
+struct MemberSpkiTable(std::sync::Mutex<std::collections::BTreeMap<(NodeId, Endpoint), Vec<u8>>>);
+
+impl MemberSpkiTable {
+  /// Records the peer's leaf SPKI as the member-mode trust anchor for
+  /// one concrete dial target. The latest record wins per target.
+  fn record(&self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
+    if let Ok(mut anchors) = self.0.lock() {
+      anchors.insert((peer.clone(), target.clone()), spki);
+    }
+  }
+
+  /// The recorded leaf SPKI anchor for `peer` at `target`, when this
+  /// process joined or pinned that exact endpoint. Every other endpoint
+  /// of the same node reports no anchor and dials under merge trust.
+  fn anchor(&self, peer: &NodeId, target: &Endpoint) -> Option<Vec<u8>> {
+    self
+      .0
+      .lock()
+      .ok()
+      .and_then(|anchors| anchors.get(&(peer.clone(), target.clone())).cloned())
+  }
+}
 
 #[derive(Clone)]
 pub(crate) struct SessionDriver {
@@ -158,25 +188,21 @@ impl SessionDriver {
     &self.issuer
   }
 
-  /// Records the peer's leaf SPKI as the member-mode trust anchor,
-  /// observed at a successful join or after a rollover fallback dial
-  /// authenticated the peer at the application proof layer. The latest
-  /// record wins: a re-issued certificate replaces the stale anchor
-  /// in-process (audit 2026-10-09 item 8).
-  pub(crate) fn record_peer_spki(&self, peer: &NodeId, spki: Vec<u8>) {
-    if let Ok(mut anchors) = self.member_spkis.0.lock() {
-      anchors.insert(peer.clone(), spki);
-    }
+  /// Records the peer's leaf SPKI as the member-mode trust anchor for
+  /// one concrete dial target, observed at a successful join over that
+  /// endpoint or after a rollover fallback dial authenticated the peer
+  /// at the application proof layer. The latest record wins per target:
+  /// a re-issued certificate replaces the stale anchor in-process
+  /// (audit 2026-10-09 item 8).
+  pub(crate) fn record_peer_spki(&self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
+    self.member_spkis.record(peer, target, spki);
   }
 
-  /// The recorded leaf SPKI anchor for `peer`, when this process joined it.
-  pub(crate) fn peer_spki(&self, peer: &NodeId) -> Option<Vec<u8>> {
-    self
-      .member_spkis
-      .0
-      .lock()
-      .ok()
-      .and_then(|anchors| anchors.get(peer).cloned())
+  /// The recorded leaf SPKI anchor for `peer` at `target`, when this
+  /// process joined or pinned that exact endpoint. Every other endpoint
+  /// of the same node reports no anchor and dials under merge trust.
+  pub(crate) fn peer_spki(&self, peer: &NodeId, target: &Endpoint) -> Option<Vec<u8>> {
+    self.member_spkis.anchor(peer, target)
   }
 
   /// The current non-secret merge hint for accepted connections: the
@@ -632,4 +658,62 @@ fn decode_grant_payload(
   }
   grant.verify(issuer_key)?;
   Ok(grant)
+}
+
+#[cfg(test)]
+mod member_spki_tests {
+  use super::MemberSpkiTable;
+  use crate::{Endpoint, NodeId};
+
+  fn peer() -> NodeId {
+    NodeId::parse("node-000000000000000000042").unwrap()
+  }
+
+  /// The anchor is scoped to one concrete dial target (scheme and
+  /// address): every other listener of the same node — the other TLS
+  /// class, a second listener of the same scheme, a rebound port —
+  /// reports no anchor, so its member dial runs under merge trust and
+  /// the identity handshake authenticates instead of a leaf pin that
+  /// would always mismatch (audit 2026-10-09 item 3). A repeated dial
+  /// to a pinned target reuses its anchor, and a rollover re-record on
+  /// one target leaves the other target untouched.
+  #[test]
+  fn anchors_key_by_peer_and_concrete_dial_target() {
+    let anchors = MemberSpkiTable::default();
+    let peer = peer();
+    let tls = Endpoint::parse("tls://127.0.0.1:7001").unwrap();
+    let wss = Endpoint::parse("wss://127.0.0.1:7002").unwrap();
+    let second_wss = Endpoint::parse("wss://127.0.0.1:7003").unwrap();
+
+    anchors.record(&peer, &tls, b"tls-leaf".to_vec());
+    anchors.record(&peer, &wss, b"wss-leaf".to_vec());
+
+    assert_eq!(
+      anchors.anchor(&peer, &tls).as_deref(),
+      Some(b"tls-leaf".as_slice()),
+      "a repeated dial to the pinned target reuses its anchor"
+    );
+    assert_eq!(
+      anchors.anchor(&peer, &wss).as_deref(),
+      Some(b"wss-leaf".as_slice()),
+      "a channel change (tls -> wss) carries its own independent anchor"
+    );
+    assert_eq!(
+      anchors.anchor(&peer, &second_wss),
+      None,
+      "a second listener of the same scheme must not inherit the first one's anchor"
+    );
+
+    anchors.record(&peer, &tls, b"rotated-leaf".to_vec());
+    assert_eq!(
+      anchors.anchor(&peer, &tls).as_deref(),
+      Some(b"rotated-leaf".as_slice()),
+      "the latest record wins per target"
+    );
+    assert_eq!(
+      anchors.anchor(&peer, &wss).as_deref(),
+      Some(b"wss-leaf".as_slice()),
+      "a rollover re-record on one target leaves the other target untouched"
+    );
+  }
 }

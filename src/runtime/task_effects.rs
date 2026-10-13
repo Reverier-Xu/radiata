@@ -309,13 +309,16 @@ async fn reconcile_join(
   let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
   let (session, view) = planes.driver.merge(&mut connection, &hint, secret).await?;
   // Remember the peer's leaf SPKI from the merge as the member-mode
-  // reconnect pinning anchor (hardening).
+  // reconnect pinning anchor for THIS endpoint (each listener of the
+  // peer binds its own ephemeral leaf; other targets stay unpinned and
+  // dial under merge trust — hardening, the identity proof is the
+  // authority).
   let peer = session.peer().clone();
   crate::audit::dial_settled(peer.as_str(), false, true);
   if !hint.leaf_spki().is_empty() {
     planes
       .driver
-      .record_peer_spki(&peer, hint.leaf_spki().to_vec());
+      .record_peer_spki(&peer, &receiver, hint.leaf_spki().to_vec());
   }
   // Keep the merge session open so both sides can stream packets over it.
   // The view returns only after the session table registers the entry, so

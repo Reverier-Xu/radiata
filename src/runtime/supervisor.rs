@@ -961,12 +961,15 @@ pub(super) async fn dial_member(
 ) -> Result<NodeId> {
   crate::audit::dial_started(peer.as_str(), recovery_dialed);
   let result = async {
-    // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
-    // at join (same-listener reconnects); without an anchor this process
-    // falls back to the join-mode relaxation and the application proof
-    // layer remains the authenticator. The endpoint's transport class
-    // decides whether either TLS mode applies at all.
-    let pinned = driver.peer_spki(peer);
+    // Member reconnects pin the peer's TLS leaf to the SPKI anchor
+    // learned for this exact concrete target (scheme and address: a
+    // repeated dial to the same endpoint); any other listener of the
+    // same peer — another scheme, a second listener, a rebound address
+    // — has no anchor here and dials under the join-mode relaxation,
+    // where the application proof layer remains the authenticator. The
+    // endpoint's transport class decides whether either TLS mode applies
+    // at all.
+    let pinned = driver.peer_spki(peer, &receiver);
     let trust = TransportTrust::for_dial(
       &receiver.selector(),
       pinned
@@ -1018,7 +1021,7 @@ pub(super) async fn dial_member(
       packet,
       sessions,
       shutdown,
-      receiver,
+      receiver.clone(),
       recovery_dialed,
       |session_task| {
         tokio::spawn(session_task);
@@ -1028,9 +1031,10 @@ pub(super) async fn dial_member(
     if pinned.is_some()
       && let Some(spki) = observed_spki
     {
-      // Process-local rollover: the re-issued leaf replaces the stale
-      // anchor, so every later member dial to this peer pins again.
-      driver.record_peer_spki(peer, spki);
+      // Process-local rollover on this target: the re-issued leaf
+      // replaces the stale anchor, so every later member dial to the
+      // same endpoint pins again.
+      driver.record_peer_spki(peer, &receiver, spki);
     }
     Ok(authenticated)
   }
