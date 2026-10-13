@@ -667,6 +667,12 @@ pub(super) struct TickState {
   /// recovery plane's `recovery_endpoint` rotation — see
   /// `runtime/degree.rs`).
   pub(super) degree_attempt: Arc<std::sync::atomic::AtomicU64>,
+  /// The bridge-probe cadence bracket: maintenance ticks an otherwise
+  /// quiescent healthy node waits before its next cross-partition probe
+  /// dial (audit finding #1's residual boundary — see `runtime/degree.rs`).
+  /// Only the maintenance worker mutates it, so a racing read at worst
+  /// shifts one probe by one tick.
+  pub(super) bridge_probe_ticks: Arc<std::sync::atomic::AtomicU32>,
   /// Recovery-tick cooldown before the next redundant-edge cut. Only
   /// the recovery worker mutates it; a racing read at worst shifts one
   /// cut by one tick.
@@ -866,6 +872,9 @@ impl Supervisor {
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       degree_attempt: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+      bridge_probe_ticks: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+        super::degree::BRIDGE_PROBE_INTERVAL_TICKS,
+      )),
       prune_cooldown: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
       exclusion_cache: Arc::clone(&self.exclusion_cache),
       trace_records: Arc::clone(&self.trace_records),
