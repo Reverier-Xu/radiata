@@ -542,6 +542,7 @@ pub fn radiata::NodeConfig::with_relay_hop_deadline(self, core::time::Duration) 
 pub fn radiata::NodeConfig::with_route_policy(self, radiata::QualifiedTag) -> Self
 pub fn radiata::NodeConfig::with_session_liveness(self, core::time::Duration, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_session_queue_limits(self, usize, usize) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_task_reconcile_slots(self, usize, usize) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_trace_metadata_limits(self, radiata::TraceMetadataLimits) -> radiata::Result<Self>
 impl core::default::Default for radiata::NodeConfig
 pub fn radiata::NodeConfig::default() -> Self
