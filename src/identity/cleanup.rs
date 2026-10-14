@@ -371,9 +371,7 @@ pub(crate) async fn persist_checkpoint_ctx(
   )?;
   drop(snapshot);
   // A discarded commit outcome would advance the reported watermark
-  // without a committed outcome behind it: Conflict/Aborted definitively
-  // did not land, and Unknown leaves durability indeterminate.
-  // Without a committed outcome behind it: Conflict/Aborted definitively
+  // without a committed record behind it: Conflict/Aborted definitively
   // did not land, and Unknown leaves durability indeterminate.
   crate::provider::commit_verdict(store.commit(transaction).await?, "cleanup checkpoint")?;
   // The checkpoint record rides the tombstone plane: the write epoch

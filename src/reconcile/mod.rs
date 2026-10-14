@@ -27,10 +27,11 @@
 // them to the session and the tick.
 pub(crate) mod digest;
 pub(crate) mod engine;
-// The fingerprint index is the plane's primitive: its full query
-// surface (point lookups, removal, set algebra) lands ahead of its
-// consumers — the engine exercises the aggregate paths today, and the
-// R4 trigger layer and lane pruning pick up the rest.
+// The fingerprint index is the plane's primitive. Its introspection
+// surface — the count and membership probes (`len`, `is_empty`,
+// `contains`, `Fingerprint::is_empty`) — lands ahead of its consumers:
+// the engine exercises the aggregate and range paths today, while the
+// probes are read only by tests.
 #[allow(dead_code)]
 pub(crate) mod fingerprint;
 pub(crate) mod plane;

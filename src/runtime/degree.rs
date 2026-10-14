@@ -140,7 +140,10 @@ impl TickState {
     // Previous tick's dials may still be in flight (dial deadline plus
     // authentication deadline exceeds one cadence): never exceed the
     // deficit with concurrent dials, or a slow mesh doubles its own
-    // dial load every tick.
+    // dial load every tick. This gate skips the whole tick when the
+    // budget is already exhausted; the spawn loop below re-checks per
+    // spawn, because a PARTIALLY free budget must not overshoot either
+    // (audit finding #5).
     if self
       .maintenance_pending
       .load(std::sync::atomic::Ordering::Relaxed)
@@ -178,6 +181,21 @@ impl TickState {
       .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
       + 1;
     for (peer, endpoints) in dials {
+      // In-flight bound re-check per spawn (audit finding #5): the
+      // pre-batch gate compares the counter to the budget once, but
+      // previous ticks' dials can still hold slots when this batch
+      // starts, so spawning the whole batch would admit up to
+      // `2*dial_budget - 1` concurrent dials. The check right before
+      // each spawn holds the batch at the budget; unserved members
+      // wait for the next tick's plan.
+      if self
+        .maintenance_pending
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= plan.dial_budget
+      {
+        debug!("degree maintenance batch truncated at the in-flight budget");
+        break;
+      }
       let Some(endpoint) = recovery_endpoint(&endpoints, attempt) else {
         continue;
       };
@@ -299,6 +317,7 @@ impl TickState {
     let sessions = self.sessions.clone();
     let packet = self.packet.clone();
     let shutdown = self.shutdown.clone();
+    let connection_tasks = self.connection_tasks.clone();
     let dial_deadline = self.config.dial_deadline();
     let dial = tokio::spawn(async move {
       if let Err(error) = dial_member(
@@ -307,6 +326,7 @@ impl TickState {
         sessions,
         packet,
         shutdown,
+        connection_tasks,
         receiver,
         &peer,
         // Ordinary caller-class edge: the recovery plane's redundancy
@@ -326,9 +346,10 @@ impl TickState {
     });
     // The maintenance dial's JoinHandle joins the same tracked
     // connection-task set as the recovery dials (audit finding #19): the
-    // recovery tick reaps finished handles and the shutdown path aborts
-    // and awaits the rest, so an in-flight maintenance handshake is
-    // owned and torn down with the node instead of outliving it.
+    // recovery tick reaps finished handles and the shutdown path drains
+    // the rest inside its bounded cooperative window, aborting only the
+    // stragglers, so an in-flight maintenance handshake is owned and
+    // torn down with the node instead of outliving it.
     if let Ok(mut handles) = self.connection_tasks.lock() {
       handles.push(dial);
     }
@@ -376,7 +397,8 @@ mod tests {
   use std::sync::Arc;
 
   use crate::runtime::supervisor::test_support::{
-    self, insert_live_session, install_member, member_id, silent_peer, supervisor_over,
+    self, insert_live_session, install_member, member_id, refusing_peer, silent_peer,
+    supervisor_over,
   };
 
   /// The maintenance tick's wiring: with one live session and four
@@ -521,6 +543,110 @@ mod tests {
     );
     first_holder.abort();
     second_holder.abort();
+  }
+
+  /// The same in-flight bound for the deficit path (audit finding #5):
+  /// with one dial still parked from the previous tick, the next tick
+  /// must hold the batch AT the dial budget instead of overshooting to
+  /// `2*dial_budget - 1` — the pre-batch gate alone admits the
+  /// overshoot because a slot frees between the ticks. A four-node
+  /// cluster (k(4) = 3) with one live session leaves a deficit of two
+  /// and exactly two dial candidates; member 101's first endpoint
+  /// refuses connections (its slot frees inside the poll below) and
+  /// its second endpoint is the silent first listener, so the second
+  /// tick starts with one held slot: exactly one further dial may
+  /// launch, whichever member the uniform pick serves first.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn maintenance_tick_holds_in_flight_dials_at_the_dial_budget() {
+    let (reference, config) = test_support::reference_and_config();
+    // A long dial deadline keeps the parked dial in flight for the whole
+    // test, so the one-held-slot window the second tick needs is wide on
+    // every platform.
+    let config = config
+      .with_dial_deadline(std::time::Duration::from_secs(30))
+      .unwrap();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    // A refusing peer: the dial fails fast and deterministically at the
+    // handshake, releasing its in-flight slot and giving the second tick
+    // exactly one held slot to start from.
+    let (refused_port, refused_holder) = refusing_peer().await;
+    let (first_port, first_connections, first_holder) = silent_peer().await;
+    let (second_port, second_connections, second_holder) = silent_peer().await;
+
+    install_member(&supervisor, &reference, 101, &[refused_port, first_port]).await;
+    install_member(&supervisor, &reference, 102, &[second_port]).await;
+    // The connected member completes the k(4) = 3 arithmetic: one live
+    // session leaves the deficit at two with 101/102 as the only
+    // candidates, so the batch and the connection counts are
+    // deterministic.
+    install_member(&supervisor, &reference, 103, &[first_port]).await;
+    insert_live_session(&sessions, member_id(103), ticks.entropy.as_ref());
+
+    // First tick: the budget of two dials 101's refused first endpoint
+    // and parks 102 against the silent peer — two slots taken, then
+    // one. The poll also awaits the parked dial's accept, since the
+    // connection lands asynchronously.
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+      loop {
+        if ticks
+          .maintenance_pending
+          .load(std::sync::atomic::Ordering::Relaxed)
+          == 1
+          && second_connections.load(std::sync::atomic::Ordering::Relaxed) >= 1
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the refused dial must release its in-flight slot");
+    assert_eq!(
+      second_connections.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "the parked dial must hold against the counted silent peer"
+    );
+
+    // Second tick: one held slot, budget two — the batch must stop at
+    // the bound instead of spawning both candidates, which would park
+    // three dials in flight.
+    ticks.maintenance_tick().await.unwrap();
+    assert_eq!(
+      ticks
+        .maintenance_pending
+        .load(std::sync::atomic::Ordering::Relaxed),
+      2,
+      "the tick must hold in-flight dials at the dial budget, never 2*dial_budget - 1"
+    );
+    // The re-dial connects asynchronously: await its accept before
+    // counting, then check the bound stopped the remaining candidate.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+      loop {
+        let dialed = first_connections.load(std::sync::atomic::Ordering::Relaxed)
+          + second_connections.load(std::sync::atomic::Ordering::Relaxed);
+        if dialed >= 2 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the second tick must launch exactly one re-dial");
+    let dialed = first_connections.load(std::sync::atomic::Ordering::Relaxed)
+      + second_connections.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+      dialed, 2,
+      "exactly one re-dial may join the parked first dial; the bound stops the rest"
+    );
+    first_holder.abort();
+    second_holder.abort();
+    refused_holder.abort();
   }
 
   /// The bridge-probe cadence stays on the order of five minutes

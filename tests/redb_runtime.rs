@@ -120,6 +120,25 @@ async fn start(
   NodeBuilder::new(factory).keys(keys).start().await
 }
 
+/// Reopens `factory` after a shutdown, tolerating the previous node's
+/// bounded file-lock settle: an in-flight detached commit can release the
+/// redb lock a few milliseconds after `shutdown` returns, so the typed
+/// `StorageLocked` is retried instead of racing it. Any other failure, or
+/// a lock that never releases, still fails the call.
+async fn start_after_shutdown(
+  factory: Arc<dyn StorageFactory>, keys: Arc<DeterministicKeys>,
+) -> Result<NodeHandle> {
+  for _ in 0..200 {
+    match start(Arc::clone(&factory), Arc::clone(&keys)).await {
+      Err(error) if error.kind() == ErrorKind::StorageLocked => {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+      }
+      result => return result,
+    }
+  }
+  start(factory, keys).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
   let dir = tempfile::tempdir().unwrap();
@@ -135,7 +154,7 @@ async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
   first.shutdown().await.unwrap();
   assert_eq!(calls.create.lock().unwrap().len(), 1);
 
-  let second = start(
+  let second = start_after_shutdown(
     radiata::adapters::redb_store(dir.path().join("store.redb")),
     Arc::new(DeterministicKeys::new(11, Arc::clone(&calls))),
   )

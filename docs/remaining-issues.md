@@ -1,61 +1,48 @@
-# 遗留问题清单（本轮未处理）
+# 遗留问题清单（本轮已全部处理）
 
-- 时间：2026-10-13
-- 来源：本轮 6 份只读侦察中发现的相邻问题（不在审计 19 条内）+ 本轮修复引入后需复核的点。
-- 说明：以下均已在当前 `fix/connectivity-liveness-integrity` 上核对，给出 file:line 与影响。这些不属于本轮已修复的 11 条。
+- 分支：`fix/remaining-hardening`（基于 `fix/connectivity-liveness-integrity`）
+- 来源：审计侦察中发现的相邻问题（P1-P4 + 两项待确认）。
+- 状态：**全部处理完毕**。每条的处置与提交见下表。
 
-## P1 — 正确性 / 任务所有权
+## 处置总表
 
-1. **member-mode session pump 未纳入任务所有权**
-   `dial_member` 用裸 `tokio::spawn(session_task)`（`src/runtime/supervisor.rs:1035-1036`），而 `reconcile_join` 走 `track_connection_task`（`src/runtime/task_effects.rs`）。由显式 `connect` 以及 recovery/degree 拨号建立的会话因此不被 recovery tick 回收、不计入 connection-task 观测、shutdown 不 await（它们仍观察 shutdown/retire 而退出，只是无人观测与等待）。与本轮 #19 同源，注册进同一 `connection_tasks` 即可。
+| # | 问题 | 处置 | 提交 |
+|---|---|---|---|
+| 1 | member-mode session pump 未纳入任务所有权 | 修复：所有会话 pump 走 `track_connection_task` | `e29947e` |
+| 2 | 优雅 consumer drain 在节点 shutdown 被 abort | 修复：shutdown 先给有界 grace，再 abort 拖尾任务 | `e29947e` |
+| 3 | plane prune 把 unknown-writer 跳过行当 superseded | 修复：deferred 身份与 refused/loser 区分，prune 豁免并在 epoch 推进时重试 | `358b445` |
+| 4 | rollover fallback 使拨号上限翻倍 | 修复：回退仅用剩余 dial budget | `34a643c` |
+| 5 | recovery/degree in-flight 计数可短暂超 `fan_out` | 修复：逐次 spawn 前复查上界 | `9e011ff` |
+| 6 | `send` 与"永久不可容纳"共用一个错误判别 | 修复：新增 `ErrorKind::FrameTooLarge`（兼容性修订，更新 0.1 基线） | `34a643c` |
+| 7 | `relay_open` 在阻塞的 `send_waiting` 前插入 pending | 修复：admission 用 hop budget 限时，取消安全（RAII reservation），分支放弃后不会事后入队 | `34a643c` |
+| 8 | 若干 `#[allow(dead_code)]` 可复核 | `TrustMode::Member` 的移除；fingerprint / `Installed` 保留并修正理由 | `393a48f` |
+| 9 | `decode_revision` 把损坏报成 invalid input | 修复：归类 `StorageCorrupt` | `3e408c5` |
+| 10 | `commit_page_batch_ctx` 混同 `Aborted`/`Conflict`（及 `Unknown`） | 复核：生产路径已正确（`Unknown` 不重试、冻结待 reconcile）；补回归测试 | `34a643c` |
+| 11 | `arm_hop_deadline` 泄漏无主定时器 | 修复：hop 拥有定时器，解析即 abort | `34a643c` |
+| 12 | `snapshot()` 在 async 线程 `begin_read` | 修复：`begin_read` 移入 `spawn_blocking` | `3e408c5` |
+| 13 | `RecoveryController::immediate` 文档重复句 | 修复 | `393a48f` |
+| 14 | `known_revocation_records_ctx` 的 `#[cfg(test)]` 夹在文档中且已 test-only | 修复：删除函数，测试改用 `scan_decoded_records` | `393a48f` |
+| 15 | `delivered_within_bound` 文档仍叙述已删 watermark 设计 | 修复 | `393a48f` |
+| 16 | `cleanup.rs` 注释重复残缺 | 修复 | `393a48f` |
+| 17 | `inbound.rs` 对 `JoinSet` Drop 语义描述相反 | 修复（Drop 会 abort；设计因所有权转移而正确） | `393a48f` |
+| 18 | 旧轮次审计编号引用 | 修复（本轮涉及文件内） | `393a48f` |
+| 待确认 A | `handshake.rs` 的 `unreachable!()` | 修复：改为 fail-closed `Malformed`，消除潜在 panic | `393a48f` |
+| 待确认 B | `recovery_endpoint` 与 degree 共享序号 | 复核为 **benign**（每步目标各自独立列表，failover 跨 attempt）；加测试与说明固定行为 | `9e011ff` |
 
-2. **优雅 consumer drain 在节点 shutdown 时被 abort**
-   drain handle 进 `connection_tasks`，但 `into_dependencies` 在 shutdown 时直接 `abort()` 这些 handle（`src/runtime/supervisor.rs:904-909`），drop `JoinSet` 会 abort 其子任务（tokio 1.53 `Drop for JoinSet` 是 abort 而非 detach）。因此 in-flight apply 只对会话级 teardown 受保护，对节点 shutdown 不受保护，与 `ConsumerDrainGuard` 注释"shutdown still awaits it"（`src/session/inbound.rs:96-100`）矛盾。需决定：shutdown 对 drain 给 bounded grace 而非 abort，或修正注释使其与实现一致。
+## CI 验证
 
-3. **plane prune 把 unknown-writer 跳过行当 superseded**
-   `src/reconcile/plane.rs:733` 的 `keys.contains(key)` 分支无法区分"资源竞争中落败"与"因 unknown writer 尚未准入"，会把后者当作 superseded 剪出 repair 集，于是其重试回退到 32-tick cadence（而非 descriptor 到达的 epoch 推进），且每轮重复付 2s unknown-writer 等待。建议 Resources apply 臂单独报告 "deferred"（unknown writer）行并在 prune 中豁免。
+- PR #77（`fix/remaining-hardening` → `fix/connectivity-liveness-integrity`）CI：**全绿**（run `38523081151`，18 项含 windows / msrv / container / chat acceptance）。
+- CI 暴露并已修复的两项（非本分支引入的库缺陷，而是测试健壮性）：
+  - redb 重启测试：对 `shutdown()` 返回后短暂（≤200ms）未释放的文件锁做有界重试（`4ed742b`）。
+  - 在飞拨号上界测试（`runtime::degree`、`runtime::recovery`）：改用"接受后立即关闭"的拒绝对端，使被拒拨号在**各平台**都在握手阶段确定性快速失败（原本连未绑定端口的拒绝时机在 Windows 上会拖满整个 dial deadline），并将驻留窗口拉宽（`c0031ad`）。
 
-## P2 — 边界 / 健壮性
+## 本轮新发现
 
-4. **rollover fallback 使单次拨号上限翻倍**
-   `src/runtime/supervisor.rs:989` 与 `:1010` 两次 `connect_with_deadline(..., dial_deadline)` 各使用完整 `dial_deadline`；pinned 拨号首次超时后总耗时可达 2×。第二次应传剩余时间。
+- **`verify-*.sh` 家族未被 CI 运行**，其中 `verify-api.sh` 是公开 API 冻结门禁（要求与 `tests/fixtures/public-api/baseline-0.1.txt` 精确一致）。基线自 `c9d62f6` 起就已漂移：`NodeConfig::with_task_reconcile_slots` 为公开 API 但不在基线中。已按固定工具 `cargo-public-api 0.52.0` 重新生成基线修复（`1bf27e3`）。**建议把 `verify-api.sh` / `verify-public-abi.sh` 纳入 CI**，否则同类漂移仍不会被发现。
+- **公开 API 兼容性修订**：`ErrorKind::FrameTooLarge` 为新增变体（`ErrorKind` 为 `#[non_exhaustive]`，非破坏性），已按 `verify-api.sh` 的既定流程更新 0.1 基线（`34a643c`）。
+- **redb 重启存在既有的有界锁释放瞬态**：`shutdown()` 返回后，一个在途的 detached redb commit（可保证取消后仍落地）仍可能短暂持有 `Arc<Database>`，使同一文件的立即重开返回 `StorageLocked`。实测在约 200ms 内自行释放（父提交 `4e12928` 与本分支均约 3/60 概率命中），**非本轮引入、也非泄漏**。重启测试（`resource_operations`、`redb_runtime`、`leave`）已改为对该类型化错误做有界重试（`4ed742b`）。建议后续在节点 shutdown 路径等待在途 detached commit 后再释放存储，从根本上消除该窗口。
 
-5. **recovery/degree in-flight 计数可短暂超 `fan_out`**
-   `recovery_tick_inner` 在批次前只检查一次 `recovery_pending >= fan_out`，随后最多 spawn `fan_out` 个，瞬时可达 `2·fan_out−1`（`src/runtime/recovery.rs:313-320`）；degree 侧同类。文档声称的 in-flight 上界与实际不符（有界、可自校正）。
+## 仍然保留的观察（非缺陷，未改）
 
-6. **`send` 与"永久不可容纳"共用一个错误判别**
-   `Error::overloaded("session queue")` 同时表示"暂时满"与"帧永久超界"（`src/session/queue.rs:226-236`），源端调用方无法区分可重试背压与配置错误。可考虑为永久不可容纳增加独立判别（本轮 #18 已在 `send_waiting` 内 fail-closed，但两者仍共享判别）。
-
-7. **`relay_open` 在可能阻塞的 `send_waiting` 之前插入 pending 条目**
-   `src/routing/forward.rs:335-376`：极端时序下 hop deadline 可重派给另一候选，而原 open 的 `send_waiting` 仍可能事后入队。概率低，但条目与帧的生命周期未耦合。
-
-8. **若干 `#[allow(dead_code)]` 可复核是否可移除**
-   `src/transport/verify.rs:57`（`TrustMode::Member`，注释称已 wired，属性仍在）、`src/reconcile/mod.rs:34`（fingerprint 模块）、`src/resource/store.rs:42`（`Installed(CommitReceipt)`）。
-
-## P3 — 错误分类 / 资源
-
-9. **`decode_revision` 的损坏分类**
-   对持久化的非法字节返回 `Error::invalid_input("redb store revision")`（`src/storage/redb/store.rs:584-588`），应归类 `StorageCorrupt`；调用点包括 `read_receipt` 与 reconcile，会把存储损坏误报为调用方输入错误。
-
-10. **`commit_page_batch_ctx` 把 `Aborted` 与 `Conflict` 混同重试**
-    `src/resource/store.rs:195-216` 对两者都重试一次。`Aborted` 语义上是确定未落地，与 Conflict 不同；若 #12 引入更细的 Unknown 语义需复核该分支。
-
-11. **`arm_hop_deadline` 每 attempt 派发无取消句柄的定时任务**
-    `src/routing/forward.rs:673-688` 每次 attempt `tokio::spawn` 一个定时器，成功/失败路径都不取消；高负载下短命定时器持续累积（有界于候选数与转发容量，但属泄漏面）。
-
-12. **`snapshot()` 在 async 线程直接 `begin_read`**
-    `src/storage/redb/store.rs` 的 `snapshot()` 未走 `spawn_blocking`；redb 读事务持内部文件锁，写压力下可能阻塞 runtime（性能，非正确性）。
-
-## P4 — 文档 / 注释一致性
-
-13. `RecoveryController::immediate` 文档重复句（`src/membership/recovery.rs:265-266`）。
-14. `known_revocation_records_ctx` 的 `#[cfg(test)]` 夹在文档注释中间（`src/identity/revocation.rs:276-279`），注释仍称 "for sync forwarding"，实际已 test-only；函数或可删除、注释需修正。
-15. `sync_common::delivered_within_bound` 文档仍叙述已删除的 watermark 设计（`src/sync_common.rs:283-300`）。
-16. `src/identity/cleanup.rs:373-379` 注释重复且第二份残缺。
-17. `src/session/inbound.rs:83-85` 称"Dropping a JoinSet detaches its children"，与 tokio 1.53 实际（Drop 会 abort）相反。
-18. 多处注释仍引用旧轮次审计编号（"audit 2026-10-09 item N"）；本轮修复后编号含义已变，建议改为描述性说明或引用本文件。
-
-## 待确认（可能为误报）
-
-- `src/protocol/handshake.rs:513` 对 `HandshakeKind::MergeGrantDelivery` 使用 `unreachable!()`：若该 kind 经此路径到达会 panic。需确认该臂确实不可达；若可达，对 hostile input 应返回协议错误而非 panic。
-- `src/runtime/recovery.rs` 的 `recovery_endpoint` 与 degree 共用 `degree_attempt` 序号：`fan_out>1` 时同一步骤内所有目标使用同一端点索引。当前对 failover 无害，但属共享序号设计。
+- `src/reconcile/budget.rs` 测量型测试的 `tracing::info!` 默认无订阅者时不回显（已完成 `553e949`）。
+- `reconcile/mod.rs` 的 fingerprint 模块部分查询面（count/membership 探针）仍保留 `#[allow(dead_code)]`，理由已精确化。

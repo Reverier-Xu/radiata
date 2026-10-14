@@ -828,12 +828,27 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
 
   // Restart on the same store: members, trust, and resources are wiped —
   // the replacement identity is born with its own singleton cluster, so
-  // the local view resolves to exactly the replacement.
-  let handle = NodeBuilder::new(storage)
-    .keys(provider)
-    .start()
-    .await
-    .unwrap();
+  // the local view resolves to exactly the replacement. The previous
+  // node's redb file lock is released by an in-flight detached commit that
+  // can settle a few milliseconds after shutdown, so a typed lock error is
+  // retried rather than raced.
+  let handle = {
+    let mut attempt = 0_u32;
+    loop {
+      match NodeBuilder::new(Arc::clone(&storage))
+        .keys(Arc::clone(&provider))
+        .start()
+        .await
+      {
+        Ok(handle) => break handle,
+        Err(error) if error.kind() == ErrorKind::StorageLocked && attempt < 200 => {
+          attempt += 1;
+          tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(error) => panic!("restart open failed: {error:?}"),
+      }
+    }
+  };
   let local = handle.local_node().await.unwrap();
   assert_eq!(local.node_id(), &replacement);
   assert_ne!(local.node_id(), &former_handle_bytes);

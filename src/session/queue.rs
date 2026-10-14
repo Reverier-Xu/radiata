@@ -56,6 +56,33 @@ const FRAME_OVERHEAD: usize = 16;
 /// staleness without busy-spinning.
 const WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 
+/// A held admission reservation: releases the queue accounting on drop
+/// unless [`Self::commit`] transfers it to the channel, so a send
+/// future cancelled mid-flight (the hop deadline dropping a parked
+/// open) can never strand count or byte accounting. Private to this
+/// module by construction: every admission path goes through
+/// [`BoundedSender`].
+struct Reservation {
+  state: Arc<QueueState>,
+  bytes: usize,
+}
+
+impl Reservation {
+  /// The reservation transfers to the channel: the receiving half
+  /// releases it when the frame drains, exactly as before.
+  fn commit(self) {
+    std::mem::forget(self);
+  }
+}
+
+impl Drop for Reservation {
+  fn drop(&mut self) {
+    self.state.count.fetch_sub(1, Ordering::Relaxed);
+    self.state.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    self.state.audit_removed.fetch_add(1, Ordering::Relaxed);
+  }
+}
+
 /// A bounded outbound frame sender. `send` atomically checks message count
 /// and summed encoded bytes against the caller-selected limits and returns
 /// a typed overload error at either boundary without partial enqueue.
@@ -143,12 +170,15 @@ impl BoundedSender {
   /// acknowledgements): saturation drops the frame instead of awaiting.
   pub(crate) fn try_send(&self, frame: SessionFrame) {
     let bytes = FRAME_OVERHEAD.saturating_add(frame.body.len());
-    let Some(bytes) = self.try_reserve(bytes) else {
+    let Some(reserved) = self.try_reserve(bytes) else {
       return;
     };
     if self.inner.try_send(frame).is_err() {
-      // The queue closed after admission; release the reservation.
-      self.release(bytes);
+      // The queue closed after admission; the guard releases the
+      // reservation on drop.
+      drop(reserved);
+    } else {
+      reserved.commit();
     }
   }
 
@@ -156,7 +186,7 @@ impl BoundedSender {
   /// concurrent senders cannot both pass the count/byte check and exceed
   /// the budget (the check-then-act is synchronous, no await inside).
   /// `Ok(None)` means saturated; an error means poisoned state.
-  fn reserve(&self, bytes: usize) -> Result<Option<usize>> {
+  fn reserve(&self, bytes: usize) -> Result<Option<Reservation>> {
     match self.state.admit.lock() {
       Ok(_guard) => {
         let count = self.state.count.load(Ordering::Relaxed);
@@ -167,21 +197,18 @@ impl BoundedSender {
           self.state.count.fetch_add(1, Ordering::Relaxed);
           self.state.bytes.fetch_add(bytes, Ordering::Relaxed);
           self.state.audit_reserved.fetch_add(1, Ordering::Relaxed);
-          Ok(Some(bytes))
+          Ok(Some(Reservation {
+            state: Arc::clone(&self.state),
+            bytes,
+          }))
         }
       }
       Err(_) => Err(Error::internal("session queue")),
     }
   }
 
-  fn try_reserve(&self, bytes: usize) -> Option<usize> {
+  fn try_reserve(&self, bytes: usize) -> Option<Reservation> {
     self.reserve(bytes).ok().flatten()
-  }
-
-  fn release(&self, bytes: usize) {
-    self.state.count.fetch_sub(1, Ordering::Relaxed);
-    self.state.bytes.fetch_sub(bytes, Ordering::Relaxed);
-    self.state.audit_removed.fetch_add(1, Ordering::Relaxed);
   }
 
   /// The forwarding variant: waits for downstream capacity instead of
@@ -190,22 +217,27 @@ impl BoundedSender {
   /// Wakeups come from [`BoundedReceiver::recv`] releases; the bounded
   /// backstop covers a closed queue that will never release again.
   /// A frame whose encoded size alone exceeds the byte bound can never be
-  /// admitted, so it is rejected with the overload error immediately
-  /// instead of waiting on a release that cannot help.
+  /// admitted, so it is rejected immediately with the dedicated
+  /// frame-too-large kind — permanently unqueueable, never backpressure —
+  /// instead of waiting on a release that cannot help. The waiting itself
+  /// is cancellation-safe: a dropped future releases any reservation it
+  /// held, so a cancelled park leaves the accounting intact.
   pub(crate) async fn send_waiting(&self, frame: SessionFrame) -> Result<()> {
     let bytes = FRAME_OVERHEAD.saturating_add(frame.body.len());
     if bytes > self.max_bytes {
       warn!(kind = ?frame.kind, bytes, "oversized frame exceeds session queue byte bound");
-      return Err(Error::overloaded("session queue"));
+      return Err(Error::frame_too_large("session queue"));
     }
     loop {
       match self.reserve(bytes)? {
         Some(reserved) => {
           if self.inner.send(frame).await.is_err() {
-            // The queue closed after admission; release the reservation.
-            self.release(reserved);
+            // The queue closed after admission; the guard releases the
+            // reservation on drop.
+            drop(reserved);
             return Err(Error::shutting_down("session queue"));
           }
+          reserved.commit();
           return Ok(());
         }
         None => {
@@ -230,10 +262,12 @@ impl BoundedSender {
         return Err(Error::overloaded("session queue"));
       };
       if inner.send(frame).await.is_err() {
-        // The queue closed after admission; release the reservation.
-        self.release(reserved);
+        // The queue closed after admission; the guard releases the
+        // reservation on drop.
+        drop(reserved);
         return Err(Error::shutting_down("session queue"));
       }
+      reserved.commit();
       Ok(())
     })
   }
@@ -322,8 +356,10 @@ mod queue_tests {
   }
 
   /// A frame whose encoded size alone exceeds the byte bound can never be
-  /// admitted, so the waiting send must fail closed with the overload
-  /// error instead of blocking forever on releases that cannot help.
+  /// admitted, so the waiting send must fail closed immediately — with the
+  /// dedicated frame-too-large kind, never the overload kind it shares
+  /// with temporary saturation — instead of blocking forever on releases
+  /// that cannot help.
   #[tokio::test]
   async fn waiting_send_fails_immediately_on_permanently_oversized_frame() {
     let (sender, mut receiver) = queue(8, FRAME_OVERHEAD + 32);
@@ -331,9 +367,68 @@ mod queue_tests {
       .await
       .unwrap()
       .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Overloaded);
+    assert_eq!(error.kind(), ErrorKind::FrameTooLarge);
     assert_eq!(error.context(), "session queue");
     // Nothing was enqueued by the rejected frame (a recv would hang).
     assert!(receiver.recv().now_or_never().is_none());
+  }
+
+  /// The permanent rejection is distinguishable from retryable
+  /// backpressure at the origin: a frame that fits waits out a saturated
+  /// queue and lands as soon as the receiver drains, while the oversized
+  /// frame fails closed with the frame-too-large kind from the same
+  /// saturated state — the two conditions never share a kind.
+  #[tokio::test(start_paused = true)]
+  async fn permanent_oversize_is_distinguishable_from_temporary_saturation() {
+    let (sender, mut receiver) = queue(1, 1_000);
+    // Temporary saturation: the only slot fills, the next waiting send
+    // parks instead of failing.
+    sender.send(frame(10)).await.unwrap();
+    let mut waiting = Box::pin(sender.send_waiting(frame(10)));
+    for _ in 0..20 {
+      if waiting.as_mut().now_or_never().is_some() {
+        panic!("the waiting send ignored downstream backpressure");
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Draining admits the parked frame: backpressure was retryable.
+    let _ = receiver.recv().await.unwrap();
+    waiting.await.unwrap();
+    assert_eq!(sender.audit_delta(), 1);
+
+    // The permanent case fails closed from the same saturated state
+    // (the one admitted frame still occupies the only slot).
+    let error = sender.send_waiting(frame(2_000)).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::FrameTooLarge);
+    assert_eq!(error.context(), "session queue");
+    assert_eq!(
+      sender.audit_delta(),
+      1,
+      "the rejected frame reserved nothing"
+    );
+  }
+
+  /// A cancelled waiting send leaves no reservation behind: the hop
+  /// deadline drops parked opens mid-wait, so the accounting must return
+  /// to exactly the queued frames and the queue must keep admitting.
+  #[tokio::test(start_paused = true)]
+  async fn a_cancelled_waiting_send_leaves_no_reservation_behind() {
+    let (sender, mut receiver) = queue(1, 1_000);
+    sender.send(frame(10)).await.unwrap();
+    let mut parked = Box::pin(sender.send_waiting(frame(10)));
+    for _ in 0..20 {
+      if parked.as_mut().now_or_never().is_some() {
+        panic!("the waiting send ignored downstream backpressure");
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(parked);
+    // Only the one queued frame is accounted; the cancelled park kept
+    // nothing.
+    assert_eq!(sender.audit_delta(), 1);
+    // Draining frees the slot and a fresh send still admits.
+    let _ = receiver.recv().await.unwrap();
+    sender.send(frame(10)).await.unwrap();
+    assert_eq!(sender.audit_delta(), 1);
   }
 }

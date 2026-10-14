@@ -310,12 +310,19 @@ impl TickState {
         && controller.due(now)
     };
     self.maybe_prune_recovery_edges(&direct)?;
-    if !dial_due || {
-      self
+    // The documented in-flight bound (the counter bounds in-flight
+    // dials, not lifetime volume): checked here to skip the whole step
+    // when already full, and re-checked before EVERY spawn below —
+    // slots held by previous ticks' dials free up between ticks, so a
+    // pre-batch check alone would admit up to `2*fan_out - 1`
+    // concurrent dials (audit finding #5).
+    let fan_out = self.config.recovery().fan_out().max(1);
+    if !dial_due
+      || self
         .recovery_pending
         .load(std::sync::atomic::Ordering::Relaxed)
-        >= self.config.recovery().fan_out().max(1)
-    } {
+        >= fan_out
+    {
       return Ok(());
     }
     // The node is fully isolated: retry every table member it is not
@@ -341,6 +348,19 @@ impl TickState {
       )
     };
     for member in step.targets {
+      // Bound re-check per spawn (audit finding #5): the counter only
+      // ever decrements when a dial completes, so the check immediately
+      // before the increment below holds the in-flight count at the
+      // bound; the truncated targets stay candidates for the
+      // controller's rotating cursor on a later step.
+      if self
+        .recovery_pending
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= fan_out
+      {
+        debug!("recovery step truncated at the in-flight fan-out bound");
+        break;
+      }
       let Some(endpoints) = candidates.get(&member) else {
         continue;
       };
@@ -366,6 +386,7 @@ impl TickState {
       let packet = self.packet.clone();
       let shutdown = self.shutdown.clone();
       let pending = Arc::clone(&self.recovery_pending);
+      let connection_tasks = self.connection_tasks.clone();
       let transport = match self.extensions.resolve_transport(&endpoint.selector()) {
         Ok(transport) => transport,
         // No transport for the endpoint: the dial fails and releases
@@ -386,6 +407,7 @@ impl TickState {
           sessions,
           packet,
           shutdown,
+          connection_tasks,
           receiver,
           &peer,
           true,
@@ -408,8 +430,9 @@ impl TickState {
         pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
       });
       // The dial's JoinHandle joins the tracked connection-task set the
-      // recovery tick reaps and the shutdown path aborts and awaits
-      // (audit finding #19): a dropped handle would leave an in-flight
+      // recovery tick reaps and the shutdown path drains inside its
+      // bounded cooperative window, aborting only the stragglers (audit
+      // finding #19): a dropped handle would leave an in-flight
       // handshake unowned — shutdown would neither cancel it nor wait
       // for it, so a lingering dial would keep holding this
       // incarnation's store and session Arcs across a restart.
@@ -513,8 +536,22 @@ impl TickState {
 /// so a member whose current endpoint is unreachable is retried on the
 /// others across successive attempts (audit 2026-10-09 item 7). The
 /// first attempt of every schedule dials the first published endpoint.
-/// Shared with the degree maintenance plane, which rotates a member's
-/// endpoints by its own dial-batch serial (remaining-items list P2-5).
+///
+/// One serial per schedule, never per member: every target of a
+/// `fan_out > 1` step dials the same index of its OWN endpoint list.
+/// That is correct because the targets of one step are distinct members
+/// whose endpoint lists are independent — a shared index correlates
+/// nothing — and failover is an across-attempts property: the serial
+/// advances once per step and wraps per member, so each member still
+/// sweeps every published endpoint across successive attempts and
+/// restarts at its primary with every new schedule. Keying the index by
+/// member would add cross-tick state for the same coverage (pinned by
+/// `one_step_dials_the_same_index_of_every_targets_own_list`).
+///
+/// Shared FUNCTION with the degree maintenance plane, which rotates a
+/// member's endpoints by its own dial-batch serial (`degree_attempt`),
+/// not by this schedule's serial — the planes' attempt counts are
+/// independent (remaining-items list P2-5).
 pub(super) fn recovery_endpoint(endpoints: &[Endpoint], attempt: u64) -> Option<&Endpoint> {
   let index = attempt.saturating_sub(1) as usize % endpoints.len().max(1);
   endpoints.get(index)
@@ -581,7 +618,9 @@ mod tests {
       CommitOutcome, ReconcileOutcome, Storage, StorageFactory, StoreCapabilities,
       StoreRequirements, StoreSnapshot, StoreTransaction,
     },
-    runtime::supervisor::test_support::{member_id, member_key, supervisor_over},
+    runtime::supervisor::test_support::{
+      install_member, member_id, member_key, refusing_peer, silent_peer, supervisor_over,
+    },
   };
 
   fn endpoint(port: u16) -> Endpoint {
@@ -605,6 +644,28 @@ mod tests {
     assert_eq!(recovery_endpoint(&single, 7), Some(&single[0]));
     // ...and an endpointless member (never a candidate) dials nothing.
     assert_eq!(recovery_endpoint(&[], 7), None);
+  }
+
+  /// The attempt serial is per SCHEDULE, never per member (the shared
+  /// endpoint-serial question): every target of one step dials the same
+  /// index of its own list, and the lists sweep independently across
+  /// attempts — a three-endpoint member and a two-endpoint member both
+  /// move on attempt 2, and only the two-endpoint one wraps back to its
+  /// primary on attempt 3. Nothing correlates the members: within a
+  /// step they are distinct targets, and across attempts each still
+  /// visits every published endpoint.
+  #[test]
+  fn one_step_dials_the_same_index_of_every_targets_own_list() {
+    let triple = vec![endpoint(1), endpoint(2), endpoint(3)];
+    let pair = vec![endpoint(8), endpoint(9)];
+    // One step, two multi-homed targets: both dial their SECOND
+    // endpoint.
+    assert_eq!(recovery_endpoint(&triple, 2), Some(&triple[1]));
+    assert_eq!(recovery_endpoint(&pair, 2), Some(&pair[1]));
+    // The next attempt advances both serials; the shorter list wraps to
+    // its primary while the longer one reaches its last endpoint.
+    assert_eq!(recovery_endpoint(&triple, 3), Some(&triple[2]));
+    assert_eq!(recovery_endpoint(&pair, 3), Some(&pair[0]));
   }
 
   /// The gated-snapshot injection: once armed, every `snapshot` call
@@ -994,5 +1055,121 @@ mod tests {
     .await
     .expect("the parked dial must close with the shutdown reply");
     holder.abort();
+  }
+
+  /// Audit finding #5's bound, through the real recovery tick: while a
+  /// previous step's dial stays parked against a silent peer, the next
+  /// step must hold the in-flight count AT the fan-out bound instead of
+  /// overshooting to `2*fan_out - 1` — the pre-batch gate alone admits
+  /// the overshoot because a slot frees between the steps. Member 101's
+  /// first endpoint refuses connections (its slot frees inside the poll
+  /// below), so the second step starts with one held slot and a fan-out
+  /// of two: exactly one further dial may launch.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn recovery_steps_hold_in_flight_dials_at_the_fan_out_bound() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let config = NodeConfig::new()
+      .with_dial_deadline(std::time::Duration::from_secs(30))
+      .unwrap()
+      .with_recovery_policy(
+        crate::RecoveryConfig::new(
+          2,
+          std::time::Duration::from_secs(1),
+          std::time::Duration::from_secs(2),
+        )
+        .unwrap(),
+      )
+      .unwrap();
+    let (supervisor, _entropy, _sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    // A refusing peer: the dial fails fast and deterministically at the
+    // handshake, releasing its in-flight slot and giving the second step
+    // exactly one held slot to start from. The silent peer parks for the
+    // long dial deadline, so the window it leaves is wide on every
+    // platform.
+    let (refused_port, refused_holder) = refusing_peer().await;
+    let (first_port, first_connections, first_holder) = silent_peer().await;
+    let (second_port, second_connections, second_holder) = silent_peer().await;
+    install_member(&supervisor, &reference, 101, &[refused_port, first_port]).await;
+    install_member(&supervisor, &reference, 102, &[second_port]).await;
+
+    // Step 1 (attempt 1): 101 dials its refused first endpoint and 102
+    // parks against the silent peer — two slots taken, then one. The
+    // poll also awaits the parked dial's accept, since the connection
+    // lands asynchronously.
+    ticks.recovery_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+      loop {
+        if ticks
+          .recovery_pending
+          .load(std::sync::atomic::Ordering::Relaxed)
+          == 1
+          && second_connections.load(std::sync::atomic::Ordering::Relaxed) >= 1
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the refused dial must release its in-flight slot");
+    assert_eq!(
+      second_connections.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "the parked dial must hold against the counted silent peer"
+    );
+
+    // Step 2 (attempt 2, once the backoff comes due): one held slot,
+    // fan-out two — the step must stop at the bound instead of spawning
+    // both targets, which would park three dials in flight.
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if ticks
+          .recovery
+          .lock()
+          .unwrap()
+          .due(crate::time::now_seconds())
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the second recovery attempt must come due");
+    ticks.recovery_tick().await.unwrap();
+    assert_eq!(
+      ticks
+        .recovery_pending
+        .load(std::sync::atomic::Ordering::Relaxed),
+      2,
+      "the step must hold in-flight dials at the fan-out bound, never 2*fan_out - 1"
+    );
+    // The re-dial connects asynchronously: await its accept before
+    // counting, then check the bound left the second target alone.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+      loop {
+        if first_connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("attempt 2 must rotate 101 to its second endpoint");
+    assert_eq!(
+      second_connections.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "the bound must leave the second target to a later step"
+    );
+    first_holder.abort();
+    second_holder.abort();
+    refused_holder.abort();
   }
 }

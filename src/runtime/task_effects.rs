@@ -69,7 +69,10 @@ pub(crate) struct EffectPlanes {
   pub(crate) routes: crate::routing::RouteTable,
   /// The graceful-shutdown signal every kept session observes.
   pub(crate) shutdown: watch::Sender<()>,
-  /// The tracked connection tasks, aborted at node shutdown.
+  /// The tracked connection tasks: kept session pumps, in-flight dials,
+  /// and the graceful consumer drains. The recovery tick reaps finished
+  /// handles; shutdown drains them inside its bounded cooperative window
+  /// and aborts only the stragglers.
   pub(crate) connection_tasks: ConnectionTasks,
   /// The member-set revision signal, bumped one-to-one with the member
   /// events the identity effects emit.
@@ -352,6 +355,7 @@ async fn reconcile_connect(
     planes.sessions.clone(),
     Arc::clone(&planes.packet),
     planes.shutdown.subscribe(),
+    Arc::clone(&planes.connection_tasks),
     receiver,
     &peer,
     false,
@@ -370,10 +374,13 @@ async fn reconcile_disconnect(deps: Arc<OperationDeps>, peer: NodeId) -> Result<
   Ok(EffectOutcome::new(TaskOutput::Disconnect(())))
 }
 
-/// Spawns one kept session task into the node's tracked connection tasks:
-/// the recovery tick reaps finished handles and the shutdown path aborts
-/// the live ones.
-fn track_connection_task(
+/// Spawns one kept session task into the node's tracked connection
+/// tasks: the recovery tick reaps finished handles and the shutdown path
+/// awaits the live ones inside its bounded cooperative window, aborting
+/// only the stragglers. Shared by the join effect and `dial_member`, so
+/// every kept outbound session pump — join, member connect, recovery,
+/// and maintenance dial alike — has the one ownership path.
+pub(super) fn track_connection_task(
   tasks: &ConnectionTasks, task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 ) {
   let handle = tokio::spawn(task);
@@ -1388,9 +1395,10 @@ async fn reconcile_listen(
   let insert_listener = std::sync::Arc::clone(&listener);
   let attachment = bound.clone();
   // The accept loop is a tracked connection task: shutdown aborts it
-  // with the rest of the tracked set, and the registry keeps its abort
-  // handle for the explicit stop and the leave teardown (a second abort
-  // of an already-aborted task is a no-op).
+  // through the registry's abort handle (it parks on `accept()` and
+  // cannot exit cooperatively with the graceful signal), and the registry
+  // keeps that handle for the explicit stop and the leave teardown too (a
+  // second abort of an already-aborted task is a no-op).
   let accept = tokio::spawn(async move {
     tracing::debug!("accept loop started");
     // The hint provider is evaluated per accepted connection (after the

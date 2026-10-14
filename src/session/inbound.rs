@@ -76,15 +76,16 @@ impl FrameSource for ConnectionReader {
 
 /// Owns the read loop's consumer `JoinSet` and hands it to a node-scoped
 /// drain task when dropped — on the orderly exit AND the cancellation
-/// path. A read loop dropped mid-frame (deterministic replacement,
-/// shutdown, liveness failure, writer death) would otherwise leave its
-/// consumer tasks detached: no owner would join them, shutdown would not
-/// wait for an in-flight apply, and the recovery tick's reaper could not
-/// see them (audit 2026-10-09 item 12附带). Dropping a `JoinSet` detaches
-/// its children — they are aborted only if the drain task itself is —
-/// so the guard moves the set into the drain task on every path. The
-/// guard drops inside the session task's runtime context, so the spawn
-/// is always legal.
+/// path. In this tokio version, dropping a `JoinSet` ABORTS its
+/// children, so a read loop dropped mid-frame (deterministic
+/// replacement, shutdown, liveness failure, writer death) would cut an
+/// in-flight apply short and leave the surviving consumer tasks with no
+/// owner: nothing would join them, shutdown would not wait for them,
+/// and the recovery tick's reaper could not see them. The guard instead
+/// MOVES the set into the drain task on every path — an ownership
+/// transfer, not a drop — so the children keep running until the drain
+/// task joins them. The guard drops inside the session task's runtime
+/// context, so the spawn is always legal.
 struct ConsumerDrainGuard {
   consumers: JoinSet<()>,
   drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -260,7 +261,7 @@ async fn read_loop_frames(
             // end closes the body normally; an interrupted end (the
             // sending leg died mid-stream) surfaces exactly one typed
             // `StreamInterrupted` to the consumer instead of a silent
-            // truncation (audit 2026-10-09 item 11).
+            // truncation.
             let terminal = match end.reason {
               wire::EndReason::Completed => StreamItem::End,
               wire::EndReason::Interrupted => StreamItem::Interrupted,
@@ -280,7 +281,7 @@ async fn read_loop_frames(
       },
       PacketKind::Ack => match wire::decode_ack(&message.body, context.parser_limits()) {
         Ok(ack) => {
-          // Acknowledgement attribution (audit 2026-10-09 item 13): an
+          // Acknowledgement attribution: an
           // acknowledgement steers a forwarded hop only when it arrives on
           // that hop's current downstream attempt. A late acknowledgement
           // from a superseded branch (the hop deadline expired or the
@@ -969,8 +970,7 @@ mod read_loop_liveness_tests {
   /// A read loop cancelled mid-frame (a deterministic replacement, a
   /// shutdown signal, a liveness failure, a writer death) still hands its
   /// consumer `JoinSet` to the node-scoped drain task: the cancellation
-  /// path must not leave the session's consumer tasks detached (audit
-  /// 2026-10-09 item 12附带).
+  /// path must not abort the session's in-flight consumer tasks.
   #[tokio::test]
   async fn cancelled_read_loop_still_registers_the_consumer_drain() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
@@ -1041,7 +1041,7 @@ mod read_loop_liveness_tests {
 
   /// The long-lived read loop reaps completed consumer entries on its
   /// receive wakes instead of accumulating finished `JoinSet` entries for
-  /// the whole session's life (audit finding #8). Several short-lived
+  /// the whole session's life. Several short-lived
   /// consumers plus one still in flight are driven through the real frame
   /// loop with a test-owned guard (the admission path itself cannot run
   /// here without a negotiated feature set, so the guard receives exactly
@@ -1231,7 +1231,7 @@ mod ack_attribution_tests {
   /// and the stale branch's session now delivers its late failure. The
   /// live hop keeps its retry armed, the live attempt's pending entry
   /// survives, nothing fails upstream, and no acknowledgement resolves on
-  /// the stale session's map (audit 2026-10-09 item 13).
+  /// the stale session's map.
   #[tokio::test]
   async fn late_ack_from_a_superseded_branch_leaves_the_live_hop_untouched() {
     let trace_id = trace(9);
@@ -1260,6 +1260,7 @@ mod ack_attribution_tests {
         downstream_acks: Arc::clone(&live_acks),
         upstream_peer: node(3),
         relay_lock: Arc::new(tokio::sync::Mutex::new(())),
+        deadline: None,
         retry: Some(RetryState {
           open: OpenFrame {
             trace_id: trace_id.clone(),
