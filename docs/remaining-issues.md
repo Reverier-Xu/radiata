@@ -29,6 +29,13 @@
 | 待确认 A | `handshake.rs` 的 `unreachable!()` | 修复：改为 fail-closed `Malformed`，消除潜在 panic | `393a48f` |
 | 待确认 B | `recovery_endpoint` 与 degree 共享序号 | 复核为 **benign**（每步目标各自独立列表，failover 跨 attempt）；加测试与说明固定行为 | `9e011ff` |
 
+## CI 验证
+
+- PR #77（`fix/remaining-hardening` → `fix/connectivity-liveness-integrity`）CI：**全绿**（run `38523081151`，18 项含 windows / msrv / container / chat acceptance）。
+- CI 暴露并已修复的两项（非本分支引入的库缺陷，而是测试健壮性）：
+  - redb 重启测试：对 `shutdown()` 返回后短暂（≤200ms）未释放的文件锁做有界重试（`4ed742b`）。
+  - 在飞拨号上界测试（`runtime::degree`、`runtime::recovery`）：改用"接受后立即关闭"的拒绝对端，使被拒拨号在**各平台**都在握手阶段确定性快速失败（原本连未绑定端口的拒绝时机在 Windows 上会拖满整个 dial deadline），并将驻留窗口拉宽（`c0031ad`）。
+
 ## 本轮新发现
 
 - **`verify-*.sh` 家族未被 CI 运行**，其中 `verify-api.sh` 是公开 API 冻结门禁（要求与 `tests/fixtures/public-api/baseline-0.1.txt` 精确一致）。基线自 `c9d62f6` 起就已漂移：`NodeConfig::with_task_reconcile_slots` 为公开 API 但不在基线中。已按固定工具 `cargo-public-api 0.52.0` 重新生成基线修复（`1bf27e3`）。**建议把 `verify-api.sh` / `verify-public-abi.sh` 纳入 CI**，否则同类漂移仍不会被发现。
