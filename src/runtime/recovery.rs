@@ -366,6 +366,7 @@ impl TickState {
       let packet = self.packet.clone();
       let shutdown = self.shutdown.clone();
       let pending = Arc::clone(&self.recovery_pending);
+      let connection_tasks = self.connection_tasks.clone();
       let transport = match self.extensions.resolve_transport(&endpoint.selector()) {
         Ok(transport) => transport,
         // No transport for the endpoint: the dial fails and releases
@@ -386,6 +387,7 @@ impl TickState {
           sessions,
           packet,
           shutdown,
+          connection_tasks,
           receiver,
           &peer,
           true,
@@ -408,8 +410,9 @@ impl TickState {
         pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
       });
       // The dial's JoinHandle joins the tracked connection-task set the
-      // recovery tick reaps and the shutdown path aborts and awaits
-      // (audit finding #19): a dropped handle would leave an in-flight
+      // recovery tick reaps and the shutdown path drains inside its
+      // bounded cooperative window, aborting only the stragglers (audit
+      // finding #19): a dropped handle would leave an in-flight
       // handshake unowned — shutdown would neither cancel it nor wait
       // for it, so a lingering dial would keep holding this
       // incarnation's store and session Arcs across a restart.

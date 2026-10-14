@@ -299,6 +299,7 @@ impl TickState {
     let sessions = self.sessions.clone();
     let packet = self.packet.clone();
     let shutdown = self.shutdown.clone();
+    let connection_tasks = self.connection_tasks.clone();
     let dial_deadline = self.config.dial_deadline();
     let dial = tokio::spawn(async move {
       if let Err(error) = dial_member(
@@ -307,6 +308,7 @@ impl TickState {
         sessions,
         packet,
         shutdown,
+        connection_tasks,
         receiver,
         &peer,
         // Ordinary caller-class edge: the recovery plane's redundancy
@@ -326,9 +328,10 @@ impl TickState {
     });
     // The maintenance dial's JoinHandle joins the same tracked
     // connection-task set as the recovery dials (audit finding #19): the
-    // recovery tick reaps finished handles and the shutdown path aborts
-    // and awaits the rest, so an in-flight maintenance handshake is
-    // owned and torn down with the node instead of outliving it.
+    // recovery tick reaps finished handles and the shutdown path drains
+    // the rest inside its bounded cooperative window, aborting only the
+    // stragglers, so an in-flight maintenance handshake is owned and
+    // torn down with the node instead of outliving it.
     if let Ok(mut handles) = self.connection_tasks.lock() {
       handles.push(dial);
     }

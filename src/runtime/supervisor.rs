@@ -8,6 +8,7 @@ use tokio::{
 
 use super::{
   anti_entropy::spawn_sync_driver,
+  task_effects::{ConnectionTasks, track_connection_task},
   task_manager::{TaskManagerHandle, spawn_task_manager},
 };
 use crate::{
@@ -30,6 +31,17 @@ use crate::{
 };
 
 const CONTROL_CAPACITY: usize = 32;
+
+/// The bounded cooperative window the drained connection tasks get at
+/// shutdown before only the stragglers are aborted: the graceful
+/// signal was already broadcast, so an in-flight consumer drain (a
+/// fully received control payload mid persist-and-emit) completes
+/// instead of being aborted mid-apply, while a task that never settles
+/// can hold the shutdown reply no longer than this bound. Handles
+/// already aborted upstream (the anti-entropy driver, the tick
+/// workers, the accept loops) resolve immediately, so a quiet node's
+/// shutdown stays as prompt as before.
+const CONNECTION_TASK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Capacity of the node's outbound packet command channel:
 /// `PACKET_CHANNEL_CAPACITY` derives from it so one bound governs both
@@ -569,11 +581,28 @@ async fn finish_shutdown(
     queued_replies.push(reply);
   }
   tasks.shutdown().await;
-  // Await the aborted accept-side and anti-entropy driver tasks so their
-  // storage captures are dropped before the shutdown reply returns (a
-  // restarted node on the same factory must not race the release).
-  for handle in drained {
-    let _ = handle.await;
+  // Drain the returned task teardown so every storage capture is dropped
+  // before the shutdown reply returns (a restarted node on the same
+  // factory must not race the release). The handles aborted upstream (the
+  // anti-entropy driver, the tick workers, the accept loops) resolve
+  // immediately; the live connection tasks get one shared, bounded
+  // cooperative window — the graceful signal was already broadcast — so
+  // an in-flight consumer drain finishes its apply, and only a task still
+  // unfinished at the window's edge is aborted and reaped: a wedged task
+  // can never hang the reply past the bound.
+  let deadline = tokio::time::Instant::now() + CONNECTION_TASK_SHUTDOWN_GRACE;
+  for mut handle in drained {
+    if tokio::time::timeout_at(deadline, &mut handle)
+      .await
+      .is_err()
+    {
+      // Straggler: abort it, then reap the aborted join so its captures
+      // still drop before the reply. (A handle that settled inside the
+      // window was already joined by the timed poll — re-polling a
+      // completed `JoinHandle` panics, so only this arm awaits again.)
+      handle.abort();
+      let _ = handle.await;
+    }
   }
   drop(control);
   drop(dependencies);
@@ -884,15 +913,15 @@ impl Supervisor {
   fn into_dependencies(mut self) -> (RuntimeDependencies, Vec<tokio::task::JoinHandle<()>>) {
     // Every open session task observes the shutdown signal and closes its
     // connection instead of being orphaned when the supervisor exits; the
-    // tracked tasks (accept side and the anti-entropy driver) are aborted
-    // and their handles returned so the shutdown path can await them and
-    // their storage captures are deterministically dropped before a
-    // restarted node reopens the same factory.
+    // abortable node planes (the anti-entropy driver and the two tick
+    // workers) are aborted now and their handles returned so the shutdown
+    // path can await them and their storage captures are deterministically
+    // dropped before a restarted node reopens the same factory.
     let _ = self.shutdown_tx.send(());
-    let mut aborted = Vec::new();
+    let mut drained = Vec::new();
     if let Some(driver) = self.sync_driver.take() {
       driver.abort();
-      aborted.push(driver);
+      drained.push(driver);
     }
     // The tick workers observe the shutdown signal above and exit
     // cooperatively; the abort is the backstop for a worker stalled
@@ -900,13 +929,27 @@ impl Supervisor {
     // returned handles keep the shutdown reply behind their teardown.
     for worker in self.tick_workers.drain(..) {
       worker.abort();
-      aborted.push(worker);
+      drained.push(worker);
     }
-    if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
-      for handle in handles.drain(..) {
-        handle.abort();
-        aborted.push(handle);
+    // The accept loops park on `accept()` and cannot observe the graceful
+    // signal, so they are aborted here through the same registry abort
+    // handles the explicit stop and the leave teardown use (a second abort
+    // of an already-stopped loop is a no-op): a loop left for the
+    // cooperative window below could never finish it, and every listening
+    // node would sit out the whole grace at shutdown.
+    if let Ok(listeners) = self.dependencies.listeners.lock() {
+      for (_, _, abort) in listeners.values() {
+        abort.abort();
       }
+    }
+    // The tracked connection tasks (kept session pumps, in-flight dials,
+    // and the graceful consumer drains) are returned LIVE, not aborted:
+    // the signal above is their cooperative exit cue, and the shutdown
+    // path gives them one bounded grace window before aborting only the
+    // stragglers — an in-flight consumer apply must complete, and the
+    // reply still waits behind every handle's teardown.
+    if let Ok(mut handles) = self.dependencies.connection_tasks.lock() {
+      drained.extend(handles.drain(..));
     }
     // Definitive session teardown: the graceful shutdown signal lets live
     // session tasks run their exit cleanup, but an abort landing first
@@ -915,7 +958,7 @@ impl Supervisor {
     if let Err(error) = crate::session::stream::retire_all_sessions(&self.dependencies.sessions) {
       tracing::warn!(kind = ?error.kind(), "session table teardown failed");
     }
-    (self.dependencies, aborted)
+    (self.dependencies, drained)
   }
 
   pub(super) fn context(&self) -> Result<Arc<LocalIdentityContext>> {
@@ -960,13 +1003,16 @@ pub(super) async fn connect_with_deadline(
 /// and exporter binding, then the session is kept open for packet streams.
 /// Called by `connect_member` and by the recovery controller's detached
 /// dial tasks. The dial deadline travels with the call so a detached
-/// recovery dial releases its in-flight slot within the bound.
+/// recovery dial releases its in-flight slot within the bound. The kept
+/// session pump joins the node's tracked connection tasks through the
+/// same registration the join effect uses, so the recovery tick reaps
+/// it and the shutdown path owns it.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn dial_member(
   transport: Arc<dyn Transport>, driver: SessionDriver,
   sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
-  shutdown: watch::Receiver<()>, receiver: Endpoint, peer: &NodeId, recovery_dialed: bool,
-  dial_deadline: std::time::Duration,
+  shutdown: watch::Receiver<()>, connection_tasks: ConnectionTasks, receiver: Endpoint,
+  peer: &NodeId, recovery_dialed: bool, dial_deadline: std::time::Duration,
 ) -> Result<NodeId> {
   crate::audit::dial_started(peer.as_str(), recovery_dialed);
   let result = async {
@@ -1024,6 +1070,7 @@ pub(super) async fn dial_member(
     // The member-mode dial returns only after the session table settles, so
     // the caller's first packet cannot race registration (including the
     // crossed-dial loser outcome, which reports no usable session).
+    let tracked_tasks = Arc::clone(&connection_tasks);
     keep_outbound_session(
       connection,
       session,
@@ -1032,9 +1079,7 @@ pub(super) async fn dial_member(
       shutdown,
       receiver.clone(),
       recovery_dialed,
-      |session_task| {
-        tokio::spawn(session_task);
-      },
+      |session_task| track_connection_task(&tracked_tasks, session_task),
     )
     .await?;
     if pinned.is_some()
@@ -1344,6 +1389,160 @@ mod receipt_retention_sweep_tests {
       .unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining);
+  }
+}
+
+/// The shutdown drain contract for the tracked connection tasks: the
+/// graceful consumer drains (and every kept session pump) must survive
+/// node shutdown long enough to finish an in-flight apply, while a task
+/// that never settles can only delay the shutdown reply to the
+/// cooperative window's edge. Both drive the real teardown sequence —
+/// `into_dependencies` then `finish_shutdown` — over the shared
+/// supervisor fixture, with tokio's paused clock making the window
+/// deterministic.
+#[cfg(test)]
+mod shutdown_drain_tests {
+  use std::{
+    sync::{
+      Arc,
+      atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+  };
+
+  use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinSet,
+  };
+
+  use super::{
+    CONNECTION_TASK_SHUTDOWN_GRACE, CONTROL_CAPACITY, LifecyclePublisher, finish_shutdown,
+    test_support,
+  };
+  use crate::{ShutdownReason, runtime::LifecycleSnapshot};
+
+  /// An in-flight consumer drain's apply completes at shutdown instead
+  /// of being aborted mid-apply: the tracked drain task is handed out
+  /// live by `into_dependencies`, and `finish_shutdown`'s cooperative
+  /// window outlasts the apply's settle (the `ConsumerDrainGuard`
+  /// contract in `session::inbound`). Under the old abort-everything
+  /// teardown the parked apply dies with the node and the flag stays
+  /// false.
+  #[tokio::test(start_paused = true)]
+  async fn shutdown_completes_an_in_flight_consumer_drain_apply() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, _sessions) = test_support::supervisor_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+
+    // One tracked connection task shaped like the read loop's teardown
+    // drain: it owns a `JoinSet` whose single consumer is an apply parked
+    // mid-persist, and it exits only when that apply settles.
+    let applied = Arc::new(AtomicBool::new(false));
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let settle = Arc::clone(&applied);
+    let drain = tokio::spawn(async move {
+      let mut consumers = tokio::task::JoinSet::new();
+      consumers.spawn(async move {
+        let _ = release_rx.await;
+        settle.store(true, Ordering::Relaxed);
+      });
+      while consumers.join_next().await.is_some() {}
+    });
+    supervisor
+      .dependencies
+      .connection_tasks
+      .lock()
+      .unwrap()
+      .push(drain);
+    // The apply settles 100ms into the cooperative window, well inside
+    // the bound.
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_millis(100)).await;
+      let _ = release_tx.send(());
+    });
+
+    let (_control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+    let (state_tx, _state_rx) = watch::channel(LifecycleSnapshot::starting());
+    let mut lifecycle = LifecyclePublisher::new(state_tx);
+    let started = tokio::time::Instant::now();
+    let (dependencies, drained) = supervisor.into_dependencies();
+    finish_shutdown(
+      control_rx,
+      JoinSet::new(),
+      dependencies,
+      drained,
+      &mut lifecycle,
+      None,
+      ShutdownReason::Explicit,
+    )
+    .await;
+
+    assert!(
+      applied.load(Ordering::Relaxed),
+      "the in-flight consumer apply must complete at shutdown, not be aborted mid-apply"
+    );
+    assert!(
+      started.elapsed() < CONNECTION_TASK_SHUTDOWN_GRACE,
+      "a settling apply must not sit out the whole window ({} elapsed)",
+      started.elapsed().as_millis()
+    );
+  }
+
+  /// The negative space: a deliberately wedged connection task cannot
+  /// delay the shutdown reply past the cooperative window — the
+  /// straggler is aborted at the window's edge, reaped, and the reply
+  /// resolves, so total shutdown stays bounded no matter what a task
+  /// holds.
+  #[tokio::test(start_paused = true)]
+  async fn shutdown_bounds_a_wedged_connection_task_at_the_grace() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, _sessions) = test_support::supervisor_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+
+    // A task that never settles: no signal it observes, no completion.
+    supervisor
+      .dependencies
+      .connection_tasks
+      .lock()
+      .unwrap()
+      .push(tokio::spawn(std::future::pending::<()>()));
+
+    let (_control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+    let (state_tx, _state_rx) = watch::channel(LifecycleSnapshot::starting());
+    let mut lifecycle = LifecyclePublisher::new(state_tx);
+    let tracked = Arc::clone(&supervisor.dependencies.connection_tasks);
+    let (dependencies, drained) = supervisor.into_dependencies();
+    assert!(
+      tracked.lock().unwrap().is_empty(),
+      "the tracked set must be drained into the shutdown path, not aborted in place"
+    );
+    let started = tokio::time::Instant::now();
+    finish_shutdown(
+      control_rx,
+      JoinSet::new(),
+      dependencies,
+      drained,
+      &mut lifecycle,
+      None,
+      ShutdownReason::Explicit,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+      elapsed >= CONNECTION_TASK_SHUTDOWN_GRACE,
+      "the wedged task must actually get the cooperative window ({elapsed:?})"
+    );
+    assert!(
+      elapsed < CONNECTION_TASK_SHUTDOWN_GRACE + Duration::from_millis(500),
+      "the wedged task must not hold the reply past the window ({elapsed:?})"
+    );
   }
 }
 
