@@ -129,7 +129,25 @@ pub(crate) mod sync {
     ResourcePage::new(records, cursor)
   }
 
-  /// Applies one received page over the running node's metadata store.
+  /// The outcome of one received page's apply: how many records the
+  /// conditional register committed, and the records still deferred —
+  /// their writer's locally trusted descriptor never converged within
+  /// the bounded wait or the end-of-page retry, so the register never
+  /// evaluated them. A deferred record is neither installed nor
+  /// refused: the reconciliation plane keeps its row in the engines and
+  /// the repair set, so the descriptor's arrival (a register-epoch
+  /// advance) drives the retry instead of the detection cadence.
+  pub(crate) struct PageApply {
+    /// Records the register committed this pass.
+    pub(crate) applied: usize,
+    /// Records skipped fail-closed behind an unconverged writer.
+    pub(crate) deferred: Vec<ResourceRecordV1>,
+  }
+
+  /// Applies one received page over the running node's metadata store
+  /// and reports only the committed count — the form the test harnesses
+  /// and offline pagers consume (the production caller is the
+  /// reconciliation plane, which takes the reported form below).
   /// Every record's writer signature is validated against the locally
   /// trusted member descriptors **before** comparison. Writers the local
   /// descriptor store does not know yet wait concurrently for one bounded
@@ -141,9 +159,22 @@ pub(crate) mod sync {
   /// Installation goes through the
   /// conditional register commit, so stale, duplicated, and losing
   /// permutations cannot replace a greater stored winner.
+  #[cfg(test)]
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
   ) -> Result<usize> {
+    Ok(apply_page_reported_ctx(store, entropy, page).await?.applied)
+  }
+
+  /// The reported form of [`apply_page_ctx`] the reconciliation plane's
+  /// resources arm consumes: the identical bounded-wait discipline,
+  /// retry pass, and commits, plus the deferral report — records whose
+  /// writer never converged are reported distinctly from a decided
+  /// contest loss, so the plane keeps their rows for the descriptor's
+  /// arrival instead of reading the skip as a verdict.
+  pub(crate) async fn apply_page_reported_ctx(
+    store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
+  ) -> Result<PageApply> {
     // Resolve each distinct writer once per page: the bounded
     // descriptor-convergence wait is a per-writer cost, not a per-record
     // cost — a page of N records from one not-yet-converged writer waits
@@ -212,6 +243,7 @@ pub(crate) mod sync {
       .copied()
       .filter(|record| !resolved_keys.contains_key(record.writer()))
       .collect();
+    let mut resolved_retry: HashMap<NodeId, crate::PublicKey> = HashMap::new();
     if !stranded.is_empty() {
       // One re-resolution (and one warn) per writer, not per record: the
       // negative cache keeps unresolved writers in the map so the warn
@@ -235,7 +267,7 @@ pub(crate) mod sync {
           retried.insert(record.writer().clone(), resolution);
         }
       }
-      let resolved_retry: HashMap<NodeId, crate::PublicKey> = retried
+      resolved_retry = retried
         .iter()
         .filter_map(|(writer, key)| key.clone().map(|key| (writer.clone(), key)))
         .collect();
@@ -243,7 +275,16 @@ pub(crate) mod sync {
         super::super::store::commit_page_batch_ctx(store, entropy, &stranded, &resolved_retry)
           .await?;
     }
-    Ok(applied)
+    // The deferral report: records whose writer resolved in neither the
+    // bounded wait nor the retry. The register never evaluated them, so
+    // their skip is a deferral rather than a decided loss — the caller
+    // keeps the rows until the descriptor converges.
+    let deferred: Vec<ResourceRecordV1> = stranded
+      .into_iter()
+      .filter(|record| !resolved_retry.contains_key(record.writer()))
+      .cloned()
+      .collect();
+    Ok(PageApply { applied, deferred })
   }
 
   /// The trusted public key of `writer`, resolved from the locally stored
@@ -527,12 +568,17 @@ mod tests {
       trust(&installer, &landed_writer, SEED).await;
     });
 
-    let applied = sync::apply_page_ctx(&store, &SystemEntropy, &page)
+    let outcome = sync::apply_page_reported_ctx(&store, &SystemEntropy, &page)
       .await
       .unwrap();
     assert_eq!(
-      applied, 1,
+      outcome.applied, 1,
       "the mid-wait descriptor's record applies; the never-landed one skips"
+    );
+    assert_eq!(
+      outcome.deferred.len(),
+      1,
+      "the never-converged writer's record reports as deferred, not decided"
     );
     let got = read_current(&store, &name(1)).await;
     assert!(got.is_some(), "writer A's record is installed");
@@ -555,11 +601,14 @@ mod tests {
     // though its tuple would win an empty register.
     let unknown = record(&name(9), 5_000, &writer(), "u://unknown", SEED);
     let page = ResourcePage::new(vec![unknown], None).unwrap();
+    let outcome = sync::apply_page_reported_ctx(&receiver, &SystemEntropy, &page)
+      .await
+      .unwrap();
+    assert_eq!(outcome.applied, 0);
     assert_eq!(
-      sync::apply_page_ctx(&receiver, &SystemEntropy, &page)
-        .await
-        .unwrap(),
-      0
+      outcome.deferred.len(),
+      1,
+      "the unknown writer's record defers instead of deciding"
     );
     assert!(read_current(&receiver, &name(9)).await.is_none());
   }
@@ -606,11 +655,13 @@ mod tests {
     )
     .unwrap();
     let page = ResourcePage::new(vec![forged], None).unwrap();
-    assert_eq!(
-      sync::apply_page_ctx(&receiver, &SystemEntropy, &page)
-        .await
-        .unwrap(),
-      0
+    let outcome = sync::apply_page_reported_ctx(&receiver, &SystemEntropy, &page)
+      .await
+      .unwrap();
+    assert_eq!(outcome.applied, 0);
+    assert!(
+      outcome.deferred.is_empty(),
+      "a known writer's bad signature is a decided skip, not a deferral"
     );
     assert!(read_current(&receiver, &name(4)).await.is_none());
   }
