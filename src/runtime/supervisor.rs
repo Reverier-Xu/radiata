@@ -1872,4 +1872,20 @@ pub(crate) mod test_support {
     });
     (port, connections, handle)
   }
+
+  /// A refusing TCP peer: accepts every connection and immediately drops
+  /// it, so a wss dial fails fast and deterministically at the handshake
+  /// on every platform — unlike a connect to an unbound port, whose
+  /// refusal timing is OS-dependent (on Windows the connect can hold the
+  /// full dial deadline, collapsing the window an in-flight test needs).
+  pub(crate) async fn refusing_peer() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+      while let Ok((stream, _)) = listener.accept().await {
+        drop(stream);
+      }
+    });
+    (port, handle)
+  }
 }

@@ -619,7 +619,7 @@ mod tests {
       StoreRequirements, StoreSnapshot, StoreTransaction,
     },
     runtime::supervisor::test_support::{
-      install_member, member_id, member_key, silent_peer, supervisor_over,
+      install_member, member_id, member_key, refusing_peer, silent_peer, supervisor_over,
     },
   };
 
@@ -1071,7 +1071,7 @@ mod tests {
       crate::storage::contract::required_capabilities(),
     ));
     let config = NodeConfig::new()
-      .with_dial_deadline(std::time::Duration::from_secs(2))
+      .with_dial_deadline(std::time::Duration::from_secs(30))
       .unwrap()
       .with_recovery_policy(
         crate::RecoveryConfig::new(
@@ -1088,11 +1088,12 @@ mod tests {
     )
     .await;
     let ticks = supervisor.tick_state().unwrap();
-    // A closed port: the dial fails fast and releases its in-flight
-    // slot, giving the second step exactly one held slot to start from.
-    let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let refused_port = refused.local_addr().unwrap().port();
-    drop(refused);
+    // A refusing peer: the dial fails fast and deterministically at the
+    // handshake, releasing its in-flight slot and giving the second step
+    // exactly one held slot to start from. The silent peer parks for the
+    // long dial deadline, so the window it leaves is wide on every
+    // platform.
+    let (refused_port, refused_holder) = refusing_peer().await;
     let (first_port, first_connections, first_holder) = silent_peer().await;
     let (second_port, second_connections, second_holder) = silent_peer().await;
     install_member(&supervisor, &reference, 101, &[refused_port, first_port]).await;
@@ -1169,5 +1170,6 @@ mod tests {
     );
     first_holder.abort();
     second_holder.abort();
+    refused_holder.abort();
   }
 }

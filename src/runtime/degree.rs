@@ -397,7 +397,8 @@ mod tests {
   use std::sync::Arc;
 
   use crate::runtime::supervisor::test_support::{
-    self, insert_live_session, install_member, member_id, silent_peer, supervisor_over,
+    self, insert_live_session, install_member, member_id, refusing_peer, silent_peer,
+    supervisor_over,
   };
 
   /// The maintenance tick's wiring: with one live session and four
@@ -558,17 +559,22 @@ mod tests {
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn maintenance_tick_holds_in_flight_dials_at_the_dial_budget() {
     let (reference, config) = test_support::reference_and_config();
+    // A long dial deadline keeps the parked dial in flight for the whole
+    // test, so the one-held-slot window the second tick needs is wide on
+    // every platform.
+    let config = config
+      .with_dial_deadline(std::time::Duration::from_secs(30))
+      .unwrap();
     let (supervisor, _entropy, sessions) = supervisor_over(
       reference.clone() as Arc<dyn crate::provider::StorageFactory>,
       config,
     )
     .await;
     let ticks = supervisor.tick_state().unwrap();
-    // A closed port: the dial fails fast and releases its in-flight
-    // slot, giving the second tick exactly one held slot to start from.
-    let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let refused_port = refused.local_addr().unwrap().port();
-    drop(refused);
+    // A refusing peer: the dial fails fast and deterministically at the
+    // handshake, releasing its in-flight slot and giving the second tick
+    // exactly one held slot to start from.
+    let (refused_port, refused_holder) = refusing_peer().await;
     let (first_port, first_connections, first_holder) = silent_peer().await;
     let (second_port, second_connections, second_holder) = silent_peer().await;
 
@@ -640,6 +646,7 @@ mod tests {
     );
     first_holder.abort();
     second_holder.abort();
+    refused_holder.abort();
   }
 
   /// The bridge-probe cadence stays on the order of five minutes
