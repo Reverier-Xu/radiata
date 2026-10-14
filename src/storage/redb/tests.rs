@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use super::RedbStoreFactory;
 use crate::{
   CommitOutcome, Digest, ErrorKind, StoreExpectation, StoreOperation, StoreRequirements,
-  StoreTransaction, StoreValue, TransactionId, provider::StorageFactory,
+  StoreRevision, StoreTransaction, StoreValue, TransactionId, provider::StorageFactory,
 };
 
 fn factory(directory: &TempDir) -> Arc<dyn StorageFactory> {
@@ -498,6 +498,60 @@ async fn redb_adapter_outcome_unknown_commit_failure_freezes_the_store() {
     crate::ReconcileOutcome::Aborted
   ));
   assert!(!store.is_blocked().unwrap());
+}
+
+/// A persisted revision row that is not the 8-byte big-endian
+/// generation is on-disk corruption, never caller input (finding #9):
+/// every reader that reaches the decoder from persisted data — here
+/// the snapshot revision and the commit precheck — must surface
+/// `StorageCorrupt` and fail closed instead of blaming the caller with
+/// invalid input.
+#[tokio::test]
+async fn redb_adapter_corrupted_persisted_revision_surfaces_storage_corrupt() {
+  let directory = TempDir::new().unwrap();
+  let path = directory.path().join("store.redb");
+  {
+    // Inject the corruption through the real meta table before the
+    // store ever opens, so the malformed row is genuine on-disk state
+    // rather than an injected fault.
+    let database = redb::Database::create(&path).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+      let mut meta = write
+        .open_table(crate::storage::redb::store::META_TABLE)
+        .unwrap();
+      meta
+        .insert(
+          crate::storage::redb::store::REVISION_META_KEY,
+          b"malformed".as_slice(),
+        )
+        .unwrap();
+    }
+    write.commit().unwrap();
+  }
+  let factory = factory(&directory);
+  let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
+
+  let error = storage.snapshot().await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::StorageCorrupt);
+
+  // The commit path's precheck decodes the same persisted revision row
+  // and must fail closed the same way instead of committing on top of
+  // an unreadable generation.
+  let base = StoreRevision::new(Arc::from(0_u64.to_be_bytes())).unwrap();
+  let transaction = StoreTransaction::new(
+    crate::storage::test_util::transaction_id(9004),
+    base,
+    vec![StoreOperation::Put {
+      namespace: crate::storage::test_util::namespace("redb-revision-corrupt"),
+      key: crate::storage::test_util::key(b"never-written"),
+      expected: StoreExpectation::Absent,
+      value: crate::storage::test_util::value(b"never-lands"),
+    }],
+  )
+  .unwrap();
+  let error = storage.commit(transaction).await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::StorageCorrupt);
 }
 
 /// A definite-abort commit failure — here a poisoned transaction —

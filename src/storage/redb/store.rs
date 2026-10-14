@@ -28,8 +28,11 @@ const ENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay
 const DIGESTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-digests-v1");
 const RECEIPTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-receipts-v1");
 const VALUE_DIGEST_BYTES: usize = 32;
-const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-meta-v1");
-const REVISION_META_KEY: &[u8] = b"revision";
+// Visible to the adapter's test module so corruption tests inject
+// malformed rows through the real tables instead of restating the
+// frozen names.
+pub(super) const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay-meta-v1");
+pub(super) const REVISION_META_KEY: &[u8] = b"revision";
 const RECEIPT_VALUE_BYTES: usize = 40;
 
 /// Test-only crash injection for the subprocess durability matrix.
@@ -284,16 +287,25 @@ impl Storage for RedbStorage {
   }
 
   fn snapshot<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn StoreSnapshot>>> {
+    let database = Arc::clone(&self.database);
     Box::pin(async move {
-      let transaction = self
-        .database
-        .begin_read()
-        .map_err(|error| map_transaction_error(error, ProviderErrorContext::StorageSnapshot))?;
-      let revision = snapshot_revision(&transaction)?;
-      Ok(Box::new(RedbSnapshot {
-        transaction,
-        revision,
-      }) as Box<dyn StoreSnapshot>)
+      // `begin_read` takes the database's internal file lock and can
+      // block behind a durable commit, so the open (and the revision
+      // read it seeds) runs on the blocking pool: write pressure can
+      // never stall the async runtime thread.
+      let snapshot = tokio::task::spawn_blocking(move || {
+        let transaction = database
+          .begin_read()
+          .map_err(|error| map_transaction_error(error, ProviderErrorContext::StorageSnapshot))?;
+        let revision = snapshot_revision(&transaction)?;
+        Ok::<RedbSnapshot, Error>(RedbSnapshot {
+          transaction,
+          revision,
+        })
+      })
+      .await
+      .map_err(|_| internal(ProviderErrorContext::StorageSnapshot))??;
+      Ok(Box::new(snapshot) as Box<dyn StoreSnapshot>)
     })
   }
 
@@ -576,15 +588,19 @@ fn current_generation(
     .get(REVISION_META_KEY)
     .map_err(|error| map_storage_error(error, context))?;
   Ok(match stored {
-    Some(guard) => decode_revision(guard.value())?,
+    Some(guard) => decode_revision(guard.value(), context)?,
     None => 0,
   })
 }
 
-fn decode_revision(bytes: &[u8]) -> Result<u64> {
+/// Decodes the persisted 8-byte big-endian generation counter. The
+/// bytes come from the on-disk revision row (or a receipt tail), never
+/// from the caller, so any other shape is storage corruption that
+/// fails closed rather than invalid input.
+fn decode_revision(bytes: &[u8], context: ProviderErrorContext) -> Result<u64> {
   let raw: [u8; 8] = bytes
     .try_into()
-    .map_err(|_| Error::invalid_input("redb store revision"))?;
+    .map_err(|_| super::super::storage_corrupt(context))?;
   Ok(u64::from_be_bytes(raw))
 }
 
@@ -614,7 +630,7 @@ fn read_receipt(
       let digest_digest: [u8; 32] = digest_bytes
         .try_into()
         .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageReconcile))?;
-      let generation = decode_revision(revision_bytes)?;
+      let generation = decode_revision(revision_bytes, ProviderErrorContext::StorageReconcile)?;
       Some(CommitReceipt::new(
         transaction.clone(),
         Digest::from_bytes(digest_digest),
