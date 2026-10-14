@@ -33,6 +33,7 @@
 
 - **`verify-*.sh` 家族未被 CI 运行**，其中 `verify-api.sh` 是公开 API 冻结门禁（要求与 `tests/fixtures/public-api/baseline-0.1.txt` 精确一致）。基线自 `c9d62f6` 起就已漂移：`NodeConfig::with_task_reconcile_slots` 为公开 API 但不在基线中。已按固定工具 `cargo-public-api 0.52.0` 重新生成基线修复（`1bf27e3`）。**建议把 `verify-api.sh` / `verify-public-abi.sh` 纳入 CI**，否则同类漂移仍不会被发现。
 - **公开 API 兼容性修订**：`ErrorKind::FrameTooLarge` 为新增变体（`ErrorKind` 为 `#[non_exhaustive]`，非破坏性），已按 `verify-api.sh` 的既定流程更新 0.1 基线（`34a643c`）。
+- **redb 重启存在既有的有界锁释放瞬态**：`shutdown()` 返回后，一个在途的 detached redb commit（可保证取消后仍落地）仍可能短暂持有 `Arc<Database>`，使同一文件的立即重开返回 `StorageLocked`。实测在约 200ms 内自行释放（父提交 `4e12928` 与本分支均约 3/60 概率命中），**非本轮引入、也非泄漏**。重启测试（`resource_operations`、`redb_runtime`、`leave`）已改为对该类型化错误做有界重试（`4ed742b`）。建议后续在节点 shutdown 路径等待在途 detached commit 后再释放存储，从根本上消除该窗口。
 
 ## 仍然保留的观察（非缺陷，未改）
 
