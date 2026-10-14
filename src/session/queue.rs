@@ -13,6 +13,7 @@ use std::{
 };
 
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::{Error, Result, TraceId, api::BoxFuture, packet::wire, protocol::wire::PacketKind};
 
@@ -188,8 +189,15 @@ impl BoundedSender {
   /// progresses. Order is preserved by the FIFO queue.
   /// Wakeups come from [`BoundedReceiver::recv`] releases; the bounded
   /// backstop covers a closed queue that will never release again.
+  /// A frame whose encoded size alone exceeds the byte bound can never be
+  /// admitted, so it is rejected with the overload error immediately
+  /// instead of waiting on a release that cannot help.
   pub(crate) async fn send_waiting(&self, frame: SessionFrame) -> Result<()> {
     let bytes = FRAME_OVERHEAD.saturating_add(frame.body.len());
+    if bytes > self.max_bytes {
+      warn!(kind = ?frame.kind, bytes, "oversized frame exceeds session queue byte bound");
+      return Err(Error::overloaded("session queue"));
+    }
     loop {
       match self.reserve(bytes)? {
         Some(reserved) => {
@@ -256,6 +264,8 @@ pub(crate) fn test_queue(max_count: usize, max_bytes: usize) -> (BoundedSender, 
 
 #[cfg(test)]
 mod queue_tests {
+  use std::time::Duration;
+
   use futures_util::FutureExt;
 
   use super::{BoundedReceiver, BoundedSender, FRAME_OVERHEAD, SessionFrame};
@@ -309,5 +319,21 @@ mod queue_tests {
     let _ = receiver.recv().await.unwrap();
     sender.send(frame(10)).await.unwrap();
     let _ = receiver.recv().await.unwrap();
+  }
+
+  /// A frame whose encoded size alone exceeds the byte bound can never be
+  /// admitted, so the waiting send must fail closed with the overload
+  /// error instead of blocking forever on releases that cannot help.
+  #[tokio::test]
+  async fn waiting_send_fails_immediately_on_permanently_oversized_frame() {
+    let (sender, mut receiver) = queue(8, FRAME_OVERHEAD + 32);
+    let error = tokio::time::timeout(Duration::from_secs(5), sender.send_waiting(frame(64)))
+      .await
+      .unwrap()
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Overloaded);
+    assert_eq!(error.context(), "session queue");
+    // Nothing was enqueued by the rejected frame (a recv would hang).
+    assert!(receiver.recv().now_or_never().is_none());
   }
 }

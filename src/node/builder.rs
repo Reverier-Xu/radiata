@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use crate::{
-  ExtensionRegistry, NodeConfig, NodeHandle, Result,
+  ExtensionRegistry, NodeConfig, NodeHandle, Result, TransportScheme,
   api::{Entropy, SystemEntropy},
   provider::{KeyProvider, StorageFactory},
   runtime::{RuntimeDependencies, spawn_runtime},
+  transport::registry::builtin_transport_tag,
 };
 
 pub struct NodeBuilder {
@@ -68,17 +69,17 @@ impl NodeBuilder {
     // through the registry at runtime.
     for (tag, transport) in [
       (
-        crate::transport::tls_transport::TlsTransport::tag()?,
+        builtin_transport_tag(TransportScheme::Tls)?,
         Arc::new(crate::transport::tls_transport::TlsTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),
       (
-        crate::transport::wss::WssTransport::tag()?,
+        builtin_transport_tag(TransportScheme::Wss)?,
         Arc::new(crate::transport::wss::WssTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),
       (
-        crate::transport::plain::PlainTransport::tag()?,
+        builtin_transport_tag(TransportScheme::Tcp)?,
         Arc::new(crate::transport::plain::PlainTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),

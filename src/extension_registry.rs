@@ -67,7 +67,7 @@ pub(crate) struct ProtocolRegistration {
 #[derive(Default)]
 pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,
-  protocols: std::sync::Mutex<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
+  protocols: std::sync::RwLock<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
   transports: BTreeMap<TransportTag, Arc<dyn Transport>>,
   /// The caller-registered transport providers, keyed by the scheme name
   /// (protocol prefix) each one owns.
@@ -75,8 +75,8 @@ pub struct ExtensionRegistry {
   #[cfg(test)]
   discoveries: BTreeMap<DiscoveryTag, Arc<dyn Discovery>>,
   load_balancers:
-    std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
-  next_hops: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
+    std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
+  next_hops: std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
   resource_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ResourceHook>>>,
   action_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ActionHook>>>,
   task_reconcilers: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::TaskReconciler>>>,
@@ -223,7 +223,7 @@ impl ExtensionRegistry {
     {
       let mut balancers = self
         .load_balancers
-        .lock()
+        .write()
         .map_err(Error::extension_registry)?;
       insert_once(&mut balancers, tag, value, "load balancer registration")?;
     }
@@ -236,7 +236,7 @@ impl ExtensionRegistry {
   ) -> Option<Arc<dyn crate::LoadBalancingPolicy>> {
     self
       .load_balancers
-      .lock()
+      .read()
       .ok()
       .and_then(|balancers| balancers.get(tag).cloned())
   }
@@ -245,7 +245,7 @@ impl ExtensionRegistry {
   pub(crate) fn has_load_balancer(&self, tag: &crate::QualifiedTag) -> bool {
     self
       .load_balancers
-      .lock()
+      .read()
       .map(|balancers| balancers.contains_key(tag))
       .unwrap_or(false)
   }
@@ -258,7 +258,7 @@ impl ExtensionRegistry {
     &mut self, tag: crate::QualifiedTag, value: Arc<dyn crate::RouteNextHop>,
   ) -> Result<&mut Self> {
     {
-      let mut policies = self.next_hops.lock().map_err(Error::extension_registry)?;
+      let mut policies = self.next_hops.write().map_err(Error::extension_registry)?;
       insert_once(&mut policies, tag, value, "next-hop registration")?;
     }
     Ok(self)
@@ -270,7 +270,7 @@ impl ExtensionRegistry {
   ) -> Option<Arc<dyn crate::RouteNextHop>> {
     self
       .next_hops
-      .lock()
+      .read()
       .ok()
       .and_then(|policies| policies.get(tag).cloned())
   }
@@ -390,7 +390,7 @@ impl ExtensionRegistry {
   fn register_protocol_inner(
     &self, value: ProtocolDefinition, consumer: Arc<dyn PacketConsumer>,
   ) -> Result<()> {
-    let mut protocols = self.protocols.lock().map_err(Error::extension_registry)?;
+    let mut protocols = self.protocols.write().map_err(Error::extension_registry)?;
     insert_once(
       &mut protocols,
       value.tag.clone(),
@@ -407,7 +407,7 @@ impl ExtensionRegistry {
   pub(crate) fn protocol(&self, tag: &ProtocolTag) -> Option<Arc<ProtocolRegistration>> {
     self
       .protocols
-      .lock()
+      .read()
       .ok()
       .and_then(|protocols| protocols.get(tag).cloned())
   }
@@ -416,7 +416,7 @@ impl ExtensionRegistry {
   pub(crate) fn has_protocol(&self, tag: &ProtocolTag) -> bool {
     self
       .protocols
-      .lock()
+      .read()
       .ok()
       .is_some_and(|protocols| protocols.contains_key(tag))
   }
@@ -429,7 +429,7 @@ impl fmt::Debug for ExtensionRegistry {
       "protocols",
       &self
         .protocols
-        .lock()
+        .read()
         .map(|protocols| protocols.len())
         .unwrap_or(0),
     );
@@ -441,7 +441,7 @@ impl fmt::Debug for ExtensionRegistry {
         "load_balancers",
         &self
           .load_balancers
-          .lock()
+          .read()
           .map(|balancers| balancers.len())
           .unwrap_or(0),
       )
@@ -449,7 +449,7 @@ impl fmt::Debug for ExtensionRegistry {
         "next_hops",
         &self
           .next_hops
-          .lock()
+          .read()
           .map(|policies| policies.len())
           .unwrap_or(0),
       )
@@ -523,6 +523,18 @@ mod tests {
   impl crate::ActionHook for NoopActionHook {}
 
   #[derive(Debug)]
+  struct NoopLoadBalancer;
+
+  impl crate::LoadBalancingPolicy for NoopLoadBalancer {
+    fn select<'a>(
+      &'a self, _selector: &'a crate::routing::Selector,
+      _candidates: &'a dyn crate::CandidateNodeReader,
+    ) -> crate::api::BoxFuture<'a, Result<crate::NodeId>> {
+      Box::pin(async { Err(crate::Error::route_unavailable("packet candidates")) })
+    }
+  }
+
+  #[derive(Debug)]
   struct NoopReconciler;
 
   impl crate::TaskReconciler for NoopReconciler {
@@ -565,6 +577,97 @@ mod tests {
     assert!(
       !registry.has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/gamma").unwrap())
     );
+  }
+
+  /// The read-mostly maps guard lookups with a shared lock and only
+  /// registration takes the exclusive lock: concurrent protocol,
+  /// load-balancer, and next-hop lookups coexist with a thread exercising
+  /// the late `&self` core-registration path — duplicate registrations
+  /// stay conflicts, the one new tag registers, and every lookup keeps
+  /// resolving exactly the registered entries. Completion is the
+  /// no-deadlock proof.
+  #[test]
+  fn concurrent_lookups_coexist_with_late_core_registration() {
+    use std::sync::Barrier;
+
+    let mut registry = ExtensionRegistry::new();
+    let alpha = definition("alpha");
+    let alpha_tag = alpha.tag.clone();
+    registry
+      .register_protocol(alpha, Arc::new(NoopConsumer))
+      .unwrap();
+    let expected_registration = registry.protocol(&alpha_tag).unwrap();
+
+    let balancer_tag = crate::QualifiedTag::parse("example.com/policies/pinned").unwrap();
+    registry
+      .register_load_balancer(balancer_tag.clone(), Arc::new(NoopLoadBalancer))
+      .unwrap();
+    let expected_balancer = registry.load_balancer(&balancer_tag).unwrap();
+
+    let hop_tag = crate::routing::DefaultNextHop::tag().unwrap();
+    registry
+      .register_next_hop(hop_tag.clone(), Arc::new(crate::routing::DefaultNextHop))
+      .unwrap();
+    let expected_hop = registry.next_hop_policy(&hop_tag).unwrap();
+
+    let registry = std::sync::Arc::new(registry);
+
+    let readers = 4;
+    let iterations = 1_000;
+    let barrier = Arc::new(Barrier::new(readers + 1));
+    let mut reader_handles = Vec::new();
+    for _ in 0..readers {
+      let registry = Arc::clone(&registry);
+      let alpha_tag = alpha_tag.clone();
+      let expected_registration = Arc::clone(&expected_registration);
+      let balancer_tag = balancer_tag.clone();
+      let expected_balancer = Arc::clone(&expected_balancer);
+      let hop_tag = hop_tag.clone();
+      let expected_hop = Arc::clone(&expected_hop);
+      let barrier = Arc::clone(&barrier);
+      reader_handles.push(std::thread::spawn(move || {
+        barrier.wait();
+        for _ in 0..iterations {
+          let registration = registry.protocol(&alpha_tag).unwrap();
+          assert!(Arc::ptr_eq(&registration, &expected_registration));
+          assert!(registry.has_protocol(&alpha_tag));
+          let balancer = registry.load_balancer(&balancer_tag).unwrap();
+          assert!(Arc::ptr_eq(&balancer, &expected_balancer));
+          let hop = registry.next_hop_policy(&hop_tag).unwrap();
+          assert!(Arc::ptr_eq(&hop, &expected_hop));
+        }
+      }));
+    }
+
+    let writer = {
+      let registry = Arc::clone(&registry);
+      let barrier = Arc::clone(&barrier);
+      std::thread::spawn(move || {
+        barrier.wait();
+        for _ in 0..256 {
+          let error = registry
+            .register_core_protocol(definition("alpha"), Arc::new(NoopConsumer))
+            .unwrap_err();
+          assert_eq!(error.kind(), ErrorKind::Conflict);
+        }
+        registry
+          .register_core_protocol(definition("beta"), Arc::new(NoopConsumer))
+          .unwrap();
+      })
+    };
+
+    for handle in reader_handles {
+      handle.join().unwrap();
+    }
+    writer.join().unwrap();
+
+    let beta = definition("beta");
+    assert!(registry.has_protocol(&beta.tag));
+    assert!(registry.has_protocol(&alpha_tag));
+    assert!(Arc::ptr_eq(
+      &registry.protocol(&alpha_tag).unwrap(),
+      &expected_registration
+    ));
   }
 
   /// The three hook maps follow the same insertion-once rule as every

@@ -27,7 +27,7 @@ use super::{
   tcp, tls,
 };
 use crate::{
-  Error, ProviderErrorContext, Result, TransportTag,
+  Error, ProviderErrorContext, Result,
   api::{BoxFuture, SystemEntropy},
   protocol::wire::connection_frame_rules,
 };
@@ -50,18 +50,6 @@ impl fmt::Debug for TlsTransport {
 impl TlsTransport {
   pub(crate) fn new() -> Self {
     Self
-  }
-
-  /// The canonical tag of the built-in transport, parsed once.
-  pub(crate) fn tag() -> Result<TransportTag> {
-    // The literal is a fixed canonical constant; parse once and surface the
-    // impossible failure as an internal error instead of panicking.
-    static TAG: std::sync::OnceLock<std::result::Result<TransportTag, ()>> =
-      std::sync::OnceLock::new();
-    TAG
-      .get_or_init(|| TransportTag::parse(BUILTIN_TRANSPORT_TLS).map_err(|_| ()))
-      .clone()
-      .map_err(|_| crate::Error::internal("built-in transport tag"))
   }
 }
 

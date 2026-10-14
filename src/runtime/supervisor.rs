@@ -667,6 +667,12 @@ pub(super) struct TickState {
   /// recovery plane's `recovery_endpoint` rotation — see
   /// `runtime/degree.rs`).
   pub(super) degree_attempt: Arc<std::sync::atomic::AtomicU64>,
+  /// The bridge-probe cadence bracket: maintenance ticks an otherwise
+  /// quiescent healthy node waits before its next cross-partition probe
+  /// dial (audit finding #1's residual boundary — see `runtime/degree.rs`).
+  /// Only the maintenance worker mutates it, so a racing read at worst
+  /// shifts one probe by one tick.
+  pub(super) bridge_probe_ticks: Arc<std::sync::atomic::AtomicU32>,
   /// Recovery-tick cooldown before the next redundant-edge cut. Only
   /// the recovery worker mutates it; a racing read at worst shifts one
   /// cut by one tick.
@@ -866,6 +872,9 @@ impl Supervisor {
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       degree_attempt: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+      bridge_probe_ticks: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+        super::degree::BRIDGE_PROBE_INTERVAL_TICKS,
+      )),
       prune_cooldown: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
       exclusion_cache: Arc::clone(&self.exclusion_cache),
       trace_records: Arc::clone(&self.trace_records),
@@ -961,12 +970,15 @@ pub(super) async fn dial_member(
 ) -> Result<NodeId> {
   crate::audit::dial_started(peer.as_str(), recovery_dialed);
   let result = async {
-    // Member reconnects pin the peer's TLS leaf to the SPKI anchor learned
-    // at join (same-listener reconnects); without an anchor this process
-    // falls back to the join-mode relaxation and the application proof
-    // layer remains the authenticator. The endpoint's transport class
-    // decides whether either TLS mode applies at all.
-    let pinned = driver.peer_spki(peer);
+    // Member reconnects pin the peer's TLS leaf to the SPKI anchor
+    // learned for this exact concrete target (scheme and address: a
+    // repeated dial to the same endpoint); any other listener of the
+    // same peer — another scheme, a second listener, a rebound address
+    // — has no anchor here and dials under the join-mode relaxation,
+    // where the application proof layer remains the authenticator. The
+    // endpoint's transport class decides whether either TLS mode applies
+    // at all.
+    let pinned = driver.peer_spki(peer, &receiver);
     let trust = TransportTrust::for_dial(
       &receiver.selector(),
       pinned
@@ -1018,7 +1030,7 @@ pub(super) async fn dial_member(
       packet,
       sessions,
       shutdown,
-      receiver,
+      receiver.clone(),
       recovery_dialed,
       |session_task| {
         tokio::spawn(session_task);
@@ -1028,9 +1040,10 @@ pub(super) async fn dial_member(
     if pinned.is_some()
       && let Some(spki) = observed_spki
     {
-      // Process-local rollover: the re-issued leaf replaces the stale
-      // anchor, so every later member dial to this peer pins again.
-      driver.record_peer_spki(peer, spki);
+      // Process-local rollover on this target: the re-issued leaf
+      // replaces the stale anchor, so every later member dial to the
+      // same endpoint pins again.
+      driver.record_peer_spki(peer, &receiver, spki);
     }
     Ok(authenticated)
   }
@@ -1348,7 +1361,7 @@ pub(crate) mod test_support {
 
   use super::{RuntimeDependencies, Supervisor, node_offer};
   use crate::{
-    NodeConfig,
+    NodeConfig, TransportScheme,
     extension_registry::ExtensionRegistry,
     identity::{
       lifecycle::open_local_identity,
@@ -1358,6 +1371,7 @@ pub(crate) mod test_support {
     provider::StorageFactory,
     session::stream::SessionTable,
     storage::contract::{ReferenceFactory, required_capabilities},
+    transport::registry::builtin_transport_tag,
   };
 
   /// Builds a supervisor over a fresh in-memory identity opened through
@@ -1383,17 +1397,17 @@ pub(crate) mod test_support {
     // resolve the members' wss endpoints through this registry.
     for (tag, transport) in [
       (
-        crate::transport::tls_transport::TlsTransport::tag().unwrap(),
+        builtin_transport_tag(TransportScheme::Tls).unwrap(),
         Arc::new(crate::transport::tls_transport::TlsTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),
       (
-        crate::transport::wss::WssTransport::tag().unwrap(),
+        builtin_transport_tag(TransportScheme::Wss).unwrap(),
         Arc::new(crate::transport::wss::WssTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),
       (
-        crate::transport::plain::PlainTransport::tag().unwrap(),
+        builtin_transport_tag(TransportScheme::Tcp).unwrap(),
         Arc::new(crate::transport::plain::PlainTransport::new())
           as Arc<dyn crate::transport::registry::Transport>,
       ),

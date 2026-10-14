@@ -287,13 +287,24 @@ pub(crate) fn is_intent_key(key: &[u8]) -> bool {
 
 /// The leave-side checkpoint sweep: conditional
 /// exact-digest deletes of collected leave records stamped at or before
-/// `watermark`. The leave intent singleton is never touched.
+/// `watermark`. The leave intent singleton is never touched, and the
+/// batch bound counts only watermark-eligible records, so a fresh head
+/// never hides the collectible tail behind it.
 pub(crate) async fn collect_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
   let namespace = leave_namespace()?;
-  let known = known_leave_records_ctx(store, records::TOMBSTONE_GC_BATCH).await?;
-  let entries: Vec<_> = known
+  let collectible = records::scan_collectible_records(
+    store,
+    namespace.clone(),
+    watermark,
+    records::TOMBSTONE_GC_BATCH,
+    intent_key_skip,
+    LeaveRecordV1::decode,
+    LeaveRecordV1::timestamp_millis,
+  )
+  .await?;
+  let entries: Vec<_> = collectible
     .iter()
     .map(|record| (leave_record_key(record.node()), record.timestamp_millis()))
     .collect();
@@ -742,7 +753,7 @@ mod tests {
   use std::{sync::Arc, time::Duration};
 
   use super::{
-    LeaveIntentV1, LeaveRecordV1, discover_leave_intent, execute, is_left_ctx,
+    LeaveIntentV1, LeaveRecordV1, collect_before_ctx, discover_leave_intent, execute, is_left_ctx,
     known_leave_records_ctx, left_nodes_ctx, persist_leave_record_ctx, resume_if_pending,
     sign_leave_record, wipe_namespaces,
   };
@@ -751,7 +762,7 @@ mod tests {
     api::Entropy,
     identity::{
       lifecycle::{self, LocalIdentityContext},
-      testing::{CreateScript, ScriptedKeys, SequenceEntropy},
+      testing::{CreateScript, ScriptedKeys, SequenceEntropy, node},
     },
     provider::StorageFactory,
     storage::MetadataStore,
@@ -903,6 +914,74 @@ mod tests {
         .len(),
       1
     );
+  }
+
+  /// A leave record signed by the local identity with an explicit
+  /// (test-chosen) removal timestamp, naming `subject` as the leaver:
+  /// the signature covers the stamp, so the checkpoint GC can order it
+  /// against watermarks.
+  async fn stamped_leave_record(
+    context: &lifecycle::LocalIdentityContext, keys: &Arc<ScriptedKeys>, subject: &crate::NodeId,
+    stamp: u64,
+  ) -> LeaveRecordV1 {
+    let identity = context.identity();
+    let body = LeaveRecordV1::encode_signed_body(subject, identity.public_key(), stamp).unwrap();
+    let signature = keys
+      .as_provider()
+      .sign(
+        identity.handle(),
+        &crate::identity::signature::signature_message(super::LEAVE_RECORD_DOMAIN, &body),
+      )
+      .await
+      .unwrap();
+    LeaveRecordV1::new(
+      subject.clone(),
+      identity.public_key().clone(),
+      stamp,
+      signature,
+    )
+  }
+
+  /// The leave-side GC batch bound counts collectible records, not
+  /// scanned ones: with `TOMBSTONE_GC_BATCH` leave records stamped after
+  /// the watermark occupying the lexicographically smallest store keys,
+  /// the stale tail record behind them is still collected — a
+  /// scanned-records cap would study the same fresh head every pass and
+  /// never reach it.
+  #[tokio::test]
+  async fn leave_gc_collects_the_stale_tail_behind_a_fresh_head() {
+    let factory = reference_factory();
+    let (keys, entropy, context) = open_store(&factory).await.unwrap();
+
+    // The fresh head: one full batch of leave records stamped after the
+    // watermark under the lexicographically smallest store keys
+    // (zero-padded node ids keep store-key order equal to numeric
+    // order), then the stale tail stamped before the watermark under the
+    // next-larger key, behind the entire fresh head.
+    let batch = crate::identity::records::TOMBSTONE_GC_BATCH;
+    let head_subject = node(8_000);
+    for index in 0..batch as u128 {
+      let subject = node(8_000 + index);
+      let record = stamped_leave_record(&context, &keys, &subject, 9_000).await;
+      persist_leave_record_ctx(context.store(), entropy.as_ref(), &record)
+        .await
+        .unwrap();
+    }
+    let stale_subject = node(8_000 + batch as u128);
+    let stale = stamped_leave_record(&context, &keys, &stale_subject, 1_000).await;
+    persist_leave_record_ctx(context.store(), entropy.as_ref(), &stale)
+      .await
+      .unwrap();
+    assert!(is_left_ctx(context.store(), &stale_subject).await.unwrap());
+
+    // The sweep walks past the entire fresh head (an over-window record
+    // consumes no batch budget) and collects the stale tail.
+    let collected = collect_before_ctx(context.store(), entropy.as_ref(), 5_000)
+      .await
+      .unwrap();
+    assert_eq!(collected, 1);
+    assert!(!is_left_ctx(context.store(), &stale_subject).await.unwrap());
+    assert!(is_left_ctx(context.store(), &head_subject).await.unwrap());
   }
 
   /// The leave-intent record round-trips canonically and rejects schema,

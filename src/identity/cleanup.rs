@@ -401,24 +401,29 @@ pub(crate) async fn collect_collected_tombstones_ctx(
 
 /// The cleanup-side sweep: conditional exact-digest deletes of collected
 /// cleanup tombstones, bounded by
-/// [`TOMBSTONE_GC_BATCH`](crate::identity::records::TOMBSTONE_GC_BATCH).
+/// [`TOMBSTONE_GC_BATCH`](crate::identity::records::TOMBSTONE_GC_BATCH)
+/// watermark-eligible records — a tombstone stamped after the watermark
+/// never consumes the batch, so a fresh head cannot hide the collectible
+/// tail behind it.
 async fn collect_cleanup_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
-  let known =
-    known_cleanup_records_ctx(store, crate::identity::records::TOMBSTONE_GC_BATCH).await?;
-  let entries: Vec<_> = known
+  let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
+  let collectible = records::scan_collectible_records(
+    store,
+    namespace.clone(),
+    watermark,
+    records::TOMBSTONE_GC_BATCH,
+    records::skip_none,
+    CleanupRecordV1::decode,
+    CleanupRecordV1::timestamp_millis,
+  )
+  .await?;
+  let entries: Vec<_> = collectible
     .iter()
     .map(|record| (cleanup_key(record.subject()), record.timestamp_millis()))
     .collect();
-  crate::identity::records::collect_tombstones_before(
-    store,
-    entropy,
-    metadata_namespace(CLEANUP_NAMESPACE)?,
-    watermark,
-    &entries,
-  )
-  .await
+  records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
 }
 
 #[cfg(test)]
@@ -727,5 +732,108 @@ mod tests {
       .await
       .unwrap();
     assert!(issued >= 5_000);
+  }
+
+  /// The GC batch bound counts collectible records, not scanned ones:
+  /// with `TOMBSTONE_GC_BATCH` tombstones stamped after the watermark
+  /// occupying the lexicographically smallest subject keys, the stale
+  /// tail record behind them is still collected — a scanned-records cap
+  /// would study the same fresh head every pass and never reach it.
+  #[tokio::test]
+  async fn checkpoint_gc_collects_the_stale_tail_behind_a_fresh_head() {
+    use crate::{StoreExpectation, StoreKey, StoreOperation, StoreValue};
+
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = lifecycle::open_local_identity(
+      &factory,
+      Some(&keys.as_provider()),
+      entropy.as_ref(),
+      std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    // The fresh head: one full batch of tombstones stamped after the
+    // watermark under the lexicographically smallest subject keys
+    // (zero-padded node ids keep store-key order equal to numeric
+    // order). Subjects stay unbound: persistence only rejects a
+    // divergent subject binding, never a missing one, and the GC tail
+    // behavior under test is independent of bindings.
+    let batch = crate::identity::records::TOMBSTONE_GC_BATCH;
+    let head_subject = node(7_500);
+    for index in 0..batch as u128 {
+      let subject = node(7_500 + index);
+      let subject_key = PublicKey::from_bytes(
+        scripted_signing(80 + index as u64)
+          .verifying_key()
+          .to_bytes(),
+      );
+      let fresh = stamped_tombstone(&context, &keys, &subject, &subject_key, 9_000).await;
+      persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &fresh)
+        .await
+        .unwrap();
+    }
+
+    // The stale tail: one tombstone stamped before the watermark under
+    // the next-larger subject key, behind the entire fresh head.
+    let stale_subject = node(7_500 + batch as u128);
+    let stale_key = PublicKey::from_bytes(
+      scripted_signing(80 + batch as u64)
+        .verifying_key()
+        .to_bytes(),
+    );
+    let stale = stamped_tombstone(&context, &keys, &stale_subject, &stale_key, 1_000).await;
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &stale)
+      .await
+      .unwrap();
+    assert!(
+      is_cleaned_ctx(context.store(), &stale_subject)
+        .await
+        .unwrap()
+    );
+
+    // The checkpoint (written directly: unsigned hygiene knowledge)
+    // declares a watermark between the two tombstone stamps.
+    let checkpoint = CleanupCheckpointV1::new(5_000, context.identity().node().clone());
+    let snapshot = context.store().snapshot().await.unwrap();
+    let transaction = context
+      .store()
+      .prepare_transaction(
+        crate::TransactionId::generate(entropy.as_ref()).unwrap(),
+        snapshot.revision().clone(),
+        vec![StoreOperation::Put {
+          namespace: metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
+          key: StoreKey::new(Arc::from(b"checkpoint".to_vec())),
+          expected: StoreExpectation::Absent,
+          value: StoreValue::new(Arc::from(checkpoint.encode().unwrap())),
+        }],
+      )
+      .unwrap();
+    assert!(matches!(
+      context.store().commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+
+    // The sweep walks past the entire fresh head (an over-window
+    // tombstone consumes no batch budget) and collects the stale tail.
+    let collected = collect_collected_tombstones_ctx(context.store(), entropy.as_ref())
+      .await
+      .unwrap();
+    assert_eq!(collected, 1);
+    assert!(
+      !is_cleaned_ctx(context.store(), &stale_subject)
+        .await
+        .unwrap()
+    );
+    assert!(
+      is_cleaned_ctx(context.store(), &head_subject)
+        .await
+        .unwrap()
+    );
   }
 }

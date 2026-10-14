@@ -19,8 +19,22 @@
 //! endpoint-level failover the recovery plane applies (remaining-items
 //! list P2-5), so a multi-homed member whose first endpoint is
 //! unreachable is retried on the others.
+//!
+//! The one deliberate exception to "healthy means dial nothing" is the
+//! bridge probe (audit finding #1's residual boundary): a healthy node
+//! at its target that still has unconnected members — two
+//! sub-partitions each internally meshed at/above the target — would
+//! otherwise never re-bridge, because the deficit budget is zero
+//! (`degree_plan`) and the recovery controller quiesces on any one
+//! route. At most once per probe interval the tick dials ONE uniformly
+//! random unconnected member through the ordinary maintenance dial
+//! path, and the `target + slack` eligibility bound caps the probe's
+//! contribution to a single edge above the target.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  sync::Arc,
+};
 
 use tracing::debug;
 
@@ -37,6 +51,21 @@ use crate::{Error, NodeId, Result};
 /// contract.
 pub(super) const DEGREE_MAINTENANCE_TICK_PERIOD: std::time::Duration =
   std::time::Duration::from_secs(30);
+
+/// The bridge-probe cadence, in maintenance ticks: a node that already
+/// sits at its degree target may dial one unconnected member at most
+/// once per this many eligible ticks (10 × 30s = 5 minutes — pinned by
+/// `bridge_probe_interval_is_five_minutes`). The bracket is what keeps
+/// the probe from ever becoming a dial storm: even a permanently
+/// partitioned cluster issues one probe per node per five minutes.
+pub(super) const BRIDGE_PROBE_INTERVAL_TICKS: u32 = 10;
+
+/// The degree headroom the bridge probe may consume above the target:
+/// the probe fires only while the session count sits below
+/// `target + slack`, so one landed probe edge disables further probes
+/// until a session drop re-opens the deficit path. A slack of one caps
+/// the probe's contribution to any node's degree at a single edge.
+pub(super) const BRIDGE_PROBE_SLACK: usize = 1;
 
 /// Runs the degree-maintenance worker: one long-lived task that owns the
 /// maintenance cadence — the tick the supervisor's select loop used to
@@ -78,7 +107,7 @@ pub(super) async fn run_maintenance_worker(state: Arc<TickState>) {
 impl TickState {
   /// One maintenance tick: recompute the degree plan from the active
   /// member universe and the live session table, and dial the deficit
-  /// in detached tasks (each bounded by the configured dial deadline
+  /// in tracked tasks (each bounded by the configured dial deadline
   /// plus the authentication deadline, reconciled by the next tick).
   /// A skipped or failed dial simply waits for the next tick — the
   /// plane is best-effort by contract.
@@ -102,8 +131,11 @@ impl TickState {
       connected.len(),
     );
     if plan.dial_budget == 0 {
-      // Healthy, fully offline (recovery owns it), or nothing to reach.
-      return Ok(());
+      // Healthy at target, fully offline (recovery owns it), or nothing
+      // left to reach. The healthy-at-target case with unconnected
+      // members left is audit finding #1's residual boundary — neither
+      // plane dials — so the low-frequency bridge probe takes over.
+      return self.bridge_probe_tick(&local, &members, &connected, &plan);
     }
     // Previous tick's dials may still be in flight (dial deadline plus
     // authentication deadline exceeds one cadence): never exceed the
@@ -154,9 +186,96 @@ impl TickState {
     Ok(())
   }
 
-  /// Spawns one detached maintenance dial: the maintenance worker never
-  /// blocks on a handshake, and the in-flight slot releases when the
-  /// dial resolves (success, refusal, or deadline).
+  /// One bridge-probe decision for an otherwise quiescent maintenance
+  /// plane (the dial budget is zero): audit finding #1's residual
+  /// boundary — two sub-partitions each internally meshed at/above the
+  /// degree target — never re-bridges on its own, because the deficit
+  /// budget is zero and the recovery controller quiesces on any one
+  /// authenticated route. The probe is deliberately slow and bounded:
+  /// it fires only for a healthy node below `target + slack` sessions
+  /// that still has unconnected members, at most once per
+  /// [`BRIDGE_PROBE_INTERVAL_TICKS`] eligible maintenance ticks, and
+  /// dials exactly ONE uniformly random unconnected member through the
+  /// SAME deficit machinery (`select_degree_dials`, endpoint rotation,
+  /// `spawn_maintenance_dial`). The edge lands as an ordinary
+  /// caller-class maintenance edge — never recovery-class — so the
+  /// recovery plane's redundant-edge pruning
+  /// (`maybe_prune_recovery_edges`) never reclaims the bridge and
+  /// re-splits the partition it just healed.
+  fn bridge_probe_tick(
+    &self, local: &NodeId, members: &BTreeMap<NodeId, Vec<crate::Endpoint>>,
+    connected: &BTreeSet<NodeId>, plan: &crate::membership::degree::DegreePlan,
+  ) -> Result<()> {
+    // Eligibility is the whole bound: healthy (the deficit path owns
+    // below-target states, the recovery plane owns zero sessions), at
+    // most `slack` edges of headroom above the target, and at least one
+    // unconnected member to reach — a fully connected node never even
+    // spends the cadence bracket.
+    let eligible = plan.state == crate::ConnectionDegreeState::Healthy
+      && connected.len() < plan.target + BRIDGE_PROBE_SLACK
+      && members.keys().any(|node| !connected.contains(node));
+    if !eligible {
+      return Ok(());
+    }
+    // One bridge dial in flight at a time — the same in-flight bound
+    // the deficit path applies to its batch, so a stalled probe dial
+    // defers the next probe instead of stacking concurrent ones.
+    if self
+      .maintenance_pending
+      .load(std::sync::atomic::Ordering::Relaxed)
+      >= 1
+    {
+      debug!("bridge probe deferred: a maintenance dial is in flight");
+      return Ok(());
+    }
+    // The cadence bracket: only eligible ticks advance it, and the
+    // probe fires on the tick it reaches one. Solely the maintenance
+    // worker mutates the atomic, so load/store cannot race here.
+    let countdown = self
+      .bridge_probe_ticks
+      .load(std::sync::atomic::Ordering::Relaxed);
+    if countdown > 1 {
+      self
+        .bridge_probe_ticks
+        .store(countdown - 1, std::sync::atomic::Ordering::Relaxed);
+      return Ok(());
+    }
+    self.bridge_probe_ticks.store(
+      BRIDGE_PROBE_INTERVAL_TICKS,
+      std::sync::atomic::Ordering::Relaxed,
+    );
+    let dials = crate::membership::degree::select_degree_dials(
+      1,
+      local,
+      members,
+      connected,
+      self.entropy.as_ref(),
+    )?;
+    // The same batch serial semantics as the deficit path: one attempt
+    // serial per probing tick, so a multi-homed member's endpoints
+    // rotate across successive probes.
+    let attempt = self
+      .degree_attempt
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+      + 1;
+    for (peer, endpoints) in dials {
+      let Some(endpoint) = recovery_endpoint(&endpoints, attempt) else {
+        continue;
+      };
+      debug!(
+        peer = %peer.as_str(),
+        endpoint = %endpoint.as_str(),
+        interval_ticks = BRIDGE_PROBE_INTERVAL_TICKS,
+        "degree bridge probe dial"
+      );
+      self.spawn_maintenance_dial(peer, endpoint.clone());
+    }
+    Ok(())
+  }
+
+  /// Spawns one maintenance dial in its own task: the maintenance
+  /// worker never blocks on a handshake, and the in-flight slot releases
+  /// when the dial resolves (success, refusal, or deadline).
   fn spawn_maintenance_dial(&self, peer: NodeId, receiver: crate::Endpoint) {
     let transport = match self.extensions.resolve_transport(&receiver.selector()) {
       Ok(transport) => transport,
@@ -181,7 +300,7 @@ impl TickState {
     let packet = self.packet.clone();
     let shutdown = self.shutdown.clone();
     let dial_deadline = self.config.dial_deadline();
-    tokio::spawn(async move {
+    let dial = tokio::spawn(async move {
       if let Err(error) = dial_member(
         transport,
         driver,
@@ -205,6 +324,14 @@ impl TickState {
       }
       pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
+    // The maintenance dial's JoinHandle joins the same tracked
+    // connection-task set as the recovery dials (audit finding #19): the
+    // recovery tick reaps finished handles and the shutdown path aborts
+    // and awaits the rest, so an in-flight maintenance handshake is
+    // owned and torn down with the node instead of outliving it.
+    if let Ok(mut handles) = self.connection_tasks.lock() {
+      handles.push(dial);
+    }
   }
 }
 
@@ -394,6 +521,193 @@ mod tests {
     );
     first_holder.abort();
     second_holder.abort();
+  }
+
+  /// The bridge-probe cadence stays on the order of five minutes
+  /// (like the tick period, purely local — never a cluster-wide
+  /// contract): pinned so a future recalibration is a deliberate act.
+  #[test]
+  fn bridge_probe_interval_is_five_minutes() {
+    assert_eq!(
+      u64::from(super::BRIDGE_PROBE_INTERVAL_TICKS)
+        * super::DEGREE_MAINTENANCE_TICK_PERIOD.as_secs(),
+      300
+    );
+  }
+
+  /// Audit finding #1's residual boundary: two sub-partitions each
+  /// internally meshed at/above the degree target never re-bridge —
+  /// the deficit budget is zero and the recovery controller quiesces
+  /// on any one route. The bridge probe heals it: a healthy node at
+  /// its target with unconnected members issues ONE cross-partition
+  /// maintenance dial per probe interval — never before the interval
+  /// elapses, never through the recovery plane — and the
+  /// `target + slack` eligibility bound keeps the session count capped.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn bridge_probe_dials_a_cross_partition_member_within_two_intervals() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (port, connections, holder) = silent_peer().await;
+
+    // Two halves of an eight-node cluster (k(8) = 4): this node's half
+    // — members 101..104 — is fully meshed from here (four live
+    // sessions, exactly the target), and the only unconnected members
+    // are the other half (105..107). Every member shares one silent
+    // listener, so whichever member the uniform pick chooses, the dial
+    // lands on the counted endpoint.
+    for seed in 101..=104 {
+      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+    }
+    for seed in 101..=107 {
+      install_member(&supervisor, &reference, seed, &[port]).await;
+    }
+    let view = supervisor.connection_degree_view().await.unwrap();
+    assert_eq!(view.target(), 4, "k(8) = 4 from the shipped degree table");
+    assert_eq!(view.sessions(), 4);
+    assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
+
+    // The finding's exact shape, one interval long: healthy at target
+    // with a zero dial budget and unconnected members — the ordinary
+    // tick dials nothing, and the cadence bracket holds every tick of
+    // the interval back.
+    for _ in 0..super::BRIDGE_PROBE_INTERVAL_TICKS - 1 {
+      ticks.maintenance_tick().await.unwrap();
+      let view = supervisor.connection_degree_view().await.unwrap();
+      assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
+      assert!(
+        view.sessions() <= view.target() + super::BRIDGE_PROBE_SLACK,
+        "the probe must never push the degree past target + slack"
+      );
+    }
+    assert_eq!(
+      connections.load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "the cadence bracket holds the interval's first ticks back"
+    );
+    assert_eq!(
+      ticks
+        .bridge_probe_ticks
+        .load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "eligible ticks spend the bracket one at a time"
+    );
+
+    // The interval's tick: exactly one cross-half dial, through the
+    // maintenance path (its in-flight slot), never the recovery plane.
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the bridge probe must issue its cross-half dial");
+    assert_eq!(
+      ticks
+        .maintenance_pending
+        .load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "the probe dial runs as an ordinary maintenance dial"
+    );
+    assert_eq!(
+      ticks
+        .recovery_pending
+        .load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "the bridge edge must never be recovery-class"
+    );
+    assert_eq!(
+      ticks
+        .bridge_probe_ticks
+        .load(std::sync::atomic::Ordering::Relaxed),
+      super::BRIDGE_PROBE_INTERVAL_TICKS,
+      "the bracket re-arms for the next interval"
+    );
+
+    // The stalled dial releases its slot at the deadline; the re-armed
+    // bracket then holds further probes back, and the session count
+    // never exceeds target + slack.
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if ticks
+          .maintenance_pending
+          .load(std::sync::atomic::Ordering::Relaxed)
+          == 0
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the stalled probe dial must release its in-flight slot");
+    for _ in 0..3 {
+      ticks.maintenance_tick().await.unwrap();
+      let view = supervisor.connection_degree_view().await.unwrap();
+      assert!(view.sessions() <= view.target() + super::BRIDGE_PROBE_SLACK);
+    }
+    assert_eq!(
+      connections.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "the re-armed bracket holds the next interval's first ticks back"
+    );
+    holder.abort();
+  }
+
+  /// The probe's negative space: a healthy node with NO unconnected
+  /// members never probes — no dial leaves the plane, and the cadence
+  /// bracket is never even spent.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_fully_connected_healthy_node_never_probes() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (port, connections, holder) = silent_peer().await;
+
+    // A five-node cluster (k(5) = 3) fully meshed from here: every
+    // member connected and the target exceeded — nothing left to
+    // reach, so no probe may ever fire.
+    for seed in 101..=104 {
+      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+    }
+    for seed in 101..=104 {
+      install_member(&supervisor, &reference, seed, &[port]).await;
+    }
+
+    for _ in 0..(3 * super::BRIDGE_PROBE_INTERVAL_TICKS) {
+      ticks.maintenance_tick().await.unwrap();
+    }
+    assert_eq!(
+      connections.load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "a fully connected node must never issue a probe dial"
+    );
+    assert_eq!(
+      ticks
+        .maintenance_pending
+        .load(std::sync::atomic::Ordering::Relaxed),
+      0
+    );
+    assert_eq!(
+      ticks
+        .bridge_probe_ticks
+        .load(std::sync::atomic::Ordering::Relaxed),
+      super::BRIDGE_PROBE_INTERVAL_TICKS,
+      "a fully connected node never spends the cadence bracket"
+    );
+    holder.abort();
   }
 
   /// The maintenance cadence stays purely local (never a cluster-wide

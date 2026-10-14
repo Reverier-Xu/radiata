@@ -110,20 +110,52 @@ impl Drop for ConsumerDrainGuard {
 }
 
 /// Serves incoming packet frames until the connection closes or a frame
-/// violates the wire contract (fail closed).
+/// violates the wire contract (fail closed). Owns the consumer drain guard:
+/// it is created here so the cancellation path (the future being dropped)
+/// still hands the consumer set to the node-scoped drain exactly like the
+/// orderly exit below.
 pub(super) async fn read_loop(
   source: &mut impl FrameSource, session: &EstablishedSession, context: &SessionPacketContext,
   frames: &BoundedSender, pending_acks: &PendingAcks,
   last_activity: &Arc<std::sync::atomic::AtomicU64>,
 ) {
-  let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
   // Registered at entry: the cancellation path must drain consumers too.
   let mut consumers = ConsumerDrainGuard {
     consumers: JoinSet::new(),
     drains: Arc::clone(&context.task_drains),
   };
+  read_loop_frames(
+    source,
+    session,
+    context,
+    frames,
+    pending_acks,
+    last_activity,
+    &mut consumers,
+  )
+  .await;
+  // The guard drops here on the orderly exit: its `Drop` hands whatever
+  // remains (in-life completed entries were already reaped) to the
+  // node-scoped drain task, unchanged from the pre-reap teardown contract.
+}
+
+/// The frame loop proper, over a caller-owned consumer guard so liveness
+/// tests can hold the guard and observe the set between the loop's in-life
+/// reap and the guard's teardown.
+async fn read_loop_frames(
+  source: &mut impl FrameSource, session: &EstablishedSession, context: &SessionPacketContext,
+  frames: &BoundedSender, pending_acks: &PendingAcks,
+  last_activity: &Arc<std::sync::atomic::AtomicU64>, consumers: &mut ConsumerDrainGuard,
+) {
+  let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
   let mut last_pong_seen = source.pong_last_seen();
   loop {
+    // Audit finding #8: completed consumer entries are reaped on every
+    // receive wake, so finished tasks no longer accumulate for the whole
+    // session's life. Non-blocking on purpose: still-running consumers are
+    // left untouched for the guard's `Drop`, which keeps handing the full
+    // remaining set to the node-scoped drain on every exit path.
+    while consumers.consumers.try_join_next().is_some() {}
     let message = match source.receive_event().await {
       Ok(Some(crate::transport::Received::Message(message))) => message,
       Ok(Some(crate::transport::Received::Pong)) => {
@@ -347,9 +379,9 @@ pub(super) async fn read_loop(
       },
     }
   }
-  // The consumer drain registered when the guard was created: its Drop
-  // hands the JoinSet to the node-scoped drain task on this orderly exit
-  // and on every cancellation path alike.
+  // The frame loop exits without dropping the guard: `read_loop` owns it
+  // and its `Drop` hands the JoinSet to the node-scoped drain task on this
+  // orderly exit and on every cancellation path alike.
 }
 
 /// Validates one open frame against the authenticated session and the
@@ -803,9 +835,12 @@ mod read_loop_liveness_tests {
   };
 
   use futures_util::future::BoxFuture;
-  use tokio::sync::mpsc;
+  use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+  };
 
-  use super::{FrameSource, read_loop};
+  use super::{ConsumerDrainGuard, FrameSource, read_loop, read_loop_frames};
   use crate::{
     NodeId,
     identity::testing::SequenceEntropy,
@@ -1002,6 +1037,96 @@ mod read_loop_liveness_tests {
       1,
       "the orderly exit registers the consumer drain exactly once"
     );
+  }
+
+  /// The long-lived read loop reaps completed consumer entries on its
+  /// receive wakes instead of accumulating finished `JoinSet` entries for
+  /// the whole session's life (audit finding #8). Several short-lived
+  /// consumers plus one still in flight are driven through the real frame
+  /// loop with a test-owned guard (the admission path itself cannot run
+  /// here without a negotiated feature set, so the guard receives exactly
+  /// the task shape `admit_open` spawns): after the loop's in-life reap
+  /// point, exactly the still-running entry remains, the reap registered no
+  /// drain, and the guard's drop still hands that remainder to the
+  /// node-scoped drain exactly once — teardown semantics unchanged.
+  #[tokio::test]
+  async fn read_loop_reaps_completed_consumer_entries_before_teardown() {
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
+    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
+    let (frames, _receiver) = test_queue(8, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(AtomicU64::new(1));
+
+    // The loop borrows the guard, so the set stays observable between the
+    // in-life reap point and the teardown drop.
+    let mut consumers = ConsumerDrainGuard {
+      consumers: JoinSet::new(),
+      drains: Arc::clone(&context.task_drains),
+    };
+
+    // Three short-lived consumers and one still in flight. Each
+    // short-lived task reports its completion, so the set's state is
+    // deterministic at the loop's reap point (the sender's poll resolves
+    // the task before the receiver's await can resume).
+    let mut finished = Vec::new();
+    for _ in 0..3 {
+      let (done, wait) = oneshot::channel::<()>();
+      finished.push(wait);
+      consumers.consumers.spawn(async move {
+        let _ = done.send(());
+      });
+    }
+    let (release, wait) = oneshot::channel::<()>();
+    consumers.consumers.spawn(async move {
+      let _ = wait.await;
+    });
+    for wait in finished {
+      wait.await.unwrap();
+    }
+
+    // The loop's first wake reaps the three completed entries in-life, then
+    // the source ends the session orderly.
+    let mut source = PongSource {
+      remaining: 0,
+      now: 0,
+    };
+    read_loop_frames(
+      &mut source,
+      &session,
+      &context,
+      &frames,
+      &pending_acks,
+      &last_activity,
+      &mut consumers,
+    )
+    .await;
+
+    // Exactly the still-running entry remains pending; before the fix all
+    // four accumulated until teardown. The in-life reap registered no
+    // teardown drain of its own.
+    assert_eq!(
+      consumers.consumers.len(),
+      1,
+      "completed consumer entries must be reaped during the session's life"
+    );
+    assert!(
+      context.task_drains.lock().unwrap().is_empty(),
+      "the in-life reap must not register a teardown drain"
+    );
+
+    // Teardown semantics unchanged: the drop hands the remaining set to the
+    // node-scoped drain exactly once, and that drain owns the in-flight
+    // consumer until it finishes.
+    drop(consumers);
+    assert_eq!(
+      context.task_drains.lock().unwrap().len(),
+      1,
+      "the orderly exit registers the consumer drain exactly once"
+    );
+    let _ = release.send(());
+    let drain = context.task_drains.lock().unwrap().pop().unwrap();
+    drain.await.unwrap();
   }
 }
 

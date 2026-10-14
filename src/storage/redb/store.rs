@@ -75,14 +75,17 @@ fn crash_hook(_point: u8) {}
 /// armed, the commit blocks its blocking thread just before the durable
 /// commit (the receipt row is staged but not yet durable), so a test can
 /// observe the not-yet-landed state, cancel the caller, and then release
-/// the landing. Mirrors the crash-hook pattern: test builds only.
+/// the landing. The reached record names the held transaction, so a
+/// waiting test observes its own commit holding the landing even while
+/// other tests' commits run concurrently. Mirrors the crash-hook
+/// pattern: test builds only.
 #[cfg(test)]
 static HOLD_BEFORE_COMMIT_ARMED: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
-static HOLD_BEFORE_COMMIT_REACHED: std::sync::atomic::AtomicBool =
-  std::sync::atomic::AtomicBool::new(false);
+static HOLD_BEFORE_COMMIT_REACHED: std::sync::Mutex<Option<TransactionId>> =
+  std::sync::Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) fn arm_landing_hold() {
@@ -90,8 +93,12 @@ pub(crate) fn arm_landing_hold() {
 }
 
 #[cfg(test)]
-pub(crate) fn landing_hold_reached() -> bool {
-  HOLD_BEFORE_COMMIT_REACHED.load(std::sync::atomic::Ordering::Acquire)
+pub(crate) fn landing_hold_reached_by(transaction: &TransactionId) -> bool {
+  HOLD_BEFORE_COMMIT_REACHED
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .as_ref()
+    .is_some_and(|held| held == transaction)
 }
 
 #[cfg(test)]
@@ -122,9 +129,11 @@ impl Drop for LandingHold {
 }
 
 #[cfg(test)]
-fn hold_before_commit() {
+fn hold_before_commit(transaction: &TransactionId) {
   if HOLD_BEFORE_COMMIT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
-    HOLD_BEFORE_COMMIT_REACHED.store(true, std::sync::atomic::Ordering::Release);
+    *HOLD_BEFORE_COMMIT_REACHED
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(transaction.clone());
     while HOLD_BEFORE_COMMIT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
       std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -133,7 +142,39 @@ fn hold_before_commit() {
 
 #[cfg(not(test))]
 #[inline(always)]
-fn hold_before_commit() {}
+fn hold_before_commit(_transaction: &TransactionId) {}
+
+/// Test-only one-shot commit-failure injection for the final durable
+/// commit (see [`commit_durable`]): armed as one entry per transaction
+/// id, so concurrent tests' arms never overwrite each other and only
+/// the armed transaction's final `write.commit()` fails. The registry
+/// is global, so armed ids must be unique across the whole test binary
+/// (the contract suite shares the `test_util::transaction_id` id
+/// space). Mirrors the crash-hook and landing-hold pattern: test
+/// builds only.
+#[cfg(test)]
+static COMMIT_FAILURE_FAULT: std::sync::Mutex<Vec<(TransactionId, redb::CommitError)>> =
+  std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn arm_commit_failure(transaction: TransactionId, error: redb::CommitError) {
+  COMMIT_FAILURE_FAULT
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .push((transaction, error));
+}
+
+#[cfg(test)]
+fn take_commit_failure(transaction: &TransactionId) -> Option<redb::CommitError> {
+  let mut fault = COMMIT_FAILURE_FAULT
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  let armed = fault
+    .iter()
+    .position(|(armed, _)| armed == transaction)
+    .map(|index| fault.swap_remove(index));
+  armed.map(|(_, error)| error)
+}
 
 /// A factory for redb stores rooted at one database file.
 pub(crate) struct RedbStoreFactory {
@@ -675,6 +716,24 @@ fn backfill_value_digests(database: &Database) -> Result<()> {
   Ok(())
 }
 
+/// Drives the final durable commit of [`commit_blocking`]: production
+/// calls [`redb::WriteTransaction::commit`]; a test build first
+/// consults the one-shot fault armed for exactly this transaction (see
+/// [`COMMIT_FAILURE_FAULT`]) and surfaces that failure instead. The
+/// fault path never runs the real commit, so the staged transaction
+/// rolls back deterministically and the injected failure exercises the
+/// outcome classification below.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn commit_durable(
+  write: redb::WriteTransaction, transaction: &TransactionId,
+) -> std::result::Result<(), redb::CommitError> {
+  #[cfg(test)]
+  if let Some(error) = take_commit_failure(transaction) {
+    return Err(error);
+  }
+  write.commit()
+}
+
 fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result<CommitOutcome> {
   let mut write = database
     .begin_write()
@@ -798,10 +857,14 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
     crash_hook(5);
     receipt
   };
-  hold_before_commit();
-  write
-    .commit()
-    .map_err(|error| map_commit_error(error, ProviderErrorContext::StorageCommit))?;
+  hold_before_commit(transaction.id());
+  // The final durable commit is the one outcome-unknown boundary: a
+  // failure here is classified rather than blanket-mapped, because a
+  // failed write-out can leave the durable state indeterminate instead
+  // of provably rolled back (audit finding #12).
+  if let Err(error) = commit_durable(write, transaction.id()) {
+    return classify_commit_failure(error, &transaction);
+  }
   crash_hook(6);
   Ok(CommitOutcome::Committed(receipt))
 }
@@ -841,6 +904,40 @@ fn map_commit_error(error: redb::CommitError, context: ProviderErrorContext) -> 
     redb::CommitError::Storage(storage) => map_storage_error(storage, context),
     _ => Error::provider(ProviderErrorKind::Io, context),
   }
+}
+
+/// Classifies a failed final durable commit ([`commit_durable`]). An
+/// I/O failure during the write-out — or the sticky [`PreviousIo`]
+/// aftermath of a prior one — can neither prove the transaction landed
+/// nor prove it rolled back, so the in-doubt identity surfaces as
+/// [`CommitOutcome::Unknown`] and the metadata store freezes on
+/// reconcile evidence instead of unfreezing and retrying as if nothing
+/// landed. Every other commit failure is provably not committed
+/// (`TransactionPoisoned`, a closed database, ...) and stays a
+/// definite-abort error through [`map_commit_error`]. Deliberately
+/// narrow per the audit: only these two indeterminate variants freeze
+/// the store, and pre-mutation begin/table failures upstream of the
+/// commit are definite aborts by construction.
+///
+/// [`PreviousIo`]: redb::StorageError::PreviousIo
+fn classify_commit_failure(
+  error: redb::CommitError, transaction: &StoreTransaction,
+) -> Result<CommitOutcome> {
+  if matches!(
+    &error,
+    redb::CommitError::Storage(redb::StorageError::Io(_))
+      | redb::CommitError::Storage(redb::StorageError::PreviousIo)
+  ) {
+    tracing::warn!(
+      transaction = %transaction.id(),
+      "redb durable commit failed with an indeterminate outcome; deferring to reconcile evidence"
+    );
+    return Ok(CommitOutcome::Unknown {
+      transaction: transaction.id().clone(),
+      operation_digest: transaction.operation_digest().clone(),
+    });
+  }
+  Err(map_commit_error(error, ProviderErrorContext::StorageCommit))
 }
 
 fn map_durability_error(error: redb::SetDurabilityError, context: ProviderErrorContext) -> Error {

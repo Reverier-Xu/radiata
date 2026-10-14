@@ -2186,13 +2186,18 @@ async fn caller_feature_registry_enters_handshake_selection_and_admission() {
 
 /// Certificate rollover (audit 2026-10-09 item 8): a peer that
 /// legitimately re-issues its ephemeral listener certificate (a restart
-/// with the same durable identity and storage, a fresh leaf, a fresh
-/// port) must stay reachable. The joiner's recorded SPKI pin fails at
-/// the TLS layer; the member dial retries once with merge trust, the
-/// member-mode identity proof authenticates the peer over the fresh
-/// channel binding, the new leaf is re-recorded as the process-local
-/// anchor, and packets flow. Before the fix every reconnect to the
-/// re-certified peer failed TLS forever.
+/// with the same durable identity and storage, a fresh leaf rebound on
+/// the same address) must stay reachable. The joiner's recorded SPKI
+/// anchor for that exact target names a leaf the listener no longer
+/// presents, so the pinned TLS establishment fails; the member dial
+/// retries once with merge trust, the member-mode identity proof
+/// authenticates the peer over the fresh channel binding, the new leaf
+/// is re-recorded as the process-local anchor, and packets flow. Before
+/// the fix every reconnect to the re-certified peer failed TLS forever.
+/// The rebind on the same address is the point: the pin is scoped to the
+/// concrete dial target, so only a genuinely different leaf on the SAME
+/// target takes this fallback path — a moved listener has no anchor and
+/// dials merge-trust directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn secure_join_certificate_rollover_reconnects_through_merge_fallback() {
   let receiver_keys = Arc::new(ScriptedKeys::full_at(210_000));
@@ -2247,7 +2252,9 @@ async fn secure_join_certificate_rollover_reconnects_through_merge_fallback() {
   let receiver_id = receiver_view.node_id().clone();
 
   // Restart the receiver over the same storage: same durable identity,
-  // fresh process, NEW ephemeral leaf certificate, NEW listener port.
+  // fresh process, NEW ephemeral leaf certificate rebound on the SAME
+  // address, so the joiner's anchor for that exact target names a leaf
+  // the listener no longer presents.
   receiver.handle.shutdown().await.unwrap();
   let restarted = Node {
     handle: restart_with_protocol(
@@ -2262,16 +2269,16 @@ async fn secure_join_certificate_rollover_reconnects_through_merge_fallback() {
   let new_listener = restarted
     .handle
     .listeners()
-    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .create(old_endpoint.clone())
     .await
     .unwrap()
     .wait()
     .await
     .unwrap();
 
-  // The joiner still pins the OLD leaf: the pinned TLS establishment
-  // fails, the merge-trust fallback runs, the identity proof
-  // authenticates, and the connect must succeed within its bound.
+  // The joiner still pins the OLD leaf for this exact target: the pinned
+  // TLS establishment fails, the merge-trust fallback runs, the identity
+  // proof authenticates, and the connect must succeed within its bound.
   let connected = tokio::time::timeout(Duration::from_secs(30), async {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -2308,4 +2315,174 @@ async fn secure_join_certificate_rollover_reconnects_through_merge_fallback() {
 
   joiner.handle.shutdown().await.unwrap();
   restarted.handle.shutdown().await.unwrap();
+}
+
+/// A counting loopback pump in front of one real listener: the proxy
+/// binds its own address, counts every accepted connection, and copies
+/// each one bidirectionally to the target. This is the CountingTransport
+/// idea expressed at the byte layer, where a public-API integration
+/// test can observe it: the counter says how many transport dial
+/// attempts reached the concrete endpoint behind it (a pin-mismatch
+/// fallback retry would open a second connection).
+async fn counting_proxy(
+  target: &Endpoint,
+) -> (
+  Endpoint,
+  Arc<std::sync::atomic::AtomicUsize>,
+  tokio::task::JoinHandle<()>,
+) {
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let (scheme, authority) = target
+    .as_str()
+    .split_once("://")
+    .unwrap_or_else(|| panic!("non-canonical proxy target {}", target.as_str()));
+  let forward: std::net::SocketAddr = authority
+    .parse()
+    .unwrap_or_else(|_| panic!("proxy target is not a host:port literal: {authority}"));
+  let endpoint = Endpoint::parse(&format!("{scheme}://127.0.0.1:{port}")).unwrap();
+  let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+  let counted = Arc::clone(&connections);
+  let pump = tokio::spawn(async move {
+    while let Ok((mut inbound, _)) = listener.accept().await {
+      counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      let forward = forward;
+      tokio::spawn(async move {
+        if let Ok(mut outbound) = tokio::net::TcpStream::connect(forward).await {
+          let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        }
+      });
+    }
+  });
+  (endpoint, connections, pump)
+}
+
+/// Merged-peer leaf pin scoping (audit 2026-10-09 item 3): a member dial
+/// to the SAME peer over a DIFFERENT listener must succeed on its first
+/// TLS establishment. Each listener of a node binds its own ephemeral
+/// leaf, so a pin keyed by node id alone would always mismatch the other
+/// channel's leaf and pay one failed handshake before the merge-trust
+/// fallback rescued the dial — tls-to-wss migration, a second listener,
+/// or a rebound address all hit it. The join runs over the node's tls
+/// listener; the member dial then targets the same node's wss listener
+/// through the counting proxy, and the counter must show exactly one
+/// establishment for the whole dial. The member-mode identity handshake
+/// authenticates the peer; the pin only ever hardened same-target
+/// redials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn secure_join_member_dial_to_another_listener_pays_no_pin_mismatch() {
+  let receiver_keys = Arc::new(ScriptedKeys::full_at(230_000));
+  let receiver_storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+  let receiver_collector = Arc::new(Collector::default());
+  let receiver = Node {
+    handle: start_with_protocol(
+      Arc::clone(&receiver_storage),
+      receiver_keys.clone(),
+      protocol("test-echo"),
+      Arc::clone(&receiver_collector),
+    )
+    .await,
+    _keys: receiver_keys.clone(),
+  };
+  let issued = receiver
+    .handle
+    .credentials()
+    .rotate()
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  // Two listeners of one node: the direct TLS channel the join runs
+  // over, and a second WebSocket listener whose ephemeral leaf differs.
+  let tls_listener = receiver
+    .handle
+    .listeners()
+    .create(Endpoint::parse("tls://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let wss_listener = receiver
+    .handle
+    .listeners()
+    .create(Endpoint::parse("wss://127.0.0.1:0").unwrap())
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let (proxy_endpoint, connections, proxy) = counting_proxy(wss_listener.endpoint()).await;
+
+  let joiner_keys = Arc::new(ScriptedKeys::full_at(235_000));
+  let joiner_storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+  let joiner_collector = Arc::new(Collector::default());
+  let joiner = Node {
+    handle: start_with_protocol(
+      Arc::clone(&joiner_storage),
+      joiner_keys.clone(),
+      protocol("test-echo"),
+      Arc::clone(&joiner_collector),
+    )
+    .await,
+    _keys: joiner_keys.clone(),
+  };
+  // The join runs over the tls listener: its leaf becomes the anchor for
+  // that exact target only.
+  let secret = issued.credential().expose_secret().to_owned();
+  let _merge = merge_ok(&joiner.handle, tls_listener.endpoint(), &secret).await;
+  let receiver_view = receiver.handle.local_node().await.unwrap();
+  let receiver_id = receiver_view.node_id().clone();
+
+  // The member dial targets the same node's OTHER listener through the
+  // counting proxy: no anchor exists for that concrete target, so the
+  // dial runs under merge trust and the identity proof authenticates.
+  let connected = tokio::time::timeout(Duration::from_secs(30), async {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+      match joiner
+        .handle
+        .connect(proxy_endpoint.clone(), receiver_id.clone())
+        .await
+      {
+        Ok(task) => match task.wait().await {
+          Ok(authenticated) => {
+            return Ok::<radiata::NodeId, std::convert::Infallible>(authenticated);
+          }
+          Err(error) => panic!("second-listener member dial failed: {error:?}"),
+        },
+        Err(error)
+          if matches!(
+            error.kind(),
+            ErrorKind::StreamInterrupted | ErrorKind::RouteUnavailable
+          ) && std::time::Instant::now() < deadline =>
+        {
+          tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(error) => panic!("second-listener connect refused: {error:?}"),
+      }
+    }
+  })
+  .await
+  .expect("the second-listener member dial must settle within the bound")
+  .unwrap();
+  assert_eq!(connected, receiver_id);
+
+  // The new channel carries data as an ordinary member session.
+  packet_round_trip(&joiner.handle, &receiver_id, &receiver_collector).await;
+
+  // The whole member dial paid exactly ONE establishment at the concrete
+  // target. A pin inherited from the tls join would have failed this
+  // leaf check, closed, and retried once more through the fallback: the
+  // proxy would count two.
+  assert_eq!(
+    connections.load(std::sync::atomic::Ordering::Relaxed),
+    1,
+    "the member dial to the peer's second listener paid a pin-mismatch retry"
+  );
+
+  joiner.handle.shutdown().await.unwrap();
+  receiver.handle.shutdown().await.unwrap();
+  proxy.abort();
 }
