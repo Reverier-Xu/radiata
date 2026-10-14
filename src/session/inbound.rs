@@ -1260,6 +1260,7 @@ mod ack_attribution_tests {
         downstream_acks: Arc::clone(&live_acks),
         upstream_peer: node(3),
         relay_lock: Arc::new(tokio::sync::Mutex::new(())),
+        deadline: None,
         retry: Some(RetryState {
           open: OpenFrame {
             trace_id: trace_id.clone(),

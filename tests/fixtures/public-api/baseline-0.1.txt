@@ -54,6 +54,7 @@ pub radiata::ErrorKind::CallerError
 pub radiata::ErrorKind::Cancelled
 pub radiata::ErrorKind::CommitUnknown
 pub radiata::ErrorKind::Conflict
+pub radiata::ErrorKind::FrameTooLarge
 pub radiata::ErrorKind::Internal
 pub radiata::ErrorKind::InvalidInput
 pub radiata::ErrorKind::Io

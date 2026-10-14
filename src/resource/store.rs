@@ -330,7 +330,7 @@ pub(crate) async fn commit_removal_ctx(
 
 #[cfg(test)]
 mod tests {
-  use std::{sync::Arc, time::Duration};
+  use std::{collections::HashMap, sync::Arc, time::Duration};
 
   use ed25519_dalek::SigningKey;
 
@@ -728,5 +728,66 @@ mod tests {
       directory.path().join("store.redb"),
     ));
     backend_preserves_the_exact_logical_version(factory).await;
+  }
+
+  /// A batched page commit never retries an indeterminate outcome: the
+  /// provider reports `Unknown` exactly once for the batch's transaction,
+  /// the typed `CommitUnknown` error surfaces to the anti-entropy cadence
+  /// (the store stays frozen for reconcile), and the provider saw exactly
+  /// one commit — a blind retry from a fresh snapshot would both mask the
+  /// freeze and risk a second landing of the same page. `Conflict` and
+  /// `Aborted` keep their retry-once semantics; only the indeterminate
+  /// arm defers.
+  #[tokio::test]
+  async fn a_page_batch_commit_never_retries_an_unknown_outcome() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::storage::contract::{
+      reference::{UnknownFaultFactory, UnknownFaultMode},
+      required_capabilities,
+    };
+
+    // Stamp the base schema through a plain reference open first: the
+    // unknown fault must hit the page commit, not the open-time stamp.
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      required_capabilities(),
+    ));
+    let plain: Arc<dyn StorageFactory> = reference.clone();
+    drop(
+      MetadataStore::open(&plain, Duration::from_secs(10))
+        .await
+        .unwrap(),
+    );
+
+    let commit_calls = Arc::new(AtomicUsize::new(0));
+    let fault: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+      reference,
+      // The faulted commit lands nothing and reports Unknown.
+      mode: UnknownFaultMode::NotApplied,
+      commit_calls: Arc::clone(&commit_calls),
+    });
+    let store = MetadataStore::open(&fault, Duration::from_secs(10))
+      .await
+      .unwrap();
+
+    let record = put(1_000, "file:///page-batch");
+    let writer = NodeId::parse("node-000000000000000000001").unwrap();
+    let mut writer_keys = HashMap::new();
+    writer_keys.insert(
+      writer,
+      crate::PublicKey::from_bytes(SigningKey::from_bytes(&SEED).verifying_key().to_bytes()),
+    );
+
+    let error = super::commit_page_batch_ctx(&store, &SystemEntropy, &[&record], &writer_keys)
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::CommitUnknown);
+    assert_eq!(
+      commit_calls.load(Ordering::SeqCst),
+      1,
+      "an indeterminate page commit must not be retried"
+    );
+    // The faulted transaction landed nothing.
+    assert_eq!(read_record_ctx(&store, &name()).await.unwrap(), None);
   }
 }

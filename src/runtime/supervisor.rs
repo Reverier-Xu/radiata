@@ -1031,6 +1031,13 @@ pub(super) async fn dial_member(
         .clone()
         .map(rustls::pki_types::SubjectPublicKeyInfoDer::from),
     );
+    // The whole member dial — pinned attempt plus any rollover fallback —
+    // must fit inside ONE dial deadline: the fallback funds itself from
+    // the remainder of the first attempt, so a peer that wastes the
+    // budget on a failed pin cannot double the dial's bound. The clock is
+    // tokio's monotonic instant — the same clock `connect_with_deadline`'s
+    // timeout runs on — so the remainder and the timeout cannot drift.
+    let pinned_started = tokio::time::Instant::now();
     let mut connection =
       match connect_with_deadline(&transport, receiver.clone(), trust, dial_deadline).await {
         Ok(connection) => connection,
@@ -1052,8 +1059,16 @@ pub(super) async fn dial_member(
             kind = ?pin_error.kind(),
             "pinned member dial failed; retrying once with merge trust for certificate rollover"
           );
+          // Only the unspent remainder of the dial budget funds the
+          // fallback; a saturated remainder (the first attempt consumed
+          // the whole deadline) fails the dial outright instead of
+          // granting the retry a second full budget.
+          let remaining = dial_deadline.saturating_sub(pinned_started.elapsed());
+          if remaining.is_zero() {
+            return Err(pin_error);
+          }
           let fallback = TransportTrust::for_dial(&receiver.selector(), None);
-          connect_with_deadline(&transport, receiver.clone(), fallback, dial_deadline).await?
+          connect_with_deadline(&transport, receiver.clone(), fallback, remaining).await?
         }
         Err(error) => return Err(error),
       };
@@ -1183,6 +1198,114 @@ mod dial_deadline_tests {
     );
 
     holder.abort();
+  }
+
+  /// A scripted transport for the rollover-budget regression: the first
+  /// (pinned) dial fails its TLS establishment with the typed
+  /// authentication failure a stale SPKI pin produces, and the
+  /// merge-trust fallback peer accepts and then goes silent, so only the
+  /// dial budget can end the attempt.
+  #[derive(Debug)]
+  struct RolloverFaultTransport {
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+  }
+
+  impl crate::transport::registry::Transport for RolloverFaultTransport {
+    fn bind(
+      &self, _endpoint: crate::Endpoint,
+    ) -> crate::BoxFuture<
+      'static,
+      crate::Result<Box<dyn crate::transport::registry::TransportListener>>,
+    > {
+      Box::pin(async { Err(crate::Error::internal("test transport bind")) })
+    }
+
+    fn connect(
+      &self, _endpoint: crate::Endpoint, _trust: TransportTrust,
+    ) -> crate::BoxFuture<'static, crate::Result<crate::transport::connection::Connection>> {
+      let attempts = Arc::clone(&self.attempts);
+      Box::pin(async move {
+        match attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+          // The pinned attempt: the handshake runs, then the stale pin
+          // fails it with the typed authentication error.
+          0 => {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(crate::Error::authentication_failed("tls transport"))
+          }
+          // The rollover fallback: the peer accepts and goes silent, so
+          // the connect never settles inside any sane test budget.
+          _ => {
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+            Err(crate::Error::internal("test transport"))
+          }
+        }
+      })
+    }
+  }
+
+  /// The certificate-rollover fallback shares ONE dial deadline with the
+  /// pinned attempt that preceded it: the retry dials on the unspent
+  /// remainder only, so a pinned failure that cost part of the budget
+  /// cannot stretch the whole member dial past the configured bound (the
+  /// double-budget fallback used to reach deadline + first-attempt cost).
+  #[tokio::test(start_paused = true)]
+  async fn the_rollover_fallback_dials_within_one_dial_deadline() {
+    let (reference, config) = super::test_support::reference_and_config();
+    let (supervisor, _entropy, _sessions) =
+      super::test_support::supervisor_over(reference, config).await;
+    let operations = supervisor
+      .dependencies
+      .operations
+      .clone()
+      .expect("supervisor fixture builds operation handles");
+    let planes = operations.planes().expect("effect planes");
+    let driver = planes.driver.clone();
+    let peer = super::test_support::member_id(7);
+    let endpoint = crate::Endpoint::parse("wss://127.0.0.1:9").unwrap();
+    // Pin a leaf anchor for this exact target so the first dial carries
+    // the member-mode SPKI pin and its failure takes the rollover arm.
+    driver.record_peer_spki(&peer, &endpoint, vec![7; 32]);
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport: Arc<dyn crate::transport::registry::Transport> =
+      Arc::new(RolloverFaultTransport {
+        attempts: Arc::clone(&attempts),
+      });
+    let dial_deadline = Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    let error = super::dial_member(
+      transport,
+      driver,
+      planes.sessions.clone(),
+      Arc::clone(&planes.packet),
+      planes.shutdown.subscribe(),
+      Arc::clone(&planes.connection_tasks),
+      endpoint,
+      &peer,
+      false,
+      dial_deadline,
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+
+    // Both attempts ran (pinned dial, then the merge-trust fallback).
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+    // The elapsed fallback budget surfaced as the same coarse typed
+    // transport-connect failure as any other dial timeout.
+    assert_eq!(error.kind(), crate::ErrorKind::Io);
+    assert_eq!(error.context(), "transport connect");
+    // The whole dial landed ON the deadline: the fallback spent only the
+    // 900ms remainder, not a second full budget (which would have ended
+    // at 1.1s).
+    assert!(
+      elapsed >= dial_deadline,
+      "the dial must use its budget ({elapsed:?})"
+    );
+    assert!(
+      elapsed < dial_deadline + Duration::from_millis(50),
+      "the fallback must not exceed one dial deadline ({elapsed:?})"
+    );
   }
 }
 

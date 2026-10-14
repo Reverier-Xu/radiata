@@ -22,6 +22,11 @@ pub enum ErrorKind {
   RouteUnavailable,
   StreamInterrupted,
   Overloaded,
+  /// A frame is larger than a queue's or wire's permanent admission
+  /// bound: no amount of waiting or draining can ever admit it, so the
+  /// caller faces a configuration-sized input, not retryable
+  /// backpressure (the session queue's oversized-frame rejection).
+  FrameTooLarge,
   ResourceExhausted,
   StorageLocked,
   StorageCorrupt,
@@ -265,6 +270,17 @@ impl Error {
   pub(crate) const fn overloaded(context: &'static str) -> Self {
     Self {
       kind: ErrorKind::Overloaded,
+      context,
+    }
+  }
+
+  /// The permanently-unqueueable counterpart of [`Error::overloaded`]
+  /// on the session queue: the frame's encoded size alone exceeds the
+  /// byte bound, so the rejection is a permanent condition the caller
+  /// must fix on its side, never backpressure to wait out.
+  pub(crate) const fn frame_too_large(context: &'static str) -> Self {
+    Self {
+      kind: ErrorKind::FrameTooLarge,
       context,
     }
   }

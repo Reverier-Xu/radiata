@@ -103,6 +103,7 @@ const fn kind_code(kind: ErrorKind) -> Option<u8> {
     ErrorKind::RouteUnavailable => 11,
     ErrorKind::StreamInterrupted => 12,
     ErrorKind::Overloaded => 13,
+    ErrorKind::FrameTooLarge => 24,
     ErrorKind::ResourceExhausted => 14,
     ErrorKind::StorageLocked => 15,
     ErrorKind::StorageCorrupt => 16,
@@ -135,6 +136,7 @@ const fn kind_from_code(code: u8) -> Result<ErrorKind> {
     11 => ErrorKind::RouteUnavailable,
     12 => ErrorKind::StreamInterrupted,
     13 => ErrorKind::Overloaded,
+    24 => ErrorKind::FrameTooLarge,
     14 => ErrorKind::ResourceExhausted,
     15 => ErrorKind::StorageLocked,
     16 => ErrorKind::StorageCorrupt,
@@ -626,6 +628,7 @@ mod tests {
       ErrorKind::RouteUnavailable,
       ErrorKind::StreamInterrupted,
       ErrorKind::Overloaded,
+      ErrorKind::FrameTooLarge,
       ErrorKind::ResourceExhausted,
       ErrorKind::StorageLocked,
       ErrorKind::StorageCorrupt,
@@ -641,7 +644,7 @@ mod tests {
       let code = super::kind_code(kind).unwrap();
       assert_eq!(super::kind_from_code(code).unwrap(), kind);
     }
-    for code in [0_u8, 24, u8::MAX] {
+    for code in [0_u8, 25, u8::MAX] {
       assert!(super::kind_from_code(code).is_err());
     }
   }
