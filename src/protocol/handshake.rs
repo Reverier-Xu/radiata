@@ -510,7 +510,19 @@ impl Handshake {
         self.receive_proof(bytes, SESSION_INITIATOR_DOMAIN, ProofRole::Initiator)?
       }
       HandshakeKind::SelectionConfirmation => self.receive_confirmation(bytes)?,
-      HandshakeKind::MergeGrantDelivery => unreachable!(),
+      // Unreachable in the current control flow: the divert above (after
+      // the role check) routes every `MergeGrantDelivery` message —
+      // including hostile decoded input, whose probed kind id resolves to
+      // this variant — into `receive_grant_delivery`, which fails closed
+      // with typed errors (wrong mode, pre-authentication, duplicate,
+      // empty grant). Fail closed here too instead of panicking, so no
+      // input path can ever reach a panic even if a future refactor
+      // moves the divert.
+      HandshakeKind::MergeGrantDelivery => {
+        return Err(HandshakeError::Malformed {
+          context: "handshake message kind",
+        });
+      }
     }
     self.completed += 1;
     Ok(())

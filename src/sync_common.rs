@@ -273,23 +273,26 @@ pub(crate) fn send_pumped_payload(
   Ok((ack_rx, pump))
 }
 
-/// Resolves one dispatched payload's admission within [`SEND_ACK_WAIT`].
-/// A dead session resolves immediately; a rejecting one returns the
-/// typed failure; a half-dead one (the session still queues but nothing
-/// crosses) surfaces as the timeout. Every outcome except the ack makes
-/// the caller re-send the failed page on the next tick.
+/// Resolves one dispatched payload's admission within [`SEND_ACK_WAIT`]:
+/// `true` only for a resolved, admitted acknowledgement. A dead session
+/// (the acknowledgement channel dropped) resolves immediately as
+/// `false`; a rejecting one resolves its typed failure as `false`; a
+/// half-dead one (the session still queues but nothing crosses) surfaces
+/// as the timeout. The verdict carries admission semantics only — the
+/// reconcile plane feeds it to the session link profile's EWMA knobs
+/// (round-trip and loss samples, which in turn drive the cadence
+/// multiplier and the bounded hint retry) and the leave lane logs an
+/// unadmitted receipt — because convergence is receiver-evidenced and
+/// nothing commits sender-side delivery state on it.
 pub(crate) async fn delivered_within_bound(
   ack: tokio::sync::oneshot::Receiver<RoutedAckOutcome>,
 ) -> bool {
   // Only a resolved, admitted outcome counts as delivered. The inner
   // check is the load-bearing one: a typed rejection (the destination
   // refused admission, or the session died mid-pump) resolves the
-  // channel with `Ok(Err(kind))`, and counting that as delivery commits
-  // the sender's continuation state over a payload the destination never
-  // took — the record then strands until the lane's periodic full-pass
-  // repair instead of re-sending on the next tick (the star-128 roster
-  // tail: rejection bursts during the join storm silently committed
-  // every stranded page's watermark).
+  // channel with `Ok(Err(kind))`, and counting that as delivery would
+  // record a round-trip sample for a payload the destination never took
+  // and blind the loss EWMA to a genuinely failing session.
   tokio::time::timeout(SEND_ACK_WAIT, ack)
     .await
     .is_ok_and(|resolved| resolved.is_ok_and(|admission| admission.is_ok()))
@@ -470,8 +473,9 @@ mod tests {
   /// dropped admission channel (dead session) resolves false without
   /// waiting out the bound. A resolved but REJECTED admission (the
   /// destination's typed refusal, or a pump that lost the session
-  /// mid-flight) is not a delivery: counting it would commit the
-  /// sender's continuation over a payload the destination never took.
+  /// mid-flight) is not a delivery: counting it would record a
+  /// round-trip sample over a payload the destination never took and
+  /// blind the loss EWMA to a genuinely failing session.
   #[tokio::test]
   async fn delivered_within_bound_observes_the_admission_outcome() {
     let (notify, ack) = tokio::sync::oneshot::channel();

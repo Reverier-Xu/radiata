@@ -55,7 +55,7 @@ pub(crate) struct RecoveryStep {
   pub(crate) targets: Vec<NodeId>,
   /// The attempt serial this step consumed: the dial plane rotates a
   /// multi-homed member through its published endpoints with this serial
-  /// (endpoint-level failover, audit 2026-10-09 item 7).
+  /// (endpoint-level failover).
   pub(crate) attempt: u64,
   /// The wall-clock wait the just-taken attempt scheduled (the jittered
   /// next doubling's base), and `0` when the deadline is already due
@@ -82,7 +82,7 @@ pub(crate) struct RecoveryController {
   /// candidates starting at this offset (modulo the candidate count), so
   /// an isolated node sweeps its whole member table across successive
   /// attempts instead of retrying the same dictionary-order prefix
-  /// forever (audit 2026-10-09 item 7).
+  /// forever.
   cursor: usize,
 }
 
@@ -171,7 +171,7 @@ impl RecoveryController {
   /// in the deterministic candidate order and advances by the width
   /// taken, so consecutive steps cover disjoint members until the sweep
   /// wraps — a prefix of permanently-down members can no longer starve
-  /// the rest of the table (audit 2026-10-09 item 7).
+  /// the rest of the table.
   pub(crate) fn next_step(
     &mut self, now: u64, candidates: &BTreeSet<NodeId>, entropy: &dyn Entropy,
   ) -> RecoveryStep {
@@ -262,11 +262,11 @@ impl RecoveryController {
         .saturating_add(self.backoff_seconds(now))
   }
 
-  /// Forces one immediate recovery cycle (immediate-recovery command).
-  /// Forces one immediate recovery cycle without storms: only an active
-  /// recovery is pulled forward. A connected node satisfies the "any one
-  /// route" contract already, so forcing a cycle there would expand the
-  /// topology — exactly what recovery must not do.
+  /// Forces one immediate recovery cycle (the immediate-recovery
+  /// command) without storms: only an active recovery is pulled forward.
+  /// A connected node satisfies the "any one route" contract already, so
+  /// forcing a cycle there would expand the topology — exactly what
+  /// recovery must not do.
   pub(crate) fn immediate(&mut self, now: u64) {
     if self.state != RecoveryState::Recovering {
       return;
@@ -461,7 +461,7 @@ mod tests {
     assert_eq!(step.targets.len(), 2, "fan-out bounds each cycle");
   }
 
-  /// The candidate window rotates (audit 2026-10-09 item 7): consecutive
+  /// The candidate window rotates: consecutive
   /// steps cover disjoint members until the sweep wraps, so an isolated
   /// node dials its whole member table across successive attempts
   /// instead of retrying the same dictionary-order prefix forever.

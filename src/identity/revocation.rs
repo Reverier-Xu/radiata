@@ -273,22 +273,6 @@ pub(crate) async fn persist_revocation_ctx(
   .await
 }
 
-/// Every known revocation tombstone, bounded by `cap`, for sync
-#[cfg(test)]
-/// forwarding. Permanent records: never pruned by any GC pass.
-pub(crate) async fn known_revocation_records_ctx(
-  store: &MetadataStore, cap: usize,
-) -> Result<Vec<RevocationRecordV1>> {
-  crate::identity::records::scan_decoded_records(
-    store,
-    namespace()?,
-    cap,
-    crate::identity::records::skip_none,
-    RevocationRecordV1::decode,
-  )
-  .await
-}
-
 /// The revoked tombstone of `subject`, when this node holds one for that
 /// exact subject key. Snapshot reads only; the result never fabricates a
 /// revocation.
@@ -360,7 +344,7 @@ mod tests {
 
   use super::{
     REVOCATION_RECORD_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, is_revoked_ctx,
-    known_revocation_records_ctx, revoke_binding_ctx, revoked_key_ctx,
+    revoke_binding_ctx, revoked_key_ctx,
   };
   use crate::{
     ErrorKind, NodeId, PublicKey, Signature, StoreExpectation,
@@ -460,8 +444,18 @@ mod tests {
     );
     assert!(is_revoked_ctx(&store, &subject(), &key(7)).await.unwrap());
     assert!(!is_revoked_ctx(&store, &subject(), &key(8)).await.unwrap());
-    // The permanent record set feeds the sync forwarder.
-    let known = known_revocation_records_ctx(&store, 64).await.unwrap();
+    // The committed record is the family's whole content: the shared
+    // namespace scan decodes it back, and — permanent records being
+    // exempt from every GC pass — it is the only entry the scan finds.
+    let known = records::scan_decoded_records(
+      &store,
+      super::namespace().unwrap(),
+      64,
+      records::skip_none,
+      RevocationRecordV1::decode,
+    )
+    .await
+    .unwrap();
     assert_eq!(known.len(), 1);
     assert_eq!(known[0].subject(), &subject());
 

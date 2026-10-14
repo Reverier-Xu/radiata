@@ -38,7 +38,8 @@ fn record_key(name: &ResourceName) -> StoreKey {
 #[derive(Debug)]
 pub(crate) enum ResourceCommitOutcome {
   /// The record is now the register's stored winner; the receipt proves
-  /// the durable commit.
+  /// the durable commit. Production callers match the variant without
+  /// reading the receipt; only the crash-lane tests inspect it.
   Installed(#[allow(dead_code)] CommitReceipt),
   /// The register refused the write and keeps its stored winner: either
   /// a greater tuple already occupies it (an accepted write that stores
@@ -579,7 +580,7 @@ mod tests {
   }
 
   /// Two preconditioned puts that both observed the same prior version
-  /// (the audit's race window: pre-check → asynchronous signature →
+  /// (the CAS race window: pre-check → asynchronous signature →
   /// commit) resolve to exactly one install at the commit boundary: the
   /// second commit re-verifies the caller's expected version inside its
   /// own snapshot, refuses with the superseded outcome (which the effect
