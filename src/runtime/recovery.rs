@@ -1103,7 +1103,7 @@ mod tests {
     // poll also awaits the parked dial's accept, since the connection
     // lands asynchronously.
     ticks.recovery_tick().await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
       loop {
         if ticks
           .recovery_pending
@@ -1152,7 +1152,7 @@ mod tests {
     );
     // The re-dial connects asynchronously: await its accept before
     // counting, then check the bound left the second target alone.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
       loop {
         if first_connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
           break;

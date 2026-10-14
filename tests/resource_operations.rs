@@ -390,8 +390,27 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
   }
 
   // Reopen the same store: the identity and the committed candidate load
-  // intact.
-  let handle = NodeBuilder::new(storage).keys(keys).start().await.unwrap();
+  // intact. The previous node's redb file lock is released by an in-flight
+  // detached commit that can settle a few milliseconds after `shutdown`
+  // returns, so the typed lock error is retried rather than raced; a lock
+  // that never releases still fails the reopen.
+  let handle = {
+    let mut attempt = 0_u32;
+    loop {
+      match NodeBuilder::new(Arc::clone(&storage))
+        .keys(Arc::clone(&keys))
+        .start()
+        .await
+      {
+        Ok(handle) => break handle,
+        Err(error) if error.kind() == radiata::ErrorKind::StorageLocked && attempt < 200 => {
+          attempt += 1;
+          tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(error) => panic!("restart open failed: {error:?}"),
+      }
+    }
+  };
   let mut events = handle
     .watch::<ResourceChanged>(EventOptions::new())
     .unwrap();
