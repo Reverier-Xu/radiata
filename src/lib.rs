@@ -1,4 +1,13 @@
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::dbg_macro
+  )
+)]
 
 //! The crate root of the radiata runtime: a deterministic relay node
 //! library with identity, membership, resource metadata, storage, and a

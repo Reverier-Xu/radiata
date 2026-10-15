@@ -620,6 +620,9 @@ jobs:
       - name: feature powerset check
         run: cargo +1.98.0 hack check --feature-powerset --depth 1 --locked
 
+      - name: each-feature check
+        run: cargo +1.98.0 hack check --each-feature --locked
+
   features-test:
     name: features / test (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -743,6 +746,39 @@ jobs:
         if: always()
         working-directory: examples/chat
         run: ./down.sh >/dev/null 2>&1 || true
+
+  abi:
+    name: abi freeze
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install nightly rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly
+
+      - name: install cargo-public-api
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        with:
+          tool: cargo-public-api@0.52.0
+
+      # The ABI freeze compares the rendered public API byte-for-byte
+      # against the approved 0.1 baseline and asserts the semantic export
+      # anchors. It is the ignored tests/public_abi.rs lane: the rendered
+      # output is pinned to cargo-public-api 0.52.0, so a different
+      # renderer must never be mistaken for API drift.
+      - name: public API freeze
+        env:
+          # cargo-public-api shells out to `cargo`; pin it to the nightly
+          # toolchain the rustdoc-JSON rendering requires.
+          RUSTUP_TOOLCHAIN: nightly
+        run: >-
+          cargo +nightly test --locked --all-features --test public_abi
+          public_api_matches_the_approved_baseline -- --ignored --exact
 
   dependency-policy:
     name: dependency-policy
