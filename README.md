@@ -171,9 +171,18 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
 
-Per-family verification lanes live in `scripts/verify-*.sh` (storage contract, membership,
-handshake, fuzz corpora, and more). The `unsafe` keyword is forbidden crate-wide, and production
-code denies `unwrap()`/`expect()`.
+Source-level invariants live in `tests/static_invariants.rs` (metadata
+namespace single-sourcing, feature gating, excised-vocabulary residue, the
+single-writer removal caller, the compatibility family inventory) and run in
+the ordinary test lane. The public ABI freeze is `tests/public_abi.rs`, an
+`#[ignore]`d test the dedicated CI `abi` job runs against the approved
+rendering with `cargo-public-api`. Only tool-dependent and long-running
+lanes stay as scripts: `scripts/verify-soak.sh`,
+`scripts/verify-evidence-validator.sh`, `scripts/verify-decoder-fuzz.sh`,
+`scripts/verify-state-fuzz.sh`, `scripts/verify-simulation-artifacts.sh`, and
+the `scripts/verify-release.sh` launcher. The `unsafe` keyword is forbidden
+crate-wide, and production code denies `unwrap()`/`expect()` and ad-hoc
+console output through the `tracing` facade.
 
 ## License
 

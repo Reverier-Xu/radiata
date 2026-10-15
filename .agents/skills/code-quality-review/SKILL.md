@@ -36,10 +36,14 @@ Before any review, build the module map from the code itself (in order):
 - `src/lib.rs` — the facade: what is public, how modules re-export.
 - Module-level rustdoc (`//!` headers) of each top-level module — ownership
   boundaries and invariants live here.
-- `tests/` — the integration surface and the public-API baseline
-  (`tests/public_api.rs`, `tests/fixtures/public-api/`).
-- `scripts/verify-*.sh` — the per-family verification lanes and the exact
-  `cargo test` filters each runs.
+- `tests/` — the integration surface, the public-API baseline
+  (`tests/public_api.rs`, `tests/fixtures/public-api/`), the source-level
+  invariants (`tests/static_invariants.rs`), and the pinned ABI freeze
+  (`tests/public_abi.rs`, run by the CI `abi` job).
+- `scripts/verify-*.sh` — only the tool-dependent and long-running lanes
+  remain (soak, evidence validator, fuzz corpora, simulation artifacts,
+  and the `verify-release.sh` launcher). Behavior coverage lives in the
+  `cargo test` suite, not in per-family scripts.
 
 Record the milestone claims under review (from the user or commit history)
 and the module partitions for section 2.
@@ -48,11 +52,13 @@ and the module partitions for section 2.
 
 Do not trust commit messages. Prove closure from evidence:
 
-1. Run every `scripts/verify-*.sh` verification script relevant to the
-   claim. Each must exit 0. Capture the exact `cargo test` lanes each
-   script runs (they encode which behavior the repo considers covered).
+1. Run the remaining `scripts/verify-*.sh` lanes relevant to the claim
+   (soak, evidence validator, fuzz corpora, simulation artifacts). Each
+   must exit 0. Behavior coverage is otherwise the `cargo test` suite; the
+   source-level invariants and the ABI freeze are `tests/static_invariants.rs`
+   and the ignored `tests/public_abi.rs`.
 2. Map every claim to a concrete test:
-   - grep the test name from the verify script lane or `tests/*.rs`;
+   - locate the test in `tests/*.rs` or the owning `#[cfg(test)]` module;
    - confirm the test body asserts the claim's key statements (e.g. "body
      bytes never enter storage", "interruption is explicit", "no downgrade");
    - note any claim with no visible test (gap).
@@ -139,7 +145,7 @@ Aggregate findings across children:
 
 ## Check Yourself
 
-- [ ] Ran every relevant verify script; recorded PASS/FAIL.
+- [ ] Ran the relevant evidence lanes (long-running scripts, `tests/static_invariants.rs`, and the `tests/public_abi.rs` ABI freeze); recorded PASS/FAIL.
 - [ ] Every milestone claim has a mapped test or an explicit gap.
 - [ ] Every child reported per-dimension; cross-cutting child did the scan.
 - [ ] P0/P1 findings spot-checked against real code.
