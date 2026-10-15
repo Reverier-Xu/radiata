@@ -7,13 +7,22 @@
 # usage: scripts/verify-release.sh
 #
 # Stages:
-#   1. quality gates        taplo, nightly rustfmt, check/clippy/test
-#                           across all targets and features, locked
-#   2. wire compatibility   golden and migration fixtures
-#   3. mixed binaries       prior/current interop
-#   4. evidence validator   sealed ledger negatives
-#   5. fuzz corpus replay   every reviewed corpus through the adapters
-#   6. churn soak           bounded churn plus baseline return
+#   1. quality gates       taplo, nightly rustfmt, check/clippy/test across
+#                          all targets and features, locked. This includes
+#                          tests/static_invariants.rs, which carries every
+#                          source-level invariant the per-family scripts
+#                          used to guard (namespace single-sourcing,
+#                          feature gating, residue, single-writer callers).
+#   2. public ABI freeze   the approved 0.1 rendering, pinned to
+#                          cargo-public-api 0.52.0 and a nightly rustdoc
+#   3. evidence validator   sealed ledger negatives
+#   4. fuzz corpus replay   every reviewed corpus through the adapters
+#   5. churn soak           bounded churn plus baseline return
+#
+# The wire-compatibility golden vectors, mixed-binary interop, and the
+# simulator fault-matrix gate all run inside the quality-gates stage or the
+# CI matrix; only the tool-dependent and long-running lanes stay explicit
+# here.
 #
 # The SLO evidence is operator-run outside this launcher: the in-process
 # lanes (tests/membership_sync.rs sixteen-node SLO and trend,
@@ -57,12 +66,13 @@ RUSTFLAGS="-Dwarnings" RUSTDOCFLAGS="-Dwarnings" \
   cargo test --workspace --all-features --locked
 printf 'stage %s PASS\n' "$STAGE"
 
-stage "wire compatibility"
-bash scripts/verify-compat-fixtures.sh
-printf 'stage %s PASS\n' "$STAGE"
-
-stage "mixed binaries"
-bash scripts/verify-mixed-binary.sh
+stage "public ABI freeze"
+command -v cargo-public-api >/dev/null || {
+  printf 'cargo-public-api is required for the ABI freeze guard\n' >&2
+  exit 1
+}
+cargo +nightly test --locked --all-features --test public_abi \
+  public_api_matches_the_approved_baseline -- --ignored --exact
 printf 'stage %s PASS\n' "$STAGE"
 
 stage "evidence validator"
