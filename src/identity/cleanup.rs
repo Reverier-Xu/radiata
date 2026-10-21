@@ -5,6 +5,9 @@
 //! subject binding and the issuer's signature; receivers verify it against
 //! the permanently retained issuer binding and the subject binding (a
 //! divergent subject key is conflicting evidence and fails closed).
+//! Divergent-but-valid tombstones over the same binding from different
+//! issuers merge deterministically (the earliest signed stamp wins, the
+//! canonical encoding breaking ties), so partitioned cleanups converge.
 //!
 //! Cleanup tombstones are terminal: there is no resurrection path, and the
 //! user is responsible for never cleaning a node that is merely offline. A
@@ -120,6 +123,34 @@ fn cleanup_key(subject: &NodeId) -> StoreKey {
   StoreKey::new(Arc::from(subject.as_str().as_bytes().to_vec()))
 }
 
+/// The cleanup family's deterministic merge decision: two verified
+/// records compete for the single subject slot only over the same pinned
+/// binding — a stored record for a different subject key never competes,
+/// it fails closed — and the canonical winner is the earliest signed
+/// removal stamp, the canonical encoding breaking exact-stamp ties, so
+/// every holder of either record converges on the same winner after
+/// reconnect. The issuer difference is legitimate evidence by
+/// construction: both records passed strict issuer-signature
+/// verification against retained bindings before they reached the merge.
+fn cleanup_merge(stored: &[u8], fresh: &[u8]) -> Result<records::TerminalWinner> {
+  let stored_record = CleanupRecordV1::decode(stored)?;
+  let fresh_record = CleanupRecordV1::decode(fresh)?;
+  if stored_record.subject_key() != fresh_record.subject_key() {
+    return Err(Error::conflict("cleanup record"));
+  }
+  Ok(
+    match fresh_record
+      .timestamp_millis()
+      .cmp(&stored_record.timestamp_millis())
+    {
+      std::cmp::Ordering::Less => records::TerminalWinner::Fresh,
+      std::cmp::Ordering::Greater => records::TerminalWinner::Stored,
+      std::cmp::Ordering::Equal if fresh < stored => records::TerminalWinner::Fresh,
+      std::cmp::Ordering::Equal => records::TerminalWinner::Stored,
+    },
+  )
+}
+
 /// Signs one cleanup tombstone for `subject` with the local identity. The
 /// subject must have a locally retained binding: the tombstone pins the
 /// exact key so a later divergent binding can never validate against it.
@@ -152,9 +183,11 @@ pub(crate) async fn sign_cleanup_record(
   ))
 }
 
-/// Persists one verified cleanup tombstone (idempotent; a re-delivery of
-/// the exact record is a no-op, a divergent record for the same subject
-/// fails closed without mutation).
+/// Persists one verified cleanup tombstone: idempotent for the exact
+/// record, merged deterministically with a divergent verified record for
+/// the same binding (the canonical winner — earliest signed stamp, then
+/// canonical encoding — replaces the loser, so partitioned cleanups
+/// converge), and failing closed for a record over a different binding.
 pub(crate) async fn persist_cleanup_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &CleanupRecordV1,
 ) -> Result<()> {
@@ -170,13 +203,14 @@ pub(crate) async fn persist_cleanup_record_ctx(
   {
     return Err(Error::not_trusted("cleanup subject binding"));
   }
-  crate::identity::records::persist_terminal_record(
+  records::persist_convergent_terminal_record(
     store,
     entropy,
     metadata_namespace(CLEANUP_NAMESPACE)?,
     cleanup_key(record.subject()),
     Arc::from(record.encode()?),
     "cleanup record",
+    cleanup_merge,
   )
   .await
 }
@@ -583,6 +617,262 @@ mod tests {
       .await
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
+  }
+
+  /// A cleanup tombstone signed by a foreign issuer with an explicit
+  /// removal timestamp: divergent-but-valid evidence over the same
+  /// binding, exactly what a partitioned cleanup produces. The issuer's
+  /// binding must be retained for the record to verify.
+  fn foreign_tombstone(
+    issuer: &NodeId, signing: &ed25519_dalek::SigningKey, subject: &NodeId,
+    subject_key: &PublicKey, stamp: u64,
+  ) -> CleanupRecordV1 {
+    use ed25519_dalek::Signer as _;
+    let body = CleanupRecordV1::encode_signed_body(subject, subject_key, issuer, stamp).unwrap();
+    let signature = signing.sign(&signature_message(CLEANUP_RECORD_DOMAIN, &body));
+    CleanupRecordV1::new(
+      subject.clone(),
+      subject_key.clone(),
+      issuer.clone(),
+      stamp,
+      Signature::from_bytes(signature.to_bytes()),
+    )
+  }
+
+  /// Two verified cleanups of the same binding from different issuers
+  /// (the partitioned-cleanup scenario) merge deterministically: the
+  /// earliest signed stamp wins regardless of delivery order, and a
+  /// re-delivery of the losing record never rolls the winner back
+  /// (audit A01).
+  #[tokio::test]
+  async fn partitioned_cleanup_records_merge_to_the_earliest_stamp() {
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = lifecycle::open_local_identity(
+      &factory,
+      Some(&keys.as_provider()),
+      entropy.as_ref(),
+      std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    let subject = node(7_600);
+    let subject_key = PublicKey::from_bytes(scripted_signing(76).verifying_key().to_bytes());
+    adopt_binding_ctx(context.store(), entropy.as_ref(), &subject, &subject_key)
+      .await
+      .unwrap();
+    let foreign = node(7_610);
+    let foreign_signing = scripted_signing(761);
+    adopt_binding_ctx(
+      context.store(),
+      entropy.as_ref(),
+      &foreign,
+      &PublicKey::from_bytes(foreign_signing.verifying_key().to_bytes()),
+    )
+    .await
+    .unwrap();
+
+    let later = stamped_tombstone(&context, &keys, &subject, &subject_key, 9_000).await;
+    let earlier = foreign_tombstone(&foreign, &foreign_signing, &subject, &subject_key, 5_000);
+
+    // Delivery order one: the later local record lands first, the
+    // earlier foreign record replaces it.
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &later)
+      .await
+      .unwrap();
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &earlier)
+      .await
+      .unwrap();
+    let known = known_cleanup_records_ctx(context.store(), 64)
+      .await
+      .unwrap();
+    assert_eq!(known.len(), 1);
+    assert_eq!(known[0].timestamp_millis(), 5_000);
+    assert_eq!(known[0].issuer(), &foreign);
+
+    // A re-delivery of the losing record never rolls the winner back.
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &later)
+      .await
+      .unwrap();
+    let known = known_cleanup_records_ctx(context.store(), 64)
+      .await
+      .unwrap();
+    assert_eq!(known.len(), 1);
+    assert_eq!(known[0].timestamp_millis(), 5_000);
+
+    // Delivery order two (a fresh subject, reversed): the same winner.
+    let subject_two = node(7_620);
+    let subject_two_key = PublicKey::from_bytes(scripted_signing(762).verifying_key().to_bytes());
+    adopt_binding_ctx(
+      context.store(),
+      entropy.as_ref(),
+      &subject_two,
+      &subject_two_key,
+    )
+    .await
+    .unwrap();
+    let later_two = stamped_tombstone(&context, &keys, &subject_two, &subject_two_key, 9_000).await;
+    let earlier_two = foreign_tombstone(
+      &foreign,
+      &foreign_signing,
+      &subject_two,
+      &subject_two_key,
+      5_000,
+    );
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &earlier_two)
+      .await
+      .unwrap();
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &later_two)
+      .await
+      .unwrap();
+    let known = known_cleanup_records_ctx(context.store(), 64)
+      .await
+      .unwrap();
+    let stored = known
+      .iter()
+      .find(|record| record.subject() == &subject_two)
+      .expect("the second subject keeps exactly one record");
+    assert_eq!(stored.timestamp_millis(), 5_000);
+  }
+
+  /// An exact-stamp tie breaks deterministically on the canonical
+  /// encoding: the lexicographic minimum wins in both delivery orders,
+  /// so tied partitioned cleanups still converge (audit A01).
+  #[tokio::test]
+  async fn tied_cleanup_records_break_deterministically_on_the_encoding() {
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = lifecycle::open_local_identity(
+      &factory,
+      Some(&keys.as_provider()),
+      entropy.as_ref(),
+      std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    let foreign = node(7_630);
+    let foreign_signing = scripted_signing(763);
+    adopt_binding_ctx(
+      context.store(),
+      entropy.as_ref(),
+      &foreign,
+      &PublicKey::from_bytes(foreign_signing.verifying_key().to_bytes()),
+    )
+    .await
+    .unwrap();
+
+    let subject_key = PublicKey::from_bytes(scripted_signing(766).verifying_key().to_bytes());
+    let local_tie = stamped_tombstone(&context, &keys, &node(7_640), &subject_key, 7_000).await;
+    let foreign_tie = foreign_tombstone(
+      &foreign,
+      &foreign_signing,
+      &node(7_640),
+      &subject_key,
+      7_000,
+    );
+    let foreign_wins = foreign_tie.encode().unwrap() < local_tie.encode().unwrap();
+
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &local_tie)
+      .await
+      .unwrap();
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &foreign_tie)
+      .await
+      .unwrap();
+    let known = known_cleanup_records_ctx(context.store(), 64)
+      .await
+      .unwrap();
+    assert_eq!(
+      *known
+        .iter()
+        .find(|record| record.subject() == &node(7_640))
+        .expect("the subject keeps exactly one record"),
+      if foreign_wins {
+        foreign_tie.clone()
+      } else {
+        local_tie.clone()
+      }
+    );
+
+    // The reversed order over a second subject converges to the same
+    // winner: the same record pair shape decides identically.
+    let local_tie = stamped_tombstone(&context, &keys, &node(7_650), &subject_key, 7_000).await;
+    let foreign_tie = foreign_tombstone(
+      &foreign,
+      &foreign_signing,
+      &node(7_650),
+      &subject_key,
+      7_000,
+    );
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &foreign_tie)
+      .await
+      .unwrap();
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &local_tie)
+      .await
+      .unwrap();
+    let known = known_cleanup_records_ctx(context.store(), 64)
+      .await
+      .unwrap();
+    assert_eq!(
+      *known
+        .iter()
+        .find(|record| record.subject() == &node(7_650))
+        .expect("the subject keeps exactly one record"),
+      if foreign_wins { foreign_tie } else { local_tie }
+    );
+  }
+
+  /// The merge never launders a different binding: a stored cleanup
+  /// record pinning another subject key still fails closed (audit A01).
+  #[tokio::test]
+  async fn cleanup_records_over_different_bindings_still_fail_closed() {
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = lifecycle::open_local_identity(
+      &factory,
+      Some(&keys.as_provider()),
+      entropy.as_ref(),
+      std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    // The subject carries no local binding, so both records pass the
+    // subject-binding gate and the divergence is decided inside the
+    // merge itself.
+    let subject = node(7_700);
+    let bound = PublicKey::from_bytes(scripted_signing(77).verifying_key().to_bytes());
+    let other = PublicKey::from_bytes(scripted_signing(78).verifying_key().to_bytes());
+    let first = stamped_tombstone(&context, &keys, &subject, &bound, 1_000).await;
+    let divergent = stamped_tombstone(&context, &keys, &subject, &other, 1_000).await;
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &first)
+      .await
+      .unwrap();
+    assert_eq!(
+      persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &divergent)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::Conflict
+    );
+    let known = known_cleanup_records_ctx(context.store(), 64)
+      .await
+      .unwrap();
+    assert_eq!(known.len(), 1);
+    assert_eq!(known[0].subject_key(), &bound);
   }
 
   /// The GC pass collects only the tombstones at or before the checkpoint

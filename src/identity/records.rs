@@ -204,35 +204,106 @@ pub(crate) fn key_handle_fresh_checks(handle: &KeyHandle) -> Result<[StoreOperat
   }))
 }
 
-/// The shared idempotent install for one terminal tombstone record
-/// (`LeaveRecordV1`, `CleanupRecordV1`, `RevocationRecordV1`): a
-/// snapshot-identical record is a no-op, any divergence conflicts, and a
-/// fresh record installs through one conditional Absent put. The caller
-/// holds the store's writer permit and has already verified the record
-/// against the retained bindings; `label` names the family in the
-/// conflict error.
+/// The shared idempotent install for one terminal tombstone record whose
+/// family holds exactly one legitimate record per subject
+/// (`LeaveRecordV1`): a snapshot-identical record is a no-op, any
+/// divergence conflicts, and a fresh record installs through one
+/// conditional Absent put. The caller holds the store's writer permit and
+/// has already verified the record against the retained bindings; `label`
+/// names the family in the conflict error.
 pub(crate) async fn persist_terminal_record(
   store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, key: StoreKey,
   encoded: Arc<[u8]>, label: &'static str,
 ) -> Result<()> {
   let snapshot = store.snapshot().await?;
-  if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    if existing.as_bytes() == encoded.as_ref() {
-      return Ok(());
+  let expected = match snapshot.get(&namespace, &key).await? {
+    Some(existing) => {
+      if existing.as_bytes() == encoded.as_ref() {
+        return Ok(());
+      }
+      return Err(Error::conflict(label));
     }
-    return Err(Error::conflict(label));
-  }
+    None => StoreExpectation::Absent,
+  };
+  let revision = snapshot.revision().clone();
+  drop(snapshot);
+  install_terminal_record(
+    store, entropy, &namespace, key, encoded, expected, revision, label,
+  )
+  .await
+}
+
+/// The deterministic canonical-winner verdict of one terminal tombstone
+/// family's merge decision: which of two verified records over the same
+/// subject wins the family's single store slot. The family's decider owns
+/// the binding policy — records pinning different subject keys never
+/// compete, they fail closed through their own error.
+pub(crate) enum TerminalWinner {
+  /// The stored record is the canonical winner: the fresh record is
+  /// dropped, and the peer that still holds it converges to the stored
+  /// one through the same decision.
+  Stored,
+  /// The fresh record is the canonical winner: the stored record is
+  /// replaced through a conditional exact-digest put.
+  Fresh,
+}
+
+/// The convergent install shared by the terminal tombstone families that
+/// admit divergent-but-valid evidence for one subject (`CleanupRecordV1`,
+/// `RevocationRecordV1`): a snapshot-identical record is a no-op, a fresh
+/// record installs through one conditional Absent put, and a divergent
+/// record competes through `decides` — the family's binding check plus
+/// canonical total order — so two partitioned members that legitimately
+/// revoked or cleaned the same binding converge on the same winner after
+/// reconnect. The replacement is one conditional put pinning the stored
+/// record's exact digest; the caller holds the store's writer permit and
+/// has already verified the fresh record against the retained bindings;
+/// `label` names the family in the conflict error.
+pub(crate) async fn persist_convergent_terminal_record(
+  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, key: StoreKey,
+  encoded: Arc<[u8]>, label: &'static str, decides: fn(&[u8], &[u8]) -> Result<TerminalWinner>,
+) -> Result<()> {
+  let snapshot = store.snapshot().await?;
+  let expected = match snapshot.get(&namespace, &key).await? {
+    Some(existing) => {
+      if existing.as_bytes() == encoded.as_ref() {
+        return Ok(());
+      }
+      match decides(existing.as_bytes(), encoded.as_ref())? {
+        TerminalWinner::Stored => return Ok(()),
+        TerminalWinner::Fresh => StoreExpectation::Exact(existing.digest().clone()),
+      }
+    }
+    None => StoreExpectation::Absent,
+  };
+  let revision = snapshot.revision().clone();
+  drop(snapshot);
+  install_terminal_record(
+    store, entropy, &namespace, key, encoded, expected, revision, label,
+  )
+  .await
+}
+
+/// The commit tail both terminal-record install paths share: one
+/// conditional `Put` under `expected`, prepared against the snapshot's
+/// CAS revision (the snapshot is released before the commit), committed
+/// through the fail-closed verdict, with the register-write epoch armed
+/// so the tombstones lane observes the change.
+#[allow(clippy::too_many_arguments)]
+async fn install_terminal_record(
+  store: &MetadataStore, entropy: &dyn Entropy, namespace: &StoreNamespace, key: StoreKey,
+  encoded: Arc<[u8]>, expected: StoreExpectation, revision: StoreRevision, label: &'static str,
+) -> Result<()> {
   let transaction = store.prepare_transaction(
     TransactionId::generate(entropy)?,
-    snapshot.revision().clone(),
+    revision,
     vec![StoreOperation::Put {
       namespace: namespace.clone(),
       key,
-      expected: StoreExpectation::Absent,
+      expected,
       value: StoreValue::new(encoded),
     }],
   )?;
-  drop(snapshot);
   // A discarded commit outcome would silently drop the tombstone: a
   // Conflict or Aborted commit definitively did not land, and an Unknown
   // leaves durability indeterminate — the caller must never report a
@@ -242,7 +313,7 @@ pub(crate) async fn persist_terminal_record(
   // trigger: a persisted terminal record (leave, cleanup, revocation)
   // enters the tombstones lane on the next rescan, so the write must
   // arm it exactly like every other store write.
-  store.note_local_write_in(&namespace);
+  store.note_local_write_in(namespace);
   Ok(())
 }
 
@@ -1747,5 +1818,86 @@ mod tests {
     let entropy = ScriptedEntropy::new(vec![ADMISSION_BYTES.to_vec()]);
     let wrapper = MergeId::generate(&entropy).unwrap();
     assert_eq!(wrapper, merge());
+  }
+
+  /// The convergent terminal-record install is deterministic regardless
+  /// of delivery order: a fresh record installs once, the exact record is
+  /// idempotent, the decider's winner replaces the loser through the
+  /// exact-digest conditional put, and the decider's own fail-closed
+  /// binding error surfaces as Conflict without mutation (audit A01).
+  #[tokio::test]
+  async fn convergent_terminal_record_replaces_the_decided_winner_deterministically() {
+    use crate::{
+      api::SystemEntropy,
+      provider::StorageFactory,
+      storage::{
+        MetadataStore,
+        contract::{ReferenceFactory, required_capabilities},
+      },
+    };
+
+    // A test decider standing in for a family's merge policy: records
+    // share a binding when their first byte agrees, and the canonical
+    // winner is the lexicographic minimum.
+    fn decides(stored: &[u8], fresh: &[u8]) -> Result<TerminalWinner> {
+      if stored.first() != fresh.first() {
+        return Err(Error::conflict("test terminal binding"));
+      }
+      Ok(if fresh < stored {
+        TerminalWinner::Fresh
+      } else {
+        TerminalWinner::Stored
+      })
+    }
+
+    let factory: Arc<dyn StorageFactory> = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let store = MetadataStore::open(&factory, std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    // Any family namespace: the install is family-agnostic.
+    let namespace = metadata_namespace(crate::storage::families::REVOCATION_NAMESPACE).unwrap();
+    let key = store_key(b"subject");
+
+    let install = |encoded: Vec<u8>| {
+      persist_convergent_terminal_record(
+        &store,
+        &SystemEntropy,
+        namespace.clone(),
+        key.clone(),
+        Arc::from(encoded),
+        "test terminal record",
+        decides,
+      )
+    };
+    let stored = || async {
+      store
+        .snapshot()
+        .await
+        .unwrap()
+        .get(&namespace, &key)
+        .await
+        .unwrap()
+        .map(|value| value.as_bytes().to_vec())
+    };
+
+    // A fresh record installs exactly once; the exact record is a no-op.
+    install(vec![0x01, 0x02, 0x03]).await.unwrap();
+    install(vec![0x01, 0x02, 0x03]).await.unwrap();
+    assert_eq!(stored().await.as_deref(), Some(&[0x01, 0x02, 0x03][..]));
+
+    // A losing fresh record (same binding, greater encoding) is dropped.
+    install(vec![0x01, 0x09]).await.unwrap();
+    assert_eq!(stored().await.as_deref(), Some(&[0x01, 0x02, 0x03][..]));
+
+    // A winning fresh record (same binding, smaller encoding) replaces
+    // the stored one.
+    install(vec![0x01, 0x00]).await.unwrap();
+    assert_eq!(stored().await.as_deref(), Some(&[0x01, 0x00][..]));
+
+    // The decider's fail-closed binding refusal surfaces as Conflict and
+    // never mutates the stored record.
+    let error = install(vec![0x07, 0x00]).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    assert_eq!(stored().await.as_deref(), Some(&[0x01, 0x00][..]));
   }
 }

@@ -560,7 +560,30 @@ pub(crate) async fn apply_tombstone_rows(
             continue;
           }
         };
-        apply_cleanup_record(store, entropy, events, revision, &evidence, &record).await?;
+        // A cleanup row, like a leave row, is terminal evidence carried
+        // by its own signature: a forged signature (AuthenticationFailed
+        // from the strict verify), a policy refusal (NotTrusted issuer or
+        // subject binding), or a divergent stored record over a different
+        // binding (Conflict) refuses the row — the batch continues, so one
+        // divergent record can never wedge the tombstone lane. Real store
+        // faults still propagate.
+        match apply_cleanup_record(store, entropy, events, revision, &evidence, &record).await {
+          Err(error)
+            if matches!(
+              error.kind(),
+              crate::ErrorKind::Conflict
+                | crate::ErrorKind::NotTrusted
+                | crate::ErrorKind::AuthenticationFailed
+            ) =>
+          {
+            tracing::warn!(
+              subject = %record.subject(),
+              kind = ?error.kind(),
+              "reconcile cleanup row refused: divergent or untrusted evidence; skipping"
+            );
+          }
+          other => other?,
+        }
       }
       3 => {
         let record = match crate::identity::revocation::RevocationRecordV1::decode(content) {
@@ -580,7 +603,30 @@ pub(crate) async fn apply_tombstone_rows(
             continue;
           }
         };
-        apply_revocation_record(store, entropy, events, &evidence, &record, sessions).await?;
+        // A revocation row, like a leave row, is terminal evidence
+        // carried by its own signature: a forged signature
+        // (AuthenticationFailed from the strict verify), a policy refusal
+        // (NotTrusted issuer or subject binding), or a divergent stored
+        // record over a different binding (Conflict) refuses the row —
+        // the batch continues, so one divergent record can never wedge
+        // the tombstone lane. Real store faults still propagate.
+        match apply_revocation_record(store, entropy, events, &evidence, &record, sessions).await {
+          Err(error)
+            if matches!(
+              error.kind(),
+              crate::ErrorKind::Conflict
+                | crate::ErrorKind::NotTrusted
+                | crate::ErrorKind::AuthenticationFailed
+            ) =>
+          {
+            tracing::warn!(
+              subject = %record.subject(),
+              kind = ?error.kind(),
+              "reconcile revocation row refused: divergent or untrusted evidence; skipping"
+            );
+          }
+          other => other?,
+        }
       }
       4 => {
         let checkpoint = match crate::identity::cleanup::CleanupCheckpointV1::decode(content) {
@@ -1569,5 +1615,168 @@ mod tests {
         .unwrap(),
       "the binding arrival re-applied the skipped row"
     );
+  }
+
+  /// Regression (audit A01): one divergent terminal record must never
+  /// abort a tombstone batch — the cleanup and revocation arms refuse the
+  /// row (warn + continue) exactly like the leave arm, a same-binding
+  /// divergent cleanup row merges to its canonical winner instead of
+  /// conflicting, and rows ordered after a refused row still apply in
+  /// the same pass. Before the fix, the `?` on the apply arms wedged the
+  /// derived-view repair on the same poison row every epoch.
+  #[tokio::test]
+  async fn divergent_tombstone_rows_refuse_row_wise_and_never_abort_the_batch() {
+    use ed25519_dalek::Signer as _;
+
+    use crate::identity::{
+      cleanup::{CleanupRecordV1, known_cleanup_records_ctx, persist_cleanup_record_ctx},
+      leave::{LeaveRecordV1, is_left_ctx},
+      revocation::{RevocationRecordV1, persist_revocation_ctx, revoked_key_ctx},
+      signature::signature_message,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full_at(9_700);
+    let scripted_entropy = Arc::new(SequenceEntropy::default());
+    let entropy: Arc<dyn Entropy> = scripted_entropy.clone();
+    let context = Arc::new(
+      open_context(&factory, &keys, &scripted_entropy)
+        .await
+        .unwrap(),
+    );
+    let store = context.store();
+
+    // The shared issuer of the terminal evidence and the subjects: the
+    // revoked subject's binding pins the stored revocation's key (the
+    // poison row pins a different one, so the apply is refused by
+    // policy), and the cleaned subject's binding is the merge row's.
+    let issuer = node_at(9_710);
+    let issuer_signing = crate::identity::testing::scripted_signing(9_711);
+    let issuer_key = key_at(9_711);
+    let revoked = node_at(9_720);
+    let revoked_key = key_at(9_721);
+    let cleaned = node_at(9_730);
+    let cleaned_key = key_at(9_731);
+    let leaver = node_at(9_740);
+    let leaver_key = key_at(9_741);
+    for (node, key) in [
+      (issuer.clone(), issuer_key),
+      (revoked.clone(), revoked_key.clone()),
+      (cleaned.clone(), cleaned_key.clone()),
+      (leaver.clone(), leaver_key.clone()),
+    ] {
+      crate::identity::trust::store::adopt_binding_ctx(store, entropy.as_ref(), &node, &key)
+        .await
+        .unwrap();
+    }
+
+    let revocation_of = |subject_key: &crate::PublicKey| {
+      let body = RevocationRecordV1::encode_signed_body(&revoked, subject_key, &issuer).unwrap();
+      let signature = issuer_signing.sign(&signature_message(
+        crate::identity::revocation::REVOCATION_RECORD_DOMAIN,
+        &body,
+      ));
+      RevocationRecordV1::new(
+        revoked.clone(),
+        subject_key.clone(),
+        issuer.clone(),
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    let cleanup_of = |subject_key: &crate::PublicKey, stamp: u64| {
+      let body =
+        CleanupRecordV1::encode_signed_body(&cleaned, subject_key, &issuer, stamp).unwrap();
+      let signature = issuer_signing.sign(&signature_message(
+        crate::identity::cleanup::CLEANUP_RECORD_DOMAIN,
+        &body,
+      ));
+      CleanupRecordV1::new(
+        cleaned.clone(),
+        subject_key.clone(),
+        issuer.clone(),
+        stamp,
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+
+    // The stored evidence the arriving rows diverge from.
+    persist_revocation_ctx(store, entropy.as_ref(), &revocation_of(&revoked_key))
+      .await
+      .unwrap();
+    persist_cleanup_record_ctx(store, entropy.as_ref(), &cleanup_of(&cleaned_key, 9_000))
+      .await
+      .unwrap();
+
+    // The leaver's own signed record: its row must apply in the same
+    // pass as the refused rows ahead of it.
+    let leave_body = LeaveRecordV1::encode_signed_body(&leaver, &leaver_key, 1_000).unwrap();
+    let leave_signature = crate::identity::testing::scripted_signing(9_741).sign(
+      &signature_message(crate::identity::leave::LEAVE_RECORD_DOMAIN, &leave_body),
+    );
+    let leave = LeaveRecordV1::new(
+      leaver.clone(),
+      leaver_key.clone(),
+      1_000,
+      crate::Signature::from_bytes(leave_signature.to_bytes()),
+    );
+
+    let row = |kind: u8, subject: &NodeId, encoded: Vec<u8>| {
+      let mut key = Vec::with_capacity(1 + subject.as_str().len());
+      key.push(kind);
+      key.extend_from_slice(subject.as_str().as_bytes());
+      (key, encoded)
+    };
+    let rows = vec![
+      // The poison rows: pinned keys that diverge from the stored
+      // records' bindings, refused by policy instead of aborting the
+      // batch — one per terminal family.
+      row(3, &revoked, revocation_of(&key_at(9_799)).encode().unwrap()),
+      row(
+        2,
+        &cleaned,
+        cleanup_of(&key_at(9_798), 5_000).encode().unwrap(),
+      ),
+      // The merge row: a same-binding divergent cleanup record, earlier
+      // stamp — it converges instead of conflicting.
+      row(
+        2,
+        &cleaned,
+        cleanup_of(&cleaned_key, 5_000).encode().unwrap(),
+      ),
+      // The leave row behind the poison rows applies in the same pass.
+      row(1, &leaver, leave.encode().unwrap()),
+    ];
+
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+    apply_tombstone_rows(
+      &context, &entropy, &events, &revision, &sessions, &rows, None, None,
+    )
+    .await
+    .expect("one divergent record must never abort the batch");
+
+    // The refused row left the stored revocation untouched.
+    assert_eq!(
+      revoked_key_ctx(store, &revoked).await.unwrap(),
+      Some(revoked_key)
+    );
+    // The merge row replaced the stored cleanup record with the
+    // earliest-stamp winner.
+    let cleaned_records = known_cleanup_records_ctx(store, 64).await.unwrap();
+    assert_eq!(
+      cleaned_records
+        .iter()
+        .find(|record| record.subject() == &cleaned)
+        .expect("the cleaned subject keeps exactly one record")
+        .timestamp_millis(),
+      5_000
+    );
+    // The leave row ordered after the poison rows applied in the same
+    // pass — the batch did not abort.
+    assert!(is_left_ctx(store, &leaver).await.unwrap());
   }
 }
