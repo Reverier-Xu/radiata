@@ -608,7 +608,14 @@ fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) {
 
 /// Digests the immutable opening context of one open frame (endpoints,
 /// protocol, canonical metadata): identical retransmissions produce the
-/// same digest; any mutation produces a different one.
+/// same digest; any mutation produces a different one. Metadata values
+/// are arbitrary wire bytes that may contain any separator byte, so the
+/// entry preimage is length-prefixed — the entry count, then a `u32`
+/// big-endian length before every key and value (the style of the
+/// receipt reference domain) — making the encoding injective: a
+/// crafted value can never impersonate an entry boundary. The digest is
+/// process-local (never serialized), so the preimage carries no
+/// compatibility weight.
 fn opening_context_digest(
   source: &NodeId, destination: &NodeId, protocol: &ProtocolTag, metadata: &StreamMetadata,
 ) -> crate::Digest {
@@ -618,11 +625,13 @@ fn opening_context_digest(
   bytes.extend_from_slice(destination.as_str().as_bytes());
   bytes.push(0);
   bytes.extend_from_slice(protocol.as_str().as_bytes());
-  for (key, value) in metadata.entries() {
+  let entries = metadata.entries();
+  bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+  for (key, value) in entries {
+    bytes.extend_from_slice(&(key.as_str().len() as u32).to_be_bytes());
     bytes.extend_from_slice(key.as_str().as_bytes());
-    bytes.push(1);
+    bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
     bytes.extend_from_slice(value);
-    bytes.push(2);
   }
   crate::identity::signature::body_digest(&bytes)
 }
@@ -783,6 +792,54 @@ mod admission_tests {
     );
     assert_ne!(first, second);
     let _ = BTreeMap::<String, ByteVec>::new();
+  }
+
+  /// Metadata values are arbitrary wire bytes that may contain the
+  /// separator bytes and the text of a later key: a value that spells
+  /// out the next entry must not collide with the genuine two-entry
+  /// context it imitates (collision regression for the length-prefixed
+  /// preimage).
+  #[test]
+  fn crafted_value_bytes_cannot_impersonate_the_next_entry() {
+    let original = opening_context_digest(
+      &node(1),
+      &node(2),
+      &protocol("test-echo"),
+      &metadata(&[("alpha", b"x"), ("beta", b"y")]),
+    );
+    let crafted = opening_context_digest(
+      &node(1),
+      &node(2),
+      &protocol("test-echo"),
+      &metadata(&[("alpha", b"x\x02radiata.woooo.tech/labels/beta\x01y")]),
+    );
+    assert_ne!(
+      original, crafted,
+      "a value spelling out the next entry must not collide with it"
+    );
+  }
+
+  /// A value that ends with the entry separator never aliases a further
+  /// entry: the entry count and the fixed-width length prefixes delimit
+  /// the map unambiguously even when values are empty.
+  #[test]
+  fn separator_bytes_inside_values_do_not_alias_entry_boundaries() {
+    let with_suffix_value = opening_context_digest(
+      &node(1),
+      &node(2),
+      &protocol("test-echo"),
+      &metadata(&[("alpha", b"x\x02")]),
+    );
+    let with_second_entry = opening_context_digest(
+      &node(1),
+      &node(2),
+      &protocol("test-echo"),
+      &metadata(&[("alpha", b"x"), ("beta", b"")]),
+    );
+    assert_ne!(
+      with_suffix_value, with_second_entry,
+      "a trailing separator byte must not open an entry boundary"
+    );
   }
 
   // ---- Rejection records stay bounded terminal facts ----
