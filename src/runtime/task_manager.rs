@@ -244,17 +244,17 @@ pub(crate) type TaskEffect = Arc<
     + Sync,
 >;
 
-/// The payload the coalescing rules compare. The verb migrations (next
-/// stage) extend the set with their verb inputs; today the effect
-/// closure owns the whole verb input and the payload carries only the
-/// coalescing subject.
+/// The payload the coalescing rules compare. A coalescing kind carries
+/// its whole verb input here — the dial intent for Connect, the pinned
+/// expected key for Revoke — so a coalesced submission can never join an
+/// in-flight task whose intent differs from its own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TaskPayload {
   /// No coalescing subject: the kind never coalesces.
   None,
   /// The coalescing subject: the dialed peer for Disconnect, the
-  /// acted-on node for Revoke/PurgeRevocation/Cleanup. The whole dial
-  /// intent is the payload, so coalescing compares it too.
+  /// acted-on node for PurgeRevocation/Cleanup. The whole dial intent is
+  /// the payload, so coalescing compares it too.
   Peer(NodeId),
   /// The full dial intent for Connect: the endpoint plus the dialed
   /// peer. The endpoint is part of the compared payload — a coalesced
@@ -263,6 +263,15 @@ pub(crate) enum TaskPayload {
   PeerDial {
     endpoint: crate::Endpoint,
     peer: NodeId,
+  },
+  /// The full revoke intent: the subject plus the pinned expected key.
+  /// The key is part of the compared payload — a coalesced submission
+  /// may join an in-flight revoke only when it pins the same key, never
+  /// silently satisfy a caller whose comparand was never checked
+  /// (the revoke effect checks only the first caller's key).
+  Revoke {
+    subject: NodeId,
+    expected_key: crate::PublicKey,
   },
 }
 
@@ -291,11 +300,15 @@ impl TaskSpec {
   /// internal invariant, never caller data).
   pub(crate) fn check_shape(&self) -> Result<()> {
     let requires_dial = matches!(self.kind, TaskKind::Connect);
+    let requires_revoke = matches!(self.kind, TaskKind::Revoke);
     let requires_subject = matches!(
       self.kind,
-      TaskKind::Disconnect | TaskKind::Revoke | TaskKind::PurgeRevocation | TaskKind::Cleanup,
+      TaskKind::Disconnect | TaskKind::PurgeRevocation | TaskKind::Cleanup,
     );
     if requires_dial && !matches!(self.payload, TaskPayload::PeerDial { .. }) {
+      return Err(Error::internal("task coalescing subject"));
+    }
+    if requires_revoke && !matches!(self.payload, TaskPayload::Revoke { .. }) {
       return Err(Error::internal("task coalescing subject"));
     }
     if requires_subject && !matches!(self.payload, TaskPayload::Peer(_)) {
@@ -310,12 +323,14 @@ impl TaskSpec {
       TaskKind::Connect => match &self.payload {
         TaskPayload::PeerDial { peer, .. } => Some(peer.clone()),
         TaskPayload::Peer(subject) => Some(subject.clone()),
-        TaskPayload::None => None,
+        TaskPayload::Revoke { .. } | TaskPayload::None => None,
       },
       TaskKind::Disconnect | TaskKind::Revoke | TaskKind::PurgeRevocation | TaskKind::Cleanup => {
         match &self.payload {
           TaskPayload::Peer(subject) => Some(subject.clone()),
-          TaskPayload::PeerDial { peer, .. } => Some(peer.clone()),
+          TaskPayload::Revoke { subject, .. } | TaskPayload::PeerDial { peer: subject, .. } => {
+            Some(subject.clone())
+          }
           TaskPayload::None => None,
         }
       }
@@ -1939,7 +1954,13 @@ mod tests {
     // A distinct kind over the same subject never coalesces.
     let revoke = client
       .submit(
-        TaskSpec::new(TaskKind::Revoke, TaskPayload::Peer(peer.clone())),
+        TaskSpec::new(
+          TaskKind::Revoke,
+          TaskPayload::Revoke {
+            subject: peer.clone(),
+            expected_key: crate::PublicKey::from_bytes([0x11; 32]),
+          },
+        ),
         wedged_effect(),
       )
       .await
@@ -1972,6 +1993,91 @@ mod tests {
       .expect("fresh admission after terminality");
     assert_ne!(quick, resubmitted);
     let _ = (first, endpoint); // the wedged first task stays non-terminal for the rest of the test
+  }
+
+  /// The revoke payload carries the pinned expected key, so coalescing
+  /// compares it (audit A05): two revokes for the same subject with
+  /// different keys are different intents — the second must conflict,
+  /// never join the in-flight task whose effect checks only the first
+  /// caller's comparand. An identical retry still joins and resolves
+  /// the first caller's exact outcome.
+  #[tokio::test]
+  async fn revoke_coalescing_compares_the_pinned_expected_key() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let subject = node('p');
+    let revoke = |key: u8| TaskPayload::Revoke {
+      subject: subject.clone(),
+      expected_key: crate::PublicKey::from_bytes([key; 32]),
+    };
+    let spec = TaskSpec::new(TaskKind::Revoke, revoke(0x11));
+    let first = client
+      .submit(spec.clone(), wedged_effect())
+      .await
+      .expect("admission");
+    // The identical retry (same subject, same pinned key) joins the
+    // in-flight revoke: the same task id.
+    let joined = client
+      .submit(spec, wedged_effect())
+      .await
+      .expect("coalesced admission");
+    assert_eq!(first, joined);
+    // The same subject behind a different pinned key is a different
+    // intent: it conflicts instead of silently riding a revoke whose
+    // precondition would never check its comparand.
+    let smuggled = client
+      .submit(
+        TaskSpec::new(TaskKind::Revoke, revoke(0x22)),
+        wedged_effect(),
+      )
+      .await
+      .expect_err("different pinned key conflicts");
+    assert_eq!(smuggled.kind(), ErrorKind::Conflict);
+    assert_eq!(smuggled.context(), "task in flight");
+    let _ = first; // the wedged first task stays non-terminal for the rest of the test
+  }
+
+  /// The regression tail of the key comparison: a joined identical
+  /// retry is the same task, so it resolves the first caller's exact
+  /// revoke outcome — never a second execution with its own closure.
+  #[tokio::test]
+  async fn a_joined_revoke_retry_resolves_the_first_callers_outcome() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let subject = node('p');
+    let payload = TaskPayload::Revoke {
+      subject: subject.clone(),
+      expected_key: crate::PublicKey::from_bytes([0x33; 32]),
+    };
+    let outcome = crate::RevokeOutcome::new(subject, false);
+    let expected = outcome.clone();
+    // The first effect terminalizes only when released, so the join's
+    // in-flight window is deterministic.
+    let release = Arc::new(Notify::new());
+    let gate = release.clone();
+    let first = client
+      .submit(
+        TaskSpec::new(TaskKind::Revoke, payload.clone()),
+        Arc::new(move |_deps, _attempt| {
+          let gate = gate.clone();
+          let outcome = outcome.clone();
+          Box::pin(async move {
+            gate.notified().await;
+            Ok(EffectOutcome::new(TaskOutput::Revoke(outcome)))
+          })
+        }),
+      )
+      .await
+      .expect("admission");
+    let joined = client
+      .submit(TaskSpec::new(TaskKind::Revoke, payload), wedged_effect())
+      .await
+      .expect("coalesced admission");
+    assert_eq!(first, joined);
+    release.notify_one();
+    let observed = handle::<crate::RevokeOutcome>(&client, &joined, TaskKind::Revoke)
+      .wait()
+      .await
+      .expect("the joined retry resolves the first task's terminal");
+    assert_eq!(observed, expected);
   }
 
   #[tokio::test]
