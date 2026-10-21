@@ -46,7 +46,7 @@ rcgen = { version = "0.14", default-features = false, features = [
   "crypto",
   "aws_lc_rs",
 ] }
-redb = { version = "4.2", optional = true }
+redb = { version = "4.4", optional = true }
 rustls = { version = "0.23", default-features = false, features = [
   "std",
   "aws_lc_rs",
@@ -59,7 +59,7 @@ sha2 = "0.11"
 # IPV6_V6ONLY explicitly on the named-host wildcard listener.
 socket2 = "0.6"
 thiserror = { version = "2.0", default-features = false }
-tokio = { version = "1.53", features = [
+tokio = { version = "1.54", features = [
   "rt",
   "sync",
   "time",
@@ -86,10 +86,10 @@ zeroize = "1.9"
 rustix = { version = "1.1", features = ["fs", "process"], optional = true }
 
 [dev-dependencies]
-proptest = "1.11"
+proptest = "1.12"
 radiata-test-support = { path = "test-support" }
 tempfile = "3.27"
-tokio = { version = "1.53", features = [
+tokio = { version = "1.54", features = [
   "macros",
   "rt",
   "rt-multi-thread",
