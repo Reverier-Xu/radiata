@@ -14,11 +14,11 @@
 //!
 //! The tick runs on the dedicated maintenance worker (audit 2026-10-09
 //! item 3), never inline in the supervisor's select loop, and every
-//! selected member carries ALL of its published endpoints: the dial
-//! rotates through them across successive ticks with the same
-//! endpoint-level failover the recovery plane applies (remaining-items
-//! list P2-5), so a multi-homed member whose first endpoint is
-//! unreachable is retried on the others.
+//! selected member carries ALL of its published endpoints: each dial of
+//! a member rotates that member to its next endpoint with the same
+//! per-member endpoint-level failover the recovery plane applies
+//! (remaining-items list P2-5), so a multi-homed member whose first
+//! endpoint is unreachable is retried on the others.
 //!
 //! The one deliberate exception to "healthy means dial nothing" is the
 //! bridge probe (audit finding #1's residual boundary): a healthy node
@@ -165,21 +165,13 @@ impl TickState {
       &connected,
       self.entropy.as_ref(),
     )?;
-    // One attempt serial per dialing tick: every selected member's
-    // published endpoints rotate by it (remaining-items list P2-5), the
-    // same `recovery_endpoint` rotation the recovery plane applies to
-    // its own dials. Like recovery, the rotation advances across
-    // ATTEMPTS (ticks), not within one batch: a member whose dialed
-    // endpoint is unreachable is retried on its next endpoint by the
-    // next tick that selects it. A member skipped for a few ticks may
-    // land past an endpoint when reselected — acceptable for this
-    // best-effort plane, whose only contract is covering the deficit,
-    // while the recovery plane's per-schedule rotation stays the
-    // guaranteed failover for an isolated node.
-    let attempt = self
-      .degree_attempt
-      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-      + 1;
+    // Per-member endpoint rotation (remaining-items list P2-5): every
+    // dial of a member advances that member's OWN serial, wrapping per
+    // member — the same per-member `recovery_endpoint` rotation the
+    // recovery plane applies, through one shared serial map. A member
+    // whose dialed endpoint is unreachable is retried on its next
+    // endpoint by the next tick that selects it, regardless of which
+    // members any one tick happens to select.
     for (peer, endpoints) in dials {
       // In-flight bound re-check per spawn (audit finding #5): the
       // pre-batch gate compares the counter to the budget once, but
@@ -196,7 +188,10 @@ impl TickState {
         debug!("degree maintenance batch truncated at the in-flight budget");
         break;
       }
-      let Some(endpoint) = recovery_endpoint(&endpoints, attempt) else {
+      let Some(serial) = self.member_dial_serial(&peer) else {
+        continue;
+      };
+      let Some(endpoint) = recovery_endpoint(&endpoints, serial) else {
         continue;
       };
       self.spawn_maintenance_dial(peer, endpoint.clone());
@@ -269,15 +264,15 @@ impl TickState {
       connected,
       self.entropy.as_ref(),
     )?;
-    // The same batch serial semantics as the deficit path: one attempt
-    // serial per probing tick, so a multi-homed member's endpoints
-    // rotate across successive probes.
-    let attempt = self
-      .degree_attempt
-      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-      + 1;
+    // Per-member endpoint rotation, the same serial map the deficit
+    // path and the recovery plane share: a multi-homed member's
+    // endpoints rotate across successive probes of that member,
+    // wrapping per member.
     for (peer, endpoints) in dials {
-      let Some(endpoint) = recovery_endpoint(&endpoints, attempt) else {
+      let Some(serial) = self.member_dial_serial(&peer) else {
+        continue;
+      };
+      let Some(endpoint) = recovery_endpoint(&endpoints, serial) else {
         continue;
       };
       debug!(
