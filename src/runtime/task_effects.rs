@@ -70,9 +70,10 @@ pub(crate) struct EffectPlanes {
   /// The graceful-shutdown signal every kept session observes.
   pub(crate) shutdown: watch::Sender<()>,
   /// The tracked connection tasks: kept session pumps, in-flight dials,
-  /// and the graceful consumer drains. The recovery tick reaps finished
-  /// handles; shutdown drains them inside its bounded cooperative window
-  /// and aborts only the stragglers.
+  /// the graceful consumer drains, and the lazy local-descriptor
+  /// publication task. The recovery tick reaps finished handles;
+  /// shutdown drains them inside its bounded cooperative window and
+  /// aborts only the stragglers.
   pub(crate) connection_tasks: ConnectionTasks,
   /// The member-set revision signal, bumped one-to-one with the member
   /// events the identity effects emit.
@@ -402,7 +403,15 @@ pub(super) fn track_connection_task(
 pub(crate) async fn revoke(
   tasks: &TaskClient, subject: NodeId, expected_key: PublicKey,
 ) -> Result<Task<RevokeOutcome>> {
-  let payload = TaskPayload::Peer(subject.clone());
+  // The pinned key rides the payload, not just the effect closure: a
+  // coalesced submission joins the in-flight revoke only when it pins
+  // the same key — a different key for the same subject conflicts
+  // instead of silently riding a revoke whose effect checks only the
+  // first caller's comparand.
+  let payload = TaskPayload::Revoke {
+    subject: subject.clone(),
+    expected_key: expected_key.clone(),
+  };
   let effect: TaskEffect = Arc::new(move |deps, _attempt| {
     let subject = subject.clone();
     let expected_key = expected_key.clone();
@@ -877,9 +886,12 @@ pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
 /// bounds the population at exactly one task; a failed publication
 /// only clears the slot (never the stamp), so the next member read
 /// retries while the maintenance tick remains the drift backstop.
-/// The task is deliberately detached — it settles with its one commit
-/// and holds only the shared deps Arcs, the same bounded-detached
-/// shape as the maintenance plane's in-flight dials.
+/// The task is enrolled in the tracked connection-task registry (the
+/// same ownership path as the maintenance plane's in-flight dials): it
+/// holds the metadata store's exclusive handle through the shared deps
+/// Arcs, so the shutdown path must await it inside the bounded
+/// cooperative window and abort the straggler before the reply returns
+/// — a detached spawn would keep the store locked past shutdown.
 ///
 /// The kicking read answers from committed state only: on a node whose
 /// descriptor is not yet published, that single read may not include
@@ -904,21 +916,24 @@ pub(super) fn kick_self_descriptor_publication(deps: &Arc<OperationDeps>) {
     return;
   }
   let deps = Arc::clone(deps);
-  tokio::spawn(async move {
-    // The slot must release even if the provider-backed ensure panics:
-    // a stuck flag would suppress every later kick for the node's
-    // lifetime, so the guard clears it on any exit path.
-    let slot = PublicationSlot {
-      deps: Arc::clone(&deps),
-    };
-    if let Err(error) = ensure_self_descriptor(&deps).await {
-      tracing::warn!(
-        kind = ?error.kind(),
-        "lazy local-descriptor publication failed; the next member read retries"
-      );
-    }
-    drop(slot);
-  });
+  track_connection_task(
+    &planes.connection_tasks,
+    Box::pin(async move {
+      // The slot must release even if the provider-backed ensure panics:
+      // a stuck flag would suppress every later kick for the node's
+      // lifetime, so the guard clears it on any exit path.
+      let slot = PublicationSlot {
+        deps: Arc::clone(&deps),
+      };
+      if let Err(error) = ensure_self_descriptor(&deps).await {
+        tracing::warn!(
+          kind = ?error.kind(),
+          "lazy local-descriptor publication failed; the next member read retries"
+        );
+      }
+      drop(slot);
+    }),
+  );
 }
 
 /// Releases the single-flight publication slot on every exit path of
@@ -1760,5 +1775,267 @@ mod descriptor_publication_tests {
       "a listener transition invalidates the stamp"
     );
     assert!(gate.begin(), "the slot is free again once released");
+  }
+}
+
+#[cfg(test)]
+mod lazy_publication_shutdown_tests {
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  use crate::{
+    BoxFuture, NodeConfig, NodeId, TransportScheme,
+    extension_registry::ExtensionRegistry,
+    identity::testing::{ScriptedKeys, SequenceEntropy},
+    provider::{
+      CommitOutcome, ReconcileOutcome, Storage, StorageFactory, StoreCapabilities, StoreOperation,
+      StoreRequirements, StoreSnapshot, StoreTransaction,
+    },
+    runtime::{
+      Control, PACKET_CHANNEL_CAPACITY, RuntimeClient, RuntimeDependencies,
+      SYNC_ROUND_CHANNEL_CAPACITY, spawn_runtime,
+    },
+    storage::contract::{ReferenceFactory, required_capabilities},
+    transport::registry::{Transport, builtin_transport_tag},
+  };
+
+  /// The descriptor-commit park: a fault-injecting factory whose every
+  /// descriptor-namespace commit never settles (the slow-storage commit
+  /// the lazy path exists for, made permanent so the test can observe a
+  /// publication wedged exactly mid-commit), while every other
+  /// operation delegates to the reference store untouched.
+  #[derive(Debug)]
+  struct ParkedDescriptorFactory {
+    reference: Arc<ReferenceFactory>,
+    reached: Arc<AtomicUsize>,
+  }
+
+  impl StorageFactory for ParkedDescriptorFactory {
+    fn open<'a>(
+      &'a self, requirements: StoreRequirements,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Storage>>> {
+      let reference = &self.reference;
+      let reached = Arc::clone(&self.reached);
+      Box::pin(async move {
+        let storage = reference.open(requirements).await?;
+        Ok(Box::new(ParkedDescriptorStorage { storage, reached }) as Box<dyn Storage>)
+      })
+    }
+  }
+
+  #[derive(Debug)]
+  struct ParkedDescriptorStorage {
+    storage: Box<dyn Storage>,
+    reached: Arc<AtomicUsize>,
+  }
+
+  impl ParkedDescriptorStorage {
+    fn parks(transaction: &StoreTransaction) -> bool {
+      let Ok(namespace) = crate::membership::descriptor_namespace() else {
+        return false;
+      };
+      transaction
+        .operations()
+        .iter()
+        .any(|operation| match operation {
+          StoreOperation::Check {
+            namespace: target, ..
+          }
+          | StoreOperation::Put {
+            namespace: target, ..
+          }
+          | StoreOperation::Delete {
+            namespace: target, ..
+          } => *target == namespace,
+          StoreOperation::ForgetReceipt { .. } => false,
+        })
+    }
+  }
+
+  impl Storage for ParkedDescriptorStorage {
+    fn capabilities(&self) -> StoreCapabilities {
+      self.storage.capabilities()
+    }
+
+    fn snapshot<'a>(&'a self) -> BoxFuture<'a, crate::Result<Box<dyn StoreSnapshot>>> {
+      self.storage.snapshot()
+    }
+
+    fn commit<'a>(
+      &'a self, transaction: StoreTransaction,
+    ) -> BoxFuture<'a, crate::Result<CommitOutcome>> {
+      if Self::parks(&transaction) {
+        self.reached.fetch_add(1, Ordering::Relaxed);
+        // The wedged commit: it never settles, so only a shutdown abort
+        // can end it — exactly the straggler the grace window bounds.
+        return Box::pin(std::future::pending());
+      }
+      self.storage.commit(transaction)
+    }
+
+    fn reconcile<'a>(
+      &'a self, transaction: &'a crate::TransactionId, digest: &'a crate::Digest,
+    ) -> BoxFuture<'a, crate::Result<ReconcileOutcome>> {
+      self.storage.reconcile(transaction, digest)
+    }
+
+    fn flush<'a>(&'a self) -> BoxFuture<'a, crate::Result<()>> {
+      self.storage.flush()
+    }
+  }
+
+  /// Spawns a listenerless runtime over the caller's factory, the same
+  /// shape `spawn_runtime` builds in production (the recovery-plane
+  /// test's `supervised_runtime` precedent): the returned registry is
+  /// the node's tracked connection-task set, so the test can observe
+  /// what the lazy publication enrolls.
+  async fn listenerless_runtime(
+    factory: Arc<dyn StorageFactory>,
+  ) -> (
+    RuntimeClient,
+    Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+  ) {
+    let keys = ScriptedKeys::full();
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let mut extensions = ExtensionRegistry::new();
+    for (tag, transport) in [
+      (
+        builtin_transport_tag(TransportScheme::Tls).unwrap(),
+        Arc::new(crate::transport::tls_transport::TlsTransport::new()) as Arc<dyn Transport>,
+      ),
+      (
+        builtin_transport_tag(TransportScheme::Wss).unwrap(),
+        Arc::new(crate::transport::wss::WssTransport::new()) as Arc<dyn Transport>,
+      ),
+      (
+        builtin_transport_tag(TransportScheme::Tcp).unwrap(),
+        Arc::new(crate::transport::plain::PlainTransport::new()) as Arc<dyn Transport>,
+      ),
+    ] {
+      extensions
+        .register_builtin_transport(tag, transport)
+        .unwrap();
+    }
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let (round_tx, round_rx) = tokio::sync::mpsc::channel(SYNC_ROUND_CHANNEL_CAPACITY);
+    let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(PACKET_CHANNEL_CAPACITY);
+    let connection_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = spawn_runtime(
+      RuntimeDependencies {
+        storage_factory: factory,
+        context: None,
+        keys: Some(keys.as_provider()),
+        config: NodeConfig::new(),
+        entropy,
+        extensions: Arc::new(extensions),
+        sessions: Default::default(),
+        routes: Default::default(),
+        events: Arc::new(crate::node::EventHub::new()),
+        member_revision: crate::node::MemberRevisionSignal::new(revision_tx),
+        leave_applied: crate::membership::sync::LeaveAppliedSignal::new(),
+        reconcile: None,
+        sync_round_requests: round_tx,
+        connection_tasks: Arc::clone(&connection_tasks),
+        listeners: Default::default(),
+        task_manager: None,
+        operations: None,
+        runtime_seed: None,
+      },
+      (packet_tx, packet_rx),
+      round_rx,
+    )
+    .await
+    .unwrap();
+    (client, connection_tasks)
+  }
+
+  /// Audit A08: the lazy local-descriptor publication used to spawn
+  /// detached, outside every shutdown registry, so a member read that
+  /// kicked a publication could still be mid descriptor commit when
+  /// `shutdown()` returned — the storage exclusive lifetime lock
+  /// outlived the reply, and an immediate reopen of the same factory
+  /// failed `StorageLocked` until the stray commit finished. This
+  /// drives the real shutdown path end to end against a store whose
+  /// descriptor commit parks forever (the slow-storage commit the lazy
+  /// path exists for): the kicked task must sit in the tracked
+  /// connection-task set, the shutdown reply must resolve inside the
+  /// bounded cooperative window (the grace-edge abort — a wedged
+  /// commit can never be waited out), and the same factory must reopen
+  /// immediately after the reply, proving the storage capture dropped
+  /// before it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn shutdown_aborts_and_awaits_the_lazy_descriptor_publication() {
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let reached = Arc::new(AtomicUsize::new(0));
+    let (client, connection_tasks) = listenerless_runtime(Arc::new(ParkedDescriptorFactory {
+      reference: Arc::clone(&reference),
+      reached: Arc::clone(&reached),
+    }))
+    .await;
+
+    // The kick: one member read on the listenerless node. The view
+    // answers from committed state while the publication runs behind
+    // it — the read itself must never await the parked commit.
+    let query = NodeId::parse("node-00000000000000000000p").unwrap();
+    client
+      .send_command(move |reply| Control::GetMember { node: query, reply })
+      .await
+      .expect("the member read resolves without awaiting the publication");
+
+    // The kicked publication reached the store and parked inside its
+    // descriptor commit (the fault): this is the window the finding
+    // describes — a commit mid-flight with the storage handle held.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      loop {
+        if reached.load(Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the kicked publication must reach its descriptor commit");
+
+    // The parked publication's JoinHandle must sit in the tracked set
+    // the shutdown path drains — an empty set is the finding's
+    // detached shape.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      loop {
+        if !connection_tasks.lock().unwrap().is_empty() {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the lazy publication must register its JoinHandle");
+
+    // The reply resolves via the grace-edge abort — the cooperative
+    // window is 3s and the commit never settles, so the reply may only
+    // come from the bounded abort, never an unbounded await (and a
+    // detached task, invisible to the drain, would strand the store
+    // instead of freeing it below).
+    tokio::time::timeout(std::time::Duration::from_secs(4), client.shutdown())
+      .await
+      .expect("shutdown must resolve inside the cooperative window")
+      .expect("the shutdown reply must resolve");
+
+    // The sharpest assertion: with the reply returned, every storage
+    // capture is already dropped, so the same factory reopens
+    // immediately — the parked task's store handle went with the
+    // abort, never past the reply. A detached spawn answers
+    // `StorageLocked` here until its commit finishes, and this fault
+    // never finishes.
+    let reopened = tokio::time::timeout(
+      std::time::Duration::from_secs(2),
+      reference.open(StoreRequirements::metadata()),
+    )
+    .await
+    .expect("the factory must reopen immediately after the reply")
+    .unwrap();
+    drop(reopened);
+    assert_eq!(reached.load(Ordering::Relaxed), 1);
   }
 }
