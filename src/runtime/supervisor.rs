@@ -690,12 +690,13 @@ pub(super) struct TickState {
   /// batch so a slow mesh never doubles its own dial load every cadence
   /// (see `runtime/degree.rs`).
   pub(super) maintenance_pending: Arc<std::sync::atomic::AtomicUsize>,
-  /// The degree plane's dial-batch serial: every maintenance tick that
-  /// dials advances it once, and each selected member's published
-  /// endpoints rotate by it (endpoint-level failover, aligned with the
-  /// recovery plane's `recovery_endpoint` rotation — see
-  /// `runtime/degree.rs`).
-  pub(super) degree_attempt: Arc<std::sync::atomic::AtomicU64>,
+  /// Per-member endpoint dial serials shared by both dial planes
+  /// (recovery and degree maintenance): each dial of a member advances
+  /// that member's own serial, so `recovery_endpoint` rotates the
+  /// member through ALL its published endpoints — endpoint-level
+  /// failover independent of which members any one step happens to
+  /// select (see `runtime/recovery.rs`).
+  pub(super) endpoint_attempts: std::sync::Mutex<std::collections::BTreeMap<NodeId, u64>>,
   /// The bridge-probe cadence bracket: maintenance ticks an otherwise
   /// quiescent healthy node waits before its next cross-partition probe
   /// dial (audit finding #1's residual boundary — see `runtime/degree.rs`).
@@ -900,7 +901,7 @@ impl Supervisor {
       recovery: Arc::clone(&self.recovery),
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-      degree_attempt: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+      endpoint_attempts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
       bridge_probe_ticks: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
         super::degree::BRIDGE_PROBE_INTERVAL_TICKS,
       )),

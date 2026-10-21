@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
-use super::canonical::canonical_record;
+use super::{canonical::canonical_record, records::TerminalWinner};
 /// The durable namespace of revocation records.
 pub(crate) use crate::storage::families::REVOCATION_NAMESPACE;
 use crate::{
@@ -150,6 +150,28 @@ fn decode_value(bytes: &[u8]) -> Result<RevocationRecordV1> {
   RevocationRecordV1::decode(bytes)
 }
 
+/// The revocation family's deterministic merge decision: two verified
+/// records compete for the single subject slot only over the same pinned
+/// binding — a stored record for a different subject key never competes,
+/// it fails closed — and the canonical winner is the lexicographic
+/// minimum of the canonical encodings, so every holder of either record
+/// converges on the same winner after reconnect. The issuer difference is
+/// legitimate evidence by construction: both records passed strict
+/// issuer-signature verification against retained bindings before they
+/// reached the merge.
+fn revocation_merge(stored: &[u8], fresh: &[u8]) -> Result<TerminalWinner> {
+  let stored_record = decode_value(stored)?;
+  let fresh_record = decode_value(fresh)?;
+  if stored_record.subject_key() != fresh_record.subject_key() {
+    return Err(Error::conflict("revocation record"));
+  }
+  Ok(if fresh < stored {
+    TerminalWinner::Fresh
+  } else {
+    TerminalWinner::Stored
+  })
+}
+
 /// The outcome of one conditional revocation commit.
 #[derive(Debug)]
 pub(crate) enum RevokeStoreOutcome {
@@ -167,12 +189,15 @@ pub(crate) enum RevokeStoreOutcome {
 /// The record's subject key must equal the locally trusted binding: an
 /// unknown subject fails `NotFound` and a different trusted key fails
 /// `Conflict`, so a stale or substituted revocation never lands. A stored
-/// revocation for a different key also fails `Conflict`; the exact same
-/// one is idempotent. The commit is one conditional transaction that pins
-/// both the revocation key's absence and the trusted binding record's
-/// exact digest, so a concurrent binding change between the snapshot and
-/// the commit fails closed instead of letting the revoke land against a
-/// stale key (the custody-lane precedent in `deletion.rs`).
+/// revocation for a different subject key still fails `Conflict`; the
+/// exact same one is idempotent, and a divergent stored record over the
+/// same binding merges deterministically (the canonical winner replaces
+/// the loser, a losing stored record reports `AlreadyRevoked`). The
+/// commit is one conditional transaction that pins both the revocation
+/// key's prior state and the trusted binding record's exact digest, so a
+/// concurrent binding change between the snapshot and the commit fails
+/// closed instead of letting the revoke land against a stale key (the
+/// custody-lane precedent in `deletion.rs`).
 pub(crate) async fn revoke_binding_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
 ) -> Result<RevokeStoreOutcome> {
@@ -192,15 +217,26 @@ pub(crate) async fn revoke_binding_ctx(
   if binding.public_key() != record.subject_key() {
     return Err(Error::conflict("revocation key"));
   }
-  if let Some(existing) = snapshot.get(&namespace, &store_key).await? {
-    let existing_record = decode_value(existing.as_bytes())?;
-    if existing_record == *record {
-      return Ok(RevokeStoreOutcome::AlreadyRevoked);
+  let encoded = record.encode()?;
+  let expected = match snapshot.get(&namespace, &store_key).await? {
+    Some(existing) => {
+      let existing_record = decode_value(existing.as_bytes())?;
+      if existing_record == *record {
+        return Ok(RevokeStoreOutcome::AlreadyRevoked);
+      }
+      // A divergent stored record over the same binding is legitimate
+      // partitioned evidence: it merges deterministically instead of
+      // conflicting, so a re-revoke against a foreign record converges
+      // (a losing stored record is already-revoked; a winning fresh
+      // record replaces it under its exact digest). A stored record for
+      // a different binding still fails closed inside the decision.
+      match revocation_merge(existing.as_bytes(), &encoded)? {
+        TerminalWinner::Stored => return Ok(RevokeStoreOutcome::AlreadyRevoked),
+        TerminalWinner::Fresh => StoreExpectation::Exact(existing.digest().clone()),
+      }
     }
-    return Err(Error::conflict("revocation key"));
-  }
-  let expected =
-    crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &store_key).await?;
+    None => StoreExpectation::Absent,
+  };
   let transaction = store.prepare_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
@@ -217,7 +253,7 @@ pub(crate) async fn revoke_binding_ctx(
         namespace,
         key: store_key,
         expected,
-        value: StoreValue::new(Arc::from(record.encode()?)),
+        value: StoreValue::new(Arc::from(encoded)),
       },
     ],
   )?;
@@ -245,8 +281,10 @@ pub(crate) async fn revoke_binding_ctx(
 
 /// Persists one issuer-signed revocation tombstone received over sync:
 /// verified against the retained issuer binding
-/// and the subject binding, idempotent for the exact record, and failing
-/// closed on any divergence.
+/// and the subject binding, idempotent for the exact record, and merged
+/// deterministically with a divergent verified record for the same
+/// binding (the canonical winner replaces the loser, so partitioned
+/// revocations converge); a record for a different binding fails closed.
 pub(crate) async fn persist_revocation_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
 ) -> Result<()> {
@@ -262,13 +300,14 @@ pub(crate) async fn persist_revocation_ctx(
   {
     return Err(Error::not_trusted("revocation subject binding"));
   }
-  crate::identity::records::persist_terminal_record(
+  crate::identity::records::persist_convergent_terminal_record(
     store,
     entropy,
     namespace()?,
     revocation_key(record.subject()),
     Arc::from(record.encode()?),
     "revocation record",
+    revocation_merge,
   )
   .await
 }
@@ -344,7 +383,7 @@ mod tests {
 
   use super::{
     REVOCATION_RECORD_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, is_revoked_ctx,
-    revoke_binding_ctx, revoked_key_ctx,
+    persist_revocation_ctx, revoke_binding_ctx, revoked_key_ctx,
   };
   use crate::{
     ErrorKind, NodeId, PublicKey, Signature, StoreExpectation,
@@ -498,6 +537,157 @@ mod tests {
       ErrorKind::Conflict
     );
     assert!(!is_revoked_ctx(&store, &substituted, &key(9)).await.unwrap());
+  }
+
+  /// One deterministic foreign issuer on each side of the fixed test
+  /// issuer's encoding, so both merge branches are exercised by
+  /// construction: `...001` encodes before `...091`, `...092` after it.
+  fn foreign_issuer(text: &str, seed: u8) -> (NodeId, ed25519_dalek::SigningKey, PublicKey) {
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let public = PublicKey::from_bytes(signing.verifying_key().to_bytes());
+    (NodeId::parse(text).unwrap(), signing, public)
+  }
+
+  fn foreign_signed_record(
+    issuer: &NodeId, signing: &ed25519_dalek::SigningKey, subject_key: &PublicKey,
+  ) -> RevocationRecordV1 {
+    use ed25519_dalek::Signer as _;
+    let body = RevocationRecordV1::encode_signed_body(&subject(), subject_key, issuer).unwrap();
+    let signature = signing.sign(&signature_message(REVOCATION_RECORD_DOMAIN, &body));
+    RevocationRecordV1::new(
+      subject(),
+      subject_key.clone(),
+      issuer.clone(),
+      Signature::from_bytes(signature.to_bytes()),
+    )
+  }
+
+  async fn stored_bytes(store: &MetadataStore) -> Vec<u8> {
+    let namespace = super::namespace().unwrap();
+    let key = super::revocation_key(&subject());
+    store
+      .snapshot()
+      .await
+      .unwrap()
+      .get(&namespace, &key)
+      .await
+      .unwrap()
+      .expect("the stored revocation record")
+      .as_bytes()
+      .to_vec()
+  }
+
+  /// Two verified revocations of the same binding from different issuers
+  /// (the partitioned-revoke scenario) converge on one canonical winner
+  /// regardless of delivery order: the lexicographic-minimum encoding
+  /// replaces the loser through the merge, a local re-revoke against a
+  /// winning foreign record reports the idempotent already-revoked
+  /// outcome instead of the old perpetual conflict, and the binding
+  /// stays revoked under the pinned key either way (audit A01).
+  #[tokio::test]
+  async fn revocations_from_partitioned_issuers_converge_on_the_canonical_winner() {
+    let (low_node, low_signing, low_key) = foreign_issuer("node-000000000000000000001", 0x21);
+    let (high_node, high_signing, high_key) = foreign_issuer("node-000000000000000000092", 0x2B);
+    let local = signed_record(&subject(), &key(7));
+    let foreign_low = foreign_signed_record(&low_node, &low_signing, &key(7));
+    let foreign_high = foreign_signed_record(&high_node, &high_signing, &key(7));
+    // The fixture's premise: the two foreign issuers bracket the local
+    // record's encoding, so both merge branches are pinned.
+    assert!(foreign_low.encode().unwrap() < local.encode().unwrap());
+    assert!(local.encode().unwrap() < foreign_high.encode().unwrap());
+
+    // A winning foreign record (stored first) survives the local
+    // re-revoke: the revoke is idempotent, never a conflict.
+    let store = open_store().await;
+    trust(&store, &subject(), &key(7)).await;
+    trust(&store, &low_node, &low_key).await;
+    persist_revocation_ctx(&store, &SystemEntropy, &foreign_low)
+      .await
+      .unwrap();
+    assert!(matches!(
+      revoke_binding_ctx(&store, &SystemEntropy, &local)
+        .await
+        .unwrap(),
+      RevokeStoreOutcome::AlreadyRevoked
+    ));
+    assert_eq!(stored_bytes(&store).await, foreign_low.encode().unwrap());
+    assert!(is_revoked_ctx(&store, &subject(), &key(7)).await.unwrap());
+
+    // The opposite delivery order converges to the same winner.
+    let store = open_store().await;
+    trust(&store, &subject(), &key(7)).await;
+    trust(&store, &low_node, &low_key).await;
+    assert!(matches!(
+      revoke_binding_ctx(&store, &SystemEntropy, &local)
+        .await
+        .unwrap(),
+      RevokeStoreOutcome::Revoked(_)
+    ));
+    persist_revocation_ctx(&store, &SystemEntropy, &foreign_low)
+      .await
+      .unwrap();
+    assert_eq!(stored_bytes(&store).await, foreign_low.encode().unwrap());
+
+    // A losing foreign record is replaced by the local winner when it
+    // is stored first...
+    let store = open_store().await;
+    trust(&store, &subject(), &key(7)).await;
+    trust(&store, &high_node, &high_key).await;
+    persist_revocation_ctx(&store, &SystemEntropy, &foreign_high)
+      .await
+      .unwrap();
+    assert!(matches!(
+      revoke_binding_ctx(&store, &SystemEntropy, &local)
+        .await
+        .unwrap(),
+      RevokeStoreOutcome::Revoked(_)
+    ));
+    assert_eq!(stored_bytes(&store).await, local.encode().unwrap());
+
+    // ...and never replaces it when it arrives second.
+    let store = open_store().await;
+    trust(&store, &subject(), &key(7)).await;
+    trust(&store, &high_node, &high_key).await;
+    assert!(matches!(
+      revoke_binding_ctx(&store, &SystemEntropy, &local)
+        .await
+        .unwrap(),
+      RevokeStoreOutcome::Revoked(_)
+    ));
+    persist_revocation_ctx(&store, &SystemEntropy, &foreign_high)
+      .await
+      .unwrap();
+    assert_eq!(stored_bytes(&store).await, local.encode().unwrap());
+  }
+
+  /// The merge never launders a different binding: a stored record
+  /// pinning another subject key still fails closed (audit A01).
+  #[tokio::test]
+  async fn revocations_over_different_bindings_still_fail_closed() {
+    let store = open_store().await;
+    // Only the issuer is trusted; the subject carries no local binding,
+    // so both records pass the subject-binding gate and the divergence
+    // is decided inside the merge itself.
+    trust(
+      &store,
+      &issuer(),
+      &PublicKey::from_bytes(issuer_signing().verifying_key().to_bytes()),
+    )
+    .await;
+    persist_revocation_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
+      .await
+      .unwrap();
+    assert_eq!(
+      persist_revocation_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(8)))
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::Conflict
+    );
+    assert_eq!(
+      revoked_key_ctx(&store, &subject()).await.unwrap(),
+      Some(key(7))
+    );
   }
 
   /// A stored revocation survives a reopen exactly (old-or-new storage

@@ -53,10 +53,6 @@ pub(crate) enum RecoveryState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryStep {
   pub(crate) targets: Vec<NodeId>,
-  /// The attempt serial this step consumed: the dial plane rotates a
-  /// multi-homed member through its published endpoints with this serial
-  /// (endpoint-level failover).
-  pub(crate) attempt: u64,
   /// The wall-clock wait the just-taken attempt scheduled (the jittered
   /// next doubling's base), and `0` when the deadline is already due
   /// (the caller wakes immediately).
@@ -187,14 +183,12 @@ impl RecoveryController {
       self.cursor = self.cursor.wrapping_add(take);
     }
     self.attempts = self.attempts.saturating_add(1);
-    let attempt = self.attempts;
     let sampled = self.sample_jitter(self.base_seconds(), entropy);
     let due_already = now >= self.last_attempt_at.saturating_add(sampled);
     self.last_attempt_at = now;
     self.scheduled_backoff = Some(sampled);
     RecoveryStep {
       targets,
-      attempt,
       backoff_seconds: if due_already { 0 } else { sampled },
     }
   }

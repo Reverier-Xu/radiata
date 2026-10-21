@@ -460,10 +460,14 @@ impl MetadataStore {
     let mut scan = snapshot.scan(&namespace, ELIGIBILITY_ANCHOR_TAG).await?;
     while let Some(entry) = scan.next().await? {
       if targets.len() >= RETENTION_SWEEP_BOUND {
-        return Ok(ReceiptRetentionReport {
-          forgotten: 0,
-          remaining: true,
-        });
+        // The pass stays latency-bounded: the already-collected due
+        // targets flow into the cleanup loop below and the report says
+        // the scan stopped at the bound, so the next pass continues.
+        tracing::debug!(
+          target_count = targets.len(),
+          "receipt retention scan stopped at sweep bound"
+        );
+        break;
       }
       let key = entry.key().as_bytes();
       let transaction = key
@@ -1182,5 +1186,130 @@ pub(crate) mod retention_testing {
     let operation_id = crate::TransactionId::generate(entropy)?;
     let outcome = store.cleanup_receipt(&identity, operation_id).await?;
     Ok(matches!(outcome, ReceiptCleanupOutcome::Anchored(_)))
+  }
+}
+
+#[cfg(test)]
+mod receipt_retention_tests {
+  use std::{
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+  };
+
+  use super::{MetadataStore, RETENTION_SWEEP_BOUND, ReceiptCleanupOutcome, ReceiptIdentity};
+  use crate::{
+    StoreExpectation, StoreOperation,
+    storage::{
+      contract::{
+        ReferenceFactory,
+        helpers::{ManualClock, committed, open_engine},
+        required_capabilities,
+      },
+      test_util::{key as store_key, namespace, transaction_id, value},
+    },
+  };
+
+  /// Anchor ids live in a disjoint transaction-id range from the commit
+  /// ids, so every receipt's anchor operation stays distinct.
+  const ANCHOR_OPERATION_OFFSET: u64 = 1_000_000;
+
+  /// Commits and anchors one receipt under the sweep's own retention
+  /// clock, exactly as production anchoring does (through the owning
+  /// cleanup state machine, never a synthetic anchor row).
+  async fn commit_and_anchor(store: &MetadataStore, index: u64) {
+    let snapshot = store.snapshot().await.unwrap();
+    let prepared = store
+      .prepare_transaction(
+        transaction_id(index),
+        snapshot.revision().clone(),
+        vec![StoreOperation::Put {
+          namespace: namespace("retention-sweep-bound"),
+          key: store_key(&index.to_be_bytes()),
+          expected: StoreExpectation::Absent,
+          value: value(b"target"),
+        }],
+      )
+      .unwrap();
+    let receipt = committed(store.commit(prepared).await.unwrap());
+    let identity = ReceiptIdentity::from_receipt(&receipt);
+    assert!(matches!(
+      store
+        .cleanup_receipt(&identity, transaction_id(index + ANCHOR_OPERATION_OFFSET))
+        .await
+        .unwrap(),
+      ReceiptCleanupOutcome::Anchored(_)
+    ));
+  }
+
+  /// A population past the sweep bound still drains: the pass that
+  /// stops at the bound forgets the targets it already collected and
+  /// reports `remaining`, and repeated passes reach a full, idempotent
+  /// drain instead of returning empty-handed forever (regression: the
+  /// bound guard used to `return` before the cleanup loop ran).
+  #[tokio::test]
+  async fn retention_sweep_drains_a_population_larger_than_the_bound() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    for index in 0..(RETENTION_SWEEP_BOUND as u64 + 1) {
+      commit_and_anchor(&store, index).await;
+    }
+    // Every anchor's deadline has passed: all 4097 are due.
+    clock.set(UNIX_EPOCH + Duration::from_secs(200));
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, RETENTION_SWEEP_BOUND as u64);
+    assert!(report.remaining, "the first pass stopped at the bound");
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(
+      report.forgotten, 1,
+      "the next pass reaches the leftover anchor"
+    );
+    assert!(!report.remaining, "the anchored population is drained");
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining, "a drained population stays drained");
+  }
+
+  /// The exact interleaving the early return broke: the bound is
+  /// reached on an entry that is not yet due, so the pass must still
+  /// forget every collected due target (previously it forgot nothing)
+  /// and the follow-up pass finds nothing due and settles.
+  #[tokio::test]
+  async fn retention_sweep_processes_the_bound_when_a_later_anchor_is_not_due() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    for index in 0..RETENTION_SWEEP_BOUND as u64 {
+      commit_and_anchor(&store, index).await;
+    }
+    // The 4096 anchors from t=100 became due at t=110; anchor the last
+    // receipt only now, so it is not yet due when the sweep runs.
+    clock.set(UNIX_EPOCH + Duration::from_secs(111));
+    commit_and_anchor(&store, RETENTION_SWEEP_BOUND as u64).await;
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(
+      report.forgotten, RETENTION_SWEEP_BOUND as u64,
+      "the collected due targets must reach the cleanup loop"
+    );
+    assert!(
+      report.remaining,
+      "the scan stopped at the bound on the fresh anchor"
+    );
+
+    // The one remaining anchor is not due yet, so the follow-up pass
+    // settles without progress and the sweep is not livelocked.
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
+
+    // Once its deadline passes, the leftover anchor forgets too.
+    clock.set(UNIX_EPOCH + Duration::from_secs(200));
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 1);
+    assert!(!report.remaining);
   }
 }
