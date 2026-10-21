@@ -14,22 +14,26 @@
 //!
 //! The tick runs on the dedicated maintenance worker (audit 2026-10-09
 //! item 3), never inline in the supervisor's select loop, and every
-//! selected member carries ALL of its published endpoints: the dial
-//! rotates through them across successive ticks with the same
-//! endpoint-level failover the recovery plane applies (remaining-items
-//! list P2-5), so a multi-homed member whose first endpoint is
-//! unreachable is retried on the others.
+//! selected member carries ALL of its published endpoints: each dial of
+//! a member rotates that member to its next endpoint with the same
+//! per-member endpoint-level failover the recovery plane applies
+//! (remaining-items list P2-5), so a multi-homed member whose first
+//! endpoint is unreachable is retried on the others.
 //!
 //! The one deliberate exception to "healthy means dial nothing" is the
-//! bridge probe (audit finding #1's residual boundary): a healthy node
-//! at its target that still has unconnected members — two
-//! sub-partitions each internally meshed at/above the target — would
+//! bridge probe (audit finding #1's residual boundary): EVERY healthy
+//! node that still has unconnected members — two sub-partitions each
+//! internally meshed at or above the degree target, including nodes
+//! holding surplus app-initiated sessions above the target — would
 //! otherwise never re-bridge, because the deficit budget is zero
 //! (`degree_plan`) and the recovery controller quiesces on any one
 //! route. At most once per probe interval the tick dials ONE uniformly
 //! random unconnected member through the ordinary maintenance dial
-//! path, and the `target + slack` eligibility bound caps the probe's
-//! contribution to a single edge above the target.
+//! path. The interval bracket alone bounds the probe — one dial per
+//! node per five minutes, whatever the session count — and a failed
+//! probe dial is recorded at debug level only: a refused or stalled
+//! peer is the probe's expected outcome while a partition persists,
+//! never an error condition.
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -52,20 +56,13 @@ use crate::{Error, NodeId, Result};
 pub(super) const DEGREE_MAINTENANCE_TICK_PERIOD: std::time::Duration =
   std::time::Duration::from_secs(30);
 
-/// The bridge-probe cadence, in maintenance ticks: a node that already
-/// sits at its degree target may dial one unconnected member at most
-/// once per this many eligible ticks (10 × 30s = 5 minutes — pinned by
-/// `bridge_probe_interval_is_five_minutes`). The bracket is what keeps
-/// the probe from ever becoming a dial storm: even a permanently
-/// partitioned cluster issues one probe per node per five minutes.
+/// The bridge-probe cadence, in maintenance ticks: a healthy node with
+/// unconnected members may dial one of them at most once per this many
+/// eligible ticks (10 × 30s = 5 minutes — pinned by
+/// `bridge_probe_interval_is_five_minutes`). The bracket is the sole
+/// storm bound: even a permanently partitioned cluster issues one
+/// probe per node per five minutes, whatever the session count.
 pub(super) const BRIDGE_PROBE_INTERVAL_TICKS: u32 = 10;
-
-/// The degree headroom the bridge probe may consume above the target:
-/// the probe fires only while the session count sits below
-/// `target + slack`, so one landed probe edge disables further probes
-/// until a session drop re-opens the deficit path. A slack of one caps
-/// the probe's contribution to any node's degree at a single edge.
-pub(super) const BRIDGE_PROBE_SLACK: usize = 1;
 
 /// Runs the degree-maintenance worker: one long-lived task that owns the
 /// maintenance cadence — the tick the supervisor's select loop used to
@@ -165,21 +162,13 @@ impl TickState {
       &connected,
       self.entropy.as_ref(),
     )?;
-    // One attempt serial per dialing tick: every selected member's
-    // published endpoints rotate by it (remaining-items list P2-5), the
-    // same `recovery_endpoint` rotation the recovery plane applies to
-    // its own dials. Like recovery, the rotation advances across
-    // ATTEMPTS (ticks), not within one batch: a member whose dialed
-    // endpoint is unreachable is retried on its next endpoint by the
-    // next tick that selects it. A member skipped for a few ticks may
-    // land past an endpoint when reselected — acceptable for this
-    // best-effort plane, whose only contract is covering the deficit,
-    // while the recovery plane's per-schedule rotation stays the
-    // guaranteed failover for an isolated node.
-    let attempt = self
-      .degree_attempt
-      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-      + 1;
+    // Per-member endpoint rotation (remaining-items list P2-5): every
+    // dial of a member advances that member's OWN serial, wrapping per
+    // member — the same per-member `recovery_endpoint` rotation the
+    // recovery plane applies, through one shared serial map. A member
+    // whose dialed endpoint is unreachable is retried on its next
+    // endpoint by the next tick that selects it, regardless of which
+    // members any one tick happens to select.
     for (peer, endpoints) in dials {
       // In-flight bound re-check per spawn (audit finding #5): the
       // pre-batch gate compares the counter to the budget once, but
@@ -196,7 +185,10 @@ impl TickState {
         debug!("degree maintenance batch truncated at the in-flight budget");
         break;
       }
-      let Some(endpoint) = recovery_endpoint(&endpoints, attempt) else {
+      let Some(serial) = self.member_dial_serial(&peer) else {
+        continue;
+      };
+      let Some(endpoint) = recovery_endpoint(&endpoints, serial) else {
         continue;
       };
       self.spawn_maintenance_dial(peer, endpoint.clone());
@@ -210,27 +202,33 @@ impl TickState {
   /// degree target — never re-bridges on its own, because the deficit
   /// budget is zero and the recovery controller quiesces on any one
   /// authenticated route. The probe is deliberately slow and bounded:
-  /// it fires only for a healthy node below `target + slack` sessions
-  /// that still has unconnected members, at most once per
-  /// [`BRIDGE_PROBE_INTERVAL_TICKS`] eligible maintenance ticks, and
-  /// dials exactly ONE uniformly random unconnected member through the
-  /// SAME deficit machinery (`select_degree_dials`, endpoint rotation,
-  /// `spawn_maintenance_dial`). The edge lands as an ordinary
-  /// caller-class maintenance edge — never recovery-class — so the
-  /// recovery plane's redundant-edge pruning
+  /// it fires for EVERY healthy node with at least one unconnected
+  /// member — including nodes already above the target, whose surplus
+  /// app-initiated sessions must not blind them to the far side of a
+  /// partition — at most once per [`BRIDGE_PROBE_INTERVAL_TICKS`]
+  /// eligible maintenance ticks (the interval bracket is the sole
+  /// storm bound), and dials exactly ONE uniformly random unconnected
+  /// member through the SAME deficit machinery (`select_degree_dials`,
+  /// endpoint rotation, `spawn_maintenance_dial`). The edge lands as an
+  /// ordinary caller-class maintenance edge — never recovery-class — so
+  /// the recovery plane's redundant-edge pruning
   /// (`maybe_prune_recovery_edges`) never reclaims the bridge and
-  /// re-splits the partition it just healed.
+  /// re-splits the partition it just healed. A failed probe dial is
+  /// recorded at debug level only: a refused peer is the probe's
+  /// expected outcome while the partition persists, never an error.
   fn bridge_probe_tick(
     &self, local: &NodeId, members: &BTreeMap<NodeId, Vec<crate::Endpoint>>,
     connected: &BTreeSet<NodeId>, plan: &crate::membership::degree::DegreePlan,
   ) -> Result<()> {
-    // Eligibility is the whole bound: healthy (the deficit path owns
-    // below-target states, the recovery plane owns zero sessions), at
-    // most `slack` edges of headroom above the target, and at least one
-    // unconnected member to reach — a fully connected node never even
-    // spends the cadence bracket.
+    // Eligibility is the whole gate: healthy (the deficit path owns
+    // below-target states, the recovery plane owns zero sessions) and
+    // at least one unconnected member to reach — a fully connected
+    // node never even spends the cadence bracket. Every healthy node
+    // qualifies regardless of how far above the target its session
+    // count sits: the interval bracket alone bounds the dial rate, so
+    // surplus app-initiated sessions cannot blind a node to the far
+    // side of a partition.
     let eligible = plan.state == crate::ConnectionDegreeState::Healthy
-      && connected.len() < plan.target + BRIDGE_PROBE_SLACK
       && members.keys().any(|node| !connected.contains(node));
     if !eligible {
       return Ok(());
@@ -269,15 +267,15 @@ impl TickState {
       connected,
       self.entropy.as_ref(),
     )?;
-    // The same batch serial semantics as the deficit path: one attempt
-    // serial per probing tick, so a multi-homed member's endpoints
-    // rotate across successive probes.
-    let attempt = self
-      .degree_attempt
-      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-      + 1;
+    // Per-member endpoint rotation, the same serial map the deficit
+    // path and the recovery plane share: a multi-homed member's
+    // endpoints rotate across successive probes of that member,
+    // wrapping per member.
     for (peer, endpoints) in dials {
-      let Some(endpoint) = recovery_endpoint(&endpoints, attempt) else {
+      let Some(serial) = self.member_dial_serial(&peer) else {
+        continue;
+      };
+      let Some(endpoint) = recovery_endpoint(&endpoints, serial) else {
         continue;
       };
       debug!(
@@ -664,11 +662,11 @@ mod tests {
   /// Audit finding #1's residual boundary: two sub-partitions each
   /// internally meshed at/above the degree target never re-bridge —
   /// the deficit budget is zero and the recovery controller quiesces
-  /// on any one route. The bridge probe heals it: a healthy node at
-  /// its target with unconnected members issues ONE cross-partition
-  /// maintenance dial per probe interval — never before the interval
-  /// elapses, never through the recovery plane — and the
-  /// `target + slack` eligibility bound keeps the session count capped.
+  /// on any one route. The bridge probe heals it: a healthy node with
+  /// unconnected members issues ONE cross-partition maintenance dial
+  /// per probe interval — never before the interval elapses, never
+  /// through the recovery plane — and the interval bracket alone
+  /// bounds the dial rate.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn bridge_probe_dials_a_cross_partition_member_within_two_intervals() {
     let (reference, config) = test_support::reference_and_config();
@@ -705,16 +703,12 @@ mod tests {
       ticks.maintenance_tick().await.unwrap();
       let view = supervisor.connection_degree_view().await.unwrap();
       assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
-      assert!(
-        view.sessions() <= view.target() + super::BRIDGE_PROBE_SLACK,
-        "the probe must never push the degree past target + slack"
+      assert_eq!(
+        connections.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the cadence bracket holds the interval's first ticks back"
       );
     }
-    assert_eq!(
-      connections.load(std::sync::atomic::Ordering::Relaxed),
-      0,
-      "the cadence bracket holds the interval's first ticks back"
-    );
     assert_eq!(
       ticks
         .bridge_probe_ticks
@@ -759,8 +753,9 @@ mod tests {
     );
 
     // The stalled dial releases its slot at the deadline; the re-armed
-    // bracket then holds further probes back, and the session count
-    // never exceeds target + slack.
+    // bracket then holds further probes back until the next interval
+    // elapses — at most one probe dial per interval, whatever the
+    // session count.
     tokio::time::timeout(std::time::Duration::from_secs(6), async {
       loop {
         if ticks
@@ -777,8 +772,6 @@ mod tests {
     .expect("the stalled probe dial must release its in-flight slot");
     for _ in 0..3 {
       ticks.maintenance_tick().await.unwrap();
-      let view = supervisor.connection_degree_view().await.unwrap();
-      assert!(view.sessions() <= view.target() + super::BRIDGE_PROBE_SLACK);
     }
     assert_eq!(
       connections.load(std::sync::atomic::Ordering::Relaxed),
@@ -786,6 +779,288 @@ mod tests {
       "the re-armed bracket holds the next interval's first ticks back"
     );
     holder.abort();
+  }
+
+  /// A03: the over-target restriction is gone. Every healthy node with
+  /// unconnected members probes — a node holding surplus app-initiated
+  /// sessions above `target + 1` no longer stays blind to the far side
+  /// of a partition until a session drop: the probe fires at its
+  /// interval even at six sessions over a target of four, and the
+  /// interval bracket stays the sole storm bound.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_node_above_the_target_with_unconnected_members_still_probes() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (port, connections, holder) = silent_peer().await;
+
+    // An eight-node cluster (k(8) = 4) with SIX live sessions — two
+    // above the old `target + slack` bound — and one unconnected member
+    // (107), so the probe's uniform pick is deterministic and the
+    // silent listener counts the dial.
+    for seed in 101..=106 {
+      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+    }
+    for seed in 101..=107 {
+      install_member(&supervisor, &reference, seed, &[port]).await;
+    }
+    let view = supervisor.connection_degree_view().await.unwrap();
+    assert_eq!(view.target(), 4, "k(8) = 4 from the shipped degree table");
+    assert_eq!(
+      view.sessions(),
+      6,
+      "the surplus sessions sit above the retired target + slack bound"
+    );
+    assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
+
+    // The bracket still holds the interval's first ticks back...
+    for _ in 0..super::BRIDGE_PROBE_INTERVAL_TICKS - 1 {
+      ticks.maintenance_tick().await.unwrap();
+    }
+    assert_eq!(
+      connections.load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "the cadence bracket holds the interval's first ticks back"
+    );
+
+    // ...and the interval's tick probes the unconnected member even
+    // though the session count sits far above the target.
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("a node above the target must still probe its unconnected member");
+    assert_eq!(
+      ticks
+        .recovery_pending
+        .load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "the bridge edge must never be recovery-class"
+    );
+    holder.abort();
+  }
+
+  /// A gated tracing capture for the probe-failure test: a global
+  /// registry layer whose recording an atomic gates, so only the armed
+  /// test observes events and every other test pays nothing. Library
+  /// tests install no subscriber otherwise, so the global default is
+  /// free to take.
+  mod captured_events {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// One recorded event: (level, target, message).
+    pub(super) type CapturedEvent = (tracing::Level, String, String);
+
+    #[derive(Debug, Default)]
+    struct Shared {
+      gate: std::sync::atomic::AtomicBool,
+      events: Mutex<Vec<CapturedEvent>>,
+    }
+
+    /// The armed capture handle: events flow until [`Capture::disarm`].
+    pub(super) struct Capture(Arc<Shared>);
+
+    impl Capture {
+      /// Clears the recorded events and starts recording.
+      pub(super) fn arm(&self) {
+        if let Ok(mut events) = self.0.events.lock() {
+          events.clear();
+        }
+        self
+          .0
+          .gate
+          .store(true, std::sync::atomic::Ordering::Relaxed);
+      }
+
+      /// Stops recording; the recorded events stay readable.
+      pub(super) fn disarm(&self) {
+        self
+          .0
+          .gate
+          .store(false, std::sync::atomic::Ordering::Relaxed);
+      }
+
+      /// The events recorded so far (other tests' concurrent events
+      /// may appear too: the gate is process-wide).
+      pub(super) fn events(&self) -> Vec<CapturedEvent> {
+        self
+          .0
+          .events
+          .lock()
+          .map(|events| events.clone())
+          .unwrap_or_default()
+      }
+    }
+
+    /// Extracts an event's `message` field (the human-readable text of
+    /// `tracing::debug!("...")`).
+    struct Message(String);
+
+    impl tracing::field::Visit for Message {
+      fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+          self.0 = format!("{value:?}");
+        }
+      }
+    }
+
+    struct Layer {
+      shared: Arc<Shared>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Layer {
+      fn on_event(
+        &self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>,
+      ) {
+        if !self.shared.gate.load(std::sync::atomic::Ordering::Relaxed) {
+          return;
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        if let Ok(mut events) = self.shared.events.lock() {
+          events.push((
+            *event.metadata().level(),
+            event.metadata().target().to_string(),
+            message.0,
+          ));
+        }
+      }
+    }
+
+    /// Installs the capturing layer once per process and hands back the
+    /// capture handle.
+    pub(super) fn install() -> Capture {
+      static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+      Capture(
+        SHARED
+          .get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let shared = Arc::new(Shared::default());
+            let _ =
+              tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Layer {
+                shared: Arc::clone(&shared),
+              }));
+            shared
+          })
+          .clone(),
+      )
+    }
+  }
+
+  /// A03: a failed probe dial is an expected outcome, never an error:
+  /// the refusal is recorded at debug level only (no warn/error
+  /// escalation anywhere on the degree plane), the tick itself stays
+  /// `Ok`, the in-flight slot releases, and the re-armed bracket probes
+  /// again at the next interval.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_failed_probe_dial_stays_at_debug_level_and_never_escalates() {
+    let capture = captured_events::install();
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    // A refusing peer: the probe dial fails fast and deterministically
+    // at the handshake on every platform.
+    let (refused_port, refused_holder) = refusing_peer().await;
+
+    // A five-node cluster (k(5) = 3) healthy at target with exactly one
+    // unconnected member (104), whose only endpoint refuses.
+    for seed in 101..=103 {
+      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+    }
+    for seed in 101..=104 {
+      install_member(&supervisor, &reference, seed, &[refused_port]).await;
+    }
+    let view = supervisor.connection_degree_view().await.unwrap();
+    assert_eq!(view.target(), 3, "k(5) = 3 from the shipped degree table");
+    assert_eq!(view.sessions(), 3);
+    assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
+
+    capture.arm();
+    // The interval's first ticks hold the bracket back, then the firing
+    // tick probes the refusing member: the dial starts, fails fast, and
+    // the failure is recorded as a debug event of the degree plane.
+    for _ in 0..super::BRIDGE_PROBE_INTERVAL_TICKS - 1 {
+      ticks.maintenance_tick().await.unwrap();
+    }
+    ticks.maintenance_tick().await.unwrap();
+    let refused_debug_records = |capture: &captured_events::Capture| {
+      capture
+        .events()
+        .iter()
+        .filter(|(level, target, message)| {
+          *level == tracing::Level::DEBUG
+            && target.as_str() == "radiata::runtime::degree"
+            && message.contains("degree maintenance dial failed")
+        })
+        .count()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if refused_debug_records(&capture) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the refused probe dial must be recorded at debug level");
+
+    // The failed dial releases its in-flight slot and the plane keeps
+    // probing: the re-armed bracket fires again at the next interval —
+    // the failure is non-fatal, never an error condition.
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if ticks
+          .maintenance_pending
+          .load(std::sync::atomic::Ordering::Relaxed)
+          == 0
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the refused dial must release its in-flight slot");
+    for _ in 0..super::BRIDGE_PROBE_INTERVAL_TICKS {
+      ticks.maintenance_tick().await.unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if refused_debug_records(&capture) >= 2 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the re-armed bracket must probe again after the failure");
+
+    // No escalation anywhere on the degree plane while armed: every
+    // event it emitted stayed at trace/debug/info.
+    assert!(
+      capture.events().iter().all(|(level, target, _)| {
+        target.as_str() != "radiata::runtime::degree"
+          || !matches!(*level, tracing::Level::WARN | tracing::Level::ERROR)
+      }),
+      "a failed probe dial must never escalate past debug"
+    );
+    capture.disarm();
+    refused_holder.abort();
   }
 
   /// The probe's negative space: a healthy node with NO unconnected
