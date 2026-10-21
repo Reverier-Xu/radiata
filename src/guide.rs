@@ -340,6 +340,10 @@
 //! [`Error::provider`](crate::Error::provider) form) so the runtime
 //! never mistakes them for its own faults.
 //!
+//! The consumer runs until the body's terminal item is consumed, while
+//! the session frees the admission slot when the end frame arrives — a
+//! delivered body is always drained, never truncated mid-stream.
+//!
 //! ```
 //! use radiata::{BoxFuture, IncomingStream, PacketConsumer, Result};
 //!

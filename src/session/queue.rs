@@ -64,22 +64,30 @@ const WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 /// [`BoundedSender`].
 struct Reservation {
   state: Arc<QueueState>,
-  bytes: usize,
+  /// The held accounting payload until committed: `None` disarms the
+  /// drop-time release while the owned state clone still drops, so a
+  /// commit can never strand a strong reference to the queue state.
+  held: Option<usize>,
 }
 
 impl Reservation {
-  /// The reservation transfers to the channel: the receiving half
-  /// releases it when the frame drains, exactly as before.
-  fn commit(self) {
-    std::mem::forget(self);
+  /// The reservation transfers to the channel: disarms the drop-time
+  /// release (the receiving half releases the accounting when the frame
+  /// drains) while the owned `Arc<QueueState>` clone drops normally —
+  /// the reservation is disarmed, never forgotten, so every commit
+  /// returns its strong reference.
+  fn commit(mut self) {
+    self.held = None;
   }
 }
 
 impl Drop for Reservation {
   fn drop(&mut self) {
-    self.state.count.fetch_sub(1, Ordering::Relaxed);
-    self.state.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
-    self.state.audit_removed.fetch_add(1, Ordering::Relaxed);
+    if let Some(bytes) = self.held.take() {
+      self.state.count.fetch_sub(1, Ordering::Relaxed);
+      self.state.bytes.fetch_sub(bytes, Ordering::Relaxed);
+      self.state.audit_removed.fetch_add(1, Ordering::Relaxed);
+    }
   }
 }
 
@@ -135,6 +143,13 @@ impl BoundedSender {
       .audit_reserved
       .load(Ordering::Relaxed)
       .saturating_sub(self.state.audit_removed.load(Ordering::Relaxed))
+  }
+
+  /// Test-only weak handle on the shared queue state, so leak
+  /// regression tests observe the last strong reference dropping.
+  #[cfg(test)]
+  fn state_weak(&self) -> std::sync::Weak<QueueState> {
+    std::sync::Arc::downgrade(&self.state)
   }
 
   /// Best-effort admission-status relay (single construction site): the
@@ -199,7 +214,7 @@ impl BoundedSender {
           self.state.audit_reserved.fetch_add(1, Ordering::Relaxed);
           Ok(Some(Reservation {
             state: Arc::clone(&self.state),
-            bytes,
+            held: Some(bytes),
           }))
         }
       }
@@ -430,5 +445,27 @@ mod queue_tests {
     let _ = receiver.recv().await.unwrap();
     sender.send(frame(10)).await.unwrap();
     assert_eq!(sender.audit_delta(), 1);
+  }
+
+  /// Every committed reservation transfers its accounting to the
+  /// channel and returns its own strong reference: after the receiver
+  /// drains and both halves drop, no committed clone may keep the
+  /// shared `QueueState` allocation alive (leak regression — a commit
+  /// disarms the drop-time release, it never forgets the guard).
+  #[tokio::test]
+  async fn committed_reservations_do_not_leak_the_shared_queue_state() {
+    let (sender, mut receiver) = queue(2, 1_000);
+    let weak = sender.state_weak();
+    for _ in 0..4 {
+      sender.send(frame(10)).await.unwrap();
+      let _ = receiver.recv().await.unwrap();
+    }
+    assert_eq!(sender.audit_delta(), 0, "every drain matched its admission");
+    drop(sender);
+    drop(receiver);
+    assert!(
+      weak.upgrade().is_none(),
+      "committed reservations must not keep the queue state alive"
+    );
   }
 }
