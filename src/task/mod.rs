@@ -12,7 +12,8 @@
 //! verb would have lost.
 
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, hash_map::DefaultHasher},
+  hash::{Hash, Hasher},
   marker::PhantomData,
   panic::AssertUnwindSafe,
   sync::{Arc, Mutex},
@@ -20,7 +21,7 @@ use std::{
 };
 
 use futures_util::FutureExt;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
   BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeId, QualifiedTag, Result, TaskId,
@@ -854,11 +855,11 @@ impl std::fmt::Debug for TaskTransition {
 }
 
 /// Runs one transition's action hooks sequentially in canonical tag
-/// order (the registry's own order). Called from the task's spawned
-/// observation task, never on the manager task and never on an
-/// execution slot: a hook error is a warn diagnostic, and a hook panic
-/// is contained right here (also a warn diagnostic) — an observer can
-/// never fail, retry, wedge, or delay the task it observes.
+/// order (the registry's own order). Called from one of the node's
+/// [`ObservationLanes`] runners, never on the manager task and never on
+/// an execution slot: a hook error is a warn diagnostic, and a hook
+/// panic is contained right here (also a warn diagnostic) — an observer
+/// can never fail, retry, wedge, or delay the task it observes.
 pub(crate) async fn notify_action_hooks(
   hooks: &[Arc<dyn ActionHook>], transition: &TaskTransition,
 ) {
@@ -875,6 +876,129 @@ pub(crate) async fn notify_action_hooks(
       ),
     }
   }
+}
+
+/// How many observations may run their hooks concurrently: one
+/// spawned runner task per lane. Observations are diagnostics-grade
+/// caller code that must never delay a task, so the budget is the
+/// facility's own — deliberately small, independent of the execution
+/// slot budgets — and a wedged hook parks at most one lane.
+pub(crate) const TASK_OBSERVATION_LANES: usize = 4;
+
+/// Each lane's inbox depth: the queued-observation bound. A lane whose
+/// runner is wedged accumulates at most this many queued observations;
+/// the next one is dropped with a warn (the explicit overload
+/// behavior — observations are best-effort diagnostics, never
+/// load-bearing work), so caller hook code can never accumulate
+/// unbounded parked tasks.
+pub(crate) const TASK_OBSERVATION_INBOX: usize = 32;
+
+/// One scheduled observation: the diagnostics label, the id of the
+/// task the observation belongs to, and the boxed observer work.
+struct Observation {
+  label: &'static str,
+  task: TaskId,
+  observation: BoxFuture<'static, ()>,
+}
+
+/// The node's bounded facility for running observer code (the action
+/// hooks behind task transitions): a fixed set of lanes, each one
+/// spawned runner task over a bounded inbox. One task's observations
+/// are pinned to a single lane — a deterministic function of the task
+/// id — and each lane is consumed by exactly one runner, so a task's
+/// observations always run in transition order without per-task
+/// bookkeeping and without detached predecessor chains. The lanes are
+/// independently managed: they hold no execution slot, and dropping
+/// the facility aborts every runner, so a wedged observation is
+/// cancelled at shutdown instead of surviving the incarnation as
+/// detached work.
+pub(crate) struct ObservationLanes {
+  inboxes: Vec<mpsc::Sender<Observation>>,
+  runners: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ObservationLanes {
+  /// Spawns the lanes' runner tasks. The observing side keeps every
+  /// runner handle, so the facility's drop is the shutdown
+  /// cancellation point.
+  pub(crate) fn new() -> Self {
+    let mut inboxes = Vec::with_capacity(TASK_OBSERVATION_LANES);
+    let mut runners = Vec::with_capacity(TASK_OBSERVATION_LANES);
+    for _ in 0..TASK_OBSERVATION_LANES {
+      let (inbox, mut received) = mpsc::channel::<Observation>(TASK_OBSERVATION_INBOX);
+      let runner = tokio::spawn(async move {
+        while let Some(observation) = received.recv().await {
+          // Panics are the scheduled work's own to contain
+          // (`notify_action_hooks` catches each hook); this is the
+          // backstop of the generic facility, so a panicking
+          // observation still never takes the lane down.
+          if let Err(_panic) = AssertUnwindSafe(observation.observation)
+            .catch_unwind()
+            .await
+          {
+            tracing::warn!(
+              observation = observation.label,
+              task = %observation.task,
+              "an observation panicked and was contained"
+            );
+          }
+        }
+      });
+      inboxes.push(inbox);
+      runners.push(runner);
+    }
+    Self { inboxes, runners }
+  }
+
+  /// Schedules one observation on its task's pinned lane. Scheduling
+  /// never blocks and never fails the caller: a full inbox drops the
+  /// observation with a warn (the explicit overload behavior — the
+  /// observation is diagnostics, and the task it belongs to has
+  /// already moved on), and a closed inbox only means the facility is
+  /// already shutting down.
+  pub(crate) fn schedule(
+    &self, task: TaskId, label: &'static str, observation: BoxFuture<'static, ()>,
+  ) {
+    let inbox = &self.inboxes[lane_of(&task)];
+    match inbox.try_send(Observation {
+      label,
+      task: task.clone(),
+      observation,
+    }) {
+      Ok(()) => {}
+      Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+        observation = label,
+        task = %task,
+        "the observation lane's inbox is full; dropping the observation"
+      ),
+      Err(mpsc::error::TrySendError::Closed(_)) => tracing::debug!(
+        observation = label,
+        task = %task,
+        "the observation lanes are shutting down; dropping the observation"
+      ),
+    }
+  }
+}
+
+impl Drop for ObservationLanes {
+  /// The shutdown cancellation: abort every runner, so an observation
+  /// wedged mid-hook is dropped — wedged observer code never outlives
+  /// the incarnation that scheduled it.
+  fn drop(&mut self) {
+    for runner in &self.runners {
+      runner.abort();
+    }
+  }
+}
+
+/// The lane one task's observations run on: a deterministic function
+/// of the task id, so every observation of one task lands on the same
+/// lane's FIFO in transition order — no per-task assignment map, no
+/// predecessor chains.
+fn lane_of(task: &TaskId) -> usize {
+  let mut hasher = DefaultHasher::new();
+  task.as_str().hash(&mut hasher);
+  (hasher.finish() % TASK_OBSERVATION_LANES as u64) as usize
 }
 
 /// Runs one write's admission hooks on the caller's task, in canonical
@@ -998,13 +1122,20 @@ impl CustomTaskSpec {
 
 #[cfg(test)]
 mod tests {
-  use std::time::{Duration, SystemTime};
+  use std::{
+    sync::{
+      Arc,
+      atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime},
+  };
 
   use tokio::sync::watch;
 
   use super::{
-    ActionHook, CredentialIssued, CustomTaskSpec, ResourceHook, Task, TaskError, TaskKind,
-    TaskObserver, TaskOutput, TaskPhase, TaskResult, TaskStatusRecord, TaskTable, TaskTransition,
+    ActionHook, CredentialIssued, CustomTaskSpec, ObservationLanes, ResourceHook,
+    TASK_OBSERVATION_INBOX, Task, TaskError, TaskKind, TaskObserver, TaskOutput, TaskPhase,
+    TaskResult, TaskStatusRecord, TaskTable, TaskTransition, lane_of,
   };
   use crate::{
     Error, ErrorKind, IssuedMergeCredential, MergeView, NodeId, QualifiedTag, Result, TaskId,
@@ -1081,6 +1212,113 @@ mod tests {
 
   fn merge_view() -> MergeView {
     MergeView::new(node('a'), node('b'))
+  }
+
+  /// The P2-1 regression at the facility level: a wedged observation
+  /// parks its lane's runner, the lane's inbox bounds how much further
+  /// work may queue behind it, the next observation is dropped with the
+  /// overload diagnostic, and dropping the lanes aborts the parked
+  /// runner — wedged observer code is cancelled at shutdown instead of
+  /// surviving as detached work.
+  #[tokio::test]
+  async fn observation_lanes_bound_a_parked_lane_drop_on_overflow_and_abort_on_drop() {
+    // Two ids pinned to the same lane: with 64 ids over the lane count
+    // the pigeonhole principle guarantees a pair.
+    let ids: Vec<TaskId> = (0..64)
+      .map(|counter| TaskId::compose(0, counter).expect("id"))
+      .collect();
+    let (parker, queued) = ids
+      .iter()
+      .enumerate()
+      .find_map(|(index, id)| {
+        ids[..index]
+          .iter()
+          .find(|other| lane_of(other) == lane_of(id))
+          .map(|other| (other.clone(), id.clone()))
+      })
+      .expect("two ids share a lane");
+
+    let lanes = ObservationLanes::new();
+    // Park the shared lane's runner: this observation sets `started`,
+    // then never settles, holding the alive guard until it is dropped.
+    let started = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
+    let wedge_started = Arc::clone(&started);
+    let wedge_alive = Arc::clone(&alive);
+    struct Held(Arc<AtomicBool>);
+    impl Drop for Held {
+      fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+      }
+    }
+    lanes.schedule(
+      parker,
+      "wedging observation",
+      Box::pin(async move {
+        wedge_started.store(true, Ordering::SeqCst);
+        let _held = Held(wedge_alive);
+        let () = std::future::pending().await;
+      }),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedging observation never started"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Fill the parked lane's inbox with instant observations for the
+    // mate: they queue behind the wedged one, never running.
+    let queued_ran = Arc::new(AtomicUsize::new(0));
+    for _ in 0..TASK_OBSERVATION_INBOX {
+      let ran = Arc::clone(&queued_ran);
+      lanes.schedule(
+        queued.clone(),
+        "queued observation",
+        Box::pin(async move {
+          ran.fetch_add(1, Ordering::SeqCst);
+        }),
+      );
+    }
+    // The next observation is the explicit overload behavior: the
+    // runner is parked, the inbox is full, so the observation is
+    // dropped with a warn instead of accumulating.
+    let overflow_ran = Arc::new(AtomicBool::new(false));
+    let overflow = Arc::clone(&overflow_ran);
+    lanes.schedule(
+      queued.clone(),
+      "overflow observation",
+      Box::pin(async move {
+        overflow.store(true, Ordering::SeqCst);
+      }),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+      !overflow_ran.load(Ordering::SeqCst),
+      "the overflow observation was dropped, never queued"
+    );
+    assert_eq!(
+      queued_ran.load(Ordering::SeqCst),
+      0,
+      "the parked runner never reached the queued observations"
+    );
+
+    // Shutdown cancellation: dropping the facility aborts the parked
+    // runner, which drops the wedged observation's state. Under the
+    // old detached-spawn design the wedged observation survived the
+    // facility (and the whole incarnation) forever.
+    drop(lanes);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged observation outlived the observation lanes"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!overflow_ran.load(Ordering::SeqCst));
   }
 
   #[test]

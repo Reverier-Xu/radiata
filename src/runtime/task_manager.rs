@@ -16,16 +16,13 @@
 //! and reconcilers never run on the manager task, and a panicking
 //! effect surfaces as the task's typed internal failure without
 //! touching the manager. Transition observations (the action hooks)
-//! run in their own spawned tasks off the worker pools: a wedged or
-//! panicking hook can never hold an execution slot, delay a terminal
-//! report, or delay the leave shutdown behind the task's own success.
+//! run on the node's bounded observation lanes, off the worker pools:
+//! a wedged or panicking hook can never hold an execution slot, delay
+//! a terminal report, or delay the leave shutdown behind the task's
+//! own success — and the lanes' runners are aborted when the manager
+//! drains, so a wedged hook never outlives the incarnation.
 
-use std::{
-  collections::BTreeMap,
-  pin::Pin,
-  sync::{Arc, Mutex},
-  time::Duration,
-};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
 
 use tokio::{
   sync::{Semaphore, mpsc, oneshot, watch},
@@ -474,12 +471,16 @@ struct ManagerShared {
   /// permit draw is class-routed so local work never queues behind a
   /// dial.
   slots: ReconcileChannels,
-  /// The per-task observation chains: the spawned action-hook
-  /// observation task of each transition awaits the task's predecessor,
-  /// which preserves one task's transition order while running wholly
-  /// off the execution slots and the attempt body. Entries are detached
-  /// at the task's terminal report.
-  observations: Mutex<BTreeMap<TaskId, tokio::task::JoinHandle<()>>>,
+  /// The bounded observation lanes the action-hook observations run
+  /// on (see [`crate::task::ObservationLanes`]): every transition's
+  /// hooks are scheduled onto the task's pinned lane, so one task's
+  /// observations still run in transition order while running wholly
+  /// off the execution slots and the attempt body. A wedged hook parks
+  /// its lane, further observations on that lane drop with a warn once
+  /// its inbox fills, and the runners are aborted when this shared
+  /// state drops — wedged observer code never accumulates unbounded
+  /// and never outlives the incarnation.
+  observations: crate::task::ObservationLanes,
 }
 
 impl ManagerShared {
@@ -608,13 +609,12 @@ impl ManagerShared {
   /// The transition observation, in the design's order: the typed event
   /// first — synchronously on the publication path, so the event stream
   /// is the table's own transition order — then the registered action
-  /// hooks, in canonical tag order, inside the task's own spawned
-  /// observation task. The observation runs off the execution slots and
+  /// hooks, in canonical tag order, scheduled onto the task's pinned
+  /// observation lane. The observation runs off the execution slots and
   /// off the attempt body, so a wedged or panicking hook can never hold
   /// a slot, delay the worker's terminal report, or (through it) the
-  /// leave shutdown. One task's observations chain through their
-  /// predecessors, so a task's hooks still observe in transition order
-  /// while different tasks never observe through each other.
+  /// leave shutdown. Lane pinning keeps one task's hooks in transition
+  /// order while different tasks never observe through each other.
   fn observe(&self, id: &TaskId, kind: &TaskKind, from: TaskPhase, to: TaskPhase) {
     self
       .events()
@@ -624,45 +624,13 @@ impl ManagerShared {
       return;
     }
     let transition = crate::task::TaskTransition::new(id.clone(), kind.clone(), from, to);
-    let previous = self
-      .observations
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .remove(id);
-    let observation = tokio::spawn(async move {
-      // A predecessor that ended without settling (an aborted
-      // observation — panics are contained inside the hook runner) is
-      // containment news, never a task outcome: log it and keep the
-      // chain going.
-      if let Some(previous) = previous
-        && let Err(join_error) = previous.await
-      {
-        tracing::warn!(
-          task = %transition.id(),
-          panic = join_error.is_panic(),
-          "an action hook observation ended without settling"
-        );
-      }
-      crate::task::notify_action_hooks(&hooks, &transition).await;
-    });
-    self
-      .observations
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .insert(id.clone(), observation);
-  }
-
-  /// Detaches the task's observation chain: the terminal report is the
-  /// task's last observation spawn site, so dropping the chain-head
-  /// handle here keeps the manager's bookkeeping bounded while any
-  /// still-running (or wedged) observation task stays detached — caller
-  /// code that never settles must not pin the manager.
-  fn detach_observations(&self, id: &TaskId) {
-    self
-      .observations
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .remove(id);
+    self.observations.schedule(
+      id.clone(),
+      "action hook observation",
+      Box::pin(async move {
+        crate::task::notify_action_hooks(&hooks, &transition).await;
+      }),
+    );
   }
 }
 
@@ -703,7 +671,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     operations: deps.operations,
     leave_complete: deps.leave_complete,
     slots: ReconcileChannels::new(local_slots, network_slots),
-    observations: Mutex::new(BTreeMap::new()),
+    observations: crate::task::ObservationLanes::new(),
   });
   let (reports_tx, reports_rx) = mpsc::unbounded_channel();
   let task = tokio::spawn(run_manager(
@@ -739,7 +707,7 @@ enum WorkerReport {
   /// single truth for the leave completion signal: a leave that
   /// published `Succeeded` still signals the active-leave shutdown even
   /// when a hook observing that publication wedges or panics (the
-  /// observations run in their own spawned tasks off this path).
+  /// observations run on the observation lanes off this path).
   Terminal { id: TaskId },
   /// The attempt failed retryably; re-spawn after the delay.
   Retry {
@@ -869,15 +837,15 @@ async fn run_manager(
         match report {
           WorkerReport::Terminal { id } => {
             coalescing.retain(|_, (in_flight, _)| in_flight != &id);
-            // The terminal publication was this task's last observation
-            // spawn site: detach the chain so the bookkeeping dies with
-            // the task while any wedged observation stays detached.
-            shared.detach_observations(&id);
+            // No observation bookkeeping runs here: the lanes pin a
+            // task's observations by id, so the terminal publication's
+            // observation — already scheduled — is the task's last, and
+            // nothing outlives the task on the manager's side.
             if leave_task.as_ref() == Some(&id) {
               leave_task = None;
               // The table's terminal phase is the single truth, driven
               // straight off the terminal publication: the action-hook
-              // observations run in their own spawned tasks off this
+              // observations run on the observation lanes off this
               // path, so a wedged or panicking hook can never delay the
               // active-leave shutdown behind the task's own success.
               let succeeded = shared
@@ -1126,10 +1094,10 @@ impl Worker {
     // the worker always reports back to the manager. The transition
     // observations (event plus action hooks) do not run here: the event
     // is emitted synchronously on the publication path and the hooks
-    // run in their own spawned observation tasks, so the body settles
-    // — and the permit releases — without waiting on any observer. The
-    // abort-on-drop guard cancels the body when the shutdown cancel
-    // wins the select.
+    // are scheduled on the bounded observation lanes, so the body
+    // settles — and the permit releases — without waiting on any
+    // observer. The abort-on-drop guard cancels the body when the
+    // shutdown cancel wins the select.
     let mut body = AbortOnDrop(tokio::spawn(
       Attempt {
         shared: Arc::clone(&self.shared),
@@ -1278,7 +1246,7 @@ mod tests {
     collections::VecDeque,
     sync::{
       Arc, Mutex,
-      atomic::{AtomicUsize, Ordering},
+      atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
   };
@@ -1381,7 +1349,7 @@ mod tests {
   }
 
   /// Polls a shared log to its final shape: the hook observations run
-  /// in their own spawned tasks, so the terminal publication precedes
+  /// on the observation lanes, so the terminal publication precedes
   /// them and the recorded sequence reaches its pinned shape only
   /// shortly after.
   async fn await_hook_calls(calls: &Arc<Mutex<Vec<HookCall>>>, expected: Vec<HookCall>) {
@@ -1439,9 +1407,9 @@ mod tests {
       .wait()
       .await
       .expect("terminal");
-    // The observations are spawned per transition and chained through
-    // their predecessors, so the sequence still observes each transition
-    // in order, in canonical tag order — it just lands off the slot.
+    // The observations run on the task's pinned observation lane, so
+    // the sequence still observes each transition in order, in
+    // canonical tag order — it just lands off the slot.
     await_hook_calls(
       &calls,
       vec![
@@ -1468,9 +1436,10 @@ mod tests {
       extensions,
     ))
     .expect("manager");
-    // The observation runs in its own spawned task off the attempt body,
-    // so a panicking hook is a contained diagnostic: the task runs its
-    // effect to success, and the manager keeps serving later tasks.
+    // The observation runs on the observation lanes off the attempt
+    // body, so a panicking hook is a contained diagnostic: the task
+    // runs its effect to success, and the manager keeps serving later
+    // tasks.
     for counter in 0..2 {
       let id = client
         .submit(
@@ -1516,7 +1485,7 @@ mod tests {
       .expect("admission");
     // The effect succeeded and published `Succeeded`; the hook
     // panicking while observing that terminal transition is contained
-    // in the observation task. Terminality is monotone and the
+    // on its observation lane. Terminality is monotone and the
     // observation is off the attempt body, so the phase stands and the
     // waiter still receives the outcome.
     handle::<()>(&client, &id, TaskKind::SyncRound)
@@ -1657,6 +1626,191 @@ mod tests {
       "the drain must complete despite the wedged observer"
     );
     let _ = drain.await;
+  }
+
+  /// An action hook that never settles while holding a guard whose
+  /// drop flips `alive` false: the test can observe exactly when the
+  /// wedged observation's state is released.
+  #[derive(Debug)]
+  struct GuardedWedgingHook {
+    started: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+  }
+
+  impl ActionHook for GuardedWedgingHook {
+    fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      let started = Arc::clone(&self.started);
+      let alive = Arc::clone(&self.alive);
+      Box::pin(async move {
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+          fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+          }
+        }
+        started.store(true, Ordering::SeqCst);
+        let _held = Held(alive);
+        let () = std::future::pending().await;
+        Ok(())
+      })
+    }
+  }
+
+  /// The P2-1 shutdown regression: under the detached-spawn design a
+  /// wedged action hook survived the whole incarnation — its spawned
+  /// observation task was dropped from the manager's bookkeeping at
+  /// the terminal report and nothing ever cancelled it. The bounded
+  /// observation lanes are the manager's own state: the shutdown drain
+  /// drops them, which aborts the parked runner and with it the
+  /// wedged observation.
+  #[tokio::test]
+  async fn a_wedged_action_hook_is_cancelled_at_shutdown() {
+    let started = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/wedged-guard").expect("tag"),
+        Arc::new(GuardedWedgingHook {
+          started: Arc::clone(&started),
+          alive: Arc::clone(&alive),
+        }),
+      )
+      .expect("registration");
+    let (client, manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
+    .expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("admission");
+    handle::<()>(&client, &id, TaskKind::SyncRound)
+      .wait()
+      .await
+      .expect("the wedged hook never delays the task");
+    // The wedged observation must actually be running (parking a
+    // lane's runner) before the shutdown is worth anything.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged observation never started"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    manager.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(5), manager.drain())
+      .await
+      .expect("the drain must complete despite the wedged observer");
+    // The drain resolves and, with it, the wedged observation is
+    // cancelled: its held state is dropped, so it cannot outlive the
+    // incarnation.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged observation outlived the incarnation"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+  }
+
+  /// An action hook that is slow exactly on the `Running` transition
+  /// and instant on the terminal one, recording what it observed.
+  #[derive(Debug)]
+  struct SlowOnRunningHook {
+    calls: Arc<Mutex<Vec<(TaskId, TaskPhase)>>>,
+  }
+
+  impl ActionHook for SlowOnRunningHook {
+    fn on_transition<'a>(&'a self, transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      let calls = Arc::clone(&self.calls);
+      let id = transition.id().clone();
+      let to = transition.to();
+      let slow = to == TaskPhase::Running;
+      Box::pin(async move {
+        if slow {
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        calls.lock().expect("hook calls").push((id, to));
+        Ok(())
+      })
+    }
+  }
+
+  /// The P2-1 ordering contract on the lane design: one task's
+  /// observations are pinned to one lane's FIFO, so a slow `Running`
+  /// observation is always followed — never overtaken — by the task's
+  /// own terminal observation. Per-observation lane choice would let
+  /// the instant terminal observation overtake the slow one; the old
+  /// predecessor chains preserved order but accumulated unbounded
+  /// detached work behind a wedged hook.
+  #[tokio::test]
+  async fn one_tasks_transition_observations_stay_in_order_on_their_lane() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/slow-running").expect("tag"),
+        Arc::new(SlowOnRunningHook {
+          calls: Arc::clone(&calls),
+        }),
+      )
+      .expect("registration");
+    let (client, _manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
+    .expect("manager");
+    let count = 8;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+      let id = client
+        .submit(
+          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          ok_effect(TaskOutput::SyncRound(())),
+        )
+        .await
+        .expect("admission");
+      handle::<()>(&client, &id, TaskKind::SyncRound)
+        .wait()
+        .await
+        .expect("terminal");
+      ids.push(id);
+    }
+    // Every task contributes exactly two observations (`Running`, then
+    // `Succeeded`; `Pending` is an event only).
+    let expected = count * 2;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+      let recorded = calls.lock().expect("hook calls").len();
+      if recorded == expected {
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the observations never completed: {recorded} of {expected}"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let recorded = calls.lock().expect("hook calls").clone();
+    for id in &ids {
+      let phases: Vec<TaskPhase> = recorded
+        .iter()
+        .filter(|(observed, _)| observed == id)
+        .map(|(_, phase)| *phase)
+        .collect();
+      assert_eq!(
+        phases,
+        vec![TaskPhase::Running, TaskPhase::Succeeded],
+        "task {id} observed out of transition order"
+      );
+    }
   }
 
   #[tokio::test]
