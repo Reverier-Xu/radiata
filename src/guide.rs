@@ -240,6 +240,23 @@
 //!   and tombstones the cleanup checkpoint already collected, so a newly
 //!   connected peer receives the lane's current truth, never its history.
 //!
+//! The name is plain [`ResourceName`](crate::ResourceName) parsing —
+//! pure setup with no node involved, so it doubles as an executed
+//! doctest: the category is fixed to `resources`, and any other
+//! category fails the parse with
+//! [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) instead
+//! of hiding behind `no_run`.
+//!
+//! ```
+//! use radiata::ResourceName;
+//!
+//! let name = ResourceName::parse("example.woooo.tech/resources/edge")?;
+//! assert_eq!(name.as_str(), "example.woooo.tech/resources/edge");
+//! // Any other category — this example's old `config` — is `InvalidInput`.
+//! assert!(ResourceName::parse("example.woooo.tech/config/edge").is_err());
+//! # Ok::<(), radiata::Error>(())
+//! ```
+//!
 //! ```no_run
 //! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
 //! # use radiata::ResourceName;
@@ -248,7 +265,7 @@
 //! // needs no verb — `node.sync()` exists to drive one round now (for
 //! // deterministic tests), not because the plane waits for it; a
 //! // bounded poll like this is the integration's own deadline.
-//! let name = ResourceName::parse("example.woooo.tech/config/edge")?;
+//! let name = ResourceName::parse("example.woooo.tech/resources/edge")?;
 //! let mut waited = 0;
 //! let view = loop {
 //!   if let Some(view) = node.resources().get(name.clone()).await? {
