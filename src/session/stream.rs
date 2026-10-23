@@ -103,6 +103,66 @@ impl SessionPolicy {
   }
 }
 
+/// The node-wide budget on live admitted-stream consumer tasks.
+///
+/// A stream leaves the per-session admitted-stream table when its wire stream
+/// ends, but its consumer keeps running until the accept future finishes
+/// (post-receive work is legitimate and must never be cancelled at the wire
+/// EOF). The per-session `queue_messages` bound cannot see those tasks, so a
+/// node-level lifecycle budget carries them: a slot is reserved before
+/// admission and released when the consumer terminates — including after the
+/// wire EOF, across session replacement, and through the consumer drain.
+/// Past the budget, new opens fail closed with typed `Overloaded`
+/// backpressure instead of growing the node's running task population.
+pub(crate) const MAX_LIVE_CONSUMERS: usize = 1_024;
+
+/// One reserved live-consumer slot: held by the consumer task for its whole
+/// life and released on drop (normal completion, error, abort, or the
+/// node-scoped drain joining it).
+pub(crate) struct ConsumerPermit {
+  _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The node-wide admission counter behind [`ConsumerPermit`].
+#[derive(Clone)]
+pub(crate) struct ConsumerBudget {
+  slots: Arc<tokio::sync::Semaphore>,
+  limit: usize,
+}
+
+impl ConsumerBudget {
+  pub(crate) fn new(limit: usize) -> Self {
+    Self {
+      slots: Arc::new(tokio::sync::Semaphore::new(limit)),
+      limit,
+    }
+  }
+
+  /// Reserves one live-consumer slot for an admission: `None` means the
+  /// node's consumer lifecycle budget is exhausted, which the caller reports
+  /// as typed `Overloaded` backpressure.
+  pub(crate) fn reserve(&self) -> Option<ConsumerPermit> {
+    self
+      .slots
+      .clone()
+      .try_acquire_owned()
+      .ok()
+      .map(|permit| ConsumerPermit { _permit: permit })
+  }
+
+  /// The node-wide bound on live consumers.
+  pub(crate) const fn limit(&self) -> usize {
+    self.limit
+  }
+
+  /// The number of slots currently held by live consumers (regression
+  /// tests observe the lifecycle release through it).
+  #[cfg(test)]
+  pub(crate) fn in_use(&self) -> usize {
+    self.limit.saturating_sub(self.slots.available_permits())
+  }
+}
+
 pub(crate) struct SessionPacketContext {
   pub(super) local: NodeId,
   pub(super) registry: Arc<ExtensionRegistry>,
@@ -129,6 +189,11 @@ pub(crate) struct SessionPacketContext {
   /// The node-scoped tracked task vec: session-exit consumer drains join
   /// it so a teardown cannot abort an in-flight apply unnoticed.
   pub(super) task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+  /// The node-wide budget on live admitted-stream consumer tasks (see
+  /// [`MAX_LIVE_CONSUMERS`]): shared by every session of this node, so a
+  /// consumer that outlives its wire stream — including across session
+  /// replacement — still occupies its slot.
+  pub(super) live_consumers: ConsumerBudget,
   pub(super) parser_limits: crate::protocol::CborLimits,
   /// The acknowledgment budget one forwarded-open hop gets (see
   /// `NodeConfig::with_relay_hop_deadline`).
@@ -164,9 +229,19 @@ impl SessionPacketContext {
       forwarding_capacity,
       route_capacity,
       task_drains,
+      live_consumers: ConsumerBudget::new(MAX_LIVE_CONSUMERS),
       parser_limits,
       relay_hop_deadline,
     }
+  }
+
+  /// Replaces the node-wide live-consumer budget: regression tests shrink
+  /// it so the lifecycle reservation is observable without spawning the
+  /// production-scale population. Call before the context is shared.
+  #[cfg(test)]
+  pub(crate) fn with_live_consumer_budget(mut self, limit: usize) -> Self {
+    self.live_consumers = ConsumerBudget::new(limit);
+    self
   }
 
   /// The node's effective next-hop routing policy tag (the caller
