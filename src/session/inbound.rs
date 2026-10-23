@@ -31,9 +31,17 @@ use crate::{
   transport::connection::ConnectionReader,
 };
 
-/// The number of body chunks buffered per admitted incoming stream before
-/// backpressure stalls the session reader.
+/// The number of body chunks buffered per admitted incoming stream: the
+/// stream's whole flow-control window. A consumer that lets it fill stalls
+/// nothing but its own stream — the session reader applies the explicit
+/// overload policy in [`forward_chunk`] instead.
 const INCOMING_STREAM_CHUNKS: usize = 8;
+
+/// The terminal slot reserved on top of the chunk window: a completed or
+/// interrupted end always queues without waiting for the consumer, so a
+/// body that fits its window always surfaces its exact terminal — and the
+/// bounded channel still never grows beyond window plus terminal.
+const INCOMING_STREAM_TERMINAL_SLOTS: usize = 1;
 
 /// The authenticated grant one established session confers on its read
 /// loop: the exact session incarnation (the identity forwarded hops bind
@@ -276,7 +284,7 @@ async fn read_loop_frames(
           let trace = chunk.trace_id.clone();
           if forward::contains(&context.forwarding, &trace) {
             forward::relay_chunk(&context.forwarding, chunk).await;
-          } else if !forward_chunk(chunk, &mut incoming).await {
+          } else if !forward_chunk(chunk, &mut incoming, frames) {
             warn!(trace_id = %trace, "incoming chunk sequence violation; closing session");
             break;
           }
@@ -293,10 +301,7 @@ async fn read_loop_frames(
             forward::relay_end(&context.forwarding, end).await;
             continue;
           }
-          if let Some(stream) = incoming
-            .remove(&end.trace_id)
-            .map(|admitted| admitted.stream)
-          {
+          if let Some(admitted) = incoming.remove(&end.trace_id) {
             // The typed terminal reason survives the relay: a completed
             // end closes the body normally; an interrupted end (the
             // sending leg died mid-stream) surfaces exactly one typed
@@ -306,7 +311,20 @@ async fn read_loop_frames(
               wire::EndReason::Completed => StreamItem::End,
               wire::EndReason::Interrupted => StreamItem::Interrupted,
             };
-            let _ = stream.send(terminal).await;
+            // The terminal is queued without waiting for the consumer: a
+            // consumer that never drains its window is the stream's own
+            // overload condition, not a reason to stall every other frame
+            // of the session (acks, pongs, other streams). The reserved
+            // terminal slot guarantees the queue succeeds for a live
+            // consumer; a failure means the consumer is gone, and dropping
+            // the sender still ends the body prefix with exactly one typed
+            // `StreamInterrupted`.
+            if admitted.stream.try_send(terminal).is_err() {
+              warn!(
+                trace_id = %end.trace_id,
+                "incoming consumer did not drain its terminal; stream interrupted"
+              );
+            }
           } else {
             // A lost consumer means its session task aborted mid-stream:
             // surface it loudly, because silence here looks like a lost
@@ -500,7 +518,7 @@ async fn admit_open(
           break 'status AckStatus::Overloaded;
         }
         let admitted_at = clock_millis(context.clock.as_ref());
-        let (stream, body) = mpsc::channel(INCOMING_STREAM_CHUNKS);
+        let (stream, body) = mpsc::channel(INCOMING_STREAM_CHUNKS + INCOMING_STREAM_TERMINAL_SLOTS);
         incoming.insert(
           open.trace_id.clone(),
           AdmittedStream {
@@ -580,7 +598,23 @@ async fn admit_open(
 
 /// Forwards one chunk to its admitted stream in strict sequence order.
 /// Returns `false` on a sequence violation (fail closed).
-async fn forward_chunk(chunk: ChunkFrame, incoming: &mut HashMap<TraceId, AdmittedStream>) -> bool {
+/// Forwards one chunk to its admitted stream in strict sequence order.
+/// Returns `false` on a sequence violation (fail closed).
+///
+/// Delivery never awaits the consumer's window: the shared session reader
+/// must stay responsive to the pongs, acknowledgements, and other streams
+/// of the same session, so one stalled consumer cannot park the whole
+/// connection (audit P1-9). The per-stream window is the flow-control bound,
+/// and exhausting it is an explicit overload policy rather than an
+/// unbounded buffer or a blocked reader: the stream is terminated — its
+/// consumer observes exactly one typed `StreamInterrupted` through the
+/// closed body channel — and the origin learns the interruption through a
+/// best-effort failed acknowledgement, exactly the status a destination-side
+/// mid-stream failure reports. The terminal slot stays reserved for the
+/// typed end, so a body that fits its window still completes cleanly.
+fn forward_chunk(
+  chunk: ChunkFrame, incoming: &mut HashMap<TraceId, AdmittedStream>, frames: &BoundedSender,
+) -> bool {
   let Some(admitted) = incoming.get_mut(&chunk.trace_id) else {
     // Unknown or already-terminated stream: drop the chunk.
     return true;
@@ -596,16 +630,35 @@ async fn forward_chunk(chunk: ChunkFrame, incoming: &mut HashMap<TraceId, Admitt
     "incoming chunk forwarded"
   );
   let bytes: Arc<[u8]> = Arc::from(chunk.bytes.as_slice());
-  if admitted
-    .stream
-    .send(StreamItem::Chunk(bytes))
-    .await
-    .is_err()
-  {
-    // The consumer is gone; terminate the incoming stream.
-    incoming.remove(&chunk.trace_id);
+  // The chunk window is the flow-control bound: a chunk never takes the
+  // reserved terminal slot. The read loop is the channel's only sender, so
+  // the check and the send are one decision — no racing sender can steal
+  // the slot between them.
+  let window_full = admitted.stream.capacity() <= INCOMING_STREAM_TERMINAL_SLOTS;
+  let delivered = if window_full {
+    Err(mpsc::error::TrySendError::Full(StreamItem::Chunk(bytes)))
+  } else {
+    admitted.stream.try_send(StreamItem::Chunk(bytes))
+  };
+  match delivered {
+    Ok(()) => true,
+    Err(error) => {
+      // The consumer is gone (closed) or has not drained its window (full).
+      // Either way this stream ends here, explicitly: dropping the sender
+      // closes the body channel, which the consumer surfaces as one typed
+      // `StreamInterrupted`, and the failed status tells the origin to stop
+      // the stream too.
+      let full = matches!(error, mpsc::error::TrySendError::Full(_));
+      warn!(
+        trace_id = %chunk.trace_id,
+        overloaded = full,
+        "incoming stream terminated instead of stalling the session reader"
+      );
+      incoming.remove(&chunk.trace_id);
+      frames.try_send_status(&chunk.trace_id, AckStatus::Failed);
+      true
+    }
   }
-  true
 }
 
 /// Resolves one pending outbound admission. The admitting node is this
@@ -1746,5 +1799,347 @@ mod durable_mirror_tests {
     let records = deliver_failed_ack(&sink, &routes, &trace(43)).await;
 
     assert!(records.is_empty(), "no durable row may be fabricated");
+  }
+}
+
+#[cfg(test)]
+mod slow_consumer_tests {
+  use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::Duration,
+  };
+
+  use futures_util::{StreamExt as _, future::BoxFuture};
+  use minicbor::bytes::ByteVec;
+
+  use super::{FrameSource, INCOMING_STREAM_CHUNKS, SessionGrant, read_loop};
+  use crate::{
+    ExtensionRegistry, FeatureTag, IncomingStream, ProtocolTag,
+    extension_registry::{PacketConsumer, ProtocolDefinition},
+    identity::testing::SequenceEntropy,
+    node::EventHub,
+    packet::wire::{AckStatus, ChunkFrame, OpenFrame},
+    protocol::{
+      CONTROL_CBOR_LIMITS,
+      wire::{BASE_SCHEMA_ID, PacketKind},
+    },
+    routing::forward::SessionIdentity,
+    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    transport::{Received, connection::Message},
+  };
+
+  fn node(value: u8) -> crate::NodeId {
+    crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> crate::TraceId {
+    crate::TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
+  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+
+  /// The authenticated grant of a session that selected the test
+  /// protocol's owning feature: admission requires the negotiated
+  /// selection, so the test grant carries it exactly like a real
+  /// handshake would.
+  fn grant() -> SessionGrant {
+    SessionGrant::new(
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+      vec![FeatureTag::parse(FEATURE).unwrap()],
+    )
+  }
+
+  /// A consumer that holds the admitted stream without draining it until
+  /// the level-triggered gate opens, then records the body's terminal:
+  /// `None` for a completed body, `Some(kind)` for exactly one typed
+  /// interruption.
+  #[derive(Debug)]
+  struct GatedConsumer {
+    gate: tokio::sync::watch::Receiver<bool>,
+    terminal: Arc<Mutex<Option<Option<crate::ErrorKind>>>>,
+  }
+
+  impl PacketConsumer for GatedConsumer {
+    fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, crate::Result<()>> {
+      let mut gate = self.gate.clone();
+      let terminal = Arc::clone(&self.terminal);
+      Box::pin(async move {
+        while !*gate.borrow_and_update() {
+          let _ = gate.changed().await;
+        }
+        let mut body = packet.body();
+        let outcome = loop {
+          match body.next().await {
+            Some(Ok(_)) => continue,
+            Some(Err(error)) => break Some(error.kind()),
+            None => break None,
+          }
+        };
+        terminal.lock().unwrap().replace(outcome);
+        Ok(())
+      })
+    }
+  }
+
+  /// Yields the queued wire messages in order, then ends the session
+  /// orderly.
+  struct FramesSource {
+    messages: std::collections::VecDeque<Message>,
+  }
+
+  impl FrameSource for FramesSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      let message = self.messages.pop_front();
+      Box::pin(async move { Ok(message.map(Received::Message)) })
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      0
+    }
+  }
+
+  fn open_frame(seed: u32) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::Open.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_open(&OpenFrame {
+        trace_id: trace(seed),
+        source: node(2),
+        destination: node(1),
+        protocol: ProtocolTag::parse(PROTOCOL).unwrap(),
+        metadata: crate::StreamMetadata::new(),
+        route: None,
+      })
+      .unwrap(),
+    }
+  }
+
+  fn chunk_frame(seed: u32, sequence: u64) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::Chunk.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_chunk(&ChunkFrame {
+        trace_id: trace(seed),
+        sequence,
+        bytes: ByteVec::from(vec![7; 8]),
+      })
+      .unwrap(),
+    }
+  }
+
+  fn context(registry: Arc<ExtensionRegistry>) -> SessionPacketContext {
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    SessionPacketContext::new(
+      node(1),
+      registry,
+      SessionPolicy::new(
+        8,
+        1 << 20,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+      ),
+      crate::runtime::RuntimeClient::routing_only(
+        tokio::sync::mpsc::channel(4).0,
+        Arc::new(Mutex::new(BTreeMap::new())),
+      ),
+      Arc::new(crate::time::HostWallClock),
+      entropy,
+      Arc::new(EventHub::new()),
+      crate::routing::DefaultNextHop::tag().unwrap(),
+      Arc::new(Mutex::new(BTreeMap::new())),
+      Arc::new(Mutex::new(BTreeMap::new())),
+      None,
+      8,
+      16,
+      Arc::new(Mutex::new(Vec::new())),
+      CONTROL_CBOR_LIMITS,
+      Duration::from_secs(5),
+    )
+  }
+
+  /// Regression (audit P1-9): a consumer that never drains its bounded
+  /// window must not stall the session's shared read loop. The window
+  /// (`INCOMING_STREAM_CHUNKS`) fills, the overflowing chunk terminates
+  /// the stream with the explicit overload policy — the origin learns it
+  /// through a typed failed acknowledgement, the consumer later observes
+  /// exactly one typed interruption — and the reader keeps processing
+  /// frames after the overload until the orderly end. Before the fix the
+  /// reader parked on the full channel and the session went mute.
+  #[tokio::test]
+  async fn an_undrained_window_terminates_the_stream_without_stalling_the_reader() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      terminal: Arc::new(Mutex::new(None)),
+    });
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        Arc::clone(&consumer) as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    let context = context(Arc::new(registry));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // The window fills, then the next chunk overflows it.
+    let mut messages = Vec::new();
+    messages.push(open_frame(9));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64 + 1) {
+      messages.push(chunk_frame(9, sequence));
+    }
+    // Frames after the overload still get processed: the terminal end for
+    // the terminated trace (now unknown — dropped with a warning) and the
+    // orderly session end both prove the loop kept running.
+    messages.push(Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(9),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    });
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop must not stall on an undrained consumer window");
+
+    // The origin saw the admission, then the typed failure from the
+    // overload policy.
+    let ack = frames_rx.recv().await.unwrap();
+    assert_eq!(ack.kind, PacketKind::Ack);
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.trace_id, trace(9));
+    assert_eq!(ack.status, AckStatus::Admitted);
+    let ack = frames_rx.recv().await.unwrap();
+    assert_eq!(ack.kind, PacketKind::Ack);
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.trace_id, trace(9));
+    assert_eq!(ack.status, AckStatus::Failed);
+
+    // Opening the gate surfaces exactly one typed interruption: the
+    // buffered chunks drain, then the dropped sender ends the prefix as
+    // interrupted — never a silent truncation.
+    gate_tx.send(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      if let Some(terminal) = consumer.terminal.lock().unwrap().take() {
+        assert_eq!(terminal, Some(crate::ErrorKind::StreamInterrupted));
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the gated consumer must finish after its gate opens"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  /// The same bounded window with a stream that completes within it still
+  /// delivers a clean terminal: exactly one completed end, no failure.
+  #[tokio::test]
+  async fn a_stream_within_the_window_receives_the_completed_terminal() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      terminal: Arc::new(Mutex::new(None)),
+    });
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        Arc::clone(&consumer) as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    let context = context(Arc::new(registry));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // A body that fits the window: the wire end queues as the terminal
+    // even while the consumer stays gated shut.
+    let mut messages = Vec::new();
+    messages.push(open_frame(10));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64) {
+      messages.push(chunk_frame(10, sequence));
+    }
+    messages.push(Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(10),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    });
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop ends orderly");
+
+    let ack = frames_rx.recv().await.unwrap();
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.status, AckStatus::Admitted);
+
+    gate_tx.send(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      if let Some(terminal) = consumer.terminal.lock().unwrap().take() {
+        assert_eq!(terminal, None, "a completed end is a clean terminal");
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the gated consumer must finish after its gate opens"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
   }
 }
