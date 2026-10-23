@@ -434,7 +434,10 @@ pub(crate) async fn terminate_stale(
 /// Applies one retention pass over the trace namespace: terminal records
 /// past their host-wall-clock deadline are removed first, then the oldest
 /// terminals down to the caller-selected cap. Active records are never
-/// removed. Returns how many records were removed.
+/// removed. Returns how many records the store committed for removal: an
+/// uncommitted batch (conflict, abort, or indeterminate outcome)
+/// contributes nothing, so the caller's live-record counter never drops
+/// below the records the store actually holds.
 pub(crate) async fn sweep(
   store: &MetadataStore, entropy: &dyn Entropy, clock: &dyn WallClock, terminal_cap: usize,
   retention: Duration,
@@ -481,9 +484,11 @@ pub(crate) async fn sweep(
     }
   }
   drop(scan);
-  // Enforce the terminal cap oldest-first across fresh terminals after the
-  // expired ones leave.
-  let overflow = (expired.len() + fresh_terminals.len()).saturating_sub(terminal_cap);
+  // The terminal cap bounds the population that remains once the expired
+  // terminals leave: they are deleted by this same sweep, so charging
+  // them against the cap would evict fresh terminals below the caller's
+  // bound. Enforce it oldest-first across the fresh terminals.
+  let overflow = fresh_terminals.len().saturating_sub(terminal_cap);
   let mut removals: Vec<(crate::StoreKey, crate::Digest)> = expired
     .into_iter()
     .map(|(key, digest, _)| (key, digest))
@@ -497,7 +502,9 @@ pub(crate) async fn sweep(
         .map(|(key, digest, _)| (key, digest)),
     );
   }
-  let total = removals.len();
+  // Only the store's committed batches count: the live-record counter
+  // reads this number, and an uncommitted batch leaves every record in
+  // place for the next bounded pass to retry.
   let operations = removals
     .into_iter()
     .map(|(key, digest)| crate::StoreOperation::Delete {
@@ -506,8 +513,7 @@ pub(crate) async fn sweep(
       expected: digest,
     })
     .collect();
-  apply_batched(store, entropy, operations).await?;
-  Ok(total)
+  apply_batched(store, entropy, operations).await
 }
 
 /// Applies up to [`MAX_BATCH_OPERATIONS`] conditional operations per
@@ -552,8 +558,9 @@ async fn commit_batch(
 #[cfg(test)]
 mod tests {
   use std::{
+    collections::VecDeque,
     sync::{
-      Arc,
+      Arc, Mutex,
       atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, UNIX_EPOCH},
@@ -570,7 +577,7 @@ mod tests {
       lifecycle,
       testing::{ScriptedKeys, SequenceEntropy},
     },
-    provider::StorageFactory,
+    provider::{Storage, StorageFactory, StoreScan, StoreSnapshot},
     storage::{MetadataStore, contract::helpers::ManualClock},
     time::WallClock,
   };
@@ -1026,6 +1033,361 @@ mod tests {
     .unwrap();
     assert_eq!(removed, 1);
     assert!(all_records(&store).await.is_empty());
+  }
+
+  // The terminal cap bounds the population that survives the expiry pass
+  // of the same sweep: charging the already-expired terminals against the
+  // cap evicted fresh terminals below the caller's bound.
+  #[tokio::test]
+  async fn sweep_charges_the_terminal_cap_after_expiry() {
+    let (_factory, store, clock) = open_store().await;
+    let terminal = |seed: u32, at| {
+      TraceRecord::new(trace(seed), node(1), node(9), at)
+        .with_transition(super::TraceTransition::Delivered, at)
+    };
+
+    // Two terminals that will expire, then two written one hundred
+    // seconds later that stay fresh.
+    for seed in [10_u32, 11] {
+      put_trace(
+        &store,
+        &SystemEntropy,
+        clock.as_ref(),
+        terminal(seed, clock.now()),
+      )
+      .await
+      .unwrap();
+    }
+    clock.set(clock.now() + Duration::from_secs(100));
+    for seed in [12_u32, 13] {
+      put_trace(
+        &store,
+        &SystemEntropy,
+        clock.as_ref(),
+        terminal(seed, clock.now()),
+      )
+      .await
+      .unwrap();
+    }
+
+    // Cap three: four terminals exist, but only the two expired ones
+    // leave — the fresh population (two) already fits the cap.
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      clock.as_ref(),
+      3,
+      Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 2);
+    let survivors = all_records(&store).await;
+    assert_eq!(survivors.len(), 2);
+    assert!(
+      survivors
+        .iter()
+        .all(|record| record.phase() == &TracePhase::Delivered)
+    );
+    let ids: Vec<_> = survivors.iter().map(|record| record.trace_id()).collect();
+    assert!(ids.contains(&&trace(12)) && ids.contains(&&trace(13)));
+  }
+
+  // The sweep reports the store's committed deletion count: with more
+  // removals than one transaction batch holds, the count covers every
+  // committed batch and nothing else.
+  #[tokio::test]
+  async fn sweep_returns_committed_removals_across_batches() {
+    let (_factory, store, clock) = open_store().await;
+    let total = super::MAX_BATCH_OPERATIONS * 2 + 6;
+    for seed in 0..total as u32 {
+      let record = TraceRecord::new(trace(seed), node(1), node(9), clock.now())
+        .with_transition(super::TraceTransition::Delivered, clock.now());
+      put_trace(&store, &SystemEntropy, clock.as_ref(), record)
+        .await
+        .unwrap();
+    }
+
+    // A zero retention expires every terminal on this pass, and the cap
+    // never binds: three batches (64 + 64 + 6) all commit.
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      clock.as_ref(),
+      usize::MAX,
+      Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, total);
+    assert!(all_records(&store).await.is_empty());
+  }
+
+  // ---- Commit-scripted store: the returned-count contract per batch outcome
+  // ----
+
+  /// The commit outcome injected into one scripted batch.
+  #[derive(Clone, Copy, Debug)]
+  enum ScriptedBatch {
+    Committed,
+    Conflict,
+    Aborted,
+    Unknown,
+  }
+
+  #[derive(Debug)]
+  struct ScriptedSweepState {
+    commits: Mutex<VecDeque<ScriptedBatch>>,
+    records: Vec<crate::StoreEntry>,
+  }
+
+  /// A storage whose snapshots serve a fixed trace-record population and
+  /// whose commits play a fixed outcome script: the in-memory reference
+  /// store cannot produce Conflict, Aborted, or Unknown on demand, and
+  /// the sweep's returned-count contract must hold for every outcome.
+  #[derive(Debug)]
+  struct ScriptedSweepStorage {
+    state: Arc<ScriptedSweepState>,
+  }
+
+  #[derive(Debug)]
+  struct ScriptedSweepFactory {
+    state: Arc<ScriptedSweepState>,
+  }
+
+  #[derive(Debug)]
+  struct ScriptedSweepSnapshot {
+    records: Vec<crate::StoreEntry>,
+    revision: crate::StoreRevision,
+  }
+
+  impl StoreSnapshot for ScriptedSweepSnapshot {
+    fn revision(&self) -> &crate::StoreRevision {
+      &self.revision
+    }
+
+    fn get<'a>(
+      &'a self, namespace: &'a crate::StoreNamespace, key: &'a crate::StoreKey,
+    ) -> crate::BoxFuture<'a, crate::Result<Option<crate::StoreValue>>> {
+      Box::pin(async move {
+        // The production schema baseline keeps the open-time migration
+        // pass on its idempotent Current path.
+        let schema = crate::storage::migration::schema_namespace()?;
+        if namespace == &schema && key == &crate::storage::migration::schema_key() {
+          return Ok(Some(crate::storage::migration::encode_schema_record(
+            crate::storage::migration::BASE_RECORD_KIND,
+            crate::storage::migration::METADATA_SCHEMA_V1,
+            None,
+          )));
+        }
+        Ok(None)
+      })
+    }
+
+    fn scan<'a>(
+      &'a self, namespace: &'a crate::StoreNamespace, _prefix: &'a [u8],
+    ) -> crate::BoxFuture<'a, crate::Result<Box<dyn StoreScan + 'a>>> {
+      let records: Vec<_> = self
+        .records
+        .iter()
+        .filter(|entry| entry.namespace() == namespace)
+        .cloned()
+        .collect();
+      Box::pin(async move {
+        Ok(Box::new(ScriptedSweepScan {
+          records,
+          position: 0,
+        }) as Box<dyn StoreScan>)
+      })
+    }
+  }
+
+  #[derive(Debug)]
+  struct ScriptedSweepScan {
+    records: Vec<crate::StoreEntry>,
+    position: usize,
+  }
+
+  impl StoreScan for ScriptedSweepScan {
+    fn next<'a>(&'a mut self) -> crate::BoxFuture<'a, crate::Result<Option<crate::StoreEntry>>> {
+      let entry = self.records.get(self.position).cloned();
+      if entry.is_some() {
+        self.position += 1;
+      }
+      Box::pin(async move { Ok(entry) })
+    }
+  }
+
+  impl Storage for ScriptedSweepStorage {
+    fn capabilities(&self) -> crate::StoreCapabilities {
+      crate::storage::contract::required_capabilities()
+    }
+
+    fn snapshot<'a>(&'a self) -> crate::BoxFuture<'a, crate::Result<Box<dyn StoreSnapshot>>> {
+      let records = self.state.records.clone();
+      Box::pin(async move {
+        Ok(Box::new(ScriptedSweepSnapshot {
+          records,
+          revision: crate::StoreRevision::new(Arc::from([1_u8])).unwrap(),
+        }) as Box<dyn StoreSnapshot>)
+      })
+    }
+
+    fn commit<'a>(
+      &'a self, transaction: crate::StoreTransaction,
+    ) -> crate::BoxFuture<'a, crate::Result<crate::CommitOutcome>> {
+      let script = self.state.commits.lock().unwrap().pop_front();
+      Box::pin(async move {
+        // A well-behaved provider echoes the transaction's own identity
+        // back on Committed and Unknown; the script picks the shape.
+        match script {
+          Some(ScriptedBatch::Committed) => {
+            Ok(crate::CommitOutcome::Committed(crate::CommitReceipt::new(
+              transaction.id().clone(),
+              transaction.operation_digest().clone(),
+              crate::StoreRevision::new(Arc::from([2_u8])).unwrap(),
+            )))
+          }
+          Some(ScriptedBatch::Unknown) => Ok(crate::CommitOutcome::Unknown {
+            transaction: transaction.id().clone(),
+            operation_digest: transaction.operation_digest().clone(),
+          }),
+          Some(ScriptedBatch::Conflict) => Ok(crate::CommitOutcome::Conflict),
+          Some(ScriptedBatch::Aborted) | None => Ok(crate::CommitOutcome::Aborted),
+        }
+      })
+    }
+
+    fn reconcile<'a>(
+      &'a self, _transaction: &'a crate::TransactionId, _digest: &'a crate::Digest,
+    ) -> crate::BoxFuture<'a, crate::Result<crate::ReconcileOutcome>> {
+      Box::pin(async { Ok(crate::ReconcileOutcome::Aborted) })
+    }
+
+    fn flush<'a>(&'a self) -> crate::BoxFuture<'a, crate::Result<()>> {
+      Box::pin(async { Ok(()) })
+    }
+  }
+
+  impl StorageFactory for ScriptedSweepFactory {
+    fn open<'a>(
+      &'a self, _requirements: crate::StoreRequirements,
+    ) -> crate::BoxFuture<'a, crate::Result<Box<dyn Storage>>> {
+      let state = Arc::clone(&self.state);
+      Box::pin(async move { Ok(Box::new(ScriptedSweepStorage { state }) as Box<dyn Storage>) })
+    }
+  }
+
+  /// Opens a scripted store whose scans serve `seeds` expired terminal
+  /// records and whose commits play `script` in order.
+  async fn scripted_sweep_store(seeds: usize, script: &[ScriptedBatch]) -> MetadataStore {
+    let records = (0..seeds)
+      .map(|seed| {
+        let record = TraceRecord::new(trace(seed as u32), node(1), node(9), UNIX_EPOCH)
+          .with_transition(super::TraceTransition::Delivered, UNIX_EPOCH);
+        crate::StoreEntry::new(
+          crate::StoreNamespace::new(crate::QualifiedTag::parse(TRACE_NAMESPACE).unwrap()),
+          super::key(record.trace_id()),
+          crate::StoreValue::new(Arc::from(record.encode().unwrap())),
+        )
+      })
+      .collect();
+    let state = Arc::new(ScriptedSweepState {
+      commits: Mutex::new(script.iter().copied().collect()),
+      records,
+    });
+    let factory: Arc<dyn StorageFactory> = Arc::new(ScriptedSweepFactory { state });
+    MetadataStore::open(&factory, Duration::from_secs(30))
+      .await
+      .unwrap()
+  }
+
+  /// A host clock far past the scripted records' `UNIX_EPOCH` write
+  /// instant, so a one-second retention expires every scripted record.
+  fn expired_sweep_clock() -> Arc<ManualClock> {
+    Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(10_000)))
+  }
+
+  #[tokio::test]
+  async fn sweep_counts_a_committed_batch() {
+    let store = scripted_sweep_store(2, &[ScriptedBatch::Committed]).await;
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      expired_sweep_clock().as_ref(),
+      128,
+      Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 2);
+  }
+
+  #[tokio::test]
+  async fn sweep_counts_a_conflicted_batch_as_zero() {
+    let store = scripted_sweep_store(2, &[ScriptedBatch::Conflict]).await;
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      expired_sweep_clock().as_ref(),
+      128,
+      Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 0);
+  }
+
+  #[tokio::test]
+  async fn sweep_counts_an_aborted_batch_as_zero() {
+    let store = scripted_sweep_store(2, &[ScriptedBatch::Aborted]).await;
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      expired_sweep_clock().as_ref(),
+      128,
+      Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 0);
+  }
+
+  #[tokio::test]
+  async fn sweep_counts_an_indeterminate_batch_as_zero() {
+    let store = scripted_sweep_store(2, &[ScriptedBatch::Unknown]).await;
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      expired_sweep_clock().as_ref(),
+      128,
+      Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 0);
+  }
+
+  // A multi-batch sweep whose later batch fails credits only the
+  // committed share: the planned count would strand the live-record
+  // counter below the records the store still holds.
+  #[tokio::test]
+  async fn sweep_returns_only_the_committed_share_of_a_partial_batch_run() {
+    let store = scripted_sweep_store(
+      super::MAX_BATCH_OPERATIONS + 6,
+      &[ScriptedBatch::Committed, ScriptedBatch::Conflict],
+    )
+    .await;
+    let removed = sweep(
+      &store,
+      &SystemEntropy,
+      expired_sweep_clock().as_ref(),
+      128,
+      Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, super::MAX_BATCH_OPERATIONS);
   }
 
   // ---- Bounded terminal-record queue: overflow drops and its counter ----
