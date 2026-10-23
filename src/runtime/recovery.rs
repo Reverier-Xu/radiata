@@ -1,14 +1,14 @@
 //! The recovery plane: the known-online healing policy over the
-//! authenticated session set, forward-entry selection for packet relay,
-//! and the recovery-observation worker that drives the bounded recovery
-//! tick and the retention sweeps off the supervisor's select loop.
+//! authenticated session set and the recovery-observation worker that
+//! drives the bounded recovery tick and the retention sweeps off the
+//! supervisor's select loop.
 
 use std::sync::Arc;
 
 use tracing::debug;
 
 use super::supervisor::{Supervisor, TickState, dial_member};
-use crate::{Endpoint, Error, NodeId, Result, session::stream::SessionEntry};
+use crate::{Endpoint, Error, NodeId, Result};
 
 /// The recovery controller's observation period (unnamed literal kept
 /// every other period out of `NodeConfig`).
@@ -95,75 +95,6 @@ impl Departed {
 const RECOVERY_PRUNE_COOLDOWN_TICKS: u32 = 4;
 
 impl Supervisor {
-  /// Resolves one live downstream session for a routed first hop through
-  /// the node's effective next-hop policy (the caller selection, or the
-  /// built-in default policy). `Ok(None)` means no eligible hop exists and
-  /// the caller fails the route explicitly.
-  pub(super) async fn select_forward_entry(
-    &self, trace: &crate::TraceId, destination: &NodeId,
-  ) -> Result<Option<SessionEntry>> {
-    let tag = self.dependencies.config.route_policy()?;
-    let local = self.packet.local().clone();
-    let peers = crate::sync_common::alive_peers(&self.dependencies.sessions)?;
-    let hop = match crate::routing::resolve_next_hop(
-      &self.dependencies.extensions,
-      &tag,
-      trace,
-      destination,
-      &local,
-      &peers,
-    )
-    .await
-    {
-      Ok(Some(hop)) => hop,
-      Ok(None) => {
-        tracing::warn!(tag = %tag, "configured route policy is not registered");
-        return Ok(None);
-      }
-      Err(error) => return Err(error),
-    };
-    let entry = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .get(&hop)
-      .filter(|entry| entry.alive())
-      .cloned();
-    debug!(hop = %hop, selected = entry.is_some(), "forward candidate resolved");
-    Ok(entry)
-  }
-  /// Resolves one matching-node target to exactly one eligible
-  /// destination: the registered load-balancing policy selects among the
-  /// incrementally streamed candidates, and core independently validates
-  /// the pick against the authoritative descriptors — an unknown, removed,
-  /// or nonmatching node fails closed before any frame moves.
-  pub(super) async fn select_matching_destination(
-    &self, selector: &crate::Selector, load_balancer: Option<&crate::QualifiedTag>,
-  ) -> Result<NodeId> {
-    let Some(load_balancer) = load_balancer else {
-      return Err(Error::invalid_input("packet load balancer"));
-    };
-    let policy = self
-      .dependencies
-      .extensions
-      .load_balancer(load_balancer)
-      .ok_or_else(|| Error::invalid_input("packet load balancer"))?;
-    let snapshot = self.context()?.store().snapshot().await?;
-    let reader = crate::routing::StoreCandidateReader::new(snapshot);
-    let selected = policy.select(selector, &reader).await?;
-    // Authoritative re-validation of the selected destination.
-    let descriptor =
-      crate::membership::store::read_descriptor_ctx(self.context()?.store(), &selected).await?;
-    let Some(descriptor) = descriptor else {
-      return Err(Error::not_found("packet destination"));
-    };
-    if descriptor.removed() || !selector.matches(descriptor.labels()) {
-      return Err(Error::not_trusted("packet destination"));
-    }
-    Ok(selected)
-  }
-
   /// The public recovery observation: whether every known online member
   /// has an authenticated path, how many members remain unreachable, and
   /// the next scheduled attempt.
