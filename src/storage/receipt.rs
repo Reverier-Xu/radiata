@@ -28,6 +28,37 @@ const RETENTION_SWEEP_DOMAIN: &[u8] = b"radiata.woooo.tech/receipt-retention/swe
 /// whether the scan stopped at the bound.
 pub(crate) const RETENTION_SWEEP_BOUND: usize = 4096;
 
+/// The in-memory resumption cursor of the bounded retention scan: the
+/// last anchor key one pass examined, so the next pass resumes strictly
+/// after it instead of rescanning the same retained prefix forever.
+/// A pass whose scan runs to its natural end resets the cursor, so the
+/// rotation keeps every anchored receipt reachable and a long
+/// not-yet-due prefix can never starve the due anchors behind it.
+/// In-memory by design: a durable cursor would commit one permanent
+/// used-ID receipt per pass, defeating the retention it drives.
+#[derive(Debug, Default)]
+pub(crate) struct RetentionScanCursor {
+  position: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl RetentionScanCursor {
+  /// Reads the resumption position; a poisoned lock degrades to a
+  /// fresh scan from the prefix head, which is correct and only less
+  /// efficient.
+  fn position(&self) -> Option<Vec<u8>> {
+    self.position.lock().ok().and_then(|guard| guard.clone())
+  }
+
+  /// Advances to the next resumption position: the last examined key
+  /// when the pass stopped at its bound, or `None` to restart from the
+  /// head once the scan ran to its end.
+  fn advance(&self, position: Option<Vec<u8>>) {
+    if let Ok(mut guard) = self.position.lock() {
+      *guard = position;
+    }
+  }
+}
+
 /// The outcome of one retention sweep; the public report lives in the
 /// view module.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -442,28 +473,43 @@ impl MetadataStore {
 
   /// Applies receipt retention over every anchored receipt: the cleanup
   /// state machine forgets the ones past their deadline and retains the
-  /// rest, so one explicit host-triggered pass advances the whole
-  /// anchored population one idempotent step. Unanchored receipts stay
-  /// untouched: anchoring is the owning state machine's decision, and a
-  /// receipt that still carries owner references must never grow an
-  /// anchor.
+  /// rest, so one explicit host-triggered pass advances the anchored
+  /// population one idempotent step. The pass examines at most
+  /// [`RETENTION_SWEEP_BOUND`] anchor entries — due or not — and the
+  /// next pass resumes strictly after the last examined key (see
+  /// [`RetentionScanCursor`]), so neither the scan nor a long
+  /// not-yet-due prefix can starve the due anchors behind it.
+  /// Unanchored receipts stay untouched: anchoring is the owning state
+  /// machine's decision, and a receipt that still carries owner
+  /// references must never grow an anchor.
   pub(crate) async fn apply_receipt_retention(&self) -> crate::Result<ReceiptRetentionReport> {
     let namespace = internal_namespace()?;
     let snapshot = self.snapshot().await?;
     let mut targets = Vec::new();
-    let mut scan = snapshot.scan(&namespace, ELIGIBILITY_ANCHOR_TAG).await?;
+    let mut examined = 0_usize;
+    let mut last_examined: Option<Vec<u8>> = None;
+    let mut stopped_at_bound = false;
+    let cursor = self.retention_scan_cursor.position();
+    let mut scan = snapshot
+      .scan_from(&namespace, ELIGIBILITY_ANCHOR_TAG, cursor.as_deref())
+      .await?;
     while let Some(entry) = scan.next().await? {
-      if targets.len() >= RETENTION_SWEEP_BOUND {
-        // The pass stays latency-bounded: the already-collected due
-        // targets flow into the cleanup loop below and the report says
-        // the scan stopped at the bound, so the next pass continues.
+      if examined >= RETENTION_SWEEP_BOUND {
+        // The pass stays latency-bounded over every scanned entry, due
+        // or not: the already-collected due targets still reach the
+        // cleanup loop below, and the cursor makes the next pass
+        // resume here instead of rescanning the same retained prefix.
         tracing::debug!(
+          examined,
           target_count = targets.len(),
           "receipt retention scan stopped at sweep bound"
         );
+        stopped_at_bound = true;
         break;
       }
       let key = entry.key().as_bytes();
+      last_examined = Some(key.to_vec());
+      examined += 1;
       let transaction = key
         .strip_prefix(ELIGIBILITY_ANCHOR_TAG)
         .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
@@ -484,6 +530,14 @@ impl MetadataStore {
     }
     drop(scan);
     drop(snapshot);
+    // The cursor advances before the cleanup loop on purpose: a failing
+    // cleanup must not pin the sweep to one segment forever, and the
+    // rotation revisits skipped targets on later passes.
+    self.retention_scan_cursor.advance(if stopped_at_bound {
+      last_examined
+    } else {
+      None
+    });
 
     let mut forgotten = 0_u64;
     for target in &targets {
@@ -498,7 +552,7 @@ impl MetadataStore {
     }
     Ok(ReceiptRetentionReport {
       forgotten,
-      remaining: targets.len() >= RETENTION_SWEEP_BOUND,
+      remaining: stopped_at_bound,
     })
   }
 }
@@ -1321,5 +1375,60 @@ mod receipt_retention_tests {
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(report.forgotten, 1);
     assert!(!report.remaining);
+  }
+
+  /// The anti-starvation property of the rotating scan: a retained
+  /// (not-yet-due) prefix longer than the sweep bound must not pin
+  /// every pass to the same prefix — the cursor resumes after the last
+  /// examined key, so the due anchor behind the prefix is still reached
+  /// (regression: the bound used to count only due targets, so one pass
+  /// scanned the whole retained prefix unbounded and a prefix-first
+  /// layout could never progress past it).
+  #[tokio::test]
+  async fn retention_sweep_rotates_past_a_retained_prefix_longer_than_the_bound() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    // The due anchor sorts last: anchor it first under the early clock,
+    // then fill the whole bound-sized prefix with later-anchored
+    // receipts whose deadlines are still ahead.
+    commit_and_anchor(&store, RETENTION_SWEEP_BOUND as u64).await;
+    clock.set(UNIX_EPOCH + Duration::from_secs(200));
+    for index in 0..RETENTION_SWEEP_BOUND as u64 {
+      commit_and_anchor(&store, index).await;
+    }
+
+    // The first pass examines exactly the retained prefix, stops at
+    // the bound without scanning further, and forgets nothing.
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(
+      report.remaining,
+      "the scan stopped inside the retained prefix"
+    );
+
+    // The next pass resumes after the prefix and reaches the due
+    // anchor behind it instead of rescanning the same prefix forever.
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(
+      report.forgotten, 1,
+      "the rotation must reach the due anchor"
+    );
+    assert!(!report.remaining, "the scan ran past the last anchor");
+
+    // Once the prefix itself becomes due, the wrapped cursor drains it
+    // across bounded passes exactly like a fresh population: the pass
+    // left behind is exactly one bound large, so the scan runs to its
+    // natural end without stopping at the bound.
+    clock.set(UNIX_EPOCH + Duration::from_secs(300));
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, RETENTION_SWEEP_BOUND as u64);
+    assert!(
+      !report.remaining,
+      "a bound-sized remainder drains fully in one pass"
+    );
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining, "the population is fully drained");
   }
 }
