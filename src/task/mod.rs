@@ -494,6 +494,50 @@ pub(crate) struct TaskObserver {
   pub(crate) stop: watch::Receiver<bool>,
 }
 
+impl TaskObserver {
+  /// The watch/shutdown arbitration every wait composes — the typed
+  /// [`Task::wait`] and the node api's id-based wait: resolves with the
+  /// terminal status record once the id terminalizes (value-based: an
+  /// already-terminal id resolves immediately, so there is no
+  /// missed-transition race), and with the typed shutdown failure
+  /// once the manager's terminal publication can no longer arrive
+  /// (the status watch closed, or the stop signal reached a kind the
+  /// shutdown drain does not await). A kind the drain awaits to
+  /// terminality (the journaled leave and frozen-journal resolution)
+  /// still resolves with its real outcome: the manager publishes it
+  /// before the drain completes.
+  pub(crate) async fn await_terminal(
+    &self, id: &TaskId, kind: &TaskKind,
+  ) -> Result<TaskStatusRecord> {
+    let Some(mut status) = self.table.watch(id) else {
+      return Err(Error::not_found("task"));
+    };
+    let mut stop = self.stop.clone();
+    loop {
+      let record = status.borrow().clone();
+      if record.phase.is_terminal() {
+        return Ok(record);
+      }
+      // The task will never terminalize once either watch closes, or
+      // once the stop signal reaches a kind the drain does not await.
+      let stopped = tokio::select! {
+        changed = status.changed() => changed.is_err(),
+        changed = stop.changed() => changed.is_err() || !kind.drains_on_shutdown(),
+      };
+      if stopped {
+        // The terminal publication can land in the same wake as the
+        // stop signal (the manager publishes before it stops), so the
+        // outcome is still read before the typed shutdown failure.
+        let record = status.borrow().clone();
+        if record.phase.is_terminal() {
+          return Ok(record);
+        }
+        return Err(Error::shutting_down("task wait"));
+      }
+    }
+  }
+}
+
 /// The sealed bound behind every typed task handle: it maps a stored
 /// [`TaskOutput`] variant to the verb's historical return type, once
 /// per verb output, and only this crate can implement it.
@@ -700,59 +744,37 @@ impl<T: TaskResult> Task<T> {
   /// its real outcome: the manager publishes it before the drain
   /// completes.
   pub async fn wait(self) -> Result<T> {
-    let Some(mut status) = self.observer.table.watch(&self.id) else {
-      return Err(Error::not_found("task"));
-    };
-    let mut stop = self.observer.stop.clone();
-    loop {
-      if let Some(result) = resolve_terminal::<T>(&self.id, &status, &self.observer.table) {
-        return result;
-      }
-      // The task will never terminalize once either watch closes, or
-      // once the stop signal reaches a kind the drain does not await.
-      let stopped = tokio::select! {
-        changed = status.changed() => changed.is_err(),
-        changed = stop.changed() => changed.is_err() || !self.kind.drains_on_shutdown(),
-      };
-      if stopped {
-        // The terminal publication can land in the same wake as the
-        // stop signal (the manager publishes before it stops), so the
-        // outcome is still read before the typed shutdown failure.
-        if let Some(result) = resolve_terminal::<T>(&self.id, &status, &self.observer.table) {
-          return result;
-        }
-        return Err(Error::shutting_down("task wait"));
-      }
-    }
+    let record = self.observer.await_terminal(&self.id, &self.kind).await?;
+    resolve_terminal::<T>(record, &self.id, &self.observer.table)
   }
 }
 
-/// Maps one watch snapshot to a terminal result when the record says
-/// terminal: the success path takes (consumes) the secret slot and maps
-/// the stored output through [`TaskResult`]; the failure path rebuilds
-/// the typed error.
+/// Maps one terminal status record to its result: the success path
+/// takes (consumes) the secret slot and maps the stored output through
+/// [`TaskResult`]; the failure path rebuilds the typed error.
 fn resolve_terminal<T: TaskResult>(
-  id: &TaskId, status: &watch::Receiver<TaskStatusRecord>, table: &TaskTable,
-) -> Option<Result<T>> {
-  let record = status.borrow().clone();
+  record: TaskStatusRecord, id: &TaskId, table: &TaskTable,
+) -> Result<T> {
   match record.phase {
     TaskPhase::Succeeded => {
       let collected = table.update(id, |entry| (entry.output.clone(), entry.secret.take()));
-      Some(match collected {
+      match collected {
         // A `Succeeded` entry always carries its output; the missing
         // shapes are internal invariant violations, never caller data.
         Ok(Some((Some(output), secret))) => T::from_output(output, secret),
         Ok(Some((None, _))) => Err(Error::internal(OUTPUT_MISMATCH)),
         Ok(None) => Err(Error::not_found("task")),
         Err(error) => Err(error),
-      })
+      }
     }
-    TaskPhase::Failed => Some(Err(
+    TaskPhase::Failed => Err(
       record
         .error
         .map_or_else(|| Error::internal("task failure"), TaskError::to_error),
-    )),
-    TaskPhase::Pending | TaskPhase::Running => None,
+    ),
+    // The arbitration resolves only at a terminal phase, so a
+    // non-terminal record here is an internal invariant violation.
+    TaskPhase::Pending | TaskPhase::Running => Err(Error::internal("task terminal phase")),
   }
 }
 
@@ -796,15 +818,13 @@ pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
 ///
 /// Hooks registered through
 /// [`ExtensionRegistry::register_action_hook`](crate::ExtensionRegistry::register_action_hook)
-/// observe each transition sequentially in canonical tag order, on the
-/// node's bounded observation lanes — never on the manager task and
+/// observe each transition sequentially in canonical tag order, in the
+/// task's own spawned observation task — never on the manager task and
 /// never on one of the manager's execution slots. One task's
-/// transitions are pinned to one lane, so its observations run in
-/// transition order; a wedged hook parks at most that lane, further
-/// observations on it drop with a warn once the inbox fills, and the
-/// runners are aborted at shutdown. They observe only: an error or a
-/// panic is a `tracing` diagnostic, so no hook can fail, retry, or
-/// delay the task it observes, its slot, or its shutdown drain.
+/// observations run in transition order (each awaits its predecessor);
+/// different tasks never observe through each other. They observe only:
+/// an error or a panic is a `tracing` diagnostic, so no hook can fail,
+/// wedge, or delay a task, its slot, or its shutdown drain.
 pub trait ActionHook: std::fmt::Debug + Send + Sync + 'static {
   fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
     Box::pin(async { Ok(()) })
