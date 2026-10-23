@@ -29,9 +29,14 @@
 //! [`ResourceVersion`](crate::ResourceVersion) tuple: wall-clock
 //! timestamp, writer [`NodeId`](crate::NodeId), removal flag, record
 //! digest. A plain
-//! [`Resources::put`](crate::Resources::put) replaces the
-//! winner unconditionally — a concurrent read-modify-write can silently
-//! lose its update.
+//! [`Resources::put`](crate::Resources::put) carries no expected-version
+//! precondition: the candidate is always admitted, but acceptance never
+//! promises it becomes or stays the winner, so a concurrent
+//! read-modify-write can silently lose its update. A caller that must
+//! know reads the mutation view the task's `wait` returns —
+//! [`accepted`](crate::ResourceMutationView::accepted) versus
+//! [`is_current_winner`](crate::ResourceMutationView::is_current_winner)
+//! — or pins the observed tuple as a precondition.
 //!
 //! Business read-modify-write therefore pins the exact observed tuple
 //! as a precondition. The tuple survives process boundaries: read it
