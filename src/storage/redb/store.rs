@@ -179,6 +179,40 @@ fn take_commit_failure(transaction: &TransactionId) -> Option<redb::CommitError>
   armed.map(|(_, error)| error)
 }
 
+/// Test-only scan-failure injection for the backfill regression (audit
+/// 2026-10-23 P2-9): armed as the number of entries the scan may yield
+/// before failing, and consumed one-shot by the first scan that reaches
+/// the threshold, so the armed fault never leaks into a later open.
+/// `usize::MAX` disarms. Mirrors the crash-hook and landing-hold
+/// pattern: test builds only.
+#[cfg(test)]
+static BACKFILL_SCAN_FAULT_AFTER: std::sync::atomic::AtomicUsize =
+  std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub(crate) fn arm_backfill_scan_fault(after: usize) {
+  BACKFILL_SCAN_FAULT_AFTER.store(after, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn backfill_scan_fault(scanned: usize) -> Result<()> {
+  use std::sync::atomic::Ordering;
+  if scanned < BACKFILL_SCAN_FAULT_AFTER.load(Ordering::SeqCst) {
+    return Ok(());
+  }
+  BACKFILL_SCAN_FAULT_AFTER.store(usize::MAX, Ordering::SeqCst);
+  Err(Error::provider(
+    ProviderErrorKind::Io,
+    ProviderErrorContext::StorageOpen,
+  ))
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn backfill_scan_fault(_scanned: usize) -> Result<()> {
+  Ok(())
+}
+
 /// A factory for redb stores rooted at one database file.
 pub(crate) struct RedbStoreFactory {
   path: PathBuf,
@@ -708,7 +742,21 @@ fn backfill_value_digests(database: &Database) -> Result<()> {
     let mut cursor = entries
       .iter()
       .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?;
-    while let Some(Ok((key, value))) = cursor.next() {
+    let mut scanned = 0_usize;
+    // A failing iterator is the open's failure, never a silent early
+    // EOF: the loop surfaces every error before the write transaction
+    // commits, so a partial backfill can never pose as a completed
+    // upgrade (audit 2026-10-23 P2-9).
+    loop {
+      backfill_scan_fault(scanned)?;
+      let entry = cursor
+        .next()
+        .transpose()
+        .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?;
+      let Some((key, value)) = entry else {
+        break;
+      };
+      scanned += 1;
       if digests
         .get(key.value())
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?
@@ -982,5 +1030,88 @@ fn map_table_error(error: redb::TableError, context: ProviderErrorContext) -> Er
     | redb::TableError::TableIsNotMultimap(_)
     | redb::TableError::TableExists(_) => Error::provider(ProviderErrorKind::Io, context),
     _ => Error::provider(ProviderErrorKind::Io, context),
+  }
+}
+
+/// The adapter-local regression lane for the 2026-10-23 P2-9 follow-up:
+/// the backfill scan's error contract. The test drives the real factory
+/// open and the real scan; the only injection is the module's
+/// established test-only fault hook.
+#[cfg(test)]
+mod followup_tests {
+  use redb::{ReadableDatabase, ReadableTableMetadata};
+  use tempfile::TempDir;
+
+  use super::{
+    DIGESTS_TABLE, ENTRIES_TABLE, RedbStoreFactory, arm_backfill_scan_fault, composite_prefix,
+  };
+  use crate::{ErrorKind, StoreRequirements, provider::StorageFactory, storage::test_util};
+
+  /// A failing backfill scan is the open's failure — never a silent
+  /// early EOF that commits a partial digest upgrade and reports the
+  /// open successful (audit 2026-10-23 P2-9): the injected iterator
+  /// error fails the open typed, the digest table stays empty (no
+  /// partial upgrade was committed), and a later open completes the
+  /// whole backfill instead of resuming a mislabeled "finished" one.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn backfill_scan_failure_fails_the_open_and_commits_nothing() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("store.redb");
+    // A legacy file: two entries whose digest sidecar rows are absent
+    // (written through the real entries table the way pre-digest files
+    // were), keyed with the composite prefix the scan iterates.
+    let namespace = test_util::namespace("redb-backfill-fault");
+    let legacy: [(&[u8], &[u8]); 2] = [(b"legacy-a", b"value-a"), (b"legacy-b", b"value-b")];
+    {
+      let database = redb::Database::create(&path).unwrap();
+      let write = database.begin_write().unwrap();
+      {
+        let mut entries = write.open_table(ENTRIES_TABLE).unwrap();
+        for (key, value) in legacy {
+          let composite = composite_prefix(&namespace, key);
+          entries.insert(composite.as_slice(), value).unwrap();
+        }
+      }
+      write.commit().unwrap();
+    }
+
+    // The scan fails after the first legacy entry: the open must fail
+    // with the mapped iterator error instead of succeeding over a
+    // partial scan.
+    arm_backfill_scan_fault(1);
+    let factory = RedbStoreFactory::new(path.clone());
+    let error = factory
+      .open(StoreRequirements::metadata())
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(error.context(), "storage open");
+
+    // No partial upgrade was committed: the digest table is exactly as
+    // empty as the legacy file left it.
+    {
+      let database = redb::Database::create(&path).unwrap();
+      let read = database.begin_read().unwrap();
+      let digests = read.open_table(DIGESTS_TABLE).unwrap();
+      assert_eq!(
+        digests.len().unwrap(),
+        0,
+        "a failed backfill must not commit partial digests"
+      );
+    }
+
+    // The retry completes the whole upgrade: both entries read back
+    // with their persisted digest sidecars through the public snapshot.
+    let factory = RedbStoreFactory::new(path);
+    let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
+    let snapshot = storage.snapshot().await.unwrap();
+    for (key, value) in legacy {
+      let stored = snapshot
+        .get(&namespace, &test_util::key(key))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("the entry {:?} must survive the backfill", key));
+      assert_eq!(stored.as_bytes(), value);
+    }
   }
 }
