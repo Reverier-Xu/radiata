@@ -761,9 +761,9 @@ fn resolve_terminal<T: TaskResult>(
 /// Hooks registered through
 /// [`ExtensionRegistry::register_resource_hook`](crate::ExtensionRegistry::register_resource_hook)
 /// run in canonical tag order. `validate` and `mutate` run on the
-/// caller's admission path, before any IO; `observed` runs in its own
-/// spawned observation task after this node's own commit lands, off the
-/// write task's execution slot.
+/// caller's admission path, before any IO; `observed` runs on the
+/// node's bounded observation lanes after this node's own commit
+/// lands, off the write task's execution slot.
 pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
   /// Rejects a write at admission, before any IO runs. The first
   /// rejection in tag order wins and the verb fails typed with it.
@@ -796,13 +796,15 @@ pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
 ///
 /// Hooks registered through
 /// [`ExtensionRegistry::register_action_hook`](crate::ExtensionRegistry::register_action_hook)
-/// observe each transition sequentially in canonical tag order, in the
-/// task's own spawned observation task — never on the manager task and
+/// observe each transition sequentially in canonical tag order, on the
+/// node's bounded observation lanes — never on the manager task and
 /// never on one of the manager's execution slots. One task's
-/// observations run in transition order (each awaits its predecessor);
-/// different tasks never observe through each other. They observe only:
-/// an error or a panic is a `tracing` diagnostic, so no hook can fail,
-/// wedge, or delay a task, its slot, or its shutdown drain.
+/// transitions are pinned to one lane, so its observations run in
+/// transition order; a wedged hook parks at most that lane, further
+/// observations on it drop with a warn once the inbox fills, and the
+/// runners are aborted at shutdown. They observe only: an error or a
+/// panic is a `tracing` diagnostic, so no hook can fail, retry, or
+/// delay the task it observes, its slot, or its shutdown drain.
 pub trait ActionHook: std::fmt::Debug + Send + Sync + 'static {
   fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
     Box::pin(async { Ok(()) })
