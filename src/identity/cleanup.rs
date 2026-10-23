@@ -188,9 +188,11 @@ pub(crate) async fn sign_cleanup_record(
 /// the same binding (the canonical winner — earliest signed stamp, then
 /// canonical encoding — replaces the loser, so partitioned cleanups
 /// converge), and failing closed for a record over a different binding.
+/// The returned verdict says whether the call changed the family's slot;
+/// notification callers act only on [`TerminalInstall::Installed`].
 pub(crate) async fn persist_cleanup_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &CleanupRecordV1,
-) -> Result<()> {
+) -> Result<records::TerminalInstall> {
   let _permit = store.write_permit().await;
   let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
   let issuer_key = bindings
