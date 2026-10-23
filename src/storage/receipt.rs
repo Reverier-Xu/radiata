@@ -205,15 +205,9 @@ impl MetadataStore {
       return Err(Error::invalid_input("metadata storage reserved namespace"));
     }
     let namespace = internal_namespace()?;
-    let groups = group_receipt_changes(&id, changes)?;
     let mut operations = caller_operations;
-    for group in &groups {
-      let built = build_receipt_change_operations(snapshot, &namespace, &id, group).await?;
-      operations
-        .try_reserve_exact(built.len())
-        .map_err(|_| Error::resource_exhausted("metadata storage transaction"))?;
-      operations.extend(built);
-    }
+    extend_with_receipt_change_operations(snapshot, &namespace, &id, changes, &mut operations)
+      .await?;
     prepare_internal_transaction(id, snapshot.revision().clone(), operations)
   }
 
@@ -786,6 +780,26 @@ pub(super) async fn build_receipt_change_operations(
   Ok(operations)
 }
 
+/// Expands receipt-reference changes into their grouped final head,
+/// edge, and anchor operations against one immutable snapshot and
+/// appends them to `operations`: the single owner-local expansion seam
+/// every prepare and cleanup site funnels through, so the grouping,
+/// group order, and transaction budget cannot drift between sites.
+pub(super) async fn extend_with_receipt_change_operations(
+  snapshot: &dyn StoreSnapshot, namespace: &StoreNamespace, self_id: &TransactionId,
+  changes: Vec<ReceiptReferenceChange>, operations: &mut Vec<StoreOperation>,
+) -> crate::Result<()> {
+  let groups = group_receipt_changes(self_id, changes)?;
+  for group in &groups {
+    let built = build_receipt_change_operations(snapshot, namespace, self_id, group).await?;
+    operations
+      .try_reserve_exact(built.len())
+      .map_err(|_| Error::resource_exhausted("metadata storage transaction"))?;
+    operations.extend(built);
+  }
+  Ok(())
+}
+
 async fn build_self_reference_operations(
   snapshot: &dyn StoreSnapshot, namespace: &StoreNamespace, self_id: &TransactionId,
   tokens: &[ReceiptReferenceToken], additional: u64,
@@ -852,21 +866,17 @@ pub(super) async fn build_pending_record_delete_operations(
     verify_live_marker(snapshot, &namespace, target.transaction()).await?,
     LiveMarker::Active(_)
   ) {
-    let groups = group_receipt_changes(
+    extend_with_receipt_change_operations(
+      snapshot,
+      &namespace,
       operation_id,
       vec![ReceiptReferenceChange::Remove {
         target: target.clone(),
         tokens: vec![token.clone()],
       }],
-    )?;
-    for group in &groups {
-      let built =
-        build_receipt_change_operations(snapshot, &namespace, operation_id, group).await?;
-      operations
-        .try_reserve_exact(built.len())
-        .map_err(|_| Error::resource_exhausted("pending cleanup transaction"))?;
-      operations.extend(built);
-    }
+      &mut operations,
+    )
+    .await?;
   }
   Ok(operations)
 }
