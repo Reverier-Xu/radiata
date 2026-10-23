@@ -389,31 +389,30 @@ impl TickState {
       // than the configured dial deadline plus the authentication
       // deadline); the result is reconciled by the next observation
       // tick.
-      self
-        .recovery_pending
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      let transport = match self.extensions.resolve_transport(&endpoint.selector()) {
+        Ok(transport) => transport,
+        // No transport for the endpoint: the dial cannot even start, so
+        // no in-flight slot is taken.
+        Err(error) => {
+          tracing::debug!(endpoint = %endpoint.as_str(), kind = ?error.kind(), "recovery dial unresolvable");
+          continue;
+        }
+      };
+      // The scoped permit holds this dial's fan-out slot for the whole
+      // task: a live local across the dial's await, dropped on
+      // completion, panic unwind, or cancellation — the counter stays
+      // the in-flight bound, never a lifetime volume (audit P2-12).
+      let permit = DialPermit::acquire(Arc::clone(&self.recovery_pending));
       let receiver = endpoint.clone();
       let peer = member.clone();
       let driver = self.driver.clone();
       let sessions = self.sessions.clone();
       let packet = self.packet.clone();
       let shutdown = self.shutdown.clone();
-      let pending = Arc::clone(&self.recovery_pending);
       let connection_tasks = self.connection_tasks.clone();
-      let transport = match self.extensions.resolve_transport(&endpoint.selector()) {
-        Ok(transport) => transport,
-        // No transport for the endpoint: the dial fails and releases
-        // its in-flight slot through the normal error path.
-        Err(error) => {
-          let _ = self
-            .recovery_pending
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-          tracing::debug!(endpoint = %endpoint.as_str(), kind = ?error.kind(), "recovery dial unresolvable");
-          continue;
-        }
-      };
       let dial_deadline = self.config.dial_deadline();
       let dial = tokio::spawn(async move {
+        let _slot = permit;
         if let Err(error) = dial_member(
           transport,
           driver,
@@ -437,10 +436,6 @@ impl TickState {
             "recovery dial failed"
           );
         }
-        // Release the in-flight slot when the dial resolves, so recovery
-        // stays alive across repeated partition waves (the counter bounds
-        // in-flight dials, not lifetime volume).
-        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
       });
       // The dial's JoinHandle joins the tracked connection-task set the
       // recovery tick reaps and the shutdown path drains inside its
@@ -562,6 +557,37 @@ impl TickState {
   }
 }
 
+/// One scoped in-flight dial slot: [`DialPermit::acquire`] increments
+/// the plane's pending counter and the permit's `Drop` decrements it
+/// exactly once. The permit is a live local across the dial's await, so
+/// every exit path of the dial task — successful completion, the dial's
+/// error return, a panic unwinding through a caller-supplied transport's
+/// future, or the shutdown path's abort — runs the drop and releases the
+/// slot. The manual `fetch_add`/`fetch_sub` pairs this replaces decremented
+/// only after the await, so any panic or cancellation skipped it and the
+/// stranded slot suppressed later maintenance/probe ticks or consumed a
+/// recovery fan-out budget for the incarnation's remainder.
+pub(super) struct DialPermit {
+  pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DialPermit {
+  /// Acquires one slot against the plane's pending counter.
+  pub(super) fn acquire(pending: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Self { pending }
+  }
+}
+
+impl Drop for DialPermit {
+  fn drop(&mut self) {
+    // Exactly one decrement per `acquire`, so the pair cannot underflow.
+    self
+      .pending
+      .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
 /// Advances a per-member endpoint serial map for `member`'s next dial
 /// and returns the 1-based serial that dial consumes: a member's first
 /// dial is serial 1 (its first published endpoint), and every further
@@ -654,13 +680,16 @@ pub(super) async fn departed_exclusions(
 mod tests {
   use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+      Arc,
+      atomic::{AtomicUsize, Ordering},
+    },
   };
 
   use tokio::sync::watch;
 
   use super::{
-    RECOVERY_TICK_PERIOD, advance_member_serial, recovery_endpoint, run_recovery_worker,
+    DialPermit, RECOVERY_TICK_PERIOD, advance_member_serial, recovery_endpoint, run_recovery_worker,
   };
   use crate::{
     BoxFuture, Endpoint, NodeConfig,
@@ -990,6 +1019,35 @@ mod tests {
     (port, accepted, closed, handle)
   }
 
+  /// A caller-registered transport whose connect future counts the
+  /// attempt and then panics mid-dial: P2-12's exact shape — a custom
+  /// transport future unwinding through the dial task. The attempt
+  /// counter is the observable: it rising again after the panic proves a
+  /// later dial still launched, which the leaked in-flight counter made
+  /// impossible.
+  #[derive(Debug)]
+  struct PanickingWire {
+    attempts: Arc<AtomicUsize>,
+  }
+
+  impl crate::TransportProvider for PanickingWire {
+    fn bind(
+      &self, _endpoint: Endpoint,
+    ) -> crate::BoxFuture<'static, crate::Result<Box<dyn crate::ProviderListener>>> {
+      Box::pin(async { Err(crate::Error::not_found("listener")) })
+    }
+
+    fn connect(
+      &self, _endpoint: Endpoint,
+    ) -> crate::BoxFuture<'static, crate::Result<Box<dyn crate::TransportStream>>> {
+      let attempts = Arc::clone(&self.attempts);
+      Box::pin(async move {
+        attempts.fetch_add(1, Ordering::Relaxed);
+        panic!("the custom transport's connect future panics mid-dial");
+      })
+    }
+  }
+
   /// Installs one dialable member (descriptor plus trusted binding)
   /// straight into the reference factory's state — the same pair
   /// `test_support::install_member` lays through the supervisor's store,
@@ -997,10 +1055,9 @@ mod tests {
   /// supervision path owns the store from `spawn_runtime` on, and the
   /// reference factory refuses a second open while the node holds it.
   fn install_dialable_member(
-    reference: &Arc<crate::storage::contract::ReferenceFactory>, seed: u64, port: u16,
+    reference: &Arc<crate::storage::contract::ReferenceFactory>, seed: u64, endpoint: Endpoint,
   ) {
     let node = member_id(seed);
-    let endpoint = Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap();
     let descriptor = crate::membership::NodeDescriptorV1::new(
       node.clone(),
       member_key(seed),
@@ -1038,6 +1095,7 @@ mod tests {
   ) -> (
     crate::runtime::RuntimeClient,
     Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    Arc<AtomicUsize>,
   ) {
     let keys = crate::identity::testing::ScriptedKeys::full();
     let entropy: Arc<dyn crate::api::Entropy> =
@@ -1064,6 +1122,18 @@ mod tests {
         .register_builtin_transport(tag, transport)
         .unwrap();
     }
+    // The panicking custom transport the P2-12 regression dials through,
+    // under its own scheme name: only endpoints that advertise it
+    // resolve here, so the other fixtures never touch it.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    extensions
+      .register_transport(
+        crate::TransportName::parse("panicwire").unwrap(),
+        Arc::new(PanickingWire {
+          attempts: Arc::clone(&attempts),
+        }),
+      )
+      .unwrap();
     let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
     let (round_tx, round_rx) =
       tokio::sync::mpsc::channel(crate::runtime::SYNC_ROUND_CHANNEL_CAPACITY);
@@ -1097,7 +1167,7 @@ mod tests {
     )
     .await
     .unwrap();
-    (client, connection_tasks)
+    (client, connection_tasks, attempts)
   }
 
   /// Audit finding #19: a recovery dial is a spawned task whose
@@ -1135,9 +1205,13 @@ mod tests {
       )
       .unwrap();
     let (port, accepted, closed, holder) = closing_silent_peer().await;
-    install_dialable_member(&reference, 101, port);
+    install_dialable_member(
+      &reference,
+      101,
+      Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap(),
+    );
 
-    let (client, connection_tasks) = supervised_runtime(reference, config).await;
+    let (client, connection_tasks, _attempts) = supervised_runtime(reference, config).await;
 
     // The recovery worker's first tick fires immediately and dials the
     // only member: the peer accepts the connection and the dial parks
@@ -1306,5 +1380,111 @@ mod tests {
     first_holder.abort();
     second_holder.abort();
     refused_holder.abort();
+  }
+
+  /// The scoped permit is P2-12's mechanism: whichever way the dial
+  /// task's future ends — completion, a panic unwinding through it, or
+  /// the shutdown path's cancellation — the drop runs and the counter
+  /// returns to its pre-acquisition value. (The completion path is the
+  /// ordinary dial tests above.)
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn dial_permit_releases_the_slot_on_panic_and_cancellation() {
+    let pending = Arc::new(AtomicUsize::new(0));
+    let panicking = {
+      let permit = DialPermit::acquire(Arc::clone(&pending));
+      assert_eq!(pending.load(Ordering::Relaxed), 1, "acquire takes the slot");
+      tokio::spawn(async move {
+        let _slot = permit;
+        panic!("the dial future panics");
+      })
+    };
+    assert!(
+      panicking.await.is_err(),
+      "the dial task must actually panic"
+    );
+    assert_eq!(
+      pending.load(Ordering::Relaxed),
+      0,
+      "the panic unwind must release the slot"
+    );
+
+    let cancelled = {
+      let permit = DialPermit::acquire(Arc::clone(&pending));
+      tokio::spawn(async move {
+        let _slot = permit;
+        std::future::pending::<()>().await;
+      })
+    };
+    cancelled.abort();
+    let _ = cancelled.await;
+    assert_eq!(
+      pending.load(Ordering::Relaxed),
+      0,
+      "the cancellation must release the slot"
+    );
+  }
+
+  /// P2-12's recovery shape, through the real supervision path: a
+  /// caller-supplied transport whose connect future panics mid-dial must
+  /// not strand its fan-out slot. The manual `fetch_add`/`fetch_sub`
+  /// pair decremented after the await, so the panic skipped it; the
+  /// fan-out gate then deferred every later recovery step for the
+  /// incarnation and the attempt counter froze at one. The scoped
+  /// permit releases on the unwind, so the plane keeps dialing.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_panicking_transport_future_releases_its_recovery_slot() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    // Fan-out one, so the single slot the panic must release is the
+    // plane's whole budget; the initial backoff schedules the second
+    // attempt within seconds (the base doubles to 2s, which has no
+    // whole-second jitter spread to sample).
+    let config = NodeConfig::new()
+      .with_dial_deadline(std::time::Duration::from_secs(5))
+      .unwrap()
+      .with_recovery_policy(
+        crate::RecoveryConfig::new(
+          1,
+          std::time::Duration::from_secs(1),
+          std::time::Duration::from_secs(2),
+        )
+        .unwrap(),
+      )
+      .unwrap();
+    install_dialable_member(
+      &reference,
+      101,
+      Endpoint::parse("panicwire://unreachable").unwrap(),
+    );
+
+    let (_client, _connection_tasks, attempts) = supervised_runtime(reference, config).await;
+
+    // Attempt 1 fires on the worker's first tick and panics inside the
+    // custom transport's future.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+      loop {
+        if attempts.load(Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the recovery worker must dial the panicking transport");
+
+    // The slot must come back: the second attempt is due after the
+    // doubled initial backoff, and only a released slot lets the
+    // fan-out-of-one gate admit it.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+      loop {
+        if attempts.load(Ordering::Relaxed) >= 2 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("recovery must keep dialing after a panicking transport");
   }
 }
