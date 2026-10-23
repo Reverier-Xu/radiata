@@ -432,8 +432,13 @@ async fn apply_cleanup_record(
     tracing::debug!(subject = %record.subject(), "cleanup record skipped: bindings unknown");
     return Ok(());
   }
-  crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), record).await?;
-  member_changed(events, revision, record.subject().clone());
+  let install =
+    crate::identity::cleanup::persist_cleanup_record_ctx(store, entropy.as_ref(), record).await?;
+  // Only a real install changes the member set: an exact replay or a
+  // legitimate losing record is a no-op success, not a notification.
+  if install == crate::identity::records::TerminalInstall::Installed {
+    member_changed(events, revision, record.subject().clone());
+  }
   Ok(())
 }
 
@@ -444,6 +449,9 @@ async fn apply_cleanup_record(
 /// boundary immediately on this node too: any live session with the
 /// revoked identity retires (its recovery dials race the propagation,
 /// so a session admitted before this tombstone landed must not linger).
+/// Session retirement is independent of the evidence verdict; the
+/// revocation event fires only for a first revocation, never for a
+/// canonical evidence replacement or an unchanged replay.
 #[allow(clippy::too_many_arguments)]
 async fn apply_revocation_record(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
@@ -457,8 +465,11 @@ async fn apply_revocation_record(
     tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
     return Ok(());
   }
-  crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), record).await?;
-  events.emit(crate::NodeRevoked::new(record.subject().clone()));
+  let transition =
+    crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), record).await?;
+  if transition.changed_authorization() {
+    events.emit(crate::NodeRevoked::new(record.subject().clone()));
+  }
   crate::session::stream::retire_session(sessions, record.subject())?;
   Ok(())
 }
@@ -1615,6 +1626,221 @@ mod tests {
         .unwrap(),
       "the binding arrival re-applied the skipped row"
     );
+  }
+
+  /// Drains one subscription's currently available events.
+  fn event_count<E: crate::Event>(subscription: &mut crate::EventSubscription<E>) -> usize {
+    let mut count = 0;
+    loop {
+      match subscription.try_recv().unwrap() {
+        crate::EventReceive::Item(_) => count += 1,
+        crate::EventReceive::Empty | crate::EventReceive::Closed => return count,
+        crate::EventReceive::Lagged { .. } => panic!("test subscription lagged"),
+      }
+    }
+  }
+
+  /// Regression (audit #14): re-delivered terminal evidence is a no-op
+  /// success, not a change notification. The member revision and the
+  /// revocation event move only for a real transition: an exact replay
+  /// notifies nothing, a cleanup evidence replacement notifies once (the
+  /// member evidence changed), and a revocation evidence replacement
+  /// over an already-revoked binding fires no second revocation. Session
+  /// retirement stays independent of the evidence verdict: an
+  /// already-revoked identity's live session still retires.
+  #[tokio::test]
+  async fn replayed_tombstone_rows_notify_only_real_transitions() {
+    use ed25519_dalek::Signer as _;
+
+    use crate::identity::{
+      cleanup::CleanupRecordV1,
+      revocation::{REVOCATION_RECORD_DOMAIN, RevocationRecordV1, revoked_key_ctx},
+      signature::signature_message,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full_at(9_900);
+    let scripted_entropy = Arc::new(SequenceEntropy::default());
+    let entropy: Arc<dyn Entropy> = scripted_entropy.clone();
+    let context = Arc::new(
+      open_context(&factory, &keys, &scripted_entropy)
+        .await
+        .unwrap(),
+    );
+    let store = context.store();
+
+    let subject = node_at(9_910);
+    let subject_key = key_at(9_911);
+    let issuer = node_at(9_920);
+    let issuer_signing = crate::identity::testing::scripted_signing(9_921);
+    let other_issuer = node_at(9_930);
+    let other_signing = crate::identity::testing::scripted_signing(9_931);
+    for (node, key) in [
+      (issuer.clone(), key_at(9_921)),
+      (other_issuer.clone(), key_at(9_931)),
+      (subject.clone(), subject_key.clone()),
+    ] {
+      crate::identity::trust::store::adopt_binding_ctx(store, entropy.as_ref(), &node, &key)
+        .await
+        .unwrap();
+    }
+
+    let revocation = |issuer: &NodeId, signing: &ed25519_dalek::SigningKey| {
+      let body = RevocationRecordV1::encode_signed_body(&subject, &subject_key, issuer).unwrap();
+      let signature = signing.sign(&signature_message(REVOCATION_RECORD_DOMAIN, &body));
+      RevocationRecordV1::new(
+        subject.clone(),
+        subject_key.clone(),
+        issuer.clone(),
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    let cleanup = |stamp: u64| {
+      let body =
+        CleanupRecordV1::encode_signed_body(&subject, &subject_key, &issuer, stamp).unwrap();
+      let signature = issuer_signing.sign(&signature_message(
+        crate::identity::cleanup::CLEANUP_RECORD_DOMAIN,
+        &body,
+      ));
+      CleanupRecordV1::new(
+        subject.clone(),
+        subject_key.clone(),
+        issuer.clone(),
+        stamp,
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    // The second delivery is the canonical winner by construction, so the
+    // revocation replacement branch is pinned regardless of byte layout.
+    let first = revocation(&issuer, &issuer_signing);
+    let second = revocation(&other_issuer, &other_signing);
+    let (winner, loser) = if first.encode().unwrap() < second.encode().unwrap() {
+      (first, second)
+    } else {
+      (second, first)
+    };
+    let winner_bytes = winner.encode().unwrap();
+
+    let row = |kind: u8, subject: &NodeId, encoded: Vec<u8>| {
+      let mut key = Vec::with_capacity(1 + subject.as_str().len());
+      key.push(kind);
+      key.extend_from_slice(subject.as_str().as_bytes());
+      (key, encoded)
+    };
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let mut revoked_events = events.subscribe::<crate::NodeRevoked>(crate::EventOptions::new());
+    let mut member_events = events.subscribe::<crate::MemberChanged>(crate::EventOptions::new());
+
+    // The first delivery is the real transition: one revocation event and
+    // one member revision for the cleanup install.
+    let first_rows = vec![
+      row(3, &subject, loser.encode().unwrap()),
+      row(2, &subject, cleanup(9_000).encode().unwrap()),
+    ];
+    apply_tombstone_rows(
+      &context,
+      &entropy,
+      &events,
+      &revision,
+      &sessions,
+      &first_rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_count(&mut revoked_events), 1);
+    assert_eq!(event_count(&mut member_events), 1);
+    assert_eq!(*revision_rx.borrow(), 1);
+
+    // An exact replay notifies nothing and bumps nothing.
+    apply_tombstone_rows(
+      &context,
+      &entropy,
+      &events,
+      &revision,
+      &sessions,
+      &first_rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_count(&mut revoked_events), 0);
+    assert_eq!(event_count(&mut member_events), 0);
+    assert_eq!(*revision_rx.borrow(), 1);
+
+    // A canonical cleanup replacement is a real member-evidence install:
+    // exactly one notification.
+    let replacement_rows = vec![row(2, &subject, cleanup(5_000).encode().unwrap())];
+    apply_tombstone_rows(
+      &context,
+      &entropy,
+      &events,
+      &revision,
+      &sessions,
+      &replacement_rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_count(&mut member_events), 1);
+    assert_eq!(*revision_rx.borrow(), 2);
+
+    // The surely-already-revoked identity's live session still retires on
+    // an evidence-only replacement, while no second revocation fires.
+    let (entry, _frames) = crate::session::stream::test_entry(&crate::api::SystemEntropy);
+    sessions.lock().unwrap().insert(subject.clone(), entry);
+    let replacement_rows = vec![row(3, &subject, winner_bytes.clone())];
+    apply_tombstone_rows(
+      &context,
+      &entropy,
+      &events,
+      &revision,
+      &sessions,
+      &replacement_rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_count(&mut revoked_events), 0);
+    assert!(
+      sessions.lock().unwrap().get(&subject).is_none(),
+      "a revoked identity's session retires even when only the evidence changed"
+    );
+    assert_eq!(
+      store_revocation_bytes(store, &subject).await,
+      winner_bytes,
+      "the canonical winner replaced the stored evidence"
+    );
+    assert_eq!(
+      revoked_key_ctx(store, &subject).await.unwrap(),
+      Some(subject_key)
+    );
+  }
+
+  /// The stored revocation encoding for `subject`.
+  async fn store_revocation_bytes(
+    store: &crate::storage::MetadataStore, subject: &NodeId,
+  ) -> Vec<u8> {
+    let snapshot = store.snapshot().await.unwrap();
+    snapshot
+      .get(
+        &crate::storage::families::namespace(crate::storage::families::REVOCATION_NAMESPACE)
+          .unwrap(),
+        &crate::StoreKey::new(Arc::from(subject.as_str().as_bytes())),
+      )
+      .await
+      .unwrap()
+      .expect("the stored revocation record")
+      .as_bytes()
+      .to_vec()
   }
 
   /// Regression (audit A01): one divergent terminal record must never

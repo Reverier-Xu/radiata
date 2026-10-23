@@ -557,16 +557,15 @@ async fn reconcile_revoke(
     &record,
   )
   .await?;
-  let was_already_revoked = matches!(
-    outcome,
-    crate::identity::revocation::RevokeStoreOutcome::AlreadyRevoked
-  );
-  if !was_already_revoked {
-    // After the known-committed transition: close the exact identity's
-    // active sessions. Redial is impossible by construction — the revoked
-    // binding is gone, so neither recovery candidates nor an inbound
-    // handshake can admit this identity again.
-    retire_session(&planes.sessions, &subject)?;
+  let transition = outcome.transition();
+  // The execution plane is independent of the evidence verdict: a revoked
+  // identity must never keep a live session, so the exact identity's
+  // sessions retire on every outcome (retiring an already-retired peer is
+  // a no-op). Redial is impossible by construction — the revoked binding
+  // is gone, so neither recovery candidates nor an inbound handshake can
+  // admit this identity again.
+  retire_session(&planes.sessions, &subject)?;
+  if transition.changed_authorization() {
     deps
       .events()
       .emit(crate::SessionChanged::new(subject.clone()));
@@ -574,7 +573,7 @@ async fn reconcile_revoke(
   }
   Ok(EffectOutcome::new(TaskOutput::Revoke(RevokeOutcome::new(
     subject,
-    was_already_revoked,
+    !transition.changed_authorization(),
   ))))
 }
 
@@ -590,14 +589,18 @@ async fn reconcile_cleanup(deps: Arc<OperationDeps>, subject: NodeId) -> Result<
   }
   let record =
     crate::identity::cleanup::sign_cleanup_record(context, context.keys(), &subject).await?;
-  crate::identity::cleanup::persist_cleanup_record_ctx(
+  let install = crate::identity::cleanup::persist_cleanup_record_ctx(
     context.store(),
     planes.entropy.as_ref(),
     &record,
   )
   .await?;
-  deps.events().emit(crate::MemberChanged::new(subject));
-  planes.member_revision.bump();
+  // An exact replay or a legitimate losing record changed nothing: the
+  // member set may be notified only for a real install.
+  if install == crate::identity::records::TerminalInstall::Installed {
+    deps.events().emit(crate::MemberChanged::new(subject));
+    planes.member_revision.bump();
+  }
   Ok(EffectOutcome::new(TaskOutput::Cleanup(())))
 }
 
