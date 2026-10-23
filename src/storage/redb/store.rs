@@ -78,17 +78,18 @@ fn crash_hook(_point: u8) {}
 /// armed, the commit blocks its blocking thread just before the durable
 /// commit (the receipt row is staged but not yet durable), so a test can
 /// observe the not-yet-landed state, cancel the caller, and then release
-/// the landing. The reached record names the held transaction, so a
+/// the landing. The reached set names every held transaction, so a
 /// waiting test observes its own commit holding the landing even while
-/// other tests' commits run concurrently. Mirrors the crash-hook
-/// pattern: test builds only.
+/// other tests' commits run concurrently (each holds its own entry until
+/// the release clears the set). Mirrors the crash-hook pattern: test
+/// builds only.
 #[cfg(test)]
 static HOLD_BEFORE_COMMIT_ARMED: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
-static HOLD_BEFORE_COMMIT_REACHED: std::sync::Mutex<Option<TransactionId>> =
-  std::sync::Mutex::new(None);
+static HOLD_BEFORE_COMMIT_REACHED: std::sync::Mutex<std::collections::BTreeSet<TransactionId>> =
+  std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 #[cfg(test)]
 pub(crate) fn arm_landing_hold() {
@@ -100,27 +101,46 @@ pub(crate) fn landing_hold_reached_by(transaction: &TransactionId) -> bool {
   HOLD_BEFORE_COMMIT_REACHED
     .lock()
     .unwrap_or_else(|poisoned| poisoned.into_inner())
-    .as_ref()
-    .is_some_and(|held| held == transaction)
+    .contains(transaction)
 }
 
 #[cfg(test)]
 pub(crate) fn release_landing_hold() {
   HOLD_BEFORE_COMMIT_ARMED.store(false, std::sync::atomic::Ordering::Release);
+  HOLD_BEFORE_COMMIT_REACHED
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .clear();
 }
+
+/// Serializes every armed hold across the whole test binary: the
+/// park/release signal is global, so two concurrently armed holds
+/// would release each other's parked commits and turn each test's
+/// "still parked" window into a race. The guard is held for the
+/// [`LandingHold`] struct's life — the test's armed window — and
+/// released by its drop.
+#[cfg(test)]
+static LANDING_HOLD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// RAII releaser for the landing hold: arms on construction and
 /// releases on drop, so a panicking test cannot leave the hold armed
 /// and wedge every later commit in the binary. Drop it explicitly at
-/// the moment the landing should proceed.
+/// the moment the landing should proceed. Construction takes the
+/// test-binary-wide hold lock, so concurrently armed holds serialize
+/// behind it instead of releasing each other's parked commits.
 #[cfg(test)]
-pub(crate) struct LandingHold;
+pub(crate) struct LandingHold {
+  _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(test)]
 impl LandingHold {
   pub(crate) fn arm() -> Self {
+    let lock = LANDING_HOLD_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
     arm_landing_hold();
-    LandingHold
+    LandingHold { _lock: lock }
   }
 }
 
@@ -134,9 +154,10 @@ impl Drop for LandingHold {
 #[cfg(test)]
 fn hold_before_commit(transaction: &TransactionId) {
   if HOLD_BEFORE_COMMIT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
-    *HOLD_BEFORE_COMMIT_REACHED
+    HOLD_BEFORE_COMMIT_REACHED
       .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(transaction.clone());
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .insert(transaction.clone());
     while HOLD_BEFORE_COMMIT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
       std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -266,6 +287,7 @@ impl StorageFactory for RedbStoreFactory {
       Ok(Box::new(RedbStorage {
         database,
         detached: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        settled: Arc::new(tokio::sync::Notify::new()),
       }) as Box<dyn Storage>)
     })
   }
@@ -279,21 +301,32 @@ struct RedbStorage {
   /// reconciler of the same transaction waits on the entry's landing
   /// signal before reading receipts, so a cancelled commit is judged by
   /// its final receipt and never by a not-yet-landed absence (audit
-  /// 2026-10-09 item 14).
+  /// 2026-10-09 item 14). An empty map is also the completion barrier
+  /// [`Storage::flush`] awaits: no in-flight execution still holds the
+  /// database or is about to commit (audit 2026-10-23 P1-10).
   detached:
     Arc<std::sync::Mutex<std::collections::BTreeMap<TransactionId, Arc<tokio::sync::Notify>>>>,
+  /// Fires whenever any detached execution ends (commit, failure, or
+  /// panic): the wakeup edge behind [`Storage::flush`]'s drain wait.
+  settled: Arc<tokio::sync::Notify>,
 }
 
 /// Fires one detached commit's landing signal and removes its registry
-/// entry on every exit path of the execution task — completion, error,
-/// or panic — so a reconciler never waits on a finished execution. The
+/// entry on every exit path of the execution — completion, error, or
+/// panic — so a reconciler never waits on a finished execution. The
 /// signal fires strictly after the blocking commit returned, so a woken
-/// reconciler reads final durable evidence.
+/// reconciler reads final durable evidence. The guard is constructed
+/// INSIDE the blocking closure that performs the durable work (audit
+/// 2026-10-23 P1-10): its drop is the commit's own end, so no outer
+/// async task's teardown can fire the signal or drop the registry entry
+/// while the durable write is still in flight. The shared `settled`
+/// notify wakes the flush barrier the same way.
 struct DetachedLandingGuard {
   registry:
     Arc<std::sync::Mutex<std::collections::BTreeMap<TransactionId, Arc<tokio::sync::Notify>>>>,
   id: TransactionId,
   landed: Arc<tokio::sync::Notify>,
+  settled: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for DetachedLandingGuard {
@@ -304,6 +337,7 @@ impl Drop for DetachedLandingGuard {
       .unwrap_or_else(|poisoned| poisoned.into_inner())
       .remove(&self.id);
     self.landed.notify_waiters();
+    self.settled.notify_waiters();
   }
 }
 
@@ -345,29 +379,32 @@ impl Storage for RedbStorage {
 
   fn commit<'a>(&'a self, transaction: StoreTransaction) -> BoxFuture<'a, Result<CommitOutcome>> {
     let registry = Arc::clone(&self.detached);
+    let settled = Arc::clone(&self.settled);
     let database = Arc::clone(&self.database);
     // The execution is registered and spawned eagerly, before the
     // returned future is ever polled: the commit still lands durably
     // when the caller is cancelled (or never polls), and a reconcile of
     // the same transaction observes the in-flight landing from the
     // moment commit is called — no drop window can hide it (audit
-    // 2026-10-09 item 14).
+    // 2026-10-09 item 14). The completion guard rides the blocking
+    // commit itself (audit 2026-10-23 P1-10): it lives and drops inside
+    // the `spawn_blocking` closure, so the registry entry and the
+    // landing signal track the true durable operation rather than any
+    // async task that happens to be awaiting it.
     let id = transaction.id().clone();
     let landed = Arc::new(tokio::sync::Notify::new());
     registry
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner())
       .insert(id.clone(), Arc::clone(&landed));
-    let execution = tokio::spawn(async move {
+    let execution = tokio::task::spawn_blocking(move || {
       let _landing = DetachedLandingGuard {
         registry,
         id,
         landed,
+        settled,
       };
-      let outcome = tokio::task::spawn_blocking(move || commit_blocking(&database, transaction))
-        .await
-        .map_err(|_| internal(ProviderErrorContext::StorageCommit))??;
-      Ok(outcome)
+      commit_blocking(&database, transaction)
     });
     Box::pin(async move {
       execution
@@ -422,8 +459,41 @@ impl Storage for RedbStorage {
   }
 
   fn flush<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-    // Every commit already fsyncs; there is no deferred durability to flush.
-    Box::pin(async { Ok(()) })
+    // The completion barrier, deliberately distinct from the durability
+    // guarantee: every commit already fsyncs (`Durability::Immediate`),
+    // so a landed transaction needs no second flush — what a shutdown
+    // caller must additionally know is that no in-flight execution
+    // still holds the database or is about to commit. This awaits the
+    // detached registry draining to empty, so every registered
+    // execution has ended (committed, failed, or rolled back) before
+    // the caller resumes (audit 2026-10-23 P1-10).
+    let registry = Arc::clone(&self.detached);
+    let settled = Arc::clone(&self.settled);
+    Box::pin(async move {
+      loop {
+        if registry
+          .lock()
+          .unwrap_or_else(|poisoned| poisoned.into_inner())
+          .is_empty()
+        {
+          return Ok(());
+        }
+        let notified = settled.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Re-check under the registration the enable observed: an
+        // execution that landed between the empty check and the enable
+        // already removed its entry, and the drain is already complete.
+        if registry
+          .lock()
+          .unwrap_or_else(|poisoned| poisoned.into_inner())
+          .is_empty()
+        {
+          return Ok(());
+        }
+        notified.await;
+      }
+    })
   }
 }
 
@@ -1033,19 +1103,28 @@ fn map_table_error(error: redb::TableError, context: ProviderErrorContext) -> Er
   }
 }
 
-/// The adapter-local regression lane for the 2026-10-23 P2-9 follow-up:
-/// the backfill scan's error contract. The test drives the real factory
-/// open and the real scan; the only injection is the module's
-/// established test-only fault hook.
+/// The adapter-local regression lanes for the 2026-10-23 follow-ups:
+/// the backfill scan's error contract (P2-9) and the flush completion
+/// barrier (P1-10). Every test drives the real factory open and the
+/// real commit path; the only injections are the module's established
+/// test-only fault hooks.
 #[cfg(test)]
 mod followup_tests {
+  use std::sync::Arc;
+
   use redb::{ReadableDatabase, ReadableTableMetadata};
   use tempfile::TempDir;
 
   use super::{
-    DIGESTS_TABLE, ENTRIES_TABLE, RedbStoreFactory, arm_backfill_scan_fault, composite_prefix,
+    DIGESTS_TABLE, ENTRIES_TABLE, LandingHold, RedbStoreFactory, arm_backfill_scan_fault,
+    composite_prefix, landing_hold_reached_by,
   };
-  use crate::{ErrorKind, StoreRequirements, provider::StorageFactory, storage::test_util};
+  use crate::{
+    CommitOutcome, ErrorKind, ReconcileOutcome, StoreExpectation, StoreOperation,
+    StoreRequirements, StoreTransaction, StoreValue,
+    provider::{Storage, StorageFactory},
+    storage::test_util,
+  };
 
   /// A failing backfill scan is the open's failure — never a silent
   /// early EOF that commits a partial digest upgrade and reports the
@@ -1113,5 +1192,126 @@ mod followup_tests {
         .unwrap_or_else(|| panic!("the entry {:?} must survive the backfill", key));
       assert_eq!(stored.as_bytes(), value);
     }
+  }
+  /// Prepares one absent-put transaction over the store's current
+  /// revision: the barrier tests need a real committed-eligible shape.
+  async fn put(
+    storage: &Arc<dyn Storage>, index: u64, key: &[u8], value: &[u8],
+  ) -> StoreTransaction {
+    let namespace = test_util::namespace("redb-flush-barrier");
+    let base = storage.snapshot().await.unwrap().revision().clone();
+    StoreTransaction::new(
+      test_util::transaction_id(index),
+      base,
+      vec![StoreOperation::Put {
+        namespace,
+        key: test_util::key(key),
+        expected: StoreExpectation::Absent,
+        value: StoreValue::new(Arc::from(value)),
+      }],
+    )
+    .unwrap()
+  }
+
+  /// `flush` is the execution completion barrier (audit 2026-10-23
+  /// P1-10): while a commit is parked just before its durable landing,
+  /// flush must not resolve — the immediate `Ok(())` it used to return
+  /// is exactly the shutdown race the finding names — and once the
+  /// execution ends, flush resolves and the parked commit has landed.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn flush_waits_for_an_in_flight_execution_to_end() {
+    let directory = TempDir::new().unwrap();
+    let factory = RedbStoreFactory::new(directory.path().join("store.redb"));
+    let storage: Arc<dyn Storage> = factory
+      .open(StoreRequirements::metadata())
+      .await
+      .unwrap()
+      .into();
+    let transaction = put(&storage, 61, b"barrier", b"lands").await;
+    let id = transaction.id().clone();
+
+    // Park the commit just before its durable landing.
+    let hold = LandingHold::arm();
+    let commit = tokio::spawn({
+      let storage = Arc::clone(&storage);
+      async move { storage.commit(transaction).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      while !landing_hold_reached_by(&id) {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("the landing hold is reached within the box");
+
+    // The barrier holds while the execution is mid-commit.
+    let flush = tokio::spawn({
+      let storage = Arc::clone(&storage);
+      async move { storage.flush().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+      !flush.is_finished(),
+      "flush must not resolve while an execution is still mid-commit"
+    );
+
+    // The execution ends and the barrier resolves behind it.
+    drop(hold);
+    flush.await.unwrap().unwrap();
+    assert!(matches!(
+      commit.await.unwrap().unwrap(),
+      CommitOutcome::Committed(_)
+    ));
+  }
+
+  /// The barrier covers the detached case the shutdown path actually
+  /// meets: the commit's caller is cancelled mid-flight, the execution
+  /// keeps running, and flush still waits for the true landing before
+  /// resolving — then the durable evidence is there to read.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn flush_waits_for_a_cancelled_callers_detached_execution() {
+    let directory = TempDir::new().unwrap();
+    let factory = RedbStoreFactory::new(directory.path().join("store.redb"));
+    let storage: Arc<dyn Storage> = factory
+      .open(StoreRequirements::metadata())
+      .await
+      .unwrap()
+      .into();
+    let transaction = put(&storage, 62, b"detached-barrier", b"lands").await;
+    let id = transaction.id().clone();
+    let digest = transaction.operation_digest().clone();
+
+    let hold = LandingHold::arm();
+    let commit = tokio::spawn({
+      let storage = Arc::clone(&storage);
+      async move { storage.commit(transaction).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      while !landing_hold_reached_by(&id) {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("the landing hold is reached within the box");
+    // The caller is cancelled; the blocking execution keeps running.
+    commit.abort();
+    assert!(commit.await.unwrap_err().is_cancelled());
+
+    let flush = tokio::spawn({
+      let storage = Arc::clone(&storage);
+      async move { storage.flush().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+      !flush.is_finished(),
+      "flush must not resolve behind a cancelled caller's still-running execution"
+    );
+
+    drop(hold);
+    flush.await.unwrap().unwrap();
+    assert!(matches!(
+      storage.reconcile(&id, &digest).await.unwrap(),
+      ReconcileOutcome::Committed(_)
+    ));
   }
 }
