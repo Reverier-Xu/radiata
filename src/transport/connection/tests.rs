@@ -91,6 +91,76 @@ async fn accepted_connections_carry_the_raw_peer_address_and_dialers_carry_none(
   assert!(address.ip().is_loopback());
 }
 
+// The upgrade authority is the canonical endpoint name plus the dialed
+// port, with IPv6 literals in the bracketed authority form.
+#[test]
+fn upgrade_authority_names_the_canonical_endpoint() {
+  let dns = rustls::pki_types::ServerName::try_from("relay.example.com".to_owned()).unwrap();
+  assert_eq!(
+    super::upgrade_authority(&dns, 8_443),
+    "relay.example.com:8443"
+  );
+  let v4 = rustls::pki_types::ServerName::IpAddress(
+    "127.0.0.1".parse::<std::net::IpAddr>().unwrap().into(),
+  );
+  assert_eq!(super::upgrade_authority(&v4, 7_000), "127.0.0.1:7000");
+  let v6 = rustls::pki_types::ServerName::IpAddress(
+    "2001:db8::1".parse::<std::net::IpAddr>().unwrap().into(),
+  );
+  assert_eq!(super::upgrade_authority(&v6, 443), "[2001:db8::1]:443");
+}
+
+// A WSS service that routes by Host (a reverse proxy's contract)
+// observes the canonical endpoint authority in the upgrade request —
+// the name the endpoint carried, never the IP the dial resolved to.
+#[tokio::test]
+async fn websocket_upgrade_names_the_canonical_endpoint_authority() {
+  use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+  let config = server_config(&certificate(53)).unwrap();
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let address = listener.local_addr().unwrap();
+  let server = tokio::spawn(async move {
+    let (tcp, _) = listener.accept().await.unwrap();
+    let tls = TlsAcceptor::from(config).accept(tcp).await.unwrap();
+    let (host_tx, host_rx) = tokio::sync::oneshot::channel();
+    #[allow(clippy::result_large_err)]
+    let observe = move |request: &Request, response: Response| {
+      // The authority a Host-routing reverse proxy acts on lives in the
+      // request's Host header.
+      let _ = host_tx.send(
+        request
+          .headers()
+          .get("Host")
+          .map(|host| host.to_str().unwrap_or_default().to_owned())
+          .unwrap_or_default(),
+      );
+      Ok(response)
+    };
+    let upgrade = tokio_tungstenite::accept_hdr_async(TlsStream::from(tls), observe).await;
+    (upgrade, host_rx.await)
+  });
+
+  let tcp = TcpStream::connect(address).await.unwrap();
+  let endpoint_name = rustls::pki_types::ServerName::try_from("relay.example.com".to_owned())
+    .unwrap()
+    .to_owned();
+  let mut client =
+    Connection::connect_tls_ws(tcp, merge_client_config().unwrap(), endpoint_name, rules())
+      .await
+      .unwrap();
+  client.send(1, 1, 0, b"hosted").await.unwrap();
+
+  let (upgrade, authority) = server.await.unwrap();
+  upgrade.unwrap();
+  // The upgrade names the endpoint, with the dialed port attached — and
+  // never the socket address the endpoint name resolved to.
+  assert_eq!(
+    authority.unwrap(),
+    format!("relay.example.com:{}", address.port())
+  );
+}
+
 async fn loopback_pair_with(
   client_config: Arc<rustls::ClientConfig>, certificate: EphemeralCertificate,
 ) -> (Connection, Connection) {

@@ -166,14 +166,18 @@ impl Connection {
 
   /// Connects to one WebSocket-class listener: TLS 1.3 handshake,
   /// exporter derivation, then the WebSocket upgrade on the fixed
-  /// `/mrly` path. The listener's non-secret join hint headers, when
-  /// present, are retained for the session driver and are never trusted
-  /// without the handshake and signed grant checks.
+  /// `/mrly` path. The upgrade request names the canonical endpoint
+  /// authority the SNI extension already presented — never the resolved
+  /// peer address — so a reverse proxy that routes by Host forwards the
+  /// upgrade to the virtual host the endpoint addressed. The listener's
+  /// non-secret join hint headers, when present, are retained for the
+  /// session driver and are never trusted without the handshake and
+  /// signed grant checks.
   pub(crate) async fn connect_tls_ws(
     tcp: TcpStream, config: Arc<ClientConfig>, server_name: ServerName<'static>, rules: FrameRules,
   ) -> Result<Self> {
     tracing::debug!("tls connection established");
-    let authority = tcp
+    let port = tcp
       .peer_addr()
       .map_err(|_| {
         Error::provider(
@@ -181,7 +185,8 @@ impl Connection {
           ProviderErrorContext::TransportConnect,
         )
       })?
-      .to_string();
+      .port();
+    let authority = upgrade_authority(&server_name, port);
     let tls = TlsConnector::from(config)
       .connect(server_name, tcp)
       .await
@@ -499,6 +504,23 @@ impl ConnectionReader {
 pub(crate) enum Received {
   Message(Message),
   Pong,
+}
+
+/// Builds the canonical HTTP upgrade authority of one WebSocket dial:
+/// the endpoint's TLS server name — the exact name the SNI extension
+/// already presented — plus the dialed port. The kernel's peer address
+/// never names the upgrade: the dial resolved that name to the address,
+/// and a Host-routing reverse proxy must see the name, or it accepts the
+/// TLS handshake and then misroutes the HTTP upgrade to another virtual
+/// host. IPv6 literals take the bracketed authority form.
+fn upgrade_authority(server_name: &ServerName<'_>, port: u16) -> String {
+  let host = server_name.to_str();
+  match host.parse::<std::net::IpAddr>() {
+    // An IPv6 literal carries the bracketed authority form.
+    Ok(std::net::IpAddr::V6(address)) => format!("[{address}]:{port}"),
+    // A DNS name or an IPv4 literal joins the port directly.
+    _ => format!("{host}:{port}"),
+  }
 }
 
 /// The single receive loop of the WebSocket class: binary messages are
