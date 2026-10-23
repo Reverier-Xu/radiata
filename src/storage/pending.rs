@@ -24,8 +24,8 @@ use super::{
   CommitState, MetadataStore, PendingCommit,
   receipt::{
     PreparedTransaction, ReceiptIdentity, ReceiptReferenceChange, ReceiptReferenceToken,
-    build_receipt_change_operations, group_receipt_changes, internal_namespace,
-    operation_uses_reserved_namespace, prepare_internal_transaction,
+    extend_with_receipt_change_operations, internal_namespace, operation_uses_reserved_namespace,
+    prepare_internal_transaction,
   },
 };
 pub(crate) use crate::storage::families::PENDING_NAMESPACE;
@@ -513,15 +513,9 @@ impl MetadataStore {
     inject_self_token(&mut changes, token)?;
 
     let internal = internal_namespace()?;
-    let groups = group_receipt_changes(&id, changes)?;
     let mut operations = caller_operations;
-    for group in &groups {
-      let built = build_receipt_change_operations(snapshot, &internal, &id, group).await?;
-      operations
-        .try_reserve_exact(built.len())
-        .map_err(|_| Error::resource_exhausted("metadata storage transaction"))?;
-      operations.extend(built);
-    }
+    extend_with_receipt_change_operations(snapshot, &internal, &id, changes, &mut operations)
+      .await?;
     let record = PendingTransactionV1::new(purpose, &id, snapshot.revision(), &operations)?;
     let value = StoreValue::new(Arc::from(record.encode()?));
     operations
@@ -629,13 +623,6 @@ impl MetadataStore {
     };
     let target = record.recover_identity(&stored)?;
     let token = ReceiptReferenceToken::for_record(&namespace, &key);
-    let groups = group_receipt_changes(
-      &operation_id,
-      vec![ReceiptReferenceChange::Remove {
-        target,
-        tokens: vec![token],
-      }],
-    )?;
     let internal = internal_namespace()?;
     let revision = snapshot.revision().clone();
     let mut operations = Vec::new();
@@ -647,14 +634,17 @@ impl MetadataStore {
       key,
       expected: stored.digest().clone(),
     });
-    for group in &groups {
-      let built =
-        build_receipt_change_operations(snapshot.as_ref(), &internal, &operation_id, group).await?;
-      operations
-        .try_reserve_exact(built.len())
-        .map_err(|_| Error::resource_exhausted("pending cleanup transaction"))?;
-      operations.extend(built);
-    }
+    extend_with_receipt_change_operations(
+      snapshot.as_ref(),
+      &internal,
+      &operation_id,
+      vec![ReceiptReferenceChange::Remove {
+        target,
+        tokens: vec![token],
+      }],
+      &mut operations,
+    )
+    .await?;
     drop(snapshot);
     let prepared = prepare_internal_transaction(operation_id, revision, operations)?;
     Ok(match self.commit(prepared).await? {
