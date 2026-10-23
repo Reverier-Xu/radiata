@@ -304,18 +304,7 @@ impl Connection {
     match &mut self.io {
       TransportIo::Ws(stream) => next_message(stream, self.rules, &self.pong_last_seen).await,
       TransportIo::Raw { read, write } => {
-        match framing::read_frame(&mut **read, write, self.rules).await? {
-          Some(framing::RawFrame::Data(message)) => Ok(Some(Received::Message(message))),
-          Some(framing::RawFrame::Pong) => {
-            self.pong_last_seen.store(
-              crate::time::now_seconds(),
-              std::sync::atomic::Ordering::Relaxed,
-            );
-            Ok(Some(Received::Pong))
-          }
-          Some(framing::RawFrame::Hint(_)) => Err(Error::invalid_input("transport hint")),
-          None => Ok(None),
-        }
+        next_raw_frame(&mut *read, write, self.rules, &self.pong_last_seen).await
       }
     }
   }
@@ -477,21 +466,7 @@ impl ConnectionReader {
     match &mut self.source {
       ReaderSource::Ws(stream) => next_message(stream, self.rules, &self.pong_last_seen).await,
       ReaderSource::Raw { read, pong_write } => {
-        match framing::read_frame(&mut **read, pong_write, self.rules).await? {
-          Some(framing::RawFrame::Data(message)) => Ok(Some(Received::Message(message))),
-          Some(framing::RawFrame::Pong) => {
-            // The peer answered a keepalive ping; record the liveness
-            // time and wake the caller so it can reflect the response
-            // into the session's activity mark.
-            self.pong_last_seen.store(
-              crate::time::now_seconds(),
-              std::sync::atomic::Ordering::Relaxed,
-            );
-            Ok(Some(Received::Pong))
-          }
-          Some(framing::RawFrame::Hint(_)) => Err(Error::invalid_input("transport hint")),
-          None => Ok(None),
-        }
+        next_raw_frame(&mut *read, pong_write, self.rules, &self.pong_last_seen).await
       }
     }
   }
@@ -578,6 +553,35 @@ where
       WsMessage::Close(_) => return Ok(None),
       WsMessage::Frame(_) => return Err(Error::invalid_input("websocket raw frame")),
     }
+  }
+}
+
+/// The raw class's receive translation, shared by the unsplit
+/// connection and the split reader: one framed read mapped onto the
+/// receive-event vocabulary, a keepalive pong refreshing the shared
+/// liveness stamp and waking the caller. No lock is held across the
+/// read: the framing layer locks the shared write half itself only when
+/// a ping must be answered.
+async fn next_raw_frame<R>(
+  read: &mut R, write: &SharedWrite, rules: FrameRules,
+  pong_last_seen: &std::sync::atomic::AtomicU64,
+) -> Result<Option<Received>>
+where
+  R: AsyncRead + Send + Unpin, {
+  match framing::read_frame(&mut *read, write, rules).await? {
+    Some(framing::RawFrame::Data(message)) => Ok(Some(Received::Message(message))),
+    Some(framing::RawFrame::Pong) => {
+      // The peer answered a keepalive ping; record the liveness time and
+      // wake the caller so it can reflect the response into its own
+      // activity mark.
+      pong_last_seen.store(
+        crate::time::now_seconds(),
+        std::sync::atomic::Ordering::Relaxed,
+      );
+      Ok(Some(Received::Pong))
+    }
+    Some(framing::RawFrame::Hint(_)) => Err(Error::invalid_input("transport hint")),
+    None => Ok(None),
   }
 }
 
