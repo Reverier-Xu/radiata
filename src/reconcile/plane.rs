@@ -958,8 +958,16 @@ impl ReconcilePlane {
         let Some(pending) = state.hint_retry.take() else {
           continue;
         };
-        if !state.profile.weak() || pending.attempts_left == 0 || pending.resume_at_tick > tick_now
-        {
+        if !state.profile.weak() || pending.attempts_left == 0 {
+          continue;
+        }
+        if pending.resume_at_tick > tick_now {
+          // The backoff has not expired yet: the slot keeps its message
+          // and its remaining budget for the due tick. Taking the slot
+          // out first and dropping an unexpired retry here is what lost
+          // the 2/4/8-tick legs of the schedule at their first
+          // not-due tick — only the initial 1-tick leg ever re-sent.
+          state.hint_retry = Some(pending);
           continue;
         }
         let backoff = 1_u64 << (HINT_RETRY_MAX - pending.attempts_left);
@@ -2764,17 +2772,202 @@ mod tests {
         "the due retry spent one attempt and kept its remaining budget"
       );
     }
-    // Burn the last attempt: the next due tick spends it and drops the
-    // exhausted slot; a further tick never resurrects it.
+    // The unexpired 4-tick backoff holds the slot: ticks 2–4 neither
+    // spend nor drop it — an unexpired retry keeps its message and its
+    // remaining budget until the due tick.
     plane.tick(&runtime).await.unwrap();
     plane.tick(&runtime).await.unwrap();
     plane.tick(&runtime).await.unwrap();
-    let guard = shared.state.lock().unwrap();
-    let state = guard.peers.get(&peer).unwrap();
-    assert!(
-      state.hint_retry.is_none(),
-      "the exhausted retry slot dropped to the detection cadence"
+    {
+      let guard = shared.state.lock().unwrap();
+      let state = guard.peers.get(&peer).unwrap();
+      let pending = state.hint_retry.as_ref().unwrap();
+      assert_eq!(
+        pending.attempts_left, 1,
+        "the unexpired backoff kept the retry slot with its budget"
+      );
+    }
+    // Burn the last attempt at its due tick (tick 5), then the next
+    // tick drops the exhausted slot; a further tick never resurrects
+    // it.
+    plane.tick(&runtime).await.unwrap();
+    plane.tick(&runtime).await.unwrap();
+    {
+      let guard = shared.state.lock().unwrap();
+      let state = guard.peers.get(&peer).unwrap();
+      assert!(
+        state.hint_retry.is_none(),
+        "the exhausted retry slot dropped to the detection cadence"
+      );
+    }
+    plane.tick(&runtime).await.unwrap();
+    {
+      let guard = shared.state.lock().unwrap();
+      let state = guard.peers.get(&peer).unwrap();
+      assert!(
+        state.hint_retry.is_none(),
+        "a spent budget never re-arms on its own"
+      );
+    }
+  }
+
+  /// Waits for the recording sink to drain the tick's dispatches and
+  /// returns the kinds recorded since the previous call: the recorded
+  /// set must hold steady across two grace windows before the test
+  /// reads it, with an initial grace ahead of the first reading so a
+  /// dispatch the tick spawned but the runtime has not yet scheduled
+  /// is not silently handed to the next tick's window — the plane's
+  /// dispatches are spawned fire-and-forget, so the tick's return does
+  /// not join them. `seen` carries the read offset across calls: each
+  /// call reports only this tick's arrivals.
+  async fn settle_recorded(
+    recorded: &Arc<std::sync::Mutex<Vec<&'static str>>>, seen: &mut usize,
+  ) -> Vec<&'static str> {
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let mut last = usize::MAX;
+    for _ in 0..20 {
+      tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      let settled = recorded.lock().unwrap().len();
+      if settled == last {
+        let guard = recorded.lock().unwrap();
+        let kinds = guard[*seen..].to_vec();
+        *seen = guard.len();
+        return kinds;
+      }
+      last = settled;
+    }
+    let guard = recorded.lock().unwrap();
+    let kinds = guard[*seen..].to_vec();
+    *seen = guard.len();
+    kinds
+  }
+
+  /// B01/P2-3: the unexpired hint retry keeps its slot until the backoff
+  /// expires, and the budget spends itself on the wire — asserted on the
+  /// packets the runtime received, not on the slot alone. Each re-send
+  /// schedules its successor one, two, four, then eight ticks out (the
+  /// doubling backoff), so the wire carries the sends at ticks 4, 5, 7,
+  /// and 11 while the final +8-tick leg is scheduled but never sent —
+  /// the budget is spent. The take-without-restore dropped every
+  /// unexpired retry at its first not-due tick, so only the first leg
+  /// of the schedule ever ran.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_unexpired_hint_retry_keeps_its_full_backoff_schedule() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let peer = node(900);
+    let (entry, _rx) = crate::session::stream::test_entry(shared.entropy.as_ref());
+    shared.sessions.lock().unwrap().insert(peer.clone(), entry);
+    // A recording sink: every dispatch decodes to its reconcile message
+    // kind and is admitted, so the profile samples flow exactly as they
+    // would against a live peer.
+    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(64);
+    let routes: crate::routing::RouteTable =
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let runtime = crate::runtime::RuntimeClient::routing_only(packet_tx, routes);
+    let recorded: Arc<std::sync::Mutex<Vec<&'static str>>> =
+      Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&recorded);
+    let acker = peer.clone();
+    tokio::spawn(async move {
+      while let Some(mut request) = packet_rx.recv().await {
+        let bytes = crate::sync_common::drain_body(request.body.as_mut(), "reconcile body")
+          .await
+          .unwrap_or_default();
+        let decoded = crate::sync_common::decode_plain_sync_envelope(
+          &bytes,
+          super::RECONCILE_SCHEMA,
+          "reconcile frame canonical form",
+          "reconcile frame schema",
+        )
+        .ok()
+        .and_then(|payload| crate::reconcile::wire::decode(payload.as_ref()).ok());
+        if let Some(message) = decoded {
+          let kind = match message {
+            crate::reconcile::wire::Message::Root { .. } => "root",
+            crate::reconcile::wire::Message::Hint { rows, .. } if rows.is_empty() => "hint",
+            crate::reconcile::wire::Message::Hint { .. } => "hint-rows",
+            crate::reconcile::wire::Message::Rows { .. }
+            | crate::reconcile::wire::Message::Offer { .. }
+            | crate::reconcile::wire::Message::Need { .. }
+            | crate::reconcile::wire::Message::Done { .. } => "other",
+          };
+          recorder.lock().unwrap().push(kind);
+        }
+        let _ = request.ack_notify.send(Ok(crate::packet::RoutedAck {
+          by: acker.clone(),
+          admitted_at: std::time::SystemTime::now(),
+        }));
+      }
+    });
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    {
+      let mut guard = shared.state.lock().unwrap();
+      let state = guard
+        .peers
+        .entry(peer.clone())
+        .or_insert_with(super::PeerState::fresh);
+      // A weak link (sustained loss) with the full budget armed for
+      // tick 4.
+      for _ in 0..12 {
+        state.profile.observe(None);
+      }
+      state.hint_retry = Some(super::PendingHint {
+        message: crate::reconcile::wire::Message::Hint {
+          lane: LaneId::Trust,
+          ranges: Vec::new(),
+          rows: Vec::new(),
+        },
+        attempts_left: super::HINT_RETRY_MAX,
+        resume_at_tick: 4,
+      });
+    }
+    // Thirteen ticks: the retry becomes due at tick 4, spends the whole
+    // budget by tick 11, and ticks 12–13 observe the exhausted slot.
+    let mut hint_ticks: Vec<u64> = Vec::new();
+    let mut resumes: Vec<(u8, u64)> = Vec::new();
+    let mut seen = 0_usize;
+    for tick in 1_u64..=13 {
+      plane.tick(&runtime).await.unwrap();
+      let kinds = settle_recorded(&recorded, &mut seen).await;
+      if kinds.contains(&"hint") {
+        hint_ticks.push(tick);
+        // The slot snapshot taken after a send: the resume tick its
+        // successor was scheduled at.
+        let guard = shared.state.lock().unwrap();
+        if let Some(pending) = guard
+          .peers
+          .get(&peer)
+          .and_then(|state| state.hint_retry.as_ref())
+        {
+          resumes.push((pending.attempts_left, pending.resume_at_tick));
+        }
+      }
+    }
+    assert_eq!(
+      hint_ticks,
+      vec![4, 5, 7, 11],
+      "the retry re-sent on the wire at the doubling schedule"
     );
+    // The schedule's slot side, pinned at each send: the sends at ticks
+    // 4, 5, 7, and 11 scheduled their successors at +1, +2, +4, and +8
+    // ticks — the last leg's +8 resume is the part the spent budget
+    // leaves unsent.
+    assert_eq!(
+      resumes,
+      vec![(3, 5), (2, 7), (1, 11), (0, 19)],
+      "each send scheduled its successor on the 1/2/4/8-tick backoff"
+    );
+    {
+      let guard = shared.state.lock().unwrap();
+      let state = guard.peers.get(&peer).unwrap();
+      assert!(
+        state.hint_retry.is_none(),
+        "the exhausted retry slot dropped to the detection cadence"
+      );
+    }
   }
 
   /// A1/B-P1: the retention resurrection — a swept removal row leaves
