@@ -122,15 +122,74 @@ fn established(handshake: &Handshake) -> Result<EstablishedSession> {
 /// certificate), a successful merge-trust fallback dial re-records the
 /// presented leaf as that target's new anchor (audit 2026-10-09 item 8)
 /// — the application identity proof, not the pin, is the authority.
+/// The in-process anchor cache is bounded: a persistent peer that churns
+/// dial targets over one process lifetime must not accumulate obsolete
+/// pins, and neither must a large cluster. Every recorded anchor carries
+/// its last-recorded sequence; eviction drops the oldest per-peer pin past
+/// [`MEMBER_SPKI_ANCHORS_PER_PEER`] and then the globally oldest pin past
+/// [`MEMBER_SPKI_ANCHORS`]. Eviction is safe by construction: an evicted
+/// target simply has no anchor, so its next dial runs under merge trust
+/// where the member handshake's identity proof is the authenticator — the
+/// same fallback as an endpoint that was never pinned.
+const MEMBER_SPKI_ANCHORS_PER_PEER: usize = 4;
+const MEMBER_SPKI_ANCHORS: usize = 256;
+
 #[derive(Default)]
-struct MemberSpkiTable(std::sync::Mutex<std::collections::BTreeMap<(NodeId, Endpoint), Vec<u8>>>);
+struct MemberSpkiTable(std::sync::Mutex<MemberSpkiAnchors>);
+
+/// The bounded anchor cache: `(peer, endpoint)` pins with their last
+/// recorded sequence, oldest-first eviction.
+#[derive(Default)]
+struct MemberSpkiAnchors {
+  sequence: u64,
+  anchors: std::collections::BTreeMap<(NodeId, Endpoint), (u64, Vec<u8>)>,
+}
+
+impl MemberSpkiAnchors {
+  fn record(&mut self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
+    self.sequence = self.sequence.wrapping_add(1);
+    self
+      .anchors
+      .insert((peer.clone(), target.clone()), (self.sequence, spki));
+    self.evict_peer_overflow(peer);
+    self.evict_global_overflow();
+  }
+
+  fn evict_peer_overflow(&mut self, peer: &NodeId) {
+    while self.anchors.keys().filter(|(node, _)| node == peer).count()
+      > MEMBER_SPKI_ANCHORS_PER_PEER
+    {
+      let oldest = self
+        .anchors
+        .iter()
+        .filter(|((node, _), _)| node == peer)
+        .min_by_key(|(_, (sequence, _))| *sequence)
+        .map(|(key, _)| key.clone());
+      let Some(oldest) = oldest else { break };
+      self.anchors.remove(&oldest);
+    }
+  }
+
+  fn evict_global_overflow(&mut self) {
+    while self.anchors.len() > MEMBER_SPKI_ANCHORS {
+      let oldest = self
+        .anchors
+        .iter()
+        .min_by_key(|(_, (sequence, _))| *sequence)
+        .map(|(key, _)| key.clone());
+      let Some(oldest) = oldest else { break };
+      self.anchors.remove(&oldest);
+    }
+  }
+}
 
 impl MemberSpkiTable {
   /// Records the peer's leaf SPKI as the member-mode trust anchor for
-  /// one concrete dial target. The latest record wins per target.
+  /// one concrete dial target. The latest record wins per target, and the
+  /// bounded cache evicts the oldest anchors beyond its bounds.
   fn record(&self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
     if let Ok(mut anchors) = self.0.lock() {
-      anchors.insert((peer.clone(), target.clone()), spki);
+      anchors.record(peer, target, spki);
     }
   }
 
@@ -138,11 +197,12 @@ impl MemberSpkiTable {
   /// process joined or pinned that exact endpoint. Every other endpoint
   /// of the same node reports no anchor and dials under merge trust.
   fn anchor(&self, peer: &NodeId, target: &Endpoint) -> Option<Vec<u8>> {
-    self
-      .0
-      .lock()
-      .ok()
-      .and_then(|anchors| anchors.get(&(peer.clone(), target.clone())).cloned())
+    self.0.lock().ok().and_then(|anchors| {
+      anchors
+        .anchors
+        .get(&(peer.clone(), target.clone()))
+        .map(|(_, spki)| spki.clone())
+    })
   }
 }
 
@@ -714,6 +774,66 @@ mod member_spki_tests {
       anchors.anchor(&peer, &wss).as_deref(),
       Some(b"wss-leaf".as_slice()),
       "a rollover re-record on one target leaves the other target untouched"
+    );
+  }
+
+  /// Endpoint churn stays bounded: the per-peer bound evicts the oldest
+  /// target, and an evicted target reports no anchor so its next dial
+  /// falls back to merge trust (the member handshake's identity proof)
+  /// instead of pinning a stale leaf for the process lifetime (audit B07).
+  #[test]
+  fn endpoint_churn_evicts_the_oldest_anchors_and_falls_back_safely() {
+    let anchors = MemberSpkiTable::default();
+    let peer = peer();
+    let targets: Vec<Endpoint> = (1..=5)
+      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:70{port:02}")).unwrap())
+      .collect();
+    for (index, target) in targets.iter().enumerate() {
+      anchors.record(&peer, target, format!("leaf-{index}").into_bytes());
+    }
+    assert_eq!(
+      anchors.anchor(&peer, &targets[0]),
+      None,
+      "the oldest target of a churning peer is evicted"
+    );
+    for (index, target) in targets.iter().enumerate().skip(1) {
+      assert_eq!(
+        anchors.anchor(&peer, target),
+        Some(format!("leaf-{index}").into_bytes()),
+        "the newest targets keep their anchors"
+      );
+    }
+  }
+
+  /// The cache is globally bounded too: a large cluster only ever keeps
+  /// the newest anchors, and the evicted ones fall back to merge trust.
+  #[test]
+  fn anchor_table_is_globally_bounded() {
+    let anchors = MemberSpkiTable::default();
+    let peers: Vec<NodeId> = (0..=MEMBER_SPKI_ANCHORS)
+      .map(|seed| NodeId::parse(&format!("node-{seed:021}")).unwrap())
+      .collect();
+    let targets: Vec<Endpoint> = (0..=MEMBER_SPKI_ANCHORS)
+      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:{}", 20_000 + port)).unwrap())
+      .collect();
+    for (peer, target) in peers.iter().zip(&targets) {
+      anchors.record(peer, target, b"leaf".to_vec());
+    }
+    assert_eq!(
+      anchors.anchor(&peers[0], &targets[0]),
+      None,
+      "the globally oldest anchor is evicted"
+    );
+    let newest = MEMBER_SPKI_ANCHORS;
+    assert_eq!(
+      anchors.anchor(&peers[newest], &targets[newest]),
+      Some(b"leaf".to_vec()),
+      "the newest anchor is retained"
+    );
+    assert_eq!(
+      anchors.0.lock().unwrap().anchors.len(),
+      MEMBER_SPKI_ANCHORS,
+      "the cache never exceeds its global bound"
     );
   }
 }
