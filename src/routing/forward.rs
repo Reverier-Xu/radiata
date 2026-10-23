@@ -8,6 +8,13 @@
 //! reported upstream with an explicit typed acknowledgement instead of a
 //! replay or continuation.
 //!
+//! Hop ownership binds to exact session incarnations ([`SessionIdentity`],
+//! never a peer alone): the upstream identity decides which session's
+//! teardown may close the hop, and the downstream identity decides which
+//! session's acknowledgements may steer it. Both outlive the one-shot
+//! admission waiter, so a legitimately late terminal acknowledgement is
+//! still attributed to the hop that owns the stream.
+//!
 //! Module boundary: the forwarding domain owns its own types (forwarding
 //! hops, pending acknowledgement entries) and may depend on session
 //! infrastructure — bounded frame senders and the session table — but
@@ -19,7 +26,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::{
-  ErrorKind, NodeId, Result, TraceId,
+  ErrorKind, NodeId, Result, SessionId, TraceId,
   extension_registry::ExtensionRegistry,
   packet::{
     AckOutcome,
@@ -64,20 +71,44 @@ pub(crate) struct RetryState {
   pub(crate) downstream_acks: PendingAcks,
 }
 
+/// The exact session incarnation one forwarded hop attaches to: the
+/// authenticated peer plus that session's server-allocated id. A
+/// replacement session for the same peer is therefore a different
+/// identity, so a retired generation can neither close nor steer the
+/// replacement's hops (audit P1-4).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionIdentity {
+  peer: NodeId,
+  id: SessionId,
+}
+
+impl SessionIdentity {
+  pub(crate) const fn new(peer: NodeId, id: SessionId) -> Self {
+    Self { peer, id }
+  }
+
+  pub(crate) const fn peer(&self) -> &NodeId {
+    &self.peer
+  }
+}
+
 #[derive(Clone)]
 pub(crate) struct ForwardingHop {
   /// Frames toward the upstream holder: acknowledgement relays.
   pub(crate) upstream: BoundedSender,
   /// Frames toward the validated next hop: payload relay.
   pub(crate) downstream: BoundedSender,
-  /// The current attempt's downstream session's pending-admission map:
-  /// a failure acknowledgement is consumed here (the entry would
-  /// otherwise relay the failure upstream past this hop's own retry).
+  /// The current attempt's downstream session's pending-admission map: the
+  /// one-shot admission waiter the hop deadline removes when the attempt
+  /// expires, and the entry a failure acknowledgement consumes so it cannot
+  /// relay the failure upstream past this hop's own retry.
   pub(crate) downstream_acks: PendingAcks,
-  /// The authenticated peer this hop came from; the session that owns the
-  /// upstream sender above cleans its hops up when it ends.
-  pub(crate) upstream_peer: NodeId,
-  /// Serializes an in-flight chunk relay against [`close_for_peer`]: the
+  /// The exact upstream session that feeds this hop: teardown cleanup binds
+  /// to this identity, never to the peer alone.
+  pub(crate) upstream_session: SessionIdentity,
+  /// The exact downstream session of the current attempt.
+  pub(crate) downstream_session: SessionIdentity,
+  /// Serializes an in-flight chunk relay against [`close_for_session`]: the
   /// relay holds this lock across its unbounded backpressure await so a
   /// closing session either queues its end after the queued chunk (strict
   /// chunk-then-end order) or observes the entry already gone. The entry
@@ -129,9 +160,10 @@ pub(crate) const FORWARDING_ROUTE_CAPACITY_DEFAULT: usize = 8_192;
 /// collaborators; no subset forms a meaningful grouping.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open(
-  local: &NodeId, peer: &NodeId, open: OpenFrame, upstream: &BoundedSender,
-  sessions: &SessionTable, forwarding: &ForwardingTable, registry: &ExtensionRegistry,
-  route_policy: &crate::QualifiedTag, forwarding_capacity: usize, relay_hop_deadline: Duration,
+  local: &NodeId, peer: &NodeId, source: &SessionIdentity, open: OpenFrame,
+  upstream: &BoundedSender, sessions: &SessionTable, forwarding: &ForwardingTable,
+  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, forwarding_capacity: usize,
+  relay_hop_deadline: Duration,
 ) -> bool {
   let envelope = crate::routing::RouteContext::from_frame(
     open.trace_id.clone(),
@@ -191,7 +223,7 @@ pub(crate) async fn open(
         relay_open(
           &context,
           &next_hop,
-          peer,
+          source,
           &open,
           upstream,
           sessions,
@@ -221,7 +253,7 @@ pub(crate) async fn relay_chunk(table: &ForwardingTable, frame: ChunkFrame) -> b
     return false;
   };
   // Hold the relay lock across the unbounded backpressure await: the entry
-  // stays visible to close_for_peer, and a concurrent close either queues
+  // stays visible to close_for_session, and a concurrent close either queues
   // its end after this chunk or removes the entry before this relay starts.
   // Dropping the guard before `send_waiting` would let a closing session
   // enqueue its end while this chunk is still waiting, breaking the strict
@@ -253,7 +285,7 @@ pub(crate) async fn relay_end(table: &ForwardingTable, frame: EndFrame) -> bool 
   };
   let relay = hop.relay_lock.lock().await;
   // Removal under the relay lock makes this terminal relay exclusive with
-  // close_for_peer: whichever acquires the lock first sends the one end.
+  // close_for_session: whichever acquires the lock first sends the one end.
   let Some(hop) = take(table, &frame.trace_id) else {
     return true;
   };
@@ -277,15 +309,19 @@ pub(crate) async fn relay_end(table: &ForwardingTable, frame: EndFrame) -> bool 
   true
 }
 
-/// Terminates every hop fed by the session of `upstream_peer`: their
-/// downstream legs receive an explicit typed end (the interruption
-/// discriminant) so no destination consumer waits forever and none can
-/// mistake the truncated body for a complete one, and no reopen path
-/// ever continues a body.
-pub(crate) async fn close_for_peer(table: &ForwardingTable, upstream_peer: &NodeId) {
+/// Terminates every hop fed by exactly this session: their downstream legs
+/// receive an explicit typed end (the interruption discriminant) so no
+/// destination consumer waits forever and none can mistake the truncated
+/// body for a complete one, and no reopen path ever continues a body.
+///
+/// The binding is the exact upstream session identity, never the peer: a
+/// replacement session for the same peer owns its own hops, so the retired
+/// generation's teardown can no longer interrupt the routes the winner just
+/// registered (audit P1-4).
+pub(crate) async fn close_for_session(table: &ForwardingTable, upstream: &SessionIdentity) {
   let candidates: Vec<TraceId> = locked(table)
     .iter()
-    .filter(|(_, hop)| hop.upstream_peer == *upstream_peer)
+    .filter(|(_, hop)| hop.upstream_session == *upstream)
     .map(|(trace, _)| trace.clone())
     .collect();
   for trace_id in candidates {
@@ -321,20 +357,26 @@ pub(crate) async fn close_for_peer(table: &ForwardingTable, upstream_peer: &Node
 /// collaborators; no subset forms a meaningful grouping.
 #[allow(clippy::too_many_arguments)]
 async fn relay_open(
-  context: &crate::routing::RouteContext, next_hop: &NodeId, peer: &NodeId, open: &OpenFrame,
-  upstream: &BoundedSender, sessions: &SessionTable, forwarding: &ForwardingTable,
-  candidates: &[NodeId], relay_hop_deadline: Duration,
+  context: &crate::routing::RouteContext, next_hop: &NodeId, source: &SessionIdentity,
+  open: &OpenFrame, upstream: &BoundedSender, sessions: &SessionTable,
+  forwarding: &ForwardingTable, candidates: &[NodeId], relay_hop_deadline: Duration,
 ) {
   let downstream = match sessions.lock() {
     Ok(guard) => guard
       .get(next_hop)
       .filter(|entry| entry.alive())
-      .map(|entry| (entry.frames.clone(), entry.pending_acks.clone())),
+      .map(|entry| {
+        (
+          entry.frames.clone(),
+          entry.pending_acks.clone(),
+          SessionIdentity::new(next_hop.clone(), entry.session_id().clone()),
+        )
+      }),
     // The table lock never spans an await: failures resolve to "no path"
     // and the typed rejection still reaches the upstream holder.
     Err(_) => None,
   };
-  let Some((downstream_frames, downstream_acks)) = downstream else {
+  let Some((downstream_frames, downstream_acks, downstream_session)) = downstream else {
     debug!(next_hop = %next_hop, "routed open has no live downstream session");
     return fail_upstream(upstream, &open.trace_id).await;
   };
@@ -411,7 +453,8 @@ async fn relay_open(
       upstream: upstream.clone(),
       downstream: downstream_frames,
       downstream_acks: downstream_acks.clone(),
-      upstream_peer: peer.clone(),
+      upstream_session: source.clone(),
+      downstream_session,
       relay_lock: Arc::new(tokio::sync::Mutex::new(())),
       // Armed below once the open is on the wire (the hop owns its
       // attempt's timer; see [`arm_hop_deadline`]).
@@ -539,6 +582,7 @@ pub(crate) async fn on_downstream_failure(
       continue;
     };
     let downstream_acks = entry.pending_acks.clone();
+    let downstream_session = SessionIdentity::new(candidate.clone(), entry.session_id().clone());
     let queued = (|| {
       let mut acks = downstream_acks.lock().ok()?;
       if acks.contains_key(trace_id) || acks.len() >= crate::session::stream::MAX_PENDING_ADMISSIONS
@@ -591,6 +635,9 @@ pub(crate) async fn on_downstream_failure(
     if let Some(hop) = locked(forwarding).get_mut(trace_id) {
       hop.downstream = entry.frames.clone();
       hop.downstream_acks = Arc::clone(&downstream_acks);
+      // Stream ownership follows the attempt: the hop's attribution now
+      // binds to the new branch's session identity.
+      hop.downstream_session = downstream_session;
       // The re-armed retry must consume its OWN attempt's pending entry:
       // the live map is the new branch's, so a failure (or deadline) from
       // this attempt removes exactly the entry it inserted — never a
@@ -841,6 +888,42 @@ mod tests {
     TraceId::parse(&format!("trace-{seed:021}")).unwrap()
   }
 
+  /// The exact session identity one test hop binds to: a peer plus one
+  /// session incarnation of it (a second incarnation of the same peer is a
+  /// different identity).
+  fn identity(peer: u8, incarnation: u32) -> super::SessionIdentity {
+    super::SessionIdentity::new(
+      node(peer),
+      crate::SessionId::parse(&format!("session-{incarnation:021}")).unwrap(),
+    )
+  }
+
+  /// One plain (pure relay) hop between the given frame senders, owned by
+  /// `upstream_peer`'s first incarnation and forwarding to
+  /// `downstream_peer`'s first incarnation.
+  fn hop(
+    upstream: crate::session::stream::BoundedSender,
+    downstream: crate::session::stream::BoundedSender,
+  ) -> ForwardingHop {
+    hop_between(upstream, downstream, 9, 7)
+  }
+
+  fn hop_between(
+    upstream: crate::session::stream::BoundedSender,
+    downstream: crate::session::stream::BoundedSender, upstream_peer: u8, downstream_peer: u8,
+  ) -> ForwardingHop {
+    ForwardingHop {
+      upstream,
+      downstream,
+      downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+      upstream_session: identity(upstream_peer, 1),
+      downstream_session: identity(downstream_peer, 2),
+      relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+      retry: None,
+      deadline: None,
+    }
+  }
+
   fn chunk(seed: u32, sequence: u64, payload: u8) -> ChunkFrame {
     ChunkFrame {
       trace_id: trace(seed),
@@ -859,22 +942,7 @@ mod tests {
     let (upstream_tx, mut upstream_rx) = crate::session::stream::test_queue(16, usize::MAX);
     let upstream_keep = upstream_tx.clone();
     let (downstream_tx, mut downstream_drain) = crate::session::stream::test_queue(16, usize::MAX);
-    super::register(
-      &table,
-      trace(1),
-      ForwardingHop {
-        upstream: upstream_tx,
-        downstream: downstream_tx,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
-        upstream_peer: node(9),
-        relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        retry: None,
-        deadline: None,
-      },
-    )
-    .unwrap();
+    super::register(&table, trace(1), hop(upstream_tx, downstream_tx)).unwrap();
 
     for sequence in 0..5_u64 {
       assert!(relay_chunk(&table, chunk(1, sequence, payload_byte(sequence))).await);
@@ -936,22 +1004,7 @@ mod tests {
     let upstream_keep = upstream_tx.clone();
     // One-message downstream queue: the second chunk must stall.
     let (downstream_tx, mut downstream_drain) = crate::session::stream::test_queue(1, usize::MAX);
-    super::register(
-      &table,
-      trace(2),
-      ForwardingHop {
-        upstream: upstream_tx,
-        downstream: downstream_tx,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
-        upstream_peer: node(9),
-        relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        retry: None,
-        deadline: None,
-      },
-    )
-    .unwrap();
+    super::register(&table, trace(2), hop(upstream_tx, downstream_tx)).unwrap();
 
     assert!(relay_chunk(&table, chunk(2, 0, 1)).await);
     // The first frame occupies the only slot: this relay cannot finish yet.
@@ -983,22 +1036,7 @@ mod tests {
     let (upstream_tx, mut upstream_rx) = crate::session::stream::test_queue(16, usize::MAX);
     let upstream_keep = upstream_tx.clone();
     let (downstream_tx, downstream_rx) = crate::session::stream::test_queue(16, usize::MAX);
-    super::register(
-      &table,
-      trace(3),
-      ForwardingHop {
-        upstream: upstream_tx,
-        downstream: downstream_tx,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
-        upstream_peer: node(9),
-        relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        retry: None,
-        deadline: None,
-      },
-    )
-    .unwrap();
+    super::register(&table, trace(3), hop(upstream_tx, downstream_tx)).unwrap();
     drop((downstream_rx,));
 
     assert!(relay_chunk(&table, chunk(3, 0, 1)).await);
@@ -1028,7 +1066,7 @@ mod tests {
   #[tokio::test]
   async fn feeding_session_end_terminates_every_downstream_leg() {
     let table = new_table();
-    let feeder = node(9);
+    let feeder = identity(9, 1);
     let mut downstreams = Vec::new();
     for seed in [4_u32, 5] {
       let (upstream_tx, _) = crate::session::stream::test_queue(16, usize::MAX);
@@ -1036,22 +1074,12 @@ mod tests {
       super::register(
         &table,
         trace(seed),
-        ForwardingHop {
-          upstream: upstream_tx,
-          downstream: downstream_tx,
-          downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-          )),
-          upstream_peer: feeder.clone(),
-          relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-          retry: None,
-          deadline: None,
-        },
+        hop_between(upstream_tx, downstream_tx, 9, 7),
       )
       .unwrap();
       downstreams.push(downstream_drain);
     }
-    super::close_for_peer(&table, &feeder).await;
+    super::close_for_session(&table, &feeder).await;
     assert!(!super::contains(&table, &trace(4)));
     assert!(!super::contains(&table, &trace(5)));
     // Both downstream legs received the typed interruption end — never a
@@ -1070,21 +1098,98 @@ mod tests {
     super::register(
       &table,
       trace(6),
-      ForwardingHop {
-        upstream: upstream_tx,
-        downstream: downstream_tx,
+      hop_between(upstream_tx, downstream_tx, 8, 7),
+    )
+    .unwrap();
+    super::close_for_session(&table, &identity(9, 1)).await;
+    assert!(super::contains(&table, &trace(6)));
+  }
+
+  /// Regression (audit P1-4): a retired session generation's teardown must
+  /// not close the routes a replacement session for the same peer just
+  /// registered. The winner's hop is registered first — the barrier — and
+  /// only then is the old generation's cleanup released; the winner's route
+  /// survives untouched while the old generation's own hop still receives
+  /// the explicit interrupted end downstream.
+  #[tokio::test]
+  async fn retired_generation_cleanup_leaves_the_replacement_sessions_routes() {
+    let table = new_table();
+    // Two incarnations of the same peer: the old session and its
+    // replacement (the winner).
+    let old = identity(9, 1);
+    let winner = identity(9, 2);
+    assert_eq!(old.peer(), winner.peer());
+    assert_ne!(old, winner, "a replacement is a different identity");
+
+    // The winner's route: registered before the old generation's cleanup
+    // is released.
+    let (winner_upstream, _winner_upstream_rx) = crate::session::stream::test_queue(16, usize::MAX);
+    let (winner_downstream, mut winner_drain) = crate::session::stream::test_queue(16, usize::MAX);
+    super::register(
+      &table,
+      trace(11),
+      super::ForwardingHop {
+        upstream: winner_upstream,
+        downstream: winner_downstream,
         downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
           std::collections::HashMap::new(),
         )),
-        upstream_peer: node(8),
+        upstream_session: winner.clone(),
+        downstream_session: identity(7, 3),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         retry: None,
         deadline: None,
       },
     )
     .unwrap();
-    super::close_for_peer(&table, &node(9)).await;
-    assert!(super::contains(&table, &trace(6)));
+    // The same peer's old generation still owns one hop of its own.
+    let (old_upstream, _old_upstream_rx) = crate::session::stream::test_queue(16, usize::MAX);
+    let (old_downstream, mut old_drain) = crate::session::stream::test_queue(16, usize::MAX);
+    super::register(
+      &table,
+      trace(12),
+      super::ForwardingHop {
+        upstream: old_upstream,
+        downstream: old_downstream,
+        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
+          std::collections::HashMap::new(),
+        )),
+        upstream_session: old.clone(),
+        downstream_session: identity(7, 3),
+        relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        retry: None,
+        deadline: None,
+      },
+    )
+    .unwrap();
+
+    // Barrier: the old generation's cleanup runs only after the winner's
+    // route is installed.
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let closer_table = table.clone();
+    let closer_identity = old.clone();
+    let closer = tokio::spawn(async move {
+      let _ = released.await;
+      super::close_for_session(&closer_table, &closer_identity).await;
+    });
+    release.send(()).unwrap();
+    closer.await.unwrap();
+
+    // The winner's route survived; the old generation's hop was terminated
+    // with an explicit interrupted end.
+    assert!(
+      super::contains(&table, &trace(11)),
+      "the replacement session's route must survive the retired generation's cleanup"
+    );
+    assert!(!super::contains(&table, &trace(12)));
+    let frame = old_drain.recv().await.unwrap();
+    assert_eq!(frame.kind, PacketKind::End);
+    let end =
+      crate::packet::wire::decode_end(&frame.body, crate::protocol::CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(end.reason, crate::packet::wire::EndReason::Interrupted);
+    // The winner's downstream leg never saw a spurious end.
+    use futures_util::FutureExt;
+    assert!(winner_drain.recv().now_or_never().is_none());
   }
 
   /// A closing session's end never passes a still-in-flight chunk: the
@@ -1094,19 +1199,20 @@ mod tests {
   #[tokio::test]
   async fn closing_session_end_queues_after_the_last_in_flight_chunk() {
     let table = new_table();
-    let feeder = node(9);
+    let feeder = identity(9, 1);
     let (upstream_tx, _) = crate::session::stream::test_queue(16, usize::MAX);
     let (downstream_tx, mut downstream_drain) = crate::session::stream::test_queue(1, usize::MAX);
     super::register(
       &table,
       trace(7),
-      ForwardingHop {
+      super::ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
         downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
           std::collections::HashMap::new(),
         )),
-        upstream_peer: feeder.clone(),
+        upstream_session: feeder.clone(),
+        downstream_session: identity(7, 1),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         retry: None,
         deadline: None,
@@ -1128,8 +1234,9 @@ mod tests {
     // A concurrent session close must wait out the in-flight chunk relay
     // instead of enqueueing its end ahead of the queued chunk.
     let closer_table = std::sync::Arc::clone(&table);
+    let closer_identity = feeder.clone();
     let closer = tokio::spawn(async move {
-      super::close_for_peer(&closer_table, &feeder).await;
+      super::close_for_session(&closer_table, &closer_identity).await;
     });
 
     // Release the stalled relay; the chunk must leave before the end.
@@ -1174,6 +1281,14 @@ mod retry_tests {
     Arc::new(crate::identity::testing::SequenceEntropy::default())
   }
 
+  /// The exact session identity one test hop binds to.
+  fn identity(peer: u8, incarnation: u32) -> super::SessionIdentity {
+    super::SessionIdentity::new(
+      node(peer),
+      crate::SessionId::parse(&format!("session-{incarnation:021}")).unwrap(),
+    )
+  }
+
   fn hop_with_retry(
     upstream: crate::session::stream::BoundedSender,
     downstream: crate::session::stream::BoundedSender, downstream_acks: super::PendingAcks,
@@ -1184,7 +1299,8 @@ mod retry_tests {
       upstream,
       downstream,
       downstream_acks: downstream_acks.clone(),
-      upstream_peer: node(1),
+      upstream_session: identity(1, 1),
+      downstream_session: identity(7, 1),
       relay_lock: Arc::new(tokio::sync::Mutex::new(())),
       retry: Some(RetryState {
         open: crate::packet::wire::OpenFrame {
@@ -1421,7 +1537,7 @@ mod retry_tests {
     super::relay_open(
       &context,
       &next_hop,
-      &node(1),
+      &identity(1, 1),
       &open,
       &upstream_tx,
       &sessions,
