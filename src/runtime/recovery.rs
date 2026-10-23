@@ -358,9 +358,9 @@ impl TickState {
     for member in step.targets {
       // Bound re-check per spawn (audit finding #5): the counter only
       // ever decrements when a dial completes, so the check immediately
-      // before the increment below holds the in-flight count at the
-      // bound; the truncated targets stay candidates for the
-      // controller's rotating cursor on a later step.
+      // before the spawn below (which acquires the slot) holds the
+      // in-flight count at the bound; the truncated targets stay
+      // candidates for the controller's rotating cursor on a later step.
       if self
         .recovery_pending
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -387,66 +387,17 @@ impl TickState {
       // Recovery dials run in their own task so the tick worker never
       // blocks on a handshake (each holds its in-flight slot no longer
       // than the configured dial deadline plus the authentication
-      // deadline); the result is reconciled by the next observation
-      // tick.
-      let transport = match self.extensions.resolve_transport(&endpoint.selector()) {
-        Ok(transport) => transport,
-        // No transport for the endpoint: the dial cannot even start, so
-        // no in-flight slot is taken.
-        Err(error) => {
-          tracing::debug!(endpoint = %endpoint.as_str(), kind = ?error.kind(), "recovery dial unresolvable");
-          continue;
-        }
-      };
-      // The scoped permit holds this dial's fan-out slot for the whole
-      // task: a live local across the dial's await, dropped on
-      // completion, panic unwind, or cancellation — the counter stays
-      // the in-flight bound, never a lifetime volume (audit P2-12).
-      let permit = DialPermit::acquire(Arc::clone(&self.recovery_pending));
-      let receiver = endpoint.clone();
-      let peer = member.clone();
-      let driver = self.driver.clone();
-      let sessions = self.sessions.clone();
-      let packet = self.packet.clone();
-      let shutdown = self.shutdown.clone();
-      let connection_tasks = self.connection_tasks.clone();
-      let dial_deadline = self.config.dial_deadline();
-      let dial = tokio::spawn(async move {
-        let _slot = permit;
-        if let Err(error) = dial_member(
-          transport,
-          driver,
-          sessions,
-          packet,
-          shutdown,
-          connection_tasks,
-          receiver,
-          &peer,
-          true,
-          dial_deadline,
-        )
-        .await
-        {
-          // A refused dial is expected while a peer restarts; the
-          // failure surfaces for the recovery controller's next
-          // observation tick instead of vanishing here.
-          tracing::warn!(
-            peer = %peer.as_str(),
-            kind = ?error.kind(),
-            "recovery dial failed"
-          );
-        }
-      });
-      // The dial's JoinHandle joins the tracked connection-task set the
-      // recovery tick reaps and the shutdown path drains inside its
-      // bounded cooperative window, aborting only the stragglers (audit
-      // finding #19): a dropped handle would leave an in-flight
-      // handshake unowned — shutdown would neither cancel it nor wait
-      // for it, so a lingering dial would keep holding this
-      // incarnation's store and session Arcs across a restart.
-      if let Ok(mut handles) = self.connection_tasks.lock() {
-        handles.push(dial);
-      }
+      // deadline); the shared dial lifecycle below owns the execution
+      // and tracking mechanics, and the result is reconciled by the next
+      // observation tick.
+      spawn_member_dial(
+        self,
+        Arc::clone(&self.recovery_pending),
+        member.clone(),
+        endpoint.clone(),
+        true,
+        report_recovery_dial_failure,
+      );
     }
     Ok(())
   }
@@ -586,6 +537,91 @@ impl Drop for DialPermit {
       .pending
       .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
   }
+}
+
+/// The plane-owned failure diagnostics the shared dial lifecycle calls
+/// when a member dial resolves to an error: each plane keeps its own
+/// log target, level, and message — a recovery failure is expected while
+/// a peer restarts and surfaces at warn for the controller's next
+/// observation tick; a maintenance failure is best-effort by contract
+/// and stays at debug.
+pub(super) type DialFailureReport = fn(&NodeId, &Error);
+
+/// The dial lifecycle both dial planes share (recovery fan-out and
+/// degree maintenance): resolve the endpoint's transport, spawn
+/// [`dial_member`] in its own task under a scoped [`DialPermit`] (the
+/// slot releases on completion, panic unwind, or cancellation), and
+/// register the JoinHandle with the tracked connection-task set the
+/// recovery tick reaps and the shutdown path drains. The planes keep
+/// their own selection policies and budgets — the caller picks the
+/// counter the permit bounds, the `recovery_dialed` edge class, and the
+/// failure diagnostics; the helper owns only the execution and tracking
+/// mechanics both planes repeated.
+pub(super) fn spawn_member_dial(
+  state: &TickState, pending: Arc<std::sync::atomic::AtomicUsize>, peer: NodeId,
+  receiver: Endpoint, recovery_dialed: bool, report: DialFailureReport,
+) {
+  let transport = match state.extensions.resolve_transport(&receiver.selector()) {
+    Ok(transport) => transport,
+    // No transport for the endpoint: the dial cannot even start, so no
+    // in-flight slot is taken, and the next tick picks again (possibly
+    // the same member).
+    Err(error) => {
+      debug!(
+        peer = %peer.as_str(),
+        endpoint = %receiver.as_str(),
+        kind = ?error.kind(),
+        "member dial unresolvable"
+      );
+      return;
+    }
+  };
+  let permit = DialPermit::acquire(pending);
+  let driver = state.driver.clone();
+  let sessions = state.sessions.clone();
+  let packet = state.packet.clone();
+  let shutdown = state.shutdown.clone();
+  let connection_tasks = state.connection_tasks.clone();
+  let dial_deadline = state.config.dial_deadline();
+  let dial = tokio::spawn(async move {
+    let _slot = permit;
+    if let Err(error) = dial_member(
+      transport,
+      driver,
+      sessions,
+      packet,
+      shutdown,
+      connection_tasks,
+      receiver,
+      &peer,
+      recovery_dialed,
+      dial_deadline,
+    )
+    .await
+    {
+      report(&peer, &error);
+    }
+  });
+  // The dial's JoinHandle joins the tracked connection-task set the
+  // recovery tick reaps (finished handles) and the shutdown path drains
+  // inside its bounded cooperative window, aborting only the stragglers
+  // (audit finding #19): an in-flight dial is owned and torn down with
+  // the node instead of outliving it.
+  if let Ok(mut handles) = state.connection_tasks.lock() {
+    handles.push(dial);
+  }
+}
+
+/// The recovery plane's failure diagnostics for the shared dial
+/// lifecycle: a refused dial is expected while a peer restarts; the
+/// failure surfaces at warn for the recovery controller's next
+/// observation tick instead of vanishing here.
+fn report_recovery_dial_failure(peer: &NodeId, error: &Error) {
+  tracing::warn!(
+    peer = %peer.as_str(),
+    kind = ?error.kind(),
+    "recovery dial failed"
+  );
 }
 
 /// Advances a per-member endpoint serial map for `member`'s next dial
