@@ -123,6 +123,13 @@ pub(crate) struct OperationDeps {
   /// double ([`OperationDeps::test_double`]), whose scripted effects read
   /// nothing; every production incarnation carries them.
   planes: Option<EffectPlanes>,
+  /// The bounded observation lanes' scheduling half, installed by
+  /// [`super::task_manager::spawn_task_manager`] before any effect can
+  /// run: the resource-write effects schedule their post-commit
+  /// observations onto the same lanes the manager owns and aborts at
+  /// drain. The manager keeps the runner handles, so this half never
+  /// pins the lanes' lifetime.
+  observation_lanes: std::sync::OnceLock<crate::task::ObservationScheduler>,
 }
 
 impl OperationDeps {
@@ -136,6 +143,7 @@ impl OperationDeps {
     Ok(Self {
       events: Arc::clone(&dependencies.events),
       extensions: Arc::clone(&dependencies.extensions),
+      observation_lanes: std::sync::OnceLock::new(),
       planes: Some(EffectPlanes {
         context: dependencies
           .context
@@ -179,6 +187,7 @@ impl OperationDeps {
       events,
       extensions,
       planes: None,
+      observation_lanes: std::sync::OnceLock::new(),
     }
   }
 
@@ -199,6 +208,26 @@ impl OperationDeps {
       .planes
       .as_ref()
       .ok_or_else(|| Error::internal("runtime operations"))
+  }
+
+  /// Installs the bounded observation lanes' scheduling half. Called
+  /// once per incarnation by the task manager spawn, before any effect
+  /// can run; a second install keeps the first and warns — the lanes
+  /// belong to the incarnation that first installed them.
+  pub(super) fn install_observation_lanes(&self, lanes: crate::task::ObservationScheduler) {
+    if self.observation_lanes.set(lanes).is_err() {
+      tracing::warn!("the observation lanes were installed twice; keeping the installed ones");
+    }
+  }
+
+  /// The bounded observation lanes' scheduling half. Installed before
+  /// the manager's first effect on every production incarnation, so
+  /// the typed internal error is unreachable there.
+  pub(super) fn observation_lanes(&self) -> Result<&crate::task::ObservationScheduler> {
+    self
+      .observation_lanes
+      .get()
+      .ok_or_else(|| Error::internal("observation lanes"))
   }
 }
 
@@ -1057,8 +1086,12 @@ async fn reconcile_put_resource(
     crate::ResourceMutationView::new(accepted.clone(), true),
     superseded,
   )?;
-  crate::task::notify_resource_observers(&deps.extensions().resource_hooks(), view.accepted())
-    .await;
+  crate::task::notify_resource_observers(
+    deps.observation_lanes()?,
+    &deps.extensions().resource_hooks(),
+    view.accepted(),
+  )
+  .await;
   Ok(EffectOutcome::new(TaskOutput::PutResource(view)))
 }
 
@@ -1178,8 +1211,12 @@ async fn reconcile_delete_resource(
     })
   })
   .await?;
-  crate::task::notify_resource_observers(&deps.extensions().resource_hooks(), view.accepted())
-    .await;
+  crate::task::notify_resource_observers(
+    deps.observation_lanes()?,
+    &deps.extensions().resource_hooks(),
+    view.accepted(),
+  )
+  .await;
   Ok(EffectOutcome::new(TaskOutput::DeleteResource(view)))
 }
 

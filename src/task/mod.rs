@@ -12,7 +12,8 @@
 //! verb would have lost.
 
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, hash_map::DefaultHasher},
+  hash::{Hash, Hasher},
   marker::PhantomData,
   panic::AssertUnwindSafe,
   sync::{Arc, Mutex},
@@ -20,7 +21,7 @@ use std::{
 };
 
 use futures_util::FutureExt;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
   BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeId, QualifiedTag, Result, TaskId,
@@ -73,29 +74,46 @@ impl TaskKind {
   /// network dials (join/connect), which can hold a slot for a whole
   /// dial deadline, draw from their own channel so local work
   /// (resource writes, credentials, maintenance) never queues behind a
-  /// wedged dial. The split's budgets live in
-  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots).
+  /// wedged dial, and the caller-registered extension kinds draw from
+  /// their own channel so a workflow awaiting core verbs through its
+  /// handle never occupies the local capacity its own child operations
+  /// need. The two core budgets live in
+  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots);
+  /// the extension channel's budget is the task manager's own constant.
   pub(crate) const fn slot_class(&self) -> SlotClass {
     match self {
       Self::Join | Self::Connect => SlotClass::Network,
+      Self::Extension(_) => SlotClass::Extension,
       _ => SlotClass::Local,
     }
   }
 }
 
-/// Which of the task manager's two execution-slot channels a kind
-/// draws from. Local work keeps its own budget so a fleet of wedged
-/// dials cannot starve the operations whose latency the caller owns.
+/// Which of the task manager's execution-slot channels a kind draws
+/// from. Each class keeps its own budget so one class's wedged work can
+/// never starve the operations whose latency the caller owns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotClass {
   /// Join and connect dials: bounded by the configured dial deadline
-  /// (seconds), so they are the only kinds that can pin a slot for a
-  /// transport-observable span.
+  /// (seconds), so they are the only core kinds that can pin a slot
+  /// for a transport-observable span.
   Network,
-  /// Everything else (resource writes, credentials, leave, recovery,
-  /// retention, sync, listener and metadata maintenance, custom
-  /// reconcilers): effects whose latency is this node's own.
+  /// The core's own node-local work (resource writes, credentials,
+  /// leave, recovery, retention, sync, listener and metadata
+  /// maintenance): effects whose latency is this node's own.
   Local,
+  /// Caller-registered extension workflows: their own channel, because
+  /// an extension reconciler is the one effect class that routinely
+  /// awaits *other* admitted tasks through its public handle — drawing
+  /// from the local channel would let a workflow occupy the very
+  /// capacity its child writes need (with one local slot, the first
+  /// such workflow deadlocks on itself). Recursive waiting is bounded
+  /// per class: code running inside one class's effect may await tasks
+  /// of other classes, but awaiting another task of the *same* class
+  /// (an extension reconciler awaiting an extension task) can
+  /// self-deadlock on that class's bounded budget, so reconcile code
+  /// must never do it.
+  Extension,
 }
 
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
@@ -444,6 +462,24 @@ impl TaskTable {
       entries.remove(&id);
     }
   }
+
+  /// The number of live non-terminal entries of one slot class: the
+  /// manager's admission bound counts these (a class whose non-terminal
+  /// count reaches its bound refuses further admissions typed), so slow
+  /// effects plus a stream of distinct intents can never accumulate
+  /// unbounded admitted work — entries, captured effects, and waiting
+  /// workers are each bounded by it. Terminal entries (the bounded
+  /// history) never count: they are observations, not work.
+  pub(crate) fn non_terminal_count(&self, class: SlotClass) -> usize {
+    self.lock().map_or(0, |entries| {
+      entries
+        .values()
+        .filter(|entry| {
+          entry.kind.slot_class() == class && !entry.status.borrow().phase.is_terminal()
+        })
+        .count()
+    })
+  }
 }
 
 /// The caller's observation half over the shared task table: the table
@@ -456,6 +492,50 @@ pub(crate) struct TaskObserver {
   /// The manager's stop signal: `true` once the manager stopped
   /// admitting and reconciling (node shutdown).
   pub(crate) stop: watch::Receiver<bool>,
+}
+
+impl TaskObserver {
+  /// The watch/shutdown arbitration every wait composes — the typed
+  /// [`Task::wait`] and the node api's id-based wait: resolves with the
+  /// terminal status record once the id terminalizes (value-based: an
+  /// already-terminal id resolves immediately, so there is no
+  /// missed-transition race), and with the typed shutdown failure
+  /// once the manager's terminal publication can no longer arrive
+  /// (the status watch closed, or the stop signal reached a kind the
+  /// shutdown drain does not await). A kind the drain awaits to
+  /// terminality (the journaled leave and frozen-journal resolution)
+  /// still resolves with its real outcome: the manager publishes it
+  /// before the drain completes.
+  pub(crate) async fn await_terminal(
+    &self, id: &TaskId, kind: &TaskKind,
+  ) -> Result<TaskStatusRecord> {
+    let Some(mut status) = self.table.watch(id) else {
+      return Err(Error::not_found("task"));
+    };
+    let mut stop = self.stop.clone();
+    loop {
+      let record = status.borrow().clone();
+      if record.phase.is_terminal() {
+        return Ok(record);
+      }
+      // The task will never terminalize once either watch closes, or
+      // once the stop signal reaches a kind the drain does not await.
+      let stopped = tokio::select! {
+        changed = status.changed() => changed.is_err(),
+        changed = stop.changed() => changed.is_err() || !kind.drains_on_shutdown(),
+      };
+      if stopped {
+        // The terminal publication can land in the same wake as the
+        // stop signal (the manager publishes before it stops), so the
+        // outcome is still read before the typed shutdown failure.
+        let record = status.borrow().clone();
+        if record.phase.is_terminal() {
+          return Ok(record);
+        }
+        return Err(Error::shutting_down("task wait"));
+      }
+    }
+  }
 }
 
 /// The sealed bound behind every typed task handle: it maps a stored
@@ -664,59 +744,37 @@ impl<T: TaskResult> Task<T> {
   /// its real outcome: the manager publishes it before the drain
   /// completes.
   pub async fn wait(self) -> Result<T> {
-    let Some(mut status) = self.observer.table.watch(&self.id) else {
-      return Err(Error::not_found("task"));
-    };
-    let mut stop = self.observer.stop.clone();
-    loop {
-      if let Some(result) = resolve_terminal::<T>(&self.id, &status, &self.observer.table) {
-        return result;
-      }
-      // The task will never terminalize once either watch closes, or
-      // once the stop signal reaches a kind the drain does not await.
-      let stopped = tokio::select! {
-        changed = status.changed() => changed.is_err(),
-        changed = stop.changed() => changed.is_err() || !self.kind.drains_on_shutdown(),
-      };
-      if stopped {
-        // The terminal publication can land in the same wake as the
-        // stop signal (the manager publishes before it stops), so the
-        // outcome is still read before the typed shutdown failure.
-        if let Some(result) = resolve_terminal::<T>(&self.id, &status, &self.observer.table) {
-          return result;
-        }
-        return Err(Error::shutting_down("task wait"));
-      }
-    }
+    let record = self.observer.await_terminal(&self.id, &self.kind).await?;
+    resolve_terminal::<T>(record, &self.id, &self.observer.table)
   }
 }
 
-/// Maps one watch snapshot to a terminal result when the record says
-/// terminal: the success path takes (consumes) the secret slot and maps
-/// the stored output through [`TaskResult`]; the failure path rebuilds
-/// the typed error.
+/// Maps one terminal status record to its result: the success path
+/// takes (consumes) the secret slot and maps the stored output through
+/// [`TaskResult`]; the failure path rebuilds the typed error.
 fn resolve_terminal<T: TaskResult>(
-  id: &TaskId, status: &watch::Receiver<TaskStatusRecord>, table: &TaskTable,
-) -> Option<Result<T>> {
-  let record = status.borrow().clone();
+  record: TaskStatusRecord, id: &TaskId, table: &TaskTable,
+) -> Result<T> {
   match record.phase {
     TaskPhase::Succeeded => {
       let collected = table.update(id, |entry| (entry.output.clone(), entry.secret.take()));
-      Some(match collected {
+      match collected {
         // A `Succeeded` entry always carries its output; the missing
         // shapes are internal invariant violations, never caller data.
         Ok(Some((Some(output), secret))) => T::from_output(output, secret),
         Ok(Some((None, _))) => Err(Error::internal(OUTPUT_MISMATCH)),
         Ok(None) => Err(Error::not_found("task")),
         Err(error) => Err(error),
-      })
+      }
     }
-    TaskPhase::Failed => Some(Err(
+    TaskPhase::Failed => Err(
       record
         .error
         .map_or_else(|| Error::internal("task failure"), TaskError::to_error),
-    )),
-    TaskPhase::Pending | TaskPhase::Running => None,
+    ),
+    // The arbitration resolves only at a terminal phase, so a
+    // non-terminal record here is an internal invariant violation.
+    TaskPhase::Pending | TaskPhase::Running => Err(Error::internal("task terminal phase")),
   }
 }
 
@@ -725,9 +783,9 @@ fn resolve_terminal<T: TaskResult>(
 /// Hooks registered through
 /// [`ExtensionRegistry::register_resource_hook`](crate::ExtensionRegistry::register_resource_hook)
 /// run in canonical tag order. `validate` and `mutate` run on the
-/// caller's admission path, before any IO; `observed` runs in its own
-/// spawned observation task after this node's own commit lands, off the
-/// write task's execution slot.
+/// caller's admission path, before any IO; `observed` runs on the
+/// node's bounded observation lanes after this node's own commit
+/// lands, off the write task's execution slot.
 pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
   /// Rejects a write at admission, before any IO runs. The first
   /// rejection in tag order wins and the verb fails typed with it.
@@ -745,11 +803,12 @@ pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
   /// Fires after this node's own commit lands: the local observation of
   /// the put or delete, never a cluster-convergence promise (cluster
   /// visibility stays the reconcile plane's domain, observable through
-  /// [`crate::ResourceChanged`]). The observation runs in its own
-  /// spawned task, off the write task's execution slot and after the
-  /// commit lands; scheduling does not await the observer, so an error
-  /// or a panic is a diagnostic and never fails, delays, or blocks the
-  /// task or its shutdown.
+  /// [`crate::ResourceChanged`]). The observation runs on the node's
+  /// bounded observation lanes (a crate-private facility), off the
+  /// write task's execution slot and after the commit lands;
+  /// scheduling does not await the observer, so an error or a panic is
+  /// a diagnostic and never fails, delays, or blocks the task or its
+  /// shutdown.
   fn observed<'a>(&'a self, _view: &'a crate::ResourceView) -> BoxFuture<'a, Result<()>> {
     Box::pin(async { Ok(()) })
   }
@@ -819,11 +878,11 @@ impl std::fmt::Debug for TaskTransition {
 }
 
 /// Runs one transition's action hooks sequentially in canonical tag
-/// order (the registry's own order). Called from the task's spawned
-/// observation task, never on the manager task and never on an
-/// execution slot: a hook error is a warn diagnostic, and a hook panic
-/// is contained right here (also a warn diagnostic) — an observer can
-/// never fail, retry, wedge, or delay the task it observes.
+/// order (the registry's own order). Called from one of the node's
+/// [`ObservationLanes`] runners, never on the manager task and never on
+/// an execution slot: a hook error is a warn diagnostic, and a hook
+/// panic is contained right here (also a warn diagnostic) — an observer
+/// can never fail, retry, wedge, or delay the task it observes.
 pub(crate) async fn notify_action_hooks(
   hooks: &[Arc<dyn ActionHook>], transition: &TaskTransition,
 ) {
@@ -840,6 +899,162 @@ pub(crate) async fn notify_action_hooks(
       ),
     }
   }
+}
+
+/// How many observations may run their hooks concurrently: one
+/// spawned runner task per lane. Observations are diagnostics-grade
+/// caller code that must never delay a task, so the budget is the
+/// facility's own — deliberately small, independent of the execution
+/// slot budgets — and a wedged hook parks at most one lane.
+pub(crate) const TASK_OBSERVATION_LANES: usize = 4;
+
+/// Each lane's inbox depth: the queued-observation bound. A lane whose
+/// runner is wedged accumulates at most this many queued observations;
+/// the next one is dropped with a warn (the explicit overload
+/// behavior — observations are best-effort diagnostics, never
+/// load-bearing work), so caller hook code can never accumulate
+/// unbounded parked tasks.
+pub(crate) const TASK_OBSERVATION_INBOX: usize = 32;
+
+/// One scheduled observation: the diagnostics label, the subject the
+/// observation belongs to (the task id, or the resource name), and the
+/// boxed observer work.
+struct Observation {
+  label: &'static str,
+  subject: String,
+  observation: BoxFuture<'static, ()>,
+}
+
+/// The node's bounded facility for running observer code — the action
+/// hooks behind task transitions and the resource hooks behind
+/// committed writes. The manager owns one `ObservationLanes` per
+/// incarnation: a fixed set of lanes, each one spawned runner task over
+/// a bounded inbox, and dropping it aborts every runner, so a wedged
+/// observation is cancelled at shutdown instead of surviving the
+/// incarnation as detached work. The shareable half is the
+/// [`ObservationScheduler`] clone the manager hands to the operation
+/// deps, so the resource-write effects schedule onto the same lanes.
+/// One observation's lane is a deterministic function of its subject
+/// (the task id, or the resource name), and each lane is consumed by
+/// exactly one runner, so one task's observations always run in
+/// transition order (and one resource's in commit order) without
+/// per-subject bookkeeping and without detached predecessor chains.
+pub(crate) struct ObservationLanes {
+  scheduler: ObservationScheduler,
+  runners: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ObservationLanes {
+  /// Spawns the lanes' runner tasks. The returned value keeps every
+  /// runner handle, so its drop is the shutdown cancellation point.
+  pub(crate) fn new() -> Self {
+    let mut inboxes = Vec::with_capacity(TASK_OBSERVATION_LANES);
+    let mut runners = Vec::with_capacity(TASK_OBSERVATION_LANES);
+    for _ in 0..TASK_OBSERVATION_LANES {
+      let (inbox, mut received) = mpsc::channel::<Observation>(TASK_OBSERVATION_INBOX);
+      let runner = tokio::spawn(async move {
+        while let Some(observation) = received.recv().await {
+          // Panics are the scheduled work's own to contain
+          // (`notify_action_hooks` and `notify_resource_observers`
+          // catch each hook); this is the backstop of the generic
+          // facility, so a panicking observation still never takes the
+          // lane down.
+          if let Err(_panic) = AssertUnwindSafe(observation.observation)
+            .catch_unwind()
+            .await
+          {
+            tracing::warn!(
+              observation = observation.label,
+              subject = %observation.subject,
+              "an observation panicked and was contained"
+            );
+          }
+        }
+      });
+      inboxes.push(inbox);
+      runners.push(runner);
+    }
+    Self {
+      scheduler: ObservationScheduler {
+        inboxes: Arc::new(inboxes),
+      },
+      runners,
+    }
+  }
+
+  /// The shareable scheduling half: a clone carrying no runner
+  /// handles, so holding it never pins the runners' lifetime.
+  pub(crate) fn scheduler(&self) -> ObservationScheduler {
+    self.scheduler.clone()
+  }
+
+  /// Schedules one observation on its subject's pinned lane (see
+  /// [`ObservationScheduler::schedule`]).
+  pub(crate) fn schedule(
+    &self, pin: &str, label: &'static str, observation: BoxFuture<'static, ()>,
+  ) {
+    self.scheduler.schedule(pin, label, observation);
+  }
+}
+
+impl Drop for ObservationLanes {
+  /// The shutdown cancellation: abort every runner, so an observation
+  /// wedged mid-hook is dropped — wedged observer code never outlives
+  /// the incarnation that scheduled it.
+  fn drop(&mut self) {
+    for runner in &self.runners {
+      runner.abort();
+    }
+  }
+}
+
+/// The scheduling half of the [`ObservationLanes`]: the clone the
+/// manager installs on the operation deps, so effects (the
+/// resource-write commits) schedule their observations onto the same
+/// bounded lanes the manager owns and cancels.
+#[derive(Clone)]
+pub(crate) struct ObservationScheduler {
+  inboxes: Arc<Vec<mpsc::Sender<Observation>>>,
+}
+
+impl ObservationScheduler {
+  /// Schedules one observation on its subject's pinned lane.
+  /// Scheduling never blocks and never fails the caller: a full inbox
+  /// drops the observation with a warn (the explicit overload behavior
+  /// — the observation is diagnostics, and the task it belongs to has
+  /// already moved on), and a closed inbox only means the lanes are
+  /// already shutting down.
+  pub(crate) fn schedule(
+    &self, pin: &str, label: &'static str, observation: BoxFuture<'static, ()>,
+  ) {
+    match self.inboxes[lane_of(pin)].try_send(Observation {
+      label,
+      subject: pin.to_owned(),
+      observation,
+    }) {
+      Ok(()) => {}
+      Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+        observation = label,
+        subject = pin,
+        "the observation lane's inbox is full; dropping the observation"
+      ),
+      Err(mpsc::error::TrySendError::Closed(_)) => tracing::debug!(
+        observation = label,
+        subject = pin,
+        "the observation lanes are shutting down; dropping the observation"
+      ),
+    }
+  }
+}
+
+/// The lane one subject's observations run on: a deterministic function
+/// of the pin string (the task id, or the resource name), so every
+/// observation of one subject lands on the same lane's FIFO in order —
+/// no per-subject assignment map, no predecessor chains.
+fn lane_of(pin: &str) -> usize {
+  let mut hasher = DefaultHasher::new();
+  pin.hash(&mut hasher);
+  (hasher.finish() % TASK_OBSERVATION_LANES as u64) as usize
 }
 
 /// Runs one write's admission hooks on the caller's task, in canonical
@@ -860,29 +1075,45 @@ pub(crate) fn apply_resource_hooks(
   Ok(write)
 }
 
-/// Schedules one write's post-commit observations: each runs
-/// sequentially in canonical tag order inside its own spawned task, off
-/// the write task's execution slot. Awaiting the call only performs the
-/// scheduling, so the write task
-/// never waits on observer code: an error or a panic in an observer is
-/// a `tracing` diagnostic that never fails, delays, or blocks anything.
+/// Schedules one write's post-commit observations on the node's
+/// bounded observation lanes: each write's hooks run sequentially in
+/// canonical tag order inside one lane runner, pinned to the resource
+/// so one resource's observations keep their commit order, off the
+/// write task's execution slot. Awaiting the call only performs the
+/// scheduling, so the write task never waits on observer code: an
+/// error or a panic in an observer is a `tracing` diagnostic that
+/// never fails, delays, or blocks anything — and a wedged observer
+/// parks its lane, further observations drop with a warn once the
+/// inbox fills, and the runners are aborted at shutdown with the
+/// lanes' owner.
 pub(crate) async fn notify_resource_observers(
-  hooks: &[Arc<dyn ResourceHook>], view: &crate::ResourceView,
+  lanes: &ObservationScheduler, hooks: &[Arc<dyn ResourceHook>], view: &crate::ResourceView,
 ) {
+  if hooks.is_empty() {
+    return;
+  }
   let hooks = hooks.to_vec();
   let view = view.clone();
-  tokio::spawn(async move {
-    for hook in hooks {
-      match AssertUnwindSafe(hook.observed(&view)).catch_unwind().await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "resource hook failed"),
-        Err(_panic) => tracing::warn!(
-          resource = %view.name(),
-          "resource hook panicked while observing the commit"
-        ),
+  // The pin is the resource name, so one resource's observations stay
+  // in commit order on their lane; it is owned before the move into
+  // the scheduled observation.
+  let pin = view.name().as_str().to_owned();
+  lanes.schedule(
+    &pin,
+    "resource hook observation",
+    Box::pin(async move {
+      for hook in hooks {
+        match AssertUnwindSafe(hook.observed(&view)).catch_unwind().await {
+          Ok(Ok(())) => {}
+          Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "resource hook failed"),
+          Err(_panic) => tracing::warn!(
+            resource = %view.name(),
+            "resource hook panicked while observing the commit"
+          ),
+        }
       }
-    }
-  });
+    }),
+  );
 }
 
 /// The caller-supplied effect behind one custom task kind: the
@@ -890,6 +1121,12 @@ pub(crate) async fn notify_resource_observers(
 /// [`ExtensionRegistry::register_task_reconciler`](crate::ExtensionRegistry::register_task_reconciler)
 /// under a caller-owned tag and dispatched by the `tasks().submit`
 /// admission.
+///
+/// A reconciler runs on the extension slot channel: it may freely await
+/// core verbs (the local and network classes) through its handle, but
+/// must never await another extension-kind task — the extension
+/// channel's bounded budget is not reentrant, and same-class recursive
+/// waiting can self-deadlock (see `SlotClass`).
 pub trait TaskReconciler: std::fmt::Debug + Send + Sync + 'static {
   /// Produces the effect for one attempt. `Ok(Succeeded)` completes the
   /// task, `Ok(Retry)` re-arms the retry schedule without progress, and
@@ -957,13 +1194,20 @@ impl CustomTaskSpec {
 
 #[cfg(test)]
 mod tests {
-  use std::time::{Duration, SystemTime};
+  use std::{
+    sync::{
+      Arc,
+      atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime},
+  };
 
   use tokio::sync::watch;
 
   use super::{
-    ActionHook, CredentialIssued, CustomTaskSpec, ResourceHook, Task, TaskError, TaskKind,
-    TaskObserver, TaskOutput, TaskPhase, TaskResult, TaskStatusRecord, TaskTable, TaskTransition,
+    ActionHook, CredentialIssued, CustomTaskSpec, ObservationLanes, ResourceHook,
+    TASK_OBSERVATION_INBOX, Task, TaskError, TaskKind, TaskObserver, TaskOutput, TaskPhase,
+    TaskResult, TaskStatusRecord, TaskTable, TaskTransition, lane_of, notify_resource_observers,
   };
   use crate::{
     Error, ErrorKind, IssuedMergeCredential, MergeView, NodeId, QualifiedTag, Result, TaskId,
@@ -1040,6 +1284,191 @@ mod tests {
 
   fn merge_view() -> MergeView {
     MergeView::new(node('a'), node('b'))
+  }
+
+  /// The P2-1 regression at the facility level: a wedged observation
+  /// parks its lane's runner, the lane's inbox bounds how much further
+  /// work may queue behind it, the next observation is dropped with the
+  /// overload diagnostic, and dropping the lanes aborts the parked
+  /// runner — wedged observer code is cancelled at shutdown instead of
+  /// surviving as detached work.
+  #[tokio::test]
+  async fn observation_lanes_bound_a_parked_lane_drop_on_overflow_and_abort_on_drop() {
+    // Two ids pinned to the same lane: with 64 ids over the lane count
+    // the pigeonhole principle guarantees a pair.
+    let ids: Vec<TaskId> = (0..64)
+      .map(|counter| TaskId::compose(0, counter).expect("id"))
+      .collect();
+    let (parker, queued) = ids
+      .iter()
+      .enumerate()
+      .find_map(|(index, id)| {
+        ids[..index]
+          .iter()
+          .find(|other| lane_of(other.as_str()) == lane_of(id.as_str()))
+          .map(|other| (other.clone(), id.clone()))
+      })
+      .expect("two ids share a lane");
+
+    let lanes = ObservationLanes::new();
+    // Park the shared lane's runner: this observation sets `started`,
+    // then never settles, holding the alive guard until it is dropped.
+    let started = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
+    let wedge_started = Arc::clone(&started);
+    let wedge_alive = Arc::clone(&alive);
+    struct Held(Arc<AtomicBool>);
+    impl Drop for Held {
+      fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+      }
+    }
+    lanes.schedule(
+      parker.as_str(),
+      "wedging observation",
+      Box::pin(async move {
+        wedge_started.store(true, Ordering::SeqCst);
+        let _held = Held(wedge_alive);
+        let () = std::future::pending().await;
+      }),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedging observation never started"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Fill the parked lane's inbox with instant observations for the
+    // mate: they queue behind the wedged one, never running.
+    let queued_ran = Arc::new(AtomicUsize::new(0));
+    for _ in 0..TASK_OBSERVATION_INBOX {
+      let ran = Arc::clone(&queued_ran);
+      lanes.schedule(
+        queued.as_str(),
+        "queued observation",
+        Box::pin(async move {
+          ran.fetch_add(1, Ordering::SeqCst);
+        }),
+      );
+    }
+    // The next observation is the explicit overload behavior: the
+    // runner is parked, the inbox is full, so the observation is
+    // dropped with a warn instead of accumulating.
+    let overflow_ran = Arc::new(AtomicBool::new(false));
+    let overflow = Arc::clone(&overflow_ran);
+    lanes.schedule(
+      queued.as_str(),
+      "overflow observation",
+      Box::pin(async move {
+        overflow.store(true, Ordering::SeqCst);
+      }),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+      !overflow_ran.load(Ordering::SeqCst),
+      "the overflow observation was dropped, never queued"
+    );
+    assert_eq!(
+      queued_ran.load(Ordering::SeqCst),
+      0,
+      "the parked runner never reached the queued observations"
+    );
+
+    // Shutdown cancellation: dropping the facility aborts the parked
+    // runner, which drops the wedged observation's state. Under the
+    // old detached-spawn design the wedged observation survived the
+    // facility (and the whole incarnation) forever.
+    drop(lanes);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged observation outlived the observation lanes"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!overflow_ran.load(Ordering::SeqCst));
+  }
+
+  /// The P2-1 resource-observer half: awaiting
+  /// [`notify_resource_observers`] only schedules onto the lanes — the
+  /// write task never waits on observer code — and one resource's
+  /// observations keep their commit order on the resource's pinned
+  /// lane.
+  #[tokio::test]
+  async fn notify_resource_observers_schedules_one_resources_hooks_in_commit_order() {
+    #[derive(Debug)]
+    struct RecordingHook {
+      calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ResourceHook for RecordingHook {
+      fn observed<'a>(&'a self, view: &'a crate::ResourceView) -> crate::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+          self
+            .calls
+            .lock()
+            .expect("hook calls")
+            .push(view.labels().uri().as_str().to_owned());
+          Ok(())
+        })
+      }
+    }
+
+    let name = crate::ResourceName::parse("radiata.woooo.tech/resources/hook-001").expect("name");
+    let commit = |uri: &str| {
+      crate::ResourceView::new(
+        name.clone(),
+        crate::ResourceLabels::new(
+          crate::LabelValue::parse("document").expect("type"),
+          crate::ResourceUri::parse(uri).expect("uri"),
+        ),
+        crate::ResourceVersion::from_parts(
+          SystemTime::UNIX_EPOCH,
+          node('a'),
+          false,
+          crate::Digest::from_bytes([1; 32]),
+        ),
+      )
+    };
+    let first = commit("file:///commit-one");
+    let second = commit("file:///commit-two");
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Arc<dyn ResourceHook> = Arc::new(RecordingHook {
+      calls: Arc::clone(&calls),
+    });
+
+    let lanes = ObservationLanes::new();
+    notify_resource_observers(&lanes.scheduler(), &[Arc::clone(&hook)], &first).await;
+    notify_resource_observers(&lanes.scheduler(), &[Arc::clone(&hook)], &second).await;
+    // Awaiting the call performed only the scheduling: on this test's
+    // single-threaded runtime the lane runners have not been polled,
+    // so neither observation has run — the write task moved on.
+    assert!(
+      calls.lock().expect("hook calls").is_empty(),
+      "scheduling awaited an observer"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while calls.lock().expect("hook calls").len() < 2 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the scheduled observations never ran"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Both commits of the one resource landed on its pinned lane, so
+    // the hooks observed them in commit order.
+    assert_eq!(
+      *calls.lock().expect("hook calls"),
+      vec![
+        "file:///commit-one".to_owned(),
+        "file:///commit-two".to_owned()
+      ]
+    );
   }
 
   #[test]
@@ -1136,9 +1565,15 @@ mod tests {
     // slot for a whole dial deadline.
     assert_eq!(TaskKind::Join.slot_class(), SlotClass::Network);
     assert_eq!(TaskKind::Connect.slot_class(), SlotClass::Network);
+    // Caller-registered extension kinds draw their own channel: a
+    // workflow awaiting core verbs through its handle must never
+    // occupy the local capacity its children need.
+    assert_eq!(
+      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/x").expect("tag")).slot_class(),
+      SlotClass::Extension
+    );
     // Everything else — resource writes, credentials, leave, and the
-    // maintenance kinds — draws from the local channel, and so do the
-    // caller-registered extension kinds.
+    // maintenance kinds — draws from the local channel.
     for kind in [
       TaskKind::Leave,
       TaskKind::Disconnect,
@@ -1157,7 +1592,6 @@ mod tests {
       TaskKind::StartRecovery,
       TaskKind::ApplyReceiptRetention,
       TaskKind::SyncRound,
-      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/x").expect("tag")),
     ] {
       assert_eq!(kind.slot_class(), SlotClass::Local, "{kind:?}");
     }

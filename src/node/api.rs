@@ -445,36 +445,15 @@ impl Tasks {
     let Some((kind, _)) = client.observer.table.status(&id) else {
       return Err(crate::Error::not_found("task"));
     };
-    let Some(mut status) = client.observer.table.watch(&id) else {
-      return Err(crate::Error::not_found("task"));
-    };
-    let mut stop = client.observer.stop.clone();
-    loop {
-      if status.borrow().phase.is_terminal() {
-        return client
-          .observer
-          .table
-          .view(&id)
-          .ok_or_else(|| crate::Error::not_found("task"));
-      }
-      let stopped = tokio::select! {
-        changed = status.changed() => changed.is_err(),
-        changed = stop.changed() => changed.is_err() || !kind.drains_on_shutdown(),
-      };
-      if stopped {
-        // The terminal publication can land in the same wake as the stop
-        // signal (the manager publishes before it stops), so the view is
-        // still read before the typed shutdown failure.
-        if status.borrow().phase.is_terminal() {
-          return client
-            .observer
-            .table
-            .view(&id)
-            .ok_or_else(|| crate::Error::not_found("task"));
-        }
-        return Err(crate::Error::shutting_down("task wait"));
-      }
-    }
+    // The watch/shutdown arbitration is the observer's own (shared
+    // with [`crate::Task::wait`]); only the terminal read differs —
+    // this wait resolves with the view, not the typed output.
+    client.observer.await_terminal(&id, &kind).await?;
+    client
+      .observer
+      .table
+      .view(&id)
+      .ok_or_else(|| crate::Error::not_found("task"))
   }
 
   /// Submits one custom-kind task. The kind tag must live under a

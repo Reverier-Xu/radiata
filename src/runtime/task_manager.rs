@@ -1,11 +1,12 @@
 //! The task manager: the node-local reconcile plane behind the
 //! declarative verb surface. One spawned manager owns admission (id
-//! composition, dedup/coalescing, the `Pending` publication), two
+//! composition, dedup/coalescing, the `Pending` publication), three
 //! bounded worker pools (one counting semaphore per slot class — the
-//! local kinds and the join/connect dials — over the per-task
-//! reconcile futures), the bounded retry schedule with per-kind
-//! policies, and the shutdown drain (cancellable kinds exit on the
-//! cancel watch; the journaled kinds are awaited to completion).
+//! core local kinds, the join/connect dials, and the caller-registered
+//! extension workflows — over the per-task reconcile futures), the
+//! bounded retry schedule with per-kind policies, and the shutdown
+//! drain (cancellable kinds exit on the cancel watch; the journaled
+//! kinds are awaited to completion).
 //!
 //! Effects are crate-internal closures over the moved verb bodies
 //! (`runtime::task_effects`, landed stage by stage with the verb
@@ -15,16 +16,13 @@
 //! and reconcilers never run on the manager task, and a panicking
 //! effect surfaces as the task's typed internal failure without
 //! touching the manager. Transition observations (the action hooks)
-//! run in their own spawned tasks off the worker pools: a wedged or
-//! panicking hook can never hold an execution slot, delay a terminal
-//! report, or delay the leave shutdown behind the task's own success.
+//! run on the node's bounded observation lanes, off the worker pools:
+//! a wedged or panicking hook can never hold an execution slot, delay
+//! a terminal report, or delay the leave shutdown behind the task's
+//! own success — and the lanes' runners are aborted when the manager
+//! drains, so a wedged hook never outlives the incarnation.
 
-use std::{
-  collections::BTreeMap,
-  pin::Pin,
-  sync::{Arc, Mutex},
-  time::Duration,
-};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
 
 use tokio::{
   sync::{Semaphore, mpsc, oneshot, watch},
@@ -43,25 +41,40 @@ use crate::{
 /// so one bound governs both admission ends.
 pub(crate) const TASK_CHANNEL_CAPACITY: usize = 32;
 
-/// The two execution-slot channels, one per slot class (see
+/// The three execution-slot channels, one per slot class (see
 /// [`crate::task::SlotClass`]). A join or connect dial can hold its
 /// slot for a whole dial deadline, so the dials draw from their own
-/// semaphore while every local kind keeps its own budget: four wedged
-/// dials must never queue a resource write (the starvation incident
-/// behind the split). The budgets come from
+/// semaphore while every core local kind keeps its own budget: four
+/// wedged dials must never queue a resource write (the starvation
+/// incident behind the split). The caller-registered extension kinds
+/// draw from their own channel for the mirror reason: an extension
+/// reconciler routinely awaits other admitted tasks through its public
+/// handle, so it must never occupy the core local capacity its own
+/// child operations need. The local and network budgets come from
 /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots)
 /// and default to two slots per channel — the historical four-permit
-/// total, one channel per class.
+/// total, one channel per core class; the extension budget is the
+/// manager's own constant below.
 struct ReconcileChannels {
   local: Arc<Semaphore>,
   network: Arc<Semaphore>,
+  extension: Arc<Semaphore>,
 }
+
+/// The extension channel's budget: an independent, deliberately fixed
+/// bound. The two configured budgets govern the core's per-verb
+/// concurrency; extension workflows are caller code over the public
+/// surface, so their channel keeps its own two-lane default — enough
+/// concurrent workflows to overlap IO while bounding how many wedged
+/// reconcilers can park waiting workflows behind them.
+const TASK_EXTENSION_RECONCILE_SLOTS: usize = 2;
 
 impl ReconcileChannels {
   fn new(local: usize, network: usize) -> Self {
     Self {
       local: Arc::new(Semaphore::new(local)),
       network: Arc::new(Semaphore::new(network)),
+      extension: Arc::new(Semaphore::new(TASK_EXTENSION_RECONCILE_SLOTS)),
     }
   }
 
@@ -70,6 +83,7 @@ impl ReconcileChannels {
     match class {
       SlotClass::Local => &self.local,
       SlotClass::Network => &self.network,
+      SlotClass::Extension => &self.extension,
     }
   }
 }
@@ -78,6 +92,19 @@ impl ReconcileChannels {
 /// readable through the observation surface; older ones are evicted
 /// (oldest-terminal first) and read as absent.
 pub(crate) const TASK_TERMINAL_HISTORY: usize = 256;
+
+/// The per-class admission bound on non-terminal tasks: once one slot
+/// class holds this many live (admitted, unsettled) entries, further
+/// admissions of that class fail typed
+/// [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) — the
+/// caller-facing backpressure of a stalled effect plane. The bound
+/// sits above the admission channel's capacity and the slot budgets (a
+/// full channel of distinct intents still queues behind the slots
+/// without refusing) while capping each class's worst-case memory —
+/// entries, captured effects, and waiting workers are each bounded by
+/// it. The three slot classes carry separate budgets, so saturating
+/// one class's backlog never consumes another's.
+pub(crate) const TASK_RECONCILE_BACKLOG: usize = 64;
 
 /// The idle retry timer: far enough out to never fire while the
 /// schedule is empty, near enough to stay inside tokio's `Instant`
@@ -368,8 +395,9 @@ impl std::fmt::Debug for TaskClient {
 impl TaskClient {
   /// Submits one task and awaits its admission: pure validation and
   /// hooks have already run caller-side; this is id composition, the
-  /// dedup/coalescing check, the `Pending` publication, and the first
-  /// reconcile spawn. No IO ever runs on this path.
+  /// dedup/coalescing check, the per-class backlog bound, the `Pending`
+  /// publication, and the first reconcile spawn. No IO ever runs on
+  /// this path.
   pub(crate) async fn submit(&self, spec: TaskSpec, effect: TaskEffect) -> Result<TaskId> {
     let (reply, response) = oneshot::channel();
     self
@@ -443,12 +471,16 @@ struct ManagerShared {
   /// permit draw is class-routed so local work never queues behind a
   /// dial.
   slots: ReconcileChannels,
-  /// The per-task observation chains: the spawned action-hook
-  /// observation task of each transition awaits the task's predecessor,
-  /// which preserves one task's transition order while running wholly
-  /// off the execution slots and the attempt body. Entries are detached
-  /// at the task's terminal report.
-  observations: Mutex<BTreeMap<TaskId, tokio::task::JoinHandle<()>>>,
+  /// The bounded observation lanes the action-hook observations run
+  /// on (see [`crate::task::ObservationLanes`]): every transition's
+  /// hooks are scheduled onto the task's pinned lane, so one task's
+  /// observations still run in transition order while running wholly
+  /// off the execution slots and the attempt body. A wedged hook parks
+  /// its lane, further observations on that lane drop with a warn once
+  /// its inbox fills, and the runners are aborted when this shared
+  /// state drops — wedged observer code never accumulates unbounded
+  /// and never outlives the incarnation.
+  observations: crate::task::ObservationLanes,
 }
 
 impl ManagerShared {
@@ -577,13 +609,12 @@ impl ManagerShared {
   /// The transition observation, in the design's order: the typed event
   /// first — synchronously on the publication path, so the event stream
   /// is the table's own transition order — then the registered action
-  /// hooks, in canonical tag order, inside the task's own spawned
-  /// observation task. The observation runs off the execution slots and
+  /// hooks, in canonical tag order, scheduled onto the task's pinned
+  /// observation lane. The observation runs off the execution slots and
   /// off the attempt body, so a wedged or panicking hook can never hold
   /// a slot, delay the worker's terminal report, or (through it) the
-  /// leave shutdown. One task's observations chain through their
-  /// predecessors, so a task's hooks still observe in transition order
-  /// while different tasks never observe through each other.
+  /// leave shutdown. Lane pinning keeps one task's hooks in transition
+  /// order while different tasks never observe through each other.
   fn observe(&self, id: &TaskId, kind: &TaskKind, from: TaskPhase, to: TaskPhase) {
     self
       .events()
@@ -593,45 +624,13 @@ impl ManagerShared {
       return;
     }
     let transition = crate::task::TaskTransition::new(id.clone(), kind.clone(), from, to);
-    let previous = self
-      .observations
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .remove(id);
-    let observation = tokio::spawn(async move {
-      // A predecessor that ended without settling (an aborted
-      // observation — panics are contained inside the hook runner) is
-      // containment news, never a task outcome: log it and keep the
-      // chain going.
-      if let Some(previous) = previous
-        && let Err(join_error) = previous.await
-      {
-        tracing::warn!(
-          task = %transition.id(),
-          panic = join_error.is_panic(),
-          "an action hook observation ended without settling"
-        );
-      }
-      crate::task::notify_action_hooks(&hooks, &transition).await;
-    });
-    self
-      .observations
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .insert(id.clone(), observation);
-  }
-
-  /// Detaches the task's observation chain: the terminal report is the
-  /// task's last observation spawn site, so dropping the chain-head
-  /// handle here keeps the manager's bookkeeping bounded while any
-  /// still-running (or wedged) observation task stays detached — caller
-  /// code that never settles must not pin the manager.
-  fn detach_observations(&self, id: &TaskId) {
-    self
-      .observations
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .remove(id);
+    self.observations.schedule(
+      id.as_str(),
+      "action hook observation",
+      Box::pin(async move {
+        crate::task::notify_action_hooks(&hooks, &transition).await;
+      }),
+    );
   }
 }
 
@@ -669,11 +668,20 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
   let shared = Arc::new(ManagerShared {
     table,
     clock: deps.clock,
-    operations: deps.operations,
+    operations: Arc::clone(&deps.operations),
     leave_complete: deps.leave_complete,
     slots: ReconcileChannels::new(local_slots, network_slots),
-    observations: Mutex::new(BTreeMap::new()),
+    observations: crate::task::ObservationLanes::new(),
   });
+  // The bounded observation lanes' scheduling half joins the operation
+  // deps here — before any effect can run — so the resource-write
+  // effects schedule their post-commit observations onto the same
+  // lanes this manager owns and aborts at drain. The manager keeps the
+  // runner handles: the lanes die with the incarnation, never with the
+  // operation deps' lifetime.
+  shared
+    .operations
+    .install_observation_lanes(shared.observations.scheduler());
   let (reports_tx, reports_rx) = mpsc::unbounded_channel();
   let task = tokio::spawn(run_manager(
     shared,
@@ -708,7 +716,7 @@ enum WorkerReport {
   /// single truth for the leave completion signal: a leave that
   /// published `Succeeded` still signals the active-leave shutdown even
   /// when a hook observing that publication wedges or panics (the
-  /// observations run in their own spawned tasks off this path).
+  /// observations run on the observation lanes off this path).
   Terminal { id: TaskId },
   /// The attempt failed retryably; re-spawn after the delay.
   Retry {
@@ -838,15 +846,15 @@ async fn run_manager(
         match report {
           WorkerReport::Terminal { id } => {
             coalescing.retain(|_, (in_flight, _)| in_flight != &id);
-            // The terminal publication was this task's last observation
-            // spawn site: detach the chain so the bookkeeping dies with
-            // the task while any wedged observation stays detached.
-            shared.detach_observations(&id);
+            // No observation bookkeeping runs here: the lanes pin a
+            // task's observations by id, so the terminal publication's
+            // observation — already scheduled — is the task's last, and
+            // nothing outlives the task on the manager's side.
             if leave_task.as_ref() == Some(&id) {
               leave_task = None;
               // The table's terminal phase is the single truth, driven
               // straight off the terminal publication: the action-hook
-              // observations run in their own spawned tasks off this
+              // observations run on the observation lanes off this
               // path, so a wedged or panicking hook can never delay the
               // active-leave shutdown behind the task's own success.
               let succeeded = shared
@@ -911,9 +919,9 @@ async fn run_manager(
 }
 
 /// The admission bookkeeping: shutdown gate, spec shape, coalescing,
-/// leave exclusivity, id composition, the `Pending` publication, and
-/// the first reconcile spawn. The admission reply always resolves —
-/// a dropped reply means the caller went away.
+/// leave exclusivity, the per-class backlog bound, id composition, the
+/// `Pending` publication, and the first reconcile spawn. The admission
+/// reply always resolves — a dropped reply means the caller went away.
 #[allow(clippy::too_many_arguments)]
 fn admit(
   shared: &Arc<ManagerShared>, counter: &mut u64,
@@ -987,6 +995,14 @@ fn admit_inner(
     && in_flight(&existing)
   {
     return Err(Error::conflict("task in flight"));
+  }
+  // The per-class backlog bound: admission itself is refused once the
+  // class holds its budget of non-terminal entries, so slow effects
+  // plus a stream of distinct intents can never accumulate unbounded
+  // admitted work. The bound is per class — a stalled dial backlog
+  // never consumes the local write budget.
+  if shared.table.non_terminal_count(kind.slot_class()) >= TASK_RECONCILE_BACKLOG {
+    return Err(Error::overloaded("task admission"));
   }
   let next = *counter;
   *counter = next
@@ -1087,10 +1103,10 @@ impl Worker {
     // the worker always reports back to the manager. The transition
     // observations (event plus action hooks) do not run here: the event
     // is emitted synchronously on the publication path and the hooks
-    // run in their own spawned observation tasks, so the body settles
-    // — and the permit releases — without waiting on any observer. The
-    // abort-on-drop guard cancels the body when the shutdown cancel
-    // wins the select.
+    // are scheduled on the bounded observation lanes, so the body
+    // settles — and the permit releases — without waiting on any
+    // observer. The abort-on-drop guard cancels the body when the
+    // shutdown cancel wins the select.
     let mut body = AbortOnDrop(tokio::spawn(
       Attempt {
         shared: Arc::clone(&self.shared),
@@ -1239,7 +1255,7 @@ mod tests {
     collections::VecDeque,
     sync::{
       Arc, Mutex,
-      atomic::{AtomicUsize, Ordering},
+      atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
   };
@@ -1342,7 +1358,7 @@ mod tests {
   }
 
   /// Polls a shared log to its final shape: the hook observations run
-  /// in their own spawned tasks, so the terminal publication precedes
+  /// on the observation lanes, so the terminal publication precedes
   /// them and the recorded sequence reaches its pinned shape only
   /// shortly after.
   async fn await_hook_calls(calls: &Arc<Mutex<Vec<HookCall>>>, expected: Vec<HookCall>) {
@@ -1400,9 +1416,9 @@ mod tests {
       .wait()
       .await
       .expect("terminal");
-    // The observations are spawned per transition and chained through
-    // their predecessors, so the sequence still observes each transition
-    // in order, in canonical tag order — it just lands off the slot.
+    // The observations run on the task's pinned observation lane, so
+    // the sequence still observes each transition in order, in
+    // canonical tag order — it just lands off the slot.
     await_hook_calls(
       &calls,
       vec![
@@ -1429,9 +1445,10 @@ mod tests {
       extensions,
     ))
     .expect("manager");
-    // The observation runs in its own spawned task off the attempt body,
-    // so a panicking hook is a contained diagnostic: the task runs its
-    // effect to success, and the manager keeps serving later tasks.
+    // The observation runs on the observation lanes off the attempt
+    // body, so a panicking hook is a contained diagnostic: the task
+    // runs its effect to success, and the manager keeps serving later
+    // tasks.
     for counter in 0..2 {
       let id = client
         .submit(
@@ -1477,7 +1494,7 @@ mod tests {
       .expect("admission");
     // The effect succeeded and published `Succeeded`; the hook
     // panicking while observing that terminal transition is contained
-    // in the observation task. Terminality is monotone and the
+    // on its observation lane. Terminality is monotone and the
     // observation is off the attempt body, so the phase stands and the
     // waiter still receives the outcome.
     handle::<()>(&client, &id, TaskKind::SyncRound)
@@ -1620,6 +1637,191 @@ mod tests {
     let _ = drain.await;
   }
 
+  /// An action hook that never settles while holding a guard whose
+  /// drop flips `alive` false: the test can observe exactly when the
+  /// wedged observation's state is released.
+  #[derive(Debug)]
+  struct GuardedWedgingHook {
+    started: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+  }
+
+  impl ActionHook for GuardedWedgingHook {
+    fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      let started = Arc::clone(&self.started);
+      let alive = Arc::clone(&self.alive);
+      Box::pin(async move {
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+          fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+          }
+        }
+        started.store(true, Ordering::SeqCst);
+        let _held = Held(alive);
+        let () = std::future::pending().await;
+        Ok(())
+      })
+    }
+  }
+
+  /// The P2-1 shutdown regression: under the detached-spawn design a
+  /// wedged action hook survived the whole incarnation — its spawned
+  /// observation task was dropped from the manager's bookkeeping at
+  /// the terminal report and nothing ever cancelled it. The bounded
+  /// observation lanes are the manager's own state: the shutdown drain
+  /// drops them, which aborts the parked runner and with it the
+  /// wedged observation.
+  #[tokio::test]
+  async fn a_wedged_action_hook_is_cancelled_at_shutdown() {
+    let started = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/wedged-guard").expect("tag"),
+        Arc::new(GuardedWedgingHook {
+          started: Arc::clone(&started),
+          alive: Arc::clone(&alive),
+        }),
+      )
+      .expect("registration");
+    let (client, manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
+    .expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("admission");
+    handle::<()>(&client, &id, TaskKind::SyncRound)
+      .wait()
+      .await
+      .expect("the wedged hook never delays the task");
+    // The wedged observation must actually be running (parking a
+    // lane's runner) before the shutdown is worth anything.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged observation never started"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    manager.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(5), manager.drain())
+      .await
+      .expect("the drain must complete despite the wedged observer");
+    // The drain resolves and, with it, the wedged observation is
+    // cancelled: its held state is dropped, so it cannot outlive the
+    // incarnation.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive.load(Ordering::SeqCst) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged observation outlived the incarnation"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+  }
+
+  /// An action hook that is slow exactly on the `Running` transition
+  /// and instant on the terminal one, recording what it observed.
+  #[derive(Debug)]
+  struct SlowOnRunningHook {
+    calls: Arc<Mutex<Vec<(TaskId, TaskPhase)>>>,
+  }
+
+  impl ActionHook for SlowOnRunningHook {
+    fn on_transition<'a>(&'a self, transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
+      let calls = Arc::clone(&self.calls);
+      let id = transition.id().clone();
+      let to = transition.to();
+      let slow = to == TaskPhase::Running;
+      Box::pin(async move {
+        if slow {
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        calls.lock().expect("hook calls").push((id, to));
+        Ok(())
+      })
+    }
+  }
+
+  /// The P2-1 ordering contract on the lane design: one task's
+  /// observations are pinned to one lane's FIFO, so a slow `Running`
+  /// observation is always followed — never overtaken — by the task's
+  /// own terminal observation. Per-observation lane choice would let
+  /// the instant terminal observation overtake the slow one; the old
+  /// predecessor chains preserved order but accumulated unbounded
+  /// detached work behind a wedged hook.
+  #[tokio::test]
+  async fn one_tasks_transition_observations_stay_in_order_on_their_lane() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_action_hook(
+        QualifiedTag::parse("example.com/hooks/slow-running").expect("tag"),
+        Arc::new(SlowOnRunningHook {
+          calls: Arc::clone(&calls),
+        }),
+      )
+      .expect("registration");
+    let (client, _manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
+    .expect("manager");
+    let count = 8;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+      let id = client
+        .submit(
+          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          ok_effect(TaskOutput::SyncRound(())),
+        )
+        .await
+        .expect("admission");
+      handle::<()>(&client, &id, TaskKind::SyncRound)
+        .wait()
+        .await
+        .expect("terminal");
+      ids.push(id);
+    }
+    // Every task contributes exactly two observations (`Running`, then
+    // `Succeeded`; `Pending` is an event only).
+    let expected = count * 2;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+      let recorded = calls.lock().expect("hook calls").len();
+      if recorded == expected {
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the observations never completed: {recorded} of {expected}"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let recorded = calls.lock().expect("hook calls").clone();
+    for id in &ids {
+      let phases: Vec<TaskPhase> = recorded
+        .iter()
+        .filter(|(observed, _)| observed == id)
+        .map(|(_, phase)| *phase)
+        .collect();
+      assert_eq!(
+        phases,
+        vec![TaskPhase::Running, TaskPhase::Succeeded],
+        "task {id} observed out of transition order"
+      );
+    }
+  }
+
   #[tokio::test]
   async fn local_kinds_never_queue_behind_a_saturated_network_channel() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
@@ -1684,6 +1886,177 @@ mod tests {
       TaskPhase::Pending,
       "the network channel is still saturated"
     );
+  }
+
+  /// The P1-6 regression: an extension reconciler is the one effect
+  /// class that routinely awaits other admitted tasks through its
+  /// public handle. Under the old two-channel split it drew from the
+  /// local channel, so with one local slot already held it took the
+  /// last remaining slot and its child write could never start — the
+  /// workflow deadlocked on the very capacity its own child needed.
+  /// The extension channel breaks the cycle: the workflow draws its
+  /// own class, and the child takes the local slot the workflow no
+  /// longer occupies.
+  #[tokio::test]
+  async fn an_extension_workflow_never_occupies_the_local_channel_its_children_need() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // One wedged core local task pins one of the local channel's two
+    // default slots: exactly one slot remains for the workflow's child.
+    let wedged = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        wedged_effect(),
+      )
+      .await
+      .expect("admission");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client
+      .observer
+      .table
+      .status(&wedged)
+      .is_some_and(|(_, status)| status.phase() == TaskPhase::Running)
+    {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged local task never started"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The extension effect submits a core local child through the same
+    // manager and awaits its terminal phase: under the shared local
+    // class the workflow itself held the last local slot, so this
+    // await never resolved.
+    let workflow_client = client.clone();
+    let effect: TaskEffect = Arc::new(move |_deps, _attempt| {
+      let client = workflow_client.clone();
+      Box::pin(async move {
+        let child = client
+          .submit(
+            TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+            ok_effect(TaskOutput::SyncRound(())),
+          )
+          .await?;
+        Task::<()>::from_parts(child, TaskKind::SyncRound, client.observer.clone())
+          .wait()
+          .await?;
+        Ok(EffectOutcome::new(TaskOutput::Extension(())))
+      })
+    });
+    let kind =
+      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"));
+    let id = client
+      .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
+      .await
+      .expect("admission");
+    tokio::time::timeout(
+      Duration::from_secs(5),
+      handle::<()>(&client, &id, kind).wait(),
+    )
+    .await
+    .expect("the extension workflow must not deadlock on the local channel")
+    .expect("terminal");
+  }
+
+  /// The P2-2 regression: the manager admitted unboundedly — the
+  /// submission channel bounded only in-flight messages, and each
+  /// admission inserted a `Pending` entry and spawned a worker before
+  /// that worker ever drew an execution slot, so a slow effect plus a
+  /// stream of distinct intents accumulated non-terminal work without
+  /// bound. The per-class backlog bound refuses typed once a class
+  /// holds its budget, and the budgets are isolated: a saturated local
+  /// backlog never consumes the network budget.
+  #[tokio::test]
+  async fn the_non_terminal_backlog_is_bounded_per_class_with_typed_overload() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // Distinct-intent wedged local tasks fill the local backlog: the
+    // two default local slots wedge and the rest wait as non-terminal
+    // `Pending` entries.
+    for _ in 0..super::TASK_RECONCILE_BACKLOG {
+      client
+        .submit(
+          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          wedged_effect(),
+        )
+        .await
+        .expect("admission below the bound");
+    }
+    let refused = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        wedged_effect(),
+      )
+      .await
+      .expect_err("the local backlog is full");
+    assert_eq!(refused.kind(), ErrorKind::Overloaded);
+    assert_eq!(refused.context(), "task admission");
+    // The class's non-terminal count sits exactly at the bound (the
+    // memory-related count is capped), and the sibling classes carry
+    // their own budgets.
+    assert_eq!(
+      client
+        .observer
+        .table
+        .non_terminal_count(super::SlotClass::Local),
+      super::TASK_RECONCILE_BACKLOG
+    );
+    assert_eq!(
+      client
+        .observer
+        .table
+        .non_terminal_count(super::SlotClass::Extension),
+      0
+    );
+    // The network budget is separate: a dial still admits and runs to
+    // its terminal phase while the local backlog is saturated.
+    let dial = client
+      .submit(
+        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        ok_effect(TaskOutput::Join(merge_view())),
+      )
+      .await
+      .expect("the network backlog is a separate budget");
+    handle::<MergeView>(&client, &dial, TaskKind::Join)
+      .wait()
+      .await
+      .expect("dial terminal");
+  }
+
+  /// The mirror isolation of the backlog budgets: a saturated network
+  /// backlog (a stalled effect plane of wedged dials) refuses further
+  /// dials typed but never blocks the core local writes.
+  #[tokio::test]
+  async fn a_saturated_network_backlog_never_blocks_local_admission() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    for _ in 0..super::TASK_RECONCILE_BACKLOG {
+      client
+        .submit(
+          TaskSpec::new(TaskKind::Join, TaskPayload::None),
+          wedged_effect(),
+        )
+        .await
+        .expect("admission below the bound");
+    }
+    let refused = client
+      .submit(
+        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        wedged_effect(),
+      )
+      .await
+      .expect_err("the network backlog is full");
+    assert_eq!(refused.kind(), ErrorKind::Overloaded);
+    // A core local write still admits and completes: one class's
+    // saturated backlog budget never consumes another's.
+    let local = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("local admission");
+    handle::<()>(&client, &local, TaskKind::SyncRound)
+      .wait()
+      .await
+      .expect("local terminal");
   }
 
   #[tokio::test]
