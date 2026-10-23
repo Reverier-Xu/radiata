@@ -604,6 +604,24 @@ async fn finish_shutdown(
       let _ = handle.await;
     }
   }
+  // The storage execution completion barrier (audit 2026-10-23 P1-10):
+  // every runtime plane is torn down above, so no new execution can
+  // start; the storage flush now resolves only when every detached
+  // execution the node spawned has ended (committed, failed, or rolled
+  // back), so the shutdown reply returns only once no in-flight commit
+  // still holds the database — a restarted node on the same factory
+  // cannot race a landing execution. Like the task manager's journaled
+  // drain, the wait is deliberately unbounded: it awaits durability
+  // obligations, not cancellable effects. A flush failure is diagnosed
+  // and teardown continues, because the reply itself must still answer.
+  if let Some(context) = dependencies.context.as_ref()
+    && let Err(error) = context.store().provider().flush().await
+  {
+    tracing::warn!(
+      kind = ?error.kind(),
+      "storage execution completion barrier failed at shutdown"
+    );
+  }
   drop(control);
   drop(dependencies);
 
@@ -1543,7 +1561,85 @@ mod shutdown_drain_tests {
     CONNECTION_TASK_SHUTDOWN_GRACE, CONTROL_CAPACITY, LifecyclePublisher, finish_shutdown,
     test_support,
   };
-  use crate::{ShutdownReason, runtime::LifecycleSnapshot};
+  use crate::{
+    BoxFuture, CommitOutcome, Digest, ReconcileOutcome, ShutdownReason, StoreCapabilities,
+    StoreRequirements, StoreTransaction, TransactionId,
+    extension::StoreSnapshot,
+    provider::{Storage, StorageFactory},
+    runtime::LifecycleSnapshot,
+    storage::contract::ReferenceFactory,
+  };
+
+  /// A storage whose `flush` (the execution completion barrier) parks on
+  /// a gate until the test releases it, so the shutdown path's wait
+  /// behind the barrier is directly observable. Everything else is the
+  /// reference store unchanged.
+  #[derive(Debug)]
+  struct FlushHoldingStorage {
+    reference: Box<dyn Storage>,
+    gate: watch::Receiver<bool>,
+    reached: std::sync::Arc<AtomicBool>,
+  }
+
+  #[derive(Debug)]
+  struct FlushHoldingFactory {
+    reference: Arc<ReferenceFactory>,
+    gate: watch::Sender<bool>,
+    reached: std::sync::Arc<AtomicBool>,
+  }
+
+  impl StorageFactory for FlushHoldingFactory {
+    fn open<'a>(
+      &'a self, requirements: StoreRequirements,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Storage>>> {
+      let reference = Arc::clone(&self.reference);
+      let gate = self.gate.subscribe();
+      let reached = std::sync::Arc::clone(&self.reached);
+      Box::pin(async move {
+        let reference = reference.open(requirements).await?;
+        Ok(Box::new(FlushHoldingStorage {
+          reference,
+          gate,
+          reached,
+        }) as Box<dyn Storage>)
+      })
+    }
+  }
+
+  impl Storage for FlushHoldingStorage {
+    fn capabilities(&self) -> StoreCapabilities {
+      self.reference.capabilities()
+    }
+
+    fn snapshot<'a>(&'a self) -> BoxFuture<'a, crate::Result<Box<dyn StoreSnapshot>>> {
+      self.reference.snapshot()
+    }
+
+    fn commit<'a>(
+      &'a self, transaction: StoreTransaction,
+    ) -> BoxFuture<'a, crate::Result<CommitOutcome>> {
+      self.reference.commit(transaction)
+    }
+
+    fn reconcile<'a>(
+      &'a self, transaction: &'a TransactionId, digest: &'a Digest,
+    ) -> BoxFuture<'a, crate::Result<ReconcileOutcome>> {
+      self.reference.reconcile(transaction, digest)
+    }
+
+    fn flush<'a>(&'a self) -> BoxFuture<'a, crate::Result<()>> {
+      let mut gate = self.gate.clone();
+      Box::pin(async move {
+        self.reached.store(true, Ordering::Relaxed);
+        while !*gate.borrow_and_update() {
+          if gate.changed().await.is_err() {
+            break;
+          }
+        }
+        self.reference.flush().await
+      })
+    }
+  }
 
   /// An in-flight consumer drain's apply completes at shutdown instead
   /// of being aborted mid-apply: the tracked drain task is handed out
@@ -1667,6 +1763,64 @@ mod shutdown_drain_tests {
       elapsed < CONNECTION_TASK_SHUTDOWN_GRACE + Duration::from_millis(500),
       "the wedged task must not hold the reply past the window ({elapsed:?})"
     );
+  }
+
+  /// `finish_shutdown` provides the storage execution completion barrier
+  /// (audit 2026-10-23 P1-10): the shutdown reply must not return while
+  /// the node's storage still has an in-flight execution — represented
+  /// here by a flush that parks on a gate — and must return promptly
+  /// once the barrier resolves. Under the old immediate-return flush the
+  /// reply would land while the "execution" still holds the database.
+  #[tokio::test]
+  async fn shutdown_awaits_the_storage_execution_completion_barrier() {
+    let (reference, config) = test_support::reference_and_config();
+    let (gate_tx, _gate_rx) = watch::channel(false);
+    let reached = Arc::new(AtomicBool::new(false));
+    let factory = FlushHoldingFactory {
+      reference,
+      gate: gate_tx.clone(),
+      reached: Arc::clone(&reached),
+    };
+    let (supervisor, _entropy, _sessions) =
+      test_support::supervisor_over(Arc::new(factory) as Arc<dyn StorageFactory>, config).await;
+
+    let (_control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+    let (state_tx, _state_rx) = watch::channel(LifecycleSnapshot::starting());
+    let mut lifecycle = LifecyclePublisher::new(state_tx);
+    let (dependencies, drained) = supervisor.into_dependencies();
+    let mut finish = std::pin::pin!(finish_shutdown(
+      control_rx,
+      JoinSet::new(),
+      dependencies,
+      drained,
+      &mut lifecycle,
+      None,
+      ShutdownReason::Explicit,
+    ));
+
+    // The barrier is reached and the reply stays behind it.
+    let observed = Arc::clone(&reached);
+    tokio::select! {
+      _ = &mut finish => panic!("the shutdown reply must not return before the barrier is even reached"),
+      _ = async {
+        while !observed.load(Ordering::Relaxed) {
+          tokio::task::yield_now().await;
+        }
+      } => {},
+      _ = tokio::time::sleep(Duration::from_secs(5)) => {
+        panic!("the shutdown path must await the storage barrier");
+      }
+    }
+    tokio::select! {
+      _ = &mut finish => panic!("the shutdown reply must not return while the barrier holds"),
+      _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+
+    // Releasing the barrier releases the reply.
+    gate_tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), &mut finish)
+      .await
+      .expect("the shutdown reply must return once the barrier resolves");
   }
 }
 
