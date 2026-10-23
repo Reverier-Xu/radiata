@@ -32,7 +32,11 @@ use tracing::{debug, instrument, trace, warn};
 #[cfg(test)]
 pub(crate) use super::queue::test_queue;
 pub(crate) use super::queue::{BoundedReceiver, BoundedSender, SessionFrame};
-use super::{driver::EstablishedSession, inbound::read_loop, liveness::liveness_observer};
+use super::{
+  driver::EstablishedSession,
+  inbound::{SessionGrant, read_loop},
+  liveness::liveness_observer,
+};
 use crate::{
   ErrorKind, NodeId, QualifiedTag, Result, TraceId,
   extension_registry::ExtensionRegistry,
@@ -262,6 +266,12 @@ impl SessionEntry {
     self.alive.load(Ordering::SeqCst)
   }
 
+  /// The session incarnation's server-allocated id: with the peer, the exact
+  /// session identity forwarded hops bind their ownership to.
+  pub(crate) fn session_id(&self) -> &crate::SessionId {
+    &self.meta.id
+  }
+
   /// Whether the recovery plane dialed this session (prunable on
   /// redundancy; see the bounded pruning pass in the recovery tick).
   pub(crate) fn recovery_dialed(&self) -> bool {
@@ -346,6 +356,12 @@ pub(crate) async fn run_session(
       return;
     }
   };
+  // The exact session incarnation this read loop serves: forwarded hops bind
+  // their upstream ownership to it (never to the peer alone), and this
+  // session's teardown closes only the hops it registered. A replacement
+  // session for the same peer is a different identity.
+  let identity = forward::SessionIdentity::new(peer.clone(), session_id.clone());
+  let grant = SessionGrant::for_session(&session, identity.clone());
   let entry = SessionEntry {
     frames: frames.clone(),
     pending_acks: Arc::clone(&pending_acks),
@@ -438,7 +454,7 @@ pub(crate) async fn run_session(
   tokio::select! {
     () = read_loop(
       &mut reader,
-      &session,
+      &grant,
       &context,
       &frames,
       &pending_acks,
@@ -491,8 +507,10 @@ pub(crate) async fn run_session(
   // Pending admissions and in-flight incoming bodies observe the
   // interruption explicitly: pending acks fail with StreamInterrupted,
   // forwarded hops relay a failed acknowledgement upstream, and dropped
-  // body channels close without an end marker. Every hop fed by this
-  // session's peer terminates downstream explicitly.
+  // body channels close without an end marker. Every hop fed by THIS
+  // session incarnation terminates downstream explicitly — the winner's
+  // routes registered by a replacement session for the same peer are a
+  // different identity and stay untouched (audit P1-4).
   let (interrupted, relays) = fail_pending_waits(&pending_acks);
   if interrupted > 0 {
     debug!(interrupted, "session closed pending admissions");
@@ -502,7 +520,7 @@ pub(crate) async fn run_session(
       .send_status(&trace_id, crate::packet::wire::AckStatus::Failed)
       .await;
   }
-  forward::close_for_peer(&context.forwarding, &peer).await;
+  forward::close_for_session(&context.forwarding, &identity).await;
 }
 
 /// Resolves when the runtime signals or drops the shutdown channel.

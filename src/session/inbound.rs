@@ -25,7 +25,7 @@ use crate::{
   },
   protocol::wire::PacketKind,
   routing::{
-    forward::{self, PendingAck, PendingAcks},
+    forward::{self, PendingAck, PendingAcks, SessionIdentity},
     table::{record_terminal_failure, update_route},
   },
   transport::connection::ConnectionReader,
@@ -34,6 +34,45 @@ use crate::{
 /// The number of body chunks buffered per admitted incoming stream before
 /// backpressure stalls the session reader.
 const INCOMING_STREAM_CHUNKS: usize = 8;
+
+/// The authenticated grant one established session confers on its read
+/// loop: the exact session incarnation (the identity forwarded hops bind
+/// their ownership to), the peer, and the negotiated feature set that gates
+/// packet-protocol admission.
+pub(super) struct SessionGrant {
+  identity: SessionIdentity,
+  selected_features: Vec<crate::FeatureTag>,
+}
+
+impl SessionGrant {
+  pub(super) const fn new(
+    identity: SessionIdentity, selected_features: Vec<crate::FeatureTag>,
+  ) -> Self {
+    Self {
+      identity,
+      selected_features,
+    }
+  }
+
+  /// The grant one authenticated session confers on its read loop: the
+  /// peer identity, the negotiated feature selection, and the exact
+  /// incarnation the session table registered.
+  pub(super) fn for_session(session: &EstablishedSession, identity: SessionIdentity) -> Self {
+    Self::new(identity, session.selected_features().to_vec())
+  }
+
+  pub(super) const fn identity(&self) -> &SessionIdentity {
+    &self.identity
+  }
+
+  pub(super) const fn peer(&self) -> &NodeId {
+    self.identity.peer()
+  }
+
+  pub(super) fn selected_features(&self) -> &[crate::FeatureTag] {
+    &self.selected_features
+  }
+}
 
 /// One admitted incoming stream: its bounded body channel, the next
 /// expected chunk sequence, the immutable opening-context digest that
@@ -116,7 +155,7 @@ impl Drop for ConsumerDrainGuard {
 /// still hands the consumer set to the node-scoped drain exactly like the
 /// orderly exit below.
 pub(super) async fn read_loop(
-  source: &mut impl FrameSource, session: &EstablishedSession, context: &SessionPacketContext,
+  source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
   frames: &BoundedSender, pending_acks: &PendingAcks,
   last_activity: &Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -127,7 +166,7 @@ pub(super) async fn read_loop(
   };
   read_loop_frames(
     source,
-    session,
+    grant,
     context,
     frames,
     pending_acks,
@@ -144,7 +183,7 @@ pub(super) async fn read_loop(
 /// tests can hold the guard and observe the set between the loop's in-life
 /// reap and the guard's teardown.
 async fn read_loop_frames(
-  source: &mut impl FrameSource, session: &EstablishedSession, context: &SessionPacketContext,
+  source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
   frames: &BoundedSender, pending_acks: &PendingAcks,
   last_activity: &Arc<std::sync::atomic::AtomicU64>, consumers: &mut ConsumerDrainGuard,
 ) {
@@ -201,7 +240,8 @@ async fn read_loop_frames(
           if routed {
             forward::open(
               &context.local().clone(),
-              session.peer(),
+              grant.peer(),
+              grant.identity(),
               open,
               frames,
               &context.sessions,
@@ -214,7 +254,7 @@ async fn read_loop_frames(
             .await;
           } else if admit_open(
             open,
-            session,
+            grant,
             context,
             frames,
             &mut incoming,
@@ -396,9 +436,8 @@ async fn read_loop_frames(
 /// this admission boundary addressed elsewhere is rejected as unsupported
 /// — fail-closed, with no consumer invocation.
 async fn admit_open(
-  open: OpenFrame, session: &EstablishedSession, context: &SessionPacketContext,
-  frames: &BoundedSender, incoming: &mut HashMap<TraceId, AdmittedStream>,
-  consumers: &mut JoinSet<()>,
+  open: OpenFrame, grant: &SessionGrant, context: &SessionPacketContext, frames: &BoundedSender,
+  incoming: &mut HashMap<TraceId, AdmittedStream>, consumers: &mut JoinSet<()>,
 ) -> Result<()> {
   let trace_id = open.trace_id.clone();
   let ack_protocol = open.protocol.clone();
@@ -418,7 +457,7 @@ async fn admit_open(
         open.destination.clone(),
         open.route.clone(),
         &local,
-        session.peer(),
+        grant.peer(),
       ),
       Ok(crate::routing::RouteProgress::Arrive)
     ) {
@@ -446,7 +485,7 @@ async fn admit_open(
     }
     match context.registry.protocol(&open.protocol) {
       Some(registration)
-        if session
+        if grant
           .selected_features()
           .contains(registration.definition.owning_feature()) =>
       {
@@ -898,11 +937,12 @@ mod read_loop_liveness_tests {
     task::JoinSet,
   };
 
-  use super::{ConsumerDrainGuard, FrameSource, read_loop, read_loop_frames};
+  use super::{ConsumerDrainGuard, FrameSource, SessionGrant, read_loop, read_loop_frames};
   use crate::{
     NodeId,
     identity::testing::SequenceEntropy,
     node::EventHub,
+    routing::forward::SessionIdentity,
     session::stream::{SessionPacketContext, SessionPolicy, test_queue},
     storage::contract::helpers::ManualClock,
     transport::Received,
@@ -910,6 +950,19 @@ mod read_loop_liveness_tests {
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  /// The authenticated grant of one test session, derived exactly as the
+  /// session loop derives it: the established session summary plus the
+  /// incarnation the session table registered.
+  fn grant() -> SessionGrant {
+    SessionGrant::for_session(
+      &crate::session::driver::EstablishedSession::test_session(node(2)),
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+    )
   }
 
   /// A frame source that answers every wake with a keepalive pong (the
@@ -986,14 +1039,14 @@ mod read_loop_liveness_tests {
       remaining: 3,
       now: 0,
     };
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
 
     read_loop(
       &mut source,
-      &session,
+      &grant,
       &context,
       &frames,
       &pending_acks,
@@ -1032,7 +1085,7 @@ mod read_loop_liveness_tests {
   async fn cancelled_read_loop_still_registers_the_consumer_drain() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
     let mut source = SilentSource;
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
@@ -1043,7 +1096,7 @@ mod read_loop_liveness_tests {
       Duration::from_millis(100),
       read_loop(
         &mut source,
-        &session,
+        &grant,
         &context,
         &frames,
         &pending_acks,
@@ -1073,7 +1126,7 @@ mod read_loop_liveness_tests {
       remaining: 0,
       now: 0,
     };
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
@@ -1081,7 +1134,7 @@ mod read_loop_liveness_tests {
 
     read_loop(
       &mut source,
-      &session,
+      &grant,
       &context,
       &frames,
       &pending_acks,
@@ -1109,7 +1162,7 @@ mod read_loop_liveness_tests {
   #[tokio::test]
   async fn read_loop_reaps_completed_consumer_entries_before_teardown() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
@@ -1150,7 +1203,7 @@ mod read_loop_liveness_tests {
     };
     read_loop_frames(
       &mut source,
-      &session,
+      &grant,
       &context,
       &frames,
       &pending_acks,
@@ -1197,7 +1250,7 @@ mod ack_attribution_tests {
 
   use futures_util::future::BoxFuture;
 
-  use super::{FrameSource, read_loop};
+  use super::{FrameSource, SessionGrant, read_loop};
   use crate::{
     NodeId, TraceId,
     identity::testing::SequenceEntropy,
@@ -1209,7 +1262,7 @@ mod ack_attribution_tests {
     },
     routing::{
       RouteContext,
-      forward::{ForwardingHop, PendingAck, PendingAcks, RetryState, register},
+      forward::{ForwardingHop, PendingAck, PendingAcks, RetryState, SessionIdentity, register},
     },
     session::stream::{SessionPacketContext, SessionPolicy, test_queue},
     transport::{Received, connection::Message},
@@ -1282,6 +1335,58 @@ mod ack_attribution_tests {
     )
   }
 
+  /// The authenticated grant of one test session, derived exactly as the
+  /// session loop derives it: the established session summary plus the
+  /// incarnation the session table registered.
+  fn grant() -> SessionGrant {
+    SessionGrant::for_session(
+      &crate::session::driver::EstablishedSession::test_session(node(2)),
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+    )
+  }
+
+  /// The session identity of another incarnation of the same peer: a hop
+  /// bound to it is not the receiving session's own downstream.
+  fn other_session(peer: u8, incarnation: u32) -> SessionIdentity {
+    SessionIdentity::new(
+      node(peer),
+      crate::SessionId::parse(&format!("session-{incarnation:021}")).unwrap(),
+    )
+  }
+
+  fn hop_on(
+    upstream: crate::session::stream::BoundedSender,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream_session: SessionIdentity,
+  ) -> ForwardingHop {
+    let trace_id = trace(9);
+    ForwardingHop {
+      upstream,
+      downstream,
+      downstream_acks: Arc::clone(&downstream_acks),
+      upstream_session: other_session(3, 1),
+      downstream_session,
+      relay_lock: Arc::new(tokio::sync::Mutex::new(())),
+      deadline: None,
+      retry: Some(RetryState {
+        open: OpenFrame {
+          trace_id: trace_id.clone(),
+          source: node(3),
+          destination: node(9),
+          protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+          metadata: crate::StreamMetadata::new(),
+          route: None,
+        },
+        context: RouteContext::new(trace_id, node(3), node(9), 8),
+        candidates: Vec::new(),
+        downstream_acks,
+      }),
+    }
+  }
+
   /// A late failure acknowledgement from a superseded branch must not
   /// steer the live hop: this node's discovering retry for the trace
   /// switched to a new downstream (the first branch's deadline expired),
@@ -1292,7 +1397,7 @@ mod ack_attribution_tests {
   #[tokio::test]
   async fn late_ack_from_a_superseded_branch_leaves_the_live_hop_untouched() {
     let trace_id = trace(9);
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context();
 
     // The hop's current downstream attempt: a live relay entry on its
@@ -1311,27 +1416,14 @@ mod ack_attribution_tests {
     register(
       &context.forwarding,
       trace_id.clone(),
-      ForwardingHop {
-        upstream: upstream_tx,
-        downstream: downstream_tx,
-        downstream_acks: Arc::clone(&live_acks),
-        upstream_peer: node(3),
-        relay_lock: Arc::new(tokio::sync::Mutex::new(())),
-        deadline: None,
-        retry: Some(RetryState {
-          open: OpenFrame {
-            trace_id: trace_id.clone(),
-            source: node(3),
-            destination: node(9),
-            protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
-            metadata: crate::StreamMetadata::new(),
-            route: None,
-          },
-          context: RouteContext::new(trace_id.clone(), node(3), node(9), 8),
-          candidates: Vec::new(),
-          downstream_acks: Arc::clone(&live_acks),
-        }),
-      },
+      hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&live_acks),
+        // A different session than the one delivering the late ack: the
+        // hop already re-dispatched to another branch.
+        other_session(7, 5),
+      ),
     )
     .unwrap();
 
@@ -1352,7 +1444,7 @@ mod ack_attribution_tests {
       Duration::from_secs(10),
       read_loop(
         &mut source,
-        &session,
+        &grant,
         &context,
         &frames,
         &stale_acks,
@@ -1390,7 +1482,7 @@ mod durable_mirror_tests {
 
   use futures_util::future::BoxFuture;
 
-  use super::{FrameSource, read_loop};
+  use super::{FrameSource, SessionGrant, read_loop};
   use crate::{
     ErrorKind, NodeId, RouteState, TraceId,
     identity::testing::SequenceEntropy,
@@ -1399,7 +1491,10 @@ mod durable_mirror_tests {
       RouteRecord,
       wire::{AckFrame, AckStatus},
     },
-    routing::trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
+    routing::{
+      forward::SessionIdentity,
+      trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
+    },
     session::stream::{SessionPacketContext, SessionPolicy, test_queue},
     transport::{Received, connection::Message},
   };
@@ -1482,7 +1577,13 @@ mod durable_mirror_tests {
     sink: &TraceSink, routes: &crate::routing::RouteTable, trace_id: &TraceId,
   ) -> Vec<TraceRecord> {
     let context = context_with(sink.clone(), routes.clone());
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = SessionGrant::for_session(
+      &crate::session::driver::EstablishedSession::test_session(node(2)),
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+    );
     let body = crate::packet::wire::encode_ack(&AckFrame {
       trace_id: trace_id.clone(),
       status: AckStatus::Failed,
@@ -1498,7 +1599,7 @@ mod durable_mirror_tests {
       Duration::from_secs(10),
       read_loop(
         &mut source,
-        &session,
+        &grant,
         &context,
         &frames,
         &pending_acks,
