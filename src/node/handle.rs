@@ -443,8 +443,12 @@ impl NodeHandle {
   /// it again while [`crate::ReceiptRetentionReport::remaining`] reports
   /// true. The recovery tick runs the same pass automatically on its
   /// sweep cadence; this forces one idempotent pass on demand (tests,
-  /// operations, a bounded drain of a large backlog). Anchoring itself
-  /// is the owning state machine's decision and is not performed here.
+  /// operations, a bounded drain of a large backlog). Receipts whose last
+  /// owner reference has committed away arrive at the anchor through the
+  /// retention-candidate path (the final-removal transaction records the
+  /// candidate and a later pass drives it through the owning cleanup state
+  /// machine); a receipt that still carries owner references is never
+  /// anchored.
   /// Returns the admitted [`Task`], whose `wait` resolves with the pass
   /// report.
   ///
