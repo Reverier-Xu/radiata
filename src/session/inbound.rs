@@ -8,6 +8,7 @@
 use std::{
   collections::HashMap,
   sync::{Arc, atomic::Ordering},
+  time::Duration,
 };
 
 use tokio::{sync::mpsc, task::JoinSet};
@@ -42,6 +43,18 @@ const INCOMING_STREAM_CHUNKS: usize = 8;
 /// body that fits its window always surfaces its exact terminal — and the
 /// bounded channel still never grows beyond window plus terminal.
 const INCOMING_STREAM_TERMINAL_SLOTS: usize = 1;
+
+/// How long the shared session reader waits for a live consumer to free a
+/// slot in its chunk window before it applies the overload policy, on the
+/// same scale as the session queue's `WAIT_BACKSTOP`. A burst above the
+/// window can reach the reader before the consumer task is first scheduled
+/// — the frames were already in the connection's receive buffer — so
+/// terminating on the spot would misread a healthy consumer as a stalled
+/// one. Each admitted stream spends this grace once: a consumer that frees
+/// a slot proves it is alive and the burst continues, while a consumer that
+/// never drains costs the shared reader one bounded patience and then ends
+/// through the explicit overload policy.
+const INCOMING_STREAM_DRAIN_PATIENCE: Duration = Duration::from_millis(50);
 
 /// The authenticated grant one established session confers on its read
 /// loop: the exact session incarnation (the identity forwarded hops bind
@@ -93,6 +106,11 @@ struct AdmittedStream {
   next_sequence: u64,
   context: crate::Digest,
   admitted_at_millis: u64,
+  /// Whether this stream already spent its single bounded drain grace. One
+  /// grace per stream is what keeps the shared reader's stall bounded by
+  /// [`INCOMING_STREAM_DRAIN_PATIENCE`] independently of the stream's
+  /// length: after it, a full window is overload, not backpressure.
+  drain_grace_spent: bool,
 }
 
 /// UNIX-milliseconds from the injected wall clock, used for the admission
@@ -286,7 +304,7 @@ async fn read_loop_frames(
           let trace = chunk.trace_id.clone();
           if forward::contains(&context.forwarding, &trace) {
             forward::relay_chunk(&context.forwarding, chunk).await;
-          } else if !forward_chunk(chunk, &mut incoming, frames) {
+          } else if !forward_chunk(chunk, &mut incoming, frames).await {
             warn!(trace_id = %trace, "incoming chunk sequence violation; closing session");
             break;
           }
@@ -550,6 +568,7 @@ async fn admit_open(
             next_sequence: 0,
             context: context_digest,
             admitted_at_millis: admitted_at,
+            drain_grace_spent: false,
           },
         );
         let packet = IncomingStream::new(
@@ -626,21 +645,23 @@ async fn admit_open(
 
 /// Forwards one chunk to its admitted stream in strict sequence order.
 /// Returns `false` on a sequence violation (fail closed).
-/// Forwards one chunk to its admitted stream in strict sequence order.
-/// Returns `false` on a sequence violation (fail closed).
 ///
-/// Delivery never awaits the consumer's window: the shared session reader
-/// must stay responsive to the pongs, acknowledgements, and other streams
-/// of the same session, so one stalled consumer cannot park the whole
-/// connection (audit P1-9). The per-stream window is the flow-control bound,
-/// and exhausting it is an explicit overload policy rather than an
-/// unbounded buffer or a blocked reader: the stream is terminated — its
-/// consumer observes exactly one typed `StreamInterrupted` through the
-/// closed body channel — and the origin learns the interruption through a
-/// best-effort failed acknowledgement, exactly the status a destination-side
-/// mid-stream failure reports. The terminal slot stays reserved for the
-/// typed end, so a body that fits its window still completes cleanly.
-fn forward_chunk(
+/// Delivery never awaits the consumer's window unboundedly: the shared
+/// session reader must stay responsive to the pongs, acknowledgements, and
+/// other streams of the same session, so one stalled consumer cannot park
+/// the whole connection (audit P1-9). The per-stream window is the
+/// flow-control bound. A full window first spends the stream's single
+/// [`INCOMING_STREAM_DRAIN_PATIENCE`] grace — a burst whose frames were
+/// already buffered by the transport can reach the reader before the
+/// consumer task is first scheduled, and a live consumer frees a slot well
+/// inside that patience. A window still full on expiry is the stream's own
+/// overload: the stream is terminated — its consumer observes exactly one
+/// typed `StreamInterrupted` through the closed body channel — and the
+/// origin learns the interruption through a best-effort failed
+/// acknowledgement, exactly the status a destination-side mid-stream
+/// failure reports. The terminal slot stays reserved for the typed end, so
+/// a body that fits its window still completes cleanly.
+async fn forward_chunk(
   chunk: ChunkFrame, incoming: &mut HashMap<TraceId, AdmittedStream>, frames: &BoundedSender,
 ) -> bool {
   let Some(admitted) = incoming.get_mut(&chunk.trace_id) else {
@@ -663,19 +684,49 @@ fn forward_chunk(
   // the check and the send are one decision — no racing sender can steal
   // the slot between them.
   let window_full = admitted.stream.capacity() <= INCOMING_STREAM_TERMINAL_SLOTS;
-  let delivered = if window_full {
-    Err(mpsc::error::TrySendError::Full(StreamItem::Chunk(bytes)))
+  let chunk_item = StreamItem::Chunk(bytes);
+  let delivered = if !window_full {
+    admitted.stream.try_send(chunk_item)
+  } else if admitted.drain_grace_spent {
+    Err(mpsc::error::TrySendError::Full(chunk_item))
   } else {
-    admitted.stream.try_send(StreamItem::Chunk(bytes))
+    admitted.drain_grace_spent = true;
+    // Spend the stream's one grace on the first full window: wait, bounded
+    // by the patience, until the consumer frees a chunk slot *and* the
+    // terminal slot the window keeps in reserve. Reserving both is what
+    // keeps the policy honest — waiting for one slot alone would spend the
+    // terminal reservation and turn a live consumer's burst into a false
+    // overload.
+    match tokio::time::timeout(
+      INCOMING_STREAM_DRAIN_PATIENCE,
+      admitted
+        .stream
+        .reserve_many(INCOMING_STREAM_TERMINAL_SLOTS + 1),
+    )
+    .await
+    {
+      Ok(Ok(mut permits)) => {
+        // The iterator holds the reserved slots; the chunk takes one and
+        // dropping the iterator returns the terminal reservation.
+        if let Some(permit) = permits.next() {
+          permit.send(chunk_item);
+          Ok(())
+        } else {
+          Err(mpsc::error::TrySendError::Full(chunk_item))
+        }
+      }
+      Ok(Err(_)) => Err(mpsc::error::TrySendError::Closed(chunk_item)),
+      Err(_elapsed) => Err(mpsc::error::TrySendError::Full(chunk_item)),
+    }
   };
   match delivered {
     Ok(()) => true,
     Err(error) => {
-      // The consumer is gone (closed) or has not drained its window (full).
-      // Either way this stream ends here, explicitly: dropping the sender
-      // closes the body channel, which the consumer surfaces as one typed
-      // `StreamInterrupted`, and the failed status tells the origin to stop
-      // the stream too.
+      // The consumer is gone (closed) or stayed stalled through its grace
+      // (full). Either way this stream ends here, explicitly: dropping the
+      // sender closes the body channel, which the consumer surfaces as one
+      // typed `StreamInterrupted`, and the failed status tells the origin
+      // to stop the stream too.
       let full = matches!(error, mpsc::error::TrySendError::Full(_));
       warn!(
         trace_id = %chunk.trace_id,
@@ -2026,7 +2077,7 @@ mod slow_consumer_tests {
 
   use super::{FrameSource, INCOMING_STREAM_CHUNKS, SessionGrant, read_loop};
   use crate::{
-    ExtensionRegistry, FeatureTag, IncomingStream, ProtocolTag,
+    ExtensionRegistry, FeatureTag, IncomingStream, ProtocolTag, TraceId,
     extension_registry::{PacketConsumer, ProtocolDefinition},
     identity::testing::SequenceEntropy,
     node::EventHub,
@@ -2132,6 +2183,10 @@ mod slow_consumer_tests {
   }
 
   fn chunk_frame(seed: u32, sequence: u64) -> Message {
+    chunk_frame_with(seed, sequence, &[7; 8])
+  }
+
+  fn chunk_frame_with(seed: u32, sequence: u64, bytes: &[u8]) -> Message {
     Message {
       schema_id: BASE_SCHEMA_ID,
       kind_id: PacketKind::Chunk.kind_id(),
@@ -2139,10 +2194,127 @@ mod slow_consumer_tests {
       body: crate::packet::wire::encode_chunk(&ChunkFrame {
         trace_id: trace(seed),
         sequence,
-        bytes: ByteVec::from(vec![7; 8]),
+        bytes: ByteVec::from(bytes.to_vec()),
       })
       .unwrap(),
     }
+  }
+
+  fn end_frame(seed: u32) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(seed),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    }
+  }
+
+  /// Every body the draining consumer finished: its trace and the
+  /// concatenated payload.
+  type RecordedBodies = Arc<Mutex<Vec<(TraceId, Vec<u8>)>>>;
+
+  /// Every terminal the draining consumer observed: its trace and `None`
+  /// for a completed body or the typed interruption kind.
+  type RecordedTerminals = Arc<Mutex<Vec<(TraceId, Option<crate::ErrorKind>)>>>;
+
+  /// A consumer that drains immediately — the healthy side of a burst —
+  /// and records each body and its terminal. The trace it is told to stall
+  /// is instead held forever without a single read: a consumer whose task
+  /// and admission slot are alive but that never frees its window.
+  #[derive(Debug)]
+  struct DrainingConsumer {
+    stalled: Option<TraceId>,
+    bodies: RecordedBodies,
+    terminals: RecordedTerminals,
+  }
+
+  impl DrainingConsumer {
+    fn new(stalled: Option<TraceId>) -> Self {
+      Self {
+        stalled,
+        bodies: Arc::default(),
+        terminals: Arc::default(),
+      }
+    }
+
+    /// Waits (bounded) for the recorded body of `trace` and returns its
+    /// bytes together with its terminal: `None` for a completed body,
+    /// `Some(kind)` for exactly one typed interruption.
+    async fn body_of(&self, trace: &TraceId) -> (Vec<u8>, Option<crate::ErrorKind>) {
+      let deadline = std::time::Instant::now() + Duration::from_secs(10);
+      loop {
+        let terminal = self
+          .terminals
+          .lock()
+          .unwrap()
+          .iter()
+          .find(|(recorded, _)| recorded == trace)
+          .map(|(_, terminal)| *terminal);
+        if let Some(terminal) = terminal {
+          let body = self
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(recorded, _)| recorded == trace)
+            .map(|(_, body)| body.clone())
+            .unwrap_or_default();
+          return (body, terminal);
+        }
+        assert!(
+          std::time::Instant::now() < deadline,
+          "the draining consumer must finish its body"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+      }
+    }
+  }
+
+  impl PacketConsumer for DrainingConsumer {
+    fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, crate::Result<()>> {
+      let stalled = self.stalled.clone();
+      let bodies = Arc::clone(&self.bodies);
+      let terminals = Arc::clone(&self.terminals);
+      Box::pin(async move {
+        let trace = packet.trace_id().clone();
+        if stalled.as_ref() == Some(&trace) {
+          // Never read a byte: the window fills and only the reader's
+          // bounded drain grace stands between it and the overload policy.
+          std::future::pending::<()>().await;
+        }
+        let mut bytes = Vec::new();
+        let mut body = packet.body();
+        let terminal = loop {
+          match body.next().await {
+            Some(Ok(chunk)) => bytes.extend_from_slice(&chunk),
+            Some(Err(error)) => break Some(error.kind()),
+            None => break None,
+          }
+        };
+        bodies.lock().unwrap().push((trace.clone(), bytes));
+        terminals.lock().unwrap().push((trace, terminal));
+        Ok(())
+      })
+    }
+  }
+
+  /// Builds the registry + read loop plumbing around one consumer.
+  fn session_for(consumer: Arc<DrainingConsumer>) -> SessionPacketContext {
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        Arc::clone(&consumer) as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    context(Arc::new(registry))
   }
 
   fn context(registry: Arc<ExtensionRegistry>) -> SessionPacketContext {
@@ -2178,12 +2350,13 @@ mod slow_consumer_tests {
 
   /// Regression (audit P1-9): a consumer that never drains its bounded
   /// window must not stall the session's shared read loop. The window
-  /// (`INCOMING_STREAM_CHUNKS`) fills, the overflowing chunk terminates
-  /// the stream with the explicit overload policy — the origin learns it
-  /// through a typed failed acknowledgement, the consumer later observes
-  /// exactly one typed interruption — and the reader keeps processing
-  /// frames after the overload until the orderly end. Before the fix the
-  /// reader parked on the full channel and the session went mute.
+  /// (`INCOMING_STREAM_CHUNKS`) fills, the overflowing chunk spends the
+  /// stream's single drain grace, the grace expires, and the explicit
+  /// overload policy terminates the stream — the origin learns it through
+  /// a typed failed acknowledgement, the consumer later observes exactly
+  /// one typed interruption — and the reader keeps processing frames after
+  /// the overload until the orderly end. Before the fix the reader parked
+  /// on the full channel and the session went mute.
   #[tokio::test]
   async fn an_undrained_window_terminates_the_stream_without_stalling_the_reader() {
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
@@ -2207,7 +2380,8 @@ mod slow_consumer_tests {
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
-    // The window fills, then the next chunk overflows it.
+    // The window fills, then the next chunk overflows it and spends the
+    // stream's one drain grace, which expires against this gated consumer.
     let mut messages = Vec::new();
     messages.push(open_frame(9));
     for sequence in 0..(INCOMING_STREAM_CHUNKS as u64 + 1) {
@@ -2352,6 +2526,156 @@ mod slow_consumer_tests {
       );
       tokio::time::sleep(Duration::from_millis(1)).await;
     }
+  }
+
+  /// Regression (the P1-9 follow-up): a burst of wire slices above the
+  /// window can reach the shared reader before the consumer task is first
+  /// scheduled — the transport already buffered every slice. The bounded
+  /// drain grace keeps that legitimate burst from being misread as
+  /// overload: the live consumer frees slots inside its patience, the body
+  /// arrives byte-exact, and the stream keeps its clean completed terminal.
+  #[tokio::test]
+  async fn a_burst_above_the_window_with_a_live_consumer_stays_byte_exact() {
+    let consumer = Arc::new(DrainingConsumer::new(None));
+    let context = session_for(Arc::clone(&consumer));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Two slices above the window: the overflowing slice spends the
+    // stream's one drain grace, which a live consumer answers immediately.
+    let mut expected = Vec::new();
+    let mut messages = Vec::new();
+    messages.push(open_frame(11));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64 + 2) {
+      let bytes = [sequence as u8; 8];
+      expected.extend_from_slice(&bytes);
+      messages.push(chunk_frame_with(11, sequence, &bytes));
+    }
+    messages.push(end_frame(11));
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop must not stall on a live consumer's burst");
+
+    // Admission is the only acknowledgement: the burst never reached the
+    // overload policy.
+    let ack = frames_rx.recv().await.unwrap();
+    assert_eq!(ack.kind, PacketKind::Ack);
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.trace_id, trace(11));
+    assert_eq!(ack.status, AckStatus::Admitted);
+    // A live consumer's burst must not surface a failed acknowledgement:
+    // the read loop already queued every frame it will ever send, so an
+    // empty queue after a short wait is the whole assertion.
+    assert!(
+      tokio::time::timeout(Duration::from_millis(100), frames_rx.recv())
+        .await
+        .is_err(),
+      "a live consumer's burst must not surface a failed acknowledgement"
+    );
+
+    let (body, terminal) = consumer.body_of(&trace(11)).await;
+    assert_eq!(terminal, None, "the burst must keep its completed terminal");
+    assert_eq!(body, expected, "the burst must arrive byte-exact");
+  }
+
+  /// The other half of the policy: a consumer that stays stalled past its
+  /// grace is still terminated. The shared reader spends one bounded
+  /// patience per stalled stream, surfaces the typed failed acknowledgement
+  /// and the consumer's single typed interruption, and keeps serving the
+  /// session — a second stream opened after the overload completes
+  /// byte-exact.
+  #[tokio::test]
+  async fn a_stalled_consumer_overloads_after_its_grace_without_holding_the_session() {
+    let stalled = trace(20);
+    let consumer = Arc::new(DrainingConsumer::new(Some(stalled.clone())));
+    let context = session_for(Arc::clone(&consumer));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // The stalled stream fills its window and spends its grace on the next
+    // slice; the live stream is opened after that overload and must be
+    // served to completion by the same read loop.
+    let mut live_expected = Vec::new();
+    let mut messages = Vec::new();
+    messages.push(open_frame(20));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64 + 1) {
+      messages.push(chunk_frame(20, sequence));
+    }
+    messages.push(open_frame(21));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64) {
+      let bytes = [sequence as u8; 8];
+      live_expected.extend_from_slice(&bytes);
+      messages.push(chunk_frame_with(21, sequence, &bytes));
+    }
+    messages.push(end_frame(21));
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop must not stall on a consumer that never drains");
+
+    // The stalled stream: admission, then the typed failure from the
+    // overload policy once its grace expired. The live stream is still
+    // admitted afterwards.
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+      let ack = frames_rx.recv().await.unwrap();
+      assert_eq!(ack.kind, PacketKind::Ack);
+      let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+      statuses.push((ack.trace_id, ack.status));
+    }
+    assert_eq!(
+      statuses,
+      vec![
+        (stalled.clone(), AckStatus::Admitted),
+        (stalled, AckStatus::Failed),
+        (trace(21), AckStatus::Admitted),
+      ],
+      "the stalled stream is overloaded and the live stream is still admitted"
+    );
+
+    let (body, terminal) = consumer.body_of(&trace(21)).await;
+    assert_eq!(terminal, None, "the live stream completes cleanly");
+    assert_eq!(body, live_expected, "the live body arrives byte-exact");
+    assert!(
+      consumer
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(recorded, _)| recorded != &trace(20)),
+      "the stalled consumer never completed a body"
+    );
   }
 }
 
