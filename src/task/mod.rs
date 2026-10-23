@@ -461,6 +461,24 @@ impl TaskTable {
       entries.remove(&id);
     }
   }
+
+  /// The number of live non-terminal entries of one slot class: the
+  /// manager's admission bound counts these (a class whose non-terminal
+  /// count reaches its bound refuses further admissions typed), so slow
+  /// effects plus a stream of distinct intents can never accumulate
+  /// unbounded admitted work — entries, captured effects, and waiting
+  /// workers are each bounded by it. Terminal entries (the bounded
+  /// history) never count: they are observations, not work.
+  pub(crate) fn non_terminal_count(&self, class: SlotClass) -> usize {
+    self.lock().map_or(0, |entries| {
+      entries
+        .values()
+        .filter(|entry| {
+          entry.kind.slot_class() == class && !entry.status.borrow().phase.is_terminal()
+        })
+        .count()
+    })
+  }
 }
 
 /// The caller's observation half over the shared task table: the table

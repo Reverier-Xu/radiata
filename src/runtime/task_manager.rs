@@ -96,6 +96,19 @@ impl ReconcileChannels {
 /// (oldest-terminal first) and read as absent.
 pub(crate) const TASK_TERMINAL_HISTORY: usize = 256;
 
+/// The per-class admission bound on non-terminal tasks: once one slot
+/// class holds this many live (admitted, unsettled) entries, further
+/// admissions of that class fail typed
+/// [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) — the
+/// caller-facing backpressure of a stalled effect plane. The bound
+/// sits above the admission channel's capacity and the slot budgets (a
+/// full channel of distinct intents still queues behind the slots
+/// without refusing) while capping each class's worst-case memory —
+/// entries, captured effects, and waiting workers are each bounded by
+/// it. The three slot classes carry separate budgets, so saturating
+/// one class's backlog never consumes another's.
+pub(crate) const TASK_RECONCILE_BACKLOG: usize = 64;
+
 /// The idle retry timer: far enough out to never fire while the
 /// schedule is empty, near enough to stay inside tokio's `Instant`
 /// arithmetic.
@@ -385,8 +398,9 @@ impl std::fmt::Debug for TaskClient {
 impl TaskClient {
   /// Submits one task and awaits its admission: pure validation and
   /// hooks have already run caller-side; this is id composition, the
-  /// dedup/coalescing check, the `Pending` publication, and the first
-  /// reconcile spawn. No IO ever runs on this path.
+  /// dedup/coalescing check, the per-class backlog bound, the `Pending`
+  /// publication, and the first reconcile spawn. No IO ever runs on
+  /// this path.
   pub(crate) async fn submit(&self, spec: TaskSpec, effect: TaskEffect) -> Result<TaskId> {
     let (reply, response) = oneshot::channel();
     self
@@ -928,9 +942,9 @@ async fn run_manager(
 }
 
 /// The admission bookkeeping: shutdown gate, spec shape, coalescing,
-/// leave exclusivity, id composition, the `Pending` publication, and
-/// the first reconcile spawn. The admission reply always resolves —
-/// a dropped reply means the caller went away.
+/// leave exclusivity, the per-class backlog bound, id composition, the
+/// `Pending` publication, and the first reconcile spawn. The admission
+/// reply always resolves — a dropped reply means the caller went away.
 #[allow(clippy::too_many_arguments)]
 fn admit(
   shared: &Arc<ManagerShared>, counter: &mut u64,
@@ -1004,6 +1018,14 @@ fn admit_inner(
     && in_flight(&existing)
   {
     return Err(Error::conflict("task in flight"));
+  }
+  // The per-class backlog bound: admission itself is refused once the
+  // class holds its budget of non-terminal entries, so slow effects
+  // plus a stream of distinct intents can never accumulate unbounded
+  // admitted work. The bound is per class — a stalled dial backlog
+  // never consumes the local write budget.
+  if shared.table.non_terminal_count(kind.slot_class()) >= TASK_RECONCILE_BACKLOG {
+    return Err(Error::overloaded("task admission"));
   }
   let next = *counter;
   *counter = next
@@ -1770,6 +1792,108 @@ mod tests {
     .await
     .expect("the extension workflow must not deadlock on the local channel")
     .expect("terminal");
+  }
+
+  /// The P2-2 regression: the manager admitted unboundedly — the
+  /// submission channel bounded only in-flight messages, and each
+  /// admission inserted a `Pending` entry and spawned a worker before
+  /// that worker ever drew an execution slot, so a slow effect plus a
+  /// stream of distinct intents accumulated non-terminal work without
+  /// bound. The per-class backlog bound refuses typed once a class
+  /// holds its budget, and the budgets are isolated: a saturated local
+  /// backlog never consumes the network budget.
+  #[tokio::test]
+  async fn the_non_terminal_backlog_is_bounded_per_class_with_typed_overload() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // Distinct-intent wedged local tasks fill the local backlog: the
+    // two default local slots wedge and the rest wait as non-terminal
+    // `Pending` entries.
+    for _ in 0..super::TASK_RECONCILE_BACKLOG {
+      client
+        .submit(
+          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          wedged_effect(),
+        )
+        .await
+        .expect("admission below the bound");
+    }
+    let refused = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        wedged_effect(),
+      )
+      .await
+      .expect_err("the local backlog is full");
+    assert_eq!(refused.kind(), ErrorKind::Overloaded);
+    assert_eq!(refused.context(), "task admission");
+    // The class's non-terminal count sits exactly at the bound (the
+    // memory-related count is capped), and the sibling classes carry
+    // their own budgets.
+    assert_eq!(
+      client
+        .observer
+        .table
+        .non_terminal_count(super::SlotClass::Local),
+      super::TASK_RECONCILE_BACKLOG
+    );
+    assert_eq!(
+      client
+        .observer
+        .table
+        .non_terminal_count(super::SlotClass::Extension),
+      0
+    );
+    // The network budget is separate: a dial still admits and runs to
+    // its terminal phase while the local backlog is saturated.
+    let dial = client
+      .submit(
+        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        ok_effect(TaskOutput::Join(merge_view())),
+      )
+      .await
+      .expect("the network backlog is a separate budget");
+    handle::<MergeView>(&client, &dial, TaskKind::Join)
+      .wait()
+      .await
+      .expect("dial terminal");
+  }
+
+  /// The mirror isolation of the backlog budgets: a saturated network
+  /// backlog (a stalled effect plane of wedged dials) refuses further
+  /// dials typed but never blocks the core local writes.
+  #[tokio::test]
+  async fn a_saturated_network_backlog_never_blocks_local_admission() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    for _ in 0..super::TASK_RECONCILE_BACKLOG {
+      client
+        .submit(
+          TaskSpec::new(TaskKind::Join, TaskPayload::None),
+          wedged_effect(),
+        )
+        .await
+        .expect("admission below the bound");
+    }
+    let refused = client
+      .submit(
+        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        wedged_effect(),
+      )
+      .await
+      .expect_err("the network backlog is full");
+    assert_eq!(refused.kind(), ErrorKind::Overloaded);
+    // A core local write still admits and completes: one class's
+    // saturated backlog budget never consumes another's.
+    let local = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        ok_effect(TaskOutput::SyncRound(())),
+      )
+      .await
+      .expect("local admission");
+    handle::<()>(&client, &local, TaskKind::SyncRound)
+      .wait()
+      .await
+      .expect("local terminal");
   }
 
   #[tokio::test]
