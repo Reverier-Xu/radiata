@@ -698,8 +698,11 @@
 //!   across consecutive ticks. The tick settles delivery verdicts off the tick
 //!   path, so a hub's per-tick hold-down stays at the dispatch cost rather than
 //!   the slowest peer's ack bound. The degree-maintenance tick adds bounded
-//!   work only while a node is below its target: nothing while healthy, one
-//!   deficit-sized dial batch per 30 seconds while healing.
+//!   work on two cadences: one deficit-sized dial batch per 30 seconds while a
+//!   node heals below target, and — healthy but not fully meshed — at most one
+//!   bridge-probe dial per five minutes (the re-bridge path of [chapter
+//!   2](#2-the-any-one-route-connectivity-contract)); a fully connected node
+//!   spends nothing.
 //!
 //! Delivery across restarts stays the application's job (the data
 //! plane is at-most-once): a `Failed` or interrupted stream is a
