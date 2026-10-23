@@ -86,11 +86,17 @@
 //! cluster exists — never only when a specific topology is up. The
 //! recovery plane never expands the topology of a connected node; it
 //! dials candidates from the member table only while the node is fully
-//! isolated, with bounded fan-out and backoff. Once any route works,
-//! the reconciliation plane
+//! isolated, with bounded fan-out and backoff. That verdict is a local
+//! one: a single authenticated path joins the node to its component and
+//! quiesces recovery, and it says nothing about how far the component
+//! reaches. From one route to a converged cluster the stages stay
+//! distinct — bridge discovery (below), each dial under its bounded
+//! connect and authentication deadlines, whatever transfer size and
+//! relay-path length the route carries, and only then the
+//! reconciliation plane
 //! ([chapter 3](#3-how-state-converges-the-reconciliation-contract))
-//! converges the rest over that route: membership descriptors, issuer
-//! trust bindings, resource rows, and removal tombstones spread as
+//! spreading membership descriptors, issuer
+//! trust bindings, resource rows, and removal tombstones as
 //! receiver-evidenced exchanges hop by hop, so a wider topology only
 //! shortens paths — it is never a convergence requirement.
 //!
@@ -107,7 +113,13 @@
 //! maintenance target, never a functional gate: below target everything
 //! keeps working, above target nothing is pruned, and only a fully
 //! offline node falls back to the recovery plane's high-frequency
-//! backoff.
+//! backoff. One deliberate exception keeps the contract honest across
+//! a partition: a healthy node that still has unconnected members
+//! maintains a low-frequency bridge probe — at most one dial of a
+//! uniformly random unconnected member per five minutes — because two
+//! sub-partitions each already meshed at or above target have a zero
+//! deficit budget and a quiesced recovery plane, and that probe is the
+//! only thing that re-bridges them.
 //!
 //! [`RecoveryView`](crate::RecoveryView) reports the any-one-route
 //! contract: `is_connected` means "at least one path", and
@@ -120,20 +132,27 @@
 //! whether the mesh is `Healthy`. A node stuck `Unhealthy` below target
 //! is the operator's signal that the network (or the peers' published
 //! endpoints) cannot carry the mesh the degree contract asks for.
-//! Convergence after a partition is bounded by the recovery backoff
-//! plus the sync plane's own cadence — a rejoined session opens with a
-//! whole-lane summary exchange, changes ride the tick-debounced hints,
-//! and whatever no message ever observed heals at the quiet detection
-//! cadence of [chapter
-//! 3](#3-how-state-converges-the-reconciliation-contract) — plus one
-//! maintenance tick for the degree top-up, never by any fixed topology.
+//! Convergence after a partition is bounded by whichever stage is the
+//! bottleneck, never by any fixed topology. A fully isolated node
+//! redials the member table on the recovery backoff until one route
+//! lands, and a node still below target adds one deficit-sized top-up
+//! batch per 30 seconds; two sub-partitions each already meshed at or
+//! above target wait on the bridge probe's five-minute bracket
+//! instead. From there the bounds stack: the successful dial finishes
+//! inside the bounded connect and authentication deadlines, the
+//! rejoined session opens with a whole-lane summary exchange, changes
+//! ride the tick-debounced hints, and whatever no message ever
+//! observed heals at the quiet detection cadence of [chapter
+//! 3](#3-how-state-converges-the-reconciliation-contract).
 //!
 //! ```no_run
 //! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
 //! let view = node.recovery().await?;
 //! if view.is_connected() {
 //!     // At least one authenticated path exists: business traffic
-//!     // flows, and the reconciliation plane converges the rest.
+//!     // flows, and state converges over it. Members that path has
+//!     // not reached yet still show up in `unreachable_members` until
+//!     // the bridge probes or a top-up dials them.
 //! } else {
 //!     // Fully isolated: recovery is dialing the member table with
 //!     // bounded fan-out; `unreachable_members` tracks its progress.
