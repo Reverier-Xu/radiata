@@ -122,10 +122,40 @@ async fn pump_chunks(
   }
 }
 
+/// Delivers one admitted stream's typed terminal end to the session queue.
+///
+/// The terminal is the last frame the stream contributes, so it waits for
+/// queue capacity instead of failing on a momentarily saturated queue: the
+/// writer either drains it or the connection dies and the queue closes (the
+/// only remaining failure, reported as `false`). Returns whether the frame
+/// reached the queue.
+async fn send_terminal(entry: &SessionEntry, trace_id: &TraceId, reason: EndReason) -> bool {
+  let Ok(body) = wire::encode_end(&EndFrame {
+    trace_id: trace_id.clone(),
+    reason,
+  }) else {
+    return false;
+  };
+  entry
+    .frames
+    .send_waiting(SessionFrame::new(PacketKind::End, body))
+    .await
+    .is_ok()
+}
+
 /// Pumps one outbound packet over its session: open, admission wait,
 /// ordered chunks, end. Updates the in-memory route record and notifies
 /// the synchronous waiter of the admission outcome (the ack
 /// proves current-process admission only).
+///
+/// Every post-admission exit is one terminal decision: a completed body ends
+/// the stream `Completed`, and every failure — a body read error, a failed
+/// or cancelled chunk pump, or a completion that cannot be delivered — ends
+/// it `Interrupted`, so the destination's consumer never waits forever on a
+/// stream this node already gave up on (audit P1-7). The delivery is
+/// best-effort by construction: when the session queue is already closed the
+/// connection is gone, the peer observes that teardown itself, and the local
+/// terminal record below is the definitive evidence.
 #[instrument(name = "packet", skip_all, fields(
   trace_id = %request.trace_id,
   target = ?request.target,
@@ -266,74 +296,72 @@ pub(crate) async fn run_outbound(
   )));
 
   if let Err(kind) = pump_chunks(&entry, &routes, &trace_id, request.body).await {
+    // The destination already runs a consumer for this stream: the failure
+    // must terminate it explicitly on the wire rather than leaving it
+    // waiting on a body that will never continue (audit P1-7).
+    debug!(
+      trace_id = %trace_id,
+      kind = ?kind,
+      "outbound body failed; interrupting the remote stream"
+    );
+    if !send_terminal(&entry, &trace_id, EndReason::Interrupted).await {
+      trace!(
+        trace_id = %trace_id,
+        "interrupted end could not be queued; the session teardown carries the interruption"
+      );
+    }
     terminal!(kind);
     return;
   }
 
-  // The authenticated sender completed the body: a normal, completed
-  // terminal (an interruption never reaches this path — a failed pump
-  // returned above without an end frame).
-  let end = match wire::encode_end(&EndFrame {
-    trace_id: trace_id.clone(),
-    reason: EndReason::Completed,
-  }) {
-    Ok(end) => end,
-    Err(error) => {
-      terminal!(error.kind());
-      return;
-    }
-  };
-  let interrupted = entry
-    .frames
-    .send(SessionFrame {
-      kind: PacketKind::End,
-      body: end,
-    })
-    .await
-    .is_err();
-  if interrupted {
+  // The authenticated sender completed the body: the normal completed
+  // terminal.
+  if !send_terminal(&entry, &trace_id, EndReason::Completed).await {
+    // The completed end never reached the queue, so the destination cannot
+    // observe a clean completion: the local terminal answer is the typed
+    // interruption of this stream.
     terminal!(ErrorKind::StreamInterrupted);
-  } else {
-    // End-of-stream terminal: enqueue completion records `Delivered`
-    // through the route table's monotonic terminal machine. When a late
-    // mid-flight failure already terminalised the record, the machine
-    // refuses this update and keeps `Failed(StreamInterrupted)` final —
-    // that refusal is the contract, not a lost update: `Delivered`
-    // states that the full body and end left this node, never that the
-    // peer consumed them (remaining items 2026-10-10, P2-3). The refused
-    // tail also skips the `RouteChanged` emit and the durable
-    // `Delivered` twin: the read loop's late-failure flip emits the
-    // nudge and persists the durable revision instead (the other half of
-    // the durable twin's mirror, remaining items 2026-10-10, P2-7), so the
-    // durable trace ends `Failed(StreamInterrupted)` under either
-    // writer ordering instead of keeping a contradicted `Delivered`
-    // for the whole retention window. A poisoned table lock keeps the
-    // legacy behavior (emit plus persist) rather than guessing.
-    update_route(&routes, &trace_id, |record| {
-      record.update(RouteState::Delivered);
-    });
-    let refused = routes
-      .lock()
-      .map(|table| {
-        table
-          .get(&trace_id)
-          .is_some_and(|record| matches!(record.state, RouteState::Failed(_)))
-      })
-      .unwrap_or(false);
-    if !refused {
-      events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-        trace_id.clone(),
-      )));
-      record_terminal_trace(
-        &trace,
-        &trace_id,
-        &source,
-        &destination,
-        crate::routing::trace::TraceTransition::Delivered,
-      );
-    }
+    return;
   }
-  debug!(interrupted, "packet stream finished");
+  // End-of-stream terminal: enqueue completion records `Delivered`
+  // through the route table's monotonic terminal machine. When a late
+  // mid-flight failure already terminalised the record, the machine
+  // refuses this update and keeps `Failed(StreamInterrupted)` final —
+  // that refusal is the contract, not a lost update: `Delivered`
+  // states that the full body and end left this node, never that the
+  // peer consumed them (remaining items 2026-10-10, P2-3). The refused
+  // tail also skips the `RouteChanged` emit and the durable
+  // `Delivered` twin: the read loop's late-failure flip emits the
+  // nudge and persists the durable revision instead (the other half of
+  // the durable twin's mirror, remaining items 2026-10-10, P2-7), so the
+  // durable trace ends `Failed(StreamInterrupted)` under either
+  // writer ordering instead of keeping a contradicted `Delivered`
+  // for the whole retention window. A poisoned table lock keeps the
+  // legacy behavior (emit plus persist) rather than guessing.
+  update_route(&routes, &trace_id, |record| {
+    record.update(RouteState::Delivered);
+  });
+  let refused = routes
+    .lock()
+    .map(|table| {
+      table
+        .get(&trace_id)
+        .is_some_and(|record| matches!(record.state, RouteState::Failed(_)))
+    })
+    .unwrap_or(false);
+  if !refused {
+    events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+      trace_id.clone(),
+    )));
+    record_terminal_trace(
+      &trace,
+      &trace_id,
+      &source,
+      &destination,
+      crate::routing::trace::TraceTransition::Delivered,
+    );
+  }
+  debug!(trace_id = %trace_id, "packet stream finished");
 }
 
 /// Fire-and-forget persistence of one durable terminal fact per packet:
@@ -627,5 +655,192 @@ mod pump_tail_durable_tests {
     let records = drained_records(&sink).await;
     assert_eq!(records.len(), 1, "the durable Delivered twin persists");
     assert_eq!(records[0].trace_id(), &trace_id);
+  }
+}
+
+#[cfg(test)]
+mod body_failure_tests {
+  use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+  use futures_util::stream;
+
+  use super::*;
+  use crate::packet::RouteRecord;
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// Resolves the pump's admission wait the moment it registers (bounded by
+  /// a wall-clock deadline, since the pump registers asynchronously after
+  /// the open frame queues).
+  async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      let resolved = entry
+        .pending_acks
+        .lock()
+        .unwrap()
+        .remove(trace_id)
+        .map(|entry| match entry {
+          PendingAck::Wait { notify, .. } => {
+            let _ = notify.send(Ok(std::time::UNIX_EPOCH));
+            true
+          }
+          PendingAck::Relay { .. } => false,
+        });
+      if resolved == Some(true) {
+        return;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the pump's admission wait never registered"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  /// Regression (audit P1-7): a body that fails after admission must end the
+  /// destination's stream explicitly. The session queue sees the open, the
+  /// chunks produced before the failure, and then an INTERRUPTED end — never
+  /// a bare return that leaves the remote consumer waiting on a body that
+  /// will never continue — and the origin's route record still ends with the
+  /// typed failure.
+  #[tokio::test]
+  async fn body_failure_ends_the_remote_stream_with_an_interrupted_end() {
+    let trace_id = trace(51);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(&routes, 8, RouteRecord::new(trace_id.clone(), node(2))).unwrap();
+
+    let (entry, mut frames) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    let (ack_tx, _ack_rx) = oneshot::channel();
+    let body = stream::iter(vec![
+      Ok(Arc::from(&b"before"[..])),
+      Err(crate::Error::internal("body source")),
+      Ok(Arc::from(&b"after"[..])),
+    ]);
+    let request = crate::packet::OutboundRequest {
+      trace_id: trace_id.clone(),
+      target: crate::packet::StreamTarget::Exact(node(2)),
+      load_balancer: None,
+      max_hops: 1,
+      protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      metadata: crate::StreamMetadata::new(),
+      body: Box::pin(body),
+      internal: false,
+      ack_notify: ack_tx,
+    };
+    let arm_entry = entry.clone();
+    let arm_trace = trace_id.clone();
+    let armed = tokio::spawn(async move { arm_admission(&arm_entry, &arm_trace).await });
+
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        request,
+        routes.clone(),
+        false,
+        None,
+        Arc::new(crate::node::EventHub::new()),
+      ),
+    )
+    .await
+    .expect("the pump finishes within the deadline");
+    armed.await.unwrap();
+
+    // The wire carries: open, the chunk before the failure, then the typed
+    // interrupted end (nothing after the failure).
+    let open = frames.recv().await.expect("open frame");
+    assert_eq!(open.kind, PacketKind::Open);
+    let chunk = frames.recv().await.expect("pre-failure chunk");
+    assert_eq!(chunk.kind, PacketKind::Chunk);
+    let end = frames.recv().await.expect("interrupted end");
+    assert_eq!(end.kind, PacketKind::End);
+    let end =
+      crate::packet::wire::decode_end(&end.body, crate::protocol::CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(end.trace_id, trace_id);
+    assert_eq!(end.reason, EndReason::Interrupted);
+    assert!(
+      frames.recv().await.is_none(),
+      "no completion frame follows the interruption"
+    );
+
+    // The origin's terminal answer is the body's typed failure.
+    let state = routes
+      .lock()
+      .unwrap()
+      .get(&trace_id)
+      .map(|record| record.state.clone())
+      .unwrap();
+    assert!(
+      matches!(state, RouteState::Failed(_)),
+      "the origin records the body failure: {state:?}"
+    );
+  }
+
+  /// The completed path is untouched: a body that ends normally still
+  /// delivers the completed end and records `Delivered`.
+  #[tokio::test]
+  async fn completed_body_still_ends_the_remote_stream_normally() {
+    let trace_id = trace(52);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(&routes, 8, RouteRecord::new(trace_id.clone(), node(2))).unwrap();
+
+    let (entry, mut frames) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    let (ack_tx, _ack_rx) = oneshot::channel();
+    let request = crate::packet::OutboundRequest {
+      trace_id: trace_id.clone(),
+      target: crate::packet::StreamTarget::Exact(node(2)),
+      load_balancer: None,
+      max_hops: 1,
+      protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      metadata: crate::StreamMetadata::new(),
+      body: Box::pin(crate::packet::StaticBody::new(Arc::from(&b"ok"[..]))),
+      internal: false,
+      ack_notify: ack_tx,
+    };
+    let arm_entry = entry.clone();
+    let arm_trace = trace_id.clone();
+    let armed = tokio::spawn(async move { arm_admission(&arm_entry, &arm_trace).await });
+
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        request,
+        routes.clone(),
+        false,
+        None,
+        Arc::new(crate::node::EventHub::new()),
+      ),
+    )
+    .await
+    .expect("the pump finishes within the deadline");
+    armed.await.unwrap();
+
+    let _open = frames.recv().await.expect("open frame");
+    let _chunk = frames.recv().await.expect("chunk");
+    let end = frames.recv().await.expect("completed end");
+    assert_eq!(end.kind, PacketKind::End);
+    let end =
+      crate::packet::wire::decode_end(&end.body, crate::protocol::CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(end.reason, EndReason::Completed);
+    assert_eq!(
+      routes
+        .lock()
+        .unwrap()
+        .get(&trace_id)
+        .map(|record| record.state.clone()),
+      Some(RouteState::Delivered)
+    );
   }
 }
