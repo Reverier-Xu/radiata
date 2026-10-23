@@ -2,12 +2,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use tokio::{
   runtime::Handle,
-  sync::{mpsc, oneshot, watch},
+  sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
   task::{AbortHandle, JoinSet},
 };
 
 use super::{
   anti_entropy::spawn_sync_driver,
+  packets::{PacketAdmission, PumpHandoff},
   task_effects::{ConnectionTasks, track_connection_task},
   task_manager::{TaskManagerHandle, spawn_task_manager},
 };
@@ -21,7 +22,7 @@ use crate::{
   },
   protocol::offer::node_offer,
   provider::{KeyProvider, StorageFactory},
-  routing::RouteTable,
+  routing::{RouteTable, outbound::run_outbound},
   runtime::{Control, LifecycleSnapshot, RuntimeClient},
   session::{
     SessionDriver,
@@ -54,6 +55,20 @@ const CONNECTION_TASK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration:
 pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
+
+/// The bound on simultaneously running packet admission tasks (audit
+/// 2026-10-23 P1-5): each admission may await a caller-supplied routing
+/// policy, so this bounds how many such waits are in flight. A
+/// saturated pool disables the control loop's packet arm instead of
+/// blocking the loop, and the bounded packet command channel carries the
+/// backpressure.
+pub(crate) const ADMISSION_CONCURRENCY: usize = 4;
+
+/// Capacity of the bounded admission-to-loop pump handoff: the loop is
+/// the only consumer and reaps it every iteration, so a full channel
+/// only parks one admission task (holding its admission slot) for one
+/// scheduling window.
+const PUMP_HANDOFF_CAPACITY: usize = ADMISSION_CONCURRENCY;
 
 /// One bound listener's supervisor-side entry: the published endpoint,
 /// the listener handle, and the abort handle of its accept loop.
@@ -403,6 +418,26 @@ async fn supervise(
     }
   };
   supervisor.tick_workers = tick_workers;
+  // The packet admission plane (audit 2026-10-23 P1-5): target
+  // resolution, descriptor validation, first-hop selection, and the route
+  // record run in spawned admission tasks, never inline here — a
+  // caller-supplied policy that never resolves parks one bounded
+  // admission slot instead of the control loop's control reads, other
+  // packet admissions, and shutdown. Record-before-pump ordering
+  // survives the move: the admission task records the route before it
+  // hands the ready request back through the bounded channel below, and
+  // only the loop (the pump `JoinSet`'s owner) spawns `run_outbound`.
+  let admission = PacketAdmission::new(&supervisor);
+  let admission_permits = Arc::new(Semaphore::new(ADMISSION_CONCURRENCY));
+  // The admission permit the packet arm holds while admitting: `None`
+  // disables the arm (a saturated pool) until a running admission
+  // releases one. The loop's own `pump_tx` keeps the handoff channel
+  // open for the node's lifetime, and `packets_open` keeps a closed
+  // command channel from being polled forever.
+  let mut packet_permit: Option<OwnedSemaphorePermit> = None;
+  let (pump_tx, mut pump_rx) = mpsc::channel::<PumpHandoff>(PUMP_HANDOFF_CAPACITY);
+  let mut pump_open = true;
+  let mut packets_open = true;
   // The leave effect's completion signal: once it lands, the caller has
   // already observed the task's terminal outcome (the publication precedes
   // the signal) and the node tears down with the active-leave reason. A
@@ -410,6 +445,12 @@ async fn supervise(
   // the arm is disabled rather than polled again.
   let mut leave_signals_open = true;
   loop {
+    // Fill the packet arm's admission slot without awaiting: a saturated
+    // pool leaves the arm disabled, and the bounded packet command
+    // channel carries the backpressure instead of the loop.
+    if packets_open && packet_permit.is_none() {
+      packet_permit = admission_permits.clone().try_acquire_owned().ok();
+    }
     tokio::select! {
       message = control.recv() => {
         let Some(message) = message else {
@@ -488,32 +529,98 @@ async fn supervise(
       }
         }
       }
-      request = packet_rx.recv() => {
+      request = packet_rx.recv(), if packets_open && packet_permit.is_some() => {
         let Some(request) = request else {
+          // The command channel closed: stop polling the arm (a closed
+          // channel would otherwise be ready every iteration).
+          packets_open = false;
+          packet_permit = None;
           continue;
         };
-        // Deliberately INLINE (audit 2026-10-09 item 3, partial): the
-        // packet arm is the node's admission backpressure point — the
-        // bounded command channel plus this await is what paces the
-        // outbound pump population. The storage IO it awaits is
-        // per-request bounded (one descriptor snapshot plus one
-        // authoritative descriptor read for matching-node targets; one
-        // policy resolution plus one session-table lock for forwarded
-        // targets), and the route record must land before the pump
-        // starts so asynchronous senders observe the admission
-        // decision. Externalizing that resolution would relocate the
-        // same serialization into a bounded admission worker while
-        // breaking the record-before-pump ordering, so the structural
-        // cost exceeds the win; the periodic ticks (the unbounded
-        // latency source) are the ones that moved off-loop.
-        let _ = supervisor.send_packet(request, &mut tasks).await;
+        let Some(permit) = packet_permit.take() else {
+          continue;
+        };
+        // The identity context (and the store handle it carries) is
+        // cloned per admission and lives only inside the admission task:
+        // a long-lived clone here would survive the shutdown path's
+        // storage drain (audit 2026-10-23 P1-10).
+        let Some(context) = supervisor.dependencies.context.clone() else {
+          request.reject(crate::ErrorKind::Internal);
+          continue;
+        };
+        let admission = admission.clone();
+        let pump = pump_tx.clone();
+        tasks.spawn(async move {
+          // The permit is the admission slot and lives as long as the
+          // resolution work, so `ADMISSION_CONCURRENCY` bounds the
+          // in-flight admissions regardless of what a policy awaits.
+          let _permit = permit;
+          match admission.admit(&context, request).await {
+            // The recorded route returns to the loop, which owns the
+            // pump `JoinSet` and spawns `run_outbound`.
+            Ok(Some(handoff)) => {
+              if let Err(mpsc::error::SendError(handoff)) = pump.send(handoff).await {
+                // The loop is gone: the request must observe a typed
+                // shutdown terminal, never a dangling admission decision.
+                admission.reject_shutdown(handoff);
+              }
+            }
+            Ok(None) => {}
+            Err(error) => {
+              tracing::warn!(kind = ?error.kind(), "packet admission failed");
+            }
+          }
+        });
+      }
+      // A finishing admission releases its permit: this arm re-enables
+      // the packet arm without parking any other arm, so control reads
+      // stay served while every admission slot is busy.
+      permit = admission_permits.clone().acquire_owned(), if packets_open && packet_permit.is_none() => {
+        // The semaphore is never closed for the node's lifetime; a closed
+        // one (shutdown) leaves the packet arm disabled, which is the
+        // exit path.
+        if let Ok(permit) = permit {
+          packet_permit = Some(permit);
+        }
+      }
+      handoff = pump_rx.recv(), if pump_open => {
+        let Some(handoff) = handoff else {
+          pump_open = false;
+          continue;
+        };
+        let local = supervisor.packet.local().clone();
+        let routes = supervisor.dependencies.routes.clone();
+        let events = Arc::clone(&supervisor.dependencies.events);
+        // Core-internal control traffic stays out of the durable trace
+        // store: its volume is a runtime implementation detail, not
+        // caller evidence. The pump simply holds no sink for it, and the
+        // record flag carries the same exclusion to the read loop's
+        // late-failure revision path.
+        let trace = if handoff.request.internal {
+          None
+        } else {
+          Some(supervisor.trace_sink.clone())
+        };
+        tasks.spawn(async move {
+          run_outbound(
+            handoff.entry,
+            local,
+            handoff.request,
+            routes,
+            handoff.force_routed,
+            trace,
+            events,
+          )
+          .await;
+        });
       }
       finished = tasks.join_next(), if !tasks.is_empty() => {
-        // Reap finished packet tasks as they complete instead of
-        // letting their handles accumulate in the JoinSet until
-        // shutdown (audit 2026-10-09, item 4): the set stays bounded
-        // by the live pump count. A join error (a panicked or aborted
-        // pump) stays visible as a diagnostic.
+        // Reap finished packet tasks (an admission or its pump) as they
+        // complete instead of letting their handles accumulate in the
+        // JoinSet until shutdown (audit 2026-10-09, item 4): the set
+        // stays bounded by the live admission-plus-pump count. A join
+        // error (a panicked or aborted task) stays visible as a
+        // diagnostic.
         if let Some(Err(error)) = finished {
           tracing::warn!(%error, "packet task exited abnormally");
         }
@@ -1828,6 +1935,287 @@ mod shutdown_drain_tests {
   }
 }
 
+/// The control-loop admission contract (audit 2026-10-23 P1-5): a
+/// caller-supplied next-hop policy that never resolves may park only one
+/// bounded admission slot. Control reads, another packet's admission,
+/// and shutdown all complete inside their bounds while that admission
+/// waits, and the admission decision still records the route before the
+/// pump starts. The real `supervise` loop drives the shared fixture with
+/// the pending policy registered through the same public registry path
+/// the node builder uses.
+#[cfg(test)]
+mod admission_loop_tests {
+  use std::{
+    sync::{
+      Arc,
+      atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+  };
+
+  use tokio::sync::{mpsc, oneshot, watch};
+
+  use super::{
+    ADMISSION_CONCURRENCY, CONTROL_CAPACITY, Control, LifecycleSnapshot, RuntimeSignals,
+    ShutdownReason, supervise,
+    test_support::{self, RuntimeFixture},
+  };
+  use crate::{
+    BoxFuture, NextHopView, NodeId, QualifiedTag, Result, RouteNextHop, StreamTarget, TraceId,
+    packet::{OutboundRequest, RoutedAckOutcome, StaticBody},
+  };
+
+  /// The box a control read or a packet admission must fit in while the
+  /// pending policy's admission slot holds: the pre-fix inline await
+  /// parked both for as long as the policy never resolves.
+  const PROBE_BOX: Duration = Duration::from_secs(2);
+  /// The box the shutdown drive and the control loop's exit must fit in.
+  const SHUTDOWN_BOX: Duration = Duration::from_secs(10);
+  /// The tag the fixture config selects and the pending policy owns.
+  const PENDING_POLICY: &str = "example.com/policies/pending-admission";
+
+  /// A next-hop policy that never resolves: exactly the caller-supplied
+  /// policy an admission must be able to await off the control loop.
+  #[derive(Debug, Default)]
+  struct PendingNextHop {
+    calls: Arc<AtomicUsize>,
+  }
+
+  impl RouteNextHop for PendingNextHop {
+    fn next_hop<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+      self.calls.fetch_add(1, Ordering::Relaxed);
+      Box::pin(std::future::pending())
+    }
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// One probe request plus its admission-ack receiver, shaped like a
+  /// caller's exact-node send.
+  fn probe_request(
+    trace_id: TraceId, target: StreamTarget,
+  ) -> (OutboundRequest, oneshot::Receiver<RoutedAckOutcome>) {
+    let (ack_notify, ack) = oneshot::channel();
+    let request = OutboundRequest {
+      trace_id,
+      target,
+      load_balancer: None,
+      max_hops: 1,
+      protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/admission-probe").unwrap(),
+      metadata: crate::StreamMetadata::new(),
+      body: Box::pin(StaticBody::new(Arc::from(&b"probe"[..]))),
+      internal: false,
+      ack_notify,
+    };
+    (request, ack)
+  }
+
+  /// The running control loop over the pending-policy fixture: the probe
+  /// surface both admission tests drive.
+  struct PendingLoop {
+    control: mpsc::Sender<Control>,
+    packet: mpsc::Sender<OutboundRequest>,
+    routes: crate::routing::RouteTable,
+    sessions: crate::session::stream::SessionTable,
+    entropy: Arc<dyn crate::api::Entropy>,
+    calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+    // A live node keeps both signal ends alive; the loop's leave and
+    // lifecycle arms then stay armed exactly as in production.
+    _leave: mpsc::Sender<()>,
+    _state: watch::Receiver<LifecycleSnapshot>,
+  }
+
+  /// Starts the real control loop over the fixture with the pending policy
+  /// registered through the public registry path the node builder uses.
+  async fn start_pending_policy_loop() -> PendingLoop {
+    let (reference, config) = test_support::reference_and_config();
+    let policy = QualifiedTag::parse(PENDING_POLICY).unwrap();
+    let config = config.with_route_policy(policy.clone());
+    let pending = Arc::new(PendingNextHop::default());
+    let calls = Arc::clone(&pending.calls);
+    let RuntimeFixture {
+      dependencies,
+      packet_tx,
+      packet_rx,
+      sync_rounds,
+      entropy,
+      sessions,
+    } = test_support::runtime_fixture_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      config,
+      move |extensions| {
+        extensions
+          .register_next_hop(policy, pending)
+          .expect("pending next-hop registration");
+      },
+    )
+    .await;
+    let routes = dependencies.routes.clone();
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+    let (leave_tx, leave_rx) = mpsc::channel(1);
+    let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(supervise(
+      dependencies,
+      (packet_tx.clone(), packet_rx),
+      sync_rounds,
+      RuntimeSignals {
+        control: control_rx,
+        leave_complete: leave_rx,
+        state: state_tx,
+        ready: ready_tx,
+      },
+    ));
+    ready_rx.await.expect("the control loop starts");
+    PendingLoop {
+      control: control_tx,
+      packet: packet_tx,
+      routes,
+      sessions,
+      entropy,
+      calls,
+      task,
+      _leave: leave_tx,
+      _state: state_rx,
+    }
+  }
+
+  impl PendingLoop {
+    /// Waits until the pending policy has been reached `target` times.
+    async fn wait_for_policy_calls(&self, target: usize) {
+      tokio::time::timeout(PROBE_BOX, async {
+        while self.calls.load(Ordering::Relaxed) < target {
+          tokio::task::yield_now().await;
+        }
+      })
+      .await
+      .expect("the admission task must reach the pending policy");
+    }
+
+    /// Sends one probe request.
+    async fn send(
+      &self, seed: u32, destination: crate::NodeId,
+    ) -> oneshot::Receiver<RoutedAckOutcome> {
+      let (request, ack) = probe_request(trace(seed), StreamTarget::Exact(destination));
+      self.packet.send(request).await.expect("packet channel");
+      ack
+    }
+
+    /// A control read must answer inside the probe bound.
+    async fn read(&self) {
+      let (reply, reply_rx) = oneshot::channel();
+      self
+        .control
+        .send(Control::GetRecovery { reply })
+        .await
+        .expect("control channel");
+      tokio::time::timeout(PROBE_BOX, reply_rx)
+        .await
+        .expect("a control read must not queue behind a pending routing policy")
+        .expect("control reply")
+        .expect("recovery view");
+    }
+
+    /// Shutdown must answer inside the shutdown bound and the loop must
+    /// exit without panicking.
+    async fn shutdown(self) {
+      let (reply, reply_rx) = oneshot::channel();
+      self
+        .control
+        .send(Control::Shutdown { reply })
+        .await
+        .expect("control channel");
+      let outcome = tokio::time::timeout(SHUTDOWN_BOX, reply_rx)
+        .await
+        .expect("shutdown must not queue behind a pending routing policy")
+        .expect("shutdown reply");
+      assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
+      tokio::time::timeout(SHUTDOWN_BOX, self.task)
+        .await
+        .expect("the control loop must exit")
+        .expect("the control loop must not panic");
+    }
+  }
+
+  #[tokio::test]
+  async fn a_pending_policy_parks_only_its_admission_slot() {
+    let pending = start_pending_policy_loop().await;
+
+    // The wedge: one packet toward an unconnected destination, so its
+    // admission consults the next-hop policy that never resolves.
+    let _wedged_ack = pending.send(1, test_support::member_id(9)).await;
+    pending.wait_for_policy_calls(1).await;
+
+    // (a) The control loop still answers a read while that admission
+    // awaits the policy forever.
+    pending.read().await;
+
+    // (b) A second packet toward a directly connected destination is
+    // admitted inside the same bound: the wedged admission occupies one
+    // slot, never the admission plane.
+    let direct = test_support::member_id(11);
+    let (direct_entry, _direct_frames) =
+      crate::session::stream::test_entry(pending.entropy.as_ref());
+    pending
+      .sessions
+      .lock()
+      .expect("session table")
+      .insert(direct.clone(), direct_entry);
+    let direct_trace = trace(2);
+    let _direct_ack = pending.send(2, direct).await;
+    tokio::time::timeout(PROBE_BOX, async {
+      while !pending
+        .routes
+        .lock()
+        .expect("route table")
+        .contains_key(&direct_trace)
+      {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("a direct-destination packet must be admitted while the pending policy holds its slot");
+
+    // (c) Shutdown still completes: the wedged admission task is part of
+    // the control loop's task set and is torn down with it.
+    pending.shutdown().await;
+  }
+
+  /// The permit bound is real, not cosmetic: once `ADMISSION_CONCURRENCY`
+  /// admissions are parked on the policy, the packet arm disables itself
+  /// and a further request waits in the bounded command channel. The loop
+  /// itself keeps serving control reads and shutdown — saturation never
+  /// blocks it.
+  #[tokio::test]
+  async fn a_saturated_admission_pool_disables_the_packet_arm() {
+    let pending = start_pending_policy_loop().await;
+
+    for seed in 0..u32::try_from(ADMISSION_CONCURRENCY).unwrap() {
+      let _ack = pending
+        .send(seed + 1, test_support::member_id(u64::from(seed) + 20))
+        .await;
+    }
+    pending.wait_for_policy_calls(ADMISSION_CONCURRENCY).await;
+
+    // No permit is free and the wedged admissions never release one, so
+    // the overflow request stays queued (the packet arm is disabled)
+    // instead of oversubscribing the policy.
+    let _overflow_ack = pending.send(99, test_support::member_id(90)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+      pending.calls.load(Ordering::Relaxed),
+      ADMISSION_CONCURRENCY,
+      "a saturated admission pool must backpressure the packet arm, not oversubscribe it"
+    );
+
+    pending.read().await;
+    pending.shutdown().await;
+  }
+}
+
 /// The runtime's shared supervisor-unit-test fixture: builds a
 /// supervisor over a caller-supplied storage factory and config the way
 /// `spawn_runtime` builds the real one (identity provisioning, builtin
@@ -1855,12 +2243,27 @@ pub(crate) mod test_support {
     transport::registry::builtin_transport_tag,
   };
 
-  /// Builds a supervisor over a fresh in-memory identity opened through
-  /// the caller's factory: no sessions, no listeners — the tick planes
-  /// run against a real store.
-  pub(crate) async fn supervisor_over(
+  /// The fixture's runtime inputs: everything `spawn_runtime` hands the
+  /// control loop, so a test can drive the real `supervise` loop (control
+  /// reads, packet admission, shutdown) instead of a pre-built supervisor.
+  pub(crate) struct RuntimeFixture {
+    pub(crate) dependencies: RuntimeDependencies,
+    pub(crate) packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
+    pub(crate) packet_rx: mpsc::Receiver<crate::packet::OutboundRequest>,
+    pub(crate) sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) entropy: Arc<dyn crate::api::Entropy>,
+    pub(crate) sessions: SessionTable,
+  }
+
+  /// Builds the runtime dependencies over a fresh in-memory identity
+  /// opened through the caller's factory: no sessions, no listeners — the
+  /// control and tick planes run against a real store. `prepare` registers
+  /// caller extensions (the same public registry path the node builder
+  /// uses) before the operation handles are built.
+  pub(crate) async fn runtime_fixture_over(
     factory: Arc<dyn StorageFactory>, config: NodeConfig,
-  ) -> (Supervisor, Arc<dyn crate::api::Entropy>, SessionTable) {
+    prepare: impl FnOnce(&mut ExtensionRegistry),
+  ) -> RuntimeFixture {
     let keys = ScriptedKeys::full();
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
     let context = Arc::new(
@@ -1897,13 +2300,14 @@ pub(crate) mod test_support {
         .register_builtin_transport(tag, transport)
         .unwrap();
     }
+    prepare(&mut extensions);
     let mut definitions = feature::builtin_definitions().unwrap();
     definitions.extend(extensions.feature_definitions());
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
     let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
     let (revision_tx, _revision_rx) = watch::channel(0_u64);
-    let (packet_tx, _packet_rx) = mpsc::channel(super::PACKET_CHANNEL_CAPACITY);
+    let (packet_tx, packet_rx) = mpsc::channel(super::PACKET_CHANNEL_CAPACITY);
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let mut dependencies = RuntimeDependencies {
       storage_factory: factory,
@@ -1931,7 +2335,31 @@ pub(crate) mod test_support {
     let operations = super::operation_deps(&dependencies, packet_tx.clone(), offer, registry)
       .expect("operation handles");
     dependencies.operations = Some(operations);
-    let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
+    RuntimeFixture {
+      dependencies,
+      packet_tx,
+      packet_rx,
+      sync_rounds: round_rx,
+      entropy,
+      sessions,
+    }
+  }
+
+  /// Builds a supervisor over the fixture's runtime dependencies: the
+  /// tick-plane tests drive the exact production construction path without
+  /// running the control loop.
+  pub(crate) async fn supervisor_over(
+    factory: Arc<dyn StorageFactory>, config: NodeConfig,
+  ) -> (Supervisor, Arc<dyn crate::api::Entropy>, SessionTable) {
+    let RuntimeFixture {
+      dependencies,
+      packet_tx,
+      sync_rounds,
+      entropy,
+      sessions,
+      ..
+    } = runtime_fixture_over(factory, config, |_| {}).await;
+    let supervisor = match Supervisor::new(dependencies, packet_tx, sync_rounds) {
       Ok(supervisor) => supervisor,
       Err(boxed) => panic!("supervisor construction failed: {}", boxed.0),
     };
