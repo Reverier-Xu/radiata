@@ -19,41 +19,96 @@ pub(super) const FORGOTTEN_MARKER_VALUE: &[u8] = b"\x01forgotten\0";
 const REFERENCE_HEAD_TAG: &[u8] = b"\x02reference-head\0";
 const REFERENCE_EDGE_TAG: &[u8] = b"\x03reference-edge\0";
 const ELIGIBILITY_ANCHOR_TAG: &[u8] = b"\x04eligibility-anchor\0";
+/// The retention-candidate key family (v1 layout: the tag, then the
+/// target receipt's transaction id, exactly like the other internal
+/// transaction tags; the value is exactly the 32-byte operation digest).
+/// One marker is written by the same transaction that removes the
+/// target's last reference, so the eligibility sweep can rebuild the
+/// full `ReceiptIdentity` from durable state alone — the digest
+/// otherwise lives only inside the provider's private receipt table.
+const RETENTION_CANDIDATE_TAG: &[u8] = b"\x05retention-candidate\0";
 const EDGE_DELIMITER: u8 = 0;
 const RECORD_REFERENCE_DOMAIN: &[u8] = b"radiata.woooo.tech/receipt-reference/metadata-record/v1\0";
 const RETENTION_SWEEP_DOMAIN: &[u8] = b"radiata.woooo.tech/receipt-retention/sweep-operation/v1\0";
-/// The upper bound on receipts one retention sweep drives through the
-/// cleanup state machine, so one host call stays latency-bounded no
-/// matter how large the anchored population grows; the report says
-/// whether the scan stopped at the bound.
+const ELIGIBILITY_SWEEP_DOMAIN: &[u8] =
+  b"radiata.woooo.tech/receipt-eligibility/sweep-operation/v1\0";
+const ORPHANED_CANDIDATE_DOMAIN: &[u8] =
+  b"radiata.woooo.tech/receipt-eligibility/orphaned-candidate/v1\0";
+/// The upper bound on entries each of a retention sweep's two scans
+/// examines — due or not — so one host call stays latency-bounded no
+/// matter how large the anchored or candidate population grows; the
+/// report says whether either scan stopped at the bound.
 pub(crate) const RETENTION_SWEEP_BOUND: usize = 4096;
 
-/// The in-memory resumption cursor of the bounded retention scan: the
-/// last anchor key one pass examined, so the next pass resumes strictly
-/// after it instead of rescanning the same retained prefix forever.
-/// A pass whose scan runs to its natural end resets the cursor, so the
-/// rotation keeps every anchored receipt reachable and a long
-/// not-yet-due prefix can never starve the due anchors behind it.
-/// In-memory by design: a durable cursor would commit one permanent
-/// used-ID receipt per pass, defeating the retention it drives.
+/// One of the two eligibility scans the retention pass drives: the
+/// anchor scan reaches every anchored receipt, the candidate scan
+/// reaches every receipt whose reference state machine left a
+/// retention-candidate marker behind. Each scan keeps its own
+/// resumption position in [`RetentionScanCursor`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EligibilityScan {
+  Anchors,
+  Candidates,
+}
+
+impl EligibilityScan {
+  /// The key prefix of this scan's family: the eligible entries of one
+  /// scan are exactly the internal keys under this prefix.
+  const fn prefix(self) -> &'static [u8] {
+    match self {
+      Self::Anchors => ELIGIBILITY_ANCHOR_TAG,
+      Self::Candidates => RETENTION_CANDIDATE_TAG,
+    }
+  }
+}
+
+/// One receipt whose reference state machine removed its last
+/// reference: the candidate marker carries the receipt's operation
+/// digest, the only durable source of the identity the eligibility
+/// sweep must rebuild (see [`RETENTION_CANDIDATE_TAG`]).
+struct RetentionCandidate {
+  target: ReceiptIdentity,
+  /// The candidate value's content digest: the exact expectation the
+  /// marker consumption deletes against.
+  marker_digest: Digest,
+}
+
+/// The in-memory resumption cursor of the bounded retention scans: for
+/// each scan family, the last key one pass examined, so the next pass
+/// resumes strictly after it instead of rescanning the same retained
+/// prefix forever. A pass whose scan runs to its natural end resets that
+/// scan's cursor, so the rotation keeps every receipt of both families
+/// reachable and a long not-yet-due prefix can never starve the due
+/// entries behind it. In-memory by design: a durable cursor would commit
+/// one permanent used-ID receipt per pass, defeating the retention it
+/// drives.
 #[derive(Debug, Default)]
 pub(crate) struct RetentionScanCursor {
-  position: std::sync::Mutex<Option<Vec<u8>>>,
+  anchors: std::sync::Mutex<Option<Vec<u8>>>,
+  candidates: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl RetentionScanCursor {
-  /// Reads the resumption position; a poisoned lock degrades to a
-  /// fresh scan from the prefix head, which is correct and only less
-  /// efficient.
-  fn position(&self) -> Option<Vec<u8>> {
-    self.position.lock().ok().and_then(|guard| guard.clone())
+  /// The position slot of one scan family.
+  fn slot(&self, scan: EligibilityScan) -> &std::sync::Mutex<Option<Vec<u8>>> {
+    match scan {
+      EligibilityScan::Anchors => &self.anchors,
+      EligibilityScan::Candidates => &self.candidates,
+    }
   }
 
-  /// Advances to the next resumption position: the last examined key
-  /// when the pass stopped at its bound, or `None` to restart from the
-  /// head once the scan ran to its end.
-  fn advance(&self, position: Option<Vec<u8>>) {
-    if let Ok(mut guard) = self.position.lock() {
+  /// Reads one scan's resumption position; a poisoned lock degrades to a
+  /// fresh scan from the prefix head, which is correct and only less
+  /// efficient.
+  fn position(&self, scan: EligibilityScan) -> Option<Vec<u8>> {
+    self.slot(scan).lock().ok().and_then(|guard| guard.clone())
+  }
+
+  /// Advances one scan's position: the last examined key when the pass
+  /// stopped at its bound, or `None` to restart from the head once the
+  /// scan ran to its end.
+  fn advance(&self, scan: EligibilityScan, position: Option<Vec<u8>>) {
+    if let Ok(mut guard) = self.slot(scan).lock() {
       *guard = position;
     }
   }
@@ -66,8 +121,9 @@ pub struct ReceiptRetentionReport {
   /// Anchored receipts whose retention deadline had elapsed and whose
   /// forget transaction committed.
   pub forgotten: u64,
-  /// The pass stopped at its internal bound with anchored receipts left;
-  /// issue the command again to continue.
+  /// The pass stopped at one of its internal bounds with anchored
+  /// receipts or retention candidates left; issue the command again to
+  /// continue.
   pub remaining: bool,
 }
 const REFERENCE_TOKEN_WIDTH: usize = 32;
@@ -471,73 +527,31 @@ impl MetadataStore {
     }
   }
 
-  /// Applies receipt retention over every anchored receipt: the cleanup
-  /// state machine forgets the ones past their deadline and retains the
-  /// rest, so one explicit host-triggered pass advances the anchored
-  /// population one idempotent step. The pass examines at most
-  /// [`RETENTION_SWEEP_BOUND`] anchor entries — due or not — and the
-  /// next pass resumes strictly after the last examined key (see
-  /// [`RetentionScanCursor`]), so neither the scan nor a long
-  /// not-yet-due prefix can starve the due anchors behind it.
-  /// Unanchored receipts stay untouched: anchoring is the owning state
-  /// machine's decision, and a receipt that still carries owner
-  /// references must never grow an anchor.
+  /// Applies receipt retention over the two eligibility key families.
+  ///
+  /// Anchored receipts: the cleanup state machine forgets the ones past
+  /// their deadline and retains the rest, so one explicit host-triggered
+  /// pass advances the anchored population one idempotent step.
+  ///
+  /// Retention candidates: the reference state machine leaves a
+  /// candidate marker carrying the operation digest behind whenever a
+  /// receipt loses its last reference (see [`RETENTION_CANDIDATE_TAG`]),
+  /// because nothing else durable names that receipt's identity. This
+  /// pass drives each candidate through the same cleanup state machine,
+  /// which anchors it, and deletes the marker in the same pass: the
+  /// anchor (or the forgotten used-ID marker) is the durable driver from
+  /// then on, so the candidate population cannot outlive its purpose.
+  /// The state machine's own audit still refuses to anchor any receipt
+  /// that carries an owner reference.
+  ///
+  /// Each scan examines at most [`RETENTION_SWEEP_BOUND`] entries — due
+  /// or not — and resumes strictly after the last examined key (see
+  /// [`RetentionScanCursor`]), so neither scan nor a long not-yet-due
+  /// prefix can starve the entries behind it.
   pub(crate) async fn apply_receipt_retention(&self) -> crate::Result<ReceiptRetentionReport> {
     let namespace = internal_namespace()?;
-    let snapshot = self.snapshot().await?;
-    let mut targets = Vec::new();
-    let mut examined = 0_usize;
-    let mut last_examined: Option<Vec<u8>> = None;
-    let mut stopped_at_bound = false;
-    let cursor = self.retention_scan_cursor.position();
-    let mut scan = snapshot
-      .scan_from(&namespace, ELIGIBILITY_ANCHOR_TAG, cursor.as_deref())
-      .await?;
-    while let Some(entry) = scan.next().await? {
-      if examined >= RETENTION_SWEEP_BOUND {
-        // The pass stays latency-bounded over every scanned entry, due
-        // or not: the already-collected due targets still reach the
-        // cleanup loop below, and the cursor makes the next pass
-        // resume here instead of rescanning the same retained prefix.
-        tracing::debug!(
-          examined,
-          target_count = targets.len(),
-          "receipt retention scan stopped at sweep bound"
-        );
-        stopped_at_bound = true;
-        break;
-      }
-      let key = entry.key().as_bytes();
-      last_examined = Some(key.to_vec());
-      examined += 1;
-      let transaction = key
-        .strip_prefix(ELIGIBILITY_ANCHOR_TAG)
-        .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
-      let (anchored_at, operation_digest) = decode_anchor_value(entry.value().as_bytes())?;
-      let deadline = anchored_at
-        .checked_add(self.receipt_retention)
-        .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
-      // Only receipts whose deadline has passed leave the scan; the
-      // state machine re-verifies everything for the ones that remain.
-      if self.clock.now() < deadline {
-        continue;
-      }
-      let transaction = TransactionId::parse(
-        std::str::from_utf8(transaction)
-          .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?,
-      )?;
-      targets.push(ReceiptIdentity::from_parts(transaction, operation_digest));
-    }
-    drop(scan);
-    drop(snapshot);
-    // The cursor advances before the cleanup loop on purpose: a failing
-    // cleanup must not pin the sweep to one segment forever, and the
-    // rotation revisits skipped targets on later passes.
-    self.retention_scan_cursor.advance(if stopped_at_bound {
-      last_examined
-    } else {
-      None
-    });
+    let (targets, anchors_remaining) = self.scan_due_anchors(&namespace).await?;
+    let (candidates, candidates_remaining) = self.scan_retention_candidates(&namespace).await?;
 
     let mut forgotten = 0_u64;
     for target in &targets {
@@ -550,11 +564,217 @@ impl MetadataStore {
           .ok_or_else(|| Error::resource_exhausted("retention sweep count"))?;
       }
     }
+    for candidate in &candidates {
+      self.drive_retention_candidate(candidate).await?;
+    }
     Ok(ReceiptRetentionReport {
       forgotten,
-      remaining: stopped_at_bound,
+      remaining: anchors_remaining || candidates_remaining,
     })
   }
+
+  /// Collects the anchored receipts whose retention deadline elapsed,
+  /// inside one bounded, cursor-rotated scan of the anchor family.
+  async fn scan_due_anchors(
+    &self, namespace: &StoreNamespace,
+  ) -> crate::Result<(Vec<ReceiptIdentity>, bool)> {
+    let snapshot = self.snapshot().await?;
+    let mut targets = Vec::new();
+    let mut examined = 0_usize;
+    let mut last_examined: Option<Vec<u8>> = None;
+    let mut stopped_at_bound = false;
+    let cursor = self
+      .retention_scan_cursor
+      .position(EligibilityScan::Anchors);
+    let mut scan = snapshot
+      .scan_from(
+        namespace,
+        EligibilityScan::Anchors.prefix(),
+        cursor.as_deref(),
+      )
+      .await?;
+    while let Some(entry) = scan.next().await? {
+      if examined >= RETENTION_SWEEP_BOUND {
+        // The pass stays latency-bounded over every scanned entry, due
+        // or not: the already-collected due targets still reach the
+        // cleanup loop, and the cursor makes the next pass resume here
+        // instead of rescanning the same retained prefix.
+        tracing::debug!(
+          examined,
+          target_count = targets.len(),
+          "receipt retention scan stopped at sweep bound"
+        );
+        stopped_at_bound = true;
+        break;
+      }
+      let key = entry.key().as_bytes();
+      last_examined = Some(key.to_vec());
+      examined += 1;
+      let transaction = decode_tagged_transaction(key, ELIGIBILITY_ANCHOR_TAG)?;
+      let (anchored_at, operation_digest) = decode_anchor_value(entry.value().as_bytes())?;
+      let deadline = anchored_at
+        .checked_add(self.receipt_retention)
+        .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
+      // Only receipts whose deadline has passed leave the scan; the
+      // state machine re-verifies everything for the ones that remain.
+      if self.clock.now() < deadline {
+        continue;
+      }
+      let transaction = TransactionId::parse(transaction)?;
+      targets.push(ReceiptIdentity::from_parts(transaction, operation_digest));
+    }
+    drop(scan);
+    drop(snapshot);
+    // The cursor advances before the cleanup loop on purpose: a failing
+    // cleanup must not pin the sweep to one segment forever, and the
+    // rotation revisits skipped targets on later passes.
+    self.retention_scan_cursor.advance(
+      EligibilityScan::Anchors,
+      if stopped_at_bound {
+        last_examined
+      } else {
+        None
+      },
+    );
+    Ok((targets, stopped_at_bound))
+  }
+
+  /// Collects the retention candidates into their rebuilt identities,
+  /// inside one bounded, cursor-rotated scan of the candidate family.
+  async fn scan_retention_candidates(
+    &self, namespace: &StoreNamespace,
+  ) -> crate::Result<(Vec<RetentionCandidate>, bool)> {
+    let snapshot = self.snapshot().await?;
+    let mut candidates = Vec::new();
+    let mut examined = 0_usize;
+    let mut last_examined: Option<Vec<u8>> = None;
+    let mut stopped_at_bound = false;
+    let cursor = self
+      .retention_scan_cursor
+      .position(EligibilityScan::Candidates);
+    let mut scan = snapshot
+      .scan_from(
+        namespace,
+        EligibilityScan::Candidates.prefix(),
+        cursor.as_deref(),
+      )
+      .await?;
+    while let Some(entry) = scan.next().await? {
+      if examined >= RETENTION_SWEEP_BOUND {
+        tracing::debug!(
+          examined,
+          candidate_count = candidates.len(),
+          "receipt retention candidate scan stopped at sweep bound"
+        );
+        stopped_at_bound = true;
+        break;
+      }
+      let key = entry.key().as_bytes();
+      last_examined = Some(key.to_vec());
+      examined += 1;
+      let transaction =
+        TransactionId::parse(decode_tagged_transaction(key, RETENTION_CANDIDATE_TAG)?)?;
+      let operation_digest = decode_candidate_value(entry.value().as_bytes())?;
+      candidates.push(RetentionCandidate {
+        target: ReceiptIdentity::from_parts(transaction, operation_digest),
+        marker_digest: entry.value().digest().clone(),
+      });
+    }
+    drop(scan);
+    drop(snapshot);
+    self.retention_scan_cursor.advance(
+      EligibilityScan::Candidates,
+      if stopped_at_bound {
+        last_examined
+      } else {
+        None
+      },
+    );
+    Ok((candidates, stopped_at_bound))
+  }
+
+  /// Drives one retention candidate through the cleanup state machine
+  /// and consumes its marker once the receipt no longer needs it.
+  async fn drive_retention_candidate(&self, candidate: &RetentionCandidate) -> crate::Result<()> {
+    let operation_id = eligibility_sweep_operation_id(candidate.target.transaction())?;
+    let consume = match self
+      .cleanup_receipt(&candidate.target, operation_id)
+      .await?
+    {
+      // Anchored by this pass, or already anchored by an earlier pass
+      // whose marker consumption did not commit: the durable anchor
+      // already drives the receipt, so the marker is redundant.
+      ReceiptCleanupOutcome::Anchored(_) | ReceiptCleanupOutcome::Retained => true,
+      // Forgotten: the receipt is gone.
+      ReceiptCleanupOutcome::Forgotten(_) => true,
+      // Conflict is ambiguous — a concurrent commit only bumps the store
+      // revision — so only the used-ID marker says whether the receipt
+      // was already forgotten and the marker is stale.
+      ReceiptCleanupOutcome::Conflict => self.receipt_forgotten(&candidate.target).await?,
+      // References are still live (the state machine refuses to anchor a
+      // referenced receipt) or the commit outcome is unknown: keep the
+      // marker so the next pass retries.
+      ReceiptCleanupOutcome::Referenced
+      | ReceiptCleanupOutcome::Aborted
+      | ReceiptCleanupOutcome::Unknown(_) => false,
+    };
+    if consume && self.consume_retention_candidate(candidate).await? {
+      tracing::debug!(
+        transaction = candidate.target.transaction().as_str(),
+        "receipt retention candidate consumed"
+      );
+    }
+    Ok(())
+  }
+
+  /// Reads the permanent used-ID marker of one receipt: `true` once the
+  /// cleanup state machine forgot it.
+  async fn receipt_forgotten(&self, target: &ReceiptIdentity) -> crate::Result<bool> {
+    let snapshot = self.snapshot().await?;
+    let namespace = internal_namespace()?;
+    Ok(matches!(
+      verify_live_marker(snapshot.as_ref(), &namespace, target.transaction()).await?,
+      LiveMarker::Forgotten
+    ))
+  }
+
+  /// Deletes one retention-candidate marker by exact conditional delete;
+  /// `false` means the delete did not commit (a concurrent revision bump,
+  /// or the marker is already gone), so a later pass retries it.
+  async fn consume_retention_candidate(
+    &self, candidate: &RetentionCandidate,
+  ) -> crate::Result<bool> {
+    let snapshot = self.snapshot().await?;
+    let mut operations = Vec::new();
+    operations
+      .try_reserve_exact(1)
+      .map_err(|_| Error::resource_exhausted("retention candidate consumption"))?;
+    operations.push(StoreOperation::Delete {
+      namespace: internal_namespace()?,
+      key: retention_candidate_key(candidate.target.transaction())?,
+      expected: candidate.marker_digest.clone(),
+    });
+    let prepared = prepare_internal_transaction(
+      orphaned_candidate_operation_id(candidate.target.transaction())?,
+      snapshot.revision().clone(),
+      operations,
+    )?;
+    drop(snapshot);
+    Ok(matches!(
+      self.commit(prepared).await?,
+      CommitOutcome::Committed(_)
+    ))
+  }
+}
+
+/// Parses the transaction id of one tagged internal key: the family tag,
+/// then the transaction id.
+fn decode_tagged_transaction<'a>(key: &'a [u8], tag: &[u8]) -> crate::Result<&'a str> {
+  let transaction = key
+    .strip_prefix(tag)
+    .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
+  std::str::from_utf8(transaction)
+    .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))
 }
 
 /// The deterministic cleanup-transaction identity for one swept receipt:
@@ -565,6 +785,34 @@ fn retention_sweep_operation_id(target: &TransactionId) -> crate::Result<Transac
   TransactionId::parse(&crate::identity::id::prefixed_id(
     "txn",
     super::deterministic_transaction_value(RETENTION_SWEEP_DOMAIN, &[target.as_str().as_bytes()])?,
+  )?)
+}
+
+/// The deterministic cleanup-transaction identity for one retention
+/// candidate: distinct from [`retention_sweep_operation_id`] because
+/// driving a candidate anchors a receipt instead of forgetting an
+/// already anchored one, so the two state-machine steps never collide
+/// on one transaction id.
+fn eligibility_sweep_operation_id(target: &TransactionId) -> crate::Result<TransactionId> {
+  TransactionId::parse(&crate::identity::id::prefixed_id(
+    "txn",
+    super::deterministic_transaction_value(
+      ELIGIBILITY_SWEEP_DOMAIN,
+      &[target.as_str().as_bytes()],
+    )?,
+  )?)
+}
+
+/// The deterministic consumption-transaction identity for one retention
+/// candidate marker, so a retried consumption replays as an idempotent
+/// no-op.
+fn orphaned_candidate_operation_id(target: &TransactionId) -> crate::Result<TransactionId> {
+  TransactionId::parse(&crate::identity::id::prefixed_id(
+    "txn",
+    super::deterministic_transaction_value(
+      ORPHANED_CANDIDATE_DOMAIN,
+      &[target.as_str().as_bytes()],
+    )?,
   )?)
 }
 
@@ -766,8 +1014,9 @@ pub(super) async fn build_receipt_change_operations(
     let remaining = count
       .checked_sub(additional)
       .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
+    let final_removal = remaining == 0;
     operations
-      .try_reserve_exact(group.tokens.len() + 1)
+      .try_reserve_exact(group.tokens.len() + 1 + usize::from(final_removal))
       .map_err(|_| Error::resource_exhausted("receipt reference change"))?;
     for (token, edge) in group.tokens.iter().zip(&edges) {
       let Some(edge) = edge else {
@@ -779,11 +1028,25 @@ pub(super) async fn build_receipt_change_operations(
         expected: edge.digest().clone(),
       });
     }
-    if remaining == 0 {
+    if final_removal {
       operations.push(StoreOperation::Delete {
         namespace: namespace.clone(),
         key: head_key,
         expected: head.digest().clone(),
+      });
+      // The receipt just lost its last reference, so nothing durable but
+      // the receipt's own provider row names its operation digest any
+      // more. The same transaction writes the retention candidate that
+      // carries it (see [`RETENTION_CANDIDATE_TAG`]); the eligibility
+      // sweep drives the receipt through the cleanup state machine and
+      // consumes the marker again, so it never accumulates. The marker
+      // is not an anchor: a receipt that still carried a reference never
+      // reaches this branch.
+      operations.push(StoreOperation::Put {
+        namespace: namespace.clone(),
+        key: retention_candidate_key(target.transaction())?,
+        expected: StoreExpectation::Absent,
+        value: candidate_value(target.operation_digest()),
       });
     } else {
       operations.push(StoreOperation::Put {
@@ -1093,6 +1356,26 @@ pub(super) fn eligibility_anchor_key(transaction: &TransactionId) -> crate::Resu
   tagged_transaction_key(ELIGIBILITY_ANCHOR_TAG, transaction)
 }
 
+fn retention_candidate_key(transaction: &TransactionId) -> crate::Result<StoreKey> {
+  tagged_transaction_key(RETENTION_CANDIDATE_TAG, transaction)
+}
+
+/// Encodes one retention-candidate value: exactly the operation digest
+/// of the receipt that lost its last reference (see
+/// [`RETENTION_CANDIDATE_TAG`] for the key layout).
+fn candidate_value(operation_digest: &Digest) -> StoreValue {
+  StoreValue::new(Arc::from(operation_digest.as_bytes().to_vec()))
+}
+
+/// Decodes one retention-candidate value; any other length is
+/// corruption.
+fn decode_candidate_value(value: &[u8]) -> crate::Result<Digest> {
+  let digest_bytes: [u8; 32] = value
+    .try_into()
+    .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
+  Ok(Digest::from_bytes(digest_bytes))
+}
+
 fn tagged_transaction_key(tag: &[u8], transaction: &TransactionId) -> crate::Result<StoreKey> {
   let transaction = transaction.as_str().as_bytes();
   let capacity = tag
@@ -1260,13 +1543,17 @@ mod receipt_retention_tests {
     time::{Duration, UNIX_EPOCH},
   };
 
-  use super::{MetadataStore, RETENTION_SWEEP_BOUND, ReceiptCleanupOutcome, ReceiptIdentity};
+  use super::{
+    MetadataStore, RETENTION_SWEEP_BOUND, ReceiptCleanupOutcome, ReceiptIdentity,
+    ReceiptReferenceChange, ReceiptReferenceToken, eligibility_anchor_key, internal_namespace,
+    retention_candidate_key,
+  };
   use crate::{
-    StoreExpectation, StoreOperation,
+    Digest, StoreExpectation, StoreOperation, StoreValue,
     storage::{
       contract::{
         ReferenceFactory,
-        helpers::{ManualClock, committed, open_engine},
+        helpers::{ManualClock, commit_target, committed, open_engine},
         required_capabilities,
       },
       test_util::{key as store_key, namespace, transaction_id, value},
@@ -1430,5 +1717,230 @@ mod receipt_retention_tests {
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining, "the population is fully drained");
+  }
+
+  /// The final removal transaction carries the retention candidate that
+  /// names the receipt's operation digest, and the sweep turns it into
+  /// the anchor the retention clock needs: an intermediate removal
+  /// writes no marker, the anchoring pass consumes the marker it used,
+  /// and the anchored receipt is then forgotten by the deadline like any
+  /// other (regression: a receipt that lost its last reference had no
+  /// durable identity source and could never be retained).
+  #[tokio::test]
+  async fn retention_sweep_anchors_the_receipt_a_final_removal_left_behind() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    let (_, target) = commit_target(&store, 500).await;
+    let internal = internal_namespace().unwrap();
+    let candidate_key = retention_candidate_key(target.transaction()).unwrap();
+    let anchor_key = eligibility_anchor_key(target.transaction()).unwrap();
+    let tokens = [
+      ReceiptReferenceToken::from_digest(Digest::from_bytes([41; 32])),
+      ReceiptReferenceToken::from_digest(Digest::from_bytes([42; 32])),
+    ];
+    for (offset, token) in tokens.iter().enumerate() {
+      assert!(matches!(
+        store
+          .add_receipt_reference(
+            &target,
+            token,
+            transaction_id(501 + u64::try_from(offset).unwrap()),
+          )
+          .await
+          .unwrap(),
+        super::ReceiptReferenceOutcome::Applied(_)
+      ));
+    }
+
+    let snapshot = store.snapshot().await.unwrap();
+    let prepared = store
+      .prepare_transaction_with_receipt_changes(
+        snapshot.as_ref(),
+        transaction_id(503),
+        vec![],
+        vec![ReceiptReferenceChange::Remove {
+          target: target.clone(),
+          tokens: vec![tokens[0].clone()],
+        }],
+      )
+      .await
+      .unwrap();
+    drop(snapshot);
+    committed(store.commit(prepared).await.unwrap());
+    let snapshot = store.snapshot().await.unwrap();
+    assert!(
+      snapshot
+        .get(&internal, &candidate_key)
+        .await
+        .unwrap()
+        .is_none(),
+      "an intermediate removal leaves the reference state machine unchanged"
+    );
+    drop(snapshot);
+
+    let snapshot = store.snapshot().await.unwrap();
+    let prepared = store
+      .prepare_transaction_with_receipt_changes(
+        snapshot.as_ref(),
+        transaction_id(504),
+        vec![],
+        vec![ReceiptReferenceChange::Remove {
+          target: target.clone(),
+          tokens: vec![tokens[1].clone()],
+        }],
+      )
+      .await
+      .unwrap();
+    drop(snapshot);
+    committed(store.commit(prepared).await.unwrap());
+    let snapshot = store.snapshot().await.unwrap();
+    assert_eq!(
+      snapshot
+        .get(&internal, &candidate_key)
+        .await
+        .unwrap()
+        .expect("the final removal writes the retention candidate")
+        .as_bytes(),
+      target.operation_digest().as_bytes(),
+      "the candidate carries the receipt's operation digest"
+    );
+    assert!(
+      snapshot
+        .get(&internal, &anchor_key)
+        .await
+        .unwrap()
+        .is_none(),
+      "the candidate is not an anchor"
+    );
+    drop(snapshot);
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
+    let snapshot = store.snapshot().await.unwrap();
+    assert!(
+      snapshot
+        .get(&internal, &candidate_key)
+        .await
+        .unwrap()
+        .is_none(),
+      "the anchoring pass consumes the candidate marker"
+    );
+    assert!(
+      snapshot
+        .get(&internal, &anchor_key)
+        .await
+        .unwrap()
+        .is_some(),
+      "the sweep anchors the receipt through the cleanup state machine"
+    );
+    drop(snapshot);
+
+    clock.set(UNIX_EPOCH + Duration::from_secs(200));
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(
+      report.forgotten, 1,
+      "the anchored receipt reaches its deadline"
+    );
+    assert!(!report.remaining);
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
+  }
+
+  /// A candidate the anchor scan already forgot is stale: the pass
+  /// consumes it instead of retrying a cleanup that can only conflict,
+  /// so a marker whose consumption was lost never accumulates.
+  #[tokio::test]
+  async fn retention_sweep_consumes_a_candidate_whose_receipt_is_already_forgotten() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    let (_, target) = commit_target(&store, 600).await;
+    assert!(matches!(
+      store
+        .cleanup_receipt(&target, transaction_id(601))
+        .await
+        .unwrap(),
+      ReceiptCleanupOutcome::Anchored(_)
+    ));
+    clock.set(UNIX_EPOCH + Duration::from_secs(200));
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 1);
+
+    // The residue a pass leaves when it anchored the receipt but its
+    // marker-consumption transaction did not commit.
+    let internal = internal_namespace().unwrap();
+    let candidate_key = retention_candidate_key(target.transaction()).unwrap();
+    factory.state.lock().unwrap().entries.insert(
+      (internal.clone(), candidate_key.clone()),
+      StoreValue::new(Arc::from(target.operation_digest().as_bytes().to_vec())),
+    );
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
+    let snapshot = store.snapshot().await.unwrap();
+    assert!(
+      snapshot
+        .get(&internal, &candidate_key)
+        .await
+        .unwrap()
+        .is_none(),
+      "a stale candidate is consumed, not retried forever"
+    );
+    drop(snapshot);
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
+  }
+
+  /// The anchoring invariant holds on the candidate path too: a receipt
+  /// that still carries a reference never grows an anchor, so the sweep
+  /// keeps the marker and retries instead of anchoring a referenced
+  /// receipt.
+  #[tokio::test]
+  async fn retention_sweep_never_anchors_a_candidate_that_still_carries_a_reference() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    let (_, target) = commit_target(&store, 700).await;
+    let token = ReceiptReferenceToken::from_digest(Digest::from_bytes([43; 32]));
+    assert!(matches!(
+      store
+        .add_receipt_reference(&target, &token, transaction_id(701))
+        .await
+        .unwrap(),
+      super::ReceiptReferenceOutcome::Applied(_)
+    ));
+    let internal = internal_namespace().unwrap();
+    let candidate_key = retention_candidate_key(target.transaction()).unwrap();
+    let anchor_key = eligibility_anchor_key(target.transaction()).unwrap();
+    factory.state.lock().unwrap().entries.insert(
+      (internal.clone(), candidate_key.clone()),
+      StoreValue::new(Arc::from(target.operation_digest().as_bytes().to_vec())),
+    );
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(!report.remaining);
+    let snapshot = store.snapshot().await.unwrap();
+    assert!(
+      snapshot
+        .get(&internal, &anchor_key)
+        .await
+        .unwrap()
+        .is_none(),
+      "a referenced receipt never grows an anchor"
+    );
+    assert!(
+      snapshot
+        .get(&internal, &candidate_key)
+        .await
+        .unwrap()
+        .is_some(),
+      "the referenced candidate keeps its marker for a later pass"
+    );
   }
 }

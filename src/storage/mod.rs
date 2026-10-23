@@ -146,8 +146,9 @@ pub(crate) struct MetadataStore {
   receipt_retention: Duration,
   /// The retention pass' in-memory resumption cursor (see
   /// `receipt::RetentionScanCursor`): each bounded pass resumes after
-  /// the last anchor key it examined instead of rescanning the same
-  /// retained prefix forever.
+  /// the last key it examined in either eligibility scan (anchor or
+  /// retention candidate) instead of rescanning the same retained
+  /// prefix forever.
   retention_scan_cursor: receipt::RetentionScanCursor,
   /// The register-install epoch: one monotonic bump per installed
   /// resource record commit (see [`Self::note_local_write`]), so
