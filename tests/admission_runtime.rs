@@ -447,8 +447,8 @@ async fn admission_runtime_slow_flash_commits_admit_under_the_calibrated_deadlin
   .unwrap_err();
   assert_eq!(
     error.kind(),
-    ErrorKind::AuthenticationFailed,
-    "a commit latency beyond the tightened deadline must expire it"
+    ErrorKind::NotReady,
+    "a commit latency beyond the tightened deadline must expire it into the retryable category"
   );
   stop(&joiner_a, "phase a joiner").await;
   stop(&issuer_a, "phase a issuer").await;
