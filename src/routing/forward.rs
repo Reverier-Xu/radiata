@@ -11,9 +11,11 @@
 //! Hop ownership binds to exact session incarnations ([`SessionIdentity`],
 //! never a peer alone): the upstream identity decides which session's
 //! teardown may close the hop, and the downstream identity decides which
-//! session's acknowledgements may steer it. Both outlive the one-shot
-//! admission waiter, so a legitimately late terminal acknowledgement is
-//! still attributed to the hop that owns the stream.
+//! session's acknowledgements may steer it. Ownership lives on the hop's
+//! lifecycle phase and outlives the one-shot admission waiter an attempt
+//! registers in its session's pending map, so a legitimately late
+//! terminal acknowledgement is still attributed to the hop that owns the
+//! stream.
 //!
 //! Module boundary: the forwarding domain owns its own types (forwarding
 //! hops, pending acknowledgement entries) and may depend on session
@@ -30,7 +32,7 @@ use crate::{
   extension_registry::ExtensionRegistry,
   packet::{
     AckOutcome,
-    wire::{self, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
+    wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
   session::stream::{BoundedSender, SessionFrame, SessionTable},
@@ -82,6 +84,48 @@ pub(crate) struct SessionIdentity {
   id: SessionId,
 }
 
+/// The lifecycle phase of one forwarded hop: which downstream session owns
+/// the stream's flow-control events, deliberately separated from the
+/// one-shot admission waiter an attempt registers in its session's
+/// pending map. That waiter is consumed exactly once when admission
+/// resolves — the hop itself keeps carrying the attribution afterwards,
+/// so a post-admission acknowledgement from the same downstream session
+/// (a mid-stream failure) is still steered instead of being dropped as a
+/// superseded branch's latecomer (audit P1-8).
+#[derive(Clone)]
+pub(crate) enum HopPhase {
+  /// Discovering a live downstream branch (pre-admission DFS): the retry
+  /// arm carries the untried candidates, and only the live attempt's
+  /// standing waiter may steer the search. Boxed so an admitted hop — the
+  /// stream's steady state for its whole life — stays small.
+  Discovering(Box<RetryState>),
+  /// The destination admitted the stream: a pure relay bound to the
+  /// downstream session that acknowledged, whose later flow-control
+  /// events still steer the hop for the stream's whole life.
+  Admitted,
+  /// A failed attempt's branch search is re-dispatching: the previous
+  /// attempt is consumed and the downstream binding is about to move, so
+  /// an acknowledgement from the superseded branch in this window is
+  /// dropped — fail-closed, and the re-armed hop deadline self-heals.
+  Redispatching,
+}
+
+impl HopPhase {
+  /// Takes the discovering retry arm out, transitioning the hop to the
+  /// re-dispatch window. `None` leaves the phase untouched: an admitted
+  /// hop never re-searches, and a hop already re-dispatching is
+  /// mid-search.
+  fn take_retry(&mut self) -> Option<Box<RetryState>> {
+    match std::mem::replace(self, HopPhase::Redispatching) {
+      HopPhase::Discovering(retry) => Some(retry),
+      other => {
+        *self = other;
+        None
+      }
+    }
+  }
+}
+
 impl SessionIdentity {
   pub(crate) const fn new(peer: NodeId, id: SessionId) -> Self {
     Self { peer, id }
@@ -115,10 +159,11 @@ pub(crate) struct ForwardingHop {
   /// stays in the table throughout, so cancellation or session death can
   /// never orphan a downstream leg without an explicit end.
   pub(crate) relay_lock: Arc<tokio::sync::Mutex<()>>,
-  /// `Some` while the hop is discovering a live downstream branch
-  /// (pre-admission DFS); `None` once the destination admitted and the
-  /// hop is a pure relay.
-  pub(crate) retry: Option<RetryState>,
+  /// The hop's lifecycle phase (see [`HopPhase`]): discovering,
+  /// admitted, or mid re-dispatch. The phase — never the one-shot
+  /// admission waiter in the downstream session's pending map — decides
+  /// which acknowledgements may steer the hop.
+  pub(crate) phase: HopPhase,
   /// The armed hop-deadline timer of the current attempt. The hop owns
   /// it: whichever path resolves the attempt — the admission
   /// acknowledgement, a typed failure, or the expiry itself — takes the
@@ -461,7 +506,7 @@ async fn relay_open(
       deadline: None,
       // The untried branches of this hop: a failure acknowledgement from
       // downstream re-dispatches here before surfacing upstream.
-      retry: Some(RetryState {
+      phase: HopPhase::Discovering(Box::new(RetryState {
         open: open.clone(),
         context: context.clone(),
         candidates: candidates
@@ -470,7 +515,7 @@ async fn relay_open(
           .cloned()
           .collect(),
         downstream_acks: downstream_acks.clone(),
-      }),
+      })),
     },
   )
   .is_err()
@@ -498,15 +543,22 @@ async fn relay_open(
 pub(crate) fn owns_discovering(table: &ForwardingTable, trace_id: &TraceId) -> bool {
   locked(table)
     .get(trace_id)
-    .is_some_and(|hop| hop.retry.is_some())
+    .is_some_and(|hop| matches!(hop.phase, HopPhase::Discovering(_)))
 }
 
 /// Marks a discovering hop admitted: the destination acknowledged the
-/// current branch, so the hop becomes a pure relay and later failures
-/// travel upstream exactly as before (never retried mid-stream).
+/// current branch, so the hop becomes a pure relay bound to that
+/// downstream session and later failures travel upstream exactly as
+/// before (never retried mid-stream).
 pub(crate) fn mark_admitted(table: &ForwardingTable, trace_id: &TraceId) {
   if let Some(hop) = locked(table).get_mut(trace_id) {
-    hop.retry = None;
+    // Only a discovering hop transitions: a duplicate admission
+    // acknowledgement for an already-admitted hop changes nothing, and a
+    // hop mid re-dispatch never reaches here (attribution drops its
+    // superseded branches first).
+    if matches!(hop.phase, HopPhase::Discovering(_)) {
+      hop.phase = HopPhase::Admitted;
+    }
     // The attempt resolved: cancel its deadline timer. The entry was
     // resolved with it, so the timer's expiry could only have no-oped —
     // aborting it just stops the sleeping task from lingering for the
@@ -534,7 +586,7 @@ pub(crate) async fn on_downstream_failure(
     let Some(hop) = guard.get_mut(trace_id) else {
       return;
     };
-    let Some(retry) = hop.retry.take() else {
+    let Some(retry) = hop.phase.take_retry() else {
       return;
     };
     // The failed attempt's deadline timer is done: abort it here so it
@@ -647,7 +699,7 @@ pub(crate) async fn on_downstream_failure(
       // misattributed and dropped; the hop deadline then re-dispatches,
       // so the window is fail-closed and self-healing.
       retry.downstream_acks = Arc::clone(&downstream_acks);
-      hop.retry = Some(retry);
+      hop.phase = HopPhase::Discovering(retry);
     }
     // The re-dispatched branch gets its own full hop budget.
     arm_hop_deadline(
@@ -693,14 +745,19 @@ async fn select_next_hop(
 /// may steer the hop registered for `trace_id`. With no forwarding hop
 /// at this node the acknowledgement resolves that session's own pending
 /// admission (the origin's synchronous waiter) exactly as before. With
-/// one, the receiving session must still be the hop's current downstream
-/// — the same pending-admission map, still holding the trace's live
-/// relay entry — so a late acknowledgement from a branch the hop already
-/// abandoned (a failed or deadline-expired attempt) cannot consume the
-/// live attempt's entry, clear its retry arm, or flip its route record
-/// (audit 2026-10-09 item 13). Lock order matches `on_downstream_failure`:
-/// the forwarding table guard never outlives this call and the acks lock
-/// nests inside it.
+/// one, the receiving session must be the hop's current downstream —
+/// the same pending-admission map — and the hop's phase decides what
+/// else the acknowledgement must prove: a discovering hop answers only
+/// its live attempt's standing waiter, so a latecomer from a branch the
+/// hop already abandoned (a failed or deadline-expired attempt) cannot
+/// consume the live attempt's entry, clear its retry arm, or flip its
+/// route record (audit 2026-10-09 item 13). An admitted hop needs
+/// nothing further — its one-shot admission waiter was consumed when
+/// admission resolved, and the downstream session it certified owns
+/// the stream's flow-control events for the stream's whole life, so a
+/// legitimate late failure from it still steers (audit P1-8). Lock
+/// order matches `on_downstream_failure`: the forwarding table guard
+/// never outlives this call and the acks lock nests inside it.
 pub(crate) fn ack_from_current_downstream(
   table: &ForwardingTable, acks: &PendingAcks, trace_id: &TraceId,
 ) -> bool {
@@ -710,15 +767,51 @@ pub(crate) fn ack_from_current_downstream(
     // acknowledgement path stays attribution-free by construction.
     return true;
   };
-  Arc::ptr_eq(acks, &hop.downstream_acks)
-    && matches!(
+  if !Arc::ptr_eq(acks, &hop.downstream_acks) {
+    return false;
+  }
+  match hop.phase {
+    HopPhase::Discovering(_) => matches!(
       acks.lock().ok().and_then(|acks| {
         acks
           .get(trace_id)
           .map(|entry| matches!(entry, PendingAck::Relay { .. }))
       }),
       Some(true)
-    )
+    ),
+    HopPhase::Admitted => true,
+    HopPhase::Redispatching => false,
+  }
+}
+
+/// Relays one acknowledgement from an admitted hop's bound downstream
+/// session upstream with its status preserved: the one-shot admission
+/// waiter was consumed when admission resolved, so the hop itself — the
+/// stream's owner for its whole life — carries the later flow-control
+/// events (a mid-stream failure) instead of the pending-map entry
+/// (audit P1-8). No-op for every other trace: the origin's
+/// `resolve_ack` already handled it through its own waiter, and a
+/// discovering hop's acknowledgements still relay through the standing
+/// entry. Best-effort like every other acknowledgement relay: a
+/// saturated upstream queue cannot stall the shared session reader.
+pub(crate) fn relay_admitted_ack(table: &ForwardingTable, ack: &AckFrame) {
+  if ack.status == AckStatus::Admitted {
+    // The admission itself was relayed when it resolved the waiter: a
+    // repeat from the same downstream reports nothing new upstream.
+    return;
+  }
+  let guard = locked(table);
+  let Some(hop) = guard.get(&ack.trace_id) else {
+    return;
+  };
+  if !matches!(hop.phase, HopPhase::Admitted) {
+    return;
+  }
+  if let Ok(body) = wire::encode_ack(ack) {
+    hop
+      .upstream
+      .try_send(SessionFrame::new(PacketKind::Ack, body));
+  }
 }
 
 /// Removes the entry (the caller already holds the hop's relay lock, so no
@@ -919,7 +1012,7 @@ mod tests {
       upstream_session: identity(upstream_peer, 1),
       downstream_session: identity(downstream_peer, 2),
       relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-      retry: None,
+      phase: super::HopPhase::Admitted,
       deadline: None,
     }
   }
@@ -1137,7 +1230,7 @@ mod tests {
         upstream_session: winner.clone(),
         downstream_session: identity(7, 3),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        retry: None,
+        phase: super::HopPhase::Admitted,
         deadline: None,
       },
     )
@@ -1157,7 +1250,7 @@ mod tests {
         upstream_session: old.clone(),
         downstream_session: identity(7, 3),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        retry: None,
+        phase: super::HopPhase::Admitted,
         deadline: None,
       },
     )
@@ -1214,7 +1307,7 @@ mod tests {
         upstream_session: feeder.clone(),
         downstream_session: identity(7, 1),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        retry: None,
+        phase: super::HopPhase::Admitted,
         deadline: None,
       },
     )
@@ -1302,7 +1395,7 @@ mod retry_tests {
       upstream_session: identity(1, 1),
       downstream_session: identity(7, 1),
       relay_lock: Arc::new(tokio::sync::Mutex::new(())),
-      retry: Some(RetryState {
+      phase: super::HopPhase::Discovering(Box::new(RetryState {
         open: crate::packet::wire::OpenFrame {
           trace_id: trace_id.clone(),
           source: node(1),
@@ -1314,7 +1407,7 @@ mod retry_tests {
         context: crate::routing::RouteContext::new(trace_id, node(1), node(9), 8),
         candidates,
         downstream_acks,
-      }),
+      })),
       deadline: None,
     }
   }
@@ -1367,12 +1460,14 @@ mod retry_tests {
     {
       let guard = super::locked(&table);
       let hop = guard.get(&trace(99)).expect("hop stays registered");
-      assert!(hop.retry.is_some());
+      assert!(matches!(hop.phase, super::HopPhase::Discovering(_)));
       // ...and the re-armed retry carries the NEW branch's map, so the
       // next failure (or deadline) consumes exactly the live attempt's
       // entry — never the superseded branch's already-consumed map
       // (audit 2026-10-09 item 13).
-      let retry = hop.retry.as_ref().expect("retry stays armed");
+      let super::HopPhase::Discovering(retry) = &hop.phase else {
+        panic!("retry stays armed");
+      };
       assert!(
         std::sync::Arc::ptr_eq(&retry.downstream_acks, &hop.downstream_acks),
         "the re-armed retry consumes its own attempt's pending map"
