@@ -17,7 +17,11 @@
 //!
 //! Every peer-visible failure maps to a generic `AuthenticationFailed`
 //! error; no handshake detail, credential, proof, or exporter bytes cross
-//! into errors or logs.
+//! into errors or logs. The one deliberate exception is an exhausted
+//! authentication deadline: slow storage or scheduling can starve a
+//! handshake whose credential is still valid, so it maps to the retryable
+//! `NotReady` category instead of masquerading as a permanent identity
+//! rejection.
 
 use std::{
   sync::{Arc, Mutex},
@@ -122,15 +126,74 @@ fn established(handshake: &Handshake) -> Result<EstablishedSession> {
 /// certificate), a successful merge-trust fallback dial re-records the
 /// presented leaf as that target's new anchor (audit 2026-10-09 item 8)
 /// — the application identity proof, not the pin, is the authority.
+/// The in-process anchor cache is bounded: a persistent peer that churns
+/// dial targets over one process lifetime must not accumulate obsolete
+/// pins, and neither must a large cluster. Every recorded anchor carries
+/// its last-recorded sequence; eviction drops the oldest per-peer pin past
+/// [`MEMBER_SPKI_ANCHORS_PER_PEER`] and then the globally oldest pin past
+/// [`MEMBER_SPKI_ANCHORS`]. Eviction is safe by construction: an evicted
+/// target simply has no anchor, so its next dial runs under merge trust
+/// where the member handshake's identity proof is the authenticator — the
+/// same fallback as an endpoint that was never pinned.
+const MEMBER_SPKI_ANCHORS_PER_PEER: usize = 4;
+const MEMBER_SPKI_ANCHORS: usize = 256;
+
 #[derive(Default)]
-struct MemberSpkiTable(std::sync::Mutex<std::collections::BTreeMap<(NodeId, Endpoint), Vec<u8>>>);
+struct MemberSpkiTable(std::sync::Mutex<MemberSpkiAnchors>);
+
+/// The bounded anchor cache: `(peer, endpoint)` pins with their last
+/// recorded sequence, oldest-first eviction.
+#[derive(Default)]
+struct MemberSpkiAnchors {
+  sequence: u64,
+  anchors: std::collections::BTreeMap<(NodeId, Endpoint), (u64, Vec<u8>)>,
+}
+
+impl MemberSpkiAnchors {
+  fn record(&mut self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
+    self.sequence = self.sequence.wrapping_add(1);
+    self
+      .anchors
+      .insert((peer.clone(), target.clone()), (self.sequence, spki));
+    self.evict_peer_overflow(peer);
+    self.evict_global_overflow();
+  }
+
+  fn evict_peer_overflow(&mut self, peer: &NodeId) {
+    while self.anchors.keys().filter(|(node, _)| node == peer).count()
+      > MEMBER_SPKI_ANCHORS_PER_PEER
+    {
+      let oldest = self
+        .anchors
+        .iter()
+        .filter(|((node, _), _)| node == peer)
+        .min_by_key(|(_, (sequence, _))| *sequence)
+        .map(|(key, _)| key.clone());
+      let Some(oldest) = oldest else { break };
+      self.anchors.remove(&oldest);
+    }
+  }
+
+  fn evict_global_overflow(&mut self) {
+    while self.anchors.len() > MEMBER_SPKI_ANCHORS {
+      let oldest = self
+        .anchors
+        .iter()
+        .min_by_key(|(_, (sequence, _))| *sequence)
+        .map(|(key, _)| key.clone());
+      let Some(oldest) = oldest else { break };
+      self.anchors.remove(&oldest);
+    }
+  }
+}
 
 impl MemberSpkiTable {
   /// Records the peer's leaf SPKI as the member-mode trust anchor for
-  /// one concrete dial target. The latest record wins per target.
+  /// one concrete dial target. The latest record wins per target, and the
+  /// bounded cache evicts the oldest anchors beyond its bounds.
   fn record(&self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
     if let Ok(mut anchors) = self.0.lock() {
-      anchors.insert((peer.clone(), target.clone()), spki);
+      anchors.record(peer, target, spki);
     }
   }
 
@@ -138,11 +201,12 @@ impl MemberSpkiTable {
   /// process joined or pinned that exact endpoint. Every other endpoint
   /// of the same node reports no anchor and dials under merge trust.
   fn anchor(&self, peer: &NodeId, target: &Endpoint) -> Option<Vec<u8>> {
-    self
-      .0
-      .lock()
-      .ok()
-      .and_then(|anchors| anchors.get(&(peer.clone(), target.clone())).cloned())
+    self.0.lock().ok().and_then(|anchors| {
+      anchors
+        .anchors
+        .get(&(peer.clone(), target.clone()))
+        .map(|(_, spki)| spki.clone())
+    })
   }
 }
 
@@ -253,7 +317,7 @@ impl SessionDriver {
   pub(crate) async fn respond(&self, connection: &mut Connection) -> Result<EstablishedSession> {
     let result = timeout(self.authentication_deadline, self.respond_inner(connection))
       .await
-      .map_err(|_| Error::authentication_failed("authentication deadline"))?;
+      .map_err(|_| authentication_deadline_elapsed())?;
     if result.is_err() {
       // A clean close lets the initiator observe a typed authentication
       // failure instead of an undifferentiated transport error. Early
@@ -466,7 +530,7 @@ impl SessionDriver {
       self.merge_inner(connection, hint, credential),
     )
     .await
-    .map_err(|_| Error::authentication_failed("authentication deadline"))?
+    .map_err(|_| authentication_deadline_elapsed())?
   }
 
   async fn merge_inner(
@@ -541,7 +605,7 @@ impl SessionDriver {
       self.member_inner(connection, peer),
     )
     .await
-    .map_err(|_| Error::authentication_failed("authentication deadline"))?
+    .map_err(|_| authentication_deadline_elapsed())?
   }
 
   async fn member_inner(
@@ -617,6 +681,16 @@ impl SessionDriver {
   }
 }
 
+/// The exhausted authentication deadline: a transient, retryable outcome.
+/// Slow storage or scheduling can consume the deadline for a handshake
+/// whose credential and identity proofs are still valid, so the failure
+/// must stay distinguishable from a permanent identity rejection — it is
+/// the `NotReady` convergence category the retry schedules already
+/// absorb, never `AuthenticationFailed` (audit O4).
+fn authentication_deadline_elapsed() -> Error {
+  Error::not_ready("authentication deadline")
+}
+
 /// Reads the trusted member-mode binding for `peer` from durable storage.
 /// Sends one handshake state machine message under its published kind.
 async fn send(connection: &mut Connection, kind: HandshakeKind, body: &[u8]) -> Result<()> {
@@ -661,8 +735,97 @@ fn decode_grant_payload(
 }
 
 #[cfg(test)]
+mod deadline_tests {
+  use std::{sync::Arc, time::Duration};
+
+  use tokio::net::{TcpListener, TcpStream};
+
+  use super::SessionDriver;
+  use crate::{
+    ErrorKind, NodeConfig,
+    identity::{
+      credential::MergeCredentialIssuer,
+      lifecycle::ensure_self_binding,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+    },
+    protocol::{feature::FeatureRegistry, offer::node_offer, wire::connection_frame_rules},
+    transport::{
+      cert::EphemeralCertificate,
+      connection::Connection,
+      tls::{merge_client_config, server_config},
+    },
+  };
+
+  /// An exhausted authentication deadline is a transient scheduling/storage
+  /// outcome, not a permanent identity rejection: the responder whose peer
+  /// never sends its hello must surface the retryable `NotReady` category,
+  /// distinguishable from `AuthenticationFailed` (audit O4).
+  #[tokio::test]
+  async fn authentication_deadline_exhaustion_is_retryable_not_a_permanent_rejection() {
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(open_context(&factory, &keys, &entropy).await.unwrap());
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+    let registry = Arc::new(FeatureRegistry::builtin().unwrap());
+    let offer = node_offer(&registry, &Default::default()).unwrap();
+    let driver = SessionDriver::new(
+      context,
+      keys.as_provider(),
+      entropy.clone(),
+      Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
+      offer,
+      registry,
+      Duration::from_millis(50),
+      NodeConfig::new().merge_admission(),
+    );
+
+    let certificate = EphemeralCertificate::generate(entropy.as_ref()).unwrap();
+    let server = server_config(&certificate).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // A peer that completes the TLS/WebSocket upgrade and then withholds
+    // the initiator hello: only the authentication deadline ends the
+    // responder's attempt.
+    let silent_peer = tokio::spawn(async move {
+      let tcp = TcpStream::connect(address).await.unwrap();
+      // The returned connection keeps the silent peer alive: dropping it
+      // would close the socket and end the responder's wait early.
+      Connection::connect_tls_ws(
+        tcp,
+        merge_client_config().unwrap(),
+        "127.0.0.1".try_into().unwrap(),
+        connection_frame_rules().unwrap(),
+      )
+      .await
+      .unwrap()
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut connection =
+      Connection::accept_tls_ws(tcp, server, connection_frame_rules().unwrap(), None)
+        .await
+        .unwrap();
+
+    let error = driver.respond(&mut connection).await.unwrap_err();
+    assert_eq!(
+      error.kind(),
+      ErrorKind::NotReady,
+      "a deadline expiry must stay retryable"
+    );
+    assert_ne!(
+      error.kind(),
+      ErrorKind::AuthenticationFailed,
+      "a deadline expiry must not read as a permanent identity rejection"
+    );
+    drop(silent_peer.await.unwrap());
+  }
+}
+
+#[cfg(test)]
 mod member_spki_tests {
-  use super::MemberSpkiTable;
+  use super::{MEMBER_SPKI_ANCHORS, MemberSpkiTable};
   use crate::{Endpoint, NodeId};
 
   fn peer() -> NodeId {
@@ -714,6 +877,66 @@ mod member_spki_tests {
       anchors.anchor(&peer, &wss).as_deref(),
       Some(b"wss-leaf".as_slice()),
       "a rollover re-record on one target leaves the other target untouched"
+    );
+  }
+
+  /// Endpoint churn stays bounded: the per-peer bound evicts the oldest
+  /// target, and an evicted target reports no anchor so its next dial
+  /// falls back to merge trust (the member handshake's identity proof)
+  /// instead of pinning a stale leaf for the process lifetime (audit B07).
+  #[test]
+  fn endpoint_churn_evicts_the_oldest_anchors_and_falls_back_safely() {
+    let anchors = MemberSpkiTable::default();
+    let peer = peer();
+    let targets: Vec<Endpoint> = (1..=5)
+      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:70{port:02}")).unwrap())
+      .collect();
+    for (index, target) in targets.iter().enumerate() {
+      anchors.record(&peer, target, format!("leaf-{index}").into_bytes());
+    }
+    assert_eq!(
+      anchors.anchor(&peer, &targets[0]),
+      None,
+      "the oldest target of a churning peer is evicted"
+    );
+    for (index, target) in targets.iter().enumerate().skip(1) {
+      assert_eq!(
+        anchors.anchor(&peer, target),
+        Some(format!("leaf-{index}").into_bytes()),
+        "the newest targets keep their anchors"
+      );
+    }
+  }
+
+  /// The cache is globally bounded too: a large cluster only ever keeps
+  /// the newest anchors, and the evicted ones fall back to merge trust.
+  #[test]
+  fn anchor_table_is_globally_bounded() {
+    let anchors = MemberSpkiTable::default();
+    let peers: Vec<NodeId> = (0..=MEMBER_SPKI_ANCHORS)
+      .map(|seed| NodeId::parse(&format!("node-{seed:021}")).unwrap())
+      .collect();
+    let targets: Vec<Endpoint> = (0..=MEMBER_SPKI_ANCHORS)
+      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:{}", 20_000 + port)).unwrap())
+      .collect();
+    for (peer, target) in peers.iter().zip(&targets) {
+      anchors.record(peer, target, b"leaf".to_vec());
+    }
+    assert_eq!(
+      anchors.anchor(&peers[0], &targets[0]),
+      None,
+      "the globally oldest anchor is evicted"
+    );
+    let newest = MEMBER_SPKI_ANCHORS;
+    assert_eq!(
+      anchors.anchor(&peers[newest], &targets[newest]),
+      Some(b"leaf".to_vec()),
+      "the newest anchor is retained"
+    );
+    assert_eq!(
+      anchors.0.lock().unwrap().anchors.len(),
+      MEMBER_SPKI_ANCHORS,
+      "the cache never exceeds its global bound"
     );
   }
 }

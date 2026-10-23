@@ -248,6 +248,20 @@ pub(crate) enum TerminalWinner {
   Fresh,
 }
 
+/// The durable verdict of one terminal-record install: whether the call
+/// changed the family's slot. Notification callers (member and
+/// authorization events) act only on [`Self::Installed`]; an exact replay
+/// or a legitimate losing record is a no-op success whose notification
+/// would fabricate a change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalInstall {
+  /// The record installed fresh or replaced the stored evidence as the
+  /// canonical winner.
+  Installed,
+  /// The stored evidence already won (exact replay or legitimate loser).
+  Unchanged,
+}
+
 /// The convergent install shared by the terminal tombstone families that
 /// admit divergent-but-valid evidence for one subject (`CleanupRecordV1`,
 /// `RevocationRecordV1`): a snapshot-identical record is a no-op, a fresh
@@ -258,19 +272,20 @@ pub(crate) enum TerminalWinner {
 /// reconnect. The replacement is one conditional put pinning the stored
 /// record's exact digest; the caller holds the store's writer permit and
 /// has already verified the fresh record against the retained bindings;
-/// `label` names the family in the conflict error.
+/// `label` names the family in the conflict error. The verdict tells the
+/// caller whether this call changed the family's slot.
 pub(crate) async fn persist_convergent_terminal_record(
   store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, key: StoreKey,
   encoded: Arc<[u8]>, label: &'static str, decides: fn(&[u8], &[u8]) -> Result<TerminalWinner>,
-) -> Result<()> {
+) -> Result<TerminalInstall> {
   let snapshot = store.snapshot().await?;
   let expected = match snapshot.get(&namespace, &key).await? {
     Some(existing) => {
       if existing.as_bytes() == encoded.as_ref() {
-        return Ok(());
+        return Ok(TerminalInstall::Unchanged);
       }
       match decides(existing.as_bytes(), encoded.as_ref())? {
-        TerminalWinner::Stored => return Ok(()),
+        TerminalWinner::Stored => return Ok(TerminalInstall::Unchanged),
         TerminalWinner::Fresh => StoreExpectation::Exact(existing.digest().clone()),
       }
     }
@@ -281,7 +296,8 @@ pub(crate) async fn persist_convergent_terminal_record(
   install_terminal_record(
     store, entropy, &namespace, key, encoded, expected, revision, label,
   )
-  .await
+  .await?;
+  Ok(TerminalInstall::Installed)
 }
 
 /// The commit tail both terminal-record install paths share: one
@@ -1881,17 +1897,29 @@ mod tests {
     };
 
     // A fresh record installs exactly once; the exact record is a no-op.
-    install(vec![0x01, 0x02, 0x03]).await.unwrap();
-    install(vec![0x01, 0x02, 0x03]).await.unwrap();
+    assert_eq!(
+      install(vec![0x01, 0x02, 0x03]).await.unwrap(),
+      TerminalInstall::Installed
+    );
+    assert_eq!(
+      install(vec![0x01, 0x02, 0x03]).await.unwrap(),
+      TerminalInstall::Unchanged
+    );
     assert_eq!(stored().await.as_deref(), Some(&[0x01, 0x02, 0x03][..]));
 
     // A losing fresh record (same binding, greater encoding) is dropped.
-    install(vec![0x01, 0x09]).await.unwrap();
+    assert_eq!(
+      install(vec![0x01, 0x09]).await.unwrap(),
+      TerminalInstall::Unchanged
+    );
     assert_eq!(stored().await.as_deref(), Some(&[0x01, 0x02, 0x03][..]));
 
     // A winning fresh record (same binding, smaller encoding) replaces
-    // the stored one.
-    install(vec![0x01, 0x00]).await.unwrap();
+    // the stored one and reports the install.
+    assert_eq!(
+      install(vec![0x01, 0x00]).await.unwrap(),
+      TerminalInstall::Installed
+    );
     assert_eq!(stored().await.as_deref(), Some(&[0x01, 0x00][..]));
 
     // The decider's fail-closed binding refusal surfaces as Conflict and

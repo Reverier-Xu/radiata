@@ -172,15 +172,57 @@ fn revocation_merge(stored: &[u8], fresh: &[u8]) -> Result<TerminalWinner> {
   })
 }
 
+/// The durable transition one verified revocation record performs over the
+/// local family slot. Evidence replacement over an already-revoked binding
+/// is not an authorization change: the boundary landed with the first
+/// record, so observers are notified (and the member view is re-read) only
+/// for [`Self::Revoked`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RevocationTransition {
+  /// The binding was not revoked on this node: this record established the
+  /// authorization boundary.
+  Revoked,
+  /// The binding was already revoked; this record replaced the stored
+  /// evidence as the canonical winner.
+  Replaced,
+  /// The stored evidence already won (exact replay or legitimate loser):
+  /// nothing changed.
+  Unchanged,
+}
+
+impl RevocationTransition {
+  /// Whether this transition changed the binding's authorization state.
+  /// Session retirement stays independent of it (a revoked identity must
+  /// never keep a live session); notifications and the public
+  /// already-revoked verdict read it.
+  pub(crate) const fn changed_authorization(self) -> bool {
+    matches!(self, Self::Revoked)
+  }
+}
+
 /// The outcome of one conditional revocation commit.
 #[derive(Debug)]
 pub(crate) enum RevokeStoreOutcome {
-  /// The revocation committed now; the caller closes sessions and emits
-  /// the event for this transition. The receipt proves the durable commit.
-  Revoked(#[allow(dead_code)] crate::CommitReceipt),
-  /// The exact binding was already revoked; the operation is idempotent
-  /// and reports no new transition.
+  /// The record committed now; the caller closes sessions and emits the
+  /// event when the transition is a new authorization boundary. The
+  /// receipt proves the durable commit.
+  Committed(
+    RevocationTransition,
+    #[allow(dead_code)] crate::CommitReceipt,
+  ),
+  /// The exact binding was already revoked and the stored evidence won;
+  /// the operation is idempotent and reports no new transition.
   AlreadyRevoked,
+}
+
+impl RevokeStoreOutcome {
+  /// The durable transition this outcome performed.
+  pub(crate) const fn transition(&self) -> RevocationTransition {
+    match self {
+      Self::Committed(transition, _) => *transition,
+      Self::AlreadyRevoked => RevocationTransition::Unchanged,
+    }
+  }
 }
 
 /// Conditionally revokes one exact subject/key binding with the given
@@ -218,7 +260,9 @@ pub(crate) async fn revoke_binding_ctx(
     return Err(Error::conflict("revocation key"));
   }
   let encoded = record.encode()?;
-  let expected = match snapshot.get(&namespace, &store_key).await? {
+  // `Replaced` means the stored slot already pins this exact binding under
+  // a revocation: an absent slot is the only new authorization boundary.
+  let (expected, transition) = match snapshot.get(&namespace, &store_key).await? {
     Some(existing) => {
       let existing_record = decode_value(existing.as_bytes())?;
       if existing_record == *record {
@@ -232,10 +276,13 @@ pub(crate) async fn revoke_binding_ctx(
       // a different binding still fails closed inside the decision.
       match revocation_merge(existing.as_bytes(), &encoded)? {
         TerminalWinner::Stored => return Ok(RevokeStoreOutcome::AlreadyRevoked),
-        TerminalWinner::Fresh => StoreExpectation::Exact(existing.digest().clone()),
+        TerminalWinner::Fresh => (
+          StoreExpectation::Exact(existing.digest().clone()),
+          RevocationTransition::Replaced,
+        ),
       }
     }
-    None => StoreExpectation::Absent,
+    None => (StoreExpectation::Absent, RevocationTransition::Revoked),
   };
   let transaction = store.prepare_transaction(
     TransactionId::generate(entropy)?,
@@ -262,7 +309,7 @@ pub(crate) async fn revoke_binding_ctx(
       // The persisted revocation is new tombstone evidence: the write
       // epoch arms the cadence for a next-tick push.
       store.note_local_write_tag(crate::storage::families::REVOCATION_NAMESPACE);
-      Ok(RevokeStoreOutcome::Revoked(receipt))
+      Ok(RevokeStoreOutcome::Committed(transition, receipt))
     }
     // A raced exact revocation committed first: idempotent. Any other
     // interleaving fails closed and the caller retries the operation.
@@ -285,9 +332,11 @@ pub(crate) async fn revoke_binding_ctx(
 /// deterministically with a divergent verified record for the same
 /// binding (the canonical winner replaces the loser, so partitioned
 /// revocations converge); a record for a different binding fails closed.
+/// The returned transition distinguishes a first revocation from an
+/// evidence-only replacement and an unchanged replay.
 pub(crate) async fn persist_revocation_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
-) -> Result<()> {
+) -> Result<RevocationTransition> {
   let _permit = store.write_permit().await;
   let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
   let issuer_key = bindings
@@ -300,7 +349,12 @@ pub(crate) async fn persist_revocation_ctx(
   {
     return Err(Error::not_trusted("revocation subject binding"));
   }
-  crate::identity::records::persist_convergent_terminal_record(
+  // The slot's prior evidence is read under the writer exclusion that the
+  // install below re-enters, so the first-revocation verdict cannot race a
+  // concurrent record.
+  let already_revoked =
+    revoked_key_ctx(store, record.subject()).await?.as_ref() == Some(record.subject_key());
+  let install = crate::identity::records::persist_convergent_terminal_record(
     store,
     entropy,
     namespace()?,
@@ -309,7 +363,14 @@ pub(crate) async fn persist_revocation_ctx(
     "revocation record",
     revocation_merge,
   )
-  .await
+  .await?;
+  Ok(match install {
+    crate::identity::records::TerminalInstall::Unchanged => RevocationTransition::Unchanged,
+    crate::identity::records::TerminalInstall::Installed if already_revoked => {
+      RevocationTransition::Replaced
+    }
+    crate::identity::records::TerminalInstall::Installed => RevocationTransition::Revoked,
+  })
 }
 
 /// The revoked tombstone of `subject`, when this node holds one for that
@@ -382,8 +443,8 @@ mod tests {
   use ed25519_dalek::Signer as _;
 
   use super::{
-    REVOCATION_RECORD_DOMAIN, RevocationRecordV1, RevokeStoreOutcome, is_revoked_ctx,
-    persist_revocation_ctx, revoke_binding_ctx, revoked_key_ctx,
+    REVOCATION_RECORD_DOMAIN, RevocationRecordV1, RevocationTransition, RevokeStoreOutcome,
+    is_revoked_ctx, persist_revocation_ctx, revoke_binding_ctx, revoked_key_ctx,
   };
   use crate::{
     ErrorKind, NodeId, PublicKey, Signature, StoreExpectation,
@@ -471,12 +532,14 @@ mod tests {
     let store = open_store().await;
     trust(&store, &subject(), &key(7)).await;
 
+    let first = revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
+      .await
+      .unwrap();
     assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
-        .await
-        .unwrap(),
-      RevokeStoreOutcome::Revoked(_)
+      first,
+      RevokeStoreOutcome::Committed(RevocationTransition::Revoked, _)
     ));
+    assert!(first.transition().changed_authorization());
     assert_eq!(
       revoked_key_ctx(&store, &subject()).await.unwrap(),
       Some(key(7))
@@ -499,12 +562,12 @@ mod tests {
     assert_eq!(known[0].subject(), &subject());
 
     // Idempotent: the same exact revocation reports no new transition.
-    assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
-        .await
-        .unwrap(),
-      RevokeStoreOutcome::AlreadyRevoked
-    ));
+    let replay = revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
+      .await
+      .unwrap();
+    assert!(matches!(replay, RevokeStoreOutcome::AlreadyRevoked));
+    assert_eq!(replay.transition(), RevocationTransition::Unchanged);
+    assert!(!replay.transition().changed_authorization());
     // A revocation recorded under one key never silently rekeys.
     assert_eq!(
       revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(8)))
@@ -601,63 +664,105 @@ mod tests {
     let store = open_store().await;
     trust(&store, &subject(), &key(7)).await;
     trust(&store, &low_node, &low_key).await;
-    persist_revocation_ctx(&store, &SystemEntropy, &foreign_low)
-      .await
-      .unwrap();
-    assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &local)
+    assert_eq!(
+      persist_revocation_ctx(&store, &SystemEntropy, &foreign_low)
         .await
         .unwrap(),
-      RevokeStoreOutcome::AlreadyRevoked
-    ));
+      RevocationTransition::Revoked,
+      "the first persisted revocation establishes the boundary"
+    );
+    let losing_local = revoke_binding_ctx(&store, &SystemEntropy, &local)
+      .await
+      .unwrap();
+    assert!(matches!(losing_local, RevokeStoreOutcome::AlreadyRevoked));
+    assert_eq!(losing_local.transition(), RevocationTransition::Unchanged);
     assert_eq!(stored_bytes(&store).await, foreign_low.encode().unwrap());
     assert!(is_revoked_ctx(&store, &subject(), &key(7)).await.unwrap());
 
-    // The opposite delivery order converges to the same winner.
+    // The opposite delivery order converges to the same winner, and the
+    // arriving loser is an unchanged replay rather than a notification.
     let store = open_store().await;
     trust(&store, &subject(), &key(7)).await;
     trust(&store, &low_node, &low_key).await;
-    assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &local)
-        .await
-        .unwrap(),
-      RevokeStoreOutcome::Revoked(_)
-    ));
-    persist_revocation_ctx(&store, &SystemEntropy, &foreign_low)
+    let local_first = revoke_binding_ctx(&store, &SystemEntropy, &local)
       .await
       .unwrap();
+    assert_eq!(
+      local_first.transition(),
+      RevocationTransition::Revoked,
+      "the local record establishes the boundary"
+    );
+    assert!(local_first.transition().changed_authorization());
+    assert_eq!(
+      persist_revocation_ctx(&store, &SystemEntropy, &foreign_low)
+        .await
+        .unwrap(),
+      RevocationTransition::Replaced,
+      "a winning late arrival replaces the evidence of an already-revoked binding"
+    );
     assert_eq!(stored_bytes(&store).await, foreign_low.encode().unwrap());
 
     // A losing foreign record is replaced by the local winner when it
-    // is stored first...
+    // is stored first. The binding was already revoked, so the local
+    // revoke is evidence replacement (already-revoked publicly), not a
+    // second authorization transition.
     let store = open_store().await;
     trust(&store, &subject(), &key(7)).await;
     trust(&store, &high_node, &high_key).await;
-    persist_revocation_ctx(&store, &SystemEntropy, &foreign_high)
+    assert_eq!(
+      persist_revocation_ctx(&store, &SystemEntropy, &foreign_high)
+        .await
+        .unwrap(),
+      RevocationTransition::Revoked
+    );
+    let replacement = revoke_binding_ctx(&store, &SystemEntropy, &local)
       .await
       .unwrap();
     assert!(matches!(
-      revoke_binding_ctx(&store, &SystemEntropy, &local)
-        .await
-        .unwrap(),
-      RevokeStoreOutcome::Revoked(_)
+      replacement,
+      RevokeStoreOutcome::Committed(RevocationTransition::Replaced, _)
     ));
+    assert!(!replacement.transition().changed_authorization());
     assert_eq!(stored_bytes(&store).await, local.encode().unwrap());
 
-    // ...and never replaces it when it arrives second.
+    // ...and the arriving loser never replaces it, nor re-notifies.
     let store = open_store().await;
     trust(&store, &subject(), &key(7)).await;
     trust(&store, &high_node, &high_key).await;
-    assert!(matches!(
+    assert_eq!(
       revoke_binding_ctx(&store, &SystemEntropy, &local)
         .await
+        .unwrap()
+        .transition(),
+      RevocationTransition::Revoked
+    );
+    assert_eq!(
+      persist_revocation_ctx(&store, &SystemEntropy, &foreign_high)
+        .await
         .unwrap(),
-      RevokeStoreOutcome::Revoked(_)
-    ));
-    persist_revocation_ctx(&store, &SystemEntropy, &foreign_high)
-      .await
-      .unwrap();
+      RevocationTransition::Unchanged
+    );
     assert_eq!(stored_bytes(&store).await, local.encode().unwrap());
+
+    // A canonical replacement over an already-revoked binding is
+    // distinguished on the sync path too.
+    let store = open_store().await;
+    trust(&store, &subject(), &key(7)).await;
+    trust(&store, &low_node, &low_key).await;
+    trust(&store, &high_node, &high_key).await;
+    assert_eq!(
+      persist_revocation_ctx(&store, &SystemEntropy, &foreign_high)
+        .await
+        .unwrap(),
+      RevocationTransition::Revoked
+    );
+    assert_eq!(
+      persist_revocation_ctx(&store, &SystemEntropy, &foreign_low)
+        .await
+        .unwrap(),
+      RevocationTransition::Replaced
+    );
+    assert_eq!(stored_bytes(&store).await, foreign_low.encode().unwrap());
   }
 
   /// The merge never launders a different binding: a stored record
@@ -707,7 +812,7 @@ mod tests {
       revoke_binding_ctx(&store, &SystemEntropy, &signed_record(&subject(), &key(7)))
         .await
         .unwrap(),
-      RevokeStoreOutcome::Revoked(_)
+      RevokeStoreOutcome::Committed(RevocationTransition::Revoked, _)
     ));
     drop(store);
 
@@ -876,7 +981,7 @@ mod crash {
     .await
     .unwrap()
     {
-      RevokeStoreOutcome::Revoked(receipt) => receipt,
+      RevokeStoreOutcome::Committed(_, receipt) => receipt,
       RevokeStoreOutcome::AlreadyRevoked => panic!("dry-run revoke must commit"),
     }
   }
@@ -916,7 +1021,7 @@ mod crash {
     .await
     .unwrap()
     {
-      RevokeStoreOutcome::Revoked(_) | RevokeStoreOutcome::AlreadyRevoked => {}
+      RevokeStoreOutcome::Committed(..) | RevokeStoreOutcome::AlreadyRevoked => {}
     }
   }
 

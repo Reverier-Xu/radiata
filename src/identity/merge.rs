@@ -86,7 +86,11 @@ impl MergeProposal {
 pub(crate) enum MergeState {
   /// The exact complete binding/use/grant triple exists.
   Consumed(CredentialUseV1, Box<MergeGrantV1>),
-  /// All three records are authoritatively absent.
+  /// The attempt left no record of its own: this generation's credential
+  /// use and this merge id's grant are authoritatively absent. The
+  /// subject binding may be absent, or present as the exact prior union
+  /// baseline a re-merge starts from and reuses; any other binding state
+  /// fails closed before this verdict.
   Aborted,
 }
 
@@ -429,8 +433,11 @@ pub(crate) async fn adopt_merge(
   }
 }
 
-/// The durable outcome of an adoption attempt: the exact issuer binding and
-/// grant pair is either complete or fully absent.
+/// The durable outcome of an adoption attempt: the grant is either present
+/// with its exact issuer binding, or absent. The issuer binding may
+/// pre-exist as a legal baseline (an earlier adoption from the same
+/// issuer), so it is validated rather than required to appear with this
+/// grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MergeAdoptionState {
   Adopted,
@@ -470,8 +477,12 @@ async fn merge_adoption_state(
 
   match (binding, stored_grant) {
     (Some(_), Some(_)) => Ok(MergeAdoptionState::Adopted),
-    (None, None) => Ok(MergeAdoptionState::Absent),
-    _ => Err(discovery_corrupt()),
+    // The grant is absent: with or without the exact prior issuer binding
+    // baseline, this attempt did not apply. The grant closure above
+    // validates a stored grant's fields and signature, so a grant without
+    // its issuer binding is the only partial state left to reject.
+    (_, None) => Ok(MergeAdoptionState::Absent),
+    (None, Some(_)) => Err(discovery_corrupt()),
   }
 }
 
@@ -536,9 +547,12 @@ async fn re_admission(
 
 /// Classifies the durable outcome of a merge attempt.
 ///
-/// The credential use, grant, and subject binding are all present with exact
-/// matching fields and a valid issuer signature, or all absent. Partial or
-/// mismatched state fails closed.
+/// The credential use and grant are either both present with exact
+/// matching fields and a valid issuer signature, or both absent. The
+/// subject binding may pre-exist as the exact union baseline (re-merge),
+/// so it is preserved and validated rather than required to appear with
+/// this attempt's records. A partial use/grant pair or a mismatched
+/// binding fails closed.
 pub(crate) async fn merge_state(
   context: &LocalIdentityContext, proposal: &MergeProposal,
 ) -> Result<MergeState> {
@@ -597,7 +611,11 @@ pub(crate) async fn merge_state(
     (Some(credential_use), Some(grant), Some(_)) => {
       Ok(MergeState::Consumed(credential_use, Box::new(grant)))
     }
-    (None, None, None) => Ok(MergeState::Aborted),
+    // The attempt's own records are absent. A binding present here is the
+    // exact prior union baseline (validated by the closure above): a
+    // re-merge that aborted before committing its use/grant pair is a
+    // legal un-applied state, not corruption.
+    (None, None, _) => Ok(MergeState::Aborted),
     _ => Err(discovery_corrupt()),
   }
 }
@@ -612,7 +630,10 @@ mod tests {
 
   use tokio::sync::Notify;
 
-  use super::{MergeProposal, MergeState, adopt_merge, commit_merge, merge_state};
+  use super::{
+    MergeAdoptionState, MergeProposal, MergeState, adopt_merge, commit_merge, merge_adoption_state,
+    merge_state,
+  };
   use crate::{
     ErrorKind, PublicKey,
     identity::{
@@ -794,6 +815,189 @@ mod tests {
     }
     assert!(pending_keys(&fixture.reference).is_empty());
     assert_never_deleted(&fixture.keys);
+  }
+
+  /// An aborted re-merge legitimately starts from the exact binding the
+  /// first merge installed: the classifier must preserve and validate
+  /// that union baseline instead of reporting storage corruption, and the
+  /// baseline itself must survive the abort untouched (audit B10).
+  #[tokio::test]
+  async fn identity_records_remerge_abort_preserves_the_union_baseline() {
+    let (reference, _factory) = fresh_reference();
+    // Identity creation (3) and the self-binding (1) pass; the first merge
+    // journal and its pending cleanup commit at positions five and six;
+    // the re-merge journal at position seven is rejected before applying.
+    let faulting = FaultingFactory::new(
+      &reference,
+      vec![Pass; 6]
+        .into_iter()
+        .chain([CommitFault::PureAborted])
+        .collect(),
+    );
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = open_context(&faulting.as_factory(), &keys, &entropy)
+      .await
+      .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+    let first = proposal(61, &entropy);
+    let grant = commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &first)
+      .await
+      .unwrap();
+
+    let mut second = proposal(62, &entropy);
+    set_subject(&mut second, proposal_subject(&first).clone());
+    set_subject_key(&mut second, proposal_subject_key(&first).clone());
+    let (binding_namespace, binding_key) = identity_binding_key(proposal_subject(&first)).unwrap();
+    let baseline = entry(&reference, &binding_namespace, &binding_key)
+      .expect("the first merge installs the subject binding")
+      .as_bytes()
+      .to_vec();
+
+    let error = commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &second)
+      .await
+      .unwrap_err();
+    assert_eq!(
+      error.kind(),
+      ErrorKind::Conflict,
+      "an aborted re-merge is a retryable conflict, not storage corruption"
+    );
+
+    // The abort is classified against the preserved baseline: the first
+    // merge is still consumed, and the second attempt is a legal
+    // un-applied state.
+    match merge_state(&context, &first).await.unwrap() {
+      MergeState::Consumed(_, existing) => assert_eq!(*existing, grant),
+      MergeState::Aborted => panic!("the first merge must stay consumed"),
+    }
+    assert!(matches!(
+      merge_state(&context, &second).await.unwrap(),
+      MergeState::Aborted
+    ));
+    assert_eq!(
+      entry(&reference, &binding_namespace, &binding_key)
+        .expect("the union baseline survives the abort")
+        .as_bytes(),
+      baseline.as_slice()
+    );
+
+    // The retry reuses the exact baseline and commits only its own use
+    // and grant records.
+    let retried = commit_merge(&context, &provider_of(&keys), entropy.as_ref(), &second)
+      .await
+      .unwrap();
+    retried.verify(context.identity().public_key()).unwrap();
+    assert_eq!(
+      entry(&reference, &binding_namespace, &binding_key)
+        .expect("the retry keeps the baseline")
+        .as_bytes(),
+      baseline.as_slice()
+    );
+    assert_never_deleted(&keys);
+  }
+
+  /// An aborted adoption of a later grant from an already-adopted issuer
+  /// starts from that issuer binding: the baseline is legal and must be
+  /// preserved, while a grant without its issuer binding still fails
+  /// closed as corruption (audit B10).
+  #[tokio::test]
+  async fn identity_records_adoption_abort_preserves_the_issuer_binding_baseline() {
+    let (reference, _factory) = fresh_reference();
+    // Identity creation (3) and the self-binding (1) pass; the first
+    // adoption journal and its pending cleanup commit at positions five
+    // and six; the second adoption journal at position seven is rejected
+    // before applying.
+    let faulting = FaultingFactory::new(
+      &reference,
+      vec![Pass; 6]
+        .into_iter()
+        .chain([CommitFault::PureAborted])
+        .collect(),
+    );
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = open_context(&faulting.as_factory(), &keys, &entropy)
+      .await
+      .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    let issuer_signing = scripted_signing(177);
+    let issuer = node(177_000);
+    let issuer_key = PublicKey::from_bytes(issuer_signing.verifying_key().to_bytes());
+    let first = signed_grant(
+      &issuer_signing,
+      issuer.clone(),
+      context.identity(),
+      &entropy,
+    );
+    adopt_merge(&context, entropy.as_ref(), &first, &issuer_key)
+      .await
+      .unwrap();
+    let (binding_namespace, binding_key) = identity_binding_key(&issuer).unwrap();
+    let baseline = entry(&reference, &binding_namespace, &binding_key)
+      .expect("the first adoption installs the issuer binding")
+      .as_bytes()
+      .to_vec();
+
+    let second = signed_grant(
+      &issuer_signing,
+      issuer.clone(),
+      context.identity(),
+      &entropy,
+    );
+    let error = adopt_merge(&context, entropy.as_ref(), &second, &issuer_key)
+      .await
+      .unwrap_err();
+    assert_eq!(
+      error.kind(),
+      ErrorKind::Conflict,
+      "an aborted adoption is a retryable conflict, not storage corruption"
+    );
+    assert_eq!(
+      merge_adoption_state(&context, &first, &issuer_key)
+        .await
+        .unwrap(),
+      MergeAdoptionState::Adopted
+    );
+    assert_eq!(
+      merge_adoption_state(&context, &second, &issuer_key)
+        .await
+        .unwrap(),
+      MergeAdoptionState::Absent
+    );
+    assert_eq!(
+      entry(&reference, &binding_namespace, &binding_key)
+        .expect("the issuer binding survives the abort")
+        .as_bytes(),
+      baseline.as_slice()
+    );
+
+    // The retry reuses the exact baseline and commits only the grant.
+    adopt_merge(&context, entropy.as_ref(), &second, &issuer_key)
+      .await
+      .unwrap();
+    assert_eq!(
+      entry(&reference, &binding_namespace, &binding_key)
+        .expect("the retry keeps the baseline")
+        .as_bytes(),
+      baseline.as_slice()
+    );
+
+    // A grant present without its issuer binding is still corruption, not
+    // an un-applied baseline.
+    remove_entry(&reference, &binding_namespace, &binding_key);
+    assert_eq!(
+      merge_adoption_state(&context, &second, &issuer_key)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::StorageCorrupt
+    );
+    assert_never_deleted(&keys);
   }
 
   #[tokio::test]
