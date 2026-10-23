@@ -376,7 +376,16 @@ async fn read_loop_frames(
             if ack.status == crate::packet::wire::AckStatus::Admitted {
               forward::mark_admitted(&context.forwarding, &ack.trace_id);
             }
-            resolve_ack(ack.clone(), pending_acks);
+            if !resolve_ack(ack.clone(), pending_acks) {
+              // The one-shot admission waiter is gone. An origin's
+              // waiter is simply finished; an admitted forwarding hop
+              // instead owns the stream for its whole life and carries
+              // the report upstream itself — a legitimate mid-stream
+              // failure from the bound downstream session must not be
+              // dropped as a superseded branch's latecomer (audit
+              // P1-8).
+              forward::relay_admitted_ack(&context.forwarding, &ack);
+            }
             // A late failure for an admitted stream (a downstream hop
             // died mid-flight) still terminates the origin's route
             // observation. This writer races the origin pump's
@@ -682,15 +691,18 @@ fn forward_chunk(
 
 /// Resolves one pending outbound admission. The admitting node is this
 /// session's authenticated peer, so the acknowledgement can name it for
-/// the synchronous sender's `DeliveryAck`.
-fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) {
+/// the synchronous sender's `DeliveryAck`. Returns whether a pending
+/// entry was resolved: an admitted forwarding hop's waiter was already
+/// consumed when admission resolved, and its later flow-control events
+/// relay upstream through the hop itself instead (audit P1-8).
+fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) -> bool {
   let entry = pending_acks
     .lock()
     .map(|mut pending| pending.remove(&ack.trace_id))
     .ok()
     .flatten();
   let Some(entry) = entry else {
-    return;
+    return false;
   };
   match entry {
     PendingAck::Wait { notify, .. } => {
@@ -715,6 +727,7 @@ fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) {
       }
     }
   }
+  true
 }
 
 /// Digests the immutable opening context of one open frame (endpoints,
@@ -1334,7 +1347,9 @@ mod ack_attribution_tests {
     },
     routing::{
       RouteContext,
-      forward::{ForwardingHop, PendingAck, PendingAcks, RetryState, SessionIdentity, register},
+      forward::{
+        ForwardingHop, HopPhase, PendingAck, PendingAcks, RetryState, SessionIdentity, register,
+      },
     },
     session::stream::{SessionPacketContext, SessionPolicy, test_queue},
     transport::{Received, connection::Message},
@@ -1443,7 +1458,7 @@ mod ack_attribution_tests {
       downstream_session,
       relay_lock: Arc::new(tokio::sync::Mutex::new(())),
       deadline: None,
-      retry: Some(RetryState {
+      phase: HopPhase::Discovering(Box::new(RetryState {
         open: OpenFrame {
           trace_id: trace_id.clone(),
           source: node(3),
@@ -1455,8 +1470,51 @@ mod ack_attribution_tests {
         context: RouteContext::new(trace_id, node(3), node(9), 8),
         candidates: Vec::new(),
         downstream_acks,
-      }),
+      })),
     }
+  }
+
+  /// The same hop once the destination admitted the stream: a pure relay
+  /// bound to `downstream_session`, whose one-shot admission waiter the
+  /// admission acknowledgement already consumed from the pending map.
+  fn admitted_hop_on(
+    upstream: crate::session::stream::BoundedSender,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream_session: SessionIdentity,
+  ) -> ForwardingHop {
+    let mut hop = hop_on(upstream, downstream, downstream_acks, downstream_session);
+    hop.phase = HopPhase::Admitted;
+    hop
+  }
+
+  /// Reads one acknowledgement frame from a fresh session frame source and
+  /// returns the peer-facing queue of the read loop: the sender stays with
+  /// the caller so "no frame was queued" is distinguishable from "the loop
+  /// dropped the queue". The source ends the session orderly after the
+  /// acknowledgement, so the loop always terminates within the timeout.
+  async fn deliver_ack(
+    grant: &SessionGrant, context: &SessionPacketContext, pending_acks: &PendingAcks, body: Vec<u8>,
+  ) -> (
+    crate::session::stream::BoundedSender,
+    crate::session::stream::BoundedReceiver,
+  ) {
+    let mut source = AckSource { body };
+    let (frames, frames_rx) = test_queue(8, 1 << 20);
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        grant,
+        context,
+        &frames,
+        pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the acknowledgement source ends the read loop orderly");
+    (frames, frames_rx)
   }
 
   /// A late failure acknowledgement from a superseded branch must not
@@ -1508,23 +1566,7 @@ mod ack_attribution_tests {
       admitted_at_millis: 0,
     })
     .unwrap();
-    let mut source = AckSource { body };
-    let (frames, mut frames_rx) = test_queue(8, 1 << 20);
-    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
-
-    tokio::time::timeout(
-      Duration::from_secs(10),
-      read_loop(
-        &mut source,
-        &grant,
-        &context,
-        &frames,
-        &stale_acks,
-        &last_activity,
-      ),
-    )
-    .await
-    .expect("the acknowledgement source ends the read loop orderly");
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &stale_acks, body).await;
 
     // The live hop is untouched: still registered, still discovering.
     assert!(crate::routing::forward::contains(
@@ -1538,6 +1580,156 @@ mod ack_attribution_tests {
     // The live attempt's pending entry survived.
     assert!(live_acks.lock().unwrap().contains_key(&trace_id));
     // Nothing failed upstream and no frame left the stale session.
+    use futures_util::FutureExt;
+    assert!(upstream_rx.recv().now_or_never().is_none());
+    assert!(frames_rx.recv().now_or_never().is_none());
+  }
+
+  /// A mid-stream failure arriving after the destination admitted the
+  /// stream belongs to the hop that owns it, even though its one-shot
+  /// admission waiter was consumed by the admission acknowledgement: the
+  /// admitted phase carries the ownership, so the report still travels
+  /// upstream instead of being dropped as a superseded branch's
+  /// latecomer (audit P1-8).
+  #[tokio::test]
+  async fn post_admission_failure_from_the_bound_session_relays_upstream() {
+    let trace_id = trace(9);
+    let grant = grant();
+    let context = context();
+
+    // The admission acknowledgement already resolved the one-shot waiter:
+    // the session's pending map is empty and the hop alone represents the
+    // stream from here on.
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    register(
+      &context.forwarding,
+      trace_id.clone(),
+      admitted_hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&session_acks),
+        grant.identity().clone(),
+      ),
+    )
+    .unwrap();
+
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Failed,
+      admitted_at_millis: 0,
+    })
+    .unwrap();
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &session_acks, body).await;
+
+    // The bound session's failure reached the previous hop with its typed
+    // status preserved.
+    use futures_util::FutureExt;
+    let relayed = upstream_rx
+      .recv()
+      .now_or_never()
+      .flatten()
+      .expect("the admitted hop relays the failure upstream");
+    assert_eq!(relayed.kind, PacketKind::Ack);
+    let relayed = crate::packet::wire::decode_ack(&relayed.body, context.parser_limits()).unwrap();
+    assert_eq!(relayed.trace_id, trace_id);
+    assert_eq!(relayed.status, AckStatus::Failed);
+    // The hop stays the stream's owner for its whole life: still
+    // registered, never re-searching, and nothing sent back downstream.
+    assert!(crate::routing::forward::contains(
+      &context.forwarding,
+      &trace_id
+    ));
+    assert!(!crate::routing::forward::owns_discovering(
+      &context.forwarding,
+      &trace_id
+    ));
+    assert!(frames_rx.recv().now_or_never().is_none());
+  }
+
+  /// The admitted hop's ownership is the exact downstream incarnation, not
+  /// the peer: a post-admission failure from a replacement session of the
+  /// same peer is another generation's traffic and is dropped rather than
+  /// steered through the live stream (audit P1-4, P1-8).
+  #[tokio::test]
+  async fn post_admission_failure_from_another_incarnation_is_dropped() {
+    let trace_id = trace(9);
+    let grant = grant();
+    let context = context();
+
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    // The hop's bound attempt is another incarnation of the delivering
+    // peer, so its pending map is not the one this session acknowledges on.
+    let bound_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    register(
+      &context.forwarding,
+      trace_id.clone(),
+      admitted_hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&bound_acks),
+        other_session(2, 7),
+      ),
+    )
+    .unwrap();
+
+    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Failed,
+      admitted_at_millis: 0,
+    })
+    .unwrap();
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &session_acks, body).await;
+
+    use futures_util::FutureExt;
+    assert!(upstream_rx.recv().now_or_never().is_none());
+    assert!(frames_rx.recv().now_or_never().is_none());
+    // The hop still owns its own stream: nothing about it changed.
+    assert!(crate::routing::forward::contains(
+      &context.forwarding,
+      &trace_id
+    ));
+    assert!(!crate::routing::forward::owns_discovering(
+      &context.forwarding,
+      &trace_id
+    ));
+  }
+
+  /// A repeated admission from the bound session carries nothing new: the
+  /// admission was relayed upstream when it resolved the one-shot waiter,
+  /// so the admitted hop does not echo it a second time.
+  #[tokio::test]
+  async fn a_repeated_admission_is_not_relayed_again() {
+    let trace_id = trace(9);
+    let grant = grant();
+    let context = context();
+
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    register(
+      &context.forwarding,
+      trace_id.clone(),
+      admitted_hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&session_acks),
+        grant.identity().clone(),
+      ),
+    )
+    .unwrap();
+
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Admitted,
+      admitted_at_millis: 1,
+    })
+    .unwrap();
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &session_acks, body).await;
+
     use futures_util::FutureExt;
     assert!(upstream_rx.recv().now_or_never().is_none());
     assert!(frames_rx.recv().now_or_never().is_none());
