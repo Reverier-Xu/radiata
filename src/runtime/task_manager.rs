@@ -1,11 +1,12 @@
 //! The task manager: the node-local reconcile plane behind the
 //! declarative verb surface. One spawned manager owns admission (id
-//! composition, dedup/coalescing, the `Pending` publication), two
+//! composition, dedup/coalescing, the `Pending` publication), three
 //! bounded worker pools (one counting semaphore per slot class — the
-//! local kinds and the join/connect dials — over the per-task
-//! reconcile futures), the bounded retry schedule with per-kind
-//! policies, and the shutdown drain (cancellable kinds exit on the
-//! cancel watch; the journaled kinds are awaited to completion).
+//! core local kinds, the join/connect dials, and the caller-registered
+//! extension workflows — over the per-task reconcile futures), the
+//! bounded retry schedule with per-kind policies, and the shutdown
+//! drain (cancellable kinds exit on the cancel watch; the journaled
+//! kinds are awaited to completion).
 //!
 //! Effects are crate-internal closures over the moved verb bodies
 //! (`runtime::task_effects`, landed stage by stage with the verb
@@ -43,25 +44,40 @@ use crate::{
 /// so one bound governs both admission ends.
 pub(crate) const TASK_CHANNEL_CAPACITY: usize = 32;
 
-/// The two execution-slot channels, one per slot class (see
+/// The three execution-slot channels, one per slot class (see
 /// [`crate::task::SlotClass`]). A join or connect dial can hold its
 /// slot for a whole dial deadline, so the dials draw from their own
-/// semaphore while every local kind keeps its own budget: four wedged
-/// dials must never queue a resource write (the starvation incident
-/// behind the split). The budgets come from
+/// semaphore while every core local kind keeps its own budget: four
+/// wedged dials must never queue a resource write (the starvation
+/// incident behind the split). The caller-registered extension kinds
+/// draw from their own channel for the mirror reason: an extension
+/// reconciler routinely awaits other admitted tasks through its public
+/// handle, so it must never occupy the core local capacity its own
+/// child operations need. The local and network budgets come from
 /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots)
 /// and default to two slots per channel — the historical four-permit
-/// total, one channel per class.
+/// total, one channel per core class; the extension budget is the
+/// manager's own constant below.
 struct ReconcileChannels {
   local: Arc<Semaphore>,
   network: Arc<Semaphore>,
+  extension: Arc<Semaphore>,
 }
+
+/// The extension channel's budget: an independent, deliberately fixed
+/// bound. The two configured budgets govern the core's per-verb
+/// concurrency; extension workflows are caller code over the public
+/// surface, so their channel keeps its own two-lane default — enough
+/// concurrent workflows to overlap IO while bounding how many wedged
+/// reconcilers can park waiting workflows behind them.
+const TASK_EXTENSION_RECONCILE_SLOTS: usize = 2;
 
 impl ReconcileChannels {
   fn new(local: usize, network: usize) -> Self {
     Self {
       local: Arc::new(Semaphore::new(local)),
       network: Arc::new(Semaphore::new(network)),
+      extension: Arc::new(Semaphore::new(TASK_EXTENSION_RECONCILE_SLOTS)),
     }
   }
 
@@ -70,6 +86,7 @@ impl ReconcileChannels {
     match class {
       SlotClass::Local => &self.local,
       SlotClass::Network => &self.network,
+      SlotClass::Extension => &self.extension,
     }
   }
 }
@@ -1684,6 +1701,75 @@ mod tests {
       TaskPhase::Pending,
       "the network channel is still saturated"
     );
+  }
+
+  /// The P1-6 regression: an extension reconciler is the one effect
+  /// class that routinely awaits other admitted tasks through its
+  /// public handle. Under the old two-channel split it drew from the
+  /// local channel, so with one local slot already held it took the
+  /// last remaining slot and its child write could never start — the
+  /// workflow deadlocked on the very capacity its own child needed.
+  /// The extension channel breaks the cycle: the workflow draws its
+  /// own class, and the child takes the local slot the workflow no
+  /// longer occupies.
+  #[tokio::test]
+  async fn an_extension_workflow_never_occupies_the_local_channel_its_children_need() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // One wedged core local task pins one of the local channel's two
+    // default slots: exactly one slot remains for the workflow's child.
+    let wedged = client
+      .submit(
+        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        wedged_effect(),
+      )
+      .await
+      .expect("admission");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client
+      .observer
+      .table
+      .status(&wedged)
+      .is_some_and(|(_, status)| status.phase() == TaskPhase::Running)
+    {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the wedged local task never started"
+      );
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The extension effect submits a core local child through the same
+    // manager and awaits its terminal phase: under the shared local
+    // class the workflow itself held the last local slot, so this
+    // await never resolved.
+    let workflow_client = client.clone();
+    let effect: TaskEffect = Arc::new(move |_deps, _attempt| {
+      let client = workflow_client.clone();
+      Box::pin(async move {
+        let child = client
+          .submit(
+            TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+            ok_effect(TaskOutput::SyncRound(())),
+          )
+          .await?;
+        Task::<()>::from_parts(child, TaskKind::SyncRound, client.observer.clone())
+          .wait()
+          .await?;
+        Ok(EffectOutcome::new(TaskOutput::Extension(())))
+      })
+    });
+    let kind =
+      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"));
+    let id = client
+      .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
+      .await
+      .expect("admission");
+    tokio::time::timeout(
+      Duration::from_secs(5),
+      handle::<()>(&client, &id, kind).wait(),
+    )
+    .await
+    .expect("the extension workflow must not deadlock on the local channel")
+    .expect("terminal");
   }
 
   #[tokio::test]

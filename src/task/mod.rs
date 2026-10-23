@@ -73,29 +73,46 @@ impl TaskKind {
   /// network dials (join/connect), which can hold a slot for a whole
   /// dial deadline, draw from their own channel so local work
   /// (resource writes, credentials, maintenance) never queues behind a
-  /// wedged dial. The split's budgets live in
-  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots).
+  /// wedged dial, and the caller-registered extension kinds draw from
+  /// their own channel so a workflow awaiting core verbs through its
+  /// handle never occupies the local capacity its own child operations
+  /// need. The two core budgets live in
+  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots);
+  /// the extension channel's budget is the task manager's own constant.
   pub(crate) const fn slot_class(&self) -> SlotClass {
     match self {
       Self::Join | Self::Connect => SlotClass::Network,
+      Self::Extension(_) => SlotClass::Extension,
       _ => SlotClass::Local,
     }
   }
 }
 
-/// Which of the task manager's two execution-slot channels a kind
-/// draws from. Local work keeps its own budget so a fleet of wedged
-/// dials cannot starve the operations whose latency the caller owns.
+/// Which of the task manager's execution-slot channels a kind draws
+/// from. Each class keeps its own budget so one class's wedged work can
+/// never starve the operations whose latency the caller owns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotClass {
   /// Join and connect dials: bounded by the configured dial deadline
-  /// (seconds), so they are the only kinds that can pin a slot for a
-  /// transport-observable span.
+  /// (seconds), so they are the only core kinds that can pin a slot
+  /// for a transport-observable span.
   Network,
-  /// Everything else (resource writes, credentials, leave, recovery,
-  /// retention, sync, listener and metadata maintenance, custom
-  /// reconcilers): effects whose latency is this node's own.
+  /// The core's own node-local work (resource writes, credentials,
+  /// leave, recovery, retention, sync, listener and metadata
+  /// maintenance): effects whose latency is this node's own.
   Local,
+  /// Caller-registered extension workflows: their own channel, because
+  /// an extension reconciler is the one effect class that routinely
+  /// awaits *other* admitted tasks through its public handle — drawing
+  /// from the local channel would let a workflow occupy the very
+  /// capacity its child writes need (with one local slot, the first
+  /// such workflow deadlocks on itself). Recursive waiting is bounded
+  /// per class: code running inside one class's effect may await tasks
+  /// of other classes, but awaiting another task of the *same* class
+  /// (an extension reconciler awaiting an extension task) can
+  /// self-deadlock on that class's bounded budget, so reconcile code
+  /// must never do it.
+  Extension,
 }
 
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
@@ -890,6 +907,12 @@ pub(crate) async fn notify_resource_observers(
 /// [`ExtensionRegistry::register_task_reconciler`](crate::ExtensionRegistry::register_task_reconciler)
 /// under a caller-owned tag and dispatched by the `tasks().submit`
 /// admission.
+///
+/// A reconciler runs on the extension slot channel: it may freely await
+/// core verbs (the local and network classes) through its handle, but
+/// must never await another extension-kind task — the extension
+/// channel's bounded budget is not reentrant, and same-class recursive
+/// waiting can self-deadlock (see `SlotClass`).
 pub trait TaskReconciler: std::fmt::Debug + Send + Sync + 'static {
   /// Produces the effect for one attempt. `Ok(Succeeded)` completes the
   /// task, `Ok(Retry)` re-arms the retry schedule without progress, and
@@ -1136,9 +1159,15 @@ mod tests {
     // slot for a whole dial deadline.
     assert_eq!(TaskKind::Join.slot_class(), SlotClass::Network);
     assert_eq!(TaskKind::Connect.slot_class(), SlotClass::Network);
+    // Caller-registered extension kinds draw their own channel: a
+    // workflow awaiting core verbs through its handle must never
+    // occupy the local capacity its children need.
+    assert_eq!(
+      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/x").expect("tag")).slot_class(),
+      SlotClass::Extension
+    );
     // Everything else — resource writes, credentials, leave, and the
-    // maintenance kinds — draws from the local channel, and so do the
-    // caller-registered extension kinds.
+    // maintenance kinds — draws from the local channel.
     for kind in [
       TaskKind::Leave,
       TaskKind::Disconnect,
@@ -1157,7 +1186,6 @@ mod tests {
       TaskKind::StartRecovery,
       TaskKind::ApplyReceiptRetention,
       TaskKind::SyncRound,
-      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/x").expect("tag")),
     ] {
       assert_eq!(kind.slot_class(), SlotClass::Local, "{kind:?}");
     }
