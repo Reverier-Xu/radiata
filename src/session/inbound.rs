@@ -85,7 +85,9 @@ impl SessionGrant {
 /// One admitted incoming stream: its bounded body channel, the next
 /// expected chunk sequence, the immutable opening-context digest that
 /// decides duplicate handling, and the admission wall-clock time reported
-/// by identical retransmissions.
+/// by identical retransmissions. The entry deliberately holds no consumer
+/// budget: the consumer task owns its reserved slot for its whole life,
+/// which outlives this table entry's wire stream.
 struct AdmittedStream {
   stream: mpsc::Sender<StreamItem>,
   next_sequence: u64,
@@ -517,6 +519,19 @@ async fn admit_open(
         if incoming.len() >= context.policy.queue_messages {
           break 'status AckStatus::Overloaded;
         }
+        // The consumer's lifecycle slot is reserved BEFORE admission and
+        // handed to the consumer task: a stream whose wire stream ends still
+        // holds its slot until the accept future finishes, so the node-wide
+        // budget — not the per-session table — bounds the running consumer
+        // population (audit P1-2).
+        let Some(permit) = context.live_consumers.reserve() else {
+          debug!(
+            trace_id = %trace_id,
+            budget = context.live_consumers.limit(),
+            "node consumer lifecycle budget exhausted; open refused"
+          );
+          break 'status AckStatus::Overloaded;
+        };
         let admitted_at = clock_millis(context.clock.as_ref());
         let (stream, body) = mpsc::channel(INCOMING_STREAM_CHUNKS + INCOMING_STREAM_TERMINAL_SLOTS);
         incoming.insert(
@@ -541,6 +556,10 @@ async fn admit_open(
         let consumer_trace = trace_id.clone();
         debug!(trace_id = %consumer_trace, "incoming consumer spawned");
         consumers.spawn(async move {
+          // The admission slot is held for the consumer's whole life —
+          // including its post-wire-EOF work and the node-scoped drain that
+          // joins it after a session teardown — and released here.
+          let _permit = permit;
           let result = consumer.accept(packet).await;
           if let Err(error) = &result {
             // An admitted stream whose consumer failed is an operational
@@ -2141,5 +2160,403 @@ mod slow_consumer_tests {
       );
       tokio::time::sleep(Duration::from_millis(1)).await;
     }
+  }
+}
+
+#[cfg(test)]
+mod consumer_lifecycle_tests {
+  use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::Duration,
+  };
+
+  use futures_util::{StreamExt as _, future::BoxFuture};
+
+  use super::{FrameSource, SessionGrant, read_loop};
+  use crate::{
+    ExtensionRegistry, FeatureTag, IncomingStream, NodeId, ProtocolTag, TraceId,
+    extension_registry::{PacketConsumer, ProtocolDefinition},
+    identity::testing::SequenceEntropy,
+    node::EventHub,
+    packet::wire::{AckStatus, OpenFrame},
+    protocol::{
+      CONTROL_CBOR_LIMITS,
+      wire::{BASE_SCHEMA_ID, PacketKind},
+    },
+    routing::forward::SessionIdentity,
+    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    transport::{Received, connection::Message},
+  };
+
+  const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
+  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// The authenticated grant of one test session: a distinct incarnation
+  /// per `peer`, carrying the feature set a real handshake would negotiate
+  /// for the test protocol.
+  fn grant(peer: u8, incarnation: u32) -> SessionGrant {
+    SessionGrant::new(
+      SessionIdentity::new(
+        node(peer),
+        crate::SessionId::parse(&format!("session-{incarnation:021}")).unwrap(),
+      ),
+      vec![FeatureTag::parse(FEATURE).unwrap()],
+    )
+  }
+
+  /// A consumer that waits for its level-triggered gate before finishing —
+  /// the post-wire-EOF work the lifecycle budget must carry — and records
+  /// every trace it accepted.
+  #[derive(Debug)]
+  struct GatedConsumer {
+    gate: tokio::sync::watch::Receiver<bool>,
+    accepted: Arc<Mutex<Vec<TraceId>>>,
+  }
+
+  impl PacketConsumer for GatedConsumer {
+    fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, crate::Result<()>> {
+      let mut gate = self.gate.clone();
+      let trace_id = packet.trace_id().clone();
+      let accepted = Arc::clone(&self.accepted);
+      Box::pin(async move {
+        while !*gate.borrow_and_update() {
+          let _ = gate.changed().await;
+        }
+        // Drain whatever terminal the body carries; the lifecycle budget
+        // observes the accept future, not the body itself.
+        let mut body = packet.body();
+        while body.next().await.is_some() {}
+        accepted.lock().unwrap().push(trace_id);
+        Ok(())
+      })
+    }
+  }
+
+  /// Yields the queued wire messages in order, then ends the session
+  /// orderly.
+  struct FramesSource {
+    messages: std::collections::VecDeque<Message>,
+  }
+
+  impl FrameSource for FramesSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      let message = self.messages.pop_front();
+      Box::pin(async move { Ok(message.map(Received::Message)) })
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      0
+    }
+  }
+
+  fn open_message(seed: u32, peer: u8) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::Open.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_open(&OpenFrame {
+        trace_id: trace(seed),
+        source: node(peer),
+        destination: node(1),
+        protocol: ProtocolTag::parse(PROTOCOL).unwrap(),
+        metadata: crate::StreamMetadata::new(),
+        route: None,
+      })
+      .unwrap(),
+    }
+  }
+
+  fn end_message(seed: u32) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(seed),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    }
+  }
+
+  /// The node context of a session-serving runtime: the node-wide consumer
+  /// budget shrunk to `budget` so the lifecycle is observable without the
+  /// production-scale population.
+  fn context(consumer: Arc<GatedConsumer>, budget: usize) -> Arc<SessionPacketContext> {
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        consumer as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    Arc::new(
+      SessionPacketContext::new(
+        node(1),
+        Arc::new(registry),
+        SessionPolicy::new(
+          8,
+          1 << 20,
+          Duration::from_secs(30),
+          Duration::from_secs(5),
+          Duration::from_secs(15),
+        ),
+        crate::runtime::RuntimeClient::routing_only(
+          tokio::sync::mpsc::channel(4).0,
+          Arc::new(Mutex::new(BTreeMap::new())),
+        ),
+        Arc::new(crate::time::HostWallClock),
+        entropy,
+        Arc::new(EventHub::new()),
+        crate::routing::DefaultNextHop::tag().unwrap(),
+        Arc::new(Mutex::new(BTreeMap::new())),
+        Arc::new(Mutex::new(BTreeMap::new())),
+        None,
+        8,
+        16,
+        Arc::new(Mutex::new(Vec::new())),
+        CONTROL_CBOR_LIMITS,
+        Duration::from_secs(5),
+      )
+      .with_live_consumer_budget(budget),
+    )
+  }
+
+  /// Waits until every gated consumer of `count` finished, bounded by a
+  /// wall-clock deadline.
+  async fn consumers_finish(consumer: &GatedConsumer, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      if consumer.accepted.lock().unwrap().len() >= count {
+        return;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the gated consumers must finish after their gate opens"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  /// Regression (audit P1-2): the wire stream's end frees the per-session
+  /// table slot, but the consumer's lifecycle slot is held until the accept
+  /// future finishes — the post-EOF work is legitimate and is never
+  /// cancelled at the wire end. Repeated complete streams accumulate their
+  /// reservations, and the budget releases each one exactly when its
+  /// consumer terminates.
+  #[tokio::test]
+  async fn complete_wire_streams_keep_their_consumer_slots_after_eof() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      accepted: Arc::new(Mutex::new(Vec::new())),
+    });
+    let context = context(Arc::clone(&consumer), 8);
+    let grant = grant(2, 1);
+    let (frames, _frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Four complete wire streams: every End frees the table entry, so the
+    // per-session bound would admit a fifth — the node budget must still
+    // see the four live consumers.
+    let mut messages = Vec::new();
+    for seed in 1_u32..=4 {
+      messages.push(open_message(seed, 2));
+      messages.push(end_message(seed));
+    }
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the gated consumers never block the read loop");
+
+    assert_eq!(
+      context.live_consumers.in_use(),
+      4,
+      "every post-EOF consumer still holds its lifecycle slot"
+    );
+
+    gate_tx.send(true).unwrap();
+    consumers_finish(&consumer, 4).await;
+    assert_eq!(
+      context.live_consumers.in_use(),
+      0,
+      "a finished consumer releases its lifecycle slot"
+    );
+  }
+
+  /// Regression (audit P1-2): past the node-wide budget, a new open is
+  /// refused with the typed `Overloaded` backpressure — never admitted
+  /// beyond the running-consumer bound — and no consumer runs for the
+  /// refused stream. The slots return once the stalled consumers finish.
+  #[tokio::test]
+  async fn an_exhausted_consumer_budget_refuses_new_opens_with_typed_overload() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      accepted: Arc::new(Mutex::new(Vec::new())),
+    });
+    let context = context(Arc::clone(&consumer), 2);
+    let grant = grant(2, 1);
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Two complete wire streams whose consumers stay parked past EOF; the
+    // third open finds the node budget exhausted even though the per-session
+    // table is empty again.
+    let mut messages = Vec::new();
+    for seed in 1_u32..=2 {
+      messages.push(open_message(seed, 2));
+      messages.push(end_message(seed));
+    }
+    messages.push(open_message(3, 2));
+    messages.push(end_message(3));
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the gated consumers never block the read loop");
+
+    // Every outcome is on the wire: dropping the session queue's last
+    // sender ends the ack stream so the statuses collect exhaustively
+    // instead of waiting on a channel that never closes.
+    drop(frames);
+    let mut statuses = Vec::new();
+    while let Some(frame) = frames_rx.recv().await {
+      let ack = crate::packet::wire::decode_ack(&frame.body, CONTROL_CBOR_LIMITS).unwrap();
+      statuses.push((ack.trace_id, ack.status));
+    }
+    assert_eq!(
+      statuses,
+      vec![
+        (trace(1), AckStatus::Admitted),
+        (trace(2), AckStatus::Admitted),
+        (trace(3), AckStatus::Overloaded),
+      ],
+      "the exhausted budget is typed backpressure, not silent growth"
+    );
+    assert_eq!(context.live_consumers.in_use(), 2);
+
+    gate_tx.send(true).unwrap();
+    consumers_finish(&consumer, 2).await;
+    assert_eq!(context.live_consumers.in_use(), 0);
+  }
+
+  /// Regression (audit P1-2): a retired session hands its consumers to the
+  /// node-scoped drain, and their lifecycle reservations survive that
+  /// transfer — and across sessions: the next session's admissions count
+  /// against the same node-wide budget, and every reservation returns when
+  /// the drained consumers finish.
+  #[tokio::test]
+  async fn retired_sessions_keep_their_reservations_through_the_node_drain() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      accepted: Arc::new(Mutex::new(Vec::new())),
+    });
+    let context = context(Arc::clone(&consumer), 8);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Session A: one complete stream, then the session ends orderly — the
+    // consumer keeps running under the node drain.
+    let (frames_a, _frames_a_rx) = test_queue(16, 1 << 20);
+    let mut source = FramesSource {
+      messages: vec![open_message(1, 2), end_message(1)].into(),
+    };
+    let grant_a = grant(2, 1);
+    read_loop(
+      &mut source,
+      &grant_a,
+      &context,
+      &frames_a,
+      &pending_acks,
+      &last_activity,
+    )
+    .await;
+    assert_eq!(
+      context.live_consumers.in_use(),
+      1,
+      "the retired session's consumer still holds its slot through the drain"
+    );
+
+    // Session B (a different peer incarnation) counts against the same
+    // node-wide budget while A's consumer is still running.
+    let (frames_b, _frames_b_rx) = test_queue(16, 1 << 20);
+    let mut source = FramesSource {
+      messages: vec![open_message(2, 3), end_message(2)].into(),
+    };
+    let grant_b = grant(3, 7);
+    read_loop(
+      &mut source,
+      &grant_b,
+      &context,
+      &frames_b,
+      &pending_acks,
+      &last_activity,
+    )
+    .await;
+    assert_eq!(
+      context.live_consumers.in_use(),
+      2,
+      "the node budget accumulates across retired sessions"
+    );
+    assert_eq!(
+      context.task_drains.lock().unwrap().len(),
+      2,
+      "each retired session handed its consumers to the node drain"
+    );
+
+    // The drained consumers finish and release their reservations.
+    gate_tx.send(true).unwrap();
+    consumers_finish(&consumer, 2).await;
+    let drains: Vec<_> = context.task_drains.lock().unwrap().drain(..).collect();
+    for drain in drains {
+      drain.await.unwrap();
+    }
+    assert_eq!(
+      context.live_consumers.in_use(),
+      0,
+      "every reservation returns when the drained consumers finish"
+    );
   }
 }
