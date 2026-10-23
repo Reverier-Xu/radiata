@@ -670,11 +670,16 @@
 //!
 //! Two sizes are worth knowing, and the defaults already answer both:
 //!
-//! - **Memory** is roughly `queue bytes × live neighbors` plus local
-//!   diagnostics and storage. The degree contract gives "live neighbors" a
-//!   practical ceiling: every node maintains about `k(n)` sessions (seven at 64
-//!   members, growing with the logarithm of the cluster), so a 64-node member
-//!   holds roughly `8 MiB × 7 ≈ 56 MiB` of queue capacity at the defaults.
+//! - **Memory** is roughly `queue bytes × live sessions` plus local diagnostics
+//!   and storage. The degree target shapes the typical count — about `k(n)`
+//!   maintenance sessions (seven at 64 members, growing with the logarithm of
+//!   the cluster) — but it is not a ceiling: the plane never prunes, so
+//!   application-initiated, inbound (hub-side), and bridge-probe sessions all
+//!   stay on top of the target. Plan against the live session count
+//!   [`node.connection_degree()`](crate::NodeHandle::connection_degree)
+//!   reports: a 64-node member at the defaults holds roughly `8 MiB` of
+//!   outbound queue capacity per live session — `8 MiB × 7 ≈ 56 MiB` at the
+//!   typical count, more on a hub.
 //!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
 //!   and the degree override are the two knobs that change it materially.
 //! - **Background load** is the reconciliation plane ([chapter
