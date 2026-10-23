@@ -75,7 +75,15 @@
 //! Collected tombstone rows are filtered
 //! at the scan and the receive boundary alike (collected evidence never
 //! enters an engine), so the checkpoint GC stops propagating reclaimed
-//! rows. The same receive-boundary discipline gates the rows the lane's
+//! rows. The resources lane's swept filter carries the same reclaim
+//! discipline on the retention contract the sweep itself enforces:
+//! only a `removed()` record past its retention deadline whose key the
+//! store no longer holds is reclaimed knowledge (never re-admitted),
+//! while a fresh deletion is legitimate evidence even on a node that
+//! never held the resource — key absence alone was never a reclaim
+//! verdict, and dropping fresh deletions let older live values
+//! resurrect on the nodes that never saw the original record.
+//! The same receive-boundary discipline gates the rows the lane's
 //! apply *refuses* — a stale descriptor revision, a binding for a revoked
 //! subject, an unhealable first install: a refused row never enters an
 //! engine, because the store will refuse it again on every re-delivery
@@ -623,6 +631,10 @@ impl ReconcilePlane {
     } else {
       None
     };
+    // The resources lane's swept predicate reads the host clock once
+    // per scan: the retention deadline is the sweep's own contract, the
+    // one basis on which a gone store key reads as reclaimed knowledge.
+    let swept_at = std::time::SystemTime::now();
     let rows: LaneScan = if plan.is_empty() {
       Vec::new()
     } else {
@@ -769,7 +781,8 @@ impl ReconcilePlane {
             }
             let collected_row =
               lane == LaneId::Tombstones && tombstone_collected(checkpoint, key, content);
-            let swept_row = lane == LaneId::Resources && resource_swept(keys, key, content);
+            let swept_row =
+              lane == LaneId::Resources && resource_swept(keys, key, content, swept_at);
             let deferred_row = lane == LaneId::Resources && deferred_rows.contains(&identity);
             if collected_row || swept_row || (keys.contains(key) && !deferred_row) {
               prune.push((key.to_vec(), content.to_vec()));
@@ -814,7 +827,7 @@ impl ReconcilePlane {
               }
               // The retention-reclaimed exemption: a swept removal row
               // is not repair work — re-applying it is the resurrection.
-              if *lane == LaneId::Resources && resource_swept(keys, key, content) {
+              if *lane == LaneId::Resources && resource_swept(keys, key, content, swept_at) {
                 continue;
               }
               // The deferred exemption's mirror: a deferred row rides
@@ -1052,20 +1065,26 @@ impl ReconcilePlane {
     }
     if !rows.is_empty() && lane == LaneId::Resources {
       // The retention-reclaimed receive filter, the tombstone mirror:
-      // a removal row whose subject the local store does not hold
-      // never enters an engine. Its subject is already gone here —
-      // admitting the row would only materialize a tombstone that the
-      // next sweep deletes again (the resurrection churn), and a newly
-      // primed peer would receive the whole historical removal set.
+      // a removal row past its retention deadline whose subject the
+      // local store no longer holds never enters an engine. The
+      // deadline is the sweep's own contract — the real basis a gone
+      // key needs before it reads as reclaimed knowledge. A fresh
+      // deletion is legitimate evidence even on a node that never held
+      // the resource (an older live value may still arrive later and
+      // must lose to it), so key absence alone never drops it: its
+      // subject is absent here either way, and admitting the row
+      // installs the tombstone that beats the late live value, while
+      // the local sweep reclaims the record at its own deadline.
       let context = self.shared.context()?;
       let store = context.store();
       let namespace = crate::resource::store::namespace()?;
       let snapshot = store.snapshot().await?;
+      let swept_at = std::time::SystemTime::now();
       let mut retained = Vec::with_capacity(rows.len());
       for (key, content) in rows {
         let swept = crate::resource::ResourceRecordV1::decode(&content)
           .ok()
-          .is_some_and(|record| record.removed())
+          .is_some_and(|record| record.removed() && removal_retention_elapsed(&record, swept_at))
           && snapshot
             .get(
               &namespace,
@@ -1467,19 +1486,41 @@ fn tombstone_collected(checkpoint: Option<u64>, key: &[u8], content: &[u8]) -> b
   }
 }
 
+/// Whether one removal record's retention window has elapsed at `now`:
+/// the retention contract the sweep itself enforces
+/// ([`crate::resource::retention`]'s default window is the one the
+/// runtime's retention pass runs), so an elapsed window is the real
+/// basis on which a gone store key reads as reclaimed knowledge —
+/// never key absence alone. A record stamped in the future (clock
+/// skew, or a fixture) is not elapsed: the window runs from the
+/// record's own timestamp, conservatively.
+fn removal_retention_elapsed(
+  record: &crate::resource::ResourceRecordV1, now: std::time::SystemTime,
+) -> bool {
+  now
+    .duration_since(record.timestamp())
+    .is_ok_and(|age| age >= crate::resource::retention::RESOURCE_REMOVAL_RETENTION)
+}
+
 /// Whether one resources-lane row is retention-reclaimed evidence: a
-/// `removed()` record whose key the local store no longer holds (the
-/// sweep deleted it, or the node never held the resource — either way
-/// the terminal row's subject is absent and re-admitting it would only
-/// materialize a tombstone for nothing). The tombstone lane's
-/// collected-mode mirror: swept rows leave the engines (the prune
-/// below), never re-enter them (the receive filter), and a newly
-/// primed peer does not receive the historical removal set back.
-fn resource_swept(keys: &BTreeSet<Vec<u8>>, key: &[u8], content: &[u8]) -> bool {
-  crate::resource::ResourceRecordV1::decode(content)
-    .ok()
-    .is_some_and(|record| record.removed())
-    && !keys.contains(key)
+/// `removed()` record whose retention window has already elapsed while
+/// the local store no longer holds its key. The tombstone lane's
+/// collected-mode mirror, with the retention deadline as the reclaim
+/// basis: key absence alone is not a verdict — a node that never held
+/// the resource knows nothing either way, so a fresh deletion stays
+/// legitimate evidence (dropping it is what let a later, older live
+/// value resurrect), while a record past its retention deadline is
+/// reclaimed knowledge on any node. Swept rows leave the engines (the
+/// prune), never re-enter them (the receive filter), and a newly
+/// primed peer does not receive the expired historical removal set
+/// back.
+fn resource_swept(
+  keys: &BTreeSet<Vec<u8>>, key: &[u8], content: &[u8], now: std::time::SystemTime,
+) -> bool {
+  !keys.contains(key)
+    && crate::resource::ResourceRecordV1::decode(content)
+      .ok()
+      .is_some_and(|record| record.removed() && removal_retention_elapsed(&record, now))
 }
 
 /// Scans the planned lanes' namespaces into canonical
@@ -2867,6 +2908,279 @@ mod tests {
     assert!(
       engine_rows(&shared, &peer, LaneId::Resources).is_empty(),
       "a re-primed peer receives no historical removal set"
+    );
+  }
+
+  /// Stores one writer's descriptor so the resources page apply
+  /// resolves and accepts its signed records.
+  async fn trusted_resource_writer(context: &Arc<LocalIdentityContext>, value: u64) {
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      node(value),
+      key(value),
+      vec![crate::Endpoint::parse("wss://127.0.0.1:3").unwrap()],
+      1,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(
+      context.store(),
+      &crate::api::SystemEntropy,
+      &descriptor,
+    )
+    .await
+    .unwrap();
+  }
+
+  /// One signed resources-lane record row for `name`: the row shape
+  /// `(key, content)` exactly as a peer's ROWS message carries it.
+  fn signed_resource_row(
+    name: &crate::ResourceName, writer_value: u64, stamp: u64, removed: bool,
+  ) -> (Vec<u8>, Vec<u8>) {
+    let signing = crate::identity::testing::scripted_signing(writer_value);
+    let record = crate::resource::ResourceRecordV1::sign(
+      name.clone(),
+      crate::LabelValue::parse("document").unwrap(),
+      crate::ResourceUri::parse("file:///record").unwrap(),
+      crate::LabelSet::new(),
+      stamp,
+      node(writer_value),
+      if removed { 1 } else { 0 },
+      removed,
+      &signing,
+    )
+    .unwrap();
+    (name.as_str().as_bytes().to_vec(), record.encode().unwrap())
+  }
+
+  /// A02/P1-1: the swept predicate's reclaim basis is the retention
+  /// deadline, never key absence alone — a fresh removal for a key the
+  /// store does not hold is unseen-key evidence, not reclaimed
+  /// knowledge, while the same shape past the deadline is exactly what
+  /// the sweep deletes and never re-admits.
+  #[test]
+  fn the_swept_predicate_needs_the_retention_deadline_not_key_absence() {
+    let fresh_stamp = crate::time::now_millis();
+    let expired_stamp = 1_000_u64;
+    let name = crate::ResourceName::parse("radiata.woooo.tech/resources/predicate").unwrap();
+    let now = std::time::SystemTime::now();
+    let mut held: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let (key, fresh_removal) = signed_resource_row(&name, 721, fresh_stamp, true);
+    let (_, expired_removal) = signed_resource_row(&name, 721, expired_stamp, true);
+    let (_, live_row) = signed_resource_row(&name, 721, fresh_stamp, false);
+    // An absent key with a fresh removal is an unseen resource: the
+    // deletion evidence stays legitimate within the retention contract.
+    assert!(
+      !super::resource_swept(&held, &key, &fresh_removal, now),
+      "a fresh removal for an unseen key is not swept"
+    );
+    // The same shape past the retention deadline is reclaimed knowledge.
+    assert!(
+      super::resource_swept(&held, &key, &expired_removal, now),
+      "an expired removal with the key gone is swept"
+    );
+    // A key the store still holds is never reclaim evidence, whatever
+    // the record's age: the sweep deletes nothing that is still there.
+    held.insert(key.clone());
+    assert!(
+      !super::resource_swept(&held, &key, &expired_removal, now),
+      "a held key is not swept"
+    );
+    // Live rows never enter the swept predicate at all.
+    held.remove(&key);
+    assert!(
+      !super::resource_swept(&held, &key, &live_row, now),
+      "a live row for an absent key is not swept"
+    );
+  }
+
+  /// A02/P1-1: a fresh deletion for a resource this node has never held
+  /// is legitimate evidence, not reclaimed knowledge. The receive
+  /// boundary keeps it (the store installs the tombstone), and the
+  /// older live value arriving afterwards loses the register's tuple
+  /// contest instead of resurrecting — the ordering a key-absence
+  /// filter broke by dropping the deletion first.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_fresh_removal_for_an_unseen_resource_beats_the_older_live_row() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    trusted_resource_writer(&context, 731).await;
+    let name =
+      crate::ResourceName::parse("radiata.woooo.tech/resources/unseen-removal-first").unwrap();
+    let fresh = crate::time::now_millis();
+    let (removal_key, removal) = signed_resource_row(&name, 731, fresh, true);
+    let (_, older_live) = signed_resource_row(&name, 731, fresh - 60_000, false);
+
+    // Removal first, on a node that never saw the live record.
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Resources,
+          rows: vec![crate::reconcile::wire::Row {
+            key: removal_key.clone(),
+            content: removal.clone(),
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    let stored = crate::resource::store::read_record_ctx(context.store(), &name)
+      .await
+      .unwrap()
+      .expect("the fresh deletion installed as the register's winner");
+    assert!(
+      stored.removed(),
+      "the unseen-key deletion evidence survived"
+    );
+    assert_eq!(
+      engine_rows(&shared, &peer, LaneId::Resources).len(),
+      1,
+      "the deletion row entered the engine"
+    );
+
+    // The older live value arrives later and must lose.
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Resources,
+          rows: vec![crate::reconcile::wire::Row {
+            key: removal_key.clone(),
+            content: older_live.clone(),
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    let stored = crate::resource::store::read_record_ctx(context.store(), &name)
+      .await
+      .unwrap()
+      .expect("the register still holds the deletion");
+    assert!(
+      stored.removed(),
+      "the older live value lost the contest to the earlier deletion"
+    );
+    // The epoch pass prunes the superseded live identity out of the
+    // engine; the deletion row keeps its seat.
+    plane.tick(&runtime).await.unwrap();
+    let rows = engine_rows(&shared, &peer, LaneId::Resources);
+    assert_eq!(rows.len(), 1, "only the deletion identity remains");
+    assert_eq!(rows[0].1, removal, "the engine holds the deletion row");
+  }
+
+  /// A02/P1-1: the same convergence from the opposite delivery order,
+  /// plus the duplicate delivery — the live value arriving first
+  /// installs, the fresh removal arriving second (twice: duplicate and
+  /// re-ordered redeliveries are the epidemic norm) wins the register,
+  /// and the duplicate changes nothing.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_out_of_order_and_duplicate_removal_delivery_converges() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    trusted_resource_writer(&context, 741).await;
+    let name =
+      crate::ResourceName::parse("radiata.woooo.tech/resources/unseen-live-first").unwrap();
+    let fresh = crate::time::now_millis();
+    let (row_key, older_live) = signed_resource_row(&name, 741, fresh - 60_000, false);
+    let (_, removal) = signed_resource_row(&name, 741, fresh, true);
+
+    let deliver_row = |content: Vec<u8>| {
+      let plane_ref = &plane;
+      let runtime_ref = &runtime;
+      let peer_ref = &peer;
+      let key = row_key.clone();
+      async move {
+        plane_ref
+          .deliver(
+            runtime_ref,
+            peer_ref,
+            crate::reconcile::wire::Message::Rows {
+              lane: LaneId::Resources,
+              rows: vec![crate::reconcile::wire::Row { key, content }],
+            },
+          )
+          .await
+          .unwrap();
+      }
+    };
+
+    // Live first: the node never saw the resource, so the live value
+    // installs as the first winner.
+    deliver_row(older_live).await;
+    let stored = crate::resource::store::read_record_ctx(context.store(), &name)
+      .await
+      .unwrap()
+      .expect("the live value installed");
+    assert!(!stored.removed());
+
+    // The fresh removal wins the register — delivered twice.
+    deliver_row(removal.clone()).await;
+    deliver_row(removal.clone()).await;
+    let stored = crate::resource::store::read_record_ctx(context.store(), &name)
+      .await
+      .unwrap()
+      .expect("the register holds a record");
+    assert!(
+      stored.removed(),
+      "the fresh removal won the register over the older live value"
+    );
+    // The epoch pass leaves exactly the removal identity in the engine.
+    plane.tick(&runtime).await.unwrap();
+    let rows = engine_rows(&shared, &peer, LaneId::Resources);
+    assert_eq!(rows.len(), 1, "one identity after the supersession prune");
+    assert_eq!(rows[0].1, removal, "the engine holds the removal row");
+  }
+
+  /// A02/P1-1: the flip side of the deadline basis — an expired removal
+  /// for a key this node never held is reclaimed knowledge under the
+  /// retention contract, so the receive boundary drops it exactly like
+  /// a swept row: no tombstone materializes, no engine seat, and the
+  /// historical removal set never floods a node that never saw it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_expired_removal_for_an_unseen_key_stays_reclaimed_knowledge() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    trusted_resource_writer(&context, 751).await;
+    let name = crate::ResourceName::parse("radiata.woooo.tech/resources/expired-unseen").unwrap();
+    let (row_key, expired) = signed_resource_row(&name, 751, 1_000, true);
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Resources,
+          rows: vec![crate::reconcile::wire::Row {
+            key: row_key,
+            content: expired,
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    assert!(
+      crate::resource::store::read_record_ctx(context.store(), &name)
+        .await
+        .unwrap()
+        .is_none(),
+      "the expired removal never materialized a tombstone"
+    );
+    assert!(
+      engine_rows(&shared, &peer, LaneId::Resources).is_empty(),
+      "the expired removal never entered the engine"
     );
   }
 
