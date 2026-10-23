@@ -625,7 +625,7 @@ impl ManagerShared {
     }
     let transition = crate::task::TaskTransition::new(id.clone(), kind.clone(), from, to);
     self.observations.schedule(
-      id.clone(),
+      id.as_str(),
       "action hook observation",
       Box::pin(async move {
         crate::task::notify_action_hooks(&hooks, &transition).await;
@@ -668,11 +668,20 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
   let shared = Arc::new(ManagerShared {
     table,
     clock: deps.clock,
-    operations: deps.operations,
+    operations: Arc::clone(&deps.operations),
     leave_complete: deps.leave_complete,
     slots: ReconcileChannels::new(local_slots, network_slots),
     observations: crate::task::ObservationLanes::new(),
   });
+  // The bounded observation lanes' scheduling half joins the operation
+  // deps here — before any effect can run — so the resource-write
+  // effects schedule their post-commit observations onto the same
+  // lanes this manager owns and aborts at drain. The manager keeps the
+  // runner handles: the lanes die with the incarnation, never with the
+  // operation deps' lifetime.
+  shared
+    .operations
+    .install_observation_lanes(shared.observations.scheduler());
   let (reports_tx, reports_rx) = mpsc::unbounded_channel();
   let task = tokio::spawn(run_manager(
     shared,
