@@ -144,6 +144,11 @@ pub(crate) struct MetadataStore {
   ready_notify: tokio::sync::Notify,
   clock: Arc<dyn WallClock>,
   receipt_retention: Duration,
+  /// The retention pass' in-memory resumption cursor (see
+  /// `receipt::RetentionScanCursor`): each bounded pass resumes after
+  /// the last anchor key it examined instead of rescanning the same
+  /// retained prefix forever.
+  retention_scan_cursor: receipt::RetentionScanCursor,
   /// The register-install epoch: one monotonic bump per installed
   /// resource record commit (see [`Self::note_local_write`]), so
   /// the sync driver observes local catalog changes with one atomic
@@ -285,6 +290,7 @@ impl MetadataStore {
       ready_notify: tokio::sync::Notify::new(),
       clock,
       receipt_retention,
+      retention_scan_cursor: receipt::RetentionScanCursor::default(),
       register_epoch: std::sync::atomic::AtomicU64::new(0),
       namespace_epochs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
       untracked_epoch: std::sync::atomic::AtomicU64::new(0),
