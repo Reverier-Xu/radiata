@@ -43,8 +43,8 @@ use std::{
 use tracing::debug;
 
 use super::{
-  recovery::recovery_endpoint,
-  supervisor::{Supervisor, TickState, dial_member},
+  recovery::{recovery_endpoint, spawn_member_dial},
+  supervisor::{Supervisor, TickState},
 };
 use crate::{Error, NodeId, Result};
 
@@ -289,69 +289,36 @@ impl TickState {
     Ok(())
   }
 
-  /// Spawns one maintenance dial in its own task: the maintenance
-  /// worker never blocks on a handshake, and the in-flight slot releases
-  /// when the dial resolves (success, refusal, or deadline).
+  /// Spawns one maintenance dial through the shared member dial
+  /// lifecycle (see `runtime/recovery.rs`): the maintenance worker never
+  /// blocks on a handshake, the scoped permit releases the in-flight
+  /// slot on completion, panic, or cancellation, and the JoinHandle
+  /// joins the tracked connection-task set — the probe dials through
+  /// this exact path.
   fn spawn_maintenance_dial(&self, peer: NodeId, receiver: crate::Endpoint) {
-    let transport = match self.extensions.resolve_transport(&receiver.selector()) {
-      Ok(transport) => transport,
-      // No transport for the endpoint: the dial cannot even start; the
-      // next tick picks again (possibly the same member).
-      Err(error) => {
-        debug!(
-          peer = %peer.as_str(),
-          endpoint = %receiver.as_str(),
-          kind = ?error.kind(),
-          "degree maintenance dial unresolvable"
-        );
-        return;
-      }
-    };
-    self
-      .maintenance_pending
-      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pending = Arc::clone(&self.maintenance_pending);
-    let driver = self.driver.clone();
-    let sessions = self.sessions.clone();
-    let packet = self.packet.clone();
-    let shutdown = self.shutdown.clone();
-    let connection_tasks = self.connection_tasks.clone();
-    let dial_deadline = self.config.dial_deadline();
-    let dial = tokio::spawn(async move {
-      if let Err(error) = dial_member(
-        transport,
-        driver,
-        sessions,
-        packet,
-        shutdown,
-        connection_tasks,
-        receiver,
-        &peer,
-        // Ordinary caller-class edge: the recovery plane's redundancy
-        // pruning never reclaims a maintenance edge (additive-only).
-        false,
-        dial_deadline,
-      )
-      .await
-      {
-        debug!(
-          peer = %peer.as_str(),
-          kind = ?error.kind(),
-          "degree maintenance dial failed"
-        );
-      }
-      pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    });
-    // The maintenance dial's JoinHandle joins the same tracked
-    // connection-task set as the recovery dials (audit finding #19): the
-    // recovery tick reaps finished handles and the shutdown path drains
-    // the rest inside its bounded cooperative window, aborting only the
-    // stragglers, so an in-flight maintenance handshake is owned and
-    // torn down with the node instead of outliving it.
-    if let Ok(mut handles) = self.connection_tasks.lock() {
-      handles.push(dial);
-    }
+    spawn_member_dial(
+      self,
+      Arc::clone(&self.maintenance_pending),
+      peer,
+      receiver,
+      // Ordinary caller-class edge: the recovery plane's redundancy
+      // pruning never reclaims a maintenance edge (additive-only).
+      false,
+      report_maintenance_dial_failure,
+    );
   }
+}
+
+/// The maintenance plane's failure diagnostics for the shared dial
+/// lifecycle: a failed deficit or probe dial is the expected outcome
+/// while a partition or outage persists — recorded at debug only, never
+/// an error condition.
+fn report_maintenance_dial_failure(peer: &NodeId, error: &Error) {
+  debug!(
+    peer = %peer.as_str(),
+    kind = ?error.kind(),
+    "degree maintenance dial failed"
+  );
 }
 
 impl Supervisor {
@@ -392,12 +359,75 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::Arc;
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
 
   use crate::runtime::supervisor::test_support::{
-    self, insert_live_session, install_member, member_id, refusing_peer, silent_peer,
+    self, insert_live_session, install_member, member_id, member_key, refusing_peer, silent_peer,
     supervisor_over,
   };
+
+  /// Installs one active member whose only endpoint addresses the
+  /// panicking custom transport: descriptor through the supervisor's
+  /// store plus the trusted binding injected into the reference factory
+  /// — the same pair `test_support::install_member` lays down for a wss
+  /// endpoint.
+  async fn install_panicking_member(
+    supervisor: &crate::runtime::supervisor::Supervisor,
+    reference: &Arc<crate::storage::contract::ReferenceFactory>, seed: u64, endpoint: &str,
+  ) {
+    let node = member_id(seed);
+    let endpoints = vec![crate::Endpoint::parse(endpoint).unwrap()];
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      node.clone(),
+      member_key(seed),
+      endpoints,
+      1,
+      false,
+      1,
+    );
+    crate::membership::store::store_descriptor_ctx(
+      supervisor.context().unwrap().store(),
+      supervisor.dependencies.entropy.as_ref(),
+      &descriptor,
+    )
+    .await
+    .unwrap();
+    let (namespace, key) = crate::identity::records::identity_binding_key(&node).unwrap();
+    let binding = crate::identity::records::IdentityBindingV1::new(node, member_key(seed));
+    crate::identity::testing::inject_entry(reference, (namespace, key), binding.encode().unwrap());
+  }
+
+  /// A caller-registered transport whose connect future counts the
+  /// attempt and then panics mid-dial: P2-12's exact shape — a custom
+  /// transport future unwinding through the dial task. The attempt
+  /// counter is the observable: it rising again after the panic proves a
+  /// later dial still launched, which the leaked in-flight counter made
+  /// impossible.
+  #[derive(Debug)]
+  struct PanickingWire {
+    attempts: Arc<AtomicUsize>,
+  }
+
+  impl crate::TransportProvider for PanickingWire {
+    fn bind(
+      &self, _endpoint: crate::Endpoint,
+    ) -> crate::BoxFuture<'static, crate::Result<Box<dyn crate::ProviderListener>>> {
+      Box::pin(async { Err(crate::Error::not_found("listener")) })
+    }
+
+    fn connect(
+      &self, _endpoint: crate::Endpoint,
+    ) -> crate::BoxFuture<'static, crate::Result<Box<dyn crate::TransportStream>>> {
+      let attempts = Arc::clone(&self.attempts);
+      Box::pin(async move {
+        attempts.fetch_add(1, Ordering::Relaxed);
+        panic!("the custom transport's connect future panics mid-dial");
+      })
+    }
+  }
 
   /// The maintenance tick's wiring: with one live session and four
   /// dialable members, the derived plan for five nodes is k(5) = 3, so
@@ -1119,5 +1149,104 @@ mod tests {
       super::DEGREE_MAINTENANCE_TICK_PERIOD,
       std::time::Duration::from_secs(30)
     );
+  }
+
+  /// P2-12's maintenance shape: a caller-supplied transport whose
+  /// connect future panics mid-dial must not strand its in-flight slot.
+  /// The manual `fetch_add`/`fetch_sub` pair decremented after the
+  /// await, so the panic skipped the decrement — and both the deficit
+  /// gate and the bridge-probe gate read this counter, so every later
+  /// tick deferred ("truncated at the in-flight budget") until restart.
+  /// With the scoped permit the slot releases on the unwind and the next
+  /// tick dials again; the probe shares this exact dial path.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_panicking_transport_future_releases_its_maintenance_slot() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let mut ticks = supervisor.tick_state().unwrap();
+    // Point the plane's transport resolution at the panicking custom
+    // transport: the ticks resolve endpoints through this registry.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut extensions = crate::ExtensionRegistry::new();
+    extensions
+      .register_transport(
+        crate::TransportName::parse("panicwire").unwrap(),
+        Arc::new(PanickingWire {
+          attempts: Arc::clone(&attempts),
+        }),
+      )
+      .unwrap();
+    ticks.extensions = Arc::new(extensions);
+
+    // A three-node cluster (k(3) = 2): member 101 is connected through
+    // a live session, member 102 is unconnected and only dialable
+    // through the panicking transport — the deficit of one is exactly
+    // one dial of 102, deterministically.
+    let (connected_port, _connected_connections, connected_holder) = silent_peer().await;
+    install_member(&supervisor, &reference, 101, &[connected_port]).await;
+    install_panicking_member(&supervisor, &reference, 102, "panicwire://unreachable").await;
+    insert_live_session(&sessions, member_id(101), ticks.entropy.as_ref());
+
+    // First tick: the deficit dial starts and the custom transport's
+    // future panics mid-dial.
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      loop {
+        if attempts.load(Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the maintenance tick must dial the panicking transport");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      loop {
+        if ticks
+          .maintenance_pending
+          .load(std::sync::atomic::Ordering::Relaxed)
+          == 0
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the panicking dial must release its in-flight slot");
+
+    // The gate reads the released counter: the next tick dials again.
+    // Under the leaked counter this tick truncated at the budget gate
+    // forever and the attempt count froze at one.
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      loop {
+        if attempts.load(Ordering::Relaxed) >= 2 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the next tick must still dial after the panic");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      loop {
+        if ticks
+          .maintenance_pending
+          .load(std::sync::atomic::Ordering::Relaxed)
+          == 0
+        {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the second panicking dial must release its in-flight slot too");
+    connected_holder.abort();
   }
 }
