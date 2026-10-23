@@ -43,8 +43,8 @@ use std::{
 use tracing::debug;
 
 use super::{
-  recovery::{DialPermit, recovery_endpoint},
-  supervisor::{Supervisor, TickState, dial_member},
+  recovery::{recovery_endpoint, spawn_member_dial},
+  supervisor::{Supervisor, TickState},
 };
 use crate::{Error, NodeId, Result};
 
@@ -289,72 +289,36 @@ impl TickState {
     Ok(())
   }
 
-  /// Spawns one maintenance dial in its own task: the maintenance
-  /// worker never blocks on a handshake, and the in-flight slot releases
-  /// through the scoped permit on every exit — success, refusal,
-  /// deadline, a panic in the transport's future, or cancellation.
+  /// Spawns one maintenance dial through the shared member dial
+  /// lifecycle (see `runtime/recovery.rs`): the maintenance worker never
+  /// blocks on a handshake, the scoped permit releases the in-flight
+  /// slot on completion, panic, or cancellation, and the JoinHandle
+  /// joins the tracked connection-task set — the probe dials through
+  /// this exact path.
   fn spawn_maintenance_dial(&self, peer: NodeId, receiver: crate::Endpoint) {
-    let transport = match self.extensions.resolve_transport(&receiver.selector()) {
-      Ok(transport) => transport,
-      // No transport for the endpoint: the dial cannot even start; the
-      // next tick picks again (possibly the same member).
-      Err(error) => {
-        debug!(
-          peer = %peer.as_str(),
-          endpoint = %receiver.as_str(),
-          kind = ?error.kind(),
-          "degree maintenance dial unresolvable"
-        );
-        return;
-      }
-    };
-    // The scoped permit holds this dial's slot for the whole task: a
-    // live local across the dial's await, dropped on completion, panic
-    // unwind, or cancellation — the deficit gate and the bridge-probe
-    // gate above read this counter, so a stranded slot would defer
-    // every later tick (audit P2-12).
-    let permit = DialPermit::acquire(Arc::clone(&self.maintenance_pending));
-    let driver = self.driver.clone();
-    let sessions = self.sessions.clone();
-    let packet = self.packet.clone();
-    let shutdown = self.shutdown.clone();
-    let connection_tasks = self.connection_tasks.clone();
-    let dial_deadline = self.config.dial_deadline();
-    let dial = tokio::spawn(async move {
-      let _slot = permit;
-      if let Err(error) = dial_member(
-        transport,
-        driver,
-        sessions,
-        packet,
-        shutdown,
-        connection_tasks,
-        receiver,
-        &peer,
-        // Ordinary caller-class edge: the recovery plane's redundancy
-        // pruning never reclaims a maintenance edge (additive-only).
-        false,
-        dial_deadline,
-      )
-      .await
-      {
-        debug!(
-          peer = %peer.as_str(),
-          kind = ?error.kind(),
-          "degree maintenance dial failed"
-        );
-      }
-    });
-    // The maintenance dial's JoinHandle joins the same tracked
-    // connection-task set as the recovery dials (audit finding #19): the
-    // recovery tick reaps finished handles and the shutdown path drains
-    // the rest inside its bounded cooperative window, aborting only the
-    // stragglers, so an in-flight maintenance handshake is owned and
-    // torn down with the node instead of outliving it.
-    if let Ok(mut handles) = self.connection_tasks.lock() {
-      handles.push(dial);
-    }
+    spawn_member_dial(
+      self,
+      Arc::clone(&self.maintenance_pending),
+      peer,
+      receiver,
+      // Ordinary caller-class edge: the recovery plane's redundancy
+      // pruning never reclaims a maintenance edge (additive-only).
+      false,
+      report_maintenance_dial_failure,
+    );
   }
+}
+
+/// The maintenance plane's failure diagnostics for the shared dial
+/// lifecycle: a failed deficit or probe dial is the expected outcome
+/// while a partition or outage persists — recorded at debug only, never
+/// an error condition.
+fn report_maintenance_dial_failure(peer: &NodeId, error: &Error) {
+  debug!(
+    peer = %peer.as_str(),
+    kind = ?error.kind(),
+    "degree maintenance dial failed"
+  );
 }
 
 impl Supervisor {
