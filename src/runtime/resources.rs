@@ -102,11 +102,31 @@ pub(super) fn issue_write_stamp(clock: &ResourceWriteClock) -> u64 {
 /// [`issue_write_stamp`] against an injected observation, so the
 /// same-millisecond collision the fold prevents stays deterministic to
 /// test.
+///
+/// The observation, the fold, and the advance are one atomic
+/// compare-and-swap: a fetch-max / compute / fetch-max interleaving let
+/// two concurrent writers observe the same previous stamp between the
+/// two steps and both issue it. Saturation is defined: a clock already
+/// at `u64::MAX` cannot advance, so every issue saturates at
+/// `u64::MAX`.
 fn issue_write_stamp_since(clock: &ResourceWriteClock, observed: u64) -> u64 {
-  let previous = clock.fetch_max(observed, std::sync::atomic::Ordering::Relaxed);
-  let stamp = previous.saturating_add(1).max(observed);
-  clock.fetch_max(stamp, std::sync::atomic::Ordering::Relaxed);
-  stamp
+  let mut previous = clock.load(std::sync::atomic::Ordering::Relaxed);
+  loop {
+    let stamp = previous.saturating_add(1).max(observed);
+    match clock.compare_exchange_weak(
+      previous,
+      stamp,
+      std::sync::atomic::Ordering::Relaxed,
+      std::sync::atomic::Ordering::Relaxed,
+    ) {
+      // The one atomic step committed: no other issuer can observe or
+      // reissue this stamp.
+      Ok(_) => return stamp,
+      // Another writer advanced the clock first (or the weak comparison
+      // failed spuriously): recompute from the value it published.
+      Err(current) => previous = current,
+    }
+  }
 }
 
 #[cfg(test)]
@@ -137,5 +157,54 @@ mod resource_stamp_tests {
     let next = issue_write_stamp_since(&clock, 4_000);
     assert_eq!(next, 5_001);
     assert!(clock.load(std::sync::atomic::Ordering::Relaxed) >= next);
+  }
+
+  // The atomicity regression: two writers issuing inside one observed
+  // millisecond previously could both observe the same previous stamp
+  // between the two fetch-max steps and both issue it. Every concurrent
+  // issue must land on a distinct, gap-free stamp sequence.
+  #[test]
+  fn concurrent_writers_never_issue_the_same_stamp() {
+    const WRITERS: usize = 8;
+    const ISSUES_PER_WRITER: usize = 2_000;
+    const OBSERVED: u64 = 1_000;
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stamps: Vec<u64> = std::thread::scope(|scope| {
+      let handles: Vec<_> = (0..WRITERS)
+        .map(|_| {
+          let clock = std::sync::Arc::clone(&clock);
+          scope.spawn(move || {
+            (0..ISSUES_PER_WRITER)
+              .map(|_| issue_write_stamp_since(&clock, OBSERVED))
+              .collect::<Vec<u64>>()
+          })
+        })
+        .collect();
+      handles
+        .into_iter()
+        .flat_map(|handle| handle.join().unwrap())
+        .collect()
+    });
+    let mut stamps = stamps;
+    stamps.sort_unstable();
+    // Exactly the contiguous sequence starting at the observed wall
+    // clock: no duplicates (the race this pins) and no gaps.
+    for (index, stamp) in stamps.iter().enumerate() {
+      assert_eq!(*stamp, OBSERVED + index as u64);
+    }
+    assert_eq!(
+      clock.load(std::sync::atomic::Ordering::Relaxed),
+      OBSERVED + (WRITERS * ISSUES_PER_WRITER) as u64 - 1
+    );
+  }
+
+  // The defined saturation behavior: a clock already at `u64::MAX`
+  // cannot advance, so issues saturate instead of wrapping.
+  #[test]
+  fn a_saturated_clock_issues_the_saturation_stamp() {
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    assert_eq!(issue_write_stamp_since(&clock, u64::MAX), u64::MAX);
+    assert_eq!(issue_write_stamp_since(&clock, u64::MAX), u64::MAX);
+    assert_eq!(clock.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
   }
 }
