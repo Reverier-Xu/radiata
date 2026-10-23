@@ -8,6 +8,7 @@
 use std::{
   collections::HashMap,
   sync::{Arc, atomic::Ordering},
+  time::Duration,
 };
 
 use tokio::{sync::mpsc, task::JoinSet};
@@ -25,25 +26,91 @@ use crate::{
   },
   protocol::wire::PacketKind,
   routing::{
-    forward::{self, PendingAck, PendingAcks},
+    forward::{self, PendingAck, PendingAcks, SessionIdentity},
     table::{record_terminal_failure, update_route},
   },
   transport::connection::ConnectionReader,
 };
 
-/// The number of body chunks buffered per admitted incoming stream before
-/// backpressure stalls the session reader.
+/// The number of body chunks buffered per admitted incoming stream: the
+/// stream's whole flow-control window. A consumer that lets it fill stalls
+/// nothing but its own stream — the session reader applies the explicit
+/// overload policy in [`forward_chunk`] instead.
 const INCOMING_STREAM_CHUNKS: usize = 8;
+
+/// The terminal slot reserved on top of the chunk window: a completed or
+/// interrupted end always queues without waiting for the consumer, so a
+/// body that fits its window always surfaces its exact terminal — and the
+/// bounded channel still never grows beyond window plus terminal.
+const INCOMING_STREAM_TERMINAL_SLOTS: usize = 1;
+
+/// How long the shared session reader waits for a live consumer to free a
+/// slot in its chunk window before it applies the overload policy, on the
+/// same scale as the session queue's `WAIT_BACKSTOP`. A burst above the
+/// window can reach the reader before the consumer task is first scheduled
+/// — the frames were already in the connection's receive buffer — so
+/// terminating on the spot would misread a healthy consumer as a stalled
+/// one. Each admitted stream spends this grace once: a consumer that frees
+/// a slot proves it is alive and the burst continues, while a consumer that
+/// never drains costs the shared reader one bounded patience and then ends
+/// through the explicit overload policy.
+const INCOMING_STREAM_DRAIN_PATIENCE: Duration = Duration::from_millis(50);
+
+/// The authenticated grant one established session confers on its read
+/// loop: the exact session incarnation (the identity forwarded hops bind
+/// their ownership to), the peer, and the negotiated feature set that gates
+/// packet-protocol admission.
+pub(super) struct SessionGrant {
+  identity: SessionIdentity,
+  selected_features: Vec<crate::FeatureTag>,
+}
+
+impl SessionGrant {
+  pub(super) const fn new(
+    identity: SessionIdentity, selected_features: Vec<crate::FeatureTag>,
+  ) -> Self {
+    Self {
+      identity,
+      selected_features,
+    }
+  }
+
+  /// The grant one authenticated session confers on its read loop: the
+  /// peer identity, the negotiated feature selection, and the exact
+  /// incarnation the session table registered.
+  pub(super) fn for_session(session: &EstablishedSession, identity: SessionIdentity) -> Self {
+    Self::new(identity, session.selected_features().to_vec())
+  }
+
+  pub(super) const fn identity(&self) -> &SessionIdentity {
+    &self.identity
+  }
+
+  pub(super) const fn peer(&self) -> &NodeId {
+    self.identity.peer()
+  }
+
+  pub(super) fn selected_features(&self) -> &[crate::FeatureTag] {
+    &self.selected_features
+  }
+}
 
 /// One admitted incoming stream: its bounded body channel, the next
 /// expected chunk sequence, the immutable opening-context digest that
 /// decides duplicate handling, and the admission wall-clock time reported
-/// by identical retransmissions.
+/// by identical retransmissions. The entry deliberately holds no consumer
+/// budget: the consumer task owns its reserved slot for its whole life,
+/// which outlives this table entry's wire stream.
 struct AdmittedStream {
   stream: mpsc::Sender<StreamItem>,
   next_sequence: u64,
   context: crate::Digest,
   admitted_at_millis: u64,
+  /// Whether this stream already spent its single bounded drain grace. One
+  /// grace per stream is what keeps the shared reader's stall bounded by
+  /// [`INCOMING_STREAM_DRAIN_PATIENCE`] independently of the stream's
+  /// length: after it, a full window is overload, not backpressure.
+  drain_grace_spent: bool,
 }
 
 /// UNIX-milliseconds from the injected wall clock, used for the admission
@@ -116,7 +183,7 @@ impl Drop for ConsumerDrainGuard {
 /// still hands the consumer set to the node-scoped drain exactly like the
 /// orderly exit below.
 pub(super) async fn read_loop(
-  source: &mut impl FrameSource, session: &EstablishedSession, context: &SessionPacketContext,
+  source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
   frames: &BoundedSender, pending_acks: &PendingAcks,
   last_activity: &Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -127,7 +194,7 @@ pub(super) async fn read_loop(
   };
   read_loop_frames(
     source,
-    session,
+    grant,
     context,
     frames,
     pending_acks,
@@ -144,7 +211,7 @@ pub(super) async fn read_loop(
 /// tests can hold the guard and observe the set between the loop's in-life
 /// reap and the guard's teardown.
 async fn read_loop_frames(
-  source: &mut impl FrameSource, session: &EstablishedSession, context: &SessionPacketContext,
+  source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
   frames: &BoundedSender, pending_acks: &PendingAcks,
   last_activity: &Arc<std::sync::atomic::AtomicU64>, consumers: &mut ConsumerDrainGuard,
 ) {
@@ -201,7 +268,8 @@ async fn read_loop_frames(
           if routed {
             forward::open(
               &context.local().clone(),
-              session.peer(),
+              grant.peer(),
+              grant.identity(),
               open,
               frames,
               &context.sessions,
@@ -214,7 +282,7 @@ async fn read_loop_frames(
             .await;
           } else if admit_open(
             open,
-            session,
+            grant,
             context,
             frames,
             &mut incoming,
@@ -236,7 +304,7 @@ async fn read_loop_frames(
           let trace = chunk.trace_id.clone();
           if forward::contains(&context.forwarding, &trace) {
             forward::relay_chunk(&context.forwarding, chunk).await;
-          } else if !forward_chunk(chunk, &mut incoming).await {
+          } else if !forward_chunk(chunk, &mut incoming, frames).await {
             warn!(trace_id = %trace, "incoming chunk sequence violation; closing session");
             break;
           }
@@ -253,10 +321,7 @@ async fn read_loop_frames(
             forward::relay_end(&context.forwarding, end).await;
             continue;
           }
-          if let Some(stream) = incoming
-            .remove(&end.trace_id)
-            .map(|admitted| admitted.stream)
-          {
+          if let Some(admitted) = incoming.remove(&end.trace_id) {
             // The typed terminal reason survives the relay: a completed
             // end closes the body normally; an interrupted end (the
             // sending leg died mid-stream) surfaces exactly one typed
@@ -266,7 +331,20 @@ async fn read_loop_frames(
               wire::EndReason::Completed => StreamItem::End,
               wire::EndReason::Interrupted => StreamItem::Interrupted,
             };
-            let _ = stream.send(terminal).await;
+            // The terminal is queued without waiting for the consumer: a
+            // consumer that never drains its window is the stream's own
+            // overload condition, not a reason to stall every other frame
+            // of the session (acks, pongs, other streams). The reserved
+            // terminal slot guarantees the queue succeeds for a live
+            // consumer; a failure means the consumer is gone, and dropping
+            // the sender still ends the body prefix with exactly one typed
+            // `StreamInterrupted`.
+            if admitted.stream.try_send(terminal).is_err() {
+              warn!(
+                trace_id = %end.trace_id,
+                "incoming consumer did not drain its terminal; stream interrupted"
+              );
+            }
           } else {
             // A lost consumer means its session task aborted mid-stream:
             // surface it loudly, because silence here looks like a lost
@@ -316,7 +394,16 @@ async fn read_loop_frames(
             if ack.status == crate::packet::wire::AckStatus::Admitted {
               forward::mark_admitted(&context.forwarding, &ack.trace_id);
             }
-            resolve_ack(ack.clone(), pending_acks);
+            if !resolve_ack(ack.clone(), pending_acks) {
+              // The one-shot admission waiter is gone. An origin's
+              // waiter is simply finished; an admitted forwarding hop
+              // instead owns the stream for its whole life and carries
+              // the report upstream itself — a legitimate mid-stream
+              // failure from the bound downstream session must not be
+              // dropped as a superseded branch's latecomer (audit
+              // P1-8).
+              forward::relay_admitted_ack(&context.forwarding, &ack);
+            }
             // A late failure for an admitted stream (a downstream hop
             // died mid-flight) still terminates the origin's route
             // observation. This writer races the origin pump's
@@ -396,9 +483,8 @@ async fn read_loop_frames(
 /// this admission boundary addressed elsewhere is rejected as unsupported
 /// — fail-closed, with no consumer invocation.
 async fn admit_open(
-  open: OpenFrame, session: &EstablishedSession, context: &SessionPacketContext,
-  frames: &BoundedSender, incoming: &mut HashMap<TraceId, AdmittedStream>,
-  consumers: &mut JoinSet<()>,
+  open: OpenFrame, grant: &SessionGrant, context: &SessionPacketContext, frames: &BoundedSender,
+  incoming: &mut HashMap<TraceId, AdmittedStream>, consumers: &mut JoinSet<()>,
 ) -> Result<()> {
   let trace_id = open.trace_id.clone();
   let ack_protocol = open.protocol.clone();
@@ -418,7 +504,7 @@ async fn admit_open(
         open.destination.clone(),
         open.route.clone(),
         &local,
-        session.peer(),
+        grant.peer(),
       ),
       Ok(crate::routing::RouteProgress::Arrive)
     ) {
@@ -446,7 +532,7 @@ async fn admit_open(
     }
     match context.registry.protocol(&open.protocol) {
       Some(registration)
-        if session
+        if grant
           .selected_features()
           .contains(registration.definition.owning_feature()) =>
       {
@@ -460,8 +546,21 @@ async fn admit_open(
         if incoming.len() >= context.policy.queue_messages {
           break 'status AckStatus::Overloaded;
         }
+        // The consumer's lifecycle slot is reserved BEFORE admission and
+        // handed to the consumer task: a stream whose wire stream ends still
+        // holds its slot until the accept future finishes, so the node-wide
+        // budget — not the per-session table — bounds the running consumer
+        // population (audit P1-2).
+        let Some(permit) = context.live_consumers.reserve() else {
+          debug!(
+            trace_id = %trace_id,
+            budget = context.live_consumers.limit(),
+            "node consumer lifecycle budget exhausted; open refused"
+          );
+          break 'status AckStatus::Overloaded;
+        };
         let admitted_at = clock_millis(context.clock.as_ref());
-        let (stream, body) = mpsc::channel(INCOMING_STREAM_CHUNKS);
+        let (stream, body) = mpsc::channel(INCOMING_STREAM_CHUNKS + INCOMING_STREAM_TERMINAL_SLOTS);
         incoming.insert(
           open.trace_id.clone(),
           AdmittedStream {
@@ -469,6 +568,7 @@ async fn admit_open(
             next_sequence: 0,
             context: context_digest,
             admitted_at_millis: admitted_at,
+            drain_grace_spent: false,
           },
         );
         let packet = IncomingStream::new(
@@ -484,6 +584,10 @@ async fn admit_open(
         let consumer_trace = trace_id.clone();
         debug!(trace_id = %consumer_trace, "incoming consumer spawned");
         consumers.spawn(async move {
+          // The admission slot is held for the consumer's whole life —
+          // including its post-wire-EOF work and the node-scoped drain that
+          // joins it after a session teardown — and released here.
+          let _permit = permit;
           let result = consumer.accept(packet).await;
           if let Err(error) = &result {
             // An admitted stream whose consumer failed is an operational
@@ -541,7 +645,25 @@ async fn admit_open(
 
 /// Forwards one chunk to its admitted stream in strict sequence order.
 /// Returns `false` on a sequence violation (fail closed).
-async fn forward_chunk(chunk: ChunkFrame, incoming: &mut HashMap<TraceId, AdmittedStream>) -> bool {
+///
+/// Delivery never awaits the consumer's window unboundedly: the shared
+/// session reader must stay responsive to the pongs, acknowledgements, and
+/// other streams of the same session, so one stalled consumer cannot park
+/// the whole connection (audit P1-9). The per-stream window is the
+/// flow-control bound. A full window first spends the stream's single
+/// [`INCOMING_STREAM_DRAIN_PATIENCE`] grace — a burst whose frames were
+/// already buffered by the transport can reach the reader before the
+/// consumer task is first scheduled, and a live consumer frees a slot well
+/// inside that patience. A window still full on expiry is the stream's own
+/// overload: the stream is terminated — its consumer observes exactly one
+/// typed `StreamInterrupted` through the closed body channel — and the
+/// origin learns the interruption through a best-effort failed
+/// acknowledgement, exactly the status a destination-side mid-stream
+/// failure reports. The terminal slot stays reserved for the typed end, so
+/// a body that fits its window still completes cleanly.
+async fn forward_chunk(
+  chunk: ChunkFrame, incoming: &mut HashMap<TraceId, AdmittedStream>, frames: &BoundedSender,
+) -> bool {
   let Some(admitted) = incoming.get_mut(&chunk.trace_id) else {
     // Unknown or already-terminated stream: drop the chunk.
     return true;
@@ -557,29 +679,81 @@ async fn forward_chunk(chunk: ChunkFrame, incoming: &mut HashMap<TraceId, Admitt
     "incoming chunk forwarded"
   );
   let bytes: Arc<[u8]> = Arc::from(chunk.bytes.as_slice());
-  if admitted
-    .stream
-    .send(StreamItem::Chunk(bytes))
+  // The chunk window is the flow-control bound: a chunk never takes the
+  // reserved terminal slot. The read loop is the channel's only sender, so
+  // the check and the send are one decision — no racing sender can steal
+  // the slot between them.
+  let window_full = admitted.stream.capacity() <= INCOMING_STREAM_TERMINAL_SLOTS;
+  let chunk_item = StreamItem::Chunk(bytes);
+  let delivered = if !window_full {
+    admitted.stream.try_send(chunk_item)
+  } else if admitted.drain_grace_spent {
+    Err(mpsc::error::TrySendError::Full(chunk_item))
+  } else {
+    admitted.drain_grace_spent = true;
+    // Spend the stream's one grace on the first full window: wait, bounded
+    // by the patience, until the consumer frees a chunk slot *and* the
+    // terminal slot the window keeps in reserve. Reserving both is what
+    // keeps the policy honest — waiting for one slot alone would spend the
+    // terminal reservation and turn a live consumer's burst into a false
+    // overload.
+    match tokio::time::timeout(
+      INCOMING_STREAM_DRAIN_PATIENCE,
+      admitted
+        .stream
+        .reserve_many(INCOMING_STREAM_TERMINAL_SLOTS + 1),
+    )
     .await
-    .is_err()
-  {
-    // The consumer is gone; terminate the incoming stream.
-    incoming.remove(&chunk.trace_id);
+    {
+      Ok(Ok(mut permits)) => {
+        // The iterator holds the reserved slots; the chunk takes one and
+        // dropping the iterator returns the terminal reservation.
+        if let Some(permit) = permits.next() {
+          permit.send(chunk_item);
+          Ok(())
+        } else {
+          Err(mpsc::error::TrySendError::Full(chunk_item))
+        }
+      }
+      Ok(Err(_)) => Err(mpsc::error::TrySendError::Closed(chunk_item)),
+      Err(_elapsed) => Err(mpsc::error::TrySendError::Full(chunk_item)),
+    }
+  };
+  match delivered {
+    Ok(()) => true,
+    Err(error) => {
+      // The consumer is gone (closed) or stayed stalled through its grace
+      // (full). Either way this stream ends here, explicitly: dropping the
+      // sender closes the body channel, which the consumer surfaces as one
+      // typed `StreamInterrupted`, and the failed status tells the origin
+      // to stop the stream too.
+      let full = matches!(error, mpsc::error::TrySendError::Full(_));
+      warn!(
+        trace_id = %chunk.trace_id,
+        overloaded = full,
+        "incoming stream terminated instead of stalling the session reader"
+      );
+      incoming.remove(&chunk.trace_id);
+      frames.try_send_status(&chunk.trace_id, AckStatus::Failed);
+      true
+    }
   }
-  true
 }
 
 /// Resolves one pending outbound admission. The admitting node is this
 /// session's authenticated peer, so the acknowledgement can name it for
-/// the synchronous sender's `DeliveryAck`.
-fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) {
+/// the synchronous sender's `DeliveryAck`. Returns whether a pending
+/// entry was resolved: an admitted forwarding hop's waiter was already
+/// consumed when admission resolved, and its later flow-control events
+/// relay upstream through the hop itself instead (audit P1-8).
+fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) -> bool {
   let entry = pending_acks
     .lock()
     .map(|mut pending| pending.remove(&ack.trace_id))
     .ok()
     .flatten();
   let Some(entry) = entry else {
-    return;
+    return false;
   };
   match entry {
     PendingAck::Wait { notify, .. } => {
@@ -604,6 +778,7 @@ fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) {
       }
     }
   }
+  true
 }
 
 /// Digests the immutable opening context of one open frame (endpoints,
@@ -898,11 +1073,12 @@ mod read_loop_liveness_tests {
     task::JoinSet,
   };
 
-  use super::{ConsumerDrainGuard, FrameSource, read_loop, read_loop_frames};
+  use super::{ConsumerDrainGuard, FrameSource, SessionGrant, read_loop, read_loop_frames};
   use crate::{
     NodeId,
     identity::testing::SequenceEntropy,
     node::EventHub,
+    routing::forward::SessionIdentity,
     session::stream::{SessionPacketContext, SessionPolicy, test_queue},
     storage::contract::helpers::ManualClock,
     transport::Received,
@@ -910,6 +1086,19 @@ mod read_loop_liveness_tests {
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  /// The authenticated grant of one test session, derived exactly as the
+  /// session loop derives it: the established session summary plus the
+  /// incarnation the session table registered.
+  fn grant() -> SessionGrant {
+    SessionGrant::for_session(
+      &crate::session::driver::EstablishedSession::test_session(node(2)),
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+    )
   }
 
   /// A frame source that answers every wake with a keepalive pong (the
@@ -986,14 +1175,14 @@ mod read_loop_liveness_tests {
       remaining: 3,
       now: 0,
     };
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
 
     read_loop(
       &mut source,
-      &session,
+      &grant,
       &context,
       &frames,
       &pending_acks,
@@ -1032,7 +1221,7 @@ mod read_loop_liveness_tests {
   async fn cancelled_read_loop_still_registers_the_consumer_drain() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
     let mut source = SilentSource;
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
@@ -1043,7 +1232,7 @@ mod read_loop_liveness_tests {
       Duration::from_millis(100),
       read_loop(
         &mut source,
-        &session,
+        &grant,
         &context,
         &frames,
         &pending_acks,
@@ -1073,7 +1262,7 @@ mod read_loop_liveness_tests {
       remaining: 0,
       now: 0,
     };
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
@@ -1081,7 +1270,7 @@ mod read_loop_liveness_tests {
 
     read_loop(
       &mut source,
-      &session,
+      &grant,
       &context,
       &frames,
       &pending_acks,
@@ -1109,7 +1298,7 @@ mod read_loop_liveness_tests {
   #[tokio::test]
   async fn read_loop_reaps_completed_consumer_entries_before_teardown() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
     let pending_acks = Arc::new(Mutex::new(HashMap::new()));
@@ -1150,7 +1339,7 @@ mod read_loop_liveness_tests {
     };
     read_loop_frames(
       &mut source,
-      &session,
+      &grant,
       &context,
       &frames,
       &pending_acks,
@@ -1197,7 +1386,7 @@ mod ack_attribution_tests {
 
   use futures_util::future::BoxFuture;
 
-  use super::{FrameSource, read_loop};
+  use super::{FrameSource, SessionGrant, read_loop};
   use crate::{
     NodeId, TraceId,
     identity::testing::SequenceEntropy,
@@ -1209,7 +1398,9 @@ mod ack_attribution_tests {
     },
     routing::{
       RouteContext,
-      forward::{ForwardingHop, PendingAck, PendingAcks, RetryState, register},
+      forward::{
+        ForwardingHop, HopPhase, PendingAck, PendingAcks, RetryState, SessionIdentity, register,
+      },
     },
     session::stream::{SessionPacketContext, SessionPolicy, test_queue},
     transport::{Received, connection::Message},
@@ -1282,6 +1473,101 @@ mod ack_attribution_tests {
     )
   }
 
+  /// The authenticated grant of one test session, derived exactly as the
+  /// session loop derives it: the established session summary plus the
+  /// incarnation the session table registered.
+  fn grant() -> SessionGrant {
+    SessionGrant::for_session(
+      &crate::session::driver::EstablishedSession::test_session(node(2)),
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+    )
+  }
+
+  /// The session identity of another incarnation of the same peer: a hop
+  /// bound to it is not the receiving session's own downstream.
+  fn other_session(peer: u8, incarnation: u32) -> SessionIdentity {
+    SessionIdentity::new(
+      node(peer),
+      crate::SessionId::parse(&format!("session-{incarnation:021}")).unwrap(),
+    )
+  }
+
+  fn hop_on(
+    upstream: crate::session::stream::BoundedSender,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream_session: SessionIdentity,
+  ) -> ForwardingHop {
+    let trace_id = trace(9);
+    ForwardingHop {
+      upstream,
+      downstream,
+      downstream_acks: Arc::clone(&downstream_acks),
+      upstream_session: other_session(3, 1),
+      downstream_session,
+      relay_lock: Arc::new(tokio::sync::Mutex::new(())),
+      deadline: None,
+      phase: HopPhase::Discovering(Box::new(RetryState {
+        open: OpenFrame {
+          trace_id: trace_id.clone(),
+          source: node(3),
+          destination: node(9),
+          protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+          metadata: crate::StreamMetadata::new(),
+          route: None,
+        },
+        context: RouteContext::new(trace_id, node(3), node(9), 8),
+        candidates: Vec::new(),
+        downstream_acks,
+      })),
+    }
+  }
+
+  /// The same hop once the destination admitted the stream: a pure relay
+  /// bound to `downstream_session`, whose one-shot admission waiter the
+  /// admission acknowledgement already consumed from the pending map.
+  fn admitted_hop_on(
+    upstream: crate::session::stream::BoundedSender,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream_session: SessionIdentity,
+  ) -> ForwardingHop {
+    let mut hop = hop_on(upstream, downstream, downstream_acks, downstream_session);
+    hop.phase = HopPhase::Admitted;
+    hop
+  }
+
+  /// Reads one acknowledgement frame from a fresh session frame source and
+  /// returns the peer-facing queue of the read loop: the sender stays with
+  /// the caller so "no frame was queued" is distinguishable from "the loop
+  /// dropped the queue". The source ends the session orderly after the
+  /// acknowledgement, so the loop always terminates within the timeout.
+  async fn deliver_ack(
+    grant: &SessionGrant, context: &SessionPacketContext, pending_acks: &PendingAcks, body: Vec<u8>,
+  ) -> (
+    crate::session::stream::BoundedSender,
+    crate::session::stream::BoundedReceiver,
+  ) {
+    let mut source = AckSource { body };
+    let (frames, frames_rx) = test_queue(8, 1 << 20);
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        grant,
+        context,
+        &frames,
+        pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the acknowledgement source ends the read loop orderly");
+    (frames, frames_rx)
+  }
+
   /// A late failure acknowledgement from a superseded branch must not
   /// steer the live hop: this node's discovering retry for the trace
   /// switched to a new downstream (the first branch's deadline expired),
@@ -1292,7 +1578,7 @@ mod ack_attribution_tests {
   #[tokio::test]
   async fn late_ack_from_a_superseded_branch_leaves_the_live_hop_untouched() {
     let trace_id = trace(9);
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = grant();
     let context = context();
 
     // The hop's current downstream attempt: a live relay entry on its
@@ -1311,27 +1597,14 @@ mod ack_attribution_tests {
     register(
       &context.forwarding,
       trace_id.clone(),
-      ForwardingHop {
-        upstream: upstream_tx,
-        downstream: downstream_tx,
-        downstream_acks: Arc::clone(&live_acks),
-        upstream_peer: node(3),
-        relay_lock: Arc::new(tokio::sync::Mutex::new(())),
-        deadline: None,
-        retry: Some(RetryState {
-          open: OpenFrame {
-            trace_id: trace_id.clone(),
-            source: node(3),
-            destination: node(9),
-            protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
-            metadata: crate::StreamMetadata::new(),
-            route: None,
-          },
-          context: RouteContext::new(trace_id.clone(), node(3), node(9), 8),
-          candidates: Vec::new(),
-          downstream_acks: Arc::clone(&live_acks),
-        }),
-      },
+      hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&live_acks),
+        // A different session than the one delivering the late ack: the
+        // hop already re-dispatched to another branch.
+        other_session(7, 5),
+      ),
     )
     .unwrap();
 
@@ -1344,23 +1617,7 @@ mod ack_attribution_tests {
       admitted_at_millis: 0,
     })
     .unwrap();
-    let mut source = AckSource { body };
-    let (frames, mut frames_rx) = test_queue(8, 1 << 20);
-    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
-
-    tokio::time::timeout(
-      Duration::from_secs(10),
-      read_loop(
-        &mut source,
-        &session,
-        &context,
-        &frames,
-        &stale_acks,
-        &last_activity,
-      ),
-    )
-    .await
-    .expect("the acknowledgement source ends the read loop orderly");
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &stale_acks, body).await;
 
     // The live hop is untouched: still registered, still discovering.
     assert!(crate::routing::forward::contains(
@@ -1378,6 +1635,156 @@ mod ack_attribution_tests {
     assert!(upstream_rx.recv().now_or_never().is_none());
     assert!(frames_rx.recv().now_or_never().is_none());
   }
+
+  /// A mid-stream failure arriving after the destination admitted the
+  /// stream belongs to the hop that owns it, even though its one-shot
+  /// admission waiter was consumed by the admission acknowledgement: the
+  /// admitted phase carries the ownership, so the report still travels
+  /// upstream instead of being dropped as a superseded branch's
+  /// latecomer (audit P1-8).
+  #[tokio::test]
+  async fn post_admission_failure_from_the_bound_session_relays_upstream() {
+    let trace_id = trace(9);
+    let grant = grant();
+    let context = context();
+
+    // The admission acknowledgement already resolved the one-shot waiter:
+    // the session's pending map is empty and the hop alone represents the
+    // stream from here on.
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    register(
+      &context.forwarding,
+      trace_id.clone(),
+      admitted_hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&session_acks),
+        grant.identity().clone(),
+      ),
+    )
+    .unwrap();
+
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Failed,
+      admitted_at_millis: 0,
+    })
+    .unwrap();
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &session_acks, body).await;
+
+    // The bound session's failure reached the previous hop with its typed
+    // status preserved.
+    use futures_util::FutureExt;
+    let relayed = upstream_rx
+      .recv()
+      .now_or_never()
+      .flatten()
+      .expect("the admitted hop relays the failure upstream");
+    assert_eq!(relayed.kind, PacketKind::Ack);
+    let relayed = crate::packet::wire::decode_ack(&relayed.body, context.parser_limits()).unwrap();
+    assert_eq!(relayed.trace_id, trace_id);
+    assert_eq!(relayed.status, AckStatus::Failed);
+    // The hop stays the stream's owner for its whole life: still
+    // registered, never re-searching, and nothing sent back downstream.
+    assert!(crate::routing::forward::contains(
+      &context.forwarding,
+      &trace_id
+    ));
+    assert!(!crate::routing::forward::owns_discovering(
+      &context.forwarding,
+      &trace_id
+    ));
+    assert!(frames_rx.recv().now_or_never().is_none());
+  }
+
+  /// The admitted hop's ownership is the exact downstream incarnation, not
+  /// the peer: a post-admission failure from a replacement session of the
+  /// same peer is another generation's traffic and is dropped rather than
+  /// steered through the live stream (audit P1-4, P1-8).
+  #[tokio::test]
+  async fn post_admission_failure_from_another_incarnation_is_dropped() {
+    let trace_id = trace(9);
+    let grant = grant();
+    let context = context();
+
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    // The hop's bound attempt is another incarnation of the delivering
+    // peer, so its pending map is not the one this session acknowledges on.
+    let bound_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    register(
+      &context.forwarding,
+      trace_id.clone(),
+      admitted_hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&bound_acks),
+        other_session(2, 7),
+      ),
+    )
+    .unwrap();
+
+    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Failed,
+      admitted_at_millis: 0,
+    })
+    .unwrap();
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &session_acks, body).await;
+
+    use futures_util::FutureExt;
+    assert!(upstream_rx.recv().now_or_never().is_none());
+    assert!(frames_rx.recv().now_or_never().is_none());
+    // The hop still owns its own stream: nothing about it changed.
+    assert!(crate::routing::forward::contains(
+      &context.forwarding,
+      &trace_id
+    ));
+    assert!(!crate::routing::forward::owns_discovering(
+      &context.forwarding,
+      &trace_id
+    ));
+  }
+
+  /// A repeated admission from the bound session carries nothing new: the
+  /// admission was relayed upstream when it resolved the one-shot waiter,
+  /// so the admitted hop does not echo it a second time.
+  #[tokio::test]
+  async fn a_repeated_admission_is_not_relayed_again() {
+    let trace_id = trace(9);
+    let grant = grant();
+    let context = context();
+
+    let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
+    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
+    register(
+      &context.forwarding,
+      trace_id.clone(),
+      admitted_hop_on(
+        upstream_tx,
+        downstream_tx,
+        Arc::clone(&session_acks),
+        grant.identity().clone(),
+      ),
+    )
+    .unwrap();
+
+    let body = crate::packet::wire::encode_ack(&AckFrame {
+      trace_id: trace_id.clone(),
+      status: AckStatus::Admitted,
+      admitted_at_millis: 1,
+    })
+    .unwrap();
+    let (_session_frames, mut frames_rx) = deliver_ack(&grant, &context, &session_acks, body).await;
+
+    use futures_util::FutureExt;
+    assert!(upstream_rx.recv().now_or_never().is_none());
+    assert!(frames_rx.recv().now_or_never().is_none());
+  }
 }
 
 #[cfg(test)]
@@ -1390,7 +1797,7 @@ mod durable_mirror_tests {
 
   use futures_util::future::BoxFuture;
 
-  use super::{FrameSource, read_loop};
+  use super::{FrameSource, SessionGrant, read_loop};
   use crate::{
     ErrorKind, NodeId, RouteState, TraceId,
     identity::testing::SequenceEntropy,
@@ -1399,7 +1806,10 @@ mod durable_mirror_tests {
       RouteRecord,
       wire::{AckFrame, AckStatus},
     },
-    routing::trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
+    routing::{
+      forward::SessionIdentity,
+      trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
+    },
     session::stream::{SessionPacketContext, SessionPolicy, test_queue},
     transport::{Received, connection::Message},
   };
@@ -1482,7 +1892,13 @@ mod durable_mirror_tests {
     sink: &TraceSink, routes: &crate::routing::RouteTable, trace_id: &TraceId,
   ) -> Vec<TraceRecord> {
     let context = context_with(sink.clone(), routes.clone());
-    let session = crate::session::driver::EstablishedSession::test_session(node(2));
+    let grant = SessionGrant::for_session(
+      &crate::session::driver::EstablishedSession::test_session(node(2)),
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+    );
     let body = crate::packet::wire::encode_ack(&AckFrame {
       trace_id: trace_id.clone(),
       status: AckStatus::Failed,
@@ -1498,7 +1914,7 @@ mod durable_mirror_tests {
       Duration::from_secs(10),
       read_loop(
         &mut source,
-        &session,
+        &grant,
         &context,
         &frames,
         &pending_acks,
@@ -1645,5 +2061,1018 @@ mod durable_mirror_tests {
     let records = deliver_failed_ack(&sink, &routes, &trace(43)).await;
 
     assert!(records.is_empty(), "no durable row may be fabricated");
+  }
+}
+
+#[cfg(test)]
+mod slow_consumer_tests {
+  use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::Duration,
+  };
+
+  use futures_util::{StreamExt as _, future::BoxFuture};
+  use minicbor::bytes::ByteVec;
+
+  use super::{FrameSource, INCOMING_STREAM_CHUNKS, SessionGrant, read_loop};
+  use crate::{
+    ExtensionRegistry, FeatureTag, IncomingStream, ProtocolTag, TraceId,
+    extension_registry::{PacketConsumer, ProtocolDefinition},
+    identity::testing::SequenceEntropy,
+    node::EventHub,
+    packet::wire::{AckStatus, ChunkFrame, OpenFrame},
+    protocol::{
+      CONTROL_CBOR_LIMITS,
+      wire::{BASE_SCHEMA_ID, PacketKind},
+    },
+    routing::forward::SessionIdentity,
+    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    transport::{Received, connection::Message},
+  };
+
+  fn node(value: u8) -> crate::NodeId {
+    crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> crate::TraceId {
+    crate::TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
+  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+
+  /// The authenticated grant of a session that selected the test
+  /// protocol's owning feature: admission requires the negotiated
+  /// selection, so the test grant carries it exactly like a real
+  /// handshake would.
+  fn grant() -> SessionGrant {
+    SessionGrant::new(
+      SessionIdentity::new(
+        node(2),
+        crate::SessionId::parse("session-000000000000000000002").unwrap(),
+      ),
+      vec![FeatureTag::parse(FEATURE).unwrap()],
+    )
+  }
+
+  /// A consumer that holds the admitted stream without draining it until
+  /// the level-triggered gate opens, then records the body's terminal:
+  /// `None` for a completed body, `Some(kind)` for exactly one typed
+  /// interruption.
+  #[derive(Debug)]
+  struct GatedConsumer {
+    gate: tokio::sync::watch::Receiver<bool>,
+    terminal: Arc<Mutex<Option<Option<crate::ErrorKind>>>>,
+  }
+
+  impl PacketConsumer for GatedConsumer {
+    fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, crate::Result<()>> {
+      let mut gate = self.gate.clone();
+      let terminal = Arc::clone(&self.terminal);
+      Box::pin(async move {
+        while !*gate.borrow_and_update() {
+          let _ = gate.changed().await;
+        }
+        let mut body = packet.body();
+        let outcome = loop {
+          match body.next().await {
+            Some(Ok(_)) => continue,
+            Some(Err(error)) => break Some(error.kind()),
+            None => break None,
+          }
+        };
+        terminal.lock().unwrap().replace(outcome);
+        Ok(())
+      })
+    }
+  }
+
+  /// Yields the queued wire messages in order, then ends the session
+  /// orderly.
+  struct FramesSource {
+    messages: std::collections::VecDeque<Message>,
+  }
+
+  impl FrameSource for FramesSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      let message = self.messages.pop_front();
+      Box::pin(async move { Ok(message.map(Received::Message)) })
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      0
+    }
+  }
+
+  fn open_frame(seed: u32) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::Open.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_open(&OpenFrame {
+        trace_id: trace(seed),
+        source: node(2),
+        destination: node(1),
+        protocol: ProtocolTag::parse(PROTOCOL).unwrap(),
+        metadata: crate::StreamMetadata::new(),
+        route: None,
+      })
+      .unwrap(),
+    }
+  }
+
+  fn chunk_frame(seed: u32, sequence: u64) -> Message {
+    chunk_frame_with(seed, sequence, &[7; 8])
+  }
+
+  fn chunk_frame_with(seed: u32, sequence: u64, bytes: &[u8]) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::Chunk.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_chunk(&ChunkFrame {
+        trace_id: trace(seed),
+        sequence,
+        bytes: ByteVec::from(bytes.to_vec()),
+      })
+      .unwrap(),
+    }
+  }
+
+  fn end_frame(seed: u32) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(seed),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    }
+  }
+
+  /// Every body the draining consumer finished: its trace and the
+  /// concatenated payload.
+  type RecordedBodies = Arc<Mutex<Vec<(TraceId, Vec<u8>)>>>;
+
+  /// Every terminal the draining consumer observed: its trace and `None`
+  /// for a completed body or the typed interruption kind.
+  type RecordedTerminals = Arc<Mutex<Vec<(TraceId, Option<crate::ErrorKind>)>>>;
+
+  /// A consumer that drains immediately — the healthy side of a burst —
+  /// and records each body and its terminal. The trace it is told to stall
+  /// is instead held forever without a single read: a consumer whose task
+  /// and admission slot are alive but that never frees its window.
+  #[derive(Debug)]
+  struct DrainingConsumer {
+    stalled: Option<TraceId>,
+    bodies: RecordedBodies,
+    terminals: RecordedTerminals,
+  }
+
+  impl DrainingConsumer {
+    fn new(stalled: Option<TraceId>) -> Self {
+      Self {
+        stalled,
+        bodies: Arc::default(),
+        terminals: Arc::default(),
+      }
+    }
+
+    /// Waits (bounded) for the recorded body of `trace` and returns its
+    /// bytes together with its terminal: `None` for a completed body,
+    /// `Some(kind)` for exactly one typed interruption.
+    async fn body_of(&self, trace: &TraceId) -> (Vec<u8>, Option<crate::ErrorKind>) {
+      let deadline = std::time::Instant::now() + Duration::from_secs(10);
+      loop {
+        let terminal = self
+          .terminals
+          .lock()
+          .unwrap()
+          .iter()
+          .find(|(recorded, _)| recorded == trace)
+          .map(|(_, terminal)| *terminal);
+        if let Some(terminal) = terminal {
+          let body = self
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(recorded, _)| recorded == trace)
+            .map(|(_, body)| body.clone())
+            .unwrap_or_default();
+          return (body, terminal);
+        }
+        assert!(
+          std::time::Instant::now() < deadline,
+          "the draining consumer must finish its body"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+      }
+    }
+  }
+
+  impl PacketConsumer for DrainingConsumer {
+    fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, crate::Result<()>> {
+      let stalled = self.stalled.clone();
+      let bodies = Arc::clone(&self.bodies);
+      let terminals = Arc::clone(&self.terminals);
+      Box::pin(async move {
+        let trace = packet.trace_id().clone();
+        if stalled.as_ref() == Some(&trace) {
+          // Never read a byte: the window fills and only the reader's
+          // bounded drain grace stands between it and the overload policy.
+          std::future::pending::<()>().await;
+        }
+        let mut bytes = Vec::new();
+        let mut body = packet.body();
+        let terminal = loop {
+          match body.next().await {
+            Some(Ok(chunk)) => bytes.extend_from_slice(&chunk),
+            Some(Err(error)) => break Some(error.kind()),
+            None => break None,
+          }
+        };
+        bodies.lock().unwrap().push((trace.clone(), bytes));
+        terminals.lock().unwrap().push((trace, terminal));
+        Ok(())
+      })
+    }
+  }
+
+  /// Builds the registry + read loop plumbing around one consumer.
+  fn session_for(consumer: Arc<DrainingConsumer>) -> SessionPacketContext {
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        Arc::clone(&consumer) as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    context(Arc::new(registry))
+  }
+
+  fn context(registry: Arc<ExtensionRegistry>) -> SessionPacketContext {
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    SessionPacketContext::new(
+      node(1),
+      registry,
+      SessionPolicy::new(
+        8,
+        1 << 20,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+      ),
+      crate::runtime::RuntimeClient::routing_only(
+        tokio::sync::mpsc::channel(4).0,
+        Arc::new(Mutex::new(BTreeMap::new())),
+      ),
+      Arc::new(crate::time::HostWallClock),
+      entropy,
+      Arc::new(EventHub::new()),
+      crate::routing::DefaultNextHop::tag().unwrap(),
+      Arc::new(Mutex::new(BTreeMap::new())),
+      Arc::new(Mutex::new(BTreeMap::new())),
+      None,
+      8,
+      16,
+      Arc::new(Mutex::new(Vec::new())),
+      CONTROL_CBOR_LIMITS,
+      Duration::from_secs(5),
+    )
+  }
+
+  /// Regression (audit P1-9): a consumer that never drains its bounded
+  /// window must not stall the session's shared read loop. The window
+  /// (`INCOMING_STREAM_CHUNKS`) fills, the overflowing chunk spends the
+  /// stream's single drain grace, the grace expires, and the explicit
+  /// overload policy terminates the stream — the origin learns it through
+  /// a typed failed acknowledgement, the consumer later observes exactly
+  /// one typed interruption — and the reader keeps processing frames after
+  /// the overload until the orderly end. Before the fix the reader parked
+  /// on the full channel and the session went mute.
+  #[tokio::test]
+  async fn an_undrained_window_terminates_the_stream_without_stalling_the_reader() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      terminal: Arc::new(Mutex::new(None)),
+    });
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        Arc::clone(&consumer) as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    let context = context(Arc::new(registry));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // The window fills, then the next chunk overflows it and spends the
+    // stream's one drain grace, which expires against this gated consumer.
+    let mut messages = Vec::new();
+    messages.push(open_frame(9));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64 + 1) {
+      messages.push(chunk_frame(9, sequence));
+    }
+    // Frames after the overload still get processed: the terminal end for
+    // the terminated trace (now unknown — dropped with a warning) and the
+    // orderly session end both prove the loop kept running.
+    messages.push(Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(9),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    });
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop must not stall on an undrained consumer window");
+
+    // The origin saw the admission, then the typed failure from the
+    // overload policy.
+    let ack = frames_rx.recv().await.unwrap();
+    assert_eq!(ack.kind, PacketKind::Ack);
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.trace_id, trace(9));
+    assert_eq!(ack.status, AckStatus::Admitted);
+    let ack = frames_rx.recv().await.unwrap();
+    assert_eq!(ack.kind, PacketKind::Ack);
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.trace_id, trace(9));
+    assert_eq!(ack.status, AckStatus::Failed);
+
+    // Opening the gate surfaces exactly one typed interruption: the
+    // buffered chunks drain, then the dropped sender ends the prefix as
+    // interrupted — never a silent truncation.
+    gate_tx.send(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      if let Some(terminal) = consumer.terminal.lock().unwrap().take() {
+        assert_eq!(terminal, Some(crate::ErrorKind::StreamInterrupted));
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the gated consumer must finish after its gate opens"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  /// The same bounded window with a stream that completes within it still
+  /// delivers a clean terminal: exactly one completed end, no failure.
+  #[tokio::test]
+  async fn a_stream_within_the_window_receives_the_completed_terminal() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      terminal: Arc::new(Mutex::new(None)),
+    });
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        Arc::clone(&consumer) as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    let context = context(Arc::new(registry));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // A body that fits the window: the wire end queues as the terminal
+    // even while the consumer stays gated shut.
+    let mut messages = Vec::new();
+    messages.push(open_frame(10));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64) {
+      messages.push(chunk_frame(10, sequence));
+    }
+    messages.push(Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(10),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    });
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop ends orderly");
+
+    let ack = frames_rx.recv().await.unwrap();
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.status, AckStatus::Admitted);
+
+    gate_tx.send(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      if let Some(terminal) = consumer.terminal.lock().unwrap().take() {
+        assert_eq!(terminal, None, "a completed end is a clean terminal");
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the gated consumer must finish after its gate opens"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  /// Regression (the P1-9 follow-up): a burst of wire slices above the
+  /// window can reach the shared reader before the consumer task is first
+  /// scheduled — the transport already buffered every slice. The bounded
+  /// drain grace keeps that legitimate burst from being misread as
+  /// overload: the live consumer frees slots inside its patience, the body
+  /// arrives byte-exact, and the stream keeps its clean completed terminal.
+  #[tokio::test]
+  async fn a_burst_above_the_window_with_a_live_consumer_stays_byte_exact() {
+    let consumer = Arc::new(DrainingConsumer::new(None));
+    let context = session_for(Arc::clone(&consumer));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Two slices above the window: the overflowing slice spends the
+    // stream's one drain grace, which a live consumer answers immediately.
+    let mut expected = Vec::new();
+    let mut messages = Vec::new();
+    messages.push(open_frame(11));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64 + 2) {
+      let bytes = [sequence as u8; 8];
+      expected.extend_from_slice(&bytes);
+      messages.push(chunk_frame_with(11, sequence, &bytes));
+    }
+    messages.push(end_frame(11));
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop must not stall on a live consumer's burst");
+
+    // Admission is the only acknowledgement: the burst never reached the
+    // overload policy.
+    let ack = frames_rx.recv().await.unwrap();
+    assert_eq!(ack.kind, PacketKind::Ack);
+    let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+    assert_eq!(ack.trace_id, trace(11));
+    assert_eq!(ack.status, AckStatus::Admitted);
+    // A live consumer's burst must not surface a failed acknowledgement:
+    // the read loop already queued every frame it will ever send, so an
+    // empty queue after a short wait is the whole assertion.
+    assert!(
+      tokio::time::timeout(Duration::from_millis(100), frames_rx.recv())
+        .await
+        .is_err(),
+      "a live consumer's burst must not surface a failed acknowledgement"
+    );
+
+    let (body, terminal) = consumer.body_of(&trace(11)).await;
+    assert_eq!(terminal, None, "the burst must keep its completed terminal");
+    assert_eq!(body, expected, "the burst must arrive byte-exact");
+  }
+
+  /// The other half of the policy: a consumer that stays stalled past its
+  /// grace is still terminated. The shared reader spends one bounded
+  /// patience per stalled stream, surfaces the typed failed acknowledgement
+  /// and the consumer's single typed interruption, and keeps serving the
+  /// session — a second stream opened after the overload completes
+  /// byte-exact.
+  #[tokio::test]
+  async fn a_stalled_consumer_overloads_after_its_grace_without_holding_the_session() {
+    let stalled = trace(20);
+    let consumer = Arc::new(DrainingConsumer::new(Some(stalled.clone())));
+    let context = session_for(Arc::clone(&consumer));
+    let grant = grant();
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // The stalled stream fills its window and spends its grace on the next
+    // slice; the live stream is opened after that overload and must be
+    // served to completion by the same read loop.
+    let mut live_expected = Vec::new();
+    let mut messages = Vec::new();
+    messages.push(open_frame(20));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64 + 1) {
+      messages.push(chunk_frame(20, sequence));
+    }
+    messages.push(open_frame(21));
+    for sequence in 0..(INCOMING_STREAM_CHUNKS as u64) {
+      let bytes = [sequence as u8; 8];
+      live_expected.extend_from_slice(&bytes);
+      messages.push(chunk_frame_with(21, sequence, &bytes));
+    }
+    messages.push(end_frame(21));
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the read loop must not stall on a consumer that never drains");
+
+    // The stalled stream: admission, then the typed failure from the
+    // overload policy once its grace expired. The live stream is still
+    // admitted afterwards.
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+      let ack = frames_rx.recv().await.unwrap();
+      assert_eq!(ack.kind, PacketKind::Ack);
+      let ack = crate::packet::wire::decode_ack(&ack.body, CONTROL_CBOR_LIMITS).unwrap();
+      statuses.push((ack.trace_id, ack.status));
+    }
+    assert_eq!(
+      statuses,
+      vec![
+        (stalled.clone(), AckStatus::Admitted),
+        (stalled, AckStatus::Failed),
+        (trace(21), AckStatus::Admitted),
+      ],
+      "the stalled stream is overloaded and the live stream is still admitted"
+    );
+
+    let (body, terminal) = consumer.body_of(&trace(21)).await;
+    assert_eq!(terminal, None, "the live stream completes cleanly");
+    assert_eq!(body, live_expected, "the live body arrives byte-exact");
+    assert!(
+      consumer
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(recorded, _)| recorded != &trace(20)),
+      "the stalled consumer never completed a body"
+    );
+  }
+}
+
+#[cfg(test)]
+mod consumer_lifecycle_tests {
+  use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::Duration,
+  };
+
+  use futures_util::{StreamExt as _, future::BoxFuture};
+
+  use super::{FrameSource, SessionGrant, read_loop};
+  use crate::{
+    ExtensionRegistry, FeatureTag, IncomingStream, NodeId, ProtocolTag, TraceId,
+    extension_registry::{PacketConsumer, ProtocolDefinition},
+    identity::testing::SequenceEntropy,
+    node::EventHub,
+    packet::wire::{AckStatus, OpenFrame},
+    protocol::{
+      CONTROL_CBOR_LIMITS,
+      wire::{BASE_SCHEMA_ID, PacketKind},
+    },
+    routing::forward::SessionIdentity,
+    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    transport::{Received, connection::Message},
+  };
+
+  const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
+  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// The authenticated grant of one test session: a distinct incarnation
+  /// per `peer`, carrying the feature set a real handshake would negotiate
+  /// for the test protocol.
+  fn grant(peer: u8, incarnation: u32) -> SessionGrant {
+    SessionGrant::new(
+      SessionIdentity::new(
+        node(peer),
+        crate::SessionId::parse(&format!("session-{incarnation:021}")).unwrap(),
+      ),
+      vec![FeatureTag::parse(FEATURE).unwrap()],
+    )
+  }
+
+  /// A consumer that waits for its level-triggered gate before finishing —
+  /// the post-wire-EOF work the lifecycle budget must carry — and records
+  /// every trace it accepted.
+  #[derive(Debug)]
+  struct GatedConsumer {
+    gate: tokio::sync::watch::Receiver<bool>,
+    accepted: Arc<Mutex<Vec<TraceId>>>,
+  }
+
+  impl PacketConsumer for GatedConsumer {
+    fn accept<'a>(&'a self, mut packet: IncomingStream) -> BoxFuture<'a, crate::Result<()>> {
+      let mut gate = self.gate.clone();
+      let trace_id = packet.trace_id().clone();
+      let accepted = Arc::clone(&self.accepted);
+      Box::pin(async move {
+        while !*gate.borrow_and_update() {
+          let _ = gate.changed().await;
+        }
+        // Drain whatever terminal the body carries; the lifecycle budget
+        // observes the accept future, not the body itself.
+        let mut body = packet.body();
+        while body.next().await.is_some() {}
+        accepted.lock().unwrap().push(trace_id);
+        Ok(())
+      })
+    }
+  }
+
+  /// Yields the queued wire messages in order, then ends the session
+  /// orderly.
+  struct FramesSource {
+    messages: std::collections::VecDeque<Message>,
+  }
+
+  impl FrameSource for FramesSource {
+    fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
+      let message = self.messages.pop_front();
+      Box::pin(async move { Ok(message.map(Received::Message)) })
+    }
+
+    fn pong_last_seen(&self) -> u64 {
+      0
+    }
+  }
+
+  fn open_message(seed: u32, peer: u8) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::Open.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_open(&OpenFrame {
+        trace_id: trace(seed),
+        source: node(peer),
+        destination: node(1),
+        protocol: ProtocolTag::parse(PROTOCOL).unwrap(),
+        metadata: crate::StreamMetadata::new(),
+        route: None,
+      })
+      .unwrap(),
+    }
+  }
+
+  fn end_message(seed: u32) -> Message {
+    Message {
+      schema_id: BASE_SCHEMA_ID,
+      kind_id: PacketKind::End.kind_id(),
+      flags: 0,
+      body: crate::packet::wire::encode_end(&crate::packet::wire::EndFrame {
+        trace_id: trace(seed),
+        reason: crate::packet::wire::EndReason::Completed,
+      })
+      .unwrap(),
+    }
+  }
+
+  /// The node context of a session-serving runtime: the node-wide consumer
+  /// budget shrunk to `budget` so the lifecycle is observable without the
+  /// production-scale population.
+  fn context(consumer: Arc<GatedConsumer>, budget: usize) -> Arc<SessionPacketContext> {
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        ProtocolDefinition::new(
+          ProtocolTag::parse(PROTOCOL).unwrap(),
+          FeatureTag::parse(FEATURE).unwrap(),
+        ),
+        consumer as Arc<dyn PacketConsumer>,
+      )
+      .unwrap();
+    let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    Arc::new(
+      SessionPacketContext::new(
+        node(1),
+        Arc::new(registry),
+        SessionPolicy::new(
+          8,
+          1 << 20,
+          Duration::from_secs(30),
+          Duration::from_secs(5),
+          Duration::from_secs(15),
+        ),
+        crate::runtime::RuntimeClient::routing_only(
+          tokio::sync::mpsc::channel(4).0,
+          Arc::new(Mutex::new(BTreeMap::new())),
+        ),
+        Arc::new(crate::time::HostWallClock),
+        entropy,
+        Arc::new(EventHub::new()),
+        crate::routing::DefaultNextHop::tag().unwrap(),
+        Arc::new(Mutex::new(BTreeMap::new())),
+        Arc::new(Mutex::new(BTreeMap::new())),
+        None,
+        8,
+        16,
+        Arc::new(Mutex::new(Vec::new())),
+        CONTROL_CBOR_LIMITS,
+        Duration::from_secs(5),
+      )
+      .with_live_consumer_budget(budget),
+    )
+  }
+
+  /// Waits until every gated consumer of `count` finished, bounded by a
+  /// wall-clock deadline.
+  async fn consumers_finish(consumer: &GatedConsumer, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      if consumer.accepted.lock().unwrap().len() >= count {
+        return;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the gated consumers must finish after their gate opens"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  /// Regression (audit P1-2): the wire stream's end frees the per-session
+  /// table slot, but the consumer's lifecycle slot is held until the accept
+  /// future finishes — the post-EOF work is legitimate and is never
+  /// cancelled at the wire end. Repeated complete streams accumulate their
+  /// reservations, and the budget releases each one exactly when its
+  /// consumer terminates.
+  #[tokio::test]
+  async fn complete_wire_streams_keep_their_consumer_slots_after_eof() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      accepted: Arc::new(Mutex::new(Vec::new())),
+    });
+    let context = context(Arc::clone(&consumer), 8);
+    let grant = grant(2, 1);
+    let (frames, _frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Four complete wire streams: every End frees the table entry, so the
+    // per-session bound would admit a fifth — the node budget must still
+    // see the four live consumers.
+    let mut messages = Vec::new();
+    for seed in 1_u32..=4 {
+      messages.push(open_message(seed, 2));
+      messages.push(end_message(seed));
+    }
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the gated consumers never block the read loop");
+
+    assert_eq!(
+      context.live_consumers.in_use(),
+      4,
+      "every post-EOF consumer still holds its lifecycle slot"
+    );
+
+    gate_tx.send(true).unwrap();
+    consumers_finish(&consumer, 4).await;
+    assert_eq!(
+      context.live_consumers.in_use(),
+      0,
+      "a finished consumer releases its lifecycle slot"
+    );
+  }
+
+  /// Regression (audit P1-2): past the node-wide budget, a new open is
+  /// refused with the typed `Overloaded` backpressure — never admitted
+  /// beyond the running-consumer bound — and no consumer runs for the
+  /// refused stream. The slots return once the stalled consumers finish.
+  #[tokio::test]
+  async fn an_exhausted_consumer_budget_refuses_new_opens_with_typed_overload() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      accepted: Arc::new(Mutex::new(Vec::new())),
+    });
+    let context = context(Arc::clone(&consumer), 2);
+    let grant = grant(2, 1);
+    let (frames, mut frames_rx) = test_queue(16, 1 << 20);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Two complete wire streams whose consumers stay parked past EOF; the
+    // third open finds the node budget exhausted even though the per-session
+    // table is empty again.
+    let mut messages = Vec::new();
+    for seed in 1_u32..=2 {
+      messages.push(open_message(seed, 2));
+      messages.push(end_message(seed));
+    }
+    messages.push(open_message(3, 2));
+    messages.push(end_message(3));
+    let mut source = FramesSource {
+      messages: messages.into(),
+    };
+
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      read_loop(
+        &mut source,
+        &grant,
+        &context,
+        &frames,
+        &pending_acks,
+        &last_activity,
+      ),
+    )
+    .await
+    .expect("the gated consumers never block the read loop");
+
+    // Every outcome is on the wire: dropping the session queue's last
+    // sender ends the ack stream so the statuses collect exhaustively
+    // instead of waiting on a channel that never closes.
+    drop(frames);
+    let mut statuses = Vec::new();
+    while let Some(frame) = frames_rx.recv().await {
+      let ack = crate::packet::wire::decode_ack(&frame.body, CONTROL_CBOR_LIMITS).unwrap();
+      statuses.push((ack.trace_id, ack.status));
+    }
+    assert_eq!(
+      statuses,
+      vec![
+        (trace(1), AckStatus::Admitted),
+        (trace(2), AckStatus::Admitted),
+        (trace(3), AckStatus::Overloaded),
+      ],
+      "the exhausted budget is typed backpressure, not silent growth"
+    );
+    assert_eq!(context.live_consumers.in_use(), 2);
+
+    gate_tx.send(true).unwrap();
+    consumers_finish(&consumer, 2).await;
+    assert_eq!(context.live_consumers.in_use(), 0);
+  }
+
+  /// Regression (audit P1-2): a retired session hands its consumers to the
+  /// node-scoped drain, and their lifecycle reservations survive that
+  /// transfer — and across sessions: the next session's admissions count
+  /// against the same node-wide budget, and every reservation returns when
+  /// the drained consumers finish.
+  #[tokio::test]
+  async fn retired_sessions_keep_their_reservations_through_the_node_drain() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let consumer = Arc::new(GatedConsumer {
+      gate: gate_rx,
+      accepted: Arc::new(Mutex::new(Vec::new())),
+    });
+    let context = context(Arc::clone(&consumer), 8);
+    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Session A: one complete stream, then the session ends orderly — the
+    // consumer keeps running under the node drain.
+    let (frames_a, _frames_a_rx) = test_queue(16, 1 << 20);
+    let mut source = FramesSource {
+      messages: vec![open_message(1, 2), end_message(1)].into(),
+    };
+    let grant_a = grant(2, 1);
+    read_loop(
+      &mut source,
+      &grant_a,
+      &context,
+      &frames_a,
+      &pending_acks,
+      &last_activity,
+    )
+    .await;
+    assert_eq!(
+      context.live_consumers.in_use(),
+      1,
+      "the retired session's consumer still holds its slot through the drain"
+    );
+
+    // Session B (a different peer incarnation) counts against the same
+    // node-wide budget while A's consumer is still running.
+    let (frames_b, _frames_b_rx) = test_queue(16, 1 << 20);
+    let mut source = FramesSource {
+      messages: vec![open_message(2, 3), end_message(2)].into(),
+    };
+    let grant_b = grant(3, 7);
+    read_loop(
+      &mut source,
+      &grant_b,
+      &context,
+      &frames_b,
+      &pending_acks,
+      &last_activity,
+    )
+    .await;
+    assert_eq!(
+      context.live_consumers.in_use(),
+      2,
+      "the node budget accumulates across retired sessions"
+    );
+    assert_eq!(
+      context.task_drains.lock().unwrap().len(),
+      2,
+      "each retired session handed its consumers to the node drain"
+    );
+
+    // The drained consumers finish and release their reservations.
+    gate_tx.send(true).unwrap();
+    consumers_finish(&consumer, 2).await;
+    let drains: Vec<_> = context.task_drains.lock().unwrap().drain(..).collect();
+    for drain in drains {
+      drain.await.unwrap();
+    }
+    assert_eq!(
+      context.live_consumers.in_use(),
+      0,
+      "every reservation returns when the drained consumers finish"
+    );
   }
 }
