@@ -39,18 +39,21 @@ use crate::{
 /// storage mutation. A handle referenced by the local identity conflicts
 /// without any mutation. Provider `Unknown` outcomes quarantine the intent
 /// until `reconcile_delete` proves `Absent`.
+///
+/// Runs inside the caller's writer section (the leave pipeline holds it
+/// across its whole phase sequence) and receives the permit; the
+/// section's inner steps get the same permit instead of acquiring again.
 pub(crate) async fn delete_unreferenced_key(
-  store: &crate::storage::MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
-  operation: &KeyOperationId, handle: &KeyHandle,
+  _permit: &crate::storage::WriterPermit<'_>, store: &crate::storage::MetadataStore,
+  keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, operation: &KeyOperationId,
+  handle: &KeyHandle,
 ) -> Result<()> {
-  // The whole journaled section holds the writer exclusion: see the
-  // same-purpose serialization note on the merge flow.
-  let _permit = store.write_permit().await;
   let purpose = deletion_purpose(handle);
   // The deletion path reconciles a frozen store after journal recovery
   // too (a cheap no-op on a non-frozen store), matching its historical
   // unconditional reconcile.
   crate::identity::lifecycle::recover_journal_prologue(
+    _permit,
     store,
     entropy,
     &purpose,
@@ -125,7 +128,7 @@ pub(crate) async fn delete_unreferenced_key(
           )
           .await?;
         drop(snapshot);
-        match commit_with_reconcile(store, prepared).await? {
+        match commit_with_reconcile(_permit, store, prepared).await? {
           CommitWithReconcile::Committed => {}
           CommitWithReconcile::Aborted => {
             if attempts >= 2 {
@@ -138,10 +141,10 @@ pub(crate) async fn delete_unreferenced_key(
       }
     };
     match delete_provider_step(
+      _permit,
       store,
       keys,
       entropy,
-      &purpose,
       &stored_intent,
       &intent,
       resumed,
@@ -156,11 +159,14 @@ pub(crate) async fn delete_unreferenced_key(
 }
 
 /// Drives the provider delete/reconcile step and the tombstone finalization
-/// for an installed deletion intent.
+/// for an installed deletion intent, still inside the caller's writer
+/// section.
 async fn delete_provider_step(
-  store: &crate::storage::MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
-  purpose: &str, stored_intent: &StoreValue, intent: &KeyDeletionIntentV1, resumed: bool,
+  _permit: &crate::storage::WriterPermit<'_>, store: &crate::storage::MetadataStore,
+  keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, stored_intent: &StoreValue,
+  intent: &KeyDeletionIntentV1, resumed: bool,
 ) -> Result<()> {
+  let purpose = deletion_purpose(intent.handle());
   let outcome = if resumed {
     keys
       .reconcile_delete(intent.operation(), intent.handle())
@@ -212,7 +218,7 @@ async fn delete_provider_step(
     .prepare_journaled_transaction(
       snapshot.as_ref(),
       TransactionId::generate(entropy)?,
-      purpose,
+      &purpose,
       vec![
         StoreOperation::Delete {
           namespace: intent_namespace,
@@ -236,11 +242,18 @@ async fn delete_provider_step(
     )
     .await?;
   drop(snapshot);
-  match commit_with_reconcile(store, prepared).await? {
+  match commit_with_reconcile(_permit, store, prepared).await? {
     CommitWithReconcile::Committed => {}
     CommitWithReconcile::Aborted => return accept_exact_tombstone(store, &tombstone).await,
   }
-  cleanup_pending_exact(store, entropy, purpose, "key deletion pending cleanup").await?;
+  cleanup_pending_exact(
+    _permit,
+    store,
+    entropy,
+    &purpose,
+    "key deletion pending cleanup",
+  )
+  .await?;
   Ok(())
 }
 
@@ -274,13 +287,24 @@ fn deletion_purpose(handle: &KeyHandle) -> String {
   crate::identity::records::JournalPurpose::KeyDeletion(handle.clone()).text()
 }
 
+/// Test entry point: the deletion section is inner to a journaled flow, so
+/// the test owns the writer permit that flow would hold and passes it in.
+#[cfg(test)]
+async fn delete_under_permit(
+  store: &crate::storage::MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+  operation: &KeyOperationId, handle: &KeyHandle,
+) -> Result<()> {
+  let permit = store.write_permit().await;
+  delete_unreferenced_key(&permit, store, keys, entropy, operation, handle).await
+}
+
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
 
   use tokio::sync::Notify;
 
-  use super::delete_unreferenced_key;
+  use super::delete_under_permit;
   use crate::{
     ErrorKind, KeyOperationId, StoreValue,
     identity::{
@@ -345,7 +369,7 @@ mod tests {
     let (operation, handle) = detached_pair(&fixture, 1);
     assert!(fixture.keys.has_handle(&handle));
 
-    delete_unreferenced_key(
+    delete_under_permit(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
@@ -363,7 +387,7 @@ mod tests {
     // Idempotent replay performs no mutation.
     let commits_before = commit_calls(&fixture.reference);
     let calls_before = fixture.keys.all_calls().len();
-    delete_unreferenced_key(
+    delete_under_permit(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
@@ -385,7 +409,7 @@ mod tests {
     let commits_before = commit_calls(&fixture.reference);
     let calls_before = fixture.keys.all_calls().len();
 
-    let error = delete_unreferenced_key(
+    let error = delete_under_permit(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
@@ -408,7 +432,7 @@ mod tests {
     let (operation, handle) = detached_pair(&fixture, 3);
     fixture.keys.push_delete_script(DeleteScript::Unknown);
 
-    let error = delete_unreferenced_key(
+    let error = delete_under_permit(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
@@ -423,7 +447,7 @@ mod tests {
 
     // Resume: reconcile_delete reports the handle still present, one delete
     // under the same operation completes, and the tombstone commits.
-    delete_unreferenced_key(
+    delete_under_permit(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
@@ -465,7 +489,7 @@ mod tests {
       let operation = KeyOperationId::parse("keyop-000000000000000000099").unwrap();
       let handle = keys.create_detached(&operation).handle().clone();
 
-      delete_unreferenced_key(
+      delete_under_permit(
         context.store(),
         &keys.as_provider(),
         entropy.as_ref(),
@@ -513,7 +537,7 @@ mod tests {
       let operation = operation.clone();
       let handle = handle.clone();
       async move {
-        delete_unreferenced_key(
+        delete_under_permit(
           context.store(),
           &provider,
           entropy.as_ref(),
@@ -537,7 +561,7 @@ mod tests {
     let context = open_context(&faulting.as_factory(), &keys, &entropy)
       .await
       .unwrap();
-    delete_unreferenced_key(
+    delete_under_permit(
       context.store(),
       &keys.as_provider(),
       entropy.as_ref(),
@@ -615,7 +639,7 @@ mod tests {
     let fixture = fixture().await;
     let (operation, handle) = detached_pair(&fixture, 7);
     let receipts_before = receipt_ids(&fixture.reference).len();
-    delete_unreferenced_key(
+    delete_under_permit(
       fixture.context.store(),
       &fixture.keys.as_provider(),
       fixture.entropy.as_ref(),
@@ -698,7 +722,7 @@ mod tests {
       state => panic!("unexpected create state: {state:?}"),
     };
 
-    delete_unreferenced_key(
+    delete_under_permit(
       context.store(),
       &keys,
       entropy.as_ref(),
@@ -738,7 +762,7 @@ mod guard_tests {
     let operation = KeyOperationId::parse("keyop-000000000000000000055").unwrap();
     let handle = keys.create_detached(&operation).handle().clone();
 
-    delete_unreferenced_key(
+    delete_under_permit(
       context.store(),
       &keys.as_provider(),
       entropy.as_ref(),
