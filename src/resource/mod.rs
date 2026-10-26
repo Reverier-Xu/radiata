@@ -421,7 +421,7 @@ impl ResourceRecordV1 {
       removal_rank,
       removed,
     )?;
-    Self::seal_prepared(
+    Ok(Self::seal_prepared(
       body,
       name,
       resource_type,
@@ -432,18 +432,20 @@ impl ResourceRecordV1 {
       removal_rank,
       removed,
       signature,
-    )
+    ))
   }
 
   /// Seals from an already-encoded canonical body: one encode, one digest
   /// (shared by `sign`, `sign_with_provider`, and the write-shape probe).
+  /// Assembly itself cannot fail — the digest is computed, not decoded —
+  /// so the constructor returns the record directly.
   #[allow(clippy::too_many_arguments)]
   fn seal_prepared(
     body: Vec<u8>, name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri,
     labels: LabelSet, timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
     signature: Signature,
-  ) -> Result<Self> {
-    Ok(Self {
+  ) -> Self {
+    Self {
       name,
       resource_type,
       resource_uri,
@@ -454,7 +456,7 @@ impl ResourceRecordV1 {
       removed,
       digest: body_digest(&body),
       signature,
-    })
+    }
   }
 
   /// Signs the canonical body with the given signing key and assembles the
@@ -483,7 +485,7 @@ impl ResourceRecordV1 {
         .sign(&signature_message(RESOURCE_RECORD_DOMAIN, &body))
         .to_bytes(),
     );
-    Self::seal_prepared(
+    Ok(Self::seal_prepared(
       body,
       name,
       resource_type,
@@ -494,7 +496,7 @@ impl ResourceRecordV1 {
       removal_rank,
       removed,
       signature,
-    )
+    ))
   }
 
   /// Assembles the record from a signature produced by the caller's key
@@ -520,7 +522,7 @@ impl ResourceRecordV1 {
     let signature = keys
       .sign(handle, &signature_message(RESOURCE_RECORD_DOMAIN, &body))
       .await?;
-    Self::seal_prepared(
+    Ok(Self::seal_prepared(
       body,
       name,
       resource_type,
@@ -531,7 +533,7 @@ impl ResourceRecordV1 {
       removal_rank,
       removed,
       signature,
-    )
+    ))
   }
 
   /// The canonical resource name this record describes.

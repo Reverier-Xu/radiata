@@ -87,9 +87,10 @@ impl TracePhase {
 }
 
 /// The closed wire-code mapping for [`ErrorKind`] failures. Codes are
-/// internal to this record schema; unknown codes fail closed.
-const fn kind_code(kind: ErrorKind) -> Option<u8> {
-  let code = match kind {
+/// internal to this record schema; the mapping covers every kind, so the
+/// code is total and unknown codes only exist on the decode side.
+const fn kind_code(kind: ErrorKind) -> u8 {
+  match kind {
     ErrorKind::InvalidInput => 1,
     ErrorKind::Conflict => 2,
     ErrorKind::NotFound => 3,
@@ -114,8 +115,7 @@ const fn kind_code(kind: ErrorKind) -> Option<u8> {
     ErrorKind::ShuttingDown => 21,
     ErrorKind::CallerError => 23,
     ErrorKind::Internal => 22,
-  };
-  Some(code)
+  }
 }
 
 /// The inverse of [`kind_code`]: a stored failure byte outside the known
@@ -266,10 +266,7 @@ struct TraceWire {
 
 fn encode_canonical_record(record: &TraceRecord) -> Result<Vec<u8>> {
   let (phase_code, failure) = match &record.phase {
-    TracePhase::Failed(kind) => (
-      TracePhase::FAILED,
-      kind_code(*kind).ok_or_else(|| Error::invalid_input("route trace failure"))?,
-    ),
+    TracePhase::Failed(kind) => (TracePhase::FAILED, kind_code(*kind)),
     phase => (phase.code(), NO_FAILURE),
   };
   crate::protocol::encode_canonical(
@@ -648,7 +645,7 @@ mod tests {
       ErrorKind::Internal,
     ];
     for kind in kinds {
-      let code = super::kind_code(kind).unwrap();
+      let code = super::kind_code(kind);
       assert_eq!(super::kind_from_code(code).unwrap(), kind);
     }
     for code in [0_u8, 25, u8::MAX] {
