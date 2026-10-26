@@ -448,41 +448,113 @@ pub(crate) fn collect_subjects<T>(
 /// budget); the next sync round continues.
 pub(crate) const TOMBSTONE_GC_BATCH: usize = 64;
 
-/// The shared checkpoint sweep body: conditional exact-digest deletes of
-/// `entries` (record key plus collection timestamp) stamped at or before
-/// `watermark`. A raced write on a tombstone conflicts and stays for the
+/// One checkpoint-collectible tombstone: the terminal record's own store
+/// key, its signed removal stamp, and the subject binding the record
+/// pins. Collecting the record retires the pinned binding in the same
+/// transaction — the unit that keeps a collected subject's old key from
+/// authenticating once its terminal evidence is reclaimed.
+pub(crate) struct CollectibleTombstone {
+  /// The terminal record's store key inside its family.
+  pub(crate) key: StoreKey,
+  /// The signed removal stamp compared against the checkpoint watermark.
+  pub(crate) stamp_millis: u64,
+  /// The subject whose pinned binding the collection retires.
+  pub(crate) subject: NodeId,
+  /// The exact key the record pins.
+  pub(crate) pinned_key: PublicKey,
+}
+
+/// The shared checkpoint sweep body: for each entry stamped at or before
+/// `watermark`, one transaction deletes the terminal record and retires
+/// the subject binding it pins while that binding is still the exact
+/// pinned key — the tombstone deletion and the binding retirement commit
+/// or conflict together, so authentication never observes a collected
+/// tombstone with a still-usable old binding (the node id revives only
+/// through a fresh merge under a new key). A re-bound subject (the
+/// retained key diverged — the revival path already ran) and a revoked
+/// subject (permanent exclusion; the retained binding is the evidence
+/// the revocation constrains) keep their bindings. A raced write
+/// conflicts the exact-digest expectations and the entry stays for the
 /// next pass (hygiene, never security). Holds the writer permit across
 /// the sweep like every identity phase.
 pub(crate) async fn collect_tombstones_before(
   store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: u64,
-  entries: &[(StoreKey, u64)],
+  entries: &[CollectibleTombstone],
 ) -> Result<usize> {
   let _permit = store.write_permit().await;
   let mut collected = 0_usize;
-  for (key, stamp_millis) in entries {
-    let (key, stamp_millis) = (key.clone(), *stamp_millis);
-    if stamp_millis > watermark {
+  for entry in entries {
+    if entry.stamp_millis > watermark {
       continue;
     }
     let snapshot = store.snapshot().await?;
-    let Some(existing) = snapshot.get(&namespace, &key).await? else {
+    let Some(existing) = snapshot.get(&namespace, &entry.key).await? else {
       continue;
     };
-    let transaction = store.prepare_transaction(
-      TransactionId::generate(entropy)?,
-      snapshot.revision().clone(),
-      vec![StoreOperation::Delete {
-        namespace: namespace.clone(),
-        key,
-        expected: existing.digest().clone(),
-      }],
-    )?;
+    let mut operations = vec![StoreOperation::Delete {
+      namespace: namespace.clone(),
+      key: entry.key.clone(),
+      expected: existing.digest().clone(),
+    }];
+    let mut retired_binding = false;
+    if let Some(retirement) = pinned_binding_retirement(store, snapshot.as_ref(), entry).await? {
+      retired_binding = true;
+      operations.push(retirement);
+    }
+    let revision = snapshot.revision().clone();
     drop(snapshot);
+    let transaction =
+      store.prepare_transaction(TransactionId::generate(entropy)?, revision, operations)?;
     if let crate::CommitOutcome::Committed(_) = store.commit(transaction).await? {
+      // The retired binding changes what the trust lane sends: the write
+      // epoch arms the plane's next rescan exactly like an adoption.
+      if retired_binding {
+        store.note_local_write_tag(crate::storage::families::IDENTITY_BINDING_NAMESPACE);
+      }
       collected += 1;
     }
   }
   Ok(collected)
+}
+
+/// The coupled binding retirement for one collected tombstone: the
+/// exact-digest delete of the subject's retained binding, present only
+/// while that binding still equals the record's pinned key and the
+/// subject carries no revocation. An undecodable binding fails every
+/// authentication read already, so its retirement is vacuous — the
+/// record is collected and the corrupt row is left to its typed readers.
+async fn pinned_binding_retirement(
+  store: &MetadataStore, snapshot: &dyn crate::provider::StoreSnapshot,
+  entry: &CollectibleTombstone,
+) -> Result<Option<StoreOperation>> {
+  let (namespace, key) = identity_binding_key(&entry.subject)?;
+  let Some(binding) = snapshot.get(&namespace, &key).await? else {
+    return Ok(None);
+  };
+  let decoded = match IdentityBindingV1::decode(binding.as_bytes()) {
+    Ok(decoded) => decoded,
+    Err(_) => {
+      tracing::debug!(
+        subject = %entry.subject,
+        "collected tombstone binding retirement skipped: undecodable binding"
+      );
+      return Ok(None);
+    }
+  };
+  if decoded.public_key() != &entry.pinned_key {
+    return Ok(None);
+  }
+  if crate::identity::revocation::revoked_key_ctx(store, &entry.subject)
+    .await?
+    .is_some()
+  {
+    return Ok(None);
+  }
+  Ok(Some(StoreOperation::Delete {
+    namespace,
+    key,
+    expected: binding.digest().clone(),
+  }))
 }
 
 #[derive(Clone, Eq, PartialEq)]
