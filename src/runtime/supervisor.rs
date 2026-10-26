@@ -1478,13 +1478,13 @@ mod receipt_retention_sweep_tests {
     retention: Duration,
   ) -> (
     Supervisor,
-    Arc<dyn crate::provider::StorageFactory>,
+    Arc<crate::storage::contract::ReferenceFactory>,
     Arc<dyn crate::api::Entropy>,
   ) {
-    let factory: Arc<dyn StorageFactory> =
-      Arc::new(crate::storage::contract::ReferenceFactory::new(
-        crate::storage::contract::required_capabilities(),
-      ));
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let factory: Arc<dyn StorageFactory> = reference.clone();
     let keys: Arc<dyn KeyProvider> = ScriptedKeys::full().as_provider();
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
     let context = Arc::new(
@@ -1536,7 +1536,7 @@ mod receipt_retention_sweep_tests {
       Ok(supervisor) => supervisor,
       Err(boxed) => panic!("supervisor construction failed: {}", boxed.0),
     };
-    (supervisor, factory, entropy)
+    (supervisor, reference, entropy)
   }
 
   fn test_namespace() -> Result<StoreNamespace> {
@@ -1604,11 +1604,10 @@ mod receipt_retention_sweep_tests {
     );
     tokio::time::sleep(retention + Duration::from_millis(250)).await;
 
-    // The manual command forgets the elapsed receipt. Receipts that lost
-    // their last reference are discovered and anchored by the candidate
-    // scan first (the retention-eligibility path), so the pass may forget
-    // more than the receipt anchored above — the important property is
-    // that the anchored receipt is gone, not the exact pass total.
+    // The manual command forgets the elapsed receipt. The ceremony
+    // behind the fixture forgets its own receipts inline, so no
+    // candidate population hides behind this pass: the forgotten count
+    // is exactly the receipt anchored above.
     let report = supervisor
       .context()
       .unwrap()
@@ -1616,7 +1615,7 @@ mod receipt_retention_sweep_tests {
       .apply_receipt_retention()
       .await
       .unwrap();
-    assert!(report.forgotten >= 1);
+    assert_eq!(report.forgotten, 1);
     assert!(!report.remaining);
     // A forgotten receipt never grows a second anchor.
     assert!(
@@ -1664,6 +1663,33 @@ mod receipt_retention_sweep_tests {
       .unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining);
+  }
+
+  /// The retention tick holds the same quietness contract as the
+  /// reconcile tick's quiescence probe: a fresh single node that just
+  /// completed its identity ceremony leaves no retention candidate and
+  /// no anchor behind, so repeated retention sweeps find nothing and the
+  /// store's commit count does not grow (regression: the ceremony's
+  /// leftover retention candidate made the first tick commit the anchor
+  /// and the candidate consumption as two background writes, drifting
+  /// commit-count pins and racing conditional commits on CI).
+  #[tokio::test]
+  async fn fresh_node_retention_sweeps_stay_storage_quiet() {
+    let (supervisor, reference, _entropy) = sweep_supervisor(Duration::from_secs(10)).await;
+    let ticks = supervisor.tick_state().unwrap();
+    let commits_before = reference
+      .commit_calls
+      .load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..3 {
+      ticks.receipt_retention_sweep().await;
+    }
+    assert_eq!(
+      reference
+        .commit_calls
+        .load(std::sync::atomic::Ordering::SeqCst),
+      commits_before,
+      "a fresh node's retention sweeps must not commit anything"
+    );
   }
 }
 

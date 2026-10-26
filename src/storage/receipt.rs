@@ -15,17 +15,18 @@ use crate::{
 };
 const USED_ID_TAG: &[u8] = b"\x01used-id\0";
 pub(crate) const ACTIVE_MARKER_VALUE: &[u8] = b"";
-pub(super) const FORGOTTEN_MARKER_VALUE: &[u8] = b"\x01forgotten\0";
+pub(crate) const FORGOTTEN_MARKER_VALUE: &[u8] = b"\x01forgotten\0";
 const REFERENCE_HEAD_TAG: &[u8] = b"\x02reference-head\0";
 const REFERENCE_EDGE_TAG: &[u8] = b"\x03reference-edge\0";
 const ELIGIBILITY_ANCHOR_TAG: &[u8] = b"\x04eligibility-anchor\0";
 /// The retention-candidate key family (v1 layout: the tag, then the
 /// target receipt's transaction id, exactly like the other internal
 /// transaction tags; the value is exactly the 32-byte operation digest).
-/// One marker is written by the same transaction that removes the
-/// target's last reference, so the eligibility sweep can rebuild the
-/// full `ReceiptIdentity` from durable state alone — the digest
-/// otherwise lives only inside the provider's private receipt table.
+/// One marker is written by the interrupted-flow resolution that removes
+/// the target's last reference (see [`FinalRemovalAction`]), so the
+/// eligibility sweep can rebuild the full `ReceiptIdentity` from durable
+/// state alone — the digest otherwise lives only inside the provider's
+/// private receipt table.
 const RETENTION_CANDIDATE_TAG: &[u8] = b"\x05retention-candidate\0";
 const EDGE_DELIMITER: u8 = 0;
 const RECORD_REFERENCE_DOMAIN: &[u8] = b"radiata.woooo.tech/receipt-reference/metadata-record/v1\0";
@@ -230,6 +231,26 @@ pub(crate) enum ReceiptReferenceChange {
     target: ReceiptIdentity,
     tokens: Vec<ReceiptReferenceToken>,
   },
+}
+
+/// What the transaction that removes a receipt's last reference does
+/// with the target receipt. Deterministic completion paths — the
+/// journaled finalize and the pending cleanup — pick
+/// [`Self::ForgetInline`]: the same transaction drives the cleanup
+/// state machine's forget arm, so a normally completed flow leaves no
+/// background retention work and the node's first retention tick stays
+/// storage-quiet (the same discipline the reconcile tick's quiescence
+/// probe enforces). The interrupted-flow resolution — a frozen journal
+/// declared uncommitted, whose durable evidence is indeterminate —
+/// picks [`Self::RetentionCandidate`] and leaves the marker the
+/// eligibility sweep collects later (see [`RETENTION_CANDIDATE_TAG`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalRemovalAction {
+  /// Flip the target's used-ID marker to forgotten and drop its provider
+  /// receipt row inside the removing transaction itself.
+  ForgetInline,
+  /// Leave the retention-candidate marker for the eligibility sweep.
+  RetentionCandidate,
 }
 
 pub(super) struct GroupedReceiptChange {
@@ -533,16 +554,19 @@ impl MetadataStore {
   /// their deadline and retains the rest, so one explicit host-triggered
   /// pass advances the anchored population one idempotent step.
   ///
-  /// Retention candidates: the reference state machine leaves a
-  /// candidate marker carrying the operation digest behind whenever a
-  /// receipt loses its last reference (see [`RETENTION_CANDIDATE_TAG`]),
-  /// because nothing else durable names that receipt's identity. This
-  /// pass drives each candidate through the same cleanup state machine,
-  /// which anchors it, and deletes the marker in the same pass: the
-  /// anchor (or the forgotten used-ID marker) is the durable driver from
-  /// then on, so the candidate population cannot outlive its purpose.
-  /// The state machine's own audit still refuses to anchor any receipt
-  /// that carries an owner reference.
+  /// Retention candidates: the interrupted-flow resolution leaves a
+  /// candidate marker carrying the operation digest behind when it
+  /// removes a receipt's last reference (see
+  /// [`RETENTION_CANDIDATE_TAG`] and [`FinalRemovalAction`]), because
+  /// nothing else durable names that receipt's identity — deterministic
+  /// completions forget their receipts inline instead, so this family
+  /// only ever holds crash and interruption leftovers. This pass drives
+  /// each candidate through the same cleanup state machine, which
+  /// anchors it, and deletes the marker in the same pass: the anchor (or
+  /// the forgotten used-ID marker) is the durable driver from then on,
+  /// so the candidate population cannot outlive its purpose. The state
+  /// machine's own audit still refuses to anchor any receipt that
+  /// carries an owner reference.
   ///
   /// Each scan examines at most [`RETENTION_SWEEP_BOUND`] entries — due
   /// or not — and resumes strictly after the last examined key (see
@@ -953,9 +977,12 @@ pub(super) fn group_receipt_changes(
   Ok(groups)
 }
 
-pub(super) async fn build_receipt_change_operations(
+/// Builds one grouped change's final operations. Only reachable within
+/// this module (the expansion seam below drives it), so the
+/// [`FinalRemovalAction`] disposition stays module-private.
+async fn build_receipt_change_operations(
   snapshot: &dyn StoreSnapshot, namespace: &StoreNamespace, self_id: &TransactionId,
-  group: &GroupedReceiptChange,
+  group: &GroupedReceiptChange, removal: FinalRemovalAction,
 ) -> crate::Result<Vec<StoreOperation>> {
   let additional = u64::try_from(group.tokens.len())
     .map_err(|_| Error::resource_exhausted("receipt reference count"))?;
@@ -969,10 +996,10 @@ pub(super) async fn build_receipt_change_operations(
     )
     .await;
   };
-  match verify_live_marker(snapshot, namespace, target.transaction()).await? {
-    LiveMarker::Active(_) => {}
+  let active_marker = match verify_live_marker(snapshot, namespace, target.transaction()).await? {
+    LiveMarker::Active(marker) => marker,
     LiveMarker::Forgotten => return Err(Error::conflict("receipt reference target")),
-  }
+  };
 
   // The multi-token change group keeps its historical read order (head,
   // anchor, every edge, then the audit): the read sequence is observable
@@ -1016,7 +1043,12 @@ pub(super) async fn build_receipt_change_operations(
       .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
     let final_removal = remaining == 0;
     operations
-      .try_reserve_exact(group.tokens.len() + 1 + usize::from(final_removal))
+      .try_reserve_exact(
+        group.tokens.len()
+          + 1
+          + usize::from(final_removal)
+          + usize::from(final_removal && matches!(removal, FinalRemovalAction::ForgetInline)),
+      )
       .map_err(|_| Error::resource_exhausted("receipt reference change"))?;
     for (token, edge) in group.tokens.iter().zip(&edges) {
       let Some(edge) = edge else {
@@ -1034,20 +1066,46 @@ pub(super) async fn build_receipt_change_operations(
         key: head_key,
         expected: head.digest().clone(),
       });
-      // The receipt just lost its last reference, so nothing durable but
-      // the receipt's own provider row names its operation digest any
-      // more. The same transaction writes the retention candidate that
-      // carries it (see [`RETENTION_CANDIDATE_TAG`]); the eligibility
-      // sweep drives the receipt through the cleanup state machine and
-      // consumes the marker again, so it never accumulates. The marker
-      // is not an anchor: a receipt that still carried a reference never
-      // reaches this branch.
-      operations.push(StoreOperation::Put {
-        namespace: namespace.clone(),
-        key: retention_candidate_key(target.transaction())?,
-        expected: StoreExpectation::Absent,
-        value: candidate_value(target.operation_digest()),
-      });
+      match removal {
+        FinalRemovalAction::ForgetInline => {
+          // The receipt just lost its last reference inside a
+          // deterministic completion, so the same transaction drives the
+          // cleanup state machine's forget arm: the permanent used-ID
+          // marker flips to forgotten (the transaction id stays
+          // reserved forever) and the provider receipt row is dropped,
+          // leaving no retention work for the background sweep. The
+          // reference audit already proved no anchor exists (a
+          // referenced receipt never carries one), so unlike the sweep's
+          // forget arm this needs no anchor step.
+          operations.push(StoreOperation::Put {
+            namespace: namespace.clone(),
+            key: used_id_key(target.transaction())?,
+            expected: StoreExpectation::Exact(active_marker.digest().clone()),
+            value: marker_value(FORGOTTEN_MARKER_VALUE),
+          });
+          operations.push(StoreOperation::ForgetReceipt {
+            transaction: target.transaction().clone(),
+            expected_operation_digest: target.operation_digest().clone(),
+          });
+        }
+        FinalRemovalAction::RetentionCandidate => {
+          // The interrupted-flow resolution cannot know the receipt's
+          // fate from durable evidence, so nothing durable but the
+          // receipt's own provider row names its operation digest any
+          // more. The same transaction writes the retention candidate
+          // that carries it (see [`RETENTION_CANDIDATE_TAG`]); the
+          // eligibility sweep drives the receipt through the cleanup
+          // state machine and consumes the marker again, so it never
+          // accumulates. The marker is not an anchor: a receipt that
+          // still carried a reference never reaches this branch.
+          operations.push(StoreOperation::Put {
+            namespace: namespace.clone(),
+            key: retention_candidate_key(target.transaction())?,
+            expected: StoreExpectation::Absent,
+            value: candidate_value(target.operation_digest()),
+          });
+        }
+      }
     } else {
       operations.push(StoreOperation::Put {
         namespace: namespace.clone(),
@@ -1102,13 +1160,36 @@ pub(super) async fn build_receipt_change_operations(
 /// appends them to `operations`: the single owner-local expansion seam
 /// every prepare and cleanup site funnels through, so the grouping,
 /// group order, and transaction budget cannot drift between sites.
+/// Deterministic completion sites call this seam directly: a receipt
+/// that loses its last reference here is forgotten in the same
+/// transaction (see [`FinalRemovalAction::ForgetInline`]).
 pub(super) async fn extend_with_receipt_change_operations(
   snapshot: &dyn StoreSnapshot, namespace: &StoreNamespace, self_id: &TransactionId,
   changes: Vec<ReceiptReferenceChange>, operations: &mut Vec<StoreOperation>,
 ) -> crate::Result<()> {
+  expand_receipt_change_operations(
+    snapshot,
+    namespace,
+    self_id,
+    changes,
+    FinalRemovalAction::ForgetInline,
+    operations,
+  )
+  .await
+}
+
+/// The disposition-aware core of [`extend_with_receipt_change_operations`]:
+/// only the interrupted-flow resolution passes a final-removal action
+/// other than the deterministic inline forget.
+async fn expand_receipt_change_operations(
+  snapshot: &dyn StoreSnapshot, namespace: &StoreNamespace, self_id: &TransactionId,
+  changes: Vec<ReceiptReferenceChange>, removal: FinalRemovalAction,
+  operations: &mut Vec<StoreOperation>,
+) -> crate::Result<()> {
   let groups = group_receipt_changes(self_id, changes)?;
   for group in &groups {
-    let built = build_receipt_change_operations(snapshot, namespace, self_id, group).await?;
+    let built =
+      build_receipt_change_operations(snapshot, namespace, self_id, group, removal).await?;
     operations
       .try_reserve_exact(built.len())
       .map_err(|_| Error::resource_exhausted("metadata storage transaction"))?;
@@ -1163,7 +1244,11 @@ async fn build_self_reference_operations(
 /// receipt, so a receipt touched by a declared-uncommitted transaction
 /// can anchor and be forgotten again instead of staying permanently
 /// referenced. A forgotten target receipt carries no reachable reference
-/// set, so the record delete alone applies.
+/// set, so the record delete alone applies. A removal that takes the
+/// target's last reference leaves the retention candidate (see
+/// [`FinalRemovalAction::RetentionCandidate`]): the interrupted flow's
+/// durable evidence is indeterminate, which is exactly the population
+/// the eligibility sweep exists to collect.
 pub(super) async fn build_pending_record_delete_operations(
   snapshot: &dyn StoreSnapshot, operation_id: &TransactionId, target: &ReceiptIdentity,
   token: &ReceiptReferenceToken, record_namespace: StoreNamespace, record_key: StoreKey,
@@ -1183,7 +1268,7 @@ pub(super) async fn build_pending_record_delete_operations(
     verify_live_marker(snapshot, &namespace, target.transaction()).await?,
     LiveMarker::Active(_)
   ) {
-    extend_with_receipt_change_operations(
+    expand_receipt_change_operations(
       snapshot,
       &namespace,
       operation_id,
@@ -1191,6 +1276,7 @@ pub(super) async fn build_pending_record_delete_operations(
         target: target.clone(),
         tokens: vec![token.clone()],
       }],
+      FinalRemovalAction::RetentionCandidate,
       &mut operations,
     )
     .await?;
@@ -1539,14 +1625,15 @@ pub(crate) mod retention_testing {
 #[cfg(test)]
 mod receipt_retention_tests {
   use std::{
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, UNIX_EPOCH},
   };
 
   use super::{
-    MetadataStore, RETENTION_SWEEP_BOUND, ReceiptCleanupOutcome, ReceiptIdentity,
-    ReceiptReferenceChange, ReceiptReferenceToken, eligibility_anchor_key, internal_namespace,
-    retention_candidate_key,
+    ACTIVE_MARKER_VALUE, FORGOTTEN_MARKER_VALUE, MetadataStore, RETENTION_SWEEP_BOUND,
+    ReceiptCleanupOutcome, ReceiptIdentity, ReceiptReferenceChange, ReceiptReferenceToken,
+    build_pending_record_delete_operations, eligibility_anchor_key, internal_namespace,
+    prepare_internal_transaction, reference_head_key, retention_candidate_key, used_id_key,
   };
   use crate::{
     Digest, StoreExpectation, StoreOperation, StoreValue,
@@ -1719,15 +1806,15 @@ mod receipt_retention_tests {
     assert!(!report.remaining, "the population is fully drained");
   }
 
-  /// The final removal transaction carries the retention candidate that
-  /// names the receipt's operation digest, and the sweep turns it into
-  /// the anchor the retention clock needs: an intermediate removal
-  /// writes no marker, the anchoring pass consumes the marker it used,
-  /// and the anchored receipt is then forgotten by the deadline like any
-  /// other (regression: a receipt that lost its last reference had no
-  /// durable identity source and could never be retained).
+  /// The deterministic completion seam forgets a receipt in the very
+  /// transaction that removes its last reference: the used-ID marker
+  /// flips to forgotten, the provider receipt row is dropped, and no
+  /// anchor or retention candidate is left behind, so repeated
+  /// eligibility passes stay commit-quiet (regression: the final removal
+  /// used to leave a retention candidate whose sweep committed the
+  /// anchor and the marker consumption on the node's first tick).
   #[tokio::test]
-  async fn retention_sweep_anchors_the_receipt_a_final_removal_left_behind() {
+  async fn final_removal_forgets_the_receipt_in_the_same_transaction() {
     let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
     let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
@@ -1735,6 +1822,7 @@ mod receipt_retention_tests {
     let internal = internal_namespace().unwrap();
     let candidate_key = retention_candidate_key(target.transaction()).unwrap();
     let anchor_key = eligibility_anchor_key(target.transaction()).unwrap();
+    let marker_key = used_id_key(target.transaction()).unwrap();
     let tokens = [
       ReceiptReferenceToken::from_digest(Digest::from_bytes([41; 32])),
       ReceiptReferenceToken::from_digest(Digest::from_bytes([42; 32])),
@@ -1777,6 +1865,16 @@ mod receipt_retention_tests {
         .is_none(),
       "an intermediate removal leaves the reference state machine unchanged"
     );
+    assert_eq!(
+      snapshot
+        .get(&internal, &marker_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .as_bytes(),
+      ACTIVE_MARKER_VALUE,
+      "the intermediate removal keeps the receipt live"
+    );
     drop(snapshot);
 
     let snapshot = store.snapshot().await.unwrap();
@@ -1797,10 +1895,164 @@ mod receipt_retention_tests {
     let snapshot = store.snapshot().await.unwrap();
     assert_eq!(
       snapshot
+        .get(&internal, &marker_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .as_bytes(),
+      FORGOTTEN_MARKER_VALUE,
+      "the final removal flips the used-ID marker to forgotten"
+    );
+    assert!(
+      snapshot
+        .get(
+          &internal,
+          &reference_head_key(target.transaction()).unwrap()
+        )
+        .await
+        .unwrap()
+        .is_none(),
+      "the final removal deletes the reference head"
+    );
+    assert!(
+      snapshot
         .get(&internal, &candidate_key)
         .await
         .unwrap()
-        .expect("the final removal writes the retention candidate")
+        .is_none(),
+      "the deterministic completion leaves no retention candidate"
+    );
+    assert!(
+      snapshot
+        .get(&internal, &anchor_key)
+        .await
+        .unwrap()
+        .is_none(),
+      "the deterministic completion leaves no anchor either"
+    );
+    drop(snapshot);
+    assert!(
+      !factory
+        .state
+        .lock()
+        .unwrap()
+        .receipts
+        .contains_key(target.transaction()),
+      "the final removal drops the provider receipt row"
+    );
+
+    // The eligibility sweep stays commit-quiet over the completed flow:
+    // no candidate, no anchor, nothing to forget.
+    let commits_before = factory.commit_calls.load(Ordering::SeqCst);
+    for _ in 0..3 {
+      let report = store.apply_receipt_retention().await.unwrap();
+      assert_eq!(report.forgotten, 0);
+      assert!(!report.remaining);
+    }
+    assert_eq!(
+      factory.commit_calls.load(Ordering::SeqCst),
+      commits_before,
+      "repeated eligibility passes must not commit over a completed flow"
+    );
+    assert!(
+      matches!(
+        store
+          .cleanup_receipt(&target, transaction_id(505))
+          .await
+          .unwrap(),
+        ReceiptCleanupOutcome::Conflict
+      ),
+      "a forgotten receipt never re-enters the cleanup state machine"
+    );
+  }
+
+  /// The interrupted-flow resolution is the one path that still leaves a
+  /// retention candidate: its declared-uncommitted target's durable
+  /// evidence is indeterminate, so the final reference removal writes
+  /// the candidate marker carrying the receipt's operation digest, the
+  /// sweep anchors and consumes it, and the elapsed deadline forgets the
+  /// anchored receipt like any other (the P2-14 acceptance: receipts
+  /// left behind by crash or interruption stay collectable).
+  #[tokio::test]
+  async fn retention_sweep_collects_the_receipt_an_interrupted_flow_left_behind() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    let (_, target) = commit_target(&store, 600).await;
+    let internal = internal_namespace().unwrap();
+    let candidate_key = retention_candidate_key(target.transaction()).unwrap();
+    let anchor_key = eligibility_anchor_key(target.transaction()).unwrap();
+    // The pending journal record a crashed flow left behind, plus the
+    // receipt-reference token that names it: exactly the durable shape
+    // the frozen-journal abort resolution deletes together.
+    let record_namespace = namespace("interrupted-pending");
+    let record_key = store_key(b"pending-record");
+    let token = ReceiptReferenceToken::for_record(&record_namespace, &record_key);
+    assert!(matches!(
+      store
+        .add_receipt_reference(&target, &token, transaction_id(601))
+        .await
+        .unwrap(),
+      super::ReceiptReferenceOutcome::Applied(_)
+    ));
+    let snapshot = store.snapshot().await.unwrap();
+    let prepared = store
+      .prepare_transaction(
+        transaction_id(602),
+        snapshot.revision().clone(),
+        vec![StoreOperation::Put {
+          namespace: record_namespace.clone(),
+          key: record_key.clone(),
+          expected: StoreExpectation::Absent,
+          value: value(b"pending record"),
+        }],
+      )
+      .unwrap();
+    drop(snapshot);
+    committed(store.commit(prepared).await.unwrap());
+    let record_digest = {
+      let snapshot = store.snapshot().await.unwrap();
+      snapshot
+        .get(&record_namespace, &record_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .digest()
+        .clone()
+    };
+
+    let snapshot = store.snapshot().await.unwrap();
+    let base_revision = snapshot.revision().clone();
+    let operations = build_pending_record_delete_operations(
+      snapshot.as_ref(),
+      &transaction_id(603),
+      &target,
+      &token,
+      record_namespace.clone(),
+      record_key.clone(),
+      record_digest,
+    )
+    .await
+    .unwrap();
+    drop(snapshot);
+    let prepared =
+      prepare_internal_transaction(transaction_id(603), base_revision, operations).unwrap();
+    committed(store.commit(prepared).await.unwrap());
+    let snapshot = store.snapshot().await.unwrap();
+    assert!(
+      snapshot
+        .get(&record_namespace, &record_key)
+        .await
+        .unwrap()
+        .is_none(),
+      "the resolution deletes the pending record"
+    );
+    assert_eq!(
+      snapshot
+        .get(&internal, &candidate_key)
+        .await
+        .unwrap()
+        .expect("the interrupted final removal writes the retention candidate")
         .as_bytes(),
       target.operation_digest().as_bytes(),
       "the candidate carries the receipt's operation digest"
