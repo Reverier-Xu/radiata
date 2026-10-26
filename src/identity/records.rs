@@ -421,6 +421,46 @@ pub(crate) async fn sign_tombstone(
   Ok(signature)
 }
 
+/// The shared shape of one issuer-signed terminal tombstone (the cleanup
+/// and revocation records): the retained-binding admission check below
+/// runs over this one view, so the two families' issuer and subject
+/// rules cannot drift apart.
+pub(crate) trait IssuerSignedTombstone {
+  /// The tombstone's issuer node.
+  fn issuer_node(&self) -> &NodeId;
+  /// The tombstone's subject node.
+  fn subject_node(&self) -> &NodeId;
+  /// The exact subject key the tombstone pins.
+  fn pinned_subject_key(&self) -> &PublicKey;
+  /// Verifies the issuer signature against `issuer_key`.
+  fn verify_issuer_signature(&self, issuer_key: &PublicKey) -> Result<()>;
+}
+
+/// The retained-binding admission check behind the cleanup and
+/// revocation persists: the issuer must hold a locally retained binding
+/// whose key verifies the record's signature, and a retained subject
+/// binding — when present — must equal the record's pinned subject key
+/// (a divergent retained binding is conflicting evidence and fails
+/// closed; an absent subject binding stays fail-open for the adoption
+/// case each family documents). The two error contexts keep the typed
+/// refusals distinguishable per family.
+pub(crate) async fn verify_retained_bindings<T: IssuerSignedTombstone>(
+  store: &MetadataStore, record: &T, issuer_context: &'static str, subject_context: &'static str,
+) -> Result<()> {
+  let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
+  let issuer_key = bindings
+    .get(record.issuer_node())
+    .cloned()
+    .ok_or_else(|| Error::not_trusted(issuer_context))?;
+  record.verify_issuer_signature(&issuer_key)?;
+  if let Some(bound) = bindings.get(record.subject_node())
+    && bound != record.pinned_subject_key()
+  {
+    return Err(Error::not_trusted(subject_context));
+  }
+  Ok(())
+}
+
 /// Whether one exact key is present in a metadata namespace (snapshot
 /// read only).
 pub(crate) async fn key_present(

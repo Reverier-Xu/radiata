@@ -413,6 +413,37 @@ pub(crate) mod store {
     None
   }
 
+  /// The same-key page-order contest over one descriptor batch: per
+  /// node, only a strictly greater revision displaces the incumbent and
+  /// the first among equals stays — the exact ordering the sequential
+  /// single-record apply committed. Single-sourced here so the
+  /// register's page batch and the reconcile plane's row apply cannot
+  /// drift apart. Returns the winner positions in first-seen order and
+  /// the loser positions in decision order (an arriving stale-or-equal
+  /// row refuses at arrival; a displaced incumbent refuses when
+  /// displaced).
+  pub(crate) fn contest_descriptors(descriptors: &[&NodeDescriptorV1]) -> (Vec<usize>, Vec<usize>) {
+    let mut winners: Vec<usize> = Vec::with_capacity(descriptors.len());
+    let mut losers = Vec::new();
+    let mut index_by_node: HashMap<&str, usize> = HashMap::with_capacity(descriptors.len());
+    for (position, descriptor) in descriptors.iter().enumerate() {
+      match index_by_node.get(descriptor.node().as_str()) {
+        Some(&index) if descriptors[winners[index]].revision() >= descriptor.revision() => {
+          losers.push(position);
+        }
+        Some(&index) => {
+          losers.push(winners[index]);
+          winners[index] = position;
+        }
+        None => {
+          index_by_node.insert(descriptor.node().as_str(), winners.len());
+          winners.push(position);
+        }
+      }
+    }
+    (winners, losers)
+  }
+
   /// Applies one received descriptor page as ONE durable transaction: the
   /// per-descriptor decisions mirror [`store_descriptor_ctx`] exactly
   /// (older revisions, removal protection, illegal first revisions, and
@@ -437,22 +468,12 @@ pub(crate) mod store {
     // Page-order contest for repeated nodes: the highest revision wins,
     // first among equals — exactly what the sequential single-record
     // apply committed — and the transaction's keys stay distinct.
-    let mut contenders: Vec<&NodeDescriptorV1> = Vec::new();
-    let mut index_by_key: HashMap<StoreKey, usize> = HashMap::new();
-    for descriptor in page.descriptors() {
-      let key = descriptor_key(descriptor.node());
-      match index_by_key.get(&key) {
-        Some(&index) => {
-          if descriptor.revision() > contenders[index].revision() {
-            contenders[index] = descriptor;
-          }
-        }
-        None => {
-          index_by_key.insert(key, contenders.len());
-          contenders.push(descriptor);
-        }
-      }
-    }
+    let page_rows: Vec<&NodeDescriptorV1> = page.descriptors().iter().collect();
+    let (winner_rows, _loser_rows) = contest_descriptors(&page_rows);
+    let contenders: Vec<&NodeDescriptorV1> = winner_rows
+      .into_iter()
+      .map(|index| page_rows[index])
+      .collect();
     let mut attempt = 0_u8;
     loop {
       let snapshot = store.snapshot().await?;
@@ -715,6 +736,35 @@ mod tests {
     assert_eq!(
       super::member_connectivity(false),
       crate::ConnectivityStatus::Reachable
+    );
+  }
+
+  /// The shared page-order contest: per node the strictly greater
+  /// revision displaces the incumbent, the first among equals stays,
+  /// and nodes keep their first-seen order — the ruleset both the
+  /// register's page batch and the reconcile plane's row apply commit.
+  #[test]
+  fn descriptor_contest_picks_first_seen_strictly_greater_winners() {
+    let rows = [
+      descriptor(1, 1, vec!["one.example"], false),
+      descriptor(3, 2, vec!["two.example"], false),
+      descriptor(3, 1, vec!["one-again.example"], false),
+      descriptor(2, 2, vec!["two-stale.example"], false),
+      descriptor(4, 1, vec!["one-final.example"], false),
+      descriptor(5, 3, vec!["three.example"], false),
+      descriptor(5, 3, vec!["three-equal.example"], false),
+    ];
+    let refs: Vec<&NodeDescriptorV1> = rows.iter().collect();
+    let (winners, losers) = store::contest_descriptors(&refs);
+    assert_eq!(winners, vec![4, 1, 5], "winners in first-seen node order");
+    assert_eq!(losers, vec![0, 3, 2, 6], "losers in decision order");
+    assert_eq!(
+      refs[winners[0]].endpoints()[0].host(),
+      Some("one-final.example")
+    );
+    assert_eq!(
+      refs[winners[2]].endpoints()[0].host(),
+      Some("three.example")
     );
   }
 

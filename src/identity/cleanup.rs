@@ -121,6 +121,26 @@ impl CleanupRecordV1 {
   }
 }
 
+/// The retained-binding admission view the shared issuer/subject check
+/// (`records::verify_retained_bindings`) runs over for this family.
+impl records::IssuerSignedTombstone for CleanupRecordV1 {
+  fn issuer_node(&self) -> &NodeId {
+    self.issuer()
+  }
+
+  fn subject_node(&self) -> &NodeId {
+    self.subject()
+  }
+
+  fn pinned_subject_key(&self) -> &PublicKey {
+    self.subject_key()
+  }
+
+  fn verify_issuer_signature(&self, issuer_key: &PublicKey) -> Result<()> {
+    self.verify(issuer_key)
+  }
+}
+
 fn cleanup_key(subject: &NodeId) -> StoreKey {
   StoreKey::new(Arc::from(subject.as_str().as_bytes().to_vec()))
 }
@@ -196,17 +216,8 @@ pub(crate) async fn persist_cleanup_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &CleanupRecordV1,
 ) -> Result<records::TerminalInstall> {
   let _permit = store.write_permit().await;
-  let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
-  let issuer_key = bindings
-    .get(record.issuer())
-    .cloned()
-    .ok_or_else(|| Error::not_trusted("cleanup issuer"))?;
-  record.verify(&issuer_key)?;
-  if let Some(bound) = bindings.get(record.subject())
-    && bound != record.subject_key()
-  {
-    return Err(Error::not_trusted("cleanup subject binding"));
-  }
+  records::verify_retained_bindings(store, record, "cleanup issuer", "cleanup subject binding")
+    .await?;
   records::persist_convergent_terminal_record(
     store,
     entropy,

@@ -446,7 +446,10 @@ async fn create_key_exact(
 }
 
 /// Verifies that the provider returns exactly `expected` for `handle`.
-async fn verify_provider_key(
+/// Shared by the lifecycle create paths and the leave replacement-key
+/// resume (both reconciliation arms must catch a provider that hands
+/// back a different key for the same handle).
+pub(crate) async fn verify_provider_key(
   keys: &Arc<dyn KeyProvider>, handle: &crate::KeyHandle, expected: &crate::PublicKey,
 ) -> Result<()> {
   let provided = keys.public_key(handle).await?;
