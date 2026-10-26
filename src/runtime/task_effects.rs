@@ -15,7 +15,10 @@
 //! half, so a caller holding a handle never keeps the metadata store's
 //! exclusive lock alive past node shutdown.
 
-use std::sync::{Arc, Mutex};
+use std::{
+  sync::{Arc, Mutex},
+  time::Duration,
+};
 
 use tokio::sync::watch;
 
@@ -927,6 +930,14 @@ pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
   Ok(())
 }
 
+/// The retry backoff between one publication task's ensure attempts: a
+/// failed attempt already paid its own entry wait, so the pause only
+/// keeps a persistently failing store from hammering the commit entry,
+/// while the publication still lands on the same kicked task (the
+/// single-flight gate stays held across retries, bounding the
+/// population at one task).
+const DESCRIPTOR_PUBLICATION_RETRY: Duration = Duration::from_millis(100);
+
 /// Schedules the local descriptor's lazy publication OFF the
 /// supervisor's select loop (remaining items 2026-10-10, P2-9): the
 /// member read views call this instead of awaiting the ensure, so a
@@ -934,15 +945,25 @@ pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
 /// longer park every control-plane operation behind the descriptor
 /// commit on slow storage. Bounded accounting: the endpoint-set stamp
 /// suppresses the kick in steady state, and the single-flight gate
-/// bounds the population at exactly one task; a failed publication
-/// only clears the slot (never the stamp), so the next member read
-/// retries while the maintenance tick remains the drift backstop.
+/// bounds the population at exactly one task. The scheduled task is
+/// PERSISTENT: it retries a failed ensure (with the short backoff
+/// above) until the publication lands, instead of exiting and waiting
+/// for the next member read to re-kick it — a member-visible write the
+/// read path already answered for must not depend on further reads to
+/// complete, and on slow storage (where one background commit can
+/// outlast the store's whole bounded entry wait) a die-and-re-kick
+/// cycle can lose the entry race indefinitely. The stamp still records
+/// only successes, so a failing task never suppresses a later kick
+/// once it terminalizes (success or shutdown).
+///
 /// The task is enrolled in the tracked connection-task registry (the
 /// same ownership path as the maintenance plane's in-flight dials): it
 /// holds the metadata store's exclusive handle through the shared deps
 /// Arcs, so the shutdown path must await it inside the bounded
 /// cooperative window and abort the straggler before the reply returns
-/// — a detached spawn would keep the store locked past shutdown.
+/// — a detached spawn would keep the store locked past shutdown. The
+/// retry loop observes the same shutdown signal, so a waiting task
+/// exits cooperatively and only a straggler mid-commit needs the abort.
 ///
 /// The kicking read answers from committed state only: on a node whose
 /// descriptor is not yet published, that single read may not include
@@ -967,22 +988,51 @@ pub(super) fn kick_self_descriptor_publication(deps: &Arc<OperationDeps>) {
     return;
   }
   let deps = Arc::clone(deps);
+  let mut shutdown = planes.shutdown.subscribe();
   track_connection_task(
     &planes.connection_tasks,
     Box::pin(async move {
       // The slot must release even if the provider-backed ensure panics:
       // a stuck flag would suppress every later kick for the node's
       // lifetime, so the guard clears it on any exit path.
-      let slot = PublicationSlot {
+      let _slot = PublicationSlot {
         deps: Arc::clone(&deps),
       };
-      if let Err(error) = ensure_self_descriptor(&deps).await {
-        tracing::warn!(
-          kind = ?error.kind(),
-          "lazy local-descriptor publication failed; the next member read retries"
-        );
+      // The first failure is the audible one; a store that keeps
+      // refusing (busy, frozen pending reconcile) retries quietly so a
+      // persistently degraded device does not spam the same warning per
+      // backoff tick. The task's completion — the descriptor landing —
+      // is itself the success signal.
+      let mut announced = false;
+      loop {
+        match ensure_self_descriptor(&deps).await {
+          Ok(()) => return,
+          Err(error) if !announced => {
+            announced = true;
+            tracing::warn!(
+              kind = ?error.kind(),
+              "lazy local-descriptor publication failed; the publication task retries"
+            );
+          }
+          Err(error) => {
+            tracing::debug!(
+              kind = ?error.kind(),
+              "lazy local-descriptor publication retry failed"
+            );
+          }
+        }
+        // The retry pause is cancellable by the shutdown signal: a
+        // node tearing down must not sit out a backoff whose only
+        // purpose is politeness toward a failing store. A closed watch
+        // (sender dropped) is the same exit cue.
+        tokio::select! {
+          changed = shutdown.changed() => {
+            let _ = changed;
+            return;
+          }
+          _ = tokio::time::sleep(DESCRIPTOR_PUBLICATION_RETRY) => {}
+        }
       }
-      drop(slot);
     }),
   );
 }
