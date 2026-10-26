@@ -446,18 +446,22 @@ async fn apply_cleanup_record(
 /// evidence, verified against the retained issuer and subject bindings
 /// before any persistence, never covered by checkpoints, and never
 /// re-adoptable away. A persisted revocation closes the authorization
-/// boundary immediately on this node too: any live session with the
-/// revoked identity retires (its recovery dials race the propagation,
-/// so a session admitted before this tombstone landed must not linger).
-/// Session retirement is independent of the evidence verdict; the
-/// revocation event fires only for a first revocation, never for a
-/// canonical evidence replacement or an unchanged replay.
+/// boundary immediately on this node too — the same boundary the local
+/// revoke effect holds (audit 2026-10-23, P1-11): any live session with
+/// the revoked identity retires, and a handshake already in flight is
+/// refused at its final publication (its recovery dials race the
+/// propagation, so a session admitted before this tombstone landed must
+/// not linger either). Session retirement is independent of the
+/// evidence verdict; the revocation event fires only for a first
+/// revocation, never for a canonical evidence replacement or an
+/// unchanged replay.
 #[allow(clippy::too_many_arguments)]
 async fn apply_revocation_record(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
   events: &Arc<crate::node::EventHub>, evidence: &TombstoneEvidence,
   record: &crate::identity::revocation::RevocationRecordV1,
   sessions: &crate::session::stream::SessionTable,
+  authorization: &crate::session::stream::AuthorizationBoundary,
 ) -> Result<()> {
   if !evidence.bindings.contains_key(record.issuer())
     || !evidence.bindings.contains_key(record.subject())
@@ -465,12 +469,24 @@ async fn apply_revocation_record(
     tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
     return Ok(());
   }
+  // The same exclusive section the local revoke effect holds (audit
+  // 2026-10-23, P1-11): the durable tombstone install, the ledger
+  // record, and the session retirement run as ONE section against
+  // session publication. A handshake whose admission predated this
+  // tombstone either published before the section ran (the retirement
+  // below removes it) or re-checks the ledger after the section and
+  // refuses to publish — the remote lane closes the in-flight window
+  // exactly like the local one. The section is short and touches no
+  // network negotiation.
+  let mut revoked = authorization.section().await;
   let transition =
     crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), record).await?;
+  revoked.record(record.subject());
+  crate::session::stream::retire_session(sessions, record.subject())?;
+  drop(revoked);
   if transition.changed_authorization() {
     events.emit(crate::NodeRevoked::new(record.subject().clone()));
   }
-  crate::session::stream::retire_session(sessions, record.subject())?;
   Ok(())
 }
 
@@ -494,7 +510,8 @@ async fn apply_checkpoint_record(
 pub(crate) async fn apply_tombstone_rows(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
-  sessions: &crate::session::stream::SessionTable, rows: &[(Vec<u8>, Vec<u8>)],
+  sessions: &crate::session::stream::SessionTable,
+  authorization: &crate::session::stream::AuthorizationBoundary, rows: &[(Vec<u8>, Vec<u8>)],
   source: Option<&NodeId>, runtime: Option<&RuntimeClient>,
 ) -> Result<()> {
   let store = context.store();
@@ -621,7 +638,17 @@ pub(crate) async fn apply_tombstone_rows(
         // record over a different binding (Conflict) refuses the row —
         // the batch continues, so one divergent record can never wedge
         // the tombstone lane. Real store faults still propagate.
-        match apply_revocation_record(store, entropy, events, &evidence, &record, sessions).await {
+        match apply_revocation_record(
+          store,
+          entropy,
+          events,
+          &evidence,
+          &record,
+          sessions,
+          authorization,
+        )
+        .await
+        {
           Err(error)
             if matches!(
               error.kind(),
@@ -1277,6 +1304,7 @@ mod tests {
         Arc::clone(&events),
         revision.clone(),
         sessions.clone(),
+        crate::session::stream::AuthorizationBoundary::default(),
       );
       let page_dispatches = Arc::new(AtomicUsize::new(0));
       // The descriptor rows that actually went on the wire — the
@@ -1319,6 +1347,7 @@ mod tests {
         events.clone(),
         revision.clone(),
         peer_sessions,
+        crate::session::stream::AuthorizationBoundary::default(),
       );
       let local = context.identity().node().clone();
       let drainer_own_plane = plane.clone();
@@ -1732,6 +1761,9 @@ mod tests {
     let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);
     let revision = crate::node::MemberRevisionSignal::new(revision_tx);
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // The boundary the production wiring shares between the tombstone
+    // lane and session publication (audit 2026-10-23, P1-11).
+    let authorization = crate::session::stream::AuthorizationBoundary::default();
     let mut revoked_events = events.subscribe::<crate::NodeRevoked>(crate::EventOptions::new());
     let mut member_events = events.subscribe::<crate::MemberChanged>(crate::EventOptions::new());
 
@@ -1747,6 +1779,7 @@ mod tests {
       &events,
       &revision,
       &sessions,
+      &authorization,
       &first_rows,
       None,
       None,
@@ -1764,6 +1797,7 @@ mod tests {
       &events,
       &revision,
       &sessions,
+      &authorization,
       &first_rows,
       None,
       None,
@@ -1783,6 +1817,7 @@ mod tests {
       &events,
       &revision,
       &sessions,
+      &authorization,
       &replacement_rows,
       None,
       None,
@@ -1803,6 +1838,7 @@ mod tests {
       &events,
       &revision,
       &sessions,
+      &authorization,
       &replacement_rows,
       None,
       None,
@@ -1978,9 +2014,18 @@ mod tests {
     let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
     let revision = crate::node::MemberRevisionSignal::new(revision_tx);
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let authorization = crate::session::stream::AuthorizationBoundary::default();
 
     apply_tombstone_rows(
-      &context, &entropy, &events, &revision, &sessions, &rows, None, None,
+      &context,
+      &entropy,
+      &events,
+      &revision,
+      &sessions,
+      &authorization,
+      &rows,
+      None,
+      None,
     )
     .await
     .expect("one divergent record must never abort the batch");
@@ -2004,5 +2049,125 @@ mod tests {
     // The leave row ordered after the poison rows applied in the same
     // pass — the batch did not abort.
     assert!(is_left_ctx(store, &leaver).await.unwrap());
+  }
+
+  /// The tombstone lane records its revocations in the shared
+  /// authorization boundary (audit 2026-10-23, P1-11): a subject whose
+  /// remote tombstone landed through sync must be refused at session
+  /// publication exactly like a locally revoked one. A fresh install and
+  /// an unchanged replay both leave the subject in the ledger (both
+  /// leave it durably revoked), and a row skipped for unknown bindings
+  /// records nothing.
+  #[tokio::test]
+  async fn revocation_rows_record_the_shared_authorization_boundary() {
+    use ed25519_dalek::Signer as _;
+
+    use crate::identity::{
+      revocation::{REVOCATION_RECORD_DOMAIN, RevocationRecordV1},
+      signature::signature_message,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full_at(9_950);
+    let scripted_entropy = Arc::new(SequenceEntropy::default());
+    let entropy: Arc<dyn Entropy> = scripted_entropy.clone();
+    let context = Arc::new(
+      open_context(&factory, &keys, &scripted_entropy)
+        .await
+        .unwrap(),
+    );
+    let store = context.store();
+
+    let subject = node_at(9_951);
+    let subject_key = key_at(9_952);
+    let stranger = node_at(9_953);
+    let stranger_key = key_at(9_954);
+    let issuer = node_at(9_955);
+    let issuer_signing = crate::identity::testing::scripted_signing(9_956);
+    for (node, key) in [
+      (issuer.clone(), key_at(9_956)),
+      (subject.clone(), subject_key.clone()),
+    ] {
+      crate::identity::trust::store::adopt_binding_ctx(store, entropy.as_ref(), &node, &key)
+        .await
+        .unwrap();
+    }
+    // The stranger stays unbound: its row must skip without touching
+    // the ledger.
+
+    let revocation = |subject: &NodeId, key: &crate::PublicKey| {
+      let body = RevocationRecordV1::encode_signed_body(subject, key, &issuer).unwrap();
+      let signature = issuer_signing.sign(&signature_message(REVOCATION_RECORD_DOMAIN, &body));
+      RevocationRecordV1::new(
+        subject.clone(),
+        key.clone(),
+        issuer.clone(),
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    let row = |kind: u8, subject: &NodeId, encoded: Vec<u8>| {
+      let mut key = Vec::with_capacity(1 + subject.as_str().len());
+      key.push(kind);
+      key.extend_from_slice(subject.as_str().as_bytes());
+      (key, encoded)
+    };
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let authorization = crate::session::stream::AuthorizationBoundary::default();
+
+    let rows = vec![
+      row(
+        3,
+        &subject,
+        revocation(&subject, &subject_key).encode().unwrap(),
+      ),
+      row(
+        3,
+        &stranger,
+        revocation(&stranger, &stranger_key).encode().unwrap(),
+      ),
+    ];
+    apply_tombstone_rows(
+      &context,
+      &entropy,
+      &events,
+      &revision,
+      &sessions,
+      &authorization,
+      &rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert!(
+      authorization.section().await.contains(&subject),
+      "the landed tombstone must gate session publication for its subject"
+    );
+    assert!(
+      !authorization.section().await.contains(&stranger),
+      "a skipped row must not record its subject"
+    );
+
+    // An unchanged replay leaves the subject durably revoked: the
+    // ledger keeps recording it, mirroring the local revoke effect's
+    // fresh-commit-and-replay alike.
+    apply_tombstone_rows(
+      &context,
+      &entropy,
+      &events,
+      &revision,
+      &sessions,
+      &authorization,
+      &rows,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+    assert!(authorization.section().await.contains(&subject));
   }
 }

@@ -1158,6 +1158,7 @@ mod read_loop_liveness_tests {
       Arc::new(Mutex::new(Vec::new())),
       crate::protocol::CONTROL_CBOR_LIMITS,
       Duration::from_secs(5),
+      crate::session::stream::AuthorizationBoundary::default(),
     )
   }
 
@@ -1470,6 +1471,7 @@ mod ack_attribution_tests {
       Arc::new(Mutex::new(Vec::new())),
       CONTROL_CBOR_LIMITS,
       Duration::from_secs(5),
+      crate::session::stream::AuthorizationBoundary::default(),
     )
   }
 
@@ -1882,6 +1884,7 @@ mod durable_mirror_tests {
       Arc::new(Mutex::new(Vec::new())),
       crate::protocol::CONTROL_CBOR_LIMITS,
       Duration::from_secs(5),
+      crate::session::stream::AuthorizationBoundary::default(),
     )
   }
 
@@ -2345,6 +2348,7 @@ mod slow_consumer_tests {
       Arc::new(Mutex::new(Vec::new())),
       CONTROL_CBOR_LIMITS,
       Duration::from_secs(5),
+      crate::session::stream::AuthorizationBoundary::default(),
     )
   }
 
@@ -2846,6 +2850,7 @@ mod consumer_lifecycle_tests {
         Arc::new(Mutex::new(Vec::new())),
         CONTROL_CBOR_LIMITS,
         Duration::from_secs(5),
+        crate::session::stream::AuthorizationBoundary::default(),
       )
       .with_live_consumer_budget(budget),
     )
