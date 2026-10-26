@@ -36,7 +36,7 @@ pub(crate) fn decode_array<const LENGTH: usize>(
   value: &str, context: &'static str,
 ) -> Result<[u8; LENGTH]> {
   let bytes = decode(value, context)?;
-  <[u8; LENGTH]>::try_from(bytes.as_slice()).map_err(|_| Error::invalid_input(context))
+  crate::error::fixed_bytes(bytes.as_slice(), context)
 }
 
 fn is_hex_digit(byte: u8) -> bool {
