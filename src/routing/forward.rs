@@ -339,7 +339,7 @@ pub(crate) async fn relay_end(table: &ForwardingTable, frame: EndFrame) -> bool 
     Ok(body) => body,
     Err(error) => {
       warn!(kind = ?error.kind(), trace_id = %frame.trace_id, "end frame encode failed");
-      fail_upstream(&hop.upstream, &frame.trace_id).await;
+      fail_upstream(&hop.upstream, &frame.trace_id);
       return true;
     }
   };
@@ -349,7 +349,7 @@ pub(crate) async fn relay_end(table: &ForwardingTable, frame: EndFrame) -> bool 
     .await
     .is_err()
   {
-    fail_upstream(&hop.upstream, &frame.trace_id).await;
+    fail_upstream(&hop.upstream, &frame.trace_id);
   }
   true
 }
@@ -423,7 +423,7 @@ async fn relay_open(
   };
   let Some((downstream_frames, downstream_acks, downstream_session)) = downstream else {
     debug!(next_hop = %next_hop, "routed open has no live downstream session");
-    return fail_upstream(upstream, &open.trace_id).await;
+    return fail_upstream(upstream, &open.trace_id);
   };
   if contains(forwarding, &open.trace_id) {
     // A duplicate routed open for an in-flight forwarded stream is a
@@ -462,7 +462,7 @@ async fn relay_open(
     Ok(body) => body,
     Err(_) => {
       remove_pending(&downstream_acks, &open.trace_id);
-      return fail_upstream(upstream, &open.trace_id).await;
+      return fail_upstream(upstream, &open.trace_id);
     }
   };
   // The pending entry and the open frame share one lifetime under the
@@ -487,7 +487,7 @@ async fn relay_open(
     // silently instead of relaying behind an open that never landed.
     Ok(Err(_)) | Err(_) => {
       remove_pending(&downstream_acks, &open.trace_id);
-      fail_upstream(upstream, &open.trace_id).await;
+      fail_upstream(upstream, &open.trace_id);
       return;
     }
   }
@@ -917,7 +917,7 @@ fn reject_open(upstream: &BoundedSender, trace_id: &TraceId) {
   send_status(upstream, trace_id, AckStatus::Unsupported);
 }
 
-async fn fail_upstream(upstream: &BoundedSender, trace_id: &TraceId) {
+fn fail_upstream(upstream: &BoundedSender, trace_id: &TraceId) {
   send_status(upstream, trace_id, AckStatus::Failed);
 }
 
