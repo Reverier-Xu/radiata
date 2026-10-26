@@ -18,7 +18,7 @@
 //! they attach to.
 
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, BTreeSet, HashMap},
   sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -26,7 +26,7 @@ use std::{
   time::Duration,
 };
 
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{MutexGuard, oneshot, watch};
 use tracing::{debug, instrument, trace, warn};
 
 #[cfg(test)]
@@ -163,6 +163,78 @@ impl ConsumerBudget {
   }
 }
 
+/// The in-incarnation ledger of durably revoked subjects: the state the
+/// [`AuthorizationBoundary`] sequences revocation against publication
+/// over. NodeId-keyed by construction — a revocation only commits against
+/// the exact current trusted binding (`revoke_binding_ctx`), so the
+/// subject names the revoked identity; a stale-key revoke fails before it
+/// reaches this ledger.
+#[derive(Default)]
+pub(crate) struct RevokedSubjects(BTreeSet<NodeId>);
+
+impl RevokedSubjects {
+  /// Whether `subject` carries a locally committed revocation — the
+  /// final session-publication gate.
+  pub(crate) fn contains(&self, subject: &NodeId) -> bool {
+    self.0.contains(subject)
+  }
+
+  /// Records one locally committed revocation (a fresh commit and an
+  /// already-revoked replay alike: both leave the subject durably
+  /// revoked).
+  pub(crate) fn record(&mut self, subject: &NodeId) {
+    self.0.insert(subject.clone());
+  }
+
+  /// Forgets one purged revocation: the operator's escape hatch must
+  /// keep working inside the incarnation, not only after a restart.
+  pub(crate) fn forget(&mut self, subject: &NodeId) {
+    self.0.remove(subject);
+  }
+}
+
+/// The node-local authorization boundary between durable revocation and
+/// final session publication (audit 2026-10-23, P1-11).
+///
+/// A handshake authorizes its peer against the durable trusted binding at
+/// admission and then spends network round trips completing. A revocation
+/// that commits inside that window used to retire only the sessions that
+/// existed when it ran, and the finishing handshake published a fresh
+/// session for the revoked identity with no further check. This boundary
+/// closes the window with one short exclusive section on each side of it:
+///
+/// - the revocation effect holds its section across the durable commit, the
+///   ledger record, and the subject's session retirement
+///   (`crate::runtime::task_effects`);
+/// - session publication (`run_session`) holds its section across the
+///   authorization re-check and the session-table insertion.
+///
+/// Either boundary order is then safe: a publication that wins the section
+/// inserts before the retirement runs (and the retirement removes it), and
+/// one that loses observes the revoked subject and refuses to publish. The
+/// section is short by construction and never spans network negotiation —
+/// only the local commit, the in-memory ledger, and the session table sit
+/// inside it.
+///
+/// The ledger is per-incarnation only: revocations from earlier
+/// incarnations are durable and fail handshake admission on their own
+/// (`trusted_binding`'s revocation gate), so the ledger exists solely to
+/// sequence the in-flight window above, which no single durable read on
+/// one side of it can close.
+#[derive(Clone, Default)]
+pub(crate) struct AuthorizationBoundary {
+  revoked: Arc<tokio::sync::Mutex<RevokedSubjects>>,
+}
+
+impl AuthorizationBoundary {
+  /// Acquires the boundary's one exclusive section. Hold it only across
+  /// the short authorization/publication steps the type documents — never
+  /// across network negotiation (handshake rounds, dials).
+  pub(crate) async fn section(&self) -> MutexGuard<'_, RevokedSubjects> {
+    self.revoked.lock().await
+  }
+}
+
 pub(crate) struct SessionPacketContext {
   pub(super) local: NodeId,
   pub(super) registry: Arc<ExtensionRegistry>,
@@ -198,6 +270,11 @@ pub(crate) struct SessionPacketContext {
   /// The acknowledgment budget one forwarded-open hop gets (see
   /// `NodeConfig::with_relay_hop_deadline`).
   pub(super) relay_hop_deadline: Duration,
+  /// The node's authorization boundary between durable revocation and
+  /// final session publication (audit 2026-10-23, P1-11): born with this
+  /// context, so every session publication and the revocation effect
+  /// serialize on the same section through the one shared instance.
+  authorization: AuthorizationBoundary,
 }
 
 impl SessionPacketContext {
@@ -232,7 +309,15 @@ impl SessionPacketContext {
       live_consumers: ConsumerBudget::new(MAX_LIVE_CONSUMERS),
       parser_limits,
       relay_hop_deadline,
+      authorization: AuthorizationBoundary::default(),
     }
+  }
+
+  /// The node's authorization boundary (see [`AuthorizationBoundary`]):
+  /// the revocation effect's section and every session publication
+  /// serialize on this one instance.
+  pub(crate) fn authorization_boundary(&self) -> &AuthorizationBoundary {
+    &self.authorization
   }
 
   /// Replaces the node-wide live-consumer budget: regression tests shrink
@@ -453,6 +538,24 @@ pub(crate) async fn run_session(
     recovery_dialed,
     retire: retire_tx,
   };
+  // The final authorization gate (audit 2026-10-23, P1-11): the peer was
+  // admitted against the durable binding before the exchange, but a
+  // revocation may have committed while the handshake was completing.
+  // Publication re-checks the revoked-subject ledger under the boundary
+  // section shared with the revocation effect, so a revoked identity
+  // either is refused here or was already inserted when the revocation's
+  // retirement ran and is removed with it. The section ends with the
+  // insertion — it never spans the connection service below.
+  let revoked = context.authorization_boundary().section().await;
+  if revoked.contains(&peer) {
+    drop(revoked);
+    warn!("session publication refused: the peer was revoked while the handshake completed");
+    alive.store(false, Ordering::SeqCst);
+    if let Some(registered) = registered {
+      let _ = registered.send(());
+    }
+    return;
+  }
   {
     let local = context.local().clone();
     let mut guard = match table.lock() {
@@ -523,6 +626,7 @@ pub(crate) async fn run_session(
       return;
     }
   }
+  drop(revoked);
 
   debug!("session established; serving packet streams");
   let mut writer_task = tokio::spawn(run_writer(writer, frames_rx, ping_rx));
@@ -774,6 +878,74 @@ mod replacement_tests {
       let keep_incoming = keep_connection(&local, &peer, DialDirection::Incoming);
       assert_ne!(keep_outgoing, keep_incoming);
     }
+  }
+}
+
+#[cfg(test)]
+mod authorization_boundary_tests {
+  use std::{
+    sync::{
+      Arc,
+      atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+  };
+
+  use super::{AuthorizationBoundary, RevokedSubjects};
+  use crate::NodeId;
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  /// The ledger is the final publication gate: a recorded subject is
+  /// revoked, and a purged one is admitted again within the incarnation
+  /// (the operator's escape hatch).
+  #[test]
+  fn ledger_records_and_forgets_revoked_subjects() {
+    let mut ledger = RevokedSubjects::default();
+    let subject = node(7);
+    assert!(!ledger.contains(&subject));
+    ledger.record(&subject);
+    assert!(ledger.contains(&subject));
+    ledger.forget(&subject);
+    assert!(!ledger.contains(&subject));
+  }
+
+  /// The boundary is one exclusive section (audit 2026-10-23, P1-11): a
+  /// second acquirer — the other side of the revocation/publication
+  /// pair — waits until the first releases, so the two critical sections
+  /// can never interleave.
+  #[tokio::test]
+  async fn sections_are_exclusive_until_released() {
+    let boundary = AuthorizationBoundary::default();
+    let first = boundary.section().await;
+    let contender_started = Arc::new(AtomicBool::new(false));
+    let contender_entered = Arc::new(AtomicBool::new(false));
+    let contender = {
+      let boundary = boundary.clone();
+      let started = Arc::clone(&contender_started);
+      let entered = Arc::clone(&contender_entered);
+      tokio::spawn(async move {
+        started.store(true, Ordering::SeqCst);
+        let _section = boundary.section().await;
+        entered.store(true, Ordering::SeqCst);
+      })
+    };
+    // The contender runs (it started) but cannot enter while the section
+    // is held; a bounded wait keeps the negative observation honest.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(contender_started.load(Ordering::SeqCst));
+    assert!(
+      !contender_entered.load(Ordering::SeqCst),
+      "the section must stay exclusive while held"
+    );
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(5), contender)
+      .await
+      .expect("the contender must enter after the release")
+      .expect("the contender task must not panic");
+    assert!(contender_entered.load(Ordering::SeqCst));
   }
 }
 
