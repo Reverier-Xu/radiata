@@ -334,6 +334,7 @@ pub fn radiata::EventSubscription<E>::poll_next(core::pin::Pin<&mut Self>, &mut 
 pub struct radiata::ExtensionRegistry
 impl radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::new() -> Self
+pub fn radiata::ExtensionRegistry::override_builtin_transport(&mut self, radiata::TransportScheme, alloc::rcs::arc::Arc<dyn radiata::TransportProvider>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_action_hook(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::ActionHook>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_feature(&mut self, radiata::FeatureDefinition) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_load_balancer(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::LoadBalancingPolicy>) -> radiata::Result<&mut Self>

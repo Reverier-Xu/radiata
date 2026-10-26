@@ -18,7 +18,7 @@ use crate::{
   Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag,
   api::BoxFuture,
   transport::{
-    TransportSelector,
+    TransportScheme, TransportSelector,
     registry::{Transport, TransportProvider, TransportProviderAdapter, builtin_transport_tag},
   },
 };
@@ -137,7 +137,9 @@ impl ExtensionRegistry {
   /// `<name>://<opaque>`). The name is unique per node: a duplicate, a
   /// reserved name, or any other conflict is rejected before use. The
   /// built-in transports are seeded by the runtime under their own
-  /// schemes and cannot be shadowed from here.
+  /// schemes and cannot be shadowed from here; replacing a built-in is
+  /// the explicit [`ExtensionRegistry::override_builtin_transport`]
+  /// decision instead.
   ///
   /// This is the public extension surface of the transport layer: the
   /// registry is the single map from endpoint selector to transport,
@@ -154,6 +156,50 @@ impl ExtensionRegistry {
       name.clone(),
     )?);
     insert_once(&mut self.schemes, name, adapter, "transport registration")?;
+    Ok(self)
+  }
+
+  /// Explicitly replaces one built-in transport with a caller-defined
+  /// implementation: from now on every dial and listen addressed to the
+  /// built-in form of `scheme` (`tls://`, `wss://`, or `tcp://`)
+  /// resolves to `transport`. The runtime seeds a built-in only when its
+  /// selector is still free, so an override installed before the node
+  /// starts wins wholesale — no built-in transport participates behind
+  /// the selector, and no built-in code path special-cases the
+  /// replacement.
+  ///
+  /// The override serves the dial intents the built-in selector
+  /// produces: a `tls://` or `wss://` override receives the
+  /// merge/member trust intents a TLS class dials with, a `tcp://`
+  /// override receives the plaintext intent. The provider medium owns
+  /// its own wire security either way — the same plaintext-class
+  /// contract every transport provider carries — and the session
+  /// handshake's identity proofs authenticate both endpoints over the
+  /// replacement channel. The channel binding derives from the built-in
+  /// selector's canonical tag, so proofs over the override stay distinct
+  /// from the replaced built-in and from every custom name; the binding
+  /// is node-local, and endpoints exchanged across nodes assume both
+  /// sides bound the selector identically (a mismatch fails at the
+  /// handshake's identity proofs, never silently).
+  ///
+  /// One override per selector: a scheme already overridden is a
+  /// conflict, rejected before use. The existing custom-name contract is
+  /// untouched — a built-in selector never becomes a custom
+  /// [`crate::TransportName`], and [`ExtensionRegistry::register_transport`]
+  /// keeps its own namespace.
+  pub fn override_builtin_transport(
+    &mut self, scheme: TransportScheme, transport: Arc<dyn TransportProvider>,
+  ) -> Result<&mut Self> {
+    let tag = builtin_transport_tag(scheme)?;
+    let adapter = Arc::new(TransportProviderAdapter::override_builtin(
+      transport, scheme,
+    )?);
+    insert_once(
+      &mut self.transports,
+      tag,
+      adapter,
+      "built-in transport override",
+    )?;
     Ok(self)
   }
 
