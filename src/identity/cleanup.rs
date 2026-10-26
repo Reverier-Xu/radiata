@@ -9,12 +9,14 @@
 //! issuers merge deterministically (the earliest signed stamp wins, the
 //! canonical encoding breaking ties), so partitioned cleanups converge.
 //!
-//! Cleanup tombstones are terminal: there is no resurrection path, and the
-//! user is responsible for never cleaning a node that is merely offline. A
-//! mistakenly cleaned node recovers only by rotating its identity and
-//! re-merging as a new `NodeId`. Cleaned nodes are excluded from session
-//! establishment and recovery dialing; their historical signed records
-//! remain valid evidence.
+//! A cleanup tombstone is terminal for as long as it lives: the cleaned
+//! node is excluded from session establishment and recovery dialing, and
+//! its historical signed records remain valid evidence. Removal is
+//! operational, not permanent: when the checkpoint GC reclaims a collected
+//! tombstone it retires the subject binding the record pins in the same
+//! transaction, so the old key can no longer authenticate and the node id
+//! revives only through a fresh merge under a new key (the join-credential
+//! path). Permanent exclusion is revocation's contract, never cleanup's.
 
 use std::sync::Arc;
 
@@ -278,7 +280,9 @@ canonical_record! {
 /// One cleanup checkpoint: an unsigned, max-wins record that rides the
 /// sync plane and declares one wall-clock watermark.
 /// It is hygiene knowledge, not authorization: it never gates live
-/// entries, revocation records, or bindings.
+/// entries or revocation records directly. The GC epoch it declares is
+/// the one place a watermark removes trust evidence — collecting a
+/// leave/cleanup tombstone retires the binding it pins with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CleanupCheckpointV1 {
   watermark_millis: u64,
@@ -416,12 +420,15 @@ pub(crate) async fn persist_checkpoint_ctx(
   Ok(())
 }
 
-/// The checkpoint GC pass: after sync rounds, delete
-/// the collected leave and cleanup tombstones stamped at or before the
-/// latest local checkpoint watermark, reusing the conditional exact-digest
-/// delete. Bounded per pass; a raced delete conflicts and stays for the
-/// next pass. Revocation records are never collected here (permanent),
-/// and live entries are never touched (the filter is removal-only).
+/// The checkpoint GC pass: after sync rounds, delete the collected
+/// leave and cleanup tombstones stamped at or before the latest local
+/// checkpoint watermark, retiring each record's pinned subject binding
+/// in the same transaction (a re-bound subject keeps its new binding,
+/// and a revoked subject keeps the binding its permanent revocation
+/// constrains — see [`records::collect_tombstones_before`]). Bounded
+/// per pass; a raced delete conflicts and stays for the next pass.
+/// Revocation records are never collected here (permanent), and live
+/// entries are never touched (the filter is removal-only).
 pub(crate) async fn collect_collected_tombstones_ctx(
   store: &MetadataStore, entropy: &dyn Entropy,
 ) -> Result<usize> {
@@ -436,9 +443,11 @@ pub(crate) async fn collect_collected_tombstones_ctx(
 /// The cleanup-side sweep: conditional exact-digest deletes of collected
 /// cleanup tombstones, bounded by
 /// [`TOMBSTONE_GC_BATCH`](crate::identity::records::TOMBSTONE_GC_BATCH)
-/// watermark-eligible records — a tombstone stamped after the watermark
-/// never consumes the batch, so a fresh head cannot hide the collectible
-/// tail behind it.
+/// watermark-eligible records and coupled with each record's pinned
+/// binding retirement (see
+/// [`records::collect_tombstones_before`]) — a tombstone stamped after
+/// the watermark never consumes the batch, so a fresh head cannot hide
+/// the collectible tail behind it.
 async fn collect_cleanup_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
@@ -455,7 +464,12 @@ async fn collect_cleanup_before_ctx(
   .await?;
   let entries: Vec<_> = collectible
     .iter()
-    .map(|record| (cleanup_key(record.subject()), record.timestamp_millis()))
+    .map(|record| records::CollectibleTombstone {
+      key: cleanup_key(record.subject()),
+      stamp_millis: record.timestamp_millis(),
+      subject: record.subject().clone(),
+      pinned_key: record.subject_key().clone(),
+    })
     .collect();
   records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
 }
@@ -484,6 +498,34 @@ mod tests {
 
   fn reference_factory() -> Arc<dyn StorageFactory> {
     Arc::new(ReferenceFactory::new(required_capabilities()))
+  }
+
+  /// Installs the checkpoint (written directly: unsigned hygiene
+  /// knowledge) at an explicit watermark, so GC tests order tombstone
+  /// stamps against it deterministically.
+  async fn install_checkpoint(
+    context: &lifecycle::LocalIdentityContext, entropy: &dyn crate::api::Entropy, watermark: u64,
+  ) {
+    use crate::{StoreExpectation, StoreKey, StoreOperation, StoreValue};
+    let checkpoint = CleanupCheckpointV1::new(watermark, context.identity().node().clone());
+    let snapshot = context.store().snapshot().await.unwrap();
+    let transaction = context
+      .store()
+      .prepare_transaction(
+        crate::TransactionId::generate(entropy).unwrap(),
+        snapshot.revision().clone(),
+        vec![StoreOperation::Put {
+          namespace: metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
+          key: StoreKey::new(Arc::from(b"checkpoint".to_vec())),
+          expected: StoreExpectation::Absent,
+          value: StoreValue::new(Arc::from(checkpoint.encode().unwrap())),
+        }],
+      )
+      .unwrap();
+    assert!(matches!(
+      context.store().commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
   }
 
   /// A cleanup tombstone signed by the local identity with an explicit
@@ -883,10 +925,7 @@ mod tests {
   /// max-wins by watermark.
   #[tokio::test]
   async fn checkpoint_gc_collects_only_up_to_the_watermark() {
-    use crate::{
-      StoreExpectation, StoreKey, StoreOperation, StoreValue,
-      identity::revocation::{RevocationRecordV1, is_revoked_ctx},
-    };
+    use crate::identity::revocation::{RevocationRecordV1, is_revoked_ctx};
 
     let factory = reference_factory();
     let keys = ScriptedKeys::full();
@@ -937,7 +976,9 @@ mod tests {
       .unwrap();
 
     // A revocation record for a third subject: the permanent class is
-    // never collected by the checkpoint GC.
+    // never collected by the checkpoint GC. The subject also carries a
+    // collected cleanup tombstone, so the GC's binding-retirement policy
+    // meets the permanent class head-on below.
     let expelled = node(7_400);
     let expelled_key = PublicKey::from_bytes(scripted_signing(74).verifying_key().to_bytes());
     adopt_binding_ctx(context.store(), entropy.as_ref(), &expelled, &expelled_key)
@@ -970,35 +1011,25 @@ mod tests {
     )
     .await
     .unwrap();
+    let expelled_tombstone =
+      stamped_tombstone(&context, &keys, &expelled, &expelled_key, 1_000).await;
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &expelled_tombstone)
+      .await
+      .unwrap();
 
     // The checkpoint (written directly: unsigned hygiene knowledge)
     // declares a watermark between the two tombstone stamps.
-    let checkpoint = CleanupCheckpointV1::new(5_000, context.identity().node().clone());
-    let snapshot = context.store().snapshot().await.unwrap();
-    let transaction = context
-      .store()
-      .prepare_transaction(
-        crate::TransactionId::generate(entropy.as_ref()).unwrap(),
-        snapshot.revision().clone(),
-        vec![StoreOperation::Put {
-          namespace: metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
-          key: StoreKey::new(Arc::from(b"checkpoint".to_vec())),
-          expected: StoreExpectation::Absent,
-          value: StoreValue::new(Arc::from(checkpoint.encode().unwrap())),
-        }],
-      )
-      .unwrap();
-    assert!(matches!(
-      context.store().commit(transaction).await.unwrap(),
-      crate::CommitOutcome::Committed(_)
-    ));
+    install_checkpoint(&context, entropy.as_ref(), 5_000).await;
 
-    // The sweep collects exactly the stale tombstone; the fresh tombstone,
-    // the revocation, and every binding stay.
+    // The sweep collects exactly the two watermark-eligible tombstones;
+    // the fresh tombstone and the revocation stay. The coupled
+    // retirement retires the collected subject's pinned binding, while
+    // the revoked subject keeps its binding — permanent exclusion
+    // outranks collection, so a fresh-key merge for it still conflicts.
     let collected = collect_collected_tombstones_ctx(context.store(), entropy.as_ref())
       .await
       .unwrap();
-    assert_eq!(collected, 1);
+    assert_eq!(collected, 2);
     assert!(
       !is_cleaned_ctx(context.store(), &stale_subject)
         .await
@@ -1013,6 +1044,30 @@ mod tests {
       is_revoked_ctx(context.store(), &expelled, &expelled_key)
         .await
         .unwrap()
+    );
+    let bindings = crate::identity::trust::store::trusted_bindings(context.store())
+      .await
+      .unwrap();
+    assert!(!bindings.contains_key(&stale_subject));
+    assert_eq!(bindings.get(&fresh_subject), Some(&fresh_key));
+    assert_eq!(bindings.get(&expelled), Some(&expelled_key));
+    let rebind = crate::identity::merge::MergeProposal::new(
+      expelled.clone(),
+      PublicKey::from_bytes(scripted_signing(741).verifying_key().to_bytes()),
+      crate::identity::records::GenerationId::generate(entropy.as_ref()).unwrap(),
+      crate::identity::records::MergeId::generate(entropy.as_ref()).unwrap(),
+    );
+    assert_eq!(
+      crate::identity::merge::commit_merge(
+        &context,
+        &keys.as_provider(),
+        entropy.as_ref(),
+        &rebind,
+      )
+      .await
+      .unwrap_err()
+      .kind(),
+      ErrorKind::Conflict
     );
 
     // Max-wins: issuing again cannot roll the epoch back.
@@ -1031,8 +1086,6 @@ mod tests {
   /// would study the same fresh head every pass and never reach it.
   #[tokio::test]
   async fn checkpoint_gc_collects_the_stale_tail_behind_a_fresh_head() {
-    use crate::{StoreExpectation, StoreKey, StoreOperation, StoreValue};
-
     let factory = reference_factory();
     let keys = ScriptedKeys::full();
     let entropy = Arc::new(SequenceEntropy::default());
@@ -1089,25 +1142,7 @@ mod tests {
 
     // The checkpoint (written directly: unsigned hygiene knowledge)
     // declares a watermark between the two tombstone stamps.
-    let checkpoint = CleanupCheckpointV1::new(5_000, context.identity().node().clone());
-    let snapshot = context.store().snapshot().await.unwrap();
-    let transaction = context
-      .store()
-      .prepare_transaction(
-        crate::TransactionId::generate(entropy.as_ref()).unwrap(),
-        snapshot.revision().clone(),
-        vec![StoreOperation::Put {
-          namespace: metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
-          key: StoreKey::new(Arc::from(b"checkpoint".to_vec())),
-          expected: StoreExpectation::Absent,
-          value: StoreValue::new(Arc::from(checkpoint.encode().unwrap())),
-        }],
-      )
-      .unwrap();
-    assert!(matches!(
-      context.store().commit(transaction).await.unwrap(),
-      crate::CommitOutcome::Committed(_)
-    ));
+    install_checkpoint(&context, entropy.as_ref(), 5_000).await;
 
     // The sweep walks past the entire fresh head (an over-window
     // tombstone consumes no batch budget) and collects the stale tail.
@@ -1125,5 +1160,237 @@ mod tests {
         .await
         .unwrap()
     );
+  }
+
+  /// The full GC contract on one cleaned subject, end to end at the
+  /// store boundary the session driver reads: the tombstone is terminal
+  /// evidence while it lives, its collection retires the pinned binding
+  /// (the old key no longer resolves to any binding), the node id
+  /// revives through a fresh merge under a new key (the join path), and
+  /// a late tombstone for the old key is unverifiable evidence — the
+  /// re-bound subject refuses it without resurrecting the old identity.
+  #[tokio::test]
+  async fn gc_retires_the_cleaned_binding_and_a_fresh_merge_rebinds_the_node() {
+    use crate::identity::{
+      merge::{MergeProposal, commit_merge},
+      records::{GenerationId, MergeId},
+      trust::store::{trusted_binding, trusted_bindings},
+    };
+
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = lifecycle::open_local_identity(
+      &factory,
+      Some(&keys.as_provider()),
+      entropy.as_ref(),
+      std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    let subject = node(7_800);
+    let old_key = PublicKey::from_bytes(scripted_signing(78).verifying_key().to_bytes());
+    adopt_binding_ctx(context.store(), entropy.as_ref(), &subject, &old_key)
+      .await
+      .unwrap();
+    let tombstone = stamped_tombstone(&context, &keys, &subject, &old_key, 1_000).await;
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &tombstone)
+      .await
+      .unwrap();
+
+    // Before the GC the tombstone is terminal evidence: the old key's
+    // session establishment fails closed at the terminal gate.
+    assert_eq!(
+      trusted_binding(context.store(), &subject)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::NotTrusted
+    );
+    assert!(is_cleaned_ctx(context.store(), &subject).await.unwrap());
+
+    // The collection couples the tombstone delete with the pinned
+    // binding's retirement: afterwards the subject carries neither
+    // terminal evidence nor a resolvable binding.
+    install_checkpoint(&context, entropy.as_ref(), 5_000).await;
+    assert_eq!(
+      collect_collected_tombstones_ctx(context.store(), entropy.as_ref())
+        .await
+        .unwrap(),
+      1
+    );
+    assert!(!is_cleaned_ctx(context.store(), &subject).await.unwrap());
+    assert_eq!(
+      trusted_binding(context.store(), &subject)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::NotFound
+    );
+    assert!(
+      !trusted_bindings(context.store())
+        .await
+        .unwrap()
+        .contains_key(&subject)
+    );
+
+    // The revival path: a fresh merge (the join credential's durable
+    // commit) installs the new binding and the node authenticates
+    // under it — the only resurrection the contract allows.
+    let new_key = PublicKey::from_bytes(scripted_signing(79).verifying_key().to_bytes());
+    let rebind = MergeProposal::new(
+      subject.clone(),
+      new_key.clone(),
+      GenerationId::generate(entropy.as_ref()).unwrap(),
+      MergeId::generate(entropy.as_ref()).unwrap(),
+    );
+    commit_merge(&context, &keys.as_provider(), entropy.as_ref(), &rebind)
+      .await
+      .unwrap();
+    assert_eq!(
+      trusted_binding(context.store(), &subject).await.unwrap(),
+      new_key
+    );
+
+    // A late tombstone for the old key is unverifiable against the
+    // re-bound subject: refused without mutation, the old identity
+    // stays retired.
+    assert_eq!(
+      persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &tombstone)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::NotTrusted
+    );
+    assert!(!is_cleaned_ctx(context.store(), &subject).await.unwrap());
+    assert_eq!(
+      trusted_binding(context.store(), &subject).await.unwrap(),
+      new_key
+    );
+  }
+
+  /// The GC's atomicity pin: with the collection pass and the
+  /// admission-time binding resolution racing each other, no
+  /// observation ever resolves a collected subject's old key — the
+  /// tombstone delete and the binding retirement commit as one
+  /// transaction, so the mid-state (tombstone gone, binding still
+  /// usable) is never visible to authentication.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn concurrent_gc_and_binding_reads_never_expose_a_retired_binding() {
+    use crate::identity::trust::store::trusted_binding;
+
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = lifecycle::open_local_identity(
+      &factory,
+      Some(&keys.as_provider()),
+      entropy.as_ref(),
+      std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    // One left subject and one cleaned subject, both bound and both
+    // carrying watermark-eligible tombstones: the pass below sweeps
+    // both families.
+    let leaver = node(7_850);
+    let leaver_signing = scripted_signing(785);
+    let leaver_key = PublicKey::from_bytes(leaver_signing.verifying_key().to_bytes());
+    let cleaned = node(7_860);
+    let cleaned_key = PublicKey::from_bytes(scripted_signing(786).verifying_key().to_bytes());
+    adopt_binding_ctx(context.store(), entropy.as_ref(), &leaver, &leaver_key)
+      .await
+      .unwrap();
+    adopt_binding_ctx(context.store(), entropy.as_ref(), &cleaned, &cleaned_key)
+      .await
+      .unwrap();
+    let leave_record = {
+      use ed25519_dalek::Signer as _;
+      let body =
+        crate::identity::leave::LeaveRecordV1::encode_signed_body(&leaver, &leaver_key, 1_000)
+          .unwrap();
+      let signature = leaver_signing.sign(&signature_message(
+        crate::identity::leave::LEAVE_RECORD_DOMAIN,
+        &body,
+      ));
+      crate::identity::leave::LeaveRecordV1::new(
+        leaver.clone(),
+        leaver_key.clone(),
+        1_000,
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    crate::identity::leave::persist_leave_record_ctx(
+      context.store(),
+      entropy.as_ref(),
+      &leave_record,
+    )
+    .await
+    .unwrap();
+    let cleanup_record = stamped_tombstone(&context, &keys, &cleaned, &cleaned_key, 1_000).await;
+    persist_cleanup_record_ctx(context.store(), entropy.as_ref(), &cleanup_record)
+      .await
+      .unwrap();
+    install_checkpoint(&context, entropy.as_ref(), 5_000).await;
+
+    // Interleave the pass with concurrent admission-time reads. Every
+    // observation must be a rejection — NotTrusted while the tombstone
+    // lives, NotFound once the collection committed — and never a
+    // resolved key, which is exactly what the un-coupled mid-state
+    // (tombstone deleted, binding still usable) would return.
+    let store = context.store();
+    let mut resolved = Vec::new();
+    let mut kinds = Vec::new();
+    for _ in 0..16 {
+      let (collected, observed) = tokio::join!(
+        collect_collected_tombstones_ctx(store, entropy.as_ref()),
+        async {
+          let mut resolved = Vec::new();
+          let mut kinds = Vec::new();
+          for _ in 0..8 {
+            for subject in [&leaver, &cleaned] {
+              match trusted_binding(store, subject).await {
+                Ok(key) => resolved.push((subject.clone(), key)),
+                Err(error) => kinds.push(error.kind()),
+              }
+            }
+          }
+          (resolved, kinds)
+        },
+      );
+      collected.unwrap();
+      resolved.extend(observed.0);
+      kinds.extend(observed.1);
+    }
+    assert!(
+      resolved.is_empty(),
+      "no read may resolve a collected subject's old key: {resolved:?}"
+    );
+    assert!(
+      kinds.iter().all(|kind| matches!(
+        kind,
+        crate::ErrorKind::NotTrusted | crate::ErrorKind::NotFound
+      )),
+      "every rejection stays a terminal or unknown refusal: {kinds:?}"
+    );
+    assert!(
+      !crate::identity::leave::is_left_ctx(store, &leaver)
+        .await
+        .unwrap()
+    );
+    assert!(!is_cleaned_ctx(store, &cleaned).await.unwrap());
+    let bindings = crate::identity::trust::store::trusted_bindings(store)
+      .await
+      .unwrap();
+    assert!(!bindings.contains_key(&leaver));
+    assert!(!bindings.contains_key(&cleaned));
   }
 }

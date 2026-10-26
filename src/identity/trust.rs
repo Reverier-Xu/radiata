@@ -526,7 +526,11 @@ pub(crate) mod store {
   /// Whether the node carries terminal departure evidence — an
   /// owner-signed leave record or an issuer-signed cleanup tombstone.
   /// Terminal members are excluded from session establishment, and every
-  /// admission-sensitive read shares this one gate.
+  /// admission-sensitive read shares this one gate. The evidence is
+  /// operational, not permanent: the checkpoint GC reclaims a collected
+  /// tombstone together with the pinned binding, and after that the
+  /// subject is simply unknown here — a fresh merge (the join-credential
+  /// path) under a new key is the only revival.
   pub(crate) async fn peer_is_terminal(store: &MetadataStore, node: &NodeId) -> Result<bool> {
     Ok(
       crate::identity::leave::is_left_ctx(store, node).await?

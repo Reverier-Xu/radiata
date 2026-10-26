@@ -149,7 +149,9 @@ canonical_record! {
 /// identity binding, never against the leaver staying online. Because the
 /// rotation destroys the old key, the record carries no replay or time-lag
 /// attack surface. The signed removal timestamp is what the checkpoint GC
-/// compares against its watermark.
+/// compares against its watermark; collecting the record retires the
+/// pinned binding with it, so a collected leaver's node id revives only
+/// through a fresh merge under a new key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LeaveRecordV1 {
   node: NodeId,
@@ -225,12 +227,29 @@ fn leave_record_key(node: &NodeId) -> StoreKey {
 
 /// Persists one verified leave record (idempotent; a re-delivery of the
 /// exact record is a no-op, a different record for the same node conflicts
-/// without mutation).
+/// without mutation). The subject binding is verified like every delivery
+/// boundary verifies it: a retained binding that diverges from the
+/// record's pinned key is unverifiable evidence and fails closed, so a
+/// late record for an already-rebound (revived) subject can neither
+/// re-exclude the node nor resurrect the old identity. A subject without
+/// a retained binding still persists (the evidence converges ahead of
+/// the binding lanes), exactly like a cleanup tombstone does.
 pub(crate) async fn persist_leave_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &LeaveRecordV1,
 ) -> Result<()> {
   let _permit = store.write_permit().await;
   record.verify()?;
+  let (binding_namespace, binding_key) =
+    crate::identity::records::identity_binding_key(record.node())?;
+  let snapshot = store.snapshot().await?;
+  if let Some(existing) = snapshot.get(&binding_namespace, &binding_key).await? {
+    let binding = crate::identity::records::IdentityBindingV1::decode(existing.as_bytes())
+      .map_err(|_| Error::invalid_input("leave record binding"))?;
+    if binding.public_key() != record.public_key() {
+      return Err(Error::not_trusted("leave record binding"));
+    }
+  }
+  drop(snapshot);
   records::persist_terminal_record(
     store,
     entropy,
@@ -285,11 +304,13 @@ pub(crate) fn is_intent_key(key: &[u8]) -> bool {
   key == INTENT_KEY
 }
 
-/// The leave-side checkpoint sweep: conditional
-/// exact-digest deletes of collected leave records stamped at or before
-/// `watermark`. The leave intent singleton is never touched, and the
-/// batch bound counts only watermark-eligible records, so a fresh head
-/// never hides the collectible tail behind it.
+/// The leave-side checkpoint sweep: conditional exact-digest deletes of
+/// collected leave records stamped at or before `watermark`, each
+/// coupled with the retirement of the record's pinned subject binding
+/// (see [`records::collect_tombstones_before`]). The leave intent
+/// singleton is never touched, and the batch bound counts only
+/// watermark-eligible records, so a fresh head never hides the
+/// collectible tail behind it.
 pub(crate) async fn collect_before_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
 ) -> Result<usize> {
@@ -306,7 +327,12 @@ pub(crate) async fn collect_before_ctx(
   .await?;
   let entries: Vec<_> = collectible
     .iter()
-    .map(|record| (leave_record_key(record.node()), record.timestamp_millis()))
+    .map(|record| records::CollectibleTombstone {
+      key: leave_record_key(record.node()),
+      stamp_millis: record.timestamp_millis(),
+      subject: record.node().clone(),
+      pinned_key: record.public_key().clone(),
+    })
     .collect();
   records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
 }
@@ -982,6 +1008,148 @@ mod tests {
     assert_eq!(collected, 1);
     assert!(!is_left_ctx(context.store(), &stale_subject).await.unwrap());
     assert!(is_left_ctx(context.store(), &head_subject).await.unwrap());
+  }
+
+  /// The leave-side GC contract on one subject, end to end at the store
+  /// boundary the session driver reads: collecting a leave record
+  /// retires the leaver's pinned binding, the node id revives only
+  /// through a fresh merge under a new key, and a late old-key leave
+  /// record is unverifiable evidence — accepted (and re-collected)
+  /// while the subject is unknown, refused once the subject re-bound,
+  /// and never able to resurrect the old identity.
+  #[tokio::test]
+  async fn checkpoint_gc_retires_the_left_binding_and_refuses_late_old_key_records() {
+    use crate::{
+      PublicKey,
+      identity::{
+        lifecycle::ensure_self_binding,
+        merge::{MergeProposal, commit_merge},
+        records::{GenerationId, MergeId},
+        testing::scripted_signing,
+        trust::store::{adopt_binding_ctx, trusted_binding, trusted_bindings},
+      },
+    };
+
+    let factory = reference_factory();
+    let (keys, entropy, context) = open_store(&factory).await.unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    let subject = node(8_100);
+    let old_signing = scripted_signing(81);
+    let old_key = PublicKey::from_bytes(old_signing.verifying_key().to_bytes());
+    adopt_binding_ctx(context.store(), entropy.as_ref(), &subject, &old_key)
+      .await
+      .unwrap();
+
+    // The owner-signed leave record pins the leaver's exact key.
+    let record = {
+      use ed25519_dalek::Signer as _;
+      let body = LeaveRecordV1::encode_signed_body(&subject, &old_key, 1_000).unwrap();
+      let signature = old_signing.sign(&crate::identity::signature::signature_message(
+        super::LEAVE_RECORD_DOMAIN,
+        &body,
+      ));
+      LeaveRecordV1::new(
+        subject.clone(),
+        old_key.clone(),
+        1_000,
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    persist_leave_record_ctx(context.store(), entropy.as_ref(), &record)
+      .await
+      .unwrap();
+
+    // Before the GC: the terminal evidence blocks the old key's session
+    // establishment.
+    assert_eq!(
+      trusted_binding(context.store(), &subject)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::NotTrusted
+    );
+
+    // The collection retires the pinned binding with the record: the
+    // subject carries neither terminal evidence nor a resolvable
+    // binding.
+    assert_eq!(
+      collect_before_ctx(context.store(), entropy.as_ref(), 5_000)
+        .await
+        .unwrap(),
+      1
+    );
+    assert!(!is_left_ctx(context.store(), &subject).await.unwrap());
+    assert_eq!(
+      trusted_binding(context.store(), &subject)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::NotFound
+    );
+    assert!(
+      !trusted_bindings(context.store())
+        .await
+        .unwrap()
+        .contains_key(&subject)
+    );
+
+    // A late old-key record while the subject is unknown: accepted as
+    // convergent evidence (the binding lanes may still be behind) and
+    // re-collected by the next pass — never a resurrection, the old key
+    // still resolves to nothing.
+    persist_leave_record_ctx(context.store(), entropy.as_ref(), &record)
+      .await
+      .unwrap();
+    assert!(is_left_ctx(context.store(), &subject).await.unwrap());
+    assert!(
+      !trusted_bindings(context.store())
+        .await
+        .unwrap()
+        .contains_key(&subject)
+    );
+    assert_eq!(
+      collect_before_ctx(context.store(), entropy.as_ref(), 5_000)
+        .await
+        .unwrap(),
+      1
+    );
+    assert!(!is_left_ctx(context.store(), &subject).await.unwrap());
+
+    // The revival path: a fresh merge under a new key installs the new
+    // binding — the only resurrection the contract allows.
+    let new_key = PublicKey::from_bytes(scripted_signing(82).verifying_key().to_bytes());
+    let rebind = MergeProposal::new(
+      subject.clone(),
+      new_key.clone(),
+      GenerationId::generate(entropy.as_ref()).unwrap(),
+      MergeId::generate(entropy.as_ref()).unwrap(),
+    );
+    commit_merge(&context, &keys.as_provider(), entropy.as_ref(), &rebind)
+      .await
+      .unwrap();
+    assert_eq!(
+      trusted_binding(context.store(), &subject).await.unwrap(),
+      new_key
+    );
+
+    // A late old-key record after the revival: unverifiable evidence
+    // against the re-bound subject — refused, no re-exclusion, no
+    // resurrection.
+    assert_eq!(
+      persist_leave_record_ctx(context.store(), entropy.as_ref(), &record)
+        .await
+        .unwrap_err()
+        .kind(),
+      ErrorKind::NotTrusted
+    );
+    assert!(!is_left_ctx(context.store(), &subject).await.unwrap());
+    assert_eq!(
+      trusted_binding(context.store(), &subject).await.unwrap(),
+      new_key
+    );
   }
 
   /// The leave-intent record round-trips canonically and rejects schema,
