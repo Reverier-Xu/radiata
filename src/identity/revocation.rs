@@ -106,6 +106,27 @@ impl RevocationRecordV1 {
   }
 }
 
+/// The retained-binding admission view the shared issuer/subject check
+/// (`crate::identity::records::verify_retained_bindings`) runs over for
+/// this family.
+impl crate::identity::records::IssuerSignedTombstone for RevocationRecordV1 {
+  fn issuer_node(&self) -> &NodeId {
+    self.issuer()
+  }
+
+  fn subject_node(&self) -> &NodeId {
+    self.subject()
+  }
+
+  fn pinned_subject_key(&self) -> &PublicKey {
+    self.subject_key()
+  }
+
+  fn verify_issuer_signature(&self, issuer_key: &PublicKey) -> Result<()> {
+    self.verify(issuer_key)
+  }
+}
+
 /// Signs one revocation tombstone for `subject` under the local identity.
 /// The subject must hold a locally trusted binding equal to
 /// `expected_key`: an unknown subject fails `NotFound` and a different
@@ -338,17 +359,13 @@ pub(crate) async fn persist_revocation_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &RevocationRecordV1,
 ) -> Result<RevocationTransition> {
   let _permit = store.write_permit().await;
-  let bindings = crate::identity::trust::store::trusted_bindings(store).await?;
-  let issuer_key = bindings
-    .get(record.issuer())
-    .cloned()
-    .ok_or_else(|| Error::not_trusted("revocation issuer"))?;
-  record.verify(&issuer_key)?;
-  if let Some(bound) = bindings.get(record.subject())
-    && bound != record.subject_key()
-  {
-    return Err(Error::not_trusted("revocation subject binding"));
-  }
+  crate::identity::records::verify_retained_bindings(
+    store,
+    record,
+    "revocation issuer",
+    "revocation subject binding",
+  )
+  .await?;
   // The slot's prior evidence is read under this section's writer permit,
   // so the first-revocation verdict cannot race a concurrent record.
   let already_revoked =

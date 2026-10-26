@@ -549,13 +549,8 @@ async fn replacement_key(
       return Err(crate::identity::lifecycle::reconcile_unknown());
     }
   };
-  let provided = keys.public_key(created.handle()).await?;
-  if &provided != created.public_key() {
-    return Err(Error::provider(
-      crate::ProviderErrorKind::Internal,
-      crate::ProviderErrorContext::KeyPublicKey,
-    ));
-  }
+  crate::identity::lifecycle::verify_provider_key(keys, created.handle(), created.public_key())
+    .await?;
   Ok(created)
 }
 
