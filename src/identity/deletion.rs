@@ -16,9 +16,7 @@ use super::{
     CommitWithReconcile, cleanup_pending_exact, commit_with_reconcile, discover_local_identity,
     discovery_corrupt,
   },
-  records::{
-    KeyDeletedV1, KeyDeletionIntentV1, key_deleted_key, key_deletion_intent_key, local_identity_key,
-  },
+  records::{KeyDeletedV1, KeyDeletionIntentV1, key_deleted_key, key_deletion_intent_key},
 };
 use crate::{
   Error, ErrorKind, KeyDeleteState, KeyHandle, KeyOperationId, Result, StoreExpectation,
@@ -103,22 +101,15 @@ pub(crate) async fn delete_unreferenced_key(
         let value = StoreValue::new(Arc::from(intent.encode()?));
         // Transactional guard: pin the exact local-identity record this
         // snapshot proved unreferenced, so a concurrent finalization that
-        // changes it aborts the intent install.
-        let mut caller_operations = Vec::new();
-        if let Some((stored_identity, _)) = &local_identity {
-          let (local_namespace, local_key) = local_identity_key()?;
-          caller_operations.push(StoreOperation::Check {
-            namespace: local_namespace,
-            key: local_key,
-            expected: StoreExpectation::Exact(stored_identity.digest().clone()),
-          });
-        }
-        caller_operations.push(StoreOperation::Put {
-          namespace: intent_namespace.clone(),
-          key: intent_key.clone(),
-          expected: StoreExpectation::Absent,
-          value: value.clone(),
-        });
+        // changes it aborts the intent install. The shared construction
+        // keeps the receipt identity exactly recoverable (see
+        // `KeyDeletionIntentV1::recovery_identity`).
+        let caller_operations = intent.install_caller_operations(
+          local_identity
+            .as_ref()
+            .map(|(stored_identity, _)| stored_identity),
+          &value,
+        )?;
         let prepared = store
           .prepare_transaction_with_receipt_changes(
             snapshot.as_ref(),
@@ -213,7 +204,18 @@ async fn delete_provider_step(
   let (deleted_namespace, deleted_key) = key_deleted_key(intent.handle())?;
   let intent_token = ReceiptReferenceToken::for_record(&intent_namespace, &intent_key);
   let tombstone_token = ReceiptReferenceToken::for_record(&deleted_namespace, &deleted_key);
-  let target = intent.recovery_identity(stored_intent)?;
+  // The recovery re-supplies the install's local-identity guard source:
+  // the digest matches exactly while the identity record is the one the
+  // install pinned, and a swapped identity refuses the forget with a
+  // conflict instead of mis-conditioning the intent receipt's
+  // retention.
+  let local_identity = discover_local_identity(snapshot.as_ref()).await?;
+  let target = intent.recovery_identity(
+    local_identity
+      .as_ref()
+      .map(|(stored_identity, _)| stored_identity),
+    stored_intent,
+  )?;
   let prepared = store
     .prepare_journaled_transaction(
       snapshot.as_ref(),
@@ -649,9 +651,13 @@ mod tests {
     .await
     .unwrap();
 
-    // intent install + tombstone finalize + pending cleanup receipts.
+    // Intent install, tombstone finalize, and pending cleanup commits; the
+    // finalize forgets the intent receipt inline (its provider row leaves
+    // with the same commit that removes the intent's last reference), so
+    // the receipt population grows by the finalize and cleanup receipts
+    // only.
     let receipts_after = receipt_ids(&fixture.reference).len();
-    assert_eq!(receipts_before + 3, receipts_after);
+    assert_eq!(receipts_before + 2, receipts_after);
 
     // The tombstone transaction receipt references only the tombstone record;
     // the intent receipt has no remaining references.

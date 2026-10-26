@@ -903,9 +903,28 @@ mod tests {
     );
     assert_final_state(&reference, &identity);
     assert_eq!(commit_calls(&reference), 3);
+    // The finalize commit forgets the intent receipt inline: its provider
+    // row is gone, only the finalize and cleanup receipts remain, and
+    // the intent transaction's used-ID marker stays reserved as the
+    // permanent forgotten marker.
     assert_eq!(
       receipt_ids(&reference),
-      vec![transaction(3), transaction(4), transaction(5)]
+      vec![transaction(4), transaction(5)]
+    );
+    let (internal_namespace, intent_marker_key) = (
+      crate::storage::receipt::internal_namespace().unwrap(),
+      crate::storage::receipt::used_id_key(&transaction(3)).unwrap(),
+    );
+    assert_eq!(
+      reference
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .get(&(internal_namespace, intent_marker_key))
+        .unwrap()
+        .as_bytes(),
+      crate::storage::receipt::FORGOTTEN_MARKER_VALUE
     );
     assert_never_signed_or_deleted(&keys);
   }
@@ -1083,7 +1102,7 @@ mod tests {
     assert_eq!(commit_calls(&reference), 3);
     assert_eq!(
       receipt_ids(&reference),
-      vec![transaction(3), transaction(4), transaction(5)]
+      vec![transaction(4), transaction(5)]
     );
     assert_never_signed_or_deleted(&keys);
   }
@@ -1105,13 +1124,22 @@ mod tests {
       let entropy = entropy.clone();
       async move { open_with(fault_factory, keys, entropy).await }
     });
+    // The hang lands after the finalize commit applied: the durable
+    // local-identity record is the observable proof of that apply (the
+    // finalize also forgets the intent receipt inline, so the receipt
+    // table alone no longer distinguishes the two committed steps).
     for _ in 0..10_000 {
-      if reference.state.lock().unwrap().receipts.len() >= 2 {
+      if stored_local(&reference).is_some() {
         break;
       }
       tokio::task::yield_now().await;
     }
-    assert_eq!(reference.state.lock().unwrap().receipts.len(), 2);
+    assert!(stored_local(&reference).is_some());
+    assert_eq!(
+      reference.state.lock().unwrap().receipts.len(),
+      1,
+      "only the finalize receipt remains: its commit forgot the intent receipt inline"
+    );
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     drop(fault_factory);
@@ -1141,7 +1169,7 @@ mod tests {
     assert_eq!(commit_calls(&reference), 3);
     assert_eq!(
       receipt_ids(&reference),
-      vec![transaction(3), transaction(4), transaction(5)]
+      vec![transaction(4), transaction(5)]
     );
     assert_never_signed_or_deleted(&keys);
   }
@@ -1191,7 +1219,7 @@ mod tests {
     assert_eq!(commit_calls(&reference), 3);
     assert_eq!(
       receipt_ids(&reference),
-      vec![transaction(3), transaction(5), transaction(6)]
+      vec![transaction(5), transaction(6)]
     );
     assert_never_signed_or_deleted(&keys);
   }
@@ -1228,7 +1256,7 @@ mod tests {
     assert_eq!(commit_calls(&reference), 3);
     assert_eq!(
       receipt_ids(&reference),
-      vec![transaction(3), transaction(4), transaction(5)]
+      vec![transaction(4), transaction(5)]
     );
     drop(context);
 
@@ -1267,7 +1295,7 @@ mod tests {
     assert!(fault.script.lock().unwrap().is_empty());
     assert_eq!(
       receipt_ids(&reference),
-      vec![transaction(3), transaction(4), transaction(6)]
+      vec![transaction(4), transaction(6)]
     );
     assert_never_signed_or_deleted(&keys);
   }
@@ -1281,7 +1309,7 @@ mod tests {
           CommitFault::Pass,
           CommitFault::UnknownApplied,
         ],
-        vec![transaction(3), transaction(4), transaction(5)],
+        vec![transaction(4), transaction(5)],
       ),
       (
         vec![
@@ -1290,7 +1318,7 @@ mod tests {
           CommitFault::UnknownNotApplied,
           CommitFault::Pass,
         ],
-        vec![transaction(3), transaction(4), transaction(6)],
+        vec![transaction(4), transaction(6)],
       ),
     ] {
       let (reference, _factory) = fresh_reference();
@@ -1409,7 +1437,7 @@ mod tests {
     assert_final_state(&reference, &identity);
     assert_eq!(
       receipt_ids(&reference),
-      vec![transaction(3), transaction(4), transaction(5)]
+      vec![transaction(4), transaction(5)]
     );
 
     let (reference, factory) = fresh_reference();

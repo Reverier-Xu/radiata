@@ -852,21 +852,54 @@ impl KeyDeletionIntentV1 {
     &self.transaction
   }
 
+  /// Builds the caller operations of this intent's install transaction:
+  /// the local-identity transactional guard — pinning the exact record
+  /// the installing snapshot proved — ahead of the intent put, only when
+  /// that snapshot held a local identity. The install commit and the
+  /// receipt-identity recovery below share this construction, so the
+  /// recovered operation digest always equals the committed receipt's.
+  pub(crate) fn install_caller_operations(
+    &self, local_identity: Option<&StoreValue>, value: &StoreValue,
+  ) -> Result<Vec<StoreOperation>> {
+    let (namespace, key) = key_deletion_intent_key(&self.handle)?;
+    let mut operations = Vec::new();
+    if let Some(stored_identity) = local_identity {
+      let (local_namespace, local_key) = local_identity_key()?;
+      operations.push(StoreOperation::Check {
+        namespace: local_namespace,
+        key: local_key,
+        expected: StoreExpectation::Exact(stored_identity.digest().clone()),
+      });
+    }
+    operations.push(StoreOperation::Put {
+      namespace,
+      key,
+      expected: StoreExpectation::Absent,
+      value: value.clone(),
+    });
+    Ok(operations)
+  }
+
   /// Reconstructs the exact storage receipt identity committed with this
-  /// intent from the stored intent value, mirroring the creation-intent
-  /// recovery path.
-  pub(crate) fn recovery_identity(&self, stored_value: &StoreValue) -> Result<ReceiptIdentity> {
+  /// intent, mirroring the creation-intent recovery path: the original
+  /// commit paired the intent put — behind the same local-identity guard
+  /// [`Self::install_caller_operations`] builds — with an `AddSelf`
+  /// receipt reference carrying the intent record token. Recovery
+  /// re-supplies the guard source, so a local identity whose record
+  /// changed since the install (a leave swap across a crashed deletion)
+  /// reconstructs a different digest and the finalize's receipt-forget
+  /// condition refuses with a conflict instead of silently
+  /// mis-conditioning the intent receipt's retention.
+  pub(crate) fn recovery_identity(
+    &self, local_identity: Option<&StoreValue>, stored_value: &StoreValue,
+  ) -> Result<ReceiptIdentity> {
     let (namespace, key) = key_deletion_intent_key(&self.handle)?;
     let token = ReceiptReferenceToken::for_record(&namespace, &key);
+    let caller_operations = self.install_caller_operations(local_identity, stored_value)?;
     recover_self_referenced_transaction(
       &self.transaction,
       &self.base_revision,
-      vec![StoreOperation::Put {
-        namespace,
-        key,
-        expected: StoreExpectation::Absent,
-        value: stored_value.clone(),
-      }],
+      caller_operations,
       &[token],
     )
   }

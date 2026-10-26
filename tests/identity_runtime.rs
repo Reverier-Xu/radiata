@@ -118,7 +118,12 @@ async fn identity_runtime_fresh_start_provisions_once_and_restart_reloads_same_i
   assert!(intent_keys(&providers.factory).is_empty());
   assert_eq!(pending_count(&providers.factory), 0);
   assert_eq!(providers.factory.commit_calls(), 4);
-  assert_eq!(providers.factory.receipt_count(), 4);
+  // The finalize commit forgets the key-creation-intent receipt inline
+  // (same transaction as the final reference removal), so the provider
+  // keeps exactly the finalize, pending-cleanup, and self-binding
+  // receipts — and the first retention tick finds no candidate to
+  // collect, keeping the commit count pinned at 4.
+  assert_eq!(providers.factory.receipt_count(), 3);
   handle.shutdown().await.unwrap();
   assert_eq!(providers.storage_drops.count(), 1);
   assert_eq!(providers.factory_drops.count(), 0);

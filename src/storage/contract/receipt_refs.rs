@@ -16,8 +16,8 @@ use crate::{
     MetadataStore,
     pending::{pending_key, pending_namespace},
     receipt::{
-      ACTIVE_MARKER_VALUE, PreparedTransaction, ReceiptCleanupOutcome, ReceiptIdentity,
-      ReceiptReferenceChange, ReceiptReferenceOutcome, ReceiptReferenceToken,
+      ACTIVE_MARKER_VALUE, FORGOTTEN_MARKER_VALUE, PreparedTransaction, ReceiptCleanupOutcome,
+      ReceiptIdentity, ReceiptReferenceChange, ReceiptReferenceOutcome, ReceiptReferenceToken,
       eligibility_anchor_key, internal_namespace, reference_edge_key, reference_head_key,
       used_id_key,
     },
@@ -214,6 +214,7 @@ async fn identity_records_finalization_moves_references_between_receipts_atomica
   let old_head = reference_head_key(old_target.transaction()).unwrap();
   let old_edge = reference_edge_key(old_target.transaction(), &old_token).unwrap();
   let old_anchor = eligibility_anchor_key(old_target.transaction()).unwrap();
+  let old_marker = used_id_key(old_target.transaction()).unwrap();
   let self_head = reference_head_key(prepared.id()).unwrap();
   let operations = prepared.operations();
   assert!(operations.iter().any(|operation| {
@@ -227,6 +228,16 @@ async fn identity_records_finalization_moves_references_between_receipts_atomica
   }));
   assert!(!operations.iter().any(|operation| {
     matches!(operation, StoreOperation::Put { key, .. } | StoreOperation::Delete { key, .. } if key == &old_anchor)
+  }));
+  // The final removal forgets the replaced receipt in the same
+  // transaction: the used-ID marker flips to forgotten and the provider
+  // receipt row is dropped, so a completed finalization leaves no
+  // retention work behind.
+  assert!(operations.iter().any(|operation| {
+    matches!(operation, StoreOperation::Put { key, value, .. } if key == &old_marker && value.as_bytes() == FORGOTTEN_MARKER_VALUE)
+  }));
+  assert!(operations.iter().any(|operation| {
+    matches!(operation, StoreOperation::ForgetReceipt { transaction, expected_operation_digest } if transaction == old_target.transaction() && expected_operation_digest == old_target.operation_digest())
   }));
 
   let receipt = committed(store.commit(prepared).await.unwrap());
@@ -274,16 +285,28 @@ async fn identity_records_finalization_moves_references_between_receipts_atomica
       .unwrap()
       .unwrap()
       .as_bytes(),
-    ACTIVE_MARKER_VALUE
+    FORGOTTEN_MARKER_VALUE,
+    "the finalization forgets the replaced receipt inline"
   );
   drop(snapshot);
+  assert!(
+    !factory
+      .state
+      .lock()
+      .unwrap()
+      .receipts
+      .contains_key(old_target.transaction()),
+    "the finalization drops the replaced receipt's provider row"
+  );
 
+  // A forgotten receipt never re-enters the cleanup state machine: the
+  // eligibility sweep finds nothing to collect over a completed flow.
   assert!(matches!(
     store
       .cleanup_receipt(&old_target, contract_transaction_id(313))
       .await
       .unwrap(),
-    ReceiptCleanupOutcome::Anchored(_)
+    ReceiptCleanupOutcome::Conflict
   ));
 }
 
