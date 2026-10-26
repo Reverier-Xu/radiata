@@ -501,7 +501,8 @@ async fn apply_checkpoint_record(
 }
 
 /// The tombstone lane's reconciliation row apply: kind-prefixed keys
-/// (the plane's `TombstoneKind` prefixes) dispatch to the same per-record
+/// (the wire contract's [`crate::reconcile::wire::TombstoneKind`]
+/// prefixes) dispatch to the same per-record
 /// arms the announcement payload uses, so both planes verify, persist,
 /// notify, and collect identically. `source` addresses the applied
 /// receipt to the peer that carried the rows; the derived-view repair
@@ -522,13 +523,26 @@ pub(crate) async fn apply_tombstone_rows(
   // derived-view repair on the same poison row forever. Store failures
   // inside the apply arms still propagate: they are real write faults.
   for (key, content) in rows {
-    let Some((kind, subject)) = key.split_first() else {
+    let Some((prefix, subject)) = key.split_first() else {
       tracing::debug!("reconcile tombstone row skipped: no kind prefix");
       continue;
     };
     let subject: &[u8] = subject;
+    // The typed kind decoder the scan side builds row keys with: one
+    // closed mapping on the wire contract, so the apply dispatch and
+    // the scan cannot drift apart.
+    let kind = match crate::reconcile::wire::TombstoneKind::from_prefix(*prefix) {
+      Some(kind) => kind,
+      None => {
+        tracing::debug!(
+          kind = prefix,
+          "reconcile tombstone row skipped: unknown kind"
+        );
+        continue;
+      }
+    };
     match kind {
-      1 => {
+      crate::reconcile::wire::TombstoneKind::Leave => {
         let record = match crate::identity::leave::LeaveRecordV1::decode(content) {
           Ok(record) if record.node().as_str().as_bytes() == subject => record,
           Ok(record) => {
@@ -573,7 +587,7 @@ pub(crate) async fn apply_tombstone_rows(
           other => other?,
         }
       }
-      2 => {
+      crate::reconcile::wire::TombstoneKind::Cleanup => {
         let record = match crate::identity::cleanup::CleanupRecordV1::decode(content) {
           Ok(record) if record.subject().as_str().as_bytes() == subject => record,
           Ok(record) => {
@@ -613,7 +627,7 @@ pub(crate) async fn apply_tombstone_rows(
           other => other?,
         }
       }
-      3 => {
+      crate::reconcile::wire::TombstoneKind::Revocation => {
         let record = match crate::identity::revocation::RevocationRecordV1::decode(content) {
           Ok(record) if record.subject().as_str().as_bytes() == subject => record,
           Ok(record) => {
@@ -666,7 +680,7 @@ pub(crate) async fn apply_tombstone_rows(
           other => other?,
         }
       }
-      4 => {
+      crate::reconcile::wire::TombstoneKind::Checkpoint => {
         let checkpoint = match crate::identity::cleanup::CleanupCheckpointV1::decode(content) {
           Ok(checkpoint) if subject == b"checkpoint" => checkpoint,
           Ok(_) => {
@@ -682,9 +696,6 @@ pub(crate) async fn apply_tombstone_rows(
           }
         };
         apply_checkpoint_record(store, entropy, &checkpoint).await?;
-      }
-      _ => {
-        tracing::debug!(kind, "reconcile tombstone row skipped: unknown kind");
       }
     }
   }

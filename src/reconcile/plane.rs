@@ -1486,13 +1486,17 @@ fn tombstone_collected(checkpoint: Option<u64>, key: &[u8], content: &[u8]) -> b
   let collected = |stamp: Option<u64>| {
     checkpoint.is_some_and(|watermark| stamp.is_some_and(|stamp| stamp <= watermark))
   };
-  match key.first() {
-    Some(1) => collected(
+  match key
+    .first()
+    .copied()
+    .and_then(wire::TombstoneKind::from_prefix)
+  {
+    Some(wire::TombstoneKind::Leave) => collected(
       crate::identity::leave::LeaveRecordV1::decode(content)
         .ok()
         .map(|record| record.timestamp_millis()),
     ),
-    Some(2) => collected(
+    Some(wire::TombstoneKind::Cleanup) => collected(
       crate::identity::cleanup::CleanupRecordV1::decode(content)
         .ok()
         .map(|record| record.timestamp_millis()),
@@ -1649,55 +1653,11 @@ async fn scan_namespace(
 }
 
 /// The tombstone lane's kind byte: one key space for the four terminal
-/// record families (a subject can carry more than one kind).
-#[derive(Clone, Copy)]
-enum TombstoneKind {
-  Leave,
-  Cleanup,
-  Revocation,
-  Checkpoint,
-}
-
-impl TombstoneKind {
-  fn prefix(&self) -> u8 {
-    match self {
-      Self::Leave => 1,
-      Self::Cleanup => 2,
-      Self::Revocation => 3,
-      Self::Checkpoint => 4,
-    }
-  }
-
-  fn namespace_tag(&self) -> &'static str {
-    match self {
-      Self::Leave => crate::storage::families::LEAVE_NAMESPACE,
-      Self::Cleanup => crate::storage::families::CLEANUP_NAMESPACE,
-      Self::Revocation => crate::storage::families::REVOCATION_NAMESPACE,
-      Self::Checkpoint => crate::storage::families::CHECKPOINT_NAMESPACE,
-    }
-  }
-
-  fn row_key(&self, subject: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(subject.len() + 1);
-    key.push(self.prefix());
-    key.extend_from_slice(subject);
-    key
-  }
-
-  /// Whether a scanned row belongs to this kind (and decodes): the
-  /// leave family's intent singleton is not a record and is skipped.
-  fn decodable(&self, key: &[u8], value: &[u8]) -> bool {
-    match self {
-      Self::Leave => {
-        !crate::identity::leave::is_intent_key(key)
-          && crate::identity::leave::LeaveRecordV1::decode(value).is_ok()
-      }
-      Self::Cleanup => crate::identity::cleanup::CleanupRecordV1::decode(value).is_ok(),
-      Self::Revocation => crate::identity::revocation::RevocationRecordV1::decode(value).is_ok(),
-      Self::Checkpoint => crate::identity::cleanup::CleanupCheckpointV1::decode(value).is_ok(),
-    }
-  }
-}
+/// record families (a subject can carry more than one kind). The enum
+/// and its typed prefix decoder live on the wire contract
+/// ([`wire::TombstoneKind`]) so the scan side here and the apply side in
+/// `membership::sync` share one mapping.
+use super::wire::TombstoneKind;
 
 /// One lane apply's outcome, split by what the store did with each
 /// row. The `refused` list is decided evidence the store will refuse
@@ -1755,27 +1715,10 @@ async fn apply_rows(
       let mut descriptors: Vec<(Vec<u8>, Vec<u8>, crate::membership::NodeDescriptorV1)> =
         Vec::with_capacity(rows.len());
       let mut refused = Vec::new();
-      let mut index_by_node: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
       for (row_key, content) in rows {
         match crate::membership::page::decode_descriptor(content) {
           Ok(descriptor) if row_key.as_slice() == descriptor.node().as_str().as_bytes() => {
-            let node = descriptor.node().as_str().to_owned();
-            match index_by_node.get(&node) {
-              Some(&index) if descriptors[index].2.revision() >= descriptor.revision() => {
-                refused.push((row_key.clone(), content.clone()));
-              }
-              Some(&index) => {
-                let superseded_content =
-                  std::mem::replace(&mut descriptors[index].1, content.clone());
-                refused.push((row_key.clone(), superseded_content));
-                descriptors[index].2 = descriptor;
-              }
-              None => {
-                index_by_node.insert(node, descriptors.len());
-                descriptors.push((row_key.clone(), content.clone(), descriptor));
-              }
-            }
+            descriptors.push((row_key.clone(), content.clone(), descriptor));
           }
           Ok(descriptor) => {
             tracing::debug!(
@@ -1793,6 +1736,28 @@ async fn apply_rows(
           }
         }
       }
+      // The same-key page-order contest, single-sourced with the
+      // register's page batch (`contest_descriptors`): the decided
+      // contest losers — stale-or-equal by construction, the same
+      // refusal the store would make — join the refused list in their
+      // original wire shape, and the winners apply in first-seen order.
+      let decoded: Vec<&crate::membership::NodeDescriptorV1> = descriptors
+        .iter()
+        .map(|(_, _, descriptor)| descriptor)
+        .collect();
+      let (winner_rows, loser_rows) = crate::membership::store::contest_descriptors(&decoded);
+      let winners: Vec<(Vec<u8>, Vec<u8>, crate::membership::NodeDescriptorV1)> = winner_rows
+        .into_iter()
+        .map(|index| {
+          let (row_key, content, descriptor) = &descriptors[index];
+          (row_key.clone(), content.clone(), descriptor.clone())
+        })
+        .collect();
+      for index in loser_rows {
+        let (row_key, content, _) = &descriptors[index];
+        refused.push((row_key.clone(), content.clone()));
+      }
+      let descriptors = winners;
       let mut skipped_ids = Vec::new();
       for chunk in descriptors.chunks(crate::paging::PAGE_MAX_ITEMS) {
         let page = crate::membership::page::MembershipPage::new(
