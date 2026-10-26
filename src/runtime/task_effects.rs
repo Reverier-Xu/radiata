@@ -580,20 +580,32 @@ async fn reconcile_revoke(
     &expected_key,
   )
   .await?;
+  // The shared authorization boundary (audit 2026-10-23, P1-11): the
+  // durable commit, the ledger record, and the session retirement run as
+  // ONE exclusive section against session publication. A handshake whose
+  // admission predated this revoke either published before the section
+  // ran (the retirement below removes it) or re-checks the ledger after
+  // the section and refuses to publish — the revoked identity never
+  // survives as a fresh session either way. The section is short and
+  // touches no network negotiation.
+  let mut revoked = planes.packet.authorization_boundary().section().await;
   let outcome = crate::identity::revocation::revoke_binding_ctx(
     context.store(),
     planes.entropy.as_ref(),
     &record,
   )
   .await?;
+  revoked.record(&subject);
   let transition = outcome.transition();
   // The execution plane is independent of the evidence verdict: a revoked
   // identity must never keep a live session, so the exact identity's
   // sessions retire on every outcome (retiring an already-retired peer is
   // a no-op). Redial is impossible by construction — the revoked binding
   // is gone, so neither recovery candidates nor an inbound handshake can
-  // admit this identity again.
+  // admit this identity again, and a finishing handshake is refused at
+  // the publication gate above.
   retire_session(&planes.sessions, &subject)?;
+  drop(revoked);
   if transition.changed_authorization() {
     deps
       .events()
@@ -640,12 +652,19 @@ async fn reconcile_purge_revocation(
 ) -> Result<EffectOutcome> {
   let planes = deps.planes()?;
   planes.context.require_unblocked()?;
+  // The purge crosses the same authorization boundary as the revoke: the
+  // ledger forgets the subject in the same section as the durable clear,
+  // so a post-purge reconnection in this incarnation is never refused by
+  // a stale ledger entry.
+  let mut revoked = planes.packet.authorization_boundary().section().await;
   crate::identity::revocation::purge_revocation_ctx(
     planes.context.store(),
     planes.entropy.as_ref(),
     &subject,
   )
   .await?;
+  revoked.forget(&subject);
+  drop(revoked);
   Ok(EffectOutcome::new(TaskOutput::PurgeRevocation(())))
 }
 
