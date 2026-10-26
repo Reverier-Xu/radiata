@@ -394,19 +394,85 @@ impl IncomingStream {
   /// Derives a caller-owned return stream to the authenticated source:
   /// the endpoints are swapped and the incoming `TraceId` is reused. Core
   /// assigns no return meaning, never completes another stream by
-  /// correlation, and the derived stream follows the exact-node direct
-  /// policy with the caller-supplied protocol and metadata.
+  /// correlation, and the derived stream targets the exact source node
+  /// with the caller-supplied protocol and metadata.
+  ///
+  /// The reply carries a single-hop budget: it is delivered directly
+  /// whenever the source is directly connected, and it may pass through
+  /// at most one relay. This is the convenience variant for the common
+  /// request/reply hop; a reply whose source sits more than one relay
+  /// away needs [`Self::derive_return_stream_with_hops`].
   pub fn derive_return_stream(
     &self, protocol: ProtocolTag, metadata: StreamMetadata,
   ) -> Result<OutboundStream> {
+    self.derive_reply(protocol, metadata, 1)
+  }
+
+  /// Derives a caller-owned return stream to the authenticated source
+  /// under an explicit relay budget: the endpoints are swapped, the
+  /// incoming `TraceId` is reused, and exactly like
+  /// [`Self::derive_return_stream`] the caller owns every reply meaning —
+  /// the protocol, the body, and any correlation between the two
+  /// directions.
+  ///
+  /// `max_hops` is the number of relays the reply may traverse (at least
+  /// one, rejected as `InvalidInput` otherwise). The routing plane still
+  /// delivers directly whenever the source is directly connected and
+  /// consults the node's next-hop policy only for the remaining hops, so
+  /// the same call is correct on direct and relayed return paths. Use
+  /// this variant when the source of the incoming stream is not a direct
+  /// peer — a request that arrived over a relay chain must be answered
+  /// over one — and keep [`Self::derive_return_stream`] when the source
+  /// is directly connected or a single relay away, where the implicit
+  /// one-hop budget already covers the return path.
+  ///
+  /// An exhausted budget ends the reply with a typed delivery failure at
+  /// this node; core never continues a reply past the caller's budget.
+  ///
+  /// ```
+  /// use radiata::{BoxFuture, IncomingStream, PacketConsumer, Result, StreamMetadata};
+  ///
+  /// /// Answers every admitted stream with a reply that may cross relays.
+  /// #[derive(Debug)]
+  /// struct Replying;
+  ///
+  /// impl PacketConsumer for Replying {
+  ///     fn accept<'a>(&'a self, packet: IncomingStream) -> BoxFuture<'a, Result<()>> {
+  ///         Box::pin(async move {
+  ///             let reply = packet.derive_return_stream_with_hops(
+  ///                 packet.protocol().clone(),
+  ///                 StreamMetadata::new(),
+  ///                 4,
+  ///             )?;
+  ///             // The reply body and its meaning are the application's.
+  ///             let _ = reply;
+  ///             Ok(())
+  ///         })
+  ///     }
+  /// }
+  /// ```
+  pub fn derive_return_stream_with_hops(
+    &self, protocol: ProtocolTag, metadata: StreamMetadata, max_hops: u32,
+  ) -> Result<OutboundStream> {
+    self.derive_reply(protocol, metadata, max_hops)
+  }
+
+  /// The one derivation both reply variants share: the registry gate and
+  /// the reply's target, trace, and budget wiring.
+  fn derive_reply(
+    &self, protocol: ProtocolTag, metadata: StreamMetadata, max_hops: u32,
+  ) -> Result<OutboundStream> {
     if !self.reply.registry.has_protocol(&protocol) {
       return Err(Error::unsupported("packet protocol"));
+    }
+    if max_hops == 0 {
+      return Err(Error::invalid_input("stream hop budget"));
     }
     Ok(OutboundStream::new(
       self.trace_id.clone(),
       StreamTarget::Exact(self.source.clone()),
       None,
-      1,
+      max_hops,
       protocol,
       metadata,
       self.reply.runtime.clone(),
@@ -694,10 +760,108 @@ mod tests {
   use futures_util::StreamExt as _;
 
   use super::{
-    METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, RoutingPolicy, StreamItem, StreamMetadata,
-    StreamPolicy, channel_body,
+    IncomingStream, METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, PacketReplyContext, RoutingPolicy,
+    StreamItem, StreamMetadata, StreamPolicy, StreamTarget, channel_body,
   };
   use crate::{ErrorKind, QualifiedTag};
+
+  fn node(value: u8) -> crate::NodeId {
+    crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  /// One admitted stream stand-in for the reply-derivation seam: the
+  /// derivation only reads the authenticated endpoints, the trace, and
+  /// the protocol registry, so the body channel and the routing-only
+  /// runtime client stay unused.
+  fn incoming(
+    source: &crate::NodeId, destination: &crate::NodeId, protocol: &crate::ProtocolTag,
+  ) -> IncomingStream {
+    #[derive(Debug)]
+    struct Silent;
+
+    impl crate::PacketConsumer for Silent {
+      fn accept<'a>(&'a self, _packet: IncomingStream) -> crate::BoxFuture<'a, crate::Result<()>> {
+        Box::pin(async { Ok(()) })
+      }
+    }
+
+    let mut registry = crate::ExtensionRegistry::new();
+    registry
+      .register_protocol(
+        crate::ProtocolDefinition::new(
+          protocol.clone(),
+          crate::FeatureTag::parse("radiata.woooo.tech/features/reply-test").unwrap(),
+        ),
+        Arc::new(Silent),
+      )
+      .unwrap();
+    let (packets, _receiver) = tokio::sync::mpsc::channel(1);
+    let runtime = crate::runtime::RuntimeClient::routing_only(
+      packets,
+      Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+    );
+    let (_, body) = tokio::sync::mpsc::channel(1);
+    IncomingStream::new(
+      source.clone(),
+      destination.clone(),
+      crate::TraceId::parse("trace-000000000000000000001").unwrap(),
+      protocol.clone(),
+      StreamMetadata::new(),
+      channel_body(body),
+      PacketReplyContext::new(Arc::new(registry), runtime),
+    )
+  }
+
+  /// The convenience variant keeps its exact-source target, its reused
+  /// trace, and its single-hop budget; the explicit variant carries the
+  /// caller's budget over the same reply shape.
+  #[test]
+  fn return_stream_variants_differ_only_in_the_hop_budget() {
+    let (source, destination) = (node(1), node(2));
+    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let packet = incoming(&source, &destination, &protocol);
+
+    let direct = packet
+      .derive_return_stream(protocol.clone(), StreamMetadata::new())
+      .unwrap();
+    let budgeted = packet
+      .derive_return_stream_with_hops(protocol, StreamMetadata::new(), 4)
+      .unwrap();
+
+    for reply in [&direct, &budgeted] {
+      assert_eq!(reply.target, StreamTarget::Exact(source.clone()));
+      assert_eq!(reply.trace_id(), packet.trace_id());
+    }
+    assert_eq!(direct.max_hops, 1);
+    assert_eq!(budgeted.max_hops, 4);
+  }
+
+  /// A zero-hop budget is not a routable reply: the explicit variant
+  /// rejects it at the derivation gate instead of building a stream that
+  /// could never be delivered.
+  #[test]
+  fn derive_return_stream_with_hops_rejects_a_zero_budget() {
+    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let packet = incoming(&node(1), &node(2), &protocol);
+    let error = packet
+      .derive_return_stream_with_hops(protocol, StreamMetadata::new(), 0)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// Both variants share the registry gate: a reply may only carry a
+  /// protocol this node registered for admission.
+  #[test]
+  fn derive_return_stream_with_hops_keeps_the_protocol_registry_gate() {
+    let registered = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let packet = incoming(&node(1), &node(2), &registered);
+    let unregistered =
+      crate::ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered").unwrap();
+    let error = packet
+      .derive_return_stream_with_hops(unregistered, StreamMetadata::new(), 4)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+  }
 
   /// The direct policy is the only routable policy: `RoutingPolicy` is
   /// `#[non_exhaustive]` with exactly one variant today, so no non-direct

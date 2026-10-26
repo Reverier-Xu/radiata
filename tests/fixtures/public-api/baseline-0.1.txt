@@ -371,6 +371,7 @@ pub struct radiata::IncomingStream
 impl radiata::IncomingStream
 pub fn radiata::IncomingStream::body(&mut self) -> core::pin::Pin<&mut (dyn futures_core::stream::Stream<Item = radiata::Result<alloc::rcs::arc::Arc<[u8]>>> + core::marker::Send)>
 pub fn radiata::IncomingStream::derive_return_stream(&self, radiata::ProtocolTag, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
+pub fn radiata::IncomingStream::derive_return_stream_with_hops(&self, radiata::ProtocolTag, radiata::StreamMetadata, u32) -> radiata::Result<radiata::OutboundStream>
 pub fn radiata::IncomingStream::destination(&self) -> &radiata::NodeId
 pub fn radiata::IncomingStream::metadata(&self) -> &radiata::StreamMetadata
 pub fn radiata::IncomingStream::protocol(&self) -> &radiata::ProtocolTag
