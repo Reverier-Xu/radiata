@@ -49,6 +49,39 @@
 //! same way through [`node.leave`](crate::NodeHandle::leave)'s
 //! resource-plane sibling [`Resources::delete`](crate::Resources::delete).
 //!
+//! Scope the comparison honestly: the precondition protects **this
+//! node's one observation** — the expected tuple is re-verified against
+//! the stored winner inside the commit's own snapshot — it is not a
+//! cluster-wide serialization order, and nothing like a globally
+//! monotonic resourceVersion exists. Two partitioned writers can each
+//! pin the same observed tuple and each commit on their own side; the
+//! register's timestamp-maximum tuple, not the comparison, still
+//! elects one winner every replica converges to. The ordering tolerates
+//! the clock anomalies wall time itself settles: a rolled-back clock
+//! makes a later local write lose (harmlessly accepted), and a
+//! future-dated writer dominates until wall time catches up. An
+//! accepted candidate that is not the winner — the **accepted loser** —
+//! is exactly what
+//! [`ResourceMutationView`](crate::ResourceMutationView) reports, and
+//! the correction path is ordinary convergence: read the current view,
+//! rebase the intended change on its tuple, and commit conditionally
+//! again.
+//!
+//! Removal memory is deliberately bounded. A signed removal record is
+//! evidence with a finite retention window: the retention pass drops a
+//! removal once its own timestamp ages past the window, and the
+//! removal population is capacity-bounded with the oldest evicted
+//! first. While the evidence survives anywhere an exchange reaches, it
+//! beats a late-arriving live value by tuple order and anti-entropy
+//! re-establishes the removal. A replica that reconnects after more
+//! than a window offline may therefore re-introduce its pre-removal
+//! rows, and already-deleted data can surface again briefly —
+//! re-converged away wherever the evidence still survives, while past
+//! a reclaimed window the cluster no longer remembers the deletion at
+//! all and a reappearing row can stay. An integration whose offline
+//! tolerance exceeds the window treats remote removals as expiring,
+//! not permanent.
+//!
 //! ```
 //! use radiata::{
 //!     NodeHandle, ResourceLabels, ResourceMutationView, ResourceName, ResourceVersion,
@@ -120,6 +153,33 @@
 //! sub-partitions each already meshed at or above target have a zero
 //! deficit budget and a quiesced recovery plane, and that probe is the
 //! only thing that re-bridges them.
+//!
+//! A bridge that lands is an ordinary edge, deliberately: the probe
+//! dials through the same maintenance path as a deficit batch, so the
+//! session it opens joins the mesh as a regular retained edge — the
+//! recovery plane's redundancy pruning never reclaims it, and the
+//! maintenance plane never prunes at all. A stable cluster therefore
+//! **densifies**: while any member stays unconnected, every
+//! five-minute bracket that succeeds adds one more permanent link,
+//! whatever the degree target says. That is the established contract,
+//! not a leak — the long-term shape of the mesh is controlled by the
+//! degree target and by operator observation, not by automatic
+//! pruning.
+//!
+//! Which transport carries a route is never inferred: every dial and
+//! bind resolves its transport from the endpoint's scheme alone — the
+//! built-in `tls://`, `wss://`, and `tcp://` forms, or the registered
+//! scheme name of a custom transport provider. There is no automatic
+//! preference or scoring between transports; a multi-homed member's
+//! published endpoints rotate across successive dials, nothing more.
+//! The endpoints an integration publishes and dials are the explicit
+//! transport choice, and confidentiality rides the same choice: the
+//! session handshake always authenticates identities over whatever
+//! medium the endpoint names, but a plaintext-class endpoint (`tcp://`,
+//! a custom medium) encrypts nothing — business encryption
+//! requirements are the caller's responsibility, discharged by
+//! choosing TLS-class endpoints or a transport provider that ciphers
+//! its own stream.
 //!
 //! [`RecoveryView`](crate::RecoveryView) reports the any-one-route
 //! contract: `is_connected` means "at least one path", and
@@ -650,6 +710,17 @@
 //! node-local observer watches `TaskChanged` for the operator surface,
 //! and a caller that restarted can re-read `tasks().get` for any task
 //! still inside the bounded terminal history.
+//!
+//! All of that observes memory, deliberately: the task table, the
+//! bounded terminal history, and `TaskChanged` live in the running
+//! process, and a restart loses the observation — never committed
+//! state. Durability is each effect's own footprint: a journaled leave
+//! resumes from its durable record, an admitted resource write
+//! survives as its committed candidate, a revocation as its record.
+//! Whatever an effect never committed existed only as intent, and
+//! uncommitted business intent — a task admitted but not terminal when
+//! the process died — is the application's own to retain and re-drive
+//! after a restart.
 //!
 //! Custom kinds extend the same surface: register a
 //! [`TaskReconciler`](crate::TaskReconciler) under a caller-owned
