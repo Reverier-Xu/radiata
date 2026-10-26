@@ -644,3 +644,68 @@ async fn namespace_write_epochs_drive_the_incremental_scan() {
     "the untracked note forces the fallback"
   );
 }
+
+/// The writer exclusion is a plain async mutex, not a task-identity
+/// reentrancy inference: two sibling futures of the same task (the legs
+/// of a `join!`) contend for it like any other callers, so the second
+/// parks instead of silently sharing the first's section and receives
+/// it only once the first releases.
+#[tokio::test]
+async fn writer_permit_queues_sibling_futures_in_the_same_task() {
+  let (store, _state) = scripted(vec![], vec![]).await;
+  let held = store.write_permit().await;
+  let mut sibling = std::pin::pin!(store.write_permit());
+  assert!(
+    futures_util::poll!(sibling.as_mut()).is_pending(),
+    "a sibling future in the same task must wait for the section, not share it"
+  );
+  drop(held);
+  assert!(
+    futures_util::poll!(sibling.as_mut()).is_ready(),
+    "the sibling acquires only after the holder releases"
+  );
+}
+
+/// A flow that spans helper calls keeps one permit owner: the helper
+/// receives the permit by reference as proof of the held section and
+/// commits inside it, while a concurrent sibling stays parked for the
+/// whole nested call.
+#[tokio::test]
+async fn writer_permit_transfers_into_an_inner_section_without_reacquiring() {
+  let submitted = transaction(0);
+  let receipt = CommitReceipt::new(
+    submitted.id().clone(),
+    submitted.operation_digest().clone(),
+    revision(2),
+  );
+  let (store, state) = scripted(
+    vec![CommitScript::Outcome(CommitOutcome::Committed(receipt))],
+    vec![],
+  )
+  .await;
+  let permit = store.write_permit().await;
+  let mut sibling = std::pin::pin!(store.write_permit());
+  assert!(futures_util::poll!(sibling.as_mut()).is_pending());
+  assert!(matches!(
+    commit_inside_section(&permit, &store, submitted)
+      .await
+      .unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+  assert_eq!(state.commit_calls.load(Ordering::SeqCst), 1);
+  assert!(
+    futures_util::poll!(sibling.as_mut()).is_pending(),
+    "the inner section runs under the caller's permit, not a nested acquisition"
+  );
+  drop(permit);
+  assert!(futures_util::poll!(sibling.as_mut()).is_ready());
+}
+
+/// The in-crate shape of a journaled helper: the caller's permit is the
+/// permission to commit, so the helper never re-acquires the mutex.
+async fn commit_inside_section(
+  _permit: &crate::storage::WriterPermit<'_>, store: &MetadataStore,
+  transaction: PreparedTransaction,
+) -> Result<CommitOutcome> {
+  store.commit(transaction).await
+}

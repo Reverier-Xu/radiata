@@ -36,8 +36,10 @@ use super::{
 };
 use crate::{
   Error, KeyHandle, KeyOperationId, NodeId, PublicKey, Result, StoreExpectation, StoreKey,
-  StoreNamespace, StoreOperation, StoreValue, TransactionId, api::Entropy, provider::KeyProvider,
-  storage::MetadataStore,
+  StoreNamespace, StoreOperation, StoreValue, TransactionId,
+  api::Entropy,
+  provider::KeyProvider,
+  storage::{MetadataStore, WriterPermit},
 };
 
 /// The durable schema of the leave-intent record.
@@ -447,7 +449,7 @@ const WIPE_RETRIES: usize = 8;
 /// Wipes one family in bounded exact-digest batches; idempotent, so a
 /// crash mid-family resumes by re-scanning.
 async fn wipe_family(
-  store: &MetadataStore, entropy: &dyn Entropy, namespace_tag: &str,
+  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, namespace_tag: &str,
 ) -> Result<()> {
   let namespace = crate::identity::records::metadata_namespace(namespace_tag)?;
   let mut retries = 0_usize;
@@ -473,7 +475,7 @@ async fn wipe_family(
     drop(snapshot);
     let prepared =
       store.prepare_transaction(TransactionId::generate(entropy)?, revision, operations)?;
-    match commit_with_reconcile(store, prepared).await? {
+    match commit_with_reconcile(_permit, store, prepared).await? {
       CommitWithReconcile::Committed => {}
       // A concurrent write raced the batch: restart the family scan with
       // a fresh snapshot; the bounded budget makes a permanent storm a
@@ -489,9 +491,11 @@ async fn wipe_family(
 }
 
 /// Wipes every domain family of the old identity.
-async fn wipe_old_metadata(store: &MetadataStore, entropy: &dyn Entropy) -> Result<()> {
+async fn wipe_old_metadata(
+  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy,
+) -> Result<()> {
   for namespace in wipe_namespaces() {
-    wipe_family(store, entropy, namespace).await?;
+    wipe_family(_permit, store, entropy, namespace).await?;
   }
   Ok(())
 }
@@ -533,7 +537,8 @@ async fn replacement_key(
 /// to the replacement (exact digest on the former record, deletion-intent
 /// guards on the replacement handle).
 async fn swap_identity(
-  store: &MetadataStore, entropy: &dyn Entropy, intent: &LeaveIntentV1, created: &crate::CreatedKey,
+  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, intent: &LeaveIntentV1,
+  created: &crate::CreatedKey,
 ) -> Result<()> {
   let replacement = LocalIdentityV1::new(
     intent.replacement_node.clone(),
@@ -571,7 +576,7 @@ async fn swap_identity(
     ],
   )?;
   drop(snapshot);
-  match commit_with_reconcile(store, prepared).await? {
+  match commit_with_reconcile(_permit, store, prepared).await? {
     CommitWithReconcile::Committed => Ok(()),
     CommitWithReconcile::Aborted => Err(Error::conflict("leave identity swap")),
   }
@@ -579,7 +584,7 @@ async fn swap_identity(
 
 /// Phase F: removes the completed leave-intent by exact digest.
 async fn complete_leave(
-  store: &MetadataStore, entropy: &dyn Entropy, stored: &StoreValue,
+  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, stored: &StoreValue,
 ) -> Result<()> {
   let snapshot = store.snapshot().await?;
   let prepared = store.prepare_transaction(
@@ -592,7 +597,7 @@ async fn complete_leave(
     }],
   )?;
   drop(snapshot);
-  match commit_with_reconcile(store, prepared).await? {
+  match commit_with_reconcile(_permit, store, prepared).await? {
     CommitWithReconcile::Committed => Ok(()),
     CommitWithReconcile::Aborted => Err(Error::conflict("leave completion")),
   }
@@ -601,11 +606,16 @@ async fn complete_leave(
 /// Runs the leave phases from the intent forward: replacement key, identity
 /// swap, metadata wipe, former-key deletion, completion. Idempotent and
 /// shared by the command path and the startup resume.
+///
+/// The whole phase sequence holds one writer permit: the phases are
+/// read-decide-commit sections that must not interleave with each other,
+/// and each phase's helper receives this permit instead of acquiring
+/// again.
 pub(crate) async fn run_leave(
   store: &MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, stored: &StoreValue,
   intent: &LeaveIntentV1,
 ) -> Result<()> {
-  let _permit = store.write_permit().await;
+  let permit = store.write_permit().await;
   let identity =
     crate::identity::lifecycle::discover_local_identity(store.snapshot().await?.as_ref())
       .await?
@@ -614,14 +624,15 @@ pub(crate) async fn run_leave(
   if identity.node() == &intent.former_node {
     // The swap has not committed yet: create the replacement key and swap.
     let created = replacement_key(keys, intent).await?;
-    swap_identity(store, entropy, intent, &created).await?;
+    swap_identity(&permit, store, entropy, intent, &created).await?;
   } else if identity.node() != &intent.replacement_node {
     // The identity is neither the former nor the replacement: the store
     // is inconsistent with the intent and fails closed as corrupt.
     return Err(super::lifecycle::discovery_corrupt());
   }
-  wipe_old_metadata(store, entropy).await?;
+  wipe_old_metadata(&permit, store, entropy).await?;
   delete_unreferenced_key(
+    &permit,
     store,
     keys,
     entropy,
@@ -629,7 +640,7 @@ pub(crate) async fn run_leave(
     intent.former_handle(),
   )
   .await?;
-  complete_leave(store, entropy, stored).await
+  complete_leave(&permit, store, entropy, stored).await
 }
 
 /// Test composition of the full drive without any announcement (the
@@ -661,14 +672,12 @@ async fn begin_intent(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
 ) -> Result<(StoreValue, LeaveIntentV1)> {
   let store = context.store();
-  // The intent install joins the store's writer exclusion like every
-  // other identity phase: read-decide-commit on the Absent expectation is
-  // then atomic against internal writers (anti-entropy, neighbouring
-  // families), and only an external writer can still win the race. The
-  // bounded retries remain as the fail-closed second line for that
-  // residual window (the lock is task-reentrant, so run_leave's own
-  // permit below nests).
-  let _permit = store.write_permit().await;
+  // The intent install is one read-decide-commit section: the Absent
+  // expectation is atomic against internal writers (anti-entropy,
+  // neighbouring families), and only an external writer can still win the
+  // race. The bounded retries remain as the fail-closed second line for
+  // that residual window.
+  let permit = store.write_permit().await;
   let former = context.identity().clone();
   let intent = LeaveIntentV1 {
     former_node: former.node().clone(),
@@ -697,7 +706,7 @@ async fn begin_intent(
       }],
     )?;
     drop(snapshot);
-    match commit_with_reconcile(store, prepared).await? {
+    match commit_with_reconcile(&permit, store, prepared).await? {
       CommitWithReconcile::Committed => return Ok((value, intent)),
       CommitWithReconcile::Aborted => continue,
     }
@@ -1236,9 +1245,17 @@ mod tests {
     let created = super::replacement_key(&keys.as_provider(), &intent)
       .await
       .unwrap();
-    super::swap_identity(context.store(), entropy.as_ref(), &intent, &created)
-      .await
-      .unwrap();
+    let permit = context.store().write_permit().await;
+    super::swap_identity(
+      &permit,
+      context.store(),
+      entropy.as_ref(),
+      &intent,
+      &created,
+    )
+    .await
+    .unwrap();
+    drop(permit);
     let replacement_node = intent.replacement_node.clone();
 
     // The startup resume completes the remaining phases.
