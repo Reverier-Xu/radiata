@@ -108,6 +108,85 @@ impl LaneId {
   }
 }
 
+/// The tombstone lane's row-key kind byte: one key space for the four
+/// terminal record families (a subject can carry more than one kind).
+/// The registry is closed exactly like the lane codes — the prefix set
+/// is frozen wire contract, never an open registration — and this one
+/// typed decoder is the single mapping both planes share: the scan side
+/// builds kind-prefixed row keys from it, the apply side dispatches on
+/// it, so the two cannot drift apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TombstoneKind {
+  /// An issuer-signed leave record ([
+  /// crate::identity::leave::LeaveRecordV1]).
+  Leave,
+  /// An issuer-signed cleanup record ([
+  /// crate::identity::cleanup::CleanupRecordV1]).
+  Cleanup,
+  /// An issuer-signed revocation record ([
+  /// crate::identity::revocation::RevocationRecordV1]).
+  Revocation,
+  /// The cleanup checkpoint singleton ([
+  /// crate::identity::cleanup::CleanupCheckpointV1]).
+  Checkpoint,
+}
+
+impl TombstoneKind {
+  /// The kind byte that prefixes one tombstone-lane row key.
+  pub(crate) const fn prefix(self) -> u8 {
+    match self {
+      Self::Leave => 1,
+      Self::Cleanup => 2,
+      Self::Revocation => 3,
+      Self::Checkpoint => 4,
+    }
+  }
+
+  /// Resolves one row-key kind byte; an unknown prefix is not a
+  /// tombstone kind (`None`) and the caller skips the row.
+  pub(crate) const fn from_prefix(prefix: u8) -> Option<Self> {
+    match prefix {
+      1 => Some(Self::Leave),
+      2 => Some(Self::Cleanup),
+      3 => Some(Self::Revocation),
+      4 => Some(Self::Checkpoint),
+      _ => None,
+    }
+  }
+
+  /// The store-family tag this kind scans.
+  pub(crate) const fn namespace_tag(self) -> &'static str {
+    match self {
+      Self::Leave => crate::storage::families::LEAVE_NAMESPACE,
+      Self::Cleanup => crate::storage::families::CLEANUP_NAMESPACE,
+      Self::Revocation => crate::storage::families::REVOCATION_NAMESPACE,
+      Self::Checkpoint => crate::storage::families::CHECKPOINT_NAMESPACE,
+    }
+  }
+
+  /// The kind-prefixed lane row key for one subject.
+  pub(crate) fn row_key(self, subject: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(subject.len() + 1);
+    key.push(self.prefix());
+    key.extend_from_slice(subject);
+    key
+  }
+
+  /// Whether one scanned store row belongs to this kind (and decodes):
+  /// the leave family's intent singleton is not a record and is skipped.
+  pub(crate) fn decodable(self, key: &[u8], value: &[u8]) -> bool {
+    match self {
+      Self::Leave => {
+        !crate::identity::leave::is_intent_key(key)
+          && crate::identity::leave::LeaveRecordV1::decode(value).is_ok()
+      }
+      Self::Cleanup => crate::identity::cleanup::CleanupRecordV1::decode(value).is_ok(),
+      Self::Revocation => crate::identity::revocation::RevocationRecordV1::decode(value).is_ok(),
+      Self::Checkpoint => crate::identity::cleanup::CleanupCheckpointV1::decode(value).is_ok(),
+    }
+  }
+}
+
 /// One inclusive digest range `[start, end]`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DigestRange {
@@ -641,7 +720,8 @@ pub(crate) fn row_fits_message(key_len: usize, content_len: usize) -> bool {
 mod tests {
   use super::{
     DigestRange, KIND_DONE, KIND_HINT, KIND_NEED, KIND_OFFER, KIND_ROOT, KIND_ROWS, LaneId,
-    MAX_RANGES_PER_MESSAGE, MAX_ROWS_PER_MESSAGE, Message, RangeFingerprint, Row, decode, encode,
+    MAX_RANGES_PER_MESSAGE, MAX_ROWS_PER_MESSAGE, Message, RangeFingerprint, Row, TombstoneKind,
+    decode, encode,
   };
   use crate::{ErrorKind, protocol::encode_canonical};
 
@@ -793,6 +873,35 @@ mod tests {
       assert_eq!(LaneId::from_code(unknown), None);
     }
     assert_eq!(codes.len(), 4);
+  }
+
+  /// The tombstone kind registry — the one mapping the scan side and
+  /// the apply side share — is closed, bijective on its prefixes, and
+  /// disjoint from every lane code it rides beside.
+  #[test]
+  fn reconcile_wire_tombstone_kind_registry_is_closed() {
+    let kinds = [
+      TombstoneKind::Leave,
+      TombstoneKind::Cleanup,
+      TombstoneKind::Revocation,
+      TombstoneKind::Checkpoint,
+    ];
+    for (index, kind) in kinds.iter().copied().enumerate() {
+      assert_eq!(TombstoneKind::from_prefix(kind.prefix()), Some(kind));
+      assert!(
+        kinds[..index]
+          .iter()
+          .all(|other| other.prefix() != kind.prefix()),
+        "duplicate tombstone kind prefix: {kind:?}"
+      );
+      // The row key is the prefix followed by the subject bytes.
+      let mut expected = vec![kind.prefix()];
+      expected.extend_from_slice(b"subject");
+      assert_eq!(kind.row_key(b"subject"), expected);
+    }
+    for unknown in [0u8, 5, 42, 255] {
+      assert_eq!(TombstoneKind::from_prefix(unknown), None);
+    }
   }
 
   /// Unknown message kinds fail closed with a typed error, whatever
