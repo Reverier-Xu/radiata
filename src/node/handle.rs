@@ -250,9 +250,13 @@ impl NodeHandle {
   /// to this node yet fails with [`crate::ErrorKind::NotFound`] — a
   /// retryable convergence state that the runtime's healing planes
   /// (recovery, connection-degree maintenance) also absorb on their own
-  /// cadence. A contradicted or revoked binding, or any handshake
-  /// failure, is [`crate::ErrorKind::AuthenticationFailed`] or
-  /// [`crate::ErrorKind::Revoked`] and is never retryable.
+  /// cadence. A contradicted or revoked binding, or a rejected
+  /// handshake proof, is [`crate::ErrorKind::AuthenticationFailed`] or
+  /// [`crate::ErrorKind::Revoked`] and is never retryable. An exhausted
+  /// deadline is the exception: a slow handshake ends in the retryable
+  /// [`crate::ErrorKind::NotReady`], an elapsed dial deadline in
+  /// [`crate::ErrorKind::Io`] — transient outcomes the dial retry
+  /// schedule absorbs, never a permanent identity rejection.
   ///
   /// Returns the admitted [`Task`], whose `wait` resolves with the
   /// authenticated peer. Admission-time failures are the pure shape
