@@ -329,8 +329,12 @@ impl NodeHandle {
   }
 
   /// Issues a convergent issuer-signed cleanup tombstone for one
-  /// decommissioned node. Terminal: there is no
-  /// resurrection path. The caller is responsible for never cleaning a
+  /// decommissioned node. Cleanup is an *operational* removal, unlike
+  /// revocation (which is permanent): once the cleanup checkpoint GC has
+  /// collected the tombstone, the subject's retired binding goes with it,
+  /// and the same node id can only return through a fresh binding issued
+  /// via the join flow (the operator's OTP rebind) — its old key is never
+  /// admitted again. The caller is still responsible for not cleaning a
   /// node that is merely offline. Returns the admitted [`Task`], whose
   /// `wait` resolves once the tombstone is persisted.
   ///
