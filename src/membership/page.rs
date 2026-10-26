@@ -209,10 +209,10 @@ fn decode_wire(
   }
   let node =
     NodeId::parse(fields.node).map_err(|_| Error::invalid_input("node descriptor node"))?;
-  let public_key = crate::PublicKey::from_bytes(
-    <[u8; 32]>::try_from(fields.public_key.as_ref())
-      .map_err(|_| Error::invalid_input("node descriptor key"))?,
-  );
+  let public_key = crate::PublicKey::from_bytes(crate::error::fixed_bytes(
+    fields.public_key.as_ref(),
+    "node descriptor key",
+  )?);
   let mut endpoints = Vec::with_capacity(fields.endpoints.len());
   for text in fields.endpoints {
     endpoints.push(

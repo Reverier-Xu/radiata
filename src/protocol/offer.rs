@@ -226,8 +226,7 @@ impl FeatureOffer {
       |entry| entry.label.as_str(),
       "feature offer supported ordering",
       |entry| {
-        let digest = <[u8; 32]>::try_from(entry.digest.as_slice())
-          .map_err(|_| Error::invalid_input("feature offer digest"))?;
+        let digest = crate::error::fixed_bytes(entry.digest.as_slice(), "feature offer digest")?;
         Ok((FeatureTag::parse(&entry.label)?, Digest::from_bytes(digest)))
       },
     )?;
