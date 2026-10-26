@@ -34,10 +34,17 @@
 //!   expects them delivered; the framing layer answers the peer's pings
 //!   automatically.
 //! - **Security is plaintext-class.** The channel binding derives from the
-//!   registered tag, so proofs stay distinct per transport, but a custom medium
-//!   provides no confidentiality or man-in-the-middle protection by itself. A
-//!   medium-level cipher is welcome and stacks cleanly (encrypt inside the
-//!   stream implementation); core never assumes it.
+//!   served selector, so proofs stay distinct per transport, but a custom
+//!   medium provides no confidentiality or man-in-the-middle protection by
+//!   itself. A medium-level cipher is welcome and stacks cleanly (encrypt
+//!   inside the stream implementation); core never assumes it.
+//!
+//! A provider registers under an addressing scheme name it owns
+//! (`ExtensionRegistry::register_transport`), or replaces a built-in
+//! transport outright (`ExtensionRegistry::override_builtin_transport`):
+//! an override serves the built-in selector's addresses and trust
+//! intents, and the runtime seeds the built-in only when the selector is
+//! still free.
 //!
 //! The built-in WSS transport is registered by default alongside the
 //! direct-TLS default and the plaintext TCP transport; see the
@@ -219,11 +226,17 @@ pub trait ProviderListener: fmt::Debug + Send + Sync + 'static {
 /// Implement this trait to bridge a medium the built-ins do not cover —
 /// an ESP-NOW radio, an 802.11 link, a serial bus, a tunneled socket —
 /// and register it under an addressing scheme name you own
-/// (`ExtensionRegistry::register_transport`). Peers address the
-/// transport with the canonical custom form `<name>://<opaque-address>`,
-/// where the opaque address grammar is yours: the endpoint hands it to
-/// you verbatim through [`TransportProvider::connect`] and
-/// [`ProviderListener::local_endpoint`].
+/// (`ExtensionRegistry::register_transport`), or as an explicit
+/// replacement of one built-in transport
+/// (`ExtensionRegistry::override_builtin_transport`), which serves the
+/// built-in selector's addresses and dial intents instead. A custom
+/// name is addressed with the canonical custom form
+/// `<name>://<opaque-address>`, where the opaque address grammar is
+/// yours: the endpoint hands it to you verbatim through
+/// [`TransportProvider::connect`] and [`ProviderListener::local_endpoint`].
+/// A built-in override is addressed with the replaced built-in's
+/// canonical form (`tls://`, `wss://`, or `tcp://`), and the host and
+/// port are yours to interpret the same way.
 ///
 /// Core wraps every stream you produce in the crate's framing: bounded
 /// length-prefixed messages, keepalive, and the join hint all work over
@@ -245,18 +258,30 @@ pub trait TransportProvider: fmt::Debug + Send + Sync + 'static {
 
 /// The adapter that wraps a caller-registered [`TransportProvider`] into
 /// the internal [`Transport`] boundary: core framing on both sides, the
-/// per-tag channel binding, and the plaintext-class trust contract.
+/// per-selector channel binding, and the plaintext-class trust contract
+/// of the selector the provider serves.
 pub(crate) struct TransportProviderAdapter {
   inner: Arc<dyn TransportProvider>,
-  name: crate::transport::TransportName,
+  /// The addressing selector this adapter serves: the canonical scheme
+  /// name of a custom registration or the canonical tag of a built-in
+  /// override. It labels diagnostics and derives the channel binding.
+  selector: String,
   binding: [u8; crate::transport::connection::CHANNEL_BINDING_LEN],
+  /// Whether the served selector is a built-in TLS class (`tls://` or
+  /// `wss://`), whose dials arrive with the merge/member trust intents.
+  /// A custom-name registration serves plaintext-class dials only; a
+  /// built-in override serves its selector's intents: the provider
+  /// medium owns its own wire security, and the session handshake's
+  /// identity proofs carry authentication either way. A mismatched
+  /// intent is a caller bug in both directions and fails typed.
+  accepts_tls_intents: bool,
 }
 
 impl fmt::Debug for TransportProviderAdapter {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("TransportProviderAdapter")
-      .field("scheme", &self.name.as_str())
+      .field("scheme", &self.selector)
       .finish_non_exhaustive()
   }
 }
@@ -272,8 +297,31 @@ impl TransportProviderAdapter {
     let binding = crate::transport::connection::custom_channel_binding(name.as_str())?;
     Ok(Self {
       inner,
-      name,
+      selector: name.as_str().to_owned(),
       binding,
+      accepts_tls_intents: false,
+    })
+  }
+
+  /// Wraps one transport provider as an explicit replacement of the
+  /// built-in transport under `scheme`'s selector. The channel binding
+  /// derives from the canonical built-in tag, so a session over the
+  /// override salts its proofs with a class constant distinct from the
+  /// replaced built-in (whose TLS classes export a per-session binding)
+  /// and from every custom name.
+  pub(crate) fn override_builtin(
+    inner: Arc<dyn TransportProvider>, scheme: TransportScheme,
+  ) -> Result<Self> {
+    let tag = builtin_transport_tag(scheme)?;
+    let binding = crate::transport::connection::custom_channel_binding(tag.as_str())?;
+    Ok(Self {
+      inner,
+      selector: tag.as_str().to_owned(),
+      binding,
+      // The override serves exactly the intents its selector produces:
+      // the TLS classes dial with merge/member trust, `tcp://` dials
+      // with plaintext trust.
+      accepts_tls_intents: matches!(scheme, TransportScheme::Tls | TransportScheme::Wss),
     })
   }
 }
@@ -296,11 +344,18 @@ impl Transport for TransportProviderAdapter {
   ) -> BoxFuture<'static, Result<Connection>> {
     let inner = Arc::clone(&self.inner);
     let binding = self.binding;
+    let accepts_tls_intents = self.accepts_tls_intents;
     Box::pin(async move {
-      // A custom medium has no TLS trust modes: anything but plaintext
-      // trust is a caller bug (the endpoint and the intent disagree)
-      // and fails typed instead of pretending.
-      if !matches!(trust, TransportTrust::Plaintext) {
+      // A custom medium has no TLS trust modes of its own: each adapter
+      // serves exactly the intents its selector produces — plaintext for
+      // a custom name or a `tcp://` override, merge/member for a
+      // `tls://` or `wss://` override — and a mismatched intent is a
+      // caller bug (the endpoint and the intent disagree) that fails
+      // typed instead of pretending. Under a tolerated TLS intent the
+      // provider medium simply ignores the TLS-specific semantics: it
+      // owns its own wire security, and the session handshake's identity
+      // proofs carry authentication either way.
+      if !matches!(trust, TransportTrust::Plaintext) != accepts_tls_intents {
         return Err(Error::invalid_input("transport trust"));
       }
       let stream = inner.connect(endpoint).await?;
@@ -600,6 +655,130 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::Conflict);
   }
 
+  // ---- The explicit built-in transport override ----
+
+  #[test]
+  fn builtin_override_registers_once_and_serves_the_selector() {
+    let mut registry = ExtensionRegistry::new();
+    let tag = builtin_transport_tag(TransportScheme::Wss).unwrap();
+    registry
+      .override_builtin_transport(TransportScheme::Wss, Arc::new(test_wire()))
+      .unwrap();
+    // The override occupies the built-in tag, so the builder's seeding
+    // loop (register only when the tag is free) skips the built-in and
+    // every selector resolution lands on the override.
+    assert!(registry.transport(&tag).is_some());
+    assert!(
+      registry
+        .resolve_transport(&TransportSelector::Builtin(TransportScheme::Wss))
+        .is_ok()
+    );
+    // One override per selector: a second registration for the same
+    // scheme is a conflict, and the untouched schemes stay seedable.
+    let error = registry
+      .override_builtin_transport(TransportScheme::Wss, Arc::new(test_wire()))
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    assert!(
+      registry
+        .transport(&builtin_transport_tag(TransportScheme::Tls).unwrap())
+        .is_none()
+    );
+    // The custom-name namespace is untouched: the built-in scheme names
+    // never become custom registrations.
+    assert!(TransportName::parse("wss").is_err());
+  }
+
+  /// The override under a TLS-class selector carries a full dial: the
+  /// merge trust intent the `wss://` selector produces is served, and a
+  /// framed message round-trips over the caller's medium. A built-in
+  /// WSS transport could not deliver this connection — success alone
+  /// proves the caller's implementation handled the dial.
+  #[tokio::test]
+  async fn builtin_override_carries_the_dial_through_the_caller_medium() {
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .override_builtin_transport(TransportScheme::Wss, Arc::new(test_wire()))
+      .unwrap();
+    let transport = registry
+      .resolve_transport(&TransportSelector::Builtin(TransportScheme::Wss))
+      .unwrap();
+    let endpoint = Endpoint::parse("wss://peer.example:443").unwrap();
+    let listener = transport.bind(endpoint.clone()).await.unwrap();
+    assert_eq!(listener.local_endpoint(), endpoint);
+
+    let (client, accepted) = tokio::join!(
+      transport.connect(endpoint, TransportTrust::Merge),
+      listener.accept(&|| None),
+    );
+    let mut client = client.unwrap();
+    let mut accepted = accepted.unwrap();
+
+    // The per-selector class binding is equal on both sides, nonzero,
+    // and the framed message round-trips over the override.
+    assert_eq!(client.channel_binding(), accepted.channel_binding());
+    assert_ne!(client.channel_binding(), &[0_u8; 32]);
+    client.send(0x0001, 0x0001, 0, b"ping").await.unwrap();
+    let message = accepted.receive().await.unwrap().unwrap();
+    assert_eq!(message.body, b"ping");
+  }
+
+  /// Each adapter serves exactly the intents its selector produces:
+  /// the custom-name adapter keeps the strict plaintext-only contract
+  /// unchanged, a TLS-class override serves merge/member only, and a
+  /// `tcp://` override serves plaintext only — including a full dial
+  /// into the caller's medium.
+  #[tokio::test]
+  async fn builtin_override_and_custom_name_enforce_their_intent_classes() {
+    let tls_override =
+      TransportProviderAdapter::override_builtin(Arc::new(test_wire()), TransportScheme::Tls)
+        .unwrap();
+    let error = tls_override
+      .connect(
+        Endpoint::parse("tls://peer.example:443").unwrap(),
+        TransportTrust::Plaintext,
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+    let custom =
+      TransportProviderAdapter::new(Arc::new(test_wire()), transport_name("espnow")).unwrap();
+    let error = custom
+      .connect(
+        custom_endpoint("espnow", "aa:bb:cc:dd:ee:ff"),
+        TransportTrust::Merge,
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+    let tcp_override = Arc::new(
+      TransportProviderAdapter::override_builtin(Arc::new(test_wire()), TransportScheme::Tcp)
+        .unwrap(),
+    );
+    let error = tcp_override
+      .connect(
+        Endpoint::parse("tcp://127.0.0.1:7000").unwrap(),
+        TransportTrust::Merge,
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+    // The `tcp://` override carries the plaintext intent its selector
+    // produces: the dial proceeds into the caller's medium and completes
+    // the framed handshake against a concurrent accept.
+    let endpoint = Endpoint::parse("tcp://127.0.0.1:7000").unwrap();
+    let listener = tcp_override.bind(endpoint.clone()).await.unwrap();
+    let (client, accepted) = tokio::join!(
+      tcp_override.connect(endpoint, TransportTrust::Plaintext),
+      listener.accept(&|| None),
+    );
+    assert!(client.is_ok());
+    assert!(accepted.is_ok());
+  }
+
   // ---- Discovery registration without central switching ----
 
   #[derive(Debug)]
@@ -884,15 +1063,13 @@ mod tests {
     fn connect(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportStream>>> {
       let bus = Arc::clone(&self.0);
       Box::pin(async move {
-        // The opaque address is the transport provider's own grammar; the
-        // wire bus validates it is present and well-formed enough to
-        // carry.
-        let opaque = endpoint
-          .opaque()
-          .ok_or_else(|| crate::Error::invalid_input("endpoint"))?;
-        if opaque.is_empty() {
-          return Err(crate::Error::invalid_input("endpoint"));
-        }
+        // The address grammar is the provider's own: a custom form
+        // carries an opaque address, a built-in override carries the
+        // canonical host:port form. Either way the canonical endpoint
+        // text identifies the destination (parsing rejected the
+        // malformed forms), and this single-destination loopback bus
+        // needs nothing more.
+        let _address = endpoint.as_str();
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
         bus
           .tx

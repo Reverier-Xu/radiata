@@ -63,9 +63,11 @@ impl NodeBuilder {
     // still free: the direct TLS transport is the default choice, the
     // WebSocket transport covers firewall-traversal deployments, and the
     // plaintext transport serves closed intranet segments with
-    // constrained IoT devices. A caller registration under a built-in
-    // tag wins, so a caller can replace a built-in wholesale; dial and
-    // listen resolve their transport from the endpoint's selector
+    // constrained IoT devices. An explicit caller override installed
+    // through `ExtensionRegistry::override_builtin_transport` occupies
+    // the tag first, so the seeding skips that scheme and the override
+    // serves every dial and listen addressed to the built-in form; dial
+    // and listen resolve their transport from the endpoint's selector
     // through the registry at runtime.
     for (tag, transport) in [
       (
