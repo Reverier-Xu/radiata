@@ -206,6 +206,10 @@ impl RevokedSubjects {
 /// - the revocation effect holds its section across the durable commit, the
 ///   ledger record, and the subject's session retirement
 ///   (`crate::runtime::task_effects`);
+/// - a sync-delivered revocation tombstone (`apply_revocation_record` in
+///   `crate::membership::sync`) holds the same section across its durable
+///   install, the ledger record, and the retirement, so a remote revocation
+///   closes the in-flight window exactly like a local one;
 /// - session publication (`run_session`) holds its section across the
 ///   authorization re-check and the session-table insertion.
 ///
@@ -272,8 +276,9 @@ pub(crate) struct SessionPacketContext {
   pub(super) relay_hop_deadline: Duration,
   /// The node's authorization boundary between durable revocation and
   /// final session publication (audit 2026-10-23, P1-11): born with this
-  /// context, so every session publication and the revocation effect
-  /// serialize on the same section through the one shared instance.
+  /// context, so every session publication, the revocation effect, and
+  /// the sync-delivered tombstone lane serialize on the same section
+  /// through the one shared instance.
   authorization: AuthorizationBoundary,
 }
 
@@ -289,6 +294,7 @@ impl SessionPacketContext {
     trace: Option<crate::routing::trace::TraceSink>, forwarding_capacity: usize,
     route_capacity: usize, task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     parser_limits: crate::protocol::CborLimits, relay_hop_deadline: Duration,
+    authorization: AuthorizationBoundary,
   ) -> Self {
     Self {
       local,
@@ -309,13 +315,13 @@ impl SessionPacketContext {
       live_consumers: ConsumerBudget::new(MAX_LIVE_CONSUMERS),
       parser_limits,
       relay_hop_deadline,
-      authorization: AuthorizationBoundary::default(),
+      authorization,
     }
   }
 
   /// The node's authorization boundary (see [`AuthorizationBoundary`]):
-  /// the revocation effect's section and every session publication
-  /// serialize on this one instance.
+  /// the revocation effect's section, the sync-delivered tombstone lane,
+  /// and every session publication serialize on this one instance.
   pub(crate) fn authorization_boundary(&self) -> &AuthorizationBoundary {
     &self.authorization
   }
