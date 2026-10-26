@@ -126,7 +126,7 @@ use crate::{
   identity::lifecycle::LocalIdentityContext,
   node::{EventHub, MemberRevisionSignal},
   runtime::RuntimeClient,
-  session::stream::SessionTable,
+  session::stream::{AuthorizationBoundary, SessionTable},
   sync_common::alive_peers,
 };
 
@@ -479,6 +479,12 @@ pub(crate) struct PlaneShared {
   events: Arc<EventHub>,
   revision: MemberRevisionSignal,
   sessions: SessionTable,
+  /// The node's authorization boundary between durable revocation and
+  /// session publication (audit 2026-10-23, P1-11): the same instance
+  /// the packet context owns, so a revocation tombstone this plane
+  /// applies serializes against a finishing handshake's publication
+  /// exactly like the local revoke effect does.
+  authorization: AuthorizationBoundary,
   state: Mutex<PlaneState>,
 }
 
@@ -512,7 +518,7 @@ pub(crate) struct ReconcilePlane {
 impl ReconcilePlane {
   pub(crate) fn new(
     context: Arc<LocalIdentityContext>, entropy: Arc<dyn Entropy>, events: Arc<EventHub>,
-    revision: MemberRevisionSignal, sessions: SessionTable,
+    revision: MemberRevisionSignal, sessions: SessionTable, authorization: AuthorizationBoundary,
   ) -> Self {
     Self {
       shared: Arc::new(PlaneShared {
@@ -521,6 +527,7 @@ impl ReconcilePlane {
         events,
         revision,
         sessions,
+        authorization,
         state: Mutex::new(PlaneState {
           peers: BTreeMap::new(),
           install_epoch: 0,
@@ -1973,6 +1980,7 @@ async fn apply_rows(
         &shared.events,
         &shared.revision,
         &shared.sessions,
+        &shared.authorization,
         rows,
         source,
         runtime,
@@ -2649,6 +2657,7 @@ mod tests {
       events,
       crate::node::MemberRevisionSignal::new(revision_tx),
       sessions,
+      crate::session::stream::AuthorizationBoundary::default(),
     )
     .shared()
   }

@@ -222,13 +222,19 @@ pub(crate) async fn spawn_runtime(
   // The core reconciliation plane rides the same authenticated sessions
   // as the sync lanes: one consumer for the reconcile v1 protocol, one
   // shared plane behind it (the anti-entropy driver ticks the same
-  // plane once the supervisor spawns it).
+  // plane once the supervisor spawns it). The plane and the packet
+  // context the operation handles build share one authorization
+  // boundary (audit 2026-10-23, P1-11), so a sync-delivered revocation
+  // tombstone and a finishing handshake's publication serialize
+  // exactly like the local revoke effect does.
+  let authorization = crate::session::stream::AuthorizationBoundary::default();
   let reconcile_plane = crate::reconcile::plane::ReconcilePlane::new(
     Arc::clone(&runtime_context),
     dependencies.entropy.clone(),
     dependencies.events.clone(),
     dependencies.member_revision.clone(),
     dependencies.sessions.clone(),
+    authorization.clone(),
   );
   let reconcile_consumer = Arc::new(crate::reconcile::plane::ReconcileConsumer::new(
     reconcile_plane.shared(),
@@ -262,7 +268,13 @@ pub(crate) async fn spawn_runtime(
   // every node handle must read the same session driver (one credential
   // issuer, one SPKI anchor table), the same packet context, and the same
   // shutdown signal.
-  let operations = operation_deps(&dependencies, packet_tx.clone(), offer, registry)?;
+  let operations = operation_deps(
+    &dependencies,
+    packet_tx.clone(),
+    offer,
+    registry,
+    authorization,
+  )?;
   dependencies.operations = Some(Arc::clone(&operations));
   // The task manager is spawned here, beside the supervisor and before the
   // node is marked running: the client side rides the node handle (so an
@@ -849,6 +861,7 @@ fn session_packet_context(
   context: &Arc<LocalIdentityContext>, dependencies: &RuntimeDependencies,
   packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
   policy: crate::session::stream::SessionPolicy,
+  authorization: crate::session::stream::AuthorizationBoundary,
 ) -> Result<SessionPacketContext> {
   // The effective route policy: the caller selection, or the built-in
   // default policy tag (registered by the builder out of the box).
@@ -882,6 +895,7 @@ fn session_packet_context(
     Arc::clone(&dependencies.connection_tasks),
     crate::protocol::CONTROL_CBOR_LIMITS,
     dependencies.config.relay_hop_deadline(),
+    authorization,
   ))
 }
 
@@ -894,6 +908,7 @@ pub(super) fn operation_deps(
   dependencies: &RuntimeDependencies, packet_tx: mpsc::Sender<crate::packet::OutboundRequest>,
   offer: crate::protocol::offer::FeatureOffer,
   features: std::sync::Arc<crate::protocol::feature::FeatureRegistry>,
+  authorization: crate::session::stream::AuthorizationBoundary,
 ) -> Result<Arc<super::task_effects::OperationDeps>> {
   let Some(context) = dependencies.context.clone() else {
     return Err(Error::internal("runtime context"));
@@ -904,6 +919,7 @@ pub(super) fn operation_deps(
     dependencies,
     packet_tx,
     policy,
+    authorization,
   )?);
   let (shutdown, _) = watch::channel(());
   let driver = SessionDriver::new(
@@ -1507,8 +1523,14 @@ mod receipt_retention_sweep_tests {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the test drives the exact production construction path for the
     // packet context and the session driver too.
-    let operations = super::operation_deps(&dependencies, packet_tx.clone(), offer, registry)
-      .expect("operation handles");
+    let operations = super::operation_deps(
+      &dependencies,
+      packet_tx.clone(),
+      offer,
+      registry,
+      crate::session::stream::AuthorizationBoundary::default(),
+    )
+    .expect("operation handles");
     dependencies.operations = Some(operations);
     let supervisor = match Supervisor::new(dependencies, packet_tx, round_rx) {
       Ok(supervisor) => supervisor,
@@ -2332,8 +2354,14 @@ pub(crate) mod test_support {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the tick drives the exact production packet context and session
     // driver instead of a stand-in.
-    let operations = super::operation_deps(&dependencies, packet_tx.clone(), offer, registry)
-      .expect("operation handles");
+    let operations = super::operation_deps(
+      &dependencies,
+      packet_tx.clone(),
+      offer,
+      registry,
+      crate::session::stream::AuthorizationBoundary::default(),
+    )
+    .expect("operation handles");
     dependencies.operations = Some(operations);
     RuntimeFixture {
       dependencies,
