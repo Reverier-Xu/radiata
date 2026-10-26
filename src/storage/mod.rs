@@ -24,95 +24,21 @@ const ENTRY_WAIT_BOUND: Duration = Duration::from_secs(5);
 /// directly, so the backoff only bounds a lost-wakeup path.
 const ENTRY_WAIT_BACKOFF: Duration = Duration::from_millis(10);
 
-/// The process-wide writer exclusion for one [`MetadataStore`]: at most
-/// one task may hold a read-decide-commit section at a time, so base
-/// revisions observed inside the section cannot move before the commit
-/// lands. Task-reentrant: a task that already holds the section acquires
-/// a no-op permit, so journaled flows can span nested helper calls
-/// without threading the permit through signatures. Root-context holders
-/// (no task id) share one pseudo-identity, so they must not
-/// `tokio::join!` concurrent store operations: both legs would observe
-/// "already holding" and run inside one exclusion at the same time.
-#[derive(Debug)]
-struct WriterLock {
-  /// The holder's task id, if the holder runs inside a spawned task;
-  /// [`None`] when the holder runs in a root future outside any task
-  /// (e.g. a unit test body). Root-context holders are inherently
-  /// sequential, so a shared pseudo-identity is sound there.
-  holder: Mutex<Option<Option<tokio::task::Id>>>,
-  /// Wakes parked acquirers when the section is released.
-  released: tokio::sync::Notify,
-}
-
-impl WriterLock {
-  /// Poisoning cannot lose the holder record in a recoverable way, so a
-  /// poisoned lock resolves to its inner value: the writer exclusion must
-  /// stay observable after a panicking holder unwinds.
-  fn slot(&self) -> std::sync::MutexGuard<'_, Option<Option<tokio::task::Id>>> {
-    match self.holder.lock() {
-      Ok(slot) => slot,
-      Err(poisoned) => poisoned.into_inner(),
-    }
-  }
-
-  fn holder(&self) -> Option<Option<tokio::task::Id>> {
-    *self.slot()
-  }
-
-  async fn acquire(&self) -> WriterPermit<'_> {
-    let me = tokio::task::try_id();
-    if self.holder() == Some(me) {
-      return WriterPermit {
-        lock: self,
-        holder: me,
-        nested: true,
-      };
-    }
-    loop {
-      // Register interest before re-checking the holder: the enable-
-      // check ordering closes the lost-wakeup window between seeing a
-      // held section and parking.
-      let notified = self.released.notified();
-      tokio::pin!(notified);
-      notified.as_mut().enable();
-      if self.holder().is_none() {
-        let mut slot = self.slot();
-        if slot.is_none() {
-          *slot = Some(me);
-          return WriterPermit {
-            lock: self,
-            holder: me,
-            nested: false,
-          };
-        }
-      }
-      notified.await;
-    }
-  }
-
-  fn release(&self, holder: Option<tokio::task::Id>) {
-    let mut slot = self.slot();
-    if *slot == Some(holder) {
-      *slot = None;
-    }
-    self.released.notify_waiters();
-  }
-}
-
-/// The held writer section; releases on drop.
+/// The held writer section for one [`MetadataStore`]: while a caller
+/// holds it, no other caller can enter a read-decide-commit section on
+/// that store, so base revisions observed inside the section cannot move
+/// before the commit lands. Releasing drops the guard.
+///
+/// The exclusion is a plain fair async mutex, and the guard *is* the
+/// permit. It is deliberately not reentrant: a second acquisition by the
+/// same task — including the sibling leg of a `join!` — queues behind the
+/// holder instead of silently sharing the section. A flow that spans
+/// helper calls owns exactly one permit and passes it down as
+/// `&WriterPermit<'_>`, so every read-decide-commit section has one
+/// explicit owner.
 #[derive(Debug)]
 pub(crate) struct WriterPermit<'a> {
-  lock: &'a WriterLock,
-  holder: Option<tokio::task::Id>,
-  nested: bool,
-}
-
-impl Drop for WriterPermit<'_> {
-  fn drop(&mut self) {
-    if !self.nested {
-      self.lock.release(self.holder);
-    }
-  }
+  _section: tokio::sync::MutexGuard<'a, ()>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,8 +62,8 @@ pub(crate) struct MetadataStore {
   provider: Arc<dyn Storage>,
   state: Mutex<CommitState>,
   /// The writer exclusion: serializes every read-decide-commit section
-  /// (see [`WriterLock`]).
-  writer_lock: WriterLock,
+  /// behind one permit (see [`WriterPermit`]).
+  writer: tokio::sync::Mutex<()>,
   /// Wakes commit-slot waiters when the state returns to Ready (or an
   /// awaitable frozen outcome lands), so entry waits park instead of
   /// polling. The backoff sleep stays as a lost-wakeup backstop.
@@ -284,10 +210,7 @@ impl MetadataStore {
     Ok(Self {
       provider,
       state: Mutex::new(state),
-      writer_lock: WriterLock {
-        holder: Mutex::new(None),
-        released: tokio::sync::Notify::new(),
-      },
+      writer: tokio::sync::Mutex::new(()),
       ready_notify: tokio::sync::Notify::new(),
       clock,
       receipt_retention,
@@ -387,12 +310,16 @@ impl MetadataStore {
     self.provider.clone()
   }
 
-  /// Acquires the writer exclusion: while held, no other task can enter
+  /// Acquires the writer exclusion: while held, no other caller can enter
   /// a read-decide-commit section on this store, so a snapshot taken
   /// under the permit stays authoritative until the caller's commit
-  /// lands. Task-reentrant; see [`WriterLock`].
+  /// lands. The permit is owned explicitly: helpers that must run inside
+  /// the same section take `&WriterPermit<'_>` instead of acquiring
+  /// again; see [`WriterPermit`].
   pub(crate) async fn write_permit(&self) -> WriterPermit<'_> {
-    self.writer_lock.acquire().await
+    WriterPermit {
+      _section: self.writer.lock().await,
+    }
   }
 
   pub(crate) async fn snapshot(&self) -> Result<Box<dyn StoreSnapshot>> {

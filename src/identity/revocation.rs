@@ -349,9 +349,8 @@ pub(crate) async fn persist_revocation_ctx(
   {
     return Err(Error::not_trusted("revocation subject binding"));
   }
-  // The slot's prior evidence is read under the writer exclusion that the
-  // install below re-enters, so the first-revocation verdict cannot race a
-  // concurrent record.
+  // The slot's prior evidence is read under this section's writer permit,
+  // so the first-revocation verdict cannot race a concurrent record.
   let already_revoked =
     revoked_key_ctx(store, record.subject()).await?.as_ref() == Some(record.subject_key());
   let install = crate::identity::records::persist_convergent_terminal_record(

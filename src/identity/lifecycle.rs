@@ -42,7 +42,7 @@ use crate::{
   api::Entropy,
   provider::{KeyProvider, StorageFactory, StoreSnapshot},
   storage::{
-    MetadataStore,
+    MetadataStore, WriterPermit,
     pending::PendingCleanupOutcome,
     receipt::{PreparedTransaction, ReceiptReferenceChange, ReceiptReferenceToken},
   },
@@ -176,13 +176,16 @@ pub(crate) async fn open_local_identity(
       .await?;
   if recovered.is_some() {
     reconcile_recovered_journal(&store).await?;
+    let permit = store.write_permit().await;
     cleanup_pending_exact(
+      &permit,
       &store,
       entropy,
       LOCAL_IDENTITY_PURPOSE,
       "local identity pending cleanup",
     )
     .await?;
+    drop(permit);
   }
   let keys: Arc<dyn KeyProvider> = match keys {
     Some(keys) => keys.clone(),
@@ -229,12 +232,14 @@ pub(crate) async fn reconcile_recovered_journal(store: &MetadataStore) -> Result
 /// mutation: a recovered pending journal for `purpose` resolves against
 /// durable provider evidence and cleans up before classification (returns
 /// `true`); otherwise a frozen store reconciles before any new work
-/// (returns `false`).
+/// (returns `false`). Runs inside the caller's writer section, whose
+/// permit it receives.
 pub(crate) async fn recover_journal_prologue(
-  store: &MetadataStore, entropy: &dyn Entropy, purpose: &str, context: &'static str,
+  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, purpose: &str,
+  context: &'static str,
 ) -> Result<bool> {
   if store.resolve_pending_journal(purpose).await? {
-    cleanup_pending_exact(store, entropy, purpose, context).await?;
+    cleanup_pending_exact(_permit, store, entropy, purpose, context).await?;
     return Ok(true);
   }
   store.reconcile_if_frozen().await?;
@@ -242,11 +247,12 @@ pub(crate) async fn recover_journal_prologue(
 }
 
 /// Deletes a pending journal record exactly once, tolerating one proven
-/// abort with a fresh transaction ID.
+/// abort with a fresh transaction ID. Runs inside the caller's writer
+/// section, whose permit it receives.
 pub(crate) async fn cleanup_pending_exact(
-  store: &MetadataStore, entropy: &dyn Entropy, purpose: &str, context: &'static str,
+  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, purpose: &str,
+  context: &'static str,
 ) -> Result<()> {
-  let _permit = store.write_permit().await;
   let mut attempts = 0_u8;
   loop {
     attempts += 1;
@@ -389,7 +395,11 @@ async fn create_identity(
     )
     .await?;
   drop(snapshot);
-  match commit_with_reconcile(&store, prepared).await? {
+  let committed = {
+    let permit = store.write_permit().await;
+    commit_with_reconcile(&permit, &store, prepared).await?
+  };
+  match committed {
     CommitWithReconcile::Committed => {}
     CommitWithReconcile::Aborted => return Err(Error::conflict("local identity intent commit")),
   }
@@ -468,6 +478,9 @@ async fn finalize_identity(
     created.handle().clone(),
   );
   let target = intent.recovery_identity(&stored_intent)?;
+  // The whole finalize section — snapshot, journaled commit, proven-abort
+  // classification, and the pending cleanup — runs under one permit.
+  let permit = store.write_permit().await;
   let snapshot = store.snapshot().await?;
   // A handle with a deletion intent or tombstone must never be referenced by
   // a new record again; the same guard keys are re-checked transactionally
@@ -512,17 +525,19 @@ async fn finalize_identity(
     )
     .await?;
   drop(snapshot);
-  match commit_with_reconcile(&store, prepared).await? {
+  match commit_with_reconcile(&permit, &store, prepared).await? {
     CommitWithReconcile::Committed => {}
     CommitWithReconcile::Aborted => accept_exact_final_state(&store, &identity).await?,
   }
   cleanup_pending_exact(
+    &permit,
     &store,
     entropy,
     LOCAL_IDENTITY_PURPOSE,
     "local identity pending cleanup",
   )
   .await?;
+  drop(permit);
   Ok(LocalIdentityContext {
     store,
     identity,
@@ -564,9 +579,8 @@ pub(crate) enum CommitWithReconcile {
 /// cannot diverge between lanes; callers keep their own committed/aborted
 /// follow-up logic.
 pub(crate) async fn commit_with_reconcile(
-  store: &MetadataStore, prepared: PreparedTransaction,
+  _permit: &WriterPermit<'_>, store: &MetadataStore, prepared: PreparedTransaction,
 ) -> Result<CommitWithReconcile> {
-  let _permit = store.write_permit().await;
   match store.commit(prepared).await? {
     CommitOutcome::Committed(_) => Ok(CommitWithReconcile::Committed),
     CommitOutcome::Aborted | CommitOutcome::Conflict => Ok(CommitWithReconcile::Aborted),

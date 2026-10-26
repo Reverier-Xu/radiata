@@ -111,14 +111,14 @@ pub(crate) async fn commit_merge(
 ) -> Result<MergeGrantV1> {
   let store = context.store();
   // The whole journaled section — recovery prologue, commit, cleanup —
-  // holds the writer exclusion: concurrent same-generation merges share
-  // one purpose-scoped pending slot, and an interleaved prologue that
-  // observes another flow's live residue would misclassify it as a crash
-  // journal (inner acquisitions in the committed helpers re-enter this
-  // permit as no-ops).
-  let _permit = store.write_permit().await;
+  // holds one writer permit: concurrent same-generation merges share one
+  // purpose-scoped pending slot, and an interleaved prologue that observes
+  // another flow's live residue would misclassify it as a crash journal.
+  // The section's helpers receive this permit instead of acquiring again.
+  let permit = store.write_permit().await;
   let purpose = merge_purpose(&proposal.generation);
   if crate::identity::lifecycle::recover_journal_prologue(
+    &permit,
     store,
     entropy,
     &purpose,
@@ -277,14 +277,14 @@ pub(crate) async fn commit_merge(
     .await?;
   drop(snapshot);
 
-  match commit_with_reconcile(store, prepared).await? {
+  match commit_with_reconcile(&permit, store, prepared).await? {
     CommitWithReconcile::Committed => {
-      cleanup_pending_exact(store, entropy, &purpose, "merge pending cleanup").await?;
+      cleanup_pending_exact(&permit, store, entropy, &purpose, "merge pending cleanup").await?;
       Ok(grant)
     }
     CommitWithReconcile::Aborted => match merge_state(context, proposal).await? {
       MergeState::Consumed(_, existing) => {
-        cleanup_pending_exact(store, entropy, &purpose, "merge pending cleanup").await?;
+        cleanup_pending_exact(&permit, store, entropy, &purpose, "merge pending cleanup").await?;
         Ok(*existing)
       }
       _ => Err(Error::conflict("merge commit")),
@@ -314,9 +314,10 @@ pub(crate) async fn adopt_merge(
 ) -> Result<()> {
   let store = context.store();
   // Same-purpose serialization: see the note on `commit_merge`.
-  let _permit = store.write_permit().await;
+  let permit = store.write_permit().await;
   let purpose = merge_adoption_purpose(grant.merge());
   if crate::identity::lifecycle::recover_journal_prologue(
+    &permit,
     store,
     entropy,
     &purpose,
@@ -418,14 +419,28 @@ pub(crate) async fn adopt_merge(
     .await?;
   drop(snapshot);
 
-  match commit_with_reconcile(store, prepared).await? {
+  match commit_with_reconcile(&permit, store, prepared).await? {
     CommitWithReconcile::Committed => {
-      cleanup_pending_exact(store, entropy, &purpose, "merge adoption pending cleanup").await?;
+      cleanup_pending_exact(
+        &permit,
+        store,
+        entropy,
+        &purpose,
+        "merge adoption pending cleanup",
+      )
+      .await?;
       Ok(())
     }
     CommitWithReconcile::Aborted => match merge_adoption_state(context, grant, issuer_key).await? {
       MergeAdoptionState::Adopted => {
-        cleanup_pending_exact(store, entropy, &purpose, "merge adoption pending cleanup").await?;
+        cleanup_pending_exact(
+          &permit,
+          store,
+          entropy,
+          &purpose,
+          "merge adoption pending cleanup",
+        )
+        .await?;
         Ok(())
       }
       MergeAdoptionState::Absent => Err(Error::conflict("adoption commit")),
