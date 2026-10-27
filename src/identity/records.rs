@@ -1704,42 +1704,27 @@ mod tests {
   #[test]
   fn identity_records_storage_key_bytes_are_exact() {
     let (identity_namespace, identity_key) = local_identity_key().unwrap();
-    assert_eq!(
-      identity_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/local-identity"
-    );
+    assert_eq!(identity_namespace.as_str(), LOCAL_IDENTITY_NAMESPACE);
     assert_eq!(identity_key.as_bytes(), b"self");
 
     let (intent_namespace, intent_key) = key_creation_intent_key(&operation()).unwrap();
-    assert_eq!(
-      intent_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/key-creation-intent"
-    );
+    assert_eq!(intent_namespace.as_str(), KEY_CREATION_INTENT_NAMESPACE);
     assert_eq!(intent_key.as_bytes(), OPERATION.as_bytes());
 
     let (binding_namespace, binding_key) = identity_binding_key(&node(SUBJECT_NODE)).unwrap();
-    assert_eq!(
-      binding_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/identity-binding"
-    );
+    assert_eq!(binding_namespace.as_str(), IDENTITY_BINDING_NAMESPACE);
     assert_eq!(binding_key.as_bytes(), SUBJECT_NODE.as_bytes());
 
     let (use_namespace, use_key) =
       credential_use_key(&node(ISSUER_NODE), &generation(), &node(SUBJECT_NODE)).unwrap();
-    assert_eq!(
-      use_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/credential-use"
-    );
+    assert_eq!(use_namespace.as_str(), CREDENTIAL_USE_NAMESPACE);
     let mut expected_use_key = ISSUER_NODE.as_bytes().to_vec();
     expected_use_key.extend_from_slice(&GENERATION_BYTES);
     expected_use_key.extend_from_slice(SUBJECT_NODE.as_bytes());
     assert_eq!(use_key.as_bytes(), expected_use_key.as_slice());
 
     let (grant_namespace, grant_key) = merge_grant_key(&merge()).unwrap();
-    assert_eq!(
-      grant_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/merge-grant"
-    );
+    assert_eq!(grant_namespace.as_str(), MERGE_GRANT_NAMESPACE);
     assert_eq!(grant_key.as_bytes(), &ADMISSION_BYTES);
   }
 

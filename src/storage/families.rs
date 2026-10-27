@@ -166,6 +166,8 @@ mod catalog {
 
   #[cfg(test)]
   mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
     use crate::protocol::tag::CATEGORY_METADATA;
 
@@ -221,10 +223,12 @@ mod catalog {
           family.namespace_tag()
         );
       }
-      assert_eq!(
-        domain_lookup("radiata.woooo.tech/metadata/v1/not-a-family"),
-        None
-      );
+      // A well-formed sibling of a registered tag stays unclassified. It is
+      // built from the constant so no second namespace literal enters the
+      // file: the single-source guard allows literals only on *_NAMESPACE
+      // constant declarations.
+      let absent = format!("{}-not-a-family", LOCAL_IDENTITY_NAMESPACE);
+      assert_eq!(domain_lookup(&absent), None);
     }
 
     /// The leave wipe scope consumes only registered families: every
@@ -238,6 +242,80 @@ mod catalog {
           "leave wipes unregistered family {tag}"
         );
       }
+    }
+
+    /// Every `*_NAMESPACE` constant declared in this file is registered
+    /// in [`metadata_families`], and every registered family tag is one
+    /// of those constants: both directions are asserted against the
+    /// declarations recovered from this file's own source, so a constant
+    /// that never reaches the registry (or a registry entry without a
+    /// constant) fails here instead of silently bypassing the all-family
+    /// storage contract.
+    #[test]
+    fn namespace_constants_and_family_registry_are_identical() {
+      let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/storage/families.rs"
+      ))
+      .unwrap_or_else(|error| panic!("read families.rs source: {error}"));
+      let constants = namespace_constant_literals(&source);
+      assert!(
+        !constants.is_empty(),
+        "no *_NAMESPACE constants found in the families source"
+      );
+
+      let registered: BTreeSet<&str> = metadata_families()
+        .iter()
+        .map(MetadataFamily::namespace_tag)
+        .collect();
+      let declared: BTreeSet<&str> = constants.values().map(String::as_str).collect();
+      assert_eq!(
+        declared, registered,
+        "*_NAMESPACE constants and metadata_families() registry diverged"
+      );
+    }
+
+    /// `*_NAMESPACE` constant declarations recovered from this module's
+    /// own source: constant identifier to namespace literal. The scan is
+    /// whitespace-insensitive, so wrapped declarations still match. The
+    /// static-invariants guard enforces the same declaration shape from
+    /// outside the crate; this helper exists because the registry
+    /// equality must observe the declarations, not a hand-maintained
+    /// list.
+    fn namespace_constant_literals(source: &str) -> BTreeMap<String, String> {
+      const NEEDLE: &str = "_NAMESPACE:&str=\"";
+      let stripped: String = source
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+      let mut out = BTreeMap::new();
+      let mut offset = 0;
+      while let Some(found) = stripped[offset..].find(NEEDLE) {
+        let start = offset + found;
+        let identifier: String = stripped[..start]
+          .chars()
+          .rev()
+          .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+          .collect::<Vec<_>>()
+          .into_iter()
+          .rev()
+          .collect();
+        assert!(
+          !identifier.is_empty(),
+          "namespace constant without an identifier"
+        );
+        let literal_start = start + NEEDLE.len();
+        let Some(literal_len) = stripped[literal_start..].find('"') else {
+          break;
+        };
+        let literal = stripped[literal_start..literal_start + literal_len].to_owned();
+        assert!(
+          out.insert(identifier, literal).is_none(),
+          "duplicate namespace constant declaration"
+        );
+        offset = literal_start + literal_len;
+      }
+      out
     }
 
     /// The registry lookup behind the classification guards.
