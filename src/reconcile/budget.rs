@@ -664,8 +664,14 @@ fn loss_cell(nodes: usize, batch: usize) -> (u64, u64) {
   (run(true), run(false))
 }
 
-/// The budget matrix: n ∈ {8, 64, 256} × single-row / batch /
-/// reconnect. The redundancy and hint budgets hold on every cell.
+/// The budget matrix: six of the nine cells in the n ∈ {8, 64, 256} ×
+/// single-row / batch16 / reconnect cross product. Covered: n=8 in all
+/// three shapes, n=64 single-row and batch16, and n=256 single-row. The
+/// three remaining cells — n=64 reconnect, n=256 batch16, and n=256
+/// reconnect — stay uncovered as a deliberate duration trade-off, the
+/// same stance the module header takes by keeping n=256 to a single
+/// matrix cell. The redundancy and hint budgets hold on every covered
+/// cell.
 #[test]
 fn sync_budget_matrix_payload_redundancy_and_hint_traffic() {
   // (nodes, batch per tick, ticks, reconnect)
