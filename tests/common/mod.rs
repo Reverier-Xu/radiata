@@ -1203,10 +1203,11 @@ impl KeyProvider for ScriptedKeys {
 }
 
 /// Installs the process-wide tracing subscriber once, honoring
-/// `RUST_LOG` with the crate's debug level as the fallback so a local
-/// run keeps its diagnostics and a CI job can raise or silence them by
-/// environment alone. `with_test_writer` routes through the test
-/// harness's captured output, which CI reports on failures.
+/// `RUST_LOG` with a fallback that keeps the crate's debug diagnostics
+/// plus every test binary's own warnings, so a local run keeps its
+/// diagnostics and a CI job can raise or silence them by environment
+/// alone. `with_test_writer` routes through the test harness's captured
+/// output, which CI reports on failures.
 pub fn init_tracing() {
   use std::sync::Once;
   static INIT: Once = Once::new();
@@ -1214,7 +1215,7 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
       .with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env()
-          .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("radiata=debug")),
+          .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,radiata=debug")),
       )
       .with_test_writer()
       .try_init();
