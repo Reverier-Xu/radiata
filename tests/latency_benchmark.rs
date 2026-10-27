@@ -12,7 +12,7 @@
 //! 3. **throughput** — 32 MiB as unpaced 32 KiB chunks (the wire chunk bound),
 //!    end to end into the receiver, in MiB/s.
 //!
-//! Connection establishment is printed for context: TLS handshake versus
+//! Connection establishment is logged for context: TLS handshake versus
 //! a full merge (TLS + WebSocket + five-position authentication +
 //! admission), single sample each.
 //!
@@ -60,14 +60,19 @@ fn percentile(samples: &mut [Duration], p: f64) -> Duration {
   samples[index.min(samples.len() - 1)]
 }
 
-fn print_latency(name: &str, mut samples: Vec<Duration>) {
+/// Logs one latency report line (mean, p50, p90, p99, max) through
+/// `tracing::info!`; the benchmark's tracing init keeps it visible under
+/// `--nocapture` without any `RUST_LOG` override.
+fn report_latency(name: &str, mut samples: Vec<Duration>) {
   let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
   let p50 = percentile(&mut samples, 0.50);
   let p90 = percentile(&mut samples, 0.90);
   let p99 = percentile(&mut samples, 0.99);
   let max = *samples.last().unwrap();
-  println!(
-    "  {name:<38} mean {mean:>9.1?} | p50 {:>9.1?} | p90 {:>9.1?} | p99 {:>9.1?} | max {:>9.1?}  (n={})",
+  tracing::info!(
+    "  {:<38} mean {:>9.1?} | p50 {:>9.1?} | p90 {:>9.1?} | p99 {:>9.1?} | max {:>9.1?}  (n={})",
+    name,
+    mean,
     p50,
     p90,
     p99,
@@ -272,8 +277,9 @@ async fn lane_radiata() {
   let merge_started = Instant::now();
   common::merge_with_retry(&sender, &receiver, receiver_endpoint).await;
   let merge = merge_started.elapsed();
-  println!(
-    "  [radiata] establishment (full merge): {merge:.1?}  (single sample; TLS+WS+5-position auth+admission)"
+  tracing::info!(
+    "  [radiata] establishment (full merge): {:.1?}  (single sample; TLS+WS+5-position auth+admission)",
+    merge
   );
 
   let peer = receiver.local_node().await.unwrap().node_id().clone();
@@ -284,10 +290,10 @@ async fn lane_radiata() {
 
   let (ack_rtts, e2e) = run_probes(&sender, &peer, &payload, &mut arrivals_rx).await;
 
-  println!("  [radiata] synchronous admission round trip (send -> ack):");
-  print_latency("send_sync ack round trip", ack_rtts);
-  println!("  [radiata] end-to-end delivery (send -> consumer arrival):");
-  print_latency("one-probe-stream delivery", e2e);
+  tracing::info!("  [radiata] synchronous admission round trip (send -> ack):");
+  report_latency("send_sync ack round trip", ack_rtts);
+  tracing::info!("  [radiata] end-to-end delivery (send -> consumer arrival):");
+  report_latency("one-probe-stream delivery", e2e);
 
   sender.shutdown().await.unwrap();
   receiver.shutdown().await.unwrap();
@@ -339,7 +345,7 @@ async fn lane_radiata_throughput() {
   let wall = started.elapsed();
   let bytes = bulk.bytes.load(Ordering::Relaxed);
   assert_eq!(bytes, expected);
-  println!(
+  tracing::info!(
     "  [radiata] throughput: {:.0} MiB in {:.2?} = {:.0} MiB/s (32 x 1 MiB streams, end to end, sustainable)",
     bytes as f64 / (1 << 20) as f64,
     wall,
@@ -401,8 +407,8 @@ async fn lane_bare_tls() {
       .unwrap();
     handshakes.push(started.elapsed());
   }
-  println!("  [bare tls] establishment (TLS 1.3 handshake):");
-  print_latency("connect", handshakes);
+  tracing::info!("  [bare tls] establishment (TLS 1.3 handshake):");
+  report_latency("connect", handshakes);
 
   // Round trip: echo server + 1 KiB probes.
   let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -443,8 +449,8 @@ async fn lane_bare_tls() {
     tls.read_exact(&mut echo).await.unwrap();
     ack_rtts.push(started.elapsed());
   }
-  println!("  [bare tls] echo round trip (same 1 KiB):");
-  print_latency("write -> echo back", ack_rtts);
+  tracing::info!("  [bare tls] echo round trip (same 1 KiB):");
+  report_latency("write -> echo back", ack_rtts);
 
   // Throughput: 32 MiB as 32 KiB writes; the server counts bytes.
   let bulk_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -477,7 +483,7 @@ async fn lane_bare_tls() {
   tls.flush().await.unwrap();
   let delivered = bulk_server.await.unwrap();
   let wall = started.elapsed();
-  println!(
+  tracing::info!(
     "  [bare tls] throughput: {:.1} MiB in {:.2?} = {:.0} MiB/s (32 KiB writes, end to end)",
     delivered as f64 / (1 << 20) as f64,
     wall,
@@ -485,16 +491,31 @@ async fn lane_bare_tls() {
   );
 }
 
+/// The benchmark's tracing init, matching the repo's test convention
+/// (`with_test_writer`, `RUST_LOG` honored). The default filter keeps the
+/// library quiet (`radiata=warn`) while leaving this file's own `info!`
+/// report lines visible — without it an unset `RUST_LOG` hides the report
+/// the benchmark exists to produce.
+fn init_tracing() {
+  use std::sync::Once;
+  static INIT: Once = Once::new();
+  INIT.call_once(|| {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+      .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,radiata=warn"));
+    let _ = tracing_subscriber::fmt()
+      .with_env_filter(filter)
+      .with_test_writer()
+      .try_init();
+  });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit benchmark: cargo test --release --test latency_benchmark -- --ignored --nocapture"]
 async fn sync_latency_and_throughput_bare_tls_vs_radiata() {
-  let _ = tracing_subscriber::fmt()
-    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-    .with_test_writer()
-    .try_init();
-  println!("=== lane: bare TLS 1.3 over loopback ===");
+  init_tracing();
+  tracing::info!("=== lane: bare TLS 1.3 over loopback ===");
   lane_bare_tls().await;
-  println!("=== lane: full radiata channel over loopback ===");
+  tracing::info!("=== lane: full radiata channel over loopback ===");
   lane_radiata().await;
   lane_radiata_throughput().await;
 }
