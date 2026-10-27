@@ -38,7 +38,7 @@ fn init_tracing() {
   static INIT: Once = Once::new();
   INIT.call_once(|| {
     tracing_subscriber::fmt()
-      .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=debug"))
+      .with_env_filter(tracing_subscriber::EnvFilter::new("info,radiata=debug"))
       .with_test_writer()
       .init();
   });
@@ -161,7 +161,7 @@ async fn convergence_time(handles: &[NodeHandle], expected: usize) -> Duration {
       if Instant::now() >= deadline {
         panic!("convergence never reached {expected} (stuck at {seen})");
       }
-      eprintln!("convergence progress: {seen}/{expected}");
+      tracing::info!(seen, expected, "convergence progress");
       tokio::time::sleep(Duration::from_secs(2)).await;
     }
   }
@@ -214,7 +214,7 @@ async fn convergence_cell(peers: usize, resources: u32) {
       &radiata::QualifiedTag::parse(radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES).unwrap(),
     ));
   }
-  println!(
+  tracing::info!(
     "cell peers={peers} resources={resources} converge={:.1}s steady_queued_bytes={queued_bytes:?}",
     elapsed.as_secs_f64(),
   );
@@ -320,7 +320,7 @@ async fn mid_catalog_single_write_cell(peers: usize, resources: u32) {
       &radiata::QualifiedTag::parse(radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES).unwrap(),
     ));
   }
-  println!(
+  tracing::info!(
     "cell peers={peers} resources={resources} single_write_converge={:.1}s steady_queued_bytes={queued_bytes:?}",
     elapsed.as_secs_f64(),
   );
@@ -420,7 +420,7 @@ async fn sync_ack_flapping_peer_does_not_stall_the_round() {
     .map(|node| node.handle.clone())
     .collect();
   let elapsed = convergence_time(&survivors, resources as usize).await;
-  println!(
+  tracing::info!(
     "cell peers={peers} resources={resources} flapping-leaf converge={:.1}s",
     elapsed.as_secs_f64(),
   );
@@ -537,7 +537,7 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
         counts.push(seen);
       }
       counts.sort();
-      eprintln!("PROBE pending={pending} counts={counts:?}");
+      tracing::info!(pending, ?counts, "probe");
     }
     assert!(
       Instant::now() < deadline,
@@ -545,7 +545,7 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
   }
-  println!(
+  tracing::info!(
     "cell peers={peers} bindings={expected} (two pages) converge={:.1}s",
     started.elapsed().as_secs_f64(),
   );
@@ -661,10 +661,7 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
     nodes.push(member);
   }
   let join_seconds = started.elapsed().as_secs_f64();
-  eprintln!(
-    "PHASE join admission: {join_seconds:.1}s for {} nodes",
-    peers
-  );
+  tracing::info!("PHASE join admission: {join_seconds:.1}s for {peers} nodes");
 
   // Trust convergence: every member's paged trust view shows all
   // `peers` bindings (128 = two wire pages at the 64-binding limit).
@@ -704,7 +701,7 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
     tokio::time::sleep(Duration::from_millis(500)).await;
   }
   let converge_seconds = converge_started.elapsed().as_secs_f64();
-  eprintln!("PHASE trust convergence: {converge_seconds:.1}s for {expected} bindings");
+  tracing::info!("PHASE trust convergence: {converge_seconds:.1}s for {expected} bindings");
 
   // Descriptor convergence: the trust binding commits ride the join
   // handshake, but the member descriptor rows reconcile through the
@@ -720,9 +717,11 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
   let mut members = member_count(&nodes[0].handle).await;
   while members != expected {
     if last_progress.elapsed() >= Duration::from_secs(10) {
-      eprintln!(
-        "descriptor convergence progress: {members}/{expected} at {}s",
-        descriptor_started.elapsed().as_secs()
+      tracing::info!(
+        members,
+        expected,
+        elapsed_secs = descriptor_started.elapsed().as_secs(),
+        "descriptor convergence progress"
       );
       last_progress = Instant::now();
     }
@@ -734,9 +733,9 @@ async fn run_128_node_star(config: NodeConfig, merge_deadline: Duration) {
     members = member_count(&nodes[0].handle).await;
   }
   let descriptor_seconds = descriptor_started.elapsed().as_secs_f64();
-  eprintln!("PHASE descriptor convergence: {descriptor_seconds:.1}s for {members} members");
+  tracing::info!("PHASE descriptor convergence: {descriptor_seconds:.1}s for {members} members");
   assert_eq!(members, expected, "the member pages must list the cluster");
-  println!(
+  tracing::info!(
     "cell peers={peers} bindings={expected} (two pages) join={join_seconds:.1}s converge={converge_seconds:.1}s descriptor={descriptor_seconds:.1}s"
   );
 

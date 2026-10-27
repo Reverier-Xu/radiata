@@ -898,10 +898,16 @@ async fn wait_converged_indices(slots: &[Slot], indices: &[usize], expected: usi
           .await
           .map(|page| page.items().len())
           .unwrap_or(0);
-        eprintln!(
-          "CONVERGE {what}: node {index} rows={} expected={expected} recovery_connected={} sessions={sessions} not-active=[{missing}] absent=[{absent}]",
-          views.len(),
-          recovery.is_connected(),
+        tracing::warn!(
+          what,
+          index,
+          rows = views.len(),
+          expected,
+          recovery_connected = recovery.is_connected(),
+          sessions,
+          missing,
+          absent,
+          "convergence straggler"
         );
       }
     }

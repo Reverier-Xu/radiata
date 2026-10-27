@@ -31,32 +31,20 @@ async fn start_configured(
 ) -> Node {
   common::init_tracing();
   // The runtime default entropy (system randomness) keeps every node's id
-  // unique; deterministic entropy would collide across nodes. A prior
-  // runtime instance's trace-persistence tail can briefly hold the
-  // factory's exclusive-open flag under load (the TraceSink detachment
-  // predates the shutdown barrier's coverage — audit 2026-10-27 B3
-  // follow-up), so the open is retried to a deadline.
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-  loop {
-    match NodeBuilder::new(factory.clone())
-      .keys(keys.clone())
-      .config(config.clone())
-      .start()
-      .await
-    {
-      Ok(handle) => {
-        return Node {
-          handle,
-          keys: keys.clone(),
-        };
-      }
-      Err(error)
-        if error.kind() == ErrorKind::StorageLocked && std::time::Instant::now() < deadline =>
-      {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-      }
-      Err(error) => panic!("node start failed persistently: {error:?}"),
-    }
+  // unique; deterministic entropy would collide across nodes. The open is
+  // un-retried: the trace sink holds its identity context weakly (audit
+  // 2026-10-27 B3, mechanism 2), so no detached trace-persistence tail
+  // can hold the factory's exclusive-open flag past the shutdown
+  // barrier — a `StorageLocked` here is a regression, not a retry.
+  let handle = NodeBuilder::new(factory.clone())
+    .keys(keys.clone())
+    .config(config.clone())
+    .start()
+    .await
+    .unwrap();
+  Node {
+    handle,
+    keys: keys.clone(),
   }
 }
 
@@ -316,7 +304,17 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
 
   // The resolution is durable: a restart on the same storage finds no
   // pending journal and starts unblocked.
+  //
+  // The restart goes through the graceful shutdown reply — the contract
+  // the un-retried reopen in `start_configured` relies on: the reply
+  // returns only once the storage execution barrier released the store,
+  // and the trace sink's weak identity context cannot re-pin it behind
+  // that barrier (audit 2026-10-27 B3, mechanism 2). A bare handle drop
+  // tears the runtime down asynchronously instead, which races any
+  // immediate reopen with a `StorageLocked` that is this drop path's,
+  // not the trace tail's.
   let receiver_keys = receiver.keys.clone();
+  receiver.handle.shutdown().await.unwrap();
   drop(receiver);
   let receiver = start(provider, receiver_keys).await;
   rotate_with_retry(&receiver).await;

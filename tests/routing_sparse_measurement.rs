@@ -34,7 +34,7 @@
 //! Two tests share this harness: `sparse_routing_structural_invariants`
 //! runs the lean profile (CI: real nodes, small samples, structural
 //! assertions), and the ignored `sparse_routing_full_profile_tables` runs
-//! the full statistical profile whose printed tables are the report data:
+//! the full statistical profile whose logged tables are the report data:
 //!
 //! ```text
 //! cargo test --release --test routing_sparse_measurement \
@@ -705,11 +705,15 @@ async fn enforce_topology(
       if live_edges(nodes).await == *target {
         return;
       }
-      eprintln!("topology drifted inside the settle window; re-enforcing");
+      tracing::warn!("topology drifted inside the settle window; re-enforcing");
     } else {
       let missing: Vec<_> = target.difference(&live).copied().collect();
       let extra: Vec<_> = live.difference(target).copied().collect();
-      eprintln!("enforce: missing={missing:?} extra={extra:?}");
+      tracing::warn!(
+        ?missing,
+        ?extra,
+        "enforce: dialing missing edges, closing extra edges"
+      );
       for (low, high) in missing {
         dial_edge(nodes, low, high).await;
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1138,7 +1142,9 @@ impl Cell {
     kinds
   }
 
-  fn print(&self) {
+  /// Logs the cell's report line through `tracing::info!` (the report
+  /// tables under `--ignored` are the measurement's deliverable).
+  fn report(&self) {
     let delivered = self.delivered();
     let total = self.attempts.len();
     let acks: Vec<Duration> = self.attempts.iter().map(|attempt| attempt.ack).collect();
@@ -1160,7 +1166,7 @@ impl Cell {
       .collect();
     let decisions_mean = (!delivered_decisions.is_empty())
       .then(|| delivered_decisions.iter().sum::<usize>() as f64 / delivered_decisions.len() as f64);
-    println!(
+    let line = format!(
       "  {shape}:{origin}->{destination} d={} budget={budget} lane={lane:<7} \
        ok {delivered}/{total} | dec mean {} max {} | hops {hops:?} | \
        ack p50 {} p90 {} max {} | e2e p50 {} p90 {} | fail {:?}",
@@ -1190,6 +1196,7 @@ impl Cell {
       delivered = delivered,
       total = total,
     );
+    tracing::info!(report = %line, "measurement cell");
   }
 }
 
@@ -1201,13 +1208,13 @@ struct RetryOutcome {
   total: Duration,
 }
 
-fn print_retries(
+fn report_retries(
   shape: &str, origin: usize, destination: usize, budget: u32, retries: &[RetryOutcome],
 ) {
   let delivered = retries.iter().filter(|retry| retry.delivered).count();
   let totals: Vec<Duration> = retries.iter().map(|retry| retry.total).collect();
   let attempt_counts: Vec<usize> = retries.iter().map(|retry| retry.attempts).collect();
-  println!(
+  let line = format!(
     "  {shape}:{origin}->{destination} budget={budget} lane=retry  ok {delivered}/{} | \
      attempts mean {:.1} max {} | exhausted caps {} | total p50 {} p90 {}",
     retries.len(),
@@ -1217,6 +1224,7 @@ fn print_retries(
     fmt_duration(percentile(totals.clone(), 0.50)),
     fmt_duration(percentile(totals.clone(), 0.90)),
   );
+  tracing::info!(report = %line, "retry cell");
 }
 
 // ---------------------------------------------------------------------
@@ -1245,13 +1253,13 @@ impl Invariants {
 }
 
 /// Measures one shape phase: enforces the exact topology, installs the
-/// BFS oracle table, runs the lanes, and prints the cells.
+/// BFS oracle table, runs the lanes, and logs the cells.
 async fn measure_shape(
   nodes: &[Node], shared: &Arc<Shared>, shape: &Shape, profile: Profile,
   invariants: &mut Invariants,
 ) {
   let target = undirected_set(&shape.edges);
-  println!("=== shape {} ({} edges) ===", shape.name, shape.edges.len());
+  tracing::info!("=== shape {} ({} edges) ===", shape.name, shape.edges.len());
   enforce_topology(
     nodes,
     &target,
@@ -1328,7 +1336,7 @@ async fn measure_shape(
           );
         }
       }
-      oracle.print();
+      oracle.report();
 
       // ---- default lane: local live peers only ----
       let mut default = Cell {
@@ -1420,7 +1428,7 @@ async fn measure_shape(
           }
         }
       }
-      default.print();
+      default.report();
 
       // ---- bounded caller-retry lane ----
       if pair.retry_lane {
@@ -1441,7 +1449,7 @@ async fn measure_shape(
             total,
           });
         }
-        print_retries(shape.name, pair.origin, pair.destination, *budget, &retries);
+        report_retries(shape.name, pair.origin, pair.destination, *budget, &retries);
       }
     }
   }
@@ -1450,7 +1458,7 @@ async fn measure_shape(
 /// The full run: boot, shape phases, failure cells, report, invariants.
 async fn run_measurement(profile: Profile) {
   init_tracing();
-  println!(
+  tracing::info!(
     "=== sparse-topology routing measurement | profile {} | build {} ===",
     profile.name(),
     if cfg!(debug_assertions) {
@@ -1478,8 +1486,8 @@ async fn run_measurement(profile: Profile) {
 
   run_failure_cells(&nodes, &shared, profile, &mut invariants).await;
 
-  println!("=== summary ===");
-  println!(
+  tracing::info!("=== summary ===");
+  tracing::info!(
     "oracle drift {} | foreign next-hop decisions (system traffic) {}",
     shared.oracle_drift(),
     shared.foreign_decisions(),
@@ -1494,7 +1502,7 @@ async fn run_measurement(profile: Profile) {
 async fn run_failure_cells(
   nodes: &[Node], shared: &Arc<Shared>, profile: Profile, invariants: &mut Invariants,
 ) {
-  println!("=== shape partition8 (anchor pair + six-node line) ===");
+  tracing::info!("=== shape partition8 (anchor pair + six-node line) ===");
   let target = undirected_set(&[(0, 1), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
   enforce_topology(
     nodes,
@@ -1540,7 +1548,7 @@ async fn run_failure_cells(
       "no body may surface behind the partition rejection".to_owned(),
     );
   }
-  p1.print();
+  p1.report();
 
   // P2: origin in the large component, destination in the isolated pair.
   // The forwarder branch search sweeps the whole component before the
@@ -1567,7 +1575,7 @@ async fn run_failure_cells(
       ),
     );
   }
-  p2.print();
+  p2.report();
 
   // P3: caller retries cannot recover an unreachable destination.
   let mut retries = Vec::new();
@@ -1586,7 +1594,7 @@ async fn run_failure_cells(
       "caller retries must never deliver to an unreachable destination".to_owned(),
     );
   }
-  print_retries("partition8", 2, 0, OPEN_BUDGET, &retries);
+  report_retries("partition8", 2, 0, OPEN_BUDGET, &retries);
 
   // P4: isolated origin. The recovery plane re-dials an offline node on
   // its own cadence (seconds), so the send follows the disconnect
@@ -1616,9 +1624,10 @@ async fn run_failure_cells(
     }
     let attempt = send_one(nodes, shared, Lane::Default, 0, 7, OPEN_BUDGET).await;
     if !attempt.delivered && attempt.kind == Some(ErrorKind::RouteUnavailable) {
-      println!(
-        "  isolated-origin 0->7: RouteUnavailable after {:.1?} (round {round})",
-        attempt.ack
+      tracing::info!(
+        "  isolated-origin 0->7: RouteUnavailable after {:.1?} (round {})",
+        attempt.ack,
+        round
       );
       break;
     }
@@ -1630,7 +1639,7 @@ async fn run_failure_cells(
   }
 
   // ---- budget exhaustion and convenience replies on the chain ----
-  println!("=== shape chain8 (re-enforced for exhaustion and reply cells) ===");
+  tracing::info!("=== shape chain8 (re-enforced for exhaustion and reply cells) ===");
   let chain = undirected_set(&[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
   enforce_topology(
     nodes,
@@ -1664,7 +1673,7 @@ async fn run_failure_cells(
       ),
     );
   }
-  b1.print();
+  b1.report();
 
   let mut retries = Vec::new();
   for _ in 0..profile.retry_sequences {
@@ -1681,7 +1690,7 @@ async fn run_failure_cells(
       "retries at a sub-path-length budget must never deliver".to_owned(),
     );
   }
-  print_retries("chain8", 0, 7, 3, &retries);
+  report_retries("chain8", 0, 7, 3, &retries);
 
   // R: convenience-reply probes. A delivered multi-hop stream's derived
   // return stream is direct-only (hardcoded one-hop budget, D-7's
@@ -1709,9 +1718,12 @@ async fn run_failure_cells(
     let _ = shared.wait_arrival(&trace, ARRIVAL_TIMEOUT).await;
     let reply = shared.wait_reply(&trace, Duration::from_secs(15)).await;
     let reply_decisions = shared.reply_decisions_of(&trace).len();
-    println!(
+    tracing::info!(
       "  reply-probe 7->0 (derived from the delivered 0->7 stream): \
-       outcome {reply:?} after {reply_decisions} reply next-hop decisions (probe {probe})"
+       outcome {:?} after {} reply next-hop decisions (probe {})",
+      reply,
+      reply_decisions,
+      probe
     );
     invariants.check(
       reply.is_err(),
@@ -1720,12 +1732,15 @@ async fn run_failure_cells(
   }
 }
 
+/// The measurement's tracing init: `RUST_LOG` is honored; the default
+/// keeps the library quiet (`radiata=warn`) while leaving this file's own
+/// `info!` report tables visible without any override.
 fn init_tracing() {
   use std::sync::Once;
   static INIT: Once = Once::new();
   INIT.call_once(|| {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-      .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("radiata=warn"));
+      .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,radiata=warn"));
     let _ = tracing_subscriber::fmt()
       .with_env_filter(filter)
       .with_test_writer()
@@ -1743,7 +1758,7 @@ async fn sparse_routing_structural_invariants() {
   run_measurement(Profile::lean()).await;
 }
 
-/// The full statistical profile behind `--ignored`; its printed tables
+/// The full statistical profile behind `--ignored`; its logged tables
 /// are the D-6 measurement report data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "full statistical profile: cargo test --release --test routing_sparse_measurement sparse_routing_full_profile_tables -- --ignored --exact --nocapture"]

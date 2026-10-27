@@ -29,11 +29,15 @@
 
 全部处理完毕，见文末"已修复记录"。本轮调查中另有新发现一项，记录备查：
 
-- **TraceSink 强引用滞后**（B3 调查中发现，未修）：`src/routing/trace.rs` 的 detached
+- **TraceSink 强引用滞后**（B3 调查中发现，**已于 2026-10-27 修复**）：`src/routing/trace.rs` 的 detached
   持久化任务强持有 `Arc<LocalIdentityContext>`（→ 存储 → 后端锁），对 shutdown 屏障
-  不可见；重路由场景下 shutdown 后任务尾巴仍可能持锁几毫秒。建议后续：改弱引用
-  （镜像 `MembershipSyncConsumer`/`ReconcilePlane` 的既有模式）或关闭路径排空 trace
-  队列。`tests/admission_runtime.rs` 的重启重试即针对此残留机制。
+  不可见；重路由场景下 shutdown 后任务尾巴仍可能持锁几毫秒。修复：改弱引用
+  （镜像 `MembershipSyncConsumer`/`ReconcilePlane` 的既有模式），upgrade 失败的持久化
+  跳过并计入既有 dropped 聚合；`tests/admission_runtime.rs` 的重启重试已删除（改为直接
+  启动，durable-resolution 场景的重启改走 graceful shutdown 回复）；回归测试：lib 层
+  teardown 跳过与计数（变异验证过强引用构建必挂）、redb 层有路由 trace 流量场景的
+  shutdown 后无重试立即重开。注：原重试还掩盖了同文件一处 handle-drop 异步拆除与立即
+  重开的竞态（非 trace 尾巴），该场景已改走 shutdown 回复。
 
 ### C. 已关闭
 
@@ -47,7 +51,14 @@
 
 **Wave 1（已完成，2026-10-27）**与 **Wave 2（已完成，2026-10-27）**：见文末"已修复记录"。
 
-**Wave 3 已全部完成**：无剩余待办。新发现的 TraceSink 项见上文 B 节。
+**Wave 3 已全部完成**：无剩余待办。新发现的 TraceSink 项见上文 B 节（已修复）。
+
+发布收尾（2026-10-27，fresh reviewer 复核 approve-with-nits）：
+
+| 项 | 提交 | 要点 |
+| --- | --- | --- |
+| TraceSink 弱引用 | `fff0f8d` + `a0033c0` | 见上文 B 节；顺带修复 admission_runtime 裸 handle drop 与立即重开的竞态 |
+| println 系清零 | `2ecf631` + `ca49f84` + `932500c` | 五个 benchmark/chaos/测量测试文件全部转 tracing（报告行 info、诊断 warn）；仅保留 `json/native.rs` 子进程 IPC 握手行；`common::init_tracing` fallback 补全局 warn 指令保诊断可见 |
 
 每项遵循"一个逻辑改动一个 commit + 全量质量门"；行为改动须附表达可观测
 失败的回归测试。
