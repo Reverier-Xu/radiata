@@ -19,7 +19,7 @@ redb    = ["dep:redb"]
 [dependencies]
 # Feature plumbing only: enables aws-lc-sys's prebuilt NASM objects so
 # Windows x86-64 source builds do not require an installed NASM assembler.
-aws-lc-rs = { version = "1", default-features = false, features = [
+aws-lc-rs = { version = "1.18", default-features = false, features = [
   "prebuilt-nasm",
 ] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
