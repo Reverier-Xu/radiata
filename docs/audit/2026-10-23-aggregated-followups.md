@@ -73,12 +73,12 @@
 ### 文档/证据缺口处理
 
 - 文档项全部修复（guide-docs lane 5 提交 + contract-docs lane 6 提交 + 集成修正）。
-- 测试/证据强化类（golden witness、命名空间守卫、重放测试、快照往返、分区断言、零传输证明、预算矩阵、仿真≠运行时、参考 oracle、严格 SLO）**本轮暂缓**，仍待处理。
+- 测试/证据强化类（golden witness、命名空间守卫、重放测试、快照往返、分区断言、零传输证明、预算矩阵、仿真≠运行时、参考 oracle、严格 SLO）本轮暂缓；其逐项复核与处置见 [2026-10-27-followup-review.md](2026-10-27-followup-review.md)（A1/A2/A4/A7 已在该轮修复）。
 - P3 维护项全部处理：kind 集中化（`0afaee9`）、三组重复 helper（`17385e8`）、fixed_bytes 去重（`a4b8920`）、infallible 构造（`a6b5bb0`）、fail_upstream（`4706026`）、dial 去重、任务等待集中（`9548485`）。广播适配/队列记账/tick 分解经评估**不改**（证据见 wave3 报告：替换会破坏取消安全/字节预算/仅重定位耦合）。
 
 ### 已知遗留（不阻塞，记录备查）
 
-- sync 路径 retire_session 不发 SessionChanged（事件奇偶性，本地路径会发）。
+- ~~sync 路径 retire_session 不发 SessionChanged~~（2026-10-27 已修复，`ebb9a9c`）。
 - MemberSpkiTable 的界是内部常量而非 NodeConfig 旋钮。
 - 两个既有 redb 临时目录/并行度 flake（单独运行均通过）。
 - ADMISSION_CONCURRENCY = 4 未与其他容量旋钮联合调参。
