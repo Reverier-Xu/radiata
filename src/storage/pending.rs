@@ -1159,10 +1159,7 @@ mod tests {
   #[test]
   fn identity_records_pending_namespace_and_singleton_key_are_exact() {
     let namespace = pending_namespace().unwrap();
-    assert_eq!(
-      namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/pending-transaction"
-    );
+    assert_eq!(namespace.as_str(), PENDING_NAMESPACE);
     assert_eq!(
       QualifiedTag::parse(namespace.as_str()).unwrap().category(),
       "metadata"

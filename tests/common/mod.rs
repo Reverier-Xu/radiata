@@ -29,10 +29,17 @@ use radiata::{
 };
 use tokio::sync::Notify;
 
+/// Integration-side mirrors of the catalog's `*_NAMESPACE` constants in
+/// `src/storage/families.rs`: the constants are `pub(crate)`, so the
+/// public-API test lane re-declares the tags it inspects here. The
+/// `metadata_namespace_literals_are_single_sourced` guard holds these
+/// mirrors catalog-backed; integration tests reference these constants,
+/// never a bare literal.
 pub const LOCAL_IDENTITY_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/local-identity";
 pub const KEY_CREATION_INTENT_NAMESPACE: &str =
   "radiata.woooo.tech/metadata/v1/key-creation-intent";
 pub const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/pending-transaction";
+pub const CHECKPOINT_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/cleanup-checkpoint";
 
 /// One merge with bounded retries against one stable credential: the
 /// accept loop precomputes its merge hint, so rotating on every retry
@@ -676,7 +683,7 @@ pub enum CommitFault {
 /// The pending-transaction journal namespace: a journaled commit is
 /// recognizable by its pending-record put into this namespace.
 fn pending_journal_namespace() -> StoreNamespace {
-  namespace("radiata.woooo.tech/metadata/v1/pending-transaction")
+  namespace(PENDING_NAMESPACE)
 }
 
 #[derive(Debug)]
