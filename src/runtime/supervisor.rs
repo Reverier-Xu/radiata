@@ -31,6 +31,18 @@ use crate::{
   transport::registry::{Transport, TransportListener, TransportTrust},
 };
 
+/// Depth of the node's control channel, the API verbs' command queue:
+/// every writer is a request/reply call on a node handle
+/// (`RuntimeClient::send_command`, including `shutdown`), each awaiting
+/// its oneshot before returning, and the supervisor's select loop
+/// answers one command inline per iteration. The depth is
+/// therefore the accepted number of concurrently unanswered control
+/// reads before a calling handle's `send_command` parks — no
+/// packet-admission path ever writes a control message and no control
+/// arm admits a packet, so it is independent of
+/// `ADMISSION_CONCURRENCY`. The shutdown path reuses it to pre-size the
+/// queued-reply drain, where it is a true bound: a closed bounded
+/// channel can hold no more queued messages than its capacity.
 const CONTROL_CAPACITY: usize = 32;
 
 /// The bounded cooperative window the drained connection tasks get at
@@ -44,16 +56,28 @@ const CONTROL_CAPACITY: usize = 32;
 /// shutdown stays as prompt as before.
 const CONNECTION_TASK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Capacity of the node's outbound packet command channel:
-/// `PACKET_CHANNEL_CAPACITY` derives from it so one bound governs both
-/// control ends.
-///
-/// The bounded channel for immediate sync-round requests forwarded to
-/// the sync driver (the cursor owner; the `SyncRound` task effect holds
-/// a sender): rounds are self-limiting (one page per session per
-/// round), so a small queue with typed backpressure matches the work.
+/// Depth of the bounded channel for immediate sync-round requests
+/// forwarded to the sync driver (the cursor owner): the only writer is
+/// the `SyncRound` task effect, which sends one oneshot and awaits its
+/// round's completion, so the queue depth is the accepted number of
+/// concurrent on-demand rounds before the submitting effect parks —
+/// rounds are self-limiting (one page per session per round), so a
+/// small queue with typed backpressure matches the work. A round's
+/// page dispatches ride the packet command channel, never this queue,
+/// so this depth is independent of `ADMISSION_CONCURRENCY`.
 pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 
+/// Depth of the node's outbound packet command channel, deliberately
+/// equal to the control channel's: both are caller-submitted command
+/// queues into the same single-consumer select loop, so one depth
+/// policy governs how far either plane may queue ahead of the loop
+/// before its sender observes backpressure (`send` parking, or the
+/// fire-and-forget `try_send` typed overload). This is a shared policy,
+/// not a structural necessity: the packet plane's producers are the
+/// public send verbs plus the internal-plane sync dispatches (the
+/// membership pages and the reconcile lanes' rows and replies), and
+/// the dispatch retry budget in `sync_common` rides out bursts that
+/// outrun this depth.
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
 
 /// The bound on simultaneously running packet admission tasks (audit
@@ -61,14 +85,42 @@ pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
 /// policy, so this bounds how many such waits are in flight. A
 /// saturated pool disables the control loop's packet arm instead of
 /// blocking the loop, and the bounded packet command channel carries the
-/// backpressure.
+/// backpressure. That backpressure hand-off is the only interaction
+/// with `PACKET_CHANNEL_CAPACITY`: the queue absorbs the burst a
+/// disabled arm cannot drain while the sync dispatch's bounded retry
+/// rides out the window — no fixed ratio ties the two depths.
 pub(crate) const ADMISSION_CONCURRENCY: usize = 4;
 
-/// Capacity of the bounded admission-to-loop pump handoff: the loop is
-/// the only consumer and reaps it every iteration, so a full channel
-/// only parks one admission task (holding its admission slot) for one
-/// scheduling window.
+/// Depth of the bounded admission-to-loop pump handoff, structurally
+/// tied to the admission pool: every writer is an admission task
+/// holding exactly one permit and writing at most one handoff, and only
+/// the control loop spawns admission tasks, so no more than
+/// `ADMISSION_CONCURRENCY` handoffs can be produced between two loop
+/// iterations. Equal depth means one fully parallel admission window's
+/// handoffs always fit without parking. The loop is the sole consumer
+/// and reaps the channel whenever it runs, so a finished admission
+/// parks on a full channel for at most one scheduling window — never
+/// behind its own pool — and defensively, a loop that has exited drops
+/// the receiving end, so a late handoff send would observe `SendError`
+/// and reject its request with the typed shutdown kind.
 const PUMP_HANDOFF_CAPACITY: usize = ADMISSION_CONCURRENCY;
+
+// The capacity constants' joint relations (audit follow-up B4), pinned
+// at compile time so a violation fails any build: the pump handoff
+// queue must fit every handoff one fully parallel admission window can
+// produce (each permit holder writes at most one handoff, and only the
+// loop spawns admissions), and the packet command channel stays on the
+// one depth policy shared with the control channel. A future edit that
+// re-inlines either side as an independent literal and silently breaks
+// the relation cannot compile.
+const _: () = assert!(
+  PUMP_HANDOFF_CAPACITY >= ADMISSION_CONCURRENCY,
+  "the pump handoff queue must hold at least one handoff per admission slot"
+);
+const _: () = assert!(
+  PACKET_CHANNEL_CAPACITY == CONTROL_CAPACITY,
+  "both command planes into the control loop share one depth policy"
+);
 
 /// One bound listener's supervisor-side entry: the published endpoint,
 /// the listener handle, and the abort handle of its accept loop.
