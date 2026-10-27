@@ -909,11 +909,12 @@ fn digest_store_value(value: &[u8]) -> Digest {
 /// Evaluates one conditional operation against closure lookups over the
 /// committing state: `entry` resolves one record to its content digest
 /// (None when absent) and `receipt` resolves one transaction id to its
-/// operation digest. This is the single definition shared by every
-/// storage adapter AND the reference provider in the storage contract
-/// suite, so a condition bug cannot hide by being copied into both the
-/// oracle and the adapter under test. Without a storage-backend feature
-/// the only callers live in test builds, which is intentionally allowed.
+/// operation digest. This is the single definition behind every storage
+/// adapter; the storage-contract reference oracle deliberately keeps its
+/// own derivation of the expectation table (see
+/// `src/storage/contract/reference.rs`, audit A9) so the oracle and the
+/// adapters cannot drift in lockstep. Without a storage-backend feature
+/// there are no callers, which is intentionally allowed.
 #[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
 pub(crate) fn condition_matches(
   mut entry: impl FnMut(&StoreNamespace, &StoreKey) -> Result<Option<Digest>>,
@@ -958,12 +959,13 @@ fn expectation_matches(digest: Option<Digest>, expected: &StoreExpectation) -> b
 /// base-revision check, then every conditional expectation through
 /// [`condition_matches`]. `None` means the caller may apply the change;
 /// `Some` is the decided outcome. The lookups are per-site closures so
-/// every storage adapter and the reference oracle keep their exact read
-/// order and error contexts: `receipt` resolves one transaction id to its
-/// stored receipt (the replay source and, derived from it, the
-/// `ForgetReceipt` digest expectation), `current_revision` resolves the
-/// current store revision, and `entry` resolves one record to its content
-/// digest.
+/// every storage adapter keeps its exact read order and error contexts
+/// (the reference oracle re-derives this order on its own, see
+/// `src/storage/contract/reference.rs`, audit A9): `receipt` resolves one
+/// transaction id to its stored receipt (the replay source and, derived
+/// from it, the `ForgetReceipt` digest expectation), `current_revision`
+/// resolves the current store revision, and `entry` resolves one record
+/// to its content digest.
 #[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
 pub(crate) fn commit_precheck(
   transaction: &StoreTransaction,
@@ -1001,13 +1003,14 @@ pub(crate) fn commit_precheck(
 }
 
 /// Classifies one stored-receipt lookup into the three-way
-/// [`ReconcileOutcome`], the single reconcile verdict shared by every
-/// storage adapter and the reference oracle: a receipt carrying the exact
-/// digest is [`ReconcileOutcome::Committed`], the same transaction id
-/// under a different digest is [`ReconcileOutcome::DigestConflict`], and
-/// no receipt is [`ReconcileOutcome::Aborted`]. The lookup itself stays at
-/// each call site so every adapter keeps its exact read order and error
-/// contexts.
+/// [`ReconcileOutcome`], the single reconcile verdict behind every
+/// storage adapter (the reference oracle keeps its own derivation, see
+/// `src/storage/contract/reference.rs`, audit A9): a receipt carrying the
+/// exact digest is [`ReconcileOutcome::Committed`], the same transaction
+/// id under a different digest is [`ReconcileOutcome::DigestConflict`],
+/// and no receipt is [`ReconcileOutcome::Aborted`]. The lookup itself
+/// stays at each call site so every adapter keeps its exact read order
+/// and error contexts.
 #[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
 pub(crate) fn classify_receipt(
   receipt: Option<CommitReceipt>, digest: &Digest,
