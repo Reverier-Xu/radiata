@@ -429,6 +429,26 @@
 //! # }
 //! ```
 //!
+//! ## The delivery contract: best-effort, healed by caller retry
+//!
+//! Routed delivery is best-effort, and deliberately so: the library
+//! never promises a packet arrives exactly once, or that any single
+//! attempt arrives at all. The split of recovery labor is the contract.
+//! A forwarding hop whose downstream branch fails runs a bounded
+//! branch search over its own remaining candidates before reporting
+//! the failure upstream, so a relay that walked into a dead end
+//! mid-route heals inside the library. The first hop has no such
+//! search: the origin picks one relay and dispatches once, and on a
+//! sparse branching topology — where no stateless policy can know
+//! which neighbor leads toward the destination — a pick that walks
+//! into a dead-end subtree fails the stream right at the origin, with
+//! the typed delivery error surfacing to the sender. Caller-level
+//! retry is the supported recovery there: make critical business
+//! flows idempotent (a receiver must tolerate a duplicate delivery),
+//! re-send on a delivery failure, and let each retry's fresh trace
+//! walk a different relay path — the same branching that fails one
+//! attempt is what makes a handful of them deliver.
+//!
 //! # 5. Receiving packets: `PacketConsumer`
 //!
 //! A protocol is one wire contract: a [`ProtocolTag`](crate::ProtocolTag)

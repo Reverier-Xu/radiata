@@ -429,6 +429,14 @@ impl IncomingStream {
   /// An exhausted budget ends the reply with a typed delivery failure at
   /// this node; core never continues a reply past the caller's budget.
   ///
+  /// Like every routed send the reply is best-effort, never
+  /// exactly-once or guaranteed: a forwarding hop heals a mid-route
+  /// dead end through its bounded branch search, but a first hop that
+  /// walks into a dead-end subtree fails the reply at this node, so a
+  /// reply that must arrive is retried by the caller — a fresh trace
+  /// per attempt walks a different relay path. The routing chapter of
+  /// the [`guide`](crate::guide) states the full delivery contract.
+  ///
   /// ```
   /// use radiata::{BoxFuture, IncomingStream, PacketConsumer, Result, StreamMetadata};
   ///
