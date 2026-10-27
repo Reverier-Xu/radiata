@@ -6,7 +6,11 @@ rust-version = "1.98.0"
 version      = "0.1.0"
 
 [dependencies]
-sha2 = "0.11"
+sha2  = "0.11"
+tokio = { version = "1.54", features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["macros", "rt"] }
 
 [lints.rust]
 unsafe_code = "forbid"

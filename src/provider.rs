@@ -896,6 +896,15 @@ pub trait Storage: fmt::Debug + Send + Sync + 'static {
     &'a self, transaction: &'a TransactionId, digest: &'a Digest,
   ) -> BoxFuture<'a, Result<ReconcileOutcome>>;
 
+  /// Flushes every in-flight execution to durability before returning:
+  /// implementations must resolve only once no spawned commit or read
+  /// execution still holds the backend (audit 2026-10-23 P1-10, extended
+  /// to snapshot readers in audit 2026-10-27 B3). The node shutdown
+  /// relies on this barrier: the reply returns only after flush
+  /// resolves, so reopening the same backend cannot race a landing
+  /// execution. The wait is deliberately unbounded — it awaits
+  /// durability obligations, not cancellable effects; a caller that
+  /// leaks a snapshot handle can hold the barrier open.
   fn flush<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
 }
 

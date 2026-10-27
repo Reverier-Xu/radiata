@@ -20,6 +20,14 @@ use radiata::{Endpoint, NodeBuilder, NodeConfig, NodeHandle, PageSpec};
 mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
+// The shared multi-cluster gate (audit 2026-10-27 B3): the lanes
+// serialize so each cluster owns the machine while it runs — in this
+// process through the gate's async mutex and across test-file
+// processes through the kernel file lock under `target/`, so
+// cross-file cluster parallelism is bounded machine-wide too (the
+// per-file `OnceLock` this replaces left other files' clusters free
+// to oversubscribe the runner).
+use radiata_test_support::cluster_gate;
 
 /// The sixteen-node lanes run the shipped defaults — one anti-entropy
 /// tick per second, recovery fan-out sixteen with a two-second initial
@@ -28,15 +36,11 @@ use common::{MemoryStorageFactory, ScriptedKeys};
 /// 10,000 ms SLO bound of the quantified 16-node OCI profile when the
 /// operator exports RADIATA_SLO_PROFILE_STRICT=1; no CI workflow sets
 /// the flag, so a green CI run is functional evidence only). The lanes
-/// share one process: the test harness runs them concurrently on a
+/// share one machine: the test harness runs them concurrently on a
 /// runner that cannot carry several oversubscribed clusters at once,
-/// so the lanes serialize on this shared gate and each cluster owns
-/// the process while it runs.
-fn cluster_gate() -> &'static tokio::sync::Mutex<()> {
-  static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-  GATE.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
+/// so the lanes serialize on the shared cluster gate and each cluster
+/// owns the machine while it runs — including against other test
+/// files' clusters (audit 2026-10-27 B3).
 fn init_tracing() {
   use std::sync::Once;
   static INIT: Once = Once::new();
@@ -846,7 +850,7 @@ async fn assert_session_census(nodes: &[Node]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
 
   // Nodes 0..14 merge first; before node 15 merges, the induced graph must
   // already be the 28-edge CQ4-minus-node-15.
@@ -933,7 +937,7 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   init_tracing();
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
 
   let hub_storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   // The hub's identity must survive its restart: one key provider
@@ -1133,7 +1137,7 @@ async fn wait_member_view(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_sync_failure_matrix_partition_healing() {
   init_tracing();
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
 
   // The failure-matrix cluster pins two knobs. The sparse-topology
   // degree target (the documented "one link is enough" shape): the
@@ -1538,7 +1542,7 @@ async fn membership_sync_failure_matrix_partition_healing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_sync_slo_trend_stays_below_bound() {
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
 
   // The trend records the full merge-to-descriptor-completion window
   // from public observations: the timer starts before the first merge so
@@ -1576,7 +1580,7 @@ async fn membership_sync_slo_trend_stays_below_bound() {
 /// plumbing over bounded bodies).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_sync_sixteen_node_revised_workload_slo() {
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
 
   init_tracing();
   // Profile setup (untimed): fifteen members merge and converge.
@@ -1728,7 +1732,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
 /// fat label sets never converged anywhere.
 #[tokio::test]
 async fn membership_sync_delivers_fat_descriptor_pages() {
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
   init_tracing();
 
   const FAT_ENTRIES: usize = 64;
@@ -1825,7 +1829,7 @@ async fn membership_sync_delivers_fat_descriptor_pages() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn descriptor_labels_survive_listener_rewrites_locally_and_on_peers() {
   // Serialize with the sixteen-node lanes on the shared process.
-  let _gate = cluster_gate().lock().await;
+  let _gate = cluster_gate().await;
 
   let issuer = start_node(
     0,

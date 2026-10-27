@@ -23,17 +23,17 @@
 
 ### A. 测试/证据强化（暂缓类）
 
-Wave 1/2/3a 已落地的条目移至文末"已修复记录"。
-
-| # | 条目 | verdict | 关键证据（当前代码） | 处置 |
-| --- | --- | --- | --- | --- |
-| A8 | 仿真≠运行时 | partial | 模型本质不变（`network.rs` 字节记账/boot epoch）；证据已经 `ProducerKind::Simulation`（`test-support/src/lib.rs:364-372`）显式分类 | Wave 3b：runtime 恢复证据通道（建设项） |
+全部暂缓条目已处理完毕，见文末"已修复记录"。
 
 ### B. 已知遗留行为项
 
-| # | 条目 | verdict | 关键证据（当前代码） | 处置 |
-| --- | --- | --- | --- | --- |
-| B3 | redb flake ×2 | still-open | 锁释放竞态（`tests/redb_runtime.rs:123-131` 局部重试缓解，机制未根治）；`cluster_gate` 每文件独立，跨文件集群并行无全局串行 | Wave 3b：根治竞态 + 并行度治理 |
+全部处理完毕，见文末"已修复记录"。本轮调查中另有新发现一项，记录备查：
+
+- **TraceSink 强引用滞后**（B3 调查中发现，未修）：`src/routing/trace.rs` 的 detached
+  持久化任务强持有 `Arc<LocalIdentityContext>`（→ 存储 → 后端锁），对 shutdown 屏障
+  不可见；重路由场景下 shutdown 后任务尾巴仍可能持锁几毫秒。建议后续：改弱引用
+  （镜像 `MembershipSyncConsumer`/`ReconcilePlane` 的既有模式）或关闭路径排空 trace
+  队列。`tests/admission_runtime.rs` 的重启重试即针对此残留机制。
 
 ### C. 已关闭
 
@@ -47,10 +47,7 @@ Wave 1/2/3a 已落地的条目移至文末"已修复记录"。
 
 **Wave 1（已完成，2026-10-27）**与 **Wave 2（已完成，2026-10-27）**：见文末"已修复记录"。
 
-**Wave 3（决策已落定后的工程项）**
-
-1. A8：runtime 恢复证据通道（真实节点 + 受控传输 + 持久化重开）。
-2. B3：redb 锁释放竞态根治 + 跨文件集群并行度治理。
+**Wave 3 已全部完成**：无剩余待办。新发现的 TraceSink 项见上文 B 节。
 
 每项遵循"一个逻辑改动一个 commit + 全量质量门"；行为改动须附表达可观测
 失败的回归测试。
@@ -90,3 +87,11 @@ Wave 3a（2026-10-27）：四条 lane（glm-5.3 worker + fresh glm-5.3 reviewer
 | A10 SLO 措辞 | `b884e1d` | README/verify-release/membership_sync 头注释：常规绿 CI = 功能证据非 deadline 证据；严格 profile 命令与 OCI 限定写明 |
 | B2 SPKI 旋钮 | `ba24c52` | `NodeConfig::with_member_spki_anchor_limits(per_peer, global)`（非零 + per_peer≤global 校验），默认 4/256 行为不变；配置经既有构造点流入淘汰逻辑（有非恒真测试钉死） |
 | B4 联合调参 | `9fa34b9` + `ae5fb8c` + `3a2e793` | 生产者/消费者拓扑分析结论：无合法配比可发明；钉住两条真实结构关系（`PUMP_HANDOFF=ADMISSION_CONCURRENCY`、`PACKET=CONTROL` 由全构建期 const assert 把守），其余旋钮各自独立性写入注释 |
+
+Wave 3b（2026-10-27）：fresh glm-5.3 reviewer 复核（approve-with-nits，minor 已修），
+集成后主线全量质量门通过（41 个二进制 1081 项全绿）。
+
+| 条目 | 修复提交 | 方案要点 |
+| --- | --- | --- |
+| A8 runtime 恢复证据 | `fa55fab` | 盘点确认 R1/R2/R4/R5 已有真实 runtime 证据；R3 缺口（磁盘重开+自动重连+元数据收敛组合）扩展既有 `restarted_node_passively_reconnects` 落地，变异验证通过；E2e 分类以文档注释落地（failure-replay 设施不适用已论证） |
+| B3 redb flake 根治 | `098d099` + `8d179ea` + `219798a` | 根因实证：`snapshot()` 阻塞任务克隆 `Arc<Database>` 对 commit 屏障不可见（插桩抓到 strong count=2）；SnapshotReaders 计数门纳入 flush 屏障；三处散装重试删除 + 12 轮无重试重开回归。cluster gate 升级机器级（进程内 mutex + `target/` 内核文件锁，零新外部依赖） |

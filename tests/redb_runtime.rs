@@ -120,25 +120,6 @@ async fn start(
   NodeBuilder::new(factory).keys(keys).start().await
 }
 
-/// Reopens `factory` after a shutdown, tolerating the previous node's
-/// bounded file-lock settle: an in-flight detached commit can release the
-/// redb lock a few milliseconds after `shutdown` returns, so the typed
-/// `StorageLocked` is retried instead of racing it. Any other failure, or
-/// a lock that never releases, still fails the call.
-async fn start_after_shutdown(
-  factory: Arc<dyn StorageFactory>, keys: Arc<DeterministicKeys>,
-) -> Result<NodeHandle> {
-  for _ in 0..200 {
-    match start(Arc::clone(&factory), Arc::clone(&keys)).await {
-      Err(error) if error.kind() == ErrorKind::StorageLocked => {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-      }
-      result => return result,
-    }
-  }
-  start(factory, keys).await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
   let dir = tempfile::tempdir().unwrap();
@@ -154,7 +135,7 @@ async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
   first.shutdown().await.unwrap();
   assert_eq!(calls.create.lock().unwrap().len(), 1);
 
-  let second = start_after_shutdown(
+  let second = start(
     radiata::adapters::redb_store(dir.path().join("store.redb")),
     Arc::new(DeterministicKeys::new(11, Arc::clone(&calls))),
   )
@@ -164,6 +145,40 @@ async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
   second.shutdown().await.unwrap();
   assert_eq!(calls.create.lock().unwrap().len(), 1);
   assert!(*calls.public_key.lock().unwrap() >= 2);
+}
+
+/// The shutdown reply returns only once the storage execution barrier
+/// has drained every execution holding the database — the detached
+/// commits (audit 2026-10-23 P1-10) AND the snapshot executions whose
+/// blocking reads or live handles used to pin the file lock a few
+/// milliseconds past the reply (audit 2026-10-27 B3). The reopen after
+/// every round is immediate and un-retried: a single `StorageLocked`
+/// here is the regression the barrier's read half exists to prevent.
+/// The rounds repeat the exact reproduction shape observed before the
+/// fix (durable activity, shutdown, immediate reopen) because the race
+/// landed in a minority of rounds under load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redb_runtime_shutdown_releases_the_file_lock_before_the_reply() {
+  const ROUNDS: usize = 12;
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("store.redb");
+  let keys = Arc::new(DeterministicKeys::new(13, Arc::new(Calls::default())));
+  for round in 0..ROUNDS {
+    let handle = start(
+      radiata::adapters::redb_store(path.clone()),
+      Arc::clone(&keys),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("round {round} open failed: {error:?}"));
+    handle.shutdown().await.unwrap();
+    let reopened = start(
+      radiata::adapters::redb_store(path.clone()),
+      Arc::clone(&keys),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("round {round} reopen failed: {error:?}"));
+    reopened.shutdown().await.unwrap();
+  }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
