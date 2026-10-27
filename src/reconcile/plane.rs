@@ -2785,35 +2785,70 @@ mod tests {
     }
   }
 
-  /// Waits for the recording sink to drain the tick's dispatches and
-  /// returns the kinds recorded since the previous call: the recorded
-  /// set must hold steady across two grace windows before the test
-  /// reads it, with an initial grace ahead of the first reading so a
-  /// dispatch the tick spawned but the runtime has not yet scheduled
-  /// is not silently handed to the next tick's window — the plane's
+  /// Counts the hint re-sends the recording sink holds: a bare hint
+  /// is the retry slot's own dispatch, distinct from a piggybacked
+  /// rows-carrying hint.
+  fn hint_count(recorded: &Arc<std::sync::Mutex<Vec<&'static str>>>) -> usize {
+    recorded
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|kind| **kind == "hint")
+      .count()
+  }
+
+  /// Waits deterministically for the recording sink to hold `expected`
+  /// cumulative hint re-sends and returns the count: the plane's
   /// dispatches are spawned fire-and-forget, so the tick's return does
-  /// not join them. `seen` carries the read offset across calls: each
-  /// call reports only this tick's arrivals.
-  async fn settle_recorded(
-    recorded: &Arc<std::sync::Mutex<Vec<&'static str>>>, seen: &mut usize,
-  ) -> Vec<&'static str> {
-    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    let mut last = usize::MAX;
-    for _ in 0..20 {
-      tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-      let settled = recorded.lock().unwrap().len();
-      if settled == last {
-        let guard = recorded.lock().unwrap();
-        let kinds = guard[*seen..].to_vec();
-        *seen = guard.len();
-        return kinds;
+  /// not join them — and a fixed observation window can only conflate
+  /// "the send happened" with "the send was observed inside the
+  /// window", which is how a loaded runner (CI job 122090153988)
+  /// handed tick 4's send to tick 5's window and read the schedule as
+  /// `[5, 7, 11]`. Waiting for the count itself makes the attribution
+  /// structural: a send dispatched at tick N is observed before the
+  /// test advances to tick N+1, so a slow runtime can delay an
+  /// observation, it cannot misattribute it. The generous bound only
+  /// fails a genuinely missing send, with everything the sink did
+  /// record, and a count past `expected` fails at once — a stray send
+  /// cannot hide behind the wait.
+  async fn await_hint_count(
+    recorded: &Arc<std::sync::Mutex<Vec<&'static str>>>, expected: usize,
+  ) -> usize {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+      let count = hint_count(recorded);
+      assert!(
+        count <= expected,
+        "the wire carried {count} hint sends where at most {expected} were expected so far: {:?}",
+        *recorded.lock().unwrap(),
+      );
+      if count == expected {
+        return count;
       }
-      last = settled;
+      assert!(
+        tokio::time::Instant::now() < deadline,
+        "the wire held only {count} of the {expected} hint sends expected so far: {:?}",
+        *recorded.lock().unwrap(),
+      );
+      tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let guard = recorded.lock().unwrap();
-    let kinds = guard[*seen..].to_vec();
-    *seen = guard.len();
-    kinds
+  }
+
+  /// Holds a modest quiet window after a tick the schedule leaves
+  /// silent and asserts no hint re-send landed across it: the
+  /// deterministic wait returns the moment the expected count is
+  /// reached, so a stray send the last ticks spawned still needs a
+  /// time-bounded negative check to be seen — but only there, where
+  /// the schedule itself says the wire must stay quiet.
+  async fn quiet_hint_window(recorded: &Arc<std::sync::Mutex<Vec<&'static str>>>, before: usize) {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let after = hint_count(recorded);
+    assert_eq!(
+      after,
+      before,
+      "a tick the schedule leaves silent sent a hint: {:?}",
+      *recorded.lock().unwrap(),
+    );
   }
 
   /// B01/P2-3: the unexpired hint retry keeps its slot until the backoff
@@ -2900,13 +2935,21 @@ mod tests {
     }
     // Thirteen ticks: the retry becomes due at tick 4, spends the whole
     // budget by tick 11, and ticks 12–13 observe the exhausted slot.
+    // Each tick's wire read waits for the schedule's cumulative send
+    // count at that tick — deterministic, so a slow runner can only
+    // delay a send's observation, never hand it to the next tick's
+    // window — and ticks 12–13 additionally hold a quiet window: the
+    // budget spent, the wire stays silent.
+    let schedule: [u64; 4] = [4, 5, 7, 11];
     let mut hint_ticks: Vec<u64> = Vec::new();
     let mut resumes: Vec<(u8, u64)> = Vec::new();
-    let mut seen = 0_usize;
+    let mut settled = 0_usize;
     for tick in 1_u64..=13 {
       plane.tick(&runtime).await.unwrap();
-      let kinds = settle_recorded(&recorded, &mut seen).await;
-      if kinds.contains(&"hint") {
+      let expected = schedule.iter().filter(|due| **due <= tick).count();
+      let count = await_hint_count(&recorded, expected).await;
+      if count > settled {
+        settled = count;
         hint_ticks.push(tick);
         // The slot snapshot taken after a send: the resume tick its
         // successor was scheduled at.
@@ -2919,10 +2962,12 @@ mod tests {
           resumes.push((pending.attempts_left, pending.resume_at_tick));
         }
       }
+      if tick >= 12 {
+        quiet_hint_window(&recorded, count).await;
+      }
     }
     assert_eq!(
-      hint_ticks,
-      vec![4, 5, 7, 11],
+      hint_ticks, schedule,
       "the retry re-sent on the wire at the doubling schedule"
     );
     // The schedule's slot side, pinned at each send: the sends at ticks
