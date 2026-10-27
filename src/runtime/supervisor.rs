@@ -2056,8 +2056,8 @@ mod admission_loop_tests {
   use tokio::sync::{mpsc, oneshot, watch};
 
   use super::{
-    ADMISSION_CONCURRENCY, CONTROL_CAPACITY, Control, LifecycleSnapshot, PACKET_CHANNEL_CAPACITY,
-    PUMP_HANDOFF_CAPACITY, RuntimeSignals, ShutdownReason, supervise,
+    ADMISSION_CONCURRENCY, CONTROL_CAPACITY, Control, LifecycleSnapshot, RuntimeSignals,
+    ShutdownReason, supervise,
     test_support::{self, RuntimeFixture},
   };
   use crate::{
