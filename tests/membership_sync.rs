@@ -228,14 +228,14 @@ async fn wait_trust(nodes: &[Node], expected: usize, timeout: Duration) {
     if std::time::Instant::now() >= deadline {
       for node in nodes {
         let page = trust_page(node).await;
-        eprintln!(
-          "TRUST node {}: {} bindings {:?}",
-          node.id,
-          page.len(),
-          page
+        tracing::warn!(
+          node = %node.id,
+          bindings = page.len(),
+          members = ?page
             .iter()
             .map(|view| view.node_id().as_str())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>(),
+          "trust convergence timeout dump"
         );
       }
       panic!("trust convergence timeout after {timeout:?}");
@@ -380,7 +380,7 @@ async fn wait_settled(
 
       let missing: Vec<_> = expected.difference(&set).collect();
       let extra: Vec<_> = set.difference(expected).collect();
-      eprintln!("SETTLE mismatch missing={missing:?} extra={extra:?}");
+      tracing::warn!(?missing, ?extra, "settled topology mismatch");
       if set.len() > expected.len() {
         // A redundant star edge reappeared (an in-flight recovery dial
         // landing after its disconnect): re-close the issuer's redundant
@@ -1138,9 +1138,9 @@ async fn membership_sync_failure_matrix_partition_healing() {
   // derived target for four nodes is k(4) = 3, and the degree-maintenance
   // plane would re-bridge a held two-component split within one 30 s
   // deficit tick — the pinned target keeps both sides at-target so the
-  // partition below stays down until the harness restores the link, and
-  // the bridge probe's first dial sits one ~5-minute bracket out, well
-  // past this lane's lifetime. Topology shaping stays caller-shaped
+  // partition below stays down until the harness restores the link.
+  // The bridge probe's first dial sits one ~5-minute bracket out (the
+  // timing boundary is spelled out below). Topology shaping stays caller-shaped
   // exactly as before: every CQ4 edge is dialed explicitly.
   //
   // The network task-slot budget: a join or connect dial can hold its
@@ -1152,6 +1152,17 @@ async fn membership_sync_failure_matrix_partition_healing() {
   // budget that can never queue: at most four caller dials per node
   // exist in this cluster (its join plus two edge dials plus one probe
   // dial), so eight network slots absorb any residue.
+  //
+  // Known timing boundary: the healthy-node bridge probe fires one dial
+  // per 300 s bracket (degree.rs pins the interval) and this lane's
+  // nodes satisfy its trigger condition, counting from cluster build.
+  // The lane's bounded waits sum to roughly 200 s plus dial pacing, so
+  // a typical run finishes well inside the bracket — but a heavily
+  // loaded runner that stretches the lane past five minutes can see one
+  // legitimate probe re-bridge the held partition, failing the frozen
+  // topology assertions loudly (never silently passing). If that ever
+  // flakes, the fix is a config knob for the probe interval, not a
+  // wider window here.
   let config = NodeConfig::new()
     .with_connection_degree(1)
     .with_task_reconcile_slots(2, 8)
