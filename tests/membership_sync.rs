@@ -5,10 +5,12 @@
 //! each authenticated session; reciprocal trust, exact descriptors, and
 //! the exact crossed-cube CQ4 topology (32 undirected sessions, degree
 //! four, diameter three) converge through public facade observations
-//! only. The failure-matrix test exercises duplicate delivery and
-//! partition healing (reorder, endpoint change, and full process restart
-//! are covered by the descriptor store's revision/replay unit tests and
-//! the secure-join restart coverage); the SLO tests record
+//! only. The failure-matrix test observes duplicate delivery as raw
+//! per-direction session multiplicity and exercises a true two-component
+//! partition with per-side offline writes, link restoration, and
+//! cross-side reconciliation (reorder, endpoint change, and full process
+//! restart are covered by the descriptor store's revision/replay unit
+//! tests and the secure-join restart coverage); the SLO tests record
 //! merge-to-descriptor-completion samples.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -84,15 +86,32 @@ fn workload_body(
   futures_util::stream::once(async move { Ok(Arc::from(chunk) as Arc<[u8]>) })
 }
 
+/// Starts a node on the shipped defaults: the sixteen-node lanes are
+/// the defaults' own convergence and SLO evidence, so nothing is
+/// overridden on this path. Lanes that pin a knob (the failure-matrix
+/// cluster's sparse degree target) use [`start_node_configured`].
 async fn start_node(seed: u64, storage: Arc<MemoryStorageFactory>) -> Node {
-  start_node_inner(seed, storage, None).await
+  start_node_configured(seed, storage, NodeConfig::new()).await
 }
 
 async fn start_node_inner(
   seed: u64, storage: Arc<MemoryStorageFactory>, echo: Option<Arc<EchoCollector>>,
 ) -> Node {
+  start_node_inner_configured(seed, storage, echo, NodeConfig::new()).await
+}
+
+async fn start_node_configured(
+  seed: u64, storage: Arc<MemoryStorageFactory>, config: NodeConfig,
+) -> Node {
+  start_node_inner_configured(seed, storage, None, config).await
+}
+
+async fn start_node_inner_configured(
+  seed: u64, storage: Arc<MemoryStorageFactory>, echo: Option<Arc<EchoCollector>>,
+  config: NodeConfig,
+) -> Node {
   let keys = Arc::new(ScriptedKeys::full_at(600_000 + seed * 1_000));
-  start_node_with_keys(seed, storage, keys, echo).await
+  start_node_with_keys(seed, storage, keys, echo, config).await
 }
 
 /// Starts a node over an explicit key provider: restartable identities
@@ -100,12 +119,9 @@ async fn start_node_inner(
 /// handle must resolve after the reopen).
 async fn start_node_with_keys(
   seed: u64, storage: Arc<MemoryStorageFactory>, keys: Arc<ScriptedKeys>,
-  echo: Option<Arc<EchoCollector>>,
+  echo: Option<Arc<EchoCollector>>, config: NodeConfig,
 ) -> Node {
   let factory: Arc<dyn radiata::extension::StorageFactory> = storage.clone();
-  // The shipped defaults: the sixteen-node lanes are the defaults'
-  // own convergence and SLO evidence, so nothing is overridden.
-  let config = NodeConfig::new();
   let mut builder = NodeBuilder::new(factory).keys(keys).config(config);
   if let Some(echo) = echo {
     let mut extensions = radiata::ExtensionRegistry::new();
@@ -392,31 +408,19 @@ async fn wait_settled(
   }
 }
 
-/// Waits until `from` holds a connected session to `to`.
-async fn wait_connected(nodes: &[Node], from: usize, to: usize, timeout: Duration) {
-  let deadline = std::time::Instant::now() + timeout;
-  loop {
-    let page = topology_edges(&nodes[from]).await;
-    if page
-      .iter()
-      .any(|edge| edge.destination() == &nodes[to].id && edge.connected())
-    {
-      return;
-    }
-    assert!(
-      std::time::Instant::now() < deadline,
-      "reconnection timeout after {timeout:?}"
-    );
-    tokio::time::sleep(Duration::from_millis(50)).await;
-  }
-}
-
 /// Starts the issuer and merges `count - 1` members. Every node listens.
 async fn build_cluster(count: usize) -> Vec<Node> {
+  build_cluster_configured(count, NodeConfig::new()).await
+}
+
+/// The [`build_cluster`] shape over a lane-pinned configuration: every
+/// member of the cluster runs the same knob set from the start.
+async fn build_cluster_configured(count: usize, config: NodeConfig) -> Vec<Node> {
   let mut nodes = Vec::with_capacity(count);
-  let mut issuer = start_node(
+  let mut issuer = start_node_configured(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+    config.clone(),
   )
   .await;
   issuer.id = node_id(&issuer).await;
@@ -426,7 +430,7 @@ async fn build_cluster(count: usize) -> Vec<Node> {
 
   for index in 1..count {
     let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
-    let mut member = start_node(index as u64, storage).await;
+    let mut member = start_node_configured(index as u64, storage, config.clone()).await;
     member.endpoint = listen(&member).await;
     let issued = rotate_with_retry(&nodes[0]).await;
     let secret = issued.credential().expose_secret().to_owned();
@@ -644,6 +648,15 @@ async fn merge_with_retry(node: &Node, endpoint: Endpoint, secret: &str) {
 /// failure (crossed dial, accept backlog) is retried; a persistent
 /// failure fails the harness.
 async fn connect_with_retry(node: &Node, endpoint: Endpoint, peer: radiata::NodeId) {
+  connect_handle_with_retry(node.handle.clone(), node.id.clone(), endpoint, peer).await
+}
+
+/// The [`connect_with_retry`] retry ladder over a bare handle, so a
+/// spawned dial task (the duplicate-delivery lane samples the whole
+/// cluster while the dial is in flight) owns no `Node`.
+async fn connect_handle_with_retry(
+  handle: NodeHandle, dialer: radiata::NodeId, endpoint: Endpoint, peer: radiata::NodeId,
+) {
   // A handshake can be dropped under load and take the full
   // authentication deadline (30 s by default) to fail, so the retry
   // window is generous.
@@ -651,20 +664,23 @@ async fn connect_with_retry(node: &Node, endpoint: Endpoint, peer: radiata::Node
   let mut attempts = 0;
   loop {
     attempts += 1;
-    let connected = match node.handle.connect(endpoint.clone(), peer.clone()).await {
+    let connected = match handle.connect(endpoint.clone(), peer.clone()).await {
       Ok(task) => task.wait().await,
       Err(error) => Err(error),
     };
     match connected {
       Ok(_) => return,
       Err(error) if std::time::Instant::now() < deadline => {
-        eprintln!("dial {} -> {} attempt {attempts}: {error:?}", node.id, peer);
+        tracing::warn!(
+          dialer = %dialer.as_str(),
+          peer = %peer.as_str(),
+          attempts,
+          kind = ?error.kind(),
+          "member dial attempt failed; retrying"
+        );
         tokio::time::sleep(retry_backoff(attempts)).await;
       }
-      Err(error) => panic!(
-        "member dial {} -> {peer} failed persistently: {error:?}",
-        node.id
-      ),
+      Err(error) => panic!("member dial {dialer} -> {peer} failed persistently: {error:?}"),
     }
   }
 }
@@ -703,6 +719,127 @@ async fn collected_topology(nodes: &[Node]) -> Vec<(u8, u8)> {
     }
   }
   undirected.into_iter().collect()
+}
+
+/// One node's raw sessions page: the live session rows with each
+/// session's per-peer replacement generation. The sessions page and
+/// the topology page are the two separately served public projections
+/// of the same node-local session table.
+async fn session_rows(node: &Node) -> Vec<radiata::SessionView> {
+  node
+    .handle
+    .sessions()
+    .list(PageSpec::first(64).unwrap())
+    .await
+    .unwrap()
+    .items()
+    .to_vec()
+}
+
+/// The highest per-direction row count over both raw public list
+/// surfaces, counted BEFORE any same-node or cross-node dedup. The
+/// session table is keyed by peer, so the facade publishes at most one
+/// row per (source, destination) direction by construction: same-peer
+/// dials deterministically replace (the crossed-dial ownership rule
+/// keeps one direction, same-direction dials keep the newest). A
+/// parallel-session regression would surface here as more than one
+/// row in one direction on either surface, so the multiplicity
+/// assertion runs against this raw count, never against the
+/// deduplicated [`collected_topology`] edge set (where multiplicity is
+/// erased before counting and the assertion could never fire).
+async fn max_directional_multiplicity(nodes: &[Node]) -> usize {
+  let index_of: std::collections::BTreeMap<radiata::NodeId, usize> = nodes
+    .iter()
+    .enumerate()
+    .map(|(index, node)| (node.id.clone(), index))
+    .collect();
+  let mut highest = 1;
+  for node in nodes {
+    // Each surface is one atomic page read; rows are grouped per
+    // direction within that single read, so a transient replacement
+    // between two reads cannot fake a multiplicity.
+    let surfaces = [
+      topology_surface(node).await,
+      session_rows_surface(node).await,
+    ];
+    for surface in surfaces {
+      let mut rows: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+      for destination in surface {
+        if let Some(peer) = index_of.get(&destination) {
+          *rows.entry(*peer).or_default() += 1;
+        }
+      }
+      highest = highest.max(rows.values().copied().max().unwrap_or(1));
+    }
+  }
+  highest
+}
+
+/// The destinations of the node's connected topology rows: the raw
+/// topology-page surface, one row per live session to a peer.
+async fn topology_surface(node: &Node) -> Vec<radiata::NodeId> {
+  topology_edges(node)
+    .await
+    .into_iter()
+    .filter(|edge| edge.connected() && edge.source() == &node.id)
+    .map(|edge| edge.destination().clone())
+    .collect()
+}
+
+/// The destinations of the node's live sessions-page rows: the raw
+/// sessions surface, one row per live session to a peer.
+async fn session_rows_surface(node: &Node) -> Vec<radiata::NodeId> {
+  session_rows(node)
+    .await
+    .into_iter()
+    .map(|view| view.peer().clone())
+    .collect()
+}
+
+/// The live session's incarnation identity from the raw sessions page:
+/// the server-allocated session id (unique per incarnation) and the
+/// per-peer replacement generation. The generation advances by one on
+/// an in-place replacement and resets to one when the previous entry
+/// died of its own wire EOF before the new incarnation published —
+/// both are legitimate one-session outcomes of a re-dial, so
+/// replacement is proven by the id changing, never by the generation
+/// number alone. It is each node's OWN local history — the two ends of
+/// a session can sit apart after retried handshakes, so cross-end
+/// equality is never asserted; only per-end deltas are.
+async fn session_incarnation(
+  node: &Node, peer: &radiata::NodeId,
+) -> Option<(radiata::SessionId, u64)> {
+  session_rows(node)
+    .await
+    .iter()
+    .find(|view| view.peer() == peer)
+    .map(|view| (view.id().clone(), view.generation()))
+}
+
+/// At a quiescent point, the three separately served session
+/// observations of every node agree: the `status/sessions` metrics
+/// counter, the live sessions-page row count, and the topology-page row
+/// count. Not a transient invariant (dead entries await removal
+/// mid-flight), so it is asserted only at settled points.
+async fn assert_session_census(nodes: &[Node]) {
+  for node in nodes {
+    let snapshot = node.handle.metrics().await.unwrap();
+    let counter = snapshot
+      .counter(&radiata::QualifiedTag::parse(radiata::ObservabilitySnapshot::SESSIONS).unwrap())
+      .unwrap();
+    let sessions = session_rows(node).await.len();
+    let topology = topology_edges(node).await.len();
+    assert_eq!(
+      counter, sessions as u64,
+      "{} disagrees with its own sessions page",
+      node.id
+    );
+    assert_eq!(
+      sessions, topology,
+      "{} disagrees with its own topology page",
+      node.id
+    );
+  }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -802,7 +939,14 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   // after the reopen).
   let hub_keys = Arc::new(ScriptedKeys::full_at(600_000));
   let mut nodes = vec![
-    start_node_with_keys(0, hub_storage.clone(), hub_keys.clone(), None).await,
+    start_node_with_keys(
+      0,
+      hub_storage.clone(),
+      hub_keys.clone(),
+      None,
+      NodeConfig::new(),
+    )
+    .await,
     start_node(
       1,
       Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
@@ -867,7 +1011,7 @@ async fn recovery_prunes_redundant_edges_after_the_anchor_returns() {
   // The hub restarts with the same identity and re-dials the leaves
   // through recovery; its dials are marked on the hub and inbound on the
   // leaves.
-  let mut hub = start_node_with_keys(0, hub_storage, hub_keys, None).await;
+  let mut hub = start_node_with_keys(0, hub_storage, hub_keys, None, NodeConfig::new()).await;
   hub.id = node_id(&hub).await;
   hub.endpoint = listen(&hub).await;
   let _ = hub.handle.start_recovery().await;
@@ -896,11 +1040,123 @@ async fn topology_edges_by(handle: &NodeHandle, peer: &radiata::NodeId) -> bool 
     .any(|edge| edge.connected() && edge.destination() == peer)
 }
 
+/// One node's current member view of `target` from its member page.
+async fn member_view_of(node: &Node, target: &radiata::NodeId) -> Option<radiata::MemberView> {
+  member_page(node)
+    .await
+    .into_iter()
+    .find(|view| view.node_id() == target)
+}
+
+/// The node's own row from its member page (the owner's local view).
+async fn own_member_view(node: &Node) -> Option<radiata::MemberView> {
+  let own = node.id.clone();
+  member_page(node)
+    .await
+    .into_iter()
+    .find(|view| view.node_id() == &own)
+}
+
+/// One owner-revision descriptor bump: patches one capability label at
+/// the node's current own revision (a lost CAS race re-observes the
+/// revision and retries) and returns the committed revision.
+async fn bump_descriptor_label(
+  node: &Node, key: &radiata::LabelKey, value: &radiata::LabelValue,
+) -> u64 {
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let revision = own_member_view(node)
+      .await
+      .map(|view| view.owner_revision())
+      .unwrap_or(1);
+    let patch = radiata::NodeMetadataPatch::new()
+      .set_capability(key.clone(), value.clone())
+      .unwrap();
+    let outcome = match node.handle.patch_metadata(revision, patch).await {
+      Ok(task) => task.wait().await,
+      Err(error) => Err(error),
+    };
+    match outcome {
+      Ok(view) => return view.owner_revision(),
+      Err(error)
+        if error.kind() == radiata::ErrorKind::Conflict && std::time::Instant::now() < deadline =>
+      {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(error) => panic!("partition-side metadata bump failed persistently: {error:?}"),
+    }
+  }
+}
+
+/// Drives deterministic anti-entropy rounds on every node until
+/// `observer`'s member view of `writer` carries the exact revision and
+/// label — one offline write reaching its own side of a partition.
+/// Every node syncs every round: the far side's rounds have no cross
+/// session to ride, which is exactly the isolation under test.
+async fn wait_member_view(
+  nodes: &[Node], observer: usize, writer: usize, revision: u64, key: &radiata::LabelKey,
+  value: &radiata::LabelValue, timeout: Duration,
+) {
+  let deadline = std::time::Instant::now() + timeout;
+  loop {
+    for node in nodes {
+      node.handle.sync().await.unwrap();
+    }
+    if let Some(view) = member_view_of(&nodes[observer], &nodes[writer].id).await
+      && view.owner_revision() == revision
+      && view.labels().get(key) == Some(value)
+    {
+      return;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "node {} never observed node {} at revision {revision} with the offline label",
+      nodes[observer].id,
+      nodes[writer].id
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+}
+
+/// The failure matrix over the four-node induced CQ4 cycle. Duplicate
+/// delivery is observed as RAW per-direction session multiplicity
+/// across the whole dial window (see [`max_directional_multiplicity`]
+/// for why the raw surfaces, not the deduplicated edge set, carry the
+/// assertion) plus the replacement generations. The partition is a
+/// TRUE two-component split — both cross edges of the cycle cut in
+/// both directions — with one offline descriptor write per component,
+/// an isolation check that the writes never cross the split, and, after
+/// the harness restores one link, automatic reconciliation of both
+/// sides' member views.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_sync_failure_matrix_partition_healing() {
+  init_tracing();
   let _cluster_gate = cluster_gate().lock().await;
 
-  let nodes = build_cluster(4).await;
+  // The failure-matrix cluster pins two knobs. The sparse-topology
+  // degree target (the documented "one link is enough" shape): the
+  // derived target for four nodes is k(4) = 3, and the degree-maintenance
+  // plane would re-bridge a held two-component split within one 30 s
+  // deficit tick — the pinned target keeps both sides at-target so the
+  // partition below stays down until the harness restores the link, and
+  // the bridge probe's first dial sits one ~5-minute bracket out, well
+  // past this lane's lifetime. Topology shaping stays caller-shaped
+  // exactly as before: every CQ4 edge is dialed explicitly.
+  //
+  // The network task-slot budget: a join or connect dial can hold its
+  // slot for a whole dial deadline (30 s), and this lane's own probe
+  // dials (the duplicate-delivery dial, the partition-restore dial)
+  // ride the same default two-slot channel as the build phase's dials —
+  // a build dial that wedges until its deadline would otherwise queue
+  // the lane's dial behind it for tens of seconds. The lane pins a
+  // budget that can never queue: at most four caller dials per node
+  // exist in this cluster (its join plus two edge dials plus one probe
+  // dial), so eight network slots absorb any residue.
+  let config = NodeConfig::new()
+    .with_connection_degree(1)
+    .with_task_reconcile_slots(2, 8)
+    .unwrap();
+  let nodes = build_cluster_configured(4, config).await;
   wait_trust(&nodes, 4, Duration::from_secs(20)).await;
   // The induced CQ4 graph on {0,1,2,3} is the 4-cycle (0,1),(0,2),(1,3),
   // (2,3); dial those exact edges through the public facade and close the
@@ -917,54 +1173,178 @@ async fn membership_sync_failure_matrix_partition_healing() {
   let expected_4: std::collections::BTreeSet<(u8, u8)> =
     [(0, 1), (0, 2), (1, 3), (2, 3)].into_iter().collect();
   wait_settled(&nodes, &expected_4, Duration::from_secs(15)).await;
+  // Every member holds every descriptor at revision 1 before any
+  // failure is injected, so the partition's isolation baseline is
+  // exact.
+  wait_descriptors(&nodes, 4, 1, Duration::from_secs(30)).await;
 
-  // Duplicate delivery: a second connect to the same peer converges to one
-  // authenticated session (no duplicate edge).
-  let edge = (0_u8, 1_u8);
-  if let Ok(task) = nodes[edge.0 as usize]
-    .handle
-    .connect(
-      nodes[edge.1 as usize].endpoint.clone(),
-      nodes[edge.1 as usize].id.clone(),
-    )
-    .await
-  {
-    let _ = task.wait().await;
+  // === Duplicate delivery ============================================
+  // A second dial to an already-connected peer converges to exactly one
+  // authenticated session: the new dial REPLACES the session
+  // incarnation (the session table is peer-keyed and same-direction
+  // dials install the newest entry, retiring the previous connection),
+  // never a parallel addition. Multiplicity is asserted on the raw
+  // per-direction row counts of both public list surfaces across the
+  // WHOLE dial window — including the in-flight handshake — and the
+  // quiescent end points additionally cross-check the census and the
+  // replacement generations.
+  //
+  // The second dial comes from the pair's DETERMINISTIC OWNER: the
+  // crossed-dial rule keeps the connection initiated by the smaller
+  // node id, and the settled session's initiator is exactly that
+  // owner (its join dial or the harness's edge dial, whichever the
+  // rule kept). A same-direction re-dial from the owner always
+  // replaces the incarnation on both ends; a re-dial from the other
+  // side is refused outright by the ownership rule — also a correct
+  // one-session outcome, but not the replacement path this lane
+  // observes.
+  let pair = if nodes[0].id < nodes[1].id {
+    (0_usize, 1_usize)
+  } else {
+    (1_usize, 0_usize)
+  };
+  // The two ends' baselines are recorded INDEPENDENTLY: the
+  // incarnation identity is each node's own local history for the
+  // peer, and the ends can legitimately sit apart after the build
+  // phase's retried handshakes. The dial's observation below is the
+  // per-end one: a NEW incarnation id landed on EACH end. The
+  // generation is not the proof — an in-place replacement advances it,
+  // but when the previous incarnation's wire dies of its own EOF
+  // before the new one publishes (the drain of the callee-side
+  // replacement retires the dialer's old connection), the fresh entry
+  // restarts at one. Both are the same one-session outcome.
+  let incarnation_before = (
+    session_incarnation(&nodes[pair.0], &nodes[pair.1].id)
+      .await
+      .expect("the dialer holds a live session to its pair peer"),
+    session_incarnation(&nodes[pair.1], &nodes[pair.0].id)
+      .await
+      .expect("the callee holds a live session to its pair peer"),
+  );
+  assert_session_census(&nodes).await;
+
+  // The dial runs as its own task so the sampler keeps reading every
+  // node's raw pages while the handshake is in flight.
+  let dial = tokio::spawn(connect_handle_with_retry(
+    nodes[pair.0].handle.clone(),
+    nodes[pair.0].id.clone(),
+    nodes[pair.1].endpoint.clone(),
+    nodes[pair.1].id.clone(),
+  ));
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let multiplicity = max_directional_multiplicity(&nodes).await;
+    assert!(
+      multiplicity <= 1,
+      "duplicate delivery produced {multiplicity} parallel sessions in one direction"
+    );
+    if dial.is_finished() {
+      let incarnation_after = (
+        session_incarnation(&nodes[pair.0], &nodes[pair.1].id).await,
+        session_incarnation(&nodes[pair.1], &nodes[pair.0].id).await,
+      );
+      let edges: std::collections::BTreeSet<(u8, u8)> =
+        collected_topology(&nodes).await.into_iter().collect();
+      // Each end registered a NEW incarnation (the session id changed;
+      // a retried dial can land more than one), and the topology is
+      // still the exact 4-cycle — one undirected session for the
+      // dialed pair.
+      if edges == expected_4
+        && incarnation_after
+          .0
+          .is_some_and(|(id, _)| id != incarnation_before.0.0)
+        && incarnation_after
+          .1
+          .is_some_and(|(id, _)| id != incarnation_before.1.0)
+      {
+        break;
+      }
+    }
+    if std::time::Instant::now() >= deadline {
+      let edges: std::collections::BTreeSet<(u8, u8)> =
+        collected_topology(&nodes).await.into_iter().collect();
+      let incarnation_now = (
+        session_incarnation(&nodes[pair.0], &nodes[pair.1].id).await,
+        session_incarnation(&nodes[pair.1], &nodes[pair.0].id).await,
+      );
+      let mut dump = String::new();
+      for index in [pair.0, pair.1] {
+        let tasks = nodes[index]
+          .handle
+          .tasks()
+          .list(PageSpec::first(64).unwrap())
+          .await
+          .unwrap();
+        let rows: Vec<String> = tasks
+          .items()
+          .iter()
+          .map(|task| format!("{:?}@{:?}", task.kind(), task.phase()))
+          .collect();
+        dump.push_str(&format!("\n  {}: {rows:?}", nodes[index].id));
+      }
+      panic!(
+        "duplicate delivery never converged to one session; \
+         pair={pair:?} dial_finished={} edges={edges:?} \
+         incarnation_before={incarnation_before:?} incarnation_now={incarnation_now:?}; \
+         task tables:{dump}",
+        dial.is_finished()
+      );
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
+  dial.await.unwrap();
+  // Converged to exactly one session for the dialed pair: the topology
+  // is still the exact 4-cycle (one undirected session for the pair),
+  // each end holds a new incarnation of the pair's session (the
+  // replacement landed on both ends), and the quiescent census still
+  // agrees.
+  assert_session_census(&nodes).await;
+
+  // === A true two-component partition =================================
+  // The cycle splits into components {0,1} and {2,3} by cutting BOTH
+  // cross edges — (0,2) and (1,3) — in both directions. One direction's
+  // disconnect alone leaves the far side's session to die on its
+  // liveness deadline; cutting both directions severs the components
+  // deterministically.
+  for (left, right) in [(0_usize, 2_usize), (1, 3)] {
+    nodes[left]
+      .handle
+      .disconnect(nodes[right].id.clone())
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
+    nodes[right]
+      .handle
+      .disconnect(nodes[left].id.clone())
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
+  }
+  // The split settles to exactly the two intra-component edges: a real
+  // component split, not a single edge loss on a connected graph.
+  let expected_split: std::collections::BTreeSet<(u8, u8)> = [(0, 1), (2, 3)].into_iter().collect();
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   loop {
-    let edges = collected_topology(&nodes).await;
-    let duplicates = edges
-      .iter()
-      .filter(|(left, right)| *left == edge.0 && *right == edge.1)
-      .count();
-    if duplicates == 1 {
+    let edges: std::collections::BTreeSet<(u8, u8)> =
+      collected_topology(&nodes).await.into_iter().collect();
+    if edges == expected_split {
       break;
     }
     assert!(
-      duplicates == 0,
-      "duplicate delivery produced {duplicates} parallel sessions"
-    );
-    assert!(
       std::time::Instant::now() < deadline,
-      "duplicate delivery never converged to one session"
+      "the components never split apart: observed {edges:?}"
     );
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
   }
-
-  // Partition healing under the "any one route" contract: the receiving
-  // side drops the (0,1) edge — a real edge loss on a node that still
-  // holds another authenticated path — so recovery stays connected
-  // WITHOUT re-dialing the lost edge (a connected node never expands its
-  // topology), and the data plane's routed relay covers the missing edge
-  // for node pairs whose direct session is gone.
-  if let Ok(task) = nodes[1].handle.disconnect(nodes[0].id.clone()).await {
-    let _ = task.wait().await;
-  }
-  let deadline = std::time::Instant::now() + Duration::from_secs(60);
-  let mut connected = false;
-  while std::time::Instant::now() < deadline {
-    let view = nodes[1]
+  // The "any one route" contract holds on both sides of the split:
+  // each node keeps its intra-component path, so recovery observes a
+  // connected state and never expands the topology.
+  for node in &nodes {
+    let view = node
       .handle
       .start_recovery()
       .await
@@ -972,21 +1352,172 @@ async fn membership_sync_failure_matrix_partition_healing() {
       .wait()
       .await
       .unwrap();
-    if view.is_connected() {
-      connected = true;
-      break;
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+      view.is_connected(),
+      "recovery must stay connected while any one route exists"
+    );
   }
-  assert!(
-    connected,
-    "recovery stays connected while any one route exists"
+
+  // Offline writes, one per component: each side bumps its own
+  // descriptor with a side-distinguishing capability label.
+  let partition_label = radiata::LabelKey::parse("example.org/labels/partition-side").unwrap();
+  let side_a = radiata::LabelValue::parse("component-0-1").unwrap();
+  let side_b = radiata::LabelValue::parse("component-2-3").unwrap();
+  let revision_0 = bump_descriptor_label(&nodes[0], &partition_label, &side_a).await;
+  let revision_2 = bump_descriptor_label(&nodes[2], &partition_label, &side_b).await;
+  assert_eq!(
+    revision_0, 2,
+    "node 0's offline write bumps revision 1 to exactly 2"
+  );
+  assert_eq!(
+    revision_2, 2,
+    "node 2's offline write bumps revision 1 to exactly 2"
   );
 
-  // Every node keeps at least one live authenticated path: the lost
-  // edge's endpoints still reach each other through the routed relay.
-  wait_connected(&nodes, 1, 3, Duration::from_secs(45)).await;
-  wait_connected(&nodes, 0, 2, Duration::from_secs(45)).await;
+  // Each side's write reaches its own component peer (every node ran
+  // deterministic sync rounds — the far side's rounds had no cross
+  // session to ride).
+  wait_member_view(
+    &nodes,
+    1,
+    0,
+    revision_0,
+    &partition_label,
+    &side_a,
+    Duration::from_secs(15),
+  )
+  .await;
+  wait_member_view(
+    &nodes,
+    3,
+    2,
+    revision_2,
+    &partition_label,
+    &side_b,
+    Duration::from_secs(15),
+  )
+  .await;
+
+  // Isolation: the far side's views stay frozen at the pre-split
+  // revision with no offline label, and the topology is still exactly
+  // the two components — no edge and no write crossed the split.
+  let frozen_0 = member_view_of(&nodes[3], &nodes[0].id)
+    .await
+    .expect("node 3 holds node 0's descriptor from the pre-split baseline");
+  assert_eq!(
+    frozen_0.owner_revision(),
+    revision_0 - 1,
+    "node 0's offline write crossed the partition to node 3"
+  );
+  assert!(
+    frozen_0.labels().get(&partition_label).is_none(),
+    "node 0's offline label crossed the partition to node 3"
+  );
+  let frozen_2 = member_view_of(&nodes[1], &nodes[2].id)
+    .await
+    .expect("node 1 holds node 2's descriptor from the pre-split baseline");
+  assert_eq!(
+    frozen_2.owner_revision(),
+    revision_2 - 1,
+    "node 2's offline write crossed the partition to node 1"
+  );
+  assert!(
+    frozen_2.labels().get(&partition_label).is_none(),
+    "node 2's offline label crossed the partition to node 1"
+  );
+  let edges: std::collections::BTreeSet<(u8, u8)> =
+    collected_topology(&nodes).await.into_iter().collect();
+  assert_eq!(
+    edges, expected_split,
+    "an edge crossed the partition while it was held"
+  );
+
+  // === Link restoration and automatic reconciliation ==================
+  // The harness restores ONE cross link (there is no un-cut verb; a
+  // dial is the operator's restore). The authenticated session
+  // re-establishes over it automatically, and ordinary anti-entropy
+  // then reconciles both sides with no further operator action: every
+  // node observes BOTH components' offline writes with identical
+  // labels and descriptor digests — the two sides' member views agree.
+  connect_with_retry(&nodes[0], nodes[2].endpoint.clone(), nodes[2].id.clone()).await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(45);
+  loop {
+    // One deterministic anti-entropy round per node; the reconciliation
+    // work itself is the system's own.
+    for node in &nodes {
+      node.handle.sync().await.unwrap();
+    }
+    let mut digests: Vec<radiata::Digest> = Vec::new();
+    let mut reconciled = true;
+    for node in &nodes {
+      let view_0 = member_view_of(node, &nodes[0].id).await;
+      let view_2 = member_view_of(node, &nodes[2].id).await;
+      match (view_0, view_2) {
+        (Some(view_0), Some(view_2))
+          if view_0.owner_revision() == revision_0
+            && view_0.labels().get(&partition_label) == Some(&side_a)
+            && view_2.owner_revision() == revision_2
+            && view_2.labels().get(&partition_label) == Some(&side_b) =>
+        {
+          digests.push(view_0.digest().clone());
+          digests.push(view_2.digest().clone());
+        }
+        _ => {
+          reconciled = false;
+          break;
+        }
+      }
+    }
+    if reconciled {
+      // Snapshot agreement across the formerly split sides: every
+      // node's view of each offline writer carries the identical
+      // descriptor digest.
+      assert!(
+        digests
+          .iter()
+          .step_by(2)
+          .all(|digest| *digest == digests[0]),
+        "views disagree on node 0's descriptor digest after healing"
+      );
+      assert!(
+        digests
+          .iter()
+          .skip(1)
+          .step_by(2)
+          .all(|digest| *digest == digests[1]),
+        "views disagree on node 2's descriptor digest after healing"
+      );
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the restored link never reconciled both sides' offline writes"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+
+  // The healed topology is ONE component again: the restored (0,2)
+  // bridge plus the two intra-component edges — the exact three-edge
+  // path 1-0-2-3. The cut (1,3) edge stays down per the any-one-route
+  // contract: no dial plane re-dials a connected node's lost edge at
+  // the pinned degree target, and the data plane's routed relay covers
+  // pairs whose direct session is gone.
+  let expected_healed: std::collections::BTreeSet<(u8, u8)> =
+    [(0, 1), (2, 3), (0, 2)].into_iter().collect();
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let edges: std::collections::BTreeSet<(u8, u8)> =
+      collected_topology(&nodes).await.into_iter().collect();
+    if edges == expected_healed {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the restored link never healed the topology into one component: observed {edges:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+
   for node in nodes {
     node.handle.shutdown().await.unwrap();
   }
