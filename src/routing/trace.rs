@@ -1965,8 +1965,9 @@ impl TraceSink {
     &self.live_records
   }
 
-  /// The terminal records dropped so far because the persistence queue
-  /// was full; the observability snapshot surfaces this aggregate.
+  /// The terminal records dropped so far: the persistence queue was
+  /// full, or the node's identity context tore down before the detached
+  /// task ran; the observability snapshot surfaces this aggregate.
   pub(crate) fn dropped(&self) -> usize {
     self.dropped.load(std::sync::atomic::Ordering::Relaxed)
   }
