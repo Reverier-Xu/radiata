@@ -817,6 +817,20 @@ fn planned_namespace(value: &str) -> Result<StoreNamespace> {
   Ok(StoreNamespace::new(QualifiedTag::parse(value)?))
 }
 
+// ---- frozen golden vectors (byte-frozen, do not edit) ----
+
+// The frozen `0.1.0` compatibility golden of the pending-transaction
+// record, single-sourced here for the compatibility manifest
+// (`crate::compatibility`): the same journal shape as the owner golden
+// pinned by this module's test suite, but its third planned operation
+// carries a cluster-genesis delete precondition instead of the
+// merge-grant one. It compiles only under `cfg(test)`, like the
+// test-only compatibility manifest itself. The bytes are frozen;
+// changing them is a deliberate compatibility amendment, never a
+// silent edit.
+#[cfg(test)]
+pub(crate) const PENDING_RECORD_COMPAT_GOLDEN: &str = "867831726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f70656e64696e672d7472616e73616374696f6e016e6c6f63616c2d6964656e74697479781974786e2d303132333435363738396162636465666768696a6b4101848400782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f6c6f63616c2d6964656e746974794473656c6681008501782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f6c6f63616c2d6964656e746974794762696e64696e67820158200b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b4c7265636f72642d62797465738402782e726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f636c75737465722d67656e65736973436f6c6458200c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c8303781974786e2d31313131313131313131313131313131313131313158200d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d";
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1159,10 +1173,7 @@ mod tests {
   #[test]
   fn identity_records_pending_namespace_and_singleton_key_are_exact() {
     let namespace = pending_namespace().unwrap();
-    assert_eq!(
-      namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/pending-transaction"
-    );
+    assert_eq!(namespace.as_str(), PENDING_NAMESPACE);
     assert_eq!(
       QualifiedTag::parse(namespace.as_str()).unwrap().category(),
       "metadata"

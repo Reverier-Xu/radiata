@@ -1139,6 +1139,30 @@ impl MergeGrantV1 {
   }
 }
 
+// ---- frozen golden vectors (byte-frozen, do not edit) ----
+
+// The hex literals below are the single source of the frozen identity
+// record vectors: the golden suite in this module pins constructors and
+// decoders to these bytes, and the `0.1.0` compatibility manifest
+// (`crate::compatibility`) references the same constants, so the two
+// suites cannot drift apart. They compile only under `cfg(test)`, like
+// the test-only compatibility manifest itself. The bytes are frozen;
+// changing one is a deliberate compatibility amendment, never a silent
+// edit.
+
+#[cfg(test)]
+pub(crate) const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6c6f63616c2d6964656e7469747901781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
+#[cfg(test)]
+pub(crate) const KEY_CREATION_INTENT_GOLDEN: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6b65792d6372656174696f6e2d696e74656e7401781b6b65796f702d353030303030303030303030303030303030303030781a6e6f64652d3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e2d3630303030303030303030303030303030303030304107";
+#[cfg(test)]
+pub(crate) const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6964656e746974792d62696e64696e6701781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139";
+#[cfg(test)]
+pub(crate) const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f63726564656e7469616c2d75736501781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+#[cfg(test)]
+pub(crate) const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d657267652d6772616e740150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840ec05240b0a1a205f4e52e9ef3d4bf18aed07f901110c65f564b40f4672df7afd13e961eafd674ad47c86d93ef086daa568745b6adca6a8ee7b8c6af93428fe0a";
+#[cfg(test)]
+pub(crate) const KEY_DELETED_GOLDEN: &str = "847829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6b65792d64656c6574656401781b6b65796f702d6161616161616161616161616161616161616161615270726f76696465722d68616e646c652d3031";
+
 #[cfg(test)]
 mod tests {
   use std::{collections::VecDeque, sync::Mutex};
@@ -1257,11 +1281,9 @@ mod tests {
     crate::hex::decode(hex, "golden").unwrap()
   }
 
-  const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6c6f63616c2d6964656e7469747901781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
-  const KEY_CREATION_INTENT_GOLDEN: &str = "887831726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6b65792d6372656174696f6e2d696e74656e7401781b6b65796f702d353030303030303030303030303030303030303030781a6e6f64652d3130303030303030303030303030303030303030306d6e6f64652d6964656e746974797821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781974786e2d3630303030303030303030303030303030303030304107";
-  const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6964656e746974792d62696e64696e6701781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139";
-  const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f63726564656e7469616c2d75736501781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
-  const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d657267652d6772616e740150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840ec05240b0a1a205f4e52e9ef3d4bf18aed07f901110c65f564b40f4672df7afd13e961eafd674ad47c86d93ef086daa568745b6adca6a8ee7b8c6af93428fe0a";
+  // The signed-body sub-vector of the frozen `MERGE_GRANT_GOLDEN`
+  // above; the record golden bytes themselves are those frozen
+  // owner-module constants, so this is the only test-local golden.
   const MERGE_GRANT_BODY_GOLDEN: &str = "877829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d657267652d6772616e740150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 
   #[test]
@@ -1682,42 +1704,27 @@ mod tests {
   #[test]
   fn identity_records_storage_key_bytes_are_exact() {
     let (identity_namespace, identity_key) = local_identity_key().unwrap();
-    assert_eq!(
-      identity_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/local-identity"
-    );
+    assert_eq!(identity_namespace.as_str(), LOCAL_IDENTITY_NAMESPACE);
     assert_eq!(identity_key.as_bytes(), b"self");
 
     let (intent_namespace, intent_key) = key_creation_intent_key(&operation()).unwrap();
-    assert_eq!(
-      intent_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/key-creation-intent"
-    );
+    assert_eq!(intent_namespace.as_str(), KEY_CREATION_INTENT_NAMESPACE);
     assert_eq!(intent_key.as_bytes(), OPERATION.as_bytes());
 
     let (binding_namespace, binding_key) = identity_binding_key(&node(SUBJECT_NODE)).unwrap();
-    assert_eq!(
-      binding_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/identity-binding"
-    );
+    assert_eq!(binding_namespace.as_str(), IDENTITY_BINDING_NAMESPACE);
     assert_eq!(binding_key.as_bytes(), SUBJECT_NODE.as_bytes());
 
     let (use_namespace, use_key) =
       credential_use_key(&node(ISSUER_NODE), &generation(), &node(SUBJECT_NODE)).unwrap();
-    assert_eq!(
-      use_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/credential-use"
-    );
+    assert_eq!(use_namespace.as_str(), CREDENTIAL_USE_NAMESPACE);
     let mut expected_use_key = ISSUER_NODE.as_bytes().to_vec();
     expected_use_key.extend_from_slice(&GENERATION_BYTES);
     expected_use_key.extend_from_slice(SUBJECT_NODE.as_bytes());
     assert_eq!(use_key.as_bytes(), expected_use_key.as_slice());
 
     let (grant_namespace, grant_key) = merge_grant_key(&merge()).unwrap();
-    assert_eq!(
-      grant_namespace.as_str(),
-      "radiata.woooo.tech/metadata/v1/merge-grant"
-    );
+    assert_eq!(grant_namespace.as_str(), MERGE_GRANT_NAMESPACE);
     assert_eq!(grant_key.as_bytes(), &ADMISSION_BYTES);
   }
 

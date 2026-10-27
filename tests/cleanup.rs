@@ -19,10 +19,6 @@ use common::{MemoryStorageFactory, ScriptedKeys};
 
 const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The cleanup-checkpoint family's durable namespace: the rejection test
-/// asserts the refused issue left no epoch record behind.
-const CHECKPOINT_NAMESPACE_TAG: &str = "radiata.woooo.tech/metadata/v1/cleanup-checkpoint";
-
 struct Node {
   handle: NodeHandle,
   endpoint: Endpoint,
@@ -536,8 +532,9 @@ async fn checkpoint_refuses_an_unreachable_member_without_writing_an_epoch() {
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::NotReady);
 
-  // No epoch record may exist behind the refusal.
-  let checkpoint_namespace = common::namespace(CHECKPOINT_NAMESPACE_TAG);
+  // No epoch record may exist behind the refusal: the cleanup-checkpoint
+  // tag comes from the integration-side catalog mirror in `common`.
+  let checkpoint_namespace = common::namespace(common::CHECKPOINT_NAMESPACE);
   assert!(
     issuer
       .factory

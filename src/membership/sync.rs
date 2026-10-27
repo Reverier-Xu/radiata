@@ -452,9 +452,10 @@ async fn apply_cleanup_record(
 /// refused at its final publication (its recovery dials race the
 /// propagation, so a session admitted before this tombstone landed must
 /// not linger either). Session retirement is independent of the
-/// evidence verdict; the revocation event fires only for a first
-/// revocation, never for a canonical evidence replacement or an
-/// unchanged replay.
+/// evidence verdict; the paired session-and-revocation notification
+/// (the same pair, in the same order, the local revoke effect emits)
+/// fires only for a first revocation, never for a canonical evidence
+/// replacement or an unchanged replay.
 #[allow(clippy::too_many_arguments)]
 async fn apply_revocation_record(
   store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
@@ -484,7 +485,12 @@ async fn apply_revocation_record(
   revoked.record(record.subject());
   crate::session::stream::retire_session(sessions, record.subject())?;
   drop(revoked);
+  // The paired notification the local revoke effect emits: the
+  // retirement above removed the session-table entry, so the session
+  // task's own exit path cannot report the change — this lane reports
+  // it, SessionChanged first, then NodeRevoked (audit 2026-10-27, B1).
   if transition.changed_authorization() {
+    events.emit(crate::SessionChanged::new(record.subject().clone()));
     events.emit(crate::NodeRevoked::new(record.subject().clone()));
   }
   Ok(())
@@ -1670,11 +1676,17 @@ mod tests {
 
   /// Drains one subscription's currently available events.
   fn event_count<E: crate::Event>(subscription: &mut crate::EventSubscription<E>) -> usize {
-    let mut count = 0;
+    drained_events(subscription).len()
+  }
+
+  /// Drains one subscription's currently available events, keeping the
+  /// items so payload parity can be pinned alongside the counts.
+  fn drained_events<E: crate::Event>(subscription: &mut crate::EventSubscription<E>) -> Vec<E> {
+    let mut drained = Vec::new();
     loop {
       match subscription.try_recv().unwrap() {
-        crate::EventReceive::Item(_) => count += 1,
-        crate::EventReceive::Empty | crate::EventReceive::Closed => return count,
+        crate::EventReceive::Item(item) => drained.push(item),
+        crate::EventReceive::Empty | crate::EventReceive::Closed => return drained,
         crate::EventReceive::Lagged { .. } => panic!("test subscription lagged"),
       }
     }
@@ -1688,6 +1700,17 @@ mod tests {
   /// over an already-revoked binding fires no second revocation. Session
   /// retirement stays independent of the evidence verdict: an
   /// already-revoked identity's live session still retires.
+  ///
+  /// Regression (audit 2026-10-27, B1): a revocation that changes
+  /// authorization through the sync lane reports the session change too
+  /// — one `SessionChanged` pairing with the one `NodeRevoked`, both for
+  /// the revoked subject, in the same branch — exactly the pair the local
+  /// revoke effect emits. The per-type subscriptions of the hub expose
+  /// counts and payloads, not a cross-type total order (the documented
+  /// parity contract of `tests/event_parity.rs`); the emission order is
+  /// pinned by the source mirroring the local path. Neither event fires
+  /// on the replay, the cleanup replacement, or the evidence-only
+  /// revocation replacement, even when a live session retires there.
   #[tokio::test]
   async fn replayed_tombstone_rows_notify_only_real_transitions() {
     use ed25519_dalek::Signer as _;
@@ -1777,9 +1800,11 @@ mod tests {
     let authorization = crate::session::stream::AuthorizationBoundary::default();
     let mut revoked_events = events.subscribe::<crate::NodeRevoked>(crate::EventOptions::new());
     let mut member_events = events.subscribe::<crate::MemberChanged>(crate::EventOptions::new());
+    let mut session_events = events.subscribe::<crate::SessionChanged>(crate::EventOptions::new());
 
-    // The first delivery is the real transition: one revocation event and
-    // one member revision for the cleanup install.
+    // The first delivery is the real transition: one revocation event,
+    // one paired session event (B1 parity with the local revoke path),
+    // and one member revision for the cleanup install.
     let first_rows = vec![
       row(3, &subject, loser.encode().unwrap()),
       row(2, &subject, cleanup(9_000).encode().unwrap()),
@@ -1797,7 +1822,12 @@ mod tests {
     )
     .await
     .unwrap();
-    assert_eq!(event_count(&mut revoked_events), 1);
+    let revoked_seen = drained_events(&mut revoked_events);
+    assert_eq!(revoked_seen.len(), 1);
+    assert_eq!(revoked_seen[0].subject(), &subject);
+    let session_seen = drained_events(&mut session_events);
+    assert_eq!(session_seen.len(), 1);
+    assert_eq!(session_seen[0].peer(), &subject);
     assert_eq!(event_count(&mut member_events), 1);
     assert_eq!(*revision_rx.borrow(), 1);
 
@@ -1816,6 +1846,7 @@ mod tests {
     .await
     .unwrap();
     assert_eq!(event_count(&mut revoked_events), 0);
+    assert_eq!(event_count(&mut session_events), 0);
     assert_eq!(event_count(&mut member_events), 0);
     assert_eq!(*revision_rx.borrow(), 1);
 
@@ -1835,6 +1866,8 @@ mod tests {
     )
     .await
     .unwrap();
+    assert_eq!(event_count(&mut revoked_events), 0);
+    assert_eq!(event_count(&mut session_events), 0);
     assert_eq!(event_count(&mut member_events), 1);
     assert_eq!(*revision_rx.borrow(), 2);
 
@@ -1857,6 +1890,7 @@ mod tests {
     .await
     .unwrap();
     assert_eq!(event_count(&mut revoked_events), 0);
+    assert_eq!(event_count(&mut session_events), 0);
     assert!(
       sessions.lock().unwrap().get(&subject).is_none(),
       "a revoked identity's session retires even when only the evidence changed"

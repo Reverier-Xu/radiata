@@ -321,6 +321,11 @@ mod tests {
         )
       })
       .collect();
+    let (first, middle, last) = (
+      bindings[0].clone(),
+      bindings[1_000].clone(),
+      bindings[1_999].clone(),
+    );
     let (issuer, issuer_key) = issuer_pair(1);
     let snapshot = TrustSnapshotV1::new(7, 1, issuer, issuer_key, bindings);
 
@@ -335,6 +340,17 @@ mod tests {
       bytes.len() <= super::TRUST_SNAPSHOT_STORE_LIMITS.max_body_len(),
       "the record must stay inside the dedicated store budget"
     );
+    // The round trip itself: decoding under the same store budget reads
+    // back the exact snapshot.
+    let decoded = TrustSnapshotV1::decode_store(&bytes).unwrap();
+    assert_eq!(decoded, snapshot);
+    // Count and order spot checks keep a regression legible without a
+    // 2,000-item diff: the canonical node-text order is the zero-padded
+    // index order, pinned at both ends and the middle.
+    assert_eq!(decoded.bindings().len(), 2_000);
+    assert_eq!(decoded.bindings()[0], first);
+    assert_eq!(decoded.bindings()[1_000], middle);
+    assert_eq!(decoded.bindings()[1_999], last);
   }
 
   #[test]
