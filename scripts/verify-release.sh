@@ -24,11 +24,18 @@
 # CI matrix; only the tool-dependent and long-running lanes stay explicit
 # here.
 #
-# The SLO evidence is operator-run outside this launcher: the in-process
-# lanes (tests/membership_sync.rs sixteen-node SLO and trend,
+# The SLO evidence is operator-run outside this launcher, and a green CI
+# run (this launcher's quality-gates stage included) is functional
+# evidence only — no CI workflow sets the strict profile flag. The
+# in-process lanes (tests/membership_sync.rs sixteen-node SLO and trend,
 # sync_scale_benchmark, soak) plus the examples e2e
 # (examples/cluster/test_slo.py, examples/chat/test_chat.py) measure and
-# assert the deadlines against a real deployment.
+# assert the deadlines against a real deployment. The strict 10,000 ms
+# bound is quantified on the exact 16-node OCI profile (dedicated
+# 0.5-CPU node containers on a 12+-CPU host) and is asserted only when
+# the operator exports the flag against that profile:
+#   RADIATA_SLO_PROFILE_STRICT=1 \
+#     cargo test --locked --all-features --test membership_sync -- slo
 #
 # The release-grade soak (24h) is an operator decision beyond this
 # launcher:

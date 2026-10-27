@@ -180,7 +180,11 @@ rendering with `cargo-public-api`. Only tool-dependent and long-running
 lanes stay as scripts: `scripts/verify-soak.sh`,
 `scripts/verify-evidence-validator.sh`, `scripts/verify-decoder-fuzz.sh`,
 `scripts/verify-state-fuzz.sh`, `scripts/verify-simulation-artifacts.sh`, and
-the `scripts/verify-release.sh` launcher. The `unsafe` keyword is forbidden
+the `scripts/verify-release.sh` launcher. Convergence-timing SLO evidence is
+operator-run on top of those gates — a green CI run is functional evidence,
+not deadline evidence; the note in `scripts/verify-release.sh` records the
+strict-profile command (`RADIATA_SLO_PROFILE_STRICT=1`) and the 16-node OCI
+profile the bound was quantified on. The `unsafe` keyword is forbidden
 crate-wide, and production code denies `unwrap()`/`expect()` and ad-hoc
 console output through the `tracing` facade.
 
