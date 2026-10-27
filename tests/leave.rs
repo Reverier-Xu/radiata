@@ -642,6 +642,14 @@ async fn redb_leave_restart_shows_only_the_replacement() {
 /// the node dials its known members without operator action (finding
 /// #4). No listener is opened on the restarted node — the healing is
 /// entirely its own outbound dial.
+/// Past the reconnect, the lane is the runtime recovery-evidence
+/// channel (audit A8; evidence class `E2e` in the test-support
+/// `ProducerKind` taxonomy — real nodes, real TLS transport, and a
+/// durable reopen — distinct from the `src/simulation` model's
+/// Simulation-classified evidence): both ends' public views converge
+/// back to reciprocal trust, one descriptor digest per member, and the
+/// restarted member observed as `Active` and `Connected`, never a
+/// leave.
 /// The json adapter refuses os-crash-durable requirements on non-unix
 /// platforms by design (no directory-barrier evidence), so the json
 /// variant of the restart probe is unix-only; windows is covered by the
@@ -784,8 +792,93 @@ async fn restarted_node_passively_reconnects(
     tokio::time::sleep(Duration::from_millis(200)).await;
   }
 
+  // Metadata convergence after the reopen: the recovery-seeded session
+  // plus the deterministic anti-entropy rounds must restore BOTH ends'
+  // public views of the two-member cluster. The restarted end's views
+  // read the reopened durable store, so the agreement is the
+  // disk-reopen proof for the metadata plane, complementing the
+  // identity-resumption and reconnect proofs above.
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    restarted.sync().await.unwrap();
+    peer.sync().await.unwrap();
+    if restart_views_agree(&restarted, &peer, &node_id, &peer_id).await {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the restarted node's membership never converged after the reopen"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+
   restarted.shutdown().await.unwrap();
   peer.shutdown().await.unwrap();
+}
+
+/// Whether both ends' public views of the two-member cluster agree
+/// after the reopen: for each member, the two trust pages name one
+/// NodeId-to-key binding and the two member views carry the identical
+/// descriptor digest; the peer additionally observes the restarted
+/// member as `Active` (an unannounced outage is not a leave) and
+/// `Connected` (the recovery-seeded session is live in its metadata
+/// plane).
+#[cfg(any(feature = "json", feature = "redb"))]
+async fn restart_views_agree(
+  restarted: &NodeHandle, peer: &NodeHandle, restarted_id: &radiata::NodeId,
+  peer_id: &radiata::NodeId,
+) -> bool {
+  for target in [restarted_id, peer_id] {
+    let Some(restarted_trust) = trust_view_of(restarted, target).await else {
+      return false;
+    };
+    let Some(peer_trust) = trust_view_of(peer, target).await else {
+      return false;
+    };
+    if restarted_trust.public_key() != peer_trust.public_key() {
+      return false;
+    }
+    let Some(restarted_member) = member_view_of(restarted, target).await else {
+      return false;
+    };
+    let Some(peer_member) = member_view_of(peer, target).await else {
+      return false;
+    };
+    if restarted_member.digest() != peer_member.digest() {
+      return false;
+    }
+    if target == restarted_id
+      && (peer_member.status() != radiata::MemberStatus::Active
+        || peer_member.connectivity() != radiata::ConnectivityStatus::Connected)
+    {
+      return false;
+    }
+  }
+  true
+}
+
+/// One end's trust binding for `target`, if its trust page holds it.
+#[cfg(any(feature = "json", feature = "redb"))]
+async fn trust_view_of(
+  handle: &NodeHandle, target: &radiata::NodeId,
+) -> Option<radiata::TrustedIdentityView> {
+  handle
+    .trust()
+    .list(PageSpec::first(8).unwrap())
+    .await
+    .unwrap()
+    .items()
+    .iter()
+    .find(|view| view.node_id() == target)
+    .cloned()
+}
+
+/// One end's member view of `target`, if its reopened store holds it.
+#[cfg(any(feature = "json", feature = "redb"))]
+async fn member_view_of(
+  handle: &NodeHandle, target: &radiata::NodeId,
+) -> Option<radiata::MemberView> {
+  handle.members().get(target.clone()).await.unwrap()
 }
 
 #[cfg(any(feature = "json", feature = "redb"))]
