@@ -435,7 +435,9 @@ mod tests {
 
   /// Duplicate, reordered, and changing
   /// pages converge to one stable winner set; a second completed pass
-  /// transfers no authoritative changes.
+  /// installs no authoritative change while re-transferring the full
+  /// winner pages byte-for-byte (the emit side pages its whole catalog
+  /// with no receiver knowledge — the test measures those bytes).
   #[tokio::test]
   async fn permuted_pages_converge_to_one_winner_set() {
     let (_source_factory, source) = open_store().await;
@@ -511,8 +513,15 @@ mod tests {
       assert_eq!(got_b, expected);
     }
 
-    // A second completed pass transfers no authoritative changes.
+    // A second completed pass installs no authoritative change — but the
+    // emit side pages its whole catalog with no knowledge of the
+    // receiver, so "zero install" is not "zero transfer": measure the
+    // bytes the pass actually re-sends and pin the real cost shape.
+    let first_pass_bytes: usize = pages.iter().map(|page| page.encode().unwrap().len()).sum();
     let mut applied_second_pass = 0;
+    let mut second_pass_bytes = 0;
+    let mut second_pass_records = 0;
+    let mut second_pass_pages = 0;
     let mut cursor: Option<Vec<u8>> = None;
     loop {
       let page = sync::emit_page_ctx(&source, cursor.as_deref(), 2)
@@ -520,6 +529,9 @@ mod tests {
         .unwrap();
       let done = page.cursor().is_none();
       cursor = page.cursor().map(|value| value.to_vec());
+      second_pass_bytes += page.encode().unwrap().len();
+      second_pass_records += page.records().len();
+      second_pass_pages += 1;
       applied_second_pass += sync::apply_page_ctx(&store_a, &SystemEntropy, &page)
         .await
         .unwrap();
@@ -527,7 +539,20 @@ mod tests {
         break;
       }
     }
-    assert_eq!(applied_second_pass, 0);
+    assert_eq!(applied_second_pass, 0, "a changeless pass installs nothing");
+    assert_eq!(
+      second_pass_records, 3,
+      "a changeless pass re-sends the full winner set"
+    );
+    assert_eq!(
+      second_pass_pages,
+      pages.len(),
+      "a changeless pass pages the catalog identically"
+    );
+    assert_eq!(
+      second_pass_bytes, first_pass_bytes,
+      "a changeless pass re-transfers the full pages byte-for-byte — zero install is not zero transfer"
+    );
   }
 
   async fn read_current(store: &MetadataStore, name: &ResourceName) -> Option<ResourceRecordV1> {

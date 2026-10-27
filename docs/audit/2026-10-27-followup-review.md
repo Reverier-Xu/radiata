@@ -23,13 +23,10 @@
 
 ### A. 测试/证据强化（暂缓类）
 
-Wave 1 已落地的条目移至文末"已修复记录"。
+Wave 1/2 已落地的条目移至文末"已修复记录"。
 
 | # | 条目 | verdict | 关键证据（当前代码） | 处置 |
 | --- | --- | --- | --- | --- |
-| A3 | 握手重放测试 | still-open | `src/protocol/handshake.rs:1685-1689` 靠位置序号 OutOfOrder 在签名工作之前拒绝；exporter/nonce 绑定的签名层防御从未被执行 | Wave 2：推进到合法 proof 位置再投重放材料 |
-| A5 | 分区/重复断言 | still-open | `tests/membership_sync.rs:675-703` 先 dedup 后计数（"N 条并行会话"断言为死代码）；partition 用例只断一条边，`wait_connected` 测的是从未断开的既有边 | Wave 2：dedup 前观测多重性 + 真分量 split |
-| A6 | 零传输证明 | still-open | `src/resource/page.rs:516-536` 只断言零安装，页面仍全量 emit，无字节/分配测量；`e2e.rs` 同 | Wave 2：emit 侧字节计数 |
 | A8 | 仿真≠运行时 | partial | 模型本质不变（`network.rs` 字节记账/boot epoch）；证据已经 `ProducerKind::Simulation`（`test-support/src/lib.rs:364-372`）显式分类 | Wave 3：runtime 恢复证据通道（建设项） |
 | A9 | 参考 oracle 不独立 | still-open | `src/storage/contract/reference.rs:160,300` 直接调用生产共享的 `classify_receipt`/`commit_precheck`（`src/provider.rs:968,1012`），语义漂移时 oracle 与生产同步变化 | Wave 3：独立化判定语义或加变异测试 |
 | A10 | 严格 SLO 无 CI 强制 | still-open | `RADIATA_SLO_PROFILE_STRICT` 在 `.github/workflows/` 出现 0 次；`scripts/verify-release.sh:27-31` 自认 operator-run | Wave 3：**收紧文档措辞**（维护者裁决） |
@@ -52,23 +49,16 @@ Wave 1 已落地的条目移至文末"已修复记录"。
 
 ## 后续工作波次
 
-**Wave 1（已完成，2026-10-27）**：见文末"已修复记录"。
-
-**Wave 2（测试场景重建）**
-
-1. A3：重放测试推进到合法 proof 位置，断言签名/transcript 层失败。
-2. A5：dedup 前观测会话多重性；构造真分量 split + 离线写入 + 自动重连 +
-   快照一致断言。
-3. A6：emit 侧统计页面字节数，把"零传输"从"零安装"升级为可测量断言。
+**Wave 1（已完成，2026-10-27）**与 **Wave 2（已完成，2026-10-27）**：见文末"已修复记录"。
 
 **Wave 3（决策已落定后的工程项）**
 
-4. A8：runtime 恢复证据通道（真实节点 + 受控传输 + 持久化重开）。
-5. A9：oracle 判定语义独立化或变异测试。
-6. A10：文档收紧——明确常规绿 CI 不构成 SLO 证据，SLO 为 operator-run。
-7. B2：`MemberSpkiTable` 上界接入 `NodeConfig`。
-8. B3：redb 锁释放竞态根治 + 跨文件集群并行度治理。
-9. B4：`ADMISSION_CONCURRENCY` 与其他容量旋钮联合调参。
+1. A8：runtime 恢复证据通道（真实节点 + 受控传输 + 持久化重开）。
+2. A9：oracle 判定语义独立化或变异测试。
+3. A10：文档收紧——明确常规绿 CI 不构成 SLO 证据，SLO 为 operator-run。
+4. B2：`MemberSpkiTable` 上界接入 `NodeConfig`。
+5. B3：redb 锁释放竞态根治 + 跨文件集群并行度治理。
+6. B4：`ADMISSION_CONCURRENCY` 与其他容量旋钮联合调参。
 
 每项遵循"一个逻辑改动一个 commit + 全量质量门"；行为改动须附表达可观测
 失败的回归测试。
@@ -87,3 +77,13 @@ Wave 1 已落地的条目移至文末"已修复记录"。
 | A7 预算矩阵注释 | `1bcd284` | 注释精确化为实际 6/9 cell，注明未覆盖形态与时长取舍 |
 | B1 SessionChanged 奇偶性 | `ebb9a9c` | sync 吊销路径补发 `SessionChanged`（先 SessionChanged 后 NodeRevoked，镜像本地路径）；回归测试经变异验证 |
 | C1 投递契约文档化 | `d035c81` | guide 路由章节 + `derive_return_stream_with_hops` rustdoc：尽力投递、首跳无库内恢复、调用方幂等重发 |
+
+Wave 2（2026-10-27）：四条 lane（glm-5.3 worker + fresh glm-5.3 reviewer
+逐项复核），集成后主线全量质量门通过（41 个二进制 1075 项全绿）。
+
+| 条目 | 修复提交 | 方案要点 |
+| --- | --- | --- |
+| A3 重放测试签名层 | `6190b4c` + `9473ec0` | `join_pair_rebound` 只改 exporter 绑定（传输层内容字节一致由断言实证）；responder 沿合法流推进后重放 proof 触发 `ProofMismatch`/`InvalidSignature`；变异验证（去 transcript 绑定即漏检） |
+| A5 分区/重复断言 | `e536946` + `861cb95` | 多重性在两个原始公开面 dedup 前计数；真双分量 split + 离线写 + 冻结断言 + 恢复后 digest 一致；重拨落地改用 incarnation id 证明（发现代际重置的合法时序） |
+| A6 零传输测量 | `346986b` + `9473ec0` | 实测结论：第二轮是全量重发（页字节逐字节相等）；e2e 钉死精确重发记录数（28/2554）；文档措辞如实化 |
+| hint 重试 CI flake | `f10ae0f` | `settle_recorded` 固定时窗改累计计数确定性等待；归属结构性正确；tick 12-13 保留静默负检查 |

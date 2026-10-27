@@ -987,6 +987,7 @@ mod tests {
   const INITIATOR_NONCE: [u8; NONCE_LEN] = [0x10; NONCE_LEN];
   const RESPONDER_NONCE: [u8; NONCE_LEN] = [0x20; NONCE_LEN];
   const CHANNEL_BINDING: [u8; 32] = [0xCB; 32];
+  const FRESH_CHANNEL_BINDING: [u8; 32] = [0x99; 32];
   const CREDENTIAL: [u8; 32] = [0x42; 32];
 
   fn credential() -> CredentialSecret {
@@ -1056,6 +1057,18 @@ mod tests {
         seed: RESPONDER_SEED,
       },
     }
+  }
+
+  /// The join-mode pair rebound to a different exporter channel binding,
+  /// modelling a second connection between the same nodes: every
+  /// wire-visible fixture (identities, nonces, keys, offers) stays
+  /// identical, so any transcript divergence is attributable to the fresh
+  /// exporter value alone.
+  fn join_pair_rebound(channel_binding: [u8; 32]) -> TestPair {
+    let mut pair = join_pair();
+    pair.initiator.config.channel_binding = channel_binding;
+    pair.responder.config.channel_binding = channel_binding;
+    pair
   }
 
   fn member_pair() -> TestPair {
@@ -1659,46 +1672,123 @@ mod tests {
     nonce: ByteVec,
   }
 
-  /// A complete prior handshake replayed on a fresh connection fails — the
-  /// fresh exporter channel binding produces a different transcript, so the
-  /// replayed proof signatures never verify.
+  /// A complete prior handshake replayed on a fresh connection fails at
+  /// both defense layers: strict position ordering rejects the replayed
+  /// initiator proof before any signature work, and once the responder's
+  /// own legitimate flow reaches the initiator proof as the next legal
+  /// position, the fresh exporter channel binding produces a different
+  /// transcript, so both the replayed credential proof and the replayed
+  /// session signature fail verification.
   #[test]
   fn handshake_state_machine_rejects_cross_connection_replay() {
     // Session A completes honestly; its messages are the replay material.
     let session_a = join_pair();
     let exchange_a = drive(&session_a, &[], false, false).unwrap();
 
-    // Session B is a fresh connection: new nonces and a fresh channel
-    // binding (different exporter value).
-    let session_b = join_pair();
-    let mut replay_responder = fresh(&session_b.responder);
+    // Session B is a fresh connection: a new exporter channel binding
+    // (different exporter value) over otherwise identical fixtures.
+    let session_b = join_pair_rebound(FRESH_CHANNEL_BINDING);
+    assert_ne!(
+      session_a.responder.config.channel_binding,
+      session_b.responder.config.channel_binding
+    );
+    assert_ne!(
+      session_a.initiator.config.channel_binding,
+      session_b.initiator.config.channel_binding
+    );
 
-    // The replayed hello is a structurally valid position-one message, so
-    // it advances; the responder then issues its own fresh hello and its
-    // own proof. The attacker cannot occupy the responder's protocol
-    // positions, so session A's initiator proof (position four) is
-    // rejected by strict position ordering before any signature work, and
-    // the fresh nonce/exporter transcript binding never becomes a replay
-    // vector.
-    replay_responder.receive(&exchange_a.messages[0]).unwrap();
-    let responder_hello = replay_responder.responder_hello().unwrap();
+    // First layer: strict position ordering. The replayed position-one
+    // hello is structurally valid and advances the responder, which then
+    // issues its own fresh hello. The replayed initiator proof (position
+    // four) is still ahead of the responder's own position three, so it
+    // is rejected before any signature work, and the replayed hello
+    // cannot be re-sent either.
+    let replayed_hello = exchange_a.messages[0].clone();
+    let mut early = fresh(&session_b.responder);
+    early.receive(&replayed_hello).unwrap();
+    let _ = early.responder_hello().unwrap();
     assert_eq!(
-      replay_responder.receive(&exchange_a.messages[3]),
+      early.receive(&exchange_a.messages[3]),
       Err(HandshakeError::OutOfOrder),
       "a replayed initiator proof must be rejected before any signature work"
     );
     assert_eq!(
-      replay_responder.receive(&exchange_a.messages[0]),
+      early.receive(&replayed_hello),
       Err(HandshakeError::Duplicate),
       "a replayed position-one hello must be rejected"
     );
+    assert!(!early.is_authenticated());
+    assert!(early.selection_confirmation().is_err());
 
-    // The responder never reaches the confirmation step with the replayed
-    // material: authentication stays incomplete, so no confirmation (and
-    // therefore no signed selection or grant) can be produced.
-    assert!(!replay_responder.is_authenticated());
-    assert!(replay_responder.selection_confirmation().is_err());
+    // Second layer: transcript binding. The responder advances along its
+    // own legitimate message flow — session B's initiator hello, then
+    // session B's responder hello and responder proof, both delivered to
+    // session B's initiator — until the initiator proof is exactly the
+    // next legal position. Session B's wire hello is byte-identical to
+    // session A's; only the locally supplied channel binding differs, so
+    // the transcripts diverge through the fresh exporter value alone.
+    let mut initiator_b = fresh(&session_b.initiator);
+    let mut responder_b = fresh(&session_b.responder);
+    let hello_b = initiator_b.initiator_hello().unwrap();
+    assert_eq!(hello_b, replayed_hello);
+    responder_b.receive(&hello_b).unwrap();
+    let responder_hello_b = responder_b.responder_hello().unwrap();
+    assert_eq!(
+      responder_hello_b, exchange_a.messages[1],
+      "session B's responder hello must be byte-identical to session A's"
+    );
+    initiator_b.receive(&responder_hello_b).unwrap();
+    let responder_proof_b = responder_b
+      .responder_proof(sign(
+        &session_b.responder.seed,
+        &responder_session_message(responder_b.transcript_bytes().unwrap()),
+      ))
+      .unwrap();
+    initiator_b.receive(&responder_proof_b).unwrap();
+    assert!(!responder_b.is_authenticated());
+    assert_ne!(
+      responder_b.transcript_bytes().unwrap(),
+      exchange_a.responder.transcript_bytes().unwrap()
+    );
 
-    let _ = responder_hello;
+    // The raw replay fails the transcript-bound credential proof first.
+    assert_eq!(
+      responder_b.receive(&exchange_a.messages[3]),
+      Err(HandshakeError::ProofMismatch),
+      "a replayed initiator proof must fail the transcript-bound credential proof"
+    );
+
+    // The merge credential is shared material, so the decisive binding is
+    // the identity signature: a position-four message with a legitimately
+    // derived session-B proof but the replayed session-A signature still
+    // fails transcript-bound signature verification.
+    let replayed: ProofWire = decode_wire(&exchange_a.messages[3]).unwrap();
+    let proof_b = derive_proof(
+      ProofRole::Initiator,
+      &FRESH_CHANNEL_BINDING,
+      &credential(),
+      &responder_b.transcript_digest().unwrap(),
+    )
+    .unwrap();
+    let forged = encode_canonical(
+      &ProofWire {
+        kind: KIND_INITIATOR_PROOF,
+        proof: Some(ByteVec::from(proof_b.as_bytes().to_vec())),
+        signature: replayed.signature,
+      },
+      CONTROL_CBOR_LIMITS,
+    )
+    .unwrap();
+    assert_eq!(
+      responder_b.receive(&forged),
+      Err(HandshakeError::InvalidSignature),
+      "a replayed session signature must fail transcript-bound verification"
+    );
+
+    // The responder never authenticates on replayed material, so no
+    // confirmation (and therefore no signed selection or grant) can be
+    // produced.
+    assert!(!responder_b.is_authenticated());
+    assert!(responder_b.selection_confirmation().is_err());
   }
 }

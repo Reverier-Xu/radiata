@@ -7,8 +7,11 @@
 //! records by strictly-increasing owner revision and resources by the
 //! signed timestamp-maximum tuple. No whole-catalog materialization, no
 //! causal or freshness ordering, no population ceiling: the 1,024-record
-//! profile converges identically through paged scans, and a changeless
-//! second pass transfers nothing.
+//! profile converges identically through paged scans; a changeless
+//! second pass installs nothing, but the emit side pages its whole
+//! catalog with no receiver knowledge, so it still re-transfers the full
+//! winner pages — the tests pin the exact re-transferred record count
+//! instead of claiming "nothing".
 
 use std::sync::Arc;
 
@@ -107,12 +110,31 @@ async fn put_descriptor(store: &MetadataStore, descriptor: &NodeDescriptorV1) {
     .unwrap();
 }
 
+/// One converge's measured outcome: the records the sweeps installed,
+/// plus every record the emit side packed into pages. The emit path
+/// pages its whole catalog with no knowledge of the receiver, so a
+/// changeless converge still re-transfers full pages — the record
+/// count pins that cost exactly (the byte-level pin lives in the
+/// page-level test's first/second-pass equality).
+struct ConvergeCost {
+  applied: usize,
+  /// Every record the emit side packed into pages, resources and
+  /// descriptors alike: the discriminating measure of a re-transfer
+  /// (a page count or byte total alone cannot tell a full resend from
+  /// a single record).
+  records: usize,
+}
+
 /// Runs one full bidirectional convergence pass: A applies every page
-/// emitted by B and vice versa, until neither side applies any change.
-/// Uses the same page apply path the reconciliation plane's row batches
-/// ride (the test emit pages the store directly).
-async fn converge(sides: [&MetadataStore; 2]) -> usize {
-  let mut total_applied = 0;
+/// emitted by B and vice versa, until neither side applies any change,
+/// and reports the measured cost above (installs plus emitted records).
+/// Uses the same page apply path the reconciliation plane's row
+/// batches ride (the test emit pages the store directly).
+async fn converge(sides: [&MetadataStore; 2]) -> ConvergeCost {
+  let mut total = ConvergeCost {
+    applied: 0,
+    records: 0,
+  };
   loop {
     let mut applied = 0;
     for index in 0..2 {
@@ -129,6 +151,7 @@ async fn converge(sides: [&MetadataStore; 2]) -> usize {
         .unwrap();
         let done = page.cursor().is_none();
         cursor = page.cursor().map(|value| value.to_vec());
+        total.records += page.records().len();
         applied += resource_page::sync::apply_page_ctx(receiver, &SystemEntropy, &page)
           .await
           .unwrap();
@@ -152,6 +175,7 @@ async fn converge(sides: [&MetadataStore; 2]) -> usize {
       }
       for chunk in descriptors.chunks(16) {
         let page = member_page::MembershipPage::new(chunk.to_vec(), None).unwrap();
+        total.records += chunk.len();
         applied += member_page::sync::apply_page_ctx(receiver, &SystemEntropy, &page)
           .await
           .unwrap()
@@ -162,9 +186,9 @@ async fn converge(sides: [&MetadataStore; 2]) -> usize {
     if applied == 0 {
       break;
     }
-    total_applied += applied;
+    total.applied += applied;
   }
-  total_applied
+  total
 }
 
 /// Two eight-node components change owner-revision node records and
@@ -289,8 +313,18 @@ async fn eight_plus_eight_components_merge_by_revision_and_tuple() {
     );
   }
 
-  // A changeless second pass transfers nothing.
-  assert_eq!(converge([&side_a, &side_b]).await, 0);
+  // A changeless second pass installs nothing, but the emit side has no
+  // receiver knowledge: it re-transfers the full winner set of both
+  // families. Pin the exact resend volume — per direction 3 resource
+  // winners plus 11 descriptors (8 a-nodes, the shared record, both
+  // writers) — so a future receiver-aware skip cannot pass silently.
+  let second_pass = converge([&side_a, &side_b]).await;
+  assert_eq!(second_pass.applied, 0, "a changeless pass installs nothing");
+  assert_eq!(
+    second_pass.records,
+    2 * (3 + 11),
+    "a changeless pass still re-transfers the full winner set on both directions"
+  );
 }
 
 /// The 1,024-profile participates with no over-population rejection, no
@@ -356,11 +390,11 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
     put_descriptor(&side_b, &descriptor(&node, 2, [3_u8; 32])).await;
   }
   let started = std::time::Instant::now();
-  let applied = converge([&side_a, &side_b]).await;
-  assert!(applied > 0);
+  let healed = converge([&side_a, &side_b]).await;
+  assert!(healed.applied > 0);
 
-  // All valid records participate: the full winner set is present on both
-  // sides, and the second pass is changeless.
+  // All valid records participate: the full winner set pages out of the
+  // store.
   let mut cursor = None;
   let mut seen = 0;
   loop {
@@ -394,6 +428,23 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
       "name {seed} must converge identically on both components"
     );
   }
+  // The changeless second pass is run and measured here, not merely
+  // implied by a comment: it installs nothing while still
+  // re-transferring the full winner set (the emit side carries no
+  // receiver knowledge).
+  let second_pass = converge([&side_a, &side_b]).await;
+  assert_eq!(
+    second_pass.applied, 0,
+    "the converged pair installs nothing"
+  );
+  // Pin the exact resend volume: per direction the 251 resource winners
+  // (the same count the emit walk asserts above) plus 1,026 descriptors
+  // (1,024 profile nodes and both bulk writers).
+  assert_eq!(
+    second_pass.records,
+    2 * (251 + 1_026),
+    "a changeless pass still re-transfers the full winner set on both directions"
+  );
   // Hygiene guard only: this layer makes no latency qualification claim.
   // The bound tolerates parallel-test contention on slow CI runners.
   assert!(started.elapsed() < std::time::Duration::from_secs(120));
@@ -445,9 +496,9 @@ async fn restart_and_readdress_repair_through_ordinary_pages() {
   put_descriptor(&side_b, &descriptor(&writer_b(), 2, SECOND_SEED)).await;
 
   // Ordinary bounded pages heal everything after the partition.
-  let applied = converge([&side_a, &side_b]).await;
+  let healed_cost = converge([&side_a, &side_b]).await;
   assert!(
-    applied > 0,
+    healed_cost.applied > 0,
     "restart and readdress must repair through ordinary pages"
   );
 
