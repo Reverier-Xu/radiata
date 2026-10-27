@@ -128,28 +128,37 @@ fn established(handshake: &Handshake) -> Result<EstablishedSession> {
 /// — the application identity proof, not the pin, is the authority.
 /// The in-process anchor cache is bounded: a persistent peer that churns
 /// dial targets over one process lifetime must not accumulate obsolete
-/// pins, and neither must a large cluster. Every recorded anchor carries
-/// its last-recorded sequence; eviction drops the oldest per-peer pin past
-/// [`MEMBER_SPKI_ANCHORS_PER_PEER`] and then the globally oldest pin past
-/// [`MEMBER_SPKI_ANCHORS`]. Eviction is safe by construction: an evicted
+/// pins, and neither must a large cluster. The bounds are configured
+/// per node through [`crate::NodeConfig::with_member_spki_anchor_limits`]
+/// (defaults: 4 pins per peer, 256 total). Every recorded anchor carries
+/// its last-recorded sequence; eviction drops the oldest per-peer pin
+/// past the per-peer bound and then the globally oldest pin past the
+/// global bound. Eviction is safe by construction: an evicted
 /// target simply has no anchor, so its next dial runs under merge trust
 /// where the member handshake's identity proof is the authenticator — the
 /// same fallback as an endpoint that was never pinned.
-const MEMBER_SPKI_ANCHORS_PER_PEER: usize = 4;
-const MEMBER_SPKI_ANCHORS: usize = 256;
-
-#[derive(Default)]
 struct MemberSpkiTable(std::sync::Mutex<MemberSpkiAnchors>);
 
 /// The bounded anchor cache: `(peer, endpoint)` pins with their last
-/// recorded sequence, oldest-first eviction.
-#[derive(Default)]
+/// recorded sequence, oldest-first eviction, bounded by the configured
+/// per-peer and global anchor limits.
 struct MemberSpkiAnchors {
+  per_peer: usize,
+  global: usize,
   sequence: u64,
   anchors: std::collections::BTreeMap<(NodeId, Endpoint), (u64, Vec<u8>)>,
 }
 
 impl MemberSpkiAnchors {
+  fn new(member_spki_anchors_per_peer: usize, member_spki_anchors: usize) -> Self {
+    Self {
+      per_peer: member_spki_anchors_per_peer,
+      global: member_spki_anchors,
+      sequence: 0,
+      anchors: std::collections::BTreeMap::new(),
+    }
+  }
+
   fn record(&mut self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
     self.sequence = self.sequence.wrapping_add(1);
     self
@@ -160,9 +169,7 @@ impl MemberSpkiAnchors {
   }
 
   fn evict_peer_overflow(&mut self, peer: &NodeId) {
-    while self.anchors.keys().filter(|(node, _)| node == peer).count()
-      > MEMBER_SPKI_ANCHORS_PER_PEER
-    {
+    while self.anchors.keys().filter(|(node, _)| node == peer).count() > self.per_peer {
       let oldest = self
         .anchors
         .iter()
@@ -175,7 +182,7 @@ impl MemberSpkiAnchors {
   }
 
   fn evict_global_overflow(&mut self) {
-    while self.anchors.len() > MEMBER_SPKI_ANCHORS {
+    while self.anchors.len() > self.global {
       let oldest = self
         .anchors
         .iter()
@@ -188,6 +195,13 @@ impl MemberSpkiAnchors {
 }
 
 impl MemberSpkiTable {
+  fn new(member_spki_anchors_per_peer: usize, member_spki_anchors: usize) -> Self {
+    Self(std::sync::Mutex::new(MemberSpkiAnchors::new(
+      member_spki_anchors_per_peer,
+      member_spki_anchors,
+    )))
+  }
+
   /// Records the peer's leaf SPKI as the member-mode trust anchor for
   /// one concrete dial target. The latest record wins per target, and the
   /// bounded cache evicts the oldest anchors beyond its bounds.
@@ -234,6 +248,7 @@ impl SessionDriver {
     context: Arc<LocalIdentityContext>, keys: Arc<dyn KeyProvider>, entropy: Arc<dyn Entropy>,
     issuer: Arc<Mutex<MergeCredentialIssuer>>, offer: FeatureOffer, features: Arc<FeatureRegistry>,
     authentication_deadline: Duration, merge_admission: crate::config::MergeAdmissionLimits,
+    member_spki_anchors_per_peer: usize, member_spki_anchors: usize,
   ) -> Self {
     Self {
       context,
@@ -244,7 +259,10 @@ impl SessionDriver {
       features,
       authentication_deadline,
       limiter: crate::identity::merge_rate::MergeLimiter::new(merge_admission),
-      member_spkis: Arc::new(MemberSpkiTable::default()),
+      member_spkis: Arc::new(MemberSpkiTable::new(
+        member_spki_anchors_per_peer,
+        member_spki_anchors,
+      )),
     }
   }
 
@@ -780,6 +798,8 @@ mod deadline_tests {
       registry,
       Duration::from_millis(50),
       NodeConfig::new().merge_admission(),
+      NodeConfig::new().member_spki_anchors_per_peer(),
+      NodeConfig::new().member_spki_anchors(),
     );
 
     let certificate = EphemeralCertificate::generate(entropy.as_ref()).unwrap();
@@ -825,8 +845,17 @@ mod deadline_tests {
 
 #[cfg(test)]
 mod member_spki_tests {
-  use super::{MEMBER_SPKI_ANCHORS, MemberSpkiTable};
-  use crate::{Endpoint, NodeId};
+  use std::sync::Arc;
+
+  use super::{MemberSpkiTable, SessionDriver};
+  use crate::{
+    Endpoint, NodeConfig, NodeId,
+    identity::{
+      credential::MergeCredentialIssuer,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+    },
+    protocol::{feature::FeatureRegistry, offer::node_offer},
+  };
 
   fn peer() -> NodeId {
     NodeId::parse("node-000000000000000000042").unwrap()
@@ -842,7 +871,7 @@ mod member_spki_tests {
   /// one target leaves the other target untouched.
   #[test]
   fn anchors_key_by_peer_and_concrete_dial_target() {
-    let anchors = MemberSpkiTable::default();
+    let anchors = MemberSpkiTable::new(4, 256);
     let peer = peer();
     let tls = Endpoint::parse("tls://127.0.0.1:7001").unwrap();
     let wss = Endpoint::parse("wss://127.0.0.1:7002").unwrap();
@@ -880,15 +909,17 @@ mod member_spki_tests {
     );
   }
 
-  /// Endpoint churn stays bounded: the per-peer bound evicts the oldest
-  /// target, and an evicted target reports no anchor so its next dial
-  /// falls back to merge trust (the member handshake's identity proof)
-  /// instead of pinning a stale leaf for the process lifetime (audit B07).
+  /// Endpoint churn stays bounded by the CONFIGURED per-peer bound:
+  /// with a tightened bound of two the third target evicts the oldest,
+  /// and an evicted target reports no anchor so its next dial falls
+  /// back to merge trust (the member handshake's identity proof)
+  /// instead of pinning a stale leaf for the process lifetime (audit
+  /// B07).
   #[test]
   fn endpoint_churn_evicts_the_oldest_anchors_and_falls_back_safely() {
-    let anchors = MemberSpkiTable::default();
+    let anchors = MemberSpkiTable::new(2, 256);
     let peer = peer();
-    let targets: Vec<Endpoint> = (1..=5)
+    let targets: Vec<Endpoint> = (1..=3)
       .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:70{port:02}")).unwrap())
       .collect();
     for (index, target) in targets.iter().enumerate() {
@@ -908,15 +939,16 @@ mod member_spki_tests {
     }
   }
 
-  /// The cache is globally bounded too: a large cluster only ever keeps
-  /// the newest anchors, and the evicted ones fall back to merge trust.
+  /// The cache is globally bounded by the CONFIGURED bound too: with a
+  /// tightened table of four, a fifth pinned member evicts the globally
+  /// oldest anchor, and the evicted one falls back to merge trust.
   #[test]
   fn anchor_table_is_globally_bounded() {
-    let anchors = MemberSpkiTable::default();
-    let peers: Vec<NodeId> = (0..=MEMBER_SPKI_ANCHORS)
+    let anchors = MemberSpkiTable::new(4, 4);
+    let peers: Vec<NodeId> = (0..=4)
       .map(|seed| NodeId::parse(&format!("node-{seed:021}")).unwrap())
       .collect();
-    let targets: Vec<Endpoint> = (0..=MEMBER_SPKI_ANCHORS)
+    let targets: Vec<Endpoint> = (0..=4)
       .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:{}", 20_000 + port)).unwrap())
       .collect();
     for (peer, target) in peers.iter().zip(&targets) {
@@ -927,7 +959,7 @@ mod member_spki_tests {
       None,
       "the globally oldest anchor is evicted"
     );
-    let newest = MEMBER_SPKI_ANCHORS;
+    let newest = 4;
     assert_eq!(
       anchors.anchor(&peers[newest], &targets[newest]),
       Some(b"leaf".to_vec()),
@@ -935,8 +967,55 @@ mod member_spki_tests {
     );
     assert_eq!(
       anchors.0.lock().unwrap().anchors.len(),
-      MEMBER_SPKI_ANCHORS,
-      "the cache never exceeds its global bound"
+      4,
+      "the cache never exceeds its configured global bound"
+    );
+  }
+
+  /// The configured bounds flow from `NodeConfig` into the driver's
+  /// eviction logic: a driver built from a config with a tightened
+  /// per-peer bound evicts through the public record/anchor surface
+  /// (audit B2 — the 4/256 bounds are NodeConfig knobs, not private
+  /// driver constants).
+  #[tokio::test]
+  async fn configured_bounds_flow_from_node_config_into_the_driver() {
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(open_context(&factory, &keys, &entropy).await.unwrap());
+    let registry = Arc::new(FeatureRegistry::builtin().unwrap());
+    let offer = node_offer(&registry, &Default::default()).unwrap();
+    let config = NodeConfig::new()
+      .with_member_spki_anchor_limits(2, 256)
+      .unwrap();
+    let driver = SessionDriver::new(
+      context,
+      keys.as_provider(),
+      entropy.clone(),
+      Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
+      offer,
+      registry,
+      config.authentication_deadline(),
+      config.merge_admission(),
+      config.member_spki_anchors_per_peer(),
+      config.member_spki_anchors(),
+    );
+    let peer = peer();
+    let targets: Vec<Endpoint> = (1..=3)
+      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:70{port:02}")).unwrap())
+      .collect();
+    for target in &targets {
+      driver.record_peer_spki(&peer, target, b"leaf".to_vec());
+    }
+    assert_eq!(
+      driver.peer_spki(&peer, &targets[0]),
+      None,
+      "the oldest pin is evicted past the configured per-peer bound"
+    );
+    assert_eq!(
+      driver.peer_spki(&peer, &targets[2]).as_deref(),
+      Some(b"leaf".as_slice()),
+      "the newest pin is retained"
     );
   }
 }

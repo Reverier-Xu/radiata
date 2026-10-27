@@ -931,6 +931,8 @@ pub(super) fn operation_deps(
     features,
     dependencies.config.authentication_deadline(),
     dependencies.config.merge_admission(),
+    dependencies.config.member_spki_anchors_per_peer(),
+    dependencies.config.member_spki_anchors(),
   );
   Ok(Arc::new(super::task_effects::OperationDeps::new(
     dependencies,

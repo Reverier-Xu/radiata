@@ -49,6 +49,12 @@ pub struct NodeConfig {
   // The task manager's network-class execution-slot budget: the join and
   // connect dials, which can each hold a slot for a whole dial deadline.
   task_reconcile_network_slots: usize,
+  // The in-process member leaf-SPKI anchor cache's per-peer bound: how
+  // many pinned dial targets one peer retains before the oldest is
+  // evicted (see `with_member_spki_anchor_limits`).
+  member_spki_anchors_per_peer: usize,
+  // The anchor cache's global bound across all peers.
+  member_spki_anchors: usize,
 }
 
 impl NodeConfig {
@@ -176,6 +182,32 @@ impl NodeConfig {
     ensure_nonzero(network, "network task reconcile slots")?;
     self.task_reconcile_local_slots = local;
     self.task_reconcile_network_slots = network;
+    Ok(self)
+  }
+
+  /// Sets the member leaf-SPKI anchor cache bounds: `per_peer` is how
+  /// many pinned dial targets one peer keeps, `global` is the whole
+  /// table's bound; past either bound the oldest pin is evicted, so its
+  /// next dial runs under merge trust (the member handshake's identity
+  /// proof authenticates; the pin is only a shortcut — see the session
+  /// driver's anchor table for the full semantics). The bounds are
+  /// purely local memory, never peer-visible, so per-device tuning is
+  /// safe. Raise `per_peer` when a peer legitimately churns dial targets
+  /// within one process lifetime — a listener rebinding ports behind a
+  /// dynamic address, or a fleet of short-lived listeners behind one
+  /// durable identity — so its hot targets keep their pins instead of
+  /// paying a merge-trust fallback dial each time; raise `global` for
+  /// clusters with many simultaneously pinned members. Both values must
+  /// be nonzero and `per_peer` must not exceed `global` (a peer could
+  /// otherwise hold more pins than the table admits).
+  pub fn with_member_spki_anchor_limits(mut self, per_peer: usize, global: usize) -> Result<Self> {
+    ensure_nonzero(per_peer, "member spki anchors per peer")?;
+    ensure_nonzero(global, "member spki anchors")?;
+    if per_peer > global {
+      return Err(Error::invalid_input("member spki anchor limits"));
+    }
+    self.member_spki_anchors_per_peer = per_peer;
+    self.member_spki_anchors = global;
     Ok(self)
   }
 
@@ -327,6 +359,18 @@ impl NodeConfig {
     self.task_reconcile_network_slots
   }
 
+  /// The member leaf-SPKI anchor cache's per-peer bound (consumed by the
+  /// session driver's anchor table; nonzero by construction).
+  pub(crate) const fn member_spki_anchors_per_peer(&self) -> usize {
+    self.member_spki_anchors_per_peer
+  }
+
+  /// The member leaf-SPKI anchor cache's global bound (consumed by the
+  /// session driver's anchor table; nonzero by construction).
+  pub(crate) const fn member_spki_anchors(&self) -> usize {
+    self.member_spki_anchors
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -386,6 +430,15 @@ impl Default for NodeConfig {
       // grow `network`; a deployment that never dials may shrink it.
       task_reconcile_local_slots: 2,
       task_reconcile_network_slots: 2,
+      // Four per peer and 256 total: a durable identity carries at most
+      // a handful of live listeners (one pin per scheme-and-address
+      // target), so four covers today's channel churn, and 256 entries
+      // bound the cache for large clusters. The bounds are memory, not
+      // correctness — an evicted target simply falls back to merge
+      // trust — so the defaults stay conservative and churn-heavy
+      // deployments raise them (see `with_member_spki_anchor_limits`).
+      member_spki_anchors_per_peer: 4,
+      member_spki_anchors: 256,
     }
   }
 }
@@ -807,6 +860,30 @@ mod tests {
     for (local, network) in [(0, 2), (2, 0), (0, 0)] {
       let error = NodeConfig::new()
         .with_task_reconcile_slots(local, network)
+        .unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+  }
+
+  /// The member SPKI anchor cache defaults to four pins per peer and
+  /// 256 total, and the builder refuses a zero bound on either side or
+  /// an inverted pair: a per-peer bound above the global bound could
+  /// never hold, so it is rejected up front.
+  #[test]
+  fn member_spki_anchor_limits_default_to_four_and_two_fifty_six() {
+    let default = NodeConfig::new();
+    assert_eq!(default.member_spki_anchors_per_peer(), 4);
+    assert_eq!(default.member_spki_anchors(), 256);
+
+    let configured = NodeConfig::new()
+      .with_member_spki_anchor_limits(8, 512)
+      .unwrap();
+    assert_eq!(configured.member_spki_anchors_per_peer(), 8);
+    assert_eq!(configured.member_spki_anchors(), 512);
+
+    for (per_peer, global) in [(0, 256), (4, 0), (0, 0), (8, 4)] {
+      let error = NodeConfig::new()
+        .with_member_spki_anchor_limits(per_peer, global)
         .unwrap_err();
       assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
