@@ -21,13 +21,14 @@ use radiata::{Endpoint, ErrorKind, NodeBuilder, NodeConfig, NodeHandle, NodeId, 
 mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys, merge_with_retry};
-
-/// The shared cluster gate: the lanes serialize so each cluster owns the
-/// process while it runs (the harness runs test files concurrently).
-fn cluster_gate() -> &'static tokio::sync::Mutex<()> {
-  static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-  GATE.get_or_init(|| tokio::sync::Mutex::new(()))
-}
+// The shared multi-cluster gate (audit 2026-10-27 B3): the lanes
+// serialize so each cluster owns the machine while it runs — in this
+// process through the gate's async mutex and across test-file
+// processes through the kernel file lock under `target/`, so
+// cross-file cluster parallelism is bounded machine-wide too (the
+// per-file `OnceLock` this replaced left other files' clusters free
+// to oversubscribe the runner).
+use radiata_test_support::cluster_gate;
 
 fn init_tracing() {
   use std::sync::Once;
@@ -133,7 +134,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_unhealthy_node_dials_its_way_back_to_target() {
   init_tracing();
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
 
   // Five nodes: a hub plus four leaves, each leaf one session below the
   // derived target k(5) = 3 after the star forms. Fast anti-entropy so
@@ -252,7 +253,7 @@ async fn an_unhealthy_node_dials_its_way_back_to_target() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
   init_tracing();
-  let _cluster_gate = cluster_gate().lock().await;
+  let _cluster_gate = cluster_gate().await;
 
   // Hub H and member B form a cluster; A joins afterwards with a slow
   // anti-entropy cadence, so B's binding cannot have spread when A's

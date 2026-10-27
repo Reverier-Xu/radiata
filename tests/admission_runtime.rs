@@ -32,8 +32,10 @@ async fn start_configured(
   common::init_tracing();
   // The runtime default entropy (system randomness) keeps every node's id
   // unique; deterministic entropy would collide across nodes. A prior
-  // runtime instance's detached teardown can briefly hold the factory's
-  // exclusive-open flag under load, so the open is retried to a deadline.
+  // runtime instance's trace-persistence tail can briefly hold the
+  // factory's exclusive-open flag under load (the TraceSink detachment
+  // predates the shutdown barrier's coverage — audit 2026-10-27 B3
+  // follow-up), so the open is retried to a deadline.
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
   loop {
     match NodeBuilder::new(factory.clone())

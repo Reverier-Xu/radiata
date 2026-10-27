@@ -779,9 +779,11 @@ async fn finish_shutdown(
   // every runtime plane is torn down above, so no new execution can
   // start; the storage flush now resolves only when every detached
   // execution the node spawned has ended (committed, failed, or rolled
-  // back), so the shutdown reply returns only once no in-flight commit
-  // still holds the database — a restarted node on the same factory
-  // cannot race a landing execution. Like the task manager's journaled
+  // back) and every snapshot execution has released its handle — commit
+  // and read alike — so the shutdown reply returns only once no
+  // in-flight execution still holds the database (the snapshot half is
+  // audit 2026-10-27 B3: a still-live read pinned the file lock past
+  // the reply and restarts raced it). Like the task manager's journaled
   // drain, the wait is deliberately unbounded: it awaits durability
   // obligations, not cancellable effects. A flush failure is diagnosed
   // and teardown continues, because the reply itself must still answer.

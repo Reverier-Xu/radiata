@@ -746,24 +746,14 @@ async fn restarted_node_passively_reconnects(
 
   // Restart on the SAME durable store: no Listen, no join, no connect —
   // the only path back is recovery seeding from the persisted evidence.
-  // A prior runtime instance's detached teardown can briefly hold the
-  // store's exclusive-open flag under load, so the start is retried to a
-  // deadline (the established admission-lane pattern).
-  let restarted = loop {
-    match NodeBuilder::new(storage.clone())
-      .keys(keys.clone())
-      .start()
-      .await
-    {
-      Ok(handle) => break handle,
-      Err(error)
-        if error.kind() == ErrorKind::StorageLocked && std::time::Instant::now() < deadline =>
-      {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-      }
-      Err(error) => panic!("restarted node start failed persistently: {error:?}"),
-    }
-  };
+  // The storage shutdown barrier covers every execution that could hold
+  // the store's lock past the reply (audit 2026-10-27 B3), so the
+  // restart opens directly with no retry.
+  let restarted = NodeBuilder::new(storage.clone())
+    .keys(keys.clone())
+    .start()
+    .await
+    .unwrap();
   assert_eq!(
     restarted.local_node().await.unwrap().node_id(),
     &node_id,
@@ -922,26 +912,16 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   // Restart on the same store: members, trust, and resources are wiped —
   // the replacement identity is born with its own singleton cluster, so
   // the local view resolves to exactly the replacement. The previous
-  // node's redb file lock is released by an in-flight detached commit that
-  // can settle a few milliseconds after shutdown, so a typed lock error is
-  // retried rather than raced.
-  let handle = {
-    let mut attempt = 0_u32;
-    loop {
-      match NodeBuilder::new(Arc::clone(&storage))
-        .keys(Arc::clone(&provider))
-        .start()
-        .await
-      {
-        Ok(handle) => break handle,
-        Err(error) if error.kind() == ErrorKind::StorageLocked && attempt < 200 => {
-          attempt += 1;
-          tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        Err(error) => panic!("restart open failed: {error:?}"),
-      }
-    }
-  };
+  // node's shutdown reply returned only after the storage execution
+  // barrier drained every database-holding execution (commits and
+  // snapshots; audit 2026-10-27 B3), so the reopen is immediate and
+  // un-retried — a `StorageLocked` here is a regression, not a settle
+  // to tolerate.
+  let handle = NodeBuilder::new(Arc::clone(&storage))
+    .keys(Arc::clone(&provider))
+    .start()
+    .await
+    .unwrap();
   let local = handle.local_node().await.unwrap();
   assert_eq!(local.node_id(), &replacement);
   assert_ne!(local.node_id(), &former_handle_bytes);

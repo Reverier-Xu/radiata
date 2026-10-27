@@ -288,6 +288,7 @@ impl StorageFactory for RedbStoreFactory {
         database,
         detached: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         settled: Arc::new(tokio::sync::Notify::new()),
+        readers: Arc::new(SnapshotReaders::default()),
       }) as Box<dyn Storage>)
     })
   }
@@ -301,14 +302,77 @@ struct RedbStorage {
   /// reconciler of the same transaction waits on the entry's landing
   /// signal before reading receipts, so a cancelled commit is judged by
   /// its final receipt and never by a not-yet-landed absence (audit
-  /// 2026-10-09 item 14). An empty map is also the completion barrier
-  /// [`Storage::flush`] awaits: no in-flight execution still holds the
-  /// database or is about to commit (audit 2026-10-23 P1-10).
+  /// 2026-10-09 item 14). An empty map is half of the completion
+  /// barrier [`Storage::flush`] awaits — the snapshot readers are the
+  /// other half — so no in-flight execution still holds the database
+  /// or is about to commit (audit 2026-10-23 P1-10).
   detached:
     Arc<std::sync::Mutex<std::collections::BTreeMap<TransactionId, Arc<tokio::sync::Notify>>>>,
   /// Fires whenever any detached execution ends (commit, failure, or
   /// panic): the wakeup edge behind [`Storage::flush`]'s drain wait.
   settled: Arc<tokio::sync::Notify>,
+  /// The in-flight snapshot executions (audit 2026-10-27 B3): a
+  /// snapshot's `spawn_blocking` read clones the database and the
+  /// returned handle keeps the read transaction open, so a live slot
+  /// pins the `Database` — and its file lock — exactly like a detached
+  /// commit does. [`Storage::flush`] awaits the gate draining, so the
+  /// barrier covers every execution that holds the database, not only
+  /// commits.
+  readers: Arc<SnapshotReaders>,
+}
+
+/// Counts the snapshot executions that still hold the database: one
+/// slot per [`Storage::snapshot`] call, from the moment its blocking
+/// read is admitted until the returned snapshot handle drops. The
+/// detached-commit registry cannot see these executions (they never
+/// register a transaction), yet empirically they held the last
+/// `Arc<Database>` past the shutdown reply — a restart then lost the
+/// race for the file lock and observed `StorageLocked` (audit
+/// 2026-10-27 B3) — so the flush barrier drains this gate as well.
+#[derive(Default)]
+struct SnapshotReaders {
+  live: std::sync::Mutex<usize>,
+  settled: tokio::sync::Notify,
+}
+
+impl SnapshotReaders {
+  fn acquire(self: &Arc<Self>) -> SnapshotReadGuard {
+    *self
+      .live
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+    SnapshotReadGuard {
+      readers: Arc::clone(self),
+    }
+  }
+
+  fn is_idle(&self) -> bool {
+    *self
+      .live
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      == 0
+  }
+}
+
+/// Holds one [`SnapshotReaders`] slot: acquired before the snapshot's
+/// blocking task is spawned, moved into the returned snapshot handle on
+/// success, and dropped on every other exit path (read failure, task
+/// panic, or an abandoned result), so the gate counts exactly the
+/// executions that still pin the database.
+struct SnapshotReadGuard {
+  readers: Arc<SnapshotReaders>,
+}
+
+impl Drop for SnapshotReadGuard {
+  fn drop(&mut self) {
+    *self
+      .readers
+      .live
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
+    self.readers.settled.notify_waiters();
+  }
 }
 
 /// Fires one detached commit's landing signal and removes its registry
@@ -356,11 +420,18 @@ impl Storage for RedbStorage {
 
   fn snapshot<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn StoreSnapshot>>> {
     let database = Arc::clone(&self.database);
+    let readers = Arc::clone(&self.readers);
     Box::pin(async move {
       // `begin_read` takes the database's internal file lock and can
       // block behind a durable commit, so the open (and the revision
       // read it seeds) runs on the blocking pool: write pressure can
-      // never stall the async runtime thread.
+      // never stall the async runtime thread. The reader slot is taken
+      // before the task is admitted and rides the returned handle
+      // (audit 2026-10-27 B3): the blocking task clones the database,
+      // so an execution the awaiting future abandoned still pins the
+      // `Database` — and its file lock — until the handle drops, and
+      // the flush barrier must see it.
+      let guard = readers.acquire();
       let snapshot = tokio::task::spawn_blocking(move || {
         let transaction = database
           .begin_read()
@@ -369,6 +440,7 @@ impl Storage for RedbStorage {
         Ok::<RedbSnapshot, Error>(RedbSnapshot {
           transaction,
           revision,
+          _readers: guard,
         })
       })
       .await
@@ -466,9 +538,17 @@ impl Storage for RedbStorage {
     // still holds the database or is about to commit. This awaits the
     // detached registry draining to empty, so every registered
     // execution has ended (committed, failed, or rolled back) before
-    // the caller resumes (audit 2026-10-23 P1-10).
+    // the caller resumes (audit 2026-10-23 P1-10), and then the
+    // snapshot readers draining to idle (audit 2026-10-27 B3): a
+    // snapshot execution — its blocking read still running or its
+    // handle still held — pins the database exactly like a commit
+    // does, and leaving it outside the barrier let the file lock
+    // outlive the shutdown reply. Sequencing is sound because the
+    // barrier runs only after every runtime plane is torn down, so no
+    // new execution of either kind can be admitted behind it.
     let registry = Arc::clone(&self.detached);
     let settled = Arc::clone(&self.settled);
+    let readers = Arc::clone(&self.readers);
     Box::pin(async move {
       loop {
         if registry
@@ -476,7 +556,7 @@ impl Storage for RedbStorage {
           .unwrap_or_else(|poisoned| poisoned.into_inner())
           .is_empty()
         {
-          return Ok(());
+          break;
         }
         let notified = settled.notified();
         tokio::pin!(notified);
@@ -489,6 +569,24 @@ impl Storage for RedbStorage {
           .unwrap_or_else(|poisoned| poisoned.into_inner())
           .is_empty()
         {
+          break;
+        }
+        notified.await;
+      }
+      loop {
+        if readers.is_idle() {
+          return Ok(());
+        }
+        // A caller that leaks a snapshot handle holds the barrier open;
+        // surface the wait instead of hanging the shutdown silently.
+        tracing::debug!("storage flush waiting for snapshot readers to drain");
+        let notified = readers.settled.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Re-check under the slot accounting the enable observed: a
+        // handle dropped between the idle check and the enable already
+        // released its slot, and the gate is already idle.
+        if readers.is_idle() {
           return Ok(());
         }
         notified.await;
@@ -500,6 +598,11 @@ impl Storage for RedbStorage {
 struct RedbSnapshot {
   transaction: redb::ReadTransaction,
   revision: StoreRevision,
+  /// The reader slot this snapshot holds (see [`SnapshotReadGuard`]):
+  /// dropping the handle — not the blocking read's return — is what
+  /// releases the database, so the barrier waits for handles too.
+  /// Drop-only, like the landing hold's `_lock`.
+  _readers: SnapshotReadGuard,
 }
 
 impl fmt::Debug for RedbSnapshot {
@@ -1313,5 +1416,44 @@ mod followup_tests {
       storage.reconcile(&id, &digest).await.unwrap(),
       ReconcileOutcome::Committed(_)
     ));
+  }
+
+  /// The barrier also covers the read side (audit 2026-10-27 B3): a
+  /// snapshot handle still held — or a snapshot blocking task still
+  /// running — clones and pins the `Database` past the shutdown reply,
+  /// and a restart on the same factory then raced the file-lock release
+  /// and observed `StorageLocked`. While a snapshot handle is alive,
+  /// flush must not resolve; when the handle drops, flush resolves.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn flush_waits_for_an_outstanding_snapshot_execution() {
+    let directory = TempDir::new().unwrap();
+    let factory = RedbStoreFactory::new(directory.path().join("store.redb"));
+    let storage: Arc<dyn Storage> = factory
+      .open(StoreRequirements::metadata())
+      .await
+      .unwrap()
+      .into();
+
+    // The snapshot's blocking read has already returned, but the
+    // handle keeps the reader slot — exactly the shape the shutdown
+    // path leaves behind when a plane's snapshot outlives the barrier.
+    let snapshot = storage.snapshot().await.unwrap();
+    let flush = tokio::spawn({
+      let storage = Arc::clone(&storage);
+      async move { storage.flush().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+      !flush.is_finished(),
+      "flush must not resolve while a snapshot handle still pins the database"
+    );
+
+    // Dropping the handle releases the slot; the barrier resolves
+    // behind it, and — the shutdown contract this guards — the factory
+    // can reopen the same file immediately afterwards.
+    drop(snapshot);
+    flush.await.unwrap().unwrap();
+    drop(storage);
+    factory.open(StoreRequirements::metadata()).await.unwrap();
   }
 }

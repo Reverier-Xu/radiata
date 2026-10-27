@@ -5,6 +5,134 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub mod ledger;
 
+/// The multi-cluster test gate's lock file name, created inside the
+/// workspace `target/` directory so parallel test processes of one
+/// checkout (cargo/nextest run test files as separate processes)
+/// serialize their oversubscribed cluster lanes machine-wide (audit
+/// 2026-10-27 B3). The lock is a kernel-managed advisory file lock: it
+/// is released by `drop` and by process exit, so a crashed lane can
+/// never leave a stale lock behind.
+const CLUSTER_GATE_LOCK_NAME: &str = ".radiata-cluster-gate.lock";
+/// Poll cadence of the gate's cross-process half while another test
+/// process holds the machine-wide slot.
+const CLUSTER_GATE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The per-process half of [`cluster_gate`]: one async mutex per test
+/// process, so lanes inside one binary queue without touching the
+/// file lock and only the queue's head polls the OS.
+static CLUSTER_GATE_PROCESS: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+  std::sync::OnceLock::new();
+
+/// One held multi-cluster slot (audit 2026-10-27 B3): serializes the
+/// heavy multi-cluster lanes against every other such lane, in this
+/// process (async mutex) and across processes (exclusive file lock
+/// under `target/`). The OS lock drops before the process mutex —
+/// declaration order — so the next lane of this process never holds
+/// the mutex while another process still sees this one locked. A
+/// machine that can host no lock file at all degrades to
+/// process-local serialization rather than hanging the lane.
+pub struct ClusterGate {
+  _file: Option<std::fs::File>,
+  _process: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Acquires the shared multi-cluster gate and returns a guard that
+/// releases it on drop. Test files that run several-node clusters use
+/// one gate per lane so at most one oversubscribed cluster owns the
+/// machine at a time, regardless of which test file's process it runs
+/// in — the per-file `OnceLock` gates this replaces serialized lanes
+/// only within their own binary and left cross-file parallelism
+/// unbounded (audit 2026-10-27 B3).
+pub async fn cluster_gate() -> ClusterGate {
+  cluster_gate_with_lock_path(cluster_gate_lock_path()).await
+}
+
+/// The gate over an explicit lock-file path: the production entry point
+/// resolves the machine-wide location; the unit lane passes a private
+/// file so it never queues behind a real cluster lane.
+async fn cluster_gate_with_lock_path(path: std::path::PathBuf) -> ClusterGate {
+  let process = CLUSTER_GATE_PROCESS
+    .get_or_init(|| tokio::sync::Mutex::new(()))
+    .lock()
+    .await;
+  let file = lock_cluster_gate_file(path).await;
+  ClusterGate {
+    _file: file,
+    _process: process,
+  }
+}
+
+/// The cross-process half: opens (or creates) the lock file and polls
+/// the kernel-managed exclusive lock (`std::fs::File::try_lock`, the
+/// cross-platform file lock stabilized in Rust 1.89) until this process
+/// owns it. The lock rides the returned file handle — closing it (drop
+/// or process exit) is the release — so there is no stale-lock state to
+/// clean up. A location that cannot host the lock file, or a lock
+/// failure that is not plain contention, falls back to the temp dir
+/// once and then degrades to process-local serialization rather than
+/// hanging the lane.
+async fn lock_cluster_gate_file(path: std::path::PathBuf) -> Option<std::fs::File> {
+  enum Slot {
+    Acquired(std::fs::File),
+    Busy,
+    Unavailable,
+  }
+
+  fn try_open(path: &std::path::Path) -> Slot {
+    let file = match std::fs::OpenOptions::new()
+      .create(true)
+      .truncate(false)
+      .write(true)
+      .open(path)
+    {
+      Ok(file) => file,
+      Err(_) => return Slot::Unavailable,
+    };
+    match file.try_lock() {
+      Ok(()) => Slot::Acquired(file),
+      Err(std::fs::TryLockError::WouldBlock) => Slot::Busy,
+      Err(std::fs::TryLockError::Error(_)) => Slot::Unavailable,
+    }
+  }
+
+  let mut path = path;
+  let mut fallback_used = false;
+  loop {
+    match try_open(&path) {
+      Slot::Acquired(file) => return Some(file),
+      // Another test process holds the machine-wide slot: poll.
+      Slot::Busy => {}
+      Slot::Unavailable => {
+        if fallback_used {
+          return None;
+        }
+        fallback_used = true;
+        path = std::env::temp_dir().join(CLUSTER_GATE_LOCK_NAME);
+      }
+    }
+    tokio::time::sleep(CLUSTER_GATE_POLL).await;
+  }
+}
+
+/// Resolves the lock file's directory: an explicit `CARGO_TARGET_DIR`
+/// wins; otherwise the `target/` directory that contains this test
+/// binary (`…/target/<profile>/deps/…`, walked up from the executable
+/// so both cargo and nextest layouts resolve); a binary run from
+/// outside any target tree falls back to the temp dir.
+fn cluster_gate_lock_path() -> std::path::PathBuf {
+  if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+    return std::path::PathBuf::from(dir).join(CLUSTER_GATE_LOCK_NAME);
+  }
+  if let Ok(executable) = std::env::current_exe()
+    && let Some(target) = executable
+      .ancestors()
+      .find(|path| path.file_name() == Some(std::ffi::OsStr::new("target")))
+  {
+    return target.join(CLUSTER_GATE_LOCK_NAME);
+  }
+  std::env::temp_dir().join(CLUSTER_GATE_LOCK_NAME)
+}
+
 use sha2::{Digest as ShaDigest, Sha256};
 
 pub const MAX_ARTIFACT_BYTES: usize = 1_048_576;
@@ -1676,5 +1804,56 @@ mod tests {
       ),
       Err(ArtifactError::FixedFieldsExceedByteCeiling),
     );
+  }
+
+  #[test]
+  fn file_try_lock_excludes_a_second_handle_while_held() {
+    // The cross-process half of `cluster_gate` rests on this primitive
+    // semantic: one open file description holding the kernel lock
+    // excludes a second opener with `WouldBlock`, and closing the
+    // holder releases it. Pinned on a scratch file so the shared gate
+    // lock is untouched.
+    let path = std::env::temp_dir().join(format!(
+      "radiata-test-support-gate-{}-{}",
+      std::process::id(),
+      line!()
+    ));
+    let open = || {
+      std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    };
+    let first = open().unwrap();
+    assert!(first.try_lock().is_ok());
+    let second = open().unwrap();
+    assert!(matches!(
+      second.try_lock(),
+      Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(first);
+    let third = open().unwrap();
+    assert!(third.try_lock().is_ok());
+    drop(third);
+    drop(second);
+    let _ = std::fs::remove_file(&path);
+  }
+
+  #[tokio::test]
+  async fn cluster_gate_acquires_releases_and_reacquires() {
+    // The composed gate end-to-end over a PRIVATE lock file: the unit
+    // lane must not queue behind a real multi-cluster lane holding the
+    // machine-wide slot (the file half is the only machine-wide part;
+    // the process mutex is private to this binary anyway).
+    let path = std::env::temp_dir().join(format!(
+      ".radiata-cluster-gate-test-{}.lock",
+      std::process::id()
+    ));
+    let gate = crate::cluster_gate_with_lock_path(path.clone()).await;
+    drop(gate);
+    let gate = crate::cluster_gate_with_lock_path(path.clone()).await;
+    drop(gate);
+    let _ = std::fs::remove_file(&path);
   }
 }
