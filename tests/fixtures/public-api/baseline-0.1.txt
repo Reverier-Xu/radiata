@@ -537,6 +537,7 @@ pub fn radiata::NodeConfig::with_anti_entropy_interval(self, core::time::Duratio
 pub fn radiata::NodeConfig::with_authentication_deadline(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_connection_degree(self, usize) -> Self
 pub fn radiata::NodeConfig::with_dial_deadline(self, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_member_spki_anchor_limits(self, usize, usize) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_merge_admission(self, radiata::MergeAdmissionLimits) -> Self
 pub fn radiata::NodeConfig::with_receipt_retention(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_recovery_policy(self, radiata::RecoveryConfig) -> radiata::Result<Self>
