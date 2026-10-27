@@ -1692,6 +1692,10 @@ mod tests {
       session_a.responder.config.channel_binding,
       session_b.responder.config.channel_binding
     );
+    assert_ne!(
+      session_a.initiator.config.channel_binding,
+      session_b.initiator.config.channel_binding
+    );
 
     // First layer: strict position ordering. The replayed position-one
     // hello is structurally valid and advances the responder, which then
@@ -1728,9 +1732,12 @@ mod tests {
     let hello_b = initiator_b.initiator_hello().unwrap();
     assert_eq!(hello_b, replayed_hello);
     responder_b.receive(&hello_b).unwrap();
-    initiator_b
-      .receive(&responder_b.responder_hello().unwrap())
-      .unwrap();
+    let responder_hello_b = responder_b.responder_hello().unwrap();
+    assert_eq!(
+      responder_hello_b, exchange_a.messages[1],
+      "session B's responder hello must be byte-identical to session A's"
+    );
+    initiator_b.receive(&responder_hello_b).unwrap();
     let responder_proof_b = responder_b
       .responder_proof(sign(
         &session_b.responder.seed,
