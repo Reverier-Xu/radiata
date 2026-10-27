@@ -257,13 +257,35 @@ async fn lane_bare_tls() -> (u64, Duration, usize) {
   (ticks, wall, delivered.1 - WARMUP * PAYLOAD_BYTES)
 }
 
+/// The benchmark's tracing init, matching the repo's test convention
+/// (`with_test_writer`, `RUST_LOG` honored). The default filter keeps the
+/// library quiet (`radiata=warn`) while leaving this file's own `info!`
+/// report lines visible — without it an unset `RUST_LOG` hides the report
+/// the benchmark exists to produce.
+fn init_tracing() {
+  use std::sync::Once;
+  static INIT: Once = Once::new();
+  INIT.call_once(|| {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+      .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,radiata=warn"));
+    let _ = tracing_subscriber::fmt()
+      .with_env_filter(filter)
+      .with_test_writer()
+      .try_init();
+  });
+}
+
 /// The benchmark: identical paced delivery through both lanes; the tick
 /// delta is the CBOR/framing/session encapsulation overhead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit benchmark: cargo test --test transport_benchmark -- --ignored --nocapture"]
 async fn transport_cpu_ticks_full_pipeline_vs_bare_tls() {
-  println!(
-    "transport benchmark: {CHUNKS} chunks x {PAYLOAD_BYTES} B at {RATE_PER_SEC} chunks/s (paced, one stream per lane)"
+  init_tracing();
+  tracing::info!(
+    "transport benchmark: {} chunks x {} B at {} chunks/s (paced, one stream per lane)",
+    CHUNKS,
+    PAYLOAD_BYTES,
+    RATE_PER_SEC
   );
 
   let receiver_sink = Arc::new(Sink::default());
@@ -285,15 +307,19 @@ async fn transport_cpu_ticks_full_pipeline_vs_bare_tls() {
 
   sender.shutdown().await.unwrap();
   receiver.shutdown().await.unwrap();
-  println!(
-    "lane A full pipeline : {a_ticks:>6} cpu ticks | {:>9.2} ms wall | {a_bytes} B delivered",
-    a_wall.as_secs_f64() * 1e3
+  tracing::info!(
+    "lane A full pipeline : {:>6} cpu ticks | {:>9.2} ms wall | {} B delivered",
+    a_ticks,
+    a_wall.as_secs_f64() * 1e3,
+    a_bytes
   );
 
   let (b_ticks, b_wall, b_bytes) = lane_bare_tls().await;
-  println!(
-    "lane B bare TLS      : {b_ticks:>6} cpu ticks | {:>9.2} ms wall | {b_bytes} B delivered",
-    b_wall.as_secs_f64() * 1e3
+  tracing::info!(
+    "lane B bare TLS      : {:>6} cpu ticks | {:>9.2} ms wall | {} B delivered",
+    b_ticks,
+    b_wall.as_secs_f64() * 1e3,
+    b_bytes
   );
 
   let overhead = if b_ticks > 0 {
@@ -301,5 +327,5 @@ async fn transport_cpu_ticks_full_pipeline_vs_bare_tls() {
   } else {
     f64::NAN
   };
-  println!("encapsulation overhead: {overhead:.1}% extra cpu ticks");
+  tracing::info!("encapsulation overhead: {:.1}% extra cpu ticks", overhead);
 }
