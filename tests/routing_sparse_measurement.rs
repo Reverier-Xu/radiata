@@ -1253,7 +1253,7 @@ impl Invariants {
 }
 
 /// Measures one shape phase: enforces the exact topology, installs the
-/// BFS oracle table, runs the lanes, and prints the cells.
+/// BFS oracle table, runs the lanes, and logs the cells.
 async fn measure_shape(
   nodes: &[Node], shared: &Arc<Shared>, shape: &Shape, profile: Profile,
   invariants: &mut Invariants,
@@ -1758,7 +1758,7 @@ async fn sparse_routing_structural_invariants() {
   run_measurement(Profile::lean()).await;
 }
 
-/// The full statistical profile behind `--ignored`; its printed tables
+/// The full statistical profile behind `--ignored`; its logged tables
 /// are the D-6 measurement report data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "full statistical profile: cargo test --release --test routing_sparse_measurement sparse_routing_full_profile_tables -- --ignored --exact --nocapture"]
