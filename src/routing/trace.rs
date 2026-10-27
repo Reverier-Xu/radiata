@@ -1427,6 +1427,84 @@ mod tests {
       .with_transition(super::TraceTransition::Delivered, sink.clock_now())
   }
 
+  /// A sink whose owning identity context is already dropped — the
+  /// node-after-shutdown shape: the runtime released the store, and the
+  /// detached persistence this sink still holds must skip it instead of
+  /// re-pinning what the shutdown reply released.
+  async fn torn_down_sink() -> TraceSink {
+    let (sink, context, _live_records) = open_sink().await;
+    drop(context);
+    sink
+  }
+
+  /// Waits (on a wall-clock deadline) until the sink's bounded queue is
+  /// empty, so a teardown test observes the detached task's final
+  /// aggregate rather than an in-flight one.
+  async fn drained_drops(sink: &TraceSink) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while sink.queued() != 0 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the admitted queue never drained"
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  }
+
+  /// A terminal fact admitted after the node tore down skips its store
+  /// write and lands in the same drop aggregate the queue bound feeds
+  /// (audit 2026-10-27 B3, mechanism 2): the weak handle finds no
+  /// context, so nothing re-pins the released store, and the best-effort
+  /// surface keeps its accounting exact — one fed record is exactly one
+  /// of dropped or persisted.
+  #[tokio::test]
+  async fn terminal_persistence_after_teardown_skips_and_counts() {
+    let sink = torn_down_sink().await;
+
+    sink.record_terminal(terminal_record(21, &sink));
+
+    drained_drops(&sink).await;
+    assert_eq!(sink.dropped(), 1);
+    assert_eq!(sink.queued(), 0);
+  }
+
+  /// The revision path follows the same rule: a late-failure revision
+  /// admitted after the teardown skips, counts, and never re-opens the
+  /// store through the weak handle's failure.
+  #[tokio::test]
+  async fn terminal_revision_after_teardown_skips_and_counts() {
+    let sink = torn_down_sink().await;
+
+    sink.revise_terminal_failure(trace(22), node(1), node(9), ErrorKind::StreamInterrupted);
+
+    drained_drops(&sink).await;
+    assert_eq!(sink.dropped(), 1);
+    assert_eq!(sink.queued(), 0);
+  }
+
+  /// The teardown drop and the queue-bound drop feed one aggregate: a
+  /// full queue followed by a teardown counts both populations without
+  /// double-counting either.
+  #[tokio::test]
+  async fn teardown_drops_share_the_queue_bound_aggregate() {
+    let sink = torn_down_sink().await;
+
+    // Feed past the bound synchronously (single-threaded test runtime:
+    // the spawned tasks cannot run until the test awaits), then drain:
+    // the admitted population all skips on the torn-down context.
+    const FED: usize = 200;
+    for seed in 0..u32::try_from(FED).unwrap() {
+      sink.record_terminal(terminal_record(seed, &sink));
+    }
+    assert_eq!(sink.queued(), MAX_QUEUED_TRACE_PERSISTENCE);
+    drained_drops(&sink).await;
+    assert_eq!(
+      sink.dropped(),
+      FED,
+      "every fed record — overflow and admitted alike — must be counted as dropped"
+    );
+  }
+
   /// The terminal-persistence queue admits at most the bound: overflow
   /// records drop and are counted instead of queueing without limit,
   /// every admitted record still persists, and the drop aggregate reads
@@ -1651,10 +1729,17 @@ mod tests {
 /// work: once the queue bound is reached, further terminal records are
 /// dropped and counted in the observability snapshot instead of queueing
 /// without limit. The shared live-record counter lets the retention sweep
-/// stay skipped while no durable record exists.
+/// stay skipped while no durable record exists. The identity context is
+/// held weakly (the same rule the membership sync consumer and the
+/// reconcile plane follow): the detached persistence tasks this sink
+/// spawns are invisible to the shutdown barrier, so a strong reference
+/// would pin the metadata store — and the backend's exclusive file lock —
+/// for a few milliseconds past the shutdown reply; a task that upgrades
+/// after the runtime dropped the context skips its write and counts the
+/// drop, consistent with the best-effort semantics here.
 #[derive(Clone)]
 pub(crate) struct TraceSink {
-  context: std::sync::Arc<crate::identity::lifecycle::LocalIdentityContext>,
+  context: std::sync::Weak<crate::identity::lifecycle::LocalIdentityContext>,
   entropy: std::sync::Arc<dyn Entropy>,
   clock: std::sync::Arc<dyn WallClock>,
   /// Bounds concurrently running persistence tasks.
@@ -1663,14 +1748,22 @@ pub(crate) struct TraceSink {
   /// queue-bound compare-and-swap before each spawn, decremented when the
   /// spawned task finishes. The bound makes the queue depth structural.
   pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-  /// Terminal records dropped because the queue bound was full; surfaced
-  /// through the observability snapshot's drop counter.
+  /// Terminal records dropped because the queue bound was full or the
+  /// node's identity context tore down before the detached task ran;
+  /// surfaced through the observability snapshot's drop counter.
   dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   /// Approximate durable record population: incremented per successful
   /// persistence, decremented by the retention sweep's removals. Transition
   /// rewrites may over-approximate; that only costs extra cheap sweeps,
   /// never a missed one.
   live_records: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  /// The strong identity reference behind the weak field: only
+  /// [`Self::test_sink`] sets it, because a standalone test sink owns its
+  /// store for its whole life (no node shutdown exists for it to
+  /// outlive). Production sinks and every lib test that keeps its own
+  /// context handle leave this empty.
+  #[cfg(test)]
+  keep_alive: Option<std::sync::Arc<crate::identity::lifecycle::LocalIdentityContext>>,
 }
 
 /// The maximum number of concurrent terminal-record persistence tasks.
@@ -1699,8 +1792,12 @@ impl TraceSink {
     entropy: std::sync::Arc<dyn Entropy>, clock: std::sync::Arc<dyn WallClock>,
     live_records: std::sync::Arc<std::sync::atomic::AtomicUsize>,
   ) -> Self {
+    // Downgraded here so every construction site keeps its plain strong
+    // handle: the caller stays the context's owner, and this sink never
+    // becomes one. The entropy and clock stay strong by design — neither
+    // owns storage, so neither can pin the store past shutdown.
     Self {
-      context,
+      context: std::sync::Arc::downgrade(&context),
       entropy,
       clock,
       permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -1709,7 +1806,35 @@ impl TraceSink {
       pending: std::sync::Arc::default(),
       dropped: std::sync::Arc::default(),
       live_records,
+      #[cfg(test)]
+      keep_alive: None,
     }
+  }
+
+  /// Upgrades the weak identity handle: `None` means the runtime dropped
+  /// the context while this detached task was still queued, parked on a
+  /// permit, or unpolled — the node is shut down and its store is gone.
+  fn context_upgrade(
+    &self,
+  ) -> Option<std::sync::Arc<crate::identity::lifecycle::LocalIdentityContext>> {
+    self.context.upgrade()
+  }
+
+  /// Skips one admitted persistence task whose node is already torn
+  /// down: re-pinning the store the shutdown reply just released is the
+  /// residual lock tail (audit 2026-10-27 B3, mechanism 2), so the
+  /// record is dropped into the same aggregate the queue-bound drops
+  /// feed — the durable trace is a best-effort observation surface —
+  /// with a debug diagnostic matching that severity.
+  fn drop_after_teardown(&self) {
+    let dropped = self
+      .dropped
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+      + 1;
+    tracing::debug!(
+      dropped,
+      "route trace record dropped: node already shut down"
+    );
   }
 
   /// Admits one bounded persistence task when the queue bound has room,
@@ -1785,9 +1910,13 @@ impl TraceSink {
     &self, trace_id: TraceId, source: NodeId, destination: NodeId, kind: ErrorKind,
   ) {
     let _permit = self.permits.acquire().await;
+    let Some(context) = self.context_upgrade() else {
+      self.drop_after_teardown();
+      return;
+    };
     for attempt in 1..=MAX_TERMINAL_REVISION_ATTEMPTS {
       match revise_terminal_once(
-        self.context.store(),
+        context.store(),
         self.entropy.as_ref(),
         self.clock.as_ref(),
         &trace_id,
@@ -1853,8 +1982,12 @@ impl TraceSink {
   /// the stream path.
   pub(crate) async fn record(&self, record: TraceRecord) {
     let _permit = self.permits.acquire().await;
+    let Some(context) = self.context_upgrade() else {
+      self.drop_after_teardown();
+      return;
+    };
     match put_trace(
-      self.context.store(),
+      context.store(),
       self.entropy.as_ref(),
       self.clock.as_ref(),
       record,
@@ -1882,7 +2015,11 @@ impl TraceSink {
   #[cfg(test)]
   pub(crate) async fn persisted_records(&self) -> Vec<TraceRecord> {
     let space = namespace().expect("trace namespace");
-    let snapshot = self.context.store().snapshot().await.expect("snapshot");
+    let context = self
+      .context
+      .upgrade()
+      .expect("the test keeps the identity context alive");
+    let snapshot = context.store().snapshot().await.expect("snapshot");
     let mut scan = snapshot.scan(&space, &[]).await.expect("trace scan");
     let mut records = Vec::new();
     while let Some(entry) = scan.next().await.expect("trace scan row") {
@@ -1913,11 +2050,17 @@ impl TraceSink {
       .expect("test identity context"),
     );
     let live_records = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    Self::new(
-      context,
+    let mut sink = Self::new(
+      context.clone(),
       entropy,
       std::sync::Arc::new(crate::time::HostWallClock),
       live_records,
-    )
+    );
+    // A standalone test sink owns its store for its whole life: nothing
+    // else holds the context, so without this strong handle the weak
+    // field would die with `test_sink`'s scope and every persistence
+    // would skip. Production sinks never set it.
+    sink.keep_alive = Some(context);
+    sink
   }
 }
