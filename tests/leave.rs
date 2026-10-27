@@ -738,24 +738,14 @@ async fn restarted_node_passively_reconnects(
 
   // Restart on the SAME durable store: no Listen, no join, no connect —
   // the only path back is recovery seeding from the persisted evidence.
-  // A prior runtime instance's detached teardown can briefly hold the
-  // store's exclusive-open flag under load, so the start is retried to a
-  // deadline (the established admission-lane pattern).
-  let restarted = loop {
-    match NodeBuilder::new(storage.clone())
-      .keys(keys.clone())
-      .start()
-      .await
-    {
-      Ok(handle) => break handle,
-      Err(error)
-        if error.kind() == ErrorKind::StorageLocked && std::time::Instant::now() < deadline =>
-      {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-      }
-      Err(error) => panic!("restarted node start failed persistently: {error:?}"),
-    }
-  };
+  // The storage shutdown barrier covers every execution that could hold
+  // the store's lock past the reply (audit 2026-10-27 B3), so the
+  // restart opens directly with no retry.
+  let restarted = NodeBuilder::new(storage.clone())
+    .keys(keys.clone())
+    .start()
+    .await
+    .unwrap();
   assert_eq!(
     restarted.local_node().await.unwrap().node_id(),
     &node_id,

@@ -577,6 +577,9 @@ impl Storage for RedbStorage {
         if readers.is_idle() {
           return Ok(());
         }
+        // A caller that leaks a snapshot handle holds the barrier open;
+        // surface the wait instead of hanging the shutdown silently.
+        tracing::debug!("storage flush waiting for snapshot readers to drain");
         let notified = readers.settled.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();

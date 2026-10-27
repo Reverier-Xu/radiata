@@ -44,11 +44,18 @@ pub struct ClusterGate {
 /// only within their own binary and left cross-file parallelism
 /// unbounded (audit 2026-10-27 B3).
 pub async fn cluster_gate() -> ClusterGate {
+  cluster_gate_with_lock_path(cluster_gate_lock_path()).await
+}
+
+/// The gate over an explicit lock-file path: the production entry point
+/// resolves the machine-wide location; the unit lane passes a private
+/// file so it never queues behind a real cluster lane.
+async fn cluster_gate_with_lock_path(path: std::path::PathBuf) -> ClusterGate {
   let process = CLUSTER_GATE_PROCESS
     .get_or_init(|| tokio::sync::Mutex::new(()))
     .lock()
     .await;
-  let file = lock_cluster_gate_file().await;
+  let file = lock_cluster_gate_file(path).await;
   ClusterGate {
     _file: file,
     _process: process,
@@ -64,7 +71,7 @@ pub async fn cluster_gate() -> ClusterGate {
 /// failure that is not plain contention, falls back to the temp dir
 /// once and then degrades to process-local serialization rather than
 /// hanging the lane.
-async fn lock_cluster_gate_file() -> Option<std::fs::File> {
+async fn lock_cluster_gate_file(path: std::path::PathBuf) -> Option<std::fs::File> {
   enum Slot {
     Acquired(std::fs::File),
     Busy,
@@ -88,7 +95,7 @@ async fn lock_cluster_gate_file() -> Option<std::fs::File> {
     }
   }
 
-  let mut path = cluster_gate_lock_path();
+  let mut path = path;
   let mut fallback_used = false;
   loop {
     match try_open(&path) {
@@ -1835,12 +1842,18 @@ mod tests {
 
   #[tokio::test]
   async fn cluster_gate_acquires_releases_and_reacquires() {
-    // The composed gate end-to-end: the real lock file is created under
-    // this test binary's target tree, the guard holds it, and dropping
-    // the guard releases both halves so the next acquisition succeeds.
-    let gate = crate::cluster_gate().await;
+    // The composed gate end-to-end over a PRIVATE lock file: the unit
+    // lane must not queue behind a real multi-cluster lane holding the
+    // machine-wide slot (the file half is the only machine-wide part;
+    // the process mutex is private to this binary anyway).
+    let path = std::env::temp_dir().join(format!(
+      ".radiata-cluster-gate-test-{}.lock",
+      std::process::id()
+    ));
+    let gate = crate::cluster_gate_with_lock_path(path.clone()).await;
     drop(gate);
-    let gate = crate::cluster_gate().await;
+    let gate = crate::cluster_gate_with_lock_path(path.clone()).await;
     drop(gate);
+    let _ = std::fs::remove_file(&path);
   }
 }
