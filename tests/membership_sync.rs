@@ -25,7 +25,9 @@ use common::{MemoryStorageFactory, ScriptedKeys};
 /// tick per second, recovery fan-out sixteen with a two-second initial
 /// backoff — so the lanes double as the evidence that the single
 /// timing profile converges at sixteen-node scale (well inside the
-/// 10,000 ms SLO bound under the strict harness profile). The lanes
+/// 10,000 ms SLO bound of the quantified 16-node OCI profile when the
+/// operator exports RADIATA_SLO_PROFILE_STRICT=1; no CI workflow sets
+/// the flag, so a green CI run is functional evidence only). The lanes
 /// share one process: the test harness runs them concurrently on a
 /// runner that cannot carry several oversubscribed clusters at once,
 /// so the lanes serialize on this shared gate and each cluster owns

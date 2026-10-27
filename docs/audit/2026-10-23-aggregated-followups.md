@@ -79,7 +79,7 @@
 ### 已知遗留（不阻塞，记录备查）
 
 - ~~sync 路径 retire_session 不发 SessionChanged~~（2026-10-27 已修复，`ebb9a9c`）。
-- MemberSpkiTable 的界是内部常量而非 NodeConfig 旋钮。
+- ~~MemberSpkiTable 的界是内部常量而非 NodeConfig 旋钮~~（2026-10-27 已修复，`ba24c52`）。
 - 两个既有 redb 临时目录/并行度 flake（单独运行均通过）。
-- ADMISSION_CONCURRENCY = 4 未与其他容量旋钮联合调参。
+- ~~ADMISSION_CONCURRENCY = 4 未与其他容量旋钮联合调参~~（2026-10-27 已处理，`9fa34b9`：拓扑分析确认无合法配比，两条真实结构关系以编译期断言钉死）。
 - tests/admission_runtime.rs 的 deadline 断言契约已随 P2-15 更新（维护者批准）。

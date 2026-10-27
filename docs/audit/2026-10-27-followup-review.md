@@ -23,21 +23,17 @@
 
 ### A. 测试/证据强化（暂缓类）
 
-Wave 1/2 已落地的条目移至文末"已修复记录"。
+Wave 1/2/3a 已落地的条目移至文末"已修复记录"。
 
 | # | 条目 | verdict | 关键证据（当前代码） | 处置 |
 | --- | --- | --- | --- | --- |
-| A8 | 仿真≠运行时 | partial | 模型本质不变（`network.rs` 字节记账/boot epoch）；证据已经 `ProducerKind::Simulation`（`test-support/src/lib.rs:364-372`）显式分类 | Wave 3：runtime 恢复证据通道（建设项） |
-| A9 | 参考 oracle 不独立 | still-open | `src/storage/contract/reference.rs:160,300` 直接调用生产共享的 `classify_receipt`/`commit_precheck`（`src/provider.rs:968,1012`），语义漂移时 oracle 与生产同步变化 | Wave 3：独立化判定语义或加变异测试 |
-| A10 | 严格 SLO 无 CI 强制 | still-open | `RADIATA_SLO_PROFILE_STRICT` 在 `.github/workflows/` 出现 0 次；`scripts/verify-release.sh:27-31` 自认 operator-run | Wave 3：**收紧文档措辞**（维护者裁决） |
+| A8 | 仿真≠运行时 | partial | 模型本质不变（`network.rs` 字节记账/boot epoch）；证据已经 `ProducerKind::Simulation`（`test-support/src/lib.rs:364-372`）显式分类 | Wave 3b：runtime 恢复证据通道（建设项） |
 
 ### B. 已知遗留行为项
 
 | # | 条目 | verdict | 关键证据（当前代码） | 处置 |
 | --- | --- | --- | --- | --- |
-| B2 | `MemberSpkiTable` 界非旋钮 | still-open | `src/session/driver.rs:137-139` 私有常量 4/256；`NodeConfig`（`src/config.rs:9-49`）无对应字段 | Wave 3：加 `NodeConfig` 旋钮 |
-| B3 | redb flake ×2 | still-open | 锁释放竞态（`tests/redb_runtime.rs:123-131` 局部重试缓解，机制未根治）；`cluster_gate` 每文件独立，跨文件集群并行无全局串行 | Wave 3：根治竞态 + 并行度治理 |
-| B4 | `ADMISSION_CONCURRENCY` 未联合调参 | still-open | `src/runtime/supervisor.rs:65` 硬编码 4，仅 `PUMP_HANDOFF_CAPACITY` 派生，与其他容量旋钮无配比 | Wave 3：联合调参 |
+| B3 | redb flake ×2 | still-open | 锁释放竞态（`tests/redb_runtime.rs:123-131` 局部重试缓解，机制未根治）；`cluster_gate` 每文件独立，跨文件集群并行无全局串行 | Wave 3b：根治竞态 + 并行度治理 |
 
 ### C. 已关闭
 
@@ -54,11 +50,7 @@ Wave 1/2 已落地的条目移至文末"已修复记录"。
 **Wave 3（决策已落定后的工程项）**
 
 1. A8：runtime 恢复证据通道（真实节点 + 受控传输 + 持久化重开）。
-2. A9：oracle 判定语义独立化或变异测试。
-3. A10：文档收紧——明确常规绿 CI 不构成 SLO 证据，SLO 为 operator-run。
-4. B2：`MemberSpkiTable` 上界接入 `NodeConfig`。
-5. B3：redb 锁释放竞态根治 + 跨文件集群并行度治理。
-6. B4：`ADMISSION_CONCURRENCY` 与其他容量旋钮联合调参。
+2. B3：redb 锁释放竞态根治 + 跨文件集群并行度治理。
 
 每项遵循"一个逻辑改动一个 commit + 全量质量门"；行为改动须附表达可观测
 失败的回归测试。
@@ -87,3 +79,14 @@ Wave 2（2026-10-27）：四条 lane（glm-5.3 worker + fresh glm-5.3 reviewer
 | A5 分区/重复断言 | `e536946` + `861cb95` | 多重性在两个原始公开面 dedup 前计数；真双分量 split + 离线写 + 冻结断言 + 恢复后 digest 一致；重拨落地改用 incarnation id 证明（发现代际重置的合法时序） |
 | A6 零传输测量 | `346986b` + `9473ec0` | 实测结论：第二轮是全量重发（页字节逐字节相等）；e2e 钉死精确重发记录数（28/2554）；文档措辞如实化 |
 | hint 重试 CI flake | `f10ae0f` | `settle_recorded` 固定时窗改累计计数确定性等待；归属结构性正确；tick 12-13 保留静默负检查 |
+
+Wave 3a（2026-10-27）：四条 lane（glm-5.3 worker + fresh glm-5.3 reviewer
+逐项复核均为 approve-with-nits，minor 已修复），集成后主线全量质量门通过
+（41 个二进制 1077 项全绿）。
+
+| 条目 | 修复提交 | 方案要点 |
+| --- | --- | --- |
+| A9 oracle 独立化 | `d7d464b` | `reference_commit_verdict`/`reference_reconcile_verdict` 按契约文本独立重写，切断对 `provider.rs` 判定函数的调用；变异验证（生产 digest 分支改错 → redb/json lane 失败而 oracle lane 绿） |
+| A10 SLO 措辞 | `b884e1d` | README/verify-release/membership_sync 头注释：常规绿 CI = 功能证据非 deadline 证据；严格 profile 命令与 OCI 限定写明 |
+| B2 SPKI 旋钮 | `ba24c52` | `NodeConfig::with_member_spki_anchor_limits(per_peer, global)`（非零 + per_peer≤global 校验），默认 4/256 行为不变；配置经既有构造点流入淘汰逻辑（有非恒真测试钉死） |
+| B4 联合调参 | `9fa34b9` + `ae5fb8c` + `3a2e793` | 生产者/消费者拓扑分析结论：无合法配比可发明；钉住两条真实结构关系（`PUMP_HANDOFF=ADMISSION_CONCURRENCY`、`PACKET=CONTROL` 由全构建期 const assert 把守），其余旋钮各自独立性写入注释 |

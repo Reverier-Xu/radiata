@@ -15,8 +15,9 @@ use super::runner::{
 };
 use crate::{
   BoxFuture, CommitOutcome, CommitReceipt, Digest, Error, ProviderErrorContext, ProviderErrorKind,
-  ReconcileOutcome, Result, StoreCapabilities, StoreEntry, StoreKey, StoreNamespace,
-  StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue, TransactionId,
+  ReconcileOutcome, Result, StoreCapabilities, StoreEntry, StoreExpectation, StoreKey,
+  StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
+  TransactionId,
   provider::{Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -156,8 +157,7 @@ impl Storage for ReferenceStorage {
     &'a self, transaction: &'a TransactionId, digest: &'a Digest,
   ) -> BoxFuture<'a, Result<ReconcileOutcome>> {
     let state = self.state.lock().unwrap();
-    let outcome =
-      crate::provider::classify_receipt(state.receipts.get(transaction).cloned(), digest);
+    let outcome = reference_reconcile_verdict(&state.receipts, transaction, digest);
     Box::pin(async move { Ok(outcome) })
   }
 
@@ -293,23 +293,115 @@ impl StoreScan for ReferenceScan<'_> {
   }
 }
 
+// Oracle verdicts, deliberately independent of the production helpers
+// `crate::provider::commit_precheck`/`classify_receipt`/`condition_matches`
+// (audit 2026-10-27 A9): those helpers are the single implementation
+// behind the redb/json adapters, so a reference provider that calls them
+// inherits every production drift and stops being an oracle — the
+// adapter contract lanes would compare the adapters against a copy of
+// themselves and a semantic drift would never surface as a divergence.
+// Each table below is re-derived from the contract prose documented on
+// `crate::provider::Storage` (the "Commit ordering" and
+// "Reconciliation" bullets), which is also the sync obligation: when
+// that prose changes, re-derive these tables from the documentation,
+// never from `provider.rs`, and never collapse them back into calls of
+// the shared helpers.
+
+/// Reconcile verdict from the "Reconciliation" bullet of the `Storage`
+/// contract: no stored receipt means the transaction never applied; a
+/// receipt under the exact digest is the committed one; the same
+/// transaction id under any other digest is the digest conflict.
+fn reference_reconcile_verdict(
+  receipts: &BTreeMap<TransactionId, CommitReceipt>, transaction: &TransactionId, digest: &Digest,
+) -> ReconcileOutcome {
+  let Some(receipt) = receipts.get(transaction) else {
+    return ReconcileOutcome::Aborted;
+  };
+  if receipt.operation_digest() == digest {
+    ReconcileOutcome::Committed(receipt.clone())
+  } else {
+    ReconcileOutcome::DigestConflict
+  }
+}
+
+/// Commit verdict from the "Commit ordering" bullet of the `Storage`
+/// contract: the receipt replay decides first (the same transaction id
+/// and operation digest is the idempotent replay; the same id under
+/// another digest is a conflict), then the base revision (anything but
+/// the committing revision conflicts), then each operation's conditional
+/// expectation in order (the first miss conflicts, nothing applies).
+/// `None` hands the transaction to the apply phase. The provider-side
+/// digest tripwire is intentionally absent here: it guards a
+/// `StoreTransaction` construction invariant, not commit semantics.
+fn reference_commit_verdict(
+  state: &ReferenceState, transaction: &StoreTransaction,
+) -> Option<CommitOutcome> {
+  if let Some(receipt) = state.receipts.get(transaction.id()) {
+    return Some(
+      if receipt.operation_digest() == transaction.operation_digest() {
+        CommitOutcome::Committed(receipt.clone())
+      } else {
+        CommitOutcome::Conflict
+      },
+    );
+  }
+  if transaction.base_revision() != &reference_revision(state.generation) {
+    return Some(CommitOutcome::Conflict);
+  }
+  for operation in transaction.operations() {
+    let expectation_holds = match operation {
+      StoreOperation::Check {
+        namespace,
+        key,
+        expected,
+      }
+      | StoreOperation::Put {
+        namespace,
+        key,
+        expected,
+        ..
+      } => reference_entry_matches(
+        state.entries.get(&(namespace.clone(), key.clone())),
+        expected,
+      ),
+      StoreOperation::Delete {
+        namespace,
+        key,
+        expected,
+      } => state
+        .entries
+        .get(&(namespace.clone(), key.clone()))
+        .is_some_and(|entry| entry.digest() == expected),
+      StoreOperation::ForgetReceipt {
+        transaction,
+        expected_operation_digest,
+      } => state
+        .receipts
+        .get(transaction)
+        .is_some_and(|receipt| receipt.operation_digest() == expected_operation_digest),
+    };
+    if !expectation_holds {
+      return Some(CommitOutcome::Conflict);
+    }
+  }
+  None
+}
+
+/// Record expectation from the conditional part of the "Commit
+/// ordering" bullet of the `Storage` contract: `Absent` holds only over
+/// a missing record and `Exact` only over that exact content digest.
+fn reference_entry_matches(entry: Option<&StoreValue>, expected: &StoreExpectation) -> bool {
+  match expected {
+    StoreExpectation::Absent => entry.is_none(),
+    StoreExpectation::Exact(digest) => entry.is_some_and(|value| value.digest() == digest),
+  }
+}
+
 fn reference_commit(
   state: &Mutex<ReferenceState>, transaction: StoreTransaction,
 ) -> Result<CommitOutcome> {
   let mut state = state.lock().unwrap();
-  if let Some(outcome) = crate::provider::commit_precheck(
-    &transaction,
-    |id: &TransactionId| Ok(state.receipts.get(id).cloned()),
-    || Ok(reference_revision(state.generation)),
-    |namespace: &StoreNamespace, key: &StoreKey| {
-      Ok(
-        state
-          .entries
-          .get(&(namespace.clone(), key.clone()))
-          .map(|value| value.digest().clone()),
-      )
-    },
-  )? {
+  if let Some(outcome) = reference_commit_verdict(&state, &transaction) {
     return Ok(outcome);
   }
 
