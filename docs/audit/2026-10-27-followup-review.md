@@ -51,7 +51,14 @@
 
 **Wave 1（已完成，2026-10-27）**与 **Wave 2（已完成，2026-10-27）**：见文末"已修复记录"。
 
-**Wave 3 已全部完成**：无剩余待办。新发现的 TraceSink 项见上文 B 节。
+**Wave 3 已全部完成**：无剩余待办。新发现的 TraceSink 项见上文 B 节（已修复）。
+
+发布收尾（2026-10-27，fresh reviewer 复核 approve-with-nits）：
+
+| 项 | 提交 | 要点 |
+| --- | --- | --- |
+| TraceSink 弱引用 | `fff0f8d` + `a0033c0` | 见上文 B 节；顺带修复 admission_runtime 裸 handle drop 与立即重开的竞态 |
+| println 系清零 | `2ecf631` + `ca49f84` + `932500c` | 五个 benchmark/chaos/测量测试文件全部转 tracing（报告行 info、诊断 warn）；仅保留 `json/native.rs` 子进程 IPC 握手行；`common::init_tracing` fallback 补全局 warn 指令保诊断可见 |
 
 每项遵循"一个逻辑改动一个 commit + 全量质量门"；行为改动须附表达可观测
 失败的回归测试。
