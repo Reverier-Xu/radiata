@@ -215,7 +215,8 @@ impl ObservabilitySnapshot {
   /// Well-known counter tag: retained trace metadata records.
   pub const TRACE_RECORDS: &str = "radiata.woooo.tech/status/trace-records";
   /// Well-known counter tag: terminal trace records dropped because the
-  /// persistence queue was full (best-effort lane, never a data loss).
+  /// persistence queue was full or the node tore down mid-flight
+  /// (best-effort lane, never a data loss).
   pub const TRACE_RECORDS_DROPPED: &str = "radiata.woooo.tech/status/trace-records-dropped";
   /// Well-known counter tag: pending metadata transactions.
   pub const PENDING_TRANSACTIONS: &str = "radiata.woooo.tech/status/pending-transactions";

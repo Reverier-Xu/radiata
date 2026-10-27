@@ -29,11 +29,15 @@
 
 全部处理完毕，见文末"已修复记录"。本轮调查中另有新发现一项，记录备查：
 
-- **TraceSink 强引用滞后**（B3 调查中发现，未修）：`src/routing/trace.rs` 的 detached
+- **TraceSink 强引用滞后**（B3 调查中发现，**已于 2026-10-27 修复**）：`src/routing/trace.rs` 的 detached
   持久化任务强持有 `Arc<LocalIdentityContext>`（→ 存储 → 后端锁），对 shutdown 屏障
-  不可见；重路由场景下 shutdown 后任务尾巴仍可能持锁几毫秒。建议后续：改弱引用
-  （镜像 `MembershipSyncConsumer`/`ReconcilePlane` 的既有模式）或关闭路径排空 trace
-  队列。`tests/admission_runtime.rs` 的重启重试即针对此残留机制。
+  不可见；重路由场景下 shutdown 后任务尾巴仍可能持锁几毫秒。修复：改弱引用
+  （镜像 `MembershipSyncConsumer`/`ReconcilePlane` 的既有模式），upgrade 失败的持久化
+  跳过并计入既有 dropped 聚合；`tests/admission_runtime.rs` 的重启重试已删除（改为直接
+  启动，durable-resolution 场景的重启改走 graceful shutdown 回复）；回归测试：lib 层
+  teardown 跳过与计数（变异验证过强引用构建必挂）、redb 层有路由 trace 流量场景的
+  shutdown 后无重试立即重开。注：原重试还掩盖了同文件一处 handle-drop 异步拆除与立即
+  重开的竞态（非 trace 尾巴），该场景已改走 shutdown 回复。
 
 ### C. 已关闭
 
