@@ -33,9 +33,9 @@ use crate::{
 
 /// Depth of the node's control channel, the API verbs' command queue:
 /// every writer is a request/reply call on a node handle
-/// (`RuntimeClient::send_command`, plus the task effects' member read),
-/// each awaiting its oneshot before returning, and the supervisor's
-/// select loop answers one command inline per iteration. The depth is
+/// (`RuntimeClient::send_command`, including `shutdown`), each awaiting
+/// its oneshot before returning, and the supervisor's select loop
+/// answers one command inline per iteration. The depth is
 /// therefore the accepted number of concurrently unanswered control
 /// reads before a calling handle's `send_command` parks — no
 /// packet-admission path ever writes a control message and no control
@@ -73,10 +73,11 @@ pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 /// policy governs how far either plane may queue ahead of the loop
 /// before its sender observes backpressure (`send` parking, or the
 /// fire-and-forget `try_send` typed overload). This is a shared policy,
-/// not a structural necessity: the packet plane's own producers are the
-/// public send verbs plus the membership-sync dispatches (one page per
-/// session per round), and the dispatch retry budget in `sync_common`
-/// rides out bursts that outrun this depth.
+/// not a structural necessity: the packet plane's producers are the
+/// public send verbs plus the internal-plane sync dispatches (the
+/// membership pages and the reconcile lanes' rows and replies), and
+/// the dispatch retry budget in `sync_common` rides out bursts that
+/// outrun this depth.
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
 
 /// The bound on simultaneously running packet admission tasks (audit
@@ -99,10 +100,27 @@ pub(crate) const ADMISSION_CONCURRENCY: usize = 4;
 /// handoffs always fit without parking. The loop is the sole consumer
 /// and reaps the channel whenever it runs, so a finished admission
 /// parks on a full channel for at most one scheduling window — never
-/// behind its own pool — and a loop that has exited drops the receiving
-/// end, so a late handoff send observes `SendError` and rejects its
-/// request with the typed shutdown kind.
+/// behind its own pool — and defensively, a loop that has exited drops
+/// the receiving end, so a late handoff send would observe `SendError`
+/// and reject its request with the typed shutdown kind.
 const PUMP_HANDOFF_CAPACITY: usize = ADMISSION_CONCURRENCY;
+
+// The capacity constants' joint relations (audit follow-up B4), pinned
+// at compile time so a violation fails any build: the pump handoff
+// queue must fit every handoff one fully parallel admission window can
+// produce (each permit holder writes at most one handoff, and only the
+// loop spawns admissions), and the packet command channel stays on the
+// one depth policy shared with the control channel. A future edit that
+// re-inlines either side as an independent literal and silently breaks
+// the relation cannot compile.
+const _: () = assert!(
+  PUMP_HANDOFF_CAPACITY >= ADMISSION_CONCURRENCY,
+  "the pump handoff queue must hold at least one handoff per admission slot"
+);
+const _: () = assert!(
+  PACKET_CHANNEL_CAPACITY == CONTROL_CAPACITY,
+  "both command planes into the control loop share one depth policy"
+);
 
 /// One bound listener's supervisor-side entry: the published endpoint,
 /// the listener handle, and the abort handle of its accept loop.
@@ -2055,24 +2073,6 @@ mod admission_loop_tests {
   const SHUTDOWN_BOX: Duration = Duration::from_secs(10);
   /// The tag the fixture config selects and the pending policy owns.
   const PENDING_POLICY: &str = "example.com/policies/pending-admission";
-
-  /// The capacity constants' joint relations (audit follow-up B4),
-  /// pinned at compile time so a violation fails the test build itself:
-  /// the pump handoff queue must fit every handoff one fully parallel
-  /// admission window can produce (each permit holder writes at most
-  /// one handoff, and only the loop spawns admissions), and the packet
-  /// command channel stays on the one depth policy shared with the
-  /// control channel. A future edit that re-inlines either side as an
-  /// independent literal and silently breaks the relation cannot
-  /// compile the test suite.
-  const _: () = assert!(
-    PUMP_HANDOFF_CAPACITY >= ADMISSION_CONCURRENCY,
-    "the pump handoff queue must hold at least one handoff per admission slot"
-  );
-  const _: () = assert!(
-    PACKET_CHANNEL_CAPACITY == CONTROL_CAPACITY,
-    "both command planes into the control loop share one depth policy"
-  );
 
   /// A next-hop policy that never resolves: exactly the caller-supplied
   /// policy an admission must be able to await off the control loop.
