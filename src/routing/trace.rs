@@ -1545,16 +1545,12 @@ mod tests {
     // well-known tag.
     let snapshot = crate::ObservabilitySnapshot::new(
       sink.clock_now(),
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      persisted,
-      sink.dropped(),
-      0,
-      true,
+      crate::view::ObservabilityCounts {
+        trace_records: persisted,
+        trace_records_dropped: sink.dropped(),
+        storage_available: true,
+        ..crate::view::ObservabilityCounts::default()
+      },
     )
     .unwrap();
     let dropped_tag =

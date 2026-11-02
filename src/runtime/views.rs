@@ -267,21 +267,23 @@ impl Supervisor {
     }
     crate::ObservabilitySnapshot::new(
       std::time::SystemTime::now(),
-      sessions,
-      self
-        .dependencies
-        .listeners
-        .lock()
-        .map(|listeners| listeners.len())
-        .unwrap_or(0),
-      background_tasks,
-      queued_messages,
-      queued_bytes,
-      open_routes,
-      trace_records,
-      trace_records_dropped,
-      pending_transactions,
-      storage_available,
+      crate::view::ObservabilityCounts {
+        sessions,
+        listeners: self
+          .dependencies
+          .listeners
+          .lock()
+          .map(|listeners| listeners.len())
+          .unwrap_or(0),
+        background_tasks,
+        queued_session_messages: queued_messages,
+        queued_session_bytes: queued_bytes,
+        open_routes,
+        trace_records,
+        trace_records_dropped,
+        pending_transactions,
+        storage_available,
+      },
     )
   }
   /// Pages the authenticated sessions as directed topology edges.

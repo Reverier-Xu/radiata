@@ -184,6 +184,22 @@ impl SessionPage {
   }
 }
 
+/// The runtime-collected inputs of one observability snapshot: one named
+/// field per well-known counter tag.
+#[derive(Default)]
+pub(crate) struct ObservabilityCounts {
+  pub(crate) sessions: usize,
+  pub(crate) listeners: usize,
+  pub(crate) background_tasks: usize,
+  pub(crate) queued_session_messages: usize,
+  pub(crate) queued_session_bytes: u64,
+  pub(crate) open_routes: usize,
+  pub(crate) trace_records: usize,
+  pub(crate) trace_records_dropped: usize,
+  pub(crate) pending_transactions: usize,
+  pub(crate) storage_available: bool,
+}
+
 /// The bounded observability snapshot of one node: counters keyed by
 /// well-known tags covering sessions,
 /// listeners, background tasks, queue totals, open routes, retained trace
@@ -235,49 +251,32 @@ impl ObservabilitySnapshot {
 
   /// Builds the snapshot from the runtime collectors; every well-known
   /// tag is present exactly once, in canonical order.
-  #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
-    captured_at: std::time::SystemTime, sessions: usize, listeners: usize, background_tasks: usize,
-    queued_session_messages: usize, queued_session_bytes: u64, open_routes: usize,
-    trace_records: usize, trace_records_dropped: usize, pending_transactions: usize,
-    storage_available: bool,
+    captured_at: std::time::SystemTime, counts: ObservabilityCounts,
   ) -> Result<Self> {
-    let internal = || Error::internal("observability counter");
     let counters: [(&str, u64); 10] = [
-      (
-        Self::SESSIONS,
-        u64::try_from(sessions).map_err(|_| internal())?,
-      ),
-      (
-        Self::LISTENERS,
-        u64::try_from(listeners).map_err(|_| internal())?,
-      ),
-      (
-        Self::BACKGROUND_TASKS,
-        u64::try_from(background_tasks).map_err(|_| internal())?,
-      ),
+      (Self::SESSIONS, count(counts.sessions)?),
+      (Self::LISTENERS, count(counts.listeners)?),
+      (Self::BACKGROUND_TASKS, count(counts.background_tasks)?),
       (
         Self::QUEUED_SESSION_MESSAGES,
-        u64::try_from(queued_session_messages).map_err(|_| internal())?,
+        count(counts.queued_session_messages)?,
       ),
-      (Self::QUEUED_SESSION_BYTES, queued_session_bytes),
-      (
-        Self::OPEN_ROUTES,
-        u64::try_from(open_routes).map_err(|_| internal())?,
-      ),
-      (
-        Self::TRACE_RECORDS,
-        u64::try_from(trace_records).map_err(|_| internal())?,
-      ),
+      (Self::QUEUED_SESSION_BYTES, counts.queued_session_bytes),
+      (Self::OPEN_ROUTES, count(counts.open_routes)?),
+      (Self::TRACE_RECORDS, count(counts.trace_records)?),
       (
         Self::TRACE_RECORDS_DROPPED,
-        u64::try_from(trace_records_dropped).map_err(|_| internal())?,
+        count(counts.trace_records_dropped)?,
       ),
       (
         Self::PENDING_TRANSACTIONS,
-        u64::try_from(pending_transactions).map_err(|_| internal())?,
+        count(counts.pending_transactions)?,
       ),
-      (Self::METADATA_STORE_AVAILABLE, u64::from(storage_available)),
+      (
+        Self::METADATA_STORE_AVAILABLE,
+        u64::from(counts.storage_available),
+      ),
     ];
     let mut map = std::collections::BTreeMap::new();
     for (tag, value) in counters {
@@ -291,6 +290,11 @@ impl ObservabilitySnapshot {
       counters: map,
     })
   }
+}
+
+/// Widens one collected counter into the snapshot's counter width.
+fn count(value: usize) -> Result<u64> {
+  u64::try_from(value).map_err(|_| Error::internal("observability counter"))
 }
 
 /// The local node's identity.
@@ -1095,9 +1099,9 @@ impl RecoveryView {
 mod tests {
   use std::time::{Duration, SystemTime};
 
-  use super::{TaskPage, TaskView};
+  use super::{ObservabilityCounts, ObservabilitySnapshot, TaskPage, TaskView};
   use crate::{
-    CredentialIssued, TaskId, TaskKind, TaskOutput, TaskPhase,
+    CredentialIssued, QualifiedTag, TaskId, TaskKind, TaskOutput, TaskPhase,
     task::{TaskError, TaskStatusRecord},
   };
 
@@ -1184,6 +1188,45 @@ mod tests {
         expires_at
       )))
     );
+  }
+
+  #[test]
+  fn observability_snapshot_labels_every_well_known_counter() {
+    let captured_at = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
+    // One distinct value per field: a mislabelled counter cannot read back
+    // as its own field's value.
+    let snapshot = ObservabilitySnapshot::new(
+      captured_at,
+      ObservabilityCounts {
+        sessions: 10,
+        listeners: 20,
+        background_tasks: 30,
+        queued_session_messages: 40,
+        queued_session_bytes: 50,
+        open_routes: 60,
+        trace_records: 70,
+        trace_records_dropped: 80,
+        pending_transactions: 90,
+        storage_available: true,
+      },
+    )
+    .expect("snapshot");
+    assert_eq!(snapshot.captured_at(), captured_at);
+    let counter = |tag: &str| {
+      snapshot
+        .counter(&QualifiedTag::parse(tag).expect("tag"))
+        .expect("counter")
+    };
+    assert_eq!(counter(ObservabilitySnapshot::SESSIONS), 10);
+    assert_eq!(counter(ObservabilitySnapshot::LISTENERS), 20);
+    assert_eq!(counter(ObservabilitySnapshot::BACKGROUND_TASKS), 30);
+    assert_eq!(counter(ObservabilitySnapshot::QUEUED_SESSION_MESSAGES), 40);
+    assert_eq!(counter(ObservabilitySnapshot::QUEUED_SESSION_BYTES), 50);
+    assert_eq!(counter(ObservabilitySnapshot::OPEN_ROUTES), 60);
+    assert_eq!(counter(ObservabilitySnapshot::TRACE_RECORDS), 70);
+    assert_eq!(counter(ObservabilitySnapshot::TRACE_RECORDS_DROPPED), 80);
+    assert_eq!(counter(ObservabilitySnapshot::PENDING_TRANSACTIONS), 90);
+    assert_eq!(counter(ObservabilitySnapshot::METADATA_STORE_AVAILABLE), 1);
   }
 
   #[test]
