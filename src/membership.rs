@@ -481,30 +481,24 @@ pub(crate) mod store {
       let mut skipped = Vec::new();
       for descriptor in contenders.iter().copied() {
         let key = descriptor_key(descriptor.node());
-        let existing = match snapshot.get(&namespace, &key).await? {
-          Some(value) => {
-            match crate::membership::page::decode_descriptor(value.as_bytes()) {
-              Ok(existing) => Some(existing),
-              // One corrupt durable row must not fail the whole page
-              // (the emit path holds the same principle): treat it as
-              // an incumbent the incoming record cannot beat, and report
-              // the incoming row as refused. Leaving it out of both lists
-              // would let the caller admit it into its engines while the
-              // store never receives it: the fingerprints then agree and
-              // nothing ever re-drives the missing row.
-              Err(error) => {
-                tracing::warn!(
-                  node = %descriptor.node(),
-                  kind = ?error.kind(),
-                  "membership page skipped over an undecodable stored descriptor"
-                );
-                skipped.push(descriptor.node().clone());
-                continue;
-              }
-            }
-          }
-          None => None,
-        };
+        // A corrupt stored descriptor is non-evidence, not a poison
+        // pill: treat it as absent so the verified incoming descriptor
+        // installs over it through the normal exact-CAS Put. Refusing
+        // the incoming row instead would leave the receiver's
+        // fingerprint without the key the sender keeps re-offering — a
+        // permanent divergence loop (the emit scan skips undecodable
+        // rows too).
+        let existing = snapshot
+          .get(&namespace, &key)
+          .await?
+          .as_ref()
+          .and_then(|value| {
+            crate::storage::incumbent::decode_or_absent(
+              value.as_bytes(),
+              crate::membership::page::decode_descriptor,
+              descriptor.node().as_str(),
+            )
+          });
         // The adopted-binding probe only matters for a skipped-revision
         // first install (see `descriptor_skip_reason`).
         let adopted = if existing.is_none() && descriptor.revision() > 1 {
@@ -811,15 +805,26 @@ mod tests {
     );
   }
 
-  /// A corrupt stored descriptor is an incumbent the incoming row cannot
-  /// beat, and the incoming row is reported as skipped: the caller keeps
-  /// it out of its derived view, so the row is re-delivered instead of
-  /// being admitted into the engines while the store never receives it.
+  /// A corrupt stored descriptor is non-evidence: the verified incoming
+  /// descriptor installs over it through the normal exact CAS, so the
+  /// lane self-heals instead of reporting the row skipped (a skip would
+  /// leave the receiver's fingerprint without the key the sender keeps
+  /// re-offering — a permanent divergence loop).
   #[tokio::test]
-  async fn undecodable_stored_descriptor_reports_the_incoming_row_as_skipped() {
+  async fn undecodable_stored_descriptor_is_replaced_by_the_incoming_row() {
     let store = crate::storage::MetadataStore::open(&factory(), std::time::Duration::from_secs(10))
       .await
       .unwrap();
+    // A revision-2 first install is healable only for an already trusted
+    // node, so adopt the binding the corrupt incumbent's row belongs to.
+    crate::identity::trust::store::adopt_binding_ctx(
+      &store,
+      &crate::api::SystemEntropy,
+      &node(1),
+      &key(1),
+    )
+    .await
+    .unwrap();
     let namespace = super::descriptor_namespace().unwrap();
     let key = crate::StoreKey::new(Arc::from(node(1).as_str().as_bytes().to_vec()));
     let snapshot = store.snapshot().await.unwrap();
@@ -838,23 +843,19 @@ mod tests {
     drop(snapshot);
     store.commit(transaction).await.unwrap();
 
-    let page = crate::membership::page::MembershipPage::new(
-      vec![descriptor(2, 1, vec!["one.example"], false)],
-      None,
-    )
-    .unwrap();
+    let incoming = descriptor(2, 1, vec!["one.example"], false);
+    let page = crate::membership::page::MembershipPage::new(vec![incoming.clone()], None).unwrap();
     let (applied, skipped) =
       store::apply_descriptor_batch_ctx(&store, &crate::api::SystemEntropy, &page)
         .await
         .unwrap();
-    assert!(applied.is_empty());
-    assert_eq!(skipped, vec![node(1)]);
+    assert_eq!(applied, vec![node(1)]);
+    assert!(skipped.is_empty(), "the corrupt incumbent is not a skip");
 
-    // The corrupt incumbent is untouched: the row was refused, not
-    // overwritten.
+    // The corrupt incumbent is replaced by the verified descriptor.
     let snapshot = store.snapshot().await.unwrap();
     let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
-    assert_eq!(stored.as_bytes(), b"not a descriptor");
+    assert_eq!(stored.as_bytes(), incoming.encode().unwrap().as_slice());
   }
 
   /// Two owner patches based on one observed revision (the audit's
