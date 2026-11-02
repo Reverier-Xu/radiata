@@ -164,8 +164,8 @@
 //! session — peer offline, teardown, or node shutdown — and the next
 //! eligible tick probes again. A stable cluster therefore does **not**
 //! densify: its steady-state session count stays the degree target plus
-//! the caller's own topology, plus at most that one bridge while a
-//! partition persists.
+//! the caller's own topology, plus at most that one bridge until its
+//! session retires (the edge is never pruned).
 //!
 //! Which transport carries a route is never inferred: every dial and
 //! bind resolves its transport from the endpoint's scheme alone — the

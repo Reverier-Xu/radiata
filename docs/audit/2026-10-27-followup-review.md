@@ -96,7 +96,7 @@ Wave 3a（2026-10-27）：四条 lane（glm-5.3 worker + fresh glm-5.3 reviewer
 | --- | --- | --- |
 | A9 oracle 独立化 | `d7d464b` | `reference_commit_verdict`/`reference_reconcile_verdict` 按契约文本独立重写，切断对 `provider.rs` 判定函数的调用；变异验证（生产 digest 分支改错 → redb/json lane 失败而 oracle lane 绿） |
 | A10 SLO 措辞 | `b884e1d` | README/verify-release/membership_sync 头注释：常规绿 CI = 功能证据非 deadline 证据；严格 profile 命令与 OCI 限定写明 |
-| B2 SPKI 旋钮 | `ba24c52` | `NodeConfig::with_member_spki_anchor_limits(per_peer, global)`（非零 + per_peer≤global 校验），默认 4/256 行为不变；配置经既有构造点流入淘汰逻辑（有非恒真测试钉死） |
+| B2 SPKI 旋钮 | `ba24c52` | `NodeConfig::with_member_spki_anchor_limits(per_peer, global)`（非零 + per_peer≤global 校验），默认 4/256 行为不变；配置经既有构造点流入淘汰逻辑（有非恒真测试钉死）。**2026-11-03 已删除**：该 pin 无安全增量（失败回退 merge trust 并重记锚点），连同两个旋钮在 `212ce49` 移除 |
 | B4 联合调参 | `9fa34b9` + `ae5fb8c` + `3a2e793` | 生产者/消费者拓扑分析结论：无合法配比可发明；钉住两条真实结构关系（`PUMP_HANDOFF=ADMISSION_CONCURRENCY`、`PACKET=CONTROL` 由全构建期 const assert 把守），其余旋钮各自独立性写入注释 |
 
 Wave 3b（2026-10-27）：fresh glm-5.3 reviewer 复核（approve-with-nits，minor 已修），
