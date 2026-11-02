@@ -43,7 +43,10 @@
 | `46e9bf5` | event_parity 等待远端资源安装后再 drain（测试确定性） |
 | `875004a` | 桥探针改为每节点一条 live probe 边，稳态 `k(n)+1` |
 | `74edd55` | 复审 nits：budget 重复注释/死语句、soak 字节阈值、issuer 锁毒构造器 |
-| `HEAD` | 复审 nits 文档：桥探针生命周期措辞、B2 审计行注记 |
+| `38356ef` | 复审 nits 文档：桥探针生命周期措辞、B2 审计行注记；新增本审计记录 |
+| `b53f75e` | 第二轮复审：桥探针 dialing-side 措辞、chapter 9 矛盾、feature digest 输入、残余记录 |
+| `f01ffe8` | 第二轮复审：receipt 坏值覆盖、删除空洞 cursor 断言、maintenance 测试改名 |
+| `HEAD` | 验证记录：最终门禁与 ABI 结果、测试隔离注记 |
 
 ## 未处理 / 推迟
 
@@ -57,9 +60,10 @@
 
 ## 验证
 
-- 全量质量门：`taplo fmt --check`、nightly `rustfmt --check`、`check`、`clippy -D warnings`、`test --workspace --all-features --locked` 全绿。
+- 全量质量门（无并发测试进程）：`taplo fmt --check`、nightly `rustfmt --check`、`check`、`clippy -D warnings`、`test --workspace --all-features --locked` 全绿（exit 0）。
 - 公开 ABI：`cargo-public-api 0.52.0` + nightly rustdoc 重新渲染，`public_abi` ignored 测试通过；基线随三次删除与一次新增更新。
-- 复审：fresh reviewer 对 HEAD 产物逐缝复核，结论 approve-with-notes；其 nits 已在本轮收尾提交中处理。
+- 复审：两轮 fresh reviewer。第一轮（无 shell）对 HEAD 产物逐缝复核，结论 approve-with-notes；第二轮（有 shell）逐 commit 读 diff、在 throwaway clone 复现 pre-fix 失败、并做变异验证，结论 approve-with-nits、无 blocker。其 nits 已在本轮收尾提交中处理；唯一 must-decide 是桥探针 same-side 选取的残余，已记录在“未处理 / 推迟”。
+- 测试隔离注记：`storage::redb::store::followup_tests::backfill_scan_failure_fails_the_open_and_commits_nothing` 与 `storage::redb::crash::redb_crash_boundaries_recover_exact_old_or_new_state` 在**并发**跑全量套件时偶发失败（前者共享进程级 fault hook，后者重开 redb 文件），单独运行必绿；最终门禁在无并发测试进程时通过。这是既有的测试隔离问题，不属于本轮改动。
 
 ## 环境注记
 
