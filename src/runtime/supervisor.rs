@@ -1207,9 +1207,10 @@ pub(super) async fn dial_member(
   transport: Arc<dyn Transport>, driver: SessionDriver,
   sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
   shutdown: watch::Receiver<()>, connection_tasks: ConnectionTasks, receiver: Endpoint,
-  peer: &NodeId, recovery_dialed: bool, dial_deadline: std::time::Duration,
+  peer: &NodeId, class: crate::session::stream::DialClass, dial_deadline: std::time::Duration,
 ) -> Result<NodeId> {
-  crate::audit::dial_started(peer.as_str(), recovery_dialed);
+  let recovery = class == crate::session::stream::DialClass::Recovery;
+  crate::audit::dial_started(peer.as_str(), recovery);
   let result = async {
     // A member dial carries the same trust intent as a join dial: the
     // endpoint's transport class decides it, and the member handshake's
@@ -1231,14 +1232,14 @@ pub(super) async fn dial_member(
       sessions,
       shutdown,
       receiver.clone(),
-      recovery_dialed,
+      class,
       |session_task| track_connection_task(&tracked_tasks, session_task),
     )
     .await?;
     Ok(authenticated)
   }
   .await;
-  crate::audit::dial_settled(peer.as_str(), recovery_dialed, result.is_ok());
+  crate::audit::dial_settled(peer.as_str(), recovery, result.is_ok());
   result
 }
 
@@ -1251,7 +1252,7 @@ pub(super) async fn keep_outbound_session(
   connection: crate::transport::connection::Connection,
   session: crate::session::EstablishedSession, packet: Arc<SessionPacketContext>,
   sessions: SessionTable, shutdown: watch::Receiver<()>, attachment: Endpoint,
-  recovery_dialed: bool,
+  class: crate::session::stream::DialClass,
   spawn: impl FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
 ) -> Result<()> {
   let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
@@ -1264,7 +1265,7 @@ pub(super) async fn keep_outbound_session(
     crate::session::stream::DialDirection::Outgoing,
     attachment,
     Some(registered_tx),
-    recovery_dialed,
+    class,
   )));
   if registered_rx.await.is_err() {
     return Err(Error::internal("session registration"));
@@ -2355,13 +2356,16 @@ pub(crate) mod test_support {
   }
 
   /// Inserts one live session entry for `peer` into the table: a
-  /// synthetic entry is enough — the tick only reads liveness.
+  /// synthetic entry is enough — the tick only reads liveness and the
+  /// edge class.
   pub(crate) fn insert_live_session(
     sessions: &SessionTable, peer: crate::NodeId, entropy: &dyn crate::api::Entropy,
+    class: crate::session::stream::DialClass,
   ) {
     let entry = crate::session::stream::SessionEntry::synthetic_entry(
       entropy,
       crate::Endpoint::parse("wss://127.0.0.1:1").unwrap(),
+      class,
     )
     .unwrap();
     sessions.lock().unwrap().insert(peer, entry);

@@ -6,10 +6,10 @@
 //! Plane separation, deliberately narrow: the maintenance plane is
 //! additive-only — it never prunes sessions, never gates functionality,
 //! and never touches the zero-session case (the recovery plane's
-//! high-frequency backoff owns a fully offline node). Its dials land as
-//! ordinary caller-class edges, so the recovery plane's redundancy
-//! pruning never fights the maintenance target. The degree gates only
-//! the status query and this cadence; below target with at least one
+//! high-frequency backoff owns a fully offline node). Its deficit dials
+//! land as ordinary caller-class edges, so the recovery plane's
+//! redundancy pruning never fights the maintenance target. The degree gates
+//! only the status query and this cadence; below target with at least one
 //! session everything keeps working.
 //!
 //! The tick runs on the dedicated maintenance worker (audit 2026-10-09
@@ -29,11 +29,19 @@
 //! (`degree_plan`) and the recovery controller quiesces on any one
 //! route. At most once per probe interval the tick dials ONE uniformly
 //! random unconnected member through the ordinary maintenance dial
-//! path. The interval bracket alone bounds the probe — one dial per
+//! path. The interval bracket alone bounds the dial rate — one dial per
 //! node per five minutes, whatever the session count — and a failed
 //! probe dial is recorded at debug level only: a refused or stalled
 //! peer is the probe's expected outcome while a partition persists,
 //! never an error condition.
+//!
+//! The probe is a one-shot bridge attempt, not a densification loop: the
+//! plane probes only while the node holds NO live probe edge, so a landed
+//! bridge caps the node at one probe edge — `k(n) + 1` sessions plus the
+//! caller's own topology, never a full mesh. That edge is never reclaimed
+//! by the recovery plane's redundancy pruning (a cut would re-split the
+//! partition it healed); it retires with its session — peer offline,
+//! teardown, or shutdown — and the next interval's tick probes again.
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -191,7 +199,11 @@ impl TickState {
       let Some(endpoint) = recovery_endpoint(&endpoints, serial) else {
         continue;
       };
-      self.spawn_maintenance_dial(peer, endpoint.clone());
+      self.spawn_maintenance_dial(
+        peer,
+        endpoint.clone(),
+        crate::session::stream::DialClass::Caller,
+      );
     }
     Ok(())
   }
@@ -206,16 +218,17 @@ impl TickState {
   /// member — including nodes already above the target, whose surplus
   /// app-initiated sessions must not blind them to the far side of a
   /// partition — at most once per [`BRIDGE_PROBE_INTERVAL_TICKS`]
-  /// eligible maintenance ticks (the interval bracket is the sole
-  /// storm bound), and dials exactly ONE uniformly random unconnected
-  /// member through the SAME deficit machinery (`select_degree_dials`,
-  /// endpoint rotation, `spawn_maintenance_dial`). The edge lands as an
-  /// ordinary caller-class maintenance edge — never recovery-class — so
-  /// the recovery plane's redundant-edge pruning
-  /// (`maybe_prune_recovery_edges`) never reclaims the bridge and
-  /// re-splits the partition it just healed. A failed probe dial is
-  /// recorded at debug level only: a refused peer is the probe's
-  /// expected outcome while the partition persists, never an error.
+  /// eligible maintenance ticks (the interval bracket bounds the dial
+  /// rate), and dials exactly ONE uniformly random unconnected member
+  /// through the SAME deficit machinery (`select_degree_dials`,
+  /// endpoint rotation, `spawn_maintenance_dial`). The edge lands as a
+  /// probe-class maintenance edge, never caller- or recovery-class: the
+  /// recovery plane's redundancy pruning never reclaims it — the bridge
+  /// that healed a partition must outlive any cut — and the plane stops
+  /// probing while it lives, so a node holds at most one probe edge. A
+  /// failed probe dial is recorded at debug level only: a refused peer
+  /// is the probe's expected outcome while the partition persists, never
+  /// an error.
   fn bridge_probe_tick(
     &self, local: &NodeId, members: &BTreeMap<NodeId, Vec<crate::Endpoint>>,
     connected: &BTreeSet<NodeId>, plan: &crate::membership::degree::DegreePlan,
@@ -256,6 +269,17 @@ impl TickState {
         .store(countdown - 1, std::sync::atomic::Ordering::Relaxed);
       return Ok(());
     }
+    // The one-live-probe-edge cap: a landed probe edge IS this node's
+    // bridge, so no further probe may fire while it lives — otherwise
+    // every interval that succeeds would add one more permanent edge and
+    // a healthy node would densify toward a full mesh. The check sits
+    // after the bracket on purpose: the bracket keeps advancing, so the
+    // first eligible tick after the probe edge retires probes again
+    // instead of waiting out a fresh interval.
+    if self.holds_live_probe_edge() {
+      debug!("bridge probe deferred: a probe edge is already live");
+      return Ok(());
+    }
     self.bridge_probe_ticks.store(
       BRIDGE_PROBE_INTERVAL_TICKS,
       std::sync::atomic::Ordering::Relaxed,
@@ -284,9 +308,30 @@ impl TickState {
         interval_ticks = BRIDGE_PROBE_INTERVAL_TICKS,
         "degree bridge probe dial"
       );
-      self.spawn_maintenance_dial(peer, endpoint.clone());
+      self.spawn_maintenance_dial(
+        peer,
+        endpoint.clone(),
+        crate::session::stream::DialClass::Probe,
+      );
     }
     Ok(())
+  }
+
+  /// Whether the node already holds a live bridge-probe edge: the probe
+  /// fires only while it holds none, so a landed probe caps the node at
+  /// one probe edge (the single extra session beyond the degree target).
+  /// A poisoned session-table lock reports "held": suppressing the probe
+  /// is the safe direction — it never densifies the mesh.
+  fn holds_live_probe_edge(&self) -> bool {
+    self
+      .sessions
+      .lock()
+      .map(|sessions| {
+        sessions.iter().any(|(_, entry)| {
+          entry.alive() && entry.dial_class() == crate::session::stream::DialClass::Probe
+        })
+      })
+      .unwrap_or(true)
   }
 
   /// Spawns one maintenance dial through the shared member dial
@@ -294,16 +339,18 @@ impl TickState {
   /// blocks on a handshake, the scoped permit releases the in-flight
   /// slot on completion, panic, or cancellation, and the JoinHandle
   /// joins the tracked connection-task set — the probe dials through
-  /// this exact path.
-  fn spawn_maintenance_dial(&self, peer: NodeId, receiver: crate::Endpoint) {
+  /// this exact path. The edge class travels with the dial: a deficit
+  /// dial is caller-class (never reclaimed), a probe dial is probe-class
+  /// (never reclaimed either, and capped at one live edge).
+  fn spawn_maintenance_dial(
+    &self, peer: NodeId, receiver: crate::Endpoint, class: crate::session::stream::DialClass,
+  ) {
     spawn_member_dial(
       self,
       Arc::clone(&self.maintenance_pending),
       peer,
       receiver,
-      // Ordinary caller-class edge: the recovery plane's redundancy
-      // pruning never reclaims a maintenance edge (additive-only).
-      false,
+      class,
       report_maintenance_dial_failure,
     );
   }
@@ -364,9 +411,12 @@ mod tests {
     atomic::{AtomicUsize, Ordering},
   };
 
-  use crate::runtime::supervisor::test_support::{
-    self, insert_live_session, install_member, member_id, member_key, refusing_peer, silent_peer,
-    supervisor_over,
+  use crate::{
+    runtime::supervisor::test_support::{
+      self, insert_live_session, install_member, member_id, member_key, refusing_peer, silent_peer,
+      supervisor_over,
+    },
+    session::stream::DialClass,
   };
 
   /// Installs one active member whose only endpoint addresses the
@@ -469,7 +519,12 @@ mod tests {
 
     // One live session: the deficit is two, dialed immediately and kept
     // in flight by the silent peer, so the slot count is deterministic.
-    insert_live_session(&sessions, member_id(101), ticks.entropy.as_ref());
+    insert_live_session(
+      &sessions,
+      member_id(101),
+      ticks.entropy.as_ref(),
+      DialClass::Caller,
+    );
     ticks.maintenance_tick().await.unwrap();
     let pending = ticks
       .maintenance_pending
@@ -523,7 +578,12 @@ mod tests {
     // endpoints — so the observed connection counts are deterministic.
     install_member(&supervisor, &reference, 101, &[first_port]).await;
     install_member(&supervisor, &reference, 102, &[first_port, second_port]).await;
-    insert_live_session(&sessions, member_id(101), ticks.entropy.as_ref());
+    insert_live_session(
+      &sessions,
+      member_id(101),
+      ticks.entropy.as_ref(),
+      DialClass::Caller,
+    );
 
     // First tick: attempt 1 dials the member's FIRST endpoint...
     ticks.maintenance_tick().await.unwrap();
@@ -613,7 +673,12 @@ mod tests {
     // candidates, so the batch and the connection counts are
     // deterministic.
     install_member(&supervisor, &reference, 103, &[first_port]).await;
-    insert_live_session(&sessions, member_id(103), ticks.entropy.as_ref());
+    insert_live_session(
+      &sessions,
+      member_id(103),
+      ticks.entropy.as_ref(),
+      DialClass::Caller,
+    );
 
     // First tick: the budget of two dials 101's refused first endpoint
     // and parks 102 against the silent peer — two slots taken, then
@@ -715,7 +780,12 @@ mod tests {
     // listener, so whichever member the uniform pick chooses, the dial
     // lands on the counted endpoint.
     for seed in 101..=104 {
-      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        ticks.entropy.as_ref(),
+        DialClass::Caller,
+      );
     }
     for seed in 101..=107 {
       install_member(&supervisor, &reference, seed, &[port]).await;
@@ -833,7 +903,12 @@ mod tests {
     // (107), so the probe's uniform pick is deterministic and the
     // silent listener counts the dial.
     for seed in 101..=106 {
-      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        ticks.entropy.as_ref(),
+        DialClass::Caller,
+      );
     }
     for seed in 101..=107 {
       install_member(&supervisor, &reference, seed, &[port]).await;
@@ -877,6 +952,95 @@ mod tests {
       0,
       "the bridge edge must never be recovery-class"
     );
+    holder.abort();
+  }
+
+  /// The probe is a one-shot bridge attempt, not a densification loop: a
+  /// landed probe edge is the node's one bridge, so the plane probes no
+  /// further while it lives — otherwise every five-minute bracket that
+  /// succeeds would add another permanent edge and a healthy node would
+  /// densify toward a full mesh. The edge retires with its session (peer
+  /// offline, teardown), and the next eligible tick probes again.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_live_probe_edge_suppresses_the_next_probe_until_it_retires() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (port, connections, holder) = silent_peer().await;
+
+    // An eight-node cluster (k(8) = 4): four live caller sessions put
+    // this node exactly at target, members 106 and 107 stay unconnected
+    // — so the probe is eligible — and the live probe edge to 105 is the
+    // bridge the previous probe landed.
+    for seed in 101..=104 {
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        ticks.entropy.as_ref(),
+        DialClass::Caller,
+      );
+    }
+    for seed in 101..=107 {
+      install_member(&supervisor, &reference, seed, &[port]).await;
+    }
+    insert_live_session(
+      &sessions,
+      member_id(105),
+      ticks.entropy.as_ref(),
+      DialClass::Probe,
+    );
+    let view = supervisor.connection_degree_view().await.unwrap();
+    assert_eq!(view.target(), 4, "k(8) = 4 from the shipped degree table");
+    assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
+
+    // Two whole brackets: while the probe edge lives, no probe dial may
+    // leave the plane — a second one would make the bridge permanent
+    // surplus on top of the first. The negative observation needs a
+    // settle window: a probe dial that (wrongly) left the plane would
+    // land on the counted listener inside it.
+    for _ in 0..(2 * super::BRIDGE_PROBE_INTERVAL_TICKS) {
+      ticks.maintenance_tick().await.unwrap();
+    }
+    let dialed = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+      loop {
+        if connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await;
+    assert!(
+      dialed.is_err(),
+      "a live probe edge must suppress every further probe dial"
+    );
+    assert_eq!(
+      ticks
+        .maintenance_pending
+        .load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "a suppressed probe takes no in-flight slot"
+    );
+
+    // The edge retires with its session: the bracket kept advancing while
+    // the probe was suppressed, so the very next eligible tick probes
+    // again instead of waiting out a fresh interval.
+    crate::session::stream::retire_session(&sessions, &member_id(105)).unwrap();
+    ticks.maintenance_tick().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the plane must probe again once the probe edge retires");
     holder.abort();
   }
 
@@ -1009,7 +1173,12 @@ mod tests {
     // A five-node cluster (k(5) = 3) healthy at target with exactly one
     // unconnected member (104), whose only endpoint refuses.
     for seed in 101..=103 {
-      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        ticks.entropy.as_ref(),
+        DialClass::Caller,
+      );
     }
     for seed in 101..=104 {
       install_member(&supervisor, &reference, seed, &[refused_port]).await;
@@ -1111,7 +1280,12 @@ mod tests {
     // member connected and the target exceeded — nothing left to
     // reach, so no probe may ever fire.
     for seed in 101..=104 {
-      insert_live_session(&sessions, member_id(seed), ticks.entropy.as_ref());
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        ticks.entropy.as_ref(),
+        DialClass::Caller,
+      );
     }
     for seed in 101..=104 {
       install_member(&supervisor, &reference, seed, &[port]).await;
@@ -1189,7 +1363,12 @@ mod tests {
     let (connected_port, _connected_connections, connected_holder) = silent_peer().await;
     install_member(&supervisor, &reference, 101, &[connected_port]).await;
     install_panicking_member(&supervisor, &reference, 102, "panicwire://unreachable").await;
-    insert_live_session(&sessions, member_id(101), ticks.entropy.as_ref());
+    insert_live_session(
+      &sessions,
+      member_id(101),
+      ticks.entropy.as_ref(),
+      DialClass::Caller,
+    );
 
     // First tick: the deficit dial starts and the custom transport's
     // future panics mid-dial.

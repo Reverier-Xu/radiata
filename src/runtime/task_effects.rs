@@ -356,7 +356,7 @@ async fn reconcile_join(
     planes.sessions.clone(),
     planes.shutdown.subscribe(),
     receiver,
-    false,
+    crate::session::stream::DialClass::Caller,
     |session_task| track_connection_task(&connection_tasks, session_task),
   )
   .await?;
@@ -380,7 +380,7 @@ async fn reconcile_connect(
     Arc::clone(&planes.connection_tasks),
     receiver,
     &peer,
-    false,
+    crate::session::stream::DialClass::Caller,
     planes.config.dial_deadline(),
   )
   .await?;
@@ -1571,7 +1571,9 @@ async fn reconcile_listen(
               crate::session::stream::DialDirection::Incoming,
               attachment.clone(),
               None,
-              false,
+              // An accepted inbound session is the peer's caller dial: the
+              // node's own topology, never reclaimed by pruning.
+              crate::session::stream::DialClass::Caller,
             )
             .await;
           }

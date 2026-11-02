@@ -382,6 +382,23 @@ pub(crate) enum DialDirection {
   Incoming,
 }
 
+/// Which plane initiated an established session, carried on the entry so
+/// the recovery plane's redundancy pruning can tell a reclaimable edge
+/// from one that must stay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DialClass {
+  /// A caller-configured, application, or accepted inbound session: the
+  /// node's own topology, never reclaimed by pruning.
+  Caller,
+  /// An isolated node's recovery dial: reclaimed once a caller edge
+  /// keeps the node connected (the star-preservation rule).
+  Recovery,
+  /// The connection-degree bridge probe: never reclaimed by pruning (a
+  /// cut would re-split the partition it healed), and capped at one live
+  /// edge per node by the degree plane's probe gate.
+  Probe,
+}
+
 /// The deterministic crossed-dial ownership rule: the
 /// connection initiated by the smaller node id wins, so both sides of a
 /// simultaneous dial converge to the same authenticated session. Each side
@@ -419,10 +436,10 @@ pub(crate) struct SessionEntry {
   pub(crate) meta: Arc<SessionMeta>,
   alive: Arc<AtomicBool>,
   direction: DialDirection,
-  /// Whether the recovery plane (not the caller) dialed this session:
-  /// pruning only ever retires recovery-dialed edges — caller-configured
-  /// and inbound sessions are never reclaimed by the pruning pass.
-  recovery_dialed: bool,
+  /// Which plane dialed this session: pruning only ever retires
+  /// recovery-dialed edges — caller-configured, application, inbound, and
+  /// bridge-probe sessions are never reclaimed by the pruning pass.
+  class: DialClass,
   retire: watch::Sender<()>,
 }
 
@@ -438,10 +455,10 @@ impl SessionEntry {
     &self.meta.id
   }
 
-  /// Whether the recovery plane dialed this session (prunable on
-  /// redundancy; see the bounded pruning pass in the recovery tick).
-  pub(crate) fn recovery_dialed(&self) -> bool {
-    self.recovery_dialed
+  /// Which plane dialed this session (the edge class the bounded pruning
+  /// pass in the recovery tick reads).
+  pub(crate) fn dial_class(&self) -> DialClass {
+    self.class
   }
 
   /// The queued outbound frame count (runtime status view).
@@ -465,7 +482,7 @@ impl SessionEntry {
   /// nothing more. Never compiled outside the test profile.
   #[cfg(test)]
   pub(crate) fn synthetic_entry(
-    entropy: &dyn crate::api::Entropy, endpoint: crate::Endpoint,
+    entropy: &dyn crate::api::Entropy, endpoint: crate::Endpoint, class: DialClass,
   ) -> crate::Result<Self> {
     let (frames, _receiver) = super::queue::BoundedSender::channel(8, 4096);
     Ok(Self {
@@ -481,7 +498,7 @@ impl SessionEntry {
       }),
       alive: Arc::new(AtomicBool::new(true)),
       direction: DialDirection::Outgoing,
-      recovery_dialed: false,
+      class,
       retire: watch::channel(()).0,
     })
   }
@@ -499,7 +516,7 @@ impl SessionEntry {
 pub(crate) async fn run_session(
   connection: Connection, session: EstablishedSession, context: Arc<SessionPacketContext>,
   table: SessionTable, shutdown: watch::Receiver<()>, direction: DialDirection,
-  attachment: crate::Endpoint, registered: Option<oneshot::Sender<()>>, recovery_dialed: bool,
+  attachment: crate::Endpoint, registered: Option<oneshot::Sender<()>>, class: DialClass,
 ) {
   let peer = session.peer().clone();
   let (writer, mut reader) = connection.into_split();
@@ -541,7 +558,7 @@ pub(crate) async fn run_session(
     }),
     alive: Arc::clone(&alive),
     direction,
-    recovery_dialed,
+    class,
     retire: retire_tx,
   };
   // The final authorization gate (audit 2026-10-23, P1-11): the peer was
@@ -845,7 +862,7 @@ pub(crate) fn test_entry(entropy: &dyn crate::api::Entropy) -> (SessionEntry, Bo
     }),
     alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     direction: DialDirection::Outgoing,
-    recovery_dialed: false,
+    class: DialClass::Caller,
     retire: watch::channel(()).0,
   };
   (entry, receiver)
@@ -966,7 +983,8 @@ mod pending_admission_tests {
   use tokio::sync::{oneshot, watch};
 
   use super::{
-    BoundedSender, DialDirection, PendingAck, PendingAcks, RouteTable, SessionEntry, SessionMeta,
+    BoundedSender, DialClass, DialDirection, PendingAck, PendingAcks, RouteTable, SessionEntry,
+    SessionMeta,
   };
   use crate::{
     ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId, packet::StaticBody,
@@ -1005,7 +1023,7 @@ mod pending_admission_tests {
       }),
       alive: Arc::new(AtomicBool::new(true)),
       direction: DialDirection::Outgoing,
-      recovery_dialed: false,
+      class: DialClass::Caller,
       retire,
     }
   }

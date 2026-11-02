@@ -320,7 +320,7 @@ impl TickState {
         Arc::clone(&self.recovery_pending),
         member.clone(),
         endpoint.clone(),
-        true,
+        crate::session::stream::DialClass::Recovery,
         report_recovery_dial_failure,
       );
     }
@@ -348,12 +348,20 @@ impl TickState {
   /// Bounded pruning of recovery-accumulated redundant edges.
   /// While connected, retires at most one recovery-dialed session per
   /// cooldown, choosing the highest peer id deterministically. An edge is
-  /// pruned only while at least one caller-configured or inbound session
-  /// remains: a node holding only recovery-dialed sessions never prunes
-  /// (those edges are its lifeline), so pruning can never re-isolate the
-  /// node, and a restored primary edge (inbound on this side) gradually
-  /// displaces the recovery mesh. Caller-configured and inbound sessions
+  /// pruned only while at least one non-reclaimable session remains: a
+  /// node holding only recovery-dialed sessions never prunes (those edges
+  /// are its lifeline), so pruning can never re-isolate the node, and a
+  /// restored primary edge (inbound on this side) gradually displaces the
+  /// recovery mesh. Caller-configured, application, and inbound sessions
   /// are never reclaimed here.
+  ///
+  /// Bridge-probe edges are outside this pass entirely: the probe edge is
+  /// the bridge across a partition, so reclaiming it would re-split the
+  /// partition it just healed. It retires with its session instead (peer
+  /// offline, teardown, or shutdown), and the degree plane's cap of one
+  /// live probe edge per node keeps it from accumulating. A probe edge
+  /// still counts as a non-reclaimable edge for the star-preservation
+  /// rule above: it is a live route the prune never cuts.
   ///
   /// The cooldown is an atomic because the tick state is Arc-shared
   /// between the two workers; only the recovery worker mutates it, so a
@@ -386,7 +394,7 @@ impl TickState {
     // reconnect that replaces the map entry in any window can never be
     // retired as the old redundant edge (audit 2026-10-09 item 13
     // addendum:
-    // the recovery-dialed flag belongs to the entry, not the key).
+    // the dial class belongs to the entry, not the key).
     let victim: Option<(NodeId, crate::session::stream::SessionEntry)> = {
       let mut sessions = self.sessions.lock().map_err(Error::session_table)?;
       let mut marked = Vec::new();
@@ -395,15 +403,15 @@ impl TickState {
         if !direct.contains(peer) || !entry.alive() {
           continue;
         }
-        if entry.recovery_dialed() {
+        if reclaimable(entry) {
           marked.push(peer.clone());
         } else {
           unmarked.push(peer.clone());
         }
       }
-      // The star-preservation rule: pruning requires a non-recovery edge
-      // to keep this node connected, so the fallback route survives the
-      // cut. The highest peer id remains the deterministic victim.
+      // The star-preservation rule: pruning requires a non-reclaimable
+      // edge to keep this node connected, so the fallback route survives
+      // the cut. The highest peer id remains the deterministic victim.
       let Some(victim) = marked.iter().max().cloned() else {
         return Ok(());
       };
@@ -412,7 +420,7 @@ impl TickState {
       }
       let removable = sessions
         .get(&victim)
-        .is_some_and(|entry| entry.alive() && entry.recovery_dialed());
+        .is_some_and(|entry| entry.alive() && reclaimable(entry));
       removable
         .then(|| sessions.remove(&victim).map(|entry| (victim, entry)))
         .flatten()
@@ -428,9 +436,23 @@ impl TickState {
       RECOVERY_PRUNE_COOLDOWN_TICKS,
       std::sync::atomic::Ordering::Relaxed,
     );
-    tracing::debug!(peer = %victim.as_str(), "pruned a redundant recovery-dialed edge");
+    tracing::debug!(
+      peer = %victim.as_str(),
+      class = ?entry.dial_class(),
+      "pruned a redundant recovery-dialed edge"
+    );
     Ok(())
   }
+}
+
+/// Whether one session edge is reclaimable by the redundancy prune: only a
+/// recovery-dialed edge is. Caller-configured, application, and inbound
+/// sessions are the node's own topology, and a bridge-probe edge is the
+/// route across the partition it healed — cutting it would re-split what
+/// the probe just joined (the degree plane's one-live-probe-edge cap
+/// keeps probe edges from accumulating instead).
+fn reclaimable(entry: &crate::session::stream::SessionEntry) -> bool {
+  entry.dial_class() == crate::session::stream::DialClass::Recovery
 }
 
 /// One scoped in-flight dial slot: [`DialPermit::acquire`] increments
@@ -479,12 +501,12 @@ pub(super) type DialFailureReport = fn(&NodeId, &Error);
 /// register the JoinHandle with the tracked connection-task set the
 /// recovery tick reaps and the shutdown path drains. The planes keep
 /// their own selection policies and budgets — the caller picks the
-/// counter the permit bounds, the `recovery_dialed` edge class, and the
-/// failure diagnostics; the helper owns only the execution and tracking
-/// mechanics both planes repeated.
+/// counter the permit bounds, the edge class the session entry carries,
+/// and the failure diagnostics; the helper owns only the execution and
+/// tracking mechanics both planes repeated.
 pub(super) fn spawn_member_dial(
   state: &TickState, pending: Arc<std::sync::atomic::AtomicUsize>, peer: NodeId,
-  receiver: Endpoint, recovery_dialed: bool, report: DialFailureReport,
+  receiver: Endpoint, class: crate::session::stream::DialClass, report: DialFailureReport,
 ) {
   let transport = match state.extensions.resolve_transport(&receiver.selector()) {
     Ok(transport) => transport,
@@ -519,7 +541,7 @@ pub(super) fn spawn_member_dial(
       connection_tasks,
       receiver,
       &peer,
-      recovery_dialed,
+      class,
       dial_deadline,
     )
     .await
@@ -660,7 +682,8 @@ mod tests {
       StoreRequirements, StoreSnapshot, StoreTransaction,
     },
     runtime::supervisor::test_support::{
-      install_member, member_id, member_key, refusing_peer, silent_peer, supervisor_over,
+      insert_live_session, install_member, member_id, member_key, refusing_peer, silent_peer,
+      supervisor_over,
     },
   };
 
@@ -1473,5 +1496,112 @@ mod tests {
     let error = ticks.recovery_tick_inner().await.unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::Internal);
     assert_eq!(error.context(), "recovery controller");
+  }
+
+  /// The bridge probe's landed edge is never reclaimed by the redundancy
+  /// prune. Two sub-partitions of a six-node cluster: this node's half
+  /// (101, 102) is connected, the probe edge (105) is the route across to
+  /// the far half, and member 104 is still unreachable — cutting the probe
+  /// edge would re-split the partition it just joined. The prune keeps
+  /// working in the same tick (the recovery-dialed edge 103 is reclaimed
+  /// because a caller edge remains), and it still leaves the probe edge
+  /// alone once the mesh completes: a probe edge retires with its session,
+  /// never with a cut, and the degree plane's one-live-probe-edge cap
+  /// keeps it from accumulating. The probe peer is the HIGHEST reclaimable
+  /// peer on purpose, so a prune that treated probe edges as reclaimable
+  /// would pick it first.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_probe_edge_is_never_reclaimed_by_the_redundancy_prune() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let (supervisor, entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      NodeConfig::new(),
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (port, _connections, holder) = silent_peer().await;
+    for seed in 101..=105 {
+      install_member(&supervisor, &reference, seed, &[port]).await;
+    }
+    // The local half (101, 102), one recovery-dialed edge (103), and the
+    // landed probe edge (105); the far half (104) is still unconnected,
+    // so the partition holds.
+    for seed in [101, 102] {
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        entropy.as_ref(),
+        crate::session::stream::DialClass::Caller,
+      );
+    }
+    insert_live_session(
+      &sessions,
+      member_id(103),
+      entropy.as_ref(),
+      crate::session::stream::DialClass::Recovery,
+    );
+    insert_live_session(
+      &sessions,
+      member_id(105),
+      entropy.as_ref(),
+      crate::session::stream::DialClass::Probe,
+    );
+
+    // Partitioned: the prune reclaims the redundant recovery-dialed edge
+    // and must leave the probe edge in place — it is the only route
+    // across the partition.
+    ticks.recovery_tick().await.unwrap();
+    assert_eq!(
+      supervisor.recovery_view().unreachable_members(),
+      1,
+      "the far-half member stays unreachable while the partition holds"
+    );
+    {
+      let table = sessions.lock().unwrap();
+      assert!(
+        table.contains_key(&member_id(105)),
+        "the probe edge must survive while a member is unreachable"
+      );
+      assert!(
+        !table.contains_key(&member_id(103)),
+        "the redundant recovery-dialed edge is reclaimed"
+      );
+    }
+
+    // The mesh completes: the far half reconnects (103 through a caller
+    // dial, 104 directly), so every known member has an authenticated
+    // path. The probe edge is still not reclaimed — a cut would re-split
+    // the partition it healed — while the caller edges stay put.
+    for seed in [103, 104] {
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        entropy.as_ref(),
+        crate::session::stream::DialClass::Caller,
+      );
+    }
+    for _ in 0..super::RECOVERY_PRUNE_COOLDOWN_TICKS {
+      ticks.recovery_tick().await.unwrap();
+    }
+    assert_eq!(
+      supervisor.recovery_view().unreachable_members(),
+      0,
+      "a complete mesh has no unreachable members"
+    );
+    let table = sessions.lock().unwrap();
+    assert!(
+      table.contains_key(&member_id(105)),
+      "the probe edge is never reclaimed by the prune, not even once the mesh is complete"
+    );
+    for seed in [101, 102, 103, 104] {
+      assert!(
+        table.contains_key(&member_id(seed)),
+        "caller edges are never reclaimed by the prune"
+      );
+    }
+    drop(table);
+    holder.abort();
   }
 }

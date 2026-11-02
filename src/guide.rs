@@ -144,27 +144,28 @@
 //! overrides it for topologies the library cannot know (a single
 //! public-IP relay needs one link, not seven). The degree is a
 //! maintenance target, never a functional gate: below target everything
-//! keeps working, above target nothing is pruned, and only a fully
-//! offline node falls back to the recovery plane's high-frequency
+//! keeps working, the maintenance plane itself never prunes, and only a
+//! fully offline node falls back to the recovery plane's high-frequency
 //! backoff. One deliberate exception keeps the contract honest across
-//! a partition: a healthy node that still has unconnected members
-//! maintains a low-frequency bridge probe — at most one dial of a
-//! uniformly random unconnected member per five minutes — because two
-//! sub-partitions each already meshed at or above target have a zero
-//! deficit budget and a quiesced recovery plane, and that probe is the
-//! only thing that re-bridges them.
+//! a partition: a healthy node that still has unconnected members and
+//! holds no bridge edge of its own maintains a low-frequency bridge probe
+//! — at most one dial of a uniformly random unconnected member per five
+//! minutes — because two sub-partitions each already meshed at or above
+//! target have a zero deficit budget and a quiesced recovery plane, and
+//! that probe is the only thing that re-bridges them.
 //!
-//! A bridge that lands is an ordinary edge, deliberately: the probe
-//! dials through the same maintenance path as a deficit batch, so the
-//! session it opens joins the mesh as a regular retained edge — the
-//! recovery plane's redundancy pruning never reclaims it, and the
-//! maintenance plane never prunes at all. A stable cluster therefore
-//! **densifies**: while any member stays unconnected, every
-//! five-minute bracket that succeeds adds one more permanent link,
-//! whatever the degree target says. That is the established contract,
-//! not a leak — the long-term shape of the mesh is controlled by the
-//! degree target and by operator observation, not by automatic
-//! pruning.
+//! A bridge that lands is a one-shot edge, deliberately: the probe dials
+//! through the same maintenance path as a deficit batch but carries its
+//! own edge class, and the plane probes no further while a probe edge is
+//! live — so a node accepts **one** bridge edge, not one per five-minute
+//! bracket. That edge is never reclaimed by the recovery plane's
+//! redundancy pruning: it is the route across the partition it healed, so
+//! a cut would re-split what the probe just joined. It retires with its
+//! session — peer offline, teardown, or node shutdown — and the next
+//! eligible tick probes again. A stable cluster therefore does **not**
+//! densify: its steady-state session count stays the degree target plus
+//! the caller's own topology, plus at most that one bridge while a
+//! partition persists.
 //!
 //! Which transport carries a route is never inferred: every dial and
 //! bind resolves its transport from the endpoint's scheme alone — the
@@ -775,15 +776,19 @@
 //! Two sizes are worth knowing, and the defaults already answer both:
 //!
 //! - **Memory** is roughly `queue bytes × live sessions` plus local diagnostics
-//!   and storage. The degree target shapes the typical count — about `k(n)`
+//!   and storage. The degree target shapes the steady-state count: about `k(n)`
 //!   maintenance sessions (seven at 64 members, growing with the logarithm of
-//!   the cluster) — but it is not a ceiling: the plane never prunes, so
-//!   application-initiated, inbound (hub-side), and bridge-probe sessions all
-//!   stay on top of the target. Plan against the live session count
+//!   the cluster), plus at most one bridge-probe session while a partition
+//!   persists — the probe is a one-shot bridge attempt, not a densification
+//!   loop: the plane stops probing while a probe edge is live and that edge
+//!   retires with its session, so the count never drifts toward a full mesh.
+//!   Application-initiated and inbound (hub-side) sessions stay on top of that.
+//!   Plan against `(k(n) + 1) × queue bytes` plus the caller's own edges — and,
+//!   for the live number, the session count
 //!   [`node.connection_degree()`](crate::NodeHandle::connection_degree)
 //!   reports: a 64-node member at the defaults holds roughly `8 MiB` of
-//!   outbound queue capacity per live session — `8 MiB × 7 ≈ 56 MiB` at the
-//!   typical count, more on a hub.
+//!   outbound queue capacity per live session — `8 MiB × 8 ≈ 64 MiB` at the
+//!   typical count (seven maintenance sessions plus one bridge), more on a hub.
 //!   [`with_session_queue_limits`](crate::NodeConfig::with_session_queue_limits)
 //!   and the degree override are the two knobs that change it materially.
 //! - **Background load** is the reconciliation plane ([chapter
@@ -803,10 +808,12 @@
 //!   path, so a hub's per-tick hold-down stays at the dispatch cost rather than
 //!   the slowest peer's ack bound. The degree-maintenance tick adds bounded
 //!   work on two cadences: one deficit-sized dial batch per 30 seconds while a
-//!   node heals below target, and — healthy but not fully meshed — at most one
-//!   bridge-probe dial per five minutes (the re-bridge path of [chapter
+//!   node heals below target, and — healthy, not fully meshed, and holding no
+//!   probe edge — at most one bridge-probe dial per five minutes (the one-shot
+//!   re-bridge path of [chapter
 //!   2](#2-the-any-one-route-connectivity-contract)); a fully connected node
-//!   spends nothing.
+//!   spends nothing, and a node already holding its bridge edge spends nothing
+//!   either.
 //!
 //! Delivery across restarts stays the application's job (the data
 //! plane is at-most-once): a `Failed` or interrupted stream is a
