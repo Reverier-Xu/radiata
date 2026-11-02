@@ -9,7 +9,7 @@
 //! (then `tcp://`, with the operator owning channel security).
 //!
 //! Security identity matches the WebSocket class exactly: the same
-//! ephemeral listener certificate, the same verifier trust modes, the
+//! ephemeral listener certificate, the same verifier trust relaxation, the
 //! same RFC 9266 exporter channel binding — only the message layer
 //! differs. The join hint travels as the framing layer's single hint
 //! frame instead of WebSocket upgrade headers.
@@ -57,16 +57,15 @@ impl Transport for TlsTransport {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Tls).await?;
-      let security = tls::listener_tls(&SystemEntropy)?;
+      let config = tls::listener_tls(&SystemEntropy)?;
       let rules = connection_frame_rules()?;
       let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
       Ok(Box::new(TlsListener {
         listener,
         shutdown_tx,
         shutdown: shutdown_rx,
-        acceptor: TlsAcceptor::from(security.config),
+        acceptor: TlsAcceptor::from(config),
         rules,
-        leaf: security.leaf_spki,
         bound,
       }) as Box<dyn TransportListener>)
     })
@@ -108,7 +107,6 @@ pub(crate) struct TlsListener {
   shutdown: tokio::sync::watch::Receiver<()>,
   acceptor: TlsAcceptor,
   rules: FrameRules,
-  leaf: Option<Vec<u8>>,
   bound: Endpoint,
 }
 
@@ -131,7 +129,6 @@ impl TransportListener for TlsListener {
   ) -> BoxFuture<'a, Result<Connection>> {
     let rules = self.rules;
     let mut shutdown = self.shutdown.clone();
-    let leaf = self.leaf.clone();
     Box::pin(async move {
       let tcp = tcp::accept(
         &self.listener,
@@ -142,12 +139,7 @@ impl TransportListener for TlsListener {
       // The hint is evaluated after the kernel accept, exactly like the
       // WebSocket class: the served generation is always the issuer's
       // current one.
-      let mut hint = hint();
-      if let Some(hint) = hint.as_mut()
-        && let Some(spki) = leaf
-      {
-        *hint = hint.clone().with_leaf_spki(spki);
-      }
+      let hint = hint();
       tracing::debug!("tls connection accepted");
       let tls_stream = self
         .acceptor

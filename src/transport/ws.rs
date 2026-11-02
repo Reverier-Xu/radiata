@@ -33,12 +33,6 @@ pub(crate) const WS_PATH: &str = "/mrly";
 /// generation ID hint (32 lowercase hexadecimal characters).
 pub(crate) const GENERATION_HINT_HEADER: &str = "mrly-generation";
 
-/// The response header carrying the listener's current leaf certificate
-/// SubjectPublicKeyInfo (lowercase hexadecimal DER). The joiner pins this
-/// as the member-mode TLS trust anchor, so a reconnect to the same
-/// listener cannot be replayed against a different certificate.
-pub(crate) const SPKI_HINT_HEADER: &str = "mrly-leaf-spki";
-
 fn generation_hex(generation: &[u8; 16]) -> String {
   crate::hex::encode(generation)
 }
@@ -97,23 +91,14 @@ fn parse_hint(
 ) -> Result<Option<MergeHint>> {
   let error = || Error::invalid_input("websocket hint");
   let generations: Vec<_> = headers.get_all(GENERATION_HINT_HEADER).iter().collect();
-  let spkis: Vec<_> = headers.get_all(SPKI_HINT_HEADER).iter().collect();
-  if generations.is_empty() && spkis.is_empty() {
+  if generations.is_empty() {
     return Ok(None);
   }
-  if generations.len() != 1 || spkis.len() > 1 {
+  if generations.len() != 1 {
     return Err(error());
   }
   let generation = parse_generation_hex(generations[0].to_str().map_err(|_| error())?)?;
-  let hint = MergeHint::new(generation);
-  let hint = match spkis.first() {
-    Some(spki) => hint.with_leaf_spki(crate::hex::decode(
-      spki.to_str().map_err(|_| error())?,
-      "websocket hint spki",
-    )?),
-    None => hint,
-  };
-  Ok(Some(hint))
+  Ok(Some(MergeHint::new(generation)))
 }
 
 // The tungstenite callback signature fixes the error type; the response
@@ -125,31 +110,17 @@ fn check_path(
 ) -> std::result::Result<Response, ErrorResponse> {
   if request.uri().path() == WS_PATH {
     if let Some(hint) = hint {
-      // Both hint values are canonical ASCII by construction; a failure to
-      // encode them is an internal bug and rejects the upgrade outright
+      // The hint value is canonical ASCII by construction; a failure to
+      // encode it is an internal bug and rejects the upgrade outright
       // rather than emitting a partial hint.
-      let spki = if hint.leaf_spki().is_empty() {
-        None
-      } else {
-        match HeaderValue::from_str(&crate::hex::encode(hint.leaf_spki())) {
-          Ok(spki) => Some(spki),
-          Err(_) => {
-            let mut rejection = ErrorResponse::new(Some("invalid merge hint".to_owned()));
-            *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            return Err(rejection);
-          }
-        }
-      };
       let Ok(generation) = HeaderValue::from_str(&generation_hex(hint.generation())) else {
         let mut rejection = ErrorResponse::new(Some("invalid merge hint".to_owned()));
         *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         return Err(rejection);
       };
-      let headers = response.headers_mut();
-      headers.insert(GENERATION_HINT_HEADER, generation);
-      if let Some(spki) = spki {
-        headers.insert(SPKI_HINT_HEADER, spki);
-      }
+      response
+        .headers_mut()
+        .insert(GENERATION_HINT_HEADER, generation);
     }
     return Ok(response);
   }

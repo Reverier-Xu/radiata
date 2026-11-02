@@ -87,31 +87,12 @@ pub(crate) fn client_config_for_trust(trust: &TransportTrust) -> Result<Arc<Clie
   }
 }
 
-/// The listener security material of one ephemeral certificate: the
-/// server TLS configuration plus the leaf SPKI the join hint carries for
-/// reconnect pinning. Fresh per listener, memory-only, never a node
-/// identity or trust record.
-pub(crate) struct ListenerSecurity {
-  pub(crate) config: Arc<ServerConfig>,
-  pub(crate) leaf_spki: Option<Vec<u8>>,
-}
-
 /// Generates the listener's ephemeral self-signed certificate from the
-/// injected entropy and builds its TLS 1.3 server configuration.
-pub(crate) fn listener_tls(entropy: &dyn crate::api::Entropy) -> Result<ListenerSecurity> {
+/// injected entropy and builds its TLS 1.3 server configuration. Fresh
+/// per listener, memory-only, never a node identity or trust record.
+pub(crate) fn listener_tls(entropy: &dyn crate::api::Entropy) -> Result<Arc<ServerConfig>> {
   let certificate = EphemeralCertificate::generate(entropy)?;
-  let config = server_config(&certificate)?;
-  let leaf_spki = match certificate.leaf_spki() {
-    Ok(spki) => Some(spki.as_ref().to_vec()),
-    // Without the SPKI the join hint loses its reconnect anchor
-    // (member-mode dialing cannot pin). This is a soft degradation,
-    // but it must never happen silently.
-    Err(error) => {
-      tracing::warn!(kind = ?error.kind(), "leaf spki unavailable; serving hint without pin");
-      None
-    }
-  };
-  Ok(ListenerSecurity { config, leaf_spki })
+  server_config(&certificate)
 }
 
 #[cfg(test)]

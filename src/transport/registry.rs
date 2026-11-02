@@ -378,9 +378,8 @@ impl TransportListener for ProviderListenerAdapter {
     Box::pin(async move {
       let stream = self.inner.accept().await?;
       // Evaluated after the medium accept, exactly like the built-in
-      // listeners. No leaf SPKI: a custom medium serves no certificate
-      // to pin, and the session handshake's identity proofs carry
-      // authentication.
+      // listeners. The session handshake's identity proofs carry
+      // authentication over the medium.
       let hint = hint();
       let rules = connection_frame_rules()?;
       let (read, write) = tokio::io::split(stream);

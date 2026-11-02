@@ -131,9 +131,8 @@ impl TransportListener for PlainListener {
       )
       .await?;
       let peer_addr = tcp.peer_addr().ok();
-      // The plaintext class serves no leaf SPKI: there is no certificate
-      // to pin, so member-mode reconnects over `tcp://` rely on the
-      // handshake proofs alone.
+      // The plaintext class serves no TLS material: the member-mode
+      // reconnects over `tcp://` rely on the handshake proofs alone.
       let hint = hint();
       let channel_binding = plaintext_channel_binding()?;
       let (read, write) = tokio::io::split(tcp);

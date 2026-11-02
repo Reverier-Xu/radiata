@@ -62,7 +62,7 @@ pub(crate) struct EffectPlanes {
   /// The node's entropy source (the effects' draws).
   pub(crate) entropy: Arc<dyn Entropy>,
   /// The session driver shared with the supervisor and the recovery
-  /// plane: its credential issuer and leaf-SPKI anchors are process-wide.
+  /// plane: its credential issuer is process-wide.
   pub(crate) driver: SessionDriver,
   /// The node-shared packet context every kept session routes through.
   pub(crate) packet: Arc<SessionPacketContext>,

@@ -75,16 +75,11 @@ impl EphemeralCertificate {
     self.key.clone_key()
   }
 
-  /// The leaf certificate bytes.
+  /// The leaf certificate bytes (test accessor: production code only
+  /// hands the chain and key to rustls).
+  #[cfg(test)]
   pub(crate) fn end_entity(&self) -> &CertificateDer<'static> {
     &self.cert
-  }
-
-  /// The leaf SubjectPublicKeyInfo, the member-mode TLS pinning anchor.
-  pub(crate) fn leaf_spki(&self) -> Result<rustls::pki_types::SubjectPublicKeyInfoDer<'static>> {
-    rustls::server::ParsedCertificate::try_from(self.end_entity())
-      .map(|parsed| parsed.subject_public_key_info())
-      .map_err(|_| Error::internal("ephemeral certificate spki"))
   }
 }
 

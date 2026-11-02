@@ -318,8 +318,7 @@ pub(crate) async fn spawn_runtime(
   // The node-shared operation handles are built here rather than inside
   // the supervisor: the supervisor's own fields, the verb effects, and
   // every node handle must read the same session driver (one credential
-  // issuer, one SPKI anchor table), the same packet context, and the same
-  // shutdown signal.
+  // issuer), the same packet context, and the same shutdown signal.
   let operations = operation_deps(
     &dependencies,
     packet_tx.clone(),
@@ -954,8 +953,8 @@ fn session_packet_context(
 }
 
 /// Builds the node-shared operation handles: the session driver (one
-/// credential issuer and one leaf-SPKI anchor table for the whole
-/// incarnation), the packet context, and the graceful-shutdown signal.
+/// credential issuer for the whole incarnation), the packet context, and
+/// the graceful-shutdown signal.
 /// Called once by `spawn_runtime`, and by the supervisor unit tests that
 /// build a standalone supervisor without the runtime's task manager.
 pub(super) fn operation_deps(

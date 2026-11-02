@@ -16,14 +16,15 @@
 //!   received pong surfaces to the session's liveness clock exactly like a WS
 //!   pong.
 //! - `0x03` hint: `u16` big-endian payload length plus the listener's
-//!   non-secret join hint. Every byte-stream listener sends exactly one hint
-//!   frame as its first application frame (an empty one when it cannot admit
-//!   mergers), the dialer reads it before returning from connect, and the join
-//!   flow therefore observes the same `merge_hint()` availability the WebSocket
-//!   upgrade headers provide.
+//!   non-secret join hint (a present flag and the credential generation ID).
+//!   Every byte-stream listener sends exactly one hint frame as its first
+//!   application frame (an empty one when it cannot admit mergers), the dialer
+//!   reads it before returning from connect, and the join flow therefore
+//!   observes the same `merge_hint()` availability the WebSocket upgrade
+//!   headers provide.
 //!
 //! All bounds are fixed: data frames cannot exceed the aggregate WS
-//! message ceiling, and hint payloads cannot exceed 65,535 bytes.
+//! message ceiling, and the hint payload is a fixed 17 bytes.
 
 use std::sync::Arc;
 
@@ -44,45 +45,25 @@ pub(crate) const TAG_PONG: u8 = 0x02;
 /// One listener join hint.
 pub(crate) const TAG_HINT: u8 = 0x03;
 
-/// The maximum hint payload length.
-const MAX_HINT_BYTES: usize = u16::MAX as usize;
-
 /// The hint-present flag of a hint payload.
 const HINT_PRESENT: u8 = 0x01;
 
 /// The non-secret merge hint a listener publishes inside its transport
 /// channel before the handshake: the credential generation ID (a
-/// handshake transcript input, never trusted on receipt) plus the
-/// listener's current leaf certificate SubjectPublicKeyInfo, which the
-/// joiner pins as the member-mode TLS trust anchor for reconnects.
+/// handshake transcript input, never trusted on receipt).
 ///
-/// The WebSocket transport encodes the same value as upgrade response
-/// headers (`ws` module); byte-stream transports encode it as the hint
+/// The WebSocket transport encodes the same value as an upgrade response
+/// header (`ws` module); byte-stream transports encode it as the hint
 /// frame. Availability semantics are identical: a listener that cannot
 /// admit mergers publishes no hint, and a merge dial fails typed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MergeHint {
   generation: [u8; 16],
-  leaf_spki: Vec<u8>,
 }
 
 impl MergeHint {
   pub(crate) const fn new(generation: [u8; 16]) -> Self {
-    Self {
-      generation,
-      leaf_spki: Vec::new(),
-    }
-  }
-
-  /// Attaches the listener's current leaf certificate SPKI as the
-  /// member-mode trust anchor for reconnect pinning.
-  pub(crate) fn with_leaf_spki(mut self, spki: Vec<u8>) -> Self {
-    self.leaf_spki = spki;
-    self
-  }
-
-  pub(crate) fn leaf_spki(&self) -> &[u8] {
-    &self.leaf_spki
+    Self { generation }
   }
 
   pub(crate) const fn generation(&self) -> &[u8; 16] {
@@ -129,17 +110,9 @@ where
   let Some(hint) = hint else {
     return write_all(write, &[TAG_HINT, 0x00, 0x00]).await;
   };
-  let spki = hint.leaf_spki();
-  let spki_len =
-    u16::try_from(spki.len()).map_err(|_| Error::invalid_input("transport hint spki"))?;
-  let mut payload = Vec::with_capacity(1 + hint.generation().len() + 2 + spki.len());
+  let mut payload = Vec::with_capacity(1 + hint.generation().len());
   payload.push(HINT_PRESENT);
   payload.extend_from_slice(hint.generation());
-  payload.extend_from_slice(&spki_len.to_be_bytes());
-  payload.extend_from_slice(spki);
-  if payload.len() > MAX_HINT_BYTES {
-    return Err(Error::invalid_input("transport hint spki"));
-  }
   let mut bytes = Vec::with_capacity(3 + payload.len());
   bytes.push(TAG_HINT);
   bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -229,29 +202,18 @@ async fn read_data(
 async fn read_hint(read: &mut (dyn AsyncRead + Unpin + Send)) -> Result<RawFrame> {
   let payload_len = read.read_u16().await.map_err(hint_io)?;
   // An empty payload is the listener's no-hint publication; anything
-  // else must carry the present flag, the generation, and a
-  // well-formed SPKI tail.
+  // else must carry the present flag and the generation.
   if payload_len == 0 {
     return Ok(RawFrame::Hint(None));
   }
   let mut payload = vec![0_u8; payload_len as usize];
   read_exact(read, &mut payload).await?;
   match payload.split_first() {
-    Some((&HINT_PRESENT, rest)) if rest.len() >= 16 + 2 => {
-      let generation: [u8; 16] = rest[..16]
+    Some((&HINT_PRESENT, rest)) if rest.len() == 16 => {
+      let generation: [u8; 16] = rest
         .try_into()
         .map_err(|_| Error::invalid_input("transport hint"))?;
-      let spki_len = u16::from_be_bytes([rest[16], rest[17]]) as usize;
-      let spki = rest
-        .get(18..)
-        .ok_or_else(|| Error::invalid_input("transport hint"))?
-        .to_vec();
-      if spki.len() != spki_len {
-        return Err(Error::invalid_input("transport hint"));
-      }
-      Ok(RawFrame::Hint(Some(
-        MergeHint::new(generation).with_leaf_spki(spki),
-      )))
+      Ok(RawFrame::Hint(Some(MergeHint::new(generation))))
     }
     _ => Err(Error::invalid_input("transport hint")),
   }
@@ -299,7 +261,9 @@ mod tests {
 
   use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
 
-  use super::{FrameRules, RawFrame, SharedWrite, read_frame, write_data, write_ping};
+  use super::{
+    FrameRules, MergeHint, RawFrame, SharedWrite, read_frame, write_data, write_hint, write_ping,
+  };
   use crate::Result;
 
   fn rules() -> FrameRules {
@@ -366,6 +330,29 @@ mod tests {
       "the close after the answered ping is orderly"
     );
     drop(client);
+    Ok(())
+  }
+
+  /// The hint frame carries exactly the present flag and the credential
+  /// generation: a 17-byte payload with no leaf SPKI tail. The regression
+  /// this guards is the deleted member pin's SPKI field riding along with
+  /// every join hint.
+  #[tokio::test]
+  async fn a_hint_frame_carries_only_the_generation() -> Result<()> {
+    let hint = MergeHint::new([0x5A; 16]);
+    let mut wire = Vec::new();
+    write_hint(&mut wire, Some(&hint)).await?;
+
+    let mut expected = vec![super::TAG_HINT, 0x00, 0x11, super::HINT_PRESENT];
+    expected.extend_from_slice(&[0x5A; 16]);
+    assert_eq!(wire, expected);
+
+    let mut read = wire.as_slice();
+    let pong_write: SharedWrite = Arc::new(tokio::sync::Mutex::new(Box::new(tokio::io::sink())));
+    match read_frame(&mut read, &pong_write, rules()).await? {
+      Some(RawFrame::Hint(Some(decoded))) => assert_eq!(decoded, hint),
+      _ => panic!("the hint frame must decode to its generation"),
+    }
     Ok(())
   }
 }

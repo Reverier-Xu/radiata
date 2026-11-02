@@ -13,8 +13,8 @@
 //! The upgrade runs on the fixed `/mrly` path with binary messages only
 //! and no per-message compression (the tungstenite permessage-deflate
 //! feature is not compiled in). The upgrade response carries the
-//! listener's non-secret join hints (credential generation ID, leaf
-//! SPKI) inside the TLS channel.
+//! listener's non-secret join hint (the credential generation ID) inside
+//! the TLS channel.
 
 use std::{fmt, sync::Arc};
 
@@ -58,16 +58,15 @@ impl Transport for WssTransport {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Wss).await?;
-      let security = tls::listener_tls(&SystemEntropy)?;
+      let config = tls::listener_tls(&SystemEntropy)?;
       let rules = connection_frame_rules()?;
       let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
       Ok(Box::new(WssListener {
         listener,
         shutdown_tx,
         shutdown: shutdown_rx,
-        config: security.config,
+        config,
         rules,
-        leaf: security.leaf_spki,
         bound,
       }) as Box<dyn TransportListener>)
     })
@@ -96,7 +95,6 @@ pub(crate) struct WssListener {
   shutdown: tokio::sync::watch::Receiver<()>,
   config: Arc<rustls::ServerConfig>,
   rules: FrameRules,
-  leaf: Option<Vec<u8>>,
   bound: Endpoint,
 }
 
@@ -120,7 +118,6 @@ impl TransportListener for WssListener {
     let config = Arc::clone(&self.config);
     let rules = self.rules;
     let mut shutdown = self.shutdown.clone();
-    let leaf = self.leaf.clone();
     Box::pin(async move {
       let tcp = tcp::accept(
         &self.listener,
@@ -130,14 +127,8 @@ impl TransportListener for WssListener {
       .await?;
       // The hint is evaluated after the kernel accept: the served
       // generation is the issuer's current one, not a snapshot from when
-      // the listener started blocking. The listener's leaf SPKI is
-      // attached here so reconnect pinning travels with the hint.
-      let mut hint = hint();
-      if let Some(hint) = hint.as_mut()
-        && let Some(spki) = leaf
-      {
-        *hint = hint.clone().with_leaf_spki(spki);
-      }
+      // the listener started blocking.
+      let hint = hint();
       Connection::accept_tls_ws(tcp, config, rules, hint.as_ref()).await
     })
   }
