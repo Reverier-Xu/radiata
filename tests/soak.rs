@@ -474,12 +474,16 @@ async fn soak_churn_then_baseline_return() {
   }
   wait_sessions(&[&issuer], 3).await;
 
-  // Queues return to the steady-state baseline: the anti-entropy slow
-  // cadence (PAGE/RESOURCE resend ticks at the 50ms tick) keeps one page
-  // plus its acknowledgement in flight periodically, so the queue
-  // baseline is a small bounded residual, not zero. The soak proves the
-  // residual stays bounded and leak-free (the queue audit delta equals
-  // the queued count) across a stability window.
+  // Queues return to the steady-state baseline. The idle-machine
+  // baseline is an empty queue — every sample of the stability window
+  // below reads zero — and the bound is a tolerance for the shared CI
+  // runners the weekly 8h and release 24h lanes run on, where a 50ms
+  // sample can catch the anti-entropy page flight and its acknowledgement
+  // in transit. The soak proves the residual stays inside that tolerance
+  // and leak-free (the queue audit delta equals the queued count) across
+  // the stability window, and publishes the bound it holds into the
+  // ledger (`steady_state_queue_max`) so the verify lane compares against
+  // this one number instead of a second hardcoded zero.
   const STEADY_STATE_QUEUE_MAX: u64 = 4;
   let deadline = Instant::now() + BASELINE_TIMEOUT;
   let mut stable_samples = 0_u32;
@@ -557,6 +561,7 @@ async fn soak_churn_then_baseline_return() {
   ));
   baseline.push(("queued_session_frames", issuer_queued.0));
   baseline.push(("queued_session_bytes", issuer_queued.1));
+  baseline.push(("steady_state_queue_max", STEADY_STATE_QUEUE_MAX));
   let pending: u64 = member_snapshots
     .iter()
     .chain(std::iter::once(&issuer_snapshot))
@@ -589,7 +594,7 @@ async fn soak_churn_then_baseline_return() {
     "the star topology must be re-established"
   );
   assert!(
-    issuer_queued.0 <= 4,
+    issuer_queued.0 <= STEADY_STATE_QUEUE_MAX,
     "the issuer queue must stay within the steady-state residual: {issuer_queued:?}"
   );
   assert!(
