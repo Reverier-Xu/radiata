@@ -100,6 +100,13 @@ impl NodeConfig {
   /// `keepalive_timeout > keepalive_interval`. These deadlines are
   /// peer-visible: keep them uniform across a cluster, or the tighter
   /// side closes sessions the looser side still holds alive.
+  ///
+  /// The policy is **second-granular**: the liveness observer compares
+  /// second-resolution activity stamps, so a sub-second component would
+  /// be silently truncated. A nonzero value below one second truncates
+  /// to zero and would close every session on the observer's first tick;
+  /// a fractional value (1500 ms) would silently become a different
+  /// deadline. Both are rejected here instead of misbehaving later.
   pub fn with_session_liveness(
     mut self, idle_timeout: Duration, keepalive_interval: Duration, keepalive_timeout: Duration,
   ) -> Result<Self> {
@@ -114,6 +121,9 @@ impl NodeConfig {
         || keepalive_timeout <= keepalive_interval)
     {
       return Err(Error::invalid_input("session liveness policy"));
+    }
+    for value in [idle_timeout, keepalive_interval, keepalive_timeout] {
+      ensure_whole_seconds(value, "session liveness policy")?;
     }
     self.session_idle_timeout = idle_timeout;
     self.keepalive_interval = keepalive_interval;
@@ -672,6 +682,15 @@ fn ensure_nonzero_duration(value: Duration, context: &'static str) -> Result<()>
   Ok(())
 }
 
+/// Rejects a duration whose sub-second component would be truncated by a
+/// second-granular consumer. Zero stays valid: it disables the policy.
+fn ensure_whole_seconds(value: Duration, context: &'static str) -> Result<()> {
+  if value.subsec_nanos() != 0 {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use std::time::Duration;
@@ -735,6 +754,42 @@ mod tests {
     assert_eq!(both.session_idle_timeout(), Duration::from_secs(30));
     assert_eq!(both.keepalive_interval(), Duration::from_secs(5));
     assert_eq!(both.keepalive_timeout(), Duration::from_secs(15));
+  }
+
+  /// The liveness policy is second-granular: a sub-second value would
+  /// truncate to zero in the observer and close every session on its
+  /// first tick, and a fractional value would silently become a
+  /// different deadline. Both are rejected at the constructor instead of
+  /// misbehaving at runtime.
+  #[test]
+  fn session_liveness_rejects_sub_second_granularity() {
+    for value in [
+      Duration::from_millis(500),
+      Duration::from_millis(1_500),
+      Duration::from_nanos(1),
+    ] {
+      let error = NodeConfig::new()
+        .with_session_liveness(value, Duration::ZERO, Duration::ZERO)
+        .unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+    // The keepalive pair is validated the same way: a fractional
+    // interval would truncate and change the meaning of the ordering
+    // invariant the setter enforces.
+    let error = NodeConfig::new()
+      .with_session_liveness(
+        Duration::ZERO,
+        Duration::from_millis(1_500),
+        Duration::from_secs(15),
+      )
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    // The smallest whole-second policy stays valid.
+    assert!(
+      NodeConfig::new()
+        .with_session_liveness(Duration::from_secs(1), Duration::ZERO, Duration::ZERO)
+        .is_ok()
+    );
   }
 
   /// The dial deadline accepts any nonzero duration and rejects zero: a
