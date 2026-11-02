@@ -10,18 +10,15 @@
 //! 4. any remaining conflict pair rejects the session;
 //! 5. the union of both required sets must be a subset of `C*`;
 //! 6. an unknown required label rejects the session;
-//! 7. `C*` is canonically sorted, effective limits are the per-limit minimum of
-//!    both offers, and the deterministic-CBOR selection bytes must match
-//!    exactly on both peers before either signs the transcript.
+//! 7. `C*` is canonically sorted and the deterministic-CBOR selection bytes
+//!    must match exactly on both peers before either signs the transcript.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use minicbor::Encode;
 
 use super::{
-  CONTROL_CBOR_LIMITS, FeatureTag, QualifiedTag, encode_canonical,
-  feature::FeatureRegistry,
-  offer::{FeatureOffer, LimitEntryWire},
+  CONTROL_CBOR_LIMITS, FeatureTag, encode_canonical, feature::FeatureRegistry, offer::FeatureOffer,
 };
 use crate::Error;
 
@@ -64,7 +61,6 @@ impl From<SelectionError> for Error {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Selection {
   features: Vec<FeatureTag>,
-  limits: Vec<(QualifiedTag, u64)>,
   bytes: Vec<u8>,
 }
 
@@ -77,16 +73,6 @@ impl Selection {
   /// The deterministic-CBOR selection bytes exchanged for exact match.
   pub(crate) fn bytes(&self) -> &[u8] {
     &self.bytes
-  }
-
-  /// One effective limit by tag.
-  #[cfg(test)]
-  pub(crate) fn limit(&self, tag: &QualifiedTag) -> Option<u64> {
-    self
-      .limits
-      .iter()
-      .find(|(candidate, _)| candidate == tag)
-      .map(|(_, value)| *value)
   }
 }
 
@@ -180,54 +166,16 @@ pub(crate) fn select(
     }
   }
 
-  // Step 7: canonical sort, per-limit minimum, and selection bytes.
-  let mut effective: BTreeMap<&QualifiedTag, u64> = BTreeMap::new();
-  for &tag in &selected {
-    let definition = registry.get(tag).ok_or(SelectionError::Malformed {
-      context: "selection definition",
-    })?;
-    for limit in definition.limits() {
-      if !limit.mandatory() {
-        continue;
-      }
-      let local = local_offer
-        .limit_value(limit.tag())
-        .ok_or(SelectionError::Malformed {
-          context: "selection local limit",
-        })?;
-      let remote = remote_offer
-        .limit_value(limit.tag())
-        .ok_or(SelectionError::Malformed {
-          context: "selection remote limit",
-        })?;
-      effective.insert(limit.tag(), local.min(remote));
-    }
-  }
-
+  // Step 7: canonical sort and selection bytes.
   let features: Vec<FeatureTag> = selected.iter().map(|tag| (*tag).clone()).collect();
-  let limits: Vec<(QualifiedTag, u64)> = effective
-    .iter()
-    .map(|(tag, value)| ((*tag).clone(), *value))
-    .collect();
   let wire = SelectionWire {
     features: features.iter().map(|tag| tag.as_str().to_owned()).collect(),
-    limits: limits
-      .iter()
-      .map(|(tag, value)| LimitEntryWire {
-        tag: tag.as_str().to_owned(),
-        value: *value,
-      })
-      .collect(),
   };
   let bytes =
     encode_canonical(&wire, CONTROL_CBOR_LIMITS).map_err(|_| SelectionError::Malformed {
       context: "selection encode",
     })?;
-  Ok(Selection {
-    features,
-    limits,
-    bytes,
-  })
+  Ok(Selection { features, bytes })
 }
 
 #[derive(Encode)]
@@ -235,8 +183,6 @@ pub(crate) fn select(
 struct SelectionWire {
   #[n(0)]
   features: Vec<String>,
-  #[n(1)]
-  limits: Vec<LimitEntryWire>,
 }
 
 #[cfg(test)]
@@ -253,9 +199,9 @@ mod tests {
   };
   use crate::{Digest, hex::encode as hex};
 
-  const INITIATOR_OFFER_HEX: &str = "8385827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e582034762210f55bb8d37e57cb41ce39f2754e1ef90a0f5cb336f3adde7d50ab6af7827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820ef2862cce032c9326511a6cd37ce797d23f66b9c1a4cc3888f22ce5b1892fcb682782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573745820a3c455472662f27e0c7821d35ce753d5308b6c38cdc848d97a73b1226c10f54682782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c697665727958200b6419664f5a5499f9416b5cc9bafcefcdb1bf7cffad70c611f0e29bae7e3066827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f72655820e47a216fe9756b4fbbf7f0453164ce4fd85edb57e45132aa88d0eab391c6cfee847830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573747828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0010000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d7265717565737473190100";
-  const RESPONDER_OFFER_HEX: &str = "8385827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e582034762210f55bb8d37e57cb41ce39f2754e1ef90a0f5cb336f3adde7d50ab6af7827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820ef2862cce032c9326511a6cd37ce797d23f66b9c1a4cc3888f22ce5b1892fcb682782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573745820a3c455472662f27e0c7821d35ce753d5308b6c38cdc848d97a73b1226c10f54682782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c697665727958200b6419664f5a5499f9416b5cc9bafcefcdb1bf7cffad70c611f0e29bae7e3066827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f72655820e47a216fe9756b4fbbf7f0453164ce4fd85edb57e45132aa88d0eab391c6cfee857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0080000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d7265717565737473190200";
-  const SELECTION_HEX: &str = "82857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f726582827829726164696174612e776f6f6f6f2e746563682f6c696d6974732f646174612d626f64792d62797465731a0010000082782c726164696174612e776f6f6f6f2e746563682f6c696d6974732f696e2d666c696768742d7265717565737473190100";
+  const INITIATOR_OFFER_HEX: &str = "8285827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58203df87b424b76c2b0e73284e877679a07aeb1688c150bf90a99c6bc667f0b8aae827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820b65136c721b44eb602c70788a372644af3b738ccfe0437c2ba33060a89ff9d2f82782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458207dfa9f0d5f24bf399f1ff3dd7f3354f09a7448d0a48b8e0b6e98c5b56e4e0a2782782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c6976657279582057dfd16e43af9dbf7a4e47bdbeb40cb50d2f031d0355bb126dc3c16134f859a5827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265582022373a9809f3ec58a1becf45acb4dfae3da54151973534fcfc18aeab57f0f874847830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573747828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265";
+  const RESPONDER_OFFER_HEX: &str = "8285827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58203df87b424b76c2b0e73284e877679a07aeb1688c150bf90a99c6bc667f0b8aae827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820b65136c721b44eb602c70788a372644af3b738ccfe0437c2ba33060a89ff9d2f82782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458207dfa9f0d5f24bf399f1ff3dd7f3354f09a7448d0a48b8e0b6e98c5b56e4e0a2782782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c6976657279582057dfd16e43af9dbf7a4e47bdbeb40cb50d2f031d0355bb126dc3c16134f859a5827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265582022373a9809f3ec58a1becf45acb4dfae3da54151973534fcfc18aeab57f0f874857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265";
+  const SELECTION_HEX: &str = "81857830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d72657175657374782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c69766572797828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265";
 
   #[test]
   fn handshake_canonical_offers_produce_exact_selection_bytes() {
@@ -298,26 +244,11 @@ mod tests {
         SESSION_CORE,
       ]
     );
-    assert_eq!(
-      as_initiator.limit(&fixtures::limit("data-body-bytes")),
-      Some(1_048_576)
-    );
-    assert_eq!(
-      as_initiator.limit(&fixtures::limit("in-flight-requests")),
-      Some(256)
-    );
 
     // Offer input ordering never changes the canonical bytes.
     let mut shuffled_supported = initiator.supported().to_vec();
     shuffled_supported.reverse();
-    let mut shuffled_limits = initiator.limits().to_vec();
-    shuffled_limits.reverse();
-    let shuffled = FeatureOffer::new(
-      shuffled_supported,
-      initiator.required().to_vec(),
-      shuffled_limits,
-    )
-    .unwrap();
+    let shuffled = FeatureOffer::new(shuffled_supported, initiator.required().to_vec()).unwrap();
     assert_eq!(shuffled.encode().unwrap(), initiator.encode().unwrap());
     let reselected = select(
       &registry,
@@ -331,48 +262,6 @@ mod tests {
   }
 
   #[test]
-  fn handshake_limit_negotiation_uses_minimum_and_rejects_out_of_range() {
-    let registry = FeatureRegistry::builtin().unwrap();
-    let data_body = fixtures::limit("data-body-bytes");
-    let in_flight = fixtures::limit("in-flight-requests");
-
-    for (local_value, remote_value, expected) in [
-      (65_536, 65_536, 65_536),
-      (65_536, 8_388_608, 65_536),
-      (8_388_608, 8_388_608, 8_388_608),
-      (1_048_576, 8_388_608, 1_048_576),
-    ] {
-      let local = offer_with_limits(&registry, local_value, 256);
-      let remote = offer_with_limits(&registry, remote_value, 1_024);
-      let selection = select(
-        &registry,
-        &local,
-        &remote,
-        local.required(),
-        remote.required(),
-      )
-      .unwrap();
-      assert_eq!(selection.limit(&data_body), Some(expected));
-      assert_eq!(selection.limit(&in_flight), Some(256));
-    }
-
-    for value in [0, 65_535, 8_388_609, u64::from(u32::MAX) + 1] {
-      let offer = offer_with_limits(&registry, value, 256);
-      let error = offer.validate_limits(&registry).unwrap_err();
-      assert_eq!(error.context(), "feature offer limit range", "{value}");
-    }
-    for value in [0, 1_025, u64::from(u16::MAX) + 1] {
-      let offer = offer_with_limits(&registry, 1_048_576, value);
-      let error = offer.validate_limits(&registry).unwrap_err();
-      assert_eq!(error.context(), "feature offer limit range", "{value}");
-    }
-
-    // Decoding an out-of-range offer fails before any selection work.
-    let encoded = offer_with_limits(&registry, 65_535, 256).encode().unwrap();
-    assert!(FeatureOffer::decode(&encoded, &registry).is_err());
-  }
-
-  #[test]
   fn handshake_selection_rejects_digest_mismatch_conflict_and_required() {
     let registry = FeatureRegistry::builtin().unwrap();
     let initiator = initiator_offer(&registry);
@@ -381,12 +270,7 @@ mod tests {
     // Step 1: a changed digest on a common label rejects.
     let mut forged_supported = responder.supported().to_vec();
     forged_supported[0].1 = Digest::from_bytes([0xCD; 32]);
-    let forged = FeatureOffer::new(
-      forged_supported,
-      responder.required().to_vec(),
-      responder.limits().to_vec(),
-    )
-    .unwrap();
+    let forged = FeatureOffer::new(forged_supported, responder.required().to_vec()).unwrap();
     let error = select(
       &registry,
       &initiator,
@@ -406,20 +290,12 @@ mod tests {
     // registry-known label still rejects against the local registry.
     let mut wrong_supported = responder.supported().to_vec();
     wrong_supported[0].1 = Digest::from_bytes([0xCD; 32]);
-    let wrong_responder = FeatureOffer::new(
-      wrong_supported,
-      responder.required().to_vec(),
-      responder.limits().to_vec(),
-    )
-    .unwrap();
+    let wrong_responder =
+      FeatureOffer::new(wrong_supported, responder.required().to_vec()).unwrap();
     let mut wrong_initiator_supported = initiator.supported().to_vec();
     wrong_initiator_supported[0].1 = Digest::from_bytes([0xCD; 32]);
-    let wrong_initiator = FeatureOffer::new(
-      wrong_initiator_supported,
-      initiator.required().to_vec(),
-      initiator.limits().to_vec(),
-    )
-    .unwrap();
+    let wrong_initiator =
+      FeatureOffer::new(wrong_initiator_supported, initiator.required().to_vec()).unwrap();
     let error = select(
       &registry,
       &wrong_initiator,
@@ -443,7 +319,6 @@ mod tests {
         supported_entry(&registry, DIRECT_REQUEST),
       ],
       vec![fixtures::feature("auth-ed25519-session")],
-      vec![(fixtures::limit("in-flight-requests"), 256)],
     )
     .unwrap();
     let error = select(
@@ -521,21 +396,6 @@ mod tests {
     assert_eq!(error.kind(), crate::ErrorKind::AuthenticationFailed);
   }
 
-  fn offer_with_limits(
-    registry: &FeatureRegistry, data_body_bytes: u64, in_flight_requests: u64,
-  ) -> FeatureOffer {
-    let initiator = initiator_offer(registry);
-    FeatureOffer::new(
-      initiator.supported().to_vec(),
-      initiator.required().to_vec(),
-      vec![
-        (fixtures::limit("data-body-bytes"), data_body_bytes),
-        (fixtures::limit("in-flight-requests"), in_flight_requests),
-      ],
-    )
-    .unwrap()
-  }
-
   fn supported_entry(registry: &FeatureRegistry, name: &str) -> (FeatureTag, Digest) {
     let tag = FeatureTag::parse(name).unwrap();
     let digest = registry.get(&tag).unwrap().definition_digest().unwrap();
@@ -553,7 +413,6 @@ mod tests {
         .map(|name| supported_entry(registry, &format!("testing.example/features/{name}")))
         .collect(),
       required.iter().map(|name| extension_tag(name)).collect(),
-      Vec::new(),
     )
     .unwrap()
   }
@@ -576,12 +435,7 @@ mod tests {
     .unwrap();
     for _ in 0..required.len() {
       required.rotate_left(1);
-      let permuted = FeatureOffer::new(
-        initiator.supported().to_vec(),
-        required.clone(),
-        initiator.limits().to_vec(),
-      )
-      .unwrap();
+      let permuted = FeatureOffer::new(initiator.supported().to_vec(), required.clone()).unwrap();
       let selection = select(
         &registry,
         &permuted,
@@ -604,12 +458,7 @@ mod tests {
     let unknown_digest = Digest::from_bytes([0xEE; 32]);
     let mut supported = initiator.supported().to_vec();
     supported.push((unknown.clone(), unknown_digest));
-    let with_unknown = FeatureOffer::new(
-      supported,
-      initiator.required().to_vec(),
-      initiator.limits().to_vec(),
-    )
-    .unwrap();
+    let with_unknown = FeatureOffer::new(supported, initiator.required().to_vec()).unwrap();
 
     let selection = select(
       &registry,
@@ -633,44 +482,29 @@ mod tests {
     );
   }
 
+  /// The selection wire carries exactly one element, the selected feature
+  /// set: the deleted per-limit array must never come back. Re-adding a
+  /// `limits` field to `SelectionWire` makes this arity check fail.
   #[test]
-  fn handshake_offer_rejects_missing_duplicate_and_unknown_mandatory_limits() {
+  fn handshake_selection_wire_carries_only_the_feature_set() {
     let registry = FeatureRegistry::builtin().unwrap();
     let initiator = initiator_offer(&registry);
-
-    // Missing a mandatory limit.
-    let missing = FeatureOffer::new(
-      initiator.supported().to_vec(),
-      initiator.required().to_vec(),
-      vec![(fixtures::limit("data-body-bytes"), 1_048_576)],
+    let responder = responder_offer(&registry);
+    let selection = select(
+      &registry,
+      &initiator,
+      &responder,
+      initiator.required(),
+      responder.required(),
     )
     .unwrap();
-    let error = missing.validate_limits(&registry).unwrap_err();
-    assert_eq!(error.context(), "feature offer mandatory limits");
-
-    // Duplicate limit entries reject at decode (ordering) and validation.
-    let mut duplicates = initiator.limits().to_vec();
-    duplicates.push(duplicates[0].clone());
-    let duplicate_offer = FeatureOffer::new(
-      initiator.supported().to_vec(),
-      initiator.required().to_vec(),
-      duplicates,
-    );
-    assert!(duplicate_offer.is_err());
-    // Unknown mandatory limit: not owned by any offered label.
-    let unknown = FeatureOffer::new(
-      initiator.supported().to_vec(),
-      initiator.required().to_vec(),
-      vec![
-        (fixtures::limit("data-body-bytes"), 1_048_576),
-        (
-          QualifiedTag::parse("radiata.woooo.tech/limits/not-owned").unwrap(),
-          1,
-        ),
-      ],
-    )
-    .unwrap();
-    let error = unknown.validate_limits(&registry).unwrap_err();
-    assert_eq!(error.context(), "feature offer unknown limit");
+    let bytes = selection.bytes();
+    let mut decoder = minicbor::Decoder::new(bytes);
+    assert_eq!(decoder.array().unwrap(), Some(1), "one wire element");
+    let features = decoder.array().unwrap().expect("feature array");
+    for _ in 0..features {
+      decoder.str().unwrap();
+    }
+    assert_eq!(decoder.position(), bytes.len(), "no trailing wire element");
   }
 }

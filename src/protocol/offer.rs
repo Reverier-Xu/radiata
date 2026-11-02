@@ -1,26 +1,23 @@
 //! Canonical authenticated feature offer encoding and validation.
 //!
 //! An offer carries sorted, unique collections: `(feature label,
-//! definition digest)` supported pairs, required labels, and the mandatory
-//! numeric limits owned by the offered labels. Decoding enforces the
-//! handshake control CBOR bounds (64 KiB body, depth 16, 1,024 collection
-//! items), the 128-entry offer caps, canonical ordering, `required` as a
-//! subset of `supported`, and the exact mandatory limit set with every
-//! value inside its legal registry range.
+//! definition digest)` supported pairs and required labels. Decoding
+//! enforces the handshake control CBOR bounds (64 KiB body, depth 16, 1,024
+//! collection items), the 128-entry offer caps, canonical ordering, and
+//! `required` as a subset of `supported`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use minicbor::{Decode, Encode};
 
 use super::{
-  CONTROL_CBOR_LIMITS, FeatureTag, QualifiedTag, decode_canonical_strict, encode_canonical,
-  feature::{FeatureRegistry, LimitDefinition, required_session_features},
+  CONTROL_CBOR_LIMITS, FeatureTag, decode_canonical_strict, encode_canonical,
+  feature::{FeatureRegistry, required_session_features},
 };
 use crate::{Digest, Error, Result};
 
 pub(crate) const MAX_SUPPORTED_LABELS: usize = 128;
 pub(crate) const MAX_REQUIRED_LABELS: usize = 128;
-pub(crate) const MAX_NEGOTIATED_LIMITS: usize = 128;
 /// The fixed authentication role of one handshake endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Role {
@@ -72,16 +69,14 @@ fn map_ordered<'a, E: 'a, T>(
 pub(crate) struct FeatureOffer {
   supported: Vec<(FeatureTag, Digest)>,
   required: Vec<FeatureTag>,
-  limits: Vec<(QualifiedTag, u64)>,
 }
 
 impl FeatureOffer {
   /// Builds a canonical offer, sorting every collection and rejecting
-  /// duplicates, capacity overflow, non-`limits` limit tags, and required
-  /// labels outside the supported set.
+  /// duplicates, capacity overflow, and required labels outside the
+  /// supported set.
   pub(crate) fn new(
     supported: Vec<(FeatureTag, Digest)>, required: Vec<FeatureTag>,
-    limits: Vec<(QualifiedTag, u64)>,
   ) -> Result<Self> {
     if supported.len() > MAX_SUPPORTED_LABELS {
       return Err(Error::invalid_input("feature offer supported capacity"));
@@ -89,24 +84,19 @@ impl FeatureOffer {
     if required.len() > MAX_REQUIRED_LABELS {
       return Err(Error::invalid_input("feature offer required capacity"));
     }
-    if limits.len() > MAX_NEGOTIATED_LIMITS {
-      return Err(Error::invalid_input("feature offer limits capacity"));
-    }
-    Self::finalize(supported, required, limits)
+    Self::finalize(supported, required)
   }
 
   /// The shared canonicalization and validation tail of both offer
-  /// paths: sorts every collection, rejects duplicates, non-`limits`
-  /// limit tags, and required labels outside the supported set. The
-  /// capacity checks stay at the entry points because the wire path
-  /// must reject capacity overflow before any per-entry parse.
+  /// paths: sorts every collection, rejects duplicates, and rejects
+  /// required labels outside the supported set. The capacity checks stay
+  /// at the entry points because the wire path must reject capacity
+  /// overflow before any per-entry parse.
   fn finalize(
     mut supported: Vec<(FeatureTag, Digest)>, mut required: Vec<FeatureTag>,
-    mut limits: Vec<(QualifiedTag, u64)>,
   ) -> Result<Self> {
     supported.sort_by(|first, second| first.0.as_str().cmp(second.0.as_str()));
     required.sort_by(|first, second| first.as_str().cmp(second.as_str()));
-    limits.sort_by(|first, second| first.0.as_str().cmp(second.0.as_str()));
     ensure_unique_sorted(
       &supported,
       |(tag, _)| tag.as_str(),
@@ -117,16 +107,6 @@ impl FeatureOffer {
       |tag| tag.as_str(),
       "feature offer required duplicate",
     )?;
-    ensure_unique_sorted(
-      &limits,
-      |(tag, _)| tag.as_str(),
-      "feature offer limits duplicate",
-    )?;
-    for (tag, _) in &limits {
-      if tag.category() != crate::protocol::tag::CATEGORY_LIMITS {
-        return Err(Error::invalid_input("feature offer limit category"));
-      }
-    }
     for tag in &required {
       if !supported.iter().any(|(candidate, _)| candidate == tag) {
         return Err(Error::invalid_input("feature offer required unsupported"));
@@ -135,7 +115,6 @@ impl FeatureOffer {
     Ok(Self {
       supported,
       required,
-      limits,
     })
   }
 
@@ -147,12 +126,6 @@ impl FeatureOffer {
     &self.required
   }
 
-  /// The offered numeric limit map.
-  #[cfg(any(test, fuzzing))]
-  pub(crate) fn limits(&self) -> &[(QualifiedTag, u64)] {
-    &self.limits
-  }
-
   pub(crate) fn supported_digest(&self, tag: &FeatureTag) -> Option<&Digest> {
     self
       .supported
@@ -161,53 +134,15 @@ impl FeatureOffer {
       .map(|(_, digest)| digest)
   }
 
-  pub(crate) fn limit_value(&self, tag: &QualifiedTag) -> Option<u64> {
-    self
-      .limits
-      .iter()
-      .find(|(candidate, _)| candidate == tag)
-      .map(|(_, value)| *value)
-  }
-
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical(&self.wire(), CONTROL_CBOR_LIMITS)
   }
 
-  /// Decodes canonical offer bytes and validates them against the local
-  /// registry, including the exact mandatory limit set and legal ranges.
-  pub(crate) fn decode(bytes: &[u8], registry: &FeatureRegistry) -> Result<Self> {
+  /// Decodes canonical offer bytes into the validated canonical form.
+  pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
     let wire: FeatureOfferWire =
       decode_canonical_strict(bytes, CONTROL_CBOR_LIMITS, "feature offer canonical form")?;
-    let offer = Self::from_wire(wire)?;
-    offer.validate_limits(registry)?;
-    Ok(offer)
-  }
-
-  /// Requires the offered limits to be exactly the mandatory limits owned
-  /// by the offered labels, each inside its legal registry range.
-  pub(crate) fn validate_limits(&self, registry: &FeatureRegistry) -> Result<()> {
-    let mut expected: BTreeMap<&QualifiedTag, &LimitDefinition> = BTreeMap::new();
-    for (tag, _) in &self.supported {
-      if let Some(definition) = registry.get(tag) {
-        for limit in definition.limits() {
-          if limit.mandatory() {
-            expected.insert(limit.tag(), limit);
-          }
-        }
-      }
-    }
-    if self.limits.len() != expected.len() {
-      return Err(Error::invalid_input("feature offer mandatory limits"));
-    }
-    for (tag, value) in &self.limits {
-      let Some(definition) = expected.get(tag) else {
-        return Err(Error::invalid_input("feature offer unknown limit"));
-      };
-      if !definition.contains(*value) {
-        return Err(Error::invalid_input("feature offer limit range"));
-      }
-    }
-    Ok(())
+    Self::from_wire(wire)
   }
 
   fn from_wire(wire: FeatureOfferWire) -> Result<Self> {
@@ -216,9 +151,6 @@ impl FeatureOffer {
     }
     if wire.required.len() > MAX_REQUIRED_LABELS {
       return Err(Error::invalid_input("feature offer required capacity"));
-    }
-    if wire.limits.len() > MAX_NEGOTIATED_LIMITS {
-      return Err(Error::invalid_input("feature offer limits capacity"));
     }
 
     let supported = map_ordered(
@@ -238,20 +170,7 @@ impl FeatureOffer {
       |label| FeatureTag::parse(label),
     )?;
 
-    let limits = map_ordered(
-      &wire.limits,
-      |entry| entry.tag.as_str(),
-      "feature offer limits ordering",
-      |entry| {
-        let tag = QualifiedTag::parse(&entry.tag)?;
-        if tag.category() != crate::protocol::tag::CATEGORY_LIMITS {
-          return Err(Error::invalid_input("feature offer limit category"));
-        }
-        Ok((tag, entry.value))
-      },
-    )?;
-
-    Self::finalize(supported, required, limits)
+    Self::finalize(supported, required)
   }
 
   fn wire(&self) -> FeatureOfferWire {
@@ -269,14 +188,6 @@ impl FeatureOffer {
         .iter()
         .map(|tag| tag.as_str().to_owned())
         .collect(),
-      limits: self
-        .limits
-        .iter()
-        .map(|(tag, value)| LimitEntryWire {
-          tag: tag.as_str().to_owned(),
-          value: *value,
-        })
-        .collect(),
     }
   }
 }
@@ -291,15 +202,6 @@ struct SupportedEntryWire {
   digest: Vec<u8>,
 }
 
-#[derive(Clone, Encode, Decode)]
-#[cbor(array)]
-pub(super) struct LimitEntryWire {
-  #[n(0)]
-  pub(super) tag: String,
-  #[n(1)]
-  pub(super) value: u64,
-}
-
 #[derive(Encode, Decode)]
 #[cbor(array)]
 struct FeatureOfferWire {
@@ -307,27 +209,18 @@ struct FeatureOfferWire {
   supported: Vec<SupportedEntryWire>,
   #[n(1)]
   required: Vec<String>,
-  #[n(2)]
-  limits: Vec<LimitEntryWire>,
 }
 
 /// Builds the node's production offer: every registry feature supported at
-/// its exact definition digest, the mandatory session features plus every
-/// caller-required feature required, and every mandatory limit at its
-/// registry default value. Caller-required labels outside the registry are
-/// rejected before any offer exists.
+/// its exact definition digest and the mandatory session features plus every
+/// caller-required feature required. Caller-required labels outside the
+/// registry are rejected before any offer exists.
 pub(crate) fn node_offer(
   registry: &FeatureRegistry, caller_required: &BTreeSet<FeatureTag>,
 ) -> Result<FeatureOffer> {
   let mut supported = Vec::new();
-  let mut limits = Vec::new();
   for (tag, definition) in registry.iter() {
     supported.push((tag.clone(), definition.definition_digest()?));
-    for limit in definition.limits() {
-      if limit.mandatory() {
-        limits.push((limit.tag().clone(), limit.default()));
-      }
-    }
   }
   let mut required = caller_required.clone();
   for tag in required_session_features()? {
@@ -338,22 +231,18 @@ pub(crate) fn node_offer(
       return Err(Error::invalid_input("required feature"));
     }
   }
-  FeatureOffer::new(supported, required.into_iter().collect(), limits)
+  FeatureOffer::new(supported, required.into_iter().collect())
 }
 
 #[cfg(test)]
 pub(crate) mod fixtures {
-  use super::{super::feature::FeatureRegistry, FeatureOffer, FeatureTag, QualifiedTag};
+  use super::{super::feature::FeatureRegistry, FeatureOffer, FeatureTag};
   use crate::Digest;
 
   pub(crate) const BUILTIN_FEATURES: [&str; 5] = crate::protocol::feature::BUILTIN_FEATURE_LABELS;
 
   pub(crate) fn feature(name: &str) -> FeatureTag {
     FeatureTag::parse(&format!("radiata.woooo.tech/features/{name}")).unwrap()
-  }
-
-  pub(crate) fn limit(name: &str) -> QualifiedTag {
-    QualifiedTag::parse(&format!("radiata.woooo.tech/limits/{name}")).unwrap()
   }
 
   /// An extension-domain feature tag (`testing.example/features/…`) for
@@ -385,7 +274,7 @@ pub(crate) mod fixtures {
   }
 
   /// The fixed initiator golden offer: all built-ins supported, the direct
-  /// request chain required, default limit values.
+  /// request chain required.
   pub(crate) fn initiator_offer(registry: &FeatureRegistry) -> FeatureOffer {
     FeatureOffer::new(
       supported(registry, &BUILTIN_FEATURES),
@@ -395,16 +284,12 @@ pub(crate) mod fixtures {
         feature("data-messages"),
         feature("direct-request"),
       ],
-      vec![
-        (limit("data-body-bytes"), 1_048_576),
-        (limit("in-flight-requests"), 256),
-      ],
     )
     .unwrap()
   }
 
   /// The fixed responder golden offer: all built-ins supported and
-  /// required, raised in-range limit values.
+  /// required.
   pub(crate) fn responder_offer(registry: &FeatureRegistry) -> FeatureOffer {
     FeatureOffer::new(
       supported(registry, &BUILTIN_FEATURES),
@@ -412,10 +297,6 @@ pub(crate) mod fixtures {
         .iter()
         .map(|name| FeatureTag::parse(name).unwrap())
         .collect(),
-      vec![
-        (limit("data-body-bytes"), 8_388_608),
-        (limit("in-flight-requests"), 512),
-      ],
     )
     .unwrap()
   }
@@ -437,7 +318,7 @@ mod tests {
   /// reproduces the exact golden selection bytes for the unmutated pair.
   fn verifies(offer: &FeatureOffer, peer: &FeatureOffer, registry: &FeatureRegistry) -> bool {
     let bytes = offer.encode().unwrap();
-    let Ok(decoded) = FeatureOffer::decode(&bytes, registry) else {
+    let Ok(decoded) = FeatureOffer::decode(&bytes) else {
       return false;
     };
     let Ok(selection) = select(
@@ -466,7 +347,7 @@ mod tests {
     let registry = registry();
     for offer in [initiator_offer(&registry), responder_offer(&registry)] {
       let bytes = offer.encode().unwrap();
-      let decoded = FeatureOffer::decode(&bytes, &registry).unwrap();
+      let decoded = FeatureOffer::decode(&bytes).unwrap();
       assert_eq!(decoded, offer);
       assert_eq!(decoded.encode().unwrap(), bytes);
     }
@@ -480,7 +361,7 @@ mod tests {
 
     let over_supported = vec![(tag.clone(), digest.clone()); 2];
     assert!(
-      FeatureOffer::new(over_supported, Vec::new(), Vec::new())
+      FeatureOffer::new(over_supported, Vec::new())
         .unwrap_err()
         .context()
         == "feature offer supported duplicate"
@@ -495,7 +376,7 @@ mod tests {
       })
       .collect();
     assert!(
-      FeatureOffer::new(distinct_supported, Vec::new(), Vec::new())
+      FeatureOffer::new(distinct_supported, Vec::new())
         .unwrap_err()
         .context()
         == "feature offer supported capacity"
@@ -507,28 +388,13 @@ mod tests {
       })
       .collect();
     assert!(
-      FeatureOffer::new(Vec::new(), over_required, Vec::new())
+      FeatureOffer::new(Vec::new(), over_required)
         .unwrap_err()
         .context()
         == "feature offer required capacity"
     );
 
-    let over_limits: Vec<(QualifiedTag, u64)> = (0..=MAX_NEGOTIATED_LIMITS)
-      .map(|index| {
-        (
-          QualifiedTag::parse(&format!("testing.example/limits/limit-{index:04}")).unwrap(),
-          1,
-        )
-      })
-      .collect();
-    assert!(
-      FeatureOffer::new(Vec::new(), Vec::new(), over_limits)
-        .unwrap_err()
-        .context()
-        == "feature offer limits capacity"
-    );
-
-    let unsupported_required = FeatureOffer::new(Vec::new(), vec![tag], Vec::new()).unwrap_err();
+    let unsupported_required = FeatureOffer::new(Vec::new(), vec![tag]).unwrap_err();
     assert_eq!(
       unsupported_required.context(),
       "feature offer required unsupported"
@@ -556,29 +422,6 @@ mod tests {
       .sort_by(|first, second| first.0.as_str().cmp(second.0.as_str()));
     assert!(!verifies(&mutated, &responder, &registry));
 
-    // Out-of-range limit value.
-    let mut mutated = initiator.clone();
-    mutated.limits[0].1 = 63 * 1_024;
-    assert!(!verifies(&mutated, &responder, &registry));
-
-    // In-range but changed limit value changes the selection bytes.
-    let mut mutated = initiator.clone();
-    mutated.limits[0].1 = 2 * 1_024 * 1_024;
-    assert!(!verifies(&mutated, &responder, &registry));
-
-    // Missing mandatory limit.
-    let mut mutated = initiator.clone();
-    mutated.limits.remove(0);
-    assert!(!verifies(&mutated, &responder, &registry));
-
-    // Unknown limit tag.
-    let mut mutated = initiator.clone();
-    mutated.limits.push((
-      QualifiedTag::parse("testing.example/limits/unknown").unwrap(),
-      1,
-    ));
-    assert!(!verifies(&mutated, &responder, &registry));
-
     // Required label outside the supported set.
     let mut mutated = initiator.clone();
     mutated
@@ -590,41 +433,64 @@ mod tests {
     let mut wire = initiator.wire();
     wire.supported.swap(0, 1);
     let bytes = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();
-    assert!(FeatureOffer::decode(&bytes, &registry).is_err());
+    assert!(FeatureOffer::decode(&bytes).is_err());
 
     // Duplicated supported entry on the wire.
     let mut wire = initiator.wire();
     let entry = wire.supported[0].clone();
     wire.supported.insert(1, entry);
     let bytes = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();
-    assert!(FeatureOffer::decode(&bytes, &registry).is_err());
+    assert!(FeatureOffer::decode(&bytes).is_err());
 
     // Truncated and trailing wire bytes.
     let bytes = initiator.encode().unwrap();
-    assert!(FeatureOffer::decode(&bytes[..bytes.len() - 1], &registry).is_err());
+    assert!(FeatureOffer::decode(&bytes[..bytes.len() - 1]).is_err());
     let mut trailing = bytes.clone();
     trailing.push(0x00);
-    assert!(FeatureOffer::decode(&trailing, &registry).is_err());
+    assert!(FeatureOffer::decode(&trailing).is_err());
 
     // Non-canonical container header.
     let mut noncanonical = bytes;
     noncanonical[0] = 0x9F;
-    assert!(FeatureOffer::decode(&noncanonical, &registry).is_err());
+    assert!(FeatureOffer::decode(&noncanonical).is_err());
   }
 
+  /// The deleted per-limit wire field must never decode again: a re-added
+  /// third array element rejects at decode, so no peer can negotiate a
+  /// numeric limit through the offer any more.
   #[test]
-  fn handshake_offer_duplicate_limit_entries_reject_at_decode() {
-    let registry = FeatureRegistry::builtin().unwrap();
-    let initiator = fixtures::initiator_offer(&registry);
-    let mut wire = initiator.wire();
-    let entry = wire.limits[0].clone();
-    wire.limits.push(entry);
-    let bytes = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();
-    assert!(FeatureOffer::decode(&bytes, &registry).is_err());
+  fn handshake_offer_wire_rejects_a_reintroduced_limits_field() {
+    #[derive(Encode)]
+    #[cbor(array)]
+    struct ReintroducedOfferWire {
+      #[n(0)]
+      supported: Vec<SupportedEntryWire>,
+      #[n(1)]
+      required: Vec<String>,
+      #[n(2)]
+      limits: Vec<ReintroducedLimitEntryWire>,
+    }
 
-    let mut unsorted = initiator.wire();
-    unsorted.limits.reverse();
-    let bytes = encode_canonical(&unsorted, CONTROL_CBOR_LIMITS).unwrap();
-    assert!(FeatureOffer::decode(&bytes, &registry).is_err());
+    #[derive(Encode)]
+    #[cbor(array)]
+    struct ReintroducedLimitEntryWire {
+      #[n(0)]
+      tag: String,
+      #[n(1)]
+      value: u64,
+    }
+
+    let registry = FeatureRegistry::builtin().unwrap();
+    let wire = initiator_offer(&registry).wire();
+    let reintroduced = ReintroducedOfferWire {
+      supported: wire.supported,
+      required: wire.required,
+      limits: vec![ReintroducedLimitEntryWire {
+        tag: "radiata.woooo.tech/limits/data-body-bytes".to_owned(),
+        value: 1_048_576,
+      }],
+    };
+    let bytes = encode_canonical(&reintroduced, CONTROL_CBOR_LIMITS).unwrap();
+    assert!(FeatureOffer::decode(&bytes).is_err());
   }
 }

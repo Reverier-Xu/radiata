@@ -461,8 +461,7 @@ async fn session_member_reconnect_preserves_exact_feature_selection() {
 // ---- mixed-binary feature intersection evidence ----
 
 /// The prior binary's offer: the four built-ins other than routed
-/// delivery, with the mandatory limits at their defaults and the
-/// mandatory session features required.
+/// delivery, with the mandatory session features required.
 fn prior_offer() -> FeatureOffer {
   prior_family_offer(None)
 }
@@ -482,23 +481,17 @@ fn prior_family_offer(prior_only: Option<(&str, [u8; 32])>) -> FeatureOffer {
     DIRECT_REQUEST,
   ];
   let mut supported = Vec::new();
-  let mut limits = Vec::new();
   for name in prior_tags {
     let tag = FeatureTag::parse(name).unwrap();
     let definition = registry.get(&tag).unwrap();
     supported.push((tag, definition.definition_digest().unwrap()));
-    for limit in definition.limits() {
-      if limit.mandatory() {
-        limits.push((limit.tag().clone(), limit.default()));
-      }
-    }
   }
   let mut required: Vec<FeatureTag> = required_session_features().unwrap().into_iter().collect();
   if let Some((name, digest)) = prior_only {
     supported.push((FeatureTag::parse(name).unwrap(), Digest::from_bytes(digest)));
     required.push(FeatureTag::parse(name).unwrap());
   }
-  FeatureOffer::new(supported, required, limits).unwrap()
+  FeatureOffer::new(supported, required).unwrap()
 }
 
 /// The current offer requiring routed delivery (current initiator): a

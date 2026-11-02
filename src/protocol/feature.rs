@@ -4,8 +4,8 @@
 //! A [`FeatureDefinition`] is the immutable contract behind one feature
 //! label. Its definition digest is SHA-256 over the deterministic-CBOR
 //! encoding of the full canonical record: tag, contract fingerprint, sorted
-//! dependencies, sorted conflicts, sorted protocol handlers, owned limit
-//! definitions sorted by tag, and the test-contract owner.
+//! dependencies, sorted conflicts, sorted protocol handlers, and the
+//! test-contract owner.
 //!
 //! Built-in contract fingerprints are fixed 32-byte values derived as
 //! SHA-256 of one exact frozen seed string per feature:
@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 
 use minicbor::Encode;
 
-use super::{CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, QualifiedTag, encode_canonical};
+use super::{CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, encode_canonical};
 use crate::{Digest, Error, Result, identity::signature::body_digest};
 
 const BUILTIN_DOMAIN: &str = super::tag::BUILTIN_DOMAIN;
@@ -45,7 +45,6 @@ pub(crate) const SESSION_CORE: &str = "radiata.woooo.tech/features/session-core"
 pub(crate) const DATA_MESSAGES: &str = "radiata.woooo.tech/features/data-messages";
 pub(crate) const DIRECT_REQUEST: &str = "radiata.woooo.tech/features/direct-request";
 pub(crate) const ROUTED_DELIVERY: &str = "radiata.woooo.tech/features/routed-delivery";
-pub(crate) const DATA_BODY_BYTES_LIMIT: &str = "radiata.woooo.tech/limits/data-body-bytes";
 
 /// The five built-in feature labels in declaration order. Fixtures and
 /// tests reuse this single list so adding a built-in feature cannot
@@ -58,15 +57,7 @@ pub(crate) const BUILTIN_FEATURE_LABELS: [&str; 5] = [
   DIRECT_REQUEST,
   ROUTED_DELIVERY,
 ];
-const IN_FLIGHT_REQUESTS_LIMIT: &str = "radiata.woooo.tech/limits/in-flight-requests";
 const DIRECT_REQUEST_PROTOCOL: &str = "radiata.woooo.tech/protocols/direct-request";
-
-const DATA_BODY_FLOOR: u64 = 64 * 1_024;
-const DATA_BODY_DEFAULT: u64 = 1_024 * 1_024;
-const DATA_BODY_CEILING: u64 = 8 * 1_024 * 1_024;
-const IN_FLIGHT_FLOOR: u64 = 1;
-const IN_FLIGHT_DEFAULT: u64 = 256;
-const IN_FLIGHT_CEILING: u64 = 1_024;
 
 const DEFINITION_LIMITS: CborLimits = CborLimits::new(16, 1_024, MAX_BODY_BYTES);
 
@@ -78,7 +69,6 @@ pub struct FeatureDefinition {
   dependencies: Vec<FeatureTag>,
   conflicts: Vec<FeatureTag>,
   protocols: Vec<ProtocolTag>,
-  limits: Vec<LimitDefinition>,
 }
 
 impl FeatureDefinition {
@@ -136,23 +126,7 @@ impl FeatureDefinition {
       dependencies: Vec::new(),
       conflicts: Vec::new(),
       protocols: Vec::new(),
-      limits: Vec::new(),
     }
-  }
-
-  pub(crate) fn limit(mut self, limit: LimitDefinition) -> Result<Self> {
-    if limit.owner() != self.tag() {
-      return Err(Error::invalid_input("feature limit owner"));
-    }
-    if self
-      .limits
-      .iter()
-      .any(|existing| existing.tag() == limit.tag())
-    {
-      return Err(Error::invalid_input("feature limit duplicate"));
-    }
-    self.limits.push(limit);
-    Ok(self)
   }
 
   pub(crate) const fn tag(&self) -> &FeatureTag {
@@ -176,10 +150,6 @@ impl FeatureDefinition {
 
   pub(crate) fn protocols(&self) -> &[ProtocolTag] {
     &self.protocols
-  }
-
-  pub(crate) fn limits(&self) -> &[LimitDefinition] {
-    &self.limits
   }
 
   /// Computes SHA-256 over the deterministic-CBOR canonical definition.
@@ -207,175 +177,14 @@ impl FeatureDefinition {
       .map(|tag| tag.as_str().to_owned())
       .collect();
     protocols.sort();
-    let mut limits: Vec<LimitDefinitionWire> =
-      self.limits.iter().map(LimitDefinition::wire).collect();
-    limits.sort_by(|first, second| first.tag.cmp(&second.tag));
     DefinitionWire {
       tag: self.tag.as_str().to_owned(),
       fingerprint: self.fingerprint.as_bytes().to_vec(),
       dependencies,
       conflicts,
       protocols,
-      limits,
     }
   }
-}
-
-/// The unsigned integer width fixed by a numeric limit definition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LimitWidth {
-  U16,
-  U32,
-  /// No built-in limit uses a 64-bit width yet; reserved by the limit
-  /// definition schema for extension limits.
-  #[allow(dead_code)]
-  U64,
-}
-
-impl LimitWidth {
-  const fn wire(self) -> u64 {
-    match self {
-      Self::U16 => 16,
-      Self::U32 => 32,
-      Self::U64 => 64,
-    }
-  }
-
-  const fn maximum(self) -> u64 {
-    match self {
-      Self::U16 => u16::MAX as u64,
-      Self::U32 => u32::MAX as u64,
-      Self::U64 => u64::MAX,
-    }
-  }
-}
-
-/// The unit fixed by a numeric limit definition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LimitUnit {
-  Bytes,
-  Count,
-}
-
-impl LimitUnit {
-  const fn wire(self) -> u64 {
-    match self {
-      Self::Bytes => 0,
-      Self::Count => 1,
-    }
-  }
-}
-
-/// The legal range and local default fixed by a numeric limit definition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LimitRange {
-  floor: u64,
-  ceiling: u64,
-  default: u64,
-}
-
-impl LimitRange {
-  pub(crate) const fn new(floor: u64, ceiling: u64, default: u64) -> Result<Self> {
-    if floor > ceiling || default < floor || default > ceiling {
-      return Err(Error::invalid_input("limit definition range"));
-    }
-    Ok(Self {
-      floor,
-      ceiling,
-      default,
-    })
-  }
-
-  const fn contains(&self, value: u64) -> bool {
-    value >= self.floor && value <= self.ceiling
-  }
-}
-
-/// The immutable definition of one negotiated numeric limit ID.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LimitDefinition {
-  tag: QualifiedTag,
-  width: LimitWidth,
-  unit: LimitUnit,
-  range: LimitRange,
-  owner: FeatureTag,
-  mandatory: bool,
-}
-
-impl LimitDefinition {
-  pub(crate) fn new(
-    tag: QualifiedTag, width: LimitWidth, unit: LimitUnit, range: LimitRange, owner: FeatureTag,
-    mandatory: bool,
-  ) -> Result<Self> {
-    if tag.category() != crate::protocol::tag::CATEGORY_LIMITS {
-      return Err(Error::invalid_input("limit definition category"));
-    }
-    if range.ceiling > width.maximum() {
-      return Err(Error::invalid_input("limit definition width"));
-    }
-    Ok(Self {
-      tag,
-      width,
-      unit,
-      range,
-      owner,
-      mandatory,
-    })
-  }
-
-  pub(crate) const fn tag(&self) -> &QualifiedTag {
-    &self.tag
-  }
-
-  pub(crate) const fn default(&self) -> u64 {
-    self.range.default
-  }
-
-  pub(crate) const fn owner(&self) -> &FeatureTag {
-    &self.owner
-  }
-
-  pub(crate) const fn mandatory(&self) -> bool {
-    self.mandatory
-  }
-
-  pub(crate) const fn contains(&self, value: u64) -> bool {
-    self.range.contains(value)
-  }
-
-  fn wire(&self) -> LimitDefinitionWire {
-    LimitDefinitionWire {
-      tag: self.tag.as_str().to_owned(),
-      width: self.width.wire(),
-      unit: self.unit.wire(),
-      floor: self.range.floor,
-      ceiling: self.range.ceiling,
-      default: self.range.default,
-      owner: self.owner.as_str().to_owned(),
-      mandatory: self.mandatory,
-    }
-  }
-}
-
-#[derive(Encode)]
-#[cbor(array)]
-struct LimitDefinitionWire {
-  #[n(0)]
-  tag: String,
-  #[n(1)]
-  width: u64,
-  #[n(2)]
-  unit: u64,
-  #[n(3)]
-  floor: u64,
-  #[n(4)]
-  ceiling: u64,
-  #[n(5)]
-  default: u64,
-  #[n(6)]
-  owner: String,
-  #[n(7)]
-  mandatory: bool,
 }
 
 #[derive(Encode)]
@@ -392,8 +201,6 @@ struct DefinitionWire {
   conflicts: Vec<String>,
   #[n(4)]
   protocols: Vec<String>,
-  #[n(5)]
-  limits: Vec<LimitDefinitionWire>,
 }
 
 /// The closed, validated set of locally implemented feature definitions.
@@ -405,7 +212,7 @@ pub(crate) struct FeatureRegistry {
 impl FeatureRegistry {
   /// Builds a registry, rejecting duplicate labels, reserved-namespace
   /// misuse, missing dependencies, dependency cycles, asymmetric or self
-  /// conflicts, and duplicate limit or protocol handler ownership.
+  /// conflicts, and duplicate protocol handler ownership.
   pub(crate) fn build(definitions: Vec<FeatureDefinition>) -> Result<Self> {
     let mut map: BTreeMap<FeatureTag, FeatureDefinition> = BTreeMap::new();
     for definition in definitions {
@@ -516,16 +323,8 @@ fn check_conflicts(definitions: &BTreeMap<FeatureTag, FeatureDefinition>) -> Res
 }
 
 fn check_unique_ownership(definitions: &BTreeMap<FeatureTag, FeatureDefinition>) -> Result<()> {
-  let mut limits: BTreeMap<&QualifiedTag, ()> = BTreeMap::new();
   let mut protocols: BTreeMap<&ProtocolTag, ()> = BTreeMap::new();
   for definition in definitions.values() {
-    for limit in definition.limits() {
-      if limits.insert(limit.tag(), ()).is_some() {
-        return Err(Error::invalid_input(
-          "feature registry duplicate limit owner",
-        ));
-      }
-    }
     for protocol in definition.protocols() {
       if protocols.insert(protocol, ()).is_some() {
         return Err(Error::invalid_input(
@@ -540,26 +339,9 @@ fn check_unique_ownership(definitions: &BTreeMap<FeatureTag, FeatureDefinition>)
 pub(crate) fn builtin_definitions() -> Result<Vec<FeatureDefinition>> {
   let auth = builtin(AUTH_ED25519_SESSION)?;
   let session = builtin(SESSION_CORE)?.dependency(FeatureTag::parse(AUTH_ED25519_SESSION)?)?;
-  let data = builtin(DATA_MESSAGES)?
-    .dependency(FeatureTag::parse(SESSION_CORE)?)?
-    .limit(LimitDefinition::new(
-      QualifiedTag::parse(DATA_BODY_BYTES_LIMIT)?,
-      LimitWidth::U32,
-      LimitUnit::Bytes,
-      LimitRange::new(DATA_BODY_FLOOR, DATA_BODY_CEILING, DATA_BODY_DEFAULT)?,
-      FeatureTag::parse(DATA_MESSAGES)?,
-      true,
-    )?)?;
+  let data = builtin(DATA_MESSAGES)?.dependency(FeatureTag::parse(SESSION_CORE)?)?;
   let direct = builtin(DIRECT_REQUEST)?
     .dependency(FeatureTag::parse(DATA_MESSAGES)?)?
-    .limit(LimitDefinition::new(
-      QualifiedTag::parse(IN_FLIGHT_REQUESTS_LIMIT)?,
-      LimitWidth::U16,
-      LimitUnit::Count,
-      LimitRange::new(IN_FLIGHT_FLOOR, IN_FLIGHT_CEILING, IN_FLIGHT_DEFAULT)?,
-      FeatureTag::parse(DIRECT_REQUEST)?,
-      true,
-    )?)?
     .protocol(ProtocolTag::parse(DIRECT_REQUEST_PROTOCOL)?)?;
   let routed = builtin(ROUTED_DELIVERY)?.dependency(FeatureTag::parse(DATA_MESSAGES)?)?;
   Ok(vec![auth, session, data, direct, routed])
@@ -582,21 +364,10 @@ fn builtin_fingerprint(tag: &FeatureTag) -> Digest {
 mod tests {
   use super::*;
   use crate::{
+    QualifiedTag,
     hex::encode as hex,
     protocol::offer::fixtures::{extension_feature, extension_tag},
   };
-
-  fn extension_limit(name: &str, owner: &FeatureTag) -> LimitDefinition {
-    LimitDefinition::new(
-      QualifiedTag::parse(&format!("testing.example/limits/{name}")).unwrap(),
-      LimitWidth::U32,
-      LimitUnit::Count,
-      LimitRange::new(1, 16, 4).unwrap(),
-      owner.clone(),
-      true,
-    )
-    .unwrap()
-  }
 
   fn builtin_definition(name: &str) -> FeatureDefinition {
     builtin_definitions()
@@ -613,27 +384,27 @@ mod tests {
       (
         AUTH_ED25519_SESSION,
         "8f83df98c958318ec3d96e4b0d16fa0e49550244a56c3e62580248a499b3ad43",
-        "34762210f55bb8d37e57cb41ce39f2754e1ef90a0f5cb336f3adde7d50ab6af7",
+        "3df87b424b76c2b0e73284e877679a07aeb1688c150bf90a99c6bc667f0b8aae",
       ),
       (
         SESSION_CORE,
         "c1e856e3ba8381bb6fbead84dfff0f28aaee5b77e4a54efd47293e2357091edd",
-        "e47a216fe9756b4fbbf7f0453164ce4fd85edb57e45132aa88d0eab391c6cfee",
+        "22373a9809f3ec58a1becf45acb4dfae3da54151973534fcfc18aeab57f0f874",
       ),
       (
         DATA_MESSAGES,
         "c5145330004d71f5bc628652ff94689c944ff21a288cb8230d732cbd3ff6a62f",
-        "ef2862cce032c9326511a6cd37ce797d23f66b9c1a4cc3888f22ce5b1892fcb6",
+        "b65136c721b44eb602c70788a372644af3b738ccfe0437c2ba33060a89ff9d2f",
       ),
       (
         DIRECT_REQUEST,
         "f267e89141b80aab766cd167502a55e5662567a7ca5ac02c091f1ec5c5003d8b",
-        "a3c455472662f27e0c7821d35ce753d5308b6c38cdc848d97a73b1226c10f546",
+        "7dfa9f0d5f24bf399f1ff3dd7f3354f09a7448d0a48b8e0b6e98c5b56e4e0a27",
       ),
       (
         ROUTED_DELIVERY,
         "6ba9b5e1ff674801f0fcb9f91c58971bec5fb085cf9f6d61674d028655f66db7",
-        "0b6419664f5a5499f9416b5cc9bafcefcdb1bf7cffad70c611f0e29bae7e3066",
+        "57dfd16e43af9dbf7a4e47bdbeb40cb50d2f031d0355bb126dc3c16134f859a5",
       ),
     ];
     for (name, fingerprint, digest) in cases {
@@ -711,20 +482,6 @@ mod tests {
       "feature conflict self"
     );
 
-    let duplicate_limit = FeatureRegistry::build(vec![
-      extension_feature("alpha", 1)
-        .limit(extension_limit("shared", &extension_tag("alpha")))
-        .unwrap(),
-      extension_feature("beta", 2)
-        .limit(extension_limit("shared", &extension_tag("beta")))
-        .unwrap(),
-    ])
-    .unwrap_err();
-    assert_eq!(
-      duplicate_limit.context(),
-      "feature registry duplicate limit owner"
-    );
-
     let protocol = ProtocolTag::parse("testing.example/protocols/shared").unwrap();
     let duplicate_protocol = FeatureRegistry::build(vec![
       extension_feature("alpha", 1)
@@ -793,13 +550,9 @@ mod tests {
         .push(FeatureTag::parse(SESSION_CORE).unwrap());
     });
     assert_mutation_detected(DATA_MESSAGES, |definition| {
-      definition.limits[0].range.floor += 1;
-    });
-    assert_mutation_detected(DATA_MESSAGES, |definition| {
-      definition.limits[0].mandatory = false;
-    });
-    assert_mutation_detected(DIRECT_REQUEST, |definition| {
-      definition.limits[0].width = LimitWidth::U32;
+      definition
+        .protocols
+        .push(ProtocolTag::parse("radiata.woooo.tech/protocols/data-messages").unwrap());
     });
     assert_mutation_detected(DIRECT_REQUEST, |definition| {
       definition

@@ -21,7 +21,6 @@ pub(crate) const BUILTIN_DOMAIN: &str = "radiata.woooo.tech";
 /// protocol-fixed, so one constant table makes the set auditable and a
 /// typo in any comparison impossible to compile.
 pub(crate) const CATEGORY_CRYPTO: &str = "crypto";
-pub(crate) const CATEGORY_LIMITS: &str = "limits";
 pub(crate) const CATEGORY_METADATA: &str = "metadata";
 pub(crate) const CATEGORY_RESOURCES: &str = "resources";
 pub(crate) const CATEGORY_LABELS: &str = "labels";

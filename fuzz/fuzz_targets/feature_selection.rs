@@ -1,7 +1,7 @@
 //! The canonical `feature_selection` state-machine fuzz target.
 //!
 //! Derived offer pairs exercise digest equality, dependency closure,
-//! conflict pairs, limit minima, and required-label rejection. An accepted
+//! conflict pairs, and required-label rejection. An accepted
 //! selection must satisfy every structural invariant again; any panic is
 //! a finding.
 

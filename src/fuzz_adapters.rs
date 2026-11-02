@@ -171,14 +171,12 @@ const STATE_FEATURES: [&str; 5] = [
   ROUTED_DELIVERY,
 ];
 
-/// Derives one offer's supported set, required set, and mandatory limits
-/// at the registry defaults from two bitmask bytes.
+/// Derives one offer's supported and required sets from two bitmask bytes.
 fn derive_offer(
   registry: &FeatureRegistry, support_bits: u8, required_bits: u8,
 ) -> crate::Result<FeatureOffer> {
   let mut supported = Vec::new();
   let mut required = Vec::new();
-  let mut limits = Vec::new();
   for (index, name) in STATE_FEATURES.iter().enumerate() {
     if support_bits & (1 << index) == 0 {
       continue;
@@ -191,18 +189,13 @@ fn derive_offer(
     if required_bits & (1 << index) != 0 {
       required.push(tag);
     }
-    for limit in definition.limits() {
-      if limit.mandatory() {
-        limits.push((limit.tag().clone(), limit.default()));
-      }
-    }
   }
-  FeatureOffer::new(supported, required, limits)
+  FeatureOffer::new(supported, required)
 }
 
 /// The feature_selection target: derived offer
 /// pairs exercise digest equality, dependency closure, conflict pairs,
-/// limit minima, and required-label rejection with no downgrade or
+/// and required-label rejection with no downgrade or
 /// fallback. Any panic is a finding; an accepted selection must satisfy
 /// every structural invariant again.
 pub fn feature_selection(input: &[u8]) -> Option<()> {
@@ -220,12 +213,7 @@ pub fn feature_selection(input: &[u8]) -> Option<()> {
         flipped[0] ^= 0xFF;
         *digest = crate::Digest::from_bytes(flipped);
       }
-      FeatureOffer::new(
-        supported,
-        local.required().to_vec(),
-        local.limits().to_vec(),
-      )
-      .ok()?
+      FeatureOffer::new(supported, local.required().to_vec()).ok()?
     }
     _ => local,
   };
