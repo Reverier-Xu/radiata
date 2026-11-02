@@ -10,10 +10,6 @@
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
-// The discovery extension surface is test-only until a discovery wiring
-// exists (see `transport::registry`).
-#[cfg(test)]
-use crate::{DiscoveryTag, transport::registry::Discovery};
 use crate::{
   Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag,
   api::BoxFuture,
@@ -22,6 +18,10 @@ use crate::{
     registry::{Transport, TransportProvider, TransportProviderAdapter, builtin_transport_tag},
   },
 };
+// The discovery extension surface is test-only until a discovery wiring
+// exists (see `transport::registry`).
+#[cfg(test)]
+use crate::{protocol::DiscoveryTag, transport::registry::Discovery};
 
 /// The immutable definition of one domain-qualified packet protocol: its
 /// tag and the feature that owns it. The owning feature must be selected

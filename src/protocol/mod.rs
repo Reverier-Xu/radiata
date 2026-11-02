@@ -27,4 +27,6 @@ pub(crate) use cbor::{
 };
 pub(crate) use envelope::{PRELUDE_LEN, Prelude, check_frame, split_message};
 pub use feature::FeatureDefinition;
-pub use tag::{DiscoveryTag, FeatureTag, ProtocolTag, QualifiedTag, TransportTag};
+#[cfg(test)]
+pub use tag::DiscoveryTag;
+pub use tag::{FeatureTag, ProtocolTag, QualifiedTag, TransportTag};

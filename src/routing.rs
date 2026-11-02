@@ -533,6 +533,7 @@ impl RouteContext {
     }
   }
 
+  #[cfg(any(test, fuzzing))]
   pub fn trace_id(&self) -> &crate::TraceId {
     &self.trace_id
   }
@@ -543,6 +544,7 @@ impl RouteContext {
 
   /// The selected destination: the exact target node or the node the
   /// registered load balancer selected for a matching-label target.
+  #[cfg(any(test, fuzzing))]
   pub fn destination(&self) -> &NodeId {
     &self.destination
   }

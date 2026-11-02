@@ -83,9 +83,7 @@ pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
   RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
 };
-pub use protocol::{
-  DiscoveryTag, FeatureDefinition, FeatureTag, ProtocolTag, QualifiedTag, TransportTag,
-};
+pub use protocol::{FeatureDefinition, FeatureTag, ProtocolTag, QualifiedTag, TransportTag};
 pub use provider::{
   CommitOutcome, CommitReceipt, CreatedKey, DurabilityLevel, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, ReconcileOutcome, StoreCapabilities, StoreEntry,
@@ -94,8 +92,7 @@ pub use provider::{
 };
 pub use resource::{ResourceLabels, ResourceName, ResourceUri, ResourceVersion};
 pub use routing::{
-  CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteContext,
-  RouteNextHop, Selector,
+  CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteNextHop, Selector,
 };
 pub use task::{
   ActionHook, CredentialIssued, CustomTaskSpec, ReconcileContext, ReconcileDecision, ResourceHook,

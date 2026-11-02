@@ -287,18 +287,6 @@ pub const fn radiata::Digest::as_bytes(&self) -> &[u8; 32]
 pub const fn radiata::Digest::from_bytes([u8; 32]) -> Self
 impl core::fmt::Debug for radiata::Digest
 pub fn radiata::Digest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct radiata::DiscoveryTag(_)
-impl radiata::DiscoveryTag
-pub fn radiata::DiscoveryTag::as_str(&self) -> &str
-pub fn radiata::DiscoveryTag::domain(&self) -> &str
-pub fn radiata::DiscoveryTag::parse(&str) -> radiata::Result<Self>
-impl core::fmt::Debug for radiata::DiscoveryTag
-pub fn radiata::DiscoveryTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::fmt::Display for radiata::DiscoveryTag
-pub fn radiata::DiscoveryTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::str::traits::FromStr for radiata::DiscoveryTag
-pub type radiata::DiscoveryTag::Err = radiata::Error
-pub fn radiata::DiscoveryTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::Endpoint
 impl radiata::Endpoint
 pub fn radiata::Endpoint::as_str(&self) -> &str
@@ -781,13 +769,6 @@ pub struct radiata::RouteChanged
 impl radiata::RouteChanged
 pub fn radiata::RouteChanged::handle(&self) -> &radiata::RouteHandle
 impl radiata::Event for radiata::RouteChanged
-pub struct radiata::RouteContext
-impl radiata::RouteContext
-pub fn radiata::RouteContext::current(&self) -> &radiata::NodeId
-pub fn radiata::RouteContext::destination(&self) -> &radiata::NodeId
-pub fn radiata::RouteContext::source(&self) -> &radiata::NodeId
-pub fn radiata::RouteContext::trace_id(&self) -> &radiata::TraceId
-pub fn radiata::RouteContext::visited(&self) -> &[radiata::NodeId]
 pub struct radiata::RouteHandle
 impl radiata::RouteHandle
 pub fn radiata::RouteHandle::trace_id(&self) -> &radiata::TraceId

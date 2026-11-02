@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 use radiata::{
-  Digest, DiscoveryTag, Endpoint, ErrorKind, FeatureTag, NodeConfig, NodeId, ProtocolTag,
-  ProviderErrorContext, ProviderErrorKind, PublicKey, QualifiedTag, RecoveryConfig, Signature,
-  TraceId, TraceMetadataLimits, TransactionId, TransportTag,
+  Digest, Endpoint, ErrorKind, FeatureTag, NodeConfig, NodeId, ProtocolTag, ProviderErrorContext,
+  ProviderErrorKind, PublicKey, QualifiedTag, RecoveryConfig, Signature, TraceId,
+  TraceMetadataLimits, TransactionId, TransportTag,
 };
 
 #[test]
@@ -62,7 +62,6 @@ fn core_tags_parse_current_namespaces_and_categories() {
   FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap();
   ProtocolTag::parse("example.com/protocols/work").unwrap();
   TransportTag::parse("example.com/transports/quic").unwrap();
-  DiscoveryTag::parse("example.com/discovery/local").unwrap();
   assert!(FeatureTag::parse("example.com/protocols/work").is_err());
 }
 

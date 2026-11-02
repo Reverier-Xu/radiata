@@ -152,6 +152,7 @@ macro_rules! category_tag {
 category_tag!(FeatureTag, "features", "feature tag");
 category_tag!(ProtocolTag, "protocols", "protocol tag");
 category_tag!(TransportTag, "transports", "transport tag");
+#[cfg(test)]
 category_tag!(DiscoveryTag, "discovery", "discovery tag");
 
 /// Validates one tag and returns its canonical text with the domain,
@@ -298,7 +299,21 @@ fn valid_version_component(component: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use super::{MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, QualifiedTag, valid_dns_hostname};
+  use super::{
+    DiscoveryTag, MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, QualifiedTag, valid_dns_hostname,
+  };
+
+  /// `DiscoveryTag` is not a facade export (its registry surface is
+  /// test-only), but the internal discovery fixture still parses and
+  /// renders the canonical discovery category.
+  #[test]
+  fn discovery_tag_parses_its_own_category() {
+    let tag = DiscoveryTag::parse("example.com/discovery/local").unwrap();
+    assert_eq!(tag.as_str(), "example.com/discovery/local");
+    assert_eq!(tag.domain(), "example.com");
+    assert_eq!(tag.to_string(), "example.com/discovery/local");
+    assert!(DiscoveryTag::parse("example.com/protocols/local").is_err());
+  }
 
   #[test]
   fn parses_versioned_tags_with_split_accessors() {

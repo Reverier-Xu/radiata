@@ -75,8 +75,6 @@ fn boundary_values_construct_parse_and_round_trip() {
   assert_eq!(protocol.as_str(), "example.org/protocols/echo");
   let transport = TransportTag::parse("example.org/transports/wss").unwrap();
   assert_eq!(transport.as_str(), "example.org/transports/wss");
-  let discovery = radiata::DiscoveryTag::parse("example.org/discovery/static").unwrap();
-  assert_eq!(discovery.as_str(), "example.org/discovery/static");
 
   let name = ResourceName::parse("radiata.woooo.tech/resources/pub-api-001").unwrap();
   assert_eq!(name.as_str(), "radiata.woooo.tech/resources/pub-api-001");
