@@ -283,10 +283,11 @@ async fn concurrent_resource_writes_converge_to_one_winner() {
 }
 
 /// Ordinary maintenance — anti-entropy ticks and topology chatter
-/// between two connected members — never erases labels and never emits
-/// a resource event without an explicit committed mutation.
+/// between two connected members — never erases labels and emits only
+/// the one remote commit event the convergence itself produces, never a
+/// stream of maintenance events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn maintenance_preserves_labels_and_emits_nothing() {
+async fn maintenance_preserves_labels_and_emits_only_the_remote_commit() {
   let issuer = start_node(
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),

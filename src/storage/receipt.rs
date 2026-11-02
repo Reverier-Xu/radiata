@@ -1700,11 +1700,11 @@ mod receipt_retention_tests {
   };
 
   use super::{
-    ACTIVE_MARKER_VALUE, EligibilityScan, FORGOTTEN_MARKER_VALUE, MetadataStore,
-    RETENTION_SWEEP_BOUND, ReceiptCleanupOutcome, ReceiptIdentity, ReceiptReferenceChange,
-    ReceiptReferenceToken, build_pending_record_delete_operations, eligibility_anchor_key,
-    encode_anchor_value, internal_namespace, prepare_internal_transaction, reference_head_key,
-    retention_candidate_key, used_id_key,
+    ACTIVE_MARKER_VALUE, FORGOTTEN_MARKER_VALUE, MetadataStore, RETENTION_SWEEP_BOUND,
+    ReceiptCleanupOutcome, ReceiptIdentity, ReceiptReferenceChange, ReceiptReferenceToken,
+    build_pending_record_delete_operations, eligibility_anchor_key, encode_anchor_value,
+    internal_namespace, prepare_internal_transaction, reference_head_key, retention_candidate_key,
+    used_id_key,
   };
   use crate::{
     Digest, StoreExpectation, StoreOperation, StoreValue,
@@ -1937,20 +1937,62 @@ mod receipt_retention_tests {
     assert_eq!(stored.as_bytes(), overflow_value.as_slice());
     drop(snapshot);
 
-    // The cursor advanced past the bad entry (the natural end resets it),
-    // so the next rotation completes instead of wedging at the same key.
-    assert!(
-      store
-        .retention_scan_cursor
-        .position(EligibilityScan::Anchors)
-        .is_none(),
-      "the scan advanced past the bad entry to its natural end"
-    );
+    // The scan reached its natural end, so the cursor reset; the second
+    // pass below is the real progress evidence: it must complete instead
+    // of failing at the same position.
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(
       !report.remaining,
       "a second pass makes progress instead of wedging"
+    );
+  }
+
+  /// The other half of the scan's skip policy: a corrupt anchor *value* is
+  /// skipped exactly like an overflowing deadline, the sweep completes, and
+  /// a good anchor before it is still collected. Without the per-entry skip
+  /// the decode error would abort the pass before the cursor advanced.
+  #[tokio::test]
+  async fn retention_sweep_skips_an_undecodable_anchor_value() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+    commit_and_anchor(&store, 1).await;
+
+    let corrupt_id = transaction_id(2);
+    let corrupt_key = eligibility_anchor_key(&corrupt_id).unwrap();
+    let snapshot = store.snapshot().await.unwrap();
+    let prepared = prepare_internal_transaction(
+      corrupt_id,
+      snapshot.revision().clone(),
+      vec![StoreOperation::Put {
+        namespace: internal_namespace().unwrap(),
+        key: corrupt_key.clone(),
+        expected: StoreExpectation::Absent,
+        value: StoreValue::new(Arc::from(vec![0xFF_u8, 0x00])),
+      }],
+    )
+    .unwrap();
+    drop(snapshot);
+    committed(store.commit(prepared).await.unwrap());
+
+    clock.set(UNIX_EPOCH + Duration::from_secs(200));
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(
+      report.forgotten, 1,
+      "the good anchor is collected despite the corrupt value behind it"
+    );
+    assert!(!report.remaining, "the scan reached its natural end");
+
+    // The corrupt row is skipped, never deleted or mistaken for a fault.
+    let snapshot = store.snapshot().await.unwrap();
+    assert!(
+      snapshot
+        .get(&internal_namespace().unwrap(), &corrupt_key)
+        .await
+        .unwrap()
+        .is_some(),
+      "the corrupt anchor row stays"
     );
   }
 
