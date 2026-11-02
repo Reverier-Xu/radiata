@@ -4,8 +4,7 @@
 //! A [`FeatureDefinition`] is the immutable contract behind one feature
 //! label. Its definition digest is SHA-256 over the deterministic-CBOR
 //! encoding of the full canonical record: tag, contract fingerprint, sorted
-//! dependencies, sorted conflicts, sorted protocol handlers, and the
-//! test-contract owner.
+//! dependencies, sorted conflicts, and sorted protocol handlers.
 //!
 //! Built-in contract fingerprints are fixed 32-byte values derived as
 //! SHA-256 of one exact frozen seed string per feature:

@@ -152,15 +152,20 @@
 //! — at most one dial of a uniformly random unconnected member per five
 //! minutes — because two sub-partitions each already meshed at or above
 //! target have a zero deficit budget and a quiesced recovery plane, and
-//! that probe is the only thing that re-bridges them.
+//! that probe is the only automatic re-bridge attempt.
 //!
 //! A bridge that lands is a one-shot edge, deliberately: the probe dials
 //! through the same maintenance path as a deficit batch but carries its
 //! own edge class, and the plane probes no further while a probe edge is
-//! live — so a node accepts **one** bridge edge, not one per five-minute
-//! bracket. That edge is never reclaimed by the recovery plane's
-//! redundancy pruning: it is the route across the partition it healed, so
-//! a cut would re-split what the probe just joined. It retires with its
+//! live — so a node dials at most **one** bridge edge, not one per
+//! five-minute bracket. The pick is uniformly random among unconnected
+//! members, so the one shot can land on a same-side peer; that edge is
+//! still kept (a cut would re-split what it joined) and the node does not
+//! probe again until it retires. An operator that must guarantee a
+//! cross-partition bridge steers the dial explicitly with `node.connect`.
+//! The edge is never reclaimed by the recovery plane's redundancy
+//! pruning: it is the route across the partition it healed, so a cut
+//! would re-split what the probe just joined. It retires with its
 //! session — peer offline, teardown, or node shutdown — and the next
 //! eligible tick probes again. A stable cluster therefore does **not**
 //! densify: its steady-state session count stays the degree target plus
@@ -778,13 +783,13 @@
 //! - **Memory** is roughly `queue bytes × live sessions` plus local diagnostics
 //!   and storage. The degree target shapes the steady-state count: about `k(n)`
 //!   maintenance sessions (seven at 64 members, growing with the logarithm of
-//!   the cluster), plus at most one bridge-probe session while a partition
-//!   persists — the probe is a one-shot bridge attempt, not a densification
-//!   loop: the plane stops probing while a probe edge is live and that edge
-//!   retires with its session, so the count never drifts toward a full mesh.
-//!   Application-initiated and inbound (hub-side) sessions stay on top of that.
-//!   Plan against `(k(n) + 1) × queue bytes` plus the caller's own edges — and,
-//!   for the live number, the session count
+//!   the cluster), plus at most one bridge-probe session (it retires with its
+//!   session, never by pruning) — the probe is a one-shot bridge attempt, not a
+//!   densification loop: the plane stops probing while a probe edge is live and
+//!   that edge retires with its session, so the count never drifts toward a
+//!   full mesh. Application-initiated and inbound (hub-side) sessions stay on
+//!   top of that. Plan against `(k(n) + 1) × queue bytes` plus the caller's own
+//!   edges — and, for the live number, the session count
 //!   [`node.connection_degree()`](crate::NodeHandle::connection_degree)
 //!   reports: a 64-node member at the defaults holds roughly `8 MiB` of
 //!   outbound queue capacity per live session — `8 MiB × 8 ≈ 64 MiB` at the

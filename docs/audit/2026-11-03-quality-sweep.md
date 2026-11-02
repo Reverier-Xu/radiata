@@ -50,7 +50,10 @@
 - **P2**：资源 removal retention 与 cap 仍是硬编码常量（未加 `NodeConfig` 旋钮）。
 - **P2**：`start_recovery()` 只强制一轮，不重置退避指数；CI 仍无无条件收敛上界。
 - **P2**：`reconcile/plane.rs::tick`、`runtime/supervisor.rs::supervise`、`membership/sync.rs::apply_tombstone_rows` 的拆分，以及 `EventHub`/tombstone GC 的模块迁移，推迟到 0.1.0 之后。
-- **已知残余**：资源毒行自愈只恢复页面活性并覆盖坏行；若坏行本身是更高版本的有效记录，写入方会在下一次发布/反熵中恢复它。
+- **已知残余（资源毒行）**：自愈只覆盖 page apply。本地 `read_record_ctx`、`commit_expected_record_ctx`、`commit_removal_ctx` 仍会对坏行报错，直到某次 peer page 覆盖它；若坏行本身是更高版本的有效记录，写入方会在下一次发布/反熵中恢复它。
+- **已知残余（描述符毒行）**：坏行按 absent 处理后，一个损坏的 removal 描述符可能被更旧的 live 行覆盖（复活）。这是 "corrupt = absent" 的固有代价，未额外加墓碑保护。
+- **已知残余（桥探针）**：one-shot 探针从"未直连成员"中均匀随机选取，可能落在同侧 peer；该边保留且节点在其会话退役前不再探针。需要保证跨分区桥的运营者应显式 `node.connect`。
+- **线格式破坏**：limit 协商删除是 pre-0.1.0 的 offer/selection 线格式变更，pre-limit 二进制无法与 post-limit 二进制握手；`tests/mixed_versions.rs` 的"旧版本"fixture 仍用当前 registry 构造，不模拟真实的旧二进制。
 
 ## 验证
 
