@@ -469,11 +469,10 @@ pub(crate) mod store {
     // first among equals — exactly what the sequential single-record
     // apply committed — and the transaction's keys stay distinct.
     let page_rows: Vec<&NodeDescriptorV1> = page.descriptors().iter().collect();
-    let (winner_rows, _loser_rows) = contest_descriptors(&page_rows);
-    let contenders: Vec<&NodeDescriptorV1> = winner_rows
-      .into_iter()
-      .map(|index| page_rows[index])
-      .collect();
+    // The page invariant is one row per node (`MembershipPage::new`), so
+    // the batch needs no page-order contest: the reconciliation plane
+    // dedups wire rows with the shared contest before it builds a page.
+    let contenders = page_rows;
     let mut attempt = 0_u8;
     loop {
       let snapshot = store.snapshot().await?;
@@ -488,13 +487,18 @@ pub(crate) mod store {
               Ok(existing) => Some(existing),
               // One corrupt durable row must not fail the whole page
               // (the emit path holds the same principle): treat it as
-              // an incumbent the incoming record cannot beat.
+              // an incumbent the incoming record cannot beat, and report
+              // the incoming row as refused. Leaving it out of both lists
+              // would let the caller admit it into its engines while the
+              // store never receives it: the fingerprints then agree and
+              // nothing ever re-drives the missing row.
               Err(error) => {
                 tracing::warn!(
                   node = %descriptor.node(),
                   kind = ?error.kind(),
                   "membership page skipped over an undecodable stored descriptor"
                 );
+                skipped.push(descriptor.node().clone());
                 continue;
               }
             }
@@ -805,6 +809,52 @@ mod tests {
         .await
         .is_err()
     );
+  }
+
+  /// A corrupt stored descriptor is an incumbent the incoming row cannot
+  /// beat, and the incoming row is reported as skipped: the caller keeps
+  /// it out of its derived view, so the row is re-delivered instead of
+  /// being admitted into the engines while the store never receives it.
+  #[tokio::test]
+  async fn undecodable_stored_descriptor_reports_the_incoming_row_as_skipped() {
+    let store = crate::storage::MetadataStore::open(&factory(), std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    let namespace = super::descriptor_namespace().unwrap();
+    let key = crate::StoreKey::new(Arc::from(node(1).as_str().as_bytes().to_vec()));
+    let snapshot = store.snapshot().await.unwrap();
+    let transaction = store
+      .prepare_transaction(
+        crate::TransactionId::generate(&crate::api::SystemEntropy).unwrap(),
+        snapshot.revision().clone(),
+        vec![crate::StoreOperation::Put {
+          namespace: namespace.clone(),
+          key: key.clone(),
+          expected: crate::StoreExpectation::Absent,
+          value: crate::StoreValue::new(Arc::from(b"not a descriptor".to_vec())),
+        }],
+      )
+      .unwrap();
+    drop(snapshot);
+    store.commit(transaction).await.unwrap();
+
+    let page = crate::membership::page::MembershipPage::new(
+      vec![descriptor(2, 1, vec!["one.example"], false)],
+      None,
+    )
+    .unwrap();
+    let (applied, skipped) =
+      store::apply_descriptor_batch_ctx(&store, &crate::api::SystemEntropy, &page)
+        .await
+        .unwrap();
+    assert!(applied.is_empty());
+    assert_eq!(skipped, vec![node(1)]);
+
+    // The corrupt incumbent is untouched: the row was refused, not
+    // overwritten.
+    let snapshot = store.snapshot().await.unwrap();
+    let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
+    assert_eq!(stored.as_bytes(), b"not a descriptor");
   }
 
   /// Two owner patches based on one observed revision (the audit's

@@ -39,6 +39,18 @@ impl MembershipPage {
       &cursor,
       "membership page",
     )?;
+    // One page carries at most one row per node: the page is the apply
+    // unit, and a duplicate node would make the batch's installed/refused
+    // split ambiguous (the caller maps the split back by node id). The
+    // reconciliation plane dedups wire rows with the shared page-order
+    // contest before it builds a page.
+    let mut seen = std::collections::BTreeSet::new();
+    if descriptors
+      .iter()
+      .any(|descriptor| !seen.insert(descriptor.node()))
+    {
+      return Err(Error::invalid_input("membership page"));
+    }
     Ok(Self {
       descriptors,
       cursor,
@@ -335,6 +347,16 @@ mod tests {
     assert!(page.cursor_loops(Some(&[1])));
     assert!(!page.cursor_loops(Some(&[2])));
     assert!(!page.cursor_loops(None));
+
+    // A duplicate node row is rejected: the page is the apply unit and
+    // the batch's installed/refused split is keyed by node id.
+    assert!(
+      MembershipPage::new(
+        vec![descriptor(1, 1, "one"), descriptor(1, 2, "one-again")],
+        None
+      )
+      .is_err()
+    );
   }
 }
 
