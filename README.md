@@ -131,10 +131,18 @@ guarantees:
 1. **Only trusted nodes are merged.** A malicious full member is indistinguishable from a
    man-in-the-middle on the path; Sybil growth, collusion, and hostile metadata are the
    deployment's responsibility.
-2. **Cleanup checkpoints are issued only against a fully converged cluster.** Deviating degrades
-   to metadata hygiene for key-dead subjects, never to security failures.
-3. **Cleaned subjects stay decommissioned.** A `cleanup_node` tombstone is terminal; there is no
-   resurrection path — a mistakenly cleaned node re-merges as a new `NodeId`.
+2. **Cleanup checkpoints are issued only against a fully converged cluster.** Every node must be
+   online and reachable, and node wall clocks must agree within one second: the checkpoint is a
+   wall-clock watermark, and the tombstone stamps it collects are written by each subject's own
+   clock. radiata uses UNIX timestamps exclusively — there is no timezone or local-time semantics
+   anywhere in the crate — so clock agreement, not timezone configuration, is the deployment's
+   obligation. Deviating degrades to metadata hygiene for key-dead subjects, never to security
+   failures.
+3. **Cleaned subjects stay decommissioned until their evidence is collected.** A `cleanup_node`
+   tombstone is terminal for as long as it lives: the subject cannot authenticate and is excluded
+   from recovery. A checkpoint GC that collects the tombstone retires the pinned binding in the
+   same transaction, after which the same `NodeId` may re-merge under a new key; a mistakenly
+   cleaned node that must return before collection re-merges as a new `NodeId`.
 
 ## Documentation
 
