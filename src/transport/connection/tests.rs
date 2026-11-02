@@ -7,7 +7,7 @@ use futures_util::SinkExt;
 use rustls::{
   ProtocolVersion, ServerConfig, SignatureAlgorithm, SignatureScheme,
   pki_types::CertificateDer,
-  server::{ClientHello, ParsedCertificate, ResolvesServerCert},
+  server::{ClientHello, ResolvesServerCert},
   sign::{CertifiedKey, Signer, SigningKey},
   version::TLS13,
 };
@@ -22,7 +22,7 @@ use crate::{
     cert::EphemeralCertificate,
     framing::MergeHint,
     testing::{SeedEntropy, server_name},
-    tls::{crypto_provider, member_client_config, merge_client_config, server_config},
+    tls::{crypto_provider, merge_client_config, server_config},
     ws::{self, MAX_MESSAGE_BYTES},
   },
 };
@@ -38,14 +38,6 @@ fn rules() -> FrameRules {
 
 fn certificate(seed: u8) -> EphemeralCertificate {
   EphemeralCertificate::generate(&SeedEntropy(seed)).unwrap()
-}
-
-fn leaf_spki(
-  certificate: &EphemeralCertificate,
-) -> rustls::pki_types::SubjectPublicKeyInfoDer<'static> {
-  ParsedCertificate::try_from(certificate.end_entity())
-    .unwrap()
-    .subject_public_key_info()
 }
 
 async fn loopback_pair() -> (Connection, Connection) {
@@ -524,37 +516,6 @@ async fn tls_transport_receive_returns_none_on_close() {
 
   raw.send(WsMessage::Close(None)).await.unwrap();
   assert_eq!(connection.receive().await.unwrap(), None);
-}
-
-#[tokio::test]
-async fn tls_transport_member_mode_binds_expected_leaf_key() {
-  // Positive: the expected key matches the presented ephemeral certificate.
-  let presented = certificate(31);
-  let expected = leaf_spki(&presented);
-  let (mut client, mut server) =
-    loopback_pair_with(member_client_config(expected).unwrap(), presented).await;
-  client.send(1, 1, 0, b"member").await.unwrap();
-  assert_eq!(server.receive().await.unwrap().unwrap().body, b"member");
-
-  // Negative: a different expected key aborts the handshake.
-  let unexpected = leaf_spki(&certificate(32));
-  let config = server_config(&certificate(33)).unwrap();
-  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let address = listener.local_addr().unwrap();
-  let server = tokio::spawn(async move {
-    let (tcp, _) = listener.accept().await.unwrap();
-    Connection::accept_tls_ws(tcp, config, rules(), None).await
-  });
-  let tcp = TcpStream::connect(address).await.unwrap();
-  let result = Connection::connect_tls_ws(
-    tcp,
-    member_client_config(unexpected).unwrap(),
-    server_name(),
-    rules(),
-  )
-  .await;
-  assert!(result.is_err());
-  assert!(server.await.unwrap().is_err());
 }
 
 #[tokio::test]

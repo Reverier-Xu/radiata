@@ -8,15 +8,10 @@
 //! rejected. This module is the single implementation of that rule; it has
 //! no accept-anything path.
 //!
-//! - [`TrustMode::Merge`]: chain, hostname, and validity-window trust are
-//!   relaxed. The certificate is not a node identity or trust record; receiver
-//!   authentication happens at the application proof layer over the RFC 9266
-//!   channel binding.
-//! - [`TrustMode::Member`]: the same relaxed chain/hostname policy plus an
-//!   exact binding of the presented leaf SubjectPublicKeyInfo to an expected
-//!   key. The exact Ed25519 identity check (proof of possession over the
-//!   exporter-bound transcript) happens at the application proof layer, not
-//!   here.
+//! - The single trust relaxation: chain, hostname, and validity-window trust
+//!   are relaxed. The certificate is not a node identity or trust record;
+//!   receiver authentication happens at the application proof layer over the
+//!   RFC 9266 channel binding.
 //!
 //! Focused review notes:
 //!
@@ -34,42 +29,19 @@ use rustls::{
   CertificateError, DigitallySignedStruct, Error as RustlsError, PeerIncompatible, SignatureScheme,
   client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
   crypto::{WebPkiSupportedAlgorithms, verify_tls13_signature},
-  pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime},
+  pki_types::{CertificateDer, ServerName, UnixTime},
   server::ParsedCertificate,
 };
-
-/// The trust relaxation applied for one authentication mode.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TrustMode {
-  /// Merge mode: the receiver's self-signed ephemeral certificate is unknown
-  /// up front, so chain and hostname trust are relaxed. Credential and
-  /// identity proofs over the channel binding authenticate the receiver.
-  Merge,
-  /// Member mode: the merge-mode relaxation plus an exact expected leaf
-  /// SubjectPublicKeyInfo binding. The durable Ed25519 identity binding is
-  /// still established by the application proof layer, not by this
-  /// verifier. The pin is best-effort hardening for same-listener
-  /// reconnects: a dial layer that observes a pin failure retries once
-  /// with merge trust and re-records the presented leaf as the anchor
-  /// after the identity proof succeeds — a peer that legitimately
-  /// re-issued its ephemeral certificate stays reachable instead of
-  /// failing TLS forever.
-  Member {
-    /// The exact expected leaf SubjectPublicKeyInfo.
-    expected_spki: SubjectPublicKeyInfoDer<'static>,
-  },
-}
 
 /// The bootstrap server certificate verifier.
 #[derive(Debug)]
 pub(crate) struct BootstrapCertVerifier {
   supported: WebPkiSupportedAlgorithms,
-  mode: TrustMode,
 }
 
 impl BootstrapCertVerifier {
-  pub(crate) const fn new(supported: WebPkiSupportedAlgorithms, mode: TrustMode) -> Self {
-    Self { supported, mode }
+  pub(crate) const fn new(supported: WebPkiSupportedAlgorithms) -> Self {
+    Self { supported }
   }
 }
 
@@ -78,7 +50,7 @@ impl ServerCertVerifier for BootstrapCertVerifier {
     &self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
     _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
   ) -> Result<ServerCertVerified, RustlsError> {
-    // The mode relaxes chain, hostname, and validity-window trust. The leaf
+    // Chain, hostname, and validity-window trust are relaxed. The leaf
     // must still carry bytes and decode as a well-formed X.509 certificate;
     // anything less fails closed.
     if end_entity.as_ref().is_empty() {
@@ -86,16 +58,8 @@ impl ServerCertVerifier for BootstrapCertVerifier {
         CertificateError::BadEncoding,
       ));
     }
-    let parsed = ParsedCertificate::try_from(end_entity)
+    ParsedCertificate::try_from(end_entity)
       .map_err(|_| RustlsError::InvalidCertificate(CertificateError::BadEncoding))?;
-
-    if let TrustMode::Member { expected_spki } = &self.mode
-      && parsed.subject_public_key_info() != *expected_spki
-    {
-      return Err(RustlsError::InvalidCertificate(
-        CertificateError::ApplicationVerificationFailure,
-      ));
-    }
 
     Ok(ServerCertVerified::assertion())
   }
@@ -149,18 +113,17 @@ mod tests {
     SignatureScheme,
     client::danger::ServerCertVerifier,
     pki_types::{CertificateDer, UnixTime},
-    server::ParsedCertificate,
   };
 
-  use super::{BootstrapCertVerifier, TrustMode};
+  use super::BootstrapCertVerifier;
   use crate::transport::{
     cert::EphemeralCertificate,
     testing::{SeedEntropy, server_name},
     tls::crypto_provider,
   };
 
-  fn verifier(mode: TrustMode) -> BootstrapCertVerifier {
-    BootstrapCertVerifier::new(crypto_provider().signature_verification_algorithms, mode)
+  fn verifier() -> BootstrapCertVerifier {
+    BootstrapCertVerifier::new(crypto_provider().signature_verification_algorithms)
   }
 
   fn certificate(seed: u8) -> EphemeralCertificate {
@@ -170,7 +133,7 @@ mod tests {
   #[test]
   fn tls_transport_verifier_join_mode_accepts_unknown_self_signed_leaf() {
     let certificate = certificate(7);
-    let verifier = verifier(TrustMode::Merge);
+    let verifier = verifier();
 
     verifier
       .verify_server_cert(
@@ -185,7 +148,7 @@ mod tests {
 
   #[test]
   fn tls_transport_verifier_rejects_empty_and_malformed_leaves() {
-    let verifier = verifier(TrustMode::Merge);
+    let verifier = verifier();
 
     let empty = CertificateDer::from(Vec::new());
     assert!(
@@ -208,37 +171,6 @@ mod tests {
     }
   }
 
-  #[test]
-  fn tls_transport_verifier_member_mode_binds_expected_leaf_key() {
-    let expected = certificate(7);
-    let other = certificate(9);
-    let expected_spki = ParsedCertificate::try_from(expected.end_entity())
-      .unwrap()
-      .subject_public_key_info();
-    let verifier = verifier(TrustMode::Member { expected_spki });
-
-    verifier
-      .verify_server_cert(
-        expected.end_entity(),
-        &[],
-        &server_name(),
-        &[],
-        UnixTime::now(),
-      )
-      .unwrap();
-    assert!(
-      verifier
-        .verify_server_cert(
-          other.end_entity(),
-          &[],
-          &server_name(),
-          &[],
-          UnixTime::now()
-        )
-        .is_err()
-    );
-  }
-
   // `verify_tls12_signature` cannot be exercised in isolation because
   // rustls exposes no `DigitallySignedStruct` constructor; its unconditional
   // rejection is covered end to end by the raw TLS 1.2 ClientHello test in
@@ -246,7 +178,7 @@ mod tests {
 
   #[test]
   fn tls_transport_verifier_signature_schemes_are_tls13_capable() {
-    let verifier = verifier(TrustMode::Merge);
+    let verifier = verifier();
 
     for scheme in verifier.supported_verify_schemes() {
       assert!(!matches!(
@@ -269,7 +201,6 @@ mod tests {
   fn tls_transport_verifier_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<BootstrapCertVerifier>();
-    assert_send_sync::<TrustMode>();
-    let _ = Arc::new(verifier(TrustMode::Merge));
+    let _ = Arc::new(verifier());
   }
 }

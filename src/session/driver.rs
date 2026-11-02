@@ -52,7 +52,6 @@ use crate::{
   },
   provider::KeyProvider,
   transport::{
-    Endpoint,
     connection::{Connection, Message},
     framing::MergeHint,
   },
@@ -109,121 +108,6 @@ fn established(handshake: &Handshake) -> Result<EstablishedSession> {
 }
 
 /// The shared node context every session driver run needs.
-/// The in-memory leaf certificate SPKI anchors learned during a join,
-/// keyed by (peer node, concrete dial endpoint). Each listener of a
-/// node binds its own ephemeral leaf, so the anchor is scoped to one
-/// scheme-and-address target: a reconnect to the SAME target pins the
-/// peer's TLS leaf to it, while a dial to any other listener of the
-/// same node — another scheme (tls after wss or the reverse), a second
-/// listener of the same scheme, or a rebound address — has no anchor
-/// and dials under merge trust, where the member handshake's identity
-/// proof is the authenticator. Keying by the node alone would make
-/// every such legitimate channel change pay one failed TLS handshake
-/// before the merge-trust fallback rescued it (audit 2026-10-09 item
-/// 3). Anchors are process-local by design: a fresh process re-joins
-/// before it reconnects as a member. When a peer legitimately re-issues
-/// its ephemeral leaf on the same target (same durable identity, new
-/// certificate), a successful merge-trust fallback dial re-records the
-/// presented leaf as that target's new anchor (audit 2026-10-09 item 8)
-/// — the application identity proof, not the pin, is the authority.
-/// The in-process anchor cache is bounded: a persistent peer that churns
-/// dial targets over one process lifetime must not accumulate obsolete
-/// pins, and neither must a large cluster. The bounds are configured
-/// per node through [`crate::NodeConfig::with_member_spki_anchor_limits`]
-/// (defaults: 4 pins per peer, 256 total). Every recorded anchor carries
-/// its last-recorded sequence; eviction drops the oldest per-peer pin
-/// past the per-peer bound and then the globally oldest pin past the
-/// global bound. Eviction is safe by construction: an evicted
-/// target simply has no anchor, so its next dial runs under merge trust
-/// where the member handshake's identity proof is the authenticator — the
-/// same fallback as an endpoint that was never pinned.
-struct MemberSpkiTable(std::sync::Mutex<MemberSpkiAnchors>);
-
-/// The bounded anchor cache: `(peer, endpoint)` pins with their last
-/// recorded sequence, oldest-first eviction, bounded by the configured
-/// per-peer and global anchor limits.
-struct MemberSpkiAnchors {
-  per_peer: usize,
-  global: usize,
-  sequence: u64,
-  anchors: std::collections::BTreeMap<(NodeId, Endpoint), (u64, Vec<u8>)>,
-}
-
-impl MemberSpkiAnchors {
-  fn new(member_spki_anchors_per_peer: usize, member_spki_anchors: usize) -> Self {
-    Self {
-      per_peer: member_spki_anchors_per_peer,
-      global: member_spki_anchors,
-      sequence: 0,
-      anchors: std::collections::BTreeMap::new(),
-    }
-  }
-
-  fn record(&mut self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
-    self.sequence = self.sequence.wrapping_add(1);
-    self
-      .anchors
-      .insert((peer.clone(), target.clone()), (self.sequence, spki));
-    self.evict_peer_overflow(peer);
-    self.evict_global_overflow();
-  }
-
-  fn evict_peer_overflow(&mut self, peer: &NodeId) {
-    while self.anchors.keys().filter(|(node, _)| node == peer).count() > self.per_peer {
-      let oldest = self
-        .anchors
-        .iter()
-        .filter(|((node, _), _)| node == peer)
-        .min_by_key(|(_, (sequence, _))| *sequence)
-        .map(|(key, _)| key.clone());
-      let Some(oldest) = oldest else { break };
-      self.anchors.remove(&oldest);
-    }
-  }
-
-  fn evict_global_overflow(&mut self) {
-    while self.anchors.len() > self.global {
-      let oldest = self
-        .anchors
-        .iter()
-        .min_by_key(|(_, (sequence, _))| *sequence)
-        .map(|(key, _)| key.clone());
-      let Some(oldest) = oldest else { break };
-      self.anchors.remove(&oldest);
-    }
-  }
-}
-
-impl MemberSpkiTable {
-  fn new(member_spki_anchors_per_peer: usize, member_spki_anchors: usize) -> Self {
-    Self(std::sync::Mutex::new(MemberSpkiAnchors::new(
-      member_spki_anchors_per_peer,
-      member_spki_anchors,
-    )))
-  }
-
-  /// Records the peer's leaf SPKI as the member-mode trust anchor for
-  /// one concrete dial target. The latest record wins per target, and the
-  /// bounded cache evicts the oldest anchors beyond its bounds.
-  fn record(&self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
-    if let Ok(mut anchors) = self.0.lock() {
-      anchors.record(peer, target, spki);
-    }
-  }
-
-  /// The recorded leaf SPKI anchor for `peer` at `target`, when this
-  /// process joined or pinned that exact endpoint. Every other endpoint
-  /// of the same node reports no anchor and dials under merge trust.
-  fn anchor(&self, peer: &NodeId, target: &Endpoint) -> Option<Vec<u8>> {
-    self.0.lock().ok().and_then(|anchors| {
-      anchors
-        .anchors
-        .get(&(peer.clone(), target.clone()))
-        .map(|(_, spki)| spki.clone())
-    })
-  }
-}
-
 #[derive(Clone)]
 pub(crate) struct SessionDriver {
   context: Arc<LocalIdentityContext>,
@@ -239,7 +123,6 @@ pub(crate) struct SessionDriver {
   features: Arc<FeatureRegistry>,
   authentication_deadline: Duration,
   limiter: crate::identity::merge_rate::MergeLimiter,
-  member_spkis: Arc<MemberSpkiTable>,
 }
 
 impl SessionDriver {
@@ -248,7 +131,6 @@ impl SessionDriver {
     context: Arc<LocalIdentityContext>, keys: Arc<dyn KeyProvider>, entropy: Arc<dyn Entropy>,
     issuer: Arc<Mutex<MergeCredentialIssuer>>, offer: FeatureOffer, features: Arc<FeatureRegistry>,
     authentication_deadline: Duration, merge_admission: crate::config::MergeAdmissionLimits,
-    member_spki_anchors_per_peer: usize, member_spki_anchors: usize,
   ) -> Self {
     Self {
       context,
@@ -259,32 +141,11 @@ impl SessionDriver {
       features,
       authentication_deadline,
       limiter: crate::identity::merge_rate::MergeLimiter::new(merge_admission),
-      member_spkis: Arc::new(MemberSpkiTable::new(
-        member_spki_anchors_per_peer,
-        member_spki_anchors,
-      )),
     }
   }
 
   pub(crate) fn issuer(&self) -> &Arc<Mutex<MergeCredentialIssuer>> {
     &self.issuer
-  }
-
-  /// Records the peer's leaf SPKI as the member-mode trust anchor for
-  /// one concrete dial target, observed at a successful join over that
-  /// endpoint or after a rollover fallback dial authenticated the peer
-  /// at the application proof layer. The latest record wins per target:
-  /// a re-issued certificate replaces the stale anchor in-process
-  /// (audit 2026-10-09 item 8).
-  pub(crate) fn record_peer_spki(&self, peer: &NodeId, target: &Endpoint, spki: Vec<u8>) {
-    self.member_spkis.record(peer, target, spki);
-  }
-
-  /// The recorded leaf SPKI anchor for `peer` at `target`, when this
-  /// process joined or pinned that exact endpoint. Every other endpoint
-  /// of the same node reports no anchor and dials under merge trust.
-  pub(crate) fn peer_spki(&self, peer: &NodeId, target: &Endpoint) -> Option<Vec<u8>> {
-    self.member_spkis.anchor(peer, target)
   }
 
   /// The current non-secret merge hint for accepted connections: the
@@ -798,8 +659,6 @@ mod deadline_tests {
       registry,
       Duration::from_millis(50),
       NodeConfig::new().merge_admission(),
-      NodeConfig::new().member_spki_anchors_per_peer(),
-      NodeConfig::new().member_spki_anchors(),
     );
 
     let certificate = EphemeralCertificate::generate(entropy.as_ref()).unwrap();
@@ -840,182 +699,5 @@ mod deadline_tests {
       "a deadline expiry must not read as a permanent identity rejection"
     );
     drop(silent_peer.await.unwrap());
-  }
-}
-
-#[cfg(test)]
-mod member_spki_tests {
-  use std::sync::Arc;
-
-  use super::{MemberSpkiTable, SessionDriver};
-  use crate::{
-    Endpoint, NodeConfig, NodeId,
-    identity::{
-      credential::MergeCredentialIssuer,
-      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
-    },
-    protocol::{feature::FeatureRegistry, offer::node_offer},
-  };
-
-  fn peer() -> NodeId {
-    NodeId::parse("node-000000000000000000042").unwrap()
-  }
-
-  /// The anchor is scoped to one concrete dial target (scheme and
-  /// address): every other listener of the same node — the other TLS
-  /// class, a second listener of the same scheme, a rebound port —
-  /// reports no anchor, so its member dial runs under merge trust and
-  /// the identity handshake authenticates instead of a leaf pin that
-  /// would always mismatch (audit 2026-10-09 item 3). A repeated dial
-  /// to a pinned target reuses its anchor, and a rollover re-record on
-  /// one target leaves the other target untouched.
-  #[test]
-  fn anchors_key_by_peer_and_concrete_dial_target() {
-    let anchors = MemberSpkiTable::new(4, 256);
-    let peer = peer();
-    let tls = Endpoint::parse("tls://127.0.0.1:7001").unwrap();
-    let wss = Endpoint::parse("wss://127.0.0.1:7002").unwrap();
-    let second_wss = Endpoint::parse("wss://127.0.0.1:7003").unwrap();
-
-    anchors.record(&peer, &tls, b"tls-leaf".to_vec());
-    anchors.record(&peer, &wss, b"wss-leaf".to_vec());
-
-    assert_eq!(
-      anchors.anchor(&peer, &tls).as_deref(),
-      Some(b"tls-leaf".as_slice()),
-      "a repeated dial to the pinned target reuses its anchor"
-    );
-    assert_eq!(
-      anchors.anchor(&peer, &wss).as_deref(),
-      Some(b"wss-leaf".as_slice()),
-      "a channel change (tls -> wss) carries its own independent anchor"
-    );
-    assert_eq!(
-      anchors.anchor(&peer, &second_wss),
-      None,
-      "a second listener of the same scheme must not inherit the first one's anchor"
-    );
-
-    anchors.record(&peer, &tls, b"rotated-leaf".to_vec());
-    assert_eq!(
-      anchors.anchor(&peer, &tls).as_deref(),
-      Some(b"rotated-leaf".as_slice()),
-      "the latest record wins per target"
-    );
-    assert_eq!(
-      anchors.anchor(&peer, &wss).as_deref(),
-      Some(b"wss-leaf".as_slice()),
-      "a rollover re-record on one target leaves the other target untouched"
-    );
-  }
-
-  /// Endpoint churn stays bounded by the CONFIGURED per-peer bound:
-  /// with a tightened bound of two the third target evicts the oldest,
-  /// and an evicted target reports no anchor so its next dial falls
-  /// back to merge trust (the member handshake's identity proof)
-  /// instead of pinning a stale leaf for the process lifetime (audit
-  /// B07).
-  #[test]
-  fn endpoint_churn_evicts_the_oldest_anchors_and_falls_back_safely() {
-    let anchors = MemberSpkiTable::new(2, 256);
-    let peer = peer();
-    let targets: Vec<Endpoint> = (1..=3)
-      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:70{port:02}")).unwrap())
-      .collect();
-    for (index, target) in targets.iter().enumerate() {
-      anchors.record(&peer, target, format!("leaf-{index}").into_bytes());
-    }
-    assert_eq!(
-      anchors.anchor(&peer, &targets[0]),
-      None,
-      "the oldest target of a churning peer is evicted"
-    );
-    for (index, target) in targets.iter().enumerate().skip(1) {
-      assert_eq!(
-        anchors.anchor(&peer, target),
-        Some(format!("leaf-{index}").into_bytes()),
-        "the newest targets keep their anchors"
-      );
-    }
-  }
-
-  /// The cache is globally bounded by the CONFIGURED bound too: with a
-  /// tightened table of four, a fifth pinned member evicts the globally
-  /// oldest anchor, and the evicted one falls back to merge trust.
-  #[test]
-  fn anchor_table_is_globally_bounded() {
-    let anchors = MemberSpkiTable::new(4, 4);
-    let peers: Vec<NodeId> = (0..=4)
-      .map(|seed| NodeId::parse(&format!("node-{seed:021}")).unwrap())
-      .collect();
-    let targets: Vec<Endpoint> = (0..=4)
-      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:{}", 20_000 + port)).unwrap())
-      .collect();
-    for (peer, target) in peers.iter().zip(&targets) {
-      anchors.record(peer, target, b"leaf".to_vec());
-    }
-    assert_eq!(
-      anchors.anchor(&peers[0], &targets[0]),
-      None,
-      "the globally oldest anchor is evicted"
-    );
-    let newest = 4;
-    assert_eq!(
-      anchors.anchor(&peers[newest], &targets[newest]),
-      Some(b"leaf".to_vec()),
-      "the newest anchor is retained"
-    );
-    assert_eq!(
-      anchors.0.lock().unwrap().anchors.len(),
-      4,
-      "the cache never exceeds its configured global bound"
-    );
-  }
-
-  /// The configured bounds flow from `NodeConfig` into the driver's
-  /// eviction logic: a driver built from a config with a tightened
-  /// per-peer bound evicts through the public record/anchor surface
-  /// (audit B2 — the 4/256 bounds are NodeConfig knobs, not private
-  /// driver constants).
-  #[tokio::test]
-  async fn configured_bounds_flow_from_node_config_into_the_driver() {
-    let (_reference, factory) = fresh_reference();
-    let keys = ScriptedKeys::full();
-    let entropy = Arc::new(SequenceEntropy::default());
-    let context = Arc::new(open_context(&factory, &keys, &entropy).await.unwrap());
-    let registry = Arc::new(FeatureRegistry::builtin().unwrap());
-    let offer = node_offer(&registry, &Default::default()).unwrap();
-    let config = NodeConfig::new()
-      .with_member_spki_anchor_limits(2, 256)
-      .unwrap();
-    let driver = SessionDriver::new(
-      context,
-      keys.as_provider(),
-      entropy.clone(),
-      Arc::new(std::sync::Mutex::new(MergeCredentialIssuer::new())),
-      offer,
-      registry,
-      config.authentication_deadline(),
-      config.merge_admission(),
-      config.member_spki_anchors_per_peer(),
-      config.member_spki_anchors(),
-    );
-    let peer = peer();
-    let targets: Vec<Endpoint> = (1..=3)
-      .map(|port| Endpoint::parse(&format!("wss://127.0.0.1:70{port:02}")).unwrap())
-      .collect();
-    for target in &targets {
-      driver.record_peer_spki(&peer, target, b"leaf".to_vec());
-    }
-    assert_eq!(
-      driver.peer_spki(&peer, &targets[0]),
-      None,
-      "the oldest pin is evicted past the configured per-peer bound"
-    );
-    assert_eq!(
-      driver.peer_spki(&peer, &targets[2]).as_deref(),
-      Some(b"leaf".as_slice()),
-      "the newest pin is retained"
-    );
   }
 }

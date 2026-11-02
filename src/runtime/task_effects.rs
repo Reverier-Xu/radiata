@@ -322,8 +322,7 @@ pub(crate) async fn disconnect(tasks: &TaskClient, peer: NodeId) -> Result<Task<
 }
 
 /// The join effect: dial under the configured deadline, merge with the
-/// presented credential, anchor the peer's leaf SPKI, and keep the
-/// session open.
+/// presented credential, and keep the session open.
 async fn reconcile_join(
   deps: Arc<OperationDeps>, transport: Arc<dyn crate::transport::registry::Transport>,
   receiver: Endpoint, credential: Arc<MergeCredential>,
@@ -334,7 +333,7 @@ async fn reconcile_join(
   let mut connection = connect_with_deadline(
     &transport,
     receiver.clone(),
-    TransportTrust::for_dial(&receiver.selector(), None),
+    TransportTrust::for_dial(&receiver.selector()),
     planes.config.dial_deadline(),
   )
   .await?;
@@ -344,18 +343,8 @@ async fn reconcile_join(
     .ok_or_else(|| Error::authentication_failed("join hint"))?;
   let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
   let (session, view) = planes.driver.merge(&mut connection, &hint, secret).await?;
-  // Remember the peer's leaf SPKI from the merge as the member-mode
-  // reconnect pinning anchor for THIS endpoint (each listener of the
-  // peer binds its own ephemeral leaf; other targets stay unpinned and
-  // dial under merge trust — hardening, the identity proof is the
-  // authority).
   let peer = session.peer().clone();
   crate::audit::dial_settled(peer.as_str(), false, true);
-  if !hint.leaf_spki().is_empty() {
-    planes
-      .driver
-      .record_peer_spki(&peer, &receiver, hint.leaf_spki().to_vec());
-  }
   // Keep the merge session open so both sides can stream packets over it.
   // The view returns only after the session table registers the entry, so
   // the caller's first packet cannot race registration.

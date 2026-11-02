@@ -24,16 +24,11 @@ use rustls::{
   ClientConfig, ServerConfig,
   client::Resumption,
   crypto::{CryptoProvider, aws_lc_rs::default_provider},
-  pki_types::SubjectPublicKeyInfoDer,
   server::NoServerSessionStorage,
   version::TLS13,
 };
 
-use super::{
-  cert::EphemeralCertificate,
-  registry::TransportTrust,
-  verify::{BootstrapCertVerifier, TrustMode},
-};
+use super::{cert::EphemeralCertificate, registry::TransportTrust, verify::BootstrapCertVerifier};
 use crate::{Error, Result};
 
 /// The aws-lc-rs-backed TLS 1.3-only provider.
@@ -65,34 +60,8 @@ pub(crate) fn server_config(certificate: &EphemeralCertificate) -> Result<Arc<Se
 /// validated. The WebPKI chain
 /// verifier is never used in join mode.
 pub(crate) fn merge_client_config() -> Result<Arc<ClientConfig>> {
-  client_config(TrustMode::Merge)
-}
-
-/// Builds the member-mode client configuration: the merge-mode relaxation
-/// plus an exact expected leaf SubjectPublicKeyInfo binding. The durable
-/// Ed25519 identity check happens at the application proof layer; the SPKI
-/// pin is the TLS-layer anchor learned during a join.
-pub(crate) fn member_client_config(
-  expected_spki: SubjectPublicKeyInfoDer<'static>,
-) -> Result<Arc<ClientConfig>> {
-  client_config(TrustMode::Member { expected_spki })
-}
-
-/// Maps the semantic trust a dial carries onto the client TLS
-/// configuration: the transport owns the wire details, the caller owns
-/// the intent. A plaintext trust on a TLS transport is a caller bug and
-/// fails typed instead of silently downgrading the channel.
-pub(crate) fn client_config_for_trust(trust: &TransportTrust) -> Result<Arc<ClientConfig>> {
-  match trust {
-    TransportTrust::Merge => merge_client_config(),
-    TransportTrust::Member { expected_spki } => member_client_config(expected_spki.clone()),
-    TransportTrust::Plaintext => Err(Error::invalid_input("transport trust")),
-  }
-}
-
-fn client_config(mode: TrustMode) -> Result<Arc<ClientConfig>> {
   let provider = crypto_provider();
-  let verifier = BootstrapCertVerifier::new(provider.signature_verification_algorithms, mode);
+  let verifier = BootstrapCertVerifier::new(provider.signature_verification_algorithms);
   let mut config = ClientConfig::builder_with_provider(provider)
     .with_protocol_versions(&[&TLS13])
     .map_err(|_| Error::internal("tls client versions"))?
@@ -105,6 +74,17 @@ fn client_config(mode: TrustMode) -> Result<Arc<ClientConfig>> {
   config.alpn_protocols = Vec::new();
 
   Ok(Arc::new(config))
+}
+
+/// Maps the semantic trust a dial carries onto the client TLS
+/// configuration: the transport owns the wire details, the caller owns
+/// the intent. A plaintext trust on a TLS transport is a caller bug and
+/// fails typed instead of silently downgrading the channel.
+pub(crate) fn client_config_for_trust(trust: &TransportTrust) -> Result<Arc<ClientConfig>> {
+  match trust {
+    TransportTrust::Merge => merge_client_config(),
+    TransportTrust::Plaintext => Err(Error::invalid_input("transport trust")),
+  }
 }
 
 /// The listener security material of one ephemeral certificate: the

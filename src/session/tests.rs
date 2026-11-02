@@ -72,8 +72,6 @@ async fn node_from(
     Arc::new(FeatureRegistry::builtin().unwrap()),
     config.authentication_deadline(),
     config.merge_admission(),
-    config.member_spki_anchors_per_peer(),
-    config.member_spki_anchors(),
   );
   Node {
     context,

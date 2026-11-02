@@ -92,16 +92,10 @@ pub(crate) fn builtin_transport_tag(scheme: TransportScheme) -> Result<Transport
 /// their own wire details; the caller never touches transport internals.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TransportTrust {
-  /// Bootstrap/merge mode: chain and hostname trust are relaxed while
-  /// the TLS 1.3 signature validation stays unconditional. The receiver
+  /// TLS-class dial: chain and hostname trust are relaxed while the TLS
+  /// 1.3 signature validation stays unconditional. The receiver
   /// authenticates at the application proof layer.
   Merge,
-  /// Member mode: the merge-mode relaxation plus an exact expected leaf
-  /// SubjectPublicKeyInfo pin learned during a join.
-  Member {
-    /// The exact expected leaf SubjectPublicKeyInfo.
-    expected_spki: rustls::pki_types::SubjectPublicKeyInfoDer<'static>,
-  },
   /// No channel security: only the plaintext TCP transport and custom
   /// transports accept this intent; every TLS transport fails typed on
   /// it instead of downgrading.
@@ -110,33 +104,19 @@ pub(crate) enum TransportTrust {
 
 impl TransportTrust {
   /// Derives the trust intent of one dial from the endpoint's transport
-  /// class and the caller's reconnect anchor: TLS-class endpoints dial
-  /// with the merge-mode relaxation or the member-mode SPKI pin;
+  /// class: TLS-class endpoints dial with the merge-mode relaxation,
   /// plaintext and custom-class endpoints dial with plaintext trust,
   /// where the session handshake proofs alone carry authentication. The
   /// mapping lives here so no dial path can accidentally pair a TLS
   /// trust mode with a plaintext-class endpoint or vice versa.
-  ///
-  /// The member-mode pin is best-effort hardening, never the identity
-  /// authority: a dial layer observing a pin failure retries once with
-  /// merge trust (`pinned_spki` = `None` here) and re-records the
-  /// presented leaf after the application identity proof succeeds, so a
-  /// peer that re-issued its ephemeral certificate stays reachable
-  /// (audit 2026-10-09 item 8).
-  pub(crate) fn for_dial(
-    selector: &crate::transport::endpoint::TransportSelector,
-    pinned_spki: Option<rustls::pki_types::SubjectPublicKeyInfoDer<'static>>,
-  ) -> Self {
+  pub(crate) fn for_dial(selector: &crate::transport::endpoint::TransportSelector) -> Self {
     match selector {
       crate::transport::endpoint::TransportSelector::Builtin(
         crate::transport::endpoint::TransportScheme::Tls,
       )
       | crate::transport::endpoint::TransportSelector::Builtin(
         crate::transport::endpoint::TransportScheme::Wss,
-      ) => match pinned_spki {
-        Some(expected_spki) => Self::Member { expected_spki },
-        None => Self::Merge,
-      },
+      ) => Self::Merge,
       crate::transport::endpoint::TransportSelector::Builtin(
         crate::transport::endpoint::TransportScheme::Tcp,
       )
@@ -186,7 +166,7 @@ pub(crate) trait Transport: fmt::Debug + Send + Sync + 'static {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>>;
 
   /// Connects to `endpoint` with the caller-selected trust intent (the
-  /// join-mode default, member-mode SPKI pinning, or plaintext).
+  /// merge-mode relaxation or plaintext).
   fn connect(
     &self, endpoint: Endpoint, trust: TransportTrust,
   ) -> BoxFuture<'static, Result<Connection>>;
@@ -268,8 +248,8 @@ pub(crate) struct TransportProviderAdapter {
   selector: String,
   binding: [u8; crate::transport::connection::CHANNEL_BINDING_LEN],
   /// Whether the served selector is a built-in TLS class (`tls://` or
-  /// `wss://`), whose dials arrive with the merge/member trust intents.
-  /// A custom-name registration serves plaintext-class dials only; a
+  /// `wss://`), whose dials arrive with the merge trust intent. A
+  /// custom-name registration serves plaintext-class dials only; a
   /// built-in override serves its selector's intents: the provider
   /// medium owns its own wire security, and the session handshake's
   /// identity proofs carry authentication either way. A mismatched
@@ -319,8 +299,8 @@ impl TransportProviderAdapter {
       selector: tag.as_str().to_owned(),
       binding,
       // The override serves exactly the intents its selector produces:
-      // the TLS classes dial with merge/member trust, `tcp://` dials
-      // with plaintext trust.
+      // the TLS classes dial with merge trust, `tcp://` dials with
+      // plaintext trust.
       accepts_tls_intents: matches!(scheme, TransportScheme::Tls | TransportScheme::Wss),
     })
   }
@@ -348,13 +328,12 @@ impl Transport for TransportProviderAdapter {
     Box::pin(async move {
       // A custom medium has no TLS trust modes of its own: each adapter
       // serves exactly the intents its selector produces — plaintext for
-      // a custom name or a `tcp://` override, merge/member for a
-      // `tls://` or `wss://` override — and a mismatched intent is a
-      // caller bug (the endpoint and the intent disagree) that fails
-      // typed instead of pretending. Under a tolerated TLS intent the
-      // provider medium simply ignores the TLS-specific semantics: it
-      // owns its own wire security, and the session handshake's identity
-      // proofs carry authentication either way.
+      // a custom name or a `tcp://` override, merge for a `tls://` or
+      // `wss://` override — and a mismatched intent is a caller bug (the
+      // endpoint and the intent disagree) that fails typed instead of
+      // pretending. The provider medium receives no trust intent beyond
+      // that class check: it owns its own wire security, and the session
+      // handshake's identity proofs carry authentication either way.
       if !matches!(trust, TransportTrust::Plaintext) != accepts_tls_intents {
         return Err(Error::invalid_input("transport trust"));
       }
@@ -400,8 +379,8 @@ impl TransportListener for ProviderListenerAdapter {
       let stream = self.inner.accept().await?;
       // Evaluated after the medium accept, exactly like the built-in
       // listeners. No leaf SPKI: a custom medium serves no certificate
-      // to pin, so member-mode reconnects rely on the handshake proofs
-      // alone.
+      // to pin, and the session handshake's identity proofs carry
+      // authentication.
       let hint = hint();
       let rules = connection_frame_rules()?;
       let (read, write) = tokio::io::split(stream);
@@ -777,6 +756,29 @@ mod tests {
     );
     assert!(client.is_ok());
     assert!(accepted.is_ok());
+  }
+
+  /// Every TLS-class dial resolves to the merge trust intent: the member
+  /// leaf-SPKI pin is gone, so no dial path can select a pinned TLS
+  /// establishment, and the session identity proof is the only peer
+  /// authority. A plaintext-class selector keeps its plaintext intent.
+  #[test]
+  fn tls_class_dials_carry_merge_trust_and_no_pin() {
+    for selector in [
+      TransportSelector::Builtin(TransportScheme::Tls),
+      TransportSelector::Builtin(TransportScheme::Wss),
+    ] {
+      assert_eq!(TransportTrust::for_dial(&selector), TransportTrust::Merge);
+    }
+    for selector in [
+      TransportSelector::Builtin(TransportScheme::Tcp),
+      TransportSelector::Custom(transport_name("espnow")),
+    ] {
+      assert_eq!(
+        TransportTrust::for_dial(&selector),
+        TransportTrust::Plaintext
+      );
+    }
   }
 
   // ---- Discovery registration without central switching ----

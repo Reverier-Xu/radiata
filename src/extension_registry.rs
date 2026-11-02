@@ -169,18 +169,18 @@ impl ExtensionRegistry {
   /// replacement.
   ///
   /// The override serves the dial intents the built-in selector
-  /// produces: a `tls://` or `wss://` override receives the
-  /// merge/member trust intents a TLS class dials with, a `tcp://`
-  /// override receives the plaintext intent. The provider medium owns
-  /// its own wire security either way — the same plaintext-class
-  /// contract every transport provider carries — and the session
-  /// handshake's identity proofs authenticate both endpoints over the
-  /// replacement channel. The channel binding derives from the built-in
-  /// selector's canonical tag, so proofs over the override stay distinct
-  /// from the replaced built-in and from every custom name; the binding
-  /// is node-local, and endpoints exchanged across nodes assume both
-  /// sides bound the selector identically (a mismatch fails at the
-  /// handshake's identity proofs, never silently).
+  /// produces: a `tls://` or `wss://` override receives the merge trust
+  /// intent a TLS class dials with, a `tcp://` override receives the
+  /// plaintext intent. The provider medium receives no trust intent
+  /// beyond that class check: it owns its own wire security — the same
+  /// plaintext-class contract every transport provider carries — and
+  /// the session handshake's identity proofs authenticate both
+  /// endpoints over the replacement channel. The channel binding derives
+  /// from the built-in selector's canonical tag, so proofs over the
+  /// override stay distinct from the replaced built-in and from every
+  /// custom name; the binding is node-local, and endpoints exchanged
+  /// across nodes assume both sides bound the selector identically (a
+  /// mismatch fails at the handshake's identity proofs, never silently).
   ///
   /// One override per selector: a scheme already overridden is a
   /// conflict, rejected before use. The existing custom-name contract is
