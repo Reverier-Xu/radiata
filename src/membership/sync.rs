@@ -2,11 +2,9 @@
 //!
 //! An authenticated session carries bounded sync payloads in one
 //! direction: a [`MembershipPage`] of node descriptors and the issuer's
-//! trust bindings as keyset pages of the snapshot record. Entries are
-//! trusted through the
+//! trust bindings as keyset pages. Entries are trusted through the
 //! authenticated session that delivered them; decoding checks
-//! only canonical wire rules and bounded capacities. Every node refreshes
-//! its own snapshot when its binding set changes, and every member pages
+//! only canonical wire rules and bounded capacities. Every member pages
 //! its local descriptors, so reciprocal trust, exact descriptors, and
 //! topology converge over the same authenticated sessions the facade
 //! observes.
@@ -19,10 +17,7 @@ use crate::{
   Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::{BoxFuture, Entropy},
   extension_registry::{PacketConsumer, ProtocolDefinition},
-  identity::{
-    lifecycle::LocalIdentityContext,
-    trust::{refresh_issuer_snapshot, store as trust_store},
-  },
+  identity::{lifecycle::LocalIdentityContext, trust::store as trust_store},
   runtime::RuntimeClient,
 };
 
@@ -843,12 +838,11 @@ pub(crate) async fn ensure_local_descriptor(
   Ok(())
 }
 
-/// One membership maintenance tick: publish the local descriptor,
-/// refresh the issuer snapshot, and run the checkpoint GC. The
-/// anti-entropy itself rides the reconciliation plane (every lane —
-/// descriptors, trust, resources, tombstones); this tick is only the
-/// local store maintenance whose writes then drive the plane's
-/// epoch-rescan triggers.
+/// One membership maintenance tick: publish the local descriptor and run
+/// the checkpoint GC. The anti-entropy itself rides the reconciliation
+/// plane (every lane — descriptors, trust, resources, tombstones); this
+/// tick is only the local store maintenance whose writes then drive the
+/// plane's epoch-rescan triggers.
 ///
 /// The same quiescence contract the old sync tick held: before any
 /// member is admitted the node's store writes are quiescent (the listen
@@ -876,16 +870,6 @@ pub(crate) async fn membership_maintenance_tick(
   if !trust_store::has_more_than_bindings(store, 1).await? {
     // No membership yet: nothing to maintain.
     return Ok(());
-  }
-  // The issuer snapshot refresh feeds the views (the trust lane
-  // propagates the bindings straight from the store): a refresh or
-  // encode failure must not fail the tick. Log and skip; the refresh
-  // retries next tick.
-  if let Err(error) = refresh_issuer_snapshot(context, entropy).await {
-    tracing::warn!(
-      kind = ?error.kind(),
-      "issuer snapshot refresh failed; skipping this round's refresh"
-    );
   }
   gc_collected_tombstones(store, entropy).await;
   Ok(())
@@ -935,75 +919,6 @@ mod tests {
   fn key_at(value: u64) -> crate::PublicKey {
     let signing = crate::identity::testing::scripted_signing(value);
     crate::PublicKey::from_bytes(signing.verifying_key().to_bytes())
-  }
-
-  /// Regression: a snapshot refresh failure used to fail the whole sync
-  /// tick every round — an issuer binding set over the single-record
-  /// store bound cannot encode (past the 16 384-entry collection cap of
-  /// the 1 MiB store body), so the maintenance tick would fail
-  /// permanently. The oversized issuer refresh fails in isolation, the
-  /// tick still returns success, and the reconciliation lanes keep
-  /// running while no snapshot revision is ever recorded.
-  #[tokio::test]
-  async fn sync_tick_survives_snapshot_refresh_overflow() {
-    use crate::{
-      identity::{
-        lifecycle,
-        records::{IdentityBindingV1, identity_binding_key},
-        testing::{ScriptedKeys, SequenceEntropy, inject_entry},
-      },
-      storage::contract::{ReferenceFactory, required_capabilities},
-    };
-
-    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
-    let factory: Arc<dyn crate::provider::StorageFactory> = reference.clone();
-    let keys = ScriptedKeys::full();
-    let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
-    let context = Arc::new(
-      lifecycle::open_local_identity(
-        &factory,
-        Some(&keys.as_provider()),
-        entropy.as_ref(),
-        std::time::Duration::from_secs(10),
-      )
-      .await
-      .unwrap(),
-    );
-    // Oversize the issuer's binding set past the snapshot wire bounds
-    // (16 384 collection entries inside the 1 MiB store body): the
-    // issuer's own snapshot can no longer encode. The entries are
-    // injected straight into the reference store — committing this many
-    // adoptions one by one is far too slow for the suite, and the
-    // refresh path only scans the identity-binding family, which is
-    // exactly what is injected. Keys repeat; only node identity is
-    // unique per binding.
-    let shared_key = key_at(0);
-    for index in 0..16_385_u64 {
-      let node = node_at(index);
-      let (namespace, key) = identity_binding_key(&node).unwrap();
-      let binding = IdentityBindingV1::new(node, shared_key.clone());
-      inject_entry(&reference, (namespace, key), binding.encode().unwrap());
-    }
-    // The injection is real: the issuer refresh fails on its own.
-    let error = refresh_issuer_snapshot(&context, &entropy)
-      .await
-      .unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
-
-    let endpoints = vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()];
-
-    // The maintenance tick succeeds despite the failed refresh leg.
-    let events = Arc::new(crate::node::EventHub::new());
-    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
-    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
-    membership_maintenance_tick(&context, &entropy, &endpoints, &events, &revision)
-      .await
-      .unwrap();
-    // A quiet second tick: the failing refresh is logged and skipped,
-    // never a tick failure.
-    membership_maintenance_tick(&context, &entropy, &endpoints, &events, &revision)
-      .await
-      .unwrap();
   }
 
   /// The leave-applied receipt carries one subject only: the applying

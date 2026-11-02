@@ -1,35 +1,19 @@
-//! Issuer trust snapshots consumed by the membership sync lane: every
-//! node is its own snapshot issuer.
+//! The durable trust surface consumed by the membership sync lane: one
+//! `NodeId`-to-`PublicKey` binding per node, held in the authoritative
+//! identity-binding family.
 //!
-//! A [`TrustSnapshotV1`] is one ordered set of `NodeId`-to-`PublicKey`
-//! bindings (strictly increasing revision, version, ordered bindings),
-//! carried over authenticated sessions and trusted through them;
-//! it carries no per-entry signatures. Conflicting evidence fails closed:
-//! wrong issuers in a decoded record's own marking, stale revisions, and
-//! `NodeId` key substitutions against locally admitted bindings are rejected
-//! without selecting a winner.
-//!
-//! Lifecycle: delivered remote snapshots are never persisted —
-//! `accept_snapshot` adopts their bindings immediately. Only the
-//! issuer's own refresh persists its snapshot, and that record is the
-//! revision basis the next refresh reads back.
+//! [`TrustBinding`] is the read view of one binding.
+//! `store::trusted_bindings` resolves the whole set — the verification
+//! basis for membership pages, cleanup tombstones, and session
+//! establishment — `store::paged_trust_ctx` pages it for the trust view,
+//! and `store::adopt_binding_ctx` commits one verified binding. There is
+//! no whole-set snapshot record: the bindings are the record, and a
+//! leave wipes them with the old identity.
 
-use std::sync::Arc;
+use crate::{NodeId, PublicKey};
 
-use minicbor::{Decode, Encode, bytes::ByteVec};
-
-use super::lifecycle::LocalIdentityContext;
-use crate::{
-  NodeId, PublicKey, Result,
-  api::Entropy,
-  protocol::{decode_canonical, encode_canonical},
-};
-
-/// The durable schema and namespace of one trust snapshot record.
-pub(crate) const TRUST_SNAPSHOT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/trust-snapshot";
-pub(crate) use crate::storage::families::TRUST_SNAPSHOT_NAMESPACE;
-
-/// One ordered `(node, key)` binding inside a snapshot.
+/// One trusted `(node, key)` binding: the read view of the durable
+/// identity-binding record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrustBinding {
   node: NodeId,
@@ -50,217 +34,9 @@ impl TrustBinding {
   }
 }
 
-/// One issuer-marked trust snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TrustSnapshotV1 {
-  revision: u64,
-  version: u16,
-  issuer: NodeId,
-  issuer_key: PublicKey,
-  bindings: Vec<TrustBinding>,
-}
-
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct BindingWire {
-  #[n(0)]
-  node: String,
-  #[n(1)]
-  key: ByteVec,
-}
-
-/// The durable full-set wire form: one issuer snapshot record holds the
-/// complete ordered binding set under the dedicated store-body budget
-/// ([`TRUST_SNAPSHOT_STORE_LIMITS`]); durable records are not wire frames
-/// and the 64 KiB control envelope does not bound them.
-#[derive(Encode, Decode)]
-#[cbor(array)]
-struct SnapshotWire {
-  #[n(0)]
-  schema: String,
-  #[n(1)]
-  record_version: u16,
-  #[n(2)]
-  revision: u64,
-  #[n(3)]
-  version: u16,
-  #[n(4)]
-  issuer: String,
-  #[n(5)]
-  issuer_key: ByteVec,
-  #[n(6)]
-  bindings: Vec<BindingWire>,
-}
-
-/// The wire-body budget for one durable snapshot record. The item cap
-/// stays above what the 1 MiB body can hold (63 bytes per binding), so
-/// the body budget binds first and roughly 16 000 bindings fit before
-/// the issuer refresh fails closed (a membership that outgrows even
-/// this is a new scale campaign, not a widening).
-const TRUST_SNAPSHOT_STORE_LIMITS: crate::protocol::CborLimits =
-  crate::protocol::CborLimits::new(16, 16_384, 1 << 20);
-
-/// Validates the shared wire fields and builds the snapshot core from
-/// either form.
-fn parse_snapshot_wire(
-  wire: SnapshotWire,
-) -> Result<(u64, u16, NodeId, PublicKey, Vec<TrustBinding>)> {
-  if wire.schema != TRUST_SNAPSHOT_SCHEMA || wire.record_version != 1 {
-    return Err(crate::Error::invalid_input("trust snapshot schema"));
-  }
-  // Only version 1 is known; an unknown version fails closed.
-  if wire.version != 1 {
-    return Err(crate::Error::invalid_input("trust snapshot version"));
-  }
-  let issuer = NodeId::parse(&wire.issuer)
-    .map_err(|_| crate::Error::invalid_input("trust snapshot issuer"))?;
-  let issuer_key = PublicKey::from_bytes(crate::error::fixed_bytes(
-    wire.issuer_key.as_ref(),
-    "trust snapshot issuer key",
-  )?);
-  let mut bindings = Vec::with_capacity(wire.bindings.len());
-  for binding in &wire.bindings {
-    let node = NodeId::parse(&binding.node)
-      .map_err(|_| crate::Error::invalid_input("trust snapshot node"))?;
-    let key = PublicKey::from_bytes(crate::error::fixed_bytes(
-      binding.key.as_ref(),
-      "trust snapshot key",
-    )?);
-    bindings.push(TrustBinding::new(node, key));
-  }
-  // Ordered deterministically: canonical node text ascending; a
-  // non-canonical order is rejected.
-  if !bindings.windows(2).all(|pair| pair[0].node < pair[1].node) {
-    return Err(crate::Error::invalid_input("trust snapshot ordering"));
-  }
-  Ok((wire.revision, wire.version, issuer, issuer_key, bindings))
-}
-
-impl TrustSnapshotV1 {
-  pub(crate) fn new(
-    revision: u64, version: u16, issuer: NodeId, issuer_key: PublicKey, bindings: Vec<TrustBinding>,
-  ) -> Self {
-    Self {
-      revision,
-      version,
-      issuer,
-      issuer_key,
-      bindings,
-    }
-  }
-
-  pub(crate) const fn revision(&self) -> u64 {
-    self.revision
-  }
-
-  pub(crate) const fn issuer(&self) -> &NodeId {
-    &self.issuer
-  }
-
-  pub(crate) fn bindings(&self) -> &[TrustBinding] {
-    &self.bindings
-  }
-
-  /// Encodes the durable full-set record under the dedicated store-body
-  /// budget (durable records are not wire frames; see
-  /// [`TRUST_SNAPSHOT_STORE_LIMITS`]).
-  pub(crate) fn encode_store(&self) -> Result<Vec<u8>> {
-    encode_canonical(&self.wire(), TRUST_SNAPSHOT_STORE_LIMITS)
-  }
-
-  /// The durable wire form.
-  fn wire(&self) -> SnapshotWire {
-    SnapshotWire {
-      schema: TRUST_SNAPSHOT_SCHEMA.to_owned(),
-      record_version: 1,
-      revision: self.revision,
-      version: self.version,
-      issuer: self.issuer.as_str().to_owned(),
-      issuer_key: ByteVec::from(self.issuer_key.as_bytes().to_vec()),
-      bindings: self
-        .bindings
-        .iter()
-        .map(|binding| BindingWire {
-          node: binding.node.as_str().to_owned(),
-          key: ByteVec::from(binding.key.as_bytes().to_vec()),
-        })
-        .collect(),
-    }
-  }
-
-  /// Decodes one durable full-set record (store limits; see
-  /// [`Self::encode_store`]): encode and decode must share the exact
-  /// budget, or a persisted snapshot would fail its own revision
-  /// read-back forever.
-  pub(crate) fn decode_store(bytes: &[u8]) -> Result<TrustSnapshotV1> {
-    let wire: SnapshotWire = decode_canonical(bytes, TRUST_SNAPSHOT_STORE_LIMITS)
-      .map_err(|_| crate::Error::invalid_input("trust snapshot decode"))?;
-    let (revision, version, issuer, issuer_key, bindings) = parse_snapshot_wire(wire)?;
-    Ok(Self::new(revision, version, issuer, issuer_key, bindings))
-  }
-
-  /// True when this snapshot is strictly newer than `other` by revision.
-  #[cfg(test)]
-  pub(crate) fn is_newer_than(&self, other: &TrustSnapshotV1) -> bool {
-    self.revision > other.revision
-  }
-
-  /// Rejects a `NodeId` key substitution against the known local bindings:
-  /// every binding whose node is already known must carry the exact same
-  /// key.
-  #[cfg(test)]
-  pub(crate) fn assert_no_key_substitution(&self, known: &[(NodeId, PublicKey)]) -> Result<()> {
-    let known: std::collections::BTreeMap<&NodeId, &PublicKey> =
-      known.iter().map(|(node, key)| (node, key)).collect();
-    for binding in &self.bindings {
-      if let Some(expected) = known.get(&binding.node)
-        && *expected != &binding.key
-      {
-        return Err(crate::Error::not_trusted("trust snapshot key substitution"));
-      }
-    }
-    Ok(())
-  }
-}
-
-pub(crate) async fn refresh_issuer_snapshot(
-  context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
-) -> Result<Option<TrustSnapshotV1>> {
-  let store = context.store();
-  let issuer = context.identity().node().clone();
-  // Cheap short-circuit: bindings are append-only between merges, so an
-  // unchanged count means an unchanged binding set; the full enumeration
-  // runs only when a merge may have added one.
-  let latest = store::latest_snapshot_ctx(store, &issuer).await?;
-  if let Some(latest) = &latest
-    && !store::has_more_than_bindings(store, latest.bindings().len()).await?
-  {
-    return Ok(Some(latest.clone()));
-  }
-  let bindings = store::trusted_bindings(store).await?;
-  let current: Vec<TrustBinding> = bindings
-    .into_iter()
-    .map(|(node, key)| TrustBinding::new(node, key))
-    .collect();
-  let revision = match &latest {
-    Some(latest) if latest.bindings() != current.as_slice() => latest.revision().saturating_add(1),
-    Some(latest) => return Ok(Some(latest.clone())),
-    None => 1,
-  };
-  let snapshot = TrustSnapshotV1::new(
-    revision,
-    1,
-    issuer,
-    context.identity().public_key().clone(),
-    current,
-  );
-  store::persist_snapshot_ctx(store, entropy.as_ref(), &snapshot).await?;
-  Ok(Some(snapshot))
-}
-
 #[cfg(test)]
 mod tests {
-  use super::{TrustBinding, TrustSnapshotV1};
+  use super::TrustBinding;
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
@@ -272,210 +48,20 @@ mod tests {
     crate::PublicKey::from_bytes(signing.verifying_key().to_bytes())
   }
 
-  fn issuer_pair(value: u8) -> (NodeId, crate::PublicKey) {
-    (node(value), key(value))
-  }
-
-  fn snapshot(revision: u64, issuer_index: u8, bindings: Vec<(u8, u8)>) -> TrustSnapshotV1 {
-    let (issuer, issuer_key) = issuer_pair(issuer_index);
-    TrustSnapshotV1::new(
-      revision,
-      1,
-      issuer,
-      issuer_key,
-      bindings
-        .into_iter()
-        .map(|(n, k)| TrustBinding::new(node(n), key(k)))
-        .collect(),
-    )
-  }
-
-  /// The durable snapshot record round-trips its marking, revision, and
-  /// ordered bindings under the dedicated store-body budget.
-  #[test]
-  fn trust_snapshot_round_trips() {
-    let snapshot = snapshot(7, 1, vec![(2, 2), (3, 3), (4, 4)]);
-    let bytes = snapshot.encode_store().unwrap();
-    let decoded = TrustSnapshotV1::decode_store(&bytes).unwrap();
-    assert_eq!(decoded, snapshot);
-    assert_eq!(decoded.bindings().len(), 3);
-    // Ordered by canonical node text.
-    assert_eq!(decoded.bindings()[0].node(), &node(2));
-    assert_eq!(decoded.issuer(), &node(1));
-  }
-
-  /// A full-capacity durable record must round-trip: the encode/decode
-  /// budget pair is the dedicated store budget, not the 64 KiB control
-  /// envelope, so a snapshot larger than the control budget persists and
-  /// still reads back as its own revision basis.
-  #[test]
-  fn trust_snapshot_over_the_control_budget_round_trips_through_the_store_form() {
-    // 2,000 bindings of canonical 26-character node ids: over the 64 KiB
-    // control budget, well inside the 1 MiB store budget. Keys repeat;
-    // only the binding order is part of the record contract.
-    let bindings: Vec<TrustBinding> = (0..2_000_u64)
-      .map(|index| {
-        TrustBinding::new(
-          NodeId::parse(&format!("node-{index:021}")).unwrap(),
-          key((index % u64::from(u8::MAX)) as u8),
-        )
-      })
-      .collect();
-    let (first, middle, last) = (
-      bindings[0].clone(),
-      bindings[1_000].clone(),
-      bindings[1_999].clone(),
-    );
-    let (issuer, issuer_key) = issuer_pair(1);
-    let snapshot = TrustSnapshotV1::new(7, 1, issuer, issuer_key, bindings);
-
-    let bytes = snapshot.encode_store().unwrap();
-    // Pins the regression: the record must sit over the control envelope
-    // a control-budget decode would impose.
-    assert!(
-      bytes.len() > crate::protocol::CONTROL_CBOR_LIMITS.max_body_len(),
-      "the regression requires a record over the 64 KiB control budget"
-    );
-    assert!(
-      bytes.len() <= super::TRUST_SNAPSHOT_STORE_LIMITS.max_body_len(),
-      "the record must stay inside the dedicated store budget"
-    );
-    // The round trip itself: decoding under the same store budget reads
-    // back the exact snapshot.
-    let decoded = TrustSnapshotV1::decode_store(&bytes).unwrap();
-    assert_eq!(decoded, snapshot);
-    // Count and order spot checks keep a regression legible without a
-    // 2,000-item diff: the canonical node-text order is the zero-padded
-    // index order, pinned at both ends and the middle.
-    assert_eq!(decoded.bindings().len(), 2_000);
-    assert_eq!(decoded.bindings()[0], first);
-    assert_eq!(decoded.bindings()[1_000], middle);
-    assert_eq!(decoded.bindings()[1_999], last);
-  }
-
-  #[test]
-  fn trust_snapshot_rejects_conflicting_evidence() {
-    let first = snapshot(7, 1, vec![(2, 2)]);
-
-    // NodeId key substitution fails closed.
-    let known = vec![(node(2), key(9))];
-    assert!(first.assert_no_key_substitution(&known).is_err());
-    let known_ok = vec![(node(2), key(2))];
-    assert!(first.assert_no_key_substitution(&known_ok).is_ok());
-
-    // Revision ordering: newer wins, stale conflicts are rejected by the
-    // caller comparing revisions.
-    let newer = snapshot(8, 1, vec![(2, 2)]);
-    assert!(newer.is_newer_than(&first));
-    assert!(!first.is_newer_than(&newer));
-  }
-
-  #[test]
-  fn trust_snapshot_rejects_noncanonical_ordering() {
-    // Bindings must be canonically ordered: a record whose bindings are
-    // reversed fails the parse, so two snapshots never differ by
-    // ordering alone.
-    let snapshot = snapshot(7, 1, vec![(2, 2), (3, 3)]);
-    let mut record = snapshot.encode_store().unwrap();
-    // Flip the two binding bodies in the encoded record: swap the two
-    // node texts so the pair reads out of order at decode.
-    let a = snapshot.bindings()[0].node().as_str().to_owned();
-    let b = snapshot.bindings()[1].node().as_str().to_owned();
-    let (i, j) = (
-      record.windows(a.len()).position(|w| w == a.as_bytes()),
-      record.windows(b.len()).position(|w| w == b.as_bytes()),
-    );
-    if let (Some(i), Some(j)) = (i, j)
-      && i < j
-    {
-      record[i..i + a.len()].copy_from_slice(b.as_bytes());
-      record[j..j + b.len()].copy_from_slice(a.as_bytes());
-    }
-    let error = TrustSnapshotV1::decode_store(&record);
-    assert!(error.is_err(), "a reordered record must fail closed");
-  }
-
-  // ---- Durable persistence and paged observations ----
-
   fn factory() -> std::sync::Arc<dyn crate::provider::StorageFactory> {
     std::sync::Arc::new(crate::storage::contract::ReferenceFactory::new(
       crate::storage::contract::required_capabilities(),
     ))
   }
+
+  /// The paged trust view serves the adopted bindings in canonical node
+  /// order across an offline restart: each store call opens and drops its
+  /// own storage handle, so the second page reads a fresh open of the same
+  /// provider — the adopted bindings are the durable record, nothing else.
   #[tokio::test]
-  async fn refresh_issuer_snapshot_persists_the_issuer_own_snapshot() {
+  async fn paged_trust_pages_the_adopted_bindings_after_restart() {
     use super::store;
-    use crate::identity::{
-      lifecycle,
-      testing::{ScriptedKeys, SequenceEntropy},
-    };
     let factory = factory();
-    let keys = ScriptedKeys::full();
-    let entropy: std::sync::Arc<dyn crate::api::Entropy> =
-      std::sync::Arc::new(SequenceEntropy::default());
-    let context = std::sync::Arc::new(
-      lifecycle::open_local_identity(
-        &factory,
-        Some(&keys.as_provider()),
-        entropy.as_ref(),
-        std::time::Duration::from_secs(10),
-      )
-      .await
-      .unwrap(),
-    );
-    let store = context.store();
-    store::adopt_binding_ctx(store, entropy.as_ref(), &node(2), &key(2))
-      .await
-      .unwrap();
-    store::adopt_binding_ctx(store, entropy.as_ref(), &node(3), &key(3))
-      .await
-      .unwrap();
-
-    let first = super::refresh_issuer_snapshot(&context, &entropy)
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(first.revision(), 1);
-    let persisted = store::latest_snapshot_ctx(store, context.identity().node())
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(persisted, first, "the issuer's own snapshot is persisted");
-
-    // An unchanged binding set re-reads the persisted snapshot without a
-    // revision bump.
-    let again = super::refresh_issuer_snapshot(&context, &entropy)
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(again.revision(), 1);
-    assert_eq!(again, first);
-
-    // A new binding bumps the persisted revision exactly once.
-    store::adopt_binding_ctx(store, entropy.as_ref(), &node(4), &key(4))
-      .await
-      .unwrap();
-    let third = super::refresh_issuer_snapshot(&context, &entropy)
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(third.revision(), 2);
-    let persisted = store::latest_snapshot_ctx(store, context.identity().node())
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(persisted, third);
-  }
-
-  #[tokio::test]
-  async fn trust_snapshot_persists_and_reloads_after_restart() {
-    use super::store;
-    let snapshot = snapshot(9, 1, vec![(2, 2), (3, 3)]);
-
-    // Persist; each store call opens and drops its own storage handle, so
-    // a later open on the same provider is an offline restart.
-    let factory = factory();
-    store::persist_snapshot(&factory, &snapshot).await.unwrap();
     store::adopt_binding(&factory, &node(2), &key(2))
       .await
       .unwrap();
@@ -483,61 +69,31 @@ mod tests {
       .await
       .unwrap();
 
-    // After the restart the exact snapshot and paged view agree with the
-    // original bindings.
-    let loaded = store::latest_snapshot(&factory, &node(1))
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(loaded.revision(), 9);
-    assert_eq!(loaded.bindings(), snapshot.bindings());
-
     let page = store::paged_trust(&factory, None, 1).await.unwrap();
     assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0], TrustBinding::new(node(2), key(2)));
     assert!(page.next.is_some());
     let page = store::paged_trust(&factory, page.next.as_deref(), 8)
       .await
       .unwrap();
     assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0], TrustBinding::new(node(3), key(3)));
     assert!(page.next.is_none());
-  }
-
-  #[tokio::test]
-  async fn trust_snapshot_rejects_stale_conflicts_on_reload() {
-    use super::store;
-    let older = snapshot(4, 1, vec![(2, 2)]);
-    let newer = snapshot(5, 1, vec![(2, 2)]);
-
-    let factory = factory();
-    store::persist_snapshot(&factory, &newer).await.unwrap();
-    store::persist_snapshot(&factory, &older).await.unwrap();
-
-    // The highest revision wins; the stale snapshot cannot overwrite it.
-    let loaded = store::latest_snapshot(&factory, &node(1))
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(loaded.revision(), 5);
   }
 }
 
-/// The trust observation store: persists issuer-signed snapshots and
-/// serves bounded paged views over every binding.
+/// The trust observation store: the durable identity-binding family,
+/// served as a whole-set resolution and as bounded paged views.
 pub(crate) mod store {
   use std::{collections::BTreeMap, sync::Arc};
 
-  use super::{TRUST_SNAPSHOT_NAMESPACE, TrustBinding, TrustSnapshotV1};
+  use super::TrustBinding;
   #[cfg(test)]
   use crate::provider::StorageFactory;
   use crate::{
-    NodeId, PublicKey, Result, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
-    StoreValue, TransactionId, api::Entropy, storage::MetadataStore,
+    NodeId, PublicKey, Result, StoreExpectation, StoreOperation, StoreValue, TransactionId,
+    api::Entropy, storage::MetadataStore,
   };
-
-  /// The zero-padded revision width in snapshot store keys. Single-sourced
-  /// so the writer and the parse-back cannot drift: lexicographic key
-  /// order must equal revision order, which requires a fixed width.
-  const REVISION_KEY_DIGITS: usize = 20;
 
   /// Whether the node carries terminal departure evidence — an
   /// owner-signed leave record or an issuer-signed cleanup tombstone.
@@ -591,120 +147,6 @@ pub(crate) mod store {
     Ok(public_key)
   }
 
-  fn snapshot_namespace() -> Result<StoreNamespace> {
-    crate::storage::families::namespace(TRUST_SNAPSHOT_NAMESPACE)
-  }
-
-  fn snapshot_key(issuer: &NodeId, revision: u64) -> StoreKey {
-    let mut bytes = Vec::with_capacity(issuer.as_str().len() + 1 + REVISION_KEY_DIGITS);
-    bytes.extend_from_slice(issuer.as_str().as_bytes());
-    bytes.push(b'/');
-    bytes.extend_from_slice(format!("{revision:0width$}", width = REVISION_KEY_DIGITS).as_bytes());
-    StoreKey::new(Arc::from(bytes))
-  }
-
-  /// Persists one snapshot over the running node's metadata store
-  /// (runtime path; never re-opens storage). The sole writer is the
-  /// issuer's own refresh — delivered remote snapshots are adopted
-  /// without persistence — and the record is the revision basis the
-  /// next refresh reads back. Re-refresh of the same revision is a
-  /// no-op (idempotent).
-  pub(crate) async fn persist_snapshot_ctx(
-    store: &MetadataStore, entropy: &dyn Entropy, snapshot: &TrustSnapshotV1,
-  ) -> Result<()> {
-    let _permit = store.write_permit().await;
-    let namespace = snapshot_namespace()?;
-    let key = snapshot_key(snapshot.issuer(), snapshot.revision());
-    let current = store.snapshot().await?;
-    if current.get(&namespace, &key).await?.is_some() {
-      return Ok(());
-    }
-    // Superseded revisions of the same issuer are pruned in the same
-    // transaction: only the latest grant set is ever read back, so keeping
-    // history would grow the scan unboundedly over the cluster lifetime.
-    let mut operations = vec![StoreOperation::Put {
-      namespace: namespace.clone(),
-      key: key.clone(),
-      expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(snapshot.encode_store()?)),
-    }];
-    let mut scan = current
-      .scan(&namespace, snapshot.issuer().as_str().as_bytes())
-      .await?;
-    while let Some(entry) = scan.next().await? {
-      let revision = revision_from_key(entry.key())?;
-      if revision < snapshot.revision() {
-        operations.push(StoreOperation::Delete {
-          namespace: namespace.clone(),
-          key: StoreKey::new(Arc::from(entry.key().as_bytes().to_vec())),
-          expected: entry.value().digest().clone(),
-        });
-      }
-    }
-    let transaction = store.prepare_transaction(
-      TransactionId::generate(entropy)?,
-      current.revision().clone(),
-      operations,
-    )?;
-    // A discarded commit outcome would report a snapshot revision as
-    // persisted without a committed outcome behind it: Conflict/Aborted
-    // definitively did not land, and Unknown leaves durability
-    // indeterminate — both must surface (the sync lane isolates them).
-    crate::provider::commit_verdict(store.commit(transaction).await?, "trust snapshot")?;
-    // The persisted revision is a local store write: the register
-    // epoch arms the reconciliation plane's next rescan pass.
-    store.note_local_write_tag(crate::storage::families::TRUST_SNAPSHOT_NAMESPACE);
-    Ok(())
-  }
-
-  /// The highest-revision snapshot for one issuer over the running node's
-  /// metadata store, scoped to the issuer's own key prefix.
-  pub(crate) async fn latest_snapshot_ctx(
-    store: &MetadataStore, trusted_issuer: &NodeId,
-  ) -> Result<Option<TrustSnapshotV1>> {
-    let namespace = snapshot_namespace()?;
-    let snapshot = store.snapshot().await?;
-    // Scan only this issuer's keys ({issuer}/{revision:020}): a higher
-    // revision snapshot from another issuer must never shadow the trusted
-    // issuer's latest snapshot.
-    let mut scan = snapshot
-      .scan(&namespace, trusted_issuer.as_str().as_bytes())
-      .await?;
-    let mut latest: Option<(u64, Vec<u8>)> = None;
-    while let Some(entry) = scan.next().await? {
-      let bytes = entry.value().as_bytes().to_vec();
-      let key = entry.key();
-      let revision = revision_from_key(key)?;
-      if latest
-        .as_ref()
-        .is_none_or(|(current, _)| revision > *current)
-      {
-        latest = Some((revision, bytes));
-      }
-    }
-    let Some((_, bytes)) = latest else {
-      return Ok(None);
-    };
-    Ok(Some(TrustSnapshotV1::decode_store(&bytes)?))
-  }
-
-  /// The revision parsed out of a snapshot key (`{issuer}/{revision:020}`).
-  /// A malformed suffix is schema corruption, never revision zero.
-  fn revision_from_key(key: &StoreKey) -> Result<u64> {
-    let text = std::str::from_utf8(key.as_bytes())
-      .map_err(|_| crate::Error::invalid_input("trust snapshot key"))?;
-    let revision = text
-      .rsplit('/')
-      .next()
-      .ok_or_else(|| crate::Error::invalid_input("trust snapshot key"))?;
-    if revision.len() != REVISION_KEY_DIGITS {
-      return Err(crate::Error::invalid_input("trust snapshot key"));
-    }
-    revision
-      .parse::<u64>()
-      .map_err(|_| crate::Error::invalid_input("trust snapshot revision"))
-  }
-
   /// Paged trust observations over the running node's metadata store:
   /// distinct bindings from the authoritative identity-binding family —
   /// the one durable binding representation — keyset-paginated in the
@@ -737,7 +179,7 @@ pub(crate) mod store {
 
   /// The durable trusted bindings from the authoritative identity-binding
   /// family (`identity_binding_namespace`): every binding this node has
-  /// committed from a verified grant or snapshot adoption. This is the
+  /// committed from a verified grant or a binding adoption. This is the
   /// single trusted-keys representation — it feeds membership page
   /// verification, the recovery online set, and the paged trust view
   /// alike.
@@ -818,7 +260,7 @@ pub(crate) mod store {
     // A discarded commit outcome would report the binding as adopted
     // without a committed outcome behind it: Conflict/Aborted
     // definitively did not land, and Unknown leaves durability
-    // indeterminate — the snapshot-accept lane treats a surfaced
+    // indeterminate — the reconcile trust lane treats a surfaced
     // conflict as skippable and everything else as evidence failure.
     crate::provider::commit_verdict(store.commit(transaction).await?, "trust binding adoption")?;
     // The adopted binding changes what every plane sends (descriptors
@@ -826,27 +268,6 @@ pub(crate) mod store {
     // epoch arms the walks for a next-tick push.
     store.note_local_write_tag(crate::storage::families::IDENTITY_BINDING_NAMESPACE);
     Ok(())
-  }
-
-  /// Persists one verified snapshot as a plain store value over a
-  /// standalone factory handle (test-only restart harness; the runtime
-  /// path always goes through the `_ctx` variants on the open store).
-  #[cfg(test)]
-  pub(crate) async fn persist_snapshot(
-    factory: &Arc<dyn StorageFactory>, snapshot: &TrustSnapshotV1,
-  ) -> Result<()> {
-    let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
-    persist_snapshot_ctx(&store, &crate::api::SystemEntropy, snapshot).await
-  }
-
-  /// The highest-revision snapshot for one issuer over a standalone
-  /// factory handle (test-only restart harness).
-  #[cfg(test)]
-  pub(crate) async fn latest_snapshot(
-    factory: &Arc<dyn StorageFactory>, trusted_issuer: &NodeId,
-  ) -> Result<Option<TrustSnapshotV1>> {
-    let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
-    latest_snapshot_ctx(&store, trusted_issuer).await
   }
 
   /// Adopts one verified nonconflicting binding over a standalone

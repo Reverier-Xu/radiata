@@ -29,8 +29,6 @@ pub(crate) const KEY_DELETED_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/k
 /// operation id. Swept only by the provider's own deletion flow, never
 /// by a domain wipe.
 pub(crate) const KEY_SEED_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/key-seed";
-/// One issuer trust snapshot per issuer and revision.
-pub(crate) const TRUST_SNAPSHOT_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/trust-snapshot";
 /// Local authorization revocation per exact subject binding.
 pub(crate) const REVOCATION_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/revocation";
 /// Cleanup checkpoint GC epoch marker, max-wins by watermark.
@@ -84,8 +82,6 @@ mod catalog {
     /// Key custody seed material (the default key store's durable
     /// artifact), removable only through the provider deletion flow.
     Custody,
-    /// Issuer trust snapshots.
-    Trust,
     /// Owner-revision-marked node descriptors.
     Node,
     /// Generic named resource registers.
@@ -136,7 +132,7 @@ mod catalog {
     INTERNAL_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE,
     KEY_DELETION_INTENT_NAMESPACE, KEY_SEED_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
     MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE,
-    REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE, TRUST_SNAPSHOT_NAMESPACE,
+    REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE,
   };
 
   /// Every core metadata family, in domain order and then declaration order.
@@ -154,7 +150,6 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETION_INTENT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Custody, KEY_SEED_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Trust, TRUST_SNAPSHOT_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Node, NODE_DESCRIPTOR_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Resource, RESOURCE_RECORD_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Route, TRACE_NAMESPACE),
@@ -195,7 +190,6 @@ mod catalog {
         MetadataDomain::Identity,
         MetadataDomain::KeyIntent,
         MetadataDomain::Custody,
-        MetadataDomain::Trust,
         MetadataDomain::Node,
         MetadataDomain::Resource,
         MetadataDomain::Route,

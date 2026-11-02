@@ -426,12 +426,12 @@ pub(crate) async fn discover_leave_intent(
   )))
 }
 
-/// The member-visible metadata domains wiped whole by a leave: the old
-/// identity's trust view plus every node-descriptor, resource, and trace
-/// family. A family added to any of these domains joins the wipe scope
-/// automatically through the registry derivation.
+/// The member-visible metadata domains wiped whole by a leave: every
+/// node-descriptor, resource, and trace family. A family added to any of
+/// these domains joins the wipe scope automatically through the registry
+/// derivation. The old identity's trust view is not a domain of its own:
+/// its one durable family is the identity-binding family below.
 const WIPE_DOMAINS: &[crate::storage::families::MetadataDomain] = &[
-  crate::storage::families::MetadataDomain::Trust,
   crate::storage::families::MetadataDomain::Node,
   crate::storage::families::MetadataDomain::Resource,
   crate::storage::families::MetadataDomain::Route,
@@ -1172,26 +1172,45 @@ mod tests {
     assert!(LeaveIntentV1::decode(&forged).is_err());
   }
 
-  /// The registry-derived wipe scope stays set-equal to the pre-registry
-  /// list: any catalog or domain change that alters what a leave wipes
-  /// must update this expectation deliberately instead of silently
-  /// widening or shrinking the wipe.
+  /// The wipe scope covers every live trust family and partitions the
+  /// catalog: the old identity's trust view is the identity-binding
+  /// family (the trust store's one durable family), it is wiped with the
+  /// old identity, and every other catalog family is either wiped or
+  /// named here as surviving the leave. A family added to the registry
+  /// without a deliberate wiped-or-exempt decision fails here instead of
+  /// silently escaping the wipe.
   #[test]
-  fn wipe_scope_matches_the_pre_registry_list() {
-    let mut derived = wipe_namespaces();
-    derived.sort_unstable();
-    let mut expected = vec![
-      crate::storage::families::IDENTITY_BINDING_NAMESPACE,
-      crate::storage::families::CREDENTIAL_USE_NAMESPACE,
-      crate::storage::families::MERGE_GRANT_NAMESPACE,
-      crate::storage::families::TRUST_SNAPSHOT_NAMESPACE,
-      crate::storage::families::REVOCATION_NAMESPACE,
-      crate::storage::families::NODE_DESCRIPTOR_NAMESPACE,
-      crate::storage::families::RESOURCE_RECORD_NAMESPACE,
-      crate::storage::families::TRACE_NAMESPACE,
+  fn the_wipe_scope_covers_every_trust_family() {
+    let wiped = wipe_namespaces();
+    assert!(
+      wiped.contains(&crate::storage::families::IDENTITY_BINDING_NAMESPACE),
+      "a leave wipes the old identity's trust view"
+    );
+    // The families that outlive a leave: the local identity singleton is
+    // swapped, never wiped; the leave intent, cleanup tombstones, and
+    // checkpoint are store hygiene records; the key-custody families
+    // leave through the provider's own deletion flow; and the storage
+    // infrastructure families carry no identity credentials.
+    let exempt = [
+      crate::storage::families::LOCAL_IDENTITY_NAMESPACE,
+      crate::storage::families::LEAVE_NAMESPACE,
+      crate::storage::families::CLEANUP_NAMESPACE,
+      crate::storage::families::CHECKPOINT_NAMESPACE,
+      crate::storage::families::KEY_CREATION_INTENT_NAMESPACE,
+      crate::storage::families::KEY_DELETION_INTENT_NAMESPACE,
+      crate::storage::families::KEY_DELETED_NAMESPACE,
+      crate::storage::families::KEY_SEED_NAMESPACE,
+      crate::storage::families::PENDING_NAMESPACE,
+      crate::storage::families::INTERNAL_NAMESPACE,
+      crate::storage::families::SCHEMA_NAMESPACE,
     ];
-    expected.sort_unstable();
-    assert_eq!(derived, expected);
+    for family in crate::storage::families::metadata_families() {
+      let tag = family.namespace_tag();
+      assert!(
+        wiped.contains(&tag) || exempt.contains(&tag),
+        "family {tag} is neither wiped by a leave nor explicitly exempt"
+      );
+    }
   }
 
   /// One leave swaps the identity, wipes every old

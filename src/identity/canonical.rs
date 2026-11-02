@@ -15,11 +15,11 @@
 //! [`::minicbor::bytes::ByteVec`], which encodes and decodes identically
 //! to the previous `#[cbor(with = "minicbor::bytes")] Vec<u8>` shape.
 //!
-//! Coverage note: every identity record family uses the macro except
-//! `TrustSnapshotV1` (handwritten in `trust.rs`): its wire shape nests a
-//! second wire struct for the binding entries, and its decode enforces a
-//! canonical ordering invariant across decoded entries plus a separate
-//! logical-version check that the macro deliberately does not model.
+//! Coverage note: every identity record family uses the macro. The
+//! trust surface has no record of its own — a binding is an
+//! [`crate::identity::records::IdentityBindingV1`] in the
+//! identity-binding family, encoded through this macro like every other
+//! identity record.
 
 /// Generates the wire struct, canonical `encode`, and canonical `decode`
 /// for one durable identity record, with an optional signed body variant.
