@@ -496,7 +496,11 @@ impl MetadataStore {
       ),
       Some(anchor) => {
         let (anchored_at, _) = decode_anchor_value(anchor.as_bytes())?;
-        let Some(deadline) = anchored_at.checked_add(self.receipt_retention) else {
+        // The scan reads the same verdict: an anchor whose deadline
+        // leaves the representable clock domain is retained, never a
+        // storage fault (a fault verdict would wedge every sweep pass
+        // at the same cursor position).
+        let Some(deadline) = retention_deadline(anchored_at, self.receipt_retention) else {
           return Ok(ReceiptCleanupOutcome::Retained);
         };
         if now < deadline {
@@ -634,17 +638,33 @@ impl MetadataStore {
       let key = entry.key().as_bytes();
       last_examined = Some(key.to_vec());
       examined += 1;
-      let transaction = decode_tagged_transaction(key, ELIGIBILITY_ANCHOR_TAG)?;
-      let (anchored_at, operation_digest) = decode_anchor_value(entry.value().as_bytes())?;
-      let deadline = anchored_at
-        .checked_add(self.receipt_retention)
-        .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
+      // Per-entry corruption skips, never fails the scan: the cursor
+      // still advances past this key, so a bad entry is examined once
+      // per rotation instead of wedging every pass at the same
+      // position. Store faults above still propagate — they are real
+      // read failures, not corrupt input.
+      let Some((transaction, (anchored_at, operation_digest))) = scan_entry(
+        &entry,
+        EligibilityScan::Anchors.prefix(),
+        decode_anchor_value,
+      ) else {
+        continue;
+      };
+      // The cleanup state machine retains an anchor whose deadline
+      // overflows the clock domain; the scan reads the same verdict, so
+      // such an anchor is not-due rather than a storage fault.
+      let Some(deadline) = retention_deadline(anchored_at, self.receipt_retention) else {
+        tracing::debug!(
+          transaction = transaction.as_str(),
+          "receipt retention skipped an anchor whose deadline overflows"
+        );
+        continue;
+      };
       // Only receipts whose deadline has passed leave the scan; the
       // state machine re-verifies everything for the ones that remain.
       if self.clock.now() < deadline {
         continue;
       }
-      let transaction = TransactionId::parse(transaction)?;
       targets.push(ReceiptIdentity::from_parts(transaction, operation_digest));
     }
     drop(scan);
@@ -696,9 +716,16 @@ impl MetadataStore {
       let key = entry.key().as_bytes();
       last_examined = Some(key.to_vec());
       examined += 1;
-      let transaction =
-        TransactionId::parse(decode_tagged_transaction(key, RETENTION_CANDIDATE_TAG)?)?;
-      let operation_digest = decode_candidate_value(entry.value().as_bytes())?;
+      // The same per-entry skip policy as the anchor scan: a corrupt
+      // candidate is skipped and the cursor advances past it, so one
+      // bad marker cannot wedge every pass at the same position.
+      let Some((transaction, operation_digest)) = scan_entry(
+        &entry,
+        EligibilityScan::Candidates.prefix(),
+        decode_candidate_value,
+      ) else {
+        continue;
+      };
       candidates.push(RetentionCandidate {
         target: ReceiptIdentity::from_parts(transaction, operation_digest),
         marker_digest: entry.value().digest().clone(),
@@ -799,6 +826,49 @@ fn decode_tagged_transaction<'a>(key: &'a [u8], tag: &[u8]) -> crate::Result<&'a
     .ok_or_else(|| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
   std::str::from_utf8(transaction)
     .map_err(|_| super::storage_corrupt(ProviderErrorContext::StorageSnapshot))
+}
+
+/// Decodes one retention-scan entry into its transaction id and value,
+/// mapping any per-entry corruption to `None` so the caller skips the
+/// entry while the cursor still advances past it. This is the sweep's
+/// one skip policy: a bad entry is examined once per rotation, never
+/// forever, and it is never mistaken for a store fault (which would
+/// abort the pass before the cursor advanced).
+fn scan_entry<T>(
+  entry: &crate::provider::StoreEntry, tag: &[u8],
+  decode_value: impl FnOnce(&[u8]) -> crate::Result<T>,
+) -> Option<(TransactionId, T)> {
+  let transaction =
+    match decode_tagged_transaction(entry.key().as_bytes(), tag).and_then(TransactionId::parse) {
+      Ok(transaction) => transaction,
+      Err(error) => {
+        tracing::warn!(
+          kind = ?error.kind(),
+          "receipt retention skipped an undecodable entry key"
+        );
+        return None;
+      }
+    };
+  match decode_value(entry.value().as_bytes()) {
+    Ok(value) => Some((transaction, value)),
+    Err(error) => {
+      tracing::warn!(
+        kind = ?error.kind(),
+        "receipt retention skipped an undecodable entry value"
+      );
+      None
+    }
+  }
+}
+
+/// The retention deadline of one anchored receipt: `None` when the
+/// anchor's timestamp plus the retention window leaves the representable
+/// clock domain. Both the cleanup state machine and the eligibility scan
+/// read this one verdict — an overflowing anchor is retained (not due),
+/// never a storage fault; a fault verdict would wedge every sweep pass
+/// at the same cursor position.
+fn retention_deadline(anchored_at: SystemTime, retention: Duration) -> Option<SystemTime> {
+  anchored_at.checked_add(retention)
 }
 
 /// The deterministic cleanup-transaction identity for one swept receipt:
@@ -1630,10 +1700,11 @@ mod receipt_retention_tests {
   };
 
   use super::{
-    ACTIVE_MARKER_VALUE, FORGOTTEN_MARKER_VALUE, MetadataStore, RETENTION_SWEEP_BOUND,
-    ReceiptCleanupOutcome, ReceiptIdentity, ReceiptReferenceChange, ReceiptReferenceToken,
-    build_pending_record_delete_operations, eligibility_anchor_key, internal_namespace,
-    prepare_internal_transaction, reference_head_key, retention_candidate_key, used_id_key,
+    ACTIVE_MARKER_VALUE, EligibilityScan, FORGOTTEN_MARKER_VALUE, MetadataStore,
+    RETENTION_SWEEP_BOUND, ReceiptCleanupOutcome, ReceiptIdentity, ReceiptReferenceChange,
+    ReceiptReferenceToken, build_pending_record_delete_operations, eligibility_anchor_key,
+    encode_anchor_value, internal_namespace, prepare_internal_transaction, reference_head_key,
+    retention_candidate_key, used_id_key,
   };
   use crate::{
     Digest, StoreExpectation, StoreOperation, StoreValue,
@@ -1804,6 +1875,83 @@ mod receipt_retention_tests {
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(report.forgotten, 0);
     assert!(!report.remaining, "the population is fully drained");
+  }
+
+  /// Regression: one anchor whose retention deadline overflows the clock
+  /// domain must not wedge the sweep. The scan reads the same verdict as
+  /// the cleanup state machine (retained, not due) and skips the entry
+  /// while still advancing the cursor, so the good anchor behind it is
+  /// collected and a second pass resumes instead of failing forever at
+  /// the same position.
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn retention_sweep_skips_an_overflowing_anchor_and_still_advances() {
+    let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(100)));
+    let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
+
+    // The good anchor: a real receipt anchored through the cleanup state
+    // machine. Its key sorts before the overflowing anchor's.
+    commit_and_anchor(&store, 1).await;
+
+    // The overflowing anchor: anchored at the last representable
+    // instant, so anchored_at + retention leaves the clock domain.
+    let overflow_id = transaction_id(2);
+    let overflow_key = eligibility_anchor_key(&overflow_id).unwrap();
+    let overflow_value = encode_anchor_value(
+      UNIX_EPOCH + Duration::from_secs(i64::MAX as u64),
+      &Digest::from_bytes([7; 32]),
+    );
+    let snapshot = store.snapshot().await.unwrap();
+    let prepared = prepare_internal_transaction(
+      overflow_id,
+      snapshot.revision().clone(),
+      vec![StoreOperation::Put {
+        namespace: internal_namespace().unwrap(),
+        key: overflow_key.clone(),
+        expected: StoreExpectation::Absent,
+        value: StoreValue::new(Arc::from(overflow_value.clone())),
+      }],
+    )
+    .unwrap();
+    drop(snapshot);
+    committed(store.commit(prepared).await.unwrap());
+
+    // Every deadline has passed at this clock except the overflowing one.
+    clock.set(UNIX_EPOCH + Duration::from_secs(200));
+
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(
+      report.forgotten, 1,
+      "the good anchor behind the bad one is collected"
+    );
+    assert!(!report.remaining, "the scan ran to its natural end");
+
+    // The bad entry is skipped, never deleted or mistaken for a fault.
+    let snapshot = store.snapshot().await.unwrap();
+    let stored = snapshot
+      .get(&internal_namespace().unwrap(), &overflow_key)
+      .await
+      .unwrap()
+      .expect("the overflowing anchor row stays");
+    assert_eq!(stored.as_bytes(), overflow_value.as_slice());
+    drop(snapshot);
+
+    // The cursor advanced past the bad entry (the natural end resets it),
+    // so the next rotation completes instead of wedging at the same key.
+    assert!(
+      store
+        .retention_scan_cursor
+        .position(EligibilityScan::Anchors)
+        .is_none(),
+      "the scan advanced past the bad entry to its natural end"
+    );
+    let report = store.apply_receipt_retention().await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert!(
+      !report.remaining,
+      "a second pass makes progress instead of wedging"
+    );
   }
 
   /// The deterministic completion seam forgets a receipt in the very
