@@ -7,6 +7,25 @@
 //! point strictly past the cursor (`StoreSnapshot::scan_from` for
 //! storage scans, one `partition_point` for in-memory tables), so a
 //! page costs O(page) reads instead of replaying the namespace head.
+//!
+//! Two independent bounds shape a page, and this module owns only the
+//! first:
+//!
+//! - **Item count**: [`PAGE_MAX_ITEMS`] caps one page at 64 entries and
+//!   [`check_page_shape`] fails a page above it closed instead of truncating
+//!   it.
+//! - **Bytes**: the shipped anti-entropy wire is [`crate::reconcile::wire`],
+//!   whose ROWS messages are packed under the reconcile engine's
+//!   `ROW_BYTES_BUDGET` (48 KiB of row bytes, headroom under the 64 KiB
+//!   control-body bound of [`crate::protocol::CONTROL_CBOR_LIMITS`]). The 32
+//!   KiB chunk bound ([`crate::packet::MAX_CHUNK_BYTES`]) and the 256 KiB
+//!   receive bound ([`crate::sync_common::MAX_SYNC_BYTES`] with
+//!   [`crate::sync_common::MAX_SYNC_CHUNKS`]) bound the framing around it.
+//!
+//! The page envelope below (`encode_page`, `decode_page`) is a **test
+//! fixture**: it round-trips the page shapes the page tests exercise, no
+//! production lane encodes it, and no golden vector pins it. Production
+//! pages come from the reconcile plane.
 
 use std::sync::Arc;
 
@@ -18,22 +37,23 @@ use crate::{Error, Result};
 /// The default page limit when the caller supplies none: one constant
 /// for every paging lane (membership descriptors, resource records), so
 /// per-lane copies cannot drift apart. It sits at the receiver cap: one
-/// full-catalog walk costs the fewest round trips the wire cap allows,
-/// and the size ladder halves a page of fat records that overflows the
-/// control-body encode bound.
+/// full-catalog walk costs the fewest round trips the item cap allows.
 pub(crate) const PAGE_DEFAULT_LIMIT: usize = PAGE_MAX_ITEMS;
 
-/// The maximum page size a receiver accepts, bounding one page's bytes:
-/// a page above this bound fails closed instead of being truncated.
+/// The maximum item count of one page: a page above this bound fails
+/// closed instead of being truncated. The count is the only bound this
+/// module owns; one shipped page's bytes are bounded by the reconcile
+/// plane's row budget (`reconcile::engine::ROW_BYTES_BUDGET`).
 pub(crate) const PAGE_MAX_ITEMS: usize = 64;
 
-/// The one bounded-page wire envelope every anti-entropy lane encodes:
-/// positional array layout, so membership pages and resource pages share
-/// the exact byte shape (golden vectors pin both).
+/// The test-fixture page envelope: one positional array layout shared by
+/// the membership and resource page round-trip tests. It is **not** a
+/// wire schema — no production lane encodes it and no golden vector pins
+/// it; the shipped anti-entropy wire is [`crate::reconcile::wire`].
 #[cfg(test)]
 #[derive(Encode, Decode)]
 #[cbor(array)]
-struct PageEnvelopeWire {
+struct TestPageEnvelope {
   #[n(0)]
   schema: String,
   #[n(1)]
@@ -56,15 +76,14 @@ pub(crate) fn check_page_shape(
   Ok(())
 }
 
-/// Encodes one bounded page envelope over pre-encoded items.
+/// Encodes one page envelope over pre-encoded items for the page
+/// round-trip tests (a test fixture: production pages are encoded by the
+/// reconcile plane).
 ///
-/// The sync size ladder (three bounds, each layer its own job):
+/// The framing bounds around any control body, for reference:
 ///
-/// 1. **64 KiB encode bound** ([`crate::protocol::CONTROL_CBOR_LIMITS`]): a
-///    page envelope (and every other control body) must encode inside it. The
-///    lane `emit_page_ctx` functions enforce this at emission with a bounded
-///    halving ladder over the page capacity, so a page of fat records splits
-///    instead of failing the tick.
+/// 1. **64 KiB body bound** ([`crate::protocol::CONTROL_CBOR_LIMITS`]): one
+///    control body must encode inside it.
 /// 2. **32 KiB chunk bound** ([`crate::packet::MAX_CHUNK_BYTES`]): the pump
 ///    forwards each body chunk as one frame. The sender splits an encoded
 ///    payload at this bound (`crate::sync_common::chunk_payload`); the receiver
@@ -72,12 +91,16 @@ pub(crate) fn check_page_shape(
 /// 3. **256 KiB receive bound** ([`crate::sync_common::MAX_SYNC_BYTES`] with
 ///    [`crate::sync_common::MAX_SYNC_CHUNKS`]): the receiver-side defense for
 ///    one drained sync body.
+///
+/// The byte budget of one shipped page is the reconcile plane's
+/// (`reconcile::engine::ROW_BYTES_BUDGET`), not a property of this
+/// fixture.
 #[cfg(test)]
 pub(crate) fn encode_page(
   schema: &str, items: &[Vec<u8>], cursor: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
   crate::protocol::encode_canonical(
-    &PageEnvelopeWire {
+    &TestPageEnvelope {
       schema: schema.to_owned(),
       items: items
         .iter()
@@ -89,18 +112,18 @@ pub(crate) fn encode_page(
   )
 }
 
-/// The decoded content of one page envelope: pre-decoded items plus the
-/// continuation cursor.
+/// The decoded content of one test-fixture page envelope: pre-decoded
+/// items plus the continuation cursor.
 #[cfg(test)]
-type PageEnvelope = (Vec<Vec<u8>>, Option<Vec<u8>>);
+type DecodedTestPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
-/// Decodes one bounded page envelope, rejecting unknown schemas,
+/// Decodes one test-fixture page envelope, rejecting unknown schemas,
 /// non-canonical encodings, and over-capacity item lists (fail closed).
 #[cfg(test)]
 pub(crate) fn decode_page(
   bytes: &[u8], schema: &str, max_items: usize, context: &'static str,
-) -> Result<PageEnvelope> {
-  let wire: PageEnvelopeWire =
+) -> Result<DecodedTestPage> {
+  let wire: TestPageEnvelope =
     crate::protocol::decode_canonical_strict(bytes, crate::protocol::CONTROL_CBOR_LIMITS, context)?;
   if wire.schema != schema {
     return Err(Error::invalid_input(context));
@@ -219,6 +242,22 @@ pub(crate) fn page_keys<T>(
     }
   }
   Paged { items, next: None }
+}
+
+/// The shared tail of every keyed page: wraps the page's next raw key
+/// into the opaque continuation cursor and assembles the page through
+/// the caller's page constructor. The cursor names the last *delivered*
+/// key — never the boundary entry the continuation page must deliver —
+/// and a page without a continuation passes `Option::None`, the one
+/// emptiness rule [`PageCursor`] enforces.
+pub(crate) fn finish_page<T, P>(
+  paged: Paged<T>, page: impl FnOnce(Vec<T>, Option<PageCursor>) -> P,
+) -> Result<P> {
+  let next = paged
+    .next
+    .map(|key| PageCursor::new(Arc::from(key)))
+    .transpose()?;
+  Ok(page(paged.items, next))
 }
 
 /// The bound for public paged views (members, topology, trust) is the
@@ -416,6 +455,48 @@ mod tests {
     let third = page_keys(entries(), Some(&cursor), 2);
     assert_eq!(third.items, vec![2]);
     assert!(third.next.is_none());
+  }
+
+  /// The shared page tail enforces the boundary rule every lane relies
+  /// on: a full page with entries after it continues from the last
+  /// *delivered* key, and a page that ends exactly at the limit with
+  /// nothing after it carries no cursor.
+  #[test]
+  fn finish_page_continues_from_the_last_delivered_key() {
+    let entries = || {
+      (0..4)
+        .map(|index| (format!("{index:03}").into_bytes(), index))
+        .collect::<Vec<_>>()
+    };
+    let first =
+      super::finish_page(page_keys(entries(), None, 2), |items, next| (items, next)).unwrap();
+    assert_eq!(first.0, vec![0, 1]);
+    let cursor = first.1.expect("two entries follow the page");
+    assert_eq!(
+      cursor.as_bytes(),
+      b"001",
+      "the cursor names the last delivered key, not the boundary entry"
+    );
+    let second = super::finish_page(
+      page_keys(entries(), Some(cursor.as_bytes()), 2),
+      |items, next| (items, next),
+    )
+    .unwrap();
+    assert_eq!(
+      second.0,
+      vec![2, 3],
+      "the continuation delivers the very next entry"
+    );
+    assert!(second.1.is_none(), "exact end yields no cursor");
+
+    // Exactly the limit with nothing after it: no continuation, so no
+    // trailing empty page.
+    let exact = super::finish_page(page_keys(entries(), Some(b"001"), 3), |items, next| {
+      (items, next)
+    })
+    .unwrap();
+    assert_eq!(exact.0, vec![2, 3]);
+    assert!(exact.1.is_none(), "no trailing empty page");
   }
 
   /// A paging snapshot that counts every `next()` step its scans take:

@@ -19,19 +19,6 @@ use tokio::task::JoinSet;
 use super::supervisor::Supervisor;
 use crate::{Error, LocalNodeView, NodeId, Result};
 
-/// The shared tail of the keyset-paged views: wraps the scan's next key
-/// into the opaque page cursor and assembles the page through the
-/// caller's page constructor.
-fn finish_page<T, P>(
-  paged: crate::paging::Paged<T>, page: impl FnOnce(Vec<T>, Option<crate::PageCursor>) -> P,
-) -> Result<P> {
-  let next = paged
-    .next
-    .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)))
-    .transpose()?;
-  Ok(page(paged.items, next))
-}
-
 impl Supervisor {
   /// Schedules the local descriptor's lazy publication without awaiting
   /// it (remaining items 2026-10-10, P2-9): the member read views stay
@@ -116,7 +103,7 @@ impl Supervisor {
       },
     )
     .await?;
-    finish_page(paged, crate::MemberPage::new)
+    crate::paging::finish_page(paged, crate::MemberPage::new)
   }
   /// Pages the live resource winners matching one selector.
   pub(super) async fn select_resources(
@@ -173,7 +160,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    finish_page(paged, crate::ListenerPage::new)
+    crate::paging::finish_page(paged, crate::ListenerPage::new)
   }
   /// Pages the live authenticated sessions in canonical peer order;
   /// selected features resolve their exact definition digests at query
@@ -222,7 +209,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    finish_page(paged, crate::SessionPage::new)
+    crate::paging::finish_page(paged, crate::SessionPage::new)
   }
   /// The bounded observability snapshot:
   /// session/listener/task counters, queue totals, route and trace
@@ -327,7 +314,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
     );
-    finish_page(paged, crate::TopologyPage::new)
+    crate::paging::finish_page(paged, crate::TopologyPage::new)
   }
   /// Pages the public trust observations: the exact
   /// NodeId-to-key bindings verified locally, deterministically ordered
@@ -363,7 +350,7 @@ impl Supervisor {
         status,
       ));
     }
-    finish_page(
+    crate::paging::finish_page(
       crate::paging::Paged {
         items,
         next: paged.next,

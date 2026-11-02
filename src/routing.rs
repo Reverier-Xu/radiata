@@ -726,11 +726,7 @@ impl CandidateNodeReader for StoreCandidateReader {
         },
       )
       .await?;
-      let next = paged
-        .next
-        .map(|key| crate::PageCursor::new(std::sync::Arc::from(key)))
-        .transpose()?;
-      Ok(crate::MemberPage::new(paged.items, next))
+      crate::paging::finish_page(paged, crate::MemberPage::new)
     })
   }
 }

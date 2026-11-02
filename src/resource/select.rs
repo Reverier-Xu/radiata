@@ -8,8 +8,6 @@
 //! whose current winner is a signed removal reads as absent: removal
 //! evidence stays internal.
 
-use std::sync::Arc;
-
 use super::{RESERVED_TYPE_LABEL_KEY, RESERVED_URI_LABEL_KEY, ResourceRecordV1};
 use crate::{
   QualifiedTag, ResourceLabels, ResourceVersion, Result, Selector, storage::MetadataStore,
@@ -70,11 +68,7 @@ pub(crate) async fn select_page_ctx(
     },
   )
   .await?;
-  let next = paged
-    .next
-    .map(|key| crate::PageCursor::new(Arc::from(key)))
-    .transpose()?;
-  Ok(crate::ResourcePage::new(paged.items, next))
+  crate::paging::finish_page(paged, crate::ResourcePage::new)
 }
 
 #[cfg(test)]

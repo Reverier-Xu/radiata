@@ -383,45 +383,32 @@ impl TaskTable {
 
   /// Pages the task views in canonical id order (= admission order,
   /// newest last), keyset-paginated on the id like every other view.
-  pub(crate) fn page_views(&self, cursor: Option<&[u8]>, limit: usize) -> crate::view::TaskPage {
-    let entries = self.lock().ok();
-    let mut views = Vec::new();
-    let mut next = None;
-    let Some(entries) = entries else {
-      return crate::view::TaskPage::new(views, None);
-    };
-    for (id, entry) in entries.iter() {
-      // The cursor is the last delivered id: everything after it, in
-      // id order, is the next page.
-      if let Some(cursor) = cursor
-        && id.as_str().as_bytes() <= cursor
-      {
-        continue;
-      }
-      if views.len() >= limit {
-        // The boundary entry is *not* delivered on this page, so the
-        // cursor must name the last delivered id — naming the boundary
-        // entry would skip it on the continuation page.
-        next = views
-          .last()
-          .map(|view| view.id().as_str().as_bytes().to_vec());
-        break;
-      }
-      views.push(crate::view::TaskView::from_record(
-        id.clone(),
-        entry.kind.clone(),
-        &entry.status.borrow(),
-        entry.output.clone(),
-      ));
-    }
-    let next = next
-      .map(std::sync::Arc::from)
-      .map(crate::PageCursor::new)
-      .transpose();
-    match next {
-      Ok(next) => crate::view::TaskPage::new(views, next),
-      Err(_) => crate::view::TaskPage::new(views, None),
-    }
+  pub(crate) fn page_views(
+    &self, cursor: Option<&[u8]>, limit: usize,
+  ) -> Result<crate::view::TaskPage> {
+    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
+    // Collect the (id bytes, view) pairs under the lock, then page them
+    // through the shared in-memory keyset loop; the guard drops before
+    // the page is assembled.
+    let entries = self
+      .lock()?
+      .iter()
+      .map(|(id, entry)| {
+        (
+          id.as_str().as_bytes().to_vec(),
+          crate::view::TaskView::from_record(
+            id.clone(),
+            entry.kind.clone(),
+            &entry.status.borrow(),
+            entry.output.clone(),
+          ),
+        )
+      })
+      .collect::<Vec<_>>();
+    crate::paging::finish_page(
+      crate::paging::page_keys(entries, cursor, limit),
+      crate::view::TaskPage::new,
+    )
   }
 
   /// Runs one mutation over the entry: the single lock discipline for
@@ -1785,7 +1772,7 @@ mod tests {
     let mut cursor: Option<Vec<u8>> = None;
     let mut walked = Vec::new();
     loop {
-      let page = harness.table.page_views(cursor.as_deref(), 1);
+      let page = harness.table.page_views(cursor.as_deref(), 1).unwrap();
       match page.next() {
         Some(next) => {
           assert_eq!(page.items().len(), 1, "a bounded page is full");
@@ -1799,5 +1786,25 @@ mod tests {
       }
     }
     assert_eq!(walked, ids.to_vec());
+  }
+
+  /// A table whose lock was poisoned reports the typed internal error
+  /// instead of posing as an empty page: the read never invents "no
+  /// tasks" out of a broken table.
+  #[test]
+  fn page_views_reports_a_poisoned_table_instead_of_an_empty_page() {
+    let mut harness = Harness::new();
+    harness.admit(TaskKind::SyncRound);
+    let poisoner = harness.table.clone();
+    // Panicking while holding the guard poisons the shared table.
+    let _ = std::thread::spawn(move || {
+      let _guard = poisoner.lock().expect("task table guard");
+      panic!("poison the task table");
+    })
+    .join();
+
+    let error = harness.table.page_views(None, 8).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "task table");
   }
 }

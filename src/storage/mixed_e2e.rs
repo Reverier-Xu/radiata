@@ -193,7 +193,7 @@ async fn converge(sides: [&MetadataStore; 2]) {
       let receiver = sides[1 - index];
       let mut cursor: Option<Vec<u8>> = None;
       loop {
-        let page = resource_page::sync::emit_page_ctx(
+        let page = resource_page::sync::emit_test_page(
           emitter,
           cursor.as_deref(),
           resource_page::DEFAULT_RESOURCE_PAGE_LIMIT,

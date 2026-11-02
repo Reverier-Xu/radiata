@@ -1354,7 +1354,7 @@ pub(crate) mod test_support {
       for (emitter, receiver) in [(a, b), (b, a)] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
-          let page_out = page::sync::emit_page_ctx(
+          let page_out = page::sync::emit_test_page(
             emitter,
             cursor.as_deref(),
             page::DEFAULT_RESOURCE_PAGE_LIMIT,

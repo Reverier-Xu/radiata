@@ -2,9 +2,9 @@
 //!
 //! One page carries a bounded list of whole signed records plus a
 //! continuation cursor, so population-sized catalogs stream without ever
-//! materializing the full catalog. Emission pages the local store from a
-//! cursor; application validates each record's digest at decode and its
-//! writer's signature against the locally trusted member descriptors
+//! materializing the full catalog. The test emit pages the local store
+//! from a cursor; application validates each record's digest at decode and
+//! its writer's signature against the locally trusted member descriptors
 //! before any comparison, then installs it through the conditional
 //! register commit — losing permutations stay harmless and duplicates are
 //! idempotent, so duplicate, reordered, truncated, and changing pages all
@@ -100,13 +100,13 @@ pub(crate) mod sync {
   /// The descriptor re-poll interval inside the bounded wait.
   const WRITER_TRUST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-  /// The unfiltered test/select emit: one page over the store's current
-  /// records after `cursor` (the reconciliation plane carries the rows;
-  /// tests and offline harnesses page with this). A catalog shorter
-  /// than the limit yields a page whose cursor is `None` (pass
-  /// complete).
+  /// The unfiltered page emit for the page round-trip tests: one page
+  /// over the store's current records after `cursor`. A **test
+  /// fixture** — production pages come from the reconcile plane, which
+  /// packs rows under its own byte budget. A catalog shorter than the
+  /// limit yields a page whose cursor is `None` (pass complete).
   #[cfg(test)]
-  pub(crate) async fn emit_page_ctx(
+  pub(crate) async fn emit_test_page(
     store: &MetadataStore, cursor: Option<&[u8]>, limit: usize,
   ) -> Result<ResourcePage> {
     let namespace = super::super::store::namespace()?;
@@ -469,7 +469,7 @@ mod tests {
     let mut pages = Vec::new();
     let mut cursor: Option<Vec<u8>> = None;
     loop {
-      let page = sync::emit_page_ctx(&source, cursor.as_deref(), 2)
+      let page = sync::emit_test_page(&source, cursor.as_deref(), 2)
         .await
         .unwrap();
       let done = page.cursor().is_none();
@@ -524,7 +524,7 @@ mod tests {
     let mut second_pass_pages = 0;
     let mut cursor: Option<Vec<u8>> = None;
     loop {
-      let page = sync::emit_page_ctx(&source, cursor.as_deref(), 2)
+      let page = sync::emit_test_page(&source, cursor.as_deref(), 2)
         .await
         .unwrap();
       let done = page.cursor().is_none();

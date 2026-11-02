@@ -142,7 +142,7 @@ async fn converge(sides: [&MetadataStore; 2]) -> ConvergeCost {
       let receiver = sides[1 - index];
       let mut cursor: Option<Vec<u8>> = None;
       loop {
-        let page = resource_page::sync::emit_page_ctx(
+        let page = resource_page::sync::emit_test_page(
           emitter,
           cursor.as_deref(),
           resource_page::DEFAULT_RESOURCE_PAGE_LIMIT,
@@ -398,7 +398,7 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
   let mut cursor = None;
   let mut seen = 0;
   loop {
-    let page = resource_page::sync::emit_page_ctx(
+    let page = resource_page::sync::emit_test_page(
       &side_a,
       cursor.as_deref(),
       resource_page::DEFAULT_RESOURCE_PAGE_LIMIT,

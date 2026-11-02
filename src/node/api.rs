@@ -421,13 +421,11 @@ impl Tasks {
     self.require_running()?;
     let cursor = page.cursor().cloned();
     let limit = page.limit().clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    Ok(
-      self
-        .client()?
-        .observer
-        .table
-        .page_views(cursor.as_ref().map(|cursor| cursor.as_bytes()), limit),
-    )
+    self
+      .client()?
+      .observer
+      .table
+      .page_views(cursor.as_ref().map(|cursor| cursor.as_bytes()), limit)
   }
 
   /// Awaits one task's terminal phase and resolves with its terminal
