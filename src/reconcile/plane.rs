@@ -151,8 +151,9 @@ const ACTIVE_LANES: [LaneId; 4] = [
 /// fair window over the alive set — the old push-round bound repurposed
 /// for the only steady traffic the plane has. ROOT bodies are tens of
 /// bytes, so the bound is about per-tick dispatch discipline, not
-/// bandwidth.
-const ROOT_EXCHANGE_WINDOW: usize = 2;
+/// bandwidth. The sync-budget harness reads it, so the modeled rotation
+/// is the deployed one.
+pub(crate) const ROOT_EXCHANGE_WINDOW: usize = 2;
 
 /// The scan's derived view, both projections per lane: the exact row
 /// identities (identity → row for the repair index) and the lane keys
@@ -368,8 +369,10 @@ struct PlaneState {
 }
 
 /// The per-lane hold on held hints: one round's worth of concurrent
-/// notices, the same discipline as the engine's pending set.
-const HELD_HINTS_PER_LANE: usize = 8;
+/// notices, the same discipline as the engine's pending set. The
+/// sync-budget harness reads it, so the modeled hold is the deployed
+/// one.
+pub(crate) const HELD_HINTS_PER_LANE: usize = 8;
 
 impl PlaneState {
   /// Whether any engine of one lane has an open round, optionally

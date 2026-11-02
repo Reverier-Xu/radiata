@@ -30,6 +30,10 @@ use super::{
   engine::{Drive, Engine},
   wire::{LaneId, Message},
 };
+use crate::{
+  reconcile::plane::{HELD_HINTS_PER_LANE, ROOT_EXCHANGE_WINDOW},
+  sync_common::DETECTION_CADENCE_TICKS,
+};
 
 /// The mesh degree k: a ring plus the half-turn chord — every node
 /// reaches the whole mesh in at most two hops, the shape the
@@ -52,17 +56,6 @@ const REDUNDANCY_BOUND: f64 = 1.05;
 
 /// The loss rate of the loss matrix: every fifth message drops.
 const LOSS_INTERVAL: u64 = 5;
-
-/// The cadence of the quiet ROOT rotation (ticks), shared with the
-/// plane.
-const CADENCE_TICKS: u32 = 32;
-
-/// The per-node hold on held hints (one round's worth of concurrent
-/// notices per peer, matching the engine's pending set discipline).
-const HELD_HINTS_PER_NODE: usize = 8;
-
-/// The ROOT exchange window per tick per node, shared with the plane.
-const ROOT_WINDOW: usize = 2;
 
 /// A deterministic xorshift64* generator: the matrix is reproducible
 /// bit-for-bit.
@@ -309,12 +302,12 @@ impl Mesh {
   /// negotiates elsewhere at the node waits in the held set.
   fn cadence_node(&mut self, index: usize) {
     let peers = self.edges[index].clone();
-    let offset = (self.tick / u64::from(CADENCE_TICKS)) as usize;
+    let offset = (self.tick / u64::from(DETECTION_CADENCE_TICKS)) as usize;
     let window: Vec<usize> = peers
       .iter()
       .cycle()
       .skip(offset % peers.len().max(1))
-      .take(ROOT_WINDOW.min(peers.len()))
+      .take(ROOT_EXCHANGE_WINDOW.min(peers.len()))
       .copied()
       .collect();
     for peer in window {
@@ -326,7 +319,7 @@ impl Mesh {
   /// node (the held re-drive releases with the lane's quiet).
   fn root_exchange_gated(&mut self, index: usize, peer: usize) {
     if self.nodes[index].lane_in_round(Some(peer))
-      && self.nodes[index].held_roots.len() < HELD_HINTS_PER_NODE
+      && self.nodes[index].held_roots.len() < HELD_HINTS_PER_LANE
     {
       self.nodes[index].held_roots.push(peer);
       return;
@@ -413,7 +406,7 @@ impl Mesh {
       let hold = match &message {
         Message::Hint { lane, ranges, .. }
           if self.nodes[to].lane_in_round(Some(from))
-            && self.nodes[to].held.values().map(Vec::len).sum::<usize>() < HELD_HINTS_PER_NODE =>
+            && self.nodes[to].held.values().map(Vec::len).sum::<usize>() < HELD_HINTS_PER_LANE =>
         {
           Some(Message::Hint {
             lane: *lane,
@@ -510,7 +503,7 @@ impl Mesh {
   /// every node's drain, and the pump.
   fn tick(&mut self, loss: bool, rng: &mut Rng) {
     self.tick += 1;
-    if self.tick.is_multiple_of(u64::from(CADENCE_TICKS)) {
+    if self.tick.is_multiple_of(u64::from(DETECTION_CADENCE_TICKS)) {
       for index in 0..self.nodes.len() {
         self.cadence_node(index);
       }
@@ -734,4 +727,34 @@ fn sync_budget_loss_convergence_not_worse_than_baseline() {
       "n={nodes}: the full layer took {full} ticks against the baseline's {baseline}"
     );
   }
+}
+
+/// The harness's rotation schedule is the plane's, not a private copy:
+/// the cadence boundary, the held-hint cap, and the ROOT window are the
+/// owner constants, so a change to any of them moves the harness with
+/// the plane instead of leaving it to measure a discipline the plane no
+/// longer runs. The boundary and the window are also observed on a
+/// quiet mesh: no ROOT crosses before the cadence tick, and the boundary
+/// tick opens exactly one bounded window per node.
+#[test]
+fn the_budget_rotation_reads_the_plane_owners() {
+  assert_eq!(DETECTION_CADENCE_TICKS, 32, "the ROOT rotation boundary");
+  assert_eq!(HELD_HINTS_PER_LANE, 8, "the per-lane held-hint cap");
+  assert_eq!(ROOT_EXCHANGE_WINDOW, 2, "the per-tick ROOT window");
+
+  let mut rng = Rng::new(0xCAD3_2026);
+  let mut mesh = Mesh::new(4, true);
+  for _ in 1..DETECTION_CADENCE_TICKS {
+    mesh.tick(false, &mut rng);
+  }
+  assert_eq!(
+    mesh.ledger.roots, 0,
+    "no ROOT crosses before the cadence boundary"
+  );
+  mesh.tick(false, &mut rng);
+  assert_eq!(
+    mesh.ledger.roots,
+    mesh.nodes.len() * ROOT_EXCHANGE_WINDOW,
+    "the boundary tick opens one bounded window per node"
+  );
 }
