@@ -17,6 +17,17 @@
 //! transaction, so the old key can no longer authenticate and the node id
 //! revives only through a fresh merge under a new key (the join-credential
 //! path). Permanent exclusion is revocation's contract, never cleanup's.
+//!
+//! The checkpoint is an operator assertion, not an autonomous retention
+//! policy: `issue_cleanup_checkpoint` stamps the local wall clock and every
+//! peer adopts the maximum watermark it has seen, so the operator must
+//! ensure every node is online and reachable and that node wall clocks agree
+//! within one second before issuing one. The crate uses UNIX timestamps
+//! exclusively — there is no timezone or local-time semantics anywhere — so
+//! clock agreement, not timezone configuration, is the deployment
+//! obligation. A node whose clock lags the watermark has its own leave and
+//! cleanup tombstones treated as already collected; that is the documented
+//! cost of the watermark contract, not a recoverable state.
 
 use std::sync::Arc;
 

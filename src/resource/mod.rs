@@ -17,6 +17,15 @@
 //! and every field mutation (name, labels, timestamp, writer,
 //! removal rank, digest, or signature) fails verification before any
 //! comparison or persistence.
+//!
+//! The signature is end-to-end and survives relay: a resource row may
+//! reach a replica through intermediate members, so the receiver verifies
+//! the writer's signature instead of trusting the delivering session.
+//! Member descriptors deliberately take the other stance — they are
+//! routing metadata trusted through the authenticated session that
+//! delivered them, so they carry no per-entry signature. The asymmetry is
+//! intentional: user data is verified at the receiver, routing metadata
+//! is admitted through the session trust boundary.
 
 use std::{fmt, sync::Arc};
 

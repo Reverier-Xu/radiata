@@ -653,6 +653,19 @@
 //! # }
 //! ```
 //!
+//! ## Cleanup checkpoints
+//!
+//! A `cleanup_node` tombstone is terminal while it lives. The operator
+//! collects tombstones by issuing a checkpoint, which is a cluster-wide
+//! wall-clock watermark: every peer adopts the maximum it has seen, and the
+//! next GC pass deletes the leave/cleanup tombstones stamped at or before it
+//! and retires their pinned bindings in the same transaction. Issue one only
+//! when every node is online and reachable and node wall clocks agree within
+//! one second; the crate uses UNIX timestamps exclusively, so clock agreement
+//! rather than timezone configuration is the obligation. A node whose clock
+//! lags the watermark has its own tombstones treated as already collected —
+//! the documented cost of the watermark contract.
+//!
 //! # 8. Operations are tasks
 //!
 //! Every mutating verb — `join`, `leave`, `connect`, `disconnect`,
