@@ -690,4 +690,74 @@ mod tests {
     );
     assert!(read_current(&receiver, &name(4)).await.is_none());
   }
+
+  /// Regression: one corrupt stored incumbent must not fail the whole
+  /// page batch. The register treats the corrupt value as non-evidence
+  /// and installs the verified incoming record over it with an exact
+  /// CAS, so the page applies, the corrupt bytes are replaced, and a
+  /// second apply finds the incoming record already stored (no
+  /// re-install).
+  #[tokio::test]
+  async fn an_undecodable_stored_incumbent_is_replaced_by_the_valid_record() {
+    let (_factory, store) = open_store().await;
+    trust(&store, &writer(), SEED).await;
+
+    // Poison one register row with bytes no resource record decodes from.
+    let poisoned = name(7);
+    let namespace = super::super::store::namespace().unwrap();
+    let key = crate::StoreKey::new(Arc::from(poisoned.as_str().as_bytes().to_vec()));
+    let corrupt = vec![0xFF_u8, 0x00];
+    let snapshot = store.snapshot().await.unwrap();
+    let transaction = store
+      .prepare_transaction(
+        crate::TransactionId::generate(&SystemEntropy).unwrap(),
+        snapshot.revision().clone(),
+        vec![crate::StoreOperation::Put {
+          namespace: namespace.clone(),
+          key: key.clone(),
+          expected: crate::StoreExpectation::Absent,
+          value: crate::StoreValue::new(Arc::from(corrupt.clone())),
+        }],
+      )
+      .unwrap();
+    drop(snapshot);
+    assert!(matches!(
+      store.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+
+    let poisoned_record = record(&poisoned, 5_000, &writer(), "u://poisoned", SEED);
+    let good = record(&name(8), 5_000, &writer(), "u://good", SEED);
+    let page = ResourcePage::new(vec![poisoned_record.clone(), good], None).unwrap();
+    let outcome = sync::apply_page_reported_ctx(&store, &SystemEntropy, &page)
+      .await
+      .unwrap();
+    assert_eq!(
+      outcome.applied, 2,
+      "both records apply over the corrupt incumbent"
+    );
+    assert!(outcome.deferred.is_empty());
+
+    // The corrupt incumbent is replaced by the verified record.
+    let stored = store
+      .snapshot()
+      .await
+      .unwrap()
+      .get(&namespace, &key)
+      .await
+      .unwrap()
+      .expect("the register holds the incoming record");
+    assert_eq!(
+      stored.as_bytes(),
+      poisoned_record.encode().unwrap().as_slice()
+    );
+    assert_eq!(read_current(&store, &poisoned).await, Some(poisoned_record));
+
+    // A second apply of the same page installs nothing: the register
+    // already holds the record.
+    let outcome = sync::apply_page_reported_ctx(&store, &SystemEntropy, &page)
+      .await
+      .unwrap();
+    assert_eq!(outcome.applied, 0, "a converged page does not re-install");
+  }
 }

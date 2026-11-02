@@ -950,6 +950,7 @@ impl MetadataStore {
 pub(crate) mod test_util;
 
 pub(crate) mod families;
+pub(crate) mod incumbent;
 #[cfg(feature = "json")]
 pub(crate) mod json;
 pub(crate) mod migration;

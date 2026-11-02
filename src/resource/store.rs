@@ -162,7 +162,9 @@ pub(crate) async fn commit_expected_record_ctx(
 /// nothing and retries once from a fresh snapshot before surfacing to
 /// the anti-entropy cadence. Records whose writer key is absent from
 /// `writer_keys` (unresolved past the bounded trust wait) are skipped —
-/// the page apply's own retry pass re-resolves them before this runs.
+/// the page apply's own retry pass re-resolves them before this runs. An
+/// undecodable stored incumbent is non-evidence: the verified incoming
+/// record installs over it through the normal exact-CAS Put.
 pub(crate) async fn commit_page_batch_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, records: &[&ResourceRecordV1],
   writer_keys: &HashMap<NodeId, crate::PublicKey>,
@@ -204,12 +206,27 @@ pub(crate) async fn commit_page_batch_ctx(
     let mut operations = Vec::new();
     for key in &order {
       let record = by_key[key];
-      if let Some(existing) = snapshot.get(&namespace, key).await? {
-        let existing = ResourceRecordV1::decode(existing.as_bytes())?;
-        if !record.wins_over(&existing) {
-          // Superseded by the stored winner: the register keeps it.
-          continue;
-        }
+      // A corrupt stored incumbent is non-evidence, not a poison pill:
+      // treat it as absent and let the verified incoming record replace
+      // it. The normal Put below carries an exact CAS on the corrupt
+      // value's digest, so the overwrite is atomic and a concurrent
+      // change conflicts (the retry re-decodes).
+      let incumbent = snapshot
+        .get(&namespace, key)
+        .await?
+        .as_ref()
+        .and_then(|value| {
+          crate::storage::incumbent::decode_or_absent(
+            value.as_bytes(),
+            ResourceRecordV1::decode,
+            record.name().as_str(),
+          )
+        });
+      if let Some(incumbent) = incumbent
+        && !record.wins_over(&incumbent)
+      {
+        // Superseded by the stored winner: the register keeps it.
+        continue;
       }
       let expected =
         crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, key).await?;
