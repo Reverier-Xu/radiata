@@ -56,18 +56,19 @@ where
 }
 
 /// The shared post-commit mapping for one resource mutation: a
-/// committed install emits exactly one change event and wins; a
+/// committed install emits exactly one change event (tagged with the
+/// effect's origin and the committed record's removal flag) and wins; a
 /// superseded mutation reports the accepted loser (plain put) or
 /// conflicts (a preconditioned write or a removal whose register
 /// moved); an indeterminate commit is never guessed into an outcome.
 pub(super) fn resource_mutation_outcome(
-  events: &EventHub, name: &crate::ResourceName,
+  events: &EventHub, name: &crate::ResourceName, origin: crate::ResourceOrigin, removal: bool,
   outcome: crate::resource::store::ResourceCommitOutcome, winner: crate::ResourceMutationView,
   superseded: Option<crate::ResourceMutationView>,
 ) -> Result<crate::ResourceMutationView> {
   match outcome {
     crate::resource::store::ResourceCommitOutcome::Installed(_) => {
-      events.emit(crate::ResourceChanged::new(name.clone()));
+      events.emit(crate::ResourceChanged::new(name.clone(), origin, removal));
       Ok(winner)
     }
     crate::resource::store::ResourceCommitOutcome::Superseded(_) => superseded

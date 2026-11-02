@@ -142,6 +142,9 @@ pub radiata::ReconcileOutcome::Aborted
 pub radiata::ReconcileOutcome::Committed(radiata::CommitReceipt)
 pub radiata::ReconcileOutcome::DigestConflict
 pub radiata::ReconcileOutcome::Unknown
+pub enum radiata::ResourceOrigin
+pub radiata::ResourceOrigin::Local
+pub radiata::ResourceOrigin::Remote
 #[non_exhaustive] pub enum radiata::RouteState
 pub radiata::RouteState::Delivered
 pub radiata::RouteState::Failed(radiata::ErrorKind)
@@ -692,6 +695,8 @@ impl radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 pub fn radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new() -> Self
 pub struct radiata::ResourceChanged
 impl radiata::ResourceChanged
+pub const fn radiata::ResourceChanged::origin(&self) -> radiata::ResourceOrigin
+pub const fn radiata::ResourceChanged::removal(&self) -> bool
 pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
 impl radiata::Event for radiata::ResourceChanged
 pub struct radiata::ResourceLabels

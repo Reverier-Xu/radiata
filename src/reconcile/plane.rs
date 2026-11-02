@@ -1928,6 +1928,17 @@ async fn apply_rows(
         )
         .await?;
         tracing::debug!(applied = outcome.applied, "reconcile resource rows applied");
+        // Each committed record is a peer-converged resource change:
+        // report it through the same event local writes emit, tagged
+        // `Remote` so a hook can tell the two apart. The removal flag
+        // follows the winning record.
+        for record in &outcome.installed {
+          shared.events.emit(crate::ResourceChanged::new(
+            record.name().clone(),
+            crate::ResourceOrigin::Remote,
+            record.removed(),
+          ));
+        }
         // The unknown-writer skips report as deferred, distinct from
         // both refusal (undecodable, misattributed) and a decided
         // contest loss (the writer resolved and the register kept a
@@ -3165,6 +3176,74 @@ mod tests {
     )
     .unwrap();
     (name.as_str().as_bytes().to_vec(), record.encode().unwrap())
+  }
+
+  /// A peer-converged resource row is a commit too: the reconcile
+  /// resources arm reports each applied record through the same
+  /// `ResourceChanged` event as a local write, tagged `Remote`, and the
+  /// removal flag follows the winning record.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn remote_resource_commits_report_their_origin_and_removal() {
+    let context = context_with_bindings(&[101, 102]).await;
+    let shared = plane_shared(&context).await;
+    let (peer, runtime) = live_peer(&shared);
+    let plane = super::ReconcilePlane {
+      shared: Arc::clone(&shared),
+    };
+    let mut events = shared
+      .events
+      .subscribe::<crate::ResourceChanged>(crate::EventOptions::new());
+    trusted_resource_writer(&context, 761).await;
+    let name = crate::ResourceName::parse("radiata.woooo.tech/resources/remote-event").unwrap();
+    let fresh = crate::time::now_millis();
+    let (row_key, live) = signed_resource_row(&name, 761, fresh - 1_000, false);
+    let (_, removal) = signed_resource_row(&name, 761, fresh, true);
+
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Resources,
+          rows: vec![crate::reconcile::wire::Row {
+            key: row_key.clone(),
+            content: live,
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    match events.try_recv().unwrap() {
+      crate::EventReceive::Item(changed) => {
+        assert_eq!(changed.resource(), &name);
+        assert_eq!(changed.origin(), crate::ResourceOrigin::Remote);
+        assert!(!changed.removal());
+      }
+      _ => panic!("expected the remote put event"),
+    }
+
+    plane
+      .deliver(
+        &runtime,
+        &peer,
+        crate::reconcile::wire::Message::Rows {
+          lane: LaneId::Resources,
+          rows: vec![crate::reconcile::wire::Row {
+            key: row_key,
+            content: removal,
+          }],
+        },
+      )
+      .await
+      .unwrap();
+    match events.try_recv().unwrap() {
+      crate::EventReceive::Item(changed) => {
+        assert_eq!(changed.resource(), &name);
+        assert_eq!(changed.origin(), crate::ResourceOrigin::Remote);
+        assert!(changed.removal());
+      }
+      _ => panic!("expected the remote removal event"),
+    }
   }
 
   /// A02/P1-1: the swept predicate's reclaim basis is the retention

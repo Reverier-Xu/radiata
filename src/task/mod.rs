@@ -788,9 +788,12 @@ pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
   }
 
   /// Fires after this node's own commit lands: the local observation of
-  /// the put or delete, never a cluster-convergence promise (cluster
-  /// visibility stays the reconcile plane's domain, observable through
-  /// [`crate::ResourceChanged`]). The observation runs on the node's
+  /// the put or delete. Cluster visibility is observable through
+  /// [`crate::ResourceChanged`], which reports both local commits and
+  /// the peer-converged records the reconcile plane applies; its
+  /// [`origin`](crate::ResourceChanged::origin) distinguishes the two
+  /// and its [`removal`](crate::ResourceChanged::removal) says whether
+  /// the winner is a removal. The observation runs on the node's
   /// bounded observation lanes (a crate-private facility), off the
   /// write task's execution slot and after the commit lands;
   /// scheduling does not await the observer, so an error or a panic is

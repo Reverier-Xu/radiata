@@ -11,8 +11,8 @@ use std::{sync::Arc, time::Duration};
 use radiata::extension::StorageFactory;
 use radiata::{
   Endpoint, EventOptions, EventReceive, NodeBuilder, NodeConfig, NodeHandle, PageSpec,
-  ResourceChanged, ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Selector,
-  ShutdownReason, extension::KeyProvider,
+  ResourceChanged, ResourceLabels, ResourceName, ResourceOrigin, ResourceUri, ResourceWrite,
+  Selector, ShutdownReason, extension::KeyProvider,
 };
 
 mod common;
@@ -132,7 +132,11 @@ async fn put_resource_commits_atomically_and_emits_one_event() {
     .unwrap()
     .unwrap();
   match event {
-    EventReceive::Item(changed) => assert_eq!(changed.resource(), &resource_name(1)),
+    EventReceive::Item(changed) => {
+      assert_eq!(changed.resource(), &resource_name(1));
+      assert_eq!(changed.origin(), ResourceOrigin::Local);
+      assert!(!changed.removal());
+    }
     _ => panic!("expected the committed resource event"),
   }
   assert!(matches!(
@@ -322,8 +326,20 @@ async fn maintenance_preserves_labels_and_emits_nothing() {
     tokio::time::sleep(Duration::from_millis(10)).await;
   }
 
-  // ...and continued maintenance ticks preserve the labels and emit no
-  // event on the member (sync convergence is not a local commit).
+  // ...and the convergence itself is one remote commit event on the
+  // member; continued maintenance ticks emit nothing further.
+  let event = tokio::time::timeout(Duration::from_secs(30), member_events.recv())
+    .await
+    .unwrap()
+    .unwrap();
+  match event {
+    EventReceive::Item(changed) => {
+      assert_eq!(changed.resource(), &resource_name(4));
+      assert_eq!(changed.origin(), ResourceOrigin::Remote);
+      assert!(!changed.removal());
+    }
+    _ => panic!("expected the peer-converged resource event"),
+  }
   tokio::time::sleep(SYNC_INTERVAL * 6).await;
   assert!(matches!(
     member_events.try_recv().unwrap(),
@@ -565,7 +581,11 @@ async fn remove_resource_requires_the_exact_version() {
     .unwrap()
     .unwrap();
   match event {
-    EventReceive::Item(changed) => assert_eq!(changed.resource(), &name),
+    EventReceive::Item(changed) => {
+      assert_eq!(changed.resource(), &name);
+      assert_eq!(changed.origin(), ResourceOrigin::Local);
+      assert!(changed.removal());
+    }
     _ => panic!("expected the removal event"),
   }
   assert!(

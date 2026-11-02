@@ -77,7 +77,7 @@ pub use node::{
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
-  ResourceWrite, RouteChanged, SessionChanged, TaskChanged,
+  ResourceOrigin, ResourceWrite, RouteChanged, SessionChanged, TaskChanged,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,

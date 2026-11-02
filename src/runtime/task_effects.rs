@@ -1067,7 +1067,7 @@ async fn reconcile_put_resource(
   let expected = &expected;
   let events = deps.events();
   let context = &context;
-  let (accepted, name, outcome) = super::resources::with_commit_race_retry("resource put", || {
+  let committed = super::resources::with_commit_race_retry("resource put", || {
     Box::pin(async move {
       // The caller's expected version is the only authority on which
       // register state the write may replace. This pre-check is the
@@ -1122,12 +1122,14 @@ async fn reconcile_put_resource(
         Ok(outcome) => Ok(super::resources::CommitRace::Final(Ok((
           accepted,
           record.name().clone(),
+          record.removed(),
           outcome,
         )))),
       }
     })
   })
   .await?;
+  let (accepted, name, removal, outcome) = committed;
   // A preconditioned write that lost the tuple can no longer be
   // replacing the expected version: the register moved past it, so the
   // precondition surfaces as an explicit conflict instead of a
@@ -1140,6 +1142,8 @@ async fn reconcile_put_resource(
   let view = super::resources::resource_mutation_outcome(
     events,
     &name,
+    crate::ResourceOrigin::Local,
+    removal,
     outcome,
     crate::ResourceMutationView::new(accepted.clone(), true),
     superseded,
@@ -1256,6 +1260,8 @@ async fn reconcile_delete_resource(
             super::resources::resource_mutation_outcome(
               events,
               name,
+              crate::ResourceOrigin::Local,
+              removal.removed(),
               outcome,
               crate::ResourceMutationView::new(
                 crate::resource::select::resource_view(&removal),

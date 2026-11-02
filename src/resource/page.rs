@@ -140,6 +140,9 @@ pub(crate) mod sync {
   pub(crate) struct PageApply {
     /// Records the register committed this pass.
     pub(crate) applied: usize,
+    /// The committed records, in commit order: the caller reports each
+    /// one as a peer-converged resource change.
+    pub(crate) installed: Vec<ResourceRecordV1>,
     /// Records skipped fail-closed behind an unconverged writer.
     pub(crate) deferred: Vec<ResourceRecordV1>,
   }
@@ -168,10 +171,11 @@ pub(crate) mod sync {
 
   /// The reported form of [`apply_page_ctx`] the reconciliation plane's
   /// resources arm consumes: the identical bounded-wait discipline,
-  /// retry pass, and commits, plus the deferral report — records whose
-  /// writer never converged are reported distinctly from a decided
-  /// contest loss, so the plane keeps their rows for the descriptor's
-  /// arrival instead of reading the skip as a verdict.
+  /// retry pass, and commits, plus the installed records and the
+  /// deferral report — records whose writer never converged are reported
+  /// distinctly from a decided contest loss, so the plane keeps their
+  /// rows for the descriptor's arrival instead of reading the skip as a
+  /// verdict.
   pub(crate) async fn apply_page_reported_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
   ) -> Result<PageApply> {
@@ -228,8 +232,9 @@ pub(crate) mod sync {
       .filter_map(|(writer, key)| key.clone().map(|key| (writer.clone(), key)))
       .collect();
     let records: Vec<&ResourceRecordV1> = page.records().iter().collect();
-    let mut applied =
+    let mut installed =
       super::super::store::commit_page_batch_ctx(store, entropy, &records, &resolved_keys).await?;
+    let mut applied = installed.len();
     // The retry pass. This page's apply serialized one bounded wait per
     // unknown writer, and membership pages apply concurrently on other
     // consumer tasks — a descriptor that landed while those waits ran is
@@ -271,9 +276,11 @@ pub(crate) mod sync {
         .iter()
         .filter_map(|(writer, key)| key.clone().map(|key| (writer.clone(), key)))
         .collect();
-      applied +=
+      let retried_installed =
         super::super::store::commit_page_batch_ctx(store, entropy, &stranded, &resolved_retry)
           .await?;
+      applied += retried_installed.len();
+      installed.extend(retried_installed);
     }
     // The deferral report: records whose writer resolved in neither the
     // bounded wait nor the retry. The register never evaluated them, so
@@ -284,7 +291,11 @@ pub(crate) mod sync {
       .filter(|record| !resolved_retry.contains_key(record.writer()))
       .cloned()
       .collect();
-    Ok(PageApply { applied, deferred })
+    Ok(PageApply {
+      applied,
+      installed,
+      deferred,
+    })
   }
 
   /// The trusted public key of `writer`, resolved from the locally stored

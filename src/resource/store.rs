@@ -158,17 +158,18 @@ pub(crate) async fn commit_expected_record_ctx(
 /// leaf applies hundreds of records, and the per-record commit queue
 /// (every commit a full durable transaction serialized through the
 /// single-commit state machine) was the minutes-long roster-convergence
-/// tail. Returns the installed record count; a conflicted commit landed
-/// nothing and retries once from a fresh snapshot before surfacing to
-/// the anti-entropy cadence. Records whose writer key is absent from
-/// `writer_keys` (unresolved past the bounded trust wait) are skipped —
-/// the page apply's own retry pass re-resolves them before this runs. An
-/// undecodable stored incumbent is non-evidence: the verified incoming
-/// record installs over it through the normal exact-CAS Put.
+/// tail. Returns the installed records in commit order; a conflicted
+/// commit landed nothing and retries once from a fresh snapshot before
+/// surfacing to the anti-entropy cadence. Records whose writer key is
+/// absent from `writer_keys` (unresolved past the bounded trust wait) are
+/// skipped — the page apply's own retry pass re-resolves them before
+/// this runs. An undecodable stored incumbent is non-evidence: the
+/// verified incoming record installs over it through the normal
+/// exact-CAS Put.
 pub(crate) async fn commit_page_batch_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, records: &[&ResourceRecordV1],
   writer_keys: &HashMap<NodeId, crate::PublicKey>,
-) -> Result<usize> {
+) -> Result<Vec<ResourceRecordV1>> {
   let _permit = store.write_permit().await;
   let namespace = namespace()?;
   // Same-key page-order contest: within one page, the last record that
@@ -204,6 +205,7 @@ pub(crate) async fn commit_page_batch_ctx(
   loop {
     let snapshot = store.snapshot().await?;
     let mut operations = Vec::new();
+    let mut installed = Vec::new();
     for key in &order {
       let record = by_key[key];
       // A corrupt stored incumbent is non-evidence, not a poison pill:
@@ -236,11 +238,11 @@ pub(crate) async fn commit_page_batch_ctx(
         expected,
         value: StoreValue::new(Arc::from(record.encode()?)),
       });
+      installed.push(record.clone());
     }
     if operations.is_empty() {
-      return Ok(0);
+      return Ok(Vec::new());
     }
-    let installed = operations.len();
     let transaction = store.prepare_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
@@ -262,7 +264,7 @@ pub(crate) async fn commit_page_batch_ctx(
         crate::provider::commit_verdict(outcome, "resource page")?;
       }
     }
-    if installed > 0 {
+    if !installed.is_empty() {
       store.note_local_write_tag(crate::resource::store::NAMESPACE_TAG);
     }
     return Ok(installed);

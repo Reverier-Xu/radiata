@@ -173,14 +173,18 @@ impl private::Sealed for NodeRevoked {}
 
 impl Event for NodeRevoked {}
 
-/// One committed local resource candidate became visible in the catalog.
-/// Emitted exactly once after the candidate's durable commit;
-/// the write's [`crate::ResourceMutationView`] reports whether that
-/// candidate is the current winner. Aborted and indeterminate candidates
-/// emit nothing, and restart or maintenance never replays the event.
+/// One committed resource candidate became visible in the catalog: this
+/// node's own write or a peer-converged record applied by the reconcile
+/// plane. Emitted exactly once after the candidate's durable commit;
+/// the write's [`crate::ResourceMutationView`] reports whether a local
+/// candidate is the current winner. Aborted and indeterminate local
+/// candidates emit nothing, and restart or maintenance never replays the
+/// event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceChanged {
   resource: crate::ResourceName,
+  origin: ResourceOrigin,
+  removal: bool,
 }
 
 impl ResourceChanged {
@@ -188,9 +192,35 @@ impl ResourceChanged {
     &self.resource
   }
 
-  pub(crate) const fn new(resource: crate::ResourceName) -> Self {
-    Self { resource }
+  /// Whether this node wrote the candidate or applied it from a peer.
+  pub const fn origin(&self) -> ResourceOrigin {
+    self.origin
   }
+
+  /// Whether the winning record is a removal.
+  pub const fn removal(&self) -> bool {
+    self.removal
+  }
+
+  pub(crate) const fn new(
+    resource: crate::ResourceName, origin: ResourceOrigin, removal: bool,
+  ) -> Self {
+    Self {
+      resource,
+      origin,
+      removal,
+    }
+  }
+}
+
+/// Where a committed resource candidate that produced
+/// [`ResourceChanged`] came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceOrigin {
+  /// This node's own write effect committed the candidate.
+  Local,
+  /// A peer's record applied through the reconcile plane.
+  Remote,
 }
 
 impl private::Sealed for ResourceChanged {}

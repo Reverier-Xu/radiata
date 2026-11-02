@@ -18,8 +18,8 @@ use std::{
 use radiata::{
   Endpoint, Event, EventOptions, EventReceive, EventSubscription, IdentityReplaced, MemberChanged,
   MemberStatus, NodeBuilder, NodeConfig, NodeHandle, NodeId, NodeRevoked, PageSpec,
-  RecoveryChanged, ResourceChanged, ResourceLabels, ResourceName, ResourceUri, ResourceWrite,
-  RouteChanged, SessionChanged,
+  RecoveryChanged, ResourceChanged, ResourceLabels, ResourceName, ResourceOrigin, ResourceUri,
+  ResourceWrite, RouteChanged, SessionChanged,
   extension::{KeyProvider, StorageFactory},
 };
 
@@ -321,8 +321,8 @@ async fn session_gone(node: &NodeHandle, peer: &NodeId) -> bool {
 ///   (removal);
 /// - issuer `SessionChanged`: member twice (join registration, teardown when
 ///   the leaver closes the socket);
-/// - issuer `ResourceChanged`: none — a synced row is writer-local by design,
-///   only the writing node emits;
+/// - issuer `ResourceChanged`: the member's synced row, once, with `Remote`
+///   origin (a peer-converged commit reports like a local one);
 /// - member `MemberChanged`: self at the resource write (its first descriptor
 ///   install precedes the commit) — the one member-initiated round carries the
 ///   member's rows to the issuer; the issuer's own rows flow back on the
@@ -331,7 +331,7 @@ async fn session_gone(node: &NodeHandle, peer: &NodeId) -> bool {
 /// - member `SessionChanged`: issuer once (join registration — the leave's
 ///   local teardown retires the table entry without a second event, exactly as
 ///   before the refactor);
-/// - member `ResourceChanged`: the one written name;
+/// - member `ResourceChanged`: the one written name, with `Local` origin;
 /// - member `IdentityReplaced`: exactly once (the leave);
 /// - `RouteChanged`/`RecoveryChanged`/`NodeRevoked`: none on either side (no
 ///   relayed packets, no recovery, no revocation).
@@ -385,8 +385,8 @@ async fn existing_events_fire_exactly_once_for_the_scripted_sequence() {
 
   // One manual convergence round: the issuer installs the member's
   // descriptor (one member-set change); the member installs the
-  // issuer's (one member-set change). The synced resource row emits
-  // nothing on the issuer.
+  // issuer's (one member-set change). The synced resource row reports
+  // once on the issuer as a remote commit.
   member.sync().await.unwrap();
   let probe_issuer = issuer.clone();
   let probe_member_id = member_id.clone();
@@ -448,10 +448,22 @@ async fn existing_events_fire_exactly_once_for_the_scripted_sequence() {
     vec![member_id.clone(), member_id.clone()],
     "issuer sessions: member at join, member at teardown"
   );
-  assert!(
-    drain(&mut issuer_events.resource).is_empty(),
-    "a synced resource row emits nothing on the receiver"
+  let issuer_resource = drain(&mut issuer_events.resource);
+  assert_eq!(
+    issuer_resource.len(),
+    1,
+    "the synced row reports once on the receiver"
   );
+  assert_eq!(
+    issuer_resource[0].resource(),
+    &ResourceName::parse("example.org/resources/parity-001").unwrap()
+  );
+  assert_eq!(
+    issuer_resource[0].origin(),
+    ResourceOrigin::Remote,
+    "a peer-converged row reports as remote"
+  );
+  assert!(!issuer_resource[0].removal());
   // Route events ride the untouched data plane (sync-round payloads,
   // the leave receipt): their count is a function of sync-plane paging
   // and best-effort delivery, never of any migrated verb, so the parity
@@ -489,14 +501,21 @@ async fn existing_events_fire_exactly_once_for_the_scripted_sequence() {
     vec![issuer_id.clone()],
     "member sessions: issuer at join; the leave teardown retires silently"
   );
+  let member_resource = drain(&mut member_events.resource);
   assert_eq!(
-    drain(&mut member_events.resource)
+    member_resource
       .iter()
       .map(|event| event.resource().clone())
       .collect::<Vec<_>>(),
     vec![ResourceName::parse("example.org/resources/parity-001").unwrap()],
     "exactly one committed-candidate event, on the writer"
   );
+  assert_eq!(
+    member_resource[0].origin(),
+    ResourceOrigin::Local,
+    "the writer's own commit is local"
+  );
+  assert!(!member_resource[0].removal());
   assert!(drain(&mut member_events.recovery).is_empty());
   assert!(drain(&mut member_events.revoked).is_empty());
   let member_identity = drain(&mut member_events.identity);

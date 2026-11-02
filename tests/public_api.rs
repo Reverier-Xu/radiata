@@ -29,9 +29,9 @@ use radiata::{
   OutboundStream, PacketConsumer, PageCursor, PageSpec, ProtocolDefinition, ProtocolTag,
   QualifiedTag, ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
-  ResourceName, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result, RouteChanged,
-  RouteHandle, RouteNextHop, RouteState, RoutingPolicy, Selector, SessionChanged, SessionView,
-  ShutdownOutcome, ShutdownReason, Signature, StoreCapabilities, StoreEntry, StoreKey,
+  ResourceName, ResourceOrigin, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result,
+  RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy, Selector, SessionChanged,
+  SessionView, ShutdownOutcome, ShutdownReason, Signature, StoreCapabilities, StoreEntry, StoreKey,
   StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
   StreamMetadata, StreamPolicy, StreamTarget, TraceId, TraceMetadataLimits, TransactionId,
   TransportTag,
@@ -844,7 +844,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap();
 
   // Resource writes, paged reads, and selection.
-  let _events = issuer
+  let mut events = issuer
     .handle
     .watch::<ResourceChanged>(EventOptions::new().capacity(8).unwrap())
     .unwrap();
@@ -879,6 +879,18 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     version.digest(),
   );
   let _ = (accepted.name(), accepted.labels());
+  let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+    .await
+    .unwrap()
+    .unwrap();
+  match event {
+    EventReceive::Item(changed) => {
+      assert_eq!(changed.resource(), accepted.name());
+      assert_eq!(changed.origin(), ResourceOrigin::Local);
+      assert!(!changed.removal());
+    }
+    _ => panic!("expected the committed resource event"),
+  }
 
   // The conditional write verb drives a real cluster: the exact
   // observed version conditions the write, and the write wins.
