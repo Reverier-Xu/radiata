@@ -397,6 +397,20 @@ async fn existing_events_fire_exactly_once_for_the_scripted_sequence() {
   })
   .await;
 
+  // The member's resource row reaches the issuer through the reconcile
+  // plane, not the membership page: wait for the receiver to install it
+  // before the leave tears the session down. The install emits the
+  // `ResourceChanged` event, so this wait is also the event's
+  // happens-before edge.
+  let probe_issuer = issuer.clone();
+  let probe_resource = ResourceName::parse("example.org/resources/parity-001").unwrap();
+  until("issuer never installed the synced resource", || {
+    let issuer = probe_issuer.clone();
+    let resource = probe_resource.clone();
+    async move { issuer.resources().get(resource).await.unwrap().is_some() }
+  })
+  .await;
+
   // Leave: the member's identity is replaced (one event on the
   // member), the issuer applies the leave record (one member-set
   // removal) and observes the session teardown (one session event).
