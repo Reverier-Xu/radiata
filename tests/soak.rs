@@ -485,6 +485,7 @@ async fn soak_churn_then_baseline_return() {
   // ledger (`steady_state_queue_max`) so the verify lane compares against
   // this one number instead of a second hardcoded zero.
   const STEADY_STATE_QUEUE_MAX: u64 = 4;
+  const STEADY_STATE_QUEUE_BYTES_MAX: u64 = 4_096;
   let deadline = Instant::now() + BASELINE_TIMEOUT;
   let mut stable_samples = 0_u32;
   loop {
@@ -544,7 +545,7 @@ async fn soak_churn_then_baseline_return() {
         radiata::ObservabilitySnapshot::QUEUED_SESSION_BYTES,
       ),
     );
-    if queued.0 <= STEADY_STATE_QUEUE_MAX && queued.1 <= 4_096 {
+    if queued.0 <= STEADY_STATE_QUEUE_MAX && queued.1 <= STEADY_STATE_QUEUE_BYTES_MAX {
       break queued;
     }
     assert!(
@@ -603,7 +604,7 @@ async fn soak_churn_then_baseline_return() {
       .find(|(name, _)| *name == "queued_session_bytes")
       .unwrap()
       .1
-      <= 4_096,
+      <= STEADY_STATE_QUEUE_BYTES_MAX,
     "the issuer queue bytes must stay within the steady-state residual"
   );
   assert_eq!(

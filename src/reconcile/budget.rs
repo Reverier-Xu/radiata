@@ -525,9 +525,6 @@ impl Mesh {
   }
 
   /// Brings one node back: the next tick's prime fills both directions'
-  /// engines with the full row sets and opens with ROOT exchanges — the
-  /// session-establishment contract.
-  /// Brings one node back: the next tick's prime fills both directions'
   /// engines with the full row sets and opens with gated ROOT exchanges
   /// — the session-establishment contract under the per-lane
   /// serialization.
@@ -573,7 +570,6 @@ impl Mesh {
 fn steady_cell(nodes: usize, batch: usize, ticks: usize, reconnect: bool) -> (f64, f64, String) {
   let mut rng = Rng::new(0xB00D_2026);
   let mut mesh = Mesh::new(nodes, true);
-  let _ = &mesh.label;
   // Prime: every session fills and opens with ROOT exchanges.
   for index in 0..nodes {
     mesh.heal(index);

@@ -169,7 +169,7 @@ impl SessionDriver {
       // "no active generation".
       Err(_) => {
         tracing::warn!("merge credential issuer lock poisoned");
-        return Err(Error::internal("merge credential issuer"));
+        return Err(Error::join_credential_issuer(()));
       }
     };
     Ok(Some(MergeHint::new(generation)))
