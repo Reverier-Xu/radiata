@@ -27,9 +27,7 @@ pub(crate) type RouteTable = Arc<Mutex<BTreeMap<TraceId, RouteRecord>>>;
 pub(crate) fn insert_route(
   routes: &RouteTable, capacity: usize, record: RouteRecord,
 ) -> Result<()> {
-  let mut table = routes
-    .lock()
-    .map_err(|_| Error::internal("route records"))?;
+  let mut table = routes.lock().map_err(Error::route_records)?;
   insert_locked(&mut table, capacity, record)
 }
 
@@ -252,5 +250,23 @@ mod insert_route_tests {
     let record = table.get(&trace(1)).unwrap();
     assert_eq!(record.state, RouteState::Routing);
     assert_eq!(record.selected_node.as_ref(), Some(&node(7)));
+  }
+
+  /// A poisoned route table reports the table's named internal error
+  /// instead of a generic one: the lock-poison diagnostic stays uniform
+  /// with the other shared tables.
+  #[test]
+  fn insert_route_reports_the_named_route_record_error_on_a_poisoned_table() {
+    let routes: RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
+    let poisoner = Arc::clone(&routes);
+    let _ = std::thread::spawn(move || {
+      let _guard = poisoner.lock().expect("route table guard");
+      panic!("poison the route table");
+    })
+    .join();
+
+    let error = insert_route(&routes, 8, RouteRecord::new(trace(1), node(7))).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "route records");
   }
 }

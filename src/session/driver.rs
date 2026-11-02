@@ -274,10 +274,7 @@ impl SessionDriver {
     let (expected_peer, generation, credential) = match peek.mode {
       HandshakeMode::Merge => {
         let active = {
-          let issuer = self
-            .issuer
-            .lock()
-            .map_err(|_| Error::internal("join credential issuer"))?;
+          let issuer = self.issuer.lock().map_err(Error::join_credential_issuer)?;
           let now = SystemTime::now();
           let active_generation = issuer
             .generation_id()

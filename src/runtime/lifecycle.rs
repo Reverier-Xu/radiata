@@ -257,10 +257,7 @@ impl RuntimeClient {
   /// Reads one in-memory route record (bounded trace metadata only, no
   /// durability claim).
   pub(crate) fn route_status(&self, handle: &RouteHandle) -> Result<RouteStatusView> {
-    let routes = self
-      .routes
-      .lock()
-      .map_err(|_| Error::internal("route records"))?;
+    let routes = self.routes.lock().map_err(Error::route_records)?;
     let record = routes
       .get(handle.trace_id())
       .ok_or_else(|| Error::not_found("route"))?;

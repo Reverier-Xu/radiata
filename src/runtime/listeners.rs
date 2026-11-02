@@ -26,7 +26,7 @@ pub(super) async fn stop_listener(
 ) -> Result<()> {
   let removed = listeners
     .lock()
-    .map_err(|_| Error::internal("listener registry"))?
+    .map_err(Error::listener_registry)?
     .remove(listener);
   let Some((endpoint, listener_handle, abort)) = removed else {
     return Err(Error::not_found("listener"));
@@ -41,4 +41,37 @@ pub(super) async fn stop_listener(
     endpoints.retain(|candidate| candidate != &endpoint);
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod stop_listener_tests {
+  use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+  };
+
+  use super::stop_listener;
+  use crate::{ErrorKind, identity::ListenerId, runtime::supervisor::ListenerRegistry};
+
+  /// A poisoned listener registry reports the registry's named internal
+  /// error instead of a generic one: the lock-poison diagnostic stays
+  /// uniform with the other shared tables.
+  #[tokio::test]
+  async fn stop_listener_reports_the_named_listener_registry_error_on_a_poisoned_registry() {
+    let listeners: ListenerRegistry = Arc::new(Mutex::new(BTreeMap::new()));
+    let poisoner = Arc::clone(&listeners);
+    let _ = std::thread::spawn(move || {
+      let _guard = poisoner.lock().expect("listener registry guard");
+      panic!("poison the listener registry");
+    })
+    .join();
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let listener = ListenerId::parse("listener-000000000000000000001").unwrap();
+
+    let error = stop_listener(&listeners, &published, &listener)
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "listener registry");
+  }
 }

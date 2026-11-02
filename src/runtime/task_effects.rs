@@ -1615,7 +1615,7 @@ async fn reconcile_listen(
   planes
     .listeners
     .lock()
-    .map_err(|_| Error::internal("listener registry"))?
+    .map_err(Error::listener_registry)?
     .insert(id.clone(), (published.clone(), insert_listener, abort));
   // Publish the advertised endpoint so the next anti-entropy tick pages
   // it in the local descriptor (recovery dials peers through published
@@ -1667,7 +1667,7 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
     .driver
     .issuer()
     .lock()
-    .map_err(|_| Error::internal("join credential issuer"))?;
+    .map_err(Error::join_credential_issuer)?;
   let issued = if rotate {
     issuer.rotate(planes.entropy.as_ref(), std::time::SystemTime::now())?
   } else {
@@ -1685,10 +1685,7 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
 /// observation moved — the moved supervisor body.
 async fn reconcile_start_recovery(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   let planes = deps.planes()?;
-  let mut controller = planes
-    .recovery
-    .lock()
-    .map_err(|_| Error::internal("recovery controller"))?;
+  let mut controller = planes.recovery.lock().map_err(Error::recovery_controller)?;
   let before = super::recovery::recovery_view(&controller);
   controller.immediate(crate::time::now_seconds());
   let after = super::recovery::recovery_view(&controller);
@@ -1793,7 +1790,7 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   let listener_ids: Vec<crate::identity::ListenerId> = planes
     .listeners
     .lock()
-    .map_err(|_| Error::internal("listener registry"))?
+    .map_err(Error::listener_registry)?
     .keys()
     .cloned()
     .collect();
@@ -2135,5 +2132,42 @@ mod lazy_publication_shutdown_tests {
     .unwrap();
     drop(reopened);
     assert_eq!(reached.load(Ordering::Relaxed), 1);
+  }
+}
+
+#[cfg(test)]
+mod shared_table_poison_tests {
+  use std::sync::Arc;
+
+  use crate::{ErrorKind, NodeConfig, runtime::supervisor::test_support::supervisor_over};
+
+  /// A poisoned join credential issuer reports the issuer's named
+  /// internal error instead of a generic one: the lock-poison diagnostic
+  /// stays uniform with the other shared tables.
+  #[tokio::test]
+  async fn reconcile_credential_reports_the_named_join_credential_issuer_error_on_a_poisoned_issuer()
+   {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let (supervisor, _entropy, _sessions) = supervisor_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      NodeConfig::new(),
+    )
+    .await;
+    let deps = supervisor.dependencies.operations.clone().unwrap();
+    let issuer = Arc::clone(deps.planes().unwrap().driver.issuer());
+    let _ = std::thread::spawn(move || {
+      let _guard = issuer.lock().expect("join credential issuer guard");
+      panic!("poison the join credential issuer");
+    })
+    .join();
+
+    let error = match super::reconcile_credential(deps, false).await {
+      Ok(_) => panic!("a poisoned issuer must fail the credential effect"),
+      Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "join credential issuer");
   }
 }

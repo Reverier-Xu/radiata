@@ -146,7 +146,7 @@ impl Supervisor {
       .dependencies
       .listeners
       .lock()
-      .map_err(|_| Error::internal("listener registry"))?
+      .map_err(Error::listener_registry)?
       .iter()
       .map(|(id, (endpoint, ..))| {
         (
@@ -240,14 +240,14 @@ impl Supervisor {
         .dependencies
         .routes
         .lock()
-        .map_err(|_| Error::internal("route records"))?;
+        .map_err(Error::route_records)?;
       routes.len()
     };
     let connection_tasks = self
       .dependencies
       .connection_tasks
       .lock()
-      .map_err(|_| Error::internal("connection tasks"))?
+      .map_err(Error::connection_tasks)?
       .len();
     let background_tasks = tasks.len() + connection_tasks + usize::from(self.sync_driver.is_some());
     let trace_records = self
@@ -366,5 +366,42 @@ impl Supervisor {
       context.identity().node().clone(),
       context.identity().public_key().clone(),
     ))
+  }
+}
+
+#[cfg(test)]
+mod shared_table_poison_tests {
+  use std::sync::Arc;
+
+  use tokio::task::JoinSet;
+
+  use crate::{ErrorKind, NodeConfig, runtime::supervisor::test_support::supervisor_over};
+
+  /// A poisoned connection-task list reports the list's named internal
+  /// error instead of a generic one: the lock-poison diagnostic stays
+  /// uniform with the other shared tables.
+  #[tokio::test]
+  async fn observability_snapshot_reports_the_named_connection_tasks_error_on_a_poisoned_list() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let (mut supervisor, _entropy, _sessions) = supervisor_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      NodeConfig::new(),
+    )
+    .await;
+    let poisoner = Arc::clone(&supervisor.dependencies.connection_tasks);
+    let _ = std::thread::spawn(move || {
+      let _guard = poisoner.lock().expect("connection tasks guard");
+      panic!("poison the connection tasks");
+    })
+    .join();
+
+    let error = supervisor
+      .observability_snapshot(&JoinSet::new())
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "connection tasks");
   }
 }

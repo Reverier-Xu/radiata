@@ -232,6 +232,32 @@ impl Error {
     Self::internal("extension registry")
   }
 
+  /// The poisoned-lock mapper for the shared listener registry (the same
+  /// one-named-site-per-table rule as [`Error::session_table`]).
+  pub(crate) fn listener_registry<T>(_: T) -> Self {
+    Self::internal("listener registry")
+  }
+
+  /// The poisoned-lock mapper for the shared route-record table.
+  pub(crate) fn route_records<T>(_: T) -> Self {
+    Self::internal("route records")
+  }
+
+  /// The poisoned-lock mapper for the shared recovery controller.
+  pub(crate) fn recovery_controller<T>(_: T) -> Self {
+    Self::internal("recovery controller")
+  }
+
+  /// The poisoned-lock mapper for the shared join credential issuer.
+  pub(crate) fn join_credential_issuer<T>(_: T) -> Self {
+    Self::internal("join credential issuer")
+  }
+
+  /// The poisoned-lock mapper for the shared connection-task list.
+  pub(crate) fn connection_tasks<T>(_: T) -> Self {
+    Self::internal("connection tasks")
+  }
+
   pub(crate) const fn resource_exhausted(context: &'static str) -> Self {
     Self {
       kind: ErrorKind::ResourceExhausted,

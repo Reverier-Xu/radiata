@@ -240,10 +240,7 @@ impl TickState {
     }
     let now = crate::time::now_seconds();
     let dial_due = {
-      let mut controller = self
-        .recovery
-        .lock()
-        .map_err(|_| crate::Error::internal("recovery controller"))?;
+      let mut controller = self.recovery.lock().map_err(Error::recovery_controller)?;
       controller.observe(&known, &direct);
       controller.state() == crate::membership::recovery::RecoveryState::Recovering
         && controller.due(now)
@@ -276,10 +273,7 @@ impl TickState {
       }
     }
     let step = {
-      let mut controller = self
-        .recovery
-        .lock()
-        .map_err(|_| crate::Error::internal("recovery controller"))?;
+      let mut controller = self.recovery.lock().map_err(Error::recovery_controller)?;
       controller.next_step(
         now,
         &candidates.keys().cloned().collect(),
@@ -1453,5 +1447,31 @@ mod tests {
     })
     .await
     .expect("recovery must keep dialing after a panicking transport");
+  }
+
+  /// A poisoned recovery controller reports the controller's named
+  /// internal error instead of a generic one: the lock-poison diagnostic
+  /// stays uniform with the other shared tables.
+  #[tokio::test]
+  async fn recovery_tick_reports_the_named_recovery_controller_error_on_a_poisoned_controller() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let (supervisor, _entropy, _sessions) = supervisor_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      NodeConfig::new(),
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let poisoner = Arc::clone(&ticks.recovery);
+    let _ = std::thread::spawn(move || {
+      let _guard = poisoner.lock().expect("recovery controller guard");
+      panic!("poison the recovery controller");
+    })
+    .join();
+
+    let error = ticks.recovery_tick_inner().await.unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::Internal);
+    assert_eq!(error.context(), "recovery controller");
   }
 }
