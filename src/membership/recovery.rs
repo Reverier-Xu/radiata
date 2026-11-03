@@ -25,6 +25,9 @@ const JITTER_QUARTER: u64 = 4;
 pub(crate) struct RecoveryPolicy {
   pub(crate) fan_out: usize,
   pub(crate) initial_backoff: u64,
+  /// The cap on the deterministic base backoff. The sampled wait adds up
+  /// to one quarter of the base on top, so no scheduled retry exceeds
+  /// `maximum_backoff + maximum_backoff / JITTER_QUARTER`.
   pub(crate) maximum_backoff: u64,
 }
 
@@ -320,7 +323,11 @@ impl Entropy for FailingEntropy {
 mod tests {
   use std::collections::BTreeSet;
 
-  use super::{FailingEntropy, RecoveryController, RecoveryPolicy, RecoveryState, WordEntropy};
+  use proptest::prelude::*;
+
+  use super::{
+    FailingEntropy, JITTER_QUARTER, RecoveryController, RecoveryPolicy, RecoveryState, WordEntropy,
+  };
   use crate::NodeId;
 
   fn node(value: u8) -> NodeId {
@@ -620,6 +627,256 @@ mod tests {
     controller.immediate(50);
     assert!(!controller.due(50));
     assert_eq!(controller.next_attempt_seconds(50), None);
+  }
+
+  /// The exact ceiling on any wait the controller can schedule:
+  /// `base_seconds` never exceeds `maximum_backoff`, and `sample_jitter`
+  /// adds at most one quarter of the base, so the sampled wait reaches at
+  /// most `maximum_backoff + maximum_backoff / JITTER_QUARTER` (the
+  /// saturating add covers a maximum at the top of the `u64` range). It is
+  /// tight: the base-eight case samples exactly `8 + 8 / 4`, as
+  /// `jitter_stays_bounded_and_decorrelates_identical_sequences` asserts.
+  fn sampled_wait_ceiling(policy: RecoveryPolicy) -> u64 {
+    policy
+      .maximum_backoff
+      .saturating_add(policy.maximum_backoff / JITTER_QUARTER)
+  }
+
+  /// A valid recovery policy: `fan_out >= 1` and
+  /// `1 <= initial_backoff <= maximum_backoff`. The narrow arm draws
+  /// whole-second cadences at operational scale; the wide arm draws the
+  /// saturating `u64` extremes, where the ceiling itself saturates.
+  fn arb_policy() -> impl Strategy<Value = RecoveryPolicy> {
+    prop_oneof![
+      3 => (1_usize..=64, 1_u64..=600)
+        .prop_flat_map(|(fan_out, initial_backoff)| {
+          (Just(fan_out), Just(initial_backoff), initial_backoff..=3_600_u64)
+        }),
+      1 => (1_usize..=64, 1_u64..=u64::MAX)
+        .prop_flat_map(|(fan_out, initial_backoff)| {
+          (Just(fan_out), Just(initial_backoff), initial_backoff..=u64::MAX)
+        }),
+    ]
+    .prop_map(|(fan_out, initial_backoff, maximum_backoff)| {
+      RecoveryPolicy::new(fan_out, initial_backoff, maximum_backoff)
+    })
+  }
+
+  proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Convergence bound 1 (backoff bound): whatever the valid policy and
+    /// however many attempts have been taken, every wait a taken step
+    /// schedules — and every wait the controller then enforces — stays
+    /// within `maximum_backoff + maximum_backoff / 4`.
+    #[test]
+    fn recovery_wait_stays_within_the_sampled_ceiling(
+      policy in arb_policy(),
+      word in any::<u64>(),
+      attempts in 1_usize..=40,
+    ) {
+      let ceiling = sampled_wait_ceiling(policy);
+      let entropy = WordEntropy(word);
+      let online = set(&[1, 2, 3]);
+      let mut controller = RecoveryController::new(policy);
+      controller.observe(&online, &set(&[]));
+      let mut now = 0_u64;
+      for _ in 0..attempts {
+        let step = controller.next_step(now, &online, &entropy);
+        prop_assert!(
+          step.backoff_seconds <= ceiling,
+          "policy {:?} attempt scheduled {} s, above the ceiling {} s",
+          policy,
+          step.backoff_seconds,
+          ceiling
+        );
+        prop_assert!(
+          controller.backoff_seconds(now) <= ceiling,
+          "policy {:?} enforced {} s, above the ceiling {} s",
+          policy,
+          controller.backoff_seconds(now),
+          ceiling
+        );
+        prop_assert!(controller.next_attempt_seconds(now).is_some());
+        now = now.saturating_add(step.backoff_seconds.max(1));
+      }
+    }
+
+    /// Convergence bound 2 (no starvation): while the node stays isolated
+    /// the wall-clock gap between consecutive attempts — measured through
+    /// the deadline the controller itself advertises — never exceeds the
+    /// same ceiling, so recovery can never silently stop retrying.
+    #[test]
+    fn an_isolated_node_retries_within_the_sampled_ceiling(
+      policy in arb_policy(),
+      word in any::<u64>(),
+      rounds in 1_usize..=48,
+    ) {
+      let ceiling = sampled_wait_ceiling(policy);
+      let entropy = WordEntropy(word);
+      let online = set(&[1, 2, 3, 4]);
+      let mut controller = RecoveryController::new(policy);
+      controller.observe(&online, &set(&[]));
+      let mut now = 0_u64;
+      // The first attempt runs immediately on activation.
+      let first = controller.next_step(now, &online, &entropy);
+      prop_assert!(!first.targets.is_empty());
+      let mut elapsed = 0_u64;
+      for _ in 0..rounds {
+        // Still isolated: the controller stays armed.
+        controller.observe(&online, &set(&[]));
+        prop_assert_eq!(controller.state(), RecoveryState::Recovering);
+        let deadline = controller
+          .next_attempt_seconds(now)
+          .expect("recovering schedules a deadline");
+        let wake = deadline.max(now);
+        let gap = wake - now;
+        prop_assert!(
+          gap <= ceiling,
+          "policy {:?} left a {} s retry gap, above the ceiling {} s",
+          policy,
+          gap,
+          ceiling
+        );
+        now = wake;
+        prop_assert!(
+          controller.due(now),
+          "the advertised deadline {} s must be due",
+          now
+        );
+        let step = controller.next_step(now, &online, &entropy);
+        prop_assert!(!step.targets.is_empty());
+        elapsed = elapsed.saturating_add(gap);
+      }
+      // The whole run of retries fits inside one ceiling per round, so the
+      // attempts kept coming at a bounded cadence instead of stalling.
+      prop_assert!(elapsed <= ceiling.saturating_mul(rounds as u64));
+    }
+
+    /// Convergence bound 3 (sweep bound): with `n` candidates and fan-out
+    /// `f`, `ceil(n / f)` consecutive steps cover every candidate — the
+    /// rotating-cursor "any one route suffices" contract. The last window
+    /// wraps when `f` does not divide `n`, so it may re-dial a member the
+    /// sweep already covered; the guarantee is coverage, not disjointness.
+    #[test]
+    fn bounded_steps_sweep_every_candidate(
+      fan_out in 1_usize..=32,
+      candidates in proptest::collection::btree_set(0_u8..=63, 0..=48),
+      word in any::<u64>(),
+    ) {
+      let online: BTreeSet<NodeId> = candidates.iter().map(|value| node(*value)).collect();
+      let count = online.len();
+      let sweep_steps = count.div_ceil(fan_out);
+      let entropy = WordEntropy(word);
+      let mut controller = RecoveryController::new(RecoveryPolicy::new(fan_out, 1, 60));
+      controller.observe(&online, &set(&[]));
+      let mut covered: BTreeSet<NodeId> = BTreeSet::new();
+      let mut now = 0_u64;
+      for step_index in 0..sweep_steps {
+        let step = controller.next_step(now, &online, &entropy);
+        prop_assert_eq!(
+          step.targets.len(),
+          fan_out.min(count),
+          "step {} of the sweep took the wrong window width",
+          step_index
+        );
+        let mut window: BTreeSet<NodeId> = BTreeSet::new();
+        for target in &step.targets {
+          prop_assert!(
+            online.contains(target),
+            "step {} dialed {} outside the candidate table",
+            step_index,
+            target
+          );
+          prop_assert!(
+            window.insert(target.clone()),
+            "step {} dialed {} twice in one window",
+            step_index,
+            target
+          );
+          covered.insert(target.clone());
+        }
+        now = now.saturating_add(1);
+      }
+      prop_assert_eq!(
+        covered.len(),
+        count,
+        "{} fan-out-{} steps covered {} of {} candidates",
+        sweep_steps,
+        fan_out,
+        covered.len(),
+        count
+      );
+    }
+
+    /// Convergence bound 4 (quiescence): as soon as at least one member is
+    /// reachable, `observe` moves the controller to `Connected` in that
+    /// same call and no further step is due at any wall-clock time.
+    #[test]
+    fn any_reachable_member_quiesces_in_the_observing_call(
+      known in proptest::collection::btree_set(0_u8..=63, 1..=48),
+      reachable in proptest::collection::btree_set(0_u8..=63, 1..=48),
+      now in any::<u64>(),
+      word in any::<u64>(),
+    ) {
+      let known: BTreeSet<NodeId> = known.iter().map(|value| node(*value)).collect();
+      let reachable: BTreeSet<NodeId> = reachable.iter().map(|value| node(*value)).collect();
+      let mut controller = RecoveryController::new(RecoveryPolicy::new(4, 1, 60));
+      // Be genuinely recovering first, so quiescence is not vacuous.
+      controller.observe(&known, &set(&[]));
+      prop_assert_eq!(controller.state(), RecoveryState::Recovering);
+      let _ = controller.next_step(now, &known, &WordEntropy(word));
+
+      controller.observe(&known, &reachable);
+      prop_assert_eq!(controller.state(), RecoveryState::Connected);
+      prop_assert_eq!(
+        controller.pending_count(),
+        known.difference(&reachable).count()
+      );
+      for probe in [now, now.saturating_add(1), u64::MAX] {
+        prop_assert!(
+          !controller.due(probe),
+          "a connected controller must not be due at {} s",
+          probe
+        );
+        prop_assert_eq!(controller.next_attempt_seconds(probe), None);
+      }
+    }
+
+    /// Convergence bound 5 (monotonicity): `base_seconds` is non-decreasing
+    /// in the attempt count and never exceeds `maximum_backoff`, so the
+    /// doubling cadence converges upward to the cap instead of oscillating.
+    #[test]
+    fn the_base_backoff_is_monotone_and_capped(
+      policy in arb_policy(),
+      word in any::<u64>(),
+      attempts in 1_usize..=48,
+    ) {
+      let entropy = WordEntropy(word);
+      let online = set(&[1, 2]);
+      let mut controller = RecoveryController::new(policy);
+      controller.observe(&online, &set(&[]));
+      prop_assert_eq!(controller.base_seconds(), policy.initial_backoff);
+      let mut previous = 0_u64;
+      for _ in 0..attempts {
+        let _ = controller.next_step(0, &online, &entropy);
+        let base = controller.base_seconds();
+        prop_assert!(
+          base <= policy.maximum_backoff,
+          "policy {:?} produced the base {} s above its maximum",
+          policy,
+          base
+        );
+        prop_assert!(
+          base >= previous,
+          "policy {:?} dropped the base from {} s to {} s",
+          policy,
+          previous,
+          base
+        );
+        previous = base;
+      }
+    }
   }
 }
 
