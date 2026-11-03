@@ -1699,12 +1699,15 @@ mod receipt_retention_tests {
     time::{Duration, UNIX_EPOCH},
   };
 
+  // The only caller is the unix-gated overflow test below: the JSON lane it
+  // rides compiles out on Windows, so the import must too.
+  #[cfg(unix)]
+  use super::encode_anchor_value;
   use super::{
     ACTIVE_MARKER_VALUE, FORGOTTEN_MARKER_VALUE, MetadataStore, RETENTION_SWEEP_BOUND,
     ReceiptCleanupOutcome, ReceiptIdentity, ReceiptReferenceChange, ReceiptReferenceToken,
-    build_pending_record_delete_operations, eligibility_anchor_key, encode_anchor_value,
-    internal_namespace, prepare_internal_transaction, reference_head_key, retention_candidate_key,
-    used_id_key,
+    build_pending_record_delete_operations, eligibility_anchor_key, internal_namespace,
+    prepare_internal_transaction, reference_head_key, retention_candidate_key, used_id_key,
   };
   use crate::{
     Digest, StoreExpectation, StoreOperation, StoreValue,
