@@ -47,32 +47,113 @@ pub(crate) fn crash_requirements() -> crate::StoreRequirements {
 #[cfg(all(test, any(feature = "json", feature = "redb")))]
 pub(crate) const CRASH_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The environment variable through which a crash-matrix parent hands its
+/// child the path of the crash-point record. The path is the parent's
+/// choice alone: children never derive it, so no lane carries its own
+/// filename convention.
+#[cfg(all(test, any(feature = "json", feature = "redb")))]
+pub(crate) const CRASH_RECORD_ENV: &str = "RADIATA_CRASH_POINT_RECORD";
+
+/// How much of each captured child stream a missing-record failure
+/// reports: enough for the child's own panic and the head of its
+/// backtrace.
+#[cfg(all(test, any(feature = "json", feature = "redb")))]
+const CHILD_OUTPUT_TAIL_CHARS: usize = 2_000;
+
+/// Records that the scripted crash point was reached, then aborts the
+/// process — the single abort site behind every `crash_hook`.
+///
+/// A crash matrix is only evidence when the child is proven to have died
+/// AT its scripted boundary: a child that panics earlier also exits
+/// abnormally, and the parent's exact-old-state assertions still pass on
+/// the untouched seed, so an unproven abort rots the matrix into a false
+/// green. [`run_crash_child`] therefore requires this record and asserts
+/// that it names the requested point.
+///
+/// The record is one unbuffered `std::fs::write` of the decimal point, so
+/// the kernel owns the bytes before `abort()` runs and the parent reads
+/// them back through the same page cache. No `sync_all`: the reader is a
+/// sibling process on this machine, not a post-power-loss reader. A point
+/// that cannot be recorded panics instead of aborting, so the parent
+/// reports that cause from the captured stderr tail rather than an
+/// unexplained missing record.
+#[cfg(all(test, any(feature = "json", feature = "redb")))]
+pub(crate) fn abort_at_crash_point(point: u8) -> ! {
+  let path = match std::env::var_os(CRASH_RECORD_ENV) {
+    Some(path) => std::path::PathBuf::from(path),
+    None => panic!(
+      "crash point {point} reached but {CRASH_RECORD_ENV} is unset: only a crash-matrix parent \
+       hands out a crash-point record path"
+    ),
+  };
+  if let Err(error) = std::fs::write(&path, point.to_string()) {
+    panic!(
+      "crash point {point} reached but its record {} cannot be written: {error}",
+      path.display()
+    );
+  }
+  std::process::abort()
+}
+
 /// Spawns the current test binary as one crash-matrix child (single
 /// source for the JSON adapter and resource register lanes): exact test
-/// filter, environment-selected crash directory and point, no stdio.
-/// Panics unless the child terminates abnormally within the timeout.
+/// filter, environment-selected crash directory and point, and the
+/// crash-point record path.
+///
+/// Panics unless the child terminates abnormally within the timeout AND
+/// its record proves the scripted crash point was reached. Only the pair
+/// is evidence: an abnormal exit alone cannot distinguish a scripted
+/// abort from a child that panicked before its boundary, and the parent's
+/// old-state assertions would still pass on the untouched seed.
+///
+/// Child stdout and stderr go to files, never pipes: the parent reads
+/// them only after the child is reaped, so no read can deadlock against a
+/// still-writing child, and their tails explain a missing record without
+/// a re-run.
 #[cfg(all(test, any(feature = "json", feature = "redb")))]
 pub(crate) fn run_crash_child(
   test_name: &str, dir_env: &str, point_env: &str, dir: &std::path::Path, point: u8, label: &str,
   extra_env: &[(&'static str, String)],
 ) {
-  use std::process::{Command, Stdio};
+  use std::{
+    fs,
+    process::{Command, Stdio},
+  };
 
   use wait_timeout::ChildExt as _;
+
+  let capture = tempfile::tempdir().expect("crash child capture directory");
+  let record_path = capture.path().join("crash-point");
+  let stdout_path = capture.path().join("child-stdout");
+  let stderr_path = capture.path().join("child-stderr");
+  // The proof below is "THIS child wrote the record", so a record left at
+  // the path by an earlier spawn must never stand in for it.
+  match fs::remove_file(&record_path) {
+    Ok(()) => {}
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Err(error) => panic!(
+      "{label} crash child at point {point}: stale crash-point record {} cannot be removed: \
+       {error}",
+      record_path.display()
+    ),
+  }
+  let stdout_file = fs::File::create(&stdout_path).expect("crash child stdout capture");
+  let stderr_file = fs::File::create(&stderr_path).expect("crash child stderr capture");
 
   let executable = std::env::current_exe().unwrap();
   let mut command = Command::new(executable);
   command
     .args(["--exact", test_name, "--ignored", "--nocapture"])
     .env(dir_env, dir)
-    .env(point_env, point.to_string());
+    .env(point_env, point.to_string())
+    .env(CRASH_RECORD_ENV, &record_path);
   for (name, value) in extra_env {
     command.env(name, value);
   }
   let mut child = command
     .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
+    .stdout(Stdio::from(stdout_file))
+    .stderr(Stdio::from(stderr_file))
     .spawn()
     .unwrap();
   let status = match child.wait_timeout(CRASH_CHILD_TIMEOUT).unwrap() {
@@ -86,6 +167,42 @@ pub(crate) fn run_crash_child(
     !status.success(),
     "{label} crash child at point {point} must terminate abnormally"
   );
+
+  let expected = point.to_string();
+  let recorded = fs::read_to_string(&record_path)
+    .ok()
+    .map(|text| text.trim().to_owned());
+  if recorded.as_deref() != Some(expected.as_str()) {
+    let observed = match recorded {
+      Some(text) => format!("the crash-point record names {text:?}"),
+      None => format!(
+        "no crash-point record was written to {}",
+        record_path.display()
+      ),
+    };
+    panic!(
+      "{label} crash child at point {point} aborted without reaching its scripted crash point: \
+       {observed}, expected {expected:?}.\n--- child stdout (tail) ---\n{}\n--- child stderr (tail) \
+       ---\n{}",
+      captured_tail(&stdout_path),
+      captured_tail(&stderr_path),
+    );
+  }
+}
+
+/// The last [`CHILD_OUTPUT_TAIL_CHARS`] characters of one captured child
+/// stream: the child's own panic is the real cause of a missing
+/// crash-point record, and reporting it here saves a re-run.
+#[cfg(all(test, any(feature = "json", feature = "redb")))]
+fn captured_tail(path: &std::path::Path) -> String {
+  let bytes = std::fs::read(path).unwrap_or_default();
+  let text = String::from_utf8_lossy(&bytes);
+  let total = text.chars().count();
+  if total <= CHILD_OUTPUT_TAIL_CHARS {
+    return text.into_owned();
+  }
+  let tail: String = text.chars().skip(total - CHILD_OUTPUT_TAIL_CHARS).collect();
+  format!("…{tail}")
 }
 
 /// The crash matrices' lock-window reopen helpers, compiled only where

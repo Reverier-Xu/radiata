@@ -25,7 +25,9 @@ use std::{
 ///
 /// The hook table is compiled only into test builds; production code carries
 /// an empty inlined stub. A child test process selects one boundary through
-/// the environment and aborts when execution reaches it.
+/// the environment and aborts when execution reaches it. The abort goes
+/// through the shared record-then-abort helper, so the parent can prove the
+/// scripted boundary was reached instead of settling for a non-zero exit.
 #[cfg(test)]
 static CRASH_POINT: AtomicU8 = AtomicU8::new(0);
 
@@ -53,7 +55,7 @@ pub(crate) const LAST_POINT: u8 = 13;
 #[cfg(test)]
 fn crash_hook(point: u8) {
   if CRASH_POINT.load(AtomicOrdering::SeqCst) == point {
-    std::process::abort();
+    crate::storage::test_util::abort_at_crash_point(point);
   }
 }
 
