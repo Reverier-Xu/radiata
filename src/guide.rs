@@ -71,7 +71,10 @@
 //! evidence with a finite retention window: the retention pass drops a
 //! removal once its own timestamp ages past the window, and the
 //! removal population is capacity-bounded with the oldest evicted
-//! first. While the evidence survives anywhere an exchange reaches, it
+//! first. Both halves are one configured policy
+//! ([`NodeConfig::with_resource_removal_retention`](crate::NodeConfig::with_resource_removal_retention)),
+//! defaulting to one month and a quarter-million rows per node. While
+//! the evidence survives anywhere an exchange reaches, it
 //! beats a late-arriving live value by tuple order and anti-entropy
 //! re-establishes the removal. A replica that reconnects after more
 //! than a window offline may therefore re-introduce its pre-removal
@@ -80,7 +83,10 @@
 //! a reclaimed window the cluster no longer remembers the deletion at
 //! all and a reappearing row can stay. An integration whose offline
 //! tolerance exceeds the window treats remote removals as expiring,
-//! not permanent.
+//! not permanent. The window is also the basis on which a node treats a
+//! gone register key as reclaimed knowledge, so it is a cluster-wide
+//! contract: keep it uniform across a cluster, and raise it when peers
+//! may be offline longer than it.
 //!
 //! ```
 //! use radiata::{

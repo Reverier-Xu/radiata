@@ -287,6 +287,9 @@ pub(crate) async fn spawn_runtime(
     dependencies.member_revision.clone(),
     dependencies.sessions.clone(),
     authorization.clone(),
+    // The plane's reclaimed-knowledge predicate reads the same removal
+    // window the periodic sweep deletes on.
+    dependencies.config.resource_removal_retention(),
   );
   let reconcile_consumer = Arc::new(crate::reconcile::plane::ReconcileConsumer::new(
     reconcile_plane.shared(),

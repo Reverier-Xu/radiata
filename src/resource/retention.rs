@@ -15,9 +15,13 @@ use std::time::Duration;
 
 use crate::{Result, StoreKey, StoreOperation, storage::MetadataStore, time::WallClock};
 
-/// The caller-selected default removal-evidence retention window: a signed
+/// The shipped default removal-evidence retention window: a signed
 /// removal record survives this long after its own timestamp before the
-/// ordinary retention pass may drop it. Mirrors the trace-metadata default.
+/// ordinary retention pass may drop it. Mirrors the trace-metadata
+/// default. The window is configurable
+/// ([`crate::NodeConfig::with_resource_removal_retention`]) because it is
+/// also the reconcile plane's reclaimed-knowledge basis — see that
+/// setter for the cluster-wide contract.
 pub(crate) const RESOURCE_REMOVAL_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// The deterministic transaction domain of one resource removal sweep:
@@ -26,8 +30,10 @@ pub(crate) const RESOURCE_REMOVAL_RETENTION: Duration = Duration::from_secs(30 *
 /// it (the receipt sweep's derivation contract).
 const REMOVAL_SWEEP_DOMAIN: &[u8] = b"radiata.woooo.tech/resource-removal/sweep/v1\0";
 
-/// The caller-selected default cap on stored removal records: once the
-/// removal population exceeds this bound, the oldest evict first.
+/// The shipped default cap on stored removal records: once the removal
+/// population exceeds this bound, the oldest evict first. Configurable
+/// alongside the retention window
+/// ([`crate::NodeConfig::with_resource_removal_retention`]).
 pub(crate) const RESOURCE_REGISTER_CAP: usize = 262_144;
 
 /// One fresh removal seen during the scan, ordered by timestamp so a

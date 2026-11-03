@@ -50,13 +50,15 @@ impl TickState {
   /// One host-wall-clock retention pass over the resource removal
   /// evidence: expired and excess signed removal records leave
   /// by exact conditional deletes that never dereference a resource URI
-  /// or touch caller data; live resource metadata is never evicted.
+  /// or touch caller data; live resource metadata is never evicted. The
+  /// window and cap are the caller's configured policy — the same window
+  /// the reconcile plane reads as its reclaimed-knowledge basis.
   pub(super) async fn resource_removal_sweep(&self) {
     if let Err(error) = crate::resource::retention::sweep_removed_ctx(
       self.context.store(),
       &crate::time::HostWallClock,
-      crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
-      crate::resource::retention::RESOURCE_REGISTER_CAP,
+      self.config.resource_removal_retention(),
+      self.config.resource_removal_cap(),
     )
     .await
     {

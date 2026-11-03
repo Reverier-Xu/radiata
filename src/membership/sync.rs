@@ -1237,6 +1237,7 @@ mod tests {
         revision.clone(),
         sessions.clone(),
         crate::session::stream::AuthorizationBoundary::default(),
+        crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
       );
       let page_dispatches = Arc::new(AtomicUsize::new(0));
       // The descriptor rows that actually went on the wire — the
@@ -1280,6 +1281,7 @@ mod tests {
         revision.clone(),
         peer_sessions,
         crate::session::stream::AuthorizationBoundary::default(),
+        crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
       );
       let local = context.identity().node().clone();
       let drainer_own_plane = plane.clone();

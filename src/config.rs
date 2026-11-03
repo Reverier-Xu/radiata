@@ -39,6 +39,15 @@ pub struct NodeConfig {
   trace_metadata_limits: TraceMetadataLimits,
   route_policy: Option<crate::QualifiedTag>,
   receipt_retention: Duration,
+  // The resource removal-evidence policy: how long a signed removal
+  // record stays convergence-eligible after its own timestamp, and the
+  // stored-removal population cap the sweep enforces oldest-first. Both
+  // halves are one policy because the reconcile plane's "reclaimed
+  // knowledge" predicate must read the same window the sweep deletes
+  // on — a window that drifted between them would either resurrect
+  // swept rows or drop live evidence.
+  resource_removal_retention: Duration,
+  resource_removal_cap: usize,
   required_features: BTreeSet<FeatureTag>,
   merge_admission: MergeAdmissionLimits,
   connection_degree: usize,
@@ -195,6 +204,32 @@ impl NodeConfig {
     Ok(self)
   }
 
+  /// Sets the resource removal-evidence policy: `retention` is how long
+  /// a signed removal record survives after its own timestamp before the
+  /// periodic sweep may drop it, and `cap` bounds the stored removal
+  /// population (the oldest evict first). Live resource metadata is
+  /// never evicted by either half.
+  ///
+  /// The window is a **cluster-wide data contract**, not a local tuning
+  /// knob: it is also the basis on which a node treats a gone register
+  /// key as reclaimed knowledge, so a peer running a shorter window
+  /// deletes evidence a peer running a longer one still honours. Keep it
+  /// uniform across a cluster; raise it when peers may be offline
+  /// longer than the window (an offline peer that misses a removal
+  /// inside the window can still resurrect the older live record).
+  /// Both values must be nonzero: a zero window would drop every removal
+  /// on the first sweep, and a zero cap would evict the whole removal
+  /// population.
+  pub fn with_resource_removal_retention(
+    mut self, retention: Duration, cap: usize,
+  ) -> Result<Self> {
+    ensure_nonzero_duration(retention, "resource removal retention")?;
+    ensure_nonzero(cap, "resource removal cap")?;
+    self.resource_removal_retention = retention;
+    self.resource_removal_cap = cap;
+    Ok(self)
+  }
+
   /// Sets the outbound dial deadline: the bound for one transport
   /// connect (TCP dial, TLS handshake, and WebSocket upgrade). The
   /// dialed peer never observes it, so per-device tuning is safe — but
@@ -257,6 +292,19 @@ impl NodeConfig {
 
   pub(crate) const fn receipt_retention(&self) -> Duration {
     self.receipt_retention
+  }
+
+  /// The caller-selected removal-evidence retention window (consumed by
+  /// the periodic sweep and by the reconcile plane's reclaimed-knowledge
+  /// predicate; nonzero by construction).
+  pub(crate) const fn resource_removal_retention(&self) -> Duration {
+    self.resource_removal_retention
+  }
+
+  /// The caller-selected stored-removal population cap (consumed by the
+  /// periodic sweep; nonzero by construction).
+  pub(crate) const fn resource_removal_cap(&self) -> usize {
+    self.resource_removal_cap
   }
 
   /// The anti-entropy tick interval (consumed by the membership sync
@@ -385,6 +433,11 @@ impl Default for NodeConfig {
       trace_metadata_limits: TraceMetadataLimits::default(),
       route_policy: None,
       receipt_retention: Duration::from_secs(30 * 24 * 60 * 60),
+      // The shipped removal-evidence policy: one month of retention and
+      // a quarter-million removal rows per node, the same defaults the
+      // sweep carried before they became configurable.
+      resource_removal_retention: crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
+      resource_removal_cap: crate::resource::retention::RESOURCE_REGISTER_CAP,
       required_features: BTreeSet::new(),
       merge_admission: MergeAdmissionLimits::default(),
       connection_degree: 0,
@@ -842,6 +895,43 @@ mod tests {
     assert_eq!(relay.connection_degree(), 3);
     let derived = NodeConfig::new().with_connection_degree(0);
     assert_eq!(derived.connection_degree(), 0);
+  }
+
+  /// The removal-evidence policy is one knob for both halves — the
+  /// window the sweep deletes on and the population cap it enforces —
+  /// because the reconcile plane's reclaimed-knowledge predicate must
+  /// read the same window. Both must be nonzero: a zero window would
+  /// drop every removal on the first pass, and a zero cap would evict
+  /// the whole removal population.
+  #[test]
+  fn resource_removal_retention_accepts_a_policy_and_rejects_zero() {
+    let default = NodeConfig::new();
+    assert_eq!(
+      default.resource_removal_retention(),
+      Duration::from_secs(30 * 24 * 60 * 60)
+    );
+    assert_eq!(default.resource_removal_cap(), 262_144);
+
+    let configured = NodeConfig::new()
+      .with_resource_removal_retention(Duration::from_secs(3_600), 1_024)
+      .unwrap();
+    assert_eq!(
+      configured.resource_removal_retention(),
+      Duration::from_secs(3_600)
+    );
+    assert_eq!(configured.resource_removal_cap(), 1_024);
+    // The default is untouched by another config's override.
+    assert_eq!(
+      NodeConfig::new().resource_removal_retention(),
+      Duration::from_secs(30 * 24 * 60 * 60)
+    );
+
+    for (retention, cap) in [(Duration::ZERO, 1), (Duration::from_secs(1), 0)] {
+      let error = NodeConfig::new()
+        .with_resource_removal_retention(retention, cap)
+        .unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
   }
 
   /// The task reconcile slot split defaults to two plus two (the
