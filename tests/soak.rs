@@ -288,7 +288,7 @@ fn append_ledger(
 /// admission rotation, packet streaming, resource writes, and session
 /// churn, then returns to the finite baselines.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "soak; run via scripts/verify-soak.sh or the CI schedule"]
+#[ignore = "soak; run via scripts/verify-soak.sh"]
 async fn soak_churn_then_baseline_return() {
   let duration_secs: u64 = std::env::var("RADIATA_SOAK_DURATION_SECS")
     .ok()
