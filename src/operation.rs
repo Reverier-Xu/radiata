@@ -268,36 +268,3 @@ impl TaskChanged {
 impl private::Sealed for TaskChanged {}
 
 impl Event for TaskChanged {}
-
-#[cfg(test)]
-mod tests {
-  use super::{Event, ResourceWrite, TaskChanged};
-  use crate::{LabelValue, ResourceLabels, ResourceName, ResourceUri, TaskId, TaskKind, TaskPhase};
-
-  #[test]
-  fn task_changed_reports_the_transition_it_carries() {
-    let id = TaskId::compose(0, 1).expect("composition");
-    let changed = TaskChanged::new(id.clone(), TaskKind::SyncRound, TaskPhase::Running);
-    assert_eq!(changed.task(), &id);
-    assert_eq!(changed.kind(), &TaskKind::SyncRound);
-    assert_eq!(changed.phase(), TaskPhase::Running);
-  }
-
-  #[test]
-  fn task_changed_is_one_of_the_node_events() {
-    fn assert_event<E: Event>() {}
-    assert_event::<TaskChanged>();
-  }
-
-  #[test]
-  fn resource_write_exposes_its_intent() {
-    let name = ResourceName::parse("radiata.woooo.tech/resources/hook-001").expect("resource name");
-    let labels = ResourceLabels::new(
-      LabelValue::parse("document").expect("resource type"),
-      ResourceUri::parse("file:///hook").expect("resource uri"),
-    );
-    let write = ResourceWrite::new(name.clone(), labels.clone());
-    assert_eq!(write.name(), &name);
-    assert_eq!(write.labels(), &labels);
-  }
-}

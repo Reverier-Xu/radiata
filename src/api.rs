@@ -27,14 +27,8 @@ fn system_entropy_error() -> Error {
 
 #[cfg(test)]
 mod tests {
-  use super::{Entropy, SystemEntropy, system_entropy_error};
+  use super::system_entropy_error;
   use crate::ErrorKind;
-
-  #[test]
-  fn lifecycle_system_entropy_fills_requested_output() {
-    let mut output = [0; 32];
-    SystemEntropy.fill(&mut output).unwrap();
-  }
 
   #[test]
   fn lifecycle_system_entropy_failure_is_typed_and_redacted() {

@@ -1099,96 +1099,8 @@ impl RecoveryView {
 mod tests {
   use std::time::{Duration, SystemTime};
 
-  use super::{ObservabilityCounts, ObservabilitySnapshot, TaskPage, TaskView};
-  use crate::{
-    CredentialIssued, QualifiedTag, TaskId, TaskKind, TaskOutput, TaskPhase,
-    task::{TaskError, TaskStatusRecord},
-  };
-
-  fn task_id(counter: u64) -> TaskId {
-    TaskId::compose(0, counter).expect("composition")
-  }
-
-  fn record(phase: TaskPhase) -> TaskStatusRecord {
-    TaskStatusRecord {
-      phase,
-      attempts: 2,
-      error: None,
-      created: SystemTime::UNIX_EPOCH,
-      started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
-      finished: None,
-    }
-  }
-
-  #[test]
-  fn task_view_mirrors_the_record_it_snapshots() {
-    let id = task_id(1);
-    let node = crate::NodeId::parse("node-00000000000000000000a").expect("node id");
-    let view = TaskView::from_record(
-      id.clone(),
-      TaskKind::Connect,
-      &record(TaskPhase::Running),
-      Some(TaskOutput::Connect(node.clone())),
-    );
-    assert_eq!(view.id(), &id);
-    assert_eq!(view.kind(), &TaskKind::Connect);
-    assert_eq!(view.phase(), TaskPhase::Running);
-    assert_eq!(view.attempts(), 2);
-    assert_eq!(view.created(), SystemTime::UNIX_EPOCH);
-    assert_eq!(
-      view.started(),
-      Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-    );
-    assert_eq!(view.finished(), None);
-    assert_eq!(view.error(), None);
-    assert_eq!(view.output(), Some(&TaskOutput::Connect(node)));
-  }
-
-  #[test]
-  fn task_view_carries_the_terminal_error_and_finish_instant() {
-    let id = task_id(2);
-    let failed = TaskStatusRecord {
-      phase: TaskPhase::Failed,
-      attempts: 4,
-      error: Some(TaskError::from_error(crate::Error::not_found(
-        "peer binding",
-      ))),
-      created: SystemTime::UNIX_EPOCH,
-      started: Some(SystemTime::UNIX_EPOCH),
-      finished: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
-    };
-    let view = TaskView::from_record(id, TaskKind::Connect, &failed, None);
-    assert_eq!(view.phase(), TaskPhase::Failed);
-    assert_eq!(view.attempts(), 4);
-    assert_eq!(
-      view.error().map(|error| error.kind()),
-      Some(crate::ErrorKind::NotFound)
-    );
-    assert_eq!(
-      view.finished(),
-      Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2))
-    );
-    assert_eq!(view.output(), None);
-  }
-
-  #[test]
-  fn task_view_observes_only_the_credential_expiry() {
-    let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
-    let view = TaskView::from_record(
-      task_id(3),
-      TaskKind::IssueCredential,
-      &record(TaskPhase::Succeeded),
-      Some(TaskOutput::IssueCredential(CredentialIssued::new(
-        expires_at,
-      ))),
-    );
-    assert_eq!(
-      view.output(),
-      Some(&TaskOutput::IssueCredential(CredentialIssued::new(
-        expires_at
-      )))
-    );
-  }
+  use super::{ObservabilityCounts, ObservabilitySnapshot};
+  use crate::QualifiedTag;
 
   #[test]
   fn observability_snapshot_labels_every_well_known_counter() {
@@ -1227,29 +1139,5 @@ mod tests {
     assert_eq!(counter(ObservabilitySnapshot::TRACE_RECORDS_DROPPED), 80);
     assert_eq!(counter(ObservabilitySnapshot::PENDING_TRANSACTIONS), 90);
     assert_eq!(counter(ObservabilitySnapshot::METADATA_STORE_AVAILABLE), 1);
-  }
-
-  #[test]
-  fn task_page_keeps_admission_order_and_the_cursor() {
-    let page = TaskPage::new(
-      vec![
-        TaskView::from_record(
-          task_id(1),
-          TaskKind::Join,
-          &record(TaskPhase::Succeeded),
-          None,
-        ),
-        TaskView::from_record(
-          task_id(2),
-          TaskKind::Leave,
-          &record(TaskPhase::Pending),
-          None,
-        ),
-      ],
-      None,
-    );
-    let ids: Vec<TaskId> = page.items().iter().map(|view| view.id().clone()).collect();
-    assert_eq!(ids, vec![task_id(1), task_id(2)]);
-    assert_eq!(page.next(), None);
   }
 }

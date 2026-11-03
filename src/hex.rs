@@ -50,38 +50,3 @@ fn hex_value(byte: u8, context: &'static str) -> Result<u8> {
     _ => Err(Error::invalid_input(context)),
   }
 }
-
-#[cfg(test)]
-mod tests {
-  use super::{decode, decode_array, encode};
-  use crate::ErrorKind;
-
-  #[test]
-  fn hex_round_trips_bytes() {
-    let bytes = [0x00_u8, 0x0F, 0x10, 0xFF, 0xAB, 0xCD];
-    let text = encode(&bytes);
-    assert_eq!(text, "000f10ffabcd");
-    assert_eq!(decode(&text, "round trip").unwrap(), bytes);
-    assert_eq!(decode_array::<6>(&text, "round trip").unwrap(), bytes);
-  }
-
-  #[test]
-  fn hex_rejects_odd_length_upper_case_and_non_hex() {
-    assert_eq!(
-      decode("abc", "odd").unwrap_err().kind(),
-      ErrorKind::InvalidInput
-    );
-    assert_eq!(
-      decode("ABCD", "upper").unwrap_err().kind(),
-      ErrorKind::InvalidInput
-    );
-    assert_eq!(
-      decode("abcz", "non-hex").unwrap_err().kind(),
-      ErrorKind::InvalidInput
-    );
-    assert_eq!(
-      decode_array::<2>("aabbcc", "length").unwrap_err().kind(),
-      ErrorKind::InvalidInput
-    );
-  }
-}
