@@ -407,6 +407,14 @@ impl NodeHandle {
   /// (with its [`crate::RecoveryChanged`] event when the observation
   /// moved).
   ///
+  /// The command is a fresh schedule, not just an earlier deadline: the
+  /// forced cycle is due immediately and the retry cadence that follows
+  /// doubles from the configured initial backoff again, so an operator
+  /// who has just repaired the network does not wait out a backoff that
+  /// grew during the outage. A connected node is unaffected — it already
+  /// satisfies the any-one-route contract, and recovery never expands a
+  /// connected node's topology.
+  ///
   /// Admission-time failures are the pure shape checks only (a stopped
   /// node); the cycle itself never fails the task.
   pub async fn start_recovery(&self) -> Result<Task<RecoveryView>> {

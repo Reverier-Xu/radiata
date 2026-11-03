@@ -261,11 +261,25 @@ impl RecoveryController {
   /// A connected node satisfies the "any one route" contract already, so
   /// forcing a cycle there would expand the topology — exactly what
   /// recovery must not do.
+  ///
+  /// The command is a fresh schedule, not just an earlier deadline: the
+  /// attempt exponent restarts at zero and the sampled wait is replaced
+  /// by zero, so the forced cycle is due on the very next due-check and
+  /// the cadence that follows doubles from the *initial* backoff instead
+  /// of resuming a partition-long exponent. Without both halves the
+  /// command is inert: `due` compares against
+  /// `last_attempt_at + backoff_seconds`, and moving `last_attempt_at`
+  /// back by one second still leaves a scheduled wait of seconds to
+  /// minutes in front of it — the cycle never runs, and the operator's
+  /// explicit retry silently waits out the full backoff it was meant to
+  /// bypass.
   pub(crate) fn immediate(&mut self, now: u64) {
     if self.state != RecoveryState::Recovering {
       return;
     }
-    self.last_attempt_at = now.saturating_sub(1);
+    self.attempts = 0;
+    self.last_attempt_at = now;
+    self.scheduled_backoff = Some(0);
   }
 }
 
@@ -514,7 +528,13 @@ mod tests {
     assert!(!next.targets.is_empty());
   }
 
-  /// An immediate-recovery command forces one cycle without storms.
+  /// An immediate-recovery command forces one cycle without storms, and
+  /// it must do so from a *live* schedule: the earlier version of this
+  /// test only covered a controller that had never stepped
+  /// (`last_attempt_at == 0`), where every due-check passes anyway, so
+  /// the command's real failure mode — a scheduled wait of seconds to
+  /// minutes sitting in front of a deadline moved back by one second —
+  /// went unobserved.
   #[test]
   fn recovery_immediate_forces_one_cycle() {
     let entropy = WordEntropy(0);
@@ -526,6 +546,80 @@ mod tests {
     // One step consumes the immediate trigger.
     let _ = controller.next_step(50, &set(&[2]), &entropy);
     assert!(!controller.due(50));
+  }
+
+  /// The command pulls a *live* schedule forward: after a step has
+  /// scheduled its wait, the next due-check is still in the future, and
+  /// the command must make the cycle due immediately and report it as
+  /// due in the observation.
+  #[test]
+  fn recovery_immediate_pulls_a_live_schedule_forward() {
+    let entropy = WordEntropy(0xAAAA_AAAA_AAAA_AAAA);
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(64, 2, 300));
+    let online = set(&[1, 2]);
+    controller.observe(&online, &set(&[]));
+    // The first step runs immediately and schedules the doubled initial
+    // (2 s << 1 = 4 s).
+    let step = controller.next_step(100, &online, &entropy);
+    assert_eq!(step.backoff_seconds, 0);
+    assert!(!controller.due(101), "the scheduled wait is still ahead");
+    assert_eq!(controller.next_attempt_seconds(101), Some(104));
+
+    // The operator's command makes the cycle due on the next check
+    // instead of leaving the scheduled wait in front of it.
+    controller.immediate(101);
+    assert!(controller.due(101));
+    assert_eq!(controller.next_attempt_seconds(101), Some(101));
+  }
+
+  /// The command restarts the cadence: the attempt exponent drops back
+  /// to zero, so the step after a forced cycle schedules the doubled
+  /// *initial* backoff rather than resuming a partition-long exponent
+  /// (which would leave the operator's retry followed by a maximum-length
+  /// silence).
+  #[test]
+  fn recovery_immediate_restarts_the_backoff_exponent() {
+    let entropy = WordEntropy(0xAAAA_AAAA_AAAA_AAAA);
+    let mut controller = RecoveryController::new(RecoveryPolicy::new(64, 2, 300));
+    let online = set(&[1, 2]);
+    controller.observe(&online, &set(&[]));
+    // Five cycles peg the exponent: the next wait is the 64 s base
+    // (plus its ±25% jitter), not the initial backoff.
+    let mut now = 100;
+    for _ in 0..5 {
+      let _ = controller.next_step(now, &online, &entropy);
+      now += 1;
+    }
+    let pegged = controller.next_attempt_seconds(now).expect("recovering");
+    assert!(
+      pegged > now + 32,
+      "five cycles must peg the wait near the 64 s base, got {pegged}"
+    );
+
+    controller.immediate(now);
+    assert!(controller.due(now));
+    let step = controller.next_step(now, &online, &entropy);
+    assert!(
+      (3..=5).contains(&step.backoff_seconds),
+      "the forced cycle restarts the cadence at the doubled initial backoff, got {}",
+      step.backoff_seconds
+    );
+    assert!(!controller.due(now + 2));
+    assert!(controller.due(now + 5));
+  }
+
+  /// A connected node satisfies the "any one route" contract already, so
+  /// the command is inert there: forcing a cycle would expand the
+  /// topology, which recovery must never do.
+  #[test]
+  fn recovery_immediate_is_inert_while_connected() {
+    let mut controller = RecoveryController::new(policy());
+    let online = set(&[1, 2]);
+    controller.observe(&online, &set(&[1]));
+    assert_eq!(controller.state(), RecoveryState::Connected);
+    controller.immediate(50);
+    assert!(!controller.due(50));
+    assert_eq!(controller.next_attempt_seconds(50), None);
   }
 }
 
