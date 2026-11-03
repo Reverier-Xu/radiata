@@ -533,7 +533,10 @@ impl RouteContext {
     }
   }
 
-  #[cfg(any(test, fuzzing))]
+  /// The trace this routing context was opened for. Test-only: no
+  /// production reader and no fuzz target observes it, so it is not
+  /// compiled into either shipped surface.
+  #[cfg(test)]
   pub fn trace_id(&self) -> &crate::TraceId {
     &self.trace_id
   }
