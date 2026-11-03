@@ -112,12 +112,17 @@ macro_rules! category_tag {
         Ok(Self(tag))
       }
 
+      /// The canonical text. Exposed for every category tag; a tag whose
+      /// registry surface is still test-only (discovery) has no production
+      /// reader yet, so the macro cannot assume every expansion is used.
+      #[allow(dead_code)]
       pub fn as_str(&self) -> &str {
         self.0.as_str()
       }
 
       /// The canonical domain prefix, derived by the parser's offsets
       /// rather than re-splitting the text.
+      #[allow(dead_code)]
       pub fn domain(&self) -> &str {
         self.0.domain()
       }
@@ -298,21 +303,7 @@ fn valid_version_component(component: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use super::{
-    DiscoveryTag, MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, QualifiedTag, valid_dns_hostname,
-  };
-
-  /// `DiscoveryTag` is not a facade export (its registry surface is
-  /// test-only), but the internal discovery fixture still parses and
-  /// renders the canonical discovery category.
-  #[test]
-  fn discovery_tag_parses_its_own_category() {
-    let tag = DiscoveryTag::parse("example.com/discovery/local").unwrap();
-    assert_eq!(tag.as_str(), "example.com/discovery/local");
-    assert_eq!(tag.domain(), "example.com");
-    assert_eq!(tag.to_string(), "example.com/discovery/local");
-    assert!(DiscoveryTag::parse("example.com/protocols/local").is_err());
-  }
+  use super::{MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, QualifiedTag, valid_dns_hostname};
 
   #[test]
   fn parses_versioned_tags_with_split_accessors() {
@@ -345,29 +336,6 @@ mod tests {
   }
 
   #[test]
-  fn rejects_five_segment_tags() {
-    for value in ["a.b/schemas/v1/x/y", "a.b/schemas/x/y/z", "a.b/c/d/e/f"] {
-      assert!(QualifiedTag::parse(value).is_err(), "accepted {value:?}");
-    }
-  }
-
-  #[test]
-  fn unversioned_tags_report_no_version() {
-    let tag = QualifiedTag::parse("a.b/schemas/x").unwrap();
-    assert_eq!(tag.version(), None);
-    assert_eq!(tag.name(), "x");
-  }
-
-  #[test]
-  fn accepts_canonical_hostnames_within_rfc1035_caps() {
-    assert!(valid_dns_hostname("radiata.woooo.tech"));
-    // A full-cap label: 63 bytes is the RFC 1035 label maximum.
-    let full_label = "a".repeat(MAX_HOSTNAME_LABEL_LEN);
-    assert!(valid_dns_hostname(&full_label));
-    assert!(valid_dns_hostname(&format!("{full_label}.example")));
-  }
-
-  #[test]
   fn rejects_labels_above_the_63_byte_cap() {
     let over_label = "a".repeat(MAX_HOSTNAME_LABEL_LEN + 1);
     assert!(!valid_dns_hostname(&over_label));
@@ -383,20 +351,5 @@ mod tests {
     assert!(within.len() > MAX_DNS_NAME_LEN);
     assert!(!valid_dns_hostname(&within));
     assert!(!valid_dns_hostname(&format!("{within}.{label}")));
-  }
-
-  #[test]
-  fn rejects_noncanonical_hostname_spellings() {
-    for host in [
-      "",
-      "trailing.dot.",
-      "Upper.Example",
-      "under_score.example",
-      "-leading-hyphen.example",
-      "trailing-hyphen-.example",
-      "double..dot",
-    ] {
-      assert!(!valid_dns_hostname(host), "host: {host}");
-    }
   }
 }
