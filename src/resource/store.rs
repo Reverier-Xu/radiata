@@ -63,6 +63,14 @@ pub(crate) enum ResourceCommitOutcome {
 }
 
 /// Reads the stored winner for one resource name, if any.
+///
+/// An undecodable stored row is an error here, not an absence: the
+/// register's content is genuinely unknown, and reporting
+/// "no such resource" would be a fabricated answer. The write path is
+/// where corruption is repaired — a plain put treats the row as
+/// non-evidence and installs over it (see
+/// [`commit_expected_record_ctx`]) — so a corrupt register is readable
+/// again after its owner's next plain put.
 pub(crate) async fn read_record_ctx(
   store: &MetadataStore, name: &ResourceName,
 ) -> Result<Option<ResourceRecordV1>> {
@@ -106,6 +114,15 @@ pub(crate) async fn commit_record_ctx(
 /// effect as the caller's version conflict) instead of being
 /// overwritten; an empty register cannot match a named prior version
 /// and reports the same not-found the effect's pre-check does.
+///
+/// An undecodable stored winner is non-evidence, exactly as it is for
+/// the page batches ([`crate::storage::incumbent::decode_or_absent`]):
+/// a plain put installs over it through the normal exact-CAS Put, so a
+/// corrupt register heals locally instead of staying unwritable until
+/// some peer happens to page it back. A preconditioned write cannot
+/// verify the caller's observation against a row it cannot read, so it
+/// reports the same not-found an empty register does — the caller's
+/// remedy is the plain put that repairs the row.
 pub(crate) async fn commit_expected_record_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
   expected: Option<&ResourceVersion>,
@@ -117,18 +134,26 @@ pub(crate) async fn commit_expected_record_ctx(
   // decision, and the per-key CAS expectation, so a concurrent writer
   // can only produce a typed conflict, never an unordered overwrite.
   let snapshot = store.snapshot().await?;
-  if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    let existing = ResourceRecordV1::decode(existing.as_bytes())?;
-    if let Some(expected) = expected
-      && !expected.matches_record(&existing)
-    {
-      return Ok(ResourceCommitOutcome::Superseded(existing));
+  let incumbent = snapshot.get(&namespace, &key).await?.and_then(|value| {
+    crate::storage::incumbent::decode_or_absent(
+      value.as_bytes(),
+      ResourceRecordV1::decode,
+      record.name().as_str(),
+    )
+  });
+  match incumbent {
+    Some(existing) => {
+      if let Some(expected) = expected
+        && !expected.matches_record(&existing)
+      {
+        return Ok(ResourceCommitOutcome::Superseded(existing));
+      }
+      if !record.wins_over(&existing) {
+        return Ok(ResourceCommitOutcome::Superseded(existing));
+      }
     }
-    if !record.wins_over(&existing) {
-      return Ok(ResourceCommitOutcome::Superseded(existing));
-    }
-  } else if expected.is_some() {
-    return Err(Error::not_found("resource"));
+    None if expected.is_some() => return Err(Error::not_found("resource")),
+    None => {}
   }
   commit_put_ctx(
     store,
@@ -314,6 +339,13 @@ async fn commit_put_ctx(
 /// newer wall-clock winner. The commit is one conditional transaction, so
 /// every fault boundary reopens to exactly the old or the new record
 /// without touching unrelated metadata.
+///
+/// Unlike the put path, this one cannot treat an undecodable stored row
+/// as absent: a removal is constructed *from* the stored record (its
+/// type, URI, labels, and removal rank), so a row that does not decode
+/// yields no removable content and the commit fails closed. The caller's
+/// own read of the register fails the same way first; the plain put that
+/// repairs the row is the caller's remedy.
 pub(crate) async fn commit_removal_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, record: &ResourceRecordV1,
   expected: &ResourceRecordV1,
@@ -658,6 +690,66 @@ mod tests {
     .unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::NotFound);
     assert!(read_record_ctx(&store, &name()).await.unwrap().is_none());
+  }
+
+  /// A corrupt stored winner must not make the register permanently
+  /// unwritable. The page batches already treat an undecodable row as
+  /// non-evidence; the local writer path must apply the same policy, or
+  /// a node that is the register's only writer can never repair it —
+  /// only some peer's page could, and a node that never receives one
+  /// stays stuck. A plain put therefore installs over the corrupt row
+  /// through the normal exact-CAS Put, and the register reads back
+  /// whole. A preconditioned write cannot verify the caller's
+  /// observation against a row it cannot decode, so it fails closed
+  /// with the same not-found an empty register reports.
+  #[tokio::test]
+  async fn a_corrupt_register_heals_through_a_plain_put() {
+    use crate::{
+      StoreKey,
+      identity::testing::inject_entry,
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let factory: Arc<dyn StorageFactory> = reference.clone();
+    let store = MetadataStore::open(&factory, Duration::from_secs(10))
+      .await
+      .unwrap();
+    let namespace = super::namespace().unwrap();
+    let key = StoreKey::new(Arc::from(name().as_str().as_bytes().to_vec()));
+    inject_entry(&reference, (namespace.clone(), key.clone()), vec![0x00]);
+
+    // The corrupt row is not readable: the register's content is
+    // genuinely unknown, so a read reports the decode fault rather than
+    // inventing an absence.
+    let error = read_record_ctx(&store, &name()).await.unwrap_err();
+    assert_ne!(error.kind(), crate::ErrorKind::NotFound);
+
+    // A preconditioned write cannot verify its observation against the
+    // corrupt row and refuses exactly as it would on an empty register.
+    let expected = ResourceVersion::from_record(&put(1_000, "file:///gone"));
+    let error = commit_expected_record_ctx(
+      &store,
+      &SystemEntropy,
+      &put(2_000, "file:///candidate"),
+      Some(&expected),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::NotFound);
+
+    // The plain put heals the register: the corrupt row is non-evidence
+    // and the verified record replaces it through the exact-CAS Put.
+    let healed = put(3_000, "file:///healed");
+    match commit_expected_record_ctx(&store, &SystemEntropy, &healed, None)
+      .await
+      .unwrap()
+    {
+      ResourceCommitOutcome::Installed(_) => {}
+      other => panic!("the plain put must install over the corrupt row, got {other:?}"),
+    }
+    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
+    assert_eq!(stored.digest(), healed.digest());
   }
 
   /// The removal path re-checks its exact-version precondition inside
