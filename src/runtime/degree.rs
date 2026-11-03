@@ -42,6 +42,22 @@
 //! by the recovery plane's redundancy pruning (a cut would re-split the
 //! partition it healed); it retires with its session — peer offline,
 //! teardown, or shutdown — and the next interval's tick probes again.
+//!
+//! The one-edge cap is bounded in TIME, not forever
+//! ([`BRIDGE_PROBE_EDGE_LIFETIME_TICKS`]). The probe picks uniformly
+//! among unconnected members, so a pick that lands on the same side of a
+//! partition bridges nothing while still consuming the node's single
+//! edge — and because probe edges are never pruned, that one unlucky pick
+//! would spend the probe for the node's whole lifetime. After the
+//! lifetime the plane reclaims its own edge and re-probes in the same
+//! tick, skipping the peer it just released so the rotation advances.
+//!
+//! Reclaiming a real bridge is safe by construction: while the probe edge
+//! is the node's only cross-partition link, every remaining unconnected
+//! member is on the far side, so the replacement probe lands on one of
+//! them. Only a same-side edge can be followed by another same-side pick,
+//! and that is exactly the case the rotation exists to escape. The steady
+//! state stays `k(n) + 1`.
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -71,6 +87,31 @@ pub(super) const DEGREE_MAINTENANCE_TICK_PERIOD: std::time::Duration =
 /// storm bound: even a permanently partitioned cluster issues one
 /// probe per node per five minutes, whatever the session count.
 pub(super) const BRIDGE_PROBE_INTERVAL_TICKS: u32 = 10;
+
+/// The bounded lifetime of one bridge-probe edge, in maintenance ticks
+/// (120 × 30 s = one hour). The probe plane reclaims its own edge after
+/// this long so a landing on the same side of a partition cannot spend
+/// the node's only probe for the rest of its life; because the
+/// replacement probe is issued in the same tick, a real bridge is
+/// re-reached within one dial rather than one interval (see the module
+/// doc for why the replacement is guaranteed to cross).
+///
+/// The unit is ticks, not intervals: while a probe edge is live the
+/// cadence bracket stays at its firing value (the probe is suppressed
+/// before the bracket is re-armed, which is what makes the plane probe
+/// again on the very first tick after the edge retires), so the gate —
+/// and this age — advances once per maintenance tick.
+pub(super) const BRIDGE_PROBE_EDGE_LIFETIME_TICKS: u32 = 120;
+
+/// The bridge-probe plane's own bookkeeping: the edge it is currently
+/// holding (with its age in probe intervals) and the peer it just
+/// released, which the replacement probe skips so the rotation advances
+/// instead of re-picking the edge it just cut.
+#[derive(Debug, Default)]
+pub(super) struct ProbeLedger {
+  edge: Option<(NodeId, u32)>,
+  retired: Option<NodeId>,
+}
 
 /// Runs the degree-maintenance worker: one long-lived task that owns the
 /// maintenance cadence — the tick the supervisor's select loop used to
@@ -269,28 +310,64 @@ impl TickState {
         .store(countdown - 1, std::sync::atomic::Ordering::Relaxed);
       return Ok(());
     }
-    // The one-live-probe-edge cap: a landed probe edge IS this node's
-    // bridge, so no further probe may fire while it lives — otherwise
-    // every interval that succeeds would add one more permanent edge and
-    // a healthy node would densify toward a full mesh. The check sits
-    // after the bracket on purpose: the bracket keeps advancing, so the
-    // first eligible tick after the probe edge retires probes again
-    // instead of waiting out a fresh interval.
-    if self.holds_live_probe_edge() {
-      debug!("bridge probe deferred: a probe edge is already live");
-      return Ok(());
+    // The one-live-probe-edge cap, bounded in time: a landed probe edge
+    // IS this node's bridge, so no further probe may fire while it lives
+    // — otherwise every interval that succeeds would add one more
+    // permanent edge and a healthy node would densify toward a full mesh.
+    // The check sits after the bracket on purpose: the bracket keeps
+    // advancing, so the first eligible tick after the probe edge retires
+    // probes again instead of waiting out a fresh interval.
+    match self.probe_edge_peer() {
+      // A poisoned session table suppresses the probe: densifying the
+      // mesh is the unsafe direction, and the edge's age simply stops
+      // advancing.
+      Err(error) => {
+        debug!(kind = ?error.kind(), "bridge probe deferred: the session table is poisoned");
+        return Ok(());
+      }
+      Ok(Some(peer)) => {
+        // The edge's bounded lifetime: a same-side landing must not spend
+        // the node's only probe forever, so an edge older than the
+        // lifetime is reclaimed here and the replacement probe runs in
+        // this same tick.
+        if !self.reclaim_aged_probe_edge(&peer)? {
+          debug!("bridge probe deferred: a probe edge is already live");
+          return Ok(());
+        }
+      }
+      Ok(None) => self.forget_probe_edge(),
     }
     self.bridge_probe_ticks.store(
       BRIDGE_PROBE_INTERVAL_TICKS,
       std::sync::atomic::Ordering::Relaxed,
     );
-    let dials = crate::membership::degree::select_degree_dials(
-      1,
-      local,
-      members,
-      connected,
-      self.entropy.as_ref(),
-    )?;
+    // The replacement probe skips the peer whose edge was just reclaimed,
+    // so the rotation advances instead of re-picking the edge it cut. The
+    // exclusion is single-slot and falls back to the full pool when it
+    // would leave nothing to dial.
+    let pool = self
+      .take_retired_probe_peer()
+      .as_ref()
+      .and_then(|retired| probe_pool(members, retired));
+    let mut dials = match &pool {
+      Some(pool) => crate::membership::degree::select_degree_dials(
+        1,
+        local,
+        pool,
+        connected,
+        self.entropy.as_ref(),
+      )?,
+      None => Vec::new(),
+    };
+    if dials.is_empty() {
+      dials = crate::membership::degree::select_degree_dials(
+        1,
+        local,
+        members,
+        connected,
+        self.entropy.as_ref(),
+      )?;
+    }
     // Per-member endpoint rotation, the same serial map the deficit
     // path and the recovery plane share: a multi-homed member's
     // endpoints rotate across successive probes of that member,
@@ -317,21 +394,91 @@ impl TickState {
     Ok(())
   }
 
-  /// Whether the node already holds a live bridge-probe edge: the probe
-  /// fires only while it holds none, so a landed probe caps the node at
-  /// one probe edge (the single extra session beyond the degree target).
-  /// A poisoned session-table lock reports "held": suppressing the probe
-  /// is the safe direction — it never densifies the mesh.
-  fn holds_live_probe_edge(&self) -> bool {
+  /// The live bridge-probe edge's peer, if the node holds one. A poisoned
+  /// session-table lock is an error: the caller suppresses the probe
+  /// rather than densify on a table it cannot read.
+  fn probe_edge_peer(&self) -> Result<Option<NodeId>> {
+    let sessions = self.sessions.lock().map_err(Error::session_table)?;
+    Ok(sessions.iter().find_map(|(peer, entry)| {
+      (entry.alive() && entry.dial_class() == crate::session::stream::DialClass::Probe)
+        .then(|| peer.clone())
+    }))
+  }
+
+  /// Ages the live probe edge by one probe interval and reclaims it once
+  /// its bounded lifetime elapses. Returns whether the plane may probe
+  /// now; a reclaimed edge records its peer for the replacement probe to
+  /// skip.
+  ///
+  /// The cut re-verifies the exact observed entry under the session-table
+  /// lock (alive and probe-class) before removing it, the redundancy
+  /// prune's exact-identity rule: a reconnect that replaced the map entry
+  /// in any window is never retired as the old edge.
+  fn reclaim_aged_probe_edge(&self, peer: &NodeId) -> Result<bool> {
+    let due = {
+      let mut ledger = self
+        .probe_ledger
+        .lock()
+        .map_err(|_| Error::internal("probe ledger"))?;
+      let age = match &ledger.edge {
+        Some((tracked, age)) if tracked == peer => age.saturating_add(1),
+        // First observation: the edge has already lived one interval.
+        _ => 1,
+      };
+      if age < BRIDGE_PROBE_EDGE_LIFETIME_TICKS {
+        ledger.edge = Some((peer.clone(), age));
+        return Ok(false);
+      }
+      ledger.edge = None;
+      true
+    };
+    debug_assert!(due);
+    let removed = {
+      let mut sessions = self.sessions.lock().map_err(Error::session_table)?;
+      match sessions.get(peer) {
+        Some(entry)
+          if entry.alive() && entry.dial_class() == crate::session::stream::DialClass::Probe =>
+        {
+          sessions.remove(peer)
+        }
+        // The edge retired on its own between the scan and the cut: the
+        // rotation state is stale, the probe is not.
+        _ => None,
+      }
+    };
+    let Some(entry) = removed else {
+      return Ok(true);
+    };
+    crate::session::stream::retire(&entry);
+    self.events.emit(crate::SessionChanged::new(peer.clone()));
     self
-      .sessions
+      .probe_ledger
       .lock()
-      .map(|sessions| {
-        sessions.iter().any(|(_, entry)| {
-          entry.alive() && entry.dial_class() == crate::session::stream::DialClass::Probe
-        })
-      })
-      .unwrap_or(true)
+      .map_err(|_| Error::internal("probe ledger"))?
+      .retired = Some(peer.clone());
+    tracing::debug!(
+      peer = %peer.as_str(),
+      intervals = BRIDGE_PROBE_EDGE_LIFETIME_TICKS,
+      "reclaimed the aged bridge-probe edge to rotate the probe"
+    );
+    Ok(true)
+  }
+
+  /// Forgets the tracked probe edge: the node holds none, so the next
+  /// landing starts a fresh lifetime.
+  fn forget_probe_edge(&self) {
+    if let Ok(mut ledger) = self.probe_ledger.lock() {
+      ledger.edge = None;
+    }
+  }
+
+  /// Consumes the peer whose probe edge the plane just reclaimed.
+  fn take_retired_probe_peer(&self) -> Option<NodeId> {
+    self
+      .probe_ledger
+      .lock()
+      .ok()
+      .and_then(|mut ledger| ledger.retired.take())
   }
 
   /// Spawns one maintenance dial through the shared member dial
@@ -354,6 +501,23 @@ impl TickState {
       report_maintenance_dial_failure,
     );
   }
+}
+
+/// The replacement probe's candidate pool: the member universe minus the
+/// peer whose probe edge the plane just reclaimed, so the rotation
+/// advances instead of re-picking the edge it cut. `None` when the
+/// exclusion would leave nothing to dial — the caller then probes the
+/// full universe, because a rotation that starves the probe is worse than
+/// re-picking one peer.
+fn probe_pool(
+  members: &BTreeMap<NodeId, Vec<crate::Endpoint>>, retired: &NodeId,
+) -> Option<BTreeMap<NodeId, Vec<crate::Endpoint>>> {
+  let pool: BTreeMap<NodeId, Vec<crate::Endpoint>> = members
+    .iter()
+    .filter(|(node, _)| *node != retired)
+    .map(|(node, endpoints)| (node.clone(), endpoints.clone()))
+    .collect();
+  (!pool.is_empty()).then_some(pool)
 }
 
 /// The maintenance plane's failure diagnostics for the shared dial
@@ -754,6 +918,52 @@ mod tests {
     );
   }
 
+  /// The replacement probe's pool excludes exactly the released peer, and
+  /// never empties: with the released peer as the only remaining
+  /// candidate the pool is `None`, so the caller falls back to the full
+  /// universe instead of leaving the plane silent.
+  #[test]
+  fn the_probe_pool_excludes_the_released_peer_without_emptying() {
+    let endpoint = crate::Endpoint::parse("wss://127.0.0.1:9").unwrap();
+    let members: std::collections::BTreeMap<_, _> = [member_id(105), member_id(106)]
+      .into_iter()
+      .map(|node| (node, vec![endpoint.clone()]))
+      .collect();
+
+    let pool = super::probe_pool(&members, &member_id(105)).expect("106 remains");
+    assert_eq!(
+      pool.keys().cloned().collect::<Vec<_>>(),
+      vec![member_id(106)]
+    );
+    let pool = super::probe_pool(&members, &member_id(106)).expect("105 remains");
+    assert_eq!(
+      pool.keys().cloned().collect::<Vec<_>>(),
+      vec![member_id(105)]
+    );
+
+    // The released peer is the only member left: no pool, so the caller
+    // probes the full universe rather than skipping the probe.
+    let only: std::collections::BTreeMap<_, _> = [member_id(105)]
+      .into_iter()
+      .map(|node| (node, vec![endpoint.clone()]))
+      .collect();
+    assert!(super::probe_pool(&only, &member_id(105)).is_none());
+  }
+
+  /// The probe edge's bounded lifetime stays on the order of an hour
+  /// (purely local, never a cluster-wide contract): pinned so a future
+  /// recalibration is a deliberate act, and so the rotation's cost — one
+  /// reclaim-and-reprobe per lifetime — stays visible next to the
+  /// cadence it multiplies.
+  #[test]
+  fn bridge_probe_edge_lifetime_is_one_hour() {
+    assert_eq!(
+      u64::from(super::BRIDGE_PROBE_EDGE_LIFETIME_TICKS)
+        * super::DEGREE_MAINTENANCE_TICK_PERIOD.as_secs(),
+      3_600
+    );
+  }
+
   /// Audit finding #1's residual boundary: two sub-partitions each
   /// internally meshed at/above the degree target never re-bridge —
   /// the deficit budget is zero and the recovery controller quiesces
@@ -960,7 +1170,9 @@ mod tests {
   /// further while it lives — otherwise every five-minute bracket that
   /// succeeds would add another permanent edge and a healthy node would
   /// densify toward a full mesh. The edge retires with its session (peer
-  /// offline, teardown), and the next eligible tick probes again.
+  /// offline, teardown), and the next eligible tick probes again. The
+  /// suppression is bounded in time, not forever — see
+  /// `an_aged_probe_edge_is_reclaimed_and_the_probe_rotates`.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_live_probe_edge_suppresses_the_next_probe_until_it_retires() {
     let (reference, config) = test_support::reference_and_config();
@@ -1041,6 +1253,157 @@ mod tests {
     })
     .await
     .expect("the plane must probe again once the probe edge retires");
+    holder.abort();
+  }
+
+  /// The one-edge cap is bounded in time: a probe edge that has lived
+  /// its whole lifetime is reclaimed by the probe plane itself and the
+  /// replacement probe runs in the same tick, skipping the peer it just
+  /// released. Without the rotation a single landing on the same side of
+  /// a partition — which bridges nothing but still holds the node's only
+  /// probe edge — would spend the probe for the node's whole lifetime.
+  ///
+  /// The exclusion is observable through the listeners: two unconnected
+  /// members, one on each port, and the reclaimed peer's port must stay
+  /// silent while the other is dialed.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_aged_probe_edge_is_reclaimed_and_the_probe_rotates() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (probed_port, probed_connections, probed_holder) = silent_peer().await;
+    let (other_port, other_connections, other_holder) = silent_peer().await;
+
+    // A seven-node cluster (k(7) = 4): four live caller sessions put this
+    // node exactly at target, so the deficit budget is zero and the probe
+    // owns the dial. Member 105 is the live probe edge (the landing the
+    // rotation must eventually release); member 106 is the only other
+    // unconnected member, on its own port.
+    for seed in 101..=104 {
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        ticks.entropy.as_ref(),
+        DialClass::Caller,
+      );
+    }
+    for seed in 101..=104 {
+      install_member(&supervisor, &reference, seed, &[probed_port]).await;
+    }
+    install_member(&supervisor, &reference, 105, &[probed_port]).await;
+    install_member(&supervisor, &reference, 106, &[other_port]).await;
+    insert_live_session(
+      &sessions,
+      member_id(105),
+      ticks.entropy.as_ref(),
+      DialClass::Probe,
+    );
+    let view = supervisor.connection_degree_view().await.unwrap();
+    assert_eq!(view.target(), 4, "k(7) = 4 from the shipped degree table");
+    assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
+
+    // The age starts on the bracket's first firing tick and advances one
+    // tick at a time from there (the bracket stays armed while the probe
+    // is suppressed), so the reclaim lands on tick
+    // `INTERVAL + LIFETIME - 1`. One tick short of it the edge is still
+    // the node's bridge and no probe may leave the plane.
+    let reclaim_tick =
+      super::BRIDGE_PROBE_INTERVAL_TICKS + super::BRIDGE_PROBE_EDGE_LIFETIME_TICKS - 1;
+    for _ in 0..reclaim_tick - 1 {
+      ticks.maintenance_tick().await.unwrap();
+    }
+    assert_eq!(
+      other_connections.load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "a live probe edge suppresses the probe until its lifetime elapses"
+    );
+    assert!(
+      sessions.lock().unwrap().contains_key(&member_id(105)),
+      "the edge is still held one tick short of its lifetime"
+    );
+
+    // The lifetime's tick: the plane reclaims its own edge and probes a
+    // different member in the same tick.
+    ticks.maintenance_tick().await.unwrap();
+    assert!(
+      !sessions.lock().unwrap().contains_key(&member_id(105)),
+      "the aged probe edge left the session table"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if other_connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the replacement probe must dial the other unconnected member");
+    assert_eq!(
+      probed_connections.load(std::sync::atomic::Ordering::Relaxed),
+      0,
+      "the replacement probe must skip the peer whose edge it just released"
+    );
+    probed_holder.abort();
+    other_holder.abort();
+  }
+
+  /// The exclusion is single-slot and never starves the probe: when the
+  /// reclaimed peer is the ONLY unconnected member left, the replacement
+  /// probe falls back to the full pool and dials it again rather than
+  /// leaving the plane silent.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn the_replacement_probe_falls_back_when_the_retired_peer_is_the_only_target() {
+    let (reference, config) = test_support::reference_and_config();
+    let (supervisor, _entropy, sessions) = supervisor_over(
+      reference.clone() as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let ticks = supervisor.tick_state().unwrap();
+    let (port, connections, holder) = silent_peer().await;
+
+    // Six nodes (k(6) = 3): three caller sessions at target, and member
+    // 105 — the live probe edge — is the only member left unconnected
+    // once its edge is reclaimed.
+    for seed in 101..=103 {
+      insert_live_session(
+        &sessions,
+        member_id(seed),
+        ticks.entropy.as_ref(),
+        DialClass::Caller,
+      );
+    }
+    for seed in 101..=105 {
+      install_member(&supervisor, &reference, seed, &[port]).await;
+    }
+    insert_live_session(
+      &sessions,
+      member_id(105),
+      ticks.entropy.as_ref(),
+      DialClass::Probe,
+    );
+    let view = supervisor.connection_degree_view().await.unwrap();
+    assert_eq!(view.target(), 3, "k(6) = 3 from the shipped degree table");
+    assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
+
+    for _ in 0..super::BRIDGE_PROBE_INTERVAL_TICKS + super::BRIDGE_PROBE_EDGE_LIFETIME_TICKS {
+      ticks.maintenance_tick().await.unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+      loop {
+        if connections.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("the replacement probe must fall back to the released peer");
     holder.abort();
   }
 

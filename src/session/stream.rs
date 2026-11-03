@@ -393,9 +393,12 @@ pub(crate) enum DialClass {
   /// An isolated node's recovery dial: reclaimed once a caller edge
   /// keeps the node connected (the star-preservation rule).
   Recovery,
-  /// The connection-degree bridge probe: never reclaimed by pruning (a
-  /// cut would re-split the partition it healed), and capped at one live
-  /// edge per node by the degree plane's probe gate.
+  /// The connection-degree bridge probe: never reclaimed by the
+  /// recovery plane's pruning (a cut would re-split the partition it
+  /// healed), and capped at one live edge per node by the degree plane's
+  /// probe gate. The probe plane reclaims its own edge after a bounded
+  /// lifetime so a same-side landing cannot spend the node's only probe
+  /// forever (see `runtime/degree.rs`).
   Probe,
 }
 

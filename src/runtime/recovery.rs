@@ -356,12 +356,15 @@ impl TickState {
   /// are never reclaimed here.
   ///
   /// Bridge-probe edges are outside this pass entirely: the probe edge is
-  /// the bridge across a partition, so reclaiming it would re-split the
-  /// partition it just healed. It retires with its session instead (peer
-  /// offline, teardown, or shutdown), and the degree plane's cap of one
-  /// live probe edge per node keeps it from accumulating. A probe edge
-  /// still counts as a non-reclaimable edge for the star-preservation
-  /// rule above: it is a live route the prune never cuts.
+  /// the bridge across a partition, so reclaiming it here would re-split
+  /// the partition it just healed. It retires with its session (peer
+  /// offline, teardown, or shutdown), or is reclaimed by the probe plane
+  /// itself once its bounded lifetime elapses — that plane re-probes in
+  /// the same tick, so the rotation never leaves the node without a
+  /// bridge attempt — and the degree plane's cap of one live probe edge
+  /// per node keeps it from accumulating. A probe edge still counts as a
+  /// non-reclaimable edge for the star-preservation rule above: it is a
+  /// live route this prune never cuts.
   ///
   /// The cooldown is an atomic because the tick state is Arc-shared
   /// between the two workers; only the recovery worker mutates it, so a

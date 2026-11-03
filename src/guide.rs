@@ -166,17 +166,24 @@
 //! live — so a node dials at most **one** bridge edge, not one per
 //! five-minute bracket. The pick is uniformly random among unconnected
 //! members, so the one shot can land on a same-side peer; that edge is
-//! still kept (a cut would re-split what it joined) and the node does not
+//! still kept (a cut would re-split what it joined), and the node does not
 //! probe again until it retires. An operator that must guarantee a
 //! cross-partition bridge steers the dial explicitly with `node.connect`.
 //! The edge is never reclaimed by the recovery plane's redundancy
 //! pruning: it is the route across the partition it healed, so a cut
 //! would re-split what the probe just joined. It retires with its
 //! session — peer offline, teardown, or node shutdown — and the next
-//! eligible tick probes again. A stable cluster therefore does **not**
-//! densify: its steady-state session count stays the degree target plus
-//! the caller's own topology, plus at most that one bridge until its
-//! session retires (the edge is never pruned).
+//! eligible tick probes again.
+//!
+//! The one-edge cap is bounded in time, because a same-side landing would
+//! otherwise spend the node's only probe for its whole lifetime: after an
+//! hour the probe plane reclaims its own edge and re-probes in the same
+//! tick, skipping the peer it just released. That rotation cannot cost a
+//! real bridge — while the probe edge is the node's only cross-partition
+//! link, every remaining unconnected member is on the far side, so the
+//! replacement lands on one of them. A stable cluster therefore does
+//! **not** densify: its steady-state session count stays the degree
+//! target plus the caller's own topology, plus at most that one bridge.
 //!
 //! Which transport carries a route is never inferred: every dial and
 //! bind resolves its transport from the endpoint's scheme alone — the
@@ -790,12 +797,13 @@
 //!   and storage. The degree target shapes the steady-state count: about `k(n)`
 //!   maintenance sessions (seven at 64 members, growing with the logarithm of
 //!   the cluster), plus at most one bridge-probe session (it retires with its
-//!   session, never by pruning) — the probe is a one-shot bridge attempt, not a
+//!   session, or is reclaimed by the probe plane itself after an hour so the
+//!   probe keeps rotating) — the probe is a one-shot bridge attempt, not a
 //!   densification loop: the plane stops probing while a probe edge is live and
-//!   that edge retires with its session, so the count never drifts toward a
-//!   full mesh. Application-initiated and inbound (hub-side) sessions stay on
-//!   top of that. Plan against `(k(n) + 1) × queue bytes` plus the caller's own
-//!   edges — and, for the live number, the session count
+//!   that edge retires rather than accumulating, so the count never drifts
+//!   toward a full mesh. Application-initiated and inbound (hub-side) sessions
+//!   stay on top of that. Plan against `(k(n) + 1) × queue bytes` plus the
+//!   caller's own edges — and, for the live number, the session count
 //!   [`node.connection_degree()`](crate::NodeHandle::connection_degree)
 //!   reports: a 64-node member at the defaults holds roughly `8 MiB` of
 //!   outbound queue capacity per live session — `8 MiB × 8 ≈ 64 MiB` at the

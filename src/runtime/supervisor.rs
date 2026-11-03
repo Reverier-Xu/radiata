@@ -896,6 +896,11 @@ pub(super) struct TickState {
   /// Only the maintenance worker mutates it, so a racing read at worst
   /// shifts one probe by one tick.
   pub(super) bridge_probe_ticks: Arc<std::sync::atomic::AtomicU32>,
+  /// The bridge-probe plane's own ledger: the probe edge it holds (with
+  /// its age in probe intervals) and the peer it just released, so the
+  /// one-edge cap is bounded in time instead of forever (see
+  /// `runtime/degree.rs`).
+  pub(super) probe_ledger: std::sync::Mutex<super::degree::ProbeLedger>,
   /// Recovery-tick cooldown before the next redundant-edge cut. Only
   /// the recovery worker mutates it; a racing read at worst shifts one
   /// cut by one tick.
@@ -1102,6 +1107,7 @@ impl Supervisor {
       bridge_probe_ticks: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
         super::degree::BRIDGE_PROBE_INTERVAL_TICKS,
       )),
+      probe_ledger: std::sync::Mutex::new(super::degree::ProbeLedger::default()),
       prune_cooldown: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
       exclusion_cache: Arc::clone(&self.exclusion_cache),
       trace_records: Arc::clone(&self.trace_records),
