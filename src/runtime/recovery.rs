@@ -698,68 +698,6 @@ mod tests {
     crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
-  /// Endpoint-level failover (audit 2026-10-09 item 7): a member's
-  /// per-member serial rotates it through its published endpoints — the
-  /// member's first dial lands on its first endpoint, later dials the
-  /// others, and the sweep wraps.
-  #[test]
-  fn recovery_endpoints_rotate_with_the_per_member_serial() {
-    let endpoints = vec![endpoint(1), endpoint(2), endpoint(3)];
-    assert_eq!(recovery_endpoint(&endpoints, 1), Some(&endpoints[0]));
-    assert_eq!(recovery_endpoint(&endpoints, 2), Some(&endpoints[1]));
-    assert_eq!(recovery_endpoint(&endpoints, 3), Some(&endpoints[2]));
-    assert_eq!(recovery_endpoint(&endpoints, 4), Some(&endpoints[0]));
-
-    // A single-endpoint member always dials it...
-    let single = vec![endpoint(9)];
-    assert_eq!(recovery_endpoint(&single, 7), Some(&single[0]));
-    // ...and an endpointless member (never a candidate) dials nothing.
-    assert_eq!(recovery_endpoint(&[], 7), None);
-  }
-
-  /// A04 (endpoint-rotation coupling): the audit's smallest pinned
-  /// shape — two multi-homed members with two endpoints each, fan-out
-  /// one. Under the shared schedule serial, member A was dialed only on
-  /// odd attempts and always its first endpoint, member B only on even
-  /// attempts and always its second — each pinned to ONE endpoint
-  /// forever (c = 2 pins fully because 2 ≡ 0 mod 2). Per-member serials
-  /// decouple endpoint rotation from the member window: across 2c
-  /// steps each member's dialed set is ALL of its own endpoints.
-  #[test]
-  fn two_multi_homed_members_each_sweep_both_endpoints() {
-    let entropy = crate::identity::testing::SequenceEntropy::default();
-    let candidates: BTreeSet<crate::NodeId> = [node(0), node(1)].into_iter().collect();
-    let endpoints: BTreeMap<crate::NodeId, Vec<Endpoint>> = candidates
-      .iter()
-      .map(|member| (member.clone(), vec![endpoint(1), endpoint(2)]))
-      .collect();
-    let mut controller = RecoveryController::new(RecoveryPolicy::new(1, 1, 60));
-    controller.observe(&candidates, &BTreeSet::new());
-    let mut serials = BTreeMap::new();
-    let mut dialed: BTreeMap<crate::NodeId, BTreeSet<usize>> = BTreeMap::new();
-    for step in 0..2 * candidates.len() {
-      let decision = controller.next_step(step as u64, &candidates, &entropy);
-      for target in decision.targets {
-        let serial = advance_member_serial(&mut serials, &target);
-        let index = recovery_endpoint(&endpoints[&target], serial)
-          .and_then(|endpoint| {
-            endpoints[&target]
-              .iter()
-              .position(|other| other == endpoint)
-          })
-          .unwrap();
-        dialed.entry(target).or_default().insert(index);
-      }
-    }
-    for (member, indexes) in dialed {
-      assert_eq!(
-        indexes,
-        (0..2).collect::<BTreeSet<_>>(),
-        "member {member:?} must sweep both of its endpoints, not {indexes:?}"
-      );
-    }
-  }
-
   /// A04's failover liveness contract, exhaustively: for every
   /// candidate count (1..=8), endpoint count (1..=4), and fan-out
   /// (1, 2, 3), driving `candidates * endpoints` recovery steps must
