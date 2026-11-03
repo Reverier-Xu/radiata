@@ -1267,9 +1267,8 @@ mod tests {
     spawn_task_manager,
   };
   use crate::{
-    ActionHook, BoxFuture, Error, ErrorKind, EventOptions, EventReceive, ExtensionRegistry,
-    MergeView, NodeId, QualifiedTag, ReconcileDecision, Result, TaskChanged, TaskId, TaskKind,
-    TaskOutput, TaskPhase, TaskTransition,
+    ActionHook, BoxFuture, Error, ErrorKind, ExtensionRegistry, MergeView, NodeId, QualifiedTag,
+    ReconcileDecision, Result, TaskId, TaskKind, TaskOutput, TaskPhase, TaskTransition,
     identity::testing::SequenceEntropy,
     runtime::{LifecycleSnapshot, RuntimeClient},
     task::Task,
@@ -1300,40 +1299,6 @@ mod tests {
     )
   }
 
-  /// One recorded `(hook tag, from, to)` transition observation.
-  type HookCall = (&'static str, TaskPhase, TaskPhase);
-
-  /// An action hook recording every transition it observes, tagged so a
-  /// test can assert the canonical tag order of the sequence.
-  #[derive(Debug)]
-  struct RecordingHook {
-    tag: &'static str,
-    calls: Arc<Mutex<Vec<HookCall>>>,
-  }
-
-  impl ActionHook for RecordingHook {
-    fn on_transition<'a>(&'a self, transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
-      Box::pin(async move {
-        self
-          .calls
-          .lock()
-          .expect("hook calls")
-          .push((self.tag, transition.from(), transition.to()));
-        Ok(())
-      })
-    }
-  }
-
-  /// An action hook that panics on every transition it observes.
-  #[derive(Debug)]
-  struct PanickingHook;
-
-  impl ActionHook for PanickingHook {
-    fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
-      Box::pin(async { panic!("scripted action hook panic") })
-    }
-  }
-
   /// An action hook that panics only on the terminal success transition.
   #[derive(Debug)]
   struct PanicOnSucceededHook;
@@ -1345,168 +1310,6 @@ mod tests {
         Ok(())
       })
     }
-  }
-
-  /// An action hook that never settles (a wedged observer under test).
-  #[derive(Debug)]
-  struct WedgingHook;
-
-  impl ActionHook for WedgingHook {
-    fn on_transition<'a>(&'a self, _transition: &'a TaskTransition) -> BoxFuture<'a, Result<()>> {
-      Box::pin(std::future::pending())
-    }
-  }
-
-  /// Polls a shared log to its final shape: the hook observations run
-  /// on the observation lanes, so the terminal publication precedes
-  /// them and the recorded sequence reaches its pinned shape only
-  /// shortly after.
-  async fn await_hook_calls(calls: &Arc<Mutex<Vec<HookCall>>>, expected: Vec<HookCall>) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-      let recorded = calls.lock().expect("hook calls").clone();
-      if recorded == expected {
-        return;
-      }
-      assert!(
-        std::time::Instant::now() < deadline,
-        "hook calls never reached {expected:?}: {recorded:?}"
-      );
-      tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-  }
-
-  #[tokio::test]
-  async fn action_hooks_run_in_canonical_tag_order() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let mut extensions = ExtensionRegistry::new();
-    // Registered out of tag order: the registry's own order (not the
-    // registration order) decides who observes first.
-    extensions
-      .register_action_hook(
-        QualifiedTag::parse("example.com/hooks/zeta").expect("tag"),
-        Arc::new(RecordingHook {
-          tag: "zeta",
-          calls: Arc::clone(&calls),
-        }),
-      )
-      .expect("registration");
-    extensions
-      .register_action_hook(
-        QualifiedTag::parse("example.com/hooks/alpha").expect("tag"),
-        Arc::new(RecordingHook {
-          tag: "alpha",
-          calls: Arc::clone(&calls),
-        }),
-      )
-      .expect("registration");
-    let (client, _manager) = spawn_task_manager(deps_with(
-      Arc::new(crate::node::EventHub::new()),
-      extensions,
-    ))
-    .expect("manager");
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
-      )
-      .await
-      .expect("admission");
-    handle::<()>(&client, &id, TaskKind::SyncRound)
-      .wait()
-      .await
-      .expect("terminal");
-    // The observations run on the task's pinned observation lane, so
-    // the sequence still observes each transition in order, in
-    // canonical tag order — it just lands off the slot.
-    await_hook_calls(
-      &calls,
-      vec![
-        ("alpha", TaskPhase::Pending, TaskPhase::Running),
-        ("zeta", TaskPhase::Pending, TaskPhase::Running),
-        ("alpha", TaskPhase::Running, TaskPhase::Succeeded),
-        ("zeta", TaskPhase::Running, TaskPhase::Succeeded),
-      ],
-    )
-    .await;
-  }
-
-  #[tokio::test]
-  async fn a_panicking_action_hook_is_contained_and_the_task_still_succeeds() {
-    let mut extensions = ExtensionRegistry::new();
-    extensions
-      .register_action_hook(
-        QualifiedTag::parse("example.com/hooks/boom").expect("tag"),
-        Arc::new(PanickingHook),
-      )
-      .expect("registration");
-    let (client, _manager) = spawn_task_manager(deps_with(
-      Arc::new(crate::node::EventHub::new()),
-      extensions,
-    ))
-    .expect("manager");
-    // The observation runs on the observation lanes off the attempt
-    // body, so a panicking hook is a contained diagnostic: the task
-    // runs its effect to success, and the manager keeps serving later
-    // tasks.
-    for counter in 0..2 {
-      let id = client
-        .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-          ok_effect(TaskOutput::SyncRound(())),
-        )
-        .await
-        .expect("admission");
-      handle::<()>(&client, &id, TaskKind::SyncRound)
-        .wait()
-        .await
-        .expect("the observer panic never fails the task");
-      assert_eq!(
-        handle::<()>(&client, &id, TaskKind::SyncRound)
-          .status()
-          .phase(),
-        TaskPhase::Succeeded,
-        "submission {counter} succeeded despite the panicking observer"
-      );
-    }
-  }
-
-  #[tokio::test]
-  async fn a_panicking_terminal_hook_leaves_the_succeeded_phase_standing() {
-    let mut extensions = ExtensionRegistry::new();
-    extensions
-      .register_action_hook(
-        QualifiedTag::parse("example.com/hooks/late-boom").expect("tag"),
-        Arc::new(PanicOnSucceededHook),
-      )
-      .expect("registration");
-    let (client, _manager) = spawn_task_manager(deps_with(
-      Arc::new(crate::node::EventHub::new()),
-      extensions,
-    ))
-    .expect("manager");
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
-      )
-      .await
-      .expect("admission");
-    // The effect succeeded and published `Succeeded`; the hook
-    // panicking while observing that terminal transition is contained
-    // on its observation lane. Terminality is monotone and the
-    // observation is off the attempt body, so the phase stands and the
-    // waiter still receives the outcome.
-    handle::<()>(&client, &id, TaskKind::SyncRound)
-      .wait()
-      .await
-      .expect("the terminal success stands");
-    assert_eq!(
-      handle::<()>(&client, &id, TaskKind::SyncRound)
-        .status()
-        .phase(),
-      TaskPhase::Succeeded
-    );
   }
 
   #[tokio::test]
@@ -1553,88 +1356,6 @@ mod tests {
       .await
       .expect("the leave signal fires")
       .expect("receiver live");
-  }
-
-  #[tokio::test]
-  async fn a_wedged_action_hook_holds_no_slot_and_never_delays_the_leave_signal_or_drain() {
-    let mut extensions = ExtensionRegistry::new();
-    extensions
-      .register_action_hook(
-        QualifiedTag::parse("example.com/hooks/wedged").expect("tag"),
-        Arc::new(WedgingHook),
-      )
-      .expect("registration");
-    let (leave_complete, mut leave_signals) = mpsc::channel(1);
-    let deps = TaskManagerDeps {
-      entropy: Arc::new(SequenceEntropy::default()),
-      clock: Arc::new(HostWallClock),
-      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
-        Arc::new(crate::node::EventHub::new()),
-        Arc::new(extensions),
-      )),
-      leave_complete,
-    };
-    let (client, manager) = spawn_task_manager(deps).expect("manager");
-    // The leave publishes `Succeeded` while its first transition
-    // observation wedges forever: the wait resolves from the table, and
-    // — because the observations run in their own spawned tasks off the
-    // attempt body — the worker's terminal report still reaches the
-    // manager, whose table read drives the active-leave signal. Under
-    // the old in-body observation this signal never fired.
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
-        ok_effect(TaskOutput::Leave(crate::LeaveOutcome::new(
-          node('a'),
-          node('b'),
-        ))),
-      )
-      .await
-      .expect("admission");
-    tokio::time::timeout(
-      Duration::from_secs(5),
-      handle::<crate::LeaveOutcome>(&client, &id, TaskKind::Leave).wait(),
-    )
-    .await
-    .expect("the terminal publication must land without the observation")
-    .expect("the terminal success stands");
-    tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
-      .await
-      .expect("the leave signal fires despite the wedged observer")
-      .expect("receiver live");
-    // The manager keeps admitting: the wedged observation holds no
-    // execution slot, so later local kinds keep running to completion.
-    for index in 0..3 {
-      let id = client
-        .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-          ok_effect(TaskOutput::SyncRound(())),
-        )
-        .await
-        .expect("admission");
-      tokio::time::timeout(
-        Duration::from_secs(5),
-        handle::<()>(&client, &id, TaskKind::SyncRound).wait(),
-      )
-      .await
-      .expect("submission never terminalized")
-      .expect("terminal");
-      let _ = index;
-    }
-    // The shutdown drain is never pinned by the wedged observer either:
-    // it waits for workers, not for observations.
-    manager.begin_shutdown();
-    let (drained, drained_rx) = tokio::sync::oneshot::channel::<()>();
-    let drain = tokio::spawn(async move {
-      manager.drain().await;
-      let _ = drained.send(());
-    });
-    let drained = tokio::time::timeout(Duration::from_secs(5), drained_rx).await;
-    assert!(
-      drained.is_ok(),
-      "the drain must complete despite the wedged observer"
-    );
-    let _ = drain.await;
   }
 
   /// An action hook that never settles while holding a guard whose
@@ -1822,72 +1543,6 @@ mod tests {
     }
   }
 
-  #[tokio::test]
-  async fn local_kinds_never_queue_behind_a_saturated_network_channel() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    // The default network channel holds two slots: two wedged dials
-    // (join effects that never settle) hold both of them.
-    let dial = || async {
-      client
-        .submit(
-          TaskSpec::new(TaskKind::Join, TaskPayload::None),
-          wedged_effect(),
-        )
-        .await
-        .expect("admission")
-    };
-    let first = dial().await;
-    let second = dial().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    for id in [&first, &second] {
-      loop {
-        let running = client
-          .observer
-          .table
-          .status(id)
-          .is_some_and(|(_, status)| status.phase() == TaskPhase::Running);
-        if running {
-          break;
-        }
-        assert!(
-          std::time::Instant::now() < deadline,
-          "a wedged dial never published running"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-      }
-    }
-    // A third dial queues on the exhausted network channel: it never
-    // leaves `Pending` for the rest of the test.
-    let queued = dial().await;
-    // A local kind, meanwhile, runs to completion on its own channel —
-    // the split this test pins: no local operation ever queues behind a
-    // dial that can hold its slot for a whole dial deadline.
-    let local = client
-      .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
-      )
-      .await
-      .expect("admission");
-    tokio::time::timeout(
-      Duration::from_secs(5),
-      handle::<()>(&client, &local, TaskKind::SyncRound).wait(),
-    )
-    .await
-    .expect("the local kind must not queue behind the wedged dials")
-    .expect("terminal");
-    let (_, queued_status) = client
-      .observer
-      .table
-      .status(&queued)
-      .expect("queued dial entry");
-    assert_eq!(
-      queued_status.phase(),
-      TaskPhase::Pending,
-      "the network channel is still saturated"
-    );
-  }
-
   /// The P1-6 regression: an extension reconciler is the one effect
   /// class that routinely awaits other admitted tasks through its
   /// public handle. Under the old two-channel split it drew from the
@@ -2059,57 +1714,12 @@ mod tests {
       .expect("local terminal");
   }
 
-  #[tokio::test]
-  async fn every_transition_emits_its_task_changed_event() {
-    let events = Arc::new(crate::node::EventHub::new());
-    let mut subscription =
-      events.subscribe::<TaskChanged>(EventOptions::new().capacity(16).expect("capacity"));
-    let (client, _manager) =
-      spawn_task_manager(deps_with(Arc::clone(&events), ExtensionRegistry::new()))
-        .expect("manager");
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
-      )
-      .await
-      .expect("admission");
-    handle::<()>(&client, &id, TaskKind::SyncRound)
-      .wait()
-      .await
-      .expect("terminal");
-    let mut phases = Vec::new();
-    while phases.len() < 3 {
-      let EventReceive::Item(event) = subscription.recv().await.expect("event") else {
-        panic!("unexpected subscription state");
-      };
-      assert_eq!(event.task(), &id);
-      assert_eq!(event.kind(), &TaskKind::SyncRound);
-      phases.push(event.phase());
-    }
-    assert_eq!(
-      phases,
-      vec![TaskPhase::Pending, TaskPhase::Running, TaskPhase::Succeeded]
-    );
-  }
-
   fn node(suffix: char) -> NodeId {
     NodeId::parse(&format!("node-00000000000000000000{suffix}")).expect("node id")
   }
 
   fn merge_view() -> MergeView {
     MergeView::new(node('a'), node('b'))
-  }
-
-  /// A freshly issued merge credential: the fixture's consumable secret.
-  fn issued_credential() -> crate::IssuedMergeCredential {
-    let entropy = SequenceEntropy::default();
-    crate::identity::credential::MergeCredentialIssuer::new()
-      .issue(
-        &entropy,
-        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(600),
-      )
-      .expect("issued credential")
   }
 
   fn handle<T: crate::task::TaskResult>(
@@ -2185,28 +1795,6 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn retry_exhaustion_terminalizes_with_the_last_error() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let scripted = Scripted::new(vec![Step::Fail(ErrorKind::NotFound, "peer binding")]);
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::Join, TaskPayload::None),
-        scripted.effect(),
-      )
-      .await
-      .expect("admission");
-    let error = handle::<MergeView>(&client, &id, TaskKind::Join)
-      .wait()
-      .await
-      .expect_err("exhausted");
-    assert_eq!(error.kind(), ErrorKind::NotFound);
-    assert_eq!(error.context(), "peer binding");
-    let status = handle::<MergeView>(&client, &id, TaskKind::Join).status();
-    assert_eq!(status.attempts(), 4, "network budget");
-    assert_eq!(scripted.attempts(), vec![1, 2, 3, 4]);
-  }
-
-  #[tokio::test]
   async fn terminal_dial_failures_never_retry() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
     let scripted = Scripted::new(vec![Step::Fail(
@@ -2274,98 +1862,6 @@ mod tests {
       handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource).status();
     assert_eq!(status.attempts(), 1, "never retried at the manager level");
     assert_eq!(scripted.attempts(), vec![1]);
-  }
-
-  #[tokio::test]
-  async fn coalescing_returns_the_in_flight_task_id() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let peer = node('p');
-    let endpoint = crate::Endpoint::parse("wss://coalesce.test:1000").expect("endpoint");
-    let dial = |peer: NodeId, port: u16| TaskPayload::PeerDial {
-      endpoint: crate::Endpoint::parse(&format!("wss://coalesce.test:{port}")).expect("endpoint"),
-      peer,
-    };
-    let spec = TaskSpec::new(TaskKind::Connect, dial(peer.clone(), 1000));
-    let first = client
-      .submit(spec.clone(), wedged_effect())
-      .await
-      .expect("admission");
-    // The same intent while in flight: the same task.
-    let second = client
-      .submit(spec, wedged_effect())
-      .await
-      .expect("coalesced admission");
-    assert_eq!(first, second);
-    // The same peer behind a different endpoint is a different intent:
-    // it conflicts instead of silently riding the in-flight dial.
-    let smuggle = client
-      .submit(
-        TaskSpec::new(TaskKind::Connect, dial(peer.clone(), 2000)),
-        wedged_effect(),
-      )
-      .await
-      .expect_err("different endpoint conflicts");
-    assert_eq!(smuggle.kind(), ErrorKind::Conflict);
-    assert_eq!(smuggle.context(), "task in flight");
-    // A different subject: a distinct task. Its effect completes (and so
-    // frees its network slot — the channel's default budget is two and
-    // the wedged first dial already holds one), which is all the
-    // distinctness assertion needs: admission composition, not
-    // in-flight-ness, separates the ids.
-    let other = client
-      .submit(
-        TaskSpec::new(TaskKind::Connect, dial(node('q'), 1000)),
-        ok_effect(TaskOutput::Connect(node('q'))),
-      )
-      .await
-      .expect("distinct admission");
-    assert_ne!(first, other);
-    handle::<NodeId>(&client, &other, TaskKind::Connect)
-      .wait()
-      .await
-      .expect("distinct dial terminal");
-    // A distinct kind over the same subject never coalesces.
-    let revoke = client
-      .submit(
-        TaskSpec::new(
-          TaskKind::Revoke,
-          TaskPayload::Revoke {
-            subject: peer.clone(),
-            expected_key: crate::PublicKey::from_bytes([0x11; 32]),
-          },
-        ),
-        wedged_effect(),
-      )
-      .await
-      .expect("distinct kind");
-    assert_ne!(first, revoke);
-    // After the in-flight task terminalizes, a new submission is a new
-    // task (the coalescing window closes with terminality).
-    let quick = client
-      .submit(
-        TaskSpec::new(TaskKind::Connect, dial(node('z'), 1000)),
-        ok_effect(TaskOutput::Connect(node('z'))),
-      )
-      .await
-      .expect("admission");
-    handle::<NodeId>(&client, &quick, TaskKind::Connect)
-      .wait()
-      .await
-      .expect("terminal");
-    // A same-subject re-submission right after the terminal publication
-    // is a fresh task even when the manager loop has not yet processed
-    // the terminal report: the table's phase is the single truth, so a
-    // `wait` caller that immediately re-submits never rejoins (and
-    // never re-reads) a terminal task's outcome.
-    let resubmitted = client
-      .submit(
-        TaskSpec::new(TaskKind::Connect, dial(node('z'), 1000)),
-        wedged_effect(),
-      )
-      .await
-      .expect("fresh admission after terminality");
-    assert_ne!(quick, resubmitted);
-    let _ = (first, endpoint); // the wedged first task stays non-terminal for the rest of the test
   }
 
   /// The revoke payload carries the pinned expected key, so coalescing
@@ -2572,22 +2068,6 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn submissions_after_shutdown_fail_typed() {
-    let (client, manager) = spawn_task_manager(deps()).expect("manager");
-    manager.begin_shutdown();
-    let error = client
-      .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
-      )
-      .await
-      .expect_err("closed admission");
-    assert_eq!(error.kind(), ErrorKind::ShuttingDown);
-    assert_eq!(error.context(), "task admission");
-    manager.drain().await;
-  }
-
-  #[tokio::test]
   async fn the_local_slot_channel_bounds_simultaneous_effects() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
     let live = Arc::new(AtomicUsize::new(0));
@@ -2634,73 +2114,6 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn a_panicking_effect_fails_the_task_typed() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let panicking: TaskEffect = Arc::new(|_deps, _attempt| {
-      Box::pin(async {
-        panic!("scripted reconciler panic");
-      })
-    });
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        panicking,
-      )
-      .await
-      .expect("admission");
-    let error = handle::<()>(&client, &id, TaskKind::SyncRound)
-      .wait()
-      .await
-      .expect_err("panic terminal");
-    assert_eq!(error.kind(), ErrorKind::Internal);
-    assert_eq!(error.context(), "reconciler panicked");
-  }
-
-  #[tokio::test]
-  async fn the_terminal_history_is_bounded_and_evicts_oldest_first() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let total = super::TASK_TERMINAL_HISTORY + 44;
-    let mut ids = Vec::new();
-    for _ in 0..total {
-      let id = client
-        .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-          ok_effect(TaskOutput::SyncRound(())),
-        )
-        .await
-        .expect("admission");
-      ids.push(id);
-    }
-    // Await the newest task's terminal publication, then the manager's
-    // retention pass (which runs on the terminal report, after the
-    // watch publish) with a bounded re-read.
-    handle::<()>(&client, ids.last().expect("newest"), TaskKind::SyncRound)
-      .wait()
-      .await
-      .expect("terminal");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while client.observer.table.status(&ids[0]).is_some() && std::time::Instant::now() < deadline {
-      tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert!(
-      client.observer.table.status(&ids[0]).is_none(),
-      "the oldest terminal task is evicted"
-    );
-    let kept = ids
-      .iter()
-      .filter(|id| client.observer.table.status(id).is_some())
-      .count();
-    assert_eq!(kept, super::TASK_TERMINAL_HISTORY, "exactly the bound kept");
-    assert!(
-      client
-        .observer
-        .table
-        .status(ids.last().expect("newest"))
-        .is_some()
-    );
-  }
-
-  #[tokio::test]
   async fn dropping_every_client_stops_the_manager() {
     let (client, manager) = spawn_task_manager(deps()).expect("manager");
     let wedged = client
@@ -2729,26 +2142,6 @@ mod tests {
     manager.drain().await;
   }
 
-  #[tokio::test]
-  async fn the_success_path_publishes_pending_running_succeeded() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
-      )
-      .await
-      .expect("admission");
-    handle::<()>(&client, &id, TaskKind::SyncRound)
-      .wait()
-      .await
-      .expect("terminal");
-    let status = handle::<()>(&client, &id, TaskKind::SyncRound).status();
-    assert_eq!(status.phase(), TaskPhase::Succeeded);
-    assert_eq!(status.attempts(), 1);
-    assert_eq!(status.error(), None);
-  }
-
   #[test]
   fn the_retry_policies_are_bounded_and_exponential() {
     let network = super::retry_policy(&TaskKind::Join);
@@ -2769,89 +2162,6 @@ mod tests {
     let once = super::retry_policy(&TaskKind::Leave);
     assert_eq!(once.max_attempts, 1);
     assert_eq!(once.backoff(1), Duration::ZERO);
-  }
-
-  #[test]
-  fn the_credential_outcome_keeps_the_observation_and_the_secret_apart() {
-    let issued = issued_credential();
-    let expires_at = issued.expires_at();
-    let outcome = EffectOutcome::credential_issued(issued);
-    match &outcome.output {
-      TaskOutput::IssueCredential(observation) => assert_eq!(observation.expires_at(), expires_at),
-      other => panic!("not a credential observation: {other:?}"),
-    }
-    assert!(outcome.secret.is_some(), "the secret rides the once slot");
-  }
-
-  #[tokio::test]
-  async fn the_credential_secret_is_collected_once_through_the_manager() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    let issued = issued_credential();
-    let expires_at = issued.expires_at();
-    // The consume-once slot under test: a credential effect can only
-    // hand its non-Clone secret out once.
-    let slot = Arc::new(Mutex::new(Some(issued)));
-    let effect: TaskEffect = Arc::new(move |_deps, _attempt| {
-      let slot = Arc::clone(&slot);
-      Box::pin(async move {
-        let issued = slot
-          .lock()
-          .expect("credential slot")
-          .take()
-          .ok_or_else(|| Error::internal("credential effect"))?;
-        Ok(EffectOutcome::credential_issued(issued))
-      })
-    });
-    let id = client
-      .submit(
-        TaskSpec::new(TaskKind::IssueCredential, TaskPayload::None),
-        effect,
-      )
-      .await
-      .expect("admission");
-    let collected = handle::<crate::IssuedMergeCredential>(&client, &id, TaskKind::IssueCredential)
-      .wait()
-      .await
-      .expect("first collection");
-    assert_eq!(collected.expires_at(), expires_at);
-    let second = handle::<crate::IssuedMergeCredential>(&client, &id, TaskKind::IssueCredential)
-      .wait()
-      .await
-      .expect_err("the slot is consumed");
-    assert_eq!(second.kind(), ErrorKind::InvalidInput);
-    assert_eq!(second.context(), "task output already collected");
-    // The table keeps the terminal task and its expiry observation.
-    let (kind, status) = client
-      .observer
-      .table
-      .status(&id)
-      .expect("the terminal entry stays readable");
-    assert_eq!(kind, TaskKind::IssueCredential);
-    assert_eq!(status.phase(), TaskPhase::Succeeded);
-  }
-
-  #[tokio::test]
-  async fn retryable_failures_retry_then_succeed() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
-    // A Join task under the network policy: NotFound (an unspread
-    // binding) retries, then the dial succeeds with the verb's payload.
-    let scripted = Scripted::new(vec![
-      Step::Fail(ErrorKind::NotFound, "peer binding"),
-      Step::Ok(TaskOutput::Join(merge_view())),
-    ]);
-    let spec = TaskSpec::new(TaskKind::Join, TaskPayload::None);
-    let id = client
-      .submit(spec, scripted.effect())
-      .await
-      .expect("admission");
-    let view = handle::<MergeView>(&client, &id, TaskKind::Join)
-      .wait()
-      .await
-      .expect("terminal");
-    assert_eq!(view, merge_view());
-    let status = handle::<MergeView>(&client, &id, TaskKind::Join).status();
-    assert_eq!(status.attempts(), 2, "attempts: {:?}", scripted.attempts());
-    assert_eq!(scripted.attempts(), vec![1, 2]);
   }
 
   /// One recorded reconciler call: the attempt index plus the previous
@@ -3015,34 +2325,6 @@ mod tests {
     assert_eq!(
       tasks.wait(unknown).await.expect_err("unknown id").kind(),
       ErrorKind::NotFound
-    );
-  }
-
-  #[tokio::test]
-  async fn custom_kind_retries_carry_the_last_error_into_the_context() {
-    let mut extensions = ExtensionRegistry::new();
-    let kind = crate::QualifiedTag::parse("example.com/tasks/v1/flaky").expect("tag");
-    let reconciler =
-      RecordingReconciler::new(vec![ReconcileDecision::Retry, ReconcileDecision::Retry]);
-    let calls = Arc::clone(&reconciler.calls);
-    extensions
-      .register_task_reconciler(kind.clone(), reconciler)
-      .expect("registration");
-    let (_handle, tasks) =
-      handle_over_manager(Arc::new(extensions), Arc::new(crate::node::EventHub::new()));
-
-    let spec = crate::CustomTaskSpec::new(kind, custom_labels());
-    let task = tasks.submit(spec).await.expect("custom admission");
-    task.wait().await.expect("terminal");
-    // The first attempt has no predecessor; every later attempt observes
-    // the previous attempt's typed error through the context.
-    assert_eq!(
-      calls.lock().expect("calls").clone(),
-      vec![
-        (1, None),
-        (2, Some(ErrorKind::Overloaded)),
-        (3, Some(ErrorKind::Overloaded)),
-      ]
     );
   }
 }

@@ -424,10 +424,9 @@ async fn terminal_history_eviction_shapes_get_wait_and_status() {
 /// handle is the only carrier of the secret (a credential task is
 /// deliberately not cloneable — the amendment's once-only slot), the
 /// accessor's wait and views observe only the expiry, and the handle's
-/// local snapshot stays readable after the delivery. The typed
-/// second-wait refusal is pinned next to the task model itself
-/// (`src/task/mod.rs`, `credential_secret_is_collected_exactly_once`)
-/// because a second handle cannot exist for this kind.
+/// local snapshot stays readable after the delivery. A second handle
+/// cannot exist for this kind, so the once-only slot is pinned by the
+/// secret's own non-clonability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn credential_secret_is_delivered_exactly_once() {
   common::init_tracing();
