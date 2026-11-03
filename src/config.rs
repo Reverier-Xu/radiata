@@ -792,63 +792,70 @@ mod tests {
     );
   }
 
-  /// The dial deadline accepts any nonzero duration and rejects zero: a
-  /// zero deadline would cancel every dial before the OS connect
-  /// resolves. The authentication deadline behaves the same, and its
-  /// default is the slow-device-safe 30 s calibration.
+  /// Every nonzero-duration and nonzero-count knob shares one setter
+  /// contract: a configured value is stored verbatim and zero is
+  /// refused (a zero deadline cancels every operation before it starts,
+  /// a zero budget never admits anything). The shipped defaults are
+  /// pinned separately by
+  /// `liveness_defaults_are_the_slow_device_calibration`.
   #[test]
-  fn dial_deadline_accepts_nonzero_and_rejects_zero() {
+  fn nonzero_knobs_store_their_value_and_refuse_zero() {
     let configured = NodeConfig::new()
       .with_dial_deadline(Duration::from_millis(250))
+      .unwrap()
+      .with_authentication_deadline(Duration::from_secs(45))
+      .unwrap()
+      .with_relay_hop_deadline(Duration::from_secs(9))
+      .unwrap()
+      .with_receipt_retention(Duration::from_secs(7))
+      .unwrap()
+      .with_resource_removal_retention(Duration::from_secs(3_600), 1_024)
+      .unwrap()
+      .with_task_reconcile_slots(4, 8)
       .unwrap();
     assert_eq!(configured.dial_deadline(), Duration::from_millis(250));
-    assert_eq!(NodeConfig::new().dial_deadline(), Duration::from_secs(10));
-    let error = NodeConfig::new()
-      .with_dial_deadline(Duration::ZERO)
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
-  }
-
-  /// The authentication deadline accepts any nonzero duration, rejects
-  /// zero, and defaults to the 30 s calibration: the join-mode
-  /// admission commit sits inside the deadline, and slow-flash commits
-  /// pushed concurrent join bursts past the old 10 s value. The relay
-  /// hop deadline behaves the same and defaults to 5 s per hop.
-  #[test]
-  fn authentication_deadline_accepts_nonzero_and_rejects_zero() {
-    let configured = NodeConfig::new()
-      .with_authentication_deadline(Duration::from_secs(45))
-      .unwrap();
     assert_eq!(
       configured.authentication_deadline(),
       Duration::from_secs(45)
     );
-    assert_eq!(
-      NodeConfig::new().authentication_deadline(),
-      Duration::from_secs(30)
-    );
-    let error = NodeConfig::new()
-      .with_authentication_deadline(Duration::ZERO)
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
-  }
-
-  /// The relay hop deadline accepts any nonzero duration, rejects zero,
-  /// and defaults to 5 s per hop.
-  #[test]
-  fn relay_hop_deadline_accepts_nonzero_and_rejects_zero() {
-    let configured = NodeConfig::new()
-      .with_relay_hop_deadline(Duration::from_secs(9))
-      .unwrap();
     assert_eq!(configured.relay_hop_deadline(), Duration::from_secs(9));
+    assert_eq!(configured.receipt_retention(), Duration::from_secs(7));
     assert_eq!(
-      NodeConfig::new().relay_hop_deadline(),
-      Duration::from_secs(5)
+      configured.resource_removal_retention(),
+      Duration::from_secs(3_600)
     );
-    let error = NodeConfig::new()
-      .with_relay_hop_deadline(Duration::ZERO)
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(configured.resource_removal_cap(), 1_024);
+    assert_eq!(configured.task_reconcile_local_slots(), 4);
+    assert_eq!(configured.task_reconcile_network_slots(), 8);
+
+    for error in [
+      NodeConfig::new()
+        .with_dial_deadline(Duration::ZERO)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_authentication_deadline(Duration::ZERO)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_relay_hop_deadline(Duration::ZERO)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_receipt_retention(Duration::ZERO)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_resource_removal_retention(Duration::ZERO, 1)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_resource_removal_retention(Duration::from_secs(1), 0)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_task_reconcile_slots(0, 2)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_task_reconcile_slots(2, 0)
+        .unwrap_err(),
+    ] {
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
   }
 
   /// The library ships exactly one profile — the defaults — and it must
@@ -895,66 +902,6 @@ mod tests {
     assert_eq!(relay.connection_degree(), 3);
     let derived = NodeConfig::new().with_connection_degree(0);
     assert_eq!(derived.connection_degree(), 0);
-  }
-
-  /// The removal-evidence policy is one knob for both halves — the
-  /// window the sweep deletes on and the population cap it enforces —
-  /// because the reconcile plane's reclaimed-knowledge predicate must
-  /// read the same window. Both must be nonzero: a zero window would
-  /// drop every removal on the first pass, and a zero cap would evict
-  /// the whole removal population.
-  #[test]
-  fn resource_removal_retention_accepts_a_policy_and_rejects_zero() {
-    let default = NodeConfig::new();
-    assert_eq!(
-      default.resource_removal_retention(),
-      Duration::from_secs(30 * 24 * 60 * 60)
-    );
-    assert_eq!(default.resource_removal_cap(), 262_144);
-
-    let configured = NodeConfig::new()
-      .with_resource_removal_retention(Duration::from_secs(3_600), 1_024)
-      .unwrap();
-    assert_eq!(
-      configured.resource_removal_retention(),
-      Duration::from_secs(3_600)
-    );
-    assert_eq!(configured.resource_removal_cap(), 1_024);
-    // The default is untouched by another config's override.
-    assert_eq!(
-      NodeConfig::new().resource_removal_retention(),
-      Duration::from_secs(30 * 24 * 60 * 60)
-    );
-
-    for (retention, cap) in [(Duration::ZERO, 1), (Duration::from_secs(1), 0)] {
-      let error = NodeConfig::new()
-        .with_resource_removal_retention(retention, cap)
-        .unwrap_err();
-      assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    }
-  }
-
-  /// The task reconcile slot split defaults to two plus two (the
-  /// historical four-permit total, one channel per class) and refuses a
-  /// zero budget on either side: a zero local channel would queue every
-  /// resource write behind the dials, a zero network channel would
-  /// never run a dial at all.
-  #[test]
-  fn task_reconcile_slots_split_the_two_channels() {
-    let default = NodeConfig::new();
-    assert_eq!(default.task_reconcile_local_slots(), 2);
-    assert_eq!(default.task_reconcile_network_slots(), 2);
-
-    let configured = NodeConfig::new().with_task_reconcile_slots(4, 8).unwrap();
-    assert_eq!(configured.task_reconcile_local_slots(), 4);
-    assert_eq!(configured.task_reconcile_network_slots(), 8);
-
-    for (local, network) in [(0, 2), (2, 0), (0, 0)] {
-      let error = NodeConfig::new()
-        .with_task_reconcile_slots(local, network)
-        .unwrap_err();
-      assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    }
   }
 
   /// A deadline without either driver, a keepalive without a deadline,
