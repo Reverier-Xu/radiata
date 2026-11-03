@@ -8,6 +8,17 @@
 //! higher revision; stale and repeated revisions cannot replace the
 //! current record, and a retained removal marker defeats reordered or
 //! replayed older descriptors.
+//!
+//! The two write paths heal, the read path refuses. An undecodable stored
+//! descriptor is non-evidence for [`store::store_descriptor_ctx`] and
+//! [`store::apply_descriptor_batch_ctx`] — the verified incoming
+//! descriptor installs over it through the normal exact-CAS Put — while
+//! [`store::read_descriptor_ctx`] reports it as an error, never as an
+//! absent descriptor, because the register's content is genuinely unknown
+//! there. The accepted residual of healing: a corrupt descriptor row can
+//! let a departed node re-enter the roster, because the removal guard
+//! needs the row to decode — a removal marker in a row this binary cannot
+//! read protects nothing.
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
@@ -317,6 +328,30 @@ pub(crate) mod store {
     )?))
   }
 
+  /// Reads one stored descriptor row as an optional incumbent for a
+  /// write. An undecodable row is non-evidence, so it reads as absent and
+  /// the verified incoming descriptor installs over it through the normal
+  /// exact-CAS Put (the expectation is the corrupt value's digest, so a
+  /// concurrent change conflicts and the retry re-decodes). Both write
+  /// paths resolve their incumbent here, so they cannot disagree about a
+  /// corrupt row, and the consequence warning lives here once.
+  fn decode_stored_descriptor(value: &StoreValue, node: &NodeId) -> Option<NodeDescriptorV1> {
+    // `decode_descriptor` is total on success, so `None` means exactly
+    // one thing: the stored row did not decode.
+    let descriptor = crate::storage::incumbent::decode_or_absent(
+      value.as_bytes(),
+      crate::membership::page::decode_descriptor,
+      node.as_str(),
+    );
+    if descriptor.is_none() {
+      tracing::warn!(
+        node = %node,
+        "stored node descriptor is undecodable; the incoming descriptor will replace it, so a row written by a newer record version is discarded and a removal marker in that row no longer protects the roster"
+      );
+    }
+    descriptor
+  }
+
   /// Stores one descriptor over the running node's metadata store. A
   /// record is replaced only by a strictly higher revision; the first
   /// record starts at revision 1. Same-revision and stale (lower)
@@ -326,6 +361,13 @@ pub(crate) mod store {
   /// for a node whose trusted binding already exists (the member updated
   /// its labels before its first descriptor page ever arrived here);
   /// a removal marker is never replaced by an older live descriptor.
+  ///
+  /// A stored row this binary cannot decode is non-evidence, exactly as
+  /// it is for the page batch: the verified incoming descriptor installs
+  /// over it, so a register corrupted under a binary that can no longer
+  /// read it heals instead of staying unwritable. The overwrite stays
+  /// atomic — the CAS expectation is the raw stored value's digest, not
+  /// the decoded record.
   pub(crate) async fn store_descriptor_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, descriptor: &NodeDescriptorV1,
   ) -> Result<()> {
@@ -333,12 +375,11 @@ pub(crate) mod store {
     let namespace = namespace()?;
     let key = descriptor_key(descriptor.node());
     let snapshot = store.snapshot().await?;
-    let existing = match snapshot.get(&namespace, &key).await? {
-      Some(value) => Some(crate::membership::page::decode_descriptor(
-        value.as_bytes(),
-      )?),
-      None => None,
-    };
+    let existing = snapshot
+      .get(&namespace, &key)
+      .await?
+      .as_ref()
+      .and_then(|value| decode_stored_descriptor(value, descriptor.node()));
     // The adopted-binding probe only matters for a skipped-revision
     // first install (see `descriptor_skip_reason`).
     let adopted = if existing.is_none() && descriptor.revision() > 1 {
@@ -481,24 +522,14 @@ pub(crate) mod store {
       let mut skipped = Vec::new();
       for descriptor in contenders.iter().copied() {
         let key = descriptor_key(descriptor.node());
-        // A corrupt stored descriptor is non-evidence, not a poison
-        // pill: treat it as absent so the verified incoming descriptor
-        // installs over it through the normal exact-CAS Put. Refusing
-        // the incoming row instead would leave the receiver's
-        // fingerprint without the key the sender keeps re-offering — a
-        // permanent divergence loop (the emit scan skips undecodable
-        // rows too).
+        // A corrupt stored descriptor reads as absent, so the verified
+        // incoming descriptor installs over it (see
+        // `decode_stored_descriptor`).
         let existing = snapshot
           .get(&namespace, &key)
           .await?
           .as_ref()
-          .and_then(|value| {
-            crate::storage::incumbent::decode_or_absent(
-              value.as_bytes(),
-              crate::membership::page::decode_descriptor,
-              descriptor.node().as_str(),
-            )
-          });
+          .and_then(|value| decode_stored_descriptor(value, descriptor.node()));
         // The adopted-binding probe only matters for a skipped-revision
         // first install (see `descriptor_skip_reason`).
         let adopted = if existing.is_none() && descriptor.revision() > 1 {
@@ -856,6 +887,62 @@ mod tests {
     let snapshot = store.snapshot().await.unwrap();
     let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
     assert_eq!(stored.as_bytes(), incoming.encode().unwrap().as_slice());
+  }
+
+  /// The single-record twin of the page-batch case: the same corrupt
+  /// stored descriptor is non-evidence for `store_descriptor_ctx`, so the
+  /// verified incoming descriptor installs over it instead of failing the
+  /// write — the two write paths agree on the corrupt-row policy.
+  #[tokio::test]
+  async fn undecodable_stored_descriptor_is_replaced_by_the_single_record_store() {
+    let store = crate::storage::MetadataStore::open(&factory(), std::time::Duration::from_secs(10))
+      .await
+      .unwrap();
+    // A revision-2 first install is healable only for an already trusted
+    // node, so adopt the binding the corrupt incumbent's row belongs to.
+    crate::identity::trust::store::adopt_binding_ctx(
+      &store,
+      &crate::api::SystemEntropy,
+      &node(1),
+      &key(1),
+    )
+    .await
+    .unwrap();
+    let namespace = super::descriptor_namespace().unwrap();
+    let key = crate::StoreKey::new(Arc::from(node(1).as_str().as_bytes().to_vec()));
+    let snapshot = store.snapshot().await.unwrap();
+    let transaction = store
+      .prepare_transaction(
+        crate::TransactionId::generate(&crate::api::SystemEntropy).unwrap(),
+        snapshot.revision().clone(),
+        vec![crate::StoreOperation::Put {
+          namespace: namespace.clone(),
+          key: key.clone(),
+          expected: crate::StoreExpectation::Absent,
+          value: crate::StoreValue::new(Arc::from(b"not a descriptor".to_vec())),
+        }],
+      )
+      .unwrap();
+    drop(snapshot);
+    store.commit(transaction).await.unwrap();
+
+    let incoming = descriptor(2, 1, vec!["one.example"], false);
+    store::store_descriptor_ctx(&store, &crate::api::SystemEntropy, &incoming)
+      .await
+      .unwrap();
+
+    // The corrupt incumbent is replaced by the verified descriptor, and
+    // the read path now sees it.
+    let snapshot = store.snapshot().await.unwrap();
+    let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
+    assert_eq!(
+      crate::membership::page::decode_descriptor(stored.as_bytes()).unwrap(),
+      incoming
+    );
+    assert_eq!(
+      store::read_descriptor_ctx(&store, &node(1)).await.unwrap(),
+      Some(incoming)
+    );
   }
 
   /// Two owner patches based on one observed revision (the audit's
