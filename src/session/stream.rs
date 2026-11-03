@@ -207,7 +207,7 @@ impl RevokedSubjects {
 ///   ledger record, and the subject's session retirement
 ///   (`crate::runtime::task_effects`);
 /// - a sync-delivered revocation tombstone (`apply_revocation_record` in
-///   `crate::membership::sync`) holds the same section across its durable
+///   `crate::membership::tombstone`) holds the same section across its durable
 ///   install, the ledger record, and the retirement, so a remote revocation
 ///   closes the in-flight window exactly like a local one;
 /// - session publication (`run_session`) holds its section across the

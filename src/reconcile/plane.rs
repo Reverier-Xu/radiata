@@ -1779,7 +1779,7 @@ async fn scan_namespace(
 /// record families (a subject can carry more than one kind). The enum
 /// and its typed prefix decoder live on the wire contract
 /// ([`wire::TombstoneKind`]) so the scan side here and the apply side in
-/// `membership::sync` share one mapping.
+/// `membership::tombstone` share one mapping.
 use super::wire::TombstoneKind;
 
 /// One lane apply's outcome, split by what the store did with each
@@ -2073,7 +2073,7 @@ async fn apply_rows(
       Ok(LaneOutcome { refused, deferred })
     }
     LaneId::Tombstones => {
-      crate::membership::sync::apply_tombstone_rows(
+      crate::membership::tombstone::apply_tombstone_rows(
         &context,
         &shared.entropy,
         &shared.events,

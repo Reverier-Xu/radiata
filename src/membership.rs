@@ -294,6 +294,7 @@ pub(crate) mod degree;
 pub(crate) mod page;
 pub(crate) mod recovery;
 pub(crate) mod sync;
+pub(crate) mod tombstone;
 
 pub(crate) mod store {
   use std::{collections::HashMap, sync::Arc};
