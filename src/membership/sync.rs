@@ -501,6 +501,234 @@ async fn apply_checkpoint_record(
   Ok(())
 }
 
+/// One decoded reconciliation row, tagged with the kind its key prefix
+/// named: the decode phase has already checked the record's own subject
+/// against the key it arrived under (and, for a leave row, that the
+/// record's signature verifies), so the apply phase dispatches on the
+/// kind alone and never re-derives the attribution.
+enum TombstoneRow {
+  Leave(crate::identity::leave::LeaveRecordV1),
+  Cleanup(crate::identity::cleanup::CleanupRecordV1),
+  Revocation(crate::identity::revocation::RevocationRecordV1),
+  Checkpoint(crate::identity::cleanup::CleanupCheckpointV1),
+}
+
+/// Decodes one reconciliation row into the evidence of its kind: the key
+/// prefix names the kind, the record must decode, its own subject must
+/// match the key it arrived under, and a leave row must carry a signature
+/// that verifies. `None` means the row is skipped with its typed reason
+/// already logged — never an error, because one poison row must not wedge
+/// the batch.
+fn decode_tombstone_row(key: &[u8], content: &[u8]) -> Option<TombstoneRow> {
+  let Some((prefix, subject)) = key.split_first() else {
+    tracing::debug!("reconcile tombstone row skipped: no kind prefix");
+    return None;
+  };
+  // The typed kind decoder the scan side builds row keys with: one
+  // closed mapping on the wire contract, so the apply dispatch and
+  // the scan cannot drift apart.
+  let kind = match crate::reconcile::wire::TombstoneKind::from_prefix(*prefix) {
+    Some(kind) => kind,
+    None => {
+      tracing::debug!(
+        kind = prefix,
+        "reconcile tombstone row skipped: unknown kind"
+      );
+      return None;
+    }
+  };
+  match kind {
+    crate::reconcile::wire::TombstoneKind::Leave => {
+      let record = match crate::identity::leave::LeaveRecordV1::decode(content) {
+        Ok(record) if record.node().as_str().as_bytes() == subject => record,
+        Ok(record) => {
+          tracing::debug!(
+            node = %record.node(),
+            "reconcile leave row skipped: subject mismatch"
+          );
+          return None;
+        }
+        Err(error) => {
+          tracing::debug!(kind = ?error.kind(), "reconcile leave row skipped: undecodable");
+          return None;
+        }
+      };
+      // A leave row is terminal evidence carried by its own
+      // signature: a failed signature (AuthenticationFailed from the
+      // strict verify) is an untrustworthy row — skip it, exactly
+      // like a corrupt row, instead of failing the batch. The
+      // evidence check inside the apply (the bound key mismatching
+      // the record's key, NotTrusted) is a policy refusal of the
+      // same class: the row is refused, the batch continues. Real
+      // store write faults still propagate.
+      if let Err(error) = record.verify() {
+        tracing::warn!(
+          node = %record.node(),
+          kind = ?error.kind(),
+          "reconcile leave row skipped: untrusted signature"
+        );
+        return None;
+      }
+      Some(TombstoneRow::Leave(record))
+    }
+    crate::reconcile::wire::TombstoneKind::Cleanup => {
+      let record = match crate::identity::cleanup::CleanupRecordV1::decode(content) {
+        Ok(record) if record.subject().as_str().as_bytes() == subject => record,
+        Ok(record) => {
+          tracing::debug!(
+            subject = %record.subject(),
+            "reconcile cleanup row skipped: subject mismatch"
+          );
+          return None;
+        }
+        Err(error) => {
+          tracing::debug!(kind = ?error.kind(), "reconcile cleanup row skipped: undecodable");
+          return None;
+        }
+      };
+      Some(TombstoneRow::Cleanup(record))
+    }
+    crate::reconcile::wire::TombstoneKind::Revocation => {
+      let record = match crate::identity::revocation::RevocationRecordV1::decode(content) {
+        Ok(record) if record.subject().as_str().as_bytes() == subject => record,
+        Ok(record) => {
+          tracing::debug!(
+            subject = %record.subject(),
+            "reconcile revocation row skipped: subject mismatch"
+          );
+          return None;
+        }
+        Err(error) => {
+          tracing::debug!(
+            kind = ?error.kind(),
+            "reconcile revocation row skipped: undecodable"
+          );
+          return None;
+        }
+      };
+      Some(TombstoneRow::Revocation(record))
+    }
+    crate::reconcile::wire::TombstoneKind::Checkpoint => {
+      let checkpoint = match crate::identity::cleanup::CleanupCheckpointV1::decode(content) {
+        Ok(checkpoint) if subject == b"checkpoint" => checkpoint,
+        Ok(_) => {
+          tracing::debug!("reconcile checkpoint row skipped: subject mismatch");
+          return None;
+        }
+        Err(error) => {
+          tracing::debug!(
+            kind = ?error.kind(),
+            "reconcile checkpoint row skipped: undecodable"
+          );
+          return None;
+        }
+      };
+      Some(TombstoneRow::Checkpoint(checkpoint))
+    }
+  }
+}
+
+/// Applies one decoded leave row: the record-level apply plus the row's
+/// refusal policy — a NotTrusted answer is the permanently retained
+/// binding disagreeing with the record's key, a refused row the batch
+/// continues past, while real store faults propagate. `receipt` is the
+/// applied receipt's target, the peer that carried the row and the client
+/// that reaches it, present together or not at all.
+async fn apply_leave_row(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+  evidence: &TombstoneEvidence, record: &crate::identity::leave::LeaveRecordV1,
+  receipt: Option<(&NodeId, &RuntimeClient)>,
+) -> Result<()> {
+  let (source, runtime) = receipt.unzip();
+  match apply_leave_record(
+    store, entropy, events, revision, evidence, record, source, runtime,
+  )
+  .await
+  {
+    Err(error) if error.kind() == crate::ErrorKind::NotTrusted => {
+      tracing::warn!(
+        node = %record.node(),
+        "reconcile leave row refused by policy: binding mismatch; skipping"
+      );
+      Ok(())
+    }
+    other => other,
+  }
+}
+
+/// Applies one decoded cleanup row: a forged signature
+/// (AuthenticationFailed from the strict verify), a policy refusal
+/// (NotTrusted issuer or subject binding), or a divergent stored record
+/// over a different binding (Conflict) refuses the row — the batch
+/// continues, so one divergent record can never wedge the tombstone lane.
+/// Real store faults still propagate.
+async fn apply_cleanup_row(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
+  evidence: &TombstoneEvidence, record: &crate::identity::cleanup::CleanupRecordV1,
+) -> Result<()> {
+  match apply_cleanup_record(store, entropy, events, revision, evidence, record).await {
+    Err(error)
+      if matches!(
+        error.kind(),
+        crate::ErrorKind::Conflict
+          | crate::ErrorKind::NotTrusted
+          | crate::ErrorKind::AuthenticationFailed
+      ) =>
+    {
+      tracing::warn!(
+        subject = %record.subject(),
+        kind = ?error.kind(),
+        "reconcile cleanup row refused: divergent or untrusted evidence; skipping"
+      );
+      Ok(())
+    }
+    other => other,
+  }
+}
+
+/// Applies one decoded revocation row under the same refusal policy as the
+/// cleanup row — a forged signature, a policy refusal, or a divergent
+/// stored record refuses the row and the batch continues — while real
+/// store faults propagate.
+async fn apply_revocation_row(
+  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
+  events: &Arc<crate::node::EventHub>, evidence: &TombstoneEvidence,
+  record: &crate::identity::revocation::RevocationRecordV1,
+  sessions: &crate::session::stream::SessionTable,
+  authorization: &crate::session::stream::AuthorizationBoundary,
+) -> Result<()> {
+  match apply_revocation_record(
+    store,
+    entropy,
+    events,
+    evidence,
+    record,
+    sessions,
+    authorization,
+  )
+  .await
+  {
+    Err(error)
+      if matches!(
+        error.kind(),
+        crate::ErrorKind::Conflict
+          | crate::ErrorKind::NotTrusted
+          | crate::ErrorKind::AuthenticationFailed
+      ) =>
+    {
+      tracing::warn!(
+        subject = %record.subject(),
+        kind = ?error.kind(),
+        "reconcile revocation row refused: divergent or untrusted evidence; skipping"
+      );
+      Ok(())
+    }
+    other => other,
+  }
+}
+
 /// The tombstone lane's reconciliation row apply: kind-prefixed keys
 /// (the wire contract's [`crate::reconcile::wire::TombstoneKind`]
 /// prefixes) dispatch to the same per-record
@@ -524,136 +752,27 @@ pub(crate) async fn apply_tombstone_rows(
   // derived-view repair on the same poison row forever. Store failures
   // inside the apply arms still propagate: they are real write faults.
   for (key, content) in rows {
-    let Some((prefix, subject)) = key.split_first() else {
-      tracing::debug!("reconcile tombstone row skipped: no kind prefix");
+    let Some(row) = decode_tombstone_row(key, content) else {
       continue;
     };
-    let subject: &[u8] = subject;
-    // The typed kind decoder the scan side builds row keys with: one
-    // closed mapping on the wire contract, so the apply dispatch and
-    // the scan cannot drift apart.
-    let kind = match crate::reconcile::wire::TombstoneKind::from_prefix(*prefix) {
-      Some(kind) => kind,
-      None => {
-        tracing::debug!(
-          kind = prefix,
-          "reconcile tombstone row skipped: unknown kind"
-        );
-        continue;
-      }
-    };
-    match kind {
-      crate::reconcile::wire::TombstoneKind::Leave => {
-        let record = match crate::identity::leave::LeaveRecordV1::decode(content) {
-          Ok(record) if record.node().as_str().as_bytes() == subject => record,
-          Ok(record) => {
-            tracing::debug!(
-              node = %record.node(),
-              "reconcile leave row skipped: subject mismatch"
-            );
-            continue;
-          }
-          Err(error) => {
-            tracing::debug!(kind = ?error.kind(), "reconcile leave row skipped: undecodable");
-            continue;
-          }
-        };
-        // A leave row is terminal evidence carried by its own
-        // signature: a failed signature (AuthenticationFailed from the
-        // strict verify) is an untrustworthy row — skip it, exactly
-        // like a corrupt row, instead of failing the batch. The
-        // evidence check inside the apply (the bound key mismatching
-        // the record's key, NotTrusted) is a policy refusal of the
-        // same class: the row is refused, the batch continues. Real
-        // store write faults still propagate.
-        if let Err(error) = record.verify() {
-          tracing::warn!(
-            node = %record.node(),
-            kind = ?error.kind(),
-            "reconcile leave row skipped: untrusted signature"
-          );
-          continue;
-        }
-        match apply_leave_record(
-          store, entropy, events, revision, &evidence, &record, source, runtime,
+    match row {
+      TombstoneRow::Leave(record) => {
+        apply_leave_row(
+          store,
+          entropy,
+          events,
+          revision,
+          &evidence,
+          &record,
+          source.zip(runtime),
         )
-        .await
-        {
-          Err(error) if error.kind() == crate::ErrorKind::NotTrusted => {
-            tracing::warn!(
-              node = %record.node(),
-              "reconcile leave row refused by policy: binding mismatch; skipping"
-            );
-          }
-          other => other?,
-        }
+        .await?;
       }
-      crate::reconcile::wire::TombstoneKind::Cleanup => {
-        let record = match crate::identity::cleanup::CleanupRecordV1::decode(content) {
-          Ok(record) if record.subject().as_str().as_bytes() == subject => record,
-          Ok(record) => {
-            tracing::debug!(
-              subject = %record.subject(),
-              "reconcile cleanup row skipped: subject mismatch"
-            );
-            continue;
-          }
-          Err(error) => {
-            tracing::debug!(kind = ?error.kind(), "reconcile cleanup row skipped: undecodable");
-            continue;
-          }
-        };
-        // A cleanup row, like a leave row, is terminal evidence carried
-        // by its own signature: a forged signature (AuthenticationFailed
-        // from the strict verify), a policy refusal (NotTrusted issuer or
-        // subject binding), or a divergent stored record over a different
-        // binding (Conflict) refuses the row — the batch continues, so one
-        // divergent record can never wedge the tombstone lane. Real store
-        // faults still propagate.
-        match apply_cleanup_record(store, entropy, events, revision, &evidence, &record).await {
-          Err(error)
-            if matches!(
-              error.kind(),
-              crate::ErrorKind::Conflict
-                | crate::ErrorKind::NotTrusted
-                | crate::ErrorKind::AuthenticationFailed
-            ) =>
-          {
-            tracing::warn!(
-              subject = %record.subject(),
-              kind = ?error.kind(),
-              "reconcile cleanup row refused: divergent or untrusted evidence; skipping"
-            );
-          }
-          other => other?,
-        }
+      TombstoneRow::Cleanup(record) => {
+        apply_cleanup_row(store, entropy, events, revision, &evidence, &record).await?;
       }
-      crate::reconcile::wire::TombstoneKind::Revocation => {
-        let record = match crate::identity::revocation::RevocationRecordV1::decode(content) {
-          Ok(record) if record.subject().as_str().as_bytes() == subject => record,
-          Ok(record) => {
-            tracing::debug!(
-              subject = %record.subject(),
-              "reconcile revocation row skipped: subject mismatch"
-            );
-            continue;
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile revocation row skipped: undecodable"
-            );
-            continue;
-          }
-        };
-        // A revocation row, like a leave row, is terminal evidence
-        // carried by its own signature: a forged signature
-        // (AuthenticationFailed from the strict verify), a policy refusal
-        // (NotTrusted issuer or subject binding), or a divergent stored
-        // record over a different binding (Conflict) refuses the row —
-        // the batch continues, so one divergent record can never wedge
-        // the tombstone lane. Real store faults still propagate.
-        match apply_revocation_record(
+      TombstoneRow::Revocation(record) => {
+        apply_revocation_row(
           store,
           entropy,
           events,
@@ -662,40 +781,9 @@ pub(crate) async fn apply_tombstone_rows(
           sessions,
           authorization,
         )
-        .await
-        {
-          Err(error)
-            if matches!(
-              error.kind(),
-              crate::ErrorKind::Conflict
-                | crate::ErrorKind::NotTrusted
-                | crate::ErrorKind::AuthenticationFailed
-            ) =>
-          {
-            tracing::warn!(
-              subject = %record.subject(),
-              kind = ?error.kind(),
-              "reconcile revocation row refused: divergent or untrusted evidence; skipping"
-            );
-          }
-          other => other?,
-        }
+        .await?;
       }
-      crate::reconcile::wire::TombstoneKind::Checkpoint => {
-        let checkpoint = match crate::identity::cleanup::CleanupCheckpointV1::decode(content) {
-          Ok(checkpoint) if subject == b"checkpoint" => checkpoint,
-          Ok(_) => {
-            tracing::debug!("reconcile checkpoint row skipped: subject mismatch");
-            continue;
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile checkpoint row skipped: undecodable"
-            );
-            continue;
-          }
-        };
+      TombstoneRow::Checkpoint(checkpoint) => {
         apply_checkpoint_record(store, entropy, &checkpoint).await?;
       }
     }
