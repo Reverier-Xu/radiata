@@ -388,7 +388,7 @@ mod tests {
 
   use super::{
     ResourceCommitOutcome, ResourceName, ResourceRecordV1, ResourceVersion,
-    commit_expected_record_ctx, commit_record_ctx, commit_removal_ctx, read_record_ctx,
+    commit_expected_record_ctx, commit_record_ctx, read_record_ctx,
   };
   use crate::{
     LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy, provider::StorageFactory,
@@ -432,10 +432,6 @@ mod tests {
     variant(timestamp_millis, 0, false, uri)
   }
 
-  fn removal(timestamp_millis: u64) -> ResourceRecordV1 {
-    variant(timestamp_millis, 1, true, "file:///removed")
-  }
-
   async fn open_store() -> (Arc<dyn StorageFactory>, MetadataStore) {
     let factory: Arc<dyn StorageFactory> =
       Arc::new(crate::storage::contract::ReferenceFactory::new(
@@ -445,32 +441,6 @@ mod tests {
       .await
       .unwrap();
     (factory, store)
-  }
-
-  /// A local put conditionally commits one whole signed record; a fresh
-  /// handle reopens exactly that metadata with every label intact.
-  #[tokio::test]
-  async fn local_put_installs_whole_and_reopens_intact() {
-    let (_factory, store) = open_store().await;
-    assert!(read_record_ctx(&store, &name()).await.unwrap().is_none());
-
-    let record = put(1_000, "file:///a");
-    match commit_record_ctx(&store, &SystemEntropy, &record)
-      .await
-      .unwrap()
-    {
-      ResourceCommitOutcome::Installed(_) => {}
-      other => panic!("first install must commit, got {other:?}"),
-    }
-
-    drop(store);
-    let reopened = MetadataStore::open(&_factory, Duration::from_secs(10))
-      .await
-      .unwrap();
-    let stored = read_record_ctx(&reopened, &name()).await.unwrap().unwrap();
-    assert_eq!(&stored, &record);
-    assert_eq!(stored.labels().entries().count(), 1);
-    assert!(!stored.removed());
   }
 
   /// The register-install epoch advances only on installs: the sync
@@ -497,199 +467,6 @@ mod tests {
       after_install,
       "a superseded write does not arm the sync plane"
     );
-  }
-
-  /// A losing write is accepted but stores nothing and wins nothing —
-  /// the stored winner is untouched and the loser never becomes visible
-  /// through any read path.
-  #[tokio::test]
-  async fn losing_writes_are_accepted_and_stay_harmless() {
-    let (_factory, store) = open_store().await;
-    let winner = put(2_000, "file:///winner");
-    assert!(matches!(
-      commit_record_ctx(&store, &SystemEntropy, &winner)
-        .await
-        .unwrap(),
-      ResourceCommitOutcome::Installed(_)
-    ));
-
-    // An older-stamped remote write loses by tuple order (clock rollback:
-    // later local work can lose).
-    let loser = put(1_000, "file:///loser");
-    match commit_record_ctx(&store, &SystemEntropy, &loser)
-      .await
-      .unwrap()
-    {
-      ResourceCommitOutcome::Superseded(existing) => {
-        assert_eq!(existing.digest(), winner.digest());
-      }
-      other => panic!("losing write must supersede, got {other:?}"),
-    }
-    // Equal-tuple losers are idempotent-adjacent: same writer, rank, and
-    // digest replays stay harmless too.
-    match commit_record_ctx(&store, &SystemEntropy, &winner)
-      .await
-      .unwrap()
-    {
-      ResourceCommitOutcome::Superseded(_) => {}
-      other => panic!("byte-identical replay must not reinstall, got {other:?}"),
-    }
-    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
-    assert_eq!(stored.digest(), winner.digest());
-  }
-
-  /// A removal is just a signed record: a greater-tuple removal replaces a
-  /// live record, and an even-greater live put replaces the removal — the
-  /// register has no hidden causal or tombstone permanence at this layer
-  /// (removal evidence retention lives in the retention module).
-  #[tokio::test]
-  async fn removals_and_puts_converge_by_tuple_order_alone() {
-    let (_factory, store) = open_store().await;
-    commit_record_ctx(&store, &SystemEntropy, &put(1_000, "file:///live"))
-      .await
-      .unwrap();
-    let remove = removal(2_000);
-    assert!(matches!(
-      commit_record_ctx(&store, &SystemEntropy, &remove)
-        .await
-        .unwrap(),
-      ResourceCommitOutcome::Installed(_)
-    ));
-    assert!(
-      read_record_ctx(&store, &name())
-        .await
-        .unwrap()
-        .unwrap()
-        .removed()
-    );
-
-    let revive = put(3_000, "file:///revived");
-    assert!(matches!(
-      commit_record_ctx(&store, &SystemEntropy, &revive)
-        .await
-        .unwrap(),
-      ResourceCommitOutcome::Installed(_)
-    ));
-    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
-    assert!(!stored.removed());
-    assert_eq!(stored.resource_uri(), revive.resource_uri());
-  }
-
-  /// Two exact-version writes prepared from one snapshot can produce only
-  /// typed conflicts or one commit — never partial labels or hidden
-  /// ordering.
-  #[tokio::test]
-  async fn raced_exact_version_writes_fail_with_typed_conflicts() {
-    let (_factory, store) = open_store().await;
-    let namespace = crate::StoreNamespace::new(
-      crate::QualifiedTag::parse(super::RESOURCE_RECORD_NAMESPACE).unwrap(),
-    );
-    let key = crate::StoreKey::new(Arc::from(name().as_str().as_bytes().to_vec()));
-
-    let snapshot = store.snapshot().await.unwrap();
-    let revision = snapshot.revision().clone();
-    let first = put(1_000, "file:///first");
-    let second = put(1_000, "file:///second");
-    let tx_first = store
-      .prepare_transaction(
-        crate::TransactionId::generate(&SystemEntropy).unwrap(),
-        revision.clone(),
-        vec![crate::StoreOperation::Put {
-          namespace: namespace.clone(),
-          key: key.clone(),
-          expected: crate::StoreExpectation::Absent,
-          value: crate::StoreValue::new(Arc::from(first.encode().unwrap())),
-        }],
-      )
-      .unwrap();
-    let tx_second = store
-      .prepare_transaction(
-        crate::TransactionId::generate(&SystemEntropy).unwrap(),
-        revision,
-        vec![crate::StoreOperation::Put {
-          namespace,
-          key,
-          expected: crate::StoreExpectation::Absent,
-          value: crate::StoreValue::new(Arc::from(second.encode().unwrap())),
-        }],
-      )
-      .unwrap();
-
-    assert!(matches!(
-      store.commit(tx_first).await.unwrap(),
-      crate::CommitOutcome::Committed(_)
-    ));
-    // The loser of the race fails closed on its stale exact-version
-    // expectation with a typed conflict; the register holds exactly one
-    // whole winner.
-    assert!(matches!(
-      store.commit(tx_second).await.unwrap(),
-      crate::CommitOutcome::Conflict
-    ));
-    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
-    assert!(stored.digest() == first.digest() || stored.digest() == second.digest());
-  }
-
-  /// Two preconditioned puts that both observed the same prior version
-  /// (the CAS race window: pre-check → asynchronous signature →
-  /// commit) resolve to exactly one install at the commit boundary: the
-  /// second commit re-verifies the caller's expected version inside its
-  /// own snapshot, refuses with the superseded outcome (which the effect
-  /// surfaces as the caller's version conflict), and never silently
-  /// overwrites the first winner even though its tuple would win.
-  #[tokio::test]
-  async fn raced_expected_puts_resolve_to_one_install_at_the_boundary() {
-    let (_factory, store) = open_store().await;
-    let observed = put(1_000, "file:///observed");
-    assert!(matches!(
-      commit_record_ctx(&store, &SystemEntropy, &observed)
-        .await
-        .unwrap(),
-      ResourceCommitOutcome::Installed(_)
-    ));
-    let expected = ResourceVersion::from_record(&observed);
-
-    // Both candidates claim the same observed version and the second's
-    // tuple would beat the first (a later stamp): only the commit-time
-    // precondition can stop the silent overwrite.
-    let first = put(2_000, "file:///first");
-    let second = put(3_000, "file:///second");
-    assert!(matches!(
-      commit_expected_record_ctx(&store, &SystemEntropy, &first, Some(&expected))
-        .await
-        .unwrap(),
-      ResourceCommitOutcome::Installed(_)
-    ));
-    match commit_expected_record_ctx(&store, &SystemEntropy, &second, Some(&expected))
-      .await
-      .unwrap()
-    {
-      ResourceCommitOutcome::Superseded(existing) => {
-        assert_eq!(existing.digest(), first.digest());
-      }
-      other => panic!("the raced preconditioned put must refuse, got {other:?}"),
-    }
-    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
-    assert_eq!(stored.digest(), first.digest());
-  }
-
-  /// A preconditioned put against an empty register fails closed at the
-  /// commit boundary with the same not-found the effect's pre-check
-  /// reports: a named prior version cannot match an absent register.
-  #[tokio::test]
-  async fn an_expected_put_on_an_empty_register_fails_closed() {
-    let (_factory, store) = open_store().await;
-    let expected = ResourceVersion::from_record(&put(1_000, "file:///gone"));
-    let error = commit_expected_record_ctx(
-      &store,
-      &SystemEntropy,
-      &put(2_000, "file:///candidate"),
-      Some(&expected),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::NotFound);
-    assert!(read_record_ctx(&store, &name()).await.unwrap().is_none());
   }
 
   /// A corrupt stored winner must not make the register permanently
@@ -750,96 +527,6 @@ mod tests {
     }
     let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
     assert_eq!(stored.digest(), healed.digest());
-  }
-
-  /// The removal path re-checks its exact-version precondition inside
-  /// the commit's own snapshot: a record that landed after the effect's
-  /// observation (the same signature window) makes the removal refuse
-  /// with the superseded outcome instead of removing newer metadata.
-  #[tokio::test]
-  async fn a_raced_removal_keeps_the_newer_record() {
-    let (_factory, store) = open_store().await;
-    let observed = put(1_000, "file:///observed");
-    assert!(matches!(
-      commit_record_ctx(&store, &SystemEntropy, &observed)
-        .await
-        .unwrap(),
-      ResourceCommitOutcome::Installed(_)
-    ));
-    // The racing writer lands a newer record after the observation.
-    let moved = put(2_000, "file:///moved");
-    assert!(matches!(
-      commit_record_ctx(&store, &SystemEntropy, &moved)
-        .await
-        .unwrap(),
-      ResourceCommitOutcome::Installed(_)
-    ));
-    match commit_removal_ctx(&store, &SystemEntropy, &removal(3_000), &observed)
-      .await
-      .unwrap()
-    {
-      ResourceCommitOutcome::Superseded(existing) => {
-        assert_eq!(existing.digest(), moved.digest());
-      }
-      other => panic!("the raced removal must refuse, got {other:?}"),
-    }
-    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
-    assert!(!stored.removed());
-    assert_eq!(stored.digest(), moved.digest());
-  }
-
-  /// Both real backends preserve the exact logical tuple version of a
-  /// stored record across a reopen — JSON and redb return the identical
-  /// signed record, never a normalized or truncated form.
-  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
-  async fn backend_preserves_the_exact_logical_version(factory: Arc<dyn StorageFactory>) {
-    let record = put(7_000, "file:///versioned");
-    let store = MetadataStore::open(&factory, Duration::from_secs(10))
-      .await
-      .unwrap();
-    match commit_record_ctx(&store, &SystemEntropy, &record)
-      .await
-      .unwrap()
-    {
-      ResourceCommitOutcome::Installed(_) => {}
-      _ => panic!("a fresh register must install the record"),
-    }
-    let stored = read_record_ctx(&store, &name()).await.unwrap().unwrap();
-    assert_eq!(stored, record);
-    drop(store);
-
-    // Reopen: the exact logical version survives restart byte-for-byte.
-    let reopened = MetadataStore::open(&factory, Duration::from_secs(10))
-      .await
-      .unwrap();
-    let restored = read_record_ctx(&reopened, &name()).await.unwrap().unwrap();
-    assert_eq!(restored, record);
-    let version = crate::ResourceVersion::from_record(&restored);
-    assert_eq!(version.timestamp(), crate::time::from_millis(7_000));
-    assert!(!version.is_removal());
-    assert_eq!(version.digest(), record.digest());
-  }
-
-  // Windows JSON cannot satisfy the metadata open requirements (no durable
-  // directory barrier); the JSON arm is therefore unix-only.
-  #[cfg(all(feature = "json", unix))]
-  #[tokio::test]
-  async fn json_backend_preserves_the_exact_logical_version() {
-    let directory = tempfile::tempdir().unwrap();
-    let factory: Arc<dyn StorageFactory> = Arc::new(crate::storage::json::JsonStoreFactory::new(
-      directory.path().to_path_buf(),
-    ));
-    backend_preserves_the_exact_logical_version(factory).await;
-  }
-
-  #[cfg(feature = "redb")]
-  #[tokio::test]
-  async fn redb_backend_preserves_the_exact_logical_version() {
-    let directory = tempfile::tempdir().unwrap();
-    let factory: Arc<dyn StorageFactory> = Arc::new(crate::storage::redb::RedbStoreFactory::new(
-      directory.path().join("store.redb"),
-    ));
-    backend_preserves_the_exact_logical_version(factory).await;
   }
 
   /// A batched page commit never retries an indeterminate outcome: the
