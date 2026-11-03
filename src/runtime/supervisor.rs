@@ -378,6 +378,17 @@ struct RuntimeSignals {
   ready: oneshot::Sender<()>,
 }
 
+/// The terminal phase one select arm decides: the reason the one shared
+/// shutdown sequence answers with, and the shutdown reply that triggered
+/// it. Only the explicit `Shutdown` command carries a reply — the
+/// active-leave and control-channel-closed exits have no caller waiting on
+/// a `ShutdownOutcome`, so the reply stays `None` and no handle is left
+/// hanging on one.
+struct TerminalPhase {
+  reason: ShutdownReason,
+  first_reply: Option<oneshot::Sender<ShutdownOutcome>>,
+}
+
 async fn supervise(
   dependencies: RuntimeDependencies,
   packets: (
@@ -395,8 +406,7 @@ async fn supervise(
   let (packet_tx, mut packet_rx) = packets;
   let mut tasks = JoinSet::<()>::new();
   let mut lifecycle = LifecyclePublisher::new(state);
-  lifecycle.publish(LifecycleSnapshot::running());
-  if ready.send(()).is_err() {
+  if !announce_running(&mut lifecycle, ready) {
     finish_shutdown(
       control,
       tasks,
@@ -433,36 +443,9 @@ async fn supervise(
       return;
     }
   };
-  // Any trace records still non-terminal from a previous incarnation
-  // terminate explicitly at startup: a restart never continues a body.
-  if let Some(context) = supervisor.dependencies.context.as_ref()
-    && let Err(error) = crate::routing::trace::terminate_stale(
-      context.store(),
-      supervisor.dependencies.entropy.as_ref(),
-      &crate::time::HostWallClock,
-    )
-    .await
-  {
-    tracing::warn!(kind = ?error.kind(), "stale trace termination failed");
-  }
-  // The periodic planes run OFF the select loop (audit 2026-10-09
-  // item 3): one long-lived recovery-observation worker (recovery tick
-  // plus the three retention sweeps) and one degree-maintenance worker,
-  // each owning its own timer, so slow storage or a slow policy no
-  // longer parks control-plane reads and packet admission behind a
-  // tick. Bounded accounting (audit item 4's lesson): exactly two tasks
-  // for the node's lifetime, aborted and awaited by the shutdown path —
-  // never one spawned task per tick.
-  let tick_workers = match supervisor.tick_state() {
-    Ok(ticks) => {
-      let ticks = std::sync::Arc::new(ticks);
-      vec![
-        tokio::spawn(super::recovery::run_recovery_worker(std::sync::Arc::clone(
-          &ticks,
-        ))),
-        tokio::spawn(super::degree::run_maintenance_worker(ticks)),
-      ]
-    }
+  terminate_stale_traces(&supervisor).await;
+  match spawn_tick_workers(&supervisor) {
+    Ok(workers) => supervisor.tick_workers = workers,
     Err(error) => {
       // Unreachable today: `Supervisor::new` already validated the
       // operation handles `tick_state` reads. A provisioning failure
@@ -482,8 +465,86 @@ async fn supervise(
       .await;
       return;
     }
-  };
-  supervisor.tick_workers = tick_workers;
+  }
+  let terminal = run_control_loop(
+    &mut supervisor,
+    &mut control,
+    &mut leave_complete,
+    &mut packet_rx,
+    &mut tasks,
+  )
+  .await;
+  // The one shutdown sequence runs here, once the loop has stopped serving
+  // arms: the supervisor releases its planes first so the teardown below
+  // awaits them, and the reason the loop returned with is the reason every
+  // queued reply answers.
+  let (dependencies, drained) = supervisor.into_dependencies();
+  finish_shutdown(
+    control,
+    tasks,
+    dependencies,
+    drained,
+    &mut lifecycle,
+    terminal.first_reply,
+    terminal.reason,
+  )
+  .await;
+}
+
+/// Publishes the running snapshot and hands the caller its ready signal: the
+/// node is observable as running before `start` returns, and a caller that
+/// already dropped the signal (a cancelled start) is reported so `supervise`
+/// runs the one shutdown sequence instead of serving arms no caller can
+/// reach.
+fn announce_running(lifecycle: &mut LifecyclePublisher, ready: oneshot::Sender<()>) -> bool {
+  lifecycle.publish(LifecycleSnapshot::running());
+  ready.send(()).is_ok()
+}
+
+/// Terminates any trace record still non-terminal from a previous
+/// incarnation: a restart never continues a body, so a record the previous
+/// process left open terminates explicitly here. A failure is diagnosed and
+/// startup continues — a stale record must never keep a node from running.
+async fn terminate_stale_traces(supervisor: &Supervisor) {
+  if let Some(context) = supervisor.dependencies.context.as_ref()
+    && let Err(error) = crate::routing::trace::terminate_stale(
+      context.store(),
+      supervisor.dependencies.entropy.as_ref(),
+      &crate::time::HostWallClock,
+    )
+    .await
+  {
+    tracing::warn!(kind = ?error.kind(), "stale trace termination failed");
+  }
+}
+
+/// Spawns the periodic planes OFF the select loop (audit 2026-10-09 item 3):
+/// one long-lived recovery-observation worker (recovery tick plus the three
+/// retention sweeps) and one degree-maintenance worker, each owning its own
+/// timer, so slow storage or a slow policy no longer parks control-plane
+/// reads and packet admission behind a tick. Bounded accounting (audit item
+/// 4's lesson): exactly two tasks for the node's lifetime, aborted and
+/// awaited by the shutdown path — never one spawned task per tick.
+fn spawn_tick_workers(supervisor: &Supervisor) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+  let ticks = std::sync::Arc::new(supervisor.tick_state()?);
+  Ok(vec![
+    tokio::spawn(super::recovery::run_recovery_worker(std::sync::Arc::clone(
+      &ticks,
+    ))),
+    tokio::spawn(super::degree::run_maintenance_worker(ticks)),
+  ])
+}
+
+/// The control loop: one select iteration serves exactly one ready arm, and
+/// the loop returns only when an arm reaches a terminal phase — a served
+/// command never leaves it. The packet plane's admission slot, handoff
+/// channel, and closed-channel flags are loop-local because they are this
+/// loop's own state machine, not the supervisor's.
+async fn run_control_loop(
+  supervisor: &mut Supervisor, control: &mut mpsc::Receiver<Control>,
+  leave_complete: &mut mpsc::Receiver<()>,
+  packet_rx: &mut mpsc::Receiver<crate::packet::OutboundRequest>, tasks: &mut JoinSet<()>,
+) -> TerminalPhase {
   // The packet admission plane (audit 2026-10-23 P1-5): target
   // resolution, descriptor validation, first-hop selection, and the route
   // record run in spawned admission tasks, never inline here — a
@@ -493,7 +554,7 @@ async fn supervise(
   // survives the move: the admission task records the route before it
   // hands the ready request back through the bounded channel below, and
   // only the loop (the pump `JoinSet`'s owner) spawns `run_outbound`.
-  let admission = PacketAdmission::new(&supervisor);
+  let admission = PacketAdmission::new(supervisor);
   let admission_permits = Arc::new(Semaphore::new(ADMISSION_CONCURRENCY));
   // The admission permit the packet arm holds while admitting: `None`
   // disables the arm (a saturated pool) until a running admission
@@ -520,79 +581,15 @@ async fn supervise(
     tokio::select! {
       message = control.recv() => {
         let Some(message) = message else {
-          break;
+          // The control channel closed: every handle is gone, so the node
+          // tears down with the explicit reason and no reply to answer.
+          return TerminalPhase {
+            reason: ShutdownReason::Explicit,
+            first_reply: None,
+          };
         };
-        match message {
-      Control::Shutdown { reply } => {
-        let (dependencies, drained) = supervisor.into_dependencies();
-        finish_shutdown(
-          control,
-          tasks,
-          dependencies,
-          drained,
-          &mut lifecycle,
-          Some(reply),
-          ShutdownReason::Explicit,
-        )
-        .await;
-        return;
-      }
-      Control::GetLocalNode { reply } => {
-        let result = supervisor.local_node().await;
-        let _ = reply.send(result);
-      }
-      Control::GetMember { node, reply } => {
-        let result = supervisor.member(node).await;
-        let _ = reply.send(result);
-      }
-      Control::GetRecovery { reply } => {
-        let _ = reply.send(Ok(supervisor.recovery_view()));
-      }
-      Control::GetConnectionDegree { reply } => {
-        let result = supervisor.connection_degree_view().await;
-        let _ = reply.send(result);
-      }
-      Control::PageMembers { cursor, limit, reply } => {
-        let result = supervisor.page_members(cursor, limit).await;
-        let _ = reply.send(result);
-      }
-      Control::SelectResources {
-        selector,
-        cursor,
-        limit,
-        reply,
-      } => {
-        let result = supervisor.select_resources(&selector, cursor, limit).await;
-        let _ = reply.send(result);
-      }
-      Control::GetResource { name, reply } => {
-        let result = supervisor.get_resource(&name).await;
-        let _ = reply.send(result);
-      }
-      Control::PageResources { cursor, limit, reply } => {
-        let result = supervisor.page_resources(cursor, limit).await;
-        let _ = reply.send(result);
-      }
-      Control::PageListeners { cursor, limit, reply } => {
-        let result = supervisor.page_listeners(cursor, limit).await;
-        let _ = reply.send(result);
-      }
-      Control::PageSessions { cursor, limit, reply } => {
-        let result = supervisor.page_sessions(cursor, limit).await;
-        let _ = reply.send(result);
-      }
-      Control::PageTopology { cursor, limit, reply } => {
-        let result = supervisor.page_topology(cursor, limit).await;
-        let _ = reply.send(result);
-      }
-      Control::PageTrust { cursor, limit, reply } => {
-        let result = supervisor.page_trust(cursor, limit).await;
-        let _ = reply.send(result);
-      }
-      Control::Observability { reply } => {
-        let result = supervisor.observability_snapshot(&tasks).await;
-        let _ = reply.send(result);
-      }
+        if let Some(terminal) = serve_control_command(supervisor, tasks, message).await {
+          return terminal;
         }
       }
       request = packet_rx.recv(), if packets_open && packet_permit.is_some() => {
@@ -606,37 +603,7 @@ async fn supervise(
         let Some(permit) = packet_permit.take() else {
           continue;
         };
-        // The identity context (and the store handle it carries) is
-        // cloned per admission and lives only inside the admission task:
-        // a long-lived clone here would survive the shutdown path's
-        // storage drain (audit 2026-10-23 P1-10).
-        let Some(context) = supervisor.dependencies.context.clone() else {
-          request.reject(crate::ErrorKind::Internal);
-          continue;
-        };
-        let admission = admission.clone();
-        let pump = pump_tx.clone();
-        tasks.spawn(async move {
-          // The permit is the admission slot and lives as long as the
-          // resolution work, so `ADMISSION_CONCURRENCY` bounds the
-          // in-flight admissions regardless of what a policy awaits.
-          let _permit = permit;
-          match admission.admit(&context, request).await {
-            // The recorded route returns to the loop, which owns the
-            // pump `JoinSet` and spawns `run_outbound`.
-            Ok(Some(handoff)) => {
-              if let Err(mpsc::error::SendError(handoff)) = pump.send(handoff).await {
-                // The loop is gone: the request must observe a typed
-                // shutdown terminal, never a dangling admission decision.
-                admission.reject_shutdown(handoff);
-              }
-            }
-            Ok(None) => {}
-            Err(error) => {
-              tracing::warn!(kind = ?error.kind(), "packet admission failed");
-            }
-          }
-        });
+        admit_packet(supervisor, &admission, &pump_tx, tasks, permit, request);
       }
       // A finishing admission releases its permit: this arm re-enables
       // the packet arm without parking any other arm, so control reads
@@ -654,75 +621,207 @@ async fn supervise(
           pump_open = false;
           continue;
         };
-        let local = supervisor.packet.local().clone();
-        let routes = supervisor.dependencies.routes.clone();
-        let events = Arc::clone(&supervisor.dependencies.events);
-        // Core-internal control traffic stays out of the durable trace
-        // store: its volume is a runtime implementation detail, not
-        // caller evidence. The pump simply holds no sink for it, and the
-        // record flag carries the same exclusion to the read loop's
-        // late-failure revision path.
-        let trace = if handoff.request.internal {
-          None
-        } else {
-          Some(supervisor.trace_sink.clone())
-        };
-        tasks.spawn(async move {
-          run_outbound(
-            handoff.entry,
-            local,
-            handoff.request,
-            routes,
-            handoff.force_routed,
-            trace,
-            events,
-          )
-          .await;
-        });
+        pump_outbound(supervisor, tasks, handoff);
       }
-      finished = tasks.join_next(), if !tasks.is_empty() => {
-        // Reap finished packet tasks (an admission or its pump) as they
-        // complete instead of letting their handles accumulate in the
-        // JoinSet until shutdown (audit 2026-10-09, item 4): the set
-        // stays bounded by the live admission-plus-pump count. A join
-        // error (a panicked or aborted task) stays visible as a
-        // diagnostic.
-        if let Some(Err(error)) = finished {
-          tracing::warn!(%error, "packet task exited abnormally");
-        }
-      }
+      finished = tasks.join_next(), if !tasks.is_empty() => reap_packet_task(finished),
       signal = leave_complete.recv(), if leave_signals_open => {
         match signal {
           Some(()) => {
-            let (dependencies, drained) = supervisor.into_dependencies();
-            finish_shutdown(
-              control,
-              tasks,
-              dependencies,
-              drained,
-              &mut lifecycle,
-              None,
-              ShutdownReason::ActiveLeave,
-            )
-            .await;
-            return;
+            return TerminalPhase {
+              reason: ShutdownReason::ActiveLeave,
+              first_reply: None,
+            };
           }
           None => leave_signals_open = false,
         }
       }
     }
   }
-  let (dependencies, drained) = supervisor.into_dependencies();
-  finish_shutdown(
-    control,
-    tasks,
-    dependencies,
-    drained,
-    &mut lifecycle,
-    None,
-    ShutdownReason::Explicit,
-  )
-  .await;
+}
+
+/// Serves one control command inline, as the loop's contract requires: the
+/// calling handle awaits its oneshot before returning, so every command is
+/// answered before the loop takes its next arm. Returns the terminal phase
+/// only for `Shutdown`; every read verb answers its reply and returns
+/// `None`, leaving the loop serving.
+async fn serve_control_command(
+  supervisor: &mut Supervisor, tasks: &JoinSet<()>, message: Control,
+) -> Option<TerminalPhase> {
+  match message {
+    Control::Shutdown { reply } => {
+      return Some(TerminalPhase {
+        reason: ShutdownReason::Explicit,
+        first_reply: Some(reply),
+      });
+    }
+    Control::GetLocalNode { reply } => {
+      let result = supervisor.local_node().await;
+      let _ = reply.send(result);
+    }
+    Control::GetMember { node, reply } => {
+      let result = supervisor.member(node).await;
+      let _ = reply.send(result);
+    }
+    Control::GetRecovery { reply } => {
+      let _ = reply.send(Ok(supervisor.recovery_view()));
+    }
+    Control::GetConnectionDegree { reply } => {
+      let result = supervisor.connection_degree_view().await;
+      let _ = reply.send(result);
+    }
+    Control::PageMembers {
+      cursor,
+      limit,
+      reply,
+    } => {
+      let result = supervisor.page_members(cursor, limit).await;
+      let _ = reply.send(result);
+    }
+    Control::SelectResources {
+      selector,
+      cursor,
+      limit,
+      reply,
+    } => {
+      let result = supervisor.select_resources(&selector, cursor, limit).await;
+      let _ = reply.send(result);
+    }
+    Control::GetResource { name, reply } => {
+      let result = supervisor.get_resource(&name).await;
+      let _ = reply.send(result);
+    }
+    Control::PageResources {
+      cursor,
+      limit,
+      reply,
+    } => {
+      let result = supervisor.page_resources(cursor, limit).await;
+      let _ = reply.send(result);
+    }
+    Control::PageListeners {
+      cursor,
+      limit,
+      reply,
+    } => {
+      let result = supervisor.page_listeners(cursor, limit).await;
+      let _ = reply.send(result);
+    }
+    Control::PageSessions {
+      cursor,
+      limit,
+      reply,
+    } => {
+      let result = supervisor.page_sessions(cursor, limit).await;
+      let _ = reply.send(result);
+    }
+    Control::PageTopology {
+      cursor,
+      limit,
+      reply,
+    } => {
+      let result = supervisor.page_topology(cursor, limit).await;
+      let _ = reply.send(result);
+    }
+    Control::PageTrust {
+      cursor,
+      limit,
+      reply,
+    } => {
+      let result = supervisor.page_trust(cursor, limit).await;
+      let _ = reply.send(result);
+    }
+    Control::Observability { reply } => {
+      let result = supervisor.observability_snapshot(tasks).await;
+      let _ = reply.send(result);
+    }
+  }
+  None
+}
+
+/// Hands one queued packet command to a spawned admission task: the permit
+/// is the admission slot and lives as long as the resolution work, so
+/// `ADMISSION_CONCURRENCY` bounds the in-flight admissions regardless of
+/// what a caller-supplied policy awaits, and the recorded route returns to
+/// the loop through the pump channel because only the loop (the pump set's
+/// owner) spawns `run_outbound`. A request whose identity context is gone is
+/// rejected in place with the internal kind, so no caller is left without a
+/// terminal decision.
+fn admit_packet(
+  supervisor: &Supervisor, admission: &PacketAdmission, pump_tx: &mpsc::Sender<PumpHandoff>,
+  tasks: &mut JoinSet<()>, permit: OwnedSemaphorePermit, request: crate::packet::OutboundRequest,
+) {
+  // The identity context (and the store handle it carries) is cloned per
+  // admission and lives only inside the admission task: a long-lived clone
+  // here would survive the shutdown path's storage drain (audit 2026-10-23
+  // P1-10).
+  let Some(context) = supervisor.dependencies.context.clone() else {
+    request.reject(crate::ErrorKind::Internal);
+    return;
+  };
+  let admission = admission.clone();
+  let pump = pump_tx.clone();
+  tasks.spawn(async move {
+    // The permit is the admission slot and lives as long as the resolution
+    // work, so `ADMISSION_CONCURRENCY` bounds the in-flight admissions
+    // regardless of what a policy awaits.
+    let _permit = permit;
+    match admission.admit(&context, request).await {
+      // The recorded route returns to the loop, which owns the pump
+      // `JoinSet` and spawns `run_outbound`.
+      Ok(Some(handoff)) => {
+        if let Err(mpsc::error::SendError(handoff)) = pump.send(handoff).await {
+          // The loop is gone: the request must observe a typed shutdown
+          // terminal, never a dangling admission decision.
+          admission.reject_shutdown(handoff);
+        }
+      }
+      Ok(None) => {}
+      Err(error) => {
+        tracing::warn!(kind = ?error.kind(), "packet admission failed");
+      }
+    }
+  });
+}
+
+/// Spawns the outbound pump for one admitted packet: the route record already
+/// landed in the admission task (record-before-pump), so the pump only runs
+/// the request under the loop's task set. Core-internal control traffic stays
+/// out of the durable trace store — its volume is a runtime implementation
+/// detail, not caller evidence — so the pump holds no sink for it, and the
+/// record flag carries the same exclusion to the read loop's late-failure
+/// revision path.
+fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: PumpHandoff) {
+  let local = supervisor.packet.local().clone();
+  let routes = supervisor.dependencies.routes.clone();
+  let events = Arc::clone(&supervisor.dependencies.events);
+  let trace = if handoff.request.internal {
+    None
+  } else {
+    Some(supervisor.trace_sink.clone())
+  };
+  tasks.spawn(async move {
+    run_outbound(
+      handoff.entry,
+      local,
+      handoff.request,
+      routes,
+      handoff.force_routed,
+      trace,
+      events,
+    )
+    .await;
+  });
+}
+
+/// Reaps one finished packet task (an admission or its pump) as it completes
+/// instead of letting its handle accumulate in the task set until shutdown
+/// (audit 2026-10-09, item 4): the set stays bounded by the live
+/// admission-plus-pump count, and a join error (a panicked or aborted task)
+/// stays visible as a diagnostic.
+fn reap_packet_task(finished: Option<std::result::Result<(), tokio::task::JoinError>>) {
+  if let Some(Err(error)) = finished {
+    tracing::warn!(%error, "packet task exited abnormally");
+  }
 }
 
 /// The shutdown sequence shared by the explicit, fatal, and active-leave
