@@ -201,47 +201,96 @@ fn take_commit_failure(transaction: &TransactionId) -> Option<redb::CommitError>
 }
 
 /// Test-only scan-failure injection for the backfill regression (audit
-/// 2026-10-23 P2-9): armed as the number of entries the scan may yield
-/// before failing, and consumed one-shot by the first scan that reaches
-/// the threshold, so the armed fault never leaks into a later open.
-/// `usize::MAX` disarms. Mirrors the crash-hook and landing-hold
-/// pattern: test builds only.
-#[cfg(test)]
-static BACKFILL_SCAN_FAULT_AFTER: std::sync::atomic::AtomicUsize =
-  std::sync::atomic::AtomicUsize::new(usize::MAX);
-
-#[cfg(test)]
-pub(crate) fn arm_backfill_scan_fault(after: usize) {
-  BACKFILL_SCAN_FAULT_AFTER.store(after, std::sync::atomic::Ordering::SeqCst);
+/// 2026-10-23 P2-9), owned by the one factory that armed it: armed as
+/// the number of entries the scan may yield before failing, and
+/// consumed one-shot by the first scan of an open on that factory that
+/// reaches the threshold, so the fault can never leak into another
+/// test's open. `usize::MAX` disarms. The threshold is compiled only
+/// into test builds; production carries the zero-sized disarmed shape,
+/// so the open path keeps no extra branch or field weight. Mirrors the
+/// crash-hook and landing-hold pattern: test builds only.
+#[derive(Clone)]
+struct BackfillScanFault {
+  /// The armed threshold, `usize::MAX` when disarmed. Shared through an
+  /// `Arc` so the open's blocking task observes and disarms this
+  /// factory's own fault rather than a copy that would fire again on a
+  /// later open.
+  #[cfg(test)]
+  after: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[cfg(test)]
-fn backfill_scan_fault(scanned: usize) -> Result<()> {
-  use std::sync::atomic::Ordering;
-  if scanned < BACKFILL_SCAN_FAULT_AFTER.load(Ordering::SeqCst) {
-    return Ok(());
+impl BackfillScanFault {
+  /// The disarmed fault every production factory and every unarmed test
+  /// factory carries.
+  fn disarmed() -> Self {
+    Self {
+      #[cfg(test)]
+      after: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+    }
   }
-  BACKFILL_SCAN_FAULT_AFTER.store(usize::MAX, Ordering::SeqCst);
-  Err(Error::provider(
-    ProviderErrorKind::Io,
-    ProviderErrorContext::StorageOpen,
-  ))
-}
 
-#[cfg(not(test))]
-#[inline(always)]
-fn backfill_scan_fault(_scanned: usize) -> Result<()> {
-  Ok(())
+  /// Arms the one-shot fault to fail the scan once it has yielded
+  /// `after` entries.
+  #[cfg(test)]
+  fn armed(after: usize) -> Self {
+    Self {
+      after: Arc::new(std::sync::atomic::AtomicUsize::new(after)),
+    }
+  }
+
+  /// Consults the fault at the top of one scan iteration: an armed
+  /// threshold fails the open typed and disarms itself, so the next
+  /// scan on the same factory runs clean. The non-test body is just
+  /// `Ok(())`, so the production open path carries no branch.
+  fn check(&self, _scanned: usize) -> Result<()> {
+    #[cfg(test)]
+    self.check_armed(_scanned)?;
+    Ok(())
+  }
+
+  /// The test-build half of [`BackfillScanFault::check`]: fires once
+  /// the scan reaches the armed count and disarms itself.
+  #[cfg(test)]
+  fn check_armed(&self, scanned: usize) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    if scanned < self.after.load(Ordering::SeqCst) {
+      return Ok(());
+    }
+    self.after.store(usize::MAX, Ordering::SeqCst);
+    Err(Error::provider(
+      ProviderErrorKind::Io,
+      ProviderErrorContext::StorageOpen,
+    ))
+  }
 }
 
 /// A factory for redb stores rooted at one database file.
 pub(crate) struct RedbStoreFactory {
   path: PathBuf,
+  /// The backfill scan fault this factory owns: disarmed in production
+  /// (a zero-sized field), armed only through
+  /// [`RedbStoreFactory::with_backfill_scan_fault`] in test builds.
+  backfill_scan_fault: BackfillScanFault,
 }
 
 impl RedbStoreFactory {
   pub(crate) fn new(path: PathBuf) -> Self {
-    Self { path }
+    Self {
+      path,
+      backfill_scan_fault: BackfillScanFault::disarmed(),
+    }
+  }
+
+  /// Builds a factory whose next backfill scan fails once it has
+  /// yielded `after` entries (audit 2026-10-23 P2-9). The fault lives
+  /// on this factory alone, so a concurrent test's open can never
+  /// consume it.
+  #[cfg(test)]
+  pub(crate) fn with_backfill_scan_fault(path: PathBuf, after: usize) -> Self {
+    Self {
+      path,
+      backfill_scan_fault: BackfillScanFault::armed(after),
+    }
   }
 
   fn capabilities() -> StoreCapabilities {
@@ -270,6 +319,7 @@ impl StorageFactory for RedbStoreFactory {
         ));
       }
       let path = self.path.clone();
+      let backfill_scan_fault = self.backfill_scan_fault.clone();
       let database = tokio::task::spawn_blocking(move || {
         Database::create(&path)
           .map_err(|error| map_database_error(error, ProviderErrorContext::StorageOpen))
@@ -280,7 +330,7 @@ impl StorageFactory for RedbStoreFactory {
       let init_database = Arc::clone(&database);
       tokio::task::spawn_blocking(move || {
         initialize(&init_database)?;
-        backfill_value_digests(&init_database)
+        backfill_value_digests(&init_database, &backfill_scan_fault)
       })
       .await
       .map_err(|_| internal(ProviderErrorContext::StorageOpen))??;
@@ -896,8 +946,10 @@ fn initialize(database: &Database) -> Result<()> {
 /// digest table existed. One write transaction over the whole table: a
 /// legacy file upgrades transparently on its first open, and a crash
 /// leaves the file at the complete old or new state. Fresh files find
-/// nothing to backfill.
-fn backfill_value_digests(database: &Database) -> Result<()> {
+/// nothing to backfill. The factory's scan fault is consulted at the
+/// top of every iteration, so a test can fail the open between two
+/// entries.
+fn backfill_value_digests(database: &Database, scan_fault: &BackfillScanFault) -> Result<()> {
   let mut write = database
     .begin_write()
     .map_err(|error| map_transaction_error(error, ProviderErrorContext::StorageOpen))?;
@@ -921,7 +973,7 @@ fn backfill_value_digests(database: &Database) -> Result<()> {
     // commits, so a partial backfill can never pose as a completed
     // upgrade (audit 2026-10-23 P2-9).
     loop {
-      backfill_scan_fault(scanned)?;
+      scan_fault.check(scanned)?;
       let entry = cursor
         .next()
         .transpose()
@@ -1219,8 +1271,8 @@ mod followup_tests {
   use tempfile::TempDir;
 
   use super::{
-    DIGESTS_TABLE, ENTRIES_TABLE, LandingHold, RedbStoreFactory, arm_backfill_scan_fault,
-    composite_prefix, landing_hold_reached_by,
+    DIGESTS_TABLE, ENTRIES_TABLE, LandingHold, RedbStoreFactory, composite_prefix,
+    landing_hold_reached_by,
   };
   use crate::{
     CommitOutcome, ErrorKind, ReconcileOutcome, StoreExpectation, StoreOperation,
@@ -1260,8 +1312,7 @@ mod followup_tests {
     // The scan fails after the first legacy entry: the open must fail
     // with the mapped iterator error instead of succeeding over a
     // partial scan.
-    arm_backfill_scan_fault(1);
-    let factory = RedbStoreFactory::new(path.clone());
+    let factory = RedbStoreFactory::with_backfill_scan_fault(path.clone(), 1);
     let error = factory
       .open(StoreRequirements::metadata())
       .await
