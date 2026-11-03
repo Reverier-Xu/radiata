@@ -208,6 +208,10 @@ jobs:
         id: test
         run: cargo +stable test --workspace --all-features --locked
 
+      - name: cargo doc
+        id: doc
+        run: cargo +stable doc --no-deps --all-features --locked
+
       - name: quality attestation
         if: always()
         shell: bash
@@ -215,6 +219,7 @@ jobs:
           CHECK: ${{ steps.check.outcome }}
           CLIPPY: ${{ steps.clippy.outcome }}
           TEST: ${{ steps.test.outcome }}
+          DOC: ${{ steps.doc.outcome }}
           JOB_STATUS: ${{ job.status }}
           STARTED: ${{ steps.start.outputs.started }}
         run: |
@@ -229,7 +234,8 @@ jobs:
           [ "$JOB_STATUS" = "cancelled" ] && uninterrupted=false
           result=fail
           if [ "$CHECK" = "success" ] && [ "$CLIPPY" = "success" ] \
-            && [ "$TEST" = "success" ] && [ "$uninterrupted" = "true" ]; then
+            && [ "$TEST" = "success" ] && [ "$DOC" = "success" ] \
+            && [ "$uninterrupted" = "true" ]; then
             result=pass
           fi
           printf '{"schema":"radiata.woooo.tech/schemas/test-attestation","commit":"%s","lock_digest":"%s","provider_run_id":"%s","attempt":"%s","job":"stable","target":"quality-stable","budget_seconds":0,"duration_seconds":%s,"uninterrupted":%s,"retry":"complete","predecessor":"","result":"%s"}\n' \
