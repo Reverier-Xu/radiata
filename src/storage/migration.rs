@@ -555,6 +555,30 @@ mod tests {
     )
   }
 
+  /// One compiled storage backend under test. The backend dimension is
+  /// this table alone, so a new backend is one row here rather than a new
+  /// copy of every migration test; the label names the backend in every
+  /// assertion message and the factory opens a fresh store for it.
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
+  struct BackendCase {
+    label: &'static str,
+    factory: fn() -> (Option<tempfile::TempDir>, Arc<dyn StorageFactory>),
+  }
+
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
+  const BACKEND_CASES: &[BackendCase] = &[
+    #[cfg(all(feature = "json", unix))]
+    BackendCase {
+      label: "json",
+      factory: json_factory,
+    },
+    #[cfg(feature = "redb")]
+    BackendCase {
+      label: "redb",
+      factory: redb_factory,
+    },
+  ];
+
   /// The open-time gate: while the production chain has no edges, a
   /// fresh store opens without any schema write (the absent record is
   /// the implicit baseline) and a reopen is equally quiet.
@@ -624,9 +648,9 @@ mod tests {
   /// schema record names a version outside the production chain fails
   /// closed there too, before any pending record is discovered.
   #[cfg(any(all(feature = "json", unix), feature = "redb"))]
-  async fn pending_recovery_rejects_a_schema_version_outside_the_chain(
-    factory: Arc<dyn StorageFactory>,
-  ) {
+  async fn pending_recovery_rejects_a_schema_version_outside_the_chain(case: &BackendCase) {
+    let backend = case.label;
+    let (_dir, factory) = (case.factory)();
     // Commit a foreign schema record through the raw storage before the
     // metadata store ever opens.
     let raw = factory
@@ -650,10 +674,13 @@ mod tests {
       }],
     )
     .unwrap();
-    assert!(matches!(
-      raw.commit(transaction).await.unwrap(),
-      crate::CommitOutcome::Committed(_)
-    ));
+    assert!(
+      matches!(
+        raw.commit(transaction).await.unwrap(),
+        crate::CommitOutcome::Committed(_)
+      ),
+      "{backend}: the foreign schema record must commit"
+    );
     drop(raw);
     let error = crate::storage::MetadataStore::open_pending_recovered(
       &factory,
@@ -662,21 +689,19 @@ mod tests {
     )
     .await
     .unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::UnsupportedSchema);
+    assert_eq!(
+      error.kind(),
+      crate::ErrorKind::UnsupportedSchema,
+      "{backend}: pending recovery must reject a schema version outside the chain"
+    );
   }
 
-  #[cfg(all(feature = "json", unix))]
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   #[tokio::test]
-  async fn pending_recovery_rejects_a_schema_version_outside_the_chain_json() {
-    let (_dir, factory) = json_factory();
-    pending_recovery_rejects_a_schema_version_outside_the_chain(factory).await;
-  }
-
-  #[cfg(feature = "redb")]
-  #[tokio::test]
-  async fn pending_recovery_rejects_a_schema_version_outside_the_chain_redb() {
-    let (_dir, factory) = redb_factory();
-    pending_recovery_rejects_a_schema_version_outside_the_chain(factory).await;
+  async fn pending_recovery_rejects_a_schema_version_outside_the_chain_per_backend() {
+    for case in BACKEND_CASES {
+      pending_recovery_rejects_a_schema_version_outside_the_chain(case).await;
+    }
   }
 
   #[tokio::test]
@@ -762,15 +787,25 @@ mod tests {
   }
 
   #[cfg(any(all(feature = "json", unix), feature = "redb"))]
-  async fn edges_apply_atomically_and_replay_idempotently(factory: Arc<dyn StorageFactory>) {
+  async fn edges_apply_atomically_and_replay_idempotently(case: &BackendCase) {
+    let backend = case.label;
+    let (_dir, factory) = (case.factory)();
     let storage: Arc<dyn Storage> =
       Arc::from(factory.open(StoreRequirements::metadata()).await.unwrap());
     seed_legacy(&*storage).await;
 
     let registry = registry_two_edges();
     let outcome = registry.ensure_schema(&*storage).await.unwrap();
-    assert_eq!(outcome, SchemaOutcome::Migrated { edges: 2 });
-    assert_eq!(read_schema(&*storage).await.as_deref(), Some(V3));
+    assert_eq!(
+      outcome,
+      SchemaOutcome::Migrated { edges: 2 },
+      "{backend}: both edges must apply"
+    );
+    assert_eq!(
+      read_schema(&*storage).await.as_deref(),
+      Some(V3),
+      "{backend}: the schema record must reach the chain target"
+    );
 
     // The legacy record moved through both edges completely; no mixed
     // state exists.
@@ -782,7 +817,8 @@ mod tests {
         .get(&legacy, &util::key(b"record"))
         .await
         .unwrap()
-        .is_none()
+        .is_none(),
+      "{backend}: the removed legacy record must be gone"
     );
     assert_eq!(
       snapshot
@@ -791,7 +827,8 @@ mod tests {
         .unwrap()
         .unwrap()
         .as_bytes(),
-      b"v2:payload:final"
+      b"v2:payload:final",
+      "{backend}: the migrated record must carry both transforms"
     );
     drop(snapshot);
 
@@ -799,16 +836,20 @@ mod tests {
     let revision_before = storage.snapshot().await.unwrap().revision().clone();
     assert_eq!(
       registry.ensure_schema(&*storage).await.unwrap(),
-      SchemaOutcome::Current
+      SchemaOutcome::Current,
+      "{backend}: replay of the exact registry must be a no-op"
     );
     assert_eq!(
       storage.snapshot().await.unwrap().revision(),
-      &revision_before
+      &revision_before,
+      "{backend}: replay must not advance the revision"
     );
   }
 
   #[cfg(any(all(feature = "json", unix), feature = "redb"))]
-  async fn older_reader_and_digest_mismatch_fail_closed(factory: Arc<dyn StorageFactory>) {
+  async fn older_reader_and_digest_mismatch_fail_closed(case: &BackendCase) {
+    let backend = case.label;
+    let (_dir, factory) = (case.factory)();
     let storage: Arc<dyn Storage> =
       Arc::from(factory.open(StoreRequirements::metadata()).await.unwrap());
     seed_legacy(&*storage).await;
@@ -819,10 +860,15 @@ mod tests {
     // store's v3 schema and must refuse without mutating anything.
     let older = registry_one_edge();
     let error = older.ensure_schema(&*storage).await.unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::UnsupportedSchema);
+    assert_eq!(
+      error.kind(),
+      crate::ErrorKind::UnsupportedSchema,
+      "{backend}: an older reader must reject the newer schema"
+    );
     assert_eq!(
       storage.snapshot().await.unwrap().revision(),
-      &revision_before
+      &revision_before,
+      "{backend}: the older reader must not mutate the store"
     );
 
     // Implementation digest mismatch: same tags, different transform
@@ -836,39 +882,32 @@ mod tests {
     );
     let forged_registry = MigrationRegistry::new(BASE_VERSION, vec![forged]).unwrap();
     let error = forged_registry.ensure_schema(&*storage).await.unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::UnsupportedSchema);
+    assert_eq!(
+      error.kind(),
+      crate::ErrorKind::UnsupportedSchema,
+      "{backend}: a digest mismatch must fail closed"
+    );
     assert_eq!(
       storage.snapshot().await.unwrap().revision(),
-      &revision_before
+      &revision_before,
+      "{backend}: a digest mismatch must not mutate the store"
     );
   }
 
-  #[cfg(all(feature = "json", unix))]
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   #[tokio::test]
-  async fn migration_edges_apply_atomically_and_replay_idempotently_json() {
-    let (_dir, factory) = json_factory();
-    edges_apply_atomically_and_replay_idempotently(factory).await;
+  async fn migration_edges_apply_atomically_and_replay_idempotently_per_backend() {
+    for case in BACKEND_CASES {
+      edges_apply_atomically_and_replay_idempotently(case).await;
+    }
   }
 
-  #[cfg(feature = "redb")]
+  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
   #[tokio::test]
-  async fn migration_edges_apply_atomically_and_replay_idempotently_redb() {
-    let (_dir, factory) = redb_factory();
-    edges_apply_atomically_and_replay_idempotently(factory).await;
-  }
-
-  #[cfg(all(feature = "json", unix))]
-  #[tokio::test]
-  async fn migration_older_reader_and_digest_mismatch_fail_closed_json() {
-    let (_dir, factory) = json_factory();
-    older_reader_and_digest_mismatch_fail_closed(factory).await;
-  }
-
-  #[cfg(feature = "redb")]
-  #[tokio::test]
-  async fn migration_older_reader_and_digest_mismatch_fail_closed_redb() {
-    let (_dir, factory) = redb_factory();
-    older_reader_and_digest_mismatch_fail_closed(factory).await;
+  async fn migration_older_reader_and_digest_mismatch_fail_closed_per_backend() {
+    for case in BACKEND_CASES {
+      older_reader_and_digest_mismatch_fail_closed(case).await;
+    }
   }
 }
 
