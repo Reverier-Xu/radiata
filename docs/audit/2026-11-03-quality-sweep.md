@@ -50,13 +50,75 @@
 
 ## 未处理 / 推迟
 
-- **P2**：资源 removal retention 与 cap 仍是硬编码常量（未加 `NodeConfig` 旋钮）。
-- **P2**：`start_recovery()` 只强制一轮，不重置退避指数；CI 仍无无条件收敛上界。
+本轮登记的四条残余已在同日第二轮收尾（见下节），此处只保留仍未处理的条目。
+
 - **P2**：`reconcile/plane.rs::tick`、`runtime/supervisor.rs::supervise`、`membership/sync.rs::apply_tombstone_rows` 的拆分，以及 `EventHub`/tombstone GC 的模块迁移，推迟到 0.1.0 之后。
-- **已知残余（资源毒行）**：自愈只覆盖 page apply。本地 `read_record_ctx`、`commit_expected_record_ctx`、`commit_removal_ctx` 仍会对坏行报错，直到某次 peer page 覆盖它；若坏行本身是更高版本的有效记录，写入方会在下一次发布/反熵中恢复它。
-- **已知残余（描述符毒行）**：坏行按 absent 处理后，一个损坏的 removal 描述符可能被更旧的 live 行覆盖（复活）。这是 "corrupt = absent" 的固有代价，未额外加墓碑保护。
-- **已知残余（桥探针）**：one-shot 探针从"未直连成员"中均匀随机选取，可能落在同侧 peer；该边保留且节点在其会话退役前不再探针。需要保证跨分区桥的运营者应显式 `node.connect`。
-- **线格式破坏**：limit 协商删除是 pre-0.1.0 的 offer/selection 线格式变更，pre-limit 二进制无法与 post-limit 二进制握手；`tests/mixed_versions.rs` 的"旧版本"fixture 仍用当前 registry 构造，不模拟真实的旧二进制。
+- **已知残余（描述符毒行）**：坏行按 absent 处理后，一个损坏的 removal 描述符可能被更旧的 live 行覆盖（复活）。这是 "corrupt = absent" 的固有代价，未额外加墓碑保护；修复它需要为坏行写入一条墓碑，而坏行的 revision 本身不可知，等于凭空造证据。
+- **已知残余（资源毒行）**：plain put 现在能本地自愈（见下节），但坏行本身仍不能被读取或删除——读取报解码错误（不伪造 absent），removal 无法从无法解码的内容构造。运营者的补救是先 plain put 覆盖。
+- **无 CI 无条件收敛上界**：`start_recovery()` 现在真的强制一轮并重置节奏（见下节），但 CI 仍没有"任意配置下必收敛"的上界断言。
+
+## 残余问题收尾（同日第二轮）
+
+### 新发现 N1（P1，本轮修复）
+
+原审计把该条记为"只强制一轮，不重置退避指数"，实测是**零轮**：
+
+`RecoveryController::immediate` 只做 `last_attempt_at = now - 1`，而 `due()` 的判据是
+`now >= last_attempt_at + backoff_seconds(now)`，`backoff_seconds` 在未到期时返回
+`scheduled_backoff`（默认初值 2 s，加倍至 5 min）。于是命令只把 deadline 提前 1 秒，
+周期不会跑。探针测试（`RecoveryPolicy::new(64, 2, 300)`，t=100 走完第一步后
+`immediate(101)`）实测 `due(101)=false`、`due(102)=false`、`next_attempt_at` 仍为 104。
+
+既有测试 `recovery_immediate_forces_one_cycle` 没暴露它：该测试的控制器从未 step 过
+（`last_attempt_at == 0`），任何 due-check 都通过，所以命令看起来生效。
+
+修复：`immediate` 重置 `attempts = 0` 并把 `scheduled_backoff` 置 0——强制周期立即到期，
+后续节奏从初始退避重新加倍，运营者刚修好网络时不必等完故障期间长出来的退避。
+
+### 修复清单（5 个 commit）
+
+| commit | 内容 |
+| --- | --- |
+| `c7660a0` | `immediate` 真正强制周期并重置退避指数；补 live-schedule 回归测试（旧测试只覆盖从未 step 的控制器） |
+| `34360b6` | 资源毒行本地自愈：`commit_expected_record_ctx` 对不可解码的 incumbent 走共享 `decode_or_absent`，plain put 通过 exact-CAS Put 覆盖坏行；带前置条件的写按空寄存器报 not-found |
+| `b349e46` | `NodeConfig::with_resource_removal_retention(window, cap)` 取代两个硬编码常量；窗口同时穿到 `ReconcilePlane`（sweep 删除与 plane 的 reclaimed-knowledge 判据必须同一来源） |
+| `3472e66` | 桥探针边改为有界寿命（120 tick = 1 小时）：到期由探针平面自己回收并在同一 tick 重探，跳过刚释放的 peer；单边上限与 `k(n)+1` 稳态不变 |
+| `0e130ec` | 兼容清单新增 `Handshake` 家族，冻结 0.1.0 的 initiator feature offer 字节；`tests/mixed_versions.rs` 的模块文档改为如实说明该 lane 只证明"不同 offer 的协商"，并写明 pre-0.1.0 的 limit 协商删除是刻意的线格式破坏 |
+
+### 设计取舍记录
+
+- **资源毒行**：写路径采纳 page batch 的 "corrupt = absent"，读路径保持报错。理由是两者语义不同——写路径把坏行当非证据才能自愈，读路径若报 absent 就是伪造答案；removal 必须从现存内容构造，因此坏行不可删除。
+- **桥探针轮换**：`k(n)+1` 的上限按时间而非永久有界。原设计的风险是"一次落在同侧就永久花掉这个节点唯一的探针"（探针边永不被剪枝，只能随会话退役）。轮换不会丢掉真桥：当探针边是该节点唯一的跨分区链路时，其余所有未直连成员都在对侧，替换探针必然落在对侧；只有同侧边才可能被同侧边接替，而那正是轮换要逃离的情形。探针边的年龄单位是**维护 tick**而非探针间隔——探针被抑制时 cadence bracket 停在触发值，所以门每 tick 都会走一次（这也是"边一退役下一 tick 就重探"的实现方式）。
+- **线格式**：真实跨版本证据需要旧二进制或冻结 transcript 重放，两者都不存在；本轮改为冻结 offer 字节，使**下一次**发布可以据此断言"仍接受 0.1.0 的 offer"。这不能追溯证明 0.1.0 与更早版本互通，文档已如实写明。
+
+### 验证
+
+- 全量质量门（单进程）：`taplo fmt --check`、nightly `rustfmt --check`、`check --all-targets --all-features`、`clippy -D warnings`、`test --workspace --all-features --locked` 全绿（exit 0）。工作区列出 1121 个测试用例，本轮新增 10 个。
+- 变异验证（每条都确认过修复前必挂）：
+  - 恢复 `immediate` 的旧实现 → `recovery_immediate_pulls_a_live_schedule_forward`、`recovery_immediate_restarts_the_backoff_exponent` 失败。
+  - `commit_expected_record_ctx` 改回 `decode(...)?` → `a_corrupt_register_heals_through_a_plain_put` 失败。
+  - 探针寿命置 `u32::MAX`（永不回收）→ `an_aged_probe_edge_is_reclaimed_and_the_probe_rotates` 失败。
+  - `probe_pool` 去掉 retired 过滤 → `the_probe_pool_excludes_the_released_peer_without_emptying` 失败；把"空池返回 `None`"改成 `Some(pool)` → 同一测试的回退断言失败。
+  - 冻结 offer 十六进制改动一字节 → `manifest_vectors_reproduce_byte_for_byte` 失败。
+- 公开 ABI：基线随 `NodeConfig::with_resource_removal_retention` 的加入重新渲染（唯一 diff 即该行），`public_abi` ignored 测试通过。
+- 探针轮换测试的稳定性：连续 5 次全量 degree 测试套件运行全绿。首版测试曾偶发失败，根因是年龄单位搞错（按间隔算，实际按 tick 算），已修正并加了寿命常量 pin。
+
+### 环境注记（ABI 渲染，修正上节）
+
+仅把 `+nightly` 转发给 `rustup run nightly cargo` 的 shim **不够**：`cargo-public-api`
+直接解析 `rustdoc`，而本机 PATH 中 stable 工具链的 bin 目录在前，`-Z unstable-options`
+会被 stable rustdoc 拒绝（`the option Z is only accepted on the nightly compiler`）。
+可用写法：
+
+```bash
+NB=$HOME/.rustup/toolchains/nightly-aarch64-apple-darwin/bin
+CARGO_TARGET_DIR=/tmp/radiata-abi \
+  PATH=$NB:/tmp/cargo-shim:$PATH RUSTC=$NB/rustc RUSTDOC=$NB/rustdoc \
+  cargo public-api --all-features -sss
+```
+
+另需独立的 `CARGO_TARGET_DIR`：nightly 复用 stable 的 `target/` 产物会报
+`E0514 found crate ... compiled by an incompatible version of rustc`。
 
 ## 验证
 
