@@ -1,13 +1,28 @@
-//! Mixed binaries.
+//! Differing feature surfaces across one negotiation.
 //!
-//! An external consumer models a prior-version binary and the current
-//! binary purely through the public facade: the prior node offers a
-//! feature surface without the current-only extension feature, the
-//! current node offers it. Both initiator roles must negotiate the
+//! An external consumer drives two nodes through the public facade: one
+//! offers a feature surface without the current-only extension feature,
+//! the other offers it. Both initiator roles must negotiate the
 //! identical signed intersection, packets and core metadata must stay
-//! interoperable across the mixed pair, incompatible required features
-//! must be refused without a weaker retry, and the pair-scoped selection
-//! must disappear with the session.
+//! interoperable across the pair, incompatible required features must be
+//! refused without a weaker retry, and the pair-scoped selection must
+//! disappear with the session.
+//!
+//! **What this lane does not prove.** Both nodes are the *current*
+//! binary; only their offered feature sets differ. This is therefore
+//! evidence about negotiation and data-plane interop across differing
+//! offers, never evidence that two *releases* interoperate on the wire.
+//! The distinction matters because the `0.1.0` feature-limit negotiation
+//! removal was a deliberate pre-release wire break: a pre-`0.1.0` binary
+//! cannot handshake with a current one, and no fixture built from the
+//! current registry can stand in for that. The frozen bytes that make a
+//! future cross-release claim checkable live in the compatibility
+//! manifest (`feature-offer-initiator-v1`), which pins the exact offer
+//! encoding a later release must keep accepting.
+//!
+//! A real cross-release lane needs a genuinely old binary or a frozen
+//! transcript replayed against the current decoder; this file is neither,
+//! and its assertions must not be read as such.
 
 use std::{sync::Arc, time::Duration};
 
@@ -101,8 +116,9 @@ fn echo_body(
 }
 
 /// `current` nodes register the current-only feature; `prior` nodes offer
-/// the prior surface without it. Both register the echo protocol so the
-/// mixed pair can exchange packets.
+/// the narrower surface without it. Both register the echo protocol so the
+/// pair can exchange packets. The flag selects an *offer*, not a binary:
+/// both sides run this build (see the module doc).
 async fn start_node(seed: u64, current: bool) -> Node {
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(2_400_000 + seed * 1_000));
   let factory: Arc<dyn radiata::extension::StorageFactory> =
@@ -262,7 +278,7 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
 }
 
 /// Joins a third, silent member and keeps one live session to BOTH
-/// sides of the mixed pair (see the retirement phase in
+/// sides of the differing-offer pair (see the retirement phase in
 /// `prior_initiator_interops_with_current_responder` for why the torn
 /// pair must never fully isolate). Returns the bystander node with its
 /// id resolved.
@@ -474,8 +490,8 @@ async fn assert_packet_interop(issuer: &Node, member: &Node) {
   }
 }
 
-/// A prior-version initiator and the current responder negotiate the
-/// identical intersection, exchange packets and metadata, and the
+/// A narrower-surface initiator and the full-surface responder negotiate
+/// the identical intersection, exchange packets and metadata, and the
 /// session-scoped selection is replaced and retired with the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prior_initiator_interops_with_current_responder() {
@@ -658,9 +674,9 @@ async fn prior_initiator_interops_with_current_responder() {
   issuer.handle.shutdown().await.unwrap();
 }
 
-/// A current initiator and a prior responder reach the identical
-/// intersection in the opposite role
-/// with packet and trust interoperability.
+/// A full-surface initiator and a narrower-surface responder reach the
+/// identical intersection in the opposite role with packet and trust
+/// interoperability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn current_initiator_interops_with_prior_responder() {
   let mut issuer = start_node(3, false).await;

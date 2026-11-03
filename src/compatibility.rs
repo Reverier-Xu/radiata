@@ -1,9 +1,10 @@
 //! The frozen `0.1.0` wire/metadata compatibility manifest.
 //!
 //! [`VECTOR_MANIFEST`] lists every golden vector the `0.1.0` release
-//! freezes across the seven format families: packet wire frames, identity
+//! freezes across the eight format families: packet wire frames, identity
 //! records, node descriptors, resource records, route trace metadata,
-//! pending transactions, and migration schema records. Each entry pins
+//! pending transactions, migration schema records, and the handshake
+//! feature offer. Each entry pins
 //! the exact vector bytes plus the current reader that must accept them;
 //! the family inventory is closed, so an omitted fixture or reader fails
 //! the compatibility suite. Vector bytes are frozen: a format change is a
@@ -34,11 +35,18 @@ pub(crate) enum CompatibilityFamily {
   Transaction,
   /// Migration schema records (base and edge shapes).
   Migration,
+  /// Handshake control-plane messages. The feature offer is the encoded
+  /// message whose shape the mixed-version lane negotiates, so freezing
+  /// it is what makes a future format change a deliberate amendment: a
+  /// field added or removed here silently breaks every older peer's
+  /// handshake, and no test that builds both sides from the current
+  /// registry can observe that.
+  Handshake,
 }
 
 impl CompatibilityFamily {
   /// Every frozen family, in manifest order.
-  pub(crate) const ALL: [Self; 7] = [
+  pub(crate) const ALL: [Self; 8] = [
     Self::Packet,
     Self::Identity,
     Self::Node,
@@ -46,6 +54,7 @@ impl CompatibilityFamily {
     Self::Trace,
     Self::Transaction,
     Self::Migration,
+    Self::Handshake,
   ];
 }
 
@@ -152,6 +161,10 @@ fn read_trace_record(bytes: &[u8]) -> Result<Vec<u8>> {
 
 fn read_pending_transaction(bytes: &[u8]) -> Result<Vec<u8>> {
   crate::storage::pending::PendingTransactionV1::decode(bytes)?.encode()
+}
+
+fn read_feature_offer(bytes: &[u8]) -> Result<Vec<u8>> {
+  crate::protocol::offer::FeatureOffer::decode(bytes)?.encode()
 }
 
 fn read_migration_schema_record(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -365,6 +378,18 @@ pub(crate) const VECTOR_MANIFEST: &[CompatibilityVector] = &[
     shape: VectorShape::ByteStable,
     read: read_migration_schema_record,
   },
+  // Handshake: the initiator's feature offer — every built-in feature
+  // supported at its definition digest, the direct-request chain
+  // required. No schema tag rides the wire (the offer is a two-element
+  // array), so the freeze is the bytes alone.
+  CompatibilityVector {
+    family: CompatibilityFamily::Handshake,
+    name: "feature-offer-initiator-v1",
+    tag: None,
+    hex: FEATURE_OFFER_INITIATOR_HEX,
+    shape: VectorShape::ByteStable,
+    read: read_feature_offer,
+  },
 ];
 
 const PENDING_TRANSACTION_TAG: &str = "radiata.woooo.tech/schemas/v1/pending-transaction";
@@ -392,11 +417,17 @@ const TRACE_RECORD_ROUTING_HEX: &str = "897829726164696174612e776f6f6f6f2e746563
 const TRACE_RECORD_DELIVERED_HEX: &str = "897829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f726f7574652d747261636501781b74726163652d303030303030303030303030303030303030303031781a6e6f64652d303030303030303030303030303030303030303031781a6e6f64652d3030303030303030303030303030303030303030330102f6191388";
 const MIGRATION_BASE_HEX: &str =
   "012b726164696174612e776f6f6f6f2e746563682f736368656d61732f76332f6d657461646174612d74657374";
+/// The `0.1.0` initiator feature offer: five supported built-ins at their
+/// definition digests plus the four required session features. Frozen
+/// because this is the message a mixed-version pair must agree on — the
+/// pre-`0.1.0` limit negotiation was removed from exactly this array, and
+/// that removal is not backward compatible.
+const FEATURE_OFFER_INITIATOR_HEX: &str = "8285827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58203df87b424b76c2b0e73284e877679a07aeb1688c150bf90a99c6bc667f0b8aae827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820b65136c721b44eb602c70788a372644af3b738ccfe0437c2ba33060a89ff9d2f82782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458207dfa9f0d5f24bf399f1ff3dd7f3354f09a7448d0a48b8e0b6e98c5b56e4e0a2782782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c6976657279582057dfd16e43af9dbf7a4e47bdbeb40cb50d2f031d0355bb126dc3c16134f859a5827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265582022373a9809f3ec58a1becf45acb4dfae3da54151973534fcfc18aeab57f0f874847830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573747828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265";
 const MIGRATION_EDGE_HEX: &str = "0230726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d6967726174696f6e2d656467652d6f6e65c00d58dde43d09d570842a07443e7f0c5e19950c605651d760d378b12945b23b";
 
 /// The frozen per-family vector inventory: an omitted fixture or reader
 /// changes a count and fails the compatibility suite.
-pub(crate) const FROZEN_FAMILY_COUNTS: [(CompatibilityFamily, usize); 7] = [
+pub(crate) const FROZEN_FAMILY_COUNTS: [(CompatibilityFamily, usize); 8] = [
   (CompatibilityFamily::Packet, 6),
   (CompatibilityFamily::Identity, 6),
   (CompatibilityFamily::Node, 2),
@@ -404,6 +435,7 @@ pub(crate) const FROZEN_FAMILY_COUNTS: [(CompatibilityFamily, usize); 7] = [
   (CompatibilityFamily::Trace, 2),
   (CompatibilityFamily::Transaction, 1),
   (CompatibilityFamily::Migration, 2),
+  (CompatibilityFamily::Handshake, 1),
 ];
 
 #[cfg(test)]
@@ -550,7 +582,7 @@ mod tests {
         .count();
       assert_eq!(shipped, count, "family {family:?} inventory drifted");
     }
-    assert_eq!(VECTOR_MANIFEST.len(), 22);
+    assert_eq!(VECTOR_MANIFEST.len(), 23);
   }
 
   /// The frozen vector shapes stay accepted by the current readers: the
