@@ -1,3 +1,24 @@
+# Quality gates.
+#
+# Two pinning rules, both deliberate:
+#
+#   * Runner images are pinned to an explicit label (`ubuntu-26.04`,
+#     `macos-26`, `windows-2025`). `-latest` silently moves under the
+#     pipeline, so a green run would stop meaning "green on the image we
+#     validated".
+#   * Actions are referenced by major version (`@v7`, `@v2`) or, for
+#     `dtolnay/rust-toolchain`, by the toolchain name its ref encodes
+#     (`@nightly`, `@stable`, `@1.98.0`). Major tags are mutable, so this
+#     trades immutability for readability and for bumps that arrive as a
+#     reviewable one-line diff; a compromised upstream tag is the accepted
+#     risk. Pin to a commit SHA instead if that trade ever stops being
+#     acceptable.
+#
+# Tool versions installed by `taiki-e/install-action` stay pinned to an
+# exact release (`taplo-cli@0.10.0`, `cargo-hack@0.6.45`,
+# `cargo-public-api@0.52.0`, `cargo-deny@0.20.2`) because the gates assert
+# against those exact versions.
+
 name: quality_check
 
 on:
@@ -19,21 +40,20 @@ env:
 jobs:
   format:
     name: format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 3
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install nightly rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
           components: rustfmt
 
       - name: install taplo
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        uses: taiki-e/install-action@v2
         with:
           tool: taplo-cli@0.10.0
 
@@ -45,19 +65,18 @@ jobs:
 
   examples:
     name: examples
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       RUSTFLAGS: -Dwarnings
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install nightly rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
           components: rustfmt, clippy
 
       # The examples live outside the workspace on purpose (customer-style
@@ -78,7 +97,7 @@ jobs:
 
   msrv:
     name: msrv
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTFLAGS: -Dwarnings
@@ -86,12 +105,11 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
-          toolchain: 1.98.0
           components: clippy
 
       - name: verify MSRV
@@ -147,7 +165,7 @@ jobs:
 
       - name: upload attestation
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v7
         with:
           name: quality-attestation-msrv
           path: target/attestation-quality-msrv.json
@@ -155,7 +173,7 @@ jobs:
 
   stable:
     name: stable
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTFLAGS: -Dwarnings
@@ -163,12 +181,11 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install stable rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: clippy
 
       - name: report stable toolchain
@@ -222,7 +239,7 @@ jobs:
 
       - name: upload attestation
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v7
         with:
           name: quality-attestation-stable
           path: target/attestation-quality-stable.json
@@ -230,7 +247,7 @@ jobs:
 
   starvation:
     name: starvation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTFLAGS: -Dwarnings
@@ -241,12 +258,10 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
 
       # The starvation gate replays the transport-chaos incidents on a
       # single core: the lanes compile unpinned, then execute under
@@ -314,7 +329,7 @@ jobs:
 
       - name: upload attestation
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v7
         with:
           name: quality-attestation-starvation
           path: target/attestation-quality-starvation.json
@@ -322,7 +337,7 @@ jobs:
 
   macos:
     name: macos
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 45
     env:
       RUSTFLAGS: -Dwarnings
@@ -330,12 +345,11 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
-          toolchain: 1.98.0
           components: clippy
 
       - name: record start
@@ -363,7 +377,7 @@ jobs:
           cargo +1.98.0 check --locked --no-default-features --features redb
 
       - name: install cargo-hack
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack@0.6.45
 
@@ -410,7 +424,7 @@ jobs:
 
       - name: upload attestation
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v7
         with:
           name: quality-attestation-macos
           path: target/attestation-quality-macos.json
@@ -418,7 +432,7 @@ jobs:
 
   windows:
     name: windows
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 60
     env:
       RUSTFLAGS: -Dwarnings
@@ -426,12 +440,11 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
-          toolchain: 1.98.0
           components: clippy
 
       - name: record start
@@ -459,7 +472,7 @@ jobs:
           cargo +1.98.0 check --locked --no-default-features --features redb
 
       - name: install cargo-hack
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack@0.6.45
 
@@ -506,7 +519,7 @@ jobs:
 
       - name: upload attestation
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v7
         with:
           name: quality-attestation-windows
           path: target/attestation-quality-windows.json
@@ -527,27 +540,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-26
             config: no-default
             flags: --no-default-features
-          - os: macos-latest
+          - os: macos-26
             config: redb-only
             flags: --no-default-features --features redb
-          - os: windows-latest
+          - os: windows-2025
             config: no-default
             flags: --no-default-features
-          - os: windows-latest
+          - os: windows-2025
             config: redb-only
             flags: --no-default-features --features redb
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: record start
         id: start
@@ -586,7 +597,7 @@ jobs:
 
       - name: upload attestation
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v7
         with:
           name: quality-attestation-native-${{ matrix.os }}-${{ matrix.config }}
           path: target/attestation-native-${{ matrix.os }}-${{ matrix.config }}.json
@@ -594,7 +605,7 @@ jobs:
 
   features-check:
     name: features / check (powerset)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 12
     env:
       RUSTFLAGS: -Dwarnings
@@ -602,15 +613,13 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: install cargo-hack
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack@0.6.45
 
@@ -625,7 +634,7 @@ jobs:
 
   features-test:
     name: features / test (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTFLAGS: -Dwarnings
@@ -643,24 +652,22 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: cargo test
         run: cargo +1.98.0 test --locked ${{ matrix.flags }}
 
   container:
     name: container
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: build quality image
         run: docker build --file .github/docker/quality.Dockerfile --tag radiata-quality:${{ github.sha }} .
@@ -673,7 +680,7 @@ jobs:
 
   chat-acceptance:
     name: chat acceptance
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Recorded expected duration: ~20 minutes total on a clean runner —
     # the release image build dominates (8-12 min uncached), the
     # scenario matrix plus boundary suite take ~3 min, and the four
@@ -688,7 +695,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: build the chat node image
         run: >-
@@ -749,20 +756,18 @@ jobs:
 
   abi:
     name: abi freeze
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install nightly rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: nightly
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: install cargo-public-api
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-public-api@0.52.0
 
@@ -782,20 +787,18 @@ jobs:
 
   dependency-policy:
     name: dependency-policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
 
     steps:
       - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
 
       - name: install stable rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: install cargo-deny
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.20.2
 
