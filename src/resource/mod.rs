@@ -62,7 +62,7 @@ const RECORD_VERSION: u16 = 1;
 /// Parsing reuses the canonical tag grammar, so names inherit domain
 /// validation, length bounds, and lowercase normalization; the category is
 /// fixed to `resources`, which keeps resource names out of the protocol,
-/// feature, transport, discovery, and label namespaces.
+/// feature, transport, and label namespaces.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResourceName(QualifiedTag);
 

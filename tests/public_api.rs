@@ -555,7 +555,7 @@ impl RouteNextHop for PubNextHop {
       view.peers().first().cloned().ok_or_else(|| {
         radiata::Error::provider(
           radiata::ProviderErrorKind::Unsupported,
-          radiata::ProviderErrorContext::NeighborPolicy,
+          radiata::ProviderErrorContext::RoutingPolicy,
         )
       })
     })

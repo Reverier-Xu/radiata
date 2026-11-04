@@ -99,12 +99,8 @@ impl fmt::Debug for QualifiedTag {
 }
 
 /// Generates one category tag type. The canonical-text and domain
-/// accessors are generated only for the tags that carry them: a tag whose
-/// registry surface is still test-only (discovery) has no production
-/// reader, so `@without_accessors` emits the type alone instead of
-/// silencing the dead-code lint for an accessor nothing calls. The
-/// accessors ride into the same `impl` block as `parse`, so a tag with
-/// them renders exactly like it did before the split.
+/// accessors ride into the same `impl` block as `parse`, so a tag renders
+/// exactly like it did before the split.
 macro_rules! category_tag {
   ($name:ident, $category:literal, $context:literal) => {
     category_tag!(@type $name, $category, $context, {
@@ -119,10 +115,6 @@ macro_rules! category_tag {
         self.0.domain()
       }
     });
-  };
-
-  (@without_accessors $name:ident, $category:literal, $context:literal) => {
-    category_tag!(@type $name, $category, $context, {});
   };
 
   (@type $name:ident, $category:literal, $context:literal, { $($accessors:tt)* }) => {
@@ -169,8 +161,6 @@ macro_rules! category_tag {
 category_tag!(FeatureTag, "features", "feature tag");
 category_tag!(ProtocolTag, "protocols", "protocol tag");
 category_tag!(TransportTag, "transports", "transport tag");
-#[cfg(test)]
-category_tag!(@without_accessors DiscoveryTag, "discovery", "discovery tag");
 
 /// Validates one tag and returns its canonical text with the domain,
 /// category, and version split offsets. The grammar admits exactly two

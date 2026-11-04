@@ -5,10 +5,9 @@
 //! aggregate), `HINT` (best-effort changed-range notice), `OFFER` (my
 //! fingerprints for negotiated ranges), `NEED` (the ranges whose rows I
 //! lack), `ROWS` (row payloads), and `DONE` (round-close receipt). The
-//! shapes follow `docs/research/06-architecture-proposal.md` §3; the
-//! lane field rides every message — not just `ROOT` — because one
-//! protocol stream carries all four lanes and dispatch happens at the
-//! session seam.
+//! shapes follow the reconcile v1 message design; the lane field rides
+//! every message — not just `ROOT` — because one protocol stream carries
+//! all four lanes and dispatch happens at the session seam.
 //!
 //! Every body is canonical CBOR through the crate's single canonical
 //! encoder/decoder (`crate::protocol::cbor`): decode re-encodes and

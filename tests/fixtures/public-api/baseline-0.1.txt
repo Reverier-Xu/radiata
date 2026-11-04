@@ -98,7 +98,6 @@ pub radiata::NodeStatus::ShuttingDown
 pub radiata::NodeStatus::Starting
 pub radiata::NodeStatus::Stopped
 #[non_exhaustive] pub enum radiata::ProviderErrorContext
-pub radiata::ProviderErrorContext::Discovery
 pub radiata::ProviderErrorContext::Entropy
 pub radiata::ProviderErrorContext::KeyCreate
 pub radiata::ProviderErrorContext::KeyDelete
@@ -106,7 +105,6 @@ pub radiata::ProviderErrorContext::KeyPublicKey
 pub radiata::ProviderErrorContext::KeyReconcile
 pub radiata::ProviderErrorContext::KeySign
 pub radiata::ProviderErrorContext::LoadBalancingPolicy
-pub radiata::ProviderErrorContext::NeighborPolicy
 pub radiata::ProviderErrorContext::PacketConsumer
 pub radiata::ProviderErrorContext::RoutingPolicy
 pub radiata::ProviderErrorContext::StorageCommit

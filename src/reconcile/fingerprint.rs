@@ -4,13 +4,12 @@
 //! A lane's local state is an ordered set of item digests — one 64-bit
 //! content digest per stored row. The index maintains the pair
 //! `(count, xor of digests)` for every digest range: the
-//! transitive-group fingerprint of range-based set reconciliation
-//! (`docs/research/03-set-reconciliation.md`). Two peers that agree on
-//! a range's fingerprint hold the same items in that range (the
-//! remaining disagreement requires a digest collision *and* a matching
-//! count, bounded far below any operational catalog size), so payload
-//! bytes only ever cross a session for ranges whose fingerprints
-//! differ.
+//! transitive-group fingerprint of range-based set reconciliation.
+//! Two peers that agree on a range's fingerprint hold the same items in
+//! that range (the remaining disagreement requires a digest collision
+//! *and* a matching count, bounded far below any operational catalog
+//! size), so payload bytes only ever cross a session for ranges whose
+//! fingerprints differ.
 //!
 //! The structure is a derived view of storage: never persisted, never
 //! expired, rebuilt from the store snapshot on start. It therefore

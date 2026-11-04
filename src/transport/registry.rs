@@ -401,67 +401,6 @@ impl TransportListener for ProviderListenerAdapter {
   }
 }
 
-/// One candidate endpoint observation for a node, with a caller-selected
-/// priority for discovery ordering. Test-only until a discovery wiring
-/// exists; no production caller constructs candidates.
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EndpointCandidate {
-  endpoint: Endpoint,
-  priority: i32,
-}
-
-#[cfg(test)]
-impl EndpointCandidate {
-  pub(crate) fn new(endpoint: Endpoint) -> Self {
-    Self {
-      endpoint,
-      priority: 0,
-    }
-  }
-
-  pub(crate) const fn endpoint(&self) -> &Endpoint {
-    &self.endpoint
-  }
-}
-
-/// One bounded page of discovery results plus an optional continuation
-/// cursor. Test-only until a discovery wiring exists.
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DiscoveryPage {
-  items: Vec<EndpointCandidate>,
-  next: Option<crate::paging::PageCursor>,
-}
-
-#[cfg(test)]
-impl DiscoveryPage {
-  pub(crate) fn new(
-    items: Vec<EndpointCandidate>, next: Option<crate::paging::PageCursor>,
-  ) -> Result<Self> {
-    if items.is_empty() && next.is_some() {
-      return Err(Error::invalid_input("discovery page"));
-    }
-    Ok(Self { items, next })
-  }
-
-  pub(crate) fn items(&self) -> &[EndpointCandidate] {
-    &self.items
-  }
-}
-
-/// An open discovery implementation registered under a canonical
-/// `DiscoveryTag`. Test-only until a discovery wiring exists: no
-/// production caller registers or resolves discoveries today.
-#[cfg(test)]
-pub(crate) trait Discovery: fmt::Debug + Send + Sync + 'static {
-  /// Returns the next bounded page of candidate endpoints. `None` cursor
-  /// starts the stream.
-  fn discover<'a>(
-    &'a self, cursor: Option<&'a crate::paging::PageCursor>, limit: usize,
-  ) -> BoxFuture<'a, Result<DiscoveryPage>>;
-}
-
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
@@ -469,18 +408,14 @@ mod tests {
   use tokio::sync::mpsc;
 
   use super::{
-    Discovery, ProviderListener, Transport, TransportProvider, TransportProviderAdapter,
-    TransportTrust, builtin_transport_tag,
+    ProviderListener, Transport, TransportProvider, TransportProviderAdapter, TransportTrust,
+    builtin_transport_tag,
   };
   use crate::{
     Endpoint, ErrorKind, ExtensionRegistry, Result, TransportName, TransportSelector,
     TransportStream, TransportTag,
     api::BoxFuture,
-    protocol::DiscoveryTag,
-    transport::{
-      endpoint::TransportScheme, registry::DiscoveryPage, tls_transport::TlsTransport,
-      wss::WssTransport,
-    },
+    transport::{endpoint::TransportScheme, tls_transport::TlsTransport, wss::WssTransport},
   };
 
   fn transport_tag(value: &str) -> TransportTag {
@@ -489,14 +424,6 @@ mod tests {
 
   fn transport_name(value: &str) -> TransportName {
     TransportName::parse(value).unwrap()
-  }
-
-  fn discovery_tag(value: &str) -> DiscoveryTag {
-    DiscoveryTag::parse(&format!("radiata.woooo.tech/discovery/{value}")).unwrap()
-  }
-
-  fn candidate(host: &str) -> super::EndpointCandidate {
-    super::EndpointCandidate::new(Endpoint::parse(&format!("wss://{host}:9000")).unwrap())
   }
 
   fn custom_endpoint(name: &str, opaque: &str) -> Endpoint {
@@ -778,61 +705,6 @@ mod tests {
         TransportTrust::Plaintext
       );
     }
-  }
-
-  // ---- Discovery registration without central switching ----
-
-  #[derive(Debug)]
-  struct StaticDiscovery(Vec<super::EndpointCandidate>);
-
-  impl Discovery for StaticDiscovery {
-    fn discover<'a>(
-      &'a self, _cursor: Option<&'a crate::paging::PageCursor>, limit: usize,
-    ) -> BoxFuture<'a, Result<DiscoveryPage>> {
-      let items = self.0.clone();
-      Box::pin(async move {
-        let page: Vec<_> = items.into_iter().take(limit).collect();
-        DiscoveryPage::new(page, None)
-      })
-    }
-  }
-
-  #[tokio::test]
-  async fn discovery_registry_resolves_two_independent_implementations() {
-    let mut registry = ExtensionRegistry::new();
-    let one = Arc::new(StaticDiscovery(vec![candidate("one.example")]));
-    let two = Arc::new(StaticDiscovery(vec![candidate("two.example")]));
-    let one: Arc<dyn Discovery> = one;
-    let two: Arc<dyn Discovery> = two;
-    registry
-      .register_discovery(discovery_tag("one"), Arc::clone(&one))
-      .unwrap();
-    registry
-      .register_discovery(discovery_tag("two"), Arc::clone(&two))
-      .unwrap();
-    // Duplicate registration fails deterministically.
-    let error = registry
-      .register_discovery(discovery_tag("one"), one)
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Conflict);
-    assert!(registry.discovery(&discovery_tag("three")).is_none());
-
-    let page = registry
-      .discovery(&discovery_tag("one"))
-      .unwrap()
-      .discover(None, 1)
-      .await
-      .unwrap();
-    assert_eq!(page.items().len(), 1);
-    assert_eq!(page.items()[0].endpoint().host(), Some("one.example"));
-
-    let page = registry
-      .discovery(&discovery_tag("two"))
-      .unwrap()
-      .discover(None, 1)
-      .await
-      .unwrap();
-    assert_eq!(page.items()[0].endpoint().host(), Some("two.example"));
   }
 
   // ---- Authenticated transport results ----

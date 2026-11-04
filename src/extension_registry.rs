@@ -18,10 +18,6 @@ use crate::{
     registry::{Transport, TransportProvider, TransportProviderAdapter, builtin_transport_tag},
   },
 };
-// The discovery extension surface is test-only until a discovery wiring
-// exists (see `transport::registry`).
-#[cfg(test)]
-use crate::{protocol::DiscoveryTag, transport::registry::Discovery};
 
 /// The immutable definition of one domain-qualified packet protocol: its
 /// tag and the feature that owns it. The owning feature must be selected
@@ -72,8 +68,6 @@ pub struct ExtensionRegistry {
   /// The caller-registered transport providers, keyed by the scheme name
   /// (protocol prefix) each one owns.
   schemes: BTreeMap<crate::transport::TransportName, Arc<dyn Transport>>,
-  #[cfg(test)]
-  discoveries: BTreeMap<DiscoveryTag, Arc<dyn Discovery>>,
   load_balancers:
     std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
   next_hops: std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
@@ -238,25 +232,9 @@ impl ExtensionRegistry {
     }
   }
 
-  /// Registers one discovery implementation under its canonical tag, with
-  /// the same duplicate/reserved/conflict rules as transports.
-  #[cfg(test)]
-  pub(crate) fn register_discovery(
-    &mut self, tag: DiscoveryTag, value: Arc<dyn Discovery>,
-  ) -> Result<&mut Self> {
-    insert_once(&mut self.discoveries, tag, value, "discovery registration")?;
-    Ok(self)
-  }
-
   /// The registered transport for one tag.
   pub(crate) fn transport(&self, tag: &TransportTag) -> Option<&Arc<dyn Transport>> {
     self.transports.get(tag)
-  }
-
-  /// The registered discovery for one tag.
-  #[cfg(test)]
-  pub(crate) fn discovery(&self, tag: &DiscoveryTag) -> Option<&Arc<dyn Discovery>> {
-    self.discoveries.get(tag)
   }
 
   /// Registers one load-balancing policy under a canonical tag. A
@@ -480,8 +458,6 @@ impl fmt::Debug for ExtensionRegistry {
         .unwrap_or(0),
     );
     builder.field("transports", &self.transports.len());
-    #[cfg(test)]
-    builder.field("discoveries", &self.discoveries.len());
     builder
       .field(
         "load_balancers",
