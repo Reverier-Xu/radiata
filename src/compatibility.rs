@@ -12,11 +12,10 @@
 
 use std::sync::Arc;
 
-use crate::{Result, StoreValue, packet::wire, protocol::wire as protocol_wire};
-
 /// The canonical decoder limits every compatibility reader uses, matching
 /// the production control-plane decode path.
-const FREEZE_CBOR_LIMITS: crate::protocol::CborLimits = crate::protocol::CONTROL_CBOR_LIMITS;
+use crate::protocol::CONTROL_CBOR_LIMITS as FREEZE_CBOR_LIMITS;
+use crate::{Result, StoreValue, packet::wire, protocol::wire as protocol_wire};
 
 /// One frozen format family of the compatibility manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

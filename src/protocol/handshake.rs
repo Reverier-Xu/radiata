@@ -65,9 +65,8 @@ use super::{
 use crate::{
   Digest, Error, NodeId, PublicKey, Signature,
   identity::signature::{body_digest, signature_message, verify_strict},
+  protocol::wire::MAGIC as PROTOCOL_MAGIC,
 };
-
-const PROTOCOL_MAGIC: &str = crate::protocol::wire::MAGIC;
 const BASE_SCHEMA_ID: u64 = crate::protocol::wire::BASE_SCHEMA_ID as u64;
 const PROTOCOL_POSITIONS: u8 = 5;
 const GENERATION_LEN: usize = 16;

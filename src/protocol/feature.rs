@@ -33,10 +33,10 @@ use std::collections::BTreeMap;
 
 use minicbor::Encode;
 
-use super::{CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, encode_canonical};
+use super::{
+  CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, encode_canonical, tag::BUILTIN_DOMAIN,
+};
 use crate::{Digest, Error, Result, identity::signature::body_digest};
-
-const BUILTIN_DOMAIN: &str = super::tag::BUILTIN_DOMAIN;
 const FINGERPRINT_SEED_PREFIX: &str = "radiata.woooo.tech/crypto/v1/feature-fingerprint/";
 
 pub(crate) const AUTH_ED25519_SESSION: &str = "radiata.woooo.tech/features/auth-ed25519-session";

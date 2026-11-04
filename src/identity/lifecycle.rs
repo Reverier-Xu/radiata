@@ -40,6 +40,7 @@ use crate::{
   ProviderErrorKind, ReconcileOutcome, Result, StoreExpectation, StoreOperation, StoreValue,
   TransactionId,
   api::Entropy,
+  identity::records::LOCAL_IDENTITY_PURPOSE_TEXT as LOCAL_IDENTITY_PURPOSE,
   provider::{KeyProvider, StorageFactory, StoreSnapshot},
   storage::{
     MetadataStore, WriterPermit,
@@ -47,8 +48,6 @@ use crate::{
     receipt::{PreparedTransaction, ReceiptReferenceChange, ReceiptReferenceToken},
   },
 };
-
-const LOCAL_IDENTITY_PURPOSE: &str = crate::identity::records::LOCAL_IDENTITY_PURPOSE_TEXT;
 
 /// An opened local identity paired with its metadata store.
 ///

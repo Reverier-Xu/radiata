@@ -13,15 +13,14 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{MAX_CHUNK_BYTES, StreamMetadata};
-use crate::{
-  Error, ErrorKind, NodeId, ProtocolTag, Result, TraceId,
-  protocol::{CONTROL_CBOR_LIMITS, CborLimits, decode_canonical_strict, encode_canonical},
-  routing::HopState,
-};
-
 /// Packet frames share the authentication phase's frame budget: one frame
 /// never exceeds the 64 KiB handshake control limit.
-const PACKET_CBOR_LIMITS: CborLimits = CONTROL_CBOR_LIMITS;
+use crate::protocol::CONTROL_CBOR_LIMITS as PACKET_CBOR_LIMITS;
+use crate::{
+  Error, ErrorKind, NodeId, ProtocolTag, Result, TraceId,
+  protocol::{CborLimits, decode_canonical_strict, encode_canonical},
+  routing::HopState,
+};
 
 /// The wire admission outcome of one open frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
