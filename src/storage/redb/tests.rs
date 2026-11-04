@@ -40,17 +40,6 @@ async fn redb_adapter_holds_an_exclusive_lifetime_lock() {
 }
 
 #[tokio::test]
-async fn redb_adapter_refuses_unsupported_capability_requirements() {
-  let directory = TempDir::new().unwrap();
-  let factory = factory(&directory);
-  let error = factory
-    .open(StoreRequirements::metadata().transactional_migration(true))
-    .await
-    .unwrap_err();
-  assert_eq!(error.kind(), ErrorKind::UnsupportedCapability);
-}
-
-#[tokio::test]
 async fn redb_adapter_reopen_preserves_entries_receipts_and_revision() {
   let directory = TempDir::new().unwrap();
   let path = directory.path().join("store.redb");

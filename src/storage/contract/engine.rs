@@ -1397,11 +1397,6 @@ async fn storage_contract_reference_provider_holds_exclusive_lock_for_storage_li
   let factory = ReferenceFactory::new(required_capabilities());
   let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
 
-  let unsupported = factory
-    .open(StoreRequirements::metadata().transactional_migration(true))
-    .await
-    .unwrap_err();
-  assert_eq!(unsupported.kind(), crate::ErrorKind::UnsupportedCapability);
   let locked = factory
     .open(StoreRequirements::metadata())
     .await

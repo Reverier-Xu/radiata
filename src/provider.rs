@@ -217,11 +217,6 @@ pub struct StoreRequirements {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
-  /// Forward infrastructure: no production adapter advertises the
-  /// transactional-migration bit and no production requirement names it,
-  /// so the bit exists only where tests and fuzzing exercise it.
-  #[cfg(any(test, fuzzing))]
-  transactional_migration: bool,
 }
 
 impl StoreRequirements {
@@ -232,8 +227,6 @@ impl StoreRequirements {
       ordered_scan: true,
       reconciliation: true,
       exclusive_lifetime_lock: true,
-      #[cfg(any(test, fuzzing))]
-      transactional_migration: false,
     }
   }
 
@@ -257,18 +250,6 @@ impl StoreRequirements {
     self.exclusive_lifetime_lock
   }
 
-  #[cfg(any(test, fuzzing))]
-  pub fn requires_transactional_migration(&self) -> bool {
-    self.transactional_migration
-  }
-
-  #[cfg(any(test, fuzzing))]
-  #[cfg_attr(fuzzing, allow(dead_code))]
-  pub(crate) const fn transactional_migration(mut self, required: bool) -> Self {
-    self.transactional_migration = required;
-    self
-  }
-
   #[cfg(all(test, not(unix)))]
   pub(crate) const fn with_required_durability(mut self, level: DurabilityLevel) -> Self {
     self.required_durability = level;
@@ -283,11 +264,6 @@ pub struct StoreCapabilities {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
-  /// Forward infrastructure: no production adapter advertises the
-  /// transactional-migration bit, so the bit exists only where tests and
-  /// fuzzing exercise it.
-  #[cfg(any(test, fuzzing))]
-  transactional_migration: bool,
 }
 
 impl StoreCapabilities {
@@ -298,8 +274,6 @@ impl StoreCapabilities {
       ordered_scan: false,
       reconciliation: false,
       exclusive_lifetime_lock: false,
-      #[cfg(any(test, fuzzing))]
-      transactional_migration: false,
     }
   }
 
@@ -336,12 +310,6 @@ impl StoreCapabilities {
     self
   }
 
-  #[cfg(any(test, fuzzing))]
-  pub fn transactional_migration(mut self, supported: bool) -> Self {
-    self.transactional_migration = supported;
-    self
-  }
-
   pub fn durability(&self) -> DurabilityLevel {
     self.durability
   }
@@ -362,35 +330,13 @@ impl StoreCapabilities {
     self.exclusive_lifetime_lock
   }
 
-  #[cfg(any(test, fuzzing))]
-  pub fn has_transactional_migration(&self) -> bool {
-    self.transactional_migration
-  }
-
   pub(crate) const fn satisfies(&self, requirements: &StoreRequirements) -> bool {
     durability_satisfies(self.durability, requirements.required_durability)
       && (!requirements.conditional_batch || self.conditional_batch)
       && (!requirements.ordered_scan || self.ordered_scan)
       && (!requirements.reconciliation || self.reconciliation)
       && (!requirements.exclusive_lifetime_lock || self.exclusive_lifetime_lock)
-      && transactional_migration_satisfied(self, requirements)
   }
-}
-
-/// The gated capability clause: production requirements cannot name the
-/// transactional-migration bit, so the clause exists only under the gate.
-#[cfg(any(test, fuzzing))]
-const fn transactional_migration_satisfied(
-  capabilities: &StoreCapabilities, requirements: &StoreRequirements,
-) -> bool {
-  !requirements.transactional_migration || capabilities.transactional_migration
-}
-
-/// With the gate off the bit cannot be required or advertised, so the
-/// clause is vacuously true.
-#[cfg(not(any(test, fuzzing)))]
-const fn transactional_migration_satisfied(_: &StoreCapabilities, _: &StoreRequirements) -> bool {
-  true
 }
 
 const fn durability_satisfies(actual: DurabilityLevel, required: DurabilityLevel) -> bool {
@@ -1202,7 +1148,6 @@ mod tests {
       ordered_scan: true,
       reconciliation: true,
       exclusive_lifetime_lock: true,
-      transactional_migration: true,
     };
 
     assert_eq!(
@@ -1213,7 +1158,6 @@ mod tests {
     assert!(requirements.requires_ordered_scan());
     assert!(requirements.requires_reconciliation());
     assert!(requirements.requires_exclusive_lifetime_lock());
-    assert!(requirements.requires_transactional_migration());
   }
 
   #[test]
