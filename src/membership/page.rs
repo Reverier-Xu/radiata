@@ -161,7 +161,6 @@ pub(crate) fn decode_descriptor(bytes: &[u8]) -> Result<NodeDescriptorV1> {
         public_key: &wire.public_key,
         endpoints: &wire.endpoints,
         revision: wire.revision,
-        removed: wire.removed,
         labels: Some(&wire.labels),
       },
     );
@@ -185,7 +184,6 @@ pub(crate) fn decode_descriptor(bytes: &[u8]) -> Result<NodeDescriptorV1> {
       public_key: &wire.public_key,
       endpoints: &wire.endpoints,
       revision: wire.revision,
-      removed: wire.removed,
       labels: None,
     },
   )
@@ -197,7 +195,6 @@ struct DescriptorFields<'a> {
   public_key: &'a minicbor::bytes::ByteVec,
   endpoints: &'a [String],
   revision: u64,
-  removed: bool,
   /// `Some` for record versions that carry capability labels.
   labels: Option<&'a [(String, String)]>,
 }
@@ -244,15 +241,8 @@ fn decode_wire(
     )?;
   }
   Ok(
-    NodeDescriptorV1::new(
-      node,
-      public_key,
-      endpoints,
-      fields.revision,
-      fields.removed,
-      version,
-    )
-    .with_labels(labels),
+    NodeDescriptorV1::new(node, public_key, endpoints, fields.revision, version)
+      .with_labels(labels),
   )
 }
 
@@ -278,7 +268,6 @@ mod tests {
       key(node_index),
       vec![Endpoint::parse(&format!("wss://{host}:9000")).unwrap()],
       revision,
-      false,
       1,
     )
   }
@@ -303,7 +292,6 @@ mod tests {
       key(1),
       vec![Endpoint::parse("wss://one-updated:9000").unwrap()],
       2,
-      false,
       1,
     );
     let page = MembershipPage::new(vec![fresh.clone()], None).unwrap();
@@ -385,7 +373,6 @@ mod label_fixture_tests {
       crate::PublicKey::from_bytes(signing.verifying_key().to_bytes()),
       vec![Endpoint::parse("wss://edge:9000").unwrap()],
       1,
-      false,
       1,
     )
   }
@@ -426,7 +413,6 @@ mod label_fixture_tests {
         .map(|endpoint| endpoint.as_str().to_owned())
         .collect(),
       revision: previous.revision(),
-      removed: previous.removed(),
       version: 1,
     };
     let bytes = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();

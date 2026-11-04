@@ -2,12 +2,12 @@
 //!
 //! A [`NodeDescriptorV1`] is the node-owned revision record: it carries the
 //! owning node's `NodeId` marking, its endpoint candidates, a strictly
-//! increasing revision, and the removal flag. Entries are trusted through
-//! the authenticated session that delivered them, so they carry
+//! increasing revision, and its capability labels. Entries are trusted
+//! through the authenticated session that delivered them, so they carry
 //! no per-entry signatures. Core accepts an update only at a strictly
 //! higher revision; stale and repeated revisions cannot replace the
-//! current record, and a retained removal marker defeats reordered or
-//! replayed older descriptors.
+//! current record. Departure is not expressed here: a leaving node is
+//! recorded by its signed leave and cleanup tombstones.
 //!
 //! The two write paths heal, the read path refuses. An undecodable stored
 //! descriptor is non-evidence for [`store::store_descriptor_ctx`] and
@@ -15,10 +15,9 @@
 //! descriptor installs over it through the normal exact-CAS Put — while
 //! [`store::read_descriptor_ctx`] reports it as an error, never as an
 //! absent descriptor, because the register's content is genuinely unknown
-//! there. The accepted residual of healing: a corrupt descriptor row can
-//! let a departed node re-enter the roster, because the removal guard
-//! needs the row to decode — a removal marker in a row this binary cannot
-//! read protects nothing.
+//! there. The accepted residual of healing: a corrupt descriptor row is
+//! replaced by the verified incoming descriptor, so a row written by a
+//! newer record version this binary cannot read is discarded.
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
@@ -47,7 +46,6 @@ pub(crate) struct NodeDescriptorV1 {
   endpoints: Vec<Endpoint>,
   labels: LabelSet,
   revision: u64,
-  removed: bool,
   version: u16,
 }
 
@@ -67,20 +65,17 @@ struct DescriptorWire {
   #[n(5)]
   revision: u64,
   #[n(6)]
-  removed: bool,
-  #[n(7)]
   version: u16,
   /// Canonical capability labels: key/value pairs sorted by key text,
   /// unique keys. Present from record version 2 on; version 1 records
   /// end at `version` and always decode to an empty label set.
-  #[n(8)]
+  #[n(7)]
   labels: Vec<(String, String)>,
 }
 
 impl NodeDescriptorV1 {
   pub(crate) fn new(
-    node: NodeId, public_key: PublicKey, endpoints: Vec<Endpoint>, revision: u64, removed: bool,
-    version: u16,
+    node: NodeId, public_key: PublicKey, endpoints: Vec<Endpoint>, revision: u64, version: u16,
   ) -> Self {
     Self {
       node,
@@ -88,7 +83,6 @@ impl NodeDescriptorV1 {
       endpoints,
       labels: LabelSet::new(),
       revision,
-      removed,
       version,
     }
   }
@@ -120,10 +114,6 @@ impl NodeDescriptorV1 {
     &self.labels
   }
 
-  pub(crate) const fn removed(&self) -> bool {
-    self.removed
-  }
-
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical(&self.wire(), crate::protocol::CONTROL_CBOR_LIMITS)
   }
@@ -147,7 +137,6 @@ impl NodeDescriptorV1 {
         .map(|(key, value)| (key.as_str().to_owned(), value.as_str().to_owned()))
         .collect(),
       revision: self.revision,
-      removed: self.removed,
       version: self.version,
     }
   }
@@ -171,8 +160,6 @@ struct DescriptorWireV1 {
   #[n(5)]
   revision: u64,
   #[n(6)]
-  removed: bool,
-  #[n(7)]
   version: u16,
 }
 
@@ -237,7 +224,6 @@ pub(crate) fn apply_metadata_patch(
       descriptor.public_key().clone(),
       endpoints,
       descriptor.revision().saturating_add(1),
-      false,
       1,
     )
     .with_labels(labels),
@@ -347,7 +333,7 @@ pub(crate) mod store {
     if descriptor.is_none() {
       tracing::warn!(
         node = %node,
-        "stored node descriptor is undecodable; the incoming descriptor will replace it, so a row written by a newer record version is discarded and a removal marker in that row no longer protects the roster"
+        "stored node descriptor is undecodable; the incoming descriptor will replace it, so a row written by a newer record version is discarded"
       );
     }
     descriptor
@@ -360,8 +346,7 @@ pub(crate) mod store {
   /// replaces the record so anti-entropy heals a lost delivery instead of
   /// diverging forever — including a first install at a higher revision
   /// for a node whose trusted binding already exists (the member updated
-  /// its labels before its first descriptor page ever arrived here);
-  /// a removal marker is never replaced by an older live descriptor.
+  /// its labels before its first descriptor page ever arrived here).
   ///
   /// A stored row this binary cannot decode is non-evidence, exactly as
   /// it is for the page batch: the verified incoming descriptor installs
@@ -429,9 +414,6 @@ pub(crate) mod store {
   ///
   /// - an equal or higher stored revision wins (the register accepts only the
   ///   strictly next revision);
-  /// - a removal marker is never replaced by a live descriptor of any revision:
-  ///   rejoining requires a newer signed-out-of-band removal reversal, not a
-  ///   replayed old record;
   /// - the descriptor register starts at revision 1: a zero-revision descriptor
   ///   is never a legal first install, not even for a node whose binding is
   ///   already adopted;
@@ -445,9 +427,6 @@ pub(crate) mod store {
     if let Some(existing) = existing {
       if descriptor.revision() <= existing.revision() {
         return Some("node descriptor revision");
-      }
-      if existing.removed() && !descriptor.removed() {
-        return Some("node descriptor removal");
       }
     } else if descriptor.revision() == 0 || (descriptor.revision() > 1 && !adopted_binding) {
       return Some("node descriptor revision");
@@ -488,7 +467,7 @@ pub(crate) mod store {
 
   /// Applies one received descriptor page as ONE durable transaction: the
   /// per-descriptor decisions mirror [`store_descriptor_ctx`] exactly
-  /// (older revisions, removal protection, illegal first revisions, and
+  /// (older revisions, illegal first revisions, and
   /// unadopted skipped-revision installs skip; everything else
   /// installs), but the page costs one permit hold, one snapshot, and
   /// one fsync-bound commit instead of one per descriptor. At join
@@ -639,15 +618,12 @@ mod tests {
     Endpoint::parse(&format!("wss://{host}:9000")).unwrap()
   }
 
-  fn descriptor(
-    revision: u64, owner_index: u8, endpoints: Vec<&str>, removed: bool,
-  ) -> NodeDescriptorV1 {
+  fn descriptor(revision: u64, owner_index: u8, endpoints: Vec<&str>) -> NodeDescriptorV1 {
     NodeDescriptorV1::new(
       node(owner_index),
       key(owner_index),
       endpoints.into_iter().map(endpoint).collect(),
       revision,
-      removed,
       1,
     )
   }
@@ -723,7 +699,7 @@ mod tests {
   /// their identity marking through the canonical wire.
   #[test]
   fn descriptor_carries_owner_marking() {
-    let descriptor = descriptor(1, 1, vec!["one.example"], false);
+    let descriptor = descriptor(1, 1, vec!["one.example"]);
     let decoded =
       crate::membership::page::decode_descriptor(&descriptor.encode().unwrap()).unwrap();
     assert_eq!(decoded.node(), &node(1));
@@ -735,7 +711,7 @@ mod tests {
   /// membership — is the authoritative liveness signal.
   #[test]
   fn member_view_defaults_active_and_carries_the_annotated_status() {
-    let descriptor = descriptor(1, 1, vec!["one.example"], false);
+    let descriptor = descriptor(1, 1, vec!["one.example"]);
     let view = super::member_view(&descriptor, crate::ConnectivityStatus::Reachable).unwrap();
     assert_eq!(view.status(), crate::MemberStatus::Active);
     assert_eq!(
@@ -776,13 +752,13 @@ mod tests {
   #[test]
   fn descriptor_contest_picks_first_seen_strictly_greater_winners() {
     let rows = [
-      descriptor(1, 1, vec!["one.example"], false),
-      descriptor(3, 2, vec!["two.example"], false),
-      descriptor(3, 1, vec!["one-again.example"], false),
-      descriptor(2, 2, vec!["two-stale.example"], false),
-      descriptor(4, 1, vec!["one-final.example"], false),
-      descriptor(5, 3, vec!["three.example"], false),
-      descriptor(5, 3, vec!["three-equal.example"], false),
+      descriptor(1, 1, vec!["one.example"]),
+      descriptor(3, 2, vec!["two.example"]),
+      descriptor(3, 1, vec!["one-again.example"]),
+      descriptor(2, 2, vec!["two-stale.example"]),
+      descriptor(4, 1, vec!["one-final.example"]),
+      descriptor(5, 3, vec!["three.example"]),
+      descriptor(5, 3, vec!["three-equal.example"]),
     ];
     let refs: Vec<&NodeDescriptorV1> = rows.iter().collect();
     let (winners, losers) = store::contest_descriptors(&refs);
@@ -803,23 +779,23 @@ mod tests {
   #[tokio::test]
   async fn descriptor_store_enforces_monotonic_revisions() {
     let factory = factory();
-    store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"], false))
+    store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"]))
       .await
       .unwrap();
 
     // Same revision rejected.
     assert!(
-      store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"], false))
+      store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"]))
         .await
         .is_err()
     );
     // Lower revision rejected (no rollback).
-    let stale = descriptor(0, 1, vec!["stale.example"], false);
+    let stale = descriptor(0, 1, vec!["stale.example"]);
     assert!(store::store_descriptor(&factory, &stale).await.is_err());
 
     // A skipped intermediate revision heals the gap instead of diverging:
     // anti-entropy must converge a peer that missed revision 2.
-    store::store_descriptor(&factory, &descriptor(3, 1, vec!["three.example"], false))
+    store::store_descriptor(&factory, &descriptor(3, 1, vec!["three.example"]))
       .await
       .unwrap();
     let current = store::read_descriptor(&factory, &node(1))
@@ -831,7 +807,7 @@ mod tests {
 
     // Rollback to an older revision after the heal is still rejected.
     assert!(
-      store::store_descriptor(&factory, &descriptor(2, 1, vec!["two.example"], false))
+      store::store_descriptor(&factory, &descriptor(2, 1, vec!["two.example"]))
         .await
         .is_err()
     );
@@ -875,7 +851,7 @@ mod tests {
     drop(snapshot);
     store.commit(transaction).await.unwrap();
 
-    let incoming = descriptor(2, 1, vec!["one.example"], false);
+    let incoming = descriptor(2, 1, vec!["one.example"]);
     let page = crate::membership::page::MembershipPage::new(vec![incoming.clone()], None).unwrap();
     let (applied, skipped) =
       store::apply_descriptor_batch_ctx(&store, &crate::api::SystemEntropy, &page)
@@ -927,7 +903,7 @@ mod tests {
     drop(snapshot);
     store.commit(transaction).await.unwrap();
 
-    let incoming = descriptor(2, 1, vec!["one.example"], false);
+    let incoming = descriptor(2, 1, vec!["one.example"]);
     store::store_descriptor_ctx(&store, &crate::api::SystemEntropy, &incoming)
       .await
       .unwrap();
@@ -954,7 +930,7 @@ mod tests {
   #[tokio::test]
   async fn raced_metadata_patches_resolve_to_one_commit() {
     let factory = factory();
-    store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"], false))
+    store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"]))
       .await
       .unwrap();
     let observed = store::read_descriptor(&factory, &node(1))
@@ -1021,7 +997,7 @@ mod tests {
     let error = store::store_descriptor_ctx(
       &store,
       &crate::api::SystemEntropy,
-      &descriptor(0, 3, vec!["zero.example"], false),
+      &descriptor(0, 3, vec!["zero.example"]),
     )
     .await
     .unwrap_err();
@@ -1032,34 +1008,6 @@ mod tests {
         .unwrap()
         .is_none(),
       "the rejected install must not land"
-    );
-  }
-
-  /// A removal marker defeats replayed older descriptors.
-  #[tokio::test]
-  async fn descriptor_removal_marker_defeats_replay() {
-    let factory = factory();
-    store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"], false))
-      .await
-      .unwrap();
-    // Removal at the next revision.
-    store::store_descriptor(&factory, &descriptor(2, 1, vec![], true))
-      .await
-      .unwrap();
-
-    // Replaying the older live descriptor (revision 1) is rejected: the
-    // current revision is 2 and a removal marker cannot be replaced by a
-    // live descriptor.
-    assert!(
-      store::store_descriptor(&factory, &descriptor(1, 1, vec!["one.example"], false))
-        .await
-        .is_err()
-    );
-    // A removal marker replaced only by a valid newer revision.
-    assert!(
-      store::store_descriptor(&factory, &descriptor(3, 1, vec![], true))
-        .await
-        .is_ok()
     );
   }
 
@@ -1078,7 +1026,7 @@ mod tests {
     let error = store::store_descriptor_ctx(
       &store,
       &crate::api::SystemEntropy,
-      &descriptor(1, 1, vec!["one.example"], false),
+      &descriptor(1, 1, vec!["one.example"]),
     )
     .await
     .unwrap_err();
@@ -1097,7 +1045,7 @@ mod tests {
   #[test]
   fn descriptor_compatibility_vectors() {
     // Round-trip produces the expected canonical values.
-    let descriptor = descriptor(7, 3, vec!["alpha.example", "beta.example"], false);
+    let descriptor = descriptor(7, 3, vec!["alpha.example", "beta.example"]);
     let decoded =
       crate::membership::page::decode_descriptor(&descriptor.encode().unwrap()).unwrap();
     assert_eq!(decoded, descriptor);

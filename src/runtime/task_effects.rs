@@ -730,8 +730,7 @@ async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
       }
     };
     let node = descriptor.node();
-    if descriptor.removed()
-      || node == planes.context.identity().node()
+    if node == planes.context.identity().node()
       || departed.status(node) != crate::MemberStatus::Active
     {
       continue;

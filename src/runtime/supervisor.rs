@@ -2448,7 +2448,6 @@ pub(crate) mod test_support {
       member_key(seed),
       endpoints,
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(

@@ -2278,7 +2278,6 @@ mod tests {
       key(702),
       vec![crate::Endpoint::parse("wss://127.0.0.1:4").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(
@@ -2369,7 +2368,6 @@ mod tests {
       key(7),
       vec![crate::Endpoint::parse("wss://127.0.0.1:5").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(
@@ -2441,7 +2439,6 @@ mod tests {
         key(703),
         vec![crate::Endpoint::parse("wss://127.0.0.1:6").unwrap()],
         1,
-        false,
         1,
       ),
     )
@@ -2478,7 +2475,6 @@ mod tests {
       key(51),
       vec![crate::Endpoint::parse("wss://good:9000").unwrap()],
       1,
-      false,
       1,
     );
     let good_key = node(51).as_str().as_bytes().to_vec();
@@ -2565,7 +2561,6 @@ mod tests {
       key(57),
       vec![crate::Endpoint::parse("wss://writer:9000").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(
@@ -3186,7 +3181,6 @@ mod tests {
       key(701),
       vec![crate::Endpoint::parse("wss://127.0.0.1:3").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(
@@ -3304,7 +3298,6 @@ mod tests {
       key(value),
       vec![crate::Endpoint::parse("wss://127.0.0.1:3").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(
@@ -3707,7 +3700,6 @@ mod tests {
       key(700),
       vec![crate::Endpoint::parse("wss://127.0.0.1:1").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(
@@ -3729,7 +3721,6 @@ mod tests {
       key(700),
       vec![crate::Endpoint::parse("wss://127.0.0.1:2").unwrap()],
       2,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(
@@ -3795,7 +3786,6 @@ mod tests {
       key(700),
       vec![crate::Endpoint::parse("wss://127.0.0.1:1").unwrap()],
       1,
-      false,
       1,
     );
     let current = crate::membership::NodeDescriptorV1::new(
@@ -3803,7 +3793,6 @@ mod tests {
       key(700),
       vec![crate::Endpoint::parse("wss://127.0.0.1:2").unwrap()],
       2,
-      false,
       1,
     );
     for descriptor in [&stale, &current] {
@@ -3884,7 +3873,6 @@ mod tests {
       key(700),
       vec![crate::Endpoint::parse("wss://127.0.0.1:1").unwrap()],
       3,
-      false,
       1,
     );
     plane

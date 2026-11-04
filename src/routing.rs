@@ -724,7 +724,7 @@ impl CandidateNodeReader for StoreCandidateReader {
           let Ok(descriptor) = crate::membership::page::decode_descriptor(bytes) else {
             return Ok(None);
           };
-          if descriptor.removed() || !selector.matches(descriptor.labels()) {
+          if !selector.matches(descriptor.labels()) {
             return Ok(None);
           }
           crate::membership::member_view(&descriptor, crate::ConnectivityStatus::Unknown).map(Some)
@@ -1087,7 +1087,6 @@ mod tests {
       public_key,
       vec![Endpoint::parse(&format!("wss://node-{node_index}:9000")).unwrap()],
       revision,
-      false,
       1,
     )
     .with_labels(set)

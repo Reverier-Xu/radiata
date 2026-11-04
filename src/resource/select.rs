@@ -165,7 +165,6 @@ mod tests {
       public_key,
       vec![crate::Endpoint::parse("wss://sel:9000").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(store, &SystemEntropy, &descriptor)

@@ -169,8 +169,7 @@ pub(super) async fn known_online_member_endpoints(
       }
     };
     let node = descriptor.node().clone();
-    if descriptor.removed()
-      || &node == local
+    if &node == local
       || excluded.contains(&node)
       || !bindings.contains_key(&node)
     {
@@ -988,7 +987,6 @@ mod tests {
       member_key(seed),
       vec![endpoint],
       1,
-      false,
       1,
     );
     let namespace =

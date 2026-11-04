@@ -79,7 +79,6 @@ fn descriptor(node: &NodeId, revision: u64, seed: [u8; 32]) -> NodeDescriptorV1 
       crate::Endpoint::parse(&format!("wss://127.0.0.1:{:04}", revision * 1000 % 64000)).unwrap(),
     ],
     revision,
-    false,
     1,
   )
 }

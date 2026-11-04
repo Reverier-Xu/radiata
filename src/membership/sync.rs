@@ -416,7 +416,6 @@ pub(crate) async fn ensure_local_descriptor(
     public_key,
     endpoints,
     descriptor_revision,
-    false,
     1,
   )
   .with_labels(labels);
@@ -1101,7 +1100,6 @@ mod tests {
       key_at(1),
       vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(

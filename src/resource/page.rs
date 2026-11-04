@@ -192,7 +192,7 @@ pub(crate) mod sync {
       // The fast path is the same read `writer_key` starts with: a
       // converged writer resolves without any wait.
       let key = match crate::membership::store::read_descriptor_ctx(store, writer).await {
-        Ok(Some(descriptor)) if !descriptor.removed() => Some(descriptor.public_key().clone()),
+        Ok(Some(descriptor)) => Some(descriptor.public_key().clone()),
         _ => None,
       };
       resolved.insert(writer.clone(), key);
@@ -254,7 +254,7 @@ pub(crate) mod sync {
         if !retried.contains_key(record.writer()) {
           let resolution =
             match crate::membership::store::read_descriptor_ctx(store, record.writer()).await {
-              Ok(Some(descriptor)) if !descriptor.removed() => {
+              Ok(Some(descriptor)) => {
                 Some(descriptor.public_key().clone())
               }
               _ => None,
@@ -311,7 +311,7 @@ pub(crate) mod sync {
     loop {
       let descriptor = crate::membership::store::read_descriptor_ctx(store, writer).await?;
       match descriptor {
-        Some(descriptor) if !descriptor.removed() => {
+        Some(descriptor) => {
           return Ok(descriptor.public_key().clone());
         }
         _ if std::time::Instant::now() >= deadline => {
@@ -398,7 +398,6 @@ mod tests {
       key,
       vec![Endpoint::parse("wss://127.0.0.1:0").unwrap()],
       1,
-      false,
       1,
     );
     descriptor_store::store_descriptor_ctx(store, &SystemEntropy, &descriptor)

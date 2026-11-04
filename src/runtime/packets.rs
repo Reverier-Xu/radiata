@@ -230,8 +230,8 @@ impl PacketAdmission {
   /// Resolves one matching-node target to exactly one eligible
   /// destination: the registered load-balancing policy selects among the
   /// incrementally streamed candidates, and core independently validates
-  /// the pick against the authoritative descriptors — an unknown, removed,
-  /// or nonmatching node fails closed before any frame moves.
+  /// the pick against the authoritative descriptors — an unknown or
+  /// nonmatching node fails closed before any frame moves.
   async fn select_matching_destination(
     &self, context: &Arc<LocalIdentityContext>, selector: &Selector,
     load_balancer: Option<&crate::QualifiedTag>,
@@ -252,7 +252,7 @@ impl PacketAdmission {
     let Some(descriptor) = descriptor else {
       return Err(Error::not_found("packet destination"));
     };
-    if descriptor.removed() || !selector.matches(descriptor.labels()) {
+    if !selector.matches(descriptor.labels()) {
       return Err(Error::not_trusted("packet destination"));
     }
     Ok(selected)

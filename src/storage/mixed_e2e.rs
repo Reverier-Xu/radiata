@@ -64,7 +64,6 @@ fn descriptor(node: &NodeId, revision: u64, seed: [u8; 32]) -> NodeDescriptorV1 
     key,
     vec![crate::Endpoint::parse("wss://127.0.0.1:64000").unwrap()],
     revision,
-    false,
     1,
   )
 }
