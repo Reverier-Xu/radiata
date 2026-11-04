@@ -183,6 +183,19 @@ type RepairIndex = BTreeMap<LaneId, BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>>;
 /// to.
 type Outbound = Vec<(NodeId, Message)>;
 
+/// The per-scan filter inputs every row-judging phase reads: the tombstone
+/// lane's collected-row watermark, the resources lane's swept-predicate
+/// host-clock sample, and the configured removal retention window. One
+/// value per scan keeps every row of a pass judged against one instant,
+/// and naming the fields keeps the two consumers from having to agree on
+/// an argument order.
+#[derive(Clone, Copy, Debug)]
+struct ScanFilters {
+  checkpoint: Option<u64>,
+  swept_at: std::time::SystemTime,
+  removal_retention: Duration,
+}
+
 /// One peer's plane state: one engine per active lane, the cadence
 /// counter, the session's link profile, and the bounded hint-retry slot.
 /// An unprimed entry exists but holds no rows yet (an inbound frame
@@ -588,11 +601,11 @@ impl ReconcilePlane {
     };
     let epoch = store.register_epoch();
     let plan = self.scan_plan(store, epoch, &peers)?;
-    let (checkpoint, swept_at, removal_retention) = self.scan_filter_inputs(store, &plan).await?;
+    let filters = self.scan_filter_inputs(store, &plan).await?;
     let rows: LaneScan = if plan.is_empty() {
       Vec::new()
     } else {
-      scan_lanes(store, &plan, checkpoint).await?
+      scan_lanes(store, &plan, filters.checkpoint).await?
     };
     let mut outbound: Outbound = Vec::new();
     let mut repair: LaneScan = Vec::new();
@@ -622,7 +635,7 @@ impl ReconcilePlane {
         &plan,
         &listed,
         &deferred_rows,
-        (checkpoint, swept_at, removal_retention),
+        filters,
       );
       outbound.extend(driven);
       // The prime's held root exchanges land now that the state
@@ -637,7 +650,7 @@ impl ReconcilePlane {
           &plan,
           &listed,
           &deferred_rows,
-          (checkpoint, swept_at, removal_retention),
+          filters,
         );
       }
       outbound.extend(cadence_window(plane));
@@ -736,7 +749,7 @@ impl ReconcilePlane {
   /// a pass judged against one instant.
   async fn scan_filter_inputs(
     &self, store: &crate::storage::MetadataStore, plan: &BTreeSet<LaneId>,
-  ) -> Result<(Option<u64>, std::time::SystemTime, Duration)> {
+  ) -> Result<ScanFilters> {
     let checkpoint = if plan.contains(&LaneId::Tombstones) {
       crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await?
     } else {
@@ -744,7 +757,11 @@ impl ReconcilePlane {
     };
     let swept_at = std::time::SystemTime::now();
     let removal_retention = self.shared.resource_removal_retention;
-    Ok((checkpoint, swept_at, removal_retention))
+    Ok(ScanFilters {
+      checkpoint,
+      swept_at,
+      removal_retention,
+    })
   }
 
   /// The derived-view repair pass, run outside the peers lock because it
@@ -1120,10 +1137,13 @@ fn scan_view(
 /// state borrow is spent.
 fn drive_peers(
   plane: &mut PlaneState, peers: &[NodeId], rows: &LaneScan, plan: &BTreeSet<LaneId>,
-  listed: &LaneListed, deferred_rows: &BTreeSet<Vec<u8>>,
-  filters: (Option<u64>, std::time::SystemTime, Duration),
+  listed: &LaneListed, deferred_rows: &BTreeSet<Vec<u8>>, filters: ScanFilters,
 ) -> (Outbound, Vec<(LaneId, NodeId)>) {
-  let (checkpoint, swept_at, removal_retention) = filters;
+  let ScanFilters {
+    checkpoint,
+    swept_at,
+    removal_retention,
+  } = filters;
   let mut outbound: Outbound = Vec::new();
   let mut prime_holds: Vec<(LaneId, NodeId)> = Vec::new();
   for peer in peers {
@@ -1255,9 +1275,13 @@ fn drive_peers(
 fn repair_index(
   peers: &BTreeMap<NodeId, PeerState>, repair_pending: &mut BTreeSet<LaneId>,
   plan: &BTreeSet<LaneId>, listed: &LaneListed, deferred_rows: &BTreeSet<Vec<u8>>,
-  filters: (Option<u64>, std::time::SystemTime, Duration),
+  filters: ScanFilters,
 ) -> LaneScan {
-  let (checkpoint, swept_at, removal_retention) = filters;
+  let ScanFilters {
+    checkpoint,
+    swept_at,
+    removal_retention,
+  } = filters;
   let mut seen: BTreeMap<LaneId, BTreeSet<Vec<u8>>> = BTreeMap::new();
   let mut pending: RepairIndex = BTreeMap::new();
   for state in peers.values() {
