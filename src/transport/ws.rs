@@ -33,10 +33,6 @@ pub(crate) const WS_PATH: &str = "/mrly";
 /// generation ID hint (32 lowercase hexadecimal characters).
 pub(crate) const GENERATION_HINT_HEADER: &str = "mrly-generation";
 
-fn generation_hex(generation: &[u8; 16]) -> String {
-  crate::hex::encode(generation)
-}
-
 fn parse_generation_hex(text: &str) -> Result<[u8; 16]> {
   crate::hex::decode_array(text, "websocket hint")
 }
@@ -113,7 +109,7 @@ fn check_path(
       // The hint value is canonical ASCII by construction; a failure to
       // encode it is an internal bug and rejects the upgrade outright
       // rather than emitting a partial hint.
-      let Ok(generation) = HeaderValue::from_str(&generation_hex(hint.generation())) else {
+      let Ok(generation) = HeaderValue::from_str(&crate::hex::encode(hint.generation())) else {
         let mut rejection = ErrorResponse::new(Some("invalid merge hint".to_owned()));
         *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         return Err(rejection);

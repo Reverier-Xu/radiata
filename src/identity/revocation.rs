@@ -167,10 +167,6 @@ fn revocation_key(subject: &NodeId) -> StoreKey {
   StoreKey::new(Arc::from(subject.as_str().as_bytes().to_vec()))
 }
 
-fn decode_value(bytes: &[u8]) -> Result<RevocationRecordV1> {
-  RevocationRecordV1::decode(bytes)
-}
-
 /// The revocation family's deterministic merge decision: two verified
 /// records compete for the single subject slot only over the same pinned
 /// binding — a stored record for a different subject key never competes,
@@ -181,8 +177,8 @@ fn decode_value(bytes: &[u8]) -> Result<RevocationRecordV1> {
 /// issuer-signature verification against retained bindings before they
 /// reached the merge.
 fn revocation_merge(stored: &[u8], fresh: &[u8]) -> Result<TerminalWinner> {
-  let stored_record = decode_value(stored)?;
-  let fresh_record = decode_value(fresh)?;
+  let stored_record = RevocationRecordV1::decode(stored)?;
+  let fresh_record = RevocationRecordV1::decode(fresh)?;
   if stored_record.subject_key() != fresh_record.subject_key() {
     return Err(Error::conflict("revocation record"));
   }
@@ -285,7 +281,7 @@ pub(crate) async fn revoke_binding_ctx(
   // a revocation: an absent slot is the only new authorization boundary.
   let (expected, transition) = match snapshot.get(&namespace, &store_key).await? {
     Some(existing) => {
-      let existing_record = decode_value(existing.as_bytes())?;
+      let existing_record = RevocationRecordV1::decode(existing.as_bytes())?;
       if existing_record == *record {
         return Ok(RevokeStoreOutcome::AlreadyRevoked);
       }
@@ -401,7 +397,11 @@ pub(crate) async fn revoked_key_ctx(
   let Some(value) = snapshot.get(&namespace, &key).await? else {
     return Ok(None);
   };
-  Ok(Some(decode_value(value.as_bytes())?.subject_key().clone()))
+  Ok(Some(
+    RevocationRecordV1::decode(value.as_bytes())?
+      .subject_key()
+      .clone(),
+  ))
 }
 
 /// Whether `subject` is locally revoked under exactly `key` (the session
