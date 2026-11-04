@@ -69,7 +69,9 @@ impl NodeConfig {
   /// the member table (N × interval per round cluster-wide); a cluster
   /// keeping one interval keeps its load predictable (nonzero).
   pub fn with_anti_entropy_interval(mut self, value: Duration) -> Result<Self> {
-    ensure_nonzero_duration(value, "anti-entropy interval")?;
+    if value.is_zero() {
+      return Err(Error::invalid_input("anti-entropy interval"));
+    }
     self.anti_entropy_interval = value;
     Ok(self)
   }
@@ -87,8 +89,12 @@ impl NodeConfig {
   /// budget. Local memory and backpressure only — it never crosses the
   /// wire, so per-device scaling is safe (both nonzero).
   pub fn with_session_queue_limits(mut self, messages: usize, bytes: usize) -> Result<Self> {
-    ensure_nonzero(messages, "session queue messages")?;
-    ensure_nonzero(bytes, "session queue bytes")?;
+    if messages == 0 {
+      return Err(Error::invalid_input("session queue messages"));
+    }
+    if bytes == 0 {
+      return Err(Error::invalid_input("session queue bytes"));
+    }
     self.session_queue_messages = messages;
     self.session_queue_bytes = bytes;
     Ok(self)
@@ -126,7 +132,9 @@ impl NodeConfig {
       return Err(Error::invalid_input("session liveness policy"));
     }
     for value in [idle_timeout, keepalive_interval, keepalive_timeout] {
-      ensure_whole_seconds(value, "session liveness policy")?;
+      if value.subsec_nanos() != 0 {
+        return Err(Error::invalid_input("session liveness policy"));
+      }
     }
     self.session_idle_timeout = idle_timeout;
     self.keepalive_interval = keepalive_interval;
@@ -191,15 +199,21 @@ impl NodeConfig {
   /// the caller's latency floor, so a deployment that never dials may
   /// shrink `network` to `1` but never zero).
   pub fn with_task_reconcile_slots(mut self, local: usize, network: usize) -> Result<Self> {
-    ensure_nonzero(local, "local task reconcile slots")?;
-    ensure_nonzero(network, "network task reconcile slots")?;
+    if local == 0 {
+      return Err(Error::invalid_input("local task reconcile slots"));
+    }
+    if network == 0 {
+      return Err(Error::invalid_input("network task reconcile slots"));
+    }
     self.task_reconcile_local_slots = local;
     self.task_reconcile_network_slots = network;
     Ok(self)
   }
 
   pub fn with_receipt_retention(mut self, value: Duration) -> Result<Self> {
-    ensure_nonzero_duration(value, "receipt retention")?;
+    if value.is_zero() {
+      return Err(Error::invalid_input("receipt retention"));
+    }
     self.receipt_retention = value;
     Ok(self)
   }
@@ -223,8 +237,12 @@ impl NodeConfig {
   pub fn with_resource_removal_retention(
     mut self, retention: Duration, cap: usize,
   ) -> Result<Self> {
-    ensure_nonzero_duration(retention, "resource removal retention")?;
-    ensure_nonzero(cap, "resource removal cap")?;
+    if retention.is_zero() {
+      return Err(Error::invalid_input("resource removal retention"));
+    }
+    if cap == 0 {
+      return Err(Error::invalid_input("resource removal cap"));
+    }
     self.resource_removal_retention = retention;
     self.resource_removal_cap = cap;
     Ok(self)
@@ -238,7 +256,9 @@ impl NodeConfig {
   /// the authentication deadline, which starts only after the connect
   /// returns.
   pub fn with_dial_deadline(mut self, value: Duration) -> Result<Self> {
-    ensure_nonzero_duration(value, "dial deadline")?;
+    if value.is_zero() {
+      return Err(Error::invalid_input("dial deadline"));
+    }
     self.dial_deadline = value;
     Ok(self)
   }
@@ -252,7 +272,9 @@ impl NodeConfig {
   /// keep it uniform across a cluster and tighten it only for
   /// uniformly fast deployments.
   pub fn with_authentication_deadline(mut self, value: Duration) -> Result<Self> {
-    ensure_nonzero_duration(value, "authentication deadline")?;
+    if value.is_zero() {
+      return Err(Error::invalid_input("authentication deadline"));
+    }
     self.authentication_deadline = value;
     Ok(self)
   }
@@ -266,7 +288,9 @@ impl NodeConfig {
   /// a stuck hop would hang to the transitive liveness bound of the
   /// sessions on the path.
   pub fn with_relay_hop_deadline(mut self, value: Duration) -> Result<Self> {
-    ensure_nonzero_duration(value, "relay hop deadline")?;
+    if value.is_zero() {
+      return Err(Error::invalid_input("relay hop deadline"));
+    }
     self.relay_hop_deadline = value;
     Ok(self)
   }
@@ -485,7 +509,9 @@ impl MergeAdmissionLimits {
   /// join pool stays fixed (strangers do not scale with the cluster);
   /// only the member pool grows with the expected member count.
   pub fn for_cluster(expected_members: usize) -> Result<Self> {
-    ensure_nonzero(expected_members, "expected members")?;
+    if expected_members == 0 {
+      return Err(Error::invalid_input("expected members"));
+    }
     Ok(Self::scaled(expected_members))
   }
 
@@ -511,10 +537,18 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    ensure_nonzero(source_burst as usize, "join source burst")?;
-    ensure_nonzero(global_burst as usize, "join global burst")?;
-    ensure_nonzero_duration(source_window, "join source window")?;
-    ensure_nonzero_duration(global_window, "join global window")?;
+    if source_burst == 0 {
+      return Err(Error::invalid_input("join source burst"));
+    }
+    if global_burst == 0 {
+      return Err(Error::invalid_input("join global burst"));
+    }
+    if source_window.is_zero() {
+      return Err(Error::invalid_input("join source window"));
+    }
+    if global_window.is_zero() {
+      return Err(Error::invalid_input("join global window"));
+    }
     self.join_source = (source_burst, source_window);
     self.join_global = (global_burst, global_window);
     Ok(self)
@@ -527,10 +561,18 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    ensure_nonzero(source_burst as usize, "member source burst")?;
-    ensure_nonzero(global_burst as usize, "member global burst")?;
-    ensure_nonzero_duration(source_window, "member source window")?;
-    ensure_nonzero_duration(global_window, "member global window")?;
+    if source_burst == 0 {
+      return Err(Error::invalid_input("member source burst"));
+    }
+    if global_burst == 0 {
+      return Err(Error::invalid_input("member global burst"));
+    }
+    if source_window.is_zero() {
+      return Err(Error::invalid_input("member source window"));
+    }
+    if global_window.is_zero() {
+      return Err(Error::invalid_input("member global window"));
+    }
     self.member_source = (source_burst, source_window);
     self.member_global = (global_burst, global_window);
     Ok(self)
@@ -569,9 +611,15 @@ pub struct TraceMetadataLimits {
 
 impl TraceMetadataLimits {
   pub fn new(active: usize, terminal: usize, retention: Duration) -> Result<Self> {
-    ensure_nonzero(active, "active trace metadata")?;
-    ensure_nonzero(terminal, "terminal trace metadata")?;
-    ensure_nonzero_duration(retention, "trace metadata retention")?;
+    if active == 0 {
+      return Err(Error::invalid_input("active trace metadata"));
+    }
+    if terminal == 0 {
+      return Err(Error::invalid_input("terminal trace metadata"));
+    }
+    if retention.is_zero() {
+      return Err(Error::invalid_input("trace metadata retention"));
+    }
     Ok(Self {
       active,
       terminal,
@@ -621,9 +669,15 @@ pub struct RecoveryConfig {
 
 impl RecoveryConfig {
   pub fn new(fan_out: usize, initial_backoff: Duration, maximum_backoff: Duration) -> Result<Self> {
-    ensure_nonzero(fan_out, "recovery fan-out")?;
-    ensure_nonzero_duration(initial_backoff, "initial recovery backoff")?;
-    ensure_nonzero_duration(maximum_backoff, "maximum recovery backoff")?;
+    if fan_out == 0 {
+      return Err(Error::invalid_input("recovery fan-out"));
+    }
+    if initial_backoff.is_zero() {
+      return Err(Error::invalid_input("initial recovery backoff"));
+    }
+    if maximum_backoff.is_zero() {
+      return Err(Error::invalid_input("maximum recovery backoff"));
+    }
     if initial_backoff > maximum_backoff {
       return Err(Error::invalid_input("recovery policy"));
     }
@@ -666,29 +720,6 @@ impl Default for RecoveryConfig {
       maximum_backoff: Duration::from_secs(5 * 60),
     }
   }
-}
-
-fn ensure_nonzero(value: usize, context: &'static str) -> Result<()> {
-  if value == 0 {
-    return Err(Error::invalid_input(context));
-  }
-  Ok(())
-}
-
-fn ensure_nonzero_duration(value: Duration, context: &'static str) -> Result<()> {
-  if value.is_zero() {
-    return Err(Error::invalid_input(context));
-  }
-  Ok(())
-}
-
-/// Rejects a duration whose sub-second component would be truncated by a
-/// second-granular consumer. Zero stays valid: it disables the policy.
-fn ensure_whole_seconds(value: Duration, context: &'static str) -> Result<()> {
-  if value.subsec_nanos() != 0 {
-    return Err(Error::invalid_input(context));
-  }
-  Ok(())
 }
 
 #[cfg(test)]
