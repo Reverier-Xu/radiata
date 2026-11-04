@@ -21,11 +21,6 @@ use crate::{
   StoreValue, TransactionId, api::Entropy, storage::MetadataStore,
 };
 
-/// The resource lane's family tag: the write sites note their local
-/// writes through it, so the reconciliation plane rescans exactly this
-/// lane on a resource commit.
-pub(crate) const NAMESPACE_TAG: &str = RESOURCE_RECORD_NAMESPACE;
-
 pub(crate) fn namespace() -> Result<StoreNamespace> {
   crate::storage::families::namespace(RESOURCE_RECORD_NAMESPACE)
 }
@@ -170,7 +165,7 @@ pub(crate) async fn commit_expected_record_ctx(
     // sync pages, retention rewrites), so this one bump is the change
     // signal the sync driver turns into next-tick pushes.
     if matches!(outcome, ResourceCommitOutcome::Installed(_)) {
-      store.note_local_write_tag(crate::resource::store::NAMESPACE_TAG);
+      store.note_local_write_tag(crate::resource::store::RESOURCE_RECORD_NAMESPACE);
     }
   })
 }
@@ -290,7 +285,7 @@ pub(crate) async fn commit_page_batch_ctx(
       }
     }
     if !installed.is_empty() {
-      store.note_local_write_tag(crate::resource::store::NAMESPACE_TAG);
+      store.note_local_write_tag(crate::resource::store::RESOURCE_RECORD_NAMESPACE);
     }
     return Ok(installed);
   }

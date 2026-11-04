@@ -711,7 +711,7 @@ impl CandidateNodeReader for StoreCandidateReader {
     &'a self, selector: &'a Selector, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> BoxFuture<'a, Result<crate::MemberPage>> {
     Box::pin(async move {
-      let limit = limit.clamp(1, crate::membership::page::DEFAULT_PAGE_LIMIT);
+      let limit = limit.clamp(1, crate::paging::PAGE_MAX_ITEMS);
       let namespace = crate::membership::descriptor_namespace()?;
       let snapshot = self.snapshot.as_ref();
       let paged = crate::paging::scan_paged(

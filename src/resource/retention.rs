@@ -199,7 +199,7 @@ pub(crate) async fn sweep_removed_ctx(
       // removal rows, and the derived-view repair re-applies them —
       // the retention resurrection (the sweep and the repair loop
       // forever over the same rows).
-      store.note_local_write_tag(super::store::NAMESPACE_TAG);
+      store.note_local_write_tag(super::store::RESOURCE_RECORD_NAMESPACE);
       Ok(removed)
     }
     // A conflict or abort mutates nothing: the newer winner (or the

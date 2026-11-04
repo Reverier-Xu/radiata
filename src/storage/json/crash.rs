@@ -27,7 +27,7 @@ fn requirements() -> StoreRequirements {
   crate::storage::test_util::crash_requirements()
 }
 
-fn seed_transaction() -> StoreTransactionAlias {
+fn seed_transaction() -> crate::StoreTransaction {
   helpers::put_transaction(
     1,
     StoreRevision::new(Arc::from(0_u64.to_be_bytes())).unwrap(),
@@ -35,11 +35,9 @@ fn seed_transaction() -> StoreTransactionAlias {
   )
 }
 
-fn child_transaction(base: StoreRevision) -> StoreTransactionAlias {
+fn child_transaction(base: StoreRevision) -> crate::StoreTransaction {
   helpers::put_transaction(2, base, &[("child", b"child-value")])
 }
-
-type StoreTransactionAlias = crate::StoreTransaction;
 
 #[ignore = "crash-matrix child process entry point"]
 #[tokio::test]

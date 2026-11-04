@@ -196,7 +196,7 @@ async fn converge(sides: [&MetadataStore; 2]) {
         let page = resource_page::sync::emit_test_page(
           emitter,
           cursor.as_deref(),
-          resource_page::DEFAULT_RESOURCE_PAGE_LIMIT,
+          crate::paging::PAGE_MAX_ITEMS,
         )
         .await
         .unwrap();

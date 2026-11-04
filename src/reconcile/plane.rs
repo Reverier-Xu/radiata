@@ -1608,7 +1608,7 @@ fn lane_of_namespace(namespace: &crate::StoreNamespace) -> Option<LaneId> {
   if tag == crate::storage::families::IDENTITY_BINDING_NAMESPACE {
     return Some(LaneId::Trust);
   }
-  if tag == crate::resource::store::NAMESPACE_TAG {
+  if tag == crate::resource::store::RESOURCE_RECORD_NAMESPACE {
     return Some(LaneId::Resources);
   }
   if matches!(

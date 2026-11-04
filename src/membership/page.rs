@@ -14,9 +14,6 @@ pub(crate) const MEMBERSHIP_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/m
 use super::NodeDescriptorV1;
 #[cfg(test)]
 use super::store;
-/// The default page limit when the caller supplies none (single-sourced
-/// in the paging module; lane-local name for readable call sites).
-pub(crate) use crate::paging::PAGE_DEFAULT_LIMIT as DEFAULT_PAGE_LIMIT;
 /// The maximum page size a receiver accepts, bounding one page's bytes.
 pub(crate) use crate::paging::PAGE_MAX_ITEMS as MAX_PAGE_DESCRIPTORS;
 use crate::{

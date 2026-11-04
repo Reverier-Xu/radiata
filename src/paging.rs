@@ -34,16 +34,12 @@ use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{Error, Result};
 
-/// The default page limit when the caller supplies none: one constant
-/// for every paging lane (membership descriptors, resource records), so
-/// per-lane copies cannot drift apart. It sits at the receiver cap: one
-/// full-catalog walk costs the fewest round trips the item cap allows.
-pub(crate) const PAGE_DEFAULT_LIMIT: usize = PAGE_MAX_ITEMS;
-
 /// The maximum item count of one page: a page above this bound fails
 /// closed instead of being truncated. The count is the only bound this
 /// module owns; one shipped page's bytes are bounded by the reconcile
-/// plane's row budget (`reconcile::engine::ROW_BYTES_BUDGET`).
+/// plane's row budget (`reconcile::engine::ROW_BYTES_BUDGET`). A caller
+/// that supplies no limit gets this cap, so one full-catalog walk costs
+/// the fewest round trips the item cap allows.
 pub(crate) const PAGE_MAX_ITEMS: usize = 64;
 
 /// The test-fixture page envelope: one positional array layout shared by

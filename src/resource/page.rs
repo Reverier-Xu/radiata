@@ -20,10 +20,6 @@ use crate::Result;
 #[cfg(test)]
 pub(crate) const RESOURCE_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/resource-page";
 
-/// The default records-per-page limit (single-sourced in the paging
-/// module; lane-local name for readable call sites).
-#[cfg(test)]
-pub(crate) use crate::paging::PAGE_DEFAULT_LIMIT as DEFAULT_RESOURCE_PAGE_LIMIT;
 /// The per-page capacity: a page above this bound fails closed instead
 /// of being truncated.
 pub(crate) use crate::paging::PAGE_MAX_ITEMS as MAX_PAGE_RECORDS;

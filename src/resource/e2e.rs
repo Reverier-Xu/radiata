@@ -145,7 +145,7 @@ async fn converge(sides: [&MetadataStore; 2]) -> ConvergeCost {
         let page = resource_page::sync::emit_test_page(
           emitter,
           cursor.as_deref(),
-          resource_page::DEFAULT_RESOURCE_PAGE_LIMIT,
+          crate::paging::PAGE_MAX_ITEMS,
         )
         .await
         .unwrap();
@@ -401,7 +401,7 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
     let page = resource_page::sync::emit_test_page(
       &side_a,
       cursor.as_deref(),
-      resource_page::DEFAULT_RESOURCE_PAGE_LIMIT,
+      crate::paging::PAGE_MAX_ITEMS,
     )
     .await
     .unwrap();

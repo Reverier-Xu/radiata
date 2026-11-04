@@ -1354,13 +1354,10 @@ pub(crate) mod test_support {
       for (emitter, receiver) in [(a, b), (b, a)] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
-          let page_out = page::sync::emit_test_page(
-            emitter,
-            cursor.as_deref(),
-            page::DEFAULT_RESOURCE_PAGE_LIMIT,
-          )
-          .await
-          .unwrap();
+          let page_out =
+            page::sync::emit_test_page(emitter, cursor.as_deref(), crate::paging::PAGE_MAX_ITEMS)
+              .await
+              .unwrap();
           let done = page_out.cursor().is_none();
           cursor = page_out.cursor().map(|value| value.to_vec());
           applied += page::sync::apply_page_ctx(receiver, &SystemEntropy, &page_out)
