@@ -294,11 +294,10 @@ async fn select_resources_pages_the_empty_catalog() {
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
-/// The lazy local-descriptor install is a member-set change (remaining
-/// items 2026-10-10, P2-9): the first paged member query on a node with
-/// no listener yet SCHEDULES the install — off the supervisor's select
-/// loop, single flight — instead of awaiting it, and the scheduled
-/// install must still fire the paired `MemberChanged` event and
+/// The lazy local-descriptor install is a member-set change: the first paged
+/// member query on a node with no listener yet SCHEDULES the install — off the
+/// supervisor's select loop, single flight — instead of awaiting it, and the
+/// scheduled install must still fire the paired `MemberChanged` event and
 /// revision bump exactly once, so a watcher that subscribes before
 /// acting never misses the local node joining its own member set. The
 /// node's own page observes the install from the next read on (the one

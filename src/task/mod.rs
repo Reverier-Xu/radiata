@@ -1224,9 +1224,9 @@ mod tests {
     NodeId::parse(&text).expect("node id")
   }
 
-  /// The P2-1 regression at the facility level: a wedged observation
-  /// parks its lane's runner, the lane's inbox bounds how much further
-  /// work may queue behind it, the next observation is dropped with the
+  /// The observation-lane regression at the facility level: a wedged
+  /// observation parks its lane's runner, the lane's inbox bounds how much
+  /// further work may queue behind it, the next observation is dropped with the
   /// overload diagnostic, and dropping the lanes aborts the parked
   /// runner — wedged observer code is cancelled at shutdown instead of
   /// surviving as detached work.
@@ -1331,7 +1331,7 @@ mod tests {
     assert!(!overflow_ran.load(Ordering::SeqCst));
   }
 
-  /// The P2-1 resource-observer half: awaiting
+  /// The resource-observer half: awaiting
   /// [`notify_resource_observers`] only schedules onto the lanes — the
   /// write task never waits on observer code — and one resource's
   /// observations keep their commit order on the resource's pinned

@@ -158,7 +158,7 @@ async fn apply_cleanup_record(
 /// before any persistence, never covered by checkpoints, and never
 /// re-adoptable away. A persisted revocation closes the authorization
 /// boundary immediately on this node too — the same boundary the local
-/// revoke effect holds (audit 2026-10-23, P1-11): any live session with
+/// revoke effect holds: any live session with
 /// the revoked identity retires, and a handshake already in flight is
 /// refused at its final publication (its recovery dials race the
 /// propagation, so a session admitted before this tombstone landed must
@@ -181,11 +181,10 @@ async fn apply_revocation_record(
     tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
     return Ok(());
   }
-  // The same exclusive section the local revoke effect holds (audit
-  // 2026-10-23, P1-11): the durable tombstone install, the ledger
-  // record, and the session retirement run as ONE section against
-  // session publication. A handshake whose admission predated this
-  // tombstone either published before the section ran (the retirement
+  // The same exclusive section the local revoke effect holds: the durable
+  // tombstone install, the ledger record, and the session retirement run as ONE
+  // section against session publication. A handshake whose admission predated
+  // this tombstone either published before the section ran (the retirement
   // below removes it) or re-checks the ledger after the section and
   // refuses to publish — the remote lane closes the in-flight window
   // exactly like the local one. The section is short and touches no
@@ -199,7 +198,7 @@ async fn apply_revocation_record(
   // The paired notification the local revoke effect emits: the
   // retirement above removed the session-table entry, so the session
   // task's own exit path cannot report the change — this lane reports
-  // it, SessionChanged first, then NodeRevoked (audit 2026-10-27, B1).
+  // it, SessionChanged first, then NodeRevoked.
   if transition.changed_authorization() {
     events.emit(crate::SessionChanged::new(record.subject().clone()));
     events.emit(crate::NodeRevoked::new(record.subject().clone()));
@@ -561,7 +560,7 @@ mod tests {
   /// retirement stays independent of the evidence verdict: an
   /// already-revoked identity's live session still retires.
   ///
-  /// Regression (audit 2026-10-27, B1): a revocation that changes
+  /// Regression: a revocation that changes
   /// authorization through the sync lane reports the session change too
   /// — one `SessionChanged` pairing with the one `NodeRevoked`, both for
   /// the revoked subject, in the same branch — exactly the pair the local
@@ -656,14 +655,14 @@ mod tests {
     let revision = crate::node::MemberRevisionSignal::new(revision_tx);
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // The boundary the production wiring shares between the tombstone
-    // lane and session publication (audit 2026-10-23, P1-11).
+    // lane and session publication.
     let authorization = crate::session::stream::AuthorizationBoundary::default();
     let mut revoked_events = events.subscribe::<crate::NodeRevoked>(crate::EventOptions::new());
     let mut member_events = events.subscribe::<crate::MemberChanged>(crate::EventOptions::new());
     let mut session_events = events.subscribe::<crate::SessionChanged>(crate::EventOptions::new());
 
     // The first delivery is the real transition: one revocation event,
-    // one paired session event (B1 parity with the local revoke path),
+    // one paired session event (parity with the local revoke path),
     // and one member revision for the cleanup install.
     let first_rows = vec![
       row(3, &subject, loser.encode().unwrap()),
@@ -784,12 +783,12 @@ mod tests {
       .to_vec()
   }
 
-  /// Regression (audit A01): one divergent terminal record must never
+  /// Regression: one divergent terminal record must never
   /// abort a tombstone batch — the cleanup and revocation arms refuse the
   /// row (warn + continue) exactly like the leave arm, a same-binding
   /// divergent cleanup row merges to its canonical winner instead of
   /// conflicting, and rows ordered after a refused row still apply in
-  /// the same pass. Before the fix, the `?` on the apply arms wedged the
+  /// the same pass. A `?` on the apply arms would wedge the
   /// derived-view repair on the same poison row every epoch.
   #[tokio::test]
   async fn divergent_tombstone_rows_refuse_row_wise_and_never_abort_the_batch() {
@@ -957,7 +956,7 @@ mod tests {
   }
 
   /// The tombstone lane records its revocations in the shared
-  /// authorization boundary (audit 2026-10-23, P1-11): a subject whose
+  /// authorization boundary: a subject whose
   /// remote tombstone landed through sync must be refused at session
   /// publication exactly like a locally revoked one. A fresh install and
   /// an unchanged replay both leave the subject in the ledger (both

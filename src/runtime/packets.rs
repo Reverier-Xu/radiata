@@ -31,15 +31,15 @@ pub(super) struct PumpHandoff {
 /// The admission plane's collaborators, cloned off the supervisor so one
 /// request's target resolution, descriptor validation, first-hop
 /// selection, and route record run in a spawned admission task instead
-/// of the control loop (audit 2026-10-23 P1-5): a caller-supplied policy
-/// that never resolves parks one bounded admission slot — never a
+/// of the control loop: a caller-supplied policy that never resolves parks
+/// one bounded admission slot — never a
 /// control read, another packet's admission, or shutdown.
 ///
 /// The node's identity context deliberately does not live here: it
 /// carries the store handle, and a long-lived clone would outlast the
-/// shutdown path's storage drain and completion barrier (audit
-/// 2026-10-23 P1-10). Each admission task receives its own clone and
-/// drops it when the task ends, and every admission task is aborted and
+/// shutdown path's storage drain and completion barrier. Each admission
+/// task receives its own clone and drops it when the task ends, and every
+/// admission task is aborted and
 /// awaited before that barrier runs. The node-local id stands in for the
 /// packet context for the same reason: that context holds the durable
 /// trace sink, which itself carries the identity context.

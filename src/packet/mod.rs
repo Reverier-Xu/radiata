@@ -643,7 +643,7 @@ pub(crate) enum StreamItem {
   /// A relay-synthesized truncated terminal: the sending leg died
   /// mid-stream. Ends the body prefix without the completed sentinel,
   /// so the body stream surfaces exactly one typed `StreamInterrupted`
-  /// — the same shape as a dropped channel (audit 2026-10-09 item 11).
+  /// — the same shape as a dropped channel.
   Interrupted,
 }
 
@@ -980,7 +980,7 @@ mod tests {
   /// A relay-synthesized interrupted terminal (a mid-stream death on the
   /// sending leg) truncates the body with exactly one typed error — the
   /// same shape as the dropped channel above — instead of completing it
-  /// normally (audit 2026-10-09 item 11).
+  /// normally.
   #[tokio::test]
   async fn channel_body_interrupted_terminal_is_one_typed_interruption() {
     let (sender, receiver) = tokio::sync::mpsc::channel(4);

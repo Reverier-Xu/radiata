@@ -399,7 +399,7 @@ pub(crate) async fn ensure_local_descriptor(
   // ([`crate::membership::apply_metadata_patch`], which preserves them),
   // so an endpoint-set rewrite must not clear them. A rewrite that
   // dropped labels would publish an empty set at a higher revision and
-  // propagate the loss to every peer (audit 2026-10-09, item 10).
+  // propagate the loss to every peer.
   //
   // Endpoint-set semantics: the bound listeners' published endpoints
   // are the descriptor's endpoint truth. An endpoint patched in without
@@ -448,14 +448,13 @@ pub(crate) async fn ensure_local_descriptor(
 /// tick is only the local store maintenance whose writes then drive the
 /// plane's epoch-rescan triggers.
 ///
-/// The same quiescence contract the old sync tick held: before any
-/// member is admitted the node's store writes are quiescent (the listen
+/// The quiescence contract: before any member is admitted the node's
+/// store writes are quiescent (the listen
 /// effect publishes the local descriptor eagerly at the listener bind,
 /// and a member query only SCHEDULES the listenerless node's lazy
-/// publication off the supervisor's select loop — remaining items
-/// 2026-10-10, P2-9), keeping the admission commit sequence deterministic
-/// for fault-injecting providers — nothing here runs before membership
-/// exists.
+/// publication off the supervisor's select loop), keeping the admission
+/// commit sequence deterministic for fault-injecting providers — nothing
+/// here runs before membership exists.
 pub(crate) async fn membership_maintenance_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
   local_endpoints: &[crate::Endpoint], events: &Arc<crate::node::EventHub>,
@@ -465,9 +464,8 @@ pub(crate) async fn membership_maintenance_tick(
   // Nothing to advertise at startup: the listen effect publishes the
   // local descriptor (with endpoints) when the first listener binds,
   // and a member query schedules the listenerless node's publication
-  // off the supervisor's select loop (remaining items 2026-10-10,
-  // P2-9), so the maintenance loop never races a transient empty
-  // endpoint set into a revision bump.
+  // off the supervisor's select loop, so the maintenance loop never races a
+  // transient empty endpoint set into a revision bump.
   if !local_endpoints.is_empty() {
     ensure_local_descriptor(context, entropy, local_endpoints.to_vec(), events, revision).await?;
   }
@@ -535,11 +533,11 @@ mod tests {
     );
   }
 
-  /// Regression (audit 2026-10-09, item 10): the local descriptor's
+  /// Regression: the local descriptor's
   /// endpoint rewrite must carry the descriptor's existing capability
-  /// labels. The rewrite used to rebuild the descriptor without them,
-  /// publishing an empty label set at a higher revision — and that loss
-  /// then propagated to every peer through sync. Both drift directions
+  /// labels. A rewrite that rebuilds the descriptor without them
+  /// publishes an empty label set at a higher revision — and that loss
+  /// then propagates to every peer through sync. Both drift directions
   /// (a listener added, a listener removed) are pinned; the documented
   /// rollback of a patched-but-unlistened endpoint is pinned by the
   /// integration test in `tests/membership_sync.rs`.
@@ -1020,7 +1018,7 @@ mod tests {
   /// traffic is its bounded confirmation refresh, and a real catalog
   /// change pushes exactly one row on the next tick, alone — one
   /// changed row costs one row on the wire, never a catalog-sized
-  /// re-send (the 2026-10 audit's cascade amplifier stays removed).
+  /// re-send.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_converged_mesh_emits_nothing_until_a_real_change() {
     use std::sync::atomic::Ordering;

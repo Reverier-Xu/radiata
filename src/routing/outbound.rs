@@ -8,18 +8,18 @@
 //! entry's bounded frame queue and its pending-admission map — the
 //! outbound counterpart of the relay path in `crate::routing::forward`.
 //!
-//! Route-record terminal contract (remaining items 2026-10-10, P2-3):
-//! the record is shared between this pump and the session read loop's
-//! late failure reports, and the two writers converge through the route
-//! table's monotonic terminal machine (`update_route`): a recorded
+//! Route-record terminal contract: the record is shared between this pump
+//! and the session read loop's late failure reports, and the two writers
+//! converge through the route table's monotonic terminal machine
+//! (`update_route`): a recorded
 //! `Failed` is final and refuses every later update, while a failure
 //! reported after a recorded `Delivered` still overrides it. `Delivered`
 //! therefore means exactly "the origin enqueued the full body and the
 //! end frame onto its session" — never "the peer consumed the stream" —
 //! and a downstream death — when its report reaches this node —
 //! deterministically ends the record `Failed(StreamInterrupted)` under
-//! either ordering. The durable route-trace twin mirrors that contract
-//! (remaining items 2026-10-10, P2-7): a refused end-of-stream update
+//! either ordering. The durable route-trace twin mirrors that contract:
+//! a refused end-of-stream update
 //! skips the durable `Delivered` write here, and the read loop's late
 //! failure handler revises the same trace id's durable terminal to
 //! `Failed(StreamInterrupted)` — so the durable evidence converges with
@@ -152,7 +152,7 @@ async fn send_terminal(entry: &SessionEntry, trace_id: &TraceId, reason: EndReas
 /// the stream `Completed`, and every failure — a body read error, a failed
 /// or cancelled chunk pump, or a completion that cannot be delivered — ends
 /// it `Interrupted`, so the destination's consumer never waits forever on a
-/// stream this node already gave up on (audit P1-7). The delivery is
+/// stream this node already gave up on. The delivery is
 /// best-effort by construction: when the session queue is already closed the
 /// connection is gone, the peer observes that teardown itself, and the local
 /// terminal record below is the definitive evidence.
@@ -298,7 +298,7 @@ pub(crate) async fn run_outbound(
   if let Err(kind) = pump_chunks(&entry, &routes, &trace_id, request.body).await {
     // The destination already runs a consumer for this stream: the failure
     // must terminate it explicitly on the wire rather than leaving it
-    // waiting on a body that will never continue (audit P1-7).
+    // waiting on a body that will never continue.
     debug!(
       trace_id = %trace_id,
       kind = ?kind,
@@ -329,15 +329,14 @@ pub(crate) async fn run_outbound(
   // refuses this update and keeps `Failed(StreamInterrupted)` final —
   // that refusal is the contract, not a lost update: `Delivered`
   // states that the full body and end left this node, never that the
-  // peer consumed them (remaining items 2026-10-10, P2-3). The refused
-  // tail also skips the `RouteChanged` emit and the durable
-  // `Delivered` twin: the read loop's late-failure flip emits the
-  // nudge and persists the durable revision instead (the other half of
-  // the durable twin's mirror, remaining items 2026-10-10, P2-7), so the
-  // durable trace ends `Failed(StreamInterrupted)` under either
-  // writer ordering instead of keeping a contradicted `Delivered`
-  // for the whole retention window. A poisoned table lock keeps the
-  // legacy behavior (emit plus persist) rather than guessing.
+  // peer consumed them. The refused tail also skips the `RouteChanged`
+  // emit and the durable `Delivered` twin: the read loop's late-failure
+  // flip emits the nudge and persists the durable revision instead (the
+  // other half of the durable twin's mirror), so the durable trace ends
+  // `Failed(StreamInterrupted)` under either writer ordering instead of
+  // keeping a contradicted `Delivered` for the whole retention window. A
+  // poisoned table lock keeps the legacy behavior (emit plus persist)
+  // rather than guessing.
   update_route(&routes, &trace_id, |record| {
     record.update(RouteState::Delivered);
   });
@@ -425,11 +424,11 @@ mod route_terminal_contract_tests {
       .unwrap()
   }
 
-  /// Pump-side half of the terminal contract (remaining items
-  /// 2026-10-10, P2-3): once a mid-flight failure is recorded, the
-  /// end-of-stream `Delivered` must not overwrite it — the route table's
-  /// monotonic terminal machine refuses the update, so the origin's final
-  /// answer stays `Failed` when the failure lands before the pump's tail.
+  /// Pump-side half of the terminal contract: once a mid-flight failure is
+  /// recorded, the end-of-stream `Delivered` must not overwrite it — the
+  /// route table's monotonic terminal machine refuses the update, so the
+  /// origin's final answer stays `Failed` when the failure lands before the
+  /// pump's tail.
   #[test]
   fn recorded_failure_refuses_the_pump_tail_delivered() {
     let trace_id = trace(1);
@@ -540,12 +539,12 @@ mod pump_tail_durable_tests {
     sink.persisted_records().await
   }
 
-  /// The refused tail must not persist a durable `Delivered` (remaining
-  /// items 2026-10-10, P2-7): when a late mid-flight failure already
-  /// terminalised the route record `Failed`, the pump's end-of-stream
-  /// `Delivered` is refused by the monotonic terminal machine — and the
-  /// refused tail skips the durable `Delivered` twin too, so the durable
-  /// trace keeps the read loop's revised `Failed(StreamInterrupted)`
+  /// The refused tail must not persist a durable `Delivered`: when a late
+  /// mid-flight failure already terminalises the route record `Failed`, the
+  /// pump's end-of-stream `Delivered` is refused by the monotonic terminal
+  /// machine — and the refused tail skips the durable `Delivered` twin too,
+  /// so the durable trace keeps the read loop's revised
+  /// `Failed(StreamInterrupted)`
   /// instead of contradicting it for the whole retention window.
   #[tokio::test]
   async fn refused_tail_skips_the_durable_delivered_twin() {
@@ -704,7 +703,7 @@ mod body_failure_tests {
     }
   }
 
-  /// Regression (audit P1-7): a body that fails after admission must end the
+  /// Regression: a body that fails after admission must end the
   /// destination's stream explicitly. The session queue sees the open, the
   /// chunks produced before the failure, and then an INTERRUPTED end — never
   /// a bare return that leaves the remote consumer waiting on a body that

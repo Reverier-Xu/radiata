@@ -114,8 +114,7 @@ pub(crate) struct ChunkFrame {
 /// A decoded packet-end frame. The typed terminal reason separates a
 /// sender-completed body from a transport interruption a relay
 /// synthesized when its upstream leg died mid-stream, so a destination
-/// can never mistake a truncated body for a complete one (audit
-/// 2026-10-09 item 11).
+/// can never mistake a truncated body for a complete one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EndFrame {
   pub(crate) trace_id: TraceId,
@@ -645,8 +644,8 @@ mod route_tests {
   /// A frame without a route decodes with `None` route state — direct
   /// delivery — through the single six-field wire shape, and structurally
   /// invalid bodies fail closed through that one path with the unified
-  /// decode context (the retired five-element branch used to report such
-  /// bodies as "packet open decode" instead).
+  /// decode context, so every structurally invalid body reports through
+  /// that one path.
   #[test]
   fn direct_open_frame_decodes_without_route_state() {
     let (trace_id, source, destination, _) = ids();
@@ -671,8 +670,7 @@ mod route_tests {
     assert!(decode_open(&padded, PACKET_CBOR_LIMITS).is_err());
 
     // A structurally invalid open body fails closed through the single
-    // remaining path — the retired branch's "packet open decode"
-    // context no longer exists anywhere.
+    // decode path, whose context is never the legacy "packet open decode".
     let mut oversized = encode_open(&frame).unwrap();
     oversized[0] = 0x87;
     oversized.extend_from_slice(&[0x00]);

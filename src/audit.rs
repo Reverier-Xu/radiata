@@ -63,9 +63,8 @@ pub(crate) fn descriptor_installed(node: &str, revision: u64) {
 /// One membership diff page went on the wire with `rows` descriptors —
 /// the sent-side counter for the anti-entropy redundancy ledger: the
 /// ratio of summed `rows` to `descriptor_installed` events is the
-/// delivered-versus-useful traffic ratio (the 2026-10 audit's 98%
-/// finding), so a regression toward whole-catalog re-sends is
-/// measurable from the audit stream alone.
+/// delivered-versus-useful traffic ratio, so a regression toward
+/// whole-catalog re-sends is measurable from the audit stream alone.
 pub(crate) fn membership_page_emitted(rows: usize) {
   #[cfg(feature = "audit")]
   debug!(target: "audit", rows, "membership diff page emitted");

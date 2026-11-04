@@ -289,7 +289,7 @@ fn cluster_identifiers_stay_excised() {
   }
 }
 
-/// The packet data plane keeps the retired hand-rolled body vocabulary out
+/// The packet data plane keeps the hand-rolled body vocabulary out
 /// of the implementation and adopts the standard `ReceiverStream` adapter.
 #[test]
 fn packet_body_vocabulary_stays_retired() {

@@ -426,7 +426,7 @@ impl PacketConsumer for DrainAll {
   }
 }
 
-/// Audit 2026-10-09, item 4: a finished packet pump is reaped from the
+/// a finished packet pump is reaped from the
 /// supervisor's task set as it completes, so the background-task
 /// counter returns to its baseline instead of growing by one per
 /// completed stream until shutdown.

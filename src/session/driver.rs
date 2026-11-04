@@ -119,7 +119,7 @@ pub(crate) struct SessionDriver {
   /// features) that built this driver's offer. Every handshake role
   /// selects against it, so a caller-registered feature survives into
   /// the session's feature intersection instead of being dropped by a
-  /// builtin-only rebuild (audit 2026-10-09 item 15).
+  /// builtin-only rebuild.
   features: Arc<FeatureRegistry>,
   authentication_deadline: Duration,
   limiter: crate::identity::merge_rate::MergeLimiter,

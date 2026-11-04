@@ -105,8 +105,7 @@ mod tests {
   }
 
   /// Same content under distinct keys digests distinctly, so two such
-  /// rows can never XOR-cancel out of a fingerprint — the audit's
-  /// `item_hash` pathology.
+  /// rows can never XOR-cancel out of a fingerprint.
   #[test]
   fn reconcile_digest_separates_same_content_under_distinct_keys() {
     let left = item_digest(b"a", b"payload").unwrap();

@@ -154,14 +154,14 @@ async fn redb_runtime_node_start_restart_preserves_identity_without_new_key() {
 
 /// The shutdown reply returns only once the storage execution barrier
 /// has drained every execution holding the database — the detached
-/// commits (audit 2026-10-23 P1-10) AND the snapshot executions whose
-/// blocking reads or live handles used to pin the file lock a few
-/// milliseconds past the reply (audit 2026-10-27 B3). The reopen after
+/// commits AND the snapshot executions whose
+/// blocking reads or live handles would otherwise pin the file lock a few
+/// milliseconds past the reply. The reopen after
 /// every round is immediate and un-retried: a single `StorageLocked`
 /// here is the regression the barrier's read half exists to prevent.
-/// The rounds repeat the exact reproduction shape observed before the
-/// fix (durable activity, shutdown, immediate reopen) because the race
-/// landed in a minority of rounds under load.
+/// The rounds repeat the exact reproduction shape (durable activity,
+/// shutdown, immediate reopen) because the race
+/// lands in a minority of rounds under load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redb_runtime_shutdown_releases_the_file_lock_before_the_reply() {
   const ROUNDS: usize = 12;
@@ -249,18 +249,18 @@ fn trace_lane_body(
 }
 
 /// The routed-traffic twin of the lock-release regression above (the
-/// audit 2026-10-27 B3 residual, mechanism 2): the trace sink's detached
-/// terminal-fact tasks used to hold their identity context — and with it
-/// the redb file lock — invisibly to the shutdown barrier, so a
+/// residual mechanism 2): the trace sink's detached
+/// terminal-fact tasks would otherwise hold their identity context — and with
+/// it the redb file lock — invisibly to the shutdown barrier, so a
 /// shutdown with routed traffic in flight could answer its reply while
-/// trace persistence still pinned the file. The sink now holds that
+/// trace persistence still pinned the file. The sink holds that
 /// context weakly: every task the barrier cannot see (still queued,
 /// still parked on the sink's persistence permits, or not yet polled)
 /// finds the store released and skips its write instead of re-pinning
 /// it. Each round drives a burst of routed streams — the only producer
 /// of terminal trace facts — until the first durable fact proves the
 /// scenario, shuts the redb node down, and reopens the same file
-/// immediately and un-retried. Like the lane above, the race landed in
+/// immediately and un-retried. Like the lane above, the race lands in
 /// a minority of rounds under load, so the rounds repeat the exact
 /// reproduction shape (terminal-fact burst, shutdown, immediate
 /// reopen); the skip itself — and its accounting — is pinned

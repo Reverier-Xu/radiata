@@ -90,7 +90,7 @@ async fn redb_adapter_reopen_preserves_entries_receipts_and_revision() {
 
 /// Dropping a commit future's handle must not roll the commit back:
 /// redb's `spawn_blocking` task detaches and still lands the durable
-/// receipt and value (audit 2026-10-09 item 14). This is the reason the
+/// receipt and value. This is the reason the
 /// metadata store's frozen slot settles from the landing task's own
 /// completion — never from the future drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -151,7 +151,7 @@ async fn redb_adapter_dropped_commit_future_still_lands_durably() {
 /// reconcile of the same transaction waits for that detached landing
 /// before reading evidence, so the landing is judged by its final
 /// receipt — never misjudged as `Aborted` while the not-yet-landed
-/// receipt is still absent (audit 2026-10-09 item 14).
+/// receipt is still absent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redb_adapter_reconcile_waits_for_a_detached_landing_before_judging() {
   let directory = TempDir::new().unwrap();
@@ -403,8 +403,8 @@ async fn redb_adapter_transaction_digest_conflicts_fail_closed() {
 /// A final `write.commit()` failing with an outcome-unknown error — an
 /// I/O failure during the durable write-out, or the sticky `PreviousIo`
 /// aftermath of a prior one — must surface as `CommitOutcome::Unknown`
-/// and freeze the metadata store on reconcile evidence (audit finding
-/// #12): never as a definite-abort error that unfreezes the store and
+/// and freeze the metadata store on reconcile evidence: never as a
+/// definite-abort error that unfreezes the store and
 /// lets a fresh retry proceed while the durable state may already hold
 /// the "failed" write. The injected fault skips the real commit, so
 /// reconcile later proves the transaction aborted.
@@ -490,7 +490,7 @@ async fn redb_adapter_outcome_unknown_commit_failure_freezes_the_store() {
 }
 
 /// A persisted revision row that is not the 8-byte big-endian
-/// generation is on-disk corruption, never caller input (finding #9):
+/// generation is on-disk corruption, never caller input:
 /// every reader that reaches the decoder from persisted data — here
 /// the snapshot revision and the commit precheck — must surface
 /// `StorageCorrupt` and fail closed instead of blaming the caller with
@@ -544,8 +544,8 @@ async fn redb_adapter_corrupted_persisted_revision_surfaces_storage_corrupt() {
 }
 
 /// A definite-abort commit failure — here a poisoned transaction —
-/// must stay a definite abort (the narrow boundary of audit finding
-/// #12): the metadata store unfreezes and returns to Ready instead of
+/// must stay a definite abort (the narrow boundary above): the metadata
+/// store unfreezes and returns to Ready instead of
 /// blocking on reconcile evidence.
 #[tokio::test]
 async fn redb_adapter_definite_abort_commit_failure_returns_to_ready() {

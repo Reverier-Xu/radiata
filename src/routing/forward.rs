@@ -77,7 +77,7 @@ pub(crate) struct RetryState {
 /// authenticated peer plus that session's server-allocated id. A
 /// replacement session for the same peer is therefore a different
 /// identity, so a retired generation can neither close nor steer the
-/// replacement's hops (audit P1-4).
+/// replacement's hops.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionIdentity {
   peer: NodeId,
@@ -91,7 +91,7 @@ pub(crate) struct SessionIdentity {
 /// resolves — the hop itself keeps carrying the attribution afterwards,
 /// so a post-admission acknowledgement from the same downstream session
 /// (a mid-stream failure) is still steered instead of being dropped as a
-/// superseded branch's latecomer (audit P1-8).
+/// superseded branch's latecomer.
 #[derive(Clone)]
 pub(crate) enum HopPhase {
   /// Discovering a live downstream branch (pre-admission DFS): the retry
@@ -362,7 +362,7 @@ pub(crate) async fn relay_end(table: &ForwardingTable, frame: EndFrame) -> bool 
 /// The binding is the exact upstream session identity, never the peer: a
 /// replacement session for the same peer owns its own hops, so the retired
 /// generation's teardown can no longer interrupt the routes the winner just
-/// registered (audit P1-4).
+/// registered.
 pub(crate) async fn close_for_session(table: &ForwardingTable, upstream: &SessionIdentity) {
   let candidates: Vec<TraceId> = locked(table)
     .iter()
@@ -693,11 +693,10 @@ pub(crate) async fn on_downstream_failure(
       // The re-armed retry must consume its OWN attempt's pending entry:
       // the live map is the new branch's, so a failure (or deadline) from
       // this attempt removes exactly the entry it inserted — never a
-      // superseded branch's already-consumed map (audit 2026-10-09
-      // item 13). Note the inherent swap window: a same-branch ack that
-      // lands between send_waiting returning and this table update is
-      // misattributed and dropped; the hop deadline then re-dispatches,
-      // so the window is fail-closed and self-healing.
+      // superseded branch's already-consumed map. Note the inherent swap
+      // window: a same-branch ack that lands between send_waiting returning and
+      // this table update is misattributed and dropped; the hop deadline then
+      // re-dispatches, so the window is fail-closed and self-healing.
       retry.downstream_acks = Arc::clone(&downstream_acks);
       hop.phase = HopPhase::Discovering(retry);
     }
@@ -751,11 +750,11 @@ async fn select_next_hop(
 /// its live attempt's standing waiter, so a latecomer from a branch the
 /// hop already abandoned (a failed or deadline-expired attempt) cannot
 /// consume the live attempt's entry, clear its retry arm, or flip its
-/// route record (audit 2026-10-09 item 13). An admitted hop needs
+/// route record. An admitted hop needs
 /// nothing further — its one-shot admission waiter was consumed when
 /// admission resolved, and the downstream session it certified owns
 /// the stream's flow-control events for the stream's whole life, so a
-/// legitimate late failure from it still steers (audit P1-8). Lock
+/// legitimate late failure from it still steers. Lock
 /// order matches `on_downstream_failure`: the forwarding table guard
 /// never outlives this call and the acks lock nests inside it.
 pub(crate) fn ack_from_current_downstream(
@@ -788,8 +787,8 @@ pub(crate) fn ack_from_current_downstream(
 /// session upstream with its status preserved: the one-shot admission
 /// waiter was consumed when admission resolved, so the hop itself — the
 /// stream's owner for its whole life — carries the later flow-control
-/// events (a mid-stream failure) instead of the pending-map entry
-/// (audit P1-8). No-op for every other trace: the origin's
+/// events (a mid-stream failure) instead of the pending-map entry.
+/// No-op for every other trace: the origin's
 /// `resolve_ack` already handled it through its own waiter, and a
 /// discovering hop's acknowledgements still relay through the standing
 /// entry. Best-effort like every other acknowledgement relay: a
@@ -1155,7 +1154,7 @@ mod tests {
   /// explicit typed end downstream and leaves the table; no reopen path
   /// continues a body, and the synthesized end carries the interruption
   /// discriminant so the destination cannot mistake a truncated body for
-  /// a complete one (audit 2026-10-09 item 11).
+  /// a complete one.
   #[tokio::test]
   async fn feeding_session_end_terminates_every_downstream_leg() {
     let table = new_table();
@@ -1177,7 +1176,7 @@ mod tests {
     assert!(!super::contains(&table, &trace(5)));
     // Both downstream legs received the typed interruption end — never a
     // normal completion — so the destination surfaces a truncated body
-    // instead of a silently complete one (audit 2026-10-09 item 11).
+    // instead of a silently complete one.
     for mut drain in downstreams {
       let frame = drain.recv().await.unwrap();
       assert_eq!(frame.kind, PacketKind::End);
@@ -1198,7 +1197,7 @@ mod tests {
     assert!(super::contains(&table, &trace(6)));
   }
 
-  /// Regression (audit P1-4): a retired session generation's teardown must
+  /// Regression: a retired session generation's teardown must
   /// not close the routes a replacement session for the same peer just
   /// registered. The winner's hop is registered first — the barrier — and
   /// only then is the old generation's cleanup released; the winner's route
@@ -1463,8 +1462,7 @@ mod retry_tests {
       assert!(matches!(hop.phase, super::HopPhase::Discovering(_)));
       // ...and the re-armed retry carries the NEW branch's map, so the
       // next failure (or deadline) consumes exactly the live attempt's
-      // entry — never the superseded branch's already-consumed map
-      // (audit 2026-10-09 item 13).
+      // entry — never the superseded branch's already-consumed map.
       let super::HopPhase::Discovering(retry) = &hop.phase else {
         panic!("retry stays armed");
       };
@@ -1861,7 +1859,7 @@ mod retry_tests {
     assert_eq!(ack.status, crate::packet::wire::AckStatus::Failed);
   }
 
-  /// Acknowledgement attribution (audit 2026-10-09 item 13): only the
+  /// Acknowledgement attribution: only the
   /// hop's current downstream attempt — the same pending map, still
   /// holding the trace's live relay entry — may steer the hop. A late
   /// acknowledgement from the abandoned branch (a different map, or the

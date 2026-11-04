@@ -218,8 +218,8 @@ async fn read_loop_frames(
   let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
   let mut last_pong_seen = source.pong_last_seen();
   loop {
-    // Audit finding #8: completed consumer entries are reaped on every
-    // receive wake, so finished tasks no longer accumulate for the whole
+    // Completed consumer entries are reaped on every
+    // receive wake, so finished tasks never accumulate for the whole
     // session's life. Non-blocking on purpose: still-running consumers are
     // left untouched for the guard's `Drop`, which keeps handing the full
     // remaining set to the node-scoped drain on every exit path.
@@ -400,8 +400,7 @@ async fn read_loop_frames(
               // instead owns the stream for its whole life and carries
               // the report upstream itself — a legitimate mid-stream
               // failure from the bound downstream session must not be
-              // dropped as a superseded branch's latecomer (audit
-              // P1-8).
+              // dropped as a superseded branch's latecomer.
               forward::relay_admitted_ack(&context.forwarding, &ack);
             }
             // A late failure for an admitted stream (a downstream hop
@@ -412,23 +411,20 @@ async fn read_loop_frames(
             // failure overrides a recorded `Delivered`, and once recorded
             // it refuses every later update — so, when the report
             // reaches this node, the origin's record ends
-            // `Failed(StreamInterrupted)` under either ordering
-            // (remaining items 2026-10-10, P2-3).
+            // `Failed(StreamInterrupted)` under either ordering.
             if ack.status == crate::packet::wire::AckStatus::Failed {
               // The pre-read decides what this flip owns: a record that
               // was not yet `Failed` transitions here, so subscribers get
               // the `RouteChanged` nudge the refused pump tail no longer
-              // emits (remaining items 2026-10-10, P2-3). The durable
-              // twin mirrors exactly the flip: the revision fires only
-              // for caller traffic with an origin-side identity — an
-              // already-failed record is final, a relay hop or a
-              // destination rejection carries no identity to persist,
+              // emits. The durable twin mirrors exactly the flip: the
+              // revision fires only for caller traffic with an origin-side
+              // identity — an already-failed record is final, a relay hop
+              // or a destination rejection carries no identity to persist,
               // and internal control traffic stays out of the durable
               // trace store on this path too — so the same trace id's
               // durable terminal ends `Failed(StreamInterrupted)` under
               // either writer ordering instead of keeping the pump tail's
-              // `Delivered` for the whole retention window (remaining
-              // items 2026-10-10, P2-7).
+              // `Delivered` for the whole retention window.
               let prior = context.routes.lock().ok().and_then(|table| {
                 let record = table.get(&ack.trace_id)?;
                 if matches!(record.state, RouteState::Failed(_)) {
@@ -550,7 +546,7 @@ async fn admit_open(
         // handed to the consumer task: a stream whose wire stream ends still
         // holds its slot until the accept future finishes, so the node-wide
         // budget — not the per-session table — bounds the running consumer
-        // population (audit P1-2).
+        // population.
         let Some(permit) = context.live_consumers.reserve() else {
           debug!(
             trace_id = %trace_id,
@@ -649,7 +645,7 @@ async fn admit_open(
 /// Delivery never awaits the consumer's window unboundedly: the shared
 /// session reader must stay responsive to the pongs, acknowledgements, and
 /// other streams of the same session, so one stalled consumer cannot park
-/// the whole connection (audit P1-9). The per-stream window is the
+/// the whole connection. The per-stream window is the
 /// flow-control bound. A full window first spends the stream's single
 /// [`INCOMING_STREAM_DRAIN_PATIENCE`] grace — a burst whose frames were
 /// already buffered by the transport can reach the reader before the
@@ -745,7 +741,7 @@ async fn forward_chunk(
 /// the synchronous sender's `DeliveryAck`. Returns whether a pending
 /// entry was resolved: an admitted forwarding hop's waiter was already
 /// consumed when admission resolved, and its later flow-control events
-/// relay upstream through the hop itself instead (audit P1-8).
+/// relay upstream through the hop itself instead.
 fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) -> bool {
   let entry = pending_acks
     .lock()
@@ -1165,8 +1161,8 @@ mod read_loop_liveness_tests {
   /// A frame-silent peer that answers keepalive pings must stay alive:
   /// every pong wake reflects the injected clock into the session's
   /// activity mark, so the liveness observer (pinned separately) never
-  /// sees the idle deadline lapse. Before the fix the pong was swallowed
-  /// inside the transport receive and the activity mark never advanced.
+  /// sees the idle deadline lapse. A pong swallowed
+  /// inside the transport receive would leave the activity mark unadvanced.
   #[tokio::test]
   async fn pong_wakes_reflect_activity_for_frame_silent_peers() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
@@ -1349,8 +1345,8 @@ mod read_loop_liveness_tests {
     )
     .await;
 
-    // Exactly the still-running entry remains pending; before the fix all
-    // four accumulated until teardown. The in-life reap registered no
+    // Exactly the still-running entry remains pending; a reap that only
+    // ran at teardown would accumulate all four. The in-life reap registers no
     // teardown drain of its own.
     assert_eq!(
       consumers.consumers.len(),
@@ -1643,7 +1639,7 @@ mod ack_attribution_tests {
   /// admission waiter was consumed by the admission acknowledgement: the
   /// admitted phase carries the ownership, so the report still travels
   /// upstream instead of being dropped as a superseded branch's
-  /// latecomer (audit P1-8).
+  /// latecomer.
   #[tokio::test]
   async fn post_admission_failure_from_the_bound_session_relays_upstream() {
     let trace_id = trace(9);
@@ -1704,7 +1700,7 @@ mod ack_attribution_tests {
   /// The admitted hop's ownership is the exact downstream incarnation, not
   /// the peer: a post-admission failure from a replacement session of the
   /// same peer is another generation's traffic and is dropped rather than
-  /// steered through the live stream (audit P1-4, P1-8).
+  /// steered through the live stream.
   #[tokio::test]
   async fn post_admission_failure_from_another_incarnation_is_dropped() {
     let trace_id = trace(9);
@@ -1972,13 +1968,12 @@ mod durable_mirror_tests {
     );
   }
 
-  /// The durable twin's mirror of the in-memory flip (remaining items
-  /// 2026-10-10, P2-7): a late failed acknowledgement that flips the
-  /// origin's in-memory record to `Failed(StreamInterrupted)` also
-  /// revises the durable terminal that already recorded `Delivered` —
-  /// the realistic ordering, since the failure report trails the pump
-  /// tail — so the durable trace ends failed exactly like the in-memory
-  /// record instead of keeping `Delivered` for the whole retention
+  /// The durable twin's mirror of the in-memory flip: a late failed
+  /// acknowledgement that flips the origin's in-memory record to
+  /// `Failed(StreamInterrupted)` also revises the durable terminal that already
+  /// recorded `Delivered` — the realistic ordering, since the failure report
+  /// trails the pump tail — so the durable trace ends failed exactly like the
+  /// in-memory record instead of keeping `Delivered` for the whole retention
   /// window.
   #[tokio::test]
   async fn late_failure_revises_the_durable_delivered_twin() {
@@ -1999,7 +1994,7 @@ mod durable_mirror_tests {
 
     let records = deliver_failed_ack(&sink, &routes, &trace_id).await;
 
-    // The in-memory record ends failed (the P2-3 contract, unchanged).
+    // The in-memory record ends failed (the terminal contract, unchanged).
     let memory = routes.lock().unwrap().get(&trace_id).cloned().unwrap();
     assert_eq!(
       memory.state,
@@ -2352,15 +2347,15 @@ mod slow_consumer_tests {
     )
   }
 
-  /// Regression (audit P1-9): a consumer that never drains its bounded
+  /// Regression: a consumer that never drains its bounded
   /// window must not stall the session's shared read loop. The window
   /// (`INCOMING_STREAM_CHUNKS`) fills, the overflowing chunk spends the
   /// stream's single drain grace, the grace expires, and the explicit
   /// overload policy terminates the stream — the origin learns it through
   /// a typed failed acknowledgement, the consumer later observes exactly
   /// one typed interruption — and the reader keeps processing frames after
-  /// the overload until the orderly end. Before the fix the reader parked
-  /// on the full channel and the session went mute.
+  /// the overload until the orderly end. A reader parked
+  /// on the full channel would leave the session mute.
   #[tokio::test]
   async fn an_undrained_window_terminates_the_stream_without_stalling_the_reader() {
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
@@ -2532,7 +2527,7 @@ mod slow_consumer_tests {
     }
   }
 
-  /// Regression (the P1-9 follow-up): a burst of wire slices above the
+  /// Regression: a burst of wire slices above the
   /// window can reach the shared reader before the consumer task is first
   /// scheduled — the transport already buffered every slice. The bounded
   /// drain grace keeps that legitimate burst from being misread as
@@ -2872,7 +2867,7 @@ mod consumer_lifecycle_tests {
     }
   }
 
-  /// Regression (audit P1-2): the wire stream's end frees the per-session
+  /// Regression: the wire stream's end frees the per-session
   /// table slot, but the consumer's lifecycle slot is held until the accept
   /// future finishes — the post-EOF work is legitimate and is never
   /// cancelled at the wire end. Repeated complete streams accumulate their
@@ -2932,7 +2927,7 @@ mod consumer_lifecycle_tests {
     );
   }
 
-  /// Regression (audit P1-2): past the node-wide budget, a new open is
+  /// Regression: past the node-wide budget, a new open is
   /// refused with the typed `Overloaded` backpressure — never admitted
   /// beyond the running-consumer bound — and no consumer runs for the
   /// refused stream. The slots return once the stalled consumers finish.
@@ -3002,7 +2997,7 @@ mod consumer_lifecycle_tests {
     assert_eq!(context.live_consumers.in_use(), 0);
   }
 
-  /// Regression (audit P1-2): a retired session hands its consumers to the
+  /// Regression: a retired session hands its consumers to the
   /// node-scoped drain, and their lifecycle reservations survive that
   /// transfer — and across sessions: the next session's admissions count
   /// against the same node-wide budget, and every reservation returns when

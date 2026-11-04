@@ -1992,7 +1992,7 @@ mod tests {
   /// of delivery order: a fresh record installs once, the exact record is
   /// idempotent, the decider's winner replaces the loser through the
   /// exact-digest conditional put, and the decider's own fail-closed
-  /// binding error surfaces as Conflict without mutation (audit A01).
+  /// binding error surfaces as Conflict without mutation.
   #[tokio::test]
   async fn convergent_terminal_record_replaces_the_decided_winner_deterministically() {
     use crate::{

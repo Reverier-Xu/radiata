@@ -1075,7 +1075,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
   //
   // The center is the mesh's articulation point: its loss splits the
   // cluster into four components (twelve isolated spokes plus three bus
-  // lines). This is the audit's mode-1 incident shape — a hub dies
+  // lines). This is the mode-1 incident shape — a hub dies
   // while leaves must re-connect leaf-to-leaf — and the survivors must
   // converge without it: the isolated spokes heal through the recovery
   // plane, the below-target bus members densify through the
@@ -1096,7 +1096,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
   let survivors: Vec<usize> = (1..NODES).collect();
   wait_recovery_connected(&slots, &survivors, "hub loss: survivors re-mesh").await;
 
-  // Data crosses the bridged mesh: a spoke to a mid-bus body used to be
+  // Data crosses the bridged mesh: a spoke to a mid-bus body is
   // unreachable without the center.
   relay_packet(
     &slots[1],
@@ -1105,7 +1105,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
   )
   .await;
 
-  // The incident's victims — the isolated spokes — also climb back to
+  // The isolated spokes also climb back to
   // the derived target degree through the maintenance plane, not just
   // to any one route.
   wait_degree_healthy(
@@ -1233,7 +1233,7 @@ async fn sixty_four_node_mixed_transport_chaos() {
     }
 
     // Return through a *different* protocol than the original edge.
-    // The target is the same member it used to dial (round 0) or a
+    // The target is the same member as round 0 or a
     // different one (round 1); the scheme is seeded and never the
     // original one.
     let (target, scheme) = loop {

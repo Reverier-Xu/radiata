@@ -80,8 +80,8 @@ pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 /// outrun this depth.
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
 
-/// The bound on simultaneously running packet admission tasks (audit
-/// 2026-10-23 P1-5): each admission may await a caller-supplied routing
+/// The bound on simultaneously running packet admission tasks: each
+/// admission may await a caller-supplied routing
 /// policy, so this bounds how many such waits are in flight. A
 /// saturated pool disables the control loop's packet arm instead of
 /// blocking the loop, and the bounded packet command channel carries the
@@ -105,7 +105,7 @@ pub(crate) const ADMISSION_CONCURRENCY: usize = 4;
 /// and reject its request with the typed shutdown kind.
 const PUMP_HANDOFF_CAPACITY: usize = ADMISSION_CONCURRENCY;
 
-// The capacity constants' joint relations (audit follow-up B4), pinned
+// The capacity constants' joint relations, pinned
 // at compile time so a violation fails any build: the pump handoff
 // queue must fit every handoff one fully parallel admission window can
 // produce (each permit holder writes at most one handoff, and only the
@@ -276,7 +276,7 @@ pub(crate) async fn spawn_runtime(
   // shared plane behind it (the anti-entropy driver ticks the same
   // plane once the supervisor spawns it). The plane and the packet
   // context the operation handles build share one authorization
-  // boundary (audit 2026-10-23, P1-11), so a sync-delivered revocation
+  // boundary, so a sync-delivered revocation
   // tombstone and a finishing handshake's publication serialize
   // exactly like the local revoke effect does.
   let authorization = crate::session::stream::AuthorizationBoundary::default();
@@ -518,12 +518,12 @@ async fn terminate_stale_traces(supervisor: &Supervisor) {
   }
 }
 
-/// Spawns the periodic planes OFF the select loop (audit 2026-10-09 item 3):
+/// Spawns the periodic planes OFF the select loop:
 /// one long-lived recovery-observation worker (recovery tick plus the three
 /// retention sweeps) and one degree-maintenance worker, each owning its own
-/// timer, so slow storage or a slow policy no longer parks control-plane
-/// reads and packet admission behind a tick. Bounded accounting (audit item
-/// 4's lesson): exactly two tasks for the node's lifetime, aborted and
+/// timer, so slow storage or a slow policy never parks control-plane
+/// reads and packet admission behind a tick. Bounded accounting: exactly
+/// two tasks for the node's lifetime, aborted and
 /// awaited by the shutdown path — never one spawned task per tick.
 fn spawn_tick_workers(supervisor: &Supervisor) -> Result<Vec<tokio::task::JoinHandle<()>>> {
   let ticks = std::sync::Arc::new(supervisor.tick_state()?);
@@ -545,7 +545,7 @@ async fn run_control_loop(
   leave_complete: &mut mpsc::Receiver<()>,
   packet_rx: &mut mpsc::Receiver<crate::packet::OutboundRequest>, tasks: &mut JoinSet<()>,
 ) -> TerminalPhase {
-  // The packet admission plane (audit 2026-10-23 P1-5): target
+  // The packet admission plane: target
   // resolution, descriptor validation, first-hop selection, and the route
   // record run in spawned admission tasks, never inline here — a
   // caller-supplied policy that never resolves parks one bounded
@@ -752,8 +752,7 @@ fn admit_packet(
 ) {
   // The identity context (and the store handle it carries) is cloned per
   // admission and lives only inside the admission task: a long-lived clone
-  // here would survive the shutdown path's storage drain (audit 2026-10-23
-  // P1-10).
+  // here would survive the shutdown path's storage drain.
   let Some(context) = supervisor.dependencies.context.clone() else {
     request.reject(crate::ErrorKind::Internal);
     return;
@@ -814,8 +813,8 @@ fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: Pump
 }
 
 /// Reaps one finished packet task (an admission or its pump) as it completes
-/// instead of letting its handle accumulate in the task set until shutdown
-/// (audit 2026-10-09, item 4): the set stays bounded by the live
+/// instead of letting its handle accumulate in the task set until shutdown:
+/// the set stays bounded by the live
 /// admission-plus-pump count, and a join error (a panicked or aborted task)
 /// stays visible as a diagnostic.
 fn reap_packet_task(finished: Option<std::result::Result<(), tokio::task::JoinError>>) {
@@ -876,15 +875,15 @@ async fn finish_shutdown(
       let _ = handle.await;
     }
   }
-  // The storage execution completion barrier (audit 2026-10-23 P1-10):
+  // The storage execution completion barrier:
   // every runtime plane is torn down above, so no new execution can
   // start; the storage flush now resolves only when every detached
   // execution the node spawned has ended (committed, failed, or rolled
   // back) and every snapshot execution has released its handle — commit
   // and read alike — so the shutdown reply returns only once no
-  // in-flight execution still holds the database (the snapshot half is
-  // audit 2026-10-27 B3: a still-live read pinned the file lock past
-  // the reply and restarts raced it). Like the task manager's journaled
+  // in-flight execution still holds the database. A still-live read
+  // would otherwise pin the file lock past
+  // the reply and restarts would race it. Like the task manager's journaled
   // drain, the wait is deliberately unbounded: it awaits durability
   // obligations, not cancellable effects. A flush failure is diagnosed
   // and teardown continues, because the reply itself must still answer.
@@ -937,7 +936,7 @@ pub(super) struct Supervisor {
   // The two periodic-plane workers (recovery observation with the
   // retention sweeps, degree maintenance): spawned once by `supervise`,
   // aborted and awaited by `into_dependencies` — a fixed two-handle
-  // population, never one task per tick (audit 2026-10-09 items 3–4).
+  // population, never one task per tick.
   pub(super) tick_workers: Vec<tokio::task::JoinHandle<()>>,
   pub(super) trace_sink: crate::routing::trace::TraceSink,
   // Approximate live durable trace-record population, shared with the
@@ -948,9 +947,9 @@ pub(super) struct Supervisor {
 
 /// The periodic planes' shared state: everything the recovery-observation
 /// worker (`recovery_tick` plus the three retention sweeps) and the
-/// degree-maintenance worker need to run OFF the supervisor's select loop
-/// (audit 2026-10-09 item 3: slow storage or a slow policy resolution must
-/// never park control-plane reads and packet admission behind a tick).
+/// degree-maintenance worker need to run OFF the supervisor's select loop,
+/// because slow storage or a slow policy resolution must
+/// never park control-plane reads and packet admission behind a tick.
 /// Built once per incarnation by [`Supervisor::tick_state`] from the same
 /// Arc-held collaborators the supervisor reads, so the workers observe the
 /// one truth per field — no second controller, cache, or session table.
@@ -991,7 +990,7 @@ pub(super) struct TickState {
   pub(super) endpoint_attempts: std::sync::Mutex<std::collections::BTreeMap<NodeId, u64>>,
   /// The bridge-probe cadence bracket: maintenance ticks an otherwise
   /// quiescent healthy node waits before its next cross-partition probe
-  /// dial (audit finding #1's residual boundary — see `runtime/degree.rs`).
+  /// dial (the plane's residual boundary — see `runtime/degree.rs`).
   /// Only the maintenance worker mutates it, so a racing read at worst
   /// shifts one probe by one tick.
   pub(super) bridge_probe_ticks: Arc<std::sync::atomic::AtomicU32>,
@@ -1030,7 +1029,7 @@ fn session_packet_context(
   // construction site): the origin pump's terminal facts and the read
   // loop's late-failure revisions share one bounded queue and one
   // live-record counter with the retention sweep and the observability
-  // view (remaining items 2026-10-10, P2-7).
+  // view.
   let trace_records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
   let trace_sink = crate::routing::trace::TraceSink::new(
     Arc::clone(context),
@@ -1133,7 +1132,7 @@ impl Supervisor {
     // construction site) and is read back here: the origin pump's terminal
     // facts, the read loop's late-failure revisions, the retention sweep,
     // and the observability view all share the one bounded instance and
-    // its live-record counter (remaining items 2026-10-10, P2-7).
+    // its live-record counter.
     let Some(trace_sink) = packet.trace_sink().cloned() else {
       return Err(Box::new((Error::internal("trace sink"), dependencies)));
     };
@@ -1658,8 +1657,8 @@ mod receipt_retention_sweep_tests {
   /// reconcile tick's quiescence probe: a fresh single node that just
   /// completed its identity ceremony leaves no retention candidate and
   /// no anchor behind, so repeated retention sweeps find nothing and the
-  /// store's commit count does not grow (regression: the ceremony's
-  /// leftover retention candidate made the first tick commit the anchor
+  /// store's commit count does not grow (a leftover ceremony retention
+  /// candidate would make the first tick commit the anchor
   /// and the candidate consumption as two background writes, drifting
   /// commit-count pins and racing conditional commits on CI).
   #[tokio::test]
@@ -1793,8 +1792,8 @@ mod shutdown_drain_tests {
   /// of being aborted mid-apply: the tracked drain task is handed out
   /// live by `into_dependencies`, and `finish_shutdown`'s cooperative
   /// window outlasts the apply's settle (the `ConsumerDrainGuard`
-  /// contract in `session::inbound`). Under the old abort-everything
-  /// teardown the parked apply dies with the node and the flag stays
+  /// contract in `session::inbound`). An abort-everything
+  /// teardown would kill the parked apply with the node and leave the flag
   /// false.
   #[tokio::test(start_paused = true)]
   async fn shutdown_completes_an_in_flight_consumer_drain_apply() {
@@ -1913,12 +1912,12 @@ mod shutdown_drain_tests {
     );
   }
 
-  /// `finish_shutdown` provides the storage execution completion barrier
-  /// (audit 2026-10-23 P1-10): the shutdown reply must not return while
+  /// `finish_shutdown` provides the storage execution completion barrier:
+  /// the shutdown reply must not return while
   /// the node's storage still has an in-flight execution — represented
   /// here by a flush that parks on a gate — and must return promptly
-  /// once the barrier resolves. Under the old immediate-return flush the
-  /// reply would land while the "execution" still holds the database.
+  /// once the barrier resolves. An immediate-return flush would land the
+  /// reply while the "execution" still holds the database.
   #[tokio::test]
   async fn shutdown_awaits_the_storage_execution_completion_barrier() {
     let (reference, config) = test_support::reference_and_config();
@@ -1972,7 +1971,7 @@ mod shutdown_drain_tests {
   }
 }
 
-/// The control-loop admission contract (audit 2026-10-23 P1-5): a
+/// The control-loop admission contract: a
 /// caller-supplied next-hop policy that never resolves may park only one
 /// bounded admission slot. Control reads, another packet's admission,
 /// and shutdown all complete inside their bounds while that admission

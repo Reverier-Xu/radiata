@@ -1069,8 +1069,8 @@ impl KeyProvider for LeaveCapableKeys {
 
 /// A never-returning action hook neither occupies an execution slot nor
 /// delays the leave shutdown. The node runs with a single local slot:
-/// the task after the wedged observation must still run (under the old
-/// in-body observation, the wedged hook pinned the slot forever), and a
+/// the task after the wedged observation must still run (an in-body
+/// observation would pin the slot forever behind the wedged hook), and a
 /// leave whose observation wedges must still replace the identity and
 /// stop the node with the ActiveLeave reason (the signal is driven by
 /// the task table's terminal phase, not by the hook chain).

@@ -348,9 +348,9 @@ mod tests {
   }
 
   /// Cancelling a pending `recv` must not destroy the subscription: the
-  /// receiver stays parked on the subscription (audit 2026-10-09 item
-  /// 16), a later `recv` observes events sent after the cancellation,
-  /// and the terminal close is still delivered exactly once.
+  /// receiver stays parked on the subscription, a later `recv` observes events
+  /// sent after the cancellation, and the terminal close is still delivered
+  /// exactly once.
   #[tokio::test]
   async fn event_subscription_recv_survives_cancellation() {
     let options = EventOptions::new().capacity(2).unwrap();

@@ -97,7 +97,7 @@ async fn status(state: State<SharedState>) -> Json<Value> {
   let member_count = members.as_ref().map_or(0, |page| page.items().len());
   // The library annotates every member page entry with its lifecycle
   // status (active / left / cleaned), so an operator — and the scenario
-  // tests — can tell live members from departed evidence (finding #9).
+  // tests — can tell live members from departed evidence.
   let member_statuses: std::collections::BTreeMap<String, String> = members
     .as_ref()
     .map(|page| {

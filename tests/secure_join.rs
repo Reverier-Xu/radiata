@@ -2078,7 +2078,7 @@ async fn probe_round_trip(
 /// Both nodes register the same caller-defined extension feature plus a
 /// protocol owned by it, and the joiner (the handshake caller)
 /// additionally requires the feature. The merged caller registry must
-/// enter every handshake (audit 2026-10-09 item 15): the join succeeds
+/// enter every handshake: the join succeeds
 /// where a builtin-only rebuild fails as an unknown required label, the
 /// feature survives into both sides' signed selections, the
 /// feature-owned protocol admits packets both ways, and a

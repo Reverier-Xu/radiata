@@ -21,12 +21,12 @@ use radiata::{Endpoint, ErrorKind, NodeBuilder, NodeConfig, NodeHandle, NodeId, 
 mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys, merge_with_retry};
-// The shared multi-cluster gate (audit 2026-10-27 B3): the lanes
+// The shared multi-cluster gate: the lanes
 // serialize so each cluster owns the machine while it runs — in this
 // process through the gate's async mutex and across test-file
 // processes through the kernel file lock under `target/`, so
-// cross-file cluster parallelism is bounded machine-wide too (the
-// per-file `OnceLock` this replaced left other files' clusters free
+// cross-file cluster parallelism is bounded machine-wide too (a
+// per-file `OnceLock` would leave other files' clusters free
 // to oversubscribe the runner).
 use radiata_test_support::cluster_gate;
 

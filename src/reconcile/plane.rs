@@ -266,7 +266,7 @@ const HINT_RETRY_MAX: u8 = 4;
 /// them), and healthy otherwise (including a fresh session with no
 /// samples yet — knobs default open so a quiet but healthy link pays no
 /// premium). The curve is a step, not a ramp, on purpose: two bands are
-/// enough for the two failure shapes the audit measured (ack-starved
+/// enough for the two failure shapes in play (ack-starved
 /// saturation and lossy long links), and every extra band is another
 /// threshold to calibrate against the same evidence. The steps:
 ///
@@ -500,7 +500,7 @@ pub(crate) struct PlaneShared {
   revision: MemberRevisionSignal,
   sessions: SessionTable,
   /// The node's authorization boundary between durable revocation and
-  /// session publication (audit 2026-10-23, P1-11): the same instance
+  /// session publication: the same instance
   /// the packet context owns, so a revocation tombstone this plane
   /// applies serializes against a finishing handshake's publication
   /// exactly like the local revoke effect does.
@@ -948,8 +948,8 @@ impl ReconcilePlane {
         // deferred rows the store cannot take yet (a tombstone whose
         // subject binding has not converged), and those rows' retry
         // lives in the next repair pass — without the scan the pass
-        // never recomputes (the delayed-content regression: the
-        // revocation arrived before its binding and never retried).
+        // never recomputes (a revocation arriving before its binding
+        // would never retry).
         // A fully-refused batch needs no scan: nothing entered the
         // store or the engines.
         if let Ok(mut guard) = self.shared.lock() {
@@ -3019,7 +3019,7 @@ mod tests {
     );
   }
 
-  /// B01/P2-3: the unexpired hint retry keeps its slot until the backoff
+  /// The unexpired hint retry keeps its slot until the backoff
   /// expires, and the budget spends itself on the wire — asserted on the
   /// packets the runtime received, not on the slot alone. Each re-send
   /// schedules its successor one, two, four, then eight ticks out (the
@@ -3157,7 +3157,7 @@ mod tests {
     }
   }
 
-  /// A1/B-P1: the retention resurrection — a swept removal row leaves
+  /// The retention resurrection contract: a swept removal row leaves
   /// the engines on the sweep-noted epoch pass, a re-primed peer never
   /// receives the historical removal set back, and a peer re-delivering
   /// the swept row is filtered at the receive boundary (the tombstone
@@ -3398,7 +3398,7 @@ mod tests {
     }
   }
 
-  /// A02/P1-1: the swept predicate's reclaim basis is the retention
+  /// The swept predicate's reclaim basis is the retention
   /// deadline, never key absence alone — a fresh removal for a key the
   /// store does not hold is unseen-key evidence, not reclaimed
   /// knowledge, while the same shape past the deadline is exactly what
@@ -3491,7 +3491,7 @@ mod tests {
     }
   }
 
-  /// A02/P1-1: a fresh deletion for a resource this node has never held
+  /// A fresh deletion for a resource this node has never held
   /// is legitimate evidence, not reclaimed knowledge. The receive
   /// boundary keeps it (the store installs the tombstone), and the
   /// older live value arriving afterwards loses the register's tuple
@@ -3572,7 +3572,7 @@ mod tests {
     assert_eq!(rows[0].1, removal, "the engine holds the deletion row");
   }
 
-  /// A02/P1-1: the same convergence from the opposite delivery order,
+  /// The same convergence from the opposite delivery order,
   /// plus the duplicate delivery — the live value arriving first
   /// installs, the fresh removal arriving second (twice: duplicate and
   /// re-ordered redeliveries are the epidemic norm) wins the register,
@@ -3639,7 +3639,7 @@ mod tests {
     assert_eq!(rows[0].1, removal, "the engine holds the removal row");
   }
 
-  /// A02/P1-1: the flip side of the deadline basis — an expired removal
+  /// The flip side of the deadline basis — an expired removal
   /// for a key this node never held is reclaimed knowledge under the
   /// retention contract, so the receive boundary drops it exactly like
   /// a swept row: no tombstone materializes, no engine seat, and the
@@ -3682,7 +3682,7 @@ mod tests {
     );
   }
 
-  /// A1: a superseded identity (a descriptor revision bump) leaves the
+  /// A superseded identity (a descriptor revision bump) leaves the
   /// engine row set on the epoch pass — the engine tracks the store's
   /// current row per key instead of growing monotonically — and a peer
   /// re-primed afterwards receives only the current identity (no
@@ -3763,9 +3763,9 @@ mod tests {
     assert_eq!(reprimed[0].1, bumped.encode().unwrap());
   }
 
-  /// A2 (the leave/restart livelock): a descriptor row the store
+  /// The leave/restart livelock: a descriptor row the store
   /// deterministically refuses — a stale revision here — never enters
-  /// the engines at the receive boundary. Admitting it made every
+  /// the engines at the receive boundary. Admitting it would make every
   /// fingerprint exchange re-detect the divergence: the epoch pass
   /// pruned the row, the prune's hint re-announced the change, and the
   /// peers that still listed the stale revision pushed it back — an
@@ -3852,7 +3852,7 @@ mod tests {
     );
   }
 
-  /// A2's leaver shape: a wiped store holds no binding for the row's
+  /// The leaver shape: a wiped store holds no binding for the row's
   /// subject, so a first descriptor install above revision 1 is refused
   /// forever. The row must not sit in the engines as repair evidence —
   /// the repair can never succeed, and every exchange would re-deliver
@@ -3968,7 +3968,7 @@ mod tests {
     );
   }
 
-  /// A1: collected tombstone rows never enter the derived view on
+  /// Collected tombstone rows never enter the derived view on
   /// either side — the scan filters them (so a prime cannot carry them)
   /// and the receive-side predicate is exactly the apply boundary's
   /// collected test.
@@ -4003,7 +4003,7 @@ mod tests {
     ));
   }
 
-  /// B2/B4: the link profile's knob curve. A fresh session (no
+  /// The link profile's knob curve. A fresh session (no
   /// samples) is healthy with every knob open; sustained undelivered
   /// dispatches cross the loss threshold and flip all three knobs; a
   /// slow-but-delivered session crosses on the RTT threshold alone;

@@ -3,7 +3,7 @@
 //! Pure observation over the signed descriptor stores and the session
 //! table. One deliberate nuance: a member query SCHEDULES the local
 //! descriptor's lazy publication (single flight, off the supervisor's
-//! select loop — remaining items 2026-10-10, P2-9) instead of awaiting
+//! select loop) instead of awaiting
 //! it, so a slow descriptor commit can never park the control plane
 //! behind a member read. The query answers from committed state only:
 //! the single kicking read on a node that never bound a listener may
@@ -21,9 +21,9 @@ use crate::{Error, LocalNodeView, NodeId, Result};
 
 impl Supervisor {
   /// Schedules the local descriptor's lazy publication without awaiting
-  /// it (remaining items 2026-10-10, P2-9): the member read views stay
-  /// pure reads, and the publication's storage IO — historically
-  /// awaited inline in this loop, parking every control-plane operation
+  /// it: the member read views stay
+  /// pure reads, and the publication's storage IO — which
+  /// awaited inline in this loop would park every control-plane operation
   /// behind a slow descriptor commit — runs in the single-flight task
   /// the kick schedules (at most one alive; none in steady state). The
   /// listener transition publishes synchronously in the listen effect,

@@ -194,12 +194,12 @@ impl RevokedSubjects {
 }
 
 /// The node-local authorization boundary between durable revocation and
-/// final session publication (audit 2026-10-23, P1-11).
+/// final session publication.
 ///
 /// A handshake authorizes its peer against the durable trusted binding at
 /// admission and then spends network round trips completing. A revocation
-/// that commits inside that window used to retire only the sessions that
-/// existed when it ran, and the finishing handshake published a fresh
+/// that commits inside that window would otherwise retire only the sessions
+/// that existed when it ran, and the finishing handshake would publish a fresh
 /// session for the revoked identity with no further check. This boundary
 /// closes the window with one short exclusive section on each side of it:
 ///
@@ -255,8 +255,8 @@ pub(crate) struct SessionPacketContext {
   pub(super) routes: RouteTable,
   /// The node's durable trace sink: the origin pump's terminal facts and
   /// the read loop's late-failure revisions persist through the one
-  /// bounded instance the supervisor owns (remaining items 2026-10-10,
-  /// P2-7). `None` only in unit-test contexts without a store.
+  /// bounded instance the supervisor owns. `None` only in unit-test
+  /// contexts without a store.
   pub(super) trace: Option<crate::routing::trace::TraceSink>,
   pub(super) forwarding_capacity: usize,
   /// The node's configured bound on in-memory terminal route records;
@@ -275,7 +275,7 @@ pub(crate) struct SessionPacketContext {
   /// `NodeConfig::with_relay_hop_deadline`).
   pub(super) relay_hop_deadline: Duration,
   /// The node's authorization boundary between durable revocation and
-  /// final session publication (audit 2026-10-23, P1-11): born with this
+  /// final session publication: born with this
   /// context, so every session publication, the revocation effect, and
   /// the sync-delivered tombstone lane serialize on the same section
   /// through the one shared instance.
@@ -564,7 +564,7 @@ pub(crate) async fn run_session(
     class,
     retire: retire_tx,
   };
-  // The final authorization gate (audit 2026-10-23, P1-11): the peer was
+  // The final authorization gate: the peer was
   // admitted against the durable binding before the exchange, but a
   // revocation may have committed while the handshake was completing.
   // Publication re-checks the revoked-subject ledger under the boundary
@@ -715,7 +715,7 @@ pub(crate) async fn run_session(
   // body channels close without an end marker. Every hop fed by THIS
   // session incarnation terminates downstream explicitly — the winner's
   // routes registered by a replacement session for the same peer are a
-  // different identity and stay untouched (audit P1-4).
+  // different identity and stay untouched.
   let (interrupted, relays) = fail_pending_waits(&pending_acks);
   if interrupted > 0 {
     debug!(interrupted, "session closed pending admissions");
@@ -938,7 +938,7 @@ mod authorization_boundary_tests {
     assert!(!ledger.contains(&subject));
   }
 
-  /// The boundary is one exclusive section (audit 2026-10-23, P1-11): a
+  /// The boundary is one exclusive section: a
   /// second acquirer — the other side of the revocation/publication
   /// pair — waits until the first releases, so the two critical sections
   /// can never interleave.

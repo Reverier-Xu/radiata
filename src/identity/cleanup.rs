@@ -708,8 +708,7 @@ mod tests {
   /// Two verified cleanups of the same binding from different issuers
   /// (the partitioned-cleanup scenario) merge deterministically: the
   /// earliest signed stamp wins regardless of delivery order, and a
-  /// re-delivery of the losing record never rolls the winner back
-  /// (audit A01).
+  /// re-delivery of the losing record never rolls the winner back.
   #[tokio::test]
   async fn partitioned_cleanup_records_merge_to_the_earliest_stamp() {
     let factory = reference_factory();
@@ -808,7 +807,7 @@ mod tests {
 
   /// An exact-stamp tie breaks deterministically on the canonical
   /// encoding: the lexicographic minimum wins in both delivery orders,
-  /// so tied partitioned cleanups still converge (audit A01).
+  /// so tied partitioned cleanups still converge.
   #[tokio::test]
   async fn tied_cleanup_records_break_deterministically_on_the_encoding() {
     let factory = reference_factory();
@@ -898,7 +897,7 @@ mod tests {
   }
 
   /// The merge never launders a different binding: a stored cleanup
-  /// record pinning another subject key still fails closed (audit A01).
+  /// record pinning another subject key still fails closed.
   #[tokio::test]
   async fn cleanup_records_over_different_bindings_still_fail_closed() {
     let factory = reference_factory();

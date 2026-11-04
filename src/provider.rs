@@ -844,8 +844,7 @@ pub trait Storage: fmt::Debug + Send + Sync + 'static {
 
   /// Flushes every in-flight execution to durability before returning:
   /// implementations must resolve only once no spawned commit or read
-  /// execution still holds the backend (audit 2026-10-23 P1-10, extended
-  /// to snapshot readers in audit 2026-10-27 B3). The node shutdown
+  /// execution still holds the backend. The node shutdown
   /// relies on this barrier: the reply returns only after flush
   /// resolves, so reopening the same backend cannot race a landing
   /// execution. The wait is deliberately unbounded — it awaits
@@ -867,7 +866,7 @@ fn digest_store_value(value: &[u8]) -> Digest {
 /// operation digest. This is the single definition behind every storage
 /// adapter; the storage-contract reference oracle deliberately keeps its
 /// own derivation of the expectation table (see
-/// `src/storage/contract/reference.rs`, audit A9) so the oracle and the
+/// `src/storage/contract/reference.rs`) so the oracle and the
 /// adapters cannot drift in lockstep. Without a storage-backend feature
 /// there are no callers, which is intentionally allowed.
 #[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
@@ -916,7 +915,7 @@ fn expectation_matches(digest: Option<Digest>, expected: &StoreExpectation) -> b
 /// `Some` is the decided outcome. The lookups are per-site closures so
 /// every storage adapter keeps its exact read order and error contexts
 /// (the reference oracle re-derives this order on its own, see
-/// `src/storage/contract/reference.rs`, audit A9): `receipt` resolves one
+/// `src/storage/contract/reference.rs`): `receipt` resolves one
 /// transaction id to its stored receipt (the replay source and, derived
 /// from it, the `ForgetReceipt` digest expectation), `current_revision`
 /// resolves the current store revision, and `entry` resolves one record
@@ -960,7 +959,7 @@ pub(crate) fn commit_precheck(
 /// Classifies one stored-receipt lookup into the three-way
 /// [`ReconcileOutcome`], the single reconcile verdict behind every
 /// storage adapter (the reference oracle keeps its own derivation, see
-/// `src/storage/contract/reference.rs`, audit A9): a receipt carrying the
+/// `src/storage/contract/reference.rs`): a receipt carrying the
 /// exact digest is [`ReconcileOutcome::Committed`], the same transaction
 /// id under a different digest is [`ReconcileOutcome::DigestConflict`],
 /// and no receipt is [`ReconcileOutcome::Aborted`]. The lookup itself

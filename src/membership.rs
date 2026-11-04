@@ -922,7 +922,7 @@ mod tests {
     );
   }
 
-  /// Two owner patches based on one observed revision (the audit's
+  /// Two owner patches based on one observed revision (the
   /// window: read → patch → commit) resolve to exactly one commit: the
   /// descriptor register's commit boundary accepts only a strictly
   /// higher revision, so the second patch's same-next-revision record

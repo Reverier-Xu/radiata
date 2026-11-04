@@ -45,11 +45,10 @@ pub(crate) const TASK_CHANNEL_CAPACITY: usize = 32;
 /// [`crate::task::SlotClass`]). A join or connect dial can hold its
 /// slot for a whole dial deadline, so the dials draw from their own
 /// semaphore while every core local kind keeps its own budget: four
-/// wedged dials must never queue a resource write (the starvation
-/// incident behind the split). The caller-registered extension kinds
-/// draw from their own channel for the mirror reason: an extension
-/// reconciler routinely awaits other admitted tasks through its public
-/// handle, so it must never occupy the core local capacity its own
+/// wedged dials must never queue a resource write. The caller-registered
+/// extension kinds draw from their own channel for the mirror reason: an
+/// extension reconciler routinely awaits other admitted tasks through its
+/// public handle, so it must never occupy the core local capacity its own
 /// child operations need. The local and network budgets come from
 /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots)
 /// and default to two slots per channel — the historical four-permit
@@ -1386,10 +1385,10 @@ mod tests {
     }
   }
 
-  /// The P2-1 shutdown regression: under the detached-spawn design a
-  /// wedged action hook survived the whole incarnation — its spawned
-  /// observation task was dropped from the manager's bookkeeping at
-  /// the terminal report and nothing ever cancelled it. The bounded
+  /// The shutdown regression: under a detached-spawn design a
+  /// wedged action hook would survive the whole incarnation — its spawned
+  /// observation task dropped from the manager's bookkeeping at
+  /// the terminal report with nothing ever cancelling it. The bounded
   /// observation lanes are the manager's own state: the shutdown drain
   /// drops them, which aborts the parked runner and with it the
   /// wedged observation.
@@ -1473,12 +1472,12 @@ mod tests {
     }
   }
 
-  /// The P2-1 ordering contract on the lane design: one task's
+  /// The ordering contract on the lane design: one task's
   /// observations are pinned to one lane's FIFO, so a slow `Running`
   /// observation is always followed — never overtaken — by the task's
   /// own terminal observation. Per-observation lane choice would let
-  /// the instant terminal observation overtake the slow one; the old
-  /// predecessor chains preserved order but accumulated unbounded
+  /// the instant terminal observation overtake the slow one; predecessor
+  /// chains preserve order but accumulate unbounded
   /// detached work behind a wedged hook.
   #[tokio::test]
   async fn one_tasks_transition_observations_stay_in_order_on_their_lane() {
@@ -1543,15 +1542,15 @@ mod tests {
     }
   }
 
-  /// The P1-6 regression: an extension reconciler is the one effect
-  /// class that routinely awaits other admitted tasks through its
-  /// public handle. Under the old two-channel split it drew from the
-  /// local channel, so with one local slot already held it took the
-  /// last remaining slot and its child write could never start — the
-  /// workflow deadlocked on the very capacity its own child needed.
-  /// The extension channel breaks the cycle: the workflow draws its
-  /// own class, and the child takes the local slot the workflow no
-  /// longer occupies.
+  /// The extension-reconciler regression: an extension reconciler is the one
+  /// effect class that routinely awaits other admitted tasks through its
+  /// public handle. A two-channel split (local plus extension) would
+  /// draw from the local channel, so with one local slot already held it
+  /// would take the last remaining slot and its child write could never
+  /// start — the workflow would deadlock on the very capacity its own
+  /// child needed. The extension channel breaks the cycle: the workflow
+  /// draws its own class, and the child takes the local slot the workflow
+  /// no longer occupies.
   #[tokio::test]
   async fn an_extension_workflow_never_occupies_the_local_channel_its_children_need() {
     let (client, _manager) = spawn_task_manager(deps()).expect("manager");
@@ -1612,11 +1611,11 @@ mod tests {
     .expect("terminal");
   }
 
-  /// The P2-2 regression: the manager admitted unboundedly — the
-  /// submission channel bounded only in-flight messages, and each
-  /// admission inserted a `Pending` entry and spawned a worker before
-  /// that worker ever drew an execution slot, so a slow effect plus a
-  /// stream of distinct intents accumulated non-terminal work without
+  /// The admission-bounding regression: a manager that admits unboundedly
+  /// — the submission channel bounding only in-flight messages, with each
+  /// admission inserting a `Pending` entry and spawning a worker before
+  /// that worker ever draws an execution slot — lets a slow effect plus a
+  /// stream of distinct intents accumulate non-terminal work without
   /// bound. The per-class backlog bound refuses typed once a class
   /// holds its budget, and the budgets are isolated: a saturated local
   /// backlog never consumes the network budget.
@@ -1865,7 +1864,7 @@ mod tests {
   }
 
   /// The revoke payload carries the pinned expected key, so coalescing
-  /// compares it (audit A05): two revokes for the same subject with
+  /// compares it: two revokes for the same subject with
   /// different keys are different intents — the second must conflict,
   /// never join the in-flight task whose effect checks only the first
   /// caller's comparand. An identical retry still joins and resolves

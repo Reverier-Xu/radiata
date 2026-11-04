@@ -66,7 +66,7 @@ struct Collector {
   packets: Mutex<Vec<(String, Vec<u8>)>>,
   /// Typed body interruptions observed mid-stream (a relay leg dying):
   /// `(trace, error kind)`. A truncated body must surface here, never as
-  /// a delivered packet (audit 2026-10-09 item 11).
+  /// a delivered packet.
   interruptions: Mutex<Vec<(String, ErrorKind)>>,
 }
 
@@ -745,7 +745,7 @@ async fn a_body_above_the_chunk_bound_crosses_three_hops_byte_exact() {
   }
 }
 
-/// A mid-route relay leg death (audit 2026-10-09 item 11): while a gated
+/// A mid-route relay leg death: while a gated
 /// body is in flight from A toward D across the A—B—C—D chain, the B—C
 /// leg dies. The relay at C must synthesize a typed *interrupted* end for
 /// D — D's consumer observes exactly one typed `StreamInterrupted` and
@@ -874,14 +874,13 @@ async fn relay_leg_death_surfaces_typed_interruption_at_the_destination() {
   }
 }
 
-/// The origin-side route record's terminal contract (remaining items
-/// 2026-10-10, P2-3): the pump's end-of-stream `Delivered` and the relay
-/// chain's late mid-flight failure report are two writers on one record,
-/// and the route table's monotonic terminal machine must converge them to
-/// one deterministic final answer. The realistic ordering is pinned here:
-/// a post-admission failure is only reported upstream when the surviving
-/// relay's chunk relay fails (`forward::relay_chunk` → `fail_hop`), so
-/// the pump's tail lands first and the failure report arrives late — and
+/// The origin-side route record's terminal contract: the pump's end-of-stream
+/// `Delivered` and the relay chain's late mid-flight failure report are two
+/// writers on one record, and the route table's monotonic terminal machine must
+/// converge them to one deterministic final answer. The realistic ordering is
+/// pinned here: a post-admission failure is only reported upstream when the
+/// surviving relay's chunk relay fails (`forward::relay_chunk` → `fail_hop`),
+/// so the pump's tail lands first and the failure report arrives late — and
 /// must still override the recorded `Delivered`. The opposite ordering
 /// (failure first) is exercised by the pump-side lib tests in
 /// `src/routing/outbound.rs`.
@@ -976,7 +975,7 @@ async fn relay_leg_death_leaves_the_origin_record_failed_regardless_of_ordering(
     .unwrap();
 
   // D's consumer observes the typed interruption — the consumer-side
-  // semantics of the same death (audit 2026-10-09 item 11).
+  // semantics of the same death.
   wait_for(
     || !nodes[3].collector.interruptions.lock().unwrap().is_empty(),
     Duration::from_secs(30),

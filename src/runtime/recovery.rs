@@ -17,8 +17,8 @@ pub(super) const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration
 /// Runs the recovery-observation worker: one long-lived task that owns
 /// the recovery cadence and, per tick, runs the recovery tick followed
 /// by the three retention sweeps — the exact work the supervisor's
-/// select loop used to await inline (audit 2026-10-09 item 3), so slow
-/// storage no longer parks control-plane reads and packet admission
+/// select loop would otherwise await inline, so slow
+/// storage never parks control-plane reads and packet admission
 /// behind a tick.
 ///
 /// Overlap policy — SKIP, never queue: the worker is a single task and
@@ -132,10 +132,10 @@ fn controller_view(
 /// and both dial planes rotate through them per member — one serial per
 /// member, advanced once per dial of that member (endpoint-level
 /// failover), so a member whose first endpoint is unreachable is still
-/// reached on the others (audit 2026-10-09 item 7). The degree plane
+/// reached on the others. The degree plane
 /// consumes the SAME full endpoint lists and the SAME per-member
-/// rotation (see `runtime/degree.rs`), so the first-endpoint projection
-/// the degree dialer used to carry is gone (remaining-items list P2-5).
+/// rotation (see `runtime/degree.rs`), so no plane carries a
+/// first-endpoint-only projection.
 pub(super) async fn known_online_member_endpoints(
   cache: &ExclusionCache, store: &crate::storage::MetadataStore, local: &NodeId,
 ) -> Result<std::collections::BTreeMap<NodeId, Vec<Endpoint>>> {
@@ -250,7 +250,7 @@ impl TickState {
     // when already full, and re-checked before EVERY spawn below —
     // slots held by previous ticks' dials free up between ticks, so a
     // pre-batch check alone would admit up to `2*fan_out - 1`
-    // concurrent dials (audit finding #5).
+    // concurrent dials.
     let fan_out = self.config.recovery().fan_out().max(1);
     if !dial_due
       || self
@@ -280,7 +280,7 @@ impl TickState {
       )
     };
     for member in step.targets {
-      // Bound re-check per spawn (audit finding #5): the counter only
+      // Bound re-check per spawn: the counter only
       // ever decrements when a dial completes, so the check immediately
       // before the spawn below (which acquires the slot) holds the
       // in-flight count at the bound; the truncated targets stay
@@ -299,9 +299,9 @@ impl TickState {
       // Endpoint-level failover with a PER-MEMBER serial: every dial of
       // this member advances its own rotation, wrapping per member, so
       // each member sweeps ALL its published endpoints no matter which
-      // members the schedule picks (audit 2026-10-09 item 7; a shared
-      // schedule serial aliased member position with endpoint index and
-      // could pin a member to one endpoint forever).
+      // members the schedule picks (a shared
+      // schedule serial aliases member position with endpoint index and
+      // can pin a member to one endpoint forever).
       let Some(serial) = self.member_dial_serial(&member) else {
         continue;
       };
@@ -394,9 +394,8 @@ impl TickState {
     // victim is removed by the exact entry identity the scan observed
     // (re-verified as an alive, direct, recovery-dialed edge), so a
     // reconnect that replaces the map entry in any window can never be
-    // retired as the old redundant edge (audit 2026-10-09 item 13
-    // addendum:
-    // the dial class belongs to the entry, not the key).
+    // retired as the old redundant edge (the dial class belongs to the
+    // entry, not the key).
     let victim: Option<(NodeId, crate::session::stream::SessionEntry)> = {
       let mut sessions = self.sessions.lock().map_err(Error::session_table)?;
       let mut marked = Vec::new();
@@ -463,9 +462,9 @@ fn reclaimable(entry: &crate::session::stream::SessionEntry) -> bool {
 /// every exit path of the dial task — successful completion, the dial's
 /// error return, a panic unwinding through a caller-supplied transport's
 /// future, or the shutdown path's abort — runs the drop and releases the
-/// slot. The manual `fetch_add`/`fetch_sub` pairs this replaces decremented
-/// only after the await, so any panic or cancellation skipped it and the
-/// stranded slot suppressed later maintenance/probe ticks or consumed a
+/// slot. A manual `fetch_add`/`fetch_sub` pair decremented only after the
+/// await would skip the decrement on any panic or cancellation, and the
+/// stranded slot would suppress later maintenance/probe ticks or consume a
 /// recovery fan-out budget for the incarnation's remainder.
 pub(super) struct DialPermit {
   pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -553,8 +552,8 @@ pub(super) fn spawn_member_dial(
   });
   // The dial's JoinHandle joins the tracked connection-task set the
   // recovery tick reaps (finished handles) and the shutdown path drains
-  // inside its bounded cooperative window, aborting only the stragglers
-  // (audit finding #19): an in-flight dial is owned and torn down with
+  // inside its bounded cooperative window, aborting only the stragglers:
+  // an in-flight dial is owned and torn down with
   // the node instead of outliving it.
   if let Ok(mut handles) = state.connection_tasks.lock() {
     handles.push(dial);
@@ -591,9 +590,8 @@ pub(super) fn advance_member_serial(
 /// The endpoint one dial of a multi-homed member lands on: the serial
 /// is the member's OWN dial count (see [`advance_member_serial`]), so a
 /// member whose current endpoint is unreachable is retried on the
-/// others across successive dials of that member (audit 2026-10-09
-/// item 7). A member's first dial lands on its first published
-/// endpoint.
+/// others across successive dials of that member. A member's first dial
+/// lands on its first published endpoint.
 ///
 /// The serial must be PER MEMBER, never a schedule-level attempt
 /// serial: member selection and a shared serial are both pure functions
@@ -607,7 +605,7 @@ pub(super) fn advance_member_serial(
 ///
 /// Shared FUNCTION with the degree maintenance plane, which feeds the
 /// member's serial from the same per-member rotation — the two planes
-/// rotate one member's endpoints together (remaining-items list P2-5).
+/// rotate one member's endpoints together.
 pub(super) fn recovery_endpoint(endpoints: &[Endpoint], serial: u64) -> Option<&Endpoint> {
   let index = serial.saturating_sub(1) as usize % endpoints.len().max(1);
   endpoints.get(index)
@@ -697,12 +695,12 @@ mod tests {
     crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
-  /// A04's failover liveness contract, exhaustively: for every
+  /// The failover liveness contract, exhaustively: for every
   /// candidate count (1..=8), endpoint count (1..=4), and fan-out
   /// (1, 2, 3), driving `candidates * endpoints` recovery steps must
   /// dial every endpoint of every member at least once. A shared
   /// schedule-level serial fails this whenever
-  /// gcd(candidate_count, endpoint_count) > 1 (the audit's aliasing);
+  /// gcd(candidate_count, endpoint_count) > 1 (the aliasing above);
   /// per-member serials sweep unconditionally.
   #[test]
   fn every_member_sweeps_every_endpoint_for_any_schedule_shape() {
@@ -834,11 +832,11 @@ mod tests {
     }
   }
 
-  /// Boundedness of the derived recovery tick (audit 2026-10-09 item 3):
+  /// Boundedness of the derived recovery tick:
   /// while one tick's storage IO never resolves, NO further tick work
   /// piles up behind it — after two more tick deadlines fire, exactly
   /// one gated snapshot has been entered. A spawn-per-tick or queued
-  /// design would have started one tick per deadline and grown the
+  /// design would start one tick per deadline and grow the
   /// counter; the single worker with `MissedTickBehavior::Skip` holds
   /// the in-flight work at one tick.
   #[tokio::test(start_paused = true)]
@@ -944,7 +942,7 @@ mod tests {
   }
 
   /// A caller-registered transport whose connect future counts the
-  /// attempt and then panics mid-dial: P2-12's exact shape — a custom
+  /// attempt and then panics mid-dial — a custom
   /// transport future unwinding through the dial task. The attempt
   /// counter is the observable: it rising again after the panic proves a
   /// later dial still launched, which the leaked in-flight counter made
@@ -1045,7 +1043,7 @@ mod tests {
         .register_builtin_transport(tag, transport)
         .unwrap();
     }
-    // The panicking custom transport the P2-12 regression dials through,
+    // The panicking custom transport the regression dials through,
     // under its own scheme name: only endpoints that advertise it
     // resolve here, so the other fixtures never touch it.
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -1093,7 +1091,7 @@ mod tests {
     (client, connection_tasks, attempts)
   }
 
-  /// Audit finding #19: a recovery dial is a spawned task whose
+  /// A recovery dial is a spawned task whose
   /// JoinHandle must be registered in the tracked connection-task set,
   /// or shutdown neither cancels nor awaits it. This drives the real
   /// shutdown path end to end: the node's recovery worker dials a
@@ -1189,7 +1187,7 @@ mod tests {
     holder.abort();
   }
 
-  /// Audit finding #5's bound, through the real recovery tick: while a
+  /// The in-flight bound, through the real recovery tick: while a
   /// previous step's dial stays parked against a silent peer, the next
   /// step must hold the in-flight count AT the fan-out bound instead of
   /// overshooting to `2*fan_out - 1` — the pre-batch gate alone admits
@@ -1305,7 +1303,7 @@ mod tests {
     refused_holder.abort();
   }
 
-  /// The scoped permit is P2-12's mechanism: whichever way the dial
+  /// The scoped permit is the dial slot's mechanism: whichever way the dial
   /// task's future ends — completion, a panic unwinding through it, or
   /// the shutdown path's cancellation — the drop runs and the counter
   /// returns to its pre-acquisition value. (The completion path is the
@@ -1347,13 +1345,13 @@ mod tests {
     );
   }
 
-  /// P2-12's recovery shape, through the real supervision path: a
+  /// The recovery shape, through the real supervision path: a
   /// caller-supplied transport whose connect future panics mid-dial must
-  /// not strand its fan-out slot. The manual `fetch_add`/`fetch_sub`
-  /// pair decremented after the await, so the panic skipped it; the
-  /// fan-out gate then deferred every later recovery step for the
-  /// incarnation and the attempt counter froze at one. The scoped
-  /// permit releases on the unwind, so the plane keeps dialing.
+  /// not strand its fan-out slot. A manual `fetch_add`/`fetch_sub`
+  /// pair decremented after the await would skip the decrement on a
+  /// panic; the fan-out gate would then defer every later recovery step
+  /// for the incarnation and the attempt counter would freeze at one. The
+  /// scoped permit releases on the unwind, so the plane keeps dialing.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_panicking_transport_future_releases_its_recovery_slot() {
     let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(

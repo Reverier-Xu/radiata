@@ -2,8 +2,7 @@
 //! retry, the post-commit outcome mapping, and the writer's monotonic
 //! resource-write stamp clock. The put and removal effects themselves
 //! live in [`super::task_effects`] (`reconcile_put_resource`,
-//! `reconcile_delete_resource`) and compose these helpers exactly the
-//! way the old supervisor methods did.
+//! `reconcile_delete_resource`) and compose these helpers.
 
 use crate::{Error, Result, node::EventHub};
 

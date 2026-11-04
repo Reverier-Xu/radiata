@@ -2,12 +2,11 @@
 //! the task manager reconciles.
 //!
 //! Admission is the synchronous half — pure validation, then the task
-//! submission — and never performs IO. The effect is the verb body that
-//! used to run inline on the supervisor's select loop, moved here
-//! unchanged: same durable writes, same events, same audit lines, same
-//! typed errors. Migrating a verb therefore moves code and changes only
-//! *where* its failures surface (the task's `wait` instead of the verb
-//! call).
+//! submission — and never performs IO. The effect is the verb body,
+//! separate from the supervisor's select loop: same durable writes, same
+//! events, same audit lines, same typed errors. Migrating a verb therefore
+//! moves code and changes only *where* its failures surface (the task's `wait`
+//! instead of the verb call).
 //!
 //! [`OperationDeps`] is the node-shared handle bundle every effect reads.
 //! It is built once per incarnation in `spawn_runtime` and owned by the
@@ -92,9 +91,8 @@ pub(crate) struct EffectPlanes {
   /// The local descriptor's lazy-publication gate: the endpoint set the
   /// descriptor was last successfully ensured against plus the
   /// single-flight flag bounding the read views' kicked publications at
-  /// one task (see [`kick_self_descriptor_publication`]; remaining
-  /// items 2026-10-10, P2-9). Module-private: only this module's ensure
-  /// and kick touch it.
+  /// one task (see [`kick_self_descriptor_publication`]). Module-private:
+  /// only this module's ensure and kick touch it.
   descriptor_publication: DescriptorPublication,
   /// The memoized departed-members exclusion set, shared with the
   /// supervisor's own pages: the checkpoint guard reads the same cache.
@@ -572,7 +570,7 @@ async fn reconcile_revoke(
     &expected_key,
   )
   .await?;
-  // The shared authorization boundary (audit 2026-10-23, P1-11): the
+  // The shared authorization boundary: the
   // durable commit, the ledger record, and the session retirement run as
   // ONE exclusive section against session publication. A handshake whose
   // admission predated this revoke either published before the section
@@ -839,13 +837,12 @@ pub(crate) async fn patch_metadata(
   ))
 }
 
-/// The local descriptor's lazy-publication coordination (remaining
-/// items 2026-10-10, P2-9): the endpoint set the descriptor was last
-/// successfully ensured against, plus the single-flight flag for the
-/// publication task the read views schedule. Together they keep the
-/// lazy path's task population bounded — a steady-state member read
-/// spawns nothing (the stamp matches), and at most ONE publication task
-/// is ever alive (the audit item 4 lesson applied to the lazy path).
+/// The local descriptor's lazy-publication coordination: the endpoint set
+/// the descriptor was last successfully ensured against, plus the
+/// single-flight flag for the publication task the read views schedule.
+/// Together they keep the lazy path's task population bounded — a
+/// steady-state member read spawns nothing (the stamp matches), and at
+/// most ONE publication task is ever alive.
 #[derive(Default)]
 struct DescriptorPublication {
   /// Whether a scheduled publication task is currently in flight.
@@ -926,11 +923,10 @@ pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
 /// population at one task).
 const DESCRIPTOR_PUBLICATION_RETRY: Duration = Duration::from_millis(100);
 
-/// Schedules the local descriptor's lazy publication OFF the
-/// supervisor's select loop (remaining items 2026-10-10, P2-9): the
-/// member read views call this instead of awaiting the ensure, so a
-/// first member read on a node that never bound a listener can no
-/// longer park every control-plane operation behind the descriptor
+/// Schedules the local descriptor's lazy publication OFF the supervisor's
+/// select loop: the member read views call this instead of awaiting the
+/// ensure, so a first member read on a node that never bound a listener
+/// can no longer park every control-plane operation behind the descriptor
 /// commit on slow storage. Bounded accounting: the endpoint-set stamp
 /// suppresses the kick in steady state, and the single-flight gate
 /// bounds the population at exactly one task. The scheduled task is
@@ -1632,11 +1628,11 @@ async fn reconcile_listen(
   {
     endpoints.push(published.clone());
   }
-  // Eager publication at the listener transition (remaining items
-  // 2026-10-10, P2-9): the member read views no longer await the lazy
-  // ensure inline, so the listener effect publishes the descriptor
-  // here, on this effect's own lane — a read that follows the listen
-  // task's completion deterministically observes the local node.
+  // Eager publication at the listener transition: the member read views
+  // never await the lazy ensure inline, so the listener effect publishes
+  // the descriptor here, on this effect's own lane — a read that follows
+  // the listen task's completion deterministically observes the local
+  // node.
   // Best-effort by the maintenance tick's contract: a failed
   // publication defers to the read views' kick and the tick's own
   // rewrite without failing the already-bound listener.
@@ -1849,10 +1845,9 @@ mod descriptor_publication_tests {
       .collect()
   }
 
-  /// The gate's two bounds (remaining items 2026-10-10, P2-9): the
-  /// endpoint-set stamp suppresses ensure work while the published
-  /// endpoints are unchanged (a listener transition is the only
-  /// invalidation), and the single-flight flag admits exactly one
+  /// The gate's two bounds: the endpoint-set stamp suppresses ensure work
+  /// while the published endpoints are unchanged (a listener transition is
+  /// the only invalidation), and the single-flight flag admits exactly one
   /// publication task at a time.
   #[test]
   fn the_stamp_suppresses_unchanged_kicks_and_the_slot_serializes() {
@@ -2053,12 +2048,12 @@ mod lazy_publication_shutdown_tests {
     (client, connection_tasks)
   }
 
-  /// Audit A08: the lazy local-descriptor publication used to spawn
-  /// detached, outside every shutdown registry, so a member read that
-  /// kicked a publication could still be mid descriptor commit when
-  /// `shutdown()` returned — the storage exclusive lifetime lock
-  /// outlived the reply, and an immediate reopen of the same factory
-  /// failed `StorageLocked` until the stray commit finished. This
+  /// The lazy local-descriptor publication must never spawn
+  /// detached, outside every shutdown registry: a member read that
+  /// kicks a publication could otherwise still be mid descriptor commit when
+  /// `shutdown()` returns — the storage exclusive lifetime lock
+  /// outlives the reply, and an immediate reopen of the same factory
+  /// fails `StorageLocked` until the stray commit finishes. This
   /// drives the real shutdown path end to end against a store whose
   /// descriptor commit parks forever (the slow-storage commit the lazy
   /// path exists for): the kicked task must sit in the tracked

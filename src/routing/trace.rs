@@ -19,7 +19,7 @@
 //!   mid-flight failure rewrites a durable `Delivered` into the explicit
 //!   `Failed(StreamInterrupted)` (the durable twin of the in-memory monotonic
 //!   terminal machine), so the durable evidence converges with the in-memory
-//!   record under either writer ordering (remaining items 2026-10-10, P2-7).
+//!   record under either writer ordering.
 //!
 //! Record accessors that only the unit tests and the compatibility
 //! golden-vector reader consume are `#[cfg(test)]`; the production
@@ -351,7 +351,7 @@ pub(crate) async fn put_trace(
 /// the given origin-side identity, because the revision races the origin
 /// pump's still-in-flight terminal write and must be able to win that
 /// ordering too (the durable twin's mirror of the route table's monotonic
-/// terminal machine — remaining items 2026-10-10, P2-7). One conditional
+/// terminal machine). One conditional
 /// write per call: the caller retries a lost store race against the
 /// winner's committed value instead of silently diverging.
 async fn revise_terminal_once(
@@ -1452,9 +1452,9 @@ mod tests {
   }
 
   /// A terminal fact admitted after the node tore down skips its store
-  /// write and lands in the same drop aggregate the queue bound feeds
-  /// (audit 2026-10-27 B3, mechanism 2): the weak handle finds no
-  /// context, so nothing re-pins the released store, and the best-effort
+  /// write and lands in the same drop aggregate the queue bound feeds:
+  /// the weak handle finds no context, so nothing re-pins the released
+  /// store, and the best-effort
   /// surface keeps its accounting exact — one fed record is exactly one
   /// of dropped or persisted.
   #[tokio::test]
@@ -1644,10 +1644,10 @@ mod tests {
   /// A revision moves an existing durable `Delivered` terminal to the
   /// explicit failure while keeping the row's bound identity — the
   /// durable twin of the in-memory monotonic terminal machine's
-  /// "a late failure overrides a recorded `Delivered`" (remaining items
-  /// 2026-10-10, P2-7): without it, a relay-leg death leaves the durable
-  /// trace claiming `Delivered` for the whole retention window while the
-  /// in-memory record ends `Failed(StreamInterrupted)`.
+  /// "a late failure overrides a recorded `Delivered`": without it, a relay-leg
+  /// death leaves the durable trace claiming `Delivered` for the whole
+  /// retention window while the in-memory record ends
+  /// `Failed(StreamInterrupted)`.
   #[tokio::test]
   async fn revision_moves_a_delivered_terminal_to_the_failure_kind() {
     let sink = TraceSink::test_sink().await;
@@ -1818,9 +1818,9 @@ impl TraceSink {
 
   /// Skips one admitted persistence task whose node is already torn
   /// down: re-pinning the store the shutdown reply just released is the
-  /// residual lock tail (audit 2026-10-27 B3, mechanism 2), so the
-  /// record is dropped into the same aggregate the queue-bound drops
-  /// feed — the durable trace is a best-effort observation surface —
+  /// residual lock tail, so the record is dropped into the same aggregate
+  /// the queue-bound drops feed — the durable trace is a best-effort
+  /// observation surface —
   /// with a debug diagnostic matching that severity.
   fn drop_after_teardown(&self) {
     let dropped = self
@@ -1874,7 +1874,7 @@ impl TraceSink {
   }
 
   /// The durable twin's mirror of the route table's monotonic terminal
-  /// machine (remaining items 2026-10-10, P2-7): the same late mid-flight
+  /// machine: the same late mid-flight
   /// failure that flips the in-memory route record to `Failed` revises
   /// this trace id's durable terminal record to `Failed(kind)`. An
   /// existing row keeps its bound identity and only the phase moves; an

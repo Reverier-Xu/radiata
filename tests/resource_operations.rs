@@ -409,7 +409,7 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
   // Reopen the same store: the identity and the committed candidate load
   // intact. The previous node's shutdown reply returned only after the
   // storage execution barrier drained every database-holding execution
-  // (commits and snapshots; audit 2026-10-27 B3), so the reopen is
+  // (commits and snapshots), so the reopen is
   // immediate and un-retried — a `StorageLocked` here is a regression,
   // not a settle to tolerate.
   let handle = NodeBuilder::new(Arc::clone(&storage))
@@ -924,12 +924,12 @@ impl radiata::extension::KeyProvider for GatedSignKeys {
   }
 }
 
-/// Regression (the 2026-10-09 audit, item 6): two concurrent
+/// Regression: two concurrent
 /// compare-and-swap writes conditioned on the same observed version
-/// must resolve to exactly one commit. The loser's signature used to
-/// land after a concurrent winner with a later stamp, and the commit's
-/// own tuple check happily replaced the register — silently violating
-/// the caller's expected version. The commit boundary now re-verifies
+/// must resolve to exactly one commit. A loser's signature landing
+/// after a concurrent winner with a later stamp would let the commit's
+/// own tuple check replace the register — silently violating
+/// the caller's expected version. The commit boundary re-verifies
 /// the precondition inside its own snapshot, so the loser surfaces the
 /// typed [`radiata::ErrorKind::Conflict`] instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

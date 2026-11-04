@@ -1,4 +1,4 @@
-//! Sparse-topology routing measurement (audit 2026-10-23 item D-6 / R2-D05).
+//! Sparse-topology routing measurement.
 //!
 //! Evidence work, not a behavior change: eight real TLS nodes over loopback
 //! are reshaped into sparse graphs — ring, tree, dead-end branches, an
@@ -29,7 +29,7 @@
 //! Failure cells classify the typed kinds the origin observes and the
 //! recovery that exists (forwarder branch search, caller fresh-trace
 //! retries) or does not (budget exhaustion below path length, unreachable
-//! destinations, the direct-only convenience reply of D-7).
+//! destinations, the direct-only convenience reply).
 //!
 //! Two tests share this harness: `sparse_routing_structural_invariants`
 //! runs the lean profile (CI: real nodes, small samples, structural
@@ -1649,7 +1649,7 @@ async fn run_failure_cells(
   )
   .await;
 
-  // B1: seven-hop destination under a three-hop budget. Every path is
+  // Seven-hop destination under a three-hop budget. Every path is
   // longer than the budget, so no attempt and no fresh trace can deliver.
   let mut b1 = Cell {
     shape: "chain8",
@@ -1693,8 +1693,8 @@ async fn run_failure_cells(
   report_retries("chain8", 0, 7, 3, &retries);
 
   // R: convenience-reply probes. A delivered multi-hop stream's derived
-  // return stream is direct-only (hardcoded one-hop budget, D-7's
-  // decided boundary): the reply can never cross the chain back to the
+  // return stream is direct-only (hardcoded one-hop budget, a decided
+  // boundary): the reply can never cross the chain back to the
   // source, whatever the caller intends.
   for probe in 0..profile.reply_probes {
     let target = nodes[7].id().clone();
@@ -1759,7 +1759,7 @@ async fn sparse_routing_structural_invariants() {
 }
 
 /// The full statistical profile behind `--ignored`; its logged tables
-/// are the D-6 measurement report data.
+/// are the measurement report data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "full statistical profile: cargo test --release --test routing_sparse_measurement sparse_routing_full_profile_tables -- --ignored --exact --nocapture"]
 async fn sparse_routing_full_profile_tables() {

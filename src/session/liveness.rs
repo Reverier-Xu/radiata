@@ -269,7 +269,7 @@ mod liveness_tests {
     handle.await.unwrap();
   }
 
-  /// Regression (audit finding 5): the close deadline must key on an
+  /// Regression: the close deadline must key on an
   /// outstanding probe, not on the ping send cadence. With the wall clock
   /// advancing one tick at a time — no jump the send branch could hide
   /// behind — a peer that never answers must still be closed by the

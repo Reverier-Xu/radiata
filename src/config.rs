@@ -423,21 +423,21 @@ impl Default for NodeConfig {
       // One second, not 250 ms: the anti-entropy cadence is a fixed
       // per-node cost paid N-wide every tick, and 64 nodes × 4 ticks/s
       // saturated a two-vcpu runner until the data plane's relay acks
-      // starved (incident C). Convergence at one tick/s stays far
-      // inside the sync SLOs; fast deployments may tighten it.
+      // starved. Convergence at one tick/s stays far inside the sync
+      // SLOs; fast deployments may tighten it.
       anti_entropy_interval: Duration::from_secs(1),
       dial_deadline: Duration::from_secs(10),
       // 30 s, not 10 s: the deadline covers the join-mode admission
       // commit, and on slow flash one commit costs hundreds of
       // milliseconds — a few concurrent joins pushed the tail of a
-      // burst past 10 s so joins failed persistently (the incident-B
-      // shape). The default must be safe on the slowest supported
-      // device; fast deployments tighten it, never the reverse.
+      // burst past 10 s so joins failed persistently. The default must
+      // be safe on the slowest supported device; fast deployments tighten
+      // it, never the reverse.
       authentication_deadline: Duration::from_secs(30),
       // Five seconds per hop: long enough for a slow hop to answer,
       // short enough that a long relay attempt fails its stuck branch
       // and moves on instead of hanging to the transitive liveness
-      // bound (the incident-C shape).
+      // bound.
       relay_hop_deadline: Duration::from_secs(5),
       recovery: RecoveryConfig::default(),
       session_queue_messages: 256,
@@ -465,12 +465,12 @@ impl Default for NodeConfig {
       required_features: BTreeSet::new(),
       merge_admission: MergeAdmissionLimits::default(),
       connection_degree: 0,
-      // Two plus two: the historical single semaphore held four permits,
-      // and the split keeps that total while giving each class its own
-      // channel — local work keeps a two-slot floor even while every
-      // network slot sits inside a dial deadline (the starvation
-      // incident behind the split). Deployments that dial heavily may
-      // grow `network`; a deployment that never dials may shrink it.
+      // Two plus two: one shared semaphore of four permits would let a
+      // dial hold every slot, so the split keeps that total while giving each
+      // class its own channel — local work keeps a two-slot floor even while
+      // every network slot sits inside a dial deadline. Deployments that dial
+      // heavily may grow `network`; a deployment that never dials may shrink
+      // it.
       task_reconcile_local_slots: 2,
       task_reconcile_network_slots: 2,
     }
@@ -493,8 +493,8 @@ pub(crate) struct AdmissionPoolLimits {
 /// (holders of a trusted binding — the self-healing path) are budgeted
 /// by the cluster scale: `max(16, 4 × expected_members)` per source and
 /// `max(256, 4 × expected_members)` per node per minute, so a whole
-/// site reconnecting behind one address never starves its tail (the
-/// incident-B shape). Tokens refill continuously at `burst / window`
+/// site reconnecting behind one address never starves its tail. Tokens
+/// refill continuously at `burst / window`
 /// per second.
 #[derive(Clone, Copy, Debug)]
 pub struct MergeAdmissionLimits {
@@ -707,9 +707,8 @@ impl Default for RecoveryConfig {
       // Sixteen, not sixty-four: the any-one-route contract needs exactly
       // one route, and on two slow cores a sixty-four-dial burst starved
       // its own tail past the authentication deadline so every dial in
-      // the burst failed and the isolated member never healed (incident
-      // B). Sixteen converges in a step or two under the same
-      // starvation.
+      // the burst failed and the isolated member never healed. Sixteen
+      // converges in a step or two under the same starvation.
       fan_out: 16,
       // Two seconds, not one: with identical backoff sequences many
       // devices recovering from one shared event retry in lockstep and
@@ -893,17 +892,17 @@ mod tests {
   /// be safe on the slowest supported device (the mixed-cluster rule:
   /// timing constants are peer-visible, so there is no second, named
   /// low-power profile). Every recalibrated value traces to a
-  /// transport-chaos incident or a slow-device bound.
+  /// transport-chaos scenario or a slow-device bound.
   #[test]
   fn liveness_defaults_are_the_slow_device_calibration() {
     let config = NodeConfig::new();
-    // Incident C: 64 nodes x 4 anti-entropy ticks/s starved a two-vcpu
+    // 64 nodes x 4 anti-entropy ticks/s starve a two-vcpu
     // runner's data plane; one tick/s keeps the O(N x interval) load
     // bounded while converging far inside the sync SLOs.
     assert_eq!(config.anti_entropy_interval(), Duration::from_secs(1));
-    // Incident B, deadline half: slow-flash admission commits pushed
-    // concurrent join tails past the old 10 s deadline into persistent
-    // join failure.
+    // Deadline half: slow-flash admission commits push
+    // concurrent join tails past a 10 s deadline into persistent
+    // join failure, so the default covers the slowest supported device.
     assert_eq!(config.authentication_deadline(), Duration::from_secs(30));
     // Duty-cycled peers skip several 20 s pings before the 60 s
     // keepalive timeout closes them, and a 90 s idle tolerates a slow
@@ -911,7 +910,7 @@ mod tests {
     assert_eq!(config.session_idle_timeout(), Duration::from_secs(90));
     assert_eq!(config.keepalive_interval(), Duration::from_secs(20));
     assert_eq!(config.keepalive_timeout(), Duration::from_secs(60));
-    // Incident B: the recovery plane's own defaults (fan-out sixteen,
+    // The recovery plane's own defaults (fan-out sixteen,
     // two-second initial backoff) are asserted in the recovery
     // controller's tests; here only the ordering invariant repeats:
     assert!(config.recovery().fan_out() >= 1);

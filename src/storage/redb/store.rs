@@ -202,8 +202,8 @@ fn take_commit_failure(transaction: &TransactionId) -> Option<redb::CommitError>
   armed.map(|(_, error)| error)
 }
 
-/// Test-only scan-failure injection for the backfill regression (audit
-/// 2026-10-23 P2-9), owned by the one factory that armed it: armed as
+/// Test-only scan-failure injection for the backfill regression,
+/// owned by the one factory that armed it: armed as
 /// the number of entries the scan may yield before failing, and
 /// consumed one-shot by the first scan of an open on that factory that
 /// reaches the threshold, so the fault can never leak into another
@@ -284,7 +284,7 @@ impl RedbStoreFactory {
   }
 
   /// Builds a factory whose next backfill scan fails once it has
-  /// yielded `after` entries (audit 2026-10-23 P2-9). The fault lives
+  /// yielded `after` entries. The fault lives
   /// on this factory alone, so a concurrent test's open can never
   /// consume it.
   #[cfg(test)]
@@ -353,17 +353,16 @@ struct RedbStorage {
   /// lands durably even after the awaiting future is dropped. A
   /// reconciler of the same transaction waits on the entry's landing
   /// signal before reading receipts, so a cancelled commit is judged by
-  /// its final receipt and never by a not-yet-landed absence (audit
-  /// 2026-10-09 item 14). An empty map is half of the completion
-  /// barrier [`Storage::flush`] awaits — the snapshot readers are the
-  /// other half — so no in-flight execution still holds the database
-  /// or is about to commit (audit 2026-10-23 P1-10).
+  /// its final receipt and never by a not-yet-landed absence. An empty
+  /// map is half of the completion barrier [`Storage::flush`] awaits —
+  /// the snapshot readers are the other half — so no in-flight execution
+  /// still holds the database or is about to commit.
   detached:
     Arc<std::sync::Mutex<std::collections::BTreeMap<TransactionId, Arc<tokio::sync::Notify>>>>,
   /// Fires whenever any detached execution ends (commit, failure, or
   /// panic): the wakeup edge behind [`Storage::flush`]'s drain wait.
   settled: Arc<tokio::sync::Notify>,
-  /// The in-flight snapshot executions (audit 2026-10-27 B3): a
+  /// The in-flight snapshot executions: a
   /// snapshot's `spawn_blocking` read clones the database and the
   /// returned handle keeps the read transaction open, so a live slot
   /// pins the `Database` — and its file lock — exactly like a detached
@@ -377,10 +376,10 @@ struct RedbStorage {
 /// slot per [`Storage::snapshot`] call, from the moment its blocking
 /// read is admitted until the returned snapshot handle drops. The
 /// detached-commit registry cannot see these executions (they never
-/// register a transaction), yet empirically they held the last
-/// `Arc<Database>` past the shutdown reply — a restart then lost the
-/// race for the file lock and observed `StorageLocked` (audit
-/// 2026-10-27 B3) — so the flush barrier drains this gate as well.
+/// register a transaction), yet they can hold the last
+/// `Arc<Database>` past the shutdown reply — a restart then loses the
+/// race for the file lock and observes `StorageLocked` — so the flush
+/// barrier drains this gate as well.
 #[derive(Default)]
 struct SnapshotReaders {
   live: std::sync::Mutex<usize>,
@@ -432,8 +431,8 @@ impl Drop for SnapshotReadGuard {
 /// panic — so a reconciler never waits on a finished execution. The
 /// signal fires strictly after the blocking commit returned, so a woken
 /// reconciler reads final durable evidence. The guard is constructed
-/// INSIDE the blocking closure that performs the durable work (audit
-/// 2026-10-23 P1-10): its drop is the commit's own end, so no outer
+/// INSIDE the blocking closure that performs the durable work: its
+/// drop is the commit's own end, so no outer
 /// async task's teardown can fire the signal or drop the registry entry
 /// while the durable write is still in flight. The shared `settled`
 /// notify wakes the flush barrier the same way.
@@ -478,8 +477,8 @@ impl Storage for RedbStorage {
       // block behind a durable commit, so the open (and the revision
       // read it seeds) runs on the blocking pool: write pressure can
       // never stall the async runtime thread. The reader slot is taken
-      // before the task is admitted and rides the returned handle
-      // (audit 2026-10-27 B3): the blocking task clones the database,
+      // before the task is admitted and rides the returned handle:
+      // the blocking task clones the database,
       // so an execution the awaiting future abandoned still pins the
       // `Database` — and its file lock — until the handle drops, and
       // the flush barrier must see it.
@@ -509,9 +508,9 @@ impl Storage for RedbStorage {
     // returned future is ever polled: the commit still lands durably
     // when the caller is cancelled (or never polls), and a reconcile of
     // the same transaction observes the in-flight landing from the
-    // moment commit is called — no drop window can hide it (audit
-    // 2026-10-09 item 14). The completion guard rides the blocking
-    // commit itself (audit 2026-10-23 P1-10): it lives and drops inside
+    // moment commit is called — no drop window can hide it. The
+    // completion guard rides the blocking
+    // commit itself: it lives and drops inside
     // the `spawn_blocking` closure, so the registry entry and the
     // landing signal track the true durable operation rather than any
     // async task that happens to be awaiting it.
@@ -547,7 +546,7 @@ impl Storage for RedbStorage {
       // A detached execution of THIS transaction may still land: wait
       // for it before reading durable evidence, so a commit whose caller
       // was cancelled is judged by its final receipt, never by a
-      // not-yet-landed absence (audit 2026-10-09 item 14).
+      // not-yet-landed absence.
       loop {
         let landed = registry
           .lock()
@@ -590,8 +589,8 @@ impl Storage for RedbStorage {
     // still holds the database or is about to commit. This awaits the
     // detached registry draining to empty, so every registered
     // execution has ended (committed, failed, or rolled back) before
-    // the caller resumes (audit 2026-10-23 P1-10), and then the
-    // snapshot readers draining to idle (audit 2026-10-27 B3): a
+    // the caller resumes, and then the
+    // snapshot readers draining to idle: a
     // snapshot execution — its blocking read still running or its
     // handle still held — pins the database exactly like a commit
     // does, and leaving it outside the barrier let the file lock
@@ -973,7 +972,7 @@ fn backfill_value_digests(database: &Database, scan_fault: &BackfillScanFault) -
     // A failing iterator is the open's failure, never a silent early
     // EOF: the loop surfaces every error before the write transaction
     // commits, so a partial backfill can never pose as a completed
-    // upgrade (audit 2026-10-23 P2-9).
+    // upgrade.
     loop {
       scan_fault.check(scanned)?;
       let entry = cursor
@@ -1152,7 +1151,7 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
   // The final durable commit is the one outcome-unknown boundary: a
   // failure here is classified rather than blanket-mapped, because a
   // failed write-out can leave the durable state indeterminate instead
-  // of provably rolled back (audit finding #12).
+  // of provably rolled back.
   if let Err(error) = commit_durable(write, transaction.id()) {
     return classify_commit_failure(error, &transaction);
   }
@@ -1206,7 +1205,7 @@ fn map_commit_error(error: redb::CommitError, context: ProviderErrorContext) -> 
 /// landed. Every other commit failure is provably not committed
 /// (`TransactionPoisoned`, a closed database, ...) and stays a
 /// definite-abort error through [`map_commit_error`]. Deliberately
-/// narrow per the audit: only these two indeterminate variants freeze
+/// narrow: only these two indeterminate variants freeze
 /// the store, and pre-mutation begin/table failures upstream of the
 /// commit are definite aborts by construction.
 ///
@@ -1260,11 +1259,10 @@ fn map_table_error(error: redb::TableError, context: ProviderErrorContext) -> Er
   }
 }
 
-/// The adapter-local regression lanes for the 2026-10-23 follow-ups:
-/// the backfill scan's error contract (P2-9) and the flush completion
-/// barrier (P1-10). Every test drives the real factory open and the
-/// real commit path; the only injections are the module's established
-/// test-only fault hooks.
+/// The adapter-local regression lanes for the backfill scan's error
+/// contract and the flush completion barrier. Every test drives the real
+/// factory open and the real commit path; the only injections are the
+/// module's established test-only fault hooks.
 #[cfg(test)]
 mod followup_tests {
   use std::sync::Arc;
@@ -1285,7 +1283,7 @@ mod followup_tests {
 
   /// A failing backfill scan is the open's failure — never a silent
   /// early EOF that commits a partial digest upgrade and reports the
-  /// open successful (audit 2026-10-23 P2-9): the injected iterator
+  /// open successful: the injected iterator
   /// error fails the open typed, the digest table stays empty (no
   /// partial upgrade was committed), and a later open completes the
   /// whole backfill instead of resuming a mislabeled "finished" one.
@@ -1369,10 +1367,10 @@ mod followup_tests {
     .unwrap()
   }
 
-  /// `flush` is the execution completion barrier (audit 2026-10-23
-  /// P1-10): while a commit is parked just before its durable landing,
-  /// flush must not resolve — the immediate `Ok(())` it used to return
-  /// is exactly the shutdown race the finding names — and once the
+  /// `flush` is the execution completion barrier: while a commit is
+  /// parked just before its durable landing,
+  /// flush must not resolve — an immediate `Ok(())` is
+  /// exactly the shutdown race — and once the
   /// execution ends, flush resolves and the parked commit has landed.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn flush_waits_for_an_in_flight_execution_to_end() {
@@ -1471,11 +1469,11 @@ mod followup_tests {
     ));
   }
 
-  /// The barrier also covers the read side (audit 2026-10-27 B3): a
+  /// The barrier also covers the read side: a
   /// snapshot handle still held — or a snapshot blocking task still
   /// running — clones and pins the `Database` past the shutdown reply,
-  /// and a restart on the same factory then raced the file-lock release
-  /// and observed `StorageLocked`. While a snapshot handle is alive,
+  /// and a restart on the same factory then races the file-lock release
+  /// and observes `StorageLocked`. While a snapshot handle is alive,
   /// flush must not resolve; when the handle drops, flush resolves.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn flush_waits_for_an_outstanding_snapshot_execution() {

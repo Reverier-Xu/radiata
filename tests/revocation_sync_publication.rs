@@ -1,6 +1,5 @@
 //! Public-API integration test for the sync-delivered half of the
-//! revocation/publication authorization boundary (audit 2026-10-23,
-//! P1-11 follow-up).
+//! revocation/publication authorization boundary.
 //!
 //! The local revoke effect already serializes its [commit → retire]
 //! against session publication through the shared boundary. A revocation
@@ -226,8 +225,8 @@ fn drain_session_changes(events: &mut radiata::EventSubscription<SessionChanged>
   }
 }
 
-/// Audit P1-11's interleaving on the sync-delivered path, driven end to
-/// end: the member's handshake with the peer passes its binding checks,
+/// The revocation/publication interleaving on the sync-delivered path, driven
+/// end to end: the member's handshake with the peer passes its binding checks,
 /// the issuer's revocation tombstone lands on the peer through ordinary
 /// sync while the handshake is mid-flight, the handshake then completes
 /// — and the session it would publish never survives under the revoked

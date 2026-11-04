@@ -32,8 +32,8 @@ async fn start_configured(
   common::init_tracing();
   // The runtime default entropy (system randomness) keeps every node's id
   // unique; deterministic entropy would collide across nodes. The open is
-  // un-retried: the trace sink holds its identity context weakly (audit
-  // 2026-10-27 B3, mechanism 2), so no detached trace-persistence tail
+  // un-retried: the trace sink holds its identity context weakly, so no
+  // detached trace-persistence tail
   // can hold the factory's exclusive-open flag past the shutdown
   // barrier — a `StorageLocked` here is a regression, not a retry.
   let handle = NodeBuilder::new(factory.clone())
@@ -65,8 +65,8 @@ async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Nod
 /// A node whose anti-entropy driver ticks hourly: the slow-flash lanes
 /// measure the ADMISSION path against the gated device, and a stray
 /// driver commit queued on the same gate would sit inside the measured
-/// deadline (the tick economics changed when verdict settlement left
-/// the tick path, so the old implicit spacing no longer holds).
+/// deadline (verdict settlement leaves the tick path, so no implicit
+/// spacing holds).
 fn quiet_driver_config() -> NodeConfig {
   NodeConfig::new()
     .with_anti_entropy_interval(std::time::Duration::from_secs(3_600))
@@ -309,7 +309,7 @@ async fn admission_runtime_declared_uncommitted_resolution_unfreezes_permanent_c
   // the un-retried reopen in `start_configured` relies on: the reply
   // returns only once the storage execution barrier released the store,
   // and the trace sink's weak identity context cannot re-pin it behind
-  // that barrier (audit 2026-10-27 B3, mechanism 2). A bare handle drop
+  // that barrier. A bare handle drop
   // tears the runtime down asynchronously instead, which races any
   // immediate reopen with a `StorageLocked` that is this drop path's,
   // not the trace tail's.

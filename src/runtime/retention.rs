@@ -4,7 +4,7 @@
 //! next tick retries), and touches core metadata only. The passes run
 //! on the recovery worker after each recovery tick (see
 //! `runtime/recovery.rs`), never inline in the supervisor's select
-//! loop (audit 2026-10-09 item 3).
+//! loop.
 
 use super::supervisor::TickState;
 

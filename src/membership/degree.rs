@@ -129,10 +129,9 @@ pub(crate) const fn degree_plan(n: usize, override_target: usize, sessions: usiz
 /// partial Fisher–Yates over the eligible members with entropy-sourced
 /// indices. Every candidate carries ALL of its published endpoints —
 /// the caller rotates through them across attempts (endpoint-level
-/// failover aligned with the recovery plane, remaining-items list
-/// P2-5) — so a multi-homed member's later endpoints stay dial
-/// candidates instead of being projected away at selection time.
-/// Returns fewer than the budget only when fewer members are
+/// failover aligned with the recovery plane) — so a multi-homed member's later
+/// endpoints stay dial candidates instead of being projected away at selection
+/// time. Returns fewer than the budget only when fewer members are
 /// eligible. The index draw reduces one entropy word modulo the
 /// remaining candidate count — the modulo bias is below `2^-32` for any
 /// real cluster size and is deliberately accepted over an unbounded
@@ -337,8 +336,7 @@ mod tests {
   /// Selection never dials the local node, never dials a connected
   /// peer, stays inside the budget, returns distinct members, and
   /// carries EVERY published endpoint of a selected multi-homed member
-  /// (the caller rotates through them across attempts —
-  /// remaining-items list P2-5).
+  /// (the caller rotates through them across attempts).
   #[test]
   fn selection_respects_budget_exclusions_distinctness_and_endpoints() {
     let local = node(0);

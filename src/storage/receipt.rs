@@ -1756,8 +1756,8 @@ mod receipt_retention_tests {
   /// A population past the sweep bound still drains: the pass that
   /// stops at the bound forgets the targets it already collected and
   /// reports `remaining`, and repeated passes reach a full, idempotent
-  /// drain instead of returning empty-handed forever (regression: the
-  /// bound guard used to `return` before the cleanup loop ran).
+  /// drain instead of returning empty-handed forever (a bound guard that
+  /// `return`s before the cleanup loop runs would do exactly that).
   #[tokio::test]
   async fn retention_sweep_drains_a_population_larger_than_the_bound() {
     let factory = Arc::new(ReferenceFactory::new(required_capabilities()));
@@ -1785,9 +1785,9 @@ mod receipt_retention_tests {
     assert!(!report.remaining, "a drained population stays drained");
   }
 
-  /// The exact interleaving the early return broke: the bound is
+  /// The exact interleaving the bound guard must survive: the bound is
   /// reached on an entry that is not yet due, so the pass must still
-  /// forget every collected due target (previously it forgot nothing)
+  /// forget every collected due target
   /// and the follow-up pass finds nothing due and settles.
   #[tokio::test]
   async fn retention_sweep_processes_the_bound_when_a_later_anchor_is_not_due() {
@@ -1829,8 +1829,8 @@ mod receipt_retention_tests {
   /// (not-yet-due) prefix longer than the sweep bound must not pin
   /// every pass to the same prefix — the cursor resumes after the last
   /// examined key, so the due anchor behind the prefix is still reached
-  /// (regression: the bound used to count only due targets, so one pass
-  /// scanned the whole retained prefix unbounded and a prefix-first
+  /// (a bound counting only due targets would scan the whole retained
+  /// prefix unbounded, and a prefix-first
   /// layout could never progress past it).
   #[tokio::test]
   async fn retention_sweep_rotates_past_a_retained_prefix_longer_than_the_bound() {
@@ -2003,8 +2003,8 @@ mod receipt_retention_tests {
   /// transaction that removes its last reference: the used-ID marker
   /// flips to forgotten, the provider receipt row is dropped, and no
   /// anchor or retention candidate is left behind, so repeated
-  /// eligibility passes stay commit-quiet (regression: the final removal
-  /// used to leave a retention candidate whose sweep committed the
+  /// eligibility passes stay commit-quiet (a final removal leaving a
+  /// retention candidate would make the sweep commit the
   /// anchor and the marker consumption on the node's first tick).
   #[tokio::test]
   async fn final_removal_forgets_the_receipt_in_the_same_transaction() {
@@ -2164,7 +2164,7 @@ mod receipt_retention_tests {
   /// evidence is indeterminate, so the final reference removal writes
   /// the candidate marker carrying the receipt's operation digest, the
   /// sweep anchors and consumes it, and the elapsed deadline forgets the
-  /// anchored receipt like any other (the P2-14 acceptance: receipts
+  /// anchored receipt like any other (receipts
   /// left behind by crash or interruption stay collectable).
   #[tokio::test]
   async fn retention_sweep_collects_the_receipt_an_interrupted_flow_left_behind() {
