@@ -58,6 +58,10 @@ pub struct NodeConfig {
   // The task manager's network-class execution-slot budget: the join and
   // connect dials, which can each hold a slot for a whole dial deadline.
   task_reconcile_network_slots: usize,
+  // The task manager's extension-class execution-slot budget: the
+  // caller-registered extension kinds, which routinely await other
+  // admitted tasks through their public handle.
+  task_reconcile_extension_slots: usize,
 }
 
 impl NodeConfig {
@@ -198,6 +202,9 @@ impl NodeConfig {
   /// peer-visible; both values must be nonzero (the local channel is
   /// the caller's latency floor, so a deployment that never dials may
   /// shrink `network` to `1` but never zero).
+  ///
+  /// The extension channel's budget is configured separately with
+  /// [`NodeConfig::with_task_reconcile_extension_slots`].
   pub fn with_task_reconcile_slots(mut self, local: usize, network: usize) -> Result<Self> {
     if local == 0 {
       return Err(Error::invalid_input("local task reconcile slots"));
@@ -207,6 +214,19 @@ impl NodeConfig {
     }
     self.task_reconcile_local_slots = local;
     self.task_reconcile_network_slots = network;
+    Ok(self)
+  }
+
+  /// Sets the task manager's extension-class execution-slot budget: the
+  /// caller-registered extension kinds draw from their own channel so a
+  /// workflow awaiting core verbs through its handle never occupies the
+  /// local capacity its own child operations need. Purely local
+  /// admission, never peer-visible; the value must be nonzero.
+  pub fn with_task_reconcile_extension_slots(mut self, extension: usize) -> Result<Self> {
+    if extension == 0 {
+      return Err(Error::invalid_input("extension task reconcile slots"));
+    }
+    self.task_reconcile_extension_slots = extension;
     Ok(self)
   }
 
@@ -409,6 +429,12 @@ impl NodeConfig {
     self.task_reconcile_network_slots
   }
 
+  /// The extension-class execution-slot budget consumed by the task
+  /// manager's admission channel (nonzero by construction).
+  pub(crate) const fn task_reconcile_extension_slots(&self) -> usize {
+    self.task_reconcile_extension_slots
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -473,6 +499,7 @@ impl Default for NodeConfig {
       // it.
       task_reconcile_local_slots: 2,
       task_reconcile_network_slots: 2,
+      task_reconcile_extension_slots: 2,
     }
   }
 }
@@ -855,6 +882,8 @@ mod tests {
       .with_resource_removal_retention(Duration::from_secs(3_600), 1_024)
       .unwrap()
       .with_task_reconcile_slots(4, 8)
+      .unwrap()
+      .with_task_reconcile_extension_slots(3)
       .unwrap();
     assert_eq!(configured.dial_deadline(), Duration::from_millis(250));
     assert_eq!(
@@ -870,6 +899,7 @@ mod tests {
     assert_eq!(configured.resource_removal_cap(), 1_024);
     assert_eq!(configured.task_reconcile_local_slots(), 4);
     assert_eq!(configured.task_reconcile_network_slots(), 8);
+    assert_eq!(configured.task_reconcile_extension_slots(), 3);
 
     for error in [
       NodeConfig::new()
@@ -896,9 +926,23 @@ mod tests {
       NodeConfig::new()
         .with_task_reconcile_slots(2, 0)
         .unwrap_err(),
+      NodeConfig::new()
+        .with_task_reconcile_extension_slots(0)
+        .unwrap_err(),
     ] {
       assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
+  }
+
+  /// The three execution-slot channels ship the same two-slot default:
+  /// the historical four-permit total split across the core classes plus
+  /// the extension channel's own two lanes.
+  #[test]
+  fn task_reconcile_slots_default_to_two_per_class() {
+    let config = NodeConfig::new();
+    assert_eq!(config.task_reconcile_local_slots(), 2);
+    assert_eq!(config.task_reconcile_network_slots(), 2);
+    assert_eq!(config.task_reconcile_extension_slots(), 2);
   }
 
   /// The library ships exactly one profile — the defaults — and it must

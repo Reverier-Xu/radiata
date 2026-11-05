@@ -77,9 +77,10 @@ impl TaskKind {
   /// wedged dial, and the caller-registered extension kinds draw from
   /// their own channel so a workflow awaiting core verbs through its
   /// handle never occupies the local capacity its own child operations
-  /// need. The two core budgets live in
+  /// need. The core budgets live in
   /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots);
-  /// the extension channel's budget is the task manager's own constant.
+  /// the extension channel's budget lives in
+  /// [`NodeConfig::with_task_reconcile_extension_slots`](crate::NodeConfig::with_task_reconcile_extension_slots).
   pub(crate) const fn slot_class(&self) -> SlotClass {
     match self {
       Self::Join | Self::Connect => SlotClass::Network,

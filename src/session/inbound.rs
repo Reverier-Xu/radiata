@@ -119,14 +119,12 @@ fn clock_millis(clock: &dyn crate::time::WallClock) -> u64 {
   crate::time::to_millis(clock.now())
 }
 
-/// The read loop's frame source: one receive wake plus the shared pong
-/// stamp. Abstracted so liveness tests can feed synthetic wakes without
-/// a TLS connection.
+/// The read loop's frame source: one receive wake. Abstracted so
+/// liveness tests can feed synthetic wakes without a TLS connection.
 pub(super) trait FrameSource {
   fn receive_event(
     &mut self,
   ) -> futures_util::future::BoxFuture<'_, crate::Result<Option<crate::transport::Received>>>;
-  fn pong_last_seen(&self) -> u64;
 }
 
 impl FrameSource for ConnectionReader {
@@ -134,10 +132,6 @@ impl FrameSource for ConnectionReader {
     &mut self,
   ) -> futures_util::future::BoxFuture<'_, crate::Result<Option<crate::transport::Received>>> {
     Box::pin(ConnectionReader::receive_event(self))
-  }
-
-  fn pong_last_seen(&self) -> u64 {
-    ConnectionReader::pong_last_seen(self)
   }
 }
 
@@ -216,7 +210,6 @@ async fn read_loop_frames(
   last_activity: &Arc<std::sync::atomic::AtomicU64>, consumers: &mut ConsumerDrainGuard,
 ) {
   let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
-  let mut last_pong_seen = source.pong_last_seen();
   loop {
     // Completed consumer entries are reaped on every
     // receive wake, so finished tasks never accumulate for the whole
@@ -227,15 +220,11 @@ async fn read_loop_frames(
     let message = match source.receive_event().await {
       Ok(Some(crate::transport::Received::Message(message))) => message,
       Ok(Some(crate::transport::Received::Pong)) => {
-        // A peer pong is a keepalive response: reflect it into the
-        // injected clock's activity mark so the liveness observer sees
-        // one time source. This wake is what lets a frame-silent but
+        // A peer pong is a keepalive response: stamp the session's
+        // activity mark from the injected clock so the liveness observer
+        // sees one time source. This wake is what lets a frame-silent but
         // responsive peer survive the idle deadline.
-        let pong = source.pong_last_seen();
-        if pong != last_pong_seen {
-          last_pong_seen = pong;
-          last_activity.store(clock_seconds(context.clock.as_ref()), Ordering::Relaxed);
-        }
+        last_activity.store(clock_seconds(context.clock.as_ref()), Ordering::Relaxed);
         continue;
       }
       Ok(None) => {
@@ -1098,11 +1087,13 @@ mod read_loop_liveness_tests {
   }
 
   /// A frame source that answers every wake with a keepalive pong (the
-  /// wire shape of a responsive but application-silent peer) and then
-  /// ends the session orderly.
+  /// wire shape of a responsive but application-silent peer), advancing
+  /// the injected clock before each wake, and then ends the session
+  /// orderly.
   struct PongSource {
     remaining: u32,
-    now: u64,
+    clock: Arc<ManualClock>,
+    second: u64,
   }
 
   impl FrameSource for PongSource {
@@ -1110,7 +1101,10 @@ mod read_loop_liveness_tests {
       let pong = self.remaining > 0;
       if pong {
         self.remaining -= 1;
-        self.now += 1;
+        self.second += 1;
+        self
+          .clock
+          .set(UNIX_EPOCH + Duration::from_secs(self.second));
       }
       Box::pin(async move {
         if pong {
@@ -1119,10 +1113,6 @@ mod read_loop_liveness_tests {
           Ok(None)
         }
       })
-    }
-
-    fn pong_last_seen(&self) -> u64 {
-      self.now
     }
   }
 
@@ -1159,10 +1149,10 @@ mod read_loop_liveness_tests {
   }
 
   /// A frame-silent peer that answers keepalive pings must stay alive:
-  /// every pong wake reflects the injected clock into the session's
-  /// activity mark, so the liveness observer (pinned separately) never
-  /// sees the idle deadline lapse. A pong swallowed
-  /// inside the transport receive would leave the activity mark unadvanced.
+  /// every pong wake stamps the session's activity mark from the
+  /// injected clock, so the liveness observer (pinned separately) never
+  /// sees the idle deadline lapse. A pong swallowed inside the transport
+  /// receive would leave the activity mark unadvanced.
   #[tokio::test]
   async fn pong_wakes_reflect_activity_for_frame_silent_peers() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
@@ -1170,7 +1160,8 @@ mod read_loop_liveness_tests {
     let last_activity = Arc::new(AtomicU64::new(1));
     let mut source = PongSource {
       remaining: 3,
-      now: 0,
+      clock: Arc::clone(&clock),
+      second: 1_000,
     };
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
@@ -1187,12 +1178,12 @@ mod read_loop_liveness_tests {
     )
     .await;
 
-    // The pong wakes advanced the activity mark to the injected clock's
-    // current seconds (the pong stamp changes are what the loop saw).
+    // Each pong wake stamped the activity mark from the injected clock,
+    // which the source advanced before every wake.
     assert_eq!(
       last_activity.load(Ordering::SeqCst),
-      1_000,
-      "the pong wakes must refresh the session activity mark"
+      1_003,
+      "the pong wakes must stamp the session activity mark from the injected clock"
     );
   }
 
@@ -1203,10 +1194,6 @@ mod read_loop_liveness_tests {
   impl FrameSource for SilentSource {
     fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
       Box::pin(std::future::pending())
-    }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
     }
   }
 
@@ -1257,7 +1244,8 @@ mod read_loop_liveness_tests {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
     let mut source = PongSource {
       remaining: 0,
-      now: 0,
+      clock: Arc::clone(&clock),
+      second: 1_000,
     };
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
@@ -1332,7 +1320,8 @@ mod read_loop_liveness_tests {
     // the source ends the session orderly.
     let mut source = PongSource {
       remaining: 0,
-      now: 0,
+      clock: Arc::clone(&clock),
+      second: 1_000,
     };
     read_loop_frames(
       &mut source,
@@ -1432,10 +1421,6 @@ mod ack_attribution_tests {
           })))
         }
       })
-    }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
     }
   }
 
@@ -1843,10 +1828,6 @@ mod durable_mirror_tests {
         }
       })
     }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
-    }
   }
 
   /// A packet context carrying a real durable trace sink and the given
@@ -2156,10 +2137,6 @@ mod slow_consumer_tests {
     fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
       let message = self.messages.pop_front();
       Box::pin(async move { Ok(message.map(Received::Message)) })
-    }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
     }
   }
 
@@ -2766,10 +2743,6 @@ mod consumer_lifecycle_tests {
     fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
       let message = self.messages.pop_front();
       Box::pin(async move { Ok(message.map(Received::Message)) })
-    }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
     }
   }
 

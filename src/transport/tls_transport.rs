@@ -81,7 +81,6 @@ impl Transport for TlsTransport {
       let config = tls::client_config_for_trust(&trust)?;
       let tcp = tcp::dial(&endpoint, ProviderErrorContext::TransportConnect).await?;
       let server_name = endpoint.server_name()?;
-      tracing::debug!("tls connection established");
       let tls_stream = tokio_rustls::TlsConnector::from(config)
         .connect(server_name, tcp)
         .await
@@ -140,7 +139,6 @@ impl TransportListener for TlsListener {
       // WebSocket class: the served generation is always the issuer's
       // current one.
       let hint = hint();
-      tracing::debug!("tls connection accepted");
       let tls_stream = self
         .acceptor
         .accept(tcp)

@@ -335,38 +335,45 @@ async fn reconcile_join(
 ) -> Result<EffectOutcome> {
   let planes = deps.planes()?;
   planes.context.require_unblocked()?;
-  crate::audit::dial_started(&receiver.to_string(), false);
-  let mut connection = connect_with_deadline(
-    &transport,
-    receiver.clone(),
-    TransportTrust::for_dial(&receiver.selector()),
-    planes.config.dial_deadline(),
-  )
-  .await?;
-  let hint = connection
-    .merge_hint()
-    .cloned()
-    .ok_or_else(|| Error::authentication_failed("join hint"))?;
-  let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
-  let (session, view) = planes.driver.merge(&mut connection, &hint, secret).await?;
-  let peer = session.peer().clone();
-  crate::audit::dial_settled(peer.as_str(), false, true);
-  // Keep the merge session open so both sides can stream packets over it.
-  // The view returns only after the session table registers the entry, so
-  // the caller's first packet cannot race registration.
-  let connection_tasks = Arc::clone(&planes.connection_tasks);
-  keep_outbound_session(
-    connection,
-    session,
-    Arc::clone(&planes.packet),
-    planes.sessions.clone(),
-    planes.shutdown.subscribe(),
-    receiver,
-    crate::session::stream::DialClass::Caller,
-    |session_task| track_connection_task(&connection_tasks, session_task),
-  )
-  .await?;
-  Ok(EffectOutcome::new(TaskOutput::Join(view)))
+  // The join dial's peer identity is the receiver endpoint: the peer node
+  // id is only learned after the merge, so both audit lines carry the
+  // endpoint to name one identity from start to settle.
+  let peer = receiver.to_string();
+  crate::audit::dial_started(&peer, crate::audit::DialInitiator::Caller);
+  let result = async {
+    let mut connection = connect_with_deadline(
+      &transport,
+      receiver.clone(),
+      TransportTrust::for_dial(&receiver.selector()),
+      planes.config.dial_deadline(),
+    )
+    .await?;
+    let hint = connection
+      .merge_hint()
+      .cloned()
+      .ok_or_else(|| Error::authentication_failed("join hint"))?;
+    let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
+    let (session, view) = planes.driver.merge(&mut connection, &hint, secret).await?;
+    // Keep the merge session open so both sides can stream packets over it.
+    // The view returns only after the session table registers the entry, so
+    // the caller's first packet cannot race registration.
+    let connection_tasks = Arc::clone(&planes.connection_tasks);
+    keep_outbound_session(
+      connection,
+      session,
+      Arc::clone(&planes.packet),
+      planes.sessions.clone(),
+      planes.shutdown.subscribe(),
+      receiver,
+      crate::session::stream::DialClass::Caller,
+      |session_task| track_connection_task(&connection_tasks, session_task),
+    )
+    .await?;
+    Ok(EffectOutcome::new(TaskOutput::Join(view)))
+  }
+  .await;
+  crate::audit::dial_settled(&peer, crate::audit::DialInitiator::Caller, result.is_ok());
+  result
 }
 
 /// The member reconnect effect: one key-trust dial that keeps the session
@@ -1543,8 +1550,7 @@ async fn reconcile_listen(
           // A failed TLS/prelude upgrade must not kill the listener;
           // consecutive failures back off on a bounded growing delay.
           accept_failures = accept_failures.saturating_add(1);
-          let delay = super::listeners::ACCEPT_BACKOFF_STEP
-            .saturating_mul(accept_failures.min(super::listeners::ACCEPT_BACKOFF_MAX_STEPS));
+          let delay = super::listeners::accept_backoff(accept_failures);
           tracing::debug!(
             kind = ?error.kind(),
             consecutive = accept_failures,

@@ -49,31 +49,23 @@ pub(crate) const TASK_CHANNEL_CAPACITY: usize = 32;
 /// extension kinds draw from their own channel for the mirror reason: an
 /// extension reconciler routinely awaits other admitted tasks through its
 /// public handle, so it must never occupy the core local capacity its own
-/// child operations need. The local and network budgets come from
+/// child operations need. All three budgets come from
 /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots)
-/// and default to two slots per channel — the historical four-permit
-/// total, one channel per core class; the extension budget is the
-/// manager's own constant below.
+/// and
+/// [`NodeConfig::with_task_reconcile_extension_slots`](crate::NodeConfig::with_task_reconcile_extension_slots)
+/// and default to two slots per channel.
 struct ReconcileChannels {
   local: Arc<Semaphore>,
   network: Arc<Semaphore>,
   extension: Arc<Semaphore>,
 }
 
-/// The extension channel's budget: an independent, deliberately fixed
-/// bound. The two configured budgets govern the core's per-verb
-/// concurrency; extension workflows are caller code over the public
-/// surface, so their channel keeps its own two-lane default — enough
-/// concurrent workflows to overlap IO while bounding how many wedged
-/// reconcilers can park waiting workflows behind them.
-const TASK_EXTENSION_RECONCILE_SLOTS: usize = 2;
-
 impl ReconcileChannels {
-  fn new(local: usize, network: usize) -> Self {
+  fn new(local: usize, network: usize, extension: usize) -> Self {
     Self {
       local: Arc::new(Semaphore::new(local)),
       network: Arc::new(Semaphore::new(network)),
-      extension: Arc::new(Semaphore::new(TASK_EXTENSION_RECONCILE_SLOTS)),
+      extension: Arc::new(Semaphore::new(extension)),
     }
   }
 
@@ -649,13 +641,14 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
   // The execution-slot budgets ride the node configuration carried by
   // the operation planes; the unit-test double (no planes) reads the
   // same defaults the configuration ships.
-  let (local_slots, network_slots) = deps
+  let (local_slots, network_slots, extension_slots) = deps
     .operations
     .planes()
     .map(|planes| {
       (
         planes.config.task_reconcile_local_slots(),
         planes.config.task_reconcile_network_slots(),
+        planes.config.task_reconcile_extension_slots(),
       )
     })
     .unwrap_or_else(|_| {
@@ -663,6 +656,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
       (
         defaults.task_reconcile_local_slots(),
         defaults.task_reconcile_network_slots(),
+        defaults.task_reconcile_extension_slots(),
       )
     });
   let shared = Arc::new(ManagerShared {
@@ -670,7 +664,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     clock: deps.clock,
     operations: Arc::clone(&deps.operations),
     leave_signal: deps.leave_signal,
-    slots: ReconcileChannels::new(local_slots, network_slots),
+    slots: ReconcileChannels::new(local_slots, network_slots, extension_slots),
     observations: crate::task::ObservationLanes::new(),
   });
   // The bounded observation lanes' scheduling half joins the operation
@@ -2202,6 +2196,30 @@ mod tests {
       .await
       .expect("drain completes")
       .expect("drain join");
+  }
+
+  #[test]
+  fn reconcile_channels_carry_the_configured_extension_budget() {
+    let channels = super::ReconcileChannels::new(1, 2, 3);
+    assert_eq!(
+      channels
+        .for_class(super::SlotClass::Local)
+        .available_permits(),
+      1
+    );
+    assert_eq!(
+      channels
+        .for_class(super::SlotClass::Network)
+        .available_permits(),
+      2
+    );
+    assert_eq!(
+      channels
+        .for_class(super::SlotClass::Extension)
+        .available_permits(),
+      3,
+      "the extension channel carries its configured budget"
+    );
   }
 
   #[tokio::test]

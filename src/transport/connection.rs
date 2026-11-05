@@ -132,8 +132,6 @@ pub(crate) struct Connection {
   /// closed, while an addressless medium attributes to its shared class
   /// bucket.
   attributable: bool,
-  /// UNIX-seconds of the last peer pong (keepalive liveness).
-  pong_last_seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Connection {
@@ -146,11 +144,11 @@ impl Connection {
     tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, hint: Option<&MergeHint>,
   ) -> Result<Self> {
     let peer_addr = tcp.peer_addr().ok();
-    tracing::debug!("tls connection accepted");
     let tls = TlsAcceptor::from(config)
       .accept(tcp)
       .await
       .map_err(|_| Error::authentication_failed("tls accept"))?;
+    tracing::debug!("tls connection accepted");
     let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
     let stream = ws::accept(TlsStream::from(tls), hint).await?;
     Ok(Self {
@@ -160,7 +158,6 @@ impl Connection {
       merge_hint: None,
       peer_addr,
       attributable: true,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
 
@@ -176,7 +173,6 @@ impl Connection {
   pub(crate) async fn connect_tls_ws(
     tcp: TcpStream, config: Arc<ClientConfig>, server_name: ServerName<'static>, rules: FrameRules,
   ) -> Result<Self> {
-    tracing::debug!("tls connection established");
     let port = tcp
       .peer_addr()
       .map_err(|_| {
@@ -191,6 +187,7 @@ impl Connection {
       .connect(server_name, tcp)
       .await
       .map_err(|_| Error::authentication_failed("tls connect"))?;
+    tracing::debug!("tls connection established");
     let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
     let (stream, merge_hint) = ws::connect(TlsStream::from(tls), &authority).await?;
     Ok(Self {
@@ -200,7 +197,6 @@ impl Connection {
       merge_hint,
       peer_addr: None,
       attributable: true,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
 
@@ -224,7 +220,6 @@ impl Connection {
       merge_hint: None,
       peer_addr,
       attributable,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
 
@@ -249,7 +244,6 @@ impl Connection {
       merge_hint,
       peer_addr: None,
       attributable: true,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
 
@@ -302,10 +296,8 @@ impl Connection {
   /// One receive wake of the unsplit connection, class-dispatched.
   async fn receive_once(&mut self) -> Result<Option<Received>> {
     match &mut self.io {
-      TransportIo::Ws(stream) => next_message(stream, self.rules, &self.pong_last_seen).await,
-      TransportIo::Raw { read, write } => {
-        next_raw_frame(&mut *read, write, self.rules, &self.pong_last_seen).await
-      }
+      TransportIo::Ws(stream) => next_message(stream, self.rules).await,
+      TransportIo::Raw { read, write } => next_raw_frame(&mut *read, write, self.rules).await,
     }
   }
 
@@ -343,11 +335,8 @@ impl Connection {
   }
 
   /// Splits the connection into independent writer and reader halves for
-  /// the post-authentication session phase. Only the reader carries the
-  /// pong clock: pongs arrive on the read half, and a writer-side
-  /// timestamp no one reads is dead weight.
+  /// the post-authentication session phase.
   pub(crate) fn into_split(self) -> (ConnectionWriter, ConnectionReader) {
-    let pong_last_seen = self.pong_last_seen;
     match self.io {
       TransportIo::Ws(stream) => {
         let (sink, stream) = stream.split();
@@ -359,7 +348,6 @@ impl Connection {
           ConnectionReader {
             source: ReaderSource::Ws(stream),
             rules: self.rules,
-            pong_last_seen,
           },
         )
       }
@@ -373,7 +361,6 @@ impl Connection {
           ConnectionReader {
             source: ReaderSource::Raw { read, pong_write },
             rules: self.rules,
-            pong_last_seen,
           },
         )
       }
@@ -438,7 +425,6 @@ impl ConnectionWriter {
 pub(crate) struct ConnectionReader {
   source: ReaderSource,
   rules: FrameRules,
-  pong_last_seen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 enum ReaderSource {
@@ -450,32 +436,24 @@ enum ReaderSource {
 }
 
 impl ConnectionReader {
-  /// UNIX-seconds of the last peer pong (host clock), used by the session
-  /// reader to reflect keepalive responses into its injected clock.
-  pub(crate) fn pong_last_seen(&self) -> u64 {
-    self
-      .pong_last_seen
-      .load(std::sync::atomic::Ordering::Relaxed)
-  }
-
   /// Receives the next wire message or keepalive pong. Returns `Ok(None)`
   /// on an orderly close; every limit or framing violation fails closed.
   /// The session read loop consumes this event form: a pong wake must
-  /// reach the loop so it can refresh the session's activity mark.
+  /// reach the loop so it can stamp the session's activity mark.
   pub(crate) async fn receive_event(&mut self) -> Result<Option<Received>> {
     match &mut self.source {
-      ReaderSource::Ws(stream) => next_message(stream, self.rules, &self.pong_last_seen).await,
+      ReaderSource::Ws(stream) => next_message(stream, self.rules).await,
       ReaderSource::Raw { read, pong_write } => {
-        next_raw_frame(&mut *read, pong_write, self.rules, &self.pong_last_seen).await
+        next_raw_frame(&mut *read, pong_write, self.rules).await
       }
     }
   }
 }
 
 /// What one receive wake observed: a wire message, or a keepalive pong
-/// the caller must reflect into its own liveness clock. Surfacing pongs
+/// the caller must reflect into its own activity mark. Surfacing pongs
 /// (instead of swallowing them) lets a frame-silent session stay alive
-/// on keepalone responses alone.
+/// on keepalive responses alone.
 pub(crate) enum Received {
   Message(Message),
   Pong,
@@ -499,12 +477,10 @@ fn upgrade_authority(server_name: &ServerName<'_>, port: u16) -> String {
 }
 
 /// The single receive loop of the WebSocket class: binary messages are
-/// split and limit-checked, pongs refresh the shared liveness stamp and
-/// surface as [`Received::Pong`], and every other control shape fails
-/// closed or is skipped exactly as documented.
-async fn next_message<S>(
-  stream: &mut S, rules: FrameRules, pong_last_seen: &std::sync::atomic::AtomicU64,
-) -> Result<Option<Received>>
+/// split and limit-checked, pongs surface as [`Received::Pong`], and
+/// every other control shape fails closed or is skipped exactly as
+/// documented.
+async fn next_message<S>(stream: &mut S, rules: FrameRules) -> Result<Option<Received>>
 where
   S: futures_util::Stream<
       Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
@@ -540,14 +516,9 @@ where
       WsMessage::Text(_) => return Err(Error::invalid_input("websocket text message")),
       WsMessage::Ping(_) => continue,
       WsMessage::Pong(_) => {
-        // The peer answered a keepalive ping; record the liveness time
-        // (tungstenite answers pings itself, so this observes the peer's
-        // own pong responses) and wake the caller so it can reflect the
-        // response into the session's activity mark.
-        pong_last_seen.store(
-          crate::time::now_seconds(),
-          std::sync::atomic::Ordering::Relaxed,
-        );
+        // The peer answered a keepalive ping (tungstenite answers pings
+        // itself, so this observes the peer's own pong responses); wake
+        // the caller so it can stamp the session's activity mark.
         return Ok(Some(Received::Pong));
       }
       WsMessage::Close(_) => return Ok(None),
@@ -558,26 +529,19 @@ where
 
 /// The raw class's receive translation, shared by the unsplit
 /// connection and the split reader: one framed read mapped onto the
-/// receive-event vocabulary, a keepalive pong refreshing the shared
-/// liveness stamp and waking the caller. No lock is held across the
-/// read: the framing layer locks the shared write half itself only when
-/// a ping must be answered.
+/// receive-event vocabulary, a keepalive pong waking the caller. No lock
+/// is held across the read: the framing layer locks the shared write
+/// half itself only when a ping must be answered.
 async fn next_raw_frame<R>(
   read: &mut R, write: &SharedWrite, rules: FrameRules,
-  pong_last_seen: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<Received>>
 where
   R: AsyncRead + Send + Unpin, {
   match framing::read_frame(&mut *read, write, rules).await? {
     Some(framing::RawFrame::Data(message)) => Ok(Some(Received::Message(message))),
     Some(framing::RawFrame::Pong) => {
-      // The peer answered a keepalive ping; record the liveness time and
-      // wake the caller so it can reflect the response into its own
-      // activity mark.
-      pong_last_seen.store(
-        crate::time::now_seconds(),
-        std::sync::atomic::Ordering::Relaxed,
-      );
+      // The peer answered a keepalive ping; wake the caller so it can
+      // stamp its own activity mark.
       Ok(Some(Received::Pong))
     }
     Some(framing::RawFrame::Hint(_)) => Err(Error::invalid_input("transport hint")),

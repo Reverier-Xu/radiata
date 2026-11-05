@@ -206,7 +206,6 @@ fn framed(stream: WebSocketStream<TlsStream<TcpStream>>) -> Connection {
     merge_hint: None,
     peer_addr: None,
     attributable: true,
-    pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
   }
 }
 
@@ -670,14 +669,10 @@ async fn tls_transport_split_burst_after_round_trip_delivers_all_messages() {
   }
 }
 
-/// Pongs surface as keepalive wakes (never swallowed) and refresh the
-/// shared liveness stamp: the session read loop's reflection depends on
-/// both halves of that contract.
+/// Pongs surface as keepalive wakes (never swallowed): the session read
+/// loop stamps its activity mark on every pong wake.
 #[tokio::test]
-async fn pongs_surface_as_events_and_refresh_the_liveness_stamp() {
-  use std::sync::atomic::{AtomicU64, Ordering};
-
-  let stamp = Arc::new(AtomicU64::new(0));
+async fn pongs_surface_as_keepalive_wakes() {
   let pong = || WsMessage::Pong(tokio_tungstenite::tungstenite::Bytes::from_static(b"ka"));
   let mut stream = futures_util::stream::iter(vec![
     Ok(pong()),
@@ -689,24 +684,19 @@ async fn pongs_surface_as_events_and_refresh_the_liveness_stamp() {
     )),
   ]);
 
-  let first = super::next_message(&mut stream, rules(), &stamp)
+  let first = super::next_message(&mut stream, rules())
     .await
     .unwrap()
     .unwrap();
   assert!(matches!(first, super::Received::Pong));
-  let second = super::next_message(&mut stream, rules(), &stamp)
+  let second = super::next_message(&mut stream, rules())
     .await
     .unwrap()
     .unwrap();
   assert!(matches!(second, super::Received::Pong));
-  assert_ne!(
-    stamp.load(Ordering::Relaxed),
-    0,
-    "a pong must refresh the liveness stamp"
-  );
 
   // The message following the pongs arrives intact.
-  let third = super::next_message(&mut stream, rules(), &stamp)
+  let third = super::next_message(&mut stream, rules())
     .await
     .unwrap()
     .unwrap();

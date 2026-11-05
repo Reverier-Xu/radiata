@@ -1336,8 +1336,12 @@ pub(super) async fn dial_member(
   shutdown: watch::Receiver<()>, connection_tasks: ConnectionTasks, receiver: Endpoint,
   peer: &NodeId, class: crate::session::stream::DialClass, dial_deadline: std::time::Duration,
 ) -> Result<NodeId> {
-  let recovery = class == crate::session::stream::DialClass::Recovery;
-  crate::audit::dial_started(peer.as_str(), recovery);
+  let initiator = match class {
+    crate::session::stream::DialClass::Caller => crate::audit::DialInitiator::Caller,
+    crate::session::stream::DialClass::Recovery => crate::audit::DialInitiator::Recovery,
+    crate::session::stream::DialClass::Probe => crate::audit::DialInitiator::Probe,
+  };
+  crate::audit::dial_started(peer.as_str(), initiator);
   let result = async {
     // A member dial carries the same trust intent as a join dial: the
     // endpoint's transport class decides it, and the member handshake's
@@ -1366,7 +1370,7 @@ pub(super) async fn dial_member(
     Ok(authenticated)
   }
   .await;
-  crate::audit::dial_settled(peer.as_str(), recovery, result.is_ok());
+  crate::audit::dial_settled(peer.as_str(), initiator, result.is_ok());
   result
 }
 
