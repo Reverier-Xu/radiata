@@ -58,6 +58,20 @@ impl LifecycleSnapshot {
   }
 }
 
+/// The leave plane's signal from the task manager (and, for the fatal
+/// case, the leave effect itself) to the supervisor's control loop. A
+/// successful leave starts the active-leave shutdown; a leave whose
+/// network teardown failed after it began cannot leave the node running —
+/// its listeners and sessions are already down — so it starts the fatal
+/// shutdown with the failure's kind instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaveSignal {
+  /// The leave task published `Succeeded`.
+  Complete,
+  /// The leave failed after its teardown began.
+  Fatal(crate::ErrorKind),
+}
+
 pub(crate) enum Control {
   Shutdown {
     reply: oneshot::Sender<ShutdownOutcome>,

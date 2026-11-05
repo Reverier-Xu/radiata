@@ -449,11 +449,12 @@ pub(crate) struct TaskManagerDeps {
   /// the submit half, so holding a handle never keeps the metadata store
   /// locked past shutdown).
   pub(crate) operations: Arc<super::task_effects::OperationDeps>,
-  /// The leave reconciler's completion signal to the supervisor
+  /// The leave plane's signal to the supervisor
   /// ([`super::supervisor::spawn_runtime`] owns the receiving end). The
-  /// manager sends it once the leave task's terminal publication landed,
-  /// which is what starts the `ActiveLeave` shutdown.
-  pub(crate) leave_complete: mpsc::Sender<()>,
+  /// manager sends the success once the leave task's terminal publication
+  /// landed, which is what starts the `ActiveLeave` shutdown; the leave
+  /// effect sends the fatal failure of a teardown that already began.
+  pub(crate) leave_signal: mpsc::Sender<super::lifecycle::LeaveSignal>,
 }
 
 /// The per-incarnation state shared with every worker future.
@@ -462,10 +463,10 @@ struct ManagerShared {
   clock: Arc<dyn WallClock>,
   /// The node-shared operation handles every effect reads.
   operations: Arc<super::task_effects::OperationDeps>,
-  /// The leave completion signal, sent once the leave task terminalized
+  /// The leave plane's signal, sent once the leave task terminalized
   /// with success (the supervisor owns the receiver and answers with the
   /// active-leave shutdown).
-  leave_complete: mpsc::Sender<()>,
+  leave_signal: mpsc::Sender<super::lifecycle::LeaveSignal>,
   /// The two execution-slot channels, one per slot class: the worker's
   /// permit draw is class-routed so local work never queues behind a
   /// dial.
@@ -668,7 +669,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     table,
     clock: deps.clock,
     operations: Arc::clone(&deps.operations),
-    leave_complete: deps.leave_complete,
+    leave_signal: deps.leave_signal,
     slots: ReconcileChannels::new(local_slots, network_slots),
     observations: crate::task::ObservationLanes::new(),
   });
@@ -849,26 +850,24 @@ async fn run_manager(
             // task's observations by id, so the terminal publication's
             // observation — already scheduled — is the task's last, and
             // nothing outlives the task on the manager's side.
+            //
+            // The leave exclusivity slot clears with the leave task's
+            // terminal report, success or failure: a failed leave is the
+            // caller's to re-admit.
             if leave_task.as_ref() == Some(&id) {
               leave_task = None;
-              // The table's terminal phase is the single truth, driven
-              // straight off the terminal publication: the action-hook
-              // observations run on the observation lanes off this
-              // path, so a wedged or panicking hook can never delay the
-              // active-leave shutdown behind the task's own success.
-              let succeeded = shared
-                .table
-                .status(&id)
-                .is_some_and(|(_, status)| status.phase() == TaskPhase::Succeeded);
-              if succeeded {
-                // The supervisor's active-leave shutdown starts here. The
-                // terminal publication already landed inside the attempt
-                // body, so every `wait` caller observed the outcome before
-                // any teardown begins. The channel is capacity-one and a
-                // leave is once-per-incarnation, so a refused send only
-                // means the supervisor is already shutting down.
-                let _ = shared.leave_complete.try_send(());
-              }
+            }
+            // The active-leave signal is read off the table's own
+            // (kind, phase) — never off id equality with the slot above:
+            // the terminal publication already landed inside the attempt
+            // body, so every `wait` caller observed the outcome before
+            // any teardown begins, and no other task's report can steal
+            // or suppress the leave's signal.
+            if let Some(signal) = leave_signal_for(&shared.table, &id) {
+              // The channel is capacity-one and a leave is
+              // once-per-incarnation, so a refused send only means the
+              // supervisor is already shutting down.
+              let _ = shared.leave_signal.try_send(signal);
             }
             shared.table.retain_terminal_history(TASK_TERMINAL_HISTORY);
           }
@@ -989,11 +988,14 @@ fn admit_inner(
       coalescing.remove(&key);
     }
   }
-  if matches!(kind, TaskKind::Leave)
-    && let Some(existing) = leave_task.clone()
-    && in_flight(&existing)
-  {
-    return Err(Error::conflict("task in flight"));
+  // Leave exclusivity: the first admitted leave owns the active-leave
+  // signal until its terminal report, so a second leave — concurrent, or
+  // a retry inside the window between the first leave's terminal
+  // publication and that report — is refused instead of replacing the
+  // first. The slot clears on the first leave's terminal report, so a
+  // failed leave is still re-admittable.
+  if matches!(kind, TaskKind::Leave) && leave_task.is_some() {
+    return Err(Error::conflict("leave in progress"));
   }
   // The per-class backlog bound: admission itself is refused once the
   // class holds its budget of non-terminal entries, so slow effects
@@ -1248,6 +1250,17 @@ fn rearm_retry_timer(timer: &mut Pin<Box<Sleep>>, retries: &BTreeMap<Instant, Ve
   }
 }
 
+/// The leave plane's signal for one terminal report, read off the table's
+/// own (kind, phase): only a succeeded leave drives the active-leave
+/// shutdown. A failed leave is the caller's to retry and leaves the node
+/// running — a failure that landed after the leave's own network teardown
+/// began reports the fatal shutdown from the effect instead.
+fn leave_signal_for(table: &TaskTable, id: &TaskId) -> Option<super::lifecycle::LeaveSignal> {
+  let (kind, status) = table.status(id)?;
+  (kind == TaskKind::Leave && status.phase() == TaskPhase::Succeeded)
+    .then_some(super::lifecycle::LeaveSignal::Complete)
+}
+
 #[cfg(test)]
 mod tests {
   use std::{
@@ -1279,7 +1292,7 @@ mod tests {
   ) -> TaskManagerDeps {
     // The leave signal's receiver is the supervisor's in production; the
     // manager tests never admit a leave effect that sends it.
-    let (leave_complete, _leave_signals) = mpsc::channel(1);
+    let (leave_signal, _leave_signals) = mpsc::channel(1);
     TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
@@ -1287,7 +1300,7 @@ mod tests {
         events,
         Arc::new(extensions),
       )),
-      leave_complete,
+      leave_signal,
     }
   }
 
@@ -1320,7 +1333,7 @@ mod tests {
         Arc::new(PanicOnSucceededHook),
       )
       .expect("registration");
-    let (leave_complete, mut leave_signals) = mpsc::channel(1);
+    let (leave_signal, mut leave_signals) = mpsc::channel(1);
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
@@ -1328,7 +1341,7 @@ mod tests {
         Arc::new(crate::node::EventHub::new()),
         Arc::new(extensions),
       )),
-      leave_complete,
+      leave_signal,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
     let id = client
@@ -1351,10 +1364,12 @@ mod tests {
       .wait()
       .await
       .expect("the terminal success stands");
-    tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
-      .await
-      .expect("the leave signal fires")
-      .expect("receiver live");
+    assert_eq!(
+      tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
+        .await
+        .expect("the leave signal fires"),
+      Some(super::super::lifecycle::LeaveSignal::Complete)
+    );
   }
 
   /// An action hook that never settles while holding a guard whose
@@ -1721,6 +1736,19 @@ mod tests {
     MergeView::new(node('a'), node('b'))
   }
 
+  /// Publishes one phase onto a table entry: the same mutation the
+  /// manager's own publication helpers perform.
+  fn publish_phase(table: &crate::task::TaskTable, id: &TaskId, phase: TaskPhase) {
+    table
+      .update(id, |entry| {
+        let mut record = entry.status.borrow().clone();
+        record.phase = phase;
+        entry.status.send_replace(record);
+      })
+      .expect("table update")
+      .expect("live entry");
+  }
+
   fn handle<T: crate::task::TaskResult>(
     client: &TaskClient, id: &TaskId, kind: TaskKind,
   ) -> Task<T> {
@@ -1980,26 +2008,132 @@ mod tests {
       .await
       .expect_err("leave exclusivity");
     assert_eq!(conflict.kind(), ErrorKind::Conflict);
-    assert_eq!(conflict.context(), "task in flight");
+    assert_eq!(conflict.context(), "leave in progress");
     // Release the gated leave to its typed failure (the `ONCE` policy
-    // never retries it): the exclusivity window closes with
-    // terminality — the table's phase is the single truth, so the
-    // re-issue never waits on the manager's report processing. A
-    // successful leave shuts the node down, so only the failed leave
-    // has a re-issue path at all.
+    // never retries it): the exclusivity slot clears with the manager's
+    // terminal report — not with the table's terminal publication, which
+    // lands inside the attempt body — so the re-issue is admitted once
+    // that report landed. A successful leave shuts the node down, so only
+    // the failed leave has a re-issue path at all.
     release.notify_one();
     handle::<crate::LeaveOutcome>(&client, &first, TaskKind::Leave)
       .wait()
       .await
       .expect_err("scripted leave failure");
-    let reissued = client
+    let reissued = tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        match client
+          .submit(
+            TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+            wedged_effect(),
+          )
+          .await
+        {
+          Ok(id) => return id,
+          Err(error) => {
+            assert_eq!(error.kind(), ErrorKind::Conflict);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+          }
+        }
+      }
+    })
+    .await
+    .expect("the exclusivity slot clears with the terminal report");
+    assert_ne!(first, reissued);
+  }
+
+  /// The leave-signal regression: a second leave admitted in the window
+  /// before the first leave's terminal report is refused instead of
+  /// replacing the first, and the first leave's own success still reaches
+  /// the supervisor's active-leave signal. The id-equality gate let the
+  /// replacement steal the slot, so the first success never signalled and
+  /// the node stayed `Running`.
+  #[tokio::test]
+  async fn a_second_leave_before_the_first_terminal_report_is_refused_and_the_first_still_signals()
+  {
+    let (leave_signal, mut leave_signals) = mpsc::channel(1);
+    let deps = TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
+        Arc::new(crate::node::EventHub::new()),
+        Arc::new(ExtensionRegistry::new()),
+      )),
+      leave_signal,
+    };
+    let (client, _manager) = spawn_task_manager(deps).expect("manager");
+    // A gated leave: it holds the exclusivity slot until released, so the
+    // window before its terminal report is deterministic.
+    let release = Arc::new(Notify::new());
+    let gate = release.clone();
+    let first = client
+      .submit(
+        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        Arc::new(move |_deps, _attempt| {
+          let gate = gate.clone();
+          Box::pin(async move {
+            gate.notified().await;
+            Ok(EffectOutcome::new(TaskOutput::Leave(
+              crate::LeaveOutcome::new(node('a'), node('b')),
+            )))
+          })
+        }),
+      )
+      .await
+      .expect("admission");
+    let refused = client
       .submit(
         TaskSpec::new(TaskKind::Leave, TaskPayload::None),
         wedged_effect(),
       )
       .await
-      .expect("re-issue after a failed leave");
-    assert_ne!(first, reissued);
+      .expect_err("a second leave is refused while one is in flight");
+    assert_eq!(refused.kind(), ErrorKind::Conflict);
+    assert_eq!(refused.context(), "leave in progress");
+    // The first leave's success still signals the active-leave shutdown:
+    // the signal is the table's own (kind, phase), never the slot's id.
+    release.notify_one();
+    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::Leave)
+      .wait()
+      .await
+      .expect("the first leave succeeds");
+    assert_eq!(
+      tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
+        .await
+        .expect("the leave signal fires"),
+      Some(super::super::lifecycle::LeaveSignal::Complete)
+    );
+  }
+
+  /// The signal decision reads the table's own (kind, phase) and nothing
+  /// else: a leave that published `Succeeded` signals — the state a raced
+  /// second admission used to suppress through the exclusivity slot's id —
+  /// and no other kind's success ever does.
+  #[test]
+  fn the_leave_signal_is_read_off_the_table_not_the_exclusivity_slot() {
+    let table = crate::task::TaskTable::new();
+    let leave = TaskId::compose(0, 0).expect("id");
+    let other = TaskId::compose(0, 1).expect("id");
+    table.insert_pending(&leave, TaskKind::Leave, std::time::SystemTime::now());
+    table.insert_pending(&other, TaskKind::SyncRound, std::time::SystemTime::now());
+    assert_eq!(
+      super::leave_signal_for(&table, &leave),
+      None,
+      "a pending leave never signals"
+    );
+    publish_phase(&table, &other, TaskPhase::Succeeded);
+    assert_eq!(
+      super::leave_signal_for(&table, &other),
+      None,
+      "no other kind's success signals the leave shutdown"
+    );
+    publish_phase(&table, &leave, TaskPhase::Succeeded);
+    assert_eq!(
+      super::leave_signal_for(&table, &leave),
+      Some(super::super::lifecycle::LeaveSignal::Complete)
+    );
+    let unknown = TaskId::compose(0, 99).expect("id");
+    assert_eq!(super::leave_signal_for(&table, &unknown), None);
   }
 
   #[tokio::test]
@@ -2216,7 +2350,7 @@ mod tests {
   fn handle_over_manager(
     extensions: std::sync::Arc<ExtensionRegistry>, events: Arc<crate::node::EventHub>,
   ) -> (crate::NodeHandle, crate::Tasks) {
-    let (leave_complete, _leave_signals) = mpsc::channel(1);
+    let (leave_signal, _leave_signals) = mpsc::channel(1);
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
@@ -2224,7 +2358,7 @@ mod tests {
         events,
         extensions.clone(),
       )),
-      leave_complete,
+      leave_signal,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
     let (control_tx, _control_rx) = mpsc::channel(32);

@@ -220,11 +220,15 @@ impl NodeHandle {
   /// `wait` resolves with the outcome; the active-leave shutdown starts
   /// only after the task terminalizes, and the terminal publication
   /// precedes the shutdown signal, so `wait` always observes the outcome
-  /// before any teardown begins.
+  /// before any teardown begins. A failure after the leave began tearing
+  /// the network down instead shuts the node down with
+  /// [`ShutdownReason::Fatal`], because it has no listeners and no
+  /// sessions left to serve with.
   ///
   /// Admission-time failures are the pure shape checks (a stopped node, a
-  /// missing acknowledgement marker, a second leave while one is in
-  /// flight); the frozen-store refusal and every journal/teardown failure
+  /// missing acknowledgement marker, a second leave while one is admitted
+  /// — the first leave holds its exclusivity slot until its terminal
+  /// report); the frozen-store refusal and every journal/teardown failure
   /// are effect-time and surface on the task's `wait`.
   ///
   /// The leave is journaled before any network effect, and once the

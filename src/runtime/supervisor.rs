@@ -23,7 +23,7 @@ use crate::{
   protocol::offer::node_offer,
   provider::{KeyProvider, StorageFactory},
   routing::{RouteTable, outbound::run_outbound},
-  runtime::{Control, LifecycleSnapshot, RuntimeClient},
+  runtime::{Control, LeaveSignal, LifecycleSnapshot, RuntimeClient},
   session::{
     SessionDriver,
     stream::{SessionPacketContext, SessionTable, run_session},
@@ -44,6 +44,12 @@ use crate::{
 /// queued-reply drain, where it is a true bound: a closed bounded
 /// channel can hold no more queued messages than its capacity.
 const CONTROL_CAPACITY: usize = 32;
+
+/// The leave plane's signal depth: one leave per incarnation, and the
+/// first signal is the one that decides the shutdown reason, so a
+/// capacity of one parks nothing and refuses only a signal the loop is
+/// already tearing down on.
+const LEAVE_SIGNAL_CAPACITY: usize = 1;
 
 /// The bounded cooperative window the drained connection tasks get at
 /// shutdown before only the stragglers are aborted: the graceful
@@ -318,6 +324,11 @@ pub(crate) async fn spawn_runtime(
   let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
   let (ready_tx, ready_rx) = oneshot::channel();
   let (packet_tx, packet_rx) = packets;
+  // The leave plane's signal to the control loop: the task manager sends
+  // the success, and the leave effect itself sends the fatal failure of a
+  // teardown that already began (see `LeaveSignal`). The effect's half
+  // rides the operation planes, so it is created before them.
+  let (leave_signal, leave_signals) = mpsc::channel(LEAVE_SIGNAL_CAPACITY);
   // The node-shared operation handles are built here rather than inside
   // the supervisor: the supervisor's own fields, the verb effects, and
   // every node handle must read the same session driver (one credential
@@ -328,18 +339,18 @@ pub(crate) async fn spawn_runtime(
     offer,
     registry,
     authorization,
+    leave_signal.clone(),
   )?;
   dependencies.operations = Some(Arc::clone(&operations));
   // The task manager is spawned here, beside the supervisor and before the
   // node is marked running: the client side rides the node handle (so an
   // admitted task always has a live manager) and the teardown handle rides
   // the runtime dependencies (so the shutdown path drains it in order).
-  let (leave_complete, leave_signals) = mpsc::channel(1);
   let (task_client, task_manager) = spawn_task_manager(super::task_manager::TaskManagerDeps {
     entropy: dependencies.entropy.clone(),
     clock: Arc::new(crate::time::HostWallClock),
     operations,
-    leave_complete,
+    leave_signal,
   })?;
   dependencies.task_manager = Some(task_manager);
   let client = RuntimeClient::new(
@@ -356,7 +367,7 @@ pub(crate) async fn spawn_runtime(
     sync_rounds,
     RuntimeSignals {
       control: control_rx,
-      leave_complete: leave_signals,
+      leave_signal: leave_signals,
       state: state_tx,
       ready: ready_tx,
     },
@@ -372,8 +383,8 @@ pub(crate) async fn spawn_runtime(
 /// transpose two same-typed channels.
 struct RuntimeSignals {
   control: mpsc::Receiver<Control>,
-  /// The task manager's leave-completion signal (see `finish_shutdown`).
-  leave_complete: mpsc::Receiver<()>,
+  /// The leave plane's signal (see [`LeaveSignal`] and `finish_shutdown`).
+  leave_signal: mpsc::Receiver<LeaveSignal>,
   state: watch::Sender<LifecycleSnapshot>,
   ready: oneshot::Sender<()>,
 }
@@ -399,7 +410,7 @@ async fn supervise(
 ) {
   let RuntimeSignals {
     mut control,
-    mut leave_complete,
+    mut leave_signal,
     state,
     ready,
   } = signals;
@@ -469,7 +480,7 @@ async fn supervise(
   let terminal = run_control_loop(
     &mut supervisor,
     &mut control,
-    &mut leave_complete,
+    &mut leave_signal,
     &mut packet_rx,
     &mut tasks,
   )
@@ -542,7 +553,7 @@ fn spawn_tick_workers(supervisor: &Supervisor) -> Result<Vec<tokio::task::JoinHa
 /// loop's own state machine, not the supervisor's.
 async fn run_control_loop(
   supervisor: &mut Supervisor, control: &mut mpsc::Receiver<Control>,
-  leave_complete: &mut mpsc::Receiver<()>,
+  leave_signal: &mut mpsc::Receiver<LeaveSignal>,
   packet_rx: &mut mpsc::Receiver<crate::packet::OutboundRequest>, tasks: &mut JoinSet<()>,
 ) -> TerminalPhase {
   // The packet admission plane: target
@@ -565,11 +576,12 @@ async fn run_control_loop(
   let (pump_tx, mut pump_rx) = mpsc::channel::<PumpHandoff>(PUMP_HANDOFF_CAPACITY);
   let mut pump_open = true;
   let mut packets_open = true;
-  // The leave effect's completion signal: once it lands, the caller has
-  // already observed the task's terminal outcome (the publication precedes
-  // the signal) and the node tears down with the active-leave reason. A
-  // closed channel means the manager (the sender's only owner) is gone, so
-  // the arm is disabled rather than polled again.
+  // The leave plane's signal: the success tears down with the
+  // active-leave reason, and a failure after the leave's teardown began
+  // tears down with the failure's kind — the node cannot keep running
+  // once its listeners and sessions are down. A closed channel means
+  // every sender (the manager and the operation planes) is gone, so the
+  // arm is disabled rather than polled again.
   let mut leave_signals_open = true;
   loop {
     // Fill the packet arm's admission slot without awaiting: a saturated
@@ -624,11 +636,17 @@ async fn run_control_loop(
         pump_outbound(supervisor, tasks, handoff);
       }
       finished = tasks.join_next(), if !tasks.is_empty() => reap_packet_task(finished),
-      signal = leave_complete.recv(), if leave_signals_open => {
+      signal = leave_signal.recv(), if leave_signals_open => {
         match signal {
-          Some(()) => {
+          Some(LeaveSignal::Complete) => {
             return TerminalPhase {
               reason: ShutdownReason::ActiveLeave,
+              first_reply: None,
+            };
+          }
+          Some(LeaveSignal::Fatal(kind)) => {
+            return TerminalPhase {
+              reason: ShutdownReason::Fatal(kind),
               first_reply: None,
             };
           }
@@ -1068,6 +1086,7 @@ pub(super) fn operation_deps(
   offer: crate::protocol::offer::FeatureOffer,
   features: std::sync::Arc<crate::protocol::feature::FeatureRegistry>,
   authorization: crate::session::stream::AuthorizationBoundary,
+  leave_signal: mpsc::Sender<LeaveSignal>,
 ) -> Result<Arc<super::task_effects::OperationDeps>> {
   let Some(context) = dependencies.context.clone() else {
     return Err(Error::internal("runtime context"));
@@ -1096,6 +1115,7 @@ pub(super) fn operation_deps(
     driver,
     packet,
     shutdown,
+    leave_signal,
   )?))
 }
 
@@ -1511,12 +1531,14 @@ mod receipt_retention_sweep_tests {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the test drives the exact production construction path for the
     // packet context and the session driver too.
+    let (leave_signal, _leave_signals) = mpsc::channel(super::LEAVE_SIGNAL_CAPACITY);
     let operations = super::operation_deps(
       &dependencies,
       packet_tx.clone(),
       offer,
       registry,
       crate::session::stream::AuthorizationBoundary::default(),
+      leave_signal,
     )
     .expect("operation handles");
     dependencies.operations = Some(operations);
@@ -1992,8 +2014,8 @@ mod admission_loop_tests {
   use tokio::sync::{mpsc, oneshot, watch};
 
   use super::{
-    ADMISSION_CONCURRENCY, CONTROL_CAPACITY, Control, LifecycleSnapshot, RuntimeSignals,
-    ShutdownReason, supervise,
+    ADMISSION_CONCURRENCY, CONTROL_CAPACITY, Control, LeaveSignal, LifecycleSnapshot,
+    RuntimeSignals, ShutdownReason, supervise,
     test_support::{self, RuntimeFixture},
   };
   use crate::{
@@ -2060,8 +2082,8 @@ mod admission_loop_tests {
     task: tokio::task::JoinHandle<()>,
     // A live node keeps both signal ends alive; the loop's leave and
     // lifecycle arms then stay armed exactly as in production.
-    _leave: mpsc::Sender<()>,
-    _state: watch::Receiver<LifecycleSnapshot>,
+    leave: mpsc::Sender<LeaveSignal>,
+    state: watch::Receiver<LifecycleSnapshot>,
   }
 
   /// Starts the real control loop over the fixture with the pending policy
@@ -2079,6 +2101,7 @@ mod admission_loop_tests {
       sync_rounds,
       entropy,
       sessions,
+      leave_signals,
     } = test_support::runtime_fixture_over(
       reference as Arc<dyn crate::provider::StorageFactory>,
       config,
@@ -2090,8 +2113,17 @@ mod admission_loop_tests {
     )
     .await;
     let routes = dependencies.routes.clone();
+    // The signal's sender is the one the leave effect itself holds, so the
+    // test drives the loop's arm through the production channel.
+    let leave = dependencies
+      .operations
+      .as_ref()
+      .expect("operation handles")
+      .planes()
+      .expect("planes")
+      .leave_signal
+      .clone();
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
-    let (leave_tx, leave_rx) = mpsc::channel(1);
     let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
     let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(supervise(
@@ -2100,7 +2132,7 @@ mod admission_loop_tests {
       sync_rounds,
       RuntimeSignals {
         control: control_rx,
-        leave_complete: leave_rx,
+        leave_signal: leave_signals,
         state: state_tx,
         ready: ready_tx,
       },
@@ -2114,8 +2146,8 @@ mod admission_loop_tests {
       entropy,
       calls,
       task,
-      _leave: leave_tx,
-      _state: state_rx,
+      leave,
+      state: state_rx,
     }
   }
 
@@ -2155,6 +2187,32 @@ mod admission_loop_tests {
         .expect("recovery view");
     }
 
+    /// The leave plane's fatal signal must stop the node with the
+    /// failure's kind — never leave it `Running` after its teardown began.
+    async fn fatal_leave(self, kind: crate::ErrorKind) {
+      self
+        .leave
+        .send(LeaveSignal::Fatal(kind))
+        .await
+        .expect("leave channel");
+      let mut state = self.state.clone();
+      let reason = tokio::time::timeout(SHUTDOWN_BOX, async {
+        loop {
+          if let Some(reason) = state.borrow().reason() {
+            return reason;
+          }
+          state.changed().await.expect("lifecycle state");
+        }
+      })
+      .await
+      .expect("the fatal leave stops the node");
+      assert_eq!(reason, ShutdownReason::Fatal(kind));
+      tokio::time::timeout(SHUTDOWN_BOX, self.task)
+        .await
+        .expect("the control loop must exit")
+        .expect("the control loop must not panic");
+    }
+
     /// Shutdown must answer inside the shutdown bound and the loop must
     /// exit without panicking.
     async fn shutdown(self) {
@@ -2174,6 +2232,15 @@ mod admission_loop_tests {
         .expect("the control loop must exit")
         .expect("the control loop must not panic");
     }
+  }
+
+  /// A leave that failed after its network teardown began cannot leave the
+  /// node running: the leave plane's fatal signal drives the one shutdown
+  /// sequence with the failure's kind.
+  #[tokio::test]
+  async fn a_fatal_leave_signal_stops_the_node_with_the_failure_kind() {
+    let pending = start_pending_policy_loop().await;
+    pending.fatal_leave(crate::ErrorKind::Internal).await;
   }
 
   #[tokio::test]
@@ -2264,7 +2331,7 @@ pub(crate) mod test_support {
 
   use tokio::sync::{mpsc, watch};
 
-  use super::{RuntimeDependencies, Supervisor, node_offer};
+  use super::{LeaveSignal, RuntimeDependencies, Supervisor, node_offer};
   use crate::{
     NodeConfig, TransportScheme,
     extension_registry::ExtensionRegistry,
@@ -2289,6 +2356,10 @@ pub(crate) mod test_support {
     pub(crate) sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
     pub(crate) entropy: Arc<dyn crate::api::Entropy>,
     pub(crate) sessions: SessionTable,
+    /// The leave plane's signal receiver: the production `supervise` loop
+    /// owns it, so a fixture that drives a real leave effect reads the
+    /// signal here.
+    pub(crate) leave_signals: mpsc::Receiver<LeaveSignal>,
   }
 
   /// Builds the runtime dependencies over a fresh in-memory identity
@@ -2368,12 +2439,14 @@ pub(crate) mod test_support {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the tick drives the exact production packet context and session
     // driver instead of a stand-in.
+    let (leave_signal, leave_signals) = mpsc::channel(super::LEAVE_SIGNAL_CAPACITY);
     let operations = super::operation_deps(
       &dependencies,
       packet_tx.clone(),
       offer,
       registry,
       crate::session::stream::AuthorizationBoundary::default(),
+      leave_signal,
     )
     .expect("operation handles");
     dependencies.operations = Some(operations);
@@ -2384,6 +2457,7 @@ pub(crate) mod test_support {
       sync_rounds: round_rx,
       entropy,
       sessions,
+      leave_signals,
     }
   }
 

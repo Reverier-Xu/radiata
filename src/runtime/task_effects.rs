@@ -109,6 +109,12 @@ pub(crate) struct EffectPlanes {
   /// Requests for one immediate anti-entropy round, forwarded to the
   /// sync driver (the cursor owner) by the sync-round effect.
   pub(crate) sync_round_requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+  /// The leave plane's signal to the supervisor's control loop: the
+  /// leave effect reports a failure that landed after its network
+  /// teardown began, so the node tears down fatally instead of staying
+  /// `Running` with every listener and session already down (see
+  /// [`super::lifecycle::LeaveSignal`]).
+  pub(crate) leave_signal: tokio::sync::mpsc::Sender<super::lifecycle::LeaveSignal>,
 }
 
 /// The node-shared operation handles behind every migrated mutating verb,
@@ -140,6 +146,7 @@ impl OperationDeps {
   pub(super) fn new(
     dependencies: &RuntimeDependencies, driver: SessionDriver, packet: Arc<SessionPacketContext>,
     shutdown: watch::Sender<()>,
+    leave_signal: tokio::sync::mpsc::Sender<super::lifecycle::LeaveSignal>,
   ) -> Result<Self> {
     Ok(Self {
       events: Arc::clone(&dependencies.events),
@@ -175,6 +182,7 @@ impl OperationDeps {
           ),
         )),
         sync_round_requests: dependencies.sync_round_requests.clone(),
+        leave_signal,
       }),
     })
   }
@@ -1737,10 +1745,13 @@ async fn reconcile_sync_round(deps: Arc<OperationDeps>) -> Result<EffectOutcome>
 /// shuts down with the active-leave reason.
 ///
 /// Admission-time failures are the pure shape checks (a stopped node, a
-/// missing acknowledgement marker, a second leave while one is in
-/// flight — [`crate::ErrorKind::Conflict`]); the frozen-store refusal
-/// and every journal/teardown failure are effect-time and surface on the
-/// task's [`Task::wait`].
+/// missing acknowledgement marker, a second leave while one is admitted —
+/// the first leave holds its exclusivity slot until its terminal report —
+/// [`crate::ErrorKind::Conflict`]); the frozen-store refusal and every
+/// journal/teardown failure are effect-time and surface on the task's
+/// [`Task::wait`]. A failure after the network teardown began also shuts
+/// the node down with [`crate::ShutdownReason::Fatal`]: it has no
+/// listeners and no sessions left to serve with.
 pub(crate) async fn leave(
   tasks: &TaskClient, acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
 ) -> Result<Task<crate::LeaveOutcome>> {
@@ -1770,7 +1781,11 @@ pub(crate) async fn leave(
 /// silent leave, which the cleanup path covers. The task's terminal
 /// publication lands before the manager signals the supervisor's
 /// active-leave shutdown, so a `wait` caller always observes the outcome
-/// before any teardown begins.
+/// before any teardown begins. A failure before the network teardown
+/// (journal, announcement) is the caller's to retry and leaves the node
+/// running; a failure once the teardown began reports the fatal shutdown
+/// itself, because the node has no listeners and no sessions left to
+/// serve with.
 async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   let planes = deps.planes()?;
   planes.context.require_unblocked()?;
@@ -1789,37 +1804,55 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   .await?;
 
   // Network teardown first: no new sessions or inbound metadata while
-  // the identity is replaced and the old metadata is wiped.
-  let listener_ids: Vec<crate::identity::ListenerId> = planes
-    .listeners
-    .lock()
-    .map_err(Error::listener_registry)?
-    .keys()
-    .cloned()
-    .collect();
-  for listener in listener_ids {
-    super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
-      .await?;
-  }
-  let peers: Vec<NodeId> = planes
-    .sessions
-    .lock()
-    .map_err(Error::session_table)?
-    .keys()
-    .cloned()
-    .collect();
-  for peer in peers {
-    retire_session(&planes.sessions, &peer)?;
-  }
+  // the identity is replaced and the old metadata is wiped. Both steps
+  // are idempotent, so a concurrent stop-listener or disconnect never
+  // fails the leave after a partial teardown. From here on the node's
+  // network is down, so a failure must drive the fatal shutdown instead
+  // of leaving the node silently `Running`.
+  let teardown = async {
+    let listener_ids: Vec<crate::identity::ListenerId> = planes
+      .listeners
+      .lock()
+      .map_err(Error::listener_registry)?
+      .keys()
+      .cloned()
+      .collect();
+    for listener in listener_ids {
+      stop_listener_for_leave(&planes.listeners, &planes.published_endpoints, &listener).await?;
+    }
+    let peers: Vec<NodeId> = planes
+      .sessions
+      .lock()
+      .map_err(Error::session_table)?
+      .keys()
+      .cloned()
+      .collect();
+    for peer in peers {
+      // Idempotent by construction: a peer with no session entry is
+      // already down, never an error.
+      retire_session(&planes.sessions, &peer)?;
+    }
 
-  crate::identity::leave::run_leave(
-    context.store(),
-    context.keys(),
-    planes.entropy.as_ref(),
-    &journaled.stored,
-    &journaled.intent,
-  )
-  .await?;
+    crate::identity::leave::run_leave(
+      context.store(),
+      context.keys(),
+      planes.entropy.as_ref(),
+      &journaled.stored,
+      &journaled.intent,
+    )
+    .await
+  }
+  .await;
+  if let Err(error) = teardown {
+    // The node cannot keep running with every listener and session down:
+    // the signal drives `finish_shutdown` with the failure's kind. The
+    // channel is capacity-one, so a refused send only means a signal
+    // already started the shutdown.
+    let _ = planes
+      .leave_signal
+      .try_send(super::lifecycle::LeaveSignal::Fatal(error.kind()));
+    return Err(error);
+  }
   let (former, replacement) = (
     journaled.intent.former_node().clone(),
     journaled.intent.replacement_node().clone(),
@@ -1831,6 +1864,22 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   Ok(EffectOutcome::new(TaskOutput::Leave(
     crate::LeaveOutcome::new(former, replacement),
   )))
+}
+
+/// Stops one listener for the leave teardown. The stop-listener effect
+/// reports an unknown listener as [`crate::ErrorKind::NotFound`], but for
+/// the leave an already-removed listener is already down: a concurrent
+/// stop that won the race must not fail the leave after it tore the rest
+/// of the network down.
+async fn stop_listener_for_leave(
+  listeners: &ListenerRegistry, published_endpoints: &Arc<Mutex<Vec<Endpoint>>>,
+  listener: &crate::identity::ListenerId,
+) -> Result<()> {
+  match super::listeners::stop_listener(listeners, published_endpoints, listener).await {
+    Ok(()) => Ok(()),
+    Err(error) if error.kind() == crate::ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error),
+  }
 }
 
 #[cfg(test)]
@@ -2171,5 +2220,86 @@ mod shared_table_poison_tests {
     };
     assert_eq!(error.kind(), ErrorKind::Internal);
     assert_eq!(error.context(), "join credential issuer");
+  }
+}
+
+#[cfg(test)]
+mod leave_teardown_tests {
+  use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+  };
+
+  use crate::{
+    ErrorKind, NodeConfig,
+    identity::ListenerId,
+    runtime::supervisor::{
+      ListenerRegistry,
+      test_support::{RuntimeFixture, runtime_fixture_over},
+    },
+  };
+
+  /// The leave teardown is idempotent per listener: a listener a
+  /// concurrent stop already removed is already down, so the leave
+  /// continues with the rest of the teardown instead of failing after a
+  /// partial one. The stop-listener effect still reports the same absence
+  /// typed, so the tolerance stays the leave's own.
+  #[tokio::test]
+  async fn an_already_removed_listener_does_not_fail_the_leave_teardown() {
+    let listeners: ListenerRegistry = Arc::new(Mutex::new(BTreeMap::new()));
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let listener = ListenerId::parse("listener-000000000000000000001").expect("listener id");
+    assert_eq!(
+      super::super::listeners::stop_listener(&listeners, &published, &listener)
+        .await
+        .expect_err("the stop-listener effect reports an unknown listener")
+        .kind(),
+      ErrorKind::NotFound
+    );
+    super::stop_listener_for_leave(&listeners, &published, &listener)
+      .await
+      .expect("an already-removed listener is already down");
+  }
+
+  /// The tolerance is narrow: only the idempotent `NotFound` is skipped.
+  /// A real teardown failure still fails the leave — and, once the
+  /// teardown began, reports the fatal shutdown instead of leaving the
+  /// node silently `Running` with every listener and session down.
+  #[tokio::test]
+  async fn a_leave_whose_teardown_fails_reports_the_fatal_shutdown() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let RuntimeFixture {
+      dependencies,
+      mut leave_signals,
+      ..
+    } = runtime_fixture_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      NodeConfig::new(),
+      |_| {},
+    )
+    .await;
+    let deps = dependencies.operations.clone().expect("operation handles");
+    let listeners = Arc::clone(&deps.planes().expect("planes").listeners);
+    let _ = std::thread::spawn(move || {
+      let _guard = listeners.lock().expect("listener registry guard");
+      panic!("poison the listener registry");
+    })
+    .join();
+
+    let error = match super::reconcile_leave(deps).await {
+      Ok(_) => panic!("a poisoned listener registry must fail the leave teardown"),
+      Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "listener registry");
+    assert_eq!(
+      leave_signals.try_recv(),
+      Ok(super::super::lifecycle::LeaveSignal::Fatal(
+        ErrorKind::Internal
+      )),
+      "the post-teardown failure must report the fatal shutdown"
+    );
   }
 }
