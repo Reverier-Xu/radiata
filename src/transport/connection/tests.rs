@@ -54,7 +54,14 @@ async fn tls_transport_merge_hint_round_trips_inside_the_tls_channel() {
     let hint = hint.clone();
     async move {
       let (tcp, _) = listener.accept().await.unwrap();
-      Connection::accept_tls_ws(tcp, config, rules(), Some(&hint)).await
+      Connection::accept_tls_ws(
+        tcp,
+        config,
+        rules(),
+        crate::transport::TransportAdmission::PeerAddressed,
+        Some(&hint),
+      )
+      .await
     }
   });
 
@@ -161,7 +168,14 @@ async fn loopback_pair_with(
   let address = listener.local_addr().unwrap();
   let server = tokio::spawn(async move {
     let (tcp, _) = listener.accept().await.unwrap();
-    Connection::accept_tls_ws(tcp, config, rules(), None).await
+    Connection::accept_tls_ws(
+      tcp,
+      config,
+      rules(),
+      crate::transport::TransportAdmission::PeerAddressed,
+      None,
+    )
+    .await
   });
 
   let tcp = TcpStream::connect(address).await.unwrap();
@@ -739,9 +753,15 @@ async fn tls_transport_maps_a_transient_io_accept_failure_to_io() {
   });
 
   let (tcp, _) = listener.accept().await.unwrap();
-  let error = Connection::accept_tls_ws(tcp, config, rules(), None)
-    .await
-    .unwrap_err();
+  let error = Connection::accept_tls_ws(
+    tcp,
+    config,
+    rules(),
+    crate::transport::TransportAdmission::PeerAddressed,
+    None,
+  )
+  .await
+  .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Io);
   dialer.await.unwrap();
 }

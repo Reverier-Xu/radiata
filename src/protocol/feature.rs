@@ -33,9 +33,7 @@ use std::collections::BTreeMap;
 
 use minicbor::Encode;
 
-use super::{
-  CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, encode_canonical, tag::BUILTIN_DOMAIN,
-};
+use super::{CborLimits, FeatureTag, MAX_BODY_BYTES, ProtocolTag, encode_canonical};
 use crate::{Digest, Error, Result, identity::signature::body_digest};
 const FINGERPRINT_SEED_PREFIX: &str = "radiata.woooo.tech/crypto/v1/feature-fingerprint/";
 
@@ -71,17 +69,15 @@ pub struct FeatureDefinition {
 }
 
 impl FeatureDefinition {
-  /// Starts a definition for an extension feature label with its immutable
-  /// 32-byte contract fingerprint.
+  /// Starts a definition for one feature label with its immutable 32-byte
+  /// contract fingerprint.
   ///
-  /// The built-in `radiata.woooo.tech` domain is reserved for the frozen
-  /// built-in definitions and is rejected here.
+  /// The definition constructor is uniform: it does not reserve the
+  /// built-in domain. Reservation is a registration decision —
+  /// [`crate::ExtensionRegistry::register_feature`] refuses caller
+  /// definitions under that domain, while the explicit default path
+  /// installs the official definitions.
   pub fn new(tag: FeatureTag, fingerprint: Digest) -> Result<Self> {
-    if tag.domain() == BUILTIN_DOMAIN {
-      return Err(Error::invalid_input(
-        "feature definition reserved namespace",
-      ));
-    }
     Ok(Self::unchecked(tag, fingerprint))
   }
 
@@ -209,9 +205,10 @@ pub(crate) struct FeatureRegistry {
 }
 
 impl FeatureRegistry {
-  /// Builds a registry, rejecting duplicate labels, reserved-namespace
-  /// misuse, missing dependencies, dependency cycles, asymmetric or self
-  /// conflicts, and duplicate protocol handler ownership.
+  /// Builds a registry, rejecting duplicate labels, missing dependencies,
+  /// dependency cycles, asymmetric or self conflicts, and duplicate
+  /// protocol handler ownership. Official and caller definitions follow
+  /// the same rules: the registry has no built-in special case.
   pub(crate) fn build(definitions: Vec<FeatureDefinition>) -> Result<Self> {
     let mut map: BTreeMap<FeatureTag, FeatureDefinition> = BTreeMap::new();
     for definition in definitions {
@@ -219,17 +216,17 @@ impl FeatureRegistry {
         return Err(Error::invalid_input("feature registry duplicate label"));
       }
     }
-    let builtins = builtin_definitions()?;
-    for definition in map.values() {
-      check_reserved_namespace(definition, &builtins)?;
-    }
     check_dependencies(&map)?;
     check_conflicts(&map)?;
     check_unique_ownership(&map)?;
     Ok(Self { definitions: map })
   }
 
-  /// Builds the frozen built-in registry.
+  /// Builds the frozen official registry explicitly. The constructor names
+  /// the official definition set; it is not a hidden fallback of
+  /// [`Self::build`]. Test/fuzz-only: production builds the registry from
+  /// the extension registry's registered definitions.
+  #[cfg(any(test, fuzzing))]
   pub(crate) fn builtin() -> Result<Self> {
     Self::build(builtin_definitions()?)
   }
@@ -251,21 +248,6 @@ pub(crate) fn required_session_features() -> Result<[FeatureTag; 2]> {
     FeatureTag::parse(AUTH_ED25519_SESSION)?,
     FeatureTag::parse(SESSION_CORE)?,
   ])
-}
-
-fn check_reserved_namespace(
-  definition: &FeatureDefinition, builtins: &[FeatureDefinition],
-) -> Result<()> {
-  if definition.tag().domain() != BUILTIN_DOMAIN {
-    return Ok(());
-  }
-  let actual = definition.definition_digest()?;
-  for candidate in builtins {
-    if candidate.tag() == definition.tag() && candidate.definition_digest()? == actual {
-      return Ok(());
-    }
-  }
-  Err(Error::invalid_input("feature registry reserved namespace"))
 }
 
 fn check_dependencies(definitions: &BTreeMap<FeatureTag, FeatureDefinition>) -> Result<()> {
@@ -349,7 +331,7 @@ pub(crate) fn builtin_definitions() -> Result<Vec<FeatureDefinition>> {
 fn builtin(tag: &str) -> Result<FeatureDefinition> {
   let tag = FeatureTag::parse(tag)?;
   let fingerprint = builtin_fingerprint(&tag);
-  Ok(FeatureDefinition::unchecked(tag, fingerprint))
+  FeatureDefinition::new(tag, fingerprint)
 }
 
 fn builtin_fingerprint(tag: &FeatureTag) -> Digest {
@@ -494,13 +476,19 @@ mod tests {
       "feature registry duplicate protocol owner"
     );
 
-    let reserved = FeatureDefinition::new(
+    // The definition constructor is uniform: an official-tagged definition
+    // is an ordinary definition, and the registry accepts it under the same
+    // rules as a caller definition. Reservation is a registration decision.
+    let official = FeatureDefinition::new(
       FeatureTag::parse(AUTH_ED25519_SESSION).unwrap(),
       Digest::from_bytes([7; 32]),
-    );
-    assert_eq!(
-      reserved.unwrap_err().context(),
-      "feature definition reserved namespace"
+    )
+    .unwrap();
+    let official_registry = FeatureRegistry::build(vec![official]).unwrap();
+    assert!(
+      official_registry
+        .get(&FeatureTag::parse(AUTH_ED25519_SESSION).unwrap())
+        .is_some()
     );
 
     let crypto = QualifiedTag::parse("radiata.woooo.tech/crypto/v1/session");
@@ -520,8 +508,12 @@ mod tests {
     assert!(valid.is_ok());
   }
 
+  /// Mutating an official definition changes its digest exactly like a
+  /// caller definition: the registry applies no built-in special case, so
+  /// the frozen golden fixture (not a registry-side reservation check) is
+  /// what pins the official digests.
   #[test]
-  fn handshake_mutated_builtin_definitions_are_detected() {
+  fn mutated_builtin_definitions_change_their_digest() {
     let names = [
       AUTH_ED25519_SESSION,
       SESSION_CORE,
@@ -535,32 +527,32 @@ mod tests {
       assert_eq!(digest, definition.definition_digest().unwrap(), "{name}");
     }
 
-    assert_mutation_detected(AUTH_ED25519_SESSION, |definition| {
+    assert_mutation_changes_digest(AUTH_ED25519_SESSION, |definition| {
       definition.fingerprint = Digest::from_bytes([0xFF; 32]);
     });
-    assert_mutation_detected(SESSION_CORE, |definition| {
+    assert_mutation_changes_digest(SESSION_CORE, |definition| {
       definition
         .dependencies
         .push(FeatureTag::parse(ROUTED_DELIVERY).unwrap());
     });
-    assert_mutation_detected(ROUTED_DELIVERY, |definition| {
+    assert_mutation_changes_digest(ROUTED_DELIVERY, |definition| {
       definition
         .conflicts
         .push(FeatureTag::parse(SESSION_CORE).unwrap());
     });
-    assert_mutation_detected(DATA_MESSAGES, |definition| {
+    assert_mutation_changes_digest(DATA_MESSAGES, |definition| {
       definition
         .protocols
         .push(ProtocolTag::parse("radiata.woooo.tech/protocols/data-messages").unwrap());
     });
-    assert_mutation_detected(DIRECT_REQUEST, |definition| {
+    assert_mutation_changes_digest(DIRECT_REQUEST, |definition| {
       definition
         .protocols
         .push(ProtocolTag::parse("radiata.woooo.tech/protocols/routed-delivery").unwrap());
     });
   }
 
-  fn assert_mutation_detected(name: &str, mutate: impl FnOnce(&mut FeatureDefinition)) {
+  fn assert_mutation_changes_digest(name: &str, mutate: impl FnOnce(&mut FeatureDefinition)) {
     let mut definitions = builtin_definitions().unwrap();
     let index = definitions
       .iter()
@@ -573,11 +565,15 @@ mod tests {
       frozen,
       "{name}"
     );
-    let error = FeatureRegistry::build(definitions).unwrap_err();
-    assert_eq!(
-      error.context(),
-      "feature registry reserved namespace",
-      "{name}"
-    );
+    // No registry-side reservation check: a mutated definition is an
+    // ordinary definition, so the build either succeeds or fails on the
+    // ordinary graph rules — never on a built-in namespace reservation.
+    if let Err(error) = FeatureRegistry::build(definitions) {
+      assert_ne!(
+        error.context(),
+        "feature registry reserved namespace",
+        "{name}"
+      );
+    }
   }
 }

@@ -23,7 +23,8 @@
 use std::{os::unix::fs::FileTypeExt, path::PathBuf};
 
 use radiata::{
-  BoxFuture, Endpoint, Error, ProviderListener, Result, TransportProvider, TransportStream,
+  AcceptedStream, BoxFuture, Endpoint, Error, ProviderListener, Result, TransportProvider,
+  TransportStream,
 };
 
 /// The scheme name this transport registers under. Peers dial
@@ -147,7 +148,7 @@ impl ProviderListener for IpcListener {
     self.endpoint.clone()
   }
 
-  fn accept(&self) -> BoxFuture<'_, Result<Box<dyn TransportStream>>> {
+  fn accept(&self) -> BoxFuture<'_, Result<AcceptedStream>> {
     Box::pin(async move {
       loop {
         let accepted = tokio::select! {
@@ -160,7 +161,7 @@ impl ProviderListener for IpcListener {
         };
         match accepted {
           Ok((stream, _peer)) => {
-            return Ok(Box::new(IpcStream(stream)) as Box<dyn TransportStream>);
+            return Ok(AcceptedStream::new(Box::new(IpcStream(stream))));
           }
           // Transient accept interruptions retry; anything else fails
           // the accept (the runtime's bounded backoff absorbs it).

@@ -14,8 +14,8 @@ use std::{
 };
 
 use radiata::{
-  Endpoint, MergeCredential, NodeBuilder, NodeHandle, ProviderListener, TransportName,
-  TransportProvider, TransportStream,
+  AcceptedStream, Endpoint, MergeCredential, NodeBuilder, NodeHandle, ProviderListener,
+  TransportName, TransportProvider, TransportStream,
 };
 use tokio::sync::mpsc;
 
@@ -145,12 +145,13 @@ impl ProviderListener for HubListener {
     self.endpoint.clone()
   }
 
-  fn accept(&self) -> radiata::BoxFuture<'_, radiata::Result<Box<dyn TransportStream>>> {
+  fn accept(&self) -> radiata::BoxFuture<'_, radiata::Result<AcceptedStream>> {
     Box::pin(async move {
       let mut receiver = self.receiver.lock().await;
       receiver
         .recv()
         .await
+        .map(AcceptedStream::new)
         .ok_or_else(|| radiata::Error::caller("hub listener closed"))
     })
   }

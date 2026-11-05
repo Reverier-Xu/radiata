@@ -7,7 +7,8 @@
 //! is the resolution key, and the extension registry is the single map from
 //! selector to implementation. Callers register custom media (an ESP-NOW radio,
 //! an 802.11 link, a serial bus) through [`crate::TransportProvider`]; the
-//! three built-ins cover the ordinary deployment space:
+//! official transports cover the ordinary deployment space and are installed
+//! by the registry's explicit default path:
 //!
 //! - [`tls_transport`] — direct TLS 1.3 over TCP. **The default**: the
 //!   simplest, cheapest stream; advertise `tls://` endpoints unless a
@@ -60,7 +61,10 @@ pub(crate) mod ws;
 pub(crate) mod wss;
 
 pub use endpoint::{Endpoint, TransportName, TransportScheme, TransportSelector};
-pub use registry::{ProviderListener, TransportProvider, TransportStream};
+pub use registry::{
+  AcceptedStream, ProviderListener, TransportAdmission, TransportCapabilities, TransportProvider,
+  TransportStream,
+};
 
 pub use crate::paging::PageCursor;
 

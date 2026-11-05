@@ -270,7 +270,7 @@ async fn read_loop_frames(
               frames,
               &context.sessions,
               &context.forwarding,
-              &context.registry,
+              context.registry.routing(),
               context.route_policy(),
               context.forwarding_capacity(),
               context.relay_hop_deadline(),
@@ -1301,9 +1301,11 @@ mod read_loop_liveness_tests {
 
   fn context(clock: Arc<dyn crate::time::WallClock>) -> SessionPacketContext {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let mut registry = crate::ExtensionRegistry::new();
+    registry.register_default().unwrap();
     SessionPacketContext::new(
       node(1),
-      Arc::new(crate::ExtensionRegistry::new()),
+      Arc::new(registry),
       SessionPolicy::new(
         8,
         1 << 20,
@@ -1609,9 +1611,11 @@ mod ack_attribution_tests {
 
   fn context() -> SessionPacketContext {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let mut registry = crate::ExtensionRegistry::new();
+    registry.register_default().unwrap();
     SessionPacketContext::new(
       node(1),
-      Arc::new(crate::ExtensionRegistry::new()),
+      Arc::new(registry),
       SessionPolicy::new(
         8,
         1 << 20,
@@ -2030,9 +2034,11 @@ mod durable_mirror_tests {
   /// be observed on both planes at once.
   fn context_with(sink: TraceSink, routes: crate::routing::RouteTable) -> SessionPacketContext {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let mut registry = crate::ExtensionRegistry::new();
+    registry.register_default().unwrap();
     SessionPacketContext::new(
       node(1),
-      Arc::new(crate::ExtensionRegistry::new()),
+      Arc::new(registry),
       SessionPolicy::new(
         8,
         1 << 20,
@@ -2478,6 +2484,7 @@ mod slow_consumer_tests {
   /// Builds the registry + read loop plumbing around one consumer.
   fn session_for(consumer: Arc<DrainingConsumer>) -> SessionPacketContext {
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(
@@ -2539,6 +2546,7 @@ mod slow_consumer_tests {
       terminal: Arc::new(Mutex::new(None)),
     });
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(
@@ -2633,6 +2641,7 @@ mod slow_consumer_tests {
       terminal: Arc::new(Mutex::new(None)),
     });
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(
@@ -2982,6 +2991,7 @@ mod consumer_lifecycle_tests {
   /// production-scale population.
   fn context(consumer: Arc<GatedConsumer>, budget: usize) -> Arc<SessionPacketContext> {
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(

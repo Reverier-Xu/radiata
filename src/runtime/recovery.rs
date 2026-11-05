@@ -170,10 +170,7 @@ pub(super) async fn known_online_member_endpoints(
       }
     };
     let node = descriptor.node().clone();
-    if &node == local
-      || excluded.contains(&node)
-      || !bindings.contains_key(&node)
-    {
+    if &node == local || excluded.contains(&node) || !bindings.contains_key(&node) {
       continue;
     }
     if descriptor.endpoints().is_empty() {
@@ -1086,27 +1083,7 @@ mod tests {
     let entropy: Arc<dyn crate::api::Entropy> =
       Arc::new(crate::identity::testing::SequenceEntropy::default());
     let mut extensions = crate::extension_registry::ExtensionRegistry::new();
-    for (tag, transport) in [
-      (
-        crate::transport::registry::builtin_transport_tag(crate::TransportScheme::Tls).unwrap(),
-        Arc::new(crate::transport::tls_transport::TlsTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        crate::transport::registry::builtin_transport_tag(crate::TransportScheme::Wss).unwrap(),
-        Arc::new(crate::transport::wss::WssTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        crate::transport::registry::builtin_transport_tag(crate::TransportScheme::Tcp).unwrap(),
-        Arc::new(crate::transport::plain::PlainTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-    ] {
-      extensions
-        .register_builtin_transport(tag, transport)
-        .unwrap();
-    }
+    extensions.register_default().unwrap();
     // The panicking custom transport the regression dials through,
     // under its own scheme name: only endpoints that advertise it
     // resolve here, so the other fixtures never touch it.

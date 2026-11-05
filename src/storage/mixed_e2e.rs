@@ -259,16 +259,8 @@ mod cross_backend {
     let seed = [7_u8; 32];
     put_descriptor(&side_a, &descriptor(&node, 1, seed)).await;
     put_descriptor(&side_b, &descriptor(&writer(2), 1, [9_u8; 32])).await;
-    put_resource(
-      &side_a,
-      &resource_record(1, &writer(1), "u://a1", 2_000),
-    )
-    .await;
-    put_resource(
-      &side_b,
-      &resource_record(2, &writer(2), "u://b1", 3_000),
-    )
-    .await;
+    put_resource(&side_a, &resource_record(1, &writer(1), "u://a1", 2_000)).await;
+    put_resource(&side_b, &resource_record(2, &writer(2), "u://b1", 3_000)).await;
 
     converge([&side_a, &side_b]).await;
 

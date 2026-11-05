@@ -50,9 +50,20 @@ const MAX_NAME_LEN: usize = 63;
 /// The maximum length of a custom-form opaque address.
 const MAX_OPAQUE_LEN: usize = 255;
 
-/// The scheme names reserved for the built-in transports and for the
-/// insecure-WebSocket spelling the crate rejects outright.
-const RESERVED_NAMES: [&str; 4] = ["tls", "wss", "tcp", "ws"];
+/// The scheme names reserved for the official transports and for the
+/// insecure-WebSocket spelling the crate rejects outright. Derived from
+/// [`TransportScheme::ALL`] plus the `ws` alias, so a newly added official
+/// scheme becomes reserved automatically.
+const RESERVED_NAMES: [&str; TransportScheme::ALL.len() + 1] = {
+  let mut names = [""; TransportScheme::ALL.len() + 1];
+  let mut index = 0;
+  while index < TransportScheme::ALL.len() {
+    names[index] = TransportScheme::ALL[index].name();
+    index += 1;
+  }
+  names[index] = "ws";
+  names
+};
 
 /// The protocol prefix (addressing scheme) of one caller-registered
 /// transport.
@@ -142,6 +153,16 @@ pub enum TransportScheme {
 impl TransportScheme {
   /// Every canonical scheme.
   pub(crate) const ALL: [Self; 3] = [Self::Tls, Self::Wss, Self::Tcp];
+
+  /// The bare scheme name (without the `://` separator), used for the
+  /// reserved-name set and the transport tag literals.
+  pub(crate) const fn name(self) -> &'static str {
+    match self {
+      Self::Tls => "tls",
+      Self::Wss => "wss",
+      Self::Tcp => "tcp",
+    }
+  }
 
   /// The canonical scheme text including the `://` separator.
   pub const fn canonical(self) -> &'static str {
@@ -735,6 +756,17 @@ mod tests {
 
   #[test]
   fn transport_name_grammar_and_reservations() {
+    // The reserved set derives from every official scheme plus the
+    // insecure `ws` alias, so a new official scheme is reserved without
+    // touching this list.
+    for scheme in TransportScheme::ALL {
+      assert!(
+        super::RESERVED_NAMES.contains(&scheme.name()),
+        "official scheme {scheme} must be reserved"
+      );
+    }
+    assert!(super::RESERVED_NAMES.contains(&"ws"));
+
     for name in ["a", "espnow", "ieee80211", "a-b", "a-1", "serial0"] {
       assert!(TransportName::parse(name).is_ok(), "name: {name}");
     }

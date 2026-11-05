@@ -40,10 +40,10 @@ use std::{
 };
 
 use radiata::{
-  BoxFuture, Endpoint, Error, FeatureTag, MemberStatus, MergeCredential, NodeBuilder, NodeConfig,
-  NodeHandle, NodeId, PacketConsumer, PageSpec, ProtocolDefinition, ProtocolTag, ProviderListener,
-  Result, RoutingPolicy, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TransportName,
-  TransportProvider, TransportStream,
+  AcceptedStream, BoxFuture, Endpoint, Error, FeatureTag, MemberStatus, MergeCredential,
+  NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer, PageSpec, ProtocolDefinition,
+  ProtocolTag, ProviderListener, Result, RoutingPolicy, ShutdownReason, StreamMetadata,
+  StreamPolicy, StreamTarget, TransportName, TransportProvider, TransportStream,
 };
 mod common;
 
@@ -213,7 +213,7 @@ impl ProviderListener for UnixListener {
     self.endpoint.clone()
   }
 
-  fn accept(&self) -> BoxFuture<'_, Result<Box<dyn TransportStream>>> {
+  fn accept(&self) -> BoxFuture<'_, Result<AcceptedStream>> {
     Box::pin(async move {
       loop {
         let accepted = tokio::select! {
@@ -224,7 +224,7 @@ impl ProviderListener for UnixListener {
         };
         match accepted {
           Ok((stream, _peer)) => {
-            return Ok(Box::new(UnixStream(stream)) as Box<dyn TransportStream>);
+            return Ok(AcceptedStream::new(Box::new(UnixStream(stream))));
           }
           Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
           Err(_) => return Err(Error::caller("unix socket accept")),

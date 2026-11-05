@@ -411,21 +411,14 @@ impl Tasks {
   /// the node stopped: the table's post-shutdown state is not part of
   /// the public contract.
   pub async fn get(&self, id: crate::TaskId) -> Result<Option<crate::view::TaskView>> {
-    self.require_running()?;
-    Ok(self.client()?.observer.table.view(&id))
+    self.runtime.get_task(id)
   }
 
   /// Tasks in canonical id order (= admission order, newest last).
   /// Local read like [`Tasks::get`]; see its shutdown note.
   pub async fn list(&self, page: PageSpec) -> Result<crate::view::TaskPage> {
-    self.require_running()?;
     let cursor = page.cursor().cloned();
-    let limit = page.limit().clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    self
-      .client()?
-      .observer
-      .table
-      .page_views(cursor.as_ref().map(|cursor| cursor.as_bytes()), limit)
+    self.runtime.page_tasks(cursor.as_ref(), page.limit())
   }
 
   /// Awaits one task's terminal phase and resolves with its terminal

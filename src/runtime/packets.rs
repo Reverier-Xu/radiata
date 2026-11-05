@@ -245,7 +245,7 @@ impl PacketAdmission {
     let hop = if routing_policy.tag() == crate::RoutingPolicy::DIRECT.tag() {
       let tag = self.config.route_policy()?;
       match crate::routing::resolve_next_hop(
-        &self.extensions,
+        self.extensions.routing(),
         &tag,
         trace,
         destination,

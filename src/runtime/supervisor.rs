@@ -309,9 +309,10 @@ pub(crate) async fn spawn_runtime(
   // runtime is marked ready (the core protocols above joined the feature
   // set): a provisioning failure (a caller-required feature outside the
   // registry) is a typed start() error, never a running node that
-  // silently stopped.
-  let mut definitions = crate::protocol::feature::builtin_definitions()?;
-  definitions.extend(dependencies.extensions.feature_definitions());
+  // silently stopped. The registry holds exactly the definitions installed
+  // by `ExtensionRegistry::register_default` plus every caller
+  // registration; there is no hidden official fallback.
+  let definitions = dependencies.extensions.feature_definitions();
   // The merged registry is shared with the session driver (Arc): the same
   // set that built the node offer drives every handshake selection, so
   // caller-registered features survive into the negotiated intersection.
@@ -1512,8 +1513,9 @@ mod receipt_retention_sweep_tests {
         .unwrap(),
     );
     let config = NodeConfig::new().with_receipt_retention(retention).unwrap();
-    let mut definitions = feature::builtin_definitions().unwrap();
-    definitions.extend(ExtensionRegistry::new().feature_definitions());
+    let mut extensions = ExtensionRegistry::new();
+    extensions.register_default().unwrap();
+    let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
     let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
@@ -1525,7 +1527,7 @@ mod receipt_retention_sweep_tests {
       keys: Some(keys),
       config,
       entropy: entropy.clone(),
-      extensions: Arc::new(ExtensionRegistry::new()),
+      extensions: Arc::new(extensions),
       sessions: Default::default(),
       routes: Default::default(),
       events: Arc::new(crate::node::EventHub::new()),
@@ -2393,7 +2395,7 @@ pub(crate) mod test_support {
 
   use super::{LeaveSignal, RuntimeDependencies, Supervisor, node_offer};
   use crate::{
-    NodeConfig, TransportScheme,
+    NodeConfig,
     extension_registry::ExtensionRegistry,
     identity::{
       lifecycle::open_local_identity,
@@ -2403,7 +2405,6 @@ pub(crate) mod test_support {
     provider::StorageFactory,
     session::stream::SessionTable,
     storage::contract::{ReferenceFactory, required_capabilities},
-    transport::registry::builtin_transport_tag,
   };
 
   /// The fixture's runtime inputs: everything `spawn_runtime` hands the
@@ -2444,32 +2445,12 @@ pub(crate) mod test_support {
       .unwrap(),
     );
     let mut extensions = ExtensionRegistry::new();
-    // The built-in transports the node builder installs: the ticks
-    // resolve the members' wss endpoints through this registry.
-    for (tag, transport) in [
-      (
-        builtin_transport_tag(TransportScheme::Tls).unwrap(),
-        Arc::new(crate::transport::tls_transport::TlsTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Wss).unwrap(),
-        Arc::new(crate::transport::wss::WssTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Tcp).unwrap(),
-        Arc::new(crate::transport::plain::PlainTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-    ] {
-      extensions
-        .register_builtin_transport(tag, transport)
-        .unwrap();
-    }
+    // Caller extensions first, then the explicit default path: the same
+    // order the node builder applies, so a caller override or a
+    // caller-claimed next-hop tag wins over the official entry.
     prepare(&mut extensions);
-    let mut definitions = feature::builtin_definitions().unwrap();
-    definitions.extend(extensions.feature_definitions());
+    extensions.register_default().unwrap();
+    let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
     let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);

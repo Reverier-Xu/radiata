@@ -24,7 +24,9 @@ use super::{
   connection::{Connection, FrameRules},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
-  registry::{Transport, TransportListener, TransportTrust},
+  registry::{
+    Transport, TransportAdmission, TransportCapabilities, TransportListener, TransportTrust,
+  },
   tcp, tls,
 };
 use crate::{
@@ -55,7 +57,12 @@ impl WssTransport {
 }
 
 impl Transport for WssTransport {
+  fn capabilities(&self) -> TransportCapabilities {
+    TransportCapabilities::new(TransportAdmission::PeerAddressed)
+  }
+
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
+    let admission = self.capabilities().admission();
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Wss).await?;
       let config = tls::listener_tls(&SystemEntropy)?;
@@ -68,6 +75,7 @@ impl Transport for WssTransport {
         config,
         rules,
         bound,
+        admission,
       }) as Box<dyn TransportListener>)
     })
   }
@@ -96,6 +104,7 @@ pub(crate) struct WssListener {
   config: Arc<rustls::ServerConfig>,
   rules: FrameRules,
   bound: Endpoint,
+  admission: TransportAdmission,
 }
 
 impl fmt::Debug for WssListener {
@@ -117,6 +126,7 @@ impl TransportListener for WssListener {
   ) -> BoxFuture<'a, Result<Connection>> {
     let config = Arc::clone(&self.config);
     let rules = self.rules;
+    let admission = self.admission;
     let mut shutdown = self.shutdown.clone();
     Box::pin(async move {
       let tcp = tcp::accept(
@@ -129,7 +139,7 @@ impl TransportListener for WssListener {
       // generation is the issuer's current one, not a snapshot from when
       // the listener started blocking.
       let hint = hint();
-      Connection::accept_tls_ws(tcp, config, rules, hint.as_ref()).await
+      Connection::accept_tls_ws(tcp, config, rules, admission, hint.as_ref()).await
     })
   }
 

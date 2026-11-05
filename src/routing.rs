@@ -864,6 +864,138 @@ impl RouteNextHop for DirectRouting {
   }
 }
 
+/// The node-local routing policy map: the next-hop policies and the
+/// stream-level routing policies.
+///
+/// The map is born empty. [`Self::register_default`] installs the core
+/// policies explicitly — the direct stream policy and the default next-hop
+/// policy — and every other entry arrives through an explicit registration
+/// call. A caller registration under the built-in domain stays refused for
+/// routing policies; the default next-hop tag is an ordinary registry tag a
+/// caller may claim before the default path runs.
+pub(crate) struct RoutingRegistry {
+  next_hops: std::sync::RwLock<std::collections::BTreeMap<QualifiedTag, Arc<dyn RouteNextHop>>>,
+  routing_policies:
+    std::sync::RwLock<std::collections::BTreeMap<QualifiedTag, Arc<dyn RouteNextHop>>>,
+}
+
+impl RoutingRegistry {
+  /// The empty routing map: no policy resolves until it is registered
+  /// (explicitly, or through [`Self::register_default`]).
+  pub(crate) fn new() -> Self {
+    Self {
+      next_hops: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+      routing_policies: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+    }
+  }
+
+  /// Installs the core policies under their canonical tags. An
+  /// already-occupied tag (a caller-claimed next-hop tag) is left
+  /// untouched, so the default path never replaces an explicit decision.
+  /// Idempotent.
+  pub(crate) fn register_default(&mut self) -> Result<&mut Self> {
+    let next_hop_tag = DefaultNextHop::tag()?;
+    {
+      let mut policies = self
+        .routing_policies
+        .write()
+        .map_err(Error::extension_registry)?;
+      policies
+        .entry(crate::RoutingPolicy::DIRECT.tag().clone())
+        .or_insert_with(|| Arc::new(DirectRouting));
+    }
+    {
+      let mut next_hops = self.next_hops.write().map_err(Error::extension_registry)?;
+      next_hops
+        .entry(next_hop_tag)
+        .or_insert_with(|| Arc::new(DefaultNextHop));
+    }
+    Ok(self)
+  }
+
+  /// Registers one next-hop policy under a canonical tag. A duplicate tag
+  /// is a conflict; registration never replaces an existing entry.
+  pub(crate) fn register_next_hop(
+    &mut self, tag: QualifiedTag, value: Arc<dyn RouteNextHop>,
+  ) -> Result<&mut Self> {
+    {
+      let mut policies = self.next_hops.write().map_err(Error::extension_registry)?;
+      crate::api::insert_once(&mut policies, tag, value, "next-hop registration")?;
+    }
+    Ok(self)
+  }
+
+  /// Registers one stream-level routing policy under its canonical tag.
+  /// A caller policy lives under a caller-owned domain: the built-in
+  /// domain is reserved for the core direct policy. A duplicate tag is a
+  /// conflict.
+  pub(crate) fn register_routing_policy(
+    &mut self, tag: QualifiedTag, value: Arc<dyn RouteNextHop>,
+  ) -> Result<&mut Self> {
+    if tag.domain() == crate::protocol::tag::BUILTIN_DOMAIN {
+      return Err(Error::invalid_input("routing policy tag"));
+    }
+    {
+      let mut policies = self
+        .routing_policies
+        .write()
+        .map_err(Error::extension_registry)?;
+      crate::api::insert_once(&mut policies, tag, value, "routing policy registration")?;
+    }
+    Ok(self)
+  }
+
+  /// The registered next-hop policy for one tag, when present.
+  pub(crate) fn next_hop_policy(&self, tag: &QualifiedTag) -> Option<Arc<dyn RouteNextHop>> {
+    self
+      .next_hops
+      .read()
+      .ok()
+      .and_then(|policies| policies.get(tag).cloned())
+  }
+
+  /// The registered stream routing policy for one tag, when present.
+  pub(crate) fn routing_policy(&self, tag: &QualifiedTag) -> Option<Arc<dyn RouteNextHop>> {
+    self
+      .routing_policies
+      .read()
+      .ok()
+      .and_then(|policies| policies.get(tag).cloned())
+  }
+
+  pub(crate) fn next_hop_count(&self) -> usize {
+    self
+      .next_hops
+      .read()
+      .map(|policies| policies.len())
+      .unwrap_or(0)
+  }
+
+  pub(crate) fn routing_policy_count(&self) -> usize {
+    self
+      .routing_policies
+      .read()
+      .map(|policies| policies.len())
+      .unwrap_or(0)
+  }
+}
+
+impl Default for RoutingRegistry {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl fmt::Debug for RoutingRegistry {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("RoutingRegistry")
+      .field("next_hops", &self.next_hop_count())
+      .field("routing_policies", &self.routing_policy_count())
+      .finish()
+  }
+}
+
 /// The shared next-hop resolution for the routing plane: resolves the
 /// registered [`RouteNextHop`] policy named by `tag` against the route
 /// view built from `trace`, `destination`, `local`, and the alive
@@ -871,8 +1003,8 @@ impl RouteNextHop for DirectRouting {
 /// callers apply their own observability and fallback; the policy's own
 /// rejection propagates as `Err`.
 pub(crate) async fn resolve_next_hop(
-  registry: &crate::extension_registry::ExtensionRegistry, tag: &QualifiedTag,
-  trace: &crate::TraceId, destination: &NodeId, local: &NodeId, peers: &[NodeId],
+  registry: &RoutingRegistry, tag: &QualifiedTag, trace: &crate::TraceId, destination: &NodeId,
+  local: &NodeId, peers: &[NodeId],
 ) -> Result<Option<NodeId>> {
   let Some(policy) = registry.next_hop_policy(tag) else {
     return Ok(None);

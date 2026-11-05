@@ -29,7 +29,6 @@ use tracing::{debug, warn};
 
 use crate::{
   ErrorKind, NodeId, Result, SessionId, TraceId,
-  extension_registry::ExtensionRegistry,
   packet::{
     AckOutcome,
     wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
@@ -207,8 +206,8 @@ pub(crate) const FORWARDING_ROUTE_CAPACITY_DEFAULT: usize = 8_192;
 pub(crate) async fn open(
   local: &NodeId, peer: &NodeId, source: &SessionIdentity, open: OpenFrame,
   upstream: &BoundedSender, sessions: &SessionTable, forwarding: &ForwardingTable,
-  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, forwarding_capacity: usize,
-  relay_hop_deadline: Duration,
+  registry: &crate::routing::RoutingRegistry, route_policy: &crate::QualifiedTag,
+  forwarding_capacity: usize, relay_hop_deadline: Duration,
 ) -> bool {
   let envelope = crate::routing::RouteContext::from_frame(
     open.trace_id.clone(),
@@ -715,15 +714,15 @@ pub(crate) async fn on_downstream_failure(
 }
 
 async fn select_next_hop(
-  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, trace: &TraceId,
+  registry: &crate::routing::RoutingRegistry, route_policy: &crate::QualifiedTag, trace: &TraceId,
   destination: &NodeId, local: &NodeId, peers: &[NodeId],
 ) -> Result<NodeId> {
   if peers.contains(destination) {
     return Ok(destination.clone());
   }
-  // A tag naming no registered policy fails closed: with the builder's
-  // built-in registration this only happens for a caller tag that was
-  // never registered on this node.
+  // A tag naming no registered policy fails closed: with the default
+  // registration this only happens for a caller tag that was never
+  // registered on this node.
   let hop =
     crate::routing::resolve_next_hop(registry, route_policy, trace, destination, local, peers)
       .await?

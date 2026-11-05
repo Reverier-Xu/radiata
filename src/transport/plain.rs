@@ -25,7 +25,9 @@ use super::{
   connection::{Connection, FrameRules, plaintext_channel_binding},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
-  registry::{Transport, TransportListener, TransportTrust},
+  registry::{
+    Transport, TransportAdmission, TransportCapabilities, TransportListener, TransportTrust,
+  },
   tcp,
 };
 use crate::{
@@ -54,7 +56,12 @@ impl PlainTransport {
 }
 
 impl Transport for PlainTransport {
+  fn capabilities(&self) -> TransportCapabilities {
+    TransportCapabilities::new(TransportAdmission::PeerAddressed)
+  }
+
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
+    let admission = self.capabilities().admission();
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Tcp).await?;
       let rules = connection_frame_rules()?;
@@ -65,6 +72,7 @@ impl Transport for PlainTransport {
         shutdown: shutdown_rx,
         rules,
         bound,
+        admission,
       }) as Box<dyn TransportListener>)
     })
   }
@@ -102,6 +110,7 @@ pub(crate) struct PlainListener {
   shutdown: tokio::sync::watch::Receiver<()>,
   rules: FrameRules,
   bound: Endpoint,
+  admission: TransportAdmission,
 }
 
 impl fmt::Debug for PlainListener {
@@ -142,7 +151,7 @@ impl TransportListener for PlainListener {
         channel_binding,
         rules,
         peer_addr,
-        true,
+        self.admission,
         hint.as_ref(),
       )
       .await

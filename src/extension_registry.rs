@@ -4,18 +4,22 @@
 //! to the [`PacketConsumer`] that receives admitted incoming streams for
 //! that protocol tag, alongside caller registration of feature
 //! definitions, load-balancing policies, and next-hop routing policies,
-//! and caller registration of transport providers. The runtime seeds the
-//! built-in transports and core protocols at startup through the same
-//! registry: it is the single map from endpoint selector to transport.
+//! and caller registration of transport providers. The registry is born
+//! empty: [`ExtensionRegistry::register_default`] installs the official
+//! transports, the core routing policies, and the core feature definitions
+//! explicitly, and the node builder calls it by default. Core protocol
+//! consumers register at runtime through `register_core_protocol` once the
+//! runtime context exists.
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{
-  Error, FeatureTag, IncomingStream, ProtocolTag, Result, TransportTag,
-  api::BoxFuture,
+  Error, FeatureTag, IncomingStream, ProtocolTag, Result,
+  api::{BoxFuture, insert_once},
+  routing::RoutingRegistry,
   transport::{
-    TransportScheme, TransportSelector,
-    registry::{Transport, TransportProvider, TransportProviderAdapter, builtin_transport_tag},
+    TransportName, TransportProvider, TransportScheme, TransportSelector,
+    registry::{Transport, TransportRegistry},
   },
 };
 
@@ -63,44 +67,31 @@ pub(crate) struct ProtocolRegistration {
 pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,
   protocols: std::sync::RwLock<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
-  transports: BTreeMap<TransportTag, Arc<dyn Transport>>,
-  /// The caller-registered transport providers, keyed by the scheme name
-  /// (protocol prefix) each one owns.
-  schemes: BTreeMap<crate::transport::TransportName, Arc<dyn Transport>>,
+  /// The transport map: its own registry owns selector resolution,
+  /// official defaults, and caller registrations.
+  transports: TransportRegistry,
+  /// The routing map: its own registry owns the next-hop and stream
+  /// routing policies, including the core defaults.
+  routing: RoutingRegistry,
   load_balancers:
     std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
-  next_hops: std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
-  /// The stream-level routing policies, keyed by the stream's
-  /// [`crate::RoutingPolicy`] tag: the built-in direct policy is seeded
-  /// here and a caller registers its own through
-  /// [`ExtensionRegistry::register_routing_policy`].
-  routing_policies: std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
   resource_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ResourceHook>>>,
   action_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ActionHook>>>,
   task_reconcilers: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::TaskReconciler>>>,
 }
 
 impl Default for ExtensionRegistry {
-  /// The empty registry with the built-in routing policies seeded: the
-  /// direct policy is always resolvable, so a stream under
-  /// [`crate::RoutingPolicy::DIRECT`] never depends on a caller
-  /// registration. Caller registrations under the built-in domain are
-  /// refused, so the seeded entry cannot be shadowed.
+  /// The empty registry: every official and caller entry is registered
+  /// explicitly. [`ExtensionRegistry::register_default`] installs the
+  /// official transports, the core routing policies, and the core feature
+  /// definitions; the node builder calls it by default.
   fn default() -> Self {
-    let mut routing_policies: BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>> =
-      BTreeMap::new();
-    routing_policies.insert(
-      crate::RoutingPolicy::DIRECT.tag().clone(),
-      Arc::new(crate::routing::DirectRouting),
-    );
     Self {
       features: std::sync::Mutex::new(BTreeMap::new()),
       protocols: std::sync::RwLock::new(BTreeMap::new()),
-      transports: BTreeMap::new(),
-      schemes: BTreeMap::new(),
+      transports: TransportRegistry::new(),
+      routing: RoutingRegistry::new(),
       load_balancers: std::sync::RwLock::new(BTreeMap::new()),
-      next_hops: std::sync::RwLock::new(BTreeMap::new()),
-      routing_policies: std::sync::RwLock::new(routing_policies),
       resource_hooks: std::sync::Mutex::new(BTreeMap::new()),
       action_hooks: std::sync::Mutex::new(BTreeMap::new()),
       task_reconcilers: std::sync::Mutex::new(BTreeMap::new()),
@@ -113,12 +104,41 @@ impl ExtensionRegistry {
     Self::default()
   }
 
+  /// Installs the official transports, the core routing policies, and the
+  /// core feature definitions explicitly. The node builder calls this by
+  /// default, so an ordinary node keeps resolving every official scheme and
+  /// feature; a caller that builds its own registry sees exactly what it
+  /// registered. Idempotent: an entry already present (a caller override, a
+  /// caller-claimed next-hop tag) is left untouched.
+  pub fn register_default(&mut self) -> Result<&mut Self> {
+    self.transports.register_default()?;
+    self.routing.register_default()?;
+    for definition in crate::protocol::feature::builtin_definitions()? {
+      self.register_core_feature(definition)?;
+    }
+    Ok(self)
+  }
+
+  /// Registers one core (runtime-owned) feature definition. Crate-private:
+  /// the default path owns the official definitions, and a caller
+  /// registration under the built-in domain stays refused.
+  pub(crate) fn register_core_feature(&mut self, value: crate::FeatureDefinition) -> Result<()> {
+    let mut features = self.features.lock().map_err(Error::extension_registry)?;
+    features.entry(value.tag().clone()).or_insert(value);
+    Ok(())
+  }
+
   /// Registers one caller-defined feature: the definition's
   /// contract fingerprint joins the node's negotiation registry, so its
   /// exact digest is offered and intersected at handshake time. A
-  /// duplicate tag is a conflict; the built-in domain is reserved (the
-  /// definition constructor already refuses it).
+  /// duplicate tag is a conflict; the built-in domain stays reserved for
+  /// the official definitions the default path installs.
   pub fn register_feature(&mut self, value: crate::FeatureDefinition) -> Result<&mut Self> {
+    if value.tag().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
+      return Err(Error::invalid_input(
+        "feature definition reserved namespace",
+      ));
+    }
     {
       let mut features = self.features.lock().map_err(Error::extension_registry)?;
       insert_once(
@@ -131,7 +151,9 @@ impl ExtensionRegistry {
     Ok(self)
   }
 
-  /// The caller-registered feature definitions in canonical tag order.
+  /// The registered feature definitions in canonical tag order: the
+  /// official definitions installed by [`ExtensionRegistry::register_default`]
+  /// and every caller registration.
   pub(crate) fn feature_definitions(&self) -> Vec<crate::FeatureDefinition> {
     self
       .features
@@ -141,31 +163,25 @@ impl ExtensionRegistry {
   }
 
   /// The exact negotiation digest of one feature tag (the digest offered
-  /// and intersected at handshake time): the caller-registered definition
-  /// wins, then the built-in registry.
+  /// and intersected at handshake time): the registered definition, with
+  /// no hidden official fallback.
   pub(crate) fn feature_digest(&self, tag: &crate::FeatureTag) -> Option<crate::Digest> {
-    let definition = self
+    self
       .features
       .lock()
       .ok()
       .and_then(|features| features.get(tag).cloned())
-      .or_else(|| {
-        crate::protocol::feature::FeatureRegistry::builtin()
-          .ok()?
-          .get(tag)
-          .cloned()
-      });
-    definition.and_then(|definition| definition.definition_digest().ok())
+      .and_then(|definition| definition.definition_digest().ok())
   }
 
   /// Registers one caller-defined transport under its addressing scheme
   /// name (the protocol prefix of the custom endpoint form
   /// `<name>://<opaque>`). The name is unique per node: a duplicate, a
   /// reserved name, or any other conflict is rejected before use. The
-  /// built-in transports are seeded by the runtime under their own
-  /// schemes and cannot be shadowed from here; replacing a built-in is
-  /// the explicit [`ExtensionRegistry::override_builtin_transport`]
-  /// decision instead.
+  /// official transports are installed by
+  /// [`ExtensionRegistry::register_default`] under their own schemes and cannot
+  /// be shadowed from here; replacing one is the explicit
+  /// [`ExtensionRegistry::override_builtin_transport`] decision instead.
   ///
   /// This is the public extension surface of the transport layer: the
   /// registry is the single map from endpoint selector to transport,
@@ -175,26 +191,22 @@ impl ExtensionRegistry {
   /// identically, and a mismatch fails at the session handshake's
   /// identity proofs rather than silently.
   pub fn register_transport(
-    &mut self, name: crate::transport::TransportName, transport: Arc<dyn TransportProvider>,
+    &mut self, name: TransportName, transport: Arc<dyn TransportProvider>,
   ) -> Result<&mut Self> {
-    let adapter = Arc::new(TransportProviderAdapter::new(
-      Arc::clone(&transport),
-      name.clone(),
-    )?);
-    insert_once(&mut self.schemes, name, adapter, "transport registration")?;
+    self.transports.register_transport(name, transport)?;
     Ok(self)
   }
 
-  /// Explicitly replaces one built-in transport with a caller-defined
+  /// Explicitly replaces one official transport with a caller-defined
   /// implementation: from now on every dial and listen addressed to the
-  /// built-in form of `scheme` (`tls://`, `wss://`, or `tcp://`)
-  /// resolves to `transport`. The runtime seeds a built-in only when its
-  /// selector is still free, so an override installed before the node
-  /// starts wins wholesale — no built-in transport participates behind
-  /// the selector, and no built-in code path special-cases the
-  /// replacement.
+  /// official form of `scheme` (`tls://`, `wss://`, or `tcp://`)
+  /// resolves to `transport`. The default path installs an official
+  /// transport only when its selector is still free, so an override
+  /// installed before the node starts wins wholesale — no official
+  /// transport participates behind the selector, and no transport code
+  /// path special-cases the replacement.
   ///
-  /// The override serves the dial intents the built-in selector
+  /// The override serves the dial intents the official selector
   /// produces: a `tls://` or `wss://` override receives the merge trust
   /// intent a TLS class dials with, a `tcp://` override receives the
   /// plaintext intent. The provider medium receives no trust intent
@@ -202,45 +214,38 @@ impl ExtensionRegistry {
   /// plaintext-class contract every transport provider carries — and
   /// the session handshake's identity proofs authenticate both
   /// endpoints over the replacement channel. The channel binding derives
-  /// from the built-in selector's canonical tag, so proofs over the
-  /// override stay distinct from the replaced built-in and from every
-  /// custom name; the binding is node-local, and endpoints exchanged
+  /// from the official selector's canonical tag, so proofs over the
+  /// override stay distinct from the replaced official transport and from
+  /// every custom name; the binding is node-local, and endpoints exchanged
   /// across nodes assume both sides bound the selector identically (a
   /// mismatch fails at the handshake's identity proofs, never silently).
   ///
   /// One override per selector: a scheme already overridden is a
   /// conflict, rejected before use. The existing custom-name contract is
-  /// untouched — a built-in selector never becomes a custom
+  /// untouched — an official selector never becomes a custom
   /// [`crate::TransportName`], and [`ExtensionRegistry::register_transport`]
   /// keeps its own namespace.
   pub fn override_builtin_transport(
     &mut self, scheme: TransportScheme, transport: Arc<dyn TransportProvider>,
   ) -> Result<&mut Self> {
-    let tag = builtin_transport_tag(scheme)?;
-    let adapter = Arc::new(TransportProviderAdapter::override_builtin(
-      transport, scheme,
-    )?);
-    insert_once(
-      &mut self.transports,
-      tag,
-      adapter,
-      "built-in transport override",
-    )?;
+    self
+      .transports
+      .override_builtin_transport(scheme, transport)?;
     Ok(self)
   }
 
-  /// Registers one built-in transport implementation under its canonical
-  /// tag. Crate-private: only the runtime seeds built-ins, and only when
-  /// the tag is still free.
+  /// Registers one official transport implementation under its canonical
+  /// tag. Test-only: the default path owns the official map in production.
+  #[cfg(test)]
   pub(crate) fn register_builtin_transport(
-    &mut self, tag: TransportTag, value: Arc<dyn Transport>,
+    &mut self, tag: crate::TransportTag, value: Arc<dyn Transport>,
   ) -> Result<&mut Self> {
-    insert_once(&mut self.transports, tag, value, "transport registration")?;
+    self.transports.register_builtin_transport(tag, value)?;
     Ok(self)
   }
 
   /// Resolves one endpoint's transport selector through the map: the
-  /// built-in transports and every caller-registered transport provider
+  /// official transports and every caller-registered transport provider
   /// merge into one resolution namespace, and a selector that resolves
   /// to nothing fails typed here — at dial or listen time, never at
   /// parse time (endpoint parsing is purely syntactic and
@@ -248,25 +253,19 @@ impl ExtensionRegistry {
   pub(crate) fn resolve_transport(
     &self, selector: &TransportSelector,
   ) -> Result<Arc<dyn Transport>> {
-    match selector {
-      TransportSelector::Builtin(scheme) => {
-        let tag = builtin_transport_tag(*scheme)?;
-        self
-          .transport(&tag)
-          .cloned()
-          .ok_or_else(|| Error::not_found("transport"))
-      }
-      TransportSelector::Custom(name) => self
-        .schemes
-        .get(name)
-        .cloned()
-        .ok_or_else(|| Error::not_found("transport")),
-    }
+    self.transports.resolve_transport(selector)
   }
 
-  /// The registered transport for one tag.
-  pub(crate) fn transport(&self, tag: &TransportTag) -> Option<&Arc<dyn Transport>> {
-    self.transports.get(tag)
+  /// The registered transport for one tag. Test-only: production resolves
+  /// through [`Self::resolve_transport`].
+  #[cfg(test)]
+  pub(crate) fn transport(&self, tag: &crate::TransportTag) -> Option<&Arc<dyn Transport>> {
+    self.transports.transport(tag)
+  }
+
+  /// The routing map: next-hop and stream routing policy resolution.
+  pub(crate) fn routing(&self) -> &RoutingRegistry {
+    &self.routing
   }
 
   /// Registers one load-balancing policy under a canonical tag. A
@@ -313,22 +312,17 @@ impl ExtensionRegistry {
   pub fn register_next_hop(
     &mut self, tag: crate::QualifiedTag, value: Arc<dyn crate::RouteNextHop>,
   ) -> Result<&mut Self> {
-    {
-      let mut policies = self.next_hops.write().map_err(Error::extension_registry)?;
-      insert_once(&mut policies, tag, value, "next-hop registration")?;
-    }
+    self.routing.register_next_hop(tag, value)?;
     Ok(self)
   }
 
-  /// The registered next-hop policy for one tag, when present.
+  /// The registered next-hop policy for one tag, when present. Test-only:
+  /// production resolution goes through [`Self::routing`].
+  #[cfg(test)]
   pub(crate) fn next_hop_policy(
     &self, tag: &crate::QualifiedTag,
   ) -> Option<Arc<dyn crate::RouteNextHop>> {
-    self
-      .next_hops
-      .read()
-      .ok()
-      .and_then(|policies| policies.get(tag).cloned())
+    self.routing.next_hop_policy(tag)
   }
 
   /// Registers one stream-level routing policy under the stream's
@@ -336,22 +330,13 @@ impl ExtensionRegistry {
   /// implementation selects the next hop for every stream carrying that
   /// policy. A duplicate tag is a conflict; registration never replaces
   /// an existing entry. The built-in `radiata.woooo.tech` domain is
-  /// reserved — the built-in direct policy is seeded there and cannot be
-  /// shadowed — so a caller policy registers under a caller-owned
-  /// domain.
+  /// reserved — the core direct policy is installed there by the default
+  /// path and cannot be shadowed — so a caller policy registers under a
+  /// caller-owned domain.
   pub fn register_routing_policy(
     &mut self, tag: crate::QualifiedTag, value: Arc<dyn crate::RouteNextHop>,
   ) -> Result<&mut Self> {
-    if tag.domain() == crate::protocol::tag::BUILTIN_DOMAIN {
-      return Err(Error::invalid_input("routing policy tag"));
-    }
-    {
-      let mut policies = self
-        .routing_policies
-        .write()
-        .map_err(Error::extension_registry)?;
-      insert_once(&mut policies, tag, value, "routing policy registration")?;
-    }
+    self.routing.register_routing_policy(tag, value)?;
     Ok(self)
   }
 
@@ -361,11 +346,7 @@ impl ExtensionRegistry {
   pub(crate) fn routing_policy(
     &self, tag: &crate::QualifiedTag,
   ) -> Option<Arc<dyn crate::RouteNextHop>> {
-    self
-      .routing_policies
-      .read()
-      .ok()
-      .and_then(|policies| policies.get(tag).cloned())
+    self.routing.routing_policy(tag)
   }
 
   /// Registers one resource-write hook under a canonical tag. All hooks
@@ -536,22 +517,8 @@ impl fmt::Debug for ExtensionRegistry {
           .map(|balancers| balancers.len())
           .unwrap_or(0),
       )
-      .field(
-        "next_hops",
-        &self
-          .next_hops
-          .read()
-          .map(|policies| policies.len())
-          .unwrap_or(0),
-      )
-      .field(
-        "routing_policies",
-        &self
-          .routing_policies
-          .read()
-          .map(|policies| policies.len())
-          .unwrap_or(0),
-      )
+      .field("next_hops", &self.routing.next_hop_count())
+      .field("routing_policies", &self.routing.routing_policy_count())
       .field(
         "resource_hooks",
         &self
@@ -580,27 +547,15 @@ impl fmt::Debug for ExtensionRegistry {
   }
 }
 
-/// Inserts `value` only when `tag` is absent; a duplicate is a typed
-/// conflict. The single insertion-once rule for every registry map.
-fn insert_once<K: Ord, V>(
-  map: &mut std::collections::BTreeMap<K, V>, tag: K, value: V, context: &'static str,
-) -> Result<()> {
-  use std::collections::btree_map::Entry;
-  match map.entry(tag) {
-    Entry::Occupied(_) => Err(Error::conflict(context)),
-    Entry::Vacant(slot) => {
-      slot.insert(value);
-      Ok(())
-    }
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
 
   use super::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
-  use crate::{ErrorKind, FeatureTag, IncomingStream, ProtocolTag, Result, api::BoxFuture};
+  use crate::{
+    Digest, ErrorKind, FeatureDefinition, FeatureTag, IncomingStream, ProtocolTag, Result,
+    api::BoxFuture,
+  };
 
   #[derive(Debug)]
   struct NoopConsumer;
@@ -649,6 +604,38 @@ mod tests {
       ProtocolTag::parse(&format!("radiata.woooo.tech/protocols/{name}")).unwrap(),
       FeatureTag::parse("radiata.woooo.tech/features/data-messages").unwrap(),
     )
+  }
+
+  #[test]
+  fn register_default_installs_official_features_and_refuses_caller_builtin_definitions() {
+    let mut registry = ExtensionRegistry::new();
+    assert!(registry.feature_definitions().is_empty());
+    registry.register_default().unwrap();
+    assert_eq!(
+      registry.feature_definitions().len(),
+      crate::protocol::feature::builtin_definitions()
+        .unwrap()
+        .len(),
+      "the default path installs every official feature definition"
+    );
+
+    let builtin = FeatureDefinition::new(
+      FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
+      Digest::from_bytes([7; 32]),
+    )
+    .unwrap();
+    let refused = registry.register_feature(builtin).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(refused.context(), "feature definition reserved namespace");
+
+    // Idempotent: a second default pass keeps exactly the official set.
+    registry.register_default().unwrap();
+    assert_eq!(
+      registry.feature_definitions().len(),
+      crate::protocol::feature::builtin_definitions()
+        .unwrap()
+        .len()
+    );
   }
 
   #[test]
@@ -845,19 +832,26 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::Conflict);
   }
 
-  /// The routing-policy registry is born with the built-in direct policy
-  /// and follows the other registries' rules: the built-in domain is
-  /// reserved (the direct tag cannot be shadowed), a caller policy
-  /// registers under a caller-owned domain, and a duplicate tag stays a
-  /// conflict.
+  /// The routing-policy registry starts empty, the explicit default path
+  /// installs the core direct policy, and the other rules hold: the
+  /// built-in domain is reserved (the direct tag cannot be shadowed), a
+  /// caller policy registers under a caller-owned domain, and a duplicate
+  /// tag stays a conflict.
   #[test]
-  fn routing_policy_registry_seeds_direct_and_reserves_the_builtin_domain() {
+  fn routing_policy_registry_defaults_direct_and_reserves_the_builtin_domain() {
     let mut registry = ExtensionRegistry::new();
     assert!(
       registry
         .routing_policy(crate::RoutingPolicy::DIRECT.tag())
+        .is_none(),
+      "a fresh registry holds no hidden direct policy"
+    );
+    registry.register_default().unwrap();
+    assert!(
+      registry
+        .routing_policy(crate::RoutingPolicy::DIRECT.tag())
         .is_some(),
-      "the built-in direct policy is always resolvable"
+      "the default path installs the direct policy"
     );
 
     let reserved = registry
@@ -880,7 +874,7 @@ mod tests {
     assert_eq!(duplicate.kind(), ErrorKind::Conflict);
     assert!(
       format!("{registry:?}").contains("routing_policies: 2"),
-      "the debug summary counts the seeded and caller policies"
+      "the debug summary counts the default and caller policies"
     );
   }
 }

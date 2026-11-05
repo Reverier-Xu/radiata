@@ -23,7 +23,9 @@ use super::{
   connection::{Connection, FrameRules, exporter_channel_binding, tls_handshake_error},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
-  registry::{Transport, TransportListener, TransportTrust},
+  registry::{
+    Transport, TransportAdmission, TransportCapabilities, TransportListener, TransportTrust,
+  },
   tcp, tls,
 };
 use crate::{
@@ -54,7 +56,12 @@ impl TlsTransport {
 }
 
 impl Transport for TlsTransport {
+  fn capabilities(&self) -> TransportCapabilities {
+    TransportCapabilities::new(TransportAdmission::PeerAddressed)
+  }
+
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
+    let admission = self.capabilities().admission();
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Tls).await?;
       let config = tls::listener_tls(&SystemEntropy)?;
@@ -67,6 +74,7 @@ impl Transport for TlsTransport {
         acceptor: TlsAcceptor::from(config),
         rules,
         bound,
+        admission,
       }) as Box<dyn TransportListener>)
     })
   }
@@ -113,6 +121,7 @@ pub(crate) struct TlsListener {
   acceptor: TlsAcceptor,
   rules: FrameRules,
   bound: Endpoint,
+  admission: TransportAdmission,
 }
 
 impl fmt::Debug for TlsListener {
@@ -157,7 +166,7 @@ impl TransportListener for TlsListener {
         channel_binding,
         rules,
         peer_addr,
-        true,
+        self.admission,
         hint.as_ref(),
       )
       .await

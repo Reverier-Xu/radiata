@@ -2,15 +2,21 @@
 //! transport implementation.
 //!
 //! A registered [`Transport`] owns the listener/connection lifecycle for
-//! one addressing selector; the map merges the three built-in
-//! transports (direct TLS, WebSocket, plaintext TCP) with every
-//! caller-registered transport provider, and a dial or bind resolves its
-//! implementation from the endpoint's
-//! [`TransportSelector`](crate::transport::TransportSelector) alone — the
-//! URL scheme for built-ins, the registered scheme name for customs.
-//! Core retains authentication and stream safety: a transport only
-//! carries prelude frames, the session handshake always authenticates,
-//! and registration never bypasses either.
+//! one addressing selector; the map merges the official transports
+//! (direct TLS, WebSocket, plaintext TCP) with every caller-registered
+//! transport provider, and a dial or bind resolves its implementation
+//! from the endpoint's
+//! [`TransportSelector`](crate::transport::TransportSelector) alone — the URL
+//! scheme for official transports, the registered scheme name for customs. Core
+//! retains authentication and stream safety: a transport only carries prelude
+//! frames, the session handshake always authenticates, and registration never
+//! bypasses either.
+//!
+//! The registry itself holds no hidden entries: [`TransportRegistry::new`]
+//! starts empty and [`TransportRegistry::register_default`] installs the
+//! official transports explicitly. The node builder calls the default
+//! path, so an ordinary node still resolves every official scheme, while
+//! a caller that builds its own registry sees exactly what it registered.
 //!
 //! ## Writing a transport provider
 //!
@@ -40,29 +46,29 @@
 //!   inside the stream implementation); core never assumes it.
 //!
 //! A provider registers under an addressing scheme name it owns
-//! (`ExtensionRegistry::register_transport`), or replaces a built-in
+//! (`ExtensionRegistry::register_transport`), or replaces an official
 //! transport outright (`ExtensionRegistry::override_builtin_transport`):
-//! an override serves the built-in selector's addresses and trust
-//! intents, and the runtime seeds the built-in only when the selector is
-//! still free.
+//! an override serves the official selector's addresses and trust
+//! intents, and the default registration seeds the official transport
+//! only when the selector is still free.
 //!
-//! The built-in WSS transport is registered by default alongside the
-//! direct-TLS default and the plaintext TCP transport; see the
+//! The official WSS transport is registered by the default path alongside
+//! the direct-TLS default and the plaintext TCP transport; see the
 //! individual modules for when each applies.
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, net::SocketAddr, sync::Arc};
 
 use crate::{
   Endpoint, Error, Result, TransportTag,
-  api::BoxFuture,
+  api::{BoxFuture, insert_once},
   protocol::wire::connection_frame_rules,
   transport::{
     connection::Connection,
     endpoint::TransportScheme,
     framing::{MergeHint, shared_write},
-    plain::BUILTIN_TRANSPORT_TCP,
-    tls_transport::BUILTIN_TRANSPORT_TLS,
-    wss::BUILTIN_TRANSPORT_WSS,
+    plain::{BUILTIN_TRANSPORT_TCP, PlainTransport},
+    tls_transport::{BUILTIN_TRANSPORT_TLS, TlsTransport},
+    wss::{BUILTIN_TRANSPORT_WSS, WssTransport},
   },
 };
 
@@ -125,8 +131,87 @@ impl TransportTrust {
   }
 }
 
+/// How one transport attributes accepted connections to peers.
+///
+/// The admission plane consumes this declaration: a peer-addressed medium
+/// charges each accepted connection to its peer address and fails closed
+/// when the address is missing, while an addressless medium shares one
+/// bucket per transport class. Official and caller-defined transports
+/// declare the same value, so neither class carries a hidden privilege.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportAdmission {
+  /// The medium reports every accepted peer's address; a missing address
+  /// is a transport fault and fails admission closed.
+  PeerAddressed,
+  /// The medium cannot attribute accepted connections to peers; the
+  /// accepted sessions share one bucket derived from the transport's
+  /// class channel binding.
+  Addressless,
+}
+
+/// The declared capabilities of one transport or transport provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportCapabilities {
+  admission: TransportAdmission,
+}
+
+impl TransportCapabilities {
+  /// Declares one admission state.
+  pub const fn new(admission: TransportAdmission) -> Self {
+    Self { admission }
+  }
+
+  /// The admission state this transport declares.
+  pub const fn admission(self) -> TransportAdmission {
+    self.admission
+  }
+}
+
+impl Default for TransportCapabilities {
+  /// The provider default: a caller-defined medium carries no peer
+  /// addressing unless it declares otherwise.
+  fn default() -> Self {
+    Self::new(TransportAdmission::Addressless)
+  }
+}
+
+/// One accepted inbound stream plus the peer address the medium
+/// attributes it to.
+///
+/// A provider whose [`TransportProvider::capabilities`] declares
+/// [`TransportAdmission::PeerAddressed`] returns [`AcceptedStream::with_peer`];
+/// an addressless provider returns [`AcceptedStream::new`]. The adapter
+/// enforces the declaration: a peer-addressed medium that reports no
+/// address fails admission closed exactly like an official transport
+/// whose kernel accept could not report one.
+#[derive(Debug)]
+pub struct AcceptedStream {
+  stream: Box<dyn TransportStream>,
+  peer: Option<SocketAddr>,
+}
+
+impl AcceptedStream {
+  /// Wraps one accepted stream from an addressless medium.
+  pub fn new(stream: Box<dyn TransportStream>) -> Self {
+    Self { stream, peer: None }
+  }
+
+  /// Wraps one accepted stream and the peer address the medium
+  /// attributes it to.
+  pub fn with_peer(stream: Box<dyn TransportStream>, peer: SocketAddr) -> Self {
+    Self {
+      stream,
+      peer: Some(peer),
+    }
+  }
+
+  pub(crate) fn into_parts(self) -> (Box<dyn TransportStream>, Option<SocketAddr>) {
+    (self.stream, self.peer)
+  }
+}
+
 /// A framed session stream produced by a registered [`Transport`]. The
-/// boundary is intentionally concrete: exactly one built-in wire format
+/// boundary is intentionally concrete: exactly one wire format
 /// exists today and the session handshake drives this type directly; a
 /// second format generalizes behind this same trait.
 pub(crate) trait TransportListener: fmt::Debug + Send + Sync + 'static {
@@ -157,11 +242,16 @@ pub(crate) trait TransportListener: fmt::Debug + Send + Sync + 'static {
 /// crate's framed [`Connection`]; every dial and bind flows through this
 /// boundary, so configured attempts are observable and bounded here.
 ///
-/// This is the internal boundary: the built-in transports implement it
+/// This is the internal boundary: the official transports implement it
 /// directly, and every caller-registered [`TransportProvider`] is wrapped
 /// into it by [`TransportProviderAdapter`]. Callers never implement this
 /// trait; the public extension surface is [`TransportProvider`].
 pub(crate) trait Transport: fmt::Debug + Send + Sync + 'static {
+  /// The capabilities this transport declares: its admission state and
+  /// any future transport-level declaration. Official transports declare
+  /// the same value a caller-defined provider can.
+  fn capabilities(&self) -> TransportCapabilities;
+
   /// Binds one listener at `endpoint`.
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>>;
 
@@ -192,8 +282,11 @@ pub trait ProviderListener: fmt::Debug + Send + Sync + 'static {
   fn local_endpoint(&self) -> Endpoint;
 
   /// Accepts the next inbound stream. A pending accept should observe
-  /// [`Self::close`] and fail promptly with the shutdown error.
-  fn accept(&self) -> BoxFuture<'_, Result<Box<dyn TransportStream>>>;
+  /// [`Self::close`] and fail promptly with the shutdown error. The
+  /// returned [`AcceptedStream`] carries the peer address when the
+  /// provider's declared admission state is
+  /// [`TransportAdmission::PeerAddressed`].
+  fn accept(&self) -> BoxFuture<'_, Result<AcceptedStream>>;
 
   /// Signals shutdown; the medium's own resources release when the
   /// listener is dropped.
@@ -203,18 +296,18 @@ pub trait ProviderListener: fmt::Debug + Send + Sync + 'static {
 /// A caller-defined transport for one medium: the public extension
 /// surface of the crate's transport layer.
 ///
-/// Implement this trait to bridge a medium the built-ins do not cover —
-/// an ESP-NOW radio, an 802.11 link, a serial bus, a tunneled socket —
-/// and register it under an addressing scheme name you own
+/// Implement this trait to bridge a medium the official transports do not
+/// cover — an ESP-NOW radio, an 802.11 link, a serial bus, a tunneled
+/// socket — and register it under an addressing scheme name you own
 /// (`ExtensionRegistry::register_transport`), or as an explicit
-/// replacement of one built-in transport
+/// replacement of one official transport
 /// (`ExtensionRegistry::override_builtin_transport`), which serves the
-/// built-in selector's addresses and dial intents instead. A custom
+/// official selector's addresses and dial intents instead. A custom
 /// name is addressed with the canonical custom form
 /// `<name>://<opaque-address>`, where the opaque address grammar is
 /// yours: the endpoint hands it to you verbatim through
 /// [`TransportProvider::connect`] and [`ProviderListener::local_endpoint`].
-/// A built-in override is addressed with the replaced built-in's
+/// An official override is addressed with the replaced selector's
 /// canonical form (`tls://`, `wss://`, or `tcp://`), and the host and
 /// port are yours to interpret the same way.
 ///
@@ -225,6 +318,16 @@ pub trait ProviderListener: fmt::Debug + Send + Sync + 'static {
 /// ordered, reliable, and complete, and your medium contributes no
 /// confidentiality unless you add it.
 pub trait TransportProvider: fmt::Debug + Send + Sync + 'static {
+  /// The capabilities this provider declares. The default is an
+  /// addressless medium: accepted sessions share one per-class bucket.
+  /// A medium that attributes connections to peer addresses declares
+  /// [`TransportAdmission::PeerAddressed`] and returns the address from
+  /// [`ProviderListener::accept`]; a missing address then fails admission
+  /// closed, exactly like an official transport.
+  fn capabilities(&self) -> TransportCapabilities {
+    TransportCapabilities::default()
+  }
+
   /// Binds one listener at `endpoint`. The endpoint's opaque address is
   /// yours to interpret; report the real dialable form from the
   /// listener's `local_endpoint` after a wildcard-style bind resolves
@@ -243,14 +346,18 @@ pub trait TransportProvider: fmt::Debug + Send + Sync + 'static {
 pub(crate) struct TransportProviderAdapter {
   inner: Arc<dyn TransportProvider>,
   /// The addressing selector this adapter serves: the canonical scheme
-  /// name of a custom registration or the canonical tag of a built-in
+  /// name of a custom registration or the canonical tag of an official
   /// override. It labels diagnostics and derives the channel binding.
   selector: String,
   binding: [u8; crate::transport::connection::CHANNEL_BINDING_LEN],
-  /// Whether the served selector is a built-in TLS class (`tls://` or
+  /// The provider's declared capabilities, carried unchanged into the
+  /// internal [`Transport`] boundary so the admission plane reads one
+  /// declaration for official and caller-defined transports alike.
+  capabilities: TransportCapabilities,
+  /// Whether the served selector is an official TLS class (`tls://` or
   /// `wss://`), whose dials arrive with the merge trust intent. A
-  /// custom-name registration serves plaintext-class dials only; a
-  /// built-in override serves its selector's intents: the provider
+  /// custom-name registration serves plaintext-class dials only; an
+  /// official override serves its selector's intents: the provider
   /// medium owns its own wire security, and the session handshake's
   /// identity proofs carry authentication either way. A mismatched
   /// intent is a caller bug in both directions and fails typed.
@@ -275,29 +382,33 @@ impl TransportProviderAdapter {
     inner: Arc<dyn TransportProvider>, name: crate::transport::TransportName,
   ) -> Result<Self> {
     let binding = crate::transport::connection::custom_channel_binding(name.as_str())?;
+    let capabilities = inner.capabilities();
     Ok(Self {
       inner,
       selector: name.as_str().to_owned(),
       binding,
+      capabilities,
       accepts_tls_intents: false,
     })
   }
 
   /// Wraps one transport provider as an explicit replacement of the
-  /// built-in transport under `scheme`'s selector. The channel binding
-  /// derives from the canonical built-in tag, so a session over the
+  /// official transport under `scheme`'s selector. The channel binding
+  /// derives from the canonical official tag, so a session over the
   /// override salts its proofs with a class constant distinct from the
-  /// replaced built-in (whose TLS classes export a per-session binding)
-  /// and from every custom name.
+  /// replaced official transport (whose TLS classes export a per-session
+  /// binding) and from every custom name.
   pub(crate) fn override_builtin(
     inner: Arc<dyn TransportProvider>, scheme: TransportScheme,
   ) -> Result<Self> {
     let tag = builtin_transport_tag(scheme)?;
     let binding = crate::transport::connection::custom_channel_binding(tag.as_str())?;
+    let capabilities = inner.capabilities();
     Ok(Self {
       inner,
       selector: tag.as_str().to_owned(),
       binding,
+      capabilities,
       // The override serves exactly the intents its selector produces:
       // the TLS classes dial with merge trust, `tcp://` dials with
       // plaintext trust.
@@ -307,14 +418,20 @@ impl TransportProviderAdapter {
 }
 
 impl Transport for TransportProviderAdapter {
+  fn capabilities(&self) -> TransportCapabilities {
+    self.capabilities
+  }
+
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
     let inner = Arc::clone(&self.inner);
     let binding = self.binding;
+    let admission = self.capabilities.admission();
     Box::pin(async move {
       let listener = inner.bind(endpoint).await?;
       Ok(Box::new(ProviderListenerAdapter {
         inner: listener,
         binding,
+        admission,
       }) as Box<dyn TransportListener>)
     })
   }
@@ -356,6 +473,7 @@ impl Transport for TransportProviderAdapter {
 struct ProviderListenerAdapter {
   inner: Box<dyn ProviderListener>,
   binding: [u8; crate::transport::connection::CHANNEL_BINDING_LEN],
+  admission: TransportAdmission,
 }
 
 impl fmt::Debug for ProviderListenerAdapter {
@@ -375,9 +493,11 @@ impl TransportListener for ProviderListenerAdapter {
     &'a self, hint: &'a (dyn Fn() -> Option<MergeHint> + Send + Sync),
   ) -> BoxFuture<'a, Result<Connection>> {
     let binding = self.binding;
+    let admission = self.admission;
     Box::pin(async move {
-      let stream = self.inner.accept().await?;
-      // Evaluated after the medium accept, exactly like the built-in
+      let accepted = self.inner.accept().await?;
+      let (stream, peer_addr) = accepted.into_parts();
+      // Evaluated after the medium accept, exactly like the official
       // listeners. The session handshake's identity proofs carry
       // authentication over the medium.
       let hint = hint();
@@ -388,8 +508,8 @@ impl TransportListener for ProviderListenerAdapter {
         shared_write(Box::new(write)),
         binding,
         rules,
-        None,
-        false,
+        peer_addr,
+        admission,
         hint.as_ref(),
       )
       .await
@@ -401,6 +521,145 @@ impl TransportListener for ProviderListenerAdapter {
   }
 }
 
+/// The node-local transport map: the single resolution namespace for the
+/// official transports and every caller-registered transport provider.
+///
+/// The map is born empty. [`Self::register_default`] installs the official
+/// transports explicitly under their canonical tags, skipping a selector a
+/// caller already replaced through
+/// [`Self::override_builtin_transport`]; every other entry arrives through
+/// an explicit registration call.
+pub(crate) struct TransportRegistry {
+  transports: BTreeMap<TransportTag, Arc<dyn Transport>>,
+  /// The caller-registered transport providers, keyed by the scheme name
+  /// (protocol prefix) each one owns.
+  schemes: BTreeMap<crate::transport::TransportName, Arc<dyn Transport>>,
+}
+
+impl TransportRegistry {
+  /// The empty transport map: no transport resolves until it is
+  /// registered (explicitly, or through [`Self::register_default`]).
+  pub(crate) fn new() -> Self {
+    Self {
+      transports: BTreeMap::new(),
+      schemes: BTreeMap::new(),
+    }
+  }
+
+  /// Installs every official transport under its canonical tag. An
+  /// already-occupied tag (a caller override) is left untouched, so the
+  /// default path never replaces an explicit decision. Idempotent.
+  pub(crate) fn register_default(&mut self) -> Result<&mut Self> {
+    for scheme in TransportScheme::ALL {
+      let tag = builtin_transport_tag(scheme)?;
+      self
+        .transports
+        .entry(tag)
+        .or_insert_with(|| official_transport(scheme));
+    }
+    Ok(self)
+  }
+
+  /// Registers one caller-defined transport under its addressing scheme
+  /// name. The name is unique per node: a duplicate is a conflict.
+  pub(crate) fn register_transport(
+    &mut self, name: crate::transport::TransportName, transport: Arc<dyn TransportProvider>,
+  ) -> Result<&mut Self> {
+    let adapter = Arc::new(TransportProviderAdapter::new(transport, name.clone())?);
+    insert_once(&mut self.schemes, name, adapter, "transport registration")?;
+    Ok(self)
+  }
+
+  /// Explicitly replaces one official transport with a caller-defined
+  /// implementation under the official selector. One override per
+  /// selector: a second registration is a conflict.
+  pub(crate) fn override_builtin_transport(
+    &mut self, scheme: TransportScheme, transport: Arc<dyn TransportProvider>,
+  ) -> Result<&mut Self> {
+    let tag = builtin_transport_tag(scheme)?;
+    let adapter = Arc::new(TransportProviderAdapter::override_builtin(
+      transport, scheme,
+    )?);
+    insert_once(
+      &mut self.transports,
+      tag,
+      adapter,
+      "built-in transport override",
+    )?;
+    Ok(self)
+  }
+
+  /// Registers one official transport implementation under its canonical
+  /// tag. Test-only: the default path owns the official map in production.
+  #[cfg(test)]
+  pub(crate) fn register_builtin_transport(
+    &mut self, tag: TransportTag, value: Arc<dyn Transport>,
+  ) -> Result<&mut Self> {
+    insert_once(&mut self.transports, tag, value, "transport registration")?;
+    Ok(self)
+  }
+
+  /// Resolves one endpoint's transport selector through the map: the
+  /// official transports and every caller-registered transport provider
+  /// merge into one resolution namespace, and a selector that resolves
+  /// to nothing fails typed here.
+  pub(crate) fn resolve_transport(
+    &self, selector: &crate::TransportSelector,
+  ) -> Result<Arc<dyn Transport>> {
+    match selector {
+      crate::TransportSelector::Builtin(scheme) => {
+        let tag = builtin_transport_tag(*scheme)?;
+        self
+          .transport(&tag)
+          .cloned()
+          .ok_or_else(|| Error::not_found("transport"))
+      }
+      crate::TransportSelector::Custom(name) => self
+        .schemes
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Error::not_found("transport")),
+    }
+  }
+
+  /// The registered transport for one tag.
+  pub(crate) fn transport(&self, tag: &TransportTag) -> Option<&Arc<dyn Transport>> {
+    self.transports.get(tag)
+  }
+
+  /// The number of tag-keyed transports (official and overrides).
+  pub(crate) fn len(&self) -> usize {
+    self.transports.len()
+  }
+}
+
+impl Default for TransportRegistry {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl fmt::Debug for TransportRegistry {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("TransportRegistry")
+      .field("transports", &self.transports.len())
+      .field("schemes", &self.schemes.len())
+      .finish()
+  }
+}
+
+/// The official transport implementation for one scheme. A new scheme
+/// forces a compile error here, so it cannot join `TransportScheme::ALL`
+/// without an implementation and a default registration.
+fn official_transport(scheme: TransportScheme) -> Arc<dyn Transport> {
+  match scheme {
+    TransportScheme::Tls => Arc::new(TlsTransport::new()),
+    TransportScheme::Wss => Arc::new(WssTransport::new()),
+    TransportScheme::Tcp => Arc::new(PlainTransport::new()),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
@@ -408,7 +667,8 @@ mod tests {
   use tokio::sync::mpsc;
 
   use super::{
-    ProviderListener, Transport, TransportProvider, TransportProviderAdapter, TransportTrust,
+    AcceptedStream, ProviderListener, Transport, TransportAdmission, TransportCapabilities,
+    TransportProvider, TransportProviderAdapter, TransportRegistry, TransportTrust,
     builtin_transport_tag,
   };
   use crate::{
@@ -475,7 +735,7 @@ mod tests {
 
   #[test]
   fn builder_seeded_registry_resolves_builtin_tags_and_transports() {
-    // Mirrors the node builder's seeding loop: every built-in registers
+    // Mirrors the default registration: every official transport registers
     // under its canonical `builtin_transport_tag` tag, and a later
     // lookup by selector resolves the identical registered transport.
     let mut registry = ExtensionRegistry::new();
@@ -569,8 +829,8 @@ mod tests {
     registry
       .override_builtin_transport(TransportScheme::Wss, Arc::new(test_wire()))
       .unwrap();
-    // The override occupies the built-in tag, so the builder's seeding
-    // loop (register only when the tag is free) skips the built-in and
+    // The override occupies the official tag, so the default path
+    // (register only when the tag is free) skips the official transport and
     // every selector resolution lands on the override.
     assert!(registry.transport(&tag).is_some());
     assert!(
@@ -596,7 +856,7 @@ mod tests {
 
   /// The override under a TLS-class selector carries a full dial: the
   /// merge trust intent the `wss://` selector produces is served, and a
-  /// framed message round-trips over the caller's medium. A built-in
+  /// framed message round-trips over the caller's medium. An official
   /// WSS transport could not deliver this connection — success alone
   /// proves the caller's implementation handled the dial.
   #[tokio::test]
@@ -965,12 +1225,13 @@ mod tests {
       self.endpoint.clone()
     }
 
-    fn accept(&self) -> BoxFuture<'_, Result<Box<dyn TransportStream>>> {
+    fn accept(&self) -> BoxFuture<'_, Result<AcceptedStream>> {
       Box::pin(async move {
         let mut received = self.bus.rx.lock().await;
         received
           .recv()
           .await
+          .map(AcceptedStream::new)
           .ok_or_else(|| crate::Error::not_ready("transport provider wire"))
       })
     }
@@ -986,6 +1247,58 @@ mod tests {
       tx,
       rx: tokio::sync::Mutex::new(rx),
     }))
+  }
+
+  /// A provider that declares the same peer-addressed admission state an
+  /// official transport declares. The bind/connect bodies are never used:
+  /// the test reads the declaration through the adapter boundary.
+  #[derive(Debug)]
+  struct PeerAddressedWire;
+
+  impl TransportProvider for PeerAddressedWire {
+    fn capabilities(&self) -> TransportCapabilities {
+      TransportCapabilities::new(TransportAdmission::PeerAddressed)
+    }
+
+    fn bind(&self, _endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn ProviderListener>>> {
+      Box::pin(async { Err(crate::Error::not_ready("peer-addressed test wire")) })
+    }
+
+    fn connect(&self, _endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportStream>>> {
+      Box::pin(async { Err(crate::Error::not_ready("peer-addressed test wire")) })
+    }
+  }
+
+  #[test]
+  fn provider_admission_capability_is_carried_through_the_adapter() {
+    let default =
+      TransportProviderAdapter::new(Arc::new(test_wire()), transport_name("addressless")).unwrap();
+    assert_eq!(
+      default.capabilities().admission(),
+      TransportAdmission::Addressless
+    );
+
+    let peer_addressed =
+      TransportProviderAdapter::new(Arc::new(PeerAddressedWire), transport_name("peeraddressed"))
+        .unwrap();
+    assert_eq!(
+      peer_addressed.capabilities().admission(),
+      TransportAdmission::PeerAddressed
+    );
+  }
+
+  #[test]
+  fn accepted_stream_carries_the_declared_peer_address() {
+    let (_client, server) = tokio::io::duplex(8);
+    let peer: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let accepted = AcceptedStream::with_peer(Box::new(server), peer);
+    let (_, reported) = accepted.into_parts();
+    assert_eq!(reported, Some(peer));
+
+    let (_client, server) = tokio::io::duplex(8);
+    let accepted = AcceptedStream::new(Box::new(server));
+    let (_, reported) = accepted.into_parts();
+    assert_eq!(reported, None);
   }
 
   /// The one-line integration a stream type needs: an empty marker impl
@@ -1022,22 +1335,80 @@ mod tests {
     assert_eq!(message.body, b"ping");
   }
 
-  // ---- The built-in transports are registered and the secure
-  // join/packet/disconnect/reconnect regression runs on the same
-  // authenticated connection path (secure_join integration lane). ----
+  // ---- The official transports are registered explicitly -------
+
+  #[test]
+  fn transport_registry_starts_empty_and_register_default_installs_every_scheme() {
+    let mut registry = TransportRegistry::new();
+    for scheme in TransportScheme::ALL {
+      assert!(
+        registry
+          .resolve_transport(&TransportSelector::Builtin(scheme))
+          .is_err(),
+        "a fresh registry holds no hidden official transport"
+      );
+    }
+    registry.register_default().unwrap();
+    for scheme in TransportScheme::ALL {
+      assert!(
+        registry
+          .resolve_transport(&TransportSelector::Builtin(scheme))
+          .is_ok()
+      );
+    }
+    // Idempotent: the second default pass keeps the same entries.
+    registry.register_default().unwrap();
+    assert_eq!(registry.len(), TransportScheme::ALL.len());
+  }
+
+  #[test]
+  fn register_default_keeps_an_explicit_override() {
+    let mut registry = TransportRegistry::new();
+    registry
+      .override_builtin_transport(TransportScheme::Wss, Arc::new(test_wire()))
+      .unwrap();
+    registry.register_default().unwrap();
+    let override_transport = registry
+      .resolve_transport(&TransportSelector::Builtin(TransportScheme::Wss))
+      .unwrap();
+    assert_eq!(
+      override_transport.capabilities().admission(),
+      TransportAdmission::Addressless
+    );
+    // The untouched schemes still resolve to the official transports.
+    for scheme in [TransportScheme::Tls, TransportScheme::Tcp] {
+      let transport = registry
+        .resolve_transport(&TransportSelector::Builtin(scheme))
+        .unwrap();
+      assert_eq!(
+        transport.capabilities().admission(),
+        TransportAdmission::PeerAddressed
+      );
+    }
+  }
+
+  #[test]
+  fn official_transports_declare_peer_addressed_admission() {
+    for scheme in TransportScheme::ALL {
+      let transport = super::official_transport(scheme);
+      assert_eq!(
+        transport.capabilities(),
+        TransportCapabilities::new(TransportAdmission::PeerAddressed)
+      );
+    }
+  }
 
   #[test]
   fn extension_registry_defaults_to_the_builtin_transports() {
     let mut registry = ExtensionRegistry::new();
     for scheme in TransportScheme::ALL {
-      let tag = builtin_transport_tag(scheme).unwrap();
-      let transport: Arc<dyn Transport> = match scheme {
-        TransportScheme::Tls => Arc::new(super::super::tls_transport::TlsTransport::new()),
-        TransportScheme::Wss => Arc::new(super::super::wss::WssTransport::new()),
-        TransportScheme::Tcp => Arc::new(super::super::plain::PlainTransport::new()),
-      };
-      registry.register_builtin_transport(tag, transport).unwrap();
+      assert!(
+        registry
+          .resolve_transport(&TransportSelector::Builtin(scheme))
+          .is_err()
+      );
     }
+    registry.register_default().unwrap();
     for scheme in TransportScheme::ALL {
       assert!(
         registry
@@ -1074,6 +1445,10 @@ impl CountingTransport {
 
 #[cfg(test)]
 impl Transport for CountingTransport {
+  fn capabilities(&self) -> TransportCapabilities {
+    self.inner.capabilities()
+  }
+
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
     self.inner.bind(endpoint)
   }

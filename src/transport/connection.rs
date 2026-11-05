@@ -51,7 +51,7 @@ use tokio_tungstenite::{
   tungstenite::{Bytes as WsBytes, Message as WsMessage},
 };
 
-use super::{framing, framing::MergeHint, ws};
+use super::{framing, framing::MergeHint, registry::TransportAdmission, ws};
 /// The local policy applied to every sent and received wire message
 /// (defined in the protocol domain; re-exported for connection callers).
 pub(crate) use crate::protocol::wire::FrameRules;
@@ -125,12 +125,14 @@ pub(crate) struct Connection {
   /// connections carry none.
   peer_addr: Option<SocketAddr>,
   /// Whether the medium attributes its accepted connections to peers at
-  /// all. TCP classes always do (a kernel failure to report the address
-  /// is a transport fault, not a property of the medium); custom
-  /// media never do, by contract. Admission semantics consume this
-  /// distinction: a missing address on an attributing medium fails
-  /// closed, while an addressless medium attributes to its shared class
-  /// bucket.
+  /// all. The transport declares this through
+  /// [`TransportAdmission`](crate::transport::TransportAdmission): a
+  /// peer-addressed medium (every official transport, and any provider
+  /// that declares the same state) always does — a kernel or medium
+  /// failure to report the address is a transport fault, not a property
+  /// of the medium — while an addressless medium attributes to its
+  /// shared class bucket. Admission semantics consume this distinction:
+  /// a missing address on an attributing medium fails closed.
   attributable: bool,
 }
 
@@ -141,7 +143,8 @@ impl Connection {
   /// admit joiners, `hint` publishes the non-secret credential
   /// generation ID as an upgrade response header inside the TLS channel.
   pub(crate) async fn accept_tls_ws(
-    tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, hint: Option<&MergeHint>,
+    tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, admission: TransportAdmission,
+    hint: Option<&MergeHint>,
   ) -> Result<Self> {
     let peer_addr = tcp.peer_addr().ok();
     let tls = TlsAcceptor::from(config)
@@ -153,13 +156,17 @@ impl Connection {
     tracing::debug!("tls connection accepted");
     let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
     let stream = ws::accept(TlsStream::from(tls), hint).await?;
+    let peer_addr = match admission {
+      TransportAdmission::PeerAddressed => peer_addr,
+      TransportAdmission::Addressless => None,
+    };
     Ok(Self {
       io: TransportIo::Ws(Box::new(stream)),
       rules,
       channel_binding,
       merge_hint: None,
       peer_addr,
-      attributable: true,
+      attributable: admission == TransportAdmission::PeerAddressed,
     })
   }
 
@@ -215,19 +222,27 @@ impl Connection {
   pub(crate) async fn accept_raw(
     read: Box<dyn AsyncRead + Unpin + Send>, write: SharedWrite,
     channel_binding: [u8; CHANNEL_BINDING_LEN], rules: FrameRules, peer_addr: Option<SocketAddr>,
-    attributable: bool, hint: Option<&MergeHint>,
+    admission: TransportAdmission, hint: Option<&MergeHint>,
   ) -> Result<Self> {
     {
       let mut write = write.lock().await;
       framing::write_hint(&mut *write, hint).await?;
     }
+    // The declared admission state is authoritative: an addressless
+    // medium never charges a peer bucket, even if it reported an address,
+    // and a peer-addressed medium reports exactly the address the
+    // admission plane must charge.
+    let peer_addr = match admission {
+      TransportAdmission::PeerAddressed => peer_addr,
+      TransportAdmission::Addressless => None,
+    };
     Ok(Self {
       io: TransportIo::Raw { read, write },
       rules,
       channel_binding,
       merge_hint: None,
       peer_addr,
-      attributable,
+      attributable: admission == TransportAdmission::PeerAddressed,
     })
   }
 

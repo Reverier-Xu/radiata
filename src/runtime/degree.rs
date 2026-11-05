@@ -591,13 +591,8 @@ mod tests {
   ) {
     let node = member_id(seed);
     let endpoints = vec![crate::Endpoint::parse(endpoint).unwrap()];
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node.clone(),
-      member_key(seed),
-      endpoints,
-      1,
-      1,
-    );
+    let descriptor =
+      crate::membership::NodeDescriptorV1::new(node.clone(), member_key(seed), endpoints, 1, 1);
     crate::membership::store::store_descriptor_ctx(
       supervisor.context().unwrap().store(),
       supervisor.dependencies.entropy.as_ref(),

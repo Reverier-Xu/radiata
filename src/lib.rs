@@ -99,8 +99,9 @@ pub use task::{
   Task, TaskError, TaskKind, TaskOutput, TaskPhase, TaskReconciler, TaskStatus, TaskTransition,
 };
 pub use transport::{
-  Endpoint, PageCursor, ProviderListener, TransportName, TransportProvider, TransportScheme,
-  TransportSelector, TransportStream,
+  AcceptedStream, Endpoint, PageCursor, ProviderListener, TransportAdmission,
+  TransportCapabilities, TransportName, TransportProvider, TransportScheme, TransportSelector,
+  TransportStream,
 };
 pub use view::{
   ConnectionDegreeState, ConnectionDegreeView, ConnectivityStatus,

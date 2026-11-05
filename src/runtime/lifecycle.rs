@@ -198,6 +198,36 @@ impl RuntimeClient {
       .ok_or_else(|| Error::not_ready("node tasks"))
   }
 
+  /// One task's current status, when live or inside the bounded terminal
+  /// history. The read is local (no supervisor round trip) and refuses
+  /// typed once the node stopped: the table's post-shutdown state is not
+  /// part of the public contract.
+  pub(crate) fn get_task(&self, id: crate::TaskId) -> Result<Option<crate::view::TaskView>> {
+    self.require_running_tasks()?;
+    Ok(self.task_client()?.observer.table.view(&id))
+  }
+
+  /// Tasks in canonical id order (= admission order, newest last). Local
+  /// read like [`Self::get_task`]; see its shutdown note.
+  pub(crate) fn page_tasks(
+    &self, cursor: Option<&crate::PageCursor>, limit: usize,
+  ) -> Result<crate::view::TaskPage> {
+    self.require_running_tasks()?;
+    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
+    self
+      .task_client()?
+      .observer
+      .table
+      .page_views(cursor.map(|cursor| cursor.as_bytes()), limit)
+  }
+
+  fn require_running_tasks(&self) -> Result<()> {
+    if self.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("node tasks"));
+    }
+    Ok(())
+  }
+
   pub(crate) fn status(&self) -> NodeStatus {
     self.state.borrow().status()
   }

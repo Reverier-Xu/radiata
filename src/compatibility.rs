@@ -780,23 +780,18 @@ mod tests {
     assert_eq!(deleted, bytes("key-deleted-v1"));
 
     // Node descriptor, current version 2 shape.
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node(1),
-      descriptor_key(),
-      vec![endpoint()],
-      7,
-      1,
-    )
-    .with_labels(
-      LabelSet::new()
-        .insert(
-          LabelKey::parse("example.org/labels/owner").unwrap(),
-          LabelValue::parse("team-a").unwrap(),
+    let descriptor =
+      crate::membership::NodeDescriptorV1::new(node(1), descriptor_key(), vec![endpoint()], 7, 1)
+        .with_labels(
+          LabelSet::new()
+            .insert(
+              LabelKey::parse("example.org/labels/owner").unwrap(),
+              LabelValue::parse("team-a").unwrap(),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .encode()
-    .unwrap();
+        .encode()
+        .unwrap();
     assert_eq!(descriptor, bytes("descriptor-v2"));
 
     // Resource records, live and removal fixtures.

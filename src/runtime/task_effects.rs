@@ -1939,7 +1939,7 @@ mod lazy_publication_shutdown_tests {
   };
 
   use crate::{
-    BoxFuture, NodeConfig, NodeId, TransportScheme,
+    BoxFuture, NodeConfig, NodeId,
     extension_registry::ExtensionRegistry,
     identity::testing::{ScriptedKeys, SequenceEntropy},
     provider::{
@@ -1951,7 +1951,6 @@ mod lazy_publication_shutdown_tests {
       SYNC_ROUND_CHANNEL_CAPACITY, spawn_runtime,
     },
     storage::contract::{ReferenceFactory, required_capabilities},
-    transport::registry::{Transport, builtin_transport_tag},
   };
 
   /// The descriptor-commit park: a fault-injecting factory whose every
@@ -2053,24 +2052,7 @@ mod lazy_publication_shutdown_tests {
     let keys = ScriptedKeys::full();
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
     let mut extensions = ExtensionRegistry::new();
-    for (tag, transport) in [
-      (
-        builtin_transport_tag(TransportScheme::Tls).unwrap(),
-        Arc::new(crate::transport::tls_transport::TlsTransport::new()) as Arc<dyn Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Wss).unwrap(),
-        Arc::new(crate::transport::wss::WssTransport::new()) as Arc<dyn Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Tcp).unwrap(),
-        Arc::new(crate::transport::plain::PlainTransport::new()) as Arc<dyn Transport>,
-      ),
-    ] {
-      extensions
-        .register_builtin_transport(tag, transport)
-        .unwrap();
-    }
+    extensions.register_default().unwrap();
     let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
     let (round_tx, round_rx) = tokio::sync::mpsc::channel(SYNC_ROUND_CHANNEL_CAPACITY);
     let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(PACKET_CHANNEL_CAPACITY);

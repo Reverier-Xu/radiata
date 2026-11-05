@@ -679,10 +679,15 @@ mod deadline_tests {
       .unwrap()
     });
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut connection =
-      Connection::accept_tls_ws(tcp, server, connection_frame_rules().unwrap(), None)
-        .await
-        .unwrap();
+    let mut connection = Connection::accept_tls_ws(
+      tcp,
+      server,
+      connection_frame_rules().unwrap(),
+      crate::transport::TransportAdmission::PeerAddressed,
+      None,
+    )
+    .await
+    .unwrap();
 
     let error = driver.respond(&mut connection).await.unwrap_err();
     assert_eq!(

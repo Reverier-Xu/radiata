@@ -150,8 +150,6 @@ pub radiata::RouteState::Failed(radiata::ErrorKind)
 pub radiata::RouteState::Routing
 pub radiata::RouteState::Selecting
 pub radiata::RouteState::Streaming
-#[non_exhaustive] pub enum radiata::RoutingPolicy
-pub radiata::RoutingPolicy::Direct
 #[non_exhaustive] pub enum radiata::ShutdownReason
 pub radiata::ShutdownReason::ActiveLeave
 pub radiata::ShutdownReason::Explicit
@@ -186,6 +184,9 @@ pub radiata::TaskPhase::Running
 pub radiata::TaskPhase::Succeeded
 impl radiata::TaskPhase
 pub const fn radiata::TaskPhase::is_terminal(self) -> bool
+pub enum radiata::TransportAdmission
+pub radiata::TransportAdmission::Addressless
+pub radiata::TransportAdmission::PeerAddressed
 pub enum radiata::TransportScheme
 pub radiata::TransportScheme::Tcp
 pub radiata::TransportScheme::Tls
@@ -200,6 +201,10 @@ pub radiata::TransportSelector::Custom(radiata::TransportName)
 #[non_exhaustive] pub enum radiata::TrustStatus
 pub radiata::TrustStatus::Revoked
 pub radiata::TrustStatus::Trusted
+pub struct radiata::AcceptedStream
+impl radiata::AcceptedStream
+pub fn radiata::AcceptedStream::new(alloc::boxed::Box<dyn radiata::TransportStream>) -> Self
+pub fn radiata::AcceptedStream::with_peer(alloc::boxed::Box<dyn radiata::TransportStream>, core::net::socket_addr::SocketAddr) -> Self
 pub struct radiata::CommitReceipt
 impl radiata::CommitReceipt
 pub fn radiata::CommitReceipt::committed_revision(&self) -> &radiata::StoreRevision
@@ -284,13 +289,17 @@ impl radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::new() -> Self
 pub fn radiata::ExtensionRegistry::override_builtin_transport(&mut self, radiata::TransportScheme, alloc::rcs::arc::Arc<dyn radiata::TransportProvider>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_action_hook(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::ActionHook>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_default(&mut self) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_feature(&mut self, radiata::FeatureDefinition) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_load_balancer(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::LoadBalancingPolicy>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_next_hop(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::RouteNextHop>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_protocol(&mut self, radiata::ProtocolDefinition, alloc::rcs::arc::Arc<dyn radiata::PacketConsumer>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_resource_hook(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::ResourceHook>) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_routing_policy(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::RouteNextHop>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_task_reconciler(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::TaskReconciler>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_transport(&mut self, radiata::TransportName, alloc::rcs::arc::Arc<dyn radiata::TransportProvider>) -> radiata::Result<&mut Self>
+impl core::default::Default for radiata::ExtensionRegistry
+pub fn radiata::ExtensionRegistry::default() -> Self
 impl core::fmt::Debug for radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::FeatureDefinition
@@ -621,6 +630,8 @@ pub fn radiata::QualifiedTag::domain(&self) -> &str
 pub fn radiata::QualifiedTag::name(&self) -> &str
 pub fn radiata::QualifiedTag::parse(&str) -> radiata::Result<Self>
 pub fn radiata::QualifiedTag::version(&self) -> core::option::Option<&str>
+impl core::convert::From<radiata::QualifiedTag> for radiata::RoutingPolicy
+pub fn radiata::RoutingPolicy::from(radiata::QualifiedTag) -> Self
 impl core::convert::From<radiata::QualifiedTag> for radiata::TaskKind
 pub fn radiata::TaskKind::from(radiata::QualifiedTag) -> Self
 impl core::fmt::Debug for radiata::QualifiedTag
@@ -753,6 +764,18 @@ pub fn radiata::RouteStatusView::updated_at(&self) -> std::time::SystemTime
 pub struct radiata::Routes
 impl radiata::Routes
 pub fn radiata::Routes::get(self, &radiata::RouteHandle) -> radiata::Result<radiata::RouteStatusView>
+pub struct radiata::RoutingPolicy(_)
+impl radiata::RoutingPolicy
+pub const radiata::RoutingPolicy::DIRECT: Self
+pub fn radiata::RoutingPolicy::as_str(&self) -> &str
+pub fn radiata::RoutingPolicy::parse(&str) -> radiata::Result<Self>
+pub const fn radiata::RoutingPolicy::tag(&self) -> &radiata::QualifiedTag
+impl core::convert::From<radiata::QualifiedTag> for radiata::RoutingPolicy
+pub fn radiata::RoutingPolicy::from(radiata::QualifiedTag) -> Self
+impl core::fmt::Debug for radiata::RoutingPolicy
+pub fn radiata::RoutingPolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for radiata::RoutingPolicy
+pub fn radiata::RoutingPolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::Selector
 impl radiata::Selector
 pub fn radiata::Selector::as_str(&self) -> &str
@@ -867,6 +890,7 @@ impl core::fmt::Debug for radiata::StreamMetadata
 pub fn radiata::StreamMetadata::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::StreamPolicy
 impl radiata::StreamPolicy
+pub fn radiata::StreamPolicy::direct(u32) -> radiata::Result<Self>
 pub fn radiata::StreamPolicy::load_balancer(self, radiata::QualifiedTag) -> Self
 pub fn radiata::StreamPolicy::load_balancing_policy(&self) -> core::option::Option<&radiata::QualifiedTag>
 pub fn radiata::StreamPolicy::max_hops(&self) -> u32
@@ -1007,6 +1031,12 @@ pub fn radiata::TransactionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core
 impl core::str::traits::FromStr for radiata::TransactionId
 pub type radiata::TransactionId::Err = radiata::Error
 pub fn radiata::TransactionId::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::TransportCapabilities
+impl radiata::TransportCapabilities
+pub const fn radiata::TransportCapabilities::admission(self) -> radiata::TransportAdmission
+pub const fn radiata::TransportCapabilities::new(radiata::TransportAdmission) -> Self
+impl core::default::Default for radiata::TransportCapabilities
+pub fn radiata::TransportCapabilities::default() -> Self
 pub struct radiata::TransportName
 impl radiata::TransportName
 pub fn radiata::TransportName::as_str(&self) -> &str
@@ -1060,7 +1090,7 @@ pub fn radiata::LoadBalancingPolicy::select<'a>(&'a self, &'a radiata::Selector,
 pub trait radiata::PacketConsumer: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::PacketConsumer::accept<'a>(&'a self, radiata::IncomingStream) -> radiata::BoxFuture<'a, radiata::Result<()>>
 pub trait radiata::ProviderListener: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::ProviderListener::accept(&self) -> radiata::BoxFuture<'_, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
+pub fn radiata::ProviderListener::accept(&self) -> radiata::BoxFuture<'_, radiata::Result<radiata::AcceptedStream>>
 pub fn radiata::ProviderListener::close(&self) -> radiata::BoxFuture<'_, radiata::Result<()>>
 pub fn radiata::ProviderListener::local_endpoint(&self) -> radiata::Endpoint
 pub trait radiata::ResourceHook: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
@@ -1075,6 +1105,7 @@ pub trait radiata::TaskReconciler: core::fmt::Debug + core::marker::Send + core:
 pub fn radiata::TaskReconciler::reconcile<'a>(&'a self, radiata::ReconcileContext) -> radiata::BoxFuture<'a, radiata::Result<radiata::ReconcileDecision>>
 pub trait radiata::TransportProvider: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::TransportProvider::bind(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::ProviderListener>>>
+pub fn radiata::TransportProvider::capabilities(&self) -> radiata::TransportCapabilities
 pub fn radiata::TransportProvider::connect(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
 pub trait radiata::TransportStream: tokio::io::async_read::AsyncRead + tokio::io::async_write::AsyncWrite + core::fmt::Debug + core::marker::Unpin + core::marker::Send + 'static
 pub fn radiata::store_scan_stream(alloc::boxed::Box<(dyn radiata::extension::StoreScan + '_)>) -> futures_core::stream::BoxStream<'_, radiata::Result<radiata::StoreEntry>>

@@ -133,6 +133,7 @@ async fn listen(
       tcp,
       config,
       connection_frame_rules().unwrap(),
+      crate::transport::TransportAdmission::PeerAddressed,
       hint.as_ref(),
     )
     .await
