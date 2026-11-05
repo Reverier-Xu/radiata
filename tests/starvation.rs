@@ -226,7 +226,7 @@ async fn reads_and_packets_flow_while_a_join_is_wedged_on_a_silent_peer() {
     member.send(
       StreamTarget::Exact(issuer_id.clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       echo_body(b"still-flowing"),
     ),
   )
@@ -410,7 +410,7 @@ async fn reads_packets_and_local_writes_flow_while_four_dials_hold_every_network
     member.send(
       StreamTarget::Exact(issuer_id.clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       echo_body(b"still-flowing"),
     ),
   )
@@ -609,7 +609,7 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
     .send(
       StreamTarget::Exact(peer_id.clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       echo_body(b"sweep-arm"),
     )
     .await
@@ -662,7 +662,7 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
       probe.send(
         StreamTarget::Exact(peer_id.clone()),
         ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-        StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+        StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
         echo_body(b"still-flowing"),
       ),
     )

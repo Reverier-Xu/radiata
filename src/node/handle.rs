@@ -46,18 +46,18 @@ impl NodeHandle {
   ///
   /// An exact-node target rejects a load-balancer selection; a
   /// matching-node target requires one whose tag resolves in the node's
-  /// [`ExtensionRegistry`]. The routing policy must be the built-in
-  /// direct policy — enforced up front when the [`StreamPolicy`] is
-  /// constructed — and the protocol tag must be registered.
+  /// [`ExtensionRegistry`]. The routing policy tag resolves in the same
+  /// registry at admission — an unregistered policy fails there — and
+  /// the protocol tag must be registered.
   pub fn open_stream(
     &self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy,
     metadata: StreamMetadata,
   ) -> Result<OutboundStream> {
-    let load_balancer = match (&target, policy.load_balancing_policy()) {
+    match (&target, policy.load_balancing_policy()) {
       (StreamTarget::Exact(_), Some(_)) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
-      (StreamTarget::Exact(_), None) => None,
+      (StreamTarget::Exact(_), None) => {}
       (StreamTarget::MatchingNodes(_), None) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
@@ -66,9 +66,8 @@ impl NodeHandle {
         if !self.extensions.has_load_balancer(tag) {
           return Err(Error::invalid_input("packet load balancer"));
         }
-        Some(tag.clone())
       }
-    };
+    }
     if !self.extensions.has_protocol(&protocol) {
       return Err(Error::unsupported("packet protocol"));
     }
@@ -76,8 +75,7 @@ impl NodeHandle {
     Ok(OutboundStream::new(
       trace_id,
       target,
-      load_balancer,
-      policy.max_hops(),
+      policy,
       protocol,
       metadata,
       self.runtime.clone(),

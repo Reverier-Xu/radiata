@@ -848,6 +848,22 @@ impl RouteNextHop for DefaultNextHop {
   }
 }
 
+/// The built-in direct routing policy: the stream-level policy registered
+/// under [`crate::RoutingPolicy::DIRECT`] that never relays. Its
+/// [`RouteNextHop`] implementation refuses every hop, so a stream that
+/// resolved it as a relay policy could never forward; the admission plane
+/// recognizes the tag instead and keeps the node-level route policy's
+/// behavior for such streams (direct delivery when the destination is
+/// connected, the configured policy's first hop otherwise).
+#[derive(Debug)]
+pub(crate) struct DirectRouting;
+
+impl RouteNextHop for DirectRouting {
+  fn next_hop<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+    Box::pin(async { Err(Error::route_unavailable("direct routing policy")) })
+  }
+}
+
 /// The shared next-hop resolution for the routing plane: resolves the
 /// registered [`RouteNextHop`] policy named by `tag` against the route
 /// view built from `trace`, `destination`, `local`, and the alive
@@ -861,13 +877,32 @@ pub(crate) async fn resolve_next_hop(
   let Some(policy) = registry.next_hop_policy(tag) else {
     return Ok(None);
   };
-  let view = NextHopView {
-    trace,
-    destination,
-    local,
-    peers,
-  };
-  policy.next_hop(view).await.map(Some)
+  policy
+    .next_hop(NextHopView {
+      trace,
+      destination,
+      local,
+      peers,
+    })
+    .await
+    .map(Some)
+}
+
+/// One already-resolved policy's next-hop decision: the same view
+/// [`resolve_next_hop`] builds, for callers that hold the policy itself
+/// (a stream's routing policy) instead of a node-level tag.
+pub(crate) async fn next_hop_of(
+  policy: &dyn RouteNextHop, trace: &crate::TraceId, destination: &NodeId, local: &NodeId,
+  peers: &[NodeId],
+) -> Result<NodeId> {
+  policy
+    .next_hop(NextHopView {
+      trace,
+      destination,
+      local,
+      peers,
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -940,6 +975,31 @@ mod tests {
     };
     let error = policy.next_hop(view).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::CallerError);
+  }
+
+  /// The built-in direct policy is the registry's no-relay entry: it
+  /// refuses every hop, so a stream that resolved it as a relay policy
+  /// could never forward. The admission plane recognizes its tag and
+  /// keeps the node-level route policy's behavior instead.
+  #[tokio::test]
+  async fn the_direct_routing_policy_never_relays() {
+    use super::{DirectRouting, NextHopView, RouteNextHop};
+
+    let destination = node(9);
+    let local = node(0);
+    let trace = TraceId::parse("trace-000000000000000000001").unwrap();
+    let peers = [node(4), node(2)];
+    let error = DirectRouting
+      .next_hop(NextHopView {
+        trace: &trace,
+        destination: &destination,
+        local: &local,
+        peers: &peers,
+      })
+      .await
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
+    assert_eq!(error.context(), "direct routing policy");
   }
 
   fn key(name: &str) -> LabelKey {

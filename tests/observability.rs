@@ -182,7 +182,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   let result = issuer.handle.open_stream(
     StreamTarget::Exact(member.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered").unwrap(),
-    StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
+    StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 8).unwrap(),
     StreamMetadata::new(),
   );
   match result {
@@ -311,7 +311,7 @@ async fn redaction_lane_rejects_every_forbidden_class() {
   let packet = member.handle.open_stream(
     StreamTarget::Exact(issuer.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered-marker").unwrap(),
-    StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
+    StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 8).unwrap(),
     StreamMetadata::new(),
   );
   match packet {
@@ -503,7 +503,7 @@ async fn finished_packet_pumps_are_reaped_from_the_task_set() {
       .send(
         StreamTarget::Exact(issuer_id.clone()),
         ProtocolTag::parse(REAP_PROTOCOL).unwrap(),
-        StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+        StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
         futures_util::stream::once(async move { Ok(chunk) }),
       )
       .await

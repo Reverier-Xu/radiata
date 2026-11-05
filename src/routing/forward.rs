@@ -35,7 +35,10 @@ use crate::{
     wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
-  session::stream::{BoundedSender, SessionFrame, SessionTable},
+  session::{
+    pending::PendingAdmissions,
+    stream::{BoundedSender, SessionFrame, SessionTable},
+  },
 };
 
 /// One pending outbound admission on a session: a synchronous waiter at
@@ -57,9 +60,6 @@ pub(crate) enum PendingAck {
   },
 }
 
-/// The per-session pending-admission map keyed by trace id.
-pub(crate) type PendingAcks = Arc<std::sync::Mutex<HashMap<TraceId, PendingAck>>>;
-
 /// The untried candidates of a discovering hop: the open frame is
 /// re-encoded per attempt with the SAME envelope state (the attempt is
 /// an alternative branch at this hop, not extra depth), so a failed
@@ -70,7 +70,7 @@ pub(crate) struct RetryState {
   pub(crate) open: OpenFrame,
   pub(crate) context: crate::routing::RouteContext,
   pub(crate) candidates: Vec<NodeId>,
-  pub(crate) downstream_acks: PendingAcks,
+  pub(crate) downstream_acks: PendingAdmissions,
 }
 
 /// The exact session incarnation one forwarded hop attaches to: the
@@ -146,7 +146,7 @@ pub(crate) struct ForwardingHop {
   /// one-shot admission waiter the hop deadline removes when the attempt
   /// expires, and the entry a failure acknowledgement consumes so it cannot
   /// relay the failure upstream past this hop's own retry.
-  pub(crate) downstream_acks: PendingAcks,
+  pub(crate) downstream_acks: PendingAdmissions,
   /// The exact upstream session that feeds this hop: teardown cleanup binds
   /// to this identity, never to the peer alone.
   pub(crate) upstream_session: SessionIdentity,
@@ -431,25 +431,23 @@ async fn relay_open(
     return reject_open(upstream, &open.trace_id);
   }
   {
-    let mut acks = match downstream_acks.lock() {
-      Ok(acks) => acks,
-      Err(_) => return reject_open(upstream, &open.trace_id),
-    };
-    if acks.contains_key(&open.trace_id) {
-      return reject_open(upstream, &open.trace_id);
-    }
     // The downstream session's admission bound applies to relayed opens
-    // too: beyond it the hop fails closed with typed backpressure.
-    if acks.len() >= crate::session::stream::MAX_PENDING_ADMISSIONS {
-      send_status(upstream, &open.trace_id, AckStatus::Overloaded);
-      return;
-    }
-    acks.insert(
-      open.trace_id.clone(),
+    // too: beyond it the hop fails closed with typed backpressure, and a
+    // duplicate routed open for one trace is the protocol violation the
+    // branch search reports upstream.
+    match downstream_acks.try_reserve_admission(
+      &open.trace_id,
       PendingAck::Relay {
         upstream: upstream.clone(),
       },
-    );
+    ) {
+      Ok(()) => {}
+      Err(ErrorKind::Overloaded) => {
+        send_status(upstream, &open.trace_id, AckStatus::Overloaded);
+        return;
+      }
+      Err(_) => return reject_open(upstream, &open.trace_id),
+    }
   }
   let body = match wire::encode_open(&OpenFrame {
     trace_id: open.trace_id.clone(),
@@ -635,36 +633,35 @@ pub(crate) async fn on_downstream_failure(
     };
     let downstream_acks = entry.pending_acks.clone();
     let downstream_session = SessionIdentity::new(candidate.clone(), entry.session_id().clone());
-    let queued = (|| {
-      let mut acks = downstream_acks.lock().ok()?;
-      if acks.contains_key(trace_id) || acks.len() >= crate::session::stream::MAX_PENDING_ADMISSIONS
-      {
-        return None;
-      }
-      acks.insert(
-        trace_id.clone(),
+    // Re-encode the open with the SAME envelope state: the retry is an
+    // alternative branch at this hop, not extra depth.
+    let body = wire::encode_open(&OpenFrame {
+      trace_id: trace_id.clone(),
+      source: retry.open.source.clone(),
+      destination: retry.open.destination.clone(),
+      protocol: retry.open.protocol.clone(),
+      metadata: retry.open.metadata.clone(),
+      route: Some(retry.context.hop_state()),
+    })
+    .ok();
+    let Some(body) = body else {
+      continue;
+    };
+    // The candidate's admission bound and the trace's duplicate rule
+    // apply to the re-dispatch exactly as to the first attempt: a
+    // candidate that cannot carry the entry right now counts as a failed
+    // attempt.
+    if downstream_acks
+      .try_reserve_admission(
+        trace_id,
         PendingAck::Relay {
           upstream: upstream.clone(),
         },
-      );
-      // Re-encode the open with the SAME envelope state: the retry is
-      // an alternative branch at this hop, not extra depth.
-      let context = retry.context.hop_state();
-      wire::encode_open(&OpenFrame {
-        trace_id: trace_id.clone(),
-        source: retry.open.source.clone(),
-        destination: retry.open.destination.clone(),
-        protocol: retry.open.protocol.clone(),
-        metadata: retry.open.metadata.clone(),
-        route: Some(context),
-      })
-      .ok()
-    })();
-    let Some(body) = queued else {
-      // The candidate cannot carry the frame right now: count it as a
-      // failed attempt and continue the search.
+      )
+      .is_err()
+    {
       continue;
-    };
+    }
     // The pending entry and the open frame share one lifetime under the
     // hop's own budget here too: a candidate whose queue stays saturated
     // past the budget counts as a failed attempt — the parked send is
@@ -686,7 +683,7 @@ pub(crate) async fn on_downstream_failure(
     }
     if let Some(hop) = locked(forwarding).get_mut(trace_id) {
       hop.downstream = entry.frames.clone();
-      hop.downstream_acks = Arc::clone(&downstream_acks);
+      hop.downstream_acks = downstream_acks.clone();
       // Stream ownership follows the attempt: the hop's attribution now
       // binds to the new branch's session identity.
       hop.downstream_session = downstream_session;
@@ -697,7 +694,7 @@ pub(crate) async fn on_downstream_failure(
       // window: a same-branch ack that lands between send_waiting returning and
       // this table update is misattributed and dropped; the hop deadline then
       // re-dispatches, so the window is fail-closed and self-healing.
-      retry.downstream_acks = Arc::clone(&downstream_acks);
+      retry.downstream_acks = downstream_acks.clone();
       hop.phase = HopPhase::Discovering(retry);
     }
     // The re-dispatched branch gets its own full hop budget.
@@ -758,7 +755,7 @@ async fn select_next_hop(
 /// order matches `on_downstream_failure`: the forwarding table guard
 /// never outlives this call and the acks lock nests inside it.
 pub(crate) fn ack_from_current_downstream(
-  table: &ForwardingTable, acks: &PendingAcks, trace_id: &TraceId,
+  table: &ForwardingTable, acks: &PendingAdmissions, trace_id: &TraceId,
 ) -> bool {
   let guard = locked(table);
   let Some(hop) = guard.get(trace_id) else {
@@ -766,18 +763,11 @@ pub(crate) fn ack_from_current_downstream(
     // acknowledgement path stays attribution-free by construction.
     return true;
   };
-  if !Arc::ptr_eq(acks, &hop.downstream_acks) {
+  if !acks.is_same_map(&hop.downstream_acks) {
     return false;
   }
   match hop.phase {
-    HopPhase::Discovering(_) => matches!(
-      acks.lock().ok().and_then(|acks| {
-        acks
-          .get(trace_id)
-          .map(|entry| matches!(entry, PendingAck::Relay { .. }))
-      }),
-      Some(true)
-    ),
+    HopPhase::Discovering(_) => acks.holds_relay(trace_id),
     HopPhase::Admitted => true,
     HopPhase::Redispatching => false,
   }
@@ -837,10 +827,8 @@ pub(crate) fn register(
   Ok(())
 }
 
-fn remove_pending(acks: &PendingAcks, trace_id: &TraceId) {
-  if let Ok(mut acks) = acks.lock() {
-    acks.remove(trace_id);
-  }
+fn remove_pending(acks: &PendingAdmissions, trace_id: &TraceId) {
+  acks.withdraw(trace_id);
 }
 
 /// Removes `trace_id`'s pending entry only if it is still a relay: an
@@ -848,11 +836,8 @@ fn remove_pending(acks: &PendingAcks, trace_id: &TraceId) {
 /// task's removal then reports nothing to expire. A poisoned map
 /// conservatively reports nothing — the session teardown owns the
 /// entries in that case.
-fn take_expired_relay(acks: &PendingAcks, trace_id: &TraceId) -> bool {
-  match acks.lock() {
-    Ok(mut acks) => matches!(acks.remove(trace_id), Some(PendingAck::Relay { .. })),
-    Err(_) => false,
-  }
+fn take_expired_relay(acks: &PendingAdmissions, trace_id: &TraceId) -> bool {
+  acks.take_expired(trace_id)
 }
 
 /// Arms the explicit per-hop budget for one forwarded open: after
@@ -866,11 +851,11 @@ fn take_expired_relay(acks: &PendingAcks, trace_id: &TraceId) -> bool {
 /// and aborts the sleeping task, so a resolved attempt leaks no
 /// short-lived timer for the rest of the budget.
 fn arm_hop_deadline(
-  forwarding: &ForwardingTable, downstream_acks: &PendingAcks, sessions: &SessionTable,
+  forwarding: &ForwardingTable, downstream_acks: &PendingAdmissions, sessions: &SessionTable,
   trace_id: &TraceId, relay_hop_deadline: Duration,
 ) {
   let table = Arc::clone(forwarding);
-  let downstream_acks = Arc::clone(downstream_acks);
+  let downstream_acks = downstream_acks.clone();
   let sessions = Arc::clone(sessions);
   let armed_for = trace_id.clone();
   let trace_id = trace_id.clone();
@@ -1007,7 +992,9 @@ mod tests {
     ForwardingHop {
       upstream,
       downstream,
-      downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+      downstream_acks: super::PendingAdmissions::new(
+        crate::session::stream::MAX_PENDING_ADMISSIONS,
+      ),
       upstream_session: identity(upstream_peer, 1),
       downstream_session: identity(downstream_peer, 2),
       relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1223,9 +1210,9 @@ mod tests {
       super::ForwardingHop {
         upstream: winner_upstream,
         downstream: winner_downstream,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
+        downstream_acks: super::PendingAdmissions::new(
+          crate::session::stream::MAX_PENDING_ADMISSIONS,
+        ),
         upstream_session: winner.clone(),
         downstream_session: identity(7, 3),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1243,9 +1230,9 @@ mod tests {
       super::ForwardingHop {
         upstream: old_upstream,
         downstream: old_downstream,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
+        downstream_acks: super::PendingAdmissions::new(
+          crate::session::stream::MAX_PENDING_ADMISSIONS,
+        ),
         upstream_session: old.clone(),
         downstream_session: identity(7, 3),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1300,9 +1287,9 @@ mod tests {
       super::ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
+        downstream_acks: super::PendingAdmissions::new(
+          crate::session::stream::MAX_PENDING_ADMISSIONS,
+        ),
         upstream_session: feeder.clone(),
         downstream_session: identity(7, 1),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1383,7 +1370,7 @@ mod retry_tests {
 
   fn hop_with_retry(
     upstream: crate::session::stream::BoundedSender,
-    downstream: crate::session::stream::BoundedSender, downstream_acks: super::PendingAcks,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: super::PendingAdmissions,
     candidates: Vec<crate::NodeId>,
   ) -> ForwardingHop {
     let trace_id = trace(99);
@@ -1431,13 +1418,16 @@ mod retry_tests {
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     let _upstream_keep = upstream_tx.clone();
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let failed_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    failed_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let failed_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    failed_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     let candidates = vec![good_id.clone()];
     register(
       &table,
@@ -1453,7 +1443,7 @@ mod retry_tests {
     let frame = good_rx.recv().await.expect("redispatched open");
     assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Open);
     // The failed branch's pending entry was consumed...
-    assert!(!failed_acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(!failed_acks.contains(&trace(99)));
     // ...the hop switched legs and stays discovering...
     let live_entry;
     {
@@ -1467,10 +1457,10 @@ mod retry_tests {
         panic!("retry stays armed");
       };
       assert!(
-        std::sync::Arc::ptr_eq(&retry.downstream_acks, &hop.downstream_acks),
+        retry.downstream_acks.is_same_map(&hop.downstream_acks),
         "the re-armed retry consumes its own attempt's pending map"
       );
-      live_entry = hop.downstream_acks.lock().unwrap().contains_key(&trace(99));
+      live_entry = hop.downstream_acks.contains(&trace(99));
     }
     assert!(
       live_entry,
@@ -1489,14 +1479,16 @@ mod retry_tests {
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let failed_acks: super::PendingAcks =
-      Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    failed_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let failed_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    failed_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1513,7 +1505,7 @@ mod retry_tests {
     assert_eq!(ack.status, crate::packet::wire::AckStatus::Failed);
     assert!(!super::contains(&table, &trace(99)));
     // The failed attempt's pending entry was consumed on the way out.
-    assert!(failed_acks.lock().unwrap().is_empty());
+    assert!(failed_acks.is_empty());
   }
 
   /// Once the destination admits a branch, the hop is a pure relay: a
@@ -1524,7 +1516,8 @@ mod retry_tests {
     assert!(!owns_discovering(&table, &trace(99)));
     let (upstream_tx, _upstream_rx) = test_queue(16, usize::MAX);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     register(
       &table,
       trace(99),
@@ -1554,13 +1547,16 @@ mod retry_tests {
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1578,7 +1574,7 @@ mod retry_tests {
       .expect("redispatched open after the hop budget");
     assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Open);
     // ...the expired pending entry was consumed...
-    assert!(!acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(!acks.contains(&trace(99)));
     // ...and nothing failed upstream (the search continues silently).
     assert!(upstream_rx.recv().now_or_never().is_none());
   }
@@ -1599,7 +1595,7 @@ mod retry_tests {
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
     let entropy = entropy();
     let (entry, mut downstream_rx) = test_entry(entropy.as_ref());
-    let downstream_acks = Arc::clone(&entry.pending_acks);
+    let downstream_acks = entry.pending_acks.clone();
     let next_hop = node(7);
     // Saturate the downstream queue: the open's waiting send parks. The
     // filler count is remembered so the drain below removes exactly what
@@ -1659,7 +1655,7 @@ mod retry_tests {
     assert_eq!(ack.status, crate::packet::wire::AckStatus::Failed);
     // The pending entry is consumed and no hop was registered for the
     // abandoned dispatch.
-    assert!(!downstream_acks.lock().unwrap().contains_key(&trace_id));
+    assert!(!downstream_acks.contains(&trace_id));
     assert!(!super::contains(&forwarding, &trace_id));
     // The abandoned branch never receives the open: drain every filler
     // that saturated the queue, wait past several wake backstops, and
@@ -1686,7 +1682,7 @@ mod retry_tests {
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
     let entropy = entropy();
     let (entry, mut downstream_rx) = test_entry(entropy.as_ref());
-    let downstream_acks = Arc::clone(&entry.pending_acks);
+    let downstream_acks = entry.pending_acks.clone();
     // Saturate the candidate's queue: the re-dispatched open parks.
     let mut saturated = 0;
     while entry.frames.send(filler()).await.is_ok() {
@@ -1695,13 +1691,16 @@ mod retry_tests {
     sessions.lock().unwrap().insert(node(7), entry);
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let failed_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    failed_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let failed_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    failed_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     let table = new_table();
     register(
       &table,
@@ -1727,8 +1726,8 @@ mod retry_tests {
     assert!(!super::contains(&table, &trace(99)));
     // Both the failed attempt's entry and the expired candidate's entry
     // were consumed...
-    assert!(failed_acks.lock().unwrap().is_empty());
-    assert!(!downstream_acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(failed_acks.is_empty());
+    assert!(!downstream_acks.contains(&trace(99)));
     // ...and the abandoned candidate never receives the open, even after
     // its queue drains.
     for _ in 0..saturated {
@@ -1754,13 +1753,16 @@ mod retry_tests {
     let table = new_table();
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1806,7 +1808,7 @@ mod retry_tests {
     // Nothing expired afterwards: far past the budget the entry survives
     // and no failure went upstream.
     tokio::time::advance(Duration::from_secs(10)).await;
-    assert!(acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(acks.contains(&trace(99)));
     assert!(upstream_rx.recv().now_or_never().is_none());
 
     // The typed-failure resolution owns its timer the same way: the
@@ -1815,13 +1817,16 @@ mod retry_tests {
     // taken out first so the fresh registration cannot conflict.
     super::locked(&table).remove(&trace(99));
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1869,16 +1874,20 @@ mod retry_tests {
   #[test]
   fn ack_attribution_requires_the_current_downstreams_live_entry() {
     let table = new_table();
-    let live_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    let live_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (upstream_tx, _upstream_rx) = test_queue(16, usize::MAX);
-    live_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx,
-      },
-    );
+    live_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx,
+        },
+      )
+      .unwrap();
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let stale_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    let stale_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     register(
       &table,
       trace(99),
@@ -1905,7 +1914,7 @@ mod retry_tests {
     ));
     // The current map after its entry was consumed (the attempt was
     // already abandoned) is not: the re-dispatch owns the next entry.
-    live_acks.lock().unwrap().remove(&trace(99));
+    live_acks.withdraw(&trace(99));
     assert!(!super::ack_from_current_downstream(
       &table,
       &live_acks,

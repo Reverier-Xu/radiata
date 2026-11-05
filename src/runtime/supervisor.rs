@@ -2066,10 +2066,18 @@ mod admission_loop_tests {
   fn probe_request(
     trace_id: TraceId, target: StreamTarget,
   ) -> (OutboundRequest, oneshot::Receiver<RoutedAckOutcome>) {
+    probe_request_with_policy(trace_id, target, crate::RoutingPolicy::DIRECT)
+  }
+
+  /// The same probe under an explicit stream routing policy.
+  fn probe_request_with_policy(
+    trace_id: TraceId, target: StreamTarget, routing_policy: crate::RoutingPolicy,
+  ) -> (OutboundRequest, oneshot::Receiver<RoutedAckOutcome>) {
     let (ack_notify, ack) = oneshot::channel();
     let request = OutboundRequest {
       trace_id,
       target,
+      routing_policy,
       load_balancer: None,
       max_hops: 1,
       protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/admission-probe").unwrap(),
@@ -2328,6 +2336,47 @@ mod admission_loop_tests {
     pending.read().await;
     pending.shutdown().await;
   }
+
+  /// A stream whose routing-policy tag names no registered policy fails
+  /// typed at admission: the sender observes the invalid-input kind and
+  /// the bounded route record ends failed with it, instead of the stream
+  /// silently routing direct.
+  #[tokio::test]
+  async fn an_unregistered_stream_routing_policy_fails_typed_at_admission() {
+    let pending = start_pending_policy_loop().await;
+    let unregistered = crate::RoutingPolicy::parse("example.com/route-policies/unregistered")
+      .expect("a canonical caller tag");
+    let trace_id = trace(7);
+    let (request, ack) = probe_request_with_policy(
+      trace_id.clone(),
+      StreamTarget::Exact(test_support::member_id(9)),
+      unregistered,
+    );
+    pending.packet.send(request).await.expect("packet channel");
+    let outcome = tokio::time::timeout(PROBE_BOX, ack)
+      .await
+      .expect("the admission must answer")
+      .expect("the admission ack channel");
+    assert_eq!(outcome.err(), Some(crate::ErrorKind::InvalidInput));
+    // The typed failure is also the route record's terminal state.
+    let state = pending
+      .routes
+      .lock()
+      .expect("route table")
+      .get(&trace_id)
+      .map(|record| record.state.clone());
+    assert_eq!(
+      state,
+      Some(crate::packet::RouteState::Failed(
+        crate::ErrorKind::InvalidInput
+      ))
+    );
+    // The pending next-hop policy the fixture registers is never reached:
+    // the stream policy resolves (and fails) first.
+    assert_eq!(pending.calls.load(Ordering::Relaxed), 0);
+
+    pending.shutdown().await;
+  }
 }
 
 /// The runtime's shared supervisor-unit-test fixture: builds a
@@ -2527,13 +2576,8 @@ pub(crate) mod test_support {
       .iter()
       .map(|port| crate::Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap())
       .collect();
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node.clone(),
-      member_key(seed),
-      endpoints,
-      1,
-      1,
-    );
+    let descriptor =
+      crate::membership::NodeDescriptorV1::new(node.clone(), member_key(seed), endpoints, 1, 1);
     crate::membership::store::store_descriptor_ctx(
       supervisor.context().unwrap().store(),
       supervisor.dependencies.entropy.as_ref(),

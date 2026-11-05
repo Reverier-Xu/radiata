@@ -10,8 +10,8 @@ use std::{
 
 use radiata::{
   ErrorKind, IncomingStream, NodeBuilder, NodeConfig, NodeHandle, NodeId, PacketConsumer, PageSpec,
-  ProtocolDefinition, ProtocolTag, RouteHandle, RouteState, RoutingPolicy, StreamMetadata,
-  StreamPolicy, StreamTarget,
+  ProtocolDefinition, ProtocolTag, RouteHandle, RouteState, StreamMetadata, StreamPolicy,
+  StreamTarget,
 };
 
 mod common;
@@ -84,7 +84,7 @@ fn protocol() -> ProtocolTag {
 }
 
 fn policy() -> StreamPolicy {
-  StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap()
+  StreamPolicy::direct(1).unwrap()
 }
 
 async fn wait_for<F: FnMut() -> bool>(mut probe: F, what: &'static str) {

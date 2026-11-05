@@ -31,6 +31,9 @@ pub(crate) mod engine;
 // probes are read only by tests.
 #[allow(dead_code)]
 pub(crate) mod fingerprint;
+// The lane seam: one policy per reconciled key space, implemented next
+// to the module that owns the rows.
+pub(crate) mod lane;
 pub(crate) mod plane;
 pub(crate) mod wire;
 

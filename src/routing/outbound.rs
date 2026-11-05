@@ -57,26 +57,13 @@ fn register_admission(
   entry: &SessionEntry, trace_id: &TraceId, ack_tx: tokio::sync::oneshot::Sender<AckOutcome>,
 ) -> Result<(), ErrorKind> {
   let queued_at = clock_seconds(entry.clock.as_ref());
-  let registered = entry.pending_acks.lock().map(|mut pending| {
-    // Typed backpressure instead of unbounded growth: beyond the
-    // per-session admission bound the open fails closed.
-    if pending.len() >= entry.pending_admissions {
-      return Err(ErrorKind::Overloaded);
-    }
-    pending.insert(
-      trace_id.clone(),
-      PendingAck::Wait {
-        notify: ack_tx,
-        queued_at,
-      },
-    );
-    Ok(())
-  });
-  match registered {
-    Ok(Ok(())) => Ok(()),
-    Ok(Err(kind)) => Err(kind),
-    Err(_) => Err(ErrorKind::Internal),
-  }
+  entry.pending_acks.try_reserve_admission(
+    trace_id,
+    PendingAck::Wait {
+      notify: ack_tx,
+      queued_at,
+    },
+  )
 }
 
 /// Streams one admitted body as ordered bounded chunks over the session
@@ -407,9 +394,7 @@ fn record_terminal_trace(
 
 /// Removes a pending admission that never reached the wire.
 fn withdraw_pending(entry: &SessionEntry, trace_id: &TraceId) {
-  if let Ok(mut pending) = entry.pending_acks.lock() {
-    pending.remove(trace_id);
-  }
+  entry.pending_acks.withdraw(trace_id);
 }
 
 #[cfg(test)]
@@ -521,18 +506,13 @@ mod pump_tail_durable_tests {
   async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-      let resolved = entry
-        .pending_acks
-        .lock()
-        .unwrap()
-        .remove(trace_id)
-        .map(|entry| match entry {
-          PendingAck::Wait { notify, .. } => {
-            let _ = notify.send(Ok(std::time::UNIX_EPOCH));
-            true
-          }
-          PendingAck::Relay { .. } => false,
-        });
+      let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
+        PendingAck::Wait { notify, .. } => {
+          let _ = notify.send(Ok(std::time::UNIX_EPOCH));
+          true
+        }
+        PendingAck::Relay { .. } => false,
+      });
       if resolved == Some(true) {
         return;
       }
@@ -584,6 +564,7 @@ mod pump_tail_durable_tests {
     let request = crate::packet::OutboundRequest {
       trace_id: trace_id.clone(),
       target: crate::packet::StreamTarget::Exact(node(2)),
+      routing_policy: crate::RoutingPolicy::DIRECT,
       load_balancer: None,
       max_hops: 1,
       protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
@@ -642,6 +623,7 @@ mod pump_tail_durable_tests {
     let request = crate::packet::OutboundRequest {
       trace_id: trace_id.clone(),
       target: crate::packet::StreamTarget::Exact(node(2)),
+      routing_policy: crate::RoutingPolicy::DIRECT,
       load_balancer: None,
       max_hops: 1,
       protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
@@ -701,18 +683,13 @@ mod body_failure_tests {
   async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-      let resolved = entry
-        .pending_acks
-        .lock()
-        .unwrap()
-        .remove(trace_id)
-        .map(|entry| match entry {
-          PendingAck::Wait { notify, .. } => {
-            let _ = notify.send(Ok(std::time::UNIX_EPOCH));
-            true
-          }
-          PendingAck::Relay { .. } => false,
-        });
+      let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
+        PendingAck::Wait { notify, .. } => {
+          let _ = notify.send(Ok(std::time::UNIX_EPOCH));
+          true
+        }
+        PendingAck::Relay { .. } => false,
+      });
       if resolved == Some(true) {
         return;
       }
@@ -747,6 +724,7 @@ mod body_failure_tests {
     let request = crate::packet::OutboundRequest {
       trace_id: trace_id.clone(),
       target: crate::packet::StreamTarget::Exact(node(2)),
+      routing_policy: crate::RoutingPolicy::DIRECT,
       load_balancer: None,
       max_hops: 1,
       protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
@@ -819,6 +797,7 @@ mod body_failure_tests {
     let request = crate::packet::OutboundRequest {
       trace_id: trace_id.clone(),
       target: crate::packet::StreamTarget::Exact(node(2)),
+      routing_policy: crate::RoutingPolicy::DIRECT,
       load_balancer: None,
       max_hops: 1,
       protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),

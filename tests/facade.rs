@@ -603,7 +603,7 @@ async fn facade_core_only_operations() {
     .open_stream(
       StreamTarget::MatchingNodes(selector),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1)
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1)
         .unwrap()
         .load_balancer(radiata::QualifiedTag::parse(LOAD_BALANCER).unwrap()),
       StreamMetadata::new(),
@@ -796,7 +796,7 @@ async fn resource_labels_never_enable_protocols() {
     .open_stream(
       StreamTarget::Exact(member.handle.local_node().await.unwrap().node_id().clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap_err();

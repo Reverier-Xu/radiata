@@ -1639,7 +1639,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
     .open_stream(
       radiata::StreamTarget::Exact(nodes[15].id.clone()),
       radiata::ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      radiata::StreamPolicy::new(radiata::RoutingPolicy::Direct, 1).unwrap(),
+      radiata::StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 1).unwrap(),
       radiata::StreamMetadata::new(),
     )
     .unwrap();

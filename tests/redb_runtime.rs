@@ -362,7 +362,7 @@ async fn redb_runtime_shutdown_releases_the_file_lock_with_inflight_trace_persis
           .send(
             target,
             protocol.clone(),
-            StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+            StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
             trace_lane_body(index),
           )
           .await

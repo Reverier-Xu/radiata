@@ -35,18 +35,70 @@ use crate::{
   extension_registry::ExtensionRegistry, runtime::RuntimeClient,
 };
 
-/// The caller-selected routing policy for one stream.
+/// The caller-selected routing policy for one stream: the canonical tag
+/// of a policy registered in the node's
+/// [`ExtensionRegistry`](crate::ExtensionRegistry). The tag resolves at
+/// admission, so an unregistered policy fails typed there instead of
+/// silently falling back.
 ///
-/// Typed so the compiler rejects unknown or misspelled policies at build
-/// time; the direct exact-node policy is the only routing policy, and
-/// selection among label-matching members goes through
-/// [`StreamTarget::MatchingNodes`] with the registered load balancer.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoutingPolicy {
-  /// Delivers directly over the authenticated session to the exact
-  /// destination node.
-  Direct,
+/// The built-in [`RoutingPolicy::DIRECT`] policy never relays: a stream
+/// under it is delivered over the authenticated session to the exact
+/// destination node, and the node's configured route policy selects a
+/// first hop when the destination is not directly connected (the
+/// pre-policy behavior). Any other registered policy selects the next
+/// hop for its stream itself. Selection among label-matching members is
+/// a separate concern: [`StreamTarget::MatchingNodes`] with the
+/// registered load balancer.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RoutingPolicy(QualifiedTag);
+
+impl RoutingPolicy {
+  /// The built-in direct policy: the stream carries no relay policy of
+  /// its own, so the node's configured route policy keeps deciding the
+  /// first hop of a destination that is not directly connected.
+  pub const DIRECT: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/route-policies/direct",
+  ));
+
+  /// Parses one routing-policy tag: any canonical qualified tag. The
+  /// built-in policies live under the built-in domain's
+  /// `route-policies` category; a caller-defined policy is any tag under
+  /// a caller-owned domain — exactly the registration key of the
+  /// caller's [`crate::RouteNextHop`] implementation.
+  pub fn parse(value: &str) -> Result<Self> {
+    Ok(Self(QualifiedTag::parse(value)?))
+  }
+
+  /// The canonical tag text.
+  pub fn as_str(&self) -> &str {
+    self.0.as_str()
+  }
+
+  /// The policy's qualified tag: the extension registry's lookup key.
+  pub const fn tag(&self) -> &QualifiedTag {
+    &self.0
+  }
+}
+
+impl From<QualifiedTag> for RoutingPolicy {
+  fn from(tag: QualifiedTag) -> Self {
+    Self(tag)
+  }
+}
+
+impl fmt::Display for RoutingPolicy {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(self.as_str())
+  }
+}
+
+impl fmt::Debug for RoutingPolicy {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_tuple("RoutingPolicy")
+      .field(&self.as_str())
+      .finish()
+  }
 }
 
 /// The maximum number of metadata entries in one stream.
@@ -81,16 +133,10 @@ pub struct StreamPolicy {
 }
 
 impl StreamPolicy {
-  /// Selects a routing policy and a nonzero hop budget.
-  ///
-  /// The built-in direct policy is the only routing policy: the
-  /// exhaustive match below makes any future `RoutingPolicy` variant a
-  /// compile error here until its routing semantics are defined, so an
-  /// unroutable policy can never be constructed silently.
+  /// Selects a routing policy and a nonzero hop budget. The policy tag is
+  /// resolved against the extension registry at admission, so a tag no
+  /// registration names fails there instead of silently routing direct.
   pub fn new(routing_policy: RoutingPolicy, max_hops: u32) -> Result<Self> {
-    match routing_policy {
-      RoutingPolicy::Direct => {}
-    }
     if max_hops == 0 {
       return Err(Error::invalid_input("stream hop budget"));
     }
@@ -99,6 +145,12 @@ impl StreamPolicy {
       load_balancing: None,
       max_hops,
     })
+  }
+
+  /// The built-in direct policy with a nonzero hop budget: the
+  /// convenience form of [`StreamPolicy::new`] for the common case.
+  pub fn direct(max_hops: u32) -> Result<Self> {
+    Self::new(RoutingPolicy::DIRECT, max_hops)
   }
 
   /// Selects a load-balancing policy for matching-node targets. Exact-node
@@ -207,6 +259,7 @@ impl Stream for StaticBody {
 pub struct OutboundStream {
   trace_id: TraceId,
   target: StreamTarget,
+  routing_policy: RoutingPolicy,
   load_balancer: Option<QualifiedTag>,
   max_hops: u32,
   protocol: ProtocolTag,
@@ -216,14 +269,15 @@ pub struct OutboundStream {
 
 impl OutboundStream {
   pub(crate) fn new(
-    trace_id: TraceId, target: StreamTarget, load_balancer: Option<QualifiedTag>, max_hops: u32,
-    protocol: ProtocolTag, metadata: StreamMetadata, runtime: RuntimeClient,
+    trace_id: TraceId, target: StreamTarget, policy: StreamPolicy, protocol: ProtocolTag,
+    metadata: StreamMetadata, runtime: RuntimeClient,
   ) -> Self {
     Self {
       trace_id,
       target,
-      load_balancer,
-      max_hops,
+      routing_policy: policy.routing_policy().clone(),
+      load_balancer: policy.load_balancing_policy().cloned(),
+      max_hops: policy.max_hops(),
       protocol,
       metadata,
       runtime,
@@ -278,6 +332,7 @@ impl OutboundStream {
     let inner = OutboundRequest {
       trace_id: self.trace_id,
       target: self.target,
+      routing_policy: self.routing_policy,
       load_balancer: self.load_balancer,
       max_hops: self.max_hops,
       protocol: self.protocol,
@@ -466,7 +521,9 @@ impl IncomingStream {
   }
 
   /// The one derivation both reply variants share: the registry gate and
-  /// the reply's target, trace, and budget wiring.
+  /// the reply's target, trace, and budget wiring. A reply carries the
+  /// built-in direct routing policy: it is addressed to the exact
+  /// authenticated source, so no stream-level relay policy applies.
   fn derive_reply(
     &self, protocol: ProtocolTag, metadata: StreamMetadata, max_hops: u32,
   ) -> Result<OutboundStream> {
@@ -479,8 +536,7 @@ impl IncomingStream {
     Ok(OutboundStream::new(
       self.trace_id.clone(),
       StreamTarget::Exact(self.source.clone()),
-      None,
-      max_hops,
+      StreamPolicy::direct(max_hops)?,
       protocol,
       metadata,
       self.reply.runtime.clone(),
@@ -618,6 +674,10 @@ pub(crate) type RoutedAckOutcome = Result<RoutedAck, ErrorKind>;
 pub(crate) struct OutboundRequest {
   pub(crate) trace_id: TraceId,
   pub(crate) target: StreamTarget,
+  /// The stream's routing policy tag: resolved in the extension registry
+  /// at admission, before the node-level route policy decides a first
+  /// hop.
+  pub(crate) routing_policy: RoutingPolicy,
   pub(crate) load_balancer: Option<QualifiedTag>,
   pub(crate) max_hops: u32,
   pub(crate) protocol: ProtocolTag,
@@ -892,19 +952,22 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::Unsupported);
   }
 
-  /// The direct policy is the only routable policy: `RoutingPolicy` is
-  /// `#[non_exhaustive]` with exactly one variant today, so no non-direct
-  /// value can even be constructed. The invariant is enforced twice — by
-  /// the type system (no other variant exists to build) and by the
-  /// exhaustive `match` in `StreamPolicy::new`, which turns any future
-  /// variant into a compile error at the construction gate until its
-  /// routing semantics are defined. This test pins the direct path: the
-  /// policy is accepted and carried unchanged.
+  /// The built-in direct policy is a canonical tag under the built-in
+  /// domain, and the stream policy carries it unchanged: the tag is the
+  /// registry key the admission plane resolves.
   #[test]
   fn stream_policy_accepts_the_direct_routing_policy() {
-    let policy = StreamPolicy::new(RoutingPolicy::Direct, 4).unwrap();
-    assert_eq!(policy.routing_policy(), &RoutingPolicy::Direct);
+    let policy = StreamPolicy::direct(4).unwrap();
+    assert_eq!(policy.routing_policy(), &RoutingPolicy::DIRECT);
+    assert_eq!(
+      policy.routing_policy().as_str(),
+      "radiata.woooo.tech/route-policies/direct"
+    );
     assert_eq!(policy.max_hops(), 4);
+    assert_eq!(
+      RoutingPolicy::parse(policy.routing_policy().as_str()).unwrap(),
+      RoutingPolicy::DIRECT
+    );
   }
 
   fn key(name: &str) -> QualifiedTag {

@@ -448,6 +448,33 @@
 //! # }
 //! ```
 //!
+//! The node-level policy above is the node's default. A stream may also
+//! carry a routing policy of its own:
+//! [`StreamPolicy`](crate::StreamPolicy) names a
+//! [`RoutingPolicy`](crate::RoutingPolicy) tag, and admission resolves it
+//! in the same registry before the node-level policy decides a first
+//! hop. The built-in
+//! [`RoutingPolicy::DIRECT`](crate::RoutingPolicy::DIRECT) carries no
+//! relay policy of its own, so such a stream keeps the node-level
+//! behavior; any other registered policy selects the next hop for its
+//! stream and is authoritative for it (its rejection fails the route
+//! instead of falling back).
+//!
+//! ```no_run
+//! # use radiata::{ExtensionRegistry, QualifiedTag, RouteNextHop, RoutingPolicy, StreamPolicy};
+//! # use std::sync::Arc;
+//! # fn demo() -> radiata::Result<()> {
+//! let mut registry = ExtensionRegistry::new();
+//! let tag = QualifiedTag::parse("example.woooo.tech/route-policies/shard")?;
+//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop);
+//! registry.register_routing_policy(tag.clone(), policy)?;
+//! let stream = StreamPolicy::new(RoutingPolicy::from(tag), 8)?;
+//! // StreamPolicy::direct(8) is the same policy under the built-in tag.
+//! # let _ = stream;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## The delivery contract: best-effort, healed by caller retry
 //!
 //! Routed delivery is best-effort, and deliberately so: the library

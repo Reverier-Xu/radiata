@@ -159,7 +159,7 @@ async fn send_chunks(sender: &NodeHandle, peer: &NodeId, count: usize, payload: 
     .open_stream(
       StreamTarget::Exact(peer.clone()),
       ProtocolTag::parse("radiata.woooo.tech/protocols/bench").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();

@@ -818,7 +818,7 @@ async fn send_one(
     .open_stream(
       StreamTarget::Exact(target.clone()),
       ProtocolTag::parse(MEASURE_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, budget).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, budget).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -1703,7 +1703,7 @@ async fn run_failure_cells(
       .open_stream(
         StreamTarget::Exact(target),
         ProtocolTag::parse(MEASURE_PROTOCOL).unwrap(),
-        StreamPolicy::new(RoutingPolicy::Direct, OPEN_BUDGET).unwrap(),
+        StreamPolicy::new(RoutingPolicy::DIRECT, OPEN_BUDGET).unwrap(),
         StreamMetadata::new(),
       )
       .unwrap();

@@ -60,7 +60,6 @@ pub(crate) struct ProtocolRegistration {
 /// [`crate::NodeBuilder::extensions`]; core protocols are registered by
 /// the runtime at startup through
 /// `ExtensionRegistry::register_core_protocol`.
-#[derive(Default)]
 pub struct ExtensionRegistry {
   features: std::sync::Mutex<BTreeMap<crate::FeatureTag, crate::FeatureDefinition>>,
   protocols: std::sync::RwLock<BTreeMap<ProtocolTag, Arc<ProtocolRegistration>>>,
@@ -71,9 +70,42 @@ pub struct ExtensionRegistry {
   load_balancers:
     std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
   next_hops: std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
+  /// The stream-level routing policies, keyed by the stream's
+  /// [`crate::RoutingPolicy`] tag: the built-in direct policy is seeded
+  /// here and a caller registers its own through
+  /// [`ExtensionRegistry::register_routing_policy`].
+  routing_policies: std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>>>,
   resource_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ResourceHook>>>,
   action_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ActionHook>>>,
   task_reconcilers: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::TaskReconciler>>>,
+}
+
+impl Default for ExtensionRegistry {
+  /// The empty registry with the built-in routing policies seeded: the
+  /// direct policy is always resolvable, so a stream under
+  /// [`crate::RoutingPolicy::DIRECT`] never depends on a caller
+  /// registration. Caller registrations under the built-in domain are
+  /// refused, so the seeded entry cannot be shadowed.
+  fn default() -> Self {
+    let mut routing_policies: BTreeMap<crate::QualifiedTag, Arc<dyn crate::RouteNextHop>> =
+      BTreeMap::new();
+    routing_policies.insert(
+      crate::RoutingPolicy::DIRECT.tag().clone(),
+      Arc::new(crate::routing::DirectRouting),
+    );
+    Self {
+      features: std::sync::Mutex::new(BTreeMap::new()),
+      protocols: std::sync::RwLock::new(BTreeMap::new()),
+      transports: BTreeMap::new(),
+      schemes: BTreeMap::new(),
+      load_balancers: std::sync::RwLock::new(BTreeMap::new()),
+      next_hops: std::sync::RwLock::new(BTreeMap::new()),
+      routing_policies: std::sync::RwLock::new(routing_policies),
+      resource_hooks: std::sync::Mutex::new(BTreeMap::new()),
+      action_hooks: std::sync::Mutex::new(BTreeMap::new()),
+      task_reconcilers: std::sync::Mutex::new(BTreeMap::new()),
+    }
+  }
 }
 
 impl ExtensionRegistry {
@@ -299,6 +331,43 @@ impl ExtensionRegistry {
       .and_then(|policies| policies.get(tag).cloned())
   }
 
+  /// Registers one stream-level routing policy under the stream's
+  /// [`crate::RoutingPolicy`] tag: the registered [`crate::RouteNextHop`]
+  /// implementation selects the next hop for every stream carrying that
+  /// policy. A duplicate tag is a conflict; registration never replaces
+  /// an existing entry. The built-in `radiata.woooo.tech` domain is
+  /// reserved — the built-in direct policy is seeded there and cannot be
+  /// shadowed — so a caller policy registers under a caller-owned
+  /// domain.
+  pub fn register_routing_policy(
+    &mut self, tag: crate::QualifiedTag, value: Arc<dyn crate::RouteNextHop>,
+  ) -> Result<&mut Self> {
+    if tag.domain() == crate::protocol::tag::BUILTIN_DOMAIN {
+      return Err(Error::invalid_input("routing policy tag"));
+    }
+    {
+      let mut policies = self
+        .routing_policies
+        .write()
+        .map_err(Error::extension_registry)?;
+      insert_once(&mut policies, tag, value, "routing policy registration")?;
+    }
+    Ok(self)
+  }
+
+  /// The registered routing policy for one stream tag, when present. The
+  /// admission plane resolves a stream's [`crate::RoutingPolicy`] here
+  /// before the node-level route policy decides a first hop.
+  pub(crate) fn routing_policy(
+    &self, tag: &crate::QualifiedTag,
+  ) -> Option<Arc<dyn crate::RouteNextHop>> {
+    self
+      .routing_policies
+      .read()
+      .ok()
+      .and_then(|policies| policies.get(tag).cloned())
+  }
+
   /// Registers one resource-write hook under a canonical tag. All hooks
   /// registered here run in canonical tag order; a duplicate tag is a
   /// conflict and registration never replaces an existing entry.
@@ -471,6 +540,14 @@ impl fmt::Debug for ExtensionRegistry {
         "next_hops",
         &self
           .next_hops
+          .read()
+          .map(|policies| policies.len())
+          .unwrap_or(0),
+      )
+      .field(
+        "routing_policies",
+        &self
+          .routing_policies
           .read()
           .map(|policies| policies.len())
           .unwrap_or(0),
@@ -766,5 +843,44 @@ mod tests {
       .register_next_hop(tag, Arc::new(crate::routing::DefaultNextHop))
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Conflict);
+  }
+
+  /// The routing-policy registry is born with the built-in direct policy
+  /// and follows the other registries' rules: the built-in domain is
+  /// reserved (the direct tag cannot be shadowed), a caller policy
+  /// registers under a caller-owned domain, and a duplicate tag stays a
+  /// conflict.
+  #[test]
+  fn routing_policy_registry_seeds_direct_and_reserves_the_builtin_domain() {
+    let mut registry = ExtensionRegistry::new();
+    assert!(
+      registry
+        .routing_policy(crate::RoutingPolicy::DIRECT.tag())
+        .is_some(),
+      "the built-in direct policy is always resolvable"
+    );
+
+    let reserved = registry
+      .register_routing_policy(
+        crate::RoutingPolicy::DIRECT.tag().clone(),
+        Arc::new(crate::routing::DefaultNextHop),
+      )
+      .unwrap_err();
+    assert_eq!(reserved.kind(), ErrorKind::InvalidInput);
+    assert_eq!(reserved.context(), "routing policy tag");
+
+    let caller = crate::QualifiedTag::parse("example.com/route-policies/shortest").unwrap();
+    registry
+      .register_routing_policy(caller.clone(), Arc::new(crate::routing::DefaultNextHop))
+      .unwrap();
+    assert!(registry.routing_policy(&caller).is_some());
+    let duplicate = registry
+      .register_routing_policy(caller, Arc::new(crate::routing::DefaultNextHop))
+      .unwrap_err();
+    assert_eq!(duplicate.kind(), ErrorKind::Conflict);
+    assert!(
+      format!("{registry:?}").contains("routing_policies: 2"),
+      "the debug summary counts the seeded and caller policies"
+    );
   }
 }

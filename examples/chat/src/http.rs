@@ -251,7 +251,7 @@ async fn send_wire(
   // typical depth: a 32-node chain relay needs 31 hops (an 8-hop budget
   // never delivered across it), and routes are loop-free by validation,
   // so a generous budget costs nothing beyond one check per hop.
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 128).map_err(|error| error.to_string())?;
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 128).map_err(|error| error.to_string())?;
   let chunk: Arc<[u8]> = Arc::from(payload.into_boxed_slice());
   let body = futures_util::stream::iter([Ok(chunk)]);
   state

@@ -3,6 +3,7 @@ pub(crate) mod cleanup;
 pub(crate) mod credential;
 pub(crate) mod deletion;
 pub(crate) mod id;
+pub(crate) mod lane;
 pub(crate) mod leave;
 pub(crate) mod lifecycle;
 pub(crate) mod merge;

@@ -30,11 +30,12 @@ use crate::{
   },
   protocol::wire::PacketKind,
   routing::{
-    forward::{self, PendingAck, PendingAcks, SessionIdentity},
+    forward::{self, PendingAck, SessionIdentity},
     outbound::record_route_terminal,
     table::{record_terminal_failure, update_route},
     trace::TraceTransition,
   },
+  session::pending::PendingAdmissions,
   transport::connection::ConnectionReader,
 };
 
@@ -184,7 +185,7 @@ impl Drop for ConsumerDrainGuard {
 /// orderly exit below.
 pub(super) async fn read_loop(
   source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
-  frames: &BoundedSender, pending_acks: &PendingAcks,
+  frames: &BoundedSender, pending_acks: &PendingAdmissions,
   last_activity: &Arc<std::sync::atomic::AtomicU64>,
 ) {
   // Registered at entry: the cancellation path must drain consumers too.
@@ -212,7 +213,7 @@ pub(super) async fn read_loop(
 /// reap and the guard's teardown.
 async fn read_loop_frames(
   source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
-  frames: &BoundedSender, pending_acks: &PendingAcks,
+  frames: &BoundedSender, pending_acks: &PendingAdmissions,
   last_activity: &Arc<std::sync::atomic::AtomicU64>, consumers: &mut ConsumerDrainGuard,
 ) {
   let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
@@ -915,13 +916,8 @@ async fn forward_chunk(
 /// entry was resolved: an admitted forwarding hop's waiter was already
 /// consumed when admission resolved, and its later flow-control events
 /// relay upstream through the hop itself instead.
-fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) -> bool {
-  let entry = pending_acks
-    .lock()
-    .map(|mut pending| pending.remove(&ack.trace_id))
-    .ok()
-    .flatten();
-  let Some(entry) = entry else {
+fn resolve_ack(ack: AckFrame, pending_acks: &PendingAdmissions) -> bool {
+  let Some(entry) = pending_acks.take(&ack.trace_id) else {
     return false;
   };
   match entry {
@@ -1228,7 +1224,7 @@ mod admission_tests {
 #[cfg(test)]
 mod read_loop_liveness_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{
       Arc, Mutex,
       atomic::{AtomicU64, Ordering},
@@ -1248,7 +1244,10 @@ mod read_loop_liveness_tests {
     identity::testing::SequenceEntropy,
     node::EventHub,
     routing::forward::SessionIdentity,
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     storage::contract::helpers::ManualClock,
     transport::Received,
   };
@@ -1350,7 +1349,7 @@ mod read_loop_liveness_tests {
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
 
     read_loop(
       &mut source,
@@ -1392,7 +1391,7 @@ mod read_loop_liveness_tests {
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(AtomicU64::new(1));
 
     // The silent source parks the loop; the bounded timeout cancels it.
@@ -1434,7 +1433,7 @@ mod read_loop_liveness_tests {
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(AtomicU64::new(1));
 
     read_loop(
@@ -1470,7 +1469,7 @@ mod read_loop_liveness_tests {
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(AtomicU64::new(1));
 
     // The loop borrows the guard, so the set stays observable between the
@@ -1549,7 +1548,6 @@ mod read_loop_liveness_tests {
 #[cfg(test)]
 mod ack_attribution_tests {
   use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -1568,11 +1566,12 @@ mod ack_attribution_tests {
     },
     routing::{
       RouteContext,
-      forward::{
-        ForwardingHop, HopPhase, PendingAck, PendingAcks, RetryState, SessionIdentity, register,
-      },
+      forward::{ForwardingHop, HopPhase, PendingAck, RetryState, SessionIdentity, register},
     },
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
@@ -1664,14 +1663,14 @@ mod ack_attribution_tests {
 
   fn hop_on(
     upstream: crate::session::stream::BoundedSender,
-    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAdmissions,
     downstream_session: SessionIdentity,
   ) -> ForwardingHop {
     let trace_id = trace(9);
     ForwardingHop {
       upstream,
       downstream,
-      downstream_acks: Arc::clone(&downstream_acks),
+      downstream_acks: downstream_acks.clone(),
       upstream_session: other_session(3, 1),
       downstream_session,
       relay_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1697,7 +1696,7 @@ mod ack_attribution_tests {
   /// admission acknowledgement already consumed from the pending map.
   fn admitted_hop_on(
     upstream: crate::session::stream::BoundedSender,
-    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAdmissions,
     downstream_session: SessionIdentity,
   ) -> ForwardingHop {
     let mut hop = hop_on(upstream, downstream, downstream_acks, downstream_session);
@@ -1711,7 +1710,8 @@ mod ack_attribution_tests {
   /// dropped the queue". The source ends the session orderly after the
   /// acknowledgement, so the loop always terminates within the timeout.
   async fn deliver_ack(
-    grant: &SessionGrant, context: &SessionPacketContext, pending_acks: &PendingAcks, body: Vec<u8>,
+    grant: &SessionGrant, context: &SessionPacketContext, pending_acks: &PendingAdmissions,
+    body: Vec<u8>,
   ) -> (
     crate::session::stream::BoundedSender,
     crate::session::stream::BoundedReceiver,
@@ -1753,13 +1753,16 @@ mod ack_attribution_tests {
     // try (any bogus failure handling would exhaust it and fail the
     // route upstream immediately).
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let live_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
-    live_acks.lock().unwrap().insert(
-      trace_id.clone(),
-      PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let live_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    live_acks
+      .try_reserve_admission(
+        &trace_id,
+        PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1767,7 +1770,7 @@ mod ack_attribution_tests {
       hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&live_acks),
+        live_acks.clone(),
         // A different session than the one delivering the late ack: the
         // hop already re-dispatched to another branch.
         other_session(7, 5),
@@ -1777,7 +1780,8 @@ mod ack_attribution_tests {
 
     // The superseded branch's session map: its entry was already
     // consumed when the hop re-dispatched.
-    let stale_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let stale_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let body = crate::packet::wire::encode_ack(&AckFrame {
       trace_id: trace_id.clone(),
       status: AckStatus::Failed,
@@ -1796,7 +1800,7 @@ mod ack_attribution_tests {
       &trace_id
     ));
     // The live attempt's pending entry survived.
-    assert!(live_acks.lock().unwrap().contains_key(&trace_id));
+    assert!(live_acks.contains(&trace_id));
     // Nothing failed upstream and no frame left the stale session.
     use futures_util::FutureExt;
     assert!(upstream_rx.recv().now_or_never().is_none());
@@ -1819,7 +1823,8 @@ mod ack_attribution_tests {
     // the session's pending map is empty and the hop alone represents the
     // stream from here on.
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let session_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1827,7 +1832,7 @@ mod ack_attribution_tests {
       admitted_hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&session_acks),
+        session_acks.clone(),
         grant.identity().clone(),
       ),
     )
@@ -1879,7 +1884,8 @@ mod ack_attribution_tests {
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     // The hop's bound attempt is another incarnation of the delivering
     // peer, so its pending map is not the one this session acknowledges on.
-    let bound_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let bound_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1887,13 +1893,14 @@ mod ack_attribution_tests {
       admitted_hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&bound_acks),
+        bound_acks.clone(),
         other_session(2, 7),
       ),
     )
     .unwrap();
 
-    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let session_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let body = crate::packet::wire::encode_ack(&AckFrame {
       trace_id: trace_id.clone(),
       status: AckStatus::Failed,
@@ -1926,7 +1933,8 @@ mod ack_attribution_tests {
     let context = context();
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let session_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1934,7 +1942,7 @@ mod ack_attribution_tests {
       admitted_hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&session_acks),
+        session_acks.clone(),
         grant.identity().clone(),
       ),
     )
@@ -1957,7 +1965,7 @@ mod ack_attribution_tests {
 #[cfg(test)]
 mod durable_mirror_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -1977,7 +1985,10 @@ mod durable_mirror_tests {
       forward::SessionIdentity,
       trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
     },
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
@@ -2071,7 +2082,7 @@ mod durable_mirror_tests {
     .unwrap();
     let mut source = AckSource { body };
     let (frames, _frames_rx) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     tokio::time::timeout(
@@ -2230,7 +2241,7 @@ mod durable_mirror_tests {
 #[cfg(test)]
 mod slow_consumer_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -2250,7 +2261,10 @@ mod slow_consumer_tests {
       wire::{BASE_SCHEMA_ID, PacketKind},
     },
     routing::forward::SessionIdentity,
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
@@ -2537,7 +2551,7 @@ mod slow_consumer_tests {
     let context = context(Arc::new(registry));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // The window fills, then the next chunk overflows it and spends the
@@ -2631,7 +2645,7 @@ mod slow_consumer_tests {
     let context = context(Arc::new(registry));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // A body that fits the window: the wire end queues as the terminal
@@ -2700,7 +2714,7 @@ mod slow_consumer_tests {
     let context = session_for(Arc::clone(&consumer));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Two slices above the window: the overflowing slice spends the
@@ -2767,7 +2781,7 @@ mod slow_consumer_tests {
     let context = session_for(Arc::clone(&consumer));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // The stalled stream fills its window and spends its grace on the next
@@ -2842,7 +2856,7 @@ mod slow_consumer_tests {
 #[cfg(test)]
 mod consumer_lifecycle_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -2861,7 +2875,10 @@ mod consumer_lifecycle_tests {
       wire::{BASE_SCHEMA_ID, PacketKind},
     },
     routing::forward::SessionIdentity,
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
@@ -3040,7 +3057,7 @@ mod consumer_lifecycle_tests {
     let context = context(Arc::clone(&consumer), 8);
     let grant = grant(2, 1);
     let (frames, _frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Four complete wire streams: every End frees the table entry, so the
@@ -3098,7 +3115,7 @@ mod consumer_lifecycle_tests {
     let context = context(Arc::clone(&consumer), 2);
     let grant = grant(2, 1);
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Two complete wire streams whose consumers stay parked past EOF; the
@@ -3167,7 +3184,7 @@ mod consumer_lifecycle_tests {
       accepted: Arc::new(Mutex::new(Vec::new())),
     });
     let context = context(Arc::clone(&consumer), 8);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Session A: one complete stream, then the session ends orderly — the

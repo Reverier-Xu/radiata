@@ -11,7 +11,7 @@
 //! follows it, and never touches anything outside the single core record
 //! key, so upper-layer objects and caller data are untouched.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::{Result, StoreKey, StoreOperation, storage::MetadataStore, time::WallClock};
 
@@ -35,6 +35,48 @@ const REMOVAL_SWEEP_DOMAIN: &[u8] = b"radiata.woooo.tech/resource-removal/sweep/
 /// alongside the retention window
 /// ([`crate::NodeConfig::with_resource_removal_retention`]).
 pub(crate) const RESOURCE_REGISTER_CAP: usize = 262_144;
+
+/// Whether one removal record's retention window has elapsed at `now`:
+/// the retention contract this sweep itself enforces — both read the
+/// caller's configured window
+/// ([`crate::NodeConfig::with_resource_removal_retention`]), so an
+/// elapsed window is the real basis on which a gone store key reads as
+/// reclaimed knowledge, never key absence alone. A record stamped in the
+/// future (clock skew, or a fixture) is not elapsed: the window runs from
+/// the record's own timestamp, conservatively.
+pub(crate) fn removal_retention_elapsed(
+  record: &super::ResourceRecordV1, now: SystemTime, retention: Duration,
+) -> bool {
+  now
+    .duration_since(record.timestamp())
+    .is_ok_and(|age| age >= retention)
+}
+
+/// Whether one resources-lane row's own record is an expired removal at
+/// `now`, independent of the local store's key: the sweep's per-record
+/// half of the reclaim predicate.
+pub(crate) fn removal_expired(content: &[u8], now: SystemTime, retention: Duration) -> bool {
+  super::ResourceRecordV1::decode(content)
+    .ok()
+    .is_some_and(|record| record.removed() && removal_retention_elapsed(&record, now, retention))
+}
+
+/// Whether one resources-lane row is retention-reclaimed evidence: a
+/// `removed()` record whose retention window has already elapsed while the
+/// local store no longer holds its key. The tombstone lane's collected-mode
+/// mirror, with the retention deadline as the reclaim basis: key absence
+/// alone is not a verdict — a node that never held the resource knows
+/// nothing either way, so a fresh deletion stays legitimate evidence
+/// (dropping it is what let a later, older live value resurrect), while a
+/// record past its retention deadline is reclaimed knowledge on any node.
+/// Swept rows leave the engines (the prune), never re-enter them (the
+/// receive filter), and a newly primed peer does not receive the expired
+/// historical removal set back.
+pub(crate) fn reclaimed(
+  key_present: bool, content: &[u8], now: SystemTime, retention: Duration,
+) -> bool {
+  !key_present && removal_expired(content, now, retention)
+}
 
 /// One fresh removal seen during the scan, ordered by timestamp so a
 /// heap bounded by the cap can track the oldest candidates without
@@ -122,9 +164,7 @@ pub(crate) async fn sweep_removed_ctx(
     }
     let key = StoreKey::new(std::sync::Arc::from(entry.key().as_bytes().to_vec()));
     let digest = entry.value().digest().clone();
-    let expired = now
-      .duration_since(record.timestamp())
-      .is_ok_and(|age| age >= retention);
+    let expired = removal_retention_elapsed(&record, now, retention);
     if expired {
       // The per-pass delete batch is bounded (the receipt sweep's twin
       // bound); the overflow stays due for the next pass.

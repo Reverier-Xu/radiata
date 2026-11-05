@@ -379,7 +379,7 @@ async fn send_request(nodes: &[Node]) -> String {
     .open_stream(
       StreamTarget::Exact(nodes[3].id().clone()),
       protocol,
-      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();

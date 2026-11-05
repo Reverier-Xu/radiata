@@ -122,6 +122,17 @@ impl PacketAdmission {
       request.reject(error.kind());
       return Err(error);
     }
+    // The stream's routing policy resolves here, before the node-level
+    // route policy decides a first hop: an unregistered tag fails typed
+    // at admission instead of silently routing direct.
+    let stream_policy = match self.extensions.routing_policy(request.routing_policy.tag()) {
+      Some(policy) => policy,
+      None => {
+        self.record_route_failure(&trace_id, ErrorKind::InvalidInput);
+        request.reject(ErrorKind::InvalidInput);
+        return Ok(None);
+      }
+    };
     self
       .events
       .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
@@ -145,19 +156,27 @@ impl PacketAdmission {
       .map_err(Error::session_table)?
       .get(&destination)
       .cloned();
-    // A direct path is preferred; without one, the node's registered
-    // next-hop policy may route through a connected peer. The
-    // pump then emits the route envelope so every intermediate hop
-    // re-validates the chain.
+    // A direct path is preferred; without one, the stream's routing
+    // policy may route through a connected peer. The pump then emits the
+    // route envelope so every intermediate hop re-validates the chain.
     let direct = entry.filter(|entry| entry.alive());
     debug!(
       destination = %destination,
       direct = direct.is_some(),
+      routing_policy = %request.routing_policy,
       "routing packet toward destination"
     );
     let (entry, force_routed) = match direct {
       Some(entry) => (entry, false),
-      None => match self.select_forward_entry(&trace_id, &destination).await {
+      None => match self
+        .select_forward_entry(
+          &trace_id,
+          &destination,
+          &request.routing_policy,
+          stream_policy,
+        )
+        .await
+      {
         Ok(Some(entry)) => (entry, true),
         // No eligible hop exists: the caller observes the typed refusal
         // through the request's rejection and the recorded route
@@ -211,32 +230,43 @@ impl PacketAdmission {
       )));
   }
 
-  /// Resolves one live downstream session for a routed first hop through
-  /// the node's effective next-hop policy (the caller selection, or the
-  /// built-in default policy). `Ok(None)` means no eligible hop exists and
-  /// the caller fails the route explicitly.
+  /// Resolves one live downstream session for a routed first hop. The
+  /// stream's own routing policy decides the hop; the built-in direct
+  /// policy never relays, so a stream under it keeps the node-level route
+  /// policy's behavior (the caller selection, or the built-in default
+  /// policy). `Ok(None)` means no eligible hop exists and the caller
+  /// fails the route explicitly.
   async fn select_forward_entry(
-    &self, trace: &TraceId, destination: &NodeId,
+    &self, trace: &TraceId, destination: &NodeId, routing_policy: &crate::RoutingPolicy,
+    stream_policy: Arc<dyn crate::RouteNextHop>,
   ) -> Result<Option<SessionEntry>> {
-    let tag = self.config.route_policy()?;
     let local = self.local.clone();
     let peers = crate::sync_common::alive_peers(&self.sessions)?;
-    let hop = match crate::routing::resolve_next_hop(
-      &self.extensions,
-      &tag,
-      trace,
-      destination,
-      &local,
-      &peers,
-    )
-    .await
-    {
-      Ok(Some(hop)) => hop,
-      Ok(None) => {
-        tracing::warn!(tag = %tag, "configured route policy is not registered");
-        return Ok(None);
+    let hop = if routing_policy.tag() == crate::RoutingPolicy::DIRECT.tag() {
+      let tag = self.config.route_policy()?;
+      match crate::routing::resolve_next_hop(
+        &self.extensions,
+        &tag,
+        trace,
+        destination,
+        &local,
+        &peers,
+      )
+      .await
+      {
+        Ok(Some(hop)) => hop,
+        Ok(None) => {
+          tracing::warn!(tag = %tag, "configured route policy is not registered");
+          return Ok(None);
+        }
+        Err(error) => return Err(error),
       }
-      Err(error) => return Err(error),
+    } else {
+      // A registered stream policy is authoritative for its stream: its
+      // rejection fails the route instead of falling back to the
+      // node-level policy.
+      crate::routing::next_hop_of(stream_policy.as_ref(), trace, destination, &local, &peers)
+        .await?
     };
     let entry = self
       .sessions

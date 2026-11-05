@@ -946,7 +946,7 @@ async fn relay_packet(from: &Slot, to: &Slot, what: &str) {
       .open_stream(
         StreamTarget::Exact(to.id().clone()),
         ProtocolTag::parse(ECHO_PROTOCOL).expect("static protocol tag"),
-        StreamPolicy::new(RoutingPolicy::Direct, NODES as u32).expect("valid policy"),
+        StreamPolicy::new(RoutingPolicy::DIRECT, NODES as u32).expect("valid policy"),
         StreamMetadata::new(),
       )
       .expect("open relay stream");

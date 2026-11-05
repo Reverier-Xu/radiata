@@ -565,7 +565,7 @@ impl RouteNextHop for PubNextHop {
 /// Stream policies, metadata, and targets are externally constructible.
 #[test]
 fn stream_surface_is_externally_constructible() {
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 3)
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 3)
     .unwrap()
     .load_balancer(QualifiedTag::parse("example.org/balancers/first").unwrap());
   assert_eq!(policy.max_hops(), 3);
@@ -573,7 +573,7 @@ fn stream_surface_is_externally_constructible() {
     policy.load_balancing_policy(),
     Some(&QualifiedTag::parse("example.org/balancers/first").unwrap())
   );
-  assert_eq!(policy.routing_policy(), &RoutingPolicy::Direct);
+  assert_eq!(policy.routing_policy(), &RoutingPolicy::DIRECT);
 
   let key = QualifiedTag::parse("example.org/pubs/hint").unwrap();
   let metadata = StreamMetadata::new()
@@ -952,7 +952,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .open_stream(
       StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -967,7 +967,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .send(
       StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       pub_body(b"pub-body"),
     )
     .await
@@ -1047,7 +1047,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .open_stream(
       StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();

@@ -539,7 +539,7 @@ fn metadata() -> StreamMetadata {
 }
 
 fn policy() -> StreamPolicy {
-  StreamPolicy::new(radiata::RoutingPolicy::Direct, 1).unwrap()
+  StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 1).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -323,7 +323,7 @@ async fn soak_churn_then_baseline_return() {
 
   let mut stats = WorkloadStats::default();
   let protocol = ProtocolTag::parse(SOAK_PROTOCOL).unwrap();
-  let policy = StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 8).unwrap();
   let started = Instant::now();
   let mut tick = 0_u64;
   let mut last_resource: Option<(ResourceName, radiata::ResourceVersion)> = None;

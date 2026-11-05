@@ -426,7 +426,7 @@ async fn assert_metadata_interop(issuer: &Node, member: &Node) {
 /// Ordered packet delivery in both directions across the mixed pair.
 async fn assert_packet_interop(issuer: &Node, member: &Node) {
   let protocol = ProtocolTag::parse(ECHO_PROTOCOL).unwrap();
-  let policy = StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 8).unwrap();
 
   // Prior initiator direction: member sends, issuer consumes.
   let packet = member
@@ -633,7 +633,7 @@ async fn prior_initiator_interops_with_current_responder() {
   // resurrection of the retired pair session, which stays gone from the
   // session page while the packet arrives.
   let protocol = ProtocolTag::parse(ECHO_PROTOCOL).unwrap();
-  let policy = StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 8).unwrap();
   let packet = issuer
     .handle
     .open_stream(

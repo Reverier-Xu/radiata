@@ -4,6 +4,12 @@
 //! One [`Engine`] per session and per lane lives behind this plane, fed
 //! through the five attachment points of the engine's lane seam:
 //!
+//! 0. **the lane seam** — everything lane-specific (the store namespaces, the
+//!    row projection, the reclaimed-evidence predicate, the receive filter, the
+//!    merge semantics, and the audit hooks) lives behind [`super::lane::Lane`],
+//!    implemented next to the module that owns the rows. This plane is
+//!    lane-agnostic: it plans, drives, applies, prunes, and audits through the
+//!    trait, so a lane change never edits it;
 //! 1. **local writes** — the driver's tick reads the store's namespace-granular
 //!    write epochs (the `note_local_write*` paths): only the lanes whose key
 //!    spaces actually changed are rescanned, every other lane is zero-scan in
@@ -67,8 +73,8 @@
 //! never take the old row back), and every newly primed peer re-receives
 //! the whole historical row set. The resources lane's swept filter carries
 //! the same reclaim discipline on the retention contract the sweep itself
-//! enforces: only a `removed()` record past its retention deadline whose key the
-//! store no longer holds is reclaimed knowledge (never re-admitted),
+//! enforces: only a `removed()` record past its retention deadline whose key
+//! the store no longer holds is reclaimed knowledge (never re-admitted),
 //! while a fresh deletion is legitimate evidence even on a node that
 //! never held the resource — key absence alone was never a reclaim
 //! verdict, and dropping fresh deletions let older live values
@@ -107,6 +113,7 @@ use minicbor::bytes::ByteVec;
 
 use super::{
   engine::{Drive, Engine},
+  lane::{LaneContext, LaneOutcome, LaneRows, ScanFilters},
   wire::{self, LaneId, Message},
 };
 use crate::{
@@ -129,13 +136,9 @@ pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/reconci
 
 /// The lanes this build carries on the engine: all four (descriptors,
 /// trust, resources, tombstones) migrated onto the plane, retiring the
-/// watermark walks entirely.
-const ACTIVE_LANES: [LaneId; 4] = [
-  LaneId::Descriptors,
-  LaneId::Trust,
-  LaneId::Resources,
-  LaneId::Tombstones,
-];
+/// watermark walks entirely. Derived from [`LaneId::ALL`], the single
+/// closed lane set.
+const ACTIVE_LANES: [LaneId; LaneId::ALL.len()] = LaneId::ALL;
 
 /// The peers one tick drives with a cadence ROOT exchange: the bounded
 /// fair window over the alive set — the old push-round bound repurposed
@@ -160,9 +163,6 @@ fn row_identity(key: &[u8], content: &[u8]) -> Vec<u8> {
   identity
 }
 
-/// One lane's canonical rows: `(key, content)` pairs in scan order.
-pub(crate) type LaneRows = Vec<(Vec<u8>, Vec<u8>)>;
-
 /// The per-lane row sets of one scan pass.
 type LaneScan = Vec<(LaneId, LaneRows)>;
 
@@ -172,19 +172,6 @@ type RepairIndex = BTreeMap<LaneId, BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>>;
 /// The messages one phase produced, each addressed to the peer it goes
 /// to.
 type Outbound = Vec<(NodeId, Message)>;
-
-/// The per-scan filter inputs every row-judging phase reads: the tombstone
-/// lane's collected-row watermark, the resources lane's swept-predicate
-/// host-clock sample, and the configured removal retention window. One
-/// value per scan keeps every row of a pass judged against one instant,
-/// and naming the fields keeps the two consumers from having to agree on
-/// an argument order.
-#[derive(Clone, Copy, Debug)]
-struct ScanFilters {
-  checkpoint: Option<u64>,
-  swept_at: std::time::SystemTime,
-  removal_retention: Duration,
-}
 
 /// One peer's plane state: one engine per active lane, the cadence
 /// counter, the session's link profile, and the bounded hint-retry slot.
@@ -444,11 +431,11 @@ impl PlaneState {
           };
           match state.engine(lane).drive(Drive::RootExchange) {
             Ok(messages) => {
-              // The same quiet-pass audit event the direct cadence
-              // drive emits: a released re-drive that observes
-              // agreement is a settled pass like any other.
-              if lane == LaneId::Resources && state.engine(lane).peer_agrees() {
-                crate::audit::resource_pass_settled(peer.as_str(), false);
+              // The same quiet-pass audit hook the direct cadence drive
+              // emits: a released re-drive that observes agreement is a
+              // settled pass like any other.
+              if state.engine(lane).peer_agrees() {
+                lane.policy().pass_settled(&peer);
               }
               outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
             }
@@ -582,7 +569,7 @@ impl ReconcilePlane {
     let rows: LaneScan = if plan.is_empty() {
       Vec::new()
     } else {
-      scan_lanes(store, &plan, filters.checkpoint).await?
+      scan_lanes(store, &plan, filters).await?
     };
     let mut outbound: Outbound = Vec::new();
     let mut repair: LaneScan = Vec::new();
@@ -698,15 +685,15 @@ impl ReconcilePlane {
 
   /// The per-scan filter inputs: the tombstone lane's collected-row
   /// watermark, read once per scan (the same predicate the apply
-  /// boundary fails open on), and the resources lane's swept-predicate
-  /// basis — the host clock plus the configured retention window, the
-  /// sweep's own contract and the one basis on which a gone store key
-  /// reads as reclaimed knowledge. One read per scan keeps every row of
-  /// a pass judged against one instant.
+  /// boundary fails open on) and only when a planned lane reads it, and
+  /// the resources lane's swept-predicate basis — the host clock plus the
+  /// configured retention window, the sweep's own contract and the one
+  /// basis on which a gone store key reads as reclaimed knowledge. One
+  /// read per scan keeps every row of a pass judged against one instant.
   async fn scan_filter_inputs(
     &self, store: &crate::storage::MetadataStore, plan: &BTreeSet<LaneId>,
   ) -> Result<ScanFilters> {
-    let checkpoint = if plan.contains(&LaneId::Tombstones) {
+    let checkpoint = if plan.iter().any(|lane| lane.policy().reads_checkpoint()) {
       crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await?
     } else {
       None
@@ -770,54 +757,22 @@ impl ReconcilePlane {
       _ => Vec::new(),
     };
     let carried = rows.len();
-    if !rows.is_empty() && lane == LaneId::Tombstones {
-      // The collected-row receive filter: a leave or cleanup record at
-      // or before the local checkpoint watermark never enters an
-      // engine (its fingerprints, its fan-out, and its repair-set
-      // candidacy alike) — re-admitting collected evidence is what
-      // made the GC rows re-propagate forever.
-      let checkpoint =
-        crate::identity::cleanup::latest_checkpoint_millis_ctx(self.shared.context()?.store())
-          .await?;
-      rows.retain(|(key, content)| !tombstone_collected(checkpoint, key, content));
-    }
-    if !rows.is_empty() && lane == LaneId::Resources {
-      // The retention-reclaimed receive filter, the tombstone mirror:
-      // a removal row past its retention deadline whose subject the
-      // local store no longer holds never enters an engine. The
-      // deadline is the sweep's own contract — the real basis a gone
-      // key needs before it reads as reclaimed knowledge. A fresh
-      // deletion is legitimate evidence even on a node that never held
-      // the resource (an older live value may still arrive later and
-      // must lose to it), so key absence alone never drops it: its
-      // subject is absent here either way, and admitting the row
-      // installs the tombstone that beats the late live value, while
-      // the local sweep reclaims the record at its own deadline.
+    if !rows.is_empty() {
+      // The lane's receive filter: the rows a peer re-delivered that must
+      // never enter an engine (collected tombstones, retention-swept
+      // removals) leave here, before any fingerprint, fan-out, or
+      // repair-set candidacy.
       let context = self.shared.context()?;
-      let store = context.store();
-      let namespace = crate::resource::store::namespace()?;
-      let snapshot = store.snapshot().await?;
-      let swept_at = std::time::SystemTime::now();
-      let removal_retention = self.shared.resource_removal_retention;
-      let mut retained = Vec::with_capacity(rows.len());
-      for (key, content) in rows {
-        let swept = crate::resource::ResourceRecordV1::decode(&content)
-          .ok()
-          .is_some_and(|record| {
-            record.removed() && removal_retention_elapsed(&record, swept_at, removal_retention)
-          })
-          && snapshot
-            .get(
-              &namespace,
-              &crate::StoreKey::new(std::sync::Arc::from(key.clone())),
-            )
-            .await?
-            .is_none();
-        if !swept {
-          retained.push((key, content));
-        }
-      }
-      rows = retained;
+      let lane_context = LaneContext {
+        context: &context,
+        entropy: &self.shared.entropy,
+        events: &self.shared.events,
+        revision: &self.shared.revision,
+        sessions: &self.shared.sessions,
+        authorization: &self.shared.authorization,
+        removal_retention: self.shared.resource_removal_retention,
+      };
+      lane.policy().receive(&lane_context, &mut rows).await?;
     }
     if !rows.is_empty() {
       // The store decides before any engine does: rows apply through
@@ -1052,11 +1007,6 @@ fn drive_peers(
   plane: &mut PlaneState, peers: &[NodeId], rows: &LaneScan, plan: &BTreeSet<LaneId>,
   listed: &LaneListed, filters: ScanFilters,
 ) -> (Outbound, Vec<(LaneId, NodeId)>) {
-  let ScanFilters {
-    checkpoint,
-    swept_at,
-    removal_retention,
-  } = filters;
   let mut outbound: Outbound = Vec::new();
   let mut prime_holds: Vec<(LaneId, NodeId)> = Vec::new();
   for peer in peers {
@@ -1132,9 +1082,9 @@ fn drive_peers(
     // The prune pass over the scanned lanes: engine rows the store no
     // longer lists leave the index — superseded identities (the key
     // survived under new content: a revision bump, a tuple loser) and
-    // collected tombstones (the checkpoint watermark's reclaim). Rows
-    // whose key the store does not hold at all stay: they are the
-    // derived-view repair set.
+    // the lane's reclaimed evidence (a collected tombstone, a
+    // retention-swept removal). Rows whose key the store does not hold at
+    // all stay: they are the derived-view repair set.
     for lane in ACTIVE_LANES {
       if !plan.contains(&lane) {
         continue;
@@ -1149,11 +1099,11 @@ fn drive_peers(
         if identities.contains(&identity) {
           continue;
         }
-        let collected_row =
-          lane == LaneId::Tombstones && tombstone_collected(checkpoint, key, content);
-        let swept_row = lane == LaneId::Resources
-          && resource_swept(keys, key, content, swept_at, removal_retention);
-        if collected_row || swept_row || keys.contains(key) {
+        let reclaimed = lane
+          .policy()
+          .reclaimed(keys.contains(key), key, content, &filters);
+        let key_present = keys.contains(key);
+        if reclaimed || key_present {
           prune.push((key.to_vec(), content.to_vec()));
         }
       }
@@ -1184,11 +1134,6 @@ fn repair_index(
   peers: &BTreeMap<NodeId, PeerState>, repair_pending: &mut BTreeSet<LaneId>,
   plan: &BTreeSet<LaneId>, listed: &LaneListed, filters: ScanFilters,
 ) -> LaneScan {
-  let ScanFilters {
-    checkpoint,
-    swept_at,
-    removal_retention,
-  } = filters;
   let mut seen: BTreeMap<LaneId, BTreeSet<Vec<u8>>> = BTreeMap::new();
   let mut pending: RepairIndex = BTreeMap::new();
   for state in peers.values() {
@@ -1204,17 +1149,13 @@ fn repair_index(
         if known.contains(&identity) {
           continue;
         }
-        if *lane == LaneId::Tombstones && tombstone_collected(checkpoint, key, content) {
+        // The lane's reclaimed evidence is not repair work — re-applying
+        // a collected tombstone or a swept removal is the resurrection.
+        let key_present = keys.contains(key);
+        if lane.policy().reclaimed(key_present, key, content, &filters) {
           continue;
         }
-        // The retention-reclaimed exemption: a swept removal row is not
-        // repair work — re-applying it is the resurrection.
-        if *lane == LaneId::Resources
-          && resource_swept(keys, key, content, swept_at, removal_retention)
-        {
-          continue;
-        }
-        if keys.contains(key) {
+        if key_present {
           continue;
         }
         if seen.entry(*lane).or_default().insert(identity.clone()) {
@@ -1280,15 +1221,12 @@ fn cadence_window(plane: &mut PlaneState) -> Outbound {
         }
         match state.engine(lane).drive(Drive::RootExchange) {
           Ok(messages) => {
-            // The resources lane's quiet-pass audit event: the SLO
-            // harness asserts its presence as the resource plane's
-            // settled-pass proof. It fires only on observed agreement —
-            // the peer's last-seen whole-lane fingerprint equals ours
-            // after the exchange — so the event means the same thing the
-            // walk's changeless scan meant (`continued = false`: a
-            // settled whole lane), never a bare dispatch.
-            if lane == LaneId::Resources && state.engine(lane).peer_agrees() {
-              crate::audit::resource_pass_settled(peer.as_str(), false);
+            // The lane's quiet-pass audit hook: it fires only on observed
+            // agreement — the peer's last-seen whole-lane fingerprint
+            // equals ours after the exchange — so a settled-pass event
+            // never means a bare dispatch.
+            if state.engine(lane).peer_agrees() {
+              lane.policy().pass_settled(peer);
             }
             outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
           }
@@ -1433,12 +1371,12 @@ fn send_message(
     tracing::debug!(lane = ?lane, "reconcile message encode failed");
     return;
   };
-  // The redundancy ledger's sent side: the audit stream's
+  // The lane's sent-side audit hook: the redundant-ledger stream's
   // rows-to-installed ratio is the reconcile plane's equivalent of the
   // page counter it replaces. The eager-delta piggyback is payload
   // crossing a session, so it counts exactly like a ROWS message.
-  if rows > 0 && lane == LaneId::Descriptors {
-    crate::audit::membership_page_emitted(rows);
+  if rows > 0 {
+    lane.policy().rows_emitted(rows);
   }
   let entropy = Arc::clone(&shared.entropy);
   let Some(protocol) = reconcile_protocol_tag() else {
@@ -1498,106 +1436,24 @@ fn send_message(
 }
 
 /// Maps one store namespace to the lane that reconciles it: the
-/// incremental scan's namespace→lane dictionary. A namespace outside
-/// every lane's key space maps to nothing (its writes cannot change any
-/// lane's row set, so no scan is armed for them).
+/// incremental scan's namespace→lane dictionary, derived from the single
+/// lane↔namespace map ([`LaneId::namespaces`]). A namespace outside every
+/// lane's key space maps to nothing (its writes cannot change any lane's
+/// row set, so no scan is armed for them).
 fn lane_of_namespace(namespace: &crate::StoreNamespace) -> Option<LaneId> {
   let tag = namespace.as_str();
-  if tag == crate::membership::NODE_DESCRIPTOR_NAMESPACE {
-    return Some(LaneId::Descriptors);
-  }
-  if tag == crate::storage::families::IDENTITY_BINDING_NAMESPACE {
-    return Some(LaneId::Trust);
-  }
-  if tag == crate::resource::store::RESOURCE_RECORD_NAMESPACE {
-    return Some(LaneId::Resources);
-  }
-  if matches!(
-    tag,
-    crate::storage::families::LEAVE_NAMESPACE
-      | crate::storage::families::CLEANUP_NAMESPACE
-      | crate::storage::families::REVOCATION_NAMESPACE
-      | crate::storage::families::CHECKPOINT_NAMESPACE
-  ) {
-    return Some(LaneId::Tombstones);
-  }
-  None
+  LaneId::ALL
+    .into_iter()
+    .find(|lane| lane.namespaces().contains(&tag))
 }
 
-/// Whether one tombstone-lane row is collected evidence: a leave or
-/// cleanup record stamped at or before the local checkpoint watermark
-/// (the same predicate the apply boundary fails open on). Revocations
-/// are never collected, and the checkpoint singleton itself never is.
-fn tombstone_collected(checkpoint: Option<u64>, key: &[u8], content: &[u8]) -> bool {
-  let collected = |stamp: Option<u64>| {
-    checkpoint.is_some_and(|watermark| stamp.is_some_and(|stamp| stamp <= watermark))
-  };
-  match key
-    .first()
-    .copied()
-    .and_then(wire::TombstoneKind::from_prefix)
-  {
-    Some(wire::TombstoneKind::Leave) => collected(
-      crate::identity::leave::LeaveRecordV1::decode(content)
-        .ok()
-        .map(|record| record.timestamp_millis()),
-    ),
-    Some(wire::TombstoneKind::Cleanup) => collected(
-      crate::identity::cleanup::CleanupRecordV1::decode(content)
-        .ok()
-        .map(|record| record.timestamp_millis()),
-    ),
-    _ => false,
-  }
-}
-
-/// Whether one removal record's retention window has elapsed at `now`:
-/// the retention contract the sweep itself enforces — both read the
-/// caller's configured window
-/// ([`crate::NodeConfig::with_resource_removal_retention`]), so an
-/// elapsed window is the real basis on which a gone store key reads as
-/// reclaimed knowledge, never key absence alone. A record stamped in the
-/// future (clock skew, or a fixture) is not elapsed: the window runs from
-/// the record's own timestamp, conservatively.
-fn removal_retention_elapsed(
-  record: &crate::resource::ResourceRecordV1, now: std::time::SystemTime,
-  retention: std::time::Duration,
-) -> bool {
-  now
-    .duration_since(record.timestamp())
-    .is_ok_and(|age| age >= retention)
-}
-
-/// Whether one resources-lane row is retention-reclaimed evidence: a
-/// `removed()` record whose retention window has already elapsed while
-/// the local store no longer holds its key. The tombstone lane's
-/// collected-mode mirror, with the retention deadline as the reclaim
-/// basis: key absence alone is not a verdict — a node that never held
-/// the resource knows nothing either way, so a fresh deletion stays
-/// legitimate evidence (dropping it is what let a later, older live
-/// value resurrect), while a record past its retention deadline is
-/// reclaimed knowledge on any node. Swept rows leave the engines (the
-/// prune), never re-enter them (the receive filter), and a newly
-/// primed peer does not receive the expired historical removal set
-/// back.
-fn resource_swept(
-  keys: &BTreeSet<Vec<u8>>, key: &[u8], content: &[u8], now: std::time::SystemTime,
-  retention: std::time::Duration,
-) -> bool {
-  !keys.contains(key)
-    && crate::resource::ResourceRecordV1::decode(content)
-      .ok()
-      .is_some_and(|record| record.removed() && removal_retention_elapsed(&record, now, retention))
-}
-
-/// Scans the planned lanes' namespaces into canonical
-/// `(key, content)` rows. Corrupt rows are skipped with a diagnostic —
-/// one bad row must not kill egress for every other row (the page
-/// lanes' corrupt-row policy, carried over). The tombstone lane skips
-/// collected rows at the scan boundary: collected evidence never
-/// enters the derived view, so it never primes a new peer either.
+/// Scans the planned lanes' namespaces into canonical `(key, content)`
+/// rows through each lane's own scan policy: the lane owns its namespaces,
+/// its decode gate, and the reclaimed evidence it skips at the boundary
+/// (so collected evidence never enters the derived view and never primes a
+/// new peer either).
 async fn scan_lanes(
-  store: &crate::storage::MetadataStore, plan: &BTreeSet<LaneId>, checkpoint: Option<u64>,
+  store: &crate::storage::MetadataStore, plan: &BTreeSet<LaneId>, filters: ScanFilters,
 ) -> Result<LaneScan> {
   let snapshot = store.snapshot().await?;
   let mut lanes = Vec::new();
@@ -1605,390 +1461,44 @@ async fn scan_lanes(
     if !plan.contains(&lane) {
       continue;
     }
-    lanes.push((lane, scan_lane(snapshot.as_ref(), lane, checkpoint).await?));
+    lanes.push((lane, lane.policy().scan(snapshot.as_ref(), &filters).await?));
   }
   Ok(lanes)
 }
 
-/// One lane's rows from a snapshot.
-async fn scan_lane(
-  snapshot: &(dyn crate::provider::StoreSnapshot + '_), lane: LaneId, checkpoint: Option<u64>,
-) -> Result<LaneRows> {
-  let mut rows = Vec::new();
-  match lane {
-    LaneId::Descriptors => {
-      scan_namespace(
-        snapshot,
-        crate::storage::families::namespace(crate::membership::NODE_DESCRIPTOR_NAMESPACE)?,
-        |_key, value| crate::membership::page::decode_descriptor(value).is_ok(),
-        &mut rows,
-      )
-      .await?;
-    }
-    LaneId::Trust => {
-      scan_namespace(
-        snapshot,
-        crate::storage::families::namespace(crate::identity::records::IDENTITY_BINDING_NAMESPACE)?,
-        |_key, value| crate::identity::records::IdentityBindingV1::decode(value).is_ok(),
-        &mut rows,
-      )
-      .await?;
-    }
-    LaneId::Resources => {
-      scan_namespace(
-        snapshot,
-        crate::resource::store::namespace()?,
-        |_key, value| crate::resource::ResourceRecordV1::decode(value).is_ok(),
-        &mut rows,
-      )
-      .await?;
-    }
-    LaneId::Tombstones => {
-      for kind in [
-        TombstoneKind::Leave,
-        TombstoneKind::Cleanup,
-        TombstoneKind::Revocation,
-      ] {
-        let mut raw = Vec::new();
-        scan_namespace(
-          snapshot,
-          crate::storage::families::namespace(kind.namespace_tag())?,
-          move |key, value| kind.decodable(key, value),
-          &mut raw,
-        )
-        .await?;
-        for (key, content) in raw {
-          let row_key = kind.row_key(&key);
-          if tombstone_collected(checkpoint, &row_key, &content) {
-            continue;
-          }
-          rows.push((row_key, content));
-        }
-      }
-      // The cleanup checkpoint singleton: one row, max-wins at apply.
-      let checkpoint = TombstoneKind::Checkpoint;
-      let namespace =
-        crate::storage::families::namespace(crate::storage::families::CHECKPOINT_NAMESPACE)?;
-      let key = crate::identity::cleanup::checkpoint_key();
-      if let Some(value) = snapshot.get(&namespace, &key).await? {
-        rows.push((
-          checkpoint.row_key(key.as_bytes()),
-          value.as_bytes().to_vec(),
-        ));
-      }
-    }
-  }
-  Ok(rows)
-}
-
-/// Scans one namespace into rows, keeping the raw store key as the row
-/// key and skipping rows the lane cannot decode.
-async fn scan_namespace(
-  snapshot: &(dyn crate::provider::StoreSnapshot + '_), namespace: crate::StoreNamespace,
-  decodable: impl Fn(&[u8], &[u8]) -> bool, rows: &mut LaneRows,
-) -> Result<()> {
-  let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
-  while let Some(entry) = scan.next().await? {
-    let key = entry.key().as_bytes().to_vec();
-    let value = entry.value().as_bytes().to_vec();
-    if !decodable(&key, &value) {
-      tracing::debug!(
-        key = %String::from_utf8_lossy(&key),
-        "reconcile lane scan skipped an undecodable row"
-      );
-      continue;
-    }
-    rows.push((key, value));
-  }
-  Ok(())
-}
-
-/// The tombstone lane's kind byte: one key space for the four terminal
-/// record families (a subject can carry more than one kind). The enum
-/// and its typed prefix decoder live on the wire contract
-/// ([`wire::TombstoneKind`]) so the scan side here and the apply side in
-/// `membership::tombstone` share one mapping.
-use super::wire::TombstoneKind;
-
-/// One lane apply's outcome: the rows the store **refused** — decided
-/// evidence it will refuse on every re-delivery, so they never enter an
-/// engine.
-struct LaneOutcome {
-  refused: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-/// Applies one message batch of rows through the lane's merge
-/// semantics. `source` is the sending peer when the rows arrived on the
-/// wire (the leave receipt addresses it); the derived-view repair path
-/// passes `None`. Returns the rows the lane **refused** — the
-/// deterministic policy skips (a stale descriptor revision, an
-/// unhealable first install, a revoked or substituted binding, a
-/// corrupt or misattributed row) whose outcome no retry can change.
-/// The receive boundary gates engine admission on this list: a refused
-/// row must never enter the derived view, because the row would then
-/// diverge every fingerprint exchange against the peers whose stores
-/// do list it, and the prune/hint/re-push cycle would re-deliver the
-/// refusal forever (the leave/restart livelock). Transient classes —
-/// the contention skips and not-yet-converged-binding skips — do NOT
-/// appear in the refused list: their retry lives in the engine (the
-/// cross-lane repair), exactly as before.
+/// Applies one message batch of rows through the lane's merge semantics.
+/// `source` is the sending peer when the rows arrived on the wire (the
+/// leave receipt addresses it); the derived-view repair path passes
+/// `None`. Returns the rows the lane **refused** — the deterministic
+/// policy skips (a stale descriptor revision, an unhealable first
+/// install, a revoked or substituted binding, a corrupt or misattributed
+/// row) whose outcome no retry can change. The receive boundary gates
+/// engine admission on this list: a refused row must never enter the
+/// derived view, because the row would then diverge every fingerprint
+/// exchange against the peers whose stores do list it, and the
+/// prune/hint/re-push cycle would re-deliver the refusal forever (the
+/// leave/restart livelock). Transient classes — the contention skips and
+/// not-yet-converged-binding skips — do NOT appear in the refused list:
+/// their retry lives in the engine (the cross-lane repair), exactly as
+/// before.
 async fn apply_rows(
-  shared: &PlaneShared, lane: &LaneId, rows: &[(Vec<u8>, Vec<u8>)], source: Option<&NodeId>,
+  shared: &PlaneShared, lane: &LaneId, rows: &LaneRows, source: Option<&NodeId>,
   runtime: Option<&RuntimeClient>,
 ) -> Result<LaneOutcome> {
   let context = shared.context()?;
-  let store = context.store();
-  match lane {
-    LaneId::Descriptors => {
-      // Row-level fault tolerance, the scan side's corrupt-row policy:
-      // one undecodable or misattributed row skips with a typed reason
-      // instead of failing the batch — a whole-batch error would wedge
-      // the derived-view repair on the same poison row forever (the
-      // engines hold it, so the fingerprints look converged while the
-      // store never receives the good rows behind it). Store failures
-      // below still propagate: they are real write faults, not corrupt
-      // input. The refused list carries the rows in their original
-      // wire shape, so the receive boundary can keep them out of the
-      // engines — including the same-key duplicates the page-order
-      // contest below drops (their loser is stale-or-equal by
-      // construction, the same refusal the store would make).
-      let mut descriptors: Vec<(Vec<u8>, Vec<u8>, crate::membership::NodeDescriptorV1)> =
-        Vec::with_capacity(rows.len());
-      let mut refused = Vec::new();
-      for (row_key, content) in rows {
-        match crate::membership::page::decode_descriptor(content) {
-          Ok(descriptor) if row_key.as_slice() == descriptor.node().as_str().as_bytes() => {
-            descriptors.push((row_key.clone(), content.clone(), descriptor));
-          }
-          Ok(descriptor) => {
-            tracing::debug!(
-              node = %descriptor.node(),
-              "reconcile descriptor row skipped: key mismatch"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile descriptor row skipped: undecodable"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-        }
-      }
-      // The same-key page-order contest, single-sourced with the
-      // register's page batch (`contest_descriptors`): the decided
-      // contest losers — stale-or-equal by construction, the same
-      // refusal the store would make — join the refused list in their
-      // original wire shape, and the winners apply in first-seen order.
-      let decoded: Vec<&crate::membership::NodeDescriptorV1> = descriptors
-        .iter()
-        .map(|(_, _, descriptor)| descriptor)
-        .collect();
-      let (winner_rows, loser_rows) = crate::membership::store::contest_descriptors(&decoded);
-      let winners: Vec<(Vec<u8>, Vec<u8>, crate::membership::NodeDescriptorV1)> = winner_rows
-        .into_iter()
-        .map(|index| {
-          let (row_key, content, descriptor) = &descriptors[index];
-          (row_key.clone(), content.clone(), descriptor.clone())
-        })
-        .collect();
-      for index in loser_rows {
-        let (row_key, content, _) = &descriptors[index];
-        refused.push((row_key.clone(), content.clone()));
-      }
-      let descriptors = winners;
-      let mut skipped_ids = Vec::new();
-      for chunk in descriptors.chunks(crate::paging::PAGE_MAX_ITEMS) {
-        let page = crate::membership::page::MembershipPage::new(
-          chunk
-            .iter()
-            .map(|(_, _, descriptor)| descriptor.clone())
-            .collect(),
-          None,
-        )?;
-        let (installed, skipped) = crate::membership::store::apply_descriptor_batch_ctx(
-          store,
-          shared.entropy.as_ref(),
-          &page,
-        )
-        .await?;
-        skipped_ids.extend(skipped);
-        for (_, _, descriptor) in chunk {
-          if installed.contains(descriptor.node()) {
-            // The audit event is the propagation path proof: a
-            // descriptor exists on this peer only because these rows
-            // carried it.
-            crate::audit::descriptor_installed(descriptor.node().as_str(), descriptor.revision());
-            crate::membership::sync::member_changed(
-              &shared.events,
-              &shared.revision,
-              descriptor.node().clone(),
-            );
-          }
-        }
-      }
-      // The batch's refused node ids map back onto exactly the rows
-      // that carried them (the dedup above left one row per node id).
-      for (row_key, content, _) in &descriptors {
-        if skipped_ids
-          .iter()
-          .any(|node| node.as_str().as_bytes() == row_key.as_slice())
-        {
-          refused.push((row_key.clone(), content.clone()));
-        }
-      }
-      Ok(LaneOutcome { refused })
-    }
-    LaneId::Trust => {
-      // The same row-level policy as the descriptors arm: a corrupt or
-      // misattributed binding row skips; adoption failures keep the
-      // snapshot-accept semantics (transient contention skips one
-      // binding — the repair retries it — and everything else, key
-      // substitution above all, fails closed and propagates).
-      let mut refused = Vec::new();
-      for (row_key, content) in rows {
-        let binding = match crate::identity::records::IdentityBindingV1::decode(content) {
-          Ok(binding) if row_key.as_slice() == binding.node().as_str().as_bytes() => binding,
-          Ok(binding) => {
-            tracing::debug!(
-              node = %binding.node(),
-              "reconcile binding row skipped: key mismatch"
-            );
-            refused.push((row_key.clone(), content.clone()));
-            continue;
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile binding row skipped: undecodable"
-            );
-            refused.push((row_key.clone(), content.clone()));
-            continue;
-          }
-        };
-        // The per-record adoption policy, row-scoped: transient
-        // contention skips one binding (the repair retries it); a
-        // revoked subject (revocation tombstones out-rank late binding
-        // rows — the delayed-content mirror order) and a substituted
-        // key are refused evidence — the row is skipped, not stored,
-        // and the batch continues (skipping IS the correct outcome;
-        // these fire on honest input, so an abort here would wedge the
-        // repair on every re-delivery). Everything else — provider
-        // faults above all — is a real write fault and propagates.
-        if let Err(error) = crate::identity::trust::store::adopt_binding_ctx(
-          store,
-          shared.entropy.as_ref(),
-          binding.node(),
-          binding.public_key(),
-        )
-        .await
-        {
-          if matches!(
-            error.kind(),
-            crate::ErrorKind::Conflict
-              | crate::ErrorKind::NotReady
-              | crate::ErrorKind::Revoked
-              | crate::ErrorKind::NotTrusted
-          ) {
-            tracing::warn!(
-              node = %binding.node(),
-              kind = ?error.kind(),
-              "reconcile binding row refused by policy; skipping"
-            );
-            // Revoked and substituted-key rows are refused evidence
-            // whose outcome no retry changes: they join the refused
-            // list so the receive boundary keeps them out of the
-            // engines. Contention and not-ready are transient — the
-            // row stays a repair candidate exactly as before.
-            if matches!(
-              error.kind(),
-              crate::ErrorKind::Revoked | crate::ErrorKind::NotTrusted
-            ) {
-              refused.push((row_key.clone(), content.clone()));
-            }
-            continue;
-          }
-          return Err(error);
-        }
-      }
-      Ok(LaneOutcome { refused })
-    }
-    LaneId::Resources => {
-      // The same row-level policy as the descriptors arm: a corrupt or
-      // misattributed record row skips, and the page apply's store
-      // faults propagate. The row is trusted through the authenticated
-      // session that delivered it (the member-descriptor stance), so no
-      // writer descriptor is resolved and no row is deferred behind
-      // one.
-      let mut staged: Vec<crate::resource::ResourceRecordV1> = Vec::with_capacity(rows.len());
-      let mut refused = Vec::new();
-      for (row_key, content) in rows {
-        match crate::resource::ResourceRecordV1::decode(content) {
-          Ok(record) if row_key.as_slice() == record.name().as_str().as_bytes() => {
-            staged.push(record);
-          }
-          Ok(record) => {
-            tracing::debug!(
-              name = %record.name().as_str(),
-              "reconcile resource row skipped: key mismatch"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile resource row skipped: undecodable"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-        }
-      }
-      for chunk in staged.chunks(crate::paging::PAGE_MAX_ITEMS) {
-        let page = crate::resource::page::ResourcePage::new(chunk.to_vec(), None)?;
-        let outcome = crate::resource::page::sync::apply_page_reported_ctx(
-          store,
-          shared.entropy.as_ref(),
-          &page,
-        )
-        .await?;
-        tracing::debug!(applied = outcome.applied, "reconcile resource rows applied");
-        // Each committed record is a peer-converged resource change:
-        // report it through the same event local writes emit, tagged
-        // `Remote` so a hook can tell the two apart. The removal flag
-        // follows the winning record.
-        for record in &outcome.installed {
-          shared.events.emit(crate::ResourceChanged::new(
-            record.name().clone(),
-            crate::ResourceOrigin::Remote,
-            record.removed(),
-          ));
-        }
-      }
-      Ok(LaneOutcome { refused })
-    }
-    LaneId::Tombstones => {
-      crate::membership::tombstone::apply_tombstone_rows(
-        &context,
-        &shared.entropy,
-        &shared.events,
-        &shared.revision,
-        &shared.sessions,
-        &shared.authorization,
-        rows,
-        source,
-        runtime,
-      )
-      .await?;
-      // No refused rows on this lane: the policy skips (a subject
-      // binding that has not converged) are the designed transient
-      // retries — every tombstone row the collected filter passed
-      // stays a repair candidate until its binding lands.
-      Ok(LaneOutcome {
-        refused: Vec::new(),
-      })
-    }
-  }
+  let lane_context = LaneContext {
+    context: &context,
+    entropy: &shared.entropy,
+    events: &shared.events,
+    revision: &shared.revision,
+    sessions: &shared.sessions,
+    authorization: &shared.authorization,
+    removal_retention: shared.resource_removal_retention,
+  };
+  lane
+    .policy()
+    .apply(&lane_context, rows, source, runtime)
+    .await
 }
 
 #[cfg(test)]
@@ -1998,8 +1508,27 @@ mod tests {
     sync::Arc,
   };
 
-  use super::{super::wire::LaneId, scan_lanes};
+  use super::{super::wire::LaneId, ACTIVE_LANES, lane_of_namespace, scan_lanes};
   use crate::identity::lifecycle::LocalIdentityContext;
+
+  /// The plane carries exactly the wire contract's lane set (the active
+  /// lanes derive from [`LaneId::ALL`]), and the namespace→lane dictionary
+  /// is that same map: every lane's namespaces map back to it and nothing
+  /// else claims a lane.
+  #[test]
+  fn the_active_lanes_and_namespace_map_derive_from_the_wire_lane_set() {
+    assert_eq!(ACTIVE_LANES, LaneId::ALL);
+    for lane in LaneId::ALL {
+      for tag in lane.namespaces() {
+        let namespace = crate::storage::families::namespace(tag).unwrap();
+        assert_eq!(lane_of_namespace(&namespace), Some(lane), "namespace {tag}");
+      }
+    }
+    // A namespace outside every lane's key space arms no scan.
+    let unrelated =
+      crate::storage::families::namespace(crate::storage::families::TRACE_NAMESPACE).unwrap();
+    assert_eq!(lane_of_namespace(&unrelated), None);
+  }
 
   fn node(value: u64) -> crate::NodeId {
     crate::NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -2043,7 +1572,12 @@ mod tests {
   async fn the_trust_lane_scans_one_row_per_binding() {
     let context = context_with_bindings(&[101, 102]).await;
     let plan: BTreeSet<LaneId> = [LaneId::Trust].into_iter().collect();
-    let lanes = scan_lanes(context.store(), &plan, None).await.unwrap();
+    let filters = super::ScanFilters {
+      checkpoint: None,
+      swept_at: std::time::SystemTime::now(),
+      removal_retention: crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
+    };
+    let lanes = scan_lanes(context.store(), &plan, filters).await.unwrap();
     let trust = lanes
       .iter()
       .find(|(lane, _)| matches!(lane, super::super::wire::LaneId::Trust))
@@ -3053,32 +2587,32 @@ mod tests {
     let name = crate::ResourceName::parse("radiata.woooo.tech/resources/predicate").unwrap();
     let now = std::time::SystemTime::now();
     let retention = crate::resource::retention::RESOURCE_REMOVAL_RETENTION;
-    let mut held: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let (key, fresh_removal) = resource_row(&name, 721, fresh_stamp, true);
+    let (_key, fresh_removal) = resource_row(&name, 721, fresh_stamp, true);
     let (_, expired_removal) = resource_row(&name, 721, expired_stamp, true);
     let (_, live_row) = resource_row(&name, 721, fresh_stamp, false);
+    let reclaimed = |key_present: bool, content: &[u8]| {
+      crate::resource::retention::reclaimed(key_present, content, now, retention)
+    };
     // An absent key with a fresh removal is an unseen resource: the
     // deletion evidence stays legitimate within the retention contract.
     assert!(
-      !super::resource_swept(&held, &key, &fresh_removal, now, retention),
+      !reclaimed(false, &fresh_removal),
       "a fresh removal for an unseen key is not swept"
     );
     // The same shape past the retention deadline is reclaimed knowledge.
     assert!(
-      super::resource_swept(&held, &key, &expired_removal, now, retention),
+      reclaimed(false, &expired_removal),
       "an expired removal with the key gone is swept"
     );
     // A key the store still holds is never reclaim evidence, whatever
     // the record's age: the sweep deletes nothing that is still there.
-    held.insert(key.clone());
     assert!(
-      !super::resource_swept(&held, &key, &expired_removal, now, retention),
+      !reclaimed(true, &expired_removal),
       "a held key is not swept"
     );
     // Live rows never enter the swept predicate at all.
-    held.remove(&key);
     assert!(
-      !super::resource_swept(&held, &key, &live_row, now, retention),
+      !reclaimed(false, &live_row),
       "a live row for an absent key is not swept"
     );
   }
@@ -3627,19 +3161,19 @@ mod tests {
     key.extend_from_slice(leaver.as_str().as_bytes());
     let content = record.encode().unwrap();
     // The checkpoint sits past the record's stamp: the row is collected.
-    let collected = super::tombstone_collected(Some(stamp), &key, &content);
+    let collected = crate::membership::tombstone::collected_row(Some(stamp), &key, &content);
     assert!(collected, "a record at the watermark is collected");
     assert!(
-      !super::tombstone_collected(Some(stamp - 1), &key, &content),
+      !crate::membership::tombstone::collected_row(Some(stamp - 1), &key, &content),
       "a record after the watermark is live"
     );
     assert!(
-      !super::tombstone_collected(None, &key, &content),
+      !crate::membership::tombstone::collected_row(None, &key, &content),
       "no checkpoint means nothing is collected"
     );
     // The revocation and checkpoint rows are never collected evidence.
     let revocation_key = vec![3_u8];
-    assert!(!super::tombstone_collected(
+    assert!(!crate::membership::tombstone::collected_row(
       Some(u64::MAX),
       &revocation_key,
       &content

@@ -18,7 +18,7 @@
 //! they attach to.
 
 use std::{
-  collections::{BTreeMap, BTreeSet, HashMap},
+  collections::{BTreeMap, BTreeSet},
   sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -41,9 +41,10 @@ use crate::{
   ErrorKind, NodeId, QualifiedTag, Result, TraceId,
   extension_registry::ExtensionRegistry,
   routing::{
-    forward::{self, PendingAck, PendingAcks},
+    forward::{self, PendingAck},
     table::RouteTable,
   },
+  session::pending::PendingAdmissions,
   transport::connection::{Connection, ConnectionWriter},
 };
 
@@ -429,11 +430,10 @@ pub(crate) struct SessionMeta {
 #[derive(Clone)]
 pub(crate) struct SessionEntry {
   pub(crate) frames: BoundedSender,
-  pub(crate) pending_acks: PendingAcks,
-  /// Per-session concurrent admission bound from the session policy,
-  /// carried here so the outbound pump (which runs without the session
-  /// context) can enforce typed backpressure.
-  pub(crate) pending_admissions: usize,
+  /// The session's pending admissions (the origin's waiters and the
+  /// forwarding hops' relays): the map carries its own per-session bound
+  /// and lock discipline, so no caller locks it directly.
+  pub(crate) pending_acks: PendingAdmissions,
   pub(crate) clock: Arc<dyn crate::time::WallClock>,
   /// The public session metadata.
   pub(crate) meta: Arc<SessionMeta>,
@@ -490,8 +490,7 @@ impl SessionEntry {
     let (frames, _receiver) = super::queue::BoundedSender::channel(8, 4096);
     Ok(Self {
       frames,
-      pending_acks: Arc::new(Mutex::new(HashMap::new())),
-      pending_admissions: 1,
+      pending_acks: PendingAdmissions::new(1),
       clock: Arc::new(crate::time::HostWallClock),
       meta: Arc::new(SessionMeta {
         id: crate::SessionId::generate(entropy)?,
@@ -525,7 +524,7 @@ pub(crate) async fn run_session(
   let (writer, mut reader) = connection.into_split();
   let (frames, frames_rx) =
     BoundedSender::channel(context.policy.queue_messages, context.policy.queue_bytes);
-  let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+  let pending_acks = PendingAdmissions::new(context.policy.pending_admissions);
   let alive = Arc::new(AtomicBool::new(true));
   let (retire_tx, retire_rx) = watch::channel(());
   let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(clock_seconds(
@@ -550,8 +549,7 @@ pub(crate) async fn run_session(
   let grant = SessionGrant::for_session(&session, identity.clone());
   let entry = SessionEntry {
     frames: frames.clone(),
-    pending_acks: Arc::clone(&pending_acks),
-    pending_admissions: context.policy.pending_admissions,
+    pending_acks: pending_acks.clone(),
     clock: context.clock.clone(),
     meta: Arc::new(SessionMeta {
       id: session_id,
@@ -797,18 +795,16 @@ pub(crate) fn retire(entry: &SessionEntry) {
 /// Drains one session's pending admission acks, failing every local
 /// waiter with the typed interruption, and returns the count plus the
 /// forwarded hops' upstream senders for the caller's relay handling.
-fn fail_pending_waits(pending_acks: &PendingAcks) -> (usize, Vec<(TraceId, BoundedSender)>) {
+fn fail_pending_waits(pending_acks: &PendingAdmissions) -> (usize, Vec<(TraceId, BoundedSender)>) {
+  let drained = pending_acks.drain();
+  let interrupted = drained.len();
   let mut relays = Vec::new();
-  let mut interrupted = 0_usize;
-  if let Ok(mut pending) = pending_acks.lock() {
-    interrupted = pending.len();
-    for (trace_id, ack) in pending.drain() {
-      match ack {
-        PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(Err(ErrorKind::StreamInterrupted));
-        }
-        PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
+  for (trace_id, ack) in drained {
+    match ack {
+      PendingAck::Wait { notify, .. } => {
+        let _ = notify.send(Err(ErrorKind::StreamInterrupted));
       }
+      PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
     }
   }
   (interrupted, relays)
@@ -854,8 +850,7 @@ pub(crate) fn test_entry(entropy: &dyn crate::api::Entropy) -> (SessionEntry, Bo
   let (frames, receiver) = test_queue(256, 8 * 1_024 * 1_024);
   let entry = SessionEntry {
     frames,
-    pending_acks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    pending_admissions: MAX_PENDING_ADMISSIONS,
+    pending_acks: PendingAdmissions::new(MAX_PENDING_ADMISSIONS),
     clock: Arc::new(crate::time::HostWallClock),
     meta: Arc::new(SessionMeta {
       id: crate::SessionId::generate(entropy).unwrap(),
@@ -978,7 +973,7 @@ mod authorization_boundary_tests {
 #[cfg(test)]
 mod pending_admission_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::{Duration, UNIX_EPOCH},
   };
@@ -986,12 +981,12 @@ mod pending_admission_tests {
   use tokio::sync::{oneshot, watch};
 
   use super::{
-    BoundedSender, DialClass, DialDirection, PendingAck, PendingAcks, RouteTable, SessionEntry,
-    SessionMeta,
+    BoundedSender, DialClass, DialDirection, PendingAck, RouteTable, SessionEntry, SessionMeta,
   };
   use crate::{
     ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId, packet::StaticBody,
-    routing::outbound::run_outbound, storage::contract::helpers::ManualClock,
+    routing::outbound::run_outbound, session::pending::PendingAdmissions,
+    storage::contract::helpers::ManualClock,
   };
 
   fn node(value: u8) -> NodeId {
@@ -1002,21 +997,22 @@ mod pending_admission_tests {
   /// admissions, ready for one more outbound pump.
   fn saturated_entry(pending_admissions: usize) -> SessionEntry {
     let (frames, _frames_rx) = BoundedSender::channel(8, 1 << 20);
-    let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(pending_admissions);
     for seed in 0..pending_admissions {
       let trace_id = TraceId::parse(&format!("trace-{seed:021}")).unwrap();
-      pending_acks.lock().unwrap().insert(
-        trace_id,
-        PendingAck::Relay {
-          upstream: frames.clone(),
-        },
-      );
+      pending_acks
+        .try_reserve_admission(
+          &trace_id,
+          PendingAck::Relay {
+            upstream: frames.clone(),
+          },
+        )
+        .unwrap();
     }
     let (retire, _) = watch::channel(());
     SessionEntry {
       frames,
       pending_acks,
-      pending_admissions,
       clock: Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1))),
       meta: Arc::new(SessionMeta {
         id: crate::SessionId::parse("session-000000000000000000001").unwrap(),
@@ -1041,6 +1037,7 @@ mod pending_admission_tests {
     let request = crate::packet::OutboundRequest {
       trace_id: TraceId::parse("trace-000000000000000000099").unwrap(),
       target: StreamTarget::Exact(node(2)),
+      routing_policy: crate::RoutingPolicy::DIRECT,
       load_balancer: None,
       max_hops: 1,
       protocol: ProtocolTag::parse("radiata.woooo.tech/protocols/test").unwrap(),

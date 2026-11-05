@@ -729,7 +729,7 @@ async fn stream_probe(state: State<SharedState>) -> Result<Json<Value>, (StatusC
     .send(
       StreamTarget::Exact(peer),
       ProtocolTag::parse("radiata.woooo.tech/protocols/probe").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       body,
     )
     .await
@@ -834,7 +834,7 @@ async fn routed_probe(
   // The budget covers the mesh's longest simple path: routes are
   // loop-free by validation, so a generous budget only costs one check
   // per hop while an 8-hop cap silently fails long relay chains.
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 128)
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 128)
     .map_err(internal_error)?
     .load_balancer(QualifiedTag::parse(FIRST_MATCH_BALANCER).map_err(bad_request)?);
   let started = std::time::Instant::now();

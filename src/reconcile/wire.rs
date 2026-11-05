@@ -75,8 +75,8 @@ pub(crate) enum LaneId {
 }
 
 impl LaneId {
-  /// Every lane, in wire-code order.
-  #[cfg(test)]
+  /// Every lane, in wire-code order: the single closed lane set the
+  /// plane's active lanes derive from.
   pub(crate) const ALL: [Self; 4] = [
     Self::Descriptors,
     Self::Trust,
@@ -131,6 +131,15 @@ pub(crate) enum TombstoneKind {
 }
 
 impl TombstoneKind {
+  /// Every tombstone kind, in wire-code order: the single closed set the
+  /// lane's scan and namespace map derive from.
+  pub(crate) const ALL: [Self; 4] = [
+    Self::Leave,
+    Self::Cleanup,
+    Self::Revocation,
+    Self::Checkpoint,
+  ];
+
   /// The kind byte that prefixes one tombstone-lane row key.
   pub(crate) const fn prefix(self) -> u8 {
     match self {

@@ -231,7 +231,7 @@ async fn sync_probe(
     .open_stream(
       StreamTarget::Exact(peer.clone()),
       ProtocolTag::parse("radiata.woooo.tech/protocols/bench-probe").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       StreamMetadata::new()
         .insert(probe_tag(), Arc::from(id.to_le_bytes().as_slice()))
         .unwrap(),
@@ -327,7 +327,7 @@ async fn lane_radiata_throughput() {
       .open_stream(
         StreamTarget::Exact(peer.clone()),
         ProtocolTag::parse("radiata.woooo.tech/protocols/bench-bulk").unwrap(),
-        StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+        StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
         StreamMetadata::new(),
       )
       .unwrap();

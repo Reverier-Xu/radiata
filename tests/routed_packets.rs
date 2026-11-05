@@ -499,7 +499,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
 
   // ---- Successful three-hop delivery ----
   let packet = nodes[0]
@@ -618,7 +618,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     .open_stream(
       StreamTarget::Exact(nodes[3].id().clone()),
       ProtocolTag::parse(PROTOCOL_TAG).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -649,7 +649,7 @@ async fn default_policy_relays_routed_packets_without_configuration() {
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let packet = nodes[0]
     .handle
     .open_stream(
@@ -703,7 +703,7 @@ async fn a_body_above_the_chunk_bound_crosses_three_hops_byte_exact() {
   let expected: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let packet = nodes[0]
     .handle
     .open_stream(
@@ -780,7 +780,7 @@ async fn relay_leg_death_surfaces_typed_interruption_at_the_destination() {
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let (body, open_flag, notify) = gated_body();
   let packet = nodes[0]
     .handle
@@ -911,7 +911,7 @@ async fn relay_leg_death_leaves_the_origin_record_failed_regardless_of_ordering(
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let (body, open_flag, notify) = gated_body();
   let packet = nodes[0]
     .handle

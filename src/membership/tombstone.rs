@@ -50,6 +50,37 @@ fn collected(checkpoint: Option<u64>, timestamp_millis: u64) -> bool {
   checkpoint.is_some_and(|watermark| timestamp_millis <= watermark)
 }
 
+/// Whether one tombstone-lane row is collected evidence: a leave or
+/// cleanup record stamped at or before the local checkpoint watermark
+/// (the same predicate the apply boundary fails open on). Revocations are
+/// never collected, and the checkpoint singleton itself never is.
+///
+/// One predicate serves the lane's scan boundary, its receive filter, its
+/// prune, and its derived-view repair, so collected evidence can never
+/// re-enter an engine by any path.
+pub(crate) fn collected_row(checkpoint: Option<u64>, key: &[u8], content: &[u8]) -> bool {
+  let collected_record = |record_stamp: Option<u64>| {
+    checkpoint.is_some_and(|watermark| record_stamp.is_some_and(|stamp| stamp <= watermark))
+  };
+  match key
+    .first()
+    .copied()
+    .and_then(crate::reconcile::wire::TombstoneKind::from_prefix)
+  {
+    Some(crate::reconcile::wire::TombstoneKind::Leave) => collected_record(
+      crate::identity::leave::LeaveRecordV1::decode(content)
+        .ok()
+        .map(|record| record.timestamp_millis()),
+    ),
+    Some(crate::reconcile::wire::TombstoneKind::Cleanup) => collected_record(
+      crate::identity::cleanup::CleanupRecordV1::decode(content)
+        .ok()
+        .map(|record| record.timestamp_millis()),
+    ),
+    _ => false,
+  }
+}
+
 /// Applies one encoded owner-signed leave record: verified against the
 /// permanently retained binding before any persistence. A record whose
 /// binding has not converged yet is skipped; the next epoch pass of the
@@ -506,6 +537,134 @@ pub(crate) async fn apply_tombstone_rows(
     }
   }
   Ok(())
+}
+
+/// The tombstones lane: the four terminal record families (leave, cleanup,
+/// revocation, and the cleanup checkpoint watermark) under one key space.
+#[derive(Debug)]
+pub(crate) struct TombstonesLane;
+
+impl TombstonesLane {
+  /// The lane's store namespaces, in kind order: the lane↔namespace map,
+  /// single-sourced from the wire contract's kind table.
+  const NAMESPACES: [&str; 4] = [
+    crate::reconcile::wire::TombstoneKind::Leave.namespace_tag(),
+    crate::reconcile::wire::TombstoneKind::Cleanup.namespace_tag(),
+    crate::reconcile::wire::TombstoneKind::Revocation.namespace_tag(),
+    crate::reconcile::wire::TombstoneKind::Checkpoint.namespace_tag(),
+  ];
+}
+
+impl crate::reconcile::lane::Lane for TombstonesLane {
+  fn id(&self) -> crate::reconcile::wire::LaneId {
+    crate::reconcile::wire::LaneId::Tombstones
+  }
+
+  fn namespaces(&self) -> &'static [&'static str] {
+    &Self::NAMESPACES
+  }
+
+  fn scan<'a>(
+    &self, snapshot: &'a dyn crate::provider::StoreSnapshot,
+    filters: &'a crate::reconcile::lane::ScanFilters,
+  ) -> crate::api::BoxFuture<'a, Result<crate::reconcile::lane::LaneRows>> {
+    Box::pin(async move {
+      use crate::reconcile::wire::TombstoneKind;
+
+      let mut rows = crate::reconcile::lane::LaneRows::new();
+      for kind in TombstoneKind::ALL {
+        if kind == TombstoneKind::Checkpoint {
+          // The cleanup checkpoint singleton: one row, max-wins at apply.
+          let namespace = crate::storage::families::namespace(kind.namespace_tag())?;
+          let key = crate::identity::cleanup::checkpoint_key();
+          if let Some(value) = snapshot.get(&namespace, &key).await? {
+            rows.push((kind.row_key(key.as_bytes()), value.as_bytes().to_vec()));
+          }
+          continue;
+        }
+        let namespace = crate::storage::families::namespace(kind.namespace_tag())?;
+        let mut raw = crate::reconcile::lane::LaneRows::new();
+        let mut scan = snapshot.scan(&namespace, &[]).await?;
+        while let Some(entry) = scan.next().await? {
+          let key = entry.key().as_bytes().to_vec();
+          let value = entry.value().as_bytes().to_vec();
+          if !kind.decodable(&key, &value) {
+            tracing::debug!(
+              namespace = %kind.namespace_tag(),
+              key = %String::from_utf8_lossy(&key),
+              "reconcile lane scan skipped an undecodable row"
+            );
+            continue;
+          }
+          raw.push((key, value));
+        }
+        for (key, content) in raw {
+          let row_key = kind.row_key(&key);
+          if collected_row(filters.checkpoint, &row_key, &content) {
+            continue;
+          }
+          rows.push((row_key, content));
+        }
+      }
+      Ok(rows)
+    })
+  }
+
+  fn reclaimed(
+    &self, _key_present: bool, key: &[u8], content: &[u8],
+    filters: &crate::reconcile::lane::ScanFilters,
+  ) -> bool {
+    collected_row(filters.checkpoint, key, content)
+  }
+
+  fn reads_checkpoint(&self) -> bool {
+    true
+  }
+
+  fn receive<'a>(
+    &self, ctx: &'a crate::reconcile::lane::LaneContext<'a>,
+    rows: &'a mut crate::reconcile::lane::LaneRows,
+  ) -> crate::api::BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+      // The collected-row receive filter: a leave or cleanup record at or
+      // before the local checkpoint watermark never enters an engine (its
+      // fingerprints, its fan-out, and its repair-set candidacy alike) —
+      // re-admitting collected evidence is what made the GC rows
+      // re-propagate forever.
+      let checkpoint =
+        crate::identity::cleanup::latest_checkpoint_millis_ctx(ctx.context.store()).await?;
+      rows.retain(|(key, content)| !collected_row(checkpoint, key, content));
+      Ok(())
+    })
+  }
+
+  fn apply<'a>(
+    &self, ctx: &'a crate::reconcile::lane::LaneContext<'a>,
+    rows: &'a crate::reconcile::lane::LaneRows, source: Option<&'a NodeId>,
+    runtime: Option<&'a RuntimeClient>,
+  ) -> crate::api::BoxFuture<'a, Result<crate::reconcile::lane::LaneOutcome>> {
+    Box::pin(async move {
+      apply_tombstone_rows(
+        ctx.context,
+        ctx.entropy,
+        ctx.events,
+        ctx.revision,
+        ctx.sessions,
+        ctx.authorization,
+        rows,
+        source,
+        runtime,
+      )
+      .await?;
+      // No refused rows on this lane: the policy skips (a subject
+      // binding that has not converged) are the designed transient
+      // retries — every tombstone row the collected filter passed stays a
+      // repair candidate until its binding lands.
+      Ok(crate::reconcile::lane::LaneOutcome {
+        refused: Vec::new(),
+      })
+    })
+  }
 }
 
 #[cfg(test)]

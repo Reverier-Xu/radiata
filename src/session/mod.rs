@@ -7,6 +7,7 @@
 mod driver;
 mod inbound;
 mod liveness;
+pub(crate) mod pending;
 mod queue;
 pub(crate) mod stream;
 

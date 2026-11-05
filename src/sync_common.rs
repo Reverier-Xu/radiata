@@ -222,6 +222,7 @@ fn outbound_request(
   let request = crate::packet::OutboundRequest {
     trace_id,
     target: crate::StreamTarget::Exact(peer.clone()),
+    routing_policy: crate::RoutingPolicy::DIRECT,
     load_balancer: None,
     max_hops: 1,
     protocol: protocol.clone(),
