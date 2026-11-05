@@ -54,7 +54,7 @@ pub(crate) const BUILTIN_FEATURE_LABELS: [&str; 5] = [
   DIRECT_REQUEST,
   ROUTED_DELIVERY,
 ];
-const DIRECT_REQUEST_PROTOCOL: &str = "radiata.woooo.tech/protocols/direct-request";
+const DIRECT_REQUEST_PROTOCOL: &str = "radiata.woooo.tech/protocols/v1/direct-request";
 
 const DEFINITION_LIMITS: CborLimits = CborLimits::new(16, 1_024, MAX_BODY_BYTES);
 
@@ -380,7 +380,7 @@ mod tests {
       (
         DIRECT_REQUEST,
         "f267e89141b80aab766cd167502a55e5662567a7ca5ac02c091f1ec5c5003d8b",
-        "7dfa9f0d5f24bf399f1ff3dd7f3354f09a7448d0a48b8e0b6e98c5b56e4e0a27",
+        "469160fe1e5ddfa06da9874fffd0fbac0582beaea670991697f809df6813e3e0",
       ),
       (
         ROUTED_DELIVERY,

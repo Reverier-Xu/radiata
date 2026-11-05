@@ -8,6 +8,9 @@ pub(crate) mod selection;
 pub(crate) mod tag;
 pub(crate) mod wire;
 
+#[cfg(test)]
+pub(crate) mod builtin;
+
 /// The handshake/control body ceiling: one wire body never exceeds
 /// it, and every derived limit (parser defaults, aggregate WebSocket
 /// messages) derives from this constant instead of restating the number.

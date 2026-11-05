@@ -22,7 +22,8 @@ use crate::{
 };
 
 /// The canonical protocol tag of the membership sync stream.
-pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str = "radiata.woooo.tech/protocols/membership-sync";
+pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str =
+  "radiata.woooo.tech/protocols/v1/membership-sync";
 
 /// The wire schema of one sync payload.
 const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/membership-sync-payload";

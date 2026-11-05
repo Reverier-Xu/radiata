@@ -19,11 +19,27 @@ pub(crate) const BUILTIN_DOMAIN: &str = "radiata.woooo.tech";
 
 /// The closed tag categories the crate compares against (single source):
 /// protocol-fixed, so one constant table makes the set auditable and a
-/// typo in any comparison impossible to compile.
+/// typo in any comparison impossible to compile. The version policy of
+/// each category lives beside these names in [`super::builtin`].
 pub(crate) const CATEGORY_CRYPTO: &str = "crypto";
-pub(crate) const CATEGORY_METADATA: &str = "metadata";
-pub(crate) const CATEGORY_RESOURCES: &str = "resources";
+pub(crate) const CATEGORY_FEATURES: &str = "features";
 pub(crate) const CATEGORY_LABELS: &str = "labels";
+pub(crate) const CATEGORY_METADATA: &str = "metadata";
+pub(crate) const CATEGORY_PROTOCOLS: &str = "protocols";
+pub(crate) const CATEGORY_RESOURCES: &str = "resources";
+pub(crate) const CATEGORY_TRANSPORTS: &str = "transports";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_ROUTE_POLICIES: &str = "route-policies";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_SCHEMAS: &str = "schemas";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_STATUS: &str = "status";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_TASKS: &str = "tasks";
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QualifiedTag {
@@ -138,7 +154,7 @@ impl fmt::Debug for QualifiedTag {
 /// accessors ride into the same `impl` block as `parse`, so a tag renders
 /// exactly like it did before the split.
 macro_rules! category_tag {
-  ($name:ident, $category:literal, $context:literal) => {
+  ($name:ident, $category:expr, $context:literal) => {
     category_tag!(@type $name, $category, $context, {
       /// The canonical text.
       pub fn as_str(&self) -> &str {
@@ -153,7 +169,7 @@ macro_rules! category_tag {
     });
   };
 
-  (@type $name:ident, $category:literal, $context:literal, { $($accessors:tt)* }) => {
+  (@type $name:ident, $category:expr, $context:literal, { $($accessors:tt)* }) => {
     #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct $name(QualifiedTag);
 
@@ -194,9 +210,9 @@ macro_rules! category_tag {
   };
 }
 
-category_tag!(FeatureTag, "features", "feature tag");
-category_tag!(ProtocolTag, "protocols", "protocol tag");
-category_tag!(TransportTag, "transports", "transport tag");
+category_tag!(FeatureTag, CATEGORY_FEATURES, "feature tag");
+category_tag!(ProtocolTag, CATEGORY_PROTOCOLS, "protocol tag");
+category_tag!(TransportTag, CATEGORY_TRANSPORTS, "transport tag");
 
 /// Validates one tag and returns its canonical text with the domain,
 /// category, and version split offsets. The grammar admits exactly two

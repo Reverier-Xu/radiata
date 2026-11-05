@@ -138,7 +138,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 pub const MAX_ARTIFACT_BYTES: usize = 1_048_576;
 pub const MAX_RETAINED_EVENTS: usize = 10_000;
 const EVENT_DIGEST_DOMAIN: &[u8] = b"radiata.woooo.tech/failure-replay/event-stream/v2";
-const FAILURE_SCHEMA: &str = "radiata.woooo.tech/schemas/failure-replay";
+const FAILURE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/failure-replay";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForbiddenFieldClass {
@@ -1633,7 +1633,7 @@ mod tests {
       assert!(
         artifact
           .as_bytes()
-          .starts_with(b"{\"schema\":\"radiata.woooo.tech/schemas/failure-replay\"")
+          .starts_with(b"{\"schema\":\"radiata.woooo.tech/schemas/v1/failure-replay\"")
       );
       assert_eq!(artifact.producer(), producer);
       assert_eq!(source.event_reads.get(), 1);
