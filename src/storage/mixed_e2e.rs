@@ -69,9 +69,9 @@ fn descriptor(node: &NodeId, revision: u64, seed: [u8; 32]) -> NodeDescriptorV1 
 }
 
 fn resource_record(
-  seed_index: u8, writer: &NodeId, uri: &str, timestamp_millis: u64, seed: [u8; 32],
+  seed_index: u8, writer: &NodeId, uri: &str, timestamp_millis: u64,
 ) -> ResourceRecordV1 {
-  ResourceRecordV1::sign(
+  ResourceRecordV1::new(
     ResourceName::parse(&format!("radiata.woooo.tech/resources/mixed-{seed_index}")).unwrap(),
     LabelValue::parse("document").unwrap(),
     crate::ResourceUri::parse(uri).unwrap(),
@@ -85,7 +85,6 @@ fn resource_record(
     writer.clone(),
     0,
     false,
-    &ed25519_dalek::SigningKey::from_bytes(&seed),
   )
   .unwrap()
 }
@@ -262,12 +261,12 @@ mod cross_backend {
     put_descriptor(&side_b, &descriptor(&writer(2), 1, [9_u8; 32])).await;
     put_resource(
       &side_a,
-      &resource_record(1, &writer(1), "u://a1", 2_000, seed),
+      &resource_record(1, &writer(1), "u://a1", 2_000),
     )
     .await;
     put_resource(
       &side_b,
-      &resource_record(2, &writer(2), "u://b1", 3_000, [9_u8; 32]),
+      &resource_record(2, &writer(2), "u://b1", 3_000),
     )
     .await;
 

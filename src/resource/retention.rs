@@ -1,6 +1,6 @@
-//! Signed removal retention and exact core-metadata cleanup.
+//! Removal retention and exact core-metadata cleanup.
 //!
-//! A removal is a signed resource record like any other: it stays the
+//! A removal is a resource record like any other: it stays the
 //! register's convergence-eligible winner until this exact-metadata policy
 //! evicts it. The policy cleans only `removed()` records — never live
 //! metadata — by conditional deletes whose expectation is the exact stored
@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::{Result, StoreKey, StoreOperation, storage::MetadataStore, time::WallClock};
 
-/// The shipped default removal-evidence retention window: a signed
-/// removal record survives this long after its own timestamp before the
+/// The shipped default removal-evidence retention window: a removal
+/// record survives this long after its own timestamp before the
 /// ordinary retention pass may drop it. Mirrors the trace-metadata
 /// default. The window is configurable
 /// ([`crate::NodeConfig::with_resource_removal_retention`]) because it is
@@ -222,8 +222,6 @@ mod tests {
     time::{Duration, UNIX_EPOCH},
   };
 
-  use ed25519_dalek::SigningKey;
-
   use super::sweep_removed_ctx;
   use crate::{
     LabelKey, LabelSet, LabelValue, NodeId,
@@ -232,8 +230,6 @@ mod tests {
     resource::{ResourceName, ResourceRecordV1},
     storage::{MetadataStore, contract::helpers::ManualClock},
   };
-
-  const SEED: [u8; 32] = [41; 32];
 
   fn name(seed: u8) -> ResourceName {
     ResourceName::parse(&format!("radiata.woooo.tech/resources/retention-{seed}")).unwrap()
@@ -251,7 +247,7 @@ mod tests {
   fn record(
     name: &ResourceName, timestamp_millis: u64, removed: bool, uri: &str,
   ) -> ResourceRecordV1 {
-    ResourceRecordV1::sign(
+    ResourceRecordV1::new(
       name.clone(),
       LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse(uri).unwrap(),
@@ -260,7 +256,6 @@ mod tests {
       NodeId::parse("node-000000000000000000001").unwrap(),
       if removed { 1 } else { 0 },
       removed,
-      &SigningKey::from_bytes(&SEED),
     )
     .unwrap()
   }

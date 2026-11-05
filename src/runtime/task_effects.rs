@@ -764,10 +764,10 @@ async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
 
 // -- resource and node-metadata verbs ----------------------------------
 
-/// Admits one resource write intent as a signed candidate record
+/// Admits one resource write intent as a candidate record
 /// (`PutResource`): `put` passes `None` (last-writer-wins) and
 /// `put_expected` passes the compare-and-swap precondition. The effect
-/// stamps, signs, and commits the record in one conditional transaction.
+/// stamps and commits the record in one conditional transaction.
 ///
 /// Admission-time failures are the pure shape checks (a stopped node, a
 /// malformed write, a resource hook's rejection) plus the hook-composed
@@ -1051,10 +1051,9 @@ impl Drop for PublicationSlot {
 }
 
 /// The put effect: the moved supervisor body — stamp the host wall-clock
-/// tuple, sign through the node's key provider, and commit the whole
-/// record in one conditional transaction under the shared bounded
-/// commit-race retry. A committed winner emits exactly one
-/// [`crate::ResourceChanged`] after durability; an accepted but
+/// tuple and commit the whole record in one conditional transaction under
+/// the shared bounded commit-race retry. A committed winner emits exactly
+/// one [`crate::ResourceChanged`] after durability; an accepted but
 /// superseded candidate emits nothing, and an indeterminate commit
 /// reports `CommitUnknown` without an event. The resource hooks'
 /// `observed` fires on the accepted record after this node's own commit
@@ -1081,15 +1080,13 @@ async fn reconcile_put_resource(
     Box::pin(async move {
       // The caller's expected version is the only authority on which
       // register state the write may replace. This pre-check is the
-      // early bail (a stale observation never pays the signature); the
-      // authoritative re-verification runs inside the commit's own
-      // snapshot (`commit_expected_record_ctx`), so the asynchronous
-      // signature step between the two cannot race the precondition
-      // away — a register that moved past the expected version refuses
-      // the write instead of being silently overwritten by a tuple
-      // winner. A mismatch is final and never retried; the CAS race
-      // guard below covers only the snapshot-commit window and re-runs
-      // this check per attempt.
+      // early bail; the authoritative re-verification runs inside the
+      // commit's own snapshot (`commit_expected_record_ctx`), so the
+      // precondition cannot race away — a register that moved past the
+      // expected version refuses the write instead of being silently
+      // overwritten by a tuple winner. A mismatch is final and never
+      // retried; the CAS race guard below covers only the
+      // snapshot-commit window and re-runs this check per attempt.
       if let Some(expected) = expected {
         let stored = crate::resource::store::read_record_ctx(context.store(), write.name())
           .await?
@@ -1101,7 +1098,7 @@ async fn reconcile_put_resource(
         }
       }
       let timestamp_millis = super::resources::issue_write_stamp(&planes.resource_write_clock);
-      let record = crate::resource::ResourceRecordV1::sign_with_provider(
+      let record = crate::resource::ResourceRecordV1::new(
         write.name().clone(),
         labels.resource_type().clone(),
         labels.uri().clone(),
@@ -1110,10 +1107,7 @@ async fn reconcile_put_resource(
         writer.clone(),
         0,
         false,
-        context.keys(),
-        context.identity().handle(),
-      )
-      .await?;
+      )?;
       let accepted = crate::resource::select::resource_view(&record);
       match crate::resource::store::commit_expected_record_ctx(
         context.store(),
@@ -1183,9 +1177,9 @@ async fn reconcile_delete_resource(
   let context = Arc::clone(&planes.context);
   let writer = context.identity().node().clone();
   // The snapshot-exact CAS can lose a race against a concurrent internal
-  // committer, so the observation, signature, and commit re-run within
-  // a bounded retry; the caller's `expected` stays the only authority
-  // on which register state the removal may replace.
+  // committer, so the observation and commit re-run within a bounded
+  // retry; the caller's `expected` stays the only authority on which
+  // register state the removal may replace.
   // Shared reborrows so the retry closure can capture by reference and
   // stay callable (FnMut) across attempts; the outer `name` is cloned
   // per attempt and re-bound to the helper's result afterwards.
@@ -1225,10 +1219,9 @@ async fn reconcile_delete_resource(
         .removal_rank()
         .checked_add(1)
         .ok_or_else(|| Error::conflict("resource removal rank"))?;
-      // The removal signs through the same single sign-and-seal path as
-      // a put (`removed = true`): one canonical encode, one digest, and
-      // no second body construction inside `seal`.
-      let removal = crate::resource::ResourceRecordV1::sign_with_provider(
+      // The removal record is built exactly like a put's (`removed =
+      // true`): one canonical encode, one digest.
+      let removal = crate::resource::ResourceRecordV1::new(
         name.clone(),
         stored.resource_type().clone(),
         stored.resource_uri().clone(),
@@ -1237,10 +1230,7 @@ async fn reconcile_delete_resource(
         writer.clone(),
         removal_rank,
         true,
-        context.keys(),
-        context.identity().handle(),
-      )
-      .await?;
+      )?;
       if !removal.wins_over(&stored) {
         // A rolled-back host clock cannot pose as a newer winner: the
         // removal is refused and the live record stays.

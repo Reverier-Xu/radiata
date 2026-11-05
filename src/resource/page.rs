@@ -1,14 +1,15 @@
 //! Bounded resource-metadata pages for ordinary anti-entropy repair.
 //!
-//! One page carries a bounded list of whole signed records plus a
-//! continuation cursor, so population-sized catalogs stream without ever
-//! materializing the full catalog. The test emit pages the local store
-//! from a cursor; application validates each record's digest at decode and
-//! its writer's signature against the locally trusted member descriptors
-//! before any comparison, then installs it through the conditional
-//! register commit — losing permutations stay harmless and duplicates are
-//! idempotent, so duplicate, reordered, truncated, and changing pages all
-//! converge to one stable winner set.
+//! One page carries a bounded list of whole records plus a continuation
+//! cursor, so population-sized catalogs stream without ever materializing
+//! the full catalog. The test emit pages the local store from a cursor;
+//! application validates each record's digest at decode — the row is
+//! trusted through the authenticated session that delivered it, exactly
+//! as member descriptors are, so there is no per-record signature to
+//! check — and then installs it through the conditional register commit:
+//! losing permutations stay harmless and duplicates are idempotent, so
+//! duplicate, reordered, truncated, and changing pages all converge to one
+//! stable winner set.
 
 use super::ResourceRecordV1;
 #[cfg(test)]
@@ -24,7 +25,7 @@ pub(crate) const RESOURCE_PAGE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/res
 /// of being truncated.
 pub(crate) use crate::paging::PAGE_MAX_ITEMS as MAX_PAGE_RECORDS;
 
-/// One bounded page of signed resource records plus a continuation cursor.
+/// One bounded page of resource records plus a continuation cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourcePage {
   records: Vec<ResourceRecordV1>,
@@ -58,8 +59,7 @@ impl ResourcePage {
   }
 
   /// Decodes one page. Every entry is fully decoded and digest-checked
-  /// here; writer-signature validation happens against the local trust
-  /// anchors during application, before comparison.
+  /// here, before any comparison.
   #[cfg(test)]
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
     let (items, cursor) = crate::paging::decode_page(
@@ -81,20 +81,8 @@ impl ResourcePage {
 /// The anti-entropy driver for resource pages: pages the local register
 /// from a cursor and applies received pages under strict validation.
 pub(crate) mod sync {
-  use std::collections::HashMap;
-
   use super::{ResourcePage, ResourceRecordV1};
-  use crate::{Error, NodeId, Result, api::Entropy, storage::MetadataStore};
-
-  /// How long one record's writer-descriptor lookup waits for the
-  /// membership lane to converge before the record skips: the descriptor
-  /// rides the same anti-entropy tick as the page, so a healthy
-  /// convergence lands within one or two ticks — the bound only has to
-  /// outlast that race.
-  const WRITER_TRUST_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-  /// The descriptor re-poll interval inside the bounded wait.
-  const WRITER_TRUST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+  use crate::{Result, api::Entropy, storage::MetadataStore};
 
   /// The unfiltered page emit for the page round-trip tests: one page
   /// over the store's current records after `cursor`. A **test
@@ -126,38 +114,25 @@ pub(crate) mod sync {
   }
 
   /// The outcome of one received page's apply: how many records the
-  /// conditional register committed, and the records still deferred —
-  /// their writer's locally trusted descriptor never converged within
-  /// the bounded wait or the end-of-page retry, so the register never
-  /// evaluated them. A deferred record is neither installed nor
-  /// refused: the reconciliation plane keeps its row in the engines and
-  /// the repair set, so the descriptor's arrival (a register-epoch
-  /// advance) drives the retry instead of the detection cadence.
+  /// conditional register committed, and the committed records — the
+  /// caller reports each one as a peer-converged resource change.
   pub(crate) struct PageApply {
     /// Records the register committed this pass.
     pub(crate) applied: usize,
-    /// The committed records, in commit order: the caller reports each
-    /// one as a peer-converged resource change.
+    /// The committed records, in commit order.
     pub(crate) installed: Vec<ResourceRecordV1>,
-    /// Records skipped fail-closed behind an unconverged writer.
-    pub(crate) deferred: Vec<ResourceRecordV1>,
   }
 
   /// Applies one received page over the running node's metadata store
   /// and reports only the committed count — the form the test harnesses
   /// and offline pagers consume (the production caller is the
   /// reconciliation plane, which takes the reported form below).
-  /// Every record's writer signature is validated against the locally
-  /// trusted member descriptors **before** comparison. Writers the local
-  /// descriptor store does not know yet wait concurrently for one bounded
-  /// period (serializing those waits would pin this page's consumer —
-  /// and its inbound admission slot — for writers x the bound, which
-  /// gridlocked receivers at join fan-out), then get one end-of-page
-  /// retry before their records skip fail-closed (the reconciliation
-  /// plane's derived-view repair remains the final backstop).
-  /// Installation goes through the
-  /// conditional register commit, so stale, duplicated, and losing
-  /// permutations cannot replace a greater stored winner.
+  ///
+  /// The row is trusted through the authenticated session that delivered
+  /// it, the same stance member descriptors take: there is no per-record
+  /// signature to check and no writer descriptor to resolve. Installation
+  /// goes through the conditional register commit, so stale, duplicated,
+  /// and losing permutations cannot replace a greater stored winner.
   #[cfg(test)]
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
@@ -166,160 +141,20 @@ pub(crate) mod sync {
   }
 
   /// The reported form of [`apply_page_ctx`] the reconciliation plane's
-  /// resources arm consumes: the identical bounded-wait discipline,
-  /// retry pass, and commits, plus the installed records and the
-  /// deferral report — records whose writer never converged are reported
-  /// distinctly from a decided contest loss, so the plane keeps their
-  /// rows for the descriptor's arrival instead of reading the skip as a
-  /// verdict.
+  /// resources arm consumes: the same commits plus the installed records.
   pub(crate) async fn apply_page_reported_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
   ) -> Result<PageApply> {
-    // Resolve each distinct writer once per page: the bounded
-    // descriptor-convergence wait is a per-writer cost, not a per-record
-    // cost — a page of N records from one not-yet-converged writer waits
-    // once, not N times.
-    let mut resolved: HashMap<NodeId, Option<crate::PublicKey>> = HashMap::new();
-    for writer in page
-      .records()
-      .iter()
-      .map(|record| record.writer())
-      .collect::<Vec<_>>()
-    {
-      if resolved.contains_key(writer) {
-        continue;
-      }
-      // The fast path is the same read `writer_key` starts with: a
-      // converged writer resolves without any wait.
-      let key = match crate::membership::store::read_descriptor_ctx(store, writer).await {
-        Ok(Some(descriptor)) => Some(descriptor.public_key().clone()),
-        _ => None,
-      };
-      resolved.insert(writer.clone(), key);
-    }
-    // The not-yet-converged writers wait concurrently, not serially: a
-    // full page of fat unknown writers must not pin this page's consumer
-    // (and with it an inbound admission slot) for
-    // writers x WRITER_TRUST_WAIT. At join fan-out that serialized wait
-    // saturated receivers' admission tables, which then rejected the
-    // membership pages that would have resolved the very writers the
-    // waiters were polling — a self-sustaining gridlock where nothing
-    // converged. Concurrent waits bound one page's apply to roughly one
-    // wait period total.
-    let unknown: Vec<NodeId> = resolved
-      .iter()
-      .filter(|(_, key)| key.is_none())
-      .map(|(writer, _)| writer.clone())
-      .collect();
-    let waits = futures_util::future::join_all(unknown.into_iter().map(|writer| async move {
-      let key = writer_key(store, &writer).await;
-      (writer, key)
-    }))
-    .await;
-    for (writer, key) in waits {
-      resolved.insert(writer, key.ok());
-    }
-    // One batched register commit for everything resolved: the whole
-    // page lands in a single durable transaction instead of one per
-    // record (the per-record commit queue at join fan-out was the
-    // minutes-long roster-convergence tail).
-    let resolved_keys: HashMap<NodeId, crate::PublicKey> = resolved
-      .iter()
-      .filter_map(|(writer, key)| key.clone().map(|key| (writer.clone(), key)))
-      .collect();
+    // One batched register commit for the whole page: it lands in a
+    // single durable transaction instead of one per record (the
+    // per-record commit queue at join fan-out was the minutes-long
+    // roster-convergence tail).
     let records: Vec<&ResourceRecordV1> = page.records().iter().collect();
-    let mut installed =
-      super::super::store::commit_page_batch_ctx(store, entropy, &records, &resolved_keys).await?;
-    let mut applied = installed.len();
-    // The retry pass. This page's apply serialized one bounded wait per
-    // unknown writer, and membership pages apply concurrently on other
-    // consumer tasks — a descriptor that landed while those waits ran is
-    // only visible now. The old code skipped these records finally,
-    // stranding them behind the sender's already-committed delivery
-    // record until a periodic whole-catalog refresh re-delivered
-    // them: at join scale that refresh is many detection cadences away
-    // and dominated roster convergence.
-    let stranded: Vec<&ResourceRecordV1> = records
-      .iter()
-      .copied()
-      .filter(|record| !resolved_keys.contains_key(record.writer()))
-      .collect();
-    let mut resolved_retry: HashMap<NodeId, crate::PublicKey> = HashMap::new();
-    if !stranded.is_empty() {
-      // One re-resolution (and one warn) per writer, not per record: the
-      // negative cache keeps unresolved writers in the map so the warn
-      // cannot repeat.
-      let mut retried: HashMap<NodeId, Option<crate::PublicKey>> = HashMap::new();
-      for record in &stranded {
-        if !retried.contains_key(record.writer()) {
-          let resolution =
-            match crate::membership::store::read_descriptor_ctx(store, record.writer()).await {
-              Ok(Some(descriptor)) => {
-                Some(descriptor.public_key().clone())
-              }
-              _ => None,
-            };
-          if resolution.is_none() {
-            tracing::warn!(
-              writer = %record.writer(),
-              "resource page writer never converged; page records skipped"
-            );
-          }
-          retried.insert(record.writer().clone(), resolution);
-        }
-      }
-      resolved_retry = retried
-        .iter()
-        .filter_map(|(writer, key)| key.clone().map(|key| (writer.clone(), key)))
-        .collect();
-      let retried_installed =
-        super::super::store::commit_page_batch_ctx(store, entropy, &stranded, &resolved_retry)
-          .await?;
-      applied += retried_installed.len();
-      installed.extend(retried_installed);
-    }
-    // The deferral report: records whose writer resolved in neither the
-    // bounded wait nor the retry. The register never evaluated them, so
-    // their skip is a deferral rather than a decided loss — the caller
-    // keeps the rows until the descriptor converges.
-    let deferred: Vec<ResourceRecordV1> = stranded
-      .into_iter()
-      .filter(|record| !resolved_retry.contains_key(record.writer()))
-      .cloned()
-      .collect();
+    let installed = super::super::store::commit_page_batch_ctx(store, entropy, &records).await?;
     Ok(PageApply {
-      applied,
+      applied: installed.len(),
       installed,
-      deferred,
     })
-  }
-
-  /// The trusted public key of `writer`, resolved from the locally stored
-  /// member descriptors that ordinary membership synchronization maintains.
-  ///
-  /// A page may legitimately arrive before its writer's descriptor: both
-  /// ride the same anti-entropy tick in either order. The resolution
-  /// therefore waits a bounded time for the descriptor to converge
-  /// instead of skipping immediately — a skip here would strand the
-  /// record behind an already-delivered row. Past the bound the
-  /// lookup fails closed; the page's end-of-apply retry pass re-resolves
-  /// once more, and the reconciliation plane's derived-view repair
-  /// remains the final
-  /// backstop.
-  async fn writer_key(store: &MetadataStore, writer: &crate::NodeId) -> Result<crate::PublicKey> {
-    let deadline = std::time::Instant::now() + WRITER_TRUST_WAIT;
-    loop {
-      let descriptor = crate::membership::store::read_descriptor_ctx(store, writer).await?;
-      match descriptor {
-        Some(descriptor) => {
-          return Ok(descriptor.public_key().clone());
-        }
-        _ if std::time::Instant::now() >= deadline => {
-          return Err(Error::not_trusted("resource page writer"));
-        }
-        _ => tokio::time::sleep(WRITER_TRUST_POLL).await,
-      }
-    }
   }
 }
 
@@ -327,17 +162,11 @@ pub(crate) mod sync {
 mod tests {
   use std::sync::Arc;
 
-  use ed25519_dalek::SigningKey;
-
   use super::{ResourcePage, ResourceRecordV1, sync};
   use crate::{
-    Endpoint, LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy,
-    membership::store as descriptor_store, provider::StorageFactory, resource::ResourceName,
-    storage::MetadataStore,
+    LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy, provider::StorageFactory,
+    resource::ResourceName, storage::MetadataStore,
   };
-
-  const SEED: [u8; 32] = [31; 32];
-  const OTHER_SEED: [u8; 32] = [33; 32];
 
   fn writer() -> NodeId {
     NodeId::parse("node-000000000000000000001").unwrap()
@@ -361,9 +190,9 @@ mod tests {
   }
 
   fn record(
-    name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str, seed: [u8; 32],
+    name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str,
   ) -> ResourceRecordV1 {
-    ResourceRecordV1::sign(
+    ResourceRecordV1::new(
       name.clone(),
       LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse(uri).unwrap(),
@@ -372,7 +201,6 @@ mod tests {
       writer.clone(),
       0,
       false,
-      &SigningKey::from_bytes(&seed),
     )
     .unwrap()
   }
@@ -388,23 +216,6 @@ mod tests {
     (factory, store)
   }
 
-  /// Stores one trusted writer descriptor through the ordinary membership
-  /// path, so the resource page lane can resolve and verify signatures.
-  async fn trust(store: &MetadataStore, node: &NodeId, seed: [u8; 32]) {
-    let key =
-      crate::PublicKey::from_bytes(SigningKey::from_bytes(&seed).verifying_key().to_bytes());
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node.clone(),
-      key,
-      vec![Endpoint::parse("wss://127.0.0.1:0").unwrap()],
-      1,
-      1,
-    );
-    descriptor_store::store_descriptor_ctx(store, &SystemEntropy, &descriptor)
-      .await
-      .unwrap();
-  }
-
   /// Pages enforce record, byte, and schema capacities — an
   /// oversized page, a wrong schema, and a truncated record all fail
   /// closed at decode.
@@ -417,17 +228,12 @@ mod tests {
           1_000,
           &writer(),
           "u://x",
-          SEED,
         )
       })
       .collect();
     assert!(ResourcePage::new(records, None).is_err());
 
-    let page = ResourcePage::new(
-      vec![record(&name(1), 1_000, &writer(), "u://x", SEED)],
-      None,
-    )
-    .unwrap();
+    let page = ResourcePage::new(vec![record(&name(1), 1_000, &writer(), "u://x")], None).unwrap();
     let bytes = page.encode().unwrap();
     assert_eq!(ResourcePage::decode(&bytes).unwrap(), page);
 
@@ -451,15 +257,9 @@ mod tests {
     // Two writers write competing permutations for three names.
     let mut truth = Vec::new();
     for seed in 1..=3_u8 {
-      truth.push(record(&name(seed), 1_000, &writer(), "u://a", SEED));
-      truth.push(record(
-        &name(seed),
-        2_000,
-        &other_writer(),
-        "u://b",
-        OTHER_SEED,
-      ));
-      truth.push(record(&name(seed), 3_000, &writer(), "u://c", SEED));
+      truth.push(record(&name(seed), 1_000, &writer(), "u://a"));
+      truth.push(record(&name(seed), 2_000, &other_writer(), "u://b"));
+      truth.push(record(&name(seed), 3_000, &writer(), "u://c"));
     }
     for record in &truth {
       match super::super::store::commit_record_ctx(&source, &SystemEntropy, record)
@@ -490,14 +290,9 @@ mod tests {
       "three winners at limit two need at least two pages"
     );
 
-    // Two receivers apply the pages in opposite orders onto fresh stores
-    // seeded with the same trusted writers.
+    // Two receivers apply the pages in opposite orders onto fresh stores.
     let (_factory_a, store_a) = open_store().await;
-    trust(&store_a, &writer(), SEED).await;
-    trust(&store_a, &other_writer(), OTHER_SEED).await;
     let (_factory_b, store_b) = open_store().await;
-    trust(&store_b, &writer(), SEED).await;
-    trust(&store_b, &other_writer(), OTHER_SEED).await;
     for page in &pages {
       sync::apply_page_ctx(&store_a, &SystemEntropy, page)
         .await
@@ -567,146 +362,49 @@ mod tests {
       .unwrap()
   }
 
-  /// Regression: a record whose writer's descriptor lands while this very
-  /// page is still applying must not be stranded. The page's unknown
-  /// writers wait concurrently (bounded); writer A's descriptor arrives
-  /// mid-wait and resolves through the poll, while writer B never lands
-  /// and runs through the end-of-apply retry pass before the fail-closed
-  /// skip. The old serial-per-writer wait pinned a page's consumer for
-  /// writers x the wait bound, which at join fan-out saturated inbound
-  /// admission tables and gridlocked the mesh.
-  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn a_descriptor_landing_mid_apply_is_retried_before_the_page_ends() {
-    use std::time::Duration;
-
-    let (_factory, store) = open_store().await;
-    let store = Arc::new(store);
-    let page = ResourcePage::new(
-      vec![
-        record(&name(1), 1_000, &writer(), "u://a", SEED),
-        record(&name(2), 1_000, &other_writer(), "u://b", OTHER_SEED),
-      ],
-      None,
-    )
-    .unwrap();
-    // Neither writer is trusted up front. Both bounded waits run
-    // concurrently; writer A's descriptor lands mid-wait, writer B's
-    // never lands.
-    let installer = Arc::clone(&store);
-    let landed_writer = writer();
-    tokio::spawn(async move {
-      tokio::time::sleep(Duration::from_secs(1)).await;
-      trust(&installer, &landed_writer, SEED).await;
-    });
-
-    let outcome = sync::apply_page_reported_ctx(&store, &SystemEntropy, &page)
-      .await
-      .unwrap();
-    assert_eq!(
-      outcome.applied, 1,
-      "the mid-wait descriptor's record applies; the never-landed one skips"
-    );
-    assert_eq!(
-      outcome.deferred.len(),
-      1,
-      "the never-converged writer's record reports as deferred, not decided"
-    );
-    let got = read_current(&store, &name(1)).await;
-    assert!(got.is_some(), "writer A's record is installed");
-    let missing = read_current(&store, &name(2)).await;
-    assert!(
-      missing.is_none(),
-      "the never-converged writer stays skipped"
-    );
-  }
-
-  /// Signature validation happens before comparison — a
-  /// record from an unknown writer or with a broken signature is skipped
-  /// fail-closed and never stored.
+  /// The session is the trust boundary: a row delivered over an
+  /// authenticated session is accepted with no per-record signature and
+  /// no local descriptor for its writer, exactly as member descriptors
+  /// are. The register's tuple order still decides the winner, and a row
+  /// whose digest does not match its fields never reaches it — the page
+  /// decode refuses the whole page.
   #[tokio::test]
-  async fn unverified_records_fail_closed_before_comparison() {
+  async fn rows_are_accepted_through_the_session_without_a_writer_descriptor() {
     let (_factory, receiver) = open_store().await;
 
-    // Unknown writer: nothing is compared or stored. The receiver stores
-    // no descriptor for the writer, so the record must be skipped even
-    // though its tuple would win an empty register.
-    let unknown = record(&name(9), 5_000, &writer(), "u://unknown", SEED);
-    let page = ResourcePage::new(vec![unknown], None).unwrap();
+    // The receiver holds no descriptor for this writer at all.
+    let delivered = record(&name(9), 5_000, &writer(), "u://delivered");
+    let page = ResourcePage::new(vec![delivered.clone()], None).unwrap();
     let outcome = sync::apply_page_reported_ctx(&receiver, &SystemEntropy, &page)
       .await
       .unwrap();
-    assert_eq!(outcome.applied, 0);
+    assert_eq!(outcome.applied, 1, "the delivered row installs");
     assert_eq!(
-      outcome.deferred.len(),
-      1,
-      "the unknown writer's record defers instead of deciding"
+      outcome.installed.as_slice(),
+      std::slice::from_ref(&delivered)
     );
-    assert!(read_current(&receiver, &name(9)).await.is_none());
-  }
-
-  /// A known writer with a bad signature is also skipped fail-closed.
-  #[tokio::test]
-  async fn bad_signature_from_known_writer_is_skipped() {
-    let (_factory, receiver) = open_store().await;
-    trust(&receiver, &writer(), SEED).await;
-    let good = record(&name(4), 5_000, &writer(), "u://good", SEED);
-    // Re-sign the same body with a different key so the record shape is
-    // valid but the signature does not verify under the trusted key.
-    let forged_body = ResourceRecordV1::encode_signed_body(
-      good.name(),
-      good.resource_type(),
-      good.resource_uri(),
-      good.labels(),
-      good.timestamp_millis(),
-      good.writer(),
-      good.removal_rank(),
-      good.removed(),
-    )
-    .unwrap();
-    let key = SigningKey::from_bytes(&OTHER_SEED);
-    use ed25519_dalek::Signer as _;
-    let signature = crate::Signature::from_bytes(
-      key
-        .sign(&crate::identity::signature::signature_message(
-          crate::resource::RESOURCE_RECORD_DOMAIN,
-          &forged_body,
-        ))
-        .to_bytes(),
-    );
-    let forged = ResourceRecordV1::seal(
-      good.name().clone(),
-      good.resource_type().clone(),
-      good.resource_uri().clone(),
-      good.labels().clone(),
-      good.timestamp_millis(),
-      good.writer().clone(),
-      good.removal_rank(),
-      good.removed(),
-      signature,
-    )
-    .unwrap();
-    let page = ResourcePage::new(vec![forged], None).unwrap();
-    let outcome = sync::apply_page_reported_ctx(&receiver, &SystemEntropy, &page)
-      .await
+    assert_eq!(read_current(&receiver, &name(9)).await, Some(delivered));
+    // A mutated row is still rejected: flipping a byte inside the record
+    // body leaves a digest that no longer matches the fields, so the
+    // page fails to decode and nothing is compared or stored.
+    let mut tampered = page.encode().unwrap();
+    let position = tampered
+      .windows("u://delivered".len())
+      .position(|window| window == b"u://delivered")
       .unwrap();
-    assert_eq!(outcome.applied, 0);
-    assert!(
-      outcome.deferred.is_empty(),
-      "a known writer's bad signature is a decided skip, not a deferral"
-    );
-    assert!(read_current(&receiver, &name(4)).await.is_none());
+    tampered[position] ^= 0x01;
+    assert!(ResourcePage::decode(&tampered).is_err());
   }
 
   /// Regression: one corrupt stored incumbent must not fail the whole
   /// page batch. The register treats the corrupt value as non-evidence
-  /// and installs the verified incoming record over it with an exact
+  /// and installs the incoming record over it with an exact
   /// CAS, so the page applies, the corrupt bytes are replaced, and a
   /// second apply finds the incoming record already stored (no
   /// re-install).
   #[tokio::test]
   async fn an_undecodable_stored_incumbent_is_replaced_by_the_valid_record() {
     let (_factory, store) = open_store().await;
-    trust(&store, &writer(), SEED).await;
 
     // Poison one register row with bytes no resource record decodes from.
     let poisoned = name(7);
@@ -732,8 +430,8 @@ mod tests {
       crate::CommitOutcome::Committed(_)
     ));
 
-    let poisoned_record = record(&poisoned, 5_000, &writer(), "u://poisoned", SEED);
-    let good = record(&name(8), 5_000, &writer(), "u://good", SEED);
+    let poisoned_record = record(&poisoned, 5_000, &writer(), "u://poisoned");
+    let good = record(&name(8), 5_000, &writer(), "u://good");
     let page = ResourcePage::new(vec![poisoned_record.clone(), good], None).unwrap();
     let outcome = sync::apply_page_reported_ctx(&store, &SystemEntropy, &page)
       .await
@@ -742,9 +440,8 @@ mod tests {
       outcome.applied, 2,
       "both records apply over the corrupt incumbent"
     );
-    assert!(outcome.deferred.is_empty());
 
-    // The corrupt incumbent is replaced by the verified record.
+    // The corrupt incumbent is replaced by the incoming record.
     let stored = store
       .snapshot()
       .await

@@ -65,19 +65,9 @@
 //! engine row set grows monotonically: superseded identities never leave
 //! (lifetime memory growth), the repair set never empties (the store can
 //! never take the old row back), and every newly primed peer re-receives
-//! the whole historical row set. The resources lane's prune carries one
-//! exemption: a row the apply deferred behind a writer whose descriptor
-//! has not converged never entered the store's contest, so the store
-//! holding its key under other content is not a supersession verdict —
-//! the row keeps its engine seat and its repair-set candidacy until the
-//! descriptor's arrival (a register-epoch advance) re-drives the repair,
-//! instead of re-paying the cadence's bounded writer wait every cycle.
-//! Collected tombstone rows are filtered
-//! at the scan and the receive boundary alike (collected evidence never
-//! enters an engine), so the checkpoint GC stops propagating reclaimed
-//! rows. The resources lane's swept filter carries the same reclaim
-//! discipline on the retention contract the sweep itself enforces:
-//! only a `removed()` record past its retention deadline whose key the
+//! the whole historical row set. The resources lane's swept filter carries
+//! the same reclaim discipline on the retention contract the sweep itself
+//! enforces: only a `removed()` record past its retention deadline whose key the
 //! store no longer holds is reclaimed knowledge (never re-admitted),
 //! while a fresh deletion is legitimate evidence even on a node that
 //! never held the resource — key absence alone was never a reclaim
@@ -369,18 +359,6 @@ struct PlaneState {
   /// point when the lane goes quiet (a fresh whole-lane claim then
   /// replaces the stale one the wait would have acted on).
   held_roots: BTreeMap<LaneId, Vec<NodeId>>,
-  /// Resources-lane row identities an apply deferred — their writer's
-  /// descriptor has not converged, so the register never evaluated
-  /// them. The prune pass exempts them from supersession (the store
-  /// holding the key under other content is not a decided contest
-  /// against a row that never entered it) and the repair set keeps
-  /// them, so the descriptor's arrival — a register-epoch advance —
-  /// drives the retry through the epoch pass instead of the detection
-  /// cadence. The set self-cleans: a scan that lists the identity
-  /// retires it, and the repair pass drops the identities it
-  /// re-evaluated and no longer defers (installed, lost, or refused —
-  /// decided outcomes all).
-  deferred_rows: BTreeSet<Vec<u8>>,
   /// The monotonic tick counter (the hint-retry backoff clock).
   tick_count: u64,
 }
@@ -567,7 +545,6 @@ impl ReconcilePlane {
           tick_count: 0,
           held_hints: BTreeMap::new(),
           held_roots: BTreeMap::new(),
-          deferred_rows: BTreeSet::new(),
         }),
       }),
     }
@@ -615,28 +592,8 @@ impl ReconcilePlane {
       // between the phases below, so no inbound frame observes a
       // half-applied tick.
       let plane = &mut *guard;
-      let listed = scan_view(
-        &mut plane.install_epoch,
-        &mut plane.deferred_rows,
-        &plan,
-        epoch,
-        &rows,
-      );
-      // The deferred exemption's read-side snapshot, taken before the
-      // peer loop's engine borrows: a resources row behind an
-      // unconverged writer never entered the store's contest, so the
-      // supersession oracle (the store holding its key under other
-      // content) must not read its skip as a decided loss.
-      let deferred_rows = plane.deferred_rows.clone();
-      let (driven, prime_holds) = drive_peers(
-        plane,
-        &peers,
-        &rows,
-        &plan,
-        &listed,
-        &deferred_rows,
-        filters,
-      );
+      let listed = scan_view(&mut plane.install_epoch, &plan, epoch, &rows);
+      let (driven, prime_holds) = drive_peers(plane, &peers, &rows, &plan, &listed, filters);
       outbound.extend(driven);
       // The prime's held root exchanges land now that the state
       // borrows are spent.
@@ -649,7 +606,6 @@ impl ReconcilePlane {
           &mut plane.repair_pending,
           &plan,
           &listed,
-          &deferred_rows,
           filters,
         );
       }
@@ -770,44 +726,21 @@ impl ReconcilePlane {
   /// here (the arms skip them in-line), so the only error is a
   /// batch-level store fault, which leaves the rows pending and forces
   /// the lane's next rescan — the retry must not wait for the lane to
-  /// see another write. The resources lane's deferred marks graduate for
-  /// the rows this pass re-evaluated and no longer defers; rows it did
-  /// not carry keep their marks (a receive concurrent with the apply may
-  /// have deferred one after the repair set was computed).
+  /// see another write.
   async fn apply_repair(&self, runtime: &RuntimeClient, repair: &LaneScan) {
     for (lane, lane_rows) in repair {
       if lane_rows.is_empty() {
         continue;
       }
       tracing::debug!(lane = ?lane, rows = lane_rows.len(), "reconcile derived-view repair");
-      match apply_rows(&self.shared, lane, lane_rows, None, Some(runtime)).await {
-        Ok(outcome) => {
-          if *lane == LaneId::Resources {
-            let still: BTreeSet<Vec<u8>> = outcome
-              .deferred
-              .iter()
-              .map(|(key, content)| row_identity(key, content))
-              .collect();
-            let evaluated: BTreeSet<Vec<u8>> = lane_rows
-              .iter()
-              .map(|(key, content)| row_identity(key, content))
-              .collect();
-            if let Ok(mut guard) = self.shared.lock() {
-              guard
-                .deferred_rows
-                .retain(|identity| !evaluated.contains(identity) || still.contains(identity));
-            }
-          }
-        }
-        Err(error) => {
-          tracing::warn!(
-            lane = ?lane,
-            kind = ?error.kind(),
-            "reconcile derived-view repair aborted by a store fault; retrying next epoch pass"
-          );
-          if let Ok(mut guard) = self.shared.lock() {
-            guard.force_rescan.insert(*lane);
-          }
+      if let Err(error) = apply_rows(&self.shared, lane, lane_rows, None, Some(runtime)).await {
+        tracing::warn!(
+          lane = ?lane,
+          kind = ?error.kind(),
+          "reconcile derived-view repair aborted by a store fault; retrying next epoch pass"
+        );
+        if let Ok(mut guard) = self.shared.lock() {
+          guard.force_rescan.insert(*lane);
         }
       }
     }
@@ -919,18 +852,6 @@ impl ReconcilePlane {
               "reconcile receive refused rows; they never enter the engines"
             );
           }
-          if !outcome.deferred.is_empty() {
-            // The deferred bookkeeping, ahead of the engine admissions
-            // below: a resources row behind an unconverged writer keeps
-            // its engine seat (it stays in `rows`) and gains its prune
-            // exemption, so the store holding its key under other
-            // content cannot read the skip as a decided supersession.
-            if let Ok(mut guard) = self.shared.lock() {
-              for (key, content) in &outcome.deferred {
-                guard.deferred_rows.insert(row_identity(key, content));
-              }
-            }
-          }
         }
         Err(error) => {
           // Row-level refusals are skipped in-line by the arms; an error
@@ -945,7 +866,7 @@ impl ReconcilePlane {
       }
       if !rows.is_empty() {
         // The lane schedules one confirmation scan: the apply may have
-        // deferred rows the store cannot take yet (a tombstone whose
+        // left rows the store cannot take yet (a tombstone whose
         // subject binding has not converged), and those rows' retry
         // lives in the next repair pass — without the scan the pass
         // never recomputes (a revocation arriving before its binding
@@ -1055,7 +976,7 @@ impl ReconcilePlane {
       outbound.extend(guard.release_held_hints());
     }
     if !rows.is_empty() {
-      // The kept rows — installed or deferred — fan out to the
+      // The kept rows fan out to the
       // sibling engines: propagation and application are decoupled
       // (the derived-view repair retries the application side on the
       // next epoch pass), and a refused row never propagates from a
@@ -1092,14 +1013,9 @@ impl ReconcilePlane {
 /// identities (the repair index's identity test) and the lane keys under
 /// them (the prune's supersession oracle). It also claims the scanned
 /// epoch as the plane's watermark — only a pass that actually scanned may
-/// claim it, or the writes a narrow plan skipped would never dirty again
-/// — and retires the deferred resources identities the scan now lists:
-/// the store took the row, so its prune exemption is over. Identities of
-/// rows still deferred (or gone entirely) keep their marks; the repair
-/// pass's graduation is the only other exit.
+/// claim it, or the writes a narrow plan skipped would never dirty again.
 fn scan_view(
-  install_epoch: &mut u64, deferred_rows: &mut BTreeSet<Vec<u8>>, plan: &BTreeSet<LaneId>,
-  epoch: u64, rows: &LaneScan,
+  install_epoch: &mut u64, plan: &BTreeSet<LaneId>, epoch: u64, rows: &LaneScan,
 ) -> LaneListed {
   if !plan.is_empty() {
     *install_epoch = epoch;
@@ -1119,9 +1035,6 @@ fn scan_view(
       )
     })
     .collect();
-  if let Some((identities, _)) = listed.get(&LaneId::Resources) {
-    deferred_rows.retain(|identity| !identities.contains(identity));
-  }
   listed
 }
 
@@ -1137,7 +1050,7 @@ fn scan_view(
 /// state borrow is spent.
 fn drive_peers(
   plane: &mut PlaneState, peers: &[NodeId], rows: &LaneScan, plan: &BTreeSet<LaneId>,
-  listed: &LaneListed, deferred_rows: &BTreeSet<Vec<u8>>, filters: ScanFilters,
+  listed: &LaneListed, filters: ScanFilters,
 ) -> (Outbound, Vec<(LaneId, NodeId)>) {
   let ScanFilters {
     checkpoint,
@@ -1221,10 +1134,7 @@ fn drive_peers(
     // survived under new content: a revision bump, a tuple loser) and
     // collected tombstones (the checkpoint watermark's reclaim). Rows
     // whose key the store does not hold at all stay: they are the
-    // derived-view repair set. One exemption: a deferred resources row
-    // was never evaluated, so the store holding its key is not a
-    // verdict against it — it stays for the writer descriptor's arrival
-    // to re-drive.
+    // derived-view repair set.
     for lane in ACTIVE_LANES {
       if !plan.contains(&lane) {
         continue;
@@ -1243,8 +1153,7 @@ fn drive_peers(
           lane == LaneId::Tombstones && tombstone_collected(checkpoint, key, content);
         let swept_row = lane == LaneId::Resources
           && resource_swept(keys, key, content, swept_at, removal_retention);
-        let deferred_row = lane == LaneId::Resources && deferred_rows.contains(&identity);
-        if collected_row || swept_row || (keys.contains(key) && !deferred_row) {
+        if collected_row || swept_row || keys.contains(key) {
           prune.push((key.to_vec(), content.to_vec()));
         }
       }
@@ -1266,16 +1175,14 @@ fn drive_peers(
 /// deduplicated across peers, plus the outstanding-repair marks. A
 /// collected tombstone, a retention-swept resource row, and a row the
 /// store holds under other content are not repair work — the first two
-/// would resurrect reclaimed evidence, the third is a decided loss —
-/// except a deferred resources row, which rides the set so the writer
-/// descriptor's arrival re-drives its retry. Lanes outside this pass's
-/// plan keep their marks: a narrow plan must not erase another lane's
-/// pending repair. `filters` is the scan's filter input triple, so the
-/// repair set judges every row against the same instant the prune did.
+/// would resurrect reclaimed evidence, the third is a decided loss.
+/// Lanes outside this pass's plan keep their marks: a narrow plan must
+/// not erase another lane's pending repair. `filters` is the scan's
+/// filter input triple, so the repair set judges every row against the
+/// same instant the prune did.
 fn repair_index(
   peers: &BTreeMap<NodeId, PeerState>, repair_pending: &mut BTreeSet<LaneId>,
-  plan: &BTreeSet<LaneId>, listed: &LaneListed, deferred_rows: &BTreeSet<Vec<u8>>,
-  filters: ScanFilters,
+  plan: &BTreeSet<LaneId>, listed: &LaneListed, filters: ScanFilters,
 ) -> LaneScan {
   let ScanFilters {
     checkpoint,
@@ -1307,13 +1214,7 @@ fn repair_index(
         {
           continue;
         }
-        // The deferred exemption's mirror: a deferred row rides the
-        // repair set even while the store holds its key under other
-        // content, so the writer descriptor's arrival (a register-epoch
-        // advance) re-drives its retry through the epoch pass instead of
-        // the detection cadence.
-        if keys.contains(key) && !(*lane == LaneId::Resources && deferred_rows.contains(&identity))
-        {
+        if keys.contains(key) {
           continue;
         }
         if seen.entry(*lane).or_default().insert(identity.clone()) {
@@ -1806,18 +1707,11 @@ async fn scan_namespace(
 /// `membership::tombstone` share one mapping.
 use super::wire::TombstoneKind;
 
-/// One lane apply's outcome, split by what the store did with each
-/// row. The `refused` list is decided evidence the store will refuse
-/// on every re-delivery (it never enters an engine); the `deferred`
-/// list is rows the store never evaluated — their admission
-/// prerequisite (the resources lane's writer descriptor) has not
-/// converged. Deferred rows keep their engine rows and their
-/// repair-set candidacy, so the prerequisite's arrival — a
-/// register-epoch advance — drives the retry through the epoch-driven
-/// repair pass instead of the detection cadence.
+/// One lane apply's outcome: the rows the store **refused** — decided
+/// evidence it will refuse on every re-delivery, so they never enter an
+/// engine.
 struct LaneOutcome {
   refused: Vec<(Vec<u8>, Vec<u8>)>,
-  deferred: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Applies one message batch of rows through the lane's merge
@@ -1831,14 +1725,10 @@ struct LaneOutcome {
 /// row must never enter the derived view, because the row would then
 /// diverge every fingerprint exchange against the peers whose stores
 /// do list it, and the prune/hint/re-push cycle would re-deliver the
-/// refusal forever (the leave/restart livelock). Deferred classes —
-/// the transient contention and not-yet-converged-binding skips — do
-/// NOT appear in the refused list: their retry lives in the engine
-/// (the cross-lane repair), exactly as before. The resources arm
-/// additionally reports its unknown-writer skips as `deferred` (not
-/// refused, not decided): those rows enter the engines and the repair
-/// set with a prune exemption, so the writer descriptor's arrival
-/// re-drives them.
+/// refusal forever (the leave/restart livelock). Transient classes —
+/// the contention skips and not-yet-converged-binding skips — do NOT
+/// appear in the refused list: their retry lives in the engine (the
+/// cross-lane repair), exactly as before.
 async fn apply_rows(
   shared: &PlaneShared, lane: &LaneId, rows: &[(Vec<u8>, Vec<u8>)], source: Option<&NodeId>,
   runtime: Option<&RuntimeClient>,
@@ -1945,10 +1835,7 @@ async fn apply_rows(
           refused.push((row_key.clone(), content.clone()));
         }
       }
-      Ok(LaneOutcome {
-        refused,
-        deferred: Vec::new(),
-      })
+      Ok(LaneOutcome { refused })
     }
     LaneId::Trust => {
       // The same row-level policy as the descriptors arm: a corrupt or
@@ -2022,26 +1909,21 @@ async fn apply_rows(
           return Err(error);
         }
       }
-      Ok(LaneOutcome {
-        refused,
-        deferred: Vec::new(),
-      })
+      Ok(LaneOutcome { refused })
     }
     LaneId::Resources => {
       // The same row-level policy as the descriptors arm: a corrupt or
-      // misattributed record row skips; the page apply below keeps its
-      // per-writer bounded wait and fail-closed skip for unknown
-      // writers, and its store faults propagate. The staged triples
-      // keep the original row bytes beside each decoded record: the
-      // deferred report must map back onto the exact wire shape the
-      // engines hold (the row identity is byte-exact).
-      let mut staged: Vec<(Vec<u8>, Vec<u8>, crate::resource::ResourceRecordV1)> =
-        Vec::with_capacity(rows.len());
+      // misattributed record row skips, and the page apply's store
+      // faults propagate. The row is trusted through the authenticated
+      // session that delivered it (the member-descriptor stance), so no
+      // writer descriptor is resolved and no row is deferred behind
+      // one.
+      let mut staged: Vec<crate::resource::ResourceRecordV1> = Vec::with_capacity(rows.len());
       let mut refused = Vec::new();
       for (row_key, content) in rows {
         match crate::resource::ResourceRecordV1::decode(content) {
           Ok(record) if row_key.as_slice() == record.name().as_str().as_bytes() => {
-            staged.push((row_key.clone(), content.clone(), record));
+            staged.push(record);
           }
           Ok(record) => {
             tracing::debug!(
@@ -2059,12 +1941,8 @@ async fn apply_rows(
           }
         }
       }
-      let mut deferred = Vec::new();
       for chunk in staged.chunks(crate::paging::PAGE_MAX_ITEMS) {
-        let page = crate::resource::page::ResourcePage::new(
-          chunk.iter().map(|(_, _, record)| record.clone()).collect(),
-          None,
-        )?;
+        let page = crate::resource::page::ResourcePage::new(chunk.to_vec(), None)?;
         let outcome = crate::resource::page::sync::apply_page_reported_ctx(
           store,
           shared.entropy.as_ref(),
@@ -2083,18 +1961,8 @@ async fn apply_rows(
             record.removed(),
           ));
         }
-        // The unknown-writer skips report as deferred, distinct from
-        // both refusal (undecodable, misattributed) and a decided
-        // contest loss (the writer resolved and the register kept a
-        // greater winner): the row was never evaluated, so its retry
-        // rides the descriptor's arrival instead of the cadence.
-        for (row_key, content, record) in chunk {
-          if outcome.deferred.contains(record) {
-            deferred.push((row_key.clone(), content.clone()));
-          }
-        }
       }
-      Ok(LaneOutcome { refused, deferred })
+      Ok(LaneOutcome { refused })
     }
     LaneId::Tombstones => {
       crate::membership::tombstone::apply_tombstone_rows(
@@ -2115,7 +1983,6 @@ async fn apply_rows(
       // stays a repair candidate until its binding lands.
       Ok(LaneOutcome {
         refused: Vec::new(),
-        deferred: Vec::new(),
       })
     }
   }
@@ -2185,25 +2052,22 @@ mod tests {
     }
   }
 
-  /// The resources lane's per-writer bounded wait keeps its liveness in
-  /// the row shape: a row batch whose writer is not (and never becomes)
-  /// trusted applies within the page's own bounded window — one wait
-  /// shared by the batch's records from that writer, then a fail-closed
-  /// skip — never a dead wait. This is the page-lane contract carried
-  /// over unchanged: the plane batches its rows into the same page
-  /// apply, so the wait bound cannot regress by row-ization.
+  /// The resources lane trusts the authenticated session that delivered
+  /// the row, exactly as the descriptors lane does: a row batch whose
+  /// writer has no local descriptor applies immediately — no bounded
+  /// writer wait, no per-record signature — and the register installs
+  /// every row whose tuple wins.
   #[tokio::test]
-  async fn the_resources_lane_skips_unknown_writers_within_the_bounded_wait() {
+  async fn the_resources_lane_applies_rows_without_a_writer_descriptor() {
     use crate::resource::ResourceRecordV1;
 
     let context = context_with_bindings(&[]).await;
     let writer = node(7);
-    let signing = crate::identity::testing::scripted_signing(7);
     let mut rows = Vec::new();
     for index in 0..4_u64 {
       let name =
         crate::ResourceName::parse(&format!("example.org/resources/unknown-{index}")).unwrap();
-      let record = ResourceRecordV1::sign(
+      let record = ResourceRecordV1::new(
         name.clone(),
         crate::LabelValue::parse("document").unwrap(),
         crate::ResourceUri::parse("u://unknown").unwrap(),
@@ -2212,12 +2076,10 @@ mod tests {
         writer.clone(),
         0,
         false,
-        &signing,
       )
       .unwrap();
       rows.push((name.as_str().as_bytes().to_vec(), record.encode().unwrap()));
     }
-    let started = std::time::Instant::now();
     let shared = plane_shared(&context).await;
     super::apply_rows(
       shared.as_ref(),
@@ -2228,233 +2090,18 @@ mod tests {
     )
     .await
     .unwrap();
-    let elapsed = started.elapsed();
-    assert!(
-      elapsed < std::time::Duration::from_secs(6),
-      "the batch bounded-waited once, not once per row: {elapsed:?}"
-    );
-    // Nothing installed: the writer never became trusted, so every
-    // record skipped fail-closed.
+    // Every row installed: the session is the trust boundary, so an
+    // unknown writer is no reason to skip or defer a row.
     for (row_key, _) in &rows {
       let name = crate::ResourceName::parse(std::str::from_utf8(row_key).unwrap()).unwrap();
       assert!(
         crate::resource::store::read_record_ctx(context.store(), &name)
           .await
           .unwrap()
-          .is_none(),
-        "an unknown writer's record must not install"
+          .is_some(),
+        "a row delivered over the authenticated session installs"
       );
     }
-  }
-
-  /// The deferred-row contract, resources lane: a row whose writer's
-  /// descriptor has not converged is not a decided contest loser. The
-  /// epoch pass's prune keeps it in the engine and the repair set even
-  /// while the store holds its key under other content (the incumbent
-  /// winner), the fail-closed skip installs nothing until the writer
-  /// lands, and once the descriptor arrives the repair pass installs
-  /// the row. A genuinely superseded identity (the displaced incumbent)
-  /// still prunes, and the exemption retires with it.
-  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn a_deferred_resources_row_survives_the_prune_and_installs_when_the_writer_lands() {
-    use crate::resource::ResourceRecordV1;
-
-    let context = context_with_bindings(&[101, 102]).await;
-    let shared = plane_shared(&context).await;
-    let (peer, runtime) = live_peer(&shared);
-    let plane = super::ReconcilePlane {
-      shared: Arc::clone(&shared),
-    };
-
-    // The store's incumbent: a trusted writer's record under the name,
-    // committed directly so the key is present before the deferred row
-    // ever arrives (the prune's supersession oracle sees exactly this
-    // shape and must not read it as a verdict against the deferred
-    // row).
-    let incumbent_writer = node(702);
-    let incumbent_signing = crate::identity::testing::scripted_signing(702);
-    let incumbent_descriptor = crate::membership::NodeDescriptorV1::new(
-      incumbent_writer.clone(),
-      key(702),
-      vec![crate::Endpoint::parse("wss://127.0.0.1:4").unwrap()],
-      1,
-      1,
-    );
-    crate::membership::store::store_descriptor_ctx(
-      context.store(),
-      &crate::api::SystemEntropy,
-      &incumbent_descriptor,
-    )
-    .await
-    .unwrap();
-    let name = crate::ResourceName::parse("example.org/resources/deferred").unwrap();
-    let incumbent = ResourceRecordV1::sign(
-      name.clone(),
-      crate::LabelValue::parse("document").unwrap(),
-      crate::ResourceUri::parse("u://incumbent").unwrap(),
-      crate::LabelSet::new(),
-      1_000,
-      incumbent_writer,
-      0,
-      false,
-      &incumbent_signing,
-    )
-    .unwrap();
-    crate::resource::store::commit_record_ctx(
-      context.store(),
-      &crate::api::SystemEntropy,
-      &incumbent,
-    )
-    .await
-    .unwrap();
-
-    // The plane primes: the engines hold the incumbent's row.
-    plane.tick(&runtime).await.unwrap();
-    assert_eq!(
-      engine_rows(&shared, &peer, LaneId::Resources).len(),
-      1,
-      "the primed engine holds the incumbent row"
-    );
-
-    // A later record from a writer whose descriptor is not here yet:
-    // the bounded wait exhausts inside the receive's apply, the row
-    // defers, and — the regression this pins — the store's key holding
-    // the incumbent must not read as a supersession verdict against a
-    // row that never entered the contest.
-    let deferred_writer = node(7);
-    let deferred_signing = crate::identity::testing::scripted_signing(7);
-    let deferred = ResourceRecordV1::sign(
-      name.clone(),
-      crate::LabelValue::parse("document").unwrap(),
-      crate::ResourceUri::parse("u://deferred").unwrap(),
-      crate::LabelSet::new(),
-      2_000,
-      deferred_writer.clone(),
-      0,
-      false,
-      &deferred_signing,
-    )
-    .unwrap();
-    let deferred_content = deferred.encode().unwrap();
-    plane
-      .deliver(
-        &runtime,
-        &peer,
-        crate::reconcile::wire::Message::Rows {
-          lane: LaneId::Resources,
-          rows: vec![crate::reconcile::wire::Row {
-            key: name.as_str().as_bytes().to_vec(),
-            content: deferred_content.clone(),
-          }],
-        },
-      )
-      .await
-      .unwrap();
-    // The fail-closed skip: the unknown writer installed nothing.
-    assert_eq!(
-      crate::resource::store::read_record_ctx(context.store(), &name)
-        .await
-        .unwrap()
-        .as_ref()
-        .map(ResourceRecordV1::timestamp_millis),
-      Some(1_000),
-      "the unknown writer's record did not install"
-    );
-
-    // The writer's descriptor lands (a register-epoch advance) before
-    // the next pass, so the repair retry resolves on the fast path.
-    let writer_descriptor = crate::membership::NodeDescriptorV1::new(
-      deferred_writer,
-      key(7),
-      vec![crate::Endpoint::parse("wss://127.0.0.1:5").unwrap()],
-      1,
-      1,
-    );
-    crate::membership::store::store_descriptor_ctx(
-      context.store(),
-      &crate::api::SystemEntropy,
-      &writer_descriptor,
-    )
-    .await
-    .unwrap();
-
-    // The epoch pass (forced by the receive's rescan mark): the
-    // deferred row survives the prune, rides the repair set, and the
-    // repair pass installs it now that its writer resolves.
-    plane.tick(&runtime).await.unwrap();
-    let rows = engine_rows(&shared, &peer, LaneId::Resources);
-    assert_eq!(
-      rows.len(),
-      2,
-      "the deferred row survived the prune pass beside the incumbent"
-    );
-    assert!(
-      rows.iter().any(|(_, content)| content == &deferred_content),
-      "the engine still holds the deferred row's exact identity"
-    );
-    {
-      let guard = shared.state.lock().unwrap();
-      assert!(
-        guard.repair_pending.contains(&LaneId::Resources),
-        "the deferred row's lane rides the epoch-driven repair set"
-      );
-      assert!(
-        guard.deferred_rows.is_empty(),
-        "the installed row's exemption retired"
-      );
-    }
-    assert_eq!(
-      crate::resource::store::read_record_ctx(context.store(), &name)
-        .await
-        .unwrap()
-        .as_ref()
-        .map(ResourceRecordV1::timestamp_millis),
-      Some(2_000),
-      "the repair pass installed the deferred row once its writer converged"
-    );
-
-    // The epoch-driven retry is armed while the repair set is live and
-    // the exemption graduates with the install.
-    {
-      let guard = shared.state.lock().unwrap();
-      assert!(
-        guard.repair_pending.contains(&LaneId::Resources),
-        "the deferred row's lane rides the epoch-driven repair set"
-      );
-      assert!(
-        guard.deferred_rows.is_empty(),
-        "the installed row's exemption retired"
-      );
-    }
-
-    // The supersession contract is intact: another epoch advance (any
-    // write) rescans the lane, and the displaced incumbent's identity
-    // prunes — the store's winner replaced it, and it was never
-    // deferred.
-    crate::membership::store::store_descriptor_ctx(
-      context.store(),
-      &crate::api::SystemEntropy,
-      &crate::membership::NodeDescriptorV1::new(
-        node(703),
-        key(703),
-        vec![crate::Endpoint::parse("wss://127.0.0.1:6").unwrap()],
-        1,
-        1,
-      ),
-    )
-    .await
-    .unwrap();
-    plane.tick(&runtime).await.unwrap();
-    let rows = engine_rows(&shared, &peer, LaneId::Resources);
-    assert_eq!(rows.len(), 1, "the superseded incumbent identity pruned");
-    assert_eq!(
-      rows[0].1, deferred_content,
-      "the engine holds the winner only"
-    );
-    assert!(
-      shared.state.lock().unwrap().repair_pending.is_empty(),
-      "the repair set emptied once the deferred row graduated"
-    );
   }
 
   /// The poison-row contract, descriptors and trust arms: a batch
@@ -2571,7 +2218,7 @@ mod tests {
     .await
     .unwrap();
     let name = crate::ResourceName::parse("example.org/resources/good").unwrap();
-    let record = ResourceRecordV1::sign(
+    let record = ResourceRecordV1::new(
       name.clone(),
       crate::LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse("u://good").unwrap(),
@@ -2580,7 +2227,6 @@ mod tests {
       writer,
       0,
       false,
-      &crate::identity::testing::scripted_signing(57),
     )
     .unwrap();
     let rows = vec![
@@ -2852,7 +2498,6 @@ mod tests {
       tick_count: 0,
       held_hints: BTreeMap::new(),
       held_roots: BTreeMap::new(),
-      deferred_rows: BTreeSet::new(),
     };
     state.repair_pending.insert(LaneId::Tombstones);
     state.repair_pending.insert(LaneId::Trust);
@@ -3172,10 +2817,8 @@ mod tests {
     let plane = super::ReconcilePlane {
       shared: Arc::clone(&shared),
     };
-    // A removal record the writer signs directly into the store (the
-    // writer's descriptor is trusted so the page apply accepts it).
+    // A removal record committed directly into the store.
     let writer = node(701);
-    let signing = crate::identity::testing::scripted_signing(701);
     let descriptor = crate::membership::NodeDescriptorV1::new(
       writer.clone(),
       key(701),
@@ -3191,7 +2834,7 @@ mod tests {
     .await
     .unwrap();
     let name = ResourceName::parse("radiata.woooo.tech/resources/swept").unwrap();
-    let removal = ResourceRecordV1::sign(
+    let removal = ResourceRecordV1::new(
       name.clone(),
       crate::LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse("file:///swept").unwrap(),
@@ -3200,7 +2843,6 @@ mod tests {
       writer,
       1,
       true,
-      &signing,
     )
     .unwrap();
     let encoded = removal.encode().unwrap();
@@ -3290,8 +2932,8 @@ mod tests {
     );
   }
 
-  /// Stores one writer's descriptor so the resources page apply
-  /// resolves and accepts its signed records.
+  /// Stores one writer's descriptor so the resources lane sees the
+  /// writer as a known member of the mesh.
   async fn trusted_resource_writer(context: &Arc<LocalIdentityContext>, value: u64) {
     let descriptor = crate::membership::NodeDescriptorV1::new(
       node(value),
@@ -3309,13 +2951,12 @@ mod tests {
     .unwrap();
   }
 
-  /// One signed resources-lane record row for `name`: the row shape
+  /// One resources-lane record row for `name`: the row shape
   /// `(key, content)` exactly as a peer's ROWS message carries it.
-  fn signed_resource_row(
+  fn resource_row(
     name: &crate::ResourceName, writer_value: u64, stamp: u64, removed: bool,
   ) -> (Vec<u8>, Vec<u8>) {
-    let signing = crate::identity::testing::scripted_signing(writer_value);
-    let record = crate::resource::ResourceRecordV1::sign(
+    let record = crate::resource::ResourceRecordV1::new(
       name.clone(),
       crate::LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse("file:///record").unwrap(),
@@ -3324,7 +2965,6 @@ mod tests {
       node(writer_value),
       if removed { 1 } else { 0 },
       removed,
-      &signing,
     )
     .unwrap();
     (name.as_str().as_bytes().to_vec(), record.encode().unwrap())
@@ -3348,8 +2988,8 @@ mod tests {
     trusted_resource_writer(&context, 761).await;
     let name = crate::ResourceName::parse("radiata.woooo.tech/resources/remote-event").unwrap();
     let fresh = crate::time::now_millis();
-    let (row_key, live) = signed_resource_row(&name, 761, fresh - 1_000, false);
-    let (_, removal) = signed_resource_row(&name, 761, fresh, true);
+    let (row_key, live) = resource_row(&name, 761, fresh - 1_000, false);
+    let (_, removal) = resource_row(&name, 761, fresh, true);
 
     plane
       .deliver(
@@ -3411,9 +3051,9 @@ mod tests {
     let now = std::time::SystemTime::now();
     let retention = crate::resource::retention::RESOURCE_REMOVAL_RETENTION;
     let mut held: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let (key, fresh_removal) = signed_resource_row(&name, 721, fresh_stamp, true);
-    let (_, expired_removal) = signed_resource_row(&name, 721, expired_stamp, true);
-    let (_, live_row) = signed_resource_row(&name, 721, fresh_stamp, false);
+    let (key, fresh_removal) = resource_row(&name, 721, fresh_stamp, true);
+    let (_, expired_removal) = resource_row(&name, 721, expired_stamp, true);
+    let (_, live_row) = resource_row(&name, 721, fresh_stamp, false);
     // An absent key with a fresh removal is an unseen resource: the
     // deletion evidence stays legitimate within the retention contract.
     assert!(
@@ -3452,7 +3092,7 @@ mod tests {
       crate::ResourceName::parse("radiata.woooo.tech/resources/configured-window").unwrap();
     // Stamped an hour ago: inside the shipped month, outside an hour.
     let stamp = crate::time::now_millis().saturating_sub(60 * 60 * 1_000);
-    let (key, removal) = signed_resource_row(&name, 731, stamp, true);
+    let (key, removal) = resource_row(&name, 731, stamp, true);
 
     // A fresh store per window: the admitted pass installs the removal,
     // and the swept predicate only reclaims a key the store no longer
@@ -3509,8 +3149,8 @@ mod tests {
     let name =
       crate::ResourceName::parse("radiata.woooo.tech/resources/unseen-removal-first").unwrap();
     let fresh = crate::time::now_millis();
-    let (removal_key, removal) = signed_resource_row(&name, 731, fresh, true);
-    let (_, older_live) = signed_resource_row(&name, 731, fresh - 60_000, false);
+    let (removal_key, removal) = resource_row(&name, 731, fresh, true);
+    let (_, older_live) = resource_row(&name, 731, fresh - 60_000, false);
 
     // Removal first, on a node that never saw the live record.
     plane
@@ -3589,8 +3229,8 @@ mod tests {
     let name =
       crate::ResourceName::parse("radiata.woooo.tech/resources/unseen-live-first").unwrap();
     let fresh = crate::time::now_millis();
-    let (row_key, older_live) = signed_resource_row(&name, 741, fresh - 60_000, false);
-    let (_, removal) = signed_resource_row(&name, 741, fresh, true);
+    let (row_key, older_live) = resource_row(&name, 741, fresh - 60_000, false);
+    let (_, removal) = resource_row(&name, 741, fresh, true);
 
     let deliver_row = |content: Vec<u8>| {
       let plane_ref = &plane;
@@ -3654,7 +3294,7 @@ mod tests {
     };
     trusted_resource_writer(&context, 751).await;
     let name = crate::ResourceName::parse("radiata.woooo.tech/resources/expired-unseen").unwrap();
-    let (row_key, expired) = signed_resource_row(&name, 751, 1_000, true);
+    let (row_key, expired) = resource_row(&name, 751, 1_000, true);
     plane
       .deliver(
         &runtime,

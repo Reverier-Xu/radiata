@@ -5,7 +5,7 @@
 //! eight-node components that changed owner-revision node records and
 //! generic resources converge, after healing, through those pages — node
 //! records by strictly-increasing owner revision and resources by the
-//! signed timestamp-maximum tuple. No whole-catalog materialization, no
+//! timestamp-maximum tuple. No whole-catalog materialization, no
 //! causal or freshness ordering, no population ceiling: the 1,024-record
 //! profile converges identically through paged scans; a changeless
 //! second pass installs nothing, but the emit side pages its whole
@@ -27,7 +27,7 @@ use crate::{
 };
 
 /// The seeded record's deterministic writer key seeds: bounded and shared
-/// so every side reproduces the same signed tuples.
+/// so every side reproduces the same tuples.
 const RECORD_SEED: [u8; 32] = [51; 32];
 const SECOND_SEED: [u8; 32] = [53; 32];
 
@@ -54,9 +54,9 @@ fn labels() -> LabelSet {
 
 #[allow(clippy::too_many_arguments)]
 fn resource(
-  name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str, seed: [u8; 32],
+  name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str,
 ) -> ResourceRecordV1 {
-  ResourceRecordV1::sign(
+  ResourceRecordV1::new(
     name.clone(),
     LabelValue::parse("document").unwrap(),
     crate::ResourceUri::parse(uri).unwrap(),
@@ -65,7 +65,6 @@ fn resource(
     writer.clone(),
     0,
     false,
-    &SigningKey::from_bytes(&seed),
   )
   .unwrap()
 }
@@ -192,7 +191,7 @@ async fn converge(sides: [&MetadataStore; 2]) -> ConvergeCost {
 
 /// Two eight-node components change owner-revision node records and
 /// generic resources; after healing, ordinary bounded pages converge node
-/// records by revision and resources by signed tuple.
+/// records by revision and resources by tuple.
 #[tokio::test]
 async fn eight_plus_eight_components_merge_by_revision_and_tuple() {
   let (_, side_a) = open_store().await;
@@ -224,36 +223,20 @@ async fn eight_plus_eight_components_merge_by_revision_and_tuple() {
 
   // Side A wins resource r1 (later tuple); side B wins r2 (later tuple);
   // both write r3 at different times.
-  put_resource(
-    &side_a,
-    &resource(&name(1), 2_000, &writer_a(), "u://a1", RECORD_SEED),
-  )
-  .await;
+  put_resource(&side_a, &resource(&name(1), 2_000, &writer_a(), "u://a1")).await;
   put_resource(
     &side_b,
-    &resource(&name(1), 1_500, &writer_b(), "u://b1-loser", SECOND_SEED),
+    &resource(&name(1), 1_500, &writer_b(), "u://b1-loser"),
   )
   .await;
-  put_resource(
-    &side_b,
-    &resource(&name(2), 3_000, &writer_b(), "u://b2", SECOND_SEED),
-  )
-  .await;
+  put_resource(&side_b, &resource(&name(2), 3_000, &writer_b(), "u://b2")).await;
   put_resource(
     &side_a,
-    &resource(&name(2), 2_500, &writer_a(), "u://a2-loser", RECORD_SEED),
+    &resource(&name(2), 2_500, &writer_a(), "u://a2-loser"),
   )
   .await;
-  put_resource(
-    &side_a,
-    &resource(&name(3), 1_000, &writer_a(), "u://a3", RECORD_SEED),
-  )
-  .await;
-  put_resource(
-    &side_b,
-    &resource(&name(3), 1_200, &writer_b(), "u://b3", SECOND_SEED),
-  )
-  .await;
+  put_resource(&side_a, &resource(&name(3), 1_000, &writer_a(), "u://a3")).await;
+  put_resource(&side_b, &resource(&name(3), 1_200, &writer_b(), "u://b3")).await;
 
   // Let the two sides exchange bounded pages until quiescent.
   converge([&side_a, &side_b]).await;
@@ -281,7 +264,7 @@ async fn eight_plus_eight_components_merge_by_revision_and_tuple() {
     assert_eq!(b.as_ref().map(|d| d.revision()), Some(expected));
   }
 
-  // Resources converge by the signed tuple maximum, never by causality or
+  // Resources converge by the tuple maximum, never by causality or
   // delivery order.
   let r1 = resource_store::read_record_ctx(&side_a, &name(1))
     .await
@@ -333,9 +316,9 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
   let (_, side_a) = open_store().await;
   let (_, side_b) = open_store().await;
 
-  // The two resource writers are trusted members of both components so
-  // cross-side signature validation passes and true convergence is
-  // exercised. The two dedicated writers sit beyond the 1,024 profile
+  // The two resource writers are known members of both components, so
+  // the convergence below exercises true cross-side page application.
+  // The two dedicated writers sit beyond the 1,024 profile
   // range so the seeding below cannot collide with them.
   let bulk_writer_a = NodeId::parse("node-000000000000000001024").unwrap();
   let bulk_writer_b = NodeId::parse("node-000000000000000001025").unwrap();
@@ -358,7 +341,6 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
           u64::from(index),
           &NodeId::parse("node-000000000000000001024").unwrap(),
           "u://a",
-          RECORD_SEED,
         ),
       )
       .await;
@@ -370,7 +352,6 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
           u64::from(index),
           &NodeId::parse("node-000000000000000001025").unwrap(),
           "u://b",
-          SECOND_SEED,
         ),
       )
       .await;
@@ -455,7 +436,7 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
 /// storage) mid-convergence, and writer B's endpoint candidate changes at
 /// a strictly higher owner revision (readdress); the ordinary bounded
 /// pages converge both sides to the highest revision and the winning
-/// signed tuples.
+/// tuples.
 #[tokio::test]
 async fn restart_and_readdress_repair_through_ordinary_pages() {
   let (_factory_a, side_a) = open_store().await;
@@ -467,21 +448,9 @@ async fn restart_and_readdress_repair_through_ordinary_pages() {
     put_descriptor(side, &descriptor(&writer_b(), 1, SECOND_SEED)).await;
   }
   // Divergent resources: one contended name, one A-only name.
-  put_resource(
-    &side_a,
-    &resource(&name(1), 1_000, &writer_a(), "u://a1", RECORD_SEED),
-  )
-  .await;
-  put_resource(
-    &side_b,
-    &resource(&name(1), 2_000, &writer_b(), "u://b1", SECOND_SEED),
-  )
-  .await;
-  put_resource(
-    &side_a,
-    &resource(&name(2), 3_000, &writer_a(), "u://a2", RECORD_SEED),
-  )
-  .await;
+  put_resource(&side_a, &resource(&name(1), 1_000, &writer_a(), "u://a1")).await;
+  put_resource(&side_b, &resource(&name(1), 2_000, &writer_b(), "u://b1")).await;
+  put_resource(&side_a, &resource(&name(2), 3_000, &writer_a(), "u://a2")).await;
 
   // Side B restarts: the handle drops and reopens over the same durable
   // factory; the metadata survives and the ordinary tick machinery
@@ -518,7 +487,7 @@ async fn restart_and_readdress_repair_through_ordinary_pages() {
     .unwrap();
   assert_eq!(
     gained.digest(),
-    resource(&name(2), 3_000, &writer_a(), "u://a2", RECORD_SEED).digest(),
+    resource(&name(2), 3_000, &writer_a(), "u://a2").digest(),
     "restart heals the missing resource"
   );
   // The tuple winner (lexicographic timestamp maximum) wins on side A.
@@ -528,7 +497,7 @@ async fn restart_and_readdress_repair_through_ordinary_pages() {
     .unwrap();
   assert_eq!(
     winner.digest(),
-    resource(&name(1), 2_000, &writer_b(), "u://b1", SECOND_SEED).digest(),
+    resource(&name(1), 2_000, &writer_b(), "u://b1").digest(),
     "the timestamp-maximum tuple wins on both sides"
   );
 }

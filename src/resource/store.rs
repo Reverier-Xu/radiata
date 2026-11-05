@@ -1,7 +1,7 @@
 //! Conditional local transactions for resource metadata.
 //!
 //! One named resource is one register: a put or removal conditionally
-//! commits exactly one whole signed record under the register key, and the
+//! commits exactly one whole record under the register key, and the
 //! commit installs only when the incoming tuple strictly wins over the
 //! stored record. Losing records are accepted and store nothing —
 //! acceptance never promises a current or future win. A losing,
@@ -17,8 +17,8 @@ use super::{ResourceName, ResourceRecordV1, ResourceVersion};
 /// The durable namespace holding one register per resource name.
 pub(crate) use crate::storage::families::RESOURCE_RECORD_NAMESPACE;
 use crate::{
-  CommitReceipt, Digest, Error, NodeId, Result, StoreKey, StoreNamespace, StoreOperation,
-  StoreValue, TransactionId, api::Entropy, storage::MetadataStore,
+  CommitReceipt, Digest, Error, Result, StoreKey, StoreNamespace, StoreOperation, StoreValue,
+  TransactionId, api::Entropy, storage::MetadataStore,
 };
 
 pub(crate) fn namespace() -> Result<StoreNamespace> {
@@ -81,7 +81,7 @@ pub(crate) async fn read_record_ctx(
   Ok(Some(ResourceRecordV1::decode(value.as_bytes())?))
 }
 
-/// Conditionally commits one signed resource record: the register accepts
+/// Conditionally commits one resource record: the register accepts
 /// the record only when its tuple strictly wins over any stored winner.
 /// The whole record is one store value, so no outcome can expose partial
 /// labels, and every transaction id is freshly generated so digests are
@@ -95,20 +95,20 @@ pub(crate) async fn commit_record_ctx(
   commit_expected_record_ctx(store, entropy, record, None).await
 }
 
-/// The preconditioned commit for one signed resource record — the form
+/// The preconditioned commit for one resource record — the form
 /// every production writer enters (plain puts pass `None`): the caller's
 /// observed version (`expected`) is re-verified against the stored
 /// winner **inside the commit's own snapshot**, under the writer
 /// exclusion, so the precondition and the per-key CAS share one view of
 /// the register. The effect's pre-commit check is only an early bail —
-/// the asynchronous signature step between it and this commit (a slow
-/// KMS provider) is exactly the window where a concurrent writer could
-/// otherwise land a record the new write beats by tuple order, silently
-/// violating the caller's compare-and-swap. Here a register that moved
-/// past `expected` refuses the write (`Superseded`, surfaced by the
-/// effect as the caller's version conflict) instead of being
-/// overwritten; an empty register cannot match a named prior version
-/// and reports the same not-found the effect's pre-check does.
+/// the asynchronous commit step between it and this commit is exactly
+/// the window where a concurrent writer could otherwise land a record
+/// the new write beats by tuple order, silently violating the caller's
+/// compare-and-swap. Here a register that moved past `expected` refuses
+/// the write (`Superseded`, surfaced by the effect as the caller's
+/// version conflict) instead of being overwritten; an empty register
+/// cannot match a named prior version and reports the same not-found the
+/// effect's pre-check does.
 ///
 /// An undecodable stored winner is non-evidence, exactly as it is for
 /// the page batches ([`crate::storage::incumbent::decode_or_absent`]):
@@ -171,24 +171,19 @@ pub(crate) async fn commit_expected_record_ctx(
 }
 
 /// One batched register commit for a received page: every record that
-/// verifies against its resolved writer key, wins over the snapshot's
-/// stored winner, and wins the page's own same-key ordering lands in ONE
-/// durable transaction — one permit hold, one snapshot, one fsync-bound
-/// commit — instead of one transaction per record. At join fan-out a
-/// leaf applies hundreds of records, and the per-record commit queue
-/// (every commit a full durable transaction serialized through the
-/// single-commit state machine) was the minutes-long roster-convergence
-/// tail. Returns the installed records in commit order; a conflicted
-/// commit landed nothing and retries once from a fresh snapshot before
-/// surfacing to the anti-entropy cadence. Records whose writer key is
-/// absent from `writer_keys` (unresolved past the bounded trust wait) are
-/// skipped — the page apply's own retry pass re-resolves them before
-/// this runs. An undecodable stored incumbent is non-evidence: the
-/// verified incoming record installs over it through the normal
-/// exact-CAS Put.
+/// wins over the snapshot's stored winner and wins the page's own
+/// same-key ordering lands in ONE durable transaction — one permit hold,
+/// one snapshot, one fsync-bound commit — instead of one transaction per
+/// record. At join fan-out a leaf applies hundreds of records, and the
+/// per-record commit queue (every commit a full durable transaction
+/// serialized through the single-commit state machine) was the
+/// minutes-long roster-convergence tail. Returns the installed records in
+/// commit order; a conflicted commit landed nothing and retries once from
+/// a fresh snapshot before surfacing to the anti-entropy cadence. An
+/// undecodable stored incumbent is non-evidence: the incoming record
+/// installs over it through the normal exact-CAS Put.
 pub(crate) async fn commit_page_batch_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, records: &[&ResourceRecordV1],
-  writer_keys: &HashMap<NodeId, crate::PublicKey>,
 ) -> Result<Vec<ResourceRecordV1>> {
   let _permit = store.write_permit().await;
   let namespace = namespace()?;
@@ -199,17 +194,6 @@ pub(crate) async fn commit_page_batch_ctx(
   let mut order: Vec<StoreKey> = Vec::new();
   let mut by_key: HashMap<StoreKey, &ResourceRecordV1> = HashMap::new();
   for record in records {
-    let Some(writer_key) = writer_keys.get(record.writer()) else {
-      continue;
-    };
-    if let Err(error) = record.verify(writer_key) {
-      tracing::debug!(
-        writer = %record.writer(),
-        kind = ?error.kind(),
-        "resource page record skipped: bad signature"
-      );
-      continue;
-    }
     let key = record_key(record.name());
     match by_key.get(&key) {
       Some(incumbent) if !record.wins_over(incumbent) => continue,
@@ -229,10 +213,10 @@ pub(crate) async fn commit_page_batch_ctx(
     for key in &order {
       let record = by_key[key];
       // A corrupt stored incumbent is non-evidence, not a poison pill:
-      // treat it as absent and let the verified incoming record replace
-      // it. The normal Put below carries an exact CAS on the corrupt
-      // value's digest, so the overwrite is atomic and a concurrent
-      // change conflicts (the retry re-decodes).
+      // treat it as absent and let the incoming record replace it. The
+      // normal Put below carries an exact CAS on the corrupt value's
+      // digest, so the overwrite is atomic and a concurrent change
+      // conflicts (the retry re-decodes).
       let incumbent = snapshot
         .get(&namespace, key)
         .await?
@@ -327,7 +311,7 @@ async fn commit_put_ctx(
   }
 }
 
-/// Conditionally commits one signed removal record under an exact-version
+/// Conditionally commits one removal record under an exact-version
 /// precondition: the stored winner must still be
 /// exactly `expected`, and the removal must strictly win the tuple, so a
 /// raced or stale removal can never overwrite a newer record or pose as a
@@ -377,9 +361,7 @@ pub(crate) async fn commit_removal_ctx(
 
 #[cfg(test)]
 mod tests {
-  use std::{collections::HashMap, sync::Arc, time::Duration};
-
-  use ed25519_dalek::SigningKey;
+  use std::{sync::Arc, time::Duration};
 
   use super::{
     ResourceCommitOutcome, ResourceName, ResourceRecordV1, ResourceVersion,
@@ -389,8 +371,6 @@ mod tests {
     LabelKey, LabelSet, LabelValue, NodeId, api::SystemEntropy, provider::StorageFactory,
     storage::MetadataStore,
   };
-
-  const SEED: [u8; 32] = [21; 32];
 
   fn name() -> ResourceName {
     ResourceName::parse("radiata.woooo.tech/resources/store-demo").unwrap()
@@ -409,7 +389,7 @@ mod tests {
   fn variant(
     timestamp_millis: u64, removal_rank: u64, removed: bool, uri: &str,
   ) -> ResourceRecordV1 {
-    ResourceRecordV1::sign(
+    ResourceRecordV1::new(
       name(),
       LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse(uri).unwrap(),
@@ -418,7 +398,6 @@ mod tests {
       NodeId::parse("node-000000000000000000001").unwrap(),
       removal_rank,
       removed,
-      &SigningKey::from_bytes(&SEED),
     )
     .unwrap()
   }
@@ -565,14 +544,7 @@ mod tests {
       .unwrap();
 
     let record = put(1_000, "file:///page-batch");
-    let writer = NodeId::parse("node-000000000000000000001").unwrap();
-    let mut writer_keys = HashMap::new();
-    writer_keys.insert(
-      writer,
-      crate::PublicKey::from_bytes(SigningKey::from_bytes(&SEED).verifying_key().to_bytes()),
-    );
-
-    let error = super::commit_page_batch_ctx(&store, &SystemEntropy, &[&record], &writer_keys)
+    let error = super::commit_page_batch_ctx(&store, &SystemEntropy, &[&record])
       .await
       .unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::CommitUnknown);

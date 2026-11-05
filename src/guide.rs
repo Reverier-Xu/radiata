@@ -25,7 +25,7 @@
 //!
 //! # 1. Resource versions across process boundaries
 //!
-//! Every resource is a last-writer-wins register ordered by the signed
+//! Every resource is a last-writer-wins register ordered by the
 //! [`ResourceVersion`](crate::ResourceVersion) tuple: wall-clock
 //! timestamp, writer [`NodeId`](crate::NodeId), removal flag, record
 //! digest. A plain
@@ -67,7 +67,7 @@
 //! rebase the intended change on its tuple, and commit conditionally
 //! again.
 //!
-//! Removal memory is deliberately bounded. A signed removal record is
+//! Removal memory is deliberately bounded. A removal record is
 //! evidence with a finite retention window: the retention pass drops a
 //! removal once its own timestamp ages past the window, and the
 //! removal population is capacity-bounded with the oldest evicted

@@ -2,7 +2,7 @@
 //!
 //! Mirrors the JSON adapter's crash lane: a parent test seeds one register
 //! value, spawns the library test binary itself with an environment-
-//! selected crash point, and the child commits one newer signed record
+//! selected crash point, and the child commits one newer record
 //! through [`commit_record_ctx`] while aborting deterministically inside
 //! the commit path. The parent reopens the store, asserts the register
 //! holds exactly the old or the new whole record, and reconciles the
@@ -12,7 +12,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 
 use super::{
@@ -64,7 +63,7 @@ fn labels() -> LabelSet {
 
 #[allow(clippy::too_many_arguments)]
 fn record(timestamp_millis: u64, removed: bool, uri: &str) -> ResourceRecordV1 {
-  ResourceRecordV1::sign(
+  ResourceRecordV1::new(
     name(),
     LabelValue::parse("document").unwrap(),
     crate::ResourceUri::parse(uri).unwrap(),
@@ -73,7 +72,6 @@ fn record(timestamp_millis: u64, removed: bool, uri: &str) -> ResourceRecordV1 {
     NodeId::parse("node-000000000000000000001").unwrap(),
     if removed { 1 } else { 0 },
     removed,
-    &SigningKey::from_bytes(&[21; 32]),
   )
   .unwrap()
 }
@@ -203,7 +201,7 @@ async fn resource_crash_boundaries_recover_exact_old_or_new_register() {
     run_child(&dir, point);
 
     // Content assertion through the metadata layer: the register decodes
-    // to exactly one whole signed record.
+    // to exactly one whole record.
     let reopened = open_store(&factory).await;
     let stored = read_record_ctx(&reopened, &name()).await.unwrap();
     let observed_old = stored.as_ref() == Some(&old_record());
