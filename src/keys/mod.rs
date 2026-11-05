@@ -77,5 +77,5 @@ pub(crate) fn io_error(error: &std::io::Error, context: ProviderErrorContext) ->
 /// prove the key it once held (a missing or unparseable key artifact),
 /// so no key state may be fabricated from it.
 pub(crate) fn custody_corrupt(context: ProviderErrorContext) -> Error {
-  Error::provider(ProviderErrorKind::StorageCorrupt, context)
+  crate::storage::storage_corrupt(context)
 }

@@ -40,8 +40,8 @@ use super::{
 };
 use crate::{
   BoxFuture, CreatedKey, Error, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, ProviderErrorContext, ProviderErrorKind, PublicKey, Result, Signature,
-  StoreExpectation, StoreKey, StoreOperation, StoreTransaction, StoreValue,
+  KeyOperationId, ProviderErrorContext, PublicKey, Result, Signature, StoreExpectation, StoreKey,
+  StoreOperation, StoreTransaction, StoreValue,
   api::SystemEntropy,
   provider::{CommitOutcome, KeyProvider, ReconcileOutcome, Storage},
   storage::families,
@@ -168,10 +168,9 @@ impl MetadataKeyStore {
         {
           ReconcileOutcome::Committed(receipt) => Ok(CommitOutcome::Committed(receipt)),
           ReconcileOutcome::Aborted => Ok(CommitOutcome::Aborted),
-          ReconcileOutcome::DigestConflict | ReconcileOutcome::Unknown => Err(Error::provider(
-            ProviderErrorKind::StorageCorrupt,
-            ProviderErrorContext::StorageReconcile,
-          )),
+          ReconcileOutcome::DigestConflict | ReconcileOutcome::Unknown => Err(
+            crate::storage::storage_corrupt(ProviderErrorContext::StorageReconcile),
+          ),
         }
       }
       settled => Ok(settled),

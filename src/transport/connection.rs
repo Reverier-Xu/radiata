@@ -591,6 +591,19 @@ where
 pub(crate) fn encode_frame(
   rules: FrameRules, schema_id: u16, kind_id: u16, flags: u16, body: &[u8],
 ) -> Result<Vec<u8>> {
+  let mut frame = Vec::with_capacity(PRELUDE_LEN + body.len());
+  encode_frame_into(&mut frame, rules, schema_id, kind_id, flags, body)?;
+  Ok(frame)
+}
+
+/// Appends one rule-checked frame — prelude then body, no intermediate
+/// allocation — to `buffer`, which the caller may already hold other
+/// bytes in (the byte-stream framing prepends its tag byte into the same
+/// buffer). [`encode_frame`] is the fresh-buffer form of the same
+/// builder, so both classes emit identical bytes.
+pub(crate) fn encode_frame_into(
+  buffer: &mut Vec<u8>, rules: FrameRules, schema_id: u16, kind_id: u16, flags: u16, body: &[u8],
+) -> Result<()> {
   let body_len = u32::try_from(body.len()).map_err(|_| Error::invalid_input("wire body length"))?;
   let prelude = Prelude::new(schema_id, kind_id, flags, body_len);
   // The send side shares the declared/flags/message-limit trio with the
@@ -603,10 +616,9 @@ pub(crate) fn encode_frame(
     rules.message_limit,
     rules.is_declared,
   )?;
-  let mut frame = Vec::with_capacity(PRELUDE_LEN + body.len());
-  frame.extend_from_slice(&prelude.encode());
-  frame.extend_from_slice(body);
-  Ok(frame)
+  buffer.extend_from_slice(&prelude.encode());
+  buffer.extend_from_slice(body);
+  Ok(())
 }
 
 /// Reads the RFC 9266 `tls-exporter` channel binding from the local TLS

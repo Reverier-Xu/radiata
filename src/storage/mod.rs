@@ -410,10 +410,7 @@ impl MetadataStore {
              transaction identity"
           );
           self.finish_frozen(call)?;
-          return Err(Error::provider(
-            ProviderErrorKind::StorageCorrupt,
-            ProviderErrorContext::StorageCommit,
-          ));
+          return Err(storage_corrupt(ProviderErrorContext::StorageCommit));
         }
         tracing::warn!(
           transaction = %pending.transaction,
@@ -474,10 +471,7 @@ impl MetadataStore {
             "metadata store stays frozen: reconcile aborted a journal-proven commit"
           );
           self.finish_frozen(call)?;
-          return Err(Error::provider(
-            ProviderErrorKind::StorageCorrupt,
-            ProviderErrorContext::StorageReconcile,
-          ));
+          return Err(storage_corrupt(ProviderErrorContext::StorageReconcile));
         }
         self.finish_ready(call)?;
         Ok(ReconcileOutcome::Aborted)
@@ -605,7 +599,7 @@ impl MetadataStore {
     if receipt.transaction() != &pending.transaction
       || receipt.operation_digest() != &pending.digest
     {
-      return Err(Error::provider(ProviderErrorKind::StorageCorrupt, context));
+      return Err(storage_corrupt(context));
     }
     Ok(())
   }
@@ -703,10 +697,7 @@ impl MetadataStore {
           crate::audit::journal_resolved(purpose, false);
           return Ok(false);
         }
-        Err(Error::provider(
-          ProviderErrorKind::StorageCorrupt,
-          ProviderErrorContext::StorageReconcile,
-        ))
+        Err(storage_corrupt(ProviderErrorContext::StorageReconcile))
       }
       Err(error) => {
         // An evidence read failure is not a classification: the store
@@ -924,10 +915,9 @@ impl MetadataStore {
     }
     match self.reconcile().await? {
       ReconcileOutcome::Committed(_) | ReconcileOutcome::Aborted => Ok(()),
-      ReconcileOutcome::DigestConflict => Err(Error::provider(
-        ProviderErrorKind::StorageCorrupt,
-        ProviderErrorContext::StorageReconcile,
-      )),
+      ReconcileOutcome::DigestConflict => {
+        Err(storage_corrupt(ProviderErrorContext::StorageReconcile))
+      }
       ReconcileOutcome::Unknown => Err(Error::provider(
         ProviderErrorKind::CommitUnknown,
         ProviderErrorContext::StorageReconcile,

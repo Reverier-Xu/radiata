@@ -266,6 +266,27 @@ impl BackfillScanFault {
   }
 }
 
+/// Test-only count of the write transactions one factory's opens took
+/// (the initialize and backfill steps, one transaction each). The field
+/// is compiled only into test builds, so production carries the
+/// zero-sized shape and the open path keeps no extra state. Mirrors the
+/// [`BackfillScanFault`] pattern.
+#[derive(Clone, Default)]
+struct OpenWriteCounter {
+  #[cfg(test)]
+  transactions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl OpenWriteCounter {
+  /// Records the one write transaction an open step is about to take.
+  fn note(&self) {
+    #[cfg(test)]
+    self
+      .transactions
+      .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+  }
+}
+
 /// A factory for redb stores rooted at one database file.
 pub(crate) struct RedbStoreFactory {
   path: PathBuf,
@@ -273,6 +294,10 @@ pub(crate) struct RedbStoreFactory {
   /// (a zero-sized field), armed only through
   /// [`RedbStoreFactory::with_backfill_scan_fault`] in test builds.
   backfill_scan_fault: BackfillScanFault,
+  /// The write transactions this factory's opens took: zero-sized in
+  /// production, counted in test builds so a reopen's no-write contract
+  /// is observable.
+  open_writes: OpenWriteCounter,
 }
 
 impl RedbStoreFactory {
@@ -280,6 +305,7 @@ impl RedbStoreFactory {
     Self {
       path,
       backfill_scan_fault: BackfillScanFault::disarmed(),
+      open_writes: OpenWriteCounter::default(),
     }
   }
 
@@ -292,7 +318,17 @@ impl RedbStoreFactory {
     Self {
       path,
       backfill_scan_fault: BackfillScanFault::armed(after),
+      open_writes: OpenWriteCounter::default(),
     }
+  }
+
+  /// The write transactions this factory's opens have taken so far.
+  #[cfg(test)]
+  fn open_write_transactions(&self) -> usize {
+    self
+      .open_writes
+      .transactions
+      .load(std::sync::atomic::Ordering::SeqCst)
   }
 
   fn capabilities() -> StoreCapabilities {
@@ -322,6 +358,7 @@ impl StorageFactory for RedbStoreFactory {
       }
       let path = self.path.clone();
       let backfill_scan_fault = self.backfill_scan_fault.clone();
+      let open_writes = self.open_writes.clone();
       let database = tokio::task::spawn_blocking(move || {
         Database::create(&path)
           .map_err(|error| map_database_error(error, ProviderErrorContext::StorageOpen))
@@ -331,8 +368,7 @@ impl StorageFactory for RedbStoreFactory {
       let database = Arc::new(database);
       let init_database = Arc::clone(&database);
       tokio::task::spawn_blocking(move || {
-        initialize(&init_database)?;
-        backfill_value_digests(&init_database, &backfill_scan_fault)
+        upgrade_on_open(&init_database, &backfill_scan_fault, &open_writes)
       })
       .await
       .map_err(|_| internal(ProviderErrorContext::StorageOpen))??;
@@ -879,8 +915,7 @@ fn read_receipt(
     Some(guard) => {
       let bytes = guard.value();
       if bytes.len() != RECEIPT_VALUE_BYTES {
-        return Err(Error::provider(
-          ProviderErrorKind::StorageCorrupt,
+        return Err(super::super::storage_corrupt(
           ProviderErrorContext::StorageReconcile,
         ));
       }
@@ -905,6 +940,121 @@ fn snapshot_revision(transaction: &redb::ReadTransaction) -> Result<StoreRevisio
     .map_err(|error| map_table_error(error, ProviderErrorContext::StorageSnapshot))?;
   let generation = current_generation(&meta, ProviderErrorContext::StorageSnapshot)?;
   StoreRevision::new(Arc::from(generation.to_be_bytes()))
+}
+
+/// What an open's write phase still has to do, as decided by one
+/// read-only preflight transaction: the schema rows (the meta revision
+/// and the four tables) and every entry's value-digest sidecar row.
+struct OpenWrite {
+  /// The meta revision row or one of the tables is missing.
+  initialize: bool,
+  /// At least one entry has no persisted value-digest sidecar row.
+  backfill: bool,
+}
+
+/// Runs an open's write phase: nothing at all when the read-only
+/// preflight found the file fully initialized, otherwise exactly the
+/// steps it found missing — each one `Durability::Immediate` write
+/// transaction, so the crash-safety of a needed upgrade is unchanged.
+fn upgrade_on_open(
+  database: &Database, scan_fault: &BackfillScanFault, writes: &OpenWriteCounter,
+) -> Result<()> {
+  let Some(steps) = open_write_steps(database)? else {
+    return Ok(());
+  };
+  if steps.initialize {
+    writes.note();
+    initialize(database)?;
+  }
+  if steps.backfill {
+    writes.note();
+    backfill_value_digests(database, scan_fault)?;
+  }
+  Ok(())
+}
+
+/// Whether `table` exists in the preflight's read transaction: a missing
+/// table is the open's initialize step, never corruption.
+fn table_exists<K, V>(
+  read: &redb::ReadTransaction, table: TableDefinition<'_, K, V>,
+) -> Result<bool>
+where
+  K: redb::Key + 'static,
+  V: redb::Value + 'static, {
+  match read.open_table(table) {
+    Ok(_) => Ok(true),
+    Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+    Err(error) => Err(map_table_error(error, ProviderErrorContext::StorageOpen)),
+  }
+}
+
+/// Decides an open's write phase from one read-only transaction: the
+/// schema is complete when the meta revision row and every table exist,
+/// and the value digests are complete when no entry lacks its sidecar
+/// row. `None` means nothing is missing, so reopening an initialized
+/// store takes no write transaction — no write lock and no fsync —
+/// instead of an initialize commit plus a whole-table backfill scan
+/// under the write lock.
+fn open_write_steps(database: &Database) -> Result<Option<OpenWrite>> {
+  let read = database
+    .begin_read()
+    .map_err(|error| map_transaction_error(error, ProviderErrorContext::StorageOpen))?;
+  let mut initialize = !table_exists(&read, META_TABLE)?
+    || !table_exists(&read, ENTRIES_TABLE)?
+    || !table_exists(&read, DIGESTS_TABLE)?
+    || !table_exists(&read, RECEIPTS_TABLE)?;
+  if !initialize {
+    let meta = read
+      .open_table(META_TABLE)
+      .map_err(|error| map_table_error(error, ProviderErrorContext::StorageOpen))?;
+    let revision = meta
+      .get(REVISION_META_KEY)
+      .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?;
+    initialize = revision.is_none();
+  }
+  let entries = match read.open_table(ENTRIES_TABLE) {
+    Ok(entries) => Some(entries),
+    Err(redb::TableError::TableDoesNotExist(_)) => None,
+    Err(error) => return Err(map_table_error(error, ProviderErrorContext::StorageOpen)),
+  };
+  let digests = match read.open_table(DIGESTS_TABLE) {
+    Ok(digests) => Some(digests),
+    Err(redb::TableError::TableDoesNotExist(_)) => None,
+    Err(error) => return Err(map_table_error(error, ProviderErrorContext::StorageOpen)),
+  };
+  // The first entry without a sidecar row settles the verdict: a
+  // complete file is scanned once, read-only, and a file needing the
+  // upgrade never scans past its first gap.
+  let mut backfill = false;
+  if let Some(entries) = &entries {
+    let mut cursor = entries
+      .iter()
+      .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?;
+    while let Some((key, _)) = cursor
+      .next()
+      .transpose()
+      .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?
+    {
+      let present = match &digests {
+        Some(digests) => digests
+          .get(key.value())
+          .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageOpen))?
+          .is_some(),
+        None => false,
+      };
+      if !present {
+        backfill = true;
+        break;
+      }
+    }
+  }
+  if !initialize && !backfill {
+    return Ok(None);
+  }
+  Ok(Some(OpenWrite {
+    initialize,
+    backfill,
+  }))
 }
 
 fn initialize(database: &Database) -> Result<()> {
@@ -1232,9 +1382,7 @@ fn classify_commit_failure(
 
 fn map_durability_error(error: redb::SetDurabilityError, context: ProviderErrorContext) -> Error {
   match error {
-    redb::SetDurabilityError::PersistentSavepointModified => {
-      Error::provider(ProviderErrorKind::StorageCorrupt, context)
-    }
+    redb::SetDurabilityError::PersistentSavepointModified => super::super::storage_corrupt(context),
     _ => Error::provider(ProviderErrorKind::Io, context),
   }
 }
@@ -1260,7 +1408,8 @@ fn map_table_error(error: redb::TableError, context: ProviderErrorContext) -> Er
 }
 
 /// The adapter-local regression lanes for the backfill scan's error
-/// contract and the flush completion barrier. Every test drives the real
+/// contract, the reopen no-write contract, and the flush completion
+/// barrier. Every test drives the real
 /// factory open and the real commit path; the only injections are the
 /// module's established test-only fault hooks.
 #[cfg(test)]
@@ -1347,8 +1496,47 @@ mod followup_tests {
       assert_eq!(stored.as_bytes(), value);
     }
   }
+
+  /// Reopening a fully initialized store takes no write transaction: the
+  /// open's read-only preflight finds the meta revision row, the four
+  /// tables, and every entry's value-digest sidecar row in place, so the
+  /// `Durability::Immediate` initialize and the whole-table backfill
+  /// never run. The fresh open is the counter's positive control.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn reopening_an_initialized_store_takes_no_write_transaction() {
+    let directory = TempDir::new().unwrap();
+    let factory = RedbStoreFactory::new(directory.path().join("store.redb"));
+    let storage: Arc<dyn Storage> = factory
+      .open(StoreRequirements::metadata())
+      .await
+      .unwrap()
+      .into();
+    assert_eq!(
+      factory.open_write_transactions(),
+      1,
+      "the fresh open initializes the file with exactly one write transaction"
+    );
+
+    // One committed entry populates its digest sidecar row through the
+    // real commit path, so the reopen has nothing left to write.
+    let transaction = put(&storage, 63, b"initialized", b"lands").await;
+    assert!(matches!(
+      storage.commit(transaction).await.unwrap(),
+      CommitOutcome::Committed(_)
+    ));
+    drop(storage);
+
+    factory.open(StoreRequirements::metadata()).await.unwrap();
+    assert_eq!(
+      factory.open_write_transactions(),
+      1,
+      "a fully initialized reopen takes no write transaction"
+    );
+  }
+
   /// Prepares one absent-put transaction over the store's current
-  /// revision: the barrier tests need a real committed-eligible shape.
+  /// revision: the tests that need a real committed-eligible shape use
+  /// it.
   async fn put(
     storage: &Arc<dyn Storage>, index: u64, key: &[u8], value: &[u8],
   ) -> StoreTransaction {

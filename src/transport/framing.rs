@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::connection::{FrameRules, Message, SharedWrite, encode_frame};
+use super::connection::{FrameRules, Message, SharedWrite, encode_frame_into};
 use crate::{
   Error, Result,
   protocol::{PRELUDE_LEN, Prelude, check_frame},
@@ -82,16 +82,17 @@ pub(crate) enum RawFrame {
 }
 
 /// Writes one data frame: the tag byte followed by the rule-checked
-/// prelude and body, composed into a single write.
+/// prelude and body, composed into a single buffer and therefore a
+/// single write — the tag is pushed ahead of the frame instead of the
+/// frame being encoded and then copied behind it.
 pub(crate) async fn write_data<Write>(
   write: &mut Write, rules: FrameRules, schema_id: u16, kind_id: u16, flags: u16, body: &[u8],
 ) -> Result<()>
 where
   Write: AsyncWrite + Unpin + Send, {
-  let frame = encode_frame(rules, schema_id, kind_id, flags, body)?;
-  let mut bytes = Vec::with_capacity(1 + frame.len());
+  let mut bytes = Vec::with_capacity(1 + PRELUDE_LEN + body.len());
   bytes.push(TAG_DATA);
-  bytes.extend_from_slice(&frame);
+  encode_frame_into(&mut bytes, rules, schema_id, kind_id, flags, body)?;
   write_all(write, &bytes).await
 }
 
@@ -330,6 +331,27 @@ mod tests {
       "the close after the answered ping is orderly"
     );
     drop(client);
+    Ok(())
+  }
+
+  /// The single-buffer data write is byte-identical to the tag byte
+  /// prepended to the shared frame encoder's output: composing the tag
+  /// and the frame in one buffer is a write-path optimization, never a
+  /// wire change.
+  #[tokio::test]
+  async fn a_data_write_is_the_tag_byte_plus_the_encoded_frame() -> Result<()> {
+    let mut wire = Vec::new();
+    write_data(&mut wire, rules(), 1, 7, 0, b"payload").await?;
+
+    let mut expected = vec![super::TAG_DATA];
+    expected.extend_from_slice(&crate::transport::connection::encode_frame(
+      rules(),
+      1,
+      7,
+      0,
+      b"payload",
+    )?);
+    assert_eq!(wire, expected);
     Ok(())
   }
 

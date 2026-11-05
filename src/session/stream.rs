@@ -207,9 +207,10 @@ impl RevokedSubjects {
 ///   ledger record, and the subject's session retirement
 ///   (`crate::runtime::task_effects`);
 /// - a sync-delivered revocation tombstone (`apply_revocation_record` in
-///   `crate::membership::tombstone`) holds the same section across its durable
-///   install, the ledger record, and the retirement, so a remote revocation
-///   closes the in-flight window exactly like a local one;
+///   `crate::membership::tombstone`) persists its durable install first and
+///   then holds the same section across the ledger record and the retirement,
+///   so a remote revocation closes the in-flight window exactly like a local
+///   one while the fsync-bound commit stays outside the section;
 /// - session publication (`run_session`) holds its section across the
 ///   authorization re-check and the session-table insertion.
 ///
@@ -217,8 +218,7 @@ impl RevokedSubjects {
 /// inserts before the retirement runs (and the retirement removes it), and
 /// one that loses observes the revoked subject and refuses to publish. The
 /// section is short by construction and never spans network negotiation —
-/// only the local commit, the in-memory ledger, and the session table sit
-/// inside it.
+/// only the in-memory ledger and the session table sit inside it.
 ///
 /// The ledger is per-incarnation only: revocations from earlier
 /// incarnations are durable and fail handshake admission on their own

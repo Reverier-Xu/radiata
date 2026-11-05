@@ -158,8 +158,9 @@ async fn apply_cleanup_record(
 /// before any persistence, never covered by checkpoints, and never
 /// re-adoptable away. A persisted revocation closes the authorization
 /// boundary immediately on this node too — the same boundary the local
-/// revoke effect holds: any live session with
-/// the revoked identity retires, and a handshake already in flight is
+/// revoke effect holds: the durable install lands first, then the
+/// boundary's section records the subject and retires any live session
+/// with the revoked identity, and a handshake already in flight is
 /// refused at its final publication (its recovery dials race the
 /// propagation, so a session admitted before this tombstone landed must
 /// not linger either). Session retirement is independent of the
@@ -181,17 +182,18 @@ async fn apply_revocation_record(
     tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
     return Ok(());
   }
-  // The same exclusive section the local revoke effect holds: the durable
-  // tombstone install, the ledger record, and the session retirement run as ONE
-  // section against session publication. A handshake whose admission predated
-  // this tombstone either published before the section ran (the retirement
-  // below removes it) or re-checks the ledger after the section and
-  // refuses to publish — the remote lane closes the in-flight window
-  // exactly like the local one. The section is short and touches no
-  // network negotiation.
-  let mut revoked = authorization.section().await;
+  // The durable tombstone install runs OUTSIDE the section: it is a
+  // fsync-bound commit, and the section must stay short. The section
+  // then covers only the ledger record and the session retirement
+  // against session publication, which still closes the in-flight
+  // window: a handshake that published before the section is removed by
+  // its retirement, and one that re-checks the ledger after the section
+  // observes the record the durable install already made true. A failed
+  // install takes no section at all and propagates as before, so a
+  // refused revocation row leaves the authorization boundary untouched.
   let transition =
     crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), record).await?;
+  let mut revoked = authorization.section().await;
   revoked.record(record.subject());
   crate::session::stream::retire_session(sessions, record.subject())?;
   drop(revoked);
@@ -940,6 +942,126 @@ mod tests {
     // The leave row ordered after the poison rows applied in the same
     // pass — the batch did not abort.
     assert!(is_left_ctx(store, &leaver).await.unwrap());
+    // The refused revocation row's failed install left the shared
+    // authorization boundary untouched: no section was taken, so the
+    // subject's session publication stays ungated by a revocation that
+    // never landed.
+    assert!(
+      !authorization.section().await.contains(&revoked),
+      "a revocation whose persist failed must not record its subject"
+    );
+  }
+
+  /// The tombstone lane's durable install runs OUTSIDE the authorization
+  /// section: the section covers only the ledger record and the session
+  /// retirement. The regression this guards is the install running under
+  /// the section, which held every session publication (and the local
+  /// revoke effect) behind a fsync-bound commit.
+  #[tokio::test]
+  async fn the_revocation_install_lands_before_the_authorization_section() {
+    use ed25519_dalek::Signer as _;
+
+    use crate::identity::{
+      revocation::{REVOCATION_RECORD_DOMAIN, RevocationRecordV1, revoked_key_ctx},
+      signature::signature_message,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full_at(9_960);
+    let scripted_entropy = Arc::new(SequenceEntropy::default());
+    let entropy: Arc<dyn Entropy> = scripted_entropy.clone();
+    let context = Arc::new(
+      open_context(&factory, &keys, &scripted_entropy)
+        .await
+        .unwrap(),
+    );
+    let store = context.store();
+
+    let subject = node_at(9_961);
+    let subject_key = key_at(9_962);
+    let issuer = node_at(9_963);
+    let issuer_signing = crate::identity::testing::scripted_signing(9_964);
+    for (node, key) in [
+      (issuer.clone(), key_at(9_964)),
+      (subject.clone(), subject_key.clone()),
+    ] {
+      crate::identity::trust::store::adopt_binding_ctx(store, entropy.as_ref(), &node, &key)
+        .await
+        .unwrap();
+    }
+
+    let body = RevocationRecordV1::encode_signed_body(&subject, &subject_key, &issuer).unwrap();
+    let signature = issuer_signing.sign(&signature_message(REVOCATION_RECORD_DOMAIN, &body));
+    let revocation = RevocationRecordV1::new(
+      subject.clone(),
+      subject_key.clone(),
+      issuer.clone(),
+      crate::Signature::from_bytes(signature.to_bytes()),
+    );
+    let mut key = Vec::with_capacity(1 + subject.as_str().len());
+    key.push(3);
+    key.extend_from_slice(subject.as_str().as_bytes());
+    let rows = vec![(key, revocation.encode().unwrap())];
+
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let (entry, _frames) = crate::session::stream::test_entry(&crate::api::SystemEntropy);
+    sessions.lock().unwrap().insert(subject.clone(), entry);
+    let authorization = crate::session::stream::AuthorizationBoundary::default();
+
+    // Hold the boundary the way a finishing handshake does: the apply
+    // must still land its durable record, then wait for the section.
+    let held = authorization.section().await;
+    let apply = tokio::spawn({
+      let context = Arc::clone(&context);
+      let entropy = Arc::clone(&entropy);
+      let events = Arc::clone(&events);
+      let revision = revision.clone();
+      let sessions = Arc::clone(&sessions);
+      let authorization = authorization.clone();
+      async move {
+        apply_tombstone_rows(
+          &context,
+          &entropy,
+          &events,
+          &revision,
+          &sessions,
+          &authorization,
+          &rows,
+          None,
+          None,
+        )
+        .await
+      }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      while revoked_key_ctx(store, &subject).await.unwrap().is_none() {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("the durable revocation lands without the authorization section");
+    assert!(
+      !apply.is_finished(),
+      "the ledger record waits for the section instead of the install holding it"
+    );
+    assert!(
+      !held.contains(&subject),
+      "the durable install alone records nothing in the ledger"
+    );
+
+    // The section is free again: the ledger record and the retirement
+    // run behind it.
+    drop(held);
+    apply.await.unwrap().unwrap();
+    assert!(authorization.section().await.contains(&subject));
+    assert!(
+      sessions.lock().unwrap().get(&subject).is_none(),
+      "the section retires the revoked subject's live session"
+    );
   }
 
   /// The tombstone lane records its revocations in the shared

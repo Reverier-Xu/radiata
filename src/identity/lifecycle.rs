@@ -560,10 +560,7 @@ async fn accept_exact_final_state(store: &MetadataStore, expected: &LocalIdentit
 }
 
 pub(crate) fn discovery_corrupt() -> Error {
-  Error::provider(
-    ProviderErrorKind::StorageCorrupt,
-    ProviderErrorContext::StorageSnapshot,
-  )
+  crate::storage::storage_corrupt(ProviderErrorContext::StorageSnapshot)
 }
 
 /// The reconciled outcome of one prepared commit.
@@ -596,10 +593,7 @@ pub(crate) async fn commit_with_reconcile(
 }
 
 pub(crate) fn reconcile_corrupt() -> Error {
-  Error::provider(
-    ProviderErrorKind::StorageCorrupt,
-    ProviderErrorContext::StorageReconcile,
-  )
+  crate::storage::storage_corrupt(ProviderErrorContext::StorageReconcile)
 }
 
 pub(crate) fn reconcile_unknown() -> Error {
