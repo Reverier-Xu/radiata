@@ -1,0 +1,782 @@
+//! The canonical-CBOR payloads behind [`TaskOutput`].
+//!
+//! A core verb's result crosses the task table as bytes, so the typed
+//! result is recovered by decoding the payload under the kind it was
+//! produced as. The encoding is the crate's one canonical CBOR form
+//! ([`crate::protocol::encode_canonical`] /
+//! [`crate::protocol::decode_canonical`]) over the private wire structs
+//! below — never a second format — so the payloads are self-delimiting,
+//! canonically ordered, and validated against the same limits every
+//! other crate payload uses.
+//!
+//! The wire structs are private: no `minicbor` type or derive reaches
+//! the public surface. Each `encode_*` names the kind it produces and
+//! each `decode_*` names the type it rebuilds, so the one caller —
+//! [`TaskResult`](crate::task::TaskResult) — reads as a table of the
+//! verb surface.
+
+use std::time::{Duration, SystemTime};
+
+use minicbor::{Decode, Encode};
+
+use crate::{
+  Digest, Endpoint, Error, LabelKey, LabelSet, LabelValue, ListenerId, MemberStatus, NodeId,
+  PublicKey, ResourceLabels, ResourceMutationView, ResourceName, ResourceUri, ResourceVersion,
+  ResourceView, Result, TaskKind, TaskOutput,
+  protocol::{CborLimits, decode_canonical, encode_canonical},
+  view::{ConnectivityStatus, LeaveOutcome, MemberView, MergeView, RecoveryView},
+};
+
+/// The payload bounds: every core result is a flat, small observation (a
+/// handful of ids, labels, and endpoints), so the limits stay tight —
+/// the same order as one resource record's.
+const OUTPUT_LIMITS: CborLimits = CborLimits::new(8, 256, 16 * 1024);
+
+/// The decode failure context: the bytes are crate-produced, so a
+/// payload that does not decode is a drift between the stored kind and
+/// its payload, never caller data.
+const DECODE_FAILURE: &str = "task output decode";
+
+// -- encoding -----------------------------------------------------------
+
+/// The join result: the local node and the merged peer.
+pub(crate) fn encode_join(view: &MergeView) -> Result<TaskOutput> {
+  encode(
+    TaskKind::JOIN,
+    &MergeViewWire {
+      node: view.node().as_str().to_owned(),
+      peer: view.peer().as_str().to_owned(),
+    },
+  )
+}
+
+/// The leave result: the former and replacement identities.
+pub(crate) fn encode_leave(outcome: &LeaveOutcome) -> Result<TaskOutput> {
+  encode(
+    TaskKind::LEAVE,
+    &LeaveOutcomeWire {
+      former: outcome.former_identity().as_str().to_owned(),
+      replacement: outcome.replacement_identity().as_str().to_owned(),
+    },
+  )
+}
+
+/// The connect result: the authenticated peer, as its canonical text.
+pub(crate) fn encode_connect(peer: &NodeId) -> Result<TaskOutput> {
+  let text = peer.as_str();
+  encode(TaskKind::CONNECT, &text)
+}
+
+/// One unit result: the kinds whose success carries no observation.
+pub(crate) fn encode_unit(kind: TaskKind) -> Result<TaskOutput> {
+  encode(kind, &())
+}
+
+/// The cleanup-checkpoint result: the issued epoch watermark.
+pub(crate) fn encode_checkpoint(watermark: u64) -> Result<TaskOutput> {
+  encode(TaskKind::ISSUE_CLEANUP_CHECKPOINT, &watermark)
+}
+
+/// The listen result: the bound listener.
+pub(crate) fn encode_listen(view: &crate::ListenerView) -> Result<TaskOutput> {
+  encode(
+    TaskKind::LISTEN,
+    &ListenerViewWire {
+      id: view.id().as_str().to_owned(),
+      endpoint: view.endpoint().as_str().to_owned(),
+    },
+  )
+}
+
+/// The put/delete result: the accepted candidate and whether it is the
+/// register's current winner.
+pub(crate) fn encode_resource_mutation(
+  kind: TaskKind, view: &ResourceMutationView,
+) -> Result<TaskOutput> {
+  encode(
+    kind,
+    &ResourceMutationViewWire {
+      accepted: resource_view_wire(view.accepted())?,
+      current_winner: view.is_current_winner(),
+    },
+  )
+}
+
+/// The node-metadata result: the owner-marked descriptor observation.
+pub(crate) fn encode_member(view: &MemberView) -> Result<TaskOutput> {
+  encode(
+    TaskKind::PATCH_NODE_METADATA,
+    &MemberViewWire {
+      node_id: view.node_id().as_str().to_owned(),
+      public_key: view.public_key().as_bytes().to_vec(),
+      owner_revision: view.owner_revision(),
+      digest: view.digest().as_bytes().to_vec(),
+      connectivity: connectivity_code(view.connectivity()),
+      status: member_status_code(view.status()),
+      endpoints: view
+        .endpoints()
+        .iter()
+        .map(|endpoint| endpoint.as_str().to_owned())
+        .collect(),
+      labels: label_entries(view.labels()),
+    },
+  )
+}
+
+/// The credential result (issue or rotate): the non-secret expiry
+/// observation. The secret itself never enters the payload.
+pub(crate) fn encode_credential(kind: TaskKind, expires_at: SystemTime) -> Result<TaskOutput> {
+  encode(kind, &time_wire(expires_at)?)
+}
+
+/// The start-recovery result: the recovery controller's observation.
+pub(crate) fn encode_recovery(view: &RecoveryView) -> Result<TaskOutput> {
+  encode(
+    TaskKind::START_RECOVERY,
+    &RecoveryViewWire {
+      is_connected: view.is_connected(),
+      unreachable_members: u64::try_from(view.unreachable_members())
+        .map_err(|_| Error::internal("task output encode"))?,
+      next_attempt_at: match view.next_attempt_at() {
+        Some(next) => Some(time_wire(next)?),
+        None => None,
+      },
+    },
+  )
+}
+
+/// The receipt-retention result: the pass report.
+pub(crate) fn encode_receipt_retention(
+  report: &crate::ReceiptRetentionReport,
+) -> Result<TaskOutput> {
+  encode(
+    TaskKind::APPLY_RECEIPT_RETENTION,
+    &ReceiptRetentionReportWire {
+      forgotten: report.forgotten(),
+      remaining: report.remaining(),
+    },
+  )
+}
+
+/// The revoke result: the subject and whether this call performed the
+/// revocation transition.
+pub(crate) fn encode_revoke(outcome: &crate::RevokeOutcome) -> Result<TaskOutput> {
+  encode(
+    TaskKind::REVOKE,
+    &RevokeOutcomeWire {
+      subject: outcome.subject().as_str().to_owned(),
+      was_already_revoked: outcome.was_already_revoked(),
+    },
+  )
+}
+
+// -- decoding -----------------------------------------------------------
+
+pub(crate) fn decode_join(bytes: &[u8]) -> Result<MergeView> {
+  let wire: MergeViewWire = decode(bytes)?;
+  Ok(MergeView::new(
+    decode_field(NodeId::parse(&wire.node))?,
+    decode_field(NodeId::parse(&wire.peer))?,
+  ))
+}
+
+pub(crate) fn decode_leave(bytes: &[u8]) -> Result<LeaveOutcome> {
+  let wire: LeaveOutcomeWire = decode(bytes)?;
+  Ok(LeaveOutcome::new(
+    decode_field(NodeId::parse(&wire.former))?,
+    decode_field(NodeId::parse(&wire.replacement))?,
+  ))
+}
+
+pub(crate) fn decode_connect(bytes: &[u8]) -> Result<NodeId> {
+  let peer: String = decode(bytes)?;
+  decode_field(NodeId::parse(&peer))
+}
+
+pub(crate) fn decode_unit(bytes: &[u8]) -> Result<()> {
+  decode(bytes)
+}
+
+pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<u64> {
+  decode(bytes)
+}
+
+pub(crate) fn decode_listen(bytes: &[u8]) -> Result<crate::ListenerView> {
+  let wire: ListenerViewWire = decode(bytes)?;
+  Ok(crate::ListenerView::new(
+    decode_field(ListenerId::parse(&wire.id))?,
+    decode_field(Endpoint::parse(&wire.endpoint))?,
+  ))
+}
+
+pub(crate) fn decode_resource_mutation(bytes: &[u8]) -> Result<ResourceMutationView> {
+  let wire: ResourceMutationViewWire = decode(bytes)?;
+  Ok(ResourceMutationView::new(
+    resource_view(&wire.accepted)?,
+    wire.current_winner,
+  ))
+}
+
+pub(crate) fn decode_member(bytes: &[u8]) -> Result<MemberView> {
+  let wire: MemberViewWire = decode(bytes)?;
+  let endpoints = wire
+    .endpoints
+    .iter()
+    .map(|endpoint| decode_field(Endpoint::parse(endpoint)))
+    .collect::<Result<Vec<_>>>()?;
+  let view = MemberView::new(
+    decode_field(NodeId::parse(&wire.node_id))?,
+    decode_field(public_key(&wire.public_key))?,
+    wire.owner_revision,
+    decode_field(digest(&wire.digest))?,
+    connectivity(wire.connectivity)?,
+    endpoints,
+    labels(wire.labels)?,
+  );
+  Ok(view.with_status(member_status(wire.status)?))
+}
+
+pub(crate) fn decode_credential(bytes: &[u8]) -> Result<crate::CredentialIssued> {
+  let wire: TimeWire = decode(bytes)?;
+  Ok(crate::CredentialIssued::new(time(&wire)?))
+}
+
+pub(crate) fn decode_recovery(bytes: &[u8]) -> Result<RecoveryView> {
+  let wire: RecoveryViewWire = decode(bytes)?;
+  let next_attempt_at = match &wire.next_attempt_at {
+    Some(wire) => Some(time(wire)?),
+    None => None,
+  };
+  Ok(RecoveryView::new(
+    wire.is_connected,
+    usize::try_from(wire.unreachable_members).map_err(|_| Error::internal(DECODE_FAILURE))?,
+    next_attempt_at,
+  ))
+}
+
+pub(crate) fn decode_receipt_retention(bytes: &[u8]) -> Result<crate::ReceiptRetentionReport> {
+  let wire: ReceiptRetentionReportWire = decode(bytes)?;
+  Ok(crate::ReceiptRetentionReport::new(
+    wire.forgotten,
+    wire.remaining,
+  ))
+}
+
+pub(crate) fn decode_revoke(bytes: &[u8]) -> Result<crate::RevokeOutcome> {
+  let wire: RevokeOutcomeWire = decode(bytes)?;
+  Ok(crate::RevokeOutcome::new(
+    decode_field(NodeId::parse(&wire.subject))?,
+    wire.was_already_revoked,
+  ))
+}
+
+// -- the shared codec ---------------------------------------------------
+
+/// Encodes one core result as the payload of `kind`.
+fn encode<T: Encode<()>>(kind: TaskKind, value: &T) -> Result<TaskOutput> {
+  let bytes =
+    encode_canonical(value, OUTPUT_LIMITS).map_err(|_| Error::internal("task output encode"))?;
+  Ok(TaskOutput::new(kind, bytes.into()))
+}
+
+/// Decodes one core result's payload.
+fn decode<'bytes, T: Decode<'bytes, ()>>(bytes: &'bytes [u8]) -> Result<T> {
+  decode_canonical(bytes, OUTPUT_LIMITS).map_err(|_| Error::internal(DECODE_FAILURE))
+}
+
+/// Maps one field's parse failure onto the typed internal error: the
+/// bytes are crate-produced, so a field that does not parse is a drift
+/// between the stored kind and its payload.
+fn decode_field<T>(value: Result<T>) -> Result<T> {
+  value.map_err(|_| Error::internal(DECODE_FAILURE))
+}
+
+fn resource_view_wire(view: &ResourceView) -> Result<ResourceViewWire> {
+  Ok(ResourceViewWire {
+    name: view.name().as_str().to_owned(),
+    resource_type: view.labels().resource_type().as_str().to_owned(),
+    uri: view.labels().uri().as_str().to_owned(),
+    custom: label_entries(view.labels().custom_labels()),
+    timestamp: time_wire(view.version().timestamp())?,
+    writer: view.version().writer().as_str().to_owned(),
+    removal: view.version().is_removal(),
+    digest: view.version().digest().as_bytes().to_vec(),
+  })
+}
+
+fn resource_view(wire: &ResourceViewWire) -> Result<ResourceView> {
+  let mut labels = ResourceLabels::new(
+    decode_field(LabelValue::parse(&wire.resource_type))?,
+    decode_field(ResourceUri::parse(&wire.uri))?,
+  );
+  for entry in &wire.custom {
+    labels = decode_field(labels.custom(
+      decode_field(LabelKey::parse(&entry.key))?,
+      decode_field(LabelValue::parse(&entry.value))?,
+    ))?;
+  }
+  Ok(ResourceView::new(
+    decode_field(ResourceName::parse(&wire.name))?,
+    labels,
+    ResourceVersion::from_parts(
+      time(&wire.timestamp)?,
+      decode_field(NodeId::parse(&wire.writer))?,
+      wire.removal,
+      decode_field(digest(&wire.digest))?,
+    ),
+  ))
+}
+
+fn label_entries(labels: &LabelSet) -> Vec<LabelWire> {
+  labels
+    .entries()
+    .map(|(key, value)| LabelWire {
+      key: key.as_str().to_owned(),
+      value: value.as_str().to_owned(),
+    })
+    .collect()
+}
+
+fn labels(entries: Vec<LabelWire>) -> Result<LabelSet> {
+  let mut labels = LabelSet::new();
+  for entry in entries {
+    labels = decode_field(labels.insert(
+      decode_field(LabelKey::parse(&entry.key))?,
+      decode_field(LabelValue::parse(&entry.value))?,
+    ))?;
+  }
+  Ok(labels)
+}
+
+fn digest(bytes: &[u8]) -> Result<Digest> {
+  let bytes: [u8; 32] = bytes
+    .try_into()
+    .map_err(|_| Error::internal(DECODE_FAILURE))?;
+  Ok(Digest::from_bytes(bytes))
+}
+
+fn public_key(bytes: &[u8]) -> Result<PublicKey> {
+  let bytes: [u8; 32] = bytes
+    .try_into()
+    .map_err(|_| Error::internal(DECODE_FAILURE))?;
+  Ok(PublicKey::from_bytes(bytes))
+}
+
+/// The connectivity codes: the wire is the closed set's index, so a
+/// value outside it is a payload drift.
+const CONNECTIVITY_UNKNOWN: u8 = 0;
+const CONNECTIVITY_REACHABLE: u8 = 1;
+const CONNECTIVITY_CONNECTED: u8 = 2;
+
+fn connectivity_code(status: ConnectivityStatus) -> u8 {
+  match status {
+    ConnectivityStatus::Unknown => CONNECTIVITY_UNKNOWN,
+    ConnectivityStatus::Reachable => CONNECTIVITY_REACHABLE,
+    ConnectivityStatus::Connected => CONNECTIVITY_CONNECTED,
+  }
+}
+
+fn connectivity(code: u8) -> Result<ConnectivityStatus> {
+  match code {
+    CONNECTIVITY_UNKNOWN => Ok(ConnectivityStatus::Unknown),
+    CONNECTIVITY_REACHABLE => Ok(ConnectivityStatus::Reachable),
+    CONNECTIVITY_CONNECTED => Ok(ConnectivityStatus::Connected),
+    _ => Err(Error::internal(DECODE_FAILURE)),
+  }
+}
+
+/// The member-status codes: the wire is the closed set's index, so a
+/// value outside it is a payload drift.
+const MEMBER_ACTIVE: u8 = 0;
+const MEMBER_LEFT: u8 = 1;
+const MEMBER_CLEANED: u8 = 2;
+
+fn member_status_code(status: MemberStatus) -> u8 {
+  match status {
+    MemberStatus::Active => MEMBER_ACTIVE,
+    MemberStatus::Left => MEMBER_LEFT,
+    MemberStatus::Cleaned => MEMBER_CLEANED,
+  }
+}
+
+fn member_status(code: u8) -> Result<MemberStatus> {
+  match code {
+    MEMBER_ACTIVE => Ok(MemberStatus::Active),
+    MEMBER_LEFT => Ok(MemberStatus::Left),
+    MEMBER_CLEANED => Ok(MemberStatus::Cleaned),
+    _ => Err(Error::internal(DECODE_FAILURE)),
+  }
+}
+
+/// One instant as `(seconds, nanoseconds)` relative to the Unix epoch:
+/// the signed seconds carry pre-epoch instants, and the nanoseconds are
+/// always the non-negative sub-second remainder, so the pair is exact
+/// and canonical.
+fn time_wire(time: SystemTime) -> Result<TimeWire> {
+  match time.duration_since(SystemTime::UNIX_EPOCH) {
+    Ok(after) => Ok(TimeWire {
+      secs: i64::try_from(after.as_secs()).map_err(|_| Error::internal("task output encode"))?,
+      nanos: after.subsec_nanos(),
+    }),
+    Err(before) => {
+      let before = before.duration();
+      let secs =
+        i64::try_from(before.as_secs()).map_err(|_| Error::internal("task output encode"))?;
+      let nanos = before.subsec_nanos();
+      Ok(if nanos == 0 {
+        TimeWire {
+          secs: -secs,
+          nanos: 0,
+        }
+      } else {
+        TimeWire {
+          secs: -secs - 1,
+          nanos: 1_000_000_000 - nanos,
+        }
+      })
+    }
+  }
+}
+
+fn time(wire: &TimeWire) -> Result<SystemTime> {
+  if wire.nanos >= 1_000_000_000 {
+    return Err(Error::internal(DECODE_FAILURE));
+  }
+  let instant = if wire.secs >= 0 {
+    let secs = u64::try_from(wire.secs).map_err(|_| Error::internal(DECODE_FAILURE))?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, wire.nanos))
+  } else {
+    let magnitude = Duration::new(wire.secs.unsigned_abs(), 0);
+    let magnitude = magnitude
+      .checked_sub(Duration::from_nanos(u64::from(wire.nanos)))
+      .ok_or_else(|| Error::internal(DECODE_FAILURE))?;
+    SystemTime::UNIX_EPOCH.checked_sub(magnitude)
+  };
+  instant.ok_or_else(|| Error::internal(DECODE_FAILURE))
+}
+
+// -- the wire structs ---------------------------------------------------
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct MergeViewWire {
+  #[n(0)]
+  node: String,
+  #[n(1)]
+  peer: String,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct LeaveOutcomeWire {
+  #[n(0)]
+  former: String,
+  #[n(1)]
+  replacement: String,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct ListenerViewWire {
+  #[n(0)]
+  id: String,
+  #[n(1)]
+  endpoint: String,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct LabelWire {
+  #[n(0)]
+  key: String,
+  #[n(1)]
+  value: String,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct ResourceViewWire {
+  #[n(0)]
+  name: String,
+  #[n(1)]
+  resource_type: String,
+  #[n(2)]
+  uri: String,
+  #[n(3)]
+  custom: Vec<LabelWire>,
+  #[n(4)]
+  timestamp: TimeWire,
+  #[n(5)]
+  writer: String,
+  #[n(6)]
+  removal: bool,
+  #[n(7)]
+  #[cbor(with = "minicbor::bytes")]
+  digest: Vec<u8>,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct ResourceMutationViewWire {
+  #[n(0)]
+  accepted: ResourceViewWire,
+  #[n(1)]
+  current_winner: bool,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct MemberViewWire {
+  #[n(0)]
+  node_id: String,
+  #[n(1)]
+  #[cbor(with = "minicbor::bytes")]
+  public_key: Vec<u8>,
+  #[n(2)]
+  owner_revision: u64,
+  #[n(3)]
+  #[cbor(with = "minicbor::bytes")]
+  digest: Vec<u8>,
+  #[n(4)]
+  connectivity: u8,
+  #[n(5)]
+  status: u8,
+  #[n(6)]
+  endpoints: Vec<String>,
+  #[n(7)]
+  labels: Vec<LabelWire>,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct RecoveryViewWire {
+  #[n(0)]
+  is_connected: bool,
+  #[n(1)]
+  unreachable_members: u64,
+  #[n(2)]
+  next_attempt_at: Option<TimeWire>,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct ReceiptRetentionReportWire {
+  #[n(0)]
+  forgotten: u64,
+  #[n(1)]
+  remaining: bool,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct RevokeOutcomeWire {
+  #[n(0)]
+  subject: String,
+  #[n(1)]
+  was_already_revoked: bool,
+}
+
+#[derive(Decode, Encode)]
+#[cbor(array)]
+struct TimeWire {
+  #[n(0)]
+  secs: i64,
+  #[n(1)]
+  nanos: u32,
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::{Duration, SystemTime};
+
+  use super::{
+    decode_checkpoint, decode_connect, decode_credential, decode_join, decode_leave, decode_listen,
+    decode_member, decode_receipt_retention, decode_recovery, decode_resource_mutation,
+    decode_revoke, decode_unit, encode_checkpoint, encode_connect, encode_credential, encode_join,
+    encode_leave, encode_listen, encode_member, encode_receipt_retention, encode_recovery,
+    encode_resource_mutation, encode_revoke, encode_unit, time, time_wire,
+  };
+  use crate::{
+    Digest, Endpoint, LabelKey, LabelSet, LabelValue, ListenerId, MemberStatus, NodeId, PublicKey,
+    ResourceLabels, ResourceMutationView, ResourceName, ResourceUri, ResourceVersion, ResourceView,
+    TaskKind,
+    view::{
+      ConnectivityStatus, LeaveOutcome, MemberView, MergeView, ReceiptRetentionReport,
+      RecoveryView, RevokeOutcome,
+    },
+  };
+
+  fn node(suffix: char) -> NodeId {
+    NodeId::parse(&format!("node-00000000000000000000{suffix}")).expect("node id")
+  }
+
+  fn labels() -> LabelSet {
+    LabelSet::new()
+      .insert(
+        LabelKey::parse("example.com/labels/lane").expect("key"),
+        LabelValue::parse("one").expect("value"),
+      )
+      .expect("labels")
+  }
+
+  fn resource_mutation() -> ResourceMutationView {
+    let labels = ResourceLabels::new(
+      LabelValue::parse("document").expect("type"),
+      ResourceUri::parse("file:///one").expect("uri"),
+    )
+    .custom(
+      LabelKey::parse("example.com/labels/lane").expect("key"),
+      LabelValue::parse("two").expect("value"),
+    )
+    .expect("labels");
+    ResourceMutationView::new(
+      ResourceView::new(
+        ResourceName::parse("example.com/resources/one").expect("name"),
+        labels,
+        ResourceVersion::from_parts(
+          SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+          node('a'),
+          false,
+          Digest::from_bytes([3; 32]),
+        ),
+      ),
+      true,
+    )
+  }
+
+  fn member() -> MemberView {
+    MemberView::new(
+      node('b'),
+      PublicKey::from_bytes([5; 32]),
+      9,
+      Digest::from_bytes([7; 32]),
+      ConnectivityStatus::Reachable,
+      vec![Endpoint::parse("wss://127.0.0.1:9000").expect("endpoint")],
+      labels(),
+    )
+    .with_status(MemberStatus::Left)
+  }
+
+  /// Every core payload survives its own encode/decode pair unchanged:
+  /// the typed result a `wait` recovers is exactly the effect's result.
+  #[test]
+  fn every_core_payload_round_trips() {
+    let merge = MergeView::new(node('a'), node('b'));
+    assert_eq!(
+      decode_join(encode_join(&merge).expect("encode").bytes()).expect("decode"),
+      merge
+    );
+
+    let leave = LeaveOutcome::new(node('c'), node('d'));
+    assert_eq!(
+      decode_leave(encode_leave(&leave).expect("encode").bytes()).expect("decode"),
+      leave
+    );
+
+    let peer = node('e');
+    assert_eq!(
+      decode_connect(encode_connect(&peer).expect("encode").bytes()).expect("decode"),
+      peer
+    );
+
+    let unit = encode_unit(TaskKind::SYNC_ROUND).expect("encode");
+    assert_eq!(unit.kind(), &TaskKind::SYNC_ROUND);
+    decode_unit(unit.bytes()).expect("decode");
+
+    let watermark = 41_u64;
+    assert_eq!(
+      decode_checkpoint(encode_checkpoint(watermark).expect("encode").bytes()).expect("decode"),
+      watermark
+    );
+
+    let listener = crate::ListenerView::new(
+      ListenerId::parse("listener-000000000000000000001").expect("listener"),
+      Endpoint::parse("wss://127.0.0.1:9001").expect("endpoint"),
+    );
+    assert_eq!(
+      decode_listen(encode_listen(&listener).expect("encode").bytes()).expect("decode"),
+      listener
+    );
+
+    let mutation = resource_mutation();
+    assert_eq!(
+      decode_resource_mutation(
+        encode_resource_mutation(TaskKind::PUT_RESOURCE, &mutation)
+          .expect("encode")
+          .bytes()
+      )
+      .expect("decode"),
+      mutation
+    );
+
+    let member = member();
+    assert_eq!(
+      decode_member(encode_member(&member).expect("encode").bytes()).expect("decode"),
+      member
+    );
+
+    let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_123);
+    assert_eq!(
+      decode_credential(
+        encode_credential(TaskKind::ISSUE_CREDENTIAL, expires_at)
+          .expect("encode")
+          .bytes()
+      )
+      .expect("decode")
+      .expires_at(),
+      expires_at
+    );
+
+    let recovery = RecoveryView::new(
+      true,
+      3,
+      Some(SystemTime::UNIX_EPOCH + Duration::from_secs(7)),
+    );
+    assert_eq!(
+      decode_recovery(encode_recovery(&recovery).expect("encode").bytes()).expect("decode"),
+      recovery
+    );
+    let idle = RecoveryView::new(false, 0, None);
+    assert_eq!(
+      decode_recovery(encode_recovery(&idle).expect("encode").bytes()).expect("decode"),
+      idle
+    );
+
+    let report = ReceiptRetentionReport::new(7, true);
+    assert_eq!(
+      decode_receipt_retention(encode_receipt_retention(&report).expect("encode").bytes())
+        .expect("decode"),
+      report
+    );
+
+    let revoke = RevokeOutcome::new(node('f'), true);
+    assert_eq!(
+      decode_revoke(encode_revoke(&revoke).expect("encode").bytes()).expect("decode"),
+      revoke
+    );
+  }
+
+  /// The instant codec is exact on both sides of the epoch: the signed
+  /// seconds plus the non-negative nanosecond remainder represent every
+  /// `SystemTime` the task surface can carry.
+  #[test]
+  fn instants_round_trip_across_the_epoch() {
+    let after = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let before = SystemTime::UNIX_EPOCH - Duration::new(1, 500_000_000);
+    let exact = SystemTime::UNIX_EPOCH - Duration::new(2, 0);
+    for instant in [SystemTime::UNIX_EPOCH, after, before, exact] {
+      let wire = time_wire(instant).expect("encode");
+      assert_eq!(time(&wire).expect("decode"), instant);
+    }
+  }
+
+  /// A payload that is not the shape its kind owns is the typed internal
+  /// error, never caller data: the stored bytes are crate-produced.
+  #[test]
+  fn a_payload_of_the_wrong_shape_is_a_typed_internal_error() {
+    let error =
+      decode_leave(encode_checkpoint(9).expect("encode").bytes()).expect_err("wrong shape");
+    assert_eq!(error.kind(), crate::ErrorKind::Internal);
+    assert_eq!(error.context(), "task output decode");
+  }
+}

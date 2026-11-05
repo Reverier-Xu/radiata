@@ -33,7 +33,7 @@ use crate::{
   BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeConfig, NodeId, Result, TaskId, TaskKind,
   TaskOutput, TaskPhase,
   api::Entropy,
-  task::{CredentialIssued, SlotClass, TaskError, TaskObserver, TaskTable},
+  task::{CoreTaskKind, SlotClass, TaskError, TaskObserver, TaskTable, output::encode_credential},
   time::WallClock,
 };
 
@@ -188,12 +188,14 @@ const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
   class: RetryClass::Extension,
 };
 
-/// The kind's retry policy (single classification site).
+/// The kind's retry policy (single classification site). A tag outside
+/// the core set is a caller-defined kind: its reconciler owns the
+/// semantics, so it rides the extension policy.
 pub(crate) fn retry_policy(kind: &TaskKind) -> &'static RetryPolicy {
-  match kind {
-    TaskKind::Join | TaskKind::Connect => &NETWORK_RETRY,
-    TaskKind::Extension(_) => &EXTENSION_RETRY,
-    _ => &ONCE,
+  match CoreTaskKind::from_tag(kind) {
+    Some(CoreTaskKind::Join | CoreTaskKind::Connect) => &NETWORK_RETRY,
+    Some(_) => &ONCE,
+    None => &EXTENSION_RETRY,
   }
 }
 
@@ -222,20 +224,20 @@ impl EffectOutcome {
 
   /// The issue-credential effect's outcome: the observation carries the
   /// generation's expiry; the secret rides the consumed-once slot.
-  pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Self {
-    Self {
-      output: TaskOutput::IssueCredential(CredentialIssued::new(issued.expires_at())),
+  pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Result<Self> {
+    Ok(Self {
+      output: encode_credential(TaskKind::ISSUE_CREDENTIAL, issued.expires_at())?,
       secret: Some(issued),
-    }
+    })
   }
 
   /// The rotate-credential effect's outcome (the same consumed-once
   /// rule).
-  pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Self {
-    Self {
-      output: TaskOutput::RotateCredential(CredentialIssued::new(issued.expires_at())),
+  pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Result<Self> {
+    Ok(Self {
+      output: encode_credential(TaskKind::ROTATE_CREDENTIAL, issued.expires_at())?,
       secret: Some(issued),
-    }
+    })
   }
 }
 
@@ -317,11 +319,12 @@ impl TaskSpec {
   /// (only crate-internal wiring builds specs, so a miss is the typed
   /// internal invariant, never caller data).
   pub(crate) fn check_shape(&self) -> Result<()> {
-    let requires_dial = matches!(self.kind, TaskKind::Connect);
-    let requires_revoke = matches!(self.kind, TaskKind::Revoke);
+    let core = CoreTaskKind::from_tag(&self.kind);
+    let requires_dial = core == Some(CoreTaskKind::Connect);
+    let requires_revoke = core == Some(CoreTaskKind::Revoke);
     let requires_subject = matches!(
-      self.kind,
-      TaskKind::Disconnect | TaskKind::PurgeRevocation | TaskKind::Cleanup,
+      core,
+      Some(CoreTaskKind::Disconnect | CoreTaskKind::PurgeRevocation | CoreTaskKind::Cleanup),
     );
     if requires_dial && !matches!(self.payload, TaskPayload::PeerDial { .. }) {
       return Err(Error::internal("task coalescing subject"));
@@ -337,21 +340,24 @@ impl TaskSpec {
 
   /// The coalescing subject, when the kind coalesces.
   pub(crate) fn coalesce_key(&self) -> Option<NodeId> {
-    match &self.kind {
-      TaskKind::Connect => match &self.payload {
+    match CoreTaskKind::from_tag(&self.kind) {
+      Some(CoreTaskKind::Connect) => match &self.payload {
         TaskPayload::PeerDial { peer, .. } => Some(peer.clone()),
         TaskPayload::Peer(subject) => Some(subject.clone()),
         TaskPayload::Revoke { .. } | TaskPayload::None => None,
       },
-      TaskKind::Disconnect | TaskKind::Revoke | TaskKind::PurgeRevocation | TaskKind::Cleanup => {
-        match &self.payload {
-          TaskPayload::Peer(subject) => Some(subject.clone()),
-          TaskPayload::Revoke { subject, .. } | TaskPayload::PeerDial { peer: subject, .. } => {
-            Some(subject.clone())
-          }
-          TaskPayload::None => None,
+      Some(
+        CoreTaskKind::Disconnect
+        | CoreTaskKind::Revoke
+        | CoreTaskKind::PurgeRevocation
+        | CoreTaskKind::Cleanup,
+      ) => match &self.payload {
+        TaskPayload::Peer(subject) => Some(subject.clone()),
+        TaskPayload::Revoke { subject, .. } | TaskPayload::PeerDial { peer: subject, .. } => {
+          Some(subject.clone())
         }
-      }
+        TaskPayload::None => None,
+      },
       _ => None,
     }
   }
@@ -988,7 +994,7 @@ fn admit_inner(
   // publication and that report — is refused instead of replacing the
   // first. The slot clears on the first leave's terminal report, so a
   // failed leave is still re-admittable.
-  if matches!(kind, TaskKind::Leave) && leave_task.is_some() {
+  if CoreTaskKind::from_tag(&kind) == Some(CoreTaskKind::Leave) && leave_task.is_some() {
     return Err(Error::conflict("leave in progress"));
   }
   // The per-class backlog bound: admission itself is refused once the
@@ -1021,7 +1027,7 @@ fn admit_inner(
   if let Some(subject) = spec.coalesce_key() {
     coalescing.insert((kind.clone(), subject), (id.clone(), spec.clone()));
   }
-  if matches!(kind, TaskKind::Leave) {
+  if CoreTaskKind::from_tag(&kind) == Some(CoreTaskKind::Leave) {
     *leave_task = Some(id.clone());
   }
   spawn_worker(
@@ -1251,7 +1257,8 @@ fn rearm_retry_timer(timer: &mut Pin<Box<Sleep>>, retries: &BTreeMap<Instant, Ve
 /// began reports the fatal shutdown from the effect instead.
 fn leave_signal_for(table: &TaskTable, id: &TaskId) -> Option<super::lifecycle::LeaveSignal> {
   let (kind, status) = table.status(id)?;
-  (kind == TaskKind::Leave && status.phase() == TaskPhase::Succeeded)
+  (CoreTaskKind::from_tag(&kind) == Some(CoreTaskKind::Leave)
+    && status.phase() == TaskPhase::Succeeded)
     .then_some(super::lifecycle::LeaveSignal::Complete)
 }
 
@@ -1340,11 +1347,11 @@ mod tests {
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
-        ok_effect(TaskOutput::Leave(crate::LeaveOutcome::new(
-          node('a'),
-          node('b'),
-        ))),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
+        ok_effect(
+          crate::task::output::encode_leave(&crate::LeaveOutcome::new(node('a'), node('b')))
+            .expect("leave output"),
+        ),
       )
       .await
       .expect("admission");
@@ -1354,7 +1361,7 @@ mod tests {
     // table's terminal phase — the single truth — drives the
     // active-leave signal: the node must not hang on shutdown waiting
     // for a leave that already succeeded.
-    handle::<crate::LeaveOutcome>(&client, &id, TaskKind::Leave)
+    handle::<crate::LeaveOutcome>(&client, &id, TaskKind::LEAVE)
       .wait()
       .await
       .expect("the terminal success stands");
@@ -1422,12 +1429,12 @@ mod tests {
     .expect("manager");
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
       )
       .await
       .expect("admission");
-    handle::<()>(&client, &id, TaskKind::SyncRound)
+    handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect("the wedged hook never delays the task");
@@ -1510,12 +1517,12 @@ mod tests {
     for _ in 0..count {
       let id = client
         .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-          ok_effect(TaskOutput::SyncRound(())),
+          TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+          ok_effect(unit_output(TaskKind::SYNC_ROUND)),
         )
         .await
         .expect("admission");
-      handle::<()>(&client, &id, TaskKind::SyncRound)
+      handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
         .wait()
         .await
         .expect("terminal");
@@ -1567,7 +1574,7 @@ mod tests {
     // default slots: exactly one slot remains for the workflow's child.
     let wedged = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -1595,18 +1602,20 @@ mod tests {
       Box::pin(async move {
         let child = client
           .submit(
-            TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-            ok_effect(TaskOutput::SyncRound(())),
+            TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+            ok_effect(unit_output(TaskKind::SYNC_ROUND)),
           )
           .await?;
-        Task::<()>::from_parts(child, TaskKind::SyncRound, client.observer.clone())
+        Task::<()>::from_parts(child, TaskKind::SYNC_ROUND, client.observer.clone())
           .wait()
           .await?;
-        Ok(EffectOutcome::new(TaskOutput::Extension(())))
+        Ok(EffectOutcome::new(custom_output(&TaskKind::from(
+          QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"),
+        ))))
       })
     });
     let kind =
-      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"));
+      TaskKind::from(QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"));
     let id = client
       .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
       .await
@@ -1637,7 +1646,7 @@ mod tests {
     for _ in 0..super::TASK_RECONCILE_BACKLOG {
       client
         .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
           wedged_effect(),
         )
         .await
@@ -1645,7 +1654,7 @@ mod tests {
     }
     let refused = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -1673,12 +1682,12 @@ mod tests {
     // its terminal phase while the local backlog is saturated.
     let dial = client
       .submit(
-        TaskSpec::new(TaskKind::Join, TaskPayload::None),
-        ok_effect(TaskOutput::Join(merge_view())),
+        TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
+        ok_effect(crate::task::output::encode_join(&merge_view()).expect("join output")),
       )
       .await
       .expect("the network backlog is a separate budget");
-    handle::<MergeView>(&client, &dial, TaskKind::Join)
+    handle::<MergeView>(&client, &dial, TaskKind::JOIN)
       .wait()
       .await
       .expect("dial terminal");
@@ -1693,7 +1702,7 @@ mod tests {
     for _ in 0..super::TASK_RECONCILE_BACKLOG {
       client
         .submit(
-          TaskSpec::new(TaskKind::Join, TaskPayload::None),
+          TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
           wedged_effect(),
         )
         .await
@@ -1701,7 +1710,7 @@ mod tests {
     }
     let refused = client
       .submit(
-        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -1711,12 +1720,12 @@ mod tests {
     // saturated backlog budget never consumes another's.
     let local = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
       )
       .await
       .expect("local admission");
-    handle::<()>(&client, &local, TaskKind::SyncRound)
+    handle::<()>(&client, &local, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect("local terminal");
@@ -1757,6 +1766,17 @@ mod tests {
     })
   }
 
+  /// One unit kind's success payload: the kind's canonical empty result.
+  fn unit_output(kind: TaskKind) -> TaskOutput {
+    crate::task::output::encode_unit(kind).expect("unit output")
+  }
+
+  /// One caller-defined kind's success payload: the reconciler's own
+  /// bytes, which the crate never encodes.
+  fn custom_output(kind: &TaskKind) -> TaskOutput {
+    TaskOutput::new(kind.clone(), Arc::from([]))
+  }
+
   /// An effect that never settles (a wedged effect under test).
   fn wedged_effect() -> TaskEffect {
     Arc::new(|_deps, _attempt| Box::pin(std::future::pending()))
@@ -1795,7 +1815,7 @@ mod tests {
             .push(context.attempt);
           let mut steps = scripted.steps.lock().expect("steps");
           let step = match steps.len() {
-            0 => Step::Ok(TaskOutput::SyncRound(())),
+            0 => Step::Ok(unit_output(TaskKind::SYNC_ROUND)),
             1 => match &steps[0] {
               Step::Ok(output) => Step::Ok(output.clone()),
               Step::Fail(kind, context) => Step::Fail(*kind, context),
@@ -1824,17 +1844,17 @@ mod tests {
     )]);
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
         scripted.effect(),
       )
       .await
       .expect("admission");
-    let error = handle::<MergeView>(&client, &id, TaskKind::Join)
+    let error = handle::<MergeView>(&client, &id, TaskKind::JOIN)
       .wait()
       .await
       .expect_err("terminal dial contract");
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-    let status = handle::<MergeView>(&client, &id, TaskKind::Join)
+    let status = handle::<MergeView>(&client, &id, TaskKind::JOIN)
       .status()
       .expect("live task status");
     assert_eq!(status.attempts(), 1);
@@ -1847,12 +1867,12 @@ mod tests {
     let scripted = Scripted::new(vec![Step::Fail(ErrorKind::NotFound, "anything")]);
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         scripted.effect(),
       )
       .await
       .expect("admission");
-    let error = handle::<()>(&client, &id, TaskKind::SyncRound)
+    let error = handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect_err("once policy");
@@ -1870,18 +1890,18 @@ mod tests {
     let scripted = Scripted::new(vec![Step::Fail(ErrorKind::Conflict, "resource version")]);
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::PutResource, TaskPayload::None),
+        TaskSpec::new(TaskKind::PUT_RESOURCE, TaskPayload::None),
         scripted.effect(),
       )
       .await
       .expect("admission");
-    let error = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource)
+    let error = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PUT_RESOURCE)
       .wait()
       .await
       .expect_err("final CAS conflict");
     assert_eq!(error.kind(), ErrorKind::Conflict);
     assert_eq!(error.context(), "resource version");
-    let status = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource)
+    let status = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PUT_RESOURCE)
       .status()
       .expect("live task status");
     assert_eq!(status.attempts(), 1, "never retried at the manager level");
@@ -1902,7 +1922,7 @@ mod tests {
       subject: subject.clone(),
       expected_key: crate::PublicKey::from_bytes([key; 32]),
     };
-    let spec = TaskSpec::new(TaskKind::Revoke, revoke(0x11));
+    let spec = TaskSpec::new(TaskKind::REVOKE, revoke(0x11));
     let first = client
       .submit(spec.clone(), wedged_effect())
       .await
@@ -1919,7 +1939,7 @@ mod tests {
     // precondition would never check its comparand.
     let smuggled = client
       .submit(
-        TaskSpec::new(TaskKind::Revoke, revoke(0x22)),
+        TaskSpec::new(TaskKind::REVOKE, revoke(0x22)),
         wedged_effect(),
       )
       .await
@@ -1948,25 +1968,27 @@ mod tests {
     let gate = release.clone();
     let first = client
       .submit(
-        TaskSpec::new(TaskKind::Revoke, payload.clone()),
+        TaskSpec::new(TaskKind::REVOKE, payload.clone()),
         Arc::new(move |_deps, _attempt| {
           let gate = gate.clone();
           let outcome = outcome.clone();
           Box::pin(async move {
             gate.notified().await;
-            Ok(EffectOutcome::new(TaskOutput::Revoke(outcome)))
+            Ok(EffectOutcome::new(
+              crate::task::output::encode_revoke(&outcome).expect("revoke output"),
+            ))
           })
         }),
       )
       .await
       .expect("admission");
     let joined = client
-      .submit(TaskSpec::new(TaskKind::Revoke, payload), wedged_effect())
+      .submit(TaskSpec::new(TaskKind::REVOKE, payload), wedged_effect())
       .await
       .expect("coalesced admission");
     assert_eq!(first, joined);
     release.notify_one();
-    let observed = handle::<crate::RevokeOutcome>(&client, &joined, TaskKind::Revoke)
+    let observed = handle::<crate::RevokeOutcome>(&client, &joined, TaskKind::REVOKE)
       .wait()
       .await
       .expect("the joined retry resolves the first task's terminal");
@@ -1983,7 +2005,7 @@ mod tests {
     let gate = release.clone();
     let first = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
         Arc::new(move |_deps, _attempt| {
           let gate = gate.clone();
           Box::pin(async move {
@@ -1999,7 +2021,7 @@ mod tests {
       .expect("admission");
     let conflict = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -2013,7 +2035,7 @@ mod tests {
     // that report landed. A successful leave shuts the node down, so only
     // the failed leave has a re-issue path at all.
     release.notify_one();
-    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::Leave)
+    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::LEAVE)
       .wait()
       .await
       .expect_err("scripted leave failure");
@@ -2021,7 +2043,7 @@ mod tests {
       loop {
         match client
           .submit(
-            TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+            TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
             wedged_effect(),
           )
           .await
@@ -2065,14 +2087,15 @@ mod tests {
     let gate = release.clone();
     let first = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
         Arc::new(move |_deps, _attempt| {
           let gate = gate.clone();
           Box::pin(async move {
             gate.notified().await;
-            Ok(EffectOutcome::new(TaskOutput::Leave(
-              crate::LeaveOutcome::new(node('a'), node('b')),
-            )))
+            Ok(EffectOutcome::new(
+              crate::task::output::encode_leave(&crate::LeaveOutcome::new(node('a'), node('b')))
+                .expect("leave output"),
+            ))
           })
         }),
       )
@@ -2080,7 +2103,7 @@ mod tests {
       .expect("admission");
     let refused = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -2090,7 +2113,7 @@ mod tests {
     // The first leave's success still signals the active-leave shutdown:
     // the signal is the table's own (kind, phase), never the slot's id.
     release.notify_one();
-    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::Leave)
+    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::LEAVE)
       .wait()
       .await
       .expect("the first leave succeeds");
@@ -2111,8 +2134,8 @@ mod tests {
     let table = crate::task::TaskTable::new();
     let leave = TaskId::compose(0, 0).expect("id");
     let other = TaskId::compose(0, 1).expect("id");
-    table.insert_pending(&leave, TaskKind::Leave, std::time::SystemTime::now());
-    table.insert_pending(&other, TaskKind::SyncRound, std::time::SystemTime::now());
+    table.insert_pending(&leave, TaskKind::LEAVE, std::time::SystemTime::now());
+    table.insert_pending(&other, TaskKind::SYNC_ROUND, std::time::SystemTime::now());
     assert_eq!(
       super::leave_signal_for(&table, &leave),
       None,
@@ -2139,7 +2162,7 @@ mod tests {
     // A cancellable kind wedged mid-effect.
     let wedged = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -2151,12 +2174,14 @@ mod tests {
       let gate = gate.clone();
       Box::pin(async move {
         gate.notified().await;
-        Ok(EffectOutcome::new(TaskOutput::ResolveFrozenJournal(())))
+        Ok(EffectOutcome::new(unit_output(
+          TaskKind::RESOLVE_FROZEN_JOURNAL,
+        )))
       })
     });
     let journaled = client
       .submit(
-        TaskSpec::new(TaskKind::ResolveFrozenJournal, TaskPayload::None),
+        TaskSpec::new(TaskKind::RESOLVE_FROZEN_JOURNAL, TaskPayload::None),
         journaled_effect,
       )
       .await
@@ -2165,13 +2190,13 @@ mod tests {
     manager.begin_shutdown();
     // The cancellable task's wait resolves ShuttingDown without the
     // effect ever settling, and the task stays non-terminal.
-    let error = handle::<()>(&client, &wedged, TaskKind::SyncRound)
+    let error = handle::<()>(&client, &wedged, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect_err("cancelled");
     assert_eq!(error.kind(), ErrorKind::ShuttingDown);
     assert_eq!(
-      handle::<()>(&client, &wedged, TaskKind::SyncRound)
+      handle::<()>(&client, &wedged, TaskKind::SYNC_ROUND)
         .status()
         .expect("live task status")
         .phase(),
@@ -2188,7 +2213,7 @@ mod tests {
       .await
       .expect_err("the drain must wait for the journaled kind");
     release.notify_waiters();
-    handle::<()>(&client, &journaled, TaskKind::ResolveFrozenJournal)
+    handle::<()>(&client, &journaled, TaskKind::RESOLVE_FROZEN_JOURNAL)
       .wait()
       .await
       .expect("journaled terminal");
@@ -2239,12 +2264,12 @@ mod tests {
           peak.fetch_max(now, Ordering::SeqCst);
           tokio::time::sleep(Duration::from_millis(20)).await;
           live.fetch_sub(1, Ordering::SeqCst);
-          Ok(EffectOutcome::new(TaskOutput::SyncRound(())))
+          Ok(EffectOutcome::new(unit_output(TaskKind::SYNC_ROUND)))
         })
       });
       let id = client
         .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
           effect,
         )
         .await
@@ -2252,11 +2277,11 @@ mod tests {
       ids.push((id, index));
     }
     for (id, _index) in ids {
-      handle::<()>(&client, &id, TaskKind::SyncRound)
+      handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
         .wait()
         .await
         .expect("terminal");
-      let status = handle::<()>(&client, &id, TaskKind::SyncRound)
+      let status = handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
         .status()
         .expect("live task status");
       assert_eq!(status.phase(), TaskPhase::Succeeded);
@@ -2275,7 +2300,7 @@ mod tests {
     let (client, manager) = spawn_task_manager(deps()).expect("manager");
     let wedged = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -2291,7 +2316,7 @@ mod tests {
       .expect("cancel signal")
       .expect("stop watch live");
     assert!(*stopped.borrow());
-    let error = Task::<()>::from_parts(wedged, TaskKind::SyncRound, observer)
+    let error = Task::<()>::from_parts(wedged, TaskKind::SYNC_ROUND, observer)
       .wait()
       .await
       .expect_err("stopped manager");
@@ -2301,7 +2326,7 @@ mod tests {
 
   #[test]
   fn the_retry_policies_are_bounded_and_exponential() {
-    let network = super::retry_policy(&TaskKind::Join);
+    let network = super::retry_policy(&TaskKind::JOIN);
     assert_eq!(network.max_attempts, 4);
     assert_eq!(network.backoff(1), Duration::from_millis(100));
     assert_eq!(network.backoff(2), Duration::from_millis(400));
@@ -2311,14 +2336,47 @@ mod tests {
     // Resource writes share the once policy: the commit-race retry
     // lives inside the effects, and a final lost-CAS Conflict never
     // re-runs at the manager level.
-    assert_eq!(super::retry_policy(&TaskKind::PutResource).max_attempts, 1);
+    assert_eq!(super::retry_policy(&TaskKind::PUT_RESOURCE).max_attempts, 1);
     assert_eq!(
-      super::retry_policy(&TaskKind::DeleteResource).max_attempts,
+      super::retry_policy(&TaskKind::DELETE_RESOURCE).max_attempts,
       1
     );
-    let once = super::retry_policy(&TaskKind::Leave);
+    let once = super::retry_policy(&TaskKind::LEAVE);
     assert_eq!(once.max_attempts, 1);
     assert_eq!(once.backoff(1), Duration::ZERO);
+    // A caller-defined kind takes the extension policy: the reconciler
+    // owns the semantics, the manager owns the bound.
+    let caller = TaskKind::parse("example.com/tasks/v1/probe").expect("tag");
+    assert_eq!(super::retry_policy(&caller).max_attempts, 4);
+  }
+
+  /// The handle's expected kind is checked against the stored payload's
+  /// kind: a drift between the two is the typed internal error, never a
+  /// caller-visible decode of the wrong shape.
+  #[tokio::test]
+  async fn a_handle_of_the_wrong_kind_is_the_typed_internal_error() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+      )
+      .await
+      .expect("admission");
+    // The task succeeded as a sync round; a handle admitted for a join
+    // reads a different expected kind.
+    let error = handle::<MergeView>(&client, &id, TaskKind::JOIN)
+      .wait()
+      .await
+      .expect_err("kind mismatch");
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "task output");
+    // The contract holds for the right handle: the mismatch never
+    // poisoned the entry.
+    handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
+      .wait()
+      .await
+      .expect("the matching handle resolves");
   }
 
   /// One recorded reconciler call: the attempt index plus the previous
@@ -2356,7 +2414,9 @@ mod tests {
           .pop_front()
           .unwrap_or(ReconcileDecision::Succeeded);
         match decision {
-          ReconcileDecision::Succeeded => Ok(ReconcileDecision::Succeeded),
+          ReconcileDecision::Succeeded | ReconcileDecision::SucceededWithOutput(_) => {
+            Ok(ReconcileDecision::Succeeded)
+          }
           ReconcileDecision::Retry => Err(Error::from_parts(
             ErrorKind::Overloaded,
             "custom task retry",
@@ -2458,12 +2518,12 @@ mod tests {
     // the terminal view still resolves immediately.
     let spec = crate::CustomTaskSpec::new(kind.clone(), custom_labels());
     let task = tasks.submit(spec).await.expect("custom admission");
-    assert_eq!(task.kind(), &TaskKind::Extension(kind.clone()));
+    assert_eq!(task.kind(), &TaskKind::from(kind.clone()));
     let id = task.id().clone();
     task.wait().await.expect("custom terminal");
     let view = tasks.wait(id.clone()).await.expect("terminal view");
     assert_eq!(view.phase(), TaskPhase::Succeeded);
-    assert_eq!(view.kind(), &TaskKind::Extension(kind));
+    assert_eq!(view.kind(), &TaskKind::from(kind));
     assert_eq!(view.attempts(), 1);
     let got = tasks
       .get(id.clone())

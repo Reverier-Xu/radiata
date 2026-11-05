@@ -31,7 +31,6 @@ use super::{
 };
 use crate::{
   Endpoint, Error, MergeView, NodeConfig, NodeId, PublicKey, Result, RevokeOutcome, Task, TaskKind,
-  TaskOutput,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{credential::MergeCredential, lifecycle::LocalIdentityContext},
@@ -39,6 +38,11 @@ use crate::{
   session::{
     SessionDriver,
     stream::{SessionPacketContext, SessionTable, retire_session},
+  },
+  task::output::{
+    encode_checkpoint, encode_connect, encode_join, encode_leave, encode_listen, encode_member,
+    encode_receipt_retention, encode_recovery, encode_resource_mutation, encode_revoke,
+    encode_unit,
   },
   transport::registry::TransportTrust,
 };
@@ -263,9 +267,9 @@ pub(crate) async fn join(
     Box::pin(async move { reconcile_join(deps, transport, receiver, credential).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Join, TaskPayload::None), effect)
+    .submit(TaskSpec::new(TaskKind::JOIN, TaskPayload::None), effect)
     .await?;
-  Ok(Task::from_parts(id, TaskKind::Join, tasks.observer.clone()))
+  Ok(Task::from_parts(id, TaskKind::JOIN, tasks.observer.clone()))
 }
 
 /// Admits one member re-connect: key trust only, no join credential. The
@@ -296,11 +300,11 @@ pub(crate) async fn connect(
     Box::pin(async move { reconcile_connect(deps, transport, receiver, peer).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Connect, payload), effect)
+    .submit(TaskSpec::new(TaskKind::CONNECT, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Connect,
+    TaskKind::CONNECT,
     tasks.observer.clone(),
   ))
 }
@@ -318,11 +322,11 @@ pub(crate) async fn disconnect(tasks: &TaskClient, peer: NodeId) -> Result<Task<
     Box::pin(async move { reconcile_disconnect(deps, peer).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Disconnect, payload), effect)
+    .submit(TaskSpec::new(TaskKind::DISCONNECT, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Disconnect,
+    TaskKind::DISCONNECT,
     tasks.observer.clone(),
   ))
 }
@@ -369,7 +373,7 @@ async fn reconcile_join(
       |session_task| track_connection_task(&connection_tasks, session_task),
     )
     .await?;
-    Ok(EffectOutcome::new(TaskOutput::Join(view)))
+    Ok(EffectOutcome::new(encode_join(&view)?))
   }
   .await;
   crate::audit::dial_settled(&peer, crate::audit::DialInitiator::Caller, result.is_ok());
@@ -397,7 +401,7 @@ async fn reconcile_connect(
     planes.config.dial_deadline(),
   )
   .await?;
-  Ok(EffectOutcome::new(TaskOutput::Connect(authenticated)))
+  Ok(EffectOutcome::new(encode_connect(&authenticated)?))
 }
 
 /// The disconnect effect: tear the peer's session down and emit the
@@ -406,7 +410,7 @@ async fn reconcile_disconnect(deps: Arc<OperationDeps>, peer: NodeId) -> Result<
   let planes = deps.planes()?;
   retire_session(&planes.sessions, &peer)?;
   deps.events().emit(crate::SessionChanged::new(peer));
-  Ok(EffectOutcome::new(TaskOutput::Disconnect(())))
+  Ok(EffectOutcome::new(encode_unit(TaskKind::DISCONNECT)?))
 }
 
 /// Spawns one kept session task into the node's tracked connection
@@ -452,11 +456,11 @@ pub(crate) async fn revoke(
     Box::pin(async move { reconcile_revoke(deps, subject, expected_key).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Revoke, payload), effect)
+    .submit(TaskSpec::new(TaskKind::REVOKE, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Revoke,
+    TaskKind::REVOKE,
     tasks.observer.clone(),
   ))
 }
@@ -474,11 +478,11 @@ pub(crate) async fn purge_revocation(tasks: &TaskClient, subject: NodeId) -> Res
     Box::pin(async move { reconcile_purge_revocation(deps, subject).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::PurgeRevocation, payload), effect)
+    .submit(TaskSpec::new(TaskKind::PURGE_REVOCATION, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::PurgeRevocation,
+    TaskKind::PURGE_REVOCATION,
     tasks.observer.clone(),
   ))
 }
@@ -496,11 +500,11 @@ pub(crate) async fn cleanup(tasks: &TaskClient, subject: NodeId) -> Result<Task<
     Box::pin(async move { reconcile_cleanup(deps, subject).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Cleanup, payload), effect)
+    .submit(TaskSpec::new(TaskKind::CLEANUP, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Cleanup,
+    TaskKind::CLEANUP,
     tasks.observer.clone(),
   ))
 }
@@ -519,13 +523,13 @@ pub(crate) async fn issue_cleanup_checkpoint(tasks: &TaskClient) -> Result<Task<
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::IssueCleanupCheckpoint, TaskPayload::None),
+      TaskSpec::new(TaskKind::ISSUE_CLEANUP_CHECKPOINT, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::IssueCleanupCheckpoint,
+    TaskKind::ISSUE_CLEANUP_CHECKPOINT,
     tasks.observer.clone(),
   ))
 }
@@ -550,13 +554,13 @@ pub(crate) async fn resolve_frozen_journal(
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::ResolveFrozenJournal, TaskPayload::None),
+      TaskSpec::new(TaskKind::RESOLVE_FROZEN_JOURNAL, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::ResolveFrozenJournal,
+    TaskKind::RESOLVE_FROZEN_JOURNAL,
     tasks.observer.clone(),
   ))
 }
@@ -617,10 +621,10 @@ async fn reconcile_revoke(
       .emit(crate::SessionChanged::new(subject.clone()));
     deps.events().emit(crate::NodeRevoked::new(subject.clone()));
   }
-  Ok(EffectOutcome::new(TaskOutput::Revoke(RevokeOutcome::new(
+  Ok(EffectOutcome::new(encode_revoke(&RevokeOutcome::new(
     subject,
     !transition.changed_authorization(),
-  ))))
+  ))?))
 }
 
 /// The cleanup effect: sign and persist one convergent cleanup tombstone,
@@ -647,7 +651,7 @@ async fn reconcile_cleanup(deps: Arc<OperationDeps>, subject: NodeId) -> Result<
     deps.events().emit(crate::MemberChanged::new(subject));
     planes.member_revision.bump();
   }
-  Ok(EffectOutcome::new(TaskOutput::Cleanup(())))
+  Ok(EffectOutcome::new(encode_unit(TaskKind::CLEANUP)?))
 }
 
 /// The purge effect: clear the local revocation record (local-only,
@@ -670,7 +674,7 @@ async fn reconcile_purge_revocation(
   .await?;
   revoked.forget(&subject);
   drop(revoked);
-  Ok(EffectOutcome::new(TaskOutput::PurgeRevocation(())))
+  Ok(EffectOutcome::new(encode_unit(TaskKind::PURGE_REVOCATION)?))
 }
 
 /// The checkpoint effect: enforce the convergence precondition, then
@@ -682,9 +686,7 @@ async fn reconcile_issue_cleanup_checkpoint(deps: Arc<OperationDeps>) -> Result<
   let watermark =
     crate::identity::cleanup::issue_checkpoint_ctx(&planes.context, planes.entropy.as_ref())
       .await?;
-  Ok(EffectOutcome::new(TaskOutput::IssueCleanupCheckpoint(
-    watermark,
-  )))
+  Ok(EffectOutcome::new(encode_checkpoint(watermark)?))
 }
 
 /// The frozen-journal resolution effect: resolve the store's frozen
@@ -703,7 +705,9 @@ async fn reconcile_resolve_frozen_journal(deps: Arc<OperationDeps>) -> Result<Ef
     .store()
     .resolve_frozen_journal_uncommitted(operation)
     .await?;
-  Ok(EffectOutcome::new(TaskOutput::ResolveFrozenJournal(())))
+  Ok(EffectOutcome::new(encode_unit(
+    TaskKind::RESOLVE_FROZEN_JOURNAL,
+  )?))
 }
 
 /// The checkpoint issue precondition: every known member other than self
@@ -790,11 +794,11 @@ pub(crate) async fn put_resource(
   });
   let payload = TaskPayload::None;
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::PutResource, payload), effect)
+    .submit(TaskSpec::new(TaskKind::PUT_RESOURCE, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::PutResource,
+    TaskKind::PUT_RESOURCE,
     tasks.observer.clone(),
   ))
 }
@@ -817,11 +821,11 @@ pub(crate) async fn delete_resource(
   });
   let payload = TaskPayload::None;
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::DeleteResource, payload), effect)
+    .submit(TaskSpec::new(TaskKind::DELETE_RESOURCE, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::DeleteResource,
+    TaskKind::DELETE_RESOURCE,
     tasks.observer.clone(),
   ))
 }
@@ -843,11 +847,14 @@ pub(crate) async fn patch_metadata(
   });
   let payload = TaskPayload::None;
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::PatchNodeMetadata, payload), effect)
+    .submit(
+      TaskSpec::new(TaskKind::PATCH_NODE_METADATA, payload),
+      effect,
+    )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::PatchNodeMetadata,
+    TaskKind::PATCH_NODE_METADATA,
     tasks.observer.clone(),
   ))
 }
@@ -1158,7 +1165,10 @@ async fn reconcile_put_resource(
     view.accepted(),
   )
   .await;
-  Ok(EffectOutcome::new(TaskOutput::PutResource(view)))
+  Ok(EffectOutcome::new(encode_resource_mutation(
+    TaskKind::PUT_RESOURCE,
+    &view,
+  )?))
 }
 
 /// The removal effect: the moved supervisor body — only when the stored
@@ -1281,7 +1291,10 @@ async fn reconcile_delete_resource(
     view.accepted(),
   )
   .await;
-  Ok(EffectOutcome::new(TaskOutput::DeleteResource(view)))
+  Ok(EffectOutcome::new(encode_resource_mutation(
+    TaskKind::DELETE_RESOURCE,
+    &view,
+  )?))
 }
 
 /// The metadata-patch effect: the moved supervisor body — replace this
@@ -1307,7 +1320,7 @@ async fn reconcile_patch_metadata(
   deps.events().emit(crate::MemberChanged::new(local.clone()));
   planes.member_revision.bump();
   let view = crate::membership::member_view(&updated, crate::ConnectivityStatus::Connected)?;
-  Ok(EffectOutcome::new(TaskOutput::PatchNodeMetadata(view)))
+  Ok(EffectOutcome::new(encode_member(&view)?))
 }
 
 // -- listener, credential, recovery, retention, and sync verbs ------
@@ -1329,11 +1342,11 @@ pub(crate) async fn listen(
     Box::pin(async move { reconcile_listen(deps, transport, endpoint).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Listen, TaskPayload::None), effect)
+    .submit(TaskSpec::new(TaskKind::LISTEN, TaskPayload::None), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Listen,
+    TaskKind::LISTEN,
     tasks.observer.clone(),
   ))
 }
@@ -1353,13 +1366,13 @@ pub(crate) async fn stop_listener(
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::StopListener, TaskPayload::None),
+      TaskSpec::new(TaskKind::STOP_LISTENER, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::StopListener,
+    TaskKind::STOP_LISTENER,
     tasks.observer.clone(),
   ))
 }
@@ -1380,13 +1393,13 @@ pub(crate) async fn issue_merge_credential(
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_credential(deps, false).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::IssueCredential, TaskPayload::None),
+      TaskSpec::new(TaskKind::ISSUE_CREDENTIAL, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::IssueCredential,
+    TaskKind::ISSUE_CREDENTIAL,
     tasks.observer.clone(),
   ))
 }
@@ -1407,13 +1420,13 @@ pub(crate) async fn rotate_merge_credential(
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_credential(deps, true).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::RotateCredential, TaskPayload::None),
+      TaskSpec::new(TaskKind::ROTATE_CREDENTIAL, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::RotateCredential,
+    TaskKind::ROTATE_CREDENTIAL,
     tasks.observer.clone(),
   ))
 }
@@ -1430,13 +1443,13 @@ pub(crate) async fn start_recovery(tasks: &TaskClient) -> Result<Task<crate::Rec
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_start_recovery(deps).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::StartRecovery, TaskPayload::None),
+      TaskSpec::new(TaskKind::START_RECOVERY, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::StartRecovery,
+    TaskKind::START_RECOVERY,
     tasks.observer.clone(),
   ))
 }
@@ -1455,13 +1468,13 @@ pub(crate) async fn apply_receipt_retention(
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::ApplyReceiptRetention, TaskPayload::None),
+      TaskSpec::new(TaskKind::APPLY_RECEIPT_RETENTION, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::ApplyReceiptRetention,
+    TaskKind::APPLY_RECEIPT_RETENTION,
     tasks.observer.clone(),
   ))
 }
@@ -1479,13 +1492,13 @@ pub(crate) async fn sync_round(tasks: &TaskClient) -> Result<Task<()>> {
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_sync_round(deps).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+      TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::SyncRound,
+    TaskKind::SYNC_ROUND,
     tasks.observer.clone(),
   ))
 }
@@ -1646,9 +1659,9 @@ async fn reconcile_listen(
       "eager descriptor publication at listen deferred to the lazy paths"
     );
   }
-  Ok(EffectOutcome::new(TaskOutput::Listen(
-    crate::ListenerView::new(id, published),
-  )))
+  Ok(EffectOutcome::new(encode_listen(
+    &crate::ListenerView::new(id, published),
+  )?))
 }
 
 /// The stop-listener effect: the shared teardown — remove the registry
@@ -1660,7 +1673,7 @@ async fn reconcile_stop_listener(
   let planes = deps.planes()?;
   super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
     .await?;
-  Ok(EffectOutcome::new(TaskOutput::StopListener(())))
+  Ok(EffectOutcome::new(encode_unit(TaskKind::STOP_LISTENER)?))
 }
 
 /// The credential effect: issue (or rotate) the live join credential
@@ -1681,9 +1694,9 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
     issuer.issue(planes.entropy.as_ref(), std::time::SystemTime::now())?
   };
   Ok(if rotate {
-    EffectOutcome::credential_rotated(issued)
+    EffectOutcome::credential_rotated(issued)?
   } else {
-    EffectOutcome::credential_issued(issued)
+    EffectOutcome::credential_issued(issued)?
   })
 }
 
@@ -1702,7 +1715,7 @@ async fn reconcile_start_recovery(deps: Arc<OperationDeps>) -> Result<EffectOutc
       .events()
       .emit(crate::RecoveryChanged::new(after.clone()));
   }
-  Ok(EffectOutcome::new(TaskOutput::StartRecovery(after)))
+  Ok(EffectOutcome::new(encode_recovery(&after)?))
 }
 
 /// The receipt-retention effect: the idempotent on-demand pass — the
@@ -1713,9 +1726,7 @@ async fn reconcile_apply_receipt_retention(deps: Arc<OperationDeps>) -> Result<E
   let planes = deps.planes()?;
   planes.context.require_unblocked()?;
   let report = planes.context.store().apply_receipt_retention().await?;
-  Ok(EffectOutcome::new(TaskOutput::ApplyReceiptRetention(
-    report,
-  )))
+  Ok(EffectOutcome::new(encode_receipt_retention(&report)?))
 }
 
 /// The sync-round effect: forward one round request to the sync driver
@@ -1730,7 +1741,7 @@ async fn reconcile_sync_round(deps: Arc<OperationDeps>) -> Result<EffectOutcome>
   round_rx
     .await
     .map_err(|_| Error::shutting_down("sync round"))?;
-  Ok(EffectOutcome::new(TaskOutput::SyncRound(())))
+  Ok(EffectOutcome::new(encode_unit(TaskKind::SYNC_ROUND)?))
 }
 
 // -- the leave verb ------------------------------------------------------
@@ -1759,11 +1770,11 @@ pub(crate) async fn leave(
   let effect: TaskEffect =
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_leave(deps).await }));
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Leave, TaskPayload::None), effect)
+    .submit(TaskSpec::new(TaskKind::LEAVE, TaskPayload::None), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Leave,
+    TaskKind::LEAVE,
     tasks.observer.clone(),
   ))
 }
@@ -1857,9 +1868,9 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
     former.clone(),
     replacement.clone(),
   ));
-  Ok(EffectOutcome::new(TaskOutput::Leave(
-    crate::LeaveOutcome::new(former, replacement),
-  )))
+  Ok(EffectOutcome::new(encode_leave(
+    &crate::LeaveOutcome::new(former, replacement),
+  )?))
 }
 
 /// Stops one listener for the leave teardown. The stop-listener effect

@@ -36,6 +36,8 @@ enum Step {
   Panic,
   /// Completes the attempt.
   Succeed,
+  /// Completes the attempt with the caller's opaque output payload.
+  SucceedWithPayload,
 }
 
 /// Everything the tests observe of one probe reconciler: the attempt
@@ -96,6 +98,9 @@ impl TaskReconciler for ProbeReconciler {
         }
         Step::Panic => panic!("scripted reconcile panic"),
         Step::Succeed => Ok(ReconcileDecision::Succeeded),
+        Step::SucceedWithPayload => Ok(ReconcileDecision::SucceededWithOutput(
+          b"probe-payload".to_vec(),
+        )),
       }
     })
   }
@@ -180,10 +185,7 @@ async fn lifecycle_phases_and_value_based_waits() {
   let mut events = node.watch::<TaskChanged>(EventOptions::new()).unwrap();
 
   let task = node.tasks().submit(probe_spec()).await.unwrap();
-  assert_eq!(
-    task.kind(),
-    &TaskKind::Extension(QualifiedTag::parse(PROBE_KIND).unwrap())
-  );
+  assert_eq!(task.kind(), &TaskKind::parse(PROBE_KIND).unwrap());
 
   // Admission then the first spawn: exactly one event per transition.
   let pending = next_changed(&mut events).await;
@@ -214,7 +216,12 @@ async fn lifecycle_phases_and_value_based_waits() {
   // handle delivers the verb output and the accessor the terminal view.
   let view = node.tasks().wait(task.id().clone()).await.unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
-  assert_eq!(view.output(), Some(&TaskOutput::Extension(())));
+  let output = view.output().expect("the custom task carries its output");
+  assert_eq!(output.kind(), &TaskKind::parse(PROBE_KIND).unwrap());
+  assert!(
+    output.bytes().is_empty(),
+    "a reconciler that returns no payload leaves the bytes empty"
+  );
   assert!(view.finished().is_some());
   let clone = task.clone();
   clone.wait().await.unwrap();
@@ -230,6 +237,24 @@ async fn lifecycle_phases_and_value_based_waits() {
   assert!(node.tasks().get(unknown.clone()).await.unwrap().is_none());
   let missing = node.tasks().wait(unknown).await.unwrap_err();
   assert_eq!(missing.kind(), ErrorKind::NotFound);
+  node.shutdown().await.unwrap();
+}
+
+/// A caller-defined kind's payload is the reconciler's own bytes: the
+/// task view carries them verbatim under the caller's tag, and the typed
+/// handle still resolves with the workflow's `()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_custom_reconcilers_output_bytes_reach_the_task_view() {
+  common::init_tracing();
+  let (extensions, _log, _release) = probe_extensions(vec![Step::SucceedWithPayload]);
+  let node = start_node(20, extensions, NodeConfig::new()).await;
+  let task = node.tasks().submit(probe_spec()).await.unwrap();
+  let view = node.tasks().wait(task.id().clone()).await.unwrap();
+  assert_eq!(view.phase(), TaskPhase::Succeeded);
+  let output = view.output().expect("the custom task carries its output");
+  assert_eq!(output.kind(), &TaskKind::parse(PROBE_KIND).unwrap());
+  assert_eq!(output.bytes(), b"probe-payload");
+  task.wait().await.unwrap();
   node.shutdown().await.unwrap();
 }
 
@@ -426,10 +451,10 @@ async fn terminal_history_eviction_shapes_get_wait_and_status() {
 /// The issued credential secret is delivered exactly once: the typed
 /// handle is the only carrier of the secret (a credential task is
 /// deliberately not cloneable — the amendment's once-only slot), the
-/// accessor's wait and views observe only the expiry, and the handle's
-/// local snapshot stays readable after the delivery. A second handle
-/// cannot exist for this kind, so the once-only slot is pinned by the
-/// secret's own non-clonability.
+/// accessor's wait and views observe only the non-secret payload, and
+/// the handle's local snapshot stays readable after the delivery. A
+/// second handle cannot exist for this kind, so the once-only slot is
+/// pinned by the secret's own non-clonability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn credential_secret_is_delivered_exactly_once() {
   common::init_tracing();
@@ -437,25 +462,30 @@ async fn credential_secret_is_delivered_exactly_once() {
 
   let task = node.credentials().issue().await.unwrap();
   // The accessor wait never touches the secret slot: it resolves with
-  // the terminal view carrying the expiry observation only.
+  // the terminal view carrying the encoded expiry observation only.
   let view = node.tasks().wait(task.id().clone()).await.unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
-  let TaskOutput::IssueCredential(observed) = view.output().unwrap() else {
-    panic!("credential task must carry the expiry observation");
-  };
-  assert!(observed.expires_at() > std::time::SystemTime::now());
+  let observed = view
+    .output()
+    .expect("credential task must carry the expiry observation");
+  assert_eq!(observed.kind(), &TaskKind::ISSUE_CREDENTIAL);
+  assert!(
+    !observed.bytes().is_empty(),
+    "the expiry observation is encoded in the payload"
+  );
 
   // The single typed wait collects the secret; the table keeps only the
   // observation afterwards.
   let task_id = task.id().clone();
   let issued = task.wait().await.unwrap();
-  assert_eq!(issued.expires_at(), observed.expires_at());
+  assert!(issued.expires_at() > std::time::SystemTime::now());
   assert!(!issued.credential().expose_secret().is_empty());
   let view = node.tasks().get(task_id).await.unwrap().unwrap();
-  assert!(matches!(
-    view.output(),
-    Some(TaskOutput::IssueCredential(later)) if later.expires_at() == observed.expires_at()
-  ));
+  assert_eq!(
+    view.output().map(TaskOutput::kind),
+    Some(&TaskKind::ISSUE_CREDENTIAL),
+    "the terminal payload stays readable after the secret is collected"
+  );
   node.shutdown().await.unwrap();
 }
 
@@ -484,7 +514,7 @@ async fn connect_coalesces_identical_in_flight_submissions() {
   );
   let joined = node.connect(endpoint.clone(), peer.clone()).await.unwrap();
   assert_eq!(joined.id(), first.id());
-  assert_eq!(joined.kind(), &TaskKind::Connect);
+  assert_eq!(joined.kind(), &TaskKind::CONNECT);
   // A distinct endpoint is a different intent for the same subject:
   // admission refuses it instead of smuggling it onto the dial.
   let other = Endpoint::parse(&format!("wss://127.0.0.1:{}", silent.port + 1)).unwrap();

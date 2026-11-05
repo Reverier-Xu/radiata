@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, str::FromStr};
 
 use crate::{Error, Result};
 
@@ -27,7 +27,10 @@ pub(crate) const CATEGORY_LABELS: &str = "labels";
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QualifiedTag {
-  value: String,
+  /// The canonical text: borrowed for the crate's own fixed tags (the
+  /// const-constructed ones, see [`QualifiedTag::from_static`]), owned
+  /// for every parsed tag.
+  value: Cow<'static, str>,
   domain_end: usize,
   category_end: usize,
   /// The end offset of the version segment when the tag carries one;
@@ -39,11 +42,44 @@ impl QualifiedTag {
   pub fn parse(value: &str) -> Result<Self> {
     let (value, domain_end, category_end, version_end) = validate_tag(value)?;
     Ok(Self {
-      value,
+      value: Cow::Owned(value),
       domain_end,
       category_end,
       version_end,
     })
+  }
+
+  /// Builds one of the crate's own fixed tags from its compile-time
+  /// canonical text: the const-callable twin of [`QualifiedTag::parse`],
+  /// so a fixed tag can be an associated constant instead of a runtime
+  /// parse. The text is not re-validated here — the segment offsets are
+  /// computed by scanning for the separators — so every `from_static`
+  /// constant is paired with a test that it parses to itself.
+  pub(crate) const fn from_static(value: &'static str) -> Self {
+    let bytes = value.as_bytes();
+    let mut domain_end = 0;
+    let mut category_end = 0;
+    let mut version_end = None;
+    let mut separators = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+      if bytes[index] == b'/' {
+        match separators {
+          0 => domain_end = index,
+          1 => category_end = index,
+          2 => version_end = Some(index),
+          _ => {}
+        }
+        separators += 1;
+      }
+      index += 1;
+    }
+    Self {
+      value: Cow::Borrowed(value),
+      domain_end,
+      category_end,
+      version_end,
+    }
   }
 
   pub fn as_str(&self) -> &str {
@@ -307,6 +343,27 @@ fn valid_version_component(component: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::{MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, QualifiedTag, valid_dns_hostname};
+
+  /// The const constructor is the parse result for every shape it is
+  /// used with: the three-segment tag and the versioned four-segment
+  /// tag (the crate's fixed tags are all three-segment, so the versioned
+  /// case pins the offset scan's third separator).
+  #[test]
+  fn from_static_matches_parse_for_every_fixed_shape() {
+    for value in [
+      "radiata.woooo.tech/tasks/join",
+      "example.com/labels/lane",
+      "a.b/schemas/v12/multi-word-name",
+    ] {
+      let parsed = QualifiedTag::parse(value).unwrap();
+      let fixed = QualifiedTag::from_static(value);
+      assert_eq!(fixed, parsed, "fixed tag drifted for {value:?}");
+      assert_eq!(fixed.domain(), parsed.domain());
+      assert_eq!(fixed.category(), parsed.category());
+      assert_eq!(fixed.version(), parsed.version());
+      assert_eq!(fixed.name(), parsed.name());
+    }
+  }
 
   #[test]
   fn parses_versioned_tags_with_split_accessors() {

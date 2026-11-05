@@ -135,6 +135,7 @@ pub radiata::ProviderErrorKind::UnsupportedSchema
 pub enum radiata::ReconcileDecision
 pub radiata::ReconcileDecision::Retry
 pub radiata::ReconcileDecision::Succeeded
+pub radiata::ReconcileDecision::SucceededWithOutput(alloc::vec::Vec<u8>)
 #[non_exhaustive] pub enum radiata::ReconcileOutcome
 pub radiata::ReconcileOutcome::Aborted
 pub radiata::ReconcileOutcome::Committed(radiata::CommitReceipt)
@@ -178,48 +179,6 @@ pub radiata::StoreOperation::Put::value: radiata::StoreValue
 #[non_exhaustive] pub enum radiata::StreamTarget
 pub radiata::StreamTarget::Exact(radiata::NodeId)
 pub radiata::StreamTarget::MatchingNodes(radiata::Selector)
-pub enum radiata::TaskKind
-pub radiata::TaskKind::ApplyReceiptRetention
-pub radiata::TaskKind::Cleanup
-pub radiata::TaskKind::Connect
-pub radiata::TaskKind::DeleteResource
-pub radiata::TaskKind::Disconnect
-pub radiata::TaskKind::Extension(radiata::QualifiedTag)
-pub radiata::TaskKind::IssueCleanupCheckpoint
-pub radiata::TaskKind::IssueCredential
-pub radiata::TaskKind::Join
-pub radiata::TaskKind::Leave
-pub radiata::TaskKind::Listen
-pub radiata::TaskKind::PatchNodeMetadata
-pub radiata::TaskKind::PurgeRevocation
-pub radiata::TaskKind::PutResource
-pub radiata::TaskKind::ResolveFrozenJournal
-pub radiata::TaskKind::Revoke
-pub radiata::TaskKind::RotateCredential
-pub radiata::TaskKind::StartRecovery
-pub radiata::TaskKind::StopListener
-pub radiata::TaskKind::SyncRound
-pub enum radiata::TaskOutput
-pub radiata::TaskOutput::ApplyReceiptRetention(radiata::ReceiptRetentionReport)
-pub radiata::TaskOutput::Cleanup(())
-pub radiata::TaskOutput::Connect(radiata::NodeId)
-pub radiata::TaskOutput::DeleteResource(radiata::ResourceMutationView)
-pub radiata::TaskOutput::Disconnect(())
-pub radiata::TaskOutput::Extension(())
-pub radiata::TaskOutput::IssueCleanupCheckpoint(u64)
-pub radiata::TaskOutput::IssueCredential(radiata::CredentialIssued)
-pub radiata::TaskOutput::Join(radiata::MergeView)
-pub radiata::TaskOutput::Leave(radiata::LeaveOutcome)
-pub radiata::TaskOutput::Listen(radiata::ListenerView)
-pub radiata::TaskOutput::PatchNodeMetadata(radiata::MemberView)
-pub radiata::TaskOutput::PurgeRevocation(())
-pub radiata::TaskOutput::PutResource(radiata::ResourceMutationView)
-pub radiata::TaskOutput::ResolveFrozenJournal(())
-pub radiata::TaskOutput::Revoke(radiata::RevokeOutcome)
-pub radiata::TaskOutput::RotateCredential(radiata::CredentialIssued)
-pub radiata::TaskOutput::StartRecovery(radiata::RecoveryView)
-pub radiata::TaskOutput::StopListener(())
-pub radiata::TaskOutput::SyncRound(())
 pub enum radiata::TaskPhase
 pub radiata::TaskPhase::Failed
 pub radiata::TaskPhase::Pending
@@ -662,6 +621,8 @@ pub fn radiata::QualifiedTag::domain(&self) -> &str
 pub fn radiata::QualifiedTag::name(&self) -> &str
 pub fn radiata::QualifiedTag::parse(&str) -> radiata::Result<Self>
 pub fn radiata::QualifiedTag::version(&self) -> core::option::Option<&str>
+impl core::convert::From<radiata::QualifiedTag> for radiata::TaskKind
+pub fn radiata::TaskKind::from(radiata::QualifiedTag) -> Self
 impl core::fmt::Debug for radiata::QualifiedTag
 pub fn radiata::QualifiedTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for radiata::QualifiedTag
@@ -938,6 +899,40 @@ pub fn radiata::TaskId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::
 impl core::str::traits::FromStr for radiata::TaskId
 pub type radiata::TaskId::Err = radiata::Error
 pub fn radiata::TaskId::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::TaskKind(_)
+impl radiata::TaskKind
+pub const radiata::TaskKind::APPLY_RECEIPT_RETENTION: Self
+pub const radiata::TaskKind::CLEANUP: Self
+pub const radiata::TaskKind::CONNECT: Self
+pub const radiata::TaskKind::DELETE_RESOURCE: Self
+pub const radiata::TaskKind::DISCONNECT: Self
+pub const radiata::TaskKind::ISSUE_CLEANUP_CHECKPOINT: Self
+pub const radiata::TaskKind::ISSUE_CREDENTIAL: Self
+pub const radiata::TaskKind::JOIN: Self
+pub const radiata::TaskKind::LEAVE: Self
+pub const radiata::TaskKind::LISTEN: Self
+pub const radiata::TaskKind::PATCH_NODE_METADATA: Self
+pub const radiata::TaskKind::PURGE_REVOCATION: Self
+pub const radiata::TaskKind::PUT_RESOURCE: Self
+pub const radiata::TaskKind::RESOLVE_FROZEN_JOURNAL: Self
+pub const radiata::TaskKind::REVOKE: Self
+pub const radiata::TaskKind::ROTATE_CREDENTIAL: Self
+pub const radiata::TaskKind::START_RECOVERY: Self
+pub const radiata::TaskKind::STOP_LISTENER: Self
+pub const radiata::TaskKind::SYNC_ROUND: Self
+pub fn radiata::TaskKind::as_str(&self) -> &str
+pub fn radiata::TaskKind::parse(&str) -> radiata::Result<Self>
+pub const fn radiata::TaskKind::tag(&self) -> &radiata::QualifiedTag
+impl core::convert::From<radiata::QualifiedTag> for radiata::TaskKind
+pub fn radiata::TaskKind::from(radiata::QualifiedTag) -> Self
+impl core::fmt::Debug for radiata::TaskKind
+pub fn radiata::TaskKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for radiata::TaskKind
+pub fn radiata::TaskKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::TaskOutput
+impl radiata::TaskOutput
+pub fn radiata::TaskOutput::bytes(&self) -> &[u8]
+pub const fn radiata::TaskOutput::kind(&self) -> &radiata::TaskKind
 pub struct radiata::TaskPage
 impl radiata::TaskPage
 pub fn radiata::TaskPage::items(&self) -> &[radiata::TaskView]

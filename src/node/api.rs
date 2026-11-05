@@ -460,7 +460,9 @@ impl Tasks {
   /// [`TaskReconciler`](crate::TaskReconciler); anything else is
   /// [`crate::ErrorKind::Unsupported`]. The admitted [`Task`] resolves
   /// with `()` on the reconciler's success — the workflow's observations
-  /// ride the handle the reconciler itself received.
+  /// ride the handle the reconciler itself received, and its optional
+  /// output bytes ride the task's
+  /// [`TaskOutput`](crate::TaskOutput) payload.
   ///
   /// Admission-time failures are the pure shape checks (a stopped node,
   /// the reserved domain, an unregistered kind); every reconciler error
@@ -475,18 +477,23 @@ impl Tasks {
       return Err(crate::Error::unsupported("task kind"));
     };
     self.require_running()?;
-    let kind = TaskKind::Extension(spec.kind().clone());
+    let kind = TaskKind::from(spec.kind().clone());
     let handle = self.handle.clone();
+    let effect_kind = kind.clone();
     let effect: TaskEffect = Arc::new(move |_deps, attempt| {
       let reconciler = Arc::clone(&reconciler);
       let handle = handle.clone();
       let spec = spec.clone();
+      let kind = effect_kind.clone();
       Box::pin(async move {
         let context =
           crate::ReconcileContext::new(handle, spec, attempt.attempt, attempt.last_error);
         match reconciler.reconcile(context).await {
           Ok(crate::ReconcileDecision::Succeeded) => {
-            Ok(EffectOutcome::new(TaskOutput::Extension(())))
+            Ok(EffectOutcome::new(TaskOutput::new(kind, Arc::from([]))))
+          }
+          Ok(crate::ReconcileDecision::SucceededWithOutput(bytes)) => {
+            Ok(EffectOutcome::new(TaskOutput::new(kind, bytes.into())))
           }
           // The explicit no-progress decision re-arms the same bounded
           // extension schedule an error rides, as the typed overload.

@@ -907,11 +907,17 @@ impl TrustPage {
   }
 }
 
-/// One admitted operation's observation: the task's identity, kind, and
-/// phase, its attempt count, and its terminal error and payload.
+/// One admitted operation's observation: the task's identity, kind tag,
+/// and phase, its attempt count, and its terminal error and payload.
+///
+/// The payload is the kind tag plus the opaque bytes the task
+/// terminalized with: a core verb's result in the crate's canonical CBOR
+/// encoding, or a caller-defined kind's own bytes. The typed form of a
+/// core result comes from [`Task::wait`](crate::Task::wait); this
+/// repeatedly readable surface carries the encoded payload.
 ///
 /// The credential kinds' payloads carry the issued generation's expiry
-/// only: the secret itself is handed to the first
+/// observation only: the secret itself is handed to the first
 /// [`Task::wait`](crate::Task::wait) caller and never enters this
 /// repeatedly readable surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -933,7 +939,8 @@ impl TaskView {
     &self.id
   }
 
-  /// The admitted kind, including caller-registered extension kinds.
+  /// The admitted kind: a core verb's [`TaskKind`](crate::TaskKind)
+  /// constant, or a caller-registered tag.
   pub const fn kind(&self) -> &crate::TaskKind {
     &self.kind
   }
@@ -970,9 +977,9 @@ impl TaskView {
     self.error
   }
 
-  /// The verb payload of a succeeded task. For the credential kinds this
-  /// is the issued generation's expiry observation only — see
-  /// [`TaskView`].
+  /// The succeeded task's output: the kind tag it was produced under and
+  /// the payload bytes. For the credential kinds the payload is the
+  /// issued generation's expiry observation only — see [`TaskView`].
   pub const fn output(&self) -> Option<&crate::TaskOutput> {
     self.output.as_ref()
   }

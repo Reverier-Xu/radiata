@@ -333,10 +333,10 @@ impl ExtensionRegistry {
 
   /// Registers one custom task kind's reconciler under the kind tag.
   /// A duplicate tag is a conflict. The built-in `radiata.woooo.tech`
-  /// domain is reserved: the core kinds are the [`crate::TaskKind`] set,
-  /// never tags, so a reconciler registered under that domain is refused
-  /// (the same reserved-domain rule the tag grammar applies to crypto
-  /// tags).
+  /// domain is reserved: the core verbs are the [`crate::TaskKind`]
+  /// constants under that domain, so a reconciler registered there is
+  /// refused (the same reserved-domain rule the tag grammar applies to
+  /// crypto tags).
   pub fn register_task_reconciler(
     &mut self, kind: crate::QualifiedTag, reconciler: Arc<dyn crate::TaskReconciler>,
   ) -> Result<&mut Self> {
@@ -727,9 +727,9 @@ mod tests {
     assert!(summary.contains("resource_hooks: 1"), "{summary}");
   }
 
-  /// Core kinds are the `TaskKind` set, never tags: the built-in domain
-  /// is reserved for task-reconciler registrations, and caller domains
-  /// register under the ordinary duplicate rule.
+  /// Core verbs are the `TaskKind` constants under the built-in domain:
+  /// that domain is reserved for task-reconciler registrations, and
+  /// caller domains register under the ordinary duplicate rule.
   #[test]
   fn task_reconciler_registration_reserves_the_builtin_domain() {
     let mut registry = ExtensionRegistry::new();
