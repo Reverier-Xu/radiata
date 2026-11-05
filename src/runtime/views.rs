@@ -19,6 +19,25 @@ use tokio::task::JoinSet;
 use super::supervisor::Supervisor;
 use crate::{Error, LocalNodeView, NodeId, Result};
 
+/// The connected-peer set of one view read: a session whose reader loop
+/// ended (`alive == false`, entry not yet removed) is not a connected
+/// peer. The exact member lookup, the member page, and the session page
+/// all read connectivity through this one filter so they cannot
+/// disagree about the same session table.
+fn connected_peers(
+  sessions: &crate::session::stream::SessionTable,
+) -> Result<std::collections::BTreeSet<NodeId>> {
+  Ok(
+    sessions
+      .lock()
+      .map_err(Error::session_table)?
+      .iter()
+      .filter(|(_, entry)| entry.alive())
+      .map(|(peer, _)| peer.clone())
+      .collect(),
+  )
+}
+
 impl Supervisor {
   /// Schedules the local descriptor's lazy publication without awaiting
   /// it: the member read views stay
@@ -36,26 +55,22 @@ impl Supervisor {
   }
 
   /// One member's public observation from the signed descriptor store and
-  /// the session table.
+  /// the session table. The removal status comes from the same memoized
+  /// departed set the member page annotates with, so the exact lookup and
+  /// the page agree.
   pub(super) async fn member(&mut self, node: NodeId) -> Result<Option<crate::MemberView>> {
     self.kick_self_descriptor();
-    let connected = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .contains_key(&node);
+    let connected = connected_peers(&self.dependencies.sessions)?.contains(&node);
     let Some(descriptor) =
       crate::membership::store::read_descriptor_ctx(self.context()?.store(), &node).await?
     else {
       return Ok(None);
     };
     let context = self.context()?;
-    let store = context.store();
-    let status = crate::membership::member_status(
-      crate::identity::cleanup::is_cleaned_ctx(store, &node).await?,
-      crate::identity::leave::is_left_ctx(store, &node).await?,
-    );
+    let status = self
+      .departed_exclusions(context.store())
+      .await?
+      .status(&node);
     let connectivity = crate::membership::member_connectivity(connected);
     Ok(Some(
       crate::membership::member_view(&descriptor, connectivity)?.with_status(status),
@@ -70,14 +85,7 @@ impl Supervisor {
     let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
     // Snapshot the connected set under the lock, then release it before
     // any await so the supervisor future stays `Send`.
-    let connected: std::collections::BTreeSet<NodeId> = self
-      .dependencies
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .keys()
-      .cloned()
-      .collect();
+    let connected = connected_peers(&self.dependencies.sessions)?;
     let namespace = crate::membership::descriptor_namespace()?;
     // The removal state comes from the terminal-record stores, collected
     // once per page: the descriptor store deliberately retains left and
@@ -169,6 +177,7 @@ impl Supervisor {
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::SessionPage> {
     let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
+    let connected = connected_peers(&self.dependencies.sessions)?;
     let entries: Vec<(Vec<u8>, crate::SessionView)> = {
       let sessions = self
         .dependencies
@@ -177,7 +186,7 @@ impl Supervisor {
         .map_err(Error::session_table)?;
       sessions
         .iter()
-        .filter(|(_, entry)| entry.alive())
+        .filter(|(peer, _)| connected.contains(*peer))
         .map(|(peer, entry)| {
           let features = entry
             .meta
@@ -366,6 +375,63 @@ impl Supervisor {
       context.identity().node().clone(),
       context.identity().public_key().clone(),
     ))
+  }
+}
+
+#[cfg(test)]
+mod connectivity_tests {
+  use std::sync::Arc;
+
+  use crate::{
+    ConnectivityStatus,
+    runtime::supervisor::test_support::{
+      install_member, member_id, reference_and_config, supervisor_over,
+    },
+  };
+
+  /// A session entry whose reader loop ended (`alive == false`, entry not
+  /// yet removed) is not a connected peer: the exact member lookup and
+  /// the member page report the same `Reachable` connectivity for it.
+  #[tokio::test]
+  async fn a_dead_session_entry_is_not_reported_connected() {
+    let (reference, config) = reference_and_config();
+    let (mut supervisor, entropy, sessions) = supervisor_over(
+      Arc::clone(&reference) as Arc<dyn crate::provider::StorageFactory>,
+      config,
+    )
+    .await;
+    let peer = member_id(7);
+    install_member(&supervisor, &reference, 7, &[9_443]).await;
+
+    // The session's reader loop ended: the entry stays in the table until
+    // its teardown removes it, but it no longer serves the connection.
+    let entry = crate::session::stream::SessionEntry::synthetic_entry(
+      entropy.as_ref(),
+      crate::Endpoint::parse("wss://127.0.0.1:9").expect("test endpoint"),
+      crate::session::stream::DialClass::Caller,
+    )
+    .expect("synthetic session entry");
+    crate::session::stream::retire(&entry);
+    assert!(!entry.alive(), "the fixture entry must be dead");
+    sessions
+      .lock()
+      .expect("session table")
+      .insert(peer.clone(), entry);
+
+    let view = supervisor
+      .member(peer.clone())
+      .await
+      .expect("member lookup")
+      .expect("the installed member has a descriptor");
+    assert_eq!(view.connectivity(), ConnectivityStatus::Reachable);
+
+    let page = supervisor.page_members(None, 8).await.expect("member page");
+    let paged = page
+      .items()
+      .iter()
+      .find(|view| view.node_id() == &peer)
+      .expect("the installed member is on the page");
+    assert_eq!(paged.connectivity(), ConnectivityStatus::Reachable);
   }
 }
 

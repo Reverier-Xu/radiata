@@ -45,11 +45,15 @@ pub struct EventSubscription<E: Event> {
 /// `try_recv`, and `poll_next` share one channel position.
 enum SubscriptionState<E: Event> {
   Idle(broadcast::Receiver<E>),
-  InFlight(crate::BoxFuture<'static, (RawReceive<E>, broadcast::Receiver<E>)>),
+  InFlight(PendingReceive<E>),
   Terminated,
 }
 
 type RawReceive<E> = std::result::Result<E, broadcast::error::RecvError>;
+
+/// One parked receive future and the receiver it hands back on
+/// resolution.
+type PendingReceive<E> = crate::BoxFuture<'static, (RawReceive<E>, broadcast::Receiver<E>)>;
 
 /// Maps one raw broadcast receive to the contract item plus the terminal
 /// flag: `Closed` is terminal (yielded once, then the stream ends).
@@ -62,24 +66,39 @@ fn map_receive<E: Event>(raw: RawReceive<E>) -> (EventReceive<E>, bool) {
 }
 
 impl<E: Event> EventSubscription<E> {
-  pub async fn recv(&mut self) -> Result<EventReceive<E>> {
-    // Check the receiver out into a pending future parked back on
-    // `self` before awaiting: a cancelled `recv` then leaves the
-    // receiver owned by the subscription (the same take-and-store-back
-    // pattern as `poll_next`) instead of dropping it with this future's
-    // frame, which would silently terminate every later receive.
-    let pending = match std::mem::replace(&mut self.state, SubscriptionState::Terminated) {
-      SubscriptionState::Terminated => return Ok(EventReceive::Closed),
+  /// Parks the receive future on the subscription and hands it out: an
+  /// idle receiver is checked out into a fresh receive future, and an
+  /// already-parked one stays where it is, so a cancelled caller leaves
+  /// the receiver owned by the subscription instead of dropping it with
+  /// the caller's frame. `None` once the subscription is terminal.
+  fn park(&mut self) -> Option<&mut PendingReceive<E>> {
+    let state = std::mem::replace(&mut self.state, SubscriptionState::Terminated);
+    self.state = match state {
+      SubscriptionState::Terminated => return None,
       SubscriptionState::Idle(mut receiver) => {
-        Box::pin(async move { (receiver.recv().await, receiver) })
+        SubscriptionState::InFlight(Box::pin(async move { (receiver.recv().await, receiver) }))
       }
-      SubscriptionState::InFlight(pending) => pending,
+      SubscriptionState::InFlight(pending) => SubscriptionState::InFlight(pending),
     };
-    self.state = SubscriptionState::InFlight(pending);
-    let SubscriptionState::InFlight(pending) = &mut self.state else {
-      unreachable!("receive future parked on the subscription")
+    match &mut self.state {
+      SubscriptionState::InFlight(pending) => Some(pending),
+      // The state was just parked as `InFlight`; a terminal subscription
+      // has no future to hand out.
+      _ => None,
+    }
+  }
+
+  pub async fn recv(&mut self) -> Result<EventReceive<E>> {
+    // The receive future is parked on `self` before awaiting, so a
+    // cancelled `recv` leaves the receiver owned by the subscription
+    // instead of dropping it with this future's frame, which would
+    // silently terminate every later receive.
+    let (raw, receiver) = {
+      let Some(pending) = self.park() else {
+        return Ok(EventReceive::Closed);
+      };
+      pending.as_mut().await
     };
-    let (raw, receiver) = pending.as_mut().await;
     let (item, terminated) = map_receive(raw);
     self.state = if terminated {
       SubscriptionState::Terminated
@@ -89,6 +108,10 @@ impl<E: Event> EventSubscription<E> {
     Ok(item)
   }
 
+  /// The non-blocking receive. `Empty` is poll-level pending: while a
+  /// `Stream` poll owns the channel position, this reports `Empty` and
+  /// leaves the parked receive (and the waker it registered) untouched,
+  /// so the stream's owner still wakes on the next event.
   pub fn try_recv(&mut self) -> Result<EventReceive<E>> {
     let state = std::mem::replace(&mut self.state, SubscriptionState::Terminated);
     match state {
@@ -109,26 +132,14 @@ impl<E: Event> EventSubscription<E> {
         };
         Ok(item)
       }
-      SubscriptionState::InFlight(mut pending) => {
-        // A pending stream poll owns the channel position: observe its
-        // current readiness without consuming the caller's waker.
-        let waker = futures_util::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        match pending.as_mut().poll(&mut context) {
-          Poll::Pending => {
-            self.state = SubscriptionState::InFlight(pending);
-            Ok(EventReceive::Empty)
-          }
-          Poll::Ready((raw, receiver)) => {
-            let (item, terminated) = map_receive(raw);
-            self.state = if terminated {
-              SubscriptionState::Terminated
-            } else {
-              SubscriptionState::Idle(receiver)
-            };
-            Ok(item)
-          }
-        }
+      SubscriptionState::InFlight(pending) => {
+        // A pending stream poll owns the channel position AND the waker
+        // it registered: polling the parked future here would re-register
+        // this call's waker and the stream's owner would never be woken.
+        // Report the poll-level empty and leave the parked future alone;
+        // the next `poll_next` (or `recv`) delivers whatever arrived.
+        self.state = SubscriptionState::InFlight(pending);
+        Ok(EventReceive::Empty)
       }
     }
   }
@@ -151,30 +162,19 @@ impl<E: Event> futures_core::Stream for EventSubscription<E> {
   type Item = EventReceive<E>;
 
   fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-    loop {
-      match &mut self.state {
-        SubscriptionState::Terminated => return Poll::Ready(None),
-        SubscriptionState::Idle(_) => {
-          let SubscriptionState::Idle(mut receiver) =
-            std::mem::replace(&mut self.state, SubscriptionState::Terminated)
-          else {
-            unreachable!("matched idle state")
-          };
-          self.state =
-            SubscriptionState::InFlight(Box::pin(async move { (receiver.recv().await, receiver) }));
-        }
-        SubscriptionState::InFlight(pending) => match pending.as_mut().poll(cx) {
-          Poll::Pending => return Poll::Pending,
-          Poll::Ready((raw, receiver)) => {
-            let (item, terminated) = map_receive(raw);
-            self.state = if terminated {
-              SubscriptionState::Terminated
-            } else {
-              SubscriptionState::Idle(receiver)
-            };
-            return Poll::Ready(Some(item));
-          }
-        },
+    let Some(pending) = self.park() else {
+      return Poll::Ready(None);
+    };
+    match pending.as_mut().poll(cx) {
+      Poll::Pending => Poll::Pending,
+      Poll::Ready((raw, receiver)) => {
+        let (item, terminated) = map_receive(raw);
+        self.state = if terminated {
+          SubscriptionState::Terminated
+        } else {
+          SubscriptionState::Idle(receiver)
+        };
+        Poll::Ready(Some(item))
       }
     }
   }
@@ -284,6 +284,11 @@ fn event_channel<E: Event>(options: EventOptions) -> (broadcast::Sender<E>, Even
 
 #[cfg(test)]
 mod tests {
+  use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  };
+
   use super::event_channel;
   use crate::{ErrorKind, Event, EventOptions, EventReceive, operation::private};
 
@@ -429,5 +434,69 @@ mod tests {
     ));
     assert!(subscription.as_mut().next().await.is_none());
     assert!(subscription.as_mut().next().await.is_none());
+  }
+
+  /// A waker that only records whether it was woken.
+  struct RecordingWaker(AtomicBool);
+
+  impl futures_util::task::ArcWake for RecordingWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+      arc_self.0.store(true, Ordering::SeqCst);
+    }
+  }
+
+  /// `try_recv` must leave the waker a pending stream poll registered in
+  /// place: polling the parked future with its own waker would replace it
+  /// and the stream's owner would never be woken again.
+  #[tokio::test]
+  async fn try_recv_leaves_the_stream_poll_waker_registered() {
+    let (sender, subscription) = event_channel::<TestEvent>(EventOptions::new());
+    tokio::pin!(subscription);
+    let recorder = Arc::new(RecordingWaker(AtomicBool::new(false)));
+    let waker = futures_util::task::waker(Arc::clone(&recorder));
+    let mut context = std::task::Context::from_waker(&waker);
+
+    assert!(
+      futures_core::Stream::poll_next(subscription.as_mut(), &mut context).is_pending(),
+      "an empty subscription parked instead of yielding an item"
+    );
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Empty
+    ));
+
+    sender.send(TestEvent(1)).unwrap();
+    assert!(
+      recorder.0.load(Ordering::SeqCst),
+      "try_recv replaced the waker the pending stream poll registered"
+    );
+    assert!(matches!(
+      futures_core::Stream::poll_next(subscription.as_mut(), &mut context),
+      std::task::Poll::Ready(Some(EventReceive::Item(TestEvent(1))))
+    ));
+  }
+
+  /// The terminal state is idempotent across every receive shape: after
+  /// the channel closes, `recv`, `try_recv`, and the stream each report
+  /// the terminal instead of panicking on the parked state.
+  #[tokio::test]
+  async fn a_closed_subscription_reports_the_terminal_from_every_receive_shape() {
+    use futures_util::StreamExt;
+
+    let (sender, mut subscription) = event_channel::<TestEvent>(EventOptions::new());
+    drop(sender);
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Closed
+    ));
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Closed
+    ));
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Closed
+    ));
+    assert!(subscription.next().await.is_none());
   }
 }
