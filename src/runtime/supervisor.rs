@@ -800,9 +800,11 @@ fn admit_packet(
   });
 }
 
-/// Spawns the outbound pump for one admitted packet: the route record already
-/// landed in the admission task (record-before-pump), so the pump only runs
-/// the request under the loop's task set. Core-internal control traffic stays
+/// Spawns the pump for one admitted packet: the route record already landed
+/// in the admission task (record-before-pump), so the pump only runs the
+/// request under the loop's task set. A remote destination rides the
+/// outbound session pump; the local node rides the local pump, which admits
+/// and consumes the stream in-process. Core-internal control traffic stays
 /// out of the durable trace store — its volume is a runtime implementation
 /// detail, not caller evidence — so the pump holds no sink for it, and the
 /// record flag carries the same exclusion to the read loop's late-failure
@@ -811,23 +813,28 @@ fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: Pump
   let local = supervisor.packet.local().clone();
   let routes = supervisor.dependencies.routes.clone();
   let events = Arc::clone(&supervisor.dependencies.events);
-  let trace = if handoff.request.internal {
-    None
-  } else {
-    Some(supervisor.trace_sink.clone())
-  };
-  tasks.spawn(async move {
-    run_outbound(
-      handoff.entry,
-      local,
-      handoff.request,
-      routes,
-      handoff.force_routed,
-      trace,
-      events,
-    )
-    .await;
-  });
+  match handoff {
+    PumpHandoff::Remote {
+      entry,
+      request,
+      force_routed,
+    } => {
+      let trace = if request.internal {
+        None
+      } else {
+        Some(supervisor.trace_sink.clone())
+      };
+      tasks.spawn(async move {
+        run_outbound(entry, local, request, routes, force_routed, trace, events).await;
+      });
+    }
+    PumpHandoff::Local { request } => {
+      let packet = Arc::clone(&supervisor.packet);
+      tasks.spawn(async move {
+        crate::session::run_local(packet, request).await;
+      });
+    }
+  }
 }
 
 /// Reaps one finished packet task (an admission or its pump) as it completes

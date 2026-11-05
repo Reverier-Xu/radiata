@@ -23,8 +23,8 @@ use tokio_tungstenite::{
   },
 };
 
-use super::framing::MergeHint;
-use crate::{Error, Result, protocol::PRELUDE_LEN};
+use super::{connection::ws_io_error, framing::MergeHint};
+use crate::{Error, ProviderErrorContext, Result, protocol::PRELUDE_LEN};
 
 /// The fixed WebSocket upgrade path.
 pub(crate) const WS_PATH: &str = "/mrly";
@@ -64,7 +64,10 @@ where
   let check = move |request: &Request, response: Response| check_path(request, response, hint);
   accept_hdr_async_with_config(stream, check, Some(config()))
     .await
-    .map_err(|_| Error::invalid_input("websocket accept"))
+    .map_err(|error| {
+      ws_io_error(&error, ProviderErrorContext::TransportAccept)
+        .unwrap_or_else(|| Error::invalid_input("websocket accept"))
+    })
 }
 
 /// Runs the client half of a WebSocket upgrade over an established TLS
@@ -78,7 +81,10 @@ where
   let request = format!("wss://{authority}{WS_PATH}");
   let (stream, response) = client_async_with_config(request, stream, Some(config()))
     .await
-    .map_err(|_| Error::invalid_input("websocket connect"))?;
+    .map_err(|error| {
+      ws_io_error(&error, ProviderErrorContext::TransportConnect)
+        .unwrap_or_else(|| Error::invalid_input("websocket connect"))
+    })?;
   Ok((stream, parse_hint(response.headers())?))
 }
 

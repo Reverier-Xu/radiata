@@ -147,7 +147,9 @@ impl Connection {
     let tls = TlsAcceptor::from(config)
       .accept(tcp)
       .await
-      .map_err(|_| Error::authentication_failed("tls accept"))?;
+      .map_err(|error| {
+        tls_handshake_error(&error, ProviderErrorContext::TransportAccept, "tls accept")
+      })?;
     tracing::debug!("tls connection accepted");
     let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
     let stream = ws::accept(TlsStream::from(tls), hint).await?;
@@ -186,7 +188,13 @@ impl Connection {
     let tls = TlsConnector::from(config)
       .connect(server_name, tcp)
       .await
-      .map_err(|_| Error::authentication_failed("tls connect"))?;
+      .map_err(|error| {
+        tls_handshake_error(
+          &error,
+          ProviderErrorContext::TransportConnect,
+          "tls connect",
+        )
+      })?;
     tracing::debug!("tls connection established");
     let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
     let (stream, merge_hint) = ws::connect(TlsStream::from(tls), &authority).await?;
@@ -626,17 +634,54 @@ fn class_channel_binding(label: &str) -> Result<[u8; CHANNEL_BINDING_LEN]> {
 
 fn receive_error(error: tokio_tungstenite::tungstenite::Error) -> Error {
   use tokio_tungstenite::tungstenite::Error as WsError;
+  if let Some(error) = ws_io_error(&error, ProviderErrorContext::TransportReceive) {
+    return error;
+  }
   match error {
-    WsError::Io(_) => Error::provider(
-      ProviderErrorKind::Io,
-      ProviderErrorContext::TransportReceive,
-    ),
     WsError::Capacity(_) => Error::provider(
       ProviderErrorKind::Overloaded,
       ProviderErrorContext::TransportReceive,
     ),
     _ => Error::invalid_input("websocket message"),
   }
+}
+
+/// The shared tungstenite IO classification: an underlying transport
+/// failure is the provider's `Io` kind under `context`, so a transient
+/// socket fault never reads as a malformed message or an authentication
+/// failure. `None` means the failure is not IO and the caller applies its
+/// own classification (a malformed message, an exhausted message bound, or
+/// a rejected upgrade).
+pub(crate) fn ws_io_error(
+  error: &tokio_tungstenite::tungstenite::Error, context: ProviderErrorContext,
+) -> Option<Error> {
+  match error {
+    tokio_tungstenite::tungstenite::Error::Io(_) => {
+      Some(Error::provider(ProviderErrorKind::Io, context))
+    }
+    _ => None,
+  }
+}
+
+/// Classifies one TLS handshake failure: a transport IO failure — the
+/// socket died, or rustls surfaced its own IO error — is the provider's
+/// `Io` kind under `context`, while every verification or protocol failure
+/// stays the typed authentication failure named by `auth_context`.
+///
+/// rustls 0.23 reports socket failures as plain `io::Error`s and wraps only
+/// its own protocol/verification errors (`InvalidData`), so "no wrapped
+/// rustls error" is exactly the transport-IO case; a wrapped rustls error
+/// is never a transient socket fault.
+pub(crate) fn tls_handshake_error(
+  error: &std::io::Error, context: ProviderErrorContext, auth_context: &'static str,
+) -> Error {
+  if error
+    .get_ref()
+    .is_some_and(|source| source.is::<rustls::Error>())
+  {
+    return Error::authentication_failed(auth_context);
+  }
+  Error::provider(ProviderErrorKind::Io, context)
 }
 
 #[cfg(test)]

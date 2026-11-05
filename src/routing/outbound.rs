@@ -45,6 +45,7 @@ use crate::{
     wire::{self, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
+  routing::trace::{TraceSink, TraceTransition},
   session::stream::{SessionEntry, SessionFrame, clock_seconds},
 };
 
@@ -182,18 +183,14 @@ pub(crate) async fn run_outbound(
   // progress stays an in-memory observation.
   macro_rules! terminal {
     ($kind:expr) => {{
-      update_route(&routes, &trace_id, |record| {
-        record.update(RouteState::Failed($kind));
-      });
-      events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-        trace_id.clone(),
-      )));
-      record_terminal_trace(
+      record_route_terminal(
+        &routes,
+        &events,
         &trace,
         &trace_id,
         &source,
         &destination,
-        crate::routing::trace::TraceTransition::Failed($kind),
+        TraceTransition::Failed($kind),
       );
     }};
   }
@@ -337,30 +334,54 @@ pub(crate) async fn run_outbound(
   // keeping a contradicted `Delivered` for the whole retention window. A
   // poisoned table lock keeps the legacy behavior (emit plus persist)
   // rather than guessing.
-  update_route(&routes, &trace_id, |record| {
-    record.update(RouteState::Delivered);
-  });
-  let refused = routes
-    .lock()
-    .map(|table| {
-      table
-        .get(&trace_id)
-        .is_some_and(|record| matches!(record.state, RouteState::Failed(_)))
-    })
-    .unwrap_or(false);
-  if !refused {
-    events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-      trace_id.clone(),
-    )));
-    record_terminal_trace(
-      &trace,
-      &trace_id,
-      &source,
-      &destination,
-      crate::routing::trace::TraceTransition::Delivered,
-    );
-  }
+  record_route_terminal(
+    &routes,
+    &events,
+    &trace,
+    &trace_id,
+    &source,
+    &destination,
+    TraceTransition::Delivered,
+  );
   debug!(trace_id = %trace_id, "packet stream finished");
+}
+
+/// Records one terminal route fact for an origin-side pump: the in-memory
+/// record, the change event, and the durable trace twin. A recorded
+/// `Failed` is final and refuses a later `Delivered`, and a refused
+/// `Delivered` skips the event and the durable twin so the record keeps
+/// the failure's answer. The remote pump and the local self-delivery pump
+/// share this body, so their terminal paths cannot drift.
+pub(crate) fn record_route_terminal(
+  routes: &RouteTable, events: &crate::node::EventHub, trace: &Option<TraceSink>,
+  trace_id: &TraceId, source: &NodeId, destination: &NodeId, transition: TraceTransition,
+) {
+  let state = match transition {
+    TraceTransition::Delivered => RouteState::Delivered,
+    TraceTransition::Failed(kind) => RouteState::Failed(kind),
+    #[cfg(test)]
+    TraceTransition::Streaming => RouteState::Streaming,
+  };
+  update_route(routes, trace_id, |record| {
+    record.update(state);
+  });
+  if matches!(transition, TraceTransition::Delivered) {
+    let refused = routes
+      .lock()
+      .map(|table| {
+        table
+          .get(trace_id)
+          .is_some_and(|record| matches!(record.state, RouteState::Failed(_)))
+      })
+      .unwrap_or(false);
+    if refused {
+      return;
+    }
+  }
+  events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+    trace_id.clone(),
+  )));
+  record_terminal_trace(trace, trace_id, source, destination, transition);
 }
 
 /// Fire-and-forget persistence of one durable terminal fact per packet:

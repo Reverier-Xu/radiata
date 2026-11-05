@@ -4,6 +4,9 @@
 //! in strict sequence into the admitted stream's bounded body channel;
 //! ends terminate streams; acks resolve pending outbound admissions
 //! (the origin-side counterpart lives in `crate::routing::outbound`).
+//! The same admission body serves local self-delivery: a packet addressed
+//! to this node is admitted and consumed in-process, with no session and
+//! no route envelope.
 
 use std::{
   collections::HashMap,
@@ -21,13 +24,16 @@ use super::{
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, Result, StreamMetadata, TraceId,
   packet::{
-    IncomingStream, PacketReplyContext, RouteState, StreamItem, channel_body,
+    IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext, RouteState, RoutedAck,
+    StreamItem, channel_body,
     wire::{self, AckFrame, AckStatus, ChunkFrame, OpenFrame},
   },
   protocol::wire::PacketKind,
   routing::{
     forward::{self, PendingAck, PendingAcks, SessionIdentity},
+    outbound::record_route_terminal,
     table::{record_terminal_failure, update_route},
+    trace::TraceTransition,
   },
   transport::connection::ConnectionReader,
 };
@@ -457,6 +463,14 @@ async fn read_loop_frames(
   // orderly exit and on every cancellation path alike.
 }
 
+/// The admission decision one open resolves to: the wire status and the
+/// admission wall-clock time reported for it (the original admission time
+/// for an identical retransmission).
+struct StreamAdmission {
+  status: AckStatus,
+  admitted_at_millis: u64,
+}
+
 /// Validates one open frame against the authenticated session and the
 /// local registry, admits it into the bounded incoming stream table, and
 /// acknowledges current-process admission (or the typed rejection).
@@ -474,27 +488,73 @@ async fn admit_open(
   let trace_id = open.trace_id.clone();
   let ack_protocol = open.protocol.clone();
   let local = context.local().clone();
+  // The routing envelope re-validates against the session-authenticated
+  // holder before anything else (the chain itself then authenticates the
+  // original source; a direct frame authenticates only through the exact
+  // source-peer match). Forwarding work belongs to the route forwarder;
+  // this admission boundary never branches a body, so any frame that does
+  // not arrive exactly here fails closed without a consumer.
+  let admission = if matches!(
+    crate::routing::receive_open_envelope(
+      trace_id.clone(),
+      open.source.clone(),
+      open.destination.clone(),
+      open.route.clone(),
+      &local,
+      grant.peer(),
+    ),
+    Ok(crate::routing::RouteProgress::Arrive)
+  ) {
+    admit_stream(
+      open,
+      |feature| grant.selected_features().contains(feature),
+      context,
+      incoming,
+      consumers,
+    )
+    .await
+  } else {
+    StreamAdmission {
+      status: AckStatus::Unsupported,
+      admitted_at_millis: clock_millis(context.clock.as_ref()),
+    }
+  };
+  let ack = AckFrame {
+    trace_id: trace_id.clone(),
+    status: admission.status,
+    admitted_at_millis: admission.admitted_at_millis,
+  };
+  debug!(
+    trace_id = %ack.trace_id,
+    protocol = %ack_protocol,
+    ?ack.status,
+    "packet admission outcome"
+  );
+  let body = wire::encode_ack(&ack)?;
+  frames
+    .send(SessionFrame {
+      kind: PacketKind::Ack,
+      body,
+    })
+    .await
+    .map_err(|_| Error::stream_interrupted("packet session"))
+}
+
+/// The one admission body shared by the inbound open path and local
+/// self-delivery: the immutable opening context's duplicate handling, the
+/// protocol registration and owning-feature gate, the bounded incoming
+/// stream table, the consumer lifecycle permit, and the consumer spawn.
+/// `owns_feature` is the caller's gate — the negotiated session selection
+/// for an inbound open, the node's own implemented features for a local
+/// stream — so the two admission paths cannot drift.
+async fn admit_stream(
+  open: OpenFrame, owns_feature: impl Fn(&crate::FeatureTag) -> bool,
+  context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
+  consumers: &mut JoinSet<()>,
+) -> StreamAdmission {
+  let trace_id = open.trace_id.clone();
   let mut reack_admitted_at: Option<u64> = None;
   let status = 'status: {
-    // The routing envelope re-validates against the session-authenticated
-    // holder before anything else (the chain itself then authenticates the
-    // original source; a direct frame authenticates only through the exact
-    // source-peer match). Forwarding work belongs to the route forwarder;
-    // this admission boundary never branches a body, so any frame that
-    // does not arrive exactly here fails closed without a consumer.
-    if !matches!(
-      crate::routing::receive_open_envelope(
-        trace_id.clone(),
-        open.source.clone(),
-        open.destination.clone(),
-        open.route.clone(),
-        &local,
-        grant.peer(),
-      ),
-      Ok(crate::routing::RouteProgress::Arrive)
-    ) {
-      break 'status AckStatus::Unsupported;
-    }
     // The immutable opening context decides duplicate handling: an
     // identical retransmission reports the current admission status
     // without invoking the consumer twice; a conflicting one fails closed.
@@ -516,11 +576,7 @@ async fn admit_open(
       None => {}
     }
     match context.registry.protocol(&open.protocol) {
-      Some(registration)
-        if grant
-          .selected_features()
-          .contains(registration.definition.owning_feature()) =>
-      {
+      Some(registration) if owns_feature(registration.definition.owning_feature()) => {
         // Saturation prioritises conflicts over genuinely new streams:
         // identical duplicates were already answered above, conflicting
         // ones failed closed above, and only a new stream receives the
@@ -607,25 +663,153 @@ async fn admit_open(
       }
     }
   };
-  let ack = AckFrame {
-    trace_id: trace_id.clone(),
+  StreamAdmission {
     status,
     admitted_at_millis: reack_admitted_at.unwrap_or_else(|| clock_millis(context.clock.as_ref())),
+  }
+}
+
+/// Delivers one locally addressed packet: the node is both the source and
+/// the destination, so the stream is admitted through the same admission
+/// body an inbound open uses and consumed in-process — no session, no first
+/// hop, and no route envelope.
+///
+/// The route record already landed in the admission task
+/// (record-before-pump), so this pump only streams the body into the
+/// admitted consumer and records the terminal fact. The synchronous
+/// sender's waiter resolves with the local admission time before any body
+/// byte moves, exactly like a remote destination's acknowledgement.
+pub(crate) async fn run_local(context: Arc<SessionPacketContext>, request: OutboundRequest) {
+  let trace_id = request.trace_id.clone();
+  let local = context.local().clone();
+  let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
+  let mut consumers = ConsumerDrainGuard {
+    consumers: JoinSet::new(),
+    drains: Arc::clone(&context.task_drains),
   };
-  debug!(
-    trace_id = %ack.trace_id,
-    protocol = %ack_protocol,
-    ?ack.status,
-    "packet admission outcome"
+  let open = OpenFrame {
+    trace_id: trace_id.clone(),
+    source: local.clone(),
+    destination: local.clone(),
+    protocol: request.protocol.clone(),
+    metadata: request.metadata.clone(),
+    route: None,
+  };
+  // The local node implements every feature its registry holds — the node
+  // offer supports exactly that set — so the owning-feature gate is the
+  // registry lookup, the same gate the negotiated session selection applies
+  // to an inbound open.
+  let admission = admit_stream(
+    open,
+    |feature| context.registry.feature_digest(feature).is_some(),
+    &context,
+    &mut incoming,
+    &mut consumers.consumers,
+  )
+  .await;
+  let trace = if request.internal {
+    None
+  } else {
+    context.trace_sink().cloned()
+  };
+  if let Some(kind) = admission.status.to_kind() {
+    request.reject(kind);
+    record_route_terminal(
+      &context.routes,
+      &context.events,
+      &trace,
+      &trace_id,
+      &local,
+      &local,
+      TraceTransition::Failed(kind),
+    );
+    return;
+  }
+  let _ = request.ack_notify.send(Ok(RoutedAck {
+    by: local.clone(),
+    admitted_at: crate::time::from_millis(admission.admitted_at_millis),
+  }));
+  update_route(&context.routes, &trace_id, |record| {
+    record.update(RouteState::Streaming);
+  });
+  context
+    .events
+    .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+      trace_id.clone(),
+    )));
+  let Some(admitted) = incoming.get_mut(&trace_id) else {
+    // The admission body admitted the stream, so its table entry exists; a
+    // missing one is an internal invariant break, reported as the typed
+    // interruption instead of a silent success.
+    record_route_terminal(
+      &context.routes,
+      &context.events,
+      &trace,
+      &trace_id,
+      &local,
+      &local,
+      TraceTransition::Failed(ErrorKind::Internal),
+    );
+    return;
+  };
+  let mut failure = None;
+  let mut body = request.body;
+  loop {
+    match std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+      Some(Ok(bytes)) => {
+        // Re-chunk at the wire bound so a consumer sees the same chunk
+        // boundaries whether the stream arrived locally or over a session.
+        for slice in bytes.chunks(MAX_CHUNK_BYTES) {
+          // This pump feeds one stream, so the consumer's window is plain
+          // backpressure: the session reader's bounded overload policy
+          // exists to keep a shared connection responsive, which does not
+          // apply here. A closed channel means the consumer is gone.
+          if admitted
+            .stream
+            .send(StreamItem::Chunk(Arc::from(slice)))
+            .await
+            .is_err()
+          {
+            failure = Some(ErrorKind::StreamInterrupted);
+            break;
+          }
+          update_route(&context.routes, &trace_id, |record| {
+            record.forward(slice.len() as u64);
+          });
+        }
+        if failure.is_some() {
+          break;
+        }
+      }
+      Some(Err(error)) => {
+        failure = Some(error.kind());
+        break;
+      }
+      None => break,
+    }
+  }
+  let transition = match failure {
+    Some(kind) => {
+      // The consumer observes exactly one typed interruption, and the
+      // origin's terminal answer is the body's own failure.
+      let _ = admitted.stream.try_send(StreamItem::Interrupted);
+      TraceTransition::Failed(kind)
+    }
+    None => {
+      let _ = admitted.stream.try_send(StreamItem::End);
+      TraceTransition::Delivered
+    }
+  };
+  record_route_terminal(
+    &context.routes,
+    &context.events,
+    &trace,
+    &trace_id,
+    &local,
+    &local,
+    transition,
   );
-  let body = wire::encode_ack(&ack)?;
-  frames
-    .send(SessionFrame {
-      kind: PacketKind::Ack,
-      body,
-    })
-    .await
-    .map_err(|_| Error::stream_interrupted("packet session"))
+  debug!(trace_id = %trace_id, "local packet stream finished");
 }
 
 /// Forwards one chunk to its admitted stream in strict sequence order.

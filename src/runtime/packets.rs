@@ -1,7 +1,10 @@
 //! The outbound packet plane: the admission state that resolves one
 //! request's destination and first hop, records the route, and records
 //! bounded terminal route failures so asynchronous senders can observe
-//! them — all off the supervisor's control loop.
+//! them — all off the supervisor's control loop. A request whose resolved
+//! destination is the local node short-circuits to local delivery: the
+//! node admits it through the same body an inbound open uses and consumes
+//! it in-process, with no session and no first hop.
 
 use std::sync::Arc;
 
@@ -22,10 +25,18 @@ use crate::{
 /// pump itself. The route record already landed when the handoff exists,
 /// which is what preserves record-before-pump ordering across the
 /// handoff.
-pub(super) struct PumpHandoff {
-  pub(super) entry: SessionEntry,
-  pub(super) request: OutboundRequest,
-  pub(super) force_routed: bool,
+pub(super) enum PumpHandoff {
+  /// A remote destination: the loop spawns the outbound pump over the
+  /// resolved first-hop session.
+  Remote {
+    entry: SessionEntry,
+    request: OutboundRequest,
+    force_routed: bool,
+  },
+  /// The local node is the destination: the loop spawns the local pump,
+  /// which admits and consumes the stream in-process — no session, no
+  /// first hop, and no route envelope.
+  Local { request: OutboundRequest },
 }
 
 /// The admission plane's collaborators, cloned off the supervisor so one
@@ -116,6 +127,14 @@ impl PacketAdmission {
       .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
         trace_id.clone(),
       )));
+    // The local node is both endpoints: the stream is admitted through the
+    // same body an inbound open uses and consumed in-process, so no session
+    // lookup, first-hop selection, or route envelope applies. A local
+    // target therefore works on an isolated node with no sessions at all.
+    if destination == self.local {
+      debug!(destination = %destination, "routing packet to the local node");
+      return Ok(Some(PumpHandoff::Local { request }));
+    }
     let fail = |request: OutboundRequest, kind: ErrorKind| {
       self.record_route_failure(&trace_id, kind);
       request.reject(kind);
@@ -159,7 +178,7 @@ impl PacketAdmission {
         }
       },
     };
-    Ok(Some(PumpHandoff {
+    Ok(Some(PumpHandoff::Remote {
       entry,
       request,
       force_routed,
@@ -171,8 +190,11 @@ impl PacketAdmission {
   /// failure and the awaiting sender observes the same kind instead of a
   /// dangling admission decision.
   pub(super) fn reject_shutdown(&self, handoff: PumpHandoff) {
-    self.record_route_failure(&handoff.request.trace_id, ErrorKind::ShuttingDown);
-    handoff.request.reject(ErrorKind::ShuttingDown);
+    let request = match handoff {
+      PumpHandoff::Remote { request, .. } | PumpHandoff::Local { request } => request,
+    };
+    self.record_route_failure(&request.trace_id, ErrorKind::ShuttingDown);
+    request.reject(ErrorKind::ShuttingDown);
   }
 
   /// Records one bounded terminal route failure for an outbound trace so

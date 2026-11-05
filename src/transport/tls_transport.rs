@@ -20,14 +20,14 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::{
-  connection::{Connection, FrameRules, exporter_channel_binding},
+  connection::{Connection, FrameRules, exporter_channel_binding, tls_handshake_error},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
   registry::{Transport, TransportListener, TransportTrust},
   tcp, tls,
 };
 use crate::{
-  Error, ProviderErrorContext, Result,
+  ProviderErrorContext, Result,
   api::{BoxFuture, SystemEntropy},
   protocol::wire::connection_frame_rules,
 };
@@ -84,7 +84,13 @@ impl Transport for TlsTransport {
       let tls_stream = tokio_rustls::TlsConnector::from(config)
         .connect(server_name, tcp)
         .await
-        .map_err(|_| Error::authentication_failed("tls connect"))?;
+        .map_err(|error| {
+          tls_handshake_error(
+            &error,
+            ProviderErrorContext::TransportConnect,
+            "tls connect",
+          )
+        })?;
       let channel_binding = exporter_channel_binding(tls_stream.get_ref().1)?;
       let rules = connection_frame_rules()?;
       let (read, write) = tokio::io::split(tls_stream);
@@ -139,11 +145,9 @@ impl TransportListener for TlsListener {
       // WebSocket class: the served generation is always the issuer's
       // current one.
       let hint = hint();
-      let tls_stream = self
-        .acceptor
-        .accept(tcp)
-        .await
-        .map_err(|_| Error::authentication_failed("tls accept"))?;
+      let tls_stream = self.acceptor.accept(tcp).await.map_err(|error| {
+        tls_handshake_error(&error, ProviderErrorContext::TransportAccept, "tls accept")
+      })?;
       let peer_addr = tls_stream.get_ref().0.peer_addr().ok();
       let channel_binding = exporter_channel_binding(tls_stream.get_ref().1)?;
       let (read, write) = tokio::io::split(tls_stream);
