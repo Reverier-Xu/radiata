@@ -1,8 +1,38 @@
-pub use crate::storage::receipt::ReceiptRetentionReport;
 use crate::{
   Endpoint, Error, ErrorKind, NodeId, PublicKey, QualifiedTag, Result,
   identity::{ListenerId, SessionId},
 };
+
+/// The outcome of one receipt-retention pass: how many anchored receipts
+/// the pass forgot and whether it stopped at one of its internal bounds
+/// with eligible receipts left.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiptRetentionReport {
+  forgotten: u64,
+  remaining: bool,
+}
+
+impl ReceiptRetentionReport {
+  /// Anchored receipts whose retention deadline had elapsed and whose
+  /// forget transaction committed.
+  pub const fn forgotten(&self) -> u64 {
+    self.forgotten
+  }
+
+  /// The pass stopped at one of its internal bounds with anchored
+  /// receipts or retention candidates left; issue the command again to
+  /// continue.
+  pub const fn remaining(&self) -> bool {
+    self.remaining
+  }
+
+  pub(crate) const fn new(forgotten: u64, remaining: bool) -> Self {
+    Self {
+      forgotten,
+      remaining,
+    }
+  }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -370,6 +400,7 @@ pub struct MemberView {
 /// verification evidence, so the status — not the page membership — is the
 /// authoritative liveness signal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum MemberStatus {
   /// No terminal removal record exists for the node.
   Active,

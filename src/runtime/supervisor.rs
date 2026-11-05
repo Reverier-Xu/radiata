@@ -1598,8 +1598,8 @@ mod receipt_retention_sweep_tests {
       .apply_receipt_retention()
       .await
       .unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
 
     // Anchor one committed receipt and let its deadline elapse.
     let receipt = commit_one(&supervisor, entropy.as_ref(), b"first").await;
@@ -1625,8 +1625,8 @@ mod receipt_retention_sweep_tests {
       .apply_receipt_retention()
       .await
       .unwrap();
-    assert_eq!(report.forgotten, 1);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 1);
+    assert!(!report.remaining());
     // A forgotten receipt never grows a second anchor.
     assert!(
       !anchor_receipt(
@@ -1671,8 +1671,8 @@ mod receipt_retention_sweep_tests {
       .apply_receipt_retention()
       .await
       .unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
   }
 
   /// The retention tick holds the same quietness contract as the

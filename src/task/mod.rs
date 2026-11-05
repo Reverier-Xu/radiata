@@ -712,15 +712,20 @@ impl<T: TaskResult> Task<T> {
   }
 
   /// The current status snapshot, read locally from the shared table
-  /// without a runtime round trip. An id outside the live table and the
-  /// bounded terminal history (evicted long after terminalizing) reads
-  /// as a fresh admission snapshot; the typed wait surfaces eviction as
-  /// a typed not-found instead.
-  pub fn status(&self) -> TaskStatus {
-    self.observer.table.status(&self.id).map_or_else(
-      || TaskStatus::new(TaskPhase::Pending, 0, None),
-      |(_, status)| status,
-    )
+  /// without a runtime round trip.
+  ///
+  /// `None` means the id left the live table and the bounded terminal
+  /// history: the task was evicted long after it terminalized, so the
+  /// runtime no longer observes it. An evicted task has no status at all —
+  /// it is never reported as a fresh `Pending` admission — and the typed
+  /// surfaces ([`crate::Tasks::get`], [`crate::Tasks::wait`]) report the
+  /// same absence as `None` and a typed not-found error.
+  pub fn status(&self) -> Option<TaskStatus> {
+    self
+      .observer
+      .table
+      .status(&self.id)
+      .map(|(_, status)| status)
   }
 
   /// Resolves when the task reaches a terminal phase: `Ok(T)` on
@@ -1141,10 +1146,43 @@ pub enum ReconcileDecision {
 /// sessions, no supervisor internals).
 #[derive(Clone)]
 pub struct ReconcileContext {
-  pub handle: crate::NodeHandle,
-  pub spec: CustomTaskSpec,
-  pub attempt: u32,
-  pub last_error: Option<TaskError>,
+  handle: crate::NodeHandle,
+  spec: CustomTaskSpec,
+  attempt: u32,
+  last_error: Option<TaskError>,
+}
+
+impl ReconcileContext {
+  /// The ordinary public node surface this attempt reconciles through.
+  pub const fn handle(&self) -> &crate::NodeHandle {
+    &self.handle
+  }
+
+  /// The caller's submission this attempt belongs to.
+  pub const fn spec(&self) -> &CustomTaskSpec {
+    &self.spec
+  }
+
+  /// The 1-based reconcile attempt number of this context.
+  pub const fn attempt(&self) -> u32 {
+    self.attempt
+  }
+
+  /// The typed error of the previous attempt, once one failed.
+  pub const fn last_error(&self) -> Option<TaskError> {
+    self.last_error
+  }
+
+  pub(crate) const fn new(
+    handle: crate::NodeHandle, spec: CustomTaskSpec, attempt: u32, last_error: Option<TaskError>,
+  ) -> Self {
+    Self {
+      handle,
+      spec,
+      attempt,
+      last_error,
+    }
+  }
 }
 
 impl std::fmt::Debug for ReconcileContext {

@@ -87,7 +87,7 @@ pub radiata::KeyCreateState::Unknown
 pub radiata::KeyDeleteState::Absent
 pub radiata::KeyDeleteState::Present
 pub radiata::KeyDeleteState::Unknown
-pub enum radiata::MemberStatus
+#[non_exhaustive] pub enum radiata::MemberStatus
 pub radiata::MemberStatus::Active
 pub radiata::MemberStatus::Cleaned
 pub radiata::MemberStatus::Left
@@ -611,6 +611,9 @@ pub const radiata::ObservabilitySnapshot::TRACE_RECORDS_DROPPED: &str
 pub fn radiata::ObservabilitySnapshot::captured_at(&self) -> std::time::SystemTime
 pub fn radiata::ObservabilitySnapshot::counter(&self, &radiata::QualifiedTag) -> core::option::Option<u64>
 pub struct radiata::OperationId(_)
+impl radiata::OperationId
+pub const fn radiata::OperationId::as_bytes(&self) -> &[u8; 16]
+pub const fn radiata::OperationId::from_bytes([u8; 16]) -> Self
 impl core::fmt::Debug for radiata::OperationId
 pub fn radiata::OperationId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::OutboundStream
@@ -666,13 +669,15 @@ impl core::str::traits::FromStr for radiata::QualifiedTag
 pub type radiata::QualifiedTag::Err = radiata::Error
 pub fn radiata::QualifiedTag::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::ReceiptRetentionReport
-pub radiata::ReceiptRetentionReport::forgotten: u64
-pub radiata::ReceiptRetentionReport::remaining: bool
+impl radiata::ReceiptRetentionReport
+pub const fn radiata::ReceiptRetentionReport::forgotten(&self) -> u64
+pub const fn radiata::ReceiptRetentionReport::remaining(&self) -> bool
 pub struct radiata::ReconcileContext
-pub radiata::ReconcileContext::attempt: u32
-pub radiata::ReconcileContext::handle: radiata::NodeHandle
-pub radiata::ReconcileContext::last_error: core::option::Option<radiata::TaskError>
-pub radiata::ReconcileContext::spec: radiata::CustomTaskSpec
+impl radiata::ReconcileContext
+pub const fn radiata::ReconcileContext::attempt(&self) -> u32
+pub const fn radiata::ReconcileContext::handle(&self) -> &radiata::NodeHandle
+pub const fn radiata::ReconcileContext::last_error(&self) -> core::option::Option<radiata::TaskError>
+pub const fn radiata::ReconcileContext::spec(&self) -> &radiata::CustomTaskSpec
 impl core::fmt::Debug for radiata::ReconcileContext
 pub fn radiata::ReconcileContext::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::RecoveryChanged
@@ -909,7 +914,7 @@ pub struct radiata::Task<T>
 impl<T: TaskResult> radiata::Task<T>
 pub fn radiata::Task<T>::id(&self) -> &radiata::TaskId
 pub fn radiata::Task<T>::kind(&self) -> &radiata::TaskKind
-pub fn radiata::Task<T>::status(&self) -> radiata::TaskStatus
+pub fn radiata::Task<T>::status(&self) -> core::option::Option<radiata::TaskStatus>
 pub async fn radiata::Task<T>::wait(self) -> radiata::Result<T>
 pub struct radiata::TaskChanged
 impl radiata::TaskChanged

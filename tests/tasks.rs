@@ -78,7 +78,7 @@ impl TaskReconciler for ProbeReconciler {
         .contexts
         .lock()
         .unwrap()
-        .push((ctx.attempt, ctx.last_error.map(|error| error.kind())));
+        .push((ctx.attempt(), ctx.last_error().map(|error| error.kind())));
       match step {
         // The extension schedule retries every error kind, so one
         // public constructor exercises the whole ladder.
@@ -201,7 +201,7 @@ async fn lifecycle_phases_and_value_based_waits() {
   assert!(view.finished().is_none());
   assert!(view.error().is_none());
   assert!(view.output().is_none());
-  let status = task.status();
+  let status = task.status().expect("live task status");
   assert_eq!(status.phase(), TaskPhase::Running);
   assert_eq!(status.attempts(), 1);
 
@@ -220,7 +220,10 @@ async fn lifecycle_phases_and_value_based_waits() {
   clone.wait().await.unwrap();
   // The handle's local snapshot stays readable after the wait consumed
   // it: the phase and attempts are table state, not wait state.
-  assert_eq!(task.status().phase(), TaskPhase::Succeeded);
+  assert_eq!(
+    task.status().expect("live task status").phase(),
+    TaskPhase::Succeeded
+  );
 
   // Unknown ids: `get` distinguishes absence, `wait` is typed not-found.
   let unknown = radiata::TaskId::parse("task-00000000000000000009z").unwrap();
@@ -412,9 +415,9 @@ async fn terminal_history_eviction_shapes_get_wait_and_status() {
   );
   let evicted = node.tasks().wait(first.id().clone()).await.unwrap_err();
   assert_eq!(evicted.kind(), ErrorKind::NotFound);
-  let status = first.status();
-  assert_eq!(status.phase(), TaskPhase::Pending);
-  assert_eq!(status.attempts(), 0);
+  // Eviction is absence, not a fabricated fresh admission: the handle's
+  // local status reads `None` exactly like `tasks().get`.
+  assert!(first.status().is_none());
   let view = node.tasks().get(last.id().clone()).await.unwrap().unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
   node.shutdown().await.unwrap();

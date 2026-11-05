@@ -11,7 +11,7 @@ pub(crate) use crate::storage::families::INTERNAL_NAMESPACE;
 use crate::{
   CommitOutcome, CommitReceipt, Digest, Error, ProviderErrorContext, StoreExpectation, StoreKey,
   StoreNamespace, StoreOperation, StoreRevision, StoreTransaction, StoreValue, TransactionId,
-  provider::StoreSnapshot,
+  provider::StoreSnapshot, view::ReceiptRetentionReport,
 };
 const USED_ID_TAG: &[u8] = b"\x01used-id\0";
 pub(crate) const ACTIVE_MARKER_VALUE: &[u8] = b"";
@@ -115,18 +115,6 @@ impl RetentionScanCursor {
   }
 }
 
-/// The outcome of one retention sweep; the public report lives in the
-/// view module.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReceiptRetentionReport {
-  /// Anchored receipts whose retention deadline had elapsed and whose
-  /// forget transaction committed.
-  pub forgotten: u64,
-  /// The pass stopped at one of its internal bounds with anchored
-  /// receipts or retention candidates left; issue the command again to
-  /// continue.
-  pub remaining: bool,
-}
 const REFERENCE_TOKEN_WIDTH: usize = 32;
 const WALL_TIME_WIDTH: usize = 13;
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
@@ -595,10 +583,10 @@ impl MetadataStore {
     for candidate in &candidates {
       self.drive_retention_candidate(candidate).await?;
     }
-    Ok(ReceiptRetentionReport {
+    Ok(ReceiptRetentionReport::new(
       forgotten,
-      remaining: anchors_remaining || candidates_remaining,
-    })
+      anchors_remaining || candidates_remaining,
+    ))
   }
 
   /// Collects the anchored receipts whose retention deadline elapsed,
@@ -1770,19 +1758,20 @@ mod receipt_retention_tests {
     clock.set(UNIX_EPOCH + Duration::from_secs(200));
 
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, RETENTION_SWEEP_BOUND as u64);
-    assert!(report.remaining, "the first pass stopped at the bound");
+    assert_eq!(report.forgotten(), RETENTION_SWEEP_BOUND as u64);
+    assert!(report.remaining(), "the first pass stopped at the bound");
 
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(
-      report.forgotten, 1,
+      report.forgotten(),
+      1,
       "the next pass reaches the leftover anchor"
     );
-    assert!(!report.remaining, "the anchored population is drained");
+    assert!(!report.remaining(), "the anchored population is drained");
 
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining, "a drained population stays drained");
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining(), "a drained population stays drained");
   }
 
   /// The exact interleaving the bound guard must survive: the bound is
@@ -1804,25 +1793,26 @@ mod receipt_retention_tests {
 
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(
-      report.forgotten, RETENTION_SWEEP_BOUND as u64,
+      report.forgotten(),
+      RETENTION_SWEEP_BOUND as u64,
       "the collected due targets must reach the cleanup loop"
     );
     assert!(
-      report.remaining,
+      report.remaining(),
       "the scan stopped at the bound on the fresh anchor"
     );
 
     // The one remaining anchor is not due yet, so the follow-up pass
     // settles without progress and the sweep is not livelocked.
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
 
     // Once its deadline passes, the leftover anchor forgets too.
     clock.set(UNIX_EPOCH + Duration::from_secs(200));
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 1);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 1);
+    assert!(!report.remaining());
   }
 
   /// The anti-starvation property of the rotating scan: a retained
@@ -1849,9 +1839,9 @@ mod receipt_retention_tests {
     // The first pass examines exactly the retained prefix, stops at
     // the bound without scanning further, and forgets nothing.
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
+    assert_eq!(report.forgotten(), 0);
     assert!(
-      report.remaining,
+      report.remaining(),
       "the scan stopped inside the retained prefix"
     );
 
@@ -1859,10 +1849,11 @@ mod receipt_retention_tests {
     // anchor behind it instead of rescanning the same prefix forever.
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(
-      report.forgotten, 1,
+      report.forgotten(),
+      1,
       "the rotation must reach the due anchor"
     );
-    assert!(!report.remaining, "the scan ran past the last anchor");
+    assert!(!report.remaining(), "the scan ran past the last anchor");
 
     // Once the prefix itself becomes due, the wrapped cursor drains it
     // across bounded passes exactly like a fresh population: the pass
@@ -1870,14 +1861,14 @@ mod receipt_retention_tests {
     // natural end without stopping at the bound.
     clock.set(UNIX_EPOCH + Duration::from_secs(300));
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, RETENTION_SWEEP_BOUND as u64);
+    assert_eq!(report.forgotten(), RETENTION_SWEEP_BOUND as u64);
     assert!(
-      !report.remaining,
+      !report.remaining(),
       "a bound-sized remainder drains fully in one pass"
     );
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining, "the population is fully drained");
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining(), "the population is fully drained");
   }
 
   /// Regression: one anchor whose retention deadline overflows the clock
@@ -1925,10 +1916,11 @@ mod receipt_retention_tests {
 
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(
-      report.forgotten, 1,
+      report.forgotten(),
+      1,
       "the good anchor behind the bad one is collected"
     );
-    assert!(!report.remaining, "the scan ran to its natural end");
+    assert!(!report.remaining(), "the scan ran to its natural end");
 
     // The bad entry is skipped, never deleted or mistaken for a fault.
     let snapshot = store.snapshot().await.unwrap();
@@ -1944,9 +1936,9 @@ mod receipt_retention_tests {
     // pass below is the real progress evidence: it must complete instead
     // of failing at the same position.
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
+    assert_eq!(report.forgotten(), 0);
     assert!(
-      !report.remaining,
+      !report.remaining(),
       "a second pass makes progress instead of wedging"
     );
   }
@@ -1982,10 +1974,11 @@ mod receipt_retention_tests {
     clock.set(UNIX_EPOCH + Duration::from_secs(200));
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(
-      report.forgotten, 1,
+      report.forgotten(),
+      1,
       "the good anchor is collected despite the corrupt value behind it"
     );
-    assert!(!report.remaining, "the scan reached its natural end");
+    assert!(!report.remaining(), "the scan reached its natural end");
 
     // The corrupt row is skipped, never deleted or mistaken for a fault.
     let snapshot = store.snapshot().await.unwrap();
@@ -2139,8 +2132,8 @@ mod receipt_retention_tests {
     let commits_before = factory.commit_calls.load(Ordering::SeqCst);
     for _ in 0..3 {
       let report = store.apply_receipt_retention().await.unwrap();
-      assert_eq!(report.forgotten, 0);
-      assert!(!report.remaining);
+      assert_eq!(report.forgotten(), 0);
+      assert!(!report.remaining());
     }
     assert_eq!(
       factory.commit_calls.load(Ordering::SeqCst),
@@ -2261,8 +2254,8 @@ mod receipt_retention_tests {
     drop(snapshot);
 
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
     let snapshot = store.snapshot().await.unwrap();
     assert!(
       snapshot
@@ -2285,13 +2278,14 @@ mod receipt_retention_tests {
     clock.set(UNIX_EPOCH + Duration::from_secs(200));
     let report = store.apply_receipt_retention().await.unwrap();
     assert_eq!(
-      report.forgotten, 1,
+      report.forgotten(),
+      1,
       "the anchored receipt reaches its deadline"
     );
-    assert!(!report.remaining);
+    assert!(!report.remaining());
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
   }
 
   /// A candidate the anchor scan already forgot is stale: the pass
@@ -2312,7 +2306,7 @@ mod receipt_retention_tests {
     ));
     clock.set(UNIX_EPOCH + Duration::from_secs(200));
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 1);
+    assert_eq!(report.forgotten(), 1);
 
     // The residue a pass leaves when it anchored the receipt but its
     // marker-consumption transaction did not commit.
@@ -2324,8 +2318,8 @@ mod receipt_retention_tests {
     );
 
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
     let snapshot = store.snapshot().await.unwrap();
     assert!(
       snapshot
@@ -2337,8 +2331,8 @@ mod receipt_retention_tests {
     );
     drop(snapshot);
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
   }
 
   /// The anchoring invariant holds on the candidate path too: a receipt
@@ -2368,8 +2362,8 @@ mod receipt_retention_tests {
     );
 
     let report = store.apply_receipt_retention().await.unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
     let snapshot = store.snapshot().await.unwrap();
     assert!(
       snapshot

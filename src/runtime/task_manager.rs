@@ -1840,7 +1840,9 @@ mod tests {
       .await
       .expect_err("terminal dial contract");
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-    let status = handle::<MergeView>(&client, &id, TaskKind::Join).status();
+    let status = handle::<MergeView>(&client, &id, TaskKind::Join)
+      .status()
+      .expect("live task status");
     assert_eq!(status.attempts(), 1);
     assert_eq!(scripted.attempts(), vec![1]);
   }
@@ -1885,8 +1887,9 @@ mod tests {
       .expect_err("final CAS conflict");
     assert_eq!(error.kind(), ErrorKind::Conflict);
     assert_eq!(error.context(), "resource version");
-    let status =
-      handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource).status();
+    let status = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource)
+      .status()
+      .expect("live task status");
     assert_eq!(status.attempts(), 1, "never retried at the manager level");
     assert_eq!(scripted.attempts(), vec![1]);
   }
@@ -2176,6 +2179,7 @@ mod tests {
     assert_eq!(
       handle::<()>(&client, &wedged, TaskKind::SyncRound)
         .status()
+        .expect("live task status")
         .phase(),
       TaskPhase::Running
     );
@@ -2234,7 +2238,9 @@ mod tests {
         .wait()
         .await
         .expect("terminal");
-      let status = handle::<()>(&client, &id, TaskKind::SyncRound).status();
+      let status = handle::<()>(&client, &id, TaskKind::SyncRound)
+        .status()
+        .expect("live task status");
       assert_eq!(status.phase(), TaskPhase::Succeeded);
     }
     // SyncRound draws from the local channel, whose default budget is
@@ -2324,8 +2330,8 @@ mod tests {
     ) -> BoxFuture<'a, Result<ReconcileDecision>> {
       Box::pin(async move {
         self.calls.lock().expect("reconciler calls").push((
-          context.attempt,
-          context.last_error.map(|error| error.kind()),
+          context.attempt(),
+          context.last_error().map(|error| error.kind()),
         ));
         let mut decisions = self.decisions.lock().expect("decisions");
         let decision = decisions

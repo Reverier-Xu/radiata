@@ -482,12 +482,8 @@ impl Tasks {
       let handle = handle.clone();
       let spec = spec.clone();
       Box::pin(async move {
-        let context = crate::ReconcileContext {
-          handle,
-          spec,
-          attempt: attempt.attempt,
-          last_error: attempt.last_error,
-        };
+        let context =
+          crate::ReconcileContext::new(handle, spec, attempt.attempt, attempt.last_error);
         match reconciler.reconcile(context).await {
           Ok(crate::ReconcileDecision::Succeeded) => {
             Ok(EffectOutcome::new(TaskOutput::Extension(())))

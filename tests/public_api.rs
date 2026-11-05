@@ -1205,8 +1205,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .wait()
     .await
     .unwrap();
-  assert_eq!(retention.forgotten, 0);
-  assert!(!retention.remaining);
+  assert_eq!(retention.forgotten(), 0);
+  assert!(!retention.remaining());
 
   // The frozen-journal recovery command on a healthy store: the typed
   // rejection is the contract (nothing is frozen), and the acknowledged
