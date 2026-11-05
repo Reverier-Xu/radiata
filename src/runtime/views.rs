@@ -145,6 +145,16 @@ impl Supervisor {
       _ => None,
     })
   }
+  /// Creates one watch over the durable resource change feed: `None`
+  /// starts at the current head, `Some(version)` replays the entries after
+  /// that version and then follows live commits. The watch holds the
+  /// store, so it reads the persisted feed rather than a process-local
+  /// buffer and survives a restart.
+  pub(super) async fn watch_resources(
+    &mut self, from: Option<u64>,
+  ) -> Result<crate::ResourceWatch> {
+    crate::ResourceWatch::subscribe(self.context()?.store_handle(), from).await
+  }
   /// Pages the node's bound listeners in canonical id order.
   pub(super) async fn page_listeners(
     &mut self, cursor: Option<crate::PageCursor>, limit: usize,

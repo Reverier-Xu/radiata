@@ -109,6 +109,10 @@ pub(crate) enum Control {
     limit: usize,
     reply: oneshot::Sender<Result<crate::ResourcePage>>,
   },
+  WatchResources {
+    from: Option<u64>,
+    reply: oneshot::Sender<Result<crate::ResourceWatch>>,
+  },
   PageListeners {
     cursor: Option<crate::PageCursor>,
     limit: usize,

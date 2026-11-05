@@ -41,6 +41,10 @@ pub(crate) const CLEANUP_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/clean
 pub(crate) const NODE_DESCRIPTOR_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/node-descriptor";
 /// One multiwriter generic resource register per resource name.
 pub(crate) const RESOURCE_RECORD_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/resource-record";
+/// The durable resource change feed: one monotonic head counter plus one
+/// entry per committed resource change, in `resourceVersion` order.
+pub(crate) const RESOURCE_CHANGE_FEED_NAMESPACE: &str =
+  "radiata.woooo.tech/metadata/v1/resource-change-feed";
 /// Bounded route-trace metadata per trace.
 pub(crate) const TRACE_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/route-trace";
 /// Durable pending-transaction journal record per transaction.
@@ -131,8 +135,9 @@ mod catalog {
     CHECKPOINT_NAMESPACE, CLEANUP_NAMESPACE, CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE,
     INTERNAL_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE,
     KEY_DELETION_INTENT_NAMESPACE, KEY_SEED_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
-    MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE,
-    REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE,
+    MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE,
+    RESOURCE_CHANGE_FEED_NAMESPACE, RESOURCE_RECORD_NAMESPACE, REVOCATION_NAMESPACE,
+    SCHEMA_NAMESPACE, TRACE_NAMESPACE,
   };
 
   /// Every core metadata family, in domain order and then declaration order.
@@ -152,6 +157,7 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::Custody, KEY_SEED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Node, NODE_DESCRIPTOR_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Resource, RESOURCE_RECORD_NAMESPACE),
+      MetadataFamily::new(MetadataDomain::Resource, RESOURCE_CHANGE_FEED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Route, TRACE_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Receipt, PENDING_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Receipt, INTERNAL_NAMESPACE),

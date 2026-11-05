@@ -604,6 +604,7 @@ pub(crate) fn check_write_shape(name: &ResourceName, labels: &ResourceLabels) ->
   Ok(())
 }
 
+pub(crate) mod feed;
 pub(crate) mod lane;
 pub(crate) mod page;
 pub(crate) mod retention;

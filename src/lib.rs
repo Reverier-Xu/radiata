@@ -90,7 +90,10 @@ pub use provider::{
   StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision,
   StoreTransaction, StoreValue, store_scan_stream,
 };
-pub use resource::{ResourceLabels, ResourceName, ResourceUri, ResourceVersion};
+pub use resource::{
+  ResourceLabels, ResourceName, ResourceUri, ResourceVersion,
+  feed::{ResourceChange, ResourceChangeKind, ResourceFeedError, ResourceWatch},
+};
 pub use routing::{
   CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteNextHop, Selector,
 };

@@ -161,9 +161,10 @@ pub(crate) async fn commit_expected_record_ctx(
   )
   .await
   .inspect(|outcome| {
-    // Every install path funnels through here (caller writes, applied
-    // sync pages, retention rewrites), so this one bump is the change
-    // signal the sync driver turns into next-tick pushes.
+    // Every put install path funnels through here (caller writes,
+    // retention rewrites), so this one bump is the change signal the sync
+    // driver turns into next-tick pushes. The feed wake-up rides the
+    // append itself (`commit_put_ctx`), so removals wake watchers too.
     if matches!(outcome, ResourceCommitOutcome::Installed(_)) {
       store.note_local_write_tag(crate::resource::store::RESOURCE_RECORD_NAMESPACE);
     }
@@ -247,6 +248,10 @@ pub(crate) async fn commit_page_batch_ctx(
     if operations.is_empty() {
       return Ok(Vec::new());
     }
+    // The page's feed entries ride the same transaction as its record
+    // puts: one atomic commit, so a landed page appends exactly one entry
+    // per installed record and a conflicted attempt appends nothing.
+    operations.extend(super::feed::append_operations(snapshot.as_ref(), &installed).await?);
     let transaction = store.prepare_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
@@ -270,6 +275,7 @@ pub(crate) async fn commit_page_batch_ctx(
     }
     if !installed.is_empty() {
       store.note_local_write_tag(crate::resource::store::RESOURCE_RECORD_NAMESPACE);
+      store.note_resource_feed_change();
     }
     return Ok(installed);
   }
@@ -284,18 +290,30 @@ async fn commit_put_ctx(
   namespace: StoreNamespace, key: StoreKey, record: &ResourceRecordV1, conflict: &'static str,
 ) -> Result<ResourceCommitOutcome> {
   let expected = crate::provider::snapshot_expectation(snapshot, &namespace, &key).await?;
+  let mut operations = vec![StoreOperation::Put {
+    namespace,
+    key,
+    expected,
+    value: StoreValue::new(Arc::from(record.encode()?)),
+  }];
+  // The feed entry and its counter bump join the record put in the same
+  // transaction, built from the same snapshot: the record cannot commit
+  // without its entry, and the entry cannot commit without the record.
+  operations.extend(super::feed::append_operations(snapshot, std::slice::from_ref(record)).await?);
   let transaction = store.prepare_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
-    vec![StoreOperation::Put {
-      namespace,
-      key,
-      expected,
-      value: StoreValue::new(Arc::from(record.encode()?)),
-    }],
+    operations,
   )?;
   match store.commit(transaction).await? {
-    crate::CommitOutcome::Committed(receipt) => Ok(ResourceCommitOutcome::Installed(receipt)),
+    crate::CommitOutcome::Committed(receipt) => {
+      // The feed entry committed with the record, so exactly one change is
+      // now readable: wake every parked watch. The wake-up is the append's
+      // own post-commit step, which is why a removal (which bypasses the
+      // put path's lane note) still reaches live watchers.
+      store.note_resource_feed_change();
+      Ok(ResourceCommitOutcome::Installed(receipt))
+    }
     // A raced writer moved the register between snapshot and commit: the
     // exact-version expectation fails closed with a typed conflict.
     crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => {

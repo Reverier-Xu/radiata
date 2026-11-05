@@ -515,6 +515,32 @@ impl NodeHandle {
     Ok(self.events.subscribe::<E>(options))
   }
 
+  /// Opens a watch over the durable resource change feed: `None` starts at
+  /// the feed's current head (only later commits are observed),
+  /// `Some(version)` first replays every entry with a version greater than
+  /// `version` and then follows live commits. Each change carries the
+  /// `resourceVersion` the commit assigned inside the same durable
+  /// transaction as the record, so a consumer resumes by passing the last
+  /// version it processed.
+  ///
+  /// The feed is persisted, not process-local: a watch created after a
+  /// restart resumes from the persisted head, and the sequence continues
+  /// with no gap and no reordering. A consumer that falls further behind
+  /// than the retained window observes [`crate::ResourceFeedError::Compacted`]
+  /// carrying the oldest available version and must re-list the register;
+  /// a slow consumer never blocks a resource write.
+  ///
+  /// The only failure is the command channel's own (a stopped node); feed
+  /// read failures and the compaction floor surface from
+  /// [`crate::ResourceWatch::next`]. The watch holds the store open, so
+  /// drop it before reopening the same storage.
+  pub async fn watch_resources(&self, from: Option<u64>) -> Result<crate::ResourceWatch> {
+    self
+      .runtime
+      .send_command(move |reply| Control::WatchResources { from, reply })
+      .await
+  }
+
   /// Sends one whole body as a single stream and waits for the
   /// destination's admission acknowledgement — the one-shot form of
   /// [`NodeHandle::open_stream`] plus `send_sync`, with empty metadata.

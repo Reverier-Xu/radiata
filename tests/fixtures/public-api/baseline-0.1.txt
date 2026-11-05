@@ -544,6 +544,7 @@ pub fn radiata::NodeHandle::topology(&self) -> radiata::Topology
 pub fn radiata::NodeHandle::trust(&self) -> radiata::Trust
 pub async fn radiata::NodeHandle::wait_for_shutdown(&self) -> radiata::Result<radiata::ShutdownReason>
 pub fn radiata::NodeHandle::watch<E: radiata::Event>(&self, radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
+pub async fn radiata::NodeHandle::watch_resources(&self, core::option::Option<u64>) -> radiata::Result<radiata::ResourceWatch>
 impl radiata::NodeHandle
 pub fn radiata::NodeHandle::member_revision(&self) -> radiata::MemberRevision
 pub fn radiata::NodeHandle::open_stream(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
@@ -674,12 +675,25 @@ pub const fn radiata::RecoveryView::unreachable_members(&self) -> usize
 pub struct radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 impl radiata::ReplaceIdentityAndDeleteOldCoreMetadata
 pub fn radiata::ReplaceIdentityAndDeleteOldCoreMetadata::new() -> Self
+pub struct radiata::ResourceChange
+impl radiata::ResourceChange
+pub const fn radiata::ResourceChange::is_removal(&self) -> bool
+pub const fn radiata::ResourceChange::kind(&self) -> &radiata::ResourceChangeKind
+pub const fn radiata::ResourceChange::name(&self) -> &radiata::ResourceName
+pub const fn radiata::ResourceChange::version(&self) -> u64
+#[non_exhaustive] pub enum radiata::ResourceChangeKind
+pub radiata::ResourceChangeKind::Put(radiata::ResourceView)
+pub radiata::ResourceChangeKind::Removed
 pub struct radiata::ResourceChanged
 impl radiata::ResourceChanged
 pub const fn radiata::ResourceChanged::origin(&self) -> radiata::ResourceOrigin
 pub const fn radiata::ResourceChanged::removal(&self) -> bool
 pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
 impl radiata::Event for radiata::ResourceChanged
+#[non_exhaustive] pub enum radiata::ResourceFeedError
+pub radiata::ResourceFeedError::Compacted
+pub radiata::ResourceFeedError::Compacted::oldest: u64
+pub radiata::ResourceFeedError::Storage(radiata::Error)
 pub struct radiata::ResourceLabels
 impl radiata::ResourceLabels
 pub fn radiata::ResourceLabels::custom(self, radiata::LabelKey, radiata::LabelValue) -> radiata::Result<Self>
@@ -733,6 +747,9 @@ impl radiata::ResourceView
 pub fn radiata::ResourceView::labels(&self) -> &radiata::ResourceLabels
 pub fn radiata::ResourceView::name(&self) -> &radiata::ResourceName
 pub fn radiata::ResourceView::version(&self) -> &radiata::ResourceVersion
+pub struct radiata::ResourceWatch
+impl radiata::ResourceWatch
+pub async fn radiata::ResourceWatch::next(&mut self) -> core::result::Result<radiata::ResourceChange, radiata::ResourceFeedError>
 pub struct radiata::ResourceWrite
 impl radiata::ResourceWrite
 pub const fn radiata::ResourceWrite::labels(&self) -> &radiata::ResourceLabels

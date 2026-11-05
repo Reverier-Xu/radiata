@@ -955,6 +955,47 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap();
   assert!(one_resource.is_some());
 
+  // The durable resource feed: a watch resumes after a version, replays
+  // the later entries, and follows a live commit.
+  let mut feed: radiata::ResourceWatch = issuer.handle.watch_resources(Some(0)).await.unwrap();
+  let replayed = tokio::time::timeout(Duration::from_secs(5), feed.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(replayed.version() > 0);
+  let _ = (replayed.name(), replayed.kind(), replayed.is_removal());
+  let mut live: radiata::ResourceWatch = issuer.handle.watch_resources(None).await.unwrap();
+  let live_write = ResourceWrite::new(
+    ResourceName::parse("radiata.woooo.tech/resources/pub-api-002").unwrap(),
+    ResourceLabels::new(
+      LabelValue::parse("document").unwrap(),
+      ResourceUri::parse("file:///pub-api-live").unwrap(),
+    ),
+  );
+  issuer
+    .handle
+    .resources()
+    .put(live_write)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let observed = tokio::time::timeout(Duration::from_secs(5), live.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    observed.name().as_str(),
+    "radiata.woooo.tech/resources/pub-api-002"
+  );
+  match observed.kind() {
+    radiata::ResourceChangeKind::Put(view) => {
+      assert_eq!(view.labels().uri().as_str(), "file:///pub-api-live");
+    }
+    other => panic!("expected a put change, got {other:?}"),
+  }
+
   // Stream with an exact-node target and a delivery ack.
   let packet: OutboundStream = issuer
     .handle
