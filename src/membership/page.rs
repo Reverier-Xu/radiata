@@ -113,8 +113,9 @@ pub(crate) mod sync {
   use crate::{NodeId, Result, api::Entropy, storage::MetadataStore};
 
   /// Applies one received page over the running node's metadata store:
-  /// the store accepts only the exact next revision, so stale, repeated,
-  /// downgraded, and replayed descriptors cannot replace a newer record.
+  /// the store accepts only a strictly greater revision, so stale,
+  /// repeated, downgraded, and replayed descriptors cannot replace a
+  /// newer record.
   /// One batched transaction for the whole page — the per-descriptor
   /// decisions live in the store module beside the single-descriptor
   /// commit they mirror — so a page costs one durable commit, not one

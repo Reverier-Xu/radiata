@@ -746,11 +746,14 @@ impl RouteRecord {
   }
 }
 
-/// Maps a wire admission rejection kind back to a typed error. The wire
-/// ack status decodes to exactly the kinds matched here; any other kind
-/// can only reach this function through a local invariant violation, and
-/// fails closed with an internal error instead of silently reading as a
-/// stream interruption.
+/// Maps one admission-outcome kind back to the typed error a synchronous
+/// sender observes. Two sources feed it: the wire ack status's own kinds
+/// (`AckStatus::to_kind` yields unsupported, overloaded, or
+/// stream-interrupted) and the local pre-admission rejections the pump
+/// reports before any frame moves (route-unavailable, shutting-down, and
+/// a selector or policy's own kind). The four kinds mapped explicitly
+/// keep their typed error; every other kind fails closed as an internal
+/// error instead of silently reading as a stream interruption.
 pub(crate) fn ack_error(kind: ErrorKind) -> Error {
   match kind {
     ErrorKind::Unsupported => Error::unsupported("packet protocol"),
@@ -769,7 +772,7 @@ mod tests {
 
   use super::{
     IncomingStream, METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, PacketReplyContext, RoutingPolicy,
-    StreamItem, StreamMetadata, StreamPolicy, StreamTarget, channel_body,
+    StreamItem, StreamMetadata, StreamPolicy, StreamTarget, ack_error, channel_body,
   };
   use crate::{ErrorKind, QualifiedTag};
 
@@ -855,6 +858,24 @@ mod tests {
       .derive_return_stream_with_hops(protocol, StreamMetadata::new(), 0)
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  }
+
+  /// The admission-outcome mapping is pinned for every kind the delivery
+  /// path produces: the wire ack kinds and the local pre-admission
+  /// rejections keep their typed error, and any other kind fails closed
+  /// as an internal error instead of reading as a stream interruption.
+  #[test]
+  fn ack_error_maps_every_reachable_admission_kind() {
+    for (kind, expected) in [
+      (ErrorKind::Unsupported, ErrorKind::Unsupported),
+      (ErrorKind::Overloaded, ErrorKind::Overloaded),
+      (ErrorKind::RouteUnavailable, ErrorKind::RouteUnavailable),
+      (ErrorKind::StreamInterrupted, ErrorKind::StreamInterrupted),
+      (ErrorKind::ShuttingDown, ErrorKind::Internal),
+      (ErrorKind::Internal, ErrorKind::Internal),
+    ] {
+      assert_eq!(ack_error(kind).kind(), expected);
+    }
   }
 
   /// Both variants share the registry gate: a reply may only carry a

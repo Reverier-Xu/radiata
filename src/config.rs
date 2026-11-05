@@ -660,6 +660,11 @@ impl Default for TraceMetadataLimits {
 /// connected node never dials. `fan_out` caps how many members one
 /// recovery round dials in parallel, and the backoff pair bounds the
 /// retry cadence.
+///
+/// The backoff pair is **second-granular**: the controller's schedule is
+/// whole seconds, so a sub-second component would be silently truncated
+/// (500 ms → 1 s, 1.5 s → 1 s). A fractional value is rejected at
+/// construction instead of becoming a different cadence at runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryConfig {
   fan_out: usize,
@@ -668,6 +673,9 @@ pub struct RecoveryConfig {
 }
 
 impl RecoveryConfig {
+  /// Builds one recovery policy: a nonzero fan-out, a nonzero initial
+  /// backoff no greater than the maximum, and both backoffs in whole
+  /// seconds.
   pub fn new(fan_out: usize, initial_backoff: Duration, maximum_backoff: Duration) -> Result<Self> {
     if fan_out == 0 {
       return Err(Error::invalid_input("recovery fan-out"));
@@ -680,6 +688,11 @@ impl RecoveryConfig {
     }
     if initial_backoff > maximum_backoff {
       return Err(Error::invalid_input("recovery policy"));
+    }
+    for value in [initial_backoff, maximum_backoff] {
+      if value.subsec_nanos() != 0 {
+        return Err(Error::invalid_input("recovery backoff granularity"));
+      }
     }
     Ok(Self {
       fan_out,
@@ -725,7 +738,7 @@ impl Default for RecoveryConfig {
 mod tests {
   use std::time::Duration;
 
-  use super::NodeConfig;
+  use super::{NodeConfig, RecoveryConfig};
   use crate::ErrorKind;
 
   /// The liveness setter stores every accepted policy shape: fully
@@ -963,5 +976,26 @@ mod tests {
         .unwrap_err();
       assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
+  }
+
+  /// The recovery backoff pair is second-granular: the controller's
+  /// schedule is whole seconds, so a sub-second value would silently
+  /// truncate to a different cadence (500 ms → 1 s, 1.5 s → 1 s). Both
+  /// halves are rejected at the constructor; the smallest whole-second
+  /// policy stays valid and reads back exactly.
+  #[test]
+  fn recovery_backoff_rejects_sub_second_granularity() {
+    for (initial_backoff, maximum_backoff) in [
+      (Duration::from_millis(500), Duration::from_secs(5)),
+      (Duration::from_millis(1_500), Duration::from_secs(5)),
+      (Duration::from_secs(1), Duration::from_millis(1_500)),
+      (Duration::from_nanos(1), Duration::from_secs(1)),
+    ] {
+      let error = RecoveryConfig::new(1, initial_backoff, maximum_backoff).unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+    let whole = RecoveryConfig::new(1, Duration::from_secs(1), Duration::from_secs(2)).unwrap();
+    assert_eq!(whole.initial_backoff_seconds(), 1);
+    assert_eq!(whole.maximum_backoff_seconds(), 2);
   }
 }

@@ -412,8 +412,8 @@ pub(crate) mod store {
   /// conflict, the page batch maps it to a skip — the RULES live here
   /// and only here.
   ///
-  /// - an equal or higher stored revision wins (the register accepts only the
-  ///   strictly next revision);
+  /// - an equal or higher stored revision wins (the register accepts only a
+  ///   strictly greater revision, so skipped revisions heal);
   /// - the descriptor register starts at revision 1: a zero-revision descriptor
   ///   is never a legal first install, not even for a node whose binding is
   ///   already adopted;

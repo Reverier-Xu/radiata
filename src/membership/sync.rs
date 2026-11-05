@@ -27,15 +27,46 @@ pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str = "radiata.woooo.tech/protocols/
 /// The wire schema of one sync payload.
 const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/membership-sync-payload";
 
-/// Payload kinds: this protocol carries the interactive leave plane
-/// only — the owner-signed leave announcement and its applied receipt.
-/// Every anti-entropy lane (descriptors, trust, resources, tombstones)
-/// rides the reconciliation plane (`crate::reconcile::plane`).
-pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
-/// A leave-applied receipt: the applying peer confirms one leave record
-/// persisted. Additive (post-0.1 peers only): peers that never send it
-/// leave the announcement on its documented bounded-degradation path.
-pub(crate) const SYNC_KIND_LEAVE_APPLIED: u8 = 7;
+/// The closed set of membership sync payload kinds: this protocol
+/// carries the interactive leave plane only — the owner-signed leave
+/// announcement and its applied receipt. Every anti-entropy lane
+/// (descriptors, trust, resources, tombstones) rides the reconciliation
+/// plane (`crate::reconcile::plane`).
+///
+/// The codes are frozen wire contract. The typed kind keeps them in this
+/// protocol's own namespace: the same numbers mean unrelated record
+/// families in the tombstone lane's row keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyncKind {
+  /// An encoded owner-signed leave announcement
+  /// ([`crate::identity::leave::LeaveRecordV1`]).
+  Leave,
+  /// A leave-applied receipt: the applying peer confirms one leave
+  /// record persisted. Additive (post-0.1 peers only): peers that never
+  /// send it leave the announcement on its documented
+  /// bounded-degradation path.
+  LeaveApplied,
+}
+
+impl SyncKind {
+  /// The immutable wire code of the kind.
+  pub(crate) const fn code(self) -> u8 {
+    match self {
+      Self::Leave => 3,
+      Self::LeaveApplied => 7,
+    }
+  }
+
+  /// Resolves a wire code to a kind; unknown codes are `None` and fail
+  /// closed at the decode boundary.
+  pub(crate) const fn from_code(code: u8) -> Option<Self> {
+    match code {
+      3 => Some(Self::Leave),
+      7 => Some(Self::LeaveApplied),
+      _ => None,
+    }
+  }
+}
 
 /// One sync payload: one encoded signed removal tombstone, or the
 /// leave-applied receipt.
@@ -52,13 +83,13 @@ pub(crate) enum SyncPayload {
 impl SyncPayload {
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     let (kind, payload) = match self {
-      Self::Leave(encoded) => (SYNC_KIND_LEAVE, encoded.clone()),
+      Self::Leave(encoded) => (SyncKind::Leave, encoded.clone()),
       Self::LeaveApplied { node } => (
-        SYNC_KIND_LEAVE_APPLIED,
+        SyncKind::LeaveApplied,
         ByteVec::from(node.as_str().as_bytes().to_vec()),
       ),
     };
-    crate::sync_common::encode_sync_envelope(SYNC_PAYLOAD_SCHEMA, Some(kind), payload)
+    crate::sync_common::encode_sync_envelope(SYNC_PAYLOAD_SCHEMA, Some(kind.code()), payload)
   }
 
   /// Decodes one payload, rejecting unknown schemas and kinds and any
@@ -70,15 +101,16 @@ impl SyncPayload {
       "membership sync payload canonical form",
       "membership sync payload schema",
     )?;
+    let kind = SyncKind::from_code(kind)
+      .ok_or_else(|| Error::invalid_input("membership sync payload kind"))?;
     match kind {
-      SYNC_KIND_LEAVE => Ok(Self::Leave(payload)),
-      SYNC_KIND_LEAVE_APPLIED => Ok(Self::LeaveApplied {
+      SyncKind::Leave => Ok(Self::Leave(payload)),
+      SyncKind::LeaveApplied => Ok(Self::LeaveApplied {
         node: NodeId::parse(
           std::str::from_utf8(payload.as_ref())
             .map_err(|_| Error::invalid_input("membership sync payload kind"))?,
         )?,
       }),
-      _ => Err(Error::invalid_input("membership sync payload kind")),
     }
   }
 }
@@ -503,6 +535,33 @@ mod tests {
       let encoded = payload.encode().unwrap();
       assert_eq!(SyncPayload::decode(&encoded).unwrap(), payload);
     }
+  }
+
+  /// The payload kind codes are frozen wire contract: the leave
+  /// announcement and its applied receipt keep their original codes, and
+  /// every other byte is not a kind — the decode boundary fails closed
+  /// instead of guessing.
+  #[test]
+  fn sync_kind_codes_are_frozen_and_unknown_codes_fail_closed() {
+    assert_eq!(SyncKind::Leave.code(), 3);
+    assert_eq!(SyncKind::LeaveApplied.code(), 7);
+    for kind in [SyncKind::Leave, SyncKind::LeaveApplied] {
+      assert_eq!(SyncKind::from_code(kind.code()), Some(kind));
+    }
+    for code in [0, 1, 2, 4, 5, 6, 8, u8::MAX] {
+      assert_eq!(SyncKind::from_code(code), None);
+    }
+
+    // The same unknown code inside a well-formed envelope is a typed
+    // invalid-input rejection, never a silently dropped payload.
+    let envelope = crate::sync_common::encode_sync_envelope(
+      SYNC_PAYLOAD_SCHEMA,
+      Some(4),
+      ByteVec::from(node(1).as_str().as_bytes().to_vec()),
+    )
+    .unwrap();
+    let error = SyncPayload::decode(&envelope).unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
   }
 
   fn node(seed: u8) -> NodeId {
