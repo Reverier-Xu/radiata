@@ -17,7 +17,7 @@ use crate::{
   Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::{BoxFuture, Entropy},
   extension_registry::{PacketConsumer, ProtocolDefinition},
-  identity::{lifecycle::LocalIdentityContext, trust::store as trust_store},
+  identity::lifecycle::LocalIdentityContext,
   runtime::RuntimeClient,
 };
 
@@ -426,13 +426,25 @@ pub(crate) async fn ensure_local_descriptor(
     // the read and the commit (every public operation ensures the local
     // descriptor first). The ensure is idempotent: the conflict is
     // acceptable only when the descriptor now exists at revision >= ours
-    // for this exact node and key.
-    let installed = crate::membership::store::read_descriptor_ctx(store, &node)
-      .await?
-      .map(|current| current.revision() >= descriptor_revision)
-      .unwrap_or(false);
-    if !installed {
+    // for this exact node and key — another writer won the race, and the
+    // next maintenance tick rewrites the endpoint set.
+    let Some(current) = crate::membership::store::read_descriptor_ctx(store, &node).await? else {
       return Err(error);
+    };
+    if current.revision() < descriptor_revision {
+      return Err(error);
+    }
+    // The paired notification belongs to this call's own write only: the
+    // stored record must be exactly the descriptor attempted here. A
+    // concurrent writer's different record (endpoint set, labels, or a
+    // higher revision from another flow) already fired its own
+    // notification, so notifying from the losing call would bump the
+    // member revision twice for one install. An identical record written
+    // concurrently is indistinguishable from this call's own landed write,
+    // and its content is exactly what this call wanted, so that bump
+    // stands.
+    if current != descriptor {
+      return Ok(());
     }
   }
   // The member set genuinely changed (the local descriptor was installed
@@ -442,11 +454,13 @@ pub(crate) async fn ensure_local_descriptor(
   Ok(())
 }
 
-/// One membership maintenance tick: publish the local descriptor and run
-/// the checkpoint GC. The anti-entropy itself rides the reconciliation
-/// plane (every lane — descriptors, trust, resources, tombstones); this
-/// tick is only the local store maintenance whose writes then drive the
-/// plane's epoch-rescan triggers.
+/// One membership maintenance tick: publish the local descriptor. The
+/// anti-entropy itself rides the reconciliation plane (every lane —
+/// descriptors, trust, resources, tombstones); this tick is only the local
+/// store maintenance whose writes then drive the plane's epoch-rescan
+/// triggers. The identity-tombstone GC is not membership work: it rides
+/// the recovery worker's retention sweeps (`runtime/retention.rs`), gated
+/// on the cleanup checkpoint instead of on the trust lane.
 ///
 /// The quiescence contract: before any member is admitted the node's
 /// store writes are quiescent (the listen
@@ -460,7 +474,6 @@ pub(crate) async fn membership_maintenance_tick(
   local_endpoints: &[crate::Endpoint], events: &Arc<crate::node::EventHub>,
   revision: &crate::node::MemberRevisionSignal,
 ) -> Result<()> {
-  let store = context.store();
   // Nothing to advertise at startup: the listen effect publishes the
   // local descriptor (with endpoints) when the first listener binds,
   // and a member query schedules the listenerless node's publication
@@ -469,11 +482,6 @@ pub(crate) async fn membership_maintenance_tick(
   if !local_endpoints.is_empty() {
     ensure_local_descriptor(context, entropy, local_endpoints.to_vec(), events, revision).await?;
   }
-  if !trust_store::has_more_than_bindings(store, 1).await? {
-    // No membership yet: nothing to maintain.
-    return Ok(());
-  }
-  crate::membership::tombstone::gc_collected_tombstones(store, entropy).await;
   Ok(())
 }
 
@@ -619,6 +627,119 @@ mod tests {
     assert_eq!(shrunk.revision(), 4);
     assert_eq!(shrunk.endpoints(), &[one.clone()][..]);
     assert_eq!(shrunk.labels().get(&tier), Some(&gold));
+  }
+
+  /// Regression: the tolerated-conflict path must not notify the member
+  /// set. A concurrent writer's different record — here the same revision
+  /// carrying a label set over the unchanged endpoint set, injected
+  /// between this call's read and its commit — wins the register, so the
+  /// losing ensure neither bumps the member revision nor emits the paired
+  /// event: one install, one bump.
+  #[tokio::test]
+  async fn tolerated_conflict_with_a_different_record_does_not_bump_the_member_revision() {
+    use crate::{
+      identity::{
+        lifecycle,
+        testing::{FaultingFactory, ScriptedKeys, SequenceEntropy, inject_entry},
+      },
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let faulting = FaultingFactory::new(&reference, Vec::new());
+    let factory: Arc<dyn crate::provider::StorageFactory> = faulting.as_factory();
+    let keys = ScriptedKeys::full_at(9_700);
+    let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        Some(&keys.as_provider()),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    let events = Arc::new(crate::node::EventHub::new());
+    let mut member_events = events.subscribe::<crate::MemberChanged>(crate::EventOptions::new());
+    let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let one = crate::Endpoint::parse("wss://one.example:9000").unwrap();
+    let two = crate::Endpoint::parse("wss://two.example:9000").unwrap();
+
+    // First publication: revision 1 over one endpoint, one bump.
+    ensure_local_descriptor(&context, &entropy, vec![one.clone()], &events, &revision)
+      .await
+      .unwrap();
+    assert_eq!(*revision_rx.borrow(), 1);
+    assert!(matches!(
+      member_events.try_recv().unwrap(),
+      crate::EventReceive::Item(_)
+    ));
+
+    // The concurrent winner: revision 2 carrying a label set over the
+    // unchanged endpoint set (the owner patch path), landing between this
+    // call's read and its commit.
+    let concurrent = crate::membership::NodeDescriptorV1::new(
+      context.identity().node().clone(),
+      context.identity().public_key().clone(),
+      vec![one.clone()],
+      2,
+      1,
+    )
+    .with_labels(
+      crate::LabelSet::new()
+        .insert(
+          crate::LabelKey::parse("example.org/labels/tier").unwrap(),
+          crate::LabelValue::parse("gold").unwrap(),
+        )
+        .unwrap(),
+    );
+    let descriptor_namespace = crate::membership::descriptor_namespace().unwrap();
+    let descriptor_key = {
+      let state = reference.state.lock().unwrap();
+      state
+        .entries
+        .keys()
+        .find(|(namespace, _)| namespace == &descriptor_namespace)
+        .map(|(_, key)| key.clone())
+        .expect("the installed local descriptor row")
+    };
+    let encoded = concurrent.encode().unwrap();
+    faulting.push_hook(Box::new(move || {
+      inject_entry(&reference, (descriptor_namespace, descriptor_key), encoded);
+    }));
+
+    // The endpoint rewrite conflicts at the same revision. The conflict
+    // stays tolerated (a current descriptor exists), but the losing call
+    // must not notify: the winner already did.
+    ensure_local_descriptor(
+      &context,
+      &entropy,
+      vec![one.clone(), two.clone()],
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      *revision_rx.borrow(),
+      1,
+      "the losing call must not bump the member revision"
+    );
+    assert!(
+      matches!(
+        member_events.try_recv().unwrap(),
+        crate::EventReceive::Empty
+      ),
+      "the losing call must not emit the paired member event"
+    );
+    let stored =
+      crate::membership::store::read_descriptor_ctx(context.store(), context.identity().node())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, concurrent, "the concurrent record stays installed");
   }
 
   /// Regression: a receiver-side leave persist failure used to surface

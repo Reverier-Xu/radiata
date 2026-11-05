@@ -442,15 +442,17 @@ pub(crate) async fn persist_checkpoint_ctx(
   Ok(())
 }
 
-/// The checkpoint GC pass: after sync rounds, delete the collected
-/// leave and cleanup tombstones stamped at or before the latest local
-/// checkpoint watermark, retiring each record's pinned subject binding
+/// The checkpoint GC pass: delete the collected leave and cleanup
+/// tombstones stamped at or before the latest local checkpoint watermark,
+/// retiring each record's pinned subject binding
 /// in the same transaction (a re-bound subject keeps its new binding,
 /// and a revoked subject keeps the binding its permanent revocation
 /// constrains — see [`records::collect_tombstones_before`]). Bounded
 /// per pass; a raced delete conflicts and stays for the next pass.
 /// Revocation records are never collected here (permanent), and live
-/// entries are never touched (the filter is removal-only).
+/// entries are never touched (the filter is removal-only). The runtime
+/// cadence owner is the recovery worker's retention sweeps
+/// (`runtime/retention.rs`), gated on the checkpoint existing.
 pub(crate) async fn collect_collected_tombstones_ctx(
   store: &MetadataStore, entropy: &dyn Entropy,
 ) -> Result<usize> {

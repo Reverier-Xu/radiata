@@ -506,19 +506,6 @@ pub(crate) async fn apply_tombstone_rows(
   Ok(())
 }
 
-/// The post-round checkpoint GC: collect the
-/// leave/cleanup tombstones at or before the local checkpoint watermark.
-/// Hygiene only — a failure is logged and retried next round.
-pub(super) async fn gc_collected_tombstones(
-  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
-) {
-  if let Err(error) =
-    crate::identity::cleanup::collect_collected_tombstones_ctx(store, entropy.as_ref()).await
-  {
-    tracing::debug!(kind = ?error.kind(), "checkpoint gc pass failed");
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;

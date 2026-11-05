@@ -16,7 +16,7 @@ pub(super) const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration
 
 /// Runs the recovery-observation worker: one long-lived task that owns
 /// the recovery cadence and, per tick, runs the recovery tick followed
-/// by the three retention sweeps — the exact work the supervisor's
+/// by the retention sweeps — the exact work the supervisor's
 /// select loop would otherwise await inline, so slow
 /// storage never parks control-plane reads and packet admission
 /// behind a tick.
@@ -50,6 +50,7 @@ pub(super) async fn run_recovery_worker(state: Arc<TickState>) {
         state.trace_retention_sweep().await;
         state.resource_removal_sweep().await;
         state.receipt_retention_sweep().await;
+        state.collected_tombstone_sweep().await;
       }
     }
   }
@@ -894,6 +895,69 @@ mod tests {
       "overlapping ticks must be skipped, never queued"
     );
 
+    worker.abort();
+  }
+
+  /// The identity-tombstone GC rides the recovery worker's retention
+  /// sweeps, gated on the cleanup checkpoint: with no checkpoint the pass
+  /// is a no-op (the collected tombstone stays), and once a checkpoint
+  /// makes the tombstone eligible the worker's tick collects it.
+  #[tokio::test(start_paused = true)]
+  async fn recovery_worker_collects_identity_tombstones_only_under_a_checkpoint() {
+    use crate::identity::{
+      cleanup::{
+        is_cleaned_ctx, issue_checkpoint_ctx, persist_cleanup_record_ctx, sign_cleanup_record,
+      },
+      lifecycle::ensure_self_binding,
+      testing::fresh_reference,
+      trust::store::adopt_binding_ctx,
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let (supervisor, entropy, _sessions) = supervisor_over(factory, NodeConfig::new()).await;
+    let ticks = supervisor.tick_state().unwrap();
+    let context = Arc::clone(&ticks.context);
+    let store = context.store();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+    let subject = member_id(9_000);
+    adopt_binding_ctx(store, entropy.as_ref(), &subject, &member_key(9_000))
+      .await
+      .unwrap();
+    let record = sign_cleanup_record(&context, context.keys(), &subject)
+      .await
+      .unwrap();
+    persist_cleanup_record_ctx(store, entropy.as_ref(), &record)
+      .await
+      .unwrap();
+    assert!(is_cleaned_ctx(store, &subject).await.unwrap());
+
+    // No checkpoint: the pass is a no-op and the tombstone stays.
+    ticks.collected_tombstone_sweep().await;
+    assert!(
+      is_cleaned_ctx(store, &subject).await.unwrap(),
+      "without a checkpoint the sweep must not collect"
+    );
+
+    // A checkpoint makes the tombstone eligible: the worker's tick
+    // collects it.
+    issue_checkpoint_ctx(&context, entropy.as_ref())
+      .await
+      .unwrap();
+    let worker = tokio::spawn(run_recovery_worker(Arc::new(ticks)));
+    let mut collected = false;
+    for _ in 0..400 {
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+      if !is_cleaned_ctx(store, &subject).await.unwrap() {
+        collected = true;
+        break;
+      }
+    }
+    assert!(
+      collected,
+      "the recovery worker's tick must collect an eligible tombstone"
+    );
     worker.abort();
   }
 

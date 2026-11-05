@@ -8,8 +8,8 @@ use std::sync::Arc;
 use crate::{Endpoint, identity::lifecycle::LocalIdentityContext};
 
 /// Spawns the anti-entropy sync driver: every tick runs the membership
-/// maintenance (local descriptor publication, issuer snapshot refresh,
-/// checkpoint GC) and drives the reconciliation plane (priming,
+/// maintenance (local descriptor publication) and drives the
+/// reconciliation plane (priming,
 /// epoch-driven local changes, the cadence root exchange, and the
 /// backlog drain across every reconciled lane). The plane's dispatches
 /// are fire-and-forget under the admission-ack discipline, so a failure

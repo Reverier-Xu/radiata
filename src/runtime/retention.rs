@@ -1,10 +1,10 @@
 //! The tick-driven retention sweeps: durable route-trace records,
-//! resource removal evidence, and anchored receipts. Every pass is
-//! bounded by the host wall clock, tolerates failure as a warning (the
-//! next tick retries), and touches core metadata only. The passes run
-//! on the recovery worker after each recovery tick (see
-//! `runtime/recovery.rs`), never inline in the supervisor's select
-//! loop.
+//! resource removal evidence, anchored receipts, and the collected
+//! identity tombstones. Every pass is bounded by the host wall clock (or
+//! by its own record batch), tolerates failure as a warning (the next tick
+//! retries), and touches core metadata only. The passes run on the
+//! recovery worker after each recovery tick (see `runtime/recovery.rs`),
+//! never inline in the supervisor's select loop.
 
 use super::supervisor::TickState;
 
@@ -75,6 +75,31 @@ impl TickState {
   pub(super) async fn receipt_retention_sweep(&self) {
     if let Err(error) = self.context.store().apply_receipt_retention().await {
       tracing::warn!(kind = ?error.kind(), "receipt retention sweep failed");
+    }
+  }
+
+  /// One bounded identity-tombstone GC pass: the collected leave and
+  /// cleanup tombstones at or before the local cleanup-checkpoint
+  /// watermark leave, together with the bindings they pin. The checkpoint
+  /// is the pass's gate — a node that never issued or received one has no
+  /// eligible watermark, so the sweep stays off the tick entirely instead
+  /// of running two empty scans. The pass itself is bounded by its record
+  /// batch; a failure (store outage, frozen slot) surfaces as a warning
+  /// and the next tick retries.
+  pub(super) async fn collected_tombstone_sweep(&self) {
+    let store = self.context.store();
+    match crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await {
+      Ok(Some(_)) => {}
+      Ok(None) => return,
+      Err(error) => {
+        tracing::warn!(kind = ?error.kind(), "tombstone gc checkpoint read failed");
+        return;
+      }
+    }
+    if let Err(error) =
+      crate::identity::cleanup::collect_collected_tombstones_ctx(store, self.entropy.as_ref()).await
+    {
+      tracing::warn!(kind = ?error.kind(), "tombstone gc sweep failed");
     }
   }
 }

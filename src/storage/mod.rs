@@ -372,8 +372,11 @@ impl MetadataStore {
       journal_proven: false,
     };
     let deadline = std::time::Instant::now() + ENTRY_WAIT_BOUND;
+    let mut settled_warned = false;
     let call = self
-      .wait_for_entry(deadline, || self.begin_commit(pending.clone()))
+      .wait_for_entry(deadline, || {
+        self.begin_commit(pending.clone(), &mut settled_warned)
+      })
       .await?;
     let result = self.provider.commit(transaction).await;
 
@@ -507,9 +510,34 @@ impl MetadataStore {
     }
   }
 
-  fn begin_commit(&self, pending: PendingCommit) -> Result<ProviderCall<'_>> {
+  /// Enters the commit slot, or refuses with `NotReady` while the slot
+  /// is taken.
+  ///
+  /// A settled freeze (`Frozen` with no provider call in flight) never
+  /// clears on its own, so the entry wait would park the whole bound with
+  /// no diagnostic: name the pending transaction once per commit attempt
+  /// (`settled_warned`), so the field report says which transaction needs
+  /// the reconcile. The in-flight case stays silent — it is a short
+  /// internal commit the wait queues behind, and a line there would repeat
+  /// on every entry retry.
+  fn begin_commit(
+    &self, pending: PendingCommit, settled_warned: &mut bool,
+  ) -> Result<ProviderCall<'_>> {
     let mut state = self.lock_state()?;
     if !matches!(*state, CommitState::Ready) {
+      if let CommitState::Frozen {
+        pending: frozen,
+        provider_call_active: false,
+      } = &*state
+        && !*settled_warned
+      {
+        *settled_warned = true;
+        tracing::warn!(
+          transaction = %frozen.transaction,
+          "metadata store is frozen on a settled commit and needs reconcile; \
+           the commit entry waits the full bound"
+        );
+      }
       return Err(Error::not_ready("metadata storage commit"));
     }
     *state = CommitState::Frozen {
