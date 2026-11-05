@@ -818,7 +818,7 @@ fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: Pump
     PumpHandoff::Remote {
       entry,
       request,
-      force_routed,
+      route,
     } => {
       let trace = if request.internal {
         None
@@ -826,7 +826,7 @@ fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: Pump
         Some(supervisor.trace_sink.clone())
       };
       tasks.spawn(async move {
-        run_outbound(entry, local, request, routes, force_routed, trace, events).await;
+        run_outbound(entry, local, request, routes, route, trace, events).await;
       });
     }
     PumpHandoff::Local { request } => {
@@ -2053,7 +2053,7 @@ mod admission_loop_tests {
   }
 
   impl RouteNextHop for PendingNextHop {
-    fn next_hop<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+    fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
       self.calls.fetch_add(1, Ordering::Relaxed);
       Box::pin(std::future::pending())
     }

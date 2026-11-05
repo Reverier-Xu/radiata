@@ -60,10 +60,11 @@ pub(crate) enum PendingAck {
 }
 
 /// The untried candidates of a discovering hop: the open frame is
-/// re-encoded per attempt with the SAME envelope state (the attempt is
-/// an alternative branch at this hop, not extra depth), so a failed
-/// subtree costs one re-dispatch here instead of an exponential
-/// re-walk from the origin.
+/// re-encoded per attempt with the same envelope state and an emptied
+/// path (the attempt is an alternative branch at this hop, not extra
+/// depth, and the branch plans its own remainder), so a failed subtree
+/// costs one re-dispatch here instead of an exponential re-walk from the
+/// origin.
 #[derive(Clone)]
 pub(crate) struct RetryState {
   pub(crate) open: OpenFrame,
@@ -196,12 +197,13 @@ pub(crate) fn contains(table: &ForwardingTable, trace_id: &TraceId) -> bool {
 pub(crate) const FORWARDING_ROUTE_CAPACITY_DEFAULT: usize = 8_192;
 
 /// Validates and relays one routed open whose destination is another node:
-/// the envelope is re-checked against the session-authenticated holder, the
-/// node's next-hop policy picks exactly one downstream session, and a relay
-/// entry is registered so the destination's acknowledgement travels back
-/// upstream. Returns `true` when the frame was fully handled (including any
-/// typed rejection relayed upstream). The argument list mirrors the hop's
-/// collaborators; no subset forms a meaningful grouping.
+/// the envelope is re-checked against the session-authenticated holder,
+/// the next hop is the head of the carried path (or, when the path is
+/// exhausted, the head of the plan this hop computes), and a relay entry
+/// is registered so the destination's acknowledgement travels back
+/// upstream. Returns `true` when the frame was fully handled (including
+/// any typed rejection relayed upstream). The argument list mirrors the
+/// hop's collaborators; no subset forms a meaningful grouping.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open(
   local: &NodeId, peer: &NodeId, source: &SessionIdentity, open: OpenFrame,
@@ -219,38 +221,39 @@ pub(crate) async fn open(
   // handling and surfaces the empty set as a typed route rejection
   // downstream instead of propagating an error.
   let peers = crate::sync_common::alive_peers(sessions).unwrap_or_default();
-  // Loop-free candidates: a next hop already in the visited chain (or
-  // the source/current holder) can only cycle back — the checked
-  // receive would reject the pick after the policy chose it, so a
-  // deterministic minimum-id policy would fail closed on every attempt
-  // (observed live on a ring topology). Excluding the chain here makes
-  // strictly forward progress structural: the candidate set shrinks
-  // with every hop.
+  // The branch candidates of this hop: the alive peers minus the visited
+  // chain, the source, and the current holder. They are the fallback
+  // plan's eligible first hops and the alternative branches of a failed
+  // attempt, so strictly forward progress stays structural: the candidate
+  // set shrinks with every hop.
   let candidates = loop_free_candidates(
     envelope.source(),
     envelope.current(),
     envelope.visited(),
     &peers,
   );
-  let mut chosen = if open.destination != *local {
+  // The plan runs only when the carried path is exhausted: the unlearned
+  // fallback, and the alternative branch of a re-dispatch. A carried path
+  // is followed without consulting any policy.
+  let mut planned = if envelope.path().is_empty() {
     Some(
-      select_next_hop(
+      plan_path(
         registry,
         route_policy,
         &open.trace_id,
         &open.destination,
         local,
         &candidates,
+        envelope.remaining_hops(),
       )
       .await,
     )
   } else {
     None
   };
-  match envelope.receive(local, peer, |_| {
-    chosen
-      .take()
-      .unwrap_or_else(|| Err(crate::Error::route_unavailable("route policy")))
+  match envelope.receive(local, peer, |_| match planned.take() {
+    Some(result) => result,
+    None => Err(crate::Error::route_unavailable("route policy")),
   }) {
     Ok(crate::routing::RouteProgress::Continue { context, next_hop }) => {
       if locked(forwarding).len() >= forwarding_capacity {
@@ -502,10 +505,12 @@ async fn relay_open(
       // attempt's timer; see [`arm_hop_deadline`]).
       deadline: None,
       // The untried branches of this hop: a failure acknowledgement from
-      // downstream re-dispatches here before surfacing upstream.
+      // downstream re-dispatches here before surfacing upstream. The
+      // re-dispatch carries no path — the alternative branch plans its
+      // own remainder from itself.
       phase: HopPhase::Discovering(Box::new(RetryState {
         open: open.clone(),
-        context: context.clone(),
+        context: context.clone().replanned(),
         candidates: candidates
           .iter()
           .filter(|candidate| *candidate != next_hop)
@@ -632,8 +637,9 @@ pub(crate) async fn on_downstream_failure(
     };
     let downstream_acks = entry.pending_acks.clone();
     let downstream_session = SessionIdentity::new(candidate.clone(), entry.session_id().clone());
-    // Re-encode the open with the SAME envelope state: the retry is an
-    // alternative branch at this hop, not extra depth.
+    // Re-encode the open with the same envelope state and no path: the
+    // retry is an alternative branch at this hop, not extra depth, and the
+    // branch plans its own remainder.
     let body = wire::encode_open(&OpenFrame {
       trace_id: trace_id.clone(),
       source: retry.open.source.clone(),
@@ -713,27 +719,39 @@ pub(crate) async fn on_downstream_failure(
   }
 }
 
-async fn select_next_hop(
+/// Plans this hop's route when the carried path is exhausted: a connected
+/// destination is one hop, otherwise the registered route policy plans the
+/// path (the built-in policy answers from the learned topology, or with
+/// one trace-keyed relay hop while nothing has been learned). The plan is
+/// validated at this boundary before it is carried.
+async fn plan_path(
   registry: &crate::routing::RoutingRegistry, route_policy: &crate::QualifiedTag, trace: &TraceId,
-  destination: &NodeId, local: &NodeId, peers: &[NodeId],
-) -> Result<NodeId> {
+  destination: &NodeId, local: &NodeId, peers: &[NodeId], remaining_hops: u32,
+) -> Result<Vec<NodeId>> {
   if peers.contains(destination) {
-    return Ok(destination.clone());
+    return Ok(vec![destination.clone()]);
   }
   // A tag naming no registered policy fails closed: with the default
   // registration this only happens for a caller tag that was never
   // registered on this node.
-  let hop =
-    crate::routing::resolve_next_hop(registry, route_policy, trace, destination, local, peers)
-      .await?
-      .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
-  if peers.contains(&hop) {
-    Ok(hop)
-  } else {
-    // A next hop without a live session cannot carry the frame; policies
-    // returning such nodes fail closed at this boundary.
-    Err(crate::Error::route_unavailable("route hop"))
+  let path = crate::routing::resolve_plan(
+    registry,
+    route_policy,
+    trace,
+    destination,
+    local,
+    peers,
+    remaining_hops,
+  )
+  .await?
+  .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
+  crate::routing::validate_planned_path(&path, remaining_hops)?;
+  if !path.first().is_some_and(|first| peers.contains(first)) {
+    // A plan that leaves along a node without a live session cannot carry
+    // the frame; policies returning such paths fail closed here.
+    return Err(crate::Error::route_unavailable("route hop"));
   }
+  Ok(path)
 }
 
 /// Whether an acknowledgement arriving on the session that owns `acks`
@@ -880,12 +898,10 @@ fn arm_hop_deadline(
 }
 
 /// The loop-free next-hop candidates for one forwarded open: the alive
-/// peers minus the visited chain, the source, and the current holder —
-/// any other choice is rejected by the envelope's own loop check after
-/// the policy picks it, so deterministic policies (minimum id) would
-/// fail closed on every attempt instead of progressing. Excluding the
-/// chain here makes strictly forward progress structural: the candidate
-/// set shrinks with every hop.
+/// peers minus the visited chain, the source, and the current holder. They
+/// are the eligible first hops of a fallback plan and the alternative
+/// branches of a failed attempt, so strictly forward progress stays
+/// structural: the candidate set shrinks with every hop.
 fn loop_free_candidates(
   source: &NodeId, current: &NodeId, visited: &[NodeId], peers: &[NodeId],
 ) -> Vec<NodeId> {
@@ -1389,7 +1405,7 @@ mod retry_tests {
           metadata: crate::StreamMetadata::new(),
           route: None,
         },
-        context: crate::routing::RouteContext::new(trace_id, node(1), node(9), 8),
+        context: crate::routing::RouteContext::new(trace_id, node(1), node(9), Vec::new(), 8),
         candidates,
         downstream_acks,
       })),
@@ -1611,7 +1627,8 @@ mod retry_tests {
     let forwarding = new_table();
     let budget = Duration::from_millis(500);
     let trace_id = trace(99);
-    let context = crate::routing::RouteContext::new(trace_id.clone(), node(1), node(9), 8);
+    let context =
+      crate::routing::RouteContext::new(trace_id.clone(), node(1), node(9), Vec::new(), 8);
     let open = crate::packet::wire::OpenFrame {
       trace_id: trace_id.clone(),
       source: node(1),

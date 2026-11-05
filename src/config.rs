@@ -155,12 +155,13 @@ impl NodeConfig {
     Ok(self)
   }
 
-  /// Selects the node's next-hop routing policy tag: when a
-  /// routed packet's destination is not directly connected, the tag
-  /// resolves in the extension registry and the registered policy picks
-  /// the single next hop. Without a tag the node relays through the
-  /// built-in [`crate::routing::DefaultNextHop`] policy, so multi-hop
-  /// routes work out of the box; setting a tag overrides the default.
+  /// Selects the node's next-hop routing policy tag: when a routed
+  /// packet's destination is not directly connected, the tag resolves in
+  /// the extension registry and the registered policy plans the route
+  /// (the ordered path the packet follows). Without a tag the node plans
+  /// through the built-in [`crate::routing::DefaultNextHop`] policy, so
+  /// multi-hop routes work out of the box; setting a tag overrides the
+  /// default.
   pub fn with_route_policy(mut self, tag: crate::QualifiedTag) -> Self {
     self.route_policy = Some(tag);
     self

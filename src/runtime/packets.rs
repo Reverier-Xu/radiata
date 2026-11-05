@@ -27,11 +27,13 @@ use crate::{
 /// handoff.
 pub(super) enum PumpHandoff {
   /// A remote destination: the loop spawns the outbound pump over the
-  /// resolved first-hop session.
+  /// resolved first-hop session. `route` is the decided route — the
+  /// planned path and the topology graph that observes its outcome — or
+  /// `None` for a direct delivery over the destination's own session.
   Remote {
     entry: SessionEntry,
     request: OutboundRequest,
-    force_routed: bool,
+    route: Option<crate::routing::PlannedRoute>,
   },
   /// The local node is the destination: the loop spawns the local pump,
   /// which admits and consumes the stream in-process — no session, no
@@ -88,11 +90,18 @@ impl PacketAdmission {
     &self, context: &Arc<LocalIdentityContext>, mut request: OutboundRequest,
   ) -> Result<Option<PumpHandoff>> {
     let trace_id = request.trace_id.clone();
+    // A caller-named path is the stream's own routing decision: it is
+    // validated here and then followed hop by hop.
+    let caller_path = match &request.target {
+      StreamTarget::Path { path, .. } => Some(path.clone()),
+      StreamTarget::Exact(_) | StreamTarget::MatchingNodes(_) => None,
+    };
     // Resolve matching-node targets to exactly one eligible destination
     // before any frame moves: candidates stream from the descriptor store,
     // the caller's policy picks one, and core re-validates the pick.
     let resolved = match &request.target {
       StreamTarget::Exact(destination) => Ok(destination.clone()),
+      StreamTarget::Path { destination, .. } => Ok(destination.clone()),
       StreamTarget::MatchingNodes(selector) => {
         self
           .select_matching_destination(context, selector, request.load_balancer.as_ref())
@@ -123,8 +132,8 @@ impl PacketAdmission {
       return Err(error);
     }
     // The stream's routing policy resolves here, before the node-level
-    // route policy decides a first hop: an unregistered tag fails typed
-    // at admission instead of silently routing direct.
+    // route policy plans a path: an unregistered tag fails typed at
+    // admission instead of silently routing direct.
     let stream_policy = match self.extensions.routing_policy(request.routing_policy.tag()) {
       Some(policy) => policy,
       None => {
@@ -156,52 +165,136 @@ impl PacketAdmission {
       .map_err(Error::session_table)?
       .get(&destination)
       .cloned();
-    // A direct path is preferred; without one, the stream's routing
-    // policy may route through a connected peer. The pump then emits the
-    // route envelope so every intermediate hop re-validates the chain.
+    // A direct path is preferred for an exact target; without one, the
+    // stream's routing policy (or the node-level route policy for the
+    // built-in direct policy) plans the route. A caller-named path is
+    // authoritative either way: the caller already decided the route.
     let direct = entry.filter(|entry| entry.alive());
     debug!(
       destination = %destination,
       direct = direct.is_some(),
+      caller_path = caller_path.is_some(),
       routing_policy = %request.routing_policy,
       "routing packet toward destination"
     );
-    let (entry, force_routed) = match direct {
-      Some(entry) => (entry, false),
-      None => match self
-        .select_forward_entry(
-          &trace_id,
-          &destination,
-          &request.routing_policy,
-          stream_policy,
-        )
+    let route = match caller_path {
+      Some(path) => match self
+        .caller_route(context, &destination, &path, request.max_hops)
         .await
       {
-        Ok(Some(entry)) => (entry, true),
-        // No eligible hop exists: the caller observes the typed refusal
-        // through the request's rejection and the recorded route
-        // failure, so the dispatch outcome itself is not interesting.
-        Ok(None) => {
-          fail(request, ErrorKind::RouteUnavailable);
-          return Ok(None);
-        }
-        // A failed first-hop resolution still ends the route explicitly:
-        // bounded terminal trace metadata records the resolution
-        // failure's own kind, while the caller sees the stable
-        // route-unavailable dispatch outcome (a policy's internal
-        // rejection kind is not a caller-facing ack status).
+        Ok(path) => path,
         Err(error) => {
+          debug!(
+            destination = %destination,
+            kind = ?error.kind(),
+            "caller-named path rejected at admission"
+          );
           self.record_route_failure(&trace_id, error.kind());
           request.reject(ErrorKind::RouteUnavailable);
           return Ok(None);
         }
       },
+      None => match direct {
+        Some(entry) => {
+          return Ok(Some(PumpHandoff::Remote {
+            entry,
+            request,
+            route: None,
+          }));
+        }
+        None => match self
+          .select_route(
+            &trace_id,
+            &destination,
+            &request.routing_policy,
+            stream_policy,
+            request.max_hops,
+          )
+          .await
+        {
+          Ok(Some(path)) => path,
+          // No eligible hop exists: the caller observes the typed refusal
+          // through the request's rejection and the recorded route
+          // failure, so the dispatch outcome itself is not interesting.
+          Ok(None) => {
+            fail(request, ErrorKind::RouteUnavailable);
+            return Ok(None);
+          }
+          // A failed route resolution still ends the route explicitly:
+          // bounded terminal trace metadata records the resolution
+          // failure's own kind, while the caller sees the stable
+          // route-unavailable dispatch outcome (a policy's internal
+          // rejection kind is not a caller-facing ack status).
+          Err(error) => {
+            self.record_route_failure(&trace_id, error.kind());
+            request.reject(ErrorKind::RouteUnavailable);
+            return Ok(None);
+          }
+        },
+      },
+    };
+    let Some(entry) = self.first_hop_entry(&route)? else {
+      debug!(
+        destination = %destination,
+        hops = route.len(),
+        "route's first hop has no live session"
+      );
+      fail(request, ErrorKind::RouteUnavailable);
+      return Ok(None);
     };
     Ok(Some(PumpHandoff::Remote {
       entry,
       request,
-      force_routed,
+      route: Some(crate::routing::PlannedRoute {
+        path: route,
+        graph: Arc::clone(self.extensions.routing().graph()),
+      }),
     }))
+  }
+
+  /// The live session of one route's first hop; `None` when the hop has no
+  /// usable session, which fails the route explicitly at the caller.
+  fn first_hop_entry(&self, path: &[NodeId]) -> Result<Option<SessionEntry>> {
+    let Some(first) = path.first() else {
+      return Ok(None);
+    };
+    Ok(
+      self
+        .sessions
+        .lock()
+        .map_err(Error::session_table)?
+        .get(first)
+        .filter(|entry| entry.alive())
+        .cloned(),
+    )
+  }
+
+  /// Validates one caller-named path at admission: the shape again (the
+  /// request may be built internally), every hop a known member, and the
+  /// first hop a live session this node can actually send over. The
+  /// remaining hops are the caller's claim; each is checked by the node
+  /// that has to forward to it.
+  async fn caller_route(
+    &self, context: &Arc<LocalIdentityContext>, destination: &NodeId, path: &[NodeId],
+    max_hops: u32,
+  ) -> Result<Vec<NodeId>> {
+    crate::packet::validate_caller_path(destination, path, max_hops)?;
+    let peers = crate::sync_common::alive_peers(&self.sessions)?;
+    let Some(first) = path.first() else {
+      return Err(Error::invalid_input("stream path"));
+    };
+    if !peers.contains(first) {
+      return Err(Error::route_unavailable("stream path"));
+    }
+    for hop in path {
+      if crate::membership::store::read_descriptor_ctx(context.store(), hop)
+        .await?
+        .is_none()
+      {
+        return Err(Error::not_found("stream path hop"));
+      }
+    }
+    Ok(path.to_vec())
   }
 
   /// Terminates a handoff the control loop can no longer start because
@@ -230,31 +323,34 @@ impl PacketAdmission {
       )));
   }
 
-  /// Resolves one live downstream session for a routed first hop. The
-  /// stream's own routing policy decides the hop; the built-in direct
-  /// policy never relays, so a stream under it keeps the node-level route
-  /// policy's behavior (the caller selection, or the built-in default
-  /// policy). `Ok(None)` means no eligible hop exists and the caller
-  /// fails the route explicitly.
-  async fn select_forward_entry(
+  /// Resolves one route plan for a routed first hop. The stream's own
+  /// routing policy plans it; the built-in direct policy never relays, so
+  /// a stream under it keeps the node-level route policy's behavior (the
+  /// caller selection, or the built-in default policy). The returned path
+  /// is validated at this boundary: non-empty, duplicate-free, inside the
+  /// hop budget, ending at the destination, and starting at a live peer.
+  /// `Ok(None)` means no eligible plan exists and the caller fails the
+  /// route explicitly.
+  async fn select_route(
     &self, trace: &TraceId, destination: &NodeId, routing_policy: &crate::RoutingPolicy,
-    stream_policy: Arc<dyn crate::RouteNextHop>,
-  ) -> Result<Option<SessionEntry>> {
+    stream_policy: Arc<dyn crate::RouteNextHop>, max_hops: u32,
+  ) -> Result<Option<Vec<NodeId>>> {
     let local = self.local.clone();
     let peers = crate::sync_common::alive_peers(&self.sessions)?;
-    let hop = if routing_policy.tag() == crate::RoutingPolicy::DIRECT.tag() {
+    let path = if routing_policy.tag() == crate::RoutingPolicy::DIRECT.tag() {
       let tag = self.config.route_policy()?;
-      match crate::routing::resolve_next_hop(
+      match crate::routing::resolve_plan(
         self.extensions.routing(),
         &tag,
         trace,
         destination,
         &local,
         &peers,
+        max_hops,
       )
       .await
       {
-        Ok(Some(hop)) => hop,
+        Ok(Some(path)) => path,
         Ok(None) => {
           tracing::warn!(tag = %tag, "configured route policy is not registered");
           return Ok(None);
@@ -265,18 +361,24 @@ impl PacketAdmission {
       // A registered stream policy is authoritative for its stream: its
       // rejection fails the route instead of falling back to the
       // node-level policy.
-      crate::routing::next_hop_of(stream_policy.as_ref(), trace, destination, &local, &peers)
-        .await?
+      crate::routing::plan_of(
+        stream_policy.as_ref(),
+        trace,
+        destination,
+        &local,
+        &peers,
+        max_hops,
+      )
+      .await?
     };
-    let entry = self
-      .sessions
-      .lock()
-      .map_err(Error::session_table)?
-      .get(&hop)
-      .filter(|entry| entry.alive())
-      .cloned();
-    debug!(hop = %hop, selected = entry.is_some(), "forward candidate resolved");
-    Ok(entry)
+    crate::routing::validate_planned_path(&path, max_hops)?;
+    if !path.first().is_some_and(|first| peers.contains(first)) {
+      // A plan that leaves along a node without a live session cannot
+      // carry the frame; policies returning such paths fail closed here.
+      return Err(Error::route_unavailable("route hop"));
+    }
+    debug!(hops = path.len(), "route plan resolved");
+    Ok(Some(path))
   }
 
   /// Resolves one matching-node target to exactly one eligible

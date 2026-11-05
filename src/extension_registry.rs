@@ -327,7 +327,7 @@ impl ExtensionRegistry {
 
   /// Registers one stream-level routing policy under the stream's
   /// [`crate::RoutingPolicy`] tag: the registered [`crate::RouteNextHop`]
-  /// implementation selects the next hop for every stream carrying that
+  /// implementation plans the route for every stream carrying that
   /// policy. A duplicate tag is a conflict; registration never replaces
   /// an existing entry. The built-in `radiata.woooo.tech` domain is
   /// reserved — the core direct policy is installed there by the default
@@ -342,7 +342,7 @@ impl ExtensionRegistry {
 
   /// The registered routing policy for one stream tag, when present. The
   /// admission plane resolves a stream's [`crate::RoutingPolicy`] here
-  /// before the node-level route policy decides a first hop.
+  /// before the node-level route policy plans the route.
   pub(crate) fn routing_policy(
     &self, tag: &crate::QualifiedTag,
   ) -> Option<Arc<dyn crate::RouteNextHop>> {
@@ -692,7 +692,10 @@ mod tests {
 
     let hop_tag = crate::routing::DefaultNextHop::tag().unwrap();
     registry
-      .register_next_hop(hop_tag.clone(), Arc::new(crate::routing::DefaultNextHop))
+      .register_next_hop(
+        hop_tag.clone(),
+        Arc::new(crate::routing::DefaultNextHop::default()),
+      )
       .unwrap();
     let expected_hop = registry.next_hop_policy(&hop_tag).unwrap();
 
@@ -824,10 +827,13 @@ mod tests {
     let mut registry = ExtensionRegistry::new();
     let tag = crate::routing::DefaultNextHop::tag().unwrap();
     registry
-      .register_next_hop(tag.clone(), Arc::new(crate::routing::DefaultNextHop))
+      .register_next_hop(
+        tag.clone(),
+        Arc::new(crate::routing::DefaultNextHop::default()),
+      )
       .unwrap();
     let error = registry
-      .register_next_hop(tag, Arc::new(crate::routing::DefaultNextHop))
+      .register_next_hop(tag, Arc::new(crate::routing::DefaultNextHop::default()))
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Conflict);
   }
@@ -857,7 +863,7 @@ mod tests {
     let reserved = registry
       .register_routing_policy(
         crate::RoutingPolicy::DIRECT.tag().clone(),
-        Arc::new(crate::routing::DefaultNextHop),
+        Arc::new(crate::routing::DefaultNextHop::default()),
       )
       .unwrap_err();
     assert_eq!(reserved.kind(), ErrorKind::InvalidInput);
@@ -865,11 +871,14 @@ mod tests {
 
     let caller = crate::QualifiedTag::parse("example.com/route-policies/shortest").unwrap();
     registry
-      .register_routing_policy(caller.clone(), Arc::new(crate::routing::DefaultNextHop))
+      .register_routing_policy(
+        caller.clone(),
+        Arc::new(crate::routing::DefaultNextHop::default()),
+      )
       .unwrap();
     assert!(registry.routing_policy(&caller).is_some());
     let duplicate = registry
-      .register_routing_policy(caller, Arc::new(crate::routing::DefaultNextHop))
+      .register_routing_policy(caller, Arc::new(crate::routing::DefaultNextHop::default()))
       .unwrap_err();
     assert_eq!(duplicate.kind(), ErrorKind::Conflict);
     assert!(

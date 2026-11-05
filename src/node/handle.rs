@@ -44,20 +44,23 @@ impl NodeHandle {
   /// until [`OutboundStream::send_sync`] or [`OutboundStream::send_async`]
   /// consumes the body.
   ///
-  /// An exact-node target rejects a load-balancer selection; a
+  /// An exact-node or path target rejects a load-balancer selection; a
   /// matching-node target requires one whose tag resolves in the node's
-  /// [`ExtensionRegistry`]. The routing policy tag resolves in the same
-  /// registry at admission — an unregistered policy fails there — and
-  /// the protocol tag must be registered.
+  /// [`ExtensionRegistry`]. A caller-named path is validated here for
+  /// shape (non-empty, duplicate-free, inside the hop budget, ending at
+  /// the destination) and at admission for reachability. The routing
+  /// policy tag resolves in the same registry at admission — an
+  /// unregistered policy fails there — and the protocol tag must be
+  /// registered.
   pub fn open_stream(
     &self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy,
     metadata: StreamMetadata,
   ) -> Result<OutboundStream> {
     match (&target, policy.load_balancing_policy()) {
-      (StreamTarget::Exact(_), Some(_)) => {
+      (StreamTarget::Exact(_) | StreamTarget::Path { .. }, Some(_)) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
-      (StreamTarget::Exact(_), None) => {}
+      (StreamTarget::Exact(_) | StreamTarget::Path { .. }, None) => {}
       (StreamTarget::MatchingNodes(_), None) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
@@ -67,6 +70,9 @@ impl NodeHandle {
           return Err(Error::invalid_input("packet load balancer"));
         }
       }
+    }
+    if let StreamTarget::Path { destination, path } = &target {
+      crate::packet::validate_caller_path(destination, path, policy.max_hops())?;
     }
     if !self.extensions.has_protocol(&protocol) {
       return Err(Error::unsupported("packet protocol"));

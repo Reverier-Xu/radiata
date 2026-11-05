@@ -177,6 +177,9 @@ pub radiata::StoreOperation::Put::value: radiata::StoreValue
 #[non_exhaustive] pub enum radiata::StreamTarget
 pub radiata::StreamTarget::Exact(radiata::NodeId)
 pub radiata::StreamTarget::MatchingNodes(radiata::Selector)
+pub radiata::StreamTarget::Path
+pub radiata::StreamTarget::Path::destination: radiata::NodeId
+pub radiata::StreamTarget::Path::path: alloc::vec::Vec<radiata::NodeId>
 pub enum radiata::TaskPhase
 pub radiata::TaskPhase::Failed
 pub radiata::TaskPhase::Pending
@@ -240,7 +243,7 @@ pub struct radiata::DefaultNextHop
 impl radiata::DefaultNextHop
 pub const radiata::DefaultNextHop::TAG: &'static str
 impl radiata::RouteNextHop for radiata::DefaultNextHop
-pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+pub fn radiata::DefaultNextHop::plan<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<alloc::vec::Vec<radiata::NodeId>>>
 pub struct radiata::DeliveryAck
 impl radiata::DeliveryAck
 pub fn radiata::DeliveryAck::admitted_at(&self) -> std::time::SystemTime
@@ -477,6 +480,7 @@ impl radiata::NextHopView<'_>
 pub fn radiata::NextHopView<'_>::destination(&self) -> &radiata::NodeId
 pub fn radiata::NextHopView<'_>::local(&self) -> &radiata::NodeId
 pub fn radiata::NextHopView<'_>::peers(&self) -> &[radiata::NodeId]
+pub fn radiata::NextHopView<'_>::remaining_hops(&self) -> u32
 pub fn radiata::NextHopView<'_>::trace(&self) -> &radiata::TraceId
 pub struct radiata::NodeBuilder
 impl radiata::NodeBuilder
@@ -1098,9 +1102,9 @@ pub fn radiata::ResourceHook::mutate(&self, radiata::ResourceWrite) -> radiata::
 pub fn radiata::ResourceHook::observed<'a>(&'a self, &'a radiata::ResourceView) -> radiata::BoxFuture<'a, radiata::Result<()>>
 pub fn radiata::ResourceHook::validate(&self, &radiata::ResourceWrite) -> radiata::Result<()>
 pub trait radiata::RouteNextHop: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
-pub fn radiata::RouteNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+pub fn radiata::RouteNextHop::plan<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<alloc::vec::Vec<radiata::NodeId>>>
 impl radiata::RouteNextHop for radiata::DefaultNextHop
-pub fn radiata::DefaultNextHop::next_hop<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
+pub fn radiata::DefaultNextHop::plan<'a>(&'a self, radiata::NextHopView<'a>) -> radiata::BoxFuture<'a, radiata::Result<alloc::vec::Vec<radiata::NodeId>>>
 pub trait radiata::TaskReconciler: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::TaskReconciler::reconcile<'a>(&'a self, radiata::ReconcileContext) -> radiata::BoxFuture<'a, radiata::Result<radiata::ReconcileDecision>>
 pub trait radiata::TransportProvider: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static

@@ -136,6 +136,11 @@ async fn send_terminal(entry: &SessionEntry, trace_id: &TraceId, reason: EndReas
 /// the synchronous waiter of the admission outcome (the ack
 /// proves current-process admission only).
 ///
+/// `route` is the origin's decided route: the planned path carried in the
+/// envelope and the topology graph that observes the attempt's terminal
+/// outcome. `None` is a direct delivery — no envelope, and nothing for the
+/// graph to learn.
+///
 /// Every post-admission exit is one terminal decision: a completed body ends
 /// the stream `Completed`, and every failure — a body read error, a failed
 /// or cancelled chunk pump, or a completion that cannot be delivered — ends
@@ -151,13 +156,16 @@ async fn send_terminal(entry: &SessionEntry, trace_id: &TraceId, reason: EndReas
 ))]
 pub(crate) async fn run_outbound(
   entry: SessionEntry, local: NodeId, request: OutboundRequest, routes: RouteTable,
-  force_routed: bool, trace: Option<crate::routing::trace::TraceSink>,
+  route: Option<crate::routing::PlannedRoute>, trace: Option<crate::routing::trace::TraceSink>,
   events: Arc<crate::node::EventHub>,
 ) {
   // The supervisor resolves selector targets before spawning the pump; a
   // matching-node request that reaches this point is an internal error.
   let destination = match request.target.clone() {
     StreamTarget::Exact(destination) => destination,
+    // The admission plane rewrote a path target to its exact destination
+    // and carries the path in `route`.
+    StreamTarget::Path { destination, .. } => destination,
     StreamTarget::MatchingNodes(_) => {
       request.reject(ErrorKind::Internal);
       return;
@@ -167,7 +175,9 @@ pub(crate) async fn run_outbound(
   let source = local.clone();
   // Fire-and-forget persistence of one durable terminal fact per packet;
   // the data plane never waits on metadata storage and intermediate
-  // progress stays an in-memory observation.
+  // progress stays an in-memory observation. The same terminal is the
+  // topology observation the learned graph keeps: the attempt either
+  // delivered or it did not.
   macro_rules! terminal {
     ($kind:expr) => {{
       record_route_terminal(
@@ -179,9 +189,15 @@ pub(crate) async fn run_outbound(
         &destination,
         TraceTransition::Failed($kind),
       );
+      record_route_outcome(
+        &route,
+        &destination,
+        &source,
+        crate::routing::RouteOutcome::Failed,
+      );
     }};
   }
-  trace!(force_routed, "pumping outbound packet");
+  trace!(routed = route.is_some(), "pumping outbound packet");
   let (ack_tx, ack_rx) = oneshot::channel();
   if !entry.alive() {
     debug!("packet rejected: session not alive");
@@ -203,23 +219,28 @@ pub(crate) async fn run_outbound(
     }
   }
 
-  // Selector-selected and multi-hop-routed deliveries carry the route
-  // envelope: every hop re-validates the chain before admission. Direct
-  // exact-node sends carry no envelope. (Matching-node targets were
-  // rejected above; `force_routed` is the only remaining envelope
-  // trigger.)
-  let route = if force_routed {
-    Some(
-      crate::routing::RouteContext::new(
+  // A routed delivery carries the route envelope: the origin's planned
+  // path, which every hop follows. A direct delivery carries no envelope.
+  let route_state = match route.as_ref() {
+    Some(planned) => {
+      let envelope = crate::routing::RouteContext::new(
         trace_id.clone(),
         local.clone(),
         destination.clone(),
+        planned.path.clone(),
         request.max_hops,
-      )
-      .hop_state(),
-    )
-  } else {
-    None
+      );
+      match envelope.dispatch() {
+        Ok((_, dispatched)) => Some(dispatched.hop_state()),
+        Err(error) => {
+          withdraw_pending(&entry, &trace_id);
+          request.reject(error.kind());
+          terminal!(error.kind());
+          return;
+        }
+      }
+    }
+    None => None,
   };
   let open = OpenFrame {
     trace_id: trace_id.clone(),
@@ -227,7 +248,7 @@ pub(crate) async fn run_outbound(
     destination: destination.clone(),
     protocol: request.protocol.clone(),
     metadata: request.metadata.clone(),
-    route,
+    route: route_state,
   };
   let body = match wire::encode_open(&open) {
     Ok(body) => body,
@@ -330,7 +351,28 @@ pub(crate) async fn run_outbound(
     &destination,
     TraceTransition::Delivered,
   );
+  record_route_outcome(
+    &route,
+    &destination,
+    &source,
+    crate::routing::RouteOutcome::Delivered,
+  );
   debug!(trace_id = %trace_id, "packet stream finished");
+}
+
+/// Records one attempt's terminal outcome in the learned topology: the
+/// path the attempt walked either delivered or it did not, and the graph
+/// weighs the next plan by that evidence. A direct delivery (no route)
+/// teaches nothing.
+fn record_route_outcome(
+  route: &Option<crate::routing::PlannedRoute>, destination: &NodeId, origin: &NodeId,
+  outcome: crate::routing::RouteOutcome,
+) {
+  if let Some(planned) = route {
+    planned
+      .graph
+      .record(destination, origin, &planned.path, outcome);
+  }
 }
 
 /// Records one terminal route fact for an origin-side pump: the in-memory
@@ -585,7 +627,7 @@ mod pump_tail_durable_tests {
         node(1),
         request,
         routes.clone(),
-        false,
+        None,
         Some(sink.clone()),
         events,
       ),
@@ -644,7 +686,7 @@ mod pump_tail_durable_tests {
         node(1),
         request,
         routes.clone(),
-        false,
+        None,
         Some(sink.clone()),
         events,
       ),
@@ -744,7 +786,7 @@ mod body_failure_tests {
         node(1),
         request,
         routes.clone(),
-        false,
+        None,
         None,
         Arc::new(crate::node::EventHub::new()),
       ),
@@ -817,7 +859,7 @@ mod body_failure_tests {
         node(1),
         request,
         routes.clone(),
-        false,
+        None,
         None,
         Arc::new(crate::node::EventHub::new()),
       ),
@@ -840,6 +882,153 @@ mod body_failure_tests {
         .get(&trace_id)
         .map(|record| record.state.clone()),
       Some(RouteState::Delivered)
+    );
+  }
+}
+
+#[cfg(test)]
+mod learned_topology_tests {
+  use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+  use tokio::sync::oneshot;
+
+  use super::*;
+  use crate::packet::{RouteRecord, StaticBody};
+
+  fn node(value: u8) -> NodeId {
+    NodeId::parse(&format!("node-{value:021}")).unwrap()
+  }
+
+  fn trace(seed: u32) -> TraceId {
+    TraceId::parse(&format!("trace-{seed:021}")).unwrap()
+  }
+
+  /// Resolves the pump's admission wait the moment it registers.
+  async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+      let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
+        PendingAck::Wait { notify, .. } => {
+          let _ = notify.send(Ok(std::time::UNIX_EPOCH));
+          true
+        }
+        PendingAck::Relay { .. } => false,
+      });
+      if resolved == Some(true) {
+        return;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the pump's admission wait never registered"
+      );
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+  }
+
+  fn request(trace_id: TraceId, destination: &NodeId) -> OutboundRequest {
+    let (ack_notify, _ack_rx) = oneshot::channel();
+    OutboundRequest {
+      trace_id,
+      target: crate::packet::StreamTarget::Exact(destination.clone()),
+      routing_policy: crate::RoutingPolicy::DIRECT,
+      load_balancer: None,
+      max_hops: 4,
+      protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      metadata: crate::StreamMetadata::new(),
+      body: Box::pin(StaticBody::new(Arc::from(&b"learn"[..]))),
+      internal: false,
+      ack_notify,
+    }
+  }
+
+  /// The pump feeds the learned topology: a delivered attempt lowers the
+  /// cost of every edge of the path it walked, and a failed attempt raises
+  /// it, so the default policy plans over what actually happened.
+  #[tokio::test]
+  async fn the_pump_records_the_attempt_outcome_in_the_learned_topology() {
+    let graph = Arc::new(crate::routing::TopologyGraph::new());
+    let destination = node(3);
+    let path = vec![node(2), destination.clone()];
+
+    // A delivered attempt: the origin's session admits the stream.
+    let trace_id = trace(61);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(
+      &routes,
+      8,
+      RouteRecord::new(trace_id.clone(), destination.clone()),
+    )
+    .unwrap();
+    let (entry, _receiver) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    let arm_entry = entry.clone();
+    let arm_trace = trace_id.clone();
+    let armed = tokio::spawn(async move { arm_admission(&arm_entry, &arm_trace).await });
+    let planned = crate::routing::PlannedRoute {
+      path: path.clone(),
+      graph: Arc::clone(&graph),
+    };
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        request(trace_id, &destination),
+        routes,
+        Some(planned),
+        None,
+        Arc::new(crate::node::EventHub::new()),
+      ),
+    )
+    .await
+    .expect("the pump finishes within the deadline");
+    armed.await.unwrap();
+    assert_eq!(
+      graph.edge_weight(&destination, &node(1), &node(2)),
+      Some(0.5),
+      "one success halves the first edge's cost"
+    );
+    assert_eq!(
+      graph.edge_weight(&destination, &node(2), &destination),
+      Some(0.5),
+      "the path's last edge is observed too"
+    );
+
+    // A failed attempt (the session is already gone): the same edges grow
+    // more expensive.
+    let trace_id = trace(62);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(
+      &routes,
+      8,
+      RouteRecord::new(trace_id.clone(), destination.clone()),
+    )
+    .unwrap();
+    let (entry, receiver) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    drop(receiver);
+    let planned = crate::routing::PlannedRoute {
+      path: path.clone(),
+      graph: Arc::clone(&graph),
+    };
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        request(trace_id, &destination),
+        routes,
+        Some(planned),
+        None,
+        Arc::new(crate::node::EventHub::new()),
+      ),
+    )
+    .await
+    .expect("the pump finishes within the deadline");
+    assert_eq!(
+      graph.edge_weight(&destination, &node(1), &node(2)),
+      Some(1.0),
+      "the failure raises the first edge's cost from 0.5 back to 1.0"
     );
   }
 }

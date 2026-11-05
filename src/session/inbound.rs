@@ -1688,7 +1688,7 @@ mod ack_attribution_tests {
           metadata: crate::StreamMetadata::new(),
           route: None,
         },
-        context: RouteContext::new(trace_id, node(3), node(9), 8),
+        context: RouteContext::new(trace_id, node(3), node(9), Vec::new(), 8),
         candidates: Vec::new(),
         downstream_acks,
       })),

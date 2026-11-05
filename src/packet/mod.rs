@@ -43,19 +43,19 @@ use crate::{
 ///
 /// The built-in [`RoutingPolicy::DIRECT`] policy never relays: a stream
 /// under it is delivered over the authenticated session to the exact
-/// destination node, and the node's configured route policy selects a
-/// first hop when the destination is not directly connected (the
-/// pre-policy behavior). Any other registered policy selects the next
-/// hop for its stream itself. Selection among label-matching members is
-/// a separate concern: [`StreamTarget::MatchingNodes`] with the
-/// registered load balancer.
+/// destination node, and the node's configured route policy plans the
+/// route when the destination is not directly connected (the pre-policy
+/// behavior). Any other registered policy plans the route for its stream
+/// itself, and its plan is carried in the packet's route envelope.
+/// Selection among label-matching members is a separate concern:
+/// [`StreamTarget::MatchingNodes`] with the registered load balancer.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RoutingPolicy(QualifiedTag);
 
 impl RoutingPolicy {
   /// The built-in direct policy: the stream carries no relay policy of
-  /// its own, so the node's configured route policy keeps deciding the
-  /// first hop of a destination that is not directly connected.
+  /// its own, so the node's configured route policy keeps planning the
+  /// route to a destination that is not directly connected.
   pub const DIRECT: Self = Self(QualifiedTag::from_static(
     "radiata.woooo.tech/route-policies/direct",
   ));
@@ -111,9 +111,14 @@ pub(crate) const METADATA_MAX_BYTES: usize = 32 * 1_024;
 /// public limit; core chunks large caller writes stay constant-memory.
 pub(crate) const MAX_CHUNK_BYTES: usize = 32 * 1_024;
 
-/// A stream destination: an exact authenticated node, or one node selected
+/// The maximum number of hops one caller-named path may carry. Admission
+/// validates every hop, so the bound keeps that work finite independently
+/// of the caller's hop budget.
+pub(crate) const STREAM_PATH_MAX_HOPS: usize = 64;
+
+/// A stream destination: an exact authenticated node, one node selected
 /// by the registered load balancer from the members whose owned labels
-/// match the selector.
+/// match the selector, or an ordered path the caller names itself.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamTarget {
@@ -122,6 +127,45 @@ pub enum StreamTarget {
   /// Delivers to the single node a registered load-balancing policy
   /// selects among the label-matching members.
   MatchingNodes(crate::Selector),
+  /// Delivers along the caller's ordered path: `path` lists the nodes the
+  /// stream is forwarded through, excluding this node and ending at
+  /// `destination`. Admission validates the path and then every hop
+  /// follows it exactly; no routing policy decides a hop of it.
+  Path {
+    /// The final node of `path`: the stream's destination.
+    destination: NodeId,
+    /// The ordered hops from the origin to `destination`, ending at
+    /// `destination`.
+    path: Vec<NodeId>,
+  },
+}
+
+/// Validates the caller-named path shape before any delivery work: it
+/// must be non-empty, bounded by both the caller's hop budget and the
+/// core path bound, duplicate-free, and end at the destination. Admission
+/// then validates reachability: every hop must be a known member, and the
+/// first hop a live session this node can send over.
+pub(crate) fn validate_caller_path(
+  destination: &NodeId, path: &[NodeId], max_hops: u32,
+) -> Result<()> {
+  if path.is_empty() {
+    return Err(Error::invalid_input("stream path"));
+  }
+  if path.len() > STREAM_PATH_MAX_HOPS
+    || path.len() > usize::try_from(max_hops).unwrap_or(usize::MAX)
+  {
+    return Err(Error::resource_exhausted("stream path"));
+  }
+  let mut seen = std::collections::BTreeSet::new();
+  for node in path {
+    if !seen.insert(node) {
+      return Err(Error::invalid_input("stream path"));
+    }
+  }
+  if path.last() != Some(destination) {
+    return Err(Error::invalid_input("stream path"));
+  }
+  Ok(())
 }
 
 /// The caller-selected routing policy for one stream.
@@ -473,8 +517,9 @@ impl IncomingStream {
   /// `max_hops` is the number of relays the reply may traverse (at least
   /// one, rejected as `InvalidInput` otherwise). The routing plane still
   /// delivers directly whenever the source is directly connected and
-  /// consults the node's next-hop policy only for the remaining hops, so
-  /// the same call is correct on direct and relayed return paths. Use
+  /// plans the route through the node's next-hop policy only for a
+  /// destination that is not, so the same call is correct on direct and
+  /// relayed return paths. Use
   /// this variant when the source of the incoming stream is not a direct
   /// peer — a request that arrived over a relay chain must be answered
   /// over one — and keep [`Self::derive_return_stream`] when the source

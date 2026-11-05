@@ -151,8 +151,9 @@ impl EndReason {
 
 /// The wire-carried per-hop route state of one routed open frame
 /// (canonical, bounded): the current upstream holder, the visited chain,
-/// and the remaining caller-selected hop budget. Identity fields (trace,
-/// source, destination) ride the frame itself and are not duplicated.
+/// the remaining caller-selected hop budget, and the remaining path after
+/// the holder. Identity fields (trace, source, destination) ride the frame
+/// itself and are not duplicated.
 #[derive(Encode, Decode)]
 #[cbor(array)]
 struct RouteWire {
@@ -162,6 +163,10 @@ struct RouteWire {
   visited: Vec<String>,
   #[n(2)]
   remaining_hops: u32,
+  /// The remaining path after `current`, ending at the destination. Empty
+  /// means the next holder plans the remainder from itself.
+  #[n(3)]
+  path: Vec<String>,
 }
 
 #[derive(Encode, Decode)]
@@ -225,6 +230,7 @@ pub(crate) fn encode_open(frame: &OpenFrame) -> Result<Vec<u8>> {
     current: route.current.to_string(),
     visited: route.visited.iter().map(NodeId::to_string).collect(),
     remaining_hops: route.remaining_hops,
+    path: route.path.iter().map(NodeId::to_string).collect(),
   });
   encode_canonical(
     &OpenWire {
@@ -242,8 +248,9 @@ pub(crate) fn encode_open(frame: &OpenFrame) -> Result<Vec<u8>> {
 /// Decodes one packet-open frame body, enforcing the single six-element
 /// shape (direct delivery carries a `None` route element), canonical
 /// encoding, canonical metadata ordering, the bounded metadata map, and —
-/// for routed frames — a duplicate-free visited chain. The caller-selected
-/// parser limits bound every decode allocation.
+/// for routed frames — a duplicate-free visited chain and a duplicate-free
+/// remaining path. The caller-selected parser limits bound every decode
+/// allocation.
 pub(crate) fn decode_open(body: &[u8], limits: CborLimits) -> Result<OpenFrame> {
   let wire: OpenWire = decode_canonical_strict(body, limits, "packet open canonical")?;
   open_from_wire(wire)
@@ -257,6 +264,7 @@ fn open_from_wire(wire: OpenWire) -> Result<OpenFrame> {
   for (key, value) in wire.metadata {
     metadata = metadata.insert(key.parse()?, Arc::from(value.as_slice()))?;
   }
+  let destination: NodeId = wire.destination.parse()?;
   let route = match wire.route {
     Some(route) => {
       let current = route.current.parse()?;
@@ -271,10 +279,24 @@ fn open_from_wire(wire: OpenWire) -> Result<OpenFrame> {
           return Err(Error::invalid_input("packet route chain"));
         }
       }
+      let mut path: Vec<NodeId> = Vec::with_capacity(route.path.len());
+      for node in route.path {
+        path.push(node.parse()?);
+      }
+      // The path is structurally one route: duplicate-free. It may stop
+      // short of the destination — the holder of its last entry plans the
+      // remainder — so its end is not pinned here.
+      let mut seen: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+      for node in &path {
+        if !seen.insert(node.clone()) {
+          return Err(Error::invalid_input("packet route path"));
+        }
+      }
       Some(HopState {
         current,
         visited,
         remaining_hops: route.remaining_hops,
+        path,
       })
     }
     None => None,
@@ -282,7 +304,7 @@ fn open_from_wire(wire: OpenWire) -> Result<OpenFrame> {
   Ok(OpenFrame {
     trace_id: wire.trace_id.parse()?,
     source: wire.source.parse()?,
-    destination: wire.destination.parse()?,
+    destination,
     protocol: wire.protocol.parse()?,
     metadata,
     route,
@@ -611,7 +633,7 @@ mod route_tests {
   }
 
   /// The current routed-frame shape round-trips canonically with its
-  /// per-hop state.
+  /// per-hop state, including the remaining path.
   #[test]
   fn routed_open_frame_round_trips_canonically() {
     let (trace_id, source, destination, holder) = ids();
@@ -625,6 +647,7 @@ mod route_tests {
         current: holder.clone(),
         visited: vec![source],
         remaining_hops: 3,
+        path: vec![destination.clone()],
       }),
     };
     let body = encode_open(&frame).unwrap();
@@ -639,6 +662,7 @@ mod route_tests {
       vec![NodeId::parse("node-000000000000000000001").unwrap()]
     );
     assert_eq!(route.remaining_hops, 3);
+    assert_eq!(route.path, vec![destination]);
   }
 
   /// A frame without a route decodes with `None` route state — direct
@@ -697,6 +721,7 @@ mod route_tests {
           "node-000000000000000000005".to_owned(),
         ],
         remaining_hops: 2,
+        path: vec![destination.to_string()],
       }),
     };
     let body = encode_canonical(&wire, CONTROL_CBOR_LIMITS).unwrap();
@@ -718,6 +743,7 @@ mod route_tests {
         current: NodeId::parse("node-000000000000000000009").unwrap(),
         visited: Vec::new(),
         remaining_hops: 1,
+        path: Vec::new(),
       }),
     };
     let body = encode_open(&frame).unwrap();
@@ -725,5 +751,43 @@ mod route_tests {
     truncated.pop();
     assert!(decode_open(&truncated, PACKET_CBOR_LIMITS).is_err());
     let _ = ByteVec::from(Vec::<u8>::new());
+  }
+
+  /// The remaining path is structurally one route: a duplicate entry
+  /// fails closed at the wire boundary, while a path that stops short of
+  /// the destination is a legal prefix (the last holder plans the rest).
+  #[test]
+  fn routed_open_frame_rejects_a_malformed_remaining_path() {
+    let (trace_id, source, destination, _) = ids();
+    let frame = |path: Vec<String>| super::OpenWire {
+      trace_id: trace_id.to_string(),
+      source: source.to_string(),
+      destination: destination.to_string(),
+      protocol: "radiata.woooo.tech/protocols/test-packets".to_owned(),
+      metadata: Vec::new(),
+      route: Some(RouteWire {
+        current: "node-000000000000000000009".to_owned(),
+        visited: Vec::new(),
+        remaining_hops: 4,
+        path,
+      }),
+    };
+    let malformed = vec![
+      "node-000000000000000000005".to_owned(),
+      "node-000000000000000000005".to_owned(),
+      destination.to_string(),
+    ];
+    let body = encode_canonical(&frame(malformed), CONTROL_CBOR_LIMITS).unwrap();
+    let error = decode_open(&body, PACKET_CBOR_LIMITS).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    // A duplicate-free prefix decodes, even when it stops short of the
+    // destination.
+    let body = encode_canonical(
+      &frame(vec!["node-000000000000000000005".to_owned()]),
+      CONTROL_CBOR_LIMITS,
+    )
+    .unwrap();
+    let decoded = decode_open(&body, PACKET_CBOR_LIMITS).unwrap();
+    assert_eq!(decoded.route.unwrap().path.len(), 1);
   }
 }

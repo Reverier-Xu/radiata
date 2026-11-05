@@ -8,25 +8,37 @@
 //! descriptor store before any frame moves.
 //!
 //! The [`RouteContext`] is the per-hop routing envelope: it names the
-//! trace, both route endpoints, the current upstream holder, the visited
-//! chain, and the remaining hop budget. Every receiving node re-validates
-//! the context against its session-authenticated peer before any
-//! forwarding work, so mutation of the trace, endpoints, protocol,
-//! metadata, or any route field fails closed before a body byte moves.
-//! Authenticity comes from the mutually authenticated session transcript
-//! (exporter binding): each hop proves the context was produced
+//! trace, both route endpoints, the current upstream holder, the remaining
+//! path, the visited chain, and the remaining hop budget. Every receiving
+//! node re-validates the context against its session-authenticated peer
+//! before any forwarding work, so mutation of the trace, endpoints,
+//! protocol, metadata, or any route field fails closed before a body byte
+//! moves. Authenticity comes from the mutually authenticated session
+//! transcript (exporter binding): each hop proves the context was produced
 //! by the peer it claims, and the canonical wire encoding rejects every
 //! mutation.
+//!
+//! The path is the routing decision: a [`RouteNextHop`] policy plans it
+//! once, at the node that opens the delivery, and every hop then follows
+//! it — the next entry is the next hop, no per-hop policy runs, and the
+//! plan's own construction (a simple path over the learned
+//! [`graph::TopologyGraph`], or a caller-named path validated at
+//! admission) is what makes the walk loop-free. A hop that receives an
+//! exhausted path plans the remainder from itself, which is how the
+//! unlearned fallback keeps multi-hop delivery working hop by hop without
+//! any node holding a network-wide view.
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use crate::{Error, NodeId, QualifiedTag, Result, api::BoxFuture};
 
 pub(crate) mod forward;
+pub(crate) mod graph;
 pub(crate) mod outbound;
 pub(crate) mod table;
 pub(crate) mod trace;
 
+pub(crate) use graph::{RouteOutcome, TopologyGraph};
 pub(crate) use table::{RouteTable, insert_route, record_terminal_failure};
 
 /// The maximum byte length of one selector input. The bound keeps parsing
@@ -489,6 +501,9 @@ pub(crate) struct HopState {
   pub(crate) current: NodeId,
   pub(crate) visited: Vec<NodeId>,
   pub(crate) remaining_hops: u32,
+  /// The remaining path after `current`, ending at the destination. Empty
+  /// means the next holder plans the remainder from itself.
+  pub(crate) path: Vec<NodeId>,
 }
 
 /// The checked outcome of receiving one routed packet at `local`.
@@ -513,21 +528,25 @@ pub struct RouteContext {
   source: NodeId,
   destination: NodeId,
   current: NodeId,
+  /// The remaining path after `current`, ending at the destination.
+  path: Vec<NodeId>,
   visited: Vec<NodeId>,
   remaining_hops: u32,
 }
 
 impl RouteContext {
-  /// Builds the origin envelope: the source holds the packet and the full
-  /// caller-selected budget remains.
+  /// Builds the origin envelope: the source holds the packet, the planned
+  /// path is the route the attempt will walk (empty for a direct
+  /// delivery), and the full caller-selected budget remains.
   pub(crate) fn new(
-    trace_id: crate::TraceId, source: NodeId, destination: NodeId, max_hops: u32,
+    trace_id: crate::TraceId, source: NodeId, destination: NodeId, path: Vec<NodeId>, max_hops: u32,
   ) -> Self {
     Self {
       trace_id,
       current: source.clone(),
       source,
       destination,
+      path,
       visited: Vec::new(),
       remaining_hops: max_hops,
     }
@@ -563,13 +582,34 @@ impl RouteContext {
     &self.visited
   }
 
+  /// The remaining path after the current holder, ending at the
+  /// destination. Empty when the current holder must plan the remainder
+  /// itself.
+  pub fn path(&self) -> &[NodeId] {
+    &self.path
+  }
+
+  /// The hop budget still available to this delivery attempt.
+  pub fn remaining_hops(&self) -> u32 {
+    self.remaining_hops
+  }
+
   /// Projects the wire-carried per-hop state out of the envelope.
   pub(crate) fn hop_state(&self) -> HopState {
     HopState {
       current: self.current.clone(),
       visited: self.visited.clone(),
       remaining_hops: self.remaining_hops,
+      path: self.path.clone(),
     }
+  }
+
+  /// The same envelope with its remaining path dropped: a re-dispatched
+  /// alternative branch at this hop plans its own path instead of
+  /// following the abandoned attempt's plan.
+  pub(crate) fn replanned(mut self) -> Self {
+    self.path = Vec::new();
+    self
   }
 
   /// Rebuilds the envelope from one decoded open frame. A frame without a
@@ -583,16 +623,36 @@ impl RouteContext {
         current,
         visited,
         remaining_hops,
+        path,
       }) => Self {
         trace_id,
         source,
         destination,
         current,
+        path,
         visited,
         remaining_hops,
       },
-      None => Self::new(trace_id, source, destination, 1),
+      None => Self::new(trace_id, source, destination, Vec::new(), 1),
     }
+  }
+
+  /// The origin's dispatch of one planned envelope: the first hop of the
+  /// plan and the envelope that hop receives — the plan's tail, with the
+  /// origin as the claimed holder. The origin's own send is not a relay,
+  /// so it consumes no budget; every later hop does.
+  pub(crate) fn dispatch(self) -> Result<(NodeId, Self)> {
+    let mut hops = self.path.into_iter();
+    let next_hop = hops
+      .next()
+      .ok_or_else(|| Error::invalid_input("route path"))?;
+    Ok((
+      next_hop,
+      Self {
+        path: hops.collect(),
+        ..self
+      },
+    ))
   }
 
   /// Validates this envelope at the receiving node `local` against its
@@ -601,38 +661,20 @@ impl RouteContext {
   ///
   /// - the authenticated session peer must be the claimed current holder, so
   ///   endpoint substitutions fail closed (`NotTrusted`);
-  /// - the visited chain must start at the source, stay duplicate-free, and
-  ///   never claim the local node (loop detection fails closed);
-  /// - forwarding requires budget left (`ResourceExhausted`) and exactly one
-  ///   caller-policy-selected next hop, which may not revisit any chain member
-  ///   or the local node.
+  /// - arrival requires the local node to be the destination;
+  /// - forwarding requires budget left (`ResourceExhausted`), and the next hop
+  ///   is the head of the remaining path.
   ///
-  /// The `choose_next` closure is the caller's single next-hop decision
-  /// (the registered routing/load-balancing policy at a forwarder); core
-  /// re-validates whatever it returns.
+  /// The path is not re-validated hop by hop: it was planned (or named and
+  /// validated) once at the origin, and its construction is what makes the
+  /// walk loop-free. The `plan` closure runs only when the remaining path
+  /// is exhausted at a node that is not the destination — the unlearned
+  /// fallback, and the alternative branch of a re-dispatch — and core
+  /// re-validates what it returns (`InvalidInput` unless it is non-empty
+  /// and duplicate-free, `ResourceExhausted` beyond the budget).
   pub(crate) fn receive(
-    self, local: &NodeId, peer: &NodeId, choose_next: impl FnOnce(&Self) -> Result<NodeId>,
+    mut self, local: &NodeId, peer: &NodeId, plan: impl FnOnce(&Self) -> Result<Vec<NodeId>>,
   ) -> Result<RouteProgress> {
-    // Loop detection first: the receiving node must not appear anywhere in
-    // the chain (including as the claimed sender), and the chain itself
-    // must be duplicate-free.
-    if self.current == *local || self.visited.contains(local) {
-      return Err(Error::conflict("route loop"));
-    }
-    let mut seen = BTreeSet::new();
-    for node in &self.visited {
-      if !seen.insert(node.clone()) {
-        return Err(Error::conflict("route loop"));
-      }
-    }
-    // The chain must start at the authenticated source.
-    if self
-      .visited
-      .first()
-      .is_some_and(|first| *first != self.source)
-    {
-      return Err(Error::invalid_input("route chain"));
-    }
     // The authenticated session peer must be the claimed current holder,
     // so endpoint substitutions fail closed (`NotTrusted`).
     if self.current != *peer {
@@ -646,41 +688,66 @@ impl RouteContext {
     if self.remaining_hops == 0 {
       return Err(Error::resource_exhausted("route hops"));
     }
-    let next_hop = choose_next(&self);
-    // The chosen hop must make forward progress: it cannot revisit any
-    // chain member, the current holder, or loop back to this node.
-    if let Ok(hop) = &next_hop
-      && (hop == local || *hop == self.current || *hop == self.source || self.visited.contains(hop))
-    {
-      return Err(Error::conflict("route loop"));
-    }
-    let next_hop = next_hop?;
+    let path = if self.path.is_empty() {
+      let planned = plan(&self)?;
+      validate_planned_path(&planned, self.remaining_hops)?;
+      planned
+    } else {
+      std::mem::take(&mut self.path)
+    };
+    let mut hops = path.into_iter();
+    let next_hop = hops
+      .next()
+      .ok_or_else(|| Error::invalid_input("route path"))?;
+    let remaining: Vec<NodeId> = hops.collect();
     Ok(RouteProgress::Continue {
       next_hop,
-      context: self.forward(local),
+      context: self.forward(local, remaining),
     })
   }
 
   /// Marks this envelope as having been forwarded by `local`: the previous
   /// holder joins the visited chain, `local` becomes the current holder,
-  /// and the budget decreases once. Called only through
-  /// [`Self::receive`]'s checked continuation.
-  fn forward(mut self, local: &NodeId) -> Self {
+  /// the remaining path loses its head, and the budget decreases once.
+  /// Called only through [`Self::receive`]'s checked continuation.
+  fn forward(mut self, local: &NodeId, remaining: Vec<NodeId>) -> Self {
     let previous = std::mem::replace(&mut self.current, local.clone());
     self.visited.push(previous);
+    self.path = remaining;
     self.remaining_hops = self.remaining_hops.saturating_sub(1);
     self
   }
 }
 
+/// Validates one planned path at the route boundary: non-empty,
+/// duplicate-free, and inside the remaining hop budget. A plan is a
+/// prefix of a route — it may stop short of the destination, in which case
+/// the node that receives its last entry plans the rest — so the plan's
+/// own end is not the destination. The first hop's liveness is the
+/// dispatching node's own check (it holds the session table).
+pub(crate) fn validate_planned_path(path: &[NodeId], remaining_hops: u32) -> Result<()> {
+  if path.is_empty() {
+    return Err(Error::invalid_input("route path"));
+  }
+  if path.len() > usize::try_from(remaining_hops).unwrap_or(usize::MAX) {
+    return Err(Error::resource_exhausted("route hops"));
+  }
+  let mut seen = BTreeSet::new();
+  for node in path {
+    if !seen.insert(node) {
+      return Err(Error::invalid_input("route path"));
+    }
+  }
+  Ok(())
+}
+
 /// Validates one decoded open frame's routing envelope at the local
 /// admission boundary (stream admission, not forwarding). The envelope is
 /// re-checked against the session-authenticated `peer` before anything
-/// else, the visited chain then authenticates the original source, and a
-/// legacy direct frame (no route state) authenticates only through the
-/// exact source-peer match. Forwarding is never a valid outcome at this
-/// boundary — the frame either arrives exactly at `local` or fails
-/// closed — so the next-hop choice is hardcoded to a typed refusal.
+/// else, and a legacy direct frame (no route state) authenticates only
+/// through the exact source-peer match. Forwarding is never a valid
+/// outcome at this boundary — the frame either arrives exactly at `local`
+/// or fails closed — so the plan is hardcoded to a typed refusal.
 pub(crate) fn receive_open_envelope(
   trace_id: crate::TraceId, source: NodeId, destination: NodeId, route: Option<HopState>,
   local: &NodeId, peer: &NodeId,
@@ -738,14 +805,15 @@ impl CandidateNodeReader for StoreCandidateReader {
 
 /// The sealed per-hop decision inputs handed to a registered
 /// [`RouteNextHop`] policy: the packet's trace, the final destination,
-/// this node, and the live session peers available as next hops
-/// (canonical order).
+/// this node, the hop budget left for the attempt, and the live session
+/// peers available as next hops (canonical order).
 #[derive(Debug)]
 pub struct NextHopView<'a> {
   pub(crate) trace: &'a crate::TraceId,
   pub(crate) destination: &'a NodeId,
   pub(crate) local: &'a NodeId,
   pub(crate) peers: &'a [NodeId],
+  pub(crate) remaining_hops: u32,
 }
 
 impl NextHopView<'_> {
@@ -765,38 +833,56 @@ impl NextHopView<'_> {
     self.local
   }
 
-  /// The live authenticated peers eligible as next hops.
+  /// The live authenticated peers eligible as the first hop of the plan.
   pub fn peers(&self) -> &[NodeId] {
     self.peers
   }
+
+  /// The hop budget left for this delivery attempt: a plan longer than
+  /// this can never be walked, so a policy bounds its path by it.
+  pub fn remaining_hops(&self) -> u32 {
+    self.remaining_hops
+  }
 }
 
-/// The node-registered policy that picks the single next hop for a routed
-/// packet whose destination is not directly connected. Implementations run
-/// at every forwarding node under bounded work; returning a NodeId outside
-/// [`NextHopView::peers`] fails closed at the route boundary.
+/// The node-registered policy that plans the route for a packet whose
+/// destination is not directly connected. Implementations run at the node
+/// that opens the delivery (and at a hop whose carried path ran out)
+/// under bounded work; the returned path fails closed at the route
+/// boundary unless it is non-empty, duplicate-free, inside the hop
+/// budget, ends at the destination, and starts at one of
+/// [`NextHopView::peers`].
 pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
-  fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>>;
+  /// The ordered path from [`NextHopView::local`] to
+  /// [`NextHopView::destination`]: the nodes the packet is forwarded
+  /// through, excluding the local node and ending at the destination.
+  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>>;
 }
 
-/// The built-in next-hop policy: relays through the live peer that
-/// minimizes a trace-keyed hash of the peer id — a stable, uniform
-/// shuffle of the candidate set for the current delivery attempt. Direct
-/// delivery to a connected destination is resolved by the routing plane
-/// before any policy is consulted, so the policy only ever sees
-/// unconnected destinations and always relays.
+/// The built-in next-hop policy: it plans over the node's learned
+/// topology graph — the success-rate weighted shortest path from this
+/// node to the destination — and falls back to the historical trace-keyed
+/// single relay while the graph holds no route.
 ///
-/// The choice is deterministic for a given trace and candidate set (the
-/// same attempt always picks the same relay, which keeps loop-freedom
-/// reasoning and replay tests simple; the hash is stable within one
-/// build, which is the only determinism any single node needs) and
-/// fresh per retry: a caller
-/// retrying a failed delivery opens a new trace, so the next attempt
-/// takes a different relay path instead of repeating a failed one. On
-/// branching topologies, where no stateless policy can tell which
-/// neighbor leads toward the destination, that per-attempt variation is
-/// what turns bounded caller-level retries into delivery — a pick that
-/// walked into a dead-end subtree is never repeated verbatim.
+/// The learned plan is the primary behavior: every routed delivery the
+/// node observes records its path with a success or failure, so a
+/// destination the node has reached before is reached along the path
+/// that has been working, and an edge that keeps failing grows expensive
+/// enough to route around. A learned path is simple by construction,
+/// which is what makes the walk loop-free — the plan is computed once at
+/// the origin and every hop follows it.
+///
+/// The fallback keeps delivery working before anything has been learned:
+/// one hop to the live peer that minimizes a trace-keyed hash of the peer
+/// id — a stable, uniform shuffle of the candidate set for the current
+/// delivery attempt. The choice is deterministic for a given trace and
+/// candidate set (the same attempt always picks the same relay, which
+/// keeps replay tests simple) and fresh per retry: a caller retrying a
+/// failed delivery opens a new trace, so the next attempt takes a
+/// different relay path instead of repeating a failed one. On branching
+/// topologies, where no stateless policy can tell which neighbor leads
+/// toward the destination, that per-attempt variation is what turns
+/// bounded caller-level retries into delivery.
 ///
 /// This is the default policy: the node builder registers it under
 /// [`DefaultNextHop::TAG`] unless the caller already did, and a node
@@ -805,8 +891,16 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
 /// with_route_policy`] selects a different registered policy instead;
 /// registering a caller policy under [`DefaultNextHop::TAG`] replaces the
 /// default outright.
-#[derive(Debug)]
-pub struct DefaultNextHop;
+///
+/// A standalone [`DefaultNextHop::default`] instance carries no learned
+/// topology — it is the fallback algorithm on its own, which is exactly
+/// what a caller delegating to it from a wrapper policy wants.
+#[derive(Debug, Default)]
+pub struct DefaultNextHop {
+  /// The node's learned topology, shared with the routing plane that
+  /// records every observed outcome. `None` for a standalone instance.
+  graph: Option<Arc<TopologyGraph>>,
+}
 
 impl DefaultNextHop {
   /// The well-known tag the built-in policy is registered under.
@@ -824,6 +918,12 @@ impl DefaultNextHop {
       .map_err(|_| Error::internal("built-in next-hop policy tag"))
   }
 
+  /// The node-scoped instance: the same algorithm over the node's learned
+  /// topology.
+  pub(crate) fn with_graph(graph: Arc<TopologyGraph>) -> Self {
+    Self { graph: Some(graph) }
+  }
+
   /// The trace-keyed relay rank of one candidate peer. The hash is keyed
   /// by the current attempt's trace, so the same attempt ranks a peer
   /// identically at every evaluation and a retry attempt (fresh trace)
@@ -836,13 +936,32 @@ impl DefaultNextHop {
 }
 
 impl RouteNextHop for DefaultNextHop {
-  fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
     Box::pin(async move {
+      // A connected destination is delivered directly: the plan is one
+      // hop and the routing plane sends the frame over that session.
+      if view.peers().contains(view.destination()) {
+        return Ok(vec![view.destination().clone()]);
+      }
+      // The learned topology is the primary answer: the cheapest known
+      // path, bounded by the budget left and starting at a live peer.
+      if let Some(path) = self.graph.as_ref().and_then(|graph| {
+        graph.path(
+          view.local(),
+          view.destination(),
+          view.peers(),
+          view.remaining_hops(),
+        )
+      }) {
+        return Ok(path);
+      }
+      // Nothing learned yet: relay one hop, ranked per attempt.
       view
         .peers()
         .iter()
         .min_by_key(|peer| Self::rank(view.trace(), peer))
         .cloned()
+        .map(|peer| vec![peer])
         .ok_or_else(|| Error::caller("no live peer to relay through"))
     })
   }
@@ -850,22 +969,23 @@ impl RouteNextHop for DefaultNextHop {
 
 /// The built-in direct routing policy: the stream-level policy registered
 /// under [`crate::RoutingPolicy::DIRECT`] that never relays. Its
-/// [`RouteNextHop`] implementation refuses every hop, so a stream that
+/// [`RouteNextHop`] implementation refuses every plan, so a stream that
 /// resolved it as a relay policy could never forward; the admission plane
 /// recognizes the tag instead and keeps the node-level route policy's
 /// behavior for such streams (direct delivery when the destination is
-/// connected, the configured policy's first hop otherwise).
+/// connected, the configured policy's plan otherwise).
 #[derive(Debug)]
 pub(crate) struct DirectRouting;
 
 impl RouteNextHop for DirectRouting {
-  fn next_hop<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+  fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
     Box::pin(async { Err(Error::route_unavailable("direct routing policy")) })
   }
 }
 
-/// The node-local routing policy map: the next-hop policies and the
-/// stream-level routing policies.
+/// The node-local routing policy map: the next-hop policies, the
+/// stream-level routing policies, and the learned topology the built-in
+/// policy plans over.
 ///
 /// The map is born empty. [`Self::register_default`] installs the core
 /// policies explicitly — the direct stream policy and the default next-hop
@@ -877,6 +997,9 @@ pub(crate) struct RoutingRegistry {
   next_hops: std::sync::RwLock<std::collections::BTreeMap<QualifiedTag, Arc<dyn RouteNextHop>>>,
   routing_policies:
     std::sync::RwLock<std::collections::BTreeMap<QualifiedTag, Arc<dyn RouteNextHop>>>,
+  /// The node-local learned topology: the routing plane records every
+  /// observed route outcome here and the built-in policy plans over it.
+  graph: Arc<TopologyGraph>,
 }
 
 impl RoutingRegistry {
@@ -886,6 +1009,7 @@ impl RoutingRegistry {
     Self {
       next_hops: std::sync::RwLock::new(std::collections::BTreeMap::new()),
       routing_policies: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+      graph: Arc::new(TopologyGraph::new()),
     }
   }
 
@@ -908,9 +1032,14 @@ impl RoutingRegistry {
       let mut next_hops = self.next_hops.write().map_err(Error::extension_registry)?;
       next_hops
         .entry(next_hop_tag)
-        .or_insert_with(|| Arc::new(DefaultNextHop));
+        .or_insert_with(|| Arc::new(DefaultNextHop::with_graph(Arc::clone(&self.graph))));
     }
     Ok(self)
+  }
+
+  /// The node's learned topology.
+  pub(crate) fn graph(&self) -> &Arc<TopologyGraph> {
+    &self.graph
   }
 
   /// Registers one next-hop policy under a canonical tag. A duplicate tag
@@ -992,49 +1121,64 @@ impl fmt::Debug for RoutingRegistry {
       .debug_struct("RoutingRegistry")
       .field("next_hops", &self.next_hop_count())
       .field("routing_policies", &self.routing_policy_count())
+      .field("graph", &self.graph)
       .finish()
   }
 }
 
-/// The shared next-hop resolution for the routing plane: resolves the
+/// The shared route-planning seam of the routing plane: resolves the
 /// registered [`RouteNextHop`] policy named by `tag` against the route
-/// view built from `trace`, `destination`, `local`, and the alive
-/// `peers`. `Ok(None)` means `tag` names no registered policy — the
-/// callers apply their own observability and fallback; the policy's own
-/// rejection propagates as `Err`.
-pub(crate) async fn resolve_next_hop(
+/// view built from `trace`, `destination`, `local`, the alive `peers`,
+/// and the budget left. `Ok(None)` means `tag` names no registered policy
+/// — the callers apply their own observability and fallback; the policy's
+/// own rejection propagates as `Err`.
+pub(crate) async fn resolve_plan(
   registry: &RoutingRegistry, tag: &QualifiedTag, trace: &crate::TraceId, destination: &NodeId,
-  local: &NodeId, peers: &[NodeId],
-) -> Result<Option<NodeId>> {
+  local: &NodeId, peers: &[NodeId], remaining_hops: u32,
+) -> Result<Option<Vec<NodeId>>> {
   let Some(policy) = registry.next_hop_policy(tag) else {
     return Ok(None);
   };
   policy
-    .next_hop(NextHopView {
+    .plan(NextHopView {
       trace,
       destination,
       local,
       peers,
+      remaining_hops,
     })
     .await
     .map(Some)
 }
 
-/// One already-resolved policy's next-hop decision: the same view
-/// [`resolve_next_hop`] builds, for callers that hold the policy itself
+/// One already-resolved policy's route plan: the same view
+/// [`resolve_plan`] builds, for callers that hold the policy itself
 /// (a stream's routing policy) instead of a node-level tag.
-pub(crate) async fn next_hop_of(
+pub(crate) async fn plan_of(
   policy: &dyn RouteNextHop, trace: &crate::TraceId, destination: &NodeId, local: &NodeId,
-  peers: &[NodeId],
-) -> Result<NodeId> {
+  peers: &[NodeId], remaining_hops: u32,
+) -> Result<Vec<NodeId>> {
   policy
-    .next_hop(NextHopView {
+    .plan(NextHopView {
       trace,
       destination,
       local,
       peers,
+      remaining_hops,
     })
     .await
+}
+
+/// The origin's decided route for one outbound pump: the planned path and
+/// the topology graph that observes the attempt's outcome. `None` at the
+/// pump means a direct delivery — no route envelope and no topology
+/// observation.
+pub(crate) struct PlannedRoute {
+  /// The path from the origin to the destination: excluding the origin,
+  /// ending at the destination.
+  pub(crate) path: Vec<NodeId>,
+  /// The node's learned topology, which records the attempt's outcome.
+  pub(crate) graph: Arc<TopologyGraph>,
 }
 
 #[cfg(test)]
@@ -1053,17 +1197,18 @@ mod tests {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
   }
 
-  /// The built-in default policy is deterministic for a given trace
-  /// (order-independent), varies across fresh traces so caller retries
-  /// explore different relay paths, and fails closed with a typed caller
-  /// error when no live peer exists.
+  /// The built-in default policy without learned topology is the
+  /// trace-keyed single relay: deterministic for a given trace
+  /// (order-independent), varying across fresh traces so caller retries
+  /// explore different relay paths, and failing closed with a typed
+  /// caller error when no live peer exists.
   #[tokio::test]
-  async fn default_next_hop_is_deterministic_and_fails_closed() {
+  async fn the_unlearned_default_policy_relays_one_trace_keyed_hop() {
     use super::{DefaultNextHop, NextHopView, RouteNextHop};
 
     let destination = node(9);
     let local = node(0);
-    let policy = DefaultNextHop;
+    let policy = DefaultNextHop::default();
     let trace = TraceId::parse("trace-000000000000000000001").unwrap();
     let peers: Vec<NodeId> = [4, 2, 7].iter().map(|value| node(*value)).collect();
     let mut picks = std::collections::BTreeSet::new();
@@ -1074,8 +1219,15 @@ mod tests {
         destination: &destination,
         local: &local,
         peers: &shuffled,
+        remaining_hops: 4,
       };
-      picks.insert(policy.next_hop(view).await.unwrap());
+      let plan = policy.plan(view).await.unwrap();
+      assert_eq!(
+        plan.len(),
+        1,
+        "the unlearned fallback relays exactly one hop"
+      );
+      picks.insert(plan[0].clone());
     }
     assert_eq!(
       picks.len(),
@@ -1092,8 +1244,9 @@ mod tests {
         destination: &destination,
         local: &local,
         peers: &peers,
+        remaining_hops: 4,
       };
-      winners.insert(policy.next_hop(view).await.unwrap());
+      winners.insert(policy.plan(view).await.unwrap()[0].clone());
     }
     assert!(
       winners.len() >= 2,
@@ -1104,13 +1257,145 @@ mod tests {
       destination: &destination,
       local: &local,
       peers: &[],
+      remaining_hops: 4,
     };
-    let error = policy.next_hop(view).await.unwrap_err();
+    let error = policy.plan(view).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::CallerError);
   }
 
+  /// A connected destination is planned directly, and a learned path is
+  /// planned whole: the policy answers with the path the routing plane
+  /// then carries in the envelope.
+  #[tokio::test]
+  async fn the_default_policy_plans_direct_and_learned_paths() {
+    use super::{DefaultNextHop, NextHopView, RouteNextHop, TopologyGraph};
+
+    let trace = TraceId::parse("trace-000000000000000000001").unwrap();
+    let local = node(1);
+    let destination = node(9);
+    let graph = Arc::new(TopologyGraph::new());
+    let policy = DefaultNextHop::with_graph(Arc::clone(&graph));
+
+    // A connected destination: one hop, the destination itself.
+    let peers = [node(9), node(2)];
+    let plan = policy
+      .plan(NextHopView {
+        trace: &trace,
+        destination: &destination,
+        local: &local,
+        peers: &peers,
+        remaining_hops: 4,
+      })
+      .await
+      .unwrap();
+    assert_eq!(plan, vec![node(9)]);
+
+    // A learned path: the whole path, not just its first hop.
+    graph.record(
+      &destination,
+      &local,
+      &[node(2), node(5), destination.clone()],
+      super::RouteOutcome::Delivered,
+    );
+    let peers = [node(2), node(3)];
+    let plan = policy
+      .plan(NextHopView {
+        trace: &trace,
+        destination: &destination,
+        local: &local,
+        peers: &peers,
+        remaining_hops: 4,
+      })
+      .await
+      .unwrap();
+    assert_eq!(plan, vec![node(2), node(5), node(9)]);
+  }
+
+  /// The policy view exposes the hop budget left for the attempt, so a
+  /// policy can bound its plan by it (C9), and the built-in policy's
+  /// learned plan respects that bound.
+  #[tokio::test]
+  async fn the_policy_view_exposes_the_remaining_hop_budget() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{DefaultNextHop, NextHopView, RouteNextHop, TopologyGraph};
+
+    #[derive(Debug)]
+    struct BudgetProbe {
+      seen: Arc<AtomicU32>,
+    }
+
+    impl RouteNextHop for BudgetProbe {
+      fn plan<'a>(
+        &'a self, view: NextHopView<'a>,
+      ) -> crate::api::BoxFuture<'a, Result<Vec<NodeId>>> {
+        self.seen.store(view.remaining_hops(), Ordering::SeqCst);
+        Box::pin(async move { Ok(vec![view.destination().clone()]) })
+      }
+    }
+
+    let trace = TraceId::parse("trace-000000000000000000001").unwrap();
+    let local = node(1);
+    let destination = node(9);
+    let peers = [node(2)];
+    let seen = Arc::new(AtomicU32::new(0));
+    let probe = BudgetProbe {
+      seen: Arc::clone(&seen),
+    };
+    let plan = probe
+      .plan(NextHopView {
+        trace: &trace,
+        destination: &destination,
+        local: &local,
+        peers: &peers,
+        remaining_hops: 3,
+      })
+      .await
+      .unwrap();
+    assert_eq!(plan, vec![destination]);
+    assert_eq!(seen.load(Ordering::SeqCst), 3);
+
+    // The built-in policy bounds its learned plan by the same budget: a
+    // learned two-hop path is planned with two hops left and refused with
+    // one.
+    let graph = Arc::new(TopologyGraph::new());
+    graph.record(
+      &node(9),
+      &local,
+      &[node(2), node(9)],
+      super::RouteOutcome::Delivered,
+    );
+    let policy = DefaultNextHop::with_graph(graph);
+    let plan = policy
+      .plan(NextHopView {
+        trace: &trace,
+        destination: &node(9),
+        local: &local,
+        peers: &peers,
+        remaining_hops: 2,
+      })
+      .await
+      .unwrap();
+    assert_eq!(plan, vec![node(2), node(9)]);
+    let plan = policy
+      .plan(NextHopView {
+        trace: &trace,
+        destination: &node(9),
+        local: &local,
+        peers: &peers,
+        remaining_hops: 1,
+      })
+      .await
+      .unwrap();
+    assert_eq!(
+      plan,
+      vec![node(2)],
+      "a plan that cannot fit the budget falls back to one relay hop"
+    );
+  }
+
   /// The built-in direct policy is the registry's no-relay entry: it
-  /// refuses every hop, so a stream that resolved it as a relay policy
+  /// refuses every plan, so a stream that resolved it as a relay policy
   /// could never forward. The admission plane recognizes its tag and
   /// keeps the node-level route policy's behavior instead.
   #[tokio::test]
@@ -1122,11 +1407,12 @@ mod tests {
     let trace = TraceId::parse("trace-000000000000000000001").unwrap();
     let peers = [node(4), node(2)];
     let error = DirectRouting
-      .next_hop(NextHopView {
+      .plan(NextHopView {
         trace: &trace,
         destination: &destination,
         local: &local,
         peers: &peers,
+        remaining_hops: 4,
       })
       .await
       .unwrap_err();
@@ -1158,68 +1444,59 @@ mod tests {
       TraceId::generate(&crate::api::SystemEntropy).unwrap(),
       node(1),
       node(3),
+      vec![node(2), node(3)],
       4,
     );
     // The envelope claims node(1) is the holder, but the authenticated
     // session peer is node(9): an endpoint substitution.
     let error = context
-      .receive(&node(2), &node(9), |_| Ok(node(3)))
+      .receive(&node(2), &node(9), |_| Ok(vec![node(3)]))
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotTrusted);
   }
 
-  /// A visited chain that does not start at the source, or that loops back
-  /// through a chain member, cannot pass validation.
+  /// A plan that the local node has to compute is validated at the route
+  /// boundary: it must be non-empty, duplicate-free, and inside the
+  /// budget. The carried path is not re-validated hop by hop — the origin
+  /// planned it once — so only the peer check and the budget gate a
+  /// followed path.
   #[test]
-  fn mutated_chain_fails_closed() {
-    // A forged chain whose first entry no longer matches the source.
-    let forged = crate::routing::RouteContext {
-      trace_id: TraceId::generate(&crate::api::SystemEntropy).unwrap(),
-      source: node(1),
-      destination: node(4),
-      current: node(3),
-      visited: vec![node(9), node(2)],
-      remaining_hops: 2,
-    };
-    let error = forged
-      .receive(&node(5), &node(3), |_| Ok(node(4)))
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
-
-    // A duplicate entry in the chain is rejected as a loop.
-    let duplicated = crate::routing::RouteContext {
-      trace_id: TraceId::generate(&crate::api::SystemEntropy).unwrap(),
-      source: node(1),
-      destination: node(4),
-      current: node(3),
-      visited: vec![node(1), node(1)],
-      remaining_hops: 2,
-    };
-    let error = duplicated
-      .receive(&node(5), &node(3), |_| Ok(node(4)))
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Conflict);
-
-    // A frame routed back to its own source cannot pass loop detection:
-    // the receiving node already appears in the chain.
-    let origin = crate::routing::RouteContext::new(
-      TraceId::generate(&crate::api::SystemEntropy).unwrap(),
-      node(1),
-      node(4),
-      4,
-    );
-    let walked = match origin
-      .clone()
-      .receive(&node(2), &node(1), |_| Ok(node(3)))
-      .unwrap()
-    {
-      crate::routing::RouteProgress::Continue { context, .. } => context,
-      crate::routing::RouteProgress::Arrive => panic!("mid-route arrival"),
-    };
-    let error = walked
-      .receive(&node(1), &node(2), |_| Ok(node(4)))
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Conflict);
+  fn a_planned_path_is_validated_at_the_route_boundary() {
+    let trace = TraceId::generate(&crate::api::SystemEntropy).unwrap();
+    // An exhausted path at a non-destination node: the plan decides.
+    let context = crate::routing::RouteContext::new(trace.clone(), node(1), node(4), Vec::new(), 4);
+    for (plan, expected) in [
+      (Vec::new(), ErrorKind::InvalidInput),
+      (vec![node(3), node(3)], ErrorKind::InvalidInput),
+      (
+        vec![node(2), node(3), node(4), node(5), node(6)],
+        ErrorKind::ResourceExhausted,
+      ),
+    ] {
+      let error = context
+        .clone()
+        .receive(&node(2), &node(1), |_| Ok(plan.clone()))
+        .unwrap_err();
+      assert_eq!(error.kind(), expected, "plan {plan:?}");
+    }
+    // A well-formed plan is followed from its head, and a plan that stops
+    // short of the destination is a prefix the next holder continues.
+    for (plan, head, tail) in [
+      (vec![node(3), node(4)], node(3), vec![node(4)]),
+      (vec![node(3)], node(3), Vec::new()),
+    ] {
+      match context
+        .clone()
+        .receive(&node(2), &node(1), |_| Ok(plan.clone()))
+        .unwrap()
+      {
+        crate::routing::RouteProgress::Continue { next_hop, context } => {
+          assert_eq!(next_hop, head);
+          assert_eq!(context.path(), tail.as_slice());
+        }
+        crate::routing::RouteProgress::Arrive => panic!("mid-route arrival"),
+      }
+    }
   }
 
   // ---- label-target selection without unauthorized routing ----
@@ -1406,50 +1683,55 @@ mod tests {
 
   // ---- checked route progress ----
 
-  /// Every hop advances exactly once along one chosen next edge; loop
-  /// attempts through chain members fail closed.
+  /// The carried path is followed exactly, hop by hop: each hop forwards
+  /// to the next path entry (no policy runs), the previous holder joins
+  /// the visited chain, and the destination ends the walk.
   #[test]
-  fn checked_progress_advances_once_and_rejects_loops() {
-    let origin = crate::routing::RouteContext::new(
-      TraceId::generate(&crate::api::SystemEntropy).unwrap(),
+  fn the_carried_path_is_followed_hop_by_hop() {
+    let trace = TraceId::generate(&crate::api::SystemEntropy).unwrap();
+    // The envelope as node 2 receives it: the origin planned the whole
+    // path, node 1 already handed the frame over, and the remaining path
+    // is 3 -> 4 -> 5.
+    let arriving = crate::routing::RouteContext::from_frame(
+      trace.clone(),
       node(1),
       node(5),
-      4,
+      Some(super::HopState {
+        current: node(1),
+        visited: Vec::new(),
+        remaining_hops: 4,
+        path: vec![node(3), node(4), node(5)],
+      }),
     );
-    // Node 2 receives from the authenticated source and forwards to 3.
-    let trace = origin.trace_id().clone();
-    let step = origin.receive(&node(2), &node(1), |_| Ok(node(3))).unwrap();
-    let second = match step {
-      crate::routing::RouteProgress::Continue { next_hop, context } => {
-        assert_eq!(next_hop, node(3));
-        assert_eq!(context.current(), &node(2));
-        assert_eq!(context.visited(), &[node(1)]);
-        context
-      }
-      crate::routing::RouteProgress::Arrive => panic!("mid-route arrival"),
-    };
-    // Node 3 receives from node 2 and forwards to 4.
-    let third = match second.receive(&node(3), &node(2), |_| Ok(node(4))).unwrap() {
-      crate::routing::RouteProgress::Continue { next_hop, context } => {
-        assert_eq!(next_hop, node(4));
-        assert_eq!(context.visited(), &[node(1), node(2)]);
-        context
-      }
-      crate::routing::RouteProgress::Arrive => panic!("mid-route arrival"),
-    };
-    assert_eq!(third.trace_id(), &trace);
-
-    // A forwarder choosing an edge back into the chain fails closed.
-    let error = third
-      .clone()
-      .receive(&node(4), &node(3), |_| Ok(node(1)))
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Conflict);
-    // Choosing this very node as next hop is a self-loop.
-    let error = third
-      .receive(&node(4), &node(3), |_| Ok(node(4)))
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Conflict);
+    let mut context = arriving;
+    for (local_index, next_index) in [(2_u8, 3_u8), (3, 4), (4, 5)] {
+      let step = context
+        .clone()
+        // The plan closure must never run while the path has a head.
+        .receive(&node(local_index), &node(local_index - 1), |_| {
+          panic!("a carried path must not consult the policy")
+        })
+        .unwrap();
+      context = match step {
+        crate::routing::RouteProgress::Continue { next_hop, context } => {
+          assert_eq!(next_hop, node(next_index));
+          assert_eq!(context.current(), &node(local_index));
+          assert_eq!(context.visited().len(), usize::from(local_index - 1));
+          context
+        }
+        crate::routing::RouteProgress::Arrive => panic!("mid-route arrival"),
+      };
+    }
+    assert_eq!(context.trace_id(), &trace);
+    assert!(context.path().is_empty());
+    // The destination ends the walk without needing budget or a plan.
+    match context
+      .receive(&node(5), &node(4), |_| panic!("arrival plans nothing"))
+      .unwrap()
+    {
+      crate::routing::RouteProgress::Arrive => {}
+      crate::routing::RouteProgress::Continue { .. } => panic!("expected arrival"),
+    }
   }
 
   /// Arrival happens exactly at the selected destination; the budget bounds
@@ -1460,6 +1742,7 @@ mod tests {
       TraceId::generate(&crate::api::SystemEntropy).unwrap(),
       node(1),
       node(5),
+      vec![node(2), node(3), node(4), node(5)],
       3,
     );
     // Walk the route 1 -> 2 -> 3 -> 4 under receiver validation: each hop
@@ -1469,7 +1752,7 @@ mod tests {
       let step = context
         .clone()
         .receive(&node(local_index), &node(local_index - 1), |_| {
-          Ok(node(local_index + 1))
+          Ok(vec![node(local_index + 1)])
         })
         .unwrap();
       context = match step {
@@ -1478,12 +1761,13 @@ mod tests {
       };
     }
     assert_eq!(context.current(), &node(4));
+    assert_eq!(context.remaining_hops(), 0);
 
     // Arrival at the selected destination never needs budget: the packet
     // ends here even with the budget exhausted.
     match context
       .clone()
-      .receive(&node(5), &node(4), |_| Ok(node(1)))
+      .receive(&node(5), &node(4), |_| Ok(vec![node(5)]))
       .unwrap()
     {
       crate::routing::RouteProgress::Arrive => {}
@@ -1491,7 +1775,7 @@ mod tests {
     }
     // But a detour through an exhausted budget is rejected explicitly.
     let error = context
-      .receive(&node(6), &node(4), |_| Ok(node(7)))
+      .receive(&node(6), &node(4), |_| Ok(vec![node(7)]))
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
   }
@@ -1499,16 +1783,18 @@ mod tests {
   // ---- bounded work independent of stream length ----
 
   /// The envelope's work bound is a pure function of the caller-selected
-  /// budget: generated chains of arbitrary attempted length always stop
-  /// within the budget, appending exactly once per successful hop with
-  /// constant per-hop memory.
+  /// budget: an unlearned hop-by-hop walk of arbitrary attempted length
+  /// always stops within the budget, appending exactly once per successful
+  /// hop with constant per-hop memory.
   #[test]
   fn envelope_work_is_bounded_by_the_selected_budget() {
     let max_hops = 7_u32;
+    let destination = node(200);
     let mut context = crate::routing::RouteContext::new(
       TraceId::generate(&crate::api::SystemEntropy).unwrap(),
       node(1),
-      node(200),
+      destination.clone(),
+      Vec::new(),
       max_hops,
     );
     // Attempt to walk an unbounded linear route 1 -> 2 -> 3 -> ...; the
@@ -1516,11 +1802,11 @@ mod tests {
     let mut successes = 0_u32;
     loop {
       let local_index = u8::try_from(successes + 2).unwrap();
-      let next = local_index + 1;
       let peer = context.current().clone();
+      let planned = destination.clone();
       match context
         .clone()
-        .receive(&node(local_index), &peer, |_| Ok(node(next)))
+        .receive(&node(local_index), &peer, |_| Ok(vec![planned.clone()]))
       {
         Ok(crate::routing::RouteProgress::Continue {
           context: advanced, ..

@@ -549,15 +549,20 @@ impl LoadBalancingPolicy for PubLoadBalancer {
 struct PubNextHop;
 
 impl RouteNextHop for PubNextHop {
-  fn next_hop<'a>(&'a self, view: radiata::NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+  fn plan<'a>(&'a self, view: radiata::NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
     Box::pin(async move {
-      let _ = (view.destination(), view.local());
-      view.peers().first().cloned().ok_or_else(|| {
-        radiata::Error::provider(
-          radiata::ProviderErrorKind::Unsupported,
-          radiata::ProviderErrorContext::RoutingPolicy,
-        )
-      })
+      let _ = (view.destination(), view.local(), view.remaining_hops());
+      view
+        .peers()
+        .first()
+        .cloned()
+        .map(|peer| vec![peer])
+        .ok_or_else(|| {
+          radiata::Error::provider(
+            radiata::ProviderErrorKind::Unsupported,
+            radiata::ProviderErrorContext::RoutingPolicy,
+          )
+        })
     })
   }
 }
@@ -586,6 +591,10 @@ fn stream_surface_is_externally_constructible() {
   let _exact = StreamTarget::Exact(node.clone());
   let _matching =
     StreamTarget::MatchingNodes(Selector::parse("example.org/labels/lane=one").unwrap());
+  let _path = StreamTarget::Path {
+    destination: node.clone(),
+    path: vec![node.clone()],
+  };
   let selector = Selector::parse("example.org/labels/lane=one").unwrap();
   assert_eq!(selector.as_str(), "example.org/labels/lane=one");
 }

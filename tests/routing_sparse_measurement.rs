@@ -336,7 +336,7 @@ struct MeasuringPolicy {
 }
 
 impl RouteNextHop for MeasuringPolicy {
-  fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
     Box::pin(async move {
       let trace = view.trace().clone();
       let local = view.local().clone();
@@ -346,7 +346,7 @@ impl RouteNextHop for MeasuringPolicy {
         // tagged policy. Behave exactly like the built-in default and
         // keep it out of the per-trace measurement log.
         self.shared.count_foreign();
-        return DefaultNextHop.next_hop(view).await;
+        return DefaultNextHop::default().plan(view).await;
       };
       let oracle_pick = match lane {
         Lane::Oracle => {
@@ -362,15 +362,15 @@ impl RouteNextHop for MeasuringPolicy {
         Lane::Default | Lane::Reply => None,
       };
       let outcome = match oracle_pick {
-        Some(next) => Ok(next),
-        None => DefaultNextHop.next_hop(view).await,
+        Some(next) => Ok(vec![next]),
+        None => DefaultNextHop::default().plan(view).await,
       };
       self.shared.record_decision(
         lane,
         &trace,
         Decision {
           local,
-          chosen: outcome.as_ref().ok().cloned(),
+          chosen: outcome.as_ref().ok().and_then(|path| path.first().cloned()),
         },
       );
       outcome

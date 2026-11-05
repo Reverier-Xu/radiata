@@ -1052,7 +1052,7 @@ mod pending_admission_tests {
       node(1),
       request,
       routes,
-      false,
+      None,
       None,
       Arc::new(crate::node::EventHub::new()),
     )

@@ -390,39 +390,51 @@
 //! The routing plane delivers a packet to a destination the sender may
 //! not hold a session with. Direct delivery to a connected destination
 //! is resolved before any policy runs; the registered
-//! [`RouteNextHop`](crate::RouteNextHop) picks the single
-//! relay for everything else, at every forwarding node, under bounded
-//! work. Returning a [`NodeId`](crate::NodeId) outside
-//! [`NextHopView::peers`](crate::NextHopView::peers) fails
-//! closed at the route boundary.
+//! [`RouteNextHop`](crate::RouteNextHop) plans the route for everything
+//! else, under bounded work, and the plan is carried in the packet's
+//! route envelope so every hop follows it.
 //!
-//! The built-in [`DefaultNextHop`](crate::DefaultNextHop)
-//! relays through the live peer a trace-keyed hash ranks first — a
-//! stable shuffle per delivery attempt, loop-free, and the default: the
-//! node registers it under its well-known tag and selects it unless the
-//! configuration names another policy, so multi-hop relay works out of
-//! the box. Because a retry opens a fresh trace, each retry attempt
-//! takes a different relay path instead of repeating a failed one, so
-//! caller-level retries deliver over branching topologies where a
-//! fixed pick could keep walking into a dead-end subtree. Implement the
-//! trait to replace it (a hub-and-spoke relay, a latency-aware pick, a
-//! shard-affine route):
+//! A plan is the ordered path from the planning node to the destination:
+//! the nodes the packet is forwarded through, excluding the planning node
+//! and ending at the destination. It must be non-empty, duplicate-free,
+//! inside [`NextHopView::remaining_hops`](crate::NextHopView::remaining_hops),
+//! and start at one of [`NextHopView::peers`](crate::NextHopView::peers) —
+//! anything else fails closed at the route boundary. A plan may also stop
+//! short of the destination: the node holding its last entry then plans
+//! the remainder from itself.
+//!
+//! The built-in [`DefaultNextHop`](crate::DefaultNextHop) plans over the
+//! node's learned topology: every routed delivery the node observes
+//! records its path with a success or failure, and the policy answers
+//! with the success-rate weighted shortest path from this node to the
+//! destination — the path that has been working, around the edges that
+//! have not. A learned path is simple by construction, which is what
+//! makes the walk loop-free: the plan is computed once at the origin and
+//! every hop follows it. While nothing has been learned for a
+//! destination, the policy falls back to the live peer a trace-keyed hash
+//! ranks first — a stable shuffle per delivery attempt — so multi-hop
+//! relay works out of the box: the relay that receives that single hop
+//! plans the rest from itself. Because a retry opens a fresh trace, each
+//! retry attempt takes a different fallback relay instead of repeating a
+//! failed one. Implement the trait to replace the default (a
+//! hub-and-spoke relay, a latency-aware plan, a shard-affine route):
 //!
 //! ```
 //! use radiata::{BoxFuture, NextHopView, NodeId, Result, RouteNextHop};
 //!
 //! /// Relays every unconnected destination through the first live
-//! /// peer in canonical order — a deterministic pick spelled out as
+//! /// peer in canonical order — a deterministic plan spelled out as
 //! /// a starting point.
 //! #[derive(Debug)]
 //! struct LowestPeerFirst;
 //!
 //! impl RouteNextHop for LowestPeerFirst {
-//!     fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+//!     fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
 //!         Box::pin(async move {
 //!             view.peers()
 //!                 .first()
 //!                 .cloned()
+//!                 .map(|peer| vec![peer])
 //!                 .ok_or_else(|| radiata::Error::caller("no live peer as next hop"))
 //!         })
 //!     }
@@ -439,7 +451,7 @@
 //! let mut registry = ExtensionRegistry::new();
 //! let tag = QualifiedTag::parse("example.woooo.tech/route-policies/lowest")?;
 //! // Arc::new(LowestPeerFirst) — or the built-in DefaultNextHop:
-//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop);
+//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop::default());
 //! registry.register_next_hop(tag.clone(), policy)?;
 //! // NodeConfig::new().with_route_policy(tag) selects it at build time;
 //! // without a selection the built-in DefaultNextHop stays the default.
@@ -452,12 +464,11 @@
 //! carry a routing policy of its own:
 //! [`StreamPolicy`](crate::StreamPolicy) names a
 //! [`RoutingPolicy`](crate::RoutingPolicy) tag, and admission resolves it
-//! in the same registry before the node-level policy decides a first
-//! hop. The built-in
-//! [`RoutingPolicy::DIRECT`](crate::RoutingPolicy::DIRECT) carries no
-//! relay policy of its own, so such a stream keeps the node-level
-//! behavior; any other registered policy selects the next hop for its
-//! stream and is authoritative for it (its rejection fails the route
+//! in the same registry before the node-level policy plans the route. The
+//! built-in [`RoutingPolicy::DIRECT`](crate::RoutingPolicy::DIRECT)
+//! carries no relay policy of its own, so such a stream keeps the
+//! node-level behavior; any other registered policy plans the route for
+//! its stream and is authoritative for it (its rejection fails the route
 //! instead of falling back).
 //!
 //! ```no_run
@@ -466,10 +477,41 @@
 //! # fn demo() -> radiata::Result<()> {
 //! let mut registry = ExtensionRegistry::new();
 //! let tag = QualifiedTag::parse("example.woooo.tech/route-policies/shard")?;
-//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop);
+//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop::default());
 //! registry.register_routing_policy(tag.clone(), policy)?;
 //! let stream = StreamPolicy::new(RoutingPolicy::from(tag), 8)?;
 //! // StreamPolicy::direct(8) is the same policy under the built-in tag.
+//! # let _ = stream;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Naming the path yourself
+//!
+//! A caller that already knows the route names it in the target:
+//! [`StreamTarget::Path`](crate::StreamTarget::Path) carries the ordered
+//! hops, excluding the sender and ending at the destination. Admission
+//! validates it — non-empty, duplicate-free, inside the hop budget, every
+//! hop a known member, the first hop a live session, the last one the
+//! destination — and then every hop follows it exactly; no policy decides
+//! a hop of a caller-named path. Validation is reachability only: the
+//! origin checks what it can see, and each hop is verified by the node
+//! that has to forward to it.
+//!
+//! ```no_run
+//! # use radiata::{NodeHandle, ProtocolTag, StreamMetadata, StreamPolicy, StreamTarget};
+//! # fn demo(handle: &NodeHandle, relay: radiata::NodeId, destination: radiata::NodeId)
+//! #   -> radiata::Result<()> {
+//! let target = StreamTarget::Path {
+//!     destination: destination.clone(),
+//!     path: vec![relay, destination],
+//! };
+//! let stream = handle.open_stream(
+//!     target,
+//!     ProtocolTag::parse("example.woooo.tech/protocols/demo")?,
+//!     StreamPolicy::direct(4)?,
+//!     StreamMetadata::new(),
+//! )?;
 //! # let _ = stream;
 //! # Ok(())
 //! # }
@@ -483,17 +525,18 @@
 //! A forwarding hop whose downstream branch fails runs a bounded
 //! branch search over its own remaining candidates before reporting
 //! the failure upstream, so a relay that walked into a dead end
-//! mid-route heals inside the library. The first hop has no such
-//! search: the origin picks one relay and dispatches once, and on a
-//! sparse branching topology — where no stateless policy can know
-//! which neighbor leads toward the destination — a pick that walks
-//! into a dead-end subtree fails the stream right at the origin, with
-//! the typed delivery error surfacing to the sender. Caller-level
-//! retry is the supported recovery there: make critical business
-//! flows idempotent (a receiver must tolerate a duplicate delivery),
-//! re-send on a delivery failure, and let each retry's fresh trace
-//! walk a different relay path — the same branching that fails one
-//! attempt is what makes a handful of them deliver.
+//! mid-route heals inside the library (each alternative branch plans its
+//! own remainder). The first hop has no such search: the origin plans one
+//! route and dispatches once, and on a sparse branching topology — where
+//! no policy can know which neighbor leads toward the destination before
+//! anything has been learned — a plan that walks into a dead-end subtree
+//! fails the stream right at the origin, with the typed delivery error
+//! surfacing to the sender. Caller-level retry is the supported recovery
+//! there: make critical business flows idempotent (a receiver must
+//! tolerate a duplicate delivery), re-send on a delivery failure, and let
+//! each retry's fresh trace plan afresh — the same branching that fails
+//! one attempt is what makes a handful of them deliver, and every
+//! attempt's outcome is what the learned topology plans over next time.
 //!
 //! # 5. Receiving packets: `PacketConsumer`
 //!
