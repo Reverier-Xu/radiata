@@ -71,9 +71,9 @@ use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 /// Cluster size: one anchor plus seven members.
 const NODES: usize = 8;
 /// The measurement protocol carrying the routed payloads.
-const MEASURE_PROTOCOL: &str = "radiata.woooo.tech/protocols/sparse-measure";
+const MEASURE_PROTOCOL: &str = "example.org/protocols/sparse-measure";
 /// The protocol of the derived convenience replies (reply-probe cell).
-const REPLY_PROTOCOL: &str = "radiata.woooo.tech/protocols/sparse-reply";
+const REPLY_PROTOCOL: &str = "example.org/protocols/sparse-reply";
 /// The session-core feature both protocols declare.
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
 /// The generous hop budget: every simple path in an eight-node graph (at

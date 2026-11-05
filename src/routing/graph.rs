@@ -144,7 +144,9 @@ impl TopologyGraph {
   /// excludes `origin`, ends at `destination`, and is simple; its first
   /// hop is always one of the live `peers` (a plan may only leave this
   /// node along a session it actually holds) and its length never exceeds
-  /// the remaining hop budget.
+  /// `remaining_hops + 1` entries — the relays the budget pays for plus
+  /// the destination, which the walk reaches before the budget is
+  /// checked.
   pub(crate) fn path(
     &self, origin: &NodeId, destination: &NodeId, peers: &[NodeId], remaining_hops: u32,
   ) -> Option<Vec<NodeId>> {
@@ -233,7 +235,9 @@ impl TopologyGraph {
       cursor = step.clone();
     }
     path.reverse();
-    if path.len() > budget || !path.first().is_some_and(|first| peers.contains(first)) {
+    if path.len() > budget.saturating_add(1)
+      || !path.first().is_some_and(|first| peers.contains(first))
+    {
       return None;
     }
     Some(path)
@@ -350,8 +354,10 @@ mod tests {
   }
 
   /// A learned multi-hop path is returned whole, and one longer than the
-  /// remaining budget is refused instead of dispatched into a doomed
-  /// walk.
+  /// remaining budget can carry is refused instead of dispatched into a
+  /// doomed walk. The budget counts relays: a path of `relays + 1` entries
+  /// (the relays plus the destination) fits a `relays` budget, because the
+  /// origin's dispatch consumes none and arrival is checked before it.
   #[test]
   fn a_learned_path_is_returned_whole_and_respects_the_budget() {
     let graph = TopologyGraph::new();
@@ -368,8 +374,13 @@ mod tests {
     );
     assert_eq!(
       graph.path(&node(1), &node(9), &peers, 2),
+      Some(path(&[2, 5, 9])),
+      "a two-relay path fits a two-relay budget"
+    );
+    assert_eq!(
+      graph.path(&node(1), &node(9), &peers, 1),
       None,
-      "a path longer than the budget is not a usable plan"
+      "a two-relay path does not fit a one-relay budget"
     );
     assert_eq!(
       graph.path(&node(1), &node(9), &peers, 0),

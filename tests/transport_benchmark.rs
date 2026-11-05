@@ -102,7 +102,7 @@ async fn start_node(seed: u64, sink: Arc<Sink>) -> (NodeHandle, Endpoint) {
   extensions
     .register_protocol(
       ProtocolDefinition::new(
-        ProtocolTag::parse("radiata.woooo.tech/protocols/bench").unwrap(),
+        ProtocolTag::parse("example.org/protocols/bench").unwrap(),
         radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
       ),
       sink,
@@ -158,7 +158,7 @@ async fn send_chunks(sender: &NodeHandle, peer: &NodeId, count: usize, payload: 
   let stream = sender
     .open_stream(
       StreamTarget::Exact(peer.clone()),
-      ProtocolTag::parse("radiata.woooo.tech/protocols/bench").unwrap(),
+      ProtocolTag::parse("example.org/protocols/bench").unwrap(),
       StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       StreamMetadata::new(),
     )

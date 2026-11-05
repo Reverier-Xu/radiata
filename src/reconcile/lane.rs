@@ -55,8 +55,11 @@ pub(crate) struct LaneOutcome {
 /// The lane-agnostic collaborators one apply or receive filter needs: the
 /// node's identity context (upgraded from the plane's weak handle), the
 /// entropy source, the event/revision/session/authorization handles the
-/// row application reports through, and the configured removal retention
-/// window the resources lane judges reclaimed evidence against.
+/// row application reports through, and the two inputs the resources lane
+/// judges reclaimed evidence against — one host-clock instant per call
+/// plus the configured removal retention window, the same pair the scan
+/// filters carry, so the prune and the receive filter read one predicate
+/// against one instant.
 pub(crate) struct LaneContext<'a> {
   pub(crate) context: &'a Arc<LocalIdentityContext>,
   pub(crate) entropy: &'a Arc<dyn Entropy>,
@@ -64,6 +67,7 @@ pub(crate) struct LaneContext<'a> {
   pub(crate) revision: &'a MemberRevisionSignal,
   pub(crate) sessions: &'a SessionTable,
   pub(crate) authorization: &'a AuthorizationBoundary,
+  pub(crate) swept_at: SystemTime,
   pub(crate) removal_retention: Duration,
 }
 

@@ -134,11 +134,10 @@ impl ExtensionRegistry {
   /// duplicate tag is a conflict; the built-in domain stays reserved for
   /// the official definitions the default path installs.
   pub fn register_feature(&mut self, value: crate::FeatureDefinition) -> Result<&mut Self> {
-    if value.tag().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
-      return Err(Error::invalid_input(
-        "feature definition reserved namespace",
-      ));
-    }
+    crate::protocol::tag::require_caller_domain(
+      value.tag().domain(),
+      "feature definition reserved namespace",
+    )?;
     {
       let mut features = self.features.lock().map_err(Error::extension_registry)?;
       insert_once(
@@ -202,9 +201,12 @@ impl ExtensionRegistry {
   /// official form of `scheme` (`tls://`, `wss://`, or `tcp://`)
   /// resolves to `transport`. The default path installs an official
   /// transport only when its selector is still free, so an override
-  /// installed before the node starts wins wholesale — no official
+  /// installed before the default path runs wins wholesale — no official
   /// transport participates behind the selector, and no transport code
-  /// path special-cases the replacement.
+  /// path special-cases the replacement. After [`Self::register_default`]
+  /// has run the official selector is taken, so the same call is a
+  /// `Conflict`: the override is a decision about the default path's
+  /// order, not a post-start replacement.
   ///
   /// The override serves the dial intents the official selector
   /// produces: a `tls://` or `wss://` override receives the merge trust
@@ -390,9 +392,7 @@ impl ExtensionRegistry {
   pub fn register_task_reconciler(
     &mut self, kind: crate::QualifiedTag, reconciler: Arc<dyn crate::TaskReconciler>,
   ) -> Result<&mut Self> {
-    if kind.domain() == crate::protocol::tag::BUILTIN_DOMAIN {
-      return Err(Error::invalid_input("task reconciler kind"));
-    }
+    crate::protocol::tag::require_caller_domain(kind.domain(), "task reconciler kind")?;
     {
       let mut reconcilers = self
         .task_reconcilers
@@ -445,10 +445,14 @@ impl ExtensionRegistry {
   }
 
   /// Registers one packet protocol and its consumer. A duplicate protocol
-  /// tag is a conflict; registration never replaces an existing entry.
+  /// tag is a conflict; registration never replaces an existing entry. The
+  /// built-in `radiata.woooo.tech` domain is reserved — the core protocols
+  /// are installed there by the runtime — so a caller protocol registers
+  /// under a caller-owned domain instead of failing later at `start()`.
   pub fn register_protocol(
     &mut self, value: ProtocolDefinition, consumer: Arc<dyn PacketConsumer>,
   ) -> Result<&mut Self> {
+    crate::protocol::tag::require_caller_domain(value.tag.domain(), "protocol registration")?;
     self.register_protocol_inner(value, consumer)?;
     Ok(self)
   }
@@ -599,9 +603,11 @@ mod tests {
     }
   }
 
+  /// A caller protocol definition under a caller-owned domain: the
+  /// built-in domain is reserved for the core registrations.
   fn definition(name: &str) -> ProtocolDefinition {
     ProtocolDefinition::new(
-      ProtocolTag::parse(&format!("radiata.woooo.tech/protocols/{name}")).unwrap(),
+      ProtocolTag::parse(&format!("example.org/protocols/{name}")).unwrap(),
       FeatureTag::parse("radiata.woooo.tech/features/data-messages").unwrap(),
     )
   }
@@ -644,9 +650,7 @@ mod tests {
     registry
       .register_protocol(definition("alpha"), Arc::new(NoopConsumer))
       .unwrap();
-    assert!(
-      registry.has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/alpha").unwrap())
-    );
+    assert!(registry.has_protocol(&ProtocolTag::parse("example.org/protocols/alpha").unwrap()));
 
     let error = registry
       .register_protocol(definition("alpha"), Arc::new(NoopConsumer))
@@ -657,11 +661,35 @@ mod tests {
     registry
       .register_protocol(definition("beta"), Arc::new(NoopConsumer))
       .unwrap();
+    assert!(registry.has_protocol(&ProtocolTag::parse("example.org/protocols/beta").unwrap()));
+    assert!(!registry.has_protocol(&ProtocolTag::parse("example.org/protocols/gamma").unwrap()));
+  }
+
+  /// The built-in domain is reserved for the core registrations: a caller
+  /// protocol under it is refused at registration instead of failing later
+  /// at `start()` with a `Conflict`. The core path still installs the same
+  /// tag.
+  #[test]
+  fn caller_protocols_under_the_builtin_domain_are_refused() {
+    let mut registry = ExtensionRegistry::new();
+    let builtin = || {
+      ProtocolDefinition::new(
+        ProtocolTag::parse("radiata.woooo.tech/protocols/v1/reconcile").unwrap(),
+        FeatureTag::parse("radiata.woooo.tech/features/data-messages").unwrap(),
+      )
+    };
+    let refused = registry
+      .register_protocol(builtin(), Arc::new(NoopConsumer))
+      .unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(refused.context(), "protocol registration");
+
+    registry
+      .register_core_protocol(builtin(), Arc::new(NoopConsumer))
+      .unwrap();
     assert!(
-      registry.has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/beta").unwrap())
-    );
-    assert!(
-      !registry.has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/gamma").unwrap())
+      registry
+        .has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/v1/reconcile").unwrap())
     );
   }
 

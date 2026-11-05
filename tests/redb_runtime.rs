@@ -267,7 +267,7 @@ fn trace_lane_body(
 /// deterministically by the lib tests in `routing::trace`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redb_runtime_shutdown_releases_the_file_lock_with_inflight_trace_persistence() {
-  const PROTOCOL_TAG: &str = "radiata.woooo.tech/protocols/redb-trace-tail";
+  const PROTOCOL_TAG: &str = "example.org/protocols/redb-trace-tail";
   const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
   /// Streams per round: well beyond the sink's sixteen
   /// concurrent-persistence permits, so when the first durable terminal

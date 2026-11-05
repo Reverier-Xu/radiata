@@ -114,18 +114,15 @@ impl TransportTrust {
   /// plaintext and custom-class endpoints dial with plaintext trust,
   /// where the session handshake proofs alone carry authentication. The
   /// mapping lives here so no dial path can accidentally pair a TLS
-  /// trust mode with a plaintext-class endpoint or vice versa.
+  /// trust mode with a plaintext-class endpoint or vice versa, and it
+  /// reads the scheme's own class predicate instead of re-listing the
+  /// TLS schemes.
   pub(crate) fn for_dial(selector: &crate::transport::endpoint::TransportSelector) -> Self {
     match selector {
-      crate::transport::endpoint::TransportSelector::Builtin(
-        crate::transport::endpoint::TransportScheme::Tls,
-      )
-      | crate::transport::endpoint::TransportSelector::Builtin(
-        crate::transport::endpoint::TransportScheme::Wss,
-      ) => Self::Merge,
-      crate::transport::endpoint::TransportSelector::Builtin(
-        crate::transport::endpoint::TransportScheme::Tcp,
-      )
+      crate::transport::endpoint::TransportSelector::Builtin(scheme) if scheme.is_tls_class() => {
+        Self::Merge
+      }
+      crate::transport::endpoint::TransportSelector::Builtin(_)
       | crate::transport::endpoint::TransportSelector::Custom(_) => Self::Plaintext,
     }
   }
@@ -411,8 +408,9 @@ impl TransportProviderAdapter {
       capabilities,
       // The override serves exactly the intents its selector produces:
       // the TLS classes dial with merge trust, `tcp://` dials with
-      // plaintext trust.
-      accepts_tls_intents: matches!(scheme, TransportScheme::Tls | TransportScheme::Wss),
+      // plaintext trust. The class predicate is the scheme's own, so a
+      // newly added TLS-class scheme cannot silently dial plaintext.
+      accepts_tls_intents: scheme.is_tls_class(),
     })
   }
 }
@@ -852,6 +850,20 @@ mod tests {
     // The custom-name namespace is untouched: the built-in scheme names
     // never become custom registrations.
     assert!(TransportName::parse("wss").is_err());
+  }
+
+  /// The override is a decision about the default path's order, not a
+  /// post-start replacement: once [`ExtensionRegistry::register_default`]
+  /// has installed the official transports, the selector is taken and the
+  /// override is a typed `Conflict`.
+  #[test]
+  fn builtin_override_after_the_default_path_conflicts() {
+    let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
+    let error = registry
+      .override_builtin_transport(TransportScheme::Wss, Arc::new(test_wire()))
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
   }
 
   /// The override under a TLS-class selector carries a full dial: the

@@ -76,13 +76,15 @@ pub(crate) struct MetadataStore {
   /// retention candidate) instead of rescanning the same retained
   /// prefix forever.
   retention_scan_cursor: receipt::RetentionScanCursor,
-  /// The resource-feed change signal: one `notify_waiters` per committed
-  /// resource change, so a live watch parks between commits instead of
-  /// polling the durable feed. The signal is a wake-up only — the
-  /// durable feed stays the source of truth — so a missed wake-up costs
-  /// one extra feed read, never a lost change, and the commit path never
-  /// blocks on a consumer.
-  resource_feed_notify: tokio::sync::Notify,
+  /// The metadata change signal: one `notify_waiters` per committed
+  /// metadata change a durable watcher follows, so a parked watcher waits
+  /// between commits instead of polling the durable rows. The signal is a
+  /// wake-up only — the durable rows stay the source of truth — so a
+  /// missed wake-up costs one extra read, never a lost change, and the
+  /// commit path never blocks on a consumer. The signal is deliberately
+  /// domain-neutral: the store knows nothing about which domain's watcher
+  /// parks on it.
+  metadata_notify: tokio::sync::Notify,
   /// The register-install epoch: one monotonic bump per installed
   /// resource record commit (see [`Self::note_local_write`]), so
   /// the sync driver observes local catalog changes with one atomic
@@ -222,7 +224,7 @@ impl MetadataStore {
       clock,
       receipt_retention,
       retention_scan_cursor: receipt::RetentionScanCursor::default(),
-      resource_feed_notify: tokio::sync::Notify::new(),
+      metadata_notify: tokio::sync::Notify::new(),
       register_epoch: std::sync::atomic::AtomicU64::new(0),
       namespace_epochs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
       untracked_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -310,19 +312,19 @@ impl MetadataStore {
     self.register_epoch.load(Ordering::Relaxed)
   }
 
-  /// Wakes every parked resource-feed watch after one committed feed
-  /// append. `notify_waiters` stores no permit and takes no lock, so the
-  /// commit path pays one wake-up and never waits for a consumer.
-  pub(crate) fn note_resource_feed_change(&self) {
-    self.resource_feed_notify.notify_waiters();
+  /// Wakes every parked metadata watcher after one committed change.
+  /// `notify_waiters` stores no permit and takes no lock, so the commit
+  /// path pays one wake-up and never waits for a consumer.
+  pub(crate) fn notify_metadata_change(&self) {
+    self.metadata_notify.notify_waiters();
   }
 
-  /// The parked-wait future of one resource-feed watch step: the caller
-  /// enables it *before* reading the durable feed, so a commit landing
+  /// The parked-wait future of one metadata watch step: the caller
+  /// enables it *before* reading the durable rows, so a commit landing
   /// between the read and the wait is either observed by the read or
   /// wakes the wait.
-  pub(crate) fn resource_feed_changed(&self) -> tokio::sync::futures::Notified<'_> {
-    self.resource_feed_notify.notified()
+  pub(crate) fn metadata_changed(&self) -> tokio::sync::futures::Notified<'_> {
+    self.metadata_notify.notified()
   }
 
   /// The shared storage handle this store commits through. The default

@@ -141,10 +141,12 @@ pub enum StreamTarget {
 }
 
 /// Validates the caller-named path shape before any delivery work: it
-/// must be non-empty, bounded by both the caller's hop budget and the
-/// core path bound, duplicate-free, and end at the destination. Admission
-/// then validates reachability: every hop must be a known member, and the
-/// first hop a live session this node can send over.
+/// must be non-empty, duplicate-free, end at the destination, and carry at
+/// most `max_hops` relays — that is, at most `max_hops + 1` entries, since
+/// the origin's dispatch consumes no budget and arrival is checked before
+/// it — inside the core path bound. Admission then validates reachability:
+/// every hop must be a known member, and the first hop a live session this
+/// node can send over.
 pub(crate) fn validate_caller_path(
   destination: &NodeId, path: &[NodeId], max_hops: u32,
 ) -> Result<()> {
@@ -152,7 +154,10 @@ pub(crate) fn validate_caller_path(
     return Err(Error::invalid_input("stream path"));
   }
   if path.len() > STREAM_PATH_MAX_HOPS
-    || path.len() > usize::try_from(max_hops).unwrap_or(usize::MAX)
+    || path.len()
+      > usize::try_from(max_hops)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1)
   {
     return Err(Error::resource_exhausted("stream path"));
   }
@@ -429,8 +434,10 @@ impl PacketReplyContext {
 }
 
 /// An admitted incoming packet stream handed to the registered
-/// [`crate::PacketConsumer`]. Endpoints are the session-authenticated node
-/// IDs; the body preserves wire order.
+/// [`crate::PacketConsumer`]. `source` is the origin the frame claims and
+/// `destination` is this node; each hop authenticates its immediate
+/// predecessor, so the origin identity is hop-attested, not end-to-end.
+/// The body preserves wire order.
 pub struct IncomingStream {
   source: NodeId,
   destination: NodeId,
@@ -498,9 +505,11 @@ impl IncomingStream {
   ///
   /// The reply carries a single-hop budget: it is delivered directly
   /// whenever the source is directly connected, and it may pass through
-  /// at most one relay. This is the convenience variant for the common
-  /// request/reply hop; a reply whose source sits more than one relay
-  /// away needs [`Self::derive_return_stream_with_hops`].
+  /// at most one relay (a path of the relay plus the source, which is
+  /// exactly what a one-relay budget carries). This is the convenience
+  /// variant for the common request/reply hop; a reply whose source sits
+  /// more than one relay away needs
+  /// [`Self::derive_return_stream_with_hops`].
   pub fn derive_return_stream(
     &self, protocol: ProtocolTag, metadata: StreamMetadata,
   ) -> Result<OutboundStream> {
@@ -934,7 +943,7 @@ mod tests {
   #[test]
   fn return_stream_variants_differ_only_in_the_hop_budget() {
     let (source, destination) = (node(1), node(2));
-    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let protocol = crate::ProtocolTag::parse("example.org/protocols/reply-test").unwrap();
     let packet = incoming(&source, &destination, &protocol);
 
     let direct = packet
@@ -957,7 +966,7 @@ mod tests {
   /// could never be delivered.
   #[test]
   fn derive_return_stream_with_hops_rejects_a_zero_budget() {
-    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let protocol = crate::ProtocolTag::parse("example.org/protocols/reply-test").unwrap();
     let packet = incoming(&node(1), &node(2), &protocol);
     let error = packet
       .derive_return_stream_with_hops(protocol, StreamMetadata::new(), 0)
@@ -987,10 +996,9 @@ mod tests {
   /// protocol this node registered for admission.
   #[test]
   fn derive_return_stream_with_hops_keeps_the_protocol_registry_gate() {
-    let registered = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let registered = crate::ProtocolTag::parse("example.org/protocols/reply-test").unwrap();
     let packet = incoming(&node(1), &node(2), &registered);
-    let unregistered =
-      crate::ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered").unwrap();
+    let unregistered = crate::ProtocolTag::parse("example.org/protocols/unregistered").unwrap();
     let error = packet
       .derive_return_stream_with_hops(unregistered, StreamMetadata::new(), 4)
       .unwrap_err();

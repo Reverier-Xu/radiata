@@ -524,7 +524,7 @@ async fn start_with_protocol_result(
 
 fn protocol(tag: &str) -> ProtocolDefinition {
   ProtocolDefinition::new(
-    ProtocolTag::parse(&format!("radiata.woooo.tech/protocols/{tag}")).unwrap(),
+    ProtocolTag::parse(&format!("example.org/protocols/{tag}")).unwrap(),
     radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
   )
 }
@@ -593,7 +593,7 @@ async fn secure_join_packet_streams_ordered_after_authentication() {
     .handle
     .open_stream(
       StreamTarget::Exact(merge.node().clone()),
-      ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      ProtocolTag::parse("example.org/protocols/test-echo").unwrap(),
       policy(),
       metadata(),
     )
@@ -644,7 +644,7 @@ async fn secure_join_packet_rejects_unknown_target_and_unregistered_protocol() {
     .handle
     .open_stream(
       StreamTarget::Exact(unknown),
-      ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      ProtocolTag::parse("example.org/protocols/test-echo").unwrap(),
       policy(),
       StreamMetadata::new(),
     )
@@ -720,7 +720,7 @@ async fn packet_round_trip(
     let packet = sender
       .open_stream(
         StreamTarget::Exact(target.clone()),
-        ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+        ProtocolTag::parse("example.org/protocols/test-echo").unwrap(),
         policy(),
         metadata(),
       )
@@ -936,7 +936,7 @@ impl radiata::PacketConsumer for ReplyConsumer {
       self.pings.lock().unwrap().push((trace.to_string(), body));
       let reply = packet
         .derive_return_stream(
-          ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+          ProtocolTag::parse("example.org/protocols/test-echo").unwrap(),
           StreamMetadata::new(),
         )
         .unwrap();
@@ -988,7 +988,7 @@ async fn round_trip_to(
   let packet = sender
     .open_stream(
       StreamTarget::Exact(target.clone()),
-      ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      ProtocolTag::parse("example.org/protocols/test-echo").unwrap(),
       policy(),
       metadata(),
     )
@@ -1210,7 +1210,7 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
   let _joiner_id = merge.node().clone();
 
   let release = Arc::new(ReleaseGate::default());
-  let protocol_tag = ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap();
+  let protocol_tag = ProtocolTag::parse("example.org/protocols/test-echo").unwrap();
   for _ in 0..4 {
     let packet = joiner_handle
       .open_stream(
@@ -1525,7 +1525,7 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   let packet = joiner_handle
     .open_stream(
       StreamTarget::Exact(receiver_id),
-      ProtocolTag::parse("radiata.woooo.tech/protocols/test-echo").unwrap(),
+      ProtocolTag::parse("example.org/protocols/test-echo").unwrap(),
       policy(),
       metadata(),
     )
@@ -1999,7 +1999,7 @@ async fn secure_join_sixteen_node_membership_merges_and_views() {
 use radiata::{FeatureDefinition, FeatureTag, NodeConfig};
 
 const PROBE_FEATURE: &str = "testing.example/features/handshake-probe";
-const PROBE_PROTOCOL: &str = "radiata.woooo.tech/protocols/handshake-probe-echo";
+const PROBE_PROTOCOL: &str = "example.org/protocols/handshake-probe-echo";
 
 /// Starts a node with the probe feature registered and the probe protocol
 /// (owned by that feature) wired to `collector`; `require_feature` marks

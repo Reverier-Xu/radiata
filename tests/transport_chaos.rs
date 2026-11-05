@@ -68,7 +68,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The protocol tag of the relay-check consumer.
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/chaos-echo";
+const ECHO_PROTOCOL: &str = "example.org/protocols/chaos-echo";
 const ECHO_OWNING_FEATURE: &str = "radiata.woooo.tech/features/session-core";
 
 /// The four transports every node advertises, in canonical order. The

@@ -11,12 +11,15 @@
 //! trace, both route endpoints, the current upstream holder, the remaining
 //! path, the visited chain, and the remaining hop budget. Every receiving
 //! node re-validates the context against its session-authenticated peer
-//! before any forwarding work, so mutation of the trace, endpoints,
-//! protocol, metadata, or any route field fails closed before a body byte
-//! moves. Authenticity comes from the mutually authenticated session
-//! transcript (exporter binding): each hop proves the context was produced
-//! by the peer it claims, and the canonical wire encoding rejects every
-//! mutation.
+//! before any forwarding work, so a frame whose claimed current holder is
+//! not the peer that handed it over fails closed before a body byte moves.
+//! Authenticity is per hop, not end-to-end: each hop authenticates its
+//! immediate predecessor through the mutually authenticated session
+//! transcript (exporter binding), so the origin identity and the visited
+//! chain are hop-attested claims, not end-to-end proofs. Under the
+//! post-admission mutual-trust model every admitted peer is trusted to
+//! relay, so a relay may rewrite the fields it forwards; what no peer can
+//! do is hand a frame to this node while claiming to be someone else.
 //!
 //! The path is the routing decision: a [`RouteNextHop`] policy plans it
 //! once, at the node that opens the delivery, and every hop then follows
@@ -725,11 +728,20 @@ impl RouteContext {
 /// the node that receives its last entry plans the rest — so the plan's
 /// own end is not the destination. The first hop's liveness is the
 /// dispatching node's own check (it holds the session table).
+///
+/// The budget counts relays, not path entries: the origin's dispatch
+/// consumes no budget, each relay consumes one, and arrival is checked
+/// before the budget, so a path of `remaining_hops + 1` entries (the
+/// relays plus the destination) is exactly what the walk can carry.
 pub(crate) fn validate_planned_path(path: &[NodeId], remaining_hops: u32) -> Result<()> {
   if path.is_empty() {
     return Err(Error::invalid_input("route path"));
   }
-  if path.len() > usize::try_from(remaining_hops).unwrap_or(usize::MAX) {
+  if path.len()
+    > usize::try_from(remaining_hops)
+      .unwrap_or(usize::MAX)
+      .saturating_add(1)
+  {
     return Err(Error::resource_exhausted("route hops"));
   }
   let mut seen = BTreeSet::new();
@@ -838,8 +850,12 @@ impl NextHopView<'_> {
     self.peers
   }
 
-  /// The hop budget left for this delivery attempt: a plan longer than
-  /// this can never be walked, so a policy bounds its path by it.
+  /// The hop budget left for this delivery attempt: the number of relays
+  /// the plan may still traverse. The origin's dispatch consumes no
+  /// budget and arrival is checked before it, so a plan of
+  /// `remaining_hops + 1` entries (the relays plus the destination) is
+  /// exactly what the walk can carry, and a policy bounds its path by
+  /// that.
   pub fn remaining_hops(&self) -> u32 {
     self.remaining_hops
   }
@@ -849,9 +865,9 @@ impl NextHopView<'_> {
 /// destination is not directly connected. Implementations run at the node
 /// that opens the delivery (and at a hop whose carried path ran out)
 /// under bounded work; the returned path fails closed at the route
-/// boundary unless it is non-empty, duplicate-free, inside the hop
-/// budget, ends at the destination, and starts at one of
-/// [`NextHopView::peers`].
+/// boundary unless it is non-empty, duplicate-free, no longer than
+/// `remaining_hops + 1` entries, ends at the destination, and starts at
+/// one of [`NextHopView::peers`].
 pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
   /// The ordered path from [`NextHopView::local`] to
   /// [`NextHopView::destination`]: the nodes the packet is forwarded
@@ -1061,9 +1077,7 @@ impl RoutingRegistry {
   pub(crate) fn register_routing_policy(
     &mut self, tag: QualifiedTag, value: Arc<dyn RouteNextHop>,
   ) -> Result<&mut Self> {
-    if tag.domain() == crate::protocol::tag::BUILTIN_DOMAIN {
-      return Err(Error::invalid_input("routing policy tag"));
-    }
+    crate::protocol::tag::require_caller_domain(tag.domain(), "routing policy tag")?;
     {
       let mut policies = self
         .routing_policies
@@ -1356,13 +1370,14 @@ mod tests {
     assert_eq!(seen.load(Ordering::SeqCst), 3);
 
     // The built-in policy bounds its learned plan by the same budget: a
-    // learned two-hop path is planned with two hops left and refused with
-    // one.
+    // learned two-relay path is planned with two relays left and refused
+    // with one (the budget pays for the relays, and the destination is
+    // reached before it is checked).
     let graph = Arc::new(TopologyGraph::new());
     graph.record(
       &node(9),
       &local,
-      &[node(2), node(9)],
+      &[node(2), node(5), node(9)],
       super::RouteOutcome::Delivered,
     );
     let policy = DefaultNextHop::with_graph(graph);
@@ -1376,7 +1391,7 @@ mod tests {
       })
       .await
       .unwrap();
-    assert_eq!(plan, vec![node(2), node(9)]);
+    assert_eq!(plan, vec![node(2), node(5), node(9)]);
     let plan = policy
       .plan(NextHopView {
         trace: &trace,
@@ -1456,10 +1471,11 @@ mod tests {
   }
 
   /// A plan that the local node has to compute is validated at the route
-  /// boundary: it must be non-empty, duplicate-free, and inside the
-  /// budget. The carried path is not re-validated hop by hop — the origin
-  /// planned it once — so only the peer check and the budget gate a
-  /// followed path.
+  /// boundary: it must be non-empty, duplicate-free, and no longer than
+  /// `remaining_hops + 1` entries (the budget pays for the relays, and the
+  /// destination is reached before it is checked). The carried path is not
+  /// re-validated hop by hop — the origin planned it once — so only the
+  /// peer check and the budget gate a followed path.
   #[test]
   fn a_planned_path_is_validated_at_the_route_boundary() {
     let trace = TraceId::generate(&crate::api::SystemEntropy).unwrap();
@@ -1469,7 +1485,7 @@ mod tests {
       (Vec::new(), ErrorKind::InvalidInput),
       (vec![node(3), node(3)], ErrorKind::InvalidInput),
       (
-        vec![node(2), node(3), node(4), node(5), node(6)],
+        vec![node(2), node(3), node(4), node(5), node(6), node(7)],
         ErrorKind::ResourceExhausted,
       ),
     ] {

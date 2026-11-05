@@ -40,7 +40,7 @@ use common::{MemoryStorageFactory, ScriptedKeys};
 const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 const CURRENT_FEATURE: &str = "testing.example/features/mixed-current";
 const PRIOR_FEATURE: &str = "testing.example/features/mixed-prior";
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/mixed-echo";
+const ECHO_PROTOCOL: &str = "example.org/protocols/mixed-echo";
 const ECHO_OWNING_FEATURE: &str = "radiata.woooo.tech/features/data-messages";
 const LOAD_BALANCER: &str = "example.org/balancers/first-match";
 

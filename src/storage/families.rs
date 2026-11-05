@@ -98,18 +98,36 @@ mod catalog {
     Schema,
   }
 
-  /// One persisted metadata family: the owning domain and its namespace tag.
+  /// One persisted metadata family: the owning domain, its namespace tag,
+  /// and whether the reconcile plane replicates it.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) struct MetadataFamily {
     domain: MetadataDomain,
     namespace_tag: &'static str,
+    replicated: bool,
   }
 
   impl MetadataFamily {
+    /// A family every node converges: the reconcile plane carries its rows
+    /// between nodes, so two converged stores hold byte-identical content.
     pub(crate) const fn new(domain: MetadataDomain, namespace_tag: &'static str) -> Self {
       Self {
         domain,
         namespace_tag,
+        replicated: true,
+      }
+    }
+
+    /// A node-local family: its rows follow this store's own commit order,
+    /// so two stores that converged through different orders legitimately
+    /// hold different content and the reconcile plane never carries them.
+    /// Consumers that compare or seed stores across nodes filter on
+    /// [`Self::replicated`] instead of naming the excluded families.
+    pub(crate) const fn node_local(domain: MetadataDomain, namespace_tag: &'static str) -> Self {
+      Self {
+        domain,
+        namespace_tag,
+        replicated: false,
       }
     }
 
@@ -119,6 +137,15 @@ mod catalog {
 
     pub(crate) const fn namespace_tag(&self) -> &'static str {
       self.namespace_tag
+    }
+
+    /// Whether the reconcile plane replicates this family between nodes.
+    /// Test-only today: the cross-store comparisons are the consumers, and
+    /// production already excludes node-local families by construction (no
+    /// lane owns their namespaces).
+    #[cfg(test)]
+    pub(crate) const fn replicated(&self) -> bool {
+      self.replicated
     }
 
     /// The namespace parsed for provider use (test-only: the storage
@@ -157,7 +184,7 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::Custody, KEY_SEED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Node, NODE_DESCRIPTOR_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Resource, RESOURCE_RECORD_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Resource, RESOURCE_CHANGE_FEED_NAMESPACE),
+      MetadataFamily::node_local(MetadataDomain::Resource, RESOURCE_CHANGE_FEED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Route, TRACE_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Receipt, PENDING_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Receipt, INTERNAL_NAMESPACE),
@@ -317,6 +344,19 @@ mod catalog {
         offset = literal_start + literal_len;
       }
       out
+    }
+
+    /// The replication property is declared per family, not per consumer:
+    /// the resource change feed is the one node-local family, and every
+    /// other family converges through the reconcile plane.
+    #[test]
+    fn only_the_resource_change_feed_is_node_local() {
+      let node_local: Vec<&str> = metadata_families()
+        .iter()
+        .filter(|family| !family.replicated())
+        .map(MetadataFamily::namespace_tag)
+        .collect();
+      assert_eq!(node_local, vec![RESOURCE_CHANGE_FEED_NAMESPACE]);
     }
 
     /// The registry lookup behind the classification guards.

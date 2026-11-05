@@ -175,9 +175,16 @@ pub(crate) async fn run_outbound(
   let source = local.clone();
   // Fire-and-forget persistence of one durable terminal fact per packet;
   // the data plane never waits on metadata storage and intermediate
-  // progress stays an in-memory observation. The same terminal is the
-  // topology observation the learned graph keeps: the attempt either
-  // delivered or it did not.
+  // progress stays an in-memory observation.
+  //
+  // The learned topology is a separate observation: it weighs the planned
+  // path by whether the route carried the stream, so only a failure that
+  // happened after this node handed the open frame to its first hop
+  // charges the path's edges. A pre-queue exit (a dead session, a
+  // saturated pending map, an envelope or encode error, a closed frame
+  // queue) never left this node, and a caller body-stream error is the
+  // caller's payload failing rather than the route: neither says anything
+  // about the path, so neither records a graph outcome.
   macro_rules! terminal {
     ($kind:expr) => {{
       record_route_terminal(
@@ -189,6 +196,13 @@ pub(crate) async fn run_outbound(
         &destination,
         TraceTransition::Failed($kind),
       );
+    }};
+  }
+  // The routed failure: the open frame was queued and the route itself
+  // failed, so the planned path's edges carry the failure.
+  macro_rules! terminal_routed {
+    ($kind:expr) => {{
+      terminal!($kind);
       record_route_outcome(
         &route,
         &destination,
@@ -290,7 +304,7 @@ pub(crate) async fn run_outbound(
     "packet admission acknowledged"
   );
   if let Some(kind) = failure {
-    terminal!(kind);
+    terminal_routed!(kind);
     return;
   }
   update_route(&routes, &trace_id, |record| {
@@ -303,7 +317,9 @@ pub(crate) async fn run_outbound(
   if let Err(kind) = pump_chunks(&entry, &routes, &trace_id, request.body).await {
     // The destination already runs a consumer for this stream: the failure
     // must terminate it explicitly on the wire rather than leaving it
-    // waiting on a body that will never continue.
+    // waiting on a body that will never continue. The route carried the
+    // open, so the failure is the caller's payload and records no graph
+    // outcome.
     debug!(
       trace_id = %trace_id,
       kind = ?kind,
@@ -324,8 +340,9 @@ pub(crate) async fn run_outbound(
   if !send_terminal(&entry, &trace_id, EndReason::Completed).await {
     // The completed end never reached the queue, so the destination cannot
     // observe a clean completion: the local terminal answer is the typed
-    // interruption of this stream.
-    terminal!(ErrorKind::StreamInterrupted);
+    // interruption of this stream, and the route failed after its open was
+    // queued.
+    terminal_routed!(ErrorKind::StreamInterrupted);
     return;
   }
   // End-of-stream terminal: enqueue completion records `Delivered`
@@ -361,9 +378,10 @@ pub(crate) async fn run_outbound(
 }
 
 /// Records one attempt's terminal outcome in the learned topology: the
-/// path the attempt walked either delivered or it did not, and the graph
+/// planned path either carried the stream or it did not, and the graph
 /// weighs the next plan by that evidence. A direct delivery (no route)
-/// teaches nothing.
+/// teaches nothing, and the caller records nothing for a failure that
+/// never reached the path (see the `terminal!` macro).
 fn record_route_outcome(
   route: &Option<crate::routing::PlannedRoute>, destination: &NodeId, origin: &NodeId,
   outcome: crate::routing::RouteOutcome,
@@ -905,11 +923,20 @@ mod learned_topology_tests {
 
   /// Resolves the pump's admission wait the moment it registers.
   async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
+    arm_admission_with(entry, trace_id, Ok(std::time::UNIX_EPOCH)).await;
+  }
+
+  /// Resolves the pump's admission wait with an explicit outcome: the
+  /// destination's typed refusal is a route failure that happens after the
+  /// open frame was queued.
+  async fn arm_admission_with(
+    entry: &SessionEntry, trace_id: &TraceId, outcome: crate::packet::AckOutcome,
+  ) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
       let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
         PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(Ok(std::time::UNIX_EPOCH));
+          let _ = notify.send(outcome);
           true
         }
         PendingAck::Relay { .. } => false,
@@ -994,8 +1021,8 @@ mod learned_topology_tests {
       "the path's last edge is observed too"
     );
 
-    // A failed attempt (the session is already gone): the same edges grow
-    // more expensive.
+    // A failed attempt (the destination refused admission after the open
+    // frame was queued): the same edges grow more expensive.
     let trace_id = trace(62);
     let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     crate::routing::insert_route(
@@ -1004,9 +1031,13 @@ mod learned_topology_tests {
       RouteRecord::new(trace_id.clone(), destination.clone()),
     )
     .unwrap();
-    let (entry, receiver) =
+    let (entry, _receiver) =
       crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
-    drop(receiver);
+    let arm_entry = entry.clone();
+    let arm_trace = trace_id.clone();
+    let armed = tokio::spawn(async move {
+      arm_admission_with(&arm_entry, &arm_trace, Err(ErrorKind::StreamInterrupted)).await
+    });
     let planned = crate::routing::PlannedRoute {
       path: path.clone(),
       graph: Arc::clone(&graph),
@@ -1025,10 +1056,109 @@ mod learned_topology_tests {
     )
     .await
     .expect("the pump finishes within the deadline");
+    armed.await.unwrap();
     assert_eq!(
       graph.edge_weight(&destination, &node(1), &node(2)),
       Some(1.0),
       "the failure raises the first edge's cost from 0.5 back to 1.0"
+    );
+  }
+
+  /// The learned topology observes the route, not the caller's payload and
+  /// not a delivery this node never attempted: a caller body-stream error
+  /// and a pre-queue exit (a dead first-hop session) both leave the planned
+  /// path's edges uncharged.
+  #[tokio::test]
+  async fn payload_and_pre_queue_failures_do_not_charge_the_planned_edges() {
+    let graph = Arc::new(crate::routing::TopologyGraph::new());
+    let destination = node(3);
+    let path = vec![node(2), destination.clone()];
+
+    // A caller body-stream error after admission: the route carried the
+    // open, so the failure is the payload's, not the path's.
+    let trace_id = trace(63);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(
+      &routes,
+      8,
+      RouteRecord::new(trace_id.clone(), destination.clone()),
+    )
+    .unwrap();
+    let (entry, _receiver) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    let arm_entry = entry.clone();
+    let arm_trace = trace_id.clone();
+    let armed = tokio::spawn(async move { arm_admission(&arm_entry, &arm_trace).await });
+    let mut failing = request(trace_id, &destination);
+    failing.body = Box::pin(futures_util::stream::iter(vec![
+      Ok(Arc::from(&b"before"[..])),
+      Err(crate::Error::internal("body source")),
+    ]));
+    let planned = crate::routing::PlannedRoute {
+      path: path.clone(),
+      graph: Arc::clone(&graph),
+    };
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        failing,
+        routes,
+        Some(planned),
+        None,
+        Arc::new(crate::node::EventHub::new()),
+      ),
+    )
+    .await
+    .expect("the pump finishes within the deadline");
+    armed.await.unwrap();
+    assert_eq!(
+      graph.edge_weight(&destination, &node(1), &node(2)),
+      None,
+      "a caller body error must not charge the first edge"
+    );
+    assert_eq!(
+      graph.edge_weight(&destination, &node(2), &destination),
+      None,
+      "a caller body error must not charge the last edge"
+    );
+
+    // A dead first-hop session: the open frame never left this node, so
+    // the planned path was never attempted.
+    let trace_id = trace(64);
+    let routes: RouteTable = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    crate::routing::insert_route(
+      &routes,
+      8,
+      RouteRecord::new(trace_id.clone(), destination.clone()),
+    )
+    .unwrap();
+    let (entry, receiver) =
+      crate::session::stream::test_entry(&crate::identity::testing::SequenceEntropy::default());
+    drop(receiver);
+    let planned = crate::routing::PlannedRoute {
+      path,
+      graph: Arc::clone(&graph),
+    };
+    tokio::time::timeout(
+      Duration::from_secs(30),
+      run_outbound(
+        entry,
+        node(1),
+        request(trace_id, &destination),
+        routes,
+        Some(planned),
+        None,
+        Arc::new(crate::node::EventHub::new()),
+      ),
+    )
+    .await
+    .expect("the pump finishes within the deadline");
+    assert_eq!(
+      graph.edge_weight(&destination, &node(1), &node(2)),
+      None,
+      "a pre-queue exit must not charge the planned path"
     );
   }
 }

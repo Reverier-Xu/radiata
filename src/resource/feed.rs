@@ -13,10 +13,11 @@
 //! Versions start at 1 and are assigned in commit order under the store's
 //! writer exclusion, so the feed is gap-free and totally ordered. The
 //! retained window is [`RESOURCE_FEED_RETENTION`] entries: each append
-//! evicts the entry that falls out of the window, and a consumer resuming
-//! below the oldest retained version gets the typed
-//! [`ResourceFeedError::Compacted`] carrying that floor so it can re-list
-//! the register and resume.
+//! evicts every entry that falls out of the window (a page batch evicts
+//! as many as it pushed out, so the window stays the contiguous tail of
+//! the version sequence), and a consumer resuming below the oldest
+//! retained version gets the typed [`ResourceFeedError::Compacted`]
+//! carrying that floor so it can re-list the register and resume.
 //!
 //! The feed is node-local: it is not a replicated lane, because its
 //! versions follow this store's own commit order. A peer-converged install
@@ -29,8 +30,15 @@
 //! a watch created after a restart resumes from the persisted head, and a
 //! slow consumer is bounded by the retained window instead of applying
 //! backpressure to the commit path: the commit only wakes parked watches.
+//! The wake-up is an optimization, never the source of truth — a parked
+//! watch re-reads the durable feed on a bounded interval too, so a commit
+//! whose notification was lost (an indeterminate commit that resolves to
+//! installed outside the commit path) is still observed. A feed whose head
+//! moved behind the watch's cursor — a leave wipe, a store restored to an
+//! older state — is the typed [`ResourceFeedError::Reset`] instead of a
+//! silent park.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
@@ -50,6 +58,12 @@ use crate::{
 /// behind than this observes [`ResourceFeedError::Compacted`] and
 /// re-lists instead of replaying a gap.
 pub(crate) const RESOURCE_FEED_RETENTION: u64 = 1024;
+
+/// The bounded re-check interval of one parked watch: the commit path's
+/// wake-up is the fast path, and this bounds how long a lost wake-up can
+/// keep a consumer parked. It is a re-read of the durable head, not a
+/// change source, so a longer interval costs latency and never a change.
+const FEED_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 const FEED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/resource-change";
 const FEED_ENTRY_VERSION: u16 = 1;
@@ -119,7 +133,8 @@ pub(crate) async fn append_operations(
     return Ok(Vec::new());
   }
   let namespace = namespace()?;
-  let mut version = read_head(snapshot).await?;
+  let prev_head = read_head(snapshot).await?;
+  let mut version = prev_head;
   let mut operations = Vec::with_capacity(records.len() + 2);
   for record in records {
     version = version
@@ -142,14 +157,23 @@ pub(crate) async fn append_operations(
     expected,
     value: StoreValue::new(Arc::from(version.to_be_bytes())),
   });
-  // Exactly one entry leaves the window per append once it is full, so
-  // the retained set stays the contiguous tail of the version sequence
-  // and `oldest_retained` is the exact compaction floor.
-  if version > RESOURCE_FEED_RETENTION {
-    let key = entry_key(version - RESOURCE_FEED_RETENTION);
+  // Every entry the batch pushed out of the window leaves in the same
+  // transaction: a batch of `n` records evicts the whole range
+  // `prev_head + 1 - RETENTION ..= version - RETENTION`, so the retained
+  // set stays the contiguous tail of the version sequence and
+  // `oldest_retained` is the exact compaction floor. Evicting only the
+  // newest expired key would leave the older ones behind and make the
+  // floor a lie.
+  let first_evicted = prev_head
+    .saturating_add(1)
+    .saturating_sub(RESOURCE_FEED_RETENTION)
+    .max(1);
+  for evicted in first_evicted..oldest_retained(version) {
+    let key = entry_key(evicted);
+    // An entry already evicted by an earlier append is simply absent.
     if let Some(value) = snapshot.get(&namespace, &key).await? {
       operations.push(StoreOperation::Delete {
-        namespace,
+        namespace: namespace.clone(),
         key,
         expected: value.digest().clone(),
       });
@@ -303,6 +327,12 @@ pub enum ResourceFeedError {
   /// from `oldest`.
   #[error("resource feed compacted below version {oldest}")]
   Compacted { oldest: u64 },
+  /// The feed head moved behind the watch's cursor: the feed was wiped or
+  /// reset (a leave wipe, a store restored to an older state), so the
+  /// cursor no longer names a version this feed assigned. Re-list the
+  /// register and resume from `head`.
+  #[error("resource feed reset to head {head}")]
+  Reset { head: u64 },
   /// The durable feed could not be read.
   #[error(transparent)]
   Storage(#[from] Error),
@@ -319,7 +349,9 @@ pub enum ResourceFeedError {
 ///
 /// A slow consumer never blocks the commit path: the commit only wakes
 /// parked watches, and a consumer that falls further behind than the
-/// retained window observes [`ResourceFeedError::Compacted`].
+/// retained window observes [`ResourceFeedError::Compacted`]. A watch
+/// whose cursor the feed no longer reaches — the feed was wiped or reset —
+/// observes [`ResourceFeedError::Reset`].
 ///
 /// The watch holds the store open, exactly like any other live handle: drop
 /// it before reopening the same storage, or the provider's exclusive
@@ -363,14 +395,21 @@ impl ResourceWatch {
       // Register the wake-up before reading: a commit landing after this
       // point is either observed by the read below or wakes the wait.
       let store = Arc::clone(&self.store);
-      let notified = store.resource_feed_changed();
+      let notified = store.metadata_changed();
       tokio::pin!(notified);
       notified.as_mut().enable();
       self.fill().await?;
       if let Some(change) = self.buffered.pop_front() {
         return Ok(change);
       }
-      notified.await;
+      // The wake-up is the fast path, not the source of truth: a commit
+      // whose notification was lost (an indeterminate commit that resolves
+      // to installed outside the commit path) must still be observed, so
+      // the wait is bounded and the loop re-reads the durable feed.
+      tokio::select! {
+        _ = notified => {}
+        _ = tokio::time::sleep(FEED_RECHECK_INTERVAL) => {}
+      }
     }
   }
 
@@ -380,6 +419,13 @@ impl ResourceWatch {
     let snapshot = self.store.snapshot().await?;
     let namespace = namespace()?;
     let head = read_head(snapshot.as_ref()).await?;
+    if self.cursor > head {
+      // The head moved behind the cursor: the feed was wiped or reset, so
+      // the cursor names a version this feed never assigned (any more).
+      // Parking here would stall the watch forever on a change that cannot
+      // arrive; the typed signal lets the consumer re-list and resume.
+      return Err(ResourceFeedError::Reset { head });
+    }
     let oldest = oldest_retained(head);
     if self.cursor.saturating_add(1) < oldest {
       return Err(ResourceFeedError::Compacted { oldest });
@@ -432,7 +478,7 @@ mod tests {
     provider::StorageFactory,
     resource::{
       ResourceName, ResourceRecordV1,
-      store::{ResourceCommitOutcome, commit_expected_record_ctx},
+      store::{ResourceCommitOutcome, commit_expected_record_ctx, commit_page_batch_ctx},
     },
   };
 
@@ -630,6 +676,170 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(next(&mut at_floor).await.unwrap().version(), 2);
+  }
+
+  /// A page batch evicts every entry it pushed out of the retained window,
+  /// not only the newest expired one: the window stays the contiguous tail
+  /// of the version sequence, so the retained count is exactly the window
+  /// and `oldest_retained` names a version that really is retained.
+  #[tokio::test]
+  async fn a_page_batch_evicts_every_entry_it_pushes_out_of_the_window() {
+    let factory = factory();
+    let store = open(&factory).await;
+    // Fill the window one commit at a time: the window is exactly full at
+    // the last install, so nothing has been evicted yet.
+    for timestamp in 1..=RESOURCE_FEED_RETENTION {
+      install(&store, &record(&name(1), timestamp, false)).await;
+    }
+    // A two-record page batch pushes two versions out of the window.
+    let first = record(&name(2), 1_000, false);
+    let second = record(&name(3), 1_000, false);
+    let installed = commit_page_batch_ctx(&store, &SystemEntropy, &[&first, &second])
+      .await
+      .unwrap();
+    assert_eq!(installed.len(), 2, "both page records install");
+
+    let snapshot = store.snapshot().await.unwrap();
+    let head = read_head(snapshot.as_ref()).await.unwrap();
+    assert_eq!(head, RESOURCE_FEED_RETENTION + 2);
+    let namespace = namespace().unwrap();
+    let mut scan = snapshot
+      .scan(&namespace, &[super::ENTRY_KEY_PREFIX])
+      .await
+      .unwrap();
+    let mut retained = 0_u64;
+    while scan.next().await.unwrap().is_some() {
+      retained += 1;
+    }
+    assert_eq!(
+      retained, RESOURCE_FEED_RETENTION,
+      "the batch must evict every entry it pushed out of the window"
+    );
+    // The reported floor is truthful: the entry below it is gone and the
+    // entry at it is retained.
+    let floor = super::oldest_retained(head);
+    assert_eq!(floor, 3);
+    assert!(
+      snapshot
+        .get(&namespace, &entry_key(floor - 1))
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      snapshot
+        .get(&namespace, &entry_key(floor))
+        .await
+        .unwrap()
+        .is_some()
+    );
+  }
+
+  /// A watch parked before an indeterminate commit still observes the
+  /// entry once the commit resolves to installed: the commit path notifies
+  /// nothing on the `Unknown` arm, so the watch's bounded re-check is what
+  /// carries the change.
+  #[tokio::test]
+  async fn a_parked_watch_observes_an_indeterminate_commit_after_reconcile() {
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::storage::contract::{
+      ReferenceFactory,
+      reference::{UnknownFaultFactory, UnknownFaultMode},
+      required_capabilities,
+    };
+
+    // Stamp the base schema through a plain reference open first: the
+    // unknown fault must hit the register commit, not the open-time stamp.
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let plain: Arc<dyn StorageFactory> = reference.clone();
+    drop(
+      crate::storage::MetadataStore::open(&plain, Duration::from_secs(10))
+        .await
+        .unwrap(),
+    );
+    let fault: Arc<dyn StorageFactory> = Arc::new(UnknownFaultFactory {
+      reference,
+      // The faulted commit lands and reports Unknown.
+      mode: UnknownFaultMode::Applied,
+      commit_calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let store = open(&fault).await;
+
+    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), None)
+      .await
+      .unwrap();
+    let parked = tokio::spawn(async move { watch.next().await });
+    // Park the watch before the commit: the first fill reads the empty
+    // feed, and the wait below starts well inside one re-check interval.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    match commit_expected_record_ctx(
+      &store,
+      &SystemEntropy,
+      &record(&name(1), 1_000, false),
+      None,
+    )
+    .await
+    .unwrap()
+    {
+      ResourceCommitOutcome::Indeterminate { .. } => {}
+      other => panic!("the faulted commit must be indeterminate, got {other:?}"),
+    }
+    store.reconcile_if_frozen().await.unwrap();
+
+    let change = tokio::time::timeout(Duration::from_secs(10), parked)
+      .await
+      .expect("the parked watch must not stall on a resolved commit")
+      .unwrap()
+      .unwrap();
+    assert_eq!(change.version(), 1);
+    assert_eq!(change.name(), &name(1));
+  }
+
+  /// A feed wiped under a live watch (a leave wipe, a store restored to an
+  /// older state) is the typed reset signal, not a silent park: the head
+  /// moved behind the cursor, so no entry can ever arrive.
+  #[tokio::test]
+  async fn a_wiped_feed_reports_the_reset_instead_of_parking() {
+    let factory = factory();
+    let store = open(&factory).await;
+    install(&store, &record(&name(1), 1_000, false)).await;
+    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(1))
+      .await
+      .unwrap();
+
+    // Wipe the feed the way a leave does: the head counter and its entries
+    // leave together, so the head reads 0 under a cursor of 1.
+    let namespace = namespace().unwrap();
+    let snapshot = store.snapshot().await.unwrap();
+    let mut operations = Vec::new();
+    for key in [super::head_key(), entry_key(1)] {
+      if let Some(value) = snapshot.get(&namespace, &key).await.unwrap() {
+        operations.push(crate::StoreOperation::Delete {
+          namespace: namespace.clone(),
+          key,
+          expected: value.digest().clone(),
+        });
+      }
+    }
+    let transaction = store
+      .prepare_transaction(
+        crate::TransactionId::generate(&SystemEntropy).unwrap(),
+        snapshot.revision().clone(),
+        operations,
+      )
+      .unwrap();
+    drop(snapshot);
+    assert!(matches!(
+      store.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+
+    match watch.next().await {
+      Err(ResourceFeedError::Reset { head }) => assert_eq!(head, 0),
+      other => panic!("expected the typed reset signal, got {other:?}"),
+    }
   }
 
   /// A live watch observes a commit that lands after it subscribed.

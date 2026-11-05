@@ -26,7 +26,7 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 
-const PROTOCOL_TAG: &str = "radiata.woooo.tech/protocols/test-reply";
+const PROTOCOL_TAG: &str = "example.org/protocols/test-reply";
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
 const REQUEST_BODY: &[u8] = b"request";
 const REPLY_BODY: &[u8] = b"reply";

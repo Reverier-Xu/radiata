@@ -528,7 +528,10 @@ impl NodeHandle {
   /// with no gap and no reordering. A consumer that falls further behind
   /// than the retained window observes [`crate::ResourceFeedError::Compacted`]
   /// carrying the oldest available version and must re-list the register;
-  /// a slow consumer never blocks a resource write.
+  /// a watch whose cursor the feed no longer reaches (the feed was wiped
+  /// or reset) observes [`crate::ResourceFeedError::Reset`] and re-lists
+  /// from the reported head; a slow consumer never blocks a resource
+  /// write.
   ///
   /// The only failure is the command channel's own (a stopped node); feed
   /// read failures and the compaction floor surface from

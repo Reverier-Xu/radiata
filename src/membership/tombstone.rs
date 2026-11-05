@@ -266,7 +266,9 @@ enum TombstoneRow {
 /// match the key it arrived under, and a leave row must carry a signature
 /// that verifies. `None` means the row is skipped with its typed reason
 /// already logged — never an error, because one poison row must not wedge
-/// the batch.
+/// the batch. Every `None` is a decided refusal (no retry can make the row
+/// decode, verify, or match its key), so the apply reports it to the
+/// receive boundary as a refused row.
 fn decode_tombstone_row(key: &[u8], content: &[u8]) -> Option<TombstoneRow> {
   let Some((prefix, subject)) = key.split_first() else {
     tracing::debug!("reconcile tombstone row skipped: no kind prefix");
@@ -483,7 +485,10 @@ async fn apply_revocation_row(
 /// arms the announcement payload uses, so both planes verify, persist,
 /// notify, and collect identically. `source` addresses the applied
 /// receipt to the peer that carried the rows; the derived-view repair
-/// passes `None`.
+/// passes `None`. Returns the rows the decode phase **refused** (see
+/// [`decode_tombstone_row`]): decided evidence no retry can change, so the
+/// receive boundary drops them from engine admission instead of
+/// re-delivering them forever.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_tombstone_rows(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
@@ -491,16 +496,19 @@ pub(crate) async fn apply_tombstone_rows(
   sessions: &crate::session::stream::SessionTable,
   authorization: &crate::session::stream::AuthorizationBoundary, rows: &[(Vec<u8>, Vec<u8>)],
   source: Option<&NodeId>, runtime: Option<&RuntimeClient>,
-) -> Result<()> {
+) -> Result<crate::reconcile::lane::LaneRows> {
   let store = context.store();
   let evidence = tombstone_evidence(store).await?;
   // Row-level fault tolerance, the scan side's corrupt-row policy: one
-  // undecodable or misattributed tombstone row skips with a typed reason
-  // instead of failing the batch — a whole-batch error would wedge the
-  // derived-view repair on the same poison row forever. Store failures
-  // inside the apply arms still propagate: they are real write faults.
+  // undecodable or misattributed tombstone row is refused with a typed
+  // reason instead of failing the batch — a whole-batch error would wedge
+  // the derived-view repair on the same poison row forever. The refusal is
+  // collected for the receive boundary; store failures inside the apply
+  // arms still propagate, because they are real write faults.
+  let mut refused = crate::reconcile::lane::LaneRows::new();
   for (key, content) in rows {
     let Some(row) = decode_tombstone_row(key, content) else {
+      refused.push((key.clone(), content.clone()));
       continue;
     };
     match row {
@@ -536,7 +544,7 @@ pub(crate) async fn apply_tombstone_rows(
       }
     }
   }
-  Ok(())
+  Ok(refused)
 }
 
 /// The tombstones lane: the four terminal record families (leave, cleanup,
@@ -644,7 +652,7 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
     runtime: Option<&'a RuntimeClient>,
   ) -> crate::api::BoxFuture<'a, Result<crate::reconcile::lane::LaneOutcome>> {
     Box::pin(async move {
-      apply_tombstone_rows(
+      let refused = apply_tombstone_rows(
         ctx.context,
         ctx.entropy,
         ctx.events,
@@ -656,13 +664,17 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
         runtime,
       )
       .await?;
-      // No refused rows on this lane: the policy skips (a subject
-      // binding that has not converged) are the designed transient
-      // retries — every tombstone row the collected filter passed stays a
-      // repair candidate until its binding lands.
-      Ok(crate::reconcile::lane::LaneOutcome {
-        refused: Vec::new(),
-      })
+      // The refused rows are the decode-phase refusals — a row with no
+      // kind prefix, an unknown kind prefix, an undecodable record, a
+      // subject/key mismatch, or an untrusted leave signature. They are
+      // decided evidence: no re-delivery can make them decode, verify, or
+      // match their key, so the receive boundary drops them from engine
+      // admission instead of re-announcing them forever. The in-arm policy
+      // skips (a subject binding that has not converged, contention) stay
+      // out: their retry is the designed transient path and lives in the
+      // engine, so every such row stays a repair candidate until its
+      // binding lands.
+      Ok(crate::reconcile::lane::LaneOutcome { refused })
     })
   }
 }
@@ -1108,6 +1120,141 @@ mod tests {
     assert!(
       !authorization.section().await.contains(&revoked),
       "a revocation whose persist failed must not record its subject"
+    );
+  }
+
+  /// The decode-phase refusals are decided evidence: a row with no kind
+  /// prefix, an unknown kind prefix, an undecodable record, a subject/key
+  /// mismatch, and an untrusted leave signature all come back as refused
+  /// rows, so the receive boundary drops them from engine admission
+  /// instead of gossiping them forever. The valid row in the same batch
+  /// still applies and is not refused: the refusals are per row, never
+  /// batch-wide.
+  #[tokio::test]
+  async fn undecodable_and_unverifiable_rows_are_refused() {
+    use ed25519_dalek::Signer as _;
+
+    use crate::{
+      identity::{
+        cleanup::{CleanupRecordV1, known_cleanup_records_ctx},
+        leave::LeaveRecordV1,
+        signature::signature_message,
+        testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+      },
+      reconcile::lane::LaneContext,
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full_at(9_500);
+    let scripted_entropy = Arc::new(SequenceEntropy::default());
+    let entropy: Arc<dyn Entropy> = scripted_entropy.clone();
+    let context = Arc::new(
+      open_context(&factory, &keys, &scripted_entropy)
+        .await
+        .unwrap(),
+    );
+    let store = context.store();
+
+    let subject = node_at(9_510);
+    let subject_key = key_at(9_511);
+    let issuer = node_at(9_520);
+    let issuer_signing = crate::identity::testing::scripted_signing(9_521);
+    for (node, key) in [
+      (subject.clone(), subject_key.clone()),
+      (issuer.clone(), key_at(9_521)),
+    ] {
+      crate::identity::trust::store::adopt_binding_ctx(store, entropy.as_ref(), &node, &key)
+        .await
+        .unwrap();
+    }
+
+    let cleanup = |recorded: &NodeId, recorded_key: &crate::PublicKey, stamp: u64| {
+      let body =
+        CleanupRecordV1::encode_signed_body(recorded, recorded_key, &issuer, stamp).unwrap();
+      let signature = issuer_signing.sign(&signature_message(
+        crate::identity::cleanup::CLEANUP_RECORD_DOMAIN,
+        &body,
+      ));
+      CleanupRecordV1::new(
+        recorded.clone(),
+        recorded_key.clone(),
+        issuer.clone(),
+        stamp,
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    let row_key = |kind: u8, of: &NodeId| {
+      let mut key = Vec::with_capacity(1 + of.as_str().len());
+      key.push(kind);
+      key.extend_from_slice(of.as_str().as_bytes());
+      key
+    };
+
+    let valid = cleanup(&subject, &subject_key, 5_000).encode().unwrap();
+    let other_subject = node_at(9_530);
+    let rows = vec![
+      // No kind prefix at all.
+      (Vec::new(), b"no-kind".to_vec()),
+      // A prefix outside the closed kind table.
+      (vec![0xFF], b"unknown-kind".to_vec()),
+      // A leave row whose content does not decode.
+      (row_key(1, &subject), vec![0x00]),
+      // A cleanup row whose record names another subject.
+      (
+        row_key(2, &subject),
+        cleanup(&other_subject, &key_at(9_531), 5_000)
+          .encode()
+          .unwrap(),
+      ),
+      // A leave row whose signature does not verify.
+      (
+        row_key(1, &subject),
+        LeaveRecordV1::new(
+          subject.clone(),
+          subject_key.clone(),
+          1_000,
+          crate::Signature::from_bytes([0_u8; 64]),
+        )
+        .encode()
+        .unwrap(),
+      ),
+      // The one valid row: it applies and is not refused.
+      (row_key(2, &subject), valid),
+    ];
+    let expected_refused = rows[..5].to_vec();
+
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let authorization = crate::session::stream::AuthorizationBoundary::default();
+    let lane_context = LaneContext {
+      context: &context,
+      entropy: &entropy,
+      events: &events,
+      revision: &revision,
+      sessions: &sessions,
+      authorization: &authorization,
+      swept_at: std::time::SystemTime::now(),
+      removal_retention: crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
+    };
+    let outcome = crate::reconcile::wire::LaneId::Tombstones
+      .policy()
+      .apply(&lane_context, &rows, None, None)
+      .await
+      .unwrap();
+    assert_eq!(
+      outcome.refused, expected_refused,
+      "every decided refusal is reported to the receive boundary"
+    );
+    // The valid row in the same batch applied: the batch was not aborted.
+    assert!(
+      known_cleanup_records_ctx(store, 64)
+        .await
+        .unwrap()
+        .iter()
+        .any(|record| record.subject() == &subject),
+      "the valid row in the refused batch still applies"
     );
   }
 

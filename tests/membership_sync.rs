@@ -59,7 +59,7 @@ struct Node {
 }
 
 /// The echo protocol tag of the revised SLO workload sample.
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/workload-echo";
+const ECHO_PROTOCOL: &str = "example.org/protocols/workload-echo";
 
 /// Counts fully drained workload packets (sample delivery observation).
 #[derive(Debug, Default)]

@@ -26,7 +26,7 @@ mod common;
 use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 
 const POLICY_TAG: &str = "radiata.woooo.tech/policies/linear";
-const PROTOCOL_TAG: &str = "radiata.woooo.tech/protocols/test-echo";
+const PROTOCOL_TAG: &str = "example.org/protocols/test-echo";
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
 
 type SharedTable = Arc<Mutex<BTreeMap<String, String>>>;
@@ -1222,6 +1222,58 @@ async fn a_caller_named_path_overrides_the_policy_and_delivers() {
   }
 }
 
+/// The hop budget counts relays, not path entries: the origin's dispatch
+/// consumes no budget and arrival is checked before it, so a path of
+/// `relays + 1` entries (the relays plus the destination) is exactly what
+/// a `max_hops = relays` budget carries. A one-relay caller-named path is
+/// therefore admissible under `StreamPolicy::direct(1)` and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_one_relay_caller_path_fits_a_one_hop_budget() {
+  init_tracing();
+  let (nodes, _table) = boot_linear_four(false).await;
+  settle_linear_chain(&nodes).await;
+  wait_for_member_descriptors(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  // A -> C -> D: one relay, so the two-entry path fits `max_hops = 1`.
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Path {
+        destination: nodes[3].id().clone(),
+        path: vec![nodes[2].id().clone(), nodes[3].id().clone()],
+      },
+      protocol,
+      StreamPolicy::direct(1).unwrap(),
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet.send_sync(vec_body(&[b"one-relay"])).await.unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body == &b"one-relay".to_vec())
+    },
+    Duration::from_secs(30),
+    "a one-relay caller path must fit a one-hop budget",
+  )
+  .await;
+  // No intermediate consumer ran along the named path.
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}
+
 /// Caller-named paths are validated: shape errors fail synchronously at
 /// `open_stream`, and reachability errors fail typed at admission before
 /// any frame moves.
@@ -1261,14 +1313,15 @@ async fn invalid_caller_paths_are_rejected() {
   // The path must end at the destination.
   let error = open(vec![nodes[1].id().clone()], policy.clone()).unwrap_err();
   assert_eq!(error.kind(), ErrorKind::InvalidInput);
-  // The path is bounded by the caller's hop budget.
+  // The path is bounded by the caller's hop budget: the budget counts
+  // relays, so a two-relay path (three entries) needs `max_hops = 2`.
   let error = open(
     vec![
       nodes[1].id().clone(),
       nodes[2].id().clone(),
       destination.clone(),
     ],
-    StreamPolicy::direct(2).unwrap(),
+    StreamPolicy::direct(1).unwrap(),
   )
   .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::ResourceExhausted);

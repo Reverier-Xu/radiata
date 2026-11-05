@@ -2283,7 +2283,7 @@ mod slow_consumer_tests {
   }
 
   const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
-  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+  const PROTOCOL: &str = "example.org/protocols/test-echo";
 
   /// The authenticated grant of a session that selected the test
   /// protocol's owning feature: admission requires the negotiated
@@ -2892,7 +2892,7 @@ mod consumer_lifecycle_tests {
   };
 
   const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
-  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+  const PROTOCOL: &str = "example.org/protocols/test-echo";
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()

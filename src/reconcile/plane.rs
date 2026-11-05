@@ -770,6 +770,7 @@ impl ReconcilePlane {
         revision: &self.shared.revision,
         sessions: &self.shared.sessions,
         authorization: &self.shared.authorization,
+        swept_at: std::time::SystemTime::now(),
         removal_retention: self.shared.resource_removal_retention,
       };
       lane.policy().receive(&lane_context, &mut rows).await?;
@@ -1493,6 +1494,7 @@ async fn apply_rows(
     revision: &shared.revision,
     sessions: &shared.sessions,
     authorization: &shared.authorization,
+    swept_at: std::time::SystemTime::now(),
     removal_retention: shared.resource_removal_retention,
   };
   lane

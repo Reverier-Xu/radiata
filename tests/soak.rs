@@ -51,7 +51,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
 }
 
 const ISSUER_RESOURCE_PREFIX: &str = "radiata.woooo.tech/resources/soak";
-const SOAK_PROTOCOL: &str = "radiata.woooo.tech/protocols/soak-echo";
+const SOAK_PROTOCOL: &str = "example.org/protocols/soak-echo";
 const SOAK_OWNING_FEATURE: &str = "radiata.woooo.tech/features/data-messages";
 const WORKLOAD_TICK: Duration = Duration::from_millis(25);
 const BASELINE_TIMEOUT: Duration = Duration::from_secs(120);

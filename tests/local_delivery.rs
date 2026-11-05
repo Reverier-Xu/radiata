@@ -18,7 +18,7 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 
-const PROTOCOL_TAG: &str = "radiata.woooo.tech/protocols/local-echo";
+const PROTOCOL_TAG: &str = "example.org/protocols/local-echo";
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
 
 /// Records every admitted packet's authenticated endpoints and body.

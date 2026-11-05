@@ -432,7 +432,7 @@ impl PacketConsumer for DrainAll {
 /// completed stream until shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finished_packet_pumps_are_reaped_from_the_task_set() {
-  const REAP_PROTOCOL: &str = "radiata.woooo.tech/protocols/observability-reap";
+  const REAP_PROTOCOL: &str = "example.org/protocols/observability-reap";
   const SEND_COUNT: usize = 8;
 
   let start_with_protocol = async |seed: u64| {

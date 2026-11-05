@@ -184,6 +184,17 @@ impl TransportScheme {
     }
   }
 
+  /// Whether this scheme's transport runs over TLS and therefore dials
+  /// with merge trust. The exhaustive match is the single classification
+  /// point: a newly added scheme has to decide here instead of silently
+  /// falling into the plaintext class at a `matches!` call site.
+  pub(crate) const fn is_tls_class(self) -> bool {
+    match self {
+      Self::Tls | Self::Wss => true,
+      Self::Tcp => false,
+    }
+  }
+
   /// Recognizes the canonical scheme prefix of `value`.
   fn from_prefix(value: &str) -> Option<Self> {
     Self::ALL

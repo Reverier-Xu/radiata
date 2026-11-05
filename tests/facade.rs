@@ -21,7 +21,7 @@ mod common;
 use common::{MemoryStorageFactory, ScriptedKeys};
 
 const SYNC_INTERVAL: Duration = Duration::from_millis(50);
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/facade-echo";
+const ECHO_PROTOCOL: &str = "example.org/protocols/facade-echo";
 const LOAD_BALANCER: &str = "example.org/balancers/first-match";
 
 struct Node {

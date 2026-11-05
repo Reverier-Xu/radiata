@@ -150,7 +150,7 @@ fn receiver_protocols(
   extensions
     .register_protocol(
       ProtocolDefinition::new(
-        ProtocolTag::parse("radiata.woooo.tech/protocols/bench-probe").unwrap(),
+        ProtocolTag::parse("example.org/protocols/bench-probe").unwrap(),
         radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
       ),
       Arc::new(ProbeSink { arrivals }),
@@ -159,7 +159,7 @@ fn receiver_protocols(
   extensions
     .register_protocol(
       ProtocolDefinition::new(
-        ProtocolTag::parse("radiata.woooo.tech/protocols/bench-bulk").unwrap(),
+        ProtocolTag::parse("example.org/protocols/bench-bulk").unwrap(),
         radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
       ),
       bulk,
@@ -177,7 +177,7 @@ fn sender_protocols(bulk: Arc<BulkSink>) -> radiata::ExtensionRegistry {
   extensions
     .register_protocol(
       ProtocolDefinition::new(
-        ProtocolTag::parse("radiata.woooo.tech/protocols/bench-probe").unwrap(),
+        ProtocolTag::parse("example.org/protocols/bench-probe").unwrap(),
         radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
       ),
       Arc::new(ProbeSink {
@@ -188,7 +188,7 @@ fn sender_protocols(bulk: Arc<BulkSink>) -> radiata::ExtensionRegistry {
   extensions
     .register_protocol(
       ProtocolDefinition::new(
-        ProtocolTag::parse("radiata.woooo.tech/protocols/bench-bulk").unwrap(),
+        ProtocolTag::parse("example.org/protocols/bench-bulk").unwrap(),
         radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
       ),
       bulk,
@@ -230,7 +230,7 @@ async fn sync_probe(
   let stream = sender
     .open_stream(
       StreamTarget::Exact(peer.clone()),
-      ProtocolTag::parse("radiata.woooo.tech/protocols/bench-probe").unwrap(),
+      ProtocolTag::parse("example.org/protocols/bench-probe").unwrap(),
       StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       StreamMetadata::new()
         .insert(probe_tag(), Arc::from(id.to_le_bytes().as_slice()))
@@ -326,7 +326,7 @@ async fn lane_radiata_throughput() {
     let stream = sender
       .open_stream(
         StreamTarget::Exact(peer.clone()),
-        ProtocolTag::parse("radiata.woooo.tech/protocols/bench-bulk").unwrap(),
+        ProtocolTag::parse("example.org/protocols/bench-bulk").unwrap(),
         StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
         StreamMetadata::new(),
       )

@@ -141,6 +141,15 @@ pub radiata::ReconcileOutcome::Aborted
 pub radiata::ReconcileOutcome::Committed(radiata::CommitReceipt)
 pub radiata::ReconcileOutcome::DigestConflict
 pub radiata::ReconcileOutcome::Unknown
+#[non_exhaustive] pub enum radiata::ResourceChangeKind
+pub radiata::ResourceChangeKind::Put(radiata::ResourceView)
+pub radiata::ResourceChangeKind::Removed
+#[non_exhaustive] pub enum radiata::ResourceFeedError
+pub radiata::ResourceFeedError::Compacted
+pub radiata::ResourceFeedError::Compacted::oldest: u64
+pub radiata::ResourceFeedError::Reset
+pub radiata::ResourceFeedError::Reset::head: u64
+pub radiata::ResourceFeedError::Storage(radiata::Error)
 pub enum radiata::ResourceOrigin
 pub radiata::ResourceOrigin::Local
 pub radiata::ResourceOrigin::Remote
@@ -681,19 +690,12 @@ pub const fn radiata::ResourceChange::is_removal(&self) -> bool
 pub const fn radiata::ResourceChange::kind(&self) -> &radiata::ResourceChangeKind
 pub const fn radiata::ResourceChange::name(&self) -> &radiata::ResourceName
 pub const fn radiata::ResourceChange::version(&self) -> u64
-#[non_exhaustive] pub enum radiata::ResourceChangeKind
-pub radiata::ResourceChangeKind::Put(radiata::ResourceView)
-pub radiata::ResourceChangeKind::Removed
 pub struct radiata::ResourceChanged
 impl radiata::ResourceChanged
 pub const fn radiata::ResourceChanged::origin(&self) -> radiata::ResourceOrigin
 pub const fn radiata::ResourceChanged::removal(&self) -> bool
 pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
 impl radiata::Event for radiata::ResourceChanged
-#[non_exhaustive] pub enum radiata::ResourceFeedError
-pub radiata::ResourceFeedError::Compacted
-pub radiata::ResourceFeedError::Compacted::oldest: u64
-pub radiata::ResourceFeedError::Storage(radiata::Error)
 pub struct radiata::ResourceLabels
 impl radiata::ResourceLabels
 pub fn radiata::ResourceLabels::custom(self, radiata::LabelKey, radiata::LabelValue) -> radiata::Result<Self>

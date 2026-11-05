@@ -67,7 +67,10 @@ impl Lane for ResourcesLane {
     Box::pin(async move {
       // The retention-reclaimed receive filter, the tombstone mirror: a
       // removal row past its retention deadline whose subject the local
-      // store no longer holds never enters an engine. The deadline is the
+      // store no longer holds never enters an engine. The predicate is
+      // the scan side's own (`retention::reclaimed`) judged against the
+      // context's one instant, so the prune and this filter cannot
+      // disagree on what reclaimed evidence is. The deadline is the
       // sweep's own contract — the real basis a gone key needs before it
       // reads as reclaimed knowledge. A fresh deletion is legitimate
       // evidence even on a node that never held the resource (an older
@@ -79,19 +82,21 @@ impl Lane for ResourcesLane {
       let store = ctx.context.store();
       let namespace = crate::resource::store::namespace()?;
       let snapshot = store.snapshot().await?;
-      let swept_at = std::time::SystemTime::now();
-      let retention = ctx.removal_retention;
       let mut retained = LaneRows::with_capacity(rows.len());
       for (key, content) in rows.drain(..) {
-        let swept = crate::resource::retention::removal_expired(&content, swept_at, retention)
-          && snapshot
-            .get(
-              &namespace,
-              &crate::StoreKey::new(std::sync::Arc::from(key.clone())),
-            )
-            .await?
-            .is_none();
-        if !swept {
+        let key_present = snapshot
+          .get(
+            &namespace,
+            &crate::StoreKey::new(std::sync::Arc::from(key.clone())),
+          )
+          .await?
+          .is_some();
+        if !crate::resource::retention::reclaimed(
+          key_present,
+          &content,
+          ctx.swept_at,
+          ctx.removal_retention,
+        ) {
           retained.push((key, content));
         }
       }

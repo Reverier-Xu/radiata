@@ -17,6 +17,20 @@ const MAX_DNS_NAME_LEN: usize = 253;
 /// drift apart.
 pub(crate) const BUILTIN_DOMAIN: &str = "radiata.woooo.tech";
 
+/// Refuses one caller-supplied tag that lives under the reserved built-in
+/// domain: the core owns that namespace, so a caller registration there
+/// could only collide with (or shadow) a core entry. `context` names the
+/// refused registration surface in the typed error. Every caller
+/// registration seam (features, protocols, task reconcilers, routing
+/// policies) reads this one predicate, so the reserved-domain rule cannot
+/// fork per surface.
+pub(crate) fn require_caller_domain(domain: &str, context: &'static str) -> Result<()> {
+  if domain == BUILTIN_DOMAIN {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 /// The closed tag categories the crate compares against (single source):
 /// protocol-fixed, so one constant table makes the set auditable and a
 /// typo in any comparison impossible to compile. The version policy of

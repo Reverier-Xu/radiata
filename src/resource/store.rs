@@ -275,7 +275,7 @@ pub(crate) async fn commit_page_batch_ctx(
     }
     if !installed.is_empty() {
       store.note_local_write_tag(crate::resource::store::RESOURCE_RECORD_NAMESPACE);
-      store.note_resource_feed_change();
+      store.notify_metadata_change();
     }
     return Ok(installed);
   }
@@ -311,7 +311,7 @@ async fn commit_put_ctx(
       // now readable: wake every parked watch. The wake-up is the append's
       // own post-commit step, which is why a removal (which bypasses the
       // put path's lane note) still reaches live watchers.
-      store.note_resource_feed_change();
+      store.notify_metadata_change();
       Ok(ResourceCommitOutcome::Installed(receipt))
     }
     // A raced writer moved the register between snapshot and commit: the

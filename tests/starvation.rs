@@ -48,7 +48,7 @@ const NETWORK_SLOTS: usize = 4;
 /// shutdown must fit in.
 const DRIVE_BOX: Duration = Duration::from_secs(10);
 
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/starvation-echo";
+const ECHO_PROTOCOL: &str = "example.org/protocols/starvation-echo";
 
 /// A packet consumer that drains and counts echo bodies.
 #[derive(Debug, Default)]

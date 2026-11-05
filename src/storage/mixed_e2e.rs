@@ -42,16 +42,14 @@ async fn open_metadata(factory: &Arc<dyn StorageFactory>) -> MetadataStore {
 
 /// The logical families: every domain except the storage-internal receipt
 /// bookkeeping, whose entries carry per-store transaction identifiers, and
-/// the resource change feed, a local commit-order log whose versions follow
-/// each store's own commit order (two stores that converge through
-/// different orders legitimately hold different entries).
+/// the node-local families, whose content follows each store's own commit
+/// order (two stores that converge through different orders legitimately
+/// hold different rows).
 fn logical_families() -> Vec<crate::storage::families::MetadataFamily> {
   metadata_families()
     .into_iter()
     .filter(|family| family.domain() != crate::storage::families::MetadataDomain::Receipt)
-    .filter(|family| {
-      family.namespace_tag() != crate::storage::families::RESOURCE_CHANGE_FEED_NAMESPACE
-    })
+    .filter(|family| family.replicated())
     .collect()
 }
 
@@ -98,18 +96,18 @@ fn resource_record(
 /// Seeds one record into every caller-writable metadata family through
 /// one cross-family transaction. Excluded: the reserved receipt-internal
 /// bookkeeping namespace, the pending-transaction journal written by the
-/// commit machinery itself, the resource change feed (written only by the
-/// register commit's own transaction), and the two record namespaces whose
+/// commit machinery itself, the node-local families (written only by their
+/// owning commit's own transaction), and the two record namespaces whose
 /// pages decode real record encodings (they are exercised by the real
 /// records and the convergence lanes instead).
 fn seedable_family_tags() -> Vec<&'static str> {
   metadata_families()
     .iter()
+    .filter(|family| family.replicated())
     .map(crate::storage::families::MetadataFamily::namespace_tag)
     .filter(|tag| *tag != crate::storage::families::INTERNAL_NAMESPACE)
     .filter(|tag| *tag != crate::storage::families::PENDING_NAMESPACE)
     .filter(|tag| *tag != crate::storage::families::RESOURCE_RECORD_NAMESPACE)
-    .filter(|tag| *tag != crate::storage::families::RESOURCE_CHANGE_FEED_NAMESPACE)
     .filter(|tag| *tag != crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
     .collect()
 }
