@@ -194,6 +194,7 @@ mod catalog {
         MetadataDomain::Resource,
         MetadataDomain::Route,
         MetadataDomain::Receipt,
+        MetadataDomain::Schema,
       ] {
         assert!(
           families.iter().any(|family| family.domain() == domain),

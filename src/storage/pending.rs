@@ -311,6 +311,24 @@ impl ExpectationWire {
   }
 }
 
+/// The purpose bound of the pending journal: nonempty, at most this many
+/// bytes, printable ASCII. The purpose is a durable field of the journal
+/// record (and its singleton key), so its grammar is an invariant of this
+/// module.
+const MAX_PURPOSE_LEN: usize = 128;
+
+/// Validates one journal purpose against the record's own bound, with the
+/// caller's context in the typed error.
+fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
+  if purpose.is_empty()
+    || purpose.len() > MAX_PURPOSE_LEN
+    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+  {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 /// A decoded pending-transaction journal record.
 ///
 /// The planned operations are the exact caller and receipt-change operations
@@ -328,7 +346,7 @@ impl PendingTransactionV1 {
     purpose: &str, transaction: &TransactionId, base_revision: &StoreRevision,
     planned_operations: &[StoreOperation],
   ) -> Result<Self> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     validate_planned_operations(purpose, planned_operations)?;
     Ok(Self {
       purpose: purpose.to_owned(),
@@ -494,7 +512,7 @@ impl MetadataStore {
     &self, snapshot: &dyn StoreSnapshot, id: TransactionId, purpose: &str,
     caller_operations: Vec<StoreOperation>, mut changes: Vec<ReceiptReferenceChange>,
   ) -> Result<PreparedTransaction> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     if caller_operations
       .iter()
       .any(operation_uses_reserved_namespace)
@@ -553,7 +571,7 @@ impl MetadataStore {
     factory: &Arc<dyn StorageFactory>, receipt_retention: Duration, purpose: &str,
     clock: Arc<dyn WallClock>,
   ) -> Result<(Self, Option<ReceiptIdentity>)> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     // The recovered open walks the production open path: the capability
     // check, the schema gate, and the store construction stay single-
     // sourced in `open_with_state`, so a store whose schema version this
@@ -592,7 +610,7 @@ impl MetadataStore {
   /// from the journal and reconciliation must prove the journaled
   /// transaction committed.
   pub(crate) async fn recover_pending(&self, purpose: &str) -> Result<Option<ReceiptIdentity>> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     let discovered = {
       let snapshot = self.snapshot().await?;
       discover_pending(snapshot.as_ref(), purpose).await?
@@ -614,7 +632,7 @@ impl MetadataStore {
   pub(crate) async fn cleanup_pending(
     &self, purpose: &str, operation_id: TransactionId,
   ) -> Result<PendingCleanupOutcome> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     let snapshot = self.snapshot().await?;
     let namespace = pending_namespace()?;
     let key = pending_key(purpose);
@@ -702,7 +720,7 @@ pub(crate) async fn discover_frozen_journal_purpose(
 pub(crate) async fn discover_pending(
   snapshot: &dyn StoreSnapshot, purpose: &str,
 ) -> Result<Option<(StoreValue, PendingTransactionV1)>> {
-  crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+  validate_purpose(purpose, "pending transaction purpose")?;
   let namespace = pending_namespace()?;
   let key = pending_key(purpose);
   let mut scan = snapshot.scan(&namespace, key.as_bytes()).await?;
@@ -1162,12 +1180,12 @@ mod tests {
 
   #[test]
   fn identity_records_pending_purpose_is_bounded_printable_ascii() {
-    assert!(crate::provider::validate_purpose("", "test").is_err());
-    assert!(crate::provider::validate_purpose(&"p".repeat(129), "test").is_err());
-    assert!(crate::provider::validate_purpose("bad\tpurpose", "test").is_err());
-    assert!(crate::provider::validate_purpose("bad\u{7f}purpose", "test").is_err());
-    assert!(crate::provider::validate_purpose("node identity", "test").is_ok());
-    assert!(crate::provider::validate_purpose(&"p".repeat(128), "test").is_ok());
+    assert!(validate_purpose("", "test").is_err());
+    assert!(validate_purpose(&"p".repeat(129), "test").is_err());
+    assert!(validate_purpose("bad\tpurpose", "test").is_err());
+    assert!(validate_purpose("bad\u{7f}purpose", "test").is_err());
+    assert!(validate_purpose("node identity", "test").is_ok());
+    assert!(validate_purpose(&"p".repeat(128), "test").is_ok());
   }
 
   #[test]

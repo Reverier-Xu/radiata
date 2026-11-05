@@ -107,6 +107,10 @@ macro_rules! canonical_id {
   };
 }
 
+// The canonical identifier generator, importable by the other modules
+// that own one identifier family (`provider::KeyOperationId`).
+pub(crate) use canonical_id;
+
 canonical_id!(NodeId, "node", "node id");
 canonical_id!(TraceId, "trace", "trace id");
 canonical_id!(TransactionId, "txn", "transaction id");

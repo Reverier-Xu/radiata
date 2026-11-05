@@ -2,9 +2,11 @@ use std::{fmt, str::FromStr, sync::Arc};
 
 use sha2::{Digest as ShaDigest, Sha256};
 
-use crate::{BoxFuture, Digest, Error, PublicKey, QualifiedTag, Result, Signature, TransactionId};
+use crate::{
+  BoxFuture, Digest, Error, PublicKey, QualifiedTag, Result, Signature, TransactionId,
+  identity::{id::canonical_id, validate_id},
+};
 
-const KEY_OPERATION_PREFIX: &str = "keyop";
 const STORE_VALUE_DOMAIN: &[u8] = b"radiata/store-value/v1\0";
 const STORE_TRANSACTION_DOMAIN: &[u8] = b"radiata/store-transaction/v1\0";
 
@@ -48,45 +50,12 @@ impl KeyCapabilities {
   }
 }
 
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct KeyOperationId(String);
+canonical_id!(KeyOperationId, "keyop", "key operation id");
 
 impl KeyOperationId {
-  pub fn parse(value: &str) -> Result<Self> {
-    crate::identity::validate_id(value, KEY_OPERATION_PREFIX, "key operation id")?;
-    Ok(Self(value.to_owned()))
-  }
-
   pub(crate) fn generate(entropy: &dyn crate::api::Entropy) -> Result<Self> {
-    let value = crate::identity::id::random_prefixed_id(KEY_OPERATION_PREFIX, entropy)?;
+    let value = crate::identity::id::random_prefixed_id("keyop", entropy)?;
     Ok(Self(value))
-  }
-
-  pub fn as_str(&self) -> &str {
-    &self.0
-  }
-}
-
-impl FromStr for KeyOperationId {
-  type Err = Error;
-
-  fn from_str(value: &str) -> Result<Self> {
-    Self::parse(value)
-  }
-}
-
-impl fmt::Debug for KeyOperationId {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter
-      .debug_tuple("KeyOperationId")
-      .field(&self.0)
-      .finish()
-  }
-}
-
-impl fmt::Display for KeyOperationId {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str(&self.0)
   }
 }
 
@@ -1047,26 +1016,6 @@ fn update_bytes(hasher: &mut Sha256, value: &[u8]) {
 
 fn update_length(hasher: &mut Sha256, value: usize) {
   hasher.update((value as u128).to_be_bytes());
-}
-
-/// The shared intent-purpose bound: nonempty, bounded, printable ASCII
-/// purposes live in both the identity intent records and the pending
-/// transaction journal, so the grammar and its limit are defined once
-/// here and both sides validate through [`validate_purpose`].
-pub(crate) const MAX_PURPOSE_LEN: usize = 128;
-
-/// The intent-purpose grammar (single source): nonempty, bounded, and
-/// printable ASCII, with the caller's context in the typed error. Both
-/// the identity intent records and the storage pending journal validate
-/// purposes through this one gate so the two bounds cannot drift.
-pub(crate) fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
-  if purpose.is_empty()
-    || purpose.len() > MAX_PURPOSE_LEN
-    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
-  {
-    return Err(Error::invalid_input(context));
-  }
-  Ok(())
 }
 
 #[cfg(test)]

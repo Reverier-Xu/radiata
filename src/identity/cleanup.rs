@@ -320,8 +320,14 @@ impl CleanupCheckpointV1 {
   }
 }
 
-fn checkpoint_key() -> StoreKey {
-  StoreKey::new(Arc::from(b"checkpoint".to_vec()))
+/// The cleanup checkpoint singleton's store key bytes: one row in the
+/// checkpoint namespace, addressed by exactly this string. The single
+/// source for the key, so the writer, the readers, and the reconcile
+/// lane all address the same row.
+pub(crate) const CHECKPOINT_KEY: &[u8] = b"checkpoint";
+
+pub(crate) fn checkpoint_key() -> StoreKey {
+  StoreKey::new(Arc::from(CHECKPOINT_KEY))
 }
 
 fn checkpoint_namespace() -> Result<StoreNamespace> {
@@ -504,9 +510,9 @@ mod tests {
 
   use super::{
     CHECKPOINT_NAMESPACE, CLEANUP_RECORD_DOMAIN, CleanupCheckpointV1, CleanupRecordV1,
-    cleaned_nodes_ctx, collect_collected_tombstones_ctx, is_cleaned_ctx, issue_checkpoint_ctx,
-    known_cleanup_records_ctx, latest_checkpoint_millis_ctx, metadata_namespace,
-    persist_cleanup_record_ctx, sign_cleanup_record,
+    checkpoint_key, cleaned_nodes_ctx, collect_collected_tombstones_ctx, is_cleaned_ctx,
+    issue_checkpoint_ctx, known_cleanup_records_ctx, latest_checkpoint_millis_ctx,
+    metadata_namespace, persist_cleanup_record_ctx, sign_cleanup_record,
   };
   use crate::{
     ErrorKind, NodeId, PublicKey, Signature,
@@ -530,7 +536,7 @@ mod tests {
   async fn install_checkpoint(
     context: &lifecycle::LocalIdentityContext, entropy: &dyn crate::api::Entropy, watermark: u64,
   ) {
-    use crate::{StoreExpectation, StoreKey, StoreOperation, StoreValue};
+    use crate::{StoreExpectation, StoreOperation, StoreValue};
     let checkpoint = CleanupCheckpointV1::new(watermark, context.identity().node().clone());
     let snapshot = context.store().snapshot().await.unwrap();
     let transaction = context
@@ -540,7 +546,7 @@ mod tests {
         snapshot.revision().clone(),
         vec![StoreOperation::Put {
           namespace: metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
-          key: StoreKey::new(Arc::from(b"checkpoint".to_vec())),
+          key: checkpoint_key(),
           expected: StoreExpectation::Absent,
           value: StoreValue::new(Arc::from(checkpoint.encode().unwrap())),
         }],

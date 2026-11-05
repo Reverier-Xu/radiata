@@ -327,7 +327,7 @@ fn decode_tombstone_row(key: &[u8], content: &[u8]) -> Option<TombstoneRow> {
     }
     crate::reconcile::wire::TombstoneKind::Checkpoint => {
       let checkpoint = match crate::identity::cleanup::CleanupCheckpointV1::decode(content) {
-        Ok(checkpoint) if subject == b"checkpoint" => checkpoint,
+        Ok(checkpoint) if subject == crate::identity::cleanup::CHECKPOINT_KEY => checkpoint,
         Ok(_) => {
           tracing::debug!("reconcile checkpoint row skipped: subject mismatch");
           return None;

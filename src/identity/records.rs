@@ -707,6 +707,23 @@ impl LocalIdentityV1 {
   }
 }
 
+/// The purpose bound of the key intent records: nonempty, at most this
+/// many bytes, printable ASCII. The purpose is a durable field of these
+/// records, so its grammar is an invariant of this module.
+const MAX_PURPOSE_LEN: usize = 128;
+
+/// Validates one intent purpose against the record's own bound, with the
+/// caller's context in the typed error.
+fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
+  if purpose.is_empty()
+    || purpose.len() > MAX_PURPOSE_LEN
+    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+  {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 canonical_record! {
   wire KeyCreationIntentWire for KeyCreationIntentV1 vis [pub(crate)] {
     schema KEY_CREATION_INTENT_SCHEMA,
@@ -739,7 +756,7 @@ impl KeyCreationIntentV1 {
     operation: KeyOperationId, intended_node: NodeId, purpose: String, transaction: TransactionId,
     base_revision: StoreRevision,
   ) -> Result<Self> {
-    crate::provider::validate_purpose(&purpose, "key creation intent purpose")?;
+    validate_purpose(&purpose, "key creation intent purpose")?;
     Ok(Self {
       operation,
       intended_node,
@@ -826,7 +843,7 @@ impl KeyDeletionIntentV1 {
     operation: KeyOperationId, handle: KeyHandle, purpose: String, transaction: TransactionId,
     base_revision: StoreRevision,
   ) -> Result<Self> {
-    crate::provider::validate_purpose(&purpose, "key deletion intent purpose")?;
+    validate_purpose(&purpose, "key deletion intent purpose")?;
     Ok(Self {
       operation,
       handle,

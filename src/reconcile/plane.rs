@@ -1669,9 +1669,12 @@ async fn scan_lane(
       let checkpoint = TombstoneKind::Checkpoint;
       let namespace =
         crate::storage::families::namespace(crate::storage::families::CHECKPOINT_NAMESPACE)?;
-      let key = crate::StoreKey::new(std::sync::Arc::from(b"checkpoint".to_vec()));
+      let key = crate::identity::cleanup::checkpoint_key();
       if let Some(value) = snapshot.get(&namespace, &key).await? {
-        rows.push((checkpoint.row_key(b"checkpoint"), value.as_bytes().to_vec()));
+        rows.push((
+          checkpoint.row_key(key.as_bytes()),
+          value.as_bytes().to_vec(),
+        ));
       }
     }
   }

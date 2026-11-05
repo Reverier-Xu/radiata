@@ -13,21 +13,39 @@ use crate::{
   QualifiedTag, ResourceLabels, ResourceVersion, Result, Selector, storage::MetadataStore,
 };
 
+/// The accessor resolving one reserved label to its record field.
+type ReservedLabelAccessor = fn(&ResourceRecordV1) -> &str;
+
+/// The reserved labels and the record field each resolves to. A reserved
+/// label is data here, so adding one never touches the lookup.
+const RESERVED_LABELS: [(&str, ReservedLabelAccessor); 2] = [
+  (RESERVED_TYPE_LABEL_KEY, resource_type_label),
+  (RESERVED_URI_LABEL_KEY, resource_uri_label),
+];
+
+fn resource_type_label(record: &ResourceRecordV1) -> &str {
+  record.resource_type().as_str()
+}
+
+fn resource_uri_label(record: &ResourceRecordV1) -> &str {
+  record.resource_uri().as_str()
+}
+
 /// Whether `record`'s full label space satisfies `selector`: the reserved
 /// type/URI labels resolve to the record's reserved fields and every other
 /// key resolves against the custom labels.
 pub(crate) fn record_matches(record: &ResourceRecordV1, selector: &Selector) -> bool {
   fn lookup<'a>(record: &'a ResourceRecordV1) -> impl Fn(&QualifiedTag) -> Option<&'a str> {
     move |tag| {
-      if tag.as_str() == RESERVED_TYPE_LABEL_KEY {
-        Some(record.resource_type().as_str())
-      } else if tag.as_str() == RESERVED_URI_LABEL_KEY {
-        Some(record.resource_uri().as_str())
-      } else {
-        crate::LabelKey::from_label_tag(tag)
-          .and_then(|key| record.labels().get(&key))
-          .map(|value| value.as_str())
-      }
+      RESERVED_LABELS
+        .iter()
+        .find(|(key, _)| *key == tag.as_str())
+        .map(|(_, accessor)| accessor(record))
+        .or_else(|| {
+          crate::LabelKey::from_label_tag(tag)
+            .and_then(|key| record.labels().get(&key))
+            .map(|value| value.as_str())
+        })
     }
   }
   selector.matches_with(lookup(record))
