@@ -43,7 +43,7 @@ use crate::{
 };
 
 /// The durable schema of the leave-intent record.
-const LEAVE_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/leave-intent";
+pub(crate) const LEAVE_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/leave-intent";
 pub(crate) use crate::storage::families::LEAVE_NAMESPACE;
 
 /// Canonical-decoder bounds for the flat intent record.

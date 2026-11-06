@@ -9,6 +9,7 @@
 mod document;
 mod store;
 
+pub(crate) use document::{GENERATION_SCHEMA, LOCK_SCHEMA, STORE_SCHEMA};
 pub(crate) use store::JsonStoreFactory;
 #[cfg(all(test, unix))]
 pub(crate) use store::{FIRST_COMMITTED_POINT, LAST_POINT, select_crash_point};

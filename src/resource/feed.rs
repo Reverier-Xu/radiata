@@ -58,7 +58,7 @@ use crate::{
 /// never a change.
 const FEED_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-const FEED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/resource-change";
+pub(crate) const FEED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/resource-change";
 const FEED_ENTRY_VERSION: u16 = 1;
 /// One entry is a version, a name, and one whole record: the record's own
 /// decode bound plus the small envelope.
