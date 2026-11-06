@@ -22,7 +22,7 @@ use minicbor::{Decode, Encode};
 use crate::{
   Digest, Endpoint, Error, LabelKey, LabelSet, LabelValue, ListenerId, MemberStatus, NodeId,
   PublicKey, ResourceLabels, ResourceMutationView, ResourceName, ResourceUri, ResourceVersion,
-  ResourceView, Result, TaskKind, TaskOutput,
+  ResourceView, Result, TaskOutput,
   label::{LABEL_SET_MAX_ENTRIES, LABEL_VALUE_MAX_BYTES},
   protocol::{CborLimits, decode_canonical, encode_canonical, tag::MAX_TAG_LEN},
   view::{ConnectivityStatus, LeaveOutcome, MemberView, MergeView, RecoveryView},
@@ -58,133 +58,107 @@ const DECODE_FAILURE: &str = "task output decode";
 
 /// The join result: the local node and the merged peer.
 pub(crate) fn encode_join(view: &MergeView) -> Result<TaskOutput> {
-  encode(
-    TaskKind::JOIN,
-    &MergeViewWire {
-      node: view.node().as_str().to_owned(),
-      peer: view.peer().as_str().to_owned(),
-    },
-  )
+  encode(&MergeViewWire {
+    node: view.node().as_str().to_owned(),
+    peer: view.peer().as_str().to_owned(),
+  })
 }
 
 /// The leave result: the former and replacement identities.
 pub(crate) fn encode_leave(outcome: &LeaveOutcome) -> Result<TaskOutput> {
-  encode(
-    TaskKind::LEAVE,
-    &LeaveOutcomeWire {
-      former: outcome.former_identity().as_str().to_owned(),
-      replacement: outcome.replacement_identity().as_str().to_owned(),
-    },
-  )
+  encode(&LeaveOutcomeWire {
+    former: outcome.former_identity().as_str().to_owned(),
+    replacement: outcome.replacement_identity().as_str().to_owned(),
+  })
 }
 
 /// The connect result: the authenticated peer, as its canonical text.
 pub(crate) fn encode_connect(peer: &NodeId) -> Result<TaskOutput> {
   let text = peer.as_str();
-  encode(TaskKind::CONNECT, &text)
+  encode(&text)
 }
 
 /// One unit result: the kinds whose success carries no observation.
-pub(crate) fn encode_unit(kind: TaskKind) -> Result<TaskOutput> {
-  encode(kind, &())
+pub(crate) fn encode_unit() -> Result<TaskOutput> {
+  encode(&())
 }
 
 /// The cleanup-checkpoint result: the issued epoch watermark.
 pub(crate) fn encode_checkpoint(watermark: u64) -> Result<TaskOutput> {
-  encode(TaskKind::ISSUE_CLEANUP_CHECKPOINT, &watermark)
+  encode(&watermark)
 }
 
 /// The listen result: the bound listener.
 pub(crate) fn encode_listen(view: &crate::ListenerView) -> Result<TaskOutput> {
-  encode(
-    TaskKind::LISTEN,
-    &ListenerViewWire {
-      id: view.id().as_str().to_owned(),
-      endpoint: view.endpoint().as_str().to_owned(),
-    },
-  )
+  encode(&ListenerViewWire {
+    id: view.id().as_str().to_owned(),
+    endpoint: view.endpoint().as_str().to_owned(),
+  })
 }
 
 /// The put/delete result: the accepted candidate and whether it is the
 /// register's current winner.
-pub(crate) fn encode_resource_mutation(
-  kind: TaskKind, view: &ResourceMutationView,
-) -> Result<TaskOutput> {
-  encode(
-    kind,
-    &ResourceMutationViewWire {
-      accepted: resource_view_wire(view.accepted())?,
-      current_winner: view.is_current_winner(),
-    },
-  )
+pub(crate) fn encode_resource_mutation(view: &ResourceMutationView) -> Result<TaskOutput> {
+  encode(&ResourceMutationViewWire {
+    accepted: resource_view_wire(view.accepted())?,
+    current_winner: view.is_current_winner(),
+  })
 }
 
 /// The node-metadata result: the owner-marked descriptor observation.
 pub(crate) fn encode_member(view: &MemberView) -> Result<TaskOutput> {
-  encode(
-    TaskKind::PATCH_NODE_METADATA,
-    &MemberViewWire {
-      node_id: view.node_id().as_str().to_owned(),
-      public_key: view.public_key().as_bytes().to_vec(),
-      owner_revision: view.owner_revision(),
-      digest: view.digest().as_bytes().to_vec(),
-      connectivity: connectivity_code(view.connectivity()),
-      status: member_status_code(view.status()),
-      endpoints: view
-        .endpoints()
-        .iter()
-        .map(|endpoint| endpoint.as_str().to_owned())
-        .collect(),
-      labels: label_entries(view.labels()),
-    },
-  )
+  encode(&MemberViewWire {
+    node_id: view.node_id().as_str().to_owned(),
+    public_key: view.public_key().as_bytes().to_vec(),
+    owner_revision: view.owner_revision(),
+    digest: view.digest().as_bytes().to_vec(),
+    connectivity: connectivity_code(view.connectivity()),
+    status: member_status_code(view.status()),
+    endpoints: view
+      .endpoints()
+      .iter()
+      .map(|endpoint| endpoint.as_str().to_owned())
+      .collect(),
+    labels: label_entries(view.labels()),
+  })
 }
 
 /// The credential result (issue or rotate): the non-secret expiry
 /// observation. The secret itself never enters the payload.
-pub(crate) fn encode_credential(kind: TaskKind, expires_at: SystemTime) -> Result<TaskOutput> {
-  encode(kind, &time_wire(expires_at)?)
+pub(crate) fn encode_credential(expires_at: SystemTime) -> Result<TaskOutput> {
+  encode(&time_wire(expires_at)?)
 }
 
 /// The start-recovery result: the recovery controller's observation.
 pub(crate) fn encode_recovery(view: &RecoveryView) -> Result<TaskOutput> {
-  encode(
-    TaskKind::START_RECOVERY,
-    &RecoveryViewWire {
-      is_connected: view.is_connected(),
-      unreachable_members: u64::try_from(view.unreachable_members())
-        .map_err(|_| Error::internal("task output encode"))?,
-      next_attempt_at: match view.next_attempt_at() {
-        Some(next) => Some(time_wire(next)?),
-        None => None,
-      },
+  encode(&RecoveryViewWire {
+    is_connected: view.is_connected(),
+    unreachable_members: u64::try_from(view.unreachable_members())
+      .map_err(|_| Error::internal("task output encode"))?,
+    next_attempt_at: match view.next_attempt_at() {
+      Some(next) => Some(time_wire(next)?),
+      None => None,
     },
-  )
+  })
 }
 
 /// The receipt-retention result: the pass report.
 pub(crate) fn encode_receipt_retention(
   report: &crate::ReceiptRetentionReport,
 ) -> Result<TaskOutput> {
-  encode(
-    TaskKind::APPLY_RECEIPT_RETENTION,
-    &ReceiptRetentionReportWire {
-      forgotten: report.forgotten(),
-      remaining: report.remaining(),
-    },
-  )
+  encode(&ReceiptRetentionReportWire {
+    forgotten: report.forgotten(),
+    remaining: report.remaining(),
+  })
 }
 
 /// The revoke result: the subject and whether this call performed the
 /// revocation transition.
 pub(crate) fn encode_revoke(outcome: &crate::RevokeOutcome) -> Result<TaskOutput> {
-  encode(
-    TaskKind::REVOKE,
-    &RevokeOutcomeWire {
-      subject: outcome.subject().as_str().to_owned(),
-      was_already_revoked: outcome.was_already_revoked(),
-    },
-  )
+  encode(&RevokeOutcomeWire {
+    subject: outcome.subject().as_str().to_owned(),
+    was_already_revoked: outcome.was_already_revoked(),
+  })
 }
 
 // -- decoding -----------------------------------------------------------
@@ -289,11 +263,11 @@ pub(crate) fn decode_revoke(bytes: &[u8]) -> Result<crate::RevokeOutcome> {
 
 // -- the shared codec ---------------------------------------------------
 
-/// Encodes one core result as the payload of `kind`.
-fn encode<T: Encode<()>>(kind: TaskKind, value: &T) -> Result<TaskOutput> {
+/// Encodes one core result payload.
+fn encode<T: Encode<()>>(value: &T) -> Result<TaskOutput> {
   let bytes =
     encode_canonical(value, OUTPUT_LIMITS).map_err(|_| Error::internal("task output encode"))?;
-  Ok(TaskOutput::new(kind, bytes.into()))
+  Ok(TaskOutput::new(bytes.into()))
 }
 
 /// Decodes one core result's payload.
@@ -616,7 +590,6 @@ mod tests {
   use crate::{
     Digest, Endpoint, LabelKey, LabelSet, LabelValue, ListenerId, MemberStatus, NodeId, PublicKey,
     ResourceLabels, ResourceMutationView, ResourceName, ResourceUri, ResourceVersion, ResourceView,
-    TaskKind,
     label::LABEL_SET_MAX_ENTRIES,
     protocol::tag::MAX_TAG_LEN,
     view::{
@@ -698,8 +671,7 @@ mod tests {
       peer
     );
 
-    let unit = encode_unit(TaskKind::SYNC_ROUND).expect("encode");
-    assert_eq!(unit.kind(), &TaskKind::SYNC_ROUND);
+    let unit = encode_unit().expect("encode");
     decode_unit(unit.bytes()).expect("decode");
 
     let watermark = 41_u64;
@@ -719,12 +691,8 @@ mod tests {
 
     let mutation = resource_mutation();
     assert_eq!(
-      decode_resource_mutation(
-        encode_resource_mutation(TaskKind::PUT_RESOURCE, &mutation)
-          .expect("encode")
-          .bytes()
-      )
-      .expect("decode"),
+      decode_resource_mutation(encode_resource_mutation(&mutation).expect("encode").bytes())
+        .expect("decode"),
       mutation
     );
 
@@ -736,13 +704,9 @@ mod tests {
 
     let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_123);
     assert_eq!(
-      decode_credential(
-        encode_credential(TaskKind::ISSUE_CREDENTIAL, expires_at)
-          .expect("encode")
-          .bytes()
-      )
-      .expect("decode")
-      .expires_at(),
+      decode_credential(encode_credential(expires_at).expect("encode").bytes())
+        .expect("decode")
+        .expires_at(),
       expires_at
     );
 
@@ -857,8 +821,7 @@ mod tests {
       ),
       true,
     );
-    let encoded = encode_resource_mutation(TaskKind::PUT_RESOURCE, &mutation)
-      .expect("maximal mutation encodes");
+    let encoded = encode_resource_mutation(&mutation).expect("maximal mutation encodes");
     assert_eq!(
       decode_resource_mutation(encoded.bytes()).expect("decode"),
       mutation

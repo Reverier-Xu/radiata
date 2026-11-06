@@ -368,37 +368,31 @@ impl CredentialIssued {
   }
 }
 
-/// One task's terminal success payload: the kind tag it was produced
-/// under plus the opaque payload bytes, stored on the task so late
-/// `wait()` callers can read the outcome after the fact from the bounded
-/// terminal history.
+/// One task's terminal success payload: the opaque payload bytes, stored
+/// on the task so late `wait()` callers can read the outcome after the
+/// fact from the bounded terminal history.
 ///
 /// A core verb's payload is its result in the crate's canonical CBOR
 /// encoding; a caller-defined kind's payload is exactly the bytes its
 /// reconciler returned. The typed form of a core result is recovered
-/// through [`Task::wait`]; the repeatedly readable view exposes the tag
-/// and the bytes. The credential kinds' payload carries the
+/// through [`Task::wait`], which decodes the payload under the kind the
+/// handle was admitted for; the repeatedly readable view exposes the
+/// bytes. The credential kinds' payload carries the
 /// [`CredentialIssued`] observation only — the secret is collected once
 /// through the typed handle (see [`CredentialIssued`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskOutput {
-  kind: TaskKind,
   bytes: Arc<[u8]>,
 }
 
 impl TaskOutput {
-  /// The kind the payload was produced under.
-  pub const fn kind(&self) -> &TaskKind {
-    &self.kind
-  }
-
   /// The opaque payload bytes.
   pub fn bytes(&self) -> &[u8] {
     &self.bytes
   }
 
-  pub(crate) fn new(kind: TaskKind, bytes: Arc<[u8]>) -> Self {
-    Self { kind, bytes }
+  pub(crate) fn new(bytes: Arc<[u8]>) -> Self {
+    Self { bytes }
   }
 }
 
@@ -717,49 +711,59 @@ mod private {
 }
 
 pub(crate) trait TaskResult: private::Sealed + Sized + Send + 'static {
-  /// Builds the verb's success value from the stored output: the payload
-  /// decodes as the kind this type carries (a kind outside that set is
-  /// the typed internal mismatch). The `secret` slot is the consumed-once
-  /// credential payload: the first collector receives `Some`, every later
-  /// caller `None` (a typed invalid-input error for the credential kinds,
-  /// ignored by the rest).
-  fn from_output(output: TaskOutput, secret: Option<IssuedMergeCredential>) -> Result<Self>;
+  /// Builds the verb's success value from the stored output, decoded
+  /// under the kind the handle was admitted for (a kind outside that
+  /// verb's set is the typed internal mismatch). The `secret` slot is
+  /// the consumed-once credential payload: the first collector receives
+  /// `Some`, every later caller `None` (a typed invalid-input error for
+  /// the credential kinds, ignored by the rest).
+  fn from_output(
+    kind: &TaskKind, output: TaskOutput, secret: Option<IssuedMergeCredential>,
+  ) -> Result<Self>;
 }
 
 /// The mismatch error for every wrong-kind mapping: the handle's type
 /// and the task's kind drifted, which only a crate bug can cause.
 const OUTPUT_MISMATCH: &str = "task output";
 
-impl TaskResult for MergeView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::Join) => output::decode_join(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
+/// One impl row per verb return type: the kinds whose payload the type
+/// decodes (matched against the handle's admitted kind) plus the payload
+/// decoder. The unit result and the credential kinds' consumed-once
+/// secret slot have their own impls below.
+macro_rules! task_result {
+  ($($ty:ty => [$($kind:ident)|+] via $decode:path),+ $(,)?) => { $(
+    impl TaskResult for $ty {
+      fn from_output(
+        kind: &TaskKind, output: TaskOutput, _secret: Option<IssuedMergeCredential>,
+      ) -> Result<Self> {
+        match CoreTaskKind::from_tag(kind) {
+          $(Some(CoreTaskKind::$kind) => $decode(output.bytes()),)+
+          _ => Err(Error::internal(OUTPUT_MISMATCH)),
+        }
+      }
     }
-  }
+    impl private::Sealed for $ty {}
+  )+ };
 }
 
-impl TaskResult for LeaveOutcome {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::Leave) => output::decode_leave(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for NodeId {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::Connect) => output::decode_connect(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
+task_result!(
+  MergeView => [Join] via output::decode_join,
+  LeaveOutcome => [Leave] via output::decode_leave,
+  NodeId => [Connect] via output::decode_connect,
+  RevokeOutcome => [Revoke] via output::decode_revoke,
+  u64 => [IssueCleanupCheckpoint] via output::decode_checkpoint,
+  ListenerView => [Listen] via output::decode_listen,
+  ResourceMutationView => [PutResource | DeleteResource] via output::decode_resource_mutation,
+  MemberView => [PatchNodeMetadata] via output::decode_member,
+  RecoveryView => [StartRecovery] via output::decode_recovery,
+  ReceiptRetentionReport => [ApplyReceiptRetention] via output::decode_receipt_retention,
+);
 
 impl TaskResult for () {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
+  fn from_output(
+    kind: &TaskKind, output: TaskOutput, _secret: Option<IssuedMergeCredential>,
+  ) -> Result<Self> {
+    match CoreTaskKind::from_tag(kind) {
       Some(
         CoreTaskKind::Disconnect
         | CoreTaskKind::PurgeRevocation
@@ -776,74 +780,11 @@ impl TaskResult for () {
   }
 }
 
-impl TaskResult for RevokeOutcome {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::Revoke) => output::decode_revoke(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for u64 {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::IssueCleanupCheckpoint) => output::decode_checkpoint(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for ListenerView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::Listen) => output::decode_listen(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for ResourceMutationView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::PutResource | CoreTaskKind::DeleteResource) => {
-        output::decode_resource_mutation(output.bytes())
-      }
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for MemberView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::PatchNodeMetadata) => output::decode_member(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for RecoveryView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::StartRecovery) => output::decode_recovery(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for ReceiptRetentionReport {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
-      Some(CoreTaskKind::ApplyReceiptRetention) => output::decode_receipt_retention(output.bytes()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
 impl TaskResult for IssuedMergeCredential {
-  fn from_output(output: TaskOutput, secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match CoreTaskKind::from_tag(output.kind()) {
+  fn from_output(
+    kind: &TaskKind, output: TaskOutput, secret: Option<IssuedMergeCredential>,
+  ) -> Result<Self> {
+    match CoreTaskKind::from_tag(kind) {
       Some(CoreTaskKind::IssueCredential | CoreTaskKind::RotateCredential) => {
         // The payload is the non-secret expiry observation; decoding it
         // pins that the stored bytes are the shape this kind owns.
@@ -855,17 +796,7 @@ impl TaskResult for IssuedMergeCredential {
   }
 }
 
-impl private::Sealed for MergeView {}
-impl private::Sealed for LeaveOutcome {}
-impl private::Sealed for NodeId {}
 impl private::Sealed for () {}
-impl private::Sealed for RevokeOutcome {}
-impl private::Sealed for u64 {}
-impl private::Sealed for ListenerView {}
-impl private::Sealed for ResourceMutationView {}
-impl private::Sealed for MemberView {}
-impl private::Sealed for RecoveryView {}
-impl private::Sealed for ReceiptRetentionReport {}
 impl private::Sealed for IssuedMergeCredential {}
 
 /// One admitted operation: the caller's proof of acceptance and its
@@ -949,15 +880,10 @@ fn resolve_terminal<T: TaskResult>(
       match collected {
         // A `Succeeded` entry always carries its output; the missing
         // shapes are internal invariant violations, never caller data.
-        Ok(Some((Some(output), secret))) => {
-          // The stored payload must be the kind this handle was admitted
-          // for: a drift between the two is an internal invariant
-          // violation, never caller data.
-          if output.kind() != kind {
-            return Err(Error::internal(OUTPUT_MISMATCH));
-          }
-          T::from_output(output, secret)
-        }
+        // The payload decodes under the kind this handle was admitted
+        // for: a drift between the two decodes as the typed internal
+        // mismatch, never caller data.
+        Ok(Some((Some(output), secret))) => T::from_output(kind, output, secret),
         Ok(Some((None, _))) => Err(Error::internal(OUTPUT_MISMATCH)),
         Ok(None) => Err(Error::not_found("task")),
         Err(error) => Err(error),

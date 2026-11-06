@@ -14,7 +14,7 @@ use radiata::{
   ActionHook, BoxFuture, CustomTaskSpec, Endpoint, Error, ErrorKind, EventOptions, EventReceive,
   ExtensionRegistry, LabelKey, LabelSet, LabelValue, NodeBuilder, NodeConfig, NodeHandle, PageSpec,
   QualifiedTag, ReconcileContext, ReconcileDecision, ResourceHook, ResourceLabels, ResourceName,
-  ResourceUri, ResourceWrite, Result, TaskChanged, TaskKind, TaskOutput, TaskPhase, TaskReconciler,
+  ResourceUri, ResourceWrite, Result, TaskChanged, TaskKind, TaskPhase, TaskReconciler,
   TaskTransition,
   extension::{KeyProvider, StorageFactory},
 };
@@ -223,7 +223,6 @@ async fn lifecycle_phases_and_value_based_waits() {
   let view = node.tasks().wait(task.id().clone()).await.unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
   let output = view.output().expect("the custom task carries its output");
-  assert_eq!(output.kind(), &TaskKind::parse(PROBE_KIND).unwrap());
   assert!(
     output.bytes().is_empty(),
     "a reconciler that returns no payload leaves the bytes empty"
@@ -258,7 +257,6 @@ async fn a_custom_reconcilers_output_bytes_reach_the_task_view() {
   let view = node.tasks().wait(task.id().clone()).await.unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
   let output = view.output().expect("the custom task carries its output");
-  assert_eq!(output.kind(), &TaskKind::parse(PROBE_KIND).unwrap());
   assert_eq!(output.bytes(), b"probe-payload");
   task.wait().await.unwrap();
   node.shutdown().await.unwrap();
@@ -515,7 +513,6 @@ async fn credential_secret_is_delivered_exactly_once() {
   let observed = view
     .output()
     .expect("credential task must carry the expiry observation");
-  assert_eq!(observed.kind(), &TaskKind::ISSUE_CREDENTIAL);
   assert!(
     !observed.bytes().is_empty(),
     "the expiry observation is encoded in the payload"
@@ -528,9 +525,8 @@ async fn credential_secret_is_delivered_exactly_once() {
   assert!(issued.expires_at() > std::time::SystemTime::now());
   assert!(!issued.credential().expose_secret().is_empty());
   let view = node.tasks().get(task_id).await.unwrap().unwrap();
-  assert_eq!(
-    view.output().map(TaskOutput::kind),
-    Some(&TaskKind::ISSUE_CREDENTIAL),
+  assert!(
+    view.output().is_some(),
     "the terminal payload stays readable after the secret is collected"
   );
   node.shutdown().await.unwrap();

@@ -238,7 +238,7 @@ impl EffectOutcome {
   /// generation's expiry; the secret rides the consumed-once slot.
   pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Result<Self> {
     Ok(Self::Done {
-      output: encode_credential(TaskKind::ISSUE_CREDENTIAL, issued.expires_at())?,
+      output: encode_credential(issued.expires_at())?,
       secret: Some(issued),
     })
   }
@@ -247,7 +247,7 @@ impl EffectOutcome {
   /// rule).
   pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Result<Self> {
     Ok(Self::Done {
-      output: encode_credential(TaskKind::ROTATE_CREDENTIAL, issued.expires_at())?,
+      output: encode_credential(issued.expires_at())?,
       secret: Some(issued),
     })
   }
@@ -1461,7 +1461,7 @@ mod tests {
     let id = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+        ok_effect(unit_output()),
       )
       .await
       .expect("admission");
@@ -1549,7 +1549,7 @@ mod tests {
       let id = client
         .submit(
           TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-          ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+          ok_effect(unit_output()),
         )
         .await
         .expect("admission");
@@ -1634,15 +1634,13 @@ mod tests {
         let child = client
           .submit(
             TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-            ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+            ok_effect(unit_output()),
           )
           .await?;
         Task::<()>::from_parts(child, TaskKind::SYNC_ROUND, client.observer.clone())
           .wait()
           .await?;
-        Ok(EffectOutcome::new(custom_output(&TaskKind::from(
-          QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"),
-        ))))
+        Ok(EffectOutcome::new(custom_output()))
       })
     });
     let kind =
@@ -1752,7 +1750,7 @@ mod tests {
     let local = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+        ok_effect(unit_output()),
       )
       .await
       .expect("local admission");
@@ -1798,14 +1796,14 @@ mod tests {
   }
 
   /// One unit kind's success payload: the kind's canonical empty result.
-  fn unit_output(kind: TaskKind) -> TaskOutput {
-    crate::task::output::encode_unit(kind).expect("unit output")
+  fn unit_output() -> TaskOutput {
+    crate::task::output::encode_unit().expect("unit output")
   }
 
   /// One caller-defined kind's success payload: the reconciler's own
   /// bytes, which the crate never encodes.
-  fn custom_output(kind: &TaskKind) -> TaskOutput {
-    TaskOutput::new(kind.clone(), Arc::from([]))
+  fn custom_output() -> TaskOutput {
+    TaskOutput::new(Arc::from([]))
   }
 
   /// An effect that never settles (a wedged effect under test).
@@ -1846,7 +1844,7 @@ mod tests {
             .push(context.attempt);
           let mut steps = scripted.steps.lock().expect("steps");
           let step = match steps.len() {
-            0 => Step::Ok(unit_output(TaskKind::SYNC_ROUND)),
+            0 => Step::Ok(unit_output()),
             1 => match &steps[0] {
               Step::Ok(output) => Step::Ok(output.clone()),
               Step::Fail(kind, context) => Step::Fail(*kind, context),
@@ -2205,9 +2203,7 @@ mod tests {
       let gate = gate.clone();
       Box::pin(async move {
         gate.notified().await;
-        Ok(EffectOutcome::new(unit_output(
-          TaskKind::RESOLVE_FROZEN_JOURNAL,
-        )))
+        Ok(EffectOutcome::new(unit_output()))
       })
     });
     let journaled = client
@@ -2295,7 +2291,7 @@ mod tests {
           peak.fetch_max(now, Ordering::SeqCst);
           tokio::time::sleep(Duration::from_millis(20)).await;
           live.fetch_sub(1, Ordering::SeqCst);
-          Ok(EffectOutcome::new(unit_output(TaskKind::SYNC_ROUND)))
+          Ok(EffectOutcome::new(unit_output()))
         })
       });
       let id = client
@@ -2390,18 +2386,19 @@ mod tests {
     let id = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+        ok_effect(unit_output()),
       )
       .await
       .expect("admission");
     // The task succeeded as a sync round; a handle admitted for a join
-    // reads a different expected kind.
+    // decodes the stored bytes under the join verb's payload shape, and
+    // the mismatch surfaces as the typed internal decode failure.
     let error = handle::<MergeView>(&client, &id, TaskKind::JOIN)
       .wait()
       .await
       .expect_err("kind mismatch");
     assert_eq!(error.kind(), ErrorKind::Internal);
-    assert_eq!(error.context(), "task output");
+    assert_eq!(error.context(), "task output decode");
     // The contract holds for the right handle: the mismatch never
     // poisoned the entry.
     handle::<()>(&client, &id, TaskKind::SYNC_ROUND)

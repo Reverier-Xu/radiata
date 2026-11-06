@@ -977,9 +977,9 @@ impl TaskView {
     self.error
   }
 
-  /// The succeeded task's output: the kind tag it was produced under and
-  /// the payload bytes. For the credential kinds the payload is the
-  /// issued generation's expiry observation only — see [`TaskView`].
+  /// The succeeded task's output: the payload bytes. For the credential
+  /// kinds the payload is the issued generation's expiry observation
+  /// only — see [`TaskView`].
   pub const fn output(&self) -> Option<&crate::TaskOutput> {
     self.output.as_ref()
   }

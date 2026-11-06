@@ -476,21 +476,19 @@ impl Tasks {
     self.require_running()?;
     let kind = TaskKind::from(spec.kind().clone());
     let handle = self.handle.clone();
-    let effect_kind = kind.clone();
     let effect: TaskEffect = Arc::new(move |_deps, attempt| {
       let reconciler = Arc::clone(&reconciler);
       let handle = handle.clone();
       let spec = spec.clone();
-      let kind = effect_kind.clone();
       Box::pin(async move {
         let context =
           crate::ReconcileContext::new(handle, spec, attempt.attempt, attempt.last_error);
         match reconciler.reconcile(context).await {
           Ok(crate::ReconcileDecision::Succeeded) => {
-            Ok(EffectOutcome::new(TaskOutput::new(kind, Arc::from([]))))
+            Ok(EffectOutcome::new(TaskOutput::new(Arc::from([]))))
           }
           Ok(crate::ReconcileDecision::SucceededWithOutput(bytes)) => {
-            Ok(EffectOutcome::new(TaskOutput::new(kind, bytes.into())))
+            Ok(EffectOutcome::new(TaskOutput::new(bytes.into())))
           }
           // The explicit no-progress decision is the only re-arm path:
           // it rides the bounded extension schedule as the typed
