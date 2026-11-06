@@ -36,6 +36,9 @@
 //! - `transports` — scheme-like registry keys; the wire version is the
 //!   TLS/WebSocket protocol, not the key.
 //! - `status` — observability counter names.
+//! - `events` — caller-owned tag-keyed event-channel keys; the crate publishes
+//!   no tagged events of its own (the official events are the sealed event
+//!   types).
 //! - `resources` — reserved resource label keys (resource *names* are
 //!   caller-chosen and never built in).
 //! - `labels` — caller-owned label keys; the crate defines none.
@@ -64,9 +67,9 @@
 //!   removal and survives only as a decoder-rejection fixture.
 
 use super::tag::{
-  CATEGORY_CRYPTO, CATEGORY_FEATURES, CATEGORY_LABELS, CATEGORY_METADATA, CATEGORY_PROTOCOLS,
-  CATEGORY_RESOURCES, CATEGORY_ROUTE_POLICIES, CATEGORY_SCHEMAS, CATEGORY_STATUS, CATEGORY_TASKS,
-  CATEGORY_TRANSPORTS,
+  CATEGORY_CRYPTO, CATEGORY_EVENTS, CATEGORY_FEATURES, CATEGORY_LABELS, CATEGORY_METADATA,
+  CATEGORY_PROTOCOLS, CATEGORY_RESOURCES, CATEGORY_ROUTE_POLICIES, CATEGORY_SCHEMAS,
+  CATEGORY_STATUS, CATEGORY_TASKS, CATEGORY_TRANSPORTS,
 };
 
 /// One built-in tag category and its version policy.
@@ -106,6 +109,7 @@ pub(crate) const BUILTIN_CATEGORIES: &[BuiltinCategory] = &[
   policy(CATEGORY_ROUTE_POLICIES, false, true),
   policy(CATEGORY_TRANSPORTS, false, true),
   policy(CATEGORY_STATUS, false, true),
+  policy(CATEGORY_EVENTS, false, true),
   policy(CATEGORY_RESOURCES, false, true),
   policy(CATEGORY_LABELS, false, true),
 ];
@@ -246,9 +250,9 @@ mod tests {
     protocol::{
       feature::{FeatureRegistry, builtin_definitions},
       tag::{
-        BUILTIN_DOMAIN, CATEGORY_CRYPTO, CATEGORY_FEATURES, CATEGORY_LABELS, CATEGORY_METADATA,
-        CATEGORY_PROTOCOLS, CATEGORY_RESOURCES, CATEGORY_ROUTE_POLICIES, CATEGORY_SCHEMAS,
-        CATEGORY_STATUS, CATEGORY_TASKS, CATEGORY_TRANSPORTS,
+        BUILTIN_DOMAIN, CATEGORY_CRYPTO, CATEGORY_EVENTS, CATEGORY_FEATURES, CATEGORY_LABELS,
+        CATEGORY_METADATA, CATEGORY_PROTOCOLS, CATEGORY_RESOURCES, CATEGORY_ROUTE_POLICIES,
+        CATEGORY_SCHEMAS, CATEGORY_STATUS, CATEGORY_TASKS, CATEGORY_TRANSPORTS,
       },
     },
     storage::families::metadata_families,
@@ -266,6 +270,7 @@ mod tests {
     (CATEGORY_ROUTE_POLICIES, 3),
     (CATEGORY_TRANSPORTS, 3),
     (CATEGORY_STATUS, 10),
+    (CATEGORY_EVENTS, 0),
     (CATEGORY_RESOURCES, 2),
     (CATEGORY_LABELS, 0),
   ];
@@ -525,6 +530,10 @@ mod tests {
     // The crate defines no built-in label keys: the category is
     // caller-owned.
     assert!(inventory(CATEGORY_LABELS).is_empty());
+
+    // The crate publishes no tagged events of its own: the category is
+    // caller-owned (the official events are the sealed event types).
+    assert!(inventory(CATEGORY_EVENTS).is_empty());
   }
 
   /// Every inventory tag appears in the source, so a rename that misses

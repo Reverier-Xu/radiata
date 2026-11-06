@@ -36,6 +36,7 @@ pub(crate) fn require_caller_domain(domain: &str, context: &'static str) -> Resu
 /// typo in any comparison impossible to compile. The version policy of
 /// each category lives beside these names in [`super::builtin`].
 pub(crate) const CATEGORY_CRYPTO: &str = "crypto";
+pub(crate) const CATEGORY_EVENTS: &str = "events";
 pub(crate) const CATEGORY_FEATURES: &str = "features";
 pub(crate) const CATEGORY_LABELS: &str = "labels";
 pub(crate) const CATEGORY_METADATA: &str = "metadata";
@@ -224,6 +225,7 @@ macro_rules! category_tag {
   };
 }
 
+category_tag!(EventTag, CATEGORY_EVENTS, "event tag");
 category_tag!(FeatureTag, CATEGORY_FEATURES, "feature tag");
 category_tag!(ProtocolTag, CATEGORY_PROTOCOLS, "protocol tag");
 category_tag!(TransportTag, CATEGORY_TRANSPORTS, "transport tag");

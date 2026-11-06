@@ -5,7 +5,7 @@ use std::{
 
 use tokio::sync::broadcast;
 
-use crate::{Error, Event, Result};
+use crate::{Error, Event, EventTag, Result, operation::TaggedEvent};
 
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 
@@ -180,8 +180,9 @@ impl<E: Event> futures_core::Stream for EventSubscription<E> {
   }
 }
 
-/// The runtime event hub: one typed subscriber set per event
-/// type. Events are transient — an emission with no live subscriber is
+/// The runtime event hub: one typed subscriber set per event type, plus
+/// one subscriber set per tag on the caller-facing tag-keyed channel.
+/// Events are transient — an emission with no live subscriber is
 /// dropped, a lagging subscriber observes `Lagged` and must re-read
 /// through the paged queries, and nothing is retained for replay after
 /// restart.
@@ -194,6 +195,11 @@ pub(crate) struct EventHub {
   subscribers: std::sync::Mutex<
     std::collections::HashMap<std::any::TypeId, Vec<Box<dyn std::any::Any + Send + Sync>>>,
   >,
+  /// The tag-keyed subscriber sets: one bounded broadcast sender per
+  /// live subscription, exactly like the typed sets.
+  tagged: std::sync::Mutex<
+    std::collections::BTreeMap<EventTag, Vec<Box<dyn std::any::Any + Send + Sync>>>,
+  >,
 }
 
 impl EventHub {
@@ -201,17 +207,11 @@ impl EventHub {
     Self::default()
   }
 
-  /// Locks the subscriber map, recovering from a poisoned lock: the map
-  /// holds only plain subscriber vectors, so a panicking emitter cannot
-  /// leave it inconsistent.
-  fn lock(
-    &self,
-  ) -> std::sync::MutexGuard<
-    '_,
-    std::collections::HashMap<std::any::TypeId, Vec<Box<dyn std::any::Any + Send + Sync>>>,
-  > {
-    self
-      .subscribers
+  /// Locks a subscriber map, recovering from a poisoned lock: the maps
+  /// hold only plain subscriber vectors, so a panicking emitter cannot
+  /// leave them inconsistent.
+  fn lock<M>(mutex: &std::sync::Mutex<M>) -> std::sync::MutexGuard<'_, M> {
+    mutex
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner())
   }
@@ -221,7 +221,7 @@ impl EventHub {
   /// subscribers.
   pub(crate) fn subscribe<E: Event>(&self, options: EventOptions) -> EventSubscription<E> {
     let (sender, receiver) = broadcast::channel(options.capacity);
-    let mut subscribers = self.lock();
+    let mut subscribers = Self::lock(&self.subscribers);
     let entries = subscribers.entry(std::any::TypeId::of::<E>()).or_default();
     Self::prune::<E>(entries);
     entries.push(Box::new(std::sync::Arc::new(sender)));
@@ -233,7 +233,7 @@ impl EventHub {
   /// Emits one event to every live subscriber of its type; a subscriber
   /// whose channel is full lags instead of blocking the emitter.
   pub(crate) fn emit<E: Event>(&self, event: E) {
-    let mut subscribers = self.lock();
+    let mut subscribers = Self::lock(&self.subscribers);
     let Some(entries) = subscribers.get_mut(&std::any::TypeId::of::<E>()) else {
       return;
     };
@@ -254,6 +254,43 @@ impl EventHub {
         .downcast_ref::<std::sync::Arc<broadcast::Sender<E>>>()
         .is_some_and(|sender| sender.receiver_count() > 0)
     });
+  }
+
+  /// Publishes one caller event to every live subscriber of its tag: the
+  /// same bounded broadcast plumbing as the typed channel, with the
+  /// [`EventTag`] as the key and the payload as opaque bytes. A publish
+  /// with no live subscriber is dropped; a subscriber whose channel is
+  /// full lags instead of blocking the publisher.
+  pub(crate) fn publish(&self, tag: &EventTag, payload: std::sync::Arc<[u8]>) {
+    let event = TaggedEvent::new(tag.clone(), payload);
+    let mut subscribers = Self::lock(&self.tagged);
+    let Some(entries) = subscribers.get_mut(tag) else {
+      return;
+    };
+    for entry in entries.iter() {
+      if let Some(sender) = entry.downcast_ref::<std::sync::Arc<broadcast::Sender<TaggedEvent>>>() {
+        // A send error means this channel has no active receivers; the
+        // transient event is gone and the next retain prunes the sender.
+        let _ = sender.send(event.clone());
+      }
+    }
+    Self::prune::<TaggedEvent>(entries);
+  }
+
+  /// Subscribes to one tag's channel with an independent bounded channel
+  /// per subscription, so one slow subscriber's lag never backpressures
+  /// publishers or other subscribers.
+  pub(crate) fn subscribe_tagged(
+    &self, tag: EventTag, options: EventOptions,
+  ) -> EventSubscription<TaggedEvent> {
+    let (sender, receiver) = broadcast::channel(options.capacity);
+    let mut subscribers = Self::lock(&self.tagged);
+    let entries = subscribers.entry(tag).or_default();
+    Self::prune::<TaggedEvent>(entries);
+    entries.push(Box::new(std::sync::Arc::new(sender)));
+    EventSubscription {
+      state: SubscriptionState::Idle(receiver),
+    }
   }
 }
 
@@ -289,8 +326,8 @@ mod tests {
     atomic::{AtomicBool, Ordering},
   };
 
-  use super::event_channel;
-  use crate::{ErrorKind, Event, EventOptions, EventReceive, operation::private};
+  use super::{EventHub, event_channel};
+  use crate::{ErrorKind, Event, EventOptions, EventReceive, EventTag, operation::private};
 
   #[derive(Clone, Debug, Eq, PartialEq)]
   struct TestEvent(u8);
@@ -498,5 +535,68 @@ mod tests {
       EventReceive::Closed
     ));
     assert!(subscription.next().await.is_none());
+  }
+
+  /// The tag-keyed channel round-trips the publisher's payload under the
+  /// publishing tag, isolates tags from each other, drops publishes with
+  /// no live subscriber, and keeps the bounded per-subscription lag
+  /// behavior of the typed channel.
+  #[tokio::test]
+  async fn tagged_publish_subscribe_round_trips_isolates_and_lags() {
+    let hub = EventHub::new();
+    let alpha = EventTag::parse("example.com/events/alpha").unwrap();
+    let beta = EventTag::parse("example.com/events/beta").unwrap();
+    let options = EventOptions::new().capacity(2).unwrap();
+    let mut subscription = hub.subscribe_tagged(alpha.clone(), options);
+
+    // A publish with no live subscriber is dropped, not buffered.
+    hub.publish(&beta, Arc::from([9_u8]));
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Empty
+    ));
+
+    hub.publish(&alpha, Arc::from([1_u8]));
+    hub.publish(&alpha, Arc::from([2_u8]));
+    hub.publish(&alpha, Arc::from([3_u8]));
+    // One tag's publishes never land on another tag's subscribers.
+    hub.publish(&beta, Arc::from([9_u8]));
+
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Lagged { missed: 1 }
+    ));
+    let first = subscription.recv().await.unwrap();
+    assert!(
+      matches!(&first, EventReceive::Item(event)
+        if event.tag() == &alpha && event.payload().as_ref() == [2_u8]),
+      "the round trip carries the publishing tag and payload"
+    );
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Item(_)
+    ));
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Empty
+    ));
+  }
+
+  /// Dropping the last subscription for a tag prunes its sender on the
+  /// next publish or subscription: the hub does not accumulate dead
+  /// channels.
+  #[tokio::test]
+  async fn a_fully_dropped_tag_subscription_is_pruned() {
+    let hub = EventHub::new();
+    let alpha = EventTag::parse("example.com/events/alpha").unwrap();
+    drop(hub.subscribe_tagged(alpha.clone(), EventOptions::new()));
+    hub.publish(&alpha, Arc::from([1_u8]));
+    // The pruned map re-subscribes cleanly.
+    let mut resubscribed = hub.subscribe_tagged(alpha.clone(), EventOptions::new());
+    hub.publish(&alpha, Arc::from([2_u8]));
+    assert!(matches!(
+      resubscribed.recv().await.unwrap(),
+      EventReceive::Item(_)
+    ));
   }
 }

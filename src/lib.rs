@@ -77,13 +77,15 @@ pub use node::{
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
-  ResourceOrigin, ResourceWrite, RouteChanged, SessionChanged, TaskChanged,
+  ResourceOrigin, ResourceWrite, RouteChanged, SessionChanged, TaggedEvent, TaskChanged,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
   RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
 };
-pub use protocol::{FeatureDefinition, FeatureTag, ProtocolTag, QualifiedTag, TransportTag};
+pub use protocol::{
+  EventTag, FeatureDefinition, FeatureTag, ProtocolTag, QualifiedTag, TransportTag,
+};
 pub use provider::{
   CommitOutcome, CommitReceipt, CreatedKey, DurabilityLevel, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, ReconcileOutcome, StoreCapabilities, StoreEntry,
