@@ -34,8 +34,11 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{
-  canonical::canonical_record, lifecycle::LocalIdentityContext, records,
-  records::metadata_namespace, signature::verify_strict,
+  canonical::canonical_record,
+  lifecycle::LocalIdentityContext,
+  records,
+  records::{FLAT_RECORD_LIMITS, metadata_namespace},
+  signature::verify_strict,
 };
 /// The durable namespace of cleanup tombstone records.
 pub(crate) use crate::storage::families::CLEANUP_NAMESPACE;
@@ -49,14 +52,11 @@ pub(crate) const CLEANUP_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/cl
 /// The signature domain of the issuer-signed cleanup tombstone.
 pub(crate) const CLEANUP_RECORD_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/cleanup-record";
 
-/// Canonical-decoder bounds for the flat cleanup record.
-const CLEANUP_LIMITS: crate::protocol::CborLimits = crate::protocol::CborLimits::new(1, 8, 1_024);
-
 canonical_record! {
   wire CleanupRecordWire for CleanupRecordV1 vis [pub(crate)] {
     schema CLEANUP_RECORD_SCHEMA,
     version u16 1,
-    limits CLEANUP_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "cleanup record", canonical "cleanup record canonical form", header_err "cleanup record schema"]
     fields {
       #[n(2)] subject = subject: String => node()
@@ -285,7 +285,7 @@ canonical_record! {
   wire CheckpointWire for CleanupCheckpointV1 vis [pub(crate)] {
     schema CHECKPOINT_SCHEMA,
     version u16 1,
-    limits CLEANUP_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "cleanup checkpoint", canonical "cleanup checkpoint canonical form", header_err "cleanup checkpoint schema"]
     fields {
       /// The GC epoch watermark: host wall-clock UNIX milliseconds. Removal

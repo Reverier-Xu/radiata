@@ -35,13 +35,13 @@ use std::{
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use super::{
-  SECRET_LEN, custody_corrupt, fresh_secret, handle_for, operation_from_handle,
+  SECRET_LEN, created_key, custody_corrupt, fresh_secret, handle_for, operation_from_handle,
   validate_delete_pair,
 };
 use crate::{
-  BoxFuture, CreatedKey, Error, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, ProviderErrorContext, PublicKey, Result, Signature, StoreExpectation, StoreKey,
-  StoreOperation, StoreTransaction, StoreValue,
+  BoxFuture, Error, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId,
+  ProviderErrorContext, PublicKey, Result, Signature, StoreExpectation, StoreKey, StoreOperation,
+  StoreTransaction, StoreValue,
   api::SystemEntropy,
   provider::{CommitOutcome, KeyProvider, ReconcileOutcome, Storage},
   storage::families,
@@ -190,17 +190,11 @@ impl MetadataKeyStore {
       let Some(signing) = Self::seed_from_row(&value, ProviderErrorContext::KeyCreate).ok() else {
         return Ok(Some(KeyCreateState::Unknown));
       };
-      return Ok(Some(KeyCreateState::Present(CreatedKey::new(
-        handle.clone(),
-        PublicKey::from_bytes(signing.verifying_key().to_bytes()),
-      ))));
+      return Ok(Some(KeyCreateState::Present(created_key(handle, &signing))));
     }
     let secret = fresh_secret()?;
     let signing = SigningKey::from_bytes(&secret);
-    let created = CreatedKey::new(
-      handle.clone(),
-      PublicKey::from_bytes(signing.verifying_key().to_bytes()),
-    );
+    let created = created_key(handle, &signing);
     let transaction = StoreTransaction::new(
       crate::TransactionId::generate(&SystemEntropy)?,
       snapshot.revision().clone(),
@@ -276,10 +270,7 @@ impl KeyProvider for MetadataKeyStore {
         // undecodable row is foreign corruption that proves nothing,
         // so the state is unknown — fail closed, never overwrite.
         Some(value) => match Self::seed_from_row(&value, ProviderErrorContext::KeyReconcile) {
-          Ok(signing) => Ok(KeyCreateState::Present(CreatedKey::new(
-            handle,
-            PublicKey::from_bytes(signing.verifying_key().to_bytes()),
-          ))),
+          Ok(signing) => Ok(KeyCreateState::Present(created_key(&handle, &signing))),
           Err(_) => Ok(KeyCreateState::Unknown),
         },
         // An absent row provably never received a seed under this

@@ -32,7 +32,7 @@ use super::{
   deletion::delete_unreferenced_key,
   lifecycle::{CommitWithReconcile, LocalIdentityContext, commit_with_reconcile},
   records,
-  records::{LocalIdentityV1, local_identity_key},
+  records::{FLAT_RECORD_LIMITS, LocalIdentityV1, local_identity_key},
 };
 use crate::{
   Error, KeyHandle, KeyOperationId, NodeId, PublicKey, Result, StoreExpectation, StoreKey,
@@ -121,15 +121,11 @@ pub(crate) const LEAVE_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/leav
 /// The signature domain of the owner-signed leave record.
 pub(crate) const LEAVE_RECORD_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/leave-record";
 
-/// Canonical-decoder bounds for the flat leave record.
-const LEAVE_RECORD_LIMITS: crate::protocol::CborLimits =
-  crate::protocol::CborLimits::new(1, 8, 1_024);
-
 canonical_record! {
   wire LeaveRecordWire for LeaveRecordV1 vis [pub(crate)] {
     schema LEAVE_RECORD_SCHEMA,
     version u16 1,
-    limits LEAVE_RECORD_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "leave record", canonical "leave record canonical form", header_err "leave record schema"]
     fields {
       #[n(2)] node = node: String => node()
@@ -475,7 +471,7 @@ const WIPE_RETRIES: usize = 8;
 /// Wipes one family in bounded exact-digest batches; idempotent, so a
 /// crash mid-family resumes by re-scanning.
 async fn wipe_family(
-  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, namespace_tag: &str,
+  permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, namespace_tag: &str,
 ) -> Result<()> {
   let namespace = crate::identity::records::metadata_namespace(namespace_tag)?;
   let mut retries = 0_usize;
@@ -501,7 +497,7 @@ async fn wipe_family(
     drop(snapshot);
     let prepared =
       store.prepare_transaction(TransactionId::generate(entropy)?, revision, operations)?;
-    match commit_with_reconcile(_permit, store, prepared).await? {
+    match commit_with_reconcile(permit, store, prepared).await? {
       CommitWithReconcile::Committed => {}
       // A concurrent write raced the batch: restart the family scan with
       // a fresh snapshot; the bounded budget makes a permanent storm a
@@ -518,10 +514,10 @@ async fn wipe_family(
 
 /// Wipes every domain family of the old identity.
 async fn wipe_old_metadata(
-  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy,
+  permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy,
 ) -> Result<()> {
   for namespace in wipe_namespaces() {
-    wipe_family(_permit, store, entropy, namespace).await?;
+    wipe_family(permit, store, entropy, namespace).await?;
   }
   Ok(())
 }
@@ -558,7 +554,7 @@ async fn replacement_key(
 /// to the replacement (exact digest on the former record, deletion-intent
 /// guards on the replacement handle).
 async fn swap_identity(
-  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, intent: &LeaveIntentV1,
+  permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, intent: &LeaveIntentV1,
   created: &crate::CreatedKey,
 ) -> Result<()> {
   let replacement = LocalIdentityV1::new(
@@ -597,7 +593,7 @@ async fn swap_identity(
     ],
   )?;
   drop(snapshot);
-  match commit_with_reconcile(_permit, store, prepared).await? {
+  match commit_with_reconcile(permit, store, prepared).await? {
     CommitWithReconcile::Committed => Ok(()),
     CommitWithReconcile::Aborted => Err(Error::conflict("leave identity swap")),
   }
@@ -605,7 +601,7 @@ async fn swap_identity(
 
 /// Phase F: removes the completed leave-intent by exact digest.
 async fn complete_leave(
-  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, stored: &StoreValue,
+  permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, stored: &StoreValue,
 ) -> Result<()> {
   let snapshot = store.snapshot().await?;
   let prepared = store.prepare_transaction(
@@ -618,7 +614,7 @@ async fn complete_leave(
     }],
   )?;
   drop(snapshot);
-  match commit_with_reconcile(_permit, store, prepared).await? {
+  match commit_with_reconcile(permit, store, prepared).await? {
     CommitWithReconcile::Committed => Ok(()),
     CommitWithReconcile::Aborted => Err(Error::conflict("leave completion")),
   }

@@ -14,12 +14,25 @@ pub(crate) mod metadata;
 
 use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::{
-  Error, KeyHandle, KeyOperationId, ProviderErrorContext, ProviderErrorKind, Result,
+  CreatedKey, Error, KeyHandle, KeyOperationId, ProviderErrorContext, ProviderErrorKind, PublicKey,
+  Result,
   api::{Entropy, SystemEntropy},
 };
+
+/// Builds the create outcome for one minted or proven signing key: the
+/// handle it is filed under and its verifying public key. Every built-in
+/// adapter shares this one construction so the handle/public-key pairing
+/// cannot drift per adapter.
+pub(crate) fn created_key(handle: &KeyHandle, signing: &SigningKey) -> CreatedKey {
+  CreatedKey::new(
+    handle.clone(),
+    PublicKey::from_bytes(signing.verifying_key().to_bytes()),
+  )
+}
 
 /// The Ed25519 seed length every built-in adapter stores and loads.
 pub(crate) const SECRET_LEN: usize = 32;

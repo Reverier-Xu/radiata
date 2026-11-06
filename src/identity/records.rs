@@ -80,6 +80,11 @@ pub(crate) use crate::storage::families::{
 const SINGLETON_KEY: &[u8] = b"self";
 const RECORD_LIMITS: CborLimits = CborLimits::new(1, 16, 1_024);
 
+/// Canonical-decoder bounds shared by every flat issuer-signed tombstone
+/// record (the revocation, leave, and cleanup records): one map-entry
+/// budget, eight inter-array values, 1 KiB body.
+pub(crate) const FLAT_RECORD_LIMITS: CborLimits = CborLimits::new(1, 8, 1_024);
+
 pub(crate) fn metadata_namespace(tag: &str) -> Result<StoreNamespace> {
   crate::storage::families::namespace(tag)
 }
