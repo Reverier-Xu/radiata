@@ -262,12 +262,11 @@ pub(crate) enum SlotClass {
   /// awaits *other* admitted tasks through its public handle — drawing
   /// from the local channel would let a workflow occupy the very
   /// capacity its child writes need (with one local slot, the first
-  /// such workflow deadlocks on itself). Recursive waiting is bounded
-  /// per class: code running inside one class's effect may await tasks
-  /// of other classes, but awaiting another task of the *same* class
-  /// (an extension reconciler awaiting an extension task) can
-  /// self-deadlock on that class's bounded budget, so reconcile code
-  /// must never do it.
+  /// such workflow deadlocks on itself). Same-class recursive waiting
+  /// is refused, not merely discouraged: a submission made from inside
+  /// an effect of the same class is a typed admission refusal (the
+  /// nested-submit refusal), because awaiting a task of one's own
+  /// bounded channel can self-deadlock on that budget.
   Extension,
 }
 
@@ -1298,9 +1297,11 @@ pub(crate) async fn notify_resource_observers(
 ///
 /// A reconciler runs on the extension slot channel: it may freely await
 /// core verbs (the local and network classes) through its handle, but
-/// must never await another extension-kind task — the extension
-/// channel's bounded budget is not reentrant, and same-class recursive
-/// waiting can self-deadlock (see `SlotClass`).
+/// never another extension-kind task — the extension channel's bounded
+/// budget is not reentrant, and same-class recursive waiting can
+/// self-deadlock. The refusal is enforced, not documented: a submission
+/// made from inside an effect of the same slot class fails admission
+/// with a typed conflict error instead of deadlocking (see `SlotClass`).
 ///
 /// One reconciler registration record: the reconciler itself (the core
 /// verbs declare policy-only records — their effects are the runtime's

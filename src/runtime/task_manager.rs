@@ -384,6 +384,21 @@ pub(crate) struct Submission {
   pub(crate) spec: TaskSpec,
   pub(crate) effect: TaskEffect,
   pub(crate) reply: oneshot::Sender<Result<TaskId>>,
+  /// The slot class of the effect this submission was made from, when
+  /// any: the attempt body scopes the running effect's class onto its
+  /// tokio task (see `RUNNING_EFFECT_CLASS`), and the admission refuses
+  /// a submission into that same class — the nested-submit refusal that
+  /// turns the same-class recursive-waiting deadlock into a typed
+  /// caller error.
+  pub(crate) from_class: Option<SlotClass>,
+}
+
+// The slot class of the reconcile effect running on the current tokio
+// task, set by the attempt body around the effect invocation. A
+// submission read off a task without this scope (a verb call from
+// ordinary caller code) carries no class and is never refused.
+tokio::task_local! {
+  static RUNNING_EFFECT_CLASS: SlotClass;
 }
 
 /// The caller's submission half over the manager: the bounded admission
@@ -407,9 +422,9 @@ impl std::fmt::Debug for TaskClient {
 impl TaskClient {
   /// Submits one task and awaits its admission: pure validation and
   /// hooks have already run caller-side; this is id composition, the
-  /// dedup/coalescing check, the per-class backlog bound, the `Pending`
-  /// publication, and the first reconcile spawn. No IO ever runs on
-  /// this path.
+  /// nested-submit refusal, the dedup/coalescing check, the per-class
+  /// backlog bound, the `Pending` publication, and the first reconcile
+  /// spawn. No IO ever runs on this path.
   pub(crate) async fn submit(&self, spec: TaskSpec, effect: TaskEffect) -> Result<TaskId> {
     let (reply, response) = oneshot::channel();
     self
@@ -418,6 +433,7 @@ impl TaskClient {
         spec,
         effect,
         reply,
+        from_class: RUNNING_EFFECT_CLASS.try_with(|class| *class).ok(),
       })
       .await
       .map_err(|_| Error::shutting_down("task admission"))?;
@@ -951,6 +967,7 @@ fn admit(
     spec,
     effect,
     reply,
+    from_class,
   } = submission;
   let result = admit_inner(
     shared,
@@ -961,6 +978,7 @@ fn admit(
     base,
     &spec,
     effect,
+    from_class,
     reports,
     outstanding,
   );
@@ -972,8 +990,8 @@ fn admit_inner(
   shared: &Arc<ManagerShared>, counter: &mut u64,
   coalescing: &mut BTreeMap<(TaskKind, NodeId), (TaskId, TaskSpec)>,
   leave_task: &mut Option<TaskId>, cancel_watch: &watch::Receiver<bool>, base: u128,
-  spec: &TaskSpec, effect: TaskEffect, reports: &mpsc::UnboundedSender<WorkerReport>,
-  outstanding: &mut usize,
+  spec: &TaskSpec, effect: TaskEffect, from_class: Option<SlotClass>,
+  reports: &mpsc::UnboundedSender<WorkerReport>, outstanding: &mut usize,
 ) -> Result<TaskId> {
   if *cancel_watch.borrow() {
     return Err(Error::shutting_down("task admission"));
@@ -989,6 +1007,13 @@ fn admit_inner(
     .extensions()
     .task_reconciler_policy(&kind)
     .ok_or_else(|| Error::internal("task policy"))?;
+  // The nested-submit refusal: a submission made from inside an effect
+  // of the same slot class would await a task of its own bounded
+  // channel — the one recursive wait that can self-deadlock on the
+  // class's budget — so it is refused typed instead of admitted.
+  if from_class == Some(policy.slot_class) {
+    return Err(Error::conflict("nested task submit"));
+  }
   // Coalescing: kind + subject, accepted only when the whole spec
   // equals the in-flight one. A task's terminal publication (which
   // wakes every `wait`) lands inside its attempt body, before this
@@ -1147,6 +1172,7 @@ impl Worker {
         shared: Arc::clone(&self.shared),
         id: self.id.clone(),
         kind: self.kind.clone(),
+        policy: self.policy,
         effect: self.effect.clone(),
         attempt: AttemptContext {
           attempt: self.attempt,
@@ -1219,6 +1245,7 @@ struct Attempt {
   shared: Arc<ManagerShared>,
   id: TaskId,
   kind: TaskKind,
+  policy: TaskReconcilePolicy,
   effect: TaskEffect,
   attempt: AttemptContext,
 }
@@ -1233,7 +1260,17 @@ impl Attempt {
       // poisoned: there is no state left to publish onto.
       return AttemptOutcome::Terminal;
     }
-    match (self.effect)(Arc::clone(&self.shared.operations), self.attempt).await {
+    // The running effect's slot class is scoped onto this task so a
+    // nested submission reads it and the admission can refuse a
+    // same-class recursive wait (the nested-submit refusal).
+    let class = self.policy.slot_class;
+    let outcome = RUNNING_EFFECT_CLASS
+      .scope(
+        class,
+        (self.effect)(Arc::clone(&self.shared.operations), self.attempt),
+      )
+      .await;
+    match outcome {
       Ok(EffectOutcome::Done { output, secret }) => {
         self
           .shared

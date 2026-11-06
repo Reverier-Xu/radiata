@@ -400,6 +400,63 @@ async fn a_failed_decision_carries_the_error() {
   node.shutdown().await.unwrap();
 }
 
+const NESTED_KIND: &str = "example.org/tasks/v1/nested";
+
+/// The same-class nested-submit reconciler: it submits its own kind
+/// through the handle and turns the outcome into its decision.
+#[derive(Debug)]
+struct NestedSubmitReconciler;
+
+impl TaskReconciler for NestedSubmitReconciler {
+  fn reconcile<'a>(&'a self, ctx: ReconcileContext) -> BoxFuture<'a, Result<ReconcileDecision>> {
+    Box::pin(async move {
+      let spec = CustomTaskSpec::new(ctx.spec().kind().clone(), LabelSet::new());
+      match ctx.handle().tasks().submit(spec).await {
+        // The same-class nested submit is the typed refusal, never a
+        // deadlock: the attempt completes on it.
+        Err(error) if error.kind() == ErrorKind::Conflict => Ok(ReconcileDecision::Succeeded),
+        Err(error) => Ok(ReconcileDecision::Failed(radiata::TaskError::from_error(
+          error,
+        ))),
+        Ok(_) => Ok(ReconcileDecision::Failed(radiata::TaskError::from_error(
+          Error::caller("nested submit was admitted"),
+        ))),
+      }
+    })
+  }
+}
+
+/// The nested-submit refusal: a reconciler awaiting another task of its
+/// own slot class would self-deadlock on the extension channel's bounded
+/// budget, so the admission refuses the same-class nested submission
+/// typed instead. The reconciler observes the conflict and completes —
+/// which only the refusal (never a deadlock, never an admission) allows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_class_nested_submit_is_refused_typed() {
+  common::init_tracing();
+  let mut extensions = ExtensionRegistry::new();
+  extensions
+    .register_task_reconciler(
+      QualifiedTag::parse(NESTED_KIND).unwrap(),
+      Arc::new(NestedSubmitReconciler),
+    )
+    .unwrap();
+  let node = start_node(23, extensions, NodeConfig::new()).await;
+  let task = node
+    .tasks()
+    .submit(CustomTaskSpec::new(
+      QualifiedTag::parse(NESTED_KIND).unwrap(),
+      LabelSet::new(),
+    ))
+    .await
+    .unwrap();
+  let () = tokio::time::timeout(Duration::from_secs(30), task.wait())
+    .await
+    .expect("the nested submit must be refused, never deadlocked")
+    .expect("the reconciler completes on the typed refusal");
+  node.shutdown().await.unwrap();
+}
+
 /// A panic inside one reconcile attempt terminalizes the task typed and
 /// leaves the node serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
