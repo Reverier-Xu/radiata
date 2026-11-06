@@ -18,14 +18,13 @@
 
 use std::{fmt, sync::Arc};
 
-use tokio::net::TcpListener;
-
 use super::{
   connection::{Connection, FrameRules},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
   registry::{Transport, TransportAdmission, TransportListener},
-  tcp, tls,
+  tcp::{self, TcpListenerBase},
+  tls,
 };
 use crate::{
   ProviderErrorContext, Result,
@@ -58,17 +57,13 @@ impl Transport for WssTransport {
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
     let admission = self.admission();
     Box::pin(async move {
-      let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Wss).await?;
+      let base = TcpListenerBase::bind(&endpoint, TransportScheme::Wss).await?;
       let config = tls::listener_tls(&SystemEntropy)?;
       let rules = connection_frame_rules()?;
-      let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
       Ok(Box::new(WssListener {
-        listener,
-        shutdown_tx,
-        shutdown: shutdown_rx,
+        base,
         config,
         rules,
-        bound,
         admission,
       }) as Box<dyn TransportListener>)
     })
@@ -90,12 +85,9 @@ impl Transport for WssTransport {
 
 /// A [`TransportListener`] for the built-in WebSocket transport.
 pub(crate) struct WssListener {
-  listener: TcpListener,
-  shutdown_tx: tokio::sync::watch::Sender<()>,
-  shutdown: tokio::sync::watch::Receiver<()>,
+  base: TcpListenerBase,
   config: Arc<rustls::ServerConfig>,
   rules: FrameRules,
-  bound: Endpoint,
   admission: TransportAdmission,
 }
 
@@ -103,14 +95,14 @@ impl fmt::Debug for WssListener {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("WssListener")
-      .field("bound", &self.bound)
+      .field("bound", &self.base.local_endpoint())
       .finish_non_exhaustive()
   }
 }
 
 impl TransportListener for WssListener {
   fn local_endpoint(&self) -> Endpoint {
-    self.bound.clone()
+    self.base.local_endpoint()
   }
 
   fn accept<'a>(
@@ -119,14 +111,8 @@ impl TransportListener for WssListener {
     let config = Arc::clone(&self.config);
     let rules = self.rules;
     let admission = self.admission;
-    let mut shutdown = self.shutdown.clone();
     Box::pin(async move {
-      let tcp = tcp::accept(
-        &self.listener,
-        &mut shutdown,
-        ProviderErrorContext::TransportAccept,
-      )
-      .await?;
+      let tcp = self.base.accept_tcp().await?;
       // The hint is evaluated after the kernel accept: the served
       // generation is the issuer's current one, not a snapshot from when
       // the listener started blocking.
@@ -137,10 +123,7 @@ impl TransportListener for WssListener {
 
   fn close<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
-      // Signalling only wakes a pending accept (it returns the shutdown
-      // error); the socket stays bound until the owner drops the
-      // listener, which is what releases the address for a rebind.
-      let _ = self.shutdown_tx.send(());
+      self.base.close();
       Ok(())
     })
   }
