@@ -28,7 +28,7 @@ use rustls::{
   version::TLS13,
 };
 
-use super::{cert::EphemeralCertificate, registry::TransportTrust, verify::BootstrapCertVerifier};
+use super::{cert::EphemeralCertificate, verify::BootstrapCertVerifier};
 use crate::{Error, Result};
 
 /// The aws-lc-rs-backed TLS 1.3-only provider.
@@ -55,10 +55,12 @@ pub(crate) fn server_config(certificate: &EphemeralCertificate) -> Result<Arc<Se
   Ok(Arc::new(config))
 }
 
-/// Builds the merge-mode client configuration: chain and hostname trust are
+/// Builds the dial-side client configuration: chain and hostname trust are
 /// relaxed, while the TLS 1.3 `CertificateVerify` signature remains fully
-/// validated. The WebPKI chain
-/// verifier is never used in join mode.
+/// validated. Every official TLS dial carries this configuration
+/// unconditionally — there is no dial-time trust selection — so peer
+/// identity is authenticated by the application-layer session handshake
+/// over the exporter channel binding, never by the WebPKI chain verifier.
 pub(crate) fn merge_client_config() -> Result<Arc<ClientConfig>> {
   let provider = crypto_provider();
   let verifier = BootstrapCertVerifier::new(provider.signature_verification_algorithms);
@@ -74,17 +76,6 @@ pub(crate) fn merge_client_config() -> Result<Arc<ClientConfig>> {
   config.alpn_protocols = Vec::new();
 
   Ok(Arc::new(config))
-}
-
-/// Maps the semantic trust a dial carries onto the client TLS
-/// configuration: the transport owns the wire details, the caller owns
-/// the intent. A plaintext trust on a TLS transport is a caller bug and
-/// fails typed instead of silently downgrading the channel.
-pub(crate) fn client_config_for_trust(trust: &TransportTrust) -> Result<Arc<ClientConfig>> {
-  match trust {
-    TransportTrust::Merge => merge_client_config(),
-    TransportTrust::Plaintext => Err(Error::invalid_input("transport trust")),
-  }
 }
 
 /// Generates the listener's ephemeral self-signed certificate from the

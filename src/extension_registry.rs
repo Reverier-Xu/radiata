@@ -18,7 +18,7 @@ use crate::{
   api::{BoxFuture, insert_once},
   routing::RoutingRegistry,
   transport::{
-    TransportName, TransportProvider, TransportScheme, TransportSelector,
+    TransportName, TransportProvider,
     registry::{Transport, TransportRegistry},
   },
 };
@@ -108,8 +108,8 @@ impl ExtensionRegistry {
   /// core feature definitions explicitly. The node builder calls this by
   /// default, so an ordinary node keeps resolving every official scheme and
   /// feature; a caller that builds its own registry sees exactly what it
-  /// registered. Idempotent: an entry already present (a caller override, a
-  /// caller-claimed next-hop tag) is left untouched.
+  /// registered. Idempotent: an entry already present (a caller-claimed
+  /// transport name, a caller-claimed next-hop tag) is left untouched.
   pub fn register_default(&mut self) -> Result<&mut Self> {
     self.transports.register_default()?;
     self.routing.register_default()?;
@@ -174,21 +174,22 @@ impl ExtensionRegistry {
   }
 
   /// Registers one caller-defined transport under its addressing scheme
-  /// name (the protocol prefix of the custom endpoint form
-  /// `<name>://<opaque>`). The name is unique per node: a duplicate, a
-  /// reserved name, or any other conflict is rejected before use. The
-  /// official transports are installed by
-  /// [`ExtensionRegistry::register_default`] under their own schemes and cannot
-  /// be shadowed from here; replacing one is the explicit
-  /// [`ExtensionRegistry::override_builtin_transport`] decision instead.
+  /// name (the protocol prefix of the endpoint form `<name>://<opaque>`).
+  /// The name is unique per node: a duplicate, a reserved name, or any
+  /// other conflict is rejected before use. The official scheme names are
+  /// ordinary registry names: a name claimed here before
+  /// [`ExtensionRegistry::register_default`] runs occupies it, and the
+  /// default path skips that scheme — the claimant's implementation serves
+  /// the official URL form with no specialization. After the default path
+  /// has run the name is taken, so the same claim is a `Conflict`.
   ///
   /// This is the public extension surface of the transport layer: the
-  /// registry is the single map from endpoint selector to transport,
-  /// and a registered name becomes dialable through the canonical
-  /// custom form `<name>://<opaque-address>`. The binding is node-local:
-  /// endpoints exchanged across nodes assume both sides bound the name
-  /// identically, and a mismatch fails at the session handshake's
-  /// identity proofs rather than silently.
+  /// registry is the single map from scheme name to transport, and a
+  /// registered name becomes dialable through the canonical form
+  /// `<name>://<opaque-address>`. The binding is node-local: endpoints
+  /// exchanged across nodes assume both sides bound the name identically,
+  /// and a mismatch fails at the session handshake's identity proofs
+  /// rather than silently.
   pub fn register_transport(
     &mut self, name: TransportName, transport: Arc<dyn TransportProvider>,
   ) -> Result<&mut Self> {
@@ -196,73 +197,31 @@ impl ExtensionRegistry {
     Ok(self)
   }
 
-  /// Explicitly replaces one official transport with a caller-defined
-  /// implementation: from now on every dial and listen addressed to the
-  /// official form of `scheme` (`tls://`, `wss://`, or `tcp://`)
-  /// resolves to `transport`. The default path installs an official
-  /// transport only when its selector is still free, so an override
-  /// installed before the default path runs wins wholesale — no official
-  /// transport participates behind the selector, and no transport code
-  /// path special-cases the replacement. After [`Self::register_default`]
-  /// has run the official selector is taken, so the same call is a
-  /// `Conflict`: the override is a decision about the default path's
-  /// order, not a post-start replacement.
-  ///
-  /// The override serves the dial intents the official selector
-  /// produces: a `tls://` or `wss://` override receives the merge trust
-  /// intent a TLS class dials with, a `tcp://` override receives the
-  /// plaintext intent. The provider medium receives no trust intent
-  /// beyond that class check: it owns its own wire security — the same
-  /// plaintext-class contract every transport provider carries — and
-  /// the session handshake's identity proofs authenticate both
-  /// endpoints over the replacement channel. The channel binding derives
-  /// from the official selector's canonical tag, so proofs over the
-  /// override stay distinct from the replaced official transport and from
-  /// every custom name; the binding is node-local, and endpoints exchanged
-  /// across nodes assume both sides bound the selector identically (a
-  /// mismatch fails at the handshake's identity proofs, never silently).
-  ///
-  /// One override per selector: a scheme already overridden is a
-  /// conflict, rejected before use. The existing custom-name contract is
-  /// untouched — an official selector never becomes a custom
-  /// [`crate::TransportName`], and [`ExtensionRegistry::register_transport`]
-  /// keeps its own namespace.
-  pub fn override_builtin_transport(
-    &mut self, scheme: TransportScheme, transport: Arc<dyn TransportProvider>,
+  /// Registers one transport implementation under a scheme name.
+  /// Test-only: the default path owns the official registrations in
+  /// production.
+  #[cfg(test)]
+  pub(crate) fn register_named_transport(
+    &mut self, name: TransportName, value: Arc<dyn Transport>,
   ) -> Result<&mut Self> {
-    self
-      .transports
-      .override_builtin_transport(scheme, transport)?;
+    self.transports.register_named_transport(name, value)?;
     Ok(self)
   }
 
-  /// Registers one official transport implementation under its canonical
-  /// tag. Test-only: the default path owns the official map in production.
-  #[cfg(test)]
-  pub(crate) fn register_builtin_transport(
-    &mut self, tag: crate::TransportTag, value: Arc<dyn Transport>,
-  ) -> Result<&mut Self> {
-    self.transports.register_builtin_transport(tag, value)?;
-    Ok(self)
+  /// Resolves one endpoint's scheme name through the map: the official
+  /// transports and every caller-registered transport provider merge
+  /// into one resolution namespace, and a name that resolves to nothing
+  /// fails typed here — at dial or listen time, never at parse time
+  /// (endpoint parsing is purely syntactic and registry-free).
+  pub(crate) fn resolve_transport(&self, name: &TransportName) -> Result<Arc<dyn Transport>> {
+    self.transports.resolve_transport(name)
   }
 
-  /// Resolves one endpoint's transport selector through the map: the
-  /// official transports and every caller-registered transport provider
-  /// merge into one resolution namespace, and a selector that resolves
-  /// to nothing fails typed here — at dial or listen time, never at
-  /// parse time (endpoint parsing is purely syntactic and
-  /// registry-free).
-  pub(crate) fn resolve_transport(
-    &self, selector: &TransportSelector,
-  ) -> Result<Arc<dyn Transport>> {
-    self.transports.resolve_transport(selector)
-  }
-
-  /// The registered transport for one tag. Test-only: production resolves
-  /// through [`Self::resolve_transport`].
+  /// The registered transport for one scheme name. Test-only: production
+  /// resolves through [`Self::resolve_transport`].
   #[cfg(test)]
-  pub(crate) fn transport(&self, tag: &crate::TransportTag) -> Option<&Arc<dyn Transport>> {
-    self.transports.transport(tag)
+  pub(crate) fn transport(&self, name: &TransportName) -> Option<&Arc<dyn Transport>> {
+    self.transports.transport(name)
   }
 
   /// The routing map: next-hop and stream routing policy resolution.

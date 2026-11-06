@@ -25,18 +25,10 @@ use super::{
   connection::{Connection, FrameRules, plaintext_channel_binding},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
-  registry::{
-    Transport, TransportAdmission, TransportCapabilities, TransportListener, TransportTrust,
-  },
+  registry::{Transport, TransportAdmission, TransportListener},
   tcp,
 };
-use crate::{
-  Error, ProviderErrorContext, Result, api::BoxFuture, protocol::wire::connection_frame_rules,
-};
-
-/// The canonical tag of the built-in plaintext transport: the
-/// closed-intranet IoT choice, selected by `tcp://` endpoints.
-pub(crate) const BUILTIN_TRANSPORT_TCP: &str = "radiata.woooo.tech/transports/tcp";
+use crate::{ProviderErrorContext, Result, api::BoxFuture, protocol::wire::connection_frame_rules};
 
 /// The built-in plaintext TCP transport.
 pub(crate) struct PlainTransport;
@@ -56,12 +48,12 @@ impl PlainTransport {
 }
 
 impl Transport for PlainTransport {
-  fn capabilities(&self) -> TransportCapabilities {
-    TransportCapabilities::new(TransportAdmission::PeerAddressed)
+  fn admission(&self) -> TransportAdmission {
+    TransportAdmission::PeerAddressed
   }
 
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
-    let admission = self.capabilities().admission();
+    let admission = self.admission();
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Tcp).await?;
       let rules = connection_frame_rules()?;
@@ -77,17 +69,8 @@ impl Transport for PlainTransport {
     })
   }
 
-  fn connect(
-    &self, endpoint: Endpoint, trust: TransportTrust,
-  ) -> BoxFuture<'static, Result<Connection>> {
+  fn connect(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Connection>> {
     Box::pin(async move {
-      // The plaintext transport only accepts plaintext trust: a TLS
-      // trust mode arriving here is a caller bug (the endpoint scheme
-      // and the trust intent disagree) and fails typed instead of
-      // silently downgrading the intended channel.
-      if !matches!(trust, TransportTrust::Plaintext) {
-        return Err(Error::invalid_input("transport trust"));
-      }
       let tcp = tcp::dial(&endpoint, ProviderErrorContext::TransportConnect).await?;
       let rules = connection_frame_rules()?;
       let channel_binding = plaintext_channel_binding()?;

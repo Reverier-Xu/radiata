@@ -24,9 +24,7 @@ use super::{
   connection::{Connection, FrameRules},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
-  registry::{
-    Transport, TransportAdmission, TransportCapabilities, TransportListener, TransportTrust,
-  },
+  registry::{Transport, TransportAdmission, TransportListener},
   tcp, tls,
 };
 use crate::{
@@ -34,10 +32,6 @@ use crate::{
   api::{BoxFuture, SystemEntropy},
   protocol::wire::connection_frame_rules,
 };
-
-/// The canonical tag of the built-in WebSocket transport: the
-/// firewall-traversal choice, selected by `wss://` endpoints.
-pub(crate) const BUILTIN_TRANSPORT_WSS: &str = "radiata.woooo.tech/transports/wss";
 
 /// The built-in WebSocket transport.
 pub(crate) struct WssTransport;
@@ -57,12 +51,12 @@ impl WssTransport {
 }
 
 impl Transport for WssTransport {
-  fn capabilities(&self) -> TransportCapabilities {
-    TransportCapabilities::new(TransportAdmission::PeerAddressed)
+  fn admission(&self) -> TransportAdmission {
+    TransportAdmission::PeerAddressed
   }
 
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
-    let admission = self.capabilities().admission();
+    let admission = self.admission();
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Wss).await?;
       let config = tls::listener_tls(&SystemEntropy)?;
@@ -80,14 +74,12 @@ impl Transport for WssTransport {
     })
   }
 
-  fn connect(
-    &self, endpoint: Endpoint, trust: TransportTrust,
-  ) -> BoxFuture<'static, Result<Connection>> {
+  fn connect(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Connection>> {
     Box::pin(async move {
-      // Reject a mismatched trust intent before any wire activity: a
-      // plaintext trust on a TLS transport is a caller bug and fails
-      // typed instead of downgrading the channel.
-      let config = tls::client_config_for_trust(&trust)?;
+      // The client configuration is unconditional: the TLS 1.3 channel
+      // always comes up, and the session handshake authenticates over
+      // its exporter binding.
+      let config = tls::merge_client_config()?;
       let tcp = tcp::dial(&endpoint, ProviderErrorContext::TransportConnect).await?;
       let server_name = endpoint.server_name()?;
       let rules = connection_frame_rules()?;

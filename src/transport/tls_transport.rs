@@ -20,12 +20,10 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::{
-  connection::{Connection, FrameRules, exporter_channel_binding, tls_handshake_error},
+  connection::{Connection, FrameRules},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
-  registry::{
-    Transport, TransportAdmission, TransportCapabilities, TransportListener, TransportTrust,
-  },
+  registry::{Transport, TransportAdmission, TransportListener},
   tcp, tls,
 };
 use crate::{
@@ -33,10 +31,6 @@ use crate::{
   api::{BoxFuture, SystemEntropy},
   protocol::wire::connection_frame_rules,
 };
-
-/// The canonical tag of the built-in direct TLS transport: the default
-/// choice, selected by `tls://` endpoints.
-pub(crate) const BUILTIN_TRANSPORT_TLS: &str = "radiata.woooo.tech/transports/tls";
 
 /// The built-in direct TLS transport.
 pub(crate) struct TlsTransport;
@@ -56,12 +50,12 @@ impl TlsTransport {
 }
 
 impl Transport for TlsTransport {
-  fn capabilities(&self) -> TransportCapabilities {
-    TransportCapabilities::new(TransportAdmission::PeerAddressed)
+  fn admission(&self) -> TransportAdmission {
+    TransportAdmission::PeerAddressed
   }
 
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
-    let admission = self.capabilities().admission();
+    let admission = self.admission();
     Box::pin(async move {
       let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Tls).await?;
       let config = tls::listener_tls(&SystemEntropy)?;
@@ -79,27 +73,25 @@ impl Transport for TlsTransport {
     })
   }
 
-  fn connect(
-    &self, endpoint: Endpoint, trust: TransportTrust,
-  ) -> BoxFuture<'static, Result<Connection>> {
+  fn connect(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Connection>> {
     Box::pin(async move {
-      // Reject a mismatched trust intent before any wire activity: a
-      // plaintext trust on a TLS transport is a caller bug and fails
-      // typed instead of downgrading the channel.
-      let config = tls::client_config_for_trust(&trust)?;
+      // The client configuration is unconditional: the TLS 1.3 channel
+      // always comes up, and the session handshake authenticates over
+      // its exporter binding.
+      let config = tls::merge_client_config()?;
       let tcp = tcp::dial(&endpoint, ProviderErrorContext::TransportConnect).await?;
       let server_name = endpoint.server_name()?;
       let tls_stream = tokio_rustls::TlsConnector::from(config)
         .connect(server_name, tcp)
         .await
         .map_err(|error| {
-          tls_handshake_error(
+          super::connection::tls_handshake_error(
             &error,
             ProviderErrorContext::TransportConnect,
             "tls connect",
           )
         })?;
-      let channel_binding = exporter_channel_binding(tls_stream.get_ref().1)?;
+      let channel_binding = super::connection::exporter_channel_binding(tls_stream.get_ref().1)?;
       let rules = connection_frame_rules()?;
       let (read, write) = tokio::io::split(tls_stream);
       Connection::connect_raw(
@@ -155,10 +147,14 @@ impl TransportListener for TlsListener {
       // current one.
       let hint = hint();
       let tls_stream = self.acceptor.accept(tcp).await.map_err(|error| {
-        tls_handshake_error(&error, ProviderErrorContext::TransportAccept, "tls accept")
+        super::connection::tls_handshake_error(
+          &error,
+          ProviderErrorContext::TransportAccept,
+          "tls accept",
+        )
       })?;
       let peer_addr = tls_stream.get_ref().0.peer_addr().ok();
-      let channel_binding = exporter_channel_binding(tls_stream.get_ref().1)?;
+      let channel_binding = super::connection::exporter_channel_binding(tls_stream.get_ref().1)?;
       let (read, write) = tokio::io::split(tls_stream);
       Connection::accept_raw(
         Box::new(read),

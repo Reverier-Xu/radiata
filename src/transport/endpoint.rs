@@ -10,16 +10,19 @@
 //!   userinfo, path, query, or fragment: every built-in transport addresses a
 //!   fixed upgrade path or a bare stream, so a path in the address would be
 //!   meaningless.
-//! - The custom scheme form `<name>://<opaque>` addresses a caller-registered
+//! - The custom scheme form `<name>://<opaque>` addresses a registered
 //!   transport (an ESP-NOW radio, an 802.11 link, a serial bus) by its
-//!   registered scheme name — the protocol prefix the caller reserves for that
-//!   medium — with the medium's own address as the opaque remainder. The name
-//!   is registered once per node (`ExtensionRegistry::register_transport`), and
+//!   registered scheme name — the protocol prefix reserved for that medium —
+//!   with the medium's own address as the opaque remainder. The name is
+//!   registered once per node (`ExtensionRegistry::register_transport`), and
 //!   each registered transport owns exactly one name, so a caller operating
-//!   many transports registers many names. The binding is node-local: an
-//!   address carrying a custom scheme resolves to whatever the local registry
-//!   binds that name to, and endpoints exchanged across nodes assume both sides
-//!   bound the name identically — a mismatch fails at the session handshake's
+//!   many transports registers many names. The official transports register
+//!   their own scheme names through the registry's default path, with no
+//!   privilege over a caller registration: a name claimed before the default
+//!   path runs serves the claimant's implementation. The binding is node-local:
+//!   an address carrying a scheme resolves to whatever the local registry binds
+//!   that name to, and endpoints exchanged across nodes assume both sides bound
+//!   the name identically — a mismatch fails at the session handshake's
 //!   identity proofs, never silently.
 //!
 //! Addresses are endpoint candidates and never identities. Parsing is
@@ -50,31 +53,22 @@ const MAX_NAME_LEN: usize = 63;
 /// The maximum length of a custom-form opaque address.
 const MAX_OPAQUE_LEN: usize = 255;
 
-/// The scheme names reserved for the official transports and for the
-/// insecure-WebSocket spelling the crate rejects outright. Derived from
-/// [`TransportScheme::ALL`] plus the `ws` alias, so a newly added official
-/// scheme becomes reserved automatically.
-const RESERVED_NAMES: [&str; TransportScheme::ALL.len() + 1] = {
-  let mut names = [""; TransportScheme::ALL.len() + 1];
-  let mut index = 0;
-  while index < TransportScheme::ALL.len() {
-    names[index] = TransportScheme::ALL[index].name();
-    index += 1;
-  }
-  names[index] = "ws";
-  names
-};
+/// The insecure-WebSocket spelling, rejected outright as a scheme name:
+/// a `ws://` address looks like a downgrade of the crate's TLS-only
+/// WebSocket transport, so the spelling never addresses a transport.
+const INSECURE_WEBSOCKET_SCHEME: &str = "ws";
 
-/// The protocol prefix (addressing scheme) of one caller-registered
-/// transport.
+/// The protocol prefix (addressing scheme) of one registered transport.
 ///
 /// A caller with many transports registers many names: the name is the
 /// sole selector in the custom endpoint form `<name>://<opaque>`, is
 /// unique per node (a duplicate registration conflicts), and binds the
-/// transport to every address that carries it. Grammar:
-/// `[a-z][a-z0-9-]{0,62}`, no leading or trailing hyphen; the built-in
-/// schemes and the insecure `ws` spelling are reserved and never
-/// parse as custom names.
+/// transport to every address that carries it. The official transports
+/// register under their own scheme names through the default path with
+/// no privilege over a caller registration: a name claimed before the
+/// default path runs serves the claimant's implementation. Grammar:
+/// `[a-z][a-z0-9-]{0,62}`, no leading or trailing hyphen; only the
+/// insecure `ws` spelling is reserved and never parses as a name.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TransportName {
   value: String,
@@ -87,7 +81,7 @@ impl TransportName {
     let bytes = value.as_bytes();
     if value.is_empty()
       || value.len() > MAX_NAME_LEN
-      || RESERVED_NAMES.contains(&value)
+      || value == INSECURE_WEBSOCKET_SCHEME
       || !bytes[0].is_ascii_lowercase()
       || bytes.ends_with(b"-")
       || !bytes[1..]
@@ -105,6 +99,17 @@ impl TransportName {
   /// The canonical name text.
   pub fn as_str(&self) -> &str {
     &self.value
+  }
+}
+
+impl TransportName {
+  /// The scheme name of one URL-form scheme: the registry key the
+  /// scheme's official transport registers under. The URL-form scheme
+  /// names satisfy the name grammar by construction.
+  pub(crate) fn from_scheme(scheme: TransportScheme) -> Self {
+    Self {
+      value: scheme.name().to_owned(),
+    }
   }
 }
 
@@ -185,14 +190,16 @@ impl TransportScheme {
     }
   }
 
-  /// Whether this scheme's transport runs over TLS and therefore dials
-  /// with merge trust. The exhaustive match is the single classification
-  /// point: a newly added scheme has to decide here instead of silently
-  /// falling into the plaintext class at a `matches!` call site.
-  pub(crate) const fn is_tls_class(self) -> bool {
+  /// The canonical built-in tag of this scheme's official transport: the
+  /// identity the transport declares in the crate's built-in tag
+  /// inventory (`radiata.woooo.tech/transports/<name>`). The official
+  /// transports register under their scheme names, not their tags; the
+  /// tag remains the declared built-in identity of the transport class.
+  pub const fn builtin_tag(self) -> &'static str {
     match self {
-      Self::Tls | Self::Wss => true,
-      Self::Tcp => false,
+      Self::Tls => "radiata.woooo.tech/transports/tls",
+      Self::Wss => "radiata.woooo.tech/transports/wss",
+      Self::Tcp => "radiata.woooo.tech/transports/tcp",
     }
   }
 
@@ -208,23 +215,6 @@ impl fmt::Display for TransportScheme {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter.write_str(self.canonical())
   }
-}
-
-/// The transport an endpoint selects: the resolution key every dial and
-/// bind looks up in the extension registry.
-///
-/// The registry is the single transport map: the built-in transports and
-/// every caller-registered transport provider merge into one namespace,
-/// and a selector that resolves to nothing fails typed at dial or
-/// listen time.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum TransportSelector {
-  /// One of the built-in transports, selected by URL scheme.
-  Builtin(TransportScheme),
-  /// A caller-registered transport provider, selected by the scheme name
-  /// the caller registered for it.
-  Custom(TransportName),
 }
 
 /// The address form carried by one [`Endpoint`].
@@ -323,12 +313,14 @@ impl Endpoint {
     &self.canonical
   }
 
-  /// The transport this endpoint selects; the key the extension
-  /// registry resolves at dial or listen time.
-  pub fn selector(&self) -> TransportSelector {
+  /// The transport this endpoint selects: the scheme name the extension
+  /// registry resolves to a transport at dial or listen time. A URL-form
+  /// endpoint selects its scheme's name (`tls`, `wss`, `tcp`); a custom
+  /// form selects the registered name it carries.
+  pub fn selector(&self) -> TransportName {
     match &self.form {
-      AddressForm::Builtin { scheme, .. } => TransportSelector::Builtin(*scheme),
-      AddressForm::Custom { name, .. } => TransportSelector::Custom(name.clone()),
+      AddressForm::Builtin { scheme, .. } => TransportName::from_scheme(*scheme),
+      AddressForm::Custom { name, .. } => name.clone(),
     }
   }
 
@@ -552,7 +544,7 @@ fn validate_dns_hostname(host: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-  use super::{AddressForm, Endpoint, TransportName, TransportScheme, TransportSelector};
+  use super::{AddressForm, Endpoint, TransportName, TransportScheme};
 
   const ESPNOW_NAME: &str = "espnow";
 
@@ -573,7 +565,7 @@ mod tests {
       assert_eq!(rebound.host(), Some("n5.example"));
       assert_eq!(rebound.port(), Some(40123));
       assert_eq!(rebound.as_str(), format!("{scheme}n5.example:40123"));
-      assert_eq!(rebound.selector(), TransportSelector::Builtin(scheme));
+      assert_eq!(rebound.selector().as_str(), scheme.name());
 
       let text = format!("{scheme}[2001:db8::1]:9443");
       let bracketed = Endpoint::parse(&text).unwrap();
@@ -615,11 +607,7 @@ mod tests {
         );
         assert_eq!(endpoint.port(), Some(port), "text: {text}");
         assert_eq!(endpoint.opaque(), None, "text: {text}");
-        assert_eq!(
-          endpoint.selector(),
-          TransportSelector::Builtin(scheme),
-          "text: {text}"
-        );
+        assert_eq!(endpoint.selector().as_str(), scheme.name(), "text: {text}");
         if bracketed {
           assert_eq!(
             endpoint.as_str(),
@@ -723,11 +711,8 @@ mod tests {
     assert!(endpoint.with_port(1).is_err());
 
     let selector = endpoint.selector();
-    let TransportSelector::Custom(name) = selector else {
-      panic!("the custom form selects a transport provider");
-    };
-    assert_eq!(name.as_str(), ESPNOW_NAME);
-    assert_eq!(name, TransportName::parse(ESPNOW_NAME).unwrap());
+    assert_eq!(selector.as_str(), ESPNOW_NAME);
+    assert_eq!(selector, TransportName::parse(ESPNOW_NAME).unwrap());
 
     // The canonical round trip holds.
     assert_eq!(Endpoint::parse(endpoint.as_str()).unwrap(), endpoint);
@@ -769,16 +754,14 @@ mod tests {
 
   #[test]
   fn transport_name_grammar_and_reservations() {
-    // The reserved set derives from every official scheme plus the
-    // insecure `ws` alias, so a new official scheme is reserved without
-    // touching this list.
+    // The official scheme names are ordinary registry names: the default
+    // path registers them like any caller registration, so they parse.
     for scheme in TransportScheme::ALL {
       assert!(
-        super::RESERVED_NAMES.contains(&scheme.name()),
-        "official scheme {scheme} must be reserved"
+        TransportName::parse(scheme.name()).is_ok(),
+        "official scheme {scheme} must parse as a registry name"
       );
     }
-    assert!(super::RESERVED_NAMES.contains(&"ws"));
 
     for name in ["a", "espnow", "ieee80211", "a-b", "a-1", "serial0"] {
       assert!(TransportName::parse(name).is_ok(), "name: {name}");
@@ -791,15 +774,24 @@ mod tests {
       "trail-",
       "under_score",
       "has space",
-      // Reserved: the built-ins and the insecure WebSocket spelling.
-      "tls",
-      "wss",
-      "tcp",
+      // Reserved: the insecure WebSocket spelling.
       "ws",
       // Over-long names.
       &"a".repeat(64),
     ] {
       assert!(TransportName::parse(name).is_err(), "name: {name:?}");
+    }
+  }
+
+  /// The built-in tag of every scheme is the canonical inventory identity
+  /// derived from the scheme name: one spelling per official transport.
+  #[test]
+  fn builtin_tags_derive_from_the_scheme_names() {
+    for scheme in TransportScheme::ALL {
+      assert_eq!(
+        scheme.builtin_tag(),
+        format!("radiata.woooo.tech/transports/{}", scheme.name())
+      );
     }
   }
 
@@ -812,14 +804,14 @@ mod tests {
         std::net::SocketAddr::from(([127_u8, 0, 0, 1], 41000_u16)),
         scheme,
       );
-      assert_eq!(bound.selector(), TransportSelector::Builtin(scheme));
+      assert_eq!(bound.selector().as_str(), scheme.name());
       assert_eq!(bound.as_str(), format!("{scheme}127.0.0.1:41000"));
 
       let rebound = Endpoint::parse(&format!("{scheme}n.example:1"))
         .unwrap()
         .with_port(2)
         .unwrap();
-      assert_eq!(rebound.selector(), TransportSelector::Builtin(scheme));
+      assert_eq!(rebound.selector().as_str(), scheme.name());
     }
 
     let bound = Endpoint::from_socket_addr(

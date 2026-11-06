@@ -44,7 +44,6 @@ use crate::{
     encode_receipt_retention, encode_recovery, encode_resource_mutation, encode_revoke,
     encode_unit,
   },
-  transport::registry::TransportTrust,
 };
 
 /// The node's tracked connection tasks: the kept session tasks of the
@@ -345,13 +344,8 @@ async fn reconcile_join(
   let peer = receiver.to_string();
   crate::audit::dial_started(&peer, crate::audit::DialInitiator::Caller);
   let result = async {
-    let mut connection = connect_with_deadline(
-      &transport,
-      receiver.clone(),
-      TransportTrust::for_dial(&receiver.selector()),
-      planes.config.dial_deadline(),
-    )
-    .await?;
+    let mut connection =
+      connect_with_deadline(&transport, receiver.clone(), planes.config.dial_deadline()).await?;
     let hint = connection
       .merge_hint()
       .cloned()
@@ -1618,19 +1612,22 @@ async fn reconcile_listen(
   // transports publish the endpoint their listener reports: the
   // medium owns its own address resolution, and the reported form is
   // its dialable contract.
-  let published = match endpoint.selector() {
-    crate::transport::TransportSelector::Custom(_) => bound,
-    crate::transport::TransportSelector::Builtin(_) => {
-      if endpoint.host() == bound.host() {
+  let published = if endpoint.host().is_some() {
+    // URL form: keep the advertised host (it re-resolves as the machine
+    // moves networks), take the bound port.
+    if endpoint.host() == bound.host() {
+      bound
+    } else {
+      endpoint.with_port(
         bound
-      } else {
-        endpoint.with_port(
-          bound
-            .port()
-            .ok_or_else(|| Error::internal("listener port"))?,
-        )?
-      }
+          .port()
+          .ok_or_else(|| Error::internal("listener port"))?,
+      )?
     }
+  } else {
+    // Custom form: the medium owns its own address resolution, and the
+    // reported form is its dialable contract.
+    bound
   };
   planes
     .listeners
