@@ -277,6 +277,11 @@ pub(crate) struct SessionPacketContext {
   /// The acknowledgment budget one forwarded-open hop gets (see
   /// `NodeConfig::with_relay_hop_deadline`).
   pub(super) relay_hop_deadline: Duration,
+  /// The node-level local-delivery plane (see [`LocalDelivery`]): the
+  /// shared admitted-stream table and pending-admission map every local
+  /// delivery leg of this node pumps through — the local counterpart of
+  /// one session's read loop, born with this context.
+  pub(super) local_delivery: Arc<super::inbound::LocalDelivery>,
   /// The node's authorization boundary between durable revocation and
   /// final session publication: born with this
   /// context, so every session publication, the revocation effect, and
@@ -318,6 +323,9 @@ impl SessionPacketContext {
       live_consumers: ConsumerBudget::new(MAX_LIVE_CONSUMERS),
       parser_limits,
       relay_hop_deadline,
+      local_delivery: Arc::new(super::inbound::LocalDelivery::new(
+        policy.pending_admissions,
+      )),
       authorization,
     }
   }

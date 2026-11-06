@@ -771,12 +771,16 @@ fn admit_packet(
   };
   let admission = admission.clone();
   let pump = pump_tx.clone();
+  // The packet context is cloned per admission for the local delivery leg;
+  // the trace sink it carries holds the identity context only weakly, so
+  // the clone never outlives the shutdown path's storage drain.
+  let packet = Arc::clone(&supervisor.packet);
   tasks.spawn(async move {
     // The permit is the admission slot and lives as long as the resolution
     // work, so `ADMISSION_CONCURRENCY` bounds the in-flight admissions
     // regardless of what a policy awaits.
     let _permit = permit;
-    match admission.admit(&context, request).await {
+    match admission.admit(&context, &packet, request).await {
       // The recorded route returns to the loop, which owns the pump
       // `JoinSet` and spawns `run_outbound`.
       Ok(Some(handoff)) => {
@@ -796,39 +800,30 @@ fn admit_packet(
 
 /// Spawns the pump for one admitted packet: the route record already landed
 /// in the admission task (record-before-pump), so the pump only runs the
-/// request under the loop's task set. A remote destination rides the
-/// outbound session pump; the local node rides the local pump, which admits
-/// and consumes the stream in-process. Core-internal control traffic stays
-/// out of the durable trace store — its volume is a runtime implementation
-/// detail, not caller evidence — so the pump holds no sink for it, and the
-/// record flag carries the same exclusion to the read loop's late-failure
-/// revision path.
+/// request under the loop's task set. The handoff's delivery leg decides
+/// where the frames go: a session leg rides the outbound session pump; the
+/// local leg admits and consumes the stream in-process.
 fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: PumpHandoff) {
   let local = supervisor.packet.local().clone();
   let routes = supervisor.dependencies.routes.clone();
   let events = Arc::clone(&supervisor.dependencies.events);
-  match handoff {
-    PumpHandoff::Leg {
-      leg,
-      request,
-      route,
-    } => {
-      let trace = if request.internal {
-        None
-      } else {
-        Some(supervisor.trace_sink.clone())
-      };
-      tasks.spawn(async move {
-        run_outbound(leg, local, request, routes, route, trace, events).await;
-      });
-    }
-    PumpHandoff::Local { request } => {
-      let packet = Arc::clone(&supervisor.packet);
-      tasks.spawn(async move {
-        crate::session::run_local(packet, request).await;
-      });
-    }
-  }
+  let PumpHandoff {
+    leg,
+    request,
+    route,
+  } = handoff;
+  // Core-internal control traffic stays out of the durable trace store —
+  // its volume is a runtime implementation detail, not caller evidence —
+  // so the pump holds no sink for it, and the record flag carries the same
+  // exclusion to the read loop's late-failure revision path.
+  let trace = if request.internal {
+    None
+  } else {
+    Some(supervisor.trace_sink.clone())
+  };
+  tasks.spawn(async move {
+    run_outbound(leg, local, request, routes, route, trace, events).await;
+  });
 }
 
 /// Reaps one finished packet task (an admission or its pump) as it completes

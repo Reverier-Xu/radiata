@@ -125,7 +125,7 @@ async fn pump_chunks(
   local = %local,
 ))]
 pub(crate) async fn run_outbound(
-  leg: DeliveryLeg, local: NodeId, request: OutboundRequest, routes: RouteTable,
+  mut leg: DeliveryLeg, local: NodeId, request: OutboundRequest, routes: RouteTable,
   route: Option<crate::routing::PlannedRoute>, trace: Option<crate::routing::trace::TraceSink>,
   events: Arc<crate::node::EventHub>,
 ) {
@@ -350,8 +350,8 @@ fn record_route_outcome(
 /// record, the change event, and the durable trace twin. A recorded
 /// `Failed` is final and refuses a later `Delivered`, and a refused
 /// `Delivered` skips the event and the durable twin so the record keeps
-/// the failure's answer. The remote pump and the local self-delivery pump
-/// share this body, so their terminal paths cannot drift.
+/// the failure's answer. Every origin-side delivery leg shares this body,
+/// so their terminal paths cannot drift.
 pub(crate) fn record_route_terminal(
   routes: &RouteTable, events: &crate::node::EventHub, trace: &Option<TraceSink>,
   trace_id: &TraceId, source: &NodeId, destination: &NodeId, state: RouteState,

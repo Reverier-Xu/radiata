@@ -12,7 +12,7 @@ mod queue;
 pub(crate) mod stream;
 
 pub(crate) use driver::{EstablishedSession, SessionDriver};
-pub(crate) use inbound::{DeliveryLeg, run_local};
+pub(crate) use inbound::{DeliveryLeg, LocalLeg};
 
 // The connection frame rules live in the protocol domain; re-exported for
 // the session test harness.

@@ -2,9 +2,9 @@
 //! request's destination and first hop, records the route, and records
 //! bounded terminal route failures so asynchronous senders can observe
 //! them — all off the supervisor's control loop. A request whose resolved
-//! destination is the local node short-circuits to local delivery: the
-//! node admits it through the same body an inbound open uses and consumes
-//! it in-process, with no session and no first hop.
+//! destination is the local node resolves to the pump's local delivery
+//! leg: the node admits it through the same body an inbound open uses and
+//! consumes it in-process, with no session and no first hop.
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use crate::{
   packet::{OutboundRequest, RouteRecord},
   routing::{RouteTable, insert_route, record_terminal_failure},
   session::{
-    DeliveryLeg,
+    DeliveryLeg, LocalLeg,
     stream::{SessionEntry, SessionTable},
   },
 };
@@ -28,20 +28,23 @@ use crate::{
 /// pump itself. The route record already landed when the handoff exists,
 /// which is what preserves record-before-pump ordering across the
 /// handoff.
-pub(super) enum PumpHandoff {
-  /// A remote destination: the loop spawns the outbound pump over the
-  /// resolved first-hop session. `route` is the decided route — the
-  /// planned path and the topology graph that observes its outcome — or
-  /// `None` for a direct delivery over the destination's own session.
-  Leg {
-    leg: DeliveryLeg,
-    request: OutboundRequest,
-    route: Option<crate::routing::PlannedRoute>,
-  },
-  /// The local node is the destination: the loop spawns the local pump,
-  /// which admits and consumes the stream in-process — no session, no
-  /// first hop, and no route envelope.
-  Local { request: OutboundRequest },
+/// One admitted route handed back to the control loop: the loop owns the
+/// outbound pump `JoinSet`, so the admission task that resolved and
+/// recorded the route returns the ready request instead of spawning the
+/// pump itself. The route record already landed when the handoff exists,
+/// which is what preserves record-before-pump ordering across the
+/// handoff.
+pub(super) struct PumpHandoff {
+  /// The resolved delivery leg: the stream's next hop. A session leg
+  /// rides the resolved first-hop session's frame queue; the local leg
+  /// admits and consumes the stream in-process — no session, no first
+  /// hop, and no route envelope.
+  pub(super) leg: DeliveryLeg,
+  pub(super) request: OutboundRequest,
+  /// The decided route — the planned path and the topology graph that
+  /// observes its outcome — or `None` for a direct delivery (a local
+  /// destination, or a remote one over its own session).
+  pub(super) route: Option<crate::routing::PlannedRoute>,
 }
 
 /// The admission plane's collaborators, cloned off the supervisor so one
@@ -88,9 +91,12 @@ impl PacketAdmission {
   /// control loop. `Ok(Some(handoff))` means the route record landed
   /// (record-before-pump) and the request is ready for the loop's pump;
   /// `Ok(None)` means a terminal admission failure already recorded the
-  /// bounded route failure and rejected the request in place.
+  /// bounded route failure and rejected the request in place. `packet` is
+  /// the node-shared packet context the local delivery leg pumps through;
+  /// it is cloned into the leg, never held by this admission plane.
   pub(super) async fn admit(
-    &self, context: &Arc<LocalIdentityContext>, mut request: OutboundRequest,
+    &self, context: &Arc<LocalIdentityContext>,
+    packet: &Arc<crate::session::stream::SessionPacketContext>, mut request: OutboundRequest,
   ) -> Result<Option<PumpHandoff>> {
     let trace_id = request.trace_id.clone();
     // A caller-named path is the stream's own routing decision: it is
@@ -152,13 +158,18 @@ impl PacketAdmission {
       .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
         trace_id.clone(),
       )));
-    // The local node is both endpoints: the stream is admitted through the
-    // same body an inbound open uses and consumed in-process, so no session
-    // lookup, first-hop selection, or route envelope applies. A local
-    // target therefore works on an isolated node with no sessions at all.
+    // The local node is both endpoints: the stream rides the pump's local
+    // leg — admitted through the same body an inbound open uses and
+    // consumed in-process — so no session lookup, first-hop selection, or
+    // route envelope applies. A local target therefore works on an
+    // isolated node with no sessions at all.
     if destination == self.local {
       debug!(destination = %destination, "routing packet to the local node");
-      return Ok(Some(PumpHandoff::Local { request }));
+      return Ok(Some(PumpHandoff {
+        leg: DeliveryLeg::Local(LocalLeg::new(packet, trace_id.clone())),
+        request,
+        route: None,
+      }));
     }
     let fail = |request: OutboundRequest, kind: ErrorKind| {
       self.record_route_failure(&trace_id, kind);
@@ -201,7 +212,7 @@ impl PacketAdmission {
       },
       None => match direct {
         Some(entry) => {
-          return Ok(Some(PumpHandoff::Leg {
+          return Ok(Some(PumpHandoff {
             leg: DeliveryLeg::Session(entry),
             request,
             route: None,
@@ -241,7 +252,7 @@ impl PacketAdmission {
       fail(request, ErrorKind::RouteUnavailable);
       return Ok(None);
     };
-    Ok(Some(PumpHandoff::Leg {
+    Ok(Some(PumpHandoff {
       leg: DeliveryLeg::Session(entry),
       request,
       route: Some(crate::routing::PlannedRoute {
@@ -301,9 +312,7 @@ impl PacketAdmission {
   /// failure and the awaiting sender observes the same kind instead of a
   /// dangling admission decision.
   pub(super) fn reject_shutdown(&self, handoff: PumpHandoff) {
-    let request = match handoff {
-      PumpHandoff::Leg { request, .. } | PumpHandoff::Local { request } => request,
-    };
+    let request = handoff.request;
     self.record_route_failure(&request.trace_id, ErrorKind::ShuttingDown);
     request.reject(ErrorKind::ShuttingDown);
   }
