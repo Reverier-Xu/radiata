@@ -19,14 +19,14 @@ use tracing::{debug, trace, warn};
 
 use super::{
   driver::EstablishedSession,
-  stream::{BoundedSender, SessionFrame, SessionPacketContext, clock_seconds},
+  stream::{BoundedSender, SessionEntry, SessionFrame, SessionPacketContext, clock_seconds},
 };
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, Result, StreamMetadata, TraceId,
   packet::{
     IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext, RouteState, RoutedAck,
     StreamItem, channel_body,
-    wire::{self, AckFrame, AckStatus, ChunkFrame, OpenFrame},
+    wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
   routing::{
@@ -915,6 +915,100 @@ fn opening_context_digest(
     bytes.extend_from_slice(value);
   }
   crate::identity::signature::body_digest(&bytes)
+}
+
+/// One delivery leg of the origin-side outbound pump: the stream's next
+/// hop. A session leg carries the wire frames over a live session's
+/// bounded frame queue. The legs share the pending-admission map, the
+/// clock, and aliveness — the pump registers its admission wait and
+/// withdraws a never-queued open through either one — and only the
+/// `deliver_*` trio diverges: where the open, the chunks, and the typed
+/// terminal go.
+pub(crate) enum DeliveryLeg {
+  Session(SessionEntry),
+}
+
+impl DeliveryLeg {
+  /// The leg's pending-admission map: the origin's one-shot admission
+  /// waiters (and, on a forwarded session, the hops' relays) register
+  /// here.
+  pub(crate) fn pending_acks(&self) -> &PendingAdmissions {
+    match self {
+      Self::Session(entry) => &entry.pending_acks,
+    }
+  }
+
+  /// The leg's wall clock: the pending waiters' queue stamps come from
+  /// the same clock the liveness observer reads.
+  pub(crate) fn clock(&self) -> &Arc<dyn crate::time::WallClock> {
+    match self {
+      Self::Session(entry) => &entry.clock,
+    }
+  }
+
+  /// Whether the leg can carry the stream's open: a session whose reader
+  /// loop is gone cannot.
+  pub(crate) fn alive(&self) -> bool {
+    match self {
+      Self::Session(entry) => entry.alive(),
+    }
+  }
+
+  /// Delivers the open frame: encodes it and queues it on the session's
+  /// bounded frame queue. The pump awaits the leg's pending-admission
+  /// resolution before streaming any body chunk.
+  pub(crate) async fn deliver_open(&self, open: OpenFrame) -> Result<(), ErrorKind> {
+    let Self::Session(entry) = self;
+    let body = wire::encode_open(&open).map_err(|error| error.kind())?;
+    entry
+      .frames
+      .send(SessionFrame {
+        kind: PacketKind::Open,
+        body,
+      })
+      .await
+      .map_err(|_| ErrorKind::StreamInterrupted)
+  }
+
+  /// Delivers one ordered body chunk (already re-chunked to the wire
+  /// bound by the pump): encodes it and queues it on the session's
+  /// bounded frame queue.
+  pub(crate) async fn deliver_chunk(&self, chunk: ChunkFrame) -> Result<(), ErrorKind> {
+    let Self::Session(entry) = self;
+    let encoded = wire::encode_chunk(&chunk).map_err(|error| error.kind())?;
+    entry
+      .frames
+      .send(SessionFrame {
+        kind: PacketKind::Chunk,
+        body: encoded,
+      })
+      .await
+      .map_err(|_| ErrorKind::StreamInterrupted)
+  }
+
+  /// Delivers the stream's typed terminal: encodes it and waits for queue
+  /// capacity — the terminal is the last frame the stream contributes, so
+  /// the writer either drains it or the connection dies and the queue
+  /// closes. Returns whether the terminal reached the queue.
+  pub(crate) async fn deliver_end(&self, trace_id: &TraceId, reason: EndReason) -> bool {
+    let Self::Session(entry) = self;
+    let Ok(body) = wire::encode_end(&EndFrame {
+      trace_id: trace_id.clone(),
+      reason,
+    }) else {
+      return false;
+    };
+    entry
+      .frames
+      .send_waiting(SessionFrame::new(PacketKind::End, body))
+      .await
+      .is_ok()
+  }
+
+  /// Removes a pending admission that never reached the leg.
+  pub(crate) fn withdraw_pending(&self, trace_id: &TraceId) {
+    self.pending_acks().withdraw(trace_id);
+  }
 }
 
 #[cfg(test)]

@@ -986,8 +986,10 @@ mod pending_admission_tests {
     BoundedSender, DialClass, DialDirection, PendingAck, RouteTable, SessionEntry, SessionMeta,
   };
   use crate::{
-    ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId, packet::StaticBody,
-    routing::outbound::run_outbound, session::pending::PendingAdmissions,
+    ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId,
+    packet::StaticBody,
+    routing::outbound::run_outbound,
+    session::{DeliveryLeg, pending::PendingAdmissions},
     storage::contract::helpers::ManualClock,
   };
 
@@ -1050,7 +1052,7 @@ mod pending_admission_tests {
     };
     let routes: RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
     run_outbound(
-      entry,
+      DeliveryLeg::Session(entry),
       node(1),
       request,
       routes,

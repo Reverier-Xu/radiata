@@ -16,7 +16,10 @@ use crate::{
   identity::lifecycle::LocalIdentityContext,
   packet::{OutboundRequest, RouteRecord},
   routing::{RouteTable, insert_route, record_terminal_failure},
-  session::stream::{SessionEntry, SessionTable},
+  session::{
+    DeliveryLeg,
+    stream::{SessionEntry, SessionTable},
+  },
 };
 
 /// One admitted route handed back to the control loop: the loop owns the
@@ -30,8 +33,8 @@ pub(super) enum PumpHandoff {
   /// resolved first-hop session. `route` is the decided route — the
   /// planned path and the topology graph that observes its outcome — or
   /// `None` for a direct delivery over the destination's own session.
-  Remote {
-    entry: SessionEntry,
+  Leg {
+    leg: DeliveryLeg,
     request: OutboundRequest,
     route: Option<crate::routing::PlannedRoute>,
   },
@@ -198,8 +201,8 @@ impl PacketAdmission {
       },
       None => match direct {
         Some(entry) => {
-          return Ok(Some(PumpHandoff::Remote {
-            entry,
+          return Ok(Some(PumpHandoff::Leg {
+            leg: DeliveryLeg::Session(entry),
             request,
             route: None,
           }));
@@ -238,8 +241,8 @@ impl PacketAdmission {
       fail(request, ErrorKind::RouteUnavailable);
       return Ok(None);
     };
-    Ok(Some(PumpHandoff::Remote {
-      entry,
+    Ok(Some(PumpHandoff::Leg {
+      leg: DeliveryLeg::Session(entry),
       request,
       route: Some(crate::routing::PlannedRoute {
         path: route,
@@ -299,7 +302,7 @@ impl PacketAdmission {
   /// dangling admission decision.
   pub(super) fn reject_shutdown(&self, handoff: PumpHandoff) {
     let request = match handoff {
-      PumpHandoff::Remote { request, .. } | PumpHandoff::Local { request } => request,
+      PumpHandoff::Leg { request, .. } | PumpHandoff::Local { request } => request,
     };
     self.record_route_failure(&request.trace_id, ErrorKind::ShuttingDown);
     request.reject(ErrorKind::ShuttingDown);

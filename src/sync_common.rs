@@ -264,7 +264,7 @@ pub(crate) fn send_pumped_payload(
   // flushed to the session. Control traffic is a single direct hop, so it
   // carries no route envelope and teaches the topology graph nothing.
   let pump = tokio::spawn(crate::routing::outbound::run_outbound(
-    context.entry,
+    crate::session::DeliveryLeg::Session(context.entry),
     context.local.clone(),
     request,
     context.routes.clone(),

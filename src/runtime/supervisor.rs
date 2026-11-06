@@ -808,8 +808,8 @@ fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: Pump
   let routes = supervisor.dependencies.routes.clone();
   let events = Arc::clone(&supervisor.dependencies.events);
   match handoff {
-    PumpHandoff::Remote {
-      entry,
+    PumpHandoff::Leg {
+      leg,
       request,
       route,
     } => {
@@ -819,7 +819,7 @@ fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: Pump
         Some(supervisor.trace_sink.clone())
       };
       tasks.spawn(async move {
-        run_outbound(entry, local, request, routes, route, trace, events).await;
+        run_outbound(leg, local, request, routes, route, trace, events).await;
       });
     }
     PumpHandoff::Local { request } => {
