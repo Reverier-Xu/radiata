@@ -111,9 +111,10 @@ const RETRY_TIMER_IDLE: Duration = Duration::from_secs(86_400 * 365);
 pub(crate) enum RetryClass {
   /// Join/connect dials: convergence and transport transients retry.
   Network,
-  /// Caller-registered custom kinds: the reconciler owns the semantics,
-  /// so every error retries within the bounded budget (the reconciler's
-  /// own `Retry` decision rides the same schedule as a typed overload).
+  /// Caller-registered custom kinds: a returned `Err` never re-arms the
+  /// schedule (the reconciler's explicit `Retry` decision is the only
+  /// re-arm path — see [`EffectOutcome::Retry`]), so the class itself
+  /// treats every error as terminal.
   Extension,
   /// Everything else: one attempt, no retry.
   Once,
@@ -131,8 +132,7 @@ impl RetryClass {
           | ErrorKind::RouteUnavailable
           | ErrorKind::StreamInterrupted
       ),
-      RetryClass::Extension => true,
-      RetryClass::Once => false,
+      RetryClass::Extension | RetryClass::Once => false,
     }
   }
 }
@@ -178,9 +178,11 @@ const ONCE: RetryPolicy = RetryPolicy {
   class: RetryClass::Once,
 };
 
-/// Caller-registered custom kinds: the reconciler's errors and explicit
-/// `Retry` decisions re-arm the same bounded schedule the network dials
-/// use (the reconciler owns the semantics; the manager owns the bound).
+/// Caller-registered custom kinds: only the reconciler's explicit
+/// `Retry` decision re-arms this bounded schedule (the reconciler owns
+/// the semantics; the manager owns the bound). A returned `Err` or an
+/// explicit `Failed` decision terminalizes the task instead — business
+/// retry belongs to the caller's logic, not the schedule.
 const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
   max_attempts: 4,
   initial: Duration::from_millis(100),
@@ -207,16 +209,26 @@ pub(crate) fn cancellable(kind: &TaskKind) -> bool {
   !kind.drains_on_shutdown()
 }
 
-/// One reconcile attempt's terminal payload: the public output plus,
-/// for the credential kinds, the consumed-once secret slot.
-pub(crate) struct EffectOutcome {
-  pub(crate) output: TaskOutput,
-  pub(crate) secret: Option<IssuedMergeCredential>,
+/// One attempt's terminal payload: either the public output plus, for
+/// the credential kinds, the consumed-once secret slot, or an explicit
+/// re-arm request carrying the error the next attempt's context reads.
+pub(crate) enum EffectOutcome {
+  /// The attempt succeeded; the task terminalizes with the payloads.
+  Done {
+    output: TaskOutput,
+    secret: Option<IssuedMergeCredential>,
+  },
+  /// The attempt made no progress and explicitly asked for a re-arm:
+  /// the manager re-runs the effect after the policy's backoff while
+  /// the attempt budget lasts, then terminalizes with this error. A
+  /// returned `Err` never re-arms; this variant is the only re-arm
+  /// path an effect controls.
+  Retry(Error),
 }
 
 impl EffectOutcome {
   pub(crate) fn new(output: TaskOutput) -> Self {
-    Self {
+    Self::Done {
       output,
       secret: None,
     }
@@ -225,7 +237,7 @@ impl EffectOutcome {
   /// The issue-credential effect's outcome: the observation carries the
   /// generation's expiry; the secret rides the consumed-once slot.
   pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Result<Self> {
-    Ok(Self {
+    Ok(Self::Done {
       output: encode_credential(TaskKind::ISSUE_CREDENTIAL, issued.expires_at())?,
       secret: Some(issued),
     })
@@ -234,7 +246,7 @@ impl EffectOutcome {
   /// The rotate-credential effect's outcome (the same consumed-once
   /// rule).
   pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Result<Self> {
-    Ok(Self {
+    Ok(Self::Done {
       output: encode_credential(TaskKind::ROTATE_CREDENTIAL, issued.expires_at())?,
       secret: Some(issued),
     })
@@ -1199,13 +1211,32 @@ impl Attempt {
       return AttemptOutcome::Terminal;
     }
     match (self.effect)(Arc::clone(&self.shared.operations), self.attempt).await {
-      Ok(EffectOutcome { output, secret }) => {
+      Ok(EffectOutcome::Done { output, secret }) => {
         self
           .shared
           .publish_success(&self.id, &self.kind, output, secret);
         AttemptOutcome::Terminal
       }
+      Ok(EffectOutcome::Retry(error)) => {
+        // The explicit re-arm decision: the schedule's budget bounds it,
+        // and the carried error rides the next attempt's context. The
+        // error's kind is not classified here — the decision itself is
+        // the re-arm request.
+        let policy = retry_policy(&self.kind);
+        if self.attempt.attempt < policy.max_attempts {
+          AttemptOutcome::Retry {
+            delay: policy.backoff(self.attempt.attempt),
+            last_error: Some(TaskError::from_error(error)),
+          }
+        } else {
+          self.shared.publish_failure(&self.id, &self.kind, error);
+          AttemptOutcome::Terminal
+        }
+      }
       Err(error) => {
+        // A returned error is terminal unless the kind's own policy
+        // classifies it retryable (the network dials' convergence
+        // transients); the extension kinds never retry an `Err`.
         let policy = retry_policy(&self.kind);
         if self.attempt.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
           AttemptOutcome::Retry {
@@ -2413,15 +2444,10 @@ mod tests {
         let decision = decisions
           .pop_front()
           .unwrap_or(ReconcileDecision::Succeeded);
-        match decision {
-          ReconcileDecision::Succeeded | ReconcileDecision::SucceededWithOutput(_) => {
-            Ok(ReconcileDecision::Succeeded)
-          }
-          ReconcileDecision::Retry => Err(Error::from_parts(
-            ErrorKind::Overloaded,
-            "custom task retry",
-          )),
-        }
+        // The scripted decision is returned verbatim: the decision
+        // semantics live in the submit effect, which this test drives
+        // through the real `tasks().submit` surface.
+        Ok(decision)
       })
     }
   }

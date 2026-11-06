@@ -319,7 +319,10 @@ pub struct TaskError {
 }
 
 impl TaskError {
-  pub(crate) fn from_error(error: Error) -> Self {
+  /// Projects one error onto the terminal-failure surface: the stable
+  /// kind plus its redacted context. Also the constructor for the
+  /// explicit [`ReconcileDecision::Failed`] decision.
+  pub fn from_error(error: Error) -> Self {
     Self {
       kind: error.kind(),
       context: error.context(),
@@ -1329,8 +1332,10 @@ pub trait TaskReconciler: std::fmt::Debug + Send + Sync + 'static {
   /// Produces the effect for one attempt. `Ok(Succeeded)` completes the
   /// task with an empty output payload, `Ok(SucceededWithOutput)`
   /// completes it with the caller's opaque bytes, `Ok(Retry)` re-arms
-  /// the retry schedule without progress, and `Err` retries (bounded)
-  /// before failing the task with that error.
+  /// the bounded retry schedule without progress, and `Ok(Failed)` or
+  /// `Err` terminalizes the task as failed with that error — the crate
+  /// never re-runs a failed attempt on its own; retrying a failed
+  /// effect is the caller's logic to re-submit.
   fn reconcile<'a>(&'a self, ctx: ReconcileContext) -> BoxFuture<'a, Result<ReconcileDecision>>;
 }
 
@@ -1345,8 +1350,14 @@ pub enum ReconcileDecision {
   /// bytes become the task's [`TaskOutput`] payload verbatim, observable
   /// through [`TaskView::output`](crate::TaskView::output).
   SucceededWithOutput(Vec<u8>),
-  /// The effect made no progress: re-arm the retry schedule.
+  /// The effect made no progress: re-arm the bounded retry schedule.
+  /// The only decision that retries an attempt — an error or a `Failed`
+  /// decision terminalizes the task.
   Retry,
+  /// The effect decided to fail: the task terminalizes `Failed` with
+  /// the carried error, exactly like a returned `Err`, but as an
+  /// explicit terminal decision rather than an exceptional one.
+  Failed(TaskError),
 }
 
 /// The owned context of one reconcile attempt.

@@ -459,8 +459,12 @@ impl Tasks {
   ///
   /// Admission-time failures are the pure shape checks (a stopped node,
   /// the reserved domain, an unregistered kind); every reconciler error
-  /// is effect-time, retried within the bounded extension schedule, and
-  /// surfaces on the task's `wait`.
+  /// is effect-time and surfaces on the task's `wait`. Only the
+  /// reconciler's explicit [`ReconcileDecision::Retry`] decision re-arms
+  /// the bounded extension retry schedule; a returned `Err` or an
+  /// explicit [`ReconcileDecision::Failed`] decision terminalizes the
+  /// task as failed with that error, never retried — re-driving a failed
+  /// workflow is the caller's own re-submission.
   pub async fn submit(&self, spec: crate::CustomTaskSpec) -> Result<Task<()>> {
     let client = self.client()?.clone();
     if spec.kind().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
@@ -488,9 +492,16 @@ impl Tasks {
           Ok(crate::ReconcileDecision::SucceededWithOutput(bytes)) => {
             Ok(EffectOutcome::new(TaskOutput::new(kind, bytes.into())))
           }
-          // The explicit no-progress decision re-arms the same bounded
-          // extension schedule an error rides, as the typed overload.
-          Ok(crate::ReconcileDecision::Retry) => Err(crate::Error::overloaded("custom task retry")),
+          // The explicit no-progress decision is the only re-arm path:
+          // it rides the bounded extension schedule as the typed
+          // overload marker the next attempt's context reads.
+          Ok(crate::ReconcileDecision::Retry) => Ok(EffectOutcome::Retry(
+            crate::Error::overloaded("custom task retry"),
+          )),
+          // The explicit terminal-failure decision and a returned error
+          // both terminalize the task with their error; nothing retries
+          // either.
+          Ok(crate::ReconcileDecision::Failed(error)) => Err(error.to_error()),
           Err(error) => Err(error),
         }
       })

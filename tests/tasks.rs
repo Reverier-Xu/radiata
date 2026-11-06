@@ -28,8 +28,10 @@ const PROBE_KIND: &str = "example.org/tasks/v1/probe";
 /// One scripted step of the probe reconciler.
 #[derive(Clone, Copy, Debug)]
 enum Step {
-  /// Fails the attempt with the typed error.
+  /// Returns an error from the attempt.
   Fail,
+  /// Decides the attempt explicitly failed with the typed error.
+  FailDecision,
   /// Parks the attempt until the shared release flips true.
   Park,
   /// Panics inside the reconcile attempt.
@@ -38,6 +40,8 @@ enum Step {
   Succeed,
   /// Completes the attempt with the caller's opaque output payload.
   SucceedWithPayload,
+  /// Makes the explicit no-progress decision (the only re-arm path).
+  Retry,
 }
 
 /// Everything the tests observe of one probe reconciler: the attempt
@@ -82,9 +86,10 @@ impl TaskReconciler for ProbeReconciler {
         .unwrap()
         .push((ctx.attempt(), ctx.last_error().map(|error| error.kind())));
       match step {
-        // The extension schedule retries every error kind, so one
-        // public constructor exercises the whole ladder.
         Step::Fail => Err(Error::caller("probe step")),
+        Step::FailDecision => Ok(ReconcileDecision::Failed(radiata::TaskError::from_error(
+          Error::caller("probe decision"),
+        ))),
         Step::Park => {
           loop {
             if *release.borrow_and_update() {
@@ -101,6 +106,7 @@ impl TaskReconciler for ProbeReconciler {
         Step::SucceedWithPayload => Ok(ReconcileDecision::SucceededWithOutput(
           b"probe-payload".to_vec(),
         )),
+        Step::Retry => Ok(ReconcileDecision::Retry),
       }
     })
   }
@@ -290,13 +296,13 @@ async fn list_reports_admission_order_with_keyset_pages() {
   node.shutdown().await.unwrap();
 }
 
-/// The bounded retry schedule drives a failed attempt again: every wake
-/// re-publishes `Running`, the attempt index climbs, and the previous
-/// attempt's typed error rides the context.
+/// The bounded retry schedule drives an explicitly `Retry`-ing attempt
+/// again: every wake re-publishes `Running`, the attempt index climbs,
+/// and the previous attempt's typed re-arm marker rides the context.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn extension_retries_republish_running_with_the_last_error() {
+async fn explicit_retry_decisions_republish_running_with_the_last_error() {
   common::init_tracing();
-  let (extensions, log, _release) = probe_extensions(vec![Step::Fail, Step::Fail, Step::Succeed]);
+  let (extensions, log, _release) = probe_extensions(vec![Step::Retry, Step::Retry, Step::Succeed]);
   let node = start_node(3, extensions, NodeConfig::new()).await;
   let mut events = node.watch::<TaskChanged>(EventOptions::new()).unwrap();
 
@@ -323,13 +329,14 @@ async fn extension_retries_republish_running_with_the_last_error() {
     ]
   );
   // The contexts: the first attempt has no predecessor error, every
-  // later attempt carries the previous typed failure.
+  // later attempt carries the re-arm marker the explicit decision
+  // rides.
   assert_eq!(
     *log.contexts.lock().unwrap(),
     vec![
       (1, None),
-      (2, Some(ErrorKind::CallerError)),
-      (3, Some(ErrorKind::CallerError))
+      (2, Some(ErrorKind::Overloaded)),
+      (3, Some(ErrorKind::Overloaded))
     ]
   );
   let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
@@ -337,21 +344,61 @@ async fn extension_retries_republish_running_with_the_last_error() {
   node.shutdown().await.unwrap();
 }
 
-/// Exhausting the bounded schedule terminalizes the task with the last
-/// typed error; nothing retries past the bound.
+/// Exhausting the bounded schedule on explicit `Retry` decisions
+/// terminalizes the task with the re-arm marker; nothing retries past
+/// the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extension_exhaustion_fails_with_the_last_error() {
   common::init_tracing();
   let (extensions, _log, _release) =
-    probe_extensions(vec![Step::Fail, Step::Fail, Step::Fail, Step::Fail]);
+    probe_extensions(vec![Step::Retry, Step::Retry, Step::Retry, Step::Retry]);
   let node = start_node(4, extensions, NodeConfig::new()).await;
   let task = node.tasks().submit(probe_spec()).await.unwrap();
   let error = task.clone().wait().await.unwrap_err();
-  assert_eq!(error.kind(), ErrorKind::CallerError);
+  assert_eq!(error.kind(), ErrorKind::Overloaded);
   let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
   assert_eq!(view.phase(), TaskPhase::Failed);
   assert_eq!(view.attempts(), 4);
-  assert_eq!(view.error().unwrap().kind(), ErrorKind::CallerError);
+  assert_eq!(view.error().unwrap().kind(), ErrorKind::Overloaded);
+  node.shutdown().await.unwrap();
+}
+
+/// A returned error terminalizes the task after exactly one attempt:
+/// only an explicit `Retry` decision re-arms the schedule, so a failed
+/// effect is never re-executed on the crate's own initiative (business
+/// retry belongs to the caller's re-submission).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconciler_error_terminalizes_without_retry() {
+  common::init_tracing();
+  let (extensions, log, _release) = probe_extensions(vec![Step::Fail]);
+  let node = start_node(21, extensions, NodeConfig::new()).await;
+  let task = node.tasks().submit(probe_spec()).await.unwrap();
+  let error = task.clone().wait().await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::CallerError);
+  assert_eq!(error.context(), "probe step");
+  let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
+  assert_eq!(view.phase(), TaskPhase::Failed);
+  assert_eq!(view.attempts(), 1);
+  assert_eq!(*log.contexts.lock().unwrap(), vec![(1, None)]);
+  node.shutdown().await.unwrap();
+}
+
+/// The explicit `Failed` decision terminalizes the task carrying its
+/// error — the typed, non-exceptional form of a business-level terminal
+/// failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_decision_carries_the_error() {
+  common::init_tracing();
+  let (extensions, _log, _release) = probe_extensions(vec![Step::FailDecision]);
+  let node = start_node(22, extensions, NodeConfig::new()).await;
+  let task = node.tasks().submit(probe_spec()).await.unwrap();
+  let error = task.clone().wait().await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::CallerError);
+  assert_eq!(error.context(), "probe decision");
+  let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
+  assert_eq!(view.phase(), TaskPhase::Failed);
+  assert_eq!(view.attempts(), 1);
+  assert_eq!(view.error().unwrap().as_str(), "probe decision");
   node.shutdown().await.unwrap();
 }
 
