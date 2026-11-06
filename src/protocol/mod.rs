@@ -5,6 +5,7 @@ pub(crate) mod feature;
 pub(crate) mod handshake;
 pub(crate) mod offer;
 pub(crate) mod selection;
+pub(crate) mod signature;
 pub(crate) mod tag;
 pub(crate) mod wire;
 
