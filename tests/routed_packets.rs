@@ -26,6 +26,8 @@ mod common;
 use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 
 const POLICY_TAG: &str = "radiata.woooo.tech/policies/linear";
+const STREAM_POLICY_TAG: &str = "example.org/route-policies/linear-stream";
+const EMPTY_POLICY_TAG: &str = "example.org/route-policies/linear-empty";
 const PROTOCOL_TAG: &str = "example.org/protocols/test-echo";
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
 
@@ -43,7 +45,9 @@ impl RouteNextHop for SharedPolicy {
   fn plan<'a>(
     &'a self, view: radiata::NextHopView<'a>,
   ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = radiata::Result<Vec<radiata::NodeId>>> + Send + 'a>,
+    Box<
+      dyn std::future::Future<Output = radiata::Result<Option<Vec<radiata::NodeId>>>> + Send + 'a,
+    >,
   > {
     Box::pin(async move {
       // The topology is per-node: which neighbour leads toward the
@@ -66,7 +70,7 @@ impl RouteNextHop for SharedPolicy {
           return Err(radiata::Error::caller("linear policy budget"));
         }
       }
-      Ok(path)
+      Ok(Some(path))
     })
   }
 }
@@ -192,10 +196,31 @@ async fn start_node(
     registry
       .register_next_hop(
         QualifiedTag::parse(POLICY_TAG).unwrap(),
-        Arc::new(SharedPolicy { table }),
+        Arc::new(SharedPolicy {
+          table: Arc::clone(&table),
+        }),
       )
       .unwrap();
     config = config.with_route_policy(QualifiedTag::parse(POLICY_TAG).unwrap());
+    // The stream-level lanes of the same policy shape: one over the
+    // shared linear table (the delivery lane of the routing-policy test)
+    // and one over a permanently empty table (the typed-failure lane).
+    registry
+      .register_routing_policy(
+        QualifiedTag::parse(STREAM_POLICY_TAG).unwrap(),
+        Arc::new(SharedPolicy {
+          table: Arc::clone(&table),
+        }),
+      )
+      .unwrap();
+    registry
+      .register_routing_policy(
+        QualifiedTag::parse(EMPTY_POLICY_TAG).unwrap(),
+        Arc::new(SharedPolicy {
+          table: Arc::default(),
+        }),
+      )
+      .unwrap();
   }
   let handle = NodeBuilder::new(factory)
     .keys(keys)
@@ -639,6 +664,109 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
       ErrorKind::StreamInterrupted | ErrorKind::RouteUnavailable | ErrorKind::Unsupported
     ),
     "expected an explicit typed route failure, got {error:?}"
+  );
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}
+
+/// A caller-registered stream-level routing policy is authoritative for
+/// its stream: registered under a caller-domain tag, selected through
+/// `StreamPolicy::new(RoutingPolicy::from(tag), hops)`, it plans the
+/// route its stream follows — and a policy over an empty table fails the
+/// route with a typed delivery error instead of falling back to the
+/// node-level policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registered_stream_routing_policy_delivers_along_its_chain() {
+  init_tracing();
+  let (nodes, table) = boot_linear_four(true).await;
+
+  // Per-node linear chain policy over the concrete identities: for every
+  // origin, the way toward a later member is its right-hand neighbour.
+  {
+    let mut guard = table.lock().unwrap();
+    for origin in 0..4_usize {
+      for destination in (origin + 1)..4_usize {
+        let next = origin + 1;
+        guard.insert(
+          format!(
+            "{}|{}",
+            nodes[origin].id().as_str(),
+            nodes[destination].id.as_ref().unwrap().as_str()
+          ),
+          nodes[next].id().as_str().to_owned(),
+        );
+      }
+    }
+  }
+
+  settle_linear_chain(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+
+  // The stream-level policy lane: A's policy plans the whole chain
+  // A -> B -> C -> D and every hop follows it.
+  let stream_policy = StreamPolicy::new(
+    RoutingPolicy::from(QualifiedTag::parse(STREAM_POLICY_TAG).unwrap()),
+    8,
+  )
+  .unwrap();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol.clone(),
+      stream_policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet.send_sync(vec_body(&[b"lane", b"d"])).await.unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .first()
+        .map(|(_, body)| body == &b"laned".to_vec())
+        .unwrap_or(false)
+    },
+    Duration::from_secs(30),
+    "the stream policy's planned chain must deliver the body",
+  )
+  .await;
+  // No intermediate consumer ran along the planned chain.
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
+  let delivered_before_failure = nodes[3].collector.packets.lock().unwrap().len();
+
+  // The empty-table lane: the same policy shape over a table with no
+  // entries plans nothing, so the route fails typed at admission instead
+  // of falling back to the node-level policy.
+  let empty_policy = StreamPolicy::new(
+    RoutingPolicy::from(QualifiedTag::parse(EMPTY_POLICY_TAG).unwrap()),
+    8,
+  )
+  .unwrap();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol,
+      empty_policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let error = packet.send_sync(vec_body(&[b"never"])).await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
+  assert_eq!(
+    nodes[3].collector.packets.lock().unwrap().len(),
+    delivered_before_failure,
+    "the failed lane must not deliver anything"
   );
 
   for node in &nodes {

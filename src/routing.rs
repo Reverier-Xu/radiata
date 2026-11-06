@@ -499,6 +499,50 @@ pub trait LoadBalancingPolicy: fmt::Debug + Send + Sync + 'static {
   ) -> BoxFuture<'a, Result<NodeId>>;
 }
 
+/// The built-in load-balancing policy: the first matching candidate in
+/// canonical node order. It is the default lane for label-addressed
+/// delivery: the node builder installs it under its well-known tag, and a
+/// caller that wants a different selection rule registers their own
+/// [`LoadBalancingPolicy`] and names that tag instead — official and
+/// caller policies have no functional difference.
+#[derive(Debug, Default)]
+pub struct DefaultLoadBalancer;
+
+impl DefaultLoadBalancer {
+  /// The well-known tag the built-in policy is registered under.
+  pub const TAG: &'static str = "radiata.woooo.tech/route-policies/first-match";
+
+  /// The built-in policy's canonical tag, parsed once. The literal is a
+  /// fixed canonical constant; the impossible parse failure surfaces as
+  /// an internal error instead of a panic.
+  pub(crate) fn tag() -> Result<QualifiedTag> {
+    static TAG: std::sync::OnceLock<std::result::Result<QualifiedTag, ()>> =
+      std::sync::OnceLock::new();
+    TAG
+      .get_or_init(|| QualifiedTag::parse(Self::TAG).map_err(|_| ()))
+      .clone()
+      .map_err(|_| Error::internal("built-in load balancer tag"))
+  }
+}
+
+impl LoadBalancingPolicy for DefaultLoadBalancer {
+  fn select<'a>(
+    &'a self, selector: &'a Selector, candidates: &'a dyn CandidateNodeReader,
+  ) -> BoxFuture<'a, Result<NodeId>> {
+    Box::pin(async move {
+      // The first page's first member: candidates stream in canonical
+      // node order, so this is the canonical first match. Core
+      // re-validates the pick against the descriptor store.
+      let page = candidates.next_matching_nodes(selector, None, 1).await?;
+      page
+        .items()
+        .first()
+        .map(|view| view.node_id().clone())
+        .ok_or_else(|| Error::route_unavailable("packet candidates"))
+    })
+  }
+}
+
 /// The per-hop route state carried in one open frame beyond the identity
 /// fields the frame itself already holds (trace, source, destination).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -526,17 +570,15 @@ pub(crate) enum RouteProgress {
 }
 
 /// The routing envelope of one packet (trace metadata: identity, selected
-/// destination, progress — never payload bytes).
+/// destination, progress — never payload bytes). The per-hop route state
+/// is embedded whole ([`HopState`]), so the wire projection is a move,
+/// never a field-for-field copy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteContext {
   trace_id: crate::TraceId,
   source: NodeId,
   destination: NodeId,
-  current: NodeId,
-  /// The remaining path after `current`, ending at the destination.
-  path: Vec<NodeId>,
-  visited: Vec<NodeId>,
-  remaining_hops: u32,
+  hop: HopState,
 }
 
 impl RouteContext {
@@ -548,12 +590,14 @@ impl RouteContext {
   ) -> Self {
     Self {
       trace_id,
-      current: source.clone(),
+      hop: HopState {
+        current: source.clone(),
+        visited: Vec::new(),
+        remaining_hops: max_hops,
+        path,
+      },
       source,
       destination,
-      path,
-      visited: Vec::new(),
-      remaining_hops: max_hops,
     }
   }
 
@@ -578,42 +622,38 @@ impl RouteContext {
 
   /// The node that most recently held (and sent) this packet.
   pub fn current(&self) -> &NodeId {
-    &self.current
+    &self.hop.current
   }
 
   /// The ordered chain of holders before the current one, starting at the
   /// source.
   pub fn visited(&self) -> &[NodeId] {
-    &self.visited
+    &self.hop.visited
   }
 
   /// The remaining path after the current holder, ending at the
   /// destination. Empty when the current holder must plan the remainder
   /// itself.
   pub fn path(&self) -> &[NodeId] {
-    &self.path
+    &self.hop.path
   }
 
   /// The hop budget still available to this delivery attempt.
   pub fn remaining_hops(&self) -> u32 {
-    self.remaining_hops
+    self.hop.remaining_hops
   }
 
-  /// Projects the wire-carried per-hop state out of the envelope.
-  pub(crate) fn hop_state(&self) -> HopState {
-    HopState {
-      current: self.current.clone(),
-      visited: self.visited.clone(),
-      remaining_hops: self.remaining_hops,
-      path: self.path.clone(),
-    }
+  /// Projects the wire-carried per-hop state out of the envelope: a move,
+  /// because the state is embedded whole.
+  pub(crate) fn into_hop_state(self) -> HopState {
+    self.hop
   }
 
   /// The same envelope with its remaining path dropped: a re-dispatched
   /// alternative branch at this hop plans its own path instead of
   /// following the abandoned attempt's plan.
   pub(crate) fn replanned(mut self) -> Self {
-    self.path = Vec::new();
+    self.hop.path = Vec::new();
     self
   }
 
@@ -624,19 +664,11 @@ impl RouteContext {
     trace_id: crate::TraceId, source: NodeId, destination: NodeId, route: Option<HopState>,
   ) -> Self {
     match route {
-      Some(HopState {
-        current,
-        visited,
-        remaining_hops,
-        path,
-      }) => Self {
+      Some(hop) => Self {
         trace_id,
         source,
         destination,
-        current,
-        path,
-        visited,
-        remaining_hops,
+        hop,
       },
       None => Self::new(trace_id, source, destination, Vec::new(), 1),
     }
@@ -647,15 +679,20 @@ impl RouteContext {
   /// origin as the claimed holder. The origin's own send is not a relay,
   /// so it consumes no budget; every later hop does.
   pub(crate) fn dispatch(self) -> Result<(NodeId, Self)> {
-    let mut hops = self.path.into_iter();
+    let mut hops = self.hop.path.into_iter();
     let next_hop = hops
       .next()
       .ok_or_else(|| Error::invalid_input("route path"))?;
     Ok((
       next_hop,
       Self {
-        path: hops.collect(),
-        ..self
+        hop: HopState {
+          path: hops.collect(),
+          ..self.hop
+        },
+        trace_id: self.trace_id,
+        source: self.source,
+        destination: self.destination,
       },
     ))
   }
@@ -682,7 +719,7 @@ impl RouteContext {
   ) -> Result<RouteProgress> {
     // The authenticated session peer must be the claimed current holder,
     // so endpoint substitutions fail closed (`NotTrusted`).
-    if self.current != *peer {
+    if self.hop.current != *peer {
       return Err(Error::not_trusted("route holder"));
     }
     if self.destination == *local {
@@ -690,15 +727,15 @@ impl RouteContext {
     }
     // Forwarding work is bounded by the caller-selected hop budget; an
     // exhausted budget ends the route explicitly instead of looping.
-    if self.remaining_hops == 0 {
+    if self.hop.remaining_hops == 0 {
       return Err(Error::resource_exhausted("route hops"));
     }
-    let path = if self.path.is_empty() {
+    let path = if self.hop.path.is_empty() {
       let planned = plan(&self)?;
-      validate_planned_path(&planned, self.remaining_hops)?;
+      validate_planned_path(&planned, self.hop.remaining_hops)?;
       planned
     } else {
-      std::mem::take(&mut self.path)
+      std::mem::take(&mut self.hop.path)
     };
     let mut hops = path.into_iter();
     let next_hop = hops
@@ -716,10 +753,10 @@ impl RouteContext {
   /// the remaining path loses its head, and the budget decreases once.
   /// Called only through [`Self::receive`]'s checked continuation.
   fn forward(mut self, local: &NodeId, remaining: Vec<NodeId>) -> Self {
-    let previous = std::mem::replace(&mut self.current, local.clone());
-    self.visited.push(previous);
-    self.path = remaining;
-    self.remaining_hops = self.remaining_hops.saturating_sub(1);
+    let previous = std::mem::replace(&mut self.hop.current, local.clone());
+    self.hop.visited.push(previous);
+    self.hop.path = remaining;
+    self.hop.remaining_hops = self.hop.remaining_hops.saturating_sub(1);
     self
   }
 }
@@ -736,23 +773,42 @@ impl RouteContext {
 /// before the budget, so a path of `remaining_hops + 1` entries (the
 /// relays plus the destination) is exactly what the walk can carry.
 pub(crate) fn validate_planned_path(path: &[NodeId], remaining_hops: u32) -> Result<()> {
+  validate_path_shape(path, path_entry_bound(remaining_hops), "route path")
+}
+
+/// The path-entry bound of one hop budget, shared by every path
+/// validator: the origin's dispatch consumes no budget and arrival is
+/// checked before it, so `max_hops` relays carry at most
+/// `max_hops + 1` entries.
+pub(crate) fn path_entry_bound(max_hops: u32) -> usize {
+  usize::try_from(max_hops)
+    .unwrap_or(usize::MAX)
+    .saturating_add(1)
+}
+
+/// Validates the shared route-path shape: non-empty, no longer than
+/// `max_entries` entries, and duplicate-free. Every named-path and
+/// planned-path admission goes through this one check so the shape rules
+/// cannot drift between boundaries.
+pub(crate) fn validate_path_shape(
+  path: &[NodeId], max_entries: usize, context: &'static str,
+) -> Result<()> {
   if path.is_empty() {
-    return Err(Error::invalid_input("route path"));
+    return Err(Error::invalid_input(context));
   }
-  if path.len()
-    > usize::try_from(remaining_hops)
-      .unwrap_or(usize::MAX)
-      .saturating_add(1)
-  {
-    return Err(Error::resource_exhausted("route hops"));
+  if path.len() > max_entries {
+    return Err(Error::resource_exhausted(context));
   }
-  let mut seen = BTreeSet::new();
-  for node in path {
-    if !seen.insert(node) {
-      return Err(Error::invalid_input("route path"));
-    }
+  if !path_duplicate_free(path) {
+    return Err(Error::invalid_input(context));
   }
   Ok(())
+}
+
+/// The duplicate-free test shared by every path and chain check,
+/// including the wire decode's structural checks.
+pub(crate) fn path_duplicate_free(path: &[NodeId]) -> bool {
+  path.iter().collect::<BTreeSet<_>>().len() == path.len()
 }
 
 /// Validates one decoded open frame's routing envelope at the local
@@ -866,7 +922,7 @@ impl NextHopView<'_> {
 /// The node-registered policy that plans the route for a packet whose
 /// destination is not directly connected. Implementations run at the node
 /// that opens the delivery (and at a hop whose carried path ran out)
-/// under bounded work; the returned path fails closed at the route
+/// under bounded work; a returned path fails closed at the route
 /// boundary unless it is non-empty, duplicate-free, no longer than
 /// `remaining_hops + 1` entries, ends at the destination, and starts at
 /// one of [`NextHopView::peers`].
@@ -874,7 +930,13 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
   /// The ordered path from [`NextHopView::local`] to
   /// [`NextHopView::destination`]: the nodes the packet is forwarded
   /// through, excluding the local node and ending at the destination.
-  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>>;
+  ///
+  /// `Ok(None)` is the explicit defer signal: this lane is not for the
+  /// policy, and the caller falls back to the node-level route policy
+  /// instead. The built-in direct stream policy is the ordinary defer
+  /// implementation — no special case recognizes its tag anywhere in the
+  /// data plane.
+  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>>;
 }
 
 /// The built-in next-hop policy: it plans over the node's learned
@@ -954,12 +1016,12 @@ impl DefaultNextHop {
 }
 
 impl RouteNextHop for DefaultNextHop {
-  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
+  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
     Box::pin(async move {
       // A connected destination is delivered directly: the plan is one
       // hop and the routing plane sends the frame over that session.
       if view.peers().contains(view.destination()) {
-        return Ok(vec![view.destination().clone()]);
+        return Ok(Some(vec![view.destination().clone()]));
       }
       // The learned topology is the primary answer: the cheapest known
       // path, bounded by the budget left and starting at a live peer.
@@ -971,7 +1033,7 @@ impl RouteNextHop for DefaultNextHop {
           view.remaining_hops(),
         )
       }) {
-        return Ok(path);
+        return Ok(Some(path));
       }
       // Nothing learned yet: relay one hop, ranked per attempt.
       view
@@ -979,25 +1041,25 @@ impl RouteNextHop for DefaultNextHop {
         .iter()
         .min_by_key(|peer| Self::rank(view.trace(), peer))
         .cloned()
-        .map(|peer| vec![peer])
+        .map(|peer| Some(vec![peer]))
         .ok_or_else(|| Error::caller("no live peer to relay through"))
     })
   }
 }
 
 /// The built-in direct routing policy: the stream-level policy registered
-/// under [`crate::RoutingPolicy::DIRECT`] that never relays. Its
-/// [`RouteNextHop`] implementation refuses every plan, so a stream that
-/// resolved it as a relay policy could never forward; the admission plane
-/// recognizes the tag instead and keeps the node-level route policy's
-/// behavior for such streams (direct delivery when the destination is
-/// connected, the configured policy's plan otherwise).
+/// under [`crate::RoutingPolicy::DIRECT`]. Its [`RouteNextHop`]
+/// implementation always defers — this lane is never its own — so a
+/// stream carrying it keeps the node-level route policy's behavior
+/// (direct delivery when the destination is connected, the configured
+/// policy's plan otherwise). It is an ordinary registered implementation:
+/// no data-plane code recognizes its tag.
 #[derive(Debug)]
 pub(crate) struct DirectRouting;
 
 impl RouteNextHop for DirectRouting {
-  fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
-    Box::pin(async { Err(Error::route_unavailable("direct routing policy")) })
+  fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
+    Box::pin(async { Ok(None) })
   }
 }
 
@@ -1007,10 +1069,11 @@ impl RouteNextHop for DirectRouting {
 ///
 /// The map is born empty. [`Self::register_default`] installs the core
 /// policies explicitly — the direct stream policy and the default next-hop
-/// policy — and every other entry arrives through an explicit registration
-/// call. A caller registration under the built-in domain stays refused for
-/// routing policies; the default next-hop tag is an ordinary registry tag a
-/// caller may claim before the default path runs.
+/// policy — under the ordinary insertion-once rule, and every other entry
+/// arrives through an explicit registration call. A caller registration
+/// under the built-in domain stays refused for routing policies, and a
+/// caller-claimed core tag makes the default path conflict instead of
+/// overriding it: there is no override mechanism.
 pub(crate) struct RoutingRegistry {
   next_hops: std::sync::RwLock<std::collections::BTreeMap<QualifiedTag, Arc<dyn RouteNextHop>>>,
   routing_policies:
@@ -1031,10 +1094,11 @@ impl RoutingRegistry {
     }
   }
 
-  /// Installs the core policies under their canonical tags. An
-  /// already-occupied tag (a caller-claimed next-hop tag) is left
-  /// untouched, so the default path never replaces an explicit decision.
-  /// Idempotent.
+  /// Installs the core policies under their canonical tags, through the
+  /// same insertion-once registration every other entry uses. An
+  /// already-occupied tag (a second default pass over one registry) is a
+  /// typed conflict: the default path never replaces an existing entry
+  /// and holds no override mechanism.
   pub(crate) fn register_default(&mut self) -> Result<&mut Self> {
     let next_hop_tag = DefaultNextHop::tag()?;
     {
@@ -1042,15 +1106,21 @@ impl RoutingRegistry {
         .routing_policies
         .write()
         .map_err(Error::extension_registry)?;
-      policies
-        .entry(crate::RoutingPolicy::DIRECT.tag().clone())
-        .or_insert_with(|| Arc::new(DirectRouting));
+      crate::api::insert_once(
+        &mut policies,
+        crate::RoutingPolicy::DIRECT.tag().clone(),
+        Arc::new(DirectRouting),
+        "routing policy registration",
+      )?;
     }
     {
       let mut next_hops = self.next_hops.write().map_err(Error::extension_registry)?;
-      next_hops
-        .entry(next_hop_tag)
-        .or_insert_with(|| Arc::new(DefaultNextHop::with_graph(Arc::clone(&self.graph))));
+      crate::api::insert_once(
+        &mut next_hops,
+        next_hop_tag,
+        Arc::new(DefaultNextHop::with_graph(Arc::clone(&self.graph))),
+        "next-hop registration",
+      )?;
     }
     Ok(self)
   }
@@ -1145,9 +1215,10 @@ impl fmt::Debug for RoutingRegistry {
 /// The shared route-planning seam of the routing plane: resolves the
 /// registered [`RouteNextHop`] policy named by `tag` against the route
 /// view built from `trace`, `destination`, `local`, the alive `peers`,
-/// and the budget left. `Ok(None)` means `tag` names no registered policy
-/// — the callers apply their own observability and fallback; the policy's
-/// own rejection propagates as `Err`.
+/// and the budget left. `Ok(None)` means this lane yields no path — the
+/// tag names no registered policy, or the policy deferred — and the
+/// callers apply their own observability and fallback; the policy's own
+/// rejection propagates as `Err`.
 pub(crate) async fn resolve_plan(
   registry: &RoutingRegistry, tag: &QualifiedTag, trace: &crate::TraceId, destination: &NodeId,
   local: &NodeId, peers: &[NodeId], remaining_hops: u32,
@@ -1164,16 +1235,16 @@ pub(crate) async fn resolve_plan(
       remaining_hops,
     })
     .await
-    .map(Some)
 }
 
 /// One already-resolved policy's route plan: the same view
 /// [`resolve_plan`] builds, for callers that hold the policy itself
-/// (a stream's routing policy) instead of a node-level tag.
+/// (a stream's routing policy) instead of a node-level tag. `Ok(None)`
+/// is the policy's explicit defer signal.
 pub(crate) async fn plan_of(
   policy: &dyn RouteNextHop, trace: &crate::TraceId, destination: &NodeId, local: &NodeId,
   peers: &[NodeId], remaining_hops: u32,
-) -> Result<Vec<NodeId>> {
+) -> Result<Option<Vec<NodeId>>> {
   policy
     .plan(NextHopView {
       trace,
@@ -1203,7 +1274,7 @@ mod tests {
 
   use proptest::strategy::Strategy as _;
 
-  use super::{CandidateNodeReader, Selector, StoreCandidateReader};
+  use super::{CandidateNodeReader, DefaultLoadBalancer, Selector, StoreCandidateReader};
   use crate::{
     Endpoint, ErrorKind, LabelKey, LabelSet, LabelValue, NodeId, Result, TraceId,
     provider::StorageFactory,
@@ -1237,7 +1308,7 @@ mod tests {
         peers: &shuffled,
         remaining_hops: 4,
       };
-      let plan = policy.plan(view).await.unwrap();
+      let plan = policy.plan(view).await.unwrap().unwrap();
       assert_eq!(
         plan.len(),
         1,
@@ -1262,7 +1333,7 @@ mod tests {
         peers: &peers,
         remaining_hops: 4,
       };
-      winners.insert(policy.plan(view).await.unwrap()[0].clone());
+      winners.insert(policy.plan(view).await.unwrap().unwrap()[0].clone());
     }
     assert!(
       winners.len() >= 2,
@@ -1303,6 +1374,7 @@ mod tests {
         remaining_hops: 4,
       })
       .await
+      .unwrap()
       .unwrap();
     assert_eq!(plan, vec![node(9)]);
 
@@ -1323,6 +1395,7 @@ mod tests {
         remaining_hops: 4,
       })
       .await
+      .unwrap()
       .unwrap();
     assert_eq!(plan, vec![node(2), node(5), node(9)]);
   }
@@ -1344,9 +1417,9 @@ mod tests {
     impl RouteNextHop for BudgetProbe {
       fn plan<'a>(
         &'a self, view: NextHopView<'a>,
-      ) -> crate::api::BoxFuture<'a, Result<Vec<NodeId>>> {
+      ) -> crate::api::BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
         self.seen.store(view.remaining_hops(), Ordering::SeqCst);
-        Box::pin(async move { Ok(vec![view.destination().clone()]) })
+        Box::pin(async move { Ok(Some(vec![view.destination().clone()])) })
       }
     }
 
@@ -1367,6 +1440,7 @@ mod tests {
         remaining_hops: 3,
       })
       .await
+      .unwrap()
       .unwrap();
     assert_eq!(plan, vec![destination]);
     assert_eq!(seen.load(Ordering::SeqCst), 3);
@@ -1392,6 +1466,7 @@ mod tests {
         remaining_hops: 2,
       })
       .await
+      .unwrap()
       .unwrap();
     assert_eq!(plan, vec![node(2), node(5), node(9)]);
     let plan = policy
@@ -1403,6 +1478,7 @@ mod tests {
         remaining_hops: 1,
       })
       .await
+      .unwrap()
       .unwrap();
     assert_eq!(
       plan,
@@ -1411,19 +1487,19 @@ mod tests {
     );
   }
 
-  /// The built-in direct policy is the registry's no-relay entry: it
-  /// refuses every plan, so a stream that resolved it as a relay policy
-  /// could never forward. The admission plane recognizes its tag and
-  /// keeps the node-level route policy's behavior instead.
+  /// The built-in direct policy is the registry's no-relay lane: it
+  /// always defers, so a stream that resolved it as a relay policy keeps
+  /// the node-level route policy's behavior — no data-plane code
+  /// recognizes its tag.
   #[tokio::test]
-  async fn the_direct_routing_policy_never_relays() {
+  async fn the_direct_routing_policy_defers_every_plan() {
     use super::{DirectRouting, NextHopView, RouteNextHop};
 
     let destination = node(9);
     let local = node(0);
     let trace = TraceId::parse("trace-000000000000000000001").unwrap();
     let peers = [node(4), node(2)];
-    let error = DirectRouting
+    let plan = DirectRouting
       .plan(NextHopView {
         trace: &trace,
         destination: &destination,
@@ -1432,9 +1508,8 @@ mod tests {
         remaining_hops: 4,
       })
       .await
-      .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
-    assert_eq!(error.context(), "direct routing policy");
+      .unwrap();
+    assert_eq!(plan, None, "the direct lane always defers");
   }
 
   fn key(name: &str) -> LabelKey {
@@ -1696,6 +1771,35 @@ mod tests {
       .unwrap();
     let selected = policy.select(&selector, &reader).await?;
     assert_eq!(selected, node(2));
+    Ok(())
+  }
+
+  /// The default path installs the built-in load balancer under its
+  /// well-known tag, and that official policy selects the first matching
+  /// candidate in canonical node order.
+  #[tokio::test]
+  async fn register_default_installs_the_first_match_load_balancer() -> Result<()> {
+    let mut registry = crate::ExtensionRegistry::new();
+    let tag = crate::QualifiedTag::parse(DefaultLoadBalancer::TAG)?;
+    assert!(!registry.has_load_balancer(&tag));
+    registry.register_default()?;
+    assert!(registry.has_load_balancer(&tag));
+    // A second default pass is an ordinary duplicate: conflict.
+    assert_eq!(
+      registry.register_default().unwrap_err().kind(),
+      ErrorKind::Conflict
+    );
+
+    let reader = candidate_reader().await;
+    let selector = Selector::parse("radiata.woooo.tech/labels/gpu=yes").unwrap();
+    let policy = registry.load_balancer(&tag).unwrap();
+    let selected = policy.select(&selector, &reader).await?;
+    assert_eq!(selected, node(2), "the canonical first matching member");
+
+    // No matching candidate fails closed with the typed route refusal.
+    let none = Selector::parse("radiata.woooo.tech/labels/gpu=nope").unwrap();
+    let error = policy.select(&none, &reader).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
     Ok(())
   }
 

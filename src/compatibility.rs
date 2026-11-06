@@ -16,11 +16,11 @@ use crate::{
   ResourceUri, StreamMetadata, TraceId,
   hex::decode as hex_decode,
   membership::{NODE_DESCRIPTOR_SCHEMA, NodeDescriptorV1, page::decode_descriptor},
-  packet::wire,
+  packet::{RouteState, wire},
   protocol::{CONTROL_CBOR_LIMITS, wire as protocol_wire},
   provider::{KeyHandle, KeyOperationId},
   resource::{RESOURCE_RECORD_SCHEMA, ResourceRecordV1},
-  routing::trace::{TRACE_SCHEMA, TracePhase, TraceRecord, TraceTransition, decode_trace_record},
+  routing::trace::{TRACE_SCHEMA, TraceRecord, decode_trace_record},
   storage::migration::{METADATA_SCHEMA_V1, decode_schema_record, encode_schema_record},
 };
 
@@ -165,15 +165,15 @@ fn unsupported_format_versions_fail_closed() {
 fn trace_vectors_decode_to_exact_phases() {
   let routing = TraceRecord::new(trace(), node(1), node(3), crate::time::from_millis(4_000));
   let decoded = decode_trace_record(&routing.encode().unwrap()).unwrap();
-  assert_eq!(decoded.phase(), &TracePhase::Routing);
+  assert_eq!(decoded.phase(), &RouteState::Routing);
   assert_eq!(decoded.source(), &node(1));
   assert_eq!(decoded.destination(), &node(3));
   let delivered = routing
-    .with_transition(TraceTransition::Delivered, crate::time::from_millis(5_000))
+    .with_transition(RouteState::Delivered, crate::time::from_millis(5_000))
     .encode()
     .unwrap();
   let decoded = decode_trace_record(&delivered).unwrap();
-  assert_eq!(decoded.phase(), &TracePhase::Delivered);
+  assert_eq!(decoded.phase(), &RouteState::Delivered);
 }
 
 /// One canonical direct open frame: no route element.

@@ -429,12 +429,14 @@
 //! struct LowestPeerFirst;
 //!
 //! impl RouteNextHop for LowestPeerFirst {
-//!     fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
+//!     fn plan<'a>(
+//!         &'a self, view: NextHopView<'a>,
+//!     ) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
 //!         Box::pin(async move {
 //!             view.peers()
 //!                 .first()
 //!                 .cloned()
-//!                 .map(|peer| vec![peer])
+//!                 .map(|peer| Some(vec![peer]))
 //!                 .ok_or_else(|| radiata::Error::caller("no live peer as next hop"))
 //!         })
 //!     }
@@ -466,10 +468,12 @@
 //! [`RoutingPolicy`](crate::RoutingPolicy) tag, and admission resolves it
 //! in the same registry before the node-level policy plans the route. The
 //! built-in [`RoutingPolicy::DIRECT`](crate::RoutingPolicy::DIRECT)
-//! carries no relay policy of its own, so such a stream keeps the
-//! node-level behavior; any other registered policy plans the route for
-//! its stream and is authoritative for it (its rejection fails the route
-//! instead of falling back).
+//! is the built-in defer lane: its implementation returns the trait's
+//! explicit defer signal, so such a stream keeps the node-level behavior;
+//! any other registered policy plans the route for its stream and is
+//! authoritative for it (its rejection fails the route instead of falling
+//! back). A caller policy may defer the same way to hand a stream back to
+//! the node-level policy.
 //!
 //! ```no_run
 //! # use radiata::{ExtensionRegistry, QualifiedTag, RouteNextHop, RoutingPolicy, StreamPolicy};
@@ -481,6 +485,73 @@
 //! registry.register_routing_policy(tag.clone(), policy)?;
 //! let stream = StreamPolicy::new(RoutingPolicy::from(tag), 8)?;
 //! // StreamPolicy::direct(8) is the same policy under the built-in tag.
+//! # let _ = stream;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Label-addressed delivery: `MatchingNodes` and the load balancer
+//!
+//! A target does not have to name a node. [`StreamTarget::MatchingNodes
+//!`](crate::StreamTarget::MatchingNodes) carries a [`Selector`](crate::
+//! Selector) instead: the members whose owned labels satisfy it stream to
+//! the sender incrementally, in canonical node order, and a registered
+//! load-balancing policy selects exactly one eligible destination from
+//! them. Core independently re-validates the pick against the
+//! authoritative descriptor store before any frame moves, so an ID
+//! outside the observed candidates fails closed at the route boundary.
+//!
+//! The built-in [`DefaultLoadBalancer`](crate::DefaultLoadBalancer) picks
+//! the first matching candidate — the default lane for label-addressed
+//! delivery, installed by the same default path as the routing policies.
+//! A different selection rule (spread the load, prefer a same-zone peer)
+//! is one registration away, and official and caller policies have no
+//! functional difference:
+//!
+//! ```
+//! use radiata::{BoxFuture, CandidateNodeReader, LoadBalancingPolicy, NodeId, Result, Selector};
+//!
+//! /// Spreads matching destinations by a stable per-selector shuffle —
+//! /// a sketch spelled out as a starting point.
+//! #[derive(Debug)]
+//! struct Shuffled;
+//!
+//! impl LoadBalancingPolicy for Shuffled {
+//!     fn select<'a>(
+//!         &'a self, selector: &'a Selector, candidates: &'a dyn CandidateNodeReader,
+//!     ) -> BoxFuture<'a, Result<NodeId>> {
+//!         Box::pin(async move {
+//!             let page = candidates.next_matching_nodes(selector, None, 64).await?;
+//!             let mut picks: Vec<NodeId> =
+//!                 page.items().iter().map(|view| view.node_id().clone()).collect();
+//!             picks.sort_by_key(|node| node.as_str().len());
+//!             picks.into_iter().next().ok_or_else(|| {
+//!                 radiata::Error::provider(
+//!                     radiata::ProviderErrorKind::Unsupported,
+//!                     radiata::ProviderErrorContext::LoadBalancingPolicy,
+//!                 )
+//!             })
+//!         })
+//!     }
+//! }
+//! ```
+//!
+//! The sender names the policy tag on the stream itself; the built-in
+//! first-match lane needs no registration at all:
+//!
+//! ```no_run
+//! # use radiata::{NodeHandle, ProtocolTag, Selector, StreamMetadata, StreamPolicy, StreamTarget};
+//! # fn demo(handle: &NodeHandle) -> radiata::Result<()> {
+//! let stream = handle.open_stream(
+//!     StreamTarget::MatchingNodes(
+//!         Selector::parse("example.woooo.tech/labels/role=worker")?,
+//!     ),
+//!     ProtocolTag::parse("example.woooo.tech/protocols/demo")?,
+//!     StreamPolicy::direct(1)?.load_balancer(
+//!         radiata::QualifiedTag::parse(radiata::DefaultLoadBalancer::TAG)?,
+//!     ),
+//!     StreamMetadata::new(),
+//! )?;
 //! # let _ = stream;
 //! # Ok(())
 //! # }

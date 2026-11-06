@@ -150,23 +150,11 @@ pub enum StreamTarget {
 pub(crate) fn validate_caller_path(
   destination: &NodeId, path: &[NodeId], max_hops: u32,
 ) -> Result<()> {
-  if path.is_empty() {
-    return Err(Error::invalid_input("stream path"));
-  }
-  if path.len() > STREAM_PATH_MAX_HOPS
-    || path.len()
-      > usize::try_from(max_hops)
-        .unwrap_or(usize::MAX)
-        .saturating_add(1)
-  {
-    return Err(Error::resource_exhausted("stream path"));
-  }
-  let mut seen = std::collections::BTreeSet::new();
-  for node in path {
-    if !seen.insert(node) {
-      return Err(Error::invalid_input("stream path"));
-    }
-  }
+  crate::routing::validate_path_shape(
+    path,
+    STREAM_PATH_MAX_HOPS.min(crate::routing::path_entry_bound(max_hops)),
+    "stream path",
+  )?;
   if path.last() != Some(destination) {
     return Err(Error::invalid_input("stream path"));
   }

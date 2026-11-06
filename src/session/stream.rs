@@ -259,6 +259,8 @@ pub(crate) struct SessionPacketContext {
   /// bounded instance the supervisor owns. `None` only in unit-test
   /// contexts without a store.
   pub(super) trace: Option<crate::routing::trace::TraceSink>,
+  /// The node's configured bound on concurrently forwarded routes (the
+  /// trace metadata budget, shared with the terminal route records).
   pub(super) forwarding_capacity: usize,
   /// The node's configured bound on in-memory terminal route records;
   /// admission rejections must respect it like every other writer.
@@ -346,7 +348,7 @@ impl SessionPacketContext {
     &self.local
   }
 
-  /// The caller-selected bound on concurrently forwarded routes.
+  /// The node's configured bound on concurrently forwarded routes.
   pub(crate) const fn forwarding_capacity(&self) -> usize {
     self.forwarding_capacity
   }

@@ -1055,6 +1055,7 @@ fn session_packet_context(
   // The effective route policy: the caller selection, or the built-in
   // default policy tag (registered by the builder out of the box).
   let route_policy = dependencies.config.route_policy()?;
+  let trace_metadata_active = dependencies.config.trace_metadata_limits().active();
   // The durable trace sink is born with the packet context it serves (one
   // construction site): the origin pump's terminal facts and the read
   // loop's late-failure revisions share one bounded queue and one
@@ -1079,8 +1080,11 @@ fn session_packet_context(
     dependencies.sessions.clone(),
     dependencies.routes.clone(),
     Some(trace_sink),
-    crate::routing::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
-    dependencies.config.trace_metadata_limits().active(),
+    // One configured bound for both in-memory route populations: the
+    // forwarding table and the terminal route records share the trace
+    // metadata budget the route table derives its capacity from.
+    trace_metadata_active,
+    trace_metadata_active,
     Arc::clone(&dependencies.connection_tasks),
     crate::protocol::CONTROL_CBOR_LIMITS,
     dependencies.config.relay_hop_deadline(),
@@ -2057,7 +2061,7 @@ mod admission_loop_tests {
   }
 
   impl RouteNextHop for PendingNextHop {
-    fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
+    fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
       self.calls.fetch_add(1, Ordering::Relaxed);
       Box::pin(std::future::pending())
     }

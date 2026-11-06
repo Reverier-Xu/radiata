@@ -27,10 +27,9 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  Endpoint, ErrorKind, FeatureDefinition, FeatureTag, LoadBalancingPolicy, NodeBuilder, NodeConfig,
-  NodeHandle, PageSpec, ProtocolDefinition, ProtocolTag, QualifiedTag, ResourceLabels,
-  ResourceName, ResourceUri, ResourceWrite, Result, StreamMetadata, StreamPolicy, StreamTarget,
-  extension::KeyProvider,
+  Endpoint, ErrorKind, FeatureDefinition, FeatureTag, NodeBuilder, NodeConfig, NodeHandle,
+  PageSpec, ProtocolDefinition, ProtocolTag, ResourceLabels, ResourceName, ResourceUri,
+  ResourceWrite, Result, StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
 };
 
 mod common;
@@ -42,7 +41,6 @@ const CURRENT_FEATURE: &str = "testing.example/features/mixed-current";
 const PRIOR_FEATURE: &str = "testing.example/features/mixed-prior";
 const ECHO_PROTOCOL: &str = "example.org/protocols/mixed-echo";
 const ECHO_OWNING_FEATURE: &str = "radiata.woooo.tech/features/data-messages";
-const LOAD_BALANCER: &str = "example.org/balancers/first-match";
 
 struct Node {
   handle: NodeHandle,
@@ -81,29 +79,6 @@ impl radiata::PacketConsumer for Collector {
 }
 
 /// Selects the first matching candidate in canonical order.
-#[derive(Debug)]
-struct FirstMatch;
-
-impl LoadBalancingPolicy for FirstMatch {
-  fn select<'a>(
-    &'a self, _selector: &'a radiata::Selector, candidates: &'a dyn radiata::CandidateNodeReader,
-  ) -> radiata::BoxFuture<'a, Result<radiata::NodeId>> {
-    Box::pin(async move {
-      let page = candidates.next_matching_nodes(_selector, None, 1).await?;
-      page
-        .items()
-        .first()
-        .map(|member| member.node_id().clone())
-        .ok_or_else(|| {
-          radiata::Error::provider(
-            radiata::ProviderErrorKind::Unsupported,
-            radiata::ProviderErrorContext::LoadBalancingPolicy,
-          )
-        })
-    })
-  }
-}
-
 /// A small opaque body for the echo packet.
 fn echo_body(
   chunks: &[&'static [u8]],
@@ -143,12 +118,6 @@ async fn start_node(seed: u64, current: bool) -> Node {
         FeatureTag::parse(ECHO_OWNING_FEATURE).unwrap(),
       ),
       Arc::clone(&collector) as Arc<dyn radiata::PacketConsumer>,
-    )
-    .unwrap();
-  extensions
-    .register_load_balancer(
-      QualifiedTag::parse(LOAD_BALANCER).unwrap(),
-      Arc::new(FirstMatch),
     )
     .unwrap();
   let config = NodeConfig::new()

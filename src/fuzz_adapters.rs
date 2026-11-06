@@ -484,7 +484,7 @@ pub fn routing(input: &[u8]) -> Option<()> {
     // `receive` consumes the envelope; keep the pre-state for the oracle
     // assertions below.
     let before = context.clone();
-    let remaining_before = before.hop_state().remaining_hops;
+    let remaining_before = before.remaining_hops();
     let visited_before = before.visited().len();
     let path_before = before.path().to_vec();
     match before.receive(&local, &peer, plan) {
@@ -501,7 +501,7 @@ pub fn routing(input: &[u8]) -> Option<()> {
         // The forwarded envelope is a fresh route state: the previous
         // holder joins the visited chain once, the budget drains once, and
         // the remaining path loses exactly the head it followed.
-        if advanced.hop_state().remaining_hops + 1 != remaining_before {
+        if advanced.remaining_hops() + 1 != remaining_before {
           panic!("route budget did not drain exactly once");
         }
         if advanced.visited().len() != visited_before + 1 {

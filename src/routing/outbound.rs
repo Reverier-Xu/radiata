@@ -45,7 +45,7 @@ use crate::{
     wire::{self, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
-  routing::trace::{TraceSink, TraceTransition},
+  routing::trace::TraceSink,
   session::stream::{SessionEntry, SessionFrame, clock_seconds},
 };
 
@@ -194,7 +194,7 @@ pub(crate) async fn run_outbound(
         &trace_id,
         &source,
         &destination,
-        TraceTransition::Failed($kind),
+        RouteState::Failed($kind),
       );
     }};
   }
@@ -245,7 +245,7 @@ pub(crate) async fn run_outbound(
         request.max_hops,
       );
       match envelope.dispatch() {
-        Ok((_, dispatched)) => Some(dispatched.hop_state()),
+        Ok((_, dispatched)) => Some(dispatched.into_hop_state()),
         Err(error) => {
           withdraw_pending(&entry, &trace_id);
           request.reject(error.kind());
@@ -366,7 +366,7 @@ pub(crate) async fn run_outbound(
     &trace_id,
     &source,
     &destination,
-    TraceTransition::Delivered,
+    RouteState::Delivered,
   );
   record_route_outcome(
     &route,
@@ -401,18 +401,12 @@ fn record_route_outcome(
 /// share this body, so their terminal paths cannot drift.
 pub(crate) fn record_route_terminal(
   routes: &RouteTable, events: &crate::node::EventHub, trace: &Option<TraceSink>,
-  trace_id: &TraceId, source: &NodeId, destination: &NodeId, transition: TraceTransition,
+  trace_id: &TraceId, source: &NodeId, destination: &NodeId, state: RouteState,
 ) {
-  let state = match transition {
-    TraceTransition::Delivered => RouteState::Delivered,
-    TraceTransition::Failed(kind) => RouteState::Failed(kind),
-    #[cfg(test)]
-    TraceTransition::Streaming => RouteState::Streaming,
-  };
   update_route(routes, trace_id, |record| {
-    record.update(state);
+    record.update(state.clone());
   });
-  if matches!(transition, TraceTransition::Delivered) {
+  if matches!(state, RouteState::Delivered) {
     let refused = routes
       .lock()
       .map(|table| {
@@ -428,7 +422,7 @@ pub(crate) fn record_route_terminal(
   events.emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
     trace_id.clone(),
   )));
-  record_terminal_trace(trace, trace_id, source, destination, transition);
+  record_terminal_trace(trace, trace_id, source, destination, state);
 }
 
 /// Fire-and-forget persistence of one durable terminal fact per packet:
@@ -438,7 +432,7 @@ pub(crate) fn record_route_terminal(
 /// drops the record and counts the drop.
 fn record_terminal_trace(
   trace: &Option<crate::routing::trace::TraceSink>, trace_id: &TraceId, source: &NodeId,
-  destination: &NodeId, transition: crate::routing::trace::TraceTransition,
+  destination: &NodeId, state: RouteState,
 ) {
   if let Some(trace) = trace {
     let updated = crate::routing::trace::TraceRecord::new(
@@ -447,7 +441,7 @@ fn record_terminal_trace(
       destination.clone(),
       trace.clock_now(),
     )
-    .with_transition(transition, trace.clock_now());
+    .with_transition(state, trace.clock_now());
     trace.record_terminal(updated);
   }
 }

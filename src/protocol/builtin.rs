@@ -208,6 +208,7 @@ pub(crate) const BUILTIN_TAGS: &[&str] = &[
   // route-policies — local algorithm-selection keys.
   "radiata.woooo.tech/route-policies/default",
   "radiata.woooo.tech/route-policies/direct",
+  "radiata.woooo.tech/route-policies/first-match",
   // transports — scheme-like registry keys.
   "radiata.woooo.tech/transports/tcp",
   "radiata.woooo.tech/transports/tls",
@@ -263,7 +264,7 @@ mod tests {
     (CATEGORY_PROTOCOLS, 3),
     (CATEGORY_FEATURES, 5),
     (CATEGORY_TASKS, 19),
-    (CATEGORY_ROUTE_POLICIES, 2),
+    (CATEGORY_ROUTE_POLICIES, 3),
     (CATEGORY_TRANSPORTS, 3),
     (CATEGORY_STATUS, 10),
     (CATEGORY_RESOURCES, 2),
@@ -459,6 +460,7 @@ mod tests {
     let policies: BTreeSet<String> = [
       DefaultNextHop::TAG.to_owned(),
       RoutingPolicy::DIRECT.as_str().to_owned(),
+      crate::DefaultLoadBalancer::TAG.to_owned(),
     ]
     .into_iter()
     .collect();
