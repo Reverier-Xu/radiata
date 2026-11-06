@@ -294,6 +294,7 @@ pub(crate) enum SlotClass {
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
 /// transition ever leaves a terminal state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum TaskPhase {
   Pending,
   Running,
@@ -975,9 +976,10 @@ fn resolve_terminal<T: TaskResult>(
 /// Hooks registered through
 /// [`ExtensionRegistry::register_resource_hook`](crate::ExtensionRegistry::register_resource_hook)
 /// run in canonical tag order. `validate` and `mutate` run on the
-/// caller's admission path, before any IO; `observed` runs on the
-/// node's bounded observation lanes after this node's own commit
-/// lands, off the write task's execution slot.
+/// caller's admission path, before any IO; they must not block, because
+/// a slow or waiting hook stalls the caller's `put().await`. `observed`
+/// runs on the node's bounded observation lanes after this node's own
+/// commit lands, off the write task's execution slot.
 pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
   /// Rejects a write at admission, before any IO runs. The first
   /// rejection in tag order wins and the verb fails typed with it.
@@ -1334,6 +1336,7 @@ pub trait TaskReconciler: std::fmt::Debug + Send + Sync + 'static {
 
 /// What one reconcile attempt decided.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ReconcileDecision {
   /// The effect completed: the task terminalizes `Succeeded` with an
   /// empty output payload.

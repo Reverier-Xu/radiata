@@ -216,6 +216,7 @@ impl ResourceChanged {
 /// Where a committed resource candidate that produced
 /// [`ResourceChanged`] came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ResourceOrigin {
   /// This node's own write effect committed the candidate.
   Local,

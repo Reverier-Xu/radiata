@@ -133,6 +133,7 @@ impl fmt::Debug for TransportName {
 
 /// The transport class selected by a built-in endpoint's URL scheme.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum TransportScheme {
   /// Direct TLS 1.3 over TCP: the default stream transport and the
   /// recommended form for every ordinary deployment.
@@ -217,6 +218,7 @@ impl fmt::Display for TransportScheme {
 /// and a selector that resolves to nothing fails typed at dial or
 /// listen time.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum TransportSelector {
   /// One of the built-in transports, selected by URL scheme.
   Builtin(TransportScheme),

@@ -21,16 +21,16 @@
 //!
 //! - `schemas` — record and page shapes exchanged on the wire or stored
 //!   durably.
-//! - `crypto` — signature and key-derivation domain separators; the
-//!   version is part of the signed preimage.
+//! - `crypto` — signature and key-derivation domain separators; the version is
+//!   part of the signed preimage.
 //! - `metadata` — durable storage namespaces.
 //! - `protocols` — authenticated stream wire contracts.
 //!
 //! The remaining categories are stable lookup keys, not contracts, and
 //! stay unversioned (`radiata.woooo.tech/<category>/<name>`):
 //!
-//! - `features` — negotiation labels whose immutable contract is the
-//!   32-byte fingerprint derived from the tag itself.
+//! - `features` — negotiation labels whose immutable contract is the 32-byte
+//!   fingerprint derived from the tag itself.
 //! - `tasks` — local admitted-verb names that never ride the wire.
 //! - `route-policies` — local algorithm-selection keys.
 //! - `transports` — scheme-like registry keys; the wire version is the
@@ -42,29 +42,26 @@
 //!
 //! ## Deliberate exceptions
 //!
-//! - `radiata.woooo.tech/crypto/ed25519` (and the `ed25519ph` variant)
-//!   names a signature algorithm, not a versioned record contract. The
-//!   algorithm identity is part of every signed preimage and is frozen
-//!   for wire compatibility; a version segment would change the
-//!   signature domain without changing the algorithm.
-//! - Non-tag domain-separation strings keep their version in the name
-//!   because they are byte-frozen hashing domains, never parsed as
-//!   qualified tags: `simulation/event-stream/v2`,
-//!   `failure-replay/event-stream/v2`,
+//! - `radiata.woooo.tech/crypto/ed25519` (and the `ed25519ph` variant) names a
+//!   signature algorithm, not a versioned record contract. The algorithm
+//!   identity is part of every signed preimage and is frozen for wire
+//!   compatibility; a version segment would change the signature domain without
+//!   changing the algorithm.
+//! - Non-tag domain-separation strings keep their version in the name because
+//!   they are byte-frozen hashing domains, never parsed as qualified tags:
+//!   `simulation/event-stream/v2`, `failure-replay/event-stream/v2`,
 //!   `receipt-reference/metadata-record/v1`,
 //!   `receipt-retention/sweep-operation/v1`,
 //!   `receipt-eligibility/sweep-operation/v1`,
-//!   `receipt-eligibility/orphaned-candidate/v1`,
-//!   `resource-removal/sweep/v1`, `migration-transaction-v1`, and
-//!   `migration-implementation-v1`.
-//! - `crypto/v1/feature-fingerprint/` is a domain-separation *prefix*
-//!   (the full seed appends a feature tag), not a complete tag.
+//!   `receipt-eligibility/orphaned-candidate/v1`, `resource-removal/sweep/v1`,
+//!   `migration-transaction-v1`, and `migration-implementation-v1`.
+//! - `crypto/v1/feature-fingerprint/` is a domain-separation *prefix* (the full
+//!   seed appends a feature tag), not a complete tag.
 //! - Test-only tags under the built-in domain (`protocols/test-echo`,
-//!   `metadata/engine-test`, …) are fixtures, not built-in contracts;
-//!   they are out of the inventory by design.
-//! - `limits/data-body-bytes` was retired with the pre-0.1.0
-//!   limit-negotiation removal and survives only as a decoder-rejection
-//!   fixture.
+//!   `metadata/engine-test`, …) are fixtures, not built-in contracts; they are
+//!   out of the inventory by design.
+//! - `limits/data-body-bytes` was retired with the pre-0.1.0 limit-negotiation
+//!   removal and survives only as a decoder-rejection fixture.
 
 use super::tag::{
   CATEGORY_CRYPTO, CATEGORY_FEATURES, CATEGORY_LABELS, CATEGORY_METADATA, CATEGORY_PROTOCOLS,
@@ -87,9 +84,7 @@ pub(crate) struct BuiltinCategory {
 }
 
 /// Builds one category entry.
-const fn policy(
-  name: &'static str, versioned: bool, parseable: bool,
-) -> BuiltinCategory {
+const fn policy(name: &'static str, versioned: bool, parseable: bool) -> BuiltinCategory {
   BuiltinCategory {
     name,
     versioned,
@@ -242,12 +237,9 @@ pub(crate) fn category(name: &str) -> Option<&'static BuiltinCategory> {
 
 #[cfg(test)]
 mod tests {
-  use std::{
-    collections::BTreeSet,
-    path::Path,
-  };
+  use std::{collections::BTreeSet, path::Path};
 
-  use super::{BUILTIN_CATEGORIES, BUILTIN_TAGS, BUILTIN_TAG_VERSION, category};
+  use super::{BUILTIN_CATEGORIES, BUILTIN_TAG_VERSION, BUILTIN_TAGS, category};
   use crate::{
     DefaultNextHop, ObservabilitySnapshot, QualifiedTag, RoutingPolicy, TaskKind, TransportScheme,
     protocol::{
@@ -349,7 +341,8 @@ mod tests {
     let mut seen = BTreeSet::new();
     for tag in BUILTIN_TAGS {
       let segments: Vec<&str> = tag.split('/').collect();
-      let policy = category(segments[1]).unwrap_or_else(|| panic!("{tag} names an unknown category"));
+      let policy =
+        category(segments[1]).unwrap_or_else(|| panic!("{tag} names an unknown category"));
       let expected_segments = if policy.versioned { 4 } else { 3 };
       assert_eq!(segments.len(), expected_segments, "{tag}");
       assert_eq!(segments[0], BUILTIN_DOMAIN, "{tag}");
@@ -453,12 +446,7 @@ mod tests {
 
     let transports: BTreeSet<String> = TransportScheme::ALL
       .into_iter()
-      .map(|scheme| {
-        builtin_transport_tag(scheme)
-          .unwrap()
-          .as_str()
-          .to_owned()
-      })
+      .map(|scheme| builtin_transport_tag(scheme).unwrap().as_str().to_owned())
       .collect();
     assert_eq!(
       transports,

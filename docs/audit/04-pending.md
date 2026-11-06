@@ -102,3 +102,25 @@ Recorded so nothing is silently dropped; none is authorized work.
 | `DialClass`, `DialInitiator`, `HopPhase`, `MergeState`, `MergeSource`, `JournalPurpose`, `LeaveSignal` | CORRECTLY CLOSED | Internal dispatch/classification; small add-a-variant cost |
 | `CompatibilityFamily` | CORRECTLY CLOSED (as a set) | Fate depends on C1; see item 9 |
 | `require_caller_domain` | CORRECTLY CLOSED — healthy | One choke point; the defect is that four seams skip it (B9) |
+
+---
+
+# Resolution record (round 5)
+
+Every pending item above was dispositioned in the round-5 interview; the dispositions live in `03-decisions.md` § Round-5 Decisions. Summary:
+
+1. ScanFilters/LaneContext union — **decided, option B** (lane-requested inputs).
+2. LaneId type after the code move — **decided, keep the enum**.
+3. B6/B7 join B5's change set — **decided, one set, decoupled implementations**.
+4. Event channel shape — **decided, EventTag category + separate publish API**.
+5. register_next_hop / reserved domain — **decided, de-privilege with B11; no claim path, no override**.
+6. tls:// occupancy after TransportTrust — **decided, delete override_builtin_transport and all scheme privileges**.
+7. TransportCapabilities — **decided, delete wrapper; rename the method**.
+8. Fuzz corpus lineage — **decided, rewrite as direct byte descriptions**.
+9. CompatibilityFamily — **decided, delete the enum**.
+10. D9 code assignment — **decided, contiguous renumbering**. Feed fill per-call cap — **no cap** (scan/cursor separation suffices). Parallel change channels — **kept** (intentional: event carries origin, feed carries change kind).
+11. MetadataFamily precedent vs registry entry point — **decided, registry entry point wins** (§11's praise of the const-table shape is superseded for LaneId).
+12. A3 — **dissolves with B1, verify at delivery**. P3-3 — **re-opened**. P3-8, E42 — **NO-FIX re-confirmed**. E21, P3-1, P3-15/16/17 — **remain NO-FIX**. E47 — **NO-FIX, analyse with A2**.
+13. Fourth-round classifications stand; the LaneId shape question is resolved above.
+
+This file is now historical: no open questions remain.

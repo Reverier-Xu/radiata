@@ -342,7 +342,9 @@ impl OutboundStream {
   /// Streams the body and waits only for the destination's current-process
   /// admission acknowledgement: the returned [`DeliveryAck`]
   /// proves authenticated admission to the destination's bounded incoming
-  /// stream, never durable retention, processing, or success.
+  /// stream, never durable retention, processing, or success. No timeout
+  /// is built in: callers compose `tokio::time::timeout` when they need
+  /// one.
   pub fn send_sync<S>(self, body: S) -> BoxFuture<'static, Result<DeliveryAck>>
   where
     S: Stream<Item = Result<Arc<[u8]>>> + Send + 'static, {
@@ -364,7 +366,9 @@ impl OutboundStream {
 
   /// Starts streaming in the background and returns the route handle
   /// immediately. Delivery progress and terminal state are observable
-  /// through the `GetRoute` query.
+  /// through the `GetRoute` query once the admission task has run: the
+  /// route record is inserted when admission completes, so an immediate
+  /// query may still observe `NotFound`.
   pub fn send_async<S>(self, body: S) -> Result<RouteHandle>
   where
     S: Stream<Item = Result<Arc<[u8]>>> + Send + 'static, {

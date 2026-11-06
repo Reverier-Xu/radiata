@@ -23,13 +23,15 @@
 //!
 //! The path is the routing decision: a [`RouteNextHop`] policy plans it
 //! once, at the node that opens the delivery, and every hop then follows
-//! it — the next entry is the next hop, no per-hop policy runs, and the
-//! plan's own construction (a simple path over the learned
-//! [`graph::TopologyGraph`], or a caller-named path validated at
-//! admission) is what makes the walk loop-free. A hop that receives an
-//! exhausted path plans the remainder from itself, which is how the
-//! unlearned fallback keeps multi-hop delivery working hop by hop without
-//! any node holding a network-wide view.
+//! it — the next entry is the next hop, no per-hop policy runs. The walk
+//! is bounded by the hop budget, not forced acyclic: a mid-route re-plan
+//! (a hop that received an exhausted path plans the remainder from
+//! itself) may revisit the visited chain when the next leg has failed,
+//! because backtracking through an already-relayed node can be the only
+//! escape when the forward links are broken. Under a sparse mesh with
+//! extra connections this costs budget, never correctness: the budget
+//! caps every walk, and the per-hop predecessor check plus the visited
+//! chain give every node the facts it needs to forward or refuse.
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 

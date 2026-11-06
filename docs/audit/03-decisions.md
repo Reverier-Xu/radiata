@@ -130,3 +130,51 @@ Decisions taken informally during the audit and implemented in a work package, r
 | A2 (original) | WebSocket upgrade IO classified as `InvalidInput` instead of `Io` | **MERGED** — folded into WP14 (`50c95c9`); `ws_io_error` is the shared mapper and `receive_error` reuses it |
 | A3 | TLS-class override channel-binding downgrade | **MERGED (capability model)** — WP10 (`665eacf`) replaced the hardcoded `attributable` state with a declared `TransportCapabilities`. Whether the override path still downgrades channel binding is **not verified**; see `04-pending.md` |
 | P3-3 (partial) | Provider domain naming unified to `radiata.woooo.tech` | **MERGED (partial)** — WP15a (`9f75a82`) inventoried the built-in tags and pinned the `<category>/v1/<name>` convention. The separate `/v1/xxx` vs `/xxx/v1` vs `/xxx-v1` consistency sweep was **not done**; see `04-pending.md` |
+
+---
+
+# Round-5 Decisions (pre-0.1.0 disposition set)
+
+Confirmed by the project owner in a structured interview following the round-5 audit (`06-round5.md`). These join the DECIDED items above; all await implementation.
+
+## Extension surface (new detail decisions)
+
+| Topic | Disposition |
+|---|---|
+| B2 shape | **DECIDED** — new `EventTag` category (QualifiedTag, reserved-domain rule like every registry) with a public tag-keyed publish/subscribe entry point; the nine sealed crate event types untouched; the two channels coexist |
+| B5 shape | **DECIDED** — keep `LaneId` as an enum; the wire `CODE` moves onto each lane; the registry lists lane objects and derives `code()`/`from_code()`/`ALL` |
+| B8 shape | **DECIDED (option B)** — `LaneContext` carries only plane-wide handles (store, clock, node id); a lane requests `sessions` / `authorization` / `checkpoint` through trait methods |
+| B5/B6/B7 delivery | **DECIDED** — one change set, but implementations stay decoupled: the derived-table pattern is shared, the code is not (each business surface owns its own table) |
+| B1 scope | **DECIDED (extended)** — delete `TransportTrust`, `accepts_tls_intents`, and `override_builtin_transport`; delete every remaining transport privilege: the `tls` scheme becomes an ordinary registered transport, a caller may register their own TLS transport with identical functionality, no specialization. `Endpoint` scheme resolution goes through the registry, not a hardcoded prefix branch |
+| TransportCapabilities | **DECIDED** — delete the wrapper struct; rename the provider method (e.g. `admission()`) so a future capability extends by adding methods, not fields |
+| B9 scope | **DECIDED** — apply `require_caller_domain` to all five missing seams at once (`register_transport`, `register_load_balancer`, `register_next_hop`, `register_resource_hook`, `register_action_hook`) |
+| next-hop privilege | **DECIDED** — de-privilege completely together with B11: the defer signal in `RouteNextHop::plan` removes the `DefaultNextHop` claim path and the `.entry().or_insert_with()` special case; no override API |
+
+## Verification facilities and naming
+
+| Topic | Disposition |
+|---|---|
+| C1 scope | **DECIDED** — full strip per the standing decision; additionally the hand-copied schema tags in `compatibility.rs:90-95,394` become references to the owner constants |
+| `CompatibilityFamily` | **DECIDED** — delete the enum; fuzz corpus lineage strings are rewritten as direct byte descriptions, not vector names |
+| C2 scope | **DECIDED** — delete all six source-grep tests, including `metadata_namespace_literals_are_single_sourced`; no new guard is added |
+| D9 codes | **DECIDED** — contiguous renumbering (0..N by declaration order) together with the single-table merge; pre-0.1.0 the wire has never shipped |
+
+## Defects and contradictions
+
+| Topic | Disposition |
+|---|---|
+| A13 | **DECIDED** — derive `FORWARDING_ROUTE_CAPACITY_DEFAULT` from the configured `TraceMetadataLimits`; the contrary comment is removed |
+| E42 (tolerated-conflict double revision bump) | **NO-FIX (re-confirmed)** — conservative direction, fix risk outweighs benefit; the rationale is recorded here |
+| `storage/migration.rs` edge machinery | **DECIDED** — delete the ~200-line production-unreachable mechanism; rewrite on demand when a real migration arrives |
+| A3 (override channel-binding downgrade) | **DECIDED** — dissolves with B1; verify at delivery time that no downgrade path remains |
+
+## Structural work and debt
+
+| Topic | Disposition |
+|---|---|
+| Round-5 P2 structural set | **DECIDED** — all land before 0.1.0: ① protocol↔identity signature-helper rehoming ② session Ack-arm extraction ③ supervisor split (dial/shutdown) ④ WallClock seam enforcement ⑤ schema-tag single-sourcing ⑥ error-context preservation (P8) |
+| P3 re-opened | **DECIDED** — only P3-3 (tag suffix `/v1/x` vs `/x/v1` vs `/x-v1` consistency sweep) and the round-5 P3 small-item package (PageCursor alias, `_permit` naming, `FLAT_RECORD_LIMITS`, `CreatedKey` ×5, `audit.rs` purpose enum, config zero-refusal consolidation, poisoned-mapper ×8, page-type consolidation) |
+| E47 | **NO-FIX** — re-analyse the interaction with A2 when A2 lands (extension retry only applies to explicit `Retry` afterwards) |
+| P3-8 (sleeps) | **NO-FIX (re-confirmed)** |
+| P3-4 / P3-7 (CHANGELOG, minimal example) | **NO-FIX (re-confirmed)** — postponed past 0.1.0 |
+| Unimplemented standing decisions | All remaining DECIDED items above (A1, A2, B3, B4, D7, B1 core, B2, B5-B12, A7, A11, A12, C1-C3, D8-D15, local-delivery hop, E2-E5, A10, feed-watch scan cursor) are authorized for implementation in the 0.1.0 cycle |

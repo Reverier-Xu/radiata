@@ -252,17 +252,14 @@ impl NodeConfig {
   /// uniform across a cluster; raise it when peers may be offline
   /// longer than the window (an offline peer that misses a removal
   /// inside the window can still resurrect the older live record).
-  /// Both values must be nonzero: a zero window would drop every removal
-  /// on the first sweep, and a zero cap would evict the whole removal
-  /// population.
+  /// The window must be nonzero: a zero window would drop every removal
+  /// on the first sweep. A zero `cap` means **no population cap** — the
+  /// sweep keeps every removal until its own window expires.
   pub fn with_resource_removal_retention(
     mut self, retention: Duration, cap: usize,
   ) -> Result<Self> {
     if retention.is_zero() {
       return Err(Error::invalid_input("resource removal retention"));
-    }
-    if cap == 0 {
-      return Err(Error::invalid_input("resource removal cap"));
     }
     self.resource_removal_retention = retention;
     self.resource_removal_cap = cap;
@@ -919,9 +916,6 @@ mod tests {
         .with_resource_removal_retention(Duration::ZERO, 1)
         .unwrap_err(),
       NodeConfig::new()
-        .with_resource_removal_retention(Duration::from_secs(1), 0)
-        .unwrap_err(),
-      NodeConfig::new()
         .with_task_reconcile_slots(0, 2)
         .unwrap_err(),
       NodeConfig::new()
@@ -944,6 +938,21 @@ mod tests {
     assert_eq!(config.task_reconcile_local_slots(), 2);
     assert_eq!(config.task_reconcile_network_slots(), 2);
     assert_eq!(config.task_reconcile_extension_slots(), 2);
+  }
+
+  /// A zero removal cap is the documented "no population cap" shape:
+  /// the sweep's candidate heap stays empty and the removal population
+  /// is bounded only by each record's own window.
+  #[test]
+  fn a_zero_removal_cap_means_no_population_cap() {
+    let config = NodeConfig::new()
+      .with_resource_removal_retention(Duration::from_secs(3_600), 0)
+      .unwrap();
+    assert_eq!(config.resource_removal_cap(), 0);
+    assert_eq!(
+      config.resource_removal_retention(),
+      Duration::from_secs(3_600)
+    );
   }
 
   /// The library ships exactly one profile — the defaults — and it must
