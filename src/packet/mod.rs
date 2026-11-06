@@ -573,7 +573,7 @@ impl IncomingStream {
   fn derive_reply(
     &self, protocol: ProtocolTag, metadata: StreamMetadata, max_hops: u32,
   ) -> Result<OutboundStream> {
-    if !self.reply.registry.has_protocol(&protocol) {
+    if !self.reply.registry.has_protocol(&protocol)? {
       return Err(Error::unsupported("packet protocol"));
     }
     if max_hops == 0 {

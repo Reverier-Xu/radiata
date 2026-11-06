@@ -275,24 +275,33 @@ impl ExtensionRegistry {
     Ok(self)
   }
 
-  /// The registered load-balancing policy for one tag, when present.
+  /// The registered load-balancing policy for one tag, when present. A
+  /// poisoned registry lock surfaces as the typed registry error instead
+  /// of degrading to "no policy".
   pub(crate) fn load_balancer(
     &self, tag: &crate::QualifiedTag,
-  ) -> Option<Arc<dyn crate::LoadBalancingPolicy>> {
-    self
-      .load_balancers
-      .read()
-      .ok()
-      .and_then(|balancers| balancers.get(tag).cloned())
+  ) -> Result<Option<Arc<dyn crate::LoadBalancingPolicy>>> {
+    Ok(
+      self
+        .load_balancers
+        .read()
+        .map_err(Error::extension_registry)?
+        .get(tag)
+        .cloned(),
+    )
   }
 
-  /// Whether the load-balancer tag is registered locally.
-  pub(crate) fn has_load_balancer(&self, tag: &crate::QualifiedTag) -> bool {
-    self
-      .load_balancers
-      .read()
-      .map(|balancers| balancers.contains_key(tag))
-      .unwrap_or(false)
+  /// Whether the load-balancer tag is registered locally. A poisoned
+  /// registry lock surfaces as the typed registry error instead of
+  /// reading as an unregistered tag.
+  pub(crate) fn has_load_balancer(&self, tag: &crate::QualifiedTag) -> Result<bool> {
+    Ok(
+      self
+        .load_balancers
+        .read()
+        .map_err(Error::extension_registry)?
+        .contains_key(tag),
+    )
   }
 
   /// Registers one next-hop routing policy under a canonical tag. The
@@ -310,12 +319,14 @@ impl ExtensionRegistry {
     Ok(self)
   }
 
-  /// The registered next-hop policy for one tag, when present. Test-only:
-  /// production resolution goes through [`Self::routing`].
+  /// The registered next-hop policy for one tag, when present. A
+  /// poisoned registry lock surfaces as the typed registry error instead
+  /// of degrading to "no policy". Test-only: production resolution goes
+  /// through [`Self::routing`].
   #[cfg(test)]
   pub(crate) fn next_hop_policy(
     &self, tag: &crate::QualifiedTag,
-  ) -> Option<Arc<dyn crate::RouteNextHop>> {
+  ) -> Result<Option<Arc<dyn crate::RouteNextHop>>> {
     self.routing.next_hop_policy(tag)
   }
 
@@ -336,10 +347,12 @@ impl ExtensionRegistry {
 
   /// The registered routing policy for one stream tag, when present. The
   /// admission plane resolves a stream's [`crate::RoutingPolicy`] here
-  /// before the node-level route policy plans the route.
+  /// before the node-level route policy plans the route. A poisoned
+  /// registry lock surfaces as the typed registry error instead of
+  /// degrading to "no policy".
   pub(crate) fn routing_policy(
     &self, tag: &crate::QualifiedTag,
-  ) -> Option<Arc<dyn crate::RouteNextHop>> {
+  ) -> Result<Option<Arc<dyn crate::RouteNextHop>>> {
     self.routing.routing_policy(tag)
   }
 
@@ -528,22 +541,31 @@ impl ExtensionRegistry {
     Ok(())
   }
 
-  /// The registration for one protocol tag, when present.
-  pub(crate) fn protocol(&self, tag: &ProtocolTag) -> Option<Arc<ProtocolRegistration>> {
-    self
-      .protocols
-      .read()
-      .ok()
-      .and_then(|protocols| protocols.get(tag).cloned())
+  /// The registration for one protocol tag, when present. A poisoned
+  /// registry lock surfaces as the typed registry error instead of
+  /// degrading to "no registration".
+  pub(crate) fn protocol(&self, tag: &ProtocolTag) -> Result<Option<Arc<ProtocolRegistration>>> {
+    Ok(
+      self
+        .protocols
+        .read()
+        .map_err(Error::extension_registry)?
+        .get(tag)
+        .cloned(),
+    )
   }
 
-  /// Whether the protocol tag is registered locally.
-  pub(crate) fn has_protocol(&self, tag: &ProtocolTag) -> bool {
-    self
-      .protocols
-      .read()
-      .ok()
-      .is_some_and(|protocols| protocols.contains_key(tag))
+  /// Whether the protocol tag is registered locally. A poisoned registry
+  /// lock surfaces as the typed registry error instead of reading as an
+  /// unregistered protocol.
+  pub(crate) fn has_protocol(&self, tag: &ProtocolTag) -> Result<bool> {
+    Ok(
+      self
+        .protocols
+        .read()
+        .map_err(Error::extension_registry)?
+        .contains_key(tag),
+    )
   }
 }
 
@@ -688,7 +710,11 @@ mod tests {
     registry
       .register_protocol(definition("alpha"), Arc::new(NoopConsumer))
       .unwrap();
-    assert!(registry.has_protocol(&ProtocolTag::parse("example.org/protocols/alpha").unwrap()));
+    assert!(
+      registry
+        .has_protocol(&ProtocolTag::parse("example.org/protocols/alpha").unwrap())
+        .unwrap()
+    );
 
     let error = registry
       .register_protocol(definition("alpha"), Arc::new(NoopConsumer))
@@ -699,8 +725,16 @@ mod tests {
     registry
       .register_protocol(definition("beta"), Arc::new(NoopConsumer))
       .unwrap();
-    assert!(registry.has_protocol(&ProtocolTag::parse("example.org/protocols/beta").unwrap()));
-    assert!(!registry.has_protocol(&ProtocolTag::parse("example.org/protocols/gamma").unwrap()));
+    assert!(
+      registry
+        .has_protocol(&ProtocolTag::parse("example.org/protocols/beta").unwrap())
+        .unwrap()
+    );
+    assert!(
+      !registry
+        .has_protocol(&ProtocolTag::parse("example.org/protocols/gamma").unwrap())
+        .unwrap()
+    );
   }
 
   /// The built-in domain is reserved for the core registrations: a caller
@@ -728,6 +762,7 @@ mod tests {
     assert!(
       registry
         .has_protocol(&ProtocolTag::parse("radiata.woooo.tech/protocols/v1/reconcile").unwrap())
+        .unwrap()
     );
   }
 
@@ -748,13 +783,13 @@ mod tests {
     registry
       .register_protocol(alpha, Arc::new(NoopConsumer))
       .unwrap();
-    let expected_registration = registry.protocol(&alpha_tag).unwrap();
+    let expected_registration = registry.protocol(&alpha_tag).unwrap().unwrap();
 
     let balancer_tag = crate::QualifiedTag::parse("example.com/policies/pinned").unwrap();
     registry
       .register_load_balancer(balancer_tag.clone(), Arc::new(NoopLoadBalancer))
       .unwrap();
-    let expected_balancer = registry.load_balancer(&balancer_tag).unwrap();
+    let expected_balancer = registry.load_balancer(&balancer_tag).unwrap().unwrap();
 
     let hop_tag = crate::QualifiedTag::parse("example.com/next-hops/hop").unwrap();
     registry
@@ -763,7 +798,7 @@ mod tests {
         Arc::new(crate::routing::DefaultNextHop::default()),
       )
       .unwrap();
-    let expected_hop = registry.next_hop_policy(&hop_tag).unwrap();
+    let expected_hop = registry.next_hop_policy(&hop_tag).unwrap().unwrap();
 
     let registry = std::sync::Arc::new(registry);
 
@@ -783,12 +818,12 @@ mod tests {
       reader_handles.push(std::thread::spawn(move || {
         barrier.wait();
         for _ in 0..iterations {
-          let registration = registry.protocol(&alpha_tag).unwrap();
+          let registration = registry.protocol(&alpha_tag).unwrap().unwrap();
           assert!(Arc::ptr_eq(&registration, &expected_registration));
-          assert!(registry.has_protocol(&alpha_tag));
-          let balancer = registry.load_balancer(&balancer_tag).unwrap();
+          assert!(registry.has_protocol(&alpha_tag).unwrap());
+          let balancer = registry.load_balancer(&balancer_tag).unwrap().unwrap();
           assert!(Arc::ptr_eq(&balancer, &expected_balancer));
-          let hop = registry.next_hop_policy(&hop_tag).unwrap();
+          let hop = registry.next_hop_policy(&hop_tag).unwrap().unwrap();
           assert!(Arc::ptr_eq(&hop, &expected_hop));
         }
       }));
@@ -817,10 +852,10 @@ mod tests {
     writer.join().unwrap();
 
     let beta = definition("beta");
-    assert!(registry.has_protocol(&beta.tag));
-    assert!(registry.has_protocol(&alpha_tag));
+    assert!(registry.has_protocol(&beta.tag).unwrap());
+    assert!(registry.has_protocol(&alpha_tag).unwrap());
     assert!(Arc::ptr_eq(
-      &registry.protocol(&alpha_tag).unwrap(),
+      &registry.protocol(&alpha_tag).unwrap().unwrap(),
       &expected_registration
     ));
   }
@@ -1068,6 +1103,7 @@ mod tests {
     assert!(
       registry
         .routing_policy(crate::RoutingPolicy::DIRECT.tag())
+        .unwrap()
         .is_none(),
       "a fresh registry holds no hidden direct policy"
     );
@@ -1075,6 +1111,7 @@ mod tests {
     assert!(
       registry
         .routing_policy(crate::RoutingPolicy::DIRECT.tag())
+        .unwrap()
         .is_some(),
       "the default path installs the direct policy"
     );
@@ -1095,7 +1132,7 @@ mod tests {
         Arc::new(crate::routing::DefaultNextHop::default()),
       )
       .unwrap();
-    assert!(registry.routing_policy(&caller).is_some());
+    assert!(registry.routing_policy(&caller).unwrap().is_some());
     let duplicate = registry
       .register_routing_policy(caller, Arc::new(crate::routing::DefaultNextHop::default()))
       .unwrap_err();
@@ -1115,11 +1152,11 @@ mod tests {
     let mut registry = ExtensionRegistry::new();
     let tag = crate::routing::DefaultNextHop::tag().unwrap();
     assert!(
-      registry.next_hop_policy(&tag).is_none(),
+      registry.next_hop_policy(&tag).unwrap().is_none(),
       "a fresh registry holds no hidden default next-hop policy"
     );
     registry.register_default().unwrap();
-    assert!(registry.next_hop_policy(&tag).is_some());
+    assert!(registry.next_hop_policy(&tag).unwrap().is_some());
     let second_pass = registry.register_default().unwrap_err();
     assert_eq!(second_pass.kind(), ErrorKind::Conflict);
   }

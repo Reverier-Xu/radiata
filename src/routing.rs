@@ -1160,22 +1160,34 @@ impl RoutingRegistry {
     Ok(self)
   }
 
-  /// The registered next-hop policy for one tag, when present.
-  pub(crate) fn next_hop_policy(&self, tag: &QualifiedTag) -> Option<Arc<dyn RouteNextHop>> {
-    self
-      .next_hops
-      .read()
-      .ok()
-      .and_then(|policies| policies.get(tag).cloned())
+  /// The registered next-hop policy for one tag, when present. A
+  /// poisoned registry lock surfaces as the typed registry error instead
+  /// of degrading to "no policy".
+  pub(crate) fn next_hop_policy(
+    &self, tag: &QualifiedTag,
+  ) -> Result<Option<Arc<dyn RouteNextHop>>> {
+    Ok(
+      self
+        .next_hops
+        .read()
+        .map_err(Error::extension_registry)?
+        .get(tag)
+        .cloned(),
+    )
   }
 
-  /// The registered stream routing policy for one tag, when present.
-  pub(crate) fn routing_policy(&self, tag: &QualifiedTag) -> Option<Arc<dyn RouteNextHop>> {
-    self
-      .routing_policies
-      .read()
-      .ok()
-      .and_then(|policies| policies.get(tag).cloned())
+  /// The registered stream routing policy for one tag, when present. A
+  /// poisoned registry lock surfaces as the typed registry error instead
+  /// of degrading to "no policy".
+  pub(crate) fn routing_policy(&self, tag: &QualifiedTag) -> Result<Option<Arc<dyn RouteNextHop>>> {
+    Ok(
+      self
+        .routing_policies
+        .read()
+        .map_err(Error::extension_registry)?
+        .get(tag)
+        .cloned(),
+    )
   }
 
   pub(crate) fn next_hop_count(&self) -> usize {
@@ -1223,7 +1235,7 @@ pub(crate) async fn resolve_plan(
   registry: &RoutingRegistry, tag: &QualifiedTag, trace: &crate::TraceId, destination: &NodeId,
   local: &NodeId, peers: &[NodeId], remaining_hops: u32,
 ) -> Result<Option<Vec<NodeId>>> {
-  let Some(policy) = registry.next_hop_policy(tag) else {
+  let Some(policy) = registry.next_hop_policy(tag)? else {
     return Ok(None);
   };
   policy
@@ -1752,7 +1764,7 @@ mod tests {
     let mut registry = crate::ExtensionRegistry::new();
     let tag = crate::QualifiedTag::parse("example.com/policies/first")?;
     registry.register_load_balancer(tag.clone(), Arc::new(FirstCandidate))?;
-    assert!(registry.has_load_balancer(&tag));
+    assert!(registry.has_load_balancer(&tag)?);
     // A duplicate tag registration conflicts.
     assert_eq!(
       registry
@@ -1766,6 +1778,7 @@ mod tests {
     let selector = Selector::parse("radiata.woooo.tech/labels/gpu=yes").unwrap();
     let policy = registry
       .load_balancer(&crate::QualifiedTag::parse("example.com/policies/first")?)
+      .unwrap()
       .unwrap();
     let selected = policy.select(&selector, &reader).await?;
     assert_eq!(selected, node(2));
@@ -1779,9 +1792,9 @@ mod tests {
   async fn register_default_installs_the_first_match_load_balancer() -> Result<()> {
     let mut registry = crate::ExtensionRegistry::new();
     let tag = crate::QualifiedTag::parse(DefaultLoadBalancer::TAG)?;
-    assert!(!registry.has_load_balancer(&tag));
+    assert!(!registry.has_load_balancer(&tag)?);
     registry.register_default()?;
-    assert!(registry.has_load_balancer(&tag));
+    assert!(registry.has_load_balancer(&tag)?);
     // A second default pass is an ordinary duplicate: conflict.
     assert_eq!(
       registry.register_default().unwrap_err().kind(),
@@ -1790,7 +1803,7 @@ mod tests {
 
     let reader = candidate_reader().await;
     let selector = Selector::parse("radiata.woooo.tech/labels/gpu=yes").unwrap();
-    let policy = registry.load_balancer(&tag).unwrap();
+    let policy = registry.load_balancer(&tag).unwrap().unwrap();
     let selected = policy.select(&selector, &reader).await?;
     assert_eq!(selected, node(2), "the canonical first matching member");
 

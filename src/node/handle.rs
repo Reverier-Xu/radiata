@@ -66,7 +66,7 @@ impl NodeHandle {
       }
       (StreamTarget::MatchingNodes(_), Some(tag)) => {
         // Every referenced policy tag must resolve in the registry.
-        if !self.extensions.has_load_balancer(tag) {
+        if !self.extensions.has_load_balancer(tag)? {
           return Err(Error::invalid_input("packet load balancer"));
         }
       }
@@ -74,7 +74,7 @@ impl NodeHandle {
     if let StreamTarget::Path { destination, path } = &target {
       crate::packet::validate_caller_path(destination, path, policy.max_hops())?;
     }
-    if !self.extensions.has_protocol(&protocol) {
+    if !self.extensions.has_protocol(&protocol)? {
       return Err(Error::unsupported("packet protocol"));
     }
     let trace_id = TraceId::generate(self.entropy.as_ref())?;
