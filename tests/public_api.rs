@@ -23,11 +23,11 @@ use radiata::{
   DeclareInterruptedTransactionUncommitted, DeliveryAck, Digest, Endpoint, EventOptions,
   EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag,
   IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState, KeyDeleteState,
-  KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveOutcome, LoadBalancingPolicy,
-  LocalNodeView, MemberChanged, MemberView, MergeCredential, MergeView, NodeBuilder, NodeConfig,
-  NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot,
-  OutboundStream, PacketConsumer, PageCursor, PageSpec, ProtocolDefinition, ProtocolTag,
-  QualifiedTag, ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView,
+  KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveOutcome, LocalNodeView,
+  MemberChanged, MemberView, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle,
+  NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
+  PacketConsumer, PageCursor, PageSpec, ProtocolDefinition, ProtocolTag, QualifiedTag,
+  ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
   ResourceName, ResourceOrigin, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result,
   RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy, Selector, SessionChanged,
@@ -523,29 +523,6 @@ impl PacketConsumer for PubConsumer {
 }
 
 #[derive(Debug)]
-struct PubLoadBalancer;
-
-impl LoadBalancingPolicy for PubLoadBalancer {
-  fn select<'a>(
-    &'a self, _selector: &'a Selector, candidates: &'a dyn radiata::CandidateNodeReader,
-  ) -> BoxFuture<'a, Result<NodeId>> {
-    Box::pin(async move {
-      let page = candidates.next_matching_nodes(_selector, None, 1).await?;
-      page
-        .items()
-        .first()
-        .map(|member| member.node_id().clone())
-        .ok_or_else(|| {
-          radiata::Error::provider(
-            radiata::ProviderErrorKind::Unsupported,
-            radiata::ProviderErrorContext::LoadBalancingPolicy,
-          )
-        })
-    })
-  }
-}
-
-#[derive(Debug)]
 struct PubNextHop;
 
 impl RouteNextHop for PubNextHop {
@@ -574,7 +551,7 @@ impl RouteNextHop for PubNextHop {
 fn stream_surface_is_externally_constructible() {
   let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 3)
     .unwrap()
-    .load_balancer(QualifiedTag::parse("example.org/balancers/first").unwrap());
+    .load_balancer(QualifiedTag::parse(radiata::DefaultLoadBalancer::TAG).unwrap());
   assert_eq!(policy.max_hops(), 3);
   assert_eq!(
     policy.load_balancing_policy(),
@@ -657,12 +634,6 @@ fn config_and_registry_are_externally_constructible() {
     .register_next_hop(
       QualifiedTag::parse("example.org/policies/next-hop").unwrap(),
       Arc::new(PubNextHop),
-    )
-    .unwrap();
-  registry
-    .register_load_balancer(
-      QualifiedTag::parse("example.org/balancers/first").unwrap(),
-      Arc::new(PubLoadBalancer),
     )
     .unwrap();
   let _config = config;

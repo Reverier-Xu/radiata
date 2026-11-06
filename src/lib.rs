@@ -95,7 +95,8 @@ pub use resource::{
   feed::{ResourceChange, ResourceChangeKind, ResourceFeedError, ResourceWatch},
 };
 pub use routing::{
-  CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteNextHop, Selector,
+  CandidateNodeReader, DefaultLoadBalancer, DefaultNextHop, LoadBalancingPolicy, NextHopView,
+  RouteNextHop, Selector,
 };
 pub use task::{
   ActionHook, CredentialIssued, CustomTaskSpec, ReconcileContext, ReconcileDecision, ResourceHook,

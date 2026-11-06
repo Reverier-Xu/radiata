@@ -6,8 +6,9 @@
 //! definitions, load-balancing policies, and next-hop routing policies,
 //! and caller registration of transport providers. The registry is born
 //! empty: [`ExtensionRegistry::register_default`] installs the official
-//! transports, the core routing policies, and the core feature definitions
-//! explicitly, and the node builder calls it by default. Core protocol
+//! transports, the core routing policies, the built-in load balancer, and
+//! the core feature definitions explicitly, and the node builder calls it
+//! by default. Core protocol
 //! consumers register at runtime through `register_core_protocol` once the
 //! runtime context exists.
 
@@ -83,8 +84,9 @@ pub struct ExtensionRegistry {
 impl Default for ExtensionRegistry {
   /// The empty registry: every official and caller entry is registered
   /// explicitly. [`ExtensionRegistry::register_default`] installs the
-  /// official transports, the core routing policies, and the core feature
-  /// definitions; the node builder calls it by default.
+  /// official transports, the core routing policies, the built-in load
+  /// balancer, and the core feature definitions; the node builder calls
+  /// it by default.
   fn default() -> Self {
     Self {
       features: std::sync::Mutex::new(BTreeMap::new()),
@@ -104,15 +106,31 @@ impl ExtensionRegistry {
     Self::default()
   }
 
-  /// Installs the official transports, the core routing policies, and the
-  /// core feature definitions explicitly. The node builder calls this by
-  /// default, so an ordinary node keeps resolving every official scheme and
-  /// feature; a caller that builds its own registry sees exactly what it
-  /// registered. Idempotent: an entry already present (a caller override, a
-  /// caller-claimed next-hop tag) is left untouched.
+  /// Installs the official transports, the core routing policies, the
+  /// built-in load balancer, and the core feature definitions explicitly.
+  /// The node builder calls this by default, so an ordinary node keeps
+  /// resolving every official scheme and feature; a caller that builds
+  /// its own registry sees exactly what it registered. The transports
+  /// keep their own insertion rule (an explicit override survives the
+  /// default pass); every core routing entry and the built-in load
+  /// balancer are installed through the ordinary insertion-once
+  /// registration, so a second default pass over one registry conflicts
+  /// instead of overriding.
   pub fn register_default(&mut self) -> Result<&mut Self> {
     self.transports.register_default()?;
     self.routing.register_default()?;
+    {
+      let mut balancers = self
+        .load_balancers
+        .write()
+        .map_err(Error::extension_registry)?;
+      crate::api::insert_once(
+        &mut balancers,
+        crate::routing::DefaultLoadBalancer::tag()?,
+        Arc::new(crate::routing::DefaultLoadBalancer),
+        "load balancer registration",
+      )?;
+    }
     for definition in crate::protocol::feature::builtin_definitions()? {
       self.register_core_feature(definition)?;
     }

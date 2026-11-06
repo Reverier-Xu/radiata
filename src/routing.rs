@@ -499,6 +499,50 @@ pub trait LoadBalancingPolicy: fmt::Debug + Send + Sync + 'static {
   ) -> BoxFuture<'a, Result<NodeId>>;
 }
 
+/// The built-in load-balancing policy: the first matching candidate in
+/// canonical node order. It is the default lane for label-addressed
+/// delivery: the node builder installs it under its well-known tag, and a
+/// caller that wants a different selection rule registers their own
+/// [`LoadBalancingPolicy`] and names that tag instead — official and
+/// caller policies have no functional difference.
+#[derive(Debug, Default)]
+pub struct DefaultLoadBalancer;
+
+impl DefaultLoadBalancer {
+  /// The well-known tag the built-in policy is registered under.
+  pub const TAG: &'static str = "radiata.woooo.tech/route-policies/first-match";
+
+  /// The built-in policy's canonical tag, parsed once. The literal is a
+  /// fixed canonical constant; the impossible parse failure surfaces as
+  /// an internal error instead of a panic.
+  pub(crate) fn tag() -> Result<QualifiedTag> {
+    static TAG: std::sync::OnceLock<std::result::Result<QualifiedTag, ()>> =
+      std::sync::OnceLock::new();
+    TAG
+      .get_or_init(|| QualifiedTag::parse(Self::TAG).map_err(|_| ()))
+      .clone()
+      .map_err(|_| Error::internal("built-in load balancer tag"))
+  }
+}
+
+impl LoadBalancingPolicy for DefaultLoadBalancer {
+  fn select<'a>(
+    &'a self, selector: &'a Selector, candidates: &'a dyn CandidateNodeReader,
+  ) -> BoxFuture<'a, Result<NodeId>> {
+    Box::pin(async move {
+      // The first page's first member: candidates stream in canonical
+      // node order, so this is the canonical first match. Core
+      // re-validates the pick against the descriptor store.
+      let page = candidates.next_matching_nodes(selector, None, 1).await?;
+      page
+        .items()
+        .first()
+        .map(|view| view.node_id().clone())
+        .ok_or_else(|| Error::route_unavailable("packet candidates"))
+    })
+  }
+}
+
 /// The per-hop route state carried in one open frame beyond the identity
 /// fields the frame itself already holds (trace, source, destination).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1218,7 +1262,7 @@ mod tests {
 
   use proptest::strategy::Strategy as _;
 
-  use super::{CandidateNodeReader, Selector, StoreCandidateReader};
+  use super::{CandidateNodeReader, DefaultLoadBalancer, Selector, StoreCandidateReader};
   use crate::{
     Endpoint, ErrorKind, LabelKey, LabelSet, LabelValue, NodeId, Result, TraceId,
     provider::StorageFactory,
@@ -1715,6 +1759,35 @@ mod tests {
       .unwrap();
     let selected = policy.select(&selector, &reader).await?;
     assert_eq!(selected, node(2));
+    Ok(())
+  }
+
+  /// The default path installs the built-in load balancer under its
+  /// well-known tag, and that official policy selects the first matching
+  /// candidate in canonical node order.
+  #[tokio::test]
+  async fn register_default_installs_the_first_match_load_balancer() -> Result<()> {
+    let mut registry = crate::ExtensionRegistry::new();
+    let tag = crate::QualifiedTag::parse(DefaultLoadBalancer::TAG)?;
+    assert!(!registry.has_load_balancer(&tag));
+    registry.register_default()?;
+    assert!(registry.has_load_balancer(&tag));
+    // A second default pass is an ordinary duplicate: conflict.
+    assert_eq!(
+      registry.register_default().unwrap_err().kind(),
+      ErrorKind::Conflict
+    );
+
+    let reader = candidate_reader().await;
+    let selector = Selector::parse("radiata.woooo.tech/labels/gpu=yes").unwrap();
+    let policy = registry.load_balancer(&tag).unwrap();
+    let selected = policy.select(&selector, &reader).await?;
+    assert_eq!(selected, node(2), "the canonical first matching member");
+
+    // No matching candidate fails closed with the typed route refusal.
+    let none = Selector::parse("radiata.woooo.tech/labels/gpu=nope").unwrap();
+    let error = policy.select(&none, &reader).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
     Ok(())
   }
 
