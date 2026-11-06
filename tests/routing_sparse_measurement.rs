@@ -11,11 +11,11 @@
 //! Two lanes run against every cell:
 //!
 //! - **default** — the built-in `DefaultNextHop` algorithm unchanged. A
-//!   measuring wrapper registered under the built-in policy's own tag
-//!   (`DefaultNextHop::TAG`, which a caller may claim per the registry
-//!   contract) delegates every decision to `radiata::DefaultNextHop` and only
-//!   records `(trace, local, chosen)` cluster-wide. No production code path
-//!   changes; the wrapper is a test-side observer.
+//!   measuring wrapper registered under a caller-owned tag selected as every
+//!   node's route policy (`with_route_policy`) delegates every decision to
+//!   `radiata::DefaultNextHop` and only records `(trace, local, chosen)`
+//!   cluster-wide. No production code path changes; the wrapper is a test-side
+//!   observer.
 //! - **oracle** — the same wrapper answers from a precomputed BFS next-hop
 //!   table of the enforced shape: what routing with full reachability knowledge
 //!   would do. The oracle lane's `decisions == distance − 1` invariant and its
@@ -76,6 +76,10 @@ const MEASURE_PROTOCOL: &str = "example.org/protocols/sparse-measure";
 const REPLY_PROTOCOL: &str = "example.org/protocols/sparse-reply";
 /// The session-core feature both protocols declare.
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
+/// The caller-owned route-policy tag carrying the measuring wrapper: the
+/// built-in default tag is core-owned (a caller claim conflicts), so the
+/// wrapper lives under its own tag and every node selects it explicitly.
+const MEASURE_POLICY_TAG: &str = "example.org/route-policies/sparse-measure";
 /// The generous hop budget: every simple path in an eight-node graph (at
 /// most seven edges) fits, so budget never masks search behavior. A path
 /// of m edges needs m − 1 ≤ budget.
@@ -325,7 +329,7 @@ impl Shared {
 }
 
 /// The measuring next-hop policy: an observer registered under the
-/// built-in policy's own tag on every node. Default and reply lanes
+/// caller-owned measurement tag on every node. Default and reply lanes
 /// delegate to the untouched built-in algorithm; the oracle lane answers
 /// from the enforced shape's BFS table (falling back to the built-in pick
 /// and counting a drift only if the table ever disagrees with the live
@@ -477,18 +481,20 @@ async fn start_node(seed: u64, shared: &Arc<Shared>) -> Node {
       )
       .unwrap();
   }
-  // Claim the built-in policy's own tag: the builder auto-registers the
-  // built-in default only when the tag is free, so every node resolves
-  // its default route policy to the measuring wrapper.
+  // Register the measuring wrapper under its caller-owned tag and select
+  // it as every node's route policy, so all lanes route through it.
+  let policy_tag = radiata::QualifiedTag::parse(MEASURE_POLICY_TAG).unwrap();
   registry
     .register_next_hop(
-      radiata::QualifiedTag::parse(DefaultNextHop::TAG).unwrap(),
+      policy_tag.clone(),
       Arc::new(MeasuringPolicy {
         shared: Arc::clone(shared),
       }),
     )
     .unwrap();
-  let config = NodeConfig::new().with_connection_degree(1);
+  let config = NodeConfig::new()
+    .with_connection_degree(1)
+    .with_route_policy(policy_tag);
   let handle = NodeBuilder::new(factory)
     .keys(keys)
     .config(config)
