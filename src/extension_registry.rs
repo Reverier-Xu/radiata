@@ -904,13 +904,11 @@ mod tests {
     assert_eq!(policy.slot_class, crate::task::SlotClass::Extension);
     assert!(!policy.drains_on_shutdown);
 
-    // Idempotent: a second default pass leaves every entry untouched.
-    registry.register_default().unwrap();
-    assert!(
-      registry
-        .task_reconciler(crate::TaskKind::JOIN.tag())
-        .is_none()
-    );
+    // Core registration is insertion-once: a second default pass over
+    // the same registry conflicts instead of overriding or silently
+    // keeping a claim (the same rule the built-in next-hop follows).
+    let second_pass = registry.register_default().unwrap_err();
+    assert_eq!(second_pass.kind(), ErrorKind::Conflict);
     assert_eq!(
       registry
         .task_reconciler_policy(&crate::TaskKind::JOIN)
@@ -921,19 +919,14 @@ mod tests {
   }
 
   /// The built-in next-hop policy's well-known tag is an ordinary
-  /// registry tag: a caller may claim it (the builder only auto-registers
-  /// when absent), but a duplicate registration for it stays a conflict —
-  /// the same insertion-once rule the built-in transport tag follows.
+  /// registry tag with the insertion-once rule: the default path installs
+  /// it, a caller registration for it before the default path conflicts,
+  /// and a duplicate registration stays a conflict.
   #[test]
   fn next_hop_registry_rejects_duplicate_builtin_tag_registrations() {
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     let tag = crate::routing::DefaultNextHop::tag().unwrap();
-    registry
-      .register_next_hop(
-        tag.clone(),
-        Arc::new(crate::routing::DefaultNextHop::default()),
-      )
-      .unwrap();
     let error = registry
       .register_next_hop(tag, Arc::new(crate::routing::DefaultNextHop::default()))
       .unwrap_err();
