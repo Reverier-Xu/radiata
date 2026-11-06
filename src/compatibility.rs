@@ -12,8 +12,8 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use crate::{
-  Digest, Endpoint, LabelKey, LabelSet, LabelValue, NodeId, ProtocolTag, PublicKey, ResourceName,
-  ResourceUri, StoreValue, StreamMetadata, TraceId,
+  Endpoint, LabelKey, LabelSet, LabelValue, NodeId, ProtocolTag, PublicKey, ResourceName,
+  ResourceUri, StreamMetadata, TraceId,
   hex::decode as hex_decode,
   membership::{NODE_DESCRIPTOR_SCHEMA, NodeDescriptorV1, page::decode_descriptor},
   packet::wire,
@@ -21,9 +21,7 @@ use crate::{
   provider::{KeyHandle, KeyOperationId},
   resource::{RESOURCE_RECORD_SCHEMA, ResourceRecordV1},
   routing::trace::{TRACE_SCHEMA, TracePhase, TraceRecord, TraceTransition, decode_trace_record},
-  storage::migration::{
-    EDGE_RECORD_KIND, METADATA_SCHEMA_V1, decode_schema_record, encode_schema_record,
-  },
+  storage::migration::{METADATA_SCHEMA_V1, decode_schema_record, encode_schema_record},
 };
 
 /// The frozen previous-shape node descriptor (record version 1, no
@@ -154,23 +152,12 @@ fn unsupported_format_versions_fail_closed() {
     }
   }
 
-  // Migration schema records: unknown record kinds fail closed.
-  for kind in [0x00_u8, 0x03] {
-    let mutated = encode_schema_record(kind, METADATA_SCHEMA_V1, None);
+  // Migration schema records: any kind other than the baseline fails
+  // closed.
+  for kind in [0x00_u8, 0x02, 0x03] {
+    let mutated = encode_schema_record(kind, METADATA_SCHEMA_V1);
     assert!(decode_schema_record(&mutated).is_err());
   }
-  // The edge-record digest width is frozen.
-  let mut short_digest = encode_schema_record(
-    EDGE_RECORD_KIND,
-    METADATA_SCHEMA_V1,
-    Some(&Digest::from_bytes([0x0D; 32])),
-  )
-  .as_bytes()
-  .to_vec();
-  short_digest.pop();
-  assert!(
-    decode_schema_record(&StoreValue::new(Arc::from(short_digest.into_boxed_slice()))).is_err()
-  );
 }
 
 /// Decoded trace records preserve their exact phase and endpoints.

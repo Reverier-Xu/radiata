@@ -1166,14 +1166,13 @@ mod tests {
       &'a self, namespace: &'a crate::StoreNamespace, key: &'a crate::StoreKey,
     ) -> crate::BoxFuture<'a, crate::Result<Option<crate::StoreValue>>> {
       Box::pin(async move {
-        // The production schema baseline keeps the open-time migration
-        // pass on its idempotent Current path.
+        // The production schema baseline keeps the open-time schema
+        // gate on its accept-without-writes path.
         let schema = crate::storage::migration::schema_namespace()?;
         if namespace == &schema && key == &crate::storage::migration::schema_key() {
           return Ok(Some(crate::storage::migration::encode_schema_record(
             crate::storage::migration::BASE_RECORD_KIND,
             crate::storage::migration::METADATA_SCHEMA_V1,
-            None,
           )));
         }
         Ok(None)

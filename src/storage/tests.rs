@@ -79,15 +79,13 @@ impl StoreSnapshot for EmptySnapshot {
   ) -> BoxFuture<'a, Result<Option<StoreValue>>> {
     Box::pin(async move {
       // The scripted store presents the production schema baseline, so
-      // the open-time migration pass takes its idempotent Current path
-      // and the scripted commits stay reserved for the test's own
-      // transactions.
+      // the open-time schema gate accepts it without writing, and the
+      // scripted commits stay reserved for the test's own transactions.
       let schema = crate::storage::migration::schema_namespace()?;
       if namespace == &schema && key == &crate::storage::migration::schema_key() {
         return Ok(Some(crate::storage::migration::encode_schema_record(
           crate::storage::migration::BASE_RECORD_KIND,
           crate::storage::migration::METADATA_SCHEMA_V1,
-          None,
         )));
       }
       Ok(None)
