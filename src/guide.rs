@@ -493,11 +493,11 @@
 //! ## Label-addressed delivery: `MatchingNodes` and the load balancer
 //!
 //! A target does not have to name a node. [`StreamTarget::MatchingNodes
-//!`](crate::StreamTarget::MatchingNodes) carries a [`Selector`](crate::
-//! Selector) instead: the members whose owned labels satisfy it stream to
-//! the sender incrementally, in canonical node order, and a registered
-//! load-balancing policy selects exactly one eligible destination from
-//! them. Core independently re-validates the pick against the
+//!`](crate::StreamTarget::MatchingNodes) carries a
+//! [`Selector`](crate::Selector) instead: the members whose owned labels
+//! satisfy it stream to the sender incrementally, in canonical node order, and
+//! a registered load-balancing policy selects exactly one eligible destination
+//! from them. Core independently re-validates the pick against the
 //! authoritative descriptor store before any frame moves, so an ID
 //! outside the observed candidates fails closed at the route boundary.
 //!

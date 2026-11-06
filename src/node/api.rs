@@ -457,11 +457,14 @@ impl Tasks {
   /// Admission-time failures are the pure shape checks (a stopped node,
   /// the reserved domain, an unregistered kind); every reconciler error
   /// is effect-time and surfaces on the task's `wait`. Only the
-  /// reconciler's explicit [`ReconcileDecision::Retry`] decision re-arms
-  /// the bounded extension retry schedule; a returned `Err` or an
-  /// explicit [`ReconcileDecision::Failed`] decision terminalizes the
-  /// task as failed with that error, never retried — re-driving a failed
-  /// workflow is the caller's own re-submission.
+  /// reconciler's explicit
+  /// [`ReconcileDecision::Retry`](crate::ReconcileDecision::Retry)
+  /// decision re-arms the bounded extension retry schedule; a returned
+  /// `Err` or an explicit
+  /// [`ReconcileDecision::Failed`](crate::ReconcileDecision::Failed)
+  /// decision terminalizes the task as failed with that error, never
+  /// retried — re-driving a failed workflow is the caller's own
+  /// re-submission.
   pub async fn submit(&self, spec: crate::CustomTaskSpec) -> Result<Task<()>> {
     let client = self.client()?.clone();
     if spec.kind().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
