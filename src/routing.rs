@@ -1750,7 +1750,7 @@ mod tests {
   #[tokio::test]
   async fn load_balancer_registration_and_selection() -> Result<()> {
     let mut registry = crate::ExtensionRegistry::new();
-    let tag = crate::QualifiedTag::parse("radiata.woooo.tech/policies/first")?;
+    let tag = crate::QualifiedTag::parse("example.com/policies/first")?;
     registry.register_load_balancer(tag.clone(), Arc::new(FirstCandidate))?;
     assert!(registry.has_load_balancer(&tag));
     // A duplicate tag registration conflicts.
@@ -1765,9 +1765,7 @@ mod tests {
     let reader = candidate_reader().await;
     let selector = Selector::parse("radiata.woooo.tech/labels/gpu=yes").unwrap();
     let policy = registry
-      .load_balancer(&crate::QualifiedTag::parse(
-        "radiata.woooo.tech/policies/first",
-      )?)
+      .load_balancer(&crate::QualifiedTag::parse("example.com/policies/first")?)
       .unwrap();
     let selected = policy.select(&selector, &reader).await?;
     assert_eq!(selected, node(2));
