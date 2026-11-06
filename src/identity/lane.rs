@@ -12,10 +12,11 @@ use crate::{
   api::BoxFuture,
   provider::StoreSnapshot,
   reconcile::{
-    lane::{Lane, LaneContext, LaneOutcome, LaneRows, ScanFilters, scan_namespaces},
+    lane::{Lane, LaneContext, LaneOutcome, LaneRows, decode_identified, scan_namespaces},
     wire::LaneId,
   },
   runtime::RuntimeClient,
+  session::stream::{AuthorizationBoundary, SessionTable},
 };
 
 /// The issuer-trust lane.
@@ -23,8 +24,13 @@ use crate::{
 pub(crate) struct TrustLane;
 
 impl TrustLane {
-  /// The lane's store namespaces: the lane↔namespace map.
-  const NAMESPACES: [&str; 1] = [crate::storage::families::IDENTITY_BINDING_NAMESPACE];
+  /// The lane's store namespaces: the lane↔namespace map (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 1] = [crate::storage::families::IDENTITY_BINDING_NAMESPACE];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 2;
 }
 
 impl Lane for TrustLane {
@@ -32,13 +38,7 @@ impl Lane for TrustLane {
     LaneId::Trust
   }
 
-  fn namespaces(&self) -> &'static [&'static str] {
-    &Self::NAMESPACES
-  }
-
-  fn scan<'a>(
-    &self, snapshot: &'a dyn StoreSnapshot, _filters: &'a ScanFilters,
-  ) -> BoxFuture<'a, Result<LaneRows>> {
+  fn scan<'a>(&self, snapshot: &'a dyn StoreSnapshot) -> BoxFuture<'a, Result<LaneRows>> {
     Box::pin(async move {
       scan_namespaces(snapshot, &Self::NAMESPACES, |_key, value| {
         crate::identity::records::IdentityBindingV1::decode(value).is_ok()
@@ -49,7 +49,8 @@ impl Lane for TrustLane {
 
   fn apply<'a>(
     &self, ctx: &'a LaneContext<'a>, rows: &'a LaneRows, _source: Option<&'a NodeId>,
-    _runtime: Option<&'a RuntimeClient>,
+    _runtime: Option<&'a RuntimeClient>, _sessions: &'a SessionTable,
+    _authorization: &'a AuthorizationBoundary,
   ) -> BoxFuture<'a, Result<LaneOutcome>> {
     Box::pin(async move {
       let store = ctx.context.store();
@@ -58,27 +59,13 @@ impl Lane for TrustLane {
       // snapshot-accept semantics (transient contention skips one
       // binding — the repair retries it — and everything else, key
       // substitution above all, fails closed and propagates).
-      let mut refused = Vec::new();
-      for (row_key, content) in rows {
-        let binding = match crate::identity::records::IdentityBindingV1::decode(content) {
-          Ok(binding) if row_key.as_slice() == binding.node().as_str().as_bytes() => binding,
-          Ok(binding) => {
-            tracing::debug!(
-              node = %binding.node(),
-              "reconcile binding row skipped: key mismatch"
-            );
-            refused.push((row_key.clone(), content.clone()));
-            continue;
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile binding row skipped: undecodable"
-            );
-            refused.push((row_key.clone(), content.clone()));
-            continue;
-          }
-        };
+      let (decoded, mut refused) = decode_identified(
+        rows,
+        "binding",
+        crate::identity::records::IdentityBindingV1::decode,
+        |binding| binding.node().as_str().as_bytes(),
+      );
+      for (binding_row, binding) in &decoded {
         // The per-record adoption policy, row-scoped: transient
         // contention skips one binding (the repair retries it); a
         // revoked subject (revocation tombstones out-rank late binding
@@ -117,7 +104,7 @@ impl Lane for TrustLane {
               error.kind(),
               crate::ErrorKind::Revoked | crate::ErrorKind::NotTrusted
             ) {
-              refused.push((row_key.clone(), content.clone()));
+              refused.push(rows[*binding_row].clone());
             }
             continue;
           }

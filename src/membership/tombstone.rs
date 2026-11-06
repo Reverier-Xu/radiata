@@ -20,6 +20,7 @@ use crate::{
   api::Entropy,
   identity::{lifecycle::LocalIdentityContext, trust::store as trust_store},
   runtime::RuntimeClient,
+  session::stream::{AuthorizationBoundary, SessionTable},
 };
 
 /// The tombstone arms' shared verification context: the trusted-binding
@@ -479,6 +480,21 @@ async fn apply_revocation_row(
   }
 }
 
+/// The tombstone apply's collaborators, bundled once per apply: the
+/// plane-wide handles the per-record arms report through, plus the
+/// session/authorization pair the revocation arm's durable install and
+/// retirement serializes against. One struct keeps the apply path's
+/// argument lists to the inputs a caller actually varies (rows, source,
+/// runtime).
+pub(crate) struct TombstoneApply<'a> {
+  pub(crate) context: &'a Arc<LocalIdentityContext>,
+  pub(crate) entropy: &'a Arc<dyn Entropy>,
+  pub(crate) events: &'a Arc<crate::node::EventHub>,
+  pub(crate) revision: &'a crate::node::MemberRevisionSignal,
+  pub(crate) sessions: &'a SessionTable,
+  pub(crate) authorization: &'a AuthorizationBoundary,
+}
+
 /// The tombstone lane's reconciliation row apply: kind-prefixed keys
 /// (the wire contract's [`crate::reconcile::wire::TombstoneKind`]
 /// prefixes) dispatch to the same per-record
@@ -489,15 +505,11 @@ async fn apply_revocation_row(
 /// [`decode_tombstone_row`]): decided evidence no retry can change, so the
 /// receive boundary drops them from engine admission instead of
 /// re-delivering them forever.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_tombstone_rows(
-  context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
-  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
-  sessions: &crate::session::stream::SessionTable,
-  authorization: &crate::session::stream::AuthorizationBoundary, rows: &[(Vec<u8>, Vec<u8>)],
-  source: Option<&NodeId>, runtime: Option<&RuntimeClient>,
+  apply: &TombstoneApply<'_>, rows: &[(Vec<u8>, Vec<u8>)], source: Option<&NodeId>,
+  runtime: Option<&RuntimeClient>,
 ) -> Result<crate::reconcile::lane::LaneRows> {
-  let store = context.store();
+  let store = apply.context.store();
   let evidence = tombstone_evidence(store).await?;
   // Row-level fault tolerance, the scan side's corrupt-row policy: one
   // undecodable or misattributed tombstone row is refused with a typed
@@ -515,9 +527,9 @@ pub(crate) async fn apply_tombstone_rows(
       TombstoneRow::Leave(record) => {
         apply_leave_row(
           store,
-          entropy,
-          events,
-          revision,
+          apply.entropy,
+          apply.events,
+          apply.revision,
           &evidence,
           &record,
           source.zip(runtime),
@@ -525,22 +537,30 @@ pub(crate) async fn apply_tombstone_rows(
         .await?;
       }
       TombstoneRow::Cleanup(record) => {
-        apply_cleanup_row(store, entropy, events, revision, &evidence, &record).await?;
+        apply_cleanup_row(
+          store,
+          apply.entropy,
+          apply.events,
+          apply.revision,
+          &evidence,
+          &record,
+        )
+        .await?;
       }
       TombstoneRow::Revocation(record) => {
         apply_revocation_row(
           store,
-          entropy,
-          events,
+          apply.entropy,
+          apply.events,
           &evidence,
           &record,
-          sessions,
-          authorization,
+          apply.sessions,
+          apply.authorization,
         )
         .await?;
       }
       TombstoneRow::Checkpoint(checkpoint) => {
-        apply_checkpoint_record(store, entropy, &checkpoint).await?;
+        apply_checkpoint_record(store, apply.entropy, &checkpoint).await?;
       }
     }
   }
@@ -554,13 +574,18 @@ pub(crate) struct TombstonesLane;
 
 impl TombstonesLane {
   /// The lane's store namespaces, in kind order: the lane↔namespace map,
-  /// single-sourced from the wire contract's kind table.
-  const NAMESPACES: [&str; 4] = [
+  /// single-sourced from the wire contract's kind table (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 4] = [
     crate::reconcile::wire::TombstoneKind::Leave.namespace_tag(),
     crate::reconcile::wire::TombstoneKind::Cleanup.namespace_tag(),
     crate::reconcile::wire::TombstoneKind::Revocation.namespace_tag(),
     crate::reconcile::wire::TombstoneKind::Checkpoint.namespace_tag(),
   ];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 4;
 }
 
 impl crate::reconcile::lane::Lane for TombstonesLane {
@@ -568,17 +593,17 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
     crate::reconcile::wire::LaneId::Tombstones
   }
 
-  fn namespaces(&self) -> &'static [&'static str] {
-    &Self::NAMESPACES
-  }
-
   fn scan<'a>(
     &self, snapshot: &'a dyn crate::provider::StoreSnapshot,
-    filters: &'a crate::reconcile::lane::ScanFilters,
   ) -> crate::api::BoxFuture<'a, Result<crate::reconcile::lane::LaneRows>> {
     Box::pin(async move {
       use crate::reconcile::wire::TombstoneKind;
 
+      // The lane's collected-row watermark, self-served from the scan's
+      // own snapshot: the checkpoint singleton this scan reads anyway is
+      // the row the watermark derives from, so the scan and its
+      // collected-row filter judge one store instant.
+      let checkpoint = crate::identity::cleanup::latest_checkpoint_millis(snapshot).await?;
       let mut rows = crate::reconcile::lane::LaneRows::new();
       for kind in TombstoneKind::ALL {
         if kind == TombstoneKind::Checkpoint {
@@ -608,7 +633,7 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
         }
         for (key, content) in raw {
           let row_key = kind.row_key(&key);
-          if collected_row(filters.checkpoint, &row_key, &content) {
+          if collected_row(checkpoint, &row_key, &content) {
             continue;
           }
           rows.push((row_key, content));
@@ -620,9 +645,9 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
 
   fn reclaimed(
     &self, _key_present: bool, key: &[u8], content: &[u8],
-    filters: &crate::reconcile::lane::ScanFilters,
+    _basis: &crate::reconcile::lane::SweptBasis, checkpoint: Option<u64>,
   ) -> bool {
-    collected_row(filters.checkpoint, key, content)
+    collected_row(checkpoint, key, content)
   }
 
   fn reads_checkpoint(&self) -> bool {
@@ -631,7 +656,7 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
 
   fn receive<'a>(
     &self, ctx: &'a crate::reconcile::lane::LaneContext<'a>,
-    rows: &'a mut crate::reconcile::lane::LaneRows,
+    _basis: &'a crate::reconcile::lane::SweptBasis, rows: &'a mut crate::reconcile::lane::LaneRows,
   ) -> crate::api::BoxFuture<'a, Result<()>> {
     Box::pin(async move {
       // The collected-row receive filter: a leave or cleanup record at or
@@ -649,16 +674,19 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
   fn apply<'a>(
     &self, ctx: &'a crate::reconcile::lane::LaneContext<'a>,
     rows: &'a crate::reconcile::lane::LaneRows, source: Option<&'a NodeId>,
-    runtime: Option<&'a RuntimeClient>,
+    runtime: Option<&'a RuntimeClient>, sessions: &'a SessionTable,
+    authorization: &'a AuthorizationBoundary,
   ) -> crate::api::BoxFuture<'a, Result<crate::reconcile::lane::LaneOutcome>> {
     Box::pin(async move {
       let refused = apply_tombstone_rows(
-        ctx.context,
-        ctx.entropy,
-        ctx.events,
-        ctx.revision,
-        ctx.sessions,
-        ctx.authorization,
+        &TombstoneApply {
+          context: ctx.context,
+          entropy: ctx.entropy,
+          events: ctx.events,
+          revision: ctx.revision,
+          sessions,
+          authorization,
+        },
         rows,
         source,
         runtime,
@@ -829,12 +857,14 @@ mod tests {
       row(2, &subject, cleanup(9_000).encode().unwrap()),
     ];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &first_rows,
       None,
       None,
@@ -852,12 +882,14 @@ mod tests {
 
     // An exact replay notifies nothing and bumps nothing.
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &first_rows,
       None,
       None,
@@ -873,12 +905,14 @@ mod tests {
     // exactly one notification.
     let replacement_rows = vec![row(2, &subject, cleanup(5_000).encode().unwrap())];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &replacement_rows,
       None,
       None,
@@ -896,12 +930,14 @@ mod tests {
     sessions.lock().unwrap().insert(subject.clone(), entry);
     let replacement_rows = vec![row(3, &subject, winner_bytes.clone())];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &replacement_rows,
       None,
       None,
@@ -1081,12 +1117,14 @@ mod tests {
     let authorization = crate::session::stream::AuthorizationBoundary::default();
 
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &rows,
       None,
       None,
@@ -1233,14 +1271,10 @@ mod tests {
       entropy: &entropy,
       events: &events,
       revision: &revision,
-      sessions: &sessions,
-      authorization: &authorization,
-      swept_at: std::time::SystemTime::now(),
-      removal_retention: crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
     };
     let outcome = crate::reconcile::wire::LaneId::Tombstones
       .policy()
-      .apply(&lane_context, &rows, None, None)
+      .apply(&lane_context, &rows, None, None, &sessions, &authorization)
       .await
       .unwrap();
     assert_eq!(
@@ -1330,12 +1364,14 @@ mod tests {
       let authorization = authorization.clone();
       async move {
         apply_tombstone_rows(
-          &context,
-          &entropy,
-          &events,
-          &revision,
-          &sessions,
-          &authorization,
+          &TombstoneApply {
+            context: &context,
+            entropy: &entropy,
+            events: &events,
+            revision: &revision,
+            sessions: &sessions,
+            authorization: &authorization,
+          },
           &rows,
           None,
           None,
@@ -1450,12 +1486,14 @@ mod tests {
       ),
     ];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &rows,
       None,
       None,
@@ -1475,12 +1513,14 @@ mod tests {
     // ledger keeps recording it, mirroring the local revoke effect's
     // fresh-commit-and-replay alike.
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &rows,
       None,
       None,

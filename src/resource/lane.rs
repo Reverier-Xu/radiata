@@ -15,10 +15,13 @@ use crate::{
   api::BoxFuture,
   provider::StoreSnapshot,
   reconcile::{
-    lane::{Lane, LaneContext, LaneOutcome, LaneRows, ScanFilters, scan_namespaces},
+    lane::{
+      Lane, LaneContext, LaneOutcome, LaneRows, SweptBasis, decode_identified, scan_namespaces,
+    },
     wire::LaneId,
   },
   runtime::RuntimeClient,
+  session::stream::{AuthorizationBoundary, SessionTable},
 };
 
 /// The resource-metadata lane.
@@ -26,8 +29,13 @@ use crate::{
 pub(crate) struct ResourcesLane;
 
 impl ResourcesLane {
-  /// The lane's store namespaces: the lane↔namespace map.
-  const NAMESPACES: [&str; 1] = [crate::storage::families::RESOURCE_RECORD_NAMESPACE];
+  /// The lane's store namespaces: the lane↔namespace map (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 1] = [crate::storage::families::RESOURCE_RECORD_NAMESPACE];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 3;
 }
 
 impl Lane for ResourcesLane {
@@ -35,13 +43,7 @@ impl Lane for ResourcesLane {
     LaneId::Resources
   }
 
-  fn namespaces(&self) -> &'static [&'static str] {
-    &Self::NAMESPACES
-  }
-
-  fn scan<'a>(
-    &self, snapshot: &'a dyn StoreSnapshot, _filters: &'a ScanFilters,
-  ) -> BoxFuture<'a, Result<LaneRows>> {
+  fn scan<'a>(&self, snapshot: &'a dyn StoreSnapshot) -> BoxFuture<'a, Result<LaneRows>> {
     Box::pin(async move {
       scan_namespaces(snapshot, &Self::NAMESPACES, |_key, value| {
         crate::resource::ResourceRecordV1::decode(value).is_ok()
@@ -51,18 +53,19 @@ impl Lane for ResourcesLane {
   }
 
   fn reclaimed(
-    &self, key_present: bool, _key: &[u8], content: &[u8], filters: &ScanFilters,
+    &self, key_present: bool, _key: &[u8], content: &[u8], basis: &SweptBasis,
+    _checkpoint: Option<u64>,
   ) -> bool {
     crate::resource::retention::reclaimed(
       key_present,
       content,
-      filters.swept_at,
-      filters.removal_retention,
+      basis.swept_at,
+      basis.removal_retention,
     )
   }
 
   fn receive<'a>(
-    &self, ctx: &'a LaneContext<'a>, rows: &'a mut LaneRows,
+    &self, ctx: &'a LaneContext<'a>, basis: &'a SweptBasis, rows: &'a mut LaneRows,
   ) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
       // The retention-reclaimed receive filter, the tombstone mirror: a
@@ -94,8 +97,8 @@ impl Lane for ResourcesLane {
         if !crate::resource::retention::reclaimed(
           key_present,
           &content,
-          ctx.swept_at,
-          ctx.removal_retention,
+          basis.swept_at,
+          basis.removal_retention,
         ) {
           retained.push((key, content));
         }
@@ -107,36 +110,22 @@ impl Lane for ResourcesLane {
 
   fn apply<'a>(
     &self, ctx: &'a LaneContext<'a>, rows: &'a LaneRows, _source: Option<&'a NodeId>,
-    _runtime: Option<&'a RuntimeClient>,
+    _runtime: Option<&'a RuntimeClient>, _sessions: &'a SessionTable,
+    _authorization: &'a AuthorizationBoundary,
   ) -> BoxFuture<'a, Result<LaneOutcome>> {
     Box::pin(async move {
       let store = ctx.context.store();
       // The same row-level policy as the descriptors lane: a corrupt or
       // misattributed record row skips, and the page apply's store
       // faults propagate.
-      let mut staged: Vec<crate::resource::ResourceRecordV1> = Vec::with_capacity(rows.len());
-      let mut refused = Vec::new();
-      for (row_key, content) in rows {
-        match crate::resource::ResourceRecordV1::decode(content) {
-          Ok(record) if row_key.as_slice() == record.name().as_str().as_bytes() => {
-            staged.push(record);
-          }
-          Ok(record) => {
-            tracing::debug!(
-              name = %record.name().as_str(),
-              "reconcile resource row skipped: key mismatch"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile resource row skipped: undecodable"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-        }
-      }
+      let (decoded, refused) = decode_identified(
+        rows,
+        "resource",
+        crate::resource::ResourceRecordV1::decode,
+        |record| record.name().as_str().as_bytes(),
+      );
+      let staged: Vec<crate::resource::ResourceRecordV1> =
+        decoded.into_iter().map(|(_, record)| record).collect();
       for chunk in staged.chunks(crate::paging::PAGE_MAX_ITEMS) {
         let page = crate::resource::page::ResourcePage::new(chunk.to_vec(), None)?;
         let outcome =

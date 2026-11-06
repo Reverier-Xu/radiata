@@ -397,9 +397,13 @@ pub(crate) async fn issue_checkpoint_ctx(
   }
 }
 
-/// The latest local checkpoint watermark, if any.
-pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Result<Option<u64>> {
-  let snapshot = store.snapshot().await?;
+/// The latest local checkpoint watermark, read from one snapshot: the
+/// scan side self-serves it (the reconcile tombstones lane judges its
+/// collected rows against the same store instant its snapshot lists),
+/// while the store handle wrapper below opens that snapshot.
+pub(crate) async fn latest_checkpoint_millis(
+  snapshot: &(dyn crate::provider::StoreSnapshot + '_),
+) -> Result<Option<u64>> {
   let Some(value) = snapshot
     .get(&checkpoint_namespace()?, &checkpoint_key())
     .await?
@@ -409,6 +413,11 @@ pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Resul
   Ok(Some(
     CleanupCheckpointV1::decode(value.as_bytes())?.watermark_millis,
   ))
+}
+
+/// The latest local checkpoint watermark, if any.
+pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Result<Option<u64>> {
+  latest_checkpoint_millis(store.snapshot().await?.as_ref()).await
 }
 
 /// Persists one checkpoint received over sync: max-wins by watermark, so

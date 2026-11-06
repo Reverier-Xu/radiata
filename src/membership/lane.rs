@@ -12,10 +12,11 @@ use crate::{
   api::BoxFuture,
   provider::StoreSnapshot,
   reconcile::{
-    lane::{Lane, LaneContext, LaneOutcome, LaneRows, ScanFilters, scan_namespaces},
+    lane::{Lane, LaneContext, LaneOutcome, LaneRows, decode_identified, scan_namespaces},
     wire::LaneId,
   },
   runtime::RuntimeClient,
+  session::stream::{AuthorizationBoundary, SessionTable},
 };
 
 /// The member-descriptor lane.
@@ -23,8 +24,13 @@ use crate::{
 pub(crate) struct DescriptorsLane;
 
 impl DescriptorsLane {
-  /// The lane's store namespaces: the lane↔namespace map.
-  const NAMESPACES: [&str; 1] = [crate::membership::NODE_DESCRIPTOR_NAMESPACE];
+  /// The lane's store namespaces: the lane↔namespace map (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 1] = [crate::membership::NODE_DESCRIPTOR_NAMESPACE];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 1;
 }
 
 impl Lane for DescriptorsLane {
@@ -32,13 +38,7 @@ impl Lane for DescriptorsLane {
     LaneId::Descriptors
   }
 
-  fn namespaces(&self) -> &'static [&'static str] {
-    &Self::NAMESPACES
-  }
-
-  fn scan<'a>(
-    &self, snapshot: &'a dyn StoreSnapshot, _filters: &'a ScanFilters,
-  ) -> BoxFuture<'a, Result<LaneRows>> {
+  fn scan<'a>(&self, snapshot: &'a dyn StoreSnapshot) -> BoxFuture<'a, Result<LaneRows>> {
     Box::pin(async move {
       scan_namespaces(snapshot, &Self::NAMESPACES, |_key, value| {
         crate::membership::page::decode_descriptor(value).is_ok()
@@ -49,7 +49,8 @@ impl Lane for DescriptorsLane {
 
   fn apply<'a>(
     &self, ctx: &'a LaneContext<'a>, rows: &'a LaneRows, _source: Option<&'a NodeId>,
-    _runtime: Option<&'a RuntimeClient>,
+    _runtime: Option<&'a RuntimeClient>, _sessions: &'a SessionTable,
+    _authorization: &'a AuthorizationBoundary,
   ) -> BoxFuture<'a, Result<LaneOutcome>> {
     Box::pin(async move {
       let store = ctx.context.store();
@@ -62,61 +63,30 @@ impl Lane for DescriptorsLane {
       // below still propagate: they are real write faults, not corrupt
       // input. The refused list carries the rows in their original
       // wire shape, so the receive boundary can keep them out of the
-      // engines — including the same-key duplicates the page-order
-      // contest below drops (their loser is stale-or-equal by
-      // construction, the same refusal the store would make).
-      let mut descriptors: Vec<(Vec<u8>, Vec<u8>, crate::membership::NodeDescriptorV1)> =
-        Vec::with_capacity(rows.len());
-      let mut refused = Vec::new();
-      for (row_key, content) in rows {
-        match crate::membership::page::decode_descriptor(content) {
-          Ok(descriptor) if row_key.as_slice() == descriptor.node().as_str().as_bytes() => {
-            descriptors.push((row_key.clone(), content.clone(), descriptor));
-          }
-          Ok(descriptor) => {
-            tracing::debug!(
-              node = %descriptor.node(),
-              "reconcile descriptor row skipped: key mismatch"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-          Err(error) => {
-            tracing::debug!(
-              kind = ?error.kind(),
-              "reconcile descriptor row skipped: undecodable"
-            );
-            refused.push((row_key.clone(), content.clone()));
-          }
-        }
-      }
+      // engines.
+      let (decoded, mut refused) = decode_identified(
+        rows,
+        "descriptor",
+        crate::membership::page::decode_descriptor,
+        |descriptor| descriptor.node().as_str().as_bytes(),
+      );
       // The same-key page-order contest, single-sourced with the
       // register's page batch (`contest_descriptors`): the decided
       // contest losers — stale-or-equal by construction, the same
       // refusal the store would make — join the refused list in their
       // original wire shape, and the winners apply in first-seen order.
-      let decoded: Vec<&crate::membership::NodeDescriptorV1> = descriptors
-        .iter()
-        .map(|(_, _, descriptor)| descriptor)
-        .collect();
-      let (winner_rows, loser_rows) = crate::membership::store::contest_descriptors(&decoded);
-      let winners: Vec<(Vec<u8>, Vec<u8>, crate::membership::NodeDescriptorV1)> = winner_rows
-        .into_iter()
-        .map(|index| {
-          let (row_key, content, descriptor) = &descriptors[index];
-          (row_key.clone(), content.clone(), descriptor.clone())
-        })
-        .collect();
+      let records: Vec<&crate::membership::NodeDescriptorV1> =
+        decoded.iter().map(|(_, descriptor)| descriptor).collect();
+      let (winner_rows, loser_rows) = crate::membership::store::contest_descriptors(&records);
       for index in loser_rows {
-        let (row_key, content, _) = &descriptors[index];
-        refused.push((row_key.clone(), content.clone()));
+        refused.push(rows[decoded[index].0].clone());
       }
-      let descriptors = winners;
       let mut skipped_ids = Vec::new();
-      for chunk in descriptors.chunks(crate::paging::PAGE_MAX_ITEMS) {
+      for chunk in winner_rows.chunks(crate::paging::PAGE_MAX_ITEMS) {
         let page = crate::membership::page::MembershipPage::new(
           chunk
             .iter()
-            .map(|(_, _, descriptor)| descriptor.clone())
+            .map(|index| decoded[*index].1.clone())
             .collect(),
           None,
         )?;
@@ -124,7 +94,8 @@ impl Lane for DescriptorsLane {
           crate::membership::store::apply_descriptor_batch_ctx(store, ctx.entropy.as_ref(), &page)
             .await?;
         skipped_ids.extend(skipped);
-        for (_, _, descriptor) in chunk {
+        for index in chunk {
+          let descriptor = &decoded[*index].1;
           if installed.contains(descriptor.node()) {
             // The audit event is the propagation path proof: a
             // descriptor exists on this peer only because these rows
@@ -140,7 +111,8 @@ impl Lane for DescriptorsLane {
       }
       // The batch's refused node ids map back onto exactly the rows
       // that carried them (the dedup above left one row per node id).
-      for (row_key, content, _) in &descriptors {
+      for index in winner_rows {
+        let (row_key, content) = &rows[decoded[index].0];
         if skipped_ids
           .iter()
           .any(|node| node.as_str().as_bytes() == row_key.as_slice())
