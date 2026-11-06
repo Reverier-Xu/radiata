@@ -570,17 +570,15 @@ pub(crate) enum RouteProgress {
 }
 
 /// The routing envelope of one packet (trace metadata: identity, selected
-/// destination, progress — never payload bytes).
+/// destination, progress — never payload bytes). The per-hop route state
+/// is embedded whole ([`HopState`]), so the wire projection is a move,
+/// never a field-for-field copy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteContext {
   trace_id: crate::TraceId,
   source: NodeId,
   destination: NodeId,
-  current: NodeId,
-  /// The remaining path after `current`, ending at the destination.
-  path: Vec<NodeId>,
-  visited: Vec<NodeId>,
-  remaining_hops: u32,
+  hop: HopState,
 }
 
 impl RouteContext {
@@ -592,12 +590,14 @@ impl RouteContext {
   ) -> Self {
     Self {
       trace_id,
-      current: source.clone(),
+      hop: HopState {
+        current: source.clone(),
+        visited: Vec::new(),
+        remaining_hops: max_hops,
+        path,
+      },
       source,
       destination,
-      path,
-      visited: Vec::new(),
-      remaining_hops: max_hops,
     }
   }
 
@@ -622,42 +622,38 @@ impl RouteContext {
 
   /// The node that most recently held (and sent) this packet.
   pub fn current(&self) -> &NodeId {
-    &self.current
+    &self.hop.current
   }
 
   /// The ordered chain of holders before the current one, starting at the
   /// source.
   pub fn visited(&self) -> &[NodeId] {
-    &self.visited
+    &self.hop.visited
   }
 
   /// The remaining path after the current holder, ending at the
   /// destination. Empty when the current holder must plan the remainder
   /// itself.
   pub fn path(&self) -> &[NodeId] {
-    &self.path
+    &self.hop.path
   }
 
   /// The hop budget still available to this delivery attempt.
   pub fn remaining_hops(&self) -> u32 {
-    self.remaining_hops
+    self.hop.remaining_hops
   }
 
-  /// Projects the wire-carried per-hop state out of the envelope.
-  pub(crate) fn hop_state(&self) -> HopState {
-    HopState {
-      current: self.current.clone(),
-      visited: self.visited.clone(),
-      remaining_hops: self.remaining_hops,
-      path: self.path.clone(),
-    }
+  /// Projects the wire-carried per-hop state out of the envelope: a move,
+  /// because the state is embedded whole.
+  pub(crate) fn into_hop_state(self) -> HopState {
+    self.hop
   }
 
   /// The same envelope with its remaining path dropped: a re-dispatched
   /// alternative branch at this hop plans its own path instead of
   /// following the abandoned attempt's plan.
   pub(crate) fn replanned(mut self) -> Self {
-    self.path = Vec::new();
+    self.hop.path = Vec::new();
     self
   }
 
@@ -668,19 +664,11 @@ impl RouteContext {
     trace_id: crate::TraceId, source: NodeId, destination: NodeId, route: Option<HopState>,
   ) -> Self {
     match route {
-      Some(HopState {
-        current,
-        visited,
-        remaining_hops,
-        path,
-      }) => Self {
+      Some(hop) => Self {
         trace_id,
         source,
         destination,
-        current,
-        path,
-        visited,
-        remaining_hops,
+        hop,
       },
       None => Self::new(trace_id, source, destination, Vec::new(), 1),
     }
@@ -691,15 +679,20 @@ impl RouteContext {
   /// origin as the claimed holder. The origin's own send is not a relay,
   /// so it consumes no budget; every later hop does.
   pub(crate) fn dispatch(self) -> Result<(NodeId, Self)> {
-    let mut hops = self.path.into_iter();
+    let mut hops = self.hop.path.into_iter();
     let next_hop = hops
       .next()
       .ok_or_else(|| Error::invalid_input("route path"))?;
     Ok((
       next_hop,
       Self {
-        path: hops.collect(),
-        ..self
+        hop: HopState {
+          path: hops.collect(),
+          ..self.hop
+        },
+        trace_id: self.trace_id,
+        source: self.source,
+        destination: self.destination,
       },
     ))
   }
@@ -726,7 +719,7 @@ impl RouteContext {
   ) -> Result<RouteProgress> {
     // The authenticated session peer must be the claimed current holder,
     // so endpoint substitutions fail closed (`NotTrusted`).
-    if self.current != *peer {
+    if self.hop.current != *peer {
       return Err(Error::not_trusted("route holder"));
     }
     if self.destination == *local {
@@ -734,15 +727,15 @@ impl RouteContext {
     }
     // Forwarding work is bounded by the caller-selected hop budget; an
     // exhausted budget ends the route explicitly instead of looping.
-    if self.remaining_hops == 0 {
+    if self.hop.remaining_hops == 0 {
       return Err(Error::resource_exhausted("route hops"));
     }
-    let path = if self.path.is_empty() {
+    let path = if self.hop.path.is_empty() {
       let planned = plan(&self)?;
-      validate_planned_path(&planned, self.remaining_hops)?;
+      validate_planned_path(&planned, self.hop.remaining_hops)?;
       planned
     } else {
-      std::mem::take(&mut self.path)
+      std::mem::take(&mut self.hop.path)
     };
     let mut hops = path.into_iter();
     let next_hop = hops
@@ -760,10 +753,10 @@ impl RouteContext {
   /// the remaining path loses its head, and the budget decreases once.
   /// Called only through [`Self::receive`]'s checked continuation.
   fn forward(mut self, local: &NodeId, remaining: Vec<NodeId>) -> Self {
-    let previous = std::mem::replace(&mut self.current, local.clone());
-    self.visited.push(previous);
-    self.path = remaining;
-    self.remaining_hops = self.remaining_hops.saturating_sub(1);
+    let previous = std::mem::replace(&mut self.hop.current, local.clone());
+    self.hop.visited.push(previous);
+    self.hop.path = remaining;
+    self.hop.remaining_hops = self.hop.remaining_hops.saturating_sub(1);
     self
   }
 }

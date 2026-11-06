@@ -453,7 +453,7 @@ async fn relay_open(
     destination: open.destination.clone(),
     protocol: open.protocol.clone(),
     metadata: open.metadata.clone(),
-    route: Some(context.hop_state()),
+    route: Some(context.hop.clone()),
   }) {
     Ok(body) => body,
     Err(_) => {
@@ -642,7 +642,7 @@ pub(crate) async fn on_downstream_failure(
       destination: retry.open.destination.clone(),
       protocol: retry.open.protocol.clone(),
       metadata: retry.open.metadata.clone(),
-      route: Some(retry.context.hop_state()),
+      route: Some(retry.context.hop.clone()),
     })
     .ok();
     let Some(body) = body else {
