@@ -11,9 +11,7 @@
 //!
 //! The lane↔namespace map is [`LaneId::namespaces`]: the incremental scan
 //! plan derives a dirty namespace's lane from it, and each lane's scan
-//! derives its namespaces from the same list. Every lane projection —
-//! the wire codes, the namespace map, the policy objects — derives from
-//! the lane registry ([`LANES`]).
+//! derives its namespaces from the same list.
 
 use std::{
   sync::Arc,
@@ -34,15 +32,15 @@ use crate::{
 /// One lane's canonical rows: `(key, content)` pairs in scan order.
 pub(crate) type LaneRows = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// The per-scan filter inputs every row-judging phase reads: the tombstone
-/// lane's collected-row watermark, the resources lane's swept-predicate
-/// host-clock sample, and the configured removal retention window. One
-/// value per scan keeps every row of a pass judged against one instant,
-/// and naming the fields keeps the lane implementations from having to
-/// agree on an argument order.
+/// The resources lane's swept-predicate basis: one host-clock instant per
+/// pass plus the configured removal-retention window — the sweep's own
+/// contract and the one basis on which a gone store key reads as
+/// reclaimed knowledge. One value per pass keeps every row the pass
+/// judges (the scan boundary, the receive filter, the prune, and the
+/// repair set) pinned to one instant, so the sweep's mirrors cannot
+/// disagree with the sweep.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ScanFilters {
-  pub(crate) checkpoint: Option<u64>,
+pub(crate) struct SweptBasis {
   pub(crate) swept_at: SystemTime,
   pub(crate) removal_retention: Duration,
 }
@@ -54,23 +52,19 @@ pub(crate) struct LaneOutcome {
   pub(crate) refused: LaneRows,
 }
 
-/// The lane-agnostic collaborators one apply or receive filter needs: the
-/// node's identity context (upgraded from the plane's weak handle), the
-/// entropy source, the event/revision/session/authorization handles the
-/// row application reports through, and the two inputs the resources lane
-/// judges reclaimed evidence against — one host-clock instant per call
-/// plus the configured removal retention window, the same pair the scan
-/// filters carry, so the prune and the receive filter read one predicate
-/// against one instant.
+/// The lane-agnostic collaborators one apply or receive filter needs:
+/// the node's identity context (upgraded from the plane's weak handle),
+/// the entropy source, and the event/revision handles the row
+/// application reports through. Per-lane inputs are deliberately not
+/// unioned in here: the session/authorization pair rides the apply hook
+/// as explicit parameters, the resources lane's swept basis rides
+/// [`SweptBasis`], and the tombstones lane self-serves its checkpoint
+/// watermark from its own scan snapshot.
 pub(crate) struct LaneContext<'a> {
   pub(crate) context: &'a Arc<LocalIdentityContext>,
   pub(crate) entropy: &'a Arc<dyn Entropy>,
   pub(crate) events: &'a Arc<EventHub>,
   pub(crate) revision: &'a MemberRevisionSignal,
-  pub(crate) sessions: &'a SessionTable,
-  pub(crate) authorization: &'a AuthorizationBoundary,
-  pub(crate) swept_at: SystemTime,
-  pub(crate) removal_retention: Duration,
 }
 
 /// One reconciliation lane's policy, implemented next to the module that
@@ -81,43 +75,56 @@ pub(crate) trait Lane: std::fmt::Debug + Send + Sync + 'static {
   fn id(&self) -> LaneId;
 
   /// The lane's canonical rows from one snapshot: every owned namespace
-  /// scanned in key order, the lane's decode gate applied, and the
-  /// lane's reclaimed evidence skipped at the scan boundary (so it never
-  /// primes a peer either).
-  fn scan<'a>(
-    &self, snapshot: &'a dyn StoreSnapshot, filters: &'a ScanFilters,
-  ) -> BoxFuture<'a, Result<LaneRows>>;
+  /// scanned in key order and the lane's decode gate applied. The lane's
+  /// per-scan inputs are its own: the tombstones lane self-serves its
+  /// collected-row watermark from the same snapshot (so the scan and its
+  /// filter judge one store instant), and the lane's reclaimed evidence
+  /// is skipped at the scan boundary — it never primes a peer either.
+  fn scan<'a>(&self, snapshot: &'a dyn StoreSnapshot) -> BoxFuture<'a, Result<LaneRows>>;
 
   /// Whether one engine row is reclaimed evidence the store will never
   /// hold again (a collected tombstone, a retention-swept removal): the
   /// prune and the derived-view repair both read it. `key_present` is
-  /// whether the store scan listed the row's key at all.
+  /// whether the store scan listed the row's key at all. The two bases a
+  /// reclaim predicate can judge against ride the call — the swept
+  /// basis and the cleanup-checkpoint watermark — and each lane reads
+  /// only its own ([`SweptBasis`] is no union of per-lane inputs; the
+  /// defaults ignore both).
   fn reclaimed(
-    &self, _key_present: bool, _key: &[u8], _content: &[u8], _filters: &ScanFilters,
+    &self, _key_present: bool, _key: &[u8], _content: &[u8], _basis: &SweptBasis,
+    _checkpoint: Option<u64>,
   ) -> bool {
     false
   }
 
-  /// Whether the lane's scan judges rows against the collected-tombstone
-  /// watermark: the plane reads it once per scan, and only when a planned
-  /// lane needs it.
+  /// Whether the lane's reclaim predicate judges rows against the
+  /// collected-tombstone watermark: the plane reads the watermark once
+  /// per pass for the prune and the repair set, and only when a planned
+  /// lane needs it (the scan side self-serves from its own snapshot).
   fn reads_checkpoint(&self) -> bool {
     false
   }
 
   /// The receive filter: drops the rows of one inbound message that must
   /// never enter an engine (reclaimed evidence a peer re-delivered).
+  /// `basis` is the pass's swept-predicate basis, one instant for every
+  /// row the filter judges.
   fn receive<'a>(
-    &self, _ctx: &'a LaneContext<'a>, _rows: &'a mut LaneRows,
+    &self, _ctx: &'a LaneContext<'a>, _basis: &'a SweptBasis, _rows: &'a mut LaneRows,
   ) -> BoxFuture<'a, Result<()>> {
     Box::pin(async { Ok(()) })
   }
 
   /// Applies one batch of rows through the lane's merge semantics and
-  /// returns the rows the lane refused (see [`LaneOutcome`]).
+  /// returns the rows the lane refused (see [`LaneOutcome`]). The
+  /// session table and the authorization boundary ride the hook as
+  /// explicit parameters: only the lanes whose trust decisions serialize
+  /// against them name them, so adding a lane input never widens this
+  /// seam for every other lane.
   fn apply<'a>(
     &self, ctx: &'a LaneContext<'a>, rows: &'a LaneRows, source: Option<&'a NodeId>,
-    runtime: Option<&'a RuntimeClient>,
+    runtime: Option<&'a RuntimeClient>, sessions: &'a SessionTable,
+    authorization: &'a AuthorizationBoundary,
   ) -> BoxFuture<'a, Result<LaneOutcome>>;
 
   /// The lane's audit event for a settled quiet pass (the peer's
@@ -241,11 +248,48 @@ pub(crate) async fn scan_namespaces(
   Ok(rows)
 }
 
+/// The shared apply prologue: decodes each row and refuses — as decided
+/// evidence the receive boundary keeps out of the engines — every row
+/// that cannot decode or whose key does not equal the record's own
+/// identity. Returns the decoded records with their row positions, plus
+/// the refused rows in their original wire shape. One undecodable or
+/// misattributed row skips with a diagnostic instead of failing the
+/// batch: a whole-batch error would wedge the derived-view repair on the
+/// same poison row forever (the scan side's corrupt-row policy, applied
+/// at the apply boundary).
+pub(crate) fn decode_identified<T>(
+  rows: &LaneRows, row_kind: &str, decode: impl Fn(&[u8]) -> Result<T>,
+  identity: impl Fn(&T) -> &[u8],
+) -> (Vec<(usize, T)>, LaneRows) {
+  let mut decoded: Vec<(usize, T)> = Vec::with_capacity(rows.len());
+  let mut refused = LaneRows::new();
+  for (index, (row_key, content)) in rows.iter().enumerate() {
+    match decode(content) {
+      Ok(record) if row_key.as_slice() == identity(&record) => {
+        decoded.push((index, record));
+      }
+      Ok(_) => {
+        tracing::debug!(row_kind = row_kind, "reconcile row skipped: key mismatch");
+        refused.push((row_key.clone(), content.clone()));
+      }
+      Err(error) => {
+        tracing::debug!(
+          row_kind = row_kind,
+          kind = ?error.kind(),
+          "reconcile row skipped: undecodable"
+        );
+        refused.push((row_key.clone(), content.clone()));
+      }
+    }
+  }
+  (decoded, refused)
+}
+
 #[cfg(test)]
 mod tests {
   use std::time::SystemTime;
 
-  use super::{LANES, LaneId, ScanFilters};
+  use super::{LANES, LaneId, SweptBasis};
 
   /// The lane registry rows align with the [`LaneId`] discriminants: the
   /// row order is the variant order — the total-indexing contract the
@@ -303,6 +347,10 @@ mod tests {
   fn each_lane_reports_its_owning_modules_reclaim_predicate() {
     let now = SystemTime::now();
     let retention = crate::resource::retention::RESOURCE_REMOVAL_RETENTION;
+    let basis = SweptBasis {
+      swept_at: now,
+      removal_retention: retention,
+    };
     let name = crate::ResourceName::parse("radiata.woooo.tech/resources/lane").unwrap();
     let expired = crate::resource::ResourceRecordV1::new(
       name,
@@ -317,27 +365,22 @@ mod tests {
     .unwrap()
     .encode()
     .unwrap();
-    let filters = ScanFilters {
-      checkpoint: None,
-      swept_at: now,
-      removal_retention: retention,
-    };
     assert_eq!(
       LaneId::Resources
         .policy()
-        .reclaimed(false, b"key", &expired, &filters),
+        .reclaimed(false, b"key", &expired, &basis, None),
       crate::resource::retention::reclaimed(false, &expired, now, retention)
     );
     assert!(
       LaneId::Resources
         .policy()
-        .reclaimed(false, b"key", &expired, &filters),
+        .reclaimed(false, b"key", &expired, &basis, None),
       "an expired removal with the key gone is reclaimed evidence"
     );
     assert!(
       !LaneId::Resources
         .policy()
-        .reclaimed(true, b"key", &expired, &filters)
+        .reclaimed(true, b"key", &expired, &basis, None)
     );
 
     // A collected leave row: the checkpoint watermark sits past the
@@ -346,27 +389,26 @@ mod tests {
     let mut key = vec![1_u8];
     key.extend_from_slice(b"node-000000000000000000007");
     let content = vec![0_u8];
-    let filters = ScanFilters {
-      checkpoint: Some(stamp),
-      swept_at: now,
-      removal_retention: retention,
-    };
     assert_eq!(
       LaneId::Tombstones
         .policy()
-        .reclaimed(false, &key, &content, &filters),
+        .reclaimed(false, &key, &content, &basis, Some(stamp)),
       crate::membership::tombstone::collected_row(Some(stamp), &key, &content)
     );
     // An undecodable row is never collected evidence.
     assert!(
       !LaneId::Tombstones
         .policy()
-        .reclaimed(false, &key, &content, &filters)
+        .reclaimed(false, &key, &content, &basis, Some(stamp))
     );
 
     // The append-only lanes never reclaim a row.
     for lane in [LaneId::Descriptors, LaneId::Trust] {
-      assert!(!lane.policy().reclaimed(false, b"key", &expired, &filters));
+      assert!(
+        !lane
+          .policy()
+          .reclaimed(false, b"key", &expired, &basis, None)
+      );
     }
   }
 

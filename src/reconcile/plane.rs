@@ -113,7 +113,7 @@ use minicbor::bytes::ByteVec;
 
 use super::{
   engine::{Drive, Engine},
-  lane::{LaneContext, LaneOutcome, LaneRows, ScanFilters},
+  lane::{LaneContext, LaneOutcome, LaneRows, SweptBasis},
   wire::{self, LaneId, Message},
 };
 use crate::{
@@ -567,11 +567,26 @@ impl ReconcilePlane {
     };
     let epoch = store.register_epoch();
     let plan = self.scan_plan(store, epoch, &peers)?;
-    let filters = self.scan_filter_inputs(store, &plan).await?;
+    // The per-pass reclaim bases: the resources lane's swept predicate
+    // reads one host-clock instant plus the configured retention window
+    // (the sweep's own contract), and the tombstones lane's
+    // collected-row predicate reads the cleanup checkpoint watermark —
+    // fetched once per pass, and only when a planned lane reads it (the
+    // same predicate the apply boundary fails open on). One read per
+    // pass keeps every row judged against one instant.
+    let basis = SweptBasis {
+      swept_at: std::time::SystemTime::now(),
+      removal_retention: self.shared.resource_removal_retention,
+    };
+    let checkpoint = if plan.iter().any(|lane| lane.policy().reads_checkpoint()) {
+      crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await?
+    } else {
+      None
+    };
     let rows: LaneScan = if plan.is_empty() {
       Vec::new()
     } else {
-      scan_lanes(store, &plan, filters).await?
+      scan_lanes(store, &plan).await?
     };
     let mut outbound: Outbound = Vec::new();
     let mut repair: LaneScan = Vec::new();
@@ -582,7 +597,8 @@ impl ReconcilePlane {
       // half-applied tick.
       let plane = &mut *guard;
       let listed = scan_view(&mut plane.install_epoch, &plan, epoch, &rows);
-      let (driven, prime_holds) = drive_peers(plane, &peers, &rows, &plan, &listed, filters);
+      let (driven, prime_holds) =
+        drive_peers(plane, &peers, &rows, &plan, &listed, &basis, checkpoint);
       outbound.extend(driven);
       // The prime's held root exchanges land now that the state
       // borrows are spent.
@@ -595,7 +611,8 @@ impl ReconcilePlane {
           &mut plane.repair_pending,
           &plan,
           &listed,
-          filters,
+          &basis,
+          checkpoint,
         );
       }
       outbound.extend(cadence_window(plane));
@@ -685,30 +702,6 @@ impl ReconcilePlane {
     }
   }
 
-  /// The per-scan filter inputs: the tombstone lane's collected-row
-  /// watermark, read once per scan (the same predicate the apply
-  /// boundary fails open on) and only when a planned lane reads it, and
-  /// the resources lane's swept-predicate basis — the host clock plus the
-  /// configured retention window, the sweep's own contract and the one
-  /// basis on which a gone store key reads as reclaimed knowledge. One
-  /// read per scan keeps every row of a pass judged against one instant.
-  async fn scan_filter_inputs(
-    &self, store: &crate::storage::MetadataStore, plan: &BTreeSet<LaneId>,
-  ) -> Result<ScanFilters> {
-    let checkpoint = if plan.iter().any(|lane| lane.policy().reads_checkpoint()) {
-      crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await?
-    } else {
-      None
-    };
-    let swept_at = std::time::SystemTime::now();
-    let removal_retention = self.shared.resource_removal_retention;
-    Ok(ScanFilters {
-      checkpoint,
-      swept_at,
-      removal_retention,
-    })
-  }
-
   /// The derived-view repair pass, run outside the peers lock because it
   /// touches the store: the rows the store scan did not list re-apply
   /// through the lane's merge semantics. Row-level refusals never reach
@@ -770,12 +763,15 @@ impl ReconcilePlane {
         entropy: &self.shared.entropy,
         events: &self.shared.events,
         revision: &self.shared.revision,
-        sessions: &self.shared.sessions,
-        authorization: &self.shared.authorization,
+      };
+      let basis = SweptBasis {
         swept_at: std::time::SystemTime::now(),
         removal_retention: self.shared.resource_removal_retention,
       };
-      lane.policy().receive(&lane_context, &mut rows).await?;
+      lane
+        .policy()
+        .receive(&lane_context, &basis, &mut rows)
+        .await?;
     }
     if !rows.is_empty() {
       // The store decides before any engine does: rows apply through
@@ -1001,14 +997,14 @@ fn scan_view(
 /// over the full set (the lanes still negotiating elsewhere come back as
 /// holds instead of driving), and every primed peer drives its local
 /// changes and prunes the engine rows the store scan superseded or
-/// collected. `filters` is the scan's filter input triple (the tombstone
-/// watermark, the swept predicate's clock and retention window), the same
-/// values the repair set judges against. Returns the outbound messages
-/// and the prime's held root exchanges, which the caller lands once this
-/// state borrow is spent.
+/// collected. `basis` and `checkpoint` are the pass's reclaim bases (the
+/// swept predicate's clock and retention window, the tombstone watermark),
+/// the same values the repair set judges against. Returns the outbound
+/// messages and the prime's held root exchanges, which the caller lands
+/// once this state borrow is spent.
 fn drive_peers(
   plane: &mut PlaneState, peers: &[NodeId], rows: &LaneScan, plan: &BTreeSet<LaneId>,
-  listed: &LaneListed, filters: ScanFilters,
+  listed: &LaneListed, basis: &SweptBasis, checkpoint: Option<u64>,
 ) -> (Outbound, Vec<(LaneId, NodeId)>) {
   let mut outbound: Outbound = Vec::new();
   let mut prime_holds: Vec<(LaneId, NodeId)> = Vec::new();
@@ -1100,9 +1096,10 @@ fn drive_peers(
         if identities.contains(&identity) {
           continue;
         }
-        let reclaimed = lane
-          .policy()
-          .reclaimed(keys.contains(key), key, content, &filters);
+        let reclaimed =
+          lane
+            .policy()
+            .reclaimed(keys.contains(key), key, content, basis, checkpoint);
         let key_present = keys.contains(key);
         if reclaimed || key_present {
           prune.push((key.to_vec(), content.to_vec()));
@@ -1128,12 +1125,12 @@ fn drive_peers(
 /// store holds under other content are not repair work — the first two
 /// would resurrect reclaimed evidence, the third is a decided loss.
 /// Lanes outside this pass's plan keep their marks: a narrow plan must
-/// not erase another lane's pending repair. `filters` is the scan's
-/// filter input triple, so the repair set judges every row against the
-/// same instant the prune did.
+/// not erase another lane's pending repair. `basis` and `checkpoint` are
+/// the pass's reclaim bases, so the repair set judges every row against
+/// the same instant the prune did.
 fn repair_index(
   peers: &BTreeMap<NodeId, PeerState>, repair_pending: &mut BTreeSet<LaneId>,
-  plan: &BTreeSet<LaneId>, listed: &LaneListed, filters: ScanFilters,
+  plan: &BTreeSet<LaneId>, listed: &LaneListed, basis: &SweptBasis, checkpoint: Option<u64>,
 ) -> LaneScan {
   let mut seen: BTreeMap<LaneId, BTreeSet<Vec<u8>>> = BTreeMap::new();
   let mut pending: RepairIndex = BTreeMap::new();
@@ -1153,7 +1150,10 @@ fn repair_index(
         // The lane's reclaimed evidence is not repair work — re-applying
         // a collected tombstone or a swept removal is the resurrection.
         let key_present = keys.contains(key);
-        if lane.policy().reclaimed(key_present, key, content, &filters) {
+        if lane
+          .policy()
+          .reclaimed(key_present, key, content, basis, checkpoint)
+        {
           continue;
         }
         if key_present {
@@ -1450,7 +1450,7 @@ fn lane_of_namespace(namespace: &crate::StoreNamespace) -> Option<LaneId> {
 /// (so collected evidence never enters the derived view and never primes a
 /// new peer either).
 async fn scan_lanes(
-  store: &crate::storage::MetadataStore, plan: &BTreeSet<LaneId>, filters: ScanFilters,
+  store: &crate::storage::MetadataStore, plan: &BTreeSet<LaneId>,
 ) -> Result<LaneScan> {
   let snapshot = store.snapshot().await?;
   let mut lanes = Vec::new();
@@ -1458,7 +1458,7 @@ async fn scan_lanes(
     if !plan.contains(&lane) {
       continue;
     }
-    lanes.push((lane, lane.policy().scan(snapshot.as_ref(), &filters).await?));
+    lanes.push((lane, lane.policy().scan(snapshot.as_ref()).await?));
   }
   Ok(lanes)
 }
@@ -1488,14 +1488,17 @@ async fn apply_rows(
     entropy: &shared.entropy,
     events: &shared.events,
     revision: &shared.revision,
-    sessions: &shared.sessions,
-    authorization: &shared.authorization,
-    swept_at: std::time::SystemTime::now(),
-    removal_retention: shared.resource_removal_retention,
   };
   lane
     .policy()
-    .apply(&lane_context, rows, source, runtime)
+    .apply(
+      &lane_context,
+      rows,
+      source,
+      runtime,
+      &shared.sessions,
+      &shared.authorization,
+    )
     .await
 }
 
@@ -1576,12 +1579,7 @@ mod tests {
   async fn the_trust_lane_scans_one_row_per_binding() {
     let context = context_with_bindings(&[101, 102]).await;
     let plan: BTreeSet<LaneId> = [LaneId::Trust].into_iter().collect();
-    let filters = super::ScanFilters {
-      checkpoint: None,
-      swept_at: std::time::SystemTime::now(),
-      removal_retention: crate::resource::retention::RESOURCE_REMOVAL_RETENTION,
-    };
-    let lanes = scan_lanes(context.store(), &plan, filters).await.unwrap();
+    let lanes = scan_lanes(context.store(), &plan).await.unwrap();
     let trust = lanes
       .iter()
       .find(|(lane, _)| matches!(lane, super::super::wire::LaneId::Trust))
