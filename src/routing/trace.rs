@@ -21,9 +21,9 @@
 //!   terminal machine), so the durable evidence converges with the in-memory
 //!   record under either writer ordering.
 //!
-//! Record accessors that only the unit tests and the compatibility
-//! golden-vector reader consume are `#[cfg(test)]`; the production
-//! surface stays exactly the record writer, decoder, and sweeps.
+//! Record accessors that only the unit tests consume are
+//! `#[cfg(test)]`; the production surface stays exactly the record
+//! writer, decoder, and sweeps.
 
 use std::time::{Duration, SystemTime};
 
@@ -223,8 +223,7 @@ impl TraceRecord {
     self
   }
 
-  /// Canonical wire encoding of the trace record; the compatibility
-  /// suite's golden-vector reader shares this exact encoder.
+  /// Canonical wire encoding of the trace record.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical_record(self)
   }

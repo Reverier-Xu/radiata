@@ -527,7 +527,7 @@ mod tests {
       let decoded = decode_end(&encode_end(&end).unwrap(), PACKET_CBOR_LIMITS).unwrap();
       assert_eq!(decoded, end);
       // The two terminal outcomes carry distinct wire bytes (pinned by
-      // the end-v1 / end-interrupted-v1 goldens in compatibility.rs).
+      // the end-frame golden vectors).
       assert_eq!(decoded.reason, reason);
     }
 

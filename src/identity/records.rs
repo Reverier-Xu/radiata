@@ -69,7 +69,7 @@ const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/identity-bi
 const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/credential-use";
 const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/merge-grant";
 const KEY_DELETION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deletion-intent";
-const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deleted";
+pub(crate) const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deleted";
 
 pub(crate) use crate::storage::families::{
   CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE,
@@ -1160,12 +1160,9 @@ impl MergeGrantV1 {
 
 // The hex literals below are the single source of the frozen identity
 // record vectors: the golden suite in this module pins constructors and
-// decoders to these bytes, and the `0.1.0` compatibility manifest
-// (`crate::compatibility`) references the same constants, so the two
-// suites cannot drift apart. They compile only under `cfg(test)`, like
-// the test-only compatibility manifest itself. The bytes are frozen;
-// changing one is a deliberate compatibility amendment, never a silent
-// edit.
+// decoders to these bytes. They compile only under `cfg(test)`. The
+// bytes are frozen; changing one is a deliberate compatibility
+// amendment, never a silent edit.
 
 #[cfg(test)]
 pub(crate) const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6c6f63616c2d6964656e7469747901781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
@@ -1177,9 +1174,6 @@ pub(crate) const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f
 pub(crate) const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f63726564656e7469616c2d75736501781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 #[cfg(test)]
 pub(crate) const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d657267652d6772616e740150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840ec05240b0a1a205f4e52e9ef3d4bf18aed07f901110c65f564b40f4672df7afd13e961eafd674ad47c86d93ef086daa568745b6adca6a8ee7b8c6af93428fe0a";
-#[cfg(test)]
-pub(crate) const KEY_DELETED_GOLDEN: &str = "847829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6b65792d64656c6574656401781b6b65796f702d6161616161616161616161616161616161616161615270726f76696465722d68616e646c652d3031";
-
 #[cfg(test)]
 mod tests {
   use std::{collections::VecDeque, sync::Mutex};

@@ -40,7 +40,7 @@ use crate::{
 };
 
 pub(crate) const BASE_RECORD_KIND: u8 = 1;
-const EDGE_RECORD_KIND: u8 = 2;
+pub(crate) const EDGE_RECORD_KIND: u8 = 2;
 
 pub(crate) fn schema_key() -> StoreKey {
   StoreKey::new(Arc::from(b"store".as_slice()))
