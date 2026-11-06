@@ -273,11 +273,8 @@ fn open_from_wire(wire: OpenWire) -> Result<OpenFrame> {
         visited.push(node.parse()?);
       }
       // A duplicate-free chain fails closed at the wire boundary.
-      let mut seen: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
-      for node in &visited {
-        if !seen.insert(node.clone()) {
-          return Err(Error::invalid_input("packet route chain"));
-        }
+      if !crate::routing::path_duplicate_free(&visited) {
+        return Err(Error::invalid_input("packet route chain"));
       }
       let mut path: Vec<NodeId> = Vec::with_capacity(route.path.len());
       for node in route.path {
@@ -286,11 +283,8 @@ fn open_from_wire(wire: OpenWire) -> Result<OpenFrame> {
       // The path is structurally one route: duplicate-free. It may stop
       // short of the destination — the holder of its last entry plans the
       // remainder — so its end is not pinned here.
-      let mut seen: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
-      for node in &path {
-        if !seen.insert(node.clone()) {
-          return Err(Error::invalid_input("packet route path"));
-        }
+      if !crate::routing::path_duplicate_free(&path) {
+        return Err(Error::invalid_input("packet route path"));
       }
       Some(HopState {
         current,

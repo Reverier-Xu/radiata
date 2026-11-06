@@ -773,23 +773,42 @@ impl RouteContext {
 /// before the budget, so a path of `remaining_hops + 1` entries (the
 /// relays plus the destination) is exactly what the walk can carry.
 pub(crate) fn validate_planned_path(path: &[NodeId], remaining_hops: u32) -> Result<()> {
+  validate_path_shape(path, path_entry_bound(remaining_hops), "route path")
+}
+
+/// The path-entry bound of one hop budget, shared by every path
+/// validator: the origin's dispatch consumes no budget and arrival is
+/// checked before it, so `max_hops` relays carry at most
+/// `max_hops + 1` entries.
+pub(crate) fn path_entry_bound(max_hops: u32) -> usize {
+  usize::try_from(max_hops)
+    .unwrap_or(usize::MAX)
+    .saturating_add(1)
+}
+
+/// Validates the shared route-path shape: non-empty, no longer than
+/// `max_entries` entries, and duplicate-free. Every named-path and
+/// planned-path admission goes through this one check so the shape rules
+/// cannot drift between boundaries.
+pub(crate) fn validate_path_shape(
+  path: &[NodeId], max_entries: usize, context: &'static str,
+) -> Result<()> {
   if path.is_empty() {
-    return Err(Error::invalid_input("route path"));
+    return Err(Error::invalid_input(context));
   }
-  if path.len()
-    > usize::try_from(remaining_hops)
-      .unwrap_or(usize::MAX)
-      .saturating_add(1)
-  {
-    return Err(Error::resource_exhausted("route hops"));
+  if path.len() > max_entries {
+    return Err(Error::resource_exhausted(context));
   }
-  let mut seen = BTreeSet::new();
-  for node in path {
-    if !seen.insert(node) {
-      return Err(Error::invalid_input("route path"));
-    }
+  if !path_duplicate_free(path) {
+    return Err(Error::invalid_input(context));
   }
   Ok(())
+}
+
+/// The duplicate-free test shared by every path and chain check,
+/// including the wire decode's structural checks.
+pub(crate) fn path_duplicate_free(path: &[NodeId]) -> bool {
+  path.iter().collect::<BTreeSet<_>>().len() == path.len()
 }
 
 /// Validates one decoded open frame's routing envelope at the local
