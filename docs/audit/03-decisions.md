@@ -188,3 +188,12 @@ Confirmed by the project owner in a structured interview following the round-5 a
 | Poisoned-mapper ×8 consolidation | **NO-FIX (revised from the P3 package)** — the eight mappers are used as function references at 54 call sites; inlining closures would copy the same context literal 54 times, a stringly regression under the crate's own single-sourcing discipline. The one-named-site-per-table rule stands. |
 | `audit.rs` journal-purpose enum | **NO-FIX** — the purpose is durable record data decoded from the pending journal, not a compile-time classification; its audit spelling is already pinned by the pending-record schema. An enum would add a parse layer to a diagnostics-only path. |
 | Public page types ×7 consolidation | **DEFERRED** — converting the seven `{items, next}` page structs to `Page<T>` aliases is pure ABI churn (every struct rendering changes) for a P3 cosmetic gain; revisit only if a further page type is added. |
+
+## Final state (0.1.0 decision cycle complete)
+
+All DECIDED and Round-5 items above are implemented and merged on `audit-followups`
+through the five-wave worktree program (feed, strip, task-surface, reconcile,
+routing, transport, registry-events, identity-time, structural, local-delivery)
+plus the parent-executed P3 package and ABI regeneration. Gates at closure:
+taplo PASS, nightly fmt PASS, clippy `-D warnings` PASS, cargo doc 0 warnings,
+cargo test 1122 passed / 0 failed, ABI freeze regenerated and PASS.
