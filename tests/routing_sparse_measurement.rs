@@ -336,7 +336,7 @@ struct MeasuringPolicy {
 }
 
 impl RouteNextHop for MeasuringPolicy {
-  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
+  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
     Box::pin(async move {
       let trace = view.trace().clone();
       let local = view.local().clone();
@@ -362,7 +362,7 @@ impl RouteNextHop for MeasuringPolicy {
         Lane::Default | Lane::Reply => None,
       };
       let outcome = match oracle_pick {
-        Some(next) => Ok(vec![next]),
+        Some(next) => Ok(Some(vec![next])),
         None => DefaultNextHop::default().plan(view).await,
       };
       self.shared.record_decision(
@@ -370,7 +370,10 @@ impl RouteNextHop for MeasuringPolicy {
         &trace,
         Decision {
           local,
-          chosen: outcome.as_ref().ok().and_then(|path| path.first().cloned()),
+          chosen: outcome
+            .as_ref()
+            .ok()
+            .and_then(|path| path.as_ref().and_then(|path| path.first().cloned())),
         },
       );
       outcome

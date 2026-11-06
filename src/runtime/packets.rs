@@ -203,13 +203,7 @@ impl PacketAdmission {
           }));
         }
         None => match self
-          .select_route(
-            &trace_id,
-            &destination,
-            &request.routing_policy,
-            stream_policy,
-            request.max_hops,
-          )
+          .select_route(&trace_id, &destination, stream_policy, request.max_hops)
           .await
         {
           Ok(Some(path)) => path,
@@ -324,52 +318,52 @@ impl PacketAdmission {
   }
 
   /// Resolves one route plan for a routed first hop. The stream's own
-  /// routing policy plans it; the built-in direct policy never relays, so
-  /// a stream under it keeps the node-level route policy's behavior (the
-  /// caller selection, or the built-in default policy). The returned path
-  /// is validated at this boundary: non-empty, duplicate-free, inside the
-  /// hop budget, ending at the destination, and starting at a live peer.
-  /// `Ok(None)` means no eligible plan exists and the caller fails the
-  /// route explicitly.
+  /// routing policy plans it; a policy that defers (`Ok(None)` — the
+  /// built-in direct policy's whole behavior) hands the plan back to the
+  /// node-level route policy. The returned path is validated at this
+  /// boundary: non-empty, duplicate-free, inside the hop budget, ending
+  /// at the destination, and starting at a live peer. `Ok(None)` means no
+  /// eligible plan exists and the caller fails the route explicitly.
   async fn select_route(
-    &self, trace: &TraceId, destination: &NodeId, routing_policy: &crate::RoutingPolicy,
-    stream_policy: Arc<dyn crate::RouteNextHop>, max_hops: u32,
+    &self, trace: &TraceId, destination: &NodeId, stream_policy: Arc<dyn crate::RouteNextHop>,
+    max_hops: u32,
   ) -> Result<Option<Vec<NodeId>>> {
     let local = self.local.clone();
     let peers = crate::sync_common::alive_peers(&self.sessions)?;
-    let path = if routing_policy.tag() == crate::RoutingPolicy::DIRECT.tag() {
-      let tag = self.config.route_policy()?;
-      match crate::routing::resolve_plan(
-        self.extensions.routing(),
-        &tag,
-        trace,
-        destination,
-        &local,
-        &peers,
-        max_hops,
-      )
-      .await
-      {
-        Ok(Some(path)) => path,
-        Ok(None) => {
-          tracing::warn!(tag = %tag, "configured route policy is not registered");
-          return Ok(None);
+    let path = match crate::routing::plan_of(
+      stream_policy.as_ref(),
+      trace,
+      destination,
+      &local,
+      &peers,
+      max_hops,
+    )
+    .await?
+    {
+      Some(path) => path,
+      // The stream's policy deferred: the node-level route policy keeps
+      // planning (the direct policy's lane — no tag is special-cased).
+      None => {
+        let tag = self.config.route_policy()?;
+        match crate::routing::resolve_plan(
+          self.extensions.routing(),
+          &tag,
+          trace,
+          destination,
+          &local,
+          &peers,
+          max_hops,
+        )
+        .await
+        {
+          Ok(Some(path)) => path,
+          Ok(None) => {
+            tracing::warn!(tag = %tag, "configured route policy is not registered");
+            return Ok(None);
+          }
+          Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
       }
-    } else {
-      // A registered stream policy is authoritative for its stream: its
-      // rejection fails the route instead of falling back to the
-      // node-level policy.
-      crate::routing::plan_of(
-        stream_policy.as_ref(),
-        trace,
-        destination,
-        &local,
-        &peers,
-        max_hops,
-      )
-      .await?
     };
     crate::routing::validate_planned_path(&path, max_hops)?;
     if !path.first().is_some_and(|first| peers.contains(first)) {

@@ -633,15 +633,6 @@ mod tests {
     let refused = registry.register_feature(builtin).unwrap_err();
     assert_eq!(refused.kind(), ErrorKind::InvalidInput);
     assert_eq!(refused.context(), "feature definition reserved namespace");
-
-    // Idempotent: a second default pass keeps exactly the official set.
-    registry.register_default().unwrap();
-    assert_eq!(
-      registry.feature_definitions().len(),
-      crate::protocol::feature::builtin_definitions()
-        .unwrap()
-        .len()
-    );
   }
 
   #[test]
@@ -913,5 +904,23 @@ mod tests {
       format!("{registry:?}").contains("routing_policies: 2"),
       "the debug summary counts the default and caller policies"
     );
+  }
+
+  /// The default next-hop policy is an ordinary registry entry the
+  /// default path installs through insertion-once: a fresh registry
+  /// resolves it after the default pass, and a second default pass
+  /// conflicts instead of overriding or silently keeping a claim.
+  #[test]
+  fn register_default_installs_the_default_next_hop_through_insertion_once() {
+    let mut registry = ExtensionRegistry::new();
+    let tag = crate::routing::DefaultNextHop::tag().unwrap();
+    assert!(
+      registry.next_hop_policy(&tag).is_none(),
+      "a fresh registry holds no hidden default next-hop policy"
+    );
+    registry.register_default().unwrap();
+    assert!(registry.next_hop_policy(&tag).is_some());
+    let second_pass = registry.register_default().unwrap_err();
+    assert_eq!(second_pass.kind(), ErrorKind::Conflict);
   }
 }

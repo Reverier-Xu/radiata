@@ -429,12 +429,14 @@
 //! struct LowestPeerFirst;
 //!
 //! impl RouteNextHop for LowestPeerFirst {
-//!     fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
+//!     fn plan<'a>(
+//!         &'a self, view: NextHopView<'a>,
+//!     ) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
 //!         Box::pin(async move {
 //!             view.peers()
 //!                 .first()
 //!                 .cloned()
-//!                 .map(|peer| vec![peer])
+//!                 .map(|peer| Some(vec![peer]))
 //!                 .ok_or_else(|| radiata::Error::caller("no live peer as next hop"))
 //!         })
 //!     }
@@ -466,10 +468,12 @@
 //! [`RoutingPolicy`](crate::RoutingPolicy) tag, and admission resolves it
 //! in the same registry before the node-level policy plans the route. The
 //! built-in [`RoutingPolicy::DIRECT`](crate::RoutingPolicy::DIRECT)
-//! carries no relay policy of its own, so such a stream keeps the
-//! node-level behavior; any other registered policy plans the route for
-//! its stream and is authoritative for it (its rejection fails the route
-//! instead of falling back).
+//! is the built-in defer lane: its implementation returns the trait's
+//! explicit defer signal, so such a stream keeps the node-level behavior;
+//! any other registered policy plans the route for its stream and is
+//! authoritative for it (its rejection fails the route instead of falling
+//! back). A caller policy may defer the same way to hand a stream back to
+//! the node-level policy.
 //!
 //! ```no_run
 //! # use radiata::{ExtensionRegistry, QualifiedTag, RouteNextHop, RoutingPolicy, StreamPolicy};

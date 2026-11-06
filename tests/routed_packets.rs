@@ -43,7 +43,9 @@ impl RouteNextHop for SharedPolicy {
   fn plan<'a>(
     &'a self, view: radiata::NextHopView<'a>,
   ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = radiata::Result<Vec<radiata::NodeId>>> + Send + 'a>,
+    Box<
+      dyn std::future::Future<Output = radiata::Result<Option<Vec<radiata::NodeId>>>> + Send + 'a,
+    >,
   > {
     Box::pin(async move {
       // The topology is per-node: which neighbour leads toward the
@@ -66,7 +68,7 @@ impl RouteNextHop for SharedPolicy {
           return Err(radiata::Error::caller("linear policy budget"));
         }
       }
-      Ok(path)
+      Ok(Some(path))
     })
   }
 }

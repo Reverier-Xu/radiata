@@ -2057,7 +2057,7 @@ mod admission_loop_tests {
   }
 
   impl RouteNextHop for PendingNextHop {
-    fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Vec<NodeId>>> {
+    fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
       self.calls.fetch_add(1, Ordering::Relaxed);
       Box::pin(std::future::pending())
     }
