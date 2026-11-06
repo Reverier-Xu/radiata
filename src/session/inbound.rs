@@ -33,7 +33,6 @@ use crate::{
     forward::{self, PendingAck, SessionIdentity},
     outbound::record_route_terminal,
     table::{record_terminal_failure, update_route},
-    trace::TraceTransition,
   },
   session::pending::PendingAdmissions,
   transport::connection::ConnectionReader,
@@ -722,7 +721,7 @@ pub(crate) async fn run_local(context: Arc<SessionPacketContext>, request: Outbo
       &trace_id,
       &local,
       &local,
-      TraceTransition::Failed(kind),
+      RouteState::Failed(kind),
     );
     return;
   }
@@ -749,7 +748,7 @@ pub(crate) async fn run_local(context: Arc<SessionPacketContext>, request: Outbo
       &trace_id,
       &local,
       &local,
-      TraceTransition::Failed(ErrorKind::Internal),
+      RouteState::Failed(ErrorKind::Internal),
     );
     return;
   };
@@ -794,11 +793,11 @@ pub(crate) async fn run_local(context: Arc<SessionPacketContext>, request: Outbo
       // The consumer observes exactly one typed interruption, and the
       // origin's terminal answer is the body's own failure.
       let _ = admitted.stream.try_send(StreamItem::Interrupted);
-      TraceTransition::Failed(kind)
+      RouteState::Failed(kind)
     }
     None => {
       let _ = admitted.stream.try_send(StreamItem::End);
-      TraceTransition::Delivered
+      RouteState::Delivered
     }
   };
   record_route_terminal(
@@ -1987,7 +1986,7 @@ mod durable_mirror_tests {
     },
     routing::{
       forward::SessionIdentity,
-      trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
+      trace::{TraceRecord, TraceSink},
     },
     session::{
       pending::PendingAdmissions,
@@ -2170,7 +2169,7 @@ mod durable_mirror_tests {
     sink
       .record(
         TraceRecord::new(trace_id.clone(), node(1), node(9), sink.clock_now())
-          .with_transition(TraceTransition::Delivered, sink.clock_now()),
+          .with_transition(RouteState::Delivered, sink.clock_now()),
       )
       .await;
 
@@ -2190,7 +2189,7 @@ mod durable_mirror_tests {
     assert_eq!(records[0].destination(), &node(9));
     assert_eq!(
       records[0].phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
   }
 
@@ -2224,7 +2223,7 @@ mod durable_mirror_tests {
     assert_eq!(records[0].destination(), &node(9));
     assert_eq!(
       records[0].phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
   }
 

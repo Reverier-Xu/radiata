@@ -454,11 +454,12 @@ mod tests {
     ResourceUri, StoreValue, StreamMetadata, TraceId,
     hex::decode as hex_decode,
     membership::page::decode_descriptor,
+    packet::RouteState,
     protocol::{CONTROL_CBOR_LIMITS, wire::PacketKind},
     resource::ResourceRecordV1,
     routing::{
       HopState,
-      trace::{TracePhase, TraceRecord, TraceTransition, decode_trace_record},
+      trace::{TraceRecord, decode_trace_record},
     },
   };
 
@@ -844,7 +845,7 @@ mod tests {
       .unwrap();
     assert_eq!(routing, bytes("record-routing-v1"));
     let delivered = TraceRecord::new(trace(), node(1), node(3), updated_at)
-      .with_transition(TraceTransition::Delivered, crate::time::from_millis(5_000))
+      .with_transition(RouteState::Delivered, crate::time::from_millis(5_000))
       .encode()
       .unwrap();
     assert_eq!(delivered, bytes("record-delivered-v1"));
@@ -896,11 +897,11 @@ mod tests {
   #[test]
   fn trace_vectors_decode_to_exact_phases() {
     let routing = decode_trace_record(&bytes("record-routing-v1")).unwrap();
-    assert_eq!(routing.phase(), &TracePhase::Routing);
+    assert_eq!(routing.phase(), &RouteState::Routing);
     assert_eq!(routing.source(), &node(1));
     assert_eq!(routing.destination(), &node(3));
     let delivered = decode_trace_record(&bytes("record-delivered-v1")).unwrap();
-    assert_eq!(delivered.phase(), &TracePhase::Delivered);
+    assert_eq!(delivered.phase(), &RouteState::Delivered);
   }
 
   /// The migration base record of the declared chain target carries no
