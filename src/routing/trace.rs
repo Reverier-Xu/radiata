@@ -42,8 +42,58 @@ pub(crate) use crate::storage::families::TRACE_NAMESPACE;
 /// sweep's work per commit.
 const MAX_BATCH_OPERATIONS: usize = 64;
 
-/// The sentinel failure code for non-failed phases (never a valid kind).
-const NO_FAILURE: u8 = 0;
+/// The one failure-code table for [`ErrorKind`], in declaration order:
+/// the code is the index, so the renumbering stays contiguous and both
+/// directions derive from the same rows. Codes are internal to this
+/// record schema and the table covers every kind; a kind missing from
+/// the table fails the encode closed instead of shipping an unstorage
+/// record, and an unknown stored byte fails the decode closed.
+const FAILURE_KINDS: [ErrorKind; 24] = [
+  ErrorKind::InvalidInput,
+  ErrorKind::Conflict,
+  ErrorKind::NotFound,
+  ErrorKind::NotReady,
+  ErrorKind::NotTrusted,
+  ErrorKind::Revoked,
+  ErrorKind::Unsupported,
+  ErrorKind::UnsupportedSchema,
+  ErrorKind::UnsupportedCapability,
+  ErrorKind::AuthenticationFailed,
+  ErrorKind::RouteUnavailable,
+  ErrorKind::StreamInterrupted,
+  ErrorKind::Overloaded,
+  ErrorKind::FrameTooLarge,
+  ErrorKind::ResourceExhausted,
+  ErrorKind::StorageLocked,
+  ErrorKind::StorageCorrupt,
+  ErrorKind::PermissionDenied,
+  ErrorKind::Io,
+  ErrorKind::CommitUnknown,
+  ErrorKind::Cancelled,
+  ErrorKind::ShuttingDown,
+  ErrorKind::CallerError,
+  ErrorKind::Internal,
+];
+
+/// The failure code of one [`ErrorKind`]: its index in the single table.
+/// `None` means the kind has not joined the table yet — an internal
+/// invariant break the caller reports instead of encoding a wrong byte.
+fn kind_code(kind: ErrorKind) -> Option<u8> {
+  FAILURE_KINDS
+    .iter()
+    .position(|candidate| *candidate == kind)
+    .map(|index| index as u8)
+}
+
+/// The kind behind one stored failure byte: a byte outside the table is
+/// schema corruption and fails closed instead of masquerading as
+/// `Internal`.
+fn kind_from_code(code: u8) -> Result<ErrorKind> {
+  match FAILURE_KINDS.get(usize::from(code)) {
+    Some(kind) => Ok(*kind),
+    None => Err(Error::invalid_input("route trace failure code")),
+  }
+}
 
 /// One observed trace phase. Terminal phases are `Delivered` and `Failed`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,9 +124,7 @@ impl TracePhase {
       (Self::ROUTING, None) => Ok(Self::Routing),
       (Self::STREAMING, None) => Ok(Self::Streaming),
       (Self::DELIVERED, None) => Ok(Self::Delivered),
-      (Self::FAILED, Some(failure)) if failure != NO_FAILURE => {
-        Ok(Self::Failed(kind_from_code(failure)?))
-      }
+      (Self::FAILED, Some(failure)) => Ok(Self::Failed(kind_from_code(failure)?)),
       _ => Err(Error::invalid_input("route trace phase")),
     }
   }
@@ -84,72 +132,6 @@ impl TracePhase {
   fn is_terminal(&self) -> bool {
     matches!(self, Self::Delivered | Self::Failed(_))
   }
-}
-
-/// The closed wire-code mapping for [`ErrorKind`] failures. Codes are
-/// internal to this record schema; the mapping covers every kind, so the
-/// code is total and unknown codes only exist on the decode side.
-const fn kind_code(kind: ErrorKind) -> u8 {
-  match kind {
-    ErrorKind::InvalidInput => 1,
-    ErrorKind::Conflict => 2,
-    ErrorKind::NotFound => 3,
-    ErrorKind::NotReady => 4,
-    ErrorKind::NotTrusted => 5,
-    ErrorKind::Revoked => 6,
-    ErrorKind::Unsupported => 7,
-    ErrorKind::UnsupportedSchema => 8,
-    ErrorKind::UnsupportedCapability => 9,
-    ErrorKind::AuthenticationFailed => 10,
-    ErrorKind::RouteUnavailable => 11,
-    ErrorKind::StreamInterrupted => 12,
-    ErrorKind::Overloaded => 13,
-    ErrorKind::FrameTooLarge => 24,
-    ErrorKind::ResourceExhausted => 14,
-    ErrorKind::StorageLocked => 15,
-    ErrorKind::StorageCorrupt => 16,
-    ErrorKind::PermissionDenied => 17,
-    ErrorKind::Io => 18,
-    ErrorKind::CommitUnknown => 19,
-    ErrorKind::Cancelled => 20,
-    ErrorKind::ShuttingDown => 21,
-    ErrorKind::CallerError => 23,
-    ErrorKind::Internal => 22,
-  }
-}
-
-/// The inverse of [`kind_code`]: a stored failure byte outside the known
-/// set is schema corruption and fails closed instead of masquerading as
-/// `Internal`.
-const fn kind_from_code(code: u8) -> Result<ErrorKind> {
-  let kind = match code {
-    1 => ErrorKind::InvalidInput,
-    2 => ErrorKind::Conflict,
-    3 => ErrorKind::NotFound,
-    4 => ErrorKind::NotReady,
-    5 => ErrorKind::NotTrusted,
-    6 => ErrorKind::Revoked,
-    7 => ErrorKind::Unsupported,
-    8 => ErrorKind::UnsupportedSchema,
-    9 => ErrorKind::UnsupportedCapability,
-    10 => ErrorKind::AuthenticationFailed,
-    11 => ErrorKind::RouteUnavailable,
-    12 => ErrorKind::StreamInterrupted,
-    13 => ErrorKind::Overloaded,
-    24 => ErrorKind::FrameTooLarge,
-    14 => ErrorKind::ResourceExhausted,
-    15 => ErrorKind::StorageLocked,
-    16 => ErrorKind::StorageCorrupt,
-    17 => ErrorKind::PermissionDenied,
-    18 => ErrorKind::Io,
-    19 => ErrorKind::CommitUnknown,
-    20 => ErrorKind::Cancelled,
-    21 => ErrorKind::ShuttingDown,
-    23 => ErrorKind::CallerError,
-    22 => ErrorKind::Internal,
-    _ => return Err(Error::invalid_input("route trace failure code")),
-  };
-  Ok(kind)
 }
 
 /// One durable route-trace record: bounded metadata only, never payload
@@ -266,8 +248,11 @@ struct TraceWire {
 
 fn encode_canonical_record(record: &TraceRecord) -> Result<Vec<u8>> {
   let (phase_code, failure) = match &record.phase {
-    TracePhase::Failed(kind) => (TracePhase::FAILED, kind_code(*kind)),
-    phase => (phase.code(), NO_FAILURE),
+    TracePhase::Failed(kind) => {
+      let code = kind_code(*kind).ok_or_else(|| Error::internal("route trace failure kind"))?;
+      (TracePhase::FAILED, Some(code))
+    }
+    phase => (phase.code(), None),
   };
   crate::protocol::encode_canonical(
     &TraceWire {
@@ -278,11 +263,7 @@ fn encode_canonical_record(record: &TraceRecord) -> Result<Vec<u8>> {
       destination: record.destination.to_string(),
       attempts: record.attempts,
       phase: phase_code,
-      failure: if failure == NO_FAILURE {
-        None
-      } else {
-        Some(failure)
-      },
+      failure,
       updated_at_millis: crate::time::to_millis(record.updated_at),
     },
     crate::protocol::CONTROL_CBOR_LIMITS,
@@ -614,8 +595,8 @@ mod tests {
 
   // ---- Trace metadata without body bytes ----
 
-  /// Every `ErrorKind` survives the closed failure-code mapping, and an
-  /// unknown stored byte fails closed instead of decoding as a valid kind.
+  /// Every `ErrorKind` survives the single contiguous failure-code table, and
+  /// an unknown stored byte fails closed instead of decoding as a valid kind.
   #[test]
   fn failure_codes_round_trip_and_reject_unknown() {
     let kinds = [
@@ -644,11 +625,17 @@ mod tests {
       ErrorKind::CallerError,
       ErrorKind::Internal,
     ];
-    for kind in kinds {
-      let code = super::kind_code(kind);
-      assert_eq!(super::kind_from_code(code).unwrap(), kind);
+    // Contiguous renumbering by declaration order: the code is the
+    // index in the single table, from zero with no gaps.
+    for (index, kind) in kinds.iter().enumerate() {
+      let code = super::kind_code(*kind).unwrap();
+      assert_eq!(usize::from(code), index, "{kind:?} drifted off its index");
+      assert_eq!(super::kind_from_code(code).unwrap(), *kind);
     }
-    for code in [0_u8, 25, u8::MAX] {
+    // The table is total over ErrorKind: every kind encodes.
+    assert_eq!(super::FAILURE_KINDS.len(), kinds.len());
+    // A stored byte outside the table fails closed.
+    for code in [kinds.len() as u8, u8::MAX] {
       assert!(super::kind_from_code(code).is_err());
     }
   }
