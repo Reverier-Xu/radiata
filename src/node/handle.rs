@@ -367,7 +367,7 @@ impl NodeHandle {
   /// Admission-time failures are the pure shape checks only (a stopped
   /// node); the frozen-store refusal and the member-connectivity
   /// precondition are effect-time and surface on the task's `wait`.
-  pub async fn issue_cleanup_checkpoint(&self) -> Result<Task<u64>> {
+  pub async fn issue_cleanup_checkpoint(&self) -> Result<Task<i64>> {
     crate::runtime::issue_cleanup_checkpoint(self.runtime.admit()?).await
   }
 

@@ -511,7 +511,7 @@ pub(crate) async fn cleanup(tasks: &TaskClient, subject: NodeId) -> Result<Task<
 /// node); the frozen-store refusal and the member-connectivity
 /// precondition are effect-time and surface on the task's [`Task::wait`]
 /// (the precondition as [`crate::ErrorKind::NotReady`]).
-pub(crate) async fn issue_cleanup_checkpoint(tasks: &TaskClient) -> Result<Task<u64>> {
+pub(crate) async fn issue_cleanup_checkpoint(tasks: &TaskClient) -> Result<Task<i64>> {
   let effect: TaskEffect = Arc::new(|deps, _attempt| {
     Box::pin(async move { reconcile_issue_cleanup_checkpoint(deps).await })
   });

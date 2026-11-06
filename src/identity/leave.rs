@@ -130,13 +130,13 @@ canonical_record! {
     fields {
       #[n(2)] node = node: String => node()
       #[n(3)] public_key = public_key: ByteVec => key32("leave record key")
-      #[n(4)] timestamp_millis = timestamp_millis: u64 => stamp()
+      #[n(4)] timestamp_millis = timestamp_millis: i64 => stamp()
       #[n(5)] signature = signature: ByteVec => sig("leave record signature")
     }
     signed_body wire LeaveRecordBodyWire fn encode_signed_body {
       #[n(2)] node: &NodeId as node: String => node()
       #[n(3)] public_key: &PublicKey as public_key: ByteVec => key32()
-      #[n(4)] timestamp_millis: u64 as timestamp_millis: u64 => stamp()
+      #[n(4)] timestamp_millis: i64 as timestamp_millis: i64 => stamp()
     }
   }
 }
@@ -154,13 +154,13 @@ canonical_record! {
 pub(crate) struct LeaveRecordV1 {
   node: NodeId,
   public_key: PublicKey,
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   signature: crate::Signature,
 }
 
 impl LeaveRecordV1 {
   pub(crate) const fn new(
-    node: NodeId, public_key: PublicKey, timestamp_millis: u64, signature: crate::Signature,
+    node: NodeId, public_key: PublicKey, timestamp_millis: i64, signature: crate::Signature,
   ) -> Self {
     Self {
       node,
@@ -178,7 +178,7 @@ impl LeaveRecordV1 {
     &self.public_key
   }
 
-  pub(crate) const fn timestamp_millis(&self) -> u64 {
+  pub(crate) const fn timestamp_millis(&self) -> i64 {
     self.timestamp_millis
   }
 
@@ -310,7 +310,7 @@ pub(crate) fn is_intent_key(key: &[u8]) -> bool {
 /// watermark-eligible records, so a fresh head never hides the
 /// collectible tail behind it.
 pub(crate) async fn collect_before_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
+  store: &MetadataStore, entropy: &dyn Entropy, watermark: i64,
 ) -> Result<usize> {
   let namespace = leave_namespace()?;
   let collectible = records::scan_collectible_records(
@@ -948,7 +948,7 @@ mod tests {
   /// against watermarks.
   async fn stamped_leave_record(
     context: &lifecycle::LocalIdentityContext, keys: &Arc<ScriptedKeys>, subject: &crate::NodeId,
-    stamp: u64,
+    stamp: i64,
   ) -> LeaveRecordV1 {
     let identity = context.identity();
     let body = LeaveRecordV1::encode_signed_body(subject, identity.public_key(), stamp).unwrap();

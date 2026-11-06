@@ -2,14 +2,28 @@
 //!
 //! One home for the injectable [`WallClock`] source and the UNIX-epoch
 //! second/millisecond conversions that every subsystem needs, so the
-//! clock seam and saturation handling cannot drift between modules. The
-//! `to_*`/`from_*` functions are pure conversions over a [`SystemTime`]
-//! value. The `now_seconds`/`now_millis` functions are the
+//! clock seam and the conversion semantics cannot drift between
+//! modules. The `to_*`/`from_*` functions are pure conversions over a
+//! [`SystemTime`] value. The `now_seconds`/`now_millis` functions are the
 //! protocol-visible liveness readings taken directly from the host clock
 //! (`SystemTime::now`) — deliberately not pure, because production code
 //! calls them exactly where the host wall clock is the required
 //! authority (injected boundaries instead take a
 //! [`WallClock`], which wraps these conversions for tests).
+//!
+//! The two scales have different conversion contracts:
+//!
+//! - Milliseconds are the stored-and-ordered wall-time scale (resource stamps,
+//!   identity stamps, trace records). `to_millis` is signed and lossless down
+//!   to the millisecond: a pre-epoch reading reports a negative value instead
+//!   of collapsing onto the epoch, so timestamp-tuple ordering survives a
+//!   wall-clock rollback below the epoch. Sub-millisecond remainders truncate
+//!   toward negative infinity, so `from_millis(to_millis(t))` never lands after
+//!   `t`.
+//! - Seconds feed liveness and deadline arithmetic only (session idle-timeout,
+//!   recovery scheduling) and are never stored as absolute instants;
+//!   `to_seconds` saturates at the epoch, which only makes a pre-epoch reading
+//!   look maximally overdue.
 
 use std::{
   fmt,
@@ -50,23 +64,35 @@ pub(crate) fn now_seconds() -> u64 {
   to_seconds(SystemTime::now())
 }
 
-/// UNIX milliseconds of `time`, saturating at the epoch.
-pub(crate) fn to_millis(time: SystemTime) -> u64 {
-  time
-    .duration_since(UNIX_EPOCH)
-    .map(|duration| duration.as_millis() as u64)
-    .unwrap_or(0)
+/// UNIX milliseconds of `time`, signed and floor-truncated: a pre-epoch
+/// reading reports a negative value instead of collapsing onto the epoch,
+/// so timestamp-tuple ordering and stored stamps survive a wall-clock
+/// rollback below the epoch. Readings beyond the `i64` millisecond range
+/// (roughly ±292 million years) saturate at the nearest boundary.
+pub(crate) fn to_millis(time: SystemTime) -> i64 {
+  match time.duration_since(UNIX_EPOCH) {
+    Ok(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
+    Err(before) => {
+      let millis = before.duration().as_nanos().div_ceil(1_000_000);
+      i64::try_from(millis).map_or(i64::MIN, |millis| -millis)
+    }
+  }
 }
 
 /// Current host wall-clock milliseconds; resource writes stamp their
 /// signed tuple with this host reading.
-pub(crate) fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> i64 {
   to_millis(SystemTime::now())
 }
 
-/// Rebuilds a [`SystemTime`] from stored UNIX milliseconds.
-pub(crate) fn from_millis(millis: u64) -> SystemTime {
-  UNIX_EPOCH + std::time::Duration::from_millis(millis)
+/// Rebuilds a [`SystemTime`] from stored UNIX milliseconds (signed; a
+/// negative value is a pre-epoch instant).
+pub(crate) fn from_millis(millis: i64) -> SystemTime {
+  if millis >= 0 {
+    UNIX_EPOCH + std::time::Duration::from_millis(millis as u64)
+  } else {
+    UNIX_EPOCH - std::time::Duration::from_millis(millis.unsigned_abs())
+  }
 }
 
 /// Rebuilds a [`SystemTime`] from stored UNIX seconds.
@@ -80,29 +106,69 @@ mod tests {
 
   use super::{from_millis, to_millis, to_seconds};
 
-  // Host `SystemTime` is the only ordering authority and conversions are
-  // total — a wall-clock rollback below the epoch saturates at zero
-  // instead of failing bounded work.
+  // Host `SystemTime` is the only ordering authority. Milliseconds are
+  // the stored-and-ordered scale: the conversion is signed, so a
+  // wall-clock rollback below the epoch keeps its identity instead of
+  // collapsing onto the epoch.
   #[test]
-  fn conversions_are_total_and_saturate_at_the_epoch() {
-    assert_eq!(to_seconds(UNIX_EPOCH), 0);
-    assert_eq!(to_seconds(UNIX_EPOCH - Duration::from_secs(1)), 0);
-    assert_eq!(to_millis(UNIX_EPOCH - Duration::from_secs(1)), 0);
-    assert_eq!(to_millis(UNIX_EPOCH - Duration::from_millis(1)), 0);
-    let later = UNIX_EPOCH + Duration::from_millis(1_500);
-    assert_eq!(to_seconds(later), 1);
-    assert_eq!(to_millis(later), 1_500);
+  fn millis_conversions_are_signed_across_the_epoch() {
+    assert_eq!(to_millis(UNIX_EPOCH), 0);
+    assert_eq!(to_millis(UNIX_EPOCH - Duration::from_secs(1)), -1_000);
+    assert_eq!(to_millis(UNIX_EPOCH - Duration::from_millis(1)), -1);
+    assert_eq!(to_millis(UNIX_EPOCH - Duration::from_nanos(1)), -1);
+    assert_eq!(to_millis(UNIX_EPOCH + Duration::from_millis(1_500)), 1_500);
+    assert_eq!(
+      from_millis(-1_500),
+      UNIX_EPOCH - Duration::from_millis(1_500)
+    );
+    assert_eq!(from_millis(0), UNIX_EPOCH);
+    assert_eq!(
+      from_millis(1_500),
+      UNIX_EPOCH + Duration::from_millis(1_500)
+    );
+  }
+
+  // Distinct pre-epoch instants stay distinct and ordered after the
+  // round trip, so a rollback cannot reorder stored stamps.
+  #[test]
+  fn pre_epoch_stamps_keep_their_order_across_the_round_trip() {
+    let rolled_back = UNIX_EPOCH - Duration::from_millis(10_000);
+    let deeper = UNIX_EPOCH - Duration::from_millis(20_000);
+    assert!(to_millis(deeper) < to_millis(rolled_back));
+    assert_eq!(from_millis(to_millis(rolled_back)), rolled_back);
+    assert_eq!(from_millis(to_millis(deeper)), deeper);
+    assert!(deeper < from_millis(to_millis(rolled_back)));
+  }
+
+  // The sub-millisecond remainder truncates toward negative infinity on
+  // both sides of the epoch, so the rebuilt instant never lands after
+  // the reading it came from.
+  #[test]
+  fn millis_truncation_is_floor_on_both_sides_of_the_epoch() {
+    let after = UNIX_EPOCH + Duration::from_nanos(1_500_000_001);
+    let before = UNIX_EPOCH - Duration::from_nanos(1_500_000_001);
+    assert_eq!(to_millis(after), 1_500);
+    assert_eq!(to_millis(before), -1_501);
+    assert!(from_millis(to_millis(after)) <= after);
+    assert!(from_millis(to_millis(before)) <= before);
   }
 
   // Stored millisecond timestamps round-trip exactly, so a
-  // clock freeze re-reads the same instant and a rollback restores an
-  // earlier recorded value without drift.
+  // clock freeze re-reads the same instant.
   #[test]
-  fn millis_round_trip_preserves_frozen_and_rolled_back_readings() {
+  fn millis_round_trip_preserves_frozen_readings() {
     let frozen = UNIX_EPOCH + Duration::from_millis(123_456_789);
     assert_eq!(from_millis(to_millis(frozen)), frozen);
-    let rolled_back = frozen - Duration::from_secs(10_000);
-    assert_eq!(from_millis(to_millis(rolled_back)), rolled_back);
-    assert!(rolled_back < from_millis(to_millis(frozen)));
+    let pre_epoch = UNIX_EPOCH - Duration::from_millis(123_456_789);
+    assert_eq!(from_millis(to_millis(pre_epoch)), pre_epoch);
+  }
+
+  // Seconds feed deadline arithmetic only; a pre-epoch reading
+  // saturates at zero, the maximally-overdue reading.
+  #[test]
+  fn seconds_saturate_at_the_epoch() {
+    assert_eq!(to_seconds(UNIX_EPOCH), 0);
+    assert_eq!(to_seconds(UNIX_EPOCH - Duration::from_secs(1)), 0);
+    assert_eq!(to_seconds(UNIX_EPOCH + Duration::from_millis(1_500)), 1);
   }
 }

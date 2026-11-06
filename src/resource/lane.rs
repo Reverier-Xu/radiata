@@ -54,7 +54,7 @@ impl Lane for ResourcesLane {
 
   fn reclaimed(
     &self, key_present: bool, _key: &[u8], content: &[u8], basis: &SweptBasis,
-    _checkpoint: Option<u64>,
+    _checkpoint: Option<i64>,
   ) -> bool {
     crate::resource::retention::reclaimed(
       key_present,

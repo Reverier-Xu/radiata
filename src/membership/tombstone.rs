@@ -28,7 +28,7 @@ use crate::{
 /// or row batch (every arm consults both).
 pub(super) struct TombstoneEvidence {
   bindings: std::collections::BTreeMap<NodeId, crate::PublicKey>,
-  checkpoint: Option<u64>,
+  checkpoint: Option<i64>,
 }
 
 pub(super) async fn tombstone_evidence(
@@ -47,7 +47,7 @@ pub(super) async fn tombstone_evidence(
 /// sender never forwarded a record its own GC had collected; the
 /// reconciliation engines cannot forget rows, so the filter lives
 /// here).
-fn collected(checkpoint: Option<u64>, timestamp_millis: u64) -> bool {
+fn collected(checkpoint: Option<i64>, timestamp_millis: i64) -> bool {
   checkpoint.is_some_and(|watermark| timestamp_millis <= watermark)
 }
 
@@ -59,8 +59,8 @@ fn collected(checkpoint: Option<u64>, timestamp_millis: u64) -> bool {
 /// One predicate serves the lane's scan boundary, its receive filter, its
 /// prune, and its derived-view repair, so collected evidence can never
 /// re-enter an engine by any path.
-pub(crate) fn collected_row(checkpoint: Option<u64>, key: &[u8], content: &[u8]) -> bool {
-  let collected_record = |record_stamp: Option<u64>| {
+pub(crate) fn collected_row(checkpoint: Option<i64>, key: &[u8], content: &[u8]) -> bool {
+  let collected_record = |record_stamp: Option<i64>| {
     checkpoint.is_some_and(|watermark| record_stamp.is_some_and(|stamp| stamp <= watermark))
   };
   match key
@@ -645,7 +645,7 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
 
   fn reclaimed(
     &self, _key_present: bool, key: &[u8], content: &[u8],
-    _basis: &crate::reconcile::lane::SweptBasis, checkpoint: Option<u64>,
+    _basis: &crate::reconcile::lane::SweptBasis, checkpoint: Option<i64>,
   ) -> bool {
     collected_row(checkpoint, key, content)
   }
@@ -806,7 +806,7 @@ mod tests {
         crate::Signature::from_bytes(signature.to_bytes()),
       )
     };
-    let cleanup = |stamp: u64| {
+    let cleanup = |stamp: i64| {
       let body =
         CleanupRecordV1::encode_signed_body(&subject, &subject_key, &issuer, stamp).unwrap();
       let signature = issuer_signing.sign(&signature_message(
@@ -1046,7 +1046,7 @@ mod tests {
         crate::Signature::from_bytes(signature.to_bytes()),
       )
     };
-    let cleanup_of = |subject_key: &crate::PublicKey, stamp: u64| {
+    let cleanup_of = |subject_key: &crate::PublicKey, stamp: i64| {
       let body =
         CleanupRecordV1::encode_signed_body(&cleaned, subject_key, &issuer, stamp).unwrap();
       let signature = issuer_signing.sign(&signature_message(
@@ -1206,7 +1206,7 @@ mod tests {
         .unwrap();
     }
 
-    let cleanup = |recorded: &NodeId, recorded_key: &crate::PublicKey, stamp: u64| {
+    let cleanup = |recorded: &NodeId, recorded_key: &crate::PublicKey, stamp: i64| {
       let body =
         CleanupRecordV1::encode_signed_body(recorded, recorded_key, &issuer, stamp).unwrap();
       let signature = issuer_signing.sign(&signature_message(

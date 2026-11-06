@@ -100,7 +100,7 @@ pub(crate) struct AckFrame {
   pub(crate) trace_id: TraceId,
   pub(crate) status: AckStatus,
   /// Milliseconds since the Unix epoch at the destination's admission.
-  pub(crate) admitted_at_millis: u64,
+  pub(crate) admitted_at_millis: i64,
 }
 
 /// A decoded packet-chunk frame.
@@ -216,7 +216,7 @@ struct AckWire {
   #[n(1)]
   outcome: u8,
   #[n(2)]
-  admitted_at_millis: u64,
+  admitted_at_millis: i64,
 }
 
 /// Encodes one packet-open frame body.

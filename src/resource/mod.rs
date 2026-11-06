@@ -318,9 +318,11 @@ struct ResourceRecordBodyWire {
   /// keys (the `LabelSet` invariant).
   #[n(5)]
   labels: Vec<(String, String)>,
-  /// Host wall-clock UNIX milliseconds (the tuple's first element).
+  /// Host wall-clock UNIX milliseconds, signed (pre-epoch readings stay
+  /// negative instead of collapsing onto the epoch) — the tuple's first
+  /// element.
   #[n(6)]
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   #[n(7)]
   writer: String,
   /// Removal rank: orders removal evidence against same-writer writes at
@@ -351,7 +353,7 @@ struct ResourceRecordWire {
   #[n(5)]
   labels: Vec<(String, String)>,
   #[n(6)]
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   #[n(7)]
   writer: String,
   #[n(8)]
@@ -369,7 +371,7 @@ pub(crate) struct ResourceRecordV1 {
   resource_type: LabelValue,
   resource_uri: ResourceUri,
   labels: LabelSet,
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   writer: NodeId,
   removal_rank: u64,
   removed: bool,
@@ -381,7 +383,7 @@ impl ResourceRecordV1 {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn encode_body(
     name: &ResourceName, resource_type: &LabelValue, resource_uri: &ResourceUri, labels: &LabelSet,
-    timestamp_millis: u64, writer: &NodeId, removal_rank: u64, removed: bool,
+    timestamp_millis: i64, writer: &NodeId, removal_rank: u64, removed: bool,
   ) -> Result<Vec<u8>> {
     encode_canonical(
       &ResourceRecordBodyWire {
@@ -409,7 +411,7 @@ impl ResourceRecordV1 {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
-    timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
+    timestamp_millis: i64, writer: NodeId, removal_rank: u64, removed: bool,
   ) -> Result<Self> {
     let body = Self::encode_body(
       &name,
@@ -459,7 +461,7 @@ impl ResourceRecordV1 {
   /// The host wall-clock timestamp in milliseconds (test-only: readers
   /// consume the normalized time view instead).
   #[cfg(test)]
-  pub(crate) const fn timestamp_millis(&self) -> u64 {
+  pub(crate) const fn timestamp_millis(&self) -> i64 {
     self.timestamp_millis
   }
 
@@ -595,7 +597,7 @@ pub(crate) fn check_write_shape(name: &ResourceName, labels: &ResourceLabels) ->
     labels.resource_type().clone(),
     labels.uri().clone(),
     labels.custom_labels().clone(),
-    u64::MAX,
+    i64::MAX,
     writer,
     u64::MAX,
     true,
@@ -652,7 +654,7 @@ mod tests {
   /// Builds one live (non-removed) record at the fixed test cluster.
   #[allow(clippy::too_many_arguments)]
   fn record(
-    name: &ResourceName, timestamp_millis: u64, writer: &NodeId, removal_rank: u64,
+    name: &ResourceName, timestamp_millis: i64, writer: &NodeId, removal_rank: u64,
     labels: &LabelSet, resource_type: &str, uri: &str,
   ) -> ResourceRecordV1 {
     ResourceRecordV1::new(

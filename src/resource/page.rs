@@ -190,7 +190,7 @@ mod tests {
   }
 
   fn record(
-    name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str,
+    name: &ResourceName, timestamp_millis: i64, writer: &NodeId, uri: &str,
   ) -> ResourceRecordV1 {
     ResourceRecordV1::new(
       name.clone(),

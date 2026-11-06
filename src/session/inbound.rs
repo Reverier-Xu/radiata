@@ -111,7 +111,7 @@ struct AdmittedStream {
   stream: mpsc::Sender<StreamItem>,
   next_sequence: u64,
   context: crate::Digest,
-  admitted_at_millis: u64,
+  admitted_at_millis: i64,
   /// Whether this stream already spent its single bounded drain grace. One
   /// grace per stream is what keeps the shared reader's stall bounded by
   /// [`INCOMING_STREAM_DRAIN_PATIENCE`] independently of the stream's
@@ -121,7 +121,7 @@ struct AdmittedStream {
 
 /// UNIX-milliseconds from the injected wall clock, used for the admission
 /// timestamps reported in acknowledgements so simulation controls them too.
-fn clock_millis(clock: &dyn crate::time::WallClock) -> u64 {
+fn clock_millis(clock: &dyn crate::time::WallClock) -> i64 {
   crate::time::to_millis(clock.now())
 }
 
@@ -468,7 +468,7 @@ async fn read_loop_frames(
 /// for an identical retransmission).
 struct StreamAdmission {
   status: AckStatus,
-  admitted_at_millis: u64,
+  admitted_at_millis: i64,
 }
 
 /// Validates one open frame against the authenticated session and the
@@ -553,7 +553,7 @@ async fn admit_stream(
   consumers: &mut JoinSet<()>,
 ) -> StreamAdmission {
   let trace_id = open.trace_id.clone();
-  let mut reack_admitted_at: Option<u64> = None;
+  let mut reack_admitted_at: Option<i64> = None;
   let status = 'status: {
     // The immutable opening context decides duplicate handling: an
     // identical retransmission reports the current admission status

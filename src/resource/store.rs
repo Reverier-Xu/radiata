@@ -405,7 +405,7 @@ mod tests {
 
   #[allow(clippy::too_many_arguments)]
   fn variant(
-    timestamp_millis: u64, removal_rank: u64, removed: bool, uri: &str,
+    timestamp_millis: i64, removal_rank: u64, removed: bool, uri: &str,
   ) -> ResourceRecordV1 {
     ResourceRecordV1::new(
       name(),
@@ -420,7 +420,7 @@ mod tests {
     .unwrap()
   }
 
-  fn put(timestamp_millis: u64, uri: &str) -> ResourceRecordV1 {
+  fn put(timestamp_millis: i64, uri: &str) -> ResourceRecordV1 {
     variant(timestamp_millis, 0, false, uri)
   }
 

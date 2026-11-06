@@ -62,7 +62,7 @@ fn labels() -> LabelSet {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record(timestamp_millis: u64, removed: bool, uri: &str) -> ResourceRecordV1 {
+fn record(timestamp_millis: i64, removed: bool, uri: &str) -> ResourceRecordV1 {
   ResourceRecordV1::new(
     name(),
     LabelValue::parse("document").unwrap(),

@@ -366,8 +366,8 @@ where
 /// records cap would study the same over-window prefix every pass and
 /// never consider it. Returns exactly the collectible records.
 pub(crate) fn scan_collectible_records<'a, T>(
-  store: &'a MetadataStore, namespace: StoreNamespace, watermark: u64, cap: usize,
-  skip: fn(&StoreKey) -> bool, decode: fn(&[u8]) -> Result<T>, stamp: fn(&T) -> u64,
+  store: &'a MetadataStore, namespace: StoreNamespace, watermark: i64, cap: usize,
+  skip: fn(&StoreKey) -> bool, decode: fn(&[u8]) -> Result<T>, stamp: fn(&T) -> i64,
 ) -> BoxFuture<'a, Result<Vec<T>>>
 where
   T: Send + 'a, {
@@ -502,7 +502,7 @@ pub(crate) struct CollectibleTombstone {
   /// The terminal record's store key inside its family.
   pub(crate) key: StoreKey,
   /// The signed removal stamp compared against the checkpoint watermark.
-  pub(crate) stamp_millis: u64,
+  pub(crate) stamp_millis: i64,
   /// The subject whose pinned binding the collection retires.
   pub(crate) subject: NodeId,
   /// The exact key the record pins.
@@ -523,7 +523,7 @@ pub(crate) struct CollectibleTombstone {
 /// next pass (hygiene, never security). Holds the writer permit across
 /// the sweep like every identity phase.
 pub(crate) async fn collect_tombstones_before(
-  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: u64,
+  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: i64,
   entries: &[CollectibleTombstone],
 ) -> Result<usize> {
   let _permit = store.write_permit().await;

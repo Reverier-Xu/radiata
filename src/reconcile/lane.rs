@@ -92,7 +92,7 @@ pub(crate) trait Lane: std::fmt::Debug + Send + Sync + 'static {
   /// defaults ignore both).
   fn reclaimed(
     &self, _key_present: bool, _key: &[u8], _content: &[u8], _basis: &SweptBasis,
-    _checkpoint: Option<u64>,
+    _checkpoint: Option<i64>,
   ) -> bool {
     false
   }
@@ -385,7 +385,7 @@ mod tests {
 
     // A collected leave row: the checkpoint watermark sits past the
     // record's stamp.
-    let stamp = 1_000_u64;
+    let stamp = 1_000_i64;
     let mut key = vec![1_u8];
     key.extend_from_slice(b"node-000000000000000000007");
     let content = vec![0_u8];
