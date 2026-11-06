@@ -115,30 +115,6 @@ impl TaskKind {
   pub const fn tag(&self) -> &QualifiedTag {
     &self.0
   }
-
-  /// Whether the kind's effect is awaited to its terminal phase during
-  /// node shutdown instead of being cancelled on the manager's cancel
-  /// watch: the journaled/store-atomic kinds whose outcome must settle
-  /// before teardown completes. Every other kind's effect may exit
-  /// mid-flight, leaving the task non-terminal for the process.
-  pub(crate) fn drains_on_shutdown(&self) -> bool {
-    CoreTaskKind::from_tag(self).is_some_and(CoreTaskKind::drains_on_shutdown)
-  }
-
-  /// The execution-slot channel the kind's effect draws from: the
-  /// network dials (join/connect), which can hold a slot for a whole
-  /// dial deadline, draw from their own channel so local work
-  /// (resource writes, credentials, maintenance) never queues behind a
-  /// wedged dial, and the caller-registered kinds draw from their own
-  /// channel so a workflow awaiting core verbs through its handle never
-  /// occupies the local capacity its own child operations need. The core
-  /// budgets live in
-  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots);
-  /// the extension channel's budget lives in
-  /// [`NodeConfig::with_task_reconcile_extension_slots`](crate::NodeConfig::with_task_reconcile_extension_slots).
-  pub(crate) fn slot_class(&self) -> SlotClass {
-    CoreTaskKind::from_tag(self).map_or(SlotClass::Extension, CoreTaskKind::slot_class)
-  }
 }
 
 impl From<QualifiedTag> for TaskKind {
@@ -249,13 +225,17 @@ impl CoreTaskKind {
   }
 
   /// Whether the verb's effect is awaited to its terminal phase during
-  /// node shutdown (see [`TaskKind::drains_on_shutdown`]).
+  /// node shutdown (the journaled/store-atomic kinds whose outcome must
+  /// settle before teardown completes). Declared onto the reconciler
+  /// registration channel by `register_default` (see
+  /// [`core_task_policies`]); never derived at dispatch time.
   pub(crate) const fn drains_on_shutdown(self) -> bool {
     matches!(self, Self::Leave | Self::ResolveFrozenJournal)
   }
 
-  /// The execution-slot channel the verb draws from (see
-  /// [`TaskKind::slot_class`]).
+  /// The execution-slot channel the verb draws from. Declared onto the
+  /// reconciler registration channel by `register_default` (see
+  /// [`core_task_policies`]); never derived at dispatch time.
   pub(crate) const fn slot_class(self) -> SlotClass {
     match self {
       Self::Join | Self::Connect => SlotClass::Network,
@@ -289,6 +269,53 @@ pub(crate) enum SlotClass {
   /// self-deadlock on that class's bounded budget, so reconcile code
   /// must never do it.
   Extension,
+}
+
+/// The execution policy a task kind's registration declares: the slot
+/// class its effect draws from plus whether the shutdown drain awaits
+/// it to terminality. The policy rides the reconciler registration
+/// (the core verbs declare theirs through the same channel in
+/// [`ExtensionRegistry::register_default`](crate::ExtensionRegistry::register_default),
+/// see [`core_task_policies`]); it is never derived from the tag being
+/// a core verb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskReconcilePolicy {
+  /// The execution-slot channel the kind's effect draws from (see
+  /// [`SlotClass`]). The core budgets live in
+  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots);
+  /// the extension channel's budget lives in
+  /// [`NodeConfig::with_task_reconcile_extension_slots`](crate::NodeConfig::with_task_reconcile_extension_slots).
+  pub(crate) slot_class: SlotClass,
+  /// Whether the kind's effect is awaited to its terminal phase during
+  /// node shutdown instead of being cancelled on the manager's cancel
+  /// watch: the journaled/store-atomic kinds whose outcome must settle
+  /// before teardown completes. Every other kind's effect may exit
+  /// mid-flight, leaving the task non-terminal for the process.
+  pub(crate) drains_on_shutdown: bool,
+}
+
+impl TaskReconcilePolicy {
+  /// The extension policy every caller-registered kind declares: its
+  /// own slot channel, cancelled on shutdown.
+  pub(crate) const EXTENSION: Self = Self {
+    slot_class: SlotClass::Extension,
+    drains_on_shutdown: false,
+  };
+}
+
+/// Every core verb's declared execution policy: the single source of
+/// the core kinds' slot class and shutdown drain, installed onto the
+/// reconciler registration channel by `register_default`. A caller
+/// kind never appears here — its registration declares
+/// [`TaskReconcilePolicy::EXTENSION`].
+pub(crate) fn core_task_policies() -> impl Iterator<Item = (TaskKind, TaskReconcilePolicy)> {
+  CORE_TASK_KINDS.iter().copied().map(|core| {
+    let policy = TaskReconcilePolicy {
+      slot_class: core.slot_class(),
+      drains_on_shutdown: core.drains_on_shutdown(),
+    };
+    (core.tag(), policy)
+  })
 }
 
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
@@ -461,12 +488,14 @@ impl TaskStatusRecord {
   }
 }
 
-/// One task-table entry: the kind, the per-task status watch, and the
-/// terminal payloads. `secret` holds an issued credential exactly until
-/// the first typed `wait()` collects it; eviction and shutdown drop the
-/// entry, and the secret's own zeroizing drop does the rest.
+/// One task-table entry: the kind, the admission-resolved execution
+/// policy, the per-task status watch, and the terminal payloads.
+/// `secret` holds an issued credential exactly until the first typed
+/// `wait()` collects it; eviction and shutdown drop the entry, and the
+/// secret's own zeroizing drop does the rest.
 pub(crate) struct TaskEntry {
   pub(crate) kind: TaskKind,
+  pub(crate) policy: TaskReconcilePolicy,
   pub(crate) status: watch::Sender<TaskStatusRecord>,
   pub(crate) output: Option<TaskOutput>,
   pub(crate) secret: Option<IssuedMergeCredential>,
@@ -502,10 +531,15 @@ impl TaskTable {
     self.entries.lock().map_err(Error::task_table)
   }
 
-  /// Inserts one admitted task's `Pending` entry. `false` when the id
-  /// already exists (an admission invariant violation, never a caller
-  /// path).
-  pub(crate) fn insert_pending(&self, id: &TaskId, kind: TaskKind, created: SystemTime) -> bool {
+  /// Inserts one admitted task's `Pending` entry, carrying the
+  /// execution policy admission resolved from the kind's registration
+  /// (the single resolution point: every later consumer — the slot
+  /// channel, the shutdown drain, the wait arbitration — reads the
+  /// entry, never the registry). `false` when the id already exists (an
+  /// admission invariant violation, never a caller path).
+  pub(crate) fn insert_pending(
+    &self, id: &TaskId, kind: TaskKind, policy: TaskReconcilePolicy, created: SystemTime,
+  ) -> bool {
     let Ok(mut entries) = self.lock() else {
       return false;
     };
@@ -517,12 +551,23 @@ impl TaskTable {
       id.clone(),
       TaskEntry {
         kind,
+        policy,
         status,
         output: None,
         secret: None,
       },
     );
     true
+  }
+
+  /// Whether the id's effect is awaited to its terminal phase by the
+  /// shutdown drain, read off the admission-resolved registration
+  /// policy. `None` for an unknown or evicted id.
+  pub(crate) fn drains_on_shutdown(&self, id: &TaskId) -> Option<bool> {
+    self
+      .lock()
+      .ok()
+      .and_then(|entries| entries.get(id).map(|entry| entry.policy.drains_on_shutdown))
   }
 
   /// The per-task status watch, when the id is live or inside the
@@ -640,7 +685,7 @@ impl TaskTable {
       entries
         .values()
         .filter(|entry| {
-          entry.kind.slot_class() == class && !entry.status.borrow().phase.is_terminal()
+          entry.policy.slot_class == class && !entry.status.borrow().phase.is_terminal()
         })
         .count()
     })
@@ -667,13 +712,15 @@ impl TaskObserver {
   /// missed-transition race), and with the typed shutdown failure
   /// once the manager's terminal publication can no longer arrive
   /// (the status watch closed, or the stop signal reached a kind the
-  /// shutdown drain does not await). A kind the drain awaits to
+  /// shutdown drain does not await — read off the admission-resolved
+  /// registration policy). A kind the drain awaits to
   /// terminality (the journaled leave and frozen-journal resolution)
   /// still resolves with its real outcome: the manager publishes it
   /// before the drain completes.
-  pub(crate) async fn await_terminal(
-    &self, id: &TaskId, kind: &TaskKind,
-  ) -> Result<TaskStatusRecord> {
+  pub(crate) async fn await_terminal(&self, id: &TaskId) -> Result<TaskStatusRecord> {
+    // The drain decision first: an unknown id falls through to the
+    // watch lookup's typed not-found below.
+    let drains = self.table.drains_on_shutdown(id);
     let Some(mut status) = self.table.watch(id) else {
       return Err(Error::not_found("task"));
     };
@@ -687,7 +734,7 @@ impl TaskObserver {
       // once the stop signal reaches a kind the drain does not await.
       let stopped = tokio::select! {
         changed = status.changed() => changed.is_err(),
-        changed = stop.changed() => changed.is_err() || !kind.drains_on_shutdown(),
+        changed = stop.changed() => changed.is_err() || !drains.unwrap_or(false),
       };
       if stopped {
         // The terminal publication can land in the same wake as the
@@ -862,7 +909,7 @@ impl<T: TaskResult> Task<T> {
   /// its real outcome: the manager publishes it before the drain
   /// completes.
   pub async fn wait(self) -> Result<T> {
-    let record = self.observer.await_terminal(&self.id, &self.kind).await?;
+    let record = self.observer.await_terminal(&self.id).await?;
     resolve_terminal::<T>(record, &self.id, &self.kind, &self.observer.table)
   }
 }
@@ -1254,6 +1301,16 @@ pub(crate) async fn notify_resource_observers(
 /// must never await another extension-kind task — the extension
 /// channel's bounded budget is not reentrant, and same-class recursive
 /// waiting can self-deadlock (see `SlotClass`).
+///
+/// One reconciler registration record: the reconciler itself (the core
+/// verbs declare policy-only records — their effects are the runtime's
+/// own closures, never registered reconcilers) plus the execution
+/// policy the registration declares.
+pub(crate) struct TaskReconcilerRegistration {
+  pub(crate) reconciler: Option<Arc<dyn TaskReconciler>>,
+  pub(crate) policy: TaskReconcilePolicy,
+}
+
 pub trait TaskReconciler: std::fmt::Debug + Send + Sync + 'static {
   /// Produces the effect for one attempt. `Ok(Succeeded)` completes the
   /// task with an empty output payload, `Ok(SucceededWithOutput)`
@@ -1380,16 +1437,20 @@ mod tests {
 
   use super::{
     CORE_TASK_KINDS, CoreTaskKind, ObservationLanes, ResourceHook, SlotClass,
-    TASK_OBSERVATION_INBOX, TaskKind, TaskTable, lane_of, notify_resource_observers,
+    TASK_OBSERVATION_INBOX, TaskKind, TaskReconcilePolicy, TaskTable, core_task_policies, lane_of,
+    notify_resource_observers,
   };
   use crate::{ErrorKind, NodeId, Result, TaskId};
 
   /// The core kind set is one table: every constant parses to itself
   /// (the const constructor computes the same offsets the parser does),
-  /// maps back onto its `CoreTaskKind`, and the two policy lookups agree
-  /// with the verb's class.
+  /// maps back onto its `CoreTaskKind`, and its declared policy — the
+  /// one `core_task_policies` installs onto the registration channel —
+  /// agrees with the verb's class and drain.
   #[test]
-  fn every_core_kind_constant_parses_maps_and_dispatches() {
+  fn every_core_kind_constant_parses_maps_and_declares_its_policy() {
+    let declared: Vec<(TaskKind, TaskReconcilePolicy)> = core_task_policies().collect();
+    assert_eq!(declared.len(), CORE_TASK_KINDS.len());
     for core in CORE_TASK_KINDS {
       let tag = core.tag();
       assert_eq!(
@@ -1398,13 +1459,19 @@ mod tests {
         "the fixed tag text drifted from the parser's canonical form"
       );
       assert_eq!(CoreTaskKind::from_tag(&tag), Some(core));
-      let expected_class = match core {
-        CoreTaskKind::Join | CoreTaskKind::Connect => SlotClass::Network,
-        _ => SlotClass::Local,
-      };
-      assert_eq!(tag.slot_class(), expected_class);
+      let (_, policy) = declared
+        .iter()
+        .find(|(kind, _)| kind == &tag)
+        .expect("every core verb declares a policy");
       assert_eq!(
-        tag.drains_on_shutdown(),
+        policy.slot_class,
+        match core {
+          CoreTaskKind::Join | CoreTaskKind::Connect => SlotClass::Network,
+          _ => SlotClass::Local,
+        }
+      );
+      assert_eq!(
+        policy.drains_on_shutdown,
         matches!(
           core,
           CoreTaskKind::Leave | CoreTaskKind::ResolveFrozenJournal
@@ -1413,15 +1480,14 @@ mod tests {
     }
   }
 
-  /// A caller-defined kind is just a tag outside the core set: it takes
-  /// the extension policy (its own slot channel, cancelled on shutdown)
-  /// and never collides with a core verb.
+  /// A caller-defined kind is just a tag outside the core set: it never
+  /// collides with a core verb, and the extension policy its registration
+  /// declares is not derived from any core table entry.
   #[test]
   fn a_caller_tag_takes_the_extension_policy() {
     let caller = TaskKind::parse("example.com/tasks/v1/probe").expect("tag");
     assert_eq!(CoreTaskKind::from_tag(&caller), None);
-    assert_eq!(caller.slot_class(), SlotClass::Extension);
-    assert!(!caller.drains_on_shutdown());
+    assert!(!core_task_policies().any(|(kind, _)| kind == caller));
     assert!(CORE_TASK_KINDS.iter().all(|core| core.tag() != caller));
   }
 
@@ -1441,7 +1507,12 @@ mod tests {
     fn admit(&mut self, kind: TaskKind) -> TaskId {
       let id = TaskId::compose(0, self.next).expect("composition");
       self.next += 1;
-      assert!(self.table.insert_pending(&id, kind, SystemTime::UNIX_EPOCH));
+      assert!(self.table.insert_pending(
+        &id,
+        kind,
+        super::TaskReconcilePolicy::EXTENSION,
+        SystemTime::UNIX_EPOCH
+      ));
       id
     }
   }

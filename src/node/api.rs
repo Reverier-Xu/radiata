@@ -433,13 +433,10 @@ impl Tasks {
   pub async fn wait(&self, id: crate::TaskId) -> Result<crate::view::TaskView> {
     self.require_running()?;
     let client = self.client()?;
-    let Some((kind, _)) = client.observer.table.status(&id) else {
-      return Err(crate::Error::not_found("task"));
-    };
     // The watch/shutdown arbitration is the observer's own (shared
     // with [`crate::Task::wait`]); only the terminal read differs —
     // this wait resolves with the view, not the typed output.
-    client.observer.await_terminal(&id, &kind).await?;
+    client.observer.await_terminal(&id).await?;
     client
       .observer
       .table
