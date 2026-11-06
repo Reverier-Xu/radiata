@@ -555,7 +555,7 @@ fn stream_surface_is_externally_constructible() {
   assert_eq!(policy.max_hops(), 3);
   assert_eq!(
     policy.load_balancing_policy(),
-    Some(&QualifiedTag::parse("example.org/balancers/first").unwrap())
+    Some(&QualifiedTag::parse(radiata::DefaultLoadBalancer::TAG).unwrap())
   );
   assert_eq!(policy.routing_policy(), &RoutingPolicy::DIRECT);
 
