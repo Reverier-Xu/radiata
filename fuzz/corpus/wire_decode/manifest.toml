@@ -9,35 +9,35 @@ aggregate = { entry_count = 10, total_bytes = 871 }
 digest = "aeba287b3d3af48d711b53ecc32de10918c3123ad66058d65dd248017e5d5b86"
 byte_count = 171
 origin = "golden-fixture"
-lineage = "compatibility manifest open-direct-v1"
+lineage = "canonical direct open frame: no route element"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
 digest = "b6c90494bc4a5a2514810ab5ce20e079c62b71f4eae1eb7c0f5b0801e7de618b"
 byte_count = 226
 origin = "golden-fixture"
-lineage = "compatibility manifest open-routed-v1"
+lineage = "canonical routed open frame: one explicit hop"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
 digest = "008519f79e584b22479bea6c6f8854733cd3e9521074200a6cca1dd9b4f62ebc"
 byte_count = 42
 origin = "golden-fixture"
-lineage = "compatibility manifest chunk-v1"
+lineage = "canonical chunk frame"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
 digest = "629023e8a4a5754a05080f37c8964a366372f8083ef8ca0871e8433af016ac48"
 byte_count = 30
 origin = "golden-fixture"
-lineage = "compatibility manifest end-v1"
+lineage = "canonical end frame with a terminal outcome"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
 digest = "34e7acff0155fb8650b397615fe8c5b4ef3f6ffeef3d86934aad1270e11d61b6"
 byte_count = 34
 origin = "golden-fixture"
-lineage = "compatibility manifest ack-v1"
+lineage = "canonical ack frame"
 schema_tags = ["packet kind 0x0010..0x0013"]
 
 [[entry]]
