@@ -118,7 +118,7 @@ impl TopologyGraph {
       // falls back to its unlearned heuristic.
       return;
     };
-    let now = SystemTime::now();
+    let now = crate::time::now();
     let mut previous = origin.clone();
     for hop in path {
       let stats = state
@@ -155,7 +155,7 @@ impl TopologyGraph {
       return None;
     }
     let state = self.state.lock().ok()?;
-    let now = SystemTime::now();
+    let now = crate::time::now();
     // The adjacency of this destination's learned edges, expired
     // observations excluded.
     let mut adjacency: BTreeMap<NodeId, Vec<(NodeId, f64)>> = BTreeMap::new();

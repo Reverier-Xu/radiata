@@ -1678,9 +1678,9 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
     .lock()
     .map_err(Error::join_credential_issuer)?;
   let issued = if rotate {
-    issuer.rotate(planes.entropy.as_ref(), std::time::SystemTime::now())?
+    issuer.rotate(planes.entropy.as_ref(), crate::time::now())?
   } else {
-    issuer.issue(planes.entropy.as_ref(), std::time::SystemTime::now())?
+    issuer.issue(planes.entropy.as_ref(), crate::time::now())?
   };
   Ok(if rotate {
     EffectOutcome::credential_rotated(issued)?

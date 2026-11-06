@@ -4,11 +4,13 @@
 //! second/millisecond conversions that every subsystem needs, so the
 //! clock seam and the conversion semantics cannot drift between
 //! modules. The `to_*`/`from_*` functions are pure conversions over a
-//! [`SystemTime`] value. The `now_seconds`/`now_millis` functions are the
-//! protocol-visible liveness readings taken directly from the host clock
-//! (`SystemTime::now`) — deliberately not pure, because production code
-//! calls them exactly where the host wall clock is the required
-//! authority (injected boundaries instead take a
+//! [`SystemTime`] value. The reading functions — [`now_seconds`],
+//! [`now_millis`], and [`now`] — are the only authority for a host wall
+//! clock read in production code: protocol-visible liveness and expiry
+//! boundaries take their readings through them, and production modules
+//! never call `SystemTime::now` directly. They are deliberately not
+//! pure, because production code calls them exactly where the host wall
+//! clock is the required authority (injected boundaries instead take a
 //! [`WallClock`], which wraps these conversions for tests).
 //!
 //! The two scales have different conversion contracts:
@@ -46,6 +48,14 @@ impl WallClock for HostWallClock {
   fn now(&self) -> SystemTime {
     SystemTime::now()
   }
+}
+
+/// The current host wall-clock reading, for sites that need the instant
+/// itself: `SystemTime`-typed stamps, tick arithmetic, and monotonic
+/// elapsed comparisons. The one production home for a direct host read —
+/// production modules never call `SystemTime::now` directly.
+pub(crate) fn now() -> SystemTime {
+  SystemTime::now()
 }
 
 /// UNIX seconds of `time`, saturating at the epoch (a pre-epoch reading

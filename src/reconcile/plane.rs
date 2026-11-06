@@ -575,7 +575,7 @@ impl ReconcilePlane {
     // same predicate the apply boundary fails open on). One read per
     // pass keeps every row judged against one instant.
     let basis = SweptBasis {
-      swept_at: std::time::SystemTime::now(),
+      swept_at: crate::time::now(),
       removal_retention: self.shared.resource_removal_retention,
     };
     let checkpoint = if plan.iter().any(|lane| lane.policy().reads_checkpoint()) {
@@ -782,7 +782,7 @@ impl ReconcilePlane {
       revision: &self.shared.revision,
     };
     let basis = SweptBasis {
-      swept_at: std::time::SystemTime::now(),
+      swept_at: crate::time::now(),
       removal_retention: self.shared.resource_removal_retention,
     };
     lane.policy().receive(&lane_context, &basis, rows).await

@@ -9,6 +9,10 @@
 mod document;
 mod store;
 
+/// The only consumer outside this module is the test-only builtin tag
+/// inventory (`protocol::builtin`), so the re-export follows that
+/// consumer's compilation: never in a production build.
+#[cfg(all(test, feature = "json"))]
 pub(crate) use document::{GENERATION_SCHEMA, LOCK_SCHEMA, STORE_SCHEMA};
 pub(crate) use store::JsonStoreFactory;
 #[cfg(all(test, unix))]

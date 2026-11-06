@@ -25,7 +25,7 @@
 
 use std::{
   sync::{Arc, Mutex},
-  time::{Duration, SystemTime},
+  time::Duration,
 };
 
 use tokio::time::timeout;
@@ -275,7 +275,7 @@ impl SessionDriver {
       HandshakeMode::Merge => {
         let active = {
           let issuer = self.issuer.lock().map_err(Error::join_credential_issuer)?;
-          let now = SystemTime::now();
+          let now = crate::time::now();
           let active_generation = issuer
             .generation_id()
             .ok_or_else(|| Error::authentication_failed("join credential"))?;
