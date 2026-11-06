@@ -1054,7 +1054,7 @@ fn scan_view(
 /// once this state borrow is spent.
 fn drive_peers(
   plane: &mut PlaneState, peers: &[NodeId], rows: &LaneScan, plan: &BTreeSet<LaneId>,
-  listed: &LaneListed, basis: &SweptBasis, checkpoint: Option<u64>,
+  listed: &LaneListed, basis: &SweptBasis, checkpoint: Option<i64>,
 ) -> (Outbound, Vec<(LaneId, NodeId)>) {
   let mut outbound: Outbound = Vec::new();
   let mut prime_holds: Vec<(LaneId, NodeId)> = Vec::new();
@@ -1180,7 +1180,7 @@ fn drive_peers(
 /// the same instant the prune did.
 fn repair_index(
   peers: &BTreeMap<NodeId, PeerState>, repair_pending: &mut BTreeSet<LaneId>,
-  plan: &BTreeSet<LaneId>, listed: &LaneListed, basis: &SweptBasis, checkpoint: Option<u64>,
+  plan: &BTreeSet<LaneId>, listed: &LaneListed, basis: &SweptBasis, checkpoint: Option<i64>,
 ) -> LaneScan {
   let mut seen: BTreeMap<LaneId, BTreeSet<Vec<u8>>> = BTreeMap::new();
   let mut pending: RepairIndex = BTreeMap::new();
@@ -1661,7 +1661,7 @@ mod tests {
         crate::LabelValue::parse("document").unwrap(),
         crate::ResourceUri::parse("u://unknown").unwrap(),
         crate::LabelSet::new(),
-        1_000 + index,
+        1_000 + index as i64,
         writer.clone(),
         0,
         false,
@@ -2543,7 +2543,7 @@ mod tests {
   /// One resources-lane record row for `name`: the row shape
   /// `(key, content)` exactly as a peer's ROWS message carries it.
   fn resource_row(
-    name: &crate::ResourceName, writer_value: u64, stamp: u64, removed: bool,
+    name: &crate::ResourceName, writer_value: u64, stamp: i64, removed: bool,
   ) -> (Vec<u8>, Vec<u8>) {
     let record = crate::resource::ResourceRecordV1::new(
       name.clone(),
@@ -2635,7 +2635,7 @@ mod tests {
   #[test]
   fn the_swept_predicate_needs_the_retention_deadline_not_key_absence() {
     let fresh_stamp = crate::time::now_millis();
-    let expired_stamp = 1_000_u64;
+    let expired_stamp = 1_000_i64;
     let name = crate::ResourceName::parse("radiata.woooo.tech/resources/predicate").unwrap();
     let now = std::time::SystemTime::now();
     let retention = crate::resource::retention::RESOURCE_REMOVAL_RETENTION;
@@ -3226,7 +3226,7 @@ mod tests {
     // The revocation and checkpoint rows are never collected evidence.
     let revocation_key = vec![3_u8];
     assert!(!crate::membership::tombstone::collected_row(
-      Some(u64::MAX),
+      Some(i64::MAX),
       &revocation_key,
       &content
     ));

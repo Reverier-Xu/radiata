@@ -1,0 +1,181 @@
+//! The shared signature-message discipline: every signed protocol or
+//! record body is authenticated over `domain ‖ SHA-256(canonical body)`.
+//!
+//! One home for the body digest, the message construction, and strict
+//! Ed25519 verification, so the domain-boundary framing cannot drift
+//! between the handshake, the credential proof, and the identity
+//! records. The concrete domain labels stay with their owning modules.
+
+use sha2::{Digest as ShaDigest, Sha256};
+
+use crate::{Digest, Error, PublicKey, Result, Signature};
+
+pub(crate) fn body_digest(canonical_body: &[u8]) -> Digest {
+  Digest::from_bytes(Sha256::digest(canonical_body).into())
+}
+
+pub(crate) fn signature_message(domain: &[u8], canonical_body: &[u8]) -> Vec<u8> {
+  let digest = body_digest(canonical_body);
+  let mut message = Vec::with_capacity(domain.len() + digest.as_bytes().len());
+  message.extend_from_slice(domain);
+  message.extend_from_slice(digest.as_bytes());
+  message
+}
+
+pub(crate) fn verify_strict(
+  domain: &[u8], canonical_body: &[u8], public_key: &PublicKey, signature: &Signature,
+  context: &'static str,
+) -> Result<()> {
+  // The signature message is domain‖digest for callers that hold a digest
+  // already proven to bind the body.
+  let key = ed25519_dalek::VerifyingKey::from_bytes(public_key.as_bytes())
+    .map_err(|_| Error::authentication_failed(context))?;
+  let signature = ed25519_dalek::Signature::from_bytes(signature.as_bytes());
+  key
+    .verify_strict(&signature_message(domain, canonical_body), &signature)
+    .map_err(|_| Error::authentication_failed(context))
+}
+
+#[cfg(test)]
+mod tests {
+  use ed25519_dalek::{Signer, SigningKey};
+
+  use super::{body_digest, signature_message, verify_strict};
+  use crate::{ErrorKind, PublicKey, Signature};
+
+  const BODY: &[u8] = b"\x85\x01\x02\x03\x04\x05";
+  const SIGNING_SEED: [u8; 32] = [7; 32];
+  const MERGE_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/merge-grant";
+  const OTHER_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/leave-record";
+
+  fn signed(body: &[u8], domain: &[u8]) -> (PublicKey, Signature) {
+    let signing_key = SigningKey::from_bytes(&SIGNING_SEED);
+    let signature = signing_key.sign(&signature_message(domain, body));
+    (
+      PublicKey::from_bytes(signing_key.verifying_key().to_bytes()),
+      Signature::from_bytes(signature.to_bytes()),
+    )
+  }
+
+  #[test]
+  fn signature_message_is_domain_then_body_digest() {
+    let message = signature_message(MERGE_DOMAIN, BODY);
+
+    assert_eq!(&message[..MERGE_DOMAIN.len()], MERGE_DOMAIN);
+    assert_eq!(&message[MERGE_DOMAIN.len()..], body_digest(BODY).as_bytes());
+    assert_eq!(message.len(), MERGE_DOMAIN.len() + 32);
+  }
+
+  #[test]
+  fn strict_verification_accepts_valid_signature() {
+    let (public_key, signature) = signed(BODY, MERGE_DOMAIN);
+
+    verify_strict(
+      MERGE_DOMAIN,
+      BODY,
+      &public_key,
+      &signature,
+      "merge grant signature",
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn strict_verification_rejects_wrong_domain_body_and_key() {
+    let (public_key, signature) = signed(BODY, MERGE_DOMAIN);
+
+    let wrong_domain = verify_strict(
+      OTHER_DOMAIN,
+      BODY,
+      &public_key,
+      &signature,
+      "merge grant signature",
+    );
+    let wrong_body = verify_strict(
+      MERGE_DOMAIN,
+      b"\x85\x01\x02\x03\x04\x06",
+      &public_key,
+      &signature,
+      "merge grant signature",
+    );
+    let other_key = SigningKey::from_bytes(&[9; 32]).verifying_key();
+    let wrong_key = verify_strict(
+      MERGE_DOMAIN,
+      BODY,
+      &PublicKey::from_bytes(other_key.to_bytes()),
+      &signature,
+      "merge grant signature",
+    );
+
+    for result in [wrong_domain, wrong_body, wrong_key] {
+      let error = result.unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
+    }
+  }
+
+  #[test]
+  fn strict_verification_rejects_noncanonical_signature_scalar() {
+    let (public_key, signature) = signed(BODY, MERGE_DOMAIN);
+    let mut malleated = *signature.as_bytes();
+    for byte in &mut malleated[32..] {
+      *byte = 0xFF;
+    }
+
+    let error = verify_strict(
+      MERGE_DOMAIN,
+      BODY,
+      &public_key,
+      &Signature::from_bytes(malleated),
+      "merge grant signature",
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
+  }
+
+  #[test]
+  fn strict_verification_rejects_undecompressible_public_key() {
+    let (_, signature) = signed(BODY, MERGE_DOMAIN);
+
+    let error = verify_strict(
+      MERGE_DOMAIN,
+      BODY,
+      &PublicKey::from_bytes([0xFF; 32]),
+      &signature,
+      "merge grant signature",
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
+    assert_eq!(error.context(), "merge grant signature");
+  }
+
+  #[test]
+  fn authentication_errors_are_redacted() {
+    let (public_key, signature) = signed(BODY, MERGE_DOMAIN);
+
+    let error = verify_strict(
+      OTHER_DOMAIN,
+      BODY,
+      &public_key,
+      &signature,
+      "merge grant signature",
+    )
+    .unwrap_err();
+    let rendered = format!("{error:?}");
+    assert_eq!(
+      rendered,
+      "Error { kind: AuthenticationFailed, context: \"merge grant signature\" }"
+    );
+    let key_hex: String = public_key
+      .as_bytes()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    let signature_hex: String = signature
+      .as_bytes()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    assert!(!rendered.contains(&key_hex));
+    assert!(!rendered.contains(&signature_hex));
+  }
+}

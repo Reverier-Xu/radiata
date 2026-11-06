@@ -243,11 +243,11 @@ pub(crate) async fn reconcile_recovered_journal(store: &MetadataStore) -> Result
 /// (returns `false`). Runs inside the caller's writer section, whose
 /// permit it receives.
 pub(crate) async fn recover_journal_prologue(
-  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, purpose: &str,
+  permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, purpose: &str,
   context: &'static str,
 ) -> Result<bool> {
   if store.resolve_pending_journal(purpose).await? {
-    cleanup_pending_exact(_permit, store, entropy, purpose, context).await?;
+    cleanup_pending_exact(permit, store, entropy, purpose, context).await?;
     return Ok(true);
   }
   store.reconcile_if_frozen().await?;

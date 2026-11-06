@@ -457,7 +457,7 @@ mod tests {
       .unwrap()
   }
 
-  fn record(name: &ResourceName, timestamp_millis: u64, removed: bool) -> ResourceRecordV1 {
+  fn record(name: &ResourceName, timestamp_millis: i64, removed: bool) -> ResourceRecordV1 {
     ResourceRecordV1::new(
       name.clone(),
       LabelValue::parse("document").unwrap(),
@@ -536,7 +536,7 @@ mod tests {
   async fn puts_and_removals_append_ordered_entries() {
     let factory = factory();
     let store = open(&factory).await;
-    for (seed, timestamp) in [(1_u8, 1_000_u64), (2, 2_000)] {
+    for (seed, timestamp) in [(1_u8, 1_000_i64), (2, 2_000)] {
       assert!(matches!(
         install(&store, &record(&name(seed), timestamp, false)).await,
         ResourceCommitOutcome::Installed(_)
@@ -576,7 +576,7 @@ mod tests {
   async fn resume_from_a_version_returns_exactly_the_later_entries() {
     let factory = factory();
     let store = open(&factory).await;
-    for (seed, timestamp) in [(1_u8, 1_000_u64), (2, 2_000), (3, 3_000)] {
+    for (seed, timestamp) in [(1_u8, 1_000_i64), (2, 2_000), (3, 3_000)] {
       install(&store, &record(&name(seed), timestamp, false)).await;
     }
 
@@ -744,7 +744,7 @@ mod tests {
   async fn a_mid_scan_decode_failure_loses_nothing() {
     let factory = factory();
     let store = open(&factory).await;
-    for (seed, timestamp) in [(1_u8, 1_000_u64), (2, 2_000), (3, 3_000)] {
+    for (seed, timestamp) in [(1_u8, 1_000_i64), (2, 2_000), (3, 3_000)] {
       install(&store, &record(&name(seed), timestamp, false)).await;
     }
 

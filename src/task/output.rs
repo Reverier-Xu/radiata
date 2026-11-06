@@ -15,7 +15,7 @@
 //! [`TaskResult`](crate::task::TaskResult) — reads as a table of the
 //! verb surface.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use minicbor::{Decode, Encode};
 
@@ -84,7 +84,7 @@ pub(crate) fn encode_unit() -> Result<TaskOutput> {
 }
 
 /// The cleanup-checkpoint result: the issued epoch watermark.
-pub(crate) fn encode_checkpoint(watermark: u64) -> Result<TaskOutput> {
+pub(crate) fn encode_checkpoint(watermark: i64) -> Result<TaskOutput> {
   encode(&watermark)
 }
 
@@ -126,7 +126,7 @@ pub(crate) fn encode_member(view: &MemberView) -> Result<TaskOutput> {
 /// The credential result (issue or rotate): the non-secret expiry
 /// observation. The secret itself never enters the payload.
 pub(crate) fn encode_credential(expires_at: SystemTime) -> Result<TaskOutput> {
-  encode(&time_wire(expires_at)?)
+  encode(&crate::time::to_millis(expires_at))
 }
 
 /// The start-recovery result: the recovery controller's observation.
@@ -135,10 +135,7 @@ pub(crate) fn encode_recovery(view: &RecoveryView) -> Result<TaskOutput> {
     is_connected: view.is_connected(),
     unreachable_members: u64::try_from(view.unreachable_members())
       .map_err(|_| Error::internal("task output encode"))?,
-    next_attempt_at: match view.next_attempt_at() {
-      Some(next) => Some(time_wire(next)?),
-      None => None,
-    },
+    next_attempt_at: view.next_attempt_at().map(crate::time::to_millis),
   })
 }
 
@@ -188,7 +185,7 @@ pub(crate) fn decode_unit(bytes: &[u8]) -> Result<()> {
   decode(bytes)
 }
 
-pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<u64> {
+pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<i64> {
   decode(bytes)
 }
 
@@ -228,16 +225,15 @@ pub(crate) fn decode_member(bytes: &[u8]) -> Result<MemberView> {
 }
 
 pub(crate) fn decode_credential(bytes: &[u8]) -> Result<crate::CredentialIssued> {
-  let wire: TimeWire = decode(bytes)?;
-  Ok(crate::CredentialIssued::new(time(&wire)?))
+  let expires_at: i64 = decode(bytes)?;
+  Ok(crate::CredentialIssued::new(crate::time::from_millis(
+    expires_at,
+  )))
 }
 
 pub(crate) fn decode_recovery(bytes: &[u8]) -> Result<RecoveryView> {
   let wire: RecoveryViewWire = decode(bytes)?;
-  let next_attempt_at = match &wire.next_attempt_at {
-    Some(wire) => Some(time(wire)?),
-    None => None,
-  };
+  let next_attempt_at = wire.next_attempt_at.map(crate::time::from_millis);
   Ok(RecoveryView::new(
     wire.is_connected,
     usize::try_from(wire.unreachable_members).map_err(|_| Error::internal(DECODE_FAILURE))?,
@@ -288,7 +284,7 @@ fn resource_view_wire(view: &ResourceView) -> Result<ResourceViewWire> {
     resource_type: view.labels().resource_type().as_str().to_owned(),
     uri: view.labels().uri().as_str().to_owned(),
     custom: label_entries(view.labels().custom_labels()),
-    timestamp: time_wire(view.version().timestamp())?,
+    timestamp_millis: crate::time::to_millis(view.version().timestamp()),
     writer: view.version().writer().as_str().to_owned(),
     removal: view.version().is_removal(),
     digest: view.version().digest().as_bytes().to_vec(),
@@ -310,7 +306,7 @@ fn resource_view(wire: &ResourceViewWire) -> Result<ResourceView> {
     decode_field(ResourceName::parse(&wire.name))?,
     labels,
     ResourceVersion::from_parts(
-      time(&wire.timestamp)?,
+      crate::time::from_millis(wire.timestamp_millis),
       decode_field(NodeId::parse(&wire.writer))?,
       wire.removal,
       decode_field(digest(&wire.digest))?,
@@ -399,53 +395,6 @@ fn member_status(code: u8) -> Result<MemberStatus> {
   }
 }
 
-/// One instant as `(seconds, nanoseconds)` relative to the Unix epoch:
-/// the signed seconds carry pre-epoch instants, and the nanoseconds are
-/// always the non-negative sub-second remainder, so the pair is exact
-/// and canonical.
-fn time_wire(time: SystemTime) -> Result<TimeWire> {
-  match time.duration_since(SystemTime::UNIX_EPOCH) {
-    Ok(after) => Ok(TimeWire {
-      secs: i64::try_from(after.as_secs()).map_err(|_| Error::internal("task output encode"))?,
-      nanos: after.subsec_nanos(),
-    }),
-    Err(before) => {
-      let before = before.duration();
-      let secs =
-        i64::try_from(before.as_secs()).map_err(|_| Error::internal("task output encode"))?;
-      let nanos = before.subsec_nanos();
-      Ok(if nanos == 0 {
-        TimeWire {
-          secs: -secs,
-          nanos: 0,
-        }
-      } else {
-        TimeWire {
-          secs: -secs - 1,
-          nanos: 1_000_000_000 - nanos,
-        }
-      })
-    }
-  }
-}
-
-fn time(wire: &TimeWire) -> Result<SystemTime> {
-  if wire.nanos >= 1_000_000_000 {
-    return Err(Error::internal(DECODE_FAILURE));
-  }
-  let instant = if wire.secs >= 0 {
-    let secs = u64::try_from(wire.secs).map_err(|_| Error::internal(DECODE_FAILURE))?;
-    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, wire.nanos))
-  } else {
-    let magnitude = Duration::new(wire.secs.unsigned_abs(), 0);
-    let magnitude = magnitude
-      .checked_sub(Duration::from_nanos(u64::from(wire.nanos)))
-      .ok_or_else(|| Error::internal(DECODE_FAILURE))?;
-    SystemTime::UNIX_EPOCH.checked_sub(magnitude)
-  };
-  instant.ok_or_else(|| Error::internal(DECODE_FAILURE))
-}
-
 // -- the wire structs ---------------------------------------------------
 
 #[derive(Decode, Encode)]
@@ -496,7 +445,7 @@ struct ResourceViewWire {
   #[n(3)]
   custom: Vec<LabelWire>,
   #[n(4)]
-  timestamp: TimeWire,
+  timestamp_millis: i64,
   #[n(5)]
   writer: String,
   #[n(6)]
@@ -546,7 +495,7 @@ struct RecoveryViewWire {
   #[n(1)]
   unreachable_members: u64,
   #[n(2)]
-  next_attempt_at: Option<TimeWire>,
+  next_attempt_at: Option<i64>,
 }
 
 #[derive(Decode, Encode)]
@@ -567,15 +516,6 @@ struct RevokeOutcomeWire {
   was_already_revoked: bool,
 }
 
-#[derive(Decode, Encode)]
-#[cbor(array)]
-struct TimeWire {
-  #[n(0)]
-  secs: i64,
-  #[n(1)]
-  nanos: u32,
-}
-
 #[cfg(test)]
 mod tests {
   use std::time::{Duration, SystemTime};
@@ -585,7 +525,7 @@ mod tests {
     decode_member, decode_receipt_retention, decode_recovery, decode_resource_mutation,
     decode_revoke, decode_unit, encode_checkpoint, encode_connect, encode_credential, encode_join,
     encode_leave, encode_listen, encode_member, encode_receipt_retention, encode_recovery,
-    encode_resource_mutation, encode_revoke, encode_unit, time, time_wire,
+    encode_resource_mutation, encode_revoke, encode_unit,
   };
   use crate::{
     Digest, Endpoint, LabelKey, LabelSet, LabelValue, ListenerId, MemberStatus, NodeId, PublicKey,
@@ -674,7 +614,7 @@ mod tests {
     let unit = encode_unit().expect("encode");
     decode_unit(unit.bytes()).expect("decode");
 
-    let watermark = 41_u64;
+    let watermark = 41_i64;
     assert_eq!(
       decode_checkpoint(encode_checkpoint(watermark).expect("encode").bytes()).expect("decode"),
       watermark
@@ -739,17 +679,19 @@ mod tests {
     );
   }
 
-  /// The instant codec is exact on both sides of the epoch: the signed
-  /// seconds plus the non-negative nanosecond remainder represent every
-  /// `SystemTime` the task surface can carry.
+  /// The instant codec is the shared signed-millisecond representation:
+  /// exact to the millisecond on both sides of the epoch, so a
+  /// pre-epoch stamp keeps its identity instead of collapsing onto the
+  /// epoch.
   #[test]
   fn instants_round_trip_across_the_epoch() {
-    let after = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
-    let before = SystemTime::UNIX_EPOCH - Duration::new(1, 500_000_000);
-    let exact = SystemTime::UNIX_EPOCH - Duration::new(2, 0);
-    for instant in [SystemTime::UNIX_EPOCH, after, before, exact] {
-      let wire = time_wire(instant).expect("encode");
-      assert_eq!(time(&wire).expect("decode"), instant);
+    let after = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+    let before = SystemTime::UNIX_EPOCH - Duration::from_millis(1_500);
+    let epoch = SystemTime::UNIX_EPOCH;
+    for instant in [epoch, after, before] {
+      let output = encode_credential(instant).unwrap();
+      let decoded = decode_credential(output.bytes()).unwrap();
+      assert_eq!(decoded.expires_at(), instant);
     }
   }
 

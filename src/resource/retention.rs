@@ -285,7 +285,7 @@ mod tests {
   }
 
   fn record(
-    name: &ResourceName, timestamp_millis: u64, removed: bool, uri: &str,
+    name: &ResourceName, timestamp_millis: i64, removed: bool, uri: &str,
   ) -> ResourceRecordV1 {
     ResourceRecordV1::new(
       name.clone(),
@@ -402,7 +402,7 @@ mod tests {
     for seed in 1..=3_u8 {
       install(
         &store,
-        &record(&name(seed), u64::from(seed) * 1_000, true, "u://r"),
+        &record(&name(seed), i64::from(seed) * 1_000, true, "u://r"),
       )
       .await;
     }

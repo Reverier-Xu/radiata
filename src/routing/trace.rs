@@ -229,7 +229,7 @@ struct TraceWire {
   #[n(7)]
   failure: Option<u8>,
   #[n(8)]
-  updated_at_millis: u64,
+  updated_at_millis: i64,
 }
 
 fn encode_canonical_record(record: &TraceRecord) -> Result<Vec<u8>> {

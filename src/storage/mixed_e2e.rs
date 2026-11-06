@@ -73,7 +73,7 @@ fn descriptor(node: &NodeId, revision: u64, seed: [u8; 32]) -> NodeDescriptorV1 
 }
 
 fn resource_record(
-  seed_index: u8, writer: &NodeId, uri: &str, timestamp_millis: u64,
+  seed_index: u8, writer: &NodeId, uri: &str, timestamp_millis: i64,
 ) -> ResourceRecordV1 {
   ResourceRecordV1::new(
     ResourceName::parse(&format!("radiata.woooo.tech/resources/mixed-{seed_index}")).unwrap(),

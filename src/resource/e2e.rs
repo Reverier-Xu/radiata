@@ -54,7 +54,7 @@ fn labels() -> LabelSet {
 
 #[allow(clippy::too_many_arguments)]
 fn resource(
-  name: &ResourceName, timestamp_millis: u64, writer: &NodeId, uri: &str,
+  name: &ResourceName, timestamp_millis: i64, writer: &NodeId, uri: &str,
 ) -> ResourceRecordV1 {
   ResourceRecordV1::new(
     name.clone(),
@@ -338,7 +338,7 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
         &side_a,
         &resource(
           &name(u8::try_from(index % 251).unwrap()),
-          u64::from(index),
+          i64::from(index),
           &NodeId::parse("node-000000000000000001024").unwrap(),
           "u://a",
         ),
@@ -349,7 +349,7 @@ async fn one_thousand_twenty_four_profile_converges_without_a_ceiling() {
         &side_b,
         &resource(
           &name(u8::try_from(index % 251).unwrap()),
-          u64::from(index),
+          i64::from(index),
           &NodeId::parse("node-000000000000000001025").unwrap(),
           "u://b",
         ),

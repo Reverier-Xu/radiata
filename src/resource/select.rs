@@ -115,7 +115,7 @@ mod tests {
   /// custom label per seed.
   #[allow(clippy::too_many_arguments)]
   fn record(
-    seed: u8, timestamp_millis: u64, writer: &NodeId, removal_rank: u64, removed: bool,
+    seed: u8, timestamp_millis: i64, writer: &NodeId, removal_rank: u64, removed: bool,
   ) -> super::ResourceRecordV1 {
     let labels = LabelSet::new()
       .insert(

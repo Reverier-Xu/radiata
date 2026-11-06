@@ -34,8 +34,11 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{
-  canonical::canonical_record, lifecycle::LocalIdentityContext, records,
-  records::metadata_namespace, signature::verify_strict,
+  canonical::canonical_record,
+  lifecycle::LocalIdentityContext,
+  records,
+  records::{FLAT_RECORD_LIMITS, metadata_namespace},
+  signature::verify_strict,
 };
 /// The durable namespace of cleanup tombstone records.
 pub(crate) use crate::storage::families::CLEANUP_NAMESPACE;
@@ -49,27 +52,24 @@ pub(crate) const CLEANUP_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/cl
 /// The signature domain of the issuer-signed cleanup tombstone.
 pub(crate) const CLEANUP_RECORD_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/cleanup-record";
 
-/// Canonical-decoder bounds for the flat cleanup record.
-const CLEANUP_LIMITS: crate::protocol::CborLimits = crate::protocol::CborLimits::new(1, 8, 1_024);
-
 canonical_record! {
   wire CleanupRecordWire for CleanupRecordV1 vis [pub(crate)] {
     schema CLEANUP_RECORD_SCHEMA,
     version u16 1,
-    limits CLEANUP_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "cleanup record", canonical "cleanup record canonical form", header_err "cleanup record schema"]
     fields {
       #[n(2)] subject = subject: String => node()
       #[n(3)] subject_key = subject_key: ByteVec => key32("cleanup record key")
       #[n(4)] issuer = issuer: String => node()
-      #[n(5)] timestamp_millis = timestamp_millis: u64 => stamp()
+      #[n(5)] timestamp_millis = timestamp_millis: i64 => stamp()
       #[n(6)] signature = signature: ByteVec => sig("cleanup record signature")
     }
     signed_body wire CleanupRecordBodyWire fn encode_signed_body {
       #[n(2)] subject: &NodeId as subject: String => node()
       #[n(3)] subject_key: &PublicKey as subject_key: ByteVec => key32()
       #[n(4)] issuer: &NodeId as issuer: String => node()
-      #[n(5)] timestamp_millis: u64 as timestamp_millis: u64 => stamp()
+      #[n(5)] timestamp_millis: i64 as timestamp_millis: i64 => stamp()
     }
   }
 }
@@ -80,13 +80,13 @@ pub(crate) struct CleanupRecordV1 {
   subject: NodeId,
   subject_key: PublicKey,
   issuer: NodeId,
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   signature: Signature,
 }
 
 impl CleanupRecordV1 {
   pub(crate) const fn new(
-    subject: NodeId, subject_key: PublicKey, issuer: NodeId, timestamp_millis: u64,
+    subject: NodeId, subject_key: PublicKey, issuer: NodeId, timestamp_millis: i64,
     signature: Signature,
   ) -> Self {
     Self {
@@ -98,7 +98,7 @@ impl CleanupRecordV1 {
     }
   }
 
-  pub(crate) const fn timestamp_millis(&self) -> u64 {
+  pub(crate) const fn timestamp_millis(&self) -> i64 {
     self.timestamp_millis
   }
 
@@ -285,12 +285,12 @@ canonical_record! {
   wire CheckpointWire for CleanupCheckpointV1 vis [pub(crate)] {
     schema CHECKPOINT_SCHEMA,
     version u16 1,
-    limits CLEANUP_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "cleanup checkpoint", canonical "cleanup checkpoint canonical form", header_err "cleanup checkpoint schema"]
     fields {
       /// The GC epoch watermark: host wall-clock UNIX milliseconds. Removal
       /// tombstones stamped at or before this watermark are collected.
-      #[n(2)] watermark_millis = watermark_millis: u64 => stamp()
+      #[n(2)] watermark_millis = watermark_millis: i64 => stamp()
       /// The member that issued the epoch (hygiene provenance only; the
       /// record is unsigned by design — violations degrade to metadata
       /// hygiene issues, never security failures).
@@ -307,12 +307,12 @@ canonical_record! {
 /// leave/cleanup tombstone retires the binding it pins with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CleanupCheckpointV1 {
-  watermark_millis: u64,
+  watermark_millis: i64,
   issuer: NodeId,
 }
 
 impl CleanupCheckpointV1 {
-  pub(crate) const fn new(watermark_millis: u64, issuer: NodeId) -> Self {
+  pub(crate) const fn new(watermark_millis: i64, issuer: NodeId) -> Self {
     Self {
       watermark_millis,
       issuer,
@@ -344,7 +344,7 @@ fn checkpoint_namespace() -> Result<StoreNamespace> {
 /// design, and no peer receipt is ever owed or tracked).
 pub(crate) async fn issue_checkpoint_ctx(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
-) -> Result<u64> {
+) -> Result<i64> {
   let store = context.store();
   let _permit = store.write_permit().await;
   // Inside the writer exclusion no other committer can interleave, so
@@ -403,7 +403,7 @@ pub(crate) async fn issue_checkpoint_ctx(
 /// while the store handle wrapper below opens that snapshot.
 pub(crate) async fn latest_checkpoint_millis(
   snapshot: &(dyn crate::provider::StoreSnapshot + '_),
-) -> Result<Option<u64>> {
+) -> Result<Option<i64>> {
   let Some(value) = snapshot
     .get(&checkpoint_namespace()?, &checkpoint_key())
     .await?
@@ -416,7 +416,7 @@ pub(crate) async fn latest_checkpoint_millis(
 }
 
 /// The latest local checkpoint watermark, if any.
-pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Result<Option<u64>> {
+pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Result<Option<i64>> {
   latest_checkpoint_millis(store.snapshot().await?.as_ref()).await
 }
 
@@ -488,7 +488,7 @@ pub(crate) async fn collect_collected_tombstones_ctx(
 /// the watermark never consumes the batch, so a fresh head cannot hide
 /// the collectible tail behind it.
 async fn collect_cleanup_before_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
+  store: &MetadataStore, entropy: &dyn Entropy, watermark: i64,
 ) -> Result<usize> {
   let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
   let collectible = records::scan_collectible_records(
@@ -543,7 +543,7 @@ mod tests {
   /// knowledge) at an explicit watermark, so GC tests order tombstone
   /// stamps against it deterministically.
   async fn install_checkpoint(
-    context: &lifecycle::LocalIdentityContext, entropy: &dyn crate::api::Entropy, watermark: u64,
+    context: &lifecycle::LocalIdentityContext, entropy: &dyn crate::api::Entropy, watermark: i64,
   ) {
     use crate::{StoreExpectation, StoreOperation, StoreValue};
     let checkpoint = CleanupCheckpointV1::new(watermark, context.identity().node().clone());
@@ -572,7 +572,7 @@ mod tests {
   /// the checkpoint GC can order it against watermarks.
   async fn stamped_tombstone(
     context: &lifecycle::LocalIdentityContext, keys: &Arc<ScriptedKeys>, subject: &NodeId,
-    subject_key: &PublicKey, stamp: u64,
+    subject_key: &PublicKey, stamp: i64,
   ) -> CleanupRecordV1 {
     let identity = context.identity();
     let body =
@@ -708,7 +708,7 @@ mod tests {
   /// binding must be retained for the record to verify.
   fn foreign_tombstone(
     issuer: &NodeId, signing: &ed25519_dalek::SigningKey, subject: &NodeId,
-    subject_key: &PublicKey, stamp: u64,
+    subject_key: &PublicKey, stamp: i64,
   ) -> CleanupRecordV1 {
     use ed25519_dalek::Signer as _;
     let body = CleanupRecordV1::encode_signed_body(subject, subject_key, issuer, stamp).unwrap();

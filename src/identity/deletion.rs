@@ -42,7 +42,7 @@ use crate::{
 /// across its whole phase sequence) and receives the permit; the
 /// section's inner steps get the same permit instead of acquiring again.
 pub(crate) async fn delete_unreferenced_key(
-  _permit: &crate::storage::WriterPermit<'_>, store: &crate::storage::MetadataStore,
+  permit: &crate::storage::WriterPermit<'_>, store: &crate::storage::MetadataStore,
   keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, operation: &KeyOperationId,
   handle: &KeyHandle,
 ) -> Result<()> {
@@ -51,7 +51,7 @@ pub(crate) async fn delete_unreferenced_key(
   // too (a cheap no-op on a non-frozen store), matching its historical
   // unconditional reconcile.
   crate::identity::lifecycle::recover_journal_prologue(
-    _permit,
+    permit,
     store,
     entropy,
     &purpose,
@@ -119,7 +119,7 @@ pub(crate) async fn delete_unreferenced_key(
           )
           .await?;
         drop(snapshot);
-        match commit_with_reconcile(_permit, store, prepared).await? {
+        match commit_with_reconcile(permit, store, prepared).await? {
           CommitWithReconcile::Committed => {}
           CommitWithReconcile::Aborted => {
             if attempts >= 2 {
@@ -132,7 +132,7 @@ pub(crate) async fn delete_unreferenced_key(
       }
     };
     match delete_provider_step(
-      _permit,
+      permit,
       store,
       keys,
       entropy,
@@ -153,7 +153,7 @@ pub(crate) async fn delete_unreferenced_key(
 /// for an installed deletion intent, still inside the caller's writer
 /// section.
 async fn delete_provider_step(
-  _permit: &crate::storage::WriterPermit<'_>, store: &crate::storage::MetadataStore,
+  permit: &crate::storage::WriterPermit<'_>, store: &crate::storage::MetadataStore,
   keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, stored_intent: &StoreValue,
   intent: &KeyDeletionIntentV1, resumed: bool,
 ) -> Result<()> {
@@ -244,12 +244,12 @@ async fn delete_provider_step(
     )
     .await?;
   drop(snapshot);
-  match commit_with_reconcile(_permit, store, prepared).await? {
+  match commit_with_reconcile(permit, store, prepared).await? {
     CommitWithReconcile::Committed => {}
     CommitWithReconcile::Aborted => return accept_exact_tombstone(store, &tombstone).await,
   }
   cleanup_pending_exact(
-    _permit,
+    permit,
     store,
     entropy,
     &purpose,

@@ -89,7 +89,8 @@
 ///   `StoreRevision::new(Arc::from(..)?)`.
 /// - `oid16(W, ctx)`: encode `field.as_bytes().to_vec()`, decode
 ///   `W::from_operation(OperationId::from_bytes(..)?)`.
-/// - `stamp`: passthrough `u64`.
+/// - `stamp`: passthrough integer (the record declares the wire type; stamps
+///   are signed `i64` milliseconds).
 /// - `sig(ctx)`: encode `field.as_bytes().to_vec()`, decode
 ///   `Signature::from_bytes(fixed_bytes(.., ctx)?)`.
 macro_rules! canonical_record {

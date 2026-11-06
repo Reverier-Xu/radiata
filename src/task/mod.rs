@@ -797,7 +797,7 @@ task_result!(
   LeaveOutcome => [Leave] via output::decode_leave,
   NodeId => [Connect] via output::decode_connect,
   RevokeOutcome => [Revoke] via output::decode_revoke,
-  u64 => [IssueCleanupCheckpoint] via output::decode_checkpoint,
+  i64 => [IssueCleanupCheckpoint] via output::decode_checkpoint,
   ListenerView => [Listen] via output::decode_listen,
   ResourceMutationView => [PutResource | DeleteResource] via output::decode_resource_mutation,
   MemberView => [PatchNodeMetadata] via output::decode_member,
