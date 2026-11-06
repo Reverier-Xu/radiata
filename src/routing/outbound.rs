@@ -4,9 +4,10 @@
 //!
 //! Module boundary: the pump owns routing-domain sequencing (the route
 //! envelope, the in-memory route record, the durable terminal trace) and
-//! attaches to the session infrastructure it pumps through — the session
-//! entry's bounded frame queue and its pending-admission map — the
-//! outbound counterpart of the relay path in `crate::routing::forward`.
+//! attaches to the delivery leg it pumps through (see
+//! `crate::session::inbound::DeliveryLeg`) — the leg's bounded frame queue
+//! and its pending-admission map — the outbound counterpart of the relay
+//! path in `crate::routing::forward`.
 //!
 //! Route-record terminal contract: the record is shared between this pump
 //! and the session read loop's late failure reports, and the two writers
@@ -42,22 +43,21 @@ use crate::{
   ErrorKind, NodeId, Result, TraceId,
   packet::{
     AckOutcome, MAX_CHUNK_BYTES, OutboundRequest, RouteState, StreamTarget,
-    wire::{self, ChunkFrame, EndFrame, EndReason, OpenFrame},
+    wire::{ChunkFrame, EndReason, OpenFrame},
   },
-  protocol::wire::PacketKind,
   routing::trace::TraceSink,
-  session::stream::{SessionEntry, SessionFrame, clock_seconds},
+  session::{DeliveryLeg, stream::clock_seconds},
 };
 
-/// Registers one outbound open's admission slot in the session's pending
-/// map: typed backpressure beyond the per-session bound, internal failure
-/// if the lock is poisoned. The named seam of the outbound pump's
+/// Registers one outbound open's admission slot in the leg's pending
+/// map: typed backpressure beyond the leg's bound, internal failure if
+/// the lock is poisoned. The named seam of the outbound pump's
 /// admission phase.
 fn register_admission(
-  entry: &SessionEntry, trace_id: &TraceId, ack_tx: tokio::sync::oneshot::Sender<AckOutcome>,
+  leg: &DeliveryLeg, trace_id: &TraceId, ack_tx: tokio::sync::oneshot::Sender<AckOutcome>,
 ) -> Result<(), ErrorKind> {
-  let queued_at = clock_seconds(entry.clock.as_ref());
-  entry.pending_acks.try_reserve_admission(
+  let queued_at = clock_seconds(leg.clock().as_ref());
+  leg.pending_acks().try_reserve_admission(
     trace_id,
     PendingAck::Wait {
       notify: ack_tx,
@@ -66,17 +66,16 @@ fn register_admission(
   )
 }
 
-/// Streams one admitted body as ordered bounded chunks over the session
-/// queue, advancing the route record's forwarded-bytes counter. Caller
-/// chunks larger than the wire's chunk bound are re-chunked into
+/// Streams one admitted body as ordered bounded chunks through the
+/// delivery leg, advancing the route record's forwarded-bytes counter.
+/// Caller chunks larger than the wire's chunk bound are re-chunked into
 /// wire-legal slices here — chunk boundaries are transport-internal (the
 /// receiver reassembles the body), so one choke point keeps every
 /// caller's body deliverable instead of failing it after the open was
-/// already admitted. Returns the wire failure if the session queue dies
+/// already admitted. Returns the wire failure if the leg's queue dies
 /// mid-stream.
 async fn pump_chunks(
-  entry: &SessionEntry, routes: &RouteTable, trace_id: &TraceId,
-  mut body: crate::packet::BodyStream,
+  leg: &DeliveryLeg, routes: &RouteTable, trace_id: &TraceId, mut body: crate::packet::BodyStream,
 ) -> Result<(), ErrorKind> {
   let mut sequence = 0_u64;
   loop {
@@ -89,15 +88,7 @@ async fn pump_chunks(
             bytes: ByteVec::from(slice.to_vec()),
           };
           sequence = sequence.saturating_add(1);
-          let encoded = wire::encode_chunk(&chunk).map_err(|error| error.kind())?;
-          entry
-            .frames
-            .send(SessionFrame {
-              kind: PacketKind::Chunk,
-              body: encoded,
-            })
-            .await
-            .map_err(|_| ErrorKind::StreamInterrupted)?;
+          leg.deliver_chunk(chunk).await?;
           update_route(routes, trace_id, |record| {
             record.forward(slice.len() as u64);
           });
@@ -110,28 +101,7 @@ async fn pump_chunks(
   }
 }
 
-/// Delivers one admitted stream's typed terminal end to the session queue.
-///
-/// The terminal is the last frame the stream contributes, so it waits for
-/// queue capacity instead of failing on a momentarily saturated queue: the
-/// writer either drains it or the connection dies and the queue closes (the
-/// only remaining failure, reported as `false`). Returns whether the frame
-/// reached the queue.
-async fn send_terminal(entry: &SessionEntry, trace_id: &TraceId, reason: EndReason) -> bool {
-  let Ok(body) = wire::encode_end(&EndFrame {
-    trace_id: trace_id.clone(),
-    reason,
-  }) else {
-    return false;
-  };
-  entry
-    .frames
-    .send_waiting(SessionFrame::new(PacketKind::End, body))
-    .await
-    .is_ok()
-}
-
-/// Pumps one outbound packet over its session: open, admission wait,
+/// Pumps one outbound packet over its delivery leg: open, admission wait,
 /// ordered chunks, end. Updates the in-memory route record and notifies
 /// the synchronous waiter of the admission outcome (the ack
 /// proves current-process admission only).
@@ -155,7 +125,7 @@ async fn send_terminal(entry: &SessionEntry, trace_id: &TraceId, reason: EndReas
   local = %local,
 ))]
 pub(crate) async fn run_outbound(
-  entry: SessionEntry, local: NodeId, request: OutboundRequest, routes: RouteTable,
+  mut leg: DeliveryLeg, local: NodeId, request: OutboundRequest, routes: RouteTable,
   route: Option<crate::routing::PlannedRoute>, trace: Option<crate::routing::trace::TraceSink>,
   events: Arc<crate::node::EventHub>,
 ) {
@@ -213,13 +183,13 @@ pub(crate) async fn run_outbound(
   }
   trace!(routed = route.is_some(), "pumping outbound packet");
   let (ack_tx, ack_rx) = oneshot::channel();
-  if !entry.alive() {
+  if !leg.alive() {
     debug!("packet rejected: session not alive");
     request.reject(ErrorKind::StreamInterrupted);
     terminal!(ErrorKind::StreamInterrupted);
     return;
   }
-  match register_admission(&entry, &trace_id, ack_tx) {
+  match register_admission(&leg, &trace_id, ack_tx) {
     Ok(()) => {}
     Err(ErrorKind::Overloaded) => {
       request.reject(ErrorKind::Overloaded);
@@ -247,7 +217,7 @@ pub(crate) async fn run_outbound(
       match envelope.dispatch() {
         Ok((_, dispatched)) => Some(dispatched.into_hop_state()),
         Err(error) => {
-          withdraw_pending(&entry, &trace_id);
+          leg.withdraw_pending(&trace_id);
           request.reject(error.kind());
           terminal!(error.kind());
           return;
@@ -264,27 +234,10 @@ pub(crate) async fn run_outbound(
     metadata: request.metadata.clone(),
     route: route_state,
   };
-  let body = match wire::encode_open(&open) {
-    Ok(body) => body,
-    Err(error) => {
-      withdraw_pending(&entry, &trace_id);
-      request.reject(error.kind());
-      terminal!(error.kind());
-      return;
-    }
-  };
-  if entry
-    .frames
-    .send(SessionFrame {
-      kind: PacketKind::Open,
-      body,
-    })
-    .await
-    .is_err()
-  {
-    withdraw_pending(&entry, &trace_id);
-    request.reject(ErrorKind::StreamInterrupted);
-    terminal!(ErrorKind::StreamInterrupted);
+  if let Err(kind) = leg.deliver_open(open).await {
+    leg.withdraw_pending(&trace_id);
+    request.reject(kind);
+    terminal!(kind);
     return;
   }
   trace!("packet open queued");
@@ -314,7 +267,7 @@ pub(crate) async fn run_outbound(
     trace_id.clone(),
   )));
 
-  if let Err(kind) = pump_chunks(&entry, &routes, &trace_id, request.body).await {
+  if let Err(kind) = pump_chunks(&leg, &routes, &trace_id, request.body).await {
     // The destination already runs a consumer for this stream: the failure
     // must terminate it explicitly on the wire rather than leaving it
     // waiting on a body that will never continue. The route carried the
@@ -325,7 +278,7 @@ pub(crate) async fn run_outbound(
       kind = ?kind,
       "outbound body failed; interrupting the remote stream"
     );
-    if !send_terminal(&entry, &trace_id, EndReason::Interrupted).await {
+    if !leg.deliver_end(&trace_id, EndReason::Interrupted).await {
       trace!(
         trace_id = %trace_id,
         "interrupted end could not be queued; the session teardown carries the interruption"
@@ -337,7 +290,7 @@ pub(crate) async fn run_outbound(
 
   // The authenticated sender completed the body: the normal completed
   // terminal.
-  if !send_terminal(&entry, &trace_id, EndReason::Completed).await {
+  if !leg.deliver_end(&trace_id, EndReason::Completed).await {
     // The completed end never reached the queue, so the destination cannot
     // observe a clean completion: the local terminal answer is the typed
     // interruption of this stream, and the route failed after its open was
@@ -397,8 +350,8 @@ fn record_route_outcome(
 /// record, the change event, and the durable trace twin. A recorded
 /// `Failed` is final and refuses a later `Delivered`, and a refused
 /// `Delivered` skips the event and the durable twin so the record keeps
-/// the failure's answer. The remote pump and the local self-delivery pump
-/// share this body, so their terminal paths cannot drift.
+/// the failure's answer. Every origin-side delivery leg shares this body,
+/// so their terminal paths cannot drift.
 pub(crate) fn record_route_terminal(
   routes: &RouteTable, events: &crate::node::EventHub, trace: &Option<TraceSink>,
   trace_id: &TraceId, source: &NodeId, destination: &NodeId, state: RouteState,
@@ -444,11 +397,6 @@ fn record_terminal_trace(
     .with_transition(state, trace.clock_now());
     trace.record_terminal(updated);
   }
-}
-
-/// Removes a pending admission that never reached the wire.
-fn withdraw_pending(entry: &SessionEntry, trace_id: &TraceId) {
-  entry.pending_acks.withdraw(trace_id);
 }
 
 #[cfg(test)]
@@ -534,7 +482,10 @@ mod pump_tail_durable_tests {
   use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
   use super::*;
-  use crate::packet::{RouteRecord, StaticBody};
+  use crate::{
+    packet::{RouteRecord, StaticBody},
+    session::stream::SessionEntry,
+  };
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -635,7 +586,7 @@ mod pump_tail_durable_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         request,
         routes.clone(),
@@ -694,7 +645,7 @@ mod pump_tail_durable_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         request,
         routes.clone(),
@@ -721,7 +672,7 @@ mod body_failure_tests {
   use futures_util::stream;
 
   use super::*;
-  use crate::packet::RouteRecord;
+  use crate::{packet::RouteRecord, protocol::wire::PacketKind, session::stream::SessionEntry};
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -794,7 +745,7 @@ mod body_failure_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         request,
         routes.clone(),
@@ -867,7 +818,7 @@ mod body_failure_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         request,
         routes.clone(),
@@ -905,7 +856,10 @@ mod learned_topology_tests {
   use tokio::sync::oneshot;
 
   use super::*;
-  use crate::packet::{RouteRecord, StaticBody};
+  use crate::{
+    packet::{RouteRecord, StaticBody},
+    session::stream::SessionEntry,
+  };
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -992,7 +946,7 @@ mod learned_topology_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         request(trace_id, &destination),
         routes,
@@ -1039,7 +993,7 @@ mod learned_topology_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         request(trace_id, &destination),
         routes,
@@ -1095,7 +1049,7 @@ mod learned_topology_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         failing,
         routes,
@@ -1138,7 +1092,7 @@ mod learned_topology_tests {
     tokio::time::timeout(
       Duration::from_secs(30),
       run_outbound(
-        entry,
+        DeliveryLeg::Session(entry),
         node(1),
         request(trace_id, &destination),
         routes,

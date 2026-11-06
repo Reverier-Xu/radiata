@@ -4,13 +4,16 @@
 //! in strict sequence into the admitted stream's bounded body channel;
 //! ends terminate streams; acks resolve pending outbound admissions
 //! (the origin-side counterpart lives in `crate::routing::outbound`).
-//! The same admission body serves local self-delivery: a packet addressed
-//! to this node is admitted and consumed in-process, with no session and
-//! no route envelope.
+//! The origin-side delivery legs live here too: [`DeliveryLeg`] is the
+//! outbound pump's next hop — a live session's frame queue, or the node
+//! itself admitting and consuming the stream in-process — so local
+//! self-delivery is one hop of the same pump, sharing the admission body
+//! and the pending-admission model, with only the `deliver_*` trio
+//! diverging.
 
 use std::{
   collections::HashMap,
-  sync::{Arc, atomic::Ordering},
+  sync::{Arc, Mutex, atomic::Ordering},
   time::Duration,
 };
 
@@ -19,20 +22,18 @@ use tracing::{debug, trace, warn};
 
 use super::{
   driver::EstablishedSession,
-  stream::{BoundedSender, SessionFrame, SessionPacketContext, clock_seconds},
+  stream::{BoundedSender, SessionEntry, SessionFrame, SessionPacketContext, clock_seconds},
 };
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, Result, StreamMetadata, TraceId,
   packet::{
-    IncomingStream, MAX_CHUNK_BYTES, OutboundRequest, PacketReplyContext, RouteState, RoutedAck,
-    StreamItem, channel_body,
-    wire::{self, AckFrame, AckStatus, ChunkFrame, OpenFrame},
+    IncomingStream, PacketReplyContext, StreamItem, channel_body,
+    wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
   routing::{
-    forward::{self, SessionIdentity},
-    outbound::record_route_terminal,
-    table::{record_terminal_failure, update_route},
+    forward::{self, PendingAck, SessionIdentity},
+    table::record_terminal_failure,
   },
   session::pending::PendingAdmissions,
   transport::connection::ConnectionReader,
@@ -465,8 +466,7 @@ async fn admit_open(
       context,
       incoming,
       consumers,
-    )
-    .await?
+    )?
   } else {
     StreamAdmission {
       status: AckStatus::Unsupported,
@@ -500,8 +500,10 @@ async fn admit_open(
 /// stream table, the consumer lifecycle permit, and the consumer spawn.
 /// `owns_feature` is the caller's gate — the negotiated session selection
 /// for an inbound open, the node's own implemented features for a local
-/// stream — so the two admission paths cannot drift.
-async fn admit_stream(
+/// stream — so the two admission paths cannot drift. The body awaits
+/// nothing: the table lock the local delivery leg holds across it is
+/// never held across a suspension.
+fn admit_stream(
   open: OpenFrame, owns_feature: impl Fn(&crate::FeatureTag) -> bool,
   context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
   consumers: &mut JoinSet<()>,
@@ -623,171 +625,145 @@ async fn admit_stream(
   })
 }
 
-/// Delivers one locally addressed packet: the node is both the source and
-/// the destination, so the stream is admitted through the same admission
-/// body an inbound open uses and consumed in-process — no session, no first
-/// hop, and no route envelope.
-///
-/// The route record already landed in the admission task
-/// (record-before-pump), so this pump only streams the body into the
-/// admitted consumer and records the terminal fact. The synchronous
-/// sender's waiter resolves with the local admission time before any body
-/// byte moves, exactly like a remote destination's acknowledgement.
-pub(crate) async fn run_local(context: Arc<SessionPacketContext>, request: OutboundRequest) {
-  let trace_id = request.trace_id.clone();
-  let local = context.local().clone();
-  let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
-  let mut consumers = ConsumerDrainGuard {
-    consumers: JoinSet::new(),
-    drains: Arc::clone(&context.task_drains),
-  };
-  let open = OpenFrame {
-    trace_id: trace_id.clone(),
-    source: local.clone(),
-    destination: local.clone(),
-    protocol: request.protocol.clone(),
-    metadata: request.metadata.clone(),
-    route: None,
-  };
-  // The local node implements every feature its registry holds — the node
-  // offer supports exactly that set — so the owning-feature gate is the
-  // registry lookup, the same gate the negotiated session selection applies
-  // to an inbound open.
-  let admission = match admit_stream(
-    open,
-    |feature| context.registry.feature_digest(feature).is_some(),
-    &context,
-    &mut incoming,
-    &mut consumers.consumers,
-  )
-  .await
-  {
-    Ok(admission) => admission,
-    Err(error) => {
-      // A poisoned registry lock is an internal fault, not a stream
-      // rejection: report the typed failure and terminate the route
-      // record instead of misreporting a wire-level refusal status.
-      warn!(
-        trace_id = %trace_id,
-        kind = ?error.kind(),
-        "local delivery admission failed"
-      );
-      request.reject(error.kind());
-      record_route_terminal(
-        &context.routes,
-        &context.events,
-        &None,
-        &trace_id,
-        &local,
-        &local,
-        RouteState::Failed(error.kind()),
-      );
-      return;
-    }
-  };
-  let trace = if request.internal {
-    None
-  } else {
-    context.trace_sink().cloned()
-  };
-  if let Some(kind) = admission.status.to_kind() {
-    request.reject(kind);
-    record_route_terminal(
-      &context.routes,
-      &context.events,
-      &trace,
-      &trace_id,
-      &local,
-      &local,
-      RouteState::Failed(kind),
-    );
-    return;
-  }
-  let _ = request.ack_notify.send(Ok(RoutedAck {
-    by: local.clone(),
-    admitted_at: crate::time::from_millis(admission.admitted_at_millis),
-  }));
-  update_route(&context.routes, &trace_id, |record| {
-    record.update(RouteState::Streaming);
-  });
-  context
-    .events
-    .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-      trace_id.clone(),
-    )));
-  let Some(admitted) = incoming.get_mut(&trace_id) else {
-    // The admission body admitted the stream, so its table entry exists; a
-    // missing one is an internal invariant break, reported as the typed
-    // interruption instead of a silent success.
-    record_route_terminal(
-      &context.routes,
-      &context.events,
-      &trace,
-      &trace_id,
-      &local,
-      &local,
-      RouteState::Failed(ErrorKind::Internal),
-    );
-    return;
-  };
-  let mut failure = None;
-  let mut body = request.body;
-  loop {
-    match std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-      Some(Ok(bytes)) => {
-        // Re-chunk at the wire bound so a consumer sees the same chunk
-        // boundaries whether the stream arrived locally or over a session.
-        for slice in bytes.chunks(MAX_CHUNK_BYTES) {
-          // This pump feeds one stream, so the consumer's window is plain
-          // backpressure: the session reader's bounded overload policy
-          // exists to keep a shared connection responsive, which does not
-          // apply here. A closed channel means the consumer is gone.
-          if admitted
-            .stream
-            .send(StreamItem::Chunk(Arc::from(slice)))
-            .await
-            .is_err()
-          {
-            failure = Some(ErrorKind::StreamInterrupted);
-            break;
-          }
-          update_route(&context.routes, &trace_id, |record| {
-            record.forward(slice.len() as u64);
-          });
-        }
-        if failure.is_some() {
-          break;
-        }
-      }
-      Some(Err(error)) => {
-        failure = Some(error.kind());
-        break;
-      }
-      None => break,
+/// The node-level local-delivery plane: the admitted-stream table and the
+/// pending-admission map every local delivery leg of this node shares —
+/// the local counterpart of one session's read loop (one table, one queue
+/// bound, one duplicate detector, one pending map). Because the table is
+/// shared instead of per-pump, duplicate detection and the session queue's
+/// message budget bound the local path exactly like the session path.
+pub(crate) struct LocalDelivery {
+  incoming: Mutex<HashMap<TraceId, AdmittedStream>>,
+  pending_acks: PendingAdmissions,
+}
+
+impl LocalDelivery {
+  /// One plane per node incarnation; `bound` mirrors the per-session
+  /// pending-admission bound the wire path uses.
+  pub(crate) fn new(bound: usize) -> Self {
+    Self {
+      incoming: Mutex::new(HashMap::new()),
+      pending_acks: PendingAdmissions::new(bound),
     }
   }
-  let transition = match failure {
-    Some(kind) => {
-      // The consumer observes exactly one typed interruption, and the
-      // origin's terminal answer is the body's own failure.
-      let _ = admitted.stream.try_send(StreamItem::Interrupted);
-      RouteState::Failed(kind)
+}
+
+/// The local node as one delivery leg of the outbound pump: the stream is
+/// admitted through the node-level [`LocalDelivery`] table — the same
+/// admission body an inbound open runs — and consumed in-process. The leg
+/// owns its delivery's consumer drain guard (its drop hands spawned
+/// consumers to the node-scoped drain) and removes its table entry on
+/// drop, so an interrupted pump cannot strand its admission in the shared
+/// table.
+pub(crate) struct LocalLeg {
+  plane: Arc<LocalDelivery>,
+  packet: Arc<SessionPacketContext>,
+  consumers: ConsumerDrainGuard,
+  trace_id: TraceId,
+}
+
+impl LocalLeg {
+  /// Builds one leg for one locally addressed stream. Born in the
+  /// admission task, moved through the pump handoff, and dropped when the
+  /// pump task ends — every drop point runs inside a runtime context, so
+  /// the guard's drain spawn is always legal.
+  pub(crate) fn new(packet: &Arc<SessionPacketContext>, trace_id: TraceId) -> Self {
+    Self {
+      plane: Arc::clone(&packet.local_delivery),
+      consumers: ConsumerDrainGuard {
+        consumers: JoinSet::new(),
+        drains: Arc::clone(&packet.task_drains),
+      },
+      packet: Arc::clone(packet),
+      trace_id,
     }
-    None => {
-      let _ = admitted.stream.try_send(StreamItem::End);
-      RouteState::Delivered
+  }
+
+  /// The local leg's open: the same admission body an inbound open runs,
+  /// with the node's own registry as the owning-feature gate (the node
+  /// offer supports exactly its registry's features — the same gate the
+  /// negotiated session selection applies to an inbound open). The pump's
+  /// pending waiter resolves on the spot with the admission outcome, the
+  /// local counterpart of a destination's acknowledgement frame.
+  async fn deliver_open(&mut self, open: OpenFrame) -> Result<(), ErrorKind> {
+    let admission = {
+      let mut incoming = self
+        .plane
+        .incoming
+        .lock()
+        .map_err(|_| ErrorKind::Internal)?;
+      admit_stream(
+        open,
+        |feature| self.packet.registry.feature_digest(feature).is_some(),
+        &self.packet,
+        &mut incoming,
+        &mut self.consumers.consumers,
+      )
+      .map_err(|error| error.kind())?
+    };
+    if let Some(PendingAck::Wait { notify, .. }) = self.plane.pending_acks.take(&self.trace_id) {
+      let _ = notify.send(match admission.status.to_kind() {
+        Some(kind) => Err(kind),
+        None => Ok(crate::time::from_millis(admission.admitted_at_millis)),
+      });
     }
-  };
-  record_route_terminal(
-    &context.routes,
-    &context.events,
-    &trace,
-    &trace_id,
-    &local,
-    &local,
-    transition,
-  );
-  debug!(trace_id = %trace_id, "local packet stream finished");
+    Ok(())
+  }
+
+  /// The local leg's chunk: one `StreamItem` into the admitted stream's
+  /// bounded body channel. This pump feeds one stream, so the consumer's
+  /// window is plain backpressure — the session reader's bounded overload
+  /// policy exists to keep a shared connection responsive, which does not
+  /// apply here. A closed channel means the consumer is gone.
+  async fn deliver_chunk(&self, chunk: ChunkFrame) -> Result<(), ErrorKind> {
+    let stream = {
+      let incoming = self
+        .plane
+        .incoming
+        .lock()
+        .map_err(|_| ErrorKind::Internal)?;
+      incoming
+        .get(&chunk.trace_id)
+        .map(|admitted| admitted.stream.clone())
+        .ok_or(ErrorKind::StreamInterrupted)?
+    };
+    stream
+      .send(StreamItem::Chunk(Arc::from(chunk.bytes.as_slice())))
+      .await
+      .map_err(|_| ErrorKind::StreamInterrupted)
+  }
+
+  /// The local leg's typed terminal: the reserved terminal slot carries
+  /// it into a live consumer's channel, and the table entry leaves the
+  /// shared table — the local counterpart of the read loop's end handler.
+  /// `false` means the terminal did not reach a consumer.
+  fn deliver_end(&self, reason: EndReason) -> bool {
+    let terminal = match reason {
+      EndReason::Completed => StreamItem::End,
+      EndReason::Interrupted => StreamItem::Interrupted,
+    };
+    let admitted = self
+      .plane
+      .incoming
+      .lock()
+      .ok()
+      .and_then(|mut incoming| incoming.remove(&self.trace_id));
+    admitted
+      .map(|admitted| admitted.stream.try_send(terminal).is_ok())
+      .unwrap_or(false)
+  }
+}
+
+impl Drop for LocalLeg {
+  fn drop(&mut self) {
+    // The shared node-level table outlives this pump: a leg whose pump
+    // ended before its typed terminal (an aborted task, a shutdown) must
+    // not strand its admission in the table and its slot in the queue
+    // bound. A completed stream already removed its entry; the removal is
+    // then a no-op.
+    if let Ok(mut incoming) = self.plane.incoming.lock() {
+      incoming.remove(&self.trace_id);
+    }
+  }
 }
 
 /// Forwards one chunk to its admitted stream in strict sequence order.
@@ -915,6 +891,121 @@ fn opening_context_digest(
     bytes.extend_from_slice(value);
   }
   crate::identity::signature::body_digest(&bytes)
+}
+
+/// One delivery leg of the origin-side outbound pump: the stream's next
+/// hop. The session leg carries the wire frames over a live session's
+/// bounded frame queue; the local leg admits and consumes the stream
+/// in-process. The legs share the pending-admission map, the clock, and
+/// aliveness — the pump registers its admission wait and withdraws a
+/// never-queued open through either one — and only the `deliver_*` trio
+/// diverges: where the open, the chunks, and the typed terminal go.
+pub(crate) enum DeliveryLeg {
+  Session(SessionEntry),
+  Local(LocalLeg),
+}
+
+impl DeliveryLeg {
+  /// The leg's pending-admission map: the origin's one-shot admission
+  /// waiters (and, on a forwarded session, the hops' relays) register
+  /// here.
+  pub(crate) fn pending_acks(&self) -> &PendingAdmissions {
+    match self {
+      Self::Session(entry) => &entry.pending_acks,
+      Self::Local(leg) => &leg.plane.pending_acks,
+    }
+  }
+
+  /// The leg's wall clock: the pending waiters' queue stamps come from
+  /// the same clock the liveness observer reads.
+  pub(crate) fn clock(&self) -> &Arc<dyn crate::time::WallClock> {
+    match self {
+      Self::Session(entry) => &entry.clock,
+      Self::Local(leg) => &leg.packet.clock,
+    }
+  }
+
+  /// Whether the leg can carry the stream's open: a session whose reader
+  /// loop is gone cannot; the local node always can.
+  pub(crate) fn alive(&self) -> bool {
+    match self {
+      Self::Session(entry) => entry.alive(),
+      Self::Local(_) => true,
+    }
+  }
+
+  /// Delivers the open frame: the session leg encodes it and queues it on
+  /// the session's bounded frame queue; the local leg admits the stream
+  /// and resolves the pump's pending waiter on the spot. The pump awaits
+  /// the leg's pending-admission resolution before streaming any body
+  /// chunk.
+  pub(crate) async fn deliver_open(&mut self, open: OpenFrame) -> Result<(), ErrorKind> {
+    match self {
+      Self::Session(entry) => {
+        let body = wire::encode_open(&open).map_err(|error| error.kind())?;
+        entry
+          .frames
+          .send(SessionFrame {
+            kind: PacketKind::Open,
+            body,
+          })
+          .await
+          .map_err(|_| ErrorKind::StreamInterrupted)
+      }
+      Self::Local(leg) => leg.deliver_open(open).await,
+    }
+  }
+
+  /// Delivers one ordered body chunk (already re-chunked to the wire
+  /// bound by the pump): the session leg encodes it and queues it on the
+  /// session's bounded frame queue; the local leg feeds the admitted
+  /// stream's body channel.
+  pub(crate) async fn deliver_chunk(&self, chunk: ChunkFrame) -> Result<(), ErrorKind> {
+    match self {
+      Self::Session(entry) => {
+        let encoded = wire::encode_chunk(&chunk).map_err(|error| error.kind())?;
+        entry
+          .frames
+          .send(SessionFrame {
+            kind: PacketKind::Chunk,
+            body: encoded,
+          })
+          .await
+          .map_err(|_| ErrorKind::StreamInterrupted)
+      }
+      Self::Local(leg) => leg.deliver_chunk(chunk).await,
+    }
+  }
+
+  /// Delivers the stream's typed terminal. Returns whether the terminal
+  /// reached the leg: the session leg encodes it and waits for queue
+  /// capacity — the terminal is the last frame the stream contributes, so
+  /// the writer either drains it or the connection dies and the queue
+  /// closes; the local leg's reserved terminal slot guarantees it for a
+  /// live consumer.
+  pub(crate) async fn deliver_end(&self, trace_id: &TraceId, reason: EndReason) -> bool {
+    match self {
+      Self::Session(entry) => {
+        let Ok(body) = wire::encode_end(&EndFrame {
+          trace_id: trace_id.clone(),
+          reason,
+        }) else {
+          return false;
+        };
+        entry
+          .frames
+          .send_waiting(SessionFrame::new(PacketKind::End, body))
+          .await
+          .is_ok()
+      }
+      Self::Local(leg) => leg.deliver_end(reason),
+    }
+  }
+
+  /// Removes a pending admission that never reached the leg.
+  pub(crate) fn withdraw_pending(&self, trace_id: &TraceId) {
+    self.pending_acks().withdraw(trace_id);
+  }
 }
 
 #[cfg(test)]
