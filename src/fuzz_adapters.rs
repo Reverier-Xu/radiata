@@ -85,7 +85,7 @@ pub fn persisted_decode(input: &[u8]) {
   let _ = decode_trace_record(input);
   let _ = PendingTransactionV1::decode(input);
   // The migration schema-record grammar is byte-framed: kind byte, tag
-  // length, tag text, optional 32-byte digest.
+  // length, tag text; every other shape fails closed.
   let _ = decode_schema_record(&crate::StoreValue::new(std::sync::Arc::from(input)));
 }
 

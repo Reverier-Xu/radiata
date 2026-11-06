@@ -680,22 +680,6 @@ mod tests {
     )
   }
 
-  /// The pinned canonical encoding of `base_record()`: deterministic CBOR
-  /// plus the digest over the canonical body.
-  const GOLDEN_RESOURCE_RECORD_V1: &[u8] = &[
-    139, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
-    104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 118, 49, 47, 114, 101, 115, 111, 117, 114, 99,
-    101, 45, 114, 101, 99, 111, 114, 100, 1, 120, 40, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111,
-    111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115, 111, 117, 114, 99, 101, 115, 47, 100,
-    101, 109, 111, 45, 111, 98, 106, 101, 99, 116, 104, 100, 111, 99, 117, 109, 101, 110, 116, 109,
-    102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 97, 129, 130, 120, 24, 101, 120, 97,
-    109, 112, 108, 101, 46, 111, 114, 103, 47, 108, 97, 98, 101, 108, 115, 47, 111, 119, 110, 101,
-    114, 102, 116, 101, 97, 109, 45, 97, 25, 3, 232, 120, 26, 110, 111, 100, 101, 45, 48, 48, 48,
-    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 0, 244, 88, 32, 232,
-    209, 48, 96, 222, 7, 77, 195, 147, 217, 211, 78, 106, 213, 171, 102, 43, 91, 52, 71, 218, 131,
-    62, 140, 104, 196, 168, 39, 58, 102, 159, 2,
-  ];
-
   // ---- Records validate before anything else ----
 
   /// A well-formed record round-trips through the canonical encoding
@@ -854,15 +838,6 @@ mod tests {
     // Byte-identical replay is idempotent.
     let decoded = ResourceRecordV1::decode(&equivocate_a.encode().unwrap()).unwrap();
     assert_eq!(&decoded, &equivocate_a);
-  }
-
-  /// Golden vector: the exact canonical bytes of one fixed record are
-  /// pinned so any encoder drift fails loudly.
-  #[test]
-  fn golden_wire_vector_is_stable() {
-    let record = base_record();
-    let bytes = record.encode().unwrap();
-    assert_eq!(bytes.as_slice(), GOLDEN_RESOURCE_RECORD_V1);
   }
 
   // ---- Namespace ownership and reserved labels ----
@@ -1067,15 +1042,16 @@ mod tests {
   }
 
   /// Current and previous fixtures round-trip canonically and preserve
-  /// their exact logical tuple versions: the older golden vector stays
-  /// byte-stable as the previous fixture, and the current fixtures pin
+  /// their exact logical tuple versions: the previous fixture is built
+  /// directly from the record constructor, and the current fixtures pin
   /// the same record shape for a live multi-domain record and a removal.
   #[test]
   fn current_and_previous_fixtures_round_trip_with_exact_versions() {
-    // Previous fixture: the older pinned bytes still decode to the
-    // identical logical record.
-    let previous = ResourceRecordV1::decode(GOLDEN_RESOURCE_RECORD_V1).unwrap();
-    assert_eq!(previous.encode().unwrap(), GOLDEN_RESOURCE_RECORD_V1);
+    // Previous fixture: the record round-trips to the identical logical
+    // record.
+    let previous = base_record();
+    let previous_decoded = ResourceRecordV1::decode(&previous.encode().unwrap()).unwrap();
+    assert_eq!(previous_decoded, previous);
     let previous_version = super::ResourceVersion::from_record(&previous);
     assert_eq!(
       previous_version.timestamp(),

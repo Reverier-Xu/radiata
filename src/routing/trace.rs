@@ -21,9 +21,9 @@
 //!   terminal machine), so the durable evidence converges with the in-memory
 //!   record under either writer ordering.
 //!
-//! Record accessors that only the unit tests and the compatibility
-//! golden-vector reader consume are `#[cfg(test)]`; the production
-//! surface stays exactly the record writer, decoder, and sweeps.
+//! Record accessors that only the unit tests consume are
+//! `#[cfg(test)]`; the production surface stays exactly the record
+//! writer, decoder, and sweeps.
 
 use std::time::{Duration, SystemTime};
 
@@ -223,8 +223,7 @@ impl TraceRecord {
     self
   }
 
-  /// Canonical wire encoding of the trace record; the compatibility
-  /// suite's golden-vector reader shares this exact encoder.
+  /// Canonical wire encoding of the trace record.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical_record(self)
   }
@@ -1167,14 +1166,13 @@ mod tests {
       &'a self, namespace: &'a crate::StoreNamespace, key: &'a crate::StoreKey,
     ) -> crate::BoxFuture<'a, crate::Result<Option<crate::StoreValue>>> {
       Box::pin(async move {
-        // The production schema baseline keeps the open-time migration
-        // pass on its idempotent Current path.
+        // The production schema baseline keeps the open-time schema
+        // gate on its accept-without-writes path.
         let schema = crate::storage::migration::schema_namespace()?;
         if namespace == &schema && key == &crate::storage::migration::schema_key() {
           return Ok(Some(crate::storage::migration::encode_schema_record(
             crate::storage::migration::BASE_RECORD_KIND,
             crate::storage::migration::METADATA_SCHEMA_V1,
-            None,
           )));
         }
         Ok(None)

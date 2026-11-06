@@ -53,9 +53,9 @@ mod view;
 #[doc(hidden)]
 pub mod fuzz_adapters;
 
-/// The frozen `0.1.0` compatibility manifest. Test-only: every
-/// golden vector is consumed through the compatibility and migration
-/// suites; the production wire/record encoders stay the single owners.
+/// Behavioral wire-compatibility checks. Test-only: the previous-shape
+/// node descriptor pin and the fail-closed assertions; the production
+/// wire/record encoders stay the single owners of their formats.
 #[cfg(test)]
 mod compatibility;
 
