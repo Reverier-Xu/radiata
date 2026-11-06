@@ -23,17 +23,18 @@ use crate::{
 pub(crate) struct TrustLane;
 
 impl TrustLane {
-  /// The lane's store namespaces: the lane↔namespace map.
-  const NAMESPACES: [&str; 1] = [crate::storage::families::IDENTITY_BINDING_NAMESPACE];
+  /// The lane's store namespaces: the lane↔namespace map (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 1] = [crate::storage::families::IDENTITY_BINDING_NAMESPACE];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 2;
 }
 
 impl Lane for TrustLane {
   fn id(&self) -> LaneId {
     LaneId::Trust
-  }
-
-  fn namespaces(&self) -> &'static [&'static str] {
-    &Self::NAMESPACES
   }
 
   fn scan<'a>(

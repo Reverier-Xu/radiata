@@ -26,17 +26,18 @@ use crate::{
 pub(crate) struct ResourcesLane;
 
 impl ResourcesLane {
-  /// The lane's store namespaces: the lane↔namespace map.
-  const NAMESPACES: [&str; 1] = [crate::storage::families::RESOURCE_RECORD_NAMESPACE];
+  /// The lane's store namespaces: the lane↔namespace map (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 1] = [crate::storage::families::RESOURCE_RECORD_NAMESPACE];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 3;
 }
 
 impl Lane for ResourcesLane {
   fn id(&self) -> LaneId {
     LaneId::Resources
-  }
-
-  fn namespaces(&self) -> &'static [&'static str] {
-    &Self::NAMESPACES
   }
 
   fn scan<'a>(

@@ -11,7 +11,9 @@
 //!
 //! The lane↔namespace map is [`LaneId::namespaces`]: the incremental scan
 //! plan derives a dirty namespace's lane from it, and each lane's scan
-//! derives its namespaces from the same list.
+//! derives its namespaces from the same list. Every lane projection —
+//! the wire codes, the namespace map, the policy objects — derives from
+//! the lane registry ([`LANES`]).
 
 use std::{
   sync::Arc,
@@ -78,10 +80,6 @@ pub(crate) trait Lane: std::fmt::Debug + Send + Sync + 'static {
   /// The lane this policy reconciles.
   fn id(&self) -> LaneId;
 
-  /// The store namespaces this lane reconciles: the single lane↔namespace
-  /// map ([`LaneId::namespaces`] delegates here).
-  fn namespaces(&self) -> &'static [&'static str];
-
   /// The lane's canonical rows from one snapshot: every owned namespace
   /// scanned in key order, the lane's decode gate applied, and the
   /// lane's reclaimed evidence skipped at the scan boundary (so it never
@@ -130,23 +128,87 @@ pub(crate) trait Lane: std::fmt::Debug + Send + Sync + 'static {
   fn rows_emitted(&self, _rows: usize) {}
 }
 
+/// One lane registry row: the lane's policy object plus the wire code and
+/// store namespaces the lane's own module owns. The values are the lane's
+/// own constants — a row only projects them — so the single source of a
+/// lane's identity stays in the lane's module and the registry stays the
+/// one listing place.
+pub(crate) struct LaneEntry {
+  pub(crate) policy: &'static dyn Lane,
+  pub(crate) code: u8,
+  pub(crate) namespaces: &'static [&'static str],
+}
+
+/// The lane registry: the one managed registration entry point listing the
+/// lane objects. Every lane projection ([`LaneId::all`], [`LaneId::code`],
+/// [`LaneId::from_code`], [`LaneId::policy`], [`LaneId::namespaces`])
+/// derives from these rows, so adding a lane is one row here plus the
+/// lane's own module. The rows are
+/// in [`LaneId`] variant order — the discriminant-indexed projections read
+/// them through it, and the registry-alignment test pins the alignment.
+pub(crate) const LANES: [LaneEntry; 4] = [
+  LaneEntry {
+    policy: &crate::membership::lane::DescriptorsLane,
+    code: crate::membership::lane::DescriptorsLane::CODE,
+    namespaces: &crate::membership::lane::DescriptorsLane::NAMESPACES,
+  },
+  LaneEntry {
+    policy: &crate::identity::lane::TrustLane,
+    code: crate::identity::lane::TrustLane::CODE,
+    namespaces: &crate::identity::lane::TrustLane::NAMESPACES,
+  },
+  LaneEntry {
+    policy: &crate::resource::lane::ResourcesLane,
+    code: crate::resource::lane::ResourcesLane::CODE,
+    namespaces: &crate::resource::lane::ResourcesLane::NAMESPACES,
+  },
+  LaneEntry {
+    policy: &crate::membership::tombstone::TombstonesLane,
+    code: crate::membership::tombstone::TombstonesLane::CODE,
+    namespaces: &crate::membership::tombstone::TombstonesLane::NAMESPACES,
+  },
+];
+
 impl LaneId {
-  /// The lane's policy implementation.
+  /// The lane's registry row. The discriminant indexes the registry
+  /// directly, so the projections are total without fallibility — the
+  /// registry-alignment test pins the row↔variant order this relies on.
+  fn entry(self) -> &'static LaneEntry {
+    &LANES[self as usize]
+  }
+
+  /// Every lane, in registry order: the single closed lane set the
+  /// plane's active-lane passes derive from.
+  pub(crate) fn all() -> impl Iterator<Item = LaneId> {
+    LANES.iter().map(|entry| entry.policy.id())
+  }
+
+  /// The lane's immutable wire code: the `CODE` constant the lane's own
+  /// module owns, read through the registry.
+  pub(crate) fn code(self) -> u8 {
+    self.entry().code
+  }
+
+  /// Resolves a wire code to a lane; unknown codes are `None` and fail
+  /// closed at the decode boundary.
+  pub(crate) fn from_code(code: u8) -> Option<Self> {
+    LANES
+      .iter()
+      .find(|entry| entry.code == code)
+      .map(|entry| entry.policy.id())
+  }
+
+  /// The lane's policy implementation: the registry object the plane
+  /// dispatches the lane's hooks through.
   pub(crate) fn policy(self) -> &'static dyn Lane {
-    let policy: &'static dyn Lane = match self {
-      LaneId::Descriptors => &crate::membership::lane::DescriptorsLane,
-      LaneId::Trust => &crate::identity::lane::TrustLane,
-      LaneId::Resources => &crate::resource::lane::ResourcesLane,
-      LaneId::Tombstones => &crate::membership::tombstone::TombstonesLane,
-    };
-    debug_assert_eq!(policy.id(), self, "lane policy registry mismatch");
-    policy
+    self.entry().policy
   }
 
   /// The store namespaces this lane reconciles: the single lane↔namespace
-  /// map the incremental scan plan and every lane scan derive from.
+  /// map the incremental scan plan and every lane scan derive from — the
+  /// registry row's projection of the lane's own `NAMESPACES` constant.
   pub(crate) fn namespaces(self) -> &'static [&'static str] {
-    self.policy().namespaces()
+    self.entry().namespaces
   }
 }
 
@@ -183,21 +245,42 @@ pub(crate) async fn scan_namespaces(
 mod tests {
   use std::time::SystemTime;
 
-  use super::{LaneId, ScanFilters};
+  use super::{LANES, LaneId, ScanFilters};
 
-  /// The lane registry is total and self-consistent: every wire lane has a
-  /// policy that names the same lane, and every policy owns at least one
-  /// store namespace.
+  /// The lane registry rows align with the [`LaneId`] discriminants: the
+  /// row order is the variant order — the total-indexing contract the
+  /// discriminant projections ([`LaneId::entry`]) rely on.
+  #[test]
+  fn the_lane_registry_rows_align_with_the_lane_discriminants() {
+    for (index, entry) in LANES.iter().enumerate() {
+      assert_eq!(
+        entry.policy.id() as usize,
+        index,
+        "registry row {index} is out of variant order"
+      );
+    }
+  }
+
+  /// The lane registry is closed and self-consistent: every wire lane
+  /// has a policy that names the same lane, a unique wire code that
+  /// round-trips through `from_code`, and at least one store namespace
+  /// the registry projects from the lane's own constant.
   #[test]
   fn the_lane_registry_covers_every_wire_lane() {
-    for lane in LaneId::ALL {
+    for lane in LaneId::all() {
       let policy = lane.policy();
       assert_eq!(policy.id(), lane);
+      assert_eq!(LaneId::from_code(lane.code()), Some(lane));
       assert!(
-        !policy.namespaces().is_empty(),
+        LaneId::all()
+          .filter(|other| *other != lane)
+          .all(|other| other.code() != lane.code()),
+        "duplicate lane code for {lane:?}"
+      );
+      assert!(
+        !lane.namespaces().is_empty(),
         "lane {lane:?} owns no namespace"
       );
-      assert_eq!(lane.namespaces(), policy.namespaces());
     }
   }
 
@@ -291,7 +374,7 @@ mod tests {
   /// against the collected-tombstone watermark.
   #[test]
   fn only_the_tombstone_lane_reads_the_checkpoint() {
-    for lane in LaneId::ALL {
+    for lane in LaneId::all() {
       assert_eq!(
         lane.policy().reads_checkpoint(),
         lane == LaneId::Tombstones,
@@ -305,7 +388,7 @@ mod tests {
   #[test]
   fn the_default_lane_hooks_are_no_ops() {
     let peer = crate::NodeId::parse("node-000000000000000000007").unwrap();
-    for lane in [LaneId::Descriptors, LaneId::Trust] {
+    for lane in LaneId::all() {
       lane.policy().pass_settled(&peer);
       lane.policy().rows_emitted(3);
     }

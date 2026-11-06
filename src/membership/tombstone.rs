@@ -554,22 +554,23 @@ pub(crate) struct TombstonesLane;
 
 impl TombstonesLane {
   /// The lane's store namespaces, in kind order: the lane↔namespace map,
-  /// single-sourced from the wire contract's kind table.
-  const NAMESPACES: [&str; 4] = [
+  /// single-sourced from the wire contract's kind table (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 4] = [
     crate::reconcile::wire::TombstoneKind::Leave.namespace_tag(),
     crate::reconcile::wire::TombstoneKind::Cleanup.namespace_tag(),
     crate::reconcile::wire::TombstoneKind::Revocation.namespace_tag(),
     crate::reconcile::wire::TombstoneKind::Checkpoint.namespace_tag(),
   ];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 4;
 }
 
 impl crate::reconcile::lane::Lane for TombstonesLane {
   fn id(&self) -> crate::reconcile::wire::LaneId {
     crate::reconcile::wire::LaneId::Tombstones
-  }
-
-  fn namespaces(&self) -> &'static [&'static str] {
-    &Self::NAMESPACES
   }
 
   fn scan<'a>(

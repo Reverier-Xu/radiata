@@ -136,9 +136,11 @@ pub(crate) const RECONCILE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/reconci
 
 /// The lanes this build carries on the engine: all four (descriptors,
 /// trust, resources, tombstones) migrated onto the plane, retiring the
-/// watermark walks entirely. Derived from [`LaneId::ALL`], the single
-/// closed lane set.
-const ACTIVE_LANES: [LaneId; LaneId::ALL.len()] = LaneId::ALL;
+/// watermark walks entirely. Derived from [`LaneId::all`], the single
+/// closed lane set the lane registry lists.
+fn active_lanes() -> impl Iterator<Item = LaneId> {
+  LaneId::all()
+}
 
 /// The peers one tick drives with a cadence ROOT exchange: the bounded
 /// fair window over the alive set — the old push-round bound repurposed
@@ -665,11 +667,11 @@ impl ReconcilePlane {
       BTreeSet::new()
     };
     if has_unprimed {
-      Ok(ACTIVE_LANES.into_iter().collect())
+      Ok(active_lanes().collect())
     } else {
       let (dirty, untracked) = store.dirty_namespaces_since(guard.install_epoch);
       if untracked.is_some() {
-        Ok(ACTIVE_LANES.into_iter().collect())
+        Ok(active_lanes().collect())
       } else {
         let mut lanes = forced;
         lanes.extend(repair_lanes);
@@ -742,7 +744,7 @@ impl ReconcilePlane {
     &self, runtime: &RuntimeClient, source: &NodeId, message: Message,
   ) -> Result<()> {
     let lane = message.lane();
-    if !ACTIVE_LANES.contains(&lane) {
+    if !active_lanes().any(|active| active == lane) {
       // Fail closed exactly like a lane mismatch at the engine: the
       // registry carries one closed lane set, so an inactive lane on
       // the wire is foreign input.
@@ -1013,9 +1015,7 @@ fn drive_peers(
   for peer in peers {
     // The per-lane gating computed ahead of the state borrow: which
     // lanes' root exchanges hold out the rounds of other sessions.
-    let held_prime_lanes: Vec<LaneId> = ACTIVE_LANES
-      .iter()
-      .copied()
+    let held_prime_lanes: Vec<LaneId> = active_lanes()
       .filter(|lane| plane.lane_in_round(*lane, Some(peer)) && plane.hold_room(*lane))
       .collect();
     let state = plane
@@ -1040,7 +1040,7 @@ fn drive_peers(
       // serialization like every initiation.
       state.primed = true;
       state.ticks_since_exchange = 0;
-      for lane in ACTIVE_LANES {
+      for lane in active_lanes() {
         if held_prime_lanes.contains(&lane) {
           continue;
         }
@@ -1061,7 +1061,7 @@ fn drive_peers(
       // piggyback rides only on this path (the originator's push head)
       // and only while the session profile allows it.
       let eager = state.profile.eager_delta();
-      for lane in ACTIVE_LANES {
+      for lane in active_lanes() {
         if !plan.contains(&lane) {
           continue;
         }
@@ -1086,7 +1086,7 @@ fn drive_peers(
     // the lane's reclaimed evidence (a collected tombstone, a
     // retention-swept removal). Rows whose key the store does not hold at
     // all stay: they are the derived-view repair set.
-    for lane in ACTIVE_LANES {
+    for lane in active_lanes() {
       if !plan.contains(&lane) {
         continue;
       }
@@ -1206,14 +1206,12 @@ fn cadence_window(plane: &mut PlaneState) -> Outbound {
   plane.rotation = rotation.cloned();
   for peer in window.iter().copied() {
     // The cadence's per-lane gating, computed ahead of the state borrow.
-    let held_cadence_lanes: Vec<LaneId> = ACTIVE_LANES
-      .iter()
-      .copied()
+    let held_cadence_lanes: Vec<LaneId> = active_lanes()
       .filter(|lane| plane.lane_in_round(*lane, Some(peer)) && plane.hold_room(*lane))
       .collect();
     if let Some(state) = plane.peers.get_mut(peer) {
       state.ticks_since_exchange = 0;
-      for lane in ACTIVE_LANES {
+      for lane in active_lanes() {
         // The cadence initiation is gated like every other: a lane
         // still negotiating elsewhere re-drives at the release point
         // with a fresh claim.
@@ -1252,7 +1250,7 @@ fn drain_engines(peers: &mut BTreeMap<NodeId, PeerState>, alive: &[NodeId]) -> O
   let mut outbound: Outbound = Vec::new();
   for peer in alive {
     if let Some(state) = peers.get_mut(peer) {
-      for lane in ACTIVE_LANES {
+      for lane in active_lanes() {
         if let Some(engine) = state.engines.get_mut(&lane) {
           match engine.drive(Drive::Drain) {
             Ok(messages) => {
@@ -1443,9 +1441,7 @@ fn send_message(
 /// row set, so no scan is armed for them).
 fn lane_of_namespace(namespace: &crate::StoreNamespace) -> Option<LaneId> {
   let tag = namespace.as_str();
-  LaneId::ALL
-    .into_iter()
-    .find(|lane| lane.namespaces().contains(&tag))
+  LaneId::all().find(|lane| lane.namespaces().contains(&tag))
 }
 
 /// Scans the planned lanes' namespaces into canonical `(key, content)`
@@ -1458,7 +1454,7 @@ async fn scan_lanes(
 ) -> Result<LaneScan> {
   let snapshot = store.snapshot().await?;
   let mut lanes = Vec::new();
-  for lane in ACTIVE_LANES {
+  for lane in active_lanes() {
     if !plan.contains(&lane) {
       continue;
     }
@@ -1510,20 +1506,26 @@ mod tests {
     sync::Arc,
   };
 
-  use super::{super::wire::LaneId, ACTIVE_LANES, lane_of_namespace, scan_lanes};
+  use super::{super::wire::LaneId, active_lanes, lane_of_namespace, scan_lanes};
   use crate::identity::lifecycle::LocalIdentityContext;
 
   /// The plane carries exactly the wire contract's lane set (the active
-  /// lanes derive from [`LaneId::ALL`]), and the namespace→lane dictionary
+  /// lanes derive from [`LaneId::all`]), and the namespace→lane dictionary
   /// is that same map: every lane's namespaces map back to it and nothing
   /// else claims a lane.
   #[test]
   fn the_active_lanes_and_namespace_map_derive_from_the_wire_lane_set() {
-    assert_eq!(ACTIVE_LANES, LaneId::ALL);
-    for lane in LaneId::ALL {
+    let active: Vec<LaneId> = active_lanes().collect();
+    let every: Vec<LaneId> = LaneId::all().collect();
+    assert_eq!(active, every);
+    for lane in &every {
       for tag in lane.namespaces() {
         let namespace = crate::storage::families::namespace(tag).unwrap();
-        assert_eq!(lane_of_namespace(&namespace), Some(lane), "namespace {tag}");
+        assert_eq!(
+          lane_of_namespace(&namespace),
+          Some(*lane),
+          "namespace {tag}"
+        );
       }
     }
     // A namespace outside every lane's key space arms no scan.
