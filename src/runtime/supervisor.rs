@@ -28,7 +28,7 @@ use crate::{
     SessionDriver,
     stream::{SessionPacketContext, SessionTable, run_session},
   },
-  transport::registry::{Transport, TransportListener, TransportTrust},
+  transport::registry::{Transport, TransportListener},
 };
 
 /// Depth of the node's control channel, the API verbs' command queue:
@@ -1317,10 +1317,9 @@ impl Supervisor {
 /// future is cancelled, so the deadline and endpoint are the only real
 /// cause a diagnostic can carry.
 pub(super) async fn connect_with_deadline(
-  transport: &Arc<dyn Transport>, receiver: Endpoint, trust: TransportTrust,
-  deadline: std::time::Duration,
+  transport: &Arc<dyn Transport>, receiver: Endpoint, deadline: std::time::Duration,
 ) -> Result<crate::transport::connection::Connection> {
-  match tokio::time::timeout(deadline, transport.connect(receiver.clone(), trust)).await {
+  match tokio::time::timeout(deadline, transport.connect(receiver.clone())).await {
     Ok(result) => result,
     Err(_) => {
       tracing::debug!(
@@ -1359,13 +1358,10 @@ pub(super) async fn dial_member(
   };
   crate::audit::dial_started(peer.as_str(), initiator);
   let result = async {
-    // A member dial carries the same trust intent as a join dial: the
-    // endpoint's transport class decides it, and the member handshake's
-    // identity proof authenticates the peer over the fresh channel
-    // binding.
-    let trust = TransportTrust::for_dial(&receiver.selector());
-    let mut connection =
-      connect_with_deadline(&transport, receiver.clone(), trust, dial_deadline).await?;
+    // The member dial dials the endpoint's transport directly: the
+    // member handshake's identity proof authenticates the peer over the
+    // fresh channel binding.
+    let mut connection = connect_with_deadline(&transport, receiver.clone(), dial_deadline).await?;
     let session = driver.initiate_member(&mut connection, peer).await?;
     let authenticated = session.peer().clone();
     // The member-mode dial returns only after the session table settles, so
@@ -1428,10 +1424,7 @@ mod dial_deadline_tests {
   };
 
   use super::connect_with_deadline;
-  use crate::{
-    Endpoint, ErrorKind,
-    transport::{registry::TransportTrust, wss::WssTransport},
-  };
+  use crate::{Endpoint, ErrorKind, transport::wss::WssTransport};
 
   /// A peer that accepts TCP and then goes silent must surface the typed
   /// dial failure within the configured deadline instead of hanging the
@@ -1459,7 +1452,7 @@ mod dial_deadline_tests {
     let endpoint = Endpoint::parse(&format!("wss://127.0.0.1:{}", address.port())).unwrap();
     let deadline = Duration::from_millis(100);
     let started = Instant::now();
-    let error = connect_with_deadline(&transport, endpoint, TransportTrust::Merge, deadline)
+    let error = connect_with_deadline(&transport, endpoint, deadline)
       .await
       .unwrap_err();
     let elapsed = started.elapsed();

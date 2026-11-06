@@ -3,12 +3,14 @@
 //!
 //! The layer is open by construction: a transport owns the
 //! listener/connection lifecycle for one canonical
-//! [`TransportTag`](crate::TransportTag), the endpoint's [`TransportSelector`]
-//! is the resolution key, and the extension registry is the single map from
-//! selector to implementation. Callers register custom media (an ESP-NOW radio,
-//! an 802.11 link, a serial bus) through [`crate::TransportProvider`]; the
-//! official transports cover the ordinary deployment space and are installed
-//! by the registry's explicit default path:
+//! [`TransportTag`](crate::TransportTag) identity, the endpoint's scheme
+//! name is the resolution key, and the extension registry is the single
+//! map from scheme name to implementation. Callers register custom media
+//! (an ESP-NOW radio, an 802.11 link, a serial bus) through
+//! [`crate::TransportProvider`]; the official transports cover the
+//! ordinary deployment space and are installed by the registry's explicit
+//! default path under their scheme names, with no privilege over a
+//! caller registration:
 //!
 //! - [`tls_transport`] — direct TLS 1.3 over TCP. **The default**: the
 //!   simplest, cheapest stream; advertise `tls://` endpoints unless a
@@ -42,9 +44,8 @@
 //!   `<scheme>host[:port]` and the custom `<name>://<opaque>` forms) used to
 //!   address listeners and peers.
 //! - [`registry`] carries the open transport map: the internal
-//!   [`registry::Transport`] boundary, the public
-//!   [`registry::TransportProvider`] extension surface, and the trust intent
-//!   dials carry.
+//!   [`registry::Transport`] boundary and the public
+//!   [`registry::TransportProvider`] extension surface.
 
 pub(crate) mod cert;
 pub(crate) mod connection;
@@ -60,10 +61,9 @@ pub(crate) mod verify;
 pub(crate) mod ws;
 pub(crate) mod wss;
 
-pub use endpoint::{Endpoint, TransportName, TransportScheme, TransportSelector};
+pub use endpoint::{Endpoint, TransportName, TransportScheme};
 pub use registry::{
-  AcceptedStream, ProviderListener, TransportAdmission, TransportCapabilities, TransportProvider,
-  TransportStream,
+  AcceptedStream, ProviderListener, TransportAdmission, TransportProvider, TransportStream,
 };
 
 pub use crate::paging::PageCursor;

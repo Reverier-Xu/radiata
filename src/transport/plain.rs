@@ -19,24 +19,14 @@
 
 use std::fmt;
 
-use tokio::net::TcpListener;
-
 use super::{
   connection::{Connection, FrameRules, plaintext_channel_binding},
   endpoint::{Endpoint, TransportScheme},
   framing::MergeHint,
-  registry::{
-    Transport, TransportAdmission, TransportCapabilities, TransportListener, TransportTrust,
-  },
-  tcp,
+  registry::{Transport, TransportAdmission, TransportListener},
+  tcp::{self, TcpListenerBase},
 };
-use crate::{
-  Error, ProviderErrorContext, Result, api::BoxFuture, protocol::wire::connection_frame_rules,
-};
-
-/// The canonical tag of the built-in plaintext transport: the
-/// closed-intranet IoT choice, selected by `tcp://` endpoints.
-pub(crate) const BUILTIN_TRANSPORT_TCP: &str = "radiata.woooo.tech/transports/tcp";
+use crate::{ProviderErrorContext, Result, api::BoxFuture, protocol::wire::connection_frame_rules};
 
 /// The built-in plaintext TCP transport.
 pub(crate) struct PlainTransport;
@@ -56,38 +46,25 @@ impl PlainTransport {
 }
 
 impl Transport for PlainTransport {
-  fn capabilities(&self) -> TransportCapabilities {
-    TransportCapabilities::new(TransportAdmission::PeerAddressed)
+  fn admission(&self) -> TransportAdmission {
+    TransportAdmission::PeerAddressed
   }
 
   fn bind(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Box<dyn TransportListener>>> {
-    let admission = self.capabilities().admission();
+    let admission = self.admission();
     Box::pin(async move {
-      let (listener, bound) = tcp::bind(&endpoint, TransportScheme::Tcp).await?;
+      let base = TcpListenerBase::bind(&endpoint, TransportScheme::Tcp).await?;
       let rules = connection_frame_rules()?;
-      let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
       Ok(Box::new(PlainListener {
-        listener,
-        shutdown_tx,
-        shutdown: shutdown_rx,
+        base,
         rules,
-        bound,
         admission,
       }) as Box<dyn TransportListener>)
     })
   }
 
-  fn connect(
-    &self, endpoint: Endpoint, trust: TransportTrust,
-  ) -> BoxFuture<'static, Result<Connection>> {
+  fn connect(&self, endpoint: Endpoint) -> BoxFuture<'static, Result<Connection>> {
     Box::pin(async move {
-      // The plaintext transport only accepts plaintext trust: a TLS
-      // trust mode arriving here is a caller bug (the endpoint scheme
-      // and the trust intent disagree) and fails typed instead of
-      // silently downgrading the intended channel.
-      if !matches!(trust, TransportTrust::Plaintext) {
-        return Err(Error::invalid_input("transport trust"));
-      }
       let tcp = tcp::dial(&endpoint, ProviderErrorContext::TransportConnect).await?;
       let rules = connection_frame_rules()?;
       let channel_binding = plaintext_channel_binding()?;
@@ -105,11 +82,8 @@ impl Transport for PlainTransport {
 
 /// A [`TransportListener`] for the built-in plaintext transport.
 pub(crate) struct PlainListener {
-  listener: TcpListener,
-  shutdown_tx: tokio::sync::watch::Sender<()>,
-  shutdown: tokio::sync::watch::Receiver<()>,
+  base: TcpListenerBase,
   rules: FrameRules,
-  bound: Endpoint,
   admission: TransportAdmission,
 }
 
@@ -117,28 +91,22 @@ impl fmt::Debug for PlainListener {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("PlainListener")
-      .field("bound", &self.bound)
+      .field("bound", &self.base.local_endpoint())
       .finish_non_exhaustive()
   }
 }
 
 impl TransportListener for PlainListener {
   fn local_endpoint(&self) -> Endpoint {
-    self.bound.clone()
+    self.base.local_endpoint()
   }
 
   fn accept<'a>(
     &'a self, hint: &'a (dyn Fn() -> Option<MergeHint> + Send + Sync),
   ) -> BoxFuture<'a, Result<Connection>> {
     let rules = self.rules;
-    let mut shutdown = self.shutdown.clone();
     Box::pin(async move {
-      let tcp = tcp::accept(
-        &self.listener,
-        &mut shutdown,
-        ProviderErrorContext::TransportAccept,
-      )
-      .await?;
+      let tcp = self.base.accept_tcp().await?;
       let peer_addr = tcp.peer_addr().ok();
       // The plaintext class serves no TLS material: the member-mode
       // reconnects over `tcp://` rely on the handshake proofs alone.
@@ -160,10 +128,7 @@ impl TransportListener for PlainListener {
 
   fn close<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
-      // Signalling only wakes a pending accept (it returns the shutdown
-      // error); the socket stays bound until the owner drops the
-      // listener, which is what releases the address for a rebind.
-      let _ = self.shutdown_tx.send(());
+      self.base.close();
       Ok(())
     })
   }

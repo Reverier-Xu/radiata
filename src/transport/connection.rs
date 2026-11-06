@@ -146,16 +146,8 @@ impl Connection {
     tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, admission: TransportAdmission,
     hint: Option<&MergeHint>,
   ) -> Result<Self> {
-    let peer_addr = tcp.peer_addr().ok();
-    let tls = TlsAcceptor::from(config)
-      .accept(tcp)
-      .await
-      .map_err(|error| {
-        tls_handshake_error(&error, ProviderErrorContext::TransportAccept, "tls accept")
-      })?;
-    tracing::debug!("tls connection accepted");
-    let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
-    let stream = ws::accept(TlsStream::from(tls), hint).await?;
+    let (tls, peer_addr, channel_binding) = accept_tls_raw(tcp, config).await?;
+    let stream = ws::accept(tls, hint).await?;
     let peer_addr = match admission {
       TransportAdmission::PeerAddressed => peer_addr,
       TransportAdmission::Addressless => None,
@@ -192,19 +184,8 @@ impl Connection {
       })?
       .port();
     let authority = upgrade_authority(&server_name, port);
-    let tls = TlsConnector::from(config)
-      .connect(server_name, tcp)
-      .await
-      .map_err(|error| {
-        tls_handshake_error(
-          &error,
-          ProviderErrorContext::TransportConnect,
-          "tls connect",
-        )
-      })?;
-    tracing::debug!("tls connection established");
-    let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
-    let (stream, merge_hint) = ws::connect(TlsStream::from(tls), &authority).await?;
+    let (tls, channel_binding) = connect_tls_raw(tcp, config, server_name).await?;
+    let (stream, merge_hint) = ws::connect(tls, &authority).await?;
     Ok(Self {
       io: TransportIo::Ws(Box::new(stream)),
       rules,
@@ -697,6 +678,52 @@ pub(crate) fn tls_handshake_error(
     return Error::authentication_failed(auth_context);
   }
   Error::provider(ProviderErrorKind::Io, context)
+}
+
+/// Performs the inbound TLS 1.3 handshake over one accepted TCP stream
+/// and derives the exporter channel binding. Shared by every TLS-class
+/// listener accept: the WebSocket class upgrades the returned stream, the
+/// raw class frames it directly.
+pub(crate) async fn accept_tls_raw(
+  tcp: TcpStream, config: Arc<ServerConfig>,
+) -> Result<(
+  TlsStream<TcpStream>,
+  Option<SocketAddr>,
+  [u8; CHANNEL_BINDING_LEN],
+)> {
+  let peer_addr = tcp.peer_addr().ok();
+  let server = TlsAcceptor::from(config)
+    .accept(tcp)
+    .await
+    .map_err(|error| {
+      tls_handshake_error(&error, ProviderErrorContext::TransportAccept, "tls accept")
+    })?;
+  tracing::debug!("tls connection accepted");
+  let channel_binding = exporter_channel_binding(server.get_ref().1)?;
+  let tls = TlsStream::from(server);
+  Ok((tls, peer_addr, channel_binding))
+}
+
+/// Performs the outbound TLS 1.3 handshake to `server_name` over one
+/// dialed TCP stream and derives the exporter channel binding. Shared by
+/// every TLS-class dial.
+pub(crate) async fn connect_tls_raw(
+  tcp: TcpStream, config: Arc<ClientConfig>, server_name: ServerName<'static>,
+) -> Result<(TlsStream<TcpStream>, [u8; CHANNEL_BINDING_LEN])> {
+  let client = TlsConnector::from(config)
+    .connect(server_name, tcp)
+    .await
+    .map_err(|error| {
+      tls_handshake_error(
+        &error,
+        ProviderErrorContext::TransportConnect,
+        "tls connect",
+      )
+    })?;
+  tracing::debug!("tls connection established");
+  let channel_binding = exporter_channel_binding(client.get_ref().1)?;
+  let tls = TlsStream::from(client);
+  Ok((tls, channel_binding))
 }
 
 #[cfg(test)]

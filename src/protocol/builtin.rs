@@ -252,7 +252,6 @@ mod tests {
       },
     },
     storage::families::metadata_families,
-    transport::registry::builtin_transport_tag,
   };
 
   /// The pinned size of each category. A new built-in tag (or a removal)
@@ -299,9 +298,7 @@ mod tests {
     "src/storage/migration.rs",
     "src/storage/pending.rs",
     "src/task/mod.rs",
-    "src/transport/plain.rs",
-    "src/transport/tls_transport.rs",
-    "src/transport/wss.rs",
+    "src/transport/endpoint.rs",
     "src/view.rs",
     "test-support/src/lib.rs",
   ];
@@ -447,7 +444,7 @@ mod tests {
 
     let transports: BTreeSet<String> = TransportScheme::ALL
       .into_iter()
-      .map(|scheme| builtin_transport_tag(scheme).unwrap().as_str().to_owned())
+      .map(|scheme| scheme.builtin_tag().to_owned())
       .collect();
     assert_eq!(
       transports,
