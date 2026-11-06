@@ -624,7 +624,6 @@ pub fn radiata::OutboundStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> cor
 pub struct radiata::PageCursor(_)
 impl radiata::PageCursor
 pub fn radiata::PageCursor::as_bytes(&self) -> &[u8]
-pub fn radiata::PageCursor::from_provider_bytes(alloc::rcs::arc::Arc<[u8]>) -> radiata::Result<Self>
 pub fn radiata::PageCursor::new(alloc::rcs::arc::Arc<[u8]>) -> radiata::Result<Self>
 pub struct radiata::PageSpec
 impl radiata::PageSpec

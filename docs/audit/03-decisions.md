@@ -178,3 +178,13 @@ Confirmed by the project owner in a structured interview following the round-5 a
 | P3-8 (sleeps) | **NO-FIX (re-confirmed)** |
 | P3-4 / P3-7 (CHANGELOG, minimal example) | **NO-FIX (re-confirmed)** — postponed past 0.1.0 |
 | Unimplemented standing decisions | All remaining DECIDED items above (A1, A2, B3, B4, D7, B1 core, B2, B5-B12, A7, A11, A12, C1-C3, D8-D15, local-delivery hop, E2-E5, A10, feed-watch scan cursor) are authorized for implementation in the 0.1.0 cycle |
+
+## Implementation-closure notes (round 5, at merge completion)
+
+| Topic | Disposition |
+|---|---|
+| E47 (retry-class × A2 interaction) | **RESOLVED** — with A2 landed, `RetryClass::Extension` no longer auto-retries (`task_manager.rs`: `Extension | Once => false`); the reconciler's explicit `Retry` decision is the only re-arm path. The extension schedule now applies solely to explicit retries, exactly as anticipated. |
+| B9 scope correction | `register_transport` is **not applicable** to `require_caller_domain`: the extended B1 decision made official scheme names ordinary claimable registry names and the transport name carries no domain. The reserved-name rule lives in `TransportName::parse` (`ws`). The check was applied to the other four seams. Round-5's "five seams" is thereby four. |
+| Poisoned-mapper ×8 consolidation | **NO-FIX (revised from the P3 package)** — the eight mappers are used as function references at 54 call sites; inlining closures would copy the same context literal 54 times, a stringly regression under the crate's own single-sourcing discipline. The one-named-site-per-table rule stands. |
+| `audit.rs` journal-purpose enum | **NO-FIX** — the purpose is durable record data decoded from the pending journal, not a compile-time classification; its audit spelling is already pinned by the pending-record schema. An enum would add a parse layer to a diagnostics-only path. |
+| Public page types ×7 consolidation | **DEFERRED** — converting the seven `{items, next}` page structs to `Page<T>` aliases is pure ABI churn (every struct rendering changes) for a P3 cosmetic gain; revisit only if a further page type is added. |
