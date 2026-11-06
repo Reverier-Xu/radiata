@@ -57,7 +57,7 @@
 //!   `receipt-retention/sweep-operation/v1`,
 //!   `receipt-eligibility/sweep-operation/v1`,
 //!   `receipt-eligibility/orphaned-candidate/v1`, `resource-removal/sweep/v1`,
-//!   `migration-transaction-v1`, and `migration-implementation-v1`.
+//!   and `crash/redb-v1` (the test-only crash-hook namespace).
 //! - `crypto/v1/feature-fingerprint/` is a domain-separation *prefix* (the full
 //!   seed appends a feature tag), not a complete tag.
 //! - Test-only tags under the built-in domain (`protocols/test-echo`,

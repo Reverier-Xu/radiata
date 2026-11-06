@@ -137,7 +137,7 @@ fn boundary_values_construct_parse_and_round_trip() {
 fn page_specs_and_cursors() {
   let spec = PageSpec::first(8).unwrap();
   let cursor_bytes: Arc<[u8]> = Arc::from(b"cursor-bytes".to_vec());
-  let cursor = PageCursor::from_provider_bytes(cursor_bytes.clone()).unwrap();
+  let cursor = PageCursor::new(cursor_bytes.clone()).unwrap();
   assert_eq!(cursor.as_bytes(), cursor_bytes.as_ref());
   let _after = PageSpec::after(cursor, 8).unwrap();
   let _first_again = spec;

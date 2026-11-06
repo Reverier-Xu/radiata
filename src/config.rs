@@ -2,6 +2,48 @@ use std::{collections::BTreeSet, time::Duration};
 
 use crate::{Error, FeatureTag, Result};
 
+/// The shared zero-refusal contract for every configured bound: a zero
+/// value is a caller mistake, not a "disable" spelling, so every setter
+/// fails typed with the value's own name.
+fn reject_zero<T>(name: &'static str, value: T) -> Result<()>
+where
+  T: ZeroCheck, {
+  value.zero_checked(name)
+}
+
+/// The internal seal over the two bound shapes a config knob takes:
+/// a plain count and a duration.
+trait ZeroCheck {
+  fn zero_checked(&self, name: &'static str) -> Result<()>;
+}
+
+impl ZeroCheck for usize {
+  fn zero_checked(&self, name: &'static str) -> Result<()> {
+    if *self == 0 {
+      return Err(Error::invalid_input(name));
+    }
+    Ok(())
+  }
+}
+
+impl ZeroCheck for u32 {
+  fn zero_checked(&self, name: &'static str) -> Result<()> {
+    if *self == 0 {
+      return Err(Error::invalid_input(name));
+    }
+    Ok(())
+  }
+}
+
+impl ZeroCheck for Duration {
+  fn zero_checked(&self, name: &'static str) -> Result<()> {
+    if self.is_zero() {
+      return Err(Error::invalid_input(name));
+    }
+    Ok(())
+  }
+}
+
 /// The node configuration: every knob is a plain value, clonable so one
 /// construction site can share a calibrated config across nodes or retry
 /// a start without rebuilding it.
@@ -73,9 +115,7 @@ impl NodeConfig {
   /// the member table (N × interval per round cluster-wide); a cluster
   /// keeping one interval keeps its load predictable (nonzero).
   pub fn with_anti_entropy_interval(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("anti-entropy interval"));
-    }
+    reject_zero("anti-entropy interval", value)?;
     self.anti_entropy_interval = value;
     Ok(self)
   }
@@ -93,12 +133,8 @@ impl NodeConfig {
   /// budget. Local memory and backpressure only — it never crosses the
   /// wire, so per-device scaling is safe (both nonzero).
   pub fn with_session_queue_limits(mut self, messages: usize, bytes: usize) -> Result<Self> {
-    if messages == 0 {
-      return Err(Error::invalid_input("session queue messages"));
-    }
-    if bytes == 0 {
-      return Err(Error::invalid_input("session queue bytes"));
-    }
+    reject_zero("session queue messages", messages)?;
+    reject_zero("session queue bytes", bytes)?;
     self.session_queue_messages = messages;
     self.session_queue_bytes = bytes;
     Ok(self)
@@ -207,12 +243,8 @@ impl NodeConfig {
   /// The extension channel's budget is configured separately with
   /// [`NodeConfig::with_task_reconcile_extension_slots`].
   pub fn with_task_reconcile_slots(mut self, local: usize, network: usize) -> Result<Self> {
-    if local == 0 {
-      return Err(Error::invalid_input("local task reconcile slots"));
-    }
-    if network == 0 {
-      return Err(Error::invalid_input("network task reconcile slots"));
-    }
+    reject_zero("local task reconcile slots", local)?;
+    reject_zero("network task reconcile slots", network)?;
     self.task_reconcile_local_slots = local;
     self.task_reconcile_network_slots = network;
     Ok(self)
@@ -224,17 +256,13 @@ impl NodeConfig {
   /// local capacity its own child operations need. Purely local
   /// admission, never peer-visible; the value must be nonzero.
   pub fn with_task_reconcile_extension_slots(mut self, extension: usize) -> Result<Self> {
-    if extension == 0 {
-      return Err(Error::invalid_input("extension task reconcile slots"));
-    }
+    reject_zero("extension task reconcile slots", extension)?;
     self.task_reconcile_extension_slots = extension;
     Ok(self)
   }
 
   pub fn with_receipt_retention(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("receipt retention"));
-    }
+    reject_zero("receipt retention", value)?;
     self.receipt_retention = value;
     Ok(self)
   }
@@ -258,9 +286,7 @@ impl NodeConfig {
   pub fn with_resource_removal_retention(
     mut self, retention: Duration, cap: usize,
   ) -> Result<Self> {
-    if retention.is_zero() {
-      return Err(Error::invalid_input("resource removal retention"));
-    }
+    reject_zero("resource removal retention", retention)?;
     self.resource_removal_retention = retention;
     self.resource_removal_cap = cap;
     Ok(self)
@@ -274,9 +300,7 @@ impl NodeConfig {
   /// the authentication deadline, which starts only after the connect
   /// returns.
   pub fn with_dial_deadline(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("dial deadline"));
-    }
+    reject_zero("dial deadline", value)?;
     self.dial_deadline = value;
     Ok(self)
   }
@@ -290,9 +314,7 @@ impl NodeConfig {
   /// keep it uniform across a cluster and tighten it only for
   /// uniformly fast deployments.
   pub fn with_authentication_deadline(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("authentication deadline"));
-    }
+    reject_zero("authentication deadline", value)?;
     self.authentication_deadline = value;
     Ok(self)
   }
@@ -306,9 +328,7 @@ impl NodeConfig {
   /// a stuck hop would hang to the transitive liveness bound of the
   /// sessions on the path.
   pub fn with_relay_hop_deadline(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("relay hop deadline"));
-    }
+    reject_zero("relay hop deadline", value)?;
     self.relay_hop_deadline = value;
     Ok(self)
   }
@@ -534,9 +554,7 @@ impl MergeAdmissionLimits {
   /// join pool stays fixed (strangers do not scale with the cluster);
   /// only the member pool grows with the expected member count.
   pub fn for_cluster(expected_members: usize) -> Result<Self> {
-    if expected_members == 0 {
-      return Err(Error::invalid_input("expected members"));
-    }
+    reject_zero("expected members", expected_members)?;
     Ok(Self::scaled(expected_members))
   }
 
@@ -562,18 +580,10 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    if source_burst == 0 {
-      return Err(Error::invalid_input("join source burst"));
-    }
-    if global_burst == 0 {
-      return Err(Error::invalid_input("join global burst"));
-    }
-    if source_window.is_zero() {
-      return Err(Error::invalid_input("join source window"));
-    }
-    if global_window.is_zero() {
-      return Err(Error::invalid_input("join global window"));
-    }
+    reject_zero("join source burst", source_burst)?;
+    reject_zero("join global burst", global_burst)?;
+    reject_zero("join source window", source_window)?;
+    reject_zero("join global window", global_window)?;
     self.join_source = (source_burst, source_window);
     self.join_global = (global_burst, global_window);
     Ok(self)
@@ -586,18 +596,10 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    if source_burst == 0 {
-      return Err(Error::invalid_input("member source burst"));
-    }
-    if global_burst == 0 {
-      return Err(Error::invalid_input("member global burst"));
-    }
-    if source_window.is_zero() {
-      return Err(Error::invalid_input("member source window"));
-    }
-    if global_window.is_zero() {
-      return Err(Error::invalid_input("member global window"));
-    }
+    reject_zero("member source burst", source_burst)?;
+    reject_zero("member global burst", global_burst)?;
+    reject_zero("member source window", source_window)?;
+    reject_zero("member global window", global_window)?;
     self.member_source = (source_burst, source_window);
     self.member_global = (global_burst, global_window);
     Ok(self)
@@ -636,15 +638,9 @@ pub struct TraceMetadataLimits {
 
 impl TraceMetadataLimits {
   pub fn new(active: usize, terminal: usize, retention: Duration) -> Result<Self> {
-    if active == 0 {
-      return Err(Error::invalid_input("active trace metadata"));
-    }
-    if terminal == 0 {
-      return Err(Error::invalid_input("terminal trace metadata"));
-    }
-    if retention.is_zero() {
-      return Err(Error::invalid_input("trace metadata retention"));
-    }
+    reject_zero("active trace metadata", active)?;
+    reject_zero("terminal trace metadata", terminal)?;
+    reject_zero("trace metadata retention", retention)?;
     Ok(Self {
       active,
       terminal,
@@ -705,12 +701,8 @@ impl RecoveryConfig {
     if fan_out == 0 {
       return Err(Error::invalid_input("recovery fan-out"));
     }
-    if initial_backoff.is_zero() {
-      return Err(Error::invalid_input("initial recovery backoff"));
-    }
-    if maximum_backoff.is_zero() {
-      return Err(Error::invalid_input("maximum recovery backoff"));
-    }
+    reject_zero("initial recovery backoff", initial_backoff)?;
+    reject_zero("maximum recovery backoff", maximum_backoff)?;
     if initial_backoff > maximum_backoff {
       return Err(Error::invalid_input("recovery policy"));
     }
