@@ -285,7 +285,7 @@ impl Supervisor {
       );
     }
     crate::ObservabilitySnapshot::new(
-      std::time::SystemTime::now(),
+      crate::time::now(),
       crate::view::ObservabilityCounts {
         sessions,
         listeners: self
@@ -327,7 +327,7 @@ impl Supervisor {
               context_node.clone(),
               peer.clone(),
               entry.alive(),
-              std::time::SystemTime::now(),
+              crate::time::now(),
             ),
           )
         })

@@ -161,7 +161,7 @@ impl From<HandshakeError> for Error {
       HandshakeError::Terminal => Error::authentication_failed("handshake terminal"),
       HandshakeError::NonCanonical => Error::invalid_input("handshake non-canonical"),
       HandshakeError::UnknownField => Error::invalid_input("handshake unknown field"),
-      HandshakeError::Malformed { .. } => Error::invalid_input("handshake malformed"),
+      HandshakeError::Malformed { context } => Error::invalid_input(context),
       HandshakeError::RoleSwapped => Error::authentication_failed("handshake role swapped"),
       HandshakeError::Duplicate => Error::authentication_failed("handshake duplicate"),
       HandshakeError::OutOfOrder => Error::authentication_failed("handshake out of order"),
@@ -178,7 +178,7 @@ impl From<HandshakeError> for Error {
         Error::authentication_failed("handshake selection mismatch")
       }
       HandshakeError::Selection(inner) => inner.into(),
-      HandshakeError::State { .. } => Error::invalid_input("handshake state"),
+      HandshakeError::State { context } => Error::invalid_input(context),
     }
   }
 }

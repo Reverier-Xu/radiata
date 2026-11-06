@@ -122,33 +122,39 @@ pub(crate) const BUILTIN_TAG_VERSION: &str = "v1";
 /// for the built-in namespace: the tests below pin it against the live
 /// registries, the owner modules, and the convention above.
 pub(crate) const BUILTIN_TAGS: &[&str] = &[
-  // schemas — durable/wire record shapes.
-  "radiata.woooo.tech/schemas/v1/cleanup-checkpoint",
-  "radiata.woooo.tech/schemas/v1/cleanup-record",
-  "radiata.woooo.tech/schemas/v1/credential-use",
+  // schemas — durable/wire record shapes, referenced from their owner
+  // modules so a wire-shape change cannot drift from the inventory.
+  crate::identity::cleanup::CHECKPOINT_SCHEMA,
+  crate::identity::cleanup::CLEANUP_RECORD_SCHEMA,
+  crate::identity::records::CREDENTIAL_USE_SCHEMA,
+  // The failure-replay artifact schema's owner is the test-support
+  // crate, which cannot be referenced from the library.
   "radiata.woooo.tech/schemas/v1/failure-replay",
-  "radiata.woooo.tech/schemas/v1/identity-binding",
-  "radiata.woooo.tech/schemas/v1/json-generation",
-  "radiata.woooo.tech/schemas/v1/json-store",
-  "radiata.woooo.tech/schemas/v1/json-store-lock",
-  "radiata.woooo.tech/schemas/v1/key-creation-intent",
-  "radiata.woooo.tech/schemas/v1/key-deleted",
-  "radiata.woooo.tech/schemas/v1/key-deletion-intent",
-  "radiata.woooo.tech/schemas/v1/leave-intent",
-  "radiata.woooo.tech/schemas/v1/leave-record",
-  "radiata.woooo.tech/schemas/v1/local-identity",
-  "radiata.woooo.tech/schemas/v1/membership-page",
-  "radiata.woooo.tech/schemas/v1/membership-sync-payload",
-  "radiata.woooo.tech/schemas/v1/merge-grant",
-  "radiata.woooo.tech/schemas/v1/metadata",
-  "radiata.woooo.tech/schemas/v1/node-descriptor",
-  "radiata.woooo.tech/schemas/v1/pending-transaction",
-  "radiata.woooo.tech/schemas/v1/reconcile",
-  "radiata.woooo.tech/schemas/v1/resource-change",
-  "radiata.woooo.tech/schemas/v1/resource-page",
-  "radiata.woooo.tech/schemas/v1/resource-record",
-  "radiata.woooo.tech/schemas/v1/revocation-record",
-  "radiata.woooo.tech/schemas/v1/route-trace",
+  crate::identity::records::IDENTITY_BINDING_SCHEMA,
+  #[cfg(feature = "json")]
+  crate::storage::json::GENERATION_SCHEMA,
+  #[cfg(feature = "json")]
+  crate::storage::json::STORE_SCHEMA,
+  #[cfg(feature = "json")]
+  crate::storage::json::LOCK_SCHEMA,
+  crate::identity::records::KEY_CREATION_INTENT_SCHEMA,
+  crate::identity::records::KEY_DELETED_SCHEMA,
+  crate::identity::records::KEY_DELETION_INTENT_SCHEMA,
+  crate::identity::leave::LEAVE_INTENT_SCHEMA,
+  crate::identity::leave::LEAVE_RECORD_SCHEMA,
+  crate::identity::records::LOCAL_IDENTITY_SCHEMA,
+  crate::membership::page::MEMBERSHIP_PAGE_SCHEMA,
+  crate::membership::sync::SYNC_PAYLOAD_SCHEMA,
+  crate::identity::records::MERGE_GRANT_SCHEMA,
+  crate::storage::migration::METADATA_SCHEMA_V1,
+  crate::membership::NODE_DESCRIPTOR_SCHEMA,
+  crate::storage::pending::PENDING_SCHEMA,
+  crate::reconcile::plane::RECONCILE_SCHEMA,
+  crate::resource::feed::FEED_SCHEMA,
+  crate::resource::page::RESOURCE_PAGE_SCHEMA,
+  crate::resource::RESOURCE_RECORD_SCHEMA,
+  crate::identity::revocation::REVOCATION_RECORD_SCHEMA,
+  crate::routing::trace::TRACE_SCHEMA,
   // crypto — signature and key-derivation domain separators.
   "radiata.woooo.tech/crypto/v1/bootstrap-initiator",
   "radiata.woooo.tech/crypto/v1/bootstrap-responder",

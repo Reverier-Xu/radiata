@@ -63,12 +63,14 @@ impl JournalPurpose {
 
 const ED25519_ALGORITHM: &str = "radiata.woooo.tech/crypto/ed25519";
 
-const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/local-identity";
-const KEY_CREATION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-creation-intent";
-const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/identity-binding";
-const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/credential-use";
-const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/merge-grant";
-const KEY_DELETION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deletion-intent";
+pub(crate) const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/local-identity";
+pub(crate) const KEY_CREATION_INTENT_SCHEMA: &str =
+  "radiata.woooo.tech/schemas/v1/key-creation-intent";
+pub(crate) const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/identity-binding";
+pub(crate) const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/credential-use";
+pub(crate) const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/merge-grant";
+pub(crate) const KEY_DELETION_INTENT_SCHEMA: &str =
+  "radiata.woooo.tech/schemas/v1/key-deletion-intent";
 pub(crate) const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deleted";
 
 pub(crate) use crate::storage::families::{

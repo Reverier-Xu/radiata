@@ -25,12 +25,17 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
+use super::{
+  table::{RouteTable, update_route},
+  trace::TraceSink,
+};
 use crate::{
   ErrorKind, NodeId, Result, SessionId, TraceId,
+  node::EventHub,
   packet::{
-    AckOutcome,
+    AckOutcome, RouteState,
     wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
@@ -814,6 +819,161 @@ pub(crate) fn relay_admitted_ack(table: &ForwardingTable, ack: &AckFrame) {
       .upstream
       .try_send(SessionFrame::new(PacketKind::Ack, body));
   }
+}
+
+/// The routing-plane handles one session read loop hands to the
+/// acknowledgement decision: the forwarding table, the session table, the
+/// origin's route records, the typed event hub, the durable trace sink,
+/// and the local identity. The bundle carries only what attribution and
+/// reporting need; the read loop builds it from its session context.
+pub(crate) struct SessionAckContext<'a> {
+  pub(crate) forwarding: &'a ForwardingTable,
+  pub(crate) sessions: &'a SessionTable,
+  pub(crate) routes: &'a RouteTable,
+  pub(crate) events: &'a EventHub,
+  pub(crate) trace: Option<&'a TraceSink>,
+  pub(crate) local: &'a NodeId,
+  pub(crate) relay_hop_deadline: Duration,
+}
+
+/// The read loop's acknowledgement decision, one home for the whole
+/// routing-plane policy an inbound acknowledgement drives:
+/// attribution (late acknowledgements from superseded branches are
+/// dropped), discovering-hop branch re-dispatch, admitted marking,
+/// pending-admission resolution, and the terminal-failure flip of the
+/// route record plus its event and durable trace revision.
+pub(crate) async fn on_session_ack(
+  context: &SessionAckContext<'_>, ack: AckFrame, acks: &PendingAdmissions,
+) {
+  // Acknowledgement attribution: an
+  // acknowledgement steers a forwarded hop only when it arrives on
+  // that hop's current downstream attempt. A late acknowledgement
+  // from a superseded branch (the hop deadline expired or the
+  // attempt failed and the open was re-dispatched elsewhere) is
+  // dropped: it must not consume the live attempt's pending
+  // entry, clear its retry arm, or flip its route record.
+  if !ack_from_current_downstream(context.forwarding, acks, &ack.trace_id) {
+    debug!(
+      trace_id = %ack.trace_id,
+      status = ?ack.status,
+      "late acknowledgement from a superseded branch dropped"
+    );
+  } else if ack.status != AckStatus::Admitted && owns_discovering(context.forwarding, &ack.trace_id)
+  {
+    // A failure for a trace this node is still discovering (it
+    // forwarded the open and the destination has not admitted it
+    // yet) belongs to this hop's branch search: the failed
+    // attempt's pending entry is consumed and the next untried
+    // branch is re-dispatched, instead of relaying the failure
+    // upstream. Every other acknowledgement resolves the session's
+    // pending admission exactly as before.
+    on_downstream_failure(
+      context.forwarding,
+      &ack.trace_id,
+      context.sessions,
+      context.relay_hop_deadline,
+    )
+    .await;
+  } else {
+    if ack.status == AckStatus::Admitted {
+      mark_admitted(context.forwarding, &ack.trace_id);
+    }
+    if !resolve_ack(&ack, acks) {
+      // The one-shot admission waiter is gone. An origin's
+      // waiter is simply finished; an admitted forwarding hop
+      // instead owns the stream for its whole life and carries
+      // the report upstream itself — a legitimate mid-stream
+      // failure from the bound downstream session must not be
+      // dropped as a superseded branch's latecomer.
+      relay_admitted_ack(context.forwarding, &ack);
+    }
+    // A late failure for an admitted stream (a downstream hop
+    // died mid-flight) still terminates the origin's route
+    // observation. This writer races the origin pump's
+    // end-of-stream `Delivered`, and the route table's monotonic
+    // terminal machine converges them deterministically: the
+    // failure overrides a recorded `Delivered`, and once recorded
+    // it refuses every later update — so, when the report
+    // reaches this node, the origin's record ends
+    // `Failed(StreamInterrupted)` under either ordering.
+    if ack.status == AckStatus::Failed {
+      // The pre-read decides what this flip owns: a record that
+      // was not yet `Failed` transitions here, so subscribers get
+      // the `RouteChanged` nudge the refused pump tail no longer
+      // emits. The durable twin mirrors exactly the flip: the
+      // revision fires only for caller traffic with an origin-side
+      // identity — an already-failed record is final, a relay hop
+      // or a destination rejection carries no identity to persist,
+      // and internal control traffic stays out of the durable
+      // trace store on this path too — so the same trace id's
+      // durable terminal ends `Failed(StreamInterrupted)` under
+      // either writer ordering instead of keeping the pump tail's
+      // `Delivered` for the whole retention window.
+      let prior = context.routes.lock().ok().and_then(|table| {
+        let record = table.get(&ack.trace_id)?;
+        if matches!(record.state, RouteState::Failed(_)) {
+          None
+        } else {
+          Some((record.selected_node.clone(), record.internal))
+        }
+      });
+      update_route(context.routes, &ack.trace_id, |record| {
+        record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
+      });
+      if let Some((destination, internal)) = prior {
+        context
+          .events
+          .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+            ack.trace_id.clone(),
+          )));
+        if let (Some(trace), Some(destination)) = (context.trace, destination.filter(|_| !internal))
+        {
+          trace.revise_terminal_failure(
+            ack.trace_id.clone(),
+            context.local.clone(),
+            destination,
+            ErrorKind::StreamInterrupted,
+          );
+        }
+      }
+    }
+  }
+}
+
+/// Resolves one pending outbound admission. The admitting node is this
+/// session's authenticated peer, so the acknowledgement can name it for
+/// the synchronous sender's `DeliveryAck`. Returns whether a pending
+/// entry was resolved: an admitted forwarding hop's waiter was already
+/// consumed when admission resolved, and its later flow-control events
+/// relay upstream through the hop itself instead.
+fn resolve_ack(ack: &AckFrame, acks: &PendingAdmissions) -> bool {
+  let Some(entry) = acks.take(&ack.trace_id) else {
+    return false;
+  };
+  match entry {
+    PendingAck::Wait { notify, .. } => {
+      // The single AckStatus→kind mapping lives on the wire type; `Admitted`
+      // carries the admission time and every rejection its typed kind.
+      let outcome = match ack.status.to_kind() {
+        None => Ok(crate::time::from_millis(ack.admitted_at_millis)),
+        Some(kind) => Err(kind),
+      };
+      trace!(trace_id = %ack.trace_id, ?ack.status, "admission ack resolved");
+      let _ = notify.send(outcome);
+    }
+    PendingAck::Relay { upstream } => {
+      // Relay the destination's acknowledgement to the previous hop with
+      // its status preserved.
+      if let Ok(body) = wire::encode_ack(&AckFrame {
+        trace_id: ack.trace_id.clone(),
+        status: ack.status,
+        admitted_at_millis: ack.admitted_at_millis,
+      }) {
+        upstream.try_send(SessionFrame::new(PacketKind::Ack, body));
+      }
+    }
+  }
+  true
 }
 
 /// Removes the entry (the caller already holds the hop's relay lock, so no

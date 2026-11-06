@@ -30,7 +30,7 @@ use crate::{
   },
   protocol::wire::PacketKind,
   routing::{
-    forward::{self, PendingAck, SessionIdentity},
+    forward::{self, SessionIdentity},
     outbound::record_route_terminal,
     table::{record_terminal_failure, update_route},
   },
@@ -254,213 +254,167 @@ async fn read_loop_frames(
       break;
     };
     trace!(kind = ?kind, "session frame received");
-    match kind {
-      PacketKind::Open => match wire::decode_open(&message.body, context.parser_limits()) {
-        Ok(open) => {
-          // A routed frame addressed elsewhere is forwarded; everything
-          // else goes through the local admission path.
-          let routed = open.destination != *context.local() && open.route.is_some();
-          if routed {
-            forward::open(
-              &context.local().clone(),
-              grant.peer(),
-              grant.identity(),
-              open,
-              frames,
-              &context.sessions,
-              &context.forwarding,
-              context.registry.routing(),
-              context.route_policy(),
-              context.forwarding_capacity(),
-              context.relay_hop_deadline(),
-            )
-            .await;
-          } else if admit_open(
-            open,
-            grant,
-            context,
-            frames,
-            &mut incoming,
-            &mut consumers.consumers,
-          )
-          .await
-          .is_err()
-          {
-            break;
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet open frame");
-          break;
-        }
-      },
-      PacketKind::Chunk => match wire::decode_chunk(&message.body, context.parser_limits()) {
-        Ok(chunk) => {
-          let trace = chunk.trace_id.clone();
-          if forward::contains(&context.forwarding, &trace) {
-            forward::relay_chunk(&context.forwarding, chunk).await;
-          } else if !forward_chunk(chunk, &mut incoming, frames).await {
-            warn!(trace_id = %trace, "incoming chunk sequence violation; closing session");
-            break;
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet chunk frame");
-          break;
-        }
-      },
-      PacketKind::End => match wire::decode_end(&message.body, context.parser_limits()) {
-        Ok(end) => {
-          trace!(trace_id = %end.trace_id, reason = ?end.reason, "incoming stream ended");
-          if forward::contains(&context.forwarding, &end.trace_id) {
-            forward::relay_end(&context.forwarding, end).await;
-            continue;
-          }
-          if let Some(admitted) = incoming.remove(&end.trace_id) {
-            // The typed terminal reason survives the relay: a completed
-            // end closes the body normally; an interrupted end (the
-            // sending leg died mid-stream) surfaces exactly one typed
-            // `StreamInterrupted` to the consumer instead of a silent
-            // truncation.
-            let terminal = match end.reason {
-              wire::EndReason::Completed => StreamItem::End,
-              wire::EndReason::Interrupted => StreamItem::Interrupted,
-            };
-            // The terminal is queued without waiting for the consumer: a
-            // consumer that never drains its window is the stream's own
-            // overload condition, not a reason to stall every other frame
-            // of the session (acks, pongs, other streams). The reserved
-            // terminal slot guarantees the queue succeeds for a live
-            // consumer; a failure means the consumer is gone, and dropping
-            // the sender still ends the body prefix with exactly one typed
-            // `StreamInterrupted`.
-            if admitted.stream.try_send(terminal).is_err() {
-              warn!(
-                trace_id = %end.trace_id,
-                "incoming consumer did not drain its terminal; stream interrupted"
-              );
-            }
-          } else {
-            // A lost consumer means its session task aborted mid-stream:
-            // surface it loudly, because silence here looks like a lost
-            // packet downstream.
-            warn!(trace_id = %end.trace_id, "end frame for unknown incoming stream");
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet end frame");
-          break;
-        }
-      },
-      PacketKind::Ack => match wire::decode_ack(&message.body, context.parser_limits()) {
-        Ok(ack) => {
-          // Acknowledgement attribution: an
-          // acknowledgement steers a forwarded hop only when it arrives on
-          // that hop's current downstream attempt. A late acknowledgement
-          // from a superseded branch (the hop deadline expired or the
-          // attempt failed and the open was re-dispatched elsewhere) is
-          // dropped: it must not consume the live attempt's pending
-          // entry, clear its retry arm, or flip its route record.
-          if !forward::ack_from_current_downstream(&context.forwarding, pending_acks, &ack.trace_id)
-          {
-            debug!(
-              trace_id = %ack.trace_id,
-              status = ?ack.status,
-              "late acknowledgement from a superseded branch dropped"
-            );
-          } else if ack.status != crate::packet::wire::AckStatus::Admitted
-            && forward::owns_discovering(&context.forwarding, &ack.trace_id)
-          {
-            // A failure for a trace this node is still discovering (it
-            // forwarded the open and the destination has not admitted it
-            // yet) belongs to this hop's branch search: the failed
-            // attempt's pending entry is consumed and the next untried
-            // branch is re-dispatched, instead of relaying the failure
-            // upstream. Every other acknowledgement resolves the session's
-            // pending admission exactly as before.
-            forward::on_downstream_failure(
-              &context.forwarding,
-              &ack.trace_id,
-              &context.sessions,
-              context.relay_hop_deadline(),
-            )
-            .await;
-          } else {
-            if ack.status == crate::packet::wire::AckStatus::Admitted {
-              forward::mark_admitted(&context.forwarding, &ack.trace_id);
-            }
-            if !resolve_ack(ack.clone(), pending_acks) {
-              // The one-shot admission waiter is gone. An origin's
-              // waiter is simply finished; an admitted forwarding hop
-              // instead owns the stream for its whole life and carries
-              // the report upstream itself — a legitimate mid-stream
-              // failure from the bound downstream session must not be
-              // dropped as a superseded branch's latecomer.
-              forward::relay_admitted_ack(&context.forwarding, &ack);
-            }
-            // A late failure for an admitted stream (a downstream hop
-            // died mid-flight) still terminates the origin's route
-            // observation. This writer races the origin pump's
-            // end-of-stream `Delivered`, and the route table's monotonic
-            // terminal machine converges them deterministically: the
-            // failure overrides a recorded `Delivered`, and once recorded
-            // it refuses every later update — so, when the report
-            // reaches this node, the origin's record ends
-            // `Failed(StreamInterrupted)` under either ordering.
-            if ack.status == crate::packet::wire::AckStatus::Failed {
-              // The pre-read decides what this flip owns: a record that
-              // was not yet `Failed` transitions here, so subscribers get
-              // the `RouteChanged` nudge the refused pump tail no longer
-              // emits. The durable twin mirrors exactly the flip: the
-              // revision fires only for caller traffic with an origin-side
-              // identity — an already-failed record is final, a relay hop
-              // or a destination rejection carries no identity to persist,
-              // and internal control traffic stays out of the durable
-              // trace store on this path too — so the same trace id's
-              // durable terminal ends `Failed(StreamInterrupted)` under
-              // either writer ordering instead of keeping the pump tail's
-              // `Delivered` for the whole retention window.
-              let prior = context.routes.lock().ok().and_then(|table| {
-                let record = table.get(&ack.trace_id)?;
-                if matches!(record.state, RouteState::Failed(_)) {
-                  None
-                } else {
-                  Some((record.selected_node.clone(), record.internal))
-                }
-              });
-              update_route(&context.routes, &ack.trace_id, |record| {
-                record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
-              });
-              if let Some((destination, internal)) = prior {
-                context
-                  .events
-                  .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-                    ack.trace_id.clone(),
-                  )));
-                if let (Some(trace), Some(destination)) =
-                  (context.trace.as_ref(), destination.filter(|_| !internal))
-                {
-                  trace.revise_terminal_failure(
-                    ack.trace_id.clone(),
-                    context.local().clone(),
-                    destination,
-                    ErrorKind::StreamInterrupted,
-                  );
-                }
-              }
-            }
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet ack frame");
-          break;
-        }
-      },
+    let open_session = match kind {
+      PacketKind::Open => {
+        handle_open(
+          &message.body,
+          grant,
+          context,
+          frames,
+          &mut incoming,
+          &mut consumers.consumers,
+        )
+        .await
+      }
+      PacketKind::Chunk => handle_chunk(&message.body, context, &mut incoming, frames).await,
+      PacketKind::End => handle_end(&message.body, context, &mut incoming).await,
+      PacketKind::Ack => handle_ack(&message.body, context, pending_acks).await,
+    };
+    if !open_session {
+      break;
     }
   }
   // The frame loop exits without dropping the guard: `read_loop` owns it
   // and its `Drop` hands the JoinSet to the node-scoped drain task on this
   // orderly exit and on every cancellation path alike.
+}
+
+/// One frame-kind handler's verdict for the session: `true` keeps the
+/// read loop open, `false` closes it (a malformed frame, or an admission
+/// or sequence violation).
+type FrameVerdict = bool;
+
+/// The `Open` handler: a routed frame addressed elsewhere is forwarded;
+/// everything else goes through the local admission path. A malformed
+/// open closes the session.
+async fn handle_open(
+  body: &[u8], grant: &SessionGrant, context: &SessionPacketContext, frames: &BoundedSender,
+  incoming: &mut HashMap<TraceId, AdmittedStream>, consumers: &mut JoinSet<()>,
+) -> FrameVerdict {
+  let Ok(open) = wire::decode_open(body, context.parser_limits()) else {
+    warn!("malformed packet open frame");
+    return false;
+  };
+  let routed = open.destination != *context.local() && open.route.is_some();
+  if routed {
+    forward::open(
+      &context.local().clone(),
+      grant.peer(),
+      grant.identity(),
+      open,
+      frames,
+      &context.sessions,
+      &context.forwarding,
+      context.registry.routing(),
+      context.route_policy(),
+      context.forwarding_capacity(),
+      context.relay_hop_deadline(),
+    )
+    .await;
+  } else if admit_open(open, grant, context, frames, incoming, consumers)
+    .await
+    .is_err()
+  {
+    return false;
+  }
+  true
+}
+
+/// The `Chunk` handler: a chunk for a trace this node forwards is
+/// relayed downstream; otherwise it flows in sequence into the admitted
+/// incoming stream. A malformed chunk, or a sequence violation, closes
+/// the session.
+async fn handle_chunk(
+  body: &[u8], context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
+  frames: &BoundedSender,
+) -> FrameVerdict {
+  let Ok(chunk) = wire::decode_chunk(body, context.parser_limits()) else {
+    warn!("malformed packet chunk frame");
+    return false;
+  };
+  let trace = chunk.trace_id.clone();
+  if forward::contains(&context.forwarding, &trace) {
+    forward::relay_chunk(&context.forwarding, chunk).await;
+  } else if !forward_chunk(chunk, incoming, frames).await {
+    warn!(trace_id = %trace, "incoming chunk sequence violation; closing session");
+    return false;
+  }
+  true
+}
+
+/// The `End` handler: an end for a forwarded trace is relayed
+/// downstream; otherwise it terminates the admitted incoming stream with
+/// its typed terminal. A malformed end closes the session.
+async fn handle_end(
+  body: &[u8], context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
+) -> FrameVerdict {
+  let Ok(end) = wire::decode_end(body, context.parser_limits()) else {
+    warn!("malformed packet end frame");
+    return false;
+  };
+  trace!(trace_id = %end.trace_id, reason = ?end.reason, "incoming stream ended");
+  if forward::contains(&context.forwarding, &end.trace_id) {
+    forward::relay_end(&context.forwarding, end).await;
+    return true;
+  }
+  if let Some(admitted) = incoming.remove(&end.trace_id) {
+    // The typed terminal reason survives the relay: a completed
+    // end closes the body normally; an interrupted end (the
+    // sending leg died mid-stream) surfaces exactly one typed
+    // `StreamInterrupted` to the consumer instead of a silent
+    // truncation.
+    let terminal = match end.reason {
+      wire::EndReason::Completed => StreamItem::End,
+      wire::EndReason::Interrupted => StreamItem::Interrupted,
+    };
+    // The terminal is queued without waiting for the consumer: a
+    // consumer that never drains its window is the stream's own
+    // overload condition, not a reason to stall every other frame
+    // of the session (acks, pongs, other streams). The reserved
+    // terminal slot guarantees the queue succeeds for a live
+    // consumer; a failure means the consumer is gone, and dropping
+    // the sender still ends the body prefix with exactly one typed
+    // `StreamInterrupted`.
+    if admitted.stream.try_send(terminal).is_err() {
+      warn!(
+        trace_id = %end.trace_id,
+        "incoming consumer did not drain its terminal; stream interrupted"
+      );
+    }
+  } else {
+    // A lost consumer means its session task aborted mid-stream:
+    // surface it loudly, because silence here looks like a lost
+    // packet downstream.
+    warn!(trace_id = %end.trace_id, "end frame for unknown incoming stream");
+  }
+  true
+}
+
+/// The `Ack` handler: the whole routing-plane acknowledgement decision
+/// lives in [`forward::on_session_ack`]; this shell decodes the frame and
+/// closes the session on a malformed one.
+async fn handle_ack(
+  body: &[u8], context: &SessionPacketContext, pending_acks: &PendingAdmissions,
+) -> FrameVerdict {
+  let Ok(ack) = wire::decode_ack(body, context.parser_limits()) else {
+    warn!("malformed packet ack frame");
+    return false;
+  };
+  forward::on_session_ack(
+    &forward::SessionAckContext {
+      forwarding: &context.forwarding,
+      sessions: &context.sessions,
+      routes: &context.routes,
+      events: &context.events,
+      trace: context.trace.as_ref(),
+      local: &context.local,
+      relay_hop_deadline: context.relay_hop_deadline(),
+    },
+    ack,
+    pending_acks,
+  )
+  .await;
+  true
 }
 
 /// The admission decision one open resolves to: the wire status and the
@@ -931,42 +885,6 @@ async fn forward_chunk(
       true
     }
   }
-}
-
-/// Resolves one pending outbound admission. The admitting node is this
-/// session's authenticated peer, so the acknowledgement can name it for
-/// the synchronous sender's `DeliveryAck`. Returns whether a pending
-/// entry was resolved: an admitted forwarding hop's waiter was already
-/// consumed when admission resolved, and its later flow-control events
-/// relay upstream through the hop itself instead.
-fn resolve_ack(ack: AckFrame, pending_acks: &PendingAdmissions) -> bool {
-  let Some(entry) = pending_acks.take(&ack.trace_id) else {
-    return false;
-  };
-  match entry {
-    PendingAck::Wait { notify, .. } => {
-      // The single AckStatus→kind mapping lives on the wire type; `Admitted`
-      // carries the admission time and every rejection its typed kind.
-      let outcome = match ack.status.to_kind() {
-        None => Ok(crate::time::from_millis(ack.admitted_at_millis)),
-        Some(kind) => Err(kind),
-      };
-      trace!(trace_id = %ack.trace_id, ?ack.status, "admission ack resolved");
-      let _ = notify.send(outcome);
-    }
-    PendingAck::Relay { upstream } => {
-      // Relay the destination's acknowledgement to the previous hop with
-      // its status preserved.
-      if let Ok(body) = wire::encode_ack(&AckFrame {
-        trace_id: ack.trace_id.clone(),
-        status: ack.status,
-        admitted_at_millis: ack.admitted_at_millis,
-      }) {
-        upstream.try_send(SessionFrame::new(PacketKind::Ack, body));
-      }
-    }
-  }
-  true
 }
 
 /// Digests the immutable opening context of one open frame (endpoints,

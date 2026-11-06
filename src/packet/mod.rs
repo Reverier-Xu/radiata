@@ -805,7 +805,7 @@ impl RouteRecord {
       selected_node: Some(selected_node),
       state: RouteState::Routing,
       bytes_forwarded: 0,
-      updated_at: SystemTime::now(),
+      updated_at: crate::time::now(),
       internal: false,
     }
   }
@@ -824,19 +824,19 @@ impl RouteRecord {
       selected_node: None,
       state: RouteState::Routing,
       bytes_forwarded: 0,
-      updated_at: SystemTime::now(),
+      updated_at: crate::time::now(),
       internal: false,
     }
   }
 
   pub(crate) fn update(&mut self, state: RouteState) {
     self.state = state;
-    self.updated_at = SystemTime::now();
+    self.updated_at = crate::time::now();
   }
 
   pub(crate) fn forward(&mut self, bytes: u64) {
     self.bytes_forwarded = self.bytes_forwarded.saturating_add(bytes);
-    self.updated_at = SystemTime::now();
+    self.updated_at = crate::time::now();
   }
 
   pub(crate) fn view(&self) -> RouteStatusView {

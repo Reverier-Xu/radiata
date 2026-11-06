@@ -1,11 +1,13 @@
 mod anti_entropy;
 mod degree;
+mod dial;
 mod lifecycle;
 mod listeners;
 mod packets;
 mod recovery;
 mod resources;
 mod retention;
+mod shutdown;
 mod supervisor;
 mod task_effects;
 mod task_manager;

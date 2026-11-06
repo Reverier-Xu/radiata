@@ -37,7 +37,7 @@ use crate::{
   provider::{StorageFactory, StoreSnapshot},
   time::{HostWallClock, WallClock},
 };
-const PENDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/pending-transaction";
+pub(crate) const PENDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/pending-transaction";
 const RECORD_VERSION: u64 = 1;
 const PENDING_LIMITS: CborLimits = CborLimits::new(8, 1_024, 65_536);
 
