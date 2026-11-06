@@ -22,11 +22,9 @@ use std::{
 use tokio::sync::watch;
 
 use super::{
+  dial::{connect_with_deadline, dial_member, keep_outbound_session},
   recovery::departed_exclusions,
-  supervisor::{
-    ListenerRegistry, RuntimeDependencies, connect_with_deadline, dial_member,
-    keep_outbound_session,
-  },
+  supervisor::{ListenerRegistry, RuntimeDependencies},
   task_manager::{EffectOutcome, TaskClient, TaskEffect, TaskPayload, TaskSpec},
 };
 use crate::{

@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use super::supervisor::{Supervisor, TickState, dial_member};
+use super::{
+  dial::dial_member,
+  supervisor::{Supervisor, TickState},
+};
 use crate::{Endpoint, Error, NodeId, Result};
 
 /// The recovery controller's observation period (unnamed literal kept
