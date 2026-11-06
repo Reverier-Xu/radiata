@@ -963,7 +963,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap()
     .unwrap();
   assert!(replayed.version() > 0);
-  let _ = (replayed.name(), replayed.kind(), replayed.is_removal());
+  let _ = (replayed.name(), replayed.kind());
   let mut live: radiata::ResourceWatch = issuer.handle.watch_resources(None).await.unwrap();
   let live_write = ResourceWrite::new(
     ResourceName::parse("radiata.woooo.tech/resources/pub-api-002").unwrap(),

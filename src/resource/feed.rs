@@ -11,13 +11,11 @@
 //! in the same transaction.
 //!
 //! Versions start at 1 and are assigned in commit order under the store's
-//! writer exclusion, so the feed is gap-free and totally ordered. The
-//! retained window is [`RESOURCE_FEED_RETENTION`] entries: each append
-//! evicts every entry that falls out of the window (a page batch evicts
-//! as many as it pushed out, so the window stays the contiguous tail of
-//! the version sequence), and a consumer resuming below the oldest
-//! retained version gets the typed [`ResourceFeedError::Compacted`]
-//! carrying that floor so it can re-list the register and resume.
+//! writer exclusion, so the feed is gap-free and totally ordered. Every
+//! committed entry stays in the feed: the library keeps the full history
+//! and never evicts, so a consumer can resume from any version it has
+//! seen. Trimming the history is the operator's cleanup decision, not a
+//! library-imposed schedule.
 //!
 //! The feed is node-local: it is not a replicated lane, because its
 //! versions follow this store's own commit order. A peer-converged install
@@ -28,12 +26,12 @@
 //! [`ResourceWatch`] replays from a caller-chosen version and then follows
 //! live commits. It reads the durable feed (never an in-memory buffer), so
 //! a watch created after a restart resumes from the persisted head, and a
-//! slow consumer is bounded by the retained window instead of applying
-//! backpressure to the commit path: the commit only wakes parked watches.
-//! The wake-up is an optimization, never the source of truth — a parked
-//! watch re-reads the durable feed on a bounded interval too, so a commit
-//! whose notification was lost (an indeterminate commit that resolves to
-//! installed outside the commit path) is still observed. A feed whose head
+//! slow consumer never applies backpressure to the commit path: the
+//! commit only wakes parked watches. The wake-up is an optimization, never
+//! the source of truth — a parked watch re-reads the durable feed on a
+//! bounded interval too, so a commit whose notification was lost (an
+//! indeterminate commit that resolves to installed outside the commit
+//! path) is still observed. A feed whose head
 //! moved behind the watch's cursor — a leave wipe, a store restored to an
 //! older state — is the typed [`ResourceFeedError::Reset`] instead of a
 //! silent park.
@@ -53,17 +51,12 @@ use crate::{
   storage::MetadataStore,
 };
 
-/// The retained window: the feed keeps the newest
-/// `RESOURCE_FEED_RETENTION` entries, so a consumer that falls further
-/// behind than this observes [`ResourceFeedError::Compacted`] and
-/// re-lists instead of replaying a gap.
-pub(crate) const RESOURCE_FEED_RETENTION: u64 = 1024;
-
-/// The bounded re-check interval of one parked watch: the commit path's
-/// wake-up is the fast path, and this bounds how long a lost wake-up can
-/// keep a consumer parked. It is a re-read of the durable head, not a
-/// change source, so a longer interval costs latency and never a change.
-const FEED_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// The periodic re-check interval of one parked watch: the commit path's
+/// wake-up is the latency path, and this bounded re-read of the durable
+/// feed guarantees a lost wake-up is observed within the interval. It is a
+/// re-read, not a change source, so a longer interval costs latency and
+/// never a change.
+const FEED_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 const FEED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/resource-change";
 const FEED_ENTRY_VERSION: u16 = 1;
@@ -95,15 +88,6 @@ fn head_key() -> StoreKey {
   StoreKey::new(Arc::from(HEAD_KEY))
 }
 
-/// The oldest version the retained window still holds for a feed whose
-/// last assigned version is `head` (0 for an empty feed).
-fn oldest_retained(head: u64) -> u64 {
-  head
-    .saturating_sub(RESOURCE_FEED_RETENTION)
-    .saturating_add(1)
-    .max(1)
-}
-
 /// Reads the feed head: the last assigned `resourceVersion`, 0 when no
 /// change has ever committed.
 pub(crate) async fn read_head(snapshot: &dyn StoreSnapshot) -> Result<u64> {
@@ -119,8 +103,8 @@ pub(crate) async fn read_head(snapshot: &dyn StoreSnapshot) -> Result<u64> {
 }
 
 /// Builds the feed operations for one commit that installs `records` in
-/// order: one entry put per record, the head-counter bump, and the
-/// eviction delete that keeps the window bounded.
+/// order: one entry put per record plus the head-counter bump. The feed
+/// keeps every entry; no eviction rides the commit.
 ///
 /// The caller merges these into the transaction that puts the records
 /// themselves, built from the same snapshot, so the record and its feed
@@ -135,7 +119,7 @@ pub(crate) async fn append_operations(
   let namespace = namespace()?;
   let prev_head = read_head(snapshot).await?;
   let mut version = prev_head;
-  let mut operations = Vec::with_capacity(records.len() + 2);
+  let mut operations = Vec::with_capacity(records.len() + 1);
   for record in records {
     version = version
       .checked_add(1)
@@ -157,28 +141,6 @@ pub(crate) async fn append_operations(
     expected,
     value: StoreValue::new(Arc::from(version.to_be_bytes())),
   });
-  // Every entry the batch pushed out of the window leaves in the same
-  // transaction: a batch of `n` records evicts the whole range
-  // `prev_head + 1 - RETENTION ..= version - RETENTION`, so the retained
-  // set stays the contiguous tail of the version sequence and
-  // `oldest_retained` is the exact compaction floor. Evicting only the
-  // newest expired key would leave the older ones behind and make the
-  // floor a lie.
-  let first_evicted = prev_head
-    .saturating_add(1)
-    .saturating_sub(RESOURCE_FEED_RETENTION)
-    .max(1);
-  for evicted in first_evicted..oldest_retained(version) {
-    let key = entry_key(evicted);
-    // An entry already evicted by an earlier append is simply absent.
-    if let Some(value) = snapshot.get(&namespace, &key).await? {
-      operations.push(StoreOperation::Delete {
-        namespace: namespace.clone(),
-        key,
-        expected: value.digest().clone(),
-      });
-    }
-  }
   Ok(operations)
 }
 
@@ -300,11 +262,6 @@ impl ResourceChange {
   pub const fn kind(&self) -> &ResourceChangeKind {
     &self.change
   }
-
-  /// Whether the committed record removes the name.
-  pub const fn is_removal(&self) -> bool {
-    matches!(self.change, ResourceChangeKind::Removed)
-  }
 }
 
 /// The change one feed entry commits.
@@ -322,11 +279,6 @@ pub enum ResourceChangeKind {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ResourceFeedError {
-  /// The watch's resume point fell out of the retained window: every
-  /// entry up to `oldest - 1` is gone. Re-list the register and resume
-  /// from `oldest`.
-  #[error("resource feed compacted below version {oldest}")]
-  Compacted { oldest: u64 },
   /// The feed head moved behind the watch's cursor: the feed was wiped or
   /// reset (a leave wipe, a store restored to an older state), so the
   /// cursor no longer names a version this feed assigned. Re-list the
@@ -348,10 +300,9 @@ pub enum ResourceFeedError {
 /// version continues the sequence with no gap and no reordering.
 ///
 /// A slow consumer never blocks the commit path: the commit only wakes
-/// parked watches, and a consumer that falls further behind than the
-/// retained window observes [`ResourceFeedError::Compacted`]. A watch
-/// whose cursor the feed no longer reaches — the feed was wiped or reset —
-/// observes [`ResourceFeedError::Reset`].
+/// parked watches, and the durable feed keeps every entry until the
+/// operator cleans it up. A watch whose cursor the feed no longer reaches
+/// — the feed was wiped or reset — observes [`ResourceFeedError::Reset`].
 ///
 /// The watch holds the store open, exactly like any other live handle: drop
 /// it before reopening the same storage, or the provider's exclusive
@@ -360,7 +311,14 @@ pub enum ResourceFeedError {
 pub struct ResourceWatch {
   store: Arc<MetadataStore>,
   /// The last version this watch delivered (or the initial resume point).
+  /// It advances only when an entry is popped, so it always names the
+  /// exact resume point a consumer re-listing after an error needs.
   cursor: u64,
+  /// The last version a scan has read into the buffer. It advances during
+  /// [`ResourceWatch::fill`], independently of `cursor`, so a scan that
+  /// fails partway loses nothing: the next scan resumes at this position,
+  /// never past an entry the consumer has not seen.
+  scan_cursor: u64,
   /// Entries read from the feed but not yet delivered.
   buffered: VecDeque<ResourceChange>,
 }
@@ -379,6 +337,7 @@ impl ResourceWatch {
     Ok(Self {
       store,
       cursor,
+      scan_cursor: cursor,
       buffered: VecDeque::new(),
     })
   }
@@ -390,6 +349,7 @@ impl ResourceWatch {
   pub async fn next(&mut self) -> std::result::Result<ResourceChange, ResourceFeedError> {
     loop {
       if let Some(change) = self.buffered.pop_front() {
+        self.cursor = change.version();
         return Ok(change);
       }
       // Register the wake-up before reading: a commit landing after this
@@ -400,6 +360,7 @@ impl ResourceWatch {
       notified.as_mut().enable();
       self.fill().await?;
       if let Some(change) = self.buffered.pop_front() {
+        self.cursor = change.version();
         return Ok(change);
       }
       // The wake-up is the fast path, not the source of truth: a commit
@@ -413,8 +374,13 @@ impl ResourceWatch {
     }
   }
 
-  /// Reads every entry past the cursor into the buffer, or reports the
-  /// compaction floor when the cursor fell out of the retained window.
+  /// Reads every entry past the scan position into the buffer.
+  ///
+  /// Only the scan position advances here: the delivered cursor moves when
+  /// [`ResourceWatch::next`] pops an entry. A scan that fails partway — a
+  /// damaged entry, a store fault — leaves the entries it already read
+  /// buffered and the scan position behind the failure, so the next scan
+  /// resumes exactly there and no change is lost.
   async fn fill(&mut self) -> std::result::Result<(), ResourceFeedError> {
     let snapshot = self.store.snapshot().await?;
     let namespace = namespace()?;
@@ -426,14 +392,10 @@ impl ResourceWatch {
       // arrive; the typed signal lets the consumer re-list and resume.
       return Err(ResourceFeedError::Reset { head });
     }
-    let oldest = oldest_retained(head);
-    if self.cursor.saturating_add(1) < oldest {
-      return Err(ResourceFeedError::Compacted { oldest });
-    }
-    if self.cursor >= head {
+    if self.scan_cursor >= head {
       return Ok(());
     }
-    let from = entry_key(self.cursor);
+    let from = entry_key(self.scan_cursor);
     let mut scan = snapshot
       .scan_from(&namespace, &[ENTRY_KEY_PREFIX], Some(from.as_bytes()))
       .await?;
@@ -442,20 +404,20 @@ impl ResourceWatch {
       // The key is the entry's own version key: a row stored under any
       // other key would break the version order the scan promises.
       if entry.key().as_bytes() != entry_key(change.version()).as_bytes()
-        || change.version() <= self.cursor
+        || change.version() <= self.scan_cursor
       {
         return Err(ResourceFeedError::Storage(crate::storage::storage_corrupt(
           ProviderErrorContext::StorageScan,
         )));
       }
-      self.cursor = change.version();
+      self.scan_cursor = change.version();
       self.buffered.push_back(change.into_view());
     }
-    // Every version between the cursor and the head is retained by
-    // construction, so a scan that stops short means the window itself is
+    // Every version between the cursor and the head is in the feed by
+    // construction, so a scan that stops short means the feed itself is
     // damaged: fail loudly instead of parking on a change that will never
     // arrive.
-    if self.cursor < head {
+    if self.scan_cursor < head {
       return Err(ResourceFeedError::Storage(crate::storage::storage_corrupt(
         ProviderErrorContext::StorageScan,
       )));
@@ -469,8 +431,8 @@ mod tests {
   use std::{sync::Arc, time::Duration};
 
   use super::{
-    RESOURCE_FEED_RETENTION, ResourceChangeKind, ResourceChangeV1, ResourceFeedError,
-    ResourceWatch, append_operations, entry_key, namespace, read_head,
+    ResourceChangeKind, ResourceChangeV1, ResourceFeedError, ResourceWatch, append_operations,
+    entry_key, namespace, read_head,
   };
   use crate::{
     LabelKey, LabelSet, LabelValue, NodeId,
@@ -478,7 +440,7 @@ mod tests {
     provider::StorageFactory,
     resource::{
       ResourceName, ResourceRecordV1,
-      store::{ResourceCommitOutcome, commit_expected_record_ctx, commit_page_batch_ctx},
+      store::{ResourceCommitOutcome, commit_expected_record_ctx},
     },
   };
 
@@ -533,6 +495,33 @@ mod tests {
       .unwrap()
   }
 
+  /// Overwrites one stored feed entry with `bytes` through a conditional
+  /// transaction, the way a corrupted write or a repair would.
+  async fn overwrite_entry(
+    store: &crate::storage::MetadataStore, namespace: &crate::StoreNamespace,
+    key: &crate::StoreKey, bytes: Vec<u8>,
+  ) {
+    let snapshot = store.snapshot().await.unwrap();
+    let current = snapshot.get(namespace, key).await.unwrap().unwrap();
+    let transaction = store
+      .prepare_transaction(
+        crate::TransactionId::generate(&SystemEntropy).unwrap(),
+        snapshot.revision().clone(),
+        vec![crate::StoreOperation::Put {
+          namespace: namespace.clone(),
+          key: key.clone(),
+          expected: crate::StoreExpectation::Exact(current.digest().clone()),
+          value: crate::StoreValue::new(Arc::from(bytes)),
+        }],
+      )
+      .unwrap();
+    drop(snapshot);
+    assert!(matches!(
+      store.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+  }
+
   async fn next(
     watch: &mut ResourceWatch,
   ) -> std::result::Result<crate::ResourceChange, ResourceFeedError> {
@@ -564,7 +553,6 @@ mod tests {
     let first = next(&mut watch).await.unwrap();
     assert_eq!(first.version(), 1);
     assert_eq!(first.name(), &name(1));
-    assert!(!first.is_removal());
     match first.kind() {
       ResourceChangeKind::Put(view) => {
         assert_eq!(view.name(), &name(1));
@@ -580,7 +568,6 @@ mod tests {
     let third = next(&mut watch).await.unwrap();
     assert_eq!(third.version(), 3);
     assert_eq!(third.name(), &name(1));
-    assert!(third.is_removal());
     assert_eq!(third.kind(), &ResourceChangeKind::Removed);
   }
 
@@ -637,102 +624,6 @@ mod tests {
       next(&mut replay).await.unwrap().version(),
     ];
     assert_eq!(versions, vec![1, 2, 3]);
-  }
-
-  /// A resume below the retained window reports the compaction floor, and
-  /// the oldest retained version still replays.
-  #[tokio::test]
-  async fn a_below_retention_resume_reports_the_compaction_floor() {
-    let factory = factory();
-    let store = open(&factory).await;
-    // One entry past the window: the oldest retained version is 2.
-    for timestamp in 1..=RESOURCE_FEED_RETENTION + 1 {
-      install(&store, &record(&name(1), timestamp, false)).await;
-    }
-    let head = read_head(store.snapshot().await.unwrap().as_ref())
-      .await
-      .unwrap();
-    assert_eq!(head, RESOURCE_FEED_RETENTION + 1);
-
-    let mut stale = ResourceWatch::subscribe(Arc::clone(&store), Some(0))
-      .await
-      .unwrap();
-    match stale.next().await {
-      Err(ResourceFeedError::Compacted { oldest }) => assert_eq!(oldest, 2),
-      other => panic!("expected the typed compaction error, got {other:?}"),
-    }
-
-    // The evicted entry is gone from the store and the floor replays.
-    let snapshot = store.snapshot().await.unwrap();
-    let namespace = namespace().unwrap();
-    assert!(
-      snapshot
-        .get(&namespace, &entry_key(1))
-        .await
-        .unwrap()
-        .is_none()
-    );
-    let mut at_floor = ResourceWatch::subscribe(Arc::clone(&store), Some(1))
-      .await
-      .unwrap();
-    assert_eq!(next(&mut at_floor).await.unwrap().version(), 2);
-  }
-
-  /// A page batch evicts every entry it pushed out of the retained window,
-  /// not only the newest expired one: the window stays the contiguous tail
-  /// of the version sequence, so the retained count is exactly the window
-  /// and `oldest_retained` names a version that really is retained.
-  #[tokio::test]
-  async fn a_page_batch_evicts_every_entry_it_pushes_out_of_the_window() {
-    let factory = factory();
-    let store = open(&factory).await;
-    // Fill the window one commit at a time: the window is exactly full at
-    // the last install, so nothing has been evicted yet.
-    for timestamp in 1..=RESOURCE_FEED_RETENTION {
-      install(&store, &record(&name(1), timestamp, false)).await;
-    }
-    // A two-record page batch pushes two versions out of the window.
-    let first = record(&name(2), 1_000, false);
-    let second = record(&name(3), 1_000, false);
-    let installed = commit_page_batch_ctx(&store, &SystemEntropy, &[&first, &second])
-      .await
-      .unwrap();
-    assert_eq!(installed.len(), 2, "both page records install");
-
-    let snapshot = store.snapshot().await.unwrap();
-    let head = read_head(snapshot.as_ref()).await.unwrap();
-    assert_eq!(head, RESOURCE_FEED_RETENTION + 2);
-    let namespace = namespace().unwrap();
-    let mut scan = snapshot
-      .scan(&namespace, &[super::ENTRY_KEY_PREFIX])
-      .await
-      .unwrap();
-    let mut retained = 0_u64;
-    while scan.next().await.unwrap().is_some() {
-      retained += 1;
-    }
-    assert_eq!(
-      retained, RESOURCE_FEED_RETENTION,
-      "the batch must evict every entry it pushed out of the window"
-    );
-    // The reported floor is truthful: the entry below it is gone and the
-    // entry at it is retained.
-    let floor = super::oldest_retained(head);
-    assert_eq!(floor, 3);
-    assert!(
-      snapshot
-        .get(&namespace, &entry_key(floor - 1))
-        .await
-        .unwrap()
-        .is_none()
-    );
-    assert!(
-      snapshot
-        .get(&namespace, &entry_key(floor))
-        .await
-        .unwrap()
-        .is_some()
-    );
   }
 
   /// A watch parked before an indeterminate commit still observes the
@@ -840,6 +731,64 @@ mod tests {
       Err(ResourceFeedError::Reset { head }) => assert_eq!(head, 0),
       other => panic!("expected the typed reset signal, got {other:?}"),
     }
+  }
+
+  /// A mid-scan decode failure loses nothing: the scan position carries
+  /// the resume point, and the delivered cursor advances only when an
+  /// entry is popped. The entries read before the anomaly still deliver,
+  /// and once the damaged entry is repaired the watch delivers it —
+  /// nothing was skipped while the anomaly stood, and a consumer
+  /// re-listing from the last version it received replays exactly the
+  /// undelivered tail.
+  #[tokio::test]
+  async fn a_mid_scan_decode_failure_loses_nothing() {
+    let factory = factory();
+    let store = open(&factory).await;
+    for (seed, timestamp) in [(1_u8, 1_000_u64), (2, 2_000), (3, 3_000)] {
+      install(&store, &record(&name(seed), timestamp, false)).await;
+    }
+
+    // Damage the stored bytes of version 3: a scan from the start reads
+    // 1 and 2, then fails to decode 3.
+    let namespace = namespace().unwrap();
+    let key = entry_key(3);
+    overwrite_entry(&store, &namespace, &key, vec![0xFF_u8, 0x00]).await;
+
+    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(0))
+      .await
+      .unwrap();
+    // The scan buffers 1 and 2, then fails on the damaged 3.
+    assert!(
+      matches!(watch.next().await, Err(ResourceFeedError::Storage(_))),
+      "the damaged entry fails the scan"
+    );
+    // The entries read before the anomaly deliver in order.
+    assert_eq!(next(&mut watch).await.unwrap().version(), 1);
+    assert_eq!(next(&mut watch).await.unwrap().version(), 2);
+    // The damaged entry still fails: the watch resumes at the scan
+    // position, never past it.
+    assert!(matches!(
+      watch.next().await,
+      Err(ResourceFeedError::Storage(_))
+    ));
+
+    // Repair the stored bytes: the scan resumes at the damaged entry and
+    // delivers it, so the parked consumer misses nothing.
+    let good = ResourceChangeV1::new(3, record(&name(3), 3_000, false));
+    overwrite_entry(&store, &namespace, &key, good.encode().unwrap()).await;
+    assert_eq!(next(&mut watch).await.unwrap().version(), 3);
+
+    // The delivered cursor is the honest resume point: a consumer
+    // re-listing from the last version it received replays nothing.
+    let mut resumed = ResourceWatch::subscribe(Arc::clone(&store), Some(3))
+      .await
+      .unwrap();
+    assert!(
+      tokio::time::timeout(Duration::from_millis(100), resumed.next())
+        .await
+        .is_err(),
+      "the full history is delivered; nothing remains to replay"
+    );
   }
 
   /// A live watch observes a commit that lands after it subscribed.

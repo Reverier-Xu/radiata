@@ -525,18 +525,16 @@ impl NodeHandle {
   ///
   /// The feed is persisted, not process-local: a watch created after a
   /// restart resumes from the persisted head, and the sequence continues
-  /// with no gap and no reordering. A consumer that falls further behind
-  /// than the retained window observes [`crate::ResourceFeedError::Compacted`]
-  /// carrying the oldest available version and must re-list the register;
-  /// a watch whose cursor the feed no longer reaches (the feed was wiped
-  /// or reset) observes [`crate::ResourceFeedError::Reset`] and re-lists
-  /// from the reported head; a slow consumer never blocks a resource
-  /// write.
+  /// with no gap and no reordering. The feed keeps its full history — the
+  /// library never evicts entries, and trimming it is the operator's
+  /// cleanup decision. A watch whose cursor the feed no longer reaches
+  /// (the feed was wiped or reset) observes
+  /// [`crate::ResourceFeedError::Reset`] and re-lists from the reported
+  /// head; a slow consumer never blocks a resource write.
   ///
   /// The only failure is the command channel's own (a stopped node); feed
-  /// read failures and the compaction floor surface from
-  /// [`crate::ResourceWatch::next`]. The watch holds the store open, so
-  /// drop it before reopening the same storage.
+  /// read failures surface from [`crate::ResourceWatch::next`]. The watch
+  /// holds the store open, so drop it before reopening the same storage.
   pub async fn watch_resources(&self, from: Option<u64>) -> Result<crate::ResourceWatch> {
     self
       .runtime
