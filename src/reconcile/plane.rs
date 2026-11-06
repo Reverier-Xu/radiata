@@ -732,7 +732,9 @@ impl ReconcilePlane {
   /// sender's engine, applies carried rows through the lane's merge
   /// semantics, fans the rows out to the sibling sessions' engines, and
   /// sends the results (responses to the source, hints to the
-  /// siblings).
+  /// siblings). The phases stay separate: row extraction, the receive
+  /// filter, the apply boundary, the message rewrite, the negotiation
+  /// drive, the sibling fan-out, and the dispatch.
   pub(crate) async fn deliver(
     &self, runtime: &RuntimeClient, source: &NodeId, message: Message,
   ) -> Result<()> {
@@ -744,222 +746,270 @@ impl ReconcilePlane {
       return Err(Error::invalid_input("reconcile lane"));
     }
     let mut message = message;
-    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = match &message {
-      Message::Rows { rows, .. } | Message::Hint { rows, .. } => rows
-        .iter()
-        .map(|row| (row.key.clone(), row.content.clone()))
-        .collect(),
-      _ => Vec::new(),
-    };
+    let mut rows = carried_rows(&message);
     let carried = rows.len();
-    if !rows.is_empty() {
-      // The lane's receive filter: the rows a peer re-delivered that must
-      // never enter an engine (collected tombstones, retention-swept
-      // removals) leave here, before any fingerprint, fan-out, or
-      // repair-set candidacy.
-      let context = self.shared.context()?;
-      let lane_context = LaneContext {
-        context: &context,
-        entropy: &self.shared.entropy,
-        events: &self.shared.events,
-        revision: &self.shared.revision,
-      };
-      let basis = SweptBasis {
-        swept_at: std::time::SystemTime::now(),
-        removal_retention: self.shared.resource_removal_retention,
-      };
-      lane
-        .policy()
-        .receive(&lane_context, &basis, &mut rows)
-        .await?;
-    }
-    if !rows.is_empty() {
-      // The store decides before any engine does: rows apply through
-      // the lane's merge semantics FIRST, and the rows the lane
-      // deterministically refused never reach the derived view — the
-      // same receive-boundary discipline the collected-tombstone and
-      // swept-resource filters enforce above. Without this gate a
-      // refused row (a stale descriptor revision, a binding for a
-      // revoked subject) enters the engine anyway, the epoch pass
-      // prunes it as superseded, the prune's hint re-announces the
-      // change, and the peers that still list the row re-deliver it —
-      // an unbounded re-negotiation loop between the refusing node and
-      // every fingerprint it exchanges (the leave/restart livelock:
-      // one starved core never drains it and the data plane starves).
-      // A batch-level store fault keeps every row in the message: the
-      // engines hold them and the derived-view repair retries, exactly
-      // as before.
-      match apply_rows(&self.shared, &lane, &rows, Some(source), Some(runtime)).await {
-        Ok(outcome) => {
-          if !outcome.refused.is_empty() {
-            rows.retain(|(key, content)| {
-              !outcome
-                .refused
-                .iter()
-                .any(|(refused_key, refused_content)| {
-                  refused_key == key && refused_content == content
-                })
-            });
-            tracing::debug!(
-              lane = ?lane,
-              refused = outcome.refused.len(),
-              "reconcile receive refused rows; they never enter the engines"
-            );
-          }
-        }
-        Err(error) => {
-          // Row-level refusals are skipped in-line by the arms; an error
-          // here is a batch-level store fault — the rows stay in the
-          // engines and the derived-view repair retries them.
-          tracing::warn!(
-            lane = ?lane,
-            kind = ?error.kind(),
-            "reconcile rows apply aborted by a store fault; the repair retries"
-          );
-        }
-      }
-      if !rows.is_empty() {
-        // The lane schedules one confirmation scan: the apply may have
-        // left rows the store cannot take yet (a tombstone whose
-        // subject binding has not converged), and those rows' retry
-        // lives in the next repair pass — without the scan the pass
-        // never recomputes (a revocation arriving before its binding
-        // would never retry).
-        // A fully-refused batch needs no scan: nothing entered the
-        // store or the engines.
-        if let Ok(mut guard) = self.shared.lock() {
-          guard.force_rescan.insert(lane);
-        }
-      }
-    }
+    self.receive_filter(&lane, &mut rows).await?;
+    self.apply_received(&lane, source, runtime, &mut rows).await;
     if rows.len() != carried {
-      // A receive filter or the apply refusal dropped rows: the
-      // engine's message must carry the retained set only — driving
-      // the original body would re-admit exactly what was refused (the
-      // engine applies piggybacked and carried rows alike before any
-      // comparison).
-      let retained_rows = rows
-        .iter()
-        .map(|(key, content)| crate::reconcile::wire::Row {
-          key: key.clone(),
-          content: content.clone(),
-        })
-        .collect();
-      message = match message {
-        Message::Rows { lane, .. } => Message::Rows {
-          lane,
-          rows: retained_rows,
-        },
-        Message::Hint { lane, ranges, .. } => Message::Hint {
-          lane,
-          ranges,
-          rows: retained_rows,
-        },
-        other => other,
-      };
+      message = retain_rows(message, &rows);
     }
-    let mut outbound: Vec<(NodeId, Message)> = Vec::new();
-    {
-      let mut guard = self.shared.lock()?;
-      // An inbound root whose lane still negotiates elsewhere at this
-      // node drops: its whole-lane claim is a then-snapshot, and
-      // initiating from a stale claim re-delivers what the open round
-      // is already bringing over the same edge. Roots are cheap and
-      // cadence-refreshed, so the drop costs one quiet window of
-      // peer-view latency, never correctness — the fresh claim comes
-      // back with the next exchange. A root from the round's own
-      // session still processes (the engine suppresses its initiation
-      // against its own open round; its agreement close must run).
-      if matches!(message, Message::Root { .. }) && guard.lane_in_round(lane, Some(source)) {
-        drop(guard);
-        return Ok(());
-      }
-      // The per-lane pull serialization: a hint arriving while a
-      // *different* session's engine of the lane still negotiates
-      // holds its ranges (the piggyback rows below still apply —
-      // payload is never held) and releases when the lane goes quiet,
-      // where a fingerprint comparison usually resolves it to silence.
-      // A hint from the round's own session walks the engine's pending
-      // set instead (its own discipline). Responses are never held: a
-      // peer's initiation must always answer, or two nodes holding
-      // each other's hints would deadlock.
-      let hold = match &message {
-        Message::Hint { ranges, .. }
-          if guard.lane_in_round(lane, Some(source)) && guard.hold_room(lane) =>
-        {
-          Some(ranges.clone())
-        }
-        _ => None,
-      };
-      if let Some(ranges) = hold {
-        guard
-          .held_hints
-          .entry(lane)
-          .or_default()
-          .push((source.clone(), ranges));
-        // The piggyback rows still enter the source engine: payload is
-        // never held, only the negotiation candidacy — and without
-        // eager candidacy (a receive path is not the originator's
-        // local write; its rows never ride a later piggyback).
-        let engine = guard
-          .peers
-          .entry(source.clone())
-          .or_insert_with(PeerState::fresh)
-          .engine(lane);
-        for (key, content) in &rows {
-          if let Err(error) = engine.insert_row_quiet(key, content) {
-            tracing::debug!(kind = ?error.kind(), "reconcile held-hint row skipped");
-          }
-        }
-      } else {
-        let engine = guard
-          .peers
-          .entry(source.clone())
-          .or_insert_with(PeerState::fresh)
-          .engine(lane);
-        let messages = engine.drive(Drive::Message(message))?;
-        outbound.extend(
-          messages
-            .into_iter()
-            .map(|message| (source.clone(), message)),
-        );
-      }
-      // A round the delivery just closed releases whatever it was
-      // holding — the released hint compares against the settled state
-      // and stays silent when its divergence was the round's own.
-      outbound.extend(guard.release_held_hints());
-    }
-    if !rows.is_empty() {
-      // The kept rows fan out to the
-      // sibling engines: propagation and application are decoupled
-      // (the derived-view repair retries the application side on the
-      // next epoch pass), and a refused row never propagates from a
-      // node that will not hold it.
-      let mut guard = self.shared.lock()?;
-      for (peer, state) in guard.peers.iter_mut() {
-        if peer == source || !state.primed {
-          continue;
-        }
-        let engine = state.engine(lane);
-        for (key, content) in &rows {
-          if let Err(error) = engine.insert_row(key, content) {
-            tracing::debug!(kind = ?error.kind(), "reconcile fan-out row skipped");
-          }
-        }
-        match engine.drive(Drive::LocalChange) {
-          Ok(messages) => {
-            outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
-          }
-          Err(error) => {
-            tracing::debug!(kind = ?error.kind(), "reconcile fan-out drive failed");
-          }
-        }
-      }
-    }
+    // A dropped root ends the delivery: its whole-lane claim was stale,
+    // and a held hint's payload already rode the source engine above.
+    let Some(mut outbound) = self.negotiate(&lane, source, message, &rows)? else {
+      return Ok(());
+    };
+    outbound.extend(self.fan_out(&lane, source, &rows)?);
     for (peer, message) in outbound {
       send_message(&self.shared, runtime, &peer, message);
     }
     Ok(())
+  }
+
+  /// The receive-filter phase: the rows a peer re-delivered that must
+  /// never enter an engine (collected tombstones, retention-swept
+  /// removals) leave here, before any fingerprint, fan-out, or
+  /// repair-set candidacy. The swept basis is one instant for every row
+  /// the filter judges.
+  async fn receive_filter(&self, lane: &LaneId, rows: &mut LaneRows) -> Result<()> {
+    if rows.is_empty() {
+      return Ok(());
+    }
+    let context = self.shared.context()?;
+    let lane_context = LaneContext {
+      context: &context,
+      entropy: &self.shared.entropy,
+      events: &self.shared.events,
+      revision: &self.shared.revision,
+    };
+    let basis = SweptBasis {
+      swept_at: std::time::SystemTime::now(),
+      removal_retention: self.shared.resource_removal_retention,
+    };
+    lane.policy().receive(&lane_context, &basis, rows).await
+  }
+
+  /// The apply-boundary phase: the store decides before any engine
+  /// does. Rows apply through the lane's merge semantics FIRST, and the
+  /// rows the lane deterministically refused never reach the derived
+  /// view — the same receive-boundary discipline the
+  /// collected-tombstone and swept-resource filters enforce before.
+  /// Without this gate a refused row (a stale descriptor revision, a
+  /// binding for a revoked subject) enters the engine anyway, the epoch
+  /// pass prunes it as superseded, the prune's hint re-announces the
+  /// change, and the peers that still list the row re-deliver it — an
+  /// unbounded re-negotiation loop between the refusing node and every
+  /// fingerprint it exchanges (the leave/restart livelock: one starved
+  /// core never drains it and the data plane starves). A batch-level
+  /// store fault keeps every row in the message: the engines hold them
+  /// and the derived-view repair retries, exactly as before.
+  async fn apply_received(
+    &self, lane: &LaneId, source: &NodeId, runtime: &RuntimeClient, rows: &mut LaneRows,
+  ) {
+    if rows.is_empty() {
+      return;
+    }
+    match apply_rows(&self.shared, lane, rows, Some(source), Some(runtime)).await {
+      Ok(outcome) => {
+        if !outcome.refused.is_empty() {
+          rows.retain(|(key, content)| {
+            !outcome
+              .refused
+              .iter()
+              .any(|(refused_key, refused_content)| {
+                refused_key == key && refused_content == content
+              })
+          });
+          tracing::debug!(
+            lane = ?lane,
+            refused = outcome.refused.len(),
+            "reconcile receive refused rows; they never enter the engines"
+          );
+        }
+      }
+      Err(error) => {
+        // Row-level refusals are skipped in-line by the arms; an error
+        // here is a batch-level store fault — the rows stay in the
+        // engines and the derived-view repair retries them.
+        tracing::warn!(
+          lane = ?lane,
+          kind = ?error.kind(),
+          "reconcile rows apply aborted by a store fault; the repair retries"
+        );
+      }
+    }
+    if rows.is_empty() {
+      // A fully-refused batch needs no scan: nothing entered the
+      // store or the engines.
+      return;
+    }
+    // The lane schedules one confirmation scan: the apply may have
+    // left rows the store cannot take yet (a tombstone whose
+    // subject binding has not converged), and those rows' retry
+    // lives in the next repair pass — without the scan the pass
+    // never recomputes (a revocation arriving before its binding
+    // would never retry).
+    if let Ok(mut guard) = self.shared.lock() {
+      guard.force_rescan.insert(*lane);
+    }
+  }
+
+  /// The negotiation-drive phase, under one state borrow: the inbound
+  /// root's staleness drop, the per-lane pull serialization (hold), the
+  /// source engine's drive, and the release of whatever the delivery
+  /// just closed. `None` means the message dropped — a stale root's
+  /// claim is re-issued by the next exchange — and the delivery ends.
+  fn negotiate(
+    &self, lane: &LaneId, source: &NodeId, message: Message, rows: &LaneRows,
+  ) -> Result<Option<Outbound>> {
+    let mut outbound: Outbound = Vec::new();
+    let mut guard = self.shared.lock()?;
+    // An inbound root whose lane still negotiates elsewhere at this
+    // node drops: its whole-lane claim is a then-snapshot, and
+    // initiating from a stale claim re-delivers what the open round
+    // is already bringing over the same edge. Roots are cheap and
+    // cadence-refreshed, so the drop costs one quiet window of
+    // peer-view latency, never correctness — the fresh claim comes
+    // back with the next exchange. A root from the round's own
+    // session still processes (the engine suppresses its initiation
+    // against its own open round; its agreement close must run).
+    if matches!(message, Message::Root { .. }) && guard.lane_in_round(*lane, Some(source)) {
+      return Ok(None);
+    }
+    // The per-lane pull serialization: a hint arriving while a
+    // *different* session's engine of the lane still negotiates
+    // holds its ranges (the piggyback rows below still apply —
+    // payload is never held) and releases when the lane goes quiet,
+    // where a fingerprint comparison usually resolves it to silence.
+    // A hint from the round's own session walks the engine's pending
+    // set instead (its own discipline). Responses are never held: a
+    // peer's initiation must always answer, or two nodes holding
+    // each other's hints would deadlock.
+    let hold = match &message {
+      Message::Hint { ranges, .. }
+        if guard.lane_in_round(*lane, Some(source)) && guard.hold_room(*lane) =>
+      {
+        Some(ranges.clone())
+      }
+      _ => None,
+    };
+    if let Some(ranges) = hold {
+      guard
+        .held_hints
+        .entry(*lane)
+        .or_default()
+        .push((source.clone(), ranges));
+      // The piggyback rows still enter the source engine: payload is
+      // never held, only the negotiation candidacy — and without
+      // eager candidacy (a receive path is not the originator's
+      // local write; its rows never ride a later piggyback).
+      let engine = guard
+        .peers
+        .entry(source.clone())
+        .or_insert_with(PeerState::fresh)
+        .engine(*lane);
+      for (key, content) in rows {
+        if let Err(error) = engine.insert_row_quiet(key, content) {
+          tracing::debug!(kind = ?error.kind(), "reconcile held-hint row skipped");
+        }
+      }
+    } else {
+      let engine = guard
+        .peers
+        .entry(source.clone())
+        .or_insert_with(PeerState::fresh)
+        .engine(*lane);
+      // A drive failure is diagnostics, like every other drive site:
+      // the messages accumulated so far still send, and the cadence
+      // (or the bounded hint retry) re-negotiates what this drive
+      // dropped. Failing the delivery here would discard them.
+      match engine.drive(Drive::Message(message)) {
+        Ok(messages) => {
+          outbound.extend(
+            messages
+              .into_iter()
+              .map(|message| (source.clone(), message)),
+          );
+        }
+        Err(error) => {
+          tracing::debug!(lane = ?lane, kind = ?error.kind(), "reconcile inbound drive failed");
+        }
+      }
+    }
+    // A round the delivery just closed releases whatever it was
+    // holding — the released hint compares against the settled state
+    // and stays silent when its divergence was the round's own.
+    outbound.extend(guard.release_held_hints());
+    Ok(Some(outbound))
+  }
+
+  /// The sibling fan-out phase: the kept rows enter every other primed
+  /// peer's engine and drive. Propagation and application are decoupled
+  /// (the derived-view repair retries the application side on the next
+  /// epoch pass), and a refused row never propagates from a node that
+  /// will not hold it.
+  fn fan_out(&self, lane: &LaneId, source: &NodeId, rows: &LaneRows) -> Result<Outbound> {
+    let mut outbound: Outbound = Vec::new();
+    if rows.is_empty() {
+      return Ok(outbound);
+    }
+    let mut guard = self.shared.lock()?;
+    for (peer, state) in guard.peers.iter_mut() {
+      if peer == source || !state.primed {
+        continue;
+      }
+      let engine = state.engine(*lane);
+      for (key, content) in rows {
+        if let Err(error) = engine.insert_row(key, content) {
+          tracing::debug!(kind = ?error.kind(), "reconcile fan-out row skipped");
+        }
+      }
+      match engine.drive(Drive::LocalChange) {
+        Ok(messages) => {
+          outbound.extend(messages.into_iter().map(|message| (peer.clone(), message)));
+        }
+        Err(error) => {
+          tracing::debug!(kind = ?error.kind(), "reconcile fan-out drive failed");
+        }
+      }
+    }
+    Ok(outbound)
+  }
+}
+
+/// The rows one inbound message carries, in wire order.
+fn carried_rows(message: &Message) -> LaneRows {
+  match message {
+    Message::Rows { rows, .. } | Message::Hint { rows, .. } => rows
+      .iter()
+      .map(|row| (row.key.clone(), row.content.clone()))
+      .collect(),
+    _ => Vec::new(),
+  }
+}
+
+/// Rewrites one inbound message to carry only the rows that survived the
+/// receive filter and the apply boundary: driving the original body
+/// would re-admit exactly what was refused (the engine applies
+/// piggybacked and carried rows alike before any comparison).
+fn retain_rows(message: Message, rows: &LaneRows) -> Message {
+  let retained_rows = rows
+    .iter()
+    .map(|(key, content)| crate::reconcile::wire::Row {
+      key: key.clone(),
+      content: content.clone(),
+    })
+    .collect();
+  match message {
+    Message::Rows { lane, .. } => Message::Rows {
+      lane,
+      rows: retained_rows,
+    },
+    Message::Hint { lane, ranges, .. } => Message::Hint {
+      lane,
+      ranges,
+      rows: retained_rows,
+    },
+    other => other,
   }
 }
 
