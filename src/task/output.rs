@@ -23,14 +23,31 @@ use crate::{
   Digest, Endpoint, Error, LabelKey, LabelSet, LabelValue, ListenerId, MemberStatus, NodeId,
   PublicKey, ResourceLabels, ResourceMutationView, ResourceName, ResourceUri, ResourceVersion,
   ResourceView, Result, TaskKind, TaskOutput,
-  protocol::{CborLimits, decode_canonical, encode_canonical},
+  label::{LABEL_SET_MAX_ENTRIES, LABEL_VALUE_MAX_BYTES},
+  protocol::{CborLimits, decode_canonical, encode_canonical, tag::MAX_TAG_LEN},
   view::{ConnectivityStatus, LeaveOutcome, MemberView, MergeView, RecoveryView},
 };
 
-/// The payload bounds: every core result is a flat, small observation (a
-/// handful of ids, labels, and endpoints), so the limits stay tight —
-/// the same order as one resource record's.
-const OUTPUT_LIMITS: CborLimits = CborLimits::new(8, 256, 16 * 1024);
+/// One maximal label entry's wire budget: a full-length key text plus a
+/// full-length value text.
+const LABEL_ENTRY_BUDGET: usize = MAX_TAG_LEN + LABEL_VALUE_MAX_BYTES;
+
+/// The framing headroom over the maximal label set: the non-label fields
+/// a core result may also carry (names, ids, digests, timestamps, and the
+/// node's own published endpoints) plus the CBOR framing itself.
+const FRAMING_HEADROOM: usize = 4 * 1024;
+
+/// The payload bounds, derived rather than hand-set: the body budget is
+/// the maximal label set a payload may carry
+/// ([`LABEL_SET_MAX_ENTRIES`] × ([`MAX_TAG_LEN`] + [`LABEL_VALUE_MAX_BYTES`]))
+/// plus the framing headroom, so a record that is legitimate under the
+/// label limits can never overflow its own task output — an overflow
+/// would turn an already-landed write into an internal failure.
+const OUTPUT_LIMITS: CborLimits = CborLimits::new(
+  8,
+  256,
+  LABEL_SET_MAX_ENTRIES * LABEL_ENTRY_BUDGET + FRAMING_HEADROOM,
+);
 
 /// The decode failure context: the bytes are crate-produced, so a
 /// payload that does not decode is a drift between the stored kind and
@@ -600,6 +617,8 @@ mod tests {
     Digest, Endpoint, LabelKey, LabelSet, LabelValue, ListenerId, MemberStatus, NodeId, PublicKey,
     ResourceLabels, ResourceMutationView, ResourceName, ResourceUri, ResourceVersion, ResourceView,
     TaskKind,
+    label::LABEL_SET_MAX_ENTRIES,
+    protocol::tag::MAX_TAG_LEN,
     view::{
       ConnectivityStatus, LeaveOutcome, MemberView, MergeView, ReceiptRetentionReport,
       RecoveryView, RevokeOutcome,
@@ -768,6 +787,82 @@ mod tests {
       let wire = time_wire(instant).expect("encode");
       assert_eq!(time(&wire).expect("decode"), instant);
     }
+  }
+
+  /// The body bound is derived from the label limits, not hand-set: a
+  /// payload carrying the maximal label set — [`LABEL_SET_MAX_ENTRIES`]
+  /// entries at the full [`MAX_TAG_LEN`] key length and the maximal
+  /// 256-byte value length — encodes and round-trips. The label text
+  /// alone exceeds the previous hand-set 16 KiB budget, so this pins
+  /// that a legitimate record can never overflow its own task output.
+  #[test]
+  fn a_maximal_label_set_round_trips_at_the_derived_bound() {
+    // A full-length key: the 62-byte domain + `labels` + the 58-byte
+    // zero-padded name total exactly MAX_TAG_LEN bytes (each component
+    // stays inside its own 63-byte cap).
+    let max_key = |index: usize| {
+      LabelKey::parse(&format!("{}.com/labels/k{index:057}", "d".repeat(58))).expect("key")
+    };
+    assert_eq!(max_key(0).as_str().len(), MAX_TAG_LEN);
+    let maximal_labels = || {
+      let mut labels = LabelSet::new();
+      for index in 0..LABEL_SET_MAX_ENTRIES {
+        let value =
+          LabelValue::parse(&"v".repeat(crate::label::LABEL_VALUE_MAX_BYTES)).expect("value");
+        labels = labels.insert(max_key(index), value).expect("labels");
+      }
+      labels
+    };
+
+    let member = MemberView::new(
+      node('b'),
+      PublicKey::from_bytes([5; 32]),
+      9,
+      Digest::from_bytes([7; 32]),
+      ConnectivityStatus::Reachable,
+      Vec::new(),
+      maximal_labels(),
+    )
+    .with_status(MemberStatus::Left);
+    let encoded = encode_member(&member).expect("a maximal member view encodes");
+    assert!(
+      encoded.bytes().len() > 16 * 1024,
+      "the maximal payload must exceed the retired hand-set bound"
+    );
+    assert_eq!(
+      decode_member(encoded.bytes()).expect("decode"),
+      member,
+      "the maximal payload round-trips"
+    );
+
+    let mut labels = ResourceLabels::new(
+      LabelValue::parse("document").expect("type"),
+      ResourceUri::parse("file:///one").expect("uri"),
+    );
+    for index in 0..LABEL_SET_MAX_ENTRIES {
+      let value =
+        LabelValue::parse(&"v".repeat(crate::label::LABEL_VALUE_MAX_BYTES)).expect("value");
+      labels = labels.custom(max_key(index), value).expect("labels");
+    }
+    let mutation = ResourceMutationView::new(
+      ResourceView::new(
+        ResourceName::parse("example.com/resources/one").expect("name"),
+        labels,
+        ResourceVersion::from_parts(
+          SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+          node('a'),
+          false,
+          Digest::from_bytes([3; 32]),
+        ),
+      ),
+      true,
+    );
+    let encoded = encode_resource_mutation(TaskKind::PUT_RESOURCE, &mutation)
+      .expect("maximal mutation encodes");
+    assert_eq!(
+      decode_resource_mutation(encoded.bytes()).expect("decode"),
+      mutation
+    );
   }
 
   /// A payload that is not the shape its kind owns is the typed internal
