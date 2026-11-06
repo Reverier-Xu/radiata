@@ -50,9 +50,7 @@ impl From<SelectionError> for Error {
       SelectionError::UnknownRequired { .. } => {
         Error::authentication_failed("feature selection unknown required")
       }
-      SelectionError::Malformed { .. } => {
-        Error::authentication_failed("feature selection malformed")
-      }
+      SelectionError::Malformed { context } => Error::invalid_input(context),
     }
   }
 }
@@ -388,12 +386,16 @@ mod tests {
       }
     );
 
-    // The `From` mapping keeps every failure an authentication failure.
+    // The `From` mapping keeps every failure an authentication failure
+    // except the structural-contract refusal, which is invalid input.
     let error: Error = SelectionError::UnknownRequired {
       label: "x".to_owned(),
     }
     .into();
     assert_eq!(error.kind(), crate::ErrorKind::AuthenticationFailed);
+    let error: Error = SelectionError::Malformed { context: "x" }.into();
+    assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    assert_eq!(error.context(), "x");
   }
 
   fn supported_entry(registry: &FeatureRegistry, name: &str) -> (FeatureTag, Digest) {
