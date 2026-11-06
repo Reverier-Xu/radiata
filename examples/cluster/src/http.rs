@@ -83,7 +83,7 @@ fn page_spec(
           )
         })?;
       let cursor =
-        PageCursor::from_provider_bytes(bytes.into_boxed_slice().into()).map_err(bad_request)?;
+        PageCursor::new(bytes.into_boxed_slice().into()).map_err(bad_request)?;;
       PageSpec::after(cursor, limit).map_err(bad_request)
     }
     _ => PageSpec::first(limit).map_err(bad_request),

@@ -58,12 +58,13 @@ impl NodeBuilder {
 
   pub async fn start(self) -> Result<NodeHandle> {
     let mut extensions = self.extensions;
-    // The official transports, core routing policies, and core feature
-    // definitions are installed explicitly. A caller override or a
-    // caller-claimed next-hop tag already occupies its entry, so the
-    // default path leaves it untouched; dial and listen resolve their
-    // transport from the endpoint's selector through the registry at
-    // runtime.
+    // The official transports, core routing policies, the built-in load
+    // balancer, and the core feature definitions are installed explicitly.
+    // The transports keep their own insertion rule (an explicit
+    // registration survives the default pass); a caller claim on a core
+    // routing entry conflicts, so a caller names its own tag instead.
+    // Dial and listen resolve their transport from the endpoint's
+    // selector through the registry at runtime.
     extensions.register_default()?;
     let extensions = Arc::new(extensions);
     let events = Arc::new(crate::node::EventHub::new());
