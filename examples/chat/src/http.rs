@@ -939,9 +939,27 @@ async fn tasks(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Js
   while let Some(page) = next {
     let view = state.node.tasks().list(page).await.map_err(internal)?;
     tasks.extend(view.items().iter().map(|task| {
+      // The stable short kind name: the tag's kebab-case name segment in
+      // PascalCase ("radiata.woooo.tech/tasks/put-resource" renders as
+      // "PutResource"), the spelling the acceptance suite pins.
+      let kind = task
+        .kind()
+        .as_str()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('-')
+        .map(|part| {
+          let mut chars = part.chars();
+          match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+          }
+        })
+        .collect::<String>();
       json!({
         "id": task.id().to_string(),
-        "kind": format!("{:?}", task.kind()),
+        "kind": kind,
         "phase": format!("{:?}", task.phase()),
         "attempts": task.attempts(),
       })
