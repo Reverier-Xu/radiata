@@ -433,13 +433,10 @@ impl Tasks {
   pub async fn wait(&self, id: crate::TaskId) -> Result<crate::view::TaskView> {
     self.require_running()?;
     let client = self.client()?;
-    let Some((kind, _)) = client.observer.table.status(&id) else {
-      return Err(crate::Error::not_found("task"));
-    };
     // The watch/shutdown arbitration is the observer's own (shared
     // with [`crate::Task::wait`]); only the terminal read differs —
     // this wait resolves with the view, not the typed output.
-    client.observer.await_terminal(&id, &kind).await?;
+    client.observer.await_terminal(&id).await?;
     client
       .observer
       .table
@@ -459,8 +456,12 @@ impl Tasks {
   ///
   /// Admission-time failures are the pure shape checks (a stopped node,
   /// the reserved domain, an unregistered kind); every reconciler error
-  /// is effect-time, retried within the bounded extension schedule, and
-  /// surfaces on the task's `wait`.
+  /// is effect-time and surfaces on the task's `wait`. Only the
+  /// reconciler's explicit [`ReconcileDecision::Retry`] decision re-arms
+  /// the bounded extension retry schedule; a returned `Err` or an
+  /// explicit [`ReconcileDecision::Failed`] decision terminalizes the
+  /// task as failed with that error, never retried — re-driving a failed
+  /// workflow is the caller's own re-submission.
   pub async fn submit(&self, spec: crate::CustomTaskSpec) -> Result<Task<()>> {
     let client = self.client()?.clone();
     if spec.kind().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
@@ -472,25 +473,30 @@ impl Tasks {
     self.require_running()?;
     let kind = TaskKind::from(spec.kind().clone());
     let handle = self.handle.clone();
-    let effect_kind = kind.clone();
     let effect: TaskEffect = Arc::new(move |_deps, attempt| {
       let reconciler = Arc::clone(&reconciler);
       let handle = handle.clone();
       let spec = spec.clone();
-      let kind = effect_kind.clone();
       Box::pin(async move {
         let context =
           crate::ReconcileContext::new(handle, spec, attempt.attempt, attempt.last_error);
         match reconciler.reconcile(context).await {
           Ok(crate::ReconcileDecision::Succeeded) => {
-            Ok(EffectOutcome::new(TaskOutput::new(kind, Arc::from([]))))
+            Ok(EffectOutcome::new(TaskOutput::new(Arc::from([]))))
           }
           Ok(crate::ReconcileDecision::SucceededWithOutput(bytes)) => {
-            Ok(EffectOutcome::new(TaskOutput::new(kind, bytes.into())))
+            Ok(EffectOutcome::new(TaskOutput::new(bytes.into())))
           }
-          // The explicit no-progress decision re-arms the same bounded
-          // extension schedule an error rides, as the typed overload.
-          Ok(crate::ReconcileDecision::Retry) => Err(crate::Error::overloaded("custom task retry")),
+          // The explicit no-progress decision is the only re-arm path:
+          // it rides the bounded extension schedule as the typed
+          // overload marker the next attempt's context reads.
+          Ok(crate::ReconcileDecision::Retry) => Ok(EffectOutcome::Retry(
+            crate::Error::overloaded("custom task retry"),
+          )),
+          // The explicit terminal-failure decision and a returned error
+          // both terminalize the task with their error; nothing retries
+          // either.
+          Ok(crate::ReconcileDecision::Failed(error)) => Err(error.to_error()),
           Err(error) => Err(error),
         }
       })

@@ -77,7 +77,8 @@ pub struct ExtensionRegistry {
     std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
   resource_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ResourceHook>>>,
   action_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ActionHook>>>,
-  task_reconcilers: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::TaskReconciler>>>,
+  task_reconcilers:
+    std::sync::Mutex<BTreeMap<crate::QualifiedTag, super::task::TaskReconcilerRegistration>>,
 }
 
 impl Default for ExtensionRegistry {
@@ -104,11 +105,12 @@ impl ExtensionRegistry {
     Self::default()
   }
 
-  /// Installs the official transports, the core routing policies, and the
-  /// core feature definitions explicitly. The node builder calls this by
-  /// default, so an ordinary node keeps resolving every official scheme and
-  /// feature; a caller that builds its own registry sees exactly what it
-  /// registered. Idempotent: an entry already present (a caller override, a
+  /// Installs the official transports, the core routing policies, the
+  /// core feature definitions, and the core verbs' execution policies
+  /// explicitly. The node builder calls this by default, so an ordinary
+  /// node keeps resolving every official scheme and feature; a caller
+  /// that builds its own registry sees exactly what it registered.
+  /// Idempotent: an entry already present (a caller override, a
   /// caller-claimed next-hop tag) is left untouched.
   pub fn register_default(&mut self) -> Result<&mut Self> {
     self.transports.register_default()?;
@@ -116,6 +118,7 @@ impl ExtensionRegistry {
     for definition in crate::protocol::feature::builtin_definitions()? {
       self.register_core_feature(definition)?;
     }
+    self.register_core_task_policies()?;
     Ok(self)
   }
 
@@ -389,6 +392,13 @@ impl ExtensionRegistry {
   /// constants under that domain, so a reconciler registered there is
   /// refused (the same reserved-domain rule the tag grammar applies to
   /// crypto tags).
+  ///
+  /// The registration declares the kind's execution policy: a
+  /// caller-registered kind always draws from the extension slot
+  /// channel and is cancelled on shutdown
+  /// (`TaskReconcilePolicy::EXTENSION`) — the core verbs declare their
+  /// own policies through the same channel in
+  /// [`ExtensionRegistry::register_default`](Self::register_default).
   pub fn register_task_reconciler(
     &mut self, kind: crate::QualifiedTag, reconciler: Arc<dyn crate::TaskReconciler>,
   ) -> Result<&mut Self> {
@@ -401,11 +411,36 @@ impl ExtensionRegistry {
       insert_once(
         &mut reconcilers,
         kind,
-        reconciler,
+        super::task::TaskReconcilerRegistration {
+          reconciler: Some(reconciler),
+          policy: super::task::TaskReconcilePolicy::EXTENSION,
+        },
         "task reconciler registration",
       )?;
     }
     Ok(self)
+  }
+
+  /// Declares the core verbs' execution policies onto the reconciler
+  /// registration channel (see
+  /// [`crate::task::core_task_policies`]): policy-only records — the
+  /// core effects are the runtime's own closures, never registered
+  /// reconcilers — and never replacing an existing entry, like every
+  /// other default.
+  pub(crate) fn register_core_task_policies(&mut self) -> Result<()> {
+    let mut reconcilers = self
+      .task_reconcilers
+      .lock()
+      .map_err(Error::extension_registry)?;
+    for (kind, policy) in crate::task::core_task_policies() {
+      reconcilers
+        .entry(kind.tag().clone())
+        .or_insert(super::task::TaskReconcilerRegistration {
+          reconciler: None,
+          policy,
+        });
+    }
+    Ok(())
   }
 
   /// The registered action hooks in canonical tag order (the order they
@@ -433,7 +468,8 @@ impl ExtensionRegistry {
 
   /// The reconciler registered for one custom task kind tag, when
   /// present (the `tasks().submit` admission resolves the kind's
-  /// effect through this lookup).
+  /// effect through this lookup). Core verbs have policy-only records
+  /// and never carry one.
   pub(crate) fn task_reconciler(
     &self, kind: &crate::QualifiedTag,
   ) -> Option<Arc<dyn crate::TaskReconciler>> {
@@ -441,7 +477,21 @@ impl ExtensionRegistry {
       .task_reconcilers
       .lock()
       .ok()
-      .and_then(|reconcilers| reconcilers.get(kind).cloned())
+      .and_then(|reconcilers| reconcilers.get(kind).and_then(|r| r.reconciler.clone()))
+  }
+
+  /// The execution policy registered for one task kind, when present:
+  /// the slot class its effect draws from and whether the shutdown
+  /// drain awaits it. The task manager's admission resolves it once and
+  /// stores it on the admitted entry.
+  pub(crate) fn task_reconciler_policy(
+    &self, kind: &crate::TaskKind,
+  ) -> Option<super::task::TaskReconcilePolicy> {
+    self
+      .task_reconcilers
+      .lock()
+      .ok()
+      .and_then(|reconcilers| reconcilers.get(kind.tag()).map(|r| r.policy))
   }
 
   /// Registers one packet protocol and its consumer. A duplicate protocol
@@ -844,6 +894,63 @@ mod tests {
       .unwrap_err();
     assert_eq!(duplicate.kind(), ErrorKind::Conflict);
     assert!(format!("{registry:?}").contains("task_reconcilers: 1"));
+  }
+
+  /// The execution policy rides the registration, not the tag being a
+  /// core verb: `register_default` declares the core verbs' policies as
+  /// policy-only records (a core kind carries no reconciler), a caller
+  /// registration declares the extension policy, and a second default
+  /// pass changes nothing.
+  #[test]
+  fn task_policies_are_declared_on_the_registration_channel() {
+    let mut registry = ExtensionRegistry::new();
+    assert!(
+      registry
+        .task_reconciler_policy(&crate::TaskKind::JOIN)
+        .is_none()
+    );
+    registry.register_default().unwrap();
+    let join = registry
+      .task_reconciler_policy(&crate::TaskKind::JOIN)
+      .expect("register_default declares every core verb");
+    assert_eq!(join.slot_class, crate::task::SlotClass::Network);
+    assert!(!join.drains_on_shutdown);
+    let leave = registry
+      .task_reconciler_policy(&crate::TaskKind::LEAVE)
+      .expect("register_default declares every core verb");
+    assert_eq!(leave.slot_class, crate::task::SlotClass::Local);
+    assert!(leave.drains_on_shutdown);
+    // Core verbs are policy-only: no reconciler resolves for them.
+    assert!(
+      registry
+        .task_reconciler(crate::TaskKind::JOIN.tag())
+        .is_none()
+    );
+
+    let caller = crate::QualifiedTag::parse("example.com/tasks/rotate-secret").unwrap();
+    registry
+      .register_task_reconciler(caller.clone(), Arc::new(NoopReconciler))
+      .unwrap();
+    let policy = registry
+      .task_reconciler_policy(&crate::TaskKind::from(caller))
+      .expect("the registration declares the kind's policy");
+    assert_eq!(policy.slot_class, crate::task::SlotClass::Extension);
+    assert!(!policy.drains_on_shutdown);
+
+    // Idempotent: a second default pass leaves every entry untouched.
+    registry.register_default().unwrap();
+    assert!(
+      registry
+        .task_reconciler(crate::TaskKind::JOIN.tag())
+        .is_none()
+    );
+    assert_eq!(
+      registry
+        .task_reconciler_policy(&crate::TaskKind::JOIN)
+        .unwrap()
+        .slot_class,
+      crate::task::SlotClass::Network
+    );
   }
 
   /// The built-in next-hop policy's well-known tag is an ordinary

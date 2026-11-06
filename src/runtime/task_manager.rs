@@ -33,7 +33,10 @@ use crate::{
   BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeConfig, NodeId, Result, TaskId, TaskKind,
   TaskOutput, TaskPhase,
   api::Entropy,
-  task::{CoreTaskKind, SlotClass, TaskError, TaskObserver, TaskTable, output::encode_credential},
+  task::{
+    CoreTaskKind, SlotClass, TaskError, TaskObserver, TaskReconcilePolicy, TaskTable,
+    output::encode_credential,
+  },
   time::WallClock,
 };
 
@@ -111,9 +114,10 @@ const RETRY_TIMER_IDLE: Duration = Duration::from_secs(86_400 * 365);
 pub(crate) enum RetryClass {
   /// Join/connect dials: convergence and transport transients retry.
   Network,
-  /// Caller-registered custom kinds: the reconciler owns the semantics,
-  /// so every error retries within the bounded budget (the reconciler's
-  /// own `Retry` decision rides the same schedule as a typed overload).
+  /// Caller-registered custom kinds: a returned `Err` never re-arms the
+  /// schedule (the reconciler's explicit `Retry` decision is the only
+  /// re-arm path — see [`EffectOutcome::Retry`]), so the class itself
+  /// treats every error as terminal.
   Extension,
   /// Everything else: one attempt, no retry.
   Once,
@@ -131,8 +135,7 @@ impl RetryClass {
           | ErrorKind::RouteUnavailable
           | ErrorKind::StreamInterrupted
       ),
-      RetryClass::Extension => true,
-      RetryClass::Once => false,
+      RetryClass::Extension | RetryClass::Once => false,
     }
   }
 }
@@ -178,9 +181,11 @@ const ONCE: RetryPolicy = RetryPolicy {
   class: RetryClass::Once,
 };
 
-/// Caller-registered custom kinds: the reconciler's errors and explicit
-/// `Retry` decisions re-arm the same bounded schedule the network dials
-/// use (the reconciler owns the semantics; the manager owns the bound).
+/// Caller-registered custom kinds: only the reconciler's explicit
+/// `Retry` decision re-arms this bounded schedule (the reconciler owns
+/// the semantics; the manager owns the bound). A returned `Err` or an
+/// explicit `Failed` decision terminalizes the task instead — business
+/// retry belongs to the caller's logic, not the schedule.
 const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
   max_attempts: 4,
   initial: Duration::from_millis(100),
@@ -203,20 +208,30 @@ pub(crate) fn retry_policy(kind: &TaskKind) -> &'static RetryPolicy {
 /// watch, or is awaited to its terminal phase by the shutdown drain.
 /// `Leave` and `ResolveFrozenJournal` are journaled/store-atomic
 /// operations whose outcome must settle before teardown completes.
-pub(crate) fn cancellable(kind: &TaskKind) -> bool {
-  !kind.drains_on_shutdown()
+pub(crate) fn cancellable(policy: &TaskReconcilePolicy) -> bool {
+  !policy.drains_on_shutdown
 }
 
-/// One reconcile attempt's terminal payload: the public output plus,
-/// for the credential kinds, the consumed-once secret slot.
-pub(crate) struct EffectOutcome {
-  pub(crate) output: TaskOutput,
-  pub(crate) secret: Option<IssuedMergeCredential>,
+/// One attempt's terminal payload: either the public output plus, for
+/// the credential kinds, the consumed-once secret slot, or an explicit
+/// re-arm request carrying the error the next attempt's context reads.
+pub(crate) enum EffectOutcome {
+  /// The attempt succeeded; the task terminalizes with the payloads.
+  Done {
+    output: TaskOutput,
+    secret: Option<IssuedMergeCredential>,
+  },
+  /// The attempt made no progress and explicitly asked for a re-arm:
+  /// the manager re-runs the effect after the policy's backoff while
+  /// the attempt budget lasts, then terminalizes with this error. A
+  /// returned `Err` never re-arms; this variant is the only re-arm
+  /// path an effect controls.
+  Retry(Error),
 }
 
 impl EffectOutcome {
   pub(crate) fn new(output: TaskOutput) -> Self {
-    Self {
+    Self::Done {
       output,
       secret: None,
     }
@@ -225,8 +240,8 @@ impl EffectOutcome {
   /// The issue-credential effect's outcome: the observation carries the
   /// generation's expiry; the secret rides the consumed-once slot.
   pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Result<Self> {
-    Ok(Self {
-      output: encode_credential(TaskKind::ISSUE_CREDENTIAL, issued.expires_at())?,
+    Ok(Self::Done {
+      output: encode_credential(issued.expires_at())?,
       secret: Some(issued),
     })
   }
@@ -234,8 +249,8 @@ impl EffectOutcome {
   /// The rotate-credential effect's outcome (the same consumed-once
   /// rule).
   pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Result<Self> {
-    Ok(Self {
-      output: encode_credential(TaskKind::ROTATE_CREDENTIAL, issued.expires_at())?,
+    Ok(Self::Done {
+      output: encode_credential(issued.expires_at())?,
       secret: Some(issued),
     })
   }
@@ -369,6 +384,21 @@ pub(crate) struct Submission {
   pub(crate) spec: TaskSpec,
   pub(crate) effect: TaskEffect,
   pub(crate) reply: oneshot::Sender<Result<TaskId>>,
+  /// The slot class of the effect this submission was made from, when
+  /// any: the attempt body scopes the running effect's class onto its
+  /// tokio task (see `RUNNING_EFFECT_CLASS`), and the admission refuses
+  /// a submission into that same class — the nested-submit refusal that
+  /// turns the same-class recursive-waiting deadlock into a typed
+  /// caller error.
+  pub(crate) from_class: Option<SlotClass>,
+}
+
+// The slot class of the reconcile effect running on the current tokio
+// task, set by the attempt body around the effect invocation. A
+// submission read off a task without this scope (a verb call from
+// ordinary caller code) carries no class and is never refused.
+tokio::task_local! {
+  static RUNNING_EFFECT_CLASS: SlotClass;
 }
 
 /// The caller's submission half over the manager: the bounded admission
@@ -392,9 +422,9 @@ impl std::fmt::Debug for TaskClient {
 impl TaskClient {
   /// Submits one task and awaits its admission: pure validation and
   /// hooks have already run caller-side; this is id composition, the
-  /// dedup/coalescing check, the per-class backlog bound, the `Pending`
-  /// publication, and the first reconcile spawn. No IO ever runs on
-  /// this path.
+  /// nested-submit refusal, the dedup/coalescing check, the per-class
+  /// backlog bound, the `Pending` publication, and the first reconcile
+  /// spawn. No IO ever runs on this path.
   pub(crate) async fn submit(&self, spec: TaskSpec, effect: TaskEffect) -> Result<TaskId> {
     let (reply, response) = oneshot::channel();
     self
@@ -403,6 +433,7 @@ impl TaskClient {
         spec,
         effect,
         reply,
+        from_class: RUNNING_EFFECT_CLASS.try_with(|class| *class).ok(),
       })
       .await
       .map_err(|_| Error::shutting_down("task admission"))?;
@@ -702,6 +733,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
 struct RetryTicket {
   id: TaskId,
   kind: TaskKind,
+  policy: TaskReconcilePolicy,
   effect: TaskEffect,
   attempt: u32,
   last_error: Option<TaskError>,
@@ -722,6 +754,7 @@ enum WorkerReport {
   Retry {
     id: TaskId,
     kind: TaskKind,
+    policy: TaskReconcilePolicy,
     effect: TaskEffect,
     attempt: u32,
     last_error: Option<TaskError>,
@@ -834,6 +867,7 @@ async fn run_manager(
               &mut outstanding,
               ticket.id,
               ticket.kind,
+              ticket.policy,
               ticket.effect,
               ticket.attempt,
               ticket.last_error,
@@ -874,6 +908,7 @@ async fn run_manager(
           WorkerReport::Retry {
             id,
             kind,
+            policy,
             effect,
             attempt,
             last_error,
@@ -889,6 +924,7 @@ async fn run_manager(
                 .push(RetryTicket {
                   id,
                   kind,
+                  policy,
                   effect,
                   attempt,
                   last_error,
@@ -931,6 +967,7 @@ fn admit(
     spec,
     effect,
     reply,
+    from_class,
   } = submission;
   let result = admit_inner(
     shared,
@@ -941,6 +978,7 @@ fn admit(
     base,
     &spec,
     effect,
+    from_class,
     reports,
     outstanding,
   );
@@ -952,14 +990,30 @@ fn admit_inner(
   shared: &Arc<ManagerShared>, counter: &mut u64,
   coalescing: &mut BTreeMap<(TaskKind, NodeId), (TaskId, TaskSpec)>,
   leave_task: &mut Option<TaskId>, cancel_watch: &watch::Receiver<bool>, base: u128,
-  spec: &TaskSpec, effect: TaskEffect, reports: &mpsc::UnboundedSender<WorkerReport>,
-  outstanding: &mut usize,
+  spec: &TaskSpec, effect: TaskEffect, from_class: Option<SlotClass>,
+  reports: &mpsc::UnboundedSender<WorkerReport>, outstanding: &mut usize,
 ) -> Result<TaskId> {
   if *cancel_watch.borrow() {
     return Err(Error::shutting_down("task admission"));
   }
   spec.check_shape()?;
   let kind = spec.kind().clone();
+  // The execution policy rides the kind's registration (the core verbs
+  // declare theirs in `register_default`, a caller kind at its own
+  // registration). A kind without one cannot be admitted: the public
+  // submit refuses unregistered kinds and the node builder always runs
+  // `register_default`, so a miss here is an internal invariant.
+  let policy = shared
+    .extensions()
+    .task_reconciler_policy(&kind)
+    .ok_or_else(|| Error::internal("task policy"))?;
+  // The nested-submit refusal: a submission made from inside an effect
+  // of the same slot class would await a task of its own bounded
+  // channel — the one recursive wait that can self-deadlock on the
+  // class's budget — so it is refused typed instead of admitted.
+  if from_class == Some(policy.slot_class) {
+    return Err(Error::conflict("nested task submit"));
+  }
   // Coalescing: kind + subject, accepted only when the whole spec
   // equals the in-flight one. A task's terminal publication (which
   // wakes every `wait`) lands inside its attempt body, before this
@@ -1002,7 +1056,7 @@ fn admit_inner(
   // plus a stream of distinct intents can never accumulate unbounded
   // admitted work. The bound is per class — a stalled dial backlog
   // never consumes the local write budget.
-  if shared.table.non_terminal_count(kind.slot_class()) >= TASK_RECONCILE_BACKLOG {
+  if shared.table.non_terminal_count(policy.slot_class) >= TASK_RECONCILE_BACKLOG {
     return Err(Error::overloaded("task admission"));
   }
   let next = *counter;
@@ -1012,7 +1066,7 @@ fn admit_inner(
   let id = TaskId::compose(base, next)?;
   if !shared
     .table
-    .insert_pending(&id, kind.clone(), shared.clock.now())
+    .insert_pending(&id, kind.clone(), policy, shared.clock.now())
   {
     return Err(Error::internal("task admission"));
   }
@@ -1037,6 +1091,7 @@ fn admit_inner(
     outstanding,
     id.clone(),
     kind,
+    policy,
     effect,
     1,
     None,
@@ -1052,6 +1107,10 @@ struct Worker {
   reports: mpsc::UnboundedSender<WorkerReport>,
   id: TaskId,
   kind: TaskKind,
+  /// The execution policy admission resolved from the kind's
+  /// registration: the slot channel this worker draws from and whether
+  /// the shutdown drain awaits the effect.
+  policy: TaskReconcilePolicy,
   effect: TaskEffect,
   attempt: u32,
   /// The previous attempt's typed error, handed to the effect from the
@@ -1070,14 +1129,14 @@ impl Worker {
   }
 
   async fn run_attempt(mut self) -> WorkerReport {
-    let cancellable = cancellable(&self.kind);
+    let cancellable = cancellable(&self.policy);
     if cancellable && *self.cancel.borrow() {
       return WorkerReport::Cancelled;
     }
-    // The permit gate, drawn from the kind's slot channel: a
+    // The permit gate, drawn from the kind's registered slot channel: a
     // cancellable kind releases its queue slot on shutdown instead of
     // waiting out the concurrency bound.
-    let slots = self.shared.slots.for_class(self.kind.slot_class());
+    let slots = self.shared.slots.for_class(self.policy.slot_class);
     let permit = if cancellable {
       tokio::select! {
         permit = slots.acquire() => permit,
@@ -1113,6 +1172,7 @@ impl Worker {
         shared: Arc::clone(&self.shared),
         id: self.id.clone(),
         kind: self.kind.clone(),
+        policy: self.policy,
         effect: self.effect.clone(),
         attempt: AttemptContext {
           attempt: self.attempt,
@@ -1144,6 +1204,7 @@ impl Worker {
       Ok(AttemptOutcome::Retry { delay, last_error }) => WorkerReport::Retry {
         id: self.id,
         kind: self.kind,
+        policy: self.policy,
         effect: self.effect,
         // The wake runs the next attempt: the ticket carries the
         // incremented index, so the budget is spent monotonically and
@@ -1184,6 +1245,7 @@ struct Attempt {
   shared: Arc<ManagerShared>,
   id: TaskId,
   kind: TaskKind,
+  policy: TaskReconcilePolicy,
   effect: TaskEffect,
   attempt: AttemptContext,
 }
@@ -1198,14 +1260,43 @@ impl Attempt {
       // poisoned: there is no state left to publish onto.
       return AttemptOutcome::Terminal;
     }
-    match (self.effect)(Arc::clone(&self.shared.operations), self.attempt).await {
-      Ok(EffectOutcome { output, secret }) => {
+    // The running effect's slot class is scoped onto this task so a
+    // nested submission reads it and the admission can refuse a
+    // same-class recursive wait (the nested-submit refusal).
+    let class = self.policy.slot_class;
+    let outcome = RUNNING_EFFECT_CLASS
+      .scope(
+        class,
+        (self.effect)(Arc::clone(&self.shared.operations), self.attempt),
+      )
+      .await;
+    match outcome {
+      Ok(EffectOutcome::Done { output, secret }) => {
         self
           .shared
           .publish_success(&self.id, &self.kind, output, secret);
         AttemptOutcome::Terminal
       }
+      Ok(EffectOutcome::Retry(error)) => {
+        // The explicit re-arm decision: the schedule's budget bounds it,
+        // and the carried error rides the next attempt's context. The
+        // error's kind is not classified here — the decision itself is
+        // the re-arm request.
+        let policy = retry_policy(&self.kind);
+        if self.attempt.attempt < policy.max_attempts {
+          AttemptOutcome::Retry {
+            delay: policy.backoff(self.attempt.attempt),
+            last_error: Some(TaskError::from_error(error)),
+          }
+        } else {
+          self.shared.publish_failure(&self.id, &self.kind, error);
+          AttemptOutcome::Terminal
+        }
+      }
       Err(error) => {
+        // A returned error is terminal unless the kind's own policy
+        // classifies it retryable (the network dials' convergence
+        // transients); the extension kinds never retry an `Err`.
         let policy = retry_policy(&self.kind);
         if self.attempt.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
           AttemptOutcome::Retry {
@@ -1225,7 +1316,8 @@ impl Attempt {
 fn spawn_worker(
   shared: &Arc<ManagerShared>, cancel_watch: &watch::Receiver<bool>,
   reports: &mpsc::UnboundedSender<WorkerReport>, outstanding: &mut usize, id: TaskId,
-  kind: TaskKind, effect: TaskEffect, attempt: u32, last_error: Option<TaskError>,
+  kind: TaskKind, policy: TaskReconcilePolicy, effect: TaskEffect, attempt: u32,
+  last_error: Option<TaskError>,
 ) {
   *outstanding += 1;
   let worker = Worker {
@@ -1233,6 +1325,7 @@ fn spawn_worker(
     reports: reports.clone(),
     id,
     kind,
+    policy,
     effect,
     attempt,
     last_error,
@@ -1289,8 +1382,12 @@ mod tests {
   };
 
   fn deps_with(
-    events: Arc<crate::node::EventHub>, extensions: ExtensionRegistry,
+    events: Arc<crate::node::EventHub>, mut extensions: ExtensionRegistry,
   ) -> TaskManagerDeps {
+    // The core verbs' execution policies come from `register_default`,
+    // exactly like the node builder's startup path: the manager tests
+    // admit core kinds (sync rounds, leaves) and need them declared.
+    extensions.register_default().expect("core task policies");
     // The leave signal's receiver is the supervisor's in production; the
     // manager tests never admit a leave effect that sends it.
     let (leave_signal, _leave_signals) = mpsc::channel(1);
@@ -1335,6 +1432,7 @@ mod tests {
       )
       .expect("registration");
     let (leave_signal, mut leave_signals) = mpsc::channel(1);
+    extensions.register_default().expect("core task policies");
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
@@ -1430,7 +1528,7 @@ mod tests {
     let id = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+        ok_effect(unit_output()),
       )
       .await
       .expect("admission");
@@ -1518,7 +1616,7 @@ mod tests {
       let id = client
         .submit(
           TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-          ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+          ok_effect(unit_output()),
         )
         .await
         .expect("admission");
@@ -1569,7 +1667,19 @@ mod tests {
   /// no longer occupies.
   #[tokio::test]
   async fn an_extension_workflow_never_occupies_the_local_channel_its_children_need() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // The workflow kind needs a registration so admission resolves its
+    // extension policy; the test drives the effect directly, so the
+    // registered reconciler never runs.
+    let kind_tag = QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag");
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_task_reconciler(kind_tag.clone(), RecordingReconciler::new(Vec::new()))
+      .expect("registration");
+    let (client, _manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
+    .expect("manager");
     // One wedged core local task pins one of the local channel's two
     // default slots: exactly one slot remains for the workflow's child.
     let wedged = client
@@ -1603,19 +1713,16 @@ mod tests {
         let child = client
           .submit(
             TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-            ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+            ok_effect(unit_output()),
           )
           .await?;
         Task::<()>::from_parts(child, TaskKind::SYNC_ROUND, client.observer.clone())
           .wait()
           .await?;
-        Ok(EffectOutcome::new(custom_output(&TaskKind::from(
-          QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"),
-        ))))
+        Ok(EffectOutcome::new(custom_output()))
       })
     });
-    let kind =
-      TaskKind::from(QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"));
+    let kind = TaskKind::from(kind_tag);
     let id = client
       .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
       .await
@@ -1721,7 +1828,7 @@ mod tests {
     let local = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+        ok_effect(unit_output()),
       )
       .await
       .expect("local admission");
@@ -1767,14 +1874,14 @@ mod tests {
   }
 
   /// One unit kind's success payload: the kind's canonical empty result.
-  fn unit_output(kind: TaskKind) -> TaskOutput {
-    crate::task::output::encode_unit(kind).expect("unit output")
+  fn unit_output() -> TaskOutput {
+    crate::task::output::encode_unit().expect("unit output")
   }
 
   /// One caller-defined kind's success payload: the reconciler's own
   /// bytes, which the crate never encodes.
-  fn custom_output(kind: &TaskKind) -> TaskOutput {
-    TaskOutput::new(kind.clone(), Arc::from([]))
+  fn custom_output() -> TaskOutput {
+    TaskOutput::new(Arc::from([]))
   }
 
   /// An effect that never settles (a wedged effect under test).
@@ -1815,7 +1922,7 @@ mod tests {
             .push(context.attempt);
           let mut steps = scripted.steps.lock().expect("steps");
           let step = match steps.len() {
-            0 => Step::Ok(unit_output(TaskKind::SYNC_ROUND)),
+            0 => Step::Ok(unit_output()),
             1 => match &steps[0] {
               Step::Ok(output) => Step::Ok(output.clone()),
               Step::Fail(kind, context) => Step::Fail(*kind, context),
@@ -2071,12 +2178,14 @@ mod tests {
   async fn a_second_leave_before_the_first_terminal_report_is_refused_and_the_first_still_signals()
   {
     let (leave_signal, mut leave_signals) = mpsc::channel(1);
+    let mut extensions = ExtensionRegistry::new();
+    extensions.register_default().expect("core task policies");
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
       operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
         Arc::new(crate::node::EventHub::new()),
-        Arc::new(ExtensionRegistry::new()),
+        Arc::new(extensions),
       )),
       leave_signal,
     };
@@ -2134,8 +2243,18 @@ mod tests {
     let table = crate::task::TaskTable::new();
     let leave = TaskId::compose(0, 0).expect("id");
     let other = TaskId::compose(0, 1).expect("id");
-    table.insert_pending(&leave, TaskKind::LEAVE, std::time::SystemTime::now());
-    table.insert_pending(&other, TaskKind::SYNC_ROUND, std::time::SystemTime::now());
+    table.insert_pending(
+      &leave,
+      TaskKind::LEAVE,
+      crate::task::TaskReconcilePolicy::EXTENSION,
+      std::time::SystemTime::now(),
+    );
+    table.insert_pending(
+      &other,
+      TaskKind::SYNC_ROUND,
+      crate::task::TaskReconcilePolicy::EXTENSION,
+      std::time::SystemTime::now(),
+    );
     assert_eq!(
       super::leave_signal_for(&table, &leave),
       None,
@@ -2174,9 +2293,7 @@ mod tests {
       let gate = gate.clone();
       Box::pin(async move {
         gate.notified().await;
-        Ok(EffectOutcome::new(unit_output(
-          TaskKind::RESOLVE_FROZEN_JOURNAL,
-        )))
+        Ok(EffectOutcome::new(unit_output()))
       })
     });
     let journaled = client
@@ -2264,7 +2381,7 @@ mod tests {
           peak.fetch_max(now, Ordering::SeqCst);
           tokio::time::sleep(Duration::from_millis(20)).await;
           live.fetch_sub(1, Ordering::SeqCst);
-          Ok(EffectOutcome::new(unit_output(TaskKind::SYNC_ROUND)))
+          Ok(EffectOutcome::new(unit_output()))
         })
       });
       let id = client
@@ -2359,18 +2476,19 @@ mod tests {
     let id = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
-        ok_effect(unit_output(TaskKind::SYNC_ROUND)),
+        ok_effect(unit_output()),
       )
       .await
       .expect("admission");
     // The task succeeded as a sync round; a handle admitted for a join
-    // reads a different expected kind.
+    // decodes the stored bytes under the join verb's payload shape, and
+    // the mismatch surfaces as the typed internal decode failure.
     let error = handle::<MergeView>(&client, &id, TaskKind::JOIN)
       .wait()
       .await
       .expect_err("kind mismatch");
     assert_eq!(error.kind(), ErrorKind::Internal);
-    assert_eq!(error.context(), "task output");
+    assert_eq!(error.context(), "task output decode");
     // The contract holds for the right handle: the mismatch never
     // poisoned the entry.
     handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
@@ -2413,15 +2531,10 @@ mod tests {
         let decision = decisions
           .pop_front()
           .unwrap_or(ReconcileDecision::Succeeded);
-        match decision {
-          ReconcileDecision::Succeeded | ReconcileDecision::SucceededWithOutput(_) => {
-            Ok(ReconcileDecision::Succeeded)
-          }
-          ReconcileDecision::Retry => Err(Error::from_parts(
-            ErrorKind::Overloaded,
-            "custom task retry",
-          )),
-        }
+        // The scripted decision is returned verbatim: the decision
+        // semantics live in the submit effect, which this test drives
+        // through the real `tasks().submit` surface.
+        Ok(decision)
       })
     }
   }
@@ -2432,8 +2545,12 @@ mod tests {
   /// registry instance serves both the handle (the reconciler lookup)
   /// and the manager (the hook source).
   fn handle_over_manager(
-    extensions: std::sync::Arc<ExtensionRegistry>, events: Arc<crate::node::EventHub>,
+    mut extensions: ExtensionRegistry, events: Arc<crate::node::EventHub>,
   ) -> (crate::NodeHandle, crate::Tasks) {
+    // The core verbs' execution policies come from `register_default`,
+    // exactly like the node builder's startup path.
+    extensions.register_default().expect("core task policies");
+    let extensions = std::sync::Arc::new(extensions);
     let (leave_signal, _leave_signals) = mpsc::channel(1);
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
@@ -2483,8 +2600,7 @@ mod tests {
     extensions
       .register_task_reconciler(kind.clone(), RecordingReconciler::new(Vec::new()))
       .expect("registration");
-    let (_handle, tasks) =
-      handle_over_manager(Arc::new(extensions), Arc::new(crate::node::EventHub::new()));
+    let (_handle, tasks) = handle_over_manager(extensions, Arc::new(crate::node::EventHub::new()));
 
     // The builtin domain is reserved and an unregistered kind is
     // unsupported: both refuse at admission, typed.

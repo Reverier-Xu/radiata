@@ -410,7 +410,7 @@ async fn reconcile_disconnect(deps: Arc<OperationDeps>, peer: NodeId) -> Result<
   let planes = deps.planes()?;
   retire_session(&planes.sessions, &peer)?;
   deps.events().emit(crate::SessionChanged::new(peer));
-  Ok(EffectOutcome::new(encode_unit(TaskKind::DISCONNECT)?))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// Spawns one kept session task into the node's tracked connection
@@ -651,7 +651,7 @@ async fn reconcile_cleanup(deps: Arc<OperationDeps>, subject: NodeId) -> Result<
     deps.events().emit(crate::MemberChanged::new(subject));
     planes.member_revision.bump();
   }
-  Ok(EffectOutcome::new(encode_unit(TaskKind::CLEANUP)?))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The purge effect: clear the local revocation record (local-only,
@@ -674,7 +674,7 @@ async fn reconcile_purge_revocation(
   .await?;
   revoked.forget(&subject);
   drop(revoked);
-  Ok(EffectOutcome::new(encode_unit(TaskKind::PURGE_REVOCATION)?))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The checkpoint effect: enforce the convergence precondition, then
@@ -705,9 +705,7 @@ async fn reconcile_resolve_frozen_journal(deps: Arc<OperationDeps>) -> Result<Ef
     .store()
     .resolve_frozen_journal_uncommitted(operation)
     .await?;
-  Ok(EffectOutcome::new(encode_unit(
-    TaskKind::RESOLVE_FROZEN_JOURNAL,
-  )?))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The checkpoint issue precondition: every known member other than self
@@ -1165,10 +1163,7 @@ async fn reconcile_put_resource(
     view.accepted(),
   )
   .await;
-  Ok(EffectOutcome::new(encode_resource_mutation(
-    TaskKind::PUT_RESOURCE,
-    &view,
-  )?))
+  Ok(EffectOutcome::new(encode_resource_mutation(&view)?))
 }
 
 /// The removal effect: the moved supervisor body — only when the stored
@@ -1291,10 +1286,7 @@ async fn reconcile_delete_resource(
     view.accepted(),
   )
   .await;
-  Ok(EffectOutcome::new(encode_resource_mutation(
-    TaskKind::DELETE_RESOURCE,
-    &view,
-  )?))
+  Ok(EffectOutcome::new(encode_resource_mutation(&view)?))
 }
 
 /// The metadata-patch effect: the moved supervisor body — replace this
@@ -1673,7 +1665,7 @@ async fn reconcile_stop_listener(
   let planes = deps.planes()?;
   super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
     .await?;
-  Ok(EffectOutcome::new(encode_unit(TaskKind::STOP_LISTENER)?))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The credential effect: issue (or rotate) the live join credential
@@ -1741,7 +1733,7 @@ async fn reconcile_sync_round(deps: Arc<OperationDeps>) -> Result<EffectOutcome>
   round_rx
     .await
     .map_err(|_| Error::shutting_down("sync round"))?;
-  Ok(EffectOutcome::new(encode_unit(TaskKind::SYNC_ROUND)?))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 // -- the leave verb ------------------------------------------------------
