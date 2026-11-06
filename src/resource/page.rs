@@ -113,12 +113,10 @@ pub(crate) mod sync {
     ResourcePage::new(records, cursor)
   }
 
-  /// The outcome of one received page's apply: how many records the
-  /// conditional register committed, and the committed records — the
-  /// caller reports each one as a peer-converged resource change.
+  /// The outcome of one received page's apply: the committed records, in
+  /// commit order — the caller reports each one as a peer-converged
+  /// resource change.
   pub(crate) struct PageApply {
-    /// Records the register committed this pass.
-    pub(crate) applied: usize,
     /// The committed records, in commit order.
     pub(crate) installed: Vec<ResourceRecordV1>,
   }
@@ -137,7 +135,12 @@ pub(crate) mod sync {
   pub(crate) async fn apply_page_ctx(
     store: &MetadataStore, entropy: &dyn Entropy, page: &ResourcePage,
   ) -> Result<usize> {
-    Ok(apply_page_reported_ctx(store, entropy, page).await?.applied)
+    Ok(
+      apply_page_reported_ctx(store, entropy, page)
+        .await?
+        .installed
+        .len(),
+    )
   }
 
   /// The reported form of [`apply_page_ctx`] the reconciliation plane's
@@ -151,10 +154,7 @@ pub(crate) mod sync {
     // roster-convergence tail).
     let records: Vec<&ResourceRecordV1> = page.records().iter().collect();
     let installed = super::super::store::commit_page_batch_ctx(store, entropy, &records).await?;
-    Ok(PageApply {
-      applied: installed.len(),
-      installed,
-    })
+    Ok(PageApply { installed })
   }
 }
 
@@ -378,7 +378,7 @@ mod tests {
     let outcome = sync::apply_page_reported_ctx(&receiver, &SystemEntropy, &page)
       .await
       .unwrap();
-    assert_eq!(outcome.applied, 1, "the delivered row installs");
+    assert_eq!(outcome.installed.len(), 1, "the delivered row installs");
     assert_eq!(
       outcome.installed.as_slice(),
       std::slice::from_ref(&delivered)
@@ -437,7 +437,8 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(
-      outcome.applied, 2,
+      outcome.installed.len(),
+      2,
       "both records apply over the corrupt incumbent"
     );
 
@@ -461,6 +462,10 @@ mod tests {
     let outcome = sync::apply_page_reported_ctx(&store, &SystemEntropy, &page)
       .await
       .unwrap();
-    assert_eq!(outcome.applied, 0, "a converged page does not re-install");
+    assert_eq!(
+      outcome.installed.len(),
+      0,
+      "a converged page does not re-install"
+    );
   }
 }

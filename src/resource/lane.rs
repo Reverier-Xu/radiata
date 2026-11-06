@@ -142,7 +142,10 @@ impl Lane for ResourcesLane {
         let outcome =
           crate::resource::page::sync::apply_page_reported_ctx(store, ctx.entropy.as_ref(), &page)
             .await?;
-        tracing::debug!(applied = outcome.applied, "reconcile resource rows applied");
+        tracing::debug!(
+          applied = outcome.installed.len(),
+          "reconcile resource rows applied"
+        );
         // Each committed record is a peer-converged resource change:
         // report it through the same event local writes emit, tagged
         // `Remote` so a hook can tell the two apart. The removal flag
