@@ -2235,9 +2235,10 @@ mod tests {
   }
 
   /// The signal decision reads the table's own (kind, phase) and nothing
-  /// else: a leave that published `Succeeded` signals — the state a raced
-  /// second admission used to suppress through the exclusivity slot's id —
-  /// and no other kind's success ever does.
+  /// else: a leave that published `Succeeded` signals, and no other
+  /// kind's success ever does. The exclusivity slot is not consulted —
+  /// the slot's id holds no signal authority, so a raced second
+  /// admission cannot change what the table reports.
   #[test]
   fn the_leave_signal_is_read_off_the_table_not_the_exclusivity_slot() {
     let table = crate::task::TaskTable::new();

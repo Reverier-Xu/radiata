@@ -921,6 +921,39 @@
 //! returned `Task<()>` waits exactly like a core kind. The reserved
 //! builtin domain is refused, so custom kinds never shadow core ones.
 //!
+//! ## Publishing your own events
+//!
+//! The event hub also carries a caller-owned, tag-keyed channel: choose
+//! an [`EventTag`](crate::EventTag) (a qualified tag, whose built-in
+//! domain is reserved — the crate's own events are the sealed types
+//! above), then [`publish`](crate::NodeHandle::publish) opaque bytes
+//! under it and hand
+//! [`subscribe`](crate::NodeHandle::subscribe) receivers the same tag.
+//! Every item is a [`TaggedEvent`](crate::TaggedEvent) carrying the
+//! publishing tag and the payload; the core never inspects either. The
+//! channel keeps the hub's contract: bounded per-subscriber channels (a
+//! slow subscriber lags instead of blocking the publisher), no replay
+//! of publishes made before the subscription, and nothing retained
+//! across a restart — it is an in-process signaling surface, not a
+//! queue. For durable state, write it through the resource plane and
+//! let the tagged channel point at it.
+//!
+//! ```no_run
+//! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
+//! use std::sync::Arc;
+//!
+//! use radiata::{EventOptions, EventReceive, EventTag};
+//!
+//! let tag = EventTag::parse("example.com/events/secrets-rotated")?;
+//! let mut events = node.subscribe(tag.clone(), EventOptions::new())?;
+//! node.publish(tag, Arc::from(b"key-42".as_slice()))?;
+//! while let EventReceive::Item(event) = events.recv().await? {
+//!     let payload = event.payload();
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # 9. Deploying on low-performance devices
 //!
 //! **There is nothing to configure.** Build the node, form the

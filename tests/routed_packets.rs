@@ -25,7 +25,7 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 
-const POLICY_TAG: &str = "radiata.woooo.tech/policies/linear";
+const POLICY_TAG: &str = "example.org/policies/linear";
 const STREAM_POLICY_TAG: &str = "example.org/route-policies/linear-stream";
 const EMPTY_POLICY_TAG: &str = "example.org/route-policies/linear-empty";
 const PROTOCOL_TAG: &str = "example.org/protocols/test-echo";

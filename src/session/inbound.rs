@@ -512,7 +512,7 @@ async fn admit_open(
       incoming,
       consumers,
     )
-    .await
+    .await?
   } else {
     StreamAdmission {
       status: AckStatus::Unsupported,
@@ -551,7 +551,7 @@ async fn admit_stream(
   open: OpenFrame, owns_feature: impl Fn(&crate::FeatureTag) -> bool,
   context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
   consumers: &mut JoinSet<()>,
-) -> StreamAdmission {
+) -> Result<StreamAdmission> {
   let trace_id = open.trace_id.clone();
   let mut reack_admitted_at: Option<u64> = None;
   let status = 'status: {
@@ -575,7 +575,7 @@ async fn admit_stream(
       Some(_) => break 'status AckStatus::Unsupported,
       None => {}
     }
-    match context.registry.protocol(&open.protocol) {
+    match context.registry.protocol(&open.protocol)? {
       Some(registration) if owns_feature(registration.definition.owning_feature()) => {
         // Saturation prioritises conflicts over genuinely new streams:
         // identical duplicates were already answered above, conflicting
@@ -663,10 +663,10 @@ async fn admit_stream(
       }
     }
   };
-  StreamAdmission {
+  Ok(StreamAdmission {
     status,
     admitted_at_millis: reack_admitted_at.unwrap_or_else(|| clock_millis(context.clock.as_ref())),
-  }
+  })
 }
 
 /// Delivers one locally addressed packet: the node is both the source and
@@ -699,14 +699,38 @@ pub(crate) async fn run_local(context: Arc<SessionPacketContext>, request: Outbo
   // offer supports exactly that set — so the owning-feature gate is the
   // registry lookup, the same gate the negotiated session selection applies
   // to an inbound open.
-  let admission = admit_stream(
+  let admission = match admit_stream(
     open,
     |feature| context.registry.feature_digest(feature).is_some(),
     &context,
     &mut incoming,
     &mut consumers.consumers,
   )
-  .await;
+  .await
+  {
+    Ok(admission) => admission,
+    Err(error) => {
+      // A poisoned registry lock is an internal fault, not a stream
+      // rejection: report the typed failure and terminate the route
+      // record instead of misreporting a wire-level refusal status.
+      warn!(
+        trace_id = %trace_id,
+        kind = ?error.kind(),
+        "local delivery admission failed"
+      );
+      request.reject(error.kind());
+      record_route_terminal(
+        &context.routes,
+        &context.events,
+        &None,
+        &trace_id,
+        &local,
+        &local,
+        RouteState::Failed(error.kind()),
+      );
+      return;
+    }
+  };
   let trace = if request.internal {
     None
   } else {

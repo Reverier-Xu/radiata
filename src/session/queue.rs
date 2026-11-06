@@ -458,8 +458,9 @@ mod queue_tests {
     assert_eq!(sender.queued_messages(), 0, "the drain released the count");
     assert_eq!(sender.queued_bytes(), 0, "the drain released the bytes");
     assert_eq!(sender.audit_delta(), 0, "the drain released the audit");
-    // The closed queue reports the shutdown, not the saturation the
-    // still-reserved frame used to look like.
+    // A closed queue reports the shutdown, never saturation: the send
+    // fails typed even though the drained reservations left the queue
+    // counter-freely empty.
     let error = sender.send(frame(10)).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ShuttingDown);
     assert_eq!(error.context(), "session queue");

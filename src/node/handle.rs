@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-  Endpoint, Error, Event, EventOptions, EventSubscription, MergeCredential, NodeId,
+  Endpoint, Error, Event, EventOptions, EventSubscription, EventTag, MergeCredential, NodeId,
   NodeMetadataPatch, NodeStatus, OutboundStream, ProtocolTag, PublicKey, Result, ShutdownOutcome,
-  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, Task, TraceId,
+  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TaggedEvent, Task, TraceId,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
   node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Trust},
@@ -66,7 +66,7 @@ impl NodeHandle {
       }
       (StreamTarget::MatchingNodes(_), Some(tag)) => {
         // Every referenced policy tag must resolve in the registry.
-        if !self.extensions.has_load_balancer(tag) {
+        if !self.extensions.has_load_balancer(tag)? {
           return Err(Error::invalid_input("packet load balancer"));
         }
       }
@@ -74,7 +74,7 @@ impl NodeHandle {
     if let StreamTarget::Path { destination, path } = &target {
       crate::packet::validate_caller_path(destination, path, policy.max_hops())?;
     }
-    if !self.extensions.has_protocol(&protocol) {
+    if !self.extensions.has_protocol(&protocol)? {
       return Err(Error::unsupported("packet protocol"));
     }
     let trace_id = TraceId::generate(self.entropy.as_ref())?;
@@ -513,6 +513,51 @@ impl NodeHandle {
       return Err(Error::shutting_down("node events"));
     }
     Ok(self.events.subscribe::<E>(options))
+  }
+
+  /// Publishes one caller event on the node's tag-keyed channel: every
+  /// live [`NodeHandle::subscribe`] subscriber of `tag` receives a
+  /// [`TaggedEvent`] carrying `tag` and the opaque `payload` bytes. The
+  /// core never inspects the payload; `tag` is the publish/subscribe
+  /// key.
+  ///
+  /// The channel shares the typed event hub's contract: subscriptions
+  /// are bounded (each subscriber lags independently instead of
+  /// blocking the publisher), an event with no live subscriber is
+  /// dropped, and nothing is retained for replay. The nine sealed crate
+  /// event types keep their own typed channel; the two coexist.
+  ///
+  /// The built-in `radiata.woooo.tech` domain is reserved: the crate's
+  /// official events are the sealed types, so a caller event lives under
+  /// a caller-owned [`EventTag`] domain and a reserved-domain tag is
+  /// refused here. The only other failure is a node that is not running.
+  pub fn publish(&self, tag: EventTag, payload: std::sync::Arc<[u8]>) -> Result<()> {
+    if self.runtime.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("tag-keyed event channel"));
+    }
+    crate::protocol::tag::require_caller_domain(tag.domain(), "tag-keyed event channel")?;
+    self.events.publish(&tag, payload);
+    Ok(())
+  }
+
+  /// Subscribes to one tag's channel on the node's tag-keyed event
+  /// channel: every later [`NodeHandle::publish`] under `tag` arrives as
+  /// a [`TaggedEvent`] item over the same bounded subscription plumbing
+  /// as [`NodeHandle::watch`] (lag, cancellation safety, and the stream
+  /// view included). Events published before the subscription are not
+  /// replayed.
+  ///
+  /// The built-in `radiata.woooo.tech` domain is reserved for the
+  /// crate's sealed event types and is refused here. The only other
+  /// failure is a node that is not running.
+  pub fn subscribe(
+    &self, tag: EventTag, options: EventOptions,
+  ) -> Result<EventSubscription<TaggedEvent>> {
+    if self.runtime.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("tag-keyed event channel"));
+    }
+    crate::protocol::tag::require_caller_domain(tag.domain(), "tag-keyed event channel")?;
+    Ok(self.events.subscribe_tagged(tag, options))
   }
 
   /// Opens a watch over the durable resource change feed: `None` starts at

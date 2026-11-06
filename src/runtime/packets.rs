@@ -133,14 +133,16 @@ impl PacketAdmission {
     }
     // The stream's routing policy resolves here, before the node-level
     // route policy plans a path: an unregistered tag fails typed at
-    // admission instead of silently routing direct.
+    // admission instead of silently routing direct. A poisoned registry
+    // lock is an internal fault, not a routing refusal, so it propagates.
     let stream_policy = match self.extensions.routing_policy(request.routing_policy.tag()) {
-      Some(policy) => policy,
-      None => {
+      Ok(Some(policy)) => policy,
+      Ok(None) => {
         self.record_route_failure(&trace_id, ErrorKind::InvalidInput);
         request.reject(ErrorKind::InvalidInput);
         return Ok(None);
       }
+      Err(error) => return Err(error),
     };
     self
       .events
@@ -389,7 +391,7 @@ impl PacketAdmission {
     };
     let policy = self
       .extensions
-      .load_balancer(load_balancer)
+      .load_balancer(load_balancer)?
       .ok_or_else(|| Error::invalid_input("packet load balancer"))?;
     let snapshot = context.store().snapshot().await?;
     let reader = crate::routing::StoreCandidateReader::new(snapshot);

@@ -801,11 +801,10 @@ mod tests {
     assert_eq!(stored, concurrent, "the concurrent record stays installed");
   }
 
-  /// Regression: a receiver-side leave persist failure used to surface
-  /// nowhere — the `?` propagated a silent error while the sender kept
-  /// forwarding, so an audit stall (leaver still Active everywhere) could
-  /// not be attributed from the log. The apply site now logs the typed
-  /// failure and propagates it; this lane pins both halves: the payload
+  /// The leave-apply lane reports its failures honestly: the apply site
+  /// logs the typed failure and propagates it instead of swallowing it,
+  /// so a stalled leave (the leaver still Active everywhere) is
+  /// attributable from the log. This lane pins both halves: the payload
   /// errors, and the store stays without the leave record.
   #[tokio::test]
   async fn leave_persist_failure_is_logged_and_propagated_at_the_apply_site() {
