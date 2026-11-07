@@ -227,12 +227,11 @@ impl<'a> SelectorParser<'a> {
     let text = &self.input[start..self.position];
     let tag = QualifiedTag::parse(text)?;
     // The closed selector key space: custom labels live in the `labels`
-    // category; the only `resources` keys are the two reserved labels.
+    // category; the only `resources` keys are the reserved labels.
     match tag.category() {
       crate::protocol::tag::CATEGORY_LABELS => Ok(tag),
       crate::protocol::tag::CATEGORY_RESOURCES
-        if tag.as_str() == crate::resource::RESERVED_TYPE_LABEL_KEY
-          || tag.as_str() == crate::resource::RESERVED_URI_LABEL_KEY =>
+        if crate::resource::RESERVED_RESOURCE_LABEL_KEYS.contains(&tag.as_str()) =>
       {
         Ok(tag)
       }
@@ -499,6 +498,19 @@ pub trait LoadBalancingPolicy: fmt::Debug + Send + Sync + 'static {
   ) -> BoxFuture<'a, Result<NodeId>>;
 }
 
+/// Parses one built-in policy's canonical tag once per static slot: the
+/// literal is a fixed canonical constant, so the impossible parse failure
+/// surfaces as an internal error instead of a panic.
+fn builtin_tag(
+  slot: &'static std::sync::OnceLock<std::result::Result<QualifiedTag, ()>>, literal: &'static str,
+  what: &'static str,
+) -> Result<QualifiedTag> {
+  slot
+    .get_or_init(|| QualifiedTag::parse(literal).map_err(|_| ()))
+    .clone()
+    .map_err(|_| Error::internal(what))
+}
+
 /// The built-in load-balancing policy: the first matching candidate in
 /// canonical node order. It is the default lane for label-addressed
 /// delivery: the node builder installs it under its well-known tag, and a
@@ -518,10 +530,7 @@ impl DefaultLoadBalancer {
   pub(crate) fn tag() -> Result<QualifiedTag> {
     static TAG: std::sync::OnceLock<std::result::Result<QualifiedTag, ()>> =
       std::sync::OnceLock::new();
-    TAG
-      .get_or_init(|| QualifiedTag::parse(Self::TAG).map_err(|_| ()))
-      .clone()
-      .map_err(|_| Error::internal("built-in load balancer tag"))
+    builtin_tag(&TAG, Self::TAG, "built-in load balancer tag")
   }
 }
 
@@ -992,10 +1001,7 @@ impl DefaultNextHop {
   pub(crate) fn tag() -> Result<QualifiedTag> {
     static TAG: std::sync::OnceLock<std::result::Result<QualifiedTag, ()>> =
       std::sync::OnceLock::new();
-    TAG
-      .get_or_init(|| QualifiedTag::parse(Self::TAG).map_err(|_| ()))
-      .clone()
-      .map_err(|_| Error::internal("built-in next-hop policy tag"))
+    builtin_tag(&TAG, Self::TAG, "built-in next-hop policy tag")
   }
 
   /// The node-scoped instance: the same algorithm over the node's learned
@@ -1238,15 +1244,15 @@ pub(crate) async fn resolve_plan(
   let Some(policy) = registry.next_hop_policy(tag)? else {
     return Ok(None);
   };
-  policy
-    .plan(NextHopView {
-      trace,
-      destination,
-      local,
-      peers,
-      remaining_hops,
-    })
-    .await
+  plan_of(
+    policy.as_ref(),
+    trace,
+    destination,
+    local,
+    peers,
+    remaining_hops,
+  )
+  .await
 }
 
 /// One already-resolved policy's route plan: the same view

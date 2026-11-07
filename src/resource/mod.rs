@@ -45,6 +45,11 @@ pub(crate) const RESERVED_TYPE_LABEL_KEY: &str = "radiata.woooo.tech/resources/t
 /// stores that object.
 pub(crate) const RESERVED_URI_LABEL_KEY: &str = "radiata.woooo.tech/resources/uri";
 
+/// The closed set of reserved `resources`-category label keys: the only
+/// `resources` keys a selector grammar accepts.
+pub(crate) const RESERVED_RESOURCE_LABEL_KEYS: [&str; 2] =
+  [RESERVED_TYPE_LABEL_KEY, RESERVED_URI_LABEL_KEY];
+
 /// Canonical-decoder bounds for one resource record: a flat record with at
 /// most the bounded label set inside, well under the handshake body budget.
 const RECORD_LIMITS: CborLimits = CborLimits::new(4, 256, 16 * 1024);

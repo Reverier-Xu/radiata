@@ -288,13 +288,9 @@ pub(crate) mod store {
 
   use super::{NODE_DESCRIPTOR_NAMESPACE, NodeDescriptorV1};
   use crate::{
-    Error, NodeId, Result, StoreKey, StoreNamespace, StoreOperation, StoreValue, TransactionId,
-    api::Entropy, storage::MetadataStore,
+    Error, NodeId, Result, StoreKey, StoreOperation, StoreValue, TransactionId, api::Entropy,
+    storage::MetadataStore,
   };
-
-  fn namespace() -> Result<StoreNamespace> {
-    crate::storage::families::namespace(NODE_DESCRIPTOR_NAMESPACE)
-  }
 
   fn descriptor_key(node: &NodeId) -> StoreKey {
     StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()))
@@ -305,7 +301,7 @@ pub(crate) mod store {
   pub(crate) async fn read_descriptor_ctx(
     store: &MetadataStore, node: &NodeId,
   ) -> Result<Option<NodeDescriptorV1>> {
-    let namespace = namespace()?;
+    let namespace = super::descriptor_namespace()?;
     let key = descriptor_key(node);
     let value = store.snapshot().await?.get(&namespace, &key).await?;
     let Some(value) = value else {
@@ -359,7 +355,7 @@ pub(crate) mod store {
     store: &MetadataStore, entropy: &dyn Entropy, descriptor: &NodeDescriptorV1,
   ) -> Result<()> {
     let _permit = store.write_permit().await;
-    let namespace = namespace()?;
+    let namespace = super::descriptor_namespace()?;
     let key = descriptor_key(descriptor.node());
     let snapshot = store.snapshot().await?;
     let existing = snapshot
@@ -486,7 +482,7 @@ pub(crate) mod store {
     store: &MetadataStore, entropy: &dyn Entropy, page: &super::page::MembershipPage,
   ) -> Result<(Vec<NodeId>, Vec<NodeId>)> {
     let _permit = store.write_permit().await;
-    let namespace = namespace()?;
+    let namespace = super::descriptor_namespace()?;
     // Page-order contest for repeated nodes: the highest revision wins,
     // first among equals — exactly what the sequential single-record
     // apply committed — and the transaction's keys stay distinct.
