@@ -624,11 +624,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "radiata-cadence"
+version = "0.0.1"
+
+[[package]]
 name = "radiata-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "radiata",
+ "radiata-cadence",
 ]
 
 [[package]]

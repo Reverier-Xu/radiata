@@ -1,0 +1,11 @@
+[package]
+description = "Cron-replacement schedule-pattern grammar: RFC 3339 shapes with set-valued fields."
+edition     = "2024"
+license     = "GPL-2.0-only"
+name        = "radiata-cadence"
+publish     = false
+rust-version = "1.98.0"
+version     = "0.0.1"
+
+[lints.rust]
+unsafe_code = "forbid"
