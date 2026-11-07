@@ -589,36 +589,41 @@ impl MetadataStore {
     ))
   }
 
-  /// Collects the anchored receipts whose retention deadline elapsed,
-  /// inside one bounded, cursor-rotated scan of the anchor family.
-  async fn scan_due_anchors(
-    &self, namespace: &StoreNamespace,
-  ) -> crate::Result<(Vec<ReceiptIdentity>, bool)> {
+  /// The bounded, cursor-rotated scan skeleton shared by the two
+  /// eligibility scans: reads the scan family's cursor position, streams
+  /// at most [`RETENTION_SWEEP_BOUND`] entries with the last-examined-key
+  /// tracking, and advances the cursor only when the pass stopped at its
+  /// bound. Per-entry semantics stay in `visit`, a synchronous callback
+  /// (both scans decide per entry without further awaits) that either
+  /// collects one item or returns `None` — the established per-entry
+  /// corruption skip: the cursor still advances past the key, so a bad
+  /// entry is examined once per rotation, never forever. Callbacks use
+  /// `?` over `scan_entry` to express the skip, and store faults from
+  /// the scan itself still fail the pass: they are real read failures,
+  /// not corrupt input.
+  async fn bounded_scan<T>(
+    &self, namespace: &StoreNamespace, scan: EligibilityScan, label: &'static str,
+    mut visit: impl FnMut(&crate::provider::StoreEntry) -> Option<T>,
+  ) -> crate::Result<(Vec<T>, bool)> {
     let snapshot = self.snapshot().await?;
-    let mut targets = Vec::new();
+    let mut collected = Vec::new();
     let mut examined = 0_usize;
     let mut last_examined: Option<Vec<u8>> = None;
     let mut stopped_at_bound = false;
-    let cursor = self
-      .retention_scan_cursor
-      .position(EligibilityScan::Anchors);
-    let mut scan = snapshot
-      .scan_from(
-        namespace,
-        EligibilityScan::Anchors.prefix(),
-        cursor.as_deref(),
-      )
+    let cursor = self.retention_scan_cursor.position(scan);
+    let mut stream = snapshot
+      .scan_from(namespace, scan.prefix(), cursor.as_deref())
       .await?;
-    while let Some(entry) = scan.next().await? {
+    while let Some(entry) = stream.next().await? {
       if examined >= RETENTION_SWEEP_BOUND {
         // The pass stays latency-bounded over every scanned entry, due
-        // or not: the already-collected due targets still reach the
-        // cleanup loop, and the cursor makes the next pass resume here
-        // instead of rescanning the same retained prefix.
+        // or not: the already-collected items still reach their cleanup
+        // loop, and the cursor makes the next pass resume here instead
+        // of rescanning the same retained prefix.
         tracing::debug!(
           examined,
-          target_count = targets.len(),
-          "receipt retention scan stopped at sweep bound"
+          collected = collected.len(),
+          "{label} scan stopped at sweep bound"
         );
         stopped_at_bound = true;
         break;
@@ -626,49 +631,65 @@ impl MetadataStore {
       let key = entry.key().as_bytes();
       last_examined = Some(key.to_vec());
       examined += 1;
-      // Per-entry corruption skips, never fails the scan: the cursor
-      // still advances past this key, so a bad entry is examined once
-      // per rotation instead of wedging every pass at the same
-      // position. Store faults above still propagate — they are real
-      // read failures, not corrupt input.
-      let Some((transaction, (anchored_at, operation_digest))) = scan_entry(
-        &entry,
-        EligibilityScan::Anchors.prefix(),
-        decode_anchor_value,
-      ) else {
-        continue;
-      };
-      // The cleanup state machine retains an anchor whose deadline
-      // overflows the clock domain; the scan reads the same verdict, so
-      // such an anchor is not-due rather than a storage fault.
-      let Some(deadline) = retention_deadline(anchored_at, self.receipt_retention) else {
-        tracing::debug!(
-          transaction = transaction.as_str(),
-          "receipt retention skipped an anchor whose deadline overflows"
-        );
-        continue;
-      };
-      // Only receipts whose deadline has passed leave the scan; the
-      // state machine re-verifies everything for the ones that remain.
-      if self.clock.now() < deadline {
-        continue;
+      if let Some(item) = visit(&entry) {
+        collected.push(item);
       }
-      targets.push(ReceiptIdentity::from_parts(transaction, operation_digest));
     }
-    drop(scan);
+    drop(stream);
     drop(snapshot);
-    // The cursor advances before the cleanup loop on purpose: a failing
-    // cleanup must not pin the sweep to one segment forever, and the
-    // rotation revisits skipped targets on later passes.
+    // The cursor advances before the caller's cleanup loop on purpose:
+    // a failing cleanup must not pin the sweep to one segment forever,
+    // and the rotation revisits skipped entries on later passes.
     self.retention_scan_cursor.advance(
-      EligibilityScan::Anchors,
+      scan,
       if stopped_at_bound {
         last_examined
       } else {
         None
       },
     );
-    Ok((targets, stopped_at_bound))
+    Ok((collected, stopped_at_bound))
+  }
+
+  /// Collects the anchored receipts whose retention deadline elapsed,
+  /// inside one bounded, cursor-rotated scan of the anchor family.
+  async fn scan_due_anchors(
+    &self, namespace: &StoreNamespace,
+  ) -> crate::Result<(Vec<ReceiptIdentity>, bool)> {
+    self
+      .bounded_scan(
+        namespace,
+        EligibilityScan::Anchors,
+        "receipt retention",
+        |entry| {
+          // Per-entry corruption skips (a `None` from the shared scan
+          // decoder), never fails the scan: the skeleton still advances
+          // the cursor past this key, so a bad entry is examined once per
+          // rotation instead of wedging every pass at the same position.
+          let (transaction, (anchored_at, operation_digest)) = scan_entry(
+            entry,
+            EligibilityScan::Anchors.prefix(),
+            decode_anchor_value,
+          )?;
+          // The cleanup state machine retains an anchor whose deadline
+          // overflows the clock domain; the scan reads the same verdict, so
+          // such an anchor is not-due rather than a storage fault.
+          let Some(deadline) = retention_deadline(anchored_at, self.receipt_retention) else {
+            tracing::debug!(
+              transaction = transaction.as_str(),
+              "receipt retention skipped an anchor whose deadline overflows"
+            );
+            return None;
+          };
+          // Only receipts whose deadline has passed leave the scan; the
+          // state machine re-verifies everything for the ones that remain.
+          if self.clock.now() < deadline {
+            return None;
+          }
+          Some(ReceiptIdentity::from_parts(transaction, operation_digest))
+        },
+      )
+      .await
   }
 
   /// Collects the retention candidates into their rebuilt identities,
@@ -676,60 +697,24 @@ impl MetadataStore {
   async fn scan_retention_candidates(
     &self, namespace: &StoreNamespace,
   ) -> crate::Result<(Vec<RetentionCandidate>, bool)> {
-    let snapshot = self.snapshot().await?;
-    let mut candidates = Vec::new();
-    let mut examined = 0_usize;
-    let mut last_examined: Option<Vec<u8>> = None;
-    let mut stopped_at_bound = false;
-    let cursor = self
-      .retention_scan_cursor
-      .position(EligibilityScan::Candidates);
-    let mut scan = snapshot
-      .scan_from(
+    self
+      .bounded_scan(
         namespace,
-        EligibilityScan::Candidates.prefix(),
-        cursor.as_deref(),
+        EligibilityScan::Candidates,
+        "receipt retention candidate",
+        |entry| {
+          let (transaction, operation_digest) = scan_entry(
+            entry,
+            EligibilityScan::Candidates.prefix(),
+            decode_candidate_value,
+          )?;
+          Some(RetentionCandidate {
+            target: ReceiptIdentity::from_parts(transaction, operation_digest),
+            marker_digest: entry.value().digest().clone(),
+          })
+        },
       )
-      .await?;
-    while let Some(entry) = scan.next().await? {
-      if examined >= RETENTION_SWEEP_BOUND {
-        tracing::debug!(
-          examined,
-          candidate_count = candidates.len(),
-          "receipt retention candidate scan stopped at sweep bound"
-        );
-        stopped_at_bound = true;
-        break;
-      }
-      let key = entry.key().as_bytes();
-      last_examined = Some(key.to_vec());
-      examined += 1;
-      // The same per-entry skip policy as the anchor scan: a corrupt
-      // candidate is skipped and the cursor advances past it, so one
-      // bad marker cannot wedge every pass at the same position.
-      let Some((transaction, operation_digest)) = scan_entry(
-        &entry,
-        EligibilityScan::Candidates.prefix(),
-        decode_candidate_value,
-      ) else {
-        continue;
-      };
-      candidates.push(RetentionCandidate {
-        target: ReceiptIdentity::from_parts(transaction, operation_digest),
-        marker_digest: entry.value().digest().clone(),
-      });
-    }
-    drop(scan);
-    drop(snapshot);
-    self.retention_scan_cursor.advance(
-      EligibilityScan::Candidates,
-      if stopped_at_bound {
-        last_examined
-      } else {
-        None
-      },
-    );
-    Ok((candidates, stopped_at_bound))
+      .await
   }
 
   /// Drives one retention candidate through the cleanup state machine
@@ -922,28 +907,46 @@ pub(crate) fn recover_self_referenced_transaction(
   let additional = u64::try_from(tokens.len())
     .map_err(|_| Error::resource_exhausted("receipt reference count"))?;
   let mut operations = caller_operations;
+  operations.extend(self_reference_op_shapes(
+    &namespace, id, tokens, additional,
+  )?);
+  let prepared = prepare_internal_transaction(id.clone(), base_revision.clone(), operations)?;
+  Ok(ReceiptIdentity::from_parts(
+    id.clone(),
+    prepared.operation_digest().clone(),
+  ))
+}
+
+/// The head-put + edge-put operation shape every self-referenced
+/// transaction materializes: one absent-expectation reference-count head
+/// row carrying `additional`, then one absent-expectation edge row per
+/// reference token. Both the recovery path
+/// ([`recover_self_referenced_transaction`]) and the live commit path
+/// ([`build_self_reference_operations`]) rebuild this exact shape, so it
+/// has one owner and cannot drift between the two sites.
+fn self_reference_op_shapes(
+  namespace: &StoreNamespace, self_id: &TransactionId, tokens: &[ReceiptReferenceToken],
+  additional: u64,
+) -> crate::Result<Vec<StoreOperation>> {
+  let mut operations = Vec::new();
   operations
     .try_reserve_exact(1 + tokens.len())
     .map_err(|_| Error::resource_exhausted("receipt reference change"))?;
   operations.push(StoreOperation::Put {
     namespace: namespace.clone(),
-    key: reference_head_key(id)?,
+    key: reference_head_key(self_id)?,
     expected: StoreExpectation::Absent,
     value: encode_reference_count(additional),
   });
   for token in tokens {
     operations.push(StoreOperation::Put {
       namespace: namespace.clone(),
-      key: reference_edge_key(id, token)?,
+      key: reference_edge_key(self_id, token)?,
       expected: StoreExpectation::Absent,
       value: StoreValue::new(Arc::from([])),
     });
   }
-  let prepared = prepare_internal_transaction(id.clone(), base_revision.clone(), operations)?;
-  Ok(ReceiptIdentity::from_parts(
-    id.clone(),
-    prepared.operation_digest().clone(),
-  ))
+  Ok(operations)
 }
 
 pub(super) fn prepare_internal_transaction(
@@ -1274,26 +1277,7 @@ async fn build_self_reference_operations(
   if head.is_some() {
     return Err(Error::conflict("receipt reference target"));
   }
-
-  let mut operations = Vec::new();
-  operations
-    .try_reserve_exact(1 + tokens.len())
-    .map_err(|_| Error::resource_exhausted("receipt reference change"))?;
-  operations.push(StoreOperation::Put {
-    namespace: namespace.clone(),
-    key: reference_head_key(self_id)?,
-    expected: StoreExpectation::Absent,
-    value: encode_reference_count(additional),
-  });
-  for token in tokens {
-    operations.push(StoreOperation::Put {
-      namespace: namespace.clone(),
-      key: reference_edge_key(self_id, token)?,
-      expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from([])),
-    });
-  }
-  Ok(operations)
+  self_reference_op_shapes(namespace, self_id, tokens, additional)
 }
 
 /// Builds the pending-record delete for one resolved frozen journal,

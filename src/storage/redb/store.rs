@@ -8,6 +8,13 @@
 //! (`Durability::Immediate`), so a receipt survives process and OS
 //! crashes. Read transactions are provider-owned immutable snapshots;
 //! scans stream one ordered redb range without materializing the namespace.
+//!
+//! The database file may host key custody: the default key store persists
+//! raw Ed25519 seed rows into the same metadata store that journals the
+//! key intents referring to them (see `crate::keys::metadata`). The file
+//! therefore carries its final 0600 mode from creation and is tightened
+//! back to 0600 on every open, warning once when an existing file was
+//! found wider (mirroring the custody hygiene of `crate::keys::file`).
 
 use std::{fmt, path::PathBuf, sync::Arc};
 
@@ -360,6 +367,7 @@ impl StorageFactory for RedbStoreFactory {
       let backfill_scan_fault = self.backfill_scan_fault.clone();
       let open_writes = self.open_writes.clone();
       let database = tokio::task::spawn_blocking(move || {
+        prepare_store_file(&path, ProviderErrorContext::StorageOpen)?;
         Database::create(&path)
           .map_err(|error| map_database_error(error, ProviderErrorContext::StorageOpen))
       })
@@ -855,6 +863,45 @@ impl StoreScan for RedbScan {
 
 fn internal(context: ProviderErrorContext) -> Error {
   Error::provider(ProviderErrorKind::Internal, context)
+}
+
+/// Prepares the database file for a create-or-open with custody-grade
+/// permissions: on unix the file is pre-created with its final 0600 mode
+/// before redb's create-or-open (a mode applied only after creation would
+/// leave a crash window with a world-readable seed), and an existing file
+/// whose permissions are wider than 0600 is tightened before its bytes
+/// are read, warning once per open — a mode defect must surface as
+/// custody hygiene, not as silent exposure. Non-unix platforms keep
+/// their volume defaults, like the file-backed key store; the mapping of
+/// the underlying filesystem errors is the key store's own
+/// [`crate::keys::io_error`].
+#[cfg(unix)]
+fn prepare_store_file(path: &std::path::Path, context: ProviderErrorContext) -> Result<()> {
+  use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+  std::fs::OpenOptions::new()
+    .write(true)
+    .create(true)
+    .truncate(false)
+    .mode(0o600)
+    .open(path)
+    .map_err(|error| crate::keys::io_error(&error, context))?;
+  let metadata = std::fs::metadata(path).map_err(|error| crate::keys::io_error(&error, context))?;
+  if metadata.mode() & 0o777 != 0o600 {
+    tracing::warn!(
+      path = %path.display(),
+      "metadata store file permissions were wider than 0600; tightened"
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+      .map_err(|error| crate::keys::io_error(&error, context))?;
+  }
+  Ok(())
+}
+
+/// The non-unix counterpart of [`prepare_store_file`]: no mode to
+/// enforce, like the file-backed key store on these platforms.
+#[cfg(not(unix))]
+fn prepare_store_file(_path: &std::path::Path, _context: ProviderErrorContext) -> Result<()> {
+  Ok(())
 }
 
 /// A persisted digest sidecar row is missing or malformed: the commit
@@ -1694,5 +1741,42 @@ mod followup_tests {
     flush.await.unwrap().unwrap();
     drop(storage);
     factory.open(StoreRequirements::metadata()).await.unwrap();
+  }
+
+  /// The store file is created with its final private 0600 mode (unix):
+  /// the metadata store may host key custody, so a umask-default
+  /// world-readable seed file is a custody defect from the first byte.
+  #[cfg(unix)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn store_file_is_created_with_private_permissions() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("store.redb");
+    RedbStoreFactory::new(path.clone())
+      .open(StoreRequirements::metadata())
+      .await
+      .unwrap();
+    let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+  }
+
+  /// A pre-existing store file whose permissions are wider than 0600 is
+  /// tightened on open (unix): mode defects surface as custody hygiene,
+  /// never as silent exposure.
+  #[cfg(unix)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn wide_store_file_permissions_are_tightened_on_open() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("store.redb");
+    let factory = RedbStoreFactory::new(path.clone());
+    factory.open(StoreRequirements::metadata()).await.unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    drop(factory.open(StoreRequirements::metadata()).await.unwrap());
+    let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o600);
   }
 }

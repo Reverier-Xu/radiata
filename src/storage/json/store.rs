@@ -8,6 +8,15 @@
 //! `tmp-<number>-<txn>-<counter>.tmp` temporary files. An OS-backed
 //! exclusive lock on the lock file plus an in-process canonical-path guard
 //! prevents concurrent or aliased opens for the backend lifetime.
+//!
+//! The store directory may host key custody: a metadata store built on
+//! this backend persists raw Ed25519 seed rows as ordinary entries (see
+//! `crate::keys::metadata`). The store never creates the directory (open
+//! requires an existing one), but the directory is tightened to its final
+//! 0700 mode on every open — warning once when it was found wider — and
+//! every file the store itself creates (lock, generation, temporary) is
+//! created with its final 0600 mode on unix, mirroring the custody
+//! hygiene of `crate::keys::file`.
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
@@ -185,11 +194,18 @@ impl StoreGuard {
       SetGuard(canonical.clone())
     };
     let lock_path = canonical.join(LOCK_FILE);
-    let lock_file = OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create(true)
-      .truncate(false)
+    // The lock file (and every file this store creates) carries its
+    // final 0600 mode from the first byte on unix: the directory may
+    // host key custody, and a post-creation tightening would leave a
+    // crash window with a world-readable file.
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::OpenOptionsExt as _;
+      options.mode(0o600);
+    }
+    let lock_file = options
       .open(&lock_path)
       .map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))?;
     // A just-released OS lock can transiently report `WouldBlock` against a
@@ -316,6 +332,10 @@ impl JsonStorage {
     if os_crash {
       directory_barrier(&canonical)?;
     }
+    // The mode hygiene runs last of all: every operational fault of the
+    // open (unreadable directory, unremovable residue) still fails typed
+    // before the mode is repaired, so hygiene never masks a failure.
+    tighten_directory_permissions(&canonical)?;
     Ok(Self {
       _guard: guard,
       capabilities,
@@ -507,11 +527,17 @@ fn write_and_rename(temp_path: &Path, final_path: &Path, bytes: &[u8]) -> std::i
   // the exclusive lock proves it can only be ours, so it is removed once.
   for attempt in 0..2 {
     crash_hook(2);
-    let mut file = match OpenOptions::new()
-      .write(true)
-      .create_new(true)
-      .open(temp_path)
+    // Generation files may host key custody, so the temp carries its
+    // final 0600 mode from the first byte on unix; the rename into the
+    // guarded directory preserves it.
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
+      use std::os::unix::fs::OpenOptionsExt as _;
+      options.mode(0o600);
+    }
+    let mut file = match options.open(temp_path) {
       Ok(file) => file,
       Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
         fs::remove_file(temp_path)?;
@@ -549,11 +575,20 @@ fn write_and_rename(temp_path: &Path, final_path: &Path, bytes: &[u8]) -> std::i
   ))
 }
 
-fn map_commit_io_error(_error: std::io::Error) -> Error {
-  Error::provider(
-    ProviderErrorKind::CommitUnknown,
-    ProviderErrorContext::StorageCommit,
-  )
+/// Maps a [`write_and_rename`] failure. Every `Err` path of that helper
+/// is provably not applied: the rename is its last step, so a returned
+/// error means the final generation was never created, and an earlier
+/// failure removes the temp before returning. The commit therefore maps
+/// to a definite failure — never to `CommitUnknown`, which would freeze
+/// the metadata store over a provably rolled-back commit. `CommitUnknown`
+/// stays reserved for the post-rename indeterminate window (the cleanup
+/// and barrier failures in [`JsonStorage::commit_inner`]).
+fn map_commit_io_error(error: std::io::Error) -> Error {
+  let kind = match error.kind() {
+    std::io::ErrorKind::PermissionDenied => ProviderErrorKind::PermissionDenied,
+    _ => ProviderErrorKind::Io,
+  };
+  Error::provider(kind, ProviderErrorContext::StorageCommit)
 }
 
 fn map_io_error(error: std::io::Error, context: ProviderErrorContext) -> Error {
@@ -563,6 +598,35 @@ fn map_io_error(error: std::io::Error, context: ProviderErrorContext) -> Error {
     _ => ProviderErrorKind::Io,
   };
   Error::provider(kind, context)
+}
+
+/// Tightens the store directory to its final 0700 mode (unix): the
+/// directory may host key custody (see the module docs), so a wider
+/// existing mode is tightened before the store reads its files, warning
+/// once per open — a mode defect must surface as custody hygiene, not as
+/// silent exposure. Non-unix platforms keep their volume defaults, like
+/// the file-backed key store.
+#[cfg(unix)]
+fn tighten_directory_permissions(directory: &Path) -> Result<()> {
+  use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+  let metadata = fs::metadata(directory)
+    .map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))?;
+  if metadata.mode() & 0o777 != 0o700 {
+    tracing::warn!(
+      path = %directory.display(),
+      "json metadata store directory permissions were wider than 0700; tightened"
+    );
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+      .map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))?;
+  }
+  Ok(())
+}
+
+/// The non-unix counterpart of [`tighten_directory_permissions`]: no
+/// mode to enforce.
+#[cfg(not(unix))]
+fn tighten_directory_permissions(_directory: &Path) -> Result<()> {
+  Ok(())
 }
 
 fn capability_set(os_crash: bool) -> StoreCapabilities {
@@ -928,5 +992,132 @@ impl Storage for JsonStorage {
   fn flush<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
     let result = directory_barrier(&self._guard.canonical);
     Box::pin(async move { result })
+  }
+}
+
+/// The unix-only custody-permission lanes and the pre-rename commit
+/// failure classification. They drive the real [`JsonStorage::open`] and
+/// commit path on a real directory; the only injection is a directory
+/// occupying the temp-file name to force a provably-not-applied write
+/// failure.
+#[cfg(all(test, unix))]
+mod unix_tests {
+  use std::{fs, os::unix::fs::PermissionsExt as _, sync::Arc};
+
+  use super::{
+    GENERATION_NUMBER_WIDTH, GENERATION_PREFIX, JsonStorage, MAX_GENERATIONS, MAX_TOTAL_BYTES,
+    TEMP_PREFIX, TEMP_SUFFIX,
+  };
+  use crate::{
+    ErrorKind, ReconcileOutcome, StoreExpectation, StoreOperation, StoreRequirements,
+    StoreTransaction, StoreValue, provider::Storage as _, storage::test_util,
+  };
+
+  fn open(directory: &std::path::Path) -> Result<JsonStorage, crate::Error> {
+    JsonStorage::open(
+      directory,
+      &StoreRequirements::metadata(),
+      MAX_GENERATIONS,
+      MAX_TOTAL_BYTES,
+    )
+  }
+
+  fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::metadata(path).unwrap().mode() & 0o777
+  }
+
+  /// The store directory may host key custody, so an existing directory
+  /// whose permissions are wider than 0700 is tightened on open, and the
+  /// files the store creates (lock, generation) carry their final 0600
+  /// mode from the first byte.
+  #[tokio::test]
+  async fn wide_store_directory_is_tightened_and_files_stay_private() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let storage = open(directory.path()).unwrap();
+    assert_eq!(mode_of(directory.path()), 0o700);
+    drop(storage);
+
+    // A later open keeps the tightened mode; the committed generation
+    // file is private too.
+    let storage = open(directory.path()).unwrap();
+    let transaction = put_transaction(&storage, 1).await;
+    assert!(matches!(
+      storage.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+    let generation = fs::read_dir(directory.path())
+      .unwrap()
+      .map(|entry| entry.unwrap().path())
+      .find(|path| {
+        path
+          .file_name()
+          .and_then(|name| name.to_str())
+          .is_some_and(|name| name.starts_with(GENERATION_PREFIX))
+      })
+      .unwrap();
+    assert_eq!(mode_of(&generation), 0o600);
+  }
+
+  /// A `write_and_rename` failure is provably not applied (the rename is
+  /// its last step), so the commit fails as a definite error instead of
+  /// `CommitUnknown` — the misclassification this regression names would
+  /// freeze a metadata store over a provably rolled-back commit. The
+  /// transaction is reconcilable as Aborted and a retry commits cleanly.
+  #[tokio::test]
+  async fn pre_rename_commit_failure_is_a_definite_abort_not_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = open(directory.path()).unwrap();
+    let transaction = put_transaction(&storage, 2).await;
+    let id = transaction.id().clone();
+    let digest = transaction.operation_digest().clone();
+    // The next generation is 1 on a fresh store; occupy the temp-file
+    // name with a directory so the temp create provably fails before any
+    // rename could have run.
+    let generation = 1_u64;
+    let temp_path = storage._guard.canonical.join(format!(
+      "{TEMP_PREFIX}{GENERATION_PREFIX}{generation:0>GENERATION_NUMBER_WIDTH$}-{id}-0{TEMP_SUFFIX}"
+    ));
+    fs::create_dir(&temp_path).unwrap();
+
+    let error = storage.commit(transaction).await.unwrap_err();
+    // A definite pre-rename failure — Io or PermissionDenied, depending
+    // on which step the platform refuses — and never `CommitUnknown`.
+    assert!(
+      matches!(error.kind(), ErrorKind::Io | ErrorKind::PermissionDenied),
+      "a provably not-applied commit must fail definitely, got {error:?}"
+    );
+
+    // Nothing was applied, and the store stays usable.
+    fs::remove_dir(&temp_path).unwrap();
+    assert!(matches!(
+      storage.reconcile(&id, &digest).await.unwrap(),
+      ReconcileOutcome::Aborted
+    ));
+    let transaction = put_transaction(&storage, 3).await;
+    assert!(matches!(
+      storage.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+  }
+
+  /// Builds one absent-put transaction over the store's current revision.
+  async fn put_transaction(storage: &JsonStorage, index: u64) -> StoreTransaction {
+    let snapshot = storage.snapshot().await.unwrap();
+    let revision = snapshot.revision().clone();
+    drop(snapshot);
+    StoreTransaction::new(
+      test_util::transaction_id(index),
+      revision,
+      vec![StoreOperation::Put {
+        namespace: test_util::namespace("json-commit-fault"),
+        key: test_util::key(b"key"),
+        expected: StoreExpectation::Absent,
+        value: StoreValue::new(Arc::from(&b"value"[..])),
+      }],
+    )
+    .unwrap()
   }
 }
