@@ -402,6 +402,24 @@ async fn a_failed_decision_carries_the_error() {
 
 const NESTED_KIND: &str = "example.org/tasks/v1/nested";
 
+/// An unregistered caller-domain kind is refused typed at submission,
+/// and the error context names the offending kind (the full-detail
+/// error-context stance: the caller sees exactly which kind missed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unregistered_task_kind_is_refused_typed_and_named() {
+  common::init_tracing();
+  let node = start_node(7, ExtensionRegistry::new(), NodeConfig::new()).await;
+  let kind = QualifiedTag::parse("example.org/tasks/v1/unregistered").unwrap();
+  let error = node
+    .tasks()
+    .submit(CustomTaskSpec::new(kind.clone(), LabelSet::new()))
+    .await
+    .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::Unsupported);
+  assert_eq!(error.context(), format!("task kind {kind}"));
+  node.shutdown().await.unwrap();
+}
+
 /// The same-class nested-submit reconciler: it submits its own kind
 /// through the handle and turns the outcome into its decision.
 #[derive(Debug)]

@@ -577,11 +577,13 @@ mod tests {
           .is_ok()
       );
     }
-    // An unregistered scheme name fails typed.
+    // An unregistered scheme name fails typed, naming the scheme (the
+    // error context carries the offending value).
     let error = registry
       .resolve_transport(&transport_name("espnow"))
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert_eq!(error.context(), "transport scheme espnow");
 
     // A caller registration under its own name closes the gap.
     let wire = test_wire();

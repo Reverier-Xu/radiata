@@ -219,9 +219,9 @@ impl Error {
   /// The poisoned-lock mapper for every shared core table (the session
   /// and task tables, the extension and listener registries, the route
   /// records, the recovery controller, the join-credential issuer, and
-  /// the connection-task list): each shared table names its own context
-  /// at exactly one lock-mapping call site, so lock-poison diagnostics
-  /// stay uniform and never panic.
+  /// the connection-task list): every lock-mapping call site passes its
+  /// table's shared literal, so lock-poison diagnostics keep one
+  /// spelling per table across all sites and never panic.
   pub(crate) fn poisoned(context: &'static str) -> Self {
     Self::internal(context)
   }
