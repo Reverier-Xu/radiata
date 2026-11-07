@@ -399,6 +399,44 @@ fn record_terminal_trace(
   }
 }
 
+/// Resolves the pump's admission wait with an explicit outcome: the
+/// destination's typed refusal is a route failure that happens after the
+/// open frame was queued. The pending entry is taken out of the session
+/// map and answered (bounded by a wall-clock deadline, since the pump
+/// registers asynchronously after the open frame queues). Shared test
+/// helper for every outbound test module's admission arming.
+#[cfg(test)]
+async fn arm_admission_with(
+  entry: &crate::session::stream::SessionEntry, trace_id: &TraceId,
+  outcome: crate::packet::AckOutcome,
+) {
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+  loop {
+    let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
+      PendingAck::Wait { notify, .. } => {
+        let _ = notify.send(outcome);
+        true
+      }
+      PendingAck::Relay { .. } => false,
+    });
+    if resolved == Some(true) {
+      return;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the pump's admission wait never registered"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+  }
+}
+
+/// Resolves the pump's admission wait the moment it registers with a
+/// successful admission.
+#[cfg(test)]
+async fn arm_admission(entry: &crate::session::stream::SessionEntry, trace_id: &TraceId) {
+  arm_admission_with(entry, trace_id, Ok(std::time::UNIX_EPOCH)).await;
+}
+
 #[cfg(test)]
 mod route_terminal_contract_tests {
   use std::{
@@ -482,10 +520,7 @@ mod pump_tail_durable_tests {
   use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
   use super::*;
-  use crate::{
-    packet::{RouteRecord, StaticBody},
-    session::stream::SessionEntry,
-  };
+  use crate::packet::{RouteRecord, StaticBody};
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -502,31 +537,6 @@ mod pump_tail_durable_tests {
       .get(trace_id)
       .map(|record| record.state.clone())
       .unwrap()
-  }
-
-  /// Resolves the pump's admission wait the moment it registers: takes
-  /// the pending entry out of the session map and answers it with a
-  /// successful admission (bounded by a wall-clock deadline, since the
-  /// pump registers asynchronously after the open frame queues).
-  async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-      let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
-        PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(Ok(std::time::UNIX_EPOCH));
-          true
-        }
-        PendingAck::Relay { .. } => false,
-      });
-      if resolved == Some(true) {
-        return;
-      }
-      assert!(
-        std::time::Instant::now() < deadline,
-        "the pump's admission wait never registered"
-      );
-      tokio::time::sleep(Duration::from_millis(1)).await;
-    }
   }
 
   /// Waits until the sink's bounded persistence queue drains, then
@@ -672,7 +682,7 @@ mod body_failure_tests {
   use futures_util::stream;
 
   use super::*;
-  use crate::{packet::RouteRecord, protocol::wire::PacketKind, session::stream::SessionEntry};
+  use crate::{packet::RouteRecord, protocol::wire::PacketKind};
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -680,30 +690,6 @@ mod body_failure_tests {
 
   fn trace(seed: u32) -> TraceId {
     TraceId::parse(&format!("trace-{seed:021}")).unwrap()
-  }
-
-  /// Resolves the pump's admission wait the moment it registers (bounded by
-  /// a wall-clock deadline, since the pump registers asynchronously after
-  /// the open frame queues).
-  async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-      let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
-        PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(Ok(std::time::UNIX_EPOCH));
-          true
-        }
-        PendingAck::Relay { .. } => false,
-      });
-      if resolved == Some(true) {
-        return;
-      }
-      assert!(
-        std::time::Instant::now() < deadline,
-        "the pump's admission wait never registered"
-      );
-      tokio::time::sleep(Duration::from_millis(1)).await;
-    }
   }
 
   /// Regression: a body that fails after admission must end the
@@ -856,10 +842,7 @@ mod learned_topology_tests {
   use tokio::sync::oneshot;
 
   use super::*;
-  use crate::{
-    packet::{RouteRecord, StaticBody},
-    session::stream::SessionEntry,
-  };
+  use crate::packet::{RouteRecord, StaticBody};
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -867,37 +850,6 @@ mod learned_topology_tests {
 
   fn trace(seed: u32) -> TraceId {
     TraceId::parse(&format!("trace-{seed:021}")).unwrap()
-  }
-
-  /// Resolves the pump's admission wait the moment it registers.
-  async fn arm_admission(entry: &SessionEntry, trace_id: &TraceId) {
-    arm_admission_with(entry, trace_id, Ok(std::time::UNIX_EPOCH)).await;
-  }
-
-  /// Resolves the pump's admission wait with an explicit outcome: the
-  /// destination's typed refusal is a route failure that happens after the
-  /// open frame was queued.
-  async fn arm_admission_with(
-    entry: &SessionEntry, trace_id: &TraceId, outcome: crate::packet::AckOutcome,
-  ) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-      let resolved = entry.pending_acks.take(trace_id).map(|entry| match entry {
-        PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(outcome);
-          true
-        }
-        PendingAck::Relay { .. } => false,
-      });
-      if resolved == Some(true) {
-        return;
-      }
-      assert!(
-        std::time::Instant::now() < deadline,
-        "the pump's admission wait never registered"
-      );
-      tokio::time::sleep(Duration::from_millis(1)).await;
-    }
   }
 
   fn request(trace_id: TraceId, destination: &NodeId) -> OutboundRequest {

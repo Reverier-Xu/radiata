@@ -105,39 +105,29 @@ impl MembershipPage {
 }
 
 /// The anti-entropy apply path: the reconciliation plane's descriptors
-/// lane applies its row batches through these page commits (the emit
+/// lane applies its row batches through the store's page commit (the emit
 /// side lives in `crate::reconcile::plane`).
+///
+/// Applies one received page over a standalone factory handle (unit/offline
+/// test path): the store accepts
+/// only a strictly greater revision, so stale, repeated, downgraded, and
+/// replayed descriptors cannot replace a newer record. One batched
+/// transaction for the whole page — the per-descriptor decisions live in
+/// the store module beside the single-descriptor commit they mirror — so
+/// a page costs one durable commit, not one per descriptor. Returns the
+/// installed descriptor count.
 #[cfg(test)]
-pub(crate) mod sync {
-  use super::MembershipPage;
-  use crate::{NodeId, Result, api::Entropy, storage::MetadataStore};
-
-  /// Applies one received page over the running node's metadata store:
-  /// the store accepts only a strictly greater revision, so stale,
-  /// repeated, downgraded, and replayed descriptors cannot replace a
-  /// newer record.
-  /// One batched transaction for the whole page — the per-descriptor
-  /// decisions live in the store module beside the single-descriptor
-  /// commit they mirror — so a page costs one durable commit, not one
-  /// per descriptor.
-  #[cfg(test)]
-  pub(crate) async fn apply_page_ctx(
-    store: &MetadataStore, entropy: &dyn Entropy, page: &MembershipPage,
-  ) -> Result<(Vec<NodeId>, Vec<NodeId>)> {
-    super::store::apply_descriptor_batch_ctx(store, entropy, page).await
-  }
-
-  /// Emits one bounded page of descriptors starting after `cursor` over a
-  /// standalone factory handle (unit/offline path).
-  #[cfg(test)]
-  pub(crate) async fn apply_page(
-    factory: &std::sync::Arc<dyn crate::provider::StorageFactory>, page: &MembershipPage,
-  ) -> Result<usize> {
-    let store = MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
-    apply_page_ctx(&store, &crate::api::SystemEntropy, page)
-      .await
-      .map(|(installed, _)| installed.len())
-  }
+pub(crate) async fn apply_page(
+  factory: &std::sync::Arc<dyn crate::provider::StorageFactory>, page: &MembershipPage,
+) -> Result<usize> {
+  let store =
+    crate::storage::MetadataStore::open(factory, std::time::Duration::from_secs(10)).await?;
+  Ok(
+    store::apply_descriptor_batch_ctx(&store, &crate::api::SystemEntropy, page)
+      .await?
+      .0
+      .len(),
+  )
 }
 
 /// The single canonical descriptor decoder: wire rules and error strings
@@ -251,7 +241,7 @@ fn decode_wire(
 mod tests {
   use std::sync::Arc;
 
-  use super::{MembershipPage, sync};
+  use super::{MembershipPage, apply_page};
   use crate::{Endpoint, NodeId, provider::StorageFactory};
 
   fn node(value: u8) -> NodeId {
@@ -302,12 +292,12 @@ mod tests {
     // once (the row applies), and re-applying is idempotent — no
     // downgrade, no duplicate install.
     assert_eq!(
-      sync::apply_page(&receiver, &decoded).await.unwrap(),
+      apply_page(&receiver, &decoded).await.unwrap(),
       1,
       "the stale receiver installs the fresher revision"
     );
     assert_eq!(
-      sync::apply_page(&receiver, &decoded).await.unwrap(),
+      apply_page(&receiver, &decoded).await.unwrap(),
       0,
       "re-applying installs nothing"
     );

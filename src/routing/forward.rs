@@ -845,35 +845,11 @@ pub(crate) struct SessionAckContext<'a> {
 pub(crate) async fn on_session_ack(
   context: &SessionAckContext<'_>, ack: AckFrame, acks: &PendingAdmissions,
 ) {
-  // Acknowledgement attribution: an
-  // acknowledgement steers a forwarded hop only when it arrives on
-  // that hop's current downstream attempt. A late acknowledgement
-  // from a superseded branch (the hop deadline expired or the
-  // attempt failed and the open was re-dispatched elsewhere) is
-  // dropped: it must not consume the live attempt's pending
-  // entry, clear its retry arm, or flip its route record.
-  if !ack_from_current_downstream(context.forwarding, acks, &ack.trace_id) {
-    debug!(
-      trace_id = %ack.trace_id,
-      status = ?ack.status,
-      "late acknowledgement from a superseded branch dropped"
-    );
-  } else if ack.status != AckStatus::Admitted && owns_discovering(context.forwarding, &ack.trace_id)
-  {
-    // A failure for a trace this node is still discovering (it
-    // forwarded the open and the destination has not admitted it
-    // yet) belongs to this hop's branch search: the failed
-    // attempt's pending entry is consumed and the next untried
-    // branch is re-dispatched, instead of relaying the failure
-    // upstream. Every other acknowledgement resolves the session's
-    // pending admission exactly as before.
-    on_downstream_failure(
-      context.forwarding,
-      &ack.trace_id,
-      context.sessions,
-      context.relay_hop_deadline,
-    )
-    .await;
+  if !attribute_ack(context, &ack, acks) {
+    return;
+  }
+  if ack.status != AckStatus::Admitted && owns_discovering(context.forwarding, &ack.trace_id) {
+    handle_discovering_failure(context, &ack.trace_id).await;
   } else {
     if ack.status == AckStatus::Admitted {
       mark_admitted(context.forwarding, &ack.trace_id);
@@ -897,45 +873,90 @@ pub(crate) async fn on_session_ack(
     // reaches this node, the origin's record ends
     // `Failed(StreamInterrupted)` under either ordering.
     if ack.status == AckStatus::Failed {
-      // The pre-read decides what this flip owns: a record that
-      // was not yet `Failed` transitions here, so subscribers get
-      // the `RouteChanged` nudge the refused pump tail no longer
-      // emits. The durable twin mirrors exactly the flip: the
-      // revision fires only for caller traffic with an origin-side
-      // identity — an already-failed record is final, a relay hop
-      // or a destination rejection carries no identity to persist,
-      // and internal control traffic stays out of the durable
-      // trace store on this path too — so the same trace id's
-      // durable terminal ends `Failed(StreamInterrupted)` under
-      // either writer ordering instead of keeping the pump tail's
-      // `Delivered` for the whole retention window.
-      let prior = context.routes.lock().ok().and_then(|table| {
-        let record = table.get(&ack.trace_id)?;
-        if matches!(record.state, RouteState::Failed(_)) {
-          None
-        } else {
-          Some((record.selected_node.clone(), record.internal))
-        }
-      });
-      update_route(context.routes, &ack.trace_id, |record| {
-        record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
-      });
-      if let Some((destination, internal)) = prior {
-        context
-          .events
-          .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-            ack.trace_id.clone(),
-          )));
-        if let (Some(trace), Some(destination)) = (context.trace, destination.filter(|_| !internal))
-        {
-          trace.revise_terminal_failure(
-            ack.trace_id.clone(),
-            context.local.clone(),
-            destination,
-            ErrorKind::StreamInterrupted,
-          );
-        }
-      }
+      flip_terminal_route(context, &ack);
+    }
+  }
+}
+
+/// Acknowledgement attribution: an acknowledgement steers a forwarded hop
+/// only when it arrives on that hop's current downstream attempt. A late
+/// acknowledgement from a superseded branch (the hop deadline expired or
+/// the attempt failed and the open was re-dispatched elsewhere) is
+/// dropped: it must not consume the live attempt's pending entry, clear
+/// its retry arm, or flip its route record. Returns whether the
+/// acknowledgement steers this hop.
+fn attribute_ack(
+  context: &SessionAckContext<'_>, ack: &AckFrame, acks: &PendingAdmissions,
+) -> bool {
+  if ack_from_current_downstream(context.forwarding, acks, &ack.trace_id) {
+    return true;
+  }
+  debug!(
+    trace_id = %ack.trace_id,
+    status = ?ack.status,
+    "late acknowledgement from a superseded branch dropped"
+  );
+  false
+}
+
+/// A failure for a trace this node is still discovering (it forwarded the
+/// open and the destination has not admitted it yet) belongs to this hop's
+/// branch search: the failed attempt's pending entry is consumed and the
+/// next untried branch is re-dispatched, instead of relaying the failure
+/// upstream. Every other acknowledgement resolves the session's pending
+/// admission exactly as before.
+async fn handle_discovering_failure(context: &SessionAckContext<'_>, trace_id: &TraceId) {
+  on_downstream_failure(
+    context.forwarding,
+    trace_id,
+    context.sessions,
+    context.relay_hop_deadline,
+  )
+  .await;
+}
+
+/// A late failure for an admitted stream (a downstream hop died mid-flight)
+/// still terminates the origin's route observation. This writer races the
+/// origin pump's end-of-stream `Delivered`, and the route table's monotonic
+/// terminal machine converges them deterministically: the failure overrides
+/// a recorded `Delivered`, and once recorded it refuses every later update —
+/// so, when the report reaches this node, the origin's record ends
+/// `Failed(StreamInterrupted)` under either ordering.
+fn flip_terminal_route(context: &SessionAckContext<'_>, ack: &AckFrame) {
+  // The pre-read decides what this flip owns: a record that was not yet
+  // `Failed` transitions here, so subscribers get the `RouteChanged` nudge
+  // the refused pump tail no longer emits. The durable twin mirrors exactly
+  // the flip: the revision fires only for caller traffic with an origin-side
+  // identity — an already-failed record is final, a relay hop or a
+  // destination rejection carries no identity to persist, and internal
+  // control traffic stays out of the durable trace store on this path too —
+  // so the same trace id's durable terminal ends `Failed(StreamInterrupted)`
+  // under either writer ordering instead of keeping the pump tail's
+  // `Delivered` for the whole retention window.
+  let prior = context.routes.lock().ok().and_then(|table| {
+    let record = table.get(&ack.trace_id)?;
+    if matches!(record.state, RouteState::Failed(_)) {
+      None
+    } else {
+      Some((record.selected_node.clone(), record.internal))
+    }
+  });
+  update_route(context.routes, &ack.trace_id, |record| {
+    record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
+  });
+  if let Some((destination, internal)) = prior {
+    context
+      .events
+      .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+        ack.trace_id.clone(),
+      )));
+    if let (Some(trace), Some(destination)) = (context.trace, destination.filter(|_| !internal)) {
+      trace.revise_terminal_failure(
+        ack.trace_id.clone(),
+        context.local.clone(),
+        destination,
+        ErrorKind::StreamInterrupted,
+      );
     }
   }
 }

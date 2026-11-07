@@ -229,7 +229,7 @@ async fn converge(sides: [&MetadataStore; 2]) {
       }
       for chunk in descriptors.chunks(16) {
         let page = member_page::MembershipPage::new(chunk.to_vec(), None).unwrap();
-        applied += member_page::sync::apply_page_ctx(receiver, &SystemEntropy, &page)
+        applied += descriptor_store::apply_descriptor_batch_ctx(receiver, &SystemEntropy, &page)
           .await
           .unwrap()
           .0
