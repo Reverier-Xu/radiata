@@ -1,5 +1,5 @@
 [workspace]
-members  = [".", "test-support"]
+members  = [".", "cadence", "test-support"]
 resolver = "3"
 
 [package]
