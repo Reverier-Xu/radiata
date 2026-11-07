@@ -265,9 +265,14 @@ mod tests {
   };
 
   /// The pinned size of each category. A new built-in tag (or a removal)
-  /// must update the table and this count together.
+  /// must update the table and this count together. The three json-backed
+  /// schema tags are inventory entries only when the json feature is
+  /// compiled in.
   const EXPECTED_COUNTS: &[(&str, usize)] = &[
-    (CATEGORY_SCHEMAS, 26),
+    (
+      CATEGORY_SCHEMAS,
+      if cfg!(feature = "json") { 26 } else { 23 },
+    ),
     (CATEGORY_CRYPTO, 8),
     (CATEGORY_METADATA, 19),
     (CATEGORY_PROTOCOLS, 3),
@@ -305,6 +310,10 @@ mod tests {
     "src/routing.rs",
     "src/routing/trace.rs",
     "src/storage/families.rs",
+    // The json document source joins the build only with its feature;
+    // scanning it in a json-less build would flag its schema literals
+    // against an inventory that excludes them.
+    #[cfg(feature = "json")]
     "src/storage/json/document.rs",
     "src/storage/migration.rs",
     "src/storage/pending.rs",

@@ -139,7 +139,7 @@ mod tests {
     },
   ];
 
-  #[cfg(any(all(feature = "json", unix), feature = "redb"))]
+  #[cfg(all(feature = "json", unix))]
   async fn read_schema(storage: &dyn Storage) -> Option<String> {
     let snapshot = storage.snapshot().await.unwrap();
     let namespace = schema_namespace().unwrap();

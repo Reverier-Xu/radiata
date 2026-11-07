@@ -125,7 +125,10 @@ mod tests {
     assert_eq!(to_millis(UNIX_EPOCH), 0);
     assert_eq!(to_millis(UNIX_EPOCH - Duration::from_secs(1)), -1_000);
     assert_eq!(to_millis(UNIX_EPOCH - Duration::from_millis(1)), -1);
-    assert_eq!(to_millis(UNIX_EPOCH - Duration::from_nanos(1)), -1);
+    // One FILETIME tick below the epoch: the smallest pre-epoch reading
+    // every supported host clock (100 ns resolution on Windows) can
+    // represent floors to -1.
+    assert_eq!(to_millis(UNIX_EPOCH - Duration::from_nanos(100)), -1);
     assert_eq!(to_millis(UNIX_EPOCH + Duration::from_millis(1_500)), 1_500);
     assert_eq!(
       from_millis(-1_500),
@@ -155,8 +158,10 @@ mod tests {
   // the reading it came from.
   #[test]
   fn millis_truncation_is_floor_on_both_sides_of_the_epoch() {
-    let after = UNIX_EPOCH + Duration::from_nanos(1_500_000_001);
-    let before = UNIX_EPOCH - Duration::from_nanos(1_500_000_001);
+    // The offsets stay on whole FILETIME ticks (multiples of 100 ns) so
+    // the host clock represents them exactly on every platform.
+    let after = UNIX_EPOCH + Duration::from_nanos(1_500_000_100);
+    let before = UNIX_EPOCH - Duration::from_nanos(1_500_000_100);
     assert_eq!(to_millis(after), 1_500);
     assert_eq!(to_millis(before), -1_501);
     assert!(from_millis(to_millis(after)) <= after);

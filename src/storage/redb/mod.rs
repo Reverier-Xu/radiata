@@ -8,9 +8,14 @@
 
 mod store;
 
+#[cfg(all(test, unix, feature = "json"))]
+pub(crate) use store::FIRST_COMMITTED_POINT;
 pub(crate) use store::RedbStoreFactory;
-#[cfg(test)]
-pub(crate) use store::{FIRST_COMMITTED_POINT, LAST_POINT, select_crash_point};
+// The crash-point hooks are test-only; the re-exports follow their
+// cross-module consumers: the identity crash matrices (either backend),
+// and the mixed json+redb crash matrix for the committed-point boundary.
+#[cfg(all(test, unix))]
+pub(crate) use store::{LAST_POINT, select_crash_point};
 
 #[cfg(test)]
 mod crash;
