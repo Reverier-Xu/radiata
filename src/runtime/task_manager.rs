@@ -30,12 +30,11 @@ use tokio::{
 };
 
 use crate::{
-  BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeConfig, NodeId, Result, TaskId, TaskKind,
-  TaskOutput, TaskPhase,
+  BoxFuture, Error, IssuedMergeCredential, NodeId, Result, TaskId, TaskKind, TaskOutput, TaskPhase,
   api::Entropy,
   task::{
-    CoreTaskKind, SlotClass, TaskError, TaskObserver, TaskReconcilePolicy, TaskTable,
-    output::encode_credential,
+    Coalescing, CoreTaskKind, RetryClass, SlotClass, TaskError, TaskObserver, TaskReconcilePolicy,
+    TaskTable, output::encode_credential,
   },
   time::WallClock,
 };
@@ -105,50 +104,17 @@ pub(crate) const TASK_RECONCILE_BACKLOG: usize = 64;
 /// arithmetic.
 const RETRY_TIMER_IDLE: Duration = Duration::from_secs(86_400 * 365);
 
-/// The retry classification behind each kind's policy: which typed
-/// error categories may retry. The taxonomy is the crate's own verbatim
-/// — e.g. an unspread binding (`NotFound`) is a retryable convergence
-/// state for a network dial, while `AuthenticationFailed`/`Revoked` are
-/// the documented terminal dial contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetryClass {
-  /// Join/connect dials: convergence and transport transients retry.
-  Network,
-  /// Caller-registered custom kinds: a returned `Err` never re-arms the
-  /// schedule (the reconciler's explicit `Retry` decision is the only
-  /// re-arm path — see [`EffectOutcome::Retry`]), so the class itself
-  /// treats every error as terminal.
-  Extension,
-  /// Everything else: one attempt, no retry.
-  Once,
-}
-
-impl RetryClass {
-  const fn retryable(self, kind: ErrorKind) -> bool {
-    match self {
-      RetryClass::Network => matches!(
-        kind,
-        ErrorKind::NotFound
-          | ErrorKind::NotReady
-          | ErrorKind::Io
-          | ErrorKind::Overloaded
-          | ErrorKind::RouteUnavailable
-          | ErrorKind::StreamInterrupted
-      ),
-      RetryClass::Extension | RetryClass::Once => false,
-    }
-  }
-}
-
-/// One kind's bounded retry policy: attempt budget plus exponential
-/// backoff (`initial * 4^(attempt-1)`, capped, no jitter — the
+/// The bounded retry schedules: attempt budget plus exponential backoff
+/// (`initial * 4^(attempt-1)`, capped, no jitter — the
 /// lockstep-slamming rationale behind the recovery plane's jitter does
 /// not apply at these scales, and seeded jitter stays additive later).
+/// Each schedule is keyed by the retry class the kind's
+/// admission-resolved registration policy declares (see
+/// [`crate::task::RetryClass`]), never matched off the tag again.
 pub(crate) struct RetryPolicy {
   pub(crate) max_attempts: u32,
   initial: Duration,
   max: Duration,
-  class: RetryClass,
 }
 
 impl RetryPolicy {
@@ -164,7 +130,6 @@ const NETWORK_RETRY: RetryPolicy = RetryPolicy {
   max_attempts: 4,
   initial: Duration::from_millis(100),
   max: Duration::from_secs(10),
-  class: RetryClass::Network,
 };
 
 /// Everything else (resource writes, leave, credentials, recovery,
@@ -178,7 +143,6 @@ const ONCE: RetryPolicy = RetryPolicy {
   max_attempts: 1,
   initial: Duration::ZERO,
   max: Duration::ZERO,
-  class: RetryClass::Once,
 };
 
 /// Caller-registered custom kinds: only the reconciler's explicit
@@ -190,17 +154,15 @@ const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
   max_attempts: 4,
   initial: Duration::from_millis(100),
   max: Duration::from_secs(10),
-  class: RetryClass::Extension,
 };
 
-/// The kind's retry policy (single classification site). A tag outside
-/// the core set is a caller-defined kind: its reconciler owns the
-/// semantics, so it rides the extension policy.
-pub(crate) fn retry_policy(kind: &TaskKind) -> &'static RetryPolicy {
-  match CoreTaskKind::from_tag(kind) {
-    Some(CoreTaskKind::Join | CoreTaskKind::Connect) => &NETWORK_RETRY,
-    Some(_) => &ONCE,
-    None => &EXTENSION_RETRY,
+/// The bounded schedule one retry class rides (single classification
+/// site, derived from the admission-resolved registration policy).
+pub(crate) fn retry_policy(class: RetryClass) -> &'static RetryPolicy {
+  match class {
+    RetryClass::Network => &NETWORK_RETRY,
+    RetryClass::Extension => &EXTENSION_RETRY,
+    RetryClass::Once => &ONCE,
   }
 }
 
@@ -237,18 +199,12 @@ impl EffectOutcome {
     }
   }
 
-  /// The issue-credential effect's outcome: the observation carries the
-  /// generation's expiry; the secret rides the consumed-once slot.
-  pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Result<Self> {
-    Ok(Self::Done {
-      output: encode_credential(issued.expires_at())?,
-      secret: Some(issued),
-    })
-  }
-
-  /// The rotate-credential effect's outcome (the same consumed-once
-  /// rule).
-  pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Result<Self> {
+  /// The credential effects' outcome: the observation carries the
+  /// generation's expiry; the secret rides the consumed-once slot. The
+  /// issue and rotate effects share this one shape — their distinct
+  /// kind tags (and so their distinct events) live at the admission
+  /// sites, never in the outcome.
+  pub(crate) fn credential(issued: IssuedMergeCredential) -> Result<Self> {
     Ok(Self::Done {
       output: encode_credential(issued.expires_at())?,
       secret: Some(issued),
@@ -330,50 +286,42 @@ impl TaskSpec {
     &self.kind
   }
 
-  /// Validates the spec shape: a coalescing kind must carry its subject
-  /// (only crate-internal wiring builds specs, so a miss is the typed
-  /// internal invariant, never caller data).
-  pub(crate) fn check_shape(&self) -> Result<()> {
-    let core = CoreTaskKind::from_tag(&self.kind);
-    let requires_dial = core == Some(CoreTaskKind::Connect);
-    let requires_revoke = core == Some(CoreTaskKind::Revoke);
-    let requires_subject = matches!(
-      core,
-      Some(CoreTaskKind::Disconnect | CoreTaskKind::PurgeRevocation | CoreTaskKind::Cleanup),
-    );
-    if requires_dial && !matches!(self.payload, TaskPayload::PeerDial { .. }) {
-      return Err(Error::internal("task coalescing subject"));
+  /// Validates the spec shape against the kind's admission-resolved
+  /// registration policy: a coalescing kind must carry the payload shape
+  /// its declared rule names (only crate-internal wiring builds specs,
+  /// so a miss is the typed internal invariant, never caller data).
+  pub(crate) fn check_shape(&self, policy: &TaskReconcilePolicy) -> Result<()> {
+    let carried = match policy.coalescing {
+      Coalescing::None => true,
+      Coalescing::PeerDial => matches!(self.payload, TaskPayload::PeerDial { .. }),
+      Coalescing::Peer => matches!(self.payload, TaskPayload::Peer(_)),
+      Coalescing::RevokeKey => matches!(self.payload, TaskPayload::Revoke { .. }),
+    };
+    if carried {
+      Ok(())
+    } else {
+      Err(Error::internal("task coalescing subject"))
     }
-    if requires_revoke && !matches!(self.payload, TaskPayload::Revoke { .. }) {
-      return Err(Error::internal("task coalescing subject"));
-    }
-    if requires_subject && !matches!(self.payload, TaskPayload::Peer(_)) {
-      return Err(Error::internal("task coalescing subject"));
-    }
-    Ok(())
   }
 
-  /// The coalescing subject, when the kind coalesces.
-  pub(crate) fn coalesce_key(&self) -> Option<NodeId> {
-    match CoreTaskKind::from_tag(&self.kind) {
-      Some(CoreTaskKind::Connect) => match &self.payload {
+  /// The coalescing subject, when the kind's declared rule coalesces:
+  /// derived from the admission-resolved policy (a kind whose rule is
+  /// [`Coalescing::None`] never coalesces, whatever its payload).
+  pub(crate) fn coalesce_key(&self, policy: &TaskReconcilePolicy) -> Option<NodeId> {
+    match policy.coalescing {
+      Coalescing::None => None,
+      Coalescing::PeerDial => match &self.payload {
         TaskPayload::PeerDial { peer, .. } => Some(peer.clone()),
-        TaskPayload::Peer(subject) => Some(subject.clone()),
-        TaskPayload::Revoke { .. } | TaskPayload::None => None,
+        _ => None,
       },
-      Some(
-        CoreTaskKind::Disconnect
-        | CoreTaskKind::Revoke
-        | CoreTaskKind::PurgeRevocation
-        | CoreTaskKind::Cleanup,
-      ) => match &self.payload {
+      Coalescing::Peer => match &self.payload {
         TaskPayload::Peer(subject) => Some(subject.clone()),
-        TaskPayload::Revoke { subject, .. } | TaskPayload::PeerDial { peer: subject, .. } => {
-          Some(subject.clone())
-        }
-        TaskPayload::None => None,
+        _ => None,
       },
-      _ => None,
+      Coalescing::RevokeKey => match &self.payload {
+        TaskPayload::Revoke { subject, .. } => Some(subject.clone()),
+        _ => None,
+      },
     }
   }
 }
@@ -676,32 +624,19 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     stop: cancel_rx.clone(),
   };
   // The execution-slot budgets ride the node configuration carried by
-  // the operation planes; the unit-test double (no planes) reads the
-  // same defaults the configuration ships.
-  let (local_slots, network_slots, extension_slots) = deps
-    .operations
-    .planes()
-    .map(|planes| {
-      (
-        planes.config.task_reconcile_local_slots(),
-        planes.config.task_reconcile_network_slots(),
-        planes.config.task_reconcile_extension_slots(),
-      )
-    })
-    .unwrap_or_else(|_| {
-      let defaults = NodeConfig::new();
-      (
-        defaults.task_reconcile_local_slots(),
-        defaults.task_reconcile_network_slots(),
-        defaults.task_reconcile_extension_slots(),
-      )
-    });
+  // the operation planes.
+  let planes = deps.operations.planes();
+  let slots = ReconcileChannels::new(
+    planes.config.task_reconcile_local_slots(),
+    planes.config.task_reconcile_network_slots(),
+    planes.config.task_reconcile_extension_slots(),
+  );
   let shared = Arc::new(ManagerShared {
     table,
     clock: deps.clock,
     operations: Arc::clone(&deps.operations),
     leave_signal: deps.leave_signal,
-    slots: ReconcileChannels::new(local_slots, network_slots, extension_slots),
+    slots,
     observations: crate::task::ObservationLanes::new(),
   });
   // The bounded observation lanes' scheduling half joins the operation
@@ -996,7 +931,6 @@ fn admit_inner(
   if *cancel_watch.borrow() {
     return Err(Error::shutting_down("task admission"));
   }
-  spec.check_shape()?;
   let kind = spec.kind().clone();
   // The execution policy rides the kind's registration (the core verbs
   // declare theirs in `register_default`, a caller kind at its own
@@ -1007,6 +941,11 @@ fn admit_inner(
     .extensions()
     .task_reconciler_policy(&kind)
     .ok_or_else(|| Error::internal("task policy"))?;
+  // The spec shape is validated against the resolved policy's own
+  // coalescing rule: a coalescing kind must carry the payload shape its
+  // registration declares, so a new coalescing verb can never ship with
+  // a shape check its policy does not name.
+  spec.check_shape(&policy)?;
   // The nested-submit refusal: a submission made from inside an effect
   // of the same slot class would await a task of its own bounded
   // channel — the one recursive wait that can self-deadlock on the
@@ -1028,7 +967,7 @@ fn admit_inner(
       .status(id)
       .is_some_and(|(_, status)| !status.phase().is_terminal())
   };
-  if let Some(subject) = spec.coalesce_key() {
+  if let Some(subject) = spec.coalesce_key(&policy) {
     let key = (kind.clone(), subject);
     if let Some((existing, in_flight_spec)) = coalescing.get(&key).cloned() {
       if in_flight(&existing) {
@@ -1078,7 +1017,7 @@ fn admit_inner(
     kind.clone(),
     TaskPhase::Pending,
   ));
-  if let Some(subject) = spec.coalesce_key() {
+  if let Some(subject) = spec.coalesce_key(&policy) {
     coalescing.insert((kind.clone(), subject), (id.clone(), spec.clone()));
   }
   if CoreTaskKind::from_tag(&kind) == Some(CoreTaskKind::Leave) {
@@ -1283,10 +1222,10 @@ impl Attempt {
         // and the carried error rides the next attempt's context. The
         // error's kind is not classified here — the decision itself is
         // the re-arm request.
-        let policy = retry_policy(&self.kind);
-        if attempt < policy.max_attempts {
+        let schedule = retry_policy(self.policy.retry_class);
+        if attempt < schedule.max_attempts {
           AttemptOutcome::Retry {
-            delay: policy.backoff(attempt),
+            delay: schedule.backoff(attempt),
             last_error: Some(TaskError::from_error(error)),
           }
         } else {
@@ -1298,10 +1237,10 @@ impl Attempt {
         // A returned error is terminal unless the kind's own policy
         // classifies it retryable (the network dials' convergence
         // transients); the extension kinds never retry an `Err`.
-        let policy = retry_policy(&self.kind);
-        if attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
+        let schedule = retry_policy(self.policy.retry_class);
+        if attempt < schedule.max_attempts && self.policy.retry_class.retryable(error.kind()) {
           AttemptOutcome::Retry {
-            delay: policy.backoff(attempt),
+            delay: schedule.backoff(attempt),
             last_error: Some(TaskError::from_error(error)),
           }
         } else {
@@ -1382,32 +1321,48 @@ mod tests {
     time::HostWallClock,
   };
 
-  fn deps_with(
-    events: Arc<crate::node::EventHub>, mut extensions: ExtensionRegistry,
-  ) -> TaskManagerDeps {
-    // The core verbs' execution policies come from `register_default`,
-    // exactly like the node builder's startup path: the manager tests
-    // admit core kinds (sync rounds, leaves) and need them declared.
-    extensions.register_default().expect("core task policies");
+  /// Builds real operation handles over a fresh in-memory identity (the
+  /// production construction path through the supervisor's test
+  /// fixture): the manager tests run the exact production planes
+  /// instead of a stand-in. `extensions` is installed before the
+  /// default pass, the same order the node builder applies. Returns the
+  /// operation handles plus the registry Arc they carry (one instance
+  /// serves both the manager and a node handle built over it).
+  async fn test_operations(
+    extensions: ExtensionRegistry,
+  ) -> (
+    Arc<super::super::task_effects::OperationDeps>,
+    Arc<ExtensionRegistry>,
+  ) {
+    let factory = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let fixture = crate::runtime::supervisor::test_support::runtime_fixture_over(
+      factory as Arc<dyn crate::provider::StorageFactory>,
+      crate::NodeConfig::new(),
+      move |registry| *registry = extensions,
+    )
+    .await;
+    let operations = fixture.dependencies.operations.expect("operation handles");
+    let extensions = Arc::clone(&fixture.dependencies.extensions);
+    (operations, extensions)
+  }
+
+  async fn deps_with(extensions: ExtensionRegistry) -> TaskManagerDeps {
     // The leave signal's receiver is the supervisor's in production; the
     // manager tests never admit a leave effect that sends it.
     let (leave_signal, _leave_signals) = mpsc::channel(1);
+    let (operations, _extensions) = test_operations(extensions).await;
     TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
-      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
-        events,
-        Arc::new(extensions),
-      )),
+      operations,
       leave_signal,
     }
   }
 
-  fn deps() -> TaskManagerDeps {
-    deps_with(
-      Arc::new(crate::node::EventHub::new()),
-      ExtensionRegistry::new(),
-    )
+  async fn deps() -> TaskManagerDeps {
+    deps_with(ExtensionRegistry::new()).await
   }
 
   /// An action hook that panics only on the terminal success transition.
@@ -1433,14 +1388,11 @@ mod tests {
       )
       .expect("registration");
     let (leave_signal, mut leave_signals) = mpsc::channel(1);
-    extensions.register_default().expect("core task policies");
+    let (operations, _extensions) = test_operations(extensions).await;
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
-      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
-        Arc::new(crate::node::EventHub::new()),
-        Arc::new(extensions),
-      )),
+      operations,
       leave_signal,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
@@ -1521,11 +1473,7 @@ mod tests {
         }),
       )
       .expect("registration");
-    let (client, manager) = spawn_task_manager(deps_with(
-      Arc::new(crate::node::EventHub::new()),
-      extensions,
-    ))
-    .expect("manager");
+    let (client, manager) = spawn_task_manager(deps_with(extensions).await).expect("manager");
     let id = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
@@ -1606,11 +1554,7 @@ mod tests {
         }),
       )
       .expect("registration");
-    let (client, _manager) = spawn_task_manager(deps_with(
-      Arc::new(crate::node::EventHub::new()),
-      extensions,
-    ))
-    .expect("manager");
+    let (client, _manager) = spawn_task_manager(deps_with(extensions).await).expect("manager");
     let count = 8;
     let mut ids = Vec::with_capacity(count);
     for _ in 0..count {
@@ -1676,11 +1620,7 @@ mod tests {
     extensions
       .register_task_reconciler(kind_tag.clone(), RecordingReconciler::new(Vec::new()))
       .expect("registration");
-    let (client, _manager) = spawn_task_manager(deps_with(
-      Arc::new(crate::node::EventHub::new()),
-      extensions,
-    ))
-    .expect("manager");
+    let (client, _manager) = spawn_task_manager(deps_with(extensions).await).expect("manager");
     // One wedged core local task pins one of the local channel's two
     // default slots: exactly one slot remains for the workflow's child.
     let wedged = client
@@ -1747,7 +1687,7 @@ mod tests {
   /// backlog never consumes the network budget.
   #[tokio::test]
   async fn the_non_terminal_backlog_is_bounded_per_class_with_typed_overload() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     // Distinct-intent wedged local tasks fill the local backlog: the
     // two default local slots wedge and the rest wait as non-terminal
     // `Pending` entries.
@@ -1806,7 +1746,7 @@ mod tests {
   /// dials typed but never blocks the core local writes.
   #[tokio::test]
   async fn a_saturated_network_backlog_never_blocks_local_admission() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     for _ in 0..super::TASK_RECONCILE_BACKLOG {
       client
         .submit(
@@ -1945,7 +1885,7 @@ mod tests {
 
   #[tokio::test]
   async fn terminal_dial_failures_never_retry() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     let scripted = Scripted::new(vec![Step::Fail(
       ErrorKind::AuthenticationFailed,
       "member handshake",
@@ -1971,7 +1911,7 @@ mod tests {
 
   #[tokio::test]
   async fn once_kinds_never_retry() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     let scripted = Scripted::new(vec![Step::Fail(ErrorKind::NotFound, "anything")]);
     let id = client
       .submit(
@@ -1990,7 +1930,7 @@ mod tests {
 
   #[tokio::test]
   async fn final_cas_conflicts_terminalize_after_one_attempt() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     // The resource effects return a lost CAS (the caller's expected
     // version no longer matches the register) as a final Conflict: the
     // bounded register-race retry lives inside the effect
@@ -2024,7 +1964,7 @@ mod tests {
   /// the first caller's exact outcome.
   #[tokio::test]
   async fn revoke_coalescing_compares_the_pinned_expected_key() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     let subject = node('p');
     let revoke = |key: u8| TaskPayload::Revoke {
       subject: subject.clone(),
@@ -2062,7 +2002,7 @@ mod tests {
   /// revoke outcome — never a second execution with its own closure.
   #[tokio::test]
   async fn a_joined_revoke_retry_resolves_the_first_callers_outcome() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     let subject = node('p');
     let payload = TaskPayload::Revoke {
       subject: subject.clone(),
@@ -2105,7 +2045,7 @@ mod tests {
 
   #[tokio::test]
   async fn leave_is_exclusive_while_in_flight() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     // A gated leave: terminalizes only when released, so the exclusivity
     // window is deterministic. `Notify::notify_one` stores its permit, so
     // the release is not lost to a gate that has not subscribed yet.
@@ -2179,15 +2119,11 @@ mod tests {
   async fn a_second_leave_before_the_first_terminal_report_is_refused_and_the_first_still_signals()
   {
     let (leave_signal, mut leave_signals) = mpsc::channel(1);
-    let mut extensions = ExtensionRegistry::new();
-    extensions.register_default().expect("core task policies");
+    let (operations, _extensions) = test_operations(ExtensionRegistry::new()).await;
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
-      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
-        Arc::new(crate::node::EventHub::new()),
-        Arc::new(extensions),
-      )),
+      operations,
       leave_signal,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
@@ -2279,7 +2215,7 @@ mod tests {
 
   #[tokio::test]
   async fn shutdown_cancels_cancellable_kinds_and_awaits_the_journaled_ones() {
-    let (client, manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, manager) = spawn_task_manager(deps().await).expect("manager");
     // A cancellable kind wedged mid-effect.
     let wedged = client
       .submit(
@@ -2368,7 +2304,7 @@ mod tests {
 
   #[tokio::test]
   async fn the_local_slot_channel_bounds_simultaneous_effects() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let mut ids = Vec::new();
@@ -2416,7 +2352,7 @@ mod tests {
 
   #[tokio::test]
   async fn dropping_every_client_stops_the_manager() {
-    let (client, manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, manager) = spawn_task_manager(deps().await).expect("manager");
     let wedged = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
@@ -2445,7 +2381,8 @@ mod tests {
 
   #[test]
   fn the_retry_policies_are_bounded_and_exponential() {
-    let network = super::retry_policy(&TaskKind::JOIN);
+    use crate::task::RetryClass;
+    let network = super::retry_policy(RetryClass::Network);
     assert_eq!(network.max_attempts, 4);
     assert_eq!(network.backoff(1), Duration::from_millis(100));
     assert_eq!(network.backoff(2), Duration::from_millis(400));
@@ -2455,18 +2392,40 @@ mod tests {
     // Resource writes share the once policy: the commit-race retry
     // lives inside the effects, and a final lost-CAS Conflict never
     // re-runs at the manager level.
-    assert_eq!(super::retry_policy(&TaskKind::PUT_RESOURCE).max_attempts, 1);
-    assert_eq!(
-      super::retry_policy(&TaskKind::DELETE_RESOURCE).max_attempts,
-      1
-    );
-    let once = super::retry_policy(&TaskKind::LEAVE);
-    assert_eq!(once.max_attempts, 1);
+    assert_eq!(super::retry_policy(RetryClass::Once).max_attempts, 1);
+    let once = super::retry_policy(RetryClass::Once);
     assert_eq!(once.backoff(1), Duration::ZERO);
     // A caller-defined kind takes the extension policy: the reconciler
     // owns the semantics, the manager owns the bound.
-    let caller = TaskKind::parse("example.com/tasks/v1/probe").expect("tag");
-    assert_eq!(super::retry_policy(&caller).max_attempts, 4);
+    assert_eq!(super::retry_policy(RetryClass::Extension).max_attempts, 4);
+  }
+
+  /// Every core verb's full execution policy resolves from the
+  /// registration channel (the single source the admission reads), and
+  /// a caller-registered kind resolves the extension registration's own
+  /// policy record — never a tag-derived fallback.
+  #[test]
+  fn every_core_kind_resolves_its_declared_policy_and_a_caller_kind_resolves_the_extension_record()
+  {
+    let mut registry = ExtensionRegistry::new();
+    registry.register_default().expect("core task policies");
+    for (kind, declared) in crate::task::core_task_policies() {
+      assert_eq!(
+        registry.task_reconciler_policy(&kind),
+        Some(declared),
+        "the registration channel resolves the declared policy for {kind}"
+      );
+    }
+    let caller = QualifiedTag::parse("example.com/tasks/v1/probe").expect("tag");
+    let mut registry = ExtensionRegistry::new();
+    registry
+      .register_task_reconciler(caller.clone(), RecordingReconciler::new(Vec::new()))
+      .expect("registration");
+    assert_eq!(
+      registry.task_reconciler_policy(&TaskKind::from(caller)),
+      Some(crate::task::TaskReconcilePolicy::EXTENSION),
+      "an unknown caller kind uses the extension registration's own policy"
+    );
   }
 
   /// The handle's expected kind is checked against the stored payload's
@@ -2474,7 +2433,7 @@ mod tests {
   /// caller-visible decode of the wrong shape.
   #[tokio::test]
   async fn a_handle_of_the_wrong_kind_is_the_typed_internal_error() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let (client, _manager) = spawn_task_manager(deps().await).expect("manager");
     let id = client
       .submit(
         TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
@@ -2546,21 +2505,13 @@ mod tests {
   /// surface (`node.tasks()`) against the real manager machinery — one
   /// registry instance serves both the handle (the reconciler lookup)
   /// and the manager (the hook source).
-  fn handle_over_manager(
-    mut extensions: ExtensionRegistry, events: Arc<crate::node::EventHub>,
-  ) -> (crate::NodeHandle, crate::Tasks) {
-    // The core verbs' execution policies come from `register_default`,
-    // exactly like the node builder's startup path.
-    extensions.register_default().expect("core task policies");
-    let extensions = std::sync::Arc::new(extensions);
+  async fn handle_over_manager(extensions: ExtensionRegistry) -> (crate::NodeHandle, crate::Tasks) {
+    let (operations, extensions) = test_operations(extensions).await;
     let (leave_signal, _leave_signals) = mpsc::channel(1);
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
-      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
-        events,
-        extensions.clone(),
-      )),
+      operations,
       leave_signal,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
@@ -2602,7 +2553,7 @@ mod tests {
     extensions
       .register_task_reconciler(kind.clone(), RecordingReconciler::new(Vec::new()))
       .expect("registration");
-    let (_handle, tasks) = handle_over_manager(extensions, Arc::new(crate::node::EventHub::new()));
+    let (_handle, tasks) = handle_over_manager(extensions).await;
 
     // The builtin domain is reserved and an unregistered kind is
     // unsupported: both refuse at admission, typed.

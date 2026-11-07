@@ -199,9 +199,9 @@ impl TickState {
   /// recovery worker (see [`run_recovery_worker`]), never inline in the
   /// supervisor's select loop.
   pub(super) async fn recovery_tick(&self) -> Result<()> {
-    let before = controller_view(&self.recovery);
+    let before = controller_view(self.recovery());
     let result = self.recovery_tick_inner().await;
-    let after = controller_view(&self.recovery);
+    let after = controller_view(self.recovery());
     if after != before {
       self.events.emit(crate::RecoveryChanged::new(after));
     }
@@ -214,20 +214,21 @@ impl TickState {
     // accepted connection and inflate the observability counts. Reaping
     // each tick keeps the vec and the counts live-work only; abort() on a
     // finished handle is a no-op, so shutdown semantics are unchanged.
-    if let Ok(mut handles) = self.connection_tasks.lock() {
+    if let Ok(mut handles) = self.connection_tasks().lock() {
       handles.retain(|handle| !handle.is_finished());
     }
     let direct: std::collections::BTreeSet<NodeId> = self
-      .sessions
+      .sessions()
       .lock()
       .map_err(|_| Error::poisoned("session table"))?
       .iter()
       .filter(|(_, entry)| entry.alive())
       .map(|(peer, _)| peer.clone())
       .collect();
-    let store = self.context.store();
-    let local = self.context.identity().node().clone();
-    let known_members = known_online_member_endpoints(&self.exclusion_cache, store, &local).await?;
+    let store = self.context().store();
+    let local = self.context().identity().node().clone();
+    let known_members =
+      known_online_member_endpoints(self.exclusion_cache(), store, &local).await?;
     let known: std::collections::BTreeSet<NodeId> = known_members.keys().cloned().collect();
     // Bounded endpoint-rotation state: a serial for a member that left
     // the member table is dead rotation phase. Drop such entries each
@@ -241,7 +242,7 @@ impl TickState {
     let now = crate::time::now_seconds();
     let dial_due = {
       let mut controller = self
-        .recovery
+        .recovery()
         .lock()
         .map_err(|_| Error::poisoned("recovery controller"))?;
       controller.observe(&known, &direct);
@@ -255,7 +256,7 @@ impl TickState {
     // slots held by previous ticks' dials free up between ticks, so a
     // pre-batch check alone would admit up to `2*fan_out - 1`
     // concurrent dials.
-    let fan_out = self.config.recovery().fan_out().max(1);
+    let fan_out = self.config().recovery().fan_out().max(1);
     if !dial_due
       || self
         .recovery_pending
@@ -277,13 +278,13 @@ impl TickState {
     }
     let step = {
       let mut controller = self
-        .recovery
+        .recovery()
         .lock()
         .map_err(|_| Error::poisoned("recovery controller"))?;
       controller.next_step(
         now,
         &candidates.keys().cloned().collect(),
-        self.entropy.as_ref(),
+        self.entropy().as_ref(),
       )
     };
     for member in step.targets {
@@ -378,7 +379,7 @@ impl TickState {
   pub(super) fn maybe_prune_recovery_edges(
     &self, direct: &std::collections::BTreeSet<NodeId>,
   ) -> Result<()> {
-    let connected = match self.recovery.lock() {
+    let connected = match self.recovery().lock() {
       Ok(controller) => controller.state() == crate::membership::recovery::RecoveryState::Connected,
       // A poisoned lock only costs this tick's prune: the edge set
       // stays as it is.
@@ -405,7 +406,7 @@ impl TickState {
     // entry, not the key).
     let victim: Option<(NodeId, crate::session::stream::SessionEntry)> = {
       let mut sessions = self
-        .sessions
+        .sessions()
         .lock()
         .map_err(|_| Error::poisoned("session table"))?;
       let mut marked = Vec::new();
@@ -535,12 +536,12 @@ pub(super) fn spawn_member_dial(
     }
   };
   let permit = DialPermit::acquire(pending);
-  let driver = state.driver.clone();
-  let sessions = state.sessions.clone();
-  let packet = state.packet.clone();
+  let driver = state.driver().clone();
+  let sessions = state.sessions().clone();
+  let packet = state.packet().clone();
   let shutdown = state.shutdown.clone();
-  let connection_tasks = state.connection_tasks.clone();
-  let dial_deadline = state.config.dial_deadline();
+  let connection_tasks = state.connection_tasks().clone();
+  let dial_deadline = state.config().dial_deadline();
   let dial = tokio::spawn(async move {
     let _slot = permit;
     if let Err(error) = dial_member(
@@ -565,7 +566,7 @@ pub(super) fn spawn_member_dial(
   // inside its bounded cooperative window, aborting only the stragglers:
   // an in-flight dial is owned and torn down with
   // the node instead of outliving it.
-  if let Ok(mut handles) = state.connection_tasks.lock() {
+  if let Ok(mut handles) = state.connection_tasks().lock() {
     handles.push(dial);
   }
 }
@@ -925,7 +926,7 @@ mod tests {
     let (_reference, factory) = fresh_reference();
     let (supervisor, entropy, _sessions) = supervisor_over(factory, NodeConfig::new()).await;
     let ticks = supervisor.tick_state().unwrap();
-    let context = Arc::clone(&ticks.context);
+    let context = Arc::clone(ticks.context());
     let store = context.store();
     ensure_self_binding(&context, entropy.as_ref())
       .await
@@ -1314,7 +1315,7 @@ mod tests {
     tokio::time::timeout(std::time::Duration::from_secs(6), async {
       loop {
         if ticks
-          .recovery
+          .recovery()
           .lock()
           .unwrap()
           .due(crate::time::now_seconds())
@@ -1476,7 +1477,7 @@ mod tests {
     )
     .await;
     let ticks = supervisor.tick_state().unwrap();
-    let poisoner = Arc::clone(&ticks.recovery);
+    let poisoner = Arc::clone(ticks.recovery());
     let _ = std::thread::spawn(move || {
       let _guard = poisoner.lock().expect("recovery controller guard");
       panic!("poison the recovery controller");

@@ -127,10 +127,9 @@ pub(crate) struct OperationDeps {
   /// The node-local extension registry: the manager's hook source and
   /// the registered transports the admissions resolve against.
   extensions: Arc<ExtensionRegistry>,
-  /// The effect planes. `None` only on the task manager's unit-test
-  /// double ([`OperationDeps::test_double`]), whose scripted effects read
-  /// nothing; every production incarnation carries them.
-  planes: Option<EffectPlanes>,
+  /// The effect planes: every production incarnation carries them (the
+  /// planes are built with the handles, never resolved later).
+  planes: EffectPlanes,
   /// The bounded observation lanes' scheduling half, installed by
   /// [`super::task_manager::spawn_task_manager`] before any effect can
   /// run: the resource-write effects schedule their post-commit
@@ -153,7 +152,7 @@ impl OperationDeps {
       events: Arc::clone(&dependencies.events),
       extensions: Arc::clone(&dependencies.extensions),
       observation_lanes: std::sync::OnceLock::new(),
-      planes: Some(EffectPlanes {
+      planes: EffectPlanes {
         context: dependencies
           .context
           .clone()
@@ -184,21 +183,8 @@ impl OperationDeps {
         )),
         sync_round_requests: dependencies.sync_round_requests.clone(),
         leave_signal,
-      }),
+      },
     })
-  }
-
-  /// A manager-test double: the manager's own bookkeeping collaborators
-  /// are real (the event hub and the extension registry), the effect
-  /// planes are absent because a scripted test effect reads nothing.
-  #[cfg(test)]
-  pub(crate) fn test_double(events: Arc<EventHub>, extensions: Arc<ExtensionRegistry>) -> Self {
-    Self {
-      events,
-      extensions,
-      planes: None,
-      observation_lanes: std::sync::OnceLock::new(),
-    }
   }
 
   /// The typed event hub.
@@ -211,13 +197,11 @@ impl OperationDeps {
     &self.extensions
   }
 
-  /// The effect planes: every production incarnation carries them; the
-  /// typed internal error is unreachable there.
-  pub(super) fn planes(&self) -> Result<&EffectPlanes> {
-    self
-      .planes
-      .as_ref()
-      .ok_or_else(|| Error::internal("runtime operations"))
+  /// The effect planes: every production incarnation carries them, so
+  /// the accessor is infallible — effects read the planes directly with
+  /// no per-effect runtime re-proof.
+  pub(super) fn planes(&self) -> &EffectPlanes {
+    &self.planes
   }
 
   /// Installs the bounded observation lanes' scheduling half. Called
@@ -334,7 +318,7 @@ async fn reconcile_join(
   deps: Arc<OperationDeps>, transport: Arc<dyn crate::transport::registry::Transport>,
   receiver: Endpoint, credential: Arc<MergeCredential>,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   // The join dial's peer identity is the receiver endpoint: the peer node
   // id is only learned after the merge, so both audit lines carry the
@@ -378,7 +362,7 @@ async fn reconcile_connect(
   deps: Arc<OperationDeps>, transport: Arc<dyn crate::transport::registry::Transport>,
   receiver: Endpoint, peer: NodeId,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let authenticated = dial_member(
     transport,
@@ -399,7 +383,7 @@ async fn reconcile_connect(
 /// The disconnect effect: tear the peer's session down and emit the
 /// session change.
 async fn reconcile_disconnect(deps: Arc<OperationDeps>, peer: NodeId) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   retire_session(&planes.sessions, &peer)?;
   deps.events().emit(crate::SessionChanged::new(peer));
   Ok(EffectOutcome::new(encode_unit()?))
@@ -564,7 +548,7 @@ pub(crate) async fn resolve_frozen_journal(
 async fn reconcile_revoke(
   deps: Arc<OperationDeps>, subject: NodeId, expected_key: PublicKey,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let context = &planes.context;
   if &subject == context.identity().node() {
@@ -622,7 +606,7 @@ async fn reconcile_revoke(
 /// The cleanup effect: sign and persist one convergent cleanup tombstone,
 /// then announce the member change.
 async fn reconcile_cleanup(deps: Arc<OperationDeps>, subject: NodeId) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let context = &planes.context;
   if &subject == context.identity().node() {
@@ -651,7 +635,7 @@ async fn reconcile_cleanup(deps: Arc<OperationDeps>, subject: NodeId) -> Result<
 async fn reconcile_purge_revocation(
   deps: Arc<OperationDeps>, subject: NodeId,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   // The purge crosses the same authorization boundary as the revoke: the
   // ledger forgets the subject in the same section as the durable clear,
@@ -672,7 +656,7 @@ async fn reconcile_purge_revocation(
 /// The checkpoint effect: enforce the convergence precondition, then
 /// start the new GC epoch at the current wall clock.
 async fn reconcile_issue_cleanup_checkpoint(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   require_members_connected(planes).await?;
   let watermark =
@@ -690,7 +674,7 @@ async fn reconcile_issue_cleanup_checkpoint(deps: Arc<OperationDeps>) -> Result<
 /// background anti-entropy writers park inside that exclusion on the
 /// commit-slot refusal and would starve the operator resolution forever.
 async fn reconcile_resolve_frozen_journal(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   let operation = crate::TransactionId::generate(planes.entropy.as_ref())?;
   planes
     .context
@@ -909,7 +893,7 @@ impl DescriptorPublication {
 /// A successful ensure memoizes the endpoint set it settled against, so
 /// steady-state member reads stop scheduling ensure work entirely.
 pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   let endpoints = planes
     .published_endpoints
     .lock()
@@ -969,9 +953,7 @@ const DESCRIPTOR_PUBLICATION_RETRY: Duration = Duration::from_millis(100);
 /// read observes it. Listener transitions publish synchronously in the
 /// listen effect, so a read after a bound listener stays deterministic.
 pub(super) fn kick_self_descriptor_publication(deps: &Arc<OperationDeps>) {
-  let Ok(planes) = deps.planes() else {
-    return;
-  };
+  let planes = deps.planes();
   let endpoints = planes
     .published_endpoints
     .lock()
@@ -1041,9 +1023,7 @@ struct PublicationSlot {
 
 impl Drop for PublicationSlot {
   fn drop(&mut self) {
-    if let Ok(planes) = self.deps.planes() {
-      planes.descriptor_publication.end();
-    }
+    self.deps.planes().descriptor_publication.end();
   }
 }
 
@@ -1059,7 +1039,7 @@ async fn reconcile_put_resource(
   deps: Arc<OperationDeps>, write: Arc<crate::ResourceWrite>,
   expected: Option<crate::ResourceVersion>,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   ensure_self_descriptor(&deps).await?;
   let context = Arc::clone(&planes.context);
@@ -1168,7 +1148,7 @@ async fn reconcile_put_resource(
 async fn reconcile_delete_resource(
   deps: Arc<OperationDeps>, name: crate::ResourceName, expected: crate::ResourceVersion,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   ensure_self_descriptor(&deps).await?;
   let context = Arc::clone(&planes.context);
@@ -1288,7 +1268,7 @@ async fn reconcile_delete_resource(
 async fn reconcile_patch_metadata(
   deps: Arc<OperationDeps>, expected_revision: u64, patch: crate::NodeMetadataPatch,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let context = Arc::clone(&planes.context);
   let local = context.identity().node().clone();
@@ -1497,7 +1477,7 @@ async fn reconcile_listen(
   deps: Arc<OperationDeps>, transport: Arc<dyn crate::transport::registry::Transport>,
   endpoint: Endpoint,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let listener: std::sync::Arc<dyn crate::transport::registry::TransportListener> =
     std::sync::Arc::from(transport.bind(endpoint.clone()).await?);
@@ -1657,7 +1637,7 @@ async fn reconcile_listen(
 async fn reconcile_stop_listener(
   deps: Arc<OperationDeps>, listener: crate::identity::ListenerId,
 ) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
     .await?;
   Ok(EffectOutcome::new(encode_unit()?))
@@ -1668,7 +1648,7 @@ async fn reconcile_stop_listener(
 /// the consumed-once slot: the task's observation carries the expiry,
 /// and exactly the first `wait` collects the credential.
 async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let mut issuer = planes
     .driver
@@ -1680,18 +1660,14 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
   } else {
     issuer.issue(planes.entropy.as_ref(), crate::time::now())?
   };
-  Ok(if rotate {
-    EffectOutcome::credential_rotated(issued)?
-  } else {
-    EffectOutcome::credential_issued(issued)?
-  })
+  EffectOutcome::credential(issued)
 }
 
 /// The start-recovery effect: force the immediate cycle on the shared
 /// controller, publish the view, and emit the change event when the
 /// observation moved — the moved supervisor body.
 async fn reconcile_start_recovery(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   let mut controller = planes
     .recovery
     .lock()
@@ -1713,7 +1689,7 @@ async fn reconcile_start_recovery(deps: Arc<OperationDeps>) -> Result<EffectOutc
 /// a pending unknown may still reference its receipt, and cleanup
 /// conflicts rather than guesses.
 async fn reconcile_apply_receipt_retention(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let report = planes.context.store().apply_receipt_retention().await?;
   Ok(EffectOutcome::new(encode_receipt_retention(&report)?))
@@ -1723,7 +1699,7 @@ async fn reconcile_apply_receipt_retention(deps: Arc<OperationDeps>) -> Result<E
 /// and resolve when the round finishes. The round still executes in
 /// the driver (the cursor owner), exactly like the wall-clock tick.
 async fn reconcile_sync_round(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   let (round, round_rx) = tokio::sync::oneshot::channel();
   if planes.sync_round_requests.send(round).await.is_err() {
     return Err(Error::shutting_down("sync round"));
@@ -1784,7 +1760,7 @@ pub(crate) async fn leave(
 /// itself, because the node has no listeners and no sessions left to
 /// serve with.
 async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
-  let planes = deps.planes()?;
+  let planes = deps.planes();
   planes.context.require_unblocked()?;
   let context = &planes.context;
   let journaled =
@@ -2186,7 +2162,7 @@ mod shared_table_poison_tests {
     )
     .await;
     let deps = supervisor.dependencies.operations.clone().unwrap();
-    let issuer = Arc::clone(deps.planes().unwrap().driver.issuer());
+    let issuer = Arc::clone(deps.planes().driver.issuer());
     let _ = std::thread::spawn(move || {
       let _guard = issuer.lock().expect("join credential issuer guard");
       panic!("poison the join credential issuer");
@@ -2260,7 +2236,7 @@ mod leave_teardown_tests {
     )
     .await;
     let deps = dependencies.operations.clone().expect("operation handles");
-    let listeners = Arc::clone(&deps.planes().expect("planes").listeners);
+    let listeners = Arc::clone(&deps.planes().listeners);
     let _ = std::thread::spawn(move || {
       let _guard = listeners.lock().expect("listener registry guard");
       panic!("poison the listener registry");

@@ -156,12 +156,12 @@ impl TickState {
   /// A skipped or failed dial simply waits for the next tick — the
   /// plane is best-effort by contract.
   pub(super) async fn maintenance_tick(&self) -> Result<()> {
-    let store = self.context.store();
-    let local = self.context.identity().node().clone();
+    let store = self.context().store();
+    let local = self.context().identity().node().clone();
     let members =
-      super::recovery::known_online_member_endpoints(&self.exclusion_cache, store, &local).await?;
+      super::recovery::known_online_member_endpoints(self.exclusion_cache(), store, &local).await?;
     let connected: BTreeSet<NodeId> = self
-      .sessions
+      .sessions()
       .lock()
       .map_err(|_| Error::poisoned("session table"))?
       .iter()
@@ -171,7 +171,7 @@ impl TickState {
     // The cluster size includes this node; the universe map excludes it.
     let plan = crate::membership::degree::degree_plan(
       members.len().saturating_add(1),
-      self.config.connection_degree(),
+      self.config().connection_degree(),
       connected.len(),
     );
     if plan.dial_budget == 0 {
@@ -206,7 +206,7 @@ impl TickState {
       &local,
       &members,
       &connected,
-      self.entropy.as_ref(),
+      self.entropy().as_ref(),
     )?;
     // Per-member endpoint rotation: every dial of a member advances that
     // member's OWN serial, wrapping per member — the same per-member
@@ -352,7 +352,7 @@ impl TickState {
         local,
         pool,
         connected,
-        self.entropy.as_ref(),
+        self.entropy().as_ref(),
       )?,
       None => Vec::new(),
     };
@@ -362,7 +362,7 @@ impl TickState {
         local,
         members,
         connected,
-        self.entropy.as_ref(),
+        self.entropy().as_ref(),
       )?;
     }
     // Per-member endpoint rotation, the same serial map the deficit
@@ -396,7 +396,7 @@ impl TickState {
   /// rather than densify on a table it cannot read.
   fn probe_edge_peer(&self) -> Result<Option<NodeId>> {
     let sessions = self
-      .sessions
+      .sessions()
       .lock()
       .map_err(|_| Error::poisoned("session table"))?;
     Ok(sessions.iter().find_map(|(peer, entry)| {
@@ -435,7 +435,7 @@ impl TickState {
     debug_assert!(due);
     let removed = {
       let mut sessions = self
-        .sessions
+        .sessions()
         .lock()
         .map_err(|_| Error::poisoned("session table"))?;
       match sessions.get(peer) {
@@ -683,7 +683,7 @@ mod tests {
     insert_live_session(
       &sessions,
       member_id(101),
-      ticks.entropy.as_ref(),
+      ticks.entropy().as_ref(),
       DialClass::Caller,
     );
     ticks.maintenance_tick().await.unwrap();
@@ -741,7 +741,7 @@ mod tests {
     insert_live_session(
       &sessions,
       member_id(101),
-      ticks.entropy.as_ref(),
+      ticks.entropy().as_ref(),
       DialClass::Caller,
     );
 
@@ -836,7 +836,7 @@ mod tests {
     insert_live_session(
       &sessions,
       member_id(103),
-      ticks.entropy.as_ref(),
+      ticks.entropy().as_ref(),
       DialClass::Caller,
     );
 
@@ -989,7 +989,7 @@ mod tests {
       insert_live_session(
         &sessions,
         member_id(seed),
-        ticks.entropy.as_ref(),
+        ticks.entropy().as_ref(),
         DialClass::Caller,
       );
     }
@@ -1112,7 +1112,7 @@ mod tests {
       insert_live_session(
         &sessions,
         member_id(seed),
-        ticks.entropy.as_ref(),
+        ticks.entropy().as_ref(),
         DialClass::Caller,
       );
     }
@@ -1188,7 +1188,7 @@ mod tests {
       insert_live_session(
         &sessions,
         member_id(seed),
-        ticks.entropy.as_ref(),
+        ticks.entropy().as_ref(),
         DialClass::Caller,
       );
     }
@@ -1198,7 +1198,7 @@ mod tests {
     insert_live_session(
       &sessions,
       member_id(105),
-      ticks.entropy.as_ref(),
+      ticks.entropy().as_ref(),
       DialClass::Probe,
     );
     let view = supervisor.connection_degree_view().await.unwrap();
@@ -1283,7 +1283,7 @@ mod tests {
       insert_live_session(
         &sessions,
         member_id(seed),
-        ticks.entropy.as_ref(),
+        ticks.entropy().as_ref(),
         DialClass::Caller,
       );
     }
@@ -1295,7 +1295,7 @@ mod tests {
     insert_live_session(
       &sessions,
       member_id(105),
-      ticks.entropy.as_ref(),
+      ticks.entropy().as_ref(),
       DialClass::Probe,
     );
     let view = supervisor.connection_degree_view().await.unwrap();
@@ -1370,7 +1370,7 @@ mod tests {
       insert_live_session(
         &sessions,
         member_id(seed),
-        ticks.entropy.as_ref(),
+        ticks.entropy().as_ref(),
         DialClass::Caller,
       );
     }
@@ -1380,7 +1380,7 @@ mod tests {
     insert_live_session(
       &sessions,
       member_id(105),
-      ticks.entropy.as_ref(),
+      ticks.entropy().as_ref(),
       DialClass::Probe,
     );
     let view = supervisor.connection_degree_view().await.unwrap();
@@ -1535,7 +1535,7 @@ mod tests {
       insert_live_session(
         &sessions,
         member_id(seed),
-        ticks.entropy.as_ref(),
+        ticks.entropy().as_ref(),
         DialClass::Caller,
       );
     }
@@ -1642,7 +1642,7 @@ mod tests {
       insert_live_session(
         &sessions,
         member_id(seed),
-        ticks.entropy.as_ref(),
+        ticks.entropy().as_ref(),
         DialClass::Caller,
       );
     }
@@ -1725,7 +1725,7 @@ mod tests {
     insert_live_session(
       &sessions,
       member_id(101),
-      ticks.entropy.as_ref(),
+      ticks.entropy().as_ref(),
       DialClass::Caller,
     );
 

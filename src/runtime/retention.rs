@@ -21,10 +21,10 @@ impl TickState {
     {
       return;
     }
-    let limits = self.config.trace_metadata_limits();
+    let limits = self.config().trace_metadata_limits();
     match crate::routing::trace::sweep(
-      self.context.store(),
-      self.entropy.as_ref(),
+      self.context().store(),
+      self.entropy().as_ref(),
       &crate::time::HostWallClock,
       limits.terminal(),
       limits.retention(),
@@ -55,10 +55,10 @@ impl TickState {
   /// the reconcile plane reads as its reclaimed-knowledge basis.
   pub(super) async fn resource_removal_sweep(&self) {
     if let Err(error) = crate::resource::retention::sweep_removed_ctx(
-      self.context.store(),
+      self.context().store(),
       &crate::time::HostWallClock,
-      self.config.resource_removal_retention(),
-      self.config.resource_removal_cap(),
+      self.config().resource_removal_retention(),
+      self.config().resource_removal_cap(),
     )
     .await
     {
@@ -73,7 +73,7 @@ impl TickState {
   /// outage, frozen reconciliation) never panics the tick: it surfaces as
   /// a warning and the next bounded pass retries.
   pub(super) async fn receipt_retention_sweep(&self) {
-    if let Err(error) = self.context.store().apply_receipt_retention().await {
+    if let Err(error) = self.context().store().apply_receipt_retention().await {
       tracing::warn!(kind = ?error.kind(), "receipt retention sweep failed");
     }
   }
@@ -87,7 +87,7 @@ impl TickState {
   /// batch; a failure (store outage, frozen slot) surfaces as a warning
   /// and the next tick retries.
   pub(super) async fn collected_tombstone_sweep(&self) {
-    let store = self.context.store();
+    let store = self.context().store();
     match crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await {
       Ok(Some(_)) => {}
       Ok(None) => return,
@@ -97,7 +97,8 @@ impl TickState {
       }
     }
     if let Err(error) =
-      crate::identity::cleanup::collect_collected_tombstones_ctx(store, self.entropy.as_ref()).await
+      crate::identity::cleanup::collect_collected_tombstones_ctx(store, self.entropy().as_ref())
+        .await
     {
       tracing::warn!(kind = ?error.kind(), "tombstone gc sweep failed");
     }
