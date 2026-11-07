@@ -35,12 +35,19 @@ share one vocabulary.
 ## Grammar (v1 draft, to be frozen by golden tests)
 
 ```
-pattern  := dateset "-" monthset "-" dayset "T" hourset ":"
-            minuteset ":" secondset offset?
+pattern  := field "-" field "-" field "T" field ":" field ":" field offset?
+field    := "{" set "}" | literal            ; exactly two forms per field
 set      := element ("," element)*          ; non-empty, mixed forms allowed
 element  := "*" | dd | dd "-" dd            ; "*" = full domain; ranges closed on both ends
+literal  := dd | dddd                       ; a bare single numeric value
 offset   := "Z" | ("+"|"-") dd ":" dd       ; "Z" is sugar for "+00:00"
 ```
+
+A field is either a **braced set** or a **bare single numeric literal**
+(`00`, `2026`) — nothing else. Bare `*`, bare ranges, and bare
+enumerations are syntax errors: reserving the unbraced form for single
+literals keeps `-` unambiguous between the date separator and the range
+syntax (the decision that motivated the brace rule).
 
 - Fields: second/minute 0-59, hour 0-23, day 1-31, month 1-12, year 0000-9999.
   Two-digit zero-padded spellings throughout (four-digit year); ranges are
